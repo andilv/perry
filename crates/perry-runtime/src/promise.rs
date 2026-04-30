@@ -1424,7 +1424,8 @@ extern "C" fn promise_all_settled_reject_handler(
 }
 
 /// Promise.any — settles with the first FULFILLED promise. If all reject, rejects
-/// with an array of rejection reasons (Perry doesn't have AggregateError yet).
+/// with an `AggregateError` whose `errors` array carries the collected reasons
+/// (constructed via `js_aggregate_error_new` in the all-rejected path below).
 #[no_mangle]
 pub extern "C" fn js_promise_any(promises_arr: *const crate::array::ArrayHeader) -> *mut Promise {
     use crate::array::{js_array_alloc, js_array_get_f64, js_array_length, js_array_set_f64};

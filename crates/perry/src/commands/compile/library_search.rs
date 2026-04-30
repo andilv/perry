@@ -313,21 +313,76 @@ pub(super) fn find_msvc_lib_paths() -> Option<String> {
         }
     }
 
-    // Find Windows SDK lib paths
-    let sdk_root = PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\Lib");
-    if let Ok(entries) = std::fs::read_dir(&sdk_root) {
-        let mut versions: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-        versions.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
-        if let Some(entry) = versions.first() {
-            let um_path = entry.path().join(r"um\x64");
-            let ucrt_path = entry.path().join(r"ucrt\x64");
-            if um_path.exists() {
-                paths.push(um_path.to_string_lossy().to_string());
-            }
-            if ucrt_path.exists() {
-                paths.push(ucrt_path.to_string_lossy().to_string());
+    // Find Windows SDK lib paths.
+    //
+    // Issue #300: pre-fix this hardcoded `C:\Program Files (x86)\Windows
+    // Kits\10\Lib` and silently returned only the MSVC CRT path (so `LIB`
+    // was missing `um\x64` → `LNK1181: cannot open user32.lib`) when the
+    // user had Windows SDK installed elsewhere — typical for non-default
+    // VS installs (D: drive, custom paths). We now probe a list of
+    // candidate roots in priority order:
+    //
+    //   1. Registry: HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots
+    //      value KitsRoot10 — this is what `vcvars64.bat` consults and
+    //      is the canonical source of truth for SDK location.
+    //   2. ProgramFiles env (handles arch-specific %ProgramFiles%).
+    //   3. ProgramFiles(x86) env.
+    //   4. Hardcoded fallback at the legacy default path.
+    //
+    // Each root is `<root>\Windows Kits\10\Lib` (or for the registry's
+    // KitsRoot10, just `<KitsRoot10>\Lib`).
+    let mut sdk_roots: Vec<PathBuf> = Vec::new();
+    if let Some(reg_root) = read_registry_kits_root_10() {
+        sdk_roots.push(reg_root.join("Lib"));
+    }
+    for env_var in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(pf) = std::env::var(env_var) {
+            sdk_roots.push(PathBuf::from(pf).join(r"Windows Kits\10\Lib"));
+        }
+    }
+    sdk_roots.push(PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\Lib"));
+
+    let mut sdk_added = false;
+    for sdk_root in &sdk_roots {
+        if let Ok(entries) = std::fs::read_dir(sdk_root) {
+            let mut versions: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+            versions.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+            if let Some(entry) = versions.first() {
+                let um_path = entry.path().join(r"um\x64");
+                let ucrt_path = entry.path().join(r"ucrt\x64");
+                if um_path.exists() {
+                    paths.push(um_path.to_string_lossy().to_string());
+                    sdk_added = true;
+                }
+                if ucrt_path.exists() {
+                    paths.push(ucrt_path.to_string_lossy().to_string());
+                }
+                if sdk_added {
+                    break;
+                }
             }
         }
+    }
+
+    if !sdk_added && std::env::var("LIB").is_err() {
+        // Loud diagnostic — pre-fix this returned silently with only the
+        // MSVC CRT path, leading to a confusing LNK1181 from link.exe
+        // about user32.lib. Tell the user exactly what we tried and what
+        // the workarounds are.
+        eprintln!(
+            "Warning: Windows SDK lib path (Windows Kits\\10\\Lib\\<ver>\\um\\x64) not found.\n\
+             Tried: {}\n\
+             Linker will likely fail with LNK1181 (e.g. cannot open user32.lib).\n\
+             Workarounds:\n\
+             - Run `vcvars64.bat` before `perry compile` (sets `LIB` env)\n\
+             - Install Windows 10/11 SDK via Visual Studio Installer\n\
+             - Set the `LIB` env var manually to your SDK's `um\\x64;ucrt\\x64` paths",
+            sdk_roots
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
 
     if paths.is_empty() {
@@ -335,6 +390,52 @@ pub(super) fn find_msvc_lib_paths() -> Option<String> {
     } else {
         Some(paths.join(";"))
     }
+}
+
+/// Issue #300: read `KitsRoot10` from the Windows registry so we don't
+/// hardcode the SDK install location. Returns the path that
+/// `vcvars64.bat` would consult. Best-effort — silently returns None
+/// on any error (registry not available, key missing, etc.).
+#[cfg(target_os = "windows")]
+fn read_registry_kits_root_10() -> Option<PathBuf> {
+    use std::process::Command;
+    // We could pull in the `winreg` crate, but a `reg query` shell-out
+    // keeps the perry build dep-free for the same lookup. Output shape:
+    //     HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Kits\Installed Roots
+    //         KitsRoot10    REG_SZ    C:\Program Files (x86)\Windows Kits\10\
+    let out = Command::new("reg")
+        .args([
+            "query",
+            r"HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots",
+            "/v",
+            "KitsRoot10",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        let line = line.trim_start();
+        if let Some(rest) = line.strip_prefix("KitsRoot10") {
+            // Skip whitespace + REG_SZ + whitespace, take the rest.
+            let rest = rest.trim_start();
+            let rest = rest.strip_prefix("REG_SZ").unwrap_or(rest).trim();
+            if !rest.is_empty() {
+                let p = PathBuf::from(rest.trim_end_matches('\\'));
+                if p.exists() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+fn read_registry_kits_root_10() -> Option<PathBuf> {
+    None
 }
 
 #[cfg(not(target_os = "windows"))]
