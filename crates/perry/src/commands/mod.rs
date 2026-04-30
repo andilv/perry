@@ -22,4 +22,5 @@ pub mod stdlib_features;
 pub mod typecheck;
 pub mod types;
 pub mod update;
+pub mod updater;
 pub mod verify;

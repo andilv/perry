@@ -108,6 +108,13 @@ enum Commands {
 
     /// Manage the per-module object cache at `.perry-cache/`
     Cache(commands::cache::CacheArgs),
+
+    /// Sign-side tooling for `@perry/updater` (closes #229).
+    ///
+    /// `perry updater keygen` — generate Ed25519 keypair.
+    /// `perry updater sign`   — sign a binary for a v2 manifest entry.
+    /// `perry updater verify` — sanity-check a v2 signature locally.
+    Updater(commands::updater::UpdaterArgs),
 }
 
 /// Check if the first non-flag argument looks like a TypeScript file
@@ -139,6 +146,7 @@ fn is_legacy_invocation(args: &[String]) -> bool {
                 | "appstore"
                 | "types"
                 | "cache"
+                | "updater"
                 | "help"
         ) {
             return false;
@@ -254,6 +262,7 @@ fn main_inner() -> Result<()> {
         Commands::Appstore(args) => commands::appstore::run(args),
         Commands::Types(args) => commands::types::run(args, cli.format, use_color),
         Commands::Cache(args) => commands::cache::run(args, cli.format),
+        Commands::Updater(args) => commands::updater::run(args),
     };
 
     // Send telemetry for non-compile commands (compile is handled above for target/status)

@@ -141,6 +141,39 @@ build time; the secret key stays on a release-signing machine alongside
 the rest of your build artifacts. Compromise of the manifest server alone
 never lets an attacker push a binary your client will accept.
 
+### Sign-side CLI (v0.5.395+)
+
+`perry updater` ships three subcommands that produce v2-shape signatures
+without needing any custom tooling:
+
+```bash
+# 1) One-time keypair generation. Save kp.json with mode 0600 and
+#    NEVER commit the secret_key field.
+perry updater keygen --output kp.json
+
+# 2) Per-release signing. The output JSON envelope contains every
+#    manifest-entry field (sha256, signature, size, version, schemaVersion=2).
+perry updater sign \
+    --binary perry-darwin-aarch64.tar.gz \
+    --version 1.2.3 \
+    --secret-key kp.json
+
+# 3) Sanity-check the signature locally before uploading the manifest —
+#    this is the same algorithm the runtime uses, so a passing verify
+#    here predicts a passing verify on the client.
+perry updater verify \
+    --binary perry-darwin-aarch64.tar.gz \
+    --version 1.2.3 \
+    --signature '<base64 from step 2>' \
+    --pubkey '<public_key from kp.json>'
+```
+
+Compose a final manifest by piping `sign` output through `jq` for each
+asset, then merging into the per-platform layout shown above. CI tip:
+pass `--secret-key-b64 "$ED25519_SECRET_KEY"` instead of `--secret-key
+file` so the secret can come from a repository secret without ever
+hitting the worker's filesystem.
+
 ## Install + rollback flow
 
 ```text
