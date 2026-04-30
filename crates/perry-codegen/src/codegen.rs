@@ -649,6 +649,15 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         if hir.classes.iter().any(|local| local.name == c.name) {
             continue;
         }
+        // Skip duplicate imported stubs of the same name. Two namespace
+        // re-exports of the same class (e.g., `export * as A from "./mod"`
+        // and `export * as B from "./mod"`) can register the same class
+        // twice in `imported_class_stubs`. Without this guard, codegen
+        // would emit `@perry_class_keys_<modprefix>__<name>` twice and
+        // clang would reject the IR with "redefinition of global". See #336.
+        if class_keys_globals_map.contains_key(&c.name) {
+            continue;
+        }
         let global_name = format!("perry_class_keys_{}__{}", module_prefix, sanitize(&c.name),);
         llmod.add_internal_global(&global_name, I64, "0");
         class_keys_globals_map.insert(c.name.clone(), global_name.clone());

@@ -1684,6 +1684,22 @@ pub fn lower_module_with_class_id(
     lower_module_with_class_id_and_types(ast_module, name, source_file_path, start_class_id, None)
 }
 
+/// Append `class` to `module.classes` only if no class with the same name has
+/// already been pushed. Same dedup policy that the function-scoped path at
+/// `lower_decl.rs::3059` already enforces — extended here to every push site
+/// so namespace-scoped, mixin, and class-expression paths can't smuggle a
+/// duplicate-named class into codegen and trip the LLVM IR's "redefinition
+/// of global '@perry_class_keys_<modprefix>__<class>'" rule. The lookup
+/// pipeline (`Expr::New { class_name }`, `class_lookup` / `class_ids`) is
+/// purely name-based today, so the second class wouldn't be reachable through
+/// any binding anyway — emitting it just produces unreachable globals that
+/// then collide with the first class's globals at link time. See #336.
+fn push_class_dedup(module: &mut Module, class: Class) {
+    if !module.classes.iter().any(|c| c.name == class.name) {
+        module.classes.push(class);
+    }
+}
+
 pub fn lower_module_with_class_id_and_types(
     ast_module: &ast::Module,
     name: &str,
@@ -1927,7 +1943,7 @@ pub fn lower_module_with_class_id_and_types(
         // Flush any pending classes created during expression lowering
         // (e.g., class expressions in `new (class extends Command { ... })()`)
         for class in ctx.pending_classes.drain(..) {
-            module.classes.push(class);
+            push_class_dedup(&mut module, class);
         }
     }
 
@@ -3976,7 +3992,7 @@ fn lower_module_decl(
                 ast::Decl::Class(class_decl) => {
                     let class = lower_class_decl(ctx, class_decl, true)?;
                     let class_name = class.name.clone();
-                    module.classes.push(class);
+                    push_class_dedup(module, class);
                     module.exports.push(Export::Named {
                         local: class_name.clone(),
                         exported: class_name,
@@ -4023,7 +4039,7 @@ fn lower_module_decl(
                             let class =
                                 lower_namespace_as_class(ctx, module, &ns_name, body, true)?;
                             let class_name = class.name.clone();
-                            module.classes.push(class);
+                            push_class_dedup(module, class);
                             module.exports.push(Export::Named {
                                 local: class_name.clone(),
                                 exported: class_name,
@@ -4431,7 +4447,7 @@ fn lower_namespace_as_class(
                     }
                     ast::Decl::Class(class_decl) => {
                         let class = lower_class_decl(ctx, class_decl, is_exported)?;
-                        module.classes.push(class);
+                        push_class_dedup(module, class);
                     }
                     _ => {}
                 }
@@ -4763,7 +4779,7 @@ fn lower_stmt(ctx: &mut LoweringContext, module: &mut Module, stmt: &ast::Stmt) 
                                         &bind_name,
                                         false,
                                     )?;
-                                    module.classes.push(lowered_class);
+                                    push_class_dedup(module, lowered_class);
                                     // Register the alias so `new X()` → `new X()`
                                     // (no-op lookup, but marks the binding as a class).
                                     ctx.class_expr_aliases
@@ -4813,7 +4829,7 @@ fn lower_stmt(ctx: &mut LoweringContext, module: &mut Module, stmt: &ast::Stmt) 
                                                                 &bind_name,
                                                                 false,
                                                             )?;
-                                                            module.classes.push(lowered_class);
+                                                            push_class_dedup(module, lowered_class);
                                                             ctx.class_expr_aliases.insert(
                                                                 bind_name.clone(),
                                                                 bind_name.clone(),
@@ -4941,7 +4957,7 @@ fn lower_stmt(ctx: &mut LoweringContext, module: &mut Module, stmt: &ast::Stmt) 
                 }
                 ast::Decl::Class(class_decl) => {
                     let class = lower_class_decl(ctx, class_decl, false)?;
-                    module.classes.push(class);
+                    push_class_dedup(module, class);
                 }
                 ast::Decl::TsEnum(enum_decl) => {
                     let en = lower_enum_decl(ctx, enum_decl, false)?;
@@ -5001,7 +5017,7 @@ fn lower_stmt(ctx: &mut LoweringContext, module: &mut Module, stmt: &ast::Stmt) 
                             };
                             let class =
                                 lower_namespace_as_class(ctx, module, &ns_name, body, false)?;
-                            module.classes.push(class);
+                            push_class_dedup(module, class);
                         }
                     }
                 }
