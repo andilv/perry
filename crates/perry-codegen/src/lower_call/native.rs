@@ -264,6 +264,78 @@ pub(crate) fn lower_native_method_call(
     // to the perry_ui_* runtime function and arg shape. Most setters
     // follow `(widget, …number args)` and most constructors return a
     // widget handle that gets NaN-boxed as POINTER on the way out.
+    // perry/ui.showToast(msg) — Phase 2 v3 Option 1. Enqueues `msg`
+    // into the runtime's drain queue; the auto-emitted .ets onClick
+    // pumps the queue into ArkUI's `promptAction.showToast` after the
+    // closure body returns. On non-harmonyos targets the runtime FFI
+    // is still defined (just with empty queue + no consumer) so
+    // cross-platform code compiles, but only harmonyos shows visual
+    // feedback. Future v3 follow-up: route to NSAlert/UIAlertController/
+    // GtkPopover on the desktop UI backends.
+    if module == "perry/ui" && method == "showToast" && object.is_none() {
+        if args.is_empty() {
+            return Ok(double_literal(f64::from_bits(0x7FFC_0000_0000_0001)));
+        }
+        let msg_d = lower_expr(ctx, &args[0])?;
+        ctx.pending_declares.push((
+            "perry_arkts_show_toast".to_string(),
+            crate::types::VOID,
+            vec![DOUBLE],
+        ));
+        let blk = ctx.block();
+        blk.call_void("perry_arkts_show_toast", &[(DOUBLE, &msg_d)]);
+        return Ok(double_literal(f64::from_bits(0x7FFC_0000_0000_0001)));
+    }
+
+    // perry/ui.setText(id, value) — Phase 2 v3 Option 2 reactive Text.
+    // Enqueues a (id, value) update; the auto-emitted .ets onClick
+    // pumps the queue into the matching `@State text_<id>` after the
+    // closure body returns. Same drain-pattern shape as showToast.
+    if module == "perry/ui" && method == "setText" && object.is_none() {
+        if args.len() < 2 {
+            return Ok(double_literal(f64::from_bits(0x7FFC_0000_0000_0001)));
+        }
+        let id_d = lower_expr(ctx, &args[0])?;
+        let val_d = lower_expr(ctx, &args[1])?;
+        ctx.pending_declares.push((
+            "perry_arkts_set_text".to_string(),
+            crate::types::VOID,
+            vec![DOUBLE, DOUBLE],
+        ));
+        let blk = ctx.block();
+        blk.call_void("perry_arkts_set_text", &[(DOUBLE, &id_d), (DOUBLE, &val_d)]);
+        return Ok(double_literal(f64::from_bits(0x7FFC_0000_0000_0001)));
+    }
+
+    // perry/arkts: HarmonyOS Phase 2 v2 callback bridge. Synthetic module
+    // injected by the harvest pass (`compile.rs::emit_index_ets`) — never
+    // user-authored. `registerCallback(idx, closure)` lowers to a call to
+    // the runtime FFI `perry_arkts_register_callback(i64, f64)` which
+    // stores the closure pointer in a slot table that NAPI's
+    // `invokeCallback(idx)` dispatches against on ArkUI tap events.
+    if module == "perry/arkts" && method == "registerCallback" && object.is_none() {
+        if args.len() != 2 {
+            bail!(
+                "perry/arkts.registerCallback expects (idx, closure), got {} args",
+                args.len()
+            );
+        }
+        let idx_d = lower_expr(ctx, &args[0])?;
+        let closure_d = lower_expr(ctx, &args[1])?;
+        ctx.pending_declares.push((
+            "perry_arkts_register_callback".to_string(),
+            crate::types::VOID,
+            vec![I64, DOUBLE],
+        ));
+        let blk = ctx.block();
+        let idx_i64 = blk.fptosi(DOUBLE, &idx_d, I64);
+        blk.call_void(
+            "perry_arkts_register_callback",
+            &[(I64, &idx_i64), (DOUBLE, &closure_d)],
+        );
+        return Ok(double_literal(f64::from_bits(0x7FFC_0000_0000_0001)));
+    }
+
     // perry/system dispatch: audioStart, audioGetLevel, getDeviceModel, etc.
     if module == "perry/system" && object.is_none() {
         if method == "notificationSchedule" {
