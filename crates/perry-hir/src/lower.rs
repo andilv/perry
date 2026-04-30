@@ -63,6 +63,14 @@ pub struct LoweringContext {
     /// avoiding the creation of shadow fields that cause later index shift bugs after
     /// inheritance resolution in codegen.
     pub(crate) class_field_names: Vec<(String, Vec<String>)>,
+    /// Issue #302 (v0.5.388): instance field types per class so the
+    /// for-of arm can detect `for (const [k, v] of this.someMap)` —
+    /// the iterable is an `ast::Expr::Member { obj: This, prop: "someMap" }`,
+    /// not an `ast::Expr::Ident`, so the existing `lookup_local_type`
+    /// path doesn't apply. Parallel to `class_field_names` but stores
+    /// `(field_name, declared_type)` pairs. Populated by
+    /// `register_class_field_types` next to `register_class_field_names`.
+    pub(crate) class_field_types: Vec<(String, Vec<(String, Type)>)>,
     /// Enums: name -> (id, members with values)
     pub(crate) enums: Vec<(String, EnumId, Vec<(String, EnumValue)>)>,
     /// Interfaces: name -> id
@@ -261,6 +269,7 @@ impl LoweringContext {
             classes: Vec::new(),
             class_statics: Vec::new(),
             class_field_names: Vec::new(),
+            class_field_types: Vec::new(),
             enums: Vec::new(),
             interfaces: Vec::new(),
             type_aliases: Vec::new(),
@@ -547,6 +556,40 @@ impl LoweringContext {
             .iter()
             .find(|(n, _)| n == class_name)
             .map(|(_, f)| f.as_slice())
+    }
+
+    /// Issue #302: register declared field types for a class (parallel to
+    /// `register_class_field_names`). Lets the for-of lowerer recognize
+    /// `for (const [k, v] of this.someMap)` patterns that hit class instance
+    /// fields rather than local variables.
+    pub(crate) fn register_class_field_types(
+        &mut self,
+        class_name: String,
+        field_types: Vec<(String, Type)>,
+    ) {
+        if let Some(entry) = self
+            .class_field_types
+            .iter_mut()
+            .find(|(n, _)| *n == class_name)
+        {
+            entry.1 = field_types;
+        } else {
+            self.class_field_types.push((class_name, field_types));
+        }
+    }
+
+    /// Issue #302: look up the declared type of a single instance field on a
+    /// class. Returns `None` if the class isn't registered or the field
+    /// name doesn't appear in the class's declared field list.
+    pub(crate) fn lookup_class_field_type(
+        &self,
+        class_name: &str,
+        field_name: &str,
+    ) -> Option<&Type> {
+        self.class_field_types
+            .iter()
+            .find(|(n, _)| n == class_name)
+            .and_then(|(_, fs)| fs.iter().find(|(n, _)| n == field_name).map(|(_, ty)| ty))
     }
 
     /// Issue #212: register the outer-scope LocalIds that a nested class
@@ -5369,43 +5412,44 @@ fn lower_stmt(ctx: &mut LoweringContext, module: &mut Module, stmt: &ast::Stmt) 
             // Lower the iterable expression (the array)
             let arr_expr = lower_expr(ctx, &for_of_stmt.right)?;
 
-            // If the iterable is a Map, wrap in MapEntries to convert to array
-            // This handles: for (const [k, v] of myMap) { ... }
-            // Also extract the Map's key/value type args for proper type propagation.
-            let mut map_key_type: Option<Type> = None;
-            let mut map_val_type: Option<Type> = None;
-            let arr_expr = if let ast::Expr::Ident(ident) = &*for_of_stmt.right {
-                let name = ident.sym.to_string();
-                let local_type = ctx.lookup_local_type(&name);
-                let map_type_args = local_type.as_ref().and_then(|ty| {
-                    if let Type::Generic { base, type_args } = ty {
-                        if base == "Map" {
-                            Some(type_args.clone())
+            // Issue #302: resolve iterable type from either local var or
+            // class instance field (`this.someMap`). Was limited to
+            // `Ident` only.
+            let iterable_type: Option<Type> = match &*for_of_stmt.right {
+                ast::Expr::Ident(ident) => ctx.lookup_local_type(&ident.sym.to_string()).cloned(),
+                ast::Expr::Member(m) => {
+                    if matches!(m.obj.as_ref(), ast::Expr::This(_)) {
+                        if let (Some(cls), ast::MemberProp::Ident(p)) =
+                            (ctx.current_class.clone(), &m.prop)
+                        {
+                            ctx.lookup_class_field_type(&cls, p.sym.as_ref()).cloned()
                         } else {
                             None
                         }
                     } else {
                         None
                     }
-                });
-                let is_set = local_type
-                    .as_ref()
-                    .map(|ty| matches!(ty, Type::Generic { base, .. } if base == "Set"))
-                    .unwrap_or(false);
-                if let Some(type_args) = map_type_args {
+                }
+                _ => None,
+            };
+
+            // If the iterable is a Map, wrap in MapEntries to convert to array
+            // This handles: for (const [k, v] of myMap) { ... } AND
+            // for (const [k, v] of this.classMap) { ... } per #302.
+            let mut map_key_type: Option<Type> = None;
+            let mut map_val_type: Option<Type> = None;
+            let arr_expr = match &iterable_type {
+                Some(Type::Generic { base, type_args }) if base == "Map" => {
                     if type_args.len() >= 2 {
                         map_key_type = Some(type_args[0].clone());
                         map_val_type = Some(type_args[1].clone());
                     }
                     Expr::MapEntries(Box::new(arr_expr))
-                } else if is_set {
-                    // Convert Set to Array for iteration: for (const x of mySet)
-                    Expr::SetValues(Box::new(arr_expr))
-                } else {
-                    arr_expr
                 }
-            } else {
-                arr_expr
+                Some(Type::Generic { base, .. }) if base == "Set" => {
+                    Expr::SetValues(Box::new(arr_expr))
+                }
+                _ => arr_expr,
             };
 
             // Determine the array element type: String for strings, Tuple(K, V) for Maps, Any otherwise.
@@ -5413,23 +5457,28 @@ fn lower_stmt(ctx: &mut LoweringContext, module: &mut Module, stmt: &ast::Stmt) 
             // `words: string[]`, extract the element type from the local's
             // declared Array<T> so the synthesized iteration variable gets
             // the right type (was always Any, breaking `word.length` etc.).
+            // #302: also draws Set + class-field Array element types
+            // from the resolved `iterable_type` above instead of
+            // re-doing the Ident lookup here.
             let elem_type = if is_string_iter {
                 Type::String
             } else if let (Some(ref k), Some(ref v)) = (&map_key_type, &map_val_type) {
                 Type::Tuple(vec![k.clone(), v.clone()])
-            } else if let ast::Expr::Ident(ident) = &*for_of_stmt.right {
-                let name = ident.sym.to_string();
-                match ctx.lookup_local_type(&name) {
+            } else {
+                match &iterable_type {
                     Some(Type::Array(elem)) => (**elem).clone(),
                     Some(Type::Generic { base, type_args })
                         if base == "Array" && type_args.len() == 1 =>
                     {
                         type_args[0].clone()
                     }
+                    Some(Type::Generic { base, type_args })
+                        if base == "Set" && type_args.len() >= 1 =>
+                    {
+                        type_args[0].clone()
+                    }
                     _ => Type::Any,
                 }
-            } else {
-                Type::Any
             };
             // The __arr holder's type: String for string iteration (so codegen uses
             // string.length and the str[i] char-access path), Array otherwise.

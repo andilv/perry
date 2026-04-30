@@ -319,6 +319,28 @@ fn compute_max_func_id(module: &Module) -> FuncId {
     for stmt in &module.init {
         scan_stmt_for_max_func(stmt, &mut max_id);
     }
+    // Issue #154: class member bodies share the FuncId namespace — their
+    // nested closures (executors, callbacks, dispose-method bodies)
+    // carry FuncIds that the iterator state-machine transform must not
+    // collide with. Mirrors the v0.5.323 class-scan added to
+    // `compute_max_local_id` for issue #212. Without this, an
+    // `await using r = new R()` where `R[Symbol.asyncDispose]()` awaits
+    // a user-built Promise has its executor closure's FuncId reused for
+    // the synthesized iterator-return, and at codegen the iterator-
+    // return body wins. The body reads past the (0-cap) executor's
+    // capture array and `js_box_set`s a code-segment pointer → SIGBUS.
+    for class in &module.classes {
+        for m in class
+            .methods
+            .iter()
+            .chain(class.static_methods.iter())
+            .chain(class.constructor.iter())
+            .chain(class.getters.iter().map(|(_, f)| f))
+            .chain(class.setters.iter().map(|(_, f)| f))
+        {
+            scan_stmts_for_max_func(&m.body, &mut max_id);
+        }
+    }
     max_id
 }
 

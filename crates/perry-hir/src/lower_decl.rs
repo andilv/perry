@@ -660,6 +660,35 @@ pub(crate) fn lower_class_decl(
     // Register static members early so method bodies can reference them
     ctx.register_class_statics(name.clone(), static_field_names, static_method_names);
 
+    // Issue #302: also collect instance field TYPES early so method bodies'
+    // `for (... of this.someField)` lowering can detect Map/Set field types
+    // BEFORE method bodies are lowered. The full `fields` Vec gets populated
+    // during the next pass starting at line 672 (with init exprs etc.); for
+    // type-name lookup we only need (name, declared type) which is cheap to
+    // pluck from `prop.type_ann`. Registered again at end-of-class
+    // (line ~1058) once `fields` is complete in case any field types got
+    // refined during body lowering.
+    let mut early_field_types: Vec<(String, Type)> = Vec::new();
+    for member in &class_decl.class.body {
+        if let ast::ClassMember::ClassProp(prop) = member {
+            if prop.is_static {
+                continue;
+            }
+            let field_name = match &prop.key {
+                ast::PropName::Ident(i) => i.sym.to_string(),
+                ast::PropName::Str(s) => s.value.as_str().unwrap_or("").to_string(),
+                _ => continue,
+            };
+            let ty = prop
+                .type_ann
+                .as_ref()
+                .map(|ann| extract_ts_type_with_ctx(&ann.type_ann, Some(ctx)))
+                .unwrap_or(Type::Any);
+            early_field_types.push((field_name, ty));
+        }
+    }
+    ctx.register_class_field_types(name.clone(), early_field_types);
+
     let mut fields = Vec::new();
     let mut static_fields = Vec::new();
     let mut constructor = None;
@@ -1047,6 +1076,17 @@ pub(crate) fn lower_class_decl(
             }
         }
         ctx.register_class_field_names(name.clone(), complete_field_names);
+
+        // Issue #302: also register field TYPES so the for-of arm can
+        // detect `for (... of this.someMap)` patterns. Only own fields are
+        // registered here; inherited field types fall through to whichever
+        // ancestor class registered them (sub-class lookups walk via the
+        // class hierarchy elsewhere if needed).
+        let field_types: Vec<(String, Type)> = fields
+            .iter()
+            .map(|f| (f.name.clone(), f.ty.clone()))
+            .collect();
+        ctx.register_class_field_types(name.clone(), field_types);
     }
 
     // Exit type parameter scope
@@ -3624,20 +3664,41 @@ pub(crate) fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Re
 
             let arr_expr = lower_expr(ctx, &for_of_stmt.right)?;
 
-            // If the iterable is a Map, wrap in MapEntries to convert to array
-            let arr_expr = if let ast::Expr::Ident(ident) = &*for_of_stmt.right {
-                let name = ident.sym.to_string();
-                let is_map = ctx
-                    .lookup_local_type(&name)
-                    .map(|ty| matches!(ty, Type::Generic { base, .. } if base == "Map"))
-                    .unwrap_or(false);
-                if is_map {
-                    Expr::MapEntries(Box::new(arr_expr))
-                } else {
-                    arr_expr
+            // Issue #302: resolve the iterable's declared type. Was
+            // limited to `Ident` (local variable lookup) so
+            // `for (const [k, v] of this.someMap)` produced a raw Map
+            // handle that the for-loop's `.length` read returned 0 on,
+            // silently skipping the loop body. Now also resolves
+            // `Member { obj: This, prop: ident }` via the class field
+            // type registry so class instance fields work too.
+            let iterable_type: Option<Type> = match &*for_of_stmt.right {
+                ast::Expr::Ident(ident) => ctx.lookup_local_type(&ident.sym.to_string()).cloned(),
+                ast::Expr::Member(m) => {
+                    if matches!(m.obj.as_ref(), ast::Expr::This(_)) {
+                        if let (Some(cls), ast::MemberProp::Ident(p)) =
+                            (ctx.current_class.clone(), &m.prop)
+                        {
+                            ctx.lookup_class_field_type(&cls, p.sym.as_ref()).cloned()
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
                 }
-            } else {
-                arr_expr
+                _ => None,
+            };
+
+            // If the iterable is a Map or Set, wrap in MapEntries / SetValues
+            // to materialize it as an array for the index-based loop.
+            let arr_expr = match &iterable_type {
+                Some(Type::Generic { base, .. }) if base == "Map" => {
+                    Expr::MapEntries(Box::new(arr_expr))
+                }
+                Some(Type::Generic { base, .. }) if base == "Set" => {
+                    Expr::SetValues(Box::new(arr_expr))
+                }
+                _ => arr_expr,
             };
 
             // For string iteration the __arr holder is typed as String (so codegen
@@ -3645,21 +3706,29 @@ pub(crate) fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Re
             // For an identifier iterable like `for (const word of words)` where
             // `words: string[]`, extract the element type from the local's
             // declared Array<T> so the loop variable gets the right type.
-            let inferred_elem_type: Option<Type> =
-                if let ast::Expr::Ident(ident) = &*for_of_stmt.right {
-                    let name = ident.sym.to_string();
-                    match ctx.lookup_local_type(&name) {
-                        Some(Type::Array(elem)) => Some((**elem).clone()),
-                        Some(Type::Generic { base, type_args })
-                            if base == "Array" && type_args.len() == 1 =>
-                        {
-                            Some(type_args[0].clone())
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
+            let inferred_elem_type: Option<Type> = match &iterable_type {
+                Some(Type::Array(elem)) => Some((**elem).clone()),
+                Some(Type::Generic { base, type_args })
+                    if base == "Array" && type_args.len() == 1 =>
+                {
+                    Some(type_args[0].clone())
+                }
+                Some(Type::Generic { base, type_args })
+                    if base == "Map" && type_args.len() >= 2 =>
+                {
+                    // for-of over Map yields [K, V] tuples
+                    Some(Type::Tuple(vec![
+                        type_args[0].clone(),
+                        type_args[1].clone(),
+                    ]))
+                }
+                Some(Type::Generic { base, type_args })
+                    if base == "Set" && type_args.len() >= 1 =>
+                {
+                    Some(type_args[0].clone())
+                }
+                _ => None,
+            };
             let holder_type = if is_string_iter {
                 Type::String
             } else if let Some(ref elem) = inferred_elem_type {
