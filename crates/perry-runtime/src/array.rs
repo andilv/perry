@@ -748,8 +748,7 @@ pub extern "C" fn js_array_set_length(arr: *mut ArrayHeader, new_length: f64) {
             // require Perry to release the underlying buffer here, and growing
             // back via `push` would just re-overwrite these slots anyway.
             const TAG_UNDEFINED_F64: f64 = unsafe { f64::from_bits(0x7FFC_0000_0000_0001u64) };
-            let elements_ptr =
-                (arr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut f64;
+            let elements_ptr = (arr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut f64;
             for i in n..cur {
                 std::ptr::write(elements_ptr.add(i as usize), TAG_UNDEFINED_F64);
             }
