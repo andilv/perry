@@ -133,6 +133,8 @@ pub const NATIVE_MODULES: &[&str] = &[
     "perry/thread",
     // Perry auto-updater (compareVersions, verifyHash, installUpdate, …)
     "perry/updater",
+    // Perry streaming media playback (createPlayer, play, pause, seek, …)
+    "perry/media",
     // SQLite
     "better-sqlite3",
 ];
@@ -173,6 +175,7 @@ const RUNTIME_ONLY_MODULES: &[&str] = &[
     "perry/widget",
     "perry/i18n",
     "perry/thread",
+    "perry/media",
 ];
 
 /// Check if a native module import requires linking perry-stdlib.
