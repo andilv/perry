@@ -930,7 +930,10 @@ pub fn run_with_parse_cache(
     // Also flips `ctx.needs_ui` back to false so the link path skips the
     // perry-ui-* lib check (which would fail on the OHOS target since no
     // such lib exists).
-    if matches!(args.target.as_deref(), Some("harmonyos") | Some("harmonyos-simulator")) {
+    if matches!(
+        args.target.as_deref(),
+        Some("harmonyos") | Some("harmonyos-simulator")
+    ) {
         // Compute entry path locally — the canonical `entry_path` binding is
         // declared further down in run_with_parse_cache (at the codegen-loop
         // entry-detection site) and isn't in scope here yet. This local copy
