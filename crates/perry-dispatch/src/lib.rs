@@ -1614,6 +1614,12 @@ pub static PERRY_UPDATER_TABLE: &[MethodRow] = &[
         ret: ReturnKind::I64AsF64,
     },
     MethodRow {
+        method: "verifySignatureV2",
+        runtime: "perry_updater_verify_signature_v2",
+        args: &[ArgKind::Str, ArgKind::Str, ArgKind::Str, ArgKind::Str],
+        ret: ReturnKind::I64AsF64,
+    },
+    MethodRow {
         method: "computeFileSha256",
         runtime: "perry_updater_compute_file_sha256",
         args: &[ArgKind::Str],

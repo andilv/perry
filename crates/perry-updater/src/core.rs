@@ -234,6 +234,118 @@ pub extern "C" fn perry_updater_verify_signature(
     }
 }
 
+/// Issue #229: version-bound Ed25519 signature verification.
+///
+/// **The signed payload is `SHA256(binary) || version_string_utf8`** —
+/// 32 bytes of digest followed by the UTF-8 bytes of the version
+/// string. This binds the version into the signature so an on-path
+/// attacker can't replay a previously-signed older binary as a "new
+/// version" by serving a manifest that pairs the old binary's URL +
+/// signature with a higher version number. (Pre-v2 the signed payload
+/// was just the 32-byte digest, leaving the version unauthenticated.)
+///
+/// The `version` argument MUST be the same byte sequence the manifest
+/// claims for this asset. Sign-side tooling produces signatures by
+/// computing `payload = sha256(binary) || version.as_bytes()` and
+/// signing that with Ed25519. Verify-side recomputes the same payload
+/// and runs the same verification — any tampering with either the
+/// version string or the binary causes the signature to fail.
+///
+/// Manifest schemaVersion 2+ uses this path. v1 manifests stay on
+/// `perry_updater_verify_signature` (digest-only) for backwards
+/// compatibility; the @perry/updater TS wrapper dispatches based on
+/// schemaVersion.
+///
+/// `sig_b64`: base64-encoded 64-byte Ed25519 signature.
+/// `pubkey_b64`: base64-encoded 32-byte Ed25519 public key.
+/// `version`: UTF-8 version string (e.g. "1.2.3" — exact bytes).
+/// Returns 1 on valid signature, 0 on any error.
+#[no_mangle]
+pub extern "C" fn perry_updater_verify_signature_v2(
+    file_path_val: i64,
+    sig_b64_val: i64,
+    pubkey_b64_val: i64,
+    version_val: i64,
+) -> i64 {
+    let path = match unsafe { extract_str(file_path_val) } {
+        Some(s) => s,
+        None => return 0,
+    };
+    let sig_b64 = match unsafe { extract_str(sig_b64_val) } {
+        Some(s) => s,
+        None => return 0,
+    };
+    let pubkey_b64 = match unsafe { extract_str(pubkey_b64_val) } {
+        Some(s) => s,
+        None => return 0,
+    };
+    let version = match unsafe { extract_str(version_val) } {
+        Some(s) => s,
+        None => return 0,
+    };
+    if version.is_empty() {
+        // Empty version would let an attacker forge a v2 manifest that
+        // matches a v1 signature byte-for-byte (since `digest || ""`
+        // == `digest`). Refuse the empty case to keep the v1 / v2
+        // payload spaces fully disjoint.
+        return 0;
+    }
+
+    let sig_bytes = match base64::engine::general_purpose::STANDARD.decode(sig_b64.trim()) {
+        Ok(b) => b,
+        Err(_) => return 0,
+    };
+    let pk_bytes = match base64::engine::general_purpose::STANDARD.decode(pubkey_b64.trim()) {
+        Ok(b) => b,
+        Err(_) => return 0,
+    };
+
+    if sig_bytes.len() != 64 || pk_bytes.len() != 32 {
+        return 0;
+    }
+
+    // Stream the file digest exactly like v1, then build the
+    // version-bound payload by appending the UTF-8 version bytes.
+    use std::io::Read;
+    let mut file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(_) => return 0,
+    };
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = match file.read(&mut buf) {
+            Ok(n) => n,
+            Err(_) => return 0,
+        };
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+
+    // payload = digest_bytes (32) || version_utf8 (variable)
+    let mut payload = Vec::with_capacity(32 + version.len());
+    payload.extend_from_slice(&digest);
+    payload.extend_from_slice(version.as_bytes());
+
+    unsafe {
+        let payload_buf = alloc_buffer(&payload);
+        let sig_buf = alloc_buffer(&sig_bytes);
+        let pk_buf = alloc_buffer(&pk_bytes);
+        if payload_buf.is_null() || sig_buf.is_null() || pk_buf.is_null() {
+            return 0;
+        }
+        let ok = js_crypto_ed25519_verify(payload_buf as i64, sig_buf as i64, pk_buf as i64);
+        if ok == 1 {
+            1
+        } else {
+            0
+        }
+    }
+}
+
 /// Allocate a perry-runtime Buffer and copy `bytes` into it. Returns the
 /// registered `*mut BufferHeader` pointer, or null on alloc failure. Used
 /// to bridge owned Rust byte slices into the FFI shape the stdlib expects.
@@ -531,6 +643,119 @@ mod tests {
             ),
             0,
             "tampered file must fail"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Issue #229: version-bound signature verify (`_v2`).
+    ///
+    /// Three assertions:
+    ///   1. `(binary, sig_v2, version)` triple verifies cleanly when the
+    ///      signature was made over `digest || version`.
+    ///   2. **Old-binary replay defense**: if an attacker pairs a
+    ///      previously-signed v1 binary with a manifest claiming a higher
+    ///      version, the v2 verify path rejects it (because the original
+    ///      sig was made over digest only, not digest||"99.0.0").
+    ///   3. Empty-string version rejection (would reduce to v1 payload).
+    #[test]
+    fn signature_verify_v2_roundtrip_and_replay_defense() {
+        let dir =
+            std::env::temp_dir().join(format!("perry-updater-sig-v2-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("payload.bin");
+        let body = b"v2 signed binary contents";
+        std::fs::write(&file, body).unwrap();
+
+        // Test keypair (NEVER commit a real one).
+        let mut seed = [0u8; 32];
+        for (i, b) in seed.iter_mut().enumerate() {
+            *b = (i + 100) as u8; // distinct from v1 test seed
+        }
+        let signing = SigningKey::from_bytes(&seed);
+        let verifying = signing.verifying_key();
+
+        let mut h = Sha256::new();
+        h.update(body);
+        let digest = h.finalize();
+
+        // Build v2 payload: digest || version_utf8
+        let version = "1.2.3";
+        let mut v2_payload = Vec::with_capacity(32 + version.len());
+        v2_payload.extend_from_slice(&digest);
+        v2_payload.extend_from_slice(version.as_bytes());
+        let v2_sig = signing.sign(&v2_payload);
+        let v2_sig_b64 = base64::engine::general_purpose::STANDARD.encode(v2_sig.to_bytes());
+
+        let pk_b64 = base64::engine::general_purpose::STANDARD.encode(verifying.to_bytes());
+        let path_str = file.to_string_lossy().to_string();
+
+        // (1) Happy path: v2 sig + matching version.
+        assert_eq!(
+            perry_updater_verify_signature_v2(
+                make_str(&path_str),
+                make_str(&v2_sig_b64),
+                make_str(&pk_b64),
+                make_str(version),
+            ),
+            1,
+            "v2 signature with matching version should verify"
+        );
+
+        // (2) Old-binary replay defense: a v1-style sig (digest only —
+        // no version bound in) must FAIL v2 verify, even when the
+        // version label happens to match.
+        let v1_sig = signing.sign(&digest);
+        let v1_sig_b64 = base64::engine::general_purpose::STANDARD.encode(v1_sig.to_bytes());
+        assert_eq!(
+            perry_updater_verify_signature_v2(
+                make_str(&path_str),
+                make_str(&v1_sig_b64),
+                make_str(&pk_b64),
+                make_str(version),
+            ),
+            0,
+            "v1-style sig (digest only) must NOT verify against v2 path"
+        );
+
+        // (2b) Different version label fails verify.
+        assert_eq!(
+            perry_updater_verify_signature_v2(
+                make_str(&path_str),
+                make_str(&v2_sig_b64),
+                make_str(&pk_b64),
+                make_str("99.0.0"),
+            ),
+            0,
+            "tampered version label must fail v2 verify"
+        );
+
+        // (2c) Tampered binary fails verify.
+        std::fs::write(&file, b"TAMPERED v2 contents").unwrap();
+        assert_eq!(
+            perry_updater_verify_signature_v2(
+                make_str(&path_str),
+                make_str(&v2_sig_b64),
+                make_str(&pk_b64),
+                make_str(version),
+            ),
+            0,
+            "tampered binary must fail v2 verify"
+        );
+        std::fs::write(&file, body).unwrap();
+
+        // (3) Empty version is rejected up-front (would otherwise
+        // collapse the v2 payload to digest-only and accept any v1
+        // signature as a valid v2 signature).
+        assert_eq!(
+            perry_updater_verify_signature_v2(
+                make_str(&path_str),
+                make_str(&v2_sig_b64),
+                make_str(&pk_b64),
+                make_str(""),
+            ),
+            0,
+            "empty version must be rejected"
         );
 
         std::fs::remove_dir_all(&dir).ok();

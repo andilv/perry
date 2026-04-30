@@ -35,6 +35,10 @@ export function computeFileSha256(filePath: string): string;
  * (NOT the hex string, NOT the file bytes themselves). Sign side must
  * compute SHA-256 → sign the raw 32 bytes with the Ed25519 secret key.
  *
+ * **Use only with manifest schemaVersion 1**. Manifests at
+ * schemaVersion 2+ MUST use `verifySignatureV2` so the version is
+ * bound into the signed payload (see #229 — old-binary replay defense).
+ *
  * @param sigB64    base64-encoded 64-byte signature
  * @param pubkeyB64 base64-encoded 32-byte public key
  * Returns 1 on valid signature, 0 on any error (size, decode, mismatch).
@@ -43,6 +47,37 @@ export function verifySignature(
   filePath: string,
   sigB64: string,
   pubkeyB64: string,
+): number;
+
+/**
+ * **Issue #229**: version-bound Ed25519 signature verification.
+ *
+ * The signed payload is **`SHA256(file) || version_utf8`** — 32 bytes
+ * of raw digest followed by the UTF-8 bytes of the version string.
+ * This binds the version into the signature so an on-path attacker
+ * can't replay a previously-signed older binary as a "new version" by
+ * pairing the old binary's URL + signature with a higher version
+ * number in a tampered manifest.
+ *
+ * Manifest schemaVersion 2+ uses this path. v1 manifests stay on
+ * `verifySignature` (digest-only); the @perry/updater wrapper
+ * dispatches based on `manifest.schemaVersion`.
+ *
+ * Sign side: `payload = sha256(binary).digest() + version.encode("utf-8")`,
+ * then sign `payload` with the Ed25519 secret key.
+ *
+ * Empty `version` is rejected (would let a v1 signature pass v2 verify).
+ *
+ * @param sigB64    base64-encoded 64-byte signature over digest||version
+ * @param pubkeyB64 base64-encoded 32-byte public key
+ * @param version   UTF-8 version string — exact bytes the manifest claims
+ * Returns 1 on valid signature, 0 on any error.
+ */
+export function verifySignatureV2(
+  filePath: string,
+  sigB64: string,
+  pubkeyB64: string,
+  version: string,
 ): number;
 
 /**

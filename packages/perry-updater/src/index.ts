@@ -11,6 +11,7 @@ import {
   compareVersions,
   verifyHash,
   verifySignature,
+  verifySignatureV2,
   computeFileSha256,
   writeSentinel,
   readSentinel,
@@ -164,7 +165,11 @@ export async function checkForUpdate(opts: UpdaterOptions): Promise<Update | nul
   }
   const manifest = (await res.json()) as UpdateManifest;
 
-  if (manifest.schemaVersion !== 1) {
+  // schemaVersion 1: signed payload is `SHA256(binary)` (legacy, vulnerable to
+  // old-binary replay — see #229).
+  // schemaVersion 2: signed payload is `SHA256(binary) || version_utf8`
+  // (recommended, version-bound).
+  if (manifest.schemaVersion !== 1 && manifest.schemaVersion !== 2) {
     throw new Error(`updater: unsupported manifest schemaVersion ${manifest.schemaVersion}`);
   }
 
@@ -186,7 +191,14 @@ export async function checkForUpdate(opts: UpdaterOptions): Promise<Update | nul
     stagedPath,
     targetPath,
     async download(onProgress) {
-      await downloadAndVerify(asset, stagedPath, opts.publicKey, onProgress);
+      await downloadAndVerify(
+        asset,
+        stagedPath,
+        opts.publicKey,
+        manifest.version,
+        manifest.schemaVersion,
+        onProgress,
+      );
     },
     async installAndRelaunch() {
       await applyAndRelaunch(stagedPath, targetPath, opts.currentVersion, manifest.version);
@@ -305,6 +317,8 @@ async function downloadAndVerify(
   asset: PlatformAsset,
   stagedPath: string,
   publicKey: string,
+  version: string,
+  schemaVersion: number,
   onProgress?: (downloaded: number, total: number) => void,
 ): Promise<void> {
   assertSecureUrl(asset.url, "asset");
@@ -338,8 +352,19 @@ async function downloadAndVerify(
       `updater: SHA-256 mismatch — expected ${asset.sha256}, got ${actual}`,
     );
   }
-  if (verifySignature(stagedPath, asset.signature, publicKey) !== 1) {
-    throw new Error(`updater: Ed25519 signature verification failed`);
+
+  // Issue #229: pick verify path based on manifest schemaVersion.
+  // - v1: signature over `SHA256(binary)` only (legacy)
+  // - v2: signature over `SHA256(binary) || version_utf8` (binds version
+  //       into the signed payload, defeats old-binary replay)
+  const sigOk =
+    schemaVersion === 2
+      ? verifySignatureV2(stagedPath, asset.signature, publicKey, version)
+      : verifySignature(stagedPath, asset.signature, publicKey);
+  if (sigOk !== 1) {
+    throw new Error(
+      `updater: Ed25519 signature verification failed (schemaVersion ${schemaVersion})`,
+    );
   }
 }
 

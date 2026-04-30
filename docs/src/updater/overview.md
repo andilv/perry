@@ -57,13 +57,13 @@ publish for; clients ignore entries that don't match their platform.
 
 | Field | Meaning |
 |-------|---------|
-| `schemaVersion` | Always `1` for now. Bump when the wire format changes. |
+| `schemaVersion` | `1` (legacy, digest-only signature) or `2` (recommended — version-bound signature; see below). |
 | `version` | Semver string of the offered version (e.g. `"1.4.0"`). |
 | `pubDate` | ISO-8601 timestamp the build was published — surfaced as metadata. |
 | `notes` | Markdown release notes shown to the user. |
 | `platforms.<os>-<arch>.url` | Direct download URL (HTTPS). |
 | `platforms.<os>-<arch>.sha256` | Lowercase hex SHA-256 of the binary. |
-| `platforms.<os>-<arch>.signature` | Base64 Ed25519 signature over the raw 32-byte digest. |
+| `platforms.<os>-<arch>.signature` | Base64 Ed25519 signature. v1: over the raw 32-byte digest. v2: over `digest \|\| version_utf8`. |
 | `platforms.<os>-<arch>.size` | Byte length of the binary — used for progress reporting. |
 
 Platform keys are canonical Rust-style triples:
@@ -78,18 +78,63 @@ Platform keys are canonical Rust-style triples:
 
 ## Trust model
 
-The signed payload is the **raw 32-byte SHA-256 digest** of the binary —
-*not* the hex string and *not* the file bytes themselves. Sign side:
+### `schemaVersion: 2` (recommended) — version-bound signature
+
+The signed payload is `SHA256(binary) || version_utf8` — the 32-byte
+raw digest concatenated with the UTF-8 bytes of the version string.
+This binds the version into the signature, so an on-path attacker
+can't replay a previously-signed older binary as a "new version" by
+serving a manifest that pairs the old binary's URL + signature with a
+higher version number ([#229](https://github.com/PerryTS/perry/issues/229)).
+
+Sign side:
 
 ```text
-sha256(binary) -> 32 raw bytes -> ed25519_sign(secret_key) -> 64-byte signature
+payload = sha256(binary).digest() + version.encode("utf-8")
+signature = ed25519_sign(secret_key, payload)  # 64-byte signature
 ```
 
 Verification on the client:
 
 1. SHA-256 the downloaded file. Reject if it doesn't match `manifest.sha256`.
-2. Re-hash and Ed25519-verify the signature against the bundled public key.
-3. Reject on any decode error, size mismatch, or signature failure.
+2. Build the v2 payload (`digest || version_utf8`) using `manifest.version`.
+3. Ed25519-verify the signature against the bundled public key.
+4. Reject on any decode error, size mismatch, or signature failure.
+
+If an attacker swaps the manifest's `version` field while keeping the
+old `signature`, step 3 fails because the signature was made over the
+*original* version. If they swap both `version` and `signature` (using
+a previously-signed older binary), step 1 fails because `sha256` of
+the older binary doesn't match the rewritten higher-version label
+either — every plausible attack on the version metadata invalidates
+something.
+
+### `schemaVersion: 1` (legacy, digest-only)
+
+The signed payload is the raw 32-byte digest only. **This shape is
+vulnerable to old-binary replay** ([#229](https://github.com/PerryTS/perry/issues/229)):
+an on-path attacker can serve a manifest claiming a higher version
+while pointing at a previously-signed older binary, and signature
+verification still passes because the version isn't bound into the
+signature. Existing v1 manifests stay supported by the client during
+migration; new deployments should use v2.
+
+### Migration
+
+`@perry/updater` v0.5.391+ accepts both `schemaVersion: 1` and
+`schemaVersion: 2`. Bumping your manifest from 1 → 2 requires:
+
+1. Update sign-side tooling to compute the new payload
+   (`sha256(binary) + version.encode("utf-8")`) and sign that.
+2. Bump `schemaVersion` in the manifest from `1` to `2`.
+3. Make sure all deployed clients are running a perry-updater version
+   that knows about v2 BEFORE you publish a v2 manifest. Older clients
+   reject `schemaVersion: 2` with an `unsupported manifest schemaVersion`
+   error. (Plan: ship a perry-updater bump with v2 support to your
+   users via a v1 manifest first; once they're on the v2-aware client,
+   the next manifest can be v2.)
+
+### Keypair
 
 You generate the keypair once and bake the public key into your app at
 build time; the secret key stays on a release-signing machine alongside
