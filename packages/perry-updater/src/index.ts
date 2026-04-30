@@ -59,7 +59,12 @@ export interface Update {
 }
 
 export interface UpdaterOptions {
-  /** Manifest URL (HTTPS). */
+  /**
+   * Manifest URL. **MUST be `https://`** in production. The runtime
+   * rejects non-HTTPS URLs except for loopback addresses
+   * (`127.0.0.1`, `[::1]`, `localhost`) which are allowed for local
+   * smoke tests. See #228 for the threat model.
+   */
   manifestUrl: string;
   /** Base64-encoded Ed25519 public key (32 bytes raw). */
   publicKey: string;
@@ -79,6 +84,51 @@ export interface InitOptions {
 // ---------------------------------------------------------------------------
 // Platform key
 // ---------------------------------------------------------------------------
+
+/**
+ * Issue #228: enforce HTTPS on the manifest URL and on each asset URL.
+ *
+ * Signature pinning protects the integrity of the downloaded code, but
+ * an on-path attacker on a non-HTTPS connection can still:
+ *   - Suppress legitimate updates (rewrite manifest fetch to claim
+ *     "you're up to date").
+ *   - Push a downgrade to a still-validly-signed older version that
+ *     has a known vulnerability fixed upstream.
+ *
+ * HTTPS doesn't prevent (2) without #229's version-binding fix, but it
+ * raises the bar from "any cafe wifi" to "compromised CA / TLS
+ * interception" and stops (1) cold.
+ *
+ * Loopback addresses (127.0.0.1, [::1], localhost) are allowed for local
+ * smoke tests — see scripts/smoke_updater.{sh,ps1} which serve the
+ * manifest from http://127.0.0.1:$PORT.
+ */
+function assertSecureUrl(url: string, kind: "manifest" | "asset"): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`updater: ${kind} URL is not a valid URL: ${url}`);
+  }
+  if (parsed.protocol === "https:") return;
+  if (parsed.protocol === "http:") {
+    const host = parsed.hostname.toLowerCase();
+    // IPv6 hostnames in URL.hostname include the brackets stripped.
+    const isLoopback =
+      host === "localhost" ||
+      host === "127.0.0.1" ||
+      host === "::1" ||
+      host === "[::1]";
+    if (isLoopback) return;
+    throw new Error(
+      `updater: ${kind} URL must use https:// (got http://${parsed.hostname}). ` +
+      `Loopback (127.0.0.1, ::1, localhost) is allowed for local testing.`,
+    );
+  }
+  throw new Error(
+    `updater: ${kind} URL must use https:// (got ${parsed.protocol}//).`,
+  );
+}
 
 function platformKey(): string {
   // os.platform() returns "darwin" / "linux" / "win32"; os.arch() returns
@@ -107,6 +157,7 @@ function platformKey(): string {
  * Returns null when up to date or no asset is published for this platform.
  */
 export async function checkForUpdate(opts: UpdaterOptions): Promise<Update | null> {
+  assertSecureUrl(opts.manifestUrl, "manifest");
   const res = await fetch(opts.manifestUrl);
   if (!res.ok) {
     throw new Error(`updater: manifest fetch failed: ${res.status}`);
@@ -256,6 +307,7 @@ async function downloadAndVerify(
   publicKey: string,
   onProgress?: (downloaded: number, total: number) => void,
 ): Promise<void> {
+  assertSecureUrl(asset.url, "asset");
   const res = await fetch(asset.url);
   if (!res.ok) {
     throw new Error(`updater: download failed: ${res.status}`);
