@@ -6539,10 +6539,15 @@ pub(crate) fn lower_expr(ctx: &mut LoweringContext, expr: &ast::Expr) -> Result<
                         _ => return Err(anyhow!("Unsupported optional chain property type")),
                     };
 
-                    // Generate: obj == null ? undefined : prop_expr
+                    // Issue #388: optional chaining short-circuits on
+                    // null OR undefined per spec. Use `LooseEq` so the
+                    // comparison `obj == null` matches both — strict
+                    // `===` only matches null, leaving undefined to
+                    // fall through and dereference (returning
+                    // `[object Object]` for Map.get's missing value).
                     Ok(Expr::Conditional {
                         condition: Box::new(Expr::Compare {
-                            op: CompareOp::Eq,
+                            op: CompareOp::LooseEq,
                             left: Box::new(obj_expr),
                             right: Box::new(Expr::Null),
                         }),
@@ -6667,10 +6672,16 @@ pub(crate) fn lower_expr(ctx: &mut LoweringContext, expr: &ast::Expr) -> Result<
                         })
                     };
 
-                    // Wrap in conditional: check_expr == null ? undefined : call_expr
+                    // Issue #388: optional chaining short-circuits on
+                    // null OR undefined per spec. Use `LooseEq` so the
+                    // comparison `check_expr == null` matches both —
+                    // strict `===` only matches null, leaving
+                    // undefined to fall through and produce
+                    // `[object Object]` (or worse) when the receiver
+                    // is `Map.get(missing)` etc.
                     Ok(Expr::Conditional {
                         condition: Box::new(Expr::Compare {
-                            op: CompareOp::Eq,
+                            op: CompareOp::LooseEq,
                             left: Box::new(check_expr),
                             right: Box::new(Expr::Null),
                         }),
