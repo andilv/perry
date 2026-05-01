@@ -44,10 +44,10 @@ fn apply_box_style(ctx: &mut FnCtx<'_>, parent_slot: &str, style_arg: &Expr) -> 
     for (key, val) in &props {
         // Reload parent handle each iteration so the SSA name is
         // valid in the current block (apply_inline_style does the
-        // same thing).
+        // same thing). The slot holds a raw i64 handle now (see the
+        // Box recognizer's call to js_perry_tui_box) so no unbox.
         let blk = ctx.block();
-        let parent_d = blk.load(DOUBLE, parent_slot);
-        let parent_handle = unbox_to_i64(blk, &parent_d);
+        let parent_handle = blk.load(I64, parent_slot);
         match key.as_str() {
             "flexDirection" => {
                 let s = get_raw_string_ptr(ctx, val)?;
@@ -215,17 +215,22 @@ pub(crate) fn lower_native_method_call(
     // to the regular PERRY_UI_TABLE dispatch (just emits js_perry_tui_box).
     // (#358 Phases 1 + 3.)
     if module == "perry/tui" && method == "Box" && object.is_none() && !args.is_empty() {
+        // Note: js_perry_tui_box returns I64 (raw handle); the
+        // dispatch table's NR_PTR contract NaN-boxes it for the
+        // outer call. The special-case path here mirrors that — call
+        // returns I64, store in an I64 slot, NaN-box at the very end
+        // when handing off to the caller.
         ctx.pending_declares
-            .push(("js_perry_tui_box".to_string(), DOUBLE, vec![]));
+            .push(("js_perry_tui_box".to_string(), I64, vec![]));
         ctx.pending_declares.push((
             "js_perry_tui_box_add_child".to_string(),
             DOUBLE,
             vec![I64, I64],
         ));
         let blk = ctx.block();
-        let parent_d = blk.call(DOUBLE, "js_perry_tui_box", &[]);
-        let parent_slot = ctx.func.alloca_entry(DOUBLE);
-        ctx.block().store(DOUBLE, &parent_d, &parent_slot);
+        let parent_handle = blk.call(I64, "js_perry_tui_box", &[]);
+        let parent_slot = ctx.func.alloca_entry(I64);
+        ctx.block().store(I64, &parent_handle, &parent_slot);
 
         // Determine which arg is the style-options object and which
         // is the children array. The classification is structural —
@@ -261,11 +266,10 @@ pub(crate) fn lower_native_method_call(
                     let child_box = lower_expr(ctx, child)?;
                     let blk = ctx.block();
                     let child_handle = unbox_to_i64(blk, &child_box);
-                    let parent_reload = blk.load(DOUBLE, &parent_slot);
-                    let parent_handle = unbox_to_i64(blk, &parent_reload);
+                    let parent_reload = blk.load(I64, &parent_slot);
                     blk.call_void(
                         "js_perry_tui_box_add_child",
-                        &[(I64, &parent_handle), (I64, &child_handle)],
+                        &[(I64, &parent_reload), (I64, &child_handle)],
                     );
                 }
             } else {
@@ -274,8 +278,10 @@ pub(crate) fn lower_native_method_call(
         }
 
         let blk = ctx.block();
-        let parent_final = blk.load(DOUBLE, &parent_slot);
-        return Ok(parent_final);
+        let parent_final = blk.load(I64, &parent_slot);
+        // NaN-box the handle into a POINTER-tagged f64 — same as the
+        // dispatch table's NR_PTR contract.
+        return Ok(nanbox_pointer_inline(blk, &parent_final));
     }
 
     // perry/ui VStack/HStack — special-case because the TS shape is

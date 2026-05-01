@@ -95,6 +95,44 @@ declare module "perry/tui" {
     export function ProgressBar(value: number, max: number, width: number): Widget;
 
     /**
+     * Animated character cycling through `-\|/` based on a frame
+     * counter. Caller bumps the frame number from a state slot to
+     * animate (`Spinner(frame.get())` inside the component, with a
+     * `setInterval(() => frame.set(frame.get() + 1), 100)` driver).
+     */
+    export function Spinner(frame: number): Widget;
+
+    /**
+     * Single-line text input renderer. Shows `value` followed by a
+     * `_` cursor character. Wire keypresses via `useInput` and
+     * mutate the value state — the widget itself is purely visual.
+     *
+     * v1 limitation: cursor is always at the end. Cursor
+     * repositioning lands in v1.5.
+     */
+    export function Input(value: string): Widget;
+
+    /**
+     * Vertical list of items as a Box of Text children. The
+     * `selected` index (default -1 = no selection) is rendered with
+     * reverse-video.
+     */
+    export function List(items: string[], selected?: number): Widget;
+
+    /**
+     * List with an enforced selection. Caller's state holds the
+     * selected index.
+     */
+    export function Select(items: string[], selected: number): Widget;
+
+    /**
+     * Multi-line text renderer. Splits `value` on `\n` and emits
+     * one Text per line inside a column-layout Box. Wire keypresses
+     * via `useInput` to edit.
+     */
+    export function TextArea(value: string): Widget;
+
+    /**
      * Allocate a reactive state slot with the given initial value.
      */
     export function state<T>(initial: T): State<T>;

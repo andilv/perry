@@ -2038,8 +2038,9 @@ pub(crate) fn lower_call(ctx: &mut FnCtx<'_>, callee: &Expr, args: &[Expr]) -> R
         // runtime's `CLASS_VTABLE_REGISTRY` (populated by v0.5.464's
         // `js_register_class_method` calls in `emit_string_pool`) dispatches
         // to the real `perry_method_<modprefix>__<class>__<method>`.
-        let class_unknown_to_codegen =
-            class_name_opt.as_ref().is_some_and(|n| !ctx.classes.contains_key(n));
+        let class_unknown_to_codegen = class_name_opt
+            .as_ref()
+            .is_some_and(|n| !ctx.classes.contains_key(n));
         let skip_native = matches!(object.as_ref(), Expr::GlobalGet(_))
             || (class_name_opt.is_some() && !is_buffer_class && !class_unknown_to_codegen);
         if !skip_native {
@@ -7176,6 +7177,52 @@ const NATIVE_MODULE_TABLE: &[NativeModSig] = &[
         class_filter: None,
         runtime: "js_perry_tui_progress_bar",
         args: &[NA_F64, NA_F64, NA_F64],
+        ret: NR_PTR,
+    },
+    // perry/tui Phase 4.5 — Spinner / Input / List / Select / TextArea.
+    NativeModSig {
+        module: "perry/tui",
+        has_receiver: false,
+        method: "Spinner",
+        class_filter: None,
+        runtime: "js_perry_tui_spinner",
+        args: &[NA_F64],
+        ret: NR_PTR,
+    },
+    NativeModSig {
+        module: "perry/tui",
+        has_receiver: false,
+        method: "Input",
+        class_filter: None,
+        runtime: "js_perry_tui_input",
+        args: &[NA_STR],
+        ret: NR_PTR,
+    },
+    NativeModSig {
+        module: "perry/tui",
+        has_receiver: false,
+        method: "List",
+        class_filter: None,
+        runtime: "js_perry_tui_list",
+        args: &[NA_PTR, NA_F64],
+        ret: NR_PTR,
+    },
+    NativeModSig {
+        module: "perry/tui",
+        has_receiver: false,
+        method: "Select",
+        class_filter: None,
+        runtime: "js_perry_tui_select",
+        args: &[NA_PTR, NA_F64],
+        ret: NR_PTR,
+    },
+    NativeModSig {
+        module: "perry/tui",
+        has_receiver: false,
+        method: "TextArea",
+        class_filter: None,
+        runtime: "js_perry_tui_text_area",
+        args: &[NA_STR],
         ret: NR_PTR,
     },
     // ========== readline (#347 Phase 1) ==========
