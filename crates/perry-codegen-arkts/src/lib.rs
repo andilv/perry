@@ -374,9 +374,12 @@ fn inlined_analysis_init(module: &Module) -> Vec<Stmt> {
     }
 
     let mut next_local: u32 = max_local_id_in_module(module).saturating_add(1);
-    let mut budget: usize = 16;
+    let mut budget: usize = 32;
     let mut visited: HashSet<FuncId> = HashSet::new();
 
+    // Phase A: top-level `Stmt::Expr(Call(FuncRef))` inlining (the
+    // original v0.5.489 behavior). For each top-level user-function
+    // call, splice the body in place of the call statement.
     let mut new_init: Vec<Stmt> = Vec::with_capacity(module.init.len());
     for stmt in &module.init {
         if budget == 0 {
@@ -415,7 +418,231 @@ fn inlined_analysis_init(module: &Module) -> Vec<Stmt> {
             _ => new_init.push(stmt.clone()),
         }
     }
+
+    // Phase B: expression-level inlining inside the inlined bodies.
+    // Walks every Stmt's expressions and substitutes:
+    //   - `Expr::Call { callee: FuncRef(id) }` (top-level fn call)
+    //   - `Expr::Call { callee: LocalGet(id) }` where bindings[id]
+    //     is `Expr::Closure { ... }` (Mango's `function makePill`
+    //     nested inside refreshConnectionList lowers to this shape:
+    //     `Stmt::Let { id: 297, init: Closure { ... } }`)
+    // with the function's return value, hoisting the body's let-and-
+    // mutator statements BEFORE the enclosing Stmt.
+    // Mango's pattern: `const pillRow = HStack(8, [makePill('A'),
+    // makePill('B')])` — each makePill call's body gets hoisted, and
+    // the call expression is replaced with `LocalGet(remapped_pill)`.
+    // Both calls run before pillRow is constructed, so the array
+    // literal's items resolve cleanly.
+    let local_bindings_for_inline = collect_const_bindings(&new_init);
+    new_init = expr_level_inline_pass(
+        new_init,
+        &function_map,
+        &local_bindings_for_inline,
+        &mut next_local,
+        &mut budget,
+    );
+
     new_init
+}
+
+/// Phase B of inlining: walk every Stmt's expressions and substitute
+/// `Expr::Call { callee: FuncRef(id) }` with the function's return
+/// value, hoisting the function body's statements BEFORE the enclosing
+/// Stmt. Each found Call gets its body inlined (with locals remapped
+/// to fresh ids) and the call expression is replaced with `LocalGet(
+/// remapped_return_id)`.
+///
+/// The function's return value is detected by walking its body
+/// backwards looking for `Stmt::Return(Some(expr))`. If the expr is
+/// `Expr::LocalGet(id)`, that local id is the return target (after
+/// remapping). If the body has no `Return` or returns a non-LocalGet
+/// expression, the call is left as-is — the simple-shape constraint
+/// covers Mango's makePill but punts on more complex returning fns.
+fn expr_level_inline_pass(
+    stmts: Vec<Stmt>,
+    function_map: &HashMap<perry_types::FuncId, perry_hir::ir::Function>,
+    bindings: &HashMap<LocalId, Expr>,
+    next_local: &mut u32,
+    budget: &mut usize,
+) -> Vec<Stmt> {
+    let mut out: Vec<Stmt> = Vec::with_capacity(stmts.len());
+    for mut stmt in stmts {
+        if *budget == 0 {
+            out.push(stmt);
+            continue;
+        }
+        let mut hoists: Vec<Stmt> = Vec::new();
+        inline_calls_in_stmt(&mut stmt, function_map, bindings, next_local, budget, &mut hoists);
+        out.extend(hoists);
+        out.push(stmt);
+    }
+    out
+}
+
+fn inline_calls_in_stmt(
+    stmt: &mut Stmt,
+    function_map: &HashMap<perry_types::FuncId, perry_hir::ir::Function>,
+    bindings: &HashMap<LocalId, Expr>,
+    next_local: &mut u32,
+    budget: &mut usize,
+    hoists: &mut Vec<Stmt>,
+) {
+    match stmt {
+        Stmt::Let { init: Some(e), .. } => {
+            inline_calls_in_expr(e, function_map, bindings, next_local, budget, hoists);
+        }
+        Stmt::Expr(e) => {
+            inline_calls_in_expr(e, function_map, bindings, next_local, budget, hoists)
+        }
+        Stmt::Return(Some(e)) => {
+            inline_calls_in_expr(e, function_map, bindings, next_local, budget, hoists)
+        }
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            inline_calls_in_expr(condition, function_map, bindings, next_local, budget, hoists);
+            // Recurse into branches: their own hoists land within the
+            // branch, not above the if.
+            *then_branch = expr_level_inline_pass(
+                std::mem::take(then_branch),
+                function_map,
+                bindings,
+                next_local,
+                budget,
+            );
+            if let Some(eb) = else_branch {
+                *eb = expr_level_inline_pass(
+                    std::mem::take(eb),
+                    function_map,
+                    bindings,
+                    next_local,
+                    budget,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn inline_calls_in_expr(
+    expr: &mut Expr,
+    function_map: &HashMap<perry_types::FuncId, perry_hir::ir::Function>,
+    bindings: &HashMap<LocalId, Expr>,
+    next_local: &mut u32,
+    budget: &mut usize,
+    hoists: &mut Vec<Stmt>,
+) {
+    use perry_hir::analysis::remap_local_ids_in_stmts;
+    // First descend into sub-expressions (post-order: children inlined
+    // first so a call's args might themselves be inlined calls).
+    match expr {
+        Expr::Call { callee, args, .. } => {
+            for a in args.iter_mut() {
+                inline_calls_in_expr(a, function_map, bindings, next_local, budget, hoists);
+            }
+            inline_calls_in_expr(callee, function_map, bindings, next_local, budget, hoists);
+        }
+        Expr::NativeMethodCall { args, object, .. } => {
+            for a in args.iter_mut() {
+                inline_calls_in_expr(a, function_map, bindings, next_local, budget, hoists);
+            }
+            if let Some(obj) = object {
+                inline_calls_in_expr(obj, function_map, bindings, next_local, budget, hoists);
+            }
+        }
+        Expr::Array(items) => {
+            for item in items.iter_mut() {
+                inline_calls_in_expr(item, function_map, bindings, next_local, budget, hoists);
+            }
+        }
+        Expr::Object(props) => {
+            for (_, v) in props.iter_mut() {
+                inline_calls_in_expr(v, function_map, bindings, next_local, budget, hoists);
+            }
+        }
+        Expr::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            inline_calls_in_expr(condition, function_map, bindings, next_local, budget, hoists);
+            inline_calls_in_expr(then_expr, function_map, bindings, next_local, budget, hoists);
+            inline_calls_in_expr(else_expr, function_map, bindings, next_local, budget, hoists);
+        }
+        _ => {}
+    }
+    // Now check if THIS expression is a Call we can inline. Resolve
+    // the callee through:
+    //   - Expr::FuncRef(id): module-level user function in function_map
+    //   - Expr::LocalGet(id) → bindings[id] = Expr::Closure: nested
+    //     function declared via `function name() { ... }` inside
+    //     another function (Mango's `makePill` shape — lowered to
+    //     `Stmt::Let { id, init: Closure { params, body, ... } }`).
+    if *budget == 0 {
+        return;
+    }
+    let (params, body, args) = match expr {
+        Expr::Call { callee, args, .. } => match callee.as_ref() {
+            Expr::FuncRef(id) => match function_map.get(id) {
+                Some(func) if func.params.len() == args.len() => (
+                    func.params.clone(),
+                    func.body.clone(),
+                    args.clone(),
+                ),
+                _ => return,
+            },
+            Expr::LocalGet(local_id) => match bindings.get(local_id) {
+                Some(Expr::Closure {
+                    params,
+                    body,
+                    is_async: false,
+                    ..
+                }) if params.len() == args.len() => {
+                    (params.clone(), body.clone(), args.clone())
+                }
+                _ => return,
+            },
+            _ => return,
+        },
+        _ => return,
+    };
+    // Detect simple-return shape: last `Stmt::Return(Some(LocalGet(id)))`.
+    // Anything else (no return, return non-local, multiple returns) is
+    // out of scope — leaves the call as-is.
+    if !matches!(
+        body.last(),
+        Some(Stmt::Return(Some(Expr::LocalGet(_))))
+    ) {
+        return;
+    }
+    // Build a synthetic Function so `inline_one_call` can do its
+    // standard remapping work. Re-uses the existing helper rather
+    // than duplicating the local-id offset / param-substitution logic.
+    let synth_func = perry_hir::ir::Function {
+        id: 0,
+        name: String::new(),
+        type_params: Vec::new(),
+        params,
+        return_type: perry_types::Type::Any,
+        body,
+        is_async: false,
+        is_generator: false,
+        is_exported: false,
+        captures: Vec::new(),
+        decorators: Vec::new(),
+        was_plain_async: false,
+    };
+    let mut inlined = inline_one_call(&synth_func, &args, next_local, &remap_local_ids_in_stmts);
+    let return_remapped = match inlined.last() {
+        Some(Stmt::Return(Some(Expr::LocalGet(id)))) => *id,
+        _ => return,
+    };
+    inlined.pop(); // drop the trailing Return
+    hoists.extend(inlined);
+    *expr = Expr::LocalGet(return_remapped);
+    *budget -= 1;
 }
 
 fn inline_one_call(
@@ -438,7 +665,37 @@ fn inline_one_call(
         *next_local += 1;
     }
 
-    let mut body = func.body.clone();
+    // Rewrite early-return patterns to if/else before remapping. Mango's
+    // `refreshConnectionList`:
+    //
+    //     if (connectionNames.length === 0) {
+    //         /* welcome card */
+    //         widgetAddChild(connListContainer, welcomeCard);
+    //         return;
+    //     }
+    //     const sectionTitle = ...;
+    //     widgetAddChild(connListContainer, sectionTitle);
+    //     /* connection-list build */
+    //     widgetAddChild(connListContainer, addMoreBtn);
+    //
+    // After rewrite the rest of the body becomes the else branch:
+    //
+    //     if (connectionNames.length === 0) {
+    //         /* welcome card */
+    //         widgetAddChild(connListContainer, welcomeCard);
+    //     } else {
+    //         const sectionTitle = ...;
+    //         /* ... */
+    //         widgetAddChild(connListContainer, addMoreBtn);
+    //     }
+    //
+    // collect_mutations's dead-branch elim then picks ONE branch (the
+    // then-branch heuristic when the condition is unfoldable / unclean
+    // serializable). Without this rewrite both the welcomeCard's CTA
+    // button AND the addMoreBtn would render unconditionally because
+    // the addMoreBtn lives at the function-body sibling level rather
+    // than inside an else block.
+    let mut body = rewrite_early_returns(func.body.clone());
     remap_fn(&mut body, &remap);
     // perry-hir's `remap_local_ids_in_stmts` only walks Stmt::Let's init,
     // not the Let's `id` field itself (its #212 design constraint:
@@ -488,6 +745,80 @@ fn max_local_id_in_module(module: &Module) -> u32 {
         }
     }
     buf.into_iter().max().unwrap_or(0)
+}
+
+/// Rewrite `if (cond) { ...; return; } <rest>` → `if (cond) { ... }
+/// else { <rest> }` so dead-branch elim can correctly drop one or the
+/// other. Stops walking after the first such pattern (the rest moved
+/// into the else). Recurses into nested if/else / for / while bodies.
+fn rewrite_early_returns(stmts: Vec<Stmt>) -> Vec<Stmt> {
+    let mut out: Vec<Stmt> = Vec::with_capacity(stmts.len());
+    let mut iter = stmts.into_iter();
+    while let Some(stmt) = iter.next() {
+        match stmt {
+            Stmt::If {
+                condition,
+                then_branch,
+                else_branch: None,
+            } if matches!(then_branch.last(), Some(Stmt::Return(_))) => {
+                // Found the early-return pattern. Pull the trailing
+                // return out of the then-branch (it's redundant once
+                // the rest is in the else), and gather all remaining
+                // siblings into a new else-branch. Recurse into both
+                // branches so nested patterns are handled too.
+                let mut new_then = rewrite_early_returns(then_branch);
+                new_then.pop(); // drop the trailing Return
+                let rest: Vec<Stmt> = iter.collect();
+                let new_else = rewrite_early_returns(rest);
+                out.push(Stmt::If {
+                    condition,
+                    then_branch: new_then,
+                    else_branch: Some(new_else),
+                });
+                return out;
+            }
+            Stmt::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                let new_then = rewrite_early_returns(then_branch);
+                let new_else = else_branch.map(rewrite_early_returns);
+                out.push(Stmt::If {
+                    condition,
+                    then_branch: new_then,
+                    else_branch: new_else,
+                });
+            }
+            Stmt::While { condition, body } => {
+                out.push(Stmt::While {
+                    condition,
+                    body: rewrite_early_returns(body),
+                });
+            }
+            Stmt::DoWhile { body, condition } => {
+                out.push(Stmt::DoWhile {
+                    body: rewrite_early_returns(body),
+                    condition,
+                });
+            }
+            Stmt::For {
+                init,
+                condition,
+                update,
+                body,
+            } => {
+                out.push(Stmt::For {
+                    init,
+                    condition,
+                    update,
+                    body: rewrite_early_returns(body),
+                });
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Walk Stmt::Let / catch-param / Stmt::For-init looking for declared
@@ -717,6 +1048,32 @@ fn collect_mutations_in_stmt(
                 // resolved branch isn't a real if/else from the
                 // emitter's perspective.
                 for s in live {
+                    collect_mutations_in_stmt(
+                        s,
+                        enclosing.clone(),
+                        out,
+                        group_counter,
+                        bindings,
+                        compile_time_consts,
+                    );
+                }
+                return;
+            }
+            // v0.5.490 — when evaluate_condition can't fold but the
+            // condition wouldn't cleanly serialize either (PropertyGet
+            // on unresolvable LocalGet, function call, etc.),
+            // serialize_condition will degrade the emit to `if (true)
+            // {...} else {...}`. Both branches would render — and the
+            // else-branch is dead source-wise. Walk only the then-
+            // branch in this case to avoid duplicate-content emission
+            // (Mango: the welcome-card branch's CTA button + the
+            // connection-list branch's addMoreBtn both rendering as
+            // "+ New Connection"). Same heuristic as the
+            // Expr::Conditional emit_widget pick-then-branch fallback
+            // and the v0.5.487 unresolvable-LocalGet "true" fallback,
+            // unified.
+            if !is_cleanly_serializable_condition(condition, bindings, compile_time_consts) {
+                for s in then_branch {
                     collect_mutations_in_stmt(
                         s,
                         enclosing.clone(),
@@ -2029,7 +2386,7 @@ fn emit_widget(
             ..
         } if m == "perry/ui" => {
             let core = match method.as_str() {
-                "Text" => emit_text(args, text_slots, arkts_locals),
+                "Text" => emit_text(args, text_slots, arkts_locals, bindings),
                 "VStack" => emit_stack(
                     "Column",
                     args,
@@ -2658,14 +3015,19 @@ fn emit_text(
     args: &[Expr],
     text_slots: &mut Vec<TextSlot>,
     arkts_locals: &HashMap<LocalId, String>,
+    bindings: &HashMap<LocalId, Expr>,
 ) -> String {
     // Phase 2 v5: inside a ForEach body, `Text(item)` where `item` is
     // the closure's loop param resolves via arkts_locals → `Text(__item)`.
     let first = args.first();
     let content_str = match first {
         Some(Expr::String(content)) => Some(arkts_string_lit(content)),
-        Some(Expr::LocalGet(id)) => arkts_locals.get(id).cloned(),
-        _ => None,
+        Some(Expr::LocalGet(id)) if arkts_locals.contains_key(id) => arkts_locals.get(id).cloned(),
+        // Fallback: try to resolve through bindings + Conditional +
+        // I18nString (perry/i18n's `t('key')` lowers to I18nString).
+        // This catches Mango's `Text(t('Welcome to Mango'))` shape.
+        Some(other) => resolve_string_arg(other, bindings).map(|s| arkts_string_lit(&s)),
+        None => None,
     };
     let Some(content_arg) = content_str else {
         return "Text('[non-literal Text arg]').fontSize(20).fontColor('#888888')".to_string();
@@ -3353,6 +3715,24 @@ fn resolve_string_arg(expr: &Expr, bindings: &HashMap<LocalId, Expr>) -> Option<
                     Some(false) => else_expr,
                     _ => then_expr,
                 };
+            }
+            // `t('key')` from `perry/i18n` lowers to an
+            // `Expr::I18nString { key, ... }`. Use the key as the
+            // string fallback — for Mango (and most apps using Perry's
+            // i18n) the English source text doubles as the key, so
+            // emitting the key gives the user readable English text on
+            // platforms where dynamic i18n hasn't been wired yet.
+            // Future: thread a locale lookup table through the harvest
+            // and pick the matching translation.
+            Expr::I18nString { key, .. } => return Some(key.clone()),
+            // `t('key')` may also surface as a NativeMethodCall to
+            // `perry/i18n` if the caller used the destructured-import
+            // form. Unwrap to the inner I18nString (or plain string)
+            // arg.
+            Expr::NativeMethodCall { module, method, args, .. }
+                if module == "perry/i18n" && method == "t" =>
+            {
+                cur = args.first()?;
             }
             _ => return None,
         }
@@ -6255,6 +6635,15 @@ mod tests {
             "btn_desktop",
             nmc("Button", vec![Expr::String("desktop".into())]),
         ));
+        // v0.5.490: dead-branch elim now fires when the condition isn't
+        // cleanly serializable. The original PropertyGet(LocalGet(9999),
+        // "isMobile") shape would have rendered both branches under
+        // `if (true) { ... } else { ... }` — but the else-branch is
+        // dead source-wise and Mango exposed this as the "+ New
+        // Connection" duplicate-content bug. New behavior: walk only
+        // the then-branch when the condition can't be serialized
+        // (matches the then-branch heuristic from v0.5.487's
+        // Expr::Conditional emit_widget arm).
         m.init.push(Stmt::If {
             condition: Expr::PropertyGet {
                 object: Box::new(Expr::LocalGet(9999)),
@@ -6271,26 +6660,16 @@ mod tests {
         });
         m.init.push(app_with_body(Expr::LocalGet(screen_id)));
         let r = emit_index_ets(&mut m).unwrap().unwrap();
-        // Predicate string contains the comparison.
-        assert!(
-            r.ets_source.contains("if ("),
-            "missing if-block:\n{}",
-            r.ets_source
-        );
-        assert!(
-            r.ets_source.contains("} else {"),
-            "missing else-block:\n{}",
-            r.ets_source
-        );
-        // Both branches' children are present under the right arm.
+        // Then-branch is the only one emitted (heuristic-pick).
         assert!(
             r.ets_source.contains("Button('phone')"),
-            "missing phone branch:\n{}",
+            "expected then-branch (`Button('phone')`) emitted:\n{}",
             r.ets_source
         );
+        // Else-branch is dropped — no `Button('desktop')`.
         assert!(
-            r.ets_source.contains("Button('desktop')"),
-            "missing desktop branch:\n{}",
+            !r.ets_source.contains("Button('desktop')"),
+            "else-branch must be dropped (cleanly-serializable gate fired):\n{}",
             r.ets_source
         );
     }
@@ -7670,10 +8049,12 @@ mod tests {
     }
 
     #[test]
-    fn issue_413_addchild_inside_unfoldable_runtime_condition_still_emits_if() {
-        // Sanity check: the dead-branch elimination must NOT fire when
-        // the condition is unfoldable. PropertyGet on a runtime value
-        // stays as a runtime `if (...) { ... } else { ... }` block.
+    fn issue_490_unfoldable_unresolvable_condition_walks_only_then_branch() {
+        // v0.5.490: when a condition is unfoldable AND not cleanly
+        // serializable, dead-branch elim picks the then-branch. The
+        // pre-v0.5.490 behavior emitted both branches under `if (true)
+        // {...} else {...}` — Mango's `connectionNames.length === 0`
+        // exposed this as the "+ New Connection" duplicate-content bug.
         let mut m = empty_module();
         let parent_id: LocalId = 110;
         let a_id: LocalId = 111;
@@ -7710,24 +8091,15 @@ mod tests {
         m.init.push(app_with_body(Expr::LocalGet(parent_id)));
         let r = emit_index_ets(&mut m).unwrap().unwrap();
         let src = &r.ets_source;
-        assert!(
-            src.contains("if ("),
-            "runtime condition must still emit `if (...)`:\n{}",
-            src
-        );
-        assert!(
-            src.contains("} else {"),
-            "runtime condition must still emit `}} else {{`:\n{}",
-            src
-        );
+        // Then-branch only — heuristic pick.
         assert!(
             src.contains("Button('a')"),
             "then-branch must render:\n{}",
             src
         );
         assert!(
-            src.contains("Button('b')"),
-            "else-branch must render:\n{}",
+            !src.contains("Button('b')"),
+            "else-branch must NOT render (dead-branch elim):\n{}",
             src
         );
     }
