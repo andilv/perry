@@ -1007,14 +1007,25 @@ pub fn gc_collect_minor() -> u64 {
     // transitively-discovered objects came via heap fields that
     // C4b-γ-2 will walk to rewrite.
     mark_stack_roots(&valid_ptrs);
-    pin_currently_marked_as_conservative();
+    // CONS_PINNED is only consumed by `evacuate_tenured_nursery_objects`,
+    // which is gated on `gen_gc_evacuate_enabled()`. When evacuation is
+    // off (the default), each `pin_currently_marked_as_conservative` call
+    // is a full arena walk producing a HashSet nobody reads — at ~1.6M
+    // objects in perf-comprehensive that's two ~10ms walks per minor GC
+    // burned for nothing. Gate both pin calls behind the same flag.
+    let evac = gen_gc_evacuate_enabled();
+    if evac {
+        pin_currently_marked_as_conservative();
+    }
     mark_global_roots(&valid_ptrs);
     mark_registered_roots(&valid_ptrs);
     // C4b-γ-1: pin again to capture scanner-discovered objects
     // (objects that mark_registered_roots added since the prior
     // pin call). The HashSet absorbs the redundant inserts of
     // already-pinned conservative discoveries cheaply.
-    pin_currently_marked_as_conservative();
+    if evac {
+        pin_currently_marked_as_conservative();
+    }
     mark_remembered_set_roots(&valid_ptrs);
     trace_marked_objects_minor(&valid_ptrs);
     mark_block_persisting_arena_objects(&valid_ptrs);
