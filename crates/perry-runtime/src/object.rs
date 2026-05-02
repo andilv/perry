@@ -29,7 +29,12 @@ use std::sync::RwLock;
 /// This handles cases like Object.assign() adding many fields to an object
 /// that was allocated with only 8 slots (e.g., @noble/curves Fp field with 21 properties).
 thread_local! {
-    static OVERFLOW_FIELDS: RefCell<HashMap<usize, Vec<u64>>> = RefCell::new(HashMap::new());
+    /// Heap-pointer keyed; PtrHasher avoids the per-call SipHash on
+    /// every overflow read/write. `clear_overflow_for_ptr` was 0.7%
+    /// leaf samples on perf-comprehensive (called from object dispatch
+    /// + arena_walk_objects in the GC path).
+    static OVERFLOW_FIELDS: RefCell<crate::fast_hash::PtrHashMap<usize, Vec<u64>>> =
+        RefCell::new(crate::fast_hash::new_ptr_hash_map());
 }
 
 /// Last-accessed overflow Vec cache — one entry, keyed by `obj_ptr`.
