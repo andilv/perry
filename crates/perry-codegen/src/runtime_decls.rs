@@ -1192,7 +1192,18 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     // Index-based field setter (no key lookup). Hot-path target for object
     // literals with statically-known keys; the i-th field directly maps to
     // the i-th packed-keys entry above.
-    module.declare_function("js_object_set_field", VOID, &[I64, I32, DOUBLE]);
+    //
+    // Issue #448: third arg is `JSValue` on the runtime side (a
+    // `#[repr(transparent)] u64` wrapper). On AArch64 / x86_64 SysV / Win64
+    // ABIs, integer and floating-point arguments use disjoint register
+    // classes — declaring the slot as DOUBLE put the NaN-boxed value in
+    // an FP register while the Rust function read its `value: JSValue`
+    // arg from a GP register, so closure pointers stored into generator
+    // iter objects (`{ next, return, throw }` literals built via the
+    // shape-cache fast path) read back as `0` and the iterator-protocol
+    // loop hung forever. Declaring the slot as I64 routes through the
+    // same register class the runtime actually reads.
+    module.declare_function("js_object_set_field", VOID, &[I64, I32, I64]);
     module.declare_function("js_object_set_field_by_name", VOID, &[I64, I64, DOUBLE]);
     module.declare_function("js_object_get_field_by_name_f64", DOUBLE, &[I64, I64]);
     module.declare_function("js_object_get_field_ic_miss", DOUBLE, &[I64, I64, PTR]);

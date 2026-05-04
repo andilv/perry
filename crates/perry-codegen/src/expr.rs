@@ -10415,9 +10415,24 @@ fn lower_object_literal(ctx: &mut FnCtx<'_>, props: &[(String, Expr)]) -> Result
         for (i, (_, value_expr)) in props.iter().enumerate() {
             let v = lower_expr(ctx, value_expr)?;
             let idx_str = i.to_string();
-            ctx.block().call_void(
+            // Issue #448: the runtime `js_object_set_field` takes its
+            // value as `JSValue` (`#[repr(transparent)] u64`), which the
+            // System V / AArch64 / Win64 ABIs all pass in a *general*-
+            // purpose register. The lowered NaN-box `v` is a `double`,
+            // which the same ABIs pass in a *floating-point* register.
+            // Without the bitcast the call sent the value in xmm0 / d0
+            // while Rust read garbage from rdx / x2, so generator iter
+            // objects (`{next, return, throw}` literals built via the
+            // shape-cache fast path) read back closure-typed fields as
+            // `0` — and the resulting `__iter.next()` dispatch never
+            // returned a real iter-result, so `for…of` over a class
+            // implementing `*[Symbol.iterator]()` hung forever
+            // allocating empty results.
+            let blk = ctx.block();
+            let v_bits = blk.bitcast_double_to_i64(&v);
+            blk.call_void(
                 "js_object_set_field",
-                &[(I64, &obj_handle), (I32, &idx_str), (DOUBLE, &v)],
+                &[(I64, &obj_handle), (I32, &idx_str), (I64, &v_bits)],
             );
         }
         return Ok(nanbox_pointer_inline(ctx.block(), &obj_handle));
