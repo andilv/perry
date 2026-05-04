@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Perry is a native TypeScript compiler written in Rust that compiles TypeScript source code directly to native executables. It uses SWC for TypeScript parsing and LLVM for code generation.
 
-**Current Version:** 0.5.505
+**Current Version:** 0.5.506
 
 
 ## TypeScript Parity Status
@@ -153,6 +153,7 @@ First-resolved directory cached in `compile_package_dirs`; subsequent imports re
 
 Keep entries to 1-2 lines max. Full details in CHANGELOG.md.
 
+- **v0.5.506** — #447 partial: skip `alwaysinline` for `was_plain_async`-rewritten functions in codegen.rs; removes the infinite microtask-loop hang from nested async-await but a deeper bug (rewritten body doesn't execute, `js_box_get` null pointer) remains — issue stays open.
 - **v0.5.505** — Closes #449: fold `new.target.<prop>` and `new.target?.<prop>` to a string/undefined literal at HIR lowering, bypassing the broken `MetaProp(NewTarget)` Object-literal path that returned `NaN` for `.name`.
 - **v0.5.504** — Closes #453: refresh stale CLAUDE.md gap-sweep claim, broaden workspace-test exclude list to all cross-host UI crates, regenerate `honest_bench/REPORT.md` against current `results.json` (perry 0.5.495 numbers).
 - **v0.5.503** — Closes #446: bind class-method PropertyGet via `js_class_method_bind` + flow type-only-import class metadata into `imported_classes` so dispatch tables see the methods.

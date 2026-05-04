@@ -2136,8 +2136,12 @@ fn compile_function(
 
     // Small leaf functions (≤ 8 statements) get alwaysinline so LLVM
     // exposes their operations to the caller's optimizer context — critical
-    // for vectorizing clamp helpers and similar patterns.
-    if f.body.len() <= 8 && !f.is_async && !f.is_generator {
+    // for vectorizing clamp helpers and similar patterns. Excluded:
+    // async/generator functions, AND functions rewritten by the
+    // async-to-generator pre-pass (was_plain_async=true). Inlining the
+    // rewritten wrapper into its caller breaks GC-root coverage of the
+    // step closure's iter capture, hanging async chains (issue #447).
+    if f.body.len() <= 8 && !f.is_async && !f.is_generator && !f.was_plain_async {
         lf.force_inline = true;
     }
     let _ = lf.create_block("entry");
