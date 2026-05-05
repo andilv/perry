@@ -42,12 +42,15 @@ pub fn module_to_features(module: &str) -> &'static [&'static str] {
         "mysql2" | "mysql2/promise" => &["database-mysql"],
         "pg" => &["database-postgres"],
         "better-sqlite3" => &["database-sqlite"],
-        // tursodb (#424): no in-tree perry-stdlib implementation;
-        // ONLY available via the well-known flip → perry-ext-tursodb.
-        // No features to enable; the well-known table picks up
-        // tursodb-by-module-name alone and links the ext .a.
+        // tursodb (#424) lives in the external
+        // `PerryTS/tursodb-bindings` repo (`bun add @perryts/tursodb`)
+        // since v0.5.557 — perry's package.json `perry.nativeLibrary`
+        // resolution path picks it up from `node_modules/`. No
+        // perry-stdlib feature gate to manage.
         "tursodb" => &[],
-        // iroh (#425): same well-known-only path as tursodb.
+        // iroh (#425) lives in the external `PerryTS/iroh-bindings`
+        // repo (`bun add @perryts/iroh`) since v0.5.557 — same model
+        // as tursodb above.
         "iroh" => &[],
         // Redis is detected via the ioredis class name in collect_modules,
         // but if it shows up as an explicit import we still need the feature.

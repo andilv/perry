@@ -92,15 +92,17 @@ crate = "perry-ext-exponential-backoff"
 lib = "perry_ext_exponential_backoff"
 tracking = "#466"
 
-[bindings.tursodb]
-crate = "perry-ext-tursodb"
-lib = "perry_ext_tursodb"
-tracking = "#424"
-
-[bindings.iroh]
-crate = "perry-ext-iroh"
-lib = "perry_ext_iroh"
-tracking = "#425"
+# NOTE: tursodb (#424) and iroh (#425) lived here through v0.5.556 but
+# were moved out to standalone third-party repositories in v0.5.557:
+#   - https://github.com/PerryTS/tursodb-bindings  → `bun add @perryts/tursodb`
+#   - https://github.com/PerryTS/iroh-bindings     → `bun add @perryts/iroh`
+# They were the demonstration cases of the "third-party native binding"
+# hypothesis from #466. Now that the package.json `perry.nativeLibrary`
+# resolution path is wired through (and the surface required is stable
+# in perry-ffi v0.5), they belong outside the perry monorepo as separate
+# npm packages users install on demand. The well-known table here keeps
+# its job: bundling the wrappers that *port* perry-stdlib's existing
+# in-tree implementations, not net-new functionality.
 
 [bindings.axios]
 crate = "perry-ext-axios"
