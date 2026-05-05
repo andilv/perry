@@ -76,3 +76,8 @@ tracking = "#466"
 crate = "perry-ext-lru-cache"
 lib = "perry_ext_lru_cache"
 tracking = "#466"
+
+[bindings.better-sqlite3]
+crate = "perry-ext-better-sqlite3"
+lib = "perry_ext_better_sqlite3"
+tracking = "#466"

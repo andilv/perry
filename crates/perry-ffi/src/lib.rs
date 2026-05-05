@@ -53,6 +53,13 @@ pub use handle::{
     with_handle, with_handle_mut, Handle, INVALID_HANDLE,
 };
 
+mod jsvalue;
+pub use jsvalue::{
+    build_object_shape, js_array_alloc, js_array_get, js_array_push, js_array_set,
+    js_object_alloc_with_shape, js_object_get_field, js_object_set_field, ArrayHeader, JsValue,
+    ObjectHeader,
+};
+
 use perry_runtime::js_string_from_bytes;
 pub use perry_runtime::StringHeader;
 
