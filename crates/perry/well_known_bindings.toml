@@ -111,3 +111,13 @@ tracking = "#466"
 crate = "perry-ext-events"
 lib = "perry_ext_events"
 tracking = "#466"
+
+[bindings."decimal.js"]
+crate = "perry-ext-decimal"
+lib = "perry_ext_decimal"
+tracking = "#466"
+
+[bindings."bignumber.js"]
+crate = "perry-ext-decimal"
+lib = "perry_ext_decimal"
+tracking = "#466"

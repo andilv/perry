@@ -31,6 +31,9 @@ pub mod async_local_storage;
 pub mod commander;
 pub mod common;
 pub mod dayjs;
+// decimal feature-gated as of v0.5.547 — well-known flip routes
+// to perry-ext-decimal.
+#[cfg(feature = "bundled-decimal")]
 pub mod decimal;
 // dotenv is feature-gated as of v0.5.533 so the well-known bindings
 // table (#466 Phase 4) can route `import 'dotenv'` to perry-ext-dotenv
@@ -66,6 +69,7 @@ pub use async_local_storage::*;
 pub use commander::*;
 pub use common::*;
 pub use dayjs::*;
+#[cfg(feature = "bundled-decimal")]
 pub use decimal::*;
 #[cfg(feature = "bundled-dotenv")]
 pub use dotenv::*;

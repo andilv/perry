@@ -128,6 +128,9 @@ pub fn module_to_features(module: &str) -> &'static [&'static str] {
         // GC-root-scanner surface that keeps EventEmitter
         // listener closures alive between .on() and .emit().
         "events" => &["bundled-events"],
+        // decimal.js / bignumber.js: feature-gated v0.5.547 —
+        // well-known flip routes to perry-ext-decimal.
+        "decimal.js" | "bignumber.js" => &["bundled-decimal"],
         // dotenv was always-on through v0.5.532; gated behind
         // `bundled-dotenv` from v0.5.533 onwards so the well-known
         // bindings flip (#466 Phase 4 step 2) can swap perry-stdlib's
