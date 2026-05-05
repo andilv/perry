@@ -51,3 +51,13 @@ tracking = "#466"
 crate = "perry-ext-slugify"
 lib = "perry_ext_slugify"
 tracking = "#466"
+
+[bindings.bcrypt]
+crate = "perry-ext-bcrypt"
+lib = "perry_ext_bcrypt"
+tracking = "#466"
+
+[bindings.argon2]
+crate = "perry-ext-argon2"
+lib = "perry_ext_argon2"
+tracking = "#466"

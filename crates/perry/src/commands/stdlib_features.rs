@@ -48,7 +48,15 @@ pub fn module_to_features(module: &str) -> &'static [&'static str] {
         "mongodb" => &["database-mongodb"],
 
         // ── Crypto ────────────────────────────────────────────────────
-        "crypto" | "bcrypt" | "jsonwebtoken" => &["crypto"],
+        // bcrypt split off into its own `bundled-bcrypt` feature in
+        // v0.5.537 so the well-known flip can route it to
+        // perry-ext-bcrypt without taking the rest of the crypto
+        // surface offline. The `crypto` umbrella still includes
+        // bundled-bcrypt for backwards compat — programs that import
+        // bcrypt also typically use sha256/jwt/etc., which keeps the
+        // umbrella worthwhile.
+        "bcrypt" => &["bundled-bcrypt"],
+        "crypto" | "jsonwebtoken" => &["crypto"],
         // ethers ships utility functions (formatUnits, parseUnits,
         // getAddress, keccak256, …) that bottom out in sha3/keccak in
         // the crypto bucket.
@@ -75,6 +83,14 @@ pub fn module_to_features(module: &str) -> &'static [&'static str] {
 
         // ── Validation (validator.js) ─────────────────────────────────
         "validator" => &["validation"],
+
+        // ── argon2 ────────────────────────────────────────────────────
+        // argon2 split off into `bundled-argon2` (v0.5.537) — same
+        // reason as bcrypt above. Note: NATIVE_MODULES doesn't list
+        // `argon2` in v0.5.532's manifest because perry-stdlib's
+        // existing dispatch routes it through a different code path,
+        // but the feature mapping is still useful for future parity.
+        "argon2" => &["bundled-argon2"],
 
         // ── IDs (uuid / nanoid) ───────────────────────────────────────
         // Per-binding split as of v0.5.534 (#466 Phase 4 step 2)

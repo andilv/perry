@@ -62,7 +62,14 @@ database-mongodb = ["dep:mongodb", "dep:bson", "dep:futures-util", "async-runtim
 # Implies `async-runtime` because bcrypt/jwt/argon2 hashing offloads to
 # `tokio::task::spawn_blocking`, and `ids` because `crypto.randomUUID()`
 # delegates to the `uuid` crate.
-crypto = ["dep:sha2", "dep:sha1", "dep:md-5", "dep:hex", "dep:hmac", "dep:bcrypt", "dep:jsonwebtoken", "dep:aes", "dep:cbc", "dep:scrypt", "dep:pbkdf2", "dep:argon2", "dep:base64", "dep:x25519-dalek", "dep:ed25519-dalek", "dep:aes-gcm", "dep:hkdf", "async-runtime", "ids"]
+# `crypto` stays as the umbrella for backwards-compat; `bundled-bcrypt`
+# and `bundled-argon2` (v0.5.537) split out the two password-hashing
+# bindings so the well-known flip (#466 Phase 4 step 2) can route them
+# to perry-ext-bcrypt / perry-ext-argon2 without taking the rest of
+# the crypto surface offline.
+crypto = ["dep:sha2", "dep:sha1", "dep:md-5", "dep:hex", "dep:hmac", "dep:jsonwebtoken", "dep:aes", "dep:cbc", "dep:scrypt", "dep:pbkdf2", "dep:base64", "dep:x25519-dalek", "dep:ed25519-dalek", "dep:aes-gcm", "dep:hkdf", "async-runtime", "ids", "bundled-bcrypt", "bundled-argon2"]
+bundled-bcrypt = ["dep:bcrypt", "async-runtime"]
+bundled-argon2 = ["dep:argon2", "async-runtime"]
 
 # Compression (zlib)
 compression = ["dep:flate2"]

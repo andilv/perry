@@ -44,6 +44,9 @@
 
 #![deny(missing_docs)]
 
+mod async_runtime;
+pub use async_runtime::{nanbox_string_bits, spawn_blocking, JsPromise, Promise};
+
 use perry_runtime::js_string_from_bytes;
 pub use perry_runtime::StringHeader;
 

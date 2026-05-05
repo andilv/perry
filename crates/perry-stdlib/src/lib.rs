@@ -17,6 +17,15 @@
 // rlib deps during the staticlib bundle step).
 pub use perry_updater;
 
+// `extern "C"` shims that perry-ffi declares for use by external
+// native binding crates (#466 Phase 1 + 5 — async surface). Gated
+// on `async-runtime` because the underlying async_bridge does;
+// every wrapper that depends on these (bcrypt, argon2, ws, db
+// drivers, …) already triggers `async-runtime` through its own
+// per-binding feature, so the linkage is automatic.
+#[cfg(feature = "async-runtime")]
+pub mod perry_ffi_async;
+
 // Core modules - always available
 pub mod async_local_storage;
 pub mod commander;
@@ -150,14 +159,19 @@ pub mod ethers;
 #[cfg(feature = "crypto")]
 pub use ethers::*;
 
-#[cfg(feature = "crypto")]
+// bcrypt + argon2 split out from the broad `crypto` feature in
+// v0.5.537 so the well-known flip can swap each one out
+// individually. The `crypto` umbrella still pulls them both in
+// (`crypto = [..., "bundled-bcrypt", "bundled-argon2"]`) so legacy
+// `--features crypto` builds keep producing byte-identical archives.
+#[cfg(feature = "bundled-bcrypt")]
 pub mod bcrypt;
-#[cfg(feature = "crypto")]
+#[cfg(feature = "bundled-bcrypt")]
 pub use bcrypt::*;
 
-#[cfg(feature = "crypto")]
+#[cfg(feature = "bundled-argon2")]
 pub mod argon2;
-#[cfg(feature = "crypto")]
+#[cfg(feature = "bundled-argon2")]
 pub use argon2::*;
 
 #[cfg(feature = "crypto")]

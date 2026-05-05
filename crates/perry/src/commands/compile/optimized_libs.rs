@@ -129,6 +129,29 @@ pub(super) fn build_optimized_libs(
             {
                 features.remove(*feat);
             }
+            // perry-ffi's async surface (#466 Phase 1.1 / Phase 5
+            // step 5+) is gated behind perry-stdlib's
+            // `async-runtime` feature — the `perry_ffi_*` shim
+            // module that wrappers like bcrypt / argon2 / ws / db
+            // pull through linking lives in
+            // `crates/perry-stdlib/src/perry_ffi_async.rs` and
+            // can only be compiled when tokio is in the build.
+            // Stripping `bundled-bcrypt` (etc.) without
+            // re-asserting `async-runtime` would leave the
+            // wrapper's `.a` carrying unresolved `perry_ffi_*`
+            // references. Detect async wrappers by checking
+            // whether the original feature list contained an
+            // async feature; if it did, ensure it stays.
+            let original_features =
+                crate::commands::stdlib_features::module_to_features(module);
+            if original_features.iter().any(|f| {
+                matches!(
+                    *f,
+                    "bundled-bcrypt" | "bundled-argon2"
+                )
+            }) {
+                features.insert("async-runtime");
+            }
             if matches!(format, OutputFormat::Text) {
                 println!(
                     "  well-known: routing `{}` → {} ({})",
