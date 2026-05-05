@@ -4298,6 +4298,22 @@ fn lower_module_decl(
                                             | Expr::FuncRef(_)
                                             | Expr::ExternFuncRef { .. }
                                             | Expr::PropertyGet { .. }
+                                            // #421 fix (v0.5.574): primitive literals must
+                                            // also flow through `exported_objects` so the
+                                            // importing module's `imported_vars` set picks
+                                            // them up — without this, `var X = "literal";
+                                            // export { X };` (the shape hono / drizzle /
+                                            // any prebundled JS uses for string / number
+                                            // constants) gets imported as a closure-pointer
+                                            // wrapper instead of the actual value, and
+                                            // `typeof X` returns "function" + `X.toString`
+                                            // prints `[object Object]`.
+                                            | Expr::String(_)
+                                            | Expr::Number(_)
+                                            | Expr::Bool(_)
+                                            | Expr::BigInt(_)
+                                            | Expr::Null
+                                            | Expr::Undefined
                                     );
                                     if is_exportable {
                                         module.exported_objects.push(exported.clone());

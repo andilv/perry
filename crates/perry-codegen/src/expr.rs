@@ -4922,12 +4922,15 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             Ok(nanbox_pointer_inline(ctx.block(), &obj_handle))
         }
 
-        // -------- new Set(arr) --------
+        // -------- new Set(iter) --------
+        // Fix #421 (v0.5.574): route through js_set_from_iterable so
+        // string inputs (`new Set("abc")`) iterate codepoints instead of
+        // segfaulting on a bad ArrayHeader cast. The runtime function
+        // takes the NaN-boxed value directly and dispatches by tag.
         Expr::SetNewFromArray(arr_expr) => {
             let arr_box = lower_expr(ctx, arr_expr)?;
             let blk = ctx.block();
-            let arr_handle = unbox_to_i64(blk, &arr_box);
-            let handle = blk.call(I64, "js_set_from_array", &[(I64, &arr_handle)]);
+            let handle = blk.call(I64, "js_set_from_iterable", &[(DOUBLE, &arr_box)]);
             Ok(nanbox_pointer_inline(blk, &handle))
         }
 
