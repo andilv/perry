@@ -581,6 +581,17 @@ fn is_inlinable(func: &Function) -> bool {
         return false;
     }
 
+    // Don't inline generator functions. The body uses `yield` and (often) a
+    // terminating `return value` to drive the state machine that
+    // `transform_generators` later builds. Inlining the body into the caller
+    // erases that contract: the `yield` exprs leak into the caller's
+    // statement list and the call expression collapses to the function's
+    // last `return` value (or `undefined`), so `gen()` no longer produces
+    // an iterator — it produces the bare return value. Issue #457.
+    if func.is_generator {
+        return false;
+    }
+
     // Don't inline functions with captures (closures)
     if !func.captures.is_empty() {
         return false;
