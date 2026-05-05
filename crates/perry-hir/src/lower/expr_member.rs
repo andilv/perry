@@ -18,6 +18,67 @@ use crate::ir::Expr;
 use super::{lower_expr, LoweringContext};
 
 pub(super) fn lower_member(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Result<Expr> {
+    // Issue #444: `import.meta.<prop>` folds directly to a literal at
+    // lowering time. Routing through the bare-`import.meta` Object
+    // synthesis hits a long-standing module-level NaN-boxing bug where
+    // string fields read back as 0 — producing `url: 0` / `main: NaN`
+    // for the user. Folding here sidesteps it entirely.
+    //
+    // Surface aligned with Node 20+ spec (`url` / `dirname` / `filename`
+    // / `main`). Bun-only aliases (`dir` / `path` / `file`) intentionally
+    // omitted — adding them would silently break code moving Perry → Node.
+    if let ast::Expr::MetaProp(mp) = member.obj.as_ref() {
+        if matches!(mp.kind, ast::MetaPropKind::ImportMeta) {
+            if let ast::MemberProp::Ident(prop_ident) = &member.prop {
+                let (url, dirname, filename) = super::expr_misc::import_meta_paths(ctx);
+                return Ok(match prop_ident.sym.as_ref() {
+                    "url" => Expr::String(url),
+                    "main" => Expr::Bool(ctx.is_entry_module),
+                    "dirname" => Expr::String(dirname),
+                    "filename" => Expr::String(filename),
+                    // Unknown property — undefined matches the spec'd
+                    // "missing property on a frozen object" behavior of
+                    // import.meta in Node / Bun.
+                    _ => Expr::Undefined,
+                });
+            }
+        }
+        // Issue #449: `new.target.<prop>` folds directly to a literal at
+        // lowering time. The bare `MetaProp(NewTarget)` lowering in
+        // `expr_misc::lower_meta_prop` returns an Object literal whose
+        // string field reads back as the raw u64 handle bits (rendering
+        // as `2e-323` / `NaN`) when constructed inside a class
+        // constructor — same module-globals NaN-boxing bug class as
+        // #444's `import.meta` Object. Folding the most common access
+        // patterns here sidesteps it entirely. Inside a constructor,
+        // `.name` is the class name string; outside, the whole
+        // expression evaluates to `undefined.<prop>` which would throw
+        // — but `new.target` outside a constructor is `undefined`, so
+        // we lower the access to `Undefined` and let downstream
+        // optional-chain rewrites (`new.target?.name`) handle the
+        // null-guard correctly.
+        if matches!(mp.kind, ast::MetaPropKind::NewTarget) {
+            if let ast::MemberProp::Ident(prop_ident) = &member.prop {
+                let prop_name = prop_ident.sym.as_ref();
+                if let Some(class_name) = ctx.in_constructor_class.clone() {
+                    return Ok(match prop_name {
+                        "name" => Expr::String(class_name),
+                        // Other props on a class reference (`prototype`,
+                        // arbitrary) — undefined is the safe fallback;
+                        // adding `prototype` would need a real class
+                        // reference, not in scope for #449.
+                        _ => Expr::Undefined,
+                    });
+                }
+                // Outside a constructor: `new.target` is undefined and
+                // `undefined.<prop>` throws TypeError. We model the
+                // observable result as Undefined (matches Node when
+                // wrapped in `new.target?.<prop>` short-circuiting).
+                return Ok(Expr::Undefined);
+            }
+        }
+    }
+
     // process.std{in,out,err}.{isTTY,columns,rows} — direct extern-call
     // shapes recognized BEFORE the regular process.X arm below, since the
     // double-Member shape (Member(Member(process, stream), prop)) doesn't

@@ -769,7 +769,7 @@ fn sign_hap(
 }
 
 #[cfg(test)]
-mod tests {
+mod build_hap_tests {
     use super::*;
     use std::io::Read;
     use zip::ZipArchive;
@@ -814,6 +814,7 @@ mod tests {
             cert_chain: None,
             profile: None,
             key_alias: None,
+            assets_dir: None,
         };
         let res = build_hap(&args).expect("build_hap failed");
         assert!(!res.signed, "no P12 env → unsigned");
@@ -969,6 +970,7 @@ mod tests {
             cert_chain: Some(&fake_cert),
             profile: Some(&fake_profile),
             key_alias: Some("ciKey"),
+            assets_dir: None,
         };
         // Signing will fail (no real keystore / no java reachable in CI
         // environment baseline), so the result is `signed: false`. The

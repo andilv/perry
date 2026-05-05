@@ -243,6 +243,11 @@ pub struct LoweringContext {
     /// here so the `Expr::New { class_name }` lowering can append
     /// `LocalGet(id)` for each captured id at every construction site.
     pub(crate) class_captures: Vec<(String, Vec<LocalId>)>,
+    /// Issue #444: true when this module is the user-supplied entry file.
+    /// Drives `import.meta.main` — Node 24+ / Bun semantics where the entry
+    /// module reports `true` and every imported module reports `false`. Set
+    /// by `lower_module_with_class_id_types_seed_and_entry`; default false.
+    pub(crate) is_entry_module: bool,
 }
 
 impl LoweringContext {
@@ -320,6 +325,7 @@ impl LoweringContext {
             next_anon_shape_id: 0,
             class_method_return_types: Vec::new(),
             class_captures: Vec::new(),
+            is_entry_module: false,
         }
     }
 
@@ -578,6 +584,32 @@ impl LoweringContext {
         }
     }
 
+    /// Pre-seed `class_field_types` (and `class_field_names`) with cross-module
+    /// class info collected from already-lowered dependencies. Lets
+    /// `infer_type_from_expr` resolve `someLocal.field` where `someLocal`'s
+    /// declared type is a class defined in another module. Without this,
+    /// `for (const x of changeset.removes)` (where `changeset:
+    /// ComponentChangeset` from another module, `removes: Set<...>`) silently
+    /// iterates 0 times because the iterable's static type is unknown and the
+    /// SetValues wrap is skipped. See ECS demo-simple repro / #412.
+    ///
+    /// Only inserts entries that aren't already registered locally — the
+    /// current module's own classes always win.
+    pub fn seed_imported_class_fields(
+        &mut self,
+        seeds: &std::collections::HashMap<String, Vec<(String, Type)>>,
+    ) {
+        for (name, fields) in seeds {
+            if !self.class_field_types.iter().any(|(n, _)| n == name) {
+                self.class_field_types.push((name.clone(), fields.clone()));
+            }
+            if !self.class_field_names.iter().any(|(n, _)| n == name) {
+                let names: Vec<String> = fields.iter().map(|(n, _)| n.clone()).collect();
+                self.class_field_names.push((name.clone(), names));
+            }
+        }
+    }
+
     /// Issue #302: look up the declared type of a single instance field on a
     /// class. Returns `None` if the class isn't registered or the field
     /// name doesn't appear in the class's declared field list.
@@ -794,9 +826,26 @@ impl LoweringContext {
             return existing.clone();
         }
 
-        let anon_id = self.next_anon_shape_id;
-        self.next_anon_shape_id += 1;
-        let class_name = format!("__AnonShape_{}", anon_id);
+        // Content-addressed name: FNV-1a hash of the canonical shape_key.
+        // Same shape across different modules produces the same name, so
+        // cross-module method inlining (which copies a body verbatim into
+        // a sibling module) doesn't accidentally bind to a same-named but
+        // different-shaped class in the destination.
+        //
+        // The pre-fix scheme (`__AnonShape_<per-module-counter>`) collided
+        // when two modules each minted a class for their own first
+        // closed-shape literal — both got `__AnonShape_0` for unrelated
+        // shapes, and the inliner's body-rewrite resolved the cross-module
+        // reference to the destination's local `__AnonShape_0`. Symptom:
+        // a 4-field command literal in `CommandBuffer.set` round-tripped
+        // as a 2-field component literal `{ x, y }`, silently dropping
+        // `entityId` / `componentType` and producing 0 entities post-sync.
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in shape_key.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        let class_name = format!("__AnonShape_{:016x}", h);
         let class_id = self.fresh_class();
 
         // Fields have `init: None` — each literal's values are passed as
@@ -847,6 +896,7 @@ impl LoweringContext {
             is_async: false,
             is_generator: false,
             was_plain_async: false,
+            was_unrolled: false,
             is_exported: false,
             captures: Vec::new(),
             decorators: Vec::new(),
@@ -1707,8 +1757,54 @@ pub fn lower_module_with_class_id_and_types(
     start_class_id: ClassId,
     resolved_types: Option<std::collections::HashMap<u32, Type>>,
 ) -> Result<(Module, ClassId)> {
+    lower_module_with_class_id_types_and_seed(
+        ast_module,
+        name,
+        source_file_path,
+        start_class_id,
+        resolved_types,
+        None,
+    )
+}
+
+pub fn lower_module_with_class_id_types_and_seed(
+    ast_module: &ast::Module,
+    name: &str,
+    source_file_path: &str,
+    start_class_id: ClassId,
+    resolved_types: Option<std::collections::HashMap<u32, Type>>,
+    imported_class_fields: Option<&std::collections::HashMap<String, Vec<(String, Type)>>>,
+) -> Result<(Module, ClassId)> {
+    lower_module_with_class_id_types_seed_and_entry(
+        ast_module,
+        name,
+        source_file_path,
+        start_class_id,
+        resolved_types,
+        imported_class_fields,
+        false,
+    )
+}
+
+/// Issue #444: variant that takes `is_entry_module` so `import.meta.main`
+/// resolves to `true` only inside the user-supplied entry TypeScript file
+/// (matching Node 24+ / Bun semantics). All other lowering callers go
+/// through the wrapper above with `is_entry_module=false`.
+pub fn lower_module_with_class_id_types_seed_and_entry(
+    ast_module: &ast::Module,
+    name: &str,
+    source_file_path: &str,
+    start_class_id: ClassId,
+    resolved_types: Option<std::collections::HashMap<u32, Type>>,
+    imported_class_fields: Option<&std::collections::HashMap<String, Vec<(String, Type)>>>,
+    is_entry_module: bool,
+) -> Result<(Module, ClassId)> {
     let mut ctx = LoweringContext::with_class_id_start(source_file_path, start_class_id);
     ctx.resolved_types = resolved_types;
+    ctx.is_entry_module = is_entry_module;
+    if let Some(seed) = imported_class_fields {
+        ctx.seed_imported_class_fields(seed);
+    }
     let mut module = Module::new(name);
 
     // Pre-scan for WeakRef/FinalizationRegistry variable declarations so subsequent
@@ -3395,11 +3491,6 @@ fn lower_module_decl(
 ) -> Result<()> {
     match decl {
         ast::ModuleDecl::Import(import_decl) => {
-            // Skip type-only imports (import type { ... } from '...') - they have no runtime value
-            if import_decl.type_only {
-                return Ok(());
-            }
-
             // Get the source module path
             let raw_source = import_decl.src.value.as_str().unwrap_or("").to_string();
             // Normalize "node:" prefix (e.g., "node:async_hooks" -> "async_hooks")
@@ -3411,13 +3502,47 @@ fn lower_module_decl(
             // Check if this is a native module import
             let is_native = is_native_module(&source);
 
+            // Native modules have no class metadata to extract — `node:fs`,
+            // `node:path`, etc. produce no `ImportedClass` entries and the
+            // runtime can't resolve type-only names anyway. Skip the whole
+            // declaration for native modules.
+            //
+            // For TypeScript modules, fall through and process the
+            // declaration even when `type_only` is set: the named-specifier
+            // loop below treats a whole-`import type { ... }` like a
+            // per-specifier `import { type ... }` (which already flowed
+            // class info into `imported_classes` since the v0.5.405 fix).
+            // Without this, `import type { Foo }` dropped Foo's class
+            // metadata before it reached compile.rs, so codegen lost the
+            // method registry — `obj.method()` worked only via the
+            // CLASS_VTABLE_REGISTRY runtime fallback (#392 followup) and
+            // `typeof obj.method` returned `"undefined"`. Issue #446.
+            if import_decl.type_only && is_native {
+                return Ok(());
+            }
+            let whole_decl_type_only = import_decl.type_only;
+
             // Parse import specifiers
             let mut specifiers = Vec::new();
             for spec in &import_decl.specifiers {
                 match spec {
                     ast::ImportSpecifier::Named(named) => {
-                        // Skip individual type-only specifiers (import { type Foo, Bar })
-                        if named.is_type_only {
+                        // Skip individual type-only specifiers (`import { type Foo,
+                        // Bar }`) only for native module imports — there's no
+                        // class info to extract from `node:fs`, etc., and the
+                        // runtime can't resolve them anyway. For TypeScript
+                        // module imports, fall through and treat them as regular
+                        // named imports so the source module's class info
+                        // flows into `imported_classes` (for method dispatch on
+                        // a `q: Query` typed local) and `cross_module_class_field_types`
+                        // (for type inference on `someLocal.field` for-of
+                        // iteration). Pre-fix, `import { type Query } from
+                        // "../src"` made `q.forEach(...)` a silent no-op
+                        // because Query was never registered with codegen —
+                        // the spread call on the closure invoked a stub that
+                        // returned undefined. ECS demo-simple repro.
+                        let spec_type_only = named.is_type_only || whole_decl_type_only;
+                        if spec_type_only && is_native {
                             continue;
                         }
                         let local = named.local.sym.to_string();
@@ -4148,7 +4273,11 @@ fn lower_module_decl(
                         }
 
                         // Check if the variable is a closure or other exportable object
-                        // by looking through init statements
+                        // by looking through init statements. For #460: also catch let
+                        // bindings whose init is a function-reference value
+                        // (`const _await = core.deferredAwait`) — without this branch
+                        // the renamed export `_await as await` produces no backing
+                        // global / getter at all and `_perry_fn_<mod>__await` link-fails.
                         for stmt in &module.init {
                             if let Stmt::Let {
                                 name,
@@ -4165,9 +4294,25 @@ fn lower_module_decl(
                                             | Expr::Call { .. }
                                             | Expr::New { .. }
                                             | Expr::JsNew { .. }
+                                            | Expr::LocalGet(_)
+                                            | Expr::FuncRef(_)
+                                            | Expr::ExternFuncRef { .. }
+                                            | Expr::PropertyGet { .. }
                                     );
                                     if is_exportable {
                                         module.exported_objects.push(exported.clone());
+                                        // Ensure the LOCAL name also surfaces as
+                                        // exported — that's what gates the global
+                                        // emission in codegen (`exported_var_names`
+                                        // is built from `exported_objects`).
+                                        // Without the local entry, `_await`'s id
+                                        // is never registered in `module_globals`,
+                                        // so even the local-name getter is missing
+                                        // and call sites that resolve through the
+                                        // local name fall through to undefined.
+                                        if !module.exported_objects.contains(&local) {
+                                            module.exported_objects.push(local.clone());
+                                        }
                                     }
                                     break;
                                 }
@@ -4910,6 +5055,12 @@ fn lower_stmt(ctx: &mut LoweringContext, module: &mut Module, stmt: &ast::Stmt) 
                                     // tls.connect returns the same Socket class — reuses
                                     // all the write/end/destroy/on/upgradeToTLS dispatch.
                                     ("tls", "connect") => Some("Socket"),
+                                    // Issue #422: `new net.Socket()` lowers to a
+                                    // receiver-less `Expr::NativeMethodCall` whose
+                                    // method is the constructor name "Socket"; this
+                                    // arm registers the binding so `sock.connect/...`
+                                    // dispatches via the class-filtered entries.
+                                    ("net", "Socket") => Some("Socket"),
                                     _ => None,
                                 };
                                 if let Some(cn) = class_name {
@@ -5494,16 +5645,79 @@ fn lower_stmt(ctx: &mut LoweringContext, module: &mut Module, stmt: &ast::Stmt) 
             // for (const [k, v] of this.classMap) { ... } per #302.
             let mut map_key_type: Option<Type> = None;
             let mut map_val_type: Option<Type> = None;
+            let is_iterable_map = matches!(
+                &iterable_type,
+                Some(Type::Generic { base, .. }) if base == "Map"
+            );
+            // Fast path: `for (const [k, v] of mapExpr)` with an exact two-element
+            // identifier destructure can iterate the Map's flat entries buffer
+            // directly via `MapEntryKeyAt` / `MapEntryValueAt`, skipping the N+1
+            // small Array allocations that `MapEntries` would do per iteration.
+            // Detected here so we can keep the iterable expression unwrapped
+            // and emit a different binding/bound shape below.
+            // Map fast path also fires for the single-binding shapes
+            //   for (const [k] of map)        — only key
+            //   for (const [, v] of map)      — only value
+            // Each non-empty slot must be a plain Ident (no nested patterns).
+            // Anything else falls through to the MapEntries materialization
+            // path so destructuring semantics for objects / nested arrays
+            // / defaults stay correct.
+            let map_kv_fastpath = is_iterable_map
+                && match &for_of_stmt.left {
+                    ast::ForHead::VarDecl(var_decl) => match var_decl.decls.first() {
+                        Some(decl) => match &decl.name {
+                            ast::Pat::Array(arr_pat) => {
+                                let len = arr_pat.elems.len();
+                                (len == 1 || len == 2)
+                                    && arr_pat.elems.iter().all(|e| {
+                                        e.is_none() || matches!(e, Some(ast::Pat::Ident(_)))
+                                    })
+                            }
+                            _ => false,
+                        },
+                        None => false,
+                    },
+                    _ => false,
+                };
+            // Fast path: `for (const x of setExpr)` with a single-Ident
+            // binding. Reads elements directly via `SetValueAt` (→
+            // `js_set_value_at`) instead of materializing the buffer with
+            // `js_set_to_array`. ECS hot paths (changeset.removes, etc.)
+            // iterate Sets repeatedly; this saves an Array alloc per loop.
+            let is_iterable_set = matches!(
+                &iterable_type,
+                Some(Type::Generic { base, .. }) if base == "Set"
+            );
+            let set_fastpath = is_iterable_set
+                && match &for_of_stmt.left {
+                    ast::ForHead::VarDecl(var_decl) => match var_decl.decls.first() {
+                        Some(decl) => matches!(&decl.name, ast::Pat::Ident(_)),
+                        None => false,
+                    },
+                    _ => false,
+                };
             let arr_expr = match &iterable_type {
                 Some(Type::Generic { base, type_args }) if base == "Map" => {
                     if type_args.len() >= 2 {
                         map_key_type = Some(type_args[0].clone());
                         map_val_type = Some(type_args[1].clone());
                     }
-                    Expr::MapEntries(Box::new(arr_expr))
+                    if map_kv_fastpath {
+                        // Keep the raw map expression — fast path reads flat
+                        // entries via MapEntryKeyAt / MapEntryValueAt below.
+                        arr_expr
+                    } else {
+                        Expr::MapEntries(Box::new(arr_expr))
+                    }
                 }
                 Some(Type::Generic { base, .. }) if base == "Set" => {
-                    Expr::SetValues(Box::new(arr_expr))
+                    if set_fastpath {
+                        // Keep the raw set expression — fast path reads
+                        // elements directly via SetValueAt below.
+                        arr_expr
+                    } else {
+                        Expr::SetValues(Box::new(arr_expr))
+                    }
                 }
                 _ => arr_expr,
             };
@@ -5536,10 +5750,24 @@ fn lower_stmt(ctx: &mut LoweringContext, module: &mut Module, stmt: &ast::Stmt) 
                     _ => Type::Any,
                 }
             };
-            // The __arr holder's type: String for string iteration (so codegen uses
-            // string.length and the str[i] char-access path), Array otherwise.
+            // The __arr holder's type: String for string iteration, Map for
+            // the Map-fast-path so `__m.size` resolves through `is_map_expr`,
+            // Array otherwise.
             let arr_type = if is_string_iter {
                 Type::String
+            } else if map_kv_fastpath {
+                Type::Generic {
+                    base: "Map".to_string(),
+                    type_args: vec![
+                        map_key_type.clone().unwrap_or(Type::Any),
+                        map_val_type.clone().unwrap_or(Type::Any),
+                    ],
+                }
+            } else if set_fastpath {
+                Type::Generic {
+                    base: "Set".to_string(),
+                    type_args: vec![elem_type.clone()],
+                }
             } else {
                 Type::Array(Box::new(elem_type.clone()))
             };
@@ -5653,52 +5881,104 @@ fn lower_stmt(ctx: &mut LoweringContext, module: &mut Module, stmt: &ast::Stmt) 
                             ast::Pat::Ident(_) => {
                                 // Simple binding: for (const x of arr)
                                 let (name, id) = var_ids[0].clone();
+                                let init = if set_fastpath {
+                                    Expr::SetValueAt {
+                                        set: Box::new(Expr::LocalGet(arr_id)),
+                                        idx: Box::new(Expr::LocalGet(idx_id)),
+                                    }
+                                } else {
+                                    item_expr
+                                };
                                 vec![Stmt::Let {
                                     id,
                                     name,
                                     ty: elem_type.clone(),
                                     mutable: false,
-                                    init: Some(item_expr),
+                                    init: Some(init),
                                 }]
                             }
                             ast::Pat::Array(arr_pat) => {
-                                // Array destructuring: for (const [a, b] of arr)
-                                let mut stmts = vec![Stmt::Let {
-                                    id: item_id,
-                                    name: format!("__item_{}", item_id),
-                                    ty: elem_type.clone(),
-                                    mutable: false,
-                                    init: Some(item_expr),
-                                }];
+                                if map_kv_fastpath {
+                                    // Map [k, v] / [k] / [, v] fast path: read
+                                    // each requested entry slot directly from
+                                    // the Map's flat buffer at the loop index.
+                                    // No `__item` Array materialization. Skipped
+                                    // slots ([,v] etc.) emit no binding.
+                                    let key_ty = map_key_type.clone().unwrap_or(Type::Any);
+                                    let val_ty = map_val_type.clone().unwrap_or(Type::Any);
+                                    let mut stmts: Vec<Stmt> = Vec::new();
+                                    let mut var_idx = 0;
+                                    for (slot, elem) in arr_pat.elems.iter().enumerate() {
+                                        let Some(ast::Pat::Ident(_)) = elem else {
+                                            continue;
+                                        };
+                                        let (name, id) = var_ids[var_idx].clone();
+                                        var_idx += 1;
+                                        let (ty, init) = if slot == 0 {
+                                            (
+                                                key_ty.clone(),
+                                                Expr::MapEntryKeyAt {
+                                                    map: Box::new(Expr::LocalGet(arr_id)),
+                                                    idx: Box::new(Expr::LocalGet(idx_id)),
+                                                },
+                                            )
+                                        } else {
+                                            (
+                                                val_ty.clone(),
+                                                Expr::MapEntryValueAt {
+                                                    map: Box::new(Expr::LocalGet(arr_id)),
+                                                    idx: Box::new(Expr::LocalGet(idx_id)),
+                                                },
+                                            )
+                                        };
+                                        stmts.push(Stmt::Let {
+                                            id,
+                                            name,
+                                            ty,
+                                            mutable: false,
+                                            init: Some(init),
+                                        });
+                                    }
+                                    stmts
+                                } else {
+                                    // Array destructuring: for (const [a, b] of arr)
+                                    let mut stmts = vec![Stmt::Let {
+                                        id: item_id,
+                                        name: format!("__item_{}", item_id),
+                                        ty: elem_type.clone(),
+                                        mutable: false,
+                                        init: Some(item_expr),
+                                    }];
 
-                                // Extract each element using pre-defined IDs
-                                let mut var_idx = 0;
-                                for (idx, elem) in arr_pat.elems.iter().enumerate() {
-                                    if let Some(elem_pat) = elem {
-                                        if let ast::Pat::Ident(_) = elem_pat {
-                                            let (name, id) = var_ids[var_idx].clone();
-                                            var_idx += 1;
-                                            // For Map destructuring, use the Tuple element type
-                                            let var_type = if let Type::Tuple(ref types) = elem_type
-                                            {
-                                                types.get(idx).cloned().unwrap_or(Type::Any)
-                                            } else {
-                                                Type::Any
-                                            };
-                                            stmts.push(Stmt::Let {
-                                                id,
-                                                name,
-                                                ty: var_type,
-                                                mutable: false,
-                                                init: Some(Expr::IndexGet {
-                                                    object: Box::new(Expr::LocalGet(item_id)),
-                                                    index: Box::new(Expr::Number(idx as f64)),
-                                                }),
-                                            });
+                                    // Extract each element using pre-defined IDs
+                                    let mut var_idx = 0;
+                                    for (idx, elem) in arr_pat.elems.iter().enumerate() {
+                                        if let Some(elem_pat) = elem {
+                                            if let ast::Pat::Ident(_) = elem_pat {
+                                                let (name, id) = var_ids[var_idx].clone();
+                                                var_idx += 1;
+                                                // For Map destructuring, use the Tuple element type
+                                                let var_type =
+                                                    if let Type::Tuple(ref types) = elem_type {
+                                                        types.get(idx).cloned().unwrap_or(Type::Any)
+                                                    } else {
+                                                        Type::Any
+                                                    };
+                                                stmts.push(Stmt::Let {
+                                                    id,
+                                                    name,
+                                                    ty: var_type,
+                                                    mutable: false,
+                                                    init: Some(Expr::IndexGet {
+                                                        object: Box::new(Expr::LocalGet(item_id)),
+                                                        index: Box::new(Expr::Number(idx as f64)),
+                                                    }),
+                                                });
+                                            }
                                         }
                                     }
+                                    stmts
                                 }
-                                stmts
                             }
                             ast::Pat::Object(obj_pat) => {
                                 // Object destructuring: for (const { a, b } of arr)
@@ -5816,6 +6096,20 @@ fn lower_stmt(ctx: &mut LoweringContext, module: &mut Module, stmt: &ast::Stmt) 
                 loop_body.insert(i, stmt);
             }
 
+            // Loop bound. Map/Set fast paths read `.size` (lowered by
+            // codegen to `js_map_size` / `js_set_size`); regular path uses
+            // `__arr.length` against the materialized iterable.
+            let bound_expr = if map_kv_fastpath || set_fastpath {
+                Expr::PropertyGet {
+                    object: Box::new(Expr::LocalGet(arr_id)),
+                    property: "size".to_string(),
+                }
+            } else {
+                Expr::PropertyGet {
+                    object: Box::new(Expr::LocalGet(arr_id)),
+                    property: "length".to_string(),
+                }
+            };
             // Create the for loop:
             // for (let __i = 0; __i < __arr.length; __i++) { ... }
             module.init.push(Stmt::For {
@@ -5829,10 +6123,7 @@ fn lower_stmt(ctx: &mut LoweringContext, module: &mut Module, stmt: &ast::Stmt) 
                 condition: Some(Expr::Compare {
                     op: CompareOp::Lt,
                     left: Box::new(Expr::LocalGet(idx_id)),
-                    right: Box::new(Expr::PropertyGet {
-                        object: Box::new(Expr::LocalGet(arr_id)),
-                        property: "length".to_string(),
-                    }),
+                    right: Box::new(bound_expr),
                 }),
                 update: Some(Expr::Update {
                     id: idx_id,
@@ -6517,6 +6808,30 @@ pub(crate) fn lower_expr(ctx: &mut LoweringContext, expr: &ast::Expr) -> Result<
             // Convert to: obj == null ? undefined : obj.prop
             match &*opt_chain.base {
                 ast::OptChainBase::Member(member) => {
+                    // Issue #449: `new.target?.<prop>` folds to a literal at
+                    // lowering time — same shape as the direct
+                    // `new.target.<prop>` fold in `expr_member::lower_member`,
+                    // applied here BEFORE `lower_expr(&member.obj)` would
+                    // otherwise route MetaProp(NewTarget) through the
+                    // broken Object-literal synthesis path. Inside a
+                    // constructor `new.target` is non-null/non-undefined,
+                    // so the optional chain just resolves the property;
+                    // outside a constructor it's undefined and the chain
+                    // short-circuits.
+                    if let ast::Expr::MetaProp(mp) = member.obj.as_ref() {
+                        if matches!(mp.kind, ast::MetaPropKind::NewTarget) {
+                            if let ast::MemberProp::Ident(prop_ident) = &member.prop {
+                                let prop_name = prop_ident.sym.as_ref();
+                                if let Some(class_name) = ctx.in_constructor_class.clone() {
+                                    return Ok(match prop_name {
+                                        "name" => Expr::String(class_name),
+                                        _ => Expr::Undefined,
+                                    });
+                                }
+                                return Ok(Expr::Undefined);
+                            }
+                        }
+                    }
                     // obj?.prop -> obj == null ? undefined : obj.prop
                     let obj_expr = lower_expr(ctx, &member.obj)?;
 

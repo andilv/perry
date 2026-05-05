@@ -193,18 +193,25 @@ pub(super) fn lower_meta_prop(
     meta_prop: &ast::MetaPropExpr,
 ) -> Result<Expr> {
     // import.meta / new.target. Property access on either (e.g.
-    // `import.meta.url`) is handled by the Member expression arm.
+    // `import.meta.url`) is intercepted at the Member expression arm
+    // (`expr_member::lower_member`) and folded directly to a literal —
+    // the Object synthesis below is the fallback for the rare bare
+    // `import.meta` use (spread, destructure, JSON.stringify, etc.).
     match meta_prop.kind {
         ast::MetaPropKind::ImportMeta => {
-            // Return the file:// URL directly for `import.meta.url`.
-            // Since `import.meta` is typically only used via `.url`,
-            // we synthesise a small one-field object so the Member
-            // arm's PropertyGet path resolves it.
-            let file_url = format!("file://{}", ctx.source_file_path);
-            Ok(Expr::Object(vec![(
-                "url".to_string(),
-                Expr::String(file_url),
-            )]))
+            // Bare `import.meta` reference. Property access goes through
+            // the Member arm and folds to a literal directly; this Object
+            // is the fallback for the rare cases where the value is used
+            // as an object (spread / destructure / passed to a function).
+            // Carries the same set of properties the Member arm exposes
+            // so `Object.keys(import.meta).includes("url")` still works.
+            let (url, dirname, filename) = import_meta_paths(ctx);
+            Ok(Expr::Object(vec![
+                ("url".to_string(), Expr::String(url)),
+                ("main".to_string(), Expr::Bool(ctx.is_entry_module)),
+                ("dirname".to_string(), Expr::String(dirname)),
+                ("filename".to_string(), Expr::String(filename)),
+            ]))
         }
         ast::MetaPropKind::NewTarget => {
             // Inside a class constructor, `new.target` evaluates to the
@@ -224,6 +231,23 @@ pub(super) fn lower_meta_prop(
             }
         }
     }
+}
+
+/// Issue #444: compute the `(url, dirname, filename)` triplet exposed via
+/// `import.meta`. Mirrors Node 20+ semantics — `url` is `file://<path>`,
+/// `filename` is the absolute file path, `dirname` is its parent directory.
+/// Used by both the bare-`import.meta` Object synthesis above and the
+/// member-access fast path in `expr_member::lower_member`.
+pub(crate) fn import_meta_paths(ctx: &LoweringContext) -> (String, String, String) {
+    let path = &ctx.source_file_path;
+    let url = format!("file://{}", path);
+    let dirname = match path.rfind('/') {
+        Some(i) if i > 0 => path[..i].to_string(),
+        Some(_) => "/".to_string(),
+        None => String::new(),
+    };
+    let filename = path.to_string();
+    (url, dirname, filename)
 }
 
 pub(super) fn lower_yield(ctx: &mut LoweringContext, y: &ast::YieldExpr) -> Result<Expr> {

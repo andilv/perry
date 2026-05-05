@@ -11,7 +11,11 @@
 
 use anyhow::{anyhow, Result};
 use perry_hir::ModuleKind;
-use perry_transform::{inline_functions, transform_async_to_generator, transform_generators};
+use perry_transform::{
+    gather_cross_module_anon_classes, gather_cross_module_methods,
+    gather_cross_module_methods_with_extern_imports, inline_functions,
+    transform_async_to_generator, transform_generators, MethodCandidate,
+};
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
@@ -185,30 +189,33 @@ pub(super) fn collect_modules(
         None
     };
 
-    let (mut hir_module, new_next_class_id) = perry_hir::lower_module_with_class_id_and_types(
-        ast_module,
-        &module_name,
-        &source_file_path,
-        *next_class_id,
-        resolved_types,
-    )?;
+    // Pass cross-module class field types so type inference can resolve
+    // `someLocal.field` where the local's declared type is a class defined
+    // in another module (and that module was already lowered earlier in
+    // the walk OR via the post-pass re-lowering kick-off below). Empty on
+    // the first pre-walk; populated for the second authoritative walk.
+    let imported_class_fields = if ctx.cross_module_class_field_types.is_empty() {
+        None
+    } else {
+        Some(&ctx.cross_module_class_field_types)
+    };
+    // Issue #444: this module is the user-supplied entry iff its canonical
+    // path matches the one stashed by `compile.rs::run_with_parse_cache`
+    // before the first `collect_modules` invocation. Bundle-extension
+    // entries don't update `entry_canonical`, so their `import.meta.main`
+    // correctly resolves to false.
+    let is_entry_module = ctx.entry_canonical.as_ref() == Some(&canonical);
+    let (mut hir_module, new_next_class_id) =
+        perry_hir::lower_module_with_class_id_types_seed_and_entry(
+            ast_module,
+            &module_name,
+            &source_file_path,
+            *next_class_id,
+            resolved_types,
+            imported_class_fields,
+            is_entry_module,
+        )?;
     *next_class_id = new_next_class_id; // Update the global class_id counter
-
-    if !skip_transforms {
-        // Apply function inlining optimization
-        inline_functions(&mut hir_module);
-
-        // Issue #256: rewrite plain async functions into generators with
-        // was_plain_async set, so the generator transform below produces
-        // a state machine wrapped in an async-step driver. Must run AFTER
-        // inline_functions (so inlined async bodies are also rewritten)
-        // and BEFORE transform_generators (which consumes the generator
-        // shape we produce).
-        transform_async_to_generator(&mut hir_module);
-
-        // Transform generator functions into state machines
-        transform_generators(&mut hir_module);
-    }
 
     // Process imports and update their resolved paths and module kinds
     for import in &mut hir_module.imports {
@@ -444,7 +451,9 @@ pub(super) fn collect_modules(
             perry_hir::Export::Named { .. } => None,
         };
         if let Some(src) = source {
-            if let Some((resolved_path, kind)) = cached_resolve_import(src, &canonical, ctx) {
+            if let Some((resolved_path, kind)) =
+                cached_resolve_import(src.as_str(), &canonical, ctx)
+            {
                 match kind {
                     ModuleKind::NativeCompiled => {
                         collect_modules(
@@ -478,6 +487,102 @@ pub(super) fn collect_modules(
                 }
             }
         }
+    }
+
+    // Run HIR transforms AFTER imports/re-exports have been recursively
+    // collected, so `ctx.native_modules` already contains every dependency
+    // of this module. The cross-module method-inlining harvester below
+    // pulls inlinable methods from those prior modules — without this
+    // ordering, a consumer (e.g. `sync-hotpath.test.ts`) would inline
+    // BEFORE `world.ts` finished processing, missing every `World.*`
+    // candidate and leaving the hot `world.set(...)` call as a runtime
+    // dispatch.
+    //
+    // Pre-existing constraint: `transform_async_to_generator` runs AFTER
+    // `inline_functions` (so inlined async bodies are still rewritten)
+    // and BEFORE `transform_generators` (which consumes the generator
+    // shape it produces). Issue #256.
+    if !skip_transforms {
+        let mut extra_methods: std::collections::HashMap<(String, String), MethodCandidate> =
+            std::collections::HashMap::new();
+        if std::env::var("PERRY_INLINE_DEBUG").is_ok() {
+            eprintln!(
+                "[INLINE-DRIVER] processing {}: prior modules={:?}",
+                hir_module.name,
+                ctx.native_modules
+                    .values()
+                    .map(|m| m.name.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+        for prior_module in ctx.native_modules.values() {
+            // The strict harvester rejects ExternFuncRef-using methods.
+            // The loose variant records each required extern name;
+            // `inline_functions` filters by destination imports.
+            // First-write-wins on key collision (rare — issue #309 cycle
+            // breaker). Strict-harvest entries are functionally equivalent
+            // when colliding with the loose variant (same body), so
+            // either ordering is correct.
+            for (k, v) in gather_cross_module_methods_with_extern_imports(prior_module) {
+                extra_methods.entry(k).or_insert(v);
+            }
+            for (k, v) in gather_cross_module_methods(prior_module) {
+                extra_methods.entry(k).or_insert(v);
+            }
+        }
+        // Cross-module field-type info: `(class_name, field_name) ->
+        // field_class_name`. Lets the inliner's `resolve_receiver_class`
+        // walk a chain like `world.commandBuffer.set(...)` — without it,
+        // the receiver match bails at the first PropertyGet and the call
+        // stays a runtime dispatch. Built from every prior module's
+        // class.fields where the type is `Named(...)`.
+        let mut extra_class_fields: std::collections::HashMap<(String, String), String> =
+            std::collections::HashMap::new();
+        for prior_module in ctx.native_modules.values() {
+            for class in &prior_module.classes {
+                for f in &class.fields {
+                    if let perry_types::Type::Named(field_class) = &f.ty {
+                        extra_class_fields
+                            .entry((class.name.clone(), f.name.clone()))
+                            .or_insert_with(|| field_class.clone());
+                    }
+                }
+            }
+        }
+        // Cross-module anon-shape classes. Names are content-addressed
+        // (FNV-1a hash of the canonical shape key), so dedup-by-name across
+        // modules is correct: any two modules that synthesized a class for
+        // the same closed-shape literal end up with byte-identical class
+        // definitions under the same name. Required so that when
+        // `inline_functions` copies a method body referencing
+        // `__AnonShape_<hash>` into this module, codegen can resolve the
+        // class definition (otherwise the field list is missing and the
+        // literal lowers as a bare object with all properties dropped).
+        let mut extra_anon_classes: std::collections::HashMap<String, perry_hir::Class> =
+            std::collections::HashMap::new();
+        for prior_module in ctx.native_modules.values() {
+            for (k, v) in gather_cross_module_anon_classes(prior_module) {
+                extra_anon_classes.entry(k).or_insert(v);
+            }
+        }
+        inline_functions(
+            &mut hir_module,
+            &extra_methods,
+            &extra_class_fields,
+            &extra_anon_classes,
+        );
+        // Static-trip-count for-loop unroll. Runs AFTER the inliner so any
+        // inlined function bodies' loops also get unrolled. Runs BEFORE the
+        // async/generator transforms — those transforms pre-emptively rewrite
+        // control flow into state-machine shapes that the unroll match would
+        // no longer recognize. Doing it pre-async keeps the analysis simple.
+        // image_convolution's 5x5 blur kernel: outer ky and inner kx both
+        // become 25 fully-unrolled stmts with `KERNEL[ky+2][kx+2]` collapsed
+        // to compile-time integer literals — see crates/perry-transform/
+        // src/unroll.rs.
+        perry_transform::unroll_static_loops(&mut hir_module);
+        transform_async_to_generator(&mut hir_module);
+        transform_generators(&mut hir_module);
     }
 
     // Detect fetch() usage — js_fetch_with_options lives in perry-stdlib

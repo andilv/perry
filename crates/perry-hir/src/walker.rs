@@ -333,6 +333,14 @@ where
             f(object);
             f(index);
         }
+        Expr::MapEntryKeyAt { map, idx } | Expr::MapEntryValueAt { map, idx } => {
+            f(map);
+            f(idx);
+        }
+        Expr::SetValueAt { set, idx } => {
+            f(set);
+            f(idx);
+        }
         Expr::IndexUpdate { object, index, .. } => {
             f(object);
             f(index);
@@ -1398,6 +1406,14 @@ where
         Expr::IndexGet { object, index } => {
             f(object);
             f(index);
+        }
+        Expr::MapEntryKeyAt { map, idx } | Expr::MapEntryValueAt { map, idx } => {
+            f(map);
+            f(idx);
+        }
+        Expr::SetValueAt { set, idx } => {
+            f(set);
+            f(idx);
         }
         Expr::IndexUpdate { object, index, .. } => {
             f(object);

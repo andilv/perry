@@ -476,6 +476,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
                     is_async: false,
                     is_generator: false,
                     was_plain_async: false,
+                    was_unrolled: false,
                     is_exported: false,
                     captures: Vec::new(),
                     decorators: Vec::new(),
@@ -565,9 +566,27 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
     // Vec we just built — the Vec lives for the remainder of compile_module).
     // Also build a map from class name → source module prefix so method
     // dispatch generates the correct cross-module symbol name.
+    //
+    // Skip imports that collide by name with a LOCAL class (#431). The
+    // local class shadows the import in `class_table` (the
+    // `class_table.entry().or_insert()` loop below preserves the local
+    // entry), so this map must not point a local-class lookup at an
+    // import's source prefix — doing so makes `compile_method` mangle
+    // the LOCAL methods under the IMPORTED module's prefix while the
+    // dispatch-table builder (line ~3614) still references them under
+    // the local prefix, leaving `@perry_method_<local>__<C>__<m>`
+    // undefined at link time. This is the cross-module sibling of
+    // #336's intra-module collision; #336 disambiguated the
+    // `@perry_class_keys_*` global, but the method-body prefix needs
+    // the same fix for cross-module name reuse (Effect's `Class` /
+    // `Refinement` / `Composite` / `ParseError` /
+    // `PropertySignatureTransformation` / `DroppingStrategy` cases).
     let mut imported_class_prefix: HashMap<String, String> = HashMap::new();
     for ic in &opts.imported_classes {
         let effective_name = ic.local_alias.as_deref().unwrap_or(&ic.name);
+        if hir.classes.iter().any(|c| c.name == *effective_name) {
+            continue;
+        }
         imported_class_prefix.insert(effective_name.to_string(), ic.source_prefix.clone());
     }
     for stub in &imported_class_stubs {
@@ -1064,13 +1083,51 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
                     .functions
                     .iter()
                     .any(|f| f.is_exported && f.name == *name);
-                if is_exported && !is_also_function {
+                // Also skip the value-getter when this name is already an
+                // exported function alias (e.g. `export const async = _async`
+                // or `export { _void as void }`). For those the #460 forwarding
+                // wrapper below emits a `perry_fn_<modprefix>__<name>`
+                // definition that actually calls the underlying function;
+                // emitting a getter here on top would be a redef and is
+                // semantically wrong (it'd return the closure value instead
+                // of invoking it).
+                let is_function_alias = hir
+                    .exported_functions
+                    .iter()
+                    .any(|(exp, _)| exp == name);
+                if is_exported && !is_also_function && !is_function_alias {
                     let fn_name = format!("perry_fn_{}__{}", module_prefix, sanitize(name),);
                     let getter = llmod.define_function(&fn_name, DOUBLE, vec![]);
                     let _ = getter.create_block("entry");
                     let blk = getter.block_mut(0).unwrap();
                     let val = blk.load(DOUBLE, &format!("@{}", global_name));
                     blk.ret(DOUBLE, &val);
+
+                    // #460: also emit a duplicate getter under any renamed
+                    // export targeting this local. `export { _await as await }`
+                    // means consumers compute the callee symbol from the
+                    // exported name `await` — without an alias getter the
+                    // link fails on `_perry_fn_<mod>__<keyword>`. The wrapper
+                    // returns the same global value the local-name getter
+                    // returns; callers that invoke it as a function get the
+                    // closure handle (matching status quo for non-renamed
+                    // `export const f = aFunctionRef` exports).
+                    for export in &hir.exports {
+                        if let perry_hir::Export::Named { local, exported } = export {
+                            if local == name && exported != name {
+                                let alias_fn =
+                                    format!("perry_fn_{}__{}", module_prefix, sanitize(exported));
+                                if alias_fn == fn_name {
+                                    continue;
+                                }
+                                let g = llmod.define_function(&alias_fn, DOUBLE, vec![]);
+                                let _ = g.create_block("entry");
+                                let b = g.block_mut(0).unwrap();
+                                let v = b.load(DOUBLE, &format!("@{}", global_name));
+                                b.ret(DOUBLE, &v);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1536,6 +1593,51 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         .with_context(|| format!("lowering function '{}'", f.name))?;
     }
 
+    // Closes #460: emit forwarding wrappers for `export { local as exported }`
+    // renames where the exported name differs from the function's local HIR
+    // name. Without these, cross-module callers compute the callee symbol
+    // from the *exported* name (`perry_fn_<src>__<exported>`) and link-fail
+    // because the body was emitted under the *local* name. Bites contextual-
+    // keyword renames the worst — Effect's `void_ as void`, `_async as async`,
+    // `_await as await`, etc. all left link-undefined `_perry_fn_..._<keyword>`.
+    {
+        use std::collections::HashSet;
+        let mut emitted_aliases: HashSet<String> = HashSet::new();
+        let func_by_id: HashMap<u32, &perry_hir::Function> =
+            hir.functions.iter().map(|f| (f.id, f)).collect();
+        for (exported_name, func_id) in &hir.exported_functions {
+            let Some(f) = func_by_id.get(func_id) else {
+                continue;
+            };
+            if &f.name == exported_name {
+                continue;
+            }
+            let alias_sym = format!("perry_fn_{}__{}", module_prefix, sanitize(exported_name));
+            let target_sym = match func_names.get(func_id) {
+                Some(s) => s.clone(),
+                None => continue,
+            };
+            if alias_sym == target_sym {
+                continue;
+            }
+            if !emitted_aliases.insert(alias_sym.clone()) {
+                continue;
+            }
+            let param_count = f.params.len();
+            let wrap_params: Vec<(LlvmType, String)> = (0..param_count)
+                .map(|i| (DOUBLE, format!("%a{}", i)))
+                .collect();
+            let wf = llmod.define_function(&alias_sym, DOUBLE, wrap_params);
+            let _ = wf.create_block("entry");
+            let blk = wf.block_mut(0).unwrap();
+            let arg_names: Vec<String> = (0..param_count).map(|i| format!("%a{}", i)).collect();
+            let call_args: Vec<(LlvmType, &str)> =
+                arg_names.iter().map(|s| (DOUBLE, s.as_str())).collect();
+            let result = blk.call(DOUBLE, &target_sym, &call_args);
+            blk.ret(DOUBLE, &result);
+        }
+    }
+
     // Lower each closure body as a top-level LLVM function.
     for (func_id, closure_expr) in &closures {
         compile_closure(
@@ -1659,6 +1761,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
                 is_async: false,
                 is_generator: false,
                 was_plain_async: false,
+                was_unrolled: false,
                 is_exported: false,
                 captures: ctor_body.2,
                 decorators: Vec::new(),
@@ -2116,8 +2219,12 @@ fn compile_function(
 
     // Small leaf functions (≤ 8 statements) get alwaysinline so LLVM
     // exposes their operations to the caller's optimizer context — critical
-    // for vectorizing clamp helpers and similar patterns.
-    if f.body.len() <= 8 && !f.is_async && !f.is_generator {
+    // for vectorizing clamp helpers and similar patterns. Excluded:
+    // async/generator functions, AND functions rewritten by the
+    // async-to-generator pre-pass (was_plain_async=true). Inlining the
+    // rewritten wrapper into its caller breaks GC-root coverage of the
+    // step closure's iter capture, hanging async chains (issue #447).
+    if f.body.len() <= 8 && !f.is_async && !f.is_generator && !f.was_plain_async {
         lf.force_inline = true;
     }
     let _ = lf.create_block("entry");
@@ -2172,6 +2279,20 @@ fn compile_function(
     // index subtree. Pure accumulators skip the Let-site i32 shadow so the body
     // stays a single-f64-alloca chain that LLVM's autovectorizer can widen.
     let index_used_locals = crate::collectors::collect_index_used_locals(&f.body);
+    // Issue #436: locals whose every write has a strictly-i32-bounded rhs
+    // (bitwise / `|0` / `>>>0` / Buffer-byte / MathImul / returns_int call,
+    // but NOT bare Add/Sub/Mul of int-stable). Used at the Let-site i32
+    // gate alongside `index_used_locals` so accumulators like image_conv's
+    // FNV-1a `h` (writes `(h^dst[i])|0` and `imul32(h,K)`) get the i32
+    // fast path even without index use, while #435's overflow-prone
+    // `sum += compute(i)` accumulators stay out (the bare Add is
+    // explicitly excluded).
+    let strictly_i32_bounded_locals = crate::collectors::collect_strictly_i32_bounded_locals(
+        &f.body,
+        &integer_locals,
+        &cross_module.flat_const_arrays.keys().copied().collect(),
+        &clamp_fn_ids,
+    );
 
     // Pre-walk: which `let x = new Class(...)` locals never escape?
     let non_escaping_news =
@@ -2230,6 +2351,7 @@ fn compile_function(
         bounded_index_pairs: Vec::new(),
         i32_counter_slots: HashMap::new(),
         index_used_locals: &index_used_locals,
+        strictly_i32_bounded_locals: &strictly_i32_bounded_locals,
         i18n: &cross_module.i18n,
         local_class_aliases: HashMap::new(),
         local_id_to_name: HashMap::new(),
@@ -2245,6 +2367,7 @@ fn compile_function(
         array_row_aliases: HashMap::new(),
         clamp3_functions: &cross_module.clamp3_functions,
         clamp_u8_functions: &cross_module.clamp_u8_functions,
+        was_unrolled: f.was_unrolled,
         ic_site_counter: ic_base,
         ic_globals: Vec::new(),
         typed_parse_rodata: Vec::new(),
@@ -2438,7 +2561,18 @@ fn compile_closure(
     // — they MUST agree on the slot indices, otherwise the body reads
     // captures from the wrong slots. Sorting the auto-detected ids
     // gives deterministic indexing across both call sites.
-    let mut auto_captures: Vec<u32> = captures.clone();
+    //
+    // Filter module globals out of the explicit captures list — same
+    // reason as in `compute_auto_captures` (closures auto-load module
+    // globals through `@perry_global_*`). Without this, the body and
+    // creation sites disagree on capture indices and a globalized
+    // block-scoped let captured by a closure ends up with a
+    // value-instead-of-box-pointer in its capture slot.
+    let mut auto_captures: Vec<u32> = captures
+        .iter()
+        .copied()
+        .filter(|id| !module_globals.contains_key(id))
+        .collect();
     {
         let mut referenced: std::collections::HashSet<u32> = std::collections::HashSet::new();
         collect_ref_ids_in_stmts(body, &mut referenced);
@@ -2515,6 +2649,12 @@ fn compile_closure(
         &clamp_fn_ids,
     );
     let index_used_locals = crate::collectors::collect_index_used_locals(body);
+    let strictly_i32_bounded_locals = crate::collectors::collect_strictly_i32_bounded_locals(
+        body,
+        &integer_locals,
+        &cross_module.flat_const_arrays.keys().copied().collect(),
+        &clamp_fn_ids,
+    );
 
     let non_escaping_news = crate::collectors::collect_non_escaping_news(
         body,
@@ -2583,6 +2723,7 @@ fn compile_closure(
         bounded_index_pairs: Vec::new(),
         i32_counter_slots: HashMap::new(),
         index_used_locals: &index_used_locals,
+        strictly_i32_bounded_locals: &strictly_i32_bounded_locals,
         i18n: &cross_module.i18n,
         local_class_aliases: HashMap::new(),
         local_id_to_name: HashMap::new(),
@@ -2598,6 +2739,7 @@ fn compile_closure(
         array_row_aliases: HashMap::new(),
         clamp3_functions: &cross_module.clamp3_functions,
         clamp_u8_functions: &cross_module.clamp_u8_functions,
+        was_unrolled: false,
         ic_site_counter: ic_base,
         ic_globals: Vec::new(),
         typed_parse_rodata: Vec::new(),
@@ -2728,6 +2870,12 @@ fn compile_method(
         &clamp_fn_ids,
     );
     let index_used_locals = crate::collectors::collect_index_used_locals(&method.body);
+    let strictly_i32_bounded_locals = crate::collectors::collect_strictly_i32_bounded_locals(
+        &method.body,
+        &integer_locals,
+        &cross_module.flat_const_arrays.keys().copied().collect(),
+        &clamp_fn_ids,
+    );
 
     let non_escaping_news = crate::collectors::collect_non_escaping_news(
         &method.body,
@@ -2792,6 +2940,7 @@ fn compile_method(
         bounded_index_pairs: Vec::new(),
         i32_counter_slots: HashMap::new(),
         index_used_locals: &index_used_locals,
+        strictly_i32_bounded_locals: &strictly_i32_bounded_locals,
         i18n: &cross_module.i18n,
         local_class_aliases: HashMap::new(),
         local_id_to_name: HashMap::new(),
@@ -2807,6 +2956,7 @@ fn compile_method(
         array_row_aliases: HashMap::new(),
         clamp3_functions: &cross_module.clamp3_functions,
         clamp_u8_functions: &cross_module.clamp_u8_functions,
+        was_unrolled: method.was_unrolled,
         ic_site_counter: ic_base,
         ic_globals: Vec::new(),
         typed_parse_rodata: Vec::new(),
@@ -3007,6 +3157,13 @@ fn compile_module_entry(
             &clamp_fn_ids,
         );
         let main_index_used_locals = crate::collectors::collect_index_used_locals(&hir.init);
+        let main_strictly_i32_bounded_locals =
+            crate::collectors::collect_strictly_i32_bounded_locals(
+                &hir.init,
+                &main_integer_locals,
+                &cross_module.flat_const_arrays.keys().copied().collect(),
+                &clamp_fn_ids,
+            );
         let main_non_escaping_news = crate::collectors::collect_non_escaping_news(
             &hir.init,
             &main_boxed_vars,
@@ -3072,6 +3229,7 @@ fn compile_module_entry(
             bounded_index_pairs: Vec::new(),
             i32_counter_slots: HashMap::new(),
             index_used_locals: &main_index_used_locals,
+            strictly_i32_bounded_locals: &main_strictly_i32_bounded_locals,
             i18n: &cross_module.i18n,
             local_class_aliases: HashMap::new(),
             local_id_to_name: HashMap::new(),
@@ -3087,6 +3245,7 @@ fn compile_module_entry(
             array_row_aliases: HashMap::new(),
             clamp3_functions: &cross_module.clamp3_functions,
             clamp_u8_functions: &cross_module.clamp_u8_functions,
+            was_unrolled: hir.init_was_unrolled,
             ic_site_counter: ic_base,
             ic_globals: Vec::new(),
             typed_parse_rodata: Vec::new(),
@@ -3246,6 +3405,13 @@ fn compile_module_entry(
             &clamp_fn_ids,
         );
         let init_index_used_locals = crate::collectors::collect_index_used_locals(&hir.init);
+        let init_strictly_i32_bounded_locals =
+            crate::collectors::collect_strictly_i32_bounded_locals(
+                &hir.init,
+                &init_integer_locals,
+                &cross_module.flat_const_arrays.keys().copied().collect(),
+                &clamp_fn_ids,
+            );
         let init_non_escaping_news = crate::collectors::collect_non_escaping_news(
             &hir.init,
             &init_boxed_vars,
@@ -3309,6 +3475,7 @@ fn compile_module_entry(
             bounded_index_pairs: Vec::new(),
             i32_counter_slots: HashMap::new(),
             index_used_locals: &init_index_used_locals,
+            strictly_i32_bounded_locals: &init_strictly_i32_bounded_locals,
             i18n: &cross_module.i18n,
             local_class_aliases: HashMap::new(),
             local_id_to_name: HashMap::new(),
@@ -3324,6 +3491,7 @@ fn compile_module_entry(
             array_row_aliases: HashMap::new(),
             clamp3_functions: &cross_module.clamp3_functions,
             clamp_u8_functions: &cross_module.clamp_u8_functions,
+            was_unrolled: hir.init_was_unrolled,
             ic_site_counter: ic_base,
             ic_globals: Vec::new(),
             typed_parse_rodata: Vec::new(),
@@ -3708,6 +3876,12 @@ fn compile_static_method(
         &clamp_fn_ids,
     );
     let index_used_locals = crate::collectors::collect_index_used_locals(&f.body);
+    let strictly_i32_bounded_locals = crate::collectors::collect_strictly_i32_bounded_locals(
+        &f.body,
+        &integer_locals,
+        &cross_module.flat_const_arrays.keys().copied().collect(),
+        &clamp_fn_ids,
+    );
 
     let static_boxed_vars = module_boxed_vars.clone();
     let non_escaping_news = crate::collectors::collect_non_escaping_news(
@@ -3774,6 +3948,7 @@ fn compile_static_method(
         bounded_index_pairs: Vec::new(),
         i32_counter_slots: HashMap::new(),
         index_used_locals: &index_used_locals,
+        strictly_i32_bounded_locals: &strictly_i32_bounded_locals,
         i18n: &cross_module.i18n,
         local_class_aliases: HashMap::new(),
         local_id_to_name: HashMap::new(),
@@ -3789,6 +3964,7 @@ fn compile_static_method(
         array_row_aliases: HashMap::new(),
         clamp3_functions: &cross_module.clamp3_functions,
         clamp_u8_functions: &cross_module.clamp_u8_functions,
+        was_unrolled: f.was_unrolled,
         ic_site_counter: ic_base,
         ic_globals: Vec::new(),
         typed_parse_rodata: Vec::new(),

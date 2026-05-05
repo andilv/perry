@@ -93,14 +93,30 @@ impl ArenaBlock {
     /// Try to allocate within this block, respecting alignment
     #[inline]
     fn alloc(&mut self, size: usize, align: usize) -> Option<*mut u8> {
-        // Align offset up
-        let aligned_offset = (self.offset + align - 1) & !(align - 1);
+        // Always preserve at least 8-byte alignment between calls so
+        // the codegen inline bump-allocator fast path
+        // (`crates/perry-codegen/src/lower_call.rs`'s inline-keys
+        // allocator) can safely advance `offset += total_size`
+        // without re-aligning. Pre-fix, an odd-sized string
+        // allocation (`StringHeader=20` + N-byte payload via
+        // `arena_alloc_gc`) left `offset` misaligned; the next
+        // inline `new ClassName()` inherited the misalignment, the
+        // returned user_ptr had low bits set, `arena_walk_objects`
+        // (which iterates at 8-aligned positions) skipped it,
+        // `build_valid_pointer_set` never inserted it, and the GC
+        // mark phase rejected it as "not in valid_ptrs". The
+        // archetype's `componentData` Map went unmarked and got
+        // swept; the freed entries buffer was reused for a new alloc;
+        // the first f64 key drifted to a denormal (~1.086e-311).
+        let pad = align.max(8);
+        let aligned_offset = (self.offset + pad - 1) & !(pad - 1);
         if aligned_offset + size > self.size {
             return None;
         }
 
         let ptr = unsafe { self.data.add(aligned_offset) };
-        self.offset = aligned_offset + size;
+        let bumped = aligned_offset + size;
+        self.offset = (bumped + pad - 1) & !(pad - 1);
         Some(ptr)
     }
 }
@@ -135,8 +151,10 @@ impl Drop for Arena {
 
 impl Arena {
     fn new() -> Self {
+        let initial = ArenaBlock::new();
+        ARENA_TOTAL_BYTES.with(|t| t.set(t.get() + initial.size));
         Arena {
-            blocks: vec![ArenaBlock::new()],
+            blocks: vec![initial],
             current: 0,
         }
     }
@@ -192,6 +210,7 @@ impl Arena {
         // semantics stay bounded even on workloads that churn
         // through nursery blocks.
         let fresh = alloc_block(size);
+        let fresh_size = fresh.size;
         let mut tomb_idx: Option<usize> = None;
         for i in 0..self.blocks.len() {
             if self.blocks[i].data.is_null() {
@@ -210,6 +229,7 @@ impl Arena {
             }
         };
         self.current = new_idx;
+        ARENA_TOTAL_BYTES.with(|t| t.set(t.get() + fresh_size));
 
         self.blocks[self.current]
             .alloc(size, align)
@@ -218,6 +238,18 @@ impl Arena {
 }
 
 thread_local! {
+    /// Cached running sum of `block.size` across every arena (general,
+    /// longlived, old-gen). `arena_total_bytes()` previously walked
+    /// every block of every arena summing this on every call — and
+    /// `gc_check_trigger()` calls it on every `gc_malloc`, so for an
+    /// 80-block working set the per-allocation overhead was ~250 ns
+    /// just to recompute a total that almost never changes (only on
+    /// fresh-block alloc and tombstone dealloc). Maintained via deltas
+    /// at the four mutation sites (Arena::new initial block, fresh
+    /// alloc into a tombstone slot or the end, and dealloc inside
+    /// `arena_reset_empty_blocks`).
+    static ARENA_TOTAL_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
     static ARENA: UnsafeCell<Arena> = UnsafeCell::new(Arena::new());
 
     /// Segregated long-lived arena (issue #179). Holds objects that are
@@ -430,7 +462,12 @@ pub fn arena_alloc_longlived(size: usize, align: usize) -> *mut u8 {
 pub fn arena_alloc_gc_longlived(size: usize, align: usize, obj_type: u8) -> *mut u8 {
     use crate::gc::{GcHeader, GC_FLAG_ARENA, GC_HEADER_SIZE};
 
-    let total = GC_HEADER_SIZE + size;
+    // Same alignment-preservation rationale as `arena_alloc_gc`: pad
+    // `total` to a multiple of `max(align, 8)` so the next caller's
+    // bumped offset stays aligned. The codegen inline fast path
+    // assumes this invariant.
+    let pad = align.max(8);
+    let total = (GC_HEADER_SIZE + size + pad - 1) & !(pad - 1);
     let raw = arena_alloc_longlived(total, align);
 
     unsafe {
@@ -468,7 +505,9 @@ pub fn arena_alloc_old(size: usize, align: usize) -> *mut u8 {
 pub fn arena_alloc_gc_old(size: usize, align: usize, obj_type: u8) -> *mut u8 {
     use crate::gc::{GcHeader, GC_FLAG_ARENA, GC_HEADER_SIZE};
 
-    let total = GC_HEADER_SIZE + size;
+    // Same alignment-preservation rationale as `arena_alloc_gc`.
+    let pad = align.max(8);
+    let total = (GC_HEADER_SIZE + size + pad - 1) & !(pad - 1);
     let raw = arena_alloc_old(total, align);
 
     unsafe {
@@ -545,7 +584,27 @@ pub fn arena_alloc_gc(size: usize, align: usize, obj_type: u8) -> *mut u8 {
         return user_ptr;
     }
 
-    let total = GC_HEADER_SIZE + size;
+    // Pad `total` up to a multiple of 8 so the arena's offset stays
+    // 8-aligned after each GC alloc. The codegen inline bump-allocator
+    // fast path in `crates/perry-codegen/src/lower_call.rs` reads the
+    // current offset, adds `total_size`, and stores back without
+    // re-aligning — its "every allocation is a multiple of 8"
+    // invariant is only valid if every `arena_alloc_gc` caller
+    // honors it. Strings (`StringHeader=20` bytes + N-byte payload)
+    // routinely allocate odd sizes, which left the offset misaligned
+    // for the next inline class allocation. Symptoms: `new World()`
+    // returned a misaligned user_ptr; `arena_walk_objects` (which
+    // walks at 8-aligned positions) skipped the World object;
+    // `build_valid_pointer_set` therefore never inserted World;
+    // `try_mark_value` rejected the World pointer found in the
+    // shadow stack; mark phase missed every reachable Map / Array
+    // hanging off World; sweep freed the archetype's componentData
+    // entries buffer; the next allocation reused that slab and the
+    // first componentData key drifted to a denormal (~1.086e-311),
+    // throwing "Component type 1 is not in this archetype" on the
+    // next query.
+    let pad = align.max(8);
+    let total = (GC_HEADER_SIZE + size + pad - 1) & !(pad - 1);
     let raw = arena_alloc(total, align);
 
     unsafe {
@@ -566,30 +625,13 @@ pub extern "C" fn js_arena_alloc(size: u32) -> *mut u8 {
     arena_alloc(size as usize, 8)
 }
 
-/// Get total bytes reserved across all arena blocks (general + longlived).
+/// Get total bytes reserved across all arena blocks (general + longlived
+/// + old-gen). Reads the running sum maintained via deltas at the four
+/// mutation sites — one TLS load instead of an O(blocks) walk on the
+/// gc-trigger hot path.
+#[inline]
 pub fn arena_total_bytes() -> usize {
-    let mut total: usize = 0;
-    ARENA.with(|arena| {
-        let arena = unsafe { &*arena.get() };
-        for block in &arena.blocks {
-            total += block.size;
-        }
-    });
-    LONGLIVED_ARENA.with(|arena| {
-        let arena = unsafe { &*arena.get() };
-        for block in &arena.blocks {
-            total += block.size;
-        }
-    });
-    // Phase B: include old-gen blocks. Empty in Phase B; Phase C
-    // populates via promotion.
-    OLD_ARENA.with(|arena| {
-        let arena = unsafe { &*arena.get() };
-        for block in &arena.blocks {
-            total += block.size;
-        }
-    });
-    total
+    ARENA_TOTAL_BYTES.with(|t| t.get())
 }
 
 /// Get bytes currently in use (sum of `block.offset` across blocks).
@@ -625,6 +667,62 @@ pub fn arena_in_use_bytes() -> usize {
 /// Walk all GcHeader objects in arena blocks linearly (general arena +
 /// longlived arena, in that order — block indices are global with
 /// general blocks occupying `0..general_block_count()`).
+/// Walk all GC objects across all 3 arenas in ascending data-pointer
+/// (block-address) order. Used by `gc::build_valid_pointer_set` so the
+/// resulting pointer stream is a single sorted run instead of K
+/// (≈ block-count) interspersed sorted runs — the final `sort()` then
+/// only has to in-place insertion-sort the small unsorted malloc tail
+/// and run one O(N) merge, dropping driftsort's K-way-merge phase
+/// (≈ 19 % of total runtime in ECS perf-comprehensive).
+///
+/// Sorting the (small) block list is microseconds (~200 entries on the
+/// ECS bench); the saved sort work over 1.6 M user pointers is on the
+/// order of N · log K cache-line-sized comparisons.
+pub fn arena_walk_objects_addr_sorted(mut callback: impl FnMut(*mut u8)) {
+    use crate::gc::GcHeader;
+
+    sync_inline_arena_state();
+
+    // Collect (data, block.offset, block.size) for every non-tombstone
+    // block across all 3 arenas. Using usize for `data` so we can sort
+    // by address; cast back to *mut u8 when walking.
+    let mut blocks: Vec<(usize, usize, usize)> = Vec::new();
+    let collect = |arena: &Arena, blocks: &mut Vec<(usize, usize, usize)>| {
+        for b in &arena.blocks {
+            if !b.data.is_null() {
+                blocks.push((b.data as usize, b.offset, b.size));
+            }
+        }
+    };
+    ARENA.with(|a| unsafe { collect(&*a.get(), &mut blocks) });
+    LONGLIVED_ARENA.with(|a| unsafe { collect(&*a.get(), &mut blocks) });
+    OLD_ARENA.with(|a| unsafe { collect(&*a.get(), &mut blocks) });
+    blocks.sort_unstable_by_key(|&(d, _, _)| d);
+
+    for (data, block_offset, block_size) in blocks {
+        let mut offset = 0usize;
+        while offset < block_offset {
+            let aligned = (offset + 7) & !7;
+            if aligned >= block_offset {
+                break;
+            }
+            let header_ptr = (data + aligned) as *mut u8;
+            let header = header_ptr as *const GcHeader;
+            unsafe {
+                let total_size = (*header).size as usize;
+                if total_size == 0 || total_size > block_size {
+                    break;
+                }
+                let obj_type = (*header).obj_type;
+                if (1..=9).contains(&obj_type) {
+                    callback(header_ptr);
+                }
+                offset = aligned + total_size;
+            }
+        }
+    }
+}
+
 /// Calls `callback` for each GcHeader pointer found.
 /// Objects are discovered by their `size` field (hop from one to the next).
 pub fn arena_walk_objects(mut callback: impl FnMut(*mut u8)) {
@@ -1046,6 +1144,7 @@ pub fn arena_reset_empty_blocks(block_has_live: &[bool]) {
                 let layout = Layout::from_size_align(block.size, 16).unwrap();
                 deallocated_ranges.push((block.data as usize, block.size));
                 std::alloc::dealloc(block.data, layout);
+                ARENA_TOTAL_BYTES.with(|t| t.set(t.get().saturating_sub(block.size)));
                 block.data = std::ptr::null_mut();
                 block.size = 0;
                 block.offset = 0;

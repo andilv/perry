@@ -9,10 +9,10 @@
 use crate::arena::arena_alloc_gc;
 use crate::ArrayHeader;
 use crate::JSValue;
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::RwLock;
 
 /// Overflow field storage for objects that exceed their pre-allocated inline slot count.
@@ -29,7 +29,12 @@ use std::sync::RwLock;
 /// This handles cases like Object.assign() adding many fields to an object
 /// that was allocated with only 8 slots (e.g., @noble/curves Fp field with 21 properties).
 thread_local! {
-    static OVERFLOW_FIELDS: RefCell<HashMap<usize, Vec<u64>>> = RefCell::new(HashMap::new());
+    /// Heap-pointer keyed; PtrHasher avoids the per-call SipHash on
+    /// every overflow read/write. `clear_overflow_for_ptr` was 0.7%
+    /// leaf samples on perf-comprehensive (called from object dispatch
+    /// + arena_walk_objects in the GC path).
+    static OVERFLOW_FIELDS: RefCell<crate::fast_hash::PtrHashMap<usize, Vec<u64>>> =
+        RefCell::new(crate::fast_hash::new_ptr_hash_map());
 }
 
 /// Last-accessed overflow Vec cache — one entry, keyed by `obj_ptr`.
@@ -613,6 +618,24 @@ pub fn clear_overflow_for_ptr(obj_ptr: usize) {
     });
 }
 
+/// Cheap check used by the GC sweep to short-circuit per-object
+/// `clear_overflow_for_ptr` calls. Most workloads never exceed the 8
+/// inline slots and OVERFLOW_FIELDS stays empty for the entire run; on
+/// those, paying a TLS access + RefCell borrow + HashMap remove on
+/// every dead arena object is pure waste (~1.4 % leaf samples on
+/// perf-comprehensive's sweep walk over ~1.6 M dead headers per cycle).
+/// When this returns true, the sweep skips both `clear_overflow_for_ptr`
+/// AND the `OVERFLOW_LAST` cache invalidation: with no entries in the
+/// HashMap, the cached `Vec` pointer is either already null (initial
+/// state) or was nulled by the most recent `clear_overflow_for_ptr` /
+/// `overflow_set` cycle that emptied the map. Either way it can't
+/// alias a freed pointer because no allocation can have produced a
+/// matching obj_ptr without first writing to OVERFLOW_FIELDS.
+#[inline]
+pub fn overflow_fields_is_empty() -> bool {
+    OVERFLOW_FIELDS.with(|m| m.borrow().is_empty())
+}
+
 /// Global class registry mapping class_id -> parent_class_id for inheritance chain lookups
 static CLASS_REGISTRY: RwLock<Option<HashMap<u32, u32>>> = RwLock::new(None);
 
@@ -854,6 +877,7 @@ pub unsafe extern "C" fn js_register_class_method(
             param_count: param_count as u32,
         },
     );
+    VTABLE_GEN.fetch_add(1, Ordering::Release);
 }
 
 /// Register a class getter in the vtable registry.
@@ -882,6 +906,122 @@ pub unsafe extern "C" fn js_register_class_getter(
         getters: HashMap::new(),
     });
     vtable.getters.insert(name, func_ptr as usize);
+    VTABLE_GEN.fetch_add(1, Ordering::Release);
+}
+
+// ============================================================================
+// Per-callsite-keyed inline cache for vtable method dispatch.
+//
+// `js_native_call_method` is the hot dispatch tower for cross-module class
+// instance method calls (e.g. `archetype.set(...)` from CommandBuffer.execute
+// in the ECS workloads). Per profile, ~12% of perf-comprehensive samples land
+// in `core::hash::BuildHasher` from the per-call `HashMap.get(method_name)`
+// SipHash on the vtable lookup.
+//
+// Cache key: `(class_id, method_name_ptr)` where `method_name_ptr` is the
+// rodata byte-pointer perry-codegen passes for the interned method name. The
+// pointer is stable across calls within a module, so its address acts as a
+// faster identity than re-hashing the bytes. Different modules may produce
+// different rodata copies of the same name — the cache simply gets one entry
+// per (class_id, name_pointer) pair, no correctness impact.
+//
+// Invalidation: a global `VTABLE_GEN` atomic is bumped on every
+// `js_register_class_method` / `js_register_class_getter`. Each cache entry
+// records the gen at populate time; lookups skip stale entries. Registration
+// is one-shot at init in practice, so steady-state lookups never miss on
+// gen.
+// ============================================================================
+
+static VTABLE_GEN: AtomicU64 = AtomicU64::new(1);
+
+const VTABLE_IC_SIZE: usize = 4096;
+const VTABLE_IC_MASK: usize = VTABLE_IC_SIZE - 1;
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct VTableICEntry {
+    gen: u64,
+    class_id: u32,
+    _pad: u32,
+    method_name_ptr: usize,
+    func_ptr: usize,
+    param_count: u32,
+    _pad2: u32,
+}
+
+const EMPTY_VTABLE_IC_ENTRY: VTableICEntry = VTableICEntry {
+    gen: 0,
+    class_id: 0,
+    _pad: 0,
+    method_name_ptr: 0,
+    func_ptr: 0,
+    param_count: 0,
+    _pad2: 0,
+};
+
+thread_local! {
+    static VTABLE_IC: UnsafeCell<[VTableICEntry; VTABLE_IC_SIZE]> = const {
+        UnsafeCell::new([EMPTY_VTABLE_IC_ENTRY; VTABLE_IC_SIZE])
+    };
+}
+
+#[inline(always)]
+fn vtable_ic_slot(class_id: u32, method_name_ptr: usize) -> usize {
+    // Mix class_id into the upper bits of the pointer to spread (class, name)
+    // pairs across slots. method_name_ptr is at least 1-byte aligned but
+    // typically 8+ for rodata strings, so shift by 3 to drop the alignment
+    // zeros before masking.
+    let key = method_name_ptr
+        .rotate_left(13)
+        .wrapping_add((class_id as usize).wrapping_mul(0x9E37_79B9));
+    (key >> 3) & VTABLE_IC_MASK
+}
+
+#[inline(always)]
+unsafe fn vtable_ic_lookup(class_id: u32, method_name_ptr: usize) -> Option<(usize, u32)> {
+    if method_name_ptr == 0 {
+        return None;
+    }
+    let cur_gen = VTABLE_GEN.load(Ordering::Relaxed);
+    let slot = vtable_ic_slot(class_id, method_name_ptr);
+    VTABLE_IC.with(|cell| {
+        let cache = &*cell.get();
+        let entry = &cache[slot];
+        if entry.gen == cur_gen
+            && entry.class_id == class_id
+            && entry.method_name_ptr == method_name_ptr
+        {
+            Some((entry.func_ptr, entry.param_count))
+        } else {
+            None
+        }
+    })
+}
+
+#[inline(always)]
+unsafe fn vtable_ic_insert(
+    class_id: u32,
+    method_name_ptr: usize,
+    func_ptr: usize,
+    param_count: u32,
+) {
+    if method_name_ptr == 0 {
+        return;
+    }
+    let cur_gen = VTABLE_GEN.load(Ordering::Relaxed);
+    let slot = vtable_ic_slot(class_id, method_name_ptr);
+    VTABLE_IC.with(|cell| {
+        let cache = &mut *cell.get();
+        cache[slot] = VTableICEntry {
+            gen: cur_gen,
+            class_id,
+            _pad: 0,
+            method_name_ptr,
+            func_ptr,
+            param_count,
+            _pad2: 0,
+        };
+    });
 }
 
 /// Call a vtable method with the correct arity.
@@ -2738,10 +2878,21 @@ pub extern "C" fn js_object_get_field_ic_miss(
                         // slow path which handles overflow correctly.
                         break;
                     }
-                    if i < 8 {
-                        (*cache)[0] = keys as i64;
-                        (*cache)[1] = i as i64;
-                    }
+                    // The codegen IC fast path computes `obj + 24 + slot*8`
+                    // and does a direct load. Any inline slot (`i <
+                    // alloc_limit`) is reachable via that path, so cache
+                    // every inline slot — including the ones at index >= 8
+                    // for classes whose `field_count` exceeds the
+                    // MIN_FIELD_SLOTS=8 baseline (e.g. World.commandBuffer
+                    // sits at slot 12). Pre-fix this branch capped the cache
+                    // at `i < 8` which left every >8-slot field permanently
+                    // missing the cache: every access fell through to a
+                    // fresh keys_array walk + js_string_equals chain. On
+                    // perf-comprehensive's hot loops that path was hit
+                    // ~900k times per run (40% inclusive samples per
+                    // perfcomp.profile).
+                    (*cache)[0] = keys as i64;
+                    (*cache)[1] = i as i64;
                     let field_ptr = (obj as *const u8)
                         .add(std::mem::size_of::<ObjectHeader>() + i * 8)
                         as *const f64;
@@ -3826,13 +3977,25 @@ pub unsafe extern "C" fn js_native_call_method(
                 }
             }
 
-            // Vtable lookup for class instances
+            // Vtable lookup for class instances — fast path via per-callsite IC
             let class_id = (*obj).class_id;
             if class_id != 0 {
+                if let Some((func_ptr, param_count)) =
+                    vtable_ic_lookup(class_id, method_name_ptr as usize)
+                {
+                    let this_i64 = jsval.as_pointer::<u8>() as i64;
+                    return call_vtable_method(func_ptr, this_i64, args_ptr, args_len, param_count);
+                }
                 if let Ok(registry) = CLASS_VTABLE_REGISTRY.read() {
                     if let Some(ref reg) = *registry {
                         if let Some(vtable) = reg.get(&class_id) {
                             if let Some(entry) = vtable.methods.get(method_name) {
+                                vtable_ic_insert(
+                                    class_id,
+                                    method_name_ptr as usize,
+                                    entry.func_ptr,
+                                    entry.param_count,
+                                );
                                 let this_i64 = jsval.as_pointer::<u8>() as i64;
                                 return call_vtable_method(
                                     entry.func_ptr,
@@ -3994,13 +4157,25 @@ pub unsafe extern "C" fn js_native_call_method(
                 }
             }
 
-            // Vtable lookup
+            // Vtable lookup — fast path via per-callsite IC
             let class_id = (*obj).class_id;
             if class_id != 0 {
+                if let Some((func_ptr, param_count)) =
+                    vtable_ic_lookup(class_id, method_name_ptr as usize)
+                {
+                    let this_i64 = raw_bits as i64;
+                    return call_vtable_method(func_ptr, this_i64, args_ptr, args_len, param_count);
+                }
                 if let Ok(registry) = CLASS_VTABLE_REGISTRY.read() {
                     if let Some(ref reg) = *registry {
                         if let Some(vtable) = reg.get(&class_id) {
                             if let Some(entry) = vtable.methods.get(method_name) {
+                                vtable_ic_insert(
+                                    class_id,
+                                    method_name_ptr as usize,
+                                    entry.func_ptr,
+                                    entry.param_count,
+                                );
                                 let this_i64 = raw_bits as i64;
                                 return call_vtable_method(
                                     entry.func_ptr,
@@ -4138,14 +4313,29 @@ pub unsafe extern "C" fn js_native_call_method(
                 let null_obj_ptr = &NULL_OBJECT_BYTES as *const NullObjectBytes as *mut u8;
                 return f64::from_bits(JSValue::pointer(null_obj_ptr).bits());
             }
-            let method_key =
-                crate::string::js_string_from_bytes(method_name.as_ptr(), method_name.len() as u32);
-
+            // Compare method_name bytes directly against each stored key
+            // instead of allocating a transient StringHeader via
+            // js_string_from_bytes — that allocation showed up as ~10% of
+            // perf-comprehensive's hot-path samples (one alloc per
+            // dynamic-dispatch method call × N keys-array lookups).
+            let method_bytes = method_name.as_bytes();
             for i in 0..key_count {
                 let key_val = crate::array::js_array_get(keys, i as u32);
                 if key_val.is_string() {
                     let stored_key = key_val.as_string_ptr();
-                    if crate::string::js_string_equals(method_key, stored_key) != 0 {
+                    let matches = if !crate::string::is_valid_string_ptr(stored_key) {
+                        false
+                    } else {
+                        let blen = (*stored_key).byte_len as usize;
+                        if blen != method_bytes.len() {
+                            false
+                        } else {
+                            let stored_data = crate::string::string_data(stored_key);
+                            let stored = std::slice::from_raw_parts(stored_data, blen);
+                            stored == method_bytes
+                        }
+                    };
+                    if matches {
                         // Found the method — delegate to `js_native_call_value`
                         // which handles both NaN-boxed pointers (POINTER_TAG)
                         // and raw-pointer-bits (e.g. the resolve/reject
@@ -4660,6 +4850,33 @@ pub extern "C" fn js_native_module_bind_method(
     crate::closure::js_closure_set_capture_ptr(closure, 1, heap_name as i64);
     crate::closure::js_closure_set_capture_ptr(closure, 2, property_name_len as i64);
 
+    crate::value::js_nanbox_pointer(closure as i64)
+}
+
+/// Build a "bound method" closure for `obj.method` PropertyGet on a known class
+/// instance. The captures (instance, method_name_ptr, method_name_len) drive
+/// `dispatch_bound_method` (closure.rs), which calls `js_native_call_method`
+/// — that resolves the method through `CLASS_VTABLE_REGISTRY` for any class
+/// registered by `js_register_class_method` at module init.
+///
+/// Issue #446: previously a class method reference (`let f = obj.method`,
+/// `typeof obj.method`, `arr.map(obj.method)`) silently lowered to the
+/// generic property-bag lookup, which doesn't store prototype methods —
+/// every such read returned `undefined`, so `typeof obj.method === "undefined"`
+/// and a captured method ran no body when invoked.
+///
+/// Method-name pointer is expected to be stable for the closure's lifetime;
+/// codegen emits it from the per-module `.str.N.bytes` rodata global.
+#[no_mangle]
+pub extern "C" fn js_class_method_bind(
+    instance: f64,
+    method_name_ptr: *const u8,
+    method_name_len: usize,
+) -> f64 {
+    let closure = crate::closure::js_closure_alloc(crate::closure::BOUND_METHOD_FUNC_PTR, 3);
+    crate::closure::js_closure_set_capture_f64(closure, 0, instance);
+    crate::closure::js_closure_set_capture_ptr(closure, 1, method_name_ptr as i64);
+    crate::closure::js_closure_set_capture_ptr(closure, 2, method_name_len as i64);
     crate::value::js_nanbox_pointer(closure as i64)
 }
 
@@ -5369,15 +5586,26 @@ pub extern "C" fn js_object_define_property(
             // keys) can see it.
             ensure_key_in_keys_array(obj, key_str);
             if let Some(k) = key_rust.clone() {
+                // Issue #450: spec says the getter/setter runs with `this === obj`
+                // (the property access target). The user's descriptor literal
+                // `{ get() {...}, set() {...} }` was lowered with `captures_this: true`
+                // and had its reserved `this` slot patched to point to the *descriptor*
+                // object at construction time — that's what every other object-literal
+                // method does. Clone the closure once at defineProperty time and
+                // rebind `this` to `obj`, so every subsequent get/set call sees the
+                // correct receiver. Closures without CAPTURES_THIS_FLAG (e.g. arrow-form
+                // `get: () => this._backing` written as a field rather than a method
+                // shorthand) pass through unchanged.
+                let recv_box = crate::value::js_nanbox_pointer(obj as i64);
                 let get_bits = if get_field.is_undefined() {
                     0u64
                 } else {
-                    get_field.bits()
+                    crate::closure::clone_closure_rebind_this(get_field.bits(), recv_box)
                 };
                 let set_bits = if set_field.is_undefined() {
                     0u64
                 } else {
-                    set_field.bits()
+                    crate::closure::clone_closure_rebind_this(set_field.bits(), recv_box)
                 };
                 set_accessor_descriptor(
                     obj as usize,

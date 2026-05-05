@@ -5,6 +5,32 @@
 //!   - ClosureHeader at the start
 //!   - Followed by captured values (as f64 or i64 pointers)
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+thread_local! {
+    /// Singleton cache keyed by `func_ptr` for non-capturing closures.
+    /// See `js_closure_alloc_singleton` and `snapshot_singleton_closures`.
+    static SINGLETON_CLOSURES: RefCell<HashMap<usize, *mut ClosureHeader>> =
+        RefCell::new(HashMap::new());
+
+    /// Per-`func_ptr` single-slot cache for closures with captures.
+    /// Each value is `(last_captures, last_closure)` — when the same
+    /// closure literal is created again with the SAME capture bits,
+    /// we return the cached closure; otherwise we allocate a fresh
+    /// one and replace the slot.
+    ///
+    /// One entry per closure literal (bounded by the number of
+    /// `Expr::Closure` sites in the program), not per
+    /// `(func_ptr, capture-tuple)` pair — this prevents a closure
+    /// whose captures vary per call (e.g.
+    /// `getOrCompute(map, key, () => new Foo(sortedTypes))` capturing
+    /// a fresh array per call) from filling the cache and crowding
+    /// out closures with stable captures.
+    static SINGLETON_CAPTURED_CLOSURES: RefCell<HashMap<usize, (Vec<u64>, *mut ClosureHeader)>> =
+        RefCell::new(HashMap::new());
+}
+
 /// Magic value stored in ClosureHeader._reserved to identify closures at runtime.
 /// Used by js_value_typeof to return "function" instead of "object" for closures.
 pub const CLOSURE_MAGIC: u32 = 0x434C_4F53; // "CLOS" in ASCII
@@ -59,6 +85,111 @@ pub extern "C" fn js_closure_alloc(func_ptr: *const u8, capture_count: u32) -> *
     }
 
     ptr
+}
+
+/// Singleton-cached closure allocation for non-capturing closures and FuncRef
+/// wrappers. The same `func_ptr` always yields the SAME ClosureHeader, so a
+/// hot loop like `arr.filter(x => x.kind === 'foo')` doesn't allocate (and
+/// trigger GC against) a fresh closure on every iteration.
+///
+/// Per-call cost: one thread-local hashmap lookup + one branch + one load.
+/// Roughly 50× faster than `js_closure_alloc` for the no-capture case
+/// because the gc_malloc path runs `gc_check_trigger` which can fire a
+/// minor collection — a single hot non-capturing closure inside a tight
+/// for-loop was the dominant cost in sync-hotpath / perf-comprehensive
+/// (sample profile pinned 7/11 samples on `isDontFragmentRelation` →
+/// `js_closure_alloc` → `gc_collect_minor`).
+///
+/// Safety: the cached closure has zero captures, so it has no per-call
+/// state — sharing it across all call sites is observationally identical
+/// to allocating fresh. The closure is GC-rooted by the singleton table
+/// (the table is scanned in `gc::trace_singleton_closures`) so it stays
+/// live across collections without being copied/moved.
+#[no_mangle]
+pub extern "C" fn js_closure_alloc_singleton(func_ptr: *const u8) -> *mut ClosureHeader {
+    // Fast path: already cached. Drop the borrow before any potential
+    // alloc so gc_malloc can re-enter SINGLETON_CLOSURES if it ever needs to.
+    if let Some(cached) = SINGLETON_CLOSURES.with(|s| s.borrow().get(&(func_ptr as usize)).copied())
+    {
+        return cached;
+    }
+    let allocated = js_closure_alloc(func_ptr, 0);
+    SINGLETON_CLOSURES.with(|s| {
+        s.borrow_mut().insert(func_ptr as usize, allocated);
+    });
+    allocated
+}
+
+/// Snapshot the singleton-closure table for the GC. Returns the cached
+/// closure pointers so `gc::build_valid_pointer_set` (or equivalent) can
+/// mark them as roots — without this, the GC would reclaim a singleton
+/// closure as soon as no live JSValue references it, even though emitted
+/// code keeps reaching for it via `js_closure_alloc_singleton`.
+pub fn snapshot_singleton_closures() -> Vec<*mut ClosureHeader> {
+    let mut out: Vec<*mut ClosureHeader> =
+        SINGLETON_CLOSURES.with(|s| s.borrow().values().copied().collect());
+    SINGLETON_CAPTURED_CLOSURES.with(|s| {
+        for (_caps, c) in s.borrow().values() {
+            out.push(*c);
+        }
+    });
+    out
+}
+
+/// Per-`func_ptr` single-slot cache for closures with captures. When
+/// the same closure literal is created again with the SAME capture
+/// bits, we return the cached closure; otherwise we allocate a fresh
+/// one and replace the slot.
+///
+/// `captures_ptr` points at `capture_count` consecutive 8-byte values
+/// matching the layout `js_closure_set_capture_f64` writes.
+///
+/// One entry per closure literal (bounded by program size). Closures
+/// whose captures vary per call (e.g. `getOrCompute(map, key, () =>
+/// ...)` capturing a fresh array each call) miss every time but only
+/// occupy one slot, so they don't crowd out steady-state captures.
+#[no_mangle]
+pub extern "C" fn js_closure_alloc_with_captures_singleton(
+    func_ptr: *const u8,
+    capture_count: u32,
+    captures_ptr: *const u64,
+) -> *mut ClosureHeader {
+    let n = real_capture_count(capture_count) as usize;
+    let captures_slice: &[u64] = if n == 0 || captures_ptr.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(captures_ptr, n) }
+    };
+
+    // Fast path: per-func-ptr single slot — if the cached captures
+    // match the new ones, return the cached closure. Avoids a HashMap
+    // allocation on the hot path.
+    if let Some(cached) = SINGLETON_CAPTURED_CLOSURES.with(|s| {
+        let s = s.borrow();
+        s.get(&(func_ptr as usize)).and_then(|(prev_caps, ptr)| {
+            if prev_caps.as_slice() == captures_slice {
+                Some(*ptr)
+            } else {
+                None
+            }
+        })
+    }) {
+        return cached;
+    }
+
+    // Slow path: allocate, populate captures, insert into cache.
+    let allocated = js_closure_alloc(func_ptr, capture_count);
+    if n > 0 && !captures_ptr.is_null() {
+        unsafe {
+            let dest = (allocated as *mut u8).add(std::mem::size_of::<ClosureHeader>()) as *mut u64;
+            std::ptr::copy_nonoverlapping(captures_ptr, dest, n);
+        }
+    }
+    SINGLETON_CAPTURED_CLOSURES.with(|s| {
+        s.borrow_mut()
+            .insert(func_ptr as usize, (captures_slice.to_vec(), allocated));
+    });
+    allocated
 }
 
 /// Get the function pointer from a closure
@@ -1225,7 +1356,6 @@ pub unsafe extern "C" fn js_native_call_value(
     }
 }
 
-use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 static CLOSURE_PROPS: OnceLock<Mutex<HashMap<usize, HashMap<String, f64>>>> = OnceLock::new();
@@ -1320,6 +1450,65 @@ pub extern "C" fn js_closure_unbind_this(val: f64) -> f64 {
         // NaN-box the new closure pointer
         let new_ptr = new_closure as u64;
         f64::from_bits(0x7FFD_0000_0000_0000 | (new_ptr & 0x0000_FFFF_FFFF_FFFF))
+    }
+}
+
+/// Issue #450: clone an accessor closure (from `Object.defineProperty(obj, k, { get, set })`)
+/// and patch its reserved `this` slot with `recv_box` (the NaN-boxed target object pointer).
+///
+/// The user's descriptor object literal's `{ get() {...}, set() {...} }` methods are codegen'd
+/// with `captures_this: true` — at object-literal construction the codegen patches their
+/// reserved `this` slot to point to the *descriptor* object. But spec says the getter/setter
+/// runs with `this === obj` (the property access target, NOT the descriptor). So we clone
+/// the closure once at defineProperty time and rebind `this` to `obj`. The original
+/// descriptor closure is untouched (in case the user reuses it).
+///
+/// `closure_bits` is the NaN-boxed closure value (POINTER_TAG | ptr); `recv_box` is the
+/// NaN-boxed target receiver (POINTER_TAG | obj). Returns the new closure as NaN-boxed bits,
+/// or returns `closure_bits` unchanged if the input isn't a CAPTURES_THIS closure.
+///
+/// Reserved `this` slot index is `auto_captures.len()` per the codegen convention
+/// (`crates/perry-codegen/src/expr.rs::lower_object_literal` and
+/// `crates/perry-runtime/src/symbol.rs::js_object_set_symbol_method` — both use the LAST
+/// capture slot, i.e. `real_count - 1`, as the `this` slot for `captures_this` closures).
+pub(crate) fn clone_closure_rebind_this(closure_bits: u64, recv_box: f64) -> u64 {
+    let tag = closure_bits & 0xFFFF_0000_0000_0000;
+    if tag != 0x7FFD_0000_0000_0000 {
+        return closure_bits;
+    }
+    let ptr = (closure_bits & 0x0000_FFFF_FFFF_FFFF) as usize;
+    if ptr < 0x10000 {
+        return closure_bits;
+    }
+    unsafe {
+        let type_tag = std::ptr::read_volatile((ptr as *const u8).add(12) as *const u32);
+        if type_tag != CLOSURE_MAGIC {
+            return closure_bits;
+        }
+        let header = ptr as *const ClosureHeader;
+        let raw_count = (*header).capture_count;
+        // No CAPTURES_THIS_FLAG → the closure body doesn't read `this`, no rebind needed.
+        if raw_count & CAPTURES_THIS_FLAG == 0 {
+            return closure_bits;
+        }
+        let count = real_capture_count(raw_count) as usize;
+        if count == 0 {
+            return closure_bits;
+        }
+        // Allocate a fresh closure with the same func_ptr + capture_count (preserving the flag).
+        let new_closure = js_closure_alloc((*header).func_ptr, raw_count);
+        let src_captures =
+            (ptr as *const u8).add(std::mem::size_of::<ClosureHeader>()) as *const f64;
+        let dst_captures =
+            (new_closure as *mut u8).add(std::mem::size_of::<ClosureHeader>()) as *mut f64;
+        // Copy every capture verbatim, then overwrite the `this` slot (last) with recv_box.
+        for i in 0..count {
+            *dst_captures.add(i) = *src_captures.add(i);
+        }
+        let this_slot = count - 1;
+        *dst_captures.add(this_slot) = recv_box;
+        let new_ptr = new_closure as u64;
+        0x7FFD_0000_0000_0000 | (new_ptr & 0x0000_FFFF_FFFF_FFFF)
     }
 }
 
@@ -1510,6 +1699,75 @@ pub unsafe extern "C" fn js_closure_call_array(
             a(15),
         ),
     }
+}
+
+/// Closure call with regular + spread args: `cb(reg0, reg1, ..., ...spread_arr)`.
+///
+/// Codegen lowers `closure(...args)` (or `closure(a, b, ...rest)`) at the
+/// CallSpread arm by collecting regular arg slots into a stack buffer,
+/// unboxing the spread source to an array handle, and calling this helper.
+/// We concatenate `regular_args[0..regular_count]` with the array's
+/// elements into a scratch buffer, then dispatch through
+/// `js_closure_call_array`.
+///
+/// `closure_box` is a NaN-boxed closure value (the same shape that
+/// `lower_expr` produces for a closure-typed expression). A null/undefined
+/// box returns TAG_UNDEFINED.
+#[no_mangle]
+pub unsafe extern "C" fn js_closure_call_apply_with_spread(
+    closure_box: f64,
+    regular_args: *const f64,
+    regular_count: i64,
+    spread_arr_handle: i64,
+) -> f64 {
+    use crate::array::ArrayHeader;
+
+    let bits = closure_box.to_bits();
+    let closure_ptr = (bits & 0x0000_FFFF_FFFF_FFFF) as *const ClosureHeader;
+    if closure_ptr.is_null() {
+        return f64::from_bits(crate::value::TAG_UNDEFINED);
+    }
+
+    let reg_n = if regular_count < 0 {
+        0
+    } else {
+        regular_count as usize
+    };
+
+    let arr = spread_arr_handle as *const ArrayHeader;
+    let (spread_n, spread_data): (usize, *const f64) = if arr.is_null() {
+        (0, std::ptr::null())
+    } else {
+        let len = (*arr).length as usize;
+        let data = (arr as *const u8).add(std::mem::size_of::<ArrayHeader>()) as *const f64;
+        (len, data)
+    };
+
+    let total = reg_n + spread_n;
+
+    // Small fast path: stack buffer for up to 16 args (matches js_closure_call16).
+    let mut stack_buf: [f64; 16] = [0.0; 16];
+    let mut heap_buf: Vec<f64>;
+    let buf_ptr: *const f64 = if total <= 16 {
+        if !regular_args.is_null() && reg_n > 0 {
+            std::ptr::copy_nonoverlapping(regular_args, stack_buf.as_mut_ptr(), reg_n);
+        }
+        if !spread_data.is_null() && spread_n > 0 {
+            std::ptr::copy_nonoverlapping(spread_data, stack_buf.as_mut_ptr().add(reg_n), spread_n);
+        }
+        stack_buf.as_ptr()
+    } else {
+        heap_buf = vec![0.0; total];
+        if !regular_args.is_null() && reg_n > 0 {
+            std::ptr::copy_nonoverlapping(regular_args, heap_buf.as_mut_ptr(), reg_n);
+        }
+        if !spread_data.is_null() && spread_n > 0 {
+            std::ptr::copy_nonoverlapping(spread_data, heap_buf.as_mut_ptr().add(reg_n), spread_n);
+        }
+        heap_buf.as_ptr()
+    };
+
+    js_closure_call_array(closure_ptr as i64, buf_ptr, total as i64)
 }
 
 // V8 interop no-op stubs. Real implementations are in perry-jsruntime/src/interop.rs.

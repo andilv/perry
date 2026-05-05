@@ -101,7 +101,11 @@ pub struct TypedArrayHeader {
 
 thread_local! {
     /// Address -> kind, so we can detect typed arrays at format/instanceof time.
-    static TYPED_ARRAY_REGISTRY: RefCell<HashMap<usize, u8>> = RefCell::new(HashMap::new());
+    /// PtrHasher (Fibonacci-multiplicative + xorshift): heap pointers don't
+    /// need SipHash. Hot on `is_registered_buffer`-adjacent dispatch paths
+    /// (~1.0% leaf samples on perf-comprehensive).
+    static TYPED_ARRAY_REGISTRY: RefCell<crate::fast_hash::PtrHashMap<usize, u8>> =
+        RefCell::new(crate::fast_hash::new_ptr_hash_map());
 }
 
 pub fn register_typed_array(ptr: *const TypedArrayHeader, kind: u8) {

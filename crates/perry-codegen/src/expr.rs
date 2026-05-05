@@ -433,6 +433,24 @@ pub(crate) struct FnCtx<'a> {
     /// loop-preservation barrier from issue #74 in place.
     pub index_used_locals: &'a std::collections::HashSet<u32>,
 
+    /// (Issue #436) Locals where every write (Stmt::Let init, LocalSet,
+    /// Update) has a strictly-i32-bounded rhs per
+    /// `is_strictly_i32_bounded_expr`. Excludes the dangerous
+    /// Add/Sub/Mul-of-int-stable arm (the #435 accumulator-overflow
+    /// shape) but includes pure bitwise ops (`a & b`, `a ^ b`, `a >> n`),
+    /// the explicit i32 coerces (`expr | 0`, `expr >>> 0`), Buffer-byte
+    /// loads, MathImul, Update (i++/i--), and calls to clamp /
+    /// returns_integer functions.
+    ///
+    /// Used at the Let-site `needs_i32_slot` gate alongside
+    /// `index_used_locals`: a local qualifies for the i32 fast path if
+    /// it's transitively-index-used OR strictly-i32-bounded. Image_conv's
+    /// FNV-1a `h` accumulator is the latter case — its writes are
+    /// `(h ^ dst[i]) | 0` (explicit coerce) and `imul32(h, K)`
+    /// (returns_integer call), both strict, so `h` stays on i32 even
+    /// though it's never used as an array index.
+    pub strictly_i32_bounded_locals: &'a std::collections::HashSet<u32>,
+
     /// Compile-time i18n resolution context. When `Some`, the
     /// `Expr::I18nString` lowering looks up the translation for the
     /// default locale at compile time and emits the resolved string
@@ -539,6 +557,19 @@ pub(crate) struct FnCtx<'a> {
     /// Clamp-pattern function IDs. Call sites emit smin/smax inline.
     pub clamp3_functions: &'a std::collections::HashSet<u32>,
     pub clamp_u8_functions: &'a std::collections::HashSet<u32>,
+
+    /// True if `perry_transform::unroll_static_loops` expanded any
+    /// static-trip-count for-loop in the function this FnCtx is lowering
+    /// (or in `module.init` for the module-init lowering). Read by the
+    /// channel-vector SIMD reduction gate in `lower_stmts` to decide
+    /// whether to skip the manual `<4 x i32>` reduction in favour of
+    /// LLVM's auto-vectorizer + constant-folding. The unroll exposes the
+    /// kernel coefficients as compile-time literals; the manual SIMD
+    /// pre-commits to a `<4 x i32>` shape that fights LLVM's freedom to
+    /// pick mul-by-shift / mul-by-1-elimination across the unrolled
+    /// body. See `image_convolution`'s blur kernel: post-unroll without
+    /// manual SIMD = 310-320 ms vs with manual SIMD = 350-360 ms.
+    pub was_unrolled: bool,
 
     /// (Issue #51) Counter for per-site inline cache globals.
     pub ic_site_counter: u32,
@@ -2140,16 +2171,22 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             let blk = ctx.block();
             let idx_bits = blk.bitcast_double_to_i64(&idx_box);
             let top16 = blk.lshr(I64, &idx_bits, "48");
-            let is_str_tag = blk.icmp_eq(I64, &top16, "32767");
+            // STRING_TAG (0x7FFF = 32767): heap StringHeader pointer.
+            let is_str_tag_heap = blk.icmp_eq(I64, &top16, "32767");
             let lower48 = blk.and(I64, &idx_bits, POINTER_MASK_I64);
             let is_valid_ptr = blk.icmp_ugt(I64, &lower48, "4095");
-            let is_str = blk.and(crate::types::I1, &is_str_tag, &is_valid_ptr);
+            let is_str_heap = blk.and(crate::types::I1, &is_str_tag_heap, &is_valid_ptr);
+            // SHORT_STRING_TAG (0x7FF9 = 32761): inline SSO from JSON.parse,
+            // .slice, etc. Lower 48 encode length+bytes, NOT a pointer, so we
+            // can't AND-mask to a StringHeader; route through unbox_str_handle
+            // which materializes SSO to a heap StringHeader (issue #434).
+            let is_str_tag_sso = blk.icmp_eq(I64, &top16, "32761");
+            let is_str = blk.or(crate::types::I1, &is_str_heap, &is_str_tag_sso);
             ctx.block().cond_br(&is_str, &str_lbl, &num_lbl);
             // String key → object field access.
             ctx.current_block = str_idx;
             let blk = ctx.block();
-            let idx_bits2 = blk.bitcast_double_to_i64(&idx_box);
-            let key_handle = blk.and(I64, &idx_bits2, POINTER_MASK_I64);
+            let key_handle = unbox_str_handle(blk, &idx_box);
             let v_str = blk.call(
                 DOUBLE,
                 "js_object_get_field_by_name_f64",
@@ -2285,6 +2322,42 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             let recv_handle = unbox_to_i64(blk, &recv_box);
             let arr_handle = blk.call(I64, "js_error_get_errors", &[(I64, &recv_handle)]);
             Ok(nanbox_pointer_inline(blk, &arr_handle))
+        }
+
+        // Buffer / Uint8Array `.length` — INLINE for locals with a
+        // pre-computed `buffer_data_slots` entry. Length lives 8 bytes
+        // before the data start (BufferHeader). The slot is populated
+        // by `Stmt::Let` for `const x = Buffer.alloc(N)` / `new
+        // Uint8Array(N)` whose binding doesn't escape — same locals
+        // that get the GEP-based fast path in `Expr::Uint8ArrayGet`.
+        // Marked `!invariant.load` so LICM can hoist the read out of
+        // tight inner loops like image_conv's FNV-1a hash:
+        //
+        //   for (let i = 0; i < dst.length; i++)
+        //
+        // Without this, `dst.length` falls through to the GC-type
+        // gate below — Buffer/Uint8Array have no GC header (they're
+        // `std::alloc`'d), so `gc_type` reads garbage, `has_length`
+        // is false, and every iteration calls `js_value_length_f64`
+        // (function call into the side-table registry). v0.5.83's
+        // `is_array || is_string` guard intentionally routes Buffers
+        // through that slow path for safety, but the buffer-data-slot
+        // path proves the receiver shape at compile time.
+        Expr::PropertyGet { object, property }
+            if property == "length"
+                && matches!(object.as_ref(), Expr::LocalGet(id)
+                    if ctx.buffer_data_slots.contains_key(id)) =>
+        {
+            let arr_id = match object.as_ref() {
+                Expr::LocalGet(id) => *id,
+                _ => unreachable!(),
+            };
+            let (ptr_slot, _scope) = ctx.buffer_data_slots.get(&arr_id).cloned().unwrap();
+            let blk = ctx.block();
+            let data_ptr = blk.load(PTR, &ptr_slot);
+            let header_ptr = blk.gep(I8, &data_ptr, &[(I32, "-8")]);
+            let len_i32 = blk.load_invariant(I32, &header_ptr);
+            return Ok(blk.sitofp(I32, &len_i32, DOUBLE));
         }
 
         // `arr.length` / `str.length` — INLINE. Both ArrayHeader and
@@ -2699,16 +2772,19 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             let blk = ctx.block();
             let idx_bits = blk.bitcast_double_to_i64(&idx_box);
             let top16 = blk.lshr(I64, &idx_bits, "48");
-            let is_str_tag = blk.icmp_eq(I64, &top16, "32767");
+            // STRING_TAG (0x7FFF) heap pointer + SHORT_STRING_TAG (0x7FF9) SSO.
+            // See IndexGet path comment / issue #434 for the SSO rationale.
+            let is_str_tag_heap = blk.icmp_eq(I64, &top16, "32767");
             let lower48 = blk.and(I64, &idx_bits, POINTER_MASK_I64);
             let is_valid_ptr = blk.icmp_ugt(I64, &lower48, "4095");
-            let is_str = blk.and(crate::types::I1, &is_str_tag, &is_valid_ptr);
+            let is_str_heap = blk.and(crate::types::I1, &is_str_tag_heap, &is_valid_ptr);
+            let is_str_tag_sso = blk.icmp_eq(I64, &top16, "32761");
+            let is_str = blk.or(crate::types::I1, &is_str_heap, &is_str_tag_sso);
             ctx.block().cond_br(&is_str, &str_lbl, &num_lbl);
             // String key → object field set.
             ctx.current_block = str_set;
             let blk = ctx.block();
-            let idx_bits2 = blk.bitcast_double_to_i64(&idx_box);
-            let key_handle = blk.and(I64, &idx_bits2, POINTER_MASK_I64);
+            let key_handle = unbox_str_handle(blk, &idx_box);
             ctx.block().call_void(
                 "js_object_set_field_by_name",
                 &[
@@ -2724,16 +2800,57 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // storage, so we preserve the pre-#157 inline scheme here. Typed-
             // array writes go through TypedArraySet which stores via
             // `js_typed_array_set` with the correct per-kind width.
+            //
+            // Issue #412 follow-up: when the receiver is a stale post-grow
+            // array pointer (forwarding marker installed at OLD location by
+            // js_array_grow), the inline `obj_handle + 8 + idx*8` store
+            // writes into OLD's buffer footprint — which is shorter than
+            // the logical length implies, corrupting the next allocation.
+            // Check GC_FLAG_FORWARDED at handle-7; if set, route through
+            // js_array_set_f64_extend whose clean_arr_ptr_mut follows the
+            // forwarding chain to the live new array. Same pattern as
+            // lower_index_set_fast and the IndexGet hot path.
             ctx.current_block = num_set;
             {
                 let blk = ctx.block();
                 let idx_i32 = blk.fptosi(DOUBLE, &idx_box, I32);
-                let idx_i64 = blk.zext(I32, &idx_i32, I64);
-                let byte_off = blk.shl(I64, &idx_i64, "3");
-                let with_hdr = blk.add(I64, &byte_off, "8");
-                let elem_addr = blk.add(I64, &obj_handle, &with_hdr);
-                let elem_ptr = blk.inttoptr(I64, &elem_addr);
-                blk.store(DOUBLE, &val_double, &elem_ptr);
+                let gc_flags_addr = blk.sub(I64, &obj_handle, "7");
+                let gc_flags_ptr = blk.inttoptr(I64, &gc_flags_addr);
+                let gc_flags = blk.load(I8, &gc_flags_ptr);
+                let fwd_bits = blk.and(I8, &gc_flags, "128");
+                let is_fwd = blk.icmp_ne(I8, &fwd_bits, "0");
+                let fwd_lbl_idx = ctx.new_block("iset.num.fwd");
+                let inline_lbl_idx = ctx.new_block("iset.num.inline");
+                let num_done_idx = ctx.new_block("iset.num.done");
+                let fwd_lbl = ctx.block_label(fwd_lbl_idx);
+                let inline_lbl = ctx.block_label(inline_lbl_idx);
+                let num_done_lbl = ctx.block_label(num_done_idx);
+                ctx.block().cond_br(&is_fwd, &fwd_lbl, &inline_lbl);
+
+                ctx.current_block = fwd_lbl_idx;
+                {
+                    let blk = ctx.block();
+                    blk.call(
+                        I64,
+                        "js_array_set_f64_extend",
+                        &[(I64, &obj_handle), (I32, &idx_i32), (DOUBLE, &val_double)],
+                    );
+                    blk.br(&num_done_lbl);
+                }
+
+                ctx.current_block = inline_lbl_idx;
+                {
+                    let blk = ctx.block();
+                    let idx_i64 = blk.zext(I32, &idx_i32, I64);
+                    let byte_off = blk.shl(I64, &idx_i64, "3");
+                    let with_hdr = blk.add(I64, &byte_off, "8");
+                    let elem_addr = blk.add(I64, &obj_handle, &with_hdr);
+                    let elem_ptr = blk.inttoptr(I64, &elem_addr);
+                    blk.store(DOUBLE, &val_double, &elem_ptr);
+                    blk.br(&num_done_lbl);
+                }
+
+                ctx.current_block = num_done_idx;
             }
             ctx.block().br(&merge_lbl);
             ctx.current_block = set_merge;
@@ -3042,6 +3159,37 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     let field_ptr = blk.gep(DOUBLE, &fields_base, &[(I64, &idx_str)]);
                     return Ok(blk.load(DOUBLE, &field_ptr));
                 }
+                // Issue #446: `obj.method` PropertyGet on a known class
+                // instance, where `method` is a method (not a field, not a
+                // getter — those branches return above). Emit a bound-method
+                // closure (`BOUND_METHOD_FUNC_PTR` sentinel + (instance,
+                // name_ptr, name_len) captures) so reads work as JS expects:
+                //   - `typeof obj.method === "function"`
+                //   - `let f = obj.method; f(args)` dispatches to the method
+                //   - `arr.map(obj.method)` passes a callable reference
+                // The closure's call path routes through
+                // `js_native_call_method`, which resolves the symbol via
+                // `CLASS_VTABLE_REGISTRY` (populated at module init by
+                // `js_register_class_method`), so this works for both local
+                // and cross-module classes. Pre-fix, the read fell through
+                // to the generic property-bag lookup which doesn't store
+                // prototype methods — every method reference returned
+                // `undefined`.
+                let method_key = (class_name.clone(), property.clone());
+                if ctx.methods.contains_key(&method_key) {
+                    let recv_box = lower_expr(ctx, object)?;
+                    let key_idx = ctx.strings.intern(property);
+                    let entry = ctx.strings.entry(key_idx);
+                    let bytes_global = format!("@{}", entry.bytes_global);
+                    let len_str = entry.byte_len.to_string();
+                    let blk = ctx.block();
+                    let bytes_i64 = blk.ptrtoint(&bytes_global, I64);
+                    return Ok(blk.call(
+                        DOUBLE,
+                        "js_class_method_bind",
+                        &[(DOUBLE, &recv_box), (I64, &bytes_i64), (I64, &len_str)],
+                    ));
+                }
             }
             let obj_box = lower_expr(ctx, object)?;
             let key_idx = ctx.strings.intern(property);
@@ -3300,6 +3448,139 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // go to whichever storage we read from.
             let v = lower_expr(ctx, value)?;
             let arr_box = lower_expr(ctx, &Expr::LocalGet(*array_id))?;
+
+            // Fast path: local-bound, non-captured, non-boxed array.
+            // This is the canonical hot shape — `out.push(...)` over a
+            // local array variable. The runtime's `js_array_push_f64`
+            // does `clean_arr_ptr_mut` (heap-range check + forwarding
+            // chain walk + length/capacity sanity check + lazy detect)
+            // before every store; for an array that's known to be a
+            // plain heap pointer, that's wasted work on the *millions*
+            // of pushes a JSON-pipeline-style workload performs.
+            //
+            // Inline shape (mirrors `lower_index_set_fast`):
+            //
+            //   if (gc_flags & FORWARDED): call js_array_push_f64 (slow)
+            //   else:
+            //     length   = load i32, arr+0
+            //     capacity = load i32, arr+4
+            //     if (length < capacity):
+            //       store double value, arr+8+length*8
+            //       store i32 (length+1), arr+0
+            //       done
+            //     else:
+            //       call js_array_push_f64 (grow path)
+            //
+            // The fast inline branch needs no slot write-back — the
+            // array pointer doesn't change unless we grow. The slow
+            // branches both update the slot via the existing
+            // boxed/captured/local fall-through below.
+            if !ctx.boxed_vars.contains(array_id)
+                && !ctx.closure_captures.contains_key(array_id)
+                && ctx.locals.contains_key(array_id)
+            {
+                let slot = ctx.locals.get(array_id).cloned().unwrap();
+                let blk = ctx.block();
+                let arr_handle = unbox_to_i64(blk, &arr_box);
+
+                // Issue #233: forwarded arrays must follow the
+                // forwarding chain. Route through the runtime which
+                // calls clean_arr_ptr_mut and writes into the live
+                // head — the inline path's offset-0 length read would
+                // otherwise pick up the lower 32 bits of the
+                // forwarding pointer (garbage).
+                let gc_flags_addr = blk.sub(I64, &arr_handle, "7");
+                let gc_flags_ptr = blk.inttoptr(I64, &gc_flags_addr);
+                let gc_flags = blk.load(I8, &gc_flags_ptr);
+                let fwd_bits = blk.and(I8, &gc_flags, "128");
+                let is_fwd = blk.icmp_ne(I8, &fwd_bits, "0");
+
+                let fwd_idx = ctx.new_block("apush.fwd");
+                let nofwd_idx = ctx.new_block("apush.nofwd");
+                let inbounds_idx = ctx.new_block("apush.inbounds");
+                let realloc_idx = ctx.new_block("apush.realloc");
+                let merge_idx = ctx.new_block("apush.merge");
+
+                let fwd_label = ctx.block_label(fwd_idx);
+                let nofwd_label = ctx.block_label(nofwd_idx);
+                let inbounds_label = ctx.block_label(inbounds_idx);
+                let realloc_label = ctx.block_label(realloc_idx);
+                let merge_label = ctx.block_label(merge_idx);
+
+                ctx.block().cond_br(&is_fwd, &fwd_label, &nofwd_label);
+
+                // FORWARDED branch: route through runtime.
+                ctx.current_block = fwd_idx;
+                {
+                    let blk = ctx.block();
+                    let new_handle = blk.call(
+                        I64,
+                        "js_array_push_f64",
+                        &[(I64, &arr_handle), (DOUBLE, &v)],
+                    );
+                    let new_box = nanbox_pointer_inline(blk, &new_handle);
+                    blk.store(DOUBLE, &new_box, &slot);
+                    blk.br(&merge_label);
+                }
+
+                // No forwarding — read length & capacity, branch on
+                // capacity. inline_store on length < capacity, slow
+                // call on full.
+                ctx.current_block = nofwd_idx;
+                {
+                    let blk = ctx.block();
+                    let length = blk.safe_load_i32_from_ptr(&arr_handle);
+                    let cap_addr = blk.add(I64, &arr_handle, "4");
+                    let cap_ptr = blk.inttoptr(I64, &cap_addr);
+                    let capacity = blk.load(I32, &cap_ptr);
+                    let has_room = blk.icmp_ult(I32, &length, &capacity);
+                    blk.cond_br(&has_room, &inbounds_label, &realloc_label);
+                }
+
+                // Inline store: arr+8+length*8 = value, length++.
+                ctx.current_block = inbounds_idx;
+                {
+                    let blk = ctx.block();
+                    let length = blk.safe_load_i32_from_ptr(&arr_handle);
+                    let length_i64 = blk.zext(I32, &length, I64);
+                    let byte_offset = blk.shl(I64, &length_i64, "3");
+                    let with_header = blk.add(I64, &byte_offset, "8");
+                    let element_addr = blk.add(I64, &arr_handle, &with_header);
+                    let element_ptr = blk.inttoptr(I64, &element_addr);
+                    blk.store(DOUBLE, &v, &element_ptr);
+                    let new_length = blk.add(I32, &length, "1");
+                    let arr_ptr = blk.inttoptr(I64, &arr_handle);
+                    blk.store(I32, &new_length, &arr_ptr);
+                    blk.br(&merge_label);
+                }
+
+                // Realloc: capacity exhausted. Runtime allocates a
+                // bigger backing block and installs the forwarding
+                // pointer; writeback the new head to the local slot.
+                ctx.current_block = realloc_idx;
+                {
+                    let blk = ctx.block();
+                    let new_handle = blk.call(
+                        I64,
+                        "js_array_push_f64",
+                        &[(I64, &arr_handle), (DOUBLE, &v)],
+                    );
+                    let new_box = nanbox_pointer_inline(blk, &new_handle);
+                    blk.store(DOUBLE, &new_box, &slot);
+                    blk.br(&merge_label);
+                }
+
+                ctx.current_block = merge_idx;
+                // Existing arr_box value (pre-push) is still valid for
+                // ArrayPush's return value semantics: returns the
+                // pushed value cast back to double — but `out.push(...)`
+                // statements never read this, and the HIR uses Stmt::Expr
+                // which discards. Match the slow path's return shape
+                // anyway by re-loading the slot (covers the realloc
+                // case where the box changed).
+                return Ok(arr_box);
+            }
+
             let blk = ctx.block();
             let arr_handle = unbox_to_i64(blk, &arr_box);
             let new_handle = blk.call(
@@ -3533,8 +3814,108 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             };
 
             let func_ref = format!("@{}", func_name);
-            let cap_count = total_caps.to_string();
-            let closure_handle = {
+            // Issue #450: when `captures_this`, OR in the runtime's
+            // `CAPTURES_THIS_FLAG` (0x8000_0000) so the runtime can detect
+            // closures whose last capture slot is the reserved `this` slot.
+            // `js_closure_alloc` masks the flag off when computing allocation
+            // size (real_capture_count) but preserves it in the stored
+            // `capture_count` field. Used by `clone_closure_rebind_this` at
+            // `Object.defineProperty(obj, k, { get(){}, set(){} })` time so
+            // accessor invocation sees `this === obj` per spec, and by
+            // `js_closure_unbind_this` for detached method references.
+            let cap_count_val = if *captures_this {
+                (total_caps as u32) | 0x8000_0000u32
+            } else {
+                total_caps as u32
+            };
+            let cap_count = cap_count_val.to_string();
+            // Closures with NO captures (and no `this` to patch) are
+            // observationally identical across every call site that
+            // produces them, so route through `js_closure_alloc_singleton`
+            // to share a single ClosureHeader cached by func_ptr.
+            //
+            // Closures WITH captures route through
+            // `js_closure_alloc_with_captures_singleton` whenever none of
+            // those captures are mutated by the body (the common case
+            // for ECS callbacks like `(eid, arch, compId) => { ...
+            // changeset ... }` capturing `this._changeset`). The cache
+            // keys on (func_ptr, capture_bits…) so distinct capture
+            // values still produce distinct closures; identical
+            // (func, captures) at a hot call site re-uses the cached
+            // ClosureHeader and skips gc_malloc + gc_check_trigger.
+            //
+            // We skip the captured-singleton path for closures whose
+            // body mutates a capture: those want fresh per-site identity
+            // because each call site might want its own writable slot.
+            //
+            // Closures that capture `this` are still routable through
+            // the captured-singleton path — we include the `this` value
+            // in the cache buffer (at slot `auto_captures.len()`,
+            // matching the runtime layout), so distinct receivers
+            // produce distinct cache keys. Hot ECS class methods like
+            // `World.executeEntityCommands` benefit from this: their
+            // inner arrow `(eid, arch, compId) => ... changeset ...`
+            // is created per-call but always with the same `this` (the
+            // World) and same captures (`this._changeset`).
+            let body_mutates_capture = !mutable_captures.is_empty()
+                && auto_captures.iter().any(|id| mutable_captures.contains(id));
+            // Boxed captures store a fresh box pointer per closure
+            // creation site, so their bits differ between calls even
+            // when the box's logical value is the same. That breaks
+            // the cache — every call would miss. Skip the captured
+            // singleton path when any capture is boxed.
+            let captures_any_boxed = auto_captures.iter().any(|id| ctx.boxed_vars.contains(id));
+            let no_capture_singleton = total_caps == 0;
+            let captured_singleton =
+                !no_capture_singleton && !body_mutates_capture && !captures_any_boxed;
+
+            // For captures_this, the cache buffer needs an extra slot
+            // for the `this` value so the cache key distinguishes
+            // closures with different receivers. We load `this` here
+            // (mirroring the post-create patch site below) when we're
+            // taking the captured-singleton path.
+            let this_value_for_cache = if captured_singleton && *captures_this {
+                let this_slot = ctx.this_stack.last().cloned();
+                Some(if let Some(slot) = this_slot {
+                    ctx.block().load(DOUBLE, &slot)
+                } else {
+                    double_literal(0.0)
+                })
+            } else {
+                None
+            };
+
+            let closure_handle = if no_capture_singleton {
+                let blk = ctx.block();
+                blk.call(I64, "js_closure_alloc_singleton", &[(PTR, &func_ref)])
+            } else if captured_singleton {
+                // Stack-allocate a `[u64; total_caps]` capture buffer
+                // (auto captures, plus `this` at the reserved slot if
+                // captures_this). The runtime helper copies these
+                // verbatim into the cached closure's capture slots.
+                let n_total = total_caps;
+                let buf = ctx.func.alloca_entry_array(I64, n_total);
+                {
+                    let blk = ctx.block();
+                    for (i, v) in captured_values.iter().enumerate() {
+                        let slot = blk.gep(I64, &buf, &[(I64, &format!("{}", i))]);
+                        let v_bits = blk.bitcast_double_to_i64(v);
+                        blk.store(I64, &v_bits, &slot);
+                    }
+                    if let Some(this_v) = &this_value_for_cache {
+                        let this_idx = auto_captures.len();
+                        let slot = blk.gep(I64, &buf, &[(I64, &format!("{}", this_idx))]);
+                        let v_bits = blk.bitcast_double_to_i64(this_v);
+                        blk.store(I64, &v_bits, &slot);
+                    }
+                }
+                let blk = ctx.block();
+                blk.call(
+                    I64,
+                    "js_closure_alloc_with_captures_singleton",
+                    &[(PTR, &func_ref), (I32, &cap_count), (PTR, &buf)],
+                )
+            } else {
                 let blk = ctx.block();
                 blk.call(
                     I64,
@@ -3542,7 +3923,11 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     &[(PTR, &func_ref), (I32, &cap_count)],
                 )
             };
-            {
+
+            // The captured-singleton helper writes captures internally
+            // (so the cached layout matches a fresh allocation). The
+            // other paths still need explicit per-slot writes.
+            if !captured_singleton {
                 let blk = ctx.block();
                 for (idx, val) in captured_values.iter().enumerate() {
                     let idx_str = idx.to_string();
@@ -5385,6 +5770,42 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             Ok(nanbox_pointer_inline(blk, &result))
         }
 
+        // -------- MapEntryKeyAt / MapEntryValueAt --------
+        // Direct flat-array entry access — used by the
+        // `for (const [k, v] of mapExpr)` fast path so the loop reads
+        // entries straight out of the Map's internal buffer instead of
+        // calling `js_map_entries` (which materializes N+1 small Arrays).
+        Expr::MapEntryKeyAt { map, idx } | Expr::MapEntryValueAt { map, idx } => {
+            let m_box = lower_expr(ctx, map)?;
+            let i_dbl = lower_expr(ctx, idx)?;
+            let blk = ctx.block();
+            let m_handle = unbox_to_i64(blk, &m_box);
+            let i_i32 = blk.fptosi(DOUBLE, &i_dbl, I32);
+            let runtime_fn = match expr {
+                Expr::MapEntryKeyAt { .. } => "js_map_entry_key_at",
+                Expr::MapEntryValueAt { .. } => "js_map_entry_value_at",
+                _ => unreachable!(),
+            };
+            Ok(blk.call(DOUBLE, runtime_fn, &[(I64, &m_handle), (I32, &i_i32)]))
+        }
+
+        // -------- Set direct-element fast path --------
+        // Counterpart to MapEntryValueAt: read the i-th element of a Set
+        // without materializing the buffer into an Array. Used by the
+        // `for (const x of setExpr)` HIR fast path.
+        Expr::SetValueAt { set, idx } => {
+            let s_box = lower_expr(ctx, set)?;
+            let i_dbl = lower_expr(ctx, idx)?;
+            let blk = ctx.block();
+            let s_handle = unbox_to_i64(blk, &s_box);
+            let i_i32 = blk.fptosi(DOUBLE, &i_dbl, I32);
+            Ok(blk.call(
+                DOUBLE,
+                "js_set_value_at",
+                &[(I64, &s_handle), (I32, &i_i32)],
+            ))
+        }
+
         // -------- Set.values (set → array conversion for iteration) --------
         Expr::SetValues(set) => {
             let s_box = lower_expr(ctx, set)?;
@@ -5432,11 +5853,12 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             let wrap_name = format!("__perry_wrap_{}", func_name);
             let blk = ctx.block();
             let wrap_ptr = format!("@{}", wrap_name);
-            // js_closure_alloc(func_ptr, capture_count=0) → ClosureHeader*
-            // The first arg is a `ptr` in LLVM IR (since the runtime
-            // takes `*const u8`). Pass `@wrap_name` directly — LLVM
-            // handles the implicit function-to-pointer cast.
-            let closure_handle = blk.call(I64, "js_closure_alloc", &[(PTR, &wrap_ptr), (I32, "0")]);
+            // FuncRef wrappers always have 0 captures, so we can route
+            // through the singleton-cached allocator: same func_ptr always
+            // yields the same ClosureHeader. Eliminates the per-evaluation
+            // gc_malloc + gc_check_trigger that was the dominant cost in
+            // tight loops which pass a function as a callback.
+            let closure_handle = blk.call(I64, "js_closure_alloc_singleton", &[(PTR, &wrap_ptr)]);
             Ok(nanbox_pointer_inline(blk, &closure_handle))
         }
 
@@ -5868,6 +6290,54 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 .filter(|a| matches!(a, CallArg::Expr(_)))
                 .count();
 
+            // console.log(...arr) / .info / .warn / .error / .debug — bundle
+            // every regular arg + every spread source into a single array,
+            // then dispatch to js_console_{log,warn,error}_spread. Without
+            // this, the generic closure-spread path below treats `console.log`
+            // as a closure value and js_closure_call_apply_with_spread fails
+            // to dispatch (issue #407). Mirrors the multi-arg console.* path
+            // in the Expr::Call codegen at lower_call.rs.
+            if let Expr::PropertyGet { object, property } = callee.as_ref() {
+                if matches!(object.as_ref(), Expr::GlobalGet(_))
+                    && matches!(
+                        property.as_str(),
+                        "log" | "info" | "warn" | "error" | "debug"
+                    )
+                {
+                    let mut acc_handle =
+                        ctx.block().call(I64, "js_array_alloc", &[(I32, "0")]);
+                    for a in args {
+                        match a {
+                            CallArg::Expr(e) => {
+                                let v = lower_expr(ctx, e)?;
+                                acc_handle = ctx.block().call(
+                                    I64,
+                                    "js_array_push_f64",
+                                    &[(I64, &acc_handle), (DOUBLE, &v)],
+                                );
+                            }
+                            CallArg::Spread(e) => {
+                                let part_box = lower_expr(ctx, e)?;
+                                let blk = ctx.block();
+                                let part_handle = unbox_to_i64(blk, &part_box);
+                                acc_handle = ctx.block().call(
+                                    I64,
+                                    "js_array_concat",
+                                    &[(I64, &acc_handle), (I64, &part_handle)],
+                                );
+                            }
+                        }
+                    }
+                    let runtime_fn = match property.as_str() {
+                        "warn" => "js_console_warn_spread",
+                        "error" => "js_console_error_spread",
+                        _ => "js_console_log_spread",
+                    };
+                    ctx.block().call_void(runtime_fn, &[(I64, &acc_handle)]);
+                    return Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)));
+                }
+            }
+
             if let Expr::FuncRef(fid) = callee.as_ref() {
                 if spread_count == 1 && regular_count == 0 {
                     if let (Some(fname), Some(sig)) = (
@@ -5910,19 +6380,90 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 }
             }
 
-            // Fallback: stub behavior. Lower everything for side effects,
-            // return undefined-equivalent. This keeps the program compiling
-            // for unsupported spread shapes while still being obviously
-            // wrong if executed.
-            let _ = lower_expr(ctx, callee)?;
-            for a in args {
-                match a {
-                    CallArg::Expr(e) | CallArg::Spread(e) => {
-                        let _ = lower_expr(ctx, e)?;
+            // Closure callee path: `cb(reg0, reg1, ..., ...spread)` where
+            // `cb` is a closure value (not a known FuncRef). We lower the
+            // callee to its NaN-boxed value, marshal regular args into a
+            // function-entry-allocated stack buffer, fold spread sources
+            // into a single array (concat when multiple), then call
+            // `js_closure_call_apply_with_spread`. This is what makes
+            // patterns like `archetype.forEachWithComponents(types, cb)`
+            // → `cb(entity, ...components)` actually invoke the user
+            // callback (issue #412).
+            //
+            // The signature must match `runtime_decls.rs`:
+            //   fn(closure_box: f64, regs_ptr: ptr, reg_count: i64,
+            //      spread_arr_handle: i64) -> f64
+            let cb_box = lower_expr(ctx, callee)?;
+
+            // Marshal regular args into a stack buffer (or null/0 if none).
+            let (regs_ptr, regs_len) = if regular_count == 0 {
+                ("null".to_string(), "0".to_string())
+            } else {
+                let buf_reg = ctx.func.alloca_entry_array(DOUBLE, regular_count);
+                let mut idx = 0usize;
+                for a in args {
+                    if let CallArg::Expr(e) = a {
+                        let v = lower_expr(ctx, e)?;
+                        let slot = ctx
+                            .block()
+                            .gep(DOUBLE, &buf_reg, &[(I64, &format!("{}", idx))]);
+                        ctx.block().store(DOUBLE, &v, &slot);
+                        idx += 1;
                     }
                 }
-            }
-            Ok(double_literal(0.0))
+                let ptr_reg = ctx.block().next_reg();
+                ctx.block().emit_raw(format!(
+                    "{} = getelementptr [{} x double], ptr {}, i64 0, i64 0",
+                    ptr_reg, regular_count, buf_reg
+                ));
+                (ptr_reg, regular_count.to_string())
+            };
+
+            // Marshal spread sources. 0 → "0" handle; 1 → unbox the one
+            // array; multiple → concat onto a fresh array.
+            let spread_handle = if spread_count == 0 {
+                "0".to_string()
+            } else if spread_count == 1 {
+                let spread_expr = args
+                    .iter()
+                    .find_map(|a| match a {
+                        CallArg::Spread(e) => Some(e),
+                        _ => None,
+                    })
+                    .expect("spread_count == 1 guarantees one Spread");
+                let arr_box = lower_expr(ctx, spread_expr)?;
+                let blk = ctx.block();
+                unbox_to_i64(blk, &arr_box)
+            } else {
+                // Concat all spread sources into a fresh array.
+                let acc = ctx.block().call(I64, "js_array_alloc", &[(I32, "0")]);
+                let mut acc_handle = acc;
+                for a in args {
+                    if let CallArg::Spread(e) = a {
+                        let part_box = lower_expr(ctx, e)?;
+                        let blk = ctx.block();
+                        let part_handle = unbox_to_i64(blk, &part_box);
+                        acc_handle = ctx.block().call(
+                            I64,
+                            "js_array_concat",
+                            &[(I64, &acc_handle), (I64, &part_handle)],
+                        );
+                    }
+                }
+                acc_handle
+            };
+
+            let result = ctx.block().call(
+                DOUBLE,
+                "js_closure_call_apply_with_spread",
+                &[
+                    (DOUBLE, &cb_box),
+                    (crate::types::PTR, &regs_ptr),
+                    (I64, &regs_len),
+                    (I64, &spread_handle),
+                ],
+            );
+            Ok(result)
         }
 
         // -------- Math.fround --------
@@ -9871,6 +10412,89 @@ fn lower_object_literal(ctx: &mut FnCtx<'_>, props: &[(String, Expr)]) -> Result
     let zero_str = "0".to_string();
     let n_str = field_count.to_string();
 
+    // Fast path: no closure-with-`this` props. Use the shape-cache allocator
+    // and write fields by INDEX — this skips the per-field linear key-search
+    // done by `js_object_set_field_by_name`. Cuts ~10ns per field on the hot
+    // path (and saves the keys_array realloc when `getDetailedIdType`-style
+    // returns are evaluated 10k×/round). Closure-with-`this` props still
+    // need the by-name path because `this_patches` populates them post-build
+    // via `js_closure_set_capture_f64`, which assumes the key is already in
+    // keys_array — fine here since the shape allocator pre-populates it.
+    let any_method_closure = props.iter().any(|(_, v)| {
+        matches!(
+            v,
+            Expr::Closure {
+                captures_this: true,
+                ..
+            }
+        )
+    });
+
+    if !any_method_closure && field_count > 0 {
+        // Build packed keys "k1\0k2\0…" interned in the StringPool (shared
+        // across all literals with the same key set + order).
+        let mut packed_keys = String::new();
+        for (k, _) in props {
+            packed_keys.push_str(k);
+            packed_keys.push('\0');
+        }
+        let keys_idx = ctx.strings.intern(&packed_keys);
+        let keys_entry = ctx.strings.entry(keys_idx);
+        let keys_global = format!("@{}", keys_entry.bytes_global);
+        let keys_len_str = keys_entry.byte_len.to_string();
+
+        // Stable shape_id derived from the packed-keys bytes. SHAPE_INLINE_CACHE
+        // is a 256-slot direct-mapped array; collisions fall through to the
+        // overflow HashMap, so any deterministic non-zero u32 works. FNV-1a
+        // is fast, dependency-free, and well-distributed across small inputs.
+        let mut shape_id: u32 = 0x811c9dc5;
+        for b in packed_keys.as_bytes() {
+            shape_id ^= *b as u32;
+            shape_id = shape_id.wrapping_mul(0x01000193);
+        }
+        if shape_id == 0 {
+            // shape_cache_get treats shape_id == 0 as "empty slot"; bump to 1.
+            shape_id = 1;
+        }
+        let shape_id_str = shape_id.to_string();
+
+        let obj_handle = ctx.block().call(
+            I64,
+            "js_object_alloc_with_shape",
+            &[
+                (I32, &shape_id_str),
+                (I32, &n_str),
+                (PTR, &keys_global),
+                (I32, &keys_len_str),
+            ],
+        );
+
+        for (i, (_, value_expr)) in props.iter().enumerate() {
+            let v = lower_expr(ctx, value_expr)?;
+            let idx_str = i.to_string();
+            // Issue #448: the runtime `js_object_set_field` takes its
+            // value as `JSValue` (`#[repr(transparent)] u64`), which the
+            // System V / AArch64 / Win64 ABIs all pass in a *general*-
+            // purpose register. The lowered NaN-box `v` is a `double`,
+            // which the same ABIs pass in a *floating-point* register.
+            // Without the bitcast the call sent the value in xmm0 / d0
+            // while Rust read garbage from rdx / x2, so generator iter
+            // objects (`{next, return, throw}` literals built via the
+            // shape-cache fast path) read back closure-typed fields as
+            // `0` — and the resulting `__iter.next()` dispatch never
+            // returned a real iter-result, so `for…of` over a class
+            // implementing `*[Symbol.iterator]()` hung forever
+            // allocating empty results.
+            let blk = ctx.block();
+            let v_bits = blk.bitcast_double_to_i64(&v);
+            blk.call_void(
+                "js_object_set_field",
+                &[(I64, &obj_handle), (I32, &idx_str), (I64, &v_bits)],
+            );
+        }
+        return Ok(nanbox_pointer_inline(ctx.block(), &obj_handle));
+    }
+
     let obj_handle = ctx
         .block()
         .call(I64, "js_object_alloc", &[(I32, &zero_str), (I32, &n_str)]);
@@ -10369,4 +10993,390 @@ pub(crate) fn extract_array_of_object_shape(
         packed.extend_from_slice(k.as_bytes());
     }
     Some((packed, keys.len() as u32))
+}
+
+/// Channel-vector reduction match on a sequence of consecutive
+/// `Stmt::Expr(LocalSet)` statements. The canonical hot shape is
+/// image_convolution's blur kernel inner body:
+///
+/// ```ts
+/// rAcc += src[idx]     * k;
+/// gAcc += src[idx + 1] * k;
+/// bAcc += src[idx + 2] * k;
+/// ```
+///
+/// Each statement decomposes to:
+///   `LocalSet(acc_i, Binary{Add, LocalGet(acc_i),
+///                          Binary{Mul, Uint8ArrayGet{arr, idx_i}, k}})`
+///
+/// where `arr` and `k` are identical across the group, the targets
+/// (`acc_i`) are distinct, and the indices form a length-N consecutive
+/// integer progression starting from a common `base_idx`. The match
+/// detects N = 3 (RGB) and N = 4 (RGBA) cases — the specific shapes that
+/// fit cleanly into ARM NEON's 128-bit vector lane (`<4 x i32>`).
+///
+/// Returned data is what the emitter needs to lay down the vector form:
+/// the target slot ids, the shared array LocalId, the per-channel
+/// integer offsets (e.g. `[0, 1, 2]`), the base index expression
+/// (whatever `idx` is), and the common factor `k` expression.
+pub(crate) struct ChannelReduction {
+    pub acc_ids: Vec<u32>,
+    pub array_id: u32,
+    pub base_idx: Box<Expr>,
+    pub offsets: Vec<i32>,
+    pub k_expr: Box<Expr>,
+}
+
+/// Try to fuse `stmts[at..]` into a `ChannelReduction`. Returns `Some` if
+/// the next 3 or 4 statements match exactly the shape described in the
+/// `ChannelReduction` doc; `None` otherwise. The caller advances by
+/// `acc_ids.len()` on a hit so the matched statements aren't lowered
+/// scalar.
+pub(crate) fn try_match_channel_reduction(
+    stmts: &[perry_hir::Stmt],
+    at: usize,
+    integer_locals: &std::collections::HashSet<u32>,
+) -> Option<ChannelReduction> {
+    use perry_hir::{BinaryOp, Stmt};
+    // Try N = 4 first so an RGBA workload picks the wider lane; fall
+    // back to N = 3.
+    for n in [4usize, 3] {
+        if at + n > stmts.len() {
+            continue;
+        }
+        let mut acc_ids: Vec<u32> = Vec::with_capacity(n);
+        let mut array_id_opt: Option<u32> = None;
+        let mut base_idx_opt: Option<Box<Expr>> = None;
+        let mut offsets: Vec<i32> = Vec::with_capacity(n);
+        let mut k_opt: Option<Box<Expr>> = None;
+        let mut all_match = true;
+        for i in 0..n {
+            let s = &stmts[at + i];
+            let (target_id, value) = match s {
+                Stmt::Expr(Expr::LocalSet(id, v)) => (*id, v.as_ref()),
+                _ => {
+                    all_match = false;
+                    break;
+                }
+            };
+            // Targets must be integer-stable so the i32 lanes are valid.
+            if !integer_locals.contains(&target_id) {
+                all_match = false;
+                break;
+            }
+            // Targets must be distinct (no two channels writing the same
+            // slot — that would be aliasing the reduction).
+            if acc_ids.contains(&target_id) {
+                all_match = false;
+                break;
+            }
+            // Shape: Add(LocalGet(target_id), Mul(Uint8ArrayGet(arr, idx), k))
+            let (lhs, rhs) = match value {
+                Expr::Binary {
+                    op: BinaryOp::Add,
+                    left,
+                    right,
+                } => (left.as_ref(), right.as_ref()),
+                _ => {
+                    all_match = false;
+                    break;
+                }
+            };
+            // lhs must be LocalGet of the target (acc += ...)
+            if !matches!(lhs, Expr::LocalGet(id) if *id == target_id) {
+                all_match = false;
+                break;
+            }
+            let (mul_left, mul_right) = match rhs {
+                Expr::Binary {
+                    op: BinaryOp::Mul,
+                    left,
+                    right,
+                } => (left.as_ref(), right.as_ref()),
+                _ => {
+                    all_match = false;
+                    break;
+                }
+            };
+            // The Uint8ArrayGet is on the left of the Mul as perry's
+            // HIR lowers it. Don't try the reverse — keeping the match
+            // narrow avoids false positives on `k * src[i]` shapes that
+            // would need a different operand ordering.
+            let (arr_id, idx_expr) = match mul_left {
+                Expr::Uint8ArrayGet { array, index } => match array.as_ref() {
+                    Expr::LocalGet(id) => (*id, index.as_ref()),
+                    _ => {
+                        all_match = false;
+                        break;
+                    }
+                },
+                _ => {
+                    all_match = false;
+                    break;
+                }
+            };
+            // Decompose the index: either bare `LocalGet(idx)` (offset 0)
+            // or `Add(LocalGet(idx), Integer(N))` (offset N).
+            let (this_base, this_offset): (Box<Expr>, i32) = match idx_expr {
+                Expr::LocalGet(_) => (Box::new(idx_expr.clone()), 0i32),
+                Expr::Binary {
+                    op: BinaryOp::Add,
+                    left,
+                    right,
+                } => {
+                    if let Expr::Integer(n) = right.as_ref() {
+                        match i32::try_from(*n) {
+                            Ok(v) => (Box::new((**left).clone()), v),
+                            Err(_) => {
+                                all_match = false;
+                                break;
+                            }
+                        }
+                    } else {
+                        all_match = false;
+                        break;
+                    }
+                }
+                _ => {
+                    all_match = false;
+                    break;
+                }
+            };
+            // First channel pins array, base, k. Subsequent channels must
+            // match on all three. We use a structural comparison via
+            // `format!("{:?}", expr)` — the expr trees we see here are
+            // shallow LocalGet / Integer / Binary and the Debug output is
+            // stable across runs.
+            match (&array_id_opt, &base_idx_opt, &k_opt) {
+                (None, None, None) => {
+                    array_id_opt = Some(arr_id);
+                    base_idx_opt = Some(this_base);
+                    k_opt = Some(Box::new(mul_right.clone()));
+                }
+                (Some(prev_arr), Some(prev_base), Some(prev_k)) => {
+                    if *prev_arr != arr_id {
+                        all_match = false;
+                        break;
+                    }
+                    if format!("{:?}", prev_base.as_ref()) != format!("{:?}", this_base.as_ref()) {
+                        all_match = false;
+                        break;
+                    }
+                    if format!("{:?}", prev_k.as_ref()) != format!("{:?}", mul_right) {
+                        all_match = false;
+                        break;
+                    }
+                }
+                _ => unreachable!(),
+            }
+            acc_ids.push(target_id);
+            offsets.push(this_offset);
+        }
+        if !all_match {
+            continue;
+        }
+        // Offsets must be a length-N consecutive integer progression
+        // (any starting point — the canonical case is `[0, 1, 2]` but
+        // `[1, 2, 3]` would fuse identically). Require strictly
+        // monotonic increase by 1 to keep the gather pattern a contiguous
+        // load instead of a scatter.
+        let mut sorted = offsets.clone();
+        sorted.sort();
+        let mut consecutive = true;
+        for i in 1..sorted.len() {
+            if sorted[i] != sorted[i - 1] + 1 {
+                consecutive = false;
+                break;
+            }
+        }
+        if !consecutive {
+            continue;
+        }
+        // Order acc_ids and offsets by offset so the emitter walks them
+        // in lane order.
+        let mut paired: Vec<(i32, u32)> = offsets
+            .iter()
+            .zip(acc_ids.iter())
+            .map(|(o, a)| (*o, *a))
+            .collect();
+        paired.sort_by_key(|p| p.0);
+        let offsets: Vec<i32> = paired.iter().map(|p| p.0).collect();
+        let acc_ids: Vec<u32> = paired.iter().map(|p| p.1).collect();
+        return Some(ChannelReduction {
+            acc_ids,
+            array_id: array_id_opt.unwrap(),
+            base_idx: base_idx_opt.unwrap(),
+            offsets,
+            k_expr: k_opt.unwrap(),
+        });
+    }
+    None
+}
+
+/// Emit the vectorized form of a `ChannelReduction`. Produces a
+/// `<4 x i32>` SIMD multiply-add — the widest lane that fits ARM NEON's
+/// 128-bit register and AVX-256/SSE2's narrowest int-vector mode. The
+/// 4th lane is unused for the N = 3 (RGB) case and zeroed for safety;
+/// LLVM's instcombine collapses it on platforms where partial-vector
+/// stores cost more than the dead lane.
+///
+/// Requires the array to have a `buffer_data_slot` entry — without the
+/// pre-computed data ptr we'd have to re-derive it inline, which costs
+/// the same as the scalar Uint8ArrayGet path and gives up the win.
+/// Caller (in `lower_stmts`) checks this and falls back to scalar
+/// lowering when absent.
+pub(crate) fn lower_channel_reduction(ctx: &mut FnCtx<'_>, r: &ChannelReduction) -> Result<()> {
+    let Some((ptr_slot, scope_idx)) = ctx.buffer_data_slots.get(&r.array_id).cloned() else {
+        return Err(anyhow!(
+            "lower_channel_reduction: array {} has no buffer_data_slot — caller should have skipped",
+            r.array_id
+        ));
+    };
+    // Lower the base index to i32 ahead of time — the gather reads N
+    // consecutive bytes from `data_ptr + base_idx + offset[c]`.
+    let i32_slots = ctx.i32_counter_slots.clone();
+    let flat_ca = ctx.flat_const_arrays.clone();
+    let ara = ctx.array_row_aliases.clone();
+    let int_locals = ctx.integer_locals.clone();
+    let base_idx_can_i32 = can_lower_expr_as_i32(
+        &r.base_idx,
+        &i32_slots,
+        &flat_ca,
+        &ara,
+        &int_locals,
+        ctx.clamp3_functions,
+        ctx.clamp_u8_functions,
+    );
+    let base_idx_i32 = if base_idx_can_i32 {
+        lower_expr_as_i32(ctx, &r.base_idx)?
+    } else {
+        let d = lower_expr(ctx, &r.base_idx)?;
+        ctx.block().fptosi(DOUBLE, &d, I32)
+    };
+    let k_can_i32 = can_lower_expr_as_i32(
+        &r.k_expr,
+        &i32_slots,
+        &flat_ca,
+        &ara,
+        &int_locals,
+        ctx.clamp3_functions,
+        ctx.clamp_u8_functions,
+    );
+    let k_i32 = if k_can_i32 {
+        lower_expr_as_i32(ctx, &r.k_expr)?
+    } else {
+        let d = lower_expr(ctx, &r.k_expr)?;
+        ctx.block().fptosi(DOUBLE, &d, I32)
+    };
+    let blk = ctx.block();
+    // Buffer length-load via the data ptr's preceding header. The 4-byte
+    // i32 length sits 8 bytes before the data start (BufferHeader
+    // layout, identical to the scalar Uint8ArrayGet path).
+    let data_ptr = blk.load(PTR, &ptr_slot);
+    let header_ptr = blk.gep(I8, &data_ptr, &[(I32, "-8")]);
+    let len_i32 = blk.load_invariant(I32, &header_ptr);
+    // Tell LLVM the highest channel offset is in-bounds. The
+    // `Uint8ArrayGet` scalar path emits one assume per access; one
+    // assume covering the highest offset is sufficient because
+    // `inbounds(base + max_offset)` implies `inbounds(base + i)` for
+    // `0 <= i <= max_offset`.
+    let max_off = *r.offsets.last().unwrap();
+    let max_idx = blk.add(I32, &base_idx_i32, &max_off.to_string());
+    let in_bounds = blk.icmp_ult(I32, &max_idx, &len_i32);
+    blk.emit_raw(format!("call void @llvm.assume(i1 {})", in_bounds));
+    // Build the byte vector by N consecutive loads + insertelement. LLVM
+    // SLP combines the scalar loads into a single vector load when the
+    // addresses are contiguous (which they are after the assume above).
+    let alias_meta = crate::expr::buffer_alias_metadata_suffix(scope_idx);
+    let _n = r.offsets.len();
+    // Lane width: <4 x i32> regardless of N, padded with 0s in unused lanes.
+    // The first insertelement seeds from a constant 0-vector; subsequent
+    // ones chain through register values.
+    let mut vec_i32 = "<i32 0, i32 0, i32 0, i32 0>".to_string();
+    for (lane, &offset) in r.offsets.iter().enumerate() {
+        let off_i32 = blk.add(I32, &base_idx_i32, &offset.to_string());
+        let byte_ptr = blk.gep_inbounds(I8, &data_ptr, &[(I32, &off_i32)]);
+        let byte_val = blk.fresh_reg();
+        blk.emit_raw(format!(
+            "{} = load i8, ptr {}{}",
+            byte_val, byte_ptr, alias_meta
+        ));
+        let i32_val = blk.zext(I8, &byte_val, I32);
+        let new_vec = blk.fresh_reg();
+        blk.emit_raw(format!(
+            "{} = insertelement <4 x i32> {}, i32 {}, i32 {}",
+            new_vec, vec_i32, i32_val, lane
+        ));
+        vec_i32 = new_vec;
+    }
+    // Splat k across the vector. Insertelement at lane 0, then
+    // shufflevector with an all-zero mask copies it to every lane.
+    let k_at_0 = blk.fresh_reg();
+    blk.emit_raw(format!(
+        "{} = insertelement <4 x i32> poison, i32 {}, i32 0",
+        k_at_0, k_i32
+    ));
+    let k_splat = blk.fresh_reg();
+    blk.emit_raw(format!(
+        "{} = shufflevector <4 x i32> {}, <4 x i32> poison, <4 x i32> zeroinitializer",
+        k_splat, k_at_0
+    ));
+    // <4 x i32> mul = bytes * k_splat.
+    let mul_vec = blk.fresh_reg();
+    blk.emit_raw(format!(
+        "{} = mul <4 x i32> {}, {}",
+        mul_vec, vec_i32, k_splat
+    ));
+    // Load the per-channel accumulators into a vector. Each acc has an
+    // i32 slot from `needs_i32_slot` (asserted via integer_locals
+    // membership during detection) — this is the load that scalar code
+    // would do anyway, just packed into a single vector value.
+    let mut acc_vec = "<i32 0, i32 0, i32 0, i32 0>".to_string();
+    for (lane, &acc_id) in r.acc_ids.iter().enumerate() {
+        let i32_slot = ctx.i32_counter_slots.get(&acc_id).cloned().ok_or_else(|| {
+            anyhow!(
+                "channel reduction acc {} missing i32 slot — should be in integer_locals",
+                acc_id
+            )
+        })?;
+        let blk = ctx.block();
+        let acc_val = blk.load(I32, &i32_slot);
+        let new_vec = blk.fresh_reg();
+        blk.emit_raw(format!(
+            "{} = insertelement <4 x i32> {}, i32 {}, i32 {}",
+            new_vec, acc_vec, acc_val, lane
+        ));
+        acc_vec = new_vec;
+    }
+    // <4 x i32> add = acc + (bytes * k).
+    let blk = ctx.block();
+    let new_acc_vec = blk.fresh_reg();
+    blk.emit_raw(format!(
+        "{} = add <4 x i32> {}, {}",
+        new_acc_vec, acc_vec, mul_vec
+    ));
+    // Extract per-lane and store back. Mirror writes to both the i32
+    // and double slots so downstream readers see consistent values.
+    for (lane, &acc_id) in r.acc_ids.iter().enumerate() {
+        let i32_slot = ctx
+            .i32_counter_slots
+            .get(&acc_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("acc {} missing i32 slot", acc_id))?;
+        let dbl_slot = ctx
+            .locals
+            .get(&acc_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("acc {} missing double slot", acc_id))?;
+        let blk = ctx.block();
+        let lane_val = blk.fresh_reg();
+        blk.emit_raw(format!(
+            "{} = extractelement <4 x i32> {}, i32 {}",
+            lane_val, new_acc_vec, lane
+        ));
+        blk.store(I32, &lane_val, &i32_slot);
+        let dbl_val = blk.sitofp(I32, &lane_val, DOUBLE);
+        blk.store(DOUBLE, &dbl_val, &dbl_slot);
+    }
+    Ok(())
 }

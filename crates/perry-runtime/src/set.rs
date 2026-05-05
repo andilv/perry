@@ -4,15 +4,16 @@
 //! The elements array is separately allocated and can be reallocated
 //! without changing the SetHeader address.
 
+use crate::fast_hash::{new_ptr_hash_set, PtrHashSet};
 use crate::string::StringHeader;
 use std::alloc::{alloc, realloc, Layout};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::ptr;
 
 thread_local! {
-    static SET_REGISTRY: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+    static SET_REGISTRY: RefCell<PtrHashSet<usize>> = RefCell::new(new_ptr_hash_set());
 }
 
 /// A wrapper around f64 JSValues that implements Hash and Eq using
@@ -23,17 +24,16 @@ struct JSValueKey(f64);
 impl Hash for JSValueKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         let bits = self.0.to_bits();
-        let ptr = extract_string_ptr_from_value(bits);
-        if !ptr.is_null() && (ptr as usize) >= 0x1000 {
-            // String value: hash by content so that identical strings
-            // with different pointers/tags produce the same hash.
+        let mut scratch = [0u8; crate::value::SHORT_STRING_MAX_LEN];
+        if let Some((data, len)) = string_view_from_bits(bits, &mut scratch) {
+            // String value: hash by content so identical strings with
+            // different representations (heap STRING_TAG / inline SSO /
+            // POINTER_TAG / raw pointer) produce the same hash.
             unsafe {
-                let len = (*ptr).byte_len;
-                // Use a distinct domain tag so string hashes don't collide
+                // Distinct domain tag so string hashes don't collide
                 // with non-string bit patterns.
                 0xFFFF_FFFFu32.hash(state);
                 len.hash(state);
-                let data = (ptr as *const u8).add(std::mem::size_of::<StringHeader>());
                 let slice = std::slice::from_raw_parts(data, len as usize);
                 slice.hash(state);
             }
@@ -52,9 +52,17 @@ impl Eq for JSValueKey {}
 
 /// Side-table mapping set_ptr -> (JSValueKey -> index_in_elements).
 /// Provides O(1) lookup for `find_value_index` instead of O(n) linear scan.
+///
+/// Both nesting levels use `PtrHasher` (Fibonacci-multiplicative + xorshift
+/// avalanche). Outer key is set heap-pointer; inner is `JSValueKey` whose
+/// `Hash` impl writes either string-content bytes or f64 bits — the
+/// avalanche step handles both cleanly. Same rationale as MAP_INDEX
+/// (commit 39e253cd) — the perry-runtime registries don't need
+/// SipHash's DoS-resistance for keys that never come from external input.
 thread_local! {
-    static SET_INDEX: RefCell<HashMap<usize, HashMap<JSValueKey, u32>>> =
-        RefCell::new(HashMap::new());
+    static SET_INDEX: RefCell<
+        crate::fast_hash::PtrHashMap<usize, crate::fast_hash::PtrHashMap<JSValueKey, u32>>,
+    > = RefCell::new(crate::fast_hash::new_ptr_hash_map());
 }
 
 fn register_set(ptr: *mut SetHeader) {
@@ -145,6 +153,8 @@ unsafe fn strings_equal(a: *const StringHeader, b: *const StringHeader) -> bool 
 }
 
 /// Extract a string pointer from a value that might be NaN-boxed with various tags.
+/// Does NOT handle SHORT_STRING_TAG (SSO) — those don't carry a heap pointer;
+/// use `string_view_from_bits` for representation-agnostic content access.
 fn extract_string_ptr_from_value(bits: u64) -> *const StringHeader {
     let upper = bits >> 48;
     match upper {
@@ -162,12 +172,54 @@ fn extract_string_ptr_from_value(bits: u64) -> *const StringHeader {
     }
 }
 
+/// Return a `(ptr, byte_len)` view for any string-like JSValue:
+/// - `STRING_TAG` heap strings, `POINTER_TAG`, and raw pointers point at a
+///   `StringHeader` and yield its inline data.
+/// - `SHORT_STRING_TAG` (SSO) inline values decode their length+bytes into
+///   `scratch` and return a pointer into it.
+///
+/// Returns `None` for non-string values. Callers must keep `scratch` alive
+/// for the lifetime of the returned slice in the SSO case.
+///
+/// Issue #434: pre-fix, `JSValueKey::hash` and `jsvalue_eq` only recognized
+/// heap-pointer string representations, so `Set.has(JSON.parse('"input"'))`
+/// missed the `"input"` literal stored as STRING_TAG.
+fn string_view_from_bits<'a>(
+    bits: u64,
+    scratch: &'a mut [u8; crate::value::SHORT_STRING_MAX_LEN],
+) -> Option<(*const u8, u32)> {
+    let upper = bits >> 48;
+    if upper == (crate::value::SHORT_STRING_TAG >> 48) {
+        let len = ((bits & crate::value::SHORT_STRING_LEN_MASK)
+            >> crate::value::SHORT_STRING_LEN_SHIFT) as usize;
+        let data = bits & crate::value::SHORT_STRING_DATA_MASK;
+        for (i, slot) in scratch.iter_mut().enumerate().take(len) {
+            *slot = ((data >> (i * 8)) & 0xFF) as u8;
+        }
+        return Some((scratch.as_ptr(), len as u32));
+    }
+    let ptr = extract_string_ptr_from_value(bits);
+    if ptr.is_null() || (ptr as usize) < 0x1000 {
+        return None;
+    }
+    unsafe {
+        let len = (*ptr).byte_len;
+        let data = (ptr as *const u8).add(std::mem::size_of::<StringHeader>());
+        Some((data, len))
+    }
+}
+
 fn is_string_like(bits: u64) -> bool {
+    let upper = bits >> 48;
+    if upper == (crate::value::SHORT_STRING_TAG >> 48) {
+        return true;
+    }
     !extract_string_ptr_from_value(bits).is_null()
 }
 
-/// Check if two JSValues are equal (for set element comparison)
-/// Handles STRING_TAG (0x7FFF), POINTER_TAG (0x7FFD), raw pointers, and cross-tag combinations.
+/// Check if two JSValues are equal (for set element comparison).
+/// Handles STRING_TAG (0x7FFF), POINTER_TAG (0x7FFD), SHORT_STRING_TAG (0x7FF9 SSO),
+/// raw pointers, and cross-tag combinations.
 fn jsvalue_eq(a: f64, b: f64) -> bool {
     let a_bits = a.to_bits();
     let b_bits = b.to_bits();
@@ -177,9 +229,24 @@ fn jsvalue_eq(a: f64, b: f64) -> bool {
     }
 
     if is_string_like(a_bits) && is_string_like(b_bits) {
-        let ptr_a = extract_string_ptr_from_value(a_bits);
-        let ptr_b = extract_string_ptr_from_value(b_bits);
-        return unsafe { strings_equal(ptr_a, ptr_b) };
+        let mut a_scratch = [0u8; crate::value::SHORT_STRING_MAX_LEN];
+        let mut b_scratch = [0u8; crate::value::SHORT_STRING_MAX_LEN];
+        if let (Some((a_ptr, a_len)), Some((b_ptr, b_len))) = (
+            string_view_from_bits(a_bits, &mut a_scratch),
+            string_view_from_bits(b_bits, &mut b_scratch),
+        ) {
+            if a_len != b_len {
+                return false;
+            }
+            if a_len == 0 {
+                return true;
+            }
+            unsafe {
+                let a_slice = std::slice::from_raw_parts(a_ptr, a_len as usize);
+                let b_slice = std::slice::from_raw_parts(b_ptr, b_len as usize);
+                return a_slice == b_slice;
+            }
+        }
     }
 
     false
@@ -251,7 +318,8 @@ pub extern "C" fn js_set_alloc(capacity: u32) -> *mut SetHeader {
 
         // Initialize O(1) lookup index
         SET_INDEX.with(|idx| {
-            idx.borrow_mut().insert(ptr as usize, HashMap::new());
+            idx.borrow_mut()
+                .insert(ptr as usize, crate::fast_hash::new_ptr_hash_map());
         });
 
         ptr
@@ -386,6 +454,26 @@ pub extern "C" fn js_set_clear(set: *mut SetHeader) {
             map.clear();
         }
     });
+}
+
+/// Direct read of the i-th element in insertion order — counterpart to
+/// `js_map_entry_value_at`. Lets the codegen iterate `for (const x of set)`
+/// without materializing the elements buffer into a transient Array via
+/// `js_set_to_array`. Returns `undefined` (NaN-box) for out-of-range / null.
+#[no_mangle]
+pub extern "C" fn js_set_value_at(set: *const SetHeader, i: u32) -> f64 {
+    const UNDEF: u64 = 0x7FFC_0000_0000_0001;
+    let set = clean_set_ptr(set);
+    if set.is_null() {
+        return f64::from_bits(UNDEF);
+    }
+    unsafe {
+        if i >= (*set).size {
+            return f64::from_bits(UNDEF);
+        }
+        let elements = (*set).elements as *const f64;
+        ptr::read(elements.add(i as usize))
+    }
 }
 
 /// Convert a Set to an Array (for Array.from(set))

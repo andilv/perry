@@ -16,8 +16,51 @@ use crate::types::{DOUBLE, I32, I64, I8, PTR};
 /// statement splits control flow, `ctx.current_block` is updated to the
 /// "fall-through" block after the split.
 pub(crate) fn lower_stmts(ctx: &mut FnCtx<'_>, stmts: &[Stmt]) -> Result<()> {
-    for s in stmts {
-        lower_stmt(ctx, s)?;
+    let mut i = 0;
+    while i < stmts.len() {
+        // Channel-reduction fusion: detect a length-3-or-4 sequence of
+        // `acc[c] += arr[idx + c] * k` accumulator updates and emit a
+        // single `<4 x i32>` SIMD multiply-add. The canonical hot shape
+        // is image_convolution's blur kernel inner body. Detection is
+        // narrow (consecutive integer offsets, identical array, identical
+        // factor, distinct integer-stable accumulators) so the fusion
+        // won't fire on shapes like `r += a[i]*k1; g += a[i]*k2;`
+        // (different factors) or `acc += a[i]*k1; acc += a[i+1]*k2;`
+        // (same accumulator).
+        //
+        // The fusion only fires when the array has a `buffer_data_slot`
+        // entry — without the pre-computed data ptr we'd have to derive
+        // it inline, which costs the same as the scalar Uint8ArrayGet
+        // and gives up the win.
+        // Skip the manual `<4 x i32>` channel reduction in functions whose
+        // body was expanded by `perry_transform::unroll_static_loops`.
+        // After the unroll, `KERNEL[ky+2][kx+2]` constant-folds to integer
+        // literals and LLVM has enough info to (a) replace mul-by-1 with
+        // no-op, (b) replace mul-by-power-of-2 with a shift, (c) choose
+        // its own vectorization shape across the 25-chunk unrolled body.
+        // Forcing `<4 x i32>` per chunk pre-commits to a vectorization
+        // that fights all three. Image_convolution measured 350-360 ms
+        // with manual SIMD vs 310-320 ms without (post-unroll) — a -50 ms
+        // savings on the canonical workload.
+        //
+        // Pre-unroll (no constant-foldable k), the manual reduction is
+        // still a 10 ms win (817c4b56) so we keep it as the default
+        // fallback for non-unrolled functions.
+        if !ctx.was_unrolled {
+            if let Some(reduction) =
+                crate::expr::try_match_channel_reduction(stmts, i, ctx.integer_locals)
+            {
+                if ctx.buffer_data_slots.contains_key(&reduction.array_id) {
+                    crate::expr::lower_channel_reduction(ctx, &reduction)?;
+                    i += reduction.acc_ids.len();
+                    if ctx.block().is_terminated() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        }
+        lower_stmt(ctx, &stmts[i])?;
         // If an earlier statement already terminated the current block
         // (e.g. return in a straight-line sequence), any following statement
         // would emit dead code. Anvil silently drops these at the block
@@ -25,6 +68,7 @@ pub(crate) fn lower_stmts(ctx: &mut FnCtx<'_>, stmts: &[Stmt]) -> Result<()> {
         if ctx.block().is_terminated() {
             break;
         }
+        i += 1;
     }
     Ok(())
 }
@@ -455,19 +499,47 @@ pub(crate) fn lower_stmt(ctx: &mut FnCtx<'_>, stmt: &Stmt) -> Result<()> {
                 Some(perry_hir::Expr::Integer(n)) => i32::try_from(*n).is_ok(),
                 _ => true, // non-Integer init: writes will always go via i32-coercing paths
             };
-            // Issue #140: only emit the parallel i32 shadow slot when this local
-            // actually participates in an array/buffer index expression. Pure
-            // accumulators (`sum = sum + 1` between `Date.now()` calls) would
-            // otherwise get a dead i32/sitofp mirror that blocks LLVM's
-            // vectorizer — combined with the #74 `asm sideeffect` loop barrier
-            // the fadd reduction can't be SIMD-widened. Real loop counters that
-            // match `classify_for_length_hoist` in `lower_for` still pick up
-            // their i32 slot via the loop-specific allocation path a few hundred
-            // lines below, so `for (let i=0; i<arr.length; i++) arr[i]=v` keeps
-            // its fast-path even when this gate skips the Let site.
+            // Issue #140 follow-up + #435 fix: gate the Let-site i32
+            // shadow on `index_used_locals` (with transitive closure —
+            // see `collect_index_used_locals` in collectors.rs).  The
+            // original v0.5.164 gate dropped the shadow for image-
+            // convolution's transitively-index-used locals (`xx → idx
+            // → array[idx]`) because the analysis was direct-only; the
+            // comment said dropping the gate was "fine" because
+            // `is_int32_producing_expr` would keep the right locals
+            // off the shadow path.  That claim was wrong:
+            // `is_int32_producing_expr` accepts `Add | Sub | Mul`
+            // over int-stable operands, so pure accumulators like
+            // `let sum = 0; for (...) sum = sum + compute(i)` (the
+            // canonical 14_closure shape) ended up with an i32 shadow
+            // whose reads truncated 64-bit sums to 32-bit signed
+            // integers — silent-correctness bug, exit 0, no
+            // diagnostics.  The gate-with-transitive-closure restores
+            // both invariants: image_conv's chain stays on the i32
+            // path (xx is transitively index-used through idx), and
+            // accumulators that never reach an array index stay off
+            // it.
+            //
+            // Drop the `*mutable` gate: immutable integer-stable Lets
+            // also benefit from an i32 shadow when they participate in
+            // an integer-arithmetic chain (`const row = yy * W;` then
+            // `idx = (row + xx) * 3` in a hot inner loop). The
+            // saturation concern in the original v0.5.164 comment was
+            // about `const SEED = 0x9E3779B9 >>> 0` whose value
+            // exceeds INT32_MAX — but that's a u32 (`>>> 0`), and
+            // `>>> 0` is intentionally not seeded into integer_locals
+            // (see collect_integer_let_ids), so SEED never ends up
+            // in this code path.
+            // (Issue #436) Allow the i32 fast path when the local is
+            // either index-used (existing #435 path) OR
+            // strictly-i32-bounded by every write (new path that
+            // recovers the FNV-1a `h` accumulator and similar
+            // explicit-i32-coerce shapes without reintroducing #435's
+            // accumulator overflow).
+            let i32_safe_local =
+                ctx.index_used_locals.contains(id) || ctx.strictly_i32_bounded_locals.contains(id);
             let needs_i32_slot = ctx.integer_locals.contains(id)
-                && ctx.index_used_locals.contains(id)
-                && *mutable
+                && i32_safe_local
                 && init_in_i32_range
                 && !ctx.boxed_vars.contains(id)
                 && !ctx.module_globals.contains_key(id)
@@ -477,9 +549,66 @@ pub(crate) fn lower_stmt(ctx: &mut FnCtx<'_>, stmt: &Stmt) -> Result<()> {
                 ctx.func.entry_allocas_push_store(I32, "0", &i32_slot);
                 ctx.i32_counter_slots.insert(*id, i32_slot);
             }
-            if let Some(init_expr) = init {
-                let v = lower_expr(ctx, init_expr)?;
-                ctx.block().store(DOUBLE, &v, &slot);
+            // Issue #50 follow-up: when this local is a row alias of a
+            // flat-const 2D int array, `try_lower_flat_const_index_get` will
+            // intercept every `LocalGet(this).at(j)` access at lowering time
+            // and emit a direct GEP into the `[N x i32]` global — the slot
+            // value is never read. Skip lowering the init expression
+            // (`let krow = KERNEL[ky+2]` would otherwise emit a generic
+            // IndexGet with the v0.5.357 lazy/forwarded cond_br guard,
+            // serializing the inner conv loop through `js_array_get_f64`
+            // and blocking SIMD on `image_convolution`'s 5×5 blur kernel).
+            // Park TAG_UNDEFINED in the slot so any pathological non-alias
+            // read (`console.log(krow)`) gets `undefined` rather than
+            // garbage; DCE removes the dummy store when no such reader
+            // exists.
+            if init.is_some() && ctx.array_row_aliases.contains_key(id) {
+                let undef =
+                    crate::nanbox::double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
+                ctx.block().store(DOUBLE, &undef, &slot);
+            } else if let Some(init_expr) = init {
+                // Issue #49 follow-up: i32-native init path. If this local
+                // has an i32 shadow slot AND the init expression can be
+                // lowered straight to i32 (Add/Sub/Mul/bitwise on i32
+                // operands, clamp call, MathImul, Integer literal,
+                // Buffer/Uint8ArrayGet, …), compute the init in i32
+                // directly and `sitofp` to seed the double slot. This
+                // avoids the `fadd → fmul → fptosi` round-trip that
+                // image_convolution's `let row = yy * W` would otherwise
+                // emit when both operands have i32 slots.
+                let used_i32_init = if let Some(i32_slot) = ctx.i32_counter_slots.get(id).cloned() {
+                    let i32_slots = ctx.i32_counter_slots.clone();
+                    let flat_ca = ctx.flat_const_arrays.clone();
+                    let ara = ctx.array_row_aliases.clone();
+                    let int_locals = ctx.integer_locals.clone();
+                    if crate::expr::can_lower_expr_as_i32(
+                        init_expr,
+                        &i32_slots,
+                        &flat_ca,
+                        &ara,
+                        &int_locals,
+                        ctx.clamp3_functions,
+                        ctx.clamp_u8_functions,
+                    ) {
+                        let i32_v = crate::expr::lower_expr_as_i32(ctx, init_expr)?;
+                        let blk = ctx.block();
+                        blk.store(I32, &i32_v, &i32_slot);
+                        let v = blk.sitofp(I32, &i32_v, DOUBLE);
+                        blk.store(DOUBLE, &v, &slot);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                let v = if !used_i32_init {
+                    let v = lower_expr(ctx, init_expr)?;
+                    ctx.block().store(DOUBLE, &v, &slot);
+                    v
+                } else {
+                    String::new() // unused below; cleanup blocks check used_i32_init
+                };
                 // Gen-GC Phase A sub-phase 3b: if this local has a
                 // shadow-frame slot, mirror the store into the
                 // frame. Bitcast double → i64 (NaN-box bits) then
@@ -490,23 +619,25 @@ pub(crate) fn lower_stmt(ctx: &mut FnCtx<'_>, stmt: &Stmt) -> Result<()> {
                 // Let — measured noise on bench_json_roundtrip.
                 // Only fires when PERRY_SHADOW_STACK=1 is set at
                 // compile time, since the map is empty otherwise.
-                if let Some(&slot_idx) = ctx.shadow_slot_map.get(id) {
-                    let v_i64 = ctx.block().bitcast_double_to_i64(&v);
-                    ctx.block().call_void(
-                        "js_shadow_slot_set",
-                        &[(I32, &slot_idx.to_string()), (I64, &v_i64)],
-                    );
-                }
-                // Seed the i32 slot from the init value when the local has one.
-                // Use fptosi→i64 + trunc→i32 instead of direct fptosi→i32
-                // to handle unsigned values (e.g. `let s = 0x9E3779B9 >>> 0`
-                // where the double exceeds INT32_MAX). Direct fptosi→i32 is
-                // UB for such values; going through i64 then truncating gives
-                // the correct bit pattern.
-                if let Some(i32_slot) = ctx.i32_counter_slots.get(id).cloned() {
-                    let v_i64 = ctx.block().fptosi(DOUBLE, &v, crate::types::I64);
-                    let v_i32 = ctx.block().trunc(crate::types::I64, &v_i64, I32);
-                    ctx.block().store(I32, &v_i32, &i32_slot);
+                if !used_i32_init {
+                    if let Some(&slot_idx) = ctx.shadow_slot_map.get(id) {
+                        let v_i64 = ctx.block().bitcast_double_to_i64(&v);
+                        ctx.block().call_void(
+                            "js_shadow_slot_set",
+                            &[(I32, &slot_idx.to_string()), (I64, &v_i64)],
+                        );
+                    }
+                    // Seed the i32 slot from the init value when the local has one.
+                    // Use fptosi→i64 + trunc→i32 instead of direct fptosi→i32
+                    // to handle unsigned values (e.g. `let s = 0x9E3779B9 >>> 0`
+                    // where the double exceeds INT32_MAX). Direct fptosi→i32 is
+                    // UB for such values; going through i64 then truncating gives
+                    // the correct bit pattern.
+                    if let Some(i32_slot) = ctx.i32_counter_slots.get(id).cloned() {
+                        let v_i64 = ctx.block().fptosi(DOUBLE, &v, crate::types::I64);
+                        let v_i32 = ctx.block().trunc(crate::types::I64, &v_i64, I32);
+                        ctx.block().store(I32, &v_i32, &i32_slot);
+                    }
                 }
                 // Buffer data-pointer slot for local (non-global) const buffers.
                 // `const src = Buffer.alloc(N)` at module-level lives here when
@@ -514,7 +645,14 @@ pub(crate) fn lower_stmt(ctx: &mut FnCtx<'_>, stmt: &Stmt) -> Result<()> {
                 // image_conv blur kernel. The pre-computed ptr slot lets
                 // Uint8ArrayGet/Set emit `getelementptr inbounds` from a
                 // proper `ptr` base instead of an `inttoptr` chain.
-                if !*mutable && matches!(init_expr, perry_hir::Expr::BufferAlloc { .. }) {
+                //
+                // Only relevant on the f64-init path (BufferAlloc isn't
+                // i32-able, so used_i32_init is always false here, but
+                // gate explicitly to keep the invariant readable).
+                if !used_i32_init
+                    && !*mutable
+                    && matches!(init_expr, perry_hir::Expr::BufferAlloc { .. })
+                {
                     let blk = ctx.block();
                     let handle = crate::expr::unbox_to_i64(blk, &v);
                     let handle_ptr = blk.inttoptr(I64, &handle);
@@ -961,9 +1099,11 @@ fn lower_for(
     let i32_local_bound_slot: Option<String> =
         if let Some((counter_id, bound_id, _op)) = local_bound_classification {
             // Allocate a parallel i32 slot for the counter if not already
-            // present.  The Let-site may have skipped it when the counter
-            // wasn't in `index_used_locals`; providing it here enables both
-            // `icmp slt i32` in the condition and `add i32 1` in Update.
+            // present.  Counters that fall outside `integer_locals`
+            // (e.g. `for (let i = 0; i < arr.length; i++)` where `i` is
+            // captured by a closure or escapes) skip the Let-site
+            // allocation; providing one here enables both `icmp slt i32`
+            // in the condition and `add i32 1` in Update.
             let fresh = if !ctx.i32_counter_slots.contains_key(&counter_id) {
                 if let Some(counter_slot) = ctx.locals.get(&counter_id).cloned() {
                     let i32_slot = ctx.func.alloca_entry(I32);
@@ -1428,6 +1568,40 @@ fn expr_preserves_array_length(e: &perry_hir::Expr, arr_id: u32, bounded_idx_id:
         Expr::PropertyGet { object, .. } => walk(object),
         Expr::PropertySet { object, value, .. } => walk(object) && walk(value),
         Expr::IndexGet { object, index } => walk(object) && walk(index),
+        // Buffer / Uint8Array reads + writes preserve the underlying array
+        // length — Buffer.alloc allocates a fixed-capacity blob, and the
+        // GEP-based fast path (`Expr::Uint8ArrayGet`/`Set`,
+        // `Expr::BufferIndexGet`/`Set`) doesn't extend it. Without these
+        // arms the default `_ => false` arm rejects bodies that touch
+        // a Buffer, blocking the `i < dst.length` peephole on
+        // `for (let i = 0; i < dst.length; i++) dst[i]` patterns —
+        // image_convolution's FNV-1a checksum loop is the canonical
+        // example, ~24M iterations through `fcmp olt double` instead of
+        // `icmp slt i32`.
+        Expr::Uint8ArrayGet { array, index } => walk(array) && walk(index),
+        Expr::Uint8ArraySet {
+            array,
+            index,
+            value,
+        } => walk(array) && walk(index) && walk(value),
+        Expr::BufferIndexGet { buffer, index } => walk(buffer) && walk(index),
+        Expr::BufferIndexSet {
+            buffer,
+            index,
+            value,
+        } => walk(buffer) && walk(index) && walk(value),
+        // Pure arithmetic intrinsics — `Math.imul(a, b)` lowers to
+        // `Expr::MathImul`, `Math.abs/sqrt/pow/floor/ceil/round` etc. all
+        // bottom out as numeric ops with no side effects on the bounded
+        // array. image_conv's FNV-1a body uses Math.imul and was rejecting
+        // the peephole until this arm landed.
+        Expr::MathImul(a, b) | Expr::MathPow(a, b) => walk(a) && walk(b),
+        Expr::MathMin(elems) | Expr::MathMax(elems) => elems.iter().all(&walk),
+        Expr::MathAbs(a)
+        | Expr::MathSqrt(a)
+        | Expr::MathFloor(a)
+        | Expr::MathCeil(a)
+        | Expr::MathRound(a) => walk(a),
         Expr::Array(elements) => elements.iter().all(&walk),
         Expr::ArraySpread(elements) => elements.iter().all(|el| match el {
             ArrayElement::Expr(e) | ArrayElement::Spread(e) => walk(e),
@@ -1435,6 +1609,7 @@ fn expr_preserves_array_length(e: &perry_hir::Expr, arr_id: u32, bounded_idx_id:
         Expr::Object(fields) => fields.iter().all(|(_, v)| walk(v)),
         Expr::LocalGet(_)
         | Expr::GlobalGet(_)
+        | Expr::FuncRef(_)
         | Expr::Number(_)
         | Expr::Integer(_)
         | Expr::Bool(_)

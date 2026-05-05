@@ -188,6 +188,19 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     //     (see crates/perry-runtime/src/closure.rs); the call site cap in
     //     lower_call.rs matches.
     module.declare_function("js_closure_alloc", I64, &[PTR, I32]);
+    // Singleton-cached variant for non-capturing closures and FuncRef
+    // wrappers — same `func_ptr` returns the same cached ClosureHeader,
+    // skipping gc_malloc + gc_check_trigger on the hot loop. See
+    // `crates/perry-runtime/src/closure.rs::js_closure_alloc_singleton`.
+    module.declare_function("js_closure_alloc_singleton", I64, &[PTR]);
+    // Singleton-cached variant for closures with captures, keyed by
+    // `(func_ptr, capture_bits…)`. Args: (func_ptr, capture_count,
+    // captures_ptr — pointer to `capture_count` u64 values).
+    module.declare_function(
+        "js_closure_alloc_with_captures_singleton",
+        I64,
+        &[PTR, I32, PTR],
+    );
     module.declare_function("js_closure_set_capture_f64", VOID, &[I64, I32, DOUBLE]);
     module.declare_function("js_closure_get_capture_f64", DOUBLE, &[I64, I32]);
     module.declare_function("js_closure_call0", DOUBLE, &[I64]);
@@ -509,11 +522,19 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_map_entries", I64, &[I64]);
     module.declare_function("js_map_keys", I64, &[I64]);
     module.declare_function("js_map_values", I64, &[I64]);
+    // Direct entry access for the `for (const [k, v] of map)` fast path
+    // — skips the pair-Array materialization that `js_map_entries`
+    // would do. (Map ptr, entry idx) → key / value.
+    module.declare_function("js_map_entry_key_at", DOUBLE, &[I64, I32]);
+    module.declare_function("js_map_entry_value_at", DOUBLE, &[I64, I32]);
     // Map/Set forEach: (collection_ptr, callback_nanboxed_f64) -> void
     module.declare_function("js_map_foreach", VOID, &[I64, DOUBLE]);
     module.declare_function("js_set_foreach", VOID, &[I64, DOUBLE]);
     // Set to array conversion (for Set iteration via for...of)
     module.declare_function("js_set_to_array", I64, &[I64]);
+    // Direct element access for the `for (const x of set)` fast path —
+    // skips the throwaway Array allocation that `js_set_to_array` would do.
+    module.declare_function("js_set_value_at", DOUBLE, &[I64, I32]);
     // Splice is unusual: takes an out-pointer for the deleted array
     // and returns the modified-in-place input (the splice point may
     // realloc). Param order is (arr, start, delete_count, items_ptr,
@@ -1075,6 +1096,13 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
 ///   our number ABI)
 pub fn declare_phase_b_arrays(module: &mut LlModule) {
     module.declare_function("js_array_alloc", I64, &[I32]);
+    // Convenience alias for `js_array_alloc(0)`; emitted by lower_call's
+    // `new Array()` no-arg branch. Issue #432: clang rejected
+    // Effect 3.21.2's `internal/fiberRuntime.ts` IR with
+    // "use of undefined value '@js_array_create'" because this
+    // declaration was missing — the call site at
+    // `lower_call/builtin.rs:217` referenced an undeclared symbol.
+    module.declare_function("js_array_create", I64, &[]);
     // Exact-sized literal allocator — one call + N direct stores replaces
     // alloc + N×push_f64. See `js_array_alloc_literal` in perry-runtime/src/array.rs.
     module.declare_function("js_array_alloc_literal", I64, &[I32]);
@@ -1153,6 +1181,25 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
 /// `js_object_alloc(0, N)` is the fallback for dynamic cases.
 pub fn declare_phase_b_objects(module: &mut LlModule) {
     module.declare_function("js_object_alloc", I64, &[I32, I32]);
+    // Shape-cache-aware variant: pre-populates keys_array via SHAPE_INLINE_CACHE,
+    // so subsequent field stores can use index-based set_field (skipping the
+    // per-call linear key-search done by js_object_set_field_by_name).
+    module.declare_function("js_object_alloc_with_shape", I64, &[I32, I32, PTR, I32]);
+    // Index-based field setter (no key lookup). Hot-path target for object
+    // literals with statically-known keys; the i-th field directly maps to
+    // the i-th packed-keys entry above.
+    //
+    // Issue #448: third arg is `JSValue` on the runtime side (a
+    // `#[repr(transparent)] u64` wrapper). On AArch64 / x86_64 SysV / Win64
+    // ABIs, integer and floating-point arguments use disjoint register
+    // classes — declaring the slot as DOUBLE put the NaN-boxed value in
+    // an FP register while the Rust function read its `value: JSValue`
+    // arg from a GP register, so closure pointers stored into generator
+    // iter objects (`{ next, return, throw }` literals built via the
+    // shape-cache fast path) read back as `0` and the iterator-protocol
+    // loop hung forever. Declaring the slot as I64 routes through the
+    // same register class the runtime actually reads.
+    module.declare_function("js_object_set_field", VOID, &[I64, I32, I64]);
     module.declare_function("js_object_set_field_by_name", VOID, &[I64, I64, DOUBLE]);
     module.declare_function("js_object_get_field_by_name_f64", DOUBLE, &[I64, I64]);
     module.declare_function("js_object_get_field_ic_miss", DOUBLE, &[I64, I64, PTR]);
@@ -1879,6 +1926,11 @@ pub fn declare_stdlib_ffi(module: &mut LlModule) {
     module.declare_function("js_call_function", DOUBLE, &[I64, I64, I64, I64, I64]);
     module.declare_function("js_call_method", DOUBLE, &[DOUBLE, I64, I64, I64, I64]);
     module.declare_function("js_closure_call_array", DOUBLE, &[I64, I64, I64]);
+    module.declare_function(
+        "js_closure_call_apply_with_spread",
+        DOUBLE,
+        &[DOUBLE, PTR, I64, I64],
+    );
     module.declare_function("js_create_callback", DOUBLE, &[I64, I64, I64]);
 
     // ========== NaN-boxing / typeof / is_* ==========
@@ -1923,6 +1975,10 @@ pub fn declare_stdlib_ffi(module: &mut LlModule) {
     // ========== Class registration ==========
     module.declare_function("js_register_class_getter", VOID, &[I64, I64, I64, I64]);
     module.declare_function("js_register_class_method", VOID, &[I64, I64, I64, I64, I64]);
+    // #446: bound-method closure for `obj.method` PropertyGet on a known class.
+    // Lets `typeof obj.method === "function"` and `let f = obj.method; f(args)`
+    // dispatch through CLASS_VTABLE_REGISTRY instead of returning undefined.
+    module.declare_function("js_class_method_bind", DOUBLE, &[DOUBLE, I64, I64]);
 
     // ========== Runtime init / module loader ==========
     module.declare_function("js_get_export", DOUBLE, &[I64, I64, I64]);
