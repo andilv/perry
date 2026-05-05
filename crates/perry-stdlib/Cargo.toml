@@ -79,8 +79,15 @@ rate-limit = ["dep:governor", "async-runtime"]
 # Validation
 validation = ["dep:validator", "dep:regex"]
 
-# UUID/nanoid
-ids = ["dep:uuid", "dep:nanoid"]
+# UUID/nanoid — `ids` stays as the umbrella for backwards compat;
+# from v0.5.534 onwards the per-binding split (`bundled-uuid` /
+# `bundled-nanoid`) is what the well-known bindings flip (#466
+# Phase 4 step 2) toggles. Each sub-feature pulls in its own
+# optional dep + gates its own module so a wrapper port can strip
+# exactly one binding from perry-stdlib without affecting the other.
+ids = ["bundled-uuid", "bundled-nanoid"]
+bundled-uuid = ["dep:uuid"]
+bundled-nanoid = ["dep:nanoid"]
 
 # Async runtime (tokio) - internal feature
 async-runtime = ["dep:tokio"]

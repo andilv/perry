@@ -77,7 +77,14 @@ pub fn module_to_features(module: &str) -> &'static [&'static str] {
         "validator" => &["validation"],
 
         // ── IDs (uuid / nanoid) ───────────────────────────────────────
-        "uuid" | "nanoid" => &["ids"],
+        // Per-binding split as of v0.5.534 (#466 Phase 4 step 2)
+        // so the well-known flip can swap each one out
+        // independently. The `ids` umbrella stays in
+        // perry-stdlib/Cargo.toml as `bundled-uuid + bundled-nanoid`
+        // for backwards compat, but feature-set computation goes
+        // straight to the per-binding feature.
+        "uuid" => &["bundled-uuid"],
+        "nanoid" => &["bundled-nanoid"],
 
         // Slugify is in the always-on stdlib core (no optional dep).
         "slugify" => &[],

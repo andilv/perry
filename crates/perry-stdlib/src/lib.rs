@@ -227,11 +227,17 @@ pub use validator::*;
 
 // === IDs ===
 #[cfg(feature = "ids")]
+// `bundled-uuid` / `bundled-nanoid` (v0.5.534) replace the old
+// `ids` umbrella so the well-known flip (#466 Phase 4) can toggle
+// each binding independently. The umbrella stays as
+// `ids = ["bundled-uuid", "bundled-nanoid"]` so existing
+// `--features ids` callers keep working byte-identically.
+#[cfg(feature = "bundled-uuid")]
 pub mod uuid;
-#[cfg(feature = "ids")]
+#[cfg(feature = "bundled-uuid")]
 pub use uuid::*;
 
-#[cfg(feature = "ids")]
+#[cfg(feature = "bundled-nanoid")]
 pub mod nanoid;
-#[cfg(feature = "ids")]
+#[cfg(feature = "bundled-nanoid")]
 pub use nanoid::*;

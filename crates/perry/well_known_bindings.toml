@@ -36,3 +36,8 @@ lib = "perry_ext_dotenv"
 # Tracking issue for the migration; surfaced in error messages
 # when the bundled .a is missing at link time.
 tracking = "#466"
+
+[bindings.nanoid]
+crate = "perry-ext-nanoid"
+lib = "perry_ext_nanoid"
+tracking = "#466"
