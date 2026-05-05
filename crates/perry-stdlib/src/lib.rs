@@ -174,9 +174,13 @@ pub mod argon2;
 #[cfg(feature = "bundled-argon2")]
 pub use argon2::*;
 
-#[cfg(feature = "crypto")]
+// jsonwebtoken split out into `bundled-jsonwebtoken` (v0.5.538)
+// for the same reason as bcrypt/argon2 — well-known flip
+// independence. The `crypto` umbrella still pulls it in for
+// backwards compat.
+#[cfg(feature = "bundled-jsonwebtoken")]
 pub mod jsonwebtoken;
-#[cfg(feature = "crypto")]
+#[cfg(feature = "bundled-jsonwebtoken")]
 pub use jsonwebtoken::*;
 
 #[cfg(feature = "crypto")]
@@ -239,9 +243,14 @@ pub mod ratelimit;
 pub use ratelimit::*;
 
 // === Validation ===
-#[cfg(feature = "validation")]
+// `validation` umbrella now expands to `bundled-validator`
+// (v0.5.538). Per-binding gate lets the well-known flip swap the
+// validator wrapper out without affecting the rest of the
+// validation surface (none — there's just the one wrapper today,
+// but the split unblocks future additions).
+#[cfg(feature = "bundled-validator")]
 pub mod validator;
-#[cfg(feature = "validation")]
+#[cfg(feature = "bundled-validator")]
 pub use validator::*;
 
 // === IDs ===

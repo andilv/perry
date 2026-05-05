@@ -67,9 +67,10 @@ database-mongodb = ["dep:mongodb", "dep:bson", "dep:futures-util", "async-runtim
 # bindings so the well-known flip (#466 Phase 4 step 2) can route them
 # to perry-ext-bcrypt / perry-ext-argon2 without taking the rest of
 # the crypto surface offline.
-crypto = ["dep:sha2", "dep:sha1", "dep:md-5", "dep:hex", "dep:hmac", "dep:jsonwebtoken", "dep:aes", "dep:cbc", "dep:scrypt", "dep:pbkdf2", "dep:base64", "dep:x25519-dalek", "dep:ed25519-dalek", "dep:aes-gcm", "dep:hkdf", "async-runtime", "ids", "bundled-bcrypt", "bundled-argon2"]
+crypto = ["dep:sha2", "dep:sha1", "dep:md-5", "dep:hex", "dep:hmac", "dep:aes", "dep:cbc", "dep:scrypt", "dep:pbkdf2", "dep:base64", "dep:x25519-dalek", "dep:ed25519-dalek", "dep:aes-gcm", "dep:hkdf", "async-runtime", "ids", "bundled-bcrypt", "bundled-argon2", "bundled-jsonwebtoken"]
 bundled-bcrypt = ["dep:bcrypt", "async-runtime"]
 bundled-argon2 = ["dep:argon2", "async-runtime"]
+bundled-jsonwebtoken = ["dep:jsonwebtoken"]
 
 # Compression (zlib)
 compression = ["dep:flate2"]
@@ -89,8 +90,10 @@ scheduler = ["dep:cron", "dep:tokio-cron-scheduler", "async-runtime"]
 # Rate limiting
 rate-limit = ["dep:governor", "async-runtime"]
 
-# Validation
-validation = ["dep:validator", "dep:regex"]
+# Validation — `validation` umbrella stays for backwards-compat;
+# v0.5.538's well-known flip toggles `bundled-validator` instead.
+validation = ["bundled-validator"]
+bundled-validator = ["dep:validator", "dep:regex"]
 
 # UUID/nanoid — `ids` stays as the umbrella for backwards compat;
 # from v0.5.534 onwards the per-binding split (`bundled-uuid` /

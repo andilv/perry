@@ -61,3 +61,13 @@ tracking = "#466"
 crate = "perry-ext-argon2"
 lib = "perry_ext_argon2"
 tracking = "#466"
+
+[bindings.jsonwebtoken]
+crate = "perry-ext-jsonwebtoken"
+lib = "perry_ext_jsonwebtoken"
+tracking = "#466"
+
+[bindings.validator]
+crate = "perry-ext-validator"
+lib = "perry_ext_validator"
+tracking = "#466"

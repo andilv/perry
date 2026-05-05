@@ -56,7 +56,8 @@ pub fn module_to_features(module: &str) -> &'static [&'static str] {
         // bcrypt also typically use sha256/jwt/etc., which keeps the
         // umbrella worthwhile.
         "bcrypt" => &["bundled-bcrypt"],
-        "crypto" | "jsonwebtoken" => &["crypto"],
+        "jsonwebtoken" => &["bundled-jsonwebtoken"],
+        "crypto" => &["crypto"],
         // ethers ships utility functions (formatUnits, parseUnits,
         // getAddress, keccak256, …) that bottom out in sha3/keccak in
         // the crypto bucket.
@@ -82,7 +83,9 @@ pub fn module_to_features(module: &str) -> &'static [&'static str] {
         "cron" | "node-cron" => &["scheduler"],
 
         // ── Validation (validator.js) ─────────────────────────────────
-        "validator" => &["validation"],
+        // `validation` umbrella retained for backwards-compat;
+        // per-binding gate is `bundled-validator` (v0.5.538).
+        "validator" => &["bundled-validator"],
 
         // ── argon2 ────────────────────────────────────────────────────
         // argon2 split off into `bundled-argon2` (v0.5.537) — same
