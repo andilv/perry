@@ -121,3 +121,13 @@ tracking = "#466"
 crate = "perry-ext-decimal"
 lib = "perry_ext_decimal"
 tracking = "#466"
+
+[bindings.dayjs]
+crate = "perry-ext-dayjs"
+lib = "perry_ext_dayjs"
+tracking = "#466"
+
+[bindings."date-fns"]
+crate = "perry-ext-dayjs"
+lib = "perry_ext_dayjs"
+tracking = "#466"

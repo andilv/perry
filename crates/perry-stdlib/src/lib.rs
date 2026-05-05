@@ -30,6 +30,10 @@ pub mod perry_ffi_async;
 pub mod async_local_storage;
 pub mod commander;
 pub mod common;
+// dayjs / date-fns — feature-gated as of v0.5.548 so the well-known
+// flip can route `import 'dayjs'` / `import 'date-fns'` to
+// perry-ext-dayjs without duplicate `_js_dayjs_*` symbols at link.
+#[cfg(feature = "bundled-dayjs")]
 pub mod dayjs;
 // decimal feature-gated as of v0.5.547 — well-known flip routes
 // to perry-ext-decimal.
@@ -68,6 +72,7 @@ pub mod worker_threads;
 pub use async_local_storage::*;
 pub use commander::*;
 pub use common::*;
+#[cfg(feature = "bundled-dayjs")]
 pub use dayjs::*;
 #[cfg(feature = "bundled-decimal")]
 pub use decimal::*;
