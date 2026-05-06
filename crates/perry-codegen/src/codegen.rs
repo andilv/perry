@@ -1996,12 +1996,62 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         // Compiled like a method: takes (i64 this, double arg0, ...) → void.
         // The constructor name matches the import declaration:
         // `<prefix>__<class>_constructor`.
+        //
+        // Refs #420: when class has no own ctor but extends a parent that
+        // does, JS spec's default ctor is `constructor(...args) { super(...args); }`.
+        // Adopt the closest ancestor-with-ctor's params as the synthesized
+        // ctor's signature, so when this standalone ctor is called via
+        // super() with the args meant for the grandparent, they can be
+        // forwarded correctly. The compile_method post-init step (below)
+        // emits the actual super-call.
         {
-            let ctor_body = class
-                .constructor
-                .as_ref()
-                .map(|c| (c.params.clone(), c.body.clone(), c.captures.clone()))
-                .unwrap_or_else(|| (Vec::new(), Vec::new(), Vec::new()));
+            let ctor_body = if let Some(c) = class.constructor.as_ref() {
+                (c.params.clone(), c.body.clone(), c.captures.clone())
+            } else if class.extends_name.is_some() {
+                // Walk ancestors for the first one with a ctor; adopt its
+                // params (cleared of ids — they'll be fresh).
+                let mut found_params: Vec<perry_hir::Param> = Vec::new();
+                let mut cur = class.extends_name.clone();
+                while let Some(pname) = cur {
+                    if let Some(pclass) = class_table.get(pname.as_str()) {
+                        if let Some(pctor) = &pclass.constructor {
+                            found_params = pctor.params.clone();
+                            break;
+                        }
+                        cur = pclass.extends_name.clone();
+                    } else if let Some(stub) = imported_class_stubs
+                        .iter()
+                        .find(|c| c.name == pname)
+                    {
+                        // Imported stub — params not in HIR; use its ctor
+                        // param count as a synthetic count of unnamed args.
+                        if let Some(ic) = opts
+                            .imported_classes
+                            .iter()
+                            .find(|i| i.local_alias.as_deref().unwrap_or(&i.name) == pname.as_str())
+                        {
+                            // Synthesize N untyped params named arg0..argN-1
+                            // with fresh local ids in a high range to avoid
+                            // collisions.
+                            for i in 0..ic.constructor_param_count {
+                                found_params.push(perry_hir::Param {
+                                    id: 0xFFFF_0000 + i as u32,
+                                    name: format!("__forward_arg{}", i),
+                                    ty: perry_types::Type::Any,
+                                    default: None,
+                                    is_rest: false,
+                                });
+                            }
+                        }
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+                (found_params, Vec::new(), Vec::new())
+            } else {
+                (Vec::new(), Vec::new(), Vec::new())
+            };
             let ctor_as_method = perry_hir::Function {
                 id: 0,
                 name: format!("{}_constructor", class.name),
@@ -3245,6 +3295,116 @@ fn compile_method(
                     class.name
                 )
             })?;
+        // Refs #420: when a class has no own constructor but extends a parent
+        // that DOES have a body, JS spec requires a default ctor that calls
+        // `super(...args)` — implicit forward. perry's standalone ctor for
+        // such a class previously emitted only field initializers, so the
+        // parent's ctor body (e.g. ColumnBuilder's `this.config = {...}`)
+        // never ran when called via the cross-module dispatch path. Inject a
+        // call to the parent's standalone ctor symbol here, forwarding all
+        // args. The walk skips empty-bodied parents (matching the JS spec
+        // chain semantics).
+        if class.constructor.is_none() && class.extends_name.is_some() {
+            let mut effective_parent: Option<&str> = class.extends_name.as_deref();
+            while let Some(pname) = effective_parent {
+                let Some(pc) = ctx.classes.get(pname).copied() else {
+                    break;
+                };
+                let has_local_body = pc.constructor.is_some();
+                let has_imported_ctor = ctx.imported_class_ctors.contains_key(pname);
+                if has_local_body || has_imported_ctor {
+                    break;
+                }
+                effective_parent = pc.extends_name.as_deref();
+            }
+            if let Some(pname) = effective_parent {
+                let pname_owned = pname.to_string();
+                // Resolve the standalone-ctor symbol name. Prefer the
+                // local class table (same module) for an inline call;
+                // fall back to imported_class_ctors for cross-module.
+                let (ctor_sym, param_count) =
+                    if let Some(pclass) = ctx.classes.get(&pname_owned).copied() {
+                        if pclass.constructor.is_some() {
+                            // Local class with own ctor — use the per-module-prefix
+                            // standalone symbol, same one compile_method emits.
+                            let module_prefix = ctx.strings.module_prefix().to_string();
+                            let sym = format!("{}__{}_constructor", module_prefix, pname_owned);
+                            let pcount = pclass
+                                .constructor
+                                .as_ref()
+                                .map(|c| c.params.len())
+                                .unwrap_or(0);
+                            (sym, pcount)
+                        } else if let Some((sym, n)) =
+                            ctx.imported_class_ctors.get(&pname_owned).cloned()
+                        {
+                            (sym, n)
+                        } else {
+                            // No callable ctor symbol — bail.
+                            stmt::lower_stmts(&mut ctx, &method.body).with_context(|| {
+                                format!(
+                                    "lowering body of method '{}::{}'",
+                                    class.name, method.name
+                                )
+                            })?;
+                            // Fall through to the default ret-void at end.
+                            if !ctx.block().is_terminated() {
+                                ctx.block().ret(DOUBLE, "0.0");
+                            }
+                            let _ = std::mem::take(&mut ctx.ic_globals);
+                            let _ = std::mem::take(&mut ctx.typed_parse_rodata);
+                            let _ = std::mem::take(&mut ctx.pending_declares);
+                            return Ok(());
+                        }
+                    } else if let Some((sym, n)) =
+                        ctx.imported_class_ctors.get(&pname_owned).cloned()
+                    {
+                        (sym, n)
+                    } else {
+                        ("".to_string(), 0)
+                    };
+                if !ctor_sym.is_empty() {
+                    let undef_lit =
+                        crate::nanbox::double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
+                    // Forward this method's params, padding with undefined if
+                    // the parent expects more.
+                    let mut forwarded: Vec<String> = Vec::with_capacity(param_count);
+                    for (i, p) in method.params.iter().enumerate() {
+                        if i >= param_count {
+                            break;
+                        }
+                        let slot = ctx.locals.get(&p.id).cloned();
+                        if let Some(slot) = slot {
+                            forwarded.push(ctx.block().load(DOUBLE, &slot));
+                        } else {
+                            forwarded.push(undef_lit.clone());
+                        }
+                    }
+                    while forwarded.len() < param_count {
+                        forwarded.push(undef_lit.clone());
+                    }
+                    // Load `this` from the this_stack.
+                    let this_slot = ctx.this_stack.last().cloned();
+                    let this_box = if let Some(slot) = this_slot {
+                        ctx.block().load(DOUBLE, &slot)
+                    } else {
+                        undef_lit.clone()
+                    };
+                    let ctor_param_types: Vec<crate::types::LlvmType> = std::iter::once(DOUBLE)
+                        .chain(forwarded.iter().map(|_| DOUBLE))
+                        .collect();
+                    let mut ctor_args: Vec<(crate::types::LlvmType, &str)> =
+                        Vec::with_capacity(1 + forwarded.len());
+                    ctor_args.push((DOUBLE, &this_box));
+                    for la in &forwarded {
+                        ctor_args.push((DOUBLE, la.as_str()));
+                    }
+                    ctx.pending_declares
+                        .push((ctor_sym.clone(), crate::types::VOID, ctor_param_types));
+                    ctx.block().call_void(&ctor_sym, &ctor_args);
+                }
+            }
+        }
     }
 
     stmt::lower_stmts(&mut ctx, &method.body)

@@ -4586,22 +4586,44 @@ pub unsafe extern "C" fn js_native_call_method(
                 }
                 if let Ok(registry) = CLASS_VTABLE_REGISTRY.read() {
                     if let Some(ref reg) = *registry {
-                        if let Some(vtable) = reg.get(&class_id) {
-                            if let Some(entry) = vtable.methods.get(method_name) {
-                                vtable_ic_insert(
-                                    class_id,
-                                    method_name_ptr as usize,
-                                    entry.func_ptr,
-                                    entry.param_count,
-                                );
-                                let this_i64 = jsval.as_pointer::<u8>() as i64;
-                                return call_vtable_method(
-                                    entry.func_ptr,
-                                    this_i64,
-                                    args_ptr,
-                                    args_len,
-                                    entry.param_count,
-                                );
+                        // Refs #420: walk the parent chain via the class
+                        // registry. Per JS spec, `subInstance.method()` for
+                        // a method defined on a parent dispatches to the
+                        // parent's implementation — drizzle's
+                        // `serial("id").primaryKey()` where primaryKey is on
+                        // ColumnBuilder (grandparent) but the receiver is a
+                        // PgSerialBuilder (grandchild). The codegen-side
+                        // dispatch tower in `lower_call.rs` only registers
+                        // classes the importing module knows about; for
+                        // not-by-name-imported subclasses (return values of
+                        // imported functions) we depend on this runtime walk.
+                        let mut cur_cid = class_id;
+                        let mut depth = 0u32;
+                        while depth < 32 {
+                            if let Some(vtable) = reg.get(&cur_cid) {
+                                if let Some(entry) = vtable.methods.get(method_name) {
+                                    vtable_ic_insert(
+                                        class_id,
+                                        method_name_ptr as usize,
+                                        entry.func_ptr,
+                                        entry.param_count,
+                                    );
+                                    let this_i64 = jsval.as_pointer::<u8>() as i64;
+                                    return call_vtable_method(
+                                        entry.func_ptr,
+                                        this_i64,
+                                        args_ptr,
+                                        args_len,
+                                        entry.param_count,
+                                    );
+                                }
+                            }
+                            match get_parent_class_id(cur_cid) {
+                                Some(pid) if pid != 0 => {
+                                    cur_cid = pid;
+                                    depth += 1;
+                                }
+                                _ => break,
                             }
                         }
                     }
@@ -4766,22 +4788,35 @@ pub unsafe extern "C" fn js_native_call_method(
                 }
                 if let Ok(registry) = CLASS_VTABLE_REGISTRY.read() {
                     if let Some(ref reg) = *registry {
-                        if let Some(vtable) = reg.get(&class_id) {
-                            if let Some(entry) = vtable.methods.get(method_name) {
-                                vtable_ic_insert(
-                                    class_id,
-                                    method_name_ptr as usize,
-                                    entry.func_ptr,
-                                    entry.param_count,
-                                );
-                                let this_i64 = raw_bits as i64;
-                                return call_vtable_method(
-                                    entry.func_ptr,
-                                    this_i64,
-                                    args_ptr,
-                                    args_len,
-                                    entry.param_count,
-                                );
+                        // Refs #420: parent-chain walk (mirror of the path
+                        // above for raw pointer instances).
+                        let mut cur_cid = class_id;
+                        let mut depth = 0u32;
+                        while depth < 32 {
+                            if let Some(vtable) = reg.get(&cur_cid) {
+                                if let Some(entry) = vtable.methods.get(method_name) {
+                                    vtable_ic_insert(
+                                        class_id,
+                                        method_name_ptr as usize,
+                                        entry.func_ptr,
+                                        entry.param_count,
+                                    );
+                                    let this_i64 = raw_bits as i64;
+                                    return call_vtable_method(
+                                        entry.func_ptr,
+                                        this_i64,
+                                        args_ptr,
+                                        args_len,
+                                        entry.param_count,
+                                    );
+                                }
+                            }
+                            match get_parent_class_id(cur_cid) {
+                                Some(pid) if pid != 0 => {
+                                    cur_cid = pid;
+                                    depth += 1;
+                                }
+                                _ => break,
                             }
                         }
                     }

@@ -1415,15 +1415,36 @@ pub(crate) fn lower_call(ctx: &mut FnCtx<'_>, callee: &Expr, args: &[Expr]) -> R
                 Some(name) => !ctx.classes.contains_key(&name),
             };
         if needs_dynamic_dispatch {
-            // Find all (class, method_name → fn_name) where the
-            // method is defined directly on a class.
+            // Find all (class_id → fn_name) for `property` — including
+            // INHERITED methods. Per JS spec, `subInstance.method()` for a
+            // method defined on a parent dispatches to the parent's
+            // implementation. perry's previous walk only added classes that
+            // DIRECTLY declared `property`; subclasses that inherited the
+            // method weren't represented in the dispatch tower, so the
+            // icmp_eq vs class_id missed and the call fell through to the
+            // runtime's js_native_call_method fallback (which returns an
+            // empty object for unknown receiver class+method combos).
+            // Refs #420 — drizzle's `serial("id").primaryKey()` where
+            // primaryKey is on ColumnBuilder (grandparent) but the
+            // receiver is a PgSerialBuilder (grandchild).
+            //
+            // Algorithm: walk every class C in `class_ids`. For each, walk
+            // C's parent chain and find the FIRST class that has `property`
+            // in `ctx.methods`. Register (C's id → that ancestor's fn_name).
             let mut implementors: Vec<(u32, String)> = Vec::new();
-            for ((cls, mname), fname) in ctx.methods.iter() {
-                if mname != property {
-                    continue;
-                }
-                if let Some(cid) = ctx.class_ids.get(cls).copied() {
-                    implementors.push((cid, fname.clone()));
+            let mut seen_pairs: std::collections::HashSet<(u32, String)> =
+                std::collections::HashSet::new();
+            for (start_cls, &start_cid) in ctx.class_ids.iter() {
+                let mut cur: Option<String> = Some(start_cls.clone());
+                while let Some(c) = cur {
+                    let key = (c.clone(), property.clone());
+                    if let Some(fname) = ctx.methods.get(&key).cloned() {
+                        if seen_pairs.insert((start_cid, fname.clone())) {
+                            implementors.push((start_cid, fname));
+                        }
+                        break;
+                    }
+                    cur = ctx.classes.get(&c).and_then(|cc| cc.extends_name.clone());
                 }
             }
             if !implementors.is_empty() {
@@ -2803,7 +2824,58 @@ pub(crate) fn lower_new(ctx: &mut FnCtx<'_>, class_name: &str, args: &[Expr]) ->
         }
         // If no parent constructor was found (imported class with no
         // inlineable constructor body), call the cross-module constructor.
-        if let Some((ctor_name, param_count)) = ctx.imported_class_ctors.get(class_name).cloned() {
+        // Refs #420: walk past empty-bodied ancestors with param_count==0
+        // imports too — when `class PgSerial extends PgColumn extends Column`
+        // and Column is imported with the real ctor body, lower_new for
+        // PgSerial needs to dispatch to Column_constructor (forwarding the
+        // ctor args). Without this walk, `new PgSerial(table, config)`
+        // produced an empty object since none of the chain's bodies ran.
+        let lookup_class = class_name.to_string();
+        let mut effective_class_name = lookup_class.clone();
+        let mut effective_extends = class.extends_name.clone();
+        loop {
+            let has_real_ctor = ctx
+                .imported_class_ctors
+                .get(&effective_class_name)
+                .map(|(_, n)| *n > 0)
+                .unwrap_or(false);
+            if has_real_ctor {
+                break;
+            }
+            let Some(parent) = effective_extends.clone() else {
+                break;
+            };
+            let Some(parent_class) = ctx.classes.get(&parent).copied() else {
+                break;
+            };
+            effective_class_name = parent;
+            effective_extends = parent_class.extends_name.clone();
+        }
+        if let Some((ctor_name, param_count)) = ctx
+            .imported_class_ctors
+            .get(&effective_class_name)
+            .cloned()
+            .filter(|(_, _)| effective_class_name != lookup_class)
+        {
+            // Walked to an ancestor — call its ctor with this and forwarded args.
+            let undef_lit =
+                crate::nanbox::double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
+            while lowered_args.len() < param_count {
+                lowered_args.push(undef_lit.clone());
+            }
+            let mut ctor_args: Vec<(crate::types::LlvmType, &str)> =
+                Vec::with_capacity(1 + lowered_args.len());
+            ctor_args.push((DOUBLE, &obj_box));
+            let ctor_param_types: Vec<crate::types::LlvmType> = std::iter::once(DOUBLE)
+                .chain(lowered_args.iter().map(|_| DOUBLE))
+                .collect();
+            for la in &lowered_args {
+                ctor_args.push((DOUBLE, la.as_str()));
+            }
+            ctx.pending_declares
+                .push((ctor_name.clone(), crate::types::VOID, ctor_param_types));
+            ctx.block().call_void(&ctor_name, &ctor_args);
+        } else if let Some((ctor_name, param_count)) = ctx.imported_class_ctors.get(class_name).cloned() {
             // Pad missing optional args with TAG_UNDEFINED so the constructor
             // doesn't read garbage from stale registers.
             let undef_lit =

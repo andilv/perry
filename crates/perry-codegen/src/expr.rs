@@ -4212,7 +4212,55 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
 
             // Inline the parent constructor with the SAME this and a
             // fresh param scope for the parent's params.
-            if let Some(parent_ctor) = &parent_class.constructor {
+            //
+            // Walk the parent chain when the IMMEDIATE parent has no
+            // constructor of its own — JS spec: an empty class implicitly
+            // forwards args to its super, so `class Mid extends Base {}`
+            // followed by `class Leaf extends Mid {}` calling `super(...)`
+            // must reach Base's constructor body. Without this walk,
+            // perry's super() produced a no-op when Mid had no ctor, and
+            // Base's `this.config = {...}` never ran. Refs #420 (drizzle
+            // PgSerialBuilder → PgColumnBuilder → ColumnBuilder chain
+            // where only ColumnBuilder has a ctor body).
+            // Walk up the parent chain to find the first class with a
+            // local constructor body OR a cross-module ctor stub WITH
+            // declared params. JS spec requires `class Mid extends Base {}`
+            // followed by `class Leaf extends Mid` calling `super(...)` to
+            // reach Base's ctor body (Mid has no ctor → implicit forward).
+            // Refs #420 (drizzle's PgSerialBuilder → PgColumnBuilder →
+            // ColumnBuilder where only ColumnBuilder has a body).
+            //
+            // We must skip past imported ctors with param_count=0 too —
+            // those represent empty-bodied derived classes whose imported
+            // standalone ctor would otherwise eat the incoming args
+            // without forwarding. Walking past them and dispatching
+            // directly to the ancestor-with-real-params standalone ctor
+            // preserves the args end-to-end.
+            let mut effective_parent_name = parent_name.clone();
+            let mut effective_parent_class = parent_class;
+            loop {
+                let has_local_body = effective_parent_class.constructor.is_some();
+                let has_real_imported_ctor = ctx
+                    .imported_class_ctors
+                    .get(&effective_parent_name)
+                    .map(|(_, n)| *n > 0)
+                    .unwrap_or(false);
+                if has_local_body || has_real_imported_ctor {
+                    break;
+                }
+                let Some(grandparent_name) =
+                    effective_parent_class.extends_name.as_deref().map(|s| s.to_string())
+                else {
+                    break;
+                };
+                let Some(gp_class) = ctx.classes.get(&grandparent_name).copied() else {
+                    break;
+                };
+                effective_parent_name = grandparent_name;
+                effective_parent_class = gp_class;
+            }
+
+            if let Some(parent_ctor) = &effective_parent_class.constructor {
                 let saved_locals = ctx.locals.clone();
                 let saved_local_types = ctx.local_types.clone();
 
@@ -4227,14 +4275,14 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     ctx.local_types.insert(param.id, param.ty.clone());
                 }
 
-                ctx.class_stack.push(parent_name);
+                ctx.class_stack.push(effective_parent_name);
                 crate::stmt::lower_stmts(ctx, &parent_ctor.body)?;
                 ctx.class_stack.pop();
 
                 ctx.locals = saved_locals;
                 ctx.local_types = saved_local_types;
             } else if let Some((ctor_name, param_count)) =
-                ctx.imported_class_ctors.get(&parent_name).cloned()
+                ctx.imported_class_ctors.get(&effective_parent_name).cloned()
             {
                 // Issue #485: parent class is imported (stub with `constructor: None`)
                 // and has no inlineable body in this module. Call the cross-module

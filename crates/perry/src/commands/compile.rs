@@ -2659,11 +2659,13 @@ pub fn run_with_parse_cache(
                                         field_names: class
                                             .fields
                                             .iter()
+                                            .filter(|f| f.key_expr.is_none())
                                             .map(|f| f.name.clone())
                                             .collect(),
                                         field_types: class
                                             .fields
                                             .iter()
+                                            .filter(|f| f.key_expr.is_none())
                                             .map(|f| f.ty.clone())
                                             .collect(),
                                         source_class_id: Some(class.id),
@@ -2779,11 +2781,13 @@ pub fn run_with_parse_cache(
                                             field_names: class
                                                 .fields
                                                 .iter()
+                                                .filter(|f| f.key_expr.is_none())
                                                 .map(|f| f.name.clone())
                                                 .collect(),
                                             field_types: class
                                                 .fields
                                                 .iter()
+                                                .filter(|f| f.key_expr.is_none())
                                                 .map(|f| f.ty.clone())
                                                 .collect(),
                                             source_class_id: Some(class.id),
@@ -2804,21 +2808,31 @@ pub fn run_with_parse_cache(
 
                     let key = (resolved_path_str.clone(), exported_name.clone());
 
-                    // Resolve effective prefix (follow re-exports)
-                    let effective_prefix =
+                    // Resolve the ORIGIN path of `exported_name` by following
+                    // re-exports. `index.js`'s `export { pgTable } from "./table.js"`
+                    // means the immediate import resolves to index.js but the
+                    // actual `Let pgTable = (...) => ...` lives in table.js. The
+                    // `exported_var_names` set is keyed by the ORIGIN path, so
+                    // looking up `(index.js, "pgTable")` misses; we need to walk
+                    // the re-export chain to find table.js. Refs #420.
+                    let origin_path: String =
                         if let Some(exports) = all_module_exports.get(&resolved_path_str) {
-                            if let Some(origin_path) = exports.get(&exported_name) {
-                                if origin_path != &resolved_path_str {
-                                    compute_module_prefix(origin_path, &ctx.project_root)
-                                } else {
-                                    source_prefix.clone()
-                                }
+                            if let Some(p) = exports.get(&exported_name) {
+                                p.clone()
                             } else {
-                                source_prefix.clone()
+                                resolved_path_str.clone()
                             }
                         } else {
-                            source_prefix.clone()
+                            resolved_path_str.clone()
                         };
+                    let origin_key = (origin_path.clone(), exported_name.clone());
+
+                    // Resolve effective prefix (follow re-exports)
+                    let effective_prefix = if origin_path != resolved_path_str {
+                        compute_module_prefix(&origin_path, &ctx.project_root)
+                    } else {
+                        source_prefix.clone()
+                    };
 
                     import_function_prefixes
                         .insert(exported_name.clone(), effective_prefix.clone());
@@ -2828,8 +2842,16 @@ pub fn run_with_parse_cache(
                     }
 
                     // Imported variables (not functions) — ExternFuncRef-as-value
-                    // should call the getter, not wrap as closure.
-                    if exported_var_names.contains(&key) {
+                    // should call the getter, not wrap as closure. Look up by the
+                    // ORIGIN path (where the `Let X = ...` actually lives), not
+                    // the immediate import path. Without this, re-exports through
+                    // `index.js` barrel files (drizzle's `pg-core/index.js`,
+                    // hono's adapter index files, etc.) silently fall through to
+                    // the direct-call path which treats the zero-arg getter's
+                    // return value AS the call result — pgTable("users", cols)
+                    // returned the closure handle (typeof === "function") with no
+                    // pgTable body actually invoked.
+                    if exported_var_names.contains(&origin_key) {
                         imported_vars.insert(exported_name.clone());
                         if local_name != exported_name {
                             imported_vars.insert(local_name.clone());
@@ -2870,8 +2892,18 @@ pub fn run_with_parse_cache(
                             getter_names: class.getters.iter().map(|(n, _)| n.clone()).collect(),
                             setter_names: class.setters.iter().map(|(n, _)| n.clone()).collect(),
                             parent_name: class.extends_name.clone(),
-                            field_names: class.fields.iter().map(|f| f.name.clone()).collect(),
-                            field_types: class.fields.iter().map(|f| f.ty.clone()).collect(),
+                            field_names: class
+                                .fields
+                                .iter()
+                                .filter(|f| f.key_expr.is_none())
+                                .map(|f| f.name.clone())
+                                .collect(),
+                            field_types: class
+                                .fields
+                                .iter()
+                                .filter(|f| f.key_expr.is_none())
+                                .map(|f| f.ty.clone())
+                                .collect(),
                             source_class_id: Some(class.id),
                         });
                     }
@@ -2990,8 +3022,18 @@ pub fn run_with_parse_cache(
                             getter_names: class.getters.iter().map(|(n, _)| n.clone()).collect(),
                             setter_names: class.setters.iter().map(|(n, _)| n.clone()).collect(),
                             parent_name: class.extends_name.clone(),
-                            field_names: class.fields.iter().map(|f| f.name.clone()).collect(),
-                            field_types: class.fields.iter().map(|f| f.ty.clone()).collect(),
+                            field_names: class
+                                .fields
+                                .iter()
+                                .filter(|f| f.key_expr.is_none())
+                                .map(|f| f.name.clone())
+                                .collect(),
+                            field_types: class
+                                .fields
+                                .iter()
+                                .filter(|f| f.key_expr.is_none())
+                                .map(|f| f.ty.clone())
+                                .collect(),
                             source_class_id: Some(class.id),
                         });
                     }
@@ -3260,8 +3302,18 @@ pub fn run_with_parse_cache(
                             getter_names: class.getters.iter().map(|(n, _)| n.clone()).collect(),
                             setter_names: class.setters.iter().map(|(n, _)| n.clone()).collect(),
                             parent_name: class.extends_name.clone(),
-                            field_names: class.fields.iter().map(|f| f.name.clone()).collect(),
-                            field_types: class.fields.iter().map(|f| f.ty.clone()).collect(),
+                            field_names: class
+                                .fields
+                                .iter()
+                                .filter(|f| f.key_expr.is_none())
+                                .map(|f| f.name.clone())
+                                .collect(),
+                            field_types: class
+                                .fields
+                                .iter()
+                                .filter(|f| f.key_expr.is_none())
+                                .map(|f| f.ty.clone())
+                                .collect(),
                             source_class_id: Some(class.id),
                         });
                     }
@@ -3359,8 +3411,18 @@ pub fn run_with_parse_cache(
                             getter_names: class.getters.iter().map(|(n, _)| n.clone()).collect(),
                             setter_names: class.setters.iter().map(|(n, _)| n.clone()).collect(),
                             parent_name: class.extends_name.clone(),
-                            field_names: class.fields.iter().map(|f| f.name.clone()).collect(),
-                            field_types: class.fields.iter().map(|f| f.ty.clone()).collect(),
+                            field_names: class
+                                .fields
+                                .iter()
+                                .filter(|f| f.key_expr.is_none())
+                                .map(|f| f.name.clone())
+                                .collect(),
+                            field_types: class
+                                .fields
+                                .iter()
+                                .filter(|f| f.key_expr.is_none())
+                                .map(|f| f.ty.clone())
+                                .collect(),
                             source_class_id: Some(class.id),
                         });
                         visited_imports.insert(ref_name.clone());
