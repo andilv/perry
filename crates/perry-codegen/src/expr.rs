@@ -6304,8 +6304,7 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         "log" | "info" | "warn" | "error" | "debug"
                     )
                 {
-                    let mut acc_handle =
-                        ctx.block().call(I64, "js_array_alloc", &[(I32, "0")]);
+                    let mut acc_handle = ctx.block().call(I64, "js_array_alloc", &[(I32, "0")]);
                     for a in args {
                         match a {
                             CallArg::Expr(e) => {

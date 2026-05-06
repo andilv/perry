@@ -151,10 +151,7 @@ fn write_u32_le(writer: &mut File, value: u32) -> std::io::Result<()> {
 }
 
 fn write_u16_le(writer: &mut File, value: u16) -> std::io::Result<()> {
-    writer.write_all(&[
-        (value & 0xFF) as u8,
-        ((value >> 8) & 0xFF) as u8,
-    ])?;
+    writer.write_all(&[(value & 0xFF) as u8, ((value >> 8) & 0xFF) as u8])?;
     Ok(())
 }
 
@@ -184,7 +181,9 @@ fn write_wav_header(writer: &mut File, num_samples: u32) -> std::io::Result<()> 
 
 fn write_wav_samples(writer: &mut File, samples: &[f32]) -> std::io::Result<()> {
     for &sample in samples {
-        let int_sample = (sample * i16::MAX as f32).max(i16::MIN as f32).min(i16::MAX as f32) as i16;
+        let int_sample = (sample * i16::MAX as f32)
+            .max(i16::MIN as f32)
+            .min(i16::MAX as f32) as i16;
         writer.write_all(&int_sample.to_le_bytes())?;
     }
     Ok(())

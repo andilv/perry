@@ -971,11 +971,7 @@ fn scan_expr_for_max_func(expr: &Expr, max_id: &mut FuncId) {
 /// `Stmt::Try` and `Stmt::Labeled` are rejected by `body_is_unrollable`
 /// so they shouldn't appear here, but the walker handles them defensively
 /// in case the unrollability rules ever loosen.
-fn refresh_local_ids(
-    stmts: &mut [Stmt],
-    next_id: &mut LocalId,
-    next_func_id: &mut FuncId,
-) {
+fn refresh_local_ids(stmts: &mut [Stmt], next_id: &mut LocalId, next_func_id: &mut FuncId) {
     let mut remap: HashMap<LocalId, LocalId> = HashMap::new();
     for s in stmts.iter_mut() {
         refresh_in_stmt(s, &mut remap, next_id, next_func_id);

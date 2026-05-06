@@ -4,8 +4,8 @@ use objc2::runtime::{AnyClass, AnyObject};
 use std::cell::RefCell;
 use std::fs::File;
 use std::io::Write;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 
 // =============================================================================
 // Shared atomic state — written by audio thread, read by main thread
@@ -367,11 +367,7 @@ fn write_u16_le(writer: &mut File, value: u16) -> std::io::Result<()> {
     writer.write_all(&value.to_le_bytes())
 }
 
-fn write_wav_header(
-    writer: &mut File,
-    num_samples: u32,
-    sample_rate: u32,
-) -> std::io::Result<()> {
+fn write_wav_header(writer: &mut File, num_samples: u32, sample_rate: u32) -> std::io::Result<()> {
     let bits_per_sample: u16 = 16;
     let channels: u16 = 1;
     let byte_rate = sample_rate * u32::from(channels) * u32::from(bits_per_sample) / 8;

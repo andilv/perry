@@ -143,9 +143,7 @@ pub unsafe extern "C" fn js_ioredis_set(
                     conn.set::<_, _, ()>(&key, &value),
                 )
                 .await
-                .map_err(|_| {
-                    redis::RedisError::from((redis::ErrorKind::Io, "Operation timed out"))
-                })
+                .map_err(|_| redis::RedisError::from((redis::ErrorKind::Io, "Operation timed out")))
                 .and_then(|r| r);
 
                 match result {
@@ -206,10 +204,7 @@ pub unsafe extern "C" fn js_ioredis_get(
                     tokio::time::timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS), conn.get(&key))
                         .await
                         .map_err(|_| {
-                            redis::RedisError::from((
-                                redis::ErrorKind::Io,
-                                "Operation timed out",
-                            ))
+                            redis::RedisError::from((redis::ErrorKind::Io, "Operation timed out"))
                         })
                         .and_then(|r| r);
 
@@ -273,10 +268,7 @@ pub unsafe extern "C" fn js_ioredis_del(
                     tokio::time::timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS), conn.del(&key))
                         .await
                         .map_err(|_| {
-                            redis::RedisError::from((
-                                redis::ErrorKind::Io,
-                                "Operation timed out",
-                            ))
+                            redis::RedisError::from((redis::ErrorKind::Io, "Operation timed out"))
                         })
                         .and_then(|r| r);
 
@@ -334,9 +326,7 @@ pub unsafe extern "C" fn js_ioredis_exists(
                     conn.exists(&key),
                 )
                 .await
-                .map_err(|_| {
-                    redis::RedisError::from((redis::ErrorKind::Io, "Operation timed out"))
-                })
+                .map_err(|_| redis::RedisError::from((redis::ErrorKind::Io, "Operation timed out")))
                 .and_then(|r| r);
 
                 match result {
@@ -393,9 +383,7 @@ pub unsafe extern "C" fn js_ioredis_incr(
                     conn.incr(&key, 1),
                 )
                 .await
-                .map_err(|_| {
-                    redis::RedisError::from((redis::ErrorKind::Io, "Operation timed out"))
-                })
+                .map_err(|_| redis::RedisError::from((redis::ErrorKind::Io, "Operation timed out")))
                 .and_then(|r| r);
 
                 match result {
@@ -452,9 +440,7 @@ pub unsafe extern "C" fn js_ioredis_decr(
                     conn.decr(&key, 1),
                 )
                 .await
-                .map_err(|_| {
-                    redis::RedisError::from((redis::ErrorKind::Io, "Operation timed out"))
-                })
+                .map_err(|_| redis::RedisError::from((redis::ErrorKind::Io, "Operation timed out")))
                 .and_then(|r| r);
 
                 match result {
@@ -514,9 +500,7 @@ pub unsafe extern "C" fn js_ioredis_expire(
                     conn.expire(&key, secs),
                 )
                 .await
-                .map_err(|_| {
-                    redis::RedisError::from((redis::ErrorKind::Io, "Operation timed out"))
-                })
+                .map_err(|_| redis::RedisError::from((redis::ErrorKind::Io, "Operation timed out")))
                 .and_then(|r| r);
 
                 match result {
@@ -611,9 +595,7 @@ pub unsafe extern "C" fn js_ioredis_setex(
                     conn.set_ex::<_, _, ()>(&key, &value, secs),
                 )
                 .await
-                .map_err(|_| {
-                    redis::RedisError::from((redis::ErrorKind::Io, "Operation timed out"))
-                })
+                .map_err(|_| redis::RedisError::from((redis::ErrorKind::Io, "Operation timed out")))
                 .and_then(|r| r);
 
                 match result {
@@ -669,9 +651,7 @@ pub unsafe extern "C" fn js_ioredis_ping(handle: Handle) -> *mut perry_runtime::
                     redis::cmd("PING").query_async(&mut conn),
                 )
                 .await
-                .map_err(|_| {
-                    redis::RedisError::from((redis::ErrorKind::Io, "Operation timed out"))
-                })
+                .map_err(|_| redis::RedisError::from((redis::ErrorKind::Io, "Operation timed out")))
                 .and_then(|r| r);
 
                 match result {
@@ -738,9 +718,7 @@ pub unsafe extern "C" fn js_ioredis_hget(
                     conn.hget(&key, &field),
                 )
                 .await
-                .map_err(|_| {
-                    redis::RedisError::from((redis::ErrorKind::Io, "Operation timed out"))
-                })
+                .map_err(|_| redis::RedisError::from((redis::ErrorKind::Io, "Operation timed out")))
                 .and_then(|r| r);
 
                 match result {
@@ -820,9 +798,7 @@ pub unsafe extern "C" fn js_ioredis_hset(
                     conn.hset(&key, &field, &value),
                 )
                 .await
-                .map_err(|_| {
-                    redis::RedisError::from((redis::ErrorKind::Io, "Operation timed out"))
-                })
+                .map_err(|_| redis::RedisError::from((redis::ErrorKind::Io, "Operation timed out")))
                 .and_then(|r| r);
 
                 match result {
@@ -881,9 +857,7 @@ pub unsafe extern "C" fn js_ioredis_hgetall(
                     conn.hgetall(&key),
                 )
                 .await
-                .map_err(|_| {
-                    redis::RedisError::from((redis::ErrorKind::Io, "Operation timed out"))
-                })
+                .map_err(|_| redis::RedisError::from((redis::ErrorKind::Io, "Operation timed out")))
                 .and_then(|r| r);
 
                 match result {
@@ -964,9 +938,7 @@ pub unsafe extern "C" fn js_ioredis_hdel(
                     conn.hdel(&key, &field),
                 )
                 .await
-                .map_err(|_| {
-                    redis::RedisError::from((redis::ErrorKind::Io, "Operation timed out"))
-                })
+                .map_err(|_| redis::RedisError::from((redis::ErrorKind::Io, "Operation timed out")))
                 .and_then(|r| r);
 
                 match result {
@@ -1021,9 +993,7 @@ pub unsafe extern "C" fn js_ioredis_hlen(
                     conn.hlen(&key),
                 )
                 .await
-                .map_err(|_| {
-                    redis::RedisError::from((redis::ErrorKind::Io, "Operation timed out"))
-                })
+                .map_err(|_| redis::RedisError::from((redis::ErrorKind::Io, "Operation timed out")))
                 .and_then(|r| r);
 
                 match result {
