@@ -1895,6 +1895,32 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 );
                 return Ok(nanbox_string_inline(blk, &result));
             }
+            // Issue #514: when the receiver's static type is genuinely
+            // unknown (`Type::Any` / `Type::Unknown`) and the index is
+            // numeric, route through the runtime tag-aware dispatcher.
+            // The pre-fix array fast path interpreted `*StringHeader`
+            // pointers as `*ArrayHeader`, returning the byte_len as a
+            // subnormal f64 — the load-bearing bug behind hono's
+            // mergePath template-literal logic that mixes `s?.[0]` /
+            // `s?.at(-1)` / `s?.slice(1)` on `(s: any)` parameters.
+            // The gate is narrow (only Type::Any/Unknown) so existing
+            // TypedArray, Object-with-numeric-keys, and class-instance
+            // fast paths keep their inline-offset reads.
+            let recv_ty = crate::type_analysis::static_type_of(ctx, object);
+            let recv_unknown = matches!(
+                recv_ty,
+                None | Some(perry_types::Type::Any) | Some(perry_types::Type::Unknown)
+            );
+            if recv_unknown && is_numeric_expr(ctx, index) {
+                let obj_box = lower_expr(ctx, object)?;
+                let idx_d = lower_expr(ctx, index)?;
+                let blk = ctx.block();
+                return Ok(blk.call(
+                    DOUBLE,
+                    "js_dyn_index_get",
+                    &[(DOUBLE, &obj_box), (DOUBLE, &idx_d)],
+                ));
+            }
             // Three cases:
             //   1. Receiver is a known array → inline f64 element load
             //   2. Index is a string (literal or string-typed local) →

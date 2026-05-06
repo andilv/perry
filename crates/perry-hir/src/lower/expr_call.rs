@@ -2753,8 +2753,26 @@ pub(super) fn lower_call(ctx: &mut LoweringContext, call: &ast::CallExpr) -> Res
                                                     ) && !matches!(ty, Type::Array(_))
                                                 })
                                                 .unwrap_or(false);
+                                        // Issue #514: gate `.at()` ArrayAt
+                                        // emission on a statically-known
+                                        // array type. `at` is shared between
+                                        // String.prototype and Array.prototype,
+                                        // so for `(s: any).at(-1)` codegen
+                                        // can't tell which one the user means.
+                                        // Pre-fix the HIR optimistically
+                                        // lowered to `Expr::ArrayAt` →
+                                        // `js_array_at`, which interprets
+                                        // the NaN-boxed *StringHeader as an
+                                        // *ArrayHeader and returns garbage.
+                                        // Now: only emit ArrayAt for proven
+                                        // arrays / typed-arrays; otherwise
+                                        // fall through to the generic method
+                                        // dispatch which lands in the runtime
+                                        // tower's tag-aware string arm.
+                                        let recv_is_array = is_typed_array
+                                            || matches!(recv_ty, Some(Type::Array(_)));
                                         if !is_class_instance {
-                                            if method_name == "at" {
+                                            if method_name == "at" && recv_is_array {
                                                 if !args.is_empty() {
                                                     return Ok(Expr::ArrayAt {
                                                         array: Box::new(Expr::LocalGet(array_id)),
@@ -2763,7 +2781,7 @@ pub(super) fn lower_call(ctx: &mut LoweringContext, call: &ast::CallExpr) -> Res
                                                         ),
                                                     });
                                                 }
-                                            } else if !args.is_empty() {
+                                            } else if method_name != "at" && !args.is_empty() {
                                                 let cb = args.into_iter().next().unwrap();
                                                 let cb = ctx
                                                     .maybe_wrap_builtin_callback(cb, &call.args[0]);
@@ -4008,7 +4026,7 @@ pub(super) fn lower_call(ctx: &mut LoweringContext, call: &ast::CallExpr) -> Res
                                     items,
                                 });
                             }
-                            "with" if args.len() >= 2 => {
+                            "with" if args.len() >= 2 && !recv_is_class => {
                                 let array_expr = lower_expr(ctx, &member.obj)?;
                                 let mut args_iter = args.into_iter();
                                 let index = args_iter.next().unwrap();

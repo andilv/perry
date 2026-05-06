@@ -1008,6 +1008,73 @@ pub extern "C" fn js_nanbox_is_string(value: f64) -> i32 {
     }
 }
 
+/// Tag-aware dynamic index dispatch for `obj[key]` where `obj` has unknown
+/// static type. Issue #514. Strings → js_string_char_at; everything else
+/// uses the same `raw_ptr + 8 + idx*8` direct-read offset hack the existing
+/// IndexGet fallback uses (which happens to be load-bearing for
+/// Object-with-numeric-keys + TypedArrays). LAZY_ARRAY / FORWARDED arrays
+/// route through `js_array_get_f64` to chase the materialized chain.
+#[no_mangle]
+pub extern "C" fn js_dyn_index_get(value: f64, index: f64) -> f64 {
+    let bits = value.to_bits();
+    let jsval = JSValue::from_bits(bits);
+    if jsval.is_string() || jsval.is_short_string() {
+        let s_ptr = js_get_string_pointer_unified(value) as *const crate::StringHeader;
+        if s_ptr.is_null() {
+            return f64::from_bits(TAG_UNDEFINED);
+        }
+        let idx_i32 = if index.is_nan() || index.is_infinite() {
+            0
+        } else {
+            index as i32
+        };
+        let result = crate::string::js_string_char_at(s_ptr, idx_i32);
+        if result.is_null() {
+            return f64::from_bits(TAG_UNDEFINED);
+        }
+        return f64::from_bits(JSValue::string_ptr(result).bits());
+    }
+    let raw_ptr = if jsval.is_pointer() {
+        (bits & POINTER_MASK) as usize
+    } else if !value.is_nan()
+        && bits != 0
+        && bits < 0x0001_0000_0000_0000
+        && (bits & 0x3) == 0
+        && bits >= 0x10000
+    {
+        bits as usize
+    } else {
+        return f64::from_bits(TAG_UNDEFINED);
+    };
+    let idx_i32 = if index.is_nan() || index.is_infinite() {
+        return f64::from_bits(TAG_UNDEFINED);
+    } else {
+        index as i32
+    };
+    if idx_i32 < 0 || raw_ptr < 0x10000 {
+        return f64::from_bits(TAG_UNDEFINED);
+    }
+    if raw_ptr >= crate::gc::GC_HEADER_SIZE {
+        let gc_hdr = unsafe {
+            (raw_ptr as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader
+        };
+        let obj_type = unsafe { (*gc_hdr).obj_type };
+        let gc_flags = unsafe { (*gc_hdr).gc_flags };
+        if obj_type == crate::gc::GC_TYPE_LAZY_ARRAY
+            || (gc_flags & crate::gc::GC_FLAG_FORWARDED) != 0
+        {
+            let arr = raw_ptr as *const crate::array::ArrayHeader;
+            return crate::array::js_array_get_f64(arr, idx_i32 as u32);
+        }
+    }
+    let elem_addr = raw_ptr.wrapping_add(8 + (idx_i32 as usize) * 8);
+    let v = unsafe { *(elem_addr as *const f64) };
+    if v.to_bits() == crate::value::TAG_HOLE {
+        return f64::from_bits(TAG_UNDEFINED);
+    }
+    v
+}
+
 /// Check if a value should trigger a destructuring default.
 /// Returns 1 if the value is TAG_UNDEFINED, or a bare IEEE NaN (e.g., from
 /// out-of-bounds array read), 0 otherwise. All other NaN-boxed values
