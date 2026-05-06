@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Perry is a native TypeScript compiler written in Rust that compiles TypeScript source code directly to native executables. It uses SWC for TypeScript parsing and LLVM for code generation.
 
-**Current Version:** 0.5.582
+**Current Version:** 0.5.583
 
 
 ## TypeScript Parity Status
@@ -152,6 +152,8 @@ First-resolved directory cached in `compile_package_dirs`; subsequent imports re
 ## Recent Changes
 
 One-liners only — full detail in CHANGELOG.md.
+
+- **v0.5.583** — Post-v0.5.582 release fix-forward 2: populated `test-parity/known_failures.json` with the 8 currently-failing tests (3 pre-existing parity gaps + 5 net tests that pass locally with the echo fixture server but fail on Linux CI without it). Each entry has a brief reason + tracking note. Without this list the `Tests` workflow's parity job rejected the v0.5.582 tag at the "Check for new failures" step, blocking the release-packages publish gate. v0.5.581 + v0.5.582's tags remain published but their assets / npm publish are blocked behind this gate; v0.5.583 unblocks the gate so the release pipeline can complete cleanly. No code changes — pure CI-config fix.
 
 - **v0.5.582** — Post-v0.5.581 release fix-forward: cargo fmt drift (52 files) reformatted in lockstep, and Cargo.lock synced to current workspace version. Lint job in `Tests` workflow rejected v0.5.581's tag with formatting check; this bump re-runs the gating workflows on a clean tree. Compile-smoke job's fastify integration test (`./scripts/run_fastify_tests.sh`) reveals a separate fastify reactor panic ("there is no reactor running") on hyper's accept loop — same LTO-strips-tokio-context shape that perry-ext-net hit in v0.5.578-580, but the `Handle::try_current` + `std::hint::black_box` workaround that worked for perry-ext-net DOESN'T work for fastify (hyper's larger surface gives LTO more to dead-strip). Tracked as a v0.6.0 followup; programs that import fastify will hit this panic at server-start time. Recommended workaround for fastify users today: use perry-stdlib's bundled fastify by setting `PERRY_DISABLE_WELL_KNOWN=1` env var on `perry compile`. Other tests in compile-smoke unaffected.
 
