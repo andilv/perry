@@ -705,6 +705,44 @@ pub(crate) fn lower_call(ctx: &mut FnCtx<'_>, callee: &Expr, args: &[Expr]) -> R
             }
         };
         let fname = format!("perry_fn_{}__{}", source_prefix, name);
+        // Issue #493 followup: when the imported binding is a VARIABLE
+        // holding a closure value (e.g. `var mergePath = (b, s, ...r) => …`
+        // exported from another module), `perry_fn_<src>__<name>` is the
+        // ZERO-arg GETTER that returns the closure pointer (set up at
+        // crates/perry/src/commands/compile.rs's `imported_vars` registration
+        // and emitted by the source module's value-getter loop). Calling
+        // the getter with N args puts garbage in the registers and discards
+        // the actual call — `mergePath('/', '/foo')` returned the closure
+        // itself instead of the merged path. The fix is to call the getter
+        // first, treating its return as a closure value, then dispatch
+        // through `js_closure_callN`. The runtime's closure-rest registry
+        // (issue #493) bundles trailing args correctly when the closure
+        // has `...rest`. Before this branch, ExternFuncRef-as-call for
+        // imported-VAR bindings silently broke any code path that imports
+        // an arrow-bound exported value (hono's `mergePath` from utils/url.js,
+        // any `export const foo = () => …` cross-module use).
+        if ctx.imported_vars.contains(name) {
+            ctx.pending_declares.push((fname.clone(), DOUBLE, vec![]));
+            let closure_box = ctx.block().call(DOUBLE, &fname, &[]);
+            let mut lowered_args: Vec<String> = Vec::with_capacity(args.len());
+            for a in args {
+                lowered_args.push(lower_expr(ctx, a)?);
+            }
+            if lowered_args.len() > 16 {
+                bail!(
+                    "perry-codegen Phase D.1: closure call with {} args (max 16)",
+                    lowered_args.len()
+                );
+            }
+            let blk = ctx.block();
+            let closure_handle = unbox_to_i64(blk, &closure_box);
+            let runtime_fn = format!("js_closure_call{}", lowered_args.len());
+            let mut call_args: Vec<(crate::types::LlvmType, &str)> = vec![(I64, &closure_handle)];
+            for v in &lowered_args {
+                call_args.push((DOUBLE, v.as_str()));
+            }
+            return Ok(blk.call(DOUBLE, &runtime_fn, &call_args));
+        }
         // Record the cross-module call so the caller can add a `declare`
         // line for it after the &mut LlFunction borrow is released. The
         // module dedupes by name, so duplicates are harmless. Without

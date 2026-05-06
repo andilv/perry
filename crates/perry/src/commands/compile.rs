@@ -1860,15 +1860,23 @@ pub fn run_with_parse_cache(
         }
     }
 
-    // Populate exported_var_names: names that are in exported_objects but NOT
-    // in exported_func_param_counts (closures assigned to const are in both).
+    // Populate exported_var_names: closures-assigned-to-const are in BOTH
+    // `exported_objects` and `exported_func_param_counts`, but their
+    // `perry_fn_<src>__<name>` symbol is a ZERO-arg getter (returns the
+    // global closure pointer), not the function body — so at call sites
+    // we still need to fetch the value via the getter and then closure-call.
+    // The `is_function_alias` exclusion keeps `function foo(){}` decls out
+    // (their perry_fn_<…> symbol IS the function body).
     for (path, hir_module) in &ctx.native_modules {
         let path_str = path.to_string_lossy().to_string();
+        let is_function_decl: std::collections::HashSet<&String> =
+            hir_module.functions.iter().filter(|f| f.is_exported).map(|f| &f.name).collect();
         for obj_name in &hir_module.exported_objects {
-            let key = (path_str.clone(), obj_name.clone());
-            if !exported_func_param_counts.contains_key(&key) {
-                exported_var_names.insert(key);
+            if is_function_decl.contains(obj_name) {
+                continue;
             }
+            let key = (path_str.clone(), obj_name.clone());
+            exported_var_names.insert(key);
         }
     }
 
