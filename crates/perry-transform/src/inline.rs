@@ -755,6 +755,7 @@ pub fn gather_cross_module_anon_classes(module: &Module) -> HashMap<String, Clas
 
 pub fn gather_cross_module_methods(module: &Module) -> HashMap<(String, String), MethodCandidate> {
     let mut out: HashMap<(String, String), MethodCandidate> = HashMap::new();
+    let nonexported = collect_nonexported_class_names(module);
     for class in &module.classes {
         if class.native_extends.is_some() {
             continue;
@@ -764,6 +765,9 @@ pub fn gather_cross_module_methods(module: &Module) -> HashMap<(String, String),
                 continue;
             }
             if !is_cross_module_safe(&method.body) {
+                continue;
+            }
+            if body_references_class_in_set(&method.body, &nonexported) {
                 continue;
             }
             out.insert(
@@ -798,6 +802,7 @@ pub fn gather_cross_module_methods_with_extern_imports(
     module: &Module,
 ) -> HashMap<(String, String), MethodCandidate> {
     let mut out: HashMap<(String, String), MethodCandidate> = HashMap::new();
+    let nonexported = collect_nonexported_class_names(module);
     // Pre-build a name → resolved_path map from this module's imports so we
     // can resolve each ExternFuncRef in a method body to its source-of-truth.
     // The destination module needs that resolved_path to add the matching
@@ -823,6 +828,20 @@ pub fn gather_cross_module_methods_with_extern_imports(
             }
             let mut extern_names: Vec<String> = Vec::new();
             if !is_cross_module_safe_with_externs(&method.body, &mut extern_names) {
+                continue;
+            }
+            // Refs #486: a method body that constructs a non-exported local
+            // class (`new InnerPrivate()`) can't be safely inlined into another
+            // module — the destination module won't have `InnerPrivate` in its
+            // class registry, so `lower_new("InnerPrivate")` falls into the
+            // placeholder path that allocates an empty object with class_id=0.
+            // Subsequent `inst.method()` dispatch then can't find a vtable
+            // entry and falls through to NULL_OBJECT_BYTES. Keep the call as
+            // a real cross-module method call (`bl perry_method_<src>__C__m`)
+            // so the source module's codegen — which DOES have the class
+            // metadata — emits the correct inline-alloc with the right
+            // class_id.
+            if body_references_class_in_set(&method.body, &nonexported) {
                 continue;
             }
             extern_names.sort();
@@ -948,6 +967,120 @@ fn is_cross_module_safe_with_externs(body: &[Stmt], extern_names: &mut Vec<Strin
         }
     }
     body.iter().all(|s| check_stmt(s, extern_names))
+}
+
+/// Collect the names of every class declared in `module` that is NOT exported.
+/// These are the classes that can't safely cross a module boundary via the
+/// inline-method-body copy path: callers in other modules don't see them in
+/// their `imported_classes` table, so any `Expr::New { class_name }` /
+/// `Expr::ClassRef` / `Expr::StaticFieldGet` / etc. that names one of these
+/// classes will lose its class metadata at codegen time. Refs #486.
+///
+/// The `__AnonShape_*` content-addressed shapes are deliberately INCLUDED in
+/// the set despite never being marked `is_exported` — but the inliner already
+/// propagates them via `extra_anon_classes` so the destination module
+/// synthesizes the same definition. We exclude them here so methods that
+/// `new __AnonShape_<hash>()` keep their inlinability.
+fn collect_nonexported_class_names(module: &Module) -> HashSet<String> {
+    let mut set = HashSet::new();
+    for c in &module.classes {
+        if c.is_exported {
+            continue;
+        }
+        if c.name.starts_with("__AnonShape_") {
+            continue;
+        }
+        set.insert(c.name.clone());
+    }
+    set
+}
+
+/// Returns true iff `stmts` references any class whose name is in `set`.
+/// Walks every Expr variant that carries a `class_name` string. Used by
+/// the cross-module method gathering passes to reject candidates whose
+/// body would dangle (or worse: silently fall to a class_id=0 placeholder)
+/// after being copied into a destination module.
+fn body_references_class_in_set(stmts: &[Stmt], set: &HashSet<String>) -> bool {
+    fn check_expr(expr: &Expr, set: &HashSet<String>) -> bool {
+        match expr {
+            Expr::New { class_name, .. }
+            | Expr::ClassRef(class_name)
+            | Expr::StaticFieldGet { class_name, .. }
+            | Expr::StaticFieldSet { class_name, .. }
+            | Expr::ClassStaticSymbolSet { class_name, .. }
+            | Expr::StaticMethodCall { class_name, .. } => {
+                if set.contains(class_name) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        let mut hit = false;
+        walk_expr_children(expr, &mut |child| {
+            if check_expr(child, set) {
+                hit = true;
+            }
+        });
+        hit
+    }
+    fn check_stmt(s: &Stmt, set: &HashSet<String>) -> bool {
+        match s {
+            Stmt::Let { init, .. } => init.as_ref().is_some_and(|e| check_expr(e, set)),
+            Stmt::Expr(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => check_expr(e, set),
+            Stmt::Return(None) | Stmt::Break | Stmt::Continue => false,
+            Stmt::LabeledBreak(_) | Stmt::LabeledContinue(_) => false,
+            Stmt::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                check_expr(condition, set)
+                    || then_branch.iter().any(|s| check_stmt(s, set))
+                    || else_branch
+                        .as_ref()
+                        .is_some_and(|eb| eb.iter().any(|s| check_stmt(s, set)))
+            }
+            Stmt::While { condition, body } | Stmt::DoWhile { body, condition } => {
+                check_expr(condition, set) || body.iter().any(|s| check_stmt(s, set))
+            }
+            Stmt::For {
+                init,
+                condition,
+                update,
+                body,
+            } => {
+                init.as_ref().is_some_and(|s| check_stmt(s, set))
+                    || condition.as_ref().is_some_and(|e| check_expr(e, set))
+                    || update.as_ref().is_some_and(|e| check_expr(e, set))
+                    || body.iter().any(|s| check_stmt(s, set))
+            }
+            Stmt::Switch {
+                discriminant,
+                cases,
+            } => {
+                check_expr(discriminant, set)
+                    || cases.iter().any(|c| {
+                        c.test.as_ref().is_some_and(|e| check_expr(e, set))
+                            || c.body.iter().any(|s| check_stmt(s, set))
+                    })
+            }
+            Stmt::Try {
+                body,
+                catch,
+                finally,
+            } => {
+                body.iter().any(|s| check_stmt(s, set))
+                    || catch
+                        .as_ref()
+                        .is_some_and(|c| c.body.iter().any(|s| check_stmt(s, set)))
+                    || finally
+                        .as_ref()
+                        .is_some_and(|f| f.iter().any(|s| check_stmt(s, set)))
+            }
+            Stmt::Labeled { body, .. } => check_stmt(body.as_ref(), set),
+        }
+    }
+    stmts.iter().any(|s| check_stmt(s, set))
 }
 
 /// Check if a body contains Expr::SuperCall or Expr::SuperMethodCall (recursively).
