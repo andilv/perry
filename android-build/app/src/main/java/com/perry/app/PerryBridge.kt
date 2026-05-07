@@ -187,6 +187,29 @@ object PerryBridge {
         }
     }
 
+    // --- Issue #553: scroll-end callback with backpressure ---
+    private val scrollEndArmed = mutableMapOf<View, Boolean>()
+
+    @JvmStatic
+    fun setOnScrollEndCallback(view: View, callbackKey: Long, thresholdPx: Float) {
+        scrollEndArmed[view] = true
+        view.setOnScrollChangeListener(View.OnScrollChangeListener { v, _, scrollY, _, _ ->
+            val contentBottom = (v as? ScrollView)?.getChildAt(0)?.height ?: v.height
+            val visibleBottom = scrollY + v.height
+            val inZone = visibleBottom >= contentBottom - thresholdPx
+            val armed = scrollEndArmed[v] ?: true
+            when {
+                inZone && armed -> {
+                    scrollEndArmed[v] = false
+                    nativeInvokeCallback0(callbackKey)
+                }
+                !inZone && !armed -> {
+                    scrollEndArmed[v] = true
+                }
+            }
+        })
+    }
+
     // --- Button styling ---
 
     @JvmStatic

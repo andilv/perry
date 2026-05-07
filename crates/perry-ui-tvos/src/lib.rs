@@ -2340,3 +2340,38 @@ pub extern "C" fn perry_media_set_now_playing(
 pub extern "C" fn perry_media_destroy(handle: f64) {
     media_playback::destroy(handle);
 }
+
+// =============================================================================
+// Issue #553 — BottomNavigation, pull-to-refresh on LazyVStack, onScrollEnd,
+// ImageGallery. Stub block — these widgets aren't natively implemented on
+// this platform yet; the symbols exist so cross-platform code compiles
+// without conditional branching. Real macOS + iOS implementations live in
+// perry-ui-macos and perry-ui-ios. Filling in the platform-specific
+// equivalents (BottomNavigationView on Android, GtkBox+ToggleButton on
+// GTK4, custom XAML-style strip on Windows, UIPageViewController flavors
+// for tvOS/watchOS/visionOS) is tracked in the same issue.
+
+#[no_mangle]
+pub extern "C" fn perry_ui_bottom_nav_create(_on_select: f64) -> i64 { 0 }
+#[no_mangle]
+pub extern "C" fn perry_ui_bottom_nav_add_item(_handle: i64, _icon_ptr: i64, _label_ptr: i64) {}
+#[no_mangle]
+pub extern "C" fn perry_ui_bottom_nav_set_badge(_handle: i64, _index: i64, _badge_ptr: i64) {}
+#[no_mangle]
+pub extern "C" fn perry_ui_bottom_nav_set_selected(_handle: i64, _index: i64) {}
+
+#[no_mangle]
+pub extern "C" fn perry_ui_lazyvstack_set_refresh_control(_handle: i64, _callback: f64) {}
+#[no_mangle]
+pub extern "C" fn perry_ui_lazyvstack_end_refreshing(_handle: i64) {}
+#[no_mangle]
+pub extern "C" fn perry_ui_lazyvstack_set_scroll_end_callback(_handle: i64, _callback: f64, _threshold_items: i64) {}
+#[no_mangle]
+pub extern "C" fn perry_ui_scrollview_set_scroll_end_callback(_handle: i64, _callback: f64, _threshold_px: f64) {}
+
+#[no_mangle]
+pub extern "C" fn perry_ui_image_gallery_create(_on_index_change: f64) -> i64 { 0 }
+#[no_mangle]
+pub extern "C" fn perry_ui_image_gallery_add_image(_handle: i64, _url_ptr: i64, _alt_ptr: i64) {}
+#[no_mangle]
+pub extern "C" fn perry_ui_image_gallery_set_index(_handle: i64, _index: i64) {}

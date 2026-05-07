@@ -739,6 +739,93 @@ export function scrollViewSetRefreshControl(scrollView: Widget, onPull: () => vo
 export function scrollviewEndRefreshing(scrollView: Widget): void;
 export function scrollViewEndRefreshing(scrollView: Widget): void;
 
+/**
+ * Issue #553 — infinite-scroll callback.
+ *
+ * Fires `onScrollEnd` once when the visible region's bottom edge gets
+ * within `thresholdPx` of the content's bottom (default 200). Re-arms
+ * after the user scrolls back up past the threshold so the callback
+ * can fire repeatedly across pagination loads.
+ *
+ * Real on macOS (NSScrollView clip-view bounds observer) + iOS
+ * (UIScrollViewDelegate.scrollViewDidScroll). No-op on platforms where
+ * `setRefreshControl` is also no-op.
+ */
+export function scrollviewSetScrollEndCallback(scrollView: Widget, onScrollEnd: () => void, thresholdPx: number): void;
+export function scrollViewSetScrollEndCallback(scrollView: Widget, onScrollEnd: () => void, thresholdPx: number): void;
+
+/**
+ * Issue #553 — pull-to-refresh on LazyVStack (parallel to ScrollView).
+ *
+ * Real on iOS (UIRefreshControl on the inner UITableView). No-op on
+ * macOS — AppKit has no native pull-to-refresh idiom; desktop apps
+ * should add an explicit "Refresh" button. Stubs on other platforms.
+ */
+export function lazyvstackSetRefreshControl(view: Widget, onPull: () => void): void;
+export function lazyvstackEndRefreshing(view: Widget): void;
+
+/**
+ * Issue #553 — infinite-scroll callback on LazyVStack.
+ *
+ * Same backpressure contract as `scrollviewSetScrollEndCallback`, but
+ * `thresholdItems` measures rows from the bottom rather than pixels —
+ * works with variable view heights as long as the LazyVStack uses a
+ * uniform row height (which is the only mode currently supported).
+ */
+export function lazyvstackSetScrollEndCallback(view: Widget, onScrollEnd: () => void, thresholdItems: number): void;
+
+// ---------------------------------------------------------------------------
+// Issue #553 — BottomNavigation (5-tab bottom bar with icon + label + badge)
+// ---------------------------------------------------------------------------
+
+/**
+ * Create an empty bottom-navigation bar. Add tabs with `bottomNavAddItem`.
+ * The `onSelect(index)` callback fires whenever the user taps a tab —
+ * after the bar's internal selectedIndex is updated. Use
+ * `bottomNavSetSelected(bar, i)` for programmatic selection (does NOT
+ * fire `onSelect`).
+ *
+ * Real on macOS (custom NSStackView + NSButton strip with SF Symbol
+ * icons) + iOS (UITabBar). Stubs on Android / GTK4 / Windows / tvOS /
+ * watchOS / visionOS — those platforms reach the bar through the
+ * BottomNavigationView / GtkBox / Pivot equivalents in a follow-up.
+ */
+export function BottomNavigation(onSelect: (index: number) => void): Widget;
+
+/** Add a tab item — `icon` is an SF Symbol name on Apple platforms. */
+export function bottomNavAddItem(bar: Widget, icon: string, label: string): void;
+
+/** Set or clear the badge string on a tab. Empty string clears the badge. */
+export function bottomNavSetBadge(bar: Widget, index: number, badge: string): void;
+
+/** Programmatically select a tab. Does NOT fire `onSelect`. */
+export function bottomNavSetSelected(bar: Widget, index: number): void;
+
+// ---------------------------------------------------------------------------
+// Issue #553 — ImageGallery (swipeable carousel)
+// ---------------------------------------------------------------------------
+
+/**
+ * Create an empty image gallery. Add images with `imageGalleryAddImage`.
+ * The `onIndexChange(index)` callback fires when the user pages to a
+ * new image (or `imageGallerySetIndex` is called programmatically and
+ * the index changes).
+ *
+ * Image source is a local file path or http(s) URL; remote images are
+ * fetched on a background queue and applied on the main thread. Local
+ * paths load synchronously.
+ *
+ * Real on macOS (horizontal-paging NSScrollView) + iOS (paging
+ * UIScrollView). Stubs on other platforms.
+ */
+export function ImageGallery(onIndexChange: (index: number) => void): Widget;
+
+/** Add an image to the gallery. `alt` is used as accessibilityLabel. */
+export function imageGalleryAddImage(gallery: Widget, url: string, alt: string): void;
+
+/** Programmatically jump to a given image index (animated). */
+export function imageGallerySetIndex(gallery: Widget, index: number): void;
+
 // ---------------------------------------------------------------------------
 // Stack layout
 // ---------------------------------------------------------------------------

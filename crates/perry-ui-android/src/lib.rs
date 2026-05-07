@@ -2329,3 +2329,81 @@ pub extern "C" fn perry_media_set_now_playing(
 pub extern "C" fn perry_media_destroy(handle: f64) {
     media_playback::destroy(handle);
 }
+
+// =============================================================================
+// Issue #553 — Real Android implementations.
+//
+// BottomNavigation: horizontal LinearLayout of (ImageView + TextView) tabs
+// with optional badge TextView, plain android.widget.* (no Material/AndroidX
+// dependency, matching the existing tabbar.rs convention).
+//
+// ImageGallery: HorizontalScrollView containing a LinearLayout of equal-page
+// ImageViews. `set_index` calls smoothScrollTo for animated paging; user
+// swipe scrolls freely (true page-snapping requires ViewPager2 / AndroidX,
+// which this crate intentionally avoids).
+//
+// onScrollEnd: View.OnScrollChangeListener via PerryBridge.setOnScrollEndCallback
+// with backpressure (re-arms only when the user scrolls back up past the
+// threshold).
+//
+// Pull-to-refresh on LazyVStack: stays no-op — SwipeRefreshLayout requires
+// AndroidX, same constraint that limits the existing scrollview impl.
+// =============================================================================
+
+#[no_mangle]
+pub extern "C" fn perry_ui_bottom_nav_create(on_select: f64) -> i64 {
+    catch_panic("perry_ui_bottom_nav_create", || {
+        widgets::bottom_nav::create(on_select)
+    })
+}
+#[no_mangle]
+pub extern "C" fn perry_ui_bottom_nav_add_item(handle: i64, icon_ptr: i64, label_ptr: i64) {
+    catch_panic_void("perry_ui_bottom_nav_add_item", || {
+        widgets::bottom_nav::add_item(handle, icon_ptr as *const u8, label_ptr as *const u8)
+    })
+}
+#[no_mangle]
+pub extern "C" fn perry_ui_bottom_nav_set_badge(handle: i64, index: i64, badge_ptr: i64) {
+    catch_panic_void("perry_ui_bottom_nav_set_badge", || {
+        widgets::bottom_nav::set_badge(handle, index, badge_ptr as *const u8)
+    })
+}
+#[no_mangle]
+pub extern "C" fn perry_ui_bottom_nav_set_selected(handle: i64, index: i64) {
+    catch_panic_void("perry_ui_bottom_nav_set_selected", || {
+        widgets::bottom_nav::set_selected(handle, index)
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn perry_ui_lazyvstack_set_refresh_control(_handle: i64, _callback: f64) {}
+#[no_mangle]
+pub extern "C" fn perry_ui_lazyvstack_end_refreshing(_handle: i64) {}
+#[no_mangle]
+pub extern "C" fn perry_ui_lazyvstack_set_scroll_end_callback(_handle: i64, _callback: f64, _threshold_items: i64) {}
+
+#[no_mangle]
+pub extern "C" fn perry_ui_scrollview_set_scroll_end_callback(handle: i64, callback: f64, threshold_px: f64) {
+    catch_panic_void("perry_ui_scrollview_set_scroll_end_callback", || {
+        widgets::scrollview::set_scroll_end_callback(handle, callback, threshold_px as f32)
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn perry_ui_image_gallery_create(on_index_change: f64) -> i64 {
+    catch_panic("perry_ui_image_gallery_create", || {
+        widgets::image_gallery::create(on_index_change)
+    })
+}
+#[no_mangle]
+pub extern "C" fn perry_ui_image_gallery_add_image(handle: i64, url_ptr: i64, alt_ptr: i64) {
+    catch_panic_void("perry_ui_image_gallery_add_image", || {
+        widgets::image_gallery::add_image(handle, url_ptr as *const u8, alt_ptr as *const u8)
+    })
+}
+#[no_mangle]
+pub extern "C" fn perry_ui_image_gallery_set_index(handle: i64, index: i64) {
+    catch_panic_void("perry_ui_image_gallery_set_index", || {
+        widgets::image_gallery::set_index(handle, index)
+    })
+}

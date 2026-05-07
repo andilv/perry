@@ -1,8 +1,10 @@
+pub mod bottom_nav;
 pub mod button;
 pub mod calendar;
 pub mod canvas;
 pub mod chart;
 pub mod divider;
+pub mod image_gallery;
 pub mod map_view;
 pub mod pdf_view;
 pub mod rich_text;

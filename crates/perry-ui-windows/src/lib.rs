@@ -2161,3 +2161,50 @@ pub extern "C" fn perry_media_set_now_playing(
 pub extern "C" fn perry_media_destroy(handle: f64) {
     media_playback::destroy(handle);
 }
+
+// =============================================================================
+// Issue #553 — Windows.
+//
+// onScrollEnd: real impl — wired into ScrollView's existing WM_VSCROLL +
+// WM_MOUSEWHEEL handlers via `check_scroll_end(handle)` after each offset
+// update. Backpressure matches the macOS / iOS / GTK4 contract.
+//
+// BottomNavigation + ImageGallery stay stubbed on Windows: Win32 has no
+// native primitives for either (no equivalent of UITabBar /
+// BottomNavigationView, no UIPageViewController). A real impl would need
+// either custom owner-drawn child windows (~300 lines / widget) OR a
+// transition to WinUI 3 — both deferred per the existing tabbar.rs Win32
+// stub convention. The symbols exist so cross-platform code links cleanly
+// today and the call paths flip to real impls when WinUI lands.
+//
+// Pull-to-refresh on LazyVStack stays no-op: no native idiom on desktop
+// Windows; explicit refresh button is the convention.
+// =============================================================================
+
+#[no_mangle]
+pub extern "C" fn perry_ui_bottom_nav_create(_on_select: f64) -> i64 { 0 }
+#[no_mangle]
+pub extern "C" fn perry_ui_bottom_nav_add_item(_handle: i64, _icon_ptr: i64, _label_ptr: i64) {}
+#[no_mangle]
+pub extern "C" fn perry_ui_bottom_nav_set_badge(_handle: i64, _index: i64, _badge_ptr: i64) {}
+#[no_mangle]
+pub extern "C" fn perry_ui_bottom_nav_set_selected(_handle: i64, _index: i64) {}
+
+#[no_mangle]
+pub extern "C" fn perry_ui_lazyvstack_set_refresh_control(_handle: i64, _callback: f64) {}
+#[no_mangle]
+pub extern "C" fn perry_ui_lazyvstack_end_refreshing(_handle: i64) {}
+#[no_mangle]
+pub extern "C" fn perry_ui_lazyvstack_set_scroll_end_callback(_handle: i64, _callback: f64, _threshold_items: i64) {}
+
+#[no_mangle]
+pub extern "C" fn perry_ui_scrollview_set_scroll_end_callback(handle: i64, callback: f64, threshold_px: f64) {
+    widgets::scrollview::set_scroll_end_callback(handle, callback, threshold_px)
+}
+
+#[no_mangle]
+pub extern "C" fn perry_ui_image_gallery_create(_on_index_change: f64) -> i64 { 0 }
+#[no_mangle]
+pub extern "C" fn perry_ui_image_gallery_add_image(_handle: i64, _url_ptr: i64, _alt_ptr: i64) {}
+#[no_mangle]
+pub extern "C" fn perry_ui_image_gallery_set_index(_handle: i64, _index: i64) {}

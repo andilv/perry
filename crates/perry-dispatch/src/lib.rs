@@ -310,6 +310,84 @@ pub const PERRY_UI_TABLE: &[MethodRow] = &[
         args: &[ArgKind::Widget],
         ret: ReturnKind::Void,
     },
+    // ---- Issue #553: infinite-scroll callback + LazyVStack pull-to-refresh ----
+    // Mirrors the #390 ScrollView pattern; same backpressure contract on
+    // both platforms (the callback fires once per threshold-cross and
+    // re-arms only when the user scrolls back up past the threshold).
+    MethodRow {
+        method: "scrollviewSetScrollEndCallback",
+        runtime: "perry_ui_scrollview_set_scroll_end_callback",
+        args: &[ArgKind::Widget, ArgKind::Closure, ArgKind::F64],
+        ret: ReturnKind::Void,
+    },
+    MethodRow {
+        method: "scrollViewSetScrollEndCallback",
+        runtime: "perry_ui_scrollview_set_scroll_end_callback",
+        args: &[ArgKind::Widget, ArgKind::Closure, ArgKind::F64],
+        ret: ReturnKind::Void,
+    },
+    MethodRow {
+        method: "lazyvstackSetRefreshControl",
+        runtime: "perry_ui_lazyvstack_set_refresh_control",
+        args: &[ArgKind::Widget, ArgKind::Closure],
+        ret: ReturnKind::Void,
+    },
+    MethodRow {
+        method: "lazyvstackEndRefreshing",
+        runtime: "perry_ui_lazyvstack_end_refreshing",
+        args: &[ArgKind::Widget],
+        ret: ReturnKind::Void,
+    },
+    MethodRow {
+        method: "lazyvstackSetScrollEndCallback",
+        runtime: "perry_ui_lazyvstack_set_scroll_end_callback",
+        args: &[ArgKind::Widget, ArgKind::Closure, ArgKind::I64Raw],
+        ret: ReturnKind::Void,
+    },
+    // ---- Issue #553: BottomNavigation (5-tab bottom bar) ----
+    MethodRow {
+        method: "BottomNavigation",
+        runtime: "perry_ui_bottom_nav_create",
+        args: &[ArgKind::Closure],
+        ret: ReturnKind::Widget,
+    },
+    MethodRow {
+        method: "bottomNavAddItem",
+        runtime: "perry_ui_bottom_nav_add_item",
+        args: &[ArgKind::Widget, ArgKind::Str, ArgKind::Str],
+        ret: ReturnKind::Void,
+    },
+    MethodRow {
+        method: "bottomNavSetBadge",
+        runtime: "perry_ui_bottom_nav_set_badge",
+        args: &[ArgKind::Widget, ArgKind::I64Raw, ArgKind::Str],
+        ret: ReturnKind::Void,
+    },
+    MethodRow {
+        method: "bottomNavSetSelected",
+        runtime: "perry_ui_bottom_nav_set_selected",
+        args: &[ArgKind::Widget, ArgKind::I64Raw],
+        ret: ReturnKind::Void,
+    },
+    // ---- Issue #553: ImageGallery (swipeable carousel) ----
+    MethodRow {
+        method: "ImageGallery",
+        runtime: "perry_ui_image_gallery_create",
+        args: &[ArgKind::Closure],
+        ret: ReturnKind::Widget,
+    },
+    MethodRow {
+        method: "imageGalleryAddImage",
+        runtime: "perry_ui_image_gallery_add_image",
+        args: &[ArgKind::Widget, ArgKind::Str, ArgKind::Str],
+        ret: ReturnKind::Void,
+    },
+    MethodRow {
+        method: "imageGallerySetIndex",
+        runtime: "perry_ui_image_gallery_set_index",
+        args: &[ArgKind::Widget, ArgKind::I64Raw],
+        ret: ReturnKind::Void,
+    },
     // ---- Stack layout ----
     MethodRow {
         method: "stackSetAlignment",

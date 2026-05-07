@@ -2274,13 +2274,74 @@ pub extern "C" fn perry_ui_tabbar_add_tab(_handle: i64, _label_ptr: i64) {}
 #[no_mangle]
 pub extern "C" fn perry_ui_tabbar_set_selected(_handle: i64, _index: i64) {}
 
-// --- ScrollView refresh control stubs (not yet implemented for macOS) ---
+// --- ScrollView refresh control stubs (macOS has no native pull-to-refresh idiom) ---
 
 #[no_mangle]
 pub extern "C" fn perry_ui_scrollview_set_refresh_control(_handle: i64, _callback: f64) {}
 
 #[no_mangle]
 pub extern "C" fn perry_ui_scrollview_end_refreshing(_handle: i64) {}
+
+// --- Issue #553: ScrollView + LazyVStack onScrollEnd, LazyVStack pull-to-refresh ---
+
+#[no_mangle]
+pub extern "C" fn perry_ui_scrollview_set_scroll_end_callback(handle: i64, callback: f64, threshold_px: f64) {
+    widgets::scrollview::set_scroll_end_callback(handle, callback, threshold_px);
+}
+
+#[no_mangle]
+pub extern "C" fn perry_ui_lazyvstack_set_refresh_control(handle: i64, callback: f64) {
+    widgets::lazyvstack::set_refresh_control(handle, callback);
+}
+
+#[no_mangle]
+pub extern "C" fn perry_ui_lazyvstack_end_refreshing(handle: i64) {
+    widgets::lazyvstack::end_refreshing(handle);
+}
+
+#[no_mangle]
+pub extern "C" fn perry_ui_lazyvstack_set_scroll_end_callback(handle: i64, callback: f64, threshold_items: i64) {
+    widgets::lazyvstack::set_scroll_end_callback(handle, callback, threshold_items);
+}
+
+// --- Issue #553: BottomNavigation (5-tab bottom bar with icon + label + badge) ---
+
+#[no_mangle]
+pub extern "C" fn perry_ui_bottom_nav_create(on_select: f64) -> i64 {
+    widgets::bottom_nav::create(on_select)
+}
+
+#[no_mangle]
+pub extern "C" fn perry_ui_bottom_nav_add_item(handle: i64, icon_ptr: i64, label_ptr: i64) {
+    widgets::bottom_nav::add_item(handle, icon_ptr as *const u8, label_ptr as *const u8);
+}
+
+#[no_mangle]
+pub extern "C" fn perry_ui_bottom_nav_set_badge(handle: i64, index: i64, badge_ptr: i64) {
+    widgets::bottom_nav::set_badge(handle, index, badge_ptr as *const u8);
+}
+
+#[no_mangle]
+pub extern "C" fn perry_ui_bottom_nav_set_selected(handle: i64, index: i64) {
+    widgets::bottom_nav::set_selected(handle, index);
+}
+
+// --- Issue #553: ImageGallery (swipeable carousel) ---
+
+#[no_mangle]
+pub extern "C" fn perry_ui_image_gallery_create(on_index_change: f64) -> i64 {
+    widgets::image_gallery::create(on_index_change)
+}
+
+#[no_mangle]
+pub extern "C" fn perry_ui_image_gallery_add_image(handle: i64, url_ptr: i64, alt_ptr: i64) {
+    widgets::image_gallery::add_image(handle, url_ptr as *const u8, alt_ptr as *const u8);
+}
+
+#[no_mangle]
+pub extern "C" fn perry_ui_image_gallery_set_index(handle: i64, index: i64) {
+    widgets::image_gallery::set_index(handle, index);
+}
 
 // --- Camera stubs (issue #191) ---
 // Real implementations live in `perry-ui-ios` (AVCaptureSession) and
