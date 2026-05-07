@@ -4122,11 +4122,22 @@ fn lower_module_decl(
                     // (see non-export class arm below for rationale).
                     for sf in &class.static_fields {
                         if let Some(init) = &sf.init {
-                            module.init.push(Stmt::Expr(Expr::StaticFieldSet {
-                                class_name: class_name.clone(),
-                                field_name: sf.name.clone(),
-                                value: Box::new(init.clone()),
-                            }));
+                            // Computed-key static fields (`static [sym] = v`)
+                            // emit a runtime-register call instead of a
+                            // string-keyed StaticFieldSet. Refs #420.
+                            if let Some(key) = sf.key_expr.as_ref() {
+                                module.init.push(Stmt::Expr(Expr::ClassStaticSymbolSet {
+                                    class_name: class_name.clone(),
+                                    key: Box::new(key.clone()),
+                                    value: Box::new(init.clone()),
+                                }));
+                            } else {
+                                module.init.push(Stmt::Expr(Expr::StaticFieldSet {
+                                    class_name: class_name.clone(),
+                                    field_name: sf.name.clone(),
+                                    value: Box::new(init.clone()),
+                                }));
+                            }
                         }
                     }
                     push_class_dedup(module, class);
@@ -5162,11 +5173,19 @@ fn lower_stmt(ctx: &mut LoweringContext, module: &mut Module, stmt: &ast::Stmt) 
                     // point in source order.
                     for sf in &class.static_fields {
                         if let Some(init) = &sf.init {
-                            module.init.push(Stmt::Expr(Expr::StaticFieldSet {
-                                class_name: class.name.clone(),
-                                field_name: sf.name.clone(),
-                                value: Box::new(init.clone()),
-                            }));
+                            if let Some(key) = sf.key_expr.as_ref() {
+                                module.init.push(Stmt::Expr(Expr::ClassStaticSymbolSet {
+                                    class_name: class.name.clone(),
+                                    key: Box::new(key.clone()),
+                                    value: Box::new(init.clone()),
+                                }));
+                            } else {
+                                module.init.push(Stmt::Expr(Expr::StaticFieldSet {
+                                    class_name: class.name.clone(),
+                                    field_name: sf.name.clone(),
+                                    value: Box::new(init.clone()),
+                                }));
+                            }
                         }
                     }
                     push_class_dedup(module, class);

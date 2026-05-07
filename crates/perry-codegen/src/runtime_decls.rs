@@ -757,6 +757,13 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_typed_array_find_last_index", DOUBLE, &[I64, I64]);
     // Object introspection / mutation (Agent A's accessor-descriptor work).
     module.declare_function("js_object_has_own", DOUBLE, &[DOUBLE, DOUBLE]);
+    // Refs #420: register a static computed-key Symbol field on a class.
+    // Called from `init_static_fields` for each `static [Symbol.X] = init`.
+    module.declare_function(
+        "js_class_register_static_symbol",
+        VOID,
+        &[I32, DOUBLE, DOUBLE],
+    );
     module.declare_function(
         "js_object_define_property",
         DOUBLE,

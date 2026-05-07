@@ -6369,8 +6369,21 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             Ok(nanbox_pointer_inline(blk, &result))
         }
 
-        // -------- ClassRef stub (returns class id 0 as a sentinel) --------
-        Expr::ClassRef(_) => Ok(double_literal(0.0)),
+        // -------- ClassRef --------
+        // Lower to the class's runtime id NaN-boxed with INT32_TAG. The
+        // runtime distinguishes class refs from other values via the tag,
+        // letting `Object.prototype.hasOwnProperty.call(SomeClass, sym)`
+        // route through the class-static-symbol side table for drizzle's
+        // `is(value, type)`. Falls back to `0.0` when the class isn't in
+        // class_ids (legacy callers checking truthiness). Refs #420.
+        Expr::ClassRef(name) => {
+            if let Some(&cid) = ctx.class_ids.get(name) {
+                let bits = crate::nanbox::INT32_TAG | (cid as u64 & 0xFFFF_FFFF);
+                Ok(double_literal(f64::from_bits(bits)))
+            } else {
+                Ok(double_literal(0.0))
+            }
+        }
 
         // -------- CallSpread: function call with spread arguments --------
         // The common shape is `fn(...args)` — single spread, no regular
@@ -8254,6 +8267,24 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 ctx.block().store(DOUBLE, &v, &g_ref);
             }
             Ok(v)
+        }
+        // `static [Symbol.for("k")] = "v"` — register in the runtime's
+        // class-static-symbol side table. Refs #420 (drizzle).
+        Expr::ClassStaticSymbolSet {
+            class_name,
+            key,
+            value,
+        } => {
+            let key_v = lower_expr(ctx, key)?;
+            let val_v = lower_expr(ctx, value)?;
+            if let Some(&class_id) = ctx.class_ids.get(class_name) {
+                let cid_str = class_id.to_string();
+                ctx.block().call_void(
+                    "js_class_register_static_symbol",
+                    &[(crate::types::I32, &cid_str), (DOUBLE, &key_v), (DOUBLE, &val_v)],
+                );
+            }
+            Ok(val_v)
         }
         Expr::NativeModuleRef(_) => Ok(double_literal(0.0)),
 

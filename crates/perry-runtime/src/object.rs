@@ -6276,6 +6276,18 @@ pub extern "C" fn js_object_has_own(obj_value: f64, key_value: f64) -> f64 {
         // string-coercion would yield null and the check would always fail.
         // Refs #420.
         if crate::symbol::js_is_symbol(key_value) != 0 {
+            // ClassRef receivers are NaN-boxed as INT32_TAG (top16 = 0x7FFE)
+            // with the class_id in the low 32 bits. Consult the
+            // class-static-symbol side table populated by
+            // `js_class_register_static_symbol`. Refs #420 (drizzle's
+            // `Object.prototype.hasOwnProperty.call(Table, entityKind)`).
+            let bits = obj_value.to_bits();
+            if (bits >> 48) == 0x7FFE {
+                let class_id = (bits & 0xFFFF_FFFF) as u32;
+                let present =
+                    crate::symbol::class_static_symbol_lookup(class_id, key_value).is_some();
+                return f64::from_bits(if present { TAG_TRUE } else { TAG_FALSE });
+            }
             let present = crate::symbol::js_object_has_own_symbol(obj_value, key_value);
             return f64::from_bits(if present { TAG_TRUE } else { TAG_FALSE });
         }

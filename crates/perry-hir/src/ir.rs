@@ -946,6 +946,16 @@ pub enum Expr {
         value: Box<Expr>,
     },
 
+    // Static computed-key Symbol field assignment, e.g.
+    // `class C { static [Symbol.for("k")] = "v" }`. Lowered at runtime
+    // through `js_class_register_static_symbol(class_id, key, value)`.
+    // Refs #420.
+    ClassStaticSymbolSet {
+        class_name: String,
+        key: Box<Expr>,
+        value: Box<Expr>,
+    },
+
     // Static method call (e.g., Counter.increment())
     StaticMethodCall {
         class_name: String,

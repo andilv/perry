@@ -1263,6 +1263,12 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
     let mut static_field_globals: HashMap<(String, String), String> = HashMap::new();
     for c in &hir.classes {
         for sf in &c.static_fields {
+            // Computed-key static fields (`static [Symbol.for(...)] = init`)
+            // are stored in a runtime side table by `init_static_fields`;
+            // they don't get a string-named global. Refs #420.
+            if sf.key_expr.is_some() {
+                continue;
+            }
             let name = format!(
                 "perry_static_{}__{}__{}",
                 module_prefix,
@@ -4676,6 +4682,27 @@ fn init_static_fields(ctx: &mut crate::expr::FnCtx<'_>, hir: &HirModule) -> Resu
     }
     for c in &hir.classes {
         for sf in &c.static_fields {
+            // Computed-key static fields go through the class-static-symbol
+            // side table. Refs #420 — drizzle's `static [entityKind] =
+            // "Table"` is consulted by `Object.prototype.hasOwnProperty.call(
+            // type, entityKind)` in drizzle's `is(value, type)`.
+            if let (Some(key_expr), Some(init_expr)) = (sf.key_expr.as_ref(), sf.init.as_ref()) {
+                let Some(&class_id) = ctx.class_ids.get(&c.name) else {
+                    continue;
+                };
+                let key_v = crate::expr::lower_expr(ctx, key_expr)?;
+                let val_v = crate::expr::lower_expr(ctx, init_expr)?;
+                let cid_str = class_id.to_string();
+                ctx.block().call_void(
+                    "js_class_register_static_symbol",
+                    &[
+                        (crate::types::I32, &cid_str),
+                        (DOUBLE, &key_v),
+                        (DOUBLE, &val_v),
+                    ],
+                );
+                continue;
+            }
             let key = (c.name.clone(), sf.name.clone());
             let Some(global_name) = ctx.static_field_globals.get(&key).cloned() else {
                 continue;

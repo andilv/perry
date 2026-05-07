@@ -908,18 +908,13 @@ pub(crate) fn lower_class_decl(
             }
             ast::ClassMember::ClassProp(prop) => {
                 // Computed-key fields (`[Symbol.for("k")] = init`) flow through
-                // here too — `lower_class_prop` captures the key expression in
-                // `ClassField.key_expr` for runtime evaluation in the constructor
-                // preamble. Static computed-key fields are skipped for now since
-                // the static-init path doesn't yet honor `key_expr`.
-                if prop.is_static {
-                    if !matches!(
-                        &prop.key,
-                        ast::PropName::Ident(_) | ast::PropName::Str(_)
-                    ) {
-                        continue;
-                    }
-                }
+                // here for both instance AND static positions.
+                // `lower_class_prop` captures the key expression in
+                // `ClassField.key_expr` for runtime evaluation. Refs #420 —
+                // drizzle's `static [entityKind] = "Table"` is the canonical
+                // static-computed-key pattern; codegen's `init_static_fields`
+                // detects `key_expr.is_some()` and emits a runtime
+                // registration into the class-static-symbol side table.
                 let field = lower_class_prop(ctx, prop)?;
                 if prop.is_static {
                     static_fields.push(field);
@@ -1583,18 +1578,13 @@ pub(crate) fn lower_class_from_ast(
             }
             ast::ClassMember::ClassProp(prop) => {
                 // Computed-key fields (`[Symbol.for("k")] = init`) flow through
-                // here too — `lower_class_prop` captures the key expression in
-                // `ClassField.key_expr` for runtime evaluation in the constructor
-                // preamble. Static computed-key fields are skipped for now since
-                // the static-init path doesn't yet honor `key_expr`.
-                if prop.is_static {
-                    if !matches!(
-                        &prop.key,
-                        ast::PropName::Ident(_) | ast::PropName::Str(_)
-                    ) {
-                        continue;
-                    }
-                }
+                // here for both instance AND static positions.
+                // `lower_class_prop` captures the key expression in
+                // `ClassField.key_expr` for runtime evaluation. Refs #420 —
+                // drizzle's `static [entityKind] = "Table"` is the canonical
+                // static-computed-key pattern; codegen's `init_static_fields`
+                // detects `key_expr.is_some()` and emits a runtime
+                // registration into the class-static-symbol side table.
                 let field = lower_class_prop(ctx, prop)?;
                 if prop.is_static {
                     static_fields.push(field);
