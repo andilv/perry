@@ -4679,6 +4679,213 @@ fn lower_namespace_as_class(
     })
 }
 
+/// Recursively walk a destructuring pattern collecting every leaf identifier
+/// (and pre-defining each as a local). Used by the for-of binding pre-pass so
+/// the loop body can reference variables introduced by *nested* patterns like
+/// `for (const { foo, bar: [a, b] } of arr)` — the outer per-prop loop only
+/// handled `Ident` leaves, so leaves buried in nested array/object patterns
+/// were silently skipped and read as zero in the body. Issue #554.
+fn collect_for_of_pattern_leaves(
+    ctx: &mut LoweringContext,
+    pat: &ast::Pat,
+    out: &mut Vec<(String, LocalId)>,
+) {
+    match pat {
+        ast::Pat::Ident(ident) => {
+            let name = ident.id.sym.to_string();
+            let id = ctx.define_local(name.clone(), Type::Any);
+            out.push((name, id));
+        }
+        ast::Pat::Array(arr_pat) => {
+            for elem in &arr_pat.elems {
+                if let Some(ep) = elem {
+                    if let ast::Pat::Rest(rest) = ep {
+                        collect_for_of_pattern_leaves(ctx, &rest.arg, out);
+                    } else {
+                        collect_for_of_pattern_leaves(ctx, ep, out);
+                    }
+                }
+            }
+        }
+        ast::Pat::Object(obj_pat) => {
+            for prop in &obj_pat.props {
+                match prop {
+                    ast::ObjectPatProp::Assign(assign) => {
+                        let name = assign.key.sym.to_string();
+                        let id = ctx.define_local(name.clone(), Type::Any);
+                        out.push((name, id));
+                    }
+                    ast::ObjectPatProp::KeyValue(kv) => {
+                        collect_for_of_pattern_leaves(ctx, &kv.value, out);
+                    }
+                    ast::ObjectPatProp::Rest(rest) => {
+                        collect_for_of_pattern_leaves(ctx, &rest.arg, out);
+                    }
+                }
+            }
+        }
+        ast::Pat::Assign(assign_pat) => {
+            collect_for_of_pattern_leaves(ctx, &assign_pat.left, out);
+        }
+        ast::Pat::Rest(rest) => {
+            collect_for_of_pattern_leaves(ctx, &rest.arg, out);
+        }
+        _ => {}
+    }
+}
+
+/// Emit `Stmt::Let` bindings for a destructuring pattern given a `source`
+/// expression that produces the value being destructured. Reuses the
+/// pre-allocated leaf ids in `var_ids` (in source order) so the loop body — which
+/// was already lowered against those ids — sees the correct bindings. Mirrors
+/// `destructuring::lower_pattern_binding_into` but takes pre-allocated ids
+/// instead of calling `define_local` itself. Issue #554.
+fn emit_for_of_pattern_binding(
+    ctx: &mut LoweringContext,
+    pat: &ast::Pat,
+    source: Expr,
+    var_ids: &[(String, LocalId)],
+    var_idx: &mut usize,
+    out: &mut Vec<Stmt>,
+) -> Result<()> {
+    match pat {
+        ast::Pat::Ident(_) => {
+            let (name, id) = var_ids[*var_idx].clone();
+            *var_idx += 1;
+            out.push(Stmt::Let {
+                id,
+                name,
+                ty: Type::Any,
+                mutable: false,
+                init: Some(source),
+            });
+            Ok(())
+        }
+        ast::Pat::Array(arr_pat) => {
+            // Default to Array(Any) so OOB reads return undefined/NaN as the
+            // existing `destructuring::lower_pattern_binding_into` helper does.
+            // (Typing the temp as Any pulls reads through the typed-element
+            // fast path which returns 0 for OOB and breaks default-value
+            // handling.)
+            let arr_ty = arr_pat
+                .type_ann
+                .as_ref()
+                .map(|ann| crate::lower_types::extract_ts_type(&ann.type_ann))
+                .unwrap_or(Type::Array(Box::new(Type::Any)));
+            let tmp_id = ctx.fresh_local();
+            let tmp_name = format!("__destruct_{}", tmp_id);
+            ctx.locals.push((tmp_name.clone(), tmp_id, arr_ty.clone()));
+            out.push(Stmt::Let {
+                id: tmp_id,
+                name: tmp_name,
+                ty: arr_ty,
+                mutable: false,
+                init: Some(source),
+            });
+            for (idx, elem) in arr_pat.elems.iter().enumerate() {
+                let Some(elem_pat) = elem else { continue };
+                if let ast::Pat::Rest(rest) = elem_pat {
+                    let slice = Expr::ArraySlice {
+                        array: Box::new(Expr::LocalGet(tmp_id)),
+                        start: Box::new(Expr::Number(idx as f64)),
+                        end: None,
+                    };
+                    emit_for_of_pattern_binding(ctx, &rest.arg, slice, var_ids, var_idx, out)?;
+                    break;
+                }
+                let elem_src = Expr::IndexGet {
+                    object: Box::new(Expr::LocalGet(tmp_id)),
+                    index: Box::new(Expr::Number(idx as f64)),
+                };
+                emit_for_of_pattern_binding(ctx, elem_pat, elem_src, var_ids, var_idx, out)?;
+            }
+            Ok(())
+        }
+        ast::Pat::Object(obj_pat) => {
+            let tmp_id = ctx.fresh_local();
+            let tmp_name = format!("__destruct_{}", tmp_id);
+            ctx.locals.push((tmp_name.clone(), tmp_id, Type::Any));
+            out.push(Stmt::Let {
+                id: tmp_id,
+                name: tmp_name,
+                ty: Type::Any,
+                mutable: false,
+                init: Some(source),
+            });
+            for prop in &obj_pat.props {
+                match prop {
+                    ast::ObjectPatProp::Assign(assign) => {
+                        let key = assign.key.sym.to_string();
+                        let prop_access = Expr::PropertyGet {
+                            object: Box::new(Expr::LocalGet(tmp_id)),
+                            property: key,
+                        };
+                        let init = if let Some(default_expr) = &assign.value {
+                            let default_val = lower_expr(ctx, default_expr)?;
+                            Expr::Conditional {
+                                condition: Box::new(Expr::Compare {
+                                    op: CompareOp::Ne,
+                                    left: Box::new(prop_access.clone()),
+                                    right: Box::new(Expr::Undefined),
+                                }),
+                                then_expr: Box::new(prop_access),
+                                else_expr: Box::new(default_val),
+                            }
+                        } else {
+                            prop_access
+                        };
+                        let (name, id) = var_ids[*var_idx].clone();
+                        *var_idx += 1;
+                        out.push(Stmt::Let {
+                            id,
+                            name,
+                            ty: Type::Any,
+                            mutable: false,
+                            init: Some(init),
+                        });
+                    }
+                    ast::ObjectPatProp::KeyValue(kv) => {
+                        let key = match &kv.key {
+                            ast::PropName::Ident(ident) => ident.sym.to_string(),
+                            ast::PropName::Str(s) => s.value.as_str().unwrap_or("").to_string(),
+                            _ => continue,
+                        };
+                        let elem_src = Expr::PropertyGet {
+                            object: Box::new(Expr::LocalGet(tmp_id)),
+                            property: key,
+                        };
+                        emit_for_of_pattern_binding(
+                            ctx, &kv.value, elem_src, var_ids, var_idx, out,
+                        )?;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+        ast::Pat::Assign(assign_pat) => {
+            let tmp_id = ctx.fresh_local();
+            let tmp_name = format!("__destruct_{}", tmp_id);
+            ctx.locals.push((tmp_name.clone(), tmp_id, Type::Any));
+            out.push(Stmt::Let {
+                id: tmp_id,
+                name: tmp_name,
+                ty: Type::Any,
+                mutable: false,
+                init: Some(source),
+            });
+            let default_val = lower_expr(ctx, &assign_pat.right)?;
+            let with_default = Expr::Conditional {
+                condition: Box::new(Expr::IsUndefinedOrBareNan(Box::new(Expr::LocalGet(tmp_id)))),
+                then_expr: Box::new(default_val),
+                else_expr: Box::new(Expr::LocalGet(tmp_id)),
+            };
+            emit_for_of_pattern_binding(ctx, &assign_pat.left, with_default, var_ids, var_idx, out)
+        }
+        _ => Ok(()),
+    }
+}
+
 fn lower_stmt(ctx: &mut LoweringContext, module: &mut Module, stmt: &ast::Stmt) -> Result<()> {
     match stmt {
         ast::Stmt::Decl(decl) => {
@@ -5954,6 +6161,13 @@ fn lower_stmt(ctx: &mut LoweringContext, module: &mut Module, stmt: &ast::Stmt) 
                                                 let name = ident.id.sym.to_string();
                                                 let id = ctx.define_local(name.clone(), Type::Any);
                                                 ids.push((name, id));
+                                            } else {
+                                                // Nested pattern (e.g. `key: [a, b]`).
+                                                // Recurse so leaves get pre-defined and
+                                                // the body can reference them. Issue #554.
+                                                collect_for_of_pattern_leaves(
+                                                    ctx, &kv.value, &mut ids,
+                                                );
                                             }
                                         }
                                         _ => {}
@@ -6149,7 +6363,16 @@ fn lower_stmt(ctx: &mut LoweringContext, module: &mut Module, stmt: &ast::Stmt) 
                                                 ast::PropName::Ident(ident) => {
                                                     ident.sym.to_string()
                                                 }
+                                                ast::PropName::Str(s) => s
+                                                    .value
+                                                    .as_str()
+                                                    .unwrap_or("")
+                                                    .to_string(),
                                                 _ => continue,
+                                            };
+                                            let key_source = Expr::PropertyGet {
+                                                object: Box::new(Expr::LocalGet(item_id)),
+                                                property: key,
                                             };
                                             if let ast::Pat::Ident(_) = &*kv.value {
                                                 let (name, id) = var_ids[var_idx].clone();
@@ -6159,11 +6382,19 @@ fn lower_stmt(ctx: &mut LoweringContext, module: &mut Module, stmt: &ast::Stmt) 
                                                     name,
                                                     ty: Type::Any,
                                                     mutable: false,
-                                                    init: Some(Expr::PropertyGet {
-                                                        object: Box::new(Expr::LocalGet(item_id)),
-                                                        property: key,
-                                                    }),
+                                                    init: Some(key_source),
                                                 });
+                                            } else {
+                                                // Nested pattern (e.g. `key: [a, b]`).
+                                                // Issue #554.
+                                                emit_for_of_pattern_binding(
+                                                    ctx,
+                                                    &kv.value,
+                                                    key_source,
+                                                    &var_ids,
+                                                    &mut var_idx,
+                                                    &mut stmts,
+                                                )?;
                                             }
                                         }
                                         _ => {}
