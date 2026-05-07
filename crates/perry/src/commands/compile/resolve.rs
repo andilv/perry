@@ -912,10 +912,20 @@ pub(super) fn resolve_import(
                         // If effective_dir failed (shouldn't happen), try the local dir
                         return Some((entry.canonicalize().ok()?, ModuleKind::NativeCompiled));
                     }
-                    // For other node_modules packages, treat as Interpreted
-                    // Even .ts files in node_modules are library source code,
-                    // not user code to be compiled. V8 will handle them at runtime.
-                    return Some((entry.canonicalize().ok()?, ModuleKind::Interpreted));
+                    // For other node_modules packages, classify by file
+                    // extension. `.ts` / `.tsx` sources are compiled natively
+                    // (matches what `collect_modules` already does for the
+                    // recursive walk when `enable_js_runtime` is off — the
+                    // default). `.js` / `.mjs` / `.cjs` and other shapes
+                    // stay Interpreted so V8 / QuickJS handles them at
+                    // runtime.
+                    let canonical = entry.canonicalize().ok()?;
+                    let kind = if is_ts_file(&canonical) {
+                        ModuleKind::NativeCompiled
+                    } else {
+                        ModuleKind::Interpreted
+                    };
+                    return Some((canonical, kind));
                 }
             }
         }
@@ -964,7 +974,17 @@ pub(super) fn resolve_import(
                         ));
                     }
                 }
-                return Some((entry.canonicalize().ok()?, ModuleKind::Interpreted));
+                // Same `.ts` / `.tsx` → NativeCompiled rule as the
+                // node_modules fallback above. Keeps `file:` deps that
+                // ship TypeScript source aligned with `collect_modules`'s
+                // recursive native walk.
+                let canonical = entry.canonicalize().ok()?;
+                let kind = if is_ts_file(&canonical) {
+                    ModuleKind::NativeCompiled
+                } else {
+                    ModuleKind::Interpreted
+                };
+                return Some((canonical, kind));
             }
         }
     }
