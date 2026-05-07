@@ -8,7 +8,13 @@ Perry natively implements many popular npm packages and Node.js APIs. When you i
 {{#include ../../examples/stdlib/overview/snippets.ts:imports}}
 ```
 
-Perry recognizes these imports at compile time and routes them to native Rust implementations in the `perry-stdlib` crate. The API surface matches the original npm package, so existing code often works unchanged.
+Perry recognizes these imports at compile time and routes them to native
+Rust implementations. Most live in standalone `perry-ext-*` crates
+backed by the stable [`perry-ffi` ABI](../native-libraries/abi.md) (the
+"well-known native bindings" registry shipped in v0.5.532); a few of
+the older Node.js built-ins still live in `perry-stdlib`. Either way the
+import surface matches the original npm package, so existing code often
+works unchanged.
 
 ## Supported Packages
 
@@ -73,6 +79,26 @@ Perry automatically detects which stdlib features your code uses:
 | Full stdlib | ~48MB |
 
 The compiler links only the required runtime components.
+
+### External native bindings
+
+Two packages live in their own GitHub repos with their own semver but
+plug into the same well-known registry:
+
+- **`@perryts/tursodb`** — Turso (libSQL fork) database client.
+  [PerryTS/tursodb-bindings](https://github.com/PerryTS/tursodb-bindings).
+- **`@perryts/iroh`** — Iroh peer-to-peer networking.
+  [PerryTS/iroh-bindings](https://github.com/PerryTS/iroh-bindings).
+
+Pure-TypeScript drivers compiled via `compilePackages` (no Rust):
+
+- **`@perryts/postgres`** — pg-compatible wire-protocol driver.
+- **`@perryts/mysql`** — mysql2-compatible wire-protocol driver.
+- **`@perryts/mongodb`** — mongodb-compatible wire-protocol driver.
+
+Each of these also runs unmodified on Node.js / Bun. See
+[Native Bindings — Overview](../native-libraries/overview.md) for
+the contract they follow.
 
 ## compilePackages
 

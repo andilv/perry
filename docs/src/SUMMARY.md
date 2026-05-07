@@ -96,6 +96,8 @@
 - [Notifications](system/notifications.md)
 - [Audio Capture](system/audio.md)
 - [Media Playback](system/media.md)
+- [Geolocation & Image Picker](system/geolocation.md)
+- [Background Tasks](system/background.md)
 - [Other](system/other.md)
 
 # Widgets
