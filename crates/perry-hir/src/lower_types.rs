@@ -552,6 +552,17 @@ pub(crate) fn infer_call_return_type(callee: &ast::Expr, ctx: &LoweringContext) 
                     if let Some(ty) = ctx.lookup_class_method_return_type(class_name, method_name) {
                         return ty.clone();
                     }
+                    // Built-in TextEncoder / TextDecoder method return types.
+                    // `new TextEncoder().encode(s)` → Uint8Array (issue #584:
+                    // without this the local typed-anonymously inherits
+                    // Type::Any, the codegen index path falls through to the
+                    // f64-stride reader, and `bytes[i]` reads 8 packed bytes
+                    // as a single f64 instead of one byte).
+                    match (class_name.as_str(), method_name) {
+                        ("TextEncoder", "encode") => return Type::Named("Uint8Array".into()),
+                        ("TextDecoder", "decode") => return Type::String,
+                        _ => {}
+                    }
                 }
 
                 // Issue #533: Map<K, V> / WeakMap<K, V> / Set<T> / WeakSet<T>

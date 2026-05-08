@@ -1,17 +1,18 @@
 //! TextEncoder / TextDecoder runtime.
 //!
-//! `js_text_encoder_encode` / `js_text_decoder_decode` return an ArrayHeader
-//! (with `f64` elements) so the inline `encoded[i]` / `encoded.length`
-//! fast path works. We allocate a proper `ArrayHeader`,
-//! widen each UTF-8 byte to f64, AND register the pointer in the buffer
-//! registry so `encoded instanceof Uint8Array` still returns true.
+//! `js_text_encoder_encode_llvm` returns a `BufferHeader*` (packed u8 bytes,
+//! identical layout to `new Uint8Array([...])`) so the inline `bytes[i]`
+//! Uint8ArrayGet path (which reads `i8` at `ptr+8+idx`) sees real byte
+//! values. Previously this allocated an `ArrayHeader` with f64-per-byte
+//! storage, which iteration paths after #578 read as packed u8 — yielding
+//! the IEEE-754 byte pattern of the first byte instead of the byte itself
+//! (issue #584).
 //!
 //! `TextEncoder` / `TextDecoder` are stateless wrappers — the encoder is
 //! always UTF-8, so we return a small sentinel integer NaN-boxed as a
 //! pointer on the codegen side. The runtime doesn't need per-instance state.
 
-use crate::array::{js_array_alloc, ArrayHeader};
-use crate::buffer::{register_buffer, BufferHeader};
+use crate::buffer::{buffer_alloc, buffer_data_mut, mark_as_uint8array, BufferHeader};
 use crate::string::{js_string_from_bytes, StringHeader};
 
 /// `new TextEncoder()` — returns a non-null sentinel integer pointer.
@@ -31,14 +32,15 @@ pub extern "C" fn js_text_decoder_new() -> i64 {
     2
 }
 
-/// `encoder.encode(str)` — UTF-8 encode `value` into an `ArrayHeader`.
+/// `encoder.encode(str)` — UTF-8 encode `value` into a `BufferHeader`.
 ///
-/// Takes a NaN-boxed f64 string value. Returns an i64 pointer to a
-/// freshly allocated `ArrayHeader` holding one `f64` per UTF-8 byte.
-/// The pointer is ALSO registered in the buffer registry so downstream
-/// `instanceof Uint8Array` checks return true.
+/// Takes a NaN-boxed f64 string value. Returns an i64 pointer to a freshly
+/// allocated `BufferHeader` with `len` packed u8 bytes (same shape as
+/// `new Uint8Array([...])`). The buffer is registered + marked as Uint8Array
+/// so `instanceof Uint8Array` returns true and the standard Uint8Array
+/// indexed-access / iteration / decoder paths all work.
 ///
-/// The returned i64 is the raw `ArrayHeader*` — the codegen NaN-boxes it
+/// The returned i64 is the raw `BufferHeader*` — the codegen NaN-boxes it
 /// with `POINTER_TAG` before handing it to user code.
 #[no_mangle]
 pub extern "C" fn js_text_encoder_encode_llvm(value: f64) -> i64 {
@@ -54,50 +56,23 @@ pub extern "C" fn js_text_encoder_encode_llvm(value: f64) -> i64 {
         }
     };
 
-    // Allocate an ArrayHeader with `len` capacity. js_array_alloc enforces
-    // a minimum of MIN_ARRAY_CAPACITY (16), but that's fine — the length
-    // field is what matters for bounds checks and `.length`.
-    let arr = js_array_alloc(len as u32);
+    let buf = buffer_alloc(len as u32);
     unsafe {
-        (*arr).length = len as u32;
+        (*buf).length = len as u32;
         if len > 0 {
-            // Write each byte as an f64 at offset 8 + i*8.
-            let elems = (arr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut f64;
-            for i in 0..len {
-                let byte = *data_ptr.add(i);
-                *elems.add(i) = byte as f64;
-            }
+            std::ptr::copy_nonoverlapping(data_ptr, buffer_data_mut(buf), len);
         }
     }
+    mark_as_uint8array(buf as usize);
 
-    // Register so `instanceof Uint8Array` works.
-    register_buffer(arr as *const BufferHeader);
-    // Remember that this pointer holds f64-encoded bytes (not packed u8)
-    // so the decoder knows how to read it.
-    remember_text_encoder_result(arr as usize);
-
-    arr as i64
+    buf as i64
 }
 
-/// `decoder.decode(buf)` — UTF-8 decode a NaN-boxed value holding either
-/// a text-encoder-produced `ArrayHeader` (with f64 bytes) or a real
-/// `BufferHeader` (with packed u8 bytes, e.g. from `new Uint8Array([...])`).
+/// `decoder.decode(buf)` — UTF-8 decode a NaN-boxed `BufferHeader` value.
 ///
 /// Returns a `*const StringHeader` as i64 — the codegen NaN-boxes with
-/// `STRING_TAG`.
-///
-/// Dispatch strategy: check the buffer registry. If the pointer isn't
-/// registered, treat it as an ArrayHeader. If registered, we need to
-/// distinguish between a "real" Uint8Array (BufferHeader with u8 bytes)
-/// and our TextEncoder output (ArrayHeader with f64 bytes that we also
-/// registered). We disambiguate via the `capacity` field:
-/// - BufferHeader capacity == byte length (packed bytes)
-/// - ArrayHeader capacity is f64-count (rounded up to MIN_ARRAY_CAPACITY)
-///
-/// A cleaner disambiguation: check whether reading past the header yields
-/// "looks like f64-encoded bytes (0..=255)" — but that's brittle. Instead,
-/// we track the ArrayHeader-backed registrations in a separate thread-local
-/// set (`TEXT_ENCODER_RESULTS`) maintained by `js_text_encoder_encode_llvm`.
+/// `STRING_TAG`. Both TextEncoder output and `new Uint8Array([...])` share
+/// the same packed-u8 BufferHeader layout, so a single read path covers both.
 #[no_mangle]
 pub extern "C" fn js_text_decoder_decode_llvm(value: f64) -> i64 {
     let bits = value.to_bits();
@@ -123,55 +98,10 @@ pub extern "C" fn js_text_decoder_decode_llvm(value: f64) -> i64 {
         return js_string_from_bytes(std::ptr::null(), 0) as i64;
     }
 
-    // Try the TextEncoder-allocated ArrayHeader path first. If this
-    // pointer was produced by `js_text_encoder_encode_llvm`, the bytes
-    // are stored as f64 elements at offset 8.
-    if is_text_encoder_result(ptr_usize) {
-        unsafe {
-            let arr = ptr_usize as *const ArrayHeader;
-            let len = (*arr).length as usize;
-            let elems = (arr as *const u8).add(std::mem::size_of::<ArrayHeader>()) as *const f64;
-            let mut bytes = Vec::with_capacity(len);
-            for i in 0..len {
-                let d = *elems.add(i);
-                // Defensive clamp in case something weird gets stored.
-                let b = (d as i64).clamp(0, 255) as u8;
-                bytes.push(b);
-            }
-            return js_string_from_bytes(bytes.as_ptr(), bytes.len() as u32) as i64;
-        }
-    }
-
-    // Fallback: treat as BufferHeader (packed u8 bytes).
     unsafe {
         let buf = ptr_usize as *const BufferHeader;
         let len = (*buf).length as usize;
         let data = (buf as *const u8).add(std::mem::size_of::<BufferHeader>());
         js_string_from_bytes(data, len as u32) as i64
     }
-}
-
-// ---------------------------------------------------------------------
-// Internal thread-local registry for TextEncoder-allocated arrays.
-//
-// We use this to distinguish "array-with-f64-bytes produced by
-// TextEncoder.encode" from "Uint8Array buffer-header with packed u8
-// bytes". Both may be registered in the buffer registry (so
-// `instanceof Uint8Array` returns true for the former), but their
-// decode read path is different.
-// ---------------------------------------------------------------------
-
-use std::cell::RefCell;
-use std::collections::HashSet;
-
-thread_local! {
-    static TEXT_ENCODER_RESULTS: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
-}
-
-fn remember_text_encoder_result(ptr: usize) {
-    TEXT_ENCODER_RESULTS.with(|s| s.borrow_mut().insert(ptr));
-}
-
-pub fn is_text_encoder_result(ptr: usize) -> bool {
-    TEXT_ENCODER_RESULTS.with(|s| s.borrow().contains(&ptr))
 }

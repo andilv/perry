@@ -113,26 +113,6 @@ unsafe fn bytes_from_jsvalue(bits: u64) -> Vec<u8> {
         return Vec::new();
     }
     if is_registered_buffer(raw) {
-        // TextEncoder produces an ArrayHeader registered in BUFFER_REGISTRY
-        // but the bytes are stored as f64 elements at offset 8 (so
-        // `instanceof Uint8Array` works while the decoder can recover the
-        // original UTF-8 bytes). Detect via the same side-table the
-        // decoder uses and unpack accordingly. Without this, reading
-        // `enc.encode("abc")` as packed u8 yields the first 3 bytes of
-        // each f64's IEEE-754 LE representation (all-zero high bytes for
-        // small ints) instead of the source bytes.
-        if perry_runtime::text::is_text_encoder_result(raw) {
-            let arr = raw as *const perry_runtime::ArrayHeader;
-            let len = (*arr).length as usize;
-            let elems = (arr as *const u8).add(std::mem::size_of::<perry_runtime::ArrayHeader>())
-                as *const f64;
-            let mut out = Vec::with_capacity(len);
-            for i in 0..len {
-                let d = *elems.add(i);
-                out.push((d as i64).clamp(0, 255) as u8);
-            }
-            return out;
-        }
         let buf = raw as *const BufferHeader;
         let len = (*buf).length as usize;
         return std::slice::from_raw_parts(buffer_payload(buf), len).to_vec();

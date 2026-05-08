@@ -74,11 +74,13 @@ pub(crate) fn refine_type_from_init(ctx: &FnCtx<'_>, init: &Expr) -> Option<HirT
         | Expr::ArrayValues { .. }
         | Expr::StringMatch { .. }
         | Expr::StringMatchAll { .. } => Some(HirType::Array(Box::new(HirType::Any))),
-        // TextEncoder.encode(str) — runtime returns an ArrayHeader whose
-        // f64 elements hold UTF-8 byte values. Refining the local type to
-        // Array(Number) lets `encoded.length` / `encoded[i]` hit the
-        // inline array fast paths instead of the dynamic-field fallback.
-        Expr::TextEncoderEncode(_) => Some(HirType::Array(Box::new(HirType::Number))),
+        // TextEncoder.encode(str) — runtime returns a BufferHeader with
+        // packed u8 bytes (same shape as `new Uint8Array([...])`). Refining
+        // the local type to Uint8Array lets `encoded[i]` route through the
+        // `Uint8ArrayGet` u8-load fast path. Pre-fix this was Array(Number)
+        // and the generic f64-stride indexing read 8 bytes-as-f64 instead
+        // of one byte (issue #584).
+        Expr::TextEncoderEncode(_) => Some(HirType::Named("Uint8Array".into())),
         // TextDecoder.decode(buf) always produces a string.
         Expr::TextDecoderDecode(_) => Some(HirType::String),
         // string.split(sep) → Array<string>
