@@ -1,0 +1,10 @@
+# Per-fixture run artifacts (regenerable on every fixture.sh invocation).
+# package-lock.json IS tracked — it pins exact dep versions for reproducibility.
+*/install.log
+*/perry-compile.log
+*/perry-run.log
+*/diff.log
+*/perry-out.txt
+*/node-out.txt
+*/out
+*/.last-skip
