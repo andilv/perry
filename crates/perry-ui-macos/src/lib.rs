@@ -2448,13 +2448,61 @@ pub extern "C" fn perry_ui_camera_set_on_tap(_handle: i64, _callback: f64) {}
 #[no_mangle]
 pub extern "C" fn perry_ui_show_toast(_msg_ptr: i64) {}
 
+/// `Text(content, id)` — 2-arg form that registers the created NSTextField
+/// with the per-id text registry so a later `state.set(...)` (which lowers
+/// to `js_state_set`) can find this widget and update its `setStringValue:`
+/// without needing the JS side to track the handle.
+///
+/// Pre-fix this stub created the widget but ignored `id_ptr` entirely, so
+/// `state.text()` (which desugars to `Text(initial, synth_id)` via
+/// `state_desugar.rs::state_text_call`) never landed in the registry —
+/// `state.set("AFTER UPDATE")` then fired `setText(synth_id, "AFTER UPDATE")`,
+/// the registry lookup missed, and the widget kept its initial text.
+/// Issue #599.
 #[no_mangle]
-pub extern "C" fn perry_ui_text_create_with_id(text_ptr: i64, _id_ptr: i64) -> i64 {
-    perry_ui_text_create(text_ptr)
+pub extern "C" fn perry_ui_text_create_with_id(text_ptr: i64, id_ptr: i64) -> i64 {
+    let handle = perry_ui_text_create(text_ptr);
+    if id_ptr != 0 {
+        unsafe {
+            let p = id_ptr as *const u8;
+            let header = p as *const crate::string_header::StringHeader;
+            let len = (*header).byte_len as usize;
+            let data = p.add(std::mem::size_of::<crate::string_header::StringHeader>());
+            widgets::text_registry::register_text_id_handler(handle, data, len);
+        }
+    }
+    handle
 }
 
+/// `setText(id, value)` — direct C-ABI entry point. The runtime's
+/// `js_state_set` pump routes through the registered cross-platform
+/// `set_text_handler` (see `app.rs::js_register_set_text_handler`), so
+/// most setText calls flow through that path. This direct shim covers
+/// the `import { setText } from "perry/ui"` user-code surface for
+/// completeness; it reads the StringHeaders and forwards to the same
+/// handler. Issue #599.
 #[no_mangle]
-pub extern "C" fn perry_ui_set_text(_id_ptr: i64, _value_ptr: i64) {}
+pub extern "C" fn perry_ui_set_text(id_ptr: i64, value_ptr: i64) {
+    if id_ptr == 0 {
+        return;
+    }
+    unsafe {
+        let ip = id_ptr as *const u8;
+        let id_header = ip as *const crate::string_header::StringHeader;
+        let id_len = (*id_header).byte_len as usize;
+        let id_data = ip.add(std::mem::size_of::<crate::string_header::StringHeader>());
+        let (val_data, val_len) = if value_ptr == 0 {
+            (std::ptr::null::<u8>(), 0usize)
+        } else {
+            let vp = value_ptr as *const u8;
+            let v_header = vp as *const crate::string_header::StringHeader;
+            let v_len = (*v_header).byte_len as usize;
+            let v_data = vp.add(std::mem::size_of::<crate::string_header::StringHeader>());
+            (v_data, v_len)
+        };
+        widgets::text_registry::set_text_handler(id_data, id_len, val_data, val_len);
+    }
+}
 
 // =============================================================================
 // perry/media — streaming media playback (issue #351). AVPlayer-backed.
