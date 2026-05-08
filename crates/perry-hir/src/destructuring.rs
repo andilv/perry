@@ -12,6 +12,80 @@ use crate::lower::{lower_expr, LoweringContext};
 use crate::lower_patterns::*;
 use crate::lower_types::*;
 
+/// True iff `e` contains an `ast::Expr::Arrow` or `ast::Expr::Fn` at
+/// any depth. Used by the let-decl pre-registration path (#593) to
+/// extend the issue-#461 self-recursion fix to indirect shapes —
+/// `const f = wrap(() => f())` (closure inside a Call), `const sub =
+/// subject.subscribe({ next: () => sub.unsubscribe() })` (closure
+/// inside an Object), `const h = handlers.map(b => () => h())[0]`
+/// (closure inside an Array+Member chain). The cost of a recursive
+/// scan over the init AST is negligible — every let-decl runs through
+/// it once at HIR lowering time.
+fn ast_expr_contains_function_expr(e: &ast::Expr) -> bool {
+    use ast::Expr;
+    match e {
+        Expr::Arrow(_) | Expr::Fn(_) => true,
+        Expr::Call(c) => {
+            (match &c.callee {
+                ast::Callee::Expr(e) => ast_expr_contains_function_expr(e),
+                _ => false,
+            }) || c.args.iter().any(|a| ast_expr_contains_function_expr(&a.expr))
+        }
+        Expr::New(n) => {
+            ast_expr_contains_function_expr(&n.callee)
+                || n.args.as_ref().map_or(false, |args| {
+                    args.iter().any(|a| ast_expr_contains_function_expr(&a.expr))
+                })
+        }
+        Expr::Member(m) => ast_expr_contains_function_expr(&m.obj),
+        Expr::Object(o) => o.props.iter().any(|p| match p {
+            ast::PropOrSpread::Spread(s) => ast_expr_contains_function_expr(&s.expr),
+            ast::PropOrSpread::Prop(p) => match &**p {
+                ast::Prop::KeyValue(kv) => ast_expr_contains_function_expr(&kv.value),
+                ast::Prop::Method(_) | ast::Prop::Getter(_) | ast::Prop::Setter(_) => true,
+                _ => false,
+            },
+        }),
+        Expr::Array(a) => a
+            .elems
+            .iter()
+            .filter_map(|e| e.as_ref())
+            .any(|e| ast_expr_contains_function_expr(&e.expr)),
+        Expr::Bin(b) => {
+            ast_expr_contains_function_expr(&b.left) || ast_expr_contains_function_expr(&b.right)
+        }
+        Expr::Unary(u) => ast_expr_contains_function_expr(&u.arg),
+        Expr::Cond(c) => {
+            ast_expr_contains_function_expr(&c.test)
+                || ast_expr_contains_function_expr(&c.cons)
+                || ast_expr_contains_function_expr(&c.alt)
+        }
+        Expr::Paren(p) => ast_expr_contains_function_expr(&p.expr),
+        Expr::TsAs(t) => ast_expr_contains_function_expr(&t.expr),
+        Expr::TsNonNull(t) => ast_expr_contains_function_expr(&t.expr),
+        Expr::TsTypeAssertion(t) => ast_expr_contains_function_expr(&t.expr),
+        Expr::TsSatisfies(t) => ast_expr_contains_function_expr(&t.expr),
+        Expr::Assign(a) => ast_expr_contains_function_expr(&a.right),
+        Expr::Seq(s) => s.exprs.iter().any(|e| ast_expr_contains_function_expr(e)),
+        Expr::Tpl(t) => t.exprs.iter().any(|e| ast_expr_contains_function_expr(e)),
+        Expr::TaggedTpl(t) => {
+            ast_expr_contains_function_expr(&t.tag)
+                || t.tpl
+                    .exprs
+                    .iter()
+                    .any(|e| ast_expr_contains_function_expr(e))
+        }
+        Expr::OptChain(o) => match &*o.base {
+            ast::OptChainBase::Member(m) => ast_expr_contains_function_expr(&m.obj),
+            ast::OptChainBase::Call(c) => {
+                ast_expr_contains_function_expr(&c.callee)
+                    || c.args.iter().any(|a| ast_expr_contains_function_expr(&a.expr))
+            }
+        },
+        _ => false,
+    }
+}
+
 pub(crate) fn lower_destructuring_assignment_stmt(
     ctx: &mut LoweringContext,
     pat: &ast::AssignTargetPat,
@@ -1845,10 +1919,23 @@ pub(crate) fn lower_var_decl_with_destructuring(
             // would silently turn a TDZ violation into a self-reference. For
             // closures, the body doesn't execute until call time, so the slot
             // holds the closure value by then.
+            // #593: extend the pre-registration to inits that *contain*
+            // an Arrow / Fn anywhere in their tree (e.g.
+            // `const off = ev.on(() => off())` — Call wrapping Arrow,
+            // `const sub = subject.subscribe({ next: () => sub.unsubscribe() })`
+            // — Object wrapping Arrow). The closure body is lowered in
+            // its own LoweringContext but reuses the parent's `locals`
+            // for outer-scope lookups (see `lower_arrow` /
+            // `lower_fn_expr`). Without pre-registration, the inner
+            // `off` / `sub` reference resolves to GlobalGet(0) and the
+            // self-recursive call no-ops at runtime.
             let is_function_expr_init = matches!(
                 decl.init.as_deref(),
                 Some(ast::Expr::Arrow(_)) | Some(ast::Expr::Fn(_))
-            );
+            ) || decl
+                .init
+                .as_deref()
+                .map_or(false, ast_expr_contains_function_expr);
             let pre_id = if is_function_expr_init
                 && !ctx.pre_registered_module_vars.contains(&name)
                 && ctx.lookup_local(&name).is_none()

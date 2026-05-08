@@ -376,6 +376,43 @@ fn collect_nested_closure_boxed_vars_in_expr(expr: &perry_hir::Expr, out: &mut H
 /// anywhere in the given statements. Used by `collect_boxed_vars` to
 /// exclude loop counters from the boxing set (they follow fresh-
 /// binding-per-iteration semantics under let scoping).
+/// True iff `init_expr` contains (at any depth) a Closure whose body
+/// references `let_id`. Used by `collect_self_recursive_closure_ids` to
+/// detect indirect self-capture shapes like
+/// `const off = ev.on(() => { off(); })` where the closure is wrapped
+/// inside a Call / New / Object / Array — not the simpler
+/// `let f = (n) => f(n-1)` direct-closure-literal init shape (#593).
+///
+/// We walk the init expression looking for any `Expr::Closure`
+/// descendant; when found, we collect every ref id from its body
+/// (including nested-closure refs, since `collect_ref_ids_in_stmts`
+/// recurses into them — see collectors.rs:862). A hit on `let_id`
+/// means the let must be boxed.
+fn init_expr_has_self_capturing_closure(init: &perry_hir::Expr, let_id: u32) -> bool {
+    use perry_hir::Expr;
+    let mut found = false;
+    walk_for_self_capturing_closure(init, let_id, &mut found);
+    found
+}
+
+fn walk_for_self_capturing_closure(e: &perry_hir::Expr, let_id: u32, found: &mut bool) {
+    use perry_hir::Expr;
+    if *found {
+        return;
+    }
+    if let Expr::Closure { body, .. } = e {
+        let mut refs: HashSet<u32> = HashSet::new();
+        collect_ref_ids_in_stmts(body, &mut refs);
+        if refs.contains(&let_id) {
+            *found = true;
+        }
+        return;
+    }
+    perry_hir::walker::walk_expr_children(e, &mut |child| {
+        walk_for_self_capturing_closure(child, let_id, found);
+    });
+}
+
 /// Detect the self-recursive closure pattern: `let fib = (n) => fib(n-1)`.
 /// When a Stmt::Let's Closure init captures the Let's own id, that id must
 /// be boxed so the closure body can read the live value instead of the
@@ -393,12 +430,30 @@ fn collect_self_recursive_closure_ids(
             ..
         } = s
         {
-            // Check if the init is a Closure whose body references
-            // this same id. We don't need to walk the full body —
-            // just check if the id is in the already-computed
-            // closure_refs set (which includes all ids referenced
-            // from any closure body in these stmts).
-            if matches!(init_expr, perry_hir::Expr::Closure { .. }) && closure_refs.contains(id) {
+            // Detect any closure inside the init expression that
+            // captures this let's own id. The classic case is
+            // `let f = (x) => f(x-1)` — direct closure init — but
+            // the same boxing requirement applies when the closure
+            // is one or more layers down inside the init: e.g.
+            //   `const off = ev.on(() => { off(); })`            (#593)
+            //   `const f = wrap({ cb: () => f() })`              (object literal)
+            //   `const g = builders.map(b => () => g())[0]`      (array literal)
+            // In every shape the closure captures `id` BEFORE the
+            // let's initial assignment runs, so without a box the
+            // capture stores the slot's pre-init value (undefined /
+            // 0) and the inner self-call no-ops at runtime. Boxing
+            // makes the closure capture the box pointer; the let's
+            // initial assignment then `js_box_set`s the value the
+            // closure reads.
+            if init_expr_has_self_capturing_closure(init_expr, *id) {
+                out.insert(*id);
+            } else if matches!(init_expr, perry_hir::Expr::Closure { .. })
+                && closure_refs.contains(id)
+            {
+                // Pre-existing direct-closure-literal arm — kept as a
+                // belt-and-suspenders fallback in case the
+                // walk-the-init detection above misses an edge shape
+                // (e.g. a future HIR variant that holds a Closure).
                 out.insert(*id);
             }
         }
