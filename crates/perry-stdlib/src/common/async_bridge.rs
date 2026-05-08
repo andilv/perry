@@ -14,10 +14,28 @@
 //! 3. The conversion callbacks run on the main thread during js_stdlib_process_pending
 
 use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use once_cell::sync::Lazy;
 use tokio::runtime::Runtime;
+
+/// Count of in-flight `perry_ffi_spawn_blocking[_with_reactor]` tasks
+/// dispatched by external native bindings (perry-ext-argon2 /
+/// -bcrypt / etc. via perry-ffi). Each spawn `fetch_add(1)`s before
+/// the closure runs; the closure-trampoline `fetch_sub(1)`s after it
+/// returns. `js_stdlib_has_active_handles` returns 1 while this
+/// counter is nonzero so the runtime's event loop keeps draining
+/// PENDING_RESOLUTIONS / PENDING_DEFERRED until the closure has
+/// queued its result.
+///
+/// Issue #591: without this counter, `await argon2.hash(pw)` returns
+/// a Promise whose resolution is queued from a tokio worker AFTER
+/// `main()` returns. The runtime saw zero active handles (no WS,
+/// net, readline) and exited before the resolution drained, so the
+/// `.then` / `await` never fired and the program ran past the await
+/// returning undefined.
+pub static EXT_BLOCKING_TASKS_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 /// Global tokio runtime for all async stdlib operations.
 /// Falls back to current-thread runtime if multi-thread fails (e.g. on iOS).
@@ -173,7 +191,8 @@ pub extern "C" fn js_stdlib_process_pending() -> i32 {
     // Process simple resolutions first
     {
         let mut pending = PENDING_RESOLUTIONS.lock().unwrap();
-        count += pending.len() as i32;
+        let n = pending.len();
+        count += n as i32;
 
         for resolution in pending.drain(..) {
             let promise_ptr = resolution.promise_ptr as *mut perry_runtime::Promise;
@@ -194,8 +213,8 @@ pub extern "C" fn js_stdlib_process_pending() -> i32 {
     // Process deferred resolutions - these run converter functions on the main thread
     {
         let mut pending = PENDING_DEFERRED.lock().unwrap();
-        let deferred_count = pending.len();
-        count += deferred_count as i32;
+        let n = pending.len();
+        count += n as i32;
 
         for resolution in pending.drain(..) {
             let promise_ptr = resolution.promise_ptr as *mut perry_runtime::Promise;
@@ -209,6 +228,7 @@ pub extern "C" fn js_stdlib_process_pending() -> i32 {
             }
         }
     }
+
 
     // Process pending WebSocket events (server/client listener callbacks)
     #[cfg(feature = "websocket")]
@@ -269,6 +289,14 @@ pub extern "C" fn js_stdlib_process_pending() -> i32 {
 /// Registered with perry-runtime via js_register_stdlib_has_active()
 /// so the runtime's trampoline calls this when perry-stdlib is linked.
 pub extern "C" fn js_stdlib_has_active_handles() -> i32 {
+    // External wrapper crates (perry-ext-argon2, -bcrypt, …) dispatch
+    // their CPU-bound work through `perry_ffi_spawn_blocking`. Until
+    // the closure has run + queued its result, the awaiter's Promise
+    // is pending but invisible to the rest of the gate (no entry in
+    // PENDING_RESOLUTIONS yet). Issue #591.
+    if EXT_BLOCKING_TASKS_INFLIGHT.load(Ordering::Acquire) != 0 {
+        return 1;
+    }
     // Check for pending stdlib resolutions
     {
         let pending = PENDING_RESOLUTIONS.lock().unwrap();

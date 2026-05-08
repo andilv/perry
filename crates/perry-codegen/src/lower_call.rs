@@ -6811,13 +6811,17 @@ const NATIVE_MODULE_TABLE: &[NativeModSig] = &[
         ret: NR_PTR,
     },
     // ========== argon2 ==========
+    // Runtime FFI signatures take `*const StringHeader`, NOT NaN-boxed f64.
+    // NA_STR routes through `js_get_string_pointer_unified` to extract the
+    // raw pointer; NA_F64 would pass the f64 in d0 while the callee reads
+    // x0 → null/garbage StringHeader → "Invalid password" (#591).
     NativeModSig {
         module: "argon2",
         has_receiver: false,
         method: "hash",
         class_filter: None,
         runtime: "js_argon2_hash",
-        args: &[NA_F64],
+        args: &[NA_STR],
         ret: NR_PTR,
     },
     NativeModSig {
@@ -6826,17 +6830,20 @@ const NATIVE_MODULE_TABLE: &[NativeModSig] = &[
         method: "verify",
         class_filter: None,
         runtime: "js_argon2_verify",
-        args: &[NA_F64, NA_F64],
+        args: &[NA_STR, NA_STR],
         ret: NR_PTR,
     },
     // ========== bcrypt ==========
+    // Same ABI rule as argon2 above: password / hash args are
+    // `*const StringHeader`. The salt-rounds arg of bcrypt.hash is a
+    // genuine f64 number and stays NA_F64.
     NativeModSig {
         module: "bcrypt",
         has_receiver: false,
         method: "hash",
         class_filter: None,
         runtime: "js_bcrypt_hash",
-        args: &[NA_F64, NA_F64],
+        args: &[NA_STR, NA_F64],
         ret: NR_PTR,
     },
     NativeModSig {
@@ -6845,7 +6852,7 @@ const NATIVE_MODULE_TABLE: &[NativeModSig] = &[
         method: "compare",
         class_filter: None,
         runtime: "js_bcrypt_compare",
-        args: &[NA_F64, NA_F64],
+        args: &[NA_STR, NA_STR],
         ret: NR_PTR,
     },
     // ========== perry/thread (parallelMap, parallelFilter, spawn) ==========

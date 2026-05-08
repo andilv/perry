@@ -59,6 +59,20 @@ thread_local! {
         = const { RefCell::new(std::collections::VecDeque::new()) };
 }
 
+/// Returns 1 iff the current thread's microtask queue has at least one
+/// pending entry, 0 otherwise. Used by the codegen-emitted event-loop
+/// active-handle check (#591) so the loop doesn't exit while a chained
+/// `.then(...)` callback is waiting in the queue. Without this, an
+/// `await` driven by perry-stdlib's `js_stdlib_process_pending`
+/// resolution path could push a continuation to TASK_QUEUE in the
+/// SAME body iteration that flips the active-handle counter to zero;
+/// the next header check would then exit before the next body's
+/// microtask drain runs.
+#[no_mangle]
+pub extern "C" fn js_microtasks_pending() -> i32 {
+    TASK_QUEUE.with(|q| if q.borrow().is_empty() { 0 } else { 1 })
+}
+
 /// Allocate a new Promise
 #[no_mangle]
 pub extern "C" fn js_promise_new() -> *mut Promise {

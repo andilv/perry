@@ -987,6 +987,12 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // Stdlib has-active-handles — returns 1 if WS servers, pending
     // HTTP events, etc. need the loop to keep running.
     module.declare_function("js_stdlib_has_active_handles", I32, &[]);
+    // #591: returns 1 iff perry-runtime's per-thread microtask
+    // TASK_QUEUE has a pending entry. The codegen-emitted event-loop
+    // header check ORs this in so the loop doesn't exit between the
+    // body iteration that queues a chained `.then` callback and the
+    // next body iteration's microtask drain.
+    module.declare_function("js_microtasks_pending", I32, &[]);
     module.declare_function("js_set_timeout_callback", I64, &[I64, DOUBLE]);
     module.declare_function("setInterval", I64, &[I64, DOUBLE]);
     module.declare_function("clearTimeout", VOID, &[I64]);
