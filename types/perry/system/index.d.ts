@@ -216,6 +216,23 @@ export function audioStopRecording(): void;
 // Other targets (tvOS / watchOS / visionOS / GTK4 / Windows / Web): no-op
 //          stubs — `geolocationGetCurrent` invokes `onError` immediately with
 //          `"unsupported-platform"`.
+//
+// Required manifest entries — the OS denies the permission silently when these
+// are missing.
+//
+//   iOS Info.plist:
+//     <key>NSLocationWhenInUseUsageDescription</key>
+//     <string>Used to find items near you.</string>
+//
+//   Android AndroidManifest.xml (inside <manifest>, not <application>):
+//     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+//     <!-- Optional coarse fallback for users who deny precise: -->
+//     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+//
+// Photo-library picker (`imagePickerPick`) needs NO manifest entries: iOS
+// PHPickerViewController is sandboxed and Android's ACTION_PICK_IMAGES /
+// ACTION_GET_CONTENT both run out-of-process. Image compression (`sharp` from
+// perry-stdlib / perry-ext-sharp) is pure userspace and also needs nothing.
 // -----------------------------------------------------------------------------
 
 /**

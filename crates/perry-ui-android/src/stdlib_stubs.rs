@@ -1,7 +1,10 @@
 //! No-op stubs for perry-stdlib symbols.
-//! Perry-stdlib can't be cross-compiled for Android (OpenSSL dependency).
-//! These stubs satisfy the linker; the actual functions are never called
-//! because the Pry app doesn't import any stdlib-dependent modules.
+//! perry-stdlib is not bundled into libperry_ui_android.a; this file exists so
+//! the linker can resolve `js_*` references emitted unconditionally by
+//! codegen for stdlib-dependent FFIs that the app doesn't actually call.
+//! Anything that needs a real Android impl gets force-linked from a smaller
+//! standalone crate via `extern crate` in lib.rs (see `extern crate
+//! perry_ext_sharp` for the issue #552 image-compression path).
 
 // Symbols now provided by perry-runtime (removed from here to avoid duplicates):
 // js_stdlib_init_dispatch, js_stdlib_process_pending (perry-runtime/stdlib_stubs.rs)
@@ -1403,62 +1406,12 @@ pub extern "C" fn js_runtime_init() -> i64 {
 pub extern "C" fn js_set_property() -> i64 {
     0
 }
-#[no_mangle]
-pub extern "C" fn js_sharp_blur() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_sharp_flip() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_sharp_flop() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_sharp_from_buffer() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_sharp_from_file() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_sharp_grayscale() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_sharp_metadata() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_sharp_negate() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_sharp_quality() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_sharp_resize() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_sharp_rotate() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_sharp_to_buffer() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_sharp_to_file() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_sharp_to_format() -> i64 {
-    0
-}
+// Issue #552: js_sharp_* symbols (blur / flip / flop / from_buffer / from_file
+// / grayscale / metadata / resize / rotate / to_buffer / to_file) now provided
+// by perry-ext-sharp via the `extern crate` reference in lib.rs.
+// js_sharp_negate / js_sharp_quality / js_sharp_to_format remain as no-op
+// stubs in perry-runtime/src/closure.rs (those three FFIs were never wired in
+// either perry-stdlib or perry-ext-sharp).
 #[no_mangle]
 pub extern "C" fn js_slugify() -> i64 {
     0
