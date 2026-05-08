@@ -4337,6 +4337,39 @@ pub(super) fn lower_call(ctx: &mut LoweringContext, call: &ast::CallExpr) -> Res
                                     callback: Box::new(cb),
                                 });
                             }
+                            // #597: arr.entries() / .keys() / .values() on
+                            // any-typed receivers (`function f(arr: any) { for (const [i,v] of arr.entries()) ... }`).
+                            // Pre-fix this fell through to a generic
+                            // `js_native_call_method` dispatch that returned
+                            // an iterator-shaped object whose `.length` was
+                            // 0 / undefined, so the index-based for-of loop
+                            // (the index lowering at lower_decl.rs:4445)
+                            // saw `__arr_N.length === 0` and ran 0 times.
+                            // The static-Array path already folds at
+                            // line 3966 above; this catch-all extends the
+                            // same fold to dynamic-receiver shapes —
+                            // `js_array_entries` / `_keys` / `_values`
+                            // tolerates non-array receivers (returns empty)
+                            // so the lowered loop's behavior on non-array
+                            // values matches Node's empty-iterator semantics.
+                            // recv_is_class gating preserves user classes
+                            // that happen to expose an `entries` method.
+                            // Drizzle's `dialect.buildInsertQuery` uses
+                            // `for (const [valueIndex, value] of values.entries())`
+                            // where `values` arrives via destructuring of an
+                            // any-typed function param.
+                            "entries" if args.is_empty() && !recv_is_class => {
+                                let array_expr = lower_expr(ctx, &member.obj)?;
+                                return Ok(Expr::ArrayEntries(Box::new(array_expr)));
+                            }
+                            "keys" if args.is_empty() && !recv_is_class => {
+                                let array_expr = lower_expr(ctx, &member.obj)?;
+                                return Ok(Expr::ArrayKeys(Box::new(array_expr)));
+                            }
+                            "values" if args.is_empty() && !recv_is_class => {
+                                let array_expr = lower_expr(ctx, &member.obj)?;
+                                return Ok(Expr::ArrayValues(Box::new(array_expr)));
+                            }
                             "sort" if !args.is_empty() => {
                                 let array_expr = lower_expr(ctx, &member.obj)?;
                                 return Ok(Expr::ArraySort {
