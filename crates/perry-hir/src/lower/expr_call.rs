@@ -759,34 +759,64 @@ pub(super) fn lower_call(ctx: &mut LoweringContext, call: &ast::CallExpr) -> Res
                                     let obj = args.first().cloned().unwrap_or(Expr::Undefined);
                                     return Ok(Expr::ObjectEntries(Box::new(obj)));
                                 }
-                                // Object.assign(target, src1, src2, ...) - treat as object spread
-                                // Each non-object arg is spread; object literal args are inlined
+                                // Object.assign(target, ...sources) — per ECMAScript spec, this
+                                // MUTATES target with each source's own enumerable string-keyed
+                                // and Symbol-keyed properties, and RETURNS target (preserving
+                                // identity, class_id, and the SYMBOL_PROPERTIES side-table).
+                                // Refs #590: the previous lowering folded the call into
+                                // ObjectSpread which allocates a fresh object — that breaks
+                                // `result === target` and orphans target's symbol-keyed
+                                // properties since the side table is keyed by raw pointer.
+                                //
+                                // Special case: no target at all (`Object.assign()`) is
+                                // a TypeError per spec; we coerce to an empty object literal.
+                                // Special case: `Object.assign({}, ...)` with a fresh empty
+                                // object-literal target — the user is explicitly asking for
+                                // a fresh object, so we keep the old ObjectSpread path
+                                // (matches `{...src1, ...src2}` semantics, no observable
+                                // difference and avoids regressing the no-spread fold below).
                                 "assign" => {
-                                    let mut parts: Vec<(Option<String>, Expr)> = Vec::new();
-                                    for arg in &args {
-                                        match arg {
-                                            Expr::Object(props) => {
-                                                // Inline object literal props as static key-value pairs
-                                                for (key, val) in props {
-                                                    parts.push((Some(key.clone()), val.clone()));
+                                    if args.is_empty() {
+                                        return Ok(Expr::Object(Vec::new()));
+                                    }
+                                    let mut iter = args.into_iter();
+                                    let target = iter.next().unwrap();
+                                    let sources: Vec<Expr> = iter.collect();
+                                    // `Object.assign({}, ...sources)` — fresh empty object as
+                                    // target. Preserve the literal-friendly fast paths
+                                    // (no_spread fold to plain Object, otherwise ObjectSpread)
+                                    // since there's no pre-existing identity / class_id to
+                                    // preserve and downstream codegen has more aggressive
+                                    // inlining for these shapes.
+                                    if matches!(&target, Expr::Object(props) if props.is_empty()) {
+                                        let mut parts: Vec<(Option<String>, Expr)> = Vec::new();
+                                        for arg in &sources {
+                                            match arg {
+                                                Expr::Object(props) => {
+                                                    for (key, val) in props {
+                                                        parts.push((Some(key.clone()), val.clone()));
+                                                    }
+                                                }
+                                                _ => {
+                                                    parts.push((None, arg.clone()));
                                                 }
                                             }
-                                            _ => {
-                                                // Spread non-object expression
-                                                parts.push((None, arg.clone()));
-                                            }
                                         }
+                                        let has_spread = parts.iter().any(|(k, _)| k.is_none());
+                                        if !has_spread {
+                                            let static_props: Vec<(String, Expr)> = parts
+                                                .into_iter()
+                                                .filter_map(|(k, v)| k.map(|key| (key, v)))
+                                                .collect();
+                                            return Ok(Expr::Object(static_props));
+                                        }
+                                        return Ok(Expr::ObjectSpread { parts });
                                     }
-                                    // If no spreads and only static props, return plain Object
-                                    let has_spread = parts.iter().any(|(k, _)| k.is_none());
-                                    if !has_spread {
-                                        let static_props: Vec<(String, Expr)> = parts
-                                            .into_iter()
-                                            .filter_map(|(k, v)| k.map(|key| (key, v)))
-                                            .collect();
-                                        return Ok(Expr::Object(static_props));
-                                    }
-                                    return Ok(Expr::ObjectSpread { parts });
+                                    // Real `Object.assign(target, ...sources)` — mutate target.
+                                    return Ok(Expr::ObjectAssign {
+                                        target: Box::new(target),
+                                        sources,
+                                    });
                                 }
                                 "fromEntries" => {
                                     let entries =

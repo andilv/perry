@@ -878,6 +878,15 @@ pub enum Expr {
         parts: Vec<(Option<String>, Expr)>,
     },
 
+    // `Object.assign(target, ...sources)` — distinct from ObjectSpread because
+    // the spec mutates `target` and returns it (preserving identity, class_id,
+    // and the SYMBOL_PROPERTIES side-table entries). ObjectSpread allocates a
+    // fresh object, which is wrong for `Object.assign` per #590.
+    ObjectAssign {
+        target: Box<Expr>,
+        sources: Vec<Expr>,
+    },
+
     // Array literal
     Array(Vec<Expr>),
 

@@ -1903,6 +1903,94 @@ pub unsafe extern "C" fn js_object_copy_own_fields(dst_i64: i64, src_f64: f64) {
     }
 }
 
+/// `Object.assign(target, source)` for a single source: mutate `target` by
+/// copying every own enumerable string-keyed AND symbol-keyed property from
+/// `source`, returning `target`. Both args are NaN-boxed JSValues; the return
+/// is `target` unchanged so the caller can chain successive sources and the
+/// final returned value is the same pointer the user passed in (preserving
+/// object identity, class_id, and the existing entries in the SYMBOL_PROPERTIES
+/// side table — the bug from #590 was that the previous lowering allocated a
+/// fresh object, breaking `result === target` and orphaning target's
+/// symbol-keyed properties since the side table is keyed by raw pointer).
+///
+/// Per spec, undefined/null target throws TypeError; here we silently no-op
+/// to match the rest of perry-runtime's permissive style. Non-object sources
+/// are skipped (matching `Object.assign(t, null)` / `Object.assign(t, 5)`
+/// which are spec-allowed).
+#[no_mangle]
+pub unsafe extern "C" fn js_object_assign_one(target_f64: f64, source_f64: f64) -> f64 {
+    const POINTER_TAG_LOCAL: u64 = 0x7FFD_0000_0000_0000;
+    const POINTER_MASK_LOCAL: u64 = 0x0000_FFFF_FFFF_FFFF;
+
+    // Decode target pointer. Accept either NaN-boxed POINTER_TAG or a raw
+    // pointer value (defensive: callers occasionally pass i64-typed handles).
+    let tgt_bits = target_f64.to_bits();
+    let tgt_top16 = tgt_bits >> 48;
+    let tgt_raw = if tgt_top16 >= 0x7FF8 {
+        if tgt_top16 == 0x7FFC {
+            // undefined/null/bool — spec says throw TypeError; silently return.
+            return target_f64;
+        }
+        (tgt_bits & POINTER_MASK_LOCAL) as usize
+    } else {
+        tgt_bits as usize
+    };
+    if tgt_raw < 0x10000 {
+        return target_f64;
+    }
+
+    // Decode source pointer. Skip null/undefined/non-pointer sources.
+    let src_bits = source_f64.to_bits();
+    let src_top16 = src_bits >> 48;
+    let src_raw = if src_top16 >= 0x7FF8 {
+        if src_top16 == 0x7FFC {
+            return target_f64;
+        }
+        (src_bits & POINTER_MASK_LOCAL) as usize
+    } else {
+        src_bits as usize
+    };
+    if src_raw < 0x10000 || src_raw == tgt_raw {
+        return target_f64;
+    }
+
+    let target = tgt_raw as *mut ObjectHeader;
+    let src = src_raw as *const ObjectHeader;
+
+    // 1) Copy own string-keyed enumerable properties from source to target,
+    //    in source insertion order. Mirrors `js_object_copy_own_fields`.
+    let src_keys = (*src).keys_array;
+    if !src_keys.is_null() && (src_keys as usize) >= 0x10000 {
+        let key_count = crate::array::js_array_length(src_keys) as usize;
+        let src_field_count = (*src).field_count as usize;
+        let header_size = std::mem::size_of::<ObjectHeader>();
+        let src_fields = (src as *const u8).add(header_size) as *const u64;
+        for i in 0..key_count.min(src_field_count) {
+            let key_val = crate::array::js_array_get(src_keys, i as u32);
+            if !key_val.is_string() {
+                continue;
+            }
+            let key_ptr = key_val.as_string_ptr();
+            let field_bits = *src_fields.add(i);
+            let field_f64 = f64::from_bits(field_bits);
+            js_object_set_field_by_name(target, key_ptr, field_f64);
+        }
+    }
+
+    // 2) Copy own symbol-keyed enumerable properties from source to target.
+    //    The clone-then-iterate dance is non-negotiable — the inner
+    //    `js_object_set_symbol_property` re-acquires SYMBOL_PROPERTIES'
+    //    Mutex; holding the lock across the iteration would deadlock.
+    let entries = crate::symbol::clone_symbol_entries_for_obj_ptr(src_raw);
+    for (sym_ptr, value_bits) in entries {
+        let sym_f64 = f64::from_bits(POINTER_TAG_LOCAL | (sym_ptr as u64 & POINTER_MASK_LOCAL));
+        let value_f64 = f64::from_bits(value_bits);
+        crate::symbol::js_object_set_symbol_property(target_f64, sym_f64, value_f64);
+    }
+
+    target_f64
+}
+
 /// Get a field from an object by index
 #[no_mangle]
 pub extern "C" fn js_object_get_field(obj: *const ObjectHeader, field_index: u32) -> JSValue {

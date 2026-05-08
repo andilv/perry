@@ -374,6 +374,23 @@ pub unsafe extern "C" fn js_symbol_to_string(sym_f64: f64) -> i64 {
     js_string_from_bytes(rendered.as_ptr(), rendered.len() as u32) as i64
 }
 
+/// Snapshot the symbol-keyed properties of `src_obj_ptr` (raw object pointer,
+/// NOT NaN-boxed). Returns a freshly cloned `Vec<(sym_ptr, value_bits)>` so
+/// callers can iterate without holding the SYMBOL_PROPERTIES lock — important
+/// when each iteration may itself need to take the same lock (e.g.
+/// `Object.assign(target, source)` re-entering `js_object_set_symbol_property`).
+pub(crate) fn clone_symbol_entries_for_obj_ptr(src_obj_ptr: usize) -> Vec<(usize, u64)> {
+    if src_obj_ptr == 0 {
+        return Vec::new();
+    }
+    let guard = SYMBOL_PROPERTIES.lock().unwrap();
+    guard
+        .as_ref()
+        .and_then(|m| m.get(&src_obj_ptr))
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// Extract the raw object pointer from a NaN-boxed JSValue. Returns 0 if the
 /// value isn't a pointer-tagged object (and 0 is also a valid "no entries"
 /// sentinel for the side table).

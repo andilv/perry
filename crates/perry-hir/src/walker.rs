@@ -535,6 +535,12 @@ where
                 f(v);
             }
         }
+        Expr::ObjectAssign { target, sources } => {
+            f(target);
+            for s in sources {
+                f(s);
+            }
+        }
         Expr::I18nString { params, .. } => {
             for (_, v) in params {
                 f(v);
@@ -1647,6 +1653,12 @@ where
         Expr::ObjectSpread { parts } => {
             for (_, v) in parts {
                 f(v);
+            }
+        }
+        Expr::ObjectAssign { target, sources } => {
+            f(target);
+            for s in sources {
+                f(s);
             }
         }
         Expr::I18nString { params, .. } => {

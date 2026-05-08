@@ -5348,6 +5348,38 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             Ok(nanbox_pointer_inline(ctx.block(), &obj_handle))
         }
 
+        // -------- Object.assign(target, ...sources) --------
+        // Per ECMAScript spec, Object.assign mutates `target` by copying each
+        // source's own enumerable string- and Symbol-keyed properties, and
+        // returns `target` (same identity, class_id, and side-table state
+        // preserved). The runtime helper `js_object_assign_one(t, s)` does
+        // both copies for one source and returns t. We chain the calls so
+        // `target` is evaluated exactly once and threaded through each source.
+        // Refs #590.
+        Expr::ObjectAssign { target, sources } => {
+            let target_box = lower_expr(ctx, target)?;
+            // Stash target in a temp slot if there are multiple sources, so
+            // each helper call uses the same SSA value (defensive: helper
+            // returns target_f64 unchanged, but the chain is clearer when we
+            // pass target_box explicitly each time — and side-step any LLVM
+            // SSA reordering quirks). With zero sources, we still want to
+            // return target itself (matching `Object.assign(t)` which is a
+            // valid no-op-and-return-target form).
+            if sources.is_empty() {
+                return Ok(target_box);
+            }
+            let mut acc = target_box;
+            for src in sources {
+                let src_box = lower_expr(ctx, src)?;
+                acc = ctx.block().call(
+                    DOUBLE,
+                    "js_object_assign_one",
+                    &[(DOUBLE, &acc), (DOUBLE, &src_box)],
+                );
+            }
+            Ok(acc)
+        }
+
         // -------- new Set(iter) --------
         // Fix #421 (v0.5.574): route through js_set_from_iterable so
         // string inputs (`new Set("abc")`) iterate codepoints instead of
