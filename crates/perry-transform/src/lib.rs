@@ -8,6 +8,7 @@
 
 pub mod async_to_generator;
 pub mod closure;
+pub mod deforest;
 pub mod finally_inline;
 pub mod generator;
 pub mod i18n;

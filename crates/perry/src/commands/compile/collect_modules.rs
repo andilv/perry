@@ -634,6 +634,13 @@ pub(super) fn collect_modules(
                 extra_anon_classes.entry(k).or_insert(v);
             }
         }
+        // Interprocedural deforestation. Runs BEFORE inline_functions
+        // so the inliner sees deforested signatures (the rewritten
+        // function takes an accumulator param; inlined call sites then
+        // already use the new shape). Intra-module only — see
+        // `deforest::run` doc-comment for limitations and the manual
+        // ABC451D validation.
+        perry_transform::deforest::run(&mut hir_module);
         inline_functions(
             &mut hir_module,
             &extra_methods,
