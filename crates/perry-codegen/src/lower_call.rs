@@ -3153,22 +3153,52 @@ pub(crate) fn lower_new(ctx: &mut FnCtx<'_>, class_name: &str, args: &[Expr]) ->
     ctx.this_stack.push(this_slot);
     ctx.class_stack.push(class_name.to_string());
 
-    // Apply ANCESTOR field initializers first — they need to be in place
-    // before any parent ctor body runs (parent body may reference its own
-    // declared fields). The leaf class's OWN field initializers are applied
-    // AFTER the parent body completes, because they may read state set by
-    // the parent body (e.g. drizzle's `class PgText extends PgColumn {
-    // enumValues = this.config.enumValues }` — PgColumn's body chain sets
-    // `this.config = config` via super → Column ctor; PgText's field init
-    // must run after that). Refs #420.
+    // Apply ANCESTOR field initializers — refs #420 / #631-followup.
     //
-    // For the own-ctor case (class has its own ctor body), the leaf's own
-    // fields are applied at the SuperCall site after parent body inlined
-    // (see expr.rs Expr::SuperCall handling). For the no-own-ctor case,
-    // they're applied here after the inherited body inline (below).
-    apply_field_initializers_recursive(ctx, class_name, FieldInitMode::AncestorsOnly)?;
+    // For the own-ctor case (class has its own ctor body): apply ALL
+    // ancestors up-front so the parent body's first read of any inherited
+    // field sees the right initial value. The leaf's own fields are
+    // applied at the SuperCall site (see expr.rs Expr::SuperCall).
+    //
+    // For the no-own-ctor case: only apply fields up to and INCLUDING
+    // the inherited-ctor class. Intermediate classes between the
+    // inherited-ctor and the leaf (e.g. SQLiteBaseInteger between
+    // SQLiteColumn and SQLiteInteger in drizzle) have their fields
+    // applied AFTER the inherited-ctor body returns, because their
+    // initializers may reference state set by the parent body (e.g.
+    // SQLiteBaseInteger's `autoIncrement = this.config.autoIncrement`
+    // depends on Column's body running `this.config = config` first).
     let has_own_ctor = class.constructor.is_some();
     let has_extends = class.extends_name.is_some();
+    let inherited_ctor_class: Option<String> = if !has_own_ctor && has_extends {
+        // Walk the inheritance chain to find the closest ancestor with
+        // an explicit ctor — same logic as the body-inlining loop below.
+        let mut walker = class.extends_name.as_deref();
+        let mut found: Option<String> = None;
+        while let Some(pname) = walker {
+            if let Some(parent_class) = ctx.classes.get(pname).copied() {
+                if parent_class.constructor.is_some() {
+                    found = Some(pname.to_string());
+                    break;
+                }
+                walker = parent_class.extends_name.as_deref();
+            } else {
+                break;
+            }
+        }
+        found
+    } else {
+        None
+    };
+    if let Some(stop_at) = inherited_ctor_class.clone() {
+        apply_field_initializers_recursive(
+            ctx,
+            class_name,
+            FieldInitMode::UpToInclusive(stop_at),
+        )?;
+    } else {
+        apply_field_initializers_recursive(ctx, class_name, FieldInitMode::AncestorsOnly)?;
+    }
     if !has_extends {
         // Base class — no super(), apply own fields now (before body).
         apply_field_initializers_recursive(ctx, class_name, FieldInitMode::SelfOnly)?;
@@ -3443,8 +3473,24 @@ pub(crate) fn lower_new(ctx: &mut FnCtx<'_>, class_name: &str, args: &[Expr]) ->
     // at the SuperCall site inside the body. For the no-own-ctor case and
     // for classes with no extends (already applied above), we skip here.
     // Refs #420 (drizzle's PgText.enumValues = this.config.enumValues).
+    //
+    // Issue #631-followup: also apply intermediate-class fields between
+    // the inherited-ctor class (exclusive) and the leaf (inclusive). Per
+    // ECMAScript spec, each default-ctor class's field initializers run
+    // immediately after that class's super() call returns. For drizzle's
+    // SQLiteInteger ← SQLiteBaseInteger ← SQLiteColumn ← Column chain,
+    // SQLiteBaseInteger's `autoIncrement = this.config.autoIncrement`
+    // must run AFTER Column's body sets `this.config`.
     if !has_own_ctor && has_extends {
-        apply_field_initializers_recursive(ctx, class_name, FieldInitMode::SelfOnly)?;
+        if let Some(stop_at) = inherited_ctor_class {
+            apply_field_initializers_recursive(
+                ctx,
+                class_name,
+                FieldInitMode::BetweenExclusiveTo(stop_at),
+            )?;
+        } else {
+            apply_field_initializers_recursive(ctx, class_name, FieldInitMode::SelfOnly)?;
+        }
     }
 
     ctx.this_stack.pop();
@@ -3468,7 +3514,7 @@ pub(crate) fn apply_field_initializers_recursive_pub(
     apply_field_initializers_recursive(ctx, class_name, FieldInitMode::All)
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FieldInitMode {
     /// Apply field initializers for the entire chain root → leaf.
     All,
@@ -3480,6 +3526,19 @@ pub(crate) enum FieldInitMode {
     /// which may reference state set by the parent body (e.g.
     /// `enumValues = this.config.enumValues` in drizzle's PgText). Refs #420.
     SelfOnly,
+    /// Issue #631-followup: apply fields for the chain root → `stop_at`
+    /// (inclusive). Used in the no-own-ctor path BEFORE the inherited-
+    /// ctor body runs, so only the inherited-ctor class's chain has its
+    /// fields set up. Intermediate classes between `stop_at` and the leaf
+    /// (e.g. SQLiteBaseInteger between SQLiteColumn and SQLiteInteger)
+    /// have their fields applied AFTER the inherited-ctor body, via
+    /// `BetweenExclusiveTo`.
+    UpToInclusive(String),
+    /// Apply fields for chain (`stop_at` exclusive) → leaf (inclusive).
+    /// Mirror of `UpToInclusive` for the post-body chain. Skips
+    /// `stop_at` itself because that class's SelfOnly fields are
+    /// applied via the SuperCall site inside the inlined body.
+    BetweenExclusiveTo(String),
 }
 
 pub(crate) fn apply_field_initializers_recursive(
@@ -3503,18 +3562,52 @@ pub(crate) fn apply_field_initializers_recursive(
     //   All: keep entire chain
     //   AncestorsOnly: drop the leaf (last entry)
     //   SelfOnly: keep only the leaf
-    let chain: Vec<String> = match mode {
+    //   UpToInclusive(stop_at): keep chain[0..=index_of(stop_at)]
+    //   BetweenExclusiveTo(stop_at): keep chain[index_of(stop_at)+1..]
+    let chain: Vec<String> = match &mode {
         FieldInitMode::All => chain,
         FieldInitMode::AncestorsOnly => {
+            // Issue #631-followup: keep only the ROOT class's fields.
+            // Per ECMAScript spec, derived-class field initializers run
+            // AFTER super() returns (so they may depend on parent body
+            // state, e.g. drizzle's `class SQLiteBaseInteger extends
+            // SQLiteColumn { autoIncrement = this.config.autoIncrement }`
+            // — `this.config` is set by Column's body two levels up).
+            // Pre-#631 this kept all-ancestors-but-leaf which incorrectly
+            // ran SQLiteBaseInteger's init before Column's body.
+            //
+            // Each intermediate class's fields are applied via the
+            // SuperCall site (`expr.rs::Expr::SuperCall`'s post-body
+            // intermediate-walk added in this commit). Root's fields
+            // need to be applied here because root has no super() and
+            // its body may reference its own fields directly.
             if chain.len() <= 1 {
                 Vec::new()
             } else {
-                chain[..chain.len() - 1].to_vec()
+                vec![chain[0].clone()]
             }
         }
         FieldInitMode::SelfOnly => {
             if let Some(last) = chain.last().cloned() {
                 vec![last]
+            } else {
+                Vec::new()
+            }
+        }
+        FieldInitMode::UpToInclusive(stop_at) => {
+            if let Some(idx) = chain.iter().position(|n| n == stop_at) {
+                chain[..=idx].to_vec()
+            } else {
+                Vec::new()
+            }
+        }
+        FieldInitMode::BetweenExclusiveTo(stop_at) => {
+            if let Some(idx) = chain.iter().position(|n| n == stop_at) {
+                if idx + 1 < chain.len() {
+                    chain[idx + 1..].to_vec()
+                } else {
+                    Vec::new()
+                }
             } else {
                 Vec::new()
             }

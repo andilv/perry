@@ -4769,7 +4769,7 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     ctx.local_types.insert(param.id, param.ty.clone());
                 }
 
-                ctx.class_stack.push(effective_parent_name);
+                ctx.class_stack.push(effective_parent_name.clone());
                 crate::stmt::lower_stmts(ctx, &parent_ctor.body)?;
                 ctx.class_stack.pop();
 
@@ -4896,10 +4896,41 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             }
 
             // After the parent body has run (which may have set `this.config`
-            // etc.), apply the CURRENT class's own field initializers — they
-            // may reference state set by the parent body. Per JS spec, field
-            // inits run immediately after super() returns. Refs #420
-            // (drizzle's PgText.enumValues = this.config.enumValues).
+            // etc.), apply field initializers for each class between
+            // `effective_parent_name` (exclusive) and `current_class_name`
+            // (inclusive). Per JS spec each default-ctor class's field
+            // inits run immediately after that class's super() returns.
+            // For drizzle's `SQLiteInteger ← SQLiteBaseInteger ← SQLiteColumn`,
+            // walking up from SuperCall in SQLiteInteger finds the
+            // inherited ctor at SQLiteColumn (effective_parent_name);
+            // SQLiteBaseInteger (intermediate, no ctor) has fields
+            // `autoIncrement = this.config.autoIncrement` that must run
+            // after SQLiteColumn's body sets `this.config`. Refs #631.
+            //
+            // Walk parent → ... → effective_parent_name (exclusive),
+            // collect intermediate names. Apply SelfOnly for each in
+            // root-most-first order, then for current_class_name.
+            let mut intermediates: Vec<String> = Vec::new();
+            let mut walker = current_class.extends_name.as_deref().map(|s| s.to_string());
+            while let Some(pname) = walker {
+                if pname == effective_parent_name {
+                    break;
+                }
+                intermediates.push(pname.clone());
+                walker = ctx
+                    .classes
+                    .get(&pname)
+                    .and_then(|c| c.extends_name.as_deref().map(|s| s.to_string()));
+            }
+            // Root-most intermediate first (reverse insertion order).
+            intermediates.reverse();
+            for inter in &intermediates {
+                crate::lower_call::apply_field_initializers_recursive(
+                    ctx,
+                    inter,
+                    crate::lower_call::FieldInitMode::SelfOnly,
+                )?;
+            }
             crate::lower_call::apply_field_initializers_recursive(
                 ctx,
                 &current_class_name,

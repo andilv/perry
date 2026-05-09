@@ -373,7 +373,39 @@ pub(crate) fn lower_stmt(ctx: &mut FnCtx<'_>, stmt: &Stmt) -> Result<()> {
                             .get(class_name)
                             .map(|c| c.extends_name.is_some())
                             .unwrap_or(false);
-                        let init_mode = if class_has_extends {
+                        // Issue #631-followup: for the no-own-ctor case,
+                        // only apply fields up to the inherited-ctor class
+                        // before the body inline. Intermediate classes
+                        // between the inherited-ctor and the leaf get
+                        // their fields after the body returns (their
+                        // initializers may depend on parent body state).
+                        let inherited_ctor_class: Option<String> =
+                            if ctor.is_none() && class_has_extends {
+                                let mut walker = ctx
+                                    .classes
+                                    .get(class_name)
+                                    .and_then(|c| c.extends_name.clone());
+                                let mut found: Option<String> = None;
+                                while let Some(pname) = walker {
+                                    if let Some(parent_class) =
+                                        ctx.classes.get(&pname).copied()
+                                    {
+                                        if parent_class.constructor.is_some() {
+                                            found = Some(pname);
+                                            break;
+                                        }
+                                        walker = parent_class.extends_name.clone();
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                found
+                            } else {
+                                None
+                            };
+                        let init_mode = if let Some(stop_at) = inherited_ctor_class.clone() {
+                            crate::lower_call::FieldInitMode::UpToInclusive(stop_at)
+                        } else if class_has_extends {
                             crate::lower_call::FieldInitMode::AncestorsOnly
                         } else {
                             crate::lower_call::FieldInitMode::All
@@ -437,11 +469,22 @@ pub(crate) fn lower_stmt(ctx: &mut FnCtx<'_>, stmt: &Stmt) -> Result<()> {
                                 }
                             }
                             // Apply leaf's own field initializers AFTER the
-                            // parent body chain has run.
+                            // parent body chain has run. Issue #631-followup:
+                            // also include intermediate-class fields between
+                            // the inherited-ctor and the leaf (per JS spec
+                            // each default-ctor class's field inits run after
+                            // its super() returns).
+                            let post_mode = if let Some(stop_at) =
+                                inherited_ctor_class.clone()
+                            {
+                                crate::lower_call::FieldInitMode::BetweenExclusiveTo(stop_at)
+                            } else {
+                                crate::lower_call::FieldInitMode::SelfOnly
+                            };
                             crate::lower_call::apply_field_initializers_recursive(
                                 ctx,
                                 class_name,
-                                crate::lower_call::FieldInitMode::SelfOnly,
+                                post_mode,
                             )?;
                         }
 
