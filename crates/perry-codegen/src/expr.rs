@@ -910,6 +910,16 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     Some("function")
                 }
                 Expr::ClassRef(_) => Some("function"),
+                // Issue #623: native-module default-imports (`import process
+                // from "node:process"`) lower as `NativeModuleRef`, which the
+                // codegen represents as a `0.0` stub double. `js_value_typeof`
+                // reads it as a number; per spec native-module bindings are
+                // objects.
+                Expr::NativeModuleRef(_) => Some("object"),
+                // Issue #623: bare `typeof globalThis` — perry models the
+                // global object as `GlobalGet(0)` lowering to `0.0`, same
+                // misclassification.
+                Expr::GlobalGet(_) => Some("object"),
                 Expr::PropertyGet { object, property } => {
                     if let Expr::ExternFuncRef { name, .. } = object.as_ref() {
                         if ctx.namespace_imports.contains(name)
@@ -918,6 +928,22 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                             Some("function")
                         } else {
                             None
+                        }
+                    } else if matches!(object.as_ref(), Expr::GlobalGet(_)) {
+                        // Issue #623: `(globalThis as any).process` /
+                        // `globalThis.console` — known Node globals that are
+                        // objects in spec. The codegen lowers
+                        // `globalThis.<name>` to a generic property read that
+                        // produces a stub double; typeof would read "number"
+                        // without this short-circuit. Function-shaped globals
+                        // (Buffer, Promise, URL, etc.) intentionally fall
+                        // through so `typeof Buffer === "function"` keeps
+                        // working through the existing class-ref path.
+                        match property.as_str() {
+                            "process" | "console" | "globalThis" | "performance" => {
+                                Some("object")
+                            }
+                            _ => None,
                         }
                     } else {
                         None
