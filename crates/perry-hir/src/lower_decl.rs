@@ -3121,47 +3121,9 @@ pub(crate) fn lower_fn_body_block_stmt(
         }
     }
 
-    // Phase 4: compute the prealloc-box set.
-    //   (a) Hoisted FnDecl ids referenced from inside any closure body in
-    //       this function body. These need a box because a sibling
-    //       hoisted closure that runs first would otherwise capture a
-    //       TAG_UNDEFINED snapshot of the slot.
-    //   (b) Function-body let/const ids captured by any hoisted closure.
-    //       Hoisting moves the closure's `Stmt::Let` ahead of the source-
-    //       position let, so the let's slot must already exist (and be
-    //       boxed) when the hoisted closure literal is built.
-    let mut closure_body_refs: HashSet<LocalId> = HashSet::new();
-    for s in hoisted_lets.iter().chain(other.iter()) {
-        collect_refs_in_closure_bodies_stmt(s, &mut closure_body_refs);
-    }
-
-    let mut body_let_ids: HashSet<LocalId> = HashSet::new();
-    for s in hoisted_lets.iter().chain(other.iter()) {
-        collect_top_level_let_ids_stmt(s, &mut body_let_ids);
-    }
-
-    let mut prealloc_set: HashSet<LocalId> = HashSet::new();
-    for &id in &hoisted_id_set {
-        if closure_body_refs.contains(&id) {
-            prealloc_set.insert(id);
-        }
-    }
-    for s in &hoisted_lets {
-        if let Stmt::Let {
-            init: Some(Expr::Closure { captures, .. }),
-            ..
-        } = s
-        {
-            for &cap in captures {
-                if body_let_ids.contains(&cap) && !hoisted_id_set.contains(&cap) {
-                    prealloc_set.insert(cap);
-                }
-            }
-        }
-    }
-
-    let mut prealloc: Vec<LocalId> = prealloc_set.into_iter().collect();
-    prealloc.sort();
+    // Phase 4: compute the prealloc-box set via shared helper.
+    let combined: Vec<Stmt> = hoisted_lets.iter().chain(other.iter()).cloned().collect();
+    let prealloc = compute_prealloc_for_hoisted_closures(&combined, &hoisted_id_set);
 
     // Phase 5: assemble the final body — PreallocateBoxes (if any),
     // then the hoisted FnDecl Lets, then everything else.
@@ -3174,11 +3136,72 @@ pub(crate) fn lower_fn_body_block_stmt(
     Ok(result)
 }
 
+/// Compute the prealloc-box set for a function/arrow/fn-expr body that
+/// performs ECMAScript function-decl hoisting. `body` is the already-
+/// hoisted body (with FnDecl `Stmt::Let`s ahead of other top-level
+/// stmts); `hoisted_id_set` is the set of LocalIds those FnDecls were
+/// hoisted under. Returns the sorted list of LocalIds that need a
+/// pre-allocated box at function entry — covers both (a) hoisted FnDecl
+/// ids referenced from any closure body in this function (sibling
+/// recursion), and (b) function-body let/const ids captured by any
+/// hoisted closure (the closure literal is built before the let's source
+/// position, so the let's box must already exist).
+///
+/// Issue #633 followup: previously only `lower_fn_body_block_stmt`
+/// (function-decl bodies) emitted the prealloc; arrow-fn and fn-expr
+/// bodies did their own hoisting inline and skipped this analysis,
+/// leading to capture-of-uninitialized-slot for hoisted async fn decls
+/// that captured outer `let`s (the dispatch chain pattern in hono
+/// `compose()`).
+pub(crate) fn compute_prealloc_for_hoisted_closures(
+    body: &[Stmt],
+    hoisted_id_set: &std::collections::HashSet<LocalId>,
+) -> Vec<LocalId> {
+    use std::collections::HashSet;
+
+    let mut closure_body_refs: HashSet<LocalId> = HashSet::new();
+    for s in body {
+        collect_refs_in_closure_bodies_stmt(s, &mut closure_body_refs);
+    }
+
+    let mut body_let_ids: HashSet<LocalId> = HashSet::new();
+    for s in body {
+        collect_top_level_let_ids_stmt(s, &mut body_let_ids);
+    }
+
+    let mut prealloc_set: HashSet<LocalId> = HashSet::new();
+    for &id in hoisted_id_set {
+        if closure_body_refs.contains(&id) {
+            prealloc_set.insert(id);
+        }
+    }
+    for s in body {
+        if let Stmt::Let {
+            id,
+            init: Some(Expr::Closure { captures, .. }),
+            ..
+        } = s
+        {
+            if hoisted_id_set.contains(id) {
+                for &cap in captures {
+                    if body_let_ids.contains(&cap) && !hoisted_id_set.contains(&cap) {
+                        prealloc_set.insert(cap);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut prealloc: Vec<LocalId> = prealloc_set.into_iter().collect();
+    prealloc.sort();
+    prealloc
+}
+
 /// Collect every `LocalId` referenced (LocalGet / LocalSet / Update / etc.)
 /// from inside any `Expr::Closure` body found within `stmt`. Used by
 /// `lower_fn_body_block_stmt` to decide which hoisted FnDecl ids need a
 /// pre-allocated box.
-fn collect_refs_in_closure_bodies_stmt(
+pub(crate) fn collect_refs_in_closure_bodies_stmt(
     stmt: &Stmt,
     out: &mut std::collections::HashSet<LocalId>,
 ) {
@@ -3302,7 +3325,7 @@ fn collect_refs_in_closure_bodies_expr(
 /// Collect `LocalId`s declared by a top-level `Stmt::Let` in `stmt`. Does
 /// NOT recurse into nested blocks (those are block-scoped — their lets
 /// aren't hoisted to function-entry).
-fn collect_top_level_let_ids_stmt(stmt: &Stmt, out: &mut std::collections::HashSet<LocalId>) {
+pub(crate) fn collect_top_level_let_ids_stmt(stmt: &Stmt, out: &mut std::collections::HashSet<LocalId>) {
     if let Stmt::Let { id, .. } = stmt {
         out.insert(*id);
     }

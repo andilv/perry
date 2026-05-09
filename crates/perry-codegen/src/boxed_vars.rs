@@ -272,9 +272,15 @@ fn collect_nested_closure_boxed_vars_in_expr(expr: &perry_hir::Expr, out: &mut H
         Expr::Closure { body, .. } => {
             // Each closure is its own lexical scope — run the scope
             // analysis on the body, then recurse into any closures
-            // that appear inside it.
+            // that appear inside it. Issue #633 followup: also collect
+            // PreallocateBoxes ids from the closure body — without this,
+            // an inner closure body that emits `Stmt::PreallocateBoxes`
+            // (the hoisted-FnDecl path) wouldn't propagate those ids
+            // into the module-wide boxed set, and reads from the boxed
+            // slot would skip `js_box_get`.
             let inner = collect_boxed_vars_scope(body);
             out.extend(inner);
+            collect_prealloc_box_ids_in_stmts(body, out);
             collect_nested_closure_boxed_vars_in_stmts(body, out);
         }
         Expr::Binary { left, right, .. }

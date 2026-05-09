@@ -115,15 +115,24 @@ pub(super) fn lower_arrow(ctx: &mut LoweringContext, arrow: &ast::ArrowExpr) -> 
         destructuring_stmts.extend(stmts);
     }
 
-    // Hoist function declarations in block body (JS hoisting semantics)
+    // Hoist function declarations in block body (JS hoisting semantics).
+    // Track the hoisted-id set so we can emit `Stmt::PreallocateBoxes`
+    // for sibling/forward captures (issue #633).
+    let mut hoisted_id_set: std::collections::HashSet<LocalId> =
+        std::collections::HashSet::new();
     if let ast::BlockStmtOrExpr::BlockStmt(block) = &*arrow.body {
         for stmt in &block.stmts {
             if let ast::Stmt::Decl(ast::Decl::Fn(fn_decl)) = stmt {
-                if fn_decl.function.body.is_some() {
+                // Generator FnDecls go through a different hoist path and
+                // aren't closure-bound at the source position.
+                if fn_decl.function.body.is_some() && !fn_decl.function.is_generator {
                     let name = fn_decl.ident.sym.to_string();
-                    if ctx.lookup_local(&name).is_none() {
-                        ctx.define_local(name, Type::Any);
-                    }
+                    let local_id = if let Some(existing) = ctx.lookup_local(&name) {
+                        existing
+                    } else {
+                        ctx.define_local(name, Type::Any)
+                    };
+                    hoisted_id_set.insert(local_id);
                 }
             }
         }
@@ -156,7 +165,29 @@ pub(super) fn lower_arrow(ctx: &mut LoweringContext, arrow: &ast::ArrowExpr) -> 
             }
             var_hoisted.extend(func_decls);
             var_hoisted.extend(exec_stmts);
-            var_hoisted
+            // Issue #633: if the arrow body has any hoisted FnDecls, run
+            // the prealloc-box analysis so sibling-captured FnDecl ids
+            // and outer let/const ids referenced from inside the hoisted
+            // closure get a pre-allocated box at function entry. Without
+            // this, the hoisted closure literal is built before the
+            // captured let's `Stmt::Let` runs, and the closure's
+            // captures list snapshots the slot's uninitialized value.
+            if !hoisted_id_set.is_empty() {
+                let prealloc = crate::lower_decl::compute_prealloc_for_hoisted_closures(
+                    &var_hoisted,
+                    &hoisted_id_set,
+                );
+                if !prealloc.is_empty() {
+                    let mut with_prealloc: Vec<Stmt> = Vec::with_capacity(var_hoisted.len() + 1);
+                    with_prealloc.push(Stmt::PreallocateBoxes(prealloc));
+                    with_prealloc.extend(var_hoisted);
+                    with_prealloc
+                } else {
+                    var_hoisted
+                }
+            } else {
+                var_hoisted
+            }
         }
         ast::BlockStmtOrExpr::Expr(expr) => {
             let return_expr = lower_expr(ctx, expr)?;
@@ -257,14 +288,20 @@ pub(super) fn lower_fn_expr(ctx: &mut LoweringContext, fn_expr: &ast::FnExpr) ->
 
     // Hoist function declarations: pre-register all function declarations in the body
     // so they can be referenced before their lexical position (JS hoisting semantics).
+    // Track ids for the prealloc-box analysis (issue #633).
+    let mut hoisted_id_set: std::collections::HashSet<LocalId> =
+        std::collections::HashSet::new();
     if let Some(ref block) = fn_expr.function.body {
         for stmt in &block.stmts {
             if let ast::Stmt::Decl(ast::Decl::Fn(fn_decl)) = stmt {
-                if fn_decl.function.body.is_some() {
+                if fn_decl.function.body.is_some() && !fn_decl.function.is_generator {
                     let name = fn_decl.ident.sym.to_string();
-                    if ctx.lookup_local(&name).is_none() {
-                        ctx.define_local(name, Type::Any);
-                    }
+                    let local_id = if let Some(existing) = ctx.lookup_local(&name) {
+                        existing
+                    } else {
+                        ctx.define_local(name, Type::Any)
+                    };
+                    hoisted_id_set.insert(local_id);
                 }
             }
         }
@@ -293,6 +330,19 @@ pub(super) fn lower_fn_expr(ctx: &mut LoweringContext, fn_expr: &ast::FnExpr) ->
         }
         var_hoisted.extend(func_decls);
         var_hoisted.extend(exec_stmts);
+        // Issue #633: prealloc-box for sibling/forward captures.
+        if !hoisted_id_set.is_empty() {
+            let prealloc = crate::lower_decl::compute_prealloc_for_hoisted_closures(
+                &var_hoisted,
+                &hoisted_id_set,
+            );
+            if !prealloc.is_empty() {
+                let mut with_prealloc: Vec<Stmt> = Vec::with_capacity(var_hoisted.len() + 1);
+                with_prealloc.push(Stmt::PreallocateBoxes(prealloc));
+                with_prealloc.extend(var_hoisted);
+                var_hoisted = with_prealloc;
+            }
+        }
         var_hoisted
     } else {
         Vec::new()
