@@ -344,9 +344,67 @@ pub(crate) fn lower_native_method_call(
                     );
                 }
             } else {
-                // Children expression isn't a literal array — lower for
-                // side effects so closures still get collected.
-                let _ = lower_expr(ctx, children_expr)?;
+                // Children expression isn't a literal array — emit an
+                // inline LLVM loop that walks the runtime array and calls
+                // `perry_ui_widget_add_child` for each element. Without
+                // this, `for (const x of xs) ys.push(chip(x));
+                // HStack(8, ys)` and similar patterns silently dropped
+                // every loop-built widget (#634); only the literal-array
+                // shape produced render output.
+                let arr_d = lower_expr(ctx, children_expr)?;
+                let arr_ptr = {
+                    let blk = ctx.block();
+                    unbox_to_i64(blk, &arr_d)
+                };
+                ctx.pending_declares
+                    .push(("js_array_get_length".to_string(), I64, vec![I64]));
+                let len = ctx
+                    .block()
+                    .call(I64, "js_array_get_length", &[(I64, &arr_ptr)]);
+
+                let i_slot = ctx.func.alloca_entry(I64);
+                ctx.block().store(I64, "0", &i_slot);
+
+                let header_idx = ctx.new_block("ui_addch.header");
+                let body_idx = ctx.new_block("ui_addch.body");
+                let exit_idx = ctx.new_block("ui_addch.exit");
+                let header_label = ctx.block_label(header_idx);
+                let body_label = ctx.block_label(body_idx);
+                let exit_label = ctx.block_label(exit_idx);
+                ctx.block().br(&header_label);
+
+                ctx.current_block = header_idx;
+                let i_h = ctx.block().load(I64, &i_slot);
+                let cmp = ctx.block().icmp_slt(I64, &i_h, &len);
+                ctx.block().cond_br(&cmp, &body_label, &exit_label);
+
+                ctx.current_block = body_idx;
+                ctx.pending_declares.push((
+                    "js_array_get_element".to_string(),
+                    DOUBLE,
+                    vec![I64, I64],
+                ));
+                let i_b = ctx.block().load(I64, &i_slot);
+                let elem_d = ctx.block().call(
+                    DOUBLE,
+                    "js_array_get_element",
+                    &[(I64, &arr_ptr), (I64, &i_b)],
+                );
+                let child_handle = {
+                    let blk = ctx.block();
+                    unbox_to_i64(blk, &elem_d)
+                };
+                let parent_reload = ctx.block().load(I64, &parent_slot);
+                ctx.block().call_void(
+                    "perry_ui_widget_add_child",
+                    &[(I64, &parent_reload), (I64, &child_handle)],
+                );
+                let one_l = "1".to_string();
+                let i_next = ctx.block().add(I64, &i_b, &one_l);
+                ctx.block().store(I64, &i_next, &i_slot);
+                ctx.block().br(&header_label);
+
+                ctx.current_block = exit_idx;
             }
         }
 
@@ -792,6 +850,44 @@ pub(crate) fn lower_native_method_call(
             method,
             args.len()
         );
+    }
+
+    // perry/ui Image({ url, alt? }) — issue #635. The positional form
+    // `Image(url, alt?)` is picked up by the perry_ui table below; the
+    // object-literal form is destructured here into the same call shape
+    // by extracting the `url` and `alt` fields and forwarding to the
+    // table. Anything else on the object (placeholder / contentMode in
+    // the documented surface) is silently dropped — those fields are
+    // post-v1.
+    if module == "perry/ui"
+        && method == "Image"
+        && object.is_none()
+        && args.len() == 1
+    {
+        if let Some(props) = extract_options_fields(ctx, &args[0]) {
+            let mut url_arg: Option<Expr> = None;
+            let mut alt_arg: Option<Expr> = None;
+            for (key, val) in &props {
+                match key.as_str() {
+                    "url" => url_arg = Some(val.clone()),
+                    "alt" => alt_arg = Some(val.clone()),
+                    _ => {
+                        // Lower for side effects so any nested closures
+                        // are still collected.
+                        let _ = lower_expr(ctx, val)?;
+                    }
+                }
+            }
+            if let Some(u) = url_arg {
+                let positional = vec![
+                    u,
+                    alt_arg.unwrap_or_else(|| Expr::String(String::new())),
+                ];
+                if let Some(sig) = perry_ui_table_lookup("Image") {
+                    return lower_perry_ui_table_call(ctx, sig, &positional);
+                }
+            }
+        }
     }
 
     if module == "perry/ui" && method == "App" && object.is_none() {

@@ -144,6 +144,15 @@ pub extern "C" fn perry_ui_image_create_file(_path_ptr: i64) -> i64 {
     tree::register_node(node)
 }
 
+/// #635 stub: remote URL images aren't fetched on watchOS yet —
+/// register an empty Image node so layout still works.
+#[no_mangle]
+pub extern "C" fn perry_ui_image_create_url(_url_ptr: i64, _alt_ptr: i64) -> i64 {
+    let mut node = NodeData::new(NodeKind::Image);
+    node.text = CString::new("photo").ok();
+    tree::register_node(node)
+}
+
 #[no_mangle]
 pub extern "C" fn perry_ui_picker_create(label_ptr: i64, on_change: f64, _style: i64) -> i64 {
     let mut node = NodeData::new(NodeKind::Picker);

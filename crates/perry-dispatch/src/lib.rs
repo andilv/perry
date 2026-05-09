@@ -579,6 +579,17 @@ pub const PERRY_UI_TABLE: &[MethodRow] = &[
         args: &[ArgKind::Str],
         ret: ReturnKind::Widget,
     },
+    // ---- Issue #635: single-Image-by-URL ----
+    // The TS surface accepts both `Image(url, alt?)` (positional, picked
+    // up by this row) and `Image({ url, alt })` (object-literal, handled
+    // by a special case in `lower_call/native.rs` that destructures the
+    // options object before falling through here).
+    MethodRow {
+        method: "Image",
+        runtime: "perry_ui_image_create_url",
+        args: &[ArgKind::Str, ArgKind::Str],
+        ret: ReturnKind::Widget,
+    },
     MethodRow {
         method: "imageSetSize",
         runtime: "perry_ui_image_set_size",

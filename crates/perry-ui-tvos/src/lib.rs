@@ -891,6 +891,13 @@ pub extern "C" fn perry_ui_image_create_file(path_ptr: i64) -> i64 {
     widgets::image::create_file(path_ptr as *const u8)
 }
 
+/// #635 stub: remote URL images aren't fetched on tvOS yet —
+/// register an empty UIImageView so layout still works.
+#[no_mangle]
+pub extern "C" fn perry_ui_image_create_url(_url_ptr: i64, _alt_ptr: i64) -> i64 {
+    widgets::image::create_file(0 as *const u8)
+}
+
 /// Set the size of an Image widget.
 #[no_mangle]
 pub extern "C" fn perry_ui_image_set_size(handle: i64, width: f64, height: f64) {

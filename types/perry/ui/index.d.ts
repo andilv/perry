@@ -422,6 +422,32 @@ export function ImageFile(path: string): Widget;
 /** Image from a system symbol name (SF Symbols). */
 export function ImageSymbol(name: string): Widget;
 
+/**
+ * Image fetched from a remote URL (or `data:` URI). The widget appears
+ * immediately as an empty box; the bytes are fetched on a background
+ * queue and applied on the main thread once the response arrives.
+ * Failed requests leave the widget empty (no crash).
+ *
+ * Real on macOS (NSImageView) + iOS (UIImageView). Other UI platforms
+ * register an empty image placeholder so layout still works.
+ *
+ * `alt`, when provided, is used as the accessibility label.
+ *
+ * Either form is accepted:
+ *
+ * ```ts
+ * Image("https://example.com/avatar.png");
+ * Image({ url: "https://example.com/avatar.png", alt: "Avatar" });
+ * ```
+ *
+ * (#635)
+ */
+export function Image(url: string, alt?: string): Widget;
+export function Image(options: {
+    url: string;
+    alt?: string;
+}): Widget;
+
 /** VStack with built-in edge insets. */
 export function VStackWithInsets(spacing: number, top: number, left: number, bottom: number, right: number): Widget;
 

@@ -306,6 +306,37 @@ static SET_WIDGET_HIDDEN_HANDLER: AtomicPtr<()> = AtomicPtr::new(null_mut());
 #[no_mangle]
 pub extern "C" fn js_register_widget_hidden_handler(f: SetWidgetHiddenHandler) {
     SET_WIDGET_HIDDEN_HANDLER.store(f as *mut (), Ordering::Release);
+    // Drain any NavStack routes that registered before the platform UI
+    // crate hooked up its handler. `js_navstack_register_route` runs at
+    // App-build time (inside the codegen-emitted IIFE); the platform
+    // handler only registers later, inside `app_run`. Without this
+    // drain, every "hide non-active route" call from the build-time
+    // pass silently no-op'd against a null handler, leaving every route
+    // body visible and overlapping (#612).
+    let routes_snapshot: Option<Vec<(String, Vec<NavRoute>)>> = {
+        let guard = match NAVSTACK_REGISTRY.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        guard.as_ref().map(|m| {
+            m.iter()
+                .map(|(synth_id, rs)| (synth_id.clone(), rs.clone()))
+                .collect()
+        })
+    };
+    if let Some(routes_by_id) = routes_snapshot {
+        for (synth_id, routes) in routes_by_id {
+            let current_value = with_state_values(|m| m.get(&synth_id).copied());
+            let Some(value_f64) = current_value else {
+                continue;
+            };
+            let current_str = decode_jsvalue_string(value_f64);
+            for route in routes {
+                let hidden = if route.name == current_str { 0 } else { 1 };
+                f(route.handle, hidden);
+            }
+        }
+    }
 }
 
 #[cfg(feature = "ohos-napi")]

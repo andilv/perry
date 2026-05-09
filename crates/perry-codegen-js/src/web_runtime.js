@@ -1343,6 +1343,15 @@ function perry_ui_image_create_symbol(name) {
     return wrapWidget(allocHandle(el));
 }
 
+// #635: Image({ url, alt }) — single image by URL.
+function perry_ui_image_create_url(url, alt) {
+    const el = document.createElement("img");
+    el.src = url || "";
+    if (alt) el.alt = alt;
+    el.style.objectFit = "cover";
+    return wrapWidget(allocHandle(el));
+}
+
 function perry_ui_image_set_size(h, width, height) {
     const el = getHandle(h);
     if (el) { el.style.width = width + "px"; el.style.height = height + "px"; }
@@ -3342,6 +3351,7 @@ window.__perry = {
     perry_ui_picker_get_selected,
     // Image
     perry_ui_image_create_symbol,
+    perry_ui_image_create_url,
     perry_ui_image_set_size,
     perry_ui_image_set_tint,
     // ProgressView

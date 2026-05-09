@@ -900,6 +900,14 @@ pub extern "C" fn perry_ui_image_create_file(path_ptr: i64) -> i64 {
     widgets::image::create_file(path_ptr as *const u8)
 }
 
+/// Create an Image whose bytes are fetched from a URL (or `data:` URI)
+/// asynchronously and applied on the main thread (#635). `alt`, when
+/// non-empty, becomes the view's accessibility label.
+#[no_mangle]
+pub extern "C" fn perry_ui_image_create_url(url_ptr: i64, alt_ptr: i64) -> i64 {
+    widgets::image::create_url(url_ptr as *const u8, alt_ptr as *const u8)
+}
+
 /// Set the size of an Image widget.
 #[no_mangle]
 pub extern "C" fn perry_ui_image_set_size(handle: i64, width: f64, height: f64) {

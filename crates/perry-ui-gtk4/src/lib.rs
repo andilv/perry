@@ -1617,6 +1617,13 @@ pub extern "C" fn perry_ui_image_create_symbol(name_ptr: i64) -> i64 {
     widgets::image::create_symbol(name_ptr as *const u8)
 }
 
+/// #635 stub: remote URL images aren't fetched on GTK4 yet —
+/// register an empty image widget so layout still works.
+#[no_mangle]
+pub extern "C" fn perry_ui_image_create_url(_url_ptr: i64, _alt_ptr: i64) -> i64 {
+    widgets::image::create_symbol(0 as *const u8)
+}
+
 /// Set the size of an image.
 #[no_mangle]
 pub extern "C" fn perry_ui_image_set_size(handle: i64, width: f64, height: f64) {

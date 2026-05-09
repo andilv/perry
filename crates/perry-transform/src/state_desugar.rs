@@ -407,7 +407,18 @@ fn collect_state_bindings(init: &[Stmt]) -> HashMap<LocalId, StateBinding> {
                 ..
             } = call_expr
             {
-                if module == "perry/ui" && method == "state" && args.len() == 1 {
+                // `state<T>(initial)` and the capital `State<T>(initial)`
+                // alias declared in `types/perry/ui/index.d.ts:458` both
+                // come through here as `NativeMethodCall` rows. Without
+                // accepting both spellings, the issue #612 repro (which
+                // uses `State<string>(...)`) bypassed every state rewrite
+                // — `__state_init` never fired, the NavStack(state, routes)
+                // pattern stayed as a 2-arg NativeMethodCall, and the
+                // codegen catch-all silently dropped the routes.
+                if module == "perry/ui"
+                    && (method == "state" || method == "State")
+                    && args.len() == 1
+                {
                     let synth_id = format!("__state_{}", counter);
                     counter += 1;
                     map.insert(

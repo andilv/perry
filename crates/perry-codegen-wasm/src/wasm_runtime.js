@@ -3009,6 +3009,13 @@ function perry_ui_picker_get_selected(h) { const el = uiGet(h); return el ? el.s
 
 // ---------- Image ----------
 function perry_ui_image_create_symbol(name) { return perry_ui_text_create("⬜ " + name); }
+function perry_ui_image_create_url(url, alt) {
+  const el = document.createElement("img");
+  el.src = url || "";
+  if (alt) el.alt = alt;
+  el.style.objectFit = "cover";
+  return uiAlloc(el);
+}
 function perry_ui_image_set_size(h, width, height) {
   const el = uiGet(h); if (!el) return;
   if (width) el.style.width = width + "px"; if (height) el.style.height = height + "px";
@@ -3527,7 +3534,7 @@ const __perryUiDispatch = {
   // Picker
   perry_ui_picker_add_item, perry_ui_picker_set_selected, perry_ui_picker_get_selected,
   // Image
-  perry_ui_image_create_symbol, perry_ui_image_set_size, perry_ui_image_set_tint,
+  perry_ui_image_create_symbol, perry_ui_image_create_url, perry_ui_image_set_size, perry_ui_image_set_tint,
   // ProgressView
   perry_ui_progressview_set_value,
   // Menu

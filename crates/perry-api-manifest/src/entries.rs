@@ -1544,6 +1544,7 @@ pub static API_MANIFEST: &[ApiEntry] = &[
     method("perry/ui", "Picker", false, None),
     method("perry/ui", "ImageFile", false, None),
     method("perry/ui", "ImageSymbol", false, None),
+    method("perry/ui", "Image", false, None),
     method("perry/ui", "LazyVStack", false, None),
     method("perry/ui", "NavStack", false, None),
     method("perry/ui", "TabBar", false, None),
