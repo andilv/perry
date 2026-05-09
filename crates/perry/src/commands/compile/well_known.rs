@@ -68,17 +68,22 @@ pub fn iter_well_known() -> impl Iterator<Item = &'static WellKnownBinding> {
 }
 
 /// Resolve the bundled `.a` path for `binding`, given the perry
-/// workspace root (from `find_perry_workspace_root`). Returns
-/// `None` when the file isn't present — caller decides whether
-/// to error or fall through.
-pub fn bundled_staticlib_path(
+/// workspace root (from `find_perry_workspace_root`) and an optional
+/// rust target triple. When `target_triple` is `Some`, look in the
+/// per-target output dir (`target/<triple>/release/`); otherwise the
+/// host build dir (`target/release/`). Returns `None` when the file
+/// isn't present — caller decides whether to error or fall through.
+pub fn bundled_staticlib_path_for_target(
     workspace_root: &Path,
     binding: &WellKnownBinding,
+    target_triple: Option<&str>,
 ) -> Option<PathBuf> {
-    let path = workspace_root
-        .join("target")
-        .join("release")
-        .join(format!("lib{}.a", binding.lib));
+    let release_dir = if let Some(triple) = target_triple {
+        workspace_root.join("target").join(triple).join("release")
+    } else {
+        workspace_root.join("target").join("release")
+    };
+    let path = release_dir.join(format!("lib{}.a", binding.lib));
     if path.exists() {
         Some(path)
     } else {
