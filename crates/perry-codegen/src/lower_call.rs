@@ -1250,6 +1250,16 @@ pub(crate) fn lower_call(ctx: &mut FnCtx<'_>, callee: &Expr, args: &[Expr]) -> R
                 | "toLocaleLowerCase" | "toLocaleUpperCase" | "replaceAll"
                 | "padStart" | "padEnd" | "repeat" | "normalize" | "codePointAt"
                 | "localeCompare" => true,
+                // Issue #638: `replace` is also string-exclusive, but routing
+                // it here unconditionally caused regressions in async dispatch
+                // pathways. Only fire when args[1] is statically detectable as
+                // a closure literal — that's the failing case (replace
+                // callback got coerced to "[object Object]" via the runtime
+                // fallback path because the string-method dispatch never
+                // saw it). When args[1] is a string, the existing
+                // js_native_call_method fallback handles it correctly via
+                // js_string_replace_string.
+                "replace" if args.len() == 2 && matches!(&args[1], Expr::Closure { .. }) => true,
                 // slice/indexOf/includes exist on both strings and arrays.
                 // Route to string path only when args rule out the array
                 // variant (e.g., slice(0) is ambiguous but slice() with 0
