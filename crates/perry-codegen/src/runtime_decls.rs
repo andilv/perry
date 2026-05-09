@@ -790,6 +790,12 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // cleanly resolves to undefined (instead of TAG_TRUE → "boolean" /
     // "(boolean).method is not a function").
     module.declare_function("js_unresolved_namespace_stub", DOUBLE, &[]);
+    // Issue #611: real persistent globalThis singleton. Returns a
+    // NaN-boxed POINTER to a per-process ObjectHeader so
+    // `globalThis[k] = v` then `globalThis[k]` round-trips correctly.
+    // The codegen IndexGet/IndexSet paths on `Expr::GlobalGet` route
+    // through this helper.
+    module.declare_function("js_get_global_this", DOUBLE, &[]);
     // Refs #420: register a static computed-key Symbol field on a class.
     // Called from `init_static_fields` for each `static [Symbol.X] = init`.
     module.declare_function(

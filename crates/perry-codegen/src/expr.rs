@@ -2081,6 +2081,28 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         // bench_array_ops with ~400K reads per iteration this is a
         // major performance win.
         Expr::IndexGet { object, index } => {
+            // Issue #611: `globalThis[<key>]` reads from the persistent
+            // global-this singleton. Pre-fix, `Expr::GlobalGet` lowered
+            // to the `0.0` sentinel and the generic IndexGet path called
+            // `js_object_get_field_by_name_f64(0, key)` which returned
+            // undefined — `(globalThis as any)[id] = m; (globalThis as
+            // any)[id]` round-trip lost the value. Route through the
+            // real singleton (`js_get_global_this`) when receiver is
+            // GlobalGet AND the key is string-typed.
+            if matches!(object.as_ref(), Expr::GlobalGet(_))
+                && (matches!(index.as_ref(), Expr::String(_)) || is_string_expr(ctx, index))
+            {
+                let global_box = ctx.block().call(DOUBLE, "js_get_global_this", &[]);
+                let key_box = lower_expr(ctx, index)?;
+                let blk = ctx.block();
+                let obj_handle = unbox_to_i64(blk, &global_box);
+                let key_handle = unbox_str_handle(blk, &key_box);
+                return Ok(blk.call(
+                    DOUBLE,
+                    "js_object_get_field_by_name_f64",
+                    &[(I64, &obj_handle), (I64, &key_handle)],
+                ));
+            }
             // Uint8ClampedArray reads must use byte-stride load (the
             // runtime stores 1 byte per element, not 8). Route to the
             // runtime helper which handles the per-kind load. Without
@@ -2790,6 +2812,24 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             index,
             value,
         } => {
+            // Issue #611: `globalThis[<key>] = value` writes to the
+            // persistent global-this singleton (see the matching IndexGet
+            // arm above for context).
+            if matches!(object.as_ref(), Expr::GlobalGet(_))
+                && (matches!(index.as_ref(), Expr::String(_)) || is_string_expr(ctx, index))
+            {
+                let global_box = ctx.block().call(DOUBLE, "js_get_global_this", &[]);
+                let key_box = lower_expr(ctx, index)?;
+                let val_double = lower_expr(ctx, value)?;
+                let blk = ctx.block();
+                let obj_handle = unbox_to_i64(blk, &global_box);
+                let key_handle = unbox_str_handle(blk, &key_box);
+                blk.call_void(
+                    "js_object_set_field_by_name",
+                    &[(I64, &obj_handle), (I64, &key_handle), (DOUBLE, &val_double)],
+                );
+                return Ok(val_double);
+            }
             // Uint8ClampedArray writes must apply ToUint8Clamp (NaN → 0,
             // v ≤ 0 → 0, v ≥ 255 → 255, otherwise round-half-to-even).
             // Route to the runtime helper which already implements the

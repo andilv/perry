@@ -7202,6 +7202,39 @@ pub extern "C" fn js_object_get_own_field_or_undef(
     }
 }
 
+/// Issue #611 (Effect): `globalThis[<computed>] = value` and the
+/// `(globalThis as any)[id] ??= new Map()` pattern (used by hono / Effect /
+/// most ESM libraries that ship a CJS-compat global side-store) wrote to
+/// a 0-pointer sentinel and read back undefined — `globalStore` was always
+/// undefined, callers SIGSEGV'd at the next `.has()` / `.get()` call. This
+/// function lazily allocates a single shared ObjectHeader (one per process,
+/// initialised on first access) and returns a NaN-boxed POINTER to it. The
+/// codegen-side IndexGet / IndexSet on `Expr::GlobalGet` routes through
+/// this helper instead of through the 0.0 sentinel so reads / writes
+/// actually persist. Existing AST-shape patterns like
+/// `PropertyGet { GlobalGet, "log" }` (console.log dispatch) match on the
+/// HIR node, not the SSA value, so they continue to fire even though the
+/// SSA value of GlobalGet now changes.
+#[no_mangle]
+pub extern "C" fn js_get_global_this() -> f64 {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static GLOBAL_THIS_PTR: AtomicI64 = AtomicI64::new(0);
+    let cached = GLOBAL_THIS_PTR.load(Ordering::Acquire);
+    let ptr = if cached != 0 {
+        cached
+    } else {
+        // First access — allocate. Race-tolerant: if two threads race the
+        // initial alloc, the loser's allocation leaks (never freed) but
+        // both threads see the winner's pointer afterward via CAS.
+        let new_ptr = js_object_alloc(0, 0) as i64;
+        match GLOBAL_THIS_PTR.compare_exchange(0, new_ptr, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => new_ptr,
+            Err(other) => other,
+        }
+    };
+    crate::value::js_nanbox_pointer(ptr)
+}
+
 /// Object.getOwnPropertyNames(obj) — returns all own property names (including non-enumerable).
 /// Takes a NaN-boxed f64 object pointer, returns a NaN-boxed f64 array pointer.
 #[no_mangle]
