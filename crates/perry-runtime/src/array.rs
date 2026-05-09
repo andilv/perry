@@ -656,6 +656,13 @@ pub extern "C" fn js_array_set_f64_extend(
 /// non-negative integer < 2^32-1. Such writes update the array's element
 /// storage; non-numeric string keys fall through to the object-property
 /// path on the array's expando map (rare).
+///
+/// Issue #637 followup: this helper is also called from the polymorphic
+/// IndexSet dispatch when the receiver type isn't statically known —
+/// the runtime detects the receiver's gc_type byte and routes to the
+/// per-kind setter. For Object/Closure receivers, fall through to
+/// `js_object_set_field_by_name`. For Array receivers, parse the key
+/// as integer and route to `js_array_set_f64_extend`.
 #[no_mangle]
 pub extern "C" fn js_array_set_string_key(
     arr: *mut ArrayHeader,
@@ -663,6 +670,27 @@ pub extern "C" fn js_array_set_string_key(
     value: f64,
 ) -> *mut ArrayHeader {
     if arr.is_null() || key.is_null() {
+        return arr;
+    }
+    // Issue #637: also called from polymorphic IndexSet — detect the
+    // receiver's gc_type and route accordingly. For Object/Closure
+    // (non-array) receivers, just call the object setter directly so
+    // the standard expando-property path runs.
+    let is_array = unsafe {
+        if (arr as usize) >= crate::gc::GC_HEADER_SIZE + 0x1000 {
+            let gc_header =
+                (arr as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
+            (*gc_header).obj_type == crate::gc::GC_TYPE_ARRAY
+        } else {
+            false
+        }
+    };
+    if !is_array {
+        crate::object::js_object_set_field_by_name(
+            arr as *mut crate::object::ObjectHeader,
+            key,
+            value,
+        );
         return arr;
     }
     // Read the key as a Rust &str via the standard StringHeader layout.
@@ -690,8 +718,7 @@ pub extern "C" fn js_array_set_string_key(
     }
     // Non-numeric string key — fall through to object-property set on the
     // array's expando map. Arrays with named properties are rare but spec-
-    // legal. Use the standard object setter; arrays don't have keys_array
-    // by default but `js_object_set_field_by_name` will allocate one.
+    // legal.
     crate::object::js_object_set_field_by_name(
         arr as *mut crate::object::ObjectHeader,
         key,

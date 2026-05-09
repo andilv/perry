@@ -3108,12 +3108,19 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             let is_str_tag_sso = blk.icmp_eq(I64, &top16, "32761");
             let is_str = blk.or(crate::types::I1, &is_str_heap, &is_str_tag_sso);
             ctx.block().cond_br(&is_str, &str_lbl, &num_lbl);
-            // String key → object field set.
+            // String key → polymorphic helper that detects array receivers
+            // and parses numeric-string keys as array indices, falling
+            // through to `js_object_set_field_by_name` for Object/Closure
+            // receivers. Issue #637: pre-fix this called the object setter
+            // unconditionally, which silently no-op'd `arr[stringKey] = X`
+            // on captured arrays whose static type was lost across the
+            // closure boundary (forEach callbacks, replace callbacks, etc.).
             ctx.current_block = str_set;
             let blk = ctx.block();
             let key_handle = unbox_str_handle(blk, &idx_box);
-            ctx.block().call_void(
-                "js_object_set_field_by_name",
+            ctx.block().call(
+                I64,
+                "js_array_set_string_key",
                 &[
                     (I64, &obj_handle),
                     (I64, &key_handle),
