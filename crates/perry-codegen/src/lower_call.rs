@@ -3461,6 +3461,20 @@ pub(crate) fn lower_new(ctx: &mut FnCtx<'_>, class_name: &str, args: &[Expr]) ->
             if has_real_ctor {
                 break;
             }
+            // v0.5.758: stop walking if this class has its own synthesized
+            // ctor symbol — the synthesized ctor (from compile_method's
+            // no-own-ctor path) applies SelfOnly fields and forwards
+            // super() to the parent's ctor, so the chain is handled
+            // correctly. Walking past would skip the leaf's field
+            // initializers (arrow fields, default-value fields). Stubs
+            // have `init: None` so checking class.fields here doesn't
+            // help. Refs #420 / #618 followup.
+            let has_imported_ctor_symbol = ctx
+                .imported_class_ctors
+                .contains_key(&effective_class_name);
+            if has_imported_ctor_symbol {
+                break;
+            }
             let Some(parent) = effective_extends.clone() else {
                 break;
             };
@@ -3535,24 +3549,19 @@ pub(crate) fn lower_new(ctx: &mut FnCtx<'_>, class_name: &str, args: &[Expr]) ->
     // SQLiteInteger ← SQLiteBaseInteger ← SQLiteColumn ← Column chain,
     // SQLiteBaseInteger's `autoIncrement = this.config.autoIncrement`
     // must run AFTER Column's body sets `this.config`.
-    // v0.5.755: don't re-apply field initializers if the cross-module
-    // imported constructor already ran them inside its body (via the
-    // SuperCall + apply_field_initializers chain at the source-module
-    // codegen). The previous check `!has_own_ctor` only saw the LOCAL
-    // class table, so imported classes (whose stub has no constructor
-    // visible) fell through here and overwrote the freshly-set field
-    // values from the imported ctor body with undefined. Drizzle's
-    // BetterSQLiteSession's `this.client = client` after super(dialect)
-    // was the load-bearing site. Refs #420 / #618 followup.
-    let has_imported_ctor_body = ctx
+    // v0.5.758: skip the post-init re-apply when the cross-module imported
+    // constructor handles fields itself (via compile_method's
+    // is_constructor_method path applying SelfOnly internally). The
+    // re-apply uses the STUB's fields (no inits → all Undefined), which
+    // would overwrite the freshly-set values. This applies whether the
+    // imported ctor is synthesized (no own body, just forwards
+    // super + applies SelfOnly) or has an explicit body. Drizzle's
+    // `BetterSQLiteSession` (explicit ctor) and arrow-field cross-
+    // module classes are both load-bearing. Refs #420 / #618 followup.
+    let has_imported_ctor = ctx
         .imported_class_ctors
-        .get(class_name)
-        .map(|(_, n)| *n > 0)
-        .unwrap_or(false)
-        || ctx
-            .imported_class_ctors
-            .contains_key(class_name);
-    if !has_own_ctor && has_extends && !has_imported_ctor_body {
+        .contains_key(class_name);
+    if !has_own_ctor && has_extends && !has_imported_ctor {
         if let Some(stop_at) = inherited_ctor_class {
             apply_field_initializers_recursive(
                 ctx,
