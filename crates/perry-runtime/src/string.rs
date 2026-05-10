@@ -558,6 +558,101 @@ fn is_ascii_string(s: *const StringHeader) -> bool {
     unsafe { (*s).utf16_len == (*s).byte_len }
 }
 
+/// SSO-aware string concatenation: takes both operands as NaN-boxed f64
+/// values, returns the result as an SSO `f64` when total ≤
+/// `SHORT_STRING_MAX_LEN` (zero heap alloc), or as a heap `STRING_TAG`-
+/// boxed pointer otherwise.
+///
+/// This is the engine-style fast path for `s + t` in code where both
+/// operands are statically-typed strings. The previous lowering had
+/// codegen `unbox_str_handle` each operand (which materialises SSO →
+/// heap, defeating the whole SSO win), call `js_string_concat`
+/// (heap-only), then re-NaN-box the result. For ABC451D's recursive
+/// `before + after` (1.4M concats with 1-9 byte operands, all SSO), that
+/// was 3 heap allocations per concat. The new path keeps SSO inline
+/// throughout — for the common case where both operands AND the
+/// result fit SSO (≤ 5 bytes total), there's literally zero heap
+/// allocation. Result is returned NaN-boxed so callers don't need a
+/// follow-up wrap.
+#[no_mangle]
+pub extern "C" fn js_string_concat_box(l_value: f64, r_value: f64) -> f64 {
+    let mut scratch_l = [0u8; crate::value::SHORT_STRING_MAX_LEN];
+    let mut scratch_r = [0u8; crate::value::SHORT_STRING_MAX_LEN];
+    let l = str_bytes_from_jsvalue(l_value, &mut scratch_l)
+        .unwrap_or((std::ptr::null(), 0));
+    let r = str_bytes_from_jsvalue(r_value, &mut scratch_r)
+        .unwrap_or((std::ptr::null(), 0));
+    let total_blen = l.1 + r.1;
+
+    // SSO fast path — assemble the result inline when it fits (≤ 5
+    // bytes). Pure bit arithmetic, no heap touch.
+    if total_blen as usize <= crate::value::SHORT_STRING_MAX_LEN {
+        unsafe {
+            let mut payload: u64 = 0;
+            for i in 0..l.1 as usize {
+                payload |= (*l.0.add(i) as u64) << (i * 8);
+            }
+            for i in 0..r.1 as usize {
+                payload |= (*r.0.add(i) as u64) << ((l.1 as usize + i) * 8);
+            }
+            let len_bits = (total_blen as u64) << crate::value::SHORT_STRING_LEN_SHIFT;
+            return f64::from_bits(crate::value::SHORT_STRING_TAG | len_bits | payload);
+        }
+    }
+
+    // Heap path — allocate a StringHeader and memcpy. Decode both
+    // operands' byte slices via `str_bytes_from_jsvalue` (already done
+    // above) and write directly into the new header's payload region.
+    let total_size = std::mem::size_of::<StringHeader>() + total_blen as usize;
+    let raw = string_arena_alloc(total_size);
+    let ptr = raw as *mut StringHeader;
+    unsafe {
+        // ASCII-fast utf16 length: count bytes < 0x80 in both slices in
+        // one pass. Most concat results are pure ASCII (number formatting,
+        // ID building, slug construction, etc.); falling back to the
+        // full Grisu-style codepoint walk for non-ASCII keeps spec
+        // compliance for the edge case.
+        let l_slice = if !l.0.is_null() {
+            std::slice::from_raw_parts(l.0, l.1 as usize)
+        } else {
+            &[]
+        };
+        let r_slice = if !r.0.is_null() {
+            std::slice::from_raw_parts(r.0, r.1 as usize)
+        } else {
+            &[]
+        };
+        let utf16_len = if l_slice.is_ascii() && r_slice.is_ascii() {
+            total_blen
+        } else {
+            let mut u16 = 0u32;
+            if !l_slice.is_empty() {
+                u16 += compute_utf16_len(l.0, l.1);
+            }
+            if !r_slice.is_empty() {
+                u16 += compute_utf16_len(r.0, r.1);
+            }
+            u16
+        };
+
+        (*ptr).utf16_len = utf16_len;
+        (*ptr).byte_len = total_blen;
+        (*ptr).capacity = total_blen;
+        (*ptr).refcount = 0;
+        (*ptr).flags = 0;
+
+        let data_ptr = (ptr as *mut u8).add(std::mem::size_of::<StringHeader>());
+        if !l_slice.is_empty() {
+            ptr::copy_nonoverlapping(l.0, data_ptr, l.1 as usize);
+        }
+        if !r_slice.is_empty() {
+            ptr::copy_nonoverlapping(r.0, data_ptr.add(l.1 as usize), r.1 as usize);
+        }
+        // NaN-box as STRING_TAG.
+        f64::from_bits(crate::value::JSValue::string_ptr(ptr).bits())
+    }
+}
+
 /// Concatenate two strings
 ///
 /// v0.5.78x perf: consolidate the eight is_valid_string_ptr checks into

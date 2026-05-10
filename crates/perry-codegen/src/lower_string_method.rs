@@ -870,19 +870,17 @@ pub(crate) fn lower_string_concat(
     let l_box = lower_expr(ctx, left)?;
     let r_box = lower_expr(ctx, right)?;
     let blk = ctx.block();
-    // Issue #214: inline `bitcast + and POINTER_MASK_I64` returns garbage
-    // for SSO operands (SHORT_STRING_TAG = 0x7FF9, lower 48 bits encode
-    // payload, not a pointer). Route through `unbox_str_handle` →
-    // `js_get_string_pointer_unified` which materializes SSO to heap.
-    let l_handle = unbox_str_handle(blk, &l_box);
-    let r_handle = unbox_str_handle(blk, &r_box);
-    let result_handle = blk.call(
-        I64,
-        "js_string_concat",
-        &[(I64, &l_handle), (I64, &r_handle)],
-    );
-    // Inline NaN-box (STRING_TAG) — concat always returns a real heap ptr.
-    Ok(nanbox_string_inline(blk, &result_handle))
+    // SSO-aware fast path: pass operands as NaN-boxed f64s directly to
+    // `js_string_concat_sso`, which keeps SSO operands inline (no
+    // materialise-to-heap defeat) and returns the result NaN-boxed —
+    // SSO when the total fits 5 bytes, heap-pointer otherwise. Saves up
+    // to 3 heap allocations per concat on hot paths like ABC451D's
+    // recursive `before + after` (1.4M concats with 1-9 byte operands).
+    Ok(blk.call(
+        DOUBLE,
+        "js_string_concat_box",
+        &[(DOUBLE, &l_box), (DOUBLE, &r_box)],
+    ))
 }
 
 /// Cap the per-call part count for the n-way fold. Must match the
