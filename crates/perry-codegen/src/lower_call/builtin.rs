@@ -135,6 +135,37 @@ pub(super) fn lower_builtin_new(
             let handle = blk.call(I64, "js_event_emitter_new", &[]);
             Ok(Some(nanbox_pointer_inline(blk, &handle)))
         }
+        // node:stream — `new Readable(opts)` / `new Writable(opts)` /
+        // `new Duplex(opts)` / `new Transform(opts)` / `new PassThrough(opts)`.
+        // Issue #631. Pre-fix the generic Expr::New path produced an empty
+        // ObjectHeader, so `r.on`, `r.pipe`, `.read`, etc. were undefined and
+        // any downstream call crashed. The runtime helpers in
+        // `perry-runtime/src/node_stream.rs` build an ObjectHeader with each
+        // method name keyed to a NaN-boxed closure pointer that captures the
+        // host object — `typeof r.on === "function"` and chained
+        // `.on(...).on(...).pipe(...)` calls return `this` so the chain
+        // doesn't lose identity. Stub semantics only: no real data pump.
+        "Readable" | "Writable" | "Duplex" | "Transform" | "PassThrough" => {
+            let opts_box = if !args.is_empty() {
+                lower_expr(ctx, &args[0])?
+            } else {
+                double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED))
+            };
+            // Lower any extra args for side effects.
+            for a in args.iter().skip(1) {
+                let _ = lower_expr(ctx, a)?;
+            }
+            let runtime_fn = match class_name {
+                "Readable" => "js_node_stream_readable_new",
+                "Writable" => "js_node_stream_writable_new",
+                "Duplex" => "js_node_stream_duplex_new",
+                "Transform" => "js_node_stream_transform_new",
+                "PassThrough" => "js_node_stream_passthrough_new",
+                _ => unreachable!(),
+            };
+            let result = ctx.block().call(DOUBLE, runtime_fn, &[(DOUBLE, &opts_box)]);
+            Ok(Some(result))
+        }
         // lru-cache LRUCache — `new LRUCache({ max: N })`. Runtime takes
         // a single `max: f64`. Extract the `max` field from the options
         // literal (handles both raw `Expr::Object(props)` and Phase 3's

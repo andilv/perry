@@ -2096,6 +2096,14 @@ pub fn declare_stdlib_ffi(module: &mut LlModule) {
     module.declare_function("js_lru_cache_set", I64, &[I64, DOUBLE, DOUBLE]);
     module.declare_function("js_lru_cache_size", DOUBLE, &[I64]);
 
+    // ========== node:stream stubs (issue #631) ==========
+    module.declare_function("js_node_stream_readable_new", DOUBLE, &[DOUBLE]);
+    module.declare_function("js_node_stream_writable_new", DOUBLE, &[DOUBLE]);
+    module.declare_function("js_node_stream_duplex_new", DOUBLE, &[DOUBLE]);
+    module.declare_function("js_node_stream_transform_new", DOUBLE, &[DOUBLE]);
+    module.declare_function("js_node_stream_passthrough_new", DOUBLE, &[DOUBLE]);
+    module.declare_function("js_node_stream_readable_from", DOUBLE, &[DOUBLE]);
+
     // ========== Event emitter ==========
     module.declare_function("js_event_emitter_emit", DOUBLE, &[I64, I64, DOUBLE]);
     module.declare_function("js_event_emitter_emit0", DOUBLE, &[I64, I64]);

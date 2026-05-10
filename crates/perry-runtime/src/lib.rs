@@ -39,6 +39,7 @@ pub mod fs;
 pub mod gc;
 pub mod map;
 pub mod math;
+pub mod node_stream;
 pub mod object;
 pub mod os;
 pub mod path;

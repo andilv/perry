@@ -6841,6 +6841,21 @@ const NATIVE_MODULE_TABLE: &[NativeModSig] = &[
         args: &[NA_STR, NA_F64, NA_STR, NA_F64],
         ret: NR_PTR,
     },
+    // ========== node:stream — Readable.from(iterable) (#631) ==========
+    // The other stream constructors (`new Readable(opts)` etc.) are wired
+    // via `lower_builtin_new` so the codegen can carry the closure-fields
+    // ObjectHeader with NaN-boxed POINTER_TAG; they never reach this
+    // table. `Readable.from` is a static factory call surfaced as
+    // `Readable.from(...)` → `stream.from(...)`, so it lives here.
+    NativeModSig {
+        module: "stream",
+        has_receiver: false,
+        method: "from",
+        class_filter: None,
+        runtime: "js_node_stream_readable_from",
+        args: &[NA_F64],
+        ret: NR_F64,
+    },
     // ========== Events ==========
     NativeModSig {
         module: "events",

@@ -1455,6 +1455,10 @@ pub static API_MANIFEST: &[ApiEntry] = &[
     class("stream", "PassThrough"),
     method("stream", "pipeline", false, None),
     method("stream", "finished", false, None),
+    // `Readable.from(iterable)` — Node's static factory. Resolves
+    // through the `Readable.foo` -> `stream.foo` route in
+    // `lower_call.rs`, so the gate keys off `stream.from`.
+    method("stream", "from", false, None),
     // --- child_process (synchronous + async exec surface;
     //     spawn/fork are documented but not yet codegen'd) ---
     method("child_process", "exec", false, None),
