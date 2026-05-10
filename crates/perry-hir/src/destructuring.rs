@@ -1542,10 +1542,25 @@ pub(crate) fn lower_var_decl_with_destructuring(
                     if let ast::Expr::Call(call_expr) = expr {
                         if let ast::Callee::Expr(callee_expr) = &call_expr.callee {
                             if let ast::Expr::Ident(ident) = callee_expr.as_ref() {
+                                // Closes #644: all three return the same
+                                // Response handle, so they must register
+                                // under module="fetch". The codegen dispatch
+                                // in `lower_fetch_native_method` gates on
+                                // `module == "fetch"` — pre-fix, registering
+                                // under "fetchWithAuth"/"fetchPostWithAuth"
+                                // missed the gate so a post-narrowing
+                                // `r.status` lowered as a NativeMethodCall
+                                // with module="fetchWithAuth" and fell
+                                // through to a generic 0.0-returning arm.
+                                // (Without narrowing the access went through
+                                // generic PropertyGet → handle dispatch →
+                                // js_fetch_response_status, so the bug only
+                                // surfaced inside an `if r !== null/undefined`
+                                // block.)
                                 return match ident.sym.as_ref() {
-                                    "fetch" => Some("fetch"),
-                                    "fetchWithAuth" => Some("fetchWithAuth"),
-                                    "fetchPostWithAuth" => Some("fetchPostWithAuth"),
+                                    "fetch" | "fetchWithAuth" | "fetchPostWithAuth" => {
+                                        Some("fetch")
+                                    }
                                     _ => None,
                                 };
                             }
