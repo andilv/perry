@@ -10346,11 +10346,63 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     ctx.pending_declares.push((fname.clone(), DOUBLE, vec![]));
                     return Ok(ctx.block().call(DOUBLE, &fname, &[]));
                 }
-                let global_name = format!("__perry_extern_closure_{}__{}", source_prefix, name);
-                let global_ref = format!("@{}", global_name);
+                // Drizzle / cross-module IIFE-pattern static-property fix:
+                // route through the SOURCE module's wrapper symbol +
+                // `js_closure_alloc_singleton` (same path the source
+                // module uses for its own `Expr::FuncRef(id)` value
+                // reads) so the consumer gets the same ClosureHeader
+                // pointer the source sees. Pre-fix each consumer emitted
+                // its own `__perry_extern_closure_<src>__<name>` global
+                // with LLVM `internal` linkage, so the consumer-side
+                // pointer differed from the source-side singleton. The
+                // IIFE pattern `((fn2) => { fn2.X = Y; })(fn)` writes to
+                // CLOSURE_DYNAMIC_PROPS keyed by the source-local closure
+                // pointer; consumer reads keyed by their own pointer
+                // missed every entry. Drizzle hit this on every
+                // `sql.raw(...)` / `sql.identifier(...)` / `sql.fromList`
+                // call — the `((sql2) => { sql2.raw = ...; })(sql)`
+                // pattern in `drizzle-orm/sql/sql.js`. The fix unifies
+                // function-declaration imports with the same architecture
+                // const-bound closures already use: ONE module-level
+                // singleton observed via stable address from every
+                // module. `js_closure_alloc_singleton` keys its
+                // pool by func_ptr, so calling it with the source's
+                // wrapper symbol from any module returns the same
+                // ClosureHeader the source returned for its
+                // `Expr::FuncRef(id)` value-reads. The pre-fix
+                // `__perry_extern_closure_<src>__<name>` global is no
+                // longer referenced and link-time DCE strips it.
+                // Refs #645 deeper followup / #488 drizzle-sqlite.
+                let target_name = format!("perry_fn_{}__{}", source_prefix, name);
+                let wrap_name = format!("__perry_wrap_{}", target_name);
+                // Declare the source's wrapper so LLVM accepts the
+                // `@<wrap_name>` reference. Signature mirrors the
+                // emission in `compile_module`'s wrapper-loop (i64
+                // closure_ptr + N doubles, arity capped at 5). The
+                // signature is for LLVM-IR well-formedness only — the
+                // runtime closure-call machinery casts the func_ptr to
+                // its own ABI at dispatch time, so size of the param
+                // count here is informational. Defaults to arity 0 if
+                // the import metadata didn't carry a count; the runtime
+                // path still works because singleton lookup uses the
+                // address, not the signature.
+                let param_count = ctx
+                    .imported_func_param_counts
+                    .get(name)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(5);
+                let mut wrap_param_types: Vec<crate::types::LlvmType> = vec![I64];
+                for _ in 0..param_count {
+                    wrap_param_types.push(DOUBLE);
+                }
+                ctx.pending_declares
+                    .push((wrap_name.clone(), DOUBLE, wrap_param_types));
                 let blk = ctx.block();
-                let addr_i64 = blk.ptrtoint(&global_ref, I64);
-                return Ok(nanbox_pointer_inline(blk, &addr_i64));
+                let wrap_ptr = format!("@{}", wrap_name);
+                let closure_handle =
+                    blk.call(I64, "js_closure_alloc_singleton", &[(PTR, &wrap_ptr)]);
+                return Ok(nanbox_pointer_inline(blk, &closure_handle));
             }
             // Issue #629: namespace imports for unresolved modules
             // (`import * as fsp from "node:fs/promises"`) — when the
