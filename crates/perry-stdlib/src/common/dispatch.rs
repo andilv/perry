@@ -125,6 +125,31 @@ pub unsafe extern "C" fn js_handle_method_dispatch(
         return crate::crypto::dispatch_hash(handle, method_name, args);
     }
 
+    // SQLite Statement handle: stmt.raw() / .all() / .get() / .run() —
+    // routes the dynamic-receiver path used by drizzle's
+    // `this.stmt.raw().all(...params)` chain (where `this.stmt` is
+    // any-typed because drizzle's PreparedQuery is a JS file with no
+    // type annotations). Without this, the call falls through to the
+    // generic dispatcher which doesn't know about sqlite stmts and
+    // returns null/undefined sentinels — `(number).all is not a
+    // function` then surfaces deeper down. Refs #643.
+    //
+    // Gated on `database-sqlite` so the dispatch fn (and its extern
+    // refs to `js_sqlite_stmt_*`) are only emitted when sqlite is in
+    // the build. The well-known flip used to strip this feature when
+    // `better-sqlite3` routed to perry-ext-better-sqlite3, which
+    // would have left this arm cfg'd out of every actually-using
+    // binary — `optimized_libs.rs` now keeps `database-sqlite` for
+    // exactly this reason (the duplicate `js_sqlite_*` symbols are
+    // resolved by the linker to a single impl).
+    #[cfg(feature = "database-sqlite")]
+    if matches!(method_name, "raw" | "all" | "get" | "run") {
+        let result = dispatch_sqlite_stmt(handle, method_name, args);
+        if result.to_bits() != perry_runtime::JSValue::undefined().bits() {
+            return result;
+        }
+    }
+
     // net.Socket: covers wrapper-function, struct-field, and Map.get
     // receivers where codegen lost the static type. Static NATIVE_MODULE_TABLE
     // path is still preferred when types are visible.
@@ -661,6 +686,85 @@ pub unsafe extern "C" fn js_handle_property_dispatch(
 
     // Unknown handle type - return undefined
     f64::from_bits(0x7FFC_0000_0000_0001)
+}
+
+/// Dispatch method calls on SQLite Statement handles. Routes the
+/// dynamic-receiver chain `this.stmt.raw().all(...params)` (drizzle's
+/// PreparedQuery.values()) and similar shapes where the codegen
+/// can't see the static stmt type. The runtime paths
+/// (`js_sqlite_stmt_*`) take a pre-packed args array, so this
+/// function repacks the f64 slice into a fresh JS array via
+/// `js_array_alloc` + `js_array_push` before delegating.
+///
+/// Gated on `database-sqlite` — symbol/feature reasoning lives at
+/// the caller arm in `js_handle_method_dispatch`. The extern
+/// `js_sqlite_stmt_*` declarations resolve to whichever crate's impl
+/// the linker picked (perry-stdlib's vs perry-ext-better-sqlite3's),
+/// so this dispatch routes to the same impl that `js_sqlite_prepare`
+/// used to allocate the handle. Refs #643.
+#[cfg(feature = "database-sqlite")]
+unsafe fn dispatch_sqlite_stmt(handle: i64, method: &str, args: &[f64]) -> f64 {
+    use perry_runtime::js_nanbox_pointer;
+    // Pack args into a fresh JS array. Each `f64` is already a
+    // NaN-boxed value as the codegen produces. js_array_push takes a
+    // perry_ffi::JsValue (NaN-boxed), but the runtime helpers in
+    // perry-stdlib accept JSValue::from_bits — convert via raw bits.
+    let arr_handle = perry_runtime::js_array_alloc(0);
+    for &v in args {
+        perry_runtime::js_array_push(arr_handle, perry_runtime::JSValue::from_bits(v.to_bits()));
+    }
+
+    // Route through extern "C" so we hit the *linked* impl
+    // (perry-stdlib's vs perry-ext-better-sqlite3's — only one wins
+    // the link race when both crates expose `js_sqlite_*`). Calling
+    // `crate::sqlite::js_sqlite_stmt_*` directly would always invoke
+    // perry-stdlib's local impl, so handles registered by perry-ext's
+    // `js_sqlite_prepare` (different TypeId) wouldn't downcast in
+    // perry-stdlib's get_handle. The extern path delegates to whichever
+    // crate's `js_sqlite_prepare` actually ran, keeping handle and
+    // lookup TypeIds consistent. Refs #643.
+    extern "C" {
+        fn js_sqlite_stmt_raw(stmt_handle: i64) -> i64;
+        fn js_sqlite_stmt_all(
+            stmt_handle: i64,
+            params_arr: *const perry_runtime::ArrayHeader,
+        ) -> *mut perry_runtime::ArrayHeader;
+        fn js_sqlite_stmt_get(
+            stmt_handle: i64,
+            params_arr: *const perry_runtime::ArrayHeader,
+        ) -> f64;
+        fn js_sqlite_stmt_run(
+            stmt_handle: i64,
+            params_arr: *const perry_runtime::ArrayHeader,
+        ) -> *mut perry_runtime::ObjectHeader;
+    }
+
+    match method {
+        "raw" => {
+            let new_handle = js_sqlite_stmt_raw(handle);
+            // NaN-box as a pointer so subsequent dynamic dispatch sees
+            // it as a heap-pointer-shaped value (the runtime detects
+            // small-handle range and routes back here).
+            js_nanbox_pointer(new_handle)
+        }
+        "all" => {
+            let arr_ptr = js_sqlite_stmt_all(handle, arr_handle);
+            js_nanbox_pointer(arr_ptr as i64)
+        }
+        "get" => {
+            // Already returns f64 (NaN-boxed bits).
+            js_sqlite_stmt_get(handle, arr_handle)
+        }
+        "run" => {
+            let obj_ptr = js_sqlite_stmt_run(handle, arr_handle);
+            if obj_ptr.is_null() {
+                f64::from_bits(perry_runtime::JSValue::undefined().bits())
+            } else {
+                js_nanbox_pointer(obj_ptr as i64)
+            }
+        }
+        _ => f64::from_bits(perry_runtime::JSValue::undefined().bits()),
+    }
 }
 
 /// Dispatch method calls on ioredis Redis client handles

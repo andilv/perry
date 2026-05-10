@@ -6490,6 +6490,22 @@ const NATIVE_MODULE_TABLE: &[NativeModSig] = &[
         args: &[NA_VARARGS],
         ret: NR_PTR,
     },
+    // `stmt.raw([toggle])` — flips the statement into raw mode and
+    // returns the same handle so `stmt.raw().all(...)` chains. drizzle's
+    // PreparedQuery.values() relies on this; without it `stmt.raw` is
+    // undefined and the call surfaces as `(number).all is not a
+    // function` deeper in the chain. Refs #643. The optional `toggle`
+    // arg isn't threaded through the dispatch yet (always enables);
+    // extend `args` if a real downstream needs `.raw(false)`.
+    NativeModSig {
+        module: "better-sqlite3",
+        has_receiver: true,
+        method: "raw",
+        class_filter: None,
+        runtime: "js_sqlite_stmt_raw",
+        args: &[],
+        ret: NR_PTR,
+    },
     NativeModSig {
         module: "better-sqlite3",
         has_receiver: true,

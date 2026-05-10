@@ -242,6 +242,23 @@ pub(super) fn build_optimized_libs(
                 if *feat == "http-client" && ctx.uses_fetch {
                     continue;
                 }
+                // Refs #643: keep `database-sqlite` enabled even when
+                // `better-sqlite3` routes to perry-ext-better-sqlite3.
+                // perry-stdlib's `dispatch_sqlite_stmt` (the dynamic
+                // receiver path used by drizzle's
+                // `this.stmt.raw().all(...)` chain) is gated on this
+                // feature; stripping it removes the dispatch arm
+                // entirely and the `.raw()` / `.all()` call falls
+                // through to the no-such-method sentinel. The
+                // duplicate `js_sqlite_*` symbols (one from each
+                // crate) are resolved by the linker picking one impl;
+                // perry-ext typically wins because it appears later on
+                // the link line. The dispatch arm calls those symbols
+                // via extern "C", so it routes through whichever impl
+                // the linker picked.
+                if *feat == "database-sqlite" {
+                    continue;
+                }
                 features.remove(*feat);
             }
             // perry-ffi's async surface (#466 Phase 1.1 / Phase 5

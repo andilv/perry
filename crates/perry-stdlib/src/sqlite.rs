@@ -9,6 +9,7 @@ use perry_runtime::{
     js_string_from_bytes, ArrayHeader, JSValue, ObjectHeader, StringHeader,
 };
 use rusqlite::{types::Value as SqliteValue, Connection};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 /// Helper to extract string from StringHeader pointer
@@ -31,6 +32,15 @@ pub struct SqliteDbHandle {
 pub struct SqliteStmtHandle {
     pub sql: String,
     pub db_handle: Handle,
+    /// Per-statement raw mode flag — `stmt.raw([toggle])` enables this.
+    /// In raw mode, `stmt.all(...)` returns array-of-arrays (one inner
+    /// array per row, column values in declared order) and
+    /// `stmt.get(...)` returns a single column-value array. drizzle's
+    /// `PreparedQuery.values()` chains `this.stmt.raw().all(...)` to
+    /// feed `mapResultRow(fields, row, joinsNotNullableMap)`. Without
+    /// this method `stmt.raw` is undefined and the call surfaces as
+    /// `(number).all is not a function` deeper in the chain. Refs #643.
+    pub raw_mode: AtomicBool,
 }
 
 /// Convert SQLite value to JSValue
@@ -174,11 +184,43 @@ pub unsafe extern "C" fn js_sqlite_prepare(
     if let Some(db) = get_handle::<SqliteDbHandle>(db_handle) {
         if let Ok(conn) = db.conn.lock() {
             if conn.prepare(&sql).is_ok() {
-                return register_handle(SqliteStmtHandle { sql, db_handle });
+                return register_handle(SqliteStmtHandle {
+                    sql,
+                    db_handle,
+                    raw_mode: AtomicBool::new(false),
+                });
             }
         }
     }
     -1
+}
+
+/// stmt.raw([toggle]) -> stmt
+///
+/// Toggle raw mode on the statement and return the same handle so
+/// `stmt.raw().all(...)` chains. Raw mode makes subsequent `.all()` /
+/// `.get()` return rows as arrays of column values (in declared
+/// column order) instead of objects keyed by column name.
+///
+/// drizzle's `PreparedQuery.values()` chains
+/// `this.stmt.raw().all(...params)` to get back row arrays it then
+/// hands to `mapResultRow(fields, row, joinsNotNullableMap)`. Without
+/// this method `stmt.raw` is undefined and the call surfaces as
+/// `(number).all is not a function` deeper in the chain because perry
+/// returns a number sentinel when calling `undefined()` instead of
+/// throwing immediately. Refs #643.
+///
+/// Argument handling: drizzle only ever uses the no-arg form. Real
+/// better-sqlite3 also accepts `.raw(false)` to disable. We don't
+/// thread the toggle through the codegen's NativeMethodCall dispatch
+/// yet (it would need an `NA_F64` slot), so the no-arg form is the
+/// only path. Conservative: always enable on call.
+#[no_mangle]
+pub unsafe extern "C" fn js_sqlite_stmt_raw(stmt_handle: Handle) -> Handle {
+    if let Some(stmt) = get_handle::<SqliteStmtHandle>(stmt_handle) {
+        stmt.raw_mode.store(true, Ordering::Relaxed);
+    }
+    stmt_handle
 }
 
 /// Extract SQLite parameters from a NaN-boxed array
@@ -295,6 +337,7 @@ pub unsafe extern "C" fn js_sqlite_stmt_get(
     let sqlite_params = params_from_array(params_arr);
 
     if let Some(stmt) = get_handle::<SqliteStmtHandle>(stmt_handle) {
+        let raw = stmt.raw_mode.load(Ordering::Relaxed);
         if let Some(db) = get_handle::<SqliteDbHandle>(stmt.db_handle) {
             if let Ok(conn) = db.conn.lock() {
                 let param_refs: Vec<&dyn rusqlite::ToSql> =
@@ -307,11 +350,21 @@ pub unsafe extern "C" fn js_sqlite_stmt_get(
                         .map(|s| s.to_string())
                         .collect();
 
-                    let (packed_keys, shape_id) = build_packed_keys(&column_names);
-
                     let mut rows = prepared.query(param_refs.as_slice());
                     if let Ok(ref mut rows) = rows {
                         if let Ok(Some(row)) = rows.next() {
+                            if raw {
+                                let row_arr = js_array_alloc(0);
+                                for (idx, _) in column_names.iter().enumerate() {
+                                    let value: SqliteValue =
+                                        row.get(idx).unwrap_or(SqliteValue::Null);
+                                    js_array_push(row_arr, sqlite_value_to_jsvalue(&value));
+                                }
+                                return f64::from_bits(
+                                    JSValue::object_ptr(row_arr as *mut u8).bits(),
+                                );
+                            }
+                            let (packed_keys, shape_id) = build_packed_keys(&column_names);
                             let obj = js_object_alloc_with_shape(
                                 shape_id,
                                 column_names.len() as u32,
@@ -351,6 +404,7 @@ pub unsafe extern "C" fn js_sqlite_stmt_all(
     let result_array = js_array_alloc(0);
 
     if let Some(stmt) = get_handle::<SqliteStmtHandle>(stmt_handle) {
+        let raw = stmt.raw_mode.load(Ordering::Relaxed);
         if let Some(db) = get_handle::<SqliteDbHandle>(stmt.db_handle) {
             if let Ok(conn) = db.conn.lock() {
                 let param_refs: Vec<&dyn rusqlite::ToSql> =
@@ -363,13 +417,34 @@ pub unsafe extern "C" fn js_sqlite_stmt_all(
                         .map(|s| s.to_string())
                         .collect();
 
-                    let (packed_keys, shape_id) = build_packed_keys(&column_names);
+                    // Only build the per-row object shape in non-raw
+                    // mode. In raw mode each row is its own array of
+                    // column values; no per-row object shape needed.
+                    let object_shape = if raw {
+                        None
+                    } else {
+                        Some(build_packed_keys(&column_names))
+                    };
 
                     let mut rows = prepared.query(param_refs.as_slice());
                     if let Ok(ref mut rows) = rows {
                         while let Ok(Some(row)) = rows.next() {
+                            if raw {
+                                let row_arr = js_array_alloc(0);
+                                for (idx, _) in column_names.iter().enumerate() {
+                                    let value: SqliteValue =
+                                        row.get(idx).unwrap_or(SqliteValue::Null);
+                                    js_array_push(row_arr, sqlite_value_to_jsvalue(&value));
+                                }
+                                js_array_push(
+                                    result_array,
+                                    JSValue::object_ptr(row_arr as *mut u8),
+                                );
+                                continue;
+                            }
+                            let (packed_keys, shape_id) = object_shape.as_ref().unwrap();
                             let obj = js_object_alloc_with_shape(
-                                shape_id,
+                                *shape_id,
                                 column_names.len() as u32,
                                 packed_keys.as_ptr(),
                                 packed_keys.len() as u32,
