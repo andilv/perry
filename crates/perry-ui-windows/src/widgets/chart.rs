@@ -158,7 +158,8 @@ fn paint_chart(handle: i64, hwnd: HWND) {
 unsafe fn draw_title(hdc: HDC, client: &RECT, title: &str) {
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, rgb(25, 25, 25));
-    let wide = to_wide(title);
+    let mut wide = to_wide(title);
+    let len = wide.len() - 1;
     let mut rect = RECT {
         left: client.left,
         top: client.top + 4,
@@ -167,7 +168,7 @@ unsafe fn draw_title(hdc: HDC, client: &RECT, title: &str) {
     };
     DrawTextW(
         hdc,
-        &wide[..wide.len() - 1],
+        &mut wide[..len],
         &mut rect,
         DT_CENTER | DT_SINGLELINE | DT_VCENTER,
     );

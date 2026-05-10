@@ -443,6 +443,48 @@ fn measure_intrinsic(handle: i64, kind: &WidgetKind, vertical: bool, cross_size:
                 24
             }
         }
+        WidgetKind::Calendar => {
+            if vertical {
+                240
+            } else {
+                280
+            }
+        }
+        WidgetKind::Combobox => {
+            if vertical {
+                28
+            } else {
+                200
+            }
+        }
+        WidgetKind::TreeView => {
+            if vertical {
+                200
+            } else {
+                240
+            }
+        }
+        WidgetKind::RichText => {
+            if vertical {
+                200
+            } else {
+                240
+            }
+        }
+        WidgetKind::Chart => {
+            if vertical {
+                200
+            } else {
+                240
+            }
+        }
+        WidgetKind::TextArea => {
+            if vertical {
+                120
+            } else {
+                280
+            }
+        }
     }
 }
 

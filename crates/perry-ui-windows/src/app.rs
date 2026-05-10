@@ -1251,6 +1251,11 @@ extern "C" {
     /// route bound to the changed state's synth id. Defined in
     /// `perry-runtime/src/ui_text_registry.rs`'s `NAVSTACK_REGISTRY` block.
     fn js_register_widget_hidden_handler(f: extern "C" fn(widget_handle: i64, hidden: i32));
+    /// ForEach re-render handler (#610 / state binding Layer 2). Defined
+    /// in `perry-runtime/src/ui_text_registry.rs::FOREACH_REGISTRY`.
+    fn js_register_foreach_render_handler(
+        f: extern "C" fn(container_handle: i64, render_closure: f64, count: f64),
+    );
 }
 
 extern "C" fn navstack_set_widget_hidden(widget_handle: i64, hidden: i32) {
@@ -1263,5 +1268,6 @@ fn register_cross_platform_text_handlers() {
         js_register_set_text_handler(crate::widgets::text_registry::set_text_handler);
         js_register_text_id_handler(crate::widgets::text_registry::register_text_id_handler);
         js_register_widget_hidden_handler(navstack_set_widget_hidden);
+        js_register_foreach_render_handler(crate::widgets::foreach_registry::render_handler);
     }
 }

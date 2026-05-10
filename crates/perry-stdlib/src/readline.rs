@@ -235,8 +235,10 @@ mod termios_impl {
     /// `disable()` restores cleanly. (#406.)
     pub fn enable() -> bool {
         unsafe {
+            // windows-sys HANDLE is `isize`; both 0 and -1 (INVALID_HANDLE_VALUE)
+            // signal failure. `.is_null()` doesn't exist on isize. (#406 fix.)
             let h_in = GetStdHandle(STD_INPUT_HANDLE);
-            if h_in.is_null() {
+            if h_in == 0 || h_in == -1 {
                 return false;
             }
             let mut current_in: u32 = 0;
@@ -244,7 +246,7 @@ mod termios_impl {
                 return false;
             }
             let h_out = GetStdHandle(STD_OUTPUT_HANDLE);
-            let current_out = if !h_out.is_null() {
+            let current_out = if h_out != 0 && h_out != -1 {
                 let mut m: u32 = 0;
                 if GetConsoleMode(h_out, &mut m) != 0 {
                     Some(m)
@@ -281,12 +283,12 @@ mod termios_impl {
             let saved = SAVED.lock().unwrap();
             if let Some((in_mode, out_mode)) = saved.as_ref() {
                 let h_in = GetStdHandle(STD_INPUT_HANDLE);
-                if !h_in.is_null() {
+                if h_in != 0 && h_in != -1 {
                     let _ = SetConsoleMode(h_in, *in_mode);
                 }
                 if let Some(m) = out_mode {
                     let h_out = GetStdHandle(STD_OUTPUT_HANDLE);
-                    if !h_out.is_null() {
+                    if h_out != 0 && h_out != -1 {
                         let _ = SetConsoleMode(h_out, *m);
                     }
                 }

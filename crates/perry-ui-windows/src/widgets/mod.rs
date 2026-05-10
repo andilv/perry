@@ -1,26 +1,36 @@
 //! Widget registry — Vec<WidgetEntry> with 1-based handles.
 //! Each widget has an HWND (on Windows), a kind, children list, and layout info.
 
+pub mod bottom_nav;
 pub mod button;
 pub mod calendar;
 pub mod canvas;
 pub mod chart;
 pub mod combobox;
+pub mod command_palette;
 pub mod divider;
+pub mod foreach_registry;
 pub mod form;
 pub mod hstack;
 pub mod image;
+pub mod image_gallery;
 pub mod lazyvstack;
+pub mod map_view;
 pub mod navstack;
+pub mod pdf_view;
 pub mod picker;
 pub mod progressview;
+pub mod qrcode;
 pub mod rich_text;
+pub mod rich_tooltip;
 pub mod scrollview;
 pub mod securefield;
 pub mod slider;
 pub mod spacer;
+pub mod table;
 pub mod text;
 pub mod text_registry;
+pub mod textarea;
 pub mod textfield;
 pub mod toast;
 pub mod toggle;
@@ -53,6 +63,7 @@ pub enum WidgetKind {
     Spacer,
     Divider,
     TextField,
+    TextArea,
     Toggle,
     Slider,
     ScrollView,
@@ -682,7 +693,14 @@ pub fn handle_command(control_id: u16, notify_code: u16, _lparam: LPARAM) {
             match kind {
                 Some(WidgetKind::Button) => button::handle_click(handle),
                 Some(WidgetKind::Toggle) => toggle::handle_click(handle),
-                _ => {}
+                _ => {
+                    // BottomNav items aren't a WidgetKind on their own —
+                    // their per-item BUTTON HWNDs share a control_id space
+                    // with regular buttons. bottom_nav::handle_click
+                    // consumes the event when the control_id maps to one
+                    // of its registered items.
+                    let _ = bottom_nav::handle_click(control_id);
+                }
             }
         }
     }
@@ -752,6 +770,7 @@ pub fn handle_command(control_id: u16, notify_code: u16, _lparam: LPARAM) {
             match kind {
                 Some(WidgetKind::SecureField) => securefield::handle_change(handle),
                 Some(WidgetKind::RichText) => rich_text::handle_change(handle),
+                Some(WidgetKind::TextArea) => textarea::handle_change(handle),
                 _ => textfield::handle_change(handle),
             }
         }
@@ -763,18 +782,22 @@ pub fn handle_command(_control_id: u16, _notify_code: u16, _lparam: isize) {}
 
 /// Dispatcher for WM_NOTIFY messages. lparam is `*mut NMHDR`.
 /// `MCN_SELCHANGE` (-749) → calendar; `TVN_SELCHANGEDW` (-411) → tree.
+/// Public Win32 NMHDR shape — table.rs / tree_view.rs / calendar.rs use
+/// this as the header of their per-control notification structs.
+#[cfg(target_os = "windows")]
+#[repr(C)]
+pub struct TableNmhdr {
+    pub hwnd_from: HWND,
+    pub id_from: usize,
+    pub code: i32,
+}
+
 #[cfg(target_os = "windows")]
 pub fn handle_notify(lparam: LPARAM) {
     if lparam.0 == 0 {
         return;
     }
-    #[repr(C)]
-    struct Nmhdr {
-        hwnd_from: HWND,
-        id_from: usize,
-        code: i32,
-    }
-    let hdr = unsafe { &*(lparam.0 as *const Nmhdr) };
+    let hdr = unsafe { &*(lparam.0 as *const TableNmhdr) };
     let control_id = hdr.id_from as u16;
     let handle = find_handle_by_control_id(control_id);
     if handle <= 0 {
@@ -786,10 +809,33 @@ pub fn handle_notify(lparam: LPARAM) {
             widgets.get(idx).map(|e| e.kind.clone())
         })
     });
+    // MCN_SELCHANGE = -749 (calendar)
     if hdr.code == -749 && matches!(kind, Some(WidgetKind::Calendar)) {
         calendar::handle_selection_change(handle);
-    } else if hdr.code == -411 && matches!(kind, Some(WidgetKind::TreeView)) {
-        tree_view::handle_selection_change(handle);
+        return;
+    }
+    // TVN_SELCHANGEDW = -411 (tree view — actual tree, not the table-shaped
+    // ListView that also gets bucketed under WidgetKind::TreeView)
+    if hdr.code == -411 {
+        // Disambiguate: the table widget keeps its handle in `table::TABLES`.
+        // If it's there, route as a table; otherwise tree.
+        let is_table = table::is_registered(handle);
+        if !is_table {
+            tree_view::handle_selection_change(handle);
+            return;
+        }
+    }
+    // ListView notifications. NM_FIRST = -100, so:
+    //   LVN_ITEMCHANGED = -101
+    //   LVN_GETDISPINFOW = -177
+    //   LVN_COLUMNCLICK = -108
+    if table::is_registered(handle) {
+        match hdr.code {
+            -101 => table::handle_itemchanged(handle, lparam),
+            -108 => table::handle_columnclick(handle, lparam),
+            -177 => table::handle_dispinfo(handle, lparam),
+            _ => {}
+        }
     }
 }
 

@@ -313,20 +313,28 @@ pub extern "C" fn perry_ui_lazyvstack_set_row_height(_handle: i64, _height: f64)
 
 // Table (stub — not yet implemented on Windows)
 #[no_mangle]
-pub extern "C" fn perry_ui_table_create(_row_count: f64, _col_count: f64, _render: f64) -> i64 {
-    0
+pub extern "C" fn perry_ui_table_create(row_count: f64, col_count: f64, render: f64) -> i64 {
+    widgets::table::create(row_count, col_count, render)
 }
 #[no_mangle]
-pub extern "C" fn perry_ui_table_set_column_header(_handle: i64, _col: i64, _title_ptr: i64) {}
+pub extern "C" fn perry_ui_table_set_column_header(handle: i64, col: i64, title_ptr: i64) {
+    widgets::table::set_column_header(handle, col, title_ptr as *const u8);
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_table_set_column_width(_handle: i64, _col: i64, _width: f64) {}
+pub extern "C" fn perry_ui_table_set_column_width(handle: i64, col: i64, width: f64) {
+    widgets::table::set_column_width(handle, col, width);
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_table_update_row_count(_handle: i64, _count: i64) {}
+pub extern "C" fn perry_ui_table_update_row_count(handle: i64, count: i64) {
+    widgets::table::update_row_count(handle, count);
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_table_set_on_row_select(_handle: i64, _callback: f64) {}
+pub extern "C" fn perry_ui_table_set_on_row_select(handle: i64, callback: f64) {
+    widgets::table::set_on_row_select(handle, callback);
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_table_get_selected_row(_handle: i64) -> i64 {
-    -1
+pub extern "C" fn perry_ui_table_get_selected_row(handle: i64) -> i64 {
+    widgets::table::get_selected_row(handle)
 }
 
 /// Create a ProgressView.
@@ -700,14 +708,17 @@ pub extern "C" fn perry_ui_widget_set_tooltip(handle: i64, text_ptr: i64) {
     widgets::set_tooltip(handle, text_ptr as *const u8);
 }
 
-/// Rich tooltip stub (issue #479). Win32 ToolTip control is text-only;
-/// a custom HWND popup with arbitrary widget tree is a future iteration.
+/// Rich tooltip — popup HWND hosting an arbitrary widget tree, shown
+/// after the configured hover delay. Win32 ToolTip class is text-only,
+/// so we roll our own popup that re-parents the content widget on show
+/// and detaches it on hide. See `widgets::rich_tooltip` (#479 / #11).
 #[no_mangle]
 pub extern "C" fn perry_ui_widget_set_rich_tooltip(
-    _handle: i64,
-    _content_handle: i64,
-    _hover_delay_ms: f64,
+    handle: i64,
+    content_handle: i64,
+    hover_delay_ms: f64,
 ) {
+    widgets::rich_tooltip::set_rich_tooltip(handle, content_handle, hover_delay_ms);
 }
 
 /// Set hidden state. Triggers a layout pass so newly visible widgets get sized.
@@ -1140,55 +1151,85 @@ pub extern "C" fn perry_ui_rich_text_toggle_underline(h: i64) {
     widgets::rich_text::toggle_underline(h)
 }
 
-// Issue #516 — PdfView stubs. Windows — Windows.Data.Pdf or a third-
-// party renderer is a future iteration.
+// PdfView (#516) — Win32 stub-with-state. STATIC label shows
+// "[PDF: name — page X/Y @ Z%]" on load + nav. Real page-bitmap
+// rendering via `Windows.Data.Pdf` WinRT or PDFium is a follow-up.
 #[no_mangle]
-pub extern "C" fn perry_ui_pdf_view_create(_w: f64, _h: f64) -> i64 {
-    0
+pub extern "C" fn perry_ui_pdf_view_create(w: f64, h: f64) -> i64 {
+    widgets::pdf_view::create(w, h)
 }
 #[no_mangle]
-pub extern "C" fn perry_ui_pdf_view_load_file(_h: i64, _p: i64) -> i64 {
-    0
+pub extern "C" fn perry_ui_pdf_view_load_file(h: i64, p: i64) -> i64 {
+    widgets::pdf_view::load_file(h, p as *const u8)
 }
 #[no_mangle]
-pub extern "C" fn perry_ui_pdf_view_get_page_count(_h: i64) -> i64 {
-    0
+pub extern "C" fn perry_ui_pdf_view_get_page_count(h: i64) -> i64 {
+    widgets::pdf_view::get_page_count(h)
 }
 #[no_mangle]
-pub extern "C" fn perry_ui_pdf_view_go_to_page(_h: i64, _i: i64) {}
-#[no_mangle]
-pub extern "C" fn perry_ui_pdf_view_get_current_page(_h: i64) -> i64 {
-    -1
+pub extern "C" fn perry_ui_pdf_view_go_to_page(h: i64, i: i64) {
+    widgets::pdf_view::go_to_page(h, i)
 }
 #[no_mangle]
-pub extern "C" fn perry_ui_pdf_view_set_scale(_h: i64, _s: f64) {}
+pub extern "C" fn perry_ui_pdf_view_get_current_page(h: i64) -> i64 {
+    widgets::pdf_view::get_current_page(h)
+}
+#[no_mangle]
+pub extern "C" fn perry_ui_pdf_view_set_scale(h: i64, s: f64) {
+    widgets::pdf_view::set_scale(h, s)
+}
 
-// Issue #517 — MapView stubs. Windows — Bing Maps WinRT API is a
-// future iteration.
+// MapView (#517 / #559) — Win32 stub-with-state. STATIC label shows
+// the current region + pin count. Real WinUI MapControl in XAML
+// Islands needs Windows App SDK + WinUI 3 stack + Bing Maps API key
+// — tracked under #559 as multi-day follow-up.
 #[no_mangle]
-pub extern "C" fn perry_ui_map_view_create(_w: f64, _h: f64) -> i64 {
-    0
+pub extern "C" fn perry_ui_map_view_create(w: f64, h: f64) -> i64 {
+    widgets::map_view::create(w, h)
 }
 #[no_mangle]
-pub extern "C" fn perry_ui_map_view_set_region(_h: i64, _lat: f64, _lon: f64, _ls: f64, _os: f64) {}
+pub extern "C" fn perry_ui_map_view_set_region(h: i64, lat: f64, lon: f64, ls: f64, os: f64) {
+    widgets::map_view::set_region(h, lat, lon, ls, os);
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_map_view_add_pin(_h: i64, _lat: f64, _lon: f64, _t: i64) {}
+pub extern "C" fn perry_ui_map_view_add_pin(h: i64, lat: f64, lon: f64, t: i64) {
+    widgets::map_view::add_pin(h, lat, lon, t as *const u8);
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_map_view_clear_pins(_h: i64) {}
+pub extern "C" fn perry_ui_map_view_clear_pins(h: i64) {
+    widgets::map_view::clear_pins(h);
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_map_view_set_map_type(_h: i64, _s: i64) {}
+pub extern "C" fn perry_ui_map_view_set_map_type(h: i64, s: i64) {
+    widgets::map_view::set_map_type(h, s);
+}
 
 // Issue #477 — Command palette stubs.
 #[no_mangle]
-pub extern "C" fn perry_ui_command_palette_register(_id: i64, _l: i64, _s: i64, _cb: f64) {}
+pub extern "C" fn perry_ui_command_palette_register(id: i64, label: i64, subtitle: i64, on_run: f64) {
+    widgets::command_palette::register(
+        id as *const u8,
+        label as *const u8,
+        subtitle as *const u8,
+        on_run,
+    );
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_command_palette_unregister(_id: i64) {}
+pub extern "C" fn perry_ui_command_palette_unregister(id: i64) {
+    widgets::command_palette::unregister(id as *const u8);
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_command_palette_clear() {}
+pub extern "C" fn perry_ui_command_palette_clear() {
+    widgets::command_palette::clear();
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_command_palette_show() {}
+pub extern "C" fn perry_ui_command_palette_show() {
+    widgets::command_palette::show();
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_command_palette_hide() {}
+pub extern "C" fn perry_ui_command_palette_hide() {
+    widgets::command_palette::hide();
+}
 
 // Issue #474 — Chart widget — real Windows impl via GDI on owner-draw HWND.
 #[no_mangle]
@@ -1226,24 +1267,34 @@ pub extern "C" fn perry_ui_calendar_get_selected_date(h: i64) -> f64 {
     widgets::calendar::get_selected_date(h)
 }
 
-// Issue #473 — table sort/filter/multi-select stubs.
+// Issue #473 — table sort / filter / multi-select. Real LVS_REPORT impl
+// lives in `widgets::table`; the bare ABI shape mirrors macOS so dispatch
+// signatures match across platforms (#7 — ListView with column headers).
 #[no_mangle]
-pub extern "C" fn perry_ui_table_set_on_sort_change(_h: i64, _cb: f64) {}
-#[no_mangle]
-pub extern "C" fn perry_ui_table_set_allows_multiple_selection(_h: i64, _allow: i64) {}
-#[no_mangle]
-pub extern "C" fn perry_ui_table_get_selected_rows_count(_h: i64) -> i64 {
-    0
+pub extern "C" fn perry_ui_table_set_on_sort_change(h: i64, cb: f64) {
+    widgets::table::set_on_sort_change(h, cb);
 }
 #[no_mangle]
-pub extern "C" fn perry_ui_table_get_selected_row_at(_h: i64, _n: i64) -> i64 {
-    -1
+pub extern "C" fn perry_ui_table_set_allows_multiple_selection(h: i64, allow: i64) {
+    widgets::table::set_allows_multiple_selection(h, allow);
 }
 #[no_mangle]
-pub extern "C" fn perry_ui_table_set_filter_text(_h: i64, _t: i64) {}
+pub extern "C" fn perry_ui_table_get_selected_rows_count(h: i64) -> i64 {
+    widgets::table::get_selected_rows_count(h)
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_table_get_filter_text(_h: i64) -> f64 {
-    f64::from_bits(0x7FFC_0000_0000_0001)
+pub extern "C" fn perry_ui_table_get_selected_row_at(h: i64, n: i64) -> i64 {
+    widgets::table::get_selected_row_at(h, n)
+}
+#[no_mangle]
+pub extern "C" fn perry_ui_table_set_filter_text(h: i64, t: i64) {
+    widgets::table::set_filter_text(h, t as *const u8);
+}
+#[no_mangle]
+pub extern "C" fn perry_ui_table_get_filter_text(h: i64) -> f64 {
+    let ptr = widgets::table::get_filter_text(h);
+    // Wrap as NaN-boxed STRING_TAG (top16 = 0x7FFF, lower 48 = pointer).
+    f64::from_bits(0x7FFF_0000_0000_0000_u64 | (ptr as u64 & 0x0000_FFFF_FFFF_FFFF))
 }
 
 /// TreeView (#480) — real Win32 impl via SysTreeView32 + TVN_SELCHANGEDW.
@@ -1661,12 +1712,14 @@ pub extern "C" fn perry_plugin_unload(_handle: i64) {}
 // implementations.
 
 #[no_mangle]
-pub extern "C" fn perry_ui_qrcode_create() -> i64 {
-    0
+pub extern "C" fn perry_ui_qrcode_create(data_ptr: i64, size: f64) -> i64 {
+    widgets::qrcode::create(data_ptr as *const u8, size)
 }
 
 #[no_mangle]
-pub extern "C" fn perry_ui_qrcode_set_data(_handle: i64, _data_ptr: i64) {}
+pub extern "C" fn perry_ui_qrcode_set_data(handle: i64, data_ptr: i64) {
+    widgets::qrcode::set_data(handle, data_ptr as *const u8);
+}
 
 #[no_mangle]
 pub extern "C" fn perry_ui_scrollview_end_refreshing(_handle: i64) {}
@@ -1821,6 +1874,13 @@ pub extern "C" fn perry_get_scale_factor() -> f64 {
     0.0
 }
 
+/// Layout-change callback registration — stub on every platform
+/// (matches macOS shape). Real on-resize plumbing would wire WM_SIZE
+/// → callback dispatch; for now apps poll dimensions via
+/// `perry_get_screen_width` / `perry_get_screen_height`.
+#[no_mangle]
+pub extern "C" fn perry_on_layout_change(_callback: f64) {}
+
 #[no_mangle]
 pub extern "C" fn perry_get_orientation() -> i64 {
     0
@@ -1950,20 +2010,22 @@ pub extern "C" fn perry_ui_poll_open_file() -> i64 {
 }
 
 // =============================================================================
-// TextArea (multi-line text editor) stubs
+// TextArea — Win32 EDIT control with ES_MULTILINE | WS_VSCROLL
 // =============================================================================
 
 #[no_mangle]
-pub extern "C" fn perry_ui_textarea_create(_on_change: f64) -> i64 {
-    0
+pub extern "C" fn perry_ui_textarea_create(on_change: f64) -> i64 {
+    widgets::textarea::create(on_change)
 }
 
 #[no_mangle]
-pub extern "C" fn perry_ui_textarea_set_string(_handle: i64, _text_ptr: i64) {}
+pub extern "C" fn perry_ui_textarea_set_string(handle: i64, text_ptr: i64) {
+    widgets::textarea::set_string(handle, text_ptr as *const u8);
+}
 
 #[no_mangle]
-pub extern "C" fn perry_ui_textarea_get_string(_handle: i64) -> i64 {
-    0
+pub extern "C" fn perry_ui_textarea_get_string(handle: i64) -> i64 {
+    widgets::textarea::get_string(handle)
 }
 
 // =============================================================================
@@ -2205,15 +2267,21 @@ pub extern "C" fn perry_media_destroy(handle: f64) {
 // =============================================================================
 
 #[no_mangle]
-pub extern "C" fn perry_ui_bottom_nav_create(_on_select: f64) -> i64 {
-    0
+pub extern "C" fn perry_ui_bottom_nav_create(on_select: f64) -> i64 {
+    widgets::bottom_nav::create(on_select)
 }
 #[no_mangle]
-pub extern "C" fn perry_ui_bottom_nav_add_item(_handle: i64, _icon_ptr: i64, _label_ptr: i64) {}
+pub extern "C" fn perry_ui_bottom_nav_add_item(handle: i64, icon_ptr: i64, label_ptr: i64) {
+    widgets::bottom_nav::add_item(handle, icon_ptr as *const u8, label_ptr as *const u8);
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_bottom_nav_set_badge(_handle: i64, _index: i64, _badge_ptr: i64) {}
+pub extern "C" fn perry_ui_bottom_nav_set_badge(handle: i64, index: i64, badge_ptr: i64) {
+    widgets::bottom_nav::set_badge(handle, index, badge_ptr as *const u8);
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_bottom_nav_set_selected(_handle: i64, _index: i64) {}
+pub extern "C" fn perry_ui_bottom_nav_set_selected(handle: i64, index: i64) {
+    widgets::bottom_nav::set_selected(handle, index);
+}
 
 #[no_mangle]
 pub extern "C" fn perry_ui_lazyvstack_set_refresh_control(_handle: i64, _callback: f64) {}
@@ -2237,10 +2305,14 @@ pub extern "C" fn perry_ui_scrollview_set_scroll_end_callback(
 }
 
 #[no_mangle]
-pub extern "C" fn perry_ui_image_gallery_create(_on_index_change: f64) -> i64 {
-    0
+pub extern "C" fn perry_ui_image_gallery_create(on_index_change: f64) -> i64 {
+    widgets::image_gallery::create(on_index_change)
 }
 #[no_mangle]
-pub extern "C" fn perry_ui_image_gallery_add_image(_handle: i64, _url_ptr: i64, _alt_ptr: i64) {}
+pub extern "C" fn perry_ui_image_gallery_add_image(handle: i64, url_ptr: i64, alt_ptr: i64) {
+    widgets::image_gallery::add_image(handle, url_ptr as *const u8, alt_ptr as *const u8);
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_image_gallery_set_index(_handle: i64, _index: i64) {}
+pub extern "C" fn perry_ui_image_gallery_set_index(handle: i64, index: i64) {
+    widgets::image_gallery::set_index(handle, index);
+}
