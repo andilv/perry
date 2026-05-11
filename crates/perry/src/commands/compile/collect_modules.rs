@@ -495,7 +495,31 @@ pub(super) fn collect_modules(
             }
         } else {
             // Could not resolve - might be a Node.js builtin or missing module
-            // For now, treat unresolved non-native imports as errors
+            // Issue #629: hard-error on namespace imports (`import * as X from ...`)
+            // for unresolved modules. Pre-fix the codegen catch-all produced a
+            // typeof-"object" empty-namespace stub; property access cleanly read
+            // undefined, but the cascade ("X is undefined" / silent no-ops when
+            // calling missing methods) is worse than a compile-time failure
+            // because the user has no idea their namespace is empty. Named
+            // imports (`import { foo } from "..."`) and bare side-effect
+            // imports still warn-and-continue per the existing behavior, since
+            // those produce more pointed runtime errors at the actual missing
+            // binding rather than silently no-op-ing every method call.
+            let has_namespace_specifier = import.specifiers.iter().any(|s| {
+                matches!(s, perry_hir::ImportSpecifier::Namespace { .. })
+            });
+            if has_namespace_specifier {
+                return Err(anyhow::anyhow!(
+                    "Could not resolve namespace import `import * as ... from \"{source}\"` in {filename}.\n\
+                     Perry has no stdlib bindings for this module path, so the namespace would compile to an empty object \
+                     — every method call on it would silently no-op at runtime. Pick one:\n  \
+                       • switch to named imports: `import {{ foo }} from \"{source}\"` (still resolves through whatever backing exists, but fails fast at the actual missing binding),\n  \
+                       • remove the import if it's unused,\n  \
+                       • or add the module to perry-stdlib / perry-ext-* / perry.compilePackages.",
+                    source = import.source,
+                    filename = filename,
+                ));
+            }
             if !import.is_native {
                 match format {
                     OutputFormat::Text => {
