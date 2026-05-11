@@ -279,6 +279,31 @@ pub(super) fn lower_fn_expr(ctx: &mut LoweringContext, fn_expr: &ast::FnExpr) ->
         }
     }
 
+    // #677: synthesize `arguments` for non-arrow function expressions when the
+    // body references it. Function expressions get their own `arguments`
+    // binding per spec — they don't inherit from the enclosing scope.
+    let user_has_arguments_param = fn_expr
+        .function
+        .params
+        .iter()
+        .any(|p| get_pat_name(&p.pat).ok().as_deref() == Some("arguments"));
+    let user_has_rest = fn_expr
+        .function
+        .params
+        .iter()
+        .any(|p| is_rest_param(&p.pat));
+    let needs_arguments_synth = !user_has_arguments_param
+        && !user_has_rest
+        && fn_expr
+            .function
+            .body
+            .as_ref()
+            .map(|b| crate::lower_decl::body_uses_arguments(&b.stmts))
+            .unwrap_or(false);
+    if needs_arguments_synth {
+        crate::lower_decl::append_synthetic_arguments_param(ctx, &mut params);
+    }
+
     // Generate Let statements for destructuring patterns BEFORE lowering body
     let mut destructuring_stmts = Vec::new();
     for (param_id, pat) in &destructuring_params {

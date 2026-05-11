@@ -200,10 +200,37 @@ fn expr_uses_arguments(expr: &ast::Expr) -> bool {
             .as_ref()
             .map(|args| args.iter().any(|a| expr_uses_arguments(&a.expr)))
             .unwrap_or(false),
-        // Don't descend into nested function declarations or arrow function
-        // bodies — those have their own (or shadowed) `arguments` binding.
+        // Arrows inherit `arguments` from the enclosing function (per spec).
+        // If an inner arrow references `arguments`, the enclosing non-arrow
+        // function must synthesize the binding so the arrow's closure
+        // capture mechanism can see it via the scope chain.
+        ast::Expr::Arrow(a) => match &*a.body {
+            ast::BlockStmtOrExpr::BlockStmt(b) => body_uses_arguments(&b.stmts),
+            ast::BlockStmtOrExpr::Expr(e) => expr_uses_arguments(e),
+        },
+        // Don't descend into nested function declarations or function
+        // expressions — those have their own `arguments` binding that
+        // shadows the enclosing scope.
         _ => false,
     }
+}
+
+/// Synthesize a trailing `...arguments` rest parameter. Call after lowering
+/// the user's parameters, before lowering the body, when the body references
+/// `arguments` and the user hasn't already bound it (either explicitly or via
+/// their own rest param).
+pub(crate) fn append_synthetic_arguments_param(
+    ctx: &mut LoweringContext,
+    params: &mut Vec<Param>,
+) {
+    let arguments_id = ctx.define_local("arguments".to_string(), Type::Any);
+    params.push(Param {
+        id: arguments_id,
+        name: "arguments".to_string(),
+        ty: Type::Any,
+        default: None,
+        is_rest: true,
+    });
 }
 
 pub(crate) fn lower_fn_decl(ctx: &mut LoweringContext, fn_decl: &ast::FnDecl) -> Result<Function> {
@@ -280,14 +307,7 @@ pub(crate) fn lower_fn_decl(ctx: &mut LoweringContext, fn_decl: &ast::FnDecl) ->
     // trailing args into an array for any rest param, and `Expr::Ident("arguments")`
     // resolves to a LocalGet of this param.
     if needs_arguments_synth {
-        let arguments_id = ctx.define_local("arguments".to_string(), Type::Any);
-        params.push(Param {
-            id: arguments_id,
-            name: "arguments".to_string(),
-            ty: Type::Any,
-            default: None,
-            is_rest: true,
-        });
+        append_synthetic_arguments_param(ctx, &mut params);
     }
 
     // Register parameters with known native types as native instances
@@ -2155,6 +2175,22 @@ pub(crate) fn lower_constructor(
         }
     }
 
+    // #677: synthesize `arguments` if the body references it and no user
+    // param already binds it (TsParamProp can't be a rest, so the only
+    // conflicts come from explicit `arguments` params or other rest params).
+    let user_has_arguments_param = params.iter().any(|p| p.name == "arguments");
+    let user_has_rest = params.iter().any(|p| p.is_rest);
+    let needs_arguments_synth = !user_has_arguments_param
+        && !user_has_rest
+        && ctor
+            .body
+            .as_ref()
+            .map(|b| body_uses_arguments(&b.stmts))
+            .unwrap_or(false);
+    if needs_arguments_synth {
+        append_synthetic_arguments_param(ctx, &mut params);
+    }
+
     // Issue #572: generate destructuring extractions BEFORE lowering the
     // body so destructured names are in scope for identifier resolution.
     let mut destructuring_stmts: Vec<Stmt> = Vec::new();
@@ -2488,6 +2524,25 @@ pub(crate) fn lower_class_method(
         if is_destructuring_pattern(inner_pat) {
             destructuring_params.push((param_id, inner_pat.clone()));
         }
+    }
+
+    // #677: synthesize `arguments` if the method body references it.
+    let user_has_arguments_param = method
+        .function
+        .params
+        .iter()
+        .any(|p| get_pat_name(&p.pat).ok().as_deref() == Some("arguments"));
+    let user_has_rest = method.function.params.iter().any(|p| is_rest_param(&p.pat));
+    let needs_arguments_synth = !user_has_arguments_param
+        && !user_has_rest
+        && method
+            .function
+            .body
+            .as_ref()
+            .map(|b| body_uses_arguments(&b.stmts))
+            .unwrap_or(false);
+    if needs_arguments_synth {
+        append_synthetic_arguments_param(ctx, &mut params);
     }
 
     // Extract return type (with context). Phase 4: when the method has no
@@ -2863,6 +2918,25 @@ pub(crate) fn lower_private_method(
         if is_destructuring_pattern(inner_pat) {
             destructuring_params.push((param_id, inner_pat.clone()));
         }
+    }
+
+    // #677: synthesize `arguments` if the private method body references it.
+    let user_has_arguments_param = method
+        .function
+        .params
+        .iter()
+        .any(|p| get_pat_name(&p.pat).ok().as_deref() == Some("arguments"));
+    let user_has_rest = method.function.params.iter().any(|p| is_rest_param(&p.pat));
+    let needs_arguments_synth = !user_has_arguments_param
+        && !user_has_rest
+        && method
+            .function
+            .body
+            .as_ref()
+            .map(|b| body_uses_arguments(&b.stmts))
+            .unwrap_or(false);
+    if needs_arguments_synth {
+        append_synthetic_arguments_param(ctx, &mut params);
     }
 
     // Extract return type
@@ -3710,6 +3784,29 @@ pub(crate) fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Re
                     if is_destructuring_pattern(&param.pat) {
                         destructuring_params.push((param_id, param.pat.clone()));
                     }
+                }
+
+                // #677: synthesize `arguments` for nested function decls.
+                let user_has_arguments_param = fn_decl
+                    .function
+                    .params
+                    .iter()
+                    .any(|p| get_pat_name(&p.pat).ok().as_deref() == Some("arguments"));
+                let user_has_rest = fn_decl
+                    .function
+                    .params
+                    .iter()
+                    .any(|p| is_rest_param(&p.pat));
+                let needs_arguments_synth = !user_has_arguments_param
+                    && !user_has_rest
+                    && fn_decl
+                        .function
+                        .body
+                        .as_ref()
+                        .map(|b| body_uses_arguments(&b.stmts))
+                        .unwrap_or(false);
+                if needs_arguments_synth {
+                    append_synthetic_arguments_param(ctx, &mut params);
                 }
 
                 // Generate destructuring stmts

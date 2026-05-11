@@ -7052,6 +7052,7 @@ pub(crate) fn lower_expr(ctx: &mut LoweringContext, expr: &ast::Expr) -> Result<
                     && name != "String"
                     && name != "Number"
                     && name != "Boolean"
+                    && name != "Function"
                     && name != "Error"
                     && name != "TypeError"
                     && name != "RangeError"
@@ -7340,6 +7341,15 @@ pub(crate) fn lower_expr(ctx: &mut LoweringContext, expr: &ast::Expr) -> Result<
             // checks fail). The static methods are real functions in
             // Node, so fold to the literal "function" string here.
             if matches!(unary.op, ast::UnaryOp::TypeOf) {
+                // #677: bare `typeof Function` — Function is a JS built-in
+                // constructor, so typeof is "function". Without this fold,
+                // the bare ident lowers to `GlobalGet(0)` and typeof reads
+                // "object" via the global-this short-circuit.
+                if let ast::Expr::Ident(id) = unary.arg.as_ref() {
+                    if id.sym.as_ref() == "Function" && ctx.lookup_local("Function").is_none() {
+                        return Ok(Expr::String("function".to_string()));
+                    }
+                }
                 if let ast::Expr::Member(member) = unary.arg.as_ref() {
                     if let ast::Expr::Ident(obj_ident) = member.obj.as_ref() {
                         if let ast::MemberProp::Ident(prop_ident) = &member.prop {
@@ -7349,6 +7359,18 @@ pub(crate) fn lower_expr(ctx: &mut LoweringContext, expr: &ast::Expr) -> Result<
                                 || (obj_name == "Array" && is_known_array_static_method(prop_name))
                             {
                                 return Ok(Expr::String("function".to_string()));
+                            }
+                            // #677: `typeof Function.prototype` → "object".
+                            // `Function.prototype` is the (immutable) prototype
+                            // chain root for all functions; in Node typeof is
+                            // "object". Other `Function.<X>` reads (`Function.name`,
+                            // etc.) fall through to GlobalGet member-access,
+                            // which today returns `undefined`.
+                            if obj_name == "Function"
+                                && prop_name == "prototype"
+                                && ctx.lookup_local("Function").is_none()
+                            {
+                                return Ok(Expr::String("object".to_string()));
                             }
                         }
                     }
