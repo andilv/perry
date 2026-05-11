@@ -3224,6 +3224,7 @@ fn is_widget_factory(name: &str) -> bool {
             | "Toggle"
             | "Slider"
             | "Picker"
+            | "Combobox"
             | "ProgressView"
             | "Section"
             | "Tabs"
@@ -4171,6 +4172,12 @@ fn emit_widget(
                     mutations,
                 ),
                 "Picker" => emit_picker(args, callbacks),
+                // Issue #475 — Combobox(initial, onChange) maps to ArkUI
+                // Select. Runtime-added items (`comboboxAddItem`) are
+                // currently not folded into the static options array;
+                // the emitted Select shows the `initial` value as its
+                // only option. Tracked for v1.1 follow-up.
+                "Combobox" => emit_combobox(args, callbacks),
                 "ProgressView" => emit_progressview(args),
                 "Section" => emit_section(
                     args,
@@ -5839,6 +5846,48 @@ fn emit_picker(args: &[Expr], callbacks: &mut Vec<Expr>) -> String {
         "TextPicker({{ range: {opts}, value: {init} }}){onchange}",
         opts = options,
         init = initial,
+        onchange = onchange,
+    )
+}
+
+/// Issue #475 — `Combobox(initial, onChange)` → ArkUI `Select([...])` with
+/// `.value()` / `.selected()` / `.onSelect()`. ArkUI's Select takes a
+/// `SelectOption[]` (each option is `{value: string}`); `.value()` sets
+/// the currently displayed label; `.onSelect((index, value) => ...)` fires
+/// when the user picks an item.
+///
+/// v1 limitation: runtime `comboboxAddItem(widget, value)` calls aren't
+/// folded into the static options list — only the `initial` string seeds
+/// the dropdown. The macOS path's NSComboBox completion behavior doesn't
+/// have a direct ArkUI analog; Select shows the dropdown on tap, which
+/// is acceptable for the v1 milestone (#475).
+fn emit_combobox(args: &[Expr], callbacks: &mut Vec<Expr>) -> String {
+    let initial = first_string_arg(args).unwrap_or_default();
+    let initial_lit = arkts_string_lit(&initial);
+
+    let onchange = match args.get(1) {
+        Some(closure @ Expr::Closure { .. }) => {
+            let idx = callbacks.len();
+            callbacks.push(closure.clone());
+            format!(
+                ".onSelect((_index: number, value: string) => {{\n    \
+                 perryEntry.invokeCallback1({}, value);\n    \
+                 {drain}\
+                 }})",
+                idx,
+                drain = drain_loop_body()
+            )
+        }
+        _ => String::new(),
+    };
+
+    // ArkUI Select requires a non-empty options array. Seed it with the
+    // initial value so the dropdown isn't empty on first render. Real
+    // app code that calls `comboboxAddItem` repeatedly will need a v1.1
+    // mutator-style fold (similar to widgetAddChild) — out of scope #475 v1.
+    format!(
+        "Select([{{ value: {init} }}]).selected(0).value({init}){onchange}",
+        init = initial_lit,
         onchange = onchange,
     )
 }
@@ -8124,6 +8173,29 @@ mod tests {
         assert!(r
             .ets_source
             .contains("perryEntry.invokeCallback1(0, index)"));
+        assert_eq!(r.callbacks.len(), 1);
+    }
+
+    #[test]
+    fn combobox_emits_arkui_select() {
+        // Issue #475 — Combobox(initial, onChange) → Select with onSelect.
+        // Asserts the canonical patterns: Select( + .onSelect( + the
+        // initial value used as both .value() and the only seed option.
+        let mut m = empty_module();
+        m.init.push(app_with_body(nmc(
+            "Combobox",
+            vec![Expr::String("Apple".into()), closure_stub()],
+        )));
+        let r = emit_index_ets(&mut m).unwrap().unwrap();
+        assert!(r.ets_source.contains("Select("));
+        assert!(r.ets_source.contains(".value('Apple')"));
+        assert!(r.ets_source.contains(".onSelect("));
+        assert!(r
+            .ets_source
+            .contains("perryEntry.invokeCallback1(0, value)"));
+        // Drain is wired so showToast / setText inside the closure body
+        // surface after onSelect returns.
+        assert!(r.ets_source.contains("perryEntry.drainToast()"));
         assert_eq!(r.callbacks.len(), 1);
     }
 
