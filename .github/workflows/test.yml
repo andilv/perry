@@ -342,7 +342,33 @@ jobs:
             test_timer \
             test_phase2v3_3_show_toast_set_text \
             test_issue_351_media_playback \
-            test_issue_442_inline_button_bg "
+            test_issue_442_inline_button_bg \
+            test_issue_538_background_tasks \
+            test_issue_553_mobile_widgets \
+            test_issue_556_table_array \
+            test_issue_556_table_concat \
+            test_issue_610_foreach \
+            test_issue_610_smoke \
+            test_issue_640_navstack_textfield \
+            test_parity_async_hooks \
+            test_parity_buffer \
+            test_parity_child_process \
+            test_parity_crypto \
+            test_parity_events \
+            test_parity_fs \
+            test_parity_http \
+            test_parity_http2 \
+            test_parity_https \
+            test_parity_net \
+            test_parity_path \
+            test_parity_process \
+            test_parity_readline \
+            test_parity_stream \
+            test_parity_tls \
+            test_parity_url \
+            test_parity_util \
+            test_parity_worker_threads \
+            test_parity_zlib "
 
           rm -rf "$LOGS_DIR"
           mkdir -p "$LOGS_DIR"
