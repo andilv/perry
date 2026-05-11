@@ -1128,14 +1128,17 @@ pub extern "C" fn perry_ui_widget_set_tooltip(handle: i64, text_ptr: i64) {
     widgets::set_tooltip(handle, text_ptr as *const u8);
 }
 
-/// Rich tooltip stub (issue #479). Android long-press popup window with
-/// arbitrary content tree is a future iteration.
+/// Rich tooltip (issue #479) — long-press on `handle` pops up a
+/// `PopupWindow` hosting the subtree at `content_handle`. `hover_delay_ms`
+/// is ignored on Android (touch devices have no hover model); the system
+/// long-press duration is used instead.
 #[no_mangle]
 pub extern "C" fn perry_ui_widget_set_rich_tooltip(
-    _handle: i64,
-    _content_handle: i64,
-    _hover_delay_ms: f64,
+    handle: i64,
+    content_handle: i64,
+    hover_delay_ms: f64,
 ) {
+    widgets::rich_tooltip::set_rich_tooltip(handle, content_handle, hover_delay_ms);
 }
 
 #[no_mangle]

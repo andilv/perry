@@ -1801,6 +1801,35 @@ object PerryBridge {
         )
     }
 
+    // ============================================================
+    // Issue #479 — RichTooltip (long-press PopupWindow).
+    // ============================================================
+    //
+    // Android has no hover model on touch devices, so the cross-platform
+    // `hover_delay_ms` argument is dropped on the Rust side and the system
+    // long-press duration (~500 ms) is used here. The popup hosts the
+    // content widget subtree directly; outside-touch dismisses it.
+
+    @JvmStatic
+    fun setRichTooltip(trigger: View, content: View) {
+        trigger.setOnLongClickListener {
+            (content.parent as? android.view.ViewGroup)?.removeView(content)
+            val popup = android.widget.PopupWindow(
+                content,
+                android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
+                android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
+                true
+            )
+            popup.isOutsideTouchable = true
+            popup.setBackgroundDrawable(
+                android.graphics.drawable.ColorDrawable(0xFFFFFFFF.toInt())
+            )
+            popup.elevation = 8f
+            popup.showAsDropDown(trigger)
+            true
+        }
+    }
+
     @JvmStatic
     fun richTextToggleUnderline(et: EditText) {
         uiHandler.post {
