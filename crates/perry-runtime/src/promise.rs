@@ -1795,6 +1795,16 @@ pub extern "C" fn js_promise_race(promises_arr: *const crate::array::ArrayHeader
         return result_promise;
     }
 
+    // Both handlers capture only `result_promise` and don't depend on
+    // the input index — so allocate once and share across all N inputs.
+    // Saves (N-1) × 2 closure allocs per Promise.race call.
+    let shared_resolve =
+        js_closure_alloc(promise_race_resolve_handler as *const u8, 1);
+    js_closure_set_capture_ptr(shared_resolve, 0, result_promise as i64);
+    let shared_reject =
+        js_closure_alloc(promise_race_reject_handler as *const u8, 1);
+    js_closure_set_capture_ptr(shared_reject, 0, result_promise as i64);
+
     // For each promise, attach resolve/reject handlers that settle the result promise.
     // Per the spec, even when an input promise is already settled we MUST route the
     // resolution through the microtask queue (by registering `.then` handlers) rather
@@ -1810,31 +1820,14 @@ pub extern "C" fn js_promise_race(promises_arr: *const crate::array::ArrayHeader
             // Non-promise value — wrap as an already-resolved promise so the
             // resolution goes through the normal microtask path.
             let wrapped = js_promise_resolved(promise_f64);
-            let resolve_closure = js_closure_alloc(promise_race_resolve_handler as *const u8, 1);
-            js_closure_set_capture_ptr(resolve_closure, 0, result_promise as i64);
-            let reject_closure = js_closure_alloc(promise_race_reject_handler as *const u8, 1);
-            js_closure_set_capture_ptr(reject_closure, 0, result_promise as i64);
-            js_promise_then(wrapped, resolve_closure, reject_closure);
+            js_promise_then(wrapped, shared_resolve, shared_reject);
             continue;
         }
         let promise_ptr = js_nanbox_get_pointer(promise_f64) as *mut Promise;
 
-        // Always use js_promise_then even for already-settled promises.
-        // This ensures race resolution goes through the microtask queue,
-        // matching the spec-mandated ordering vs other pending callbacks.
-        let resolve_closure = js_closure_alloc(
-            promise_race_resolve_handler as *const u8,
-            1, // 1 capture: result_promise
-        );
-        js_closure_set_capture_ptr(resolve_closure, 0, result_promise as i64);
-
-        // Create reject handler closure (captures result_promise)
-        let reject_closure = js_closure_alloc(promise_race_reject_handler as *const u8, 1);
-        js_closure_set_capture_ptr(reject_closure, 0, result_promise as i64);
-
         // Attach handlers via then — if the input is already settled this will
         // push a microtask rather than resolving result_promise synchronously.
-        js_promise_attach_handlers(promise_ptr, resolve_closure, reject_closure);
+        js_promise_attach_handlers(promise_ptr, shared_resolve, shared_reject);
     }
 
     result_promise
