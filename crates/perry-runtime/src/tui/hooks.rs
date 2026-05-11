@@ -75,6 +75,51 @@ static NEXT_HOOK_IDX: AtomicUsize = AtomicUsize::new(0);
 
 const TAG_UNDEFINED: u64 = 0x7FFC_0000_0000_0001;
 
+/// GC root scanner — emits every heap-pointer-bearing slot value so
+/// the tracing GC keeps `useState`/`useMemo`/`useRef` payloads alive
+/// across collections.
+///
+/// Without this, a `setMessages(messages.concat([…]))` call (or any
+/// other store-an-array-into-state pattern) leaves the new array
+/// referenced only from `SLOTS[idx].value_bits`. The very next
+/// allocation can trigger a minor GC that finds no other root for the
+/// array and reclaims it. Subsequent renders read stale bits and
+/// `messages.map(…)` produces nothing visible — the symptom that
+/// surfaced in the perry-code demo (#679 follow-up).
+///
+/// `Effect` slots intentionally don't emit `cleanup` because it's
+/// always 0 today; when cleanup-on-dep-change wiring lands the
+/// scanner will need to emit it too.
+pub fn scan_hook_slot_roots(mark: &mut dyn FnMut(f64)) {
+    let s = match SLOTS.try_lock() {
+        Ok(g) => g,
+        // The render loop holds the lock while building widgets; if GC
+        // fires from inside that path we just skip this scan rather
+        // than deadlocking. Any pointer transitively reachable from a
+        // local will still be picked up by the conservative stack scan.
+        Err(_) => return,
+    };
+    for slot in s.iter() {
+        match slot {
+            HookSlot::State { value_bits } => mark(f64::from_bits(*value_bits)),
+            HookSlot::Memo {
+                value_bits,
+                computed,
+                ..
+            } => {
+                if *computed {
+                    mark(f64::from_bits(*value_bits));
+                }
+            }
+            HookSlot::Ref { value_bits } => mark(f64::from_bits(*value_bits)),
+            // TODO: when useEffect cleanup-on-dep-change wiring lands,
+            // emit `cleanup` here too — it'll hold a NaN-boxed POINTER
+            // to a Perry closure that the GC otherwise can't see.
+            HookSlot::Effect { .. } | HookSlot::Focus { .. } => {}
+        }
+    }
+}
+
 /// Reset the hook index at the top of each render. Called by run.rs.
 pub fn reset_hook_index() {
     NEXT_HOOK_IDX.store(0, Ordering::Release);

@@ -33,6 +33,21 @@ pub static STATE_DIRTY: AtomicBool = AtomicBool::new(false);
 /// cleanly.
 static SLOTS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
+/// GC root scanner — emits every slot value so heap-allocated JS
+/// arrays/objects/strings stashed via `state.set(...)` stay reachable
+/// across collections. Same rationale as `hooks::scan_hook_slot_roots`.
+/// Pre-fix only numeric-state demos worked; storing an array reference
+/// then triggering allocation freed it (#679 follow-up).
+pub fn scan_state_slot_roots(mark: &mut dyn FnMut(f64)) {
+    let s = match SLOTS.try_lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    for bits in s.iter() {
+        mark(f64::from_bits(*bits));
+    }
+}
+
 /// Allocate a fresh state slot with the given initial value (NaN-boxed
 /// JSValue bits). Returns the slot index as the handle.
 #[no_mangle]

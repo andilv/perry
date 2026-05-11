@@ -3629,6 +3629,16 @@ pub fn gc_init() {
     gc_register_root_scanner(crate::promise::scan_iter_result_root);
     // Async-step thunk single-slot cache (build_async_step_thunks).
     gc_register_root_scanner(crate::promise::scan_async_step_thunk_cache);
+    // perry/tui hook + state slot pools — they store raw NaN-boxed
+    // value bits but the GC has no other way to know which slots hold
+    // heap pointers (arrays/objects/strings stashed via setState /
+    // useState / useRef). #679 follow-up: pre-fix, an Enter-press in
+    // the perry-code demo stored a freshly-concat'd messages array,
+    // the next allocation triggered minor GC, and the array was
+    // reclaimed because nothing else held it — `messages.map(…)` on
+    // the stale pointer produced an empty render.
+    gc_register_root_scanner(crate::tui::hooks::scan_hook_slot_roots);
+    gc_register_root_scanner(crate::tui::state::scan_state_slot_roots);
     #[cfg(feature = "ohos-napi")]
     gc_register_root_scanner(crate::arkts_callbacks::arkts_callbacks_root_scanner);
 }
