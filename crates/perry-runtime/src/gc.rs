@@ -1448,22 +1448,27 @@ fn gc_collect_inner() -> u64 {
 /// lookup is fast enough that the few thousand stack-scan candidate
 /// validations per GC barely move the total.
 pub(crate) struct ValidPointerSet {
-    // Insertion-side staging: `arena_sorted` is filled in ascending
-    // order by the address-sorted arena walk (already sorted), and
-    // `malloc_sorted` is filled in MallocState insertion order then
-    // sorted in `finalize()`. After `finalize()` both staging vecs are
-    // empty (their contents merged into `merged_sorted` for lookup).
+    /// Insertion-side staging for arena entries — filled in ascending
+    /// order by the address-sorted arena walk. Swapped into
+    /// `merged_sorted` in `finalize()` so `enclosing_object` can do
+    /// its interior-pointer floor-search. Malloc entries are *not*
+    /// staged here: they are inserted directly into `lookup_set`
+    /// during the malloc walk, bypassing the per-cycle
+    /// `sort_unstable` + merge that dominated `build_valid_pointer_set`
+    /// on promise-heavy kernels (5-6 % of total kernel time).
     arena_sorted: Vec<usize>,
-    malloc_sorted: Vec<usize>,
-    /// Single sorted vec across both regions, populated in `finalize()`.
-    /// Kept for `enclosing_object`'s interior-pointer lookup (a
-    /// floor-search that the hashset can't answer). Hot `contains`
-    /// lookups go through `lookup_set` instead — O(log n) binary search
-    /// over a 100k+ entry vec dominated the GC mark phase on
-    /// promise-heavy kernels (`try_mark_value` 28 % self-time on
-    /// `promise_all_chains`: each call paid ~17 cache misses through a
-    /// 1.2 MB sorted Vec, called millions of times per cycle while
-    /// scanning closure captures + promise fields).
+    /// Arena-only sorted vec, populated in `finalize()` by swapping
+    /// `arena_sorted` in. Kept for `enclosing_object`'s
+    /// interior-pointer floor-search (a lookup the hashset can't
+    /// answer). Malloc objects (Closure, Promise, String, Map, Error,
+    /// BigInt, Symbol) are deliberately omitted — every Perry runtime
+    /// function that holds an interior pointer across user callbacks
+    /// (`js_array_reduce`'s `elements_ptr = arr + 8`, etc.) does so
+    /// against an arena-allocated array/buffer; malloc-tracked types
+    /// are always accessed via their start (user pointer) and never
+    /// give rise to interior-pointer probes. If that invariant ever
+    /// changes, the malloc walk in `build_valid_pointer_set` must
+    /// also populate `arena_sorted` (or a separate sorted vec).
     merged_sorted: Vec<usize>,
     /// O(1) hash set for the hot `contains` path. Built from
     /// `merged_sorted` in `finalize()` with `PtrHasher` (Fibonacci-
@@ -1495,7 +1500,6 @@ impl ValidPointerSet {
         let est = arena_capacity + malloc_capacity;
         Self {
             arena_sorted: Vec::with_capacity(arena_capacity),
-            malloc_sorted: Vec::with_capacity(malloc_capacity),
             merged_sorted: Vec::new(),
             lookup_set: std::collections::HashSet::with_capacity_and_hasher(
                 est * 2,
@@ -1511,67 +1515,56 @@ impl ValidPointerSet {
     fn push_arena(&mut self, ptr: usize) {
         self.arena_sorted.push(ptr);
     }
-    fn push_malloc(&mut self, ptr: usize) {
-        self.malloc_sorted.push(ptr);
-    }
     fn finalize(&mut self) {
-        // arena_sorted is built pre-sorted by the address-sorted walk;
-        // only the malloc tail (insertion-order) needs sorting. It's
-        // typically a few thousand entries — fast even with
-        // sort_unstable's pdqsort.
-        self.malloc_sorted.sort_unstable();
+        // `merged_sorted` is arena-only — `build_valid_pointer_set`
+        // direct-inserts malloc entries into `lookup_set`, so the
+        // expensive `malloc_sorted.sort_unstable()` + merge pass that
+        // dominated `build_valid_pointer_set` on
+        // `promise_all_chains` (~30 ms × 3 cycles = ~90 ms total,
+        // 5.78 % of kernel time) is gone. `enclosing_object` uses
+        // `merged_sorted` for interior-pointer floor-search — see
+        // `build_valid_pointer_set` for the correctness note that
+        // restricts that lookup to arena objects.
+        std::mem::swap(&mut self.merged_sorted, &mut self.arena_sorted);
 
-        // Merge the two sorted vecs into one. Each `contains` call in
-        // the mark phase otherwise does TWO binary searches (one per
-        // region); a single merged vec halves that — material on
-        // ABC451D-shaped allocation-heavy workloads where `contains`
-        // is called millions of times per GC cycle. The merge is O(n)
-        // and runs once per cycle (here in finalize); the mark-phase
-        // savings are O(n × log n × calls), so even at million-entry
-        // scale the trade favors the merged layout.
-        if self.arena_sorted.is_empty() {
-            std::mem::swap(&mut self.merged_sorted, &mut self.malloc_sorted);
-        } else if self.malloc_sorted.is_empty() {
-            std::mem::swap(&mut self.merged_sorted, &mut self.arena_sorted);
-        } else {
-            self.merged_sorted
-                .reserve(self.arena_sorted.len() + self.malloc_sorted.len());
-            let (mut i, mut j) = (0usize, 0usize);
-            let (a, m) = (&self.arena_sorted, &self.malloc_sorted);
-            while i < a.len() && j < m.len() {
-                if a[i] <= m[j] {
-                    self.merged_sorted.push(a[i]);
-                    i += 1;
-                } else {
-                    self.merged_sorted.push(m[j]);
-                    j += 1;
-                }
-            }
-            self.merged_sorted.extend_from_slice(&a[i..]);
-            self.merged_sorted.extend_from_slice(&m[j..]);
-        }
-
-        // Compute the min/max range from the merged vec (sorted, so
-        // first/last are the extremes). Empty regions leave the
-        // sentinel values, which the `maybe_contains` short-circuit
-        // handles via `if ptr < min || ptr > max` — both extremes will
-        // exclude every input.
+        // Compute the `merged_sorted` (arena) range first, then
+        // extend with the malloc range that was tracked separately
+        // in `range_min` / `range_max` via the
+        // `record_malloc_for_range` calls during the build. The
+        // final `[range_min, range_max]` covers BOTH regions so
+        // `maybe_contains` still prefilters correctly for malloc
+        // pointers (closures/promises) that fall outside the
+        // arena address span.
         if let (Some(&first), Some(&last)) =
             (self.merged_sorted.first(), self.merged_sorted.last())
         {
-            self.range_min = first;
-            self.range_max = last;
+            if first < self.range_min {
+                self.range_min = first;
+            }
+            if last > self.range_max {
+                self.range_max = last;
+            }
         }
 
-        // Build the hot-path hash set from the merged Vec. Iterating
-        // the Vec gives cache-friendly sequential reads; hashbrown
-        // distributes them into buckets. Sized with 2× headroom in
-        // `new()` so this `extend` does no rehashing — a single
-        // allocation up front and a tight insert loop. Empirical:
-        // on `promise_all_chains` (~100 k malloc entries) the build
-        // takes ~1 ms per cycle while saving 15+ ms on the mark
-        // phase's `contains` calls.
+        // Insert the arena entries into the unified `lookup_set`.
+        // Malloc entries are already in there (inserted directly by
+        // `build_valid_pointer_set`'s malloc walk). The hashset was
+        // sized in `new()` to hold both regions without rehashing.
         self.lookup_set.extend(self.merged_sorted.iter().copied());
+    }
+    /// Track the address span of malloc entries so `maybe_contains`'s
+    /// `[range_min, range_max]` prefilter still rejects out-of-range
+    /// pointers correctly. `build_valid_pointer_set` calls this once
+    /// per malloc user pointer alongside the direct `lookup_set.insert`.
+    /// Cheap branch-free min/max update; no Vec materialization.
+    #[inline(always)]
+    fn record_malloc_for_range(&mut self, ptr: usize) {
+        if ptr < self.range_min {
+            self.range_min = ptr;
+        }
+        if ptr > self.range_max {
+            self.range_max = ptr;
+        }
     }
     /// Cheap O(1) range-rejection prefilter. Most stack words and
     /// register spills are not heap pointers; if the candidate falls
@@ -1651,14 +1644,35 @@ fn build_valid_pointer_set() -> ValidPointerSet {
         set.push_arena(user_ptr as usize);
     });
 
-    // Malloc objects (insertion order, NOT sorted — finalize sorts the
-    // small malloc-only Vec separately so the 1.6 M arena run never
-    // gets touched by driftsort's merge phase).
+    // Malloc objects: insert *directly* into the lookup_set,
+    // bypassing `malloc_sorted` + the per-cycle
+    // `sort_unstable() + merge`. On promise-heavy kernels
+    // `MallocState.objects` is millions of entries (~2.1 M on
+    // `promise_all_chains`); the per-cycle `sort_unstable` was
+    // ~30 ms (5-6 % of total kernel time) and the
+    // subsequent `lookup_set.extend(...)` did the same hashset
+    // inserts anyway. Cutting straight to `lookup_set.insert` gives
+    // us the same hashset content without the Vec materialization,
+    // sort, or merge step.
+    //
+    // Correctness note: this means `merged_sorted` (and therefore
+    // `enclosing_object`) contains arena entries only. That is the
+    // intended scope: every Perry runtime function known to derive
+    // an interior pointer (`js_array_reduce`'s `elements_ptr = arr + 8`,
+    // `js_buffer_data = buf + 8`, etc.) holds it across user
+    // callbacks for an *arena-allocated* array/buffer; malloc-tracked
+    // types (Closure, Promise, String, Map, Error, BigInt, Symbol)
+    // are accessed exclusively at their user pointer (object start).
+    // If a future runtime function starts holding an interior pointer
+    // into a malloc-allocated object, this comment is the place to
+    // revisit.
     MALLOC_STATE.with(|s| {
         let s = s.borrow();
         for &header in s.objects.iter() {
             let user_ptr = unsafe { (header as *mut u8).add(GC_HEADER_SIZE) };
-            set.push_malloc(user_ptr as usize);
+            let addr = user_ptr as usize;
+            set.lookup_set.insert(addr);
+            set.record_malloc_for_range(addr);
         }
     });
 
