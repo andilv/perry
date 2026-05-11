@@ -1557,6 +1557,64 @@ pub extern "C" fn js_array_fill(arr: *mut ArrayHeader, value: f64) -> *mut Array
     }
 }
 
+/// `Array.prototype.fill(value, start, end)` — fills the index range
+/// `[start, end)` with `value`. Per ECMA-262: negative indices count from
+/// the end (`len + idx`), then are clamped to `[0, len]`. `end > len`
+/// clamps to `len`, `start > end` yields no-op. Returns the same array.
+#[no_mangle]
+pub extern "C" fn js_array_fill_range(
+    arr: *mut ArrayHeader,
+    value: f64,
+    start: f64,
+    end: f64,
+) -> *mut ArrayHeader {
+    let arr = clean_arr_ptr_mut(arr);
+    if arr.is_null() {
+        return arr;
+    }
+    unsafe {
+        let len = (*arr).length as i64;
+        if len == 0 {
+            return arr;
+        }
+        let clamp = |idx: f64, default_to_len: bool| -> i64 {
+            if idx.is_nan() {
+                return 0;
+            }
+            let mut i = idx as i64;
+            if idx.is_infinite() {
+                if idx > 0.0 {
+                    return len;
+                }
+                if default_to_len {
+                    return len;
+                }
+                return 0;
+            }
+            if i < 0 {
+                i += len;
+                if i < 0 {
+                    i = 0;
+                }
+            }
+            if i > len {
+                i = len;
+            }
+            i
+        };
+        let s = clamp(start, false);
+        let e = clamp(end, true);
+        if s >= e {
+            return arr;
+        }
+        let elements = (arr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut f64;
+        for i in s..e {
+            *elements.add(i as usize) = value;
+        }
+        arr
+    }
+}
+
 /// `Array.prototype.sort()` — default sort with no comparator. Per JS
 /// semantics, elements are converted to strings and compared
 /// lexicographically. Sorts in place and returns the same array pointer.

@@ -477,21 +477,51 @@ pub(crate) fn lower_array_method(
             Ok(blk.call(DOUBLE, "js_array_shift_f64", &[(I64, &recv_handle)]))
         }
         "fill" => {
-            if args.len() != 1 {
-                bail!(
-                    "perry-codegen: Array.fill expects 1 arg, got {}",
+            // ECMA-262 Array.prototype.fill(value, start?, end?). The
+            // 2-/3-arg forms route through `js_array_fill_range` which
+            // applies the spec's negative-index + clamp rules and fills
+            // `[start, end)`. The 1-arg form keeps the existing
+            // whole-array fast path.
+            match args.len() {
+                1 => {
+                    let val_box = lower_expr(ctx, &args[0])?;
+                    let blk = ctx.block();
+                    let recv_handle = unbox_to_i64(blk, &recv_box);
+                    let result = blk.call(
+                        I64,
+                        "js_array_fill",
+                        &[(I64, &recv_handle), (DOUBLE, &val_box)],
+                    );
+                    Ok(nanbox_pointer_inline(blk, &result))
+                }
+                2 | 3 => {
+                    let val_box = lower_expr(ctx, &args[0])?;
+                    let start_d = lower_expr(ctx, &args[1])?;
+                    let end_d = if args.len() == 3 {
+                        lower_expr(ctx, &args[2])?
+                    } else {
+                        // Default end = +Infinity → clamps to length in the runtime.
+                        crate::nanbox::double_literal(f64::INFINITY)
+                    };
+                    let blk = ctx.block();
+                    let recv_handle = unbox_to_i64(blk, &recv_box);
+                    let result = blk.call(
+                        I64,
+                        "js_array_fill_range",
+                        &[
+                            (I64, &recv_handle),
+                            (DOUBLE, &val_box),
+                            (DOUBLE, &start_d),
+                            (DOUBLE, &end_d),
+                        ],
+                    );
+                    Ok(nanbox_pointer_inline(blk, &result))
+                }
+                _ => bail!(
+                    "perry-codegen: Array.fill expects 1-3 args, got {}",
                     args.len()
-                );
+                ),
             }
-            let val_box = lower_expr(ctx, &args[0])?;
-            let blk = ctx.block();
-            let recv_handle = unbox_to_i64(blk, &recv_box);
-            let result = blk.call(
-                I64,
-                "js_array_fill",
-                &[(I64, &recv_handle), (DOUBLE, &val_box)],
-            );
-            Ok(nanbox_pointer_inline(blk, &result))
         }
         "unshift" => {
             if args.len() != 1 {
