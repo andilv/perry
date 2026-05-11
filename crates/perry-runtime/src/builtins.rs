@@ -1239,6 +1239,14 @@ pub extern "C" fn js_value_typeof(value: f64) -> *mut StringHeader {
                 return get_cached(&TYPEOF_OBJECT, "object");
             }
         }
+        // Date — stored as a raw f64 millisecond timestamp, registered
+        // in `DATE_REGISTRY` because the value carries no tag of its
+        // own. `typeof new Date()` must be "object" per ECMA-262 — any
+        // duck-type test (`typeof v === "object" && v instanceof Date`)
+        // gates Date handling on this returning the right thing.
+        if crate::date::is_registered_date_bits(bits) {
+            return get_cached(&TYPEOF_OBJECT, "object");
+        }
         // Regular f64 number
         get_cached(&TYPEOF_NUMBER, "number")
     }
