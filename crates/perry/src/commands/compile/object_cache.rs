@@ -516,6 +516,7 @@ mod object_cache_tests {
             is_entry_module: false,
             non_entry_module_prefixes: Vec::new(),
             import_function_prefixes: std::collections::HashMap::new(),
+            namespace_member_prefixes: std::collections::HashMap::new(),
             emit_ir_only: false,
             namespace_imports: Vec::new(),
             imported_classes: Vec::new(),
