@@ -13,6 +13,19 @@ REPORT_DIR="$SCRIPT_DIR/test-parity/reports"
 BACKEND_FLAG=""
 BACKEND_LABEL="LLVM"
 
+# Optional substring filter — only test files whose basename contains
+# this string get executed. Useful for iterating on a subset:
+#   ./run_parity_tests.sh --filter parity_url
+#   ./run_parity_tests.sh --filter parity_     # all parity-inventory tests
+TEST_FILTER=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --filter) TEST_FILTER="$2"; shift 2 ;;
+        --filter=*) TEST_FILTER="${1#--filter=}"; shift ;;
+        *) shift ;;
+    esac
+done
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -170,6 +183,8 @@ normalize_output() {
         # appeared after the Node v25 upgrade and has nothing to do
         # with Perry's output).
         sed -E '/^\(node:[0-9]+\) \[MODULE_TYPELESS_PACKAGE_JSON\]/d' | \
+        sed -E '/^\(node:[0-9]+\) \[DEP[0-9]+\] DeprecationWarning:/d' | \
+        sed -E '/^\(Use `node --trace-deprecation/d' | \
         sed -E '/^Reparsing as ES module because module syntax was detected/d' | \
         sed -E '/^To eliminate this warning, add "type": "module"/d' | \
         sed -E '/^\(Use `node --trace-warnings/d' | \
@@ -292,6 +307,12 @@ for test_file in "$TEST_DIR"/*.ts; do
     [[ -d "$test_file" ]] && continue
 
     test_name=$(basename "$test_file" .ts)
+
+    # Optional --filter flag: only run tests whose basename contains it.
+    if [[ -n "$TEST_FILTER" ]] && [[ "$test_name" != *"$TEST_FILTER"* ]]; then
+        continue
+    fi
+
     node_output_file="$OUTPUT_DIR/node/${test_name}.txt"
     perry_output_file="$OUTPUT_DIR/perry/${test_name}.txt"
     perry_binary="/tmp/perry_parity_$test_name"
@@ -333,12 +354,14 @@ for test_file in "$TEST_DIR"/*.ts; do
     # Save Node.js output
     echo "$node_output" > "$node_output_file"
 
-    # Compile with Perry. Direct invocation of the release binary built
-    # above — pre-fix this was `cargo run --quiet --bin perry --` (no
-    # `--release`), which silently triggered a debug build of perry that
-    # was both slower as a compiler and incurred per-call cargo overhead
-    # × ~150 tests. Direct binary call shaves multiple minutes off CI.
-    compile_output=$("$PERRY_BIN" $BACKEND_FLAG "$test_file" -o "$perry_binary" 2>&1)
+    # Compile with Perry. test_parity_* files run in permissive mode
+    # (PERRY_ALLOW_UNIMPLEMENTED=1) so unimplemented APIs surface as
+    # runtime divergence (the gap signal) instead of hard compile errors.
+    compile_env=""
+    if [[ "$test_name" == test_parity_* ]]; then
+        compile_env="PERRY_ALLOW_UNIMPLEMENTED=1"
+    fi
+    compile_output=$(env $compile_env "$PERRY_BIN" $BACKEND_FLAG "$test_file" -o "$perry_binary" 2>&1)
     compile_exit=$?
 
     if [[ $compile_exit -ne 0 ]]; then
