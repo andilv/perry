@@ -3179,6 +3179,47 @@ fn collect_mutations_in_expr(
                 cond,
             );
         }
+        // Issue #479 — `widgetSetRichTooltip(target, content, hoverDelayMs)`
+        // → ArkUI `.bindPopup(...)` modifier. ArkUI's bindPopup ships
+        // both a simple-message variant (`{message: string}`) and a
+        // builder variant (`{builder: () => CustomBuilder}`); the
+        // simple-message form is the fidelity-correct match for a
+        // text-only tooltip, the builder form would be needed for
+        // truly rich custom-widget tooltips (v1.1 follow-up — wiring
+        // the builder requires access to emit_widget machinery which
+        // collect_mutations_in_expr doesn't have).
+        //
+        // For v1 we extract a plain-text payload from the content
+        // widget when it resolves to a simple `Text(string)` call;
+        // anything more complex degrades to a comment marker so the
+        // user can see the gap. Hover-delay arg is documented but
+        // not honored — ArkUI's popup show-trigger is implicit
+        // (long-press / click), matching the android long-press
+        // semantics the brief calls out as acceptable.
+        "widgetSetRichTooltip" => {
+            let content_text = args
+                .get(1)
+                .and_then(|content| resolve_tooltip_text(content, bindings));
+            if let Some(text) = content_text {
+                push_mut(
+                    Mutation::Modifier(format!(
+                        ".bindPopup(false, {{ message: {} }})",
+                        arkts_string_lit(&text)
+                    )),
+                    out,
+                    cond,
+                );
+            } else {
+                push_mut(
+                    Mutation::Comment(
+                        "widgetSetRichTooltip: non-static content widget, simple-popup fallback skipped (v1.1 follow-up)"
+                            .to_string(),
+                    ),
+                    out,
+                    cond,
+                );
+            }
+        }
         // Unrecognized mutator on a known target — log a comment so the
         // user can see the gap. Avoids silent fidelity loss.
         other => {
@@ -3252,6 +3293,36 @@ fn mutator_target_local_id(args: &[Expr]) -> Option<LocalId> {
         Some(Expr::LocalGet(id)) => Some(*id),
         _ => None,
     }
+}
+
+/// Issue #479 — extract a plain-text payload from a tooltip content
+/// widget expression. The harvest can fold runtime-built widget trees
+/// into ArkUI source via emit_widget, but the modifier pre-walk runs
+/// before that pass and only has access to `bindings`. For v1 we
+/// recognize the canonical shape `Text(literal-string)`, both as a
+/// direct call and as a `LocalGet(id)` that resolves through bindings
+/// to one. Anything else (HStack/VStack content, dynamic strings,
+/// closure-captured locals) returns None and the caller falls back
+/// to a comment.
+fn resolve_tooltip_text(expr: &Expr, bindings: &HashMap<LocalId, Expr>) -> Option<String> {
+    let mut cur = expr;
+    for _ in 0..16 {
+        match cur {
+            Expr::NativeMethodCall {
+                module, method, args, ..
+            } if module == "perry/ui" && method == "Text" => {
+                if let Some(Expr::String(s)) = args.first() {
+                    return Some(s.clone());
+                }
+                return None;
+            }
+            Expr::LocalGet(id) => {
+                cur = bindings.get(id)?;
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// Issue #413 — return the ArkUI cross-axis alignment enum name for the
@@ -8635,6 +8706,76 @@ mod tests {
             r.ets_source
                 .contains(".backgroundColor('rgba(51, 128, 242, 1)')"),
             "expected rgba background:\n{}",
+            r.ets_source
+        );
+    }
+
+    #[test]
+    fn issue_479_widget_set_rich_tooltip_emits_bind_popup_modifier() {
+        // const btn = Button("Save");
+        // const tip = Text("Press to save now");
+        // widgetSetRichTooltip(btn, tip, 500);
+        // App({body: btn});
+        //
+        // Asserts the tooltip lowers to ArkUI's `.bindPopup(false, {
+        // message: '...' })` modifier chained off the trigger widget.
+        // The hover delay is documented but not honored — ArkUI's
+        // popup show-trigger is implicit (long-press / click).
+        let mut m = empty_module();
+        let btn_id: LocalId = 100;
+        let tip_id: LocalId = 101;
+        m.init.push(let_widget(
+            btn_id,
+            "btn",
+            nmc("Button", vec![Expr::String("Save".into())]),
+        ));
+        m.init.push(let_widget(
+            tip_id,
+            "tip",
+            nmc("Text", vec![Expr::String("Press to save now".into())]),
+        ));
+        m.init.push(mutator_stmt(
+            "widgetSetRichTooltip",
+            vec![
+                Expr::LocalGet(btn_id),
+                Expr::LocalGet(tip_id),
+                Expr::Number(500.0),
+            ],
+        ));
+        m.init.push(app_with_body(Expr::LocalGet(btn_id)));
+        let r = emit_index_ets(&mut m).unwrap().unwrap();
+        assert!(
+            r.ets_source.contains(".bindPopup(false, { message: 'Press to save now' })"),
+            "expected bindPopup modifier:\n{}",
+            r.ets_source
+        );
+    }
+
+    #[test]
+    fn issue_479_widget_set_rich_tooltip_with_inline_text_content() {
+        // Same as above but the content widget is constructed inline,
+        // without an intervening LocalGet binding — exercises the
+        // direct-call branch of resolve_tooltip_text.
+        let mut m = empty_module();
+        let btn_id: LocalId = 110;
+        m.init.push(let_widget(
+            btn_id,
+            "btn",
+            nmc("Button", vec![Expr::String("Save".into())]),
+        ));
+        m.init.push(mutator_stmt(
+            "widgetSetRichTooltip",
+            vec![
+                Expr::LocalGet(btn_id),
+                nmc("Text", vec![Expr::String("inline tip".into())]),
+                Expr::Number(0.0),
+            ],
+        ));
+        m.init.push(app_with_body(Expr::LocalGet(btn_id)));
+        let r = emit_index_ets(&mut m).unwrap().unwrap();
+        assert!(
+            r.ets_source.contains(".bindPopup(false, { message: 'inline tip' })"),
+            "expected bindPopup modifier:\n{}",
             r.ets_source
         );
     }
