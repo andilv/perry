@@ -1950,6 +1950,86 @@ fn try_mark_value_or_raw(word: u64, valid_ptrs: &ValidPointerSet) -> bool {
     true
 }
 
+/// Specialized mark-and-enqueue for trace-phase field walks.
+///
+/// `trace_closure`, `trace_array`, `trace_object`, `trace_map`,
+/// `trace_promise.value/.reason` all share the same pattern: read a
+/// heap-field word that is either a NaN-boxed JSValue or a raw I64
+/// pointer at an object start, mark it if live, and push the marked
+/// header onto the local worklist. The generic
+/// `try_mark_value_or_raw` is general enough to also handle
+/// conservative stack scans (raw interior pointers via
+/// `enclosing_object`) and root scans (push to MARK_SEEDS so the
+/// trace-marked-objects entry point can pick them up), but BOTH of
+/// those features are pure overhead inside `drain_trace_worklist`:
+///
+/// 1. Field words never hold interior pointers — they're written via
+///    `arr[i] = x` / `obj.f = x` / closure capture stores, all of
+///    which use the object-start user pointer. Skipping
+///    `enclosing_object` saves a binary-search lookup per field.
+///
+/// 2. The MARK_SEEDS push happens once per newly-marked object during
+///    trace, but the same header is also pushed onto the local
+///    worklist by the caller (so the trace drain visits it). The
+///    extra MARK_SEEDS push goes onto a TLS vec, gets cleared at the
+///    start of the next cycle, and is pure waste while we're already
+///    in the trace phase. Skipping it saves a TLS slot deref +
+///    Vec::push per marked object.
+///
+/// 3. The caller-side re-decode of the NaN-tag (to figure out
+///    POINTER_MASK extraction vs raw-pointer extraction) is folded
+///    into this function, so the caller doesn't pay that switch a
+///    second time.
+///
+/// The valid-pointer hashset check is still load-bearing here — we
+/// only elide the secondary `enclosing_object` fallback.
+#[inline(always)]
+unsafe fn mark_field_into_worklist(
+    val_bits: u64,
+    valid_ptrs: &ValidPointerSet,
+    worklist: &mut Vec<*mut GcHeader>,
+) {
+    let tag = val_bits & TAG_MASK;
+    let ptr_val: usize = if tag == POINTER_TAG || tag == STRING_TAG || tag == BIGINT_TAG {
+        let p = (val_bits & POINTER_MASK) as usize;
+        if p == 0 {
+            return;
+        }
+        p
+    } else {
+        // Possible raw-I64 pointer. Reject anything with NaN-tag bits
+        // (already handled above) or anything outside the 48-bit
+        // user-address range. f64 numbers have the exponent bits set,
+        // which puts them well above 0x0000_FFFF_FFFF_FFFF — they're
+        // rejected here.
+        if !(0x1000..=0x0000_FFFF_FFFF_FFFF).contains(&val_bits) {
+            return;
+        }
+        val_bits as usize
+    };
+
+    // Range gate + hashset lookup. No enclosing_object fallback:
+    // trace-phase field words always store user pointers at object
+    // starts, not interior pointers (those only arise in conservative
+    // stack scanning, which uses `try_mark_value_or_raw`).
+    if !valid_ptrs.contains(&ptr_val) {
+        return;
+    }
+
+    let header = header_from_user_ptr(ptr_val as *const u8);
+    let flags = (*header).gc_flags;
+    if flags & (GC_FLAG_MARKED | GC_FLAG_PINNED) != 0 {
+        return;
+    }
+    (*header).gc_flags = flags | GC_FLAG_MARKED;
+    // Push directly onto the caller's worklist. No MARK_SEEDS push —
+    // that's only needed for root-phase callers that don't own a
+    // worklist (mark_global_roots, mark_registered_roots,
+    // mark_remembered_set_roots, mark_stack_roots). The trace drain
+    // already owns and consumes this worklist.
+    worklist.push(header);
+}
+
 /// Get the bottom (highest address) of the current thread's stack.
 #[cfg(target_os = "macos")]
 fn get_stack_bottom() -> usize {
@@ -2388,30 +2468,23 @@ unsafe fn trace_map(
         return;
     }
 
-    // Each entry is 2 x f64 (key + value)
+    // Each entry is 2 x f64 (key + value). Specialized field walker
+    // for both — see `mark_field_into_worklist`.
     for i in 0..(size as usize) {
         let key_bits = *entries.add(i * 2);
         let val_bits = *entries.add(i * 2 + 1);
-
-        // Mark and trace key
-        if try_mark_value_or_raw(key_bits, valid_ptrs) {
-            // Newly marked — add to worklist for transitive tracing
-            let ptr_val = extract_ptr_from_bits(key_bits);
-            if ptr_val > 0 && valid_ptrs.contains(&ptr_val) {
-                worklist.push(header_from_user_ptr(ptr_val as *const u8));
-            }
-        }
-        // Mark and trace value
-        if try_mark_value_or_raw(val_bits, valid_ptrs) {
-            let ptr_val = extract_ptr_from_bits(val_bits);
-            if ptr_val > 0 && valid_ptrs.contains(&ptr_val) {
-                worklist.push(header_from_user_ptr(ptr_val as *const u8));
-            }
-        }
+        mark_field_into_worklist(key_bits, valid_ptrs, worklist);
+        mark_field_into_worklist(val_bits, valid_ptrs, worklist);
     }
 }
 
 /// Extract a raw pointer value from NaN-boxed or raw bits.
+///
+/// Previously called from `trace_map`; now subsumed by
+/// `mark_field_into_worklist` which folds the extraction and the
+/// mark-and-enqueue dance into one inlined step. Kept for any
+/// external callers / future use.
+#[allow(dead_code)]
 fn extract_ptr_from_bits(bits: u64) -> usize {
     let tag = bits & TAG_MASK;
     match tag {
@@ -2467,18 +2540,10 @@ unsafe fn trace_array(
     let elements =
         (user_ptr as *const u8).add(std::mem::size_of::<crate::array::ArrayHeader>()) as *const u64;
 
+    // Specialized field walker — see `mark_field_into_worklist`.
     for i in 0..length as usize {
         let val_bits = *elements.add(i);
-        if try_mark_value_or_raw(val_bits, valid_ptrs) {
-            let tag = val_bits & TAG_MASK;
-            let ptr_val = if tag == POINTER_TAG || tag == STRING_TAG || tag == BIGINT_TAG {
-                (val_bits & POINTER_MASK) as usize
-            } else {
-                val_bits as usize // raw pointer
-            };
-            let header = header_from_user_ptr(ptr_val as *const u8);
-            worklist.push(header);
-        }
+        mark_field_into_worklist(val_bits, valid_ptrs, worklist);
     }
 }
 
@@ -2502,20 +2567,13 @@ unsafe fn trace_object(
     let fields = (user_ptr as *const u8).add(std::mem::size_of::<crate::object::ObjectHeader>())
         as *const u64;
 
-    // Trace each field — use try_mark_value_or_raw since codegen may store raw I64 pointers
-    // (e.g., for is_pointer variables) alongside NaN-boxed JSValues.
+    // Trace each field with the specialized field walker (handles both
+    // NaN-boxed JSValues and raw I64 pointers — codegen stores some
+    // fields as raw I64 for is_pointer typed variables). See
+    // `mark_field_into_worklist` for why this beats `try_mark_value_or_raw`.
     for i in 0..field_count as usize {
         let val_bits = *fields.add(i);
-        if try_mark_value_or_raw(val_bits, valid_ptrs) {
-            let tag = val_bits & TAG_MASK;
-            let ptr_val = if tag == POINTER_TAG || tag == STRING_TAG || tag == BIGINT_TAG {
-                (val_bits & POINTER_MASK) as usize
-            } else {
-                val_bits as usize // raw pointer
-            };
-            let header = header_from_user_ptr(ptr_val as *const u8);
-            worklist.push(header);
-        }
+        mark_field_into_worklist(val_bits, valid_ptrs, worklist);
     }
 
     // Trace keys_array pointer.
@@ -2655,19 +2713,14 @@ unsafe fn trace_closure(
     let captures = (user_ptr as *const u8).add(std::mem::size_of::<crate::closure::ClosureHeader>())
         as *const u64;
 
+    // Specialized field walker: skips MARK_SEEDS push (caller owns
+    // `worklist`) and the interior-pointer fallback (closure capture
+    // slots only hold user-pointer object starts). See
+    // `mark_field_into_worklist` for why this beats the generic
+    // `try_mark_value_or_raw` path on this hot loop.
     for i in 0..capture_count as usize {
         let val_bits = *captures.add(i);
-        if try_mark_value_or_raw(val_bits, valid_ptrs) {
-            // Determine the actual heap pointer: NaN-boxed uses lower 48 bits, raw uses full value
-            let tag = val_bits & TAG_MASK;
-            let ptr_val = if tag == POINTER_TAG || tag == STRING_TAG || tag == BIGINT_TAG {
-                (val_bits & POINTER_MASK) as usize
-            } else {
-                val_bits as usize // raw pointer
-            };
-            let header = header_from_user_ptr(ptr_val as *const u8);
-            worklist.push(header);
-        }
+        mark_field_into_worklist(val_bits, valid_ptrs, worklist);
     }
 }
 
@@ -2679,18 +2732,10 @@ unsafe fn trace_promise(
 ) {
     let promise = user_ptr as *const crate::promise::Promise;
 
-    // Trace value and reason — may be NaN-boxed JSValues or raw I64 pointers
+    // Trace value and reason — may be NaN-boxed JSValues or raw I64 pointers.
+    // Specialized field walker — see `mark_field_into_worklist`.
     for &val_bits in &[(*promise).value.to_bits(), (*promise).reason.to_bits()] {
-        if try_mark_value_or_raw(val_bits, valid_ptrs) {
-            let tag = val_bits & TAG_MASK;
-            let ptr_val = if tag == POINTER_TAG || tag == STRING_TAG || tag == BIGINT_TAG {
-                (val_bits & POINTER_MASK) as usize
-            } else {
-                val_bits as usize
-            };
-            let header = header_from_user_ptr(ptr_val as *const u8);
-            worklist.push(header);
-        }
+        mark_field_into_worklist(val_bits, valid_ptrs, worklist);
     }
 
     // Trace on_fulfilled and on_rejected (closure pointers)
