@@ -3267,6 +3267,7 @@ fn is_widget_factory(name: &str) -> bool {
             | "Picker"
             | "Combobox"
             | "RichTextEditor"
+            | "Calendar"
             | "ProgressView"
             | "Section"
             | "Tabs"
@@ -4254,6 +4255,11 @@ fn emit_widget(
                 // maps to ArkUI RichEditor. HTML round-trip + per-span
                 // bold/italic/underline toggles are #478 v1.1.
                 "RichTextEditor" => emit_richtexteditor(args, callbacks),
+                // Issue #481 — Calendar(year, month, onChange) maps to
+                // ArkUI's CalendarPicker. Per the #481 v1 brief, the
+                // picker variant is simpler than the full Calendar
+                // (which would need a builder for cell rendering).
+                "Calendar" => emit_calendar(args, callbacks),
                 "ProgressView" => emit_progressview(args),
                 "Section" => emit_section(
                     args,
@@ -6023,6 +6029,59 @@ fn emit_richtexteditor(args: &[Expr], callbacks: &mut Vec<Expr>) -> String {
     format!(
         "RichEditor({{ controller: new RichEditorController() }}){sizing}{onchange}",
         sizing = sizing,
+        onchange = onchange,
+    )
+}
+
+/// Issue #481 — `Calendar(year, month, onChange)` → ArkUI
+/// `CalendarPicker({selected: new Date(year, month-1, 1)}).onChange(...)`.
+/// CalendarPicker fires `.onChange((value: Date) => ...)` when the user
+/// picks a date. Perry's `onChange` receives an ISO `yyyy-MM-dd` string
+/// (POSIX-locale), so the forwarded payload is `value.toISOString().split('T')[0]`.
+///
+/// JavaScript's `Date` constructor takes `(year, monthIndex, day)` where
+/// monthIndex is 0-based; Perry passes a 1-based month per its TS
+/// signature, so we emit `month - 1` literally when both args resolve.
+/// When the args don't resolve to literals, we fall back to today's
+/// date (`new Date()`) — the user can still pick a date even if the
+/// initial highlight is wrong, which is strictly better than emitting
+/// an invalid Date object.
+fn emit_calendar(args: &[Expr], callbacks: &mut Vec<Expr>) -> String {
+    let year = numeric_arg(args, 0);
+    let month = numeric_arg(args, 1);
+    let selected = match (year, month) {
+        (Some(y), Some(m)) => {
+            // ArkUI's Date constructor wants (year, monthIndex, day).
+            let m_idx = (m as i64).saturating_sub(1).max(0);
+            format!("new Date({}, {}, 1)", y as i64, m_idx)
+        }
+        _ => "new Date()".to_string(),
+    };
+
+    let onchange = match args.get(2) {
+        Some(closure @ Expr::Closure { .. }) => {
+            let idx = callbacks.len();
+            callbacks.push(closure.clone());
+            // ArkUI's CalendarPicker.onChange hands us a `Date`; convert
+            // to the ISO yyyy-MM-dd shape Perry's TS surface promises.
+            // .toISOString() returns "yyyy-MM-ddTHH:mm:ss.sssZ" — split
+            // at 'T' and take the date half.
+            format!(
+                ".onChange((value: Date) => {{\n    \
+                 const __iso = value.toISOString().split('T')[0];\n    \
+                 perryEntry.invokeCallback1({}, __iso);\n    \
+                 {drain}\
+                 }})",
+                idx,
+                drain = drain_loop_body()
+            )
+        }
+        _ => String::new(),
+    };
+
+    format!(
+        "CalendarPicker({{ selected: {sel} }}){onchange}",
+        sel = selected,
         onchange = onchange,
     )
 }
@@ -8357,6 +8416,45 @@ mod tests {
         assert!(r.ets_source.contains(".onIMEInputComplete("));
         assert!(r.ets_source.contains("perryEntry.invokeCallback1(0, ''"));
         assert_eq!(r.callbacks.len(), 1);
+    }
+
+    #[test]
+    fn calendar_emits_arkui_calendar_picker() {
+        // Issue #481 — Calendar(2026, 5, onChange) → CalendarPicker
+        // with selected = new Date(2026, 4, 1) (month is 0-indexed in
+        // JS Date) and an onChange that converts the Date payload to
+        // an ISO yyyy-MM-dd string before invoking the TS callback.
+        let mut m = empty_module();
+        m.init.push(app_with_body(nmc(
+            "Calendar",
+            vec![Expr::Number(2026.0), Expr::Number(5.0), closure_stub()],
+        )));
+        let r = emit_index_ets(&mut m).unwrap().unwrap();
+        assert!(r.ets_source.contains("CalendarPicker("));
+        // 1-based month 5 (May) → 0-based monthIndex 4
+        assert!(r.ets_source.contains("new Date(2026, 4, 1)"));
+        assert!(r.ets_source.contains(".onChange((value: Date) => {"));
+        assert!(r.ets_source.contains("value.toISOString().split('T')[0]"));
+        assert!(r.ets_source.contains("perryEntry.invokeCallback1(0, __iso)"));
+        assert_eq!(r.callbacks.len(), 1);
+    }
+
+    #[test]
+    fn calendar_without_literal_args_falls_back_to_today() {
+        // Calendar(yearLocal, monthLocal, _) — args don't resolve to
+        // numeric literals, so the selected date defaults to `new Date()`.
+        let mut m = empty_module();
+        m.init.push(app_with_body(nmc(
+            "Calendar",
+            vec![
+                Expr::String("not-a-number".into()),
+                Expr::String("nope".into()),
+                Expr::Number(0.0),
+            ],
+        )));
+        let r = emit_index_ets(&mut m).unwrap().unwrap();
+        assert!(r.ets_source.contains("CalendarPicker("));
+        assert!(r.ets_source.contains("selected: new Date()"));
     }
 
     #[test]
