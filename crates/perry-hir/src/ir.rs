@@ -542,6 +542,16 @@ pub struct Class {
     pub extends_name: Option<String>,
     /// Native parent class (module_name, class_name) - e.g., ("events", "EventEmitter")
     pub native_extends: Option<(String, String)>,
+    /// Issue #711: `class X extends fn(...)` / `class X extends Y.method(...)` —
+    /// when the super-class expression is anything other than `Ident` or
+    /// `Member` (i.e., not statically resolvable to a known class), we capture
+    /// the lowered expression here. Codegen emits a runtime call
+    /// `js_register_class_parent_dynamic(child_cid, eval(extends_expr))` at
+    /// the source-order position of the class declaration so the parent edge
+    /// in `CLASS_REGISTRY` is wired before the first instance is created.
+    /// `extends` and `extends_name` are both `None` for these classes (the
+    /// parent class_id is only known at runtime).
+    pub extends_expr: Option<Box<Expr>>,
     /// Instance fields
     pub fields: Vec<ClassField>,
     /// Constructor (if any)
@@ -989,6 +999,36 @@ pub enum Expr {
         class_name: String,
         key: Box<Expr>,
         value: Box<Expr>,
+    },
+
+    // Issue #711: dynamic parent-class registration for
+    // `class X extends fn(...)` shapes where the parent class_id is only
+    // known at runtime. Emitted by lower.rs into module.init at the
+    // source-order position of the class declaration. Codegen lowers
+    // `parent_expr` to a Perry value, then calls
+    // `js_register_class_parent_dynamic(class_id, value)` which reads the
+    // value's class_id (via GcHeader for real objects, ClassRef tag for
+    // class references) and wires the (child, parent) edge into
+    // CLASS_REGISTRY. No-op if `parent_expr` evaluates to a value with no
+    // class_id (e.g., a closure or primitive — preserves the "no parent"
+    // baseline rather than crashing).
+    RegisterClassParentDynamic {
+        class_name: String,
+        parent_expr: Box<Expr>,
+    },
+
+    // Issue #711 part 2: `<func_expr>.prototype = <obj_expr>` pattern,
+    // used by Effect's effectable.ts to declare prototype-based
+    // classes. Codegen emits a call to `js_set_function_prototype`
+    // which stores `func_value → synthetic_class_id` in a side-table
+    // and binds the object as the synthetic class's prototype source.
+    // When `class Derived extends <func>` evaluates later, the dynamic
+    // parent registration looks up that synthetic class_id and wires
+    // it into CLASS_REGISTRY so method dispatch on Derived instances
+    // walks through to the prototype object's methods.
+    SetFunctionPrototype {
+        func: Box<Expr>,
+        proto: Box<Expr>,
     },
 
     // Static method call (e.g., Counter.increment())
