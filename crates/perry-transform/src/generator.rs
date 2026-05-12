@@ -1149,6 +1149,27 @@ fn transform_generator_function(
                 }
             }
         }
+        // Rewrite every `Expr::Yield(v)` inside the catch body back to
+        // `Expr::Await(v)`. The earlier `transform_async_to_generator`
+        // pass blanket-rewrote every `await` to `yield` across the whole
+        // function body, including inside catch clauses. But catches are
+        // NOT lifted into state-machine states by `linearize_body` — they
+        // get stashed verbatim and inlined into the `__async_throw`
+        // closure (a regular sync closure, `is_async: false`,
+        // `is_generator: false`). Yields in that closure hit the
+        // `Expr::Yield => double_literal(0.0)` codegen arm — the await
+        // operand is evaluated for side effects, the result is discarded,
+        // and `const r = await helperFn()` binds `r = 0`. User code that
+        // relies on the awaited value silently sees `0` (or fails
+        // downstream with `Cannot read properties of 0`). The flip-back
+        // restores the original await semantics; awaits inside the catch
+        // body run via the busy-wait codegen path (which drains
+        // microtasks while polling promise state — safe because
+        // `__async_throw` is invoked from Task::AsyncStep dispatch where
+        // the microtask runner is already on the stack and re-entrant
+        // drains are no-ops on an empty queue). Doesn't recurse into
+        // nested closures (those have their own await/yield context).
+        rewrite_yield_to_await_in_stmts(&mut rewritten);
         // Rewrite every `Return X` inside the catch body to
         // `Return make_iter_result(X, true)`. The catch body lives inside
         // the `__async_throw` closure; its `Return` exits __async_throw
@@ -2852,6 +2873,113 @@ fn is_iter_result(expr: &Expr) -> bool {
 /// the hot path.
 fn rewrite_iter_results_to_scratch(expr: &mut Expr) {
     rewrite_expr(expr);
+}
+
+/// Rewrite every `Expr::Yield { value, .. }` to `Expr::Await(value)` recursively
+/// through statement and expression trees. Does NOT descend into nested closures
+/// (their await/yield context is independent).
+///
+/// Used by the async-step `__async_throw` builder: the global await→yield
+/// rewrite in `transform_async_to_generator` runs on the whole function body
+/// indiscriminately, but catch bodies aren't lifted into state-machine states —
+/// they're inlined into a regular sync closure where yield codegens to
+/// `double_literal(0.0)`. Flipping the yields back to awaits restores the
+/// busy-wait await semantics for awaits inside catch handlers.
+fn rewrite_yield_to_await_in_stmts(stmts: &mut Vec<Stmt>) {
+    for s in stmts.iter_mut() {
+        rewrite_yield_to_await_in_stmt(s);
+    }
+}
+
+fn rewrite_yield_to_await_in_stmt(stmt: &mut Stmt) {
+    match stmt {
+        Stmt::Expr(e) | Stmt::Throw(e) => rewrite_yield_to_await_in_expr(e),
+        Stmt::Let { init: Some(e), .. } => rewrite_yield_to_await_in_expr(e),
+        Stmt::Return(Some(e)) => rewrite_yield_to_await_in_expr(e),
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            rewrite_yield_to_await_in_expr(condition);
+            rewrite_yield_to_await_in_stmts(then_branch);
+            if let Some(eb) = else_branch.as_mut() {
+                rewrite_yield_to_await_in_stmts(eb);
+            }
+        }
+        Stmt::While { condition, body } | Stmt::DoWhile { body, condition } => {
+            rewrite_yield_to_await_in_expr(condition);
+            rewrite_yield_to_await_in_stmts(body);
+        }
+        Stmt::For {
+            init,
+            condition,
+            update,
+            body,
+        } => {
+            if let Some(i) = init.as_mut() {
+                rewrite_yield_to_await_in_stmt(i.as_mut());
+            }
+            if let Some(c) = condition.as_mut() {
+                rewrite_yield_to_await_in_expr(c);
+            }
+            if let Some(u) = update.as_mut() {
+                rewrite_yield_to_await_in_expr(u);
+            }
+            rewrite_yield_to_await_in_stmts(body);
+        }
+        Stmt::Try {
+            body,
+            catch,
+            finally,
+        } => {
+            rewrite_yield_to_await_in_stmts(body);
+            if let Some(c) = catch.as_mut() {
+                rewrite_yield_to_await_in_stmts(&mut c.body);
+            }
+            if let Some(f) = finally.as_mut() {
+                rewrite_yield_to_await_in_stmts(f);
+            }
+        }
+        Stmt::Switch { cases, .. } => {
+            for case in cases.iter_mut() {
+                rewrite_yield_to_await_in_stmts(&mut case.body);
+            }
+        }
+        Stmt::Labeled { body, .. } => {
+            rewrite_yield_to_await_in_stmt(body.as_mut());
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_yield_to_await_in_expr(expr: &mut Expr) {
+    if let Expr::Yield { value, .. } = expr {
+        let inner = value
+            .take()
+            .map(|b| *b)
+            .unwrap_or(Expr::Undefined);
+        let mut new_inner = inner;
+        rewrite_yield_to_await_in_expr(&mut new_inner);
+        *expr = Expr::Await(Box::new(new_inner));
+        return;
+    }
+    // Recurse into child expressions but stop at Closure boundaries —
+    // a nested closure has its own await/yield context.
+    rewrite_yield_to_await_in_expr_children(expr);
+}
+
+fn rewrite_yield_to_await_in_expr_children(expr: &mut Expr) {
+    use perry_hir::walker::walk_expr_children_mut;
+    // Skip Closure bodies — their inner statements have their own
+    // independent semantics (already-rewritten or not as their own
+    // closure-level pass dictates).
+    if matches!(expr, Expr::Closure { .. }) {
+        return;
+    }
+    walk_expr_children_mut(expr, &mut |child: &mut Expr| {
+        rewrite_yield_to_await_in_expr(child);
+    });
 }
 
 /// Rewrite every `Stmt::Return(Some(X))` to `Stmt::Return(Some(make_iter_result(X, true)))`
