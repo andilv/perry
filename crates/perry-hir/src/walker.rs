@@ -212,6 +212,8 @@ where
         | Expr::MathExp(v)
         | Expr::MathMinSpread(v)
         | Expr::MathMaxSpread(v)
+        | Expr::WebAssemblyValidate(v)
+        | Expr::WebAssemblyInstantiate(v)
         | Expr::Atob(v)
         | Expr::Btoa(v)
         | Expr::TextEncoderEncode(v)
@@ -521,6 +523,17 @@ where
         }
         Expr::MathMin(elements) | Expr::MathMax(elements) | Expr::MathHypot(elements) => {
             for e in elements {
+                f(e);
+            }
+        }
+        Expr::WebAssemblyCallExport {
+            instance,
+            name,
+            args,
+        } => {
+            f(instance);
+            f(name);
+            for e in args {
                 f(e);
             }
         }
@@ -1392,6 +1405,8 @@ where
         | Expr::MathExp(v)
         | Expr::MathMinSpread(v)
         | Expr::MathMaxSpread(v)
+        | Expr::WebAssemblyValidate(v)
+        | Expr::WebAssemblyInstantiate(v)
         | Expr::Atob(v)
         | Expr::Btoa(v)
         | Expr::TextEncoderEncode(v)
@@ -1697,6 +1712,17 @@ where
         }
         Expr::MathMin(elements) | Expr::MathMax(elements) | Expr::MathHypot(elements) => {
             for e in elements {
+                f(e);
+            }
+        }
+        Expr::WebAssemblyCallExport {
+            instance,
+            name,
+            args,
+        } => {
+            f(instance);
+            f(name);
+            for e in args {
                 f(e);
             }
         }

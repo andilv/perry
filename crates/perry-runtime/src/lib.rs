@@ -54,6 +54,19 @@ pub mod timer;
 pub mod typedarray;
 pub mod url;
 pub mod value;
+/// WebAssembly host shims (issue #76). Forward-declares the
+/// `perry_wasm_host_*` C ABI; the wasmi-backed implementation lives in
+/// the separate `perry-wasm-host` crate and is linked in only when the
+/// user passes `--enable-wasm-runtime`.
+///
+/// Gated behind the `wasm-host` Cargo feature so non-wasm programs don't
+/// pull `js_webassembly_*` into libperry_runtime.a — those shims hold
+/// undefined references to `perry_wasm_host_*` which would fail to link
+/// without libperry_wasm_host.a on the line. The auto-optimize path
+/// (crates/perry/src/commands/compile/optimized_libs.rs) flips this
+/// feature on when `ctx.needs_wasm_runtime` is true.
+#[cfg(feature = "wasm-host")]
+pub mod webassembly;
 // `net` moved to `perry-stdlib::net` (event-driven async) in A1/A1.5.
 // The old sync `perry-runtime::net` module is retained as source but
 // not exported so its `js_net_socket_{write,end,destroy}` symbols don't
