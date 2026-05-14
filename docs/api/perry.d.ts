@@ -1,6 +1,6 @@
 // Auto-generated from Perry's API manifest (#465). Do not edit by hand.
 // Source: perry-api-manifest::API_MANIFEST
-// Coverage: 825 entries across 70 modules
+// Coverage: 826 entries across 70 modules
 
 declare module "argon2" {
   /** stdlib */
