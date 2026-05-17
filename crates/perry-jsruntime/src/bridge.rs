@@ -14,6 +14,8 @@ use perry_runtime::JSValue;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
+use crate::interop::{bump_js_handle_released, bump_js_handle_stored, bump_v8_entry, V8EntryKind};
+
 // NaN-boxing constants (must match perry-runtime/src/value.rs)
 const TAG_UNDEFINED: u64 = 0x7FFC_0000_0000_0001;
 const TAG_NULL: u64 = 0x7FFC_0000_0000_0002;
@@ -38,8 +40,61 @@ thread_local! {
     static JS_OBJECT_HANDLES: RefCell<HashMap<u64, v8::Global<v8::Value>>> = RefCell::new(HashMap::new());
     /// Stable V8 constructor-like wrappers for Perry class references.
     static NATIVE_CLASS_HANDLES: RefCell<HashMap<u32, v8::Global<v8::Value>>> = RefCell::new(HashMap::new());
+    /// V8 Promise resolvers waiting on native Perry promises returned through callbacks.
+    static NATIVE_PROMISE_RESOLVERS: RefCell<HashMap<u64, v8::Global<v8::PromiseResolver>>> = RefCell::new(HashMap::new());
+    /// Snapshot of untampered intrinsics used by the conservative JS export
+    /// data-object fast path. Captured during `js_runtime_init`, before user
+    /// modules can replace `globalThis.Object` or its methods.
+    static EXPORT_SNAPSHOT_INTRINSICS: RefCell<Option<ExportSnapshotIntrinsics>> = const { RefCell::new(None) };
     /// Counter for generating unique handle IDs
     static NEXT_HANDLE_ID: Cell<u64> = const { Cell::new(1) };
+    static NEXT_NATIVE_PROMISE_RESOLVER_ID: Cell<u64> = const { Cell::new(1) };
+}
+
+struct ExportSnapshotIntrinsics {
+    object_prototype: v8::Global<v8::Value>,
+    object_is_frozen: v8::Global<v8::Function>,
+}
+
+pub fn capture_export_snapshot_intrinsics(scope: &mut v8::PinScope<'_, '_>) {
+    let Some(intrinsics) = load_export_snapshot_intrinsics(scope) else {
+        // If the lookup of `globalThis.Object` / its `prototype` / `isFrozen`
+        // ever fails at runtime init, every export-data-object fast-path
+        // eligibility check will silently return false (`is_plain_object`
+        // requires the intrinsics cell to be set). That would manifest as a
+        // perf cliff rather than a correctness bug — surface it loudly so
+        // regressions don't hide as "slow but still working".
+        eprintln!(
+            "perry-jsruntime: failed to capture Object intrinsics at init; \
+             JS export-data-object snapshot fast path disabled \
+             (every export read will go through V8 fallback)"
+        );
+        return;
+    };
+    EXPORT_SNAPSHOT_INTRINSICS.with(|cell| {
+        *cell.borrow_mut() = Some(intrinsics);
+    });
+}
+
+fn load_export_snapshot_intrinsics(
+    scope: &mut v8::PinScope<'_, '_>,
+) -> Option<ExportSnapshotIntrinsics> {
+    let global = scope.get_current_context().global(scope);
+    let object_key = v8::String::new(scope, "Object")?;
+    let object_value = global.get(scope, object_key.into())?;
+    let object_ctor = v8::Local::<v8::Object>::try_from(object_value).ok()?;
+
+    let prototype_key = v8::String::new(scope, "prototype")?;
+    let object_prototype = object_ctor.get(scope, prototype_key.into())?;
+
+    let is_frozen_key = v8::String::new(scope, "isFrozen")?;
+    let is_frozen_value = object_ctor.get(scope, is_frozen_key.into())?;
+    let object_is_frozen = v8::Local::<v8::Function>::try_from(is_frozen_value).ok()?;
+
+    Some(ExportSnapshotIntrinsics {
+        object_prototype: v8::Global::new(scope, object_prototype),
+        object_is_frozen: v8::Global::new(scope, object_is_frozen),
+    })
 }
 
 fn native_class_constructor(
@@ -153,6 +208,7 @@ pub fn store_js_handle(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Va
     JS_OBJECT_HANDLES.with(|handles| {
         handles.borrow_mut().insert(handle_id, global);
     });
+    bump_js_handle_stored();
     handle_id
 }
 
@@ -171,7 +227,11 @@ pub fn get_js_handle<'s>(
 
 /// Release a V8 handle from the table
 pub fn release_js_handle(handle: u64) -> bool {
-    JS_OBJECT_HANDLES.with(|handles| handles.borrow_mut().remove(&handle).is_some())
+    let released = JS_OBJECT_HANDLES.with(|handles| handles.borrow_mut().remove(&handle).is_some());
+    if released {
+        bump_js_handle_released();
+    }
+    released
 }
 
 /// Check if a NaN-boxed value is a JS handle
@@ -193,6 +253,35 @@ pub fn get_handle_id(value: f64) -> Option<u64> {
 /// Create a NaN-boxed value representing a JS handle
 pub fn make_js_handle_value(handle_id: u64) -> f64 {
     f64::from_bits(JS_HANDLE_TAG | (handle_id & POINTER_MASK))
+}
+
+fn store_native_promise_resolver(
+    scope: &mut v8::PinScope<'_, '_>,
+    resolver: v8::Local<v8::PromiseResolver>,
+) -> u64 {
+    let resolver_id = NEXT_NATIVE_PROMISE_RESOLVER_ID.with(|id| {
+        let current = id.get();
+        id.set(current + 1);
+        current
+    });
+    NATIVE_PROMISE_RESOLVERS.with(|resolvers| {
+        resolvers
+            .borrow_mut()
+            .insert(resolver_id, v8::Global::new(scope, resolver));
+    });
+    resolver_id
+}
+
+fn take_native_promise_resolver<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    resolver_id: u64,
+) -> Option<v8::Local<'s, v8::PromiseResolver>> {
+    NATIVE_PROMISE_RESOLVERS.with(|resolvers| {
+        resolvers
+            .borrow_mut()
+            .remove(&resolver_id)
+            .map(|resolver| v8::Local::new(scope, resolver))
+    })
 }
 
 /// Fix up a native value for JS interop boundary.
@@ -377,6 +466,24 @@ pub fn v8_to_native(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value
     f64::from_bits(TAG_UNDEFINED)
 }
 
+/// Convert JS module-export values to Perry values.
+///
+/// Frozen plain data objects exported from JS modules are safe to snapshot into
+/// native Perry objects. That keeps follow-on property reads on constants like
+/// `MODULE_METADATA.PROVIDERS` native instead of bouncing back into V8 for each
+/// field. Mutable objects, accessors, proxies, custom prototypes, functions,
+/// promises, arrays, symbols, or nested non-data values stay as V8 handles.
+pub fn v8_to_native_export_value(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<v8::Value>,
+) -> f64 {
+    if let Some(snapshot) = v8_plain_data_object_to_native(scope, value, 0) {
+        return snapshot;
+    }
+
+    v8_to_native(scope, value)
+}
+
 /// Convert a V8 value to a native NaN-boxed value, converting arrays to native arrays
 ///
 /// This variant converts arrays to native Perry arrays instead of JS handles.
@@ -392,6 +499,226 @@ pub fn v8_to_native_array(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8:
 
     // For everything else, use the standard conversion
     v8_to_native(scope, value)
+}
+
+fn v8_plain_data_object_to_native(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<v8::Value>,
+    depth: usize,
+) -> Option<f64> {
+    if depth > 4
+        || value.is_function()
+        || value.is_array()
+        || value.is_promise()
+        || v8_value_is_proxy(scope, value)
+        || !value.is_object()
+    {
+        return None;
+    }
+
+    let obj = v8::Local::<v8::Object>::try_from(value).ok()?;
+    if !is_plain_object(scope, obj) {
+        return None;
+    }
+    if !v8_object_is_frozen(scope, obj)? {
+        return None;
+    }
+
+    let mut names_args = v8::GetPropertyNamesArgsBuilder::new();
+    let names = obj.get_own_property_names(
+        scope,
+        names_args
+            .mode(v8::KeyCollectionMode::OwnOnly)
+            .property_filter(v8::PropertyFilter::ALL_PROPERTIES)
+            .index_filter(v8::IndexFilter::IncludeIndices)
+            .key_conversion(v8::KeyConversionMode::ConvertToString)
+            .build(),
+    )?;
+    if names.length() == 0 {
+        return None;
+    }
+    let mut fields: Vec<(String, f64)> = Vec::with_capacity(names.length() as usize);
+
+    for i in 0..names.length() {
+        let key = names.get_index(scope, i)?;
+        if key.is_symbol() {
+            return None;
+        }
+        let key_string = key.to_string(scope)?.to_rust_string_lossy(scope);
+        let field_value = frozen_data_descriptor_value(scope, obj, key)?;
+        let native_value =
+            if let Some(snapshot) = v8_plain_data_object_to_native(scope, field_value, depth + 1) {
+                snapshot
+            } else if is_plain_data_leaf(field_value) {
+                v8_to_native(scope, field_value)
+            } else {
+                return None;
+            };
+        fields.push((key_string, native_value));
+    }
+
+    let native_obj = perry_runtime::js_object_alloc(0, 0);
+    for (key, value) in fields {
+        let key_ptr = perry_runtime::js_string_from_bytes(key.as_ptr(), key.len() as u32);
+        perry_runtime::js_object_set_field_by_name(native_obj, key_ptr, value);
+    }
+
+    Some(f64::from_bits(
+        POINTER_TAG | (native_obj as u64 & POINTER_MASK),
+    ))
+}
+
+fn is_plain_data_leaf(value: v8::Local<v8::Value>) -> bool {
+    value.is_undefined()
+        || value.is_null()
+        || value.is_boolean()
+        || value.is_number()
+        || value.is_string()
+        || value.is_big_int()
+}
+
+fn v8_value_is_proxy(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> bool {
+    if value.is_proxy() {
+        return true;
+    }
+
+    let global = scope.get_current_context().global(scope);
+    let Some(deno_key) = v8::String::new(scope, "Deno") else {
+        return false;
+    };
+    let Some(deno_value) = global.get(scope, deno_key.into()) else {
+        return false;
+    };
+    let Ok(deno) = v8::Local::<v8::Object>::try_from(deno_value) else {
+        return false;
+    };
+    let Some(core_key) = v8::String::new(scope, "core") else {
+        return false;
+    };
+    let Some(core_value) = deno.get(scope, core_key.into()) else {
+        return false;
+    };
+    let Ok(core) = v8::Local::<v8::Object>::try_from(core_value) else {
+        return false;
+    };
+
+    if call_v8_boolean_method(scope, core, "isProxy", value).unwrap_or(false) {
+        return true;
+    }
+
+    let Some(ops_key) = v8::String::new(scope, "ops") else {
+        return false;
+    };
+    let Some(ops_value) = core.get(scope, ops_key.into()) else {
+        return false;
+    };
+    let Ok(ops) = v8::Local::<v8::Object>::try_from(ops_value) else {
+        return false;
+    };
+    call_v8_boolean_method(scope, ops, "op_is_proxy", value).unwrap_or(false)
+}
+
+fn call_v8_boolean_method(
+    scope: &mut v8::PinScope<'_, '_>,
+    receiver: v8::Local<v8::Object>,
+    method_name: &str,
+    arg: v8::Local<v8::Value>,
+) -> Option<bool> {
+    let key = v8::String::new(scope, method_name)?;
+    let method_value = receiver.get(scope, key.into())?;
+    let method = v8::Local::<v8::Function>::try_from(method_value).ok()?;
+    let result = method.call(scope, receiver.into(), &[arg])?;
+    if result.is_boolean() {
+        Some(result.boolean_value(scope))
+    } else {
+        None
+    }
+}
+
+fn is_plain_object(scope: &mut v8::PinScope<'_, '_>, obj: v8::Local<v8::Object>) -> bool {
+    let Some(proto) = obj.get_prototype(scope) else {
+        return false;
+    };
+    if proto.is_null() {
+        return true;
+    }
+
+    EXPORT_SNAPSHOT_INTRINSICS.with(|cell| {
+        let intrinsics = cell.borrow();
+        let Some(intrinsics) = intrinsics.as_ref() else {
+            return false;
+        };
+        let object_proto = v8::Local::new(scope, &intrinsics.object_prototype);
+        proto.strict_equals(object_proto)
+    })
+}
+
+fn v8_object_is_frozen(
+    scope: &mut v8::PinScope<'_, '_>,
+    obj: v8::Local<v8::Object>,
+) -> Option<bool> {
+    EXPORT_SNAPSHOT_INTRINSICS.with(|cell| {
+        let intrinsics = cell.borrow();
+        let intrinsics = intrinsics.as_ref()?;
+        let is_frozen = v8::Local::new(scope, &intrinsics.object_is_frozen);
+        let receiver = v8::undefined(scope).into();
+        let obj_value: v8::Local<v8::Value> = obj.into();
+        let result = is_frozen.call(scope, receiver, &[obj_value])?;
+        if result.is_boolean() {
+            Some(result.boolean_value(scope))
+        } else {
+            None
+        }
+    })
+}
+
+fn frozen_data_descriptor_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    obj: v8::Local<v8::Object>,
+    key: v8::Local<v8::Value>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let name = v8::Local::<v8::Name>::try_from(key).ok()?;
+    let descriptor_value = obj.get_own_property_descriptor(scope, name)?;
+    if descriptor_value.is_undefined() || !descriptor_value.is_object() {
+        return None;
+    }
+    let descriptor = v8::Local::<v8::Object>::try_from(descriptor_value).ok()?;
+
+    let get_key = v8::String::new(scope, "get")?;
+    let getter = descriptor.get(scope, get_key.into())?;
+    if !getter.is_undefined() {
+        return None;
+    }
+
+    let set_key = v8::String::new(scope, "set")?;
+    let setter = descriptor.get(scope, set_key.into())?;
+    if !setter.is_undefined() {
+        return None;
+    }
+
+    let writable_key = v8::String::new(scope, "writable")?;
+    let writable = descriptor.get(scope, writable_key.into())?;
+    if !writable.is_boolean() || writable.boolean_value(scope) {
+        return None;
+    }
+
+    let configurable_key = v8::String::new(scope, "configurable")?;
+    let configurable = descriptor.get(scope, configurable_key.into())?;
+    if !configurable.is_boolean() || configurable.boolean_value(scope) {
+        return None;
+    }
+
+    let value_key = v8::String::new(scope, "value")?;
+    if !descriptor.has(scope, value_key.into())? {
+        return None;
+    }
+    let descriptor_value = descriptor.get(scope, value_key.into())?;
+    let current_value = obj.get(scope, key)?;
+    if !current_value.same_value(descriptor_value) {
+        return None;
+    }
+
+    Some(descriptor_value)
 }
 
 /// Convert a native string pointer to a Rust String
@@ -426,6 +753,84 @@ fn rust_string_to_native(s: &str) -> *const u8 {
     js_string_from_bytes(bytes.as_ptr(), bytes.len() as u32) as *const u8
 }
 
+extern "C" fn native_promise_v8_resolve(
+    closure: *const perry_runtime::closure::ClosureHeader,
+    value: f64,
+) -> f64 {
+    bump_v8_entry(V8EntryKind::NativePromiseResolve);
+    let resolver_id = perry_runtime::closure::js_closure_get_capture_f64(closure, 0) as u64;
+    crate::with_runtime(|state| {
+        deno_core::scope!(scope, &mut state.runtime);
+        if let Some(resolver) = take_native_promise_resolver(scope, resolver_id) {
+            let v8_value = native_to_v8(scope, value);
+            let _ = resolver.resolve(scope, v8_value);
+        }
+    });
+    perry_runtime::event_pump::js_notify_main_thread();
+    f64::from_bits(TAG_UNDEFINED)
+}
+
+extern "C" fn native_promise_v8_reject(
+    closure: *const perry_runtime::closure::ClosureHeader,
+    reason: f64,
+) -> f64 {
+    bump_v8_entry(V8EntryKind::NativePromiseReject);
+    let resolver_id = perry_runtime::closure::js_closure_get_capture_f64(closure, 0) as u64;
+    crate::with_runtime(|state| {
+        deno_core::scope!(scope, &mut state.runtime);
+        if let Some(resolver) = take_native_promise_resolver(scope, resolver_id) {
+            let v8_reason = native_to_v8(scope, reason);
+            let _ = resolver.reject(scope, v8_reason);
+        }
+    });
+    perry_runtime::event_pump::js_notify_main_thread();
+    f64::from_bits(TAG_UNDEFINED)
+}
+
+fn native_promise_to_v8<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    promise: *mut perry_runtime::promise::Promise,
+) -> v8::Local<'s, v8::Value> {
+    let Some(resolver) = v8::PromiseResolver::new(scope) else {
+        return v8::undefined(scope).into();
+    };
+    let v8_promise = resolver.get_promise(scope);
+    match perry_runtime::promise::js_promise_state(promise) {
+        1 => {
+            bump_v8_entry(V8EntryKind::NativePromiseResolve);
+            let value = perry_runtime::promise::js_promise_value(promise);
+            let v8_value = native_to_v8(scope, value);
+            let _ = resolver.resolve(scope, v8_value);
+        }
+        2 => {
+            bump_v8_entry(V8EntryKind::NativePromiseReject);
+            let reason = perry_runtime::promise::js_promise_reason(promise);
+            let v8_reason = native_to_v8(scope, reason);
+            let _ = resolver.reject(scope, v8_reason);
+        }
+        _ => {
+            let resolver_id = store_native_promise_resolver(scope, resolver);
+            let resolve_closure =
+                perry_runtime::closure::js_closure_alloc(native_promise_v8_resolve as *const u8, 1);
+            let reject_closure =
+                perry_runtime::closure::js_closure_alloc(native_promise_v8_reject as *const u8, 1);
+            perry_runtime::closure::js_closure_set_capture_f64(
+                resolve_closure,
+                0,
+                resolver_id as f64,
+            );
+            perry_runtime::closure::js_closure_set_capture_f64(
+                reject_closure,
+                0,
+                resolver_id as f64,
+            );
+            let _ =
+                perry_runtime::promise::js_promise_then(promise, resolve_closure, reject_closure);
+        }
+    }
+    v8_promise.into()
+}
+
 /// Convert a native object pointer to a V8 object
 fn native_object_to_v8<'s>(
     scope: &mut v8::PinScope<'s, '_>,
@@ -441,6 +846,10 @@ fn native_object_to_v8<'s>(
     if gc_header_ptr > 0x1000 {
         let gc_header = unsafe { &*(gc_header_ptr as *const perry_runtime::gc::GcHeader) };
         let is_arena = (gc_header.gc_flags & perry_runtime::gc::GC_FLAG_ARENA) != 0;
+
+        if gc_header.obj_type == perry_runtime::gc::GC_TYPE_PROMISE {
+            return native_promise_to_v8(scope, ptr as *mut perry_runtime::promise::Promise);
+        }
 
         if is_arena && gc_header.obj_type == perry_runtime::gc::GC_TYPE_ARRAY {
             // GC-tracked array: ArrayHeader { length: u32, capacity: u32 } + f64 elements
