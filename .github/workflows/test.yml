@@ -308,6 +308,11 @@ jobs:
       - name: Build compiler
         run: cargo build --release
 
+      - name: Issue #945 scalar method IR guard
+        run: |
+          PERRY_BIN="$PWD/target/release/perry" \
+          scripts/run_issue_945_scalar_method_ir_guard.sh
+
       - name: Native no-fallback gate
         run: |
           PERRY_BIN="$PWD/target/release/perry" \
@@ -362,6 +367,10 @@ jobs:
           # the v3.3 toast/setText worker (PR #322 family); skip-listing
           # here unblocks the v9 CI smoke landing without papering over
           # the underlying gap.
+          # test_ramda_user_import intentionally imports a user package
+          # (`ramda`) through the V8 fallback path. The compile-smoke
+          # runner does not npm-install optional package fixtures, so the
+          # strict unresolved-namespace diagnostic is expected here.
           export SKIP_TESTS=" \
             test_ui_comprehensive \
             test_ui_controls \
@@ -379,6 +388,7 @@ jobs:
             test_issue_640_navstack_textfield \
             test_issue_763_reactive_textfield \
             test_issue_764_state_at_module_init \
+            test_ramda_user_import \
             test_parity_assert \
             test_parity_async_hooks \
             test_parity_buffer \

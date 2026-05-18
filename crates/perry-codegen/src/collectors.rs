@@ -4763,12 +4763,10 @@ fn check_escapes_in_expr(
             check_escapes_in_expr(else_expr, candidates, classes, escaped);
         }
         Expr::Call { callee, args, .. } => {
-            // Method-call form: `local.method(...)` lowers to
-            // `Call { callee: PropertyGet { LocalGet(id), ... } }`. The
-            // PropertyGet escape check above treats `local.field` reads as
-            // safe, but a method call passes `local` as `this` to a function
-            // that dereferences it as a real object pointer. Scalar
-            // replacement has no pointer to give — mark as escape.
+            // Method-call form: `local.method(...)` needs a real heap `this`
+            // pointer. HIR exact-receiver inlining is the layer that may prove
+            // a safe `return this.field` replacement; if a method call reaches
+            // codegen as a call, keep the receiver allocated.
             if let Expr::PropertyGet { object, .. } = callee.as_ref() {
                 if let Expr::LocalGet(id) = object.as_ref() {
                     if candidates.contains_key(id) {
@@ -5229,6 +5227,7 @@ fn check_escapes_in_expr(
         | Expr::ExternFuncRef { .. }
         | Expr::GlobalGet(_)
         | Expr::DateNow
+        | Expr::PerformanceNow
         | Expr::MapNew
         | Expr::SetNew
         | Expr::EnumMember { .. }
