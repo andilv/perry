@@ -2435,6 +2435,16 @@ pub struct ObjectHeader {
     pub keys_array: *mut ArrayHeader,
 }
 
+#[inline]
+unsafe fn set_object_keys_array(obj: *mut ObjectHeader, keys_array: *mut ArrayHeader) {
+    (*obj).keys_array = keys_array;
+    crate::gc::runtime_write_barrier_slot(
+        obj as usize,
+        &(*obj).keys_array as *const _ as usize,
+        keys_array as u64,
+    );
+}
+
 /// Allocate a new object with the given class ID and field count
 /// Returns a pointer to the object header
 #[no_mangle]
@@ -3274,7 +3284,9 @@ pub extern "C" fn js_object_set_field(obj: *mut ObjectHeader, field_index: u32, 
             value
         };
         let fields_ptr = (obj as *mut u8).add(std::mem::size_of::<ObjectHeader>()) as *mut JSValue;
-        ptr::write(fields_ptr.add(field_index as usize), value);
+        let slot = fields_ptr.add(field_index as usize);
+        ptr::write(slot, value);
+        crate::gc::runtime_write_barrier_slot(obj as usize, slot as usize, value.bits());
     }
 }
 
@@ -3419,7 +3431,7 @@ pub extern "C" fn js_object_set_field_by_index(
 #[no_mangle]
 pub extern "C" fn js_object_set_keys(obj: *mut ObjectHeader, keys_array: *mut ArrayHeader) {
     unsafe {
-        (*obj).keys_array = keys_array;
+        set_object_keys_array(obj, keys_array);
     }
 }
 
@@ -5213,7 +5225,7 @@ pub extern "C" fn js_object_set_field_by_name(
                 } else {
                     vbits
                 };
-                (*obj).keys_array = next_keys as *mut ArrayHeader;
+                set_object_keys_array(obj, next_keys as *mut ArrayHeader);
                 let alloc_limit = std::cmp::max((*obj).field_count, 8) as usize;
                 if (slot_idx as usize) < alloc_limit {
                     // Inline the field write — `obj` has already been
@@ -5223,7 +5235,9 @@ pub extern "C" fn js_object_set_field_by_name(
                     // point re-doing it in `js_object_set_field`.
                     let fields_ptr =
                         (obj as *mut u8).add(std::mem::size_of::<ObjectHeader>()) as *mut JSValue;
-                    ptr::write(fields_ptr.add(slot_idx as usize), JSValue::from_bits(vbits));
+                    let slot = fields_ptr.add(slot_idx as usize);
+                    ptr::write(slot, JSValue::from_bits(vbits));
+                    crate::gc::runtime_write_barrier_slot(obj as usize, slot as usize, vbits);
                     // Bump field_count only for inline slots — leaving
                     // it at the physical capacity is what steers
                     // `js_object_get_field_by_name`'s reads to the
@@ -5258,7 +5272,7 @@ pub extern "C" fn js_object_set_field_by_name(
             let new_keys = crate::array::js_array_alloc(4);
             let new_keys =
                 crate::array::js_array_push(new_keys, JSValue::string_ptr(key as *mut _));
-            (*obj).keys_array = new_keys;
+            set_object_keys_array(obj, new_keys);
 
             // Reallocate fields to hold at least one value
             // Note: We assume the object has enough field slots pre-allocated
@@ -5362,7 +5376,7 @@ pub extern "C" fn js_object_set_field_by_name(
                     *dst_data.add(i) = *src_data.add(i);
                 }
                 (*cloned).length = key_count as u32;
-                (*obj).keys_array = cloned;
+                set_object_keys_array(obj, cloned);
                 cloned
             } else {
                 keys
@@ -5377,7 +5391,7 @@ pub extern "C" fn js_object_set_field_by_name(
                 };
                 let new_keys =
                     crate::array::js_array_push(owned_keys, JSValue::string_ptr(key as *mut _));
-                (*obj).keys_array = new_keys;
+                set_object_keys_array(obj, new_keys);
                 overflow_set(obj as usize, new_index, vbits);
                 transition_cache_insert(
                     prev_keys_usize,
@@ -5395,7 +5409,7 @@ pub extern "C" fn js_object_set_field_by_name(
             }
             let new_keys =
                 crate::array::js_array_push(owned_keys, JSValue::string_ptr(key as *mut _));
-            (*obj).keys_array = new_keys;
+            set_object_keys_array(obj, new_keys);
             js_object_set_field(obj, new_index as u32, JSValue::from_bits(value.to_bits()));
             if new_index as u32 >= (*obj).field_count {
                 (*obj).field_count = new_index as u32 + 1;
@@ -5516,7 +5530,7 @@ pub extern "C" fn js_object_set_field_by_name(
                 *dst_data.add(i) = *src_data.add(i);
             }
             (*cloned).length = key_count as u32;
-            (*obj).keys_array = cloned;
+            set_object_keys_array(obj, cloned);
             cloned
         } else {
             keys
@@ -5538,7 +5552,7 @@ pub extern "C" fn js_object_set_field_by_name(
             };
             let new_keys =
                 crate::array::js_array_push(owned_keys, JSValue::string_ptr(key as *mut _));
-            (*obj).keys_array = new_keys;
+            set_object_keys_array(obj, new_keys);
             overflow_set(obj as usize, new_index, vbits);
             // Record the shape transition so the next object sharing
             // `prev_keys` that adds the same key hits the fast path.
@@ -5556,7 +5570,7 @@ pub extern "C" fn js_object_set_field_by_name(
         // First, add the key to the keys array (may reallocate)
         let new_keys = crate::array::js_array_push(owned_keys, JSValue::string_ptr(key as *mut _));
         // Update the object's keys_array pointer in case js_array_push reallocated
-        (*obj).keys_array = new_keys;
+        set_object_keys_array(obj, new_keys);
 
         // Set the field at the new index and update logical field_count
         js_object_set_field(obj, new_index as u32, JSValue::from_bits(value.to_bits()));
@@ -5638,7 +5652,7 @@ pub extern "C" fn js_object_delete_field(
             *dst_elements.add(j) = *src_elements.add(j + 1);
         }
         (*keys_cloned).length = new_count as u32;
-        (*obj).keys_array = keys_cloned;
+        set_object_keys_array(obj, keys_cloned);
 
         // 1) Shift values down: for slot j in i..new_count, copy slot j+1
         //    into slot j. Inline reads/writes for j < alloc_limit;
@@ -10113,7 +10127,7 @@ unsafe fn ensure_key_in_keys_array(obj: *mut ObjectHeader, key: *const crate::St
     if keys.is_null() {
         let new_keys = crate::array::js_array_alloc(4);
         let new_keys = crate::array::js_array_push(new_keys, JSValue::string_ptr(key as *mut _));
-        (*obj).keys_array = new_keys;
+        set_object_keys_array(obj, new_keys);
         if (*obj).field_count == 0 {
             (*obj).field_count = 1;
         }
@@ -10144,13 +10158,13 @@ unsafe fn ensure_key_in_keys_array(obj: *mut ObjectHeader, key: *const crate::St
             *dst_data.add(i) = *src_data.add(i);
         }
         (*cloned).length = key_count as u32;
-        (*obj).keys_array = cloned;
+        set_object_keys_array(obj, cloned);
         cloned
     } else {
         keys
     };
     let new_keys = crate::array::js_array_push(owned_keys, JSValue::string_ptr(key as *mut _));
-    (*obj).keys_array = new_keys;
+    set_object_keys_array(obj, new_keys);
     let new_index = key_count as u32;
     if new_index >= (*obj).field_count {
         (*obj).field_count = new_index + 1;

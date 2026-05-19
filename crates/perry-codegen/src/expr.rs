@@ -1059,22 +1059,32 @@ impl<'a> FnCtx<'a> {
 
 /// Lower an expression to a raw LLVM `double` value. Returns the string form
 /// of the value (either a `%rN` register or a literal like `42.0`).
-/// Gen-GC Phase C2 helper: emit `js_write_barrier(parent_bits,
-/// child_bits)` after a heap-store site when `PERRY_WRITE_BARRIERS=1`.
-/// `parent_bits` and `child_bits` are SSA names already bitcast to
-/// i64. No-op when the gate is off — branchless at codegen time
-/// because the env var is read once, OnceLock-cached.
-///
-/// Called from every emit site that writes a child value into a
-/// heap-allocated parent: PropertySet, IndexSet (array element +
-/// object key), class field set fast path, closure capture set
-/// (boxed + non-boxed), array push, etc.
+/// Gen-GC Phase C2 helper: emit a write barrier after heap-store sites
+/// when `PERRY_WRITE_BARRIERS=1`. Sites with a precise field/element
+/// address use `js_write_barrier_slot`; opaque helper stores keep using
+/// the compatibility wrapper, which conservatively marks the parent span.
+/// The env gate is read once and OnceLock-cached at codegen time.
 fn emit_write_barrier(ctx: &mut FnCtx<'_>, parent_bits: &str, child_bits: &str) {
     if !crate::codegen::write_barriers_enabled() {
         return;
     }
     ctx.block()
         .call_void("js_write_barrier", &[(I64, parent_bits), (I64, child_bits)]);
+}
+
+fn emit_write_barrier_slot_on_block(
+    blk: &mut LlBlock,
+    parent_bits: &str,
+    slot_addr: &str,
+    child_bits: &str,
+) {
+    if !crate::codegen::write_barriers_enabled() {
+        return;
+    }
+    blk.call_void(
+        "js_write_barrier_slot",
+        &[(I64, parent_bits), (I64, slot_addr), (I64, child_bits)],
+    );
 }
 
 /// Issue #562 — `super({ ... })` for `class X extends ReadableStream`,
@@ -3309,6 +3319,7 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             if is_array_expr(ctx, object) && is_string_expr(ctx, index) {
                 let arr_box = lower_expr(ctx, object)?;
                 let key_box = lower_expr(ctx, index)?;
+                let value_needs_barrier = !is_numeric_expr(ctx, value);
                 let val_double = lower_expr(ctx, value)?;
                 let blk = ctx.block();
                 let arr_handle = unbox_to_i64(blk, &arr_box);
@@ -3322,9 +3333,11 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         (DOUBLE, &val_double),
                     ],
                 );
-                let val_bits = ctx.block().bitcast_double_to_i64(&val_double);
-                let arr_bits = ctx.block().bitcast_double_to_i64(&arr_box);
-                emit_write_barrier(ctx, &arr_bits, &val_bits);
+                if value_needs_barrier {
+                    let val_bits = ctx.block().bitcast_double_to_i64(&val_double);
+                    let arr_bits = ctx.block().bitcast_double_to_i64(&arr_box);
+                    emit_write_barrier(ctx, &arr_bits, &val_bits);
+                }
                 return Ok(val_double);
             }
             // Issue #637 followup: `arr[k] = X` where receiver is array
@@ -3341,6 +3354,7 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             if is_array_expr(ctx, object) && !is_numeric_expr(ctx, index) {
                 let arr_box = lower_expr(ctx, object)?;
                 let idx_double = lower_expr(ctx, index)?;
+                let value_needs_barrier = !is_numeric_expr(ctx, value);
                 let val_double = lower_expr(ctx, value)?;
                 let blk = ctx.block();
                 let arr_handle = unbox_to_i64(blk, &arr_box);
@@ -3353,9 +3367,11 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         (DOUBLE, &val_double),
                     ],
                 );
-                let val_bits = ctx.block().bitcast_double_to_i64(&val_double);
-                let arr_bits = ctx.block().bitcast_double_to_i64(&arr_box);
-                emit_write_barrier(ctx, &arr_bits, &val_bits);
+                if value_needs_barrier {
+                    let val_bits = ctx.block().bitcast_double_to_i64(&val_double);
+                    let arr_bits = ctx.block().bitcast_double_to_i64(&arr_box);
+                    emit_write_barrier(ctx, &arr_bits, &val_bits);
+                }
                 return Ok(val_double);
             }
             // Same dispatch tree as IndexGet: known array → fast inline,
@@ -3395,6 +3411,13 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         let element_addr = blk.add(I64, &arr_handle, &with_header);
                         let element_ptr = blk.inttoptr(I64, &element_addr);
                         blk.store(DOUBLE, &val_double, &element_ptr);
+                        let val_bits = blk.bitcast_double_to_i64(&val_double);
+                        emit_write_barrier_slot_on_block(
+                            blk,
+                            &arr_handle,
+                            &element_addr,
+                            &val_bits,
+                        );
                         return Ok(val_double);
                     }
                 }
@@ -3509,9 +3532,6 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     "js_object_set_field_by_name",
                     &[(I64, &obj_handle), (I64, &key_raw), (DOUBLE, &val_double)],
                 );
-                // Gen-GC Phase C2: write barrier on object key store.
-                let val_bits = ctx.block().bitcast_double_to_i64(&val_double);
-                emit_write_barrier(ctx, &obj_bits, &val_bits);
                 return Ok(val_double);
             }
             if is_string_expr(ctx, index) {
@@ -3531,9 +3551,6 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         (DOUBLE, &val_double),
                     ],
                 );
-                // Gen-GC Phase C2: write barrier on string-keyed obj write.
-                let val_bits = ctx.block().bitcast_double_to_i64(&val_double);
-                emit_write_barrier(ctx, &obj_bits, &val_bits);
                 return Ok(val_double);
             }
             // Fallback with runtime STRING_TAG check, matching IndexGet.
@@ -3751,6 +3768,9 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     let idx_str = field_index.to_string();
                     let field_ptr = blk.gep(DOUBLE, &fields_base, &[(I64, &idx_str)]);
                     blk.store(DOUBLE, &val_double, &field_ptr);
+                    let field_addr = blk.ptrtoint(&field_ptr, I64);
+                    let val_bits = blk.bitcast_double_to_i64(&val_double);
+                    emit_write_barrier_slot_on_block(blk, &obj_bits, &field_addr, &val_bits);
                     return Ok(val_double);
                 }
             }
@@ -3777,10 +3797,6 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 "js_object_set_field_by_name",
                 &[(I64, &obj_bits), (I64, &key_raw), (DOUBLE, &val_double)],
             );
-            // Gen-GC Phase C2 (per docs/generational-gc-plan.md §C):
-            // see emit_write_barrier — gated PERRY_WRITE_BARRIERS=1.
-            let val_bits = ctx.block().bitcast_double_to_i64(&val_double);
-            emit_write_barrier(ctx, &obj_bits, &val_bits);
             Ok(val_double)
         }
 
@@ -14685,6 +14701,8 @@ fn lower_index_set_fast(
         );
         let new_box = nanbox_pointer_inline(blk, &new_handle);
         blk.store(DOUBLE, &new_box, &slot);
+        let val_bits = blk.bitcast_double_to_i64(val_double);
+        emit_write_barrier_slot_on_block(blk, &arr_handle, "0", &val_bits);
         blk.br(&merge_label);
     }
 
@@ -14696,20 +14714,28 @@ fn lower_index_set_fast(
         .cond_br(&in_bounds, &inbounds_label, &check_cap_label);
 
     // Helper: compute element_ptr = arr_ptr + 8 + idx*8 and emit a store.
-    fn store_element(blk: &mut LlBlock, arr_handle: &str, idx_i32: &str, val_double: &str) {
+    fn store_element(
+        blk: &mut LlBlock,
+        arr_handle: &str,
+        idx_i32: &str,
+        val_double: &str,
+    ) -> String {
         let idx_i64 = blk.zext(I32, idx_i32, I64);
         let byte_offset = blk.shl(I64, &idx_i64, "3"); // *8
         let with_header = blk.add(I64, &byte_offset, "8"); // +8 for header
         let element_addr = blk.add(I64, arr_handle, &with_header);
         let element_ptr = blk.inttoptr(I64, &element_addr);
         blk.store(DOUBLE, val_double, &element_ptr);
+        element_addr
     }
 
     // FASTEST: in-bounds path. Store directly, jump to merge.
     ctx.current_block = inbounds_idx;
     {
         let blk = ctx.block();
-        store_element(blk, &arr_handle, &idx_i32, val_double);
+        let element_addr = store_element(blk, &arr_handle, &idx_i32, val_double);
+        let val_bits = blk.bitcast_double_to_i64(val_double);
+        emit_write_barrier_slot_on_block(blk, &arr_handle, &element_addr, &val_bits);
         blk.br(&merge_label);
     }
 
@@ -14730,11 +14756,13 @@ fn lower_index_set_fast(
     ctx.current_block = extend_inline_idx;
     {
         let blk = ctx.block();
-        store_element(blk, &arr_handle, &idx_i32, val_double);
+        let element_addr = store_element(blk, &arr_handle, &idx_i32, val_double);
         // Bump length: store idx+1 to arr_ptr+0.
         let new_len = blk.add(I32, &idx_i32, "1");
         let len_ptr = blk.inttoptr(I64, &arr_handle); // length is at offset 0
         blk.store(I32, &new_len, &len_ptr);
+        let val_bits = blk.bitcast_double_to_i64(val_double);
+        emit_write_barrier_slot_on_block(blk, &arr_handle, &element_addr, &val_bits);
         blk.br(&merge_label);
     }
 
@@ -14749,20 +14777,12 @@ fn lower_index_set_fast(
         );
         let new_box = nanbox_pointer_inline(blk, &new_handle);
         blk.store(DOUBLE, &new_box, &slot);
+        let val_bits = blk.bitcast_double_to_i64(val_double);
+        emit_write_barrier_slot_on_block(blk, &arr_handle, "0", &val_bits);
         blk.br(&merge_label);
     }
 
     ctx.current_block = merge_idx;
-    // Gen-GC Phase C2: write barrier on the array element store.
-    // Both fast and slow paths funnel here. We use `arr_handle`
-    // (already in scope) as the parent. Note: post-realloc, the
-    // local slot has been updated with the new pointer; the
-    // barrier sees the OLD `arr_handle` which is fine for Phase C
-    // — the new pointer points into the same arena, same gen-flag
-    // status, and the parent is what we record (not the new
-    // location).
-    let val_bits = ctx.block().bitcast_double_to_i64(val_double);
-    emit_write_barrier(ctx, &arr_handle, &val_bits);
     Ok(())
 }
 
