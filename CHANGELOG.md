@@ -2,6 +2,17 @@
 
 Detailed changelog for Perry. See CLAUDE.md for concise summaries.
 
+## v0.5.1015 — feat(stdlib): implement `node:querystring` (#1151) + fix latent SSO bugs
+
+Lands [TheHypnoo](https://github.com/TheHypnoo)'s `node:querystring` implementation as a direct cherry-pick onto main (PR #1151 went DIRTY against post-#1146 main and the contributor's fork has no "Allow edits by maintainers"). Greenfield: `escape` / `unescape` / `parse` / `stringify` + `decode` / `encode` aliases, six matching `NativeModSig` rows, API-manifest entries, and removal of `test_parity_querystring` from `known_failures.json`. Parity goes byte-for-byte against `node --experimental-strip-types`.
+
+### Two latent bugs in the contributor's `nanboxed_to_string` helper, fixed in this version
+
+1. **Wrong SSO tag.** The inline-short-string branch checked `top16 == 0x7FFA` (`BIGINT_TAG`) with a 4-bit length at offset 44 and a 6-byte buffer. The real encoding (per `perry_runtime::value`) is `0x7FF9` (`SHORT_STRING_TAG`) with an 8-bit length at offset 40, max 5 bytes. Currently safe because Perry's codegen hands every string literal as a `STRING_TAG (0x7FFF)` heap pointer, so the bad branch never fired — but if SSO ever propagates through the call site, a real BigInt would be misread as a 4-bit-length short string.
+2. **Loose small-handle guard.** The heap-pointer fallback rejected `addr < 0x1000`, admitting any small-handle id in `0x1000..0x10000` and then dereferencing it as a `*const StringHeader`. Bumped to `< 0x10000` to match the rest of the runtime's pointer-vs-handle ceiling (`object.rs`'s small-handle dispatch path uses the same threshold).
+
+Attribution: code authored by TheHypnoo (PR #1151). The SSO/guard fixes are review fixes applied at merge time. PR #1151 itself can be closed; the squash-merge wasn't possible because the contributor's fork doesn't allow maintainer pushes.
+
 ## v0.5.1014 — fix(codegen): restore `IncomingMessage` `__get_statusCode` / `__get_statusMessage` / `__get_headers` rows lost in #1099 squash
 
 The v0.5.1012 fix added three `NativeModSig` rows to `lower_call.rs` so `res.statusCode` on a client-side `IncomingMessage` routes to perry-ext-http's `js_http_status_code` (instead of falling through to the zero-sentinel). #1150 (chore(codegen) #1099 — split `lower_call.rs` into `lower_call/*` submodules) was authored against pre-fix `main`, and its squash-merge resolved the modify/delete conflict by taking the PR's deletion of the file — losing the three rows that had moved into `native_table.rs` via the resolution commit on the PR branch.

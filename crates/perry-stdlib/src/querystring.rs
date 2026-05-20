@@ -42,16 +42,22 @@ fn _unused(_: Handle) {}
 unsafe fn nanboxed_to_string(value: f64) -> Option<String> {
     let bits = value.to_bits();
     let top16 = bits >> 48;
-    // SHORT_STRING_TAG inline form.
-    if top16 == 0x7FFA {
-        let len = ((bits >> 44) & 0xF) as usize;
+    // SHORT_STRING_TAG (0x7FF9) inline form. Encoding (per
+    // `perry_runtime::value`): bits 40..47 carry the byte length (max 5),
+    // bits 0..39 carry the UTF-8 payload little-endian. The original PR
+    // checked 0x7FFA (BIGINT_TAG) with a 4-bit-at-offset-44 length field —
+    // both wrong; safe in practice today because codegen passes string
+    // literals as heap-allocated STRING_TAG (0x7FFF) pointers, so the bad
+    // branch never fired. Fixed at merge time (PR #1151 review).
+    if top16 == 0x7FF9 {
+        let len = ((bits >> 40) & 0xFF) as usize;
         if len == 0 {
             return Some(String::new());
         }
-        if len > 6 {
+        if len > 5 {
             return None;
         }
-        let mut buf = [0u8; 6];
+        let mut buf = [0u8; 5];
         for (i, b) in buf.iter_mut().enumerate().take(len) {
             *b = ((bits >> (i * 8)) & 0xFF) as u8;
         }
@@ -59,9 +65,11 @@ unsafe fn nanboxed_to_string(value: f64) -> Option<String> {
     }
     // STRING_TAG / POINTER_TAG / raw heap pointer — all keep the address
     // in the low 48 bits, and the layout starts with `byte_len: u32`
-    // followed by `byte_len` bytes of UTF-8.
+    // followed by `byte_len` bytes of UTF-8. Reject anything below the
+    // small-handle ceiling (0x10000) — matches the runtime's
+    // pointer-vs-handle guards in object.rs / value.rs.
     let addr = (bits & 0x0000_FFFF_FFFF_FFFF) as usize;
-    if addr < 0x1000 {
+    if addr < 0x10000 {
         return None;
     }
     let hdr = addr as *const StringHeader;
