@@ -2,6 +2,14 @@
 
 Detailed changelog for Perry. See CLAUDE.md for concise summaries.
 
+## v0.5.1014 — fix(codegen): restore `IncomingMessage` `__get_statusCode` / `__get_statusMessage` / `__get_headers` rows lost in #1099 squash
+
+The v0.5.1012 fix added three `NativeModSig` rows to `lower_call.rs` so `res.statusCode` on a client-side `IncomingMessage` routes to perry-ext-http's `js_http_status_code` (instead of falling through to the zero-sentinel). #1150 (chore(codegen) #1099 — split `lower_call.rs` into `lower_call/*` submodules) was authored against pre-fix `main`, and its squash-merge resolved the modify/delete conflict by taking the PR's deletion of the file — losing the three rows that had moved into `native_table.rs` via the resolution commit on the PR branch.
+
+Symptom: `test_node_http_client_request` parity regressed (Perry prints `req1 status: 0` instead of `req1 status: 200`) on `ec0b0c9c..main`.
+
+Fix: re-add the three rows to `crates/perry-codegen/src/lower_call/native_table.rs` at the same insertion point (after the IncomingMessage `__get_destroyed` row, before the ServerResponse `__get_statusCode` row). Pure restoration of v0.5.1012's contract — no new code paths.
+
 ## v0.5.1013 — fix(fastify,runtime) #1113 #1114: bidirectional WebSocket upgrade on `app.server`; setInterval+async CPU-wedge regression
 
 Two issues filed against shop-admin on v0.5.1009. #1113's boot-blocking shape was already partially fixed in v0.5.1011 (the boot-unblocking shape); this release finishes #1113 (real WS upgrade dispatch) and fixes the #1114 CPU wedge.
