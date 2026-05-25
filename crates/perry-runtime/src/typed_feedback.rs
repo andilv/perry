@@ -10,8 +10,8 @@ use std::sync::{LazyLock, Mutex};
 use crate::array::ArrayHeader;
 use crate::object::ObjectHeader;
 use crate::value::{
-    BIGINT_TAG, INT32_TAG, POINTER_MASK, POINTER_TAG, SHORT_STRING_TAG, STRING_TAG, TAG_FALSE,
-    TAG_HOLE, TAG_MASK, TAG_NULL, TAG_TRUE, TAG_UNDEFINED,
+    BIGINT_TAG, INT32_TAG, JS_HANDLE_TAG, POINTER_MASK, POINTER_TAG, SHORT_STRING_TAG, STRING_TAG,
+    TAG_FALSE, TAG_HOLE, TAG_MASK, TAG_NULL, TAG_TRUE, TAG_UNDEFINED,
 };
 
 const POLYMORPHIC_CAP: usize = 4;
@@ -395,6 +395,7 @@ const STABLE_VALUE_STRING: u16 = 7;
 const STABLE_VALUE_BIGINT: u16 = 8;
 const STABLE_VALUE_POINTER: u16 = 9;
 const STABLE_VALUE_INT32: u16 = 10;
+const STABLE_VALUE_JS_HANDLE: u16 = 11;
 
 const ARRAY_ACCESS_UNKNOWN: u8 = 0;
 const ARRAY_ACCESS_INDEXED_IN_BOUNDS: u8 = 1;
@@ -424,6 +425,7 @@ fn stable_value_kind(bits: u64) -> u16 {
         POINTER_TAG => STABLE_VALUE_POINTER,
         STRING_TAG => STABLE_VALUE_STRING,
         BIGINT_TAG => STABLE_VALUE_BIGINT,
+        JS_HANDLE_TAG => STABLE_VALUE_JS_HANDLE,
         SHORT_STRING_TAG => STABLE_VALUE_SHORT_STRING,
         INT32_TAG => STABLE_VALUE_INT32,
         _ => STABLE_VALUE_NUMBER,
@@ -981,6 +983,13 @@ fn is_plain_number_bits(bits: u64) -> bool {
     stable_value_kind(bits) == STABLE_VALUE_NUMBER
 }
 
+fn is_numeric_value_bits(bits: u64) -> bool {
+    matches!(
+        stable_value_kind(bits),
+        STABLE_VALUE_NUMBER | STABLE_VALUE_INT32
+    )
+}
+
 fn gc_header_for_user_addr(addr: usize) -> Option<*const crate::gc::GcHeader> {
     if addr < crate::gc::GC_HEADER_SIZE + 0x1000
         || (addr as u64) >> 48 != 0
@@ -1011,6 +1020,33 @@ fn plain_array_index_guard(arr: *const ArrayHeader, index: u32, require_in_bound
             return false;
         }
         !require_in_bounds || index < len
+    }
+}
+
+fn numeric_array_index_guard(arr: *const ArrayHeader, index: u32, require_in_bounds: bool) -> bool {
+    plain_array_index_guard(arr, index, require_in_bounds)
+        && crate::array::js_array_is_numeric_f64_layout(arr) != 0
+}
+
+fn numeric_array_push_guard(arr: *const ArrayHeader, value: f64) -> bool {
+    let raw_addr = normalize_raw_object_addr(arr as u64);
+    let Some(header) = gc_header_for_user_addr(raw_addr) else {
+        return false;
+    };
+    unsafe {
+        if (*header).obj_type != crate::gc::GC_TYPE_ARRAY
+            || (*header).gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
+        {
+            return false;
+        }
+        let arr = raw_addr as *const ArrayHeader;
+        let len = (*arr).length;
+        let cap = (*arr).capacity;
+        len <= 16_000_000
+            && cap <= 16_000_000
+            && len < cap
+            && is_numeric_value_bits(value.to_bits())
+            && crate::array::js_array_is_numeric_f64_layout(arr) != 0
     }
 }
 
@@ -1131,6 +1167,47 @@ pub extern "C" fn js_typed_feedback_plain_array_index_get_guard(
     let contract_valid = is_plain_number_bits(index_value.to_bits())
         && index >= 0
         && plain_array_index_guard(
+            raw_addr as *const ArrayHeader,
+            index as u32,
+            require_in_bounds != 0,
+        );
+    let pass = guard_observe(
+        site_id,
+        TypedFeedbackSiteKind::ArrayElement,
+        observation,
+        contract_valid,
+    );
+    if pass {
+        1
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn js_typed_feedback_numeric_array_index_get_guard(
+    site_id: u64,
+    receiver: f64,
+    index_value: f64,
+    index: i32,
+    require_in_bounds: i32,
+) -> i32 {
+    let raw_addr = normalize_raw_object_addr(receiver.to_bits());
+    let observed_index = if index >= 0 { index as u32 } else { u32::MAX };
+    let (class_id, heap_type, aux, element_kind) = classify_array(raw_addr, Some(observed_index));
+    let observation = Observation {
+        source: ObservationSource::Array,
+        object_addr: 0,
+        shape_addr: 0,
+        key_hash: 0,
+        class_id,
+        heap_type,
+        aux,
+        value_tag: element_kind,
+    };
+    let contract_valid = is_plain_number_bits(index_value.to_bits())
+        && index >= 0
+        && numeric_array_index_guard(
             raw_addr as *const ArrayHeader,
             index as u32,
             require_in_bounds != 0,
@@ -1324,6 +1401,84 @@ pub extern "C" fn js_typed_feedback_plain_array_index_set_guard(
         TypedFeedbackSiteKind::ArrayElement,
         observation,
         contract_valid,
+    );
+    if pass {
+        1
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn js_typed_feedback_numeric_array_index_set_guard(
+    site_id: u64,
+    receiver: f64,
+    index: i32,
+    value: f64,
+    require_in_bounds: i32,
+) -> i32 {
+    let raw_addr = normalize_raw_object_addr(receiver.to_bits());
+    let observed_index = if index >= 0 { index as u32 } else { u32::MAX };
+    let (class_id, heap_type, aux, _element_kind) = classify_array(raw_addr, Some(observed_index));
+    let observation = Observation {
+        source: ObservationSource::Array,
+        object_addr: 0,
+        shape_addr: 0,
+        key_hash: 0,
+        class_id,
+        heap_type,
+        aux,
+        value_tag: stable_value_kind(value.to_bits()),
+    };
+    let contract_valid = index >= 0
+        && is_numeric_value_bits(value.to_bits())
+        && numeric_array_index_guard(
+            raw_addr as *const ArrayHeader,
+            index as u32,
+            require_in_bounds != 0,
+        );
+    let pass = guard_observe(
+        site_id,
+        TypedFeedbackSiteKind::ArrayElement,
+        observation,
+        contract_valid,
+    );
+    if pass {
+        1
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn js_typed_feedback_numeric_array_push_guard(
+    site_id: u64,
+    receiver: f64,
+    value: f64,
+) -> i32 {
+    let raw_addr = normalize_raw_object_addr(receiver.to_bits());
+    let push_index = match gc_header_for_user_addr(raw_addr) {
+        Some(header) if unsafe { (*header).obj_type == crate::gc::GC_TYPE_ARRAY } => unsafe {
+            (*(raw_addr as *const ArrayHeader)).length
+        },
+        _ => u32::MAX,
+    };
+    let (class_id, heap_type, aux, _element_kind) = classify_array(raw_addr, Some(push_index));
+    let observation = Observation {
+        source: ObservationSource::Array,
+        object_addr: 0,
+        shape_addr: 0,
+        key_hash: 0,
+        class_id,
+        heap_type,
+        aux,
+        value_tag: stable_value_kind(value.to_bits()),
+    };
+    let pass = guard_observe(
+        site_id,
+        TypedFeedbackSiteKind::ArrayElement,
+        observation,
+        numeric_array_push_guard(raw_addr as *const ArrayHeader, value),
     );
     if pass {
         1
