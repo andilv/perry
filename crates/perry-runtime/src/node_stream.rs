@@ -131,7 +131,7 @@ fn push_chunk(stream: f64, chunk: f64) -> f64 {
     let prev = get_hidden_value(stream, hidden_buffered_key()).unwrap_or(0.0);
     let total = prev + added;
     set_hidden_value(stream, hidden_buffered_key(), total);
-    let hwm = get_hidden_value(stream, hidden_hwm_key()).unwrap_or(16384.0);
+    let hwm = get_hidden_value(stream, hidden_hwm_key()).unwrap_or_else(|| default_hwm(false));
     if total < hwm {
         f64::from_bits(TAG_TRUE)
     } else {
@@ -1458,13 +1458,41 @@ fn opt_number(opts: f64, key: &[u8]) -> Option<f64> {
     jsvalue_as_f64(get_hidden_value(opts, hidden_key(key))?)
 }
 
+/// Read a boolean constructor option, returning `true` only when the option
+/// is present and truthy.
+fn opt_bool(opts: f64, key: &[u8]) -> bool {
+    get_hidden_value(opts, hidden_key(key)).is_some_and(|v| crate::value::js_is_truthy(v) != 0)
+}
+
+// #1537: the platform-default highWaterMark, settable at runtime via
+// `stream.setDefaultHighWaterMark(objectMode, value)`. Node's defaults are
+// 65536 bytes for byte streams and 16 for objectMode; both are mutable for
+// the lifetime of the process (Perry tracks them per-thread, matching its
+// per-thread runtime model). Streams constructed without an explicit
+// `highWaterMark` inherit the current default for their mode.
+thread_local! {
+    static DEFAULT_HWM_BYTE: std::cell::Cell<f64> = const { std::cell::Cell::new(65536.0) };
+    static DEFAULT_HWM_OBJECT: std::cell::Cell<f64> = const { std::cell::Cell::new(16.0) };
+}
+
+fn default_hwm(object_mode: bool) -> f64 {
+    if object_mode {
+        DEFAULT_HWM_OBJECT.with(|c| c.get())
+    } else {
+        DEFAULT_HWM_BYTE.with(|c| c.get())
+    }
+}
+
 /// Resolve an effective highWaterMark: the direction-specific option
 /// (`readableHighWaterMark` / `writableHighWaterMark`) falls back to the
-/// generic `highWaterMark`, then Node's default of 16384 for byte streams.
-fn resolve_hwm(opts: f64, specific: &[u8]) -> f64 {
-    opt_number(opts, specific)
-        .or_else(|| opt_number(opts, b"highWaterMark"))
-        .unwrap_or(16384.0)
+/// generic `highWaterMark`, then to the platform default for the stream's
+/// mode (#1537: 65536 for byte streams, 16 for objectMode).
+fn resolve_hwm(opts: f64, specific: &[u8], specific_object_mode: &[u8]) -> f64 {
+    if let Some(v) = opt_number(opts, specific).or_else(|| opt_number(opts, b"highWaterMark")) {
+        return v;
+    }
+    let object_mode = opt_bool(opts, specific_object_mode) || opt_bool(opts, b"objectMode");
+    default_hwm(object_mode)
 }
 
 /// Initialize the readable side of a stream: direction flag, buffered byte
@@ -1473,7 +1501,7 @@ fn resolve_hwm(opts: f64, specific: &[u8]) -> f64 {
 fn init_readable_state(stream: f64, opts: f64) {
     set_hidden_value(stream, hidden_readable_flag_key(), f64::from_bits(TAG_TRUE));
     set_hidden_value(stream, hidden_buffered_key(), 0.0);
-    let r_hwm = resolve_hwm(opts, b"readableHighWaterMark");
+    let r_hwm = resolve_hwm(opts, b"readableHighWaterMark", b"readableObjectMode");
     set_hidden_value(stream, hidden_hwm_key(), r_hwm);
     set_hidden_value(stream, hidden_key(b"readableHighWaterMark"), r_hwm);
 }
@@ -1482,7 +1510,7 @@ fn init_readable_state(stream: f64, opts: f64) {
 /// `writableHighWaterMark` property (#1534/#1539).
 fn init_writable_state(stream: f64, opts: f64) {
     set_hidden_value(stream, hidden_writable_flag_key(), f64::from_bits(TAG_TRUE));
-    let w_hwm = resolve_hwm(opts, b"writableHighWaterMark");
+    let w_hwm = resolve_hwm(opts, b"writableHighWaterMark", b"writableObjectMode");
     set_hidden_value(stream, hidden_key(b"writableHighWaterMark"), w_hwm);
 }
 
@@ -1587,24 +1615,64 @@ pub extern "C" fn js_node_stream_is_errored(stream: f64) -> f64 {
     }
 }
 
-/// #1534: `Readable.isReadable(s)` / module-level `isReadable(s)`. Node
-/// returns `true` while a readable-side stream is still readable —
-/// i.e. it has the readable direction and hasn't ended, errored, or
-/// been destroyed. Perry tracks the readable-direction flag at
-/// construction and the ended/errored bits as methods run, so a
-/// freshly-constructed Readable answers `true` and a Writable answers
-/// `false` (no readable flag).
+/// #1534/#1746: `Readable.isReadable(s)` / module-level `isReadable(s)`.
+/// Node returns `null` for a stream with no readable side (e.g. a bare
+/// Writable), `false` once the readable side has ended or errored, and
+/// `true` while it's still readable. Perry tracks the readable-direction
+/// flag at construction and the ended/errored bits as methods run.
 #[no_mangle]
 pub extern "C" fn js_node_stream_is_readable(stream: f64) -> f64 {
-    let is_readable_dir = get_hidden_value(stream, hidden_readable_flag_key())
-        .is_some_and(|v| crate::value::js_is_truthy(v) != 0);
+    if get_hidden_value(stream, hidden_readable_flag_key()).is_none() {
+        return f64::from_bits(TAG_NULL);
+    }
     let ended = stream_hidden_ended(stream);
     let errored = readable_hidden_error(stream).is_some();
-    if is_readable_dir && !ended && !errored {
-        f64::from_bits(TAG_TRUE)
-    } else {
+    if ended || errored {
         f64::from_bits(TAG_FALSE)
+    } else {
+        f64::from_bits(TAG_TRUE)
     }
+}
+
+/// #1746: `stream.isWritable(s)` / `Writable.isWritable(s)`. Mirror of
+/// `isReadable` for the writable side: `null` for a stream with no
+/// writable side (a bare Readable), `false` once it has ended (`.end()`)
+/// or errored, `true` otherwise. A Duplex answers for its writable side.
+#[no_mangle]
+pub extern "C" fn js_node_stream_is_writable(stream: f64) -> f64 {
+    if get_hidden_value(stream, hidden_writable_flag_key()).is_none() {
+        return f64::from_bits(TAG_NULL);
+    }
+    let ended = stream_hidden_ended(stream);
+    let errored = readable_hidden_error(stream).is_some();
+    if ended || errored {
+        f64::from_bits(TAG_FALSE)
+    } else {
+        f64::from_bits(TAG_TRUE)
+    }
+}
+
+/// #1537: `stream.getDefaultHighWaterMark(objectMode)` returns the current
+/// platform-default highWaterMark — 65536 for byte streams, 16 for
+/// objectMode (both settable via `setDefaultHighWaterMark`).
+#[no_mangle]
+pub extern "C" fn js_node_stream_get_default_hwm(object_mode: f64) -> f64 {
+    default_hwm(crate::value::js_is_truthy(object_mode) != 0)
+}
+
+/// #1537: `stream.setDefaultHighWaterMark(objectMode, value)` updates the
+/// per-mode default returned by `getDefaultHighWaterMark` and inherited by
+/// streams constructed without an explicit `highWaterMark`. Returns
+/// `undefined`, matching Node.
+#[no_mangle]
+pub extern "C" fn js_node_stream_set_default_hwm(object_mode: f64, value: f64) -> f64 {
+    let n = jsvalue_as_f64(value).unwrap_or(0.0);
+    if crate::value::js_is_truthy(object_mode) != 0 {
+        DEFAULT_HWM_OBJECT.with(|c| c.set(n));
+    } else {
+        DEFAULT_HWM_BYTE.with(|c| c.set(n));
+    }
+    f64::from_bits(TAG_UNDEFINED)
 }
 
 /// #1541: `stream.addAbortSignal(signal, stream)` — Node wires the
@@ -1752,6 +1820,12 @@ static KEEP_NS_IS_ERRORED: extern "C" fn(f64) -> f64 = js_node_stream_is_errored
 #[used]
 static KEEP_NS_IS_READABLE: extern "C" fn(f64) -> f64 = js_node_stream_is_readable;
 #[used]
+static KEEP_NS_IS_WRITABLE: extern "C" fn(f64) -> f64 = js_node_stream_is_writable;
+#[used]
+static KEEP_NS_GET_DEFAULT_HWM: extern "C" fn(f64) -> f64 = js_node_stream_get_default_hwm;
+#[used]
+static KEEP_NS_SET_DEFAULT_HWM: extern "C" fn(f64, f64) -> f64 = js_node_stream_set_default_hwm;
+#[used]
 static KEEP_NS_ADD_ABORT_SIGNAL: extern "C" fn(f64, f64) -> f64 = js_node_stream_add_abort_signal;
 #[used]
 static KEEP_NS_COMPOSE: extern "C" fn(f64) -> f64 = js_node_stream_compose;
@@ -1763,207 +1837,5 @@ static KEEP_NS_TO_WEB: extern "C" fn(f64) -> f64 = js_node_stream_to_web;
 static KEEP_NS_FROM_WEB: extern "C" fn(f64) -> f64 = js_node_stream_from_web;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::cell::RefCell;
-
-    thread_local! {
-        static WRITE_CAPTURED: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
-    }
-
-    fn string_value(s: &str) -> f64 {
-        let ptr = crate::string::js_string_from_bytes(s.as_ptr(), s.len() as u32);
-        box_string(ptr)
-    }
-
-    fn buffer_value(bytes: &[u8]) -> f64 {
-        let buf = crate::buffer::buffer_alloc(bytes.len() as u32);
-        unsafe {
-            (*buf).length = bytes.len() as u32;
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                crate::buffer::buffer_data_mut(buf),
-                bytes.len(),
-            );
-        }
-        box_pointer(buf as *const u8)
-    }
-
-    extern "C" fn write_capture(
-        _closure: *const ClosureHeader,
-        chunk: f64,
-        _enc: f64,
-        cb: f64,
-    ) -> f64 {
-        let readable = js_node_stream_readable_from(chunk);
-        let bytes = js_node_stream_collect_bytes(readable);
-        WRITE_CAPTURED.with(|captured| captured.borrow_mut().push(bytes));
-        unsafe {
-            let _ = crate::closure::js_native_call_value(cb, std::ptr::null(), 0);
-        }
-        f64::from_bits(TAG_UNDEFINED)
-    }
-
-    extern "C" fn read_records_this(closure: *const ClosureHeader) -> f64 {
-        let stream = crate::closure::js_closure_get_capture_f64(closure, 0);
-        set_hidden_value(stream, hidden_error_key(), string_value("from-read"));
-        f64::from_bits(TAG_UNDEFINED)
-    }
-
-    #[test]
-    fn readable_from_retains_string_chunks_for_consumers() {
-        let mut arr = crate::array::js_array_alloc(2);
-        arr = crate::array::js_array_push_f64(arr, string_value("he"));
-        arr = crate::array::js_array_push_f64(arr, string_value("llo"));
-
-        let readable = js_node_stream_readable_from(box_pointer(arr as *const u8));
-
-        assert_eq!(js_node_stream_collect_bytes(readable), b"hello");
-    }
-
-    #[test]
-    fn readable_from_retains_buffer_chunks_for_consumers() {
-        let mut arr = crate::array::js_array_alloc(2);
-        arr = crate::array::js_array_push_f64(arr, buffer_value(b"ab"));
-        arr = crate::array::js_array_push_f64(arr, buffer_value(b"cd"));
-
-        let readable = js_node_stream_readable_from(box_pointer(arr as *const u8));
-
-        assert_eq!(js_node_stream_collect_bytes(readable), b"abcd");
-    }
-
-    #[test]
-    fn writable_options_write_callback_is_invoked_by_stub_write() {
-        WRITE_CAPTURED.with(|captured| captured.borrow_mut().clear());
-        let opts = crate::object::js_object_alloc(0, 1);
-        let closure = js_closure_alloc(write_capture as *const u8, 0);
-        crate::closure::js_register_closure_arity(write_capture as *const u8, 3);
-        js_object_set_field_by_name(
-            opts,
-            hidden_key(b"write"),
-            f64::from_bits(JSValue::pointer(closure as *const u8).bits()),
-        );
-
-        let writable = js_node_stream_writable_new(box_pointer(opts as *const u8));
-        let write = js_object_get_field_by_name_f64(
-            raw_ptr_from_value(writable) as *const ObjectHeader,
-            hidden_key(b"write"),
-        );
-        let args = [string_value("chunk"), f64::from_bits(TAG_UNDEFINED)];
-        unsafe {
-            let _ = crate::closure::js_native_call_value(write, args.as_ptr(), args.len());
-        }
-
-        WRITE_CAPTURED.with(|captured| {
-            assert_eq!(captured.borrow().as_slice(), &[b"chunk".to_vec()]);
-        });
-    }
-
-    #[test]
-    fn readable_options_read_callback_this_is_rebound_to_stream() {
-        let opts = crate::object::js_object_alloc(0, 1);
-        let closure = js_closure_alloc(
-            read_records_this as *const u8,
-            crate::closure::CAPTURES_THIS_FLAG | 1,
-        );
-        crate::closure::js_register_closure_arity(read_records_this as *const u8, 0);
-        crate::closure::js_closure_set_capture_f64(closure, 0, box_pointer(opts as *const u8));
-        js_object_set_field_by_name(
-            opts,
-            hidden_key(b"read"),
-            f64::from_bits(JSValue::pointer(closure as *const u8).bits()),
-        );
-
-        let readable = js_node_stream_readable_new(box_pointer(opts as *const u8));
-
-        let err = js_node_stream_hidden_error_after_read(readable).expect("stream error");
-        assert!(string_value_eq(err, b"from-read"));
-        assert!(readable_hidden_error(box_pointer(opts as *const u8)).is_none());
-    }
-
-    #[test]
-    fn stream_methods_use_implicit_this_without_closure_capture() {
-        let stream = js_node_stream_passthrough_new(f64::from_bits(TAG_UNDEFINED));
-        let prev_this = crate::object::js_implicit_this_set(stream);
-        let _ = ns_end1(std::ptr::null(), f64::from_bits(TAG_UNDEFINED));
-        crate::object::js_implicit_this_set(prev_this);
-
-        assert!(js_node_stream_is_stub_ended_after_read(stream));
-    }
-
-    #[test]
-    fn stream_method_closure_capture_wins_over_stale_implicit_this() {
-        let stream = js_node_stream_passthrough_new(f64::from_bits(TAG_UNDEFINED));
-        let other = box_pointer(crate::object::js_object_alloc(0, 0) as *const u8);
-        let end = js_object_get_field_by_name_f64(
-            raw_ptr_from_value(stream) as *const ObjectHeader,
-            hidden_key(b"end"),
-        );
-
-        let prev_this = crate::object::js_implicit_this_set(other);
-        unsafe {
-            let _ = crate::closure::js_native_call_value(end, std::ptr::null(), 0);
-        }
-        crate::object::js_implicit_this_set(prev_this);
-
-        assert!(js_node_stream_is_stub_ended_after_read(stream));
-        assert!(!stream_hidden_ended(other));
-    }
-
-    #[test]
-    fn stream_methods_dispatch_through_dynamic_method_call() {
-        let stream = js_node_stream_passthrough_new(f64::from_bits(TAG_UNDEFINED));
-        unsafe {
-            let _ = crate::object::js_native_call_method(
-                stream,
-                b"end".as_ptr() as *const i8,
-                3,
-                std::ptr::null(),
-                0,
-            );
-        }
-
-        assert!(js_node_stream_is_stub_ended_after_read(stream));
-    }
-
-    #[test]
-    fn stream_native_receiver_methods_update_hidden_state() {
-        let stream = js_node_stream_passthrough_new(f64::from_bits(TAG_UNDEFINED));
-        let handle = raw_ptr_from_value(stream) as i64;
-        let err = string_value("boom");
-
-        assert_eq!(
-            js_node_stream_method_emit(handle, string_value("error"), err).to_bits(),
-            TAG_TRUE
-        );
-        assert!(js_node_stream_hidden_error_after_read(stream).is_some());
-
-        let stream = js_node_stream_passthrough_new(f64::from_bits(TAG_UNDEFINED));
-        let handle = raw_ptr_from_value(stream) as i64;
-        let _ = js_node_stream_method_end(handle, f64::from_bits(TAG_UNDEFINED));
-        assert!(js_node_stream_is_stub_ended_after_read(stream));
-    }
-
-    #[test]
-    fn stream_stub_arities_are_registered_per_thread() {
-        let _ = js_node_stream_passthrough_new(f64::from_bits(TAG_UNDEFINED));
-        assert_eq!(
-            crate::closure::lookup_closure_arity(ns_end1 as *const u8),
-            Some(1)
-        );
-
-        std::thread::spawn(|| {
-            let _ = js_node_stream_passthrough_new(f64::from_bits(TAG_UNDEFINED));
-            assert_eq!(
-                crate::closure::lookup_closure_arity(ns_end1 as *const u8),
-                Some(1)
-            );
-            assert_eq!(
-                crate::closure::lookup_closure_arity(ns_write2 as *const u8),
-                Some(2)
-            );
-        })
-        .join()
-        .expect("stream arity registration thread should not panic");
-    }
-}
+#[path = "node_stream_tests.rs"]
+mod tests;
