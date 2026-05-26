@@ -113,6 +113,12 @@ pub fn register_typed_array(ptr: *const TypedArrayHeader, kind: u8) {
     });
 }
 
+pub fn unregister_typed_array(ptr: *const TypedArrayHeader) {
+    TYPED_ARRAY_REGISTRY.with(|r| {
+        r.borrow_mut().remove(&(ptr as usize));
+    });
+}
+
 /// Returns Some(kind) if the (already-stripped) address is a registered
 /// typed array, else None.
 pub fn lookup_typed_array_kind(addr: usize) -> Option<u8> {
@@ -140,12 +146,70 @@ pub fn clean_ta_ptr(ptr: *const TypedArrayHeader) -> *const TypedArrayHeader {
 
 #[inline]
 fn data_ptr(ta: *const TypedArrayHeader) -> *const u8 {
-    unsafe { (ta as *const u8).add(std::mem::size_of::<TypedArrayHeader>()) }
+    unsafe {
+        if crate::native_arena::is_native_typed_view(ta) {
+            crate::native_arena::native_view_data_ptr(ta)
+        } else {
+            (ta as *const u8).add(std::mem::size_of::<TypedArrayHeader>())
+        }
+    }
 }
 
 #[inline]
 fn data_ptr_mut(ta: *mut TypedArrayHeader) -> *mut u8 {
-    unsafe { (ta as *mut u8).add(std::mem::size_of::<TypedArrayHeader>()) }
+    unsafe {
+        if crate::native_arena::is_native_typed_view(ta as *const TypedArrayHeader) {
+            crate::native_arena::native_view_data_ptr_mut(ta)
+        } else {
+            (ta as *mut u8).add(std::mem::size_of::<TypedArrayHeader>())
+        }
+    }
+}
+
+/// Return the byte view for a registered typed array.
+///
+/// Native arena views do not store their bytes after `TypedArrayHeader`; this
+/// helper routes through `data_ptr`, which validates disposed native views and
+/// returns the external backing pointer.
+pub unsafe fn typed_array_bytes<'a>(ta: *const TypedArrayHeader) -> Option<&'a [u8]> {
+    let ta = clean_ta_ptr(ta);
+    if ta.is_null() || lookup_typed_array_kind(ta as usize).is_none() {
+        return None;
+    }
+    let data = data_ptr(ta);
+    let len = ((*ta).length as usize).saturating_mul((*ta).elem_size as usize);
+    if len == 0 {
+        return Some(std::slice::from_raw_parts(
+            ptr::NonNull::<u8>::dangling().as_ptr(),
+            0,
+        ));
+    }
+    if data.is_null() {
+        return None;
+    }
+    Some(std::slice::from_raw_parts(data, len))
+}
+
+/// Return the mutable byte view for a registered typed array.
+///
+/// See [`typed_array_bytes`] for the native-view layout invariant.
+pub unsafe fn typed_array_bytes_mut<'a>(ta: *mut TypedArrayHeader) -> Option<&'a mut [u8]> {
+    let ta = clean_ta_ptr(ta as *const TypedArrayHeader) as *mut TypedArrayHeader;
+    if ta.is_null() || lookup_typed_array_kind(ta as usize).is_none() {
+        return None;
+    }
+    let data = data_ptr_mut(ta);
+    let len = ((*ta).length as usize).saturating_mul((*ta).elem_size as usize);
+    if len == 0 {
+        return Some(std::slice::from_raw_parts_mut(
+            ptr::NonNull::<u8>::dangling().as_ptr(),
+            0,
+        ));
+    }
+    if data.is_null() {
+        return None;
+    }
+    Some(std::slice::from_raw_parts_mut(data, len))
 }
 
 fn ta_layout(capacity: u32, elem_size: usize) -> Layout {
@@ -488,7 +552,14 @@ pub extern "C" fn js_typed_array_length(ta: *const TypedArrayHeader) -> i32 {
     if ta.is_null() {
         return 0;
     }
-    unsafe { (*ta).length as i32 }
+    unsafe {
+        if crate::native_arena::is_native_typed_view(ta) {
+            crate::native_arena::validate_view_alive(
+                crate::native_arena::native_view_from_typed_array(ta),
+            );
+        }
+        (*ta).length as i32
+    }
 }
 
 /// `ta[i]` — returns plain f64 numeric value (NOT NaN-boxed).
@@ -499,6 +570,11 @@ pub extern "C" fn js_typed_array_get(ta: *const TypedArrayHeader, index: i32) ->
         return 0.0;
     }
     unsafe {
+        if crate::native_arena::is_native_typed_view(ta) {
+            crate::native_arena::validate_view_alive(
+                crate::native_arena::native_view_from_typed_array(ta),
+            );
+        }
         if index < 0 || index as u32 >= (*ta).length {
             return f64::from_bits(crate::value::TAG_UNDEFINED);
         }
@@ -514,6 +590,11 @@ pub extern "C" fn js_typed_array_at(ta: *const TypedArrayHeader, index: f64) -> 
         return f64::from_bits(crate::value::TAG_UNDEFINED);
     }
     unsafe {
+        if crate::native_arena::is_native_typed_view(ta) {
+            crate::native_arena::validate_view_alive(
+                crate::native_arena::native_view_from_typed_array(ta),
+            );
+        }
         let len = (*ta).length as i64;
         let mut idx = index as i64;
         if idx < 0 {
@@ -534,10 +615,54 @@ pub extern "C" fn js_typed_array_set(ta: *mut TypedArrayHeader, index: i32, valu
         return;
     }
     unsafe {
+        if crate::native_arena::is_native_typed_view(ta as *const TypedArrayHeader) {
+            crate::native_arena::validate_view_alive(
+                crate::native_arena::native_view_from_typed_array(ta as *const TypedArrayHeader),
+            );
+        }
         if index < 0 || index as u32 >= (*ta).length {
             return;
         }
         store_at(ta, index as usize, jsvalue_to_f64(value));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn js_uint8array_get(target: *const TypedArrayHeader, index: i32) -> i32 {
+    let addr = strip_nanbox(target as u64);
+    if addr < 0x1000 || index < 0 {
+        return 0;
+    }
+    if let Some(kind) = lookup_typed_array_kind(addr) {
+        if !matches!(kind, KIND_UINT8 | KIND_UINT8_CLAMPED) {
+            return 0;
+        }
+        let value = js_typed_array_get(addr as *const TypedArrayHeader, index);
+        if value.to_bits() == crate::value::TAG_UNDEFINED {
+            0
+        } else {
+            value as i32
+        }
+    } else if crate::buffer::is_registered_buffer(addr) {
+        crate::buffer::js_buffer_get(addr as *const crate::buffer::BufferHeader, index)
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn js_uint8array_set(target: *mut TypedArrayHeader, index: i32, value: i32) {
+    let addr = strip_nanbox(target as u64);
+    if addr < 0x1000 || index < 0 {
+        return;
+    }
+    if let Some(kind) = lookup_typed_array_kind(addr) {
+        if !matches!(kind, KIND_UINT8 | KIND_UINT8_CLAMPED) {
+            return;
+        }
+        js_typed_array_set(addr as *mut TypedArrayHeader, index, value as f64);
+    } else if crate::buffer::is_registered_buffer(addr) {
+        crate::buffer::js_buffer_set(addr as *mut crate::buffer::BufferHeader, index, value);
     }
 }
 

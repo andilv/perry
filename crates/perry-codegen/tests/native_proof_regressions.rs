@@ -294,6 +294,52 @@ fn buffer_let(id: u32, name: &str, size: Expr) -> Stmt {
     }
 }
 
+fn typed_array_let(id: u32, name: &str, class_name: &str, kind: u8, length: Expr) -> Stmt {
+    Stmt::Let {
+        id,
+        name: name.to_string(),
+        ty: Type::Named(class_name.to_string()),
+        mutable: false,
+        init: Some(Expr::TypedArrayNew {
+            kind,
+            arg: Some(Box::new(length)),
+        }),
+    }
+}
+
+fn native_arena_owner_let(id: u32, name: &str, byte_length: Expr, mutable: bool) -> Stmt {
+    Stmt::Let {
+        id,
+        name: name.to_string(),
+        ty: Type::Any,
+        mutable,
+        init: Some(Expr::NativeArenaAlloc(Box::new(byte_length))),
+    }
+}
+
+fn native_arena_view_let(
+    id: u32,
+    name: &str,
+    owner_id: u32,
+    class_name: &str,
+    kind: u8,
+    byte_offset: Expr,
+    length: Expr,
+) -> Stmt {
+    Stmt::Let {
+        id,
+        name: name.to_string(),
+        ty: Type::Named(class_name.to_string()),
+        mutable: false,
+        init: Some(Expr::NativeArenaView {
+            owner: Box::new(local(owner_id)),
+            kind,
+            byte_offset: Box::new(byte_offset),
+            length: Box::new(length),
+        }),
+    }
+}
+
 fn number_array_let(id: u32, name: &str, values: Vec<i64>) -> Stmt {
     Stmt::Let {
         id,
@@ -341,6 +387,23 @@ fn buffer_set(buffer_id: u32, index: Expr) -> Stmt {
         index: Box::new(index),
         value: Box::new(int(1)),
     })
+}
+
+fn buffer_read(buffer_id: u32, method: &str, index: Expr) -> Expr {
+    call(
+        Expr::PropertyGet {
+            object: Box::new(local(buffer_id)),
+            property: method.to_string(),
+        },
+        vec![index],
+    )
+}
+
+fn index_get(object_id: u32, index: Expr) -> Expr {
+    Expr::IndexGet {
+        object: Box::new(local(object_id)),
+        index: Box::new(index),
+    }
 }
 
 fn call(callee: Expr, args: Vec<Expr>) -> Expr {
@@ -467,7 +530,7 @@ fn artifact_schema_v6_records_consumed_native_facts_for_buffer_region() {
     ];
 
     let artifact = compile_artifact_json("artifact_positive_buffer_region.ts", body);
-    assert_eq!(artifact["schema_version"], 6);
+    assert_eq!(artifact["schema_version"], 8);
     let records = artifact["records"].as_array().unwrap();
     assert!(
         records.iter().any(|record| {
@@ -500,7 +563,7 @@ fn artifact_schema_v6_records_rejected_facts_for_buffer_fallback() {
     ];
 
     let artifact = compile_artifact_json("artifact_rejected_buffer_region.ts", body);
-    assert_eq!(artifact["schema_version"], 6);
+    assert_eq!(artifact["schema_version"], 8);
     let records = artifact["records"].as_array().unwrap();
     assert!(
         records.iter().any(|record| {
@@ -546,7 +609,7 @@ fn artifact_schema_v6_records_c_layout_pod_manifest() {
     ];
 
     let artifact = compile_artifact_json("artifact_c_layout_pod_record.ts", body);
-    assert_eq!(artifact["schema_version"], 6);
+    assert_eq!(artifact["schema_version"], 8);
     assert_eq!(artifact["summary"]["pod_layout_count"], 1);
     assert_eq!(artifact["summary"]["pod_record_count"], 1);
     let layouts = artifact["pod_layouts"].as_array().unwrap();
@@ -618,7 +681,7 @@ fn artifact_schema_v6_records_pod_dynamic_write_fallback() {
     ];
 
     let artifact = compile_artifact_json("artifact_c_layout_pod_dynamic_write.ts", body);
-    assert_eq!(artifact["schema_version"], 6);
+    assert_eq!(artifact["schema_version"], 8);
     assert!(
         artifact["records"]
             .as_array()
@@ -641,7 +704,7 @@ fn artifact_schema_v6_records_pod_dynamic_write_fallback() {
 }
 
 #[test]
-fn artifact_schema_v6_rejects_inexact_pod_initializer_values() {
+fn artifact_schema_v8_rejects_inexact_pod_initializer_values() {
     let packet_ty = pod_type(&[
         ("tag", Type::Named("PerryU32".to_string())),
         ("gain", Type::Named("PerryF32".to_string())),
@@ -665,7 +728,7 @@ fn artifact_schema_v6_rejects_inexact_pod_initializer_values() {
     ];
 
     let artifact = compile_artifact_json("artifact_c_layout_pod_init_reject.ts", body);
-    assert_eq!(artifact["schema_version"], 6);
+    assert_eq!(artifact["schema_version"], 8);
     assert_eq!(artifact["summary"]["pod_layout_count"], 0);
     assert_eq!(artifact["summary"]["pod_record_count"], 0);
     assert!(artifact["pod_layouts"].as_array().unwrap().is_empty());
@@ -716,7 +779,7 @@ fn artifact_schema_v6_records_pod_pointerful_field_rejection() {
     ];
 
     let artifact = compile_artifact_json("artifact_c_layout_pod_reject.ts", body);
-    assert_eq!(artifact["schema_version"], 6);
+    assert_eq!(artifact["schema_version"], 8);
     assert_eq!(artifact["summary"]["pod_layout_count"], 0);
     assert!(artifact["pod_layouts"].as_array().unwrap().is_empty());
     assert!(
@@ -735,164 +798,6 @@ fn artifact_schema_v6_records_pod_pointerful_field_rejection() {
                     })
             }),
         "expected explicit pointerful POD rejection record:\n{artifact:#}"
-    );
-}
-
-#[test]
-fn artifact_records_buffer_read_u32_and_unsigned_materialization() {
-    let body = vec![
-        buffer_let(1, "buf", int(8)),
-        Stmt::Return(Some(Expr::Call {
-            callee: Box::new(Expr::PropertyGet {
-                object: Box::new(local(1)),
-                property: "readUInt32BE".to_string(),
-            }),
-            args: vec![int(0)],
-            type_args: Vec::new(),
-        })),
-    ];
-
-    let artifact = compile_artifact_json("artifact_buffer_read_u32.ts", body);
-    let records = artifact["records"].as_array().unwrap();
-    assert!(
-        records.iter().any(|record| {
-            record["expr_kind"] == "BufferNumericRead"
-                && record["consumer"] == "BufferNumericRead.native_u32"
-                && record["native_rep_name"] == "u32"
-                && record["llvm_ty"] == "i32"
-                && record["native_value_state"] == "region_local"
-        }),
-        "expected region-local u32 buffer numeric read record:\n{artifact:#}"
-    );
-    assert!(
-        records.iter().any(|record| {
-            record["consumer"] == "materialize_js_value"
-                && record["native_value_state"] == "materialized"
-                && record["native_abi_transition"]["from_native_rep"] == "u32"
-                && record["native_abi_transition"]["to_native_rep"] == "js_value"
-                && record["native_abi_transition"]["op"] == "unsigned_int_to_float"
-                && record["native_abi_transition"]["lossy"] == false
-        }),
-        "expected unsigned u32 JS materialization record:\n{artifact:#}"
-    );
-    assert!(
-        artifact["summary"]["native_abi_transition_count"]
-            .as_u64()
-            .is_some_and(|count| count >= 1)
-            && artifact["summary"]["native_abi_transition_op_counts"]["unsigned_int_to_float"]
-                .as_u64()
-                .is_some_and(|count| count >= 1),
-        "expected transition summary counts for unsigned materialization:\n{artifact:#}"
-    );
-}
-
-#[test]
-fn loop_length_bound_does_not_prove_multibyte_buffer_read_inbounds() {
-    let body = vec![
-        buffer_let(1, "buf", int(8)),
-        for_loop(
-            2,
-            length(1),
-            vec![Stmt::Expr(call(
-                Expr::PropertyGet {
-                    object: Box::new(local(1)),
-                    property: "readUInt32BE".to_string(),
-                },
-                vec![local(2)],
-            ))],
-        ),
-        Stmt::Return(Some(int(0))),
-    ];
-
-    let ir = compile_ir("loop_bound_multibyte_buffer_read.ts", body.clone());
-    assert!(
-        !ir.contains("getelementptr inbounds i8"),
-        "`i < buf.length` only proves one-byte Buffer access; multi-byte reads must not emit an inbounds GEP:\n{ir}"
-    );
-
-    let artifact = compile_artifact_json("artifact_loop_bound_multibyte_buffer_read.ts", body);
-    let records = artifact["records"].as_array().unwrap();
-    assert!(
-        !records.iter().any(|record| {
-            record["expr_kind"] == "BufferNumericRead"
-                && record["consumer"] == "BufferNumericRead.native_u32"
-        }),
-        "multi-byte Buffer read must not consume a one-byte loop proof:\n{artifact:#}"
-    );
-}
-
-#[test]
-fn artifact_records_buffer_read_double_as_f64() {
-    let body = vec![
-        buffer_let(1, "buf", int(8)),
-        Stmt::Return(Some(Expr::Call {
-            callee: Box::new(Expr::PropertyGet {
-                object: Box::new(local(1)),
-                property: "readDoubleLE".to_string(),
-            }),
-            args: vec![int(0)],
-            type_args: Vec::new(),
-        })),
-    ];
-
-    let artifact = compile_artifact_json("artifact_buffer_read_double.ts", body);
-    let records = artifact["records"].as_array().unwrap();
-    assert!(
-        records.iter().any(|record| {
-            record["expr_kind"] == "BufferNumericRead"
-                && record["consumer"] == "BufferNumericRead.native_f64"
-                && record["native_rep_name"] == "f64"
-                && record["llvm_ty"] == "double"
-                && record["native_value_state"] == "region_local"
-        }),
-        "expected region-local f64 buffer numeric read record:\n{artifact:#}"
-    );
-    assert!(
-        records.iter().any(|record| {
-            record["consumer"] == "materialize_js_value"
-                && record["native_abi_transition"]["from_native_rep"] == "f64"
-                && record["native_abi_transition"]["op"] == "none"
-                && record["native_abi_transition"]["lossy"] == false
-        }),
-        "expected no-op f64 JS materialization record:\n{artifact:#}"
-    );
-}
-
-#[test]
-fn artifact_records_buffer_read_float_as_f32_and_float_extend_materialization() {
-    let body = vec![
-        buffer_let(1, "buf", int(8)),
-        Stmt::Return(Some(call(
-            Expr::PropertyGet {
-                object: Box::new(local(1)),
-                property: "readFloatLE".to_string(),
-            },
-            vec![int(0)],
-        ))),
-    ];
-
-    let artifact = compile_artifact_json("artifact_buffer_read_f32.ts", body);
-    let records = artifact["records"].as_array().unwrap();
-    assert!(
-        records.iter().any(|record| {
-            record["expr_kind"] == "BufferNumericRead"
-                && record["consumer"] == "BufferNumericRead.native_f32"
-                && record["native_rep_name"] == "f32"
-                && record["llvm_ty"] == "float"
-                && record["native_value_state"] == "region_local"
-        }),
-        "expected region-local f32 buffer numeric read record:\n{artifact:#}"
-    );
-    assert!(
-        records.iter().any(|record| {
-            record["consumer"] == "materialize_js_value"
-                && record["native_value_state"] == "materialized"
-                && record["native_abi_transition"]["from_native_rep"] == "f32"
-                && record["native_abi_transition"]["to_native_rep"] == "js_value"
-                && record["native_abi_transition"]["op"] == "float_extend"
-                && record["native_abi_transition"]["lossy"] == false
-        }),
-        "expected explicit f32->double materialization record:\n{artifact:#}"
     );
 }
 

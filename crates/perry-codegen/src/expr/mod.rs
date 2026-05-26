@@ -23,10 +23,11 @@ use crate::lower_string_method::{
 };
 use crate::nanbox::{double_literal, POINTER_MASK_I64};
 use crate::native_value::{
-    AliasState, BoundedBufferIndex, BoundsProof, BoundsState, BufferAccessMode, BufferElem,
-    BufferViewRep, BufferViewSlot, ExpectedNativeRep, LengthSource, LoweredValue,
-    MaterializationReason, NativeFactUse, NativeRep, NativeRepRecord, NativeValueState,
-    ScalarConversionRecord, SemanticKind,
+    AliasState, BoundedBufferIndex, BoundsProof, BoundsState, BufferAccessFacts, BufferAccessMode,
+    BufferElem, BufferIndexUnit, BufferViewRep, BufferViewSlot, ExpectedNativeRep,
+    GuardedBufferIndex, LengthSource, LoweredValue, MaterializationReason, NativeFactUse,
+    NativeOwnedViewFact, NativeRep, NativeRepRecord, NativeValueState, ScalarConversionRecord,
+    SemanticKind,
 };
 use crate::strings::StringPool;
 use crate::type_analysis::{
@@ -42,6 +43,7 @@ use crate::types::{DOUBLE, I1, I32, I64, I8, PTR};
 // existing `crate::expr::X` paths resolve unchanged.
 mod array_literal;
 mod buffer_access;
+mod buffer_views;
 mod channel;
 mod helpers;
 mod i32_fast_path;
@@ -59,8 +61,16 @@ mod write_barrier;
 pub(crate) use crate::native_value::materialize_js_value;
 pub(crate) use array_literal::lower_array_literal;
 pub(crate) use buffer_access::{
-    emit_buffer_access_pointer, lower_buffer_access_proof, lower_buffer_load, lower_buffer_store,
+    access_facts_for_spec, emit_buffer_access_pointer, lower_buffer_access_proof,
+    lower_buffer_load, lower_buffer_store, lower_typed_array_load, lower_typed_array_store,
     BufferAccessEmission, BufferAccessSpec, StoreResult,
+};
+pub(crate) use buffer_views::{
+    alias_buffer_view_slot, attach_native_owned_view_fact, buffer_access_materialization_reason,
+    buffer_view_lowered_value, downgrade_buffer_alias, downgrade_buffer_aliases_in_expr,
+    invalidate_native_owned_views_for_dispose, invalidate_native_owned_views_for_owner,
+    native_arena_canonical_owner_id, native_owned_fact_for_view,
+    record_native_arena_owner_assignment, update_buffer_view_for_assignment,
 };
 #[allow(unused_imports)] // ChannelReduction kept reachable for surface stability
 pub(crate) use channel::{
@@ -90,9 +100,9 @@ pub(crate) use pod_record::{
 };
 pub(crate) use range_facts::{
     bounds_for_buffer_access, bounds_for_buffer_access_width, effective_alias_state_for_access,
-    int_range_expr, invalidate_local_write_facts, record_int_facts_for_let,
-    record_int_facts_for_local_set, record_int_facts_for_update, while_condition_range_fact,
-    IntRange, IntRangeFact,
+    guarded_buffer_indices_for_condition, int_range_expr, invalidate_local_write_facts,
+    record_int_facts_for_let, record_int_facts_for_local_set, record_int_facts_for_update,
+    while_condition_range_fact, IntRange, IntRangeFact,
 };
 pub(crate) use strings::emit_string_literal_global;
 pub(crate) use typed_feedback::{
@@ -775,6 +785,13 @@ pub(crate) struct FnCtx<'a> {
     /// exist with `AliasState::Unknown`, while noalias metadata requires a
     /// proven/guarded alias state at the consumer.
     pub buffer_view_slots: std::collections::HashMap<u32, BufferViewSlot>,
+    /// Local owner-handle aliases for native arenas. Values are canonical
+    /// owner local ids used by native-owned typed-array view proof state.
+    pub native_arena_owner_aliases: std::collections::HashMap<u32, u32>,
+    /// Owner-handle aliases whose canonical owner is path-dependent after
+    /// control-flow merge. Hazards through these locals conservatively
+    /// invalidate every native-owned view.
+    pub native_arena_ambiguous_owner_aliases: std::collections::HashSet<u32>,
     /// Benchmark/debug switch that forces tracked buffers through the existing
     /// helper fallback instead of native GEP/load/store lowering.
     pub disable_buffer_fast_path: bool,
@@ -783,6 +800,10 @@ pub(crate) struct FnCtx<'a> {
     /// Loop-local facts proving a buffer index is bounded inside the current
     /// loop body.
     pub bounded_buffer_index_pairs: Vec<BoundedBufferIndex>,
+    /// Branch/loop-condition facts proving `index + width <= view.length`.
+    /// These are scoped like loop facts and consumed only for accesses whose
+    /// required width does not exceed the guarded width.
+    pub guarded_buffer_index_pairs: Vec<GuardedBufferIndex>,
     pub buffer_hazard_reasons: std::collections::HashMap<u32, MaterializationReason>,
     /// Local aliases that preserve an i32 index, e.g. `const j = i | 0`.
     pub native_i32_aliases: std::collections::HashMap<u32, u32>,
@@ -945,6 +966,11 @@ fn materialization_reason_label(reason: &MaterializationReason) -> &'static str 
         MaterializationReason::ClosureCapture => "closure_capture",
         MaterializationReason::Reassignment => "reassignment",
         MaterializationReason::UnknownCallEscape => "unknown_call_escape",
+        MaterializationReason::UseAfterDispose => "use_after_dispose",
+        MaterializationReason::EscapingUnownedPointer => "escaping_unowned_pointer",
+        MaterializationReason::StaleViewLength => "stale_view_length",
+        MaterializationReason::MutableAlias => "mutable_alias",
+        MaterializationReason::MissingOwnerRoot => "missing_owner_root",
         MaterializationReason::PodMaterialization => "pod_materialization",
         MaterializationReason::PodUnsupported => "pod_unsupported",
         MaterializationReason::PodDynamicMutation => "pod_dynamic_mutation",
@@ -1246,6 +1272,7 @@ impl<'a> FnCtx<'a> {
             access_mode,
             materialization_reason,
             None,
+            None,
             emitted_inbounds,
             emitted_noalias,
             notes,
@@ -1263,6 +1290,7 @@ impl<'a> FnCtx<'a> {
         access_mode: Option<BufferAccessMode>,
         materialization_reason: Option<MaterializationReason>,
         scalar_conversion: Option<ScalarConversionRecord>,
+        buffer_access: Option<BufferAccessFacts>,
         emitted_inbounds: bool,
         emitted_noalias: bool,
         notes: Vec<String>,
@@ -1312,6 +1340,8 @@ impl<'a> FnCtx<'a> {
             bounds_state,
             alias_state,
             access_mode,
+            buffer_access,
+            native_owned_view: None,
             materialization_reason,
             fallback_reason,
             native_value_state,
@@ -1325,111 +1355,6 @@ impl<'a> FnCtx<'a> {
             notes,
         });
     }
-}
-
-pub(crate) fn buffer_view_lowered_value(
-    data_ptr: &str,
-    length: &str,
-    bounds: BoundsState,
-    alias: AliasState,
-) -> LoweredValue {
-    LoweredValue::buffer_view(data_ptr, length, bounds, alias)
-}
-
-pub(crate) fn downgrade_buffer_alias(ctx: &mut FnCtx<'_>, id: u32, reason: MaterializationReason) {
-    if let Some(view) = ctx.buffer_view_slots.get_mut(&id) {
-        view.alias = AliasState::MayAlias;
-        view.scope_idx = None;
-    }
-    ctx.buffer_hazard_reasons.insert(id, reason);
-}
-
-pub(crate) fn alias_buffer_view_slot(
-    ctx: &mut FnCtx<'_>,
-    alias_id: u32,
-    source_id: u32,
-    reason: MaterializationReason,
-) {
-    let Some(mut view) = ctx.buffer_view_slots.get(&source_id).cloned() else {
-        return;
-    };
-    downgrade_buffer_alias(ctx, source_id, reason.clone());
-    view.alias = AliasState::MayAlias;
-    view.scope_idx = None;
-    ctx.buffer_view_slots.insert(alias_id, view);
-    ctx.buffer_hazard_reasons.insert(alias_id, reason);
-}
-
-pub(crate) fn update_buffer_view_for_assignment(
-    ctx: &mut FnCtx<'_>,
-    id: u32,
-    value: &Expr,
-    lowered_value: &str,
-) {
-    if matches!(
-        value,
-        Expr::BufferAlloc { .. } | Expr::BufferAllocUnsafe(_) | Expr::Uint8ArrayNew(_)
-    ) {
-        let blk = ctx.block();
-        let handle = unbox_to_i64(blk, lowered_value);
-        let handle_ptr = blk.inttoptr(I64, &handle);
-        let data_ptr = blk.gep(I8, &handle_ptr, &[(I32, "8")]);
-        let data_slot = ctx
-            .buffer_view_slots
-            .get(&id)
-            .map(|view| view.data_slot.clone())
-            .unwrap_or_else(|| ctx.func.alloca_entry(PTR));
-        ctx.block().store(PTR, &data_ptr, &data_slot);
-        ctx.buffer_view_slots.insert(
-            id,
-            BufferViewSlot {
-                data_slot,
-                scope_idx: None,
-                elem: BufferElem::U8,
-                alias: AliasState::MayAlias,
-                length_source: Some(LengthSource::Unknown),
-            },
-        );
-    } else {
-        ctx.buffer_view_slots.remove(&id);
-    }
-    ctx.buffer_hazard_reasons
-        .insert(id, MaterializationReason::Reassignment);
-}
-
-pub(crate) fn downgrade_buffer_aliases_in_expr(
-    ctx: &mut FnCtx<'_>,
-    expr: &Expr,
-    reason: MaterializationReason,
-) {
-    match expr {
-        Expr::LocalGet(id) => downgrade_buffer_alias(ctx, *id, reason),
-        Expr::Binary { left, right, .. } => {
-            downgrade_buffer_aliases_in_expr(ctx, left, reason.clone());
-            downgrade_buffer_aliases_in_expr(ctx, right, reason);
-        }
-        Expr::PropertyGet { object, .. } => downgrade_buffer_aliases_in_expr(ctx, object, reason),
-        Expr::IndexGet { object, index } => {
-            downgrade_buffer_aliases_in_expr(ctx, object, reason.clone());
-            downgrade_buffer_aliases_in_expr(ctx, index, reason);
-        }
-        _ => {}
-    }
-}
-
-pub(crate) fn buffer_access_materialization_reason(
-    ctx: &FnCtx<'_>,
-    expr: &Expr,
-) -> MaterializationReason {
-    if let Expr::LocalGet(id) = expr {
-        if let Some(reason) = ctx.buffer_hazard_reasons.get(id) {
-            return reason.clone();
-        }
-        if ctx.closure_captures.contains_key(id) {
-            return MaterializationReason::ClosureCapture;
-        }
-    }
-    MaterializationReason::UnknownBounds
 }
 
 // Issue #1098 phase 2: lower_expr arm-bodies extracted into
@@ -1639,6 +1564,9 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         | Expr::BufferIndexGet { .. }
         | Expr::BufferIndexSet { .. }
         | Expr::TypedArrayNew { .. }
+        | Expr::NativeArenaAlloc(..)
+        | Expr::NativeArenaView { .. }
+        | Expr::NativeArenaDispose(..)
         | Expr::ArrayUnshift { .. }
         | Expr::ArrayEntries(..)
         | Expr::ArrayKeys(..)

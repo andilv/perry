@@ -182,6 +182,13 @@ pub(crate) fn verify_native_rep_records(records: &[NativeRepRecord]) -> Result<(
         }
         if matches!(
             record.access_mode.as_ref(),
+            Some(BufferAccessMode::UncheckedNative)
+        ) && record.native_owned_view.is_some()
+        {
+            validate_native_owned_unchecked_access(record, &mut errors);
+        }
+        if matches!(
+            record.access_mode.as_ref(),
             Some(BufferAccessMode::CheckedNative)
         ) && !matches!(
             record.bounds_state,
@@ -200,6 +207,48 @@ pub(crate) fn verify_native_rep_records(records: &[NativeRepRecord]) -> Result<(
         );
     }
     Ok(())
+}
+
+fn validate_native_owned_unchecked_access(record: &NativeRepRecord, errors: &mut Vec<String>) {
+    let Some(fact) = record.native_owned_view.as_ref() else {
+        return;
+    };
+    let prefix = || {
+        format!(
+            "{}:{} {}",
+            record.function, record.block_label, record.consumer
+        )
+    };
+    if fact.owner_root_state != "rooted" {
+        errors.push(format!(
+            "{} unchecked native-owned view access missing rooted owner",
+            prefix()
+        ));
+    }
+    if fact.disposed_state != "alive" {
+        errors.push(format!(
+            "{} unchecked native-owned view access may use disposed owner",
+            prefix()
+        ));
+    }
+    if !matches!(
+        record.bounds_state,
+        Some(BoundsState::Proven { .. } | BoundsState::Guarded { .. })
+    ) {
+        errors.push(format!(
+            "{} unchecked native-owned view access missing bounds proof",
+            prefix()
+        ));
+    }
+    if !matches!(
+        record.alias_state,
+        Some(AliasState::NoAliasProven | AliasState::NoAliasGuarded { .. })
+    ) {
+        errors.push(format!(
+            "{} unchecked native-owned view access missing alias proof",
+            prefix()
+        ));
+    }
 }
 
 fn expected_llvm_type(rep: &NativeRep) -> Option<&'static str> {
@@ -395,6 +444,8 @@ mod tests {
             bounds_state: None,
             alias_state: None,
             access_mode: None,
+            buffer_access: None,
+            native_owned_view: None,
             materialization_reason: None,
             fallback_reason: None,
             native_value_state: NativeValueState::RegionLocal,
@@ -610,6 +661,10 @@ mod tests {
             data_ptr: "%ptr".to_string(),
             length: "%len".to_string(),
             elem: crate::native_value::BufferElem::U8,
+            element_width_bytes: 1,
+            index_unit: crate::native_value::BufferIndexUnit::Byte,
+            view_byte_offset: Some(0),
+            length_offset_from_data: -8,
             bounds: BoundsState::Unknown,
             alias: AliasState::Unknown,
         });

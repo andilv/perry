@@ -81,7 +81,7 @@ pub(crate) fn lower_uint8array_get_i32(
     let a = lower_expr(ctx, array)?;
     let blk = ctx.block();
     let handle = unbox_to_i64(blk, &a);
-    let byte_i32 = blk.call(I32, "js_buffer_get", &[(I64, &handle), (I32, &idx_i32)]);
+    let byte_i32 = blk.call(I32, "js_uint8array_get", &[(I64, &handle), (I32, &idx_i32)]);
     let slow = LoweredValue {
         semantic: SemanticKind::JsNumber,
         rep: NativeRep::I32,
@@ -627,16 +627,13 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 let v = lower_expr(ctx, value)?;
                 ctx.block().fptosi(DOUBLE, &v, I32)
             };
-            // Issue #1205 slow path: route the indexed store through
-            // `js_buffer_set` so a view receiver propagates the write
-            // to its backing buffer (and any sister views).  Fast
-            // path above stays direct — `buffer_data_slots` only
-            // tracks `Buffer.alloc` locals, which are never views.
+            // Slow path accepts either BufferHeader-backed Uint8Arrays or
+            // NativeArena typed views.
             let a = lower_expr(ctx, array)?;
             let blk = ctx.block();
             let handle = unbox_to_i64(blk, &a);
             blk.call_void(
-                "js_buffer_set",
+                "js_uint8array_set",
                 &[(I64, &handle), (I32, &idx_i32), (I32, &val_i32)],
             );
             let reason = buffer_access_materialization_reason(ctx, array);
@@ -808,6 +805,51 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     }
                 },
             }
+        }
+
+        Expr::NativeArenaAlloc(byte_length) => {
+            let byte_length = lower_expr(ctx, byte_length)?;
+            let byte_length_i64 = ctx.block().fptosi(DOUBLE, &byte_length, I64);
+            let owner = ctx
+                .block()
+                .call(I64, "js_native_arena_alloc", &[(I64, &byte_length_i64)]);
+            Ok(nanbox_pointer_inline(ctx.block(), &owner))
+        }
+
+        Expr::NativeArenaView {
+            owner,
+            kind,
+            byte_offset,
+            length,
+        } => {
+            let owner_value = lower_expr(ctx, owner)?;
+            let byte_offset = lower_expr(ctx, byte_offset)?;
+            let length = lower_expr(ctx, length)?;
+            let blk = ctx.block();
+            let owner_handle = unbox_to_i64(blk, &owner_value);
+            let kind_i32 = (*kind as i32).to_string();
+            let byte_offset_i64 = blk.fptosi(DOUBLE, &byte_offset, I64);
+            let length_i64 = blk.fptosi(DOUBLE, &length, I64);
+            let view = blk.call(
+                I64,
+                "js_native_arena_view",
+                &[
+                    (I64, &owner_handle),
+                    (I32, &kind_i32),
+                    (I64, &byte_offset_i64),
+                    (I64, &length_i64),
+                ],
+            );
+            Ok(nanbox_pointer_inline(blk, &view))
+        }
+
+        Expr::NativeArenaDispose(owner) => {
+            let owner_value = lower_expr(ctx, owner)?;
+            let blk = ctx.block();
+            let owner_handle = unbox_to_i64(blk, &owner_value);
+            blk.call_void("js_native_arena_dispose", &[(I64, &owner_handle)]);
+            super::invalidate_native_owned_views_for_dispose(ctx, owner);
+            Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)))
         }
 
         // -------- arr.unshift(value) --------

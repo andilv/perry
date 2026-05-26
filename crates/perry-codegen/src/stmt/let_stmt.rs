@@ -4,8 +4,9 @@ use super::*;
 
 use crate::expr::lower_expr_with_expected_type;
 use crate::native_value::{
-    AliasState, BufferAccessMode, BufferElem, BufferViewSlot, LengthSource, LoweredValue,
-    MaterializationReason, NativeRep, PodLayoutDecision, PodLocal, SemanticKind,
+    AliasState, BufferAccessMode, BufferElem, BufferIndexUnit, BufferViewSlot, LengthSource,
+    LoweredValue, MaterializationReason, NativeOwnedViewSlot, NativeRep, PodLayoutDecision,
+    PodLocal, SemanticKind,
 };
 use crate::types::{I32, I64, I8, PTR};
 
@@ -656,24 +657,7 @@ pub(crate) fn lower_let(
             // Uint8ArrayGet/Set then uses `getelementptr inbounds` from this
             // pointer instead of the inttoptr chain.
             if ctx.known_noalias_buffer_locals.contains(&id) {
-                let blk = ctx.block();
-                let handle = crate::expr::unbox_to_i64(blk, &v);
-                let handle_ptr = blk.inttoptr(I64, &handle);
-                let data_ptr = blk.gep(I8, &handle_ptr, &[(I32, "8")]);
-                let slot = ctx.func.alloca_entry(PTR);
-                ctx.block().store(PTR, &data_ptr, &slot);
-                let scope_idx = ctx.buffer_alias_base + ctx.buffer_data_slots.len() as u32;
-                ctx.buffer_data_slots.insert(id, (slot.clone(), scope_idx));
-                ctx.buffer_view_slots.insert(
-                    id,
-                    BufferViewSlot {
-                        data_slot: slot,
-                        scope_idx: Some(scope_idx),
-                        elem: BufferElem::U8,
-                        alias: AliasState::NoAliasProven,
-                        length_source: Some(buffer_alloc_length_source(init_expr)),
-                    },
-                );
+                register_noalias_buffer_view(ctx, id, init_expr, &v);
             }
             if let Some(source_id) = buffer_local_alias_source(init_expr) {
                 crate::expr::alias_buffer_view_slot(
@@ -954,6 +938,7 @@ pub(crate) fn lower_let(
                 ctx.block().store(I32, &v_i32, &i32_slot);
             }
         }
+        crate::expr::record_native_arena_owner_assignment(ctx, id, init_expr);
         // Buffer data-pointer slot for local (non-global) const buffers. The
         // HIR fact layer owns the source-shape decision; lowering only consumes
         // the stable local-id fact and emits the ptr slot used by
@@ -963,25 +948,7 @@ pub(crate) fn lower_let(
         // i32-able, so used_i32_init is always false here, but
         // gate explicitly to keep the invariant readable).
         if !used_i32_init && ctx.known_noalias_buffer_locals.contains(&id) {
-            let blk = ctx.block();
-            let handle = crate::expr::unbox_to_i64(blk, &v);
-            let handle_ptr = blk.inttoptr(I64, &handle);
-            let data_ptr = blk.gep(I8, &handle_ptr, &[(I32, "8")]);
-            let buf_slot = ctx.func.alloca_entry(PTR);
-            ctx.block().store(PTR, &data_ptr, &buf_slot);
-            let scope_idx = ctx.buffer_alias_base + ctx.buffer_data_slots.len() as u32;
-            ctx.buffer_data_slots
-                .insert(id, (buf_slot.clone(), scope_idx));
-            ctx.buffer_view_slots.insert(
-                id,
-                BufferViewSlot {
-                    data_slot: buf_slot,
-                    scope_idx: Some(scope_idx),
-                    elem: BufferElem::U8,
-                    alias: AliasState::NoAliasProven,
-                    length_source: Some(buffer_alloc_length_source(init_expr)),
-                },
-            );
+            register_noalias_buffer_view(ctx, id, init_expr, &v);
         }
         if let Some(source_id) = buffer_local_alias_source(init_expr) {
             crate::expr::alias_buffer_view_slot(
@@ -1020,6 +987,160 @@ fn native_i32_alias_source(expr: &perry_hir::Expr) -> Option<u32> {
 fn buffer_local_alias_source(expr: &perry_hir::Expr) -> Option<u32> {
     match expr {
         perry_hir::Expr::LocalGet(id) => Some(*id),
+        _ => None,
+    }
+}
+
+struct BufferViewInit {
+    elem: BufferElem,
+    element_width_bytes: u32,
+    index_unit: BufferIndexUnit,
+    data_offset_bytes: i32,
+    length_offset_from_data: i32,
+    length_source: LengthSource,
+    native_owner_local_id: Option<u32>,
+    native_byte_offset: Option<i64>,
+    native_byte_length: Option<i64>,
+}
+
+fn register_noalias_buffer_view(
+    ctx: &mut FnCtx<'_>,
+    id: u32,
+    init_expr: &perry_hir::Expr,
+    value: &str,
+) {
+    let Some(init) = buffer_view_init_for_expr(init_expr) else {
+        return;
+    };
+    let blk = ctx.block();
+    let handle = crate::expr::unbox_to_i64(blk, value);
+    let handle_ptr = blk.inttoptr(I64, &handle);
+    let data_ptr = if init.native_owner_local_id.is_some() {
+        let data_field = blk.gep(I8, &handle_ptr, &[(I32, "24")]);
+        blk.load(PTR, &data_field)
+    } else {
+        blk.gep(
+            I8,
+            &handle_ptr,
+            &[(I32, &init.data_offset_bytes.to_string())],
+        )
+    };
+    let data_slot = ctx.func.alloca_entry(PTR);
+    ctx.block().store(PTR, &data_ptr, &data_slot);
+    let length_slot = if init.native_owner_local_id.is_some() {
+        let len_field = ctx.block().gep(I8, &handle_ptr, &[(I32, "0")]);
+        let len_value = ctx.block().load(I32, &len_field);
+        let slot = ctx.func.alloca_entry(I32);
+        ctx.block().store(I32, &len_value, &slot);
+        Some(slot)
+    } else {
+        None
+    };
+    let scope_idx = ctx.buffer_alias_base + ctx.buffer_data_slots.len() as u32;
+    ctx.buffer_data_slots
+        .insert(id, (data_slot.clone(), scope_idx));
+    let native_owned = match init.native_owner_local_id {
+        Some(owner_local_id) => {
+            let owner_local_id = crate::expr::native_arena_canonical_owner_id(ctx, owner_local_id);
+            Some(NativeOwnedViewSlot {
+                owner_local_id,
+                byte_offset: init.native_byte_offset,
+                byte_length: init.native_byte_length,
+                owner_rooted: true,
+                disposed: false,
+                pointer_free_backing: true,
+            })
+        }
+        None => None,
+    };
+    ctx.buffer_view_slots.insert(
+        id,
+        BufferViewSlot {
+            data_slot,
+            length_slot,
+            scope_idx: Some(scope_idx),
+            elem: init.elem,
+            element_width_bytes: init.element_width_bytes,
+            index_unit: init.index_unit,
+            view_byte_offset: Some(0),
+            length_offset_from_data: init.length_offset_from_data,
+            alias: AliasState::NoAliasProven,
+            length_source: Some(init.length_source),
+            native_owned,
+        },
+    );
+}
+
+fn buffer_view_init_for_expr(expr: &perry_hir::Expr) -> Option<BufferViewInit> {
+    match expr {
+        perry_hir::Expr::BufferAlloc { .. }
+        | perry_hir::Expr::BufferAllocUnsafe(_)
+        | perry_hir::Expr::Uint8ArrayNew(_) => Some(BufferViewInit {
+            elem: BufferElem::U8,
+            element_width_bytes: 1,
+            index_unit: BufferIndexUnit::Byte,
+            data_offset_bytes: 8,
+            length_offset_from_data: -8,
+            length_source: buffer_alloc_length_source(expr),
+            native_owner_local_id: None,
+            native_byte_offset: None,
+            native_byte_length: None,
+        }),
+        perry_hir::Expr::TypedArrayNew { kind, .. } => {
+            let (elem, width) = typed_array_elem_width_for_kind(*kind)?;
+            Some(BufferViewInit {
+                elem,
+                element_width_bytes: width,
+                index_unit: BufferIndexUnit::Element,
+                data_offset_bytes: 16,
+                length_offset_from_data: -16,
+                length_source: buffer_alloc_length_source(expr),
+                native_owner_local_id: None,
+                native_byte_offset: None,
+                native_byte_length: None,
+            })
+        }
+        perry_hir::Expr::NativeArenaView {
+            owner,
+            kind,
+            byte_offset,
+            length,
+        } => {
+            let (elem, width) = typed_array_elem_width_for_kind(*kind)?;
+            let owner_local_id = match owner.as_ref() {
+                perry_hir::Expr::LocalGet(id) => Some(*id),
+                _ => None,
+            }?;
+            let byte_offset_const = const_i64_expr(byte_offset);
+            let length_const = const_i64_expr(length);
+            let native_byte_length = length_const.and_then(|len| len.checked_mul(width as i64));
+            Some(BufferViewInit {
+                elem,
+                element_width_bytes: width,
+                index_unit: BufferIndexUnit::Element,
+                data_offset_bytes: 24,
+                length_offset_from_data: 0,
+                length_source: length_source_from_expr(length).unwrap_or(LengthSource::Unknown),
+                native_owner_local_id: Some(owner_local_id),
+                native_byte_offset: byte_offset_const,
+                native_byte_length,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn typed_array_elem_width_for_kind(kind: u8) -> Option<(BufferElem, u32)> {
+    match kind {
+        perry_hir::TYPED_ARRAY_KIND_INT8 => Some((BufferElem::I8, 1)),
+        perry_hir::TYPED_ARRAY_KIND_UINT8 => Some((BufferElem::U8, 1)),
+        perry_hir::TYPED_ARRAY_KIND_UINT8_CLAMPED => Some((BufferElem::U8Clamped, 1)),
+        perry_hir::TYPED_ARRAY_KIND_INT16 => Some((BufferElem::I16, 2)),
+        perry_hir::TYPED_ARRAY_KIND_UINT16 => Some((BufferElem::U16, 2)),
+        perry_hir::TYPED_ARRAY_KIND_INT32 => Some((BufferElem::I32, 4)),
+        perry_hir::TYPED_ARRAY_KIND_UINT32 => Some((BufferElem::U32, 4)),
+        perry_hir::TYPED_ARRAY_KIND_FLOAT32 => Some((BufferElem::F32, 4)),
+        perry_hir::TYPED_ARRAY_KIND_FLOAT64 => Some((BufferElem::F64, 8)),
         _ => None,
     }
 }
@@ -1067,10 +1188,25 @@ fn buffer_alloc_length_source(expr: &perry_hir::Expr) -> LengthSource {
         perry_hir::Expr::BufferAlloc { size, .. } => Some(size.as_ref()),
         perry_hir::Expr::BufferAllocUnsafe(size) => Some(size.as_ref()),
         perry_hir::Expr::Uint8ArrayNew(Some(size)) => Some(size.as_ref()),
+        perry_hir::Expr::TypedArrayNew {
+            arg: Some(size), ..
+        } => Some(size.as_ref()),
+        perry_hir::Expr::TypedArrayNew { arg: None, .. } => {
+            return LengthSource::Constant(0);
+        }
+        perry_hir::Expr::NativeArenaView { length, .. } => Some(length.as_ref()),
         _ => None,
     };
     len.and_then(length_source_from_expr)
         .unwrap_or(LengthSource::Unknown)
+}
+
+fn const_i64_expr(expr: &perry_hir::Expr) -> Option<i64> {
+    match expr {
+        perry_hir::Expr::Integer(n) => Some(*n),
+        perry_hir::Expr::Number(n) if n.is_finite() && n.fract() == 0.0 => Some(*n as i64),
+        _ => None,
+    }
 }
 
 fn length_source_from_expr(expr: &perry_hir::Expr) -> Option<LengthSource> {
