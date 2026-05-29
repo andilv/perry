@@ -21,6 +21,8 @@ assert SPEC.loader is not None
 sys.modules[SPEC.name] = HARNESS
 SPEC.loader.exec_module(HARNESS)
 
+from compiler_output_harness.capture import SUITES
+
 
 GOOD_IR = """
 define i32 @main() {
@@ -680,6 +682,9 @@ entry:
         self.assertIn("numeric_arrays", spec["workloads"])
         self.assertIn("raw_numeric_object_fields", spec["workloads"])
         self.assertIn("scalar_replacement_literals", spec["workloads"])
+        self.assertIn("native_pod_layout_constants", spec["workloads"])
+        self.assertIn("native_memory_bulk_fill", spec["workloads"])
+        self.assertIn("native_memory_fixture", spec["workloads"])
         self.assertIn("native_abi_packet_typed", spec["workloads"])
         self.assertIn("native_abi_packet_control", spec["workloads"])
         self.assertTrue(spec["workloads"]["fma_contract"]["fma_gate"]["enabled"])
@@ -727,6 +732,17 @@ entry:
         )
         self.assertEqual(args.suite, "native-abi-proof")
         self.assertTrue(args.gate)
+
+    def test_native_abi_proof_suite_includes_native_memory_workloads(self):
+        suite = SUITES["native-abi-proof"]
+        packet_typed_index = suite.index("native_abi_packet_typed")
+        for workload in (
+            "native_pod_layout_constants",
+            "native_memory_bulk_fill",
+            "native_memory_fixture",
+        ):
+            self.assertIn(workload, suite)
+            self.assertLess(suite.index(workload), packet_typed_index)
 
     def test_workload_spec_rejects_missing_required_fields(self):
         with self.assertRaises(HARNESS.HarnessError):

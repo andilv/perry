@@ -49,8 +49,10 @@ mod helpers;
 mod i32_fast_path;
 mod index;
 mod nanbox_inline;
+mod native_memory;
 mod native_record;
 mod object_literal;
+mod pod_layout_constants;
 mod pod_record;
 mod range_facts;
 mod strings;
@@ -1554,6 +1556,9 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         | Expr::ArrayKeys(..)
         | Expr::ArrayValues(..)
         | Expr::ClassRef(..) => arrays_finds::lower(ctx, expr),
+        Expr::NativeMemoryFillU32 { .. } | Expr::NativeMemoryCopy { .. } => {
+            native_memory::lower(ctx, expr)
+        }
         Expr::CallSpread { .. } => call_spread::lower(ctx, expr),
         Expr::MathFround(..)
         | Expr::MapNewFromArray(..)
@@ -1800,6 +1805,9 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         | Expr::GetFunctionPrototypeMethod { .. }
         | Expr::ClassStaticSymbolSet { .. }
         | Expr::NativeModuleRef(..) => static_field_meta::lower(ctx, expr),
+        Expr::PodLayoutSizeOf { .. }
+        | Expr::PodLayoutAlignOf { .. }
+        | Expr::PodLayoutOffsetOf { .. } => pod_layout_constants::lower(ctx, expr),
         Expr::ObjectRest { .. }
         | Expr::BigInt(..)
         | Expr::BigIntCoerce(..)

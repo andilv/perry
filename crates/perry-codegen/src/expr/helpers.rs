@@ -2,7 +2,7 @@
 //! unboxing, globalThis builtin-name tables) extracted from `expr.rs`,
 //! issue #1098. Pure move — no logic changes.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::Result;
 use perry_hir::{BinaryOp, Expr, UnaryOp};
 use perry_types::Type as HirType;
 
@@ -45,7 +45,13 @@ fn local_get_produces_non_pointer_bits_by_dataflow(ctx: &FnCtx<'_>, id: u32) -> 
 
 fn expr_produces_numeric_bits_by_construction(ctx: &FnCtx<'_>, expr: &Expr) -> bool {
     match expr {
-        Expr::Integer(_) | Expr::Number(_) | Expr::DateNow | Expr::NumberCoerce(_) => true,
+        Expr::Integer(_)
+        | Expr::Number(_)
+        | Expr::PodLayoutSizeOf { .. }
+        | Expr::PodLayoutAlignOf { .. }
+        | Expr::PodLayoutOffsetOf { .. }
+        | Expr::DateNow
+        | Expr::NumberCoerce(_) => true,
         Expr::LocalGet(id) => local_get_produces_non_pointer_bits_by_dataflow(ctx, *id),
         Expr::Unary { op, operand } => match op {
             UnaryOp::Neg | UnaryOp::Pos | UnaryOp::BitNot => {
@@ -134,27 +140,15 @@ pub(crate) fn lower_expr_with_expected_type(
             owner,
             byte_offset,
             count,
-        } => {
-            let Some(expected_ty) = expected_ty else {
-                bail!(
-                    "__perry_native_pod_view requires an explicit PerryPodView<T> type annotation"
-                );
-            };
-            let layout = crate::native_value::layout_for_pod_view_type(ctx, expected_ty)
-                .map_err(|reason| {
-                    anyhow!(
-                        "__perry_native_pod_view requires PerryPodView<T> where T resolves to PerryPod<...>: {}",
-                        reason
-                    )
-                })?;
-            super::arrays_finds::lower_native_pod_view_with_layout(
-                ctx,
-                owner,
-                byte_offset,
-                count,
-                &layout,
-            )
-        }
+            view_type,
+        } => super::arrays_finds::lower_native_pod_view(
+            ctx,
+            owner,
+            byte_offset,
+            count,
+            expected_ty,
+            view_type.as_ref(),
+        ),
         _ => lower_expr(ctx, expr),
     }
 }

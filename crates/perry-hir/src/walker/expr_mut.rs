@@ -22,6 +22,9 @@ where
         | Expr::FuncRef(_)
         | Expr::ExternFuncRef { .. }
         | Expr::NativeModuleRef(_)
+        | Expr::PodLayoutSizeOf { .. }
+        | Expr::PodLayoutAlignOf { .. }
+        | Expr::PodLayoutOffsetOf { .. }
         | Expr::ClassRef(_)
         | Expr::This
         | Expr::SuperPropertyGet { .. }
@@ -338,10 +341,21 @@ where
             owner,
             byte_offset,
             count,
+            ..
         } => {
             f(owner);
             f(byte_offset);
             f(count);
+        }
+
+        Expr::NativeMemoryFillU32 { view, value } => {
+            f(view);
+            f(value);
+        }
+
+        Expr::NativeMemoryCopy { dst, src } => {
+            f(dst);
+            f(src);
         }
 
         Expr::UrlSearchParamsForEach {

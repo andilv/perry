@@ -1082,9 +1082,35 @@ pub enum Expr {
         owner: Box<Expr>,
         byte_offset: Box<Expr>,
         count: Box<Expr>,
+        view_type: Option<Type>,
+    },
+    /// Compile-time POD layout constant: `sizeof<T>()`.
+    PodLayoutSizeOf {
+        ty: Type,
+    },
+    /// Compile-time POD layout constant: `alignof<T>()`.
+    PodLayoutAlignOf {
+        ty: Type,
+    },
+    /// Compile-time POD field offset constant: `offsetof<T>("field.path")`.
+    PodLayoutOffsetOf {
+        ty: Type,
+        field_path: Vec<String>,
     },
     /// Hidden Perry intrinsic: `__perry_native_arena_dispose(owner)`.
     NativeArenaDispose(Box<Expr>),
+    /// Public compile-time NativeMemory API:
+    /// `NativeMemory.fillU32(view, value)`.
+    NativeMemoryFillU32 {
+        view: Box<Expr>,
+        value: Box<Expr>,
+    },
+    /// Public compile-time NativeMemory API:
+    /// `NativeMemory.copy(dst, src)`.
+    NativeMemoryCopy {
+        dst: Box<Expr>,
+        src: Box<Expr>,
+    },
 
     // Child Process operations
     ChildProcessExecSync {

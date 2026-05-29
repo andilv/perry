@@ -300,6 +300,37 @@ fn update_call_sites_in_expr(
                 update_call_sites_in_expr(arg, ctx, lookup);
             }
         }
+        Expr::NativeArenaAlloc(size) | Expr::NativeArenaDispose(size) => {
+            update_call_sites_in_expr(size, ctx, lookup);
+        }
+        Expr::NativeArenaView {
+            owner,
+            byte_offset,
+            length,
+            ..
+        } => {
+            update_call_sites_in_expr(owner, ctx, lookup);
+            update_call_sites_in_expr(byte_offset, ctx, lookup);
+            update_call_sites_in_expr(length, ctx, lookup);
+        }
+        Expr::NativePodView {
+            owner,
+            byte_offset,
+            count,
+            ..
+        } => {
+            update_call_sites_in_expr(owner, ctx, lookup);
+            update_call_sites_in_expr(byte_offset, ctx, lookup);
+            update_call_sites_in_expr(count, ctx, lookup);
+        }
+        Expr::NativeMemoryFillU32 { view, value } => {
+            update_call_sites_in_expr(view, ctx, lookup);
+            update_call_sites_in_expr(value, ctx, lookup);
+        }
+        Expr::NativeMemoryCopy { dst, src } => {
+            update_call_sites_in_expr(dst, ctx, lookup);
+            update_call_sites_in_expr(src, ctx, lookup);
+        }
         Expr::FsReadFileSync(path) => update_call_sites_in_expr(path, ctx, lookup),
         Expr::FsWriteFileSync(path, content) => {
             update_call_sites_in_expr(path, ctx, lookup);
@@ -585,11 +616,15 @@ fn infer_type_args_for_class_from_lookup(
 /// Infer expression type using the lookup table (for update phase)
 fn infer_expr_type_from_lookup(expr: &Expr, lookup: &InferenceLookup) -> Option<Type> {
     match expr {
-        Expr::Number(_) => Some(Type::Number),
+        Expr::Number(_)
+        | Expr::PodLayoutSizeOf { .. }
+        | Expr::PodLayoutAlignOf { .. }
+        | Expr::PodLayoutOffsetOf { .. } => Some(Type::Number),
         Expr::String(_) => Some(Type::String),
         Expr::Bool(_) => Some(Type::Boolean),
         Expr::Null => Some(Type::Null),
         Expr::Undefined => Some(Type::Void),
+        Expr::NativeMemoryFillU32 { .. } | Expr::NativeMemoryCopy { .. } => Some(Type::Void),
         Expr::BigInt(_) => Some(Type::BigInt),
 
         Expr::Array(elems) => {

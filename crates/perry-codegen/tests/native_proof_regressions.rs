@@ -1,9 +1,9 @@
 use perry_codegen::{compile_module, AppMetadata, CompileOptions};
 use perry_hir::{
-    BinaryOp, Class, ClassField, CompareOp, Expr, Function, Module, ModuleInitKind, Param, Stmt,
-    UpdateOp,
+    monomorphize_module, BinaryOp, Class, ClassField, CompareOp, Expr, Function, Module,
+    ModuleInitKind, Param, Stmt, UpdateOp,
 };
-use perry_types::{ObjectType, PropertyInfo, Type};
+use perry_types::{ObjectType, PropertyInfo, Type, TypeParam};
 
 static ARTIFACT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -113,6 +113,10 @@ fn compile_ir(name: &str, body: Vec<Stmt>) -> String {
 
 fn compile_ir_with_opts(name: &str, body: Vec<Stmt>, opts: CompileOptions) -> String {
     String::from_utf8(compile_module(&module(name, body), opts).unwrap()).unwrap()
+}
+
+fn compile_ir_for_module_with_opts(module: Module, opts: CompileOptions) -> anyhow::Result<String> {
+    Ok(String::from_utf8(compile_module(&module, opts)?)?)
 }
 
 fn compile_artifact_json(name: &str, body: Vec<Stmt>) -> serde_json::Value {
@@ -370,6 +374,7 @@ fn native_pod_view_let(
             owner: Box::new(local(owner_id)),
             byte_offset: Box::new(byte_offset),
             count: Box::new(count),
+            view_type: None,
         }),
     }
 }
@@ -728,6 +733,391 @@ fn artifact_schema_v6_records_c_layout_pod_manifest() {
                     && record["consumer"] == "pod_record_stack_alloc"
             }),
         "expected pod_record stack allocation record:\n{artifact:#}"
+    );
+}
+
+fn pod_layout_constant_opts() -> CompileOptions {
+    let header_ty = pod_type(&[
+        ("code", Type::Named("PerryU32".to_string())),
+        ("flags", Type::Named("PerryU32".to_string())),
+    ]);
+    let packet_ty = pod_type(&[
+        ("tag", Type::Named("PerryU32".to_string())),
+        ("header", header_ty),
+        ("total", Type::Number),
+        ("count", Type::Named("PerryU32".to_string())),
+    ]);
+    let mut opts = empty_opts();
+    opts.type_aliases.insert("Packet".to_string(), packet_ty);
+    opts
+}
+
+fn compile_pod_layout_constant(expr: Expr) -> anyhow::Result<String> {
+    compile_ir_for_module_with_opts(
+        module("pod_layout_constants.ts", vec![Stmt::Return(Some(expr))]),
+        pod_layout_constant_opts(),
+    )
+}
+
+fn pod_layout_specialization_opts() -> CompileOptions {
+    let tiny_ty = pod_type(&[
+        ("tag", Type::Named("PerryU32".to_string())),
+        ("payload", Type::Named("PerryU32".to_string())),
+    ]);
+    let wide_ty = pod_type(&[
+        ("tag", Type::Named("PerryU32".to_string())),
+        ("payload", Type::Number),
+    ]);
+    let mut opts = empty_opts();
+    opts.type_aliases.insert("Tiny".to_string(), tiny_ty);
+    opts.type_aliases.insert("Wide".to_string(), wide_ty);
+    opts
+}
+
+fn pod_layout_metric_expr(ty: Type) -> Expr {
+    add(
+        add(
+            add(
+                Expr::PodLayoutSizeOf { ty: ty.clone() },
+                Expr::PodLayoutAlignOf { ty: ty.clone() },
+            ),
+            Expr::PodLayoutOffsetOf {
+                ty,
+                field_path: vec!["payload".to_string()],
+            },
+        ),
+        number(0.5),
+    )
+}
+
+fn pod_layout_specialization_module() -> Module {
+    let mut module = Module::new("pod_layout_specialization.ts");
+    module.functions.push(Function {
+        id: 1,
+        name: "layout".to_string(),
+        type_params: vec![TypeParam {
+            name: "T".to_string(),
+            constraint: Some(Box::new(Type::Generic {
+                base: "PerryPod".to_string(),
+                type_args: vec![Type::Any],
+            })),
+            default: None,
+        }],
+        params: vec![],
+        return_type: Type::Number,
+        body: vec![Stmt::Return(Some(pod_layout_metric_expr(Type::TypeVar(
+            "T".to_string(),
+        ))))],
+        is_async: false,
+        is_generator: false,
+        is_exported: false,
+        captures: vec![],
+        decorators: vec![],
+        was_plain_async: false,
+        was_unrolled: false,
+    });
+    module.init.push(Stmt::Expr(Expr::Call {
+        callee: Box::new(Expr::FuncRef(1)),
+        args: vec![],
+        type_args: vec![Type::Named("Tiny".to_string())],
+    }));
+    module.init.push(Stmt::Expr(Expr::Call {
+        callee: Box::new(Expr::FuncRef(1)),
+        args: vec![],
+        type_args: vec![Type::Named("Wide".to_string())],
+    }));
+    module
+}
+
+fn native_pod_view_specialization_module() -> Module {
+    let generic_view_ty = Type::Generic {
+        base: "PerryPodView".to_string(),
+        type_args: vec![Type::TypeVar("T".to_string())],
+    };
+    let mut module = Module::new("native_pod_view_specialization.ts");
+    module.functions.push(Function {
+        id: 1,
+        name: "view".to_string(),
+        type_params: vec![TypeParam {
+            name: "T".to_string(),
+            constraint: None,
+            default: None,
+        }],
+        params: vec![param(0, "arena", Type::Named("NativeArena".to_string()))],
+        return_type: generic_view_ty.clone(),
+        body: vec![Stmt::Return(Some(Expr::NativePodView {
+            owner: Box::new(local(0)),
+            byte_offset: Box::new(int(0)),
+            count: Box::new(int(4)),
+            view_type: Some(generic_view_ty),
+        }))],
+        is_async: false,
+        is_generator: false,
+        is_exported: false,
+        captures: vec![],
+        decorators: vec![],
+        was_plain_async: false,
+        was_unrolled: false,
+    });
+    module.init.push(Stmt::Expr(Expr::Call {
+        callee: Box::new(Expr::FuncRef(1)),
+        args: vec![Expr::NativeArenaAlloc(Box::new(int(4096)))],
+        type_args: vec![Type::Named("Tiny".to_string())],
+    }));
+    module.init.push(Stmt::Expr(Expr::Call {
+        callee: Box::new(Expr::FuncRef(1)),
+        args: vec![Expr::NativeArenaAlloc(Box::new(int(4096)))],
+        type_args: vec![Type::Named("Wide".to_string())],
+    }));
+    module
+}
+
+fn function_ir_section<'a>(ir: &'a str, symbol: &str) -> &'a str {
+    let needle = format!("define double @{}(", symbol);
+    let start = ir
+        .find(&needle)
+        .unwrap_or_else(|| panic!("function `{}` not found in IR:\n{}", symbol, ir));
+    let rest = &ir[start..];
+    let end = rest.find("\n}\n").map(|idx| idx + 3).unwrap_or(rest.len());
+    &rest[..end]
+}
+
+fn error_chain(err: &anyhow::Error) -> String {
+    err.chain()
+        .map(|cause| cause.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn pod_layout_constants_emit_layout_numbers() {
+    let ty = Type::Named("Packet".to_string());
+
+    let size_ir = compile_pod_layout_constant(Expr::PodLayoutSizeOf { ty: ty.clone() }).unwrap();
+    assert!(
+        size_ir.contains("ret double 32.0"),
+        "sizeof<Packet>() should emit the POD size constant:\n{size_ir}"
+    );
+
+    let align_ir = compile_pod_layout_constant(Expr::PodLayoutAlignOf { ty: ty.clone() }).unwrap();
+    assert!(
+        align_ir.contains("ret double 8.0"),
+        "alignof<Packet>() should emit the POD alignment constant:\n{align_ir}"
+    );
+
+    let offset_ir = compile_pod_layout_constant(Expr::PodLayoutOffsetOf {
+        ty,
+        field_path: vec!["header".to_string(), "flags".to_string()],
+    })
+    .unwrap();
+    assert!(
+        offset_ir.contains("ret double 8.0"),
+        "offsetof<Packet>(\"header.flags\") should emit the flattened field offset:\n{offset_ir}"
+    );
+}
+
+#[test]
+fn pod_layout_constants_specialize_generic_layout_type_params() {
+    let mut module = pod_layout_specialization_module();
+    monomorphize_module(&mut module);
+
+    assert!(
+        module.functions.iter().any(|f| f.name == "layout$Tiny"),
+        "expected Tiny specialization: {:?}",
+        module
+            .functions
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        module.functions.iter().any(|f| f.name == "layout$Wide"),
+        "expected Wide specialization: {:?}",
+        module
+            .functions
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    module.functions.retain(|func| func.type_params.is_empty());
+    module.init.clear();
+    let ir = compile_ir_for_module_with_opts(module, pod_layout_specialization_opts()).unwrap();
+    let tiny_ir = function_ir_section(&ir, "perry_fn_pod_layout_specialization_ts__layout_Tiny");
+    let wide_ir = function_ir_section(&ir, "perry_fn_pod_layout_specialization_ts__layout_Wide");
+
+    assert!(
+        tiny_ir.contains("8.0") && tiny_ir.contains("4.0") && !tiny_ir.contains("16.0"),
+        "Tiny specialization should use size 8, align 4, offset 4:\n{tiny_ir}"
+    );
+    assert!(
+        wide_ir.contains("16.0") && wide_ir.contains("8.0") && !wide_ir.contains("4.0"),
+        "Wide specialization should use size 16, align 8, offset 8:\n{wide_ir}"
+    );
+}
+
+#[test]
+fn native_pod_view_specializes_generic_layout_type_params() {
+    let mut module = native_pod_view_specialization_module();
+    monomorphize_module(&mut module);
+
+    assert!(
+        module.functions.iter().any(|f| f.name == "view$Tiny"),
+        "expected Tiny specialization: {:?}",
+        module
+            .functions
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        module.functions.iter().any(|f| f.name == "view$Wide"),
+        "expected Wide specialization: {:?}",
+        module
+            .functions
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    module.functions.retain(|func| func.type_params.is_empty());
+    module.init.clear();
+    let ir = compile_ir_for_module_with_opts(module, pod_layout_specialization_opts()).unwrap();
+    let tiny_ir = function_ir_section(&ir, "perry_fn_native_pod_view_specialization_ts__view_Tiny");
+    let wide_ir = function_ir_section(&ir, "perry_fn_native_pod_view_specialization_ts__view_Wide");
+
+    assert!(
+        tiny_ir.contains("call i64 @js_native_pod_view") && tiny_ir.contains("i64 8, i64 4"),
+        "Tiny specialization should use stride 8 and alignment 4:\n{tiny_ir}"
+    );
+    assert!(
+        wide_ir.contains("call i64 @js_native_pod_view") && wide_ir.contains("i64 16, i64 8"),
+        "Wide specialization should use stride 16 and alignment 8:\n{wide_ir}"
+    );
+}
+
+#[test]
+fn pod_layout_constants_reject_non_pod_type() {
+    let err = compile_pod_layout_constant(Expr::PodLayoutSizeOf { ty: Type::Number })
+        .expect_err("non-POD type should fail codegen");
+    let chain = error_chain(&err);
+
+    assert!(
+        chain.contains("sizeof<T>() requires T to resolve to PerryPod<...>"),
+        "unexpected error: {chain}"
+    );
+}
+
+#[test]
+fn pod_layout_constants_reject_missing_field_path() {
+    let err = compile_pod_layout_constant(Expr::PodLayoutOffsetOf {
+        ty: Type::Named("Packet".to_string()),
+        field_path: vec!["header".to_string(), "missing".to_string()],
+    })
+    .expect_err("unknown offsetof path should fail codegen");
+    let chain = error_chain(&err);
+
+    assert!(
+        chain.contains("offsetof<T>(\"header.missing\") could not find that field path"),
+        "unexpected error: {chain}"
+    );
+}
+
+#[test]
+fn native_memory_fill_u32_zero_uses_memset_fast_path() {
+    let body = vec![
+        native_arena_owner_let(1, "arena", int(64), false),
+        native_arena_view_let(
+            2,
+            "words",
+            1,
+            "Uint32Array",
+            perry_hir::TYPED_ARRAY_KIND_UINT32,
+            int(0),
+            int(16),
+        ),
+        Stmt::Expr(Expr::NativeMemoryFillU32 {
+            view: Box::new(local(2)),
+            value: Box::new(int(0)),
+        }),
+        Stmt::Return(Some(int(0))),
+    ];
+
+    let ir = compile_ir("native_memory_fill_u32_zero.ts", body.clone());
+    assert!(
+        ir.contains("call void @llvm.memset.p0.i64"),
+        "NativeMemory.fillU32(words, 0) should lower to llvm.memset:\n{ir}"
+    );
+    assert!(
+        !ir.contains("call void @js_native_memory_fill_u32"),
+        "proven local Uint32Array view should not use runtime fallback:\n{ir}"
+    );
+
+    let artifact = compile_artifact_json("artifact_native_memory_fill_u32_zero.ts", body);
+    let records = artifact["records"].as_array().unwrap();
+    assert!(
+        records.iter().any(|record| {
+            record["expr_kind"] == "NativeMemoryFillU32"
+                && record["consumer"] == "NativeMemoryFillU32.memset_zero"
+                && record["native_rep_name"] == "buffer_view"
+                && record["access_mode"] == "checked_native"
+        }),
+        "expected NativeMemoryFillU32 buffer_view record:\n{artifact:#}"
+    );
+}
+
+#[test]
+fn native_memory_copy_uses_memmove_fast_path() {
+    let body = vec![
+        native_arena_owner_let(1, "arena", int(128), false),
+        native_arena_view_let(
+            2,
+            "src",
+            1,
+            "Uint32Array",
+            perry_hir::TYPED_ARRAY_KIND_UINT32,
+            int(0),
+            int(16),
+        ),
+        native_arena_view_let(
+            3,
+            "dst",
+            1,
+            "Uint32Array",
+            perry_hir::TYPED_ARRAY_KIND_UINT32,
+            int(64),
+            int(16),
+        ),
+        Stmt::Expr(Expr::NativeMemoryCopy {
+            dst: Box::new(local(3)),
+            src: Box::new(local(2)),
+        }),
+        Stmt::Return(Some(int(0))),
+    ];
+
+    let ir = compile_ir("native_memory_copy.ts", body.clone());
+    assert!(
+        ir.contains("call void @llvm.memmove.p0.p0.i64"),
+        "NativeMemory.copy(dst, src) should lower to llvm.memmove:\n{ir}"
+    );
+    assert!(
+        !ir.contains("call void @js_native_memory_copy"),
+        "proven local typed views should not use runtime fallback:\n{ir}"
+    );
+
+    let artifact = compile_artifact_json("artifact_native_memory_copy.ts", body);
+    let records = artifact["records"].as_array().unwrap();
+    assert!(
+        records.iter().any(|record| {
+            record["expr_kind"] == "NativeMemoryCopy"
+                && record["consumer"] == "NativeMemoryCopy.dst.memmove"
+                && record["native_rep_name"] == "buffer_view"
+        }) && records.iter().any(|record| {
+            record["expr_kind"] == "NativeMemoryCopy"
+                && record["consumer"] == "NativeMemoryCopy.src.memmove"
+                && record["native_rep_name"] == "buffer_view"
+        }),
+        "expected NativeMemoryCopy dst/src buffer_view records:\n{artifact:#}"
     );
 }
 

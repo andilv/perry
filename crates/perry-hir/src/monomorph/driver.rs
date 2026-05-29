@@ -368,6 +368,37 @@ fn collect_instantiations_in_expr(
                 collect_instantiations_in_expr(arg, ctx, module, idx);
             }
         }
+        Expr::NativeArenaAlloc(size) | Expr::NativeArenaDispose(size) => {
+            collect_instantiations_in_expr(size, ctx, module, idx);
+        }
+        Expr::NativeArenaView {
+            owner,
+            byte_offset,
+            length,
+            ..
+        } => {
+            collect_instantiations_in_expr(owner, ctx, module, idx);
+            collect_instantiations_in_expr(byte_offset, ctx, module, idx);
+            collect_instantiations_in_expr(length, ctx, module, idx);
+        }
+        Expr::NativePodView {
+            owner,
+            byte_offset,
+            count,
+            ..
+        } => {
+            collect_instantiations_in_expr(owner, ctx, module, idx);
+            collect_instantiations_in_expr(byte_offset, ctx, module, idx);
+            collect_instantiations_in_expr(count, ctx, module, idx);
+        }
+        Expr::NativeMemoryFillU32 { view, value } => {
+            collect_instantiations_in_expr(view, ctx, module, idx);
+            collect_instantiations_in_expr(value, ctx, module, idx);
+        }
+        Expr::NativeMemoryCopy { dst, src } => {
+            collect_instantiations_in_expr(dst, ctx, module, idx);
+            collect_instantiations_in_expr(src, ctx, module, idx);
+        }
         Expr::FsReadFileSync(path) => collect_instantiations_in_expr(path, ctx, module, idx),
         Expr::FsWriteFileSync(path, content) => {
             collect_instantiations_in_expr(path, ctx, module, idx);
