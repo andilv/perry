@@ -1846,6 +1846,8 @@ declare module "process" {
   /** stdlib */
   export function getActiveResourcesInfo(...args: any[]): any;
   /** stdlib */
+  export function getBuiltinModule(...args: any[]): any;
+  /** stdlib */
   export function getMaxListeners(...args: any[]): any;
   /** stdlib */
   export function getegid(...args: any[]): any;

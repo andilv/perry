@@ -1683,6 +1683,7 @@ Total: 1521 entries across 84 modules.
 - `eventNames` — module
 - `exit` — module
 - `getActiveResourcesInfo` — module
+- `getBuiltinModule` — module
 - `getMaxListeners` — module
 - `getegid` — module
 - `geteuid` — module
