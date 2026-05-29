@@ -480,6 +480,7 @@ pub(super) fn try_array_only_methods(
                         if matches!(
                             &array_expr,
                             Expr::BufferConcat(_)
+                                | Expr::BufferConcatWithLength { .. }
                                 | Expr::BufferFrom { .. }
                                 | Expr::BufferSlice { .. }
                         ) {
