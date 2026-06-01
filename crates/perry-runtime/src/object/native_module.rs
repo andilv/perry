@@ -1038,6 +1038,30 @@ const EVENTS_NAMESPACE_KEYS: &[&[u8]] = &[
     b"setMaxListeners",
 ];
 
+const WORKER_THREADS_NAMESPACE_KEYS: &[&[u8]] = &[
+    b"BroadcastChannel",
+    b"MessageChannel",
+    b"MessagePort",
+    b"SHARE_ENV",
+    b"Worker",
+    b"getEnvironmentData",
+    b"isInternalThread",
+    b"isMainThread",
+    b"isMarkedAsUntransferable",
+    b"locks",
+    b"markAsUncloneable",
+    b"markAsUntransferable",
+    b"moveMessagePortToContext",
+    b"parentPort",
+    b"postMessageToThread",
+    b"receiveMessageOnPort",
+    b"resourceLimits",
+    b"setEnvironmentData",
+    b"threadId",
+    b"threadName",
+    b"workerData",
+];
+
 // Linux-only open() flags: Node only enumerates these on platforms whose libc
 // defines them (e.g. `O_DIRECT`/`O_NOATIME` are absent on macOS), so gate the
 // enumerable-key tail by target so `Object.keys(constants)` matches Node here.
@@ -1365,6 +1389,7 @@ pub(crate) fn native_module_enumerable_keys(module_name: &str) -> Option<&'stati
         "http2" => Some(crate::node_http2_constants::HTTP2_NAMESPACE_KEYS),
         "http2.constants" => Some(crate::node_http2_constants::HTTP2_CONSTANTS_KEYS),
         "events" => Some(EVENTS_NAMESPACE_KEYS),
+        "worker_threads" => Some(WORKER_THREADS_NAMESPACE_KEYS),
         "timers/promises" => Some(&[b"setTimeout", b"setImmediate", b"setInterval", b"scheduler"]),
         "zlib" => Some(&[b"codes"]),
         _ => None,
