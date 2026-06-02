@@ -1909,6 +1909,7 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         | Expr::ChildProcessKillProcess(..) => child_proc::lower(ctx, expr),
         Expr::FileURLToPath(..)
         | Expr::UrlNew { .. }
+        | Expr::UrlPatternNew { .. }
         | Expr::UrlGetHref(..)
         | Expr::UrlGetPathname(..)
         | Expr::UrlGetProtocol(..)

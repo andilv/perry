@@ -1678,6 +1678,11 @@ pub enum Expr {
         url: Box<Expr>,
         base: Option<Box<Expr>>,
     },
+    /// new URLPattern(input?, base?) -> URLPattern object
+    UrlPatternNew {
+        input: Box<Expr>,
+        base: Option<Box<Expr>>,
+    },
     /// url.href -> string (full URL)
     UrlGetHref(Box<Expr>),
     /// url.pathname -> string (path portion)
