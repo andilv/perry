@@ -32,6 +32,7 @@ mod class_gc_roots;
 mod class_handles;
 mod class_registry;
 mod collection_proto_thunks;
+mod data_view_registry;
 mod delete_rest;
 mod descriptors;
 mod field_get_set;
@@ -67,6 +68,7 @@ pub(crate) use class_gc_roots::{
     test_seed_class_parent_closure_root,
 };
 pub use class_registry::*;
+pub(crate) use data_view_registry::extends_builtin_data_view;
 pub use delete_rest::*;
 pub use descriptors::*;
 pub use field_get_set::*;
