@@ -1667,6 +1667,97 @@ pub(crate) fn native_module_enumerable_keys(module_name: &str) -> Option<&'stati
         ]),
         "http2" => Some(crate::node_http2_constants::HTTP2_NAMESPACE_KEYS),
         "http2.constants" => Some(crate::node_http2_constants::HTTP2_CONSTANTS_KEYS),
+        // #3906: native-module default/namespace objects previously enumerated
+        // only the internal `__module__` sentinel. List each module's supported
+        // export surface (the same set the api-manifest / docs / DTS expose and
+        // that `hasOwnProperty` / named imports agree on) so `Object.keys(mod)`
+        // matches Node. tty / perf_hooks / util.types are byte-identical to
+        // Node; v8 lists the 17 exports Perry implements (the 6 V8-internal
+        // stubs — getHeapSnapshot/getCppHeapStatistics/writeHeapSnapshot/
+        // queryObjects/isStringOneByteRepresentation/startCpuProfile — stay out
+        // of the manifest surface, tracked by #3904). Key order follows Node's.
+        "tty" => Some(&[b"isatty", b"ReadStream", b"WriteStream"]),
+        "v8" => Some(&[
+            b"cachedDataVersionTag",
+            b"getHeapStatistics",
+            b"getHeapSpaceStatistics",
+            b"getHeapCodeStatistics",
+            b"setFlagsFromString",
+            b"Serializer",
+            b"Deserializer",
+            b"DefaultSerializer",
+            b"DefaultDeserializer",
+            b"deserialize",
+            b"takeCoverage",
+            b"stopCoverage",
+            b"serialize",
+            b"promiseHooks",
+            b"startupSnapshot",
+            b"setHeapSnapshotNearHeapLimit",
+            b"GCProfiler",
+        ]),
+        "perf_hooks" => Some(&[
+            b"Performance",
+            b"PerformanceEntry",
+            b"PerformanceMark",
+            b"PerformanceMeasure",
+            b"PerformanceObserver",
+            b"PerformanceObserverEntryList",
+            b"PerformanceResourceTiming",
+            b"monitorEventLoopDelay",
+            b"eventLoopUtilization",
+            b"timerify",
+            b"createHistogram",
+            b"performance",
+            b"constants",
+        ]),
+        // The util/types namespace object is tagged `util.types` internally
+        // (see the `callable_module_name` remap below); accept both spellings.
+        "util/types" | "util.types" => Some(&[
+            b"isArgumentsObject",
+            b"isArrayBuffer",
+            b"isAsyncFunction",
+            b"isBigIntObject",
+            b"isBooleanObject",
+            b"isDataView",
+            b"isDate",
+            b"isExternal",
+            b"isGeneratorFunction",
+            b"isGeneratorObject",
+            b"isMap",
+            b"isMapIterator",
+            b"isModuleNamespaceObject",
+            b"isNativeError",
+            b"isNumberObject",
+            b"isPromise",
+            b"isProxy",
+            b"isRegExp",
+            b"isSet",
+            b"isSetIterator",
+            b"isSharedArrayBuffer",
+            b"isStringObject",
+            b"isSymbolObject",
+            b"isWeakMap",
+            b"isWeakSet",
+            b"isAnyArrayBuffer",
+            b"isBoxedPrimitive",
+            b"isArrayBufferView",
+            b"isTypedArray",
+            b"isUint8Array",
+            b"isUint8ClampedArray",
+            b"isUint16Array",
+            b"isUint32Array",
+            b"isInt8Array",
+            b"isInt16Array",
+            b"isInt32Array",
+            b"isFloat16Array",
+            b"isFloat32Array",
+            b"isFloat64Array",
+            b"isBigInt64Array",
+            b"isBigUint64Array",
+            b"isKeyObject",
+            b"isCryptoKey",
+        ]),
         "events" => Some(EVENTS_NAMESPACE_KEYS),
         "worker_threads" => Some(WORKER_THREADS_NAMESPACE_KEYS),
         "timers/promises" => Some(&[b"setTimeout", b"setImmediate", b"setInterval", b"scheduler"]),
@@ -1899,19 +1990,6 @@ pub unsafe extern "C" fn js_native_module_property_by_name(
         if let Some(value) = super::global_this::webcrypto_method_value(property_name) {
             return value;
         }
-    }
-
-    // #3679: node:v8 lifecycle namespaces. `v8.startupSnapshot` /
-    // `v8.promiseHooks` are object-valued exports; resolve them to
-    // dedicated native-module namespace objects so `typeof === "object"` and
-    // their methods dispatch through `dispatch_native_module_method`.
-    if module_name == "v8" && matches!(property_name, "startupSnapshot" | "promiseHooks") {
-        let submodule = if property_name == "startupSnapshot" {
-            "v8.startupSnapshot"
-        } else {
-            "v8.promiseHooks"
-        };
-        return js_create_native_module_namespace(submodule.as_ptr(), submodule.len());
     }
 
     if let Some(val) = get_native_module_constant(module_name, property_name, 0.0) {
@@ -2211,6 +2289,16 @@ fn native_callable_export_arity(module: &str, prop: &str) -> Option<u32> {
         ("v8", "getCppHeapStatistics" | "startCpuProfile") => Some(0),
         ("v8", "getHeapSnapshot" | "isStringOneByteRepresentation" | "queryObjects") => Some(1),
         ("v8", "writeHeapSnapshot") => Some(2),
+        // #3906: implemented top-level v8 helpers reachable as bound callables.
+        ("v8", "serialize" | "deserialize") => Some(1),
+        (
+            "v8",
+            "getHeapStatistics"
+            | "getHeapSpaceStatistics"
+            | "getHeapCodeStatistics"
+            | "cachedDataVersionTag"
+            | "GCProfiler",
+        ) => Some(0),
         ("net", "_normalizeArgs") => Some(1),
         ("net", "_createServerHandle") => Some(5),
         ("domain", "Domain" | "createDomain" | "create") => Some(0),
@@ -3792,6 +3880,20 @@ pub(crate) fn is_native_module_callable_export(module: &str, prop: &str) -> bool
             | ("v8", "takeCoverage")
             | ("v8", "stopCoverage")
             | ("v8", "setHeapSnapshotNearHeapLimit")
+            // #3906: the implemented serialize/heap-introspection helpers read
+            // as bound callables too, so `const s = v8.serialize` / `v8[k]`
+            // (and `Object.keys(v8).map(k => v8[k])`) match Node instead of
+            // returning undefined. Invocation routes through
+            // dispatch_native_module_method. `GCProfiler` is a constructor
+            // (construction lowers via new_dynamic.rs); the value read is a
+            // function per Node.
+            | ("v8", "serialize")
+            | ("v8", "deserialize")
+            | ("v8", "getHeapStatistics")
+            | ("v8", "getHeapSpaceStatistics")
+            | ("v8", "getHeapCodeStatistics")
+            | ("v8", "cachedDataVersionTag")
+            | ("v8", "GCProfiler")
             // #3904: modern V8 diagnostics/profiler named exports (function-valued).
             | ("v8", "getCppHeapStatistics")
             | ("v8", "getHeapSnapshot")
@@ -4152,6 +4254,25 @@ pub(crate) unsafe fn get_native_module_constant(
         if let Some(value) = cjs_default_export_value(module_name) {
             return Some(value);
         }
+    }
+
+    // #3906/#3679: node:v8 lifecycle namespaces. `v8.startupSnapshot` /
+    // `v8.promiseHooks` are object-valued exports; resolve them to dedicated
+    // native-module namespace objects so `typeof === "object"` and their
+    // methods dispatch through `dispatch_native_module_method`. Handled here
+    // (rather than only in the codegen `js_native_module_property_by_name`
+    // path) so dynamic reads — `v8["promiseHooks"]`, `const { promiseHooks } =
+    // v8` — resolve to the same object instead of `undefined`.
+    if module_name == "v8" && matches!(property, "startupSnapshot" | "promiseHooks") {
+        let submodule = if property == "startupSnapshot" {
+            "v8.startupSnapshot"
+        } else {
+            "v8.promiseHooks"
+        };
+        return Some(js_create_native_module_namespace(
+            submodule.as_ptr(),
+            submodule.len(),
+        ));
     }
 
     let o_nofollow: f64 = {
