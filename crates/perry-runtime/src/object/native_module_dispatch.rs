@@ -1778,11 +1778,19 @@ pub(crate) unsafe fn dispatch_native_module_method(
         ("v8", "getHeapSpaceStatistics") => crate::node_v8::js_v8_get_heap_space_statistics(),
         ("v8", "getHeapCodeStatistics") => crate::node_v8::js_v8_get_heap_code_statistics(),
         ("v8", "cachedDataVersionTag") => crate::node_v8::js_v8_cached_data_version_tag(),
+        ("v8", "getHeapSnapshot") => crate::node_v8::js_v8_get_heap_snapshot(arg(0)),
+        ("v8", "writeHeapSnapshot") => crate::node_v8::js_v8_write_heap_snapshot(arg(0), arg(1)),
 
-        // #3142: `new v8.GCProfiler()` is the "v8.GCProfiler" namespace.
-        // `start()` returns undefined; `stop()` returns the report object.
-        ("v8.GCProfiler", "start") => f64::from_bits(JSValue::undefined().bits()),
-        ("v8.GCProfiler", "stop") => crate::node_v8::js_v8_gc_profiler_report(),
+        // #3142: `new v8.GCProfiler()` keeps a small started flag on the
+        // native-module instance. `stop()` returns a report only after start.
+        ("v8.GCProfiler", "start") => {
+            let recv = crate::value::js_nanbox_pointer(obj as i64);
+            crate::node_v8::js_v8_gc_profiler_start(recv)
+        }
+        ("v8.GCProfiler", "stop") => {
+            let recv = crate::value::js_nanbox_pointer(obj as i64);
+            crate::node_v8::js_v8_gc_profiler_stop(recv)
+        }
 
         // node:repl non-interactive server and constructor surface.
         ("repl", "start") => crate::node_repl::js_repl_start(arg(0)),

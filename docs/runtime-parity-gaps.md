@@ -60,13 +60,12 @@ Selected highlights (full list in `runtime-parity.md`):
 
 ### node:v8
 
-**Total APIs: 58** · Perry covers: 0 · Gap: 58
+**Total APIs: 58** · Perry covers: 3 · Gap: 55
 
 Selected highlights (full list in `runtime-parity.md`):
 
 - `v8.cachedDataVersionTag()`
 - `v8.getHeapCodeStatistics()`
-- `v8.getHeapSnapshot([options])`
 - `v8.getHeapSpaceStatistics()`
 - `v8.getHeapStatistics()`
 - `v8.getCppHeapStatistics([detailLevel])`
@@ -74,9 +73,8 @@ Selected highlights (full list in `runtime-parity.md`):
 - `v8.setFlagsFromString(flags)`
 - `v8.stopCoverage()`
 - `v8.takeCoverage()`
-- `v8.writeHeapSnapshot([filename[, options]])`
 - `v8.setHeapSnapshotNearHeapLimit(limit)`
-- … and 46 more
+- … and 45 more
 
 ### node:dns
 
