@@ -71,6 +71,7 @@ jobs:
     steps:
       - name: Filter platforms
         id: filter
+        shell: bash
         run: |
           PLATFORMS="${{ github.event.inputs.platforms }}"
           if [ "$PLATFORMS" = "all" ]; then
