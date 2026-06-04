@@ -1,0 +1,169 @@
+name: Manual Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: "Platforms to build (comma-separated)"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - macos
+          - linux
+          - windows
+      profile:
+        description: "Rust build profile"
+        required: false
+        default: "release"
+        type: choice
+        options:
+          - release
+          - dev
+      target:
+        description: "Specific Rust target triple (leave empty for default host target)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact: perry-macos-aarch64
+            platform: macos
+          - os: macos-15
+            target: x86_64-apple-darwin
+            artifact: perry-macos-x86_64
+            platform: macos
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            artifact: perry-linux-x86_64
+            platform: linux
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: perry-linux-aarch64
+            platform: linux
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            artifact: perry-linux-x86_64-musl
+            platform: linux
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            artifact: perry-linux-aarch64-musl
+            platform: linux
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: perry-windows-x86_64
+            platform: windows
+
+    runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+    steps:
+      - name: Filter platforms
+        id: filter
+        run: |
+          PLATFORMS="${{ github.event.inputs.platforms }}"
+          if [ "$PLATFORMS" = "all" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif echo "$PLATFORMS" | grep -q "${{ matrix.platform }}"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v6
+        if: steps.filter.outputs.run == 'true'
+
+      - name: Install Rust toolchain
+        if: steps.filter.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.filter.outputs.run == 'true'
+        with:
+          shared-key: "manual-${{ matrix.target }}"
+
+      - name: Install dependencies (macOS)
+        if: steps.filter.outputs.run == 'true' && runner.os == 'macOS'
+        run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+
+      - name: Install dependencies (Linux glibc)
+        if: steps.filter.outputs.run == 'true' && runner.os == 'Linux' && !endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libunwind-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libwebkitgtk-6.0-dev libshumate-dev
+
+      - name: Install dependencies (Linux musl)
+        if: steps.filter.outputs.run == 'true' && endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Determine target
+        if: steps.filter.outputs.run == 'true'
+        id: target
+        run: |
+          OVERRIDE="${{ github.event.inputs.target }}"
+          if [ -n "$OVERRIDE" ]; then
+            echo "triple=$OVERRIDE" >> "$GITHUB_OUTPUT"
+          else
+            echo "triple=${{ matrix.target }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build perry
+        if: steps.filter.outputs.run == 'true'
+        run: cargo build --${{ github.event.inputs.profile }} --target ${{ steps.target.outputs.triple }} -p perry
+
+      - name: Build runtime
+        if: steps.filter.outputs.run == 'true'
+        run: |
+          cargo build --${{ github.event.inputs.profile }} --target ${{ steps.target.outputs.triple }} -p perry-runtime
+          cargo build --${{ github.event.inputs.profile }} --target ${{ steps.target.outputs.triple }} -p perry-stdlib
+
+      - name: Package (Unix)
+        if: steps.filter.outputs.run == 'true' && runner.os != 'Windows'
+        run: |
+          mkdir -p staging
+          cp target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/perry staging/
+          for lib in libperry_runtime.a libperry_stdlib.a libperry_ui_macos.a libperry_ui_gtk4.a; do
+            if [ -f "target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/$lib" ]; then
+              cp "target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/$lib" staging/
+            fi
+          done
+          cd staging
+          tar czf ../${{ matrix.artifact }}.tar.gz *
+
+      - name: Package (Windows)
+        if: steps.filter.outputs.run == 'true' && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging
+          Copy-Item "target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/perry.exe" staging/
+          $libs = @("perry_runtime.lib", "perry_stdlib.lib")
+          foreach ($lib in $libs) {
+            $path = "target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/$lib"
+            if (Test-Path $path) { Copy-Item $path staging/ }
+          }
+          Compress-Archive -Path staging/* -DestinationPath "${{ matrix.artifact }}.zip"
+
+      - name: Upload artifact (Unix)
+        if: steps.filter.outputs.run == 'true' && runner.os != 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: "*.tar.gz"
+
+      - name: Upload artifact (Windows)
+        if: steps.filter.outputs.run == 'true' && runner.os == 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: "*.zip"
