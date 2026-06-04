@@ -659,6 +659,80 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_js_sloppy_future_reserved_words() {
+        let source = r#"
+            var implements = "implements";
+            var interface = "interface";
+            var package = "package";
+            var private = "private";
+            var protected = "protected";
+            var public = "public";
+            var static = "static";
+        "#;
+        let mut cache = SourceCache::new();
+
+        let result = parse_typescript_with_cache(source, "test.js", &mut cache).unwrap();
+
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_parse_js_lookalike_directives_keep_function_body_sloppy() {
+        let source = r#"
+            function doubledSpace() {
+                "use  strict";
+                var public = 1;
+                return public;
+            }
+            function escapedSpace() {
+                "use\x20strict";
+                var yield = 2;
+                return yield;
+            }
+            function interrupted() {
+                var interface = 3;
+                "use strict";
+                return interface;
+            }
+        "#;
+        let mut cache = SourceCache::new();
+
+        let result = parse_typescript_with_cache(source, "test.js", &mut cache).unwrap();
+
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_parse_js_sloppy_escaped_contextual_identifiers() {
+        let source = r#"
+            var imp\u006Cements = 1;
+            var yie\u006Cd = 2;
+            var awa\u0069t = 3;
+        "#;
+        let mut cache = SourceCache::new();
+
+        let result = parse_typescript_with_cache(source, "test.js", &mut cache).unwrap();
+
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_parse_js_keyword_property_accessors() {
+        let source = r#"
+            var obj = { await: 0, yield: 1, static: 2, implements: 3 };
+            obj.await = "await";
+            obj.yield = "yield";
+            obj.static = "static";
+            obj.implements = "implements";
+        "#;
+        let mut cache = SourceCache::new();
+
+        let result = parse_typescript_with_cache(source, "test.js", &mut cache).unwrap();
+
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
     fn test_parse_ts_still_rejects_ts_syntax_errors() {
         let source = "let x: number = ;";
         let mut cache = SourceCache::new();

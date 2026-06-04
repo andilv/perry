@@ -454,6 +454,14 @@ fn invalid_hostname_error(value: f64) -> f64 {
     type_error_value(&message, "ERR_INVALID_ARG_TYPE")
 }
 
+fn invalid_hostname_value_error(value: f64) -> f64 {
+    let message = format!(
+        "The argument 'hostname' must be a non-empty string. Received {}",
+        invalid_arg_value_received(value)
+    );
+    type_error_value(&message, "ERR_INVALID_ARG_VALUE")
+}
+
 fn invalid_address_error(value: f64) -> f64 {
     let message = format!(
         "The argument 'address' is invalid. Received {}",
@@ -497,12 +505,16 @@ fn throw_invalid_dns_order(value: f64) -> ! {
     crate::fs::validate::throw_type_error_with_code(&message, "ERR_INVALID_ARG_VALUE");
 }
 
-fn throw_invalid_name(value: f64) -> ! {
+fn invalid_name_error(value: f64) -> f64 {
     let message = format!(
         "The \"name\" argument must be of type string. Received {}",
         crate::fs::validate::describe_received(value)
     );
-    crate::fs::validate::throw_type_error_with_code(&message, "ERR_INVALID_ARG_TYPE");
+    type_error_value(&message, "ERR_INVALID_ARG_TYPE")
+}
+
+fn throw_invalid_name(value: f64) -> ! {
+    throw_error_value(invalid_name_error(value));
 }
 
 fn throw_invalid_callback(value: f64) -> ! {
@@ -513,42 +525,46 @@ fn throw_invalid_callback(value: f64) -> ! {
     crate::fs::validate::throw_type_error_with_code(&message, "ERR_INVALID_ARG_TYPE");
 }
 
-fn throw_invalid_rrtype_type(value: f64) -> ! {
+fn invalid_rrtype_type_error(value: f64) -> f64 {
     let message = format!(
         "The \"rrtype\" argument must be of type string. Received {}",
         crate::fs::validate::describe_received(value)
     );
-    crate::fs::validate::throw_type_error_with_code(&message, "ERR_INVALID_ARG_TYPE");
+    type_error_value(&message, "ERR_INVALID_ARG_TYPE")
 }
 
-fn throw_invalid_rrtype_value(value: f64) -> ! {
+fn invalid_rrtype_value_error(value: f64) -> f64 {
     let message = format!(
         "The argument 'rrtype' is invalid. Received {}",
         invalid_arg_value_received(value)
     );
-    crate::fs::validate::throw_type_error_with_code(&message, "ERR_INVALID_ARG_VALUE");
+    type_error_value(&message, "ERR_INVALID_ARG_VALUE")
+}
+
+fn parse_record_kind_result(value: f64) -> Result<RecordKind, f64> {
+    let Some(rrtype) = js_string_to_rust(value) else {
+        return Err(invalid_rrtype_type_error(value));
+    };
+    match rrtype.as_str() {
+        "A" => Ok(RecordKind::A),
+        "AAAA" => Ok(RecordKind::Aaaa),
+        "ANY" => Ok(RecordKind::Any),
+        "CAA" => Ok(RecordKind::Caa),
+        "CNAME" => Ok(RecordKind::Cname),
+        "MX" => Ok(RecordKind::Mx),
+        "NAPTR" => Ok(RecordKind::Naptr),
+        "NS" => Ok(RecordKind::Ns),
+        "PTR" => Ok(RecordKind::Ptr),
+        "SOA" => Ok(RecordKind::Soa),
+        "SRV" => Ok(RecordKind::Srv),
+        "TLSA" => Ok(RecordKind::Tlsa),
+        "TXT" => Ok(RecordKind::Txt),
+        _ => Err(invalid_rrtype_value_error(value)),
+    }
 }
 
 fn parse_record_kind(value: f64) -> RecordKind {
-    let Some(rrtype) = js_string_to_rust(value) else {
-        throw_invalid_rrtype_type(value);
-    };
-    match rrtype.as_str() {
-        "A" => RecordKind::A,
-        "AAAA" => RecordKind::Aaaa,
-        "ANY" => RecordKind::Any,
-        "CAA" => RecordKind::Caa,
-        "CNAME" => RecordKind::Cname,
-        "MX" => RecordKind::Mx,
-        "NAPTR" => RecordKind::Naptr,
-        "NS" => RecordKind::Ns,
-        "PTR" => RecordKind::Ptr,
-        "SOA" => RecordKind::Soa,
-        "SRV" => RecordKind::Srv,
-        "TLSA" => RecordKind::Tlsa,
-        "TXT" => RecordKind::Txt,
-        _ => throw_invalid_rrtype_value(value),
-    }
+    parse_record_kind_result(value).unwrap_or_else(|error| throw_error_value(error))
 }
 
 pub(crate) fn dns_set_default_result_order_value(value: f64) -> f64 {
@@ -935,19 +951,22 @@ fn callback_record_args(args: i64, default_kind: Option<RecordKind>) -> (String,
     }
 }
 
-fn promise_record_args(args: i64, default_kind: Option<RecordKind>) -> (String, RecordKind) {
+fn promise_record_args(
+    args: i64,
+    default_kind: Option<RecordKind>,
+) -> Result<(String, RecordKind), f64> {
     let name_value = arg(args, 0);
     let Some(name) = js_string_to_rust(name_value) else {
-        throw_invalid_name(name_value);
+        return Err(invalid_name_error(name_value));
     };
-    let kind = default_kind.unwrap_or_else(|| {
-        if args_len(args) < 2 {
-            RecordKind::A
-        } else {
-            parse_record_kind(arg(args, 1))
-        }
-    });
-    (name, kind)
+    let kind = if let Some(kind) = default_kind {
+        kind
+    } else if args_len(args) < 2 {
+        RecordKind::A
+    } else {
+        parse_record_kind_result(arg(args, 1))?
+    };
+    Ok((name, kind))
 }
 
 fn callback_reverse_args(args: i64) -> (String, f64) {
@@ -1002,7 +1021,8 @@ fn promise_rejected_value(reason: f64) -> f64 {
 }
 
 fn dns_promise_resolve(args: i64, default_kind: Option<RecordKind>) -> f64 {
-    let (name, kind) = promise_record_args(args, default_kind);
+    let (name, kind) =
+        promise_record_args(args, default_kind).unwrap_or_else(|error| throw_error_value(error));
     promise_value(resolve_records(kind, &name))
 }
 
@@ -1503,13 +1523,18 @@ pub extern "C" fn js_dns_promises_resolver_reverse(_handle: i64, args: i64) -> f
 #[no_mangle]
 pub extern "C" fn js_dns_promises_lookup(args: i64) -> f64 {
     let hostname_value = arg(args, 0);
+    let hostname_js = JSValue::from_bits(hostname_value.to_bits());
     let hostname = match js_string_to_rust(hostname_value) {
-        Some(hostname) => hostname,
-        None => return promise_rejected_value(invalid_hostname_error(hostname_value)),
+        Some(hostname) if !hostname.is_empty() => hostname,
+        Some(_) => return promise_rejected_value(invalid_hostname_value_error(hostname_value)),
+        None if hostname_js.is_undefined() || hostname_js.is_null() => {
+            return promise_rejected_value(invalid_hostname_value_error(hostname_value));
+        }
+        None => throw_error_value(invalid_hostname_error(hostname_value)),
     };
     let options = match parse_lookup_options(arg(args, 1)) {
         Ok(options) => options,
-        Err(error) => return promise_rejected_value(error),
+        Err(error) => throw_error_value(error),
     };
     match lookup_value(&hostname, options) {
         Ok(value) => promise_value(value),
@@ -1520,19 +1545,19 @@ pub extern "C" fn js_dns_promises_lookup(args: i64) -> f64 {
 #[no_mangle]
 pub extern "C" fn js_dns_promises_lookup_service(args: i64) -> f64 {
     if args_len(args) < 2 {
-        return promise_rejected_value(lookup_service_missing_args_error());
+        throw_error_value(lookup_service_missing_args_error());
     }
     let address_value = arg(args, 0);
     let address = match js_string_to_rust(address_value) {
         Some(address) => address,
-        None => return promise_rejected_value(invalid_address_error(address_value)),
+        None => throw_error_value(invalid_address_error(address_value)),
     };
     let port = match parse_lookup_service_port(arg(args, 1)) {
         Ok(port) => port,
-        Err(error) => return promise_rejected_value(error),
+        Err(error) => throw_error_value(error),
     };
     match lookup_service_result(&address, port) {
         Ok((hostname, service)) => promise_value(lookup_service_object(&hostname, &service)),
-        Err(error) => promise_rejected_value(error),
+        Err(error) => throw_error_value(error),
     }
 }

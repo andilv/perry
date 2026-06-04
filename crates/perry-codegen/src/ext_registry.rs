@@ -198,6 +198,37 @@ const FFI_REGISTRY: &[(&str, OwnerKind)] = &[
     ("js_http_get_overload",                        OwnerKind::WellKnown("http")),
     ("js_https_request_overload",                   OwnerKind::WellKnown("http")),
     ("js_https_get_overload",                       OwnerKind::WellKnown("http")),
+    ("js_http_request",                             OwnerKind::WellKnown("http")),
+    ("js_http_get",                                 OwnerKind::WellKnown("http")),
+    ("js_https_request",                            OwnerKind::WellKnown("http")),
+    ("js_https_get",                                OwnerKind::WellKnown("http")),
+    ("js_http_on",                                  OwnerKind::WellKnown("http")),
+    ("js_http_set_header",                          OwnerKind::WellKnown("http")),
+    ("js_http_set_timeout",                         OwnerKind::WellKnown("http")),
+    ("js_http_client_request_end",                  OwnerKind::WellKnown("http")),
+    ("js_http_client_request_write",                OwnerKind::WellKnown("http")),
+    ("js_http_client_request_listener_count",       OwnerKind::WellKnown("http")),
+    ("js_http_client_request_get_header",           OwnerKind::WellKnown("http")),
+    ("js_http_client_request_has_header",           OwnerKind::WellKnown("http")),
+    ("js_http_client_request_remove_header",        OwnerKind::WellKnown("http")),
+    ("js_http_client_request_get_header_names",     OwnerKind::WellKnown("http")),
+    ("js_http_client_request_get_headers",          OwnerKind::WellKnown("http")),
+    ("js_http_client_request_get_raw_header_names", OwnerKind::WellKnown("http")),
+    ("js_http_client_request_abort",                OwnerKind::WellKnown("http")),
+    ("js_http_client_request_destroy",              OwnerKind::WellKnown("http")),
+    ("js_http_client_request_noop_undefined",       OwnerKind::WellKnown("http")),
+    ("js_http_client_request_method",               OwnerKind::WellKnown("http")),
+    ("js_http_client_request_protocol",             OwnerKind::WellKnown("http")),
+    ("js_http_client_request_host",                 OwnerKind::WellKnown("http")),
+    ("js_http_client_request_path",                 OwnerKind::WellKnown("http")),
+    ("js_http_client_request_aborted",              OwnerKind::WellKnown("http")),
+    ("js_http_client_request_destroyed",            OwnerKind::WellKnown("http")),
+    ("js_http_client_request_finished",             OwnerKind::WellKnown("http")),
+    ("js_http_client_request_reused_socket",        OwnerKind::WellKnown("http")),
+    ("js_http_client_request_max_headers_count",    OwnerKind::WellKnown("http")),
+    ("js_http_client_request_writable_ended",       OwnerKind::WellKnown("http")),
+    ("js_http_client_request_writable_finished",    OwnerKind::WellKnown("http")),
+    ("js_http_client_request_socket",               OwnerKind::WellKnown("http")),
 
     // ── #846: node:http server ───────────────────────────────────────
     // `perry-ext-http-server` defines `js_node_http_*`. It's pulled in
@@ -351,6 +382,14 @@ const FFI_REGISTRY: &[(&str, OwnerKind)] = &[
     ("js_net_socket_address_get_family",            OwnerKind::WellKnown("net")),
     ("js_net_socket_address_get_port",              OwnerKind::WellKnown("net")),
     ("js_net_socket_address_get_flowlabel",         OwnerKind::WellKnown("net")),
+    // #2013 — net validation rows whose runtime helpers live only in
+    // `perry-ext-net`. These calls can be emitted by native-table lowering,
+    // so they must independently flip the net well-known provider.
+    ("js_net_get_default_auto_select_family",       OwnerKind::WellKnown("net")),
+    ("js_net_set_default_auto_select_family",       OwnerKind::WellKnown("net")),
+    ("js_net_get_default_auto_select_family_attempt_timeout", OwnerKind::WellKnown("net")),
+    ("js_net_set_default_auto_select_family_attempt_timeout", OwnerKind::WellKnown("net")),
+    ("js_net_socket_set_timeout",                   OwnerKind::WellKnown("net")),
     // #1852 — chainable no-op option setters for Socket/Server.
     ("js_net_socket_noop_self",                     OwnerKind::WellKnown("net")),
     ("js_net_socket_get_type_of_service",           OwnerKind::WellKnown("net")),
@@ -547,6 +586,9 @@ mod tests {
             .expect("provider test lock poisoned");
         for symbol in [
             "js_http_request_overload",
+            "js_http_set_header",
+            "js_http_client_request_get_header",
+            "js_http_client_request_destroyed",
             "js_https_get_overload",
             "js_node_http_im_set_timeout",
             "js_node_http_res_cork",
@@ -568,6 +610,28 @@ mod tests {
                 _ => OwnerKind::WellKnown("http"),
             };
             assert_symbol_routes_to(symbol, owner);
+        }
+    }
+
+    /// #2013 regression: net validation fixtures emit provider-only
+    /// `perry-ext-net` symbols through native-table lowering. Each one must
+    /// route to the net well-known archive so `PERRY_NO_AUTO_OPTIMIZE=1`
+    /// compiles the fixtures instead of linking unresolved `js_net_*` calls.
+    #[test]
+    fn emitted_net_validation_external_symbols_route_to_net() {
+        let _guard = PROVIDER_TEST_LOCK
+            .lock()
+            .expect("provider test lock poisoned");
+        for symbol in [
+            "js_net_create_server",
+            "js_net_server_listen",
+            "js_net_get_default_auto_select_family",
+            "js_net_set_default_auto_select_family",
+            "js_net_get_default_auto_select_family_attempt_timeout",
+            "js_net_set_default_auto_select_family_attempt_timeout",
+            "js_net_socket_set_timeout",
+        ] {
+            assert_symbol_routes_to(symbol, OwnerKind::WellKnown("net"));
         }
     }
 }

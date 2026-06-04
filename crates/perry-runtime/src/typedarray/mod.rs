@@ -1,6 +1,4 @@
-//! TypedArray support: Int8Array, Uint8Array, Int16Array, Uint16Array,
-//! Int32Array, Uint32Array, Float32Array, Float64Array, BigInt64Array,
-//! BigUint64Array.
+//! TypedArray support for all JS typed-array element kinds.
 //!
 //! Each TypedArrayHeader stores its element kind + size and a contiguous
 //! data region. Element-level read/write goes through `js_typed_array_get`
@@ -18,6 +16,10 @@ use std::ptr;
 use crate::array::ArrayHeader;
 use crate::closure::ClosureHeader;
 use crate::typedarray_half::{f16_bits_to_f64, f64_to_f16_bits};
+
+pub(crate) mod bigint;
+mod format;
+pub use format::format_typed_array;
 
 // Element kind tags. Match the order used by HIR/codegen.
 pub const KIND_INT8: u8 = 0;
@@ -140,6 +142,11 @@ thread_local! {
     /// (~1.0% leaf samples on perf-comprehensive).
     static TYPED_ARRAY_REGISTRY: RefCell<crate::fast_hash::PtrHashMap<usize, u8>> =
         RefCell::new(crate::fast_hash::new_ptr_hash_map());
+    /// Perry currently materializes typed-array views over ArrayBuffer storage
+    /// as owning TypedArrayHeader values. Track which views came from
+    /// SharedArrayBuffer so Atomics.wait can apply Node's shared-buffer guard.
+    static TYPED_ARRAY_SHARED_BACKING: RefCell<crate::fast_hash::PtrHashSet<usize>> =
+        RefCell::new(crate::fast_hash::new_ptr_hash_set());
 }
 
 pub fn register_typed_array(ptr: *const TypedArrayHeader, kind: u8) {
@@ -149,15 +156,31 @@ pub fn register_typed_array(ptr: *const TypedArrayHeader, kind: u8) {
 }
 
 pub fn unregister_typed_array(ptr: *const TypedArrayHeader) {
+    let owner = ptr as usize;
     TYPED_ARRAY_REGISTRY.with(|r| {
-        r.borrow_mut().remove(&(ptr as usize));
+        r.borrow_mut().remove(&owner);
     });
+    TYPED_ARRAY_SHARED_BACKING.with(|r| {
+        r.borrow_mut().remove(&owner);
+    });
+    crate::typedarray_props::typed_array_clear_own_props(owner);
 }
 
 /// Returns Some(kind) if the (already-stripped) address is a registered
 /// typed array, else None.
 pub fn lookup_typed_array_kind(addr: usize) -> Option<u8> {
     TYPED_ARRAY_REGISTRY.with(|r| r.borrow().get(&addr).copied())
+}
+
+pub(crate) fn mark_typed_array_shared_backing(ptr: *const TypedArrayHeader) {
+    TYPED_ARRAY_SHARED_BACKING.with(|r| {
+        r.borrow_mut().insert(ptr as usize);
+    });
+}
+
+pub(crate) fn typed_array_has_shared_backing(ptr: *const TypedArrayHeader) -> bool {
+    let ptr = clean_ta_ptr(ptr);
+    TYPED_ARRAY_SHARED_BACKING.with(|r| r.borrow().contains(&(ptr as usize)))
 }
 
 #[inline]
@@ -531,6 +554,17 @@ fn jsvalue_to_f64(v: f64) -> f64 {
     if !(0x7FFA..0x8000).contains(&top16) {
         return v;
     }
+    // ECMA-262 IntegerIndexedElementSet on a non-bigint view performs
+    // ToNumber on the value. ToNumber(Symbol) and ToNumber(BigInt) are both
+    // TypeErrors (§7.1.4). Bigint views never reach here (js_typed_array_set
+    // routes ToBigInt separately), so a BigInt at this point is being written
+    // into a numeric view and must throw. Symbols are POINTER_TAG.
+    if top16 == 0x7FFA {
+        crate::collection_iter::throw_type_error("Cannot convert a BigInt value to a number");
+    }
+    if top16 == 0x7FFD && unsafe { crate::symbol::js_is_symbol(v) } != 0 {
+        crate::collection_iter::throw_type_error("Cannot convert a Symbol value to a number");
+    }
     // INT32 tag
     if top16 == 0x7FFE {
         let n = (bits & 0xFFFF_FFFF) as i32;
@@ -635,10 +669,10 @@ unsafe fn store_at(ta: *mut TypedArrayHeader, idx: usize, value: f64) {
             *(base.add(off) as *mut f64) = value;
         }
         KIND_BIGINT64 => {
-            *(base.add(off) as *mut i64) = value as i64;
+            *(base.add(off) as *mut i64) = bigint::bigint_slot_bits(value) as i64;
         }
         KIND_BIGUINT64 => {
-            *(base.add(off) as *mut u64) = value as u64;
+            *(base.add(off) as *mut u64) = bigint::bigint_slot_bits(value);
         }
         _ => {}
     }
@@ -660,8 +694,17 @@ unsafe fn load_at(ta: *const TypedArrayHeader, idx: usize) -> f64 {
         KIND_FLOAT16 => f16_bits_to_f64(*(base.add(off) as *const u16)),
         KIND_FLOAT32 => *(base.add(off) as *const f32) as f64,
         KIND_FLOAT64 => *(base.add(off) as *const f64),
-        KIND_BIGINT64 => *(base.add(off) as *const i64) as f64,
-        KIND_BIGUINT64 => *(base.add(off) as *const u64) as f64,
+        // BigInt kinds return a NaN-boxed BigInt (not a plain Number), so
+        // `ta[i]` round-trips as a `bigint`. The raw slot bits are the BigInt's
+        // low limb; widen via the signed/unsigned constructor for `> i64::MAX`.
+        KIND_BIGINT64 => {
+            let v = *(base.add(off) as *const i64);
+            crate::value::js_nanbox_bigint(crate::bigint::js_bigint_from_i64(v) as i64)
+        }
+        KIND_BIGUINT64 => {
+            let v = *(base.add(off) as *const u64);
+            crate::value::js_nanbox_bigint(crate::bigint::js_bigint_from_u64(v) as i64)
+        }
         _ => 0.0,
     }
 }
@@ -714,6 +757,16 @@ pub extern "C" fn js_typed_array_new_empty(kind: i32, length: i32) -> *mut Typed
 pub extern "C" fn js_typed_array_new(kind: i32, val: f64) -> *mut TypedArrayHeader {
     let bits = val.to_bits();
     let top16 = (bits >> 48) as u16;
+    // `new TA(arg)` with a non-object arg performs ToIndex(arg) = ToNumber(arg)
+    // for the length. ToNumber(BigInt) and ToNumber(Symbol) are TypeErrors
+    // (§7.1.4), so `new Int8Array(5n)` / `new Int8Array(Symbol())` must throw
+    // rather than yielding an empty (BigInt) or garbage-copied (Symbol) array.
+    if top16 == 0x7FFA {
+        crate::collection_iter::throw_type_error("Cannot convert a BigInt value to a number");
+    }
+    if top16 == 0x7FFD && unsafe { crate::symbol::js_is_symbol(val) } != 0 {
+        crate::collection_iter::throw_type_error("Cannot convert a Symbol value to a number");
+    }
     if top16 == 0x7FFD {
         // POINTER_TAG — existing array pointer; copy its elements.
         let arr = (bits & 0x0000_FFFF_FFFF_FFFF) as *const crate::array::ArrayHeader;
@@ -728,6 +781,12 @@ pub extern "C" fn js_typed_array_new(kind: i32, val: f64) -> *mut TypedArrayHead
                 kind as u8,
                 raw_addr as *const TypedArrayHeader,
             );
+        }
+        if crate::buffer::is_registered_buffer(raw_addr)
+            && crate::buffer::is_any_array_buffer(raw_addr)
+        {
+            let undefined = f64::from_bits(crate::value::TAG_UNDEFINED);
+            return crate::typedarray_view::js_typed_array_view(kind, val, undefined, undefined);
         }
         return js_typed_array_new_from_array(kind, arr);
     }
@@ -821,7 +880,7 @@ pub extern "C" fn js_typed_array_new_from_array(
         // `typed_array_alloc` may GC and free/move an unrooted cloned source
         // (`.of/.from` path), and the raw inline read mis-read it (#871).
         let vals: Vec<f64> = (0..len)
-            .map(|i| jsvalue_to_f64(crate::array::js_array_get_f64(arr, i)))
+            .map(|i| bigint::coerce_for_kind(kind, crate::array::js_array_get_f64(arr, i)))
             .collect();
         let ta = typed_array_alloc(kind, len);
         for (i, v) in vals.iter().enumerate() {
@@ -885,57 +944,7 @@ pub extern "C" fn js_typed_array_get(ta: *const TypedArrayHeader, index: i32) ->
 ///   * a numeric (non-string) key → integer-indexed element read.
 #[no_mangle]
 pub extern "C" fn js_typed_array_index_get_dynamic(ta: *const TypedArrayHeader, key: f64) -> f64 {
-    let jsval = crate::value::JSValue::from_bits(key.to_bits());
-    if jsval.is_string() || jsval.is_short_string() {
-        let key_ptr =
-            crate::value::js_get_string_pointer_unified(key) as *const crate::string::StringHeader;
-        if key_ptr.is_null() {
-            return f64::from_bits(crate::value::TAG_UNDEFINED);
-        }
-        if let Some(idx) = canonical_typed_array_index(key_ptr) {
-            return js_typed_array_get(ta, idx);
-        }
-        return crate::object::js_object_get_field_by_name_f64(
-            ta as *const crate::object::ObjectHeader,
-            key_ptr,
-        );
-    }
-    // Numeric key — INT32 tag or plain double (defensive: codegen only routes
-    // string-typed keys here, but type erasure can let a number flow in).
-    let num = if jsval.is_int32() {
-        jsval.as_int32() as f64
-    } else if !key.is_nan() {
-        key
-    } else {
-        return f64::from_bits(crate::value::TAG_UNDEFINED);
-    };
-    if !num.is_finite() || num < 0.0 || num.fract() != 0.0 || num > i32::MAX as f64 {
-        return f64::from_bits(crate::value::TAG_UNDEFINED);
-    }
-    js_typed_array_get(ta, num as i32)
-}
-
-/// Canonical numeric array-index parse for a TypedArray string key. Returns
-/// `Some(idx)` only when `key` is the canonical decimal form of a
-/// non-negative integer in `[0, i32::MAX]` (no leading zeros, sign, or
-/// fractional part) — a CanonicalNumericIndexString that is a valid integer
-/// index. Mirrors the array string-key dispatch in `js_array_set_string_key`.
-fn canonical_typed_array_index(key: *const crate::string::StringHeader) -> Option<i32> {
-    let key_str = unsafe {
-        let len = (*key).byte_len as usize;
-        if len == 0 {
-            return None;
-        }
-        let data = (key as *const u8).add(std::mem::size_of::<crate::string::StringHeader>());
-        let bytes = std::slice::from_raw_parts(data, len);
-        std::str::from_utf8(bytes).ok()?
-    };
-    let idx = key_str.parse::<u32>().ok()?;
-    if idx.to_string() == key_str && idx <= i32::MAX as u32 {
-        Some(idx as i32)
-    } else {
-        None
-    }
+    unsafe { crate::typedarray_props::typed_array_index_get_dynamic(ta as usize, key) }
 }
 
 // #2063: force-keep the dynamic-key getter under LTO / auto-optimize. Like
@@ -988,7 +997,15 @@ pub extern "C" fn js_typed_array_set(ta: *mut TypedArrayHeader, index: i32, valu
         if index < 0 || index as u32 >= (*ta).length {
             return;
         }
-        store_at(ta, index as usize, jsvalue_to_f64(value));
+        let kind = (*ta).kind;
+        if kind == KIND_BIGINT64 || kind == KIND_BIGUINT64 {
+            // IntegerIndexedElementSet on a bigint view performs `ToBigInt` —
+            // a Number throws `TypeError`. Pass the NaN-boxed BigInt straight
+            // to `store_at` (NOT through `jsvalue_to_f64`, which maps it to NaN).
+            store_at(ta, index as usize, bigint::to_bigint_for_store(value));
+        } else {
+            store_at(ta, index as usize, jsvalue_to_f64(value));
+        }
     }
 }
 
@@ -999,7 +1016,7 @@ pub extern "C" fn js_typed_array_set(ta: *mut TypedArrayHeader, index: i32, valu
 ///   - an array-like object (`{ length, 0, 1, … }`).
 /// Returns `None` for null/undefined (caller throws TypeError) and an empty
 /// vec for unrecognized non-iterable values (Node coerces those to length 0).
-unsafe fn collect_typed_array_set_source(source_value: f64) -> Option<Vec<f64>> {
+unsafe fn collect_typed_array_set_source(source_value: f64, dst_kind: u8) -> Option<Vec<f64>> {
     let v = crate::value::JSValue::from_bits(source_value.to_bits());
     if v.is_null() || v.is_undefined() {
         return None;
@@ -1037,9 +1054,10 @@ unsafe fn collect_typed_array_set_source(source_value: f64) -> Option<Vec<f64>> 
             let len = crate::array::js_array_length(arr) as usize;
             let mut out = Vec::with_capacity(len);
             for i in 0..len {
-                out.push(jsvalue_to_f64(crate::array::js_array_get_f64(
-                    arr, i as u32,
-                )));
+                out.push(bigint::coerce_for_kind(
+                    dst_kind,
+                    crate::array::js_array_get_f64(arr, i as u32),
+                ));
             }
             return Some(out);
         }
@@ -1058,7 +1076,10 @@ unsafe fn collect_typed_array_set_source(source_value: f64) -> Option<Vec<f64>> 
                 let key = i.to_string();
                 let key_ptr = crate::string::js_string_from_bytes(key.as_ptr(), key.len() as u32);
                 let field = crate::object::js_object_get_field_by_name(obj, key_ptr);
-                out.push(jsvalue_to_f64(f64::from_bits(field.bits())));
+                out.push(bigint::coerce_for_kind(
+                    dst_kind,
+                    f64::from_bits(field.bits()),
+                ));
             }
             return Some(out);
         }
@@ -1089,7 +1110,7 @@ pub extern "C" fn js_typed_array_set_from(
         0.0
     };
     unsafe {
-        let elems = match collect_typed_array_set_source(source_value) {
+        let elems = match collect_typed_array_set_source(source_value, (*ta).kind) {
             Some(e) => e,
             None => throw_type_error(b"Cannot convert undefined or null to object"),
         };
@@ -1725,35 +1746,6 @@ pub extern "C" fn js_typed_array_reduce_right(
     }
 }
 
-/// Format a typed array Node-style: `Int32Array(N) [ a, b, c ]`. Used by
-/// `format_jsvalue` in builtins.rs.
-pub fn format_typed_array(ta: *const TypedArrayHeader) -> String {
-    let ta = clean_ta_ptr(ta);
-    if ta.is_null() {
-        return "TypedArray(0) []".to_string();
-    }
-    unsafe {
-        let kind = (*ta).kind;
-        let len = (*ta).length as usize;
-        let name = name_for_kind(kind);
-        if len == 0 {
-            return format!("{}(0) []", name);
-        }
-        let mut s = format!("{}({}) [", name, len);
-        for i in 0..len {
-            if i == 0 {
-                s.push(' ');
-            } else {
-                s.push_str(", ");
-            }
-            let v = load_at(ta, i);
-            s.push_str(&format_typed_value(kind, v));
-        }
-        s.push_str(" ]");
-        s
-    }
-}
-
 // #3148: %TypedArray%.prototype join / slice / reverse / fill / subarray.
 // (reduce/reduceRight/copyWithin/set_from/findIndex live above — added separately.)
 /// `ta.join(sep?)` — Number→String each element (Node formatting), joined by
@@ -1786,7 +1778,7 @@ pub extern "C" fn js_typed_array_join(
             if i > 0 {
                 result.push_str(sep_str);
             }
-            result.push_str(&format_typed_value(kind, load_at(ta, i)));
+            result.push_str(&format::format_typed_value(kind, load_at(ta, i), false));
         }
         let ret = js_string_from_bytes(result.as_ptr(), result.len() as u32);
         std::hint::black_box(&result);
@@ -1943,34 +1935,10 @@ pub extern "C" fn js_typed_array_subarray(
     }
 }
 
-fn format_typed_value(kind: u8, v: f64) -> String {
-    match kind {
-        KIND_FLOAT16 | KIND_FLOAT32 | KIND_FLOAT64 => {
-            // Match Node: integer-valued floats render with no decimal,
-            // others render via Rust's default Debug for f64.
-            if v.is_nan() {
-                "NaN".to_string()
-            } else if v.is_infinite() {
-                if v > 0.0 {
-                    "Infinity".to_string()
-                } else {
-                    "-Infinity".to_string()
-                }
-            } else if v == v.trunc() && v.abs() < 1e16 {
-                format!("{}", v as i64)
-            } else {
-                // Use Rust's default short formatting.
-                let s = format!("{}", v);
-                s
-            }
-        }
-        _ => {
-            // Integer types
-            format!("{}", v as i64)
-        }
-    }
-}
-
+/// Format a single typed-array element. `bigint_suffix` controls whether a
+/// `BigInt64`/`BigUint64` element renders with the trailing `n` (true for the
+/// `console.log` inspect form `BigInt64Array(1) [ 5n ]`, false for `join`,
+/// which calls plain `ToString` on each element → `"5"`).
 #[cfg(test)]
 mod tests {
     use super::*;

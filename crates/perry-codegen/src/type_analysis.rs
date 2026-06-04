@@ -257,6 +257,16 @@ pub(crate) fn refine_type_from_init(ctx: &FnCtx<'_>, init: &Expr) -> Option<HirT
         } if module == "buffer" && method == "copyBytesFrom" => {
             Some(HirType::Named("Uint8Array".into()))
         }
+        Expr::NativeMethodCall {
+            module,
+            method,
+            object: None,
+            ..
+        } if matches!(module.as_str(), "http" | "https")
+            && matches!(method.as_str(), "request" | "get") =>
+        {
+            Some(HirType::Named("ClientRequest".into()))
+        }
         // Compare results are now NaN-boxed booleans (TAG_TRUE/FALSE).
         // Type-refining the local as Boolean lets is_numeric_expr
         // skip the fast path (which would emit fcmp/sitofp on a NaN
@@ -621,7 +631,7 @@ pub(crate) fn is_bigint_expr(ctx: &FnCtx<'_>, e: &Expr) -> bool {
     }
 }
 
-fn is_numeric_typed_array_class(name: &str) -> bool {
+pub(crate) fn is_numeric_typed_array_class(name: &str) -> bool {
     matches!(
         name,
         "Int8Array"
@@ -1104,7 +1114,7 @@ pub(crate) fn is_string_expr(ctx: &FnCtx<'_>, e: &Expr) -> bool {
         Expr::String(_) | Expr::WtfString(_) => true,
         Expr::LocalGet(id) => {
             match ctx.local_types.get(id) {
-                Some(HirType::String) => true,
+                Some(HirType::String | HirType::StringLiteral(_)) => true,
                 // Union(String, Null/Void) — nullable strings are still
                 // strings at runtime when non-null. The ?. and != null
                 // guard paths lower the non-null case through the string
@@ -1112,7 +1122,9 @@ pub(crate) fn is_string_expr(ctx: &FnCtx<'_>, e: &Expr) -> bool {
                 // toUpperCase()` fell through to the generic path and
                 // returned undefined.
                 Some(HirType::Union(members)) => {
-                    members.iter().any(|m| matches!(m, HirType::String))
+                    members
+                        .iter()
+                        .any(|m| matches!(m, HirType::String | HirType::StringLiteral(_)))
                 }
                 _ => false,
             }

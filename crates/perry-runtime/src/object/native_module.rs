@@ -2792,7 +2792,6 @@ pub(crate) fn native_module_enumerable_keys(module_name: &str) -> Option<&'stati
             b"isAsyncFunction",
             b"isBigIntObject",
             b"isBooleanObject",
-            b"isDataView",
             b"isDate",
             b"isExternal",
             b"isGeneratorFunction",
@@ -2815,6 +2814,7 @@ pub(crate) fn native_module_enumerable_keys(module_name: &str) -> Option<&'stati
             b"isAnyArrayBuffer",
             b"isBoxedPrimitive",
             b"isArrayBufferView",
+            b"isDataView",
             b"isTypedArray",
             b"isUint8Array",
             b"isUint8ClampedArray",
@@ -3162,6 +3162,11 @@ pub unsafe extern "C" fn js_native_module_property_by_name(
             return value;
         }
     }
+    if module_name == "crypto.subtle" {
+        if let Some(value) = super::global_this::subtle_crypto_method_value(property_name) {
+            return value;
+        }
+    }
 
     // #3687: `node:cluster` is a singleton EventEmitter. Its EventEmitter
     // method surface is exposed ONLY on the default import (the distinct
@@ -3274,6 +3279,9 @@ pub(crate) fn bound_native_callable_export_value(module_name: &str, property_nam
     }
     if export_module_name == "crypto" && property_name == "KeyObject" {
         attach_crypto_key_object_shape(closure_addr, value);
+    }
+    if export_module_name == "crypto" && property_name == "X509Certificate" {
+        attach_crypto_x509_certificate_shape(closure_addr, value);
     }
 
     // `PerformanceObserver.supportedEntryTypes` is a static array on the
@@ -3544,6 +3552,7 @@ fn native_callable_export_arity(module: &str, prop: &str) -> Option<u32> {
         // #3726: `crypto.Cipheriv` / `crypto.Decipheriv` constructor exports —
         // `(cipher, key, iv, options)` arity matches Node's length 4.
         ("crypto", "Cipheriv" | "Decipheriv") => Some(4),
+        ("crypto", "X509Certificate") => Some(1),
         ("crypto", "KeyObject") => Some(2),
         ("crypto.KeyObject", "from") => Some(1),
         // #2706/#2716 and #2694: crypto module-level callable exports.
@@ -3663,8 +3672,14 @@ fn native_callable_export_arity(module: &str, prop: &str) -> Option<u32> {
         ("http", "_connectionListener") => Some(1),
         ("module", "register" | "registerHooks") => Some(1),
         // #3904: modern V8 diagnostics/profiler exports (Node .length values).
-        ("v8", "getCppHeapStatistics" | "startCpuProfile") => Some(0),
-        ("v8", "getHeapSnapshot" | "isStringOneByteRepresentation" | "queryObjects") => Some(1),
+        ("v8", "getCppHeapStatistics") => Some(0),
+        (
+            "v8",
+            "getHeapSnapshot"
+            | "isStringOneByteRepresentation"
+            | "queryObjects"
+            | "startCpuProfile",
+        ) => Some(1),
         ("v8", "writeHeapSnapshot") => Some(2),
         // #3906: implemented top-level v8 helpers reachable as bound callables.
         ("v8", "serialize" | "deserialize") => Some(1),
@@ -3693,7 +3708,7 @@ fn native_callable_export_arity(module: &str, prop: &str) -> Option<u32> {
         ("fs", "ReadStream" | "WriteStream") => Some(2),
         ("fs", "Utf8Stream") => Some(0),
         ("fs", "Dir" | "Dirent") => Some(3),
-        ("fs", "Stats") => Some(14),
+        ("fs", "Stats") => Some(18),
         ("fs", "mkdtempDisposableSync") => Some(2),
         ("fs", "openAsBlob") => Some(1),
         ("fs", "_toUnixTimestamp") => Some(1),
@@ -4230,6 +4245,49 @@ fn attach_crypto_key_object_shape(closure_addr: usize, constructor_value: f64) {
         constructor.to_string(),
         super::PropertyAttrs::new(true, false, true),
     );
+
+    let proto_value = crate::value::js_nanbox_pointer(proto as i64);
+    crate::closure::closure_set_dynamic_prop(closure_addr, "prototype", proto_value);
+    super::set_builtin_property_attrs(
+        closure_addr,
+        "prototype".to_string(),
+        super::PropertyAttrs::new(true, false, false),
+    );
+}
+
+extern "C" fn x509_issuer_certificate_getter_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+) -> f64 {
+    f64::from_bits(crate::value::TAG_UNDEFINED)
+}
+
+fn attach_crypto_x509_certificate_shape(closure_addr: usize, constructor_value: f64) {
+    let proto = js_object_alloc(0, 0);
+    if proto.is_null() {
+        return;
+    }
+    let constructor = "constructor";
+    let constructor_key =
+        crate::string::js_string_from_bytes(constructor.as_ptr(), constructor.len() as u32);
+    js_object_set_field_by_name(proto, constructor_key, constructor_value);
+    super::set_builtin_property_attrs(
+        proto as usize,
+        constructor.to_string(),
+        super::PropertyAttrs::new(true, false, true),
+    );
+
+    unsafe {
+        crate::closure::js_register_closure_arity(
+            x509_issuer_certificate_getter_thunk as *const u8,
+            0,
+        );
+        let getter =
+            crate::closure::js_closure_alloc(x509_issuer_certificate_getter_thunk as *const u8, 0);
+        if !getter.is_null() {
+            let getter_bits = crate::value::js_nanbox_pointer(getter as i64).to_bits();
+            super::object_ops::install_builtin_getter(proto, "issuerCertificate", getter_bits);
+        }
+    }
 
     let proto_value = crate::value::js_nanbox_pointer(proto as i64);
     crate::closure::closure_set_dynamic_prop(closure_addr, "prototype", proto_value);
@@ -5440,6 +5498,7 @@ pub(crate) fn is_native_module_callable_export(module: &str, prop: &str) -> bool
             // callable functions so `typeof crypto.Cipheriv === "function"`.
             | ("crypto", "Cipheriv")
             | ("crypto", "Decipheriv")
+            | ("crypto", "X509Certificate")
             // #2565: public KeyObject constructor shape plus the supported
             // secret-key `KeyObject.from(CryptoKey)` static helper.
             | ("crypto", "KeyObject")
@@ -5611,6 +5670,11 @@ pub extern "C" fn js_native_module_bind_method(
 
     if module_name == "crypto.webcrypto" {
         if let Some(value) = super::global_this::webcrypto_method_value(property_name) {
+            return value;
+        }
+    }
+    if module_name == "crypto.subtle" {
+        if let Some(value) = super::global_this::subtle_crypto_method_value(property_name) {
             return value;
         }
     }

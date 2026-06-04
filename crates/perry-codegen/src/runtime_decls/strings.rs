@@ -402,6 +402,11 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_fs_glob_sync_options", DOUBLE, &[DOUBLE, DOUBLE]);
     module.declare_function("js_fs_link_sync", I32, &[DOUBLE, DOUBLE]);
     module.declare_function("js_fs_symlink_sync", I32, &[DOUBLE, DOUBLE]);
+    module.declare_function(
+        "js_fs_symlink_callback",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, DOUBLE, DOUBLE],
+    );
     module.declare_function("js_fs_readlink_sync", I64, &[DOUBLE]);
     module.declare_function("js_fs_readlink_sync_options", I64, &[DOUBLE, DOUBLE]);
     module.declare_function("js_fs_readlink_dispatch", DOUBLE, &[DOUBLE, DOUBLE]);
@@ -487,6 +492,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // and prints as `<Buffer xx xx ...>`.
     module.declare_function("js_fs_read_file_binary", I64, &[DOUBLE]);
     module.declare_function("js_number_coerce", DOUBLE, &[DOUBLE]);
+    module.declare_function("js_math_to_number", DOUBLE, &[DOUBLE]);
     module.declare_function("js_set_add", I64, &[I64, DOUBLE]);
     module.declare_function("js_set_has", I32, &[I64, DOUBLE]);
     module.declare_function("js_set_delete", I32, &[I64, DOUBLE]);
@@ -1103,6 +1109,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
         DOUBLE,
         &[DOUBLE, PTR, I64],
     );
+    module.declare_function("js_function_prototype_value_for_read", DOUBLE, &[DOUBLE]);
     module.declare_function("js_typeerror_new", I64, &[I64]);
     module.declare_function("js_rangeerror_new", I64, &[I64]);
     module.declare_function("js_syntaxerror_new", I64, &[I64]);

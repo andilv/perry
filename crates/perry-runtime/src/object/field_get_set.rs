@@ -22,8 +22,12 @@ const CRYPTO_USAGE_DERIVE_KEY: u32 = 1 << 4;
 const CRYPTO_USAGE_DERIVE_BITS: u32 = 1 << 5;
 const CRYPTO_USAGE_WRAP_KEY: u32 = 1 << 6;
 const CRYPTO_USAGE_UNWRAP_KEY: u32 = 1 << 7;
+const CRYPTO_USAGE_ENCAPSULATE_BITS: u32 = 1 << 8;
+const CRYPTO_USAGE_DECAPSULATE_BITS: u32 = 1 << 9;
+const CRYPTO_USAGE_ENCAPSULATE_KEY: u32 = 1 << 10;
+const CRYPTO_USAGE_DECAPSULATE_KEY: u32 = 1 << 11;
 
-unsafe fn crypto_key_property_value(addr: usize, key_bytes: &[u8]) -> Option<JSValue> {
+pub(crate) unsafe fn crypto_key_property_value(addr: usize, key_bytes: &[u8]) -> Option<JSValue> {
     let (algo, hash, kind, extractable, usages) = crate::buffer::crypto_key_meta(addr)?;
     match key_bytes {
         b"algorithm" => Some(crypto_key_algorithm_value(addr, algo, hash)),
@@ -34,6 +38,10 @@ unsafe fn crypto_key_property_value(addr: usize, key_bytes: &[u8]) -> Option<JSV
             _ => "secret",
         })),
         b"usages" => Some(crypto_key_usages_value(usages)),
+        b"constructor" => {
+            let ctor = super::js_get_global_this_builtin_value(b"CryptoKey".as_ptr(), 9);
+            Some(JSValue::from_bits(ctor.to_bits()))
+        }
         _ => None,
     }
 }
@@ -82,6 +90,20 @@ fn crypto_key_algorithm_name(algo: u8) -> &'static str {
         12 => "RSASSA-PKCS1-v1_5",
         13 => "RSA-OAEP",
         14 => "RSA-PSS",
+        15 | 17 => "ECDSA",
+        16 | 18 => "ECDH",
+        19 => "Argon2d",
+        20 => "Argon2i",
+        21 => "Argon2id",
+        22 => "ChaCha20-Poly1305",
+        23 => "KMAC128",
+        24 => "KMAC256",
+        25 => "AES-OCB",
+        26 => "X448",
+        27 => "Ed448",
+        30 => "ML-KEM-512",
+        31 => "ML-KEM-768",
+        32 => "ML-KEM-1024",
         _ => "",
     }
 }
@@ -100,12 +122,14 @@ fn crypto_key_algorithm_has_hash(algo: u8) -> bool {
 }
 
 fn crypto_key_algorithm_has_length(algo: u8) -> bool {
-    matches!(algo, 1 | 2 | 3 | 4 | 5)
+    matches!(algo, 1 | 2 | 3 | 4 | 5 | 21 | 22 | 25)
 }
 
 fn crypto_key_named_curve(algo: u8) -> Option<&'static str> {
     match algo {
         8 | 9 => Some("P-256"),
+        15 | 16 => Some("P-384"),
+        17 | 18 => Some("P-521"),
         _ => None,
     }
 }
@@ -120,6 +144,10 @@ unsafe fn crypto_key_usages_value(usages: u32) -> JSValue {
         (CRYPTO_USAGE_DERIVE_BITS, "deriveBits"),
         (CRYPTO_USAGE_WRAP_KEY, "wrapKey"),
         (CRYPTO_USAGE_UNWRAP_KEY, "unwrapKey"),
+        (CRYPTO_USAGE_ENCAPSULATE_BITS, "encapsulateBits"),
+        (CRYPTO_USAGE_DECAPSULATE_BITS, "decapsulateBits"),
+        (CRYPTO_USAGE_ENCAPSULATE_KEY, "encapsulateKey"),
+        (CRYPTO_USAGE_DECAPSULATE_KEY, "decapsulateKey"),
     ];
     let count = entries.iter().filter(|(bit, _)| usages & *bit != 0).count();
     let mut arr = crate::array::js_array_alloc(count as u32);
@@ -940,6 +968,14 @@ pub extern "C" fn js_object_keys_value(value: f64) -> *mut ArrayHeader {
             return arr;
         }
     }
+    if let Some(addr) = crate::typedarray_props::typed_array_addr_from_value(value) {
+        return unsafe {
+            crate::typedarray_props::typed_array_own_property_names(
+                addr as *const crate::typedarray::TypedArrayHeader,
+                true,
+            )
+        };
+    }
     if jv.is_pointer() {
         let ptr = jv.as_pointer::<u8>() as usize;
         if ptr > 0 && ptr < 0x100000 {
@@ -956,6 +992,14 @@ pub extern "C" fn js_object_keys_value(value: f64) -> *mut ArrayHeader {
                 }
             }
             return crate::array::js_array_alloc(0);
+        }
+        if crate::typedarray::lookup_typed_array_kind(ptr).is_some() {
+            return unsafe {
+                crate::typedarray_props::typed_array_own_property_names(
+                    ptr as *const crate::typedarray::TypedArrayHeader,
+                    true,
+                )
+            };
         }
         if crate::closure::is_closure_ptr(ptr) {
             return js_closure_dynamic_keys(ptr);
@@ -1088,8 +1132,22 @@ pub extern "C" fn js_object_values_value(value: f64) -> *mut ArrayHeader {
         }
         return out;
     }
+    if let Some(addr) = crate::typedarray_props::typed_array_addr_from_value(value) {
+        return unsafe {
+            crate::typedarray_props::typed_array_own_enumerable_values(
+                addr as *const crate::typedarray::TypedArrayHeader,
+            )
+        };
+    }
     if jv.is_pointer() {
         let ptr = jv.as_pointer::<u8>() as usize;
+        if crate::typedarray::lookup_typed_array_kind(ptr).is_some() {
+            return unsafe {
+                crate::typedarray_props::typed_array_own_enumerable_values(
+                    ptr as *const crate::typedarray::TypedArrayHeader,
+                )
+            };
+        }
         if crate::closure::is_closure_ptr(ptr) {
             return js_closure_dynamic_values(ptr);
         }
@@ -1126,8 +1184,22 @@ pub extern "C" fn js_object_entries_value(value: f64) -> *mut ArrayHeader {
         }
         return out;
     }
+    if let Some(addr) = crate::typedarray_props::typed_array_addr_from_value(value) {
+        return unsafe {
+            crate::typedarray_props::typed_array_own_enumerable_entries(
+                addr as *const crate::typedarray::TypedArrayHeader,
+            )
+        };
+    }
     if jv.is_pointer() {
         let ptr = jv.as_pointer::<u8>() as usize;
+        if crate::typedarray::lookup_typed_array_kind(ptr).is_some() {
+            return unsafe {
+                crate::typedarray_props::typed_array_own_enumerable_entries(
+                    ptr as *const crate::typedarray::TypedArrayHeader,
+                )
+            };
+        }
         if crate::closure::is_closure_ptr(ptr) {
             return js_closure_dynamic_entries(ptr);
         }
@@ -1247,6 +1319,24 @@ pub extern "C" fn js_object_keys(obj: *const ObjectHeader) -> *mut ArrayHeader {
             obj
         }
     };
+    if let Some(addr) =
+        crate::typedarray_props::typed_array_addr_from_value(f64::from_bits(obj as u64))
+    {
+        return unsafe {
+            crate::typedarray_props::typed_array_own_property_names(
+                addr as *const crate::typedarray::TypedArrayHeader,
+                true,
+            )
+        };
+    }
+    if crate::typedarray::lookup_typed_array_kind(stripped as usize).is_some() {
+        return unsafe {
+            crate::typedarray_props::typed_array_own_property_names(
+                stripped as *const crate::typedarray::TypedArrayHeader,
+                true,
+            )
+        };
+    }
     if crate::closure::is_closure_ptr(stripped as usize) {
         let props = crate::closure::closure_dynamic_props_snapshot(stripped as usize);
         let out = crate::array::js_array_alloc(props.len() as u32);
@@ -1391,6 +1481,31 @@ pub extern "C" fn js_object_keys(obj: *const ObjectHeader) -> *mut ArrayHeader {
 /// Returns an array of the object's field values
 #[no_mangle]
 pub extern "C" fn js_object_values(obj: *const ObjectHeader) -> *mut ArrayHeader {
+    let stripped = {
+        let bits = obj as u64;
+        let top16 = bits >> 48;
+        if top16 == 0x7FFD || top16 >= 0x7FF8 {
+            (bits & 0x0000_FFFF_FFFF_FFFF) as *const ObjectHeader
+        } else {
+            obj
+        }
+    };
+    if let Some(addr) =
+        crate::typedarray_props::typed_array_addr_from_value(f64::from_bits(obj as u64))
+    {
+        return unsafe {
+            crate::typedarray_props::typed_array_own_enumerable_values(
+                addr as *const crate::typedarray::TypedArrayHeader,
+            )
+        };
+    }
+    if crate::typedarray::lookup_typed_array_kind(stripped as usize).is_some() {
+        return unsafe {
+            crate::typedarray_props::typed_array_own_enumerable_values(
+                stripped as *const crate::typedarray::TypedArrayHeader,
+            )
+        };
+    }
     if obj.is_null() || !is_valid_obj_ptr(obj as *const u8) {
         // Issue #893: defensive sibling of `js_object_entries` —
         // see that function's comment for the rationale.
@@ -1431,6 +1546,31 @@ pub extern "C" fn js_object_values(obj: *const ObjectHeader) -> *mut ArrayHeader
 /// Returns an array where each element is a 2-element array [key, value]
 #[no_mangle]
 pub extern "C" fn js_object_entries(obj: *const ObjectHeader) -> *mut ArrayHeader {
+    let stripped = {
+        let bits = obj as u64;
+        let top16 = bits >> 48;
+        if top16 == 0x7FFD || top16 >= 0x7FF8 {
+            (bits & 0x0000_FFFF_FFFF_FFFF) as *const ObjectHeader
+        } else {
+            obj
+        }
+    };
+    if let Some(addr) =
+        crate::typedarray_props::typed_array_addr_from_value(f64::from_bits(obj as u64))
+    {
+        return unsafe {
+            crate::typedarray_props::typed_array_own_enumerable_entries(
+                addr as *const crate::typedarray::TypedArrayHeader,
+            )
+        };
+    }
+    if crate::typedarray::lookup_typed_array_kind(stripped as usize).is_some() {
+        return unsafe {
+            crate::typedarray_props::typed_array_own_enumerable_entries(
+                stripped as *const crate::typedarray::TypedArrayHeader,
+            )
+        };
+    }
     if obj.is_null() || !is_valid_obj_ptr(obj as *const u8) {
         // Issue #893 lineage: chalk's `Object.entries(ansiStyles)` passed a
         // value whose unboxed low-48 bits weren't a real heap pointer
@@ -1585,6 +1725,33 @@ pub extern "C" fn js_object_has_property(obj: f64, key: f64) -> f64 {
 
     let obj_addr = obj_val.bits() & 0x0000_FFFF_FFFF_FFFF;
     if obj_addr >= 0x10000 {
+        if crate::typedarray::lookup_typed_array_kind(obj_addr as usize).is_some() {
+            let ta = obj_addr as *const crate::typedarray::TypedArrayHeader;
+            if key_val.is_any_string() {
+                let key_str =
+                    crate::value::js_get_string_pointer_unified(key) as *const crate::StringHeader;
+                let present =
+                    unsafe { crate::typedarray_props::typed_array_has_own_property(ta, key_str) };
+                return if present { nanbox_true } else { nanbox_false };
+            }
+            if key_val.is_int32() {
+                let index = key_val.as_int32();
+                let present = unsafe { index >= 0 && (index as u32) < (*ta).length };
+                return if present { nanbox_true } else { nanbox_false };
+            }
+            if key_val.is_number() {
+                let f = f64::from_bits(key_val.bits());
+                let present = unsafe {
+                    f.is_finite()
+                        && f >= 0.0
+                        && f.fract() == 0.0
+                        && f <= i32::MAX as f64
+                        && (f as u32) < (*ta).length
+                };
+                return if present { nanbox_true } else { nanbox_false };
+            }
+            return nanbox_false;
+        }
         let obj_ptr = obj_addr as *mut ObjectHeader;
         unsafe {
             if !obj_ptr.is_null() && (*obj_ptr).class_id == NATIVE_MODULE_CLASS_ID {
@@ -1869,6 +2036,84 @@ pub extern "C" fn js_object_get_field_by_name(
                 let v = crate::proxy::js_proxy_get(boxed, key_f64);
                 return JSValue::from_bits(v.to_bits());
             }
+        }
+    }
+    if let Some(addr) =
+        crate::typedarray_props::typed_array_addr_from_value(f64::from_bits(obj as u64))
+    {
+        if !key.is_null() {
+            unsafe {
+                let key_ptr = (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
+                let key_len = (*key).byte_len as usize;
+                let key_bytes = std::slice::from_raw_parts(key_ptr, key_len);
+                let ta = addr as *const crate::typedarray::TypedArrayHeader;
+                if let Some(value) = crypto_key_property_value(addr, key_bytes) {
+                    return value;
+                }
+                if let Some(value) =
+                    crate::typedarray_props::typed_array_get_own_property_value(ta, key)
+                {
+                    return JSValue::from_bits(value.to_bits());
+                }
+                if let Some(kind) = crate::typedarray::lookup_typed_array_kind(addr) {
+                    let elem_size = crate::typedarray::elem_size_for_kind(kind);
+                    match key_bytes {
+                        b"length" => {
+                            let len = crate::typedarray::js_typed_array_length(ta);
+                            return JSValue::number(len as f64);
+                        }
+                        b"byteLength" => {
+                            let len = crate::typedarray::js_typed_array_length(ta);
+                            return JSValue::number((len as usize * elem_size) as f64);
+                        }
+                        b"buffer" => {
+                            let buf = crate::typedarray::typed_array_to_array_buffer(ta);
+                            if buf.is_null() {
+                                return JSValue::undefined();
+                            }
+                            return JSValue::from_bits(
+                                crate::value::js_nanbox_pointer(buf as i64).to_bits(),
+                            );
+                        }
+                        b"byteOffset" => return JSValue::number(0.0),
+                        b"BYTES_PER_ELEMENT" => return JSValue::number(elem_size as f64),
+                        _ => {}
+                    }
+                } else {
+                    let buf = addr as *const crate::buffer::BufferHeader;
+                    match key_bytes {
+                        b"length" | b"byteLength" => {
+                            return JSValue::number(crate::buffer::js_buffer_length(buf) as f64);
+                        }
+                        b"buffer" | b"parent" => {
+                            let alias = crate::buffer::buffer_backing_array_buffer(addr);
+                            return JSValue::from_bits(
+                                crate::value::js_nanbox_pointer(alias as i64).to_bits(),
+                            );
+                        }
+                        b"byteOffset" | b"offset" => {
+                            let offset = crate::buffer::buffer_byte_offset(addr);
+                            return JSValue::number(offset as f64);
+                        }
+                        b"BYTES_PER_ELEMENT" => return JSValue::number(1.0),
+                        b"constructor" => {
+                            let ctor =
+                                super::js_get_global_this_builtin_value(b"Uint8Array".as_ptr(), 10);
+                            return JSValue::from_bits(ctor.to_bits());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // #4363 regression fix: a secret-key Uint8Array (KeyObject backing
+        // buffer) exposes `type` / `symmetricKeySize` / `asymmetricKey*`
+        // through the KeyObject metadata block later in this function. The
+        // typed-array own-property fallback must not shadow those with
+        // `undefined` — fall through for a secret-key buffer so the metadata
+        // block resolves them. Plain typed arrays keep the `undefined` result.
+        if !crate::buffer::is_secret_key(addr) {
+            return JSValue::undefined();
         }
     }
     // #2128: a plain JS number value (a finite double or canonical NaN —
@@ -2462,8 +2707,18 @@ pub extern "C" fn js_object_get_field_by_name(
                 if crate::closure::closure_is_key_deleted(obj as usize, name_str) {
                     return JSValue::undefined();
                 }
+                // ECMAScript "poison pill": reading `caller` / `arguments` off a
+                // strict-mode function throws a TypeError (the %ThrowTypeError%
+                // accessor on `Function.prototype`). Perry has no sloppy mode —
+                // all TS/JS it compiles is strict — so this applies to every
+                // function (declarations, expressions, methods, classes, arrows,
+                // bound and built-in closures), matching `node`'s strict-mode
+                // behavior. A `delete fn.caller` (handled above) still wins, and a
+                // genuine own data prop of that name takes precedence so the rare
+                // `Object.defineProperty(fn, "caller", …)` round-trips.
                 if matches!(name_str, "caller" | "arguments")
-                    && crate::closure::closure_is_arrow(obj as *const crate::closure::ClosureHeader)
+                    && crate::closure::closure_get_dynamic_prop(obj as usize, name_str).to_bits()
+                        == crate::value::TAG_UNDEFINED
                 {
                     crate::fs::validate::throw_type_error_with_code(
                         "Restricted function property access",
@@ -2473,6 +2728,26 @@ pub extern "C" fn js_object_get_field_by_name(
                 let val = crate::closure::closure_get_dynamic_prop(obj as usize, name_str);
                 if val.to_bits() != crate::value::TAG_UNDEFINED {
                     return JSValue::from_bits(val.to_bits());
+                }
+                if name_str == "constructor" {
+                    if let Some(ctor) =
+                        crate::object::generator_function_constructor_of(obj as usize)
+                    {
+                        return JSValue::from_bits(ctor.to_bits());
+                    }
+                }
+                if name_str == "prototype" {
+                    if let Some(proto) =
+                        crate::object::generator_function_prototype_of(obj as usize)
+                    {
+                        return JSValue::from_bits(proto.to_bits());
+                    }
+                    let func_value = crate::value::js_nanbox_pointer(obj as i64);
+                    if let Some(proto) =
+                        super::ordinary_function_prototype_value_for_read(func_value)
+                    {
+                        return JSValue::from_bits(proto.to_bits());
+                    }
                 }
                 if name_str == "length" {
                     let closure_value = crate::value::js_nanbox_pointer(obj as i64);
@@ -2636,6 +2911,11 @@ pub extern "C" fn js_object_get_field_by_name(
                 let key_bytes = std::slice::from_raw_parts(key_ptr, key_len);
                 let ta = obj as *const crate::typedarray::TypedArrayHeader;
                 let elem_size = crate::typedarray::elem_size_for_kind(kind);
+                if let Some(value) =
+                    crate::typedarray_props::typed_array_get_own_property_value(ta, key)
+                {
+                    return JSValue::from_bits(value.to_bits());
+                }
                 match key_bytes {
                     b"length" => {
                         let len = crate::typedarray::js_typed_array_length(ta);
@@ -2753,10 +3033,15 @@ pub extern "C" fn js_object_get_field_by_name(
                     if crate::closure::closure_is_key_deleted(obj as usize, name_str) {
                         return JSValue::undefined();
                     }
+                    // ECMAScript "poison pill" — see the matching arm in
+                    // `js_object_get_field_by_name`. Reading `caller`/`arguments`
+                    // off any strict-mode function throws a TypeError; Perry has
+                    // no sloppy mode, so this covers every function. A genuine own
+                    // data prop of that name still wins.
                     if matches!(name_str, "caller" | "arguments")
-                        && crate::closure::closure_is_arrow(
-                            obj as *const crate::closure::ClosureHeader,
-                        )
+                        && crate::closure::closure_get_dynamic_prop(obj as usize, name_str)
+                            .to_bits()
+                            == crate::value::TAG_UNDEFINED
                     {
                         crate::fs::validate::throw_type_error_with_code(
                             "Restricted function property access",
@@ -3348,6 +3633,13 @@ pub extern "C" fn js_object_get_field_by_name(
                 }
                 if module_name == "crypto.webcrypto" {
                     if let Some(value) = super::global_this::webcrypto_method_value(property_name) {
+                        return JSValue::from_bits(value.to_bits());
+                    }
+                }
+                if module_name == "crypto.subtle" {
+                    if let Some(value) =
+                        super::global_this::subtle_crypto_method_value(property_name)
+                    {
                         return JSValue::from_bits(value.to_bits());
                     }
                 }
@@ -4023,6 +4315,10 @@ pub extern "C" fn js_object_get_field_ic_miss(
         // inspect GC/object metadata, so mirror js_object_get_field_by_name's
         // buffer-first dispatch here.
         if crate::buffer::is_registered_buffer(obj as usize) {
+            let value = js_object_get_field_by_name(obj, key);
+            return f64::from_bits(value.bits());
+        }
+        if crate::typedarray::lookup_typed_array_kind(obj as usize).is_some() {
             let value = js_object_get_field_by_name(obj, key);
             return f64::from_bits(value.bits());
         }

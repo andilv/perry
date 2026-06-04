@@ -382,6 +382,8 @@ pub(super) fn compile_for_ios_widget(
         bundle_id: Some(app_bundle_id.to_string()),
         is_dylib: false,
         codegen_cache_stats: None,
+        link_cache_stats: None,
+        build_cache_stats: None,
     })
 }
 
@@ -633,6 +635,8 @@ pub(super) fn compile_for_watchos_widget(
         bundle_id: Some(app_bundle_id.to_string()),
         is_dylib: false,
         codegen_cache_stats: None,
+        link_cache_stats: None,
+        build_cache_stats: None,
     })
 }
 
@@ -966,6 +970,8 @@ pub(super) fn compile_for_android_widget(
         bundle_id: Some(app_package.to_string()),
         is_dylib: false,
         codegen_cache_stats: None,
+        link_cache_stats: None,
+        build_cache_stats: None,
     })
 }
 
@@ -1217,6 +1223,8 @@ pub(super) fn compile_for_wearos_tile(
         bundle_id: Some(app_package.to_string()),
         is_dylib: false,
         codegen_cache_stats: None,
+        link_cache_stats: None,
+        build_cache_stats: None,
     })
 }
 
@@ -1375,6 +1383,8 @@ pub(super) fn compile_for_web(
         bundle_id: None,
         is_dylib: false,
         codegen_cache_stats: None,
+        link_cache_stats: None,
+        build_cache_stats: None,
     })
 }
 
@@ -1523,5 +1533,7 @@ pub(super) fn compile_for_wasm(
         bundle_id: None,
         is_dylib: false,
         codegen_cache_stats: None,
+        link_cache_stats: None,
+        build_cache_stats: None,
     })
 }

@@ -219,7 +219,7 @@ bundled-mongodb = ["dep:mongodb", "dep:bson", "dep:futures-util", "async-runtime
 # bindings so the well-known flip (#466 Phase 4 step 2) can route them
 # to perry-ext-bcrypt / perry-ext-argon2 without taking the rest of
 # the crypto surface offline.
-crypto = ["dep:sha2", "dep:sha1", "dep:sha3", "dep:rsa-sha1", "dep:md-5", "dep:hex", "dep:hmac", "dep:aes", "dep:cbc", "dep:ecb", "dep:ctr", "dep:scrypt", "dep:pbkdf2", "dep:base64", "dep:x25519-dalek", "dep:ed25519-dalek", "dep:aes-gcm", "dep:ghash", "dep:aes-kw", "dep:hkdf", "dep:p256", "dep:x509-cert", "async-runtime", "ids", "bundled-bcrypt", "bundled-argon2", "bundled-jsonwebtoken", "bundled-ethers"]
+crypto = ["dep:sha2", "dep:sha1", "dep:sha3", "dep:sha3_010", "dep:sha3-utils", "dep:rsa-sha1", "dep:md-5", "dep:hex", "dep:hmac", "dep:aes", "dep:cbc", "dep:ecb", "dep:ctr", "dep:scrypt", "dep:pbkdf2", "dep:base64", "dep:x25519-dalek", "dep:x448", "dep:ed25519-dalek", "dep:ed448-goldilocks", "dep:aes-gcm", "dep:chacha20poly1305", "dep:ghash", "dep:aes-kw", "dep:hkdf", "dep:p256", "dep:p384", "dep:p521", "dep:x509-cert", "dep:ml-kem", "async-runtime", "ids", "bundled-bcrypt", "bundled-argon2", "bundled-jsonwebtoken", "bundled-ethers"]
 bundled-bcrypt = ["dep:bcrypt", "async-runtime"]
 bundled-argon2 = ["dep:argon2", "async-runtime"]
 bundled-jsonwebtoken = ["dep:jsonwebtoken", "dep:p256", "dep:rsa", "dep:spki"]
@@ -358,6 +358,8 @@ rusqlite = { version = "0.32.1", features = ["bundled", "column_decltype", "limi
 sha2 = { version = "0.11", optional = true }
 sha1 = { version = "0.11", optional = true }
 sha3 = { version = "0.11", optional = true }
+sha3_010 = { package = "sha3", version = "0.10", optional = true, default-features = false }
+sha3-utils = { version = "0.5", optional = true }
 rsa-sha1 = { package = "sha1", version = "0.10", optional = true }
 md-5 = { version = "0.11", optional = true }
 hex = { version = "0.4", optional = true }
@@ -365,6 +367,8 @@ hmac = { version = "0.13", optional = true }
 bcrypt = { version = "0.17", optional = true }
 jsonwebtoken = { workspace = true, optional = true }
 p256 = { version = "0.13", optional = true, default-features = false, features = ["pkcs8", "pem", "ecdsa", "ecdh"] }
+p384 = { version = "0.13", optional = true, default-features = false, features = ["pkcs8", "pem", "ecdsa", "ecdh"] }
+p521 = { version = "0.13", optional = true, default-features = false, features = ["pkcs8", "pem", "ecdsa", "ecdh"] }
 rsa = { version = "0.9", optional = true, default-features = false, features = ["pem", "pkcs5", "sha2"] }
 # #1367 node:crypto X509Certificate — DER/PEM cert parsing (RustCrypto, reuses
 # the der/spki/const-oid already in the lock).
@@ -379,14 +383,18 @@ pbkdf2 = { version = "0.13", features = ["hmac"], optional = true }
 argon2 = { version = "0.5", optional = true }
 base64 = { version = "0.22", optional = true }
 x25519-dalek = { version = "2.0", features = ["static_secrets"], optional = true }
+x448 = { version = "0.14.0-pre.9", features = ["static_secrets"], optional = true }
 ed25519-dalek = { version = "2.1", optional = true }
+ed448-goldilocks = { version = "0.14.0-pre.12", default-features = false, features = ["alloc", "signing"], optional = true }
 aes-gcm = { version = "0.10", optional = true }
+chacha20poly1305 = { version = "0.10", optional = true }
 ghash = { version = "0.5", optional = true }
 # AES-KW (RFC 3394) — used by `crypto.subtle.wrapKey` / `unwrapKey`
 # when the wrap algorithm is `{ name: 'AES-KW' }`. Gated under the
 # `crypto` umbrella so it tracks the rest of the symmetric surface.
 aes-kw = { version = "0.3.0", optional = true }
 hkdf = { version = "0.13", optional = true }
+ml-kem = { version = "0.3.2", features = ["pkcs8"], optional = true }
 
 # Compression
 flate2 = { version = "1.0", optional = true }
@@ -405,7 +413,7 @@ image = { version = "0.25", optional = true }
 scraper = { version = "0.27", optional = true }
 
 # Scheduler
-cron = { version = "0.12", optional = true }
+cron = { version = "0.16", optional = true }
 tokio-cron-scheduler = { version = "0.10", optional = true }
 
 # Rate limiting

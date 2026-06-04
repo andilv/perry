@@ -182,6 +182,13 @@ pub fn is_buffer_method_name(name: &str) -> bool {
             | "setUint32"
             | "setFloat32"
             | "setFloat64"
+            // #4365: DataView BigInt64/BigUint64 accessors (8-byte BigInt
+            // read/write). Route through `dispatch_buffer_method` like the
+            // other DataView numeric methods.
+            | "getBigInt64"
+            | "getBigUint64"
+            | "setBigInt64"
+            | "setBigUint64"
     )
 }
 
@@ -279,6 +286,10 @@ unsafe fn secret_to_crypto_key(addr: usize, algorithm_bits: f64) -> f64 {
         "AES-CTR" => 5,
         "HKDF" => 6,
         "PBKDF2" => 7,
+        "CHACHA20-POLY1305" => 15,
+        "KMAC128" => 23,
+        "KMAC256" => 24,
+        "AES-OCB" => 25,
         _ => return f64::from_bits(JSValue::undefined().bits()),
     };
     let hash_name = object_field_string_value(algorithm_bits, b"hash")

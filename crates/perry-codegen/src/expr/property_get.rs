@@ -27,11 +27,15 @@ use crate::native_value::{
 #[allow(unused_imports)]
 use crate::type_analysis::{
     compute_auto_captures, is_array_expr, is_bigint_expr, is_bool_expr, is_map_expr,
-    is_numeric_expr, is_set_expr, is_string_expr, is_url_search_params_expr, receiver_class_name,
+    is_numeric_expr, is_numeric_typed_array_class, is_set_expr, is_string_expr,
+    is_url_search_params_expr, receiver_class_name,
 };
 #[allow(unused_imports)]
 use crate::types::{DOUBLE, I1, I32, I64, I8, PTR};
 
+use super::property_get_names::{
+    is_headers_method_name, is_http_client_request_method_name, is_url_pattern_data_property,
+};
 #[allow(unused_imports)]
 use super::{
     buffer_alias_metadata_suffix, can_lower_expr_as_i32, emit_layout_note_slot_on_block,
@@ -49,37 +53,6 @@ use super::{
     variant_name, ChannelReduction, FlatConstInfo, FnCtx, I18nLowerCtx, TypedFeedbackContract,
     TypedFeedbackKind,
 };
-
-fn is_headers_method_name(name: &str) -> bool {
-    matches!(
-        name,
-        "append"
-            | "delete"
-            | "entries"
-            | "forEach"
-            | "get"
-            | "getSetCookie"
-            | "has"
-            | "keys"
-            | "set"
-            | "values"
-    )
-}
-
-fn is_url_pattern_data_property(name: &str) -> bool {
-    matches!(
-        name,
-        "protocol"
-            | "username"
-            | "password"
-            | "hostname"
-            | "port"
-            | "pathname"
-            | "search"
-            | "hash"
-            | "hasRegExpGroups"
-    )
-}
 
 fn class_has_computed_runtime_members(ctx: &FnCtx<'_>, class_name: &str) -> bool {
     ctx.classes
@@ -192,25 +165,20 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             Ok(nanbox_pointer_inline(blk, &arr_handle))
         }
 
-        // Buffer / Uint8Array `.length` — INLINE for locals with a
-        // pre-computed `buffer_data_slots` entry. Length lives 8 bytes
-        // before the data start (BufferHeader). The slot is populated
-        // by `Stmt::Let` for `const x = Buffer.alloc(N)` / `new
-        // Uint8Array(N)` whose binding doesn't escape — same locals
-        // that get the GEP-based fast path in `Expr::Uint8ArrayGet`.
-        // Marked `!invariant.load` so LICM can hoist the read out of
-        // tight inner loops like image_conv's FNV-1a hash:
-        //
-        //   for (let i = 0; i < dst.length; i++)
-        //
-        // Without this, `dst.length` falls through to the GC-type
-        // gate below — Buffer/Uint8Array have no GC header (they're
-        // `std::alloc`'d), so `gc_type` reads garbage, `has_length`
-        // is false, and every iteration calls `js_value_length_f64`
-        // (function call into the side-table registry). v0.5.83's
-        // `is_array || is_string` guard intentionally routes Buffers
-        // through that slow path for safety, but the buffer-data-slot
-        // path proves the receiver shape at compile time.
+        // TypedArray `.length` can be shadowed by an own property, so use
+        // the runtime length helper before the Buffer/Uint8Array inline path.
+        Expr::PropertyGet { object, property }
+            if property == "length"
+                && receiver_class_name(ctx, object)
+                    .as_deref()
+                    .is_some_and(is_numeric_typed_array_class) =>
+        {
+            let recv_box = lower_expr(ctx, object)?;
+            Ok(ctx
+                .block()
+                .call(DOUBLE, "js_value_length_f64", &[(DOUBLE, &recv_box)]))
+        }
+
         Expr::PropertyGet { object, property }
             if property == "length"
                 && matches!(object.as_ref(), Expr::LocalGet(id)
@@ -452,23 +420,17 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             let i32_v = blk.call(I32, "js_url_search_params_size", &[(I64, &recv_handle)]);
             Ok(blk.sitofp(I32, &i32_v, DOUBLE))
         }
-
-        // `arr[i] = v` — typed-Number array element write.
-        //
-        // INLINE FAST PATH:
-        //
-        //   load length from arr_ptr+0
-        //   if idx < length: inline store, done
-        //   else if idx < capacity: inline store + bump length, done
-        //   else: call js_array_set_f64_extend (slow realloc path)
-        //
-        // The ArrayHeader layout is `{ length: u32, capacity: u32, ... }`
-        // (8 bytes), followed by `[f64; N]` elements at offset 8.
-        //
-        // For non-LocalGet receivers we still use bounds-checked
-        // `js_array_set_f64` (no return value, no realloc) since there's
-        // no local to write a possibly-realloc'd pointer back to.
         Expr::PropertyGet { object, property } => {
+            if property == "prototype"
+                && matches!(object.as_ref(), Expr::FuncRef(_) | Expr::Closure { .. })
+            {
+                let func_value = lower_expr(ctx, object)?;
+                return Ok(ctx.block().call(
+                    DOUBLE,
+                    "js_function_prototype_value_for_read",
+                    &[(DOUBLE, &func_value)],
+                ));
+            }
             if let Some((builtin_name, method_name)) =
                 builtin_prototype_method_read(object, property)
             {
@@ -1293,6 +1255,20 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     return Ok(blk.call(
                         DOUBLE,
                         "js_headers_method_value",
+                        &[(DOUBLE, &recv_box), (I64, &bytes_i64), (I64, &len_str)],
+                    ));
+                }
+                if class_name == "ClientRequest" && is_http_client_request_method_name(property) {
+                    let recv_box = lower_expr(ctx, object)?;
+                    let key_idx = ctx.strings.intern(property);
+                    let entry = ctx.strings.entry(key_idx);
+                    let bytes_global = format!("@{}", entry.bytes_global);
+                    let len_str = entry.byte_len.to_string();
+                    let blk = ctx.block();
+                    let bytes_i64 = blk.ptrtoint(&bytes_global, I64);
+                    return Ok(blk.call(
+                        DOUBLE,
+                        "js_class_method_bind",
                         &[(DOUBLE, &recv_box), (I64, &bytes_i64), (I64, &len_str)],
                     ));
                 }

@@ -54,6 +54,9 @@ unsafe fn describe_value_for_type_error(value: f64) -> String {
 /// `Object.create` accepts as a descriptor / properties bag? (#2817)
 /// Functions/closures count as objects too.
 pub(crate) unsafe fn value_is_object_like(value: f64) -> bool {
+    if crate::typedarray_props::typed_array_addr_from_value(value).is_some() {
+        return true;
+    }
     let jv = crate::value::JSValue::from_bits(value.to_bits());
     if !jv.is_pointer() {
         // Module-level raw-I64 object pointers (top16 == 0) — accept if it
@@ -83,6 +86,36 @@ unsafe fn value_is_callable(value: f64) -> bool {
     }
     // Class refs (INT32-tagged, top16 == 0x7FFE) are callable constructors.
     (value.to_bits() >> 48) == 0x7FFE
+}
+
+unsafe fn registered_buffer_index_own_property_present(
+    obj_value: f64,
+    key_str: *const crate::StringHeader,
+) -> Option<bool> {
+    let obj_js = crate::JSValue::from_bits(obj_value.to_bits());
+    let raw_buffer_addr = if obj_js.is_pointer() {
+        obj_js.as_pointer::<u8>() as usize
+    } else {
+        let bits = obj_value.to_bits();
+        if bits != 0 && bits <= 0x0000_FFFF_FFFF_FFFF && bits > 0x10000 {
+            bits as usize
+        } else {
+            0
+        }
+    };
+    if raw_buffer_addr == 0 || !crate::buffer::is_registered_buffer(raw_buffer_addr) {
+        return None;
+    }
+
+    // Only answer for canonical *index* keys here. Non-index keys (e.g.
+    // `length` or user-defined expandos on a typed array) are owned by the
+    // `typedarray_props` registry — returning `Some(false)` for them would
+    // shadow that check (`typed_array_has_own_property`) and wrongly report
+    // a defined own property as absent. Fall through with `None` instead.
+    let idx = super::has_own_helpers::str_from_string_header(key_str)
+        .and_then(super::canonical_array_index)?;
+    let buf = raw_buffer_addr as *const crate::buffer::BufferHeader;
+    Some(idx < (*buf).length as u32)
 }
 
 /// Validate a property descriptor object per ES `ToPropertyDescriptor`
@@ -509,6 +542,10 @@ pub extern "C" fn js_object_has_own(obj_value: f64, key_value: f64) -> f64 {
             return f64::from_bits(if present { TAG_TRUE } else { TAG_FALSE });
         }
 
+        if let Some(present) = registered_buffer_index_own_property_present(obj_value, key_str) {
+            return f64::from_bits(if present { TAG_TRUE } else { TAG_FALSE });
+        }
+
         if let Some(class_id) = super::class_ref_id(obj_value) {
             let present = super::has_own_helpers::str_from_string_header(key_str)
                 .map(|key| {
@@ -534,16 +571,38 @@ pub extern "C" fn js_object_has_own(obj_value: f64, key_value: f64) -> f64 {
             return f64::from_bits(if present { TAG_TRUE } else { TAG_FALSE });
         }
 
+        if let Some(addr) = crate::typedarray_props::typed_array_addr_from_value(obj_value) {
+            let present = crate::typedarray_props::typed_array_has_own_property(
+                addr as *const crate::typedarray::TypedArrayHeader,
+                key_str,
+            );
+            return f64::from_bits(if present { TAG_TRUE } else { TAG_FALSE });
+        }
+
         // #3655: functions/closures carry built-in own `name`/`length`
         // (and `prototype` for constructors) plus any user-attached props.
         // Route them here instead of through `extract_obj_ptr`/`own_key_present`,
         // which would read `keys_array` off a closure (out of bounds).
         if obj_js.is_pointer() {
             let ptr = obj_js.as_pointer::<u8>() as usize;
+            if crate::buffer::is_registered_buffer(ptr) {
+                let present = super::has_own_helpers::buffer_own_key_present(
+                    ptr as *const crate::buffer::BufferHeader,
+                    key_str,
+                );
+                return f64::from_bits(if present { TAG_TRUE } else { TAG_FALSE });
+            }
             if crate::closure::is_closure_ptr(ptr) {
                 let present = super::has_own_helpers::str_from_string_header(key_str)
                     .map(|k| super::has_own_helpers::closure_own_key_present(ptr, k))
                     .unwrap_or(false);
+                return f64::from_bits(if present { TAG_TRUE } else { TAG_FALSE });
+            }
+            if crate::typedarray::lookup_typed_array_kind(ptr).is_some() {
+                let present = crate::typedarray_props::typed_array_has_own_property(
+                    ptr as *const crate::typedarray::TypedArrayHeader,
+                    key_str,
+                );
                 return f64::from_bits(if present { TAG_TRUE } else { TAG_FALSE });
             }
             if ptr >= crate::gc::GC_HEADER_SIZE + 0x1000
@@ -643,6 +702,14 @@ pub extern "C" fn js_object_property_is_enumerable(obj_value: f64, key_value: f6
             return f64::from_bits(if is_length { TAG_FALSE } else { TAG_TRUE });
         }
 
+        if let Some(addr) = crate::typedarray_props::typed_array_addr_from_value(obj_value) {
+            let enumerable = crate::typedarray_props::typed_array_property_is_enumerable(
+                addr as *const crate::typedarray::TypedArrayHeader,
+                key_str,
+            );
+            return f64::from_bits(if enumerable { TAG_TRUE } else { TAG_FALSE });
+        }
+
         // #3655: functions/closures. Built-in `name`/`length`/`prototype` are
         // non-enumerable; user-attached props default to enumerable.
         if obj_jv.is_pointer() {
@@ -660,6 +727,13 @@ pub extern "C" fn js_object_property_is_enumerable(obj_value: f64, key_value: f6
                 let enumerable = super::get_property_attrs(ptr, key_name)
                     .map(|attrs| attrs.enumerable())
                     .unwrap_or(true);
+                return f64::from_bits(if enumerable { TAG_TRUE } else { TAG_FALSE });
+            }
+            if crate::typedarray::lookup_typed_array_kind(ptr).is_some() {
+                let enumerable = crate::typedarray_props::typed_array_property_is_enumerable(
+                    ptr as *const crate::typedarray::TypedArrayHeader,
+                    key_str,
+                );
                 return f64::from_bits(if enumerable { TAG_TRUE } else { TAG_FALSE });
             }
         }
@@ -852,6 +926,17 @@ pub extern "C" fn js_object_define_property(
         }
         validate_property_descriptor(descriptor_value);
 
+        // TypedArrays are Integer-Indexed exotic objects: a canonical numeric
+        // index key bypasses ordinary define entirely (validate the index, then
+        // either write the element or reject with a TypeError).
+        match super::typed_array_define_own_property(obj_value, key_value, descriptor_value) {
+            super::TypedArrayDefineOutcome::Defined => return obj_value,
+            super::TypedArrayDefineOutcome::Rejected => {
+                throw_object_type_error(b"Cannot redefine property")
+            }
+            super::TypedArrayDefineOutcome::NotTypedArray => {}
+        }
+
         // #2159: when the receiver is a class-ref (`Class.prototype` evaluates
         // back to the class itself in Perry — see `class_ref_id` /
         // `js_object_get_own_property_descriptor`'s class-ref arm), route the
@@ -980,6 +1065,30 @@ pub extern "C" fn js_object_define_property(
             return obj_value;
         }
 
+        if let Some(addr) = crate::typedarray_props::typed_array_addr_from_value(obj_value) {
+            let key_str = crate::builtins::js_string_coerce(key_value);
+            if key_str.is_null() {
+                return obj_value;
+            }
+            let key_rust: Option<String> = {
+                let name_ptr =
+                    (key_str as *const u8).add(std::mem::size_of::<crate::StringHeader>());
+                let name_len = (*key_str).byte_len as usize;
+                let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
+                std::str::from_utf8(name_bytes).ok().map(|s| s.to_string())
+            };
+            if let Some(ref key_name) = key_rust {
+                return crate::typedarray_props::typed_array_define_own_property(
+                    obj_value,
+                    addr as *mut crate::typedarray::TypedArrayHeader,
+                    key_str,
+                    key_name,
+                    descriptor_value,
+                );
+            }
+            return obj_value;
+        }
+
         let obj = extract_obj_ptr(obj_value);
         if obj.is_null() {
             return obj_value;
@@ -1071,6 +1180,18 @@ pub extern "C" fn js_object_define_property(
             let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
             std::str::from_utf8(name_bytes).ok().map(|s| s.to_string())
         };
+        if crate::typedarray::lookup_typed_array_kind(obj as usize).is_some() {
+            if let Some(ref key_name) = key_rust {
+                return crate::typedarray_props::typed_array_define_own_property(
+                    obj_value,
+                    obj as *mut crate::typedarray::TypedArrayHeader,
+                    key_str,
+                    key_name,
+                    descriptor_value,
+                );
+            }
+            return obj_value;
+        }
         if let Some(result) = super::define_array_property(
             obj,
             obj_value,

@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 use perry_hir::{Module as HirModule, ModuleKind};
+use serde::{Deserialize, Serialize};
 
 use crate::OutputFormat;
 
@@ -27,6 +28,30 @@ pub struct CompileResult {
     /// `None` when disabled (`--no-cache`, `PERRY_NO_CACHE=1`, or bitcode-link mode).
     /// Tuple is `(hits, misses, stores, store_errors)`.
     pub codegen_cache_stats: Option<(usize, usize, usize, usize)>,
+    /// Native executable link-cache status for this build. `None` for
+    /// non-executable outputs and non-native targets that do not use the
+    /// executable linker path.
+    #[allow(dead_code)]
+    pub link_cache_stats: Option<LinkCacheStats>,
+    /// Native executable build-level no-op status. `Some` for native executable
+    /// compile attempts; `None` for targets that bypass the native linker path.
+    #[allow(dead_code)]
+    pub build_cache_stats: Option<BuildCacheStats>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkCacheStats {
+    pub linked: bool,
+    pub skipped: bool,
+    pub object_fingerprints_used: usize,
+    pub object_files_hashed: usize,
+    pub external_inputs_hashed: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildCacheStats {
+    pub hit: bool,
+    pub reason: String,
 }
 
 // Helpers moved to sub-modules:
@@ -402,6 +427,10 @@ pub struct CompilationContext {
     pub needs_stdlib: bool,
     /// Project root (where we start looking for node_modules)
     pub project_root: PathBuf,
+    /// Root for `.perry-cache` artifacts. Usually the package/config root
+    /// or current working directory; kept separate from `project_root` so
+    /// legacy module-prefix behavior does not force caches under `src/`.
+    pub cache_root: PathBuf,
     /// External native libraries discovered from package dependencies
     pub native_libraries: Vec<NativeLibraryManifest>,
     /// Package aliases: maps npm package name → replacement package name (from perry.packageAliases)
@@ -690,6 +719,7 @@ impl CompilationContext {
             harmonyos_index_ets: None,
             needs_plugins: false,
             needs_stdlib: false,
+            cache_root: project_root.clone(),
             project_root,
             native_libraries: Vec::new(),
             package_aliases: HashMap::new(),

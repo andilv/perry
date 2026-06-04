@@ -30,6 +30,7 @@ mod class_registry;
 mod collection_proto_thunks;
 mod data_view_registry;
 mod dataview_proto_thunks;
+mod date_proto_thunks;
 mod delete_rest;
 mod descriptors;
 mod field_get_set;
@@ -58,6 +59,7 @@ mod property_key;
 pub(crate) mod prototype_chain;
 mod prototype_helpers;
 mod reflect_support;
+mod typed_array_define;
 mod typed_array_proto_thunks;
 mod util_types;
 mod websocket_global;
@@ -101,6 +103,10 @@ pub(crate) use primitive_proto_thunks::primitive_proto_method_value;
 pub use property_key::*;
 pub(crate) use prototype_helpers::*;
 pub(crate) use reflect_support::*;
+pub(crate) use typed_array_define::{
+    typed_array_define_own_property, typed_array_own_index, TypedArrayDefineOutcome,
+    TypedArrayOwnIndex,
+};
 pub use util_types::*;
 pub use with_env::*;
 
@@ -1912,6 +1918,21 @@ pub unsafe extern "C" fn js_object_to_string(value: f64) -> f64 {
         let bytes = formatted.as_bytes();
         let str_ptr = crate::string::js_string_from_bytes(bytes.as_ptr(), bytes.len() as u32);
         return f64::from_bits(STRING_TAG | (str_ptr as u64 & POINTER_MASK));
+    }
+    if (raw_addr >= 0x10000 && crate::closure::is_closure_ptr(raw_addr))
+        || crate::object::is_class_object_ptr(raw_addr as *const u8)
+    {
+        let bytes = b"[object Function]";
+        let str_ptr = crate::string::js_string_from_bytes(bytes.as_ptr(), bytes.len() as u32);
+        return f64::from_bits(STRING_TAG | (str_ptr as u64 & POINTER_MASK));
+    }
+    if jsv.is_int32() {
+        let class_id = (bits & 0xFFFF_FFFF) as u32;
+        if crate::object::is_class_id_registered(class_id) {
+            let bytes = b"[object Function]";
+            let str_ptr = crate::string::js_string_from_bytes(bytes.as_ptr(), bytes.len() as u32);
+            return f64::from_bits(STRING_TAG | (str_ptr as u64 & POINTER_MASK));
+        }
     }
     if jsv.is_int32() || jsv.is_number() {
         let bytes = b"[object Number]";

@@ -11,20 +11,22 @@
 //! logic changes.
 
 pub use super::class_handles::{
-    event_emitter_async_resource_handle_probe, event_emitter_handle_probe, event_emitter_on,
+    event_emitter_async_resource_handle_probe, event_emitter_get_domain,
+    event_emitter_handle_probe, event_emitter_on, event_emitter_set_domain,
     fetch_handle_kind_probe, handle_method_dispatch, handle_own_property_names_dispatch,
     handle_property_dispatch, handle_property_set_dispatch, handle_prototype_dispatch,
-    js_register_event_emitter_async_resource_handle_probe, js_register_event_emitter_handle_probe,
-    js_register_event_emitter_on, js_register_fetch_handle_kind_probe,
+    js_register_event_emitter_async_resource_handle_probe, js_register_event_emitter_get_domain,
+    js_register_event_emitter_handle_probe, js_register_event_emitter_on,
+    js_register_event_emitter_set_domain, js_register_fetch_handle_kind_probe,
     js_register_handle_method_dispatch, js_register_handle_own_property_names_dispatch,
     js_register_handle_property_dispatch, js_register_handle_property_set_dispatch,
     js_register_handle_prototype_dispatch, js_register_net_socket_handle_probe,
     js_register_stream_handle_kind_probe, js_register_stream_handle_probe, net_socket_handle_probe,
     stream_handle_kind_probe, stream_handle_probe, EventEmitterAsyncResourceHandleProbeFn,
-    EventEmitterHandleProbeFn, EventEmitterOnFn, FetchHandleKindProbeFn, HandleMethodDispatchFn,
-    HandleOwnPropertyNamesDispatchFn, HandlePropertyDispatchFn, HandlePropertySetDispatchFn,
-    HandlePrototypeDispatchFn, NetSocketHandleProbeFn, StreamHandleKindProbeFn,
-    StreamHandleProbeFn,
+    EventEmitterGetDomainFn, EventEmitterHandleProbeFn, EventEmitterOnFn, EventEmitterSetDomainFn,
+    FetchHandleKindProbeFn, HandleMethodDispatchFn, HandleOwnPropertyNamesDispatchFn,
+    HandlePropertyDispatchFn, HandlePropertySetDispatchFn, HandlePrototypeDispatchFn,
+    NetSocketHandleProbeFn, StreamHandleKindProbeFn, StreamHandleProbeFn,
 };
 use super::*;
 
@@ -418,6 +420,31 @@ pub(crate) unsafe fn resolve_proto_chain_field_with_receiver(
     resolve_proto_chain_field_inner(class_id, key, Some(receiver))
 }
 
+unsafe fn inherited_proto_accessor_value(
+    proto_obj: *mut ObjectHeader,
+    key: *const crate::StringHeader,
+    receiver: f64,
+) -> Option<JSValue> {
+    if key.is_null() || !ACCESSORS_IN_USE.with(|c| c.get()) {
+        return None;
+    }
+    let key_ptr = (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
+    let key_len = (*key).byte_len as usize;
+    let name = std::str::from_utf8(std::slice::from_raw_parts(key_ptr, key_len)).ok()?;
+    let acc = get_accessor_descriptor(proto_obj as usize, name)?;
+    if acc.get == 0 {
+        return Some(JSValue::undefined());
+    }
+    let closure = (acc.get & crate::value::POINTER_MASK) as *const crate::closure::ClosureHeader;
+    if closure.is_null() {
+        return Some(JSValue::undefined());
+    }
+    let previous_this = js_implicit_this_set(receiver);
+    let value = crate::closure::js_closure_call0(closure);
+    js_implicit_this_set(previous_this);
+    Some(JSValue::from_bits(value.to_bits()))
+}
+
 unsafe fn resolve_proto_chain_field_inner(
     class_id: u32,
     key: *const crate::StringHeader,
@@ -428,6 +455,11 @@ unsafe fn resolve_proto_chain_field_inner(
     while depth < 32 {
         let proto_obj = class_prototype_object(cid);
         if !proto_obj.is_null() {
+            if let Some(receiver) = receiver {
+                if let Some(value) = inherited_proto_accessor_value(proto_obj, key, receiver) {
+                    return Some(value);
+                }
+            }
             let field_val = if let Some(receiver) = receiver {
                 let previous_this = js_implicit_this_set(receiver);
                 let value = js_object_get_field_by_name(proto_obj as *const _, key);
@@ -672,6 +704,9 @@ pub(super) fn identify_global_builtin_constructor(func_value: f64) -> Option<&'s
     if ptr.is_null() {
         return None;
     }
+    if (ptr as usize) % std::mem::align_of::<crate::closure::ClosureHeader>() != 0 {
+        return None;
+    }
     if !is_valid_obj_ptr(ptr as *const u8) {
         return None;
     }
@@ -699,12 +734,20 @@ pub(super) fn identify_global_builtin_constructor(func_value: f64) -> Option<&'s
             || func_ptr == global_this_object_thunk as *const u8 as usize
             || func_ptr == global_this_date_thunk as *const u8 as usize
             || func_ptr == global_this_blob_thunk as *const u8 as usize
+            || func_ptr == global_this_file_thunk as *const u8 as usize
             || func_ptr == global_this_headers_thunk as *const u8 as usize
             || func_ptr == global_this_request_thunk as *const u8 as usize
             || func_ptr == global_this_response_thunk as *const u8 as usize
             || func_ptr == global_this_string_thunk as *const u8 as usize
             || func_ptr == global_this_number_thunk as *const u8 as usize
             || func_ptr == global_this_boolean_thunk as *const u8 as usize
+            || func_ptr == error_constructor_call_thunk as *const u8 as usize
+            || func_ptr == type_error_constructor_call_thunk as *const u8 as usize
+            || func_ptr == range_error_constructor_call_thunk as *const u8 as usize
+            || func_ptr == reference_error_constructor_call_thunk as *const u8 as usize
+            || func_ptr == syntax_error_constructor_call_thunk as *const u8 as usize
+            || func_ptr == eval_error_constructor_call_thunk as *const u8 as usize
+            || func_ptr == uri_error_constructor_call_thunk as *const u8 as usize
             || func_ptr == webcrypto_illegal_constructor_thunk as *const u8 as usize
             || func_ptr
                 == crate::messaging::js_message_channel_constructor_call_error as *const u8
@@ -1399,6 +1442,26 @@ pub unsafe extern "C" fn js_new_function_construct(
                     .unwrap_or(f64::from_bits(crate::value::TAG_UNDEFINED));
                 return crate::object::global_this_blob_thunk(std::ptr::null(), parts, options);
             }
+            "File" => {
+                let parts = args
+                    .first()
+                    .copied()
+                    .unwrap_or(f64::from_bits(crate::value::TAG_UNDEFINED));
+                let name = args
+                    .get(1)
+                    .copied()
+                    .unwrap_or(f64::from_bits(crate::value::TAG_UNDEFINED));
+                let options = args
+                    .get(2)
+                    .copied()
+                    .unwrap_or(f64::from_bits(crate::value::TAG_UNDEFINED));
+                return crate::object::global_this_file_thunk(
+                    std::ptr::null(),
+                    parts,
+                    name,
+                    options,
+                );
+            }
             "Headers" => {
                 let init = args
                     .first()
@@ -1867,6 +1930,9 @@ fn is_callable_function_value(value: f64) -> bool {
     if ptr.is_null() {
         return false;
     }
+    if (ptr as usize) % std::mem::align_of::<crate::closure::ClosureHeader>() != 0 {
+        return false;
+    }
     if !is_valid_obj_ptr(ptr as *const u8) {
         return false;
     }
@@ -1880,6 +1946,9 @@ fn is_arrow_function_value(value: f64) -> bool {
         return false;
     }
     let ptr = jv.as_pointer() as *const crate::closure::ClosureHeader;
+    if (ptr as usize) % std::mem::align_of::<crate::closure::ClosureHeader>() != 0 {
+        return false;
+    }
     if ptr.is_null() || !is_valid_obj_ptr(ptr as *const u8) {
         return false;
     }
@@ -1904,6 +1973,37 @@ pub(crate) fn ordinary_function_prototype_value_for_read(func_value: f64) -> Opt
         return None;
     }
     Some(crate::value::js_nanbox_pointer(proto as i64))
+}
+
+#[no_mangle]
+pub extern "C" fn js_function_prototype_value_for_read(func_value: f64) -> f64 {
+    let undef = f64::from_bits(crate::value::TAG_UNDEFINED);
+    let jv = crate::value::JSValue::from_bits(func_value.to_bits());
+    if !jv.is_pointer() {
+        return undef;
+    }
+    let ptr = jv.as_pointer() as *const crate::closure::ClosureHeader;
+    if ptr.is_null() || !is_valid_obj_ptr(ptr as *const u8) {
+        return undef;
+    }
+    unsafe {
+        if (*ptr).type_tag != crate::closure::CLOSURE_MAGIC {
+            return undef;
+        }
+    }
+
+    let closure_addr = ptr as usize;
+    if crate::closure::closure_is_key_deleted(closure_addr, "prototype") {
+        return undef;
+    }
+    let dynamic = crate::closure::closure_get_dynamic_prop(closure_addr, "prototype");
+    if dynamic.to_bits() != crate::value::TAG_UNDEFINED {
+        return dynamic;
+    }
+    if let Some(proto) = generator_function_prototype_of(closure_addr) {
+        return proto;
+    }
+    ordinary_function_prototype_value_for_read(func_value).unwrap_or(undef)
 }
 
 /// Lookup helper: returns the registered prototype-method value for

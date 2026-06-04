@@ -394,6 +394,12 @@ struct ProcessFinalizationEntry {
     kind: ProcessFinalizationKind,
 }
 
+#[derive(Clone)]
+struct ProcessPermissionDrop {
+    scope: String,
+    reference: Option<String>,
+}
+
 thread_local! {
     static PROCESS_FINALIZATION_REGISTRY: RefCell<Vec<ProcessFinalizationEntry>> =
         RefCell::new(Vec::new());
@@ -407,6 +413,8 @@ thread_local! {
     static MODULE_LOADER_HOOKS: RefCell<Vec<ModuleLoaderHookEntry>> =
         const { RefCell::new(Vec::new()) };
     static MODULE_LOADER_HOOK_NEXT_ID: Cell<u64> = const { Cell::new(1) };
+    static PROCESS_PERMISSION_DROPS: RefCell<Vec<ProcessPermissionDrop>> =
+        const { RefCell::new(Vec::new()) };
     static MODULE_LOADER_NEXT_RESOLVE: Cell<*const crate::closure::ClosureHeader> =
         const { Cell::new(std::ptr::null()) };
     static MODULE_LOADER_NEXT_LOAD: Cell<*const crate::closure::ClosureHeader> =
@@ -920,7 +928,40 @@ fn permission_path_allowed(reference: &str, allowed: &[String]) -> bool {
     false
 }
 
+fn process_permission_is_dropped(scope: &str, reference: Option<&str>) -> bool {
+    PROCESS_PERMISSION_DROPS.with(|drops| {
+        drops.borrow().iter().any(|drop| {
+            if drop.scope != scope {
+                return false;
+            }
+            match (&drop.reference, reference) {
+                (None, _) => true,
+                (Some(drop_reference), Some(reference)) => {
+                    permission_path_allowed(reference, std::slice::from_ref(drop_reference))
+                }
+                _ => false,
+            }
+        })
+    })
+}
+
+fn process_permission_drop(scope: &str, reference: Option<String>) {
+    PROCESS_PERMISSION_DROPS.with(|drops| {
+        let mut drops = drops.borrow_mut();
+        if reference.is_none() {
+            drops.retain(|drop| drop.scope != scope);
+        }
+        drops.push(ProcessPermissionDrop {
+            scope: scope.to_string(),
+            reference,
+        });
+    });
+}
+
 fn process_permission_scope_allowed(scope: &str, reference: Option<&str>) -> bool {
+    if process_permission_is_dropped(scope, reference) {
+        return false;
+    }
     match scope {
         "fs.read" => {
             let allowed = process_permission_flag_values("--allow-fs-read");
@@ -974,6 +1015,26 @@ extern "C" fn process_permission_has_thunk(
     ))
 }
 
+extern "C" fn process_permission_drop_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    scope_value: f64,
+    reference_value: f64,
+) -> f64 {
+    let Some(scope) = module_value_to_string(scope_value) else {
+        throw_permission_arg_type("scope", scope_value);
+    };
+    let reference_js = JSValue::from_bits(reference_value.to_bits());
+    let reference = if reference_js.is_undefined() || reference_js.is_null() {
+        None
+    } else if let Some(reference) = module_value_to_string_or_buffer(reference_value) {
+        Some(reference)
+    } else {
+        throw_permission_arg_type("reference", reference_value);
+    };
+    process_permission_drop(&scope, reference);
+    undefined_value()
+}
+
 fn process_permission_value() -> Option<f64> {
     if !process_permission_enabled() {
         return None;
@@ -988,11 +1049,16 @@ fn process_permission_value() -> Option<f64> {
         return Some(cached);
     }
 
-    let obj = crate::object::js_object_alloc(0, 1);
+    let obj = crate::object::js_object_alloc(0, 2);
     module_set_field(
         obj,
         "has",
         module_function2("has", process_permission_has_thunk, 2),
+    );
+    module_set_field(
+        obj,
+        "drop",
+        module_function2("drop", process_permission_drop_thunk, 2),
     );
     let value = module_object_value(obj);
     CACHED_PERMISSION.with(|c| c.set(value));
@@ -4714,97 +4780,43 @@ fn module_contains_enum(source: &str) -> bool {
     (0..bytes.len()).any(|index| module_word_at(bytes, index, b"enum"))
 }
 
-fn module_transform_enums(source: &str) -> String {
-    let bytes = source.as_bytes();
-    let mut out = String::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        if !module_word_at(bytes, index, b"enum") {
-            out.push(bytes[index] as char);
-            index += 1;
-            continue;
-        }
-
-        let enum_start = index;
-        let mut cursor = module_skip_ws(bytes, index + "enum".len());
-        let name_start = cursor;
-        while cursor < bytes.len() && module_is_ident_byte(bytes[cursor]) {
-            cursor += 1;
-        }
-        if name_start == cursor {
-            out.push(bytes[index] as char);
-            index += 1;
-            continue;
-        }
-        let name = &source[name_start..cursor];
-        cursor = module_skip_ws(bytes, cursor);
-        if cursor >= bytes.len() || bytes[cursor] != b'{' {
-            out.push_str(&source[enum_start..cursor.min(source.len())]);
-            index = cursor;
-            continue;
-        }
-        let body_start = cursor + 1;
-        let mut depth = 1usize;
-        cursor += 1;
-        while cursor < bytes.len() {
-            match bytes[cursor] {
-                b'{' => depth += 1,
-                b'}' => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                _ => {}
-            }
-            cursor += 1;
-        }
-        if cursor >= bytes.len() {
-            out.push_str(&source[enum_start..]);
-            break;
-        }
-        let body = &source[body_start..cursor];
-        let mut next_value = 0i32;
-        out.push_str("var ");
-        out.push_str(name);
-        out.push_str(";\n(function (");
-        out.push_str(name);
-        out.push_str(") {\n");
-        for raw_member in body.split(',') {
-            let member = raw_member.trim();
-            if member.is_empty() {
-                continue;
-            }
-            let (member_name, value) = if let Some((left, right)) = member.split_once('=') {
-                let parsed = right.trim().parse::<i32>().unwrap_or(next_value);
-                (left.trim(), parsed)
-            } else {
-                (member, next_value)
-            };
-            if member_name.is_empty() {
-                continue;
-            }
-            out.push_str("  ");
-            out.push_str(name);
-            out.push('[');
-            out.push_str(name);
-            out.push_str("[\"");
-            out.push_str(member_name);
-            out.push_str("\"] = ");
-            out.push_str(&value.to_string());
-            out.push_str("] = \"");
-            out.push_str(member_name);
-            out.push_str("\";\n");
-            next_value = value.saturating_add(1);
-        }
-        out.push_str("})(");
-        out.push_str(name);
-        out.push_str(" || (");
-        out.push_str(name);
-        out.push_str(" = {}));");
-        index = cursor + 1;
+fn module_invalid_option_received(value: f64) -> String {
+    let jv = JSValue::from_bits(value.to_bits());
+    if jv.is_undefined() {
+        return "undefined".to_string();
     }
-    out
+    if jv.is_null() {
+        return "null".to_string();
+    }
+    if jv.is_bool() {
+        return jv.as_bool().to_string();
+    }
+    if let Some(value) = module_value_to_string(value) {
+        return format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"));
+    }
+    if jv.is_int32() {
+        return jv.as_int32().to_string();
+    }
+    if jv.is_number() {
+        let number = jv.as_number();
+        if number.fract() == 0.0 {
+            return format!("{number:.0}");
+        }
+        return number.to_string();
+    }
+    if jv.is_pointer() {
+        let ptr = jv.as_pointer::<u8>();
+        if !ptr.is_null() && (ptr as usize) >= crate::gc::GC_HEADER_SIZE + 0x1000 {
+            let gc_header =
+                unsafe { &*(ptr.sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader) };
+            return if gc_header.obj_type == crate::gc::GC_TYPE_ARRAY {
+                "[]".to_string()
+            } else {
+                "{}".to_string()
+            };
+        }
+    }
+    crate::fs::validate::describe_received(value)
 }
 
 #[no_mangle]
@@ -4817,49 +4829,38 @@ pub extern "C" fn js_module_strip_typescript_types(code: f64, options: f64) -> f
         crate::fs::validate::throw_type_error_with_code(&message, "ERR_INVALID_ARG_TYPE");
     };
 
-    let mut mode = "strip".to_string();
-    let mut source_map = false;
     if let Some(options_obj) = module_required_options_object(options, "options") {
         let mode_value = module_get_named_field(options_obj, "mode");
         if !JSValue::from_bits(mode_value.to_bits()).is_undefined() {
-            let Some(mode_string) = module_value_to_string(mode_value) else {
+            let mode_string = module_value_to_string(mode_value);
+            if mode_string.as_deref() != Some("strip") {
                 let message = format!(
-                    "The property 'options.mode' must be one of: 'strip', 'transform'. Received {}",
-                    crate::fs::validate::describe_received(mode_value)
-                );
-                crate::fs::validate::throw_type_error_with_code(&message, "ERR_INVALID_ARG_VALUE");
-            };
-            if mode_string != "strip" && mode_string != "transform" {
-                let message = format!(
-                    "The property 'options.mode' must be one of: 'strip', 'transform'. Received '{}'",
-                    mode_string
+                    "The property 'options.mode' must be one of: 'strip'. Received {}",
+                    module_invalid_option_received(mode_value)
                 );
                 crate::fs::validate::throw_type_error_with_code(&message, "ERR_INVALID_ARG_VALUE");
             }
-            mode = mode_string;
         }
 
         let source_map_value = module_get_named_field(options_obj, "sourceMap");
-        if let Some(value) = module_validate_bool_property(source_map_value, "sourceMap") {
-            source_map = value;
+        let source_map = JSValue::from_bits(source_map_value.to_bits());
+        if !source_map.is_undefined() && !(source_map.is_bool() && !source_map.as_bool()) {
+            let message = format!(
+                "The property 'options.sourceMap' must be one of: false, undefined. Received {}",
+                module_invalid_option_received(source_map_value)
+            );
+            crate::fs::validate::throw_type_error_with_code(&message, "ERR_INVALID_ARG_VALUE");
         }
     }
 
-    if mode == "strip" && module_contains_enum(&source) {
+    if module_contains_enum(&source) {
         module_throw_syntax_error_with_code(
             "TypeScript enum is not supported in strip-only mode",
             "ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX",
         );
     }
 
-    let mut output = if mode == "transform" {
-        module_strip_type_syntax(&module_transform_enums(&source))
-    } else {
-        module_strip_type_syntax(&source)
-    };
-    if mode == "transform" && source_map {
-        output.push_str("\n//# sourceMappingURL=data:application/json;base64,e30=");
-    }
+    let output = module_strip_type_syntax(&source);
     module_string_value(&output)
 }
 

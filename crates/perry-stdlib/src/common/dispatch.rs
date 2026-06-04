@@ -229,6 +229,11 @@ pub unsafe extern "C" fn js_handle_method_dispatch(
     }
 
     #[cfg(feature = "http-client")]
+    if let Some(value) = unsafe { crate::http::dispatch_agent_method(handle, method_name, &args) } {
+        return value;
+    }
+
+    #[cfg(feature = "http-client")]
     if let Some(value) = crate::http::dispatch_client_request_method(handle, method_name, &args) {
         return value;
     }
@@ -479,7 +484,15 @@ pub unsafe extern "C" fn js_handle_method_dispatch(
     #[cfg(feature = "crypto")]
     if matches!(
         method_name,
-        "toString" | "toJSON" | "checkHost" | "checkEmail" | "checkIP"
+        "toString"
+            | "toJSON"
+            | "toLegacyObject"
+            | "checkHost"
+            | "checkEmail"
+            | "checkIP"
+            | "verify"
+            | "checkPrivateKey"
+            | "checkIssued"
     ) && with_handle::<crate::crypto::X509Handle, bool, _>(handle, |_| true).unwrap_or(false)
     {
         return crate::crypto::dispatch_x509_method(handle, method_name, &args);
@@ -1295,6 +1308,15 @@ unsafe fn dispatch_net_socket(handle: i64, method: &str, args: &[f64]) -> f64 {
             crate::net::js_net_socket_destroy(handle);
             f64::from_bits(0x7FFC_0000_0000_0001)
         }
+        "getTypeOfService" => crate::net::js_net_socket_get_type_of_service(handle),
+        "setTypeOfService" => {
+            let value = args
+                .first()
+                .copied()
+                .unwrap_or(f64::from_bits(0x7FFC_0000_0000_0001));
+            crate::net::js_net_socket_set_type_of_service(handle, value);
+            f64::from_bits(0x7FFD_0000_0000_0000u64 | (handle as u64 & 0x0000_FFFF_FFFF_FFFF))
+        }
         "on" if args.len() >= 2 => {
             let event_ptr = unbox_to_i64(args[0]);
             let cb_ptr = unbox_to_i64(args[1]);
@@ -1600,6 +1622,11 @@ pub unsafe extern "C" fn js_handle_property_dispatch(
     }
 
     #[cfg(feature = "http-client")]
+    if let Some(value) = crate::http::dispatch_agent_property(handle, property_name) {
+        return value;
+    }
+
+    #[cfg(feature = "http-client")]
     if let Some(value) = crate::http::dispatch_client_request_property(handle, property_name) {
         return value;
     }
@@ -1890,6 +1917,7 @@ pub unsafe extern "C" fn js_handle_property_dispatch(
                 | "closed"
                 | "destroyed"
                 | "alpnProtocol"
+                | "pendingSettingsAck"
                 | "localSettings"
                 | "remoteSettings"
                 | "state"
@@ -2212,19 +2240,27 @@ pub unsafe extern "C" fn js_handle_property_dispatch(
             | "validTo"
             | "validToDate"
             | "serialNumber"
+            | "signatureAlgorithm"
+            | "signatureAlgorithmOid"
             | "fingerprint"
             | "fingerprint256"
             | "fingerprint512"
             | "subjectAltName"
             | "keyUsage"
+            | "infoAccess"
             | "ca"
             | "raw"
             | "publicKey"
+            | "issuerCertificate"
             | "toString"
             | "toJSON"
+            | "toLegacyObject"
             | "checkHost"
             | "checkEmail"
             | "checkIP"
+            | "verify"
+            | "checkPrivateKey"
+            | "checkIssued"
     ) && with_handle::<crate::crypto::X509Handle, bool, _>(handle, |_| true).unwrap_or(false)
     {
         return crate::crypto::dispatch_x509_property(handle, property_name);
@@ -2616,6 +2652,7 @@ pub unsafe extern "C" fn js_stdlib_init_dispatch() {
         #[cfg(feature = "http-client")]
         fn js_register_global_fetch_constructors(
             blob_new: unsafe extern "C" fn(f64, f64) -> f64,
+            file_new: unsafe extern "C" fn(f64, f64, f64, f64) -> f64,
             headers_new: extern "C" fn() -> f64,
             headers_init_from_value: unsafe extern "C" fn(f64, f64) -> f64,
             request_new: unsafe extern "C" fn(
@@ -2675,6 +2712,7 @@ pub unsafe extern "C" fn js_stdlib_init_dispatch() {
     #[cfg(feature = "http-client")]
     js_register_global_fetch_constructors(
         crate::fetch_blob::js_blob_new,
+        crate::fetch_blob::js_file_new,
         crate::fetch::js_headers_new,
         crate::fetch::js_headers_init_from_value,
         crate::fetch::js_request_new,

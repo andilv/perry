@@ -2,6 +2,72 @@
 
 Detailed changelog for Perry. See CLAUDE.md for concise summaries.
 
+## v0.5.1122 — fix(release): decouple aspirational platform/framework smokes from the publish gate
+
+v0.5.1121's publish was blocked at `await-tests` because the tag-gated **Tests** workflow concluded failure — but the only *core*-job failures were `cargo-test` (the `secret_key_buffer_metadata_survives_ic_miss_for_aes_sizes` regression from #4363 typed-array own-properties, since fixed on `main` by #4399) and `lint` (a transient rustup/curl network flake during toolchain setup). The v0.5.1121 tag predated #4399, so its `cargo-test` could never pass; this release re-tags from a `main` that includes the fix.
+
+To stop new aspirational smoke jobs from silently re-blocking publish (the recurring failure mode this whole pipeline-repair has hit), marked `harmonyos-smoke` and `ink-link-smoke` `continue-on-error: true` — joining `effect-basic-smoke` (already so) and the `parity`/`compile-smoke`/`doc-tests`/`drizzle-mysql-smoke` set. Package publish now effectively gates only on the four core jobs: `cargo-test`, `lint`, `api-docs-drift`, `compiler-output-regression` (+ Simulator Tests).
+
+Note: a more durable fix is to have `release-packages.yml`'s `await-tests` gate key on those core jobs' conclusions directly rather than the whole-workflow conclusion, so future aspirational jobs need no `continue-on-error` annotation. Tracked as a follow-up.
+
+## v0.5.1121 — fix(release): build Apple cross-libs on the arm64 mac job only (unblocks npm/brew/apt/winget publish)
+
+v0.5.1120 fixed the gtk4 + android build-matrix breakage (both verified green on the real toolchains) and published 34 assets, but `release-packages` still concluded failure and skipped the package-manager publish legs (`npm-publish`/`homebrew`/`apt`/`winget`, which `needs: build` = every primary build). The lone remaining failure was `build (macos-15, x86_64-apple-darwin)`: its "Build iOS cross-compile libraries (macOS)" step panicked in `libsqlite3-sys` build.rs — `could not run bindgen on header sqlite3/sqlite3.h` — a libclang/SDK issue on the macos-15 x86_64 runner. The macos-14 arm64 runner built the identical iOS aarch64 libs fine; the failure was masked in earlier releases by the build matrix's (now-removed) fail-fast.
+
+Fix: gate the "Build iOS cross-compile libraries (macOS)" and "Build tvOS/visionOS/watchOS cross-compile libraries (macOS)" steps to `matrix.target == 'aarch64-apple-darwin'`. These Apple cross-libs are aarch64 and host-independent, so building them on the x86_64 mac job was pure redundancy. The macOS staging step copies them only `if [ -f ]`, so the x86_64 (Intel) bottle degrades gracefully — the arm64 bottle and the standalone `build-cross` `perry-cross-aarch64-apple-*` tarballs still ship every Apple cross-lib.
+
+## v0.5.1120 — fix(release): unblock the publish build matrix (gtk4 + android cross-host UI crates)
+
+v0.5.1117 fixed the `await-tests` gate (publishing resumed after ~90 dark versions) but `release-packages` still concluded failure and skipped npm/brew/apt/winget — a second, separate breakage in the **cross-host UI crates**, which `cargo-test` excludes (so no PR CI catches them):
+
+- **perry-ui-gtk4** (`widgets/canvas.rs`) called `gtk4::gdk::cairo::set_source_pixbuf(cr, …)`, but in gdk4 0.9 `set_source_pixbuf` is the `GdkCairoContextExt` trait method on the cairo `Context` (`fn set_source_pixbuf(&self, pixbuf, x, y)`), in scope via `gtk4::prelude::*`. Changed to `cr.set_source_pixbuf(&scaled, *dx, *dy)`. This broke the **linux-gnu** primary build (the gtk4 lib is bundled into the Linux tarball), which — with the build matrix lacking `fail-fast: false` — cancelled the macOS/Windows/linux-arm builds and skipped every publish leg (they `needs: build`).
+- **perry-runtime** `fs/mod.rs` bound `_path_str_for_log` but the `#[cfg(target_os = "android")]` debug-log block referenced `path_str_for_log` (no underscore) — a name mismatch only the android cross-build compiled. Fixed the reference.
+- **release-packages.yml**: added `fail-fast: false` to the primary `build` matrix (mirrors `build-cross`) so one platform's failure no longer cancels the rest — partial publish beats no publish.
+
+Note: the gtk4/android crates can't be compiled on the macOS dev host (no GTK/NDK toolchain); fixes were validated against the cached `gdk4-0.9.6` trait signature and the exact name mismatch. Follow-up worth filing: cross-host UI crates have no PR CI coverage, so they rot silently between releases.
+
+## v0.5.1119 — feat(runtime): implement DataView getBigInt64/setBigInt64/getBigUint64/setBigUint64 (#4365)
+
+`DataView.prototype.getBigInt64`/`setBigInt64`/`getBigUint64`/`setBigUint64` were unimplemented — `DataViewKind::from_method_suffix` didn't recognize the `"BigInt64"`/`"BigUint64"` suffixes, so the method names never routed to the DataView dispatch: reads returned `undefined` and setters silently no-op'd.
+
+- **`buffer/dataview.rs`** — add `BigInt64`/`BigUint64` to `DataViewKind` (width 8) and `from_method_suffix`. The `get` arms read the raw 8 bytes (endian-aware) and return a NaN-boxed BigInt (`js_bigint_from_i64`/`js_bigint_from_u64`). The `set` path runs `ToBigInt` (a Number throws `TypeError: Cannot convert <n> to a BigInt`, Boolean/String coerce, BigInt passes through) via the new `to_bigint_raw_or_throw`, then writes the BigInt's low 64 bits — bypassing the numeric `to_number`/ToIntN wrap the integer kinds use.
+- **`object/dataview_proto_thunks.rs`** — register `get`/`setBigInt64` + `get`/`setBigUint64` thunks and prototype-table rows so they are reflectable (`typeof DataView.prototype.getBigInt64 === "function"`) and `.call`-able.
+- **`object/buffer_dispatch.rs`** — add the four names to the buffer-method gate so instance calls reach `dispatch_buffer_method`.
+
+Verified byte-for-byte against `node --experimental-strip-types`: signed/unsigned round-trip, negative + u64-max values, big/little endian, Boolean coercion, Number→`TypeError`, out-of-bounds `RangeError`, prototype reflection, `.call` dispatch, and the non-DataView-receiver brand check. Numeric DataView accessors are unchanged. Follow-up to #4356 (#4364); reuses the same BigInt limb box/unbox helpers. New fixture: `test-parity/node-suite/buffer/dataview/bigint-accessors.ts`.
+
+## v0.5.1118 — fix(runtime): round-trip BigInt64Array/BigUint64Array elements as BigInt (#4356)
+
+`BigInt64Array`/`BigUint64Array` element reads and writes coerced through `f64`, so values round-tripped as **Numbers** instead of **BigInts** and large/non-representable bigints were silently truncated: `const b = new BigInt64Array(2); b[0] = 5n; b[0]` yielded `0` (typeof Number) instead of `5n`.
+
+All fixes in `crates/perry-runtime/src/typedarray/`:
+
+- **`load_at`** — bigint kinds now return a NaN-boxed BigInt (`js_bigint_from_i64`/`js_bigint_from_u64`) instead of `raw as f64`, so element reads are real `bigint`s.
+- **`store_at`** — bigint kinds read the BigInt's raw low limb (`bigint::bigint_slot_bits`) rather than `value as i64` on an already-NaN-boxed pointer (which mapped to `0`).
+- **`js_typed_array_set`** — bigint views run `ToBigInt`: a Number throws `TypeError: Cannot convert <n> to a BigInt`, Boolean/String coerce, BigInt passes through; the raw value is stored (not `jsvalue_to_f64`'d).
+- **Construction-from-array** and **`TypedArray.prototype.set()`** — coerce per destination kind (`bigint::coerce_for_kind` → `ToBigInt` for bigint views), so `new BigInt64Array([1n, 2n])` and `ta.set([...])` keep real BigInt elements.
+- **`format_typed_value`** — render bigint elements from the raw limb, with the trailing `n` for the `console.log` inspect form and without it for `join`.
+
+The internal `load_at`→`store_at` data-movement helpers (`slice`, `reverse`, `copyWithin`, set-from-TA) round-trip the raw bits unchanged. The inline codegen element fast paths have no BigInt `BufferElem` variant, so bigint views always reach the runtime — a runtime-only fix covers the codegen path too. Unblocks the element-set side-effect assertions in the test262 `TypedArrayConstructors/internals/DefineOwnProperty/BigInt/` subdirectory. Verified byte-for-byte against `node --experimental-strip-types` for element get/set, negative + u64-max values, construction, `join`/inspect, in-place `reverse`, `slice`, `set()` from a typed array and a plain array, Boolean coercion, `Object`/`Reflect.defineProperty`, out-of-bounds rejection, and the Number→`TypeError`. New fixture: `test-parity/node-suite/bigint/typed-array/element-roundtrip.ts`.
+
+`DataView.prototype.getBigInt64`/`setBigInt64`/`getBigUint64`/`setBigUint64` (a distinct, previously-unimplemented feature) is tracked in #4365. Chained-method-result element indexing (`const x = ta.reverse(); x[0]`) and `String(ta)` read raw bytes — a pre-existing codegen/`toString` limitation that affects numeric typed arrays too, not bigint-specific.
+
+To keep `typedarray.rs` (already at the 2000-line file-size cap) under the limit, it was converted to a directory module: the BigInt element-coercion helpers moved to `typedarray/bigint.rs` and the Node-style display formatting to `typedarray/format.rs`.
+
+## v0.5.1117 — fix(release-gate): unblock package publishing (IteratorFrom panic, Math no_mangle, decouple extended suites)
+
+The release pipeline had shipped **no binary/npm/brew assets since v0.5.1025** (~90 versions): every tag created a GitHub release object but `release-packages.yml`'s `await-tests` gate failed because the tag-gated **Tests** workflow stayed red on its aspirational extended jobs. Core jobs (`cargo-test`, `lint`, `api-docs-drift`, `compiler-output-regression`) passed throughout.
+
+Two real, deterministic bugs that kept `compile-smoke` red:
+
+- **codegen panic** — `Iterator.from(x)` (#2874) lowers to `Expr::IteratorFrom`, which `expr/mod.rs` routes to `instance_misc1::lower`, but that submodule never implemented the arm — so it hit the catch-all `unreachable!("expr/mod.rs dispatched a variant not handled by this submodule")` and crashed the compiler on `test_gap_iterator_helpers_2874`. Added the arm: lower to the existing `js_iterator_from` runtime helper (`f64 -> f64`, NaN-boxed in/out). (The lazy helper methods `.map`/`.filter`/`.toArray`/… returning `undefined` at runtime remains a separate #2874 functional gap; `compile-smoke` is compile-only.)
+- **link error** — `js_throw_math_constructor_type_error` (`crates/perry-runtime/src/error.rs`) was missing `#[no_mangle]` (every sibling `js_throw_*_constructor_type_error` has it), so the symbol was Rust-mangled and the codegen-emitted C call failed to link with `Undefined symbols: _js_throw_math_constructor_type_error` on the default auto-optimize path (`test_gap_language_types_object_part_a`).
+
+CI / release gating:
+
+- Added the four `perry/ui`-importing smoke tests (`test_ui_on_keydown_smoke`, `test_issue_1495_image_systemname`, `test_issue_1867_audio_playback`, `test_issue_2022_canvas_draw_image`) to the `compile-smoke` `SKIP_TESTS` list — they need `--target macos` to link platform widgets and fail with ld undefined-symbol errors on the bare Linux compile path (`ci-env`, consistent with the existing `test_ui_*` skips).
+- **Decoupled package publish from the aspirational extended suites.** Marked `parity`, `compile-smoke`, `doc-tests`, and `drizzle-mysql-smoke` as `continue-on-error: true` at the job level so a red result no longer fails the Tests workflow run conclusion — which is what `await-tests` keys on. Publishing now gates on the CORE jobs that actually pass (+ Simulator Tests); the extended suites still run on every tag and surface their pass/fail as an informational signal. This is a deliberate maintainer decision over chasing full extended-suite green, which is partly CI-environment-bound (parity runs node 22 on Linux; doc-tests fails only on the macos-14 runner's older objc2/Xcode toolchain — it builds clean locally).
+
 ## v0.5.1116 — fix(events): node:events module-level static helpers dispatch (events.once/on/listenerCount/...)
 
 `events.once(emitter, name)` and the other `node:events` module-level static

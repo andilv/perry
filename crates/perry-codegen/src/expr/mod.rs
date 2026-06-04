@@ -54,6 +54,7 @@ mod native_record;
 mod object_literal;
 mod pod_layout_constants;
 mod pod_record;
+mod property_get_names;
 mod range_facts;
 mod strings;
 mod typed_feedback;
@@ -1976,5 +1977,16 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             "perry-codegen Phase 2: expression {} not yet supported",
             variant_name(other)
         ),
+    }
+}
+
+pub(crate) fn lower_math_operand(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
+    let raw = lower_expr(ctx, expr)?;
+    if is_numeric_expr(ctx, expr) {
+        Ok(raw)
+    } else {
+        Ok(ctx
+            .block()
+            .call(DOUBLE, "js_math_to_number", &[(DOUBLE, &raw)]))
     }
 }

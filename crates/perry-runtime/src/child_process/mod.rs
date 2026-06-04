@@ -36,8 +36,8 @@ use std::sync::{
 };
 
 use sync_run::{
-    cp_read_async_run_options, cp_read_run_options, cp_run_to_completion, CpRun, CpRunError,
-    CpRunOptions,
+    cp_read_async_run_options, cp_read_run_options, cp_read_spawn_sync_run_options,
+    cp_read_sync_stdio_run_options, cp_run_to_completion, CpRun, CpRunError, CpRunOptions,
 };
 
 use crate::closure::{
@@ -393,13 +393,13 @@ pub extern "C" fn js_child_process_exec_sync(
     };
     cp_apply_options(&mut command, opts_val);
 
-    let run_options = cp_read_run_options(opts_val);
+    let run_options = cp_read_sync_stdio_run_options(opts_val);
     let run = cp_run_to_completion(command, &run_options);
-    let stdout_box = cp_box_output(&run.stdout, &mode);
+    let stdout_box = cp_box_run_output(&run.stdout, run.stdout_piped, &mode);
     if run.success() {
         return stdout_box;
     }
-    let stderr_box = cp_box_output(&run.stderr, &mode);
+    let stderr_box = cp_box_run_output(&run.stderr, run.stderr_piped, &mode);
     cp_sync_throw_error(&run, &cmd_str, stdout_box, stderr_box);
 }
 
@@ -435,17 +435,21 @@ pub extern "C" fn js_child_process_spawn_sync(
     // unless `shell` is set).
     let arg_strs = unsafe { cp_read_arg_strings(args_ptr as i64) };
     let command = cp_build_command(&cmd_str, &arg_strs, opts_val);
-    let run_options = cp_read_run_options(opts_val);
+    let run_options = cp_read_spawn_sync_run_options(opts_val);
     let run = cp_run_to_completion(command, &run_options);
 
     let spawn_failed_before_pid = run.spawn_error.is_some() && run.pid.is_none();
     let stdout_box = if spawn_failed_before_pid {
         cp_undefined()
+    } else if !run.stdout_piped {
+        TAG_NULL_F64
     } else {
         cp_box_output(&run.stdout, &mode)
     };
     let stderr_box = if spawn_failed_before_pid {
         cp_undefined()
+    } else if !run.stderr_piped {
+        TAG_NULL_F64
     } else {
         cp_box_output(&run.stderr, &mode)
     };
@@ -560,6 +564,7 @@ pub extern "C" fn js_child_process_exec(cmd_ptr: *const StringHeader, arg1: f64,
     // sit in the `arg1` slot, so the encoding is read from there. When `arg1`
     // is the callback the lookup no-ops and the default applies.
     let mode = cp_read_output_mode(arg1, true);
+    let abort_signal = cp_read_abort_signal(arg1);
 
     if cmd_ptr.is_null() {
         let empty = cp_box_output(b"", &mode);
@@ -576,6 +581,21 @@ pub extern "C" fn js_child_process_exec(cmd_ptr: *const StringHeader, arg1: f64,
         let cmd_bytes = std::slice::from_raw_parts(data_ptr, len);
         String::from_utf8_lossy(cmd_bytes).into_owned()
     };
+
+    if abort_signal.is_some_and(cp_abort_signal_is_aborted) {
+        let stdout_box = cp_box_output(b"", &mode);
+        if cb.is_null() {
+            return stdout_box;
+        }
+        let stderr_box = cp_box_output(b"", &mode);
+        crate::closure::js_closure_call3(
+            cb,
+            cp_abort_error(Some(&cmd_str)),
+            stdout_box,
+            stderr_box,
+        );
+        return f64::from_bits(TAG_UNDEFINED_BITS);
+    }
 
     // `exec` always runs through the shell. The options object sits in the
     // `arg1` slot (`exec(cmd, options, cb)`); when `arg1` is the callback
@@ -637,6 +657,7 @@ pub extern "C" fn js_child_process_exec(cmd_ptr: *const StringHeader, arg1: f64,
 const CP_SHAPE_ID: u32 = 0x7FFF_FD00;
 const CP_READABLE_SHAPE_ID: u32 = 0x7FFF_FD40;
 const CP_WRITABLE_SHAPE_ID: u32 = 0x7FFF_FD80;
+const CP_ABORT_ERROR_CLASS_ID: u32 = 0x7FFF_FDC0;
 
 #[inline]
 fn cp_undefined() -> f64 {
@@ -800,7 +821,34 @@ fn cp_emit(target: f64, event: &str, args: &[f64]) -> bool {
     fired
 }
 
-fn cp_signal_name(sig: i32) -> &'static str {
+pub(super) const CP_SIGTERM: i32 = 15;
+
+#[cfg(unix)]
+pub(super) fn cp_signal_name(sig: i32) -> &'static str {
+    match sig {
+        x if x == libc::SIGHUP => "SIGHUP",
+        x if x == libc::SIGINT => "SIGINT",
+        x if x == libc::SIGQUIT => "SIGQUIT",
+        x if x == libc::SIGILL => "SIGILL",
+        x if x == libc::SIGTRAP => "SIGTRAP",
+        x if x == libc::SIGABRT => "SIGABRT",
+        x if x == libc::SIGBUS => "SIGBUS",
+        x if x == libc::SIGFPE => "SIGFPE",
+        x if x == libc::SIGKILL => "SIGKILL",
+        x if x == libc::SIGUSR1 => "SIGUSR1",
+        x if x == libc::SIGSEGV => "SIGSEGV",
+        x if x == libc::SIGUSR2 => "SIGUSR2",
+        x if x == libc::SIGPIPE => "SIGPIPE",
+        x if x == libc::SIGALRM => "SIGALRM",
+        x if x == libc::SIGTERM => "SIGTERM",
+        x if x == libc::SIGSTOP => "SIGSTOP",
+        x if x == libc::SIGCONT => "SIGCONT",
+        _ => "SIGTERM",
+    }
+}
+
+#[cfg(not(unix))]
+pub(super) fn cp_signal_name(sig: i32) -> &'static str {
     match sig {
         1 => "SIGHUP",
         2 => "SIGINT",
@@ -809,6 +857,74 @@ fn cp_signal_name(sig: i32) -> &'static str {
         11 => "SIGSEGV",
         15 => "SIGTERM",
         _ => "SIGTERM",
+    }
+}
+
+#[cfg(unix)]
+pub(super) fn cp_signal_number(name: &str) -> Option<i32> {
+    Some(match name {
+        "SIGHUP" => libc::SIGHUP,
+        "SIGINT" => libc::SIGINT,
+        "SIGQUIT" => libc::SIGQUIT,
+        "SIGILL" => libc::SIGILL,
+        "SIGTRAP" => libc::SIGTRAP,
+        "SIGABRT" => libc::SIGABRT,
+        "SIGBUS" => libc::SIGBUS,
+        "SIGFPE" => libc::SIGFPE,
+        "SIGKILL" => libc::SIGKILL,
+        "SIGUSR1" => libc::SIGUSR1,
+        "SIGSEGV" => libc::SIGSEGV,
+        "SIGUSR2" => libc::SIGUSR2,
+        "SIGPIPE" => libc::SIGPIPE,
+        "SIGALRM" => libc::SIGALRM,
+        "SIGTERM" => libc::SIGTERM,
+        "SIGSTOP" => libc::SIGSTOP,
+        "SIGCONT" => libc::SIGCONT,
+        _ => return None,
+    })
+}
+
+#[cfg(not(unix))]
+pub(super) fn cp_signal_number(_name: &str) -> Option<i32> {
+    None
+}
+
+pub(super) fn cp_signal_from_value(signal: f64) -> i32 {
+    let js = JSValue::from_bits(signal.to_bits());
+    if js.is_undefined() || js.is_null() {
+        return CP_SIGTERM;
+    }
+    if let Some(name) = cp_value_to_string(signal) {
+        return cp_signal_number(&name).unwrap_or(CP_SIGTERM);
+    }
+    if signal.is_finite() {
+        let n = signal as i32;
+        return if n == 0 { CP_SIGTERM } else { n };
+    }
+    CP_SIGTERM
+}
+
+pub(super) fn cp_read_kill_signal(opts_val: f64) -> i32 {
+    if cp_object_ptr(opts_val).is_none() {
+        return CP_SIGTERM;
+    }
+    cp_signal_from_value(cp_get_field(opts_val, b"killSignal"))
+}
+
+pub(super) fn cp_read_timeout(opts_val: f64) -> Option<std::time::Duration> {
+    if cp_object_ptr(opts_val).is_none() {
+        return None;
+    }
+    let value = cp_get_field(opts_val, b"timeout");
+    let js = JSValue::from_bits(value.to_bits());
+    if js.is_undefined() || js.is_null() {
+        return None;
+    }
+    let timeout = js.to_number();
+    if timeout.is_finite() && timeout > 0.0 {
+        Some(std::time::Duration::from_millis(timeout as u64))
+    } else {
+        None
     }
 }
 
@@ -1325,14 +1441,14 @@ fn cp_args_from_value(value: f64) -> Vec<String> {
 }
 
 // ============================================================================
-// Spawn / exec options: `cwd`, `env`, `shell`, `argv0`, sync buffered I/O —
-// #1780/#2555
+// Spawn / exec options: `cwd`, `env`, `uid`, `gid`, `shell`, `argv0`, sync
+// buffered I/O — #1780/#2555
 // ============================================================================
 //
-// These helpers read the common, host-portable options off a NaN-boxed options
-// value and apply them to a `std::process::Command`. The sync buffered forms
-// also parse `{ input, timeout, maxBuffer }`; broader stdio routing remains
-// outside the current runtime surface.
+// These helpers read common options off a NaN-boxed options value and apply them
+// to a `std::process::Command`. The sync buffered forms also parse `{ input,
+// timeout, maxBuffer }`; broader stdio routing remains outside the current
+// runtime surface.
 
 /// Coerce any JS value to an owned Rust string — string fast-path, else
 /// `js_jsvalue_to_string`. Used for `env` values, which Node stringifies.
@@ -1347,8 +1463,45 @@ fn cp_coerce_string(value: f64) -> String {
     unsafe { cp_read_string_header(p as i64) }
 }
 
-/// Apply the host-portable `{ cwd, env }` options to `command`. `opts_val` is a
-/// NaN-boxed options object (or undefined/null/non-object — then a no-op). Node
+fn cp_read_uid_gid_option(opts_val: f64, key: &[u8]) -> Option<u32> {
+    let value = cp_get_field(opts_val, key);
+    let js_value = JSValue::from_bits(value.to_bits());
+    if js_value.is_undefined() || js_value.is_null() {
+        return None;
+    }
+    if !js_value.is_number() && !js_value.is_int32() {
+        return None;
+    }
+    let id = js_value.to_number();
+    if id.is_finite() && id >= 0.0 && id.fract() == 0.0 && id <= u32::MAX as f64 {
+        Some(id as u32)
+    } else {
+        None
+    }
+}
+
+fn cp_apply_uid_gid(command: &mut Command, opts_val: f64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        if let Some(gid) = cp_read_uid_gid_option(opts_val, b"gid") {
+            command.gid(gid);
+        }
+        if let Some(uid) = cp_read_uid_gid_option(opts_val, b"uid") {
+            command.uid(uid);
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (command, opts_val);
+    }
+}
+
+/// Apply shared command options to `command`. `cwd` and `env` are portable;
+/// `uid` and `gid` are applied on Unix targets. `opts_val` is a NaN-boxed
+/// options object (or undefined/null/non-object — then a no-op). Node
 /// semantics: `env` *replaces* the child's environment wholesale, so when an
 /// `env` object is provided we `env_clear()` first and skip keys whose value is
 /// `undefined`. #1780.
@@ -1382,6 +1535,8 @@ fn cp_apply_options(command: &mut Command, opts_val: f64) {
             }
         }
     }
+
+    cp_apply_uid_gid(command, opts_val);
 }
 
 pub(super) fn cp_read_argv0(opts_val: f64) -> Option<String> {
@@ -1389,6 +1544,29 @@ pub(super) fn cp_read_argv0(opts_val: f64) -> Option<String> {
         return None;
     }
     cp_value_to_string(cp_get_field(opts_val, b"argv0"))
+}
+
+pub(super) fn cp_read_abort_signal(opts_val: f64) -> Option<f64> {
+    if cp_object_ptr(opts_val).is_none() {
+        return None;
+    }
+    let signal = cp_get_field(opts_val, b"signal");
+    if JSValue::from_bits(signal.to_bits()).is_undefined() {
+        return None;
+    }
+    if crate::url::abort::abort_signal_ptr_from_value(signal).is_some() {
+        return Some(signal);
+    }
+    let message = format!(
+        "The \"options.signal\" property must be an instance of AbortSignal. Received {}",
+        crate::fs::validate::describe_received(signal)
+    );
+    crate::fs::validate::throw_type_error_with_code(&message, "ERR_INVALID_ARG_TYPE");
+}
+
+pub(super) fn cp_abort_signal_is_aborted(signal: f64) -> bool {
+    crate::url::abort::abort_signal_ptr_from_value(signal)
+        .is_some_and(|ptr| crate::url::js_abort_signal_is_aborted(ptr) != 0)
 }
 
 pub(super) fn cp_spawnargs_argv0(default: &str, opts_val: f64) -> String {
@@ -1410,14 +1588,88 @@ pub(super) fn cp_apply_argv0(command: &mut Command, opts_val: f64) {
     }
 }
 
+fn cp_option_detached(opts_val: f64) -> bool {
+    if cp_object_ptr(opts_val).is_none() {
+        return false;
+    }
+    cp_get_field(opts_val, b"detached").to_bits() == TAG_TRUE_F64.to_bits()
+}
+
+pub(super) fn cp_apply_detached(command: &mut Command, opts_val: f64) {
+    if !cp_option_detached(opts_val) {
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x00000008 | 0x00000200);
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = command;
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CpStdio {
     Pipe,
     Ignore,
     Inherit,
+    Fd(i32),
 }
 
-fn cp_stdio_kind(value: f64) -> CpStdio {
+fn cp_stdio_number_fd(value: f64) -> Option<i32> {
+    let js_value = JSValue::from_bits(value.to_bits());
+    if js_value.is_int32() {
+        Some(js_value.as_int32())
+    } else if js_value.is_number() {
+        let n = js_value.as_number();
+        if n.is_finite() && n >= 0.0 && n.fract() == 0.0 && n <= i32::MAX as f64 {
+            Some(n as i32)
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+fn cp_stdio_stream_fd(value: f64, fd_index: usize) -> Option<i32> {
+    let expected_stream = match fd_index {
+        0 => crate::fs::is_fs_stream_instance_value(value, "ReadStream"),
+        1 | 2 => crate::fs::is_fs_stream_instance_value(value, "WriteStream"),
+        _ => false,
+    };
+    if !expected_stream {
+        return None;
+    }
+    let fd = cp_get_field(value, b"fd");
+    cp_stdio_number_fd(fd).filter(|fd| crate::fs::fd_is_registered(*fd))
+}
+
+fn cp_stdio_kind(value: f64, fd_index: usize) -> CpStdio {
+    if let Some(fd) = cp_stdio_number_fd(value) {
+        return CpStdio::Fd(fd);
+    }
+    if let Some(fd) = cp_stdio_stream_fd(value, fd_index) {
+        return CpStdio::Fd(fd);
+    }
+
     match cp_value_to_string(value).as_deref() {
         Some("ignore") => CpStdio::Ignore,
         Some("inherit") => CpStdio::Inherit,
@@ -1425,9 +1677,9 @@ fn cp_stdio_kind(value: f64) -> CpStdio {
     }
 }
 
-/// Read the deterministic live-stdio subset: `pipe` (default), `ignore`, and
-/// `inherit`. Other Node forms (numeric fds, custom streams) intentionally
-/// remain in #2555.
+/// Read the deterministic live-stdio subset: `pipe` (default), `ignore`,
+/// `inherit`, numeric fd entries, and opened fs stream objects backed by a
+/// registered fd.
 pub(super) fn cp_read_stdio(opts_val: f64, fds: usize) -> Vec<CpStdio> {
     let mut out = vec![CpStdio::Pipe; fds];
     if cp_object_ptr(opts_val).is_none() {
@@ -1435,6 +1687,14 @@ pub(super) fn cp_read_stdio(opts_val: f64, fds: usize) -> Vec<CpStdio> {
     }
 
     let stdio = cp_get_field(opts_val, b"stdio");
+    if let Some(arr) = cp_array_ptr(stdio) {
+        let n = crate::array::js_array_length(arr).min(fds as u32);
+        for i in 0..n {
+            out[i as usize] = cp_stdio_kind(crate::array::js_array_get_f64(arr, i), i as usize);
+        }
+        return out;
+    }
+
     if let Some(s) = cp_value_to_string(stdio) {
         match s.as_str() {
             "ignore" => out.fill(CpStdio::Ignore),
@@ -1443,21 +1703,13 @@ pub(super) fn cp_read_stdio(opts_val: f64, fds: usize) -> Vec<CpStdio> {
         }
         return out;
     }
-
-    let Some(arr) = cp_array_ptr(stdio) else {
-        return out;
-    };
-    let n = crate::array::js_array_length(arr).min(fds as u32);
-    for i in 0..n {
-        out[i as usize] = cp_stdio_kind(crate::array::js_array_get_f64(arr, i));
-    }
     out
 }
 
 pub(super) fn cp_stdio_js_value(kind: CpStdio, pipe_obj: f64) -> f64 {
     match kind {
         CpStdio::Pipe => pipe_obj,
-        CpStdio::Ignore | CpStdio::Inherit => TAG_NULL_F64,
+        CpStdio::Ignore | CpStdio::Inherit | CpStdio::Fd(_) => TAG_NULL_F64,
     }
 }
 
@@ -1466,10 +1718,31 @@ pub(super) fn cp_apply_live_stdio(command: &mut Command, stdio: &[CpStdio]) {
         CpStdio::Pipe => Stdio::piped(),
         CpStdio::Ignore => Stdio::null(),
         CpStdio::Inherit => Stdio::inherit(),
+        CpStdio::Fd(fd) => cp_stdio_from_fd(fd),
     };
     command.stdin(to_stdio(stdio.first().copied().unwrap_or(CpStdio::Pipe)));
     command.stdout(to_stdio(stdio.get(1).copied().unwrap_or(CpStdio::Pipe)));
     command.stderr(to_stdio(stdio.get(2).copied().unwrap_or(CpStdio::Pipe)));
+}
+
+#[cfg(unix)]
+fn cp_stdio_from_fd(fd: i32) -> Stdio {
+    use std::os::fd::FromRawFd;
+
+    if let Some(file) = crate::fs::try_clone_registered_fd(fd) {
+        return Stdio::from(file);
+    }
+
+    let dup_fd = unsafe { libc::dup(fd) };
+    if dup_fd < 0 {
+        return Stdio::null();
+    }
+    unsafe { Stdio::from_raw_fd(dup_fd) }
+}
+
+#[cfg(not(unix))]
+fn cp_stdio_from_fd(_fd: i32) -> Stdio {
+    Stdio::null()
 }
 
 /// Default shell for `{ shell: true }` (`shell: "<path>"` overrides it).
@@ -1519,6 +1792,7 @@ fn cp_build_command(cmd: &str, args: &[String], opts_val: f64) -> Command {
 
     cp_apply_argv0(&mut command, opts_val);
     cp_apply_options(&mut command, opts_val);
+    cp_apply_detached(&mut command, opts_val);
     command
 }
 
@@ -1588,6 +1862,14 @@ fn cp_box_output(bytes: &[u8], mode: &CpOutput) -> f64 {
     match mode {
         CpOutput::Buffer => cp_make_buffer(bytes),
         CpOutput::Text(enc) => crate::value::js_nanbox_string(cp_encode_text(bytes, enc) as i64),
+    }
+}
+
+fn cp_box_run_output(bytes: &[u8], piped: bool, mode: &CpOutput) -> f64 {
+    if piped {
+        cp_box_output(bytes, mode)
+    } else {
+        TAG_NULL_F64
     }
 }
 
@@ -1685,6 +1967,24 @@ fn cp_make_range_error(message: &str, extra: &[(&str, f64)]) -> f64 {
         message,
         extra,
     )
+}
+
+pub(super) fn cp_abort_error(cmd: Option<&str>) -> f64 {
+    crate::object::js_register_class_extends_error(CP_ABORT_ERROR_CLASS_ID);
+    let obj = crate::object::js_object_alloc(CP_ABORT_ERROR_CLASS_ID, 4);
+    let set = |key: &str, value: f64| {
+        let kp = js_string_from_bytes(key.as_ptr(), key.len() as u32);
+        js_object_set_field_by_name(obj, kp, value);
+    };
+    set("code", cp_box_string("ABORT_ERR"));
+    set("name", cp_box_string("AbortError"));
+    set("message", cp_box_string("The operation was aborted"));
+    if let Some(cmd) = cmd {
+        set("cmd", cp_box_string(cmd));
+    }
+    let hidden = crate::object::PropertyAttrs::new(true, false, true);
+    crate::object::set_property_attrs(obj as usize, "message".to_string(), hidden);
+    cp_box_ptr(obj as *const u8)
 }
 
 /// `[null, stdout, stderr]` — the Node `output` array shared by spawnSync and
@@ -1902,6 +2202,22 @@ pub extern "C" fn js_child_process_exec_file(
     let arg_strs = cp_args_from_value(args_val);
     // execFile defaults to utf8 (callback stdout/stderr are strings).
     let mode = cp_read_output_mode(opts_val, true);
+    let abort_signal = cp_read_abort_signal(opts_val);
+
+    if abort_signal.is_some_and(cp_abort_signal_is_aborted) {
+        let stdout_box = cp_box_output(b"", &mode);
+        if cb.is_null() {
+            return stdout_box;
+        }
+        let stderr_box = cp_box_output(b"", &mode);
+        crate::closure::js_closure_call3(
+            cb,
+            cp_abort_error(Some(&cp_file_cmd_display(&file_str, &arg_strs))),
+            stdout_box,
+            stderr_box,
+        );
+        return f64::from_bits(TAG_UNDEFINED_BITS);
+    }
 
     // `cwd`/`env` come from the options slot; when `opts_val` is the callback
     // (`execFile(file, args, cb)`) it's a closure, so the helper no-ops.
@@ -1950,14 +2266,14 @@ pub extern "C" fn js_child_process_exec_file_sync(
     command.args(&arg_strs);
     cp_apply_argv0(&mut command, opts_val);
     cp_apply_options(&mut command, opts_val);
-    let run_options = cp_read_run_options(opts_val);
+    let run_options = cp_read_sync_stdio_run_options(opts_val);
     let run = cp_run_to_completion(command, &run_options);
 
-    let stdout_box = cp_box_output(&run.stdout, &mode);
+    let stdout_box = cp_box_run_output(&run.stdout, run.stdout_piped, &mode);
     if run.success() {
         return stdout_box;
     }
-    let stderr_box = cp_box_output(&run.stderr, &mode);
+    let stderr_box = cp_box_run_output(&run.stderr, run.stderr_piped, &mode);
     cp_sync_throw_error(
         &run,
         &cp_file_cmd_display(&file_str, &arg_strs),

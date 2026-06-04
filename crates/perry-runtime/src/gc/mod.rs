@@ -273,6 +273,7 @@ pub fn gc_init() {
     gc_register_mutable_root_scanner(crate::perf_hooks::scan_perf_entries_roots_mut);
     gc_register_mutable_root_scanner(crate::v8::scan_v8_promise_hook_roots_mut);
     gc_register_mutable_root_scanner(crate::typed_feedback::scan_typed_feedback_roots_mut);
+    gc_register_mutable_root_scanner(crate::typedarray_props::scan_typed_array_own_props_roots_mut);
     gc_register_mutable_root_scanner(transition_cache_mutable_root_scanner);
     gc_register_mutable_root_scanner(crate::object::scan_object_cache_roots_mut);
     gc_register_mutable_root_scanner(crate::object::scan_arguments_object_roots_mut);
@@ -312,6 +313,7 @@ pub fn gc_init() {
     gc_register_mutable_root_scanner(small_int_cache_mutable_root_scanner);
     gc_register_mutable_root_scanner(crate::builtins::scan_console_log_singleton_roots_mut);
     gc_register_mutable_root_scanner(crate::builtins::scan_boxed_primitive_payload_roots_mut);
+    gc_register_mutable_root_scanner(crate::weakref::scan_pending_finalization_jobs_roots_mut);
     // Issue #841: GC roots for the per-(submodule, export) function
     // singletons + per-submodule namespace stub objects allocated by
     // `node_submodules.rs`. Without this scanner the next GC cycle
