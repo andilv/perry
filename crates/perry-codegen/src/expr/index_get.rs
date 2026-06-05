@@ -35,7 +35,7 @@ use crate::types::{DOUBLE, I1, I32, I64, I8, PTR};
 use super::arrays_finds::lower_buffer_index_get_i32;
 #[allow(unused_imports)]
 use super::{
-    buffer_access_materialization_reason, buffer_alias_metadata_suffix, can_lower_expr_as_i32,
+    buffer_access_materialization_reason, buffer_alias_metadata_suffix,
     emit_layout_note_slot_on_block, emit_shadow_slot_clear, emit_shadow_slot_update_for_expr,
     emit_string_literal_global, emit_typed_feedback_register_site, emit_v8_export_call,
     emit_v8_member_method_call, emit_write_barrier, emit_write_barrier_slot_on_block,
@@ -74,6 +74,28 @@ fn is_uint8array_receiver(ctx: &FnCtx<'_>, object: &Expr) -> bool {
         receiver_class_name(ctx, object).as_deref(),
         Some("Buffer" | "Uint8Array")
     )
+}
+
+fn numeric_index_needs_runtime_key(index: &Expr) -> bool {
+    // Only a LITERAL numeric key that is not a clean array index in
+    // `0..=i32::MAX` needs the runtime key helper: out-of-range/negative
+    // integers (`a[2**32-1]`, `a[-1]`), non-integer floats (`a[1.5]`), and
+    // non-finite values (`a[NaN]`/`a[Infinity]`). These become string-keyed
+    // properties and must reach `js_array_*_index_or_string`.
+    //
+    // Computed/dynamic numeric indices are deliberately NOT rerouted here:
+    // they keep flowing through the typed-feedback numeric-array guard path,
+    // which already carries its own out-of-range/non-integer fallback. Sending
+    // them to the runtime key helper would defeat the native numeric-array hot
+    // path and drop the index guard (regressing the native-region proof and
+    // the typed-feedback hot-path tests). (#4557/#4543)
+    match index {
+        Expr::Integer(i) => *i < 0 || *i > i32::MAX as i64,
+        Expr::Number(n) => {
+            !(n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n <= i32::MAX as f64)
+        }
+        _ => false,
+    }
 }
 
 fn is_async_dispose_symbol_index(index: &Expr) -> bool {
@@ -658,6 +680,32 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         DOUBLE,
                         "js_object_get_symbol_property",
                         &[(DOUBLE, &obj_box), (DOUBLE, &key_box)],
+                    ));
+                }
+                if !is_numeric_expr(ctx, index) {
+                    let arr_box = lower_expr(ctx, object)?;
+                    let idx_double = lower_expr(ctx, index)?;
+                    let arr_handle = {
+                        let blk = ctx.block();
+                        unbox_to_i64(blk, &arr_box)
+                    };
+                    return Ok(ctx.block().call(
+                        DOUBLE,
+                        "js_array_get_index_or_string",
+                        &[(I64, &arr_handle), (DOUBLE, &idx_double)],
+                    ));
+                }
+                if numeric_index_needs_runtime_key(index) {
+                    let arr_box = lower_expr(ctx, object)?;
+                    let idx_double = lower_expr(ctx, index)?;
+                    let arr_handle = {
+                        let blk = ctx.block();
+                        unbox_to_i64(blk, &arr_box)
+                    };
+                    return Ok(ctx.block().call(
+                        DOUBLE,
+                        "js_array_get_index_or_string",
+                        &[(I64, &arr_handle), (DOUBLE, &idx_double)],
                     ));
                 }
                 let require_numeric_layout =

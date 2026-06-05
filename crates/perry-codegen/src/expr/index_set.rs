@@ -35,7 +35,7 @@ use crate::types::{DOUBLE, I1, I32, I64, I8, PTR};
 #[allow(unused_imports)]
 use super::{
     array_store_needs_layout_note, array_store_needs_write_barrier,
-    buffer_access_materialization_reason, buffer_alias_metadata_suffix, can_lower_expr_as_i32,
+    buffer_access_materialization_reason, buffer_alias_metadata_suffix,
     emit_array_numeric_write_note_on_block, emit_jsvalue_slot_store_on_block,
     emit_layout_note_slot_on_block, emit_root_nanbox_store_on_block, emit_shadow_slot_clear,
     emit_shadow_slot_update_for_expr, emit_string_literal_global,
@@ -76,6 +76,28 @@ fn is_uint8array_receiver(ctx: &FnCtx<'_>, object: &Expr) -> bool {
         receiver_class_name(ctx, object).as_deref(),
         Some("Uint8Array")
     )
+}
+
+fn numeric_index_needs_runtime_key(index: &Expr) -> bool {
+    // Only a LITERAL numeric key that is not a clean array index in
+    // `0..=i32::MAX` needs the runtime key helper: out-of-range/negative
+    // integers (`a[2**32-1]`, `a[-1]`), non-integer floats (`a[1.5]`), and
+    // non-finite values (`a[NaN]`/`a[Infinity]`). These become string-keyed
+    // properties and must reach `js_array_*_index_or_string`.
+    //
+    // Computed/dynamic numeric indices are deliberately NOT rerouted here:
+    // they keep flowing through the typed-feedback numeric-array guard path,
+    // which already carries its own out-of-range/non-integer fallback. Sending
+    // them to the runtime key helper would defeat the native numeric-array hot
+    // path and drop the index guard (regressing the native-region proof and
+    // the typed-feedback hot-path tests). (#4557/#4543)
+    match index {
+        Expr::Integer(i) => *i < 0 || *i > i32::MAX as i64,
+        Expr::Number(n) => {
+            !(n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n <= i32::MAX as f64)
+        }
+        _ => false,
+    }
 }
 
 pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
@@ -242,6 +264,38 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     ctx,
                     TypedFeedbackKind::ArrayElement,
                     "array[dynamic_index]",
+                    TypedFeedbackContract::array_set_index(),
+                );
+                ctx.block().call(
+                    I64,
+                    "js_typed_feedback_array_set_index_or_string",
+                    &[
+                        (I64, &site_id),
+                        (I64, &arr_handle),
+                        (DOUBLE, &idx_double),
+                        (DOUBLE, &val_double),
+                    ],
+                );
+                if value_needs_barrier {
+                    let val_bits = ctx.block().bitcast_double_to_i64(&val_double);
+                    let arr_bits = ctx.block().bitcast_double_to_i64(&arr_box);
+                    emit_write_barrier(ctx, &arr_bits, &val_bits);
+                }
+                return Ok(val_double);
+            }
+            if is_array_expr(ctx, object) && numeric_index_needs_runtime_key(index) {
+                let arr_box = lower_expr(ctx, object)?;
+                let idx_double = lower_expr(ctx, index)?;
+                let value_needs_barrier = array_store_needs_write_barrier(ctx, value);
+                let val_double = lower_expr(ctx, value)?;
+                let arr_handle = {
+                    let blk = ctx.block();
+                    unbox_to_i64(blk, &arr_box)
+                };
+                let site_id = emit_typed_feedback_register_site(
+                    ctx,
+                    TypedFeedbackKind::ArrayElement,
+                    "array[boundary_index]",
                     TypedFeedbackContract::array_set_index(),
                 );
                 ctx.block().call(
