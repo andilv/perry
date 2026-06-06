@@ -546,6 +546,24 @@ pub extern "C" fn js_uint8array_new(val: f64) -> *mut BufferHeader {
                 return dst;
             }
         }
+        if let Some(src_kind) = crate::typedarray::lookup_typed_array_kind(raw) {
+            if crate::typedarray::bigint::is_bigint_kind(src_kind) {
+                crate::typedarray::bigint::throw_bigint_number_mix();
+            }
+            let src = raw as *const crate::typedarray::TypedArrayHeader;
+            unsafe {
+                let len = crate::typedarray::js_typed_array_length(src).max(0) as u32;
+                let dst = buffer_alloc(len);
+                (*dst).length = len;
+                let dst_data = buffer_data_mut(dst);
+                for i in 0..len as usize {
+                    let value = crate::typedarray::js_typed_array_get(src, i as i32);
+                    *dst_data.add(i) = buffer_byte_from_js_value(value);
+                }
+                mark_as_uint8array(dst as usize);
+                return dst;
+            }
+        }
         // Otherwise treat as a numeric source array.
         return js_uint8array_from_array(raw as *const ArrayHeader);
     }
@@ -634,7 +652,15 @@ fn array_buffer_to_index(value: f64) -> i32 {
     if jv.is_undefined() {
         return 0;
     }
-    let n = jv.to_number();
+    // ToIndex(length) → ToNumber: a BigInt throws TypeError; `js_number_coerce`
+    // is the full ToNumber — it runs an object's `valueOf`/`toString` (so a
+    // throwing one propagates) and throws TypeError on a Symbol. The bare
+    // `JSValue::to_number()` previously produced NaN→0 for objects/symbols, so
+    // `new ArrayBuffer({valueOf(){return 42}})` silently became length 0.
+    if jv.is_bigint() {
+        crate::collection_iter::throw_type_error("Cannot convert a BigInt value to a number");
+    }
+    let n = crate::builtins::js_number_coerce(value);
     if n.is_nan() {
         return 0;
     }
@@ -706,7 +732,15 @@ fn dataview_to_index(value: f64, what: &str) -> i64 {
     if jv.is_undefined() {
         return 0;
     }
-    let n = jv.to_number();
+    // ToIndex → ToNumber: a BigInt throws a TypeError (ToNumber rejects it), and
+    // `js_number_coerce` is the full ToNumber — it throws a TypeError on a Symbol
+    // and runs an object's `valueOf`/`toString`. The bare `JSValue::to_number()`
+    // previously produced `NaN`→0 for those, so `new DataView(buf, Symbol())`
+    // didn't throw and a `valueOf` never ran.
+    if jv.is_bigint() {
+        crate::collection_iter::throw_type_error("Cannot convert a BigInt value to a number");
+    }
+    let n = crate::builtins::js_number_coerce(value);
     if n.is_nan() {
         // ToIntegerOrInfinity(NaN) = 0.
         return 0;

@@ -35,6 +35,14 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+fn is_non_constructable_builtin_function_value(value: f64) -> bool {
+    super::native_module::builtin_closure_is_non_constructable_value(value)
+}
+
+fn throw_non_constructable_builtin_function() -> ! {
+    super::object_ops::throw_object_type_error(b"Function is not a constructor")
+}
+
 pub(crate) fn class_mark_key_deleted(class_id: u32, key: &str) {
     if class_id == 0 {
         return;
@@ -104,6 +112,10 @@ pub struct VTableMethodEntry {
     pub func_ptr: usize,
     pub param_count: u32,
     pub has_synthetic_arguments: bool,
+    /// Trailing user rest param (`method(a, ...rest)`). Distinct from
+    /// `has_synthetic_arguments`: the rest slot holds only the args from the
+    /// rest position onward, so apply/dynamic dispatch bundles them correctly.
+    pub has_rest: bool,
 }
 
 /// Per-class vtable with methods, getters, and setters
@@ -167,6 +179,14 @@ pub static FUNCTION_CLASS_IDS: RwLock<Option<HashMap<u64, u32>>> = RwLock::new(N
 // usage is guaranteed.
 pub static CLASS_PROTOTYPE_OBJECTS: RwLock<Option<HashMap<u32, usize>>> = RwLock::new(None);
 
+/// Lazily materialized `Class.prototype` objects for declared ES classes.
+/// These are separate from `CLASS_PROTOTYPE_OBJECTS`: that older table is
+/// intentionally overloaded for synthetic prototype sources and static
+/// inheritance shortcuts. Declared class prototypes need stable heap identity
+/// for `typeof C.prototype`, `Object.getPrototypeOf(new C())`, and
+/// `C.prototype.isPrototypeOf(instance)` without perturbing those paths.
+pub static CLASS_DECL_PROTOTYPE_OBJECTS: RwLock<Option<HashMap<u32, usize>>> = RwLock::new(None);
+
 /// #36 / #321: maps a child class_id to the raw address of a parent CLOSURE
 /// (function value) when `class Child extends <function value> {}`. effect's
 /// `class Svc extends Context.Tag("Svc")<...>() {}` extends the function
@@ -184,6 +204,18 @@ pub(crate) fn class_prototype_object_root_store(class_id: u32, proto_ptr: *mut O
         return;
     }
     let mut guard = CLASS_PROTOTYPE_OBJECTS.write().unwrap();
+    if guard.is_none() {
+        *guard = Some(HashMap::new());
+    }
+    guard.as_mut().unwrap().insert(class_id, proto_ptr as usize);
+    crate::gc::runtime_write_barrier_root_raw_ptr(proto_ptr);
+}
+
+pub(crate) fn class_decl_prototype_object_root_store(class_id: u32, proto_ptr: *mut ObjectHeader) {
+    if class_id == 0 || proto_ptr.is_null() {
+        return;
+    }
+    let mut guard = CLASS_DECL_PROTOTYPE_OBJECTS.write().unwrap();
     if guard.is_none() {
         *guard = Some(HashMap::new());
     }
@@ -209,6 +241,97 @@ pub(crate) fn class_parent_closure(class_id: u32) -> Option<usize> {
         .read()
         .ok()
         .and_then(|g| g.as_ref().and_then(|m| m.get(&class_id).copied()))
+}
+
+pub(crate) fn class_decl_prototype_object(class_id: u32) -> *mut ObjectHeader {
+    if let Ok(read) = CLASS_DECL_PROTOTYPE_OBJECTS.read() {
+        if let Some(map) = read.as_ref() {
+            return map.get(&class_id).copied().unwrap_or(0) as *mut ObjectHeader;
+        }
+    }
+    std::ptr::null_mut()
+}
+
+fn class_decl_prototype_method_names(class_id: u32) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Ok(registry) = CLASS_VTABLE_REGISTRY.read() {
+        if let Some(vtable) = registry.as_ref().and_then(|reg| reg.get(&class_id)) {
+            names.extend(
+                vtable
+                    .methods
+                    .keys()
+                    .filter(|name| *name != "constructor")
+                    .cloned(),
+            );
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn install_class_decl_prototype_method_fields(proto: *mut ObjectHeader, class_id: u32) {
+    let proto_value = crate::value::js_nanbox_pointer(proto as i64);
+    for name in class_decl_prototype_method_names(class_id) {
+        let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+        let leaked: &'static [u8] = name.as_bytes().to_vec().leak();
+        let method = js_class_method_bind(proto_value, leaked.as_ptr(), leaked.len());
+        js_object_set_field_by_name(proto, key, method);
+        set_builtin_property_attrs(proto as usize, name, PropertyAttrs::new(true, false, true));
+    }
+}
+
+pub(crate) fn class_decl_prototype_value(class_id: u32) -> f64 {
+    if class_id == 0 || class_name_for_id(class_id).is_none() {
+        return f64::from_bits(crate::value::TAG_UNDEFINED);
+    }
+
+    let existing = class_decl_prototype_object(class_id);
+    if !existing.is_null() {
+        return crate::value::js_nanbox_pointer(existing as i64);
+    }
+
+    let proto = js_object_alloc(class_id, 0);
+    if proto.is_null() {
+        return f64::from_bits(crate::value::TAG_UNDEFINED);
+    }
+    class_decl_prototype_object_root_store(class_id, proto);
+
+    let constructor_key =
+        crate::string::js_string_from_bytes(b"constructor".as_ptr(), "constructor".len() as u32);
+    js_object_set_field_by_name(
+        proto,
+        constructor_key,
+        class_constructor_ref_value(class_id),
+    );
+    set_builtin_property_attrs(
+        proto as usize,
+        "constructor".to_string(),
+        PropertyAttrs::new(true, false, true),
+    );
+    install_class_decl_prototype_method_fields(proto, class_id);
+
+    let parent_proto_bits = get_parent_class_id(class_id)
+        .filter(|parent_id| *parent_id != 0 && *parent_id != class_id)
+        .and_then(|parent_id| {
+            let parent_proto = class_decl_prototype_value(parent_id);
+            let parent_bits = parent_proto.to_bits();
+            ((parent_bits >> 48) == 0x7FFD).then_some(parent_bits)
+        })
+        .or_else(global_object_prototype_bits);
+    if let Some(bits) = parent_proto_bits {
+        super::prototype_chain::object_set_static_prototype(proto as usize, bits);
+    }
+
+    crate::value::js_nanbox_pointer(proto as i64)
+}
+
+pub(crate) fn class_decl_prototype_value_for_instance_class(class_id: u32) -> Option<f64> {
+    if class_id == 0 || class_name_for_id(class_id).is_none() {
+        return None;
+    }
+    let proto = class_decl_prototype_value(class_id);
+    ((proto.to_bits() >> 48) == 0x7FFD).then_some(proto)
 }
 
 fn global_object_prototype_bits() -> Option<u64> {
@@ -462,7 +585,14 @@ unsafe fn resolve_proto_chain_field_inner(
             }
             let field_val = if let Some(receiver) = receiver {
                 let previous_this = js_implicit_this_set(receiver);
+                // The recursive `get_field(proto_obj, key)` re-derives a class
+                // getter's `this` from `proto_obj`; stash the real instance so an
+                // inherited getter (object-literal `get x()` on an
+                // `Object.create(proto)` prototype) binds `this` to the instance.
+                let prev_override =
+                    super::field_get_set::accessor_receiver_override_begin(receiver);
                 let value = js_object_get_field_by_name(proto_obj as *const _, key);
+                super::field_get_set::accessor_receiver_override_end(prev_override);
                 js_implicit_this_set(previous_this);
                 value
             } else {
@@ -1195,6 +1325,24 @@ pub unsafe extern "C" fn js_new_function_construct(
     args_ptr: *const f64,
     args_len: usize,
 ) -> f64 {
+    // `new <primitive>()` is a TypeError — a primitive is never a constructor
+    // (`new undefined()`, `new 5n()`, `new "s"()`, `new true()`). Checked via
+    // the unambiguous NaN-box tags only (NOT `is_number`, whose f64 range
+    // overlaps the raw-i64 pointer encoding of module-level objects). Without
+    // this, `new x.method()` where `x.method` reads back `undefined`, and other
+    // primitive callees, silently fell through to the empty-object fallback.
+    {
+        let jv = crate::value::JSValue::from_bits(func_value.to_bits());
+        if jv.is_undefined()
+            || jv.is_null()
+            || jv.is_bool()
+            || (jv.is_int32() && constructor_class_ref_id(func_value).is_none())
+            || jv.is_any_string()
+            || jv.is_bigint()
+        {
+            super::object_ops::throw_object_type_error(b"is not a constructor");
+        }
+    }
     // #3656: `new p()` where `p` is a Proxy dispatches through its `construct`
     // trap (or forwards to the target). Reached when the compiler can't prove
     // the callee is a proxy statically (e.g. `new record.proxy()`). newTarget
@@ -1209,6 +1357,9 @@ pub unsafe extern "C" fn js_new_function_construct(
         }
         let arr_box = f64::from_bits(0x7FFD_0000_0000_0000 | (a as u64 & 0x0000_FFFF_FFFF_FFFF));
         return crate::proxy::js_proxy_construct(func_value, arr_box, func_value);
+    }
+    if is_non_constructable_builtin_function_value(func_value) {
+        throw_non_constructable_builtin_function();
     }
     if let Some((module, method)) = bound_native_callable_module_and_method(func_value) {
         if module == "sqlite"
@@ -1724,34 +1875,12 @@ pub unsafe extern "C" fn js_new_function_construct(
         }
     }
 
-    // #321 (effect Layer/Scope): `new C(args)` where `C` is a *class
-    // reference held as a first-class value* — the INT32-tagged form a bare
-    // `class` identifier lowers to (`Expr::ClassRef` → `INT32_TAG |
-    // class_id`). This reaches the dynamic-new helper via the
-    // `Expr::LocalGet` callee route in `new_dynamic.rs` whenever a class is
-    // aliased through a variable / field / cross-module argument
-    // (`const C = Svc; new C()`, or effect's `flatMap(self, …)` storing a
-    // `Context.Tag` subclass into `effect_instruction_i0`). Pre-fix this
-    // value was neither a heap class-object (the `is_class_object_value`
-    // arm above) nor a pointer-shaped closure (so
-    // `synthetic_class_id_for_function` returned 0 — it requires
-    // `is_pointer()`), leaving the instance stamped with class_id 0: every
-    // inherited prototype method then threw `<m> is not a function`.
-    // Stamp the registered class id so method dispatch walks the parent
-    // chain. Mirrors the #1789 heap-class-object arm above: the constructor
-    // body / field initializers are emitted on the static `new ClassName()`
-    // codegen path (there is no constructor-by-class_id runtime entry), so a
-    // dynamically-constructed instance starts with no own props — fields
-    // written afterward and prototype methods work.
-    {
-        let bits = func_value.to_bits();
-        if (bits >> 48) == 0x7FFE {
-            let class_cid = (bits & 0xFFFF_FFFF) as u32;
-            if class_cid != 0 && is_class_id_registered(class_cid) {
-                let inst = js_object_alloc(class_cid, 0);
-                return crate::value::js_nanbox_pointer(inst as i64);
-            }
-        }
+    // #321/#4530: `new C(args)` where `C` is a first-class ClassRef, including
+    // proxy-forwarded construction. Allocate an instance stamped with the
+    // registered class id and replay the standalone constructor so field
+    // initializers and `this.foo = ...` writes match static `new ClassName()`.
+    if let Some(class_cid) = constructor_class_ref_id(func_value) {
+        return construct_registered_class_ref(class_cid, class_cid, args_ptr, args_len);
     }
     if is_arrow_function_value(func_value) {
         crate::fs::validate::throw_type_error_with_code(
@@ -1803,6 +1932,47 @@ pub unsafe extern "C" fn js_new_function_construct(
     nan_boxed
 }
 
+fn constructor_class_ref_id(value: f64) -> Option<u32> {
+    if super::class_prototype_ref_id(value).is_some() {
+        return None;
+    }
+    super::class_ref_id(value)
+}
+
+fn class_object_class_id(value: f64) -> Option<u32> {
+    if !is_class_object_value(value) {
+        return None;
+    }
+    let obj = crate::value::JSValue::from_bits(value.to_bits()).as_pointer::<ObjectHeader>();
+    let class_id = js_object_get_class_id(obj);
+    if class_id != 0 && is_class_id_registered(class_id) {
+        Some(class_id)
+    } else {
+        None
+    }
+}
+
+fn new_target_class_id(new_target: f64) -> Option<u32> {
+    constructor_class_ref_id(new_target).or_else(|| class_object_class_id(new_target))
+}
+
+unsafe fn construct_registered_class_ref(
+    target_cid: u32,
+    instance_cid: u32,
+    args_ptr: *const f64,
+    args_len: usize,
+) -> f64 {
+    let inst = if let Some((keys_array, field_count)) = registered_class_keys_array(instance_cid) {
+        js_object_alloc_class_inline_keys(instance_cid, 0, field_count, keys_array)
+    } else {
+        js_object_alloc(instance_cid, 0)
+    };
+    super::class_constructors::replay_registered_class_constructor(
+        target_cid, inst, args_ptr, args_len,
+    );
+    crate::value::js_nanbox_pointer(inst as i64)
+}
+
 fn constructor_prototype_bits(new_target: f64) -> Option<u64> {
     let bits = new_target.to_bits();
     if (bits >> 48) != 0x7FFD {
@@ -1847,8 +2017,17 @@ pub unsafe extern "C" fn js_new_function_construct_with_new_target(
         let arr_box = f64::from_bits(0x7FFD_0000_0000_0000 | (a as u64 & 0x0000_FFFF_FFFF_FFFF));
         return crate::proxy::js_proxy_construct(func_value, arr_box, nt);
     }
+    if let Some(target_cid) = constructor_class_ref_id(func_value) {
+        let instance_cid = new_target_class_id(nt).unwrap_or(target_cid);
+        return construct_registered_class_ref(target_cid, instance_cid, args_ptr, args_len);
+    }
     if !is_callable_function_value(func_value) {
         return js_new_function_construct(func_value, args_ptr, args_len);
+    }
+    if is_non_constructable_builtin_function_value(func_value)
+        || is_non_constructable_builtin_function_value(nt)
+    {
+        throw_non_constructable_builtin_function();
     }
     if is_arrow_function_value(func_value) {
         crate::fs::validate::throw_type_error_with_code(
@@ -2620,6 +2799,7 @@ pub unsafe extern "C" fn js_register_class_method(
     func_ptr: i64,
     param_count: i64,
     has_synthetic_arguments: i64,
+    has_rest: i64,
 ) {
     let name = if name_ptr.is_null() || name_len <= 0 {
         return;
@@ -2645,6 +2825,7 @@ pub unsafe extern "C" fn js_register_class_method(
             func_ptr: func_ptr as usize,
             param_count: param_count as u32,
             has_synthetic_arguments: has_synthetic_arguments != 0,
+            has_rest: has_rest != 0,
         },
     );
     VTABLE_GEN.fetch_add(1, Ordering::Release);
@@ -2758,6 +2939,7 @@ struct VTableICEntry {
     func_ptr: usize,
     param_count: u32,
     has_synthetic_arguments: u32,
+    has_rest: u32,
 }
 
 const EMPTY_VTABLE_IC_ENTRY: VTableICEntry = VTableICEntry {
@@ -2768,6 +2950,7 @@ const EMPTY_VTABLE_IC_ENTRY: VTableICEntry = VTableICEntry {
     func_ptr: 0,
     param_count: 0,
     has_synthetic_arguments: 0,
+    has_rest: 0,
 };
 
 thread_local! {
@@ -2792,7 +2975,7 @@ fn vtable_ic_slot(class_id: u32, method_name_ptr: usize) -> usize {
 pub(crate) unsafe fn vtable_ic_lookup(
     class_id: u32,
     method_name_ptr: usize,
-) -> Option<(usize, u32, bool)> {
+) -> Option<(usize, u32, bool, bool)> {
     if method_name_ptr == 0 {
         return None;
     }
@@ -2809,6 +2992,7 @@ pub(crate) unsafe fn vtable_ic_lookup(
                 entry.func_ptr,
                 entry.param_count,
                 entry.has_synthetic_arguments != 0,
+                entry.has_rest != 0,
             ))
         } else {
             None
@@ -2823,6 +3007,7 @@ pub(crate) unsafe fn vtable_ic_insert(
     func_ptr: usize,
     param_count: u32,
     has_synthetic_arguments: bool,
+    has_rest: bool,
 ) {
     if method_name_ptr == 0 {
         return;
@@ -2839,6 +3024,7 @@ pub(crate) unsafe fn vtable_ic_insert(
             func_ptr,
             param_count,
             has_synthetic_arguments: if has_synthetic_arguments { 1 } else { 0 },
+            has_rest: if has_rest { 1 } else { 0 },
         };
     });
 }
@@ -2852,6 +3038,7 @@ pub(crate) unsafe fn call_vtable_method(
     args_len: usize,
     param_count: u32,
     has_synthetic_arguments: bool,
+    has_rest: bool,
 ) -> f64 {
     #[inline(always)]
     unsafe fn arg_or_nan(args_ptr: *const f64, args_len: usize, idx: usize) -> f64 {
@@ -2890,12 +3077,31 @@ pub(crate) unsafe fn call_vtable_method(
         }
     };
 
+    // A trailing param that is either the synthesized `arguments` object or a
+    // user rest param (`method(a, ...rest)`) needs the call-site args bundled
+    // into a JS array for that slot. Without this, an apply/dynamic dispatch
+    // (`recv.method(...spread)` via `js_native_call_method_apply`) passes the
+    // raw individual args and the callee reads `rest = args[0]` as a scalar —
+    // marked's `new Marked()` -> `this.use(...e)` hit exactly this, throwing
+    // `(number).forEach is not a function`. The synthesized-`arguments` slot
+    // holds ALL passed args; a user rest slot holds only args from the rest
+    // position onward (so `method(a, ...rest)` keeps `a` positional).
     let mut adjusted_args_storage: Option<Vec<f64>> = None;
-    let (call_args_ptr, call_args_len) = if has_synthetic_arguments {
+    let (call_args_ptr, call_args_len) = if has_synthetic_arguments || has_rest {
         let visible_params = (param_count as usize).saturating_sub(1);
-        let raw_args = crate::array::js_array_alloc_with_length(args_len as u32);
-        for i in 0..args_len {
-            crate::array::js_array_set_f64(raw_args, i as u32, arg_or_nan(args_ptr, args_len, i));
+        let pack_start = if has_synthetic_arguments {
+            0
+        } else {
+            visible_params.min(args_len)
+        };
+        let packed_len = args_len.saturating_sub(pack_start);
+        let raw_args = crate::array::js_array_alloc_with_length(packed_len as u32);
+        for (slot, i) in (pack_start..args_len).enumerate() {
+            crate::array::js_array_set_f64(
+                raw_args,
+                slot as u32,
+                arg_or_nan(args_ptr, args_len, i),
+            );
         }
         let raw_args_value = crate::value::js_nanbox_pointer(raw_args as i64);
         let mut args = Vec::with_capacity(param_count as usize);
@@ -3319,6 +3525,7 @@ pub unsafe extern "C" fn js_register_class_computed_method(
                 // metadata through this registration path (only `has_rest`),
                 // so they never receive a synthesized arguments object.
                 has_synthetic_arguments: false,
+                has_rest: has_rest != 0,
             },
         );
     }
@@ -3872,11 +4079,11 @@ pub(crate) fn get_parent_class_id(class_id: u32) -> Option<u32> {
 }
 
 /// Look up a method by name in the class vtable, walking the parent chain.
-/// Returns `Some((func_ptr, param_count, has_synthetic_arguments))` if found,
-/// `None` otherwise.
+/// Returns `Some((func_ptr, param_count, has_synthetic_arguments, has_rest))`
+/// if found, `None` otherwise.
 /// Used by `js_assimilate_thenable` (refs #586) and other runtime callers
 /// that need to probe a class for a method without invoking it.
-pub fn lookup_class_method_in_chain(class_id: u32, name: &str) -> Option<(usize, u32, bool)> {
+pub fn lookup_class_method_in_chain(class_id: u32, name: &str) -> Option<(usize, u32, bool, bool)> {
     let registry = CLASS_VTABLE_REGISTRY.read().unwrap();
     let reg = registry.as_ref()?;
     let mut cur = class_id;
@@ -3887,6 +4094,7 @@ pub fn lookup_class_method_in_chain(class_id: u32, name: &str) -> Option<(usize,
                     entry.func_ptr,
                     entry.param_count,
                     entry.has_synthetic_arguments,
+                    entry.has_rest,
                 ));
             }
         }

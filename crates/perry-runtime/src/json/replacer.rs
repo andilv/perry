@@ -137,8 +137,9 @@ unsafe fn dispatch_pointer_with_replacer(
         crate::gc::GC_TYPE_OBJECT => {
             if is_object_pointer(ptr) {
                 stringify_object_with_replacer_pretty(ptr, replacer, buf, indent, depth);
-            } else if (*(ptr as *const crate::ObjectHeader)).keys_array.is_null() {
-                // Genuinely-empty object (#1704): emit "{}" not "null".
+            } else if super::stringify::object_has_no_own_keys(ptr) {
+                // Empty object (#1704) incl. a class instance with no own fields
+                // (only prototype methods/getters): emit "{}" not "null".
                 buf.push_str("{}");
             } else {
                 buf.push_str("null");
@@ -208,9 +209,19 @@ pub(crate) unsafe fn stringify_object_with_replacer_pretty(
     let actual_fields = std::cmp::min(num_fields, keys_len);
     let use_pretty = !indent.is_empty();
     let inner_depth = depth + 1;
+    // A function replacer only sees own ENUMERABLE keys (EnumerableOwnProperty
+    // Names); gated for the common no-descriptor case.
+    let filter_non_enum = crate::object::descriptors_in_use();
     buf.push('{');
     let mut first = true;
     for f in 0..actual_fields {
+        // Skip non-enumerable own keys before invoking the replacer.
+        if filter_non_enum
+            && f < keys_len
+            && super::stringify::json_key_non_enumerable(obj, *keys_elements.add(f as usize))
+        {
+            continue;
+        }
         // Get the key as a string
         let (key_str_ptr, key_str_opt) = if f < keys_len {
             let key_f64 = *keys_elements.add(f as usize);
@@ -235,8 +246,16 @@ pub(crate) unsafe fn stringify_object_with_replacer_pretty(
             nanbox_string_f64(fallback_ptr)
         };
 
-        // Get the field value, resolve toJSON, then apply the replacer.
-        let field_val = *fields_ptr.add(f as usize);
+        // Get the field value (invoking an own getter, as spec [[Get]] does),
+        // resolve toJSON, then apply the replacer.
+        let mut field_val = *fields_ptr.add(f as usize);
+        if filter_non_enum && f < keys_len {
+            if let Some(gv) =
+                crate::object::json_object_getter_value(obj, *keys_elements.add(f as usize))
+            {
+                field_val = gv;
+            }
+        }
         let field_after_to_json = apply_to_json_keyed(field_val, key_f64_for_replacer);
         let replaced = call_replacer(replacer, key_f64_for_replacer, field_after_to_json);
         let replaced_bits = replaced.to_bits();
@@ -520,6 +539,25 @@ pub(crate) unsafe fn stringify_value_pretty(
             buf.push_str("{}");
             return;
         }
+        // An empty object (incl. a class instance with no own fields — only
+        // prototype methods/getters) fails `is_object_pointer` and would be
+        // misdetected as an array by the `else` fallback below. Emit "{}" after
+        // a `toJSON` probe (a `class { toJSON() {…} }` instance carries no own
+        // field but must still honour the prototype method).
+        if gc_obj_type(ptr) == crate::gc::GC_TYPE_OBJECT
+            && super::stringify::object_has_no_own_keys(ptr)
+        {
+            if (*(ptr as *const crate::ObjectHeader)).class_id != 0 {
+                if let Some(to_json_val) = object_get_to_json(ptr) {
+                    arm_to_json_result_guard(to_json_val);
+                    stringify_value_pretty(to_json_val, TYPE_UNKNOWN, buf, indent, depth);
+                    SUPPRESS_NEXT_TO_JSON.with(|c| c.set(false));
+                    return;
+                }
+            }
+            buf.push_str("{}");
+            return;
+        }
         if type_hint == TYPE_OBJECT || (type_hint == TYPE_UNKNOWN && is_object_pointer(ptr)) {
             stringify_object_pretty(ptr, buf, indent, depth);
         } else if type_hint == TYPE_ARRAY {
@@ -588,11 +626,29 @@ pub(crate) unsafe fn stringify_object_pretty(
     let fields_ptr =
         (ptr as *const u8).add(std::mem::size_of::<crate::ObjectHeader>()) as *const f64;
     let actual_fields = std::cmp::min(num_fields, keys_len);
+    // Only own ENUMERABLE keys are serialized (gated for the common case).
+    let filter_non_enum = crate::object::descriptors_in_use();
 
     // Collect non-undefined, non-closure fields
     let mut entries: Vec<(String, f64)> = Vec::new();
     for f in 0..actual_fields {
-        let field_val = *fields_ptr.add(f as usize);
+        // Skip non-enumerable own keys (`Object.defineProperty(o, k,
+        // { enumerable: false })`) before touching the value.
+        if filter_non_enum
+            && f < keys_len
+            && super::stringify::json_key_non_enumerable(obj, *keys_elements.add(f as usize))
+        {
+            continue;
+        }
+        let mut field_val = *fields_ptr.add(f as usize);
+        // Own accessor properties: serialize the getter's return value.
+        if filter_non_enum && f < keys_len {
+            if let Some(gv) =
+                crate::object::json_object_getter_value(obj, *keys_elements.add(f as usize))
+            {
+                field_val = gv;
+            }
+        }
         let field_bits = field_val.to_bits();
         if field_bits == TAG_UNDEFINED || is_closure_value(field_bits) {
             continue;

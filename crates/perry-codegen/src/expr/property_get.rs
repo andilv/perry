@@ -34,7 +34,8 @@ use crate::type_analysis::{
 use crate::types::{DOUBLE, I1, I32, I64, I8, PTR};
 
 use super::property_get_names::{
-    is_headers_method_name, is_http_client_request_method_name, is_url_pattern_data_property,
+    is_headers_method_name, is_http_client_request_method_name, is_net_native_method_value,
+    is_url_pattern_data_property,
 };
 #[allow(unused_imports)]
 use super::{
@@ -77,6 +78,25 @@ fn lower_runtime_property_get_by_name(
         DOUBLE,
         "js_object_get_field_by_name_f64",
         &[(I64, &obj_bits), (I64, &key_handle)],
+    ))
+}
+
+fn lower_class_method_bind(
+    ctx: &mut FnCtx<'_>,
+    object: &Expr,
+    method_name: &str,
+) -> Result<String> {
+    let recv_box = lower_expr(ctx, object)?;
+    let key_idx = ctx.strings.intern(method_name);
+    let entry = ctx.strings.entry(key_idx);
+    let bytes_global = format!("@{}", entry.bytes_global);
+    let len_str = entry.byte_len.to_string();
+    let blk = ctx.block();
+    let bytes_i64 = blk.ptrtoint(&bytes_global, I64);
+    Ok(blk.call(
+        DOUBLE,
+        "js_class_method_bind",
+        &[(DOUBLE, &recv_box), (I64, &bytes_i64), (I64, &len_str)],
     ))
 }
 
@@ -149,7 +169,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             let recv_bits = blk.bitcast_double_to_i64(&recv_box);
             let recv_handle = blk.and(I64, &recv_bits, POINTER_MASK_I64);
             let len_i32 = blk.safe_load_i32_from_ptr(&recv_handle);
-            Ok(blk.sitofp(I32, &len_i32, DOUBLE))
+            Ok(blk.uitofp(I32, &len_i32, DOUBLE))
         }
 
         // Phase H err: `agg.errors` — AggregateError.errors field.
@@ -236,7 +256,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         // `arr.length` / `str.length` — INLINE. Both ArrayHeader and
         // StringHeader start with `length: u32` (`crates/perry-runtime/src
         // /array.rs` and `string.rs`). Same pattern: unbox pointer, load
-        // u32 from offset 0, sitofp to double.
+        // u32 from offset 0, uitofp to double.
         // `.length` — INLINE for array, string, and interface-typed
         // receivers. Named types (interfaces, class instances) often
         // wrap strings or arrays at runtime, where length is at offset 0.
@@ -361,7 +381,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
 
             ctx.current_block = fast_idx;
             let fast_len_i32 = ctx.block().safe_load_i32_from_ptr(&recv_handle);
-            let fast_len = ctx.block().sitofp(I32, &fast_len_i32, DOUBLE);
+            let fast_len = ctx.block().uitofp(I32, &fast_len_i32, DOUBLE);
             let fast_pred_label = ctx.block().label.clone();
             ctx.block().br(&merge_label);
 
@@ -671,6 +691,18 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // arrives. Other property shapes still fall through to
             // `0.0`.
             if matches!(object.as_ref(), Expr::GlobalGet(_)) {
+                // `process.env` read as a VALUE (not `process.env.X`) must
+                // materialize the live env object, not the `undefined` sentinel.
+                // Member reads `process.env.X` are special-cased elsewhere to
+                // `EnvGet`, but passing `process.env` whole (e.g.
+                // `EnvSchema.safeParse(process.env)` — the canonical config
+                // pattern) reached the GlobalGet fall-through and lowered to
+                // `undefined`, so the consumer iterated `undefined`. Only the
+                // `process` global exposes a meaningful `.env`, so routing by the
+                // property string alone is safe here.
+                if property == "env" {
+                    return Ok(ctx.block().call(DOUBLE, "js_process_env", &[]));
+                }
                 // #2904: V8/Node static Error members read as values
                 // (`typeof Error.isError`, `Error.stackTraceLimit`, …). The
                 // HIR collapses every builtin global receiver to
@@ -1180,30 +1212,43 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // Without this, the codegen uses the address of the
             // ClosureHeader global (wrong memory) instead of the
             // object stored in the module's export global.
+            //
+            // Gate strictly on `imported_vars`: only exported const/let
+            // bindings have a `perry_fn_<src>__<name>` *getter* whose call
+            // returns the value. For an imported *function*, that same symbol
+            // IS the function body — calling it here invoked the function with
+            // zero args (reading garbage params) and read the property off its
+            // return value. Stripe hit this on `StripeResource.method` /
+            // `.extend` (an `export { StripeResource }` function with static
+            // props); every static read invoked the constructor instead. The
+            // function/class case falls through to the generic path below,
+            // which materializes the closure value and reads its dynamic prop.
             if let Expr::ExternFuncRef { name, .. } = object.as_ref() {
-                if let Some(source_prefix) = ctx.import_function_prefixes.get(name).cloned() {
-                    // Issue #678: re-export renames mean the suffix in the
-                    // origin module differs from the consumer-visible name.
-                    let origin_suffix =
-                        import_origin_suffix(ctx.import_function_origin_names, name);
-                    let getter = format!("perry_fn_{}__{}", source_prefix, origin_suffix);
-                    ctx.pending_declares.push((getter.clone(), DOUBLE, vec![]));
-                    let obj_val = ctx.block().call(DOUBLE, &getter, &[]);
-                    // Now do property access on the actual object.
-                    let key_idx = ctx.strings.intern(property);
-                    let key_handle_global =
-                        format!("@{}", ctx.strings.entry(key_idx).handle_global);
-                    let blk = ctx.block();
-                    let obj_bits = blk.bitcast_double_to_i64(&obj_val);
-                    let obj_handle = blk.and(I64, &obj_bits, POINTER_MASK_I64);
-                    let key_box = blk.load(DOUBLE, &key_handle_global);
-                    let key_bits = blk.bitcast_double_to_i64(&key_box);
-                    let key_handle = blk.and(I64, &key_bits, POINTER_MASK_I64);
-                    return Ok(blk.call(
-                        DOUBLE,
-                        "js_object_get_field_by_name_f64",
-                        &[(I64, &obj_handle), (I64, &key_handle)],
-                    ));
+                if ctx.imported_vars.contains(name) {
+                    if let Some(source_prefix) = ctx.import_function_prefixes.get(name).cloned() {
+                        // Issue #678: re-export renames mean the suffix in the
+                        // origin module differs from the consumer-visible name.
+                        let origin_suffix =
+                            import_origin_suffix(ctx.import_function_origin_names, name);
+                        let getter = format!("perry_fn_{}__{}", source_prefix, origin_suffix);
+                        ctx.pending_declares.push((getter.clone(), DOUBLE, vec![]));
+                        let obj_val = ctx.block().call(DOUBLE, &getter, &[]);
+                        // Now do property access on the actual object.
+                        let key_idx = ctx.strings.intern(property);
+                        let key_handle_global =
+                            format!("@{}", ctx.strings.entry(key_idx).handle_global);
+                        let blk = ctx.block();
+                        let obj_bits = blk.bitcast_double_to_i64(&obj_val);
+                        let obj_handle = blk.and(I64, &obj_bits, POINTER_MASK_I64);
+                        let key_box = blk.load(DOUBLE, &key_handle_global);
+                        let key_bits = blk.bitcast_double_to_i64(&key_box);
+                        let key_handle = blk.and(I64, &key_bits, POINTER_MASK_I64);
+                        return Ok(blk.call(
+                            DOUBLE,
+                            "js_object_get_field_by_name_f64",
+                            &[(I64, &obj_handle), (I64, &key_handle)],
+                        ));
+                    }
                 }
             }
             // Getter dispatch: if the receiver is a known class and
@@ -1271,6 +1316,9 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         "js_class_method_bind",
                         &[(DOUBLE, &recv_box), (I64, &bytes_i64), (I64, &len_str)],
                     ));
+                }
+                if is_net_native_method_value(&class_name, property) {
+                    return lower_class_method_bind(ctx, object, property);
                 }
                 if class_has_computed_runtime_members(ctx, &class_name) {
                     return lower_runtime_property_get_by_name(ctx, object, property);

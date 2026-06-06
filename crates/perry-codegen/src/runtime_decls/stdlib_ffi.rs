@@ -580,9 +580,10 @@ pub fn declare_stdlib_ffi(module: &mut LlModule) {
     module.declare_function("js_zlib_unzip_sync", I64, &[DOUBLE]);
     module.declare_function("js_zlib_unzip", VOID, &[DOUBLE, DOUBLE]);
     module.declare_function("js_zlib_crc32", DOUBLE, &[DOUBLE, DOUBLE]);
-    // #1843 — Brotli one-shots (sync validates JS values; async queues callbacks).
-    module.declare_function("js_zlib_brotli_compress_sync", I64, &[DOUBLE]);
-    module.declare_function("js_zlib_brotli_decompress_sync", I64, &[DOUBLE]);
+    // Brotli sync one-shots take data as raw NaN-box bits for the same
+    // shared validation path as gzipSync/deflateSync.
+    module.declare_function("js_zlib_brotli_compress_sync", I64, &[I64]);
+    module.declare_function("js_zlib_brotli_decompress_sync", I64, &[I64]);
     module.declare_function("js_zlib_brotli_compress", VOID, &[DOUBLE, DOUBLE]);
     module.declare_function("js_zlib_brotli_decompress", VOID, &[DOUBLE, DOUBLE]);
     module.declare_function("js_zlib_zstd_compress_sync", I64, &[DOUBLE, DOUBLE]);
@@ -1521,6 +1522,11 @@ pub fn declare_stdlib_ffi(module: &mut LlModule) {
     // `Expr::DateToLocaleString` LLVM arm when the receiver's static
     // type narrows to `HirType::Number` / `HirType::Int32`.
     module.declare_function("js_number_to_locale_string", I64, &[DOUBLE]);
+    // Runtime-dispatched `value.toLocaleString()` for receivers whose
+    // static type is unknown at codegen time (plain objects, strings,
+    // booleans). Returns an already-NaN-boxed value, so the LLVM arm
+    // must NOT re-box it.
+    module.declare_function("js_value_to_locale_string", DOUBLE, &[DOUBLE]);
 
     // ========== String ==========
     module.declare_function("js_string_split_regex", I64, &[I64, I64]);
@@ -1802,7 +1808,7 @@ pub fn declare_stdlib_ffi(module: &mut LlModule) {
     module.declare_function(
         "js_register_class_method",
         VOID,
-        &[I64, I64, I64, I64, I64, I64],
+        &[I64, I64, I64, I64, I64, I64, I64],
     );
     // #1787: register a class's standalone constructor so `new
     // <classObjectValue>()` can replay it on a dynamically-allocated instance.

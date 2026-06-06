@@ -338,12 +338,56 @@ unsafe fn ordinary_object_prototype_method_value(
     }
 }
 
+thread_local! {
+    /// Receiver to bind when an accessor getter is reached by walking a
+    /// prototype chain. `js_object_get_field_by_name(proto, key)` re-derives the
+    /// accessor receiver from its `obj` argument — which is the PROTOTYPE during
+    /// an inherited read, not the original instance. `resolve_inherited_field`
+    /// stashes the real receiver here for the duration of the walk; the getter
+    /// invocation consumes it so `this` is the instance, matching the spec's
+    /// `[[Get]](P, Receiver)`. (object-literal getters on a `Object.create`
+    /// prototype — e.g. @hono/node-server's request prototype reading
+    /// `this[incomingKey].method`.)
+    static ACCESSOR_RECEIVER_OVERRIDE: std::cell::Cell<Option<f64>>
+        = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn accessor_receiver_override_begin(receiver: f64) -> Option<f64> {
+    ACCESSOR_RECEIVER_OVERRIDE.with(|c| {
+        // Keep the OUTERMOST receiver across multi-hop prototype walks.
+        let to_set = c.get().or(Some(receiver));
+        c.replace(to_set)
+    })
+}
+
+pub(crate) fn accessor_receiver_override_end(prev: Option<f64>) {
+    ACCESSOR_RECEIVER_OVERRIDE.with(|c| c.set(prev));
+}
+
+/// `this` to pass to a class getter (vtable `getters`) found while resolving a
+/// property. When the getter was reached by walking a prototype chain, `obj` is
+/// the PROTOTYPE the getter lives on — bind the original instance stashed by
+/// `resolve_inherited_field` instead. Take() consumes it so the getter body
+/// runs with a clean override.
+unsafe fn class_getter_this(obj: *const ObjectHeader) -> f64 {
+    ACCESSOR_RECEIVER_OVERRIDE
+        .with(|c| c.take())
+        .unwrap_or_else(|| f64::from_bits(crate::value::js_nanbox_pointer(obj as i64).to_bits()))
+}
+
 unsafe fn invoke_accessor_getter(get_bits: u64, receiver: f64) -> JSValue {
     let closure = (get_bits & crate::value::POINTER_MASK) as *const crate::closure::ClosureHeader;
     if closure.is_null() {
         return JSValue::undefined();
     }
-    let prev = super::js_implicit_this_set(receiver);
+    // Consume any inherited-receiver override: the getter's `this` must be the
+    // original instance, not the prototype the accessor lives on. Take() clears
+    // it so the getter BODY runs with a fresh override (a nested inherited read
+    // inside the getter gets its own).
+    let eff_receiver = ACCESSOR_RECEIVER_OVERRIDE
+        .with(|c| c.take())
+        .unwrap_or(receiver);
+    let prev = super::js_implicit_this_set(eff_receiver);
     let result_f64 = crate::closure::js_closure_call0(closure);
     super::js_implicit_this_set(prev);
     JSValue::from_bits(result_f64.to_bits())
@@ -1359,10 +1403,43 @@ pub extern "C" fn js_object_keys(obj: *const ObjectHeader) -> *mut ArrayHeader {
             let gc_header = (stripped as *const u8).sub(crate::gc::GC_HEADER_SIZE)
                 as *const crate::gc::GcHeader;
             if (*gc_header).obj_type == crate::gc::GC_TYPE_ARRAY {
-                let arr = stripped as *const crate::array::ArrayHeader;
+                // Issue #233: a grown array installs a forwarding pointer at the
+                // old location; a binding written before the grow still holds it.
+                // Resolve the chain so we read the live header (without this,
+                // `Object.keys(a)` after `a.length = N` saw a forwarding header
+                // and returned []).
+                let arr = crate::array::clean_arr_ptr(stripped as *const crate::array::ArrayHeader);
                 let length = (*arr).length;
                 if length > 100_000 {
-                    return crate::array::js_array_alloc(0);
+                    let names = crate::array::array_named_property_names(arr, true);
+                    let dense_limit = if length > (*arr).capacity && (*arr).capacity <= 1_000_000 {
+                        (*arr).capacity
+                    } else {
+                        0
+                    };
+                    let result = crate::array::js_array_alloc(
+                        dense_limit.saturating_add(names.len() as u32),
+                    );
+                    if dense_limit > 0 {
+                        let elements = (arr as *const u8)
+                            .add(std::mem::size_of::<crate::array::ArrayHeader>())
+                            as *const u64;
+                        for i in 0..dense_limit {
+                            if std::ptr::read(elements.add(i as usize)) == crate::value::TAG_HOLE {
+                                continue;
+                            }
+                            let s = i.to_string();
+                            let key_box =
+                                crate::string::js_string_new_sso(s.as_ptr(), s.len() as u32);
+                            crate::array::js_array_push_f64(result, key_box);
+                        }
+                    }
+                    for name in names {
+                        let key =
+                            crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+                        crate::array::js_array_push(result, JSValue::string_ptr(key));
+                    }
+                    return result;
                 }
                 let elements = (arr as *const u8)
                     .add(std::mem::size_of::<crate::array::ArrayHeader>())
@@ -1506,6 +1583,40 @@ pub extern "C" fn js_object_values(obj: *const ObjectHeader) -> *mut ArrayHeader
             )
         };
     }
+    // Arrays: emit each present (non-hole) element value, then enumerable named
+    // properties. `js_object_values` has no `ArrayHeader` layout, so the generic
+    // object path below would read an array's body as object fields and crash;
+    // handle arrays explicitly (mirrors the `js_object_keys` array branch).
+    if !stripped.is_null() && (stripped as usize) >= crate::gc::GC_HEADER_SIZE + 0x1000 {
+        unsafe {
+            let gc_header = (stripped as *const u8).sub(crate::gc::GC_HEADER_SIZE)
+                as *const crate::gc::GcHeader;
+            if (*gc_header).obj_type == crate::gc::GC_TYPE_ARRAY {
+                let arr = crate::array::clean_arr_ptr(stripped as *const crate::array::ArrayHeader);
+                let length = (*arr).length;
+                if length > 100_000 {
+                    return crate::array::js_array_alloc(0);
+                }
+                let elements = (arr as *const u8)
+                    .add(std::mem::size_of::<crate::array::ArrayHeader>())
+                    as *const u64;
+                let result = crate::array::js_array_alloc(length);
+                for i in 0..length {
+                    if std::ptr::read(elements.add(i as usize)) == crate::value::TAG_HOLE {
+                        continue;
+                    }
+                    let v = crate::array::js_array_get(arr, i);
+                    crate::array::js_array_push_f64(result, f64::from_bits(v.bits()));
+                }
+                for name in crate::array::array_named_property_names(arr, true) {
+                    if let Some(v) = crate::array::array_named_property_get_by_name(arr, &name) {
+                        crate::array::js_array_push_f64(result, v);
+                    }
+                }
+                return result;
+            }
+        }
+    }
     if obj.is_null() || !is_valid_obj_ptr(obj as *const u8) {
         // Issue #893: defensive sibling of `js_object_entries` —
         // see that function's comment for the rationale.
@@ -1570,6 +1681,57 @@ pub extern "C" fn js_object_entries(obj: *const ObjectHeader) -> *mut ArrayHeade
                 stripped as *const crate::typedarray::TypedArrayHeader,
             )
         };
+    }
+    // Arrays: emit [index, value] pairs for present elements, then named props.
+    // `js_object_entries` has no `ArrayHeader` layout, so the generic object
+    // path below would read an array's body as object fields and crash; handle
+    // arrays explicitly (mirrors the `js_object_keys` / `js_object_values`
+    // array branches).
+    if !stripped.is_null() && (stripped as usize) >= crate::gc::GC_HEADER_SIZE + 0x1000 {
+        unsafe {
+            let gc_header = (stripped as *const u8).sub(crate::gc::GC_HEADER_SIZE)
+                as *const crate::gc::GcHeader;
+            if (*gc_header).obj_type == crate::gc::GC_TYPE_ARRAY {
+                let arr = crate::array::clean_arr_ptr(stripped as *const crate::array::ArrayHeader);
+                let length = (*arr).length;
+                if length > 100_000 {
+                    return crate::array::js_array_alloc(0);
+                }
+                let elements = (arr as *const u8)
+                    .add(std::mem::size_of::<crate::array::ArrayHeader>())
+                    as *const u64;
+                let result = crate::array::js_array_alloc(length);
+                for i in 0..length {
+                    if std::ptr::read(elements.add(i as usize)) == crate::value::TAG_HOLE {
+                        continue;
+                    }
+                    let pair = crate::array::js_array_alloc(2);
+                    let s = i.to_string();
+                    let key_box = crate::string::js_string_new_sso(s.as_ptr(), s.len() as u32);
+                    crate::array::js_array_push_f64(pair, key_box);
+                    let v = crate::array::js_array_get(arr, i);
+                    crate::array::js_array_push_f64(pair, f64::from_bits(v.bits()));
+                    crate::array::js_array_push_f64(
+                        result,
+                        crate::value::js_nanbox_pointer(pair as i64),
+                    );
+                }
+                for name in crate::array::array_named_property_names(arr, true) {
+                    if let Some(v) = crate::array::array_named_property_get_by_name(arr, &name) {
+                        let pair = crate::array::js_array_alloc(2);
+                        let key =
+                            crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+                        crate::array::js_array_push(pair, JSValue::string_ptr(key));
+                        crate::array::js_array_push_f64(pair, v);
+                        crate::array::js_array_push_f64(
+                            result,
+                            crate::value::js_nanbox_pointer(pair as i64),
+                        );
+                    }
+                }
+                return result;
+            }
+        }
     }
     if obj.is_null() || !is_valid_obj_ptr(obj as *const u8) {
         // Issue #893 lineage: chalk's `Object.entries(ansiStyles)` passed a
@@ -1832,11 +1994,10 @@ pub extern "C" fn js_object_has_property(obj: f64, key: f64) -> f64 {
             let gc_header =
                 (obj_ptr as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
             if (*gc_header).obj_type == crate::gc::GC_TYPE_ARRAY {
-                let arr = obj_ptr as *const crate::array::ArrayHeader;
+                // Issue #233: resolve a grow forwarding pointer so `index in arr`
+                // / `arr.hasOwnProperty(i)` stay correct after `arr.length = N`.
+                let arr = crate::array::clean_arr_ptr(obj_ptr as *const crate::array::ArrayHeader);
                 let length = (*arr).length;
-                if length > 100_000 {
-                    return nanbox_false;
-                }
                 // Numeric key: extract the index. Accept both NaN-boxed i32
                 // and plain f64 (e.g. literal `1`) provided it's a
                 // non-negative integer in range.
@@ -1861,6 +2022,13 @@ pub extern "C" fn js_object_has_property(obj: f64, key: f64) -> f64 {
                     if idx >= length {
                         return nanbox_false;
                     }
+                    let sparse_key = idx.to_string();
+                    if crate::array::array_named_property_get_by_name(arr, &sparse_key).is_some() {
+                        return nanbox_true;
+                    }
+                    if idx >= (*arr).capacity {
+                        return nanbox_false;
+                    }
                     let elements = (arr as *const u8)
                         .add(std::mem::size_of::<crate::array::ArrayHeader>())
                         as *const u64;
@@ -1876,24 +2044,11 @@ pub extern "C" fn js_object_has_property(obj: f64, key: f64) -> f64 {
                         if let Some(key_name) =
                             super::has_own_helpers::str_from_string_header(key_str)
                         {
-                            if key_name == "length" {
+                            if super::has_own_helpers::array_own_key_present(arr, key_str) {
                                 return nanbox_true;
                             }
-                            if let Some(index) = super::canonical_array_index(key_name) {
-                                if index < length {
-                                    let elements = (arr as *const u8)
-                                        .add(std::mem::size_of::<crate::array::ArrayHeader>())
-                                        as *const u64;
-                                    if std::ptr::read(elements.add(index as usize))
-                                        != crate::value::TAG_HOLE
-                                    {
-                                        return nanbox_true;
-                                    }
-                                }
+                            if super::canonical_array_index(key_name).is_some() {
                                 return nanbox_false;
-                            }
-                            if crate::array::array_named_property_has(arr, key_str) {
-                                return nanbox_true;
                             }
                             if array_prototype_property_value(key_name, obj_ptr as usize).is_some()
                             {
@@ -2243,6 +2398,28 @@ pub extern "C" fn js_object_get_field_by_name(
                         let v = js_get_global_this_builtin_value(b"Date".as_ptr(), 4);
                         return JSValue::from_bits(v.to_bits());
                     }
+                    // A Date method read as a *value* (`const f = d.getTime`,
+                    // `typeof d.toISOString`, `d.toJSON === Date.prototype.toJSON`)
+                    // resolves to the same thunk installed on `Date.prototype`.
+                    // The `d.method()` call form is handled by codegen's fast
+                    // path and never reaches here, so this only affects value
+                    // reads. Unknown keys still return undefined.
+                    let date_ctor = js_get_global_this_builtin_value(b"Date".as_ptr(), 4);
+                    let cv = JSValue::from_bits(date_ctor.to_bits());
+                    if cv.is_pointer() {
+                        let ctor_ptr = cv.as_pointer::<crate::closure::ClosureHeader>() as usize;
+                        let proto = crate::closure::closure_get_dynamic_prop(ctor_ptr, "prototype");
+                        let pv = JSValue::from_bits(proto.to_bits());
+                        if pv.is_pointer() {
+                            let proto_ptr = pv.as_pointer::<ObjectHeader>();
+                            if !proto_ptr.is_null() {
+                                let m = js_object_get_field_by_name(proto_ptr, key);
+                                if !m.is_undefined() {
+                                    return JSValue::from_bits(m.bits());
+                                }
+                            }
+                        }
+                    }
                 }
             }
             return JSValue::undefined();
@@ -2320,7 +2497,11 @@ pub extern "C" fn js_object_get_field_by_name(
                     && is_class_id_registered(class_id)
                     && !is_prototype_ref
                 {
-                    let value = super::class_prototype_ref_value(class_id);
+                    let value = super::class_registry::class_decl_prototype_value(class_id);
+                    if value.to_bits() == crate::value::TAG_UNDEFINED {
+                        let value = super::class_prototype_ref_value(class_id);
+                        return JSValue::from_bits(value.to_bits());
+                    }
                     return JSValue::from_bits(value.to_bits());
                 }
                 if class_id != 0 && class_has_own_method(class_id, name) {
@@ -3806,9 +3987,7 @@ pub extern "C" fn js_object_get_field_by_name(
                             while depth < 32 {
                                 if let Some(vtable) = reg.get(&cid) {
                                     if let Some(&getter_ptr) = vtable.getters.get(name) {
-                                        let this_f64 = f64::from_bits(
-                                            crate::value::js_nanbox_pointer(obj as i64).to_bits(),
-                                        );
+                                        let this_f64 = class_getter_this(obj);
                                         let f: extern "C" fn(f64) -> f64 =
                                             std::mem::transmute(getter_ptr);
                                         return JSValue::from_bits(f(this_f64).to_bits());
@@ -4072,9 +4251,7 @@ pub extern "C" fn js_object_get_field_by_name(
                                     // Getters take `this` as f64 (NaN-boxed
                                     // POINTER_TAG), matching the codegen
                                     // calling convention for class methods.
-                                    let this_f64: f64 = f64::from_bits(
-                                        crate::value::js_nanbox_pointer(obj as i64).to_bits(),
-                                    );
+                                    let this_f64: f64 = class_getter_this(obj);
                                     let f: extern "C" fn(f64) -> f64 =
                                         std::mem::transmute(getter_ptr);
                                     return JSValue::from_bits(f(this_f64).to_bits());

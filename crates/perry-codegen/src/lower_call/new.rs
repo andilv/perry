@@ -132,6 +132,33 @@ fn pack_lowered_args_array(ctx: &mut FnCtx<'_>, args: &[String]) -> String {
     nanbox_pointer_inline(ctx.block(), &current)
 }
 
+/// The effective constructor arity for `new <class>(...)`: the class's own
+/// ctor params, else — for a subclass with no own ctor — the closest
+/// ancestor-with-a-ctor's param count (the synthesized default ctor forwards
+/// `super(...args)`). Matches the standalone-ctor signature emitted in
+/// `codegen/artifacts.rs`, so callers pass the right number of args.
+fn effective_constructor_param_count(ctx: &FnCtx<'_>, class: &perry_hir::Class) -> usize {
+    if let Some(ctor) = class.constructor.as_ref() {
+        return ctor.params.len();
+    }
+    let mut parent = class.extends_name.as_deref();
+    while let Some(pname) = parent {
+        if let Some((_sym, n)) = ctx.imported_class_ctors.get(pname) {
+            return *n;
+        }
+        match ctx.classes.get(pname).copied() {
+            Some(pc) => {
+                if let Some(pctor) = pc.constructor.as_ref() {
+                    return pctor.params.len();
+                }
+                parent = pc.extends_name.as_deref();
+            }
+            None => break,
+        }
+    }
+    0
+}
+
 fn call_local_constructor_symbol(
     ctx: &mut FnCtx<'_>,
     class: &perry_hir::Class,
@@ -146,11 +173,18 @@ fn call_local_constructor_symbol(
     else {
         return;
     };
-    let param_count = class
-        .constructor
-        .as_ref()
-        .map(|ctor| ctor.params.len())
-        .unwrap_or(0);
+    // The standalone `<class>_constructor` symbol's signature is the class's
+    // OWN ctor params, OR — when the class has no own ctor — the closest
+    // ancestor-with-a-ctor's params (codegen/artifacts.rs synthesizes the
+    // default ctor `constructor(...args) { super(...args) }` with that adopted
+    // signature). Mirror that here so we pass the constructor arguments through
+    // this nested-construction path. Reading `param_count` from `class.constructor`
+    // alone yielded 0 for a no-own-ctor subclass, so `new Sub(arg)` issued inside a
+    // method of `Sub` (the recursion-guarded symbol-call path) dropped every arg —
+    // the synthesized ctor's forwarded params then read uninitialized and the
+    // inherited `this.x = arg` stored garbage. Pervasive in zod (`new ZodNumber({…})`
+    // from `_addCheck`, where ZodNumber has no own ctor and ZodType does).
+    let param_count = effective_constructor_param_count(ctx, class);
     let undef_lit = double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
     let mut ctor_values = lowered_args.to_vec();
     ctor_values.truncate(param_count);
@@ -735,6 +769,27 @@ pub(crate) fn lower_new(ctx: &mut FnCtx<'_>, class_name: &str, args: &[Expr]) ->
                     ctx.class_stack.push(class_name.to_string());
 
                     restore_inline_constructor_scope(ctx, saved_scope);
+
+                    // Apply the field initializers of every class BELOW the
+                    // inherited-ctor class — the leaf and any intermediates —
+                    // now that the parent ctor body has run (the post-super()
+                    // step, mirroring the own-ctor path's SelfOnly-after). The
+                    // up-front pass above used `UpToInclusive(inherited)`, which
+                    // keeps `chain[0..=idx(inherited)]` and therefore EXCLUDES
+                    // the leaf, so without this a no-own-ctor subclass's own
+                    // field initializers never ran — e.g. zod's
+                    // `class ZodObject extends ZodType { private _cached = null }`
+                    // left `_cached` at the raw-0 slot, so `_getCached()`'s
+                    // `this._cached !== null` was true (0 !== null) and returned
+                    // 0; `_parse` then destructured `{ keys }` off 0, iterated
+                    // nothing, and every `z.object({...}).parse()` dropped all
+                    // fields.
+                    apply_field_initializers_recursive(
+                        ctx,
+                        class_name,
+                        FieldInitMode::BetweenExclusiveTo(pname.to_string()),
+                    )?;
+
                     found_inherited_ctor = true;
                     break; // Found and inlined the parent ctor.
                 }

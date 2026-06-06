@@ -1433,44 +1433,15 @@ pub(crate) fn lower_expr(ctx: &mut LoweringContext, expr: &ast::Expr) -> Result<
                     let prop_expr = match &member.prop {
                         ast::MemberProp::Ident(ident) => {
                             let prop_name = ident.sym.to_string();
-                            // Mirror the eager-fold from
-                            // `expr_member::lower_member` for `m.index` /
-                            // `m.groups` when `m` is a tracked
-                            // regex.exec()/string.match() result. The
-                            // standard `lower_member` fires when the
-                            // AST is `m.groups`; for the optional-chain
-                            // form `m?.groups` SWC routes here, the
-                            // `member.obj` has already been lowered to
-                            // `LocalGet(...)`, so `lower_member`'s
-                            // `ast::Expr::Ident` check fails. Intercept
-                            // here so the optional-chain shape also
-                            // resolves to the thread-local groups
-                            // object instead of a generic property
-                            // read that returns undefined.
-                            if (prop_name == "groups" || prop_name == "index")
-                                && match member.obj.as_ref() {
-                                    ast::Expr::Ident(ident) => {
-                                        ctx.regex_exec_locals.contains(&ident.sym.to_string())
-                                    }
-                                    ast::Expr::TsNonNull(nn) => match nn.expr.as_ref() {
-                                        ast::Expr::Ident(ident) => {
-                                            ctx.regex_exec_locals.contains(&ident.sym.to_string())
-                                        }
-                                        _ => false,
-                                    },
-                                    _ => false,
-                                }
-                            {
-                                if prop_name == "groups" {
-                                    Expr::RegExpExecGroups
-                                } else {
-                                    Expr::RegExpExecIndex
-                                }
-                            } else {
-                                Expr::PropertyGet {
-                                    object: Box::new(obj_expr.clone()),
-                                    property: prop_name,
-                                }
+                            // RegExp exec/match `.index` / `.groups` / `.input`
+                            // are real own properties on the result array
+                            // (regex.rs), so they resolve as a generic
+                            // PropertyGet — no thread-local fold. This keeps a
+                            // stored result correct after an intervening match
+                            // on another regex.
+                            Expr::PropertyGet {
+                                object: Box::new(obj_expr.clone()),
+                                property: prop_name,
                             }
                         }
                         ast::MemberProp::Computed(comp) => {

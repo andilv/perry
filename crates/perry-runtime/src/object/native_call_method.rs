@@ -144,7 +144,7 @@ pub unsafe extern "C" fn js_native_call_method_value(
                 let class_id = (bits & 0xFFFF_FFFF) as u32;
                 let is_prototype_ref = crate::object::class_prototype_ref_id(object).is_some();
                 if is_prototype_ref {
-                    if let Some((func_ptr, param_count, _has_rest)) =
+                    if let Some((func_ptr, param_count, has_rest)) =
                         lookup_class_symbol_method_in_chain(class_id, sym_key, false)
                     {
                         return call_vtable_method(
@@ -153,10 +153,11 @@ pub unsafe extern "C" fn js_native_call_method_value(
                             args_ptr,
                             args_len,
                             param_count,
-                            // Computed symbol methods track `has_rest`, not a
-                            // synthetic-arguments flag, and never synthesize an
-                            // `arguments` object — so pass `false`.
+                            // Computed symbol methods never synthesize an
+                            // `arguments` object, but DO carry a `has_rest`
+                            // flag for a trailing user rest param.
                             false,
+                            has_rest,
                         );
                     }
                 } else {
@@ -199,7 +200,7 @@ pub unsafe extern "C" fn js_native_call_method_value(
                     if !obj.is_null() && is_valid_obj_ptr(obj as *const u8) {
                         let class_id = js_object_get_class_id(obj);
                         if class_id != 0 {
-                            if let Some((func_ptr, param_count, _has_rest)) =
+                            if let Some((func_ptr, param_count, has_rest)) =
                                 lookup_class_symbol_method_in_chain(class_id, sym_key, false)
                             {
                                 let this_i64 = obj as i64;
@@ -210,8 +211,9 @@ pub unsafe extern "C" fn js_native_call_method_value(
                                     args_len,
                                     param_count,
                                     // Computed symbol methods never synthesize an
-                                    // `arguments` object.
+                                    // `arguments` object, but DO carry `has_rest`.
                                     false,
+                                    has_rest,
                                 );
                             }
                         }
@@ -392,17 +394,32 @@ fn throw_object_to_string_not_function() -> ! {
 #[inline]
 unsafe fn gc_pointer_and_type_from_value(value: f64) -> Option<(*const u8, u8)> {
     let jsval = JSValue::from_bits(value.to_bits());
-    if !jsval.is_pointer() {
-        return None;
-    }
-    let ptr = jsval.as_pointer::<u8>();
-    if ptr.is_null()
-        || (ptr as usize) < crate::gc::GC_HEADER_SIZE + 0x1000
-        || !is_valid_obj_ptr(ptr as *const u8)
-    {
+    let ptr = if jsval.is_pointer() {
+        jsval.as_pointer::<u8>()
+    } else {
+        let bits = value.to_bits();
+        if (bits >> 48) == 0 && bits >= (crate::gc::GC_HEADER_SIZE as u64) + 0x1000 {
+            bits as *const u8
+        } else {
+            return None;
+        }
+    };
+    if ptr.is_null() || (ptr as usize) < crate::gc::GC_HEADER_SIZE + 0x1000 {
         return None;
     }
     let addr = ptr as usize;
+    if crate::buffer::is_any_array_buffer(addr) {
+        return Some((ptr, crate::gc::GC_TYPE_BUFFER));
+    }
+    if crate::buffer::is_uint8array_buffer(addr) {
+        return Some((ptr, crate::gc::GC_TYPE_BUFFER));
+    }
+    if crate::typedarray::lookup_typed_array_kind(addr).is_some() {
+        return Some((ptr, crate::gc::GC_TYPE_TYPED_ARRAY));
+    }
+    if !is_valid_obj_ptr(ptr as *const u8) {
+        return None;
+    }
     if crate::set::is_registered_set(addr)
         || crate::map::is_registered_map(addr)
         || crate::regex::is_regex_pointer(ptr as *const u8)
@@ -510,10 +527,31 @@ pub(crate) unsafe fn js_object_default_to_locale_string(receiver: f64) -> f64 {
     crate::object::js_object_to_string(receiver)
 }
 
+/// #4546: codegen entry point for `value.toLocaleString()` when the
+/// receiver's static type is unknown (plain object, string, boolean) — the
+/// `Expr::DateToLocaleString` LLVM arm used to mis-route every non-number
+/// receiver to `js_date_to_locale_string`, yielding a 1970-epoch
+/// "Invalid Date" string. Dispatches on the runtime tag (number → grouping,
+/// Date → date string, object → custom/`[object Object]`). Returns an
+/// already-NaN-boxed value.
+#[no_mangle]
+pub extern "C" fn js_value_to_locale_string(receiver: f64) -> f64 {
+    unsafe { js_object_default_to_locale_string(receiver) }
+}
+
 /// Shared implementation for `Object.prototype.isPrototypeOf`.
 pub(crate) unsafe fn js_object_is_prototype_of_value(receiver: f64, target: f64) -> bool {
-    let receiver_ptr = match object_ptr_from_value(receiver) {
-        Some(ptr) => ptr,
+    // The receiver (and every link in the target's `[[Prototype]]` chain) is
+    // compared by raw heap address. Exotic-typed prototype objects —
+    // `Array.prototype` is itself a GC_TYPE_ARRAY, `Uint8Array.prototype` a
+    // typed-array proto — are NOT `GC_TYPE_OBJECT`, so resolving them with
+    // `object_ptr_from_value` (which only accepts GC_TYPE_OBJECT) returned
+    // `None` and the walk bailed. #4549: use the raw GC pointer instead.
+    let heap_addr = |v: f64| -> Option<usize> {
+        gc_pointer_and_type_from_value(v).map(|(ptr, _)| ptr as usize)
+    };
+    let receiver_addr = match heap_addr(receiver) {
+        Some(addr) => addr,
         None => return false,
     };
 
@@ -524,21 +562,21 @@ pub(crate) unsafe fn js_object_is_prototype_of_value(receiver: f64, target: f64)
             return false;
         }
         let proto = crate::closure::closure_get_dynamic_prop(ctor_ptr, "prototype");
-        if let Some(proto_ptr) = object_ptr_from_value(proto) {
-            return std::ptr::addr_eq(proto_ptr, receiver_ptr);
+        if let Some(proto_addr) = heap_addr(proto) {
+            return proto_addr == receiver_addr;
         }
         return false;
     }
 
     let target_jsval = JSValue::from_bits(target.to_bits());
-    if !target_jsval.is_pointer() {
+    if !target_jsval.is_pointer() && gc_pointer_and_type_from_value(target).is_none() {
         return false;
     }
 
     if let Some(target_ptr) = object_ptr_from_value(target) {
         let has_instance_prototype =
             crate::object::prototype_chain::object_static_prototype(target_ptr as usize).is_some();
-        if std::ptr::addr_eq(target_ptr, receiver_ptr) {
+        if target_ptr as usize == receiver_addr {
             return false;
         }
         // A `new Func()` instance snapshots the function's current
@@ -559,7 +597,7 @@ pub(crate) unsafe fn js_object_is_prototype_of_value(receiver: f64, target: f64)
                 let proto_obj = crate::object::class_registry::class_prototype_object(cid);
                 let mut next_cid = 0;
                 if !proto_obj.is_null() {
-                    if std::ptr::addr_eq(proto_obj, receiver_ptr) {
+                    if proto_obj as usize == receiver_addr {
                         return true;
                     }
                     next_cid =
@@ -586,8 +624,21 @@ pub(crate) unsafe fn js_object_is_prototype_of_value(receiver: f64, target: f64)
             Some(info) => info,
             None => return false,
         };
+        // #4549: arrays and typed arrays are objects whose `[[Prototype]]`
+        // chain is modeled (`Array.prototype` → `Object.prototype`,
+        // `Uint8Array.prototype` → `%TypedArray%.prototype` →
+        // `Object.prototype`), so they must reach the generic walk below.
+        // Previously only closures/errors were allowed, so
+        // `Array.prototype.isPrototypeOf([1, 2])` and
+        // `Object.prototype.isPrototypeOf([])` wrongly returned `false`.
+        // #4554: ArrayBuffer / SharedArrayBuffer use BufferHeader storage
+        // without a GcHeader for small buffers, but they still have a modeled
+        // prototype chain via `js_object_get_prototype_of`.
         if target_gc_type != crate::gc::GC_TYPE_CLOSURE
             && target_gc_type != crate::gc::GC_TYPE_ERROR
+            && target_gc_type != crate::gc::GC_TYPE_ARRAY
+            && target_gc_type != crate::gc::GC_TYPE_TYPED_ARRAY
+            && target_gc_type != crate::gc::GC_TYPE_BUFFER
         {
             return false;
         }
@@ -595,20 +646,20 @@ pub(crate) unsafe fn js_object_is_prototype_of_value(receiver: f64, target: f64)
 
     let mut current = target;
     for _ in 0..32 {
-        let current_ptr = object_ptr_from_value(current);
+        let current_addr = heap_addr(current);
         let proto = crate::object::js_object_get_prototype_of(current);
         let proto_jsval = JSValue::from_bits(proto.to_bits());
         if proto_jsval.is_null() || proto_jsval.is_undefined() {
             break;
         }
-        let proto_ptr = match object_ptr_from_value(proto) {
-            Some(ptr) => ptr,
+        let proto_addr = match heap_addr(proto) {
+            Some(addr) => addr,
             None => break,
         };
-        if current_ptr.is_some_and(|ptr| std::ptr::addr_eq(ptr, proto_ptr)) {
+        if current_addr == Some(proto_addr) {
             break;
         }
-        if std::ptr::addr_eq(proto_ptr, receiver_ptr) {
+        if proto_addr == receiver_addr {
             return true;
         }
         current = proto;
@@ -969,6 +1020,59 @@ fn throw_fn_proto_not_callable(method: &str) -> ! {
     crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64))
 }
 
+/// Dispatch `receiver.<method>(args)` straight through the class vtable,
+/// bypassing any own data property of the same name. Returns `None` when the
+/// receiver is not a class instance whose prototype chain defines `method`, so
+/// the caller falls back to the ordinary by-name lookup.
+///
+/// Used by bound-method VALUE dispatch (`dispatch_bound_method`): a method
+/// captured at READ time (`const f = obj.m`) must keep invoking that method even
+/// after `obj.m` is reassigned — the ubiquitous `this.m = this.m.bind(this)`
+/// pattern. Re-resolving by name would find the own (bound) property and recurse
+/// until the call-depth guard returns the null object.
+pub(crate) unsafe fn try_dispatch_instance_method_value(
+    receiver: f64,
+    method_name_ptr: *const i8,
+    method_name_len: usize,
+    args_ptr: *const f64,
+    args_len: usize,
+) -> Option<f64> {
+    if method_name_ptr.is_null() || method_name_len == 0 {
+        return None;
+    }
+    let jsval = JSValue::from_bits(receiver.to_bits());
+    if !jsval.is_pointer() {
+        return None;
+    }
+    let raw = crate::value::js_nanbox_get_pointer(receiver) as usize;
+    if raw < 0x100000 {
+        return None;
+    }
+    let ptr = raw as *const ObjectHeader;
+    // `js_object_get_class_id` returns 0 for anything that isn't a user class
+    // instance (null/non-pointer, Set/Map/Regex headers, closures, namespaces).
+    let class_id = crate::object::js_object_get_class_id(ptr);
+    if class_id == 0 {
+        return None;
+    }
+    let name = std::str::from_utf8(std::slice::from_raw_parts(
+        method_name_ptr as *const u8,
+        method_name_len,
+    ))
+    .ok()?;
+    let (func_ptr, param_count, has_synthetic_arguments, has_rest) =
+        crate::object::class_registry::lookup_class_method_in_chain(class_id, name)?;
+    Some(crate::object::class_registry::call_vtable_method(
+        func_ptr,
+        receiver.to_bits() as i64,
+        args_ptr,
+        args_len,
+        param_count,
+        has_synthetic_arguments,
+        has_rest,
+    ))
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn js_native_call_method(
     object: f64,
@@ -1052,10 +1156,46 @@ pub unsafe extern "C" fn js_native_call_method(
         return f64::from_bits(0x7FF8_0000_0000_0001); // undefined
     }
 
+    // #4661 follow-up: a *fused* method call `proxy.method(args)` on a Proxy
+    // receiver. The decomposed form `const f = proxy.method; f(args)` already
+    // works because the property read routes through `js_proxy_get`. The fused
+    // form, however, reaches this generic dispatcher with the proxy id intact.
+    // Proxy ids encode to small pointer-tagged values (band 0xF0000..0x100000),
+    // so without this guard the receiver is misclassified as a native-module
+    // *integer handle* by the `raw_ptr < 0x100000` small-handle dispatch below
+    // (when an app links a native handle dispatcher, e.g. mysql2 / Fastify),
+    // which returns null for an unknown id — silently dropping the call.
+    //
+    // Mirror the spec: `Get(proxy, "method")` (honors the get trap / forwards
+    // through the target's prototype chain) then `Call(method, proxy, args)`
+    // with `this` bound to the proxy itself.
+    if crate::proxy::js_proxy_is_proxy(object) == 1 {
+        let key = crate::string::js_string_from_bytes(
+            method_name_ptr as *const u8,
+            method_name_len as u32,
+        );
+        let key_box = f64::from_bits(JSValue::string_ptr(key).bits());
+        let key_handle = root_scope.root_nanbox_f64(key_box);
+        let method_value =
+            crate::proxy::js_proxy_get(object_handle.get_nanbox_f64(), key_handle.get_nanbox_f64());
+        let method_handle = root_scope.root_nanbox_f64(method_value);
+        let args = refreshed_args();
+        // Bind `this` to the proxy for the duration of the call, matching the
+        // receiver semantics of a normal `obj.method(args)` invocation.
+        let prev_this = IMPLICIT_THIS.with(|c| c.replace(object_handle.get_nanbox_f64().to_bits()));
+        let result = crate::closure::js_native_call_value(
+            method_handle.get_nanbox_f64(),
+            args.as_ptr(),
+            args.len(),
+        );
+        IMPLICIT_THIS.with(|c| c.set(prev_this));
+        return result;
+    }
+
     if (object.to_bits() >> 48) == 0x7FFE {
         let class_id = (object.to_bits() & 0xFFFF_FFFF) as u32;
         if crate::object::class_prototype_ref_id(object).is_some() {
-            if let Some((func_ptr, param_count, has_synthetic_arguments)) =
+            if let Some((func_ptr, param_count, has_synthetic_arguments, has_rest)) =
                 crate::object::class_registry::lookup_class_method_in_chain(class_id, method_name)
             {
                 return crate::object::class_registry::call_vtable_method(
@@ -1065,6 +1205,7 @@ pub unsafe extern "C" fn js_native_call_method(
                     args_len,
                     param_count,
                     has_synthetic_arguments,
+                    has_rest,
                 );
             }
         } else if class_id != 0
@@ -1088,6 +1229,9 @@ pub unsafe extern "C" fn js_native_call_method(
         // falling through to the generic `"[object Object]"`.
         let raw_addr = crate::value::js_nanbox_get_pointer(object) as usize;
         if raw_addr >= 0x100000 && crate::closure::is_closure_ptr(raw_addr) {
+            if let Some(result) = crate::value::function_to_string_method_result(object) {
+                return result;
+            }
             let func_ptr = (*(raw_addr as *const crate::closure::ClosureHeader)).func_ptr as usize;
             let s = crate::builtins::function_source_for_func_ptr(func_ptr);
             let str_ptr = crate::string::js_string_from_bytes(s.as_ptr(), s.len() as u32);
@@ -2717,7 +2861,7 @@ pub unsafe extern "C" fn js_native_call_method(
             // Vtable lookup for class instances — fast path via per-callsite IC
             let class_id = (*obj).class_id;
             if class_id != 0 {
-                if let Some((func_ptr, param_count, has_synthetic_arguments)) =
+                if let Some((func_ptr, param_count, has_synthetic_arguments, has_rest)) =
                     vtable_ic_lookup(class_id, method_name_ptr as usize)
                 {
                     let this_i64 = jsval.as_pointer::<u8>() as i64;
@@ -2728,6 +2872,7 @@ pub unsafe extern "C" fn js_native_call_method(
                         args_len,
                         param_count,
                         has_synthetic_arguments,
+                        has_rest,
                     );
                 }
                 if let Ok(registry) = CLASS_VTABLE_REGISTRY.read() {
@@ -2754,6 +2899,7 @@ pub unsafe extern "C" fn js_native_call_method(
                                         entry.func_ptr,
                                         entry.param_count,
                                         entry.has_synthetic_arguments,
+                                        entry.has_rest,
                                     );
                                     let this_i64 = jsval.as_pointer::<u8>() as i64;
                                     return call_vtable_method(
@@ -2763,6 +2909,7 @@ pub unsafe extern "C" fn js_native_call_method(
                                         args_len,
                                         entry.param_count,
                                         entry.has_synthetic_arguments,
+                                        entry.has_rest,
                                     );
                                 }
                             }
@@ -3158,7 +3305,7 @@ pub unsafe extern "C" fn js_native_call_method(
             // Vtable lookup — fast path via per-callsite IC
             let class_id = (*obj).class_id;
             if class_id != 0 {
-                if let Some((func_ptr, param_count, has_synthetic_arguments)) =
+                if let Some((func_ptr, param_count, has_synthetic_arguments, has_rest)) =
                     vtable_ic_lookup(class_id, method_name_ptr as usize)
                 {
                     let this_i64 = raw_bits as i64;
@@ -3169,6 +3316,7 @@ pub unsafe extern "C" fn js_native_call_method(
                         args_len,
                         param_count,
                         has_synthetic_arguments,
+                        has_rest,
                     );
                 }
                 if let Ok(registry) = CLASS_VTABLE_REGISTRY.read() {
@@ -3186,6 +3334,7 @@ pub unsafe extern "C" fn js_native_call_method(
                                         entry.func_ptr,
                                         entry.param_count,
                                         entry.has_synthetic_arguments,
+                                        entry.has_rest,
                                     );
                                     let this_i64 = raw_bits as i64;
                                     return call_vtable_method(
@@ -3195,6 +3344,7 @@ pub unsafe extern "C" fn js_native_call_method(
                                         args_len,
                                         entry.param_count,
                                         entry.has_synthetic_arguments,
+                                        entry.has_rest,
                                     );
                                 }
                             }
@@ -3902,11 +4052,18 @@ pub unsafe extern "C" fn js_native_call_method(
                     // pointer, so non-callable field values (numbers,
                     // strings, booleans) safely return undefined.
                     let field_val = js_object_get_field(obj as *mut _, i as u32);
-                    return crate::closure::js_native_call_value(
-                        f64::from_bits(field_val.bits()),
+                    let bound = crate::closure::clone_closure_rebind_this(
+                        field_val.bits(),
+                        f64::from_bits(jsval.bits()),
+                    );
+                    let prev_this = IMPLICIT_THIS.with(|c| c.replace(jsval.bits()));
+                    let result = crate::closure::js_native_call_value(
+                        f64::from_bits(bound),
                         args_ptr,
                         args_len,
                     );
+                    IMPLICIT_THIS.with(|c| c.set(prev_this));
+                    return result;
                 }
             }
         }
@@ -3949,6 +4106,7 @@ pub unsafe extern "C" fn js_native_call_method(
                                 args_len,
                                 entry.param_count,
                                 entry.has_synthetic_arguments,
+                                entry.has_rest,
                             );
                         }
                     }
@@ -4034,6 +4192,7 @@ pub unsafe extern "C" fn js_native_call_method(
                                         args_len,
                                         entry.param_count,
                                         entry.has_synthetic_arguments,
+                                        entry.has_rest,
                                     );
                                 }
                             }

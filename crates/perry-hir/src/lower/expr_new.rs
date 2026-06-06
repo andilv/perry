@@ -263,8 +263,14 @@ fn is_fetch_constructor_name(name: &str) -> bool {
 }
 
 fn is_global_object_expr(ctx: &LoweringContext, expr: &Expr) -> bool {
-    matches!(expr, Expr::GlobalGet(_))
-        || matches!(expr, Expr::LocalGet(id) if ctx.global_this_aliases.contains(id))
+    match expr {
+        Expr::GlobalGet(_) => true,
+        Expr::LocalGet(id) => ctx.global_this_aliases.contains(id),
+        Expr::PropertyGet { object, property } => {
+            property == "globalThis" && matches!(object.as_ref(), Expr::GlobalGet(_))
+        }
+        _ => false,
+    }
 }
 
 pub(super) fn lower_new(ctx: &mut LoweringContext, new_expr: &ast::NewExpr) -> Result<Expr> {
@@ -340,7 +346,12 @@ pub(super) fn lower_new(ctx: &mut LoweringContext, new_expr: &ast::NewExpr) -> R
 
             let is_net_module =
                 obj_name == "net" || ctx.lookup_builtin_module_alias(obj_name) == Some("net");
-            if is_net_module && matches!(prop_ident.sym.as_ref(), "Socket" | "Stream" | "Server") {
+            if is_net_module
+                && matches!(
+                    prop_ident.sym.as_ref(),
+                    "Socket" | "Stream" | "Server" | "BlockList" | "SocketAddress"
+                )
+            {
                 let args = new_expr
                     .args
                     .as_ref()
@@ -1171,7 +1182,22 @@ pub(super) fn lower_new(ctx: &mut LoweringContext, new_expr: &ast::NewExpr) -> R
                     "Boolean" => crate::BoxedPrimitiveKind::Boolean,
                     _ => unreachable!(),
                 };
-                let arg = args.drain(..).next().unwrap_or(Expr::Undefined);
+                // A *present* argument is coerced per spec: `new Number(x)` →
+                // ToNumber(x), `new String(x)` → ToString(x). This matters for
+                // an explicit `undefined`: `new Number(undefined)` is NaN and
+                // `new String(undefined)` is "undefined" — distinct from the
+                // *no-arg* forms `new Number()`/`new String()` which box +0/""
+                // (handled by the undefined sentinel in `js_boxed_*_new`).
+                // Without this, both collapse to `Expr::Undefined` and the
+                // runtime can't tell them apart.
+                let arg = match args.drain(..).next() {
+                    Some(inner) => match kind {
+                        crate::BoxedPrimitiveKind::Number => Expr::NumberCoerce(Box::new(inner)),
+                        crate::BoxedPrimitiveKind::String => Expr::StringCoerce(Box::new(inner)),
+                        crate::BoxedPrimitiveKind::Boolean => Expr::BooleanCoerce(Box::new(inner)),
+                    },
+                    None => Expr::Undefined,
+                };
                 return Ok(Expr::BoxedPrimitiveNew {
                     kind,
                     arg: Box::new(arg),
@@ -1188,28 +1214,6 @@ pub(super) fn lower_new(ctx: &mut LoweringContext, new_expr: &ast::NewExpr) -> R
                     })
                     .transpose()?
                     .unwrap_or_default();
-                // If the proxy's construction wrapped a known class,
-                // call the construct trap (for side effects) then
-                // instantiate the real class. This matches the
-                // test's expected behaviour.
-                if let Some(target_class) = ctx.proxy_target_classes.get(&class_name).cloned() {
-                    if ctx.lookup_class(&target_class).is_some() {
-                        if let Some(id) = ctx.lookup_local(&class_name) {
-                            let trap_call = Expr::ProxyConstruct {
-                                proxy: Box::new(Expr::LocalGet(id)),
-                                args: args.clone(),
-                            };
-                            return Ok(Expr::Sequence(vec![
-                                trap_call,
-                                Expr::New {
-                                    class_name: target_class,
-                                    args,
-                                    type_args: vec![],
-                                },
-                            ]));
-                        }
-                    }
-                }
                 if let Some(id) = ctx.lookup_local(&class_name) {
                     return Ok(Expr::ProxyConstruct {
                         proxy: Box::new(Expr::LocalGet(id)),
@@ -1559,7 +1563,9 @@ pub(super) fn lower_new(ctx: &mut LoweringContext, new_expr: &ast::NewExpr) -> R
             // allocation that matches the pre-fix baseline. Real
             // classes still win — the `lookup_class` check above
             // returns `Expr::New { class_name }` before reaching here.
-            if ctx.lookup_class(&class_name).is_none() {
+            if ctx.lookup_class(&class_name).is_none()
+                && ctx.resolve_class_alias(&class_name).is_none()
+            {
                 if let Some(local_id) = ctx.lookup_local(&class_name) {
                     return Ok(Expr::NewDynamic {
                         callee: Box::new(Expr::LocalGet(local_id)),
@@ -1671,7 +1677,7 @@ pub(super) fn lower_new(ctx: &mut LoweringContext, new_expr: &ast::NewExpr) -> R
                 .transpose()?
                 .unwrap_or_default();
             if let Expr::PropertyGet { object, property } = callee.as_ref() {
-                if matches!(object.as_ref(), Expr::GlobalGet(_))
+                if is_global_object_expr(ctx, object.as_ref())
                     && matches!(property.as_str(), "Symbol" | "BigInt" | "Math")
                 {
                     return Ok(nonconstructable_builtin_throw_expr(property, args));

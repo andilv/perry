@@ -137,12 +137,6 @@ crates/perry-stdlib/src/common/dispatch.rs
 # SQLite stdlib shim remains a generated-feel native adapter table; current
 # main crossed the threshold before this PR. Split tracked under #1435.
 crates/perry-stdlib/src/sqlite.rs
-# WHATWG Streams (ReadableStream/WritableStream/TransformStream + reader/
-# writer/controller dispatch). Crossed the limit at 2088 LOC after the
-# web-stream correctness batch (#2450 pipeTo preventClose, #2455 BYOB-on-
-# non-byte reject, #2460 reserved-type reject) landed on main without a
-# split. Splitting per stream-kind family is tracked under #2472.
-crates/perry-stdlib/src/streams.rs
 # Member-expression lowering tower (one big match over member/property/call
 # shapes, plus per-namespace literal builders). Crossed the limit at 2121 LOC
 # after #3161 inlined the full allowedNodeEnvironmentFlags string list into
@@ -241,6 +235,15 @@ crates/perry-hir/src/analysis.rs
 # Crossed the 2000-line gate after the stream/web adapter additions. Splitting
 # classic constructors from the web adapters is tracked under #1435.
 crates/perry-runtime/src/node_stream_constructors.rs
+# Codegen property-get / method-dispatch lowering tower (one arm per builtin
+# accessor + collection/string/regex method). Crossed the 2000-line gate (2004
+# LOC) on main after recent dispatch-arm additions. Splitting per receiver-type
+# family is tracked under #1435.
+crates/perry-codegen/src/expr/property_get.rs
+# Regex engine wrapper (compile/exec/replace + named-group + lookahead handling).
+# Crossed the 2000-line gate (2026 LOC) after the replace-lookahead additions.
+# Splitting the matcher from the replace machinery is tracked under #1435.
+crates/perry-runtime/src/regex.rs
 EOF
 )
 

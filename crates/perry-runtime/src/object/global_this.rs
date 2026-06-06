@@ -339,6 +339,46 @@ pub(crate) extern "C" fn typed_array_constructor_call_thunk(
     super::object_ops::throw_object_type_error(b"Constructor %TypedArray% requires 'new'")
 }
 
+// #4569: Map/Set/WeakMap/WeakSet/WeakRef are constructors — calling them
+// without `new` is a TypeError (ECMA-262: an undefined newTarget throws). The
+// bare-call form previously fell through to `global_this_builtin_noop_thunk`
+// and silently returned `undefined`. (`new Map()` uses the separate
+// construct-expression path and is unaffected.)
+pub(crate) extern "C" fn map_constructor_call_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    _arg: f64,
+) -> f64 {
+    super::object_ops::throw_object_type_error(b"Constructor Map requires 'new'")
+}
+
+pub(crate) extern "C" fn set_constructor_call_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    _arg: f64,
+) -> f64 {
+    super::object_ops::throw_object_type_error(b"Constructor Set requires 'new'")
+}
+
+pub(crate) extern "C" fn weak_map_constructor_call_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    _arg: f64,
+) -> f64 {
+    super::object_ops::throw_object_type_error(b"Constructor WeakMap requires 'new'")
+}
+
+pub(crate) extern "C" fn weak_set_constructor_call_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    _arg: f64,
+) -> f64 {
+    super::object_ops::throw_object_type_error(b"Constructor WeakSet requires 'new'")
+}
+
+pub(crate) extern "C" fn weak_ref_constructor_call_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    _arg: f64,
+) -> f64 {
+    super::object_ops::throw_object_type_error(b"Constructor WeakRef requires 'new'")
+}
+
 extern "C" fn global_this_url_pattern_call_thunk(
     _closure: *const crate::closure::ClosureHeader,
     input: f64,
@@ -866,6 +906,23 @@ extern "C" fn global_this_decode_uri_component_thunk(
     crate::value::js_nanbox_string(crate::builtins::js_decode_uri_component(value))
 }
 
+// #4511: legacy `escape()` / `unescape()` (ES Annex B). Used in the wild by
+// `qs` for `%uXXXX` decoding, so any app pulling in `qs` (e.g. via `stripe`)
+// needs them as real callable globalThis function values.
+extern "C" fn global_this_escape_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    value: f64,
+) -> f64 {
+    crate::value::js_nanbox_string(crate::builtins::js_escape(value))
+}
+
+extern "C" fn global_this_unescape_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    value: f64,
+) -> f64 {
+    crate::value::js_nanbox_string(crate::builtins::js_unescape(value))
+}
+
 // #2889: call-form thunks for `Number`/`Boolean` global constructor values.
 // `Object`/`String` already have dedicated thunks above; these mirror the
 // bare-call HIR lowering (`Expr::NumberCoerce` / `Expr::BooleanCoerce`) so
@@ -963,6 +1020,29 @@ extern "C" fn function_prototype_call_thunk(
     let result = unsafe { crate::closure::js_native_call_value(target, args_ptr, args_len) };
     IMPLICIT_THIS.with(|c| c.set(prev_this));
     result
+}
+
+/// `Function.prototype.bind` as a real callable thunk. Reads the target
+/// function from `IMPLICIT_THIS` (set by `.call`/`.apply`/`Reflect.apply`),
+/// flattens `(thisArg, ...boundArgs)` into one argument list, and delegates to
+/// `js_function_bind` (which builds the BOUND_FUNCTION closure).
+///
+/// Previously `bind` was installed as a *no-op* proto method, so calling it as
+/// a value — `Reflect.apply(Function.prototype.bind, fn, [thisArg])` or
+/// `Function.prototype.bind.apply(fn, …)` — returned `undefined` instead of a
+/// bound function. The `Function.prototype.call.bind(method)` uncurry idiom in
+/// `call-bind-apply-helpers` (used by call-bound → side-channel → qs → Stripe)
+/// hit exactly this: `Reflect.apply(bind, call, [fn])` yielded `undefined`.
+extern "C" fn function_prototype_bind_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    this_arg: f64,
+    rest: f64,
+) -> f64 {
+    let target = f64::from_bits(IMPLICIT_THIS.with(|c| c.get()));
+    let mut args: Vec<f64> = Vec::with_capacity(1);
+    args.push(this_arg);
+    args.extend(global_this_rest_array_values(rest));
+    unsafe { crate::closure::js_function_bind(target, args.as_ptr(), args.len()) }
 }
 
 extern "C" fn global_this_set_timeout_thunk(
@@ -1997,6 +2077,9 @@ pub extern "C" fn js_generator_attach_prototype(obj: f64, is_async: i32) -> f64 
     if obj_ptr == 0 {
         return obj;
     }
+    if is_async != 0 {
+        super::async_generator_queue::wrap_async_generator_instance(obj_ptr as *mut ObjectHeader);
+    }
     let gen_proto = generator_prototype_ptr(is_async != 0);
     if gen_proto.is_null() {
         return obj;
@@ -2263,6 +2346,16 @@ pub(crate) fn populate_global_this_builtins(singleton: *mut ObjectHeader) {
         let value = crate::value::js_nanbox_pointer(singleton as i64);
         js_object_set_field_by_name(singleton, key, value);
     }
+    {
+        // #4511: Node exposes the global object as `global` too
+        // (`global === globalThis`). Install the same self-reference so bare
+        // `global` / `(global as any).x` reads resolve to the real singleton
+        // instead of the unknown-identifier sentinel.
+        let name = b"global";
+        let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+        let value = crate::value::js_nanbox_pointer(singleton as i64);
+        js_object_set_field_by_name(singleton, key, value);
+    }
     // #2145: pre-allocate the shared `%TypedArray%` intrinsic so per-kind
     // typed-array constructors can link their `__proto__` to it as they're
     // built below, and the per-kind `.prototype` objects can be flagged with
@@ -2323,6 +2416,12 @@ pub(crate) fn populate_global_this_builtins(singleton: *mut ObjectHeader) {
             "Int8Array" | "Uint8Array" | "Uint8ClampedArray" | "Int16Array" | "Uint16Array"
             | "Int32Array" | "Uint32Array" | "Float16Array" | "Float32Array" | "Float64Array"
             | "BigInt64Array" | "BigUint64Array" => typed_array_constructor_call_thunk as *const u8,
+            // #4569: collection constructors throw when called without `new`.
+            "Map" => map_constructor_call_thunk as *const u8,
+            "Set" => set_constructor_call_thunk as *const u8,
+            "WeakMap" => weak_map_constructor_call_thunk as *const u8,
+            "WeakSet" => weak_set_constructor_call_thunk as *const u8,
+            "WeakRef" => weak_ref_constructor_call_thunk as *const u8,
             _ => global_this_builtin_noop_thunk as *const u8,
         };
         let closure_ptr = crate::closure::js_closure_alloc(func_ptr, 0);
@@ -2590,6 +2689,9 @@ pub(crate) fn populate_global_this_builtins(singleton: *mut ObjectHeader) {
                 1,
                 false,
             ),
+            // #4511: legacy escape/unescape (ES Annex B).
+            "escape" => (global_this_escape_thunk as *const u8, 1, false),
+            "unescape" => (global_this_unescape_thunk as *const u8, 1, false),
             _ => continue,
         };
         let closure_ptr = crate::closure::js_closure_alloc(func_ptr, 0);
@@ -3052,11 +3154,108 @@ extern "C" fn bigint_as_uint_n_thunk(
     bigint_as_n_dispatch(bits, value, false)
 }
 
+extern "C" fn json_parse_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    text: f64,
+    reviver: f64,
+) -> f64 {
+    let text_ptr = crate::value::js_get_string_pointer_unified(text) as *const crate::StringHeader;
+    let reviver_value = JSValue::from_bits(reviver.to_bits());
+    let parsed = unsafe {
+        if reviver_value.is_pointer()
+            && crate::closure::is_closure_ptr(reviver_value.as_pointer::<u8>() as usize)
+        {
+            crate::json::js_json_parse_with_reviver(
+                text_ptr,
+                reviver_value.as_pointer::<crate::closure::ClosureHeader>() as i64,
+            )
+        } else {
+            crate::json::js_json_parse(text_ptr)
+        }
+    };
+    f64::from_bits(parsed.bits())
+}
+
+extern "C" fn json_stringify_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    value: f64,
+    replacer: f64,
+    space: f64,
+) -> f64 {
+    f64::from_bits(unsafe { crate::json::js_json_stringify_full(value, replacer, space) as u64 })
+}
+
+extern "C" fn json_raw_json_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    text: f64,
+) -> f64 {
+    unsafe { crate::json::js_json_raw_json(text) }
+}
+
+extern "C" fn json_is_raw_json_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    value: f64,
+) -> f64 {
+    unsafe { crate::json::js_json_is_raw_json(value) }
+}
+
+extern "C" fn reflect_apply_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    target: f64,
+    this_arg: f64,
+    args: f64,
+) -> f64 {
+    crate::proxy::js_reflect_apply(target, this_arg, args)
+}
+
+extern "C" fn symbol_for_thunk(_closure: *const crate::closure::ClosureHeader, key: f64) -> f64 {
+    unsafe { crate::symbol::js_symbol_for(key) }
+}
+
+extern "C" fn symbol_key_for_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    symbol: f64,
+) -> f64 {
+    unsafe { crate::symbol::js_symbol_key_for(symbol) }
+}
+
 extern "C" fn number_is_safe_integer_thunk(
     _closure: *const crate::closure::ClosureHeader,
     value: f64,
 ) -> f64 {
     crate::builtins::js_number_is_safe_integer(value)
+}
+
+// #4627: reified `String.fromCharCode(...units)` / `fromCodePoint(...points)`.
+// Both collect all arguments into `rest` (call-arity 0), so `rest` is already
+// the array-like the array-form runtime helpers expect.
+extern "C" fn string_from_char_code_static(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    let s = crate::string::js_string_from_char_code_array(rest);
+    crate::value::js_nanbox_string(s as i64)
+}
+
+extern "C" fn string_from_code_point_static(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    let s = crate::string::js_string_from_code_point_array(rest);
+    crate::value::js_nanbox_string(s as i64)
+}
+
+// #4627: reified `String.raw(callSite, ...substitutions)` tag function. One
+// fixed param (the template/cooked object) then a rest of substitutions, which
+// `js_string_raw` reads by numeric index — so `rest` (the collected array) is
+// passed straight through as the substitutions array-like.
+extern "C" fn string_raw_static(
+    _closure: *const crate::closure::ClosureHeader,
+    call_site: f64,
+    rest: f64,
+) -> f64 {
+    let s = crate::string::js_string_raw(call_site, rest);
+    crate::value::js_nanbox_string(s as i64)
 }
 
 extern "C" fn number_parse_float_thunk(
@@ -3263,7 +3462,7 @@ pub(super) fn install_constructor_static(
     install_constructor_static_with_call_arity(ctor, name, func_ptr, arity, arity, has_rest);
 }
 
-fn install_constructor_static_with_call_arity(
+pub(super) fn install_constructor_static_with_call_arity(
     ctor: *mut crate::closure::ClosureHeader,
     name: &str,
     func_ptr: *const u8,
@@ -3282,6 +3481,7 @@ fn install_constructor_static_with_call_arity(
     }
     super::native_module::set_bound_native_closure_name(closure, name);
     super::native_module::set_builtin_closure_length(closure as usize, spec_length);
+    super::native_module::set_builtin_closure_non_constructable(closure as usize);
     let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
     let value = crate::value::js_nanbox_pointer(closure as i64);
     js_object_set_field_by_name(ctor as *mut ObjectHeader, key, value);
@@ -3301,7 +3501,9 @@ fn install_number_static_data_properties(ctor: *mut crate::closure::ClosureHeade
         ("POSITIVE_INFINITY", f64::INFINITY),
         ("NEGATIVE_INFINITY", f64::NEG_INFINITY),
         ("MAX_VALUE", f64::MAX),
-        ("MIN_VALUE", f64::MIN_POSITIVE),
+        // ECMAScript Number.MIN_VALUE is the smallest *denormal* (5e-324 =
+        // 2^-1074 = bit pattern 1), NOT f64::MIN_POSITIVE (smallest *normal*).
+        ("MIN_VALUE", f64::from_bits(1)),
         ("EPSILON", f64::EPSILON),
         ("MAX_SAFE_INTEGER", 9007199254740991.0),
         ("MIN_SAFE_INTEGER", -9007199254740991.0),
@@ -3457,6 +3659,43 @@ fn install_builtin_constructor_statics(name: &str, ctor: *mut crate::closure::Cl
                 false,
             );
         }
+        "Symbol" => {
+            install_constructor_static(ctor, "for", symbol_for_thunk as *const u8, 1, false);
+            install_constructor_static(ctor, "keyFor", symbol_key_for_thunk as *const u8, 1, false);
+        }
+        "String" => {
+            // #4627: reify the variadic `String.fromCharCode` / `fromCodePoint`
+            // statics so they are real function values (correct `.name` /
+            // `.length`, usable via reference / spread). Call-arity 0 (all args
+            // collected into `rest`) with spec `.length` 1. `String.raw` (a tag
+            // function) is left on its intrinsic path for now.
+            install_constructor_static_with_call_arity(
+                ctor,
+                "fromCharCode",
+                string_from_char_code_static as *const u8,
+                1,
+                0,
+                true,
+            );
+            install_constructor_static_with_call_arity(
+                ctor,
+                "fromCodePoint",
+                string_from_code_point_static as *const u8,
+                1,
+                0,
+                true,
+            );
+            // #4627: `String.raw` (tag function) — 1 fixed param (template
+            // object) + rest substitutions; spec `.length` 1.
+            install_constructor_static_with_call_arity(
+                ctor,
+                "raw",
+                string_raw_static as *const u8,
+                1,
+                1,
+                true,
+            );
+        }
         "ArrayBuffer" => {
             install_constructor_static(
                 ctor,
@@ -3551,6 +3790,7 @@ pub(super) fn install_proto_method(
     // can't distinguish `map` (1) from `slice` (2). Read back by the `.length`
     // value-accessor and `getOwnPropertyDescriptor`.
     super::native_module::set_builtin_closure_length(closure as usize, arity);
+    super::native_module::set_builtin_closure_non_constructable(closure as usize);
     let key = crate::string::js_string_from_bytes(method_name.as_ptr(), method_name.len() as u32);
     let value = crate::value::js_nanbox_pointer(closure as i64);
     js_object_set_field_by_name(proto_obj, key, value);
@@ -3612,6 +3852,7 @@ pub(super) fn install_proto_method_rest_with_length(
     crate::closure::js_register_closure_rest(func_ptr, call_fixed_arity);
     super::native_module::set_bound_native_closure_name(closure, method_name);
     super::native_module::set_builtin_closure_length(closure as usize, spec_length);
+    super::native_module::set_builtin_closure_non_constructable(closure as usize);
     let key = crate::string::js_string_from_bytes(method_name.as_ptr(), method_name.len() as u32);
     let value = crate::value::js_nanbox_pointer(closure as i64);
     js_object_set_field_by_name(proto_obj, key, value);
@@ -3633,19 +3874,17 @@ pub(super) fn install_proto_method_rest_with_length(
     value
 }
 
-/// #4139: reify the `JSON` namespace's own methods for reflection parity. See
-/// `install_math_namespace` for the rationale (call sites are codegen
-/// intrinsics; these no-op-backed fields exist only for reflection).
+/// #4139/#4437: reify the `JSON` namespace's own methods for reflection parity
+/// and detached value calls. Direct call sites are still codegen intrinsics.
 fn install_json_namespace_members(ns_obj: *mut ObjectHeader) {
-    let noop = global_this_builtin_noop_thunk as *const u8;
-    const METHODS: &[(&str, u32)] = &[
-        ("parse", 2),
-        ("stringify", 3),
-        ("rawJSON", 1),
-        ("isRawJSON", 1),
+    const METHODS: &[(&str, *const u8, u32)] = &[
+        ("parse", json_parse_thunk as *const u8, 2),
+        ("stringify", json_stringify_thunk as *const u8, 3),
+        ("rawJSON", json_raw_json_thunk as *const u8, 1),
+        ("isRawJSON", json_is_raw_json_thunk as *const u8, 1),
     ];
-    for (name, arity) in METHODS.iter().copied() {
-        install_proto_method(ns_obj, name, noop, arity);
+    for (name, func_ptr, arity) in METHODS.iter().copied() {
+        install_proto_method(ns_obj, name, func_ptr, arity);
     }
 }
 
@@ -3653,23 +3892,23 @@ fn install_json_namespace_members(ns_obj: *mut ObjectHeader) {
 /// See `install_math_namespace` for the rationale.
 fn install_reflect_namespace_members(ns_obj: *mut ObjectHeader) {
     let noop = global_this_builtin_noop_thunk as *const u8;
-    const METHODS: &[(&str, u32)] = &[
-        ("defineProperty", 3),
-        ("deleteProperty", 2),
-        ("apply", 3),
-        ("construct", 2),
-        ("get", 2),
-        ("getOwnPropertyDescriptor", 2),
-        ("getPrototypeOf", 1),
-        ("has", 2),
-        ("isExtensible", 1),
-        ("ownKeys", 1),
-        ("preventExtensions", 1),
-        ("set", 3),
-        ("setPrototypeOf", 2),
+    let methods = [
+        ("defineProperty", noop, 3),
+        ("deleteProperty", noop, 2),
+        ("apply", reflect_apply_thunk as *const u8, 3),
+        ("construct", noop, 2),
+        ("get", noop, 2),
+        ("getOwnPropertyDescriptor", noop, 2),
+        ("getPrototypeOf", noop, 1),
+        ("has", noop, 2),
+        ("isExtensible", noop, 1),
+        ("ownKeys", noop, 1),
+        ("preventExtensions", noop, 1),
+        ("set", noop, 3),
+        ("setPrototypeOf", noop, 2),
     ];
-    for (name, arity) in METHODS.iter().copied() {
-        install_proto_method(ns_obj, name, noop, arity);
+    for (name, func_ptr, arity) in methods {
+        install_proto_method(ns_obj, name, func_ptr, arity);
     }
 }
 
@@ -3709,22 +3948,17 @@ fn install_atomics_namespace_members(ns_obj: *mut ObjectHeader) {
     }
 }
 
-/// Install a list of `(method_name, arity)` pairs on a prototype object,
-/// each backed by `global_this_builtin_noop_thunk`. The shared no-op thunk
-/// is fine because every method shares the same backing func pointer (the
-/// arity registration on that pointer is overwritten harmlessly with each
-/// call — the last winner is whichever arity matches the dominant call
-/// site, but no current code path depends on the registered arity for the
-/// noop thunk; the real dispatch arms each register their own arity on
-/// their own thunk pointer).
+/// Install a list of `(method_name, arity)` pairs on a prototype object.
+/// Most entries are reflection-only methods backed by
+/// `global_this_builtin_noop_thunk`, but inherited Object methods with
+/// observable receiver-sensitive behavior use their real thunk.
 fn install_noop_proto_methods(proto_obj: *mut ObjectHeader, methods: &[(&str, u32)]) {
     for (name, arity) in methods.iter().copied() {
-        install_proto_method(
-            proto_obj,
-            name,
-            global_this_builtin_noop_thunk as *const u8,
-            arity,
-        );
+        let func_ptr = match name {
+            "isPrototypeOf" => object_prototype_is_prototype_of_thunk as *const u8,
+            _ => global_this_builtin_noop_thunk as *const u8,
+        };
+        install_proto_method(proto_obj, name, func_ptr, arity);
     }
 }
 
@@ -3970,7 +4204,12 @@ fn populate_builtin_prototype_methods(builtin_name: &str, proto_obj: *mut Object
                 function_prototype_apply_thunk as *const u8,
                 2,
             );
-            install_noop_proto_methods(proto_obj, &[("bind", 1)]);
+            install_proto_method_rest(
+                proto_obj,
+                "bind",
+                function_prototype_bind_thunk as *const u8,
+                1,
+            );
             // #4101: dedicated toString thunk (source reconstruction + brand
             // check) instead of the shared no-op.
             install_proto_method(
@@ -4227,7 +4466,24 @@ fn populate_builtin_prototype_methods(builtin_name: &str, proto_obj: *mut Object
             }
         }
         "Promise" => {
-            install_noop_proto_methods(proto_obj, &[("catch", 1), ("finally", 1), ("then", 2)]);
+            install_proto_method(
+                proto_obj,
+                "catch",
+                crate::promise::promise_prototype_catch_thunk as *const u8,
+                1,
+            );
+            install_proto_method(
+                proto_obj,
+                "finally",
+                crate::promise::promise_prototype_finally_thunk as *const u8,
+                1,
+            );
+            install_proto_method(
+                proto_obj,
+                "then",
+                crate::promise::promise_prototype_then_thunk as *const u8,
+                2,
+            );
             install_noop_proto_methods(proto_obj, OBJECT_PROTO_METHODS);
         }
         "TextEncoder" => {

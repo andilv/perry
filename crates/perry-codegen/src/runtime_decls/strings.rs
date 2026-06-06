@@ -971,6 +971,11 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
         I64,
         &[I64, DOUBLE, DOUBLE, I32, DOUBLE],
     );
+    module.declare_function(
+        "js_array_copy_within_value",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, DOUBLE, I32, DOUBLE],
+    );
     module.declare_function("js_regexp_new", I64, &[I64, I64]);
     module.declare_function("js_regexp_test", I32, &[I64, I64]);
     // RegExp.escape(str) — #2899. Takes/returns NaN-boxed f64 (string).
@@ -1215,6 +1220,8 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // JSON.parse returns JSValue (u64) via integer register on ARM64,
     // not f64. Use I64 return + bitcast to avoid ABI mismatch crash.
     module.declare_function("js_json_parse", I64, &[I64]);
+    // #4578: ToString(text) for JSON.parse — heap *StringHeader, throws on Symbol.
+    module.declare_function("js_json_text_to_string", I64, &[DOUBLE]);
     // #2900: JSON.rawJSON(text) / JSON.isRawJSON(value). Both take and return
     // a NaN-boxed f64 (the wrapper object pointer / a boolean).
     module.declare_function("js_json_raw_json", DOUBLE, &[DOUBLE]);

@@ -386,6 +386,7 @@ pub fn check_escapes_in_expr(
         | Expr::MathMinSpread(operand)
         | Expr::MathMaxSpread(operand)
         | Expr::ArrayFrom(operand)
+        | Expr::ArrayFromArrayLikeHoley(operand)
         | Expr::IteratorFrom(operand)
         | Expr::Uint8ArrayFrom(operand)
         | Expr::JsonParse(operand)
@@ -847,6 +848,19 @@ pub fn check_escapes_in_expr(
         Expr::ArrayCopyWithin {
             target, start, end, ..
         } => {
+            check_escapes_in_expr(target, candidates, classes, escaped);
+            check_escapes_in_expr(start, candidates, classes, escaped);
+            if let Some(e) = end {
+                check_escapes_in_expr(e, candidates, classes, escaped);
+            }
+        }
+        Expr::ArrayCopyWithinValue {
+            receiver,
+            target,
+            start,
+            end,
+        } => {
+            check_escapes_in_expr(receiver, candidates, classes, escaped);
             check_escapes_in_expr(target, candidates, classes, escaped);
             check_escapes_in_expr(start, candidates, classes, escaped);
             if let Some(e) = end {

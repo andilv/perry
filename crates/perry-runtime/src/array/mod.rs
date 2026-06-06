@@ -23,7 +23,7 @@ mod tests;
 pub use self::alloc::{
     js_array_alloc, js_array_alloc_literal, js_array_alloc_with_length,
     js_array_alloc_with_length_longlived, js_array_constructor_single, js_array_create,
-    js_array_from_f64,
+    js_array_from_arraylike_holey_value, js_array_from_f64,
 };
 pub use self::concat_reverse::{
     js_array_concat, js_array_concat_new, js_array_fill, js_array_fill_range, js_array_reverse,
@@ -41,14 +41,16 @@ pub use self::header::{
     scan_template_raw_roots_mut, ArrayHeader,
 };
 pub use self::immutable::{
-    js_array_copy_within, js_array_to_reversed, js_array_to_sorted_default,
-    js_array_to_sorted_with_comparator, js_array_to_spliced, js_array_with,
+    js_array_copy_within, js_array_copy_within_value, js_array_to_reversed,
+    js_array_to_sorted_default, js_array_to_sorted_with_comparator, js_array_to_spliced,
+    js_array_with,
 };
 pub use self::indexing::{
     js_array_get_element, js_array_get_element_f64, js_array_get_f64, js_array_get_f64_unchecked,
-    js_array_get_length, js_array_length, js_array_numeric_get_f64_unboxed,
-    js_array_numeric_set_f64_unboxed, js_array_set_f64, js_array_set_f64_extend,
-    js_array_set_f64_unchecked, js_array_set_index_or_string, js_array_set_string_key,
+    js_array_get_index_or_string, js_array_get_length, js_array_length,
+    js_array_numeric_get_f64_unboxed, js_array_numeric_set_f64_unboxed, js_array_set_f64,
+    js_array_set_f64_extend, js_array_set_f64_unchecked, js_array_set_index_or_string,
+    js_array_set_string_key,
 };
 pub use self::is_array::js_array_is_array;
 pub(crate) use self::iter_methods::throw_reduce_of_empty;

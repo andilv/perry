@@ -125,6 +125,19 @@ fn is_util_mime_params_receiver(ctx: &LoweringContext, expr: &ast::Expr) -> bool
     }
 }
 
+fn is_fs_dir_receiver(ctx: &LoweringContext, expr: &ast::Expr) -> bool {
+    let ast::Expr::Ident(ident) = unwrap_transparent_expr(expr) else {
+        return false;
+    };
+    ctx.lookup_local_type(ident.sym.as_ref())
+        .is_some_and(|ty| matches!(ty, Type::Named(name) if name == "Dir" || name == "fs.Dir"))
+        || ctx
+            .lookup_native_instance(ident.sym.as_ref())
+            .is_some_and(|(module, class_name)| {
+                module.strip_prefix("node:").unwrap_or(module) == "fs" && class_name == "Dir"
+            })
+}
+
 /// Does this expression's method chain originate from a node:stream
 /// source — `Readable.from(...)` / `Readable.of(...)`, `new Transform()`,
 /// or a chain of lazy iterator helpers (`map`/`filter`/`flatMap`/`take`/
@@ -570,7 +583,11 @@ pub(super) fn try_array_only_methods(
                     // `for (const [valueIndex, value] of values.entries())`
                     // where `values` arrives via destructuring of an
                     // any-typed function param.
-                    "entries" if args.is_empty() && !recv_is_class => {
+                    "entries"
+                        if args.is_empty()
+                            && !recv_is_class
+                            && !is_fs_dir_receiver(ctx, &member.obj) =>
+                    {
                         let array_expr = lower_expr(ctx, &member.obj)?;
                         return Ok(Ok(Expr::ArrayEntries(Box::new(array_expr))));
                     }
@@ -644,7 +661,8 @@ pub(super) fn try_array_only_methods(
                             &array_expr,
                             Expr::ArrayMap { .. } | Expr::ArrayFilter { .. } | Expr::ArraySort { .. } |
                                     Expr::ArraySlice { .. } | Expr::Array(_) | Expr::ArraySpread(_) |
-                                    Expr::ArrayFrom(_) | Expr::ArrayFromMapped { .. } |
+                                    Expr::ArrayFrom(_) | Expr::ArrayFromArrayLikeHoley(_) |
+                                    Expr::ArrayFromMapped { .. } |
                                     Expr::ArrayFlat { .. } | Expr::StringSplit(_, _) |
                                     Expr::ArrayToReversed { .. } | Expr::ArrayToSorted { .. } |
                                     Expr::ArrayToSpliced { .. } | Expr::ArrayWith { .. } |
@@ -691,6 +709,7 @@ pub(super) fn try_array_only_methods(
                                 | Expr::ArraySlice { .. }
                                 | Expr::ArraySpread(_)
                                 | Expr::ArrayFrom(_)
+                                | Expr::ArrayFromArrayLikeHoley(_)
                                 | Expr::ArrayFromMapped { .. }
                                 | Expr::ArrayFlat { .. }
                                 | Expr::StringSplit(_, _)
@@ -751,6 +770,7 @@ pub(super) fn try_array_only_methods(
                                         | Expr::ArraySlice { .. }
                                         | Expr::Array(_)
                                         | Expr::ArrayFrom(_)
+                                        | Expr::ArrayFromArrayLikeHoley(_)
                                         | Expr::StringSplit(_, _)
                                         | Expr::ObjectKeys(_)
                                         | Expr::ObjectValues(_)
@@ -790,6 +810,7 @@ pub(super) fn try_array_only_methods(
                                         | Expr::ArraySlice { .. }
                                         | Expr::Array(_)
                                         | Expr::ArrayFrom(_)
+                                        | Expr::ArrayFromArrayLikeHoley(_)
                                         | Expr::StringSplit(_, _)
                                         | Expr::ObjectKeys(_)
                                         | Expr::ObjectValues(_)
@@ -931,15 +952,10 @@ pub(super) fn try_array_only_methods(
                         };
                         if !is_user_class_receiver {
                             let array_expr = lower_expr(ctx, &member.obj)?;
-                            if call.args.first().is_some_and(|arg| arg.spread.is_some()) {
-                                return Ok(Ok(Expr::NativeMethodCall {
-                                    module: "array".to_string(),
-                                    method: "push_spread".to_string(),
-                                    class_name: None,
-                                    object: Some(Box::new(array_expr)),
-                                    args,
-                                }));
-                            } else {
+                            let any_spread = call.args.iter().any(|a| a.spread.is_some());
+                            if !any_spread {
+                                // No spreads — `push_single` loops over every
+                                // arg, so a single native call handles N values.
                                 return Ok(Ok(Expr::NativeMethodCall {
                                     module: "array".to_string(),
                                     method: "push_single".to_string(),
@@ -948,6 +964,47 @@ pub(super) fn try_array_only_methods(
                                     args,
                                 }));
                             }
+                            if args.len() == 1 {
+                                // Exactly one spread arg — the `push_spread`
+                                // native arm packs the source as `args[0]`.
+                                return Ok(Ok(Expr::NativeMethodCall {
+                                    module: "array".to_string(),
+                                    method: "push_spread".to_string(),
+                                    class_name: None,
+                                    object: Some(Box::new(array_expr)),
+                                    args,
+                                }));
+                            }
+                            // Mixed/multiple args with at least one spread
+                            // (e.g. `arr.push(...a, ...b)` or `arr.push(...a, x)`
+                            // inside a method/getter body). The single-arg
+                            // `push_spread`/`push_single` native arms each
+                            // expect exactly one arg; the previous code passed
+                            // all of them to one `push_spread`, which bailed at
+                            // codegen ("expects exactly 1 arg"). Decompose into a
+                            // `Sequence` of single-arg native calls, choosing the
+                            // helper per-arg from the original AST spread flag.
+                            // Each native arm re-reads the receiver and writes
+                            // back the (possibly realloc'd) handle, so chaining
+                            // threads the array correctly; JS `push` returns the
+                            // final length, which is exactly what the last
+                            // element of the `Sequence` yields. (#4508)
+                            let mut stmts: Vec<Expr> = Vec::with_capacity(args.len());
+                            for (ast_arg, arg) in call.args.iter().zip(args.into_iter()) {
+                                let method = if ast_arg.spread.is_some() {
+                                    "push_spread"
+                                } else {
+                                    "push_single"
+                                };
+                                stmts.push(Expr::NativeMethodCall {
+                                    module: "array".to_string(),
+                                    method: method.to_string(),
+                                    class_name: None,
+                                    object: Some(Box::new(array_expr.clone())),
+                                    args: vec![arg],
+                                });
+                            }
+                            return Ok(Ok(Expr::Sequence(stmts)));
                         }
                     }
                     _ => {} // Fall through - ambiguous methods on non-array expressions use generic dispatch

@@ -239,6 +239,7 @@ where
         | Expr::StaticPluginResolve(v)
         | Expr::ArrayIsArray(v)
         | Expr::ArrayFrom(v)
+        | Expr::ArrayFromArrayLikeHoley(v)
         | Expr::IteratorFrom(v)
         | Expr::IteratorToArray(v)
         | Expr::GetIterator(v)
@@ -1600,6 +1601,19 @@ where
             start,
             end,
         } => {
+            f(target);
+            f(start);
+            if let Some(e) = end {
+                f(e);
+            }
+        }
+        Expr::ArrayCopyWithinValue {
+            receiver,
+            target,
+            start,
+            end,
+        } => {
+            f(receiver);
             f(target);
             f(start);
             if let Some(e) = end {

@@ -469,6 +469,14 @@ fn jsvalue_eq(a: f64, b: f64) -> bool {
         return true;
     }
 
+    // Symbols compare by identity only (same-symbol caught by the fast path
+    // above). A description-less `Symbol()` exposes a zero-length string view,
+    // so without this guard it would content-compare equal to the "" key and
+    // collide inside Set/Map. (#4570)
+    if unsafe { crate::symbol::js_is_symbol(a) != 0 || crate::symbol::js_is_symbol(b) != 0 } {
+        return false;
+    }
+
     if is_string_like(a_bits) && is_string_like(b_bits) {
         let mut a_scratch = [0u8; crate::value::SHORT_STRING_MAX_LEN];
         let mut b_scratch = [0u8; crate::value::SHORT_STRING_MAX_LEN];
@@ -901,6 +909,9 @@ pub extern "C" fn js_set_from_iterable(value: f64) -> *mut SetHeader {
 /// omitted at the call site.
 #[no_mangle]
 pub extern "C" fn js_set_foreach(set: *const SetHeader, callback: f64, this_arg: f64) {
+    // ECMA-262 Set.prototype.forEach step 4: a non-callable callback throws a
+    // TypeError before iterating (and before any null-set early return).
+    crate::array::js_validate_array_callback(callback);
     let set = clean_set_ptr(set);
     if set.is_null() {
         return;

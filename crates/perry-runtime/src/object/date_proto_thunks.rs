@@ -102,7 +102,7 @@ extern "C" fn date_to_json(_closure: *const crate::closure::ClosureHeader) -> f6
     let tv = if crate::date::is_date_value(this) {
         crate::date::date_cell_timestamp(this)
     } else {
-        match unsafe { crate::value::ordinary_to_primitive_number_for_add(this) } {
+        match unsafe { crate::value::to_primitive_number(this) } {
             crate::value::OrdinaryToPrimitiveOutcome::Primitive(p) => p,
             // A plain object's default `"[object Object]"` is a String, never a
             // Number, so step 3 (non-finite Number → null) never fires; fall
@@ -167,6 +167,11 @@ extern "C" fn date_to_json(_closure: *const crate::closure::ClosureHeader) -> f6
     super::object_ops::throw_object_type_error(b"toISOString is not a function")
 }
 
+#[cfg(test)]
+pub(crate) fn test_date_to_json_current_this() -> f64 {
+    date_to_json(std::ptr::null())
+}
+
 // --- Date constructor static methods (Date.now / Date.parse / Date.UTC) ---
 //
 // The functional call forms are codegen intrinsics (`Expr::DateNow` /
@@ -215,11 +220,17 @@ pub(crate) fn install_date_constructor_statics(ctor: *mut crate::closure::Closur
         1,
         false,
     );
-    super::global_this::install_constructor_static(
+    // `date_utc_static` collects *all* arguments into its `rest` param, so the
+    // call-arity (fixed params before the rest) must be 0 — otherwise the rest
+    // registration reserves 7 fixed slots and `Date.UTC(2020, 0)` (fewer than 7
+    // args) puts nothing in the rest array → js_date_utc([]) → NaN. The spec
+    // `.length` stays 7. (#4596)
+    super::global_this::install_constructor_static_with_call_arity(
         ctor,
         "UTC",
         date_utc_static as *const u8,
         7,
+        0,
         true,
     );
 }

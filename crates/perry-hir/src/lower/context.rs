@@ -65,6 +65,7 @@ impl LoweringContext {
             interface_source_keys: std::collections::HashMap::new(),
             interface_object_types: std::collections::HashMap::new(),
             imported_functions: Vec::new(),
+            builtin_named_imports: Vec::new(),
             native_modules: Vec::new(),
             builtin_module_aliases: Vec::new(),
             subns_path_aliases: HashMap::new(),
@@ -114,16 +115,15 @@ impl LoweringContext {
             weakmap_locals: HashSet::new(),
             weakset_locals: HashSet::new(),
             namespace_import_locals: HashSet::new(),
+            namespace_import_sources: std::collections::HashMap::new(),
             generator_func_names: HashSet::new(),
             async_generator_func_names: HashSet::new(),
             iterator_func_for_class: std::collections::HashMap::new(),
-            regex_exec_locals: HashSet::new(),
             proxy_locals: HashSet::new(),
             builtin_proto_method_locals: HashMap::new(),
             wasm_instance_locals: HashSet::new(),
             plain_object_locals: HashSet::new(),
             proxy_revoke_locals: HashMap::new(),
-            proxy_target_classes: HashMap::new(),
             class_expr_aliases: HashMap::new(),
             in_constructor_class: None,
             current_class_super_ident: None,
@@ -938,6 +938,23 @@ impl LoweringContext {
         self.imported_functions_index
             .insert(local_name.clone(), idx);
         self.imported_functions.push((local_name, original_name));
+    }
+
+    pub(crate) fn register_builtin_named_import(
+        &mut self,
+        local_name: String,
+        module_name: String,
+        exported_name: String,
+    ) {
+        self.builtin_named_imports
+            .push((local_name, module_name, exported_name));
+    }
+
+    pub(crate) fn lookup_builtin_named_import(&self, name: &str) -> Option<(&str, &str)> {
+        self.builtin_named_imports
+            .iter()
+            .find(|(local, _, _)| local == name)
+            .map(|(_, module, exported)| (module.as_str(), exported.as_str()))
     }
 
     pub(crate) fn register_extern_func_types(

@@ -554,6 +554,15 @@ fn jsvalue_eq(a: f64, b: f64) -> bool {
         return true;
     }
 
+    // Symbols are compared by identity only — two distinct symbols are never
+    // equal (and a same-symbol match was already caught by the bit-equality
+    // fast path). A description-less `Symbol()` exposes a zero-length string
+    // view, so without this guard it would content-compare equal to the ""
+    // key and collide inside Map/Set. (#4570)
+    if unsafe { crate::symbol::js_is_symbol(a) != 0 || crate::symbol::js_is_symbol(b) != 0 } {
+        return false;
+    }
+
     if is_string_like(a_bits) && is_string_like(b_bits) {
         let mut a_scratch = [0u8; crate::value::SHORT_STRING_MAX_LEN];
         let mut b_scratch = [0u8; crate::value::SHORT_STRING_MAX_LEN];
@@ -1400,6 +1409,11 @@ static KEEP_JS_MAP_FROM_ITERABLE: extern "C" fn(f64) -> *mut MapHeader = js_map_
 /// when omitted at the call site.
 #[no_mangle]
 pub extern "C" fn js_map_foreach(map: *const MapHeader, callback: f64, this_arg: f64) {
+    // ECMA-262 Map.prototype.forEach step 4: a non-callable callback throws a
+    // TypeError *before* iterating (and before any null-map early return).
+    // Without this, a non-function callback either silently no-ops or — for a
+    // numeric value — is dereferenced as a function pointer and segfaults.
+    crate::array::js_validate_array_callback(callback);
     let map = clean_map_ptr(map);
     if map.is_null() {
         return;

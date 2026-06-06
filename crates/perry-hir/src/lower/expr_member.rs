@@ -772,7 +772,8 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                     "MAX_SAFE_INTEGER" => Some(9007199254740991.0),
                     "MIN_SAFE_INTEGER" => Some(-9007199254740991.0),
                     "MAX_VALUE" => Some(f64::MAX),
-                    "MIN_VALUE" => Some(f64::MIN_POSITIVE),
+                    // smallest denormal (5e-324), not smallest normal
+                    "MIN_VALUE" => Some(f64::from_bits(1)),
                     "EPSILON" => Some(f64::EPSILON),
                     "POSITIVE_INFINITY" => Some(f64::INFINITY),
                     "NEGATIVE_INFINITY" => Some(f64::NEG_INFINITY),
@@ -829,6 +830,58 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                 return Ok(Expr::EnumMember {
                     enum_name: obj_name,
                     member_name,
+                });
+            }
+        }
+    }
+
+    // Computed access on an enum identifier: `Color[expr]` (#4509).
+    // TypeScript numeric enums carry a reverse mapping in addition to the
+    // forward one — `Color.Blue === 2` *and* `Color[2] === "Blue"`. The
+    // `.Member` form above folds to a compile-time constant, but the
+    // computed form can index with a runtime value, so materialize the
+    // enum's runtime object — the forward members plus a reverse entry for
+    // every numeric member — and index into it. String-valued members get
+    // no reverse entry, matching tsc (string enums are one-directional).
+    // Unwrap TS-only casts/parens so `(Color as any)[c]` is recognised too.
+    {
+        fn unwrap_enum_receiver(mut e: &ast::Expr) -> &ast::Expr {
+            loop {
+                match e {
+                    ast::Expr::TsAs(x) => e = &x.expr,
+                    ast::Expr::TsNonNull(x) => e = &x.expr,
+                    ast::Expr::TsConstAssertion(x) => e = &x.expr,
+                    ast::Expr::TsTypeAssertion(x) => e = &x.expr,
+                    ast::Expr::TsSatisfies(x) => e = &x.expr,
+                    ast::Expr::Paren(x) => e = &x.expr,
+                    _ => break,
+                }
+            }
+            e
+        }
+        if let (ast::Expr::Ident(obj_ident), ast::MemberProp::Computed(computed)) =
+            (unwrap_enum_receiver(member.obj.as_ref()), &member.prop)
+        {
+            let members: Option<Vec<(String, crate::ir::EnumValue)>> = ctx
+                .lookup_enum(obj_ident.sym.as_ref())
+                .map(|(_, m)| m.to_vec());
+            if let Some(members) = members {
+                let index = lower_expr(ctx, &computed.expr)?;
+                let mut fields: Vec<(String, Expr)> = Vec::new();
+                for (name, value) in &members {
+                    match value {
+                        crate::ir::EnumValue::Number(n) => {
+                            fields.push((name.clone(), Expr::Number(*n as f64)));
+                            fields.push((n.to_string(), Expr::String(name.clone())));
+                        }
+                        crate::ir::EnumValue::String(s) => {
+                            fields.push((name.clone(), Expr::String(s.clone())));
+                        }
+                    }
+                }
+                return Ok(Expr::IndexGet {
+                    object: Box::new(Expr::Object(fields)),
+                    index: Box::new(index),
                 });
             }
         }
@@ -1512,7 +1565,7 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                         property_name
                     };
                     let class_filter =
-                        if matches!(module_name.as_str(), "http" | "https" | "events") {
+                        if matches!(module_name.as_str(), "http" | "https" | "events" | "net") {
                             Some(class_name.clone())
                         } else {
                             None
@@ -1615,25 +1668,12 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                 }
             }
         }
-        // RegExpExecArray.index / .groups — receiver is a local that holds the result
-        // of regex.exec(...). The runtime stores the most recent exec metadata in
-        // thread-locals which RegExpExecIndex/Groups read.
-        if prop_name == "index" || prop_name == "groups" {
-            // Strip non-null assertion (m1! → m1)
-            let inner = match member.obj.as_ref() {
-                ast::Expr::TsNonNull(nn) => nn.expr.as_ref(),
-                other => other,
-            };
-            if let ast::Expr::Ident(ident) = inner {
-                if ctx.regex_exec_locals.contains(&ident.sym.to_string()) {
-                    return Ok(if prop_name == "index" {
-                        Expr::RegExpExecIndex
-                    } else {
-                        Expr::RegExpExecGroups
-                    });
-                }
-            }
-        }
+        // RegExpExecArray `.index` / `.groups` / `.input` are NOT folded to
+        // thread-local reads: the runtime attaches them as real own properties
+        // on each exec/match result array (regex.rs::set_exec_array_metadata /
+        // set_exec_array_groups), so a generic PropertyGet reads the per-result
+        // value. That keeps a stored `m.index` / `m.groups` correct after an
+        // intervening match on another regex, where a thread-local was clobbered.
     }
 
     // Tagged-template `.raw` — recognize `<strings>.raw` where the
@@ -1787,15 +1827,85 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                                     | "values"
                             )
                         );
+                    // #4437: value reads such as `JSON.stringify` /
+                    // `Reflect.apply` / `BigInt.asIntN` / `Symbol.for` need the
+                    // reified namespace/constructor receiver. Direct calls still
+                    // take the intrinsic path this reroute-undo protects.
+                    let outer_static_member = match &member.prop {
+                        ast::MemberProp::Ident(p) => Some(p.sym.as_ref()),
+                        ast::MemberProp::Computed(c) => match c.expr.as_ref() {
+                            ast::Expr::Lit(ast::Lit::Str(s)) => s.value.as_str(),
+                            _ => None,
+                        },
+                        ast::MemberProp::PrivateName(_) => None,
+                    };
+                    // #4596 follow-up: `Array.isArray` / `Array.from` /
+                    // `Array.of` read as VALUES need the reified Array
+                    // constructor receiver so they resolve to the real native
+                    // function objects (correct `.name` / `.length`). They are
+                    // installed with metadata via `install_constructor_static`
+                    // (global_this.rs), but the reroute-undo otherwise collapses
+                    // them to `GlobalGet(0).<name>`, whose intrinsic path drops
+                    // the metadata (`typeof` is "function" but `.name` was
+                    // undefined). `Array.fromAsync` is unreified and stays
+                    // undefined either way. Direct calls keep the intrinsic
+                    // fast path via the `!member_is_call_callee` gate.
+                    // #4627: all six Number statics (isFinite / isInteger /
+                    // isNaN / isSafeInteger / parseFloat / parseInt) are reified
+                    // with metadata via install_constructor_static, so routing
+                    // value reads to the reified Number receiver is safe and
+                    // fixes the missing `.name`/`.length` on isInteger /
+                    // isSafeInteger. (String's fromCharCode/etc. are NOT reified
+                    // yet — left to #4627.)
+                    let outer_is_reified_builtin_static_value = !member_is_call_callee
+                        && matches!(
+                            property.as_str(),
+                            "JSON" | "Reflect" | "BigInt" | "Symbol" | "Array" | "Number"
+                        )
+                        && outer_static_member
+                            .map(|member| {
+                                crate::analysis::is_builtin_static_function_member(property, member)
+                            })
+                            .unwrap_or(false);
                     // Non-callee `console.log` reads need the namespace
                     // receiver; the property-only GlobalGet path collides
                     // with detached `Math.log`.
                     let receiver_is_detached_console_read =
                         property == "console" && !member_is_call_callee;
+                    // #4596: `Date.now` / `Date.parse` / `Date.UTC` read as a
+                    // VALUE needs the reified Date constructor receiver so it
+                    // resolves to the real native function object (typeof
+                    // "function", correct `.name`/`.length`, callable). Undoing
+                    // the reroute collapses it to `GlobalGet(0).now`, for which
+                    // codegen has no intrinsic handler (unlike `Object.keys` /
+                    // `Math.max`) — so the read mis-folds to a number. Direct
+                    // CALLS (`Date.now()`) are intercepted earlier as
+                    // `Expr::DateNow` / `DateParse` / `DateUtc`, so gate on a
+                    // non-callee read.
+                    let outer_is_reified_date_static_value = !member_is_call_callee
+                        && property == "Date"
+                        && outer_static_member
+                            .map(|member| matches!(member, "now" | "parse" | "UTC"))
+                            .unwrap_or(false);
+                    // #4627: `String.fromCharCode` / `fromCodePoint` / `raw` are
+                    // reified statics — value reads need the reified String
+                    // receiver for correct `.name`/`.length`. Explicit member
+                    // list (NOT the whole namespace) so only the reified statics
+                    // are rerouted.
+                    let outer_is_reified_string_static_value = !member_is_call_callee
+                        && property == "String"
+                        && outer_static_member
+                            .map(|member| {
+                                matches!(member, "fromCharCode" | "fromCodePoint" | "raw")
+                            })
+                            .unwrap_or(false);
                     if !outer_is_prototype_or_proto
                         && !receiver_is_namespace_value
                         && !outer_is_websocket_static
                         && !outer_is_reified_object_static_value
+                        && !outer_is_reified_builtin_static_value
+                        && !outer_is_reified_date_static_value
+                        && !outer_is_reified_string_static_value
                         && !receiver_is_detached_console_read
                     {
                         object_expr = Expr::GlobalGet(0);

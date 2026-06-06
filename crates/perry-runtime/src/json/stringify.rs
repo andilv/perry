@@ -177,19 +177,45 @@ pub(crate) unsafe fn is_object_pointer(ptr: *const u8) -> bool {
     }
 }
 
+/// True when `ptr` is a valid object with NO own (enumerable) keys: either a
+/// null `keys_array` (`{}`, `Object.fromEntries([])`) or a valid-but-empty one
+/// — the shape of a `class C {}` instance or a class whose only members are
+/// prototype methods/getters (those are not own properties). Such objects
+/// serialize as `{}`, never `null` or an array. Used by the value dispatchers
+/// to disambiguate an empty object from a corrupted pointer after the
+/// `keys_len > 0` `is_object_pointer` probe fails.
+pub(crate) unsafe fn object_has_no_own_keys(ptr: *const u8) -> bool {
+    let keys = (*(ptr as *const crate::ObjectHeader)).keys_array;
+    if keys.is_null() {
+        return true;
+    }
+    let kp = keys as u64;
+    let top_16 = kp >> 48;
+    let looks_valid = (top_16 == 0 || top_16 == 1) && kp > 0x10000 && (kp & 0x7) == 0;
+    looks_valid && (*keys).length == 0
+}
+
 #[inline]
 pub(crate) unsafe fn write_number(buf: &mut String, value: f64) {
     // #2089: a Date is now a NaN-boxed `DateCell` pointer, handled in
     // `stringify_value`/`stringify_value_depth` before this numeric funnel —
     // so no Date detection is needed here anymore.
     if value.is_nan() || value.is_infinite() {
+        // JSON has no NaN/Infinity literal; the spec serializes them as null.
         buf.push_str("null");
     } else if value.fract() == 0.0 && value.abs() < (i64::MAX as f64) {
+        // Fast path for in-range integers (the overwhelming majority of JSON
+        // numbers); identical to ECMAScript NumberToString over this range.
         let mut itoa_buf = itoa::Buffer::new();
         buf.push_str(itoa_buf.format(value as i64));
     } else {
-        let mut ryu_buf = ryu::Buffer::new();
-        buf.push_str(ryu_buf.format(value));
+        // ECMAScript Number::toString (spec 6.1.6.1.20): fixed notation for an
+        // exponent in -6..=20, else exponential with an `e+`/`e-` sign. `ryu`
+        // emits shortest round-trip digits but its own notation (`1e20`,
+        // `1e-6`, `1e21`), so JSON.stringify diverged from `String(n)` and
+        // Node. Reuse the shared JS formatter so `JSON.stringify(1e20)` is
+        // `100000000000000000000` (not `1e20`) and `1e21` is `1e+21`.
+        buf.push_str(&crate::string::js_format_f64(value));
     }
 }
 
@@ -580,12 +606,13 @@ pub(crate) unsafe fn stringify_value(value: f64, type_hint: u32, buf: &mut Strin
                             return;
                         }
                     }
-                    if (*(ptr as *const crate::ObjectHeader)).keys_array.is_null() {
-                        // #1704: a genuinely empty object (null keys_array, e.g.
-                        // `Object.fromEntries([])` / a never-mutated `{}`) fails
-                        // `is_object_pointer`'s `keys_len > 0` guard but is valid —
-                        // emit "{}" not "null". A non-empty object that fails the
-                        // check is treated as corrupted and still emits "null".
+                    if object_has_no_own_keys(ptr) {
+                        // A valid object with no own keys (null keys_array like
+                        // `Object.fromEntries([])` / `{}`, OR a valid-but-empty
+                        // keys_array like a `class C {}` instance or a class with
+                        // only prototype methods/getters) fails `is_object_pointer`'s
+                        // `keys_len > 0` guard but is still `{}`, not `null`. A
+                        // non-empty object that fails the check is corrupted → "null".
                         buf.push_str("{}");
                     } else {
                         buf.push_str("null");
@@ -810,6 +837,30 @@ pub(crate) unsafe fn stringify_value_depth(
     write_number(buf, value);
 }
 
+/// JSON.stringify serializes only own ENUMERABLE string-keyed properties.
+/// Returns `true` when the own key `key_f64` on `obj` carries an explicit
+/// `enumerable: false` descriptor (`Object.defineProperty`, `freeze`/`seal`,
+/// or a builtin descriptor such as `Uint8Array.prototype.BYTES_PER_ELEMENT`),
+/// so the caller must skip it. Callers gate this behind
+/// `crate::object::descriptors_in_use()` so the common no-descriptor object
+/// pays only a single relaxed atomic load and never touches the descriptor map.
+pub(crate) unsafe fn json_key_non_enumerable(
+    obj: *const crate::ObjectHeader,
+    key_f64: f64,
+) -> bool {
+    let mut sso = [0u8; crate::value::SHORT_STRING_MAX_LEN];
+    if let Some(kb) =
+        crate::string::js_string_key_bytes(crate::JSValue::from_bits(key_f64.to_bits()), &mut sso)
+    {
+        if let Ok(ks) = std::str::from_utf8(kb) {
+            if let Some(attrs) = crate::object::get_property_attrs(obj as usize, ks) {
+                return !attrs.enumerable();
+            }
+        }
+    }
+    false
+}
+
 #[inline]
 pub(crate) unsafe fn stringify_object(ptr: *const u8, buf: &mut String) {
     stringify_object_inner(ptr, buf, 0)
@@ -887,7 +938,10 @@ pub(crate) unsafe fn stringify_object_inner(ptr: *const u8, buf: &mut String, de
         let keys_arr = (*obj).keys_array;
         !keys_arr.is_null() && (*keys_arr).length > num_fields
     };
-    if num_fields >= 5 && !has_overflow_fields {
+    // The shape-template fast path emits every key in the shape; it can't
+    // honor per-key `enumerable: false`, so fall through to the slow path
+    // (which filters) whenever any descriptor exists on this thread.
+    if num_fields >= 5 && !has_overflow_fields && !crate::object::descriptors_in_use() {
         if let Some(tmpl_ptr) = shape_template_for(ptr) {
             if try_emit_shape_element(make_pointer_bits(ptr), &*tmpl_ptr, buf, depth) {
                 if depth > MAX_FAST_DEPTH {
@@ -993,6 +1047,9 @@ pub(crate) unsafe fn stringify_object_inner(ptr: *const u8, buf: &mut String, de
 
     buf.push('{');
     let mut first = true;
+    // Only own ENUMERABLE keys are serialized; gated so descriptor-free
+    // objects (the common case) pay a single relaxed atomic load.
+    let filter_non_enum = crate::object::descriptors_in_use();
     // `pos(j)` maps the j-th enumerated slot to its key/field index: spec
     // order when array-index keys are present, else slot `j` (no allocation).
     let pos = |j: u32| -> u32 {
@@ -1003,9 +1060,25 @@ pub(crate) unsafe fn stringify_object_inner(ptr: *const u8, buf: &mut String, de
     };
     for j in 0..actual_fields {
         let f = pos(j);
-        let field_bits = read_field_bits(f);
+        // Skip non-enumerable own keys (e.g. `Object.defineProperty(o, k,
+        // { enumerable: false })`) before touching the value.
+        if filter_non_enum && json_key_non_enumerable(obj, *keys_elements.add(f as usize)) {
+            continue;
+        }
+        let mut field_bits = read_field_bits(f);
+        // Own accessor properties: serialize the getter's return value (Node
+        // invokes the getter), not the raw slot — which holds the getter
+        // closure (object-literal `get x() {}`) or an empty placeholder
+        // (`Object.defineProperty(o, k, { get })`). Gated on the descriptor flag.
+        if filter_non_enum {
+            if let Some(gv) =
+                crate::object::json_object_getter_value(obj, *keys_elements.add(f as usize))
+            {
+                field_bits = gv.to_bits();
+            }
+        }
         let field_val = f64::from_bits(field_bits);
-        // Skip undefined per JSON spec
+        // Skip undefined per JSON spec (incl. a getter that returned undefined).
         if field_bits == TAG_UNDEFINED {
             continue;
         }

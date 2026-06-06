@@ -523,6 +523,40 @@ pub(crate) fn set_symbol_property_attrs(
     guard.as_mut().unwrap().insert((owner, sym_key), attrs);
 }
 
+pub(crate) unsafe fn js_object_delete_symbol_property(obj_f64: f64, sym_f64: f64) -> i32 {
+    let obj_key = obj_key_from_f64(obj_f64);
+    let sym_key = sym_key_from_f64(sym_f64);
+    if obj_key == 0 || sym_key == 0 {
+        return 1;
+    }
+    if get_symbol_property_attrs(obj_key, sym_key).is_some_and(|attrs| !attrs.configurable()) {
+        return 0;
+    }
+
+    accessors::clear_symbol_accessor_property(obj_key, sym_key);
+    {
+        let mut guard = crate::gc::lock_gc_root_registry(&SYMBOL_PROPERTIES);
+        if let Some(map) = guard.as_mut() {
+            let should_remove_owner = if let Some(entries) = map.get_mut(&obj_key) {
+                entries.retain(|(key, _)| *key != sym_key);
+                entries.is_empty()
+            } else {
+                false
+            };
+            if should_remove_owner {
+                map.remove(&obj_key);
+            }
+        }
+    }
+    {
+        let mut guard = crate::gc::lock_gc_root_registry(&SYMBOL_PROPERTY_ATTRS);
+        if let Some(map) = guard.as_mut() {
+            map.remove(&(obj_key, sym_key));
+        }
+    }
+    1
+}
+
 pub(crate) fn symbol_property_is_enumerable(owner: usize, sym_key: usize) -> bool {
     get_symbol_property_attrs(owner, sym_key)
         .map(|attrs| attrs.enumerable())
@@ -531,6 +565,35 @@ pub(crate) fn symbol_property_is_enumerable(owner: usize, sym_key: usize) -> boo
 
 pub(crate) fn symbol_accessor_descriptor_bits(owner: usize, sym_key: usize) -> Option<(u64, u64)> {
     accessors::symbol_accessor_property_by_key(owner, sym_key).map(|acc| (acc.get, acc.set))
+}
+
+pub(crate) unsafe fn reflect_symbol_getter_closure_bits(obj_f64: f64, sym_f64: f64) -> Option<u64> {
+    let obj_key = obj_key_from_f64(obj_f64);
+    let sym_key = sym_key_from_f64(sym_f64);
+    if obj_key == 0 || sym_key == 0 {
+        return None;
+    }
+    let acc = accessors::symbol_accessor_property_by_key(obj_key, sym_key)?;
+    if acc.get != 0 {
+        Some(acc.get)
+    } else {
+        Some(0)
+    }
+}
+
+pub(crate) unsafe fn js_object_has_own_symbol_property(obj_f64: f64, sym_f64: f64) -> bool {
+    let bits = obj_f64.to_bits();
+    if (bits >> 48) == 0x7FFE {
+        let class_id = (bits & 0xFFFF_FFFF) as u32;
+        return class_static_symbol_lookup(class_id, sym_f64).is_some();
+    }
+    let obj_key = obj_key_from_f64(obj_f64);
+    let sym_key = sym_key_from_f64(sym_f64);
+    if obj_key == 0 || sym_key == 0 {
+        return false;
+    }
+    accessors::has_own_symbol_accessor(obj_key, sym_key)
+        || object_symbol_data_property_exists(obj_key, sym_key)
 }
 
 /// Extract the raw object pointer from a NaN-boxed JSValue. Returns 0 if the
@@ -1426,6 +1489,15 @@ unsafe fn web_stream_symbol_property(obj_f64: f64, sym_f64: f64) -> Option<f64> 
 
 #[no_mangle]
 pub unsafe extern "C" fn js_object_get_symbol_property(obj_f64: f64, sym_f64: f64) -> f64 {
+    // A Proxy is a small registered id (its band overlaps the small-handle
+    // band); dereferencing it as a heap object to read a symbol-keyed property
+    // is an EXC_BAD_ACCESS. Route a SYMBOL-keyed read through the proxy `get`
+    // trap (which forwards to the target). drizzle's aliased-column proxies are
+    // read with symbol keys (`col[entityKind]`, `col[Table.Symbol.*]`) while
+    // building a relational query.
+    if crate::proxy::js_proxy_is_proxy(obj_f64) != 0 {
+        return crate::proxy::js_proxy_get(obj_f64, sym_f64);
+    }
     // Check CLASS_STATIC_SYMBOLS first when receiver is a class ref
     // (top16 == 0x7FFE, INT32_TAG).
     let bits = obj_f64.to_bits();
@@ -1563,6 +1635,31 @@ pub unsafe extern "C" fn js_object_get_symbol_property(obj_f64: f64, sym_f64: f6
             }
         }
     }
+    // Small native handles (HTTP IncomingMessage/socket, fetch bodies, etc.)
+    // NaN-boxed as POINTER are NOT heap objects: the well-known-symbol dispatch
+    // above already handled the symbols they expose. Any OTHER symbol read must
+    // return undefined rather than falling through to the pointer-deref paths
+    // below (`symbol_accessor_property` / `own_symbol_property` /
+    // `resolve_explicit_object_prototype_symbol`), which reinterpret the tiny
+    // handle id as an ObjectHeader and read `id + offset` → EXC_BAD_ACCESS.
+    // @hono/node-server reads symbols off the IncomingMessage handle while
+    // adapting it to a web Request. Proxies share the small-id band
+    // (0xF0000..0x100000) but have real symbol semantics, so exclude them.
+    if (bits >> 48) == 0x7FFD {
+        let id = (bits & 0x0000_FFFF_FFFF_FFFF) as usize;
+        // Only short-circuit values that are NOT real heap objects. A genuine
+        // ObjectHeader can live at a low address in a small program, so gate on
+        // `is_valid_obj_ptr` (validates the GcHeader) rather than the address
+        // band alone — otherwise a symbol read on a low-address object returned
+        // undefined. Proxies (registered small ids) keep their own semantics.
+        if id > 0
+            && id < 0x100000
+            && !crate::object::is_valid_obj_ptr(id as *const u8)
+            && crate::proxy::js_proxy_is_proxy(obj_f64) == 0
+        {
+            return f64::from_bits(TAG_UNDEFINED);
+        }
+    }
     if let Some(acc) = accessors::symbol_accessor_property(obj_f64, sym_f64) {
         return accessors::invoke_symbol_accessor_getter(acc.get, obj_f64);
     }
@@ -1588,6 +1685,31 @@ pub unsafe extern "C" fn js_object_get_symbol_property(obj_f64: f64, sym_f64: f6
     }
     if let Some(v) = resolve_explicit_object_prototype_symbol(obj_f64, sym_f64) {
         return v;
+    }
+    if sym_key != 0 {
+        let iter_wk = well_known_symbol("iterator");
+        if !iter_wk.is_null() {
+            let iter_f64 =
+                f64::from_bits(crate::value::JSValue::pointer(iter_wk as *const u8).bits());
+            if sym_key == sym_key_from_f64(iter_f64) {
+                let raw_iter_ptr = crate::value::js_nanbox_get_pointer(obj_f64) as usize;
+                if raw_iter_ptr >= 0x10000
+                    && crate::array::is_builtin_iterator_class_id(raw_iter_ptr)
+                {
+                    let receiver = if (bits >> 48) == 0x7FFD {
+                        obj_f64
+                    } else {
+                        crate::value::js_nanbox_pointer(raw_iter_ptr as i64)
+                    };
+                    let method = b"Symbol.iterator";
+                    return crate::object::js_class_method_bind(
+                        receiver,
+                        method.as_ptr(),
+                        method.len(),
+                    );
+                }
+            }
+        }
     }
     // Buffer extends Uint8Array in Node, so Buffer values must expose
     // @@iterator as values(). Perry's direct Buffer.from() paths often

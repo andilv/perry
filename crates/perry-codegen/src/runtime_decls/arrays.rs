@@ -40,6 +40,7 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
     // Refs #488: bulk push for `arr.push(...src)` spread call.
     module.declare_function("js_array_push_spread_f64", I64, &[I64, I64]);
     module.declare_function("js_array_get_f64", DOUBLE, &[I64, I32]);
+    module.declare_function("js_array_get_index_or_string", DOUBLE, &[I64, DOUBLE]);
     module.declare_function("js_array_numeric_get_f64_unboxed", DOUBLE, &[I64, I32]);
     module.declare_function("js_array_set_f64", VOID, &[I64, I32, DOUBLE]);
     module.declare_function("js_array_numeric_set_f64_unboxed", I32, &[I64, I32, DOUBLE]);
@@ -124,6 +125,9 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
     // number/boolean/symbol -> [], otherwise materializes via js_array_clone.
     // Takes the raw NaN-boxed value so the tag bits survive.
     module.declare_function("js_array_from_value", I64, &[DOUBLE]);
+    // Array.prototype generic receiver materialization — like LengthOfArrayLike,
+    // but absent indexed keys remain holes rather than present undefined slots.
+    module.declare_function("js_array_from_arraylike_holey_value", I64, &[DOUBLE]);
     // #2874: Iterator.from(x) — wrap any iterable in a lazy iterator-helper
     // object. Returns an already NaN-boxed pointer (DOUBLE).
     module.declare_function("js_iterator_from", DOUBLE, &[DOUBLE]);

@@ -276,6 +276,13 @@ pub(crate) fn lower_module_decl(
                                 }
                             }
                         } else {
+                            if is_node_builtin_module(&source) {
+                                ctx.register_builtin_named_import(
+                                    local.clone(),
+                                    source.clone(),
+                                    imported.clone(),
+                                );
+                            }
                             // Register as imported function. Issue #35 (#321):
                             // use the LOCAL name as the original-name marker
                             // (identity registration) — mirroring the Default
@@ -415,6 +422,11 @@ pub(crate) fn lower_module_decl(
                             // not lower to StaticMethodCall — see the heuristic
                             // in expr_call::static_and_instance.
                             ctx.namespace_import_locals.insert(local.clone());
+                            // Remember the source so a later bare `export { local }`
+                            // re-exports the namespace itself rather than a bare
+                            // function symbol (see the local-export branch below).
+                            ctx.namespace_import_sources
+                                .insert(local.clone(), source.clone());
                         }
                         specifiers.push(ImportSpecifier::Namespace { local });
                     }
@@ -1374,6 +1386,24 @@ pub(crate) fn lower_module_decl(
                                 }
                             })
                             .unwrap_or_else(|| local.clone());
+
+                        // When the re-exported local is a namespace import
+                        // (`import * as z from "src"; export { z }`), it is NOT a
+                        // plain binding — it is the module namespace of `src`.
+                        // Emit it as a NamespaceReExport (the same lowering as
+                        // `export * as z from "src"`, #310) so the importer
+                        // receives the namespace object with all its members,
+                        // not a bare `perry_fn_<mod>__z` function symbol. This is
+                        // exactly how zod re-exports `z`, so without this every
+                        // `z.object` / `z.coerce` in consumer code is undefined.
+                        if let Some(ns_source) = ctx.namespace_import_sources.get(&local).cloned() {
+                            module.exports.push(Export::NamespaceReExport {
+                                source: ns_source,
+                                name: exported.clone(),
+                            });
+                            continue;
+                        }
+
                         module.exports.push(Export::Named {
                             local: local.clone(),
                             exported: exported.clone(),
@@ -1455,6 +1485,17 @@ pub(crate) fn lower_module_decl(
                                             | Expr::FuncRef(_)
                                             | Expr::ExternFuncRef { .. }
                                             | Expr::PropertyGet { .. }
+                                            // A const aliasing a class STATIC field value
+                                            // (`const stringType = ZodString.create;
+                                            // export { stringType as string }`) lowers its
+                                            // init to `StaticFieldGet`. Like `PropertyGet`
+                                            // above it must flow through `exported_objects`
+                                            // so the importer reads the const's value via the
+                                            // module getter instead of link-failing to a
+                                            // nonexistent `perry_fn_<src>__<name>` symbol
+                                            // (which made the call return `undefined`). zod's
+                                            // `z.string`/`z.number`/… are all this shape.
+                                            | Expr::StaticFieldGet { .. }
                                             // #421 fix (v0.5.574): primitive literals must
                                             // also flow through `exported_objects` so the
                                             // importing module's `imported_vars` set picks
@@ -1839,6 +1880,14 @@ pub(crate) fn lower_namespace_as_class(
 
     let mut static_methods = Vec::new();
     let mut static_method_names = Vec::new();
+    // Namespace `export const` members surfaced as static fields so `Ns.member`
+    // resolves CROSS-MODULE (the per-module `namespace_vars` local is invisible
+    // to importers; only namespace FUNCTIONS — lowered as static methods —
+    // crossed the boundary). The field's VALUE is copied from the const's local
+    // by a `StaticFieldSet` appended to `module.init` right after the const's
+    // own `Let`, so it is evaluated exactly once and in the right order. zod's
+    // `util` namespace (`util.objectKeys`, …) is imported this way.
+    let mut ns_static_fields: Vec<crate::ir::ClassField> = Vec::new();
 
     // First pass: collect exported function names, pre-register all functions and variables
     // (so namespace members can reference each other regardless of declaration order)
@@ -2005,9 +2054,32 @@ pub(crate) fn lower_namespace_as_class(
                                     mutable,
                                     init: Some(expr),
                                 });
-                                // Track as namespace variable for Ns.member access resolution
+                                // Track as namespace variable for `Ns.member`
+                                // access AND intra-namespace bare references.
                                 ctx.namespace_vars
                                     .push((ns_name.to_string(), name.clone(), id));
+                                // Surface as a static field of the namespace class
+                                // and copy the const's value into it (after the Let
+                                // above), so `Ns.member` resolves cross-module via
+                                // the static-field global. The field carries no
+                                // initializer of its own — the value is set once,
+                                // here, from the already-evaluated local.
+                                if is_exported {
+                                    ns_static_fields.push(crate::ir::ClassField {
+                                        name: name.clone(),
+                                        key_expr: None,
+                                        ty: Type::Any,
+                                        init: None,
+                                        is_private: false,
+                                        is_readonly: !mutable,
+                                        decorators: Vec::new(),
+                                    });
+                                    module.init.push(Stmt::Expr(Expr::StaticFieldSet {
+                                        class_name: ns_name.to_string(),
+                                        field_name: name.clone(),
+                                        value: Box::new(Expr::LocalGet(id)),
+                                    }));
+                                }
                                 // Export the variable for cross-module access
                                 if is_exported {
                                     module.exported_objects.push(name.clone());
@@ -2046,7 +2118,7 @@ pub(crate) fn lower_namespace_as_class(
         methods: Vec::new(),
         getters: Vec::new(),
         setters: Vec::new(),
-        static_fields: Vec::new(),
+        static_fields: ns_static_fields,
         static_methods,
         computed_members: Vec::new(),
         decorators: Vec::new(),

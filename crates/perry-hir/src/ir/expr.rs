@@ -1498,6 +1498,12 @@ pub enum Expr {
         start: Box<Expr>,
         end: Option<Box<Expr>>,
     }, // arr.copyWithin(target, start, end?) -> same array
+    ArrayCopyWithinValue {
+        receiver: Box<Expr>,
+        target: Box<Expr>,
+        start: Box<Expr>,
+        end: Option<Box<Expr>>,
+    }, // Array.prototype.copyWithin.call(arrayLike, target, start, end?) -> same receiver
     ArrayEntries(Box<Expr>), // arr.entries() -> Array<[index, value]> (eager materialization)
     ArrayKeys(Box<Expr>),    // arr.keys() -> Array<index>
     ArrayValues(Box<Expr>),  // arr.values() -> Array<value> (essentially clone)
@@ -2045,6 +2051,8 @@ pub enum Expr {
     /// Array.from(iterable) -> Array
     /// Creates a new array from an iterable (e.g., Map.entries(), Map.keys(), another array)
     ArrayFrom(Box<Expr>),
+    /// Array.prototype generic receiver materialization preserving absent keys as holes.
+    ArrayFromArrayLikeHoley(Box<Expr>),
 
     /// `Iterator.from(iterable)` (#2874) — wrap any iterable/iterator in a lazy
     /// iterator-helper object exposing `.map`/`.filter`/`.take`/`.drop`/

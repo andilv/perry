@@ -127,6 +127,10 @@ pub struct LoweringContext {
     pub(crate) interface_object_types: std::collections::HashMap<String, perry_types::ObjectType>,
     /// Imported functions: local_name -> original_name (the exported name in the source module)
     pub(crate) imported_functions: Vec<(String, String)>,
+    /// Built-in named imports: local_name -> (module_name, exported_name).
+    /// Kept separate from `imported_functions`, whose identity mapping is part
+    /// of cross-module codegen symbol disambiguation.
+    pub(crate) builtin_named_imports: Vec<(String, String, String)>,
     /// Native module imports: local_name -> (module_name, method_name)
     /// For namespace imports (import * as x), method_name is None
     /// For named imports (import { v4 as uuid }), method_name is Some("v4")
@@ -321,6 +325,13 @@ pub struct LoweringContext {
     /// default imports of actual classes (`import { MongoClient }`) are NOT in
     /// this set and keep the static-method path.
     pub(crate) namespace_import_locals: HashSet<String>,
+    /// Maps a namespace-import local (`import * as z from "src"`) to its source
+    /// module. Used so a later bare `export { z }` re-export of that local routes
+    /// to `Export::NamespaceReExport` (equivalent to `export * as z from "src"`)
+    /// rather than `Export::Named`, which would resolve `z` to a bare function
+    /// symbol in the importer and drop every namespace member. Closes the zod
+    /// `import { z }` breakage (zod's index does `import * as z; export { z }`).
+    pub(crate) namespace_import_sources: std::collections::HashMap<String, String>,
     /// Names of functions declared with `function*` — used to detect generator
     /// calls in `for...of` so the iterator protocol loop is emitted instead of
     /// the array-index loop.
@@ -334,10 +345,6 @@ pub struct LoweringContext {
     /// takes `this` as its first parameter. Consumed by `for...of` to
     /// dispatch through the iterator protocol via a direct FuncRef call.
     pub(crate) iterator_func_for_class: std::collections::HashMap<String, perry_types::FuncId>,
-    /// Local names whose value was assigned from `regex.exec(...)`. Used to
-    /// route `local.index` / `local.groups` to the bare RegExpExecIndex/Groups
-    /// HIR variants which read the runtime's thread-local exec metadata.
-    pub(crate) regex_exec_locals: HashSet<String>,
     pub(crate) proxy_locals: HashSet<String>,
     /// #3144: local name -> builtin prototype method name, for bindings like
     /// `const m = [].map` / `const s = "".slice`. Lets the `.call`/`.apply`
@@ -358,10 +365,6 @@ pub struct LoweringContext {
     /// timestamp and print `1970-01-01T00:00:00.000Z`).
     pub(crate) plain_object_locals: HashSet<String>,
     pub(crate) proxy_revoke_locals: HashMap<String, String>,
-    /// For `const p = new Proxy(ClassName, handler)`, record the class name
-    /// so `new p(args)` can fold to `new ClassName(args)` (pragmatic — lets
-    /// the test's construct trap see the expected value).
-    pub(crate) proxy_target_classes: HashMap<String, String>,
     /// Alias map for class expressions: `const MyClass = class { ... }`
     /// binds the local `MyClass` to the synthetic class name created
     /// by `lower_class_from_ast`. The `new MyClass(...)` lowering looks

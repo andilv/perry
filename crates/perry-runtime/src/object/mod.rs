@@ -21,6 +21,7 @@ mod alloc;
 mod arguments;
 mod array_object_ops;
 mod assert;
+mod async_generator_queue;
 mod bigint_dispatch;
 mod buffer_dispatch;
 mod class_constructors;
@@ -75,8 +76,9 @@ pub use class_gc_roots::scan_class_inheritance_roots_mut;
 #[cfg(test)]
 pub(crate) use class_gc_roots::{
     test_class_parent_closure_root, test_class_prototype_object_root,
-    test_clear_class_inheritance_roots, test_seed_class_inheritance_roots,
-    test_seed_class_parent_closure_root,
+    test_clear_class_inheritance_roots, test_decl_class_prototype_root,
+    test_seed_class_inheritance_roots, test_seed_class_parent_closure_root,
+    test_seed_decl_class_prototype_root,
 };
 pub use class_registry::*;
 pub(crate) use collection_proto_thunks::{is_builtin_map_set_value, is_builtin_set_add_value};
@@ -652,6 +654,39 @@ pub(crate) fn reflect_getter_closure_bits(value: f64, key: f64) -> Option<u64> {
         // that via 0 so the caller returns undefined rather than a field read.
         Some(0)
     }
+}
+
+/// `JSON.stringify` helper: if the own key `key_f64` on `obj` is an accessor
+/// property, invoke its getter (with `obj` as the `this` receiver) and return
+/// the result bits; `None` when there is no own accessor (caller falls back to
+/// the data-field slot). An accessor with no getter reads as `undefined`, which
+/// `JSON.stringify` then omits. Node serializes a getter's *return value*, not
+/// the stored slot (which holds the getter closure or an empty placeholder).
+/// Callers gate this on `descriptors_in_use()`.
+pub(crate) unsafe fn json_object_getter_value(
+    obj: *const ObjectHeader,
+    key_f64: f64,
+) -> Option<f64> {
+    let mut sso = [0u8; crate::value::SHORT_STRING_MAX_LEN];
+    let kb = crate::string::js_string_key_bytes(
+        crate::value::JSValue::from_bits(key_f64.to_bits()),
+        &mut sso,
+    )?;
+    let name = std::str::from_utf8(kb).ok()?;
+    let acc = get_accessor_descriptor(obj as usize, name)?;
+    const TAG_UNDEFINED: u64 = 0x7FFC_0000_0000_0001;
+    if acc.get == 0 {
+        return Some(f64::from_bits(TAG_UNDEFINED));
+    }
+    let closure = (acc.get & crate::value::POINTER_MASK) as *const crate::closure::ClosureHeader;
+    if closure.is_null() {
+        return Some(f64::from_bits(TAG_UNDEFINED));
+    }
+    let receiver = crate::value::js_nanbox_pointer(obj as i64);
+    let prev = js_implicit_this_set(receiver);
+    let result = crate::closure::js_closure_call0(closure);
+    js_implicit_this_set(prev);
+    Some(result)
 }
 
 /// Store an accessor descriptor for (obj, key).
@@ -1414,6 +1449,7 @@ pub fn scan_object_cache_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'
         Ordering::Acquire,
         Ordering::Release,
     );
+    async_generator_queue::scan_async_generator_queue_roots_mut(visitor);
     visitor.visit_atomic_i64_slot(&LOCAL_STORAGE_PTR, Ordering::Acquire, Ordering::Release);
     visitor.visit_atomic_i64_slot(&SESSION_STORAGE_PTR, Ordering::Acquire, Ordering::Release);
     // Shared `%IteratorPrototype%`-style singletons for Array/Map/Set/String

@@ -24,7 +24,10 @@ pub use match_all::{
     REGEXP_STRING_ITERATOR_CLASS_ID,
 };
 use replace_fn::call_replace_callback;
-pub use replace_fn::{js_string_replace_all_string_fn, js_string_replace_string_fn};
+pub use replace_fn::{
+    js_string_replace_all_string, js_string_replace_all_string_fn, js_string_replace_string,
+    js_string_replace_string_fn,
+};
 
 thread_local! {
     /// Last exec result metadata: (index, groups_object_ptr)
@@ -221,6 +224,28 @@ fn set_exec_array_metadata(arr: *mut ArrayHeader, input: &str, index: f64) {
     let input_str = js_string_from_str(input);
     let input_value = js_nanbox_string(input_str as i64);
     crate::array::js_array_set_string_key(arr, input_key, input_value);
+}
+
+/// Attach the `groups` own property to a regex match-result array.
+///
+/// Mirrors `set_exec_array_metadata` for `index`/`input`: the result of
+/// `regex.exec(s)` / `s.match(regex)` carries `groups` as a real own property
+/// so reads stay correct under aliasing and interleaved matches — a stored
+/// `m.groups` survives a later `re2.exec(...)`, instead of resolving through a
+/// single most-recent-match thread-local (`LAST_EXEC_GROUPS`). Per ECMA-262
+/// RegExpBuiltinExec, `groups` is the named-capture object when the pattern
+/// has named groups, else `undefined`.
+fn set_exec_array_groups(arr: *mut ArrayHeader, groups_obj: *mut ObjectHeader) {
+    if arr.is_null() {
+        return;
+    }
+    let groups_key = js_string_from_str("groups");
+    let value = if groups_obj.is_null() {
+        f64::from_bits(0x7FFC_0000_0000_0001) // TAG_UNDEFINED
+    } else {
+        crate::value::js_nanbox_pointer(groups_obj as i64)
+    };
+    crate::array::js_array_set_string_key(arr, groups_key, value);
 }
 
 fn char_index_to_byte(s: &str, char_index: usize) -> usize {
@@ -519,7 +544,23 @@ pub extern "C" fn js_string_match(
                                 crate::array::store_array_slot(arr, i, undefined.to_bits());
                             }
                         }
+                        // Attach .index / .input as real own properties.
+                        let match_char_offset = caps
+                            .get(0)
+                            .map(|m| str_data[..m.start()].chars().count())
+                            .unwrap_or(0);
+                        set_exec_array_metadata(
+                            arr_handle.get_raw_mut_ptr::<ArrayHeader>(),
+                            str_data,
+                            match_char_offset as f64,
+                        );
                         LAST_EXEC_GROUPS.with(|g| *g.borrow_mut() = ptr::null_mut());
+                        // fancy-regex path doesn't extract named groups; mirror
+                        // the thread-local (`undefined`) on the result object.
+                        set_exec_array_groups(
+                            arr_handle.get_raw_mut_ptr::<ArrayHeader>(),
+                            ptr::null_mut(),
+                        );
                         return arr_handle.get_raw_mut_ptr::<ArrayHeader>();
                     }
                     _ => {
@@ -579,6 +620,19 @@ pub extern "C" fn js_string_match(
                         }
                     }
 
+                    // Attach .index / .input as real own properties (mirrors
+                    // js_regexp_exec) so they survive aliasing and a later match
+                    // on another regex, instead of a most-recent-match thread-local.
+                    let match_char_offset = caps
+                        .get(0)
+                        .map(|m| str_data[..m.start()].chars().count())
+                        .unwrap_or(0);
+                    set_exec_array_metadata(
+                        arr_handle.get_raw_mut_ptr::<ArrayHeader>(),
+                        str_data,
+                        match_char_offset as f64,
+                    );
+
                     // Build groups object for named captures (same shape as
                     // `regex.exec(str)` does in `js_regexp_exec`). Stored in
                     // `LAST_EXEC_GROUPS` thread-local so the HIR fold for
@@ -626,8 +680,16 @@ pub extern "C" fn js_string_match(
                             *g.borrow_mut() =
                                 groups_handle.get_raw_mut_ptr::<crate::object::ObjectHeader>()
                         });
+                        set_exec_array_groups(
+                            arr_handle.get_raw_mut_ptr::<ArrayHeader>(),
+                            groups_handle.get_raw_mut_ptr::<crate::object::ObjectHeader>(),
+                        );
                     } else {
                         LAST_EXEC_GROUPS.with(|g| *g.borrow_mut() = ptr::null_mut());
+                        set_exec_array_groups(
+                            arr_handle.get_raw_mut_ptr::<ArrayHeader>(),
+                            ptr::null_mut(),
+                        );
                     }
 
                     arr_handle.get_raw_mut_ptr::<ArrayHeader>()
@@ -829,63 +891,6 @@ pub extern "C" fn js_string_replace_all_regex(
     js_string_replace_regex(s, re, replacement)
 }
 
-/// Replace with a simple string pattern (not regex)
-/// string.replace(pattern, replacement) -> string
-#[no_mangle]
-pub extern "C" fn js_string_replace_string(
-    s: *const StringHeader,
-    pattern: *const StringHeader,
-    replacement: *const StringHeader,
-) -> *mut StringHeader {
-    if !is_valid_ptr(s) {
-        return js_string_from_str("");
-    }
-
-    let str_data = string_as_str(s);
-    let pattern_str = if is_valid_ptr(pattern) {
-        string_as_str(pattern)
-    } else {
-        ""
-    };
-    let repl_str = if is_valid_ptr(replacement) {
-        string_as_str(replacement)
-    } else {
-        "undefined"
-    };
-
-    // String.replace with a string pattern only replaces the first occurrence
-    let result = str_data.replacen(pattern_str, repl_str, 1);
-    js_string_from_str(&result)
-}
-
-/// Replace ALL occurrences with a simple string pattern (not regex)
-/// string.replaceAll(pattern, replacement) -> string
-#[no_mangle]
-pub extern "C" fn js_string_replace_all_string(
-    s: *const StringHeader,
-    pattern: *const StringHeader,
-    replacement: *const StringHeader,
-) -> *mut StringHeader {
-    if !is_valid_ptr(s) {
-        return js_string_from_str("");
-    }
-
-    let str_data = string_as_str(s);
-    let pattern_str = if is_valid_ptr(pattern) {
-        string_as_str(pattern)
-    } else {
-        ""
-    };
-    let repl_str = if is_valid_ptr(replacement) {
-        string_as_str(replacement)
-    } else {
-        "undefined"
-    };
-
-    let result = str_data.replace(pattern_str, repl_str);
-    js_string_from_str(&result)
-}
-
 /// Split a string by a regex delimiter
 /// string.split(regex) -> string[] (array of NaN-boxed string pointers)
 #[no_mangle]
@@ -1073,6 +1078,12 @@ pub extern "C" fn js_regexp_exec(
                     );
                     LAST_EXEC_INDEX.with(|idx| *idx.borrow_mut() = match_char_offset as f64);
                     LAST_EXEC_GROUPS.with(|g| *g.borrow_mut() = ptr::null_mut());
+                    // fancy-regex path doesn't extract named groups; mirror the
+                    // thread-local (`undefined`) on the result object.
+                    set_exec_array_groups(
+                        arr_handle.get_raw_mut_ptr::<ArrayHeader>(),
+                        ptr::null_mut(),
+                    );
                     return Some(arr_handle.get_raw_mut_ptr::<ArrayHeader>());
                 }
                 return Some(ptr::null_mut()); // fancy-regex tried but no match
@@ -1139,36 +1150,42 @@ pub extern "C" fn js_regexp_exec(
                     .collect();
 
                 if !group_names.is_empty() {
-                    let mut packed_keys: Vec<u8> = Vec::new();
-                    for (name, _) in &group_names {
-                        packed_keys.extend_from_slice(name.as_bytes());
-                        packed_keys.push(0);
-                    }
-                    let groups_obj = crate::object::js_object_alloc_with_shape(
-                        0x7FFF_FE00,
-                        group_names.len() as u32,
-                        packed_keys.as_ptr(),
-                        packed_keys.len() as u32,
-                    );
+                    // Allocate a fresh per-result object (and shape) via
+                    // `js_object_alloc(0, 0)` + by-name setters, NOT a shared
+                    // `js_object_alloc_with_shape(const_id)`. A fixed interned
+                    // shape id makes a later match with different named captures
+                    // inherit the prior call's key names (e.g. `(?<x>…)` then
+                    // `(?<z>…)` exposing `.x` on the second result). This mirrors
+                    // the fix already applied to the `js_string_match` path.
+                    let groups_obj = crate::object::js_object_alloc(0, 0);
                     let groups_handle = scope.root_raw_mut_ptr(groups_obj);
-                    for (idx, (_, m)) in group_names.iter().enumerate() {
+                    for (name, m) in &group_names {
                         let val = if let Some(m) = m {
                             let str_ptr = js_string_from_str(m.as_str());
-                            let nanboxed = js_nanbox_string(str_ptr as i64);
-                            crate::value::JSValue::from_bits(nanboxed.to_bits())
+                            js_nanbox_string(str_ptr as i64)
                         } else {
-                            crate::value::JSValue::undefined()
+                            f64::from_bits(TAG_UNDEFINED)
                         };
+                        let key_ptr =
+                            crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
                         let groups_obj =
                             groups_handle.get_raw_mut_ptr::<crate::object::ObjectHeader>();
-                        crate::object::js_object_set_field(groups_obj, idx as u32, val);
+                        crate::object::js_object_set_field_by_name(groups_obj, key_ptr, val);
                     }
                     LAST_EXEC_GROUPS.with(|g| {
                         *g.borrow_mut() =
                             groups_handle.get_raw_mut_ptr::<crate::object::ObjectHeader>()
                     });
+                    set_exec_array_groups(
+                        arr_handle.get_raw_mut_ptr::<ArrayHeader>(),
+                        groups_handle.get_raw_mut_ptr::<crate::object::ObjectHeader>(),
+                    );
                 } else {
                     LAST_EXEC_GROUPS.with(|g| *g.borrow_mut() = ptr::null_mut());
+                    set_exec_array_groups(
+                        arr_handle.get_raw_mut_ptr::<ArrayHeader>(),
+                        ptr::null_mut(),
+                    );
                 }
 
                 arr_handle.get_raw_mut_ptr::<ArrayHeader>()
@@ -1355,6 +1372,96 @@ pub extern "C" fn js_regexp_set_last_index(re: *mut RegExpHeader, value: f64) {
     }
 }
 
+/// Fancy-regex fallback for `js_string_replace_regex_fn`: used when the pattern
+/// needs lookahead/backreferences that the `regex` crate can't compile. Mirrors
+/// the standard-engine loop below (full ECMAScript callback argument list,
+/// char-based offset, named-group `groups` object) but drives the match loop
+/// with `fancy_regex`.
+unsafe fn replace_regex_fn_fancy(
+    str_data: &str,
+    fre: &fancy_regex::Regex,
+    global: bool,
+    closure_ptr: *const crate::closure::ClosureHeader,
+) -> *mut StringHeader {
+    const TAG_UNDEFINED: u64 = 0x7FFC_0000_0000_0001;
+
+    let has_named_groups = fre.capture_names().any(|n| n.is_some());
+
+    // Collect captures up front so a GC during callback dispatch can't disturb
+    // the iterator's borrow of `str_data`.
+    let mut captures_list: Vec<fancy_regex::Captures> = Vec::new();
+    let mut iter = fre.captures_iter(str_data);
+    while let Some(Ok(caps)) = iter.next() {
+        captures_list.push(caps);
+        if !global {
+            break;
+        }
+    }
+
+    let mut result = String::new();
+    let mut last_end = 0usize;
+
+    for caps in &captures_list {
+        let full_match = caps.get(0).unwrap();
+        result.push_str(&str_data[last_end..full_match.start()]);
+
+        let char_offset = str_data[..full_match.start()].chars().count();
+
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let mut arg_handles: Vec<crate::gc::RuntimeHandle<'_>> = Vec::new();
+
+        let match_nanboxed = js_nanbox_string(js_string_from_str(full_match.as_str()) as i64);
+        arg_handles.push(scope.root_nanbox_f64(match_nanboxed));
+
+        let num_groups = caps.len() - 1; // exclude full match
+        for gi in 1..=num_groups {
+            let group_val = if let Some(m) = caps.get(gi) {
+                js_nanbox_string(js_string_from_str(m.as_str()) as i64)
+            } else {
+                f64::from_bits(TAG_UNDEFINED)
+            };
+            arg_handles.push(scope.root_nanbox_f64(group_val));
+        }
+
+        arg_handles.push(scope.root_nanbox_f64(char_offset as f64));
+        let string_nanboxed = js_nanbox_string(js_string_from_str(str_data) as i64);
+        arg_handles.push(scope.root_nanbox_f64(string_nanboxed));
+
+        if has_named_groups {
+            let groups_obj = crate::object::js_object_alloc(0, 0);
+            let groups_handle = scope.root_raw_mut_ptr(groups_obj);
+            let group_names: Vec<(&str, Option<fancy_regex::Match>)> = fre
+                .capture_names()
+                .enumerate()
+                .filter_map(|(i, name)| name.map(|n| (n, caps.get(i))))
+                .collect();
+            for (name, m) in &group_names {
+                let val = if let Some(m) = m {
+                    js_nanbox_string(js_string_from_str(m.as_str()) as i64)
+                } else {
+                    f64::from_bits(TAG_UNDEFINED)
+                };
+                let key_ptr = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+                let groups_obj = groups_handle.get_raw_mut_ptr::<crate::object::ObjectHeader>();
+                crate::object::js_object_set_field_by_name(groups_obj, key_ptr, val);
+            }
+            let groups_ptr = groups_handle.get_raw_mut_ptr::<crate::object::ObjectHeader>();
+            let groups_value = crate::value::js_nanbox_pointer(groups_ptr as i64);
+            arg_handles.push(scope.root_nanbox_f64(groups_value));
+        }
+
+        let call_args: Vec<f64> = arg_handles.iter().map(|h| h.get_nanbox_f64()).collect();
+        let callback_value =
+            f64::from_bits(crate::value::JSValue::pointer(closure_ptr as *mut u8).bits());
+        result.push_str(&call_replace_callback(callback_value, &call_args));
+
+        last_end = full_match.end();
+    }
+
+    result.push_str(&str_data[last_end..]);
+    js_string_from_str(&result)
+}
+
 /// string.replace(regex, replacerFn) — replace with a callback function.
 ///
 /// The callback receives the full ECMAScript argument list (#2867):
@@ -1390,6 +1497,17 @@ pub extern "C" fn js_string_replace_regex_fn(
             crate::value::js_nanbox_get_pointer(callback) as *const crate::closure::ClosureHeader;
         if closure_ptr.is_null() {
             return js_string_from_str(str_data);
+        }
+
+        // If the `regex` crate couldn't compile this pattern (lookahead,
+        // backreferences, …), `get_or_compile_regex` stashed a never-match
+        // placeholder in `(*re).regex_ptr` and the real pattern in
+        // `FANCY_CACHE`. Route the callback-replace through fancy-regex so the
+        // callback actually fires — otherwise `captures_iter` below would
+        // silently match nothing and return the input unchanged. (get-intrinsic's
+        // `stringToPath` relies on `String.prototype.replace(/…(?=…)…/g, fn)`.)
+        if let Some(fre) = lookup_fancy_regex(re) {
+            return replace_regex_fn_fancy(str_data, &fre, global, closure_ptr);
         }
 
         let mut result = String::new();

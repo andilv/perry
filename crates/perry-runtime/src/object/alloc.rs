@@ -7,6 +7,32 @@
 
 use super::*;
 
+static CLASS_KEYS_BY_ID: std::sync::RwLock<Option<std::collections::HashMap<u32, (usize, u32)>>> =
+    std::sync::RwLock::new(None);
+
+fn remember_class_keys_array(class_id: u32, field_count: u32, keys_array: *mut ArrayHeader) {
+    if class_id == 0 || keys_array.is_null() {
+        return;
+    }
+    let mut guard = CLASS_KEYS_BY_ID.write().unwrap();
+    if guard.is_none() {
+        *guard = Some(std::collections::HashMap::new());
+    }
+    guard
+        .as_mut()
+        .unwrap()
+        .insert(class_id, (keys_array as usize, field_count));
+}
+
+pub(crate) fn registered_class_keys_array(class_id: u32) -> Option<(*mut ArrayHeader, u32)> {
+    let guard = CLASS_KEYS_BY_ID.read().ok()?;
+    let (addr, field_count) = guard.as_ref()?.get(&class_id).copied()?;
+    if addr == 0 {
+        return None;
+    }
+    Some((addr as *mut ArrayHeader, field_count))
+}
+
 /// Allocate a new object with the given class ID and field count
 /// Returns a pointer to the object header
 #[no_mangle]
@@ -237,11 +263,13 @@ pub extern "C" fn js_build_class_keys_array(
         .wrapping_add(1000000);
     let cached = shape_cache_get(shape_id);
     if !cached.is_null() {
+        remember_class_keys_array(class_id, field_count, cached);
         return cached;
     }
     if field_count == 0 || packed_keys_len == 0 || packed_keys.is_null() {
         let arr = crate::array::js_array_alloc_with_length_longlived(0);
         shape_cache_insert(shape_id, arr);
+        remember_class_keys_array(class_id, field_count, arr);
         return arr;
     }
     let keys_bytes = unsafe { std::slice::from_raw_parts(packed_keys, packed_keys_len as usize) };
@@ -273,6 +301,7 @@ pub extern "C" fn js_build_class_keys_array(
         }
     }
     shape_cache_insert(shape_id, arr);
+    remember_class_keys_array(class_id, field_count, arr);
     arr
 }
 
@@ -357,6 +386,7 @@ pub extern "C" fn js_object_alloc_class_with_keys(
     unsafe {
         set_object_keys_array(ptr, keys_arr);
     }
+    remember_class_keys_array(class_id, field_count, keys_arr);
     ptr
 }
 
@@ -761,6 +791,33 @@ pub unsafe extern "C" fn js_object_assign_one(target_f64: f64, source_f64: f64) 
     // `(*src).keys_array` just below; an unaligned non-object source must
     // be skipped, not dereferenced.
     if src_raw < 0x10000 || src_raw % 8 != 0 || crate::symbol::is_registered_symbol(src_raw) {
+        return target_f64;
+    }
+
+    // A function/closure source is NOT an `ObjectHeader`: reading `keys_array`
+    // off it dereferences a bogus field, yielding a garbage `key_count` and a
+    // runaway copy loop. Enumerate the closure's own *enumerable* dynamic props
+    // instead — the built-in `length`/`name`/`prototype` slots are
+    // non-enumerable and excluded, matching `Object.keys`/`getOwnPropertyNames`.
+    // (Stripe's `protoExtend` does `Object.assign(Constructor, Super)` to copy a
+    // resource class's enumerable statics like `.extend`/`.method`; without this
+    // the call hung at `import 'stripe'`.)
+    if crate::closure::is_closure_ptr(src_raw) {
+        for (name, value) in crate::closure::closure_dynamic_props_snapshot(src_raw) {
+            if matches!(name.as_str(), "length" | "name" | "prototype") {
+                continue;
+            }
+            if crate::closure::closure_is_key_deleted(src_raw, &name) {
+                continue;
+            }
+            if let Some(attrs) = get_property_attrs(src_raw, &name) {
+                if !attrs.enumerable() {
+                    continue;
+                }
+            }
+            let key_ptr = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+            object_assign_set_string_key(target, target_is_array, key_ptr, value);
+        }
         return target_f64;
     }
 

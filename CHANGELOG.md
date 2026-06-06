@@ -2,6 +2,68 @@
 
 Detailed changelog for Perry. See CLAUDE.md for concise summaries.
 
+## v0.5.1124 — fix(runtime): array boundary-index, sparse length, and non-integer keys
+
+Closes #4557 and #4543; supersedes #4585 and #4559 by combining both into one branch.
+
+**Symptom.** `const a=[0,1,2]; a[4294967295]='x'` produced a deterministically-bogus
+`length` of 193 and an unreadable element. `b[4294967294]='y'` (the max valid index)
+could not be represented at all by the dense model. `a[1.5]='z'` truncated to `a[1]`,
+clobbering an existing element instead of creating the `"1.5"` string property.
+
+**Root cause.** Two orthogonal gaps sharing the boundary: (1) the computed-member
+fast path narrowed numeric/computed keys through `i32` before the runtime could
+classify them, so `2**32-1` and non-integer keys never reached
+`js_array_set_index_or_string`; (2) the dense array model assumed
+`length <= capacity`, so a far-but-valid index (`2**32-2`) had no representation.
+
+**Fix.**
+- **Codegen** (`expr/index_get.rs`, `expr/index_set.rs`): `numeric_index_needs_runtime_key`
+  now routes any **literal** that is not a clean array index in `0..=i32::MAX` — negatives,
+  out-of-range integers (`a[2**32-1]`), non-integer floats (`a[1.5]`), and non-finite
+  values (`a[NaN]`/`a[Infinity]`) — through `js_array_get/set_index_or_string` instead
+  of the truncating i32 path. Computed/dynamic numeric indices (`a[i % n]`) are
+  deliberately left on the typed-feedback numeric-array guard path (which has its own
+  out-of-range fallback); rerouting them would drop the index guard and regress the
+  native-region proof. Boundary-valued *variables* (`const k = 2**32-1; a[k]`) remain a
+  known follow-up.
+- **Runtime sparse storage** (`array/indexing.rs`, `array/header.rs`): far writes beyond
+  `MAX_DENSE_ARRAY_GROW_LENGTH` (1M) and writes at/above the dense capacity store into
+  the array's `ARRAY_NAMED_PROPS` side table while `length` is tracked separately, so
+  `b[2**32-2]='y'` yields `length === 4294967295` with one stored element instead of a
+  ~32 GB allocation. `clean_arr_ptr` admits the `length > capacity` sparse shape (gated
+  on `GC_TYPE_ARRAY` + `capacity <= 1M`). New `js_array_get_index_or_string` mirrors the
+  set helper for reads.
+- **Non-integer keys** (`array/indexing.rs`): `js_array_set_index_or_string` now
+  stringifies any non-canonical number (`2**32-1`+, negatives, `1.5`) via
+  `js_jsvalue_to_string` and stores it as an ordinary `"…"` property, instead of the old
+  `format!("{:.0}")` integer path that dropped/mis-parsed non-integer floats.
+
+**Verification.** Byte-identical to `node --experimental-strip-types` for `a[2**32-1]`,
+`a[2**32-2]`, `a[1.5]`, `a[-1]`, string-key reads, `a[10n]` canonical index, and
+delete/hasOwnProperty/in. test262-equivalent of `built-ins/Array/15.4.5.1-5-1.js` /
+`-5-2.js`: 10/10. node-suite fixtures `array-index-boundary.ts` and
+`array-property-keys.ts` identical to node in both auto-optimize and
+`PERRY_NO_AUTO_OPTIMIZE=1` paths. Dense-array regression sweep
+(map/filter/reduce/for-of/forEach/JSON/push/pop/slice/spread/Object.keys/1000-element
+grow) unaffected. `cargo test -p perry-runtime --lib array::` 57/0.
+
+## v0.5.1123 — fix(json): internalize JSON.parse reviver via the spec InternalizeJSONProperty walk (#4588)
+
+`JSON.parse(text, reviver)` previously walked the parsed value's raw object/array storage slots in place — it never went through `[[Get]]`/`[[Delete]]`/`CreateDataProperty`, so spec-mandated behaviours were invisible: deleting the property when the reviver returns `undefined`, re-reading a value the reviver mutated, holder `this` binding, the root `{ "": rootValue }` wrapper, and `Object.keys`/array-length snapshots taken before iteration.
+
+This reworks `crates/perry-runtime/src/json/reviver.rs` to implement ECMA-262 25.5.1.1 `InternalizeJSONProperty(holder, name, reviver)` post-order:
+
+- The root value is wrapped in `{ "": rootValue }` and the walk starts from that holder. `apply_reviver` builds the wrapper with a raw own-field set (`js_object_set_field_by_name`), not `[[Set]]`, so a setter installed on `Object.prototype` for the empty key is never invoked (matches `reviver-wrapper`).
+- For each key (objects: an `Object.keys` snapshot; arrays: a `length` snapshot via the header), the walk does a real `[[Get]]` re-read off the holder, recurses, then applies the reviver result: `undefined` → `[[Delete]]` (`delete-or-keep`), else `CreateDataProperty` (`create-or-keep`). Both follow ordinary-object semantics — a non-configurable property silently survives an attempted delete/redefine with no throw, per `OrdinaryDelete` / `CreateDataProperty` returning `false` rather than throwing.
+- The reviver is invoked with the holder bound as `this` (`js_implicit_this_set`); abrupt completions from a throwing reviver or holder getter propagate via the existing setjmp/longjmp unwind. GC-moved handles are refreshed across the callback and descriptor writes.
+
+Verified against test262 `built-ins/JSON/parse/reviver-*`: the applicable (non-`Proxy`, non-`json-parse-with-source`) cases go from 1/24 to 5/24 exit-code parity with Node — newly passing: `reviver-call-order`, `reviver-object-non-configurable-prop-create`, `reviver-object-non-configurable-prop-delete`, `reviver-wrapper`. Zero regressions; common value-transform usage (`JSON.parse(x, (k,v)=>…)`, including delete-via-`undefined`, nested objects/arrays, and the `""` root key) stays byte-identical to Node. The orthogonal arg-`ToString` fix (#4587) is untouched.
+
+Out of scope (separate pre-existing gaps, tracked as follow-ups): `Proxy`-holder traps (`reviver-*-{define-prop,delete,own-keys,length-*}-err`, `revived-proxy*`), the ES2025 `{ source }` third-argument feature (`reviver-context-source-*`, `reviver-forward-modifies-object`, `reviver-call-args-after-forward-modification`), `Object.prototype`-inherited re-reads (`reviver-*-get-prop-from-prototype` — a general object-model limitation), and array index `[[DefineOwnProperty]]`/accessor descriptors (`reviver-array-non-configurable-prop-*`, `reviver-get-name-err`).
+
+Authored by @andrewtdiz.
+
 ## v0.5.1122 — fix(release): decouple aspirational platform/framework smokes from the publish gate
 
 v0.5.1121's publish was blocked at `await-tests` because the tag-gated **Tests** workflow concluded failure — but the only *core*-job failures were `cargo-test` (the `secret_key_buffer_metadata_survives_ic_miss_for_aes_sizes` regression from #4363 typed-array own-properties, since fixed on `main` by #4399) and `lint` (a transient rustup/curl network flake during toolchain setup). The v0.5.1121 tag predated #4399, so its `cargo-test` could never pass; this release re-tags from a `main` that includes the fix.

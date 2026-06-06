@@ -32,9 +32,10 @@ use crate::type_analysis::{
 #[allow(unused_imports)]
 use crate::types::{DOUBLE, I1, I32, I64, I8, PTR};
 
+use super::arrays_finds::lower_buffer_index_get_i32;
 #[allow(unused_imports)]
 use super::{
-    buffer_access_materialization_reason, buffer_alias_metadata_suffix, can_lower_expr_as_i32,
+    buffer_access_materialization_reason, buffer_alias_metadata_suffix,
     emit_layout_note_slot_on_block, emit_shadow_slot_clear, emit_shadow_slot_update_for_expr,
     emit_string_literal_global, emit_typed_feedback_register_site, emit_v8_export_call,
     emit_v8_member_method_call, emit_write_barrier, emit_write_barrier_slot_on_block,
@@ -71,8 +72,60 @@ fn is_width_tracked_typed_array_receiver(ctx: &FnCtx<'_>, object: &Expr) -> bool
 fn is_uint8array_receiver(ctx: &FnCtx<'_>, object: &Expr) -> bool {
     matches!(
         receiver_class_name(ctx, object).as_deref(),
-        Some("Uint8Array")
+        Some("Buffer" | "Uint8Array")
     )
+}
+
+fn numeric_index_needs_runtime_key(index: &Expr) -> bool {
+    // Only a LITERAL numeric key that is not a clean array index in
+    // `0..=i32::MAX` needs the runtime key helper: out-of-range/negative
+    // integers (`a[2**32-1]`, `a[-1]`), non-integer floats (`a[1.5]`), and
+    // non-finite values (`a[NaN]`/`a[Infinity]`). These become string-keyed
+    // properties and must reach `js_array_*_index_or_string`.
+    //
+    // Computed/dynamic numeric indices are deliberately NOT rerouted here:
+    // they keep flowing through the typed-feedback numeric-array guard path,
+    // which already carries its own out-of-range/non-integer fallback. Sending
+    // them to the runtime key helper would defeat the native numeric-array hot
+    // path and drop the index guard (regressing the native-region proof and
+    // the typed-feedback hot-path tests). (#4557/#4543)
+    match index {
+        Expr::Integer(i) => *i < 0 || *i > i32::MAX as i64,
+        Expr::Number(n) => {
+            !(n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n <= i32::MAX as f64)
+        }
+        _ => false,
+    }
+}
+
+fn is_async_dispose_symbol_index(index: &Expr) -> bool {
+    let Expr::SymbolFor(symbol_name) = index else {
+        return false;
+    };
+    match symbol_name.as_ref() {
+        Expr::String(name) => name == "@@__perry_wk_asyncDispose",
+        Expr::WtfString(name) => name.as_slice() == b"@@__perry_wk_asyncDispose",
+        _ => false,
+    }
+}
+
+fn lower_class_method_bind(
+    ctx: &mut FnCtx<'_>,
+    object: &Expr,
+    method_name: &str,
+) -> Result<String> {
+    let recv_box = lower_expr(ctx, object)?;
+    let key_idx = ctx.strings.intern(method_name);
+    let entry = ctx.strings.entry(key_idx);
+    let bytes_global = format!("@{}", entry.bytes_global);
+    let len_str = entry.byte_len.to_string();
+    let blk = ctx.block();
+    let bytes_i64 = blk.ptrtoint(&bytes_global, I64);
+    Ok(blk.call(
+        DOUBLE,
+        "js_class_method_bind",
+        &[(DOUBLE, &recv_box), (I64, &bytes_i64), (I64, &len_str)],
+    ))
 }
 
 fn lower_guarded_array_index_get(
@@ -396,6 +449,11 @@ fn lower_legacy_array_index_get(
 pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
     match expr {
         Expr::IndexGet { object, index } => {
+            if receiver_class_name(ctx, object).as_deref() == Some("Server")
+                && is_async_dispose_symbol_index(index)
+            {
+                return lower_class_method_bind(ctx, object, "@@__perry_wk_asyncDispose");
+            }
             // Issue #611: `globalThis[<key>]` reads from the persistent
             // global-this singleton. Pre-fix, `Expr::GlobalGet` lowered
             // to the `0.0` sentinel and the generic IndexGet path called
@@ -495,6 +553,11 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     "js_typed_array_index_get_dynamic",
                     &[(I64, &arr_i64), (DOUBLE, &key_box)],
                 ));
+            }
+            if is_uint8array_receiver(ctx, object) && is_numeric_expr(ctx, index) {
+                let value = lower_buffer_index_get_i32(ctx, object, index)?;
+                let reason = buffer_access_materialization_reason(ctx, object);
+                return Ok(materialize_js_value(ctx, value, reason));
             }
             // Scalar-replaced array literal: `arr[k]` where arr was bound to
             // `[...]` and never escaped, and k is a compile-time index in
@@ -617,6 +680,32 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         DOUBLE,
                         "js_object_get_symbol_property",
                         &[(DOUBLE, &obj_box), (DOUBLE, &key_box)],
+                    ));
+                }
+                if !is_numeric_expr(ctx, index) {
+                    let arr_box = lower_expr(ctx, object)?;
+                    let idx_double = lower_expr(ctx, index)?;
+                    let arr_handle = {
+                        let blk = ctx.block();
+                        unbox_to_i64(blk, &arr_box)
+                    };
+                    return Ok(ctx.block().call(
+                        DOUBLE,
+                        "js_array_get_index_or_string",
+                        &[(I64, &arr_handle), (DOUBLE, &idx_double)],
+                    ));
+                }
+                if numeric_index_needs_runtime_key(index) {
+                    let arr_box = lower_expr(ctx, object)?;
+                    let idx_double = lower_expr(ctx, index)?;
+                    let arr_handle = {
+                        let blk = ctx.block();
+                        unbox_to_i64(blk, &arr_box)
+                    };
+                    return Ok(ctx.block().call(
+                        DOUBLE,
+                        "js_array_get_index_or_string",
+                        &[(I64, &arr_handle), (DOUBLE, &idx_double)],
                     ));
                 }
                 let require_numeric_layout =

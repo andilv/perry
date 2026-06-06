@@ -702,6 +702,10 @@ pub extern "C" fn js_object_property_is_enumerable(obj_value: f64, key_value: f6
             return f64::from_bits(if is_length { TAG_FALSE } else { TAG_TRUE });
         }
 
+        if let Some(present) = registered_buffer_index_own_property_present(obj_value, key_str) {
+            return f64::from_bits(if present { TAG_TRUE } else { TAG_FALSE });
+        }
+
         if let Some(addr) = crate::typedarray_props::typed_array_addr_from_value(obj_value) {
             let enumerable = crate::typedarray_props::typed_array_property_is_enumerable(
                 addr as *const crate::typedarray::TypedArrayHeader,
@@ -854,7 +858,7 @@ unsafe fn define_class_prototype_method(target_cid: u32, name: &str, value_bits:
         if (*closure).type_tag == CLOSURE_MAGIC && (*closure).func_ptr == BOUND_METHOD_FUNC_PTR {
             let recv = crate::closure::js_closure_get_capture_f64(closure, 0);
             if let Some(source_cid) = super::class_ref_id(recv) {
-                if let Some((func_ptr, param_count, has_synthetic_arguments)) =
+                if let Some((func_ptr, param_count, has_synthetic_arguments, has_rest)) =
                     super::lookup_class_method_in_chain(source_cid, name)
                 {
                     let mut guard = CLASS_VTABLE_REGISTRY.write().unwrap();
@@ -873,6 +877,7 @@ unsafe fn define_class_prototype_method(target_cid: u32, name: &str, value_bits:
                             func_ptr,
                             param_count,
                             has_synthetic_arguments,
+                            has_rest,
                         },
                     );
                     drop(guard);
@@ -1435,6 +1440,15 @@ pub(crate) unsafe fn install_builtin_getter(proto: *mut ObjectHeader, key: &str,
     }
     // Make the key discoverable by `own_key_present` / `getOwnPropertyNames`.
     ensure_key_in_keys_array(proto, key_str);
+    // Spec: an accessor getter's `.name` is `"get " + key` (e.g.
+    // `Object.getOwnPropertyDescriptor(ArrayBuffer.prototype,"byteLength").get.name
+    // === "get byteLength"`). Register it against the getter closure's func_ptr;
+    // without this the `.name` read returned `""`.
+    let getter_ptr = (getter_bits & 0x0000_FFFF_FFFF_FFFF) as usize;
+    if getter_ptr >= 0x1000 && crate::closure::is_closure_ptr(getter_ptr) {
+        let func_ptr = (*(getter_ptr as *const crate::closure::ClosureHeader)).func_ptr as usize;
+        crate::builtins::register_function_name_if_absent(func_ptr, &format!("get {key}"));
+    }
     set_builtin_accessor_descriptor(
         proto as usize,
         key.to_string(),
@@ -1693,6 +1707,15 @@ pub extern "C" fn js_object_get_prototype_of(obj_value: f64) -> f64 {
             throw_object_type_error(b"Cannot convert undefined or null to object");
         }
     }
+    // A Proxy is a small registered id, NOT a heap object — the handle path
+    // below would mis-read it and return `null`. Route it to the proxy
+    // `[[GetPrototypeOf]]` (handler trap, else the target's prototype) so
+    // `Object.getPrototypeOf(proxy)` matches the target. drizzle aliases columns
+    // as `new Proxy(column, …)` and `is(value, type)` reads
+    // `getPrototypeOf(value).constructor`, which crashed on `null.constructor`.
+    if crate::proxy::js_proxy_is_proxy(obj_value) != 0 {
+        return crate::proxy::js_proxy_get_prototype_of(obj_value);
+    }
     let bits = obj_value.to_bits();
     let top16 = bits >> 48;
     if top16 == 0x7FFD {
@@ -1721,6 +1744,41 @@ pub extern "C" fn js_object_get_prototype_of(obj_value: f64) -> f64 {
             }
         }
         None
+    };
+    let buffer_backed_prototype = |addr: usize| -> Option<f64> {
+        let name = if crate::buffer::is_array_buffer(addr) {
+            "ArrayBuffer"
+        } else if crate::buffer::is_shared_array_buffer(addr) {
+            "SharedArrayBuffer"
+        } else {
+            return None;
+        };
+        let proto = crate::object::builtin_prototype_value(name);
+        if proto.to_bits() != crate::value::TAG_UNDEFINED {
+            Some(proto)
+        } else {
+            None
+        }
+    };
+    let buffer_backed_uint8array_prototype = |addr: usize| -> Option<f64> {
+        if !crate::buffer::is_uint8array_buffer(addr) {
+            return None;
+        }
+        let proto = crate::object::builtin_prototype_value("Uint8Array");
+        if proto.to_bits() != crate::value::TAG_UNDEFINED {
+            Some(proto)
+        } else {
+            None
+        }
+    };
+    let typed_array_instance_prototype = |addr: usize| -> Option<f64> {
+        let kind = crate::typedarray::lookup_typed_array_kind(addr)?;
+        let proto = crate::object::builtin_prototype_value(crate::typedarray::name_for_kind(kind));
+        if proto.to_bits() != crate::value::TAG_UNDEFINED {
+            Some(proto)
+        } else {
+            None
+        }
     };
     let function_prototype_or_null = || {
         let proto = crate::object::builtin_prototype_value("Function");
@@ -1760,6 +1818,15 @@ pub extern "C" fn js_object_get_prototype_of(obj_value: f64) -> f64 {
     if top16 == 0x7FFD {
         let raw_addr = bits & 0x0000_FFFF_FFFF_FFFF;
         if raw_addr != 0 && raw_addr >= (crate::gc::GC_HEADER_SIZE as u64) + 0x1000 {
+            if let Some(proto) = typed_array_instance_prototype(raw_addr as usize) {
+                return proto;
+            }
+            if let Some(proto) = buffer_backed_prototype(raw_addr as usize) {
+                return proto;
+            }
+            if let Some(proto) = buffer_backed_uint8array_prototype(raw_addr as usize) {
+                return proto;
+            }
             if let Some(proto) = collection_prototype(raw_addr as usize) {
                 return proto;
             }
@@ -1850,6 +1917,13 @@ pub extern "C" fn js_object_get_prototype_of(obj_value: f64) -> f64 {
                     if let Some(proto) = super::iterator_prototype_for_class_id((*obj).class_id) {
                         return proto;
                     }
+                    if let Some(proto) =
+                        super::class_registry::class_decl_prototype_value_for_instance_class(
+                            (*obj).class_id,
+                        )
+                    {
+                        return proto;
+                    }
                 }
             }
             return obj_value;
@@ -1857,6 +1931,15 @@ pub extern "C" fn js_object_get_prototype_of(obj_value: f64) -> f64 {
     }
     if top16 == 0 {
         if bits >= (crate::gc::GC_HEADER_SIZE as u64) + 0x1000 {
+            if let Some(proto) = typed_array_instance_prototype(bits as usize) {
+                return proto;
+            }
+            if let Some(proto) = buffer_backed_prototype(bits as usize) {
+                return proto;
+            }
+            if let Some(proto) = buffer_backed_uint8array_prototype(bits as usize) {
+                return proto;
+            }
             if let Some(proto) = collection_prototype(bits as usize) {
                 return proto;
             }
@@ -1919,6 +2002,13 @@ pub extern "C" fn js_object_get_prototype_of(obj_value: f64) -> f64 {
                 }
                 if (*gc).obj_type == crate::gc::GC_TYPE_OBJECT {
                     if let Some(proto) = super::iterator_prototype_for_class_id((*obj).class_id) {
+                        return proto;
+                    }
+                    if let Some(proto) =
+                        super::class_registry::class_decl_prototype_value_for_instance_class(
+                            (*obj).class_id,
+                        )
+                    {
                         return proto;
                     }
                 }

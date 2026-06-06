@@ -45,9 +45,9 @@ const URI_RESERVED: &[u8] = b";/?:@&=+$,#";
 const URI_COMPONENT_UNESCAPED: &[u8] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*'()";
 
-fn percent_encode(input: &str, safe_chars: &[u8]) -> String {
+fn percent_encode(input: &[u8], safe_chars: &[u8]) -> String {
     let mut result = String::with_capacity(input.len() * 3);
-    for byte in input.as_bytes() {
+    for byte in input {
         if safe_chars.contains(byte) {
             result.push(*byte as char);
         } else {
@@ -117,14 +117,44 @@ fn extract_str_from_nanbox(value: f64) -> String {
     }
 }
 
+struct ExtractedStringBytes {
+    bytes: Vec<u8>,
+    flags: u32,
+}
+
+fn extract_string_bytes_from_nanbox(value: f64) -> ExtractedStringBytes {
+    let str_ptr = crate::value::js_get_string_pointer_unified(value);
+    if (str_ptr as usize) < 0x1000 {
+        return ExtractedStringBytes {
+            bytes: Vec::new(),
+            flags: 0,
+        };
+    }
+    unsafe {
+        let header = str_ptr as *const StringHeader;
+        let len = (*header).byte_len as usize;
+        let flags = (*header).flags;
+        let data = (header as *const u8).add(std::mem::size_of::<StringHeader>());
+        let bytes = std::slice::from_raw_parts(data, len).to_vec();
+        ExtractedStringBytes { bytes, flags }
+    }
+}
+
+fn throw_if_lone_surrogate(input: &ExtractedStringBytes) {
+    if input.flags & crate::string::STRING_FLAG_HAS_LONE_SURROGATES != 0 {
+        throw_uri_malformed();
+    }
+}
+
 /// encodeURI(string) -> string
 #[no_mangle]
 pub extern "C" fn js_encode_uri(value: f64) -> i64 {
-    let input = extract_str_from_nanbox(value);
+    let input = extract_string_bytes_from_nanbox(value);
+    throw_if_lone_surrogate(&input);
     let mut safe = Vec::with_capacity(URI_UNESCAPED.len() + URI_RESERVED.len());
     safe.extend_from_slice(URI_UNESCAPED);
     safe.extend_from_slice(URI_RESERVED);
-    let encoded = percent_encode(&input, &safe);
+    let encoded = percent_encode(&input.bytes, &safe);
     let ptr = js_string_from_bytes(encoded.as_ptr(), encoded.len() as u32);
     ptr as i64
 }
@@ -141,8 +171,9 @@ pub extern "C" fn js_decode_uri(value: f64) -> i64 {
 /// encodeURIComponent(string) -> string
 #[no_mangle]
 pub extern "C" fn js_encode_uri_component(value: f64) -> i64 {
-    let input = extract_str_from_nanbox(value);
-    let encoded = percent_encode(&input, URI_COMPONENT_UNESCAPED);
+    let input = extract_string_bytes_from_nanbox(value);
+    throw_if_lone_surrogate(&input);
+    let encoded = percent_encode(&input.bytes, URI_COMPONENT_UNESCAPED);
     let ptr = js_string_from_bytes(encoded.as_ptr(), encoded.len() as u32);
     ptr as i64
 }
@@ -154,6 +185,90 @@ pub extern "C" fn js_decode_uri_component(value: f64) -> i64 {
     let decoded = percent_decode(&input, false).unwrap_or_else(|_| throw_uri_malformed());
     let ptr = js_string_from_bytes(decoded.as_ptr(), decoded.len() as u32);
     ptr as i64
+}
+
+// ============================================================
+// escape / unescape (ECMAScript Annex B B.2.1)
+// ============================================================
+
+/// Characters `escape()` leaves unencoded (ES Annex B B.2.1.1): ASCII
+/// letters, digits, and `@ * _ + - . /`. Unlike `encodeURIComponent`, the
+/// escape set keeps `+` and `@` and encodes everything else — code units
+/// < 256 as `%XX`, the rest as `%uXXXX`.
+const ESCAPE_UNESCAPED: &[u8] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@*_+-./";
+
+/// escape(string) -> string (legacy, ES Annex B B.2.1.1)
+#[no_mangle]
+pub extern "C" fn js_escape(value: f64) -> i64 {
+    let input = extract_str_from_nanbox(value);
+    let mut result = String::with_capacity(input.len() * 3);
+    let mut buf = [0u16; 2];
+    for c in input.chars() {
+        let cp = c as u32;
+        if cp < 0x80 && ESCAPE_UNESCAPED.contains(&(cp as u8)) {
+            result.push(c);
+        } else {
+            // Encode per UTF-16 code unit so astral code points emit the two
+            // `%uXXXX` escapes for their surrogate pair, matching Node.
+            for unit in c.encode_utf16(&mut buf) {
+                if *unit < 0x100 {
+                    result.push_str(&format!("%{:02X}", *unit));
+                } else {
+                    result.push_str(&format!("%u{:04X}", *unit));
+                }
+            }
+        }
+    }
+    let ptr = js_string_from_bytes(result.as_ptr(), result.len() as u32);
+    ptr as i64
+}
+
+/// unescape(string) -> string (legacy, ES Annex B B.2.1.2)
+#[no_mangle]
+pub extern "C" fn js_unescape(value: f64) -> i64 {
+    let input = extract_str_from_nanbox(value);
+    let chars: Vec<char> = input.chars().collect();
+    // Reassemble into UTF-16 code units, then decode, so `%uD835%uDFD8`-style
+    // surrogate pairs recombine into a single astral scalar.
+    let mut units: Vec<u16> = Vec::with_capacity(chars.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '%' {
+            // %uXXXX
+            if i + 5 < chars.len() && chars[i + 1] == 'u' {
+                if let Some(u) = hex4_chars(&chars[i + 2..i + 6]) {
+                    units.push(u);
+                    i += 6;
+                    continue;
+                }
+            }
+            // %XX
+            if i + 2 < chars.len() {
+                if let (Some(h), Some(l)) = (chars[i + 1].to_digit(16), chars[i + 2].to_digit(16)) {
+                    units.push((h * 16 + l) as u16);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        let mut buf = [0u16; 2];
+        for unit in chars[i].encode_utf16(&mut buf) {
+            units.push(*unit);
+        }
+        i += 1;
+    }
+    let decoded = String::from_utf16_lossy(&units);
+    let ptr = js_string_from_bytes(decoded.as_ptr(), decoded.len() as u32);
+    ptr as i64
+}
+
+fn hex4_chars(cs: &[char]) -> Option<u16> {
+    let mut v: u16 = 0;
+    for &c in cs {
+        v = v.checked_mul(16)?.checked_add(c.to_digit(16)? as u16)?;
+    }
+    Some(v)
 }
 
 // ============================================================
