@@ -34,6 +34,7 @@ mod dataview_proto_thunks;
 mod date_proto_thunks;
 mod delete_rest;
 mod descriptors;
+mod disposable_proto_thunks;
 mod field_get_set;
 mod field_set_by_name;
 mod global_fetch;
