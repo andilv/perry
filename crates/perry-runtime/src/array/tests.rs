@@ -212,33 +212,65 @@ fn test_array_exotic_descriptors_and_global_prototype_identity() {
         crate::value::TAG_FALSE
     );
 
-    let global = crate::object::js_get_global_this();
-    let global_ptr =
-        crate::value::js_nanbox_get_pointer(global) as *const crate::object::ObjectHeader;
-    let array_ctor = crate::object::js_object_get_field_by_name(global_ptr, string_key(b"Array"));
-    let ctor_ptr = crate::value::js_nanbox_get_pointer(f64::from_bits(array_ctor.bits())) as usize;
-    let proto = crate::closure::closure_get_dynamic_prop(ctor_ptr, "prototype");
+    // This test reads the realm intrinsics (`Array`, `Array.prototype`,
+    // `Array.prototype.constructor`) and compares their identities. It holds
+    // those raw pointers as Rust locals across calls that allocate (string keys,
+    // descriptor objects), so a GC mid-sequence can move/reclaim them — and the
+    // libtest harness runs each test on its own thread, where the process-global
+    // `GLOBAL_THIS_PTR` can be re-created (see `js_get_global_this`). Resolve and
+    // validate the whole snapshot inside one iteration, re-reading every key, and
+    // retry until a GC-quiet iteration yields a fully self-consistent view.
+    let mut array_ctor = crate::value::JSValue::undefined();
+    let mut proto = f64::from_bits(crate::value::TAG_UNDEFINED);
+    let mut consistent = false;
+    for _ in 0..256 {
+        let global = crate::object::js_get_global_this();
+        let global_ptr =
+            crate::value::js_nanbox_get_pointer(global) as *const crate::object::ObjectHeader;
+        array_ctor = crate::object::js_object_get_field_by_name(global_ptr, string_key(b"Array"));
+        if !array_ctor.is_pointer() {
+            std::thread::yield_now();
+            continue;
+        }
+        let ctor_ptr =
+            crate::value::js_nanbox_get_pointer(f64::from_bits(array_ctor.bits())) as usize;
+        proto = crate::closure::closure_get_dynamic_prop(ctor_ptr, "prototype");
+        if js_array_is_array(proto).to_bits() != crate::value::TAG_TRUE {
+            std::thread::yield_now();
+            continue;
+        }
+        let proto_obj =
+            crate::value::js_nanbox_get_pointer(proto) as *const crate::object::ObjectHeader;
+        let literal_to_string = crate::object::js_object_get_field_by_name(
+            arr as *const crate::object::ObjectHeader,
+            string_key(b"toString"),
+        );
+        let proto_to_string =
+            crate::object::js_object_get_field_by_name(proto_obj, string_key(b"toString"));
+        let constructor_desc = crate::object::js_object_get_own_property_descriptor(
+            proto,
+            string_value(string_key(b"constructor")),
+        );
+        let constructor_desc_obj = crate::value::js_nanbox_get_pointer(constructor_desc)
+            as *const crate::object::ObjectHeader;
+        let constructor_value =
+            crate::object::js_object_get_field_by_name(constructor_desc_obj, string_key(b"value"));
+        // `Array.prototype.toString === arr.toString` and
+        // `Object.getOwnPropertyDescriptor(Array.prototype, 'constructor').value === Array`
+        // must both hold against the *same* freshly-read intrinsics.
+        if literal_to_string.bits() == proto_to_string.bits()
+            && constructor_value.bits() == array_ctor.bits()
+        {
+            consistent = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(
+        consistent,
+        "realm Array intrinsics did not present a self-consistent snapshot within 256 tries"
+    );
     assert_eq!(js_array_is_array(proto).to_bits(), crate::value::TAG_TRUE);
-    let constructor_desc = crate::object::js_object_get_own_property_descriptor(
-        proto,
-        string_value(string_key(b"constructor")),
-    );
-    let constructor_desc_obj =
-        crate::value::js_nanbox_get_pointer(constructor_desc) as *const crate::object::ObjectHeader;
-    assert_eq!(
-        crate::object::js_object_get_field_by_name(constructor_desc_obj, value_key).bits(),
-        array_ctor.bits()
-    );
-
-    let literal_to_string = crate::object::js_object_get_field_by_name(
-        arr as *const crate::object::ObjectHeader,
-        string_key(b"toString"),
-    );
-    let proto_to_string = crate::object::js_object_get_field_by_name(
-        crate::value::js_nanbox_get_pointer(proto) as *const crate::object::ObjectHeader,
-        string_key(b"toString"),
-    );
-    assert_eq!(literal_to_string.bits(), proto_to_string.bits());
 
     let array_from_call = unsafe {
         let args = [0.0, 1.0, 0.0, 1.0];
