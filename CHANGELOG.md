@@ -1,3 +1,23 @@
+## v0.5.1152 — install.sh download/extraction progress + per-distro Linux toolchain docs (#4869)
+
+External contribution from @nglmercer, with a maintainer fixup at review time:
+
+- **`packaging/install.sh` progress indicators**: `curl --progress-bar` on interactive
+  terminals (detected via `[ -t 2 ]`; piped/CI runs keep the old silent `-fsS` behavior),
+  `pv`-based pipe-through extraction progress when `pv` is installed, and a
+  `Done in Xs (size)` summary after download. `set -e` tightened to `set -eu`.
+- **Maintainer fixup (610db903f)**: kept `-f` on the interactive download — without it,
+  HTTP errors (transient 5xx, proxy interception) write the error body into
+  `perry.tar.gz` and exit 0, surfacing later as a confusing tar/gzip failure. Also
+  restored the release-probe comments (why the script probes recent tags instead of
+  `releases/latest`, and the multi-hop `%{http_code}` parsing).
+- **Per-distro Linux C-toolchain docs**: install commands for Arch/Manjaro/CachyOS,
+  Fedora/RHEL, openSUSE, Alpine, and Void Linux in `README.md` and
+  `docs/src/getting-started/installation.md` (previously only Debian/Ubuntu and Alpine).
+
+Also rolled up in this version: dependabot bumps #4864 (cargo minor/patch group) and
+#4865 (indicatif 0.17.11 → 0.18.4).
+
 ## v0.5.1151 — release pipeline green: Android/Windows platform builds, dense-array growth hang, perf gate re-armed
 
 Release-infrastructure release. v0.5.1150 shipped with 5 of 19 platform build jobs red
