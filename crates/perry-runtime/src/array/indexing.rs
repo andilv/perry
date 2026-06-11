@@ -1,4 +1,5 @@
 //! Indexing — length / element get / element set / hybrid string-or-index dispatch.
+use super::header::{array_numeric_layout, NumericArrayLayout};
 use super::*;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -324,7 +325,25 @@ pub extern "C" fn js_array_get_f64_unchecked(arr: *const ArrayHeader, index: u32
 
 #[no_mangle]
 pub extern "C" fn js_array_numeric_get_f64_unboxed(arr: *mut ArrayHeader, index: u32) -> f64 {
+    let arr = clean_arr_ptr_mut(arr);
+    if arr.is_null() {
+        return js_array_get_f64(arr, index);
+    }
+
+    // Hot path for guarded raw-f64 arrays. The typed-feedback guard already
+    // proved this receiver is a non-forwarded plain Array with raw numeric
+    // layout, so keep the helper leaf-small: avoid re-running the expensive
+    // rebuild/descriptor path on every indexed read in numeric loops.
     unsafe {
+        if array_numeric_layout(arr) == Some(NumericArrayLayout::RawF64)
+            && array_object_flags(arr) & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS == 0
+            && index < (*arr).length
+        {
+            let elements_ptr =
+                (arr as *const u8).add(std::mem::size_of::<ArrayHeader>()) as *const f64;
+            return *elements_ptr.add(index as usize);
+        }
+
         if let Some(value) = array_numeric_raw_f64_get(arr, index) {
             return value;
         }
@@ -497,10 +516,32 @@ pub extern "C" fn js_array_numeric_set_f64_unboxed(
     index: u32,
     value: f64,
 ) -> i32 {
-    if array_is_frozen(arr) {
+    let arr = clean_arr_ptr_mut(arr);
+    if arr.is_null() {
         return 0;
     }
+
+    let flags = array_object_flags(arr);
+    if flags & (crate::gc::OBJ_FLAG_FROZEN | crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS) != 0 {
+        return 0;
+    }
+
+    // Hot path for the codegen's guarded numeric-array store. Raw-f64 arrays
+    // are pointer-free, so an in-bounds numeric overwrite can update the
+    // payload directly without per-slot layout notes or revalidating/rebuilding
+    // the whole layout on every iteration. Preserve the helper fallback for
+    // direct runtime calls and arrays that have not been converted yet.
     unsafe {
+        if index < (*arr).length && array_numeric_layout(arr) == Some(NumericArrayLayout::RawF64) {
+            let Some(number) = value_bits_to_number(value.to_bits()) else {
+                clear_array_numeric_layout(arr);
+                return 0;
+            };
+            let elements_ptr = (arr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut f64;
+            ptr::write(elements_ptr.add(index as usize), number);
+            return 1;
+        }
+
         if array_numeric_raw_f64_set_inbounds(arr, index, value) {
             return 1;
         }
@@ -702,6 +743,251 @@ pub extern "C" fn js_array_set_f64_extend(
         arr
     }
 }
+
+/// Bulk numeric dense fill for compiler-proven trivial loops:
+/// `for (let i = 0; i < end; i++) arr[i] = constant`.
+///
+/// This keeps JavaScript semantics for frozen/sealed/descriptor arrays by
+/// falling back to the ordinary extending setter. The fast path is restricted
+/// to dense writes from index 0 through `end - 1`, so the resulting live
+/// payload is entirely numeric and can be marked raw-f64 / pointer-free once.
+#[no_mangle]
+pub extern "C" fn js_array_fill_f64_const_extend(
+    arr: *mut ArrayHeader,
+    end: u32,
+    value: f64,
+) -> *mut ArrayHeader {
+    if end == 0 {
+        return clean_arr_ptr_mut(arr);
+    }
+    let arr = clean_arr_ptr_mut(arr);
+    if arr.is_null() {
+        let new_arr = js_array_alloc(end);
+        return js_array_fill_f64_const_extend(new_arr, end, value);
+    }
+    note_array_index_write(arr as usize);
+    let flags = array_object_flags(arr);
+    if flags
+        & (crate::gc::OBJ_FLAG_FROZEN
+            | crate::gc::OBJ_FLAG_SEALED
+            | crate::gc::OBJ_FLAG_NO_EXTEND
+            | crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS)
+        != 0
+        || crate::buffer::is_registered_buffer(arr as usize)
+        || crate::typedarray::lookup_typed_array_kind(arr as usize).is_some()
+    {
+        let mut out = arr;
+        for i in 0..end {
+            out = js_array_set_f64_extend(out, i, value);
+        }
+        return out;
+    }
+
+    let Some(number) = value_bits_to_number(value.to_bits()) else {
+        let mut out = arr;
+        for i in 0..end {
+            out = js_array_set_f64_extend(out, i, value);
+        }
+        return out;
+    };
+
+    unsafe {
+        let old_length = (*arr).length;
+        let raw_before = array_numeric_layout(arr) == Some(NumericArrayLayout::RawF64);
+        if old_length > end && !raw_before {
+            let mut fallback = arr;
+            for i in 0..end {
+                fallback = js_array_set_f64_extend(fallback, i, value);
+            }
+            return fallback;
+        }
+
+        let mut out = if end > (*arr).capacity {
+            js_array_grow(arr, end)
+        } else {
+            arr
+        };
+        out = clean_arr_ptr_mut(out);
+        if out.is_null() || end > (*out).capacity {
+            let mut fallback = arr;
+            for i in 0..end {
+                fallback = js_array_set_f64_extend(fallback, i, value);
+            }
+            return fallback;
+        }
+        let elements_ptr = (out as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut f64;
+        for i in 0..end as usize {
+            // GC_STORE_AUDIT(POINTER_FREE): bulk numeric fill writes raw f64s only.
+            ptr::write(elements_ptr.add(i), number);
+        }
+        if (*out).length < end {
+            (*out).length = end;
+        }
+        set_array_numeric_layout(out, NumericArrayLayout::RawF64);
+        out
+    }
+}
+
+/// Bulk numeric dense fill for loops bounded by current array length:
+/// `for (let i = 0; i < arr.length; i++) arr[i] = constant`.
+///
+/// If the receiver is exotic (frozen/sealed/descriptors/etc.), the fallback
+/// re-reads `.length` on every iteration so it preserves the source loop's
+/// observable behavior when setters mutate array length.
+#[no_mangle]
+pub extern "C" fn js_array_fill_f64_const_len_extend(
+    arr: *mut ArrayHeader,
+    value: f64,
+) -> *mut ArrayHeader {
+    let arr = clean_arr_ptr_mut(arr);
+    let end = js_array_length(arr);
+    if end == 0 || arr.is_null() {
+        return arr;
+    }
+    note_array_index_write(arr as usize);
+    let flags = array_object_flags(arr);
+    if flags
+        & (crate::gc::OBJ_FLAG_FROZEN
+            | crate::gc::OBJ_FLAG_SEALED
+            | crate::gc::OBJ_FLAG_NO_EXTEND
+            | crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS)
+        != 0
+        || crate::buffer::is_registered_buffer(arr as usize)
+        || crate::typedarray::lookup_typed_array_kind(arr as usize).is_some()
+    {
+        let mut out = arr;
+        let mut i = 0;
+        while i < js_array_length(out) {
+            out = js_array_set_f64_extend(out, i, value);
+            i += 1;
+        }
+        return out;
+    }
+    js_array_fill_f64_const_extend(arr, end, value)
+}
+
+/// Bulk numeric dense fill for compiler-proven trivial loops:
+/// `for (let i = 0; i < end; i++) arr[i] = i`.
+#[no_mangle]
+pub extern "C" fn js_array_fill_f64_iota_extend(
+    arr: *mut ArrayHeader,
+    end: u32,
+) -> *mut ArrayHeader {
+    if end == 0 {
+        return clean_arr_ptr_mut(arr);
+    }
+    let arr = clean_arr_ptr_mut(arr);
+    if arr.is_null() {
+        let new_arr = js_array_alloc(end);
+        return js_array_fill_f64_iota_extend(new_arr, end);
+    }
+    note_array_index_write(arr as usize);
+    let flags = array_object_flags(arr);
+    if flags
+        & (crate::gc::OBJ_FLAG_FROZEN
+            | crate::gc::OBJ_FLAG_SEALED
+            | crate::gc::OBJ_FLAG_NO_EXTEND
+            | crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS)
+        != 0
+        || crate::buffer::is_registered_buffer(arr as usize)
+        || crate::typedarray::lookup_typed_array_kind(arr as usize).is_some()
+    {
+        let mut out = arr;
+        for i in 0..end {
+            out = js_array_set_f64_extend(out, i, i as f64);
+        }
+        return out;
+    }
+
+    unsafe {
+        let old_length = (*arr).length;
+        let raw_before = array_numeric_layout(arr) == Some(NumericArrayLayout::RawF64);
+        if old_length > end && !raw_before {
+            let mut fallback = arr;
+            for i in 0..end {
+                fallback = js_array_set_f64_extend(fallback, i, i as f64);
+            }
+            return fallback;
+        }
+
+        let mut out = if end > (*arr).capacity {
+            js_array_grow(arr, end)
+        } else {
+            arr
+        };
+        out = clean_arr_ptr_mut(out);
+        if out.is_null() || end > (*out).capacity {
+            let mut fallback = arr;
+            for i in 0..end {
+                fallback = js_array_set_f64_extend(fallback, i, i as f64);
+            }
+            return fallback;
+        }
+        let elements_ptr = (out as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut f64;
+        for i in 0..end as usize {
+            // GC_STORE_AUDIT(POINTER_FREE): bulk iota fill writes raw f64s only.
+            ptr::write(elements_ptr.add(i), i as f64);
+        }
+        if (*out).length < end {
+            (*out).length = end;
+        }
+        set_array_numeric_layout(out, NumericArrayLayout::RawF64);
+        out
+    }
+}
+
+/// Bulk numeric dense fill for loops bounded by current array length:
+/// `for (let i = 0; i < arr.length; i++) arr[i] = i`.
+///
+/// If the receiver is exotic (frozen/sealed/descriptors/etc.), the fallback
+/// re-reads `.length` on every iteration so it preserves the source loop's
+/// observable behavior when setters mutate array length.
+#[no_mangle]
+pub extern "C" fn js_array_fill_f64_iota_len_extend(arr: *mut ArrayHeader) -> *mut ArrayHeader {
+    let arr = clean_arr_ptr_mut(arr);
+    let end = js_array_length(arr);
+    if end == 0 || arr.is_null() {
+        return arr;
+    }
+    note_array_index_write(arr as usize);
+    let flags = array_object_flags(arr);
+    if flags
+        & (crate::gc::OBJ_FLAG_FROZEN
+            | crate::gc::OBJ_FLAG_SEALED
+            | crate::gc::OBJ_FLAG_NO_EXTEND
+            | crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS)
+        != 0
+        || crate::buffer::is_registered_buffer(arr as usize)
+        || crate::typedarray::lookup_typed_array_kind(arr as usize).is_some()
+    {
+        let mut out = arr;
+        let mut i = 0;
+        while i < js_array_length(out) {
+            out = js_array_set_f64_extend(out, i, i as f64);
+            i += 1;
+        }
+        return out;
+    }
+    js_array_fill_f64_iota_extend(arr, end)
+}
+
+#[used]
+static KEEP_ARRAY_FILL_F64_CONST_EXTEND: extern "C" fn(
+    *mut ArrayHeader,
+    u32,
+    f64,
+) -> *mut ArrayHeader = js_array_fill_f64_const_extend;
+#[used]
+static KEEP_ARRAY_FILL_F64_IOTA_EXTEND: extern "C" fn(*mut ArrayHeader, u32) -> *mut ArrayHeader =
+    js_array_fill_f64_iota_extend;
+#[used]
+static KEEP_ARRAY_FILL_F64_CONST_LEN_EXTEND: extern "C" fn(
+    *mut ArrayHeader,
+    f64,
+) -> *mut ArrayHeader = js_array_fill_f64_const_len_extend;
+#[used]
+static KEEP_ARRAY_FILL_F64_IOTA_LEN_EXTEND: extern "C" fn(*mut ArrayHeader) -> *mut ArrayHeader =
+    js_array_fill_f64_iota_len_extend;
 
 /// `arr[stringKey] = value` — handles the JS spec rule that numeric-string
 /// keys on arrays are coerced to integer indices. Pre-fix the codegen's
