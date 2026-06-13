@@ -34,8 +34,8 @@ use crate::type_analysis::{
 use crate::types::{DOUBLE, I1, I32, I64, I8, PTR};
 
 use super::property_get_names::{
-    is_headers_method_name, is_http_client_request_method_name, is_net_native_method_value,
-    is_url_pattern_data_property,
+    is_headers_method_name, is_http_agent_method_name, is_http_client_request_method_name,
+    is_net_native_method_value, is_url_pattern_data_property,
 };
 #[allow(unused_imports)]
 use super::{
@@ -140,6 +140,64 @@ fn builtin_prototype_method_read<'a>(
         .then_some((builtin_name.as_str(), property))
 }
 
+fn is_global_builtin_value_expr(expr: &Expr, name: &str) -> bool {
+    matches!(
+        expr,
+        Expr::PropertyGet { object, property }
+            if property == name && matches!(object.as_ref(), Expr::GlobalGet(_))
+    )
+}
+
+fn promise_static_function_length_expr(expr: &Expr) -> Option<u32> {
+    let Expr::PropertyGet { object, property } = expr else {
+        return None;
+    };
+    let is_promise_receiver = matches!(object.as_ref(), Expr::GlobalGet(_))
+        || is_global_builtin_value_expr(object, "Promise");
+    if !is_promise_receiver {
+        return None;
+    }
+    match property.as_str() {
+        "withResolvers" => Some(0),
+        "resolve" | "reject" | "all" | "race" | "allSettled" | "any" | "try" => Some(1),
+        _ => None,
+    }
+}
+
+fn lower_global_builtin_static_value(ctx: &mut FnCtx<'_>, builtin: &str, property: &str) -> String {
+    if builtin == "Promise" {
+        let key_idx = ctx.strings.intern(property);
+        let key_bytes_global = format!("@{}", ctx.strings.entry(key_idx).bytes_global);
+        let key_len = property.len().to_string();
+        return ctx.block().call(
+            DOUBLE,
+            "js_promise_static_function_value",
+            &[(PTR, &key_bytes_global), (I64, &key_len)],
+        );
+    }
+
+    let builtin_idx = ctx.strings.intern(builtin);
+    let builtin_bytes_global = format!("@{}", ctx.strings.entry(builtin_idx).bytes_global);
+    let builtin_len = builtin.len().to_string();
+    let builtin_value = ctx.block().call(
+        DOUBLE,
+        "js_get_global_this_builtin_value",
+        &[(PTR, &builtin_bytes_global), (I64, &builtin_len)],
+    );
+    let key_idx = ctx.strings.intern(property);
+    let key_handle_global = format!("@{}", ctx.strings.entry(key_idx).handle_global);
+    let blk = ctx.block();
+    let builtin_handle = unbox_to_i64(blk, &builtin_value);
+    let key_box = blk.load(DOUBLE, &key_handle_global);
+    let key_bits = blk.bitcast_double_to_i64(&key_box);
+    let key_raw = blk.and(I64, &key_bits, POINTER_MASK_I64);
+    blk.call(
+        DOUBLE,
+        "js_object_get_field_by_name_f64",
+        &[(I64, &builtin_handle), (I64, &key_raw)],
+    )
+}
+
 pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
     match expr {
         Expr::PropertyGet { object, property }
@@ -183,6 +241,30 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             let recv_handle = unbox_to_i64(blk, &recv_box);
             let arr_handle = blk.call(I64, "js_error_get_errors", &[(I64, &recv_handle)]);
             Ok(nanbox_pointer_inline(blk, &arr_handle))
+        }
+
+        Expr::PropertyGet { object, property }
+            if is_global_builtin_value_expr(object, "Promise")
+                && matches!(
+                    property.as_str(),
+                    "resolve"
+                        | "reject"
+                        | "all"
+                        | "race"
+                        | "allSettled"
+                        | "any"
+                        | "withResolvers"
+                        | "try"
+                ) =>
+        {
+            Ok(lower_global_builtin_static_value(ctx, "Promise", property))
+        }
+
+        Expr::PropertyGet { object, property }
+            if property == "length" && promise_static_function_length_expr(object).is_some() =>
+        {
+            let len = promise_static_function_length_expr(object).unwrap();
+            Ok(double_literal(len as f64))
         }
 
         // TypedArray `.length` can be shadowed by an own property, so use
@@ -264,10 +346,17 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             if property == "length"
                 && (is_array_expr(ctx, object)
                     || is_string_expr(ctx, object)
-                    || matches!(
-                        crate::type_analysis::static_type_of(ctx, object),
-                        Some(HirType::Named(_)) | Some(HirType::Tuple(_))
-                    )) =>
+                    || match crate::type_analysis::static_type_of(ctx, object) {
+                        // A `Function`-typed receiver is a closure, not a
+                        // String/Array — its `.length` is the spec param
+                        // count, served by the runtime reflection path
+                        // (`closure_length` table). Loading a u32 from
+                        // payload offset 0 here would read 0. Let it fall
+                        // through to the generic property path.
+                        Some(HirType::Named(n)) => n != "Function",
+                        Some(HirType::Tuple(_)) => true,
+                        _ => false,
+                    }) =>
         {
             // Scalar-replaced array literal: length is a compile-time
             // constant — no header to load from (the heap array doesn't
@@ -703,6 +792,19 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 if property == "env" {
                     return Ok(ctx.block().call(DOUBLE, "js_process_env", &[]));
                 }
+                if matches!(
+                    property.as_str(),
+                    "resolve"
+                        | "reject"
+                        | "all"
+                        | "race"
+                        | "allSettled"
+                        | "any"
+                        | "withResolvers"
+                        | "try"
+                ) {
+                    return Ok(lower_global_builtin_static_value(ctx, "Promise", property));
+                }
                 // #2904: V8/Node static Error members read as values
                 // (`typeof Error.isError`, `Error.stackTraceLimit`, …). The
                 // HIR collapses every builtin global receiver to
@@ -735,6 +837,36 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         "js_object_get_field_by_name_f64",
                         &[(I64, &ctor_handle), (I64, &key_raw)],
                     ));
+                }
+                // Object statics read as VALUES (`var f = Object.seal`,
+                // `typeof Object.defineProperties`, `Object.is.length`).
+                // The receiver name is collapsed to GlobalGet(0), so route by
+                // property name — but ONLY names unique to `Object` among the
+                // builtin globals: the Reflect-overlapping ones
+                // (defineProperty / getOwnPropertyDescriptor / getPrototypeOf /
+                // setPrototypeOf / isExtensible / preventExtensions) and
+                // Map-overlapping `groupBy` must keep their current behavior.
+                // Resolves the reified ctor closure installed by
+                // `install_builtin_constructor_statics`.
+                if matches!(
+                    property.as_str(),
+                    "keys"
+                        | "values"
+                        | "entries"
+                        | "fromEntries"
+                        | "assign"
+                        | "create"
+                        | "seal"
+                        | "freeze"
+                        | "isFrozen"
+                        | "isSealed"
+                        | "is"
+                        | "getOwnPropertyNames"
+                        | "getOwnPropertySymbols"
+                        | "getOwnPropertyDescriptors"
+                        | "defineProperties"
+                ) {
+                    return Ok(lower_global_builtin_static_value(ctx, "Object", property));
                 }
                 // #3527: `Object.hasOwn` read as a VALUE (not a direct call) —
                 // e.g. iconv-lite's merge-exports does
@@ -1317,6 +1449,9 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         &[(DOUBLE, &recv_box), (I64, &bytes_i64), (I64, &len_str)],
                     ));
                 }
+                if class_name == "Agent" && is_http_agent_method_name(property) {
+                    return lower_class_method_bind(ctx, object, property);
+                }
                 if is_net_native_method_value(&class_name, property) {
                     return lower_class_method_bind(ctx, object, property);
                 }
@@ -1324,9 +1459,22 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     return lower_runtime_property_get_by_name(ctx, object, property);
                 }
                 let getter_key = (class_name.clone(), format!("__get_{}", property));
-                if let Some(fn_name) = ctx.methods.get(&getter_key).cloned() {
-                    let recv_box = lower_expr(ctx, object)?;
-                    return Ok(ctx.block().call(DOUBLE, &fn_name, &[(DOUBLE, &recv_box)]));
+                // STATIC accessors are emitted with the static (no-`this`)
+                // calling convention under a `perry_static_…` symbol, so the
+                // instance direct-call ABI here would reference a symbol that
+                // is never emitted (`__get_get_#f` undefined-value link error
+                // for `static get #f()`). Route them through the dynamic
+                // by-name dispatch below, which hits CLASS_STATIC_ACCESSORS.
+                let is_static_accessor = ctx
+                    .classes
+                    .get(&class_name)
+                    .map(|c| c.static_accessor_names.iter().any(|n| n == property))
+                    .unwrap_or(false);
+                if !is_static_accessor {
+                    if let Some(fn_name) = ctx.methods.get(&getter_key).cloned() {
+                        let recv_box = lower_expr(ctx, object)?;
+                        return Ok(ctx.block().call(DOUBLE, &fn_name, &[(DOUBLE, &recv_box)]));
+                    }
                 }
                 // #1642: bound-method reference for Web Streams instance methods
                 // (`typeof rs.getReader === "function"`, `const f = rs.getReader;

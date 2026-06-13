@@ -17,6 +17,19 @@ use crate::ir::Expr;
 
 use super::{lower_expr, LoweringContext};
 
+/// #5009: resolve a build-time `perry.define` of `process.env.<name>` to the
+/// HIR literal it should fold to, if one is configured for this build. Returns
+/// `None` when there is no define for `name` (the caller then emits the normal
+/// runtime `EnvGet`).
+fn env_define_literal(name: &str) -> Option<Expr> {
+    crate::ir::env_define_lookup(name).map(|d| match d {
+        crate::ir::EnvDefine::Str(s) => Expr::String(s),
+        crate::ir::EnvDefine::Bool(b) => Expr::Bool(b),
+        crate::ir::EnvDefine::Num(n) => Expr::Number(n),
+        crate::ir::EnvDefine::Null => Expr::Null,
+    })
+}
+
 pub(super) fn lower_member(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Result<Expr> {
     // #1723: when THIS access is the auditable `ns[dynamicKey].staticMember`
     // shape — a dynamic stdlib SUB-namespace selection (`path.win32` /
@@ -197,22 +210,50 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
         if matches!(mp.kind, ast::MetaPropKind::NewTarget) {
             if let ast::MemberProp::Ident(prop_ident) = &member.prop {
                 let prop_name = prop_ident.sym.as_ref();
-                if let Some(class_name) = ctx.in_constructor_class.clone() {
-                    return Ok(match prop_name {
-                        "name" => Expr::String(class_name),
-                        // Other props on a class reference (`prototype`,
-                        // arbitrary) — undefined is the safe fallback;
-                        // adding `prototype` would need a real class
-                        // reference, not in scope for #449.
-                        _ => Expr::Undefined,
-                    });
-                }
-                // Outside a constructor: `new.target` is undefined and
-                // ordinary functions resolve it dynamically at runtime.
+                // #2768: read the property off the RUNTIME `new.target`, which
+                // codegen resolves to the active constructor's leaf class ref
+                // (`INT32_TAG | class_id`). `.name` / `.prototype` /
+                // `=== SomeClass` then all reflect the actual constructed
+                // class. The old fold returned the *enclosing* class name
+                // string (wrong leaf for `super()`-inlined bodies) and made
+                // `new.target.prototype` undefined. Outside a constructor
+                // `new.target` is `undefined`, so the runtime read yields
+                // `undefined.<prop>` semantics via the same PropertyGet.
                 return Ok(Expr::PropertyGet {
                     object: Box::new(Expr::NewTarget),
                     property: prop_name.to_string(),
                 });
+            }
+        }
+    }
+
+    // Promise statics are receiver-sensitive: ECMA-262 uses their `this`
+    // value as the constructor, so value reads like `Promise.resolve.call(...)`
+    // must keep the `Promise` receiver instead of collapsing to the legacy
+    // property-only `GlobalGet(0).resolve` intrinsic shape.
+    if let ast::Expr::Ident(obj_ident) = member.obj.as_ref() {
+        let promise_is_source_bound = ctx.lookup_local("Promise").is_some()
+            || ctx.lookup_func("Promise").is_some()
+            || ctx.lookup_imported_func("Promise").is_some();
+        if obj_ident.sym.as_ref() == "Promise" && !promise_is_source_bound {
+            let static_member = match &member.prop {
+                ast::MemberProp::Ident(prop_ident) => Some(prop_ident.sym.as_ref()),
+                ast::MemberProp::Computed(computed) => match computed.expr.as_ref() {
+                    ast::Expr::Lit(ast::Lit::Str(s)) => s.value.as_str(),
+                    _ => None,
+                },
+                ast::MemberProp::PrivateName(_) => None,
+            };
+            if let Some(static_member) = static_member {
+                if crate::analysis::is_builtin_static_function_member("Promise", static_member) {
+                    return Ok(Expr::PropertyGet {
+                        object: Box::new(Expr::PropertyGet {
+                            object: Box::new(Expr::GlobalGet(0)),
+                            property: "Promise".to_string(),
+                        }),
+                        property: static_member.to_string(),
+                    });
+                }
             }
         }
     }
@@ -717,6 +758,16 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                             ast::MemberProp::Ident(var_ident) => {
                                 // process.env.VARNAME (static key)
                                 let var_name = var_ident.sym.to_string();
+                                // #5009: honor a build-time `perry.define` of
+                                // `process.env.<NAME>` by substituting the
+                                // literal here — before `EnvGet` (a live
+                                // runtime env lookup) is emitted. esbuild-style
+                                // define semantics: the define wins over the
+                                // runtime environment, in every context and
+                                // regardless of tree-shaking.
+                                if let Some(lit) = env_define_literal(&var_name) {
+                                    return Ok(lit);
+                                }
                                 return Ok(Expr::EnvGet(var_name));
                             }
                             ast::MemberProp::Computed(computed) => {
@@ -727,6 +778,11 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                                 // dynamic.
                                 if let ast::Expr::Lit(ast::Lit::Str(s)) = computed.expr.as_ref() {
                                     if let Some(name) = s.value.as_str() {
+                                        // #5009: same define substitution as the
+                                        // dot form above.
+                                        if let Some(lit) = env_define_literal(name) {
+                                            return Ok(lit);
+                                        }
                                         return Ok(Expr::EnvGet(name.to_string()));
                                     }
                                 }
@@ -1147,7 +1203,9 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                         object: Box::new(object_expr),
                         property: property_name,
                     });
-                } else if module_name == "stream" && is_classic_stream_method_name(&property_name) {
+                } else if matches!(module_name.as_str(), "stream" | "node:stream")
+                    && is_classic_stream_method_name(&property_name)
+                {
                     // Classic Node streams materialize core stream and
                     // EventEmitter methods as closure-valued fields on the
                     // stream object. A bare method read (`r.read`, `r.on`)
@@ -1172,10 +1230,15 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                         property: property_name,
                     });
                 } else if module_name == "events"
+                    // Any native instance registered under module `events` is
+                    // an emitter; the class name can be an alias of the
+                    // constructor binding rather than the canonical
+                    // "EventEmitter" — `var EE = require('events'); new EE()`
+                    // registers class "EE" (#4995). Gating on the canonical
+                    // names sent alias reads down the zero-arg
+                    // NativeMethodCall path, so `typeof emitter.on` CALLED
+                    // `events.on()` and threw ERR_INVALID_ARG_TYPE.
                     && (matches!(
-                        class_name.as_str(),
-                        "EventEmitter" | "EventEmitterAsyncResource"
-                    ) && (matches!(
                         property_name.as_str(),
                         "on" | "addListener"
                             | "once"
@@ -1192,7 +1255,7 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                             | "setMaxListeners"
                             | "getMaxListeners"
                     ) || (class_name == "EventEmitterAsyncResource"
-                        && property_name == "emitDestroy")))
+                        && property_name == "emitDestroy"))
                 {
                     let object_expr = lower_expr(ctx, &member.obj)?;
                     return Ok(Expr::PropertyGet {
@@ -1214,9 +1277,14 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                     });
                 } else if matches!(module_name.as_str(), "http" | "https")
                     && class_name == "Agent"
+                    && property_name == "close"
+                {
+                    return Ok(Expr::Undefined);
+                } else if matches!(module_name.as_str(), "http" | "https")
+                    && class_name == "Agent"
                     && matches!(
                         property_name.as_str(),
-                        "keepSocketAlive" | "reuseSocket" | "getName" | "destroy" | "close"
+                        "keepSocketAlive" | "reuseSocket" | "getName" | "destroy"
                     )
                 {
                     // A bare read of an Agent method (`typeof a.getName`)
@@ -1426,7 +1494,13 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                     // Getter properties keep the 0-arg NativeMethodCall below
                     // (they really are getters); everything else here is a
                     // callable method.
-                    "locked" | "desiredSize" | "closed" | "ready" | "readable" | "writable"
+                    "locked"
+                        | "desiredSize"
+                        | "closed"
+                        | "ready"
+                        | "readable"
+                        | "writable"
+                        | "byobRequest"
                 ) {
                     // #1642: a value-read of a Web Streams *method* (not a
                     // getter) must yield a callable bound-method reference, not
@@ -1517,6 +1591,8 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                             | ("IncomingMessage", "method")
                             | ("IncomingMessage", "url")
                             | ("IncomingMessage", "httpVersion")
+                            | ("IncomingMessage", "httpVersionMajor")
+                            | ("IncomingMessage", "httpVersionMinor")
                             | ("IncomingMessage", "complete")
                             | ("IncomingMessage", "aborted")
                             | ("IncomingMessage", "destroyed")
@@ -1543,6 +1619,7 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                             // perry-ext-http-server (Phase 1 returns the
                             // stored numeric default; Phase 2 will reflect
                             // the live hyper accept-loop state).
+                            | ("HttpServer", "listening")
                             | ("HttpServer", "headersTimeout")
                             | ("HttpServer", "keepAliveTimeout")
                             | ("HttpServer", "keepAliveTimeoutBuffer")
@@ -1550,6 +1627,7 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                             | ("HttpServer", "timeout")
                             | ("HttpServer", "maxHeadersCount")
                             | ("HttpServer", "maxRequestsPerSocket")
+                            | ("HttpsServer", "listening")
                             | ("HttpsServer", "headersTimeout")
                             | ("HttpsServer", "keepAliveTimeout")
                             | ("HttpsServer", "keepAliveTimeoutBuffer")
@@ -1708,6 +1786,26 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                 return Ok(Expr::Number(value));
             }
         }
+        // #4533/#4561: `Error.isPrototypeOf(x)`, `Number.bind(...)`, etc. read an
+        // inherited Function/Object prototype method off a builtin constructor.
+        // Those builtin idents otherwise collapse to bare `GlobalGet(0)`
+        // (globalThis) in the static-member path below, so the predicate ran
+        // against globalThis instead of the real constructor. Resolve the
+        // builtin to its globalThis property so the receiver is the constructor.
+        if matches!(
+            prop_ident.sym.as_ref(),
+            "bind" | "call" | "apply" | "isPrototypeOf"
+        ) {
+            if let ast::Expr::Ident(obj_ident) = member.obj.as_ref() {
+                let obj_name = obj_ident.sym.as_ref();
+                if crate::analysis::is_builtin_global_value_name(obj_name) {
+                    object_expr = Expr::PropertyGet {
+                        object: Box::new(Expr::GlobalGet(0)),
+                        property: obj_name.to_string(),
+                    };
+                }
+            }
+        }
     }
     let member_object_is_global_this = matches!(
         unwrap_transparent(member.obj.as_ref()),
@@ -1797,7 +1895,12 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                     );
                     let receiver_is_namespace_value = matches!(
                         property.as_str(),
-                        "Atomics" | "crypto" | "WebAssembly" | "localStorage" | "sessionStorage"
+                        "Atomics"
+                            | "crypto"
+                            | "WebAssembly"
+                            | "Temporal"
+                            | "localStorage"
+                            | "sessionStorage"
                     );
                     let outer_is_websocket_static = property == "WebSocket"
                         && match &member.prop {
@@ -1828,9 +1931,10 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                             )
                         );
                     // #4437: value reads such as `JSON.stringify` /
-                    // `Reflect.apply` / `BigInt.asIntN` / `Symbol.for` need the
-                    // reified namespace/constructor receiver. Direct calls still
-                    // take the intrinsic path this reroute-undo protects.
+                    // `Reflect.apply` / `BigInt.asIntN` / `Symbol.for` /
+                    // `Promise.resolve` need the reified namespace/constructor
+                    // receiver. Direct calls still take the intrinsic path this
+                    // reroute-undo protects.
                     let outer_static_member = match &member.prop {
                         ast::MemberProp::Ident(p) => Some(p.sym.as_ref()),
                         ast::MemberProp::Computed(c) => match c.expr.as_ref() {
@@ -1860,7 +1964,13 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                     let outer_is_reified_builtin_static_value = !member_is_call_callee
                         && matches!(
                             property.as_str(),
-                            "JSON" | "Reflect" | "BigInt" | "Symbol" | "Array" | "Number"
+                            "JSON"
+                                | "Reflect"
+                                | "BigInt"
+                                | "Symbol"
+                                | "Array"
+                                | "Number"
+                                | "Promise"
                         )
                         && outer_static_member
                             .map(|member| {
@@ -1899,6 +2009,52 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                                 matches!(member, "fromCharCode" | "fromCodePoint" | "raw")
                             })
                             .unwrap_or(false);
+                    // #4521: `Promise.resolve` / `reject` / `all` / `race` /
+                    // `allSettled` / `any` / `withResolvers` / `try` read as
+                    // VALUES need the reified Promise constructor receiver so
+                    // they resolve to the real native function objects (correct
+                    // `.name` / `.length`, callable via reference / `.call`).
+                    // They are installed with metadata via
+                    // `install_constructor_static` (global_this.rs); the
+                    // reroute-undo otherwise collapses them to
+                    // `GlobalGet(0).<name>` (undefined). Direct calls
+                    // (`Promise.all([...])`) take the codegen fast path via the
+                    // `!member_is_call_callee` gate.
+                    let outer_is_reified_promise_static_value = !member_is_call_callee
+                        && property == "Promise"
+                        && outer_static_member
+                            .map(|member| {
+                                matches!(
+                                    member,
+                                    "resolve"
+                                        | "reject"
+                                        | "all"
+                                        | "race"
+                                        | "allSettled"
+                                        | "any"
+                                        | "withResolvers"
+                                        | "try"
+                                )
+                            })
+                            .unwrap_or(false);
+                    // #4533/#4561: inherited Object/Function prototype methods
+                    // (`Error.isPrototypeOf`, `Number.valueOf`, `Object.bind`)
+                    // must keep the real constructor receiver, not collapse to
+                    // bare `GlobalGet(0)` — otherwise the predicate/dispatch runs
+                    // against globalThis. The reroute above already resolved the
+                    // receiver to `globalThis.<ctor>`; don't undo it here.
+                    let outer_is_inherited_object_proto_method = matches!(
+                        outer_static_member,
+                        Some(
+                            "hasOwnProperty"
+                                | "isPrototypeOf"
+                                | "propertyIsEnumerable"
+                                | "toLocaleString"
+                                | "valueOf"
+                        )
+                    );
+                    let outer_is_inherited_function_proto_method =
+                        matches!(outer_static_member, Some("bind" | "call" | "apply"));
                     if !outer_is_prototype_or_proto
                         && !receiver_is_namespace_value
                         && !outer_is_websocket_static
@@ -1906,6 +2062,9 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                         && !outer_is_reified_builtin_static_value
                         && !outer_is_reified_date_static_value
                         && !outer_is_reified_string_static_value
+                        && !outer_is_reified_promise_static_value
+                        && !outer_is_inherited_object_proto_method
+                        && !outer_is_inherited_function_proto_method
                         && !receiver_is_detached_console_read
                     {
                         object_expr = Expr::GlobalGet(0);
@@ -1970,7 +2129,9 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                     _ => false,
                 };
                 if is_global_builtin {
-                    if let Some(len) = crate::analysis::builtin_constructor_length(name) {
+                    if let Some(len) = crate::analysis::builtin_constructor_length(name)
+                        .or_else(|| crate::analysis::builtin_global_function_length(name))
+                    {
                         return Ok(Expr::Number(len as f64));
                     }
                 }
@@ -2287,11 +2448,48 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
             Ok(Expr::IndexGet { object, index })
         }
         ast::MemberProp::PrivateName(private) => {
-            // Private field access: this.#field -> PropertyGet with "#field"
+            // Private field access: this.#field -> PropertyGet with "#field".
+            // Wrap the receiver in a brand+kind guard so accessing the private
+            // member on a wrong receiver throws TypeError per spec.
             let property = format!("#{}", private.name);
+            let object = wrap_private_guard(ctx, object, &property, PRIV_OP_READ);
             Ok(Expr::PropertyGet { object, property })
         }
     }
+}
+
+/// Wire codes for `Expr::PrivateGuard.op` — the operation a private member
+/// access performs. Keep in sync with the `js_private_guard` runtime helper:
+/// 0/1 are instance read/write, 2/3 are static read/write.
+pub(crate) const PRIV_OP_READ: u8 = 0;
+pub(crate) const PRIV_OP_WRITE: u8 = 1;
+
+/// Wrap the receiver of a private member access `obj.#name` in a brand+kind
+/// guard so an access on a non-conforming receiver throws `TypeError`. If the
+/// name cannot be resolved to a declaring class in scope, the object is
+/// returned unwrapped (falls back to the pre-existing string-keyed behavior so
+/// this can never reject a legal access). A STATIC member emits a static-brand
+/// guard (the receiver must be the declaring class constructor itself).
+/// `op` is `PRIV_OP_READ` / `PRIV_OP_WRITE`.
+pub(crate) fn wrap_private_guard(
+    ctx: &LoweringContext,
+    object: Box<Expr>,
+    field_name: &str,
+    op: u8,
+) -> Box<Expr> {
+    if let Some((class_name, member)) = ctx.resolve_private(field_name) {
+        // Static members get a static brand (op + 2); instance members the
+        // ordinary op code.
+        let op = if member.is_static { op + 2 } else { op };
+        return Box::new(Expr::PrivateGuard {
+            class_name,
+            field_name: field_name.to_string(),
+            kind: member.kind as u8,
+            op,
+            object,
+        });
+    }
+    object
 }
 
 /// #503 — Node-core stdlib namespace receivers whose dynamic (`obj[x]`)
@@ -2502,6 +2700,7 @@ fn is_stream_api_member(module: &str, prop: &str) -> bool {
                 | "close"
                 | "error"
                 | "desiredSize"
+                | "byobRequest"
         ),
         "readable_stream_reader" => {
             matches!(prop, "read" | "releaseLock" | "cancel" | "closed")
@@ -2534,6 +2733,18 @@ fn is_classic_stream_method_name(prop: &str) -> bool {
             | "uncork"
             | "setDefaultEncoding"
             | "compose"
+            | "iterator"
+            | "toArray"
+            | "map"
+            | "filter"
+            | "reduce"
+            | "forEach"
+            | "find"
+            | "some"
+            | "every"
+            | "flatMap"
+            | "take"
+            | "drop"
             | "on"
             | "addListener"
             | "once"
@@ -2595,6 +2806,8 @@ fn is_http_incoming_message_runtime_property_name(prop: &str) -> bool {
         "method"
             | "url"
             | "httpVersion"
+            | "httpVersionMajor"
+            | "httpVersionMinor"
             | "headers"
             | "rawHeaders"
             | "headersDistinct"

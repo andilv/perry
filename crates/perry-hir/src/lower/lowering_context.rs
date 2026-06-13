@@ -17,6 +17,34 @@ pub(crate) struct WithEnvFrame {
     pub(crate) local_mark: usize,
 }
 
+/// Kind of a private class element, for the read/write legality checks that
+/// `obj.#name` access performs (in addition to the brand check). The numeric
+/// values are the wire codes passed to the `js_private_guard` runtime helper —
+/// keep them in sync with `crates/perry-runtime/src/object/field_get_set.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrivKind {
+    Field = 0,
+    Method = 1,
+    Get = 2,
+    Set = 3,
+    GetSet = 4,
+}
+
+/// One private element declared by a class: its kind and whether it is static.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PrivMember {
+    pub(crate) kind: PrivKind,
+    pub(crate) is_static: bool,
+}
+
+/// Private-name scope for one class body. `members` is keyed by the
+/// `#name` string (with the leading `#`).
+#[derive(Debug, Clone)]
+pub(crate) struct PrivateScope {
+    pub(crate) class_name: String,
+    pub(crate) members: HashMap<String, PrivMember>,
+}
+
 pub struct LoweringContext {
     /// Counter for generating unique local IDs
     pub(crate) next_local_id: LocalId,
@@ -176,6 +204,15 @@ pub struct LoweringContext {
     pub(crate) current_class: Option<String>,
     /// True while lowering a static class member body.
     pub(crate) current_class_member_is_static: bool,
+    /// Lexical stack of private-name scopes — one entry per enclosing class
+    /// body, innermost last. Each access of `obj.#name` resolves `#name` to
+    /// the nearest enclosing class that DECLARES it, yielding the declaring
+    /// class (for the brand check) and the member kind (for the
+    /// read-on-setter-only / write-on-method etc. TypeError checks). This is
+    /// kept on the context (not derived from `current_class`) so it survives
+    /// nested plain-function / arrow lowering — a private name referenced from
+    /// an inner function still lexically resolves to its declaring class.
+    pub(crate) private_scopes: Vec<PrivateScope>,
     /// Home-object local for object-literal methods while their bodies are
     /// lowered. Used to preserve `super` in object methods.
     pub(crate) object_super_home_stack: Vec<LocalId>,
@@ -197,6 +234,11 @@ pub struct LoweringContext {
     /// (static property key); flushed into `Module.closure_display_names`
     /// alongside `pending_functions`.
     pub(crate) closure_display_names: HashMap<FuncId, String>,
+    /// Per-generator count of leading parameter-prologue statements (default
+    /// guards + destructuring binding stmts) prepended to the body. Flushed
+    /// into `Module.gen_param_prologue_len`; the generator transform uses it to
+    /// run param binding synchronously at call time. See that field's docs.
+    pub(crate) gen_param_prologue_len: HashMap<FuncId, usize>,
     /// Test262 assignment name inference: when lowering `lhs = rhs`, a bare
     /// identifier lhs can provide the `NamedEvaluation` name for an anonymous
     /// function/class rhs. This slot is set only while lowering that rhs.
@@ -238,6 +280,15 @@ pub struct LoweringContext {
     /// lowering, so closures and later top-level reads share storage.
     pub(crate) sloppy_implicit_globals: Vec<(String, LocalId)>,
     pub(crate) sloppy_implicit_global_ids: HashSet<LocalId>,
+    /// Sloppy implicit globals minted as `with`-set FALLBACKS. Whether the
+    /// binding ever materialises is a runtime question (the with-env may own
+    /// the property and take the write), so these locals start as a HOLE
+    /// sentinel and bare reads route through `js_with_implicit_read` which
+    /// throws ReferenceError while unset. id → identifier name.
+    pub(crate) with_sloppy_implicit_ids: std::collections::HashMap<LocalId, String>,
+    /// (id, name) pairs whose sentinel-init `Stmt::Let` still needs to be
+    /// emitted ahead of the with statement currently being lowered.
+    pub(crate) pending_with_implicit_inits: Vec<(LocalId, String)>,
     /// Current function/closure nesting depth (`enter_scope` bumps this,
     /// `exit_scope` decrements). 0 == still at module top level.
     pub(crate) scope_depth: usize,
@@ -262,6 +313,16 @@ pub struct LoweringContext {
     pub(crate) uses_fetch: bool,
     /// Issue #76 — set when any `WebAssembly.*` HIR variant is lowered.
     pub(crate) uses_webassembly: bool,
+    /// #4950: local binding name of a default import from the npm `react`
+    /// package (`import React from 'react'`). When set, JSX lowers to
+    /// `<local>.createElement(type, props)` so REACT controls when function
+    /// components run (the reconciler installs the hooks dispatcher first).
+    /// Perry's native `js_jsx` adapter calls function components EAGERLY
+    /// (SSR-to-HTML semantics, hono-style) — under a real React renderer
+    /// (ink, react-three-fiber, …) that ran `<Text>`'s `useContext` outside
+    /// any render and threw React's "Invalid hook call" / null-dispatcher
+    /// TypeError.
+    pub(crate) react_default_import_local: Option<String>,
     /// #1723 — one-shot flag set by an enclosing `ns[dynamicKey].staticMember`
     /// access to tell the *immediately-nested* computed-member lowering to skip
     /// the #503 dynamic-stdlib-dispatch refusal. The dynamic index there only
@@ -288,6 +349,15 @@ pub struct LoweringContext {
     /// continue to lexically shadow the object environment.
     pub(crate) with_env_stack: Vec<WithEnvFrame>,
     pub(crate) var_hoisted_ids: HashSet<LocalId>,
+    /// #4973: top-of-function-body `let`/`const` Ident bindings pre-registered
+    /// by the function-body hoist pass so hoisted sibling FUNCTIONS that
+    /// reference them before their lexical position bind the (boxed) local
+    /// instead of falling through to a global read (the classic Node test
+    /// shape: `function t() { server.close(); }` … `const server = …`).
+    /// Keyed by the declarator-ident span (`span.lo.0`) so ONLY the exact
+    /// declarator reuses the id at its Let site — a shadowing `const` in an
+    /// inner block still lowers a fresh binding.
+    pub(crate) lexical_forward_decls: HashMap<u32, LocalId>,
     /// Shadow index: function name -> index in `functions` Vec (last entry for shadowing)
     pub(crate) functions_index: HashMap<String, usize>,
     /// Shadow index: class name -> index in `classes` Vec
@@ -380,6 +450,17 @@ pub struct LoweringContext {
     /// Used to resolve `new.target` to a placeholder object whose `.name`
     /// returns the class name. None outside any constructor.
     pub(crate) in_constructor_class: Option<String>,
+    /// True while lowering inside a class declaration/expression whose
+    /// heritage clause is present (`class C extends ... {}`). Combined with
+    /// `in_constructor_class` to decide whether a direct `eval` body may
+    /// contain `super()` (spec: PerformEval early errors). Saved/restored
+    /// alongside `current_class` at both class lowering entry points.
+    pub(crate) current_class_is_derived: bool,
+    /// True while lowering a class field initializer expression. A direct
+    /// `eval` body containing `arguments` in this context is a SyntaxError at
+    /// the eval call (field initializers have no arguments object). Set in
+    /// `lower_class_prop` / `lower_private_prop`.
+    pub(crate) in_class_field_init: bool,
     /// Issue #562 — set to the parent class identifier (e.g. `"WritableStream"`,
     /// `"ReadableStream"`, `"TransformStream"`, or any ident from `class X
     /// extends Y`) when lowering inside a class declaration. Used by the
@@ -396,6 +477,15 @@ pub struct LoweringContext {
     /// field layout. Dedup is per-module only; cross-module dedup would need
     /// a stable hash and is deferred.
     pub(crate) anon_shape_classes: HashMap<String, String>,
+    /// Class DECLARATION names at the top level of the function body
+    /// currently being lowered. JS resolves a method-body reference to a
+    /// sibling class declared LATER in the same function at call time
+    /// (vendored zod: `ZodType.optional()` calls `ZodOptional.create(...)`
+    /// with ZodOptional declared hundreds of lines below) — without this
+    /// set the Ident lowered to the unknown-global sentinel and the member
+    /// call dispatched into `Object.create`. Scoped save/restore in
+    /// `lower_fn_body_block_stmt`.
+    pub(crate) forward_class_names: std::collections::HashSet<String>,
     /// Counter for generating anon-class names (`__AnonShape_N`).
     // #854: initialized in `new` but unread — anon-shape classes are now named
     // by content-addressed FNV hash (see `synthesize_anon_shape_class`), not by
@@ -514,4 +604,9 @@ pub struct LoweringContext {
     /// observe the failure instead of rejecting the whole user source at
     /// compile time. Outside try blocks, `require(literal)` still hard-errors.
     pub(crate) optional_require_try_depth: u32,
+    /// Pre-scanned constant environment for `new Function` / `Function(...)`
+    /// argument resolution (single-assignment module vars, `toString`-bearing
+    /// object literals, counters). Built once per module in
+    /// `lower_module_full`; consumed by `const_fold_fn`.
+    pub(crate) fn_ctor_env: super::fn_ctor_env::FnCtorEnv,
 }

@@ -78,12 +78,13 @@ pub fn lower_fn_decl(ctx: &mut LoweringContext, fn_decl: &ast::FnDecl) -> Result
     ctx.enter_strict_mode(strict);
     let simple_parameters = params_are_simple_arguments_list(&fn_decl.function.params);
     let needs_arguments_synth = !user_has_arguments_param
-        && fn_decl
+        && (fn_decl
             .function
             .body
             .as_ref()
             .map(|b| body_uses_arguments(&b.stmts))
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || params_use_arguments(&fn_decl.function.params));
 
     // Lower parameters with type extraction (using context for type param resolution)
     //
@@ -124,11 +125,9 @@ pub fn lower_fn_decl(ctx: &mut LoweringContext, fn_decl: &ast::FnDecl) -> Result
             destructuring_params.push((param_id, inner_pat.clone()));
         }
     }
-    for (param, pat) in params.iter_mut().zip(default_param_pats.iter()) {
-        param.default = get_param_default(ctx, pat)?;
-    }
-
-    // If the body references `arguments`, append the hidden raw-arguments input.
+    // If the body (or a parameter default) references `arguments`, append the
+    // hidden raw-arguments input — BEFORE the defaults are lowered below so
+    // `arguments` inside a default expression resolves to the synthetic local.
     if needs_arguments_synth {
         let mapped = !strict && simple_parameters;
         let mapped_parameter_ids = if mapped {
@@ -144,6 +143,10 @@ pub fn lower_fn_decl(ctx: &mut LoweringContext, fn_decl: &ast::FnDecl) -> Result
             !mapped,
             mapped_parameter_ids,
         );
+    }
+
+    for (param, pat) in params.iter_mut().zip(default_param_pats.iter()) {
+        param.default = get_param_default(ctx, pat)?;
     }
 
     // Register parameters with known native types as native instances
@@ -257,6 +260,7 @@ pub fn lower_fn_decl(ctx: &mut LoweringContext, fn_decl: &ast::FnDecl) -> Result
         let stmts = generate_param_destructuring_stmts(ctx, pat, *param_id)?;
         destructuring_stmts.extend(stmts);
     }
+    let destructuring_prologue_len = destructuring_stmts.len();
 
     let outer_strict = ctx.current_strict;
     let is_strict = outer_strict || function_has_use_strict(&fn_decl.function);
@@ -285,6 +289,17 @@ pub fn lower_fn_decl(ctx: &mut LoweringContext, fn_decl: &ast::FnDecl) -> Result
     // rationale). Without this, cross-module callers that pad missing args
     // with TAG_UNDEFINED read the param as `undefined` instead of its default.
     let default_stmts = build_default_param_stmts(&params);
+    // Record the param-prologue length for generators so the generator
+    // transform can run param binding synchronously at call time (spec
+    // FunctionDeclarationInstantiation order). Prologue = default guards +
+    // destructuring stmts, both prepended below. Only generators need this;
+    // for plain functions / async functions the prologue stays in the body.
+    if fn_decl.function.is_generator {
+        let prologue_len = default_stmts.len() + destructuring_prologue_len;
+        if prologue_len > 0 {
+            ctx.gen_param_prologue_len.insert(func_id, prologue_len);
+        }
+    }
     if !default_stmts.is_empty() {
         let mut new_body = default_stmts;
         new_body.append(&mut body);

@@ -36,6 +36,7 @@ where
         | Expr::EnvGet(_)
         | Expr::ProcessEnv
         | Expr::GlobalThisExpr
+        | Expr::ModuleTopThis
         | Expr::ProcessUptime
         | Expr::ProcessCwd
         | Expr::ProcessArgv
@@ -146,6 +147,7 @@ where
         | Expr::ObjectGetPrototypeOf(v)
         | Expr::ObjectGetOwnPropertySymbols(v)
         | Expr::ObjectKeys(v)
+        | Expr::ForInKeys(v)
         | Expr::ObjectValues(v)
         | Expr::ObjectEntries(v)
         | Expr::ObjectFromEntries(v)
@@ -243,7 +245,9 @@ where
         | Expr::IteratorFrom(v)
         | Expr::IteratorToArray(v)
         | Expr::GetIterator(v)
+        | Expr::GetAsyncIterator(v)
         | Expr::ForOfToArray(v)
+        | Expr::ForAwaitToArray(v)
         | Expr::ObjectRest { object: v, .. }
         | Expr::ProxyRevoke(v)
         | Expr::ReflectOwnKeys(v)
@@ -273,6 +277,7 @@ where
         | Expr::DateToString(v)
         | Expr::DateToDateString(v)
         | Expr::DateToTimeString(v)
+        | Expr::DateToUTCString(v)
         | Expr::DateToLocaleDateString(v)
         | Expr::DateToLocaleTimeString(v)
         | Expr::DateToLocaleString(v)
@@ -574,6 +579,12 @@ where
         Expr::RegisterClassParentDynamic { parent_expr, .. } => {
             f(parent_expr);
         }
+        Expr::RegisterClassCaptures { captures, .. } => {
+            for c in captures {
+                f(c);
+            }
+        }
+        Expr::ClassCaptureValue { .. } => {}
         Expr::RegisterClassStaticSymbol {
             key_expr,
             value_expr,
@@ -638,6 +649,9 @@ where
             f(object);
         }
         Expr::PrivateBrandCheck { object, .. } => {
+            f(object);
+        }
+        Expr::PrivateGuard { object, .. } => {
             f(object);
         }
         Expr::FsWriteFileSync(a, b)
@@ -845,6 +859,13 @@ where
                 }
             }
         }
+        Expr::SuperCallSpread(args) => {
+            for a in args {
+                match a {
+                    CallArg::Expr(e) | CallArg::Spread(e) => f(e),
+                }
+            }
+        }
         Expr::ArraySpread(elements) => {
             for el in elements {
                 match el {
@@ -878,6 +899,14 @@ where
             f(callee);
             for a in args {
                 f(a);
+            }
+        }
+        Expr::NewDynamicSpread { callee, args } => {
+            f(callee);
+            for a in args {
+                match a {
+                    CallArg::Expr(e) | CallArg::Spread(e) => f(e),
+                }
             }
         }
         Expr::JsNew {
@@ -1424,12 +1453,16 @@ where
             method,
             body,
             headers,
+            headers_dynamic,
         } => {
             f(url);
             f(method);
             f(body);
             for (_, v) in headers {
                 f(v);
+            }
+            if let Some(hd) = headers_dynamic {
+                f(hd);
             }
         }
         Expr::FetchGetWithAuth { url, auth_header } => {
@@ -1567,6 +1600,16 @@ where
                 f(s);
             }
         }
+        Expr::ArrayLikeMethod {
+            method: _,
+            receiver,
+            args,
+        } => {
+            f(receiver);
+            for a in args {
+                f(a);
+            }
+        }
         Expr::ArrayToSorted { array, comparator } => {
             f(array);
             if let Some(c) = comparator {
@@ -1594,6 +1637,9 @@ where
             f(array);
             f(index);
             f(value);
+        }
+        Expr::ArrayReverseValue { receiver } => {
+            f(receiver);
         }
         Expr::ArrayCopyWithin {
             array_id: _,
@@ -1671,10 +1717,20 @@ where
             f(target);
             f(key);
         }
-        Expr::ReflectSet { target, key, value } => {
+        Expr::ReflectGetOwnPropertyDescriptor { target, key } => {
+            f(target);
+            f(key);
+        }
+        Expr::ReflectSet {
+            target,
+            key,
+            value,
+            receiver,
+        } => {
             f(target);
             f(key);
             f(value);
+            f(receiver);
         }
         Expr::PutValueSet {
             target,

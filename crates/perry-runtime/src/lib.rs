@@ -29,6 +29,7 @@ pub mod array;
 pub mod async_context;
 pub mod async_hooks;
 pub mod atomics;
+pub mod atomics_futex;
 pub mod bigint;
 pub mod r#box;
 pub mod buffer;
@@ -41,8 +42,10 @@ pub mod collection_iter_object;
 pub mod color_parse;
 pub mod date;
 pub mod dgram;
+pub mod dgram_reactor;
 pub mod disposable;
 pub mod dns;
+pub mod dns_resolver;
 pub mod error;
 pub mod event_pump;
 pub mod event_target;
@@ -54,6 +57,7 @@ pub mod fs;
 pub mod gc;
 pub mod intl;
 pub mod iterator_helpers;
+pub mod macos_bundle;
 pub mod map;
 pub mod math;
 pub mod messaging;
@@ -70,6 +74,7 @@ pub mod node_sea;
 pub mod node_stream;
 pub mod node_submodules;
 pub mod node_test;
+pub mod yoga;
 // #3137/#3138/#3142: public `node:v8` serialize/deserialize + heap stats + GCProfiler.
 pub mod node_v8;
 // #3127/#3128/#3130/#3283: public `node:vm` import/require and narrowed execution.
@@ -91,8 +96,12 @@ pub mod readline_helpers;
 pub mod regex;
 pub mod safe_area;
 pub mod set;
+pub mod shared_sab;
 pub mod string;
 pub mod symbol;
+/// TC39 Temporal API (#4686): `Temporal.Duration`, `Temporal.Instant`,
+/// `Temporal.PlainDate`, … wrapping the pure-Rust `temporal_rs` engine.
+pub mod temporal;
 pub mod text;
 pub mod timer;
 pub mod typed_feedback;
@@ -102,6 +111,7 @@ pub(crate) mod typedarray_props;
 pub mod typedarray_view;
 pub mod url;
 pub mod v8;
+pub mod validators;
 pub mod value;
 pub mod wasi;
 pub mod web_storage;
@@ -128,7 +138,10 @@ pub mod webassembly;
 pub mod arkts_callbacks;
 pub mod geisterhand_registry;
 pub mod i18n;
-#[cfg(all(any(target_os = "ios", target_os = "tvos"), feature = "ios-game-loop"))]
+#[cfg(all(
+    any(target_os = "ios", target_os = "tvos", target_os = "visionos"),
+    feature = "ios-game-loop"
+))]
 pub mod ios_game_loop;
 pub mod json;
 pub mod json_tape;
@@ -225,7 +238,8 @@ pub use object::{
 };
 pub use promise::{js_is_promise, js_promise_run_microtasks, js_promise_state, js_promise_value};
 pub use promise::{
-    js_promise_new, js_promise_reject, js_promise_rejected, js_promise_resolve, js_promise_resolved,
+    js_promise_mark_internally_handled, js_promise_new, js_promise_reject, js_promise_rejected,
+    js_promise_resolve, js_promise_resolved,
 };
 pub use string::js_string_from_bytes;
 pub use value::{
@@ -235,10 +249,10 @@ pub use value::{
 pub use value::{
     js_set_handle_array_get, js_set_handle_array_length, js_set_handle_call_method,
     js_set_handle_object_get_property, js_set_handle_to_string, js_set_handle_typeof,
-    js_set_native_crypto_dispatch, js_set_native_domain_dispatch, js_set_native_http_dispatch,
-    js_set_native_module_js_loader, js_set_native_querystring_dispatch,
-    js_set_native_sqlite_dispatch, js_set_native_tls_dispatch, js_set_native_webcrypto_dispatch,
-    js_set_native_zlib_dispatch, js_set_new_from_handle_v8,
+    js_set_native_crypto_dispatch, js_set_native_domain_dispatch, js_set_native_events_construct,
+    js_set_native_http_dispatch, js_set_native_module_js_loader,
+    js_set_native_querystring_dispatch, js_set_native_sqlite_dispatch, js_set_native_tls_dispatch,
+    js_set_native_webcrypto_dispatch, js_set_native_zlib_dispatch, js_set_new_from_handle_v8,
 };
 
 // Extension pump registration — allows extensions to register pump functions
@@ -376,6 +390,10 @@ mod stdlib_pump {
         // so it runs even when perry-stdlib isn't linked. Zero-cost (one relaxed
         // atomic load) when there are no live children.
         crate::child_process::reactor::cp_reactor_pump();
+        // #4911: deliver queued UDP datagrams as `'message'` events. Lives in
+        // perry-runtime so node:dgram works without perry-stdlib linked.
+        // Zero-cost (one relaxed load) when no sockets are bound.
+        crate::dgram_reactor::pump();
         crate::process::js_process_ipc_drain();
         let f = STDLIB_PUMP_FN.load(Ordering::Acquire);
         if !f.is_null() {
@@ -410,6 +428,10 @@ mod stdlib_pump {
         // #1934: a live spawn-reactor child keeps the event loop alive even when
         // perry-stdlib isn't linked (or reports no handles).
         if crate::child_process::reactor::cp_reactor_has_live() {
+            return 1;
+        }
+        // #4911: a bound + `ref`'d node:dgram socket keeps the loop alive.
+        if crate::dgram_reactor::has_active() {
             return 1;
         }
         if crate::process::js_process_ipc_has_active() != 0 {

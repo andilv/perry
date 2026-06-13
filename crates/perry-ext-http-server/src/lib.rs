@@ -52,14 +52,23 @@ use std::sync::Once;
 
 use perry_ffi::{gc_register_mutable_root_scanner_named, iter_handles_of_mut, GcRootVisitor};
 
+mod cluster_bind;
+// Unit-test binaries do not link the host stdlib/runtime archive that
+// provides the perry_ffi async bridge; without these the test link is at the
+// mercy of --gc-sections keeping/dropping the perry-ffi references pulled in
+// via the perry-ext-net rlib (same shims as perry-ext-net / perry-ext-fetch).
 mod handle_dispatch;
 mod http2_server;
 mod http2_session_settings;
 mod http2_settings;
+mod http2_stream_props;
 mod https_server;
+mod raw_upgrade;
 mod request;
 mod response;
 mod server;
+#[cfg(test)]
+mod test_async_shims;
 mod tls;
 mod types;
 mod upgrade;
@@ -123,6 +132,12 @@ fn scan_http_server_roots(visitor: &mut GcRootVisitor<'_>) {
     fn scan_base_server_roots(server: &mut HttpServer, visitor: &mut GcRootVisitor<'_>) {
         visitor.visit_i64_slot(&mut server.handler);
         scan_listener_roots(&mut server.listeners, visitor);
+        // #4903 — listen callbacks queued for the deferred `'listening'`
+        // emit; a GC between `listen()` and the pump tick must not sweep
+        // them.
+        for cb in server.deferred_listen_cbs.iter_mut() {
+            visitor.visit_i64_slot(cb);
+        }
     }
 
     iter_handles_of_mut::<HttpServer, _>(|s| {
@@ -140,9 +155,14 @@ fn scan_http_server_roots(visitor: &mut GcRootVisitor<'_>) {
         scan_listener_roots(&mut im.listeners, visitor);
         visitor.visit_nanbox_f64_slot(&mut im.signal_controller);
         visitor.visit_nanbox_f64_slot(&mut im.signal);
+        visitor.visit_nanbox_f64_slot(&mut im.socket_value);
     });
     iter_handles_of_mut::<ServerResponse, _>(|sr| {
         scan_listener_roots(&mut sr.listeners, visitor);
+        visitor.visit_nanbox_f64_slot(&mut sr.standalone_socket);
+        for cb in sr.pending_write_callbacks.iter_mut() {
+            visitor.visit_i64_slot(cb);
+        }
     });
     iter_handles_of_mut::<Http2SessionHandle, _>(|session| {
         scan_listener_roots(&mut session.listeners, visitor);
@@ -237,7 +257,7 @@ mod tests {
         assert_eq!(s.keep_alive_timeout_buffer, 1_000.0);
         assert_eq!(s.request_timeout, 300_000.0);
         assert_eq!(s.idle_timeout, 0.0);
-        assert_eq!(s.max_headers_count, 2000.0);
+        assert_eq!(s.max_headers_count.to_bits(), crate::types::TAG_NULL);
         assert_eq!(s.max_requests_per_socket, 0.0);
         assert!(s.no_delay);
         assert!(!s.keep_alive);

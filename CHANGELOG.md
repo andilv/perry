@@ -1,6 +1,1155 @@
+## v0.5.1164 — perf(codegen): integer-specialize `i < n` loop guards when the bound is `any`/untyped
+
+Tight integer loops whose bound is **not statically typed `number`** — most
+commonly an `any`-typed or un-annotated value (e.g. a count out of
+`JSON.parse`) — compiled their `i < n` / `i <= n` guard to a generic
+per-iteration comparison: `sitofp` the i32 counter back to a double, keep `n`
+as a NaN-boxed f64 on the stack, and `call @js_rel_lt` every iteration. On the
+hot path of a compute kernel this is ~50× slower than an integer induction
+variable + `icmp`, and it blocks SCEV / the loop vectorizer.
+
+It presented as an x86_64-vs-arm64 divergence, but the emitted LLVM IR is
+**identical** across both targets (only the `target triple` header differs).
+The difference was downstream, in the link pipeline: `js_rel_lt` is a
+`#[no_mangle] extern "C"` runtime function in a separate compilation unit. The
+macOS default **auto-optimize** build rebuilds + inlines the runtime so LLVM
+folds the call away (making it *look* optimized), whereas the `--target linux`
+build links a **prebuilt `libperry_runtime.a`** with no cross-module inlining,
+so the per-iteration `callq` survives — the entire cause of poor compute
+throughput on Lambda.
+
+**Fix** (`crates/perry-codegen`): a runtime-guarded i32 specialization that
+extends the existing `i < arr.length` / `i < n` (number-typed) peepholes to
+`any`/untyped bounds. New `classify_for_local_bound_dynamic` matches the shape;
+the loop head hoists, **once**, an `is-number` check (NaN-box tag test
+mirroring `JSValue::is_number`) plus `fptosi(n)`; the cond block branches on
+that loop-invariant flag into `for.cond.fast` (`icmp slt i32`, no per-iteration
+`sitofp`/`call`) and `for.cond.slow` (the generic `js_rel_lt` path, preserving
+full JS coercion semantics for non-number values). LLVM's LoopUnswitch peels
+the invariant branch into two loops at -O2+; even unswitched, the hot
+(is-number) path runs pure integer compares. When the bound *is* a primitive
+number, hoisting `fptosi(n)` once carries the same documented trust-types
+trade-off as the static `number`-typed path (a non-integer float bound shifts
+the trip count by at most one). Added the `SHORT_STRING_TAG` ABI-mirror
+constant to codegen's `nanbox.rs`.
+
+Verified: `any`-bound loop guards now lower to `icmp slt i32` with no
+per-iteration call; numeric `any` bounds compute the correct result via the
+fast path, while string/`<=` cases keep correct coercion semantics via the slow
+path. `perry-codegen` (16/16), `perry-hir` + `perry` (522/0 + integration
+suites) green; the residual `perry-runtime` date/url failures and the
+`issue_4909` HTTP-timeout test are pre-existing load/timezone flakes
+(unchanged with this patch stashed; pass in isolation).
+
+## v0.5.1163 — fix: chalk boolean style modifiers — `<Text dimColor>` no longer renders `[object Object]` (#5039)
+
+Fixes #5039 — ink's `<Text dimColor>` (and `bold`/`italic`/`underline`/…)
+rendered `[object Object]` instead of the styled text. chalk 5's style
+modifiers are **getter accessors on a function prototype chain**
+(`Object.defineProperties(createChalk.prototype, styles)` reached through
+`Object.setPrototypeOf(chalk, createChalk.prototype)` where `chalk` is itself
+a function), and four independent Perry gaps conspired so `chalk.dim` never
+resolved:
+
+1. **runtime** (`closure/dynamic_props.rs`): `closure_get_dynamic_prop`'s
+   static-prototype walk only consulted data properties. Both arms (closure
+   proto and plain-object proto) now resolve ACCESSOR descriptors, invoking
+   the getter with the ORIGINAL receiver (`clone_closure_rebind_this`) so
+   chalk's `Object.defineProperty(this, styleName, {value: builder})`
+   self-cache lands on the instance instead of throwing "Cannot redefine
+   property: dim" against the non-configurable accessor on the shared proto.
+2. **codegen** (`lower_call/property_get.rs`): Annex B HTML-wrapper names
+   (`bold`, `link`, `anchor`, `big`, …) on *any*-typed receivers were
+   force-routed to `String.prototype`, so `chalk.bold(s)` coerced the chalk
+   closure to its source text and returned `<b>(...strings) => strings.join(' ')</b>`.
+   Dropped from the force list; an Any receiver that really is a string still
+   resolves through the `jsval.is_string()` arm of `js_native_call_method`.
+3. **resolver** (`commands/compile/resolve.rs`): Node subpath imports
+   (`#`-prefixed specifiers via the package's own `package.json` `"imports"`
+   map) were unsupported, so chalk's `import ansiStyles from '#ansi-styles'`
+   (vendored dep) silently resolved to nothing and EVERY style table came up
+   empty — `color="cyan"` only *looked* fine because ink fell back to the
+   unstyled string. Conditional entries prefer `node` over `default` (chalk's
+   `#supports-color` ships a browser build as `default`).
+4. **HIR** (`lower_patterns.rs`): `unescape_template` didn't decode
+   `\xHH` / `\uHHHH` / `\u{…}` (plus `\b\f\v\0` and line continuations), so
+   ansi-styles' `` `\u001B[${code}m` `` template literals produced the
+   6-char literal text instead of ESC. Surrogate pairs combine; a lone
+   surrogate becomes U+FFFD (WTF-8 remains a categorical gap).
+
+Validation: new `test-files/test_gap_chalk_proto_styles_5039.ts` is
+byte-identical vs `node --experimental-strip-types`; real chalk 5 compiled
+via `perry.compilePackages` produces Node-identical ANSI output for
+`dim`/`bold`/`cyan` including nested `chalk.dim.bold`; the issue's ink repro
+(on top of #5038's yoga-taffy branch) renders all four lines correctly with
+real escape codes. 3 new resolver unit tests cover the imports map (exact,
+conditional node/default, unmapped). Touched-crate test suites green.
+
+Deferred (pre-existing, observed while validating): `Object.entries` on
+ansi-styles' assembled object returns 55 entries vs Node's 45
+(non-enumerable `defineProperty` slots leak into enumeration);
+`JSON.stringify` emits `\u000c`/`\u0008` instead of the `\f`/`\b` short
+forms.
+
+## v0.5.1162 — feat: native yoga-layout via taffy + JSON module imports + Context.Provider fix (ink #348 end-to-end)
+
+Makes `ink` (React-based TUI) compile **and render** fully natively — no WASM
+yoga, no V8. Three independent changes land together under #348.
+
+### 1. Native `perry/yoga` backend over taffy
+
+`yoga-layout` (the WASM flexbox engine ink depends on for geometry) is replaced
+by a native backend built on `taffy` 0.7 (already a `perry-runtime` dependency).
+
+- New `crates/perry-runtime/src/yoga.rs`: a handle-based node store
+  (`YOGA_NODES`) with the full FFI surface ink uses — node new/free,
+  insert/remove/child-count, set number/edge/gap/enum props, measure-func
+  register/unregister, `calculateLayout`, and computed-box/edge getters. Each
+  `calculateLayout` builds a fresh `TaffyTree`, wires per-node measure
+  callbacks back into JS via `js_native_call_value`, and computes layout with
+  `compute_layout_with_measure`. A GC root scanner marks the live measure
+  callbacks.
+- New `crates/perry-codegen/src/lower_call/native_table/yoga.rs`: 14
+  `NativeModSig` rows mapping the `perry/yoga` method names to the runtime
+  entry points; registered in `native_table/mod.rs`.
+- `perry/yoga` added to the perry-namespace module list in
+  `perry-api-manifest`.
+- `node_modules/yoga-layout`'s `src/index.ts` is a thin shim re-exporting the
+  native primitives behind the real yoga `Node`/`Config` API surface.
+
+### 2. JSON module imports compile to a native default export
+
+`import data from "./x.json"` (with or without `with { type: "json" }`) was
+previously **skipped entirely** during module collection, leaving the default
+import bound to the empty-module sentinel. ink's `cli-boxes` dependency
+(`import cliBoxes from "./boxes.json"`) therefore resolved to `undefined`, and
+any `<Box borderStyle="round">` threw `Cannot read properties of undefined
+(reading 'topLeft')`.
+
+`crates/perry/src/commands/compile/collect_modules.rs` now materializes a JSON
+import as a native ESM module: the file is validated as JSON, then compiled as
+`export default <json>;` (JSON being a syntactic subset of a JS expression) and
+flows through the normal parse → lower → codegen path. Non-JSON modules are
+unaffected (identical code path). Malformed JSON now fails with a clear
+`Failed to parse JSON module …` error instead of silently producing the
+sentinel.
+
+### 3. Labeled `break` from a nested `switch` resolves to the outer switch
+
+A labeled `switch` did not register its label as a break target, so a
+`break <label>;` from a *nested* switch (as in react-reconciler's
+`createFiberFromTypeAndProps`) escaped to the wrong exit — dropping
+`Context.Provider` children, so ink rendered nothing. `switch_stmt.rs` now
+registers the consumed label like loops already did.
+
+Result: `render(<App/>)` with nested Boxes, `flexDirection` row/column,
+`padding`/`margin`/`width`/`justifyContent`, and `borderStyle` all lay out via
+taffy and emit positioned ANSI from a single native executable.
+
+Known remaining follow-up (separate, minor): `<Text dimColor>` renders as
+`[object Object]` (boolean style-modifier handling in ink's Text); `color=`
+works.
+
+## v0.5.1161 — fix(http): `server.ref()`/`server.unref()` return `this` instead of a raw number (#5011)
+
+Fixes #5011 — `server.ref()` and `server.unref()` on a `node:http`/`node:https`
+server returned the receiver **handle as a raw number** instead of the server
+object. Node returns `this`, so `http.createServer(cb).unref().listen(...)` broke
+under Perry with `TypeError: (number).listen is not a function`
+(`test-http-request-method-delete-payload.js` and friends).
+
+Root cause: `crates/perry-codegen/src/lower_call/native_table/http_server.rs` had
+no `ref`/`unref` rows for the `HttpServer`/`HttpsServer` class filters, so the
+calls fell through to a generic handler that yielded the handle as a number —
+the same shape `listen` had before #2129.
+
+Fix:
+- Added `ref`/`unref` `NativeModSig` rows (`ret: NR_PTR`) for both the http and
+  https server tables, routing to new runtime entry points.
+- New `js_node_http_server_ref`/`_unref` and `js_node_https_server_ref`/`_unref`
+  return the receiver handle (so `s.ref() === s`) and toggle a new `refed` flag
+  on `HttpServer`. `server_is_active` now ignores a listening-but-`unref()`ed
+  server, so the event loop can exit while the server is still bound (Node
+  semantics) — pending listen callbacks and queued requests still keep the loop
+  alive long enough to flush in-flight work.
+- Mirrored the methods in the `server: any` dynamic dispatcher
+  (`handle_dispatch.rs`) and registered the externs in `ext_registry.rs`,
+  `runtime_decls/stdlib_ffi.rs`, and the `force_link_http_server` anchor table.
+
+Verified: `typeof s.unref()` → `object`, `s.unref() === s` → `true`,
+`s.ref() === s` → `true`, `createServer(cb).unref().listen(...)` works, and a
+listening unref'd server lets the process exit (exit 0, no hang). 0 regressions
+in the http/https server surface.
+
+Not in scope (separate `(number).<method>` cases tracked under #4975):
+`new http.Agent().createConnection(...)` returning a number
+(`test-http-socket-encoding-error`) and `server.ALPNProtocols` not being a
+Buffer (`test-https-argument-of-creating`).
+
+## v0.5.1160 — fix(hir): `queueMicrotask`/`structuredClone`/`atob`/`btoa` as first-class function values (#5015)
+
+Fixes #5015 — react-reconciler 0.33 production build threw `TypeError: value is
+not a function` inside `updateContainerSync` on the first render, blocking every
+custom React renderer (ink, react-three-fiber, react-pdf, …).
+
+**Root cause.** Four callable global helpers — `queueMicrotask`,
+`structuredClone`, `atob`, `btoa` — were callable directly
+(`queueMicrotask(fn)` is picked off in `expr_call/globals.rs`) but were never
+added to `is_builtin_global_value_name` in `crates/perry-hir/src/analysis/builtins.rs`.
+So a bare *value* read — `const m = queueMicrotask`, or the object-literal
+property `{ scheduleMicrotask: queueMicrotask }` — fell through the ident
+lowering to the `GlobalGet(0)` sentinel and evaluated to the **number `0`**.
+`typeof` reported `"number"` and calling the stored value threw "value is not a
+function". (The companion `typeof`-of-bare-ident fold and the
+`globalThis.<name>` thunk table already covered these names; only the value-read
+list was missing them — a gap left over from #3986.)
+
+react-reconciler stores the host config's `scheduleMicrotask: queueMicrotask`
+into a module var and later invokes it from
+`scheduleImmediateRootScheduleTask` (reached via `updateContainerSync →
+updateContainerImpl → scheduleUpdateOnFiber → ensureRootIsScheduled`). The
+stored `0` was the non-callable the issue's backtrace pinpointed.
+
+**Fix.** Add the four names to `is_builtin_global_value_name` so a bare value
+read lowers to `PropertyGet { GlobalGet(0), <name> }`, resolving through the
+existing globalThis thunk (the same path `fetch`/`parseInt`/`eval` already use).
+This fixes both the bare value read and the object-literal property form, and
+is value-read-only — direct calls are unaffected. Regression test:
+`test-files/test_gap_global_fn_values_5015.ts` (byte-for-byte vs Node).
+
+**Follow-up wall (separate bug, not in this PR).** With this fix
+`updateContainerSync` succeeds; the minimal repro's subsequent `flushSyncWork()`
+now reaches `commitRoot`, where `flushPendingEffects` — a forward-referenced,
+hoisted sibling function declaration captured by `commitRoot` inside the
+huge `module.exports = function($$$config){…}` factory — reads back as
+`undefined` (a distinct closure-capture/box issue, independent of
+`queueMicrotask`: it reproduces with an arrow `scheduleMicrotask` too). To be
+filed as its own issue.
+
+## v0.5.1159 — security: fix path traversal / arbitrary file write in `perry publish` (GHSA-x55v-q459-68ch)
+
+Security release. `perry publish` trusted the build server's
+`ArtifactReady.artifact_name` and `download_path` verbatim when constructing
+the local destination path, allowing a malicious/compromised hub to write
+downloaded content outside the output directory (arbitrary file write) and, in
+the self-hosted-hub local-copy path, copy out arbitrary local files. All
+versions through v0.5.1158 are affected. Upgrade to v0.5.1159.
+
+- fix(publish): sanitize server-controlled artifact path (GHSA-x55v-q459-68ch) (#4989)
+
+## v0.5.1158 — release roll-up: stub-elimination epic tail, React render walls, http/cluster/streams parity
+
+Version-bump + changelog roll-up for the 16 commits that landed after the
+v0.5.1157 bump without per-commit metadata (maintainer-folds-at-merge PRs).
+No code changes in this commit itself.
+
+- feat(runtime): real AsyncLocalStorage + async_hooks context propagation (#788/#789) (#4967)
+- feat(runtime): real child_process spawn/exec ChildProcess handle semantics (#2130/#1934) (#4968)
+- feat(streams): BYOB readers + real ByteLengthQueuingStrategy accounting (#4915) (#4966)
+- feat(cluster): workers share a listening port — SO_REUSEPORT + IPC 'listening' round-trip (#4914) (#4963)
+- feat(diagnostics): real v8 heap snapshot from GC heap walk + inspector/repl honesty (#4916) (#4979)
+- fix(hir,codegen,runtime): clear the #4950 React render-time walls — JSX createElement mode, nested-fn branch-var hoisting, timer/AbortController values, surrogate-range regex classes (#4969)
+- fix(http): client write/end callbacks + backpressure, real client timeouts, dynamic listener registration (#4909) (#4964)
+- fix(http): wire res.write/res.end callbacks + backpressure boolean into static dispatch (#4909) (#4954)
+- fix(http): falsy ClientRequest method defaults to GET instead of throwing (#4970) (#4978)
+- fix(net,ext-http): tls.connect Node overloads + https idle-connection close path (#4971) (#4983)
+- fix(hir): lower inline `export default class` bodies — methods/fields survive (#4976) (#4981)
+- fix(hir): synthesized capture ctor on a derived class must call super() (#4972) (#4980)
+- fix(hir): self-named native member base no longer OOM-loops codegen (#4908) (#4955)
+- fix(compile): support package createRequire interop (#4960)
+- perf(runtime): optimize numeric array raw payload helpers (#4957)
+- test(codegen): unbreak typed_shape_descriptors after #4957 bulk-fill lowering (#4984)
+
+## v0.5.1157 — feat(atomics): real cross-agent `Atomics.wait`/`notify`/`waitAsync` over a shared SAB (#4913)
+
+Stage 2 of #4913 (Stage 1 — the honesty floor — landed in #4929). `Atomics.wait`,
+`Atomics.notify`, and `Atomics.waitAsync` were non-blocking fakes: `wait` always
+returned `"timed-out"`, `notify` always returned `0`, and `waitAsync` resolved
+`"timed-out"` immediately. They now block and wake for real across `perry/thread`
+agents.
+
+**Shared backing that actually aliases across threads.** The prerequisite was a
+`SharedArrayBuffer` whose bytes are visible from every agent. Previously every
+value crossing a `perry/thread` boundary was deep-copied (`SerializedValue`), so a
+SAB lost its sharing. Now:
+
+- `new SharedArrayBuffer(n)` allocates its `BufferHeader + data` block from the
+  global allocator (`crate::shared_sab`) — a stable, process-wide address that is
+  never freed (matching Perry's "buffers live for the life of the process" model)
+  and is therefore valid and writable from any OS thread.
+- A new `SerializedValue::SharedArrayBuffer { addr }` variant carries the SAB
+  **by reference** across the thread boundary instead of copying it; the receiving
+  agent re-registers the same address in its thread-local buffer / SAB tables, so
+  `new Int32Array(sab)` there aliases the exact same physical bytes (via the
+  existing #4103 view-meta backing path). The serializer recognises a SAB before
+  the `GcHeader` dispatch (buffers carry no `GcHeader`).
+
+**Futex park/wake (`crate::atomics_futex`).** A process-global wait table keyed by
+the **absolute physical byte address** of the atomic slot. Because a SAB aliases
+the same bytes on every agent, two agents viewing the same index compute the same
+key.
+
+- `Atomics.wait` re-checks the slot value and enqueues a waiter **atomically under
+  the table lock**, then parks the OS thread on a `Condvar` until a matching
+  `notify` or the timeout deadline — so a `notify` racing the call is never lost
+  (the agent either sees the changed value and returns `"not-equal"`, or parks and
+  is woken). Returns the real `"ok"` / `"not-equal"` / `"timed-out"`. A
+  `timeout === 0` poll still returns immediately; an `undefined`/`Infinity` timeout
+  blocks until notified.
+- `Atomics.notify` wakes up to `count` parked agents (default `undefined` →
+  `+Infinity` → all) and returns the **actual** number woken.
+- `Atomics.waitAsync` enqueues the waiter synchronously (atomic with the value
+  check, so the wake can't be missed), then resolves its promise from a background
+  thread — `"ok"` on notify, `"timed-out"` on the deadline — via the same
+  pending-result → event-loop path `spawn` uses.
+
+The `perry_stub_warn` / `PERRY_STRICT_STUBS` honesty gates added in #4929 are
+removed from these three ops — they are no longer lies.
+
+Caveat: only the `SharedArrayBuffer` itself shares across agents; a typed-array
+*view* captured directly into a thread closure still deep-copies (build the view
+per-agent from the shared SAB). The agent-coordinated test262 cases
+(`$262.agent`) remain out of scope.
+
+New: `crates/perry-runtime/src/shared_sab.rs`, `crates/perry-runtime/src/atomics_futex.rs`,
+`crates/perry/tests/issue_4913_atomics_cross_thread.rs`,
+`test-files/test_issue_4913_atomics_cross_thread.ts`.
+
+## v0.5.1156 — fix(fetch): send dynamically-built request headers (#4932)
+
+`fetch(url, { headers })` silently dropped **every** request header whenever the
+`headers` value was anything other than a plain object *literal* — a variable
+(`const h = {}; h["Authorization"] = ...; fetch(url, { headers: h })`), a spread
+literal (`{ ...h }`), or a call such as `Object.assign({}, h)` / `new Headers(h)`
+/ `JSON.parse(JSON.stringify(h))`. The literal form worked, so any library that
+builds its headers dynamically lost its auth header. Most visibly this broke the
+Stripe Node SDK's fetch HTTP client: it constructs headers via property
+assignment, so the `Authorization` header vanished and every call 401'd.
+
+**Root cause.** HIR lowering of `fetch(url, { ... })`
+(`crates/perry-hir/src/lower/expr_call/globals.rs`) only extracted the `headers`
+field when it was an object literal whose props were all plain (non-computed)
+string/ident keys, walking the AST into a `Vec<(String, Expr)>`. Any other shape
+fell through with an **empty** headers vector — codegen then built an empty
+object, stringified it to `{}`, and sent no headers. Spread props and computed
+keys inside an otherwise-literal `headers` object hit the same hole.
+
+**Fix.** `FetchWithOptions` gains a `headers_dynamic: Option<Box<Expr>>` field.
+Lowering now classifies the `headers` value: a literal with only plain
+string/ident keys keeps the existing static-extraction fast path; anything else
+(variable, spread literal, call, computed/getter prop) is captured whole in
+`headers_dynamic`. Codegen lowers that expression to a JSValue and
+`js_json_stringify`s it at runtime — exactly the path object literals already
+took — so a property-assigned object enumerates its own properties identically
+to a literal. The JS and WASM backends were updated to match.
+
+Verified against a local echo server: dynamic / literal / spread /
+`Object.assign` / copy-loop / `JSON.parse(JSON.stringify(...))` headers all send
+the `Authorization` header now; an empty `{}` and no-options `fetch` are
+unchanged. New regression test
+`crates/perry-hir/tests/fetch_dynamic_headers_lowering.rs`. Note: passing the
+*entire* options object as a variable (`fetch(url, opts)`) is a separate,
+pre-existing gap (it still falls back to a bare GET) and is out of scope here.
+
+## v0.5.1155 — chore(runtime): split date.rs under the 2,000-line CI cap
+
+`crates/perry-runtime/src/date.rs` had grown to 2008 lines (pushed over by the
+Temporal tail work in #4923), tripping `scripts/check_file_size.sh` and failing
+the required `lint` gate on **every** open PR (the check runs against each PR's
+merge with current `main`).
+
+Extracted the date-string parsing cluster — `parse_date_string` and its
+per-grammar helpers (`parse_iso8601`, `parse_rfc_or_named`, `parse_tz_offset`,
+`normalize_millis`, `month_from_name`, `FULL_MONTHS`) — into a new
+`crates/perry-runtime/src/date/parse.rs` submodule (Rust 2018 keeps `date.rs`
+alongside `date/parse.rs`, no rename). `date.rs` declares `mod parse;` and
+re-exports the single entry point with `use parse::parse_date_string;`; the
+per-grammar helpers stay private to the submodule. Shared time math
+(`make_utc_ms`, `time_clip`, `timestamp_to_local_components`) stays in the parent
+and is reached via `super::` (a child module can see its ancestor's private
+items, so no visibility was widened beyond `parse_date_string`).
+
+No behavior change — pure code movement. `date.rs` is now 1675 lines,
+`date/parse.rs` 347; the date tests (incl. the `parse_date_string` cases) pass.
+
+## v0.5.1154 — feat(ui-windows-winui): real Windows App SDK bootstrap probe (#4680 step 2)
+
+**WinUI 3 backend, step 2 of 6.** `--target windows-winui` already builds, links,
+and runs (the `perry-ui-windows-winui` crate re-exports the Win32 backend and
+shares its Fluent DWM chrome — Mica, rounded corners, theme-aware title bar). The
+one piece that was still a no-op lie was the Windows App SDK bootstrap:
+`winui::bootstrap::initialize()` unconditionally returned `Ready` whether or not
+the runtime existed. This turns it into a real runtime probe.
+
+`crates/perry-ui-windows-winui/src/winui.rs` now resolves the bootstrapper at
+**runtime via dynamic loading** — `LoadLibraryW("Microsoft.WindowsAppRuntime.Bootstrap.dll")`
++ `GetProcAddress` — and calls `MddBootstrapInitialize2` (falling back to
+`MddBootstrapInitialize` on older SDKs). `S_OK` → `InitStatus::Ready`; a missing
+DLL, missing entry points, or any failure HRESULT → `InitStatus::RuntimeMissing`,
+so the caller falls back to Win32 instead of crashing.
+
+Dynamic loading (not a link-time import of `Microsoft.WindowsAppRuntime.Bootstrap.lib`)
+is deliberate: it preserves Perry's single self-contained `.exe` model. A
+`windows-winui` binary starts on a host *without* the Windows App SDK and degrades
+to the Win32 path, rather than failing to load against an unresolved import. No new
+cargo dependency is added — the bootstrapper is bound with raw `extern "system"`
+declarations against `kernel32`, mirroring the existing `dwm.rs`/`crash_handler`
+FFI style.
+
+Details:
+- Result is memoized in an `AtomicU8` (the runtime is process-wide and initialized
+  at most once); repeated `initialize()` calls are cheap and stable.
+- Target SDK release defaults to 1.6, overridable at runtime with
+  `PERRY_WINAPPSDK_VERSION="major.minor"` so a host with a different SDK can be
+  targeted without a rebuild.
+- `PACKAGE_VERSION` is passed as a by-value `u64` (ABI-identical to the single-`UINT64`
+  union on x64); `versionTag` empty (stable channel); `minVersion` 0 (any installed
+  framework at/above the requested major.minor).
+- Off Windows the probe is a compile-time `RuntimeMissing` (the crate still builds
+  everywhere for host tooling).
+- Tests: `initialize()` is total (never panics) and idempotent on any host; off
+  Windows it must report `RuntimeMissing`. The `RuntimeMissing` path is fully
+  covered on a host without the SDK; the success path runs only where the runtime
+  is installed.
+
+Step 3 (the XAML widget mapping) consults this probe before constructing any
+`Microsoft.UI.Xaml` object; that work is still ahead. Win32 (`--target windows`)
+remains the default and is unaffected.
+
+## v0.5.1153 — fix: keep `js_promise_report_unhandled_rejections` alive through auto-optimize LTO (#4876)
+
+**Regression fix (v0.5.1151 → all native links broken).** Codegen emits an
+unconditional call to `js_promise_report_unhandled_rejections` in the generated
+`_main` (the program-end unhandled-rejection hook from the #4838/#4852 readable
+unhandled-rejection work), but the runtime symbol was being dropped by the
+auto-optimize whole-program-bitcode internalize+dead-strip pass. The function is
+`#[no_mangle] pub extern "C"` and reachable only from generated `.o`, so without a
+`#[used]` anchor LTO internalized and stripped it — every native link
+(`aarch64-apple-{darwin,ios,tvos}`, `x86_64-unknown-linux-gnu`) failed with
+`undefined symbol: js_promise_report_unhandled_rejections`. (Android linked because
+it doesn't go through the same auto-optimize bitcode path.)
+
+- **Fix**: added a `#[used] static KEEP_PROMISE_REPORT_UNHANDLED_REJECTIONS` anchor in
+  `crates/perry-runtime/src/promise/then.rs`, matching the existing keepalive pattern
+  used for codegen-only FFIs in `error.rs` and `promise/combinators.rs`.
+- **Validation**: built perry + runtime/stdlib, cleared `.perry-cache`, compiled a
+  minimal program with an unhandled `Promise.reject` — the auto-optimize path
+  (rebuilds runtime+stdlib with LTO) now links cleanly and prints
+  `Uncaught (in promise) Error: boom` with exit code 1.
+
+## v0.5.1152 — install.sh download/extraction progress + per-distro Linux toolchain docs (#4869)
+
+External contribution from @nglmercer, with a maintainer fixup at review time:
+
+- **`packaging/install.sh` progress indicators**: `curl --progress-bar` on interactive
+  terminals (detected via `[ -t 2 ]`; piped/CI runs keep the old silent `-fsS` behavior),
+  `pv`-based pipe-through extraction progress when `pv` is installed, and a
+  `Done in Xs (size)` summary after download. `set -e` tightened to `set -eu`.
+- **Maintainer fixup (610db903f)**: kept `-f` on the interactive download — without it,
+  HTTP errors (transient 5xx, proxy interception) write the error body into
+  `perry.tar.gz` and exit 0, surfacing later as a confusing tar/gzip failure. Also
+  restored the release-probe comments (why the script probes recent tags instead of
+  `releases/latest`, and the multi-hop `%{http_code}` parsing).
+- **Per-distro Linux C-toolchain docs**: install commands for Arch/Manjaro/CachyOS,
+  Fedora/RHEL, openSUSE, Alpine, and Void Linux in `README.md` and
+  `docs/src/getting-started/installation.md` (previously only Debian/Ubuntu and Alpine).
+
+Also rolled up in this version: dependabot bumps #4864 (cargo minor/patch group) and
+#4865 (indicatif 0.17.11 → 0.18.4).
+
+## v0.5.1151 — release pipeline green: Android/Windows platform builds, dense-array growth hang, perf gate re-armed
+
+Release-infrastructure release. v0.5.1150 shipped with 5 of 19 platform build jobs red
+(publish steps skipped) and a Regression Check that had been hanging at the 6h timeout
+on every run since v0.5.1129. This release makes the full matrix green and the gates real:
+
+- **Android builds** (both arches): E0597 borrow-lifetime error in
+  `perry-ui-android/src/drag_drop.rs` (if-let tail-expression temporary outliving `jstr`).
+- **Windows builds**: `windows-core` direct dep for `#[implement]` COM authoring landed in
+  #4837 just after the v0.5.1150 tag; first release to actually ship it.
+- **Dense-array growth hang** (PR #4857): #4648's absolute 1M dense cap routed sequential
+  10M-element fills through string-keyed sparse properties (linear-scan Vec per insert →
+  quadratic → `03_array_write` ran 6h instead of ~3s, cancelling every Regression Check).
+  Sparse storage is now gated on the gap the write creates (`index − length > 1024`) in
+  addition to absolute size; sequential growth stays dense at any size. Reads consult
+  sparse storage only past capacity, keeping the dense hot path call-free.
+- **Performance gate was vacuous since ≤ v0.5.1122**: `compare.sh` resolved `--json-out`
+  after `cd benchmarks/suite`, so `current.json` was never written; the comparison crashed
+  and `| tee` (no pipefail) swallowed the exit — release-mode "hard-fail" gates passed
+  without comparing anything. Fixed (absolute path + pipefail + `timeout-minutes: 100`)
+  and `benchmarks/baseline.json` refreshed from a current green run.
+- **Binary-size baseline** refreshed to v0.5.1150 sizes (libperry_runtime +34.8% over the
+  v0.5.1122→1150 parity push; 317 commits, verified organic growth).
+
+Known issue found en route (not fixed here): `date::tests::test_full_year_setters_revive_invalid_date_only`
+fails under non-UTC local timezones (CI is UTC; local CEST repro) — local-time revive of an
+invalid Date via setFullYear returns NaN.
+
 # Changelog
 
 Detailed changelog for Perry. See CLAUDE.md for concise summaries.
+
+## v0.5.1150 — Fully-static musl Linux target + async tail-return promise adoption
+
+Release-sync bump folding in two changes that landed on `main` after the v0.5.1149
+changelog entry:
+
+- **feat(linux): fully-static musl target** (`--libc musl` / `[linux] libc`) (#4834) —
+  produce fully-static Linux executables against musl.
+- **fix(runtime): adopt returned promise state on async tail-return** (#4832) — an
+  `async` function that tail-returns a promise now adopts that promise's eventual
+  state instead of resolving to the promise object itself.
+
+## v0.5.1149 — Honor `dangerouslySetInnerHTML` in hono/jsx rendering (#4827)
+
+Perry's built-in JSX server renderer (`crates/perry-runtime/src/jsx.rs`, which
+`hono/jsx`'s `jsx`/`jsxs` thunks forward into) treated the React/hono special
+prop `dangerouslySetInnerHTML={{ __html }}` as an ordinary attribute. The
+attribute-serialization loop in `render_props_attrs` stringified its object
+value via the canonical stringifier, producing `[object Object]`, so
+`<div dangerouslySetInnerHTML={{ __html: "<b>hi</b>" }} />` rendered as
+`<div dangerouslySetInnerHTML="[object Object]"></div>` and the raw HTML (e.g.
+`<style dangerouslySetInnerHTML={{ __html: baseCss }} />`) was dropped entirely.
+
+Fix: match upstream hono/jsx (and React) semantics. A new `dangerous_inner_html`
+helper reads the prop's `__html` field; when present, `dispatch` splices that
+string as the element's inner content **unescaped** in place of normal
+`children`, and forces a normal (non-void) element so the raw HTML has a body
+even when the source used a self-closing tag (`<div .../>` → `<div>...</div>`).
+`render_props_attrs` now skips the `dangerouslySetInnerHTML` key so it is never
+emitted as an attribute. Void elements without the prop (e.g. `<br />`) and
+ordinary text/attribute escaping are unchanged.
+
+## v0.5.1147 — Wire the fancy-regex fallback through every RegExp operation (#4797)
+
+`fancy-regex` (lookbehind, lookahead, backreferences, named groups) was already
+a dependency with a partial fallback in `crates/perry-runtime/src/regex.rs`, but
+the fallback was only consulted by `test`, `exec`, `match`, and the
+callback form of `replace`. For any pattern the `regex` crate can't compile,
+`get_or_compile_regex` stores a never-match `[^\s\S]` placeholder in the
+`RegExpHeader` and stashes the real engine in `FANCY_CACHE`; operations that
+read `regex_ptr` directly therefore silently returned no-match results. This
+finishes the integration so a lookbehind/backreference pattern behaves the same
+as in V8/Node across the whole `String.prototype`/`RegExp.prototype` surface.
+
+Changes (all in `regex.rs` / `regex/match_all.rs`):
+
+- **`String.prototype.search`** — fancy fallback via `fre.find` (was always -1).
+- **`String.prototype.split`** — `fancy_regex` has no `split`, so walk
+  non-overlapping matches and slice between them, mirroring the `regex` crate's
+  split semantics (delimiter dropped, captured groups not spliced — unchanged
+  from the standard path). Zero-width lookbehind splits (`"a1b2c3".split(/(?<=\d)/)`
+  → `["a1","b2","c3",""]`) now work.
+- **`String.prototype.replace`/`replaceAll` (string replacement)** — new
+  `replace_regex_str_fancy` drives the match loop with `fancy_regex` and a
+  `fancy_regex`-typed twin of `expand_js_replacement`, so `$1`/`$<name>`/`$&`/
+  `` $` ``/`$'`/`$$` substitution works under lookbehind/backreferences. The
+  `$<name>` (`js_string_replace_regex_named`) path routes through it too.
+- **Named-capture `groups`** now come through the fallback for `match`
+  (non-global), `exec`, and `matchAll` via a shared `build_fancy_groups`
+  helper (fancy-regex exposes `capture_names()` just like the `regex` crate);
+  previously the fancy branches hard-coded `groups = undefined`.
+- **`String.prototype.matchAll`** — fancy branch in
+  `materialize_match_all_results` (was an empty iterator for fancy patterns).
+
+Zero regressions on the fast `regex`-crate path: simple patterns never enter
+the fallback (it's gated on the `regex` crate failing to compile), and all
+prior regex unit tests pass alongside six new fancy-path tests.
+
+Not in scope (tracked separately under #4797's umbrella): the `v` flag's
+set-notation matching (`[[...]]`, `\q{}`) — fancy-regex shares the `regex`
+crate's class syntax and can't express nested set operations — and the `d`-flag
+indices array, which is not built on the standard path either.
+
+## v0.5.1146 — Default Windows output extension by type (#4771)
+
+On Windows, `perry compile .\src\main.ts -o main` produced an extension-less
+file named `main`, which PowerShell / cmd won't launch (`.\main` fails). The
+`.exe` default previously only applied when `-o` was omitted entirely.
+
+- When the user passes `-o NAME` **without** an extension on a Windows target,
+  the extension now defaults to the target-appropriate one: executable →
+  `.exe`, shared library (`--output-type dylib`) → `.dll`, static library
+  (`--output-type staticlib`) → `.lib`. An explicit extension is respected
+  verbatim (`-o app.appx` stays `app.appx`). Non-Windows targets keep the bare
+  name — Unix executables are conventionally extension-less, so nothing changes
+  there.
+- New `windows_default_output_extension(is_dylib, is_staticlib)` helper in
+  `library_search.rs`, applied at the `exe_path` computation in `compile.rs`
+  when `args.output` is `Some` and has no extension. The no-`-o` default path
+  was refactored into a `default_output_path()` free fn (behavior unchanged).
+- New unit test `windows_output_extension_defaults_by_type`.
+
+Merge note: rebased over the `windows-winui` target work (#4681 series); the
+new Windows-detection branches treat `windows-winui` like `windows`, matching
+the rest of `compile.rs`.
+
+## v0.5.1145 — Win32 Fluent polish: Mica-by-default + WM_DPICHANGED relayout (#4681)
+
+Continues the #4681 Win32/GDI modernization (after #4682 default DWM chrome and
+#4683 comctl32 v6 themed controls). Three remaining items land here:
+
+- **Mica backdrop by default.** `dwm::apply_default_window_chrome` now also
+  requests `DWMWA_SYSTEMBACKDROP_TYPE = DWMSBT_MAINWINDOW` (Mica) at window
+  creation, alongside the existing rounded corners + theme-aware title bar. On
+  Windows 11 22H2+ the DWM-drawn non-client frame (title bar) picks up the Mica
+  material; older systems reject the attribute (`E_INVALIDARG`) and silently
+  ignore it, same as the corner-preference attribute. This deliberately does
+  **not** make the client area transparent — Perry still paints an opaque client
+  background via the class brush / `WM_ERASEBKGND` root-background path — so it
+  cannot reintroduce the #1542 "black area after resize" regression. Full
+  client-area Mica/Acrylic blur-through (which extends the frame and clears the
+  client) remains the explicit `app.setVibrancy(...)` opt-in.
+
+- **Per-monitor-v2 DPI: `WM_DPICHANGED` handling.** The main window proc now
+  handles `WM_DPICHANGED` (0x02E0): it honors the OS-suggested, DPI-scaled window
+  rect via `SetWindowPos` and relayouts the root (mirroring `WM_SIZE`) instead of
+  letting `DefWindowProc` bitmap-stretch. Windows now stay crisp when dragged
+  between monitors with mixed scaling. DPI awareness was already opted into at
+  startup (`dpi_compat::set_process_dpi_awareness_compat`, per-monitor-v2 →
+  v1 → system fallback chain); this closes the runtime side.
+
+- **Doc accuracy.** Refreshed the stale `geisterhand_style.rs` caveat that
+  described `set_opacity` / `set_border_*` / shadow as "stub-with-state". Those
+  apply paths are real now (layered window, `WM_PAINT` border subclass,
+  `SetWindowRgn` corner clip, parent shadow-paint subclass); #210 and #230 are
+  closed.
+
+## v0.5.1144 — `new <imported-function>()` runs the constructor body (zod v4 checks; #4698)
+
+`new F(args)` where `F` is a **function (or a `const`/`let` holding a closure
+value) imported from another module** silently produced an empty object — the
+constructor body never ran, so `this.x = …` and `Object.defineProperty(this,
+…)` writes were lost. This is the zod-v4 `TypeError: Cannot read properties of
+undefined (reading 'onattach')` crash (#4698): every string/number schema with
+a check (`.min`, `.max`, `.length`, `.regex`, numeric `.gt`/`.lt`, …) builds its
+`$ZodCheckMinLength`-style check via `new checks.$ZodCheckMinLength(def)` across
+the `core/checks.ts` → `core/api.ts` module boundary, and the check instance came
+back with its non-enumerable `_zod` property (and everything else) gone because
+the constructor body was skipped.
+
+Root cause was two gaps; an imported binding that isn't a registered class fell
+through to an empty-object placeholder instead of the `js_new_function_construct`
+helper that binds `this`, runs the body, and returns the populated instance. The
+fix lives entirely in codegen — at HIR-lowering time an imported class and an
+imported function are indistinguishable (both unknown to `lookup_class`), and the
+cross-module class-inline machinery in `collect_modules` relies on
+`new <ImportedClass>()` staying as `Expr::New { class_name }`, so HIR must not
+reroute it:
+
+- **Codegen (`lower_call/new.rs`)** — bare `new <importedFn>()` (`import { Fn }
+  from "./m"`). When `lower_new` finds no class for the name but the name
+  resolves to an imported binding (`import_function_prefixes`, excluding
+  V8-fallback specifiers), it now lowers the name as an `ExternFuncRef` value and
+  constructs via `js_new_function_construct` instead of returning the empty
+  placeholder. Imported classes are registered in `ctx.classes` and take the
+  construction path, so they never reach this fallback (the
+  `dependency_is_transformed_before_importer_for_cross_module_inline` test
+  guards this).
+- **Codegen (`expr/v8_interop.rs::try_static_class_name` + `expr/new_dynamic.rs`)**
+  — `new ns.Foo()` over a namespace import (zod's actual path: `new
+  checks.$ZodCheckMinLength(def)`, where `checks` is `import * as`). It now only
+  takes the class-construction path when `Foo` actually names a known class; a
+  closure-valued `const` export falls through to the NewDynamic
+  function-construct route (`ExternFuncRef` added to its callee set). Real
+  namespace-imported classes (in `ctx.classes`) and re-exported builtins
+  (intercepted by `js_new_function_construct`'s global thunks) are unaffected.
+
+The exact repro `z.string().min(2).parse("hello")` now prints `hello`; `.max` /
+`.length` / `.regex` / numeric `.gt` / `.lt` and nested object schemas with
+checks all match Node byte-for-byte. The `safeParse` error-path / `.email()`
+error-formatting failures noted in #4698 are a separate, still-open issue. Refs
+#793.
+
+## v0.5.1143 — Class destructuring (dstr) + default-parameter parity (test262)
+
+Brought `language/{statements,expressions}/class/dstr` from 512→664 passing (41.6%→53.9%) with **zero regressions**, and lifted the wider `built-ins`+`language` sweep by ~6–9% per shard (0 regressions across sampled shards). These are method/constructor/accessor parameter-destructuring tests across plain, generator, async-generator, static, and private class methods.
+
+Root causes fixed:
+
+- **Array binding patterns now use the iterator protocol.** `lower_pattern_binding` lowered `let [a, b] = x` (and every method/param destructuring) to raw index reads (`x[0]`, `x[1]`), so it never invoked `Symbol.iterator`, never closed the iterator, mishandled holes/rest, and couldn't destructure non-array iterables. Rewrote the `Pat::Array` arm to emit `GetIterator` → `IteratorStep`/`IteratorValue` per element, draining a rest element via the new `js_iterator_rest_to_array`, advancing the iterator for elisions, and performing `IteratorClose` on both normal completion (when not exhausted) and any abrupt completion from a default initializer or nested pattern. Destructuring defaults now use a strict `=== undefined` check (a genuine `NaN` element no longer triggers the default).
+- **Object binding patterns enforce `RequireObjectCoercible`.** New `js_require_object_coercible` throws a `TypeError` for a `null`/`undefined` source even for an empty pattern `{}`, before any property read.
+- **Static-method calls now pad omitted arguments with `undefined`.** `Expr::StaticMethodCall` (non-rest path) forwarded only the supplied args, so a static method called with fewer args than declared read uninitialized parameter slots; `static f(a = 1)` returned `0` and `static m([x] = [])` threw. It now pads to the declared arity.
+- **Private methods emit their default-parameter prologue.** `lower_private_method` computed `param.default` but never called `build_default_param_stmts`, so `#m(a = 1)` silently dropped the default.
+- **Method-as-value calls pad omitted arguments with `undefined`.** `call_vtable_method` padded missing args with a bare IEEE `NaN`; that path is reached without call-site padding when a method is invoked as a value (`const f = obj.m; f()`, or a `get m(){ return this.#m }` accessor exposing a private method), so a defaulted/destructuring param never saw `undefined`. It now pads with `undefined`.
+
+Files: `crates/perry-hir/src/destructuring/pattern_binding.rs`, `crates/perry-hir/src/lower_decl/private_members.rs`, `crates/perry-codegen/src/expr/static_method.rs`, `crates/perry-codegen/src/lower_call/native/mod.rs`, `crates/perry-codegen/src/runtime_decls/{arrays,objects}.rs`, `crates/perry-runtime/src/array/iterator.rs`, `crates/perry-runtime/src/object/{class_registry,has_own_helpers}.rs`.
+
+## v0.5.1142 — @hono/node-server `c.req.text()`/`.json()`/`.formData()` work on POST/PUT
+
+Fixes `TypeError: text is not a function` (and `formData is not a function`) on
+every body-reading route of a Perry-compiled Hono app served by
+`@hono/node-server`. GET/HEAD were unaffected; any POST/PUT handler that read the
+body 500'd. Root cause spans three layers.
+
+**1. Parent registration dropped for `var X = class extends <alias> {}`.** The
+`var C = class {…}` fast path in `perry-hir/src/lower/stmt.rs` lowered the class
+to a bare `ClassRef` and — unlike the general class-expression arm
+(`lower_expr.rs`) and the `Decl::Class` arms — never emitted
+`RegisterClassParentDynamic`. node-server's `var Request = class extends
+GlobalRequest {}` (with `GlobalRequest = global.Request`) therefore never
+registered its fetch-builtin parent, so the constructed subclass instance got no
+underlying native fetch handle, `instanceof Request` was false, and all
+inherited body methods were missing. The fast path now emits the dynamic parent
+registration in source order (where the alias still resolves), matching the
+other class-lowering paths.
+
+**2. `super()` could not see the aliased parent.** `js_fetch_or_value_super`
+identified the parent kind solely from the runtime parent VALUE, which for an
+aliased module-var parent re-lowered to `undefined` at super-call time. It now
+falls back to the fetch-parent kind registered against the instance's class id
+(captured at module init), so the native handle attaches regardless of how the
+`extends` expression resolves at the call site.
+
+**3. Body methods were not readable, and a streamed body was not read.** Reading
+a body method as a value — `r.text` or the computed `r["text"]` that
+`@hono/node-server` uses (`this[getRequestCache]()[k]()`) — on a fetch-subclass
+returned `undefined` (the handle id was dereferenced as an `ObjectHeader`). It
+now returns a bound method that re-dispatches through the native handle. The
+`Request` thunk drains a `ReadableStream` body via the existing
+`js_response_body_init_ptr` (instead of stringifying the stream handle to its
+numeric id), and Perry's `node:http` `IncomingMessage` now exposes `rawBody`
+(the already-collected body `Buffer`). With `rawBody` present, node-server takes
+its synchronous body path and avoids the data-less `Readable.toWeb(incoming)`
+stub (the #1540 Node↔WHATWG stream-forwarding gap).
+
+Result: `c.req.text()` / `.json()` / `.formData()` return the real request body
+on POST/PUT, GET is unaffected, and a 50-POST burst is stable. Regression test:
+`tests/test_request_subclass_stream_body.sh`.
+
+## v0.5.1141 — Node streams honor `emitClose` / `autoDestroy` close-lifecycle options
+
+`new Readable/Writable/Duplex({ emitClose: false })` now suppresses the `'close'`
+event on `destroy()` (previously it fired regardless), and `autoDestroy: false`
+is honored, matching Node's stream close lifecycle. Verified:
+`Readable({ emitClose: false })` → close listener does **not** fire on
+`destroy()`, while the default (`emitClose: true`) still fires it. Option keys
+are read from the constructor options and stored as hidden stream state
+(`node_stream_keys.rs` / `node_stream_constructors.rs` / `node_stream_readwrite.rs`
+/ `node_stream_destroy_state.rs`); covered by new `node_stream_tests_extra.rs`
+unit tests.
+
+## v0.5.1140 — `http`/`https` Agent drops the bogus `close` method (matches Node)
+
+Node's `http.Agent`/`https.Agent` has no `close()` method — only `destroy()`.
+Perry previously bound `agent.close` as a chainable no-op, so `typeof
+agent.close` was `"function"` instead of Node's `"undefined"`. `close` is now
+removed from the Agent method/property surface (`expr_member.rs`,
+`common/dispatch.rs`, `http/agent_dispatch.rs`, `agent.rs`, the http-client
+native table, and `http.rs`), so a bare read of `agent.close` is `undefined`
+while `destroy`/`getName`/`keepSocketAlive`/`reuseSocket` keep working. The PR's
+`js_ext_http_agent_dispatch_method` had already landed on `main` via another
+change; the duplicate was reconciled (kept the `close`-free version). Adds
+`node-suite/https/surface/agent-method-values.ts`.
+
+## v0.5.1139 — spec `.length` for legacy/global function values (e.g. `parseInt.length`)
+
+Adds `builtin_global_function_length`, giving bare global function *values* their
+spec-defined `.length` when read or borrowed (`parseInt.length` was `0`, now `2`;
+also covers `structuredClone`/`setTimeout`/`setInterval` → 2 and the
+1-arg globals `eval`/`fetch`/`atob`/`btoa`/`clearTimeout`/`clearInterval`/
+`setImmediate`/`clearImmediate`/`queueMicrotask`/`parseFloat`/`isNaN`/`isFinite`/
+`encodeURI`/`decodeURI`/`encodeURIComponent`/`decodeURIComponent`/`escape`/
+`unescape` → 1). Wired through `name_fold.rs` and the `.length` member resolver in
+`expr_member.rs`. (Originally #4511's legacy-escape + `global`-alias work, but
+those already landed on `main` independently — this is the residual net-new
+`.length` slice; the conflicting duplicate `escape`/`unescape` runtime impl and
+`global` reclassification were dropped in favor of main's.) Adds
+`node-suite/globals/legacy-escape-global.ts`.
+
+## v0.5.1138 — Promise static methods preserve receiver brand checks when borrowed
+
+Part of #4521. Borrowed `Promise` statics (`Promise.resolve`/`reject`/`all`/
+`race`/`allSettled`/`any` via `.call`/`.apply`/`.bind` or detached value reads)
+now keep their receiver-sensitive behavior: invoked on a non-`Promise` `this`
+(or detached) they throw a `TypeError`, while `Promise.resolve.call(Promise, x)`
+still works. `Promise` joins the reified-builtin-static-value set in
+`expr_member.rs` (alongside main's `Array`/`Number`) so the value read resolves
+to the real native function object, and new `js_promise_static_function_value`
+runtime thunks brand-check `this` against the Promise constructor. Verified
+against the parity fixture: detached/object receivers `throw:TypeError`,
+proper-receiver calls fulfil/reject as expected. Adds
+`node-suite/globals/promise-static-brand-checks.ts`.
+
+## v0.5.1137 — generic `Array.prototype.reverse` over array-like receivers
+
+`Array.prototype.reverse.call(arrayLike)` (and bound/`.apply` forms) now
+reverses a generic array-like receiver in place and returns the *same*
+receiver, instead of falling through to the array-only member-call path. A
+dedicated `Expr::ArrayReverseValue` HIR variant lowers to a new
+`js_array_reverse_value` runtime helper (wired through the codegen collectors,
+JS emitter, stable-hash, and HIR walkers). Routed beside the `fill` /
+`copyWithin` generic mutators in `try_arraylike_receiver_method`. Verified:
+`{length:3,0:'a',1:'b',2:'c'}` → `c b a` (same receiver identity);
+`[1,2,3,4].reverse()` → `[4,3,2,1]`. Adds
+`node-suite/globals/array-generic-reverse.ts`.
+
+## v0.5.1136 — generic `Array.prototype.fill` over array-like receivers
+
+`Array.prototype.fill.call(arrayLike, …)` (and bound/`.apply` forms) now mutates
+a generic array-like receiver in place instead of falling through to the
+member-call path that only handled real arrays. A dedicated
+`js_array_fill_generic` runtime helper writes back to the *original* receiver
+(rather than a materialized clone), wired through a new `array`/`fill_generic`
+`NativeMethodCall` lowering in `try_arraylike_receiver_method` — sitting beside
+the existing generic `copyWithin` mutator and the #4597 read-only generic
+engine. Plain objects with a `length` + indexed keys, and real arrays, both fill
+correctly (`{length:3,0:'a',1:'b',2:'c'}` → `a x x`; `[1,2,3,4].fill(9,1,3)` →
+`[1,9,9,4]`). Adds `node-suite/globals/array-generic-fill.ts`.
+
+## v0.5.1135 — `net.Socket` instanceof for native handles + explicit Tokio runtimes
+
+Registers the ext-net socket-handle probe so dynamic/static `instanceof
+net.Socket` (and the `net.Stream` alias) recognize native socket handles, so
+`new net.Stream() instanceof net.Socket` matches Node while preserving
+`net.Stream === net.Socket`. Socket `connect` and server `listen` futures now
+run on explicit current-thread Tokio runtimes instead of relying on an ambient
+reactor handle, stabilizing the net reactor paths. Touches
+`perry-ext-net/src/lib.rs`, `perry-runtime/src/object/instanceof.rs`, and
+`perry-codegen/src/expr/instance_misc1.rs`.
+
+## v0.5.1134 — external `node:zlib` Transform stream handles (write/end/on/pipe/reset…)
+
+Part of #800. External `node:zlib` stream handles now expose callable
+Transform-style method properties (`write`, `end`, `on`, `pipe`, `close`,
+`destroy`, `params`, `reset`), add `reset()` support, and report Node-like
+`bytesWritten` timing for queued stream writes. The external zlib stream pump is
+drained whenever `external-zlib-pump` is enabled (including no-auto node-suite
+builds that keep the full stdlib), and `run_parity_tests.sh` now builds
+`perry-ext-zlib` + the stdlib zlib pump bridge for no-auto zlib parity runs so
+stream fixtures exercise the same external archive path. Complementary to #4506
+(async one-shot callback validation); no overlap.
+
+## v0.5.1133 — zlib async one-shot helpers validate their callback synchronously
+
+Node throws synchronously (`ERR_INVALID_ARG_TYPE`) when an async one-shot zlib
+helper (`gzip`/`gunzip`/`brotliCompress`/`brotliDecompress`/… `(data, cb)`) is
+called without a callable callback, *before* any codec work is queued. Perry's
+ext-zlib path previously coerced a missing/invalid callback to a null pointer
+and silently dropped the result. It now calls a new
+`js_zlib_validate_callback` runtime shim (delegating to the shared
+`fs::validate::validate_required_callback`) at the top of
+`queue_one_shot_callback`, so the throw happens up front and matches Node. The
+old ad-hoc `callback_ptr` helper is removed in favor of the validated handle.
+
+## v0.5.1132 — WebCrypto `algorithm.length` for KMAC128/KMAC256, not ChaCha20-Poly1305
+
+Aligns the `CryptoKey.algorithm.length` surface with WebCrypto/Node:
+`crypto_key_algorithm_has_length` now reports a `length` member for the KMAC128
+(tag `23`) and KMAC256 (tag `24`) key algorithms and stops reporting one for
+ChaCha20-Poly1305 (tag `22`, a fixed-256-bit AEAD whose algorithm dictionary has
+no `length`). One-line table fix in
+`crates/perry-runtime/src/object/field_get_set.rs`.
+
+## v0.5.1131 — async-from-sync iterator adapter (`for await` over sync iterables)
+
+Closes #4520. `for await...of` over a *synchronous* iterable that yields
+promises now unwraps each yielded promise instead of materializing the sync
+iterable up front and awaiting the raw values.
+
+A runtime async-from-sync iterator wrapper (`crates/perry-runtime/src/array/iterator.rs`)
+implements `next`/`return`/`throw`/`[Symbol.asyncIterator]` with full argument
+forwarding, missing-`return`/missing-`throw` handling, sync-call rejection, and
+close-on-rejected-value semantics. Dynamic `for await...of` lowering now routes
+through `js_get_async_iterator` rather than eagerly draining sync iterables, and
+`Array.fromAsync` wraps sync iterables so promise-valued sync yields are
+unwrapped while async-generator inputs stay on the async path. Parity coverage
+added under `node-suite/globals/async-from-sync-iterator.ts` (for-await, early
+close, destructuring, `Array.fromAsync`, rejected promise values, malformed
+iterator results). Async-generator `yield*` delegation keeps its separate
+transform path and is out of scope here.
+
+## v0.5.1130 — subclassing native `Request`/`Response` exposes working body methods
+
+Subclassing the native global `Request` (or `Response`) produced instances that
+were missing the body-reading methods (`text`/`json`/`arrayBuffer`/`blob`/
+`formData`/`bytes`) and the inherited property getters, and `sub instanceof
+Request` was `false`. This broke `@hono/node-server`, which does
+`class Request extends GlobalRequest { ... }` — every `c.req.text()` /
+`c.req.json()` on a POST/PUT route threw, turning webhooks and form posts into
+500s.
+
+**Root cause.** A Web-Fetch `Request`/`Response` in Perry is not a heap JS
+object — it is a native registry handle (a small id NaN-boxed as a pointer)
+whose methods are resolved by native handle dispatch, not via a JS prototype
+chain. `class X extends Request {}` + `new X(...)` produced an ordinary heap JS
+object with no link to any native handle: property/method lookup walked the JS
+prototype chain, found nothing (the body methods live in native dispatch, not on
+`Request.prototype`), and returned `undefined`.
+
+**Fix.** `super(input, init)` on a `Request`/`Response` parent now allocates the
+underlying native handle and stashes its id on `this` under the hidden field
+`__perry_fetch_handle__` (mirrors the Web-Streams `__perry_stream_handle__`
+mechanism from #562). Both the explicit-constructor path (`Expr::SuperCall`,
+`expr/this_super_call.rs`) and the implicit default-constructor path
+(`lower_call/new.rs`, parallel to the node-stream `*_subclass_init` hooks) are
+wired, via two new runtime shims `js_request_subclass_init` /
+`js_response_subclass_init` (`object/global_this.rs`). At access time:
+
+- method calls (`object/native_call_method.rs`): inherited body methods on a
+  subclass receiver are forwarded to the native handle dispatcher (gated on the
+  fetch body-method name set, and only after all user-defined dispatch — own
+  fields, vtable, prototype walk — has missed, so a subclass override still
+  wins);
+- property reads (`object/field_get_set.rs`): a missed read on a subclass
+  instance is forwarded to the handle, so `url`/`method`/`headers`/`body`/
+  `bodyUsed`/… and body-method-as-value reads resolve;
+- `instanceof` (`object/instanceof.rs`): the `Request`/`Response`/`Headers`/
+  `Blob` arm unwraps the stashed handle and runs the existing fetch kind-probe.
+
+Non-subclassed `Request`/`Response` and other native-builtin subclasses are
+unaffected (the new paths only trigger when a heap object carries
+`__perry_fetch_handle__`). Regression test:
+`tests/test_request_subclass_body.sh`.
+
+
+## v0.5.1129 — fix(windows): `perry update` extracts the `.zip` artifact instead of failing with "invalid gzip header" (#4715)
+
+`perform_self_update` in `crates/perry/src/update_checker.rs` always decoded the
+downloaded release archive with `flate2::GzDecoder` + `tar::Archive`, regardless
+of platform. The Windows release artifact (`perry-windows-x86_64.zip`) is a real
+ZIP, not a gzip stream, so `perry update` on Windows bailed out with:
+
+```
+Error: Failed to extract archive
+Caused by:
+    0: failed to iterate over archive
+    1: invalid gzip header
+```
+
+Two fixes:
+
+- **Extraction now dispatches on the artifact extension.** Factored the inline
+  decode into a testable `extract_archive(bytes, artifact_name, dest)` helper:
+  `.zip` → `zip::ZipArchive::extract`, everything else → gzip/tar as before. The
+  extension (not the host `cfg`) chooses the decoder.
+- **Binary lookup is now platform-aware.** The post-extract step searched for a
+  file named exactly `perry`, but the Windows zip ships `perry.exe`, so the swap
+  would have failed with "Perry binary not found in archive" even once extraction
+  succeeded. Windows now looks for `perry.exe`.
+
+Added `test_extract_zip_artifact` and `test_extract_targz_artifact` unit tests
+that round-trip an in-memory archive of each kind through `extract_archive`.
+
+Not addressed here: the npm/`npmx.dev` "two 0.5.1125 versions / latest shows
+0.5.1122" registry confusion the reporter also noted is a publishing-pipeline
+issue, not a compiler bug.
+
+## v0.5.1128 — fix(string): generic-`this` for all String.prototype methods + slice/substring index coercion (built-ins/String 60.2%→79.3%)
+
+Extends the generic-`this` work started in #4713 (which only covered the
+char-access methods `at`/`charAt`/`charCodeAt`/`codePointAt` +
+`[Symbol.iterator]`) to **every** coercing `String.prototype` method, and fixes
+a class of argument-coercion bugs on the slice/substring index path. Lifts the
+full `built-ins/String` test262 subset from **60.2% → 79.3%** parity
+(`pass 561→739`, `runtime-fail 343→171`), **zero regressions** (the four
+`prototype/trim/*` items flagged in the contended full sweep pass cleanly in
+isolation — transient auto-optimize/cargo contention, not real failures).
+
+Per ECMA-262 §22.1.3 each method begins with `RequireObjectCoercible(this)` then
+`ToString(this)`, so a boxed `new String("x")` / `new Boolean(false)` /
+`new Number(5)` / `{ toString }` receiver coerces, and a `null`/`undefined`/
+`Symbol` receiver throws a `TypeError`.
+
+Generic-`this` reflective methods (`crates/perry-runtime/src/object/string_proto_thunks.rs`):
+- One shared `string_proto_generic_thunk` now backs `concat`, `endsWith`,
+  `includes`, `indexOf`, `isWellFormed`, `lastIndexOf`, `localeCompare`,
+  `match`, `matchAll`, `normalize`, `padEnd`, `padStart`, `repeat`, `replace`,
+  `replaceAll`, `search`, `slice`, `split`, `startsWith`, `substr`, `substring`,
+  `toLocaleLowerCase`, `toLocaleUpperCase`, `toLowerCase`, `toUpperCase`,
+  `toWellFormed`, `trim`, `trimEnd`, `trimStart` (replacing the no-op thunks).
+  It reads its own method name off the closure, applies RequireObjectCoercible +
+  ToString to `this`, and re-dispatches to the typed string-method tower
+  (`js_native_call_method`) with the coerced string as receiver. `toString` /
+  `valueOf` stay no-op-backed — they are brand-checked, not ToString-coercing.
+- These methods are excluded from the HIR `.call`/`.apply` fold
+  (`is_string_prototype_generic_method`) so `String.prototype.slice.call(x, …)`
+  reaches the coercing thunk instead of being rewritten to `x.slice(…)` (which
+  dispatched on `x`'s own type and threw).
+
+Native dispatch arms (`crates/perry-runtime/src/object/native_call_method.rs`):
+- Added `padStart`/`padEnd`/`normalize`/`localeCompare`/`isWellFormed`/
+  `toWellFormed` arms (previously only a codegen fast path existed), so the
+  generic-`this` re-dispatch and `(s: any).<m>(…)` dynamic dispatch resolve to
+  the runtime helper instead of the TypeError catch-all.
+- `indexOf`/`lastIndexOf` now `ToString` the search argument
+  (`s.indexOf(undefined)` searches for `"undefined"`; `{toString}` objects
+  coerce) instead of returning `-1`.
+- Index/position args (`slice`/`substring`/`substr`/positions) route through
+  `js_string_index_to_i32` (full `ToIntegerOrInfinity`) instead of a raw
+  `v as i32`, so a boolean (`slice(false, true)` → `0,1`), numeric string, or
+  `{ valueOf }` index coerces per spec.
+- `split` passes a RegExp separator through as its raw pointer (so
+  `js_string_split_n` detects + delegates to the regex splitter),
+  ToString-coerces a primitive separator, and treats an `undefined`/omitted
+  separator as "whole string" (not a per-character split).
+- Receiver re-fetched (rooted) after any argument coercion that can run user
+  code, and the coerced needle is rooted, to stay GC-safe.
+
+Codegen + spec end-index fix (`crates/perry-codegen/src/lower_string_method.rs`,
+new `js_string_end_index_to_i32`):
+- `slice`/`substring` now coerce `start`/`end` via `js_string_index_to_i32`
+  rather than a raw `fptosi(DOUBLE → i32)` — `fptosi` is UB on `±Infinity`/`NaN`
+  and on x86 yields the integer-indefinite `i32::MIN`, so
+  `"abc".substring(Infinity, NaN)` wrongly clamped to `""`.
+- An `undefined` `end` (omitted **or** explicit) now means `len`, not
+  `ToInteger(undefined) === 0`, in both codegen and the runtime arm —
+  `s.substring(0, undefined) === s`.
+
+## v0.5.1127 — fix(array): Array.prototype callback `thisArg`, array-like `ToLength`, spec op-order + 0-arg validation
+
+Closes a batch of `built-ins/Array/prototype/*` test262 gaps in the callback /
+array-like / validation clusters. Focused `built-ins/Array` test262 parity
+(test262_subset radar) moved **61.5% → 72.5%** (~290 fewer runtime/compile
+failures); zero regressions in the forEach before/after diff.
+
+**1. `thisArg` on the dense-array callback methods.** `arr.forEach(cb, thisArg)`
+(and `map`/`filter`/`some`/`every`/`find`/`findIndex`/`findLast`/`findLastIndex`/
+`flatMap`) silently dropped the second `thisArg` argument — the callback's `this`
+was whatever ambient `this` happened to be active, so the entire
+`15.4.4.N-5-*` ("thisArg is X") test series failed. The hot `js_array_<m>(arr,
+cb)` runtime entry points take no `this`, and the HIR fast-path variants
+(`Expr::ArrayForEach { array, callback }` …) carry no `thisArg` field.
+
+- Runtime: added `js_array_<m>_this(arr, cb, this_arg)` wrappers
+  (`array/iter_methods.rs`) that install `this_arg` via the implicit-`this`
+  thread-local (a `Drop` guard restores the prior binding) and delegate to the
+  existing loop, so hole/length semantics stay in one place. `#[used]` anchors
+  pin them against dead-strip on the default bitcode-relink path (#3320).
+- Codegen: `lower_array_method` now lowers the optional 2nd arg and calls the
+  `_this` variant when present; the no-`thisArg` path is byte-identical.
+- HIR: the array-method folds (`array_only_methods`, `local_array_methods`,
+  `inline_array_methods`, `imported_array_methods`, `array_fold`) only fold to
+  the fast-path variant for the 1-arg form now; a 2-arg call falls through to
+  the generic member call → `lower_array_method` (which binds `this`).
+  `reduce`/`reduceRight` (whose 2nd arg is the initial value) are unchanged.
+
+**2. Array-like `LengthOfArrayLike` = `ToLength(ToNumber(...))`.** The generic
+`Array.prototype.<m>.call(arrayLike, …)` engine (`array/generic.rs`) read the
+`length` property and fed the raw NaN-boxed value straight to `ToLength`. String
+/ boolean / null `length` values are themselves NaN bit-patterns, so
+`length: "2"` / `"0x0002"` collapsed to 0 and iteration was skipped. Now runs
+`js_number_coerce` (ToNumber) first; an un-coercible object `length`
+(`{valueOf,toString}` returning objects) correctly throws a `TypeError`.
+
+**3. Spec operation order.** All generic array-like callback methods computed the
+`IsCallable(callbackfn)` check before `LengthOfArrayLike`. Per ECMA-262 §23.1.3,
+`LengthOfArrayLike` (step 2) runs first, so a `length` getter's side effects /
+throw are observed even when the callback is non-callable. Swapped the order.
+
+**4. 0-arg validation (compile-fail → runtime semantics).**
+`[].reduce()` / `[].reduceRight()` compile-failed instead of throwing a
+`TypeError` at runtime; `[undefined].indexOf()` / `.lastIndexOf()` compile-failed
+instead of searching for `undefined` (returns `0`). These `lower_array_method`
+arms now pad the missing argument and defer to the runtime (validator throws for
+the callback methods; the search proceeds for indexOf/lastIndexOf), matching
+Node.
+
+Known remaining `built-ins/Array/prototype` clusters (follow-ups): boxed-
+primitive / exotic-object receivers (`-1-*`: `forEach.call(false, cb)`,
+Date/RegExp/Error expandos), and live-mutation / index-getter / inherited-
+`HasProperty` during iteration (`-7-*`).
+
+## v0.5.1126 — fix(class): hide private members from reflection + unblock exotic-private-name compilation
+
+Two fixes for class **private members** (`#x` fields, `#m()` methods, `get/set #a`
+accessors, and their `static` forms), targeting the largest test262 class cluster.
+On `language/expressions/class/elements` this moved the radar from **pass=415 /
+parity 30.4%** to **pass=497 / parity 36.4%** (+82 tests, 0 regressions), with the
+`compile-fail` bucket dropping 430→5.
+
+**1. Private names are no longer observable as own string properties.** Perry
+stores a class instance's private fields in the object's `keys_array` under their
+`#`-prefixed source name, and private methods/accessors in the class vtable /
+static tables under `#name` keys. These leaked into every reflection and
+enumeration surface — `Object.getOwnPropertyNames(c)` returned `["#x"]`,
+`c.hasOwnProperty("#x")` / `"#x" in c` returned `true`, and `#m` showed up on the
+prototype's own-property list — none of which Node does. Per ECMA-262 a private
+name is never an own string property.
+
+Added `private_member_key_bytes` / `private_member_key_value` helpers
+(`object/field_get_set.rs`) and filtered `#`-prefixed keys from: `Object.keys` /
+`values` / `entries`, `Object.getOwnPropertyNames` (both the class-ref
+prototype/constructor path and the instance `keys_array` path),
+`getOwnPropertyDescriptor` (both paths → `undefined`), `hasOwnProperty` (instance
+*and* class-ref, so `static #gen` no longer appears on the constructor),
+`propertyIsEnumerable`, the `in` operator, `JSON.stringify`, object spread
+(`{...c}`), and `Object.assign`. `Reflect.ownKeys` is covered transitively.
+
+The instance-side filters are gated on `class_id != 0` (i.e. the receiver is a
+class instance), so a plain object literal that legitimately uses a `#`-prefixed
+*string* key — e.g. a hex-color map `{ "#fff": "white" }` created via
+`obj["#fff"] = …` — keeps that key visible. The class-ref (prototype/constructor)
+paths filter unconditionally, since a `#`-name there is always a private member.
+
+**2. Exotic private names no longer collide into one LLVM symbol.** The codegen
+symbol sanitizer (`codegen/helpers.rs::sanitize`) replaced every character outside
+`[A-Za-z0-9_]` with a single `_`, so distinct private methods like `#$`, `#_`, and
+`#℘` all mangled to the same `perry_method_…__C____` symbol and clang aborted the
+whole module with `invalid redefinition of function`. This failed ~425 procedurally
+generated `*-private*` cases (which exercise private names built from `$`, unicode,
+and zero-width joiners) at compile time.
+
+The fix adds a new injective `sanitize_member` (escapes each non-alnum char to
+`_<hex-codepoint>_`) and applies it to the **member-name component** of method /
+getter / setter / static-method symbols (`perry_method_…` / `perry_static_…__c<id>__…`).
+Member symbols are module-local — instance methods/accessors dispatch through the
+runtime vtable by source name, not by cross-module LLVM symbol — so the encoding
+only has to be self-consistent within one codegen pass. `sanitize` itself is left
+unchanged (single-`_` collapse): it is also used for the **module-symbol prefix**
+(`perry_fn_<prefix>__<name>`, `native_region_slug`), which must stay byte-compatible
+with the driver's `compute_module_prefix`, or cross-module function references go
+unresolved at link time. Names made only of `[A-Za-z0-9_]` (essentially all ordinary
+identifiers) are returned unchanged by both, so existing symbols are unperturbed.
+
+Not yet covered (follow-ups): the private **brand check on access** — reading
+`other.#x` on a receiver that lacks the brand must throw `TypeError`, but Perry
+currently returns `undefined`; a correct fix needs lexical resolution of the
+private name's *declaring* class (it is not always the innermost class), so it is
+deferred to avoid regressing nested-class private access. Many of the now-compiling
+tests also depend on unrelated **public** static-method descriptor support
+(`verifyProperty(C, "m", …)` on `static *m()`), which is tracked separately.
+
+## v0.5.1125 — feat(compile): --windows-subsystem override + tier-3 Apple link dedup + pointer-width portability
+
+Three related cross-compile / link improvements, bundled because they share the
+Windows/tvOS/watchOS build paths.
+
+**1. `--windows-subsystem` override (PE subsystem control).** `--target windows`
+previously always derived the PE subsystem from an import heuristic: a program that
+imports `perry/ui` links `/SUBSYSTEM:WINDOWS` (GUI), everything else links
+`/SUBSYSTEM:CONSOLE` so `console.log` reaches the terminal (the issue #120 regression
+guard). That left no way to ship a GUI app that renders its own window without importing
+`perry/ui` (e.g. a Bloom Engine game) — Windows would allocate a console window alongside
+it. New `--windows-subsystem auto|console|windows` flag plus a `perry.toml [windows]
+subsystem` fallback (the source that survives the `perry publish` worker round-trip, since
+the dev shell's flags don't transfer but perry.toml is uploaded with `--project`).
+Precedence: explicit CLI `console`/`windows` wins → else perry.toml → else the import
+heuristic. Unknown values are a hard error so a typo fails loudly instead of silently
+linking the wrong subsystem.
+
+- `types.rs`: new `CompileArgs.windows_subsystem` flag + `CompilationContext.windows_subsystem`.
+- `bootstrap.rs`: `validate_windows_subsystem` resolves CLI → perry.toml → `auto` in the
+  post-collect preflight chain.
+- `library_search.rs`: `windows_subsystem_needs_ui` folds the override into the
+  auto-detected `needs_ui` bool that `windows_pe_subsystem_flag` consumes.
+- `platform_cmd.rs`: link command threads the resolved override through.
+- `windows_link_tests.rs`: regression guards for auto/console/windows polarities and
+  composition with the min-windows-version suffix.
+
+**2. Tier-3 Apple (tvOS/watchOS) link dedup.** Those targets have no prebuilt std, so
+perry-runtime and perry-stdlib are each built with `-Zbuild-std` and each bundle their own
+copy of std's panic/unwind runtime (`__rust_drop_panic`, `__rust_foreign_exception`,
+`rust_begin_unwind`, `rust_eh_personality`) → `ld64.lld: duplicate symbol` at the final
+link. `strip_dedup.rs` now localizes those shims alongside the allocator shims, and
+`link/mod.rs` runs the strip over the stdlib archive and tier-3 native libs (gated to
+tvOS/watchOS; ios/macos use prebuilt std and never hit this).
+
+**3. Pointer-width portability.** Several GC/timer/typedarray plausibility checks compared
+allocation size against `1usize << 34`, which overflows on 32-bit targets (arm64_32 watchOS,
+wasm32). Switched the comparisons to `size as u64 > (1u64 << 34)` in `gc/barrier.rs`,
+`gc/copying.rs`, `timer.rs`, `typedarray/mod.rs`, and widened a `tm_gmtoff` cast to `i64`
+in `date.rs`.
 
 ## v0.5.1124 — fix(runtime): array boundary-index, sparse length, and non-integer keys
 

@@ -22,7 +22,9 @@ pub(crate) use client_request_surface::{
     dispatch_client_request_method, dispatch_client_request_property,
 };
 mod agent_dispatch;
-pub(crate) use agent_dispatch::{dispatch_agent_method, dispatch_agent_property};
+pub(crate) use agent_dispatch::{
+    dispatch_agent_method, dispatch_agent_property, dispatch_agent_property_set,
+};
 #[cfg(feature = "external-http-client-pump")]
 mod external_client_request;
 
@@ -657,6 +659,21 @@ pub unsafe extern "C" fn js_http_request(options_f64: f64, callback_i64: i64) ->
         ended: false,
         agent_handle,
     })
+}
+
+/// `new http.ClientRequest(options)` (#4904). Perry's client model defers
+/// the actual send to `.end()`, so constructing is exactly `http.request`
+/// without a response callback. Node coerces a falsy `options.method` to
+/// `GET` — mirror that here (`http.request` keeps whatever string it got).
+#[no_mangle]
+pub unsafe extern "C" fn js_http_client_request_standalone_new(options_f64: f64) -> Handle {
+    let handle = js_http_request(options_f64, 0);
+    if let Some(req) = get_handle_mut::<ClientRequestHandle>(handle) {
+        if req.method.is_empty() {
+            req.method = "GET".to_string();
+        }
+    }
+    handle
 }
 
 /// https.request(options, callback) -> ClientRequest handle
@@ -1768,10 +1785,18 @@ unsafe fn append_https_agent_name_fields(name: &mut String, options_f64: f64) {
     push_truthy_string(name, "privateKeyEngine");
 }
 
-/// `agent.destroy()` / `.close()` — release pooled sockets. Perry doesn't
-/// pool today, so it's a no-op that returns the receiver for chainability.
+/// `agent.keepSocketAlive(socket)` / `agent.reuseSocket(socket, req)` —
+/// this Agent flavor exposes no per-socket hooks to act on, so these return
+/// the receiver for chainability but otherwise do nothing. Warn once instead
+/// of silently succeeding (#4917). (Default builds route http through
+/// perry-ext-http, where reqwest owns the keep-alive pool.)
 #[no_mangle]
 pub extern "C" fn js_http_agent_noop_self(handle: Handle) -> Handle {
+    perry_runtime::stub_diag::perry_stub_warn(
+        "http.Agent keepSocketAlive/reuseSocket",
+        "this http Agent has no per-socket hooks; the call is a no-op",
+        Some("#4917"),
+    );
     handle
 }
 

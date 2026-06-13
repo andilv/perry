@@ -2,111 +2,7 @@
 
 use super::*;
 
-fn is_global_this_value(ctx: &LoweringContext, expr: &Expr) -> bool {
-    matches!(expr, Expr::GlobalGet(_))
-        || matches!(
-            expr,
-            Expr::PropertyGet { object, property }
-                if matches!(object.as_ref(), Expr::GlobalGet(_))
-                    && property == "globalThis"
-        )
-        || matches!(expr, Expr::LocalGet(id) if ctx.global_this_aliases.contains(id))
-}
-
-/// #3663: classic-stream constructor export names from `node:stream`.
-const STREAM_CTOR_NAMES: [&str; 5] = ["Readable", "Writable", "Duplex", "Transform", "PassThrough"];
-
-/// #3663: the string argument of a `require("<literal>")` call, if any. Unlike
-/// `is_require_builtin_module` (whose allowlist is just fs/path/crypto), this
-/// returns the specifier verbatim so the caller can match the module it cares
-/// about (`"stream"`).
-fn require_literal_specifier(init: &ast::Expr) -> Option<String> {
-    let ast::Expr::Call(call) = init else {
-        return None;
-    };
-    let ast::Callee::Expr(callee) = &call.callee else {
-        return None;
-    };
-    let ast::Expr::Ident(ident) = callee.as_ref() else {
-        return None;
-    };
-    if ident.sym.as_ref() != "require" {
-        return None;
-    }
-    let arg = call.args.first()?;
-    if arg.spread.is_some() {
-        return None;
-    }
-    let ast::Expr::Lit(ast::Lit::Str(s)) = arg.expr.as_ref() else {
-        return None;
-    };
-    s.value.as_str().map(|s| s.to_string())
-}
-
-/// #3663: resolve the builtin module that a destructuring RHS reads from.
-/// Handles `const { Readable } = require('stream')` (CJS), and the namespace
-/// forms `const { Readable } = stream` where `stream` is an `import * as` /
-/// `const stream = require('stream')` alias. Returns the canonical module name.
-fn destructure_builtin_module_source(ctx: &LoweringContext, init: &ast::Expr) -> Option<String> {
-    if let Some(module) = require_literal_specifier(init) {
-        return Some(module);
-    }
-    if let ast::Expr::Ident(ident) = init {
-        let name = ident.sym.as_ref();
-        if let Some(module) = ctx.lookup_builtin_module_alias(name) {
-            return Some(module.to_string());
-        }
-        if let Some((module, None)) = ctx.lookup_native_module(name) {
-            return Some(module.to_string());
-        }
-    }
-    None
-}
-
-/// #3663: register destructured `node:stream` constructor bindings as
-/// native-module member aliases, mirroring `import { Readable } from 'stream'`.
-/// Without this, `const { Readable } = require('stream')` leaves `Readable` as a
-/// plain local, so the later `const r = new Readable(...)` binding is never
-/// tagged as a stream instance — and `r.on()/.write()/.pipe()` then fall through
-/// to no-op stub closures instead of routing to the real stream pump (the
-/// `NativeMethodCall` path the named-import form already takes).
-fn register_destructured_stream_ctors(ctx: &mut LoweringContext, decl: &ast::VarDeclarator) {
-    let ast::Pat::Object(obj_pat) = &decl.name else {
-        return;
-    };
-    let Some(init) = decl.init.as_deref() else {
-        return;
-    };
-    let Some(module) = destructure_builtin_module_source(ctx, init) else {
-        return;
-    };
-    if module != "stream" {
-        return;
-    }
-    for prop in &obj_pat.props {
-        let (key, binding) = match prop {
-            ast::ObjectPatProp::Assign(assign) => {
-                let name = assign.key.sym.to_string();
-                (name.clone(), name)
-            }
-            ast::ObjectPatProp::KeyValue(kv) => {
-                let key = match &kv.key {
-                    ast::PropName::Ident(i) => i.sym.to_string(),
-                    ast::PropName::Str(s) => s.value.as_str().unwrap_or("").to_string(),
-                    _ => continue,
-                };
-                let ast::Pat::Ident(binding) = kv.value.as_ref() else {
-                    continue;
-                };
-                (key, binding.id.sym.to_string())
-            }
-            _ => continue,
-        };
-        if STREAM_CTOR_NAMES.contains(&key.as_str()) {
-            ctx.register_native_module(binding, "stream".to_string(), Some(key));
-        }
-    }
-}
+use super::var_decl_sources::*;
 
 /// Lower a variable declaration, handling array destructuring patterns.
 /// Returns a vector of statements (multiple for destructuring, single for simple bindings).
@@ -122,6 +18,17 @@ pub(crate) fn lower_var_decl_with_destructuring(
         ast::Pat::Ident(ident) => {
             // Simple binding: let x = expr
             let name = ident.id.sym.to_string();
+
+            // Strict-mode early error: `var eval` / `var arguments` (and the
+            // let/const forms) are a SyntaxError (ECMA-262 BindingIdentifier
+            // static semantics). Surfaced as a compile error so the test262
+            // negative cases agree with Node (12.2.1-22-s).
+            if ctx.current_strict && matches!(name.as_str(), "eval" | "arguments") {
+                anyhow::bail!(
+                    "SyntaxError: unexpected `{}` as a strict-mode binding identifier",
+                    name
+                );
+            }
 
             // #809: tag locals provably bound to a plain object (an object
             // literal or `Object.create(...)`). `static_receiver_class`
@@ -996,6 +903,12 @@ pub(crate) fn lower_var_decl_with_destructuring(
                     None
                 }
 
+                if crate::lower_types::is_node_readable_static_factory_call(ctx, init_expr) {
+                    let readable = "Readable".to_string();
+                    ty = Type::Named(readable.clone());
+                    ctx.register_native_instance(name.clone(), "stream".to_string(), readable);
+                }
+
                 // Check for: const response = fetch(url) / fetchWithAuth(url, auth) / fetchPostWithAuth(url, auth, body)
                 if let Some(module) = get_fetch_module(init_expr) {
                     ctx.register_native_instance(
@@ -1094,6 +1007,17 @@ pub(crate) fn lower_var_decl_with_destructuring(
                                     name.clone(),
                                     "readable_stream".to_string(),
                                     "ReadableStream".to_string(),
+                                );
+                                ctx.uses_fetch = true;
+                            }
+                            // #4915: `new ReadableStreamBYOBReader(stream)` —
+                            // the handle is a reader, same module tag as
+                            // `stream.getReader({ mode: "byob" })`.
+                            "ReadableStreamBYOBReader" => {
+                                ctx.register_native_instance(
+                                    name.clone(),
+                                    "readable_stream_reader".to_string(),
+                                    "ReadableStreamBYOBReader".to_string(),
                                 );
                                 ctx.uses_fetch = true;
                             }
@@ -1579,6 +1503,21 @@ pub(crate) fn lower_var_decl_with_destructuring(
                     *existing_ty = ty.clone();
                 }
                 id
+            } else if let Some(fid) = match &decl.name {
+                // #4973: the function-body hoist pass pre-registered this
+                // exact `let`/`const` declarator (span-keyed) so hoisted
+                // sibling functions could forward-reference it. Reuse the
+                // pre-registered id here so the init lands in the slot/box
+                // those references captured.
+                ast::Pat::Ident(ident) => ctx.lexical_forward_decls.remove(&ident.id.span.lo.0),
+                _ => None,
+            } {
+                if let Some((_, _, existing_ty)) =
+                    ctx.locals.iter_mut().rev().find(|(_, lid, _)| *lid == fid)
+                {
+                    *existing_ty = ty.clone();
+                }
+                fid
             } else if let Some(id) = is_var_decl
                 .then(|| {
                     // Issue #838 followup (b): when the closure-body hoist
@@ -1900,6 +1839,32 @@ pub(crate) fn lower_var_decl_with_destructuring(
                     _ => {}
                 }
             }
+            // `with (o) { var foo = v; }` — the binding `foo` is hoisted to
+            // the enclosing var scope, but the *initialisation* is a normal
+            // PutValue under the with environment: when `o` has a `foo`
+            // property, the write goes to `o.foo`, not the hoisted local
+            // (test262 with/12.10-0-8). Emit the hoisted Let (no init) plus
+            // a WithSet for the assignment.
+            if is_var_decl && init.is_some() {
+                if let Some(env_id) = ctx.active_with_envs_for_ident(&name).into_iter().next() {
+                    result.push(Stmt::Let {
+                        id,
+                        name: name.clone(),
+                        ty,
+                        mutable,
+                        init: None,
+                    });
+                    let fallback = crate::lower::with_set_fallback_for_ident(ctx, &name);
+                    result.push(Stmt::Expr(Expr::WithSet {
+                        object: Box::new(Expr::LocalGet(env_id)),
+                        property: name,
+                        value: Box::new(init.unwrap()),
+                        fallback,
+                        strict: ctx.current_strict,
+                    }));
+                    return Ok(result);
+                }
+            }
             result.push(Stmt::Let {
                 id,
                 name,
@@ -1909,10 +1874,40 @@ pub(crate) fn lower_var_decl_with_destructuring(
             });
         }
         ast::Pat::Array(_) | ast::Pat::Object(_) => {
-            // #3663: tag destructured `node:stream` constructors as native-module
-            // aliases so subsequent `new Readable(...)` bindings register as
-            // stream instances and their methods route to the real pump.
-            register_destructured_stream_ctors(ctx, decl);
+            // #3663 / #4905: tag destructured builtin-module members
+            // (stream ctors, net factories) as native-module aliases so
+            // call sites route through the static native table. Bindings
+            // returned in `skip_local_bindings` must not also bind a
+            // runtime local — the local (undefined for `net.connect`)
+            // would shadow the alias at call sites; ESM named imports
+            // never create one (exact parity).
+            let skip_local_bindings = register_destructured_stream_ctors(ctx, decl);
+            let filtered_pat;
+            let pattern: &ast::Pat = if skip_local_bindings.is_empty() {
+                &decl.name
+            } else if let ast::Pat::Object(obj) = &decl.name {
+                let mut obj = obj.clone();
+                obj.props.retain(|prop| match prop {
+                    ast::ObjectPatProp::Assign(a) => {
+                        !skip_local_bindings.contains(&a.key.sym.to_string())
+                    }
+                    ast::ObjectPatProp::KeyValue(kv) => match kv.value.as_ref() {
+                        ast::Pat::Ident(b) => !skip_local_bindings.contains(&b.id.sym.to_string()),
+                        _ => true,
+                    },
+                    _ => true,
+                });
+                if obj.props.is_empty() {
+                    // Every binding became a native alias; nothing left to
+                    // bind at runtime (require of a builtin module has no
+                    // observable side effects).
+                    return Ok(result);
+                }
+                filtered_pat = ast::Pat::Object(obj);
+                &filtered_pat
+            } else {
+                &decl.name
+            };
 
             // Delegate to the recursive pattern binding helper so that all
             // destructuring features (nested patterns, defaults, rest, computed
@@ -1937,7 +1932,7 @@ pub(crate) fn lower_var_decl_with_destructuring(
                         .transpose()?
                         .ok_or_else(|| anyhow!("Destructuring requires an initializer"))?
                 };
-            let stmts = lower_pattern_binding(ctx, &decl.name, init_expr, mutable)?;
+            let stmts = lower_pattern_binding(ctx, pattern, init_expr, mutable)?;
             result.extend(stmts);
         }
         _ => {

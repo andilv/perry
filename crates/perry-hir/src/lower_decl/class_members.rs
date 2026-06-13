@@ -174,7 +174,7 @@ pub fn lower_constructor(
         // touch only params (not `this`), so they stay at the very top.
         if let Some(super_pos) = body
             .iter()
-            .position(|s| matches!(s, Stmt::Expr(Expr::SuperCall(_))))
+            .position(|s| matches!(s, Stmt::Expr(Expr::SuperCall(_) | Expr::SuperCallSpread(_))))
         {
             let tail = body.split_off(super_pos + 1);
             body.extend(assignments);
@@ -411,6 +411,9 @@ pub fn lower_class_method(
     let name = match &method.key {
         ast::PropName::Ident(ident) => ident.sym.to_string(),
         ast::PropName::Str(s) => s.value.as_str().unwrap_or("").to_string(),
+        // Numeric-literal method name (`42() {}`): the registration key (and
+        // func name) is the canonical ToString of the value.
+        ast::PropName::Num(n) => crate::lower::number_to_js_key(n.value),
         ast::PropName::Computed(computed) if is_symbol_iterator_key(&computed.expr) => {
             "@@iterator".to_string()
         }
@@ -516,25 +519,29 @@ pub fn lower_class_method_with_name(
             destructuring_params.push((param_id, inner_pat.clone()));
         }
     }
-    for (param, pat) in params.iter_mut().zip(default_param_pats.iter()) {
-        param.default = get_param_default(ctx, pat)?;
-    }
-
-    // #677: synthesize `arguments` if the method body references it.
+    // #677: synthesize `arguments` if the method body — or any parameter
+    // DEFAULT expression (`method(x = arguments[2]) {}`) — references it.
+    // Appended BEFORE the defaults are lowered below so `arguments` inside a
+    // default resolves to the synthetic local instead of an unknown global.
     let user_has_arguments_param = method
         .function
         .params
         .iter()
         .any(|p| get_pat_name(&p.pat).ok().as_deref() == Some("arguments"));
     let needs_arguments_synth = !user_has_arguments_param
-        && method
+        && (method
             .function
             .body
             .as_ref()
             .map(|b| body_uses_arguments(&b.stmts))
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || params_use_arguments(&method.function.params));
     if needs_arguments_synth {
         append_synthetic_arguments_param(ctx, &mut params, true, false, true, Vec::new());
+    }
+
+    for (param, pat) in params.iter_mut().zip(default_param_pats.iter()) {
+        param.default = get_param_default(ctx, pat)?;
     }
 
     // Extract return type (with context). Phase 4: when the method has no
@@ -580,6 +587,10 @@ pub fn lower_class_method_with_name(
         Vec::new()
     };
 
+    // Capture the destructuring-prologue length before it is drained into the
+    // body, so generator methods can replay param binding synchronously at call
+    // time (see the `gen_param_prologue_len` recording below).
+    let destructuring_prologue_len = destructuring_stmts.len();
     if !destructuring_stmts.is_empty() {
         destructuring_stmts.append(&mut body);
         body = destructuring_stmts;
@@ -595,6 +606,7 @@ pub fn lower_class_method_with_name(
     // `undefined` post-padding because the method body just did `return a + b`
     // with no default check.
     let default_stmts = build_default_param_stmts(&params);
+    let default_prologue_len = default_stmts.len();
     if !default_stmts.is_empty() {
         let mut new_body = default_stmts;
         new_body.extend(body);
@@ -631,8 +643,22 @@ pub fn lower_class_method_with_name(
     // Exit method's type param scope
     ctx.exit_type_param_scope();
 
+    let func_id = ctx.fresh_func();
+    // Record the param-prologue length for generator methods so the generator
+    // transform runs param binding (default guards + destructuring) synchronously
+    // at call time per spec FunctionDeclarationInstantiation order. Without this,
+    // a `*method`/`async *method` with a destructuring/default param leaves the
+    // binding inside the lazy state-machine body, so a throwing default
+    // initializer never fires at call time (test262 class/dstr async-gen-meth-*).
+    if method.function.is_generator {
+        let prologue_len = default_prologue_len + destructuring_prologue_len;
+        if prologue_len > 0 {
+            ctx.gen_param_prologue_len.insert(func_id, prologue_len);
+        }
+    }
+
     Ok(Function {
-        id: ctx.fresh_func(),
+        id: func_id,
         name,
         type_params,
         params,
@@ -657,6 +683,10 @@ pub fn lower_getter_method(
     let name = match &method.key {
         ast::PropName::Ident(ident) => format!("get_{}", ident.sym),
         ast::PropName::Str(s) => format!("get_{}", s.value.as_str().unwrap_or("")),
+        // Numeric-literal getter (`get 0()`): synthetic internal symbol; the
+        // accessor is registered under the canonical numeric prop key by the
+        // caller (lower_class_decl), not this name.
+        ast::PropName::Num(n) => format!("get_{}", n.value),
         ast::PropName::Computed(computed) => {
             // Well-known symbol getters (e.g., `get [Symbol.toStringTag]()`)
             // get a synthetic `get_@@<short>` name. The caller is
@@ -742,6 +772,9 @@ pub fn lower_setter_method(
     let name = match &method.key {
         ast::PropName::Ident(ident) => format!("set_{}", ident.sym),
         ast::PropName::Str(s) => format!("set_{}", s.value.as_str().unwrap_or("")),
+        // Numeric-literal setter (`set 0(v)`): synthetic internal symbol;
+        // registered under the canonical numeric prop key by the caller.
+        ast::PropName::Num(n) => format!("set_{}", n.value),
         _ => return Err(anyhow!("Unsupported setter key")),
     };
     lower_setter_method_with_name(ctx, method, name)
@@ -839,6 +872,10 @@ pub fn lower_class_prop(ctx: &mut LoweringContext, prop: &ast::ClassProp) -> Res
     let (name, key_expr) = match &prop.key {
         ast::PropName::Ident(ident) => (ident.sym.to_string(), None),
         ast::PropName::Str(s) => (s.value.as_str().unwrap_or("").to_string(), None),
+        // Numeric field keys (`0 = 'bar'`, `1e-7;`) use the canonical JS number
+        // -to-string conversion so reads via `c[0]` / `c['1e-7']` agree.
+        ast::PropName::Num(n) => (crate::lower::number_to_js_key(n.value), None),
+        ast::PropName::BigInt(b) => (b.value.to_string(), None),
         ast::PropName::Computed(c) => {
             let key = lower_expr(ctx, &c.expr)?;
             // Synthetic name — uniqueness within a class is enforced by the
@@ -849,7 +886,6 @@ pub fn lower_class_prop(ctx: &mut LoweringContext, prop: &ast::ClassProp) -> Res
             let synth = format!("__computed_field_{}_{}", c.span.lo.0, c.span.hi.0);
             (synth, Some(key))
         }
-        _ => return Err(anyhow!("Unsupported property key")),
     };
 
     // Extract type from type annotation (using context for class type param resolution).
@@ -866,12 +902,31 @@ pub fn lower_class_prop(ctx: &mut LoweringContext, prop: &ast::ClassProp) -> Res
             .unwrap_or(Type::Any),
     };
 
-    // Lower initializer expression if present
+    // Lower initializer expression if present. Mark the field-initializer
+    // context so a direct `eval` in the initializer rejects `arguments`
+    // (PerformEval early error — field initializers have no arguments object).
+    // NamedEvaluation: an anonymous function/arrow/class initializer takes
+    // the field's name (`static fromArgs = function(){}` → `.name ===
+    // "fromArgs"`, test262 elements/static-field-anonymous-function-name).
+    // Computed keys (key_expr) have no compile-time name to confer.
+    let saved_field_init = ctx.in_class_field_init;
+    ctx.in_class_field_init = true;
     let init = prop
         .value
         .as_ref()
-        .map(|e| lower_expr(ctx, e))
-        .transpose()?;
+        .map(|e| {
+            if key_expr.is_none() && crate::lower::expr_assign::rhs_accepts_assignment_name(e) {
+                let old = ctx.assignment_inferred_name.replace(name.clone());
+                let result = lower_expr(ctx, e);
+                ctx.assignment_inferred_name = old;
+                result
+            } else {
+                lower_expr(ctx, e)
+            }
+        })
+        .transpose();
+    ctx.in_class_field_init = saved_field_init;
+    let init = init?;
 
     Ok(ClassField {
         name,

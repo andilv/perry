@@ -34,6 +34,8 @@ mod dataview_proto_thunks;
 mod date_proto_thunks;
 mod delete_rest;
 mod descriptors;
+mod disposable_proto_thunks;
+pub(crate) mod exotic_expando;
 mod field_get_set;
 mod field_set_by_name;
 mod global_fetch;
@@ -46,11 +48,13 @@ pub(crate) mod iterator_prototypes;
 mod namespace_create;
 mod native_call_method;
 mod native_module;
+pub(crate) use native_module::install_native_module_vtable;
 mod native_module_crypto_key_object;
 mod native_module_crypto_random;
 mod native_module_dispatch;
 mod native_module_dispatch_crypto;
 mod native_module_stream;
+mod native_this_alias;
 mod object_literal_ops;
 mod object_ops;
 mod object_ops_frozen;
@@ -60,6 +64,9 @@ mod property_key;
 pub(crate) mod prototype_chain;
 mod prototype_helpers;
 mod reflect_support;
+mod regex_proto_thunks;
+mod string_proto_thunks;
+mod temporal_proto;
 mod typed_array_define;
 mod typed_array_proto_thunks;
 mod util_types;
@@ -69,6 +76,7 @@ pub use alloc::*;
 pub use arguments::*;
 pub(crate) use array_object_ops::*;
 pub use assert::*;
+pub(crate) use async_generator_queue::is_async_generator_instance_value;
 pub(crate) use bigint_dispatch::*;
 pub use buffer_dispatch::*;
 pub use class_constructors::*;
@@ -85,6 +93,7 @@ pub(crate) use collection_proto_thunks::{is_builtin_map_set_value, is_builtin_se
 pub(crate) use data_view_registry::extends_builtin_data_view;
 pub use delete_rest::*;
 pub use descriptors::*;
+pub use exotic_expando::scan_exotic_expando_roots_mut;
 pub use field_get_set::*;
 pub use field_set_by_name::*;
 pub use global_this::*;
@@ -345,6 +354,90 @@ thread_local! {
 thread_local! {
     static IMPLICIT_THIS: Cell<u64> = const { Cell::new(crate::value::TAG_UNDEFINED) };
     static NEW_TARGET: Cell<u64> = const { Cell::new(crate::value::TAG_UNDEFINED) };
+    // One-shot receiver override for STATIC method bodies. A compiled static
+    // method's `this` slot used to be a compile-time class-ref literal, so
+    // `C.m.call({})` / `D.m()` (inherited) ran with `this === C` and static
+    // private brand checks could never throw (test262 class/elements
+    // static-private-*). Armed by the dynamic dispatch paths that know the
+    // real receiver (`js_class_static_method_call`, the Function.prototype
+    // call/apply arms for a static bound-method value); consumed (take
+    // semantics) by `js_static_this_resolve` in the static-method prologue.
+    // Direct compiled calls never arm it, so they keep the lexical class-ref.
+    static STATIC_THIS_OVERRIDE: Cell<(bool, u64)> =
+        const { Cell::new((false, crate::value::TAG_UNDEFINED)) };
+}
+
+/// Arm the static-`this` override unconditionally (used by the call/apply
+/// receiver paths, which take precedence over the inner dynamic dispatch).
+pub(crate) fn static_this_arm(value: f64) {
+    STATIC_THIS_OVERRIDE.with(|c| c.set((true, value.to_bits())));
+}
+
+/// Arm the static-`this` override only when no outer caller has already armed
+/// it — `js_class_static_method_call` runs INSIDE the call/apply plumbing, and
+/// the outermost receiver (the `.call(x)` thisArg) must win.
+pub(crate) fn static_this_arm_if_unarmed(value: f64) {
+    STATIC_THIS_OVERRIDE.with(|c| {
+        if !c.get().0 {
+            c.set((true, value.to_bits()));
+        }
+    });
+}
+
+/// Disarm without consuming (paired with arm sites as a safety net in case
+/// the invoked target never reached a static-method prologue).
+pub(crate) fn static_this_disarm() {
+    STATIC_THIS_OVERRIDE.with(|c| c.set((false, crate::value::TAG_UNDEFINED)));
+}
+
+/// Arm the static-`this` override with a class constructor ref. Emitted by
+/// codegen immediately before a direct call to an INHERITED static method
+/// (`D.f()` where `f` lives on a parent class) so the body sees the dispatch
+/// base (`this === D`) instead of the lexical defining class — spec
+/// OrdinaryCallBindThis for `D.f()`, and what makes static-private brand
+/// checks on subclass receivers throw (test262 static-private-method-
+/// subclass-receiver).
+// #1561-style force-keep: only generated IR calls this.
+#[used]
+static KEEP_JS_STATIC_THIS_ARM_CLASSREF: extern "C" fn(u32) = js_static_this_arm_classref;
+
+#[no_mangle]
+pub extern "C" fn js_static_this_arm_classref(class_id: u32) {
+    if class_id != 0 {
+        static_this_arm(native_module::class_constructor_ref_value(class_id));
+    }
+}
+
+/// Arm the static-`this` override with an arbitrary receiver value. Emitted
+/// by the codegen static-dispatch tower (`D.f()` where the receiver is a
+/// class-ref expression and the method resolves on a parent class at compile
+/// time) right before the direct call.
+// #1561-style force-keep: only generated IR calls this.
+#[used]
+static KEEP_JS_STATIC_THIS_ARM_VALUE: extern "C" fn(f64) = js_static_this_arm_value;
+
+#[no_mangle]
+pub extern "C" fn js_static_this_arm_value(value: f64) {
+    static_this_arm(value);
+}
+
+/// Static-method prologue `this` resolution: take the armed override if any,
+/// else the lexical class-ref the codegen passes in.
+// #1561-style force-keep: only generated IR calls this.
+#[used]
+static KEEP_JS_STATIC_THIS_RESOLVE: extern "C" fn(f64) -> f64 = js_static_this_resolve;
+
+#[no_mangle]
+pub extern "C" fn js_static_this_resolve(default_this: f64) -> f64 {
+    STATIC_THIS_OVERRIDE.with(|c| {
+        let (armed, bits) = c.get();
+        if armed {
+            c.set((false, crate::value::TAG_UNDEFINED));
+            f64::from_bits(bits)
+        } else {
+            default_this
+        }
+    })
 }
 
 /// Read the current implicit `this` (issue #519).
@@ -430,6 +523,12 @@ pub fn scan_implicit_this_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<
         let mut bits = c.get();
         if visitor.visit_nanbox_u64_slot(&mut bits) {
             c.set(bits);
+        }
+    });
+    STATIC_THIS_OVERRIDE.with(|c| {
+        let (armed, mut bits) = c.get();
+        if visitor.visit_nanbox_u64_slot(&mut bits) {
+            c.set((armed, bits));
         }
     });
 }
@@ -579,6 +678,39 @@ pub(crate) fn descriptors_in_use() -> bool {
     GLOBAL_DESCRIPTORS_IN_USE.load(Ordering::Relaxed)
 }
 
+/// #5054: a descriptor (any kind) has been installed on the canonical
+/// `Object.prototype` — inherited setters / non-writable data props there
+/// must intercept writes of keys missing on the receiver, so the dynamic
+/// plain-object write fast path is disabled process-wide once this flips.
+static OBJECT_PROTO_DESCRIPTORS: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn object_proto_descriptors_in_use() -> bool {
+    OBJECT_PROTO_DESCRIPTORS.load(Ordering::Relaxed)
+}
+
+/// #5054: record descriptor installation on the target object itself —
+/// `OBJ_FLAG_HAS_DESCRIPTORS` in its GcHeader (travels with the object on
+/// evacuation), plus the `Object.prototype` process-global above. Unlike
+/// `GLOBAL_DESCRIPTORS_IN_USE`, neither is poisoned by the runtime
+/// installing attrs on unrelated builtins (RegExp prototype etc.), so the
+/// dynamic-write fast path stays precise.
+pub(crate) fn note_descriptor_target(obj: usize) {
+    if crate::array::object_prototype_addr_matches(obj) {
+        OBJECT_PROTO_DESCRIPTORS.store(true, Ordering::Relaxed);
+    }
+    if crate::typedarray::lookup_typed_array_kind(obj).is_some() {
+        return;
+    }
+    unsafe {
+        if let Some(header) = crate::value::addr_class::try_read_gc_header(obj) {
+            if header.obj_type == crate::gc::GC_TYPE_OBJECT {
+                let header = header as *const crate::gc::GcHeader as *mut crate::gc::GcHeader;
+                (*header)._reserved |= crate::gc::OBJ_FLAG_HAS_DESCRIPTORS;
+            }
+        }
+    }
+}
+
 /// Look up the property descriptor for (obj, key). Returns None if no entry exists,
 /// in which case the JS default `{ writable: true, enumerable: true, configurable: true }` applies.
 pub(crate) fn get_property_attrs(obj: usize, key: &str) -> Option<PropertyAttrs> {
@@ -587,6 +719,7 @@ pub(crate) fn get_property_attrs(obj: usize, key: &str) -> Option<PropertyAttrs>
 
 /// Store a property descriptor for (obj, key).
 pub(crate) fn set_property_attrs(obj: usize, key: String, attrs: PropertyAttrs) {
+    note_descriptor_target(obj);
     PROPERTY_ATTRS_IN_USE.with(|c| c.set(true));
     GLOBAL_DESCRIPTORS_IN_USE.store(true, Ordering::Relaxed);
     PROPERTY_DESCRIPTORS.with(|m| {
@@ -691,6 +824,7 @@ pub(crate) unsafe fn json_object_getter_value(
 
 /// Store an accessor descriptor for (obj, key).
 pub(crate) fn set_accessor_descriptor(obj: usize, key: String, acc: AccessorDescriptor) {
+    note_descriptor_target(obj);
     ACCESSORS_IN_USE.with(|c| c.set(true));
     GLOBAL_DESCRIPTORS_IN_USE.store(true, Ordering::Relaxed);
     ACCESSOR_DESCRIPTORS.with(|m| {
@@ -750,6 +884,7 @@ pub(crate) fn set_builtin_accessor_descriptor(
 /// `PROPERTY_DESCRIPTORS` per-object and unconditionally. The gate stays
 /// down, so the object get/set hot path is unaffected for every program.
 pub(crate) fn set_builtin_property_attrs(obj: usize, key: String, attrs: PropertyAttrs) {
+    note_descriptor_target(obj);
     PROPERTY_DESCRIPTORS.with(|m| {
         m.borrow_mut().insert((obj, key), attrs);
     });
@@ -1720,6 +1855,31 @@ pub fn overflow_fields_is_empty() -> bool {
 /// Global class registry mapping class_id -> parent_class_id for inheritance chain lookups
 static CLASS_REGISTRY: RwLock<Option<HashMap<u32, u32>>> = RwLock::new(None);
 
+/// class_id -> fetch-builtin parent kind (1 = Request, 2 = Response). Recorded
+/// when a class is registered (at module init / class-expression evaluation)
+/// whose parent value identifies as the global `Request`/`Response`
+/// constructor — including via an alias such as `@hono/node-server`'s
+/// `GlobalRequest = global.Request`. Lets the runtime dynamic-construction
+/// path (`new (classExprValue)(...)` / ClassRef `new`) attach the underlying
+/// native fetch handle, matching what the static codegen `super()` path does.
+static FETCH_PARENT_KIND: RwLock<Option<HashMap<u32, u8>>> = RwLock::new(None);
+
+/// Record that `class_id` directly extends the global Request (kind 1) or
+/// Response (kind 2) constructor.
+pub(crate) fn register_fetch_parent_kind(class_id: u32, kind: u8) {
+    let mut g = FETCH_PARENT_KIND.write().unwrap();
+    if g.is_none() {
+        *g = Some(HashMap::new());
+    }
+    g.as_mut().unwrap().insert(class_id, kind);
+}
+
+/// The directly-recorded fetch parent kind for `class_id` (no chain walk).
+pub(crate) fn fetch_parent_kind(class_id: u32) -> Option<u8> {
+    let g = FETCH_PARENT_KIND.read().ok()?;
+    g.as_ref()?.get(&class_id).copied()
+}
+
 /// Global registry of class IDs that extend the built-in Error class
 static EXTENDS_ERROR_REGISTRY: RwLock<Option<std::collections::HashSet<u32>>> = RwLock::new(None);
 
@@ -1957,7 +2117,11 @@ pub unsafe extern "C" fn js_object_to_string(value: f64) -> f64 {
     }
     if (raw_addr >= 0x10000 && crate::closure::is_closure_ptr(raw_addr))
         || crate::object::is_class_object_ptr(raw_addr as *const u8)
+        || is_function_prototype_object_value(value)
     {
+        // %Function.prototype% is itself a (callable) Function object, so
+        // `Object.prototype.toString.call(Function.prototype)` is
+        // "[object Function]" even though Perry stores it as a plain object.
         let bytes = b"[object Function]";
         let str_ptr = crate::string::js_string_from_bytes(bytes.as_ptr(), bytes.len() as u32);
         return f64::from_bits(STRING_TAG | (str_ptr as u64 & POINTER_MASK));
@@ -2118,54 +2282,11 @@ pub(crate) fn extends_builtin_error(class_id: u32) -> bool {
     false
 }
 
-/// Check if a pointer is a valid heap object (safe to dereference GcHeader).
-/// Values below 0x100000 (1MB) are likely INT32_TAG extracts, small handles,
-/// or null. The upper bound filters out NaN-box tag bits that leaked through.
-///
-/// Issue #73 follow-up: raised the lower bound from 1 MB to 2 TB to reject
-/// corrupted NaN-boxes whose 48-bit handle lands in the 1-2 TB window
-/// (e.g. `0x00FF_0000_0000` from an `ArrayHeader { length: 0, capacity:
-/// 255 }` read as u64). Real macOS mimalloc + arena allocations all
-/// land in the 3-5 TB range; anything below 2 TB is certainly bogus on
-/// that platform. Linux glibc and Windows mimalloc allocate well below
-/// 2 TB though (often in the GB-to-tens-of-GB range), so the macOS floor
-/// silently rejects every legitimate object pointer there — issues
-/// #385/#386/#387 traced back to this exact filter on Windows.
-///
-/// #1136 / #1129: iOS-family *device* targets (aarch64-apple-ios,
-/// -tvos, -watchos, -visionos) ship without mimalloc and use
-/// libsystem_malloc, whose user allocations land in the same low range
-/// as Android/Linux/Windows. Treat them like those platforms — the
-/// downstream `GcHeader.obj_type` check is the real liveness guard.
-/// The simulator (e.g. ios + target_abi = "sim") runs on the macOS
-/// host's mimalloc so its allocations still land above 2 TB; lowering
-/// the floor here is safe because the obj_type validation does the
-/// work.
-#[inline(always)]
-pub(crate) fn is_valid_obj_ptr(ptr: *const u8) -> bool {
-    let addr = ptr as u64;
-    #[cfg(any(
-        target_os = "android",
-        target_os = "linux",
-        target_os = "windows",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "watchos",
-        target_os = "visionos",
-    ))]
-    const HEAP_MIN: u64 = 0x1000;
-    #[cfg(not(any(
-        target_os = "android",
-        target_os = "linux",
-        target_os = "windows",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "watchos",
-        target_os = "visionos",
-    )))]
-    const HEAP_MIN: u64 = 0x200_0000_0000;
-    (HEAP_MIN..0x8000_0000_0000).contains(&addr)
-}
+// `is_valid_obj_ptr` moved to `value/addr_class.rs` (the centralized
+// handle-vs-heap-pointer classification module); re-exported here so the
+// existing `crate::object::is_valid_obj_ptr` call sites keep compiling
+// unchanged.
+pub(crate) use crate::value::addr_class::is_valid_obj_ptr;
 
 /// Object header - precedes the fields in memory
 #[repr(C)]

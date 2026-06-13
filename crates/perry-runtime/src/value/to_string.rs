@@ -32,7 +32,7 @@ thread_local! {
 /// `value` MUST be a NaN-boxed `POINTER_TAG` object whose pointer is a real
 /// heap address (`>= 0x10000`); the caller has already excluded symbols,
 /// buffers, arrays, and JSX nodes (those carry their own coercion rules).
-unsafe fn ordinary_to_primitive_string(value: f64) -> Option<f64> {
+pub(crate) unsafe fn ordinary_to_primitive_string(value: f64) -> Option<f64> {
     // Bound recursion: a `toString` that itself string-coerces `this`.
     let depth = TO_PRIMITIVE_DEPTH.with(|c| c.get());
     if depth >= 200 {
@@ -66,18 +66,61 @@ unsafe fn ordinary_to_primitive_string_inner(value: f64) -> Option<f64> {
         // Custom toString returned a non-primitive (object): per spec, fall
         // through to `valueOf`.
         MethodOutcome::NonPrimitive => {}
-        // No callable custom toString — this is the default
-        // `Object.prototype.toString` → `"[object Object]"`. Stop here.
-        MethodOutcome::Absent => return None,
+        // No callable custom toString. For an ordinary object this stands in
+        // for the default `Object.prototype.toString` → `"[object Object]"`
+        // (stop here). But a null-`[[Prototype]]` object (`Object.create(null)`)
+        // genuinely has NO toString/valueOf, so OrdinaryToPrimitive must fall
+        // through to `valueOf` and, finding none, throw — matching Node
+        // (`String(Object.create(null))` throws; Test262 ToPropertyKey on a
+        // null-proto computed key).
+        MethodOutcome::Absent => {
+            if !value_is_null_proto_object(value) {
+                return None;
+            }
+        }
     }
 
     match call_method_for_primitive(&scope, &value_handle, b"valueOf") {
         MethodOutcome::Primitive(p) => Some(p),
-        // Both toString and valueOf failed to produce a primitive — Node
-        // throws `TypeError: Cannot convert object to primitive value`. We
-        // approximate by falling back to the default `"[object Object]"`.
-        MethodOutcome::NonPrimitive | MethodOutcome::Absent => None,
+        // We only reach here when a *custom* `toString` ran and returned a
+        // non-primitive (the `Absent` toString case already returned
+        // `"[object Object]"` above). Per spec `OrdinaryToPrimitive` then tries
+        // `valueOf`; if that also fails to yield a primitive, ToPrimitive throws
+        // `TypeError: Cannot convert object to primitive value` (Node agrees:
+        // `String({ toString: () => ({}) })` throws). A plain object with no
+        // custom `toString` never reaches this throw.
+        MethodOutcome::NonPrimitive | MethodOutcome::Absent => throw_cannot_convert_to_primitive(),
     }
+}
+
+/// True iff `value` is a heap object stamped `OBJ_FLAG_NULL_PROTO`
+/// (`Object.create(null)` and friends) — i.e. it has no `[[Prototype]]`, so it
+/// does not inherit the default `Object.prototype.toString`/`valueOf`.
+unsafe fn value_is_null_proto_object(value: f64) -> bool {
+    let jsval = JSValue::from_bits(value.to_bits());
+    if !jsval.is_pointer() {
+        return false;
+    }
+    let obj = jsval.as_pointer::<crate::ObjectHeader>();
+    if obj.is_null() || (obj as usize) < 0x10000 {
+        return false;
+    }
+    if !crate::object::is_valid_obj_ptr(obj as *const u8) {
+        return false;
+    }
+    if (obj as usize) < crate::gc::GC_HEADER_SIZE + 0x1000 {
+        return false;
+    }
+    let gc = (obj as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
+    (*gc)._reserved & crate::gc::OBJ_FLAG_NULL_PROTO != 0
+}
+
+#[cold]
+fn throw_cannot_convert_to_primitive() -> ! {
+    let msg = b"Cannot convert object to primitive value";
+    let s = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
+    let err = crate::error::js_typeerror_new(s);
+    crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64))
 }
 
 /// Function objects are closure headers, not `ObjectHeader`s, so the ordinary
@@ -232,6 +275,26 @@ pub(crate) unsafe fn ordinary_to_primitive_number_for_add(
 ) -> OrdinaryToPrimitiveOutcome {
     let scope = crate::gc::RuntimeHandleScope::new();
     let value_handle = scope.root_nanbox_f64(value);
+
+    // A TypedArray is an exotic object whose header is NOT an ObjectHeader;
+    // the `valueOf`/`toString` field lookups below would bit-cast garbage
+    // (heap-dependent: sometimes a fake "method" → spurious TypeError, e.g.
+    // `"" + new Float64Array([1])`). Its ToPrimitive resolves to
+    // %TypedArray%.prototype.toString (= `join(",")`); detect via the
+    // registry (no deref) and join. `Symbol.toPrimitive` was already
+    // consulted by the caller (`js_to_primitive`).
+    if (value.to_bits() & 0xFFFF_0000_0000_0000) == POINTER_TAG {
+        let addr = (value.to_bits() & POINTER_MASK) as usize;
+        if crate::typedarray::lookup_typed_array_kind(addr).is_some() {
+            let joined = crate::typedarray::js_typed_array_join(
+                addr as *const crate::typedarray::TypedArrayHeader,
+                std::ptr::null(),
+            );
+            return OrdinaryToPrimitiveOutcome::Primitive(crate::value::js_nanbox_string(
+                joined as i64,
+            ));
+        }
+    }
 
     match call_method_for_primitive(&scope, &value_handle, b"valueOf") {
         MethodOutcome::Primitive(p) => return OrdinaryToPrimitiveOutcome::Primitive(p),
@@ -478,8 +541,17 @@ pub extern "C" fn js_jsvalue_to_string(value: f64) -> *mut crate::string::String
             crate::string::js_string_from_bytes(b"false".as_ptr(), 5)
         }
     } else if jsval.is_int32() {
-        // Convert int32 to string
+        // A registered class id shares the INT32 encoding (`Expr::ClassRef`)
+        // — `String(C)` / `"" + C` must produce function source, not the
+        // numeric id. Perry keeps no class source, so the NativeFunction
+        // form with the class name.
         let n = jsval.as_int32();
+        let cid = (value.to_bits() & 0xFFFF_FFFF) as u32;
+        if crate::object::is_class_id_registered(cid) {
+            let name = crate::object::class_name_for_id(cid).unwrap_or_default();
+            let s = format!("function {name}() {{ [native code] }}");
+            return crate::string::js_string_from_bytes(s.as_ptr(), s.len() as u32);
+        }
         let s = n.to_string();
         crate::string::js_string_from_bytes(s.as_ptr(), s.len() as u32)
     } else if jsval.is_bigint() {
@@ -491,7 +563,42 @@ pub extern "C" fn js_jsvalue_to_string(value: f64) -> *mut crate::string::String
         // stringify via `Array.prototype.join(",")` per JS semantics; other
         // objects fall back to "[object Object]".
         let ptr: *const u8 = jsval.as_pointer();
+        // Proxy ids can be SMALLER than the 0x10000 heap floor — check the
+        // registry (a by-value lookup, no deref) before the gate.
+        if crate::proxy::js_proxy_is_proxy(value) != 0 {
+            if crate::proxy::proxy_wraps_callable(value) {
+                let s = "function () { [native code] }";
+                return crate::string::js_string_from_bytes(s.as_ptr(), s.len() as u32);
+            }
+            let target = crate::proxy::js_proxy_target(value);
+            if target.to_bits() != value.to_bits() {
+                return js_jsvalue_to_string(target);
+            }
+            return crate::string::js_string_from_bytes(b"[object Object]".as_ptr(), 15);
+        }
         if !ptr.is_null() && (ptr as usize) >= 0x10000 {
+            // A Proxy is a small registered id, not a heap object — the GC-header
+            // probes / ToPrimitive dispatch below would deref the fake pointer
+            // and segfault (e.g. `String(proxy)`). Default `ToString` has no
+            // toString/valueOf trap of its own, so resolve to the target and
+            // stringify that ("[object Object]" for an ordinary object target),
+            // which matches Node for the trap-less case. (Proxy crash cluster.)
+            if crate::proxy::js_proxy_is_proxy(value) != 0 {
+                // A callable-target proxy's default ToString runs
+                // Function.prototype.toString with the PROXY as receiver —
+                // never introspectable, so the NativeFunction form (matches
+                // Node: `String(new Proxy(fn, {}))`). Non-callable targets
+                // resolve through the target.
+                if crate::proxy::proxy_wraps_callable(value) {
+                    let s = "function () { [native code] }";
+                    return crate::string::js_string_from_bytes(s.as_ptr(), s.len() as u32);
+                }
+                let target = crate::proxy::js_proxy_target(value);
+                if target.to_bits() != value.to_bits() {
+                    return js_jsvalue_to_string(target);
+                }
+                return crate::string::js_string_from_bytes(b"[object Object]".as_ptr(), 15);
+            }
             // Symbols: detect via the side-table before any GC header read.
             if crate::symbol::is_registered_symbol(ptr as usize) {
                 return unsafe {
@@ -529,6 +636,20 @@ pub extern "C" fn js_jsvalue_to_string(value: f64) -> *mut crate::string::String
                     0,
                 );
             }
+            // A TypedArray stringifies via %TypedArray%.prototype.toString
+            // (= `Array.prototype.join(",")`), not "[object Object]". Detected
+            // via the registry (a by-value lookup, no deref) before any
+            // GC-header probe — a TypedArrayHeader is NOT an ObjectHeader, so
+            // the ordinary toString/valueOf field path below would bit-cast
+            // garbage. Covers `String(ta)`, `` `${ta}` ``, and the `+` add
+            // fallback. (`Symbol.toPrimitive` overrides were already consulted
+            // above via `js_to_primitive`.)
+            if crate::typedarray::lookup_typed_array_kind(ptr as usize).is_some() {
+                return crate::typedarray::js_typed_array_join(
+                    ptr as *const crate::typedarray::TypedArrayHeader,
+                    std::ptr::null(),
+                );
+            }
             // #2089: a Date is a NaN-boxed `DateCell` pointer. `String(date)`,
             // `` `${date}` ``, and `date.toString()` produce the full local
             // date string (or "Invalid Date"), not "[object Object]". Detect
@@ -536,6 +657,15 @@ pub extern "C" fn js_jsvalue_to_string(value: f64) -> *mut crate::string::String
             // than an ObjectHeader), after non-GC native buffer handles.
             if crate::date::is_date_cell_addr(ptr as usize) {
                 return crate::date::js_date_to_string(value);
+            }
+            // Temporal (#4686): `String(temporal)`, `` `${temporal}` ``, and
+            // `temporal.toString()` produce the value's canonical ISO-8601 /
+            // IXDTF string, not "[object Object]". Detected here for the same
+            // reason as Date — the cell is smaller than an ObjectHeader.
+            if crate::temporal::is_temporal_cell_addr(ptr as usize) {
+                if let Some(s) = crate::temporal::temporal_iso_string(value) {
+                    return crate::string::js_string_from_bytes(s.as_ptr(), s.len() as u32);
+                }
             }
             // A RegExp stringifies to `/source/flags` (RegExp.prototype.toString),
             // not "[object Object]" — covers `String(re)` and `` `${re}` ``.
@@ -716,7 +846,7 @@ pub extern "C" fn js_jsvalue_to_string_method(value: f64) -> *mut crate::string:
     }
     if jsval.is_pointer() {
         let handle = jsval.as_pointer::<u8>() as usize;
-        if (1..0x100000).contains(&handle) {
+        if crate::value::addr_class::is_small_handle(handle) {
             if let Some(dispatch) = crate::object::handle_method_dispatch() {
                 let result = unsafe {
                     dispatch(handle as i64, b"toString".as_ptr(), 8, std::ptr::null(), 0)
@@ -732,6 +862,25 @@ pub extern "C" fn js_jsvalue_to_string_method(value: f64) -> *mut crate::string:
         }
     }
     js_jsvalue_to_string(value)
+}
+
+/// Spec `ToString(value)` for argument coercion (e.g. `RegExp.prototype.exec`'s
+/// `ToString(string)`, the RegExp constructor's pattern/flags). Unlike
+/// [`js_jsvalue_to_string_method`] — which models an explicit `x.toString()`
+/// method call and therefore throws on `undefined`/`null` — `ToString(undefined)`
+/// is `"undefined"` and `ToString(null)` is `"null"`. For every other value it
+/// defers to the method path so object receivers dispatch their own
+/// `toString`/`valueOf` (and a throwing one propagates).
+#[no_mangle]
+pub extern "C" fn js_jsvalue_to_string_coerce(value: f64) -> *mut crate::string::StringHeader {
+    let jsval = JSValue::from_bits(value.to_bits());
+    if jsval.is_undefined() {
+        return crate::string::js_string_from_bytes(b"undefined".as_ptr(), 9);
+    }
+    if jsval.is_null() {
+        return crate::string::js_string_from_bytes(b"null".as_ptr(), 4);
+    }
+    js_jsvalue_to_string_method(value)
 }
 
 fn throw_radix_range_error() -> ! {
@@ -868,18 +1017,41 @@ pub extern "C" fn js_jsvalue_to_string_radix(
 ) -> *mut crate::string::StringHeader {
     let jsval = JSValue::from_bits(value.to_bits());
 
-    // Coerce + validate the radix once up front. `None` → default radix 10.
-    let radix = match unsafe { coerce_validate_radix(radix_value) } {
-        Some(r) => r,
-        None => 10,
-    };
+    // A Temporal value's `toString` takes an *options object*, not a radix —
+    // the codegen routes any single-arg `.toString(x)` here. Dispatch back to
+    // the Temporal method router so the options bag flows through, instead of
+    // ToNumber-coercing it as a radix (which throws a spurious RangeError).
+    if crate::temporal::is_temporal_value(value) {
+        let result = crate::temporal::dispatch::call_method(value, "toString", &[radix_value]);
+        let rv = JSValue::from_bits(result.to_bits());
+        if rv.is_string() {
+            return rv.as_string_ptr() as *mut crate::string::StringHeader;
+        }
+        return js_jsvalue_to_string(result);
+    }
+
+    // Numeric receivers (Number / BigInt / Int32 / boxed Number): the second
+    // argument is a radix — coerce + validate it (throws on out-of-range). Other
+    // object receivers (Date, user `toString(opts)` methods) reach this with a
+    // non-radix argument, so we lazily validate the radix only on the numeric
+    // arms and otherwise dispatch the receiver's own `toString` with the
+    // argument forwarded — never ToNumber-coercing an options object as a radix.
+    macro_rules! radix {
+        () => {
+            match unsafe { coerce_validate_radix(radix_value) } {
+                Some(r) => r,
+                None => 10,
+            }
+        };
+    }
 
     if jsval.is_bigint() {
         let ptr = jsval.as_bigint_ptr();
-        crate::bigint::js_bigint_to_string_radix(ptr, radix)
+        crate::bigint::js_bigint_to_string_radix(ptr, radix!())
     } else if jsval.is_string() {
         jsval.as_string_ptr() as *mut crate::string::StringHeader
     } else if jsval.is_int32() {
+        let radix = radix!();
         let n = jsval.as_int32();
         if radix == 10 {
             let s = n.to_string();
@@ -887,25 +1059,68 @@ pub extern "C" fn js_jsvalue_to_string_radix(
         }
         let s = double_to_radix_string(n as f64, radix as u32);
         crate::string::js_string_from_bytes(s.as_ptr(), s.len() as u32)
+    } else if jsval.is_number() {
+        number_to_radix_string(value, radix!())
     } else {
-        // Regular f64 number
-        let n = value;
-        if n.is_nan() {
-            return crate::string::js_string_from_bytes(b"NaN".as_ptr(), 3);
-        }
-        if n.is_infinite() {
-            if n > 0.0 {
-                return crate::string::js_string_from_bytes(b"Infinity".as_ptr(), 8);
-            } else {
-                return crate::string::js_string_from_bytes(b"-Infinity".as_ptr(), 9);
+        // Pointer / object receiver. `Number.prototype.toString` brand
+        // semantics (ECMA-262 21.1.3): a boxed `Number` exposes its
+        // [[NumberData]]; `Number.prototype` itself has [[NumberData]] +0;
+        // any other object has no number value and dispatches its own
+        // `toString` with the argument forwarded (so a Temporal/Date receiver
+        // honours its options bag instead of treating it as a radix).
+        const CLASS_ID_BOXED_NUMBER: u32 = 0xFFFF_00D0;
+        if let Some((cid, payload)) = crate::builtins::boxed_primitive_payload(value) {
+            if cid == CLASS_ID_BOXED_NUMBER {
+                return number_to_radix_string(payload, radix!());
             }
         }
-        if radix == 10 {
-            return crate::string::js_number_to_string(value);
+        if value.to_bits() == crate::object::builtin_prototype_value("Number").to_bits() {
+            return number_to_radix_string(0.0, radix!());
         }
-        let s = double_to_radix_string(n, radix as u32);
-        crate::string::js_string_from_bytes(s.as_ptr(), s.len() as u32)
+        // Forward the argument to the receiver's own `toString`. A Temporal
+        // value routes to its options-aware `toString`; a plain object falls
+        // back to `Object.prototype.toString` ([object Object]).
+        if jsval.is_pointer() {
+            let args = [radix_value];
+            let result = unsafe {
+                crate::object::js_native_call_method(
+                    value,
+                    b"toString".as_ptr() as *const i8,
+                    8,
+                    args.as_ptr(),
+                    1,
+                )
+            };
+            let rjv = JSValue::from_bits(result.to_bits());
+            if rjv.is_string() {
+                return rjv.as_string_ptr() as *mut crate::string::StringHeader;
+            }
+            if rjv.is_short_string() {
+                return crate::string::js_string_materialize_to_heap(result);
+            }
+        }
+        js_jsvalue_to_string(value)
     }
+}
+
+/// Format a real f64 `n` in the given `radix` (2..=36), matching
+/// `Number.prototype.toString`'s NaN/Infinity/decimal handling.
+fn number_to_radix_string(n: f64, radix: i32) -> *mut crate::string::StringHeader {
+    if n.is_nan() {
+        return crate::string::js_string_from_bytes(b"NaN".as_ptr(), 3);
+    }
+    if n.is_infinite() {
+        if n > 0.0 {
+            return crate::string::js_string_from_bytes(b"Infinity".as_ptr(), 8);
+        } else {
+            return crate::string::js_string_from_bytes(b"-Infinity".as_ptr(), 9);
+        }
+    }
+    if radix == 10 {
+        return crate::string::js_number_to_string(n);
+    }
+    let s = double_to_radix_string(n, radix as u32);
+    crate::string::js_string_from_bytes(s.as_ptr(), s.len() as u32)
 }
 
 /// Ensure a value is a native string pointer.

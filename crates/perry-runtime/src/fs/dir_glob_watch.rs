@@ -800,6 +800,8 @@ struct PromiseWatchState {
     encoding: String,
     object_value: f64,
     timer_id: i64,
+    persistent: bool,
+    active: bool,
     snapshot: WatchSnapshot,
     queue: VecDeque<WatchEvent>,
     pending: VecDeque<*mut crate::promise::Promise>,
@@ -1342,7 +1344,9 @@ fn close_promise_watcher_return(id: usize) -> Vec<*mut crate::promise::Promise> 
     let Some(state) = removed else {
         return Vec::new();
     };
-    crate::timer::clearInterval(state.timer_id);
+    if state.timer_id != 0 {
+        crate::timer::clearInterval(state.timer_id);
+    }
     remove_abort_listener(state.signal, state.abort_listener);
     state.pending.into_iter().collect()
 }
@@ -1353,9 +1357,12 @@ fn abort_promise_watcher(id: usize, reason: f64) -> Vec<*mut crate::promise::Pro
         let Some(state) = watchers.get_mut(&id) else {
             return Vec::new();
         };
-        crate::timer::clearInterval(state.timer_id);
+        if state.timer_id != 0 {
+            crate::timer::clearInterval(state.timer_id);
+        }
         remove_abort_listener(state.signal, state.abort_listener);
         state.timer_id = 0;
+        state.active = false;
         state.signal = undefined_value();
         state.abort_listener = undefined_value();
         state.object_value = undefined_value();
@@ -1509,6 +1516,23 @@ extern "C" fn promise_watcher_poll_impl(closure: *const ClosureHeader) -> f64 {
         resolve_promise_with_event(promise, event, encoding);
     }
     undefined_value()
+}
+
+fn start_promise_watcher(id: usize, state: &mut PromiseWatchState) {
+    if state.active || state.closed {
+        return;
+    }
+    // Keep the creation-time baseline (seeded in `js_fs_promises_watch`) rather
+    // than re-snapshotting here — re-snapshotting would discard any events that
+    // occurred between `watch()` and this first `.next()` pull, which Node
+    // delivers (it buffers from FSWatcher creation, not from first iteration).
+    let timer_callback = poll_closure_value(promise_watcher_poll_impl as *const u8, id);
+    let timer_id = crate::timer::setInterval(timer_callback as i64, FS_WATCH_POLL_INTERVAL_MS);
+    if !state.persistent {
+        crate::timer::js_timer_unref(timer_id);
+    }
+    state.timer_id = timer_id;
+    state.active = true;
 }
 
 extern "C" fn watch_file_poll_impl(closure: *const ClosureHeader) -> f64 {
@@ -1776,6 +1800,7 @@ extern "C" fn promise_watcher_next_impl(closure: *const ClosureHeader) -> f64 {
         if state.closed {
             return PromiseNextAction::Done;
         }
+        start_promise_watcher(id, state);
         if let Some(event) = state.queue.pop_front() {
             return PromiseNextAction::Event(event, state.encoding.clone());
         }
@@ -2185,7 +2210,14 @@ pub extern "C" fn js_fs_promises_watch(path_value: f64, options_value: f64) -> f
         Ok(signal) => signal,
         Err(err) => crate::exception::js_throw(err),
     };
-    let snapshot = match snapshot_watch_target(&path, recursive) {
+    // Capture the directory state at creation time. Node registers the
+    // FSWatcher synchronously in `watch()` and buffers events emitted before
+    // the first `.next()` pull, so a file written between `watch()` and the
+    // first iteration is still delivered. Perry's watcher is poll-based and
+    // previously took its baseline snapshot lazily at the first `.next()`,
+    // which silently dropped those pre-iteration events. Seed the baseline
+    // here so the first poll diffs against the creation-time state.
+    let initial_snapshot = match snapshot_watch_target(&path, recursive) {
         Ok(snapshot) => snapshot,
         Err(err) => unsafe {
             crate::exception::js_throw(build_fs_error_value(&err, "watch", &path));
@@ -2193,11 +2225,6 @@ pub extern "C" fn js_fs_promises_watch(path_value: f64, options_value: f64) -> f
     };
     let id = next_watch_id();
     let object_value = build_promise_watcher_object(id);
-    let timer_callback = poll_closure_value(promise_watcher_poll_impl as *const u8, id);
-    let timer_id = crate::timer::setInterval(timer_callback as i64, FS_WATCH_POLL_INTERVAL_MS);
-    if !persistent {
-        crate::timer::js_timer_unref(timer_id);
-    }
     let abort_listener = signal
         .filter(|signal| !signal_is_aborted(*signal))
         .map(|signal| add_abort_listener(signal, id, promise_watcher_abort_impl))
@@ -2216,8 +2243,10 @@ pub extern "C" fn js_fs_promises_watch(path_value: f64, options_value: f64) -> f
                 recursive,
                 encoding,
                 object_value,
-                timer_id,
-                snapshot,
+                timer_id: 0,
+                persistent,
+                active: false,
+                snapshot: initial_snapshot,
                 queue: VecDeque::new(),
                 pending: VecDeque::new(),
                 signal: signal_value,
@@ -2227,9 +2256,6 @@ pub extern "C" fn js_fs_promises_watch(path_value: f64, options_value: f64) -> f
             },
         );
     });
-    if abort_reason.is_some() {
-        crate::timer::clearInterval(timer_id);
-    }
     object_value
 }
 

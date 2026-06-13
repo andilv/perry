@@ -651,7 +651,114 @@ pub(crate) fn lower_stmt(
                                     if let Some(inner_name) = inner_name_for_register {
                                         lowered_class.aliases.push(inner_name);
                                     }
+                                    // Computed member keys (`static get [expr]()`,
+                                    // `[expr]() {}`) register at runtime against the
+                                    // class id — the general class-expression arm in
+                                    // `lower_expr.rs` sequences these in front of the
+                                    // `ClassRef`. This `var C = class {…}` fast path
+                                    // emits a bare `ClassRef` binding instead, so emit
+                                    // the same registrations here or the computed
+                                    // accessors/methods never reach the side tables
+                                    // (Test262 accessor-name-{static,inst}/computed).
+                                    let computed_member_registrations: Vec<Expr> = lowered_class
+                                        .computed_members
+                                        .iter()
+                                        .map(|member| {
+                                            class_computed_member_registration_expr(
+                                                &bind_name, member,
+                                            )
+                                        })
+                                        .collect();
+                                    // Runtime-value parent (`var X = class extends
+                                    // <expr> {}` where the parent isn't a known class —
+                                    // e.g. @hono/node-server's `var Request = class
+                                    // extends GlobalRequest {}`, `GlobalRequest =
+                                    // global.Request`). The general class-expression arm
+                                    // in `lower_expr.rs` and the `Decl::Class` arms emit
+                                    // `RegisterClassParentDynamic` so the parent edge —
+                                    // and the fetch-parent kind for Request/Response
+                                    // subclasses — is wired at module init (where the
+                                    // alias still resolves). This `var C = class {…}`
+                                    // fast path emitted a bare `ClassRef` binding and
+                                    // skipped it, so the parent never registered and a
+                                    // `Request`/`Response` subclass got no native handle
+                                    // (inherited body methods threw "text is not a
+                                    // function"). Emit it here too, in source order
+                                    // before the value binding. Clone the extends
+                                    // expression before `push_class_dedup` moves the
+                                    // class out.
+                                    let parent_register =
+                                        lowered_class.extends_expr.clone().map(|p| {
+                                            Stmt::Expr(Expr::RegisterClassParentDynamic {
+                                                class_name: bind_name.clone(),
+                                                parent_expr: p,
+                                            })
+                                        });
+                                    // Inline static field/element initializers and
+                                    // static blocks at the class-expression's source
+                                    // position, exactly as the `Decl::Class` arm does
+                                    // for declarations. Without this the `var C =
+                                    // class { static x = 1 }` fast path relied solely
+                                    // on the late `init_static_fields_late` codegen
+                                    // pass, which runs AFTER the surrounding top-level
+                                    // statements — so `C.x` read immediately after the
+                                    // binding saw the uninitialized (0.0) slot, and a
+                                    // static method's `this.#priv` read undefined.
+                                    let static_field_inits: Vec<Stmt> = lowered_class
+                                        .static_fields
+                                        .iter()
+                                        .filter_map(|sf| {
+                                            sf.init.as_ref().map(|init| {
+                                                // `this` in a static initializer is
+                                                // the class constructor — see the
+                                                // matching substitution in the
+                                                // `Decl::Class` arm.
+                                                let mut init_value = init.clone();
+                                                crate::analysis::substitute_lexical_this_in_expr(
+                                                    &mut init_value,
+                                                    &Expr::ClassRef(bind_name.clone()),
+                                                );
+                                                if let Some(key) = sf.key_expr.as_ref() {
+                                                    Stmt::Expr(Expr::ClassStaticSymbolSet {
+                                                        class_name: bind_name.clone(),
+                                                        key: Box::new(key.clone()),
+                                                        value: Box::new(init_value),
+                                                    })
+                                                } else {
+                                                    Stmt::Expr(Expr::StaticFieldSet {
+                                                        class_name: bind_name.clone(),
+                                                        field_name: sf.name.clone(),
+                                                        value: Box::new(init_value),
+                                                    })
+                                                }
+                                            })
+                                        })
+                                        .collect();
+                                    let static_block_calls: Vec<Stmt> = lowered_class
+                                        .static_methods
+                                        .iter()
+                                        .filter(|m| m.name.starts_with("__perry_static_init_"))
+                                        .map(|m| {
+                                            Stmt::Expr(Expr::StaticMethodCall {
+                                                class_name: bind_name.clone(),
+                                                method_name: m.name.clone(),
+                                                args: Vec::new(),
+                                            })
+                                        })
+                                        .collect();
                                     push_class_dedup(module, lowered_class);
+                                    if let Some(reg) = parent_register {
+                                        module.init.push(reg);
+                                    }
+                                    for reg in computed_member_registrations {
+                                        module.init.push(Stmt::Expr(reg));
+                                    }
+                                    for s in static_field_inits {
+                                        module.init.push(s);
+                                    }
+                                    for s in static_block_calls {
+                                        module.init.push(s);
+                                    }
                                     // Register the alias so `new X()` → `new X()`
                                     // (no-op lookup, but marks the binding as a class).
                                     ctx.class_expr_aliases
@@ -962,17 +1069,27 @@ pub(crate) fn lower_stmt(
                     // point in source order.
                     for sf in &class.static_fields {
                         if let Some(init) = &sf.init {
+                            // Per ClassDefinitionEvaluation the initializer
+                            // runs with `this` bound to the class constructor;
+                            // these stmts evaluate in module-init context
+                            // (empty this_stack), so substitute lexical `this`
+                            // — including inside arrows — with the class ref.
+                            let mut init_value = init.clone();
+                            crate::analysis::substitute_lexical_this_in_expr(
+                                &mut init_value,
+                                &Expr::ClassRef(class.name.clone()),
+                            );
                             if let Some(key) = sf.key_expr.as_ref() {
                                 module.init.push(Stmt::Expr(Expr::ClassStaticSymbolSet {
                                     class_name: class.name.clone(),
                                     key: Box::new(key.clone()),
-                                    value: Box::new(init.clone()),
+                                    value: Box::new(init_value),
                                 }));
                             } else {
                                 module.init.push(Stmt::Expr(Expr::StaticFieldSet {
                                     class_name: class.name.clone(),
                                     field_name: sf.name.clone(),
-                                    value: Box::new(init.clone()),
+                                    value: Box::new(init_value),
                                 }));
                             }
                         }
@@ -1318,15 +1435,35 @@ pub(crate) fn lower_stmt(
             let catch = if let Some(ref catch_clause) = try_stmt.handler {
                 let scope_mark = ctx.enter_scope();
 
+                let mut binding_stmts: Vec<Stmt> = Vec::new();
                 let param = if let Some(ref pat) = catch_clause.param {
                     let param_name = get_pat_name(pat)?;
                     let param_id = ctx.define_local(param_name.clone(), Type::Any);
+                    // Destructured catch binding — `catch ([a, b = d()])` /
+                    // `catch ({ message })`: bind the pattern leaves off the
+                    // exception value before the user body runs.
+                    if !matches!(pat, ast::Pat::Ident(_)) {
+                        let mut leaves = Vec::new();
+                        collect_for_of_pattern_leaves(ctx, pat, &mut leaves);
+                        let mut idx = 0usize;
+                        emit_for_of_pattern_binding(
+                            ctx,
+                            pat,
+                            Expr::LocalGet(param_id),
+                            &leaves,
+                            &mut idx,
+                            &mut binding_stmts,
+                        )?;
+                    }
                     Some((param_id, param_name))
                 } else {
                     None
                 };
 
-                let catch_body = lower_block_stmt(ctx, &catch_clause.body)?;
+                let mut catch_body = lower_block_stmt(ctx, &catch_clause.body)?;
+                for (i, stmt) in binding_stmts.into_iter().enumerate() {
+                    catch_body.insert(i, stmt);
+                }
                 ctx.exit_scope(scope_mark);
 
                 Some(CatchClause {
@@ -1390,6 +1527,7 @@ pub(crate) fn lower_stmt(
                     "`with` statement is forbidden in strict mode"
                 );
             }
+            let insert_at = module.init.len();
             let env_id = ctx.define_local("__perry_with_env".to_string(), Type::Any);
             module.init.push(Stmt::Let {
                 id: env_id,
@@ -1402,6 +1540,14 @@ pub(crate) fn lower_stmt(
             let body_result = lower_body_stmt(ctx, &with_stmt.body);
             ctx.pop_with_env();
             module.init.extend(body_result?);
+            // Sentinel slots for implicit globals minted by with-set
+            // fallbacks inside this body (see with_set_fallback_for_ident).
+            for (i, (id, name)) in ctx.pending_with_implicit_inits.drain(..).enumerate() {
+                module.init.insert(
+                    insert_at + i,
+                    crate::lower::with_implicit_unset_let(id, name),
+                );
+            }
         }
         _ => {}
     }

@@ -69,38 +69,31 @@ fn register_map(ptr: *mut MapHeader) {
 }
 
 pub fn is_registered_map(addr: usize) -> bool {
-    // Fast pre-filter: managed Maps carry `GcHeader.obj_type ==
-    // GC_TYPE_MAP` at `addr - GC_HEADER_SIZE`. A single i8 load + cmp
-    // short-circuits the non-Map path (the common case across the
-    // typed-dispatch chain `if is_registered_map { ... } else if
-    // is_registered_set { ... } ...`) without paying the
-    // `HashSet<usize>::contains` SipHash. The HashSet check still runs
-    // on byte-matches to defend against:
-    //   1. False-positive aliasing — another managed object or a non-GC
-    //      allocation (for example a small BufferHeader slab entry) whose
-    //      preceding byte happens to read as 8.
-    //   2. Stale post-sweep ptrs — drop_map_index removes from
-    //      MAP_REGISTRY; the GcHeader byte may persist until the slot
-    //      is reused.
-    // Profile (samply, perf-comprehensive): ~5.7% inclusive samples
-    // were attributed to is_registered_map's HashSet lookup before
-    // this fast path landed.
     // #4004: small-handle registry ids (Web Fetch, perry-ffi/node:http, timers,
-    // …) are NaN-boxed POINTER_TAG values living below the `0x100000`
-    // small-handle cutoff; they are not heap addresses. Managed Maps are
-    // arena-allocated above it, so reject the whole small-handle band before
-    // dereferencing `addr - GC_HEADER_SIZE` (deref'ing e.g. a 0x40000 fetch
-    // handle reads unmapped memory and segfaults — see is_date_cell_addr).
-    if addr < 0x100000 {
+    // …) are NaN-boxed POINTER_TAG values living below the small-handle
+    // cutoff; they are not heap addresses. Managed Maps are arena-allocated
+    // above it. See `value::addr_class` for the band map.
+    if crate::value::addr_class::is_handle_band(addr) {
         return false;
     }
-    unsafe {
-        let header = (addr - crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-        if (*header).obj_type != crate::gc::GC_TYPE_MAP {
-            return false;
-        }
+    // Registry FIRST: it is authoritative and dereference-free (mirrors
+    // set::is_registered_set, #4665). The previous ordering probed
+    // `GcHeader.obj_type` at `addr - 8` as a fast pre-filter BEFORE the
+    // registry lookup — that dereferenced arbitrary above-band candidate
+    // pointers (e.g. garbage read off a mis-typed receiver) and segfaults on
+    // Linux where freed/foreign pages get unmapped (mimalloc on macOS retains
+    // them, hiding the bug). The pre-filter's perf rationale (a ~5.7%-sample
+    // SipHash `HashSet::contains`) predates MAP_REGISTRY moving to the
+    // Fibonacci-hash `PtrHashSet`, which is what set.rs ships with today.
+    if !MAP_REGISTRY.with(|r| r.borrow().contains(&addr)) {
+        return false;
     }
-    MAP_REGISTRY.with(|r| r.borrow().contains(&addr))
+    // A registered address is a live arena Map; the header read is safe and
+    // guards against a stale entry whose memory was reused by another type.
+    match unsafe { crate::value::addr_class::try_read_gc_header(addr) } {
+        Some(header) => header.obj_type == crate::gc::GC_TYPE_MAP,
+        None => false,
+    }
 }
 
 /// Resolve a NaN-boxed (or raw-i64) `this` receiver to a registered `Map`
@@ -1424,12 +1417,19 @@ pub extern "C" fn js_map_foreach(map: *const MapHeader, callback: f64, this_arg:
     let this_handle = scope.root_nanbox_f64(this_arg);
     unsafe {
         let map = map_handle.get_raw_const_ptr::<MapHeader>();
-        let size = (*map).size as usize;
         // The collection itself is the third callback argument and the
         // identity user code compares `self === m` against.
         let map_value = crate::value::js_nanbox_pointer(map as i64);
 
-        for i in 0..size {
+        // ECMA-262 24.1.3.5: forEach iterates [[MapData]] in insertion order,
+        // re-reading the live entry count each step. Entries appended during
+        // the callback (`map.set` inside the callback) MUST be visited, so the
+        // loop bound is re-evaluated against `(*map).size` every iteration
+        // rather than snapshotting the initial size — see the
+        // `iterates-values-added-after-foreach-begins` / `deleted-values`
+        // Test262 cases.
+        let mut i = 0usize;
+        loop {
             let map = map_handle.get_raw_const_ptr::<MapHeader>();
             if i >= (*map).size as usize {
                 break;
@@ -1446,6 +1446,7 @@ pub extern "C" fn js_map_foreach(map: *const MapHeader, callback: f64, this_arg:
             let prev_this = crate::object::js_implicit_this_set(this_v);
             let _ = crate::closure::js_native_call_value(cb, args.as_ptr(), args.len());
             crate::object::js_implicit_this_set(prev_this);
+            i += 1;
         }
     }
 }

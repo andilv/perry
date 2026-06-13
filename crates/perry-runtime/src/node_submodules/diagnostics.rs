@@ -477,6 +477,31 @@ pub fn error_path_for_message(message_ptr: *const StringHeader) -> Option<String
     ERROR_MESSAGE_PATHS.with(|m| m.borrow().get(&(message_ptr as usize)).cloned())
 }
 
+thread_local! {
+    pub(crate) static ERROR_MESSAGE_HOSTNAMES: RefCell<HashMap<usize, String>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Attach a Node-style `hostname` string to an Error keyed by its message
+/// StringHeader. Node's c-ares `dns.resolve*`/`dns.reverse` failures carry the
+/// queried hostname (or address) on `err.hostname`. Read back from the
+/// `.hostname` getter in `field_get_set` (mirrors `.path`).
+pub fn register_error_hostname(message_ptr: *const StringHeader, hostname: String) {
+    if message_ptr.is_null() {
+        return;
+    }
+    ERROR_MESSAGE_HOSTNAMES.with(|m| {
+        m.borrow_mut().insert(message_ptr as usize, hostname);
+    });
+}
+
+pub fn error_hostname_for_message(message_ptr: *const StringHeader) -> Option<String> {
+    if message_ptr.is_null() {
+        return None;
+    }
+    ERROR_MESSAGE_HOSTNAMES.with(|m| m.borrow().get(&(message_ptr as usize)).cloned())
+}
+
 /// Attach a Node-style `dest` string to an Error keyed by its message
 /// StringHeader. Node sets `dest` on two-path fs errors (rename/copyFile/
 /// link/symlink) alongside `path`. Read back from the `.dest` getter.
@@ -573,6 +598,21 @@ pub fn error_user_prop(error_ptr: usize, key: &str) -> Option<f64> {
                 ErrUserProp::Bits(b) => f64::from_bits(*b),
             })
         })
+    })
+}
+
+/// Remove a user-assigned own property from an Error object. Returns true
+/// when the property existed (used by `delete err.prop` and data↔accessor
+/// descriptor conversions).
+pub fn remove_error_user_prop(error_ptr: usize, key: &str) -> bool {
+    if error_ptr == 0 {
+        return false;
+    }
+    ERROR_USER_PROPS.with(|m| {
+        m.borrow_mut()
+            .get_mut(&error_ptr)
+            .map(|props| props.remove(key).is_some())
+            .unwrap_or(false)
     })
 }
 

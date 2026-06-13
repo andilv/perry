@@ -145,6 +145,12 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
         DOUBLE,
         &[DOUBLE, DOUBLE],
     );
+    // Annex B §B.2.2 accessor helpers — `Object.prototype.__defineGetter__`
+    // etc., reached via the `.call(obj, key[, fn])` rewrite.
+    module.declare_function("js_object_define_getter", DOUBLE, &[DOUBLE, DOUBLE, DOUBLE]);
+    module.declare_function("js_object_define_setter", DOUBLE, &[DOUBLE, DOUBLE, DOUBLE]);
+    module.declare_function("js_object_lookup_getter", DOUBLE, &[DOUBLE, DOUBLE]);
+    module.declare_function("js_object_lookup_setter", DOUBLE, &[DOUBLE, DOUBLE]);
     // Issue #620: own-property override probe used by class-method dispatch.
     // Returns the stored value if `name` is in obj's own keys_array (data
     // property only — no vtable getter walk), else TAG_UNDEFINED. Lets
@@ -189,6 +195,7 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     // The codegen IndexGet/IndexSet paths on `Expr::GlobalGet` route
     // through this helper.
     module.declare_function("js_get_global_this", DOUBLE, &[]);
+    module.declare_function("js_module_top_this", DOUBLE, &[]);
     module.declare_function("js_global_or_console_property_by_name", DOUBLE, &[I64]);
     // Refs #420: register a static computed-key Symbol field on a class.
     // Called from `init_static_fields` for each `static [Symbol.X] = init`.
@@ -308,11 +315,17 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     module.declare_function("js_string_normalize", I64, &[I64, DOUBLE]);
     module.declare_function("js_string_pad_start", I64, &[I64, DOUBLE, I64]);
     module.declare_function("js_string_pad_end", I64, &[I64, DOUBLE, I64]);
+    // ToString-coerce a padStart/padEnd fillString (undefined → null → " ").
+    module.declare_function("js_string_pad_fill", I64, &[DOUBLE]);
     module.declare_function("js_string_is_well_formed", DOUBLE, &[I64]);
     module.declare_function("js_string_to_well_formed", I64, &[I64]);
     module.declare_function("js_string_match_all", I64, &[I64, I64]);
     module.declare_function("js_string_match_all_value", I64, &[I64, DOUBLE]);
     module.declare_function("js_string_search_regex", I32, &[I64, I64]);
+    // Boxed-arg search/match: coerce a non-RegExp arg via RegExpCreate(ToString)
+    // (ECMA-262 §22.1.3.12 / §22.1.3.11).
+    module.declare_function("js_string_search_value", I32, &[I64, DOUBLE]);
+    module.declare_function("js_string_match_value", I64, &[I64, DOUBLE]);
     // Regex extras (runtime has them; codegen was stubbing).
     module.declare_function("js_regexp_exec_get_index", DOUBLE, &[]);
     module.declare_function("js_regexp_exec_get_groups", I64, &[]);
@@ -323,6 +336,16 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     module.declare_function("js_string_replace_regex_named", I64, &[I64, I64, I64]);
     module.declare_function("js_string_replace_all_regex_named", I64, &[I64, I64, I64]);
     module.declare_function("js_string_replace_string_fn", I64, &[I64, I64, DOUBLE]);
+    module.declare_function("js_string_replace_string_dyn", I64, &[I64, I64, DOUBLE]);
+    module.declare_function("js_string_replace_all_string_dyn", I64, &[I64, I64, DOUBLE]);
+    module.declare_function("js_string_replace_regex_dyn", I64, &[I64, I64, DOUBLE]);
+    module.declare_function("js_string_replace_all_regex_dyn", I64, &[I64, I64, DOUBLE]);
+    module.declare_function("js_string_replace_search_dyn", I64, &[I64, DOUBLE, DOUBLE]);
+    module.declare_function(
+        "js_string_replace_all_search_dyn",
+        I64,
+        &[I64, DOUBLE, DOUBLE],
+    );
     module.declare_function("js_string_replace_all_string_fn", I64, &[I64, I64, DOUBLE]);
     module.declare_function("js_string_replace_regex_fn", I64, &[I64, I64, DOUBLE]);
     module.declare_function("js_string_replace_all_regex_fn", I64, &[I64, I64, DOUBLE]);
@@ -378,6 +401,21 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     module.declare_function("js_crypto_md5", I64, &[I64]);
     module.declare_function("js_crypto_hmac_sha256", I64, &[I64, I64]);
     module.declare_function("js_crypto_hmac_sha256_bytes", I64, &[I64, I64]);
+    // #2013/#3146: shared codegen-callable argument validators. Emitted before
+    // a NaN-boxed value is unboxed to a raw pointer so a bad type throws node's
+    // `TypeError [ERR_INVALID_ARG_TYPE]` instead of dereferencing a bogus
+    // pointer (segfault). Used by `crypto.createHash`/`createHmac`/`pbkdf2*`.
+    module.declare_function("js_runtime_validate_string_arg", VOID, &[DOUBLE, PTR, I32]);
+    module.declare_function(
+        "js_runtime_validate_crypto_key_arg",
+        VOID,
+        &[DOUBLE, PTR, I32],
+    );
+    module.declare_function(
+        "js_runtime_validate_integer_arg",
+        VOID,
+        &[DOUBLE, PTR, I32, DOUBLE, DOUBLE],
+    );
     module.declare_function(
         "js_crypto_pbkdf2_bytes",
         I64,
@@ -618,6 +656,12 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     // branch so `await thenable` enters the polling path.
     module.declare_function("js_assimilate_thenable", DOUBLE, &[DOUBLE]);
     module.declare_function("js_promise_run_microtasks", I32, &[]);
+    // ESM entry marker: first microtask drain finishes promise jobs before
+    // the nextTick queue (Node module-evaluation checkpoint ordering, #788).
+    module.declare_function("js_mark_entry_module_esm", VOID, &[]);
+    // Promise/queueMicrotask jobs only — no nextTick drain, no timers.
+    // Used by the await lowering's drain_once block (#788).
+    module.declare_function("js_promise_run_promise_jobs", I32, &[]);
     // Drain stdlib's tokio async queue (fetch, DB, etc.). Lives in
     // perry-runtime as a thin function-pointer trampoline so it's
     // safe to call even when perry-stdlib is not linked (no-op).
@@ -985,6 +1029,13 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
         DOUBLE,
         &[DOUBLE, DOUBLE],
     );
+    // #4915: BYOB reader surface.
+    module.declare_function("js_readable_stream_get_byob_reader", DOUBLE, &[DOUBLE]);
+    module.declare_function(
+        "js_readable_stream_controller_byob_request",
+        DOUBLE,
+        &[DOUBLE],
+    );
     // #1645: ReadableStream.from(iterable) — builds a pre-loaded stream.
     module.declare_function("js_readable_stream_from_iterable", DOUBLE, &[DOUBLE]);
     module.declare_function("js_readable_stream_locked", DOUBLE, &[DOUBLE]);
@@ -1014,6 +1065,8 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     );
     // ReadableStreamDefaultReader.
     module.declare_function("js_reader_read", I64, &[DOUBLE]);
+    // #4915: BYOB `read(view)` — fills the caller-supplied view.
+    module.declare_function("js_reader_read_with_view", I64, &[DOUBLE, DOUBLE]);
     module.declare_function("js_reader_release_lock", DOUBLE, &[DOUBLE]);
     module.declare_function("js_reader_closed", I64, &[DOUBLE]);
     module.declare_function("js_reader_cancel", I64, &[DOUBLE, DOUBLE]);
@@ -1046,16 +1099,17 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     module.declare_function("js_writer_ready", I64, &[DOUBLE]);
     module.declare_function("js_writer_desired_size", DOUBLE, &[DOUBLE]);
     // TransformStream.
-    // #1644: leading arg is the `start` hook.
+    // #1644: leading arg is the `start` hook. #4915: the two trailing args
+    // are the writable / readable strategies (number or strategy object).
     module.declare_function(
         "js_transform_stream_new",
         DOUBLE,
-        &[DOUBLE, DOUBLE, DOUBLE, DOUBLE],
+        &[DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE],
     );
     module.declare_function(
         "js_transform_stream_new_from_transformer_object",
         DOUBLE,
-        &[DOUBLE, DOUBLE],
+        &[DOUBLE, DOUBLE, DOUBLE],
     );
     module.declare_function("js_transform_stream_readable", DOUBLE, &[DOUBLE]);
     module.declare_function("js_transform_stream_writable", DOUBLE, &[DOUBLE]);
@@ -1098,6 +1152,27 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
         DOUBLE,
         &[DOUBLE, DOUBLE, DOUBLE, DOUBLE],
     );
+    // `class X extends Request` / `extends Response`: `super(...)` shims that
+    // allocate the underlying native fetch handle and stash it on `this`.
+    // Invoked from the `Expr::SuperCall` Request/Response arm.
+    module.declare_function(
+        "js_request_subclass_init",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, DOUBLE],
+    );
+    module.declare_function(
+        "js_response_subclass_init",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, DOUBLE],
+    );
+    // Runtime-value super() dispatcher: identifies an aliased global
+    // Request/Response constructor parent (e.g. `extends GlobalRequest`) and
+    // stashes the native handle on `this`, else forwards to js_native_call_value.
+    module.declare_function(
+        "js_fetch_or_value_super",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, PTR, I64],
+    );
 
     // ──────────────────────────────────────────────────────────────────
     // AbortController / AbortSignal — perry-runtime/src/url.rs.
@@ -1116,6 +1191,13 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     module.declare_function("js_abort_signal_throw_if_aborted", DOUBLE, &[I64]);
     module.declare_function("js_event_target_new", I64, &[]);
     module.declare_function("js_event_new", I64, &[DOUBLE, DOUBLE, I32]);
+    // `super(type, options)` from `class X extends Event/CustomEvent` —
+    // initializes Event fields onto the existing subclass `this`.
+    module.declare_function(
+        "js_event_subclass_init",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, DOUBLE, I32, I32],
+    );
     module.declare_function("js_custom_event_new", I64, &[DOUBLE, DOUBLE, I32]);
     module.declare_function("js_dom_exception_new", I64, &[DOUBLE, DOUBLE]);
     module.declare_function("js_event_target_add_event_listener", VOID, &[I64, I64, I64]);

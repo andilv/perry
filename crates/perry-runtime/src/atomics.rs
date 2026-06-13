@@ -27,12 +27,6 @@ fn throw_type_error(message: &[u8]) -> ! {
     crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64))
 }
 
-fn throw_type_error_string(message: String) -> ! {
-    let msg = crate::string::js_string_from_bytes(message.as_ptr(), message.len() as u32);
-    let err = crate::error::js_typeerror_new(msg);
-    crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64))
-}
-
 fn throw_range_error(message: &[u8]) -> ! {
     let msg = crate::string::js_string_from_bytes(message.as_ptr(), message.len() as u32);
     let err = crate::error::js_rangeerror_new(msg);
@@ -52,6 +46,55 @@ fn bigint_integer_kind(kind: u8) -> bool {
 
 fn supported_integer_kind(kind: u8) -> bool {
     numeric_integer_kind(kind) || bigint_integer_kind(kind)
+}
+
+/// Element size in bytes for the wait/notify-eligible kinds (Int32 / BigInt64).
+fn atomic_elem_size(kind: u8) -> usize {
+    match kind {
+        KIND_BIGINT64 | KIND_BIGUINT64 => 8,
+        _ => 4,
+    }
+}
+
+/// Translate an already-`ToNumber`'d Atomics timeout (milliseconds) into a
+/// futex deadline. Per spec: `undefined`/`NaN` and `+Infinity` mean "block
+/// forever" (`None`); a non-positive value means "poll, return immediately"
+/// (`Some(ZERO)`); otherwise the millisecond duration. Absurdly large finite
+/// timeouts that would overflow `Duration` are treated as infinite.
+fn timeout_to_deadline(timeout_ms: f64) -> Option<std::time::Duration> {
+    if timeout_ms.is_nan() || timeout_ms == f64::INFINITY {
+        return None;
+    }
+    if timeout_ms <= 0.0 {
+        return Some(std::time::Duration::ZERO);
+    }
+    let secs = timeout_ms / 1000.0;
+    if secs > 1.0e9 {
+        return None;
+    }
+    Some(std::time::Duration::from_secs_f64(secs))
+}
+
+/// `Atomics.notify` count argument → number of waiters to wake. `undefined`
+/// means `+Infinity` (wake all). Otherwise `ToIntegerOrInfinity` clamped to
+/// `[0, usize::MAX]`. `number_arg` runs the full `ToNumber` (object `valueOf`,
+/// BigInt → TypeError) before truncation.
+fn notify_count_arg(count: f64) -> usize {
+    if JSValue::from_bits(count.to_bits()).is_undefined() {
+        return usize::MAX;
+    }
+    let n = number_arg(count);
+    if n.is_nan() {
+        0
+    } else if n == f64::INFINITY {
+        usize::MAX
+    } else if n <= 0.0 {
+        0
+    } else if n >= usize::MAX as f64 {
+        usize::MAX
+    } else {
+        n.trunc() as usize
+    }
 }
 
 enum AtomicView {
@@ -107,6 +150,34 @@ impl AtomicView {
             AtomicView::TypedArray { ptr, .. } => js_typed_array_set(*ptr, index, value),
             AtomicView::Uint8ArrayBuffer(ptr) => {
                 crate::buffer::js_buffer_set(*ptr, index, value as i32);
+            }
+        }
+    }
+
+    /// Absolute physical byte address of element `index`'s storage. For a
+    /// `SharedArrayBuffer`-backed view this resolves (through the view-meta
+    /// aliasing in `typed_array_bytes`) into the process-global backing store,
+    /// so the same SAB index yields the same address on every agent — the futex
+    /// table key that lets cross-thread `wait`/`notify` rendezvous (#4913).
+    /// Returns 0 if the backing pointer can't be resolved.
+    fn slot_addr(&self, index: i32) -> usize {
+        match self {
+            AtomicView::TypedArray { ptr, kind } => unsafe {
+                let base = crate::typedarray::typed_array_bytes(*ptr)
+                    .map(|b| b.as_ptr() as usize)
+                    .unwrap_or(0);
+                if base == 0 {
+                    return 0;
+                }
+                base + (index.max(0) as usize) * atomic_elem_size(*kind)
+            },
+            AtomicView::Uint8ArrayBuffer(ptr) => {
+                let base =
+                    crate::buffer::buffer_data(*ptr as *const crate::buffer::BufferHeader) as usize;
+                if base == 0 {
+                    return 0;
+                }
+                base + index.max(0) as usize
             }
         }
     }
@@ -173,61 +244,56 @@ fn atomics_wait_notify_view_arg(value: f64) -> AtomicView {
 }
 
 fn atomics_to_index(index: f64, length: i32) -> i32 {
-    let mut n = JSValue::from_bits(index.to_bits()).to_number();
-    if n.is_nan() {
-        n = 0.0;
+    // ECMA-262 ToIndex(index): ToNumber(index) → ToIntegerOrInfinity → range
+    // check. `js_number_coerce` is the full ToNumber — it runs an object's
+    // `Symbol.toPrimitive`/`valueOf`/`toString` (so the harness's
+    // `{ valueOf: () => 125 }` indices actually evaluate) and throws TypeError
+    // on a Symbol. A BigInt index is a ToNumber TypeError. The truncation must
+    // happen BEFORE the negativity check so a fractional in-bounds index like
+    // `-0.9` maps to +0 (ToIntegerOrInfinity) instead of wrongly throwing.
+    let js = JSValue::from_bits(index.to_bits());
+    if js.is_bigint() {
+        throw_type_error(b"Cannot convert a BigInt value to a number");
     }
-    if n < 0.0 || n > 9_007_199_254_740_991.0 {
+    let num = crate::builtins::js_number_coerce(index);
+    let integer = if num.is_nan() { 0.0 } else { num.trunc() };
+    if integer < 0.0 || integer > 9_007_199_254_740_991.0 {
         throw_range_error(b"Invalid atomic access index");
     }
-    let i = n.trunc();
-    if i >= length as f64 {
+    if integer >= length as f64 {
         throw_range_error(b"Invalid atomic access index");
     }
-    i as i32
+    integer as i32
 }
 
 fn number_arg(value: f64) -> f64 {
+    // ToNumber for the integer-view value / count / timeout arguments. A BigInt
+    // is a ToNumber TypeError; everything else (objects with `valueOf`, strings,
+    // booleans, Symbols-throw) is handled by the shared ToNumber.
     let js = JSValue::from_bits(value.to_bits());
     if js.is_bigint() {
         throw_type_error(b"Cannot convert a BigInt value to a number");
     }
-    if js.is_any_string() {
-        let ptr = crate::value::js_get_string_pointer_unified(value)
-            as *const crate::string::StringHeader;
-        if ptr.is_null() {
-            f64::NAN
-        } else {
-            unsafe {
-                let len = (*ptr).byte_len as usize;
-                let data =
-                    (ptr as *const u8).add(std::mem::size_of::<crate::string::StringHeader>());
-                match std::str::from_utf8(std::slice::from_raw_parts(data, len)) {
-                    Ok(s) => match s.trim() {
-                        "Infinity" | "+Infinity" => f64::INFINITY,
-                        "-Infinity" => f64::NEG_INFINITY,
-                        other => other.parse::<f64>().unwrap_or(f64::NAN),
-                    },
-                    Err(_) => f64::NAN,
-                }
-            }
-        }
-    } else {
-        js.to_number()
-    }
+    crate::builtins::js_number_coerce(value)
 }
 
 fn numeric_arg(value: f64) -> f64 {
     let n = number_arg(value);
     if n.is_finite() {
-        n.trunc()
+        // ToIntegerOrInfinity: truncate toward zero and normalize -0 to +0
+        // (the `+ 0.0` collapses -0.0). `Atomics.store(i32a, 0, -0)` must
+        // therefore return +0 (test262 store/expected-return-value-negative-zero).
+        n.trunc() + 0.0
     } else {
         0.0
     }
 }
 
-fn coerce_for_kind(kind: u8, value: f64) -> f64 {
-    let n = numeric_arg(value);
+/// Narrow an already-ToInteger'd number to the element kind (the modular
+/// reduction in `SetValueInBuffer`/`ToRawBytes`). Takes the integer directly so
+/// callers that already coerced the argument (and must observe `valueOf` only
+/// once) don't double-coerce.
+fn clamp_integer_for_kind(kind: u8, n: f64) -> f64 {
     match kind {
         KIND_INT8 => (n as i32 as i8) as f64,
         KIND_UINT8 => (n as i64).rem_euclid(256) as f64,
@@ -237,6 +303,10 @@ fn coerce_for_kind(kind: u8, value: f64) -> f64 {
         KIND_UINT32 => (n as i64 as u32) as f64,
         _ => n,
     }
+}
+
+fn coerce_for_kind(kind: u8, value: f64) -> f64 {
+    clamp_integer_for_kind(kind, numeric_arg(value))
 }
 
 fn to_uint32_bits(value: f64) -> u32 {
@@ -255,64 +325,26 @@ fn bitwise_result_for_kind(kind: u8, bits: u32) -> f64 {
     }
 }
 
-fn format_number_label(value: f64) -> String {
-    if value.is_nan() {
-        return "NaN".to_string();
-    }
-    if value.is_infinite() {
-        return if value.is_sign_negative() {
-            "-Infinity".to_string()
-        } else {
-            "Infinity".to_string()
-        };
-    }
-    if value == 0.0 {
-        return "0".to_string();
-    }
-    if value.fract() == 0.0 && value.abs() < 1e21 {
-        return format!("{value:.0}");
-    }
-    format!("{value}")
-}
-
-fn throw_number_to_bigint_error(value: f64, js: JSValue) -> ! {
-    let label = if js.is_int32() {
-        js.as_int32().to_string()
-    } else {
-        format_number_label(value)
-    };
-    throw_type_error_string(format!("Cannot convert {label} to a BigInt"))
-}
-
+/// `ToBigInt(value)` for the BigInt-view Atomics arguments. Delegates to the
+/// shared TypedArray store coercion, which runs `Symbol.toPrimitive`/`valueOf`/
+/// `toString` on objects and throws the spec TypeErrors (Number/undefined/null/
+/// Symbol → "Cannot convert … to a BigInt").
 fn bigint_value(value: f64) -> f64 {
-    let js = JSValue::from_bits(value.to_bits());
-    if js.is_bigint() {
-        return value;
-    }
-    if js.is_int32() || js.is_number() {
-        throw_number_to_bigint_error(value, js);
-    }
-    if js.is_bool() || js.is_any_string() {
-        let ptr = crate::bigint::js_bigint_from_f64(value);
-        return f64::from_bits(JSValue::bigint_ptr(ptr).bits());
-    }
-    if js.is_undefined() {
-        throw_type_error(b"Cannot convert undefined to a BigInt");
-    }
-    if js.is_null() {
-        throw_type_error(b"Cannot convert null to a BigInt");
-    }
-    throw_type_error(b"Cannot convert value to a BigInt");
+    crate::typedarray::bigint::to_bigint_for_store(value)
 }
 
-fn bigint_bits(value: f64) -> u64 {
-    let coerced = bigint_value(value);
+/// Low 64 bits of an already-coerced BigInt value (its limb-0 magnitude bits).
+fn bigint_limb0(coerced: f64) -> u64 {
     let ptr = JSValue::from_bits(coerced.to_bits()).as_bigint_ptr();
     let ptr = crate::bigint::clean_bigint_ptr(ptr);
     if ptr.is_null() {
         return 0;
     }
     unsafe { (*ptr).limbs[0] }
+}
+
+fn bigint_bits(value: f64) -> u64 {
+    bigint_limb0(bigint_value(value))
 }
 
 fn bigint_result_for_kind(kind: u8, bits: u64) -> f64 {
@@ -443,8 +475,12 @@ pub extern "C" fn js_atomics_load(_closure: *const ClosureHeader, view: f64, ind
 
 #[no_mangle]
 pub extern "C" fn js_atomics_is_lock_free(_closure: *const ClosureHeader, size: f64) -> f64 {
+    // ToNumber(size) (runs `valueOf`/`toString`, so `'4'`→4 behaves like Node),
+    // then an EXACT membership test over the lock-free element widths. Node/V8
+    // compares the raw number, so `4.9` is NOT floored to 4 — it is simply not a
+    // valid element width and returns false.
     let n = number_arg(size);
-    nanbox_bool(n.is_finite() && n.trunc() == n && matches!(n as i32, 1 | 2 | 4 | 8))
+    nanbox_bool(n == 1.0 || n == 2.0 || n == 4.0 || n == 8.0)
 }
 
 #[no_mangle]
@@ -456,12 +492,18 @@ pub extern "C" fn js_atomics_store(
 ) -> f64 {
     let (view, idx) = slot(view, index);
     if view.is_bigint() {
+        // ToBigInt runs the value's coercion hook exactly once; spec returns the
+        // coerced BigInt itself.
         let stored = bigint_value(value);
-        view.set_bigint_bits(idx, bigint_bits(stored));
+        view.set_bigint_bits(idx, bigint_limb0(stored));
         return stored;
     }
-    view.set_numeric(idx, coerce_for_kind(view.kind(), value));
-    view.get_numeric(idx)
+    // ToIntegerOrInfinity once (observes `valueOf` a single time). Atomics.store
+    // returns that integer — NOT the element-narrowed read-back — so e.g.
+    // `Atomics.store(int8, 0, 300)` returns 300 even though the slot holds 44.
+    let n = numeric_arg(value);
+    view.set_numeric(idx, clamp_integer_for_kind(view.kind(), n));
+    n
 }
 
 #[no_mangle]
@@ -592,12 +634,19 @@ pub extern "C" fn js_atomics_notify(
     index: f64,
     count: f64,
 ) -> f64 {
-    let (view, _idx) = wait_notify_slot(view, index);
-    let _ = numeric_arg(count);
+    let (view, idx) = wait_notify_slot(view, index);
+    // Coerce the count for its observable side effects even on a non-shared
+    // buffer (spec runs ToIntegerOrInfinity before the shared check returns 0).
+    let count = notify_count_arg(count);
     if !view.has_shared_backing() {
+        // A non-shared buffer can have no parked agents — spec returns 0.
         return 0.0;
     }
-    0.0
+    let addr = view.slot_addr(idx);
+    if addr == 0 {
+        return 0.0;
+    }
+    crate::atomics_futex::notify(addr, count) as f64
 }
 
 #[no_mangle]
@@ -608,24 +657,50 @@ pub extern "C" fn js_atomics_wait(
     expected: f64,
     timeout: f64,
 ) -> f64 {
-    let (view, idx) = wait_notify_slot(view, index);
+    // Spec order: validate the view, then the shared-buffer check throws BEFORE
+    // ValidateAtomicAccess coerces the index — so a poisoned `valueOf` index on
+    // a non-shared view must not run (test262 wait/non-shared-bufferdata-throws).
+    let view = atomics_wait_notify_view_arg(view);
     if !view.has_shared_backing() {
         throw_type_error(b"Atomics.wait requires a shared typed array");
     }
-    if view.kind() == KIND_BIGINT64 {
-        let expected = bigint_bits(expected);
-        if view.get_bigint_bits(idx) != expected {
-            return string_value(b"not-equal");
-        }
+    let idx = atomics_to_index(index, view.length());
+    let kind = view.kind();
+    // Coerce expected (and timeout) before parking, observing `valueOf` once.
+    let expected_bits = if kind == KIND_BIGINT64 {
+        bigint_bits(expected)
     } else {
-        let expected = coerce_for_kind(KIND_INT32, expected);
-        if view.get_numeric(idx) != expected {
-            return string_value(b"not-equal");
-        }
+        0
+    };
+    let expected_num = if kind == KIND_BIGINT64 {
+        0.0
+    } else {
+        coerce_for_kind(KIND_INT32, expected)
+    };
+    let deadline = timeout_to_deadline(number_arg(timeout));
+    let addr = view.slot_addr(idx);
+    if addr == 0 {
+        return string_value(b"not-equal");
     }
 
-    let _ = number_arg(timeout);
-    string_value(b"timed-out")
+    // Real futex park (#4913). The value re-check runs under the wait table's
+    // lock (atomic with the enqueue), so a `notify` from another agent that
+    // races this call is never lost: the agent either sees the changed value
+    // and returns "not-equal", or parks and is woken. A `timeout === 0` poll
+    // enqueues then immediately times out → "timed-out". An `undefined`/
+    // Infinity timeout blocks until notified.
+    let still_equal = || {
+        if kind == KIND_BIGINT64 {
+            view.get_bigint_bits(idx) == expected_bits
+        } else {
+            view.get_numeric(idx) == expected_num
+        }
+    };
+    match crate::atomics_futex::wait(addr, deadline, still_equal) {
+        crate::atomics_futex::WaitOutcome::NotEqual => string_value(b"not-equal"),
+        crate::atomics_futex::WaitOutcome::Ok => string_value(b"ok"),
+        crate::atomics_futex::WaitOutcome::TimedOut => string_value(b"timed-out"),
+    }
 }
 
 #[no_mangle]
@@ -636,10 +711,11 @@ pub extern "C" fn js_atomics_wait_async(
     expected: f64,
     timeout: f64,
 ) -> f64 {
-    let (view, idx) = wait_notify_slot(view, index);
+    let view = atomics_wait_notify_view_arg(view);
     if !view.has_shared_backing() {
         throw_type_error(b"Atomics.waitAsync requires a shared typed array");
     }
+    let idx = atomics_to_index(index, view.length());
     let kind = view.kind();
     let expected_bigint_bits = if kind == KIND_BIGINT64 {
         bigint_bits(expected)
@@ -658,14 +734,51 @@ pub extern "C" fn js_atomics_wait_async(
         view.get_numeric(idx) != expected_i32
     };
     if mismatched {
+        // Value already differs → synchronous, non-async "not-equal".
         return wait_async_result(false, string_value(b"not-equal"));
     }
     if timeout <= 0.0 {
+        // A zero/negative timeout returns synchronously (no promise).
         return wait_async_result(false, string_value(b"timed-out"));
     }
 
-    let scope = crate::gc::RuntimeHandleScope::new();
-    let timed_out = scope.root_nanbox_f64(string_value(b"timed-out"));
-    let promise = crate::promise::js_promise_resolved(timed_out.get_nanbox_f64());
+    // Matching value + positive (possibly Infinity/NaN) timeout: enqueue a
+    // waiter synchronously (atomic with the value check, so a racing `notify`
+    // is not lost), then resolve the promise from a background thread when a
+    // matching `notify` arrives or the timeout elapses (#4913, Stage 2).
+    let still_equal = || {
+        if kind == KIND_BIGINT64 {
+            view.get_bigint_bits(idx) == expected_bigint_bits
+        } else {
+            view.get_numeric(idx) == expected_i32
+        }
+    };
+    let addr = view.slot_addr(idx);
+    let handle = if addr == 0 {
+        None
+    } else {
+        crate::atomics_futex::enqueue(addr, still_equal)
+    };
+    let Some(handle) = handle else {
+        // Value changed at the atomic enqueue point → synchronous "not-equal".
+        return wait_async_result(false, string_value(b"not-equal"));
+    };
+
+    let deadline = timeout_to_deadline(timeout);
+    let promise = crate::promise::js_promise_new();
+    // Pin the promise + keep the event loop alive until the async result lands.
+    unsafe {
+        crate::thread::pin_promise(promise);
+    }
+    crate::thread::thread_job_begin();
+    let promise_usize = promise as usize;
+    std::thread::spawn(move || {
+        let outcome = crate::atomics_futex::block(handle, deadline);
+        let result = match outcome {
+            crate::atomics_futex::WaitOutcome::Ok => "ok",
+            _ => "timed-out",
+        };
+        crate::thread::queue_promise_string_result(promise_usize, result);
+    });
     wait_async_result(true, crate::value::js_nanbox_pointer(promise as i64))
 }

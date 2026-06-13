@@ -46,6 +46,54 @@ use super::{
     I18nLowerCtx,
 };
 
+/// Reserved runtime class id for a built-in constructor usable as a class
+/// heritage (`class S extends Array {}`). Used to register the subclass →
+/// built-in parent edge so `new S() instanceof Array` walks the class chain
+/// and matches. The ids MUST stay in sync with the `instanceof <Builtin>`
+/// match in `lower_instanceof` (this file) and the per-id branches in
+/// perry-runtime/src/object/instanceof.rs. Returns `None` for names without a
+/// reserved id (those can't be subclassed with working `instanceof` yet).
+pub(crate) fn builtin_parent_reserved_class_id(name: &str) -> Option<u32> {
+    Some(match name {
+        "Error" => 0xFFFF0001,
+        "TypeError" => 0xFFFF0010,
+        "RangeError" => 0xFFFF0011,
+        "ReferenceError" => 0xFFFF0012,
+        "SyntaxError" => 0xFFFF0013,
+        "AggregateError" => 0xFFFF0014,
+        "EvalError" => 0xFFFF0015,
+        "URIError" => 0xFFFF0016,
+        "Date" => 0xFFFF0020,
+        "RegExp" => 0xFFFF0021,
+        "Map" => 0xFFFF0022,
+        "Set" => 0xFFFF0023,
+        "Array" => 0xFFFF0024,
+        "ArrayBuffer" => 0xFFFF0025,
+        "DataView" => 0xFFFF002B,
+        "WeakMap" => 0xFFFF002C,
+        "WeakSet" => 0xFFFF002D,
+        "Promise" => 0xFFFF0027,
+        "Number" => 0xFFFF00D0,
+        "String" => 0xFFFF00D1,
+        "Boolean" => 0xFFFF00D2,
+        "BigInt" => 0xFFFF00D3,
+        "Symbol" => 0xFFFF00D4,
+        "Int8Array" => 0xFFFF0030,
+        "Uint8Array" => 0xFFFF0004,
+        "Int16Array" => 0xFFFF0032,
+        "Uint16Array" => 0xFFFF0033,
+        "Int32Array" => 0xFFFF0034,
+        "Uint32Array" => 0xFFFF0035,
+        "Float32Array" => 0xFFFF0036,
+        "Float64Array" => 0xFFFF0037,
+        "Uint8ClampedArray" => 0xFFFF0038,
+        "BigInt64Array" => 0xFFFF0039,
+        "BigUint64Array" => 0xFFFF003A,
+        "Function" => 0xFFFF00F0,
+        _ => return None,
+    })
+}
+
 fn emit_with_key(ctx: &mut FnCtx<'_>, property: &str) -> (String, String) {
     let key_idx = ctx.strings.intern(property);
     let key_entry = ctx.strings.entry(key_idx);
@@ -170,12 +218,16 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         } => {
             let obj = lower_expr(ctx, object)?;
             let (key_box, key_raw) = emit_with_key(ctx, property);
+            // HasBinding probe AFTER the RHS evaluates — matches V8/node
+            // (`with (o) { var x = delete o.x; }` writes the hoisted var,
+            // not o.x — test262 variable/binding-resolution.js judges
+            // against node's order, not the spec's resolve-reference-first).
+            let value_reg = lower_expr(ctx, value)?;
             let had = ctx.block().call(
                 I32,
                 "js_with_has_binding",
                 &[(DOUBLE, &obj), (I64, &key_raw)],
             );
-            let value_reg = lower_expr(ctx, value)?;
             let had_bool = ctx.block().icmp_ne(I32, &had, "0");
 
             let hit_idx = ctx.new_block("with.set.hit");
@@ -284,6 +336,11 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 .get(ty)
                 .map(|source| source.strip_prefix("node:").unwrap_or(source) == "fs")
                 .unwrap_or(false);
+            let imported_from_net = ctx
+                .imported_class_sources
+                .get(ty)
+                .map(|source| source.strip_prefix("node:").unwrap_or(source) == "net")
+                .unwrap_or(false);
             let cid = match ty.as_str() {
                 "Error" => 0xFFFF0001u32,
                 "TypeError" => 0xFFFF0010u32,
@@ -331,6 +388,15 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 // `ArrayBuffer` — runtime detects BufferHeader storage marked
                 // with Perry's ArrayBuffer side registry.
                 "ArrayBuffer" => 0xFFFF0025u32,
+                // WeakMap / WeakSet / DataView — no runtime probe for real
+                // instances yet (those return false independently), but the
+                // reserved ids let a `class S extends WeakMap {}` subclass
+                // instance match via the class-chain walk in
+                // perry-runtime/src/object/instanceof.rs. Refs
+                // class/subclass-builtins/subclass-{WeakMap,WeakSet,DataView}.
+                "DataView" => 0xFFFF002Bu32,
+                "WeakMap" => 0xFFFF002Cu32,
+                "WeakSet" => 0xFFFF002Du32,
                 // `Blob` — stream consumers allocate a scoped Blob-shaped
                 // ObjectHeader tagged with this reserved class id.
                 "Blob" => 0xFFFF0026u32,
@@ -370,6 +436,18 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 "PerformanceObserverEntryList" => 0xFFFF008Fu32,
                 "PerformanceResourceTiming" => 0xFFFF008Du32,
                 "Console" => 0xFFFF0083u32,
+                // Temporal reference types. A Temporal value is a NaN-boxed
+                // brand-tagged cell; the runtime resolves these reserved ids via
+                // a brand-kind probe in object/instanceof.rs. Keep in sync with
+                // perry-runtime/src/temporal/mod.rs (CLASS_ID_TEMPORAL_*).
+                "Temporal.Duration" => 0xFFFF0200u32,
+                "Temporal.Instant" => 0xFFFF0201u32,
+                "Temporal.PlainDate" => 0xFFFF0202u32,
+                "Temporal.PlainTime" => 0xFFFF0203u32,
+                "Temporal.PlainDateTime" => 0xFFFF0204u32,
+                "Temporal.PlainYearMonth" => 0xFFFF0205u32,
+                "Temporal.PlainMonthDay" => 0xFFFF0206u32,
+                "Temporal.ZonedDateTime" => 0xFFFF0207u32,
                 "Event" | "globalThis.Event" => 0xFFFF2403u32,
                 "CustomEvent" | "globalThis.CustomEvent" => 0xFFFF2404u32,
                 "DOMException" | "globalThis.DOMException" => 0xFFFF2405u32,
@@ -387,6 +465,10 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 "Stats" if imported_from_fs => 0xFFFF008Au32,
                 "fs.Utf8Stream" => 0xFFFF008Bu32,
                 "Utf8Stream" if imported_from_fs => 0xFFFF008Bu32,
+                // node:net `Stream` is an alias for `Socket`. Both are native
+                // small-handle values, so runtime probes the net socket map.
+                "net.Socket" | "net.Stream" => 0xFFFF00B4u32,
+                "Socket" | "Stream" if imported_from_net => 0xFFFF00B4u32,
                 "ReadStream" | "tty.ReadStream" => 0xFFFF0084u32,
                 "WriteStream" | "tty.WriteStream" => 0xFFFF0085u32,
                 "SecureContext" | "tls.SecureContext" => 0xFFFF00B5u32,
@@ -402,6 +484,13 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 // → false, so `{} instanceof Object` would otherwise
                 // regress; thread a real id through here instead.
                 "Object" => 0xFFFF0050u32,
+                // `Function` — every callable value (function declaration,
+                // expression, arrow, method, bound function, native handle,
+                // built-in constructor) is `instanceof Function`. The runtime
+                // resolves this reserved id by testing callability rather than
+                // walking a class chain. Keep in sync with
+                // perry-runtime/src/object/instanceof.rs (CLASS_ID_FUNCTION).
+                "Function" => 0xFFFF00F0u32,
                 _ => ctx.class_ids.get(ty).copied().unwrap_or_else(|| {
                     // Keep in sync with perry-runtime/src/object/instanceof.rs.
                     let classic_stream_cid = match ty.as_str() {
@@ -535,9 +624,15 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 }
                 Expr::PropertyGet { object, property } => {
                     let obj_box = lower_expr(ctx, object)?;
+                    // `delete null.x` / `delete undefined.x` → TypeError. The
+                    // `delete` algorithm calls `ToObject(GetBase)` on a property
+                    // reference, which throws for a nullish base.
+                    ctx.block()
+                        .call(DOUBLE, "js_require_object_coercible", &[(DOUBLE, &obj_box)]);
                     let key_idx = ctx.strings.intern(property);
                     let key_handle_global =
                         format!("@{}", ctx.strings.entry(key_idx).handle_global);
+                    let strict = if ctx.is_strict_fn { "1" } else { "0" };
                     let blk = ctx.block();
                     let obj_handle = unbox_to_i64(blk, &obj_box);
                     let key_box = blk.load(DOUBLE, &key_handle_global);
@@ -547,19 +642,18 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         "js_object_delete_field",
                         &[(I64, &obj_handle), (I64, &key_handle)],
                     );
-                    let bit = blk.icmp_ne(I32, &i32_v, "0");
-                    let tagged = blk.select(
-                        crate::types::I1,
-                        &bit,
-                        I64,
-                        crate::nanbox::TAG_TRUE_I64,
-                        crate::nanbox::TAG_FALSE_I64,
-                    );
-                    Ok(blk.bitcast_i64_to_double(&tagged))
+                    Ok(blk.call(DOUBLE, "js_delete_result", &[(I32, &i32_v), (I32, strict)]))
                 }
                 Expr::IndexGet { object, index } if is_string_expr(ctx, index) => {
                     let obj_box = lower_expr(ctx, object)?;
                     let key_box = lower_expr(ctx, index)?;
+                    // `delete null[k]` / `delete undefined[k]` → TypeError, after
+                    // the key expression is evaluated (spec
+                    // EvaluatePropertyAccessWithExpressionKey: RequireObjectCoercible
+                    // runs after ToPropertyKey's operand is evaluated).
+                    ctx.block()
+                        .call(DOUBLE, "js_require_object_coercible", &[(DOUBLE, &obj_box)]);
+                    let strict = if ctx.is_strict_fn { "1" } else { "0" };
                     let blk = ctx.block();
                     let obj_handle = unbox_to_i64(blk, &obj_box);
                     // SSO-safe key unbox — `js_object_delete_field`
@@ -570,15 +664,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         "js_object_delete_field",
                         &[(I64, &obj_handle), (I64, &key_handle)],
                     );
-                    let bit = blk.icmp_ne(I32, &i32_v, "0");
-                    let tagged = blk.select(
-                        crate::types::I1,
-                        &bit,
-                        I64,
-                        crate::nanbox::TAG_TRUE_I64,
-                        crate::nanbox::TAG_FALSE_I64,
-                    );
-                    Ok(blk.bitcast_i64_to_double(&tagged))
+                    Ok(blk.call(DOUBLE, "js_delete_result", &[(I32, &i32_v), (I32, strict)]))
                 }
                 // delete obj[expr] — route dynamic keys through the runtime so
                 // string-valued locals (for example `delete fn[name]`) still
@@ -587,6 +673,9 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 Expr::IndexGet { object, index } => {
                     let obj_box = lower_expr(ctx, object)?;
                     let idx_box = lower_expr(ctx, index)?;
+                    ctx.block()
+                        .call(DOUBLE, "js_require_object_coercible", &[(DOUBLE, &obj_box)]);
+                    let strict = if ctx.is_strict_fn { "1" } else { "0" };
                     let blk = ctx.block();
                     let obj_handle = unbox_to_i64(blk, &obj_box);
                     let i32_v = blk.call(
@@ -594,15 +683,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         "js_object_delete_dynamic",
                         &[(I64, &obj_handle), (DOUBLE, &idx_box)],
                     );
-                    let bit = blk.icmp_ne(I32, &i32_v, "0");
-                    let tagged = blk.select(
-                        crate::types::I1,
-                        &bit,
-                        I64,
-                        crate::nanbox::TAG_TRUE_I64,
-                        crate::nanbox::TAG_FALSE_I64,
-                    );
-                    Ok(blk.bitcast_i64_to_double(&tagged))
+                    Ok(blk.call(DOUBLE, "js_delete_result", &[(I32, &i32_v), (I32, strict)]))
                 }
                 _ => {
                     let _ = lower_expr(ctx, operand)?;
@@ -966,10 +1047,13 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             let str_box = lower_expr(ctx, string)?;
             let blk = ctx.block();
             let regex_handle = unbox_to_i64(blk, &regex_box);
-            // String pointer extraction goes through the unified
-            // helper because the receiver may be a literal, a local,
-            // or a concat result.
-            let str_handle = blk.call(I64, "js_get_string_pointer_unified", &[(DOUBLE, &str_box)]);
+            // Per spec `RegExp.prototype.test` does `ToString(argument)`, so a
+            // String wrapper (`re.test(new String("x"))`), a number
+            // (`re.test(123)`), or an object with a custom `toString` must be
+            // coerced — and a throwing `toString`/`valueOf` must propagate.
+            // `js_get_string_pointer_unified` only unwraps real strings, so use
+            // the coercing ToString that dispatches `toString` on objects.
+            let str_handle = blk.call(I64, "js_jsvalue_to_string_coerce", &[(DOUBLE, &str_box)]);
             let i32_v = blk.call(
                 I32,
                 "js_regexp_test",
@@ -987,7 +1071,10 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             let str_box = lower_expr(ctx, string)?;
             let blk = ctx.block();
             let regex_handle = unbox_to_i64(blk, &regex_box);
-            let str_handle = blk.call(I64, "js_get_string_pointer_unified", &[(DOUBLE, &str_box)]);
+            // `RegExp.prototype.exec` does `ToString(argument)` — coerce String
+            // wrappers / numbers / objects (and propagate a throwing toString)
+            // rather than only unwrapping real strings (see RegExpTest above).
+            let str_handle = blk.call(I64, "js_jsvalue_to_string_coerce", &[(DOUBLE, &str_box)]);
             let result = blk.call(
                 I64,
                 "js_regexp_exec",
@@ -1105,7 +1192,10 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             let out_slot = blk.alloca(I64);
             blk.store(I64, "0", &out_slot);
             let arr_handle = unbox_to_i64(blk, &arr_box);
-            let start_i32 = blk.fptosi(DOUBLE, &start_d, I32);
+            // ToIntegerOrInfinity via the clamping helper: `fptosi` on
+            // ±Infinity/NaN is LLVM poison — `splice(Infinity, 3)` deleted
+            // from index 0 (test262 splice/S15.4.4.12_A2.1_T3).
+            let start_i32 = blk.call(I32, "js_array_splice_delete_count", &[(DOUBLE, &start_d)]);
             let count_i32 = blk.call(I32, "js_array_splice_delete_count", &[(DOUBLE, &count_d)]);
 
             let (items_ptr, items_count_str) = if item_vals.is_empty() {
@@ -1207,7 +1297,18 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 "js_string_match",
                 &[(I64, &s_handle), (I64, &r_handle)],
             );
-            Ok(nanbox_pointer_inline(blk, &result))
+            // #4858: js_string_match returns null (0) on no-match. NaN-boxing
+            // 0 with POINTER_TAG yields a value that is neither `null` nor a
+            // valid heap pointer — `s.match(/x/g) === null` was false and
+            // consumers that deref the result (JSON.stringify, .map) crashed.
+            // Branchless null → TAG_NULL select, same as RegExpExec above.
+            let is_null = blk.icmp_eq(I64, &result, "0");
+            let ptr_boxed = nanbox_pointer_inline(ctx.block(), &result);
+            let ptr_bits = ctx.block().bitcast_double_to_i64(&ptr_boxed);
+            let selected =
+                ctx.block()
+                    .select(I1, &is_null, I64, crate::nanbox::TAG_NULL_I64, &ptr_bits);
+            Ok(ctx.block().bitcast_i64_to_double(&selected))
         }
 
         // -------- string.matchAll(pattern) --------
@@ -1290,11 +1391,19 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 "js_object_get_field_by_name_f64",
                 &[(I64, &obj_handle), (I64, &key_handle)],
             );
-            let old_num = blk.call(DOUBLE, "js_number_coerce", &[(DOUBLE, &old)]);
-            let new = match op {
-                BinaryOp::Sub => blk.fsub(&old_num, "1.0"),
-                _ => blk.fadd(&old_num, "1.0"),
+            // ToNumeric + Type(old)::add/sub(old, unit): a BigInt field stays a
+            // BigInt (`var x = {y:0n}; ++x.y === 1n`), not the Number `1`. Mirrors
+            // the identifier `Expr::Update` path. #4918 prefix/postfix bigint.
+            let old_num = blk.call(DOUBLE, "js_to_numeric", &[(DOUBLE, &old)]);
+            let step_arg = match op {
+                BinaryOp::Sub => "0",
+                _ => "1",
             };
+            let new = blk.call(
+                DOUBLE,
+                "js_numeric_step",
+                &[(DOUBLE, &old_num), (I32, step_arg)],
+            );
             blk.call_void(
                 "js_object_set_field_by_name",
                 &[(I64, &obj_handle), (I64, &key_handle), (DOUBLE, &new)],
@@ -1327,11 +1436,19 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 "js_dyn_index_get",
                 &[(DOUBLE, &obj_box), (DOUBLE, &idx_box)],
             );
-            let old_num = blk.call(DOUBLE, "js_number_coerce", &[(DOUBLE, &old)]);
-            let new = match op {
-                BinaryOp::Sub => blk.fsub(&old_num, "1.0"),
-                _ => blk.fadd(&old_num, "1.0"),
+            // ToNumeric + numeric step so a BigInt element stays BigInt
+            // (`var x = [0n]; ++x[0] === 1n`). Mirrors the identifier Update +
+            // PropertyUpdate paths. #4918 prefix/postfix bigint.
+            let old_num = blk.call(DOUBLE, "js_to_numeric", &[(DOUBLE, &old)]);
+            let step_arg = match op {
+                BinaryOp::Sub => "0",
+                _ => "1",
             };
+            let new = blk.call(
+                DOUBLE,
+                "js_numeric_step",
+                &[(DOUBLE, &old_num), (I32, step_arg)],
+            );
             blk.call(
                 DOUBLE,
                 "js_dyn_index_set",

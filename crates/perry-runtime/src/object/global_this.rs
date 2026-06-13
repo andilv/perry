@@ -5,44 +5,82 @@ use super::*;
 #[path = "global_this_webassembly.rs"]
 mod global_this_webassembly;
 
-/// Issue #611: lazily allocate shared `globalThis` for computed global access.
+thread_local! {
+    /// This thread's `globalThis`. The realm global is allocated in a *per-thread*
+    /// arena, but `GLOBAL_THIS_PTR` (the GC-root slot) is a process-global static.
+    /// A pointer published there by another, now-finished thread (the unit-test
+    /// harness runs each test on its own thread; `perry/thread` workers have their
+    /// own arenas) points into freed/reused memory — reading `globalThis.Array`
+    /// through it returns `undefined`, or worse derefs an invalid header. Caching
+    /// the global per thread means we only ever hand back a global this thread
+    /// created, and never dereference another thread's pointer to "validate" it.
+    static THREAD_GLOBAL_THIS: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    /// Module top-level `this` (Node-CJS `module.exports` stand-in) — a
+    /// lazily-allocated plain object distinct from `globalThis`. See
+    /// `Expr::ModuleTopThis`.
+    static THREAD_MODULE_TOP_THIS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// `this` in module top-level code. Node runs files as CommonJS where
+/// top-level `this` is `module.exports`: a fresh ordinary object, NOT the
+/// global. One object per thread (Perry links the whole program into one
+/// binary; the test corpus is single-module).
+#[no_mangle]
+pub extern "C" fn js_module_top_this() -> f64 {
+    let cached = THREAD_MODULE_TOP_THIS.with(|c| c.get());
+    if cached != 0 {
+        return f64::from_bits(cached);
+    }
+    let obj = super::alloc::js_object_alloc(0, 0);
+    let val = crate::value::js_nanbox_pointer(obj as i64);
+    THREAD_MODULE_TOP_THIS.with(|c| c.set(val.to_bits()));
+    // Keep it alive across GCs — the cell is a raw bits cache, not a scanned
+    // root, so register the slot address as a global root once.
+    crate::gc::runtime_write_barrier_root_heap_word(obj as u64);
+    let slot = THREAD_MODULE_TOP_THIS.with(|c| c.as_ptr() as usize);
+    crate::gc::js_gc_register_global_root(slot as i64);
+    val
+}
+
+/// Keepalive anchor: `js_module_top_this` is referenced only from
+/// codegen-generated `.o` files, so the auto-optimize whole-program LLVM
+/// rebuild would dead-strip it without this `#[used]` pin (see
+/// project_auto_optimize_keepalive_3320).
+#[used]
+static KEEP_JS_MODULE_TOP_THIS: extern "C" fn() -> f64 = js_module_top_this;
+
+/// Issue #611: lazily allocate `globalThis` for computed global access.
 #[no_mangle]
 pub extern "C" fn js_get_global_this() -> f64 {
-    let cached = GLOBAL_THIS_PTR.load(Ordering::Acquire);
-    let ptr = if cached != 0 {
-        while !GLOBAL_THIS_READY.load(Ordering::Acquire) {
-            std::hint::spin_loop();
-        }
-        cached
-    } else {
-        // First access — allocate. Race-tolerant: if two threads race the
-        // initial alloc, the loser's allocation leaks (never freed) but
-        // both threads see the winner's pointer afterward via CAS.
-        let new_ptr = js_object_alloc(0, 0) as i64;
-        // GC_STORE_AUDIT(ROOT): GLOBAL_THIS_PTR is a mutable root visited by scan_object_cache_roots_mut.
-        match crate::gc::runtime_compare_exchange_root_atomic_raw_i64(
-            &GLOBAL_THIS_PTR,
-            0,
-            new_ptr,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => {
-                // Populate constructor values for `globalThis.Array` /
-                // `context.Array` style reads without changing bare `new Array`.
-                populate_global_this_builtins(new_ptr as *mut ObjectHeader);
-                GLOBAL_THIS_READY.store(true, Ordering::Release);
-                new_ptr
-            }
-            Err(other) => {
-                while !GLOBAL_THIS_READY.load(Ordering::Acquire) {
-                    std::hint::spin_loop();
-                }
-                other
-            }
-        }
-    };
-    crate::value::js_nanbox_pointer(ptr)
+    let mine = THREAD_GLOBAL_THIS.with(|c| c.get());
+    if mine != 0 {
+        return crate::value::js_nanbox_pointer(mine);
+    }
+    // Register this thread's GC root scanners before the global exists, so the
+    // global (and the `Array`/`Object` intrinsics it holds) is born under a live
+    // root and survives later collections on this thread. Worker threads and the
+    // unit-test harness never run `js_gc_init()`, so without this a collection
+    // would reclaim the global mid-use, leaving a dangling intrinsic. No-op in
+    // production (already initialized) and inside the GC tests' controlled scopes.
+    crate::gc::ensure_gc_initialized();
+    // First access on this thread — allocate our own global.
+    let new_ptr = js_object_alloc(0, 0) as i64;
+    THREAD_GLOBAL_THIS.with(|c| c.set(new_ptr));
+    // Publish to the process-global GC-root slot so this thread's collector marks
+    // it (the unit-test harness runs tests sequentially, so the slot always holds
+    // the running thread's global). `GLOBAL_THIS_READY` is toggled around
+    // population so any concurrent reader spins until the field bag is complete.
+    GLOBAL_THIS_READY.store(false, Ordering::Release);
+    // GC_STORE_AUDIT(ROOT): GLOBAL_THIS_PTR is a mutable root visited by scan_object_cache_roots_mut.
+    crate::gc::runtime_store_root_atomic_raw_i64(&GLOBAL_THIS_PTR, new_ptr, Ordering::Release);
+    // Populate constructor values for `globalThis.Array` / `context.Array` style
+    // reads without changing bare `new Array`.
+    populate_global_this_builtins(new_ptr as *mut ObjectHeader);
+    GLOBAL_THIS_READY.store(true, Ordering::Release);
+    crate::value::js_nanbox_pointer(new_ptr)
 }
 
 #[no_mangle]
@@ -218,7 +256,24 @@ pub(crate) extern "C" fn global_this_request_thunk(
 ) -> f64 {
     let url_ptr = crate::value::js_get_string_pointer_unified(input) as *const crate::StringHeader;
     let method_ptr = global_this_fetch_option_string_ptr(init, b"method");
-    let body_ptr = global_this_fetch_option_string_ptr(init, b"body");
+    // Body init coercion that DRAINS a `ReadableStream` body. @hono/node-server
+    // wraps the incoming request body as `Readable.toWeb(incoming)` / a
+    // `new ReadableStream({...})`, so the plain string coercion would stringify
+    // the stream HANDLE to its numeric id and `await c.req.text()` would resolve
+    // to a bogus number. Route through the registered body-init helper (stdlib
+    // `js_response_body_init_ptr`), which drains the stream's buffered chunks;
+    // string bodies fall back to the ordinary coercion. Refs Hono `c.req.text()`.
+    let body_ptr = {
+        let body_val = global_this_fetch_option(init, b"body");
+        if matches!(
+            body_val.to_bits(),
+            crate::value::TAG_UNDEFINED | crate::value::TAG_NULL
+        ) {
+            std::ptr::null()
+        } else {
+            super::global_fetch::call_global_body_init_ptr(body_val)
+        }
+    };
     let headers_handle = global_this_init_headers_handle(init);
     let referrer_ptr = global_this_fetch_option_string_ptr(init, b"referrer");
     let referrer_policy_ptr = global_this_fetch_option_string_ptr(init, b"referrerPolicy");
@@ -254,6 +309,209 @@ pub(crate) extern "C" fn global_this_request_thunk(
         signal,
     )
 }
+
+/// Resolve a NaN-boxed `this` value to a heap `ObjectHeader` pointer, or
+/// `None` for a non-pointer / small-handle / null receiver.
+unsafe fn subclass_this_object_ptr(this_box: f64) -> Option<*mut ObjectHeader> {
+    let bits = this_box.to_bits();
+    if (bits >> 48) != 0x7FFD {
+        return None;
+    }
+    let raw = (bits & 0x0000_FFFF_FFFF_FFFF) as usize;
+    if !crate::value::addr_class::is_plausible_heap_addr(raw) {
+        return None;
+    }
+    Some(raw as *mut ObjectHeader)
+}
+
+/// Stash the id of a freshly-created native Web-Fetch handle (`handle_box` is
+/// the NaN-boxed pointer-tagged value the Request/Response thunk returns) on a
+/// subclass instance's `this` under `__perry_fetch_handle__`. Stored as a
+/// plain numeric f64 — `fetch_subclass_handle_id` reads it back.
+unsafe fn attach_fetch_handle_to_this(this_box: f64, handle_box: f64) {
+    if let Some(obj) = subclass_this_object_ptr(this_box) {
+        let id = crate::value::js_nanbox_get_pointer(handle_box);
+        let key = crate::string::js_string_from_bytes(
+            FETCH_SUBCLASS_HANDLE_FIELD.as_ptr(),
+            FETCH_SUBCLASS_HANDLE_FIELD.len() as u32,
+        );
+        crate::object::js_object_set_field_by_name(obj, key, id as f64);
+    }
+}
+
+/// Attach a native fetch handle to a freshly dynamically-constructed
+/// Request/Response subclass instance, building it from the `new` arguments.
+/// `kind` is 1 (Request) or 2 (Response). Used by the runtime
+/// dynamic-construction path (`js_new_function_construct`) for class-expression
+/// / ClassRef subclasses whose `super()` couldn't statically route the parent.
+pub(crate) unsafe fn attach_fetch_handle_for_construction(
+    inst: *mut ObjectHeader,
+    kind: u8,
+    args_ptr: *const f64,
+    args_len: usize,
+) {
+    let undef = f64::from_bits(crate::value::TAG_UNDEFINED);
+    let arg0 = if args_len >= 1 && !args_ptr.is_null() {
+        *args_ptr
+    } else {
+        undef
+    };
+    let arg1 = if args_len >= 2 && !args_ptr.is_null() {
+        *args_ptr.add(1)
+    } else {
+        undef
+    };
+    let handle = if kind == 1 {
+        global_this_request_thunk(std::ptr::null(), arg0, arg1)
+    } else {
+        global_this_response_thunk(std::ptr::null(), arg0, arg1)
+    };
+    let this_box = crate::value::js_nanbox_pointer(inst as i64);
+    attach_fetch_handle_to_this(this_box, handle);
+}
+
+/// `super(input, init)` for `class X extends Request`. Allocates the underlying
+/// native Request handle and stashes it on `this`; inherited body methods /
+/// property getters are forwarded to the handle at access time. Returns
+/// `undefined` (the super-call value).
+#[no_mangle]
+pub extern "C" fn js_request_subclass_init(this_box: f64, input: f64, init: f64) -> f64 {
+    let handle = global_this_request_thunk(std::ptr::null(), input, init);
+    unsafe { attach_fetch_handle_to_this(this_box, handle) };
+    f64::from_bits(crate::value::TAG_UNDEFINED)
+}
+
+/// `super(body, init)` for `class X extends Response`. Mirror of
+/// `js_request_subclass_init` for the Response handle.
+#[no_mangle]
+pub extern "C" fn js_response_subclass_init(this_box: f64, body: f64, init: f64) -> f64 {
+    let handle = global_this_response_thunk(std::ptr::null(), body, init);
+    unsafe { attach_fetch_handle_to_this(this_box, handle) };
+    f64::from_bits(crate::value::TAG_UNDEFINED)
+}
+
+// The two shims above are reached only from codegen-emitted IR (the
+// `Expr::SuperCall` Request/Response arm); pin them so the auto-optimize
+// bitcode rebuild's dead-strip can't drop them (see
+// project_auto_optimize_keepalive_3320).
+#[used]
+static KEEP_JS_REQUEST_SUBCLASS_INIT: extern "C" fn(f64, f64, f64) -> f64 =
+    js_request_subclass_init;
+#[used]
+static KEEP_JS_RESPONSE_SUBCLASS_INIT: extern "C" fn(f64, f64, f64) -> f64 =
+    js_response_subclass_init;
+
+/// `super(...)` for `class X extends <runtime-value constructor>` where the
+/// parent expression is an alias of the global `Request`/`Response` constructor
+/// — e.g. `@hono/node-server`'s `class Request extends GlobalRequest` with
+/// `GlobalRequest = global.Request`. The textual parent name is the alias
+/// ("GlobalRequest"), not "Request", so codegen can't statically route it;
+/// instead every runtime-value `super()` dispatches through here. When
+/// `parent_val` resolves to the Request/Response constructor we allocate the
+/// native handle and stash it on `this` (so inherited body methods work);
+/// otherwise we fall back to the ordinary implicit-`this`-bound
+/// `js_native_call_value`, preserving the prior behavior for every other
+/// runtime-value parent (Effect's `Data.Class`, etc.).
+#[no_mangle]
+pub unsafe extern "C" fn js_fetch_or_value_super(
+    parent_val: f64,
+    this_box: f64,
+    args_ptr: *const f64,
+    args_len: usize,
+) -> f64 {
+    let undef = f64::from_bits(crate::value::TAG_UNDEFINED);
+    // Resolve the parent constructor kind from the value first. When the
+    // `extends` expression is an alias of `global.Request`/`global.Response`
+    // (`@hono/node-server`'s `class Request extends GlobalRequest`), the alias
+    // var can lower to a constructor-scope local that reads `undefined` at
+    // super-time, so `identify_global_builtin_constructor(parent_val)` returns
+    // `None`. Fall back to the fetch-parent kind registered against the
+    // instance's class at module init (via `js_register_class_parent_dynamic`,
+    // where the alias resolved correctly) so the native handle still attaches.
+    let kind =
+        super::class_registry::identify_global_builtin_constructor(parent_val).or_else(|| {
+            let obj = subclass_this_object_ptr(this_box)?;
+            match super::class_registry::fetch_parent_kind_in_chain(
+                crate::object::js_object_get_class_id(obj),
+            ) {
+                Some(1) => Some("Request"),
+                Some(2) => Some("Response"),
+                _ => None,
+            }
+        });
+    match kind {
+        Some("Request") | Some("Response") => {
+            let arg0 = if args_len >= 1 && !args_ptr.is_null() {
+                *args_ptr
+            } else {
+                undef
+            };
+            let arg1 = if args_len >= 2 && !args_ptr.is_null() {
+                *args_ptr.add(1)
+            } else {
+                undef
+            };
+            let handle = if kind == Some("Request") {
+                global_this_request_thunk(std::ptr::null(), arg0, arg1)
+            } else {
+                global_this_response_thunk(std::ptr::null(), arg0, arg1)
+            };
+            attach_fetch_handle_to_this(this_box, handle);
+            undef
+        }
+        _ => {
+            // `class PQ extends t {}` nested inside another function (webpack/
+            // ncc inner modules — next/dist/compiled/p-queue extending
+            // eventemitter3): HIR lowers the heritage Ident at class-DECL
+            // scope, but codegen re-emits that expression inside the
+            // constructor, where the captured slot index is unrelated, so
+            // `parent_val` arrives stale (undefined). The decl-site
+            // `js_register_class_parent_dynamic` call DID see the live value
+            // and recorded it in CLASS_PARENT_CLOSURES — prefer that
+            // registration whenever `parent_val` isn't actually callable, so
+            // the parent function body still runs with `this` bound (sets
+            // `this._events` etc.). A valid closure / class-object parent
+            // value keeps the existing direct-dispatch path untouched.
+            let mut callee = parent_val;
+            let bits = parent_val.to_bits();
+            const POINTER_TAG: u64 = 0x7FFD_0000_0000_0000;
+            const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
+            const PTR_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+            let usable = if bits & TAG_MASK == POINTER_TAG {
+                let p = (bits & PTR_MASK) as usize;
+                // A real callability test: a closure, or a per-evaluation class
+                // OBJECT (constructor). The prior `class_id != 0` accepted any
+                // pointer-tagged object with a class id — including non-callable
+                // instances — so a stale captured slot holding one of those
+                // skipped the `parent_closure_in_chain` recovery below and
+                // dispatched `js_native_call_value` on a non-function.
+                crate::closure::is_closure_ptr(p)
+                    || super::class_registry::is_class_object_ptr(p as *const u8)
+            } else {
+                // INT32-tagged ClassRefs route through the static super paths
+                // before reaching here; anything else (undefined / a stale
+                // numeric slot) is not a constructor.
+                bits & TAG_MASK == 0x7FFE_0000_0000_0000
+            };
+            if !usable {
+                if let Some(obj) = subclass_this_object_ptr(this_box) {
+                    let cid = crate::object::js_object_get_class_id(obj);
+                    if let Some(addr) = super::class_registry::parent_closure_in_chain(cid) {
+                        callee = f64::from_bits(POINTER_TAG | addr as u64);
+                    }
+                }
+            }
+            let prev = crate::object::js_implicit_this_set(this_box);
+            let r = crate::closure::js_native_call_value(callee, args_ptr, args_len);
+            crate::object::js_implicit_this_set(prev);
+            r
+        }
+    }
+}
+
+#[used]
+static KEEP_JS_FETCH_OR_VALUE_SUPER: unsafe extern "C" fn(f64, f64, *const f64, usize) -> f64 =
+    js_fetch_or_value_super;
 
 extern "C" fn global_this_response_error_thunk(
     _closure: *const crate::closure::ClosureHeader,
@@ -300,6 +558,14 @@ extern "C" fn global_this_eval_thunk(
     _closure: *const crate::closure::ClosureHeader,
     source: f64,
 ) -> f64 {
+    // PerformEval step: "If Type(x) is not String, return x." A non-string
+    // argument (number, boolean, null, undefined, or a String/Number/Boolean
+    // *wrapper object*) is returned unchanged — eval does not evaluate it. This
+    // must run before any ToString coercion. (test262
+    // language/eval-code/indirect/non-string-{object,primitive})
+    if !crate::value::JSValue::from_bits(source.to_bits()).is_string() {
+        return source;
+    }
     let source = crate::builtins::js_string_coerce(source);
     let Some(body) = (unsafe { super::has_own_helpers::str_from_string_header(source) }) else {
         return f64::from_bits(crate::value::TAG_UNDEFINED);
@@ -439,6 +705,21 @@ pub(crate) extern "C" fn uri_error_constructor_call_thunk(
     message: f64,
 ) -> f64 {
     error_constructor_call(crate::error::ERROR_KIND_URI_ERROR, message)
+}
+
+/// Whether `value` is the %Function.prototype% intrinsic object. It is the
+/// one ordinary-object-shaped value that is itself a Function: callable
+/// (returns `undefined`), tagged `[object Function]`, but NOT a constructor.
+/// Only consulted on slow paths (failed call dispatch, `Object.prototype.
+/// toString`), so the per-call re-resolution through the global registry is
+/// fine — and safer than caching a raw pointer across GC cycles.
+pub(crate) fn is_function_prototype_object_value(value: f64) -> bool {
+    let jv = JSValue::from_bits(value.to_bits());
+    if !jv.is_pointer() {
+        return false;
+    }
+    let proto = builtin_prototype_value("Function");
+    proto.to_bits() == value.to_bits()
 }
 
 pub(crate) fn builtin_prototype_value(name: &str) -> f64 {
@@ -1016,6 +1297,7 @@ extern "C" fn function_prototype_call_thunk(
     } else {
         (args.as_ptr(), args.len())
     };
+    let this_arg = crate::closure::coerce_call_this(target, this_arg);
     let prev_this = IMPLICIT_THIS.with(|c| c.replace(this_arg.to_bits()));
     let result = unsafe { crate::closure::js_native_call_value(target, args_ptr, args_len) };
     IMPLICIT_THIS.with(|c| c.set(prev_this));
@@ -1170,9 +1452,15 @@ extern "C" fn object_prototype_is_prototype_of_thunk(
     value: f64,
 ) -> f64 {
     let this_value = f64::from_bits(IMPLICIT_THIS.with(|c| c.get()));
-    // RequireObjectCoercible(this): `Object.prototype.isPrototypeOf.call(null)`
-    // / `.call(undefined)` must throw a TypeError (spec step 1), matching the
-    // sibling Object.prototype methods. Pre-fix this silently returned false.
+    // Spec 20.1.3.3 step order: if V is not an Object, return false FIRST —
+    // `Object.prototype.isPrototypeOf.call(undefined, 1)` is `false`, not a
+    // TypeError. Symbols are POINTER_TAG'd in Perry but are primitives.
+    let value_jsv = JSValue::from_bits(value.to_bits());
+    if !value_jsv.is_pointer() || unsafe { crate::symbol::js_is_symbol(value) } != 0 {
+        return f64::from_bits(JSValue::bool(false).bits());
+    }
+    // Step 2, ToObject(this): `.call(null, obj)` / `.call(undefined, obj)`
+    // must throw a TypeError, matching the sibling Object.prototype methods.
     let this_jsv = JSValue::from_bits(this_value.to_bits());
     if this_jsv.is_null() || this_jsv.is_undefined() {
         super::object_ops::throw_object_type_error(
@@ -1181,6 +1469,21 @@ extern "C" fn object_prototype_is_prototype_of_thunk(
     }
     f64::from_bits(
         JSValue::bool(unsafe { super::js_object_is_prototype_of_value(this_value, value) }).bits(),
+    )
+}
+
+/// #4533: native error subclass constructors whose `[[Prototype]]` is `Error`
+/// (their `.prototype.[[Prototype]]` already links to `Error.prototype`).
+fn is_native_error_subclass_constructor(name: &str) -> bool {
+    matches!(
+        name,
+        "TypeError"
+            | "RangeError"
+            | "SyntaxError"
+            | "ReferenceError"
+            | "EvalError"
+            | "URIError"
+            | "AggregateError"
     )
 }
 
@@ -1206,6 +1509,43 @@ extern "C" fn object_prototype_property_is_enumerable_thunk(
 ) -> f64 {
     let this_value = f64::from_bits(IMPLICIT_THIS.with(|c| c.get()));
     super::js_object_property_is_enumerable(this_value, key)
+}
+
+// Annex B §B.2.2 Object.prototype accessor methods — real thunks so reflective
+// access (`Object.prototype.__defineGetter__.call(o, k, fn)`, `typeof`) works,
+// not just the direct `o.__defineGetter__(...)` native-dispatch path.
+extern "C" fn object_prototype_define_getter_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    key: f64,
+    getter: f64,
+) -> f64 {
+    let this_value = f64::from_bits(IMPLICIT_THIS.with(|c| c.get()));
+    super::js_object_define_getter(this_value, key, getter)
+}
+
+extern "C" fn object_prototype_define_setter_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    key: f64,
+    setter: f64,
+) -> f64 {
+    let this_value = f64::from_bits(IMPLICIT_THIS.with(|c| c.get()));
+    super::js_object_define_setter(this_value, key, setter)
+}
+
+extern "C" fn object_prototype_lookup_getter_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    key: f64,
+) -> f64 {
+    let this_value = f64::from_bits(IMPLICIT_THIS.with(|c| c.get()));
+    super::js_object_lookup_getter(this_value, key)
+}
+
+extern "C" fn object_prototype_lookup_setter_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    key: f64,
+) -> f64 {
+    let this_value = f64::from_bits(IMPLICIT_THIS.with(|c| c.get()));
+    super::js_object_lookup_setter(this_value, key)
 }
 
 extern "C" fn error_prototype_to_string_thunk(
@@ -1278,6 +1618,14 @@ unsafe fn function_apply_args(args_array: f64) -> Vec<f64> {
     if value.is_undefined() || value.is_null() {
         return Vec::new();
     }
+    // An arguments OBJECT is array-like but fails the IsArray check below —
+    // unpack it via its registry (`fn.apply(this, arguments)`).
+    if value.is_pointer() {
+        let raw = (value.bits() & crate::value::POINTER_MASK) as usize;
+        if let Some(values) = super::arguments_object_to_vec(raw as *const super::ObjectHeader) {
+            return values;
+        }
+    }
     let is_array = JSValue::from_bits(crate::array::js_array_is_array(args_array).to_bits());
     if !is_array.is_bool() || !is_array.as_bool() {
         return Vec::new();
@@ -1310,6 +1658,7 @@ extern "C" fn function_prototype_apply_thunk(
     unsafe {
         let target = f64::from_bits(IMPLICIT_THIS.with(|c| c.get()));
         let args = function_apply_args(args_array);
+        let this_arg = crate::closure::coerce_call_this(target, this_arg);
         let prev_this = IMPLICIT_THIS.with(|c| c.replace(this_arg.to_bits()));
         let result = crate::closure::js_native_call_value(target, args.as_ptr(), args.len());
         IMPLICIT_THIS.with(|c| c.set(prev_this));
@@ -1336,6 +1685,27 @@ extern "C" fn function_prototype_to_string_thunk(
         0
     };
     if raw == 0 || !crate::closure::is_closure_ptr(raw) {
+        // A Proxy whose target is callable is itself callable; its source is
+        // never introspectable, so the spec mandates the NativeFunction form.
+        let this_val = f64::from_bits(this_bits);
+        if crate::proxy::js_proxy_is_proxy(this_val) == 1
+            && crate::proxy::proxy_wraps_callable(this_val)
+        {
+            let s = "function () { [native code] }";
+            let str_ptr = crate::string::js_string_from_bytes(s.as_ptr(), s.len() as u32);
+            return f64::from_bits(JSValue::string_ptr(str_ptr).bits());
+        }
+        // A class reference (INT32-tagged registered class id) is a function
+        // value; Perry retains no class source, so emit the NativeFunction
+        // form with the class name.
+        if super::class_prototype_ref_id(this_val).is_none() {
+            if let Some(cid) = super::native_module::class_ref_id(this_val) {
+                let name = super::class_registry::class_name_for_id(cid).unwrap_or_default();
+                let s = format!("function {name}() {{ [native code] }}");
+                let str_ptr = crate::string::js_string_from_bytes(s.as_ptr(), s.len() as u32);
+                return f64::from_bits(JSValue::string_ptr(str_ptr).bits());
+            }
+        }
         super::object_ops::throw_object_type_error(
             b"Function.prototype.toString requires that 'this' be a Function",
         );
@@ -1399,6 +1769,179 @@ extern "C" fn array_prototype_slice_thunk(
     f64::from_bits(crate::value::js_nanbox_pointer(result as i64).to_bits())
 }
 
+/// Real callable thunks for the generic `Array.prototype` mutators
+/// (`pop`/`shift`/`reverse` — no positional args; `push`/`unshift`/`splice` —
+/// variadic). Each reads the call-site receiver from `IMPLICIT_THIS` (set by
+/// the own-field dispatch and `Function.prototype.call`/`.apply`) and forwards
+/// to the shared engine, which mutates a real array via the dense helpers or a
+/// plain array-like object via live `Get`/`Set`/`Delete`. Without these, the
+/// methods were noop-backed (`global_this_builtin_noop_thunk`), so a borrowed
+/// reference (`obj.pop = Array.prototype.pop; obj.pop()` or
+/// `Array.prototype.pop.call(obj)`) returned `undefined` / looped.
+extern "C" fn array_prototype_pop_thunk(_c: *const crate::closure::ClosureHeader, _a: f64) -> f64 {
+    let this = crate::object::js_implicit_this_get();
+    crate::array::array_proto_mutator(this, "pop", std::ptr::null(), 0)
+}
+extern "C" fn array_prototype_shift_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    _a: f64,
+) -> f64 {
+    let this = crate::object::js_implicit_this_get();
+    crate::array::array_proto_mutator(this, "shift", std::ptr::null(), 0)
+}
+extern "C" fn array_prototype_reverse_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    _a: f64,
+) -> f64 {
+    let this = crate::object::js_implicit_this_get();
+    crate::array::array_proto_mutator(this, "reverse", std::ptr::null(), 0)
+}
+extern "C" fn array_prototype_push_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    let this = crate::object::js_implicit_this_get();
+    let args = global_this_rest_array_values(rest);
+    crate::array::array_proto_mutator(this, "push", args.as_ptr(), args.len())
+}
+extern "C" fn array_prototype_unshift_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    let this = crate::object::js_implicit_this_get();
+    let args = global_this_rest_array_values(rest);
+    crate::array::array_proto_mutator(this, "unshift", args.as_ptr(), args.len())
+}
+extern "C" fn array_prototype_splice_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    let this = crate::object::js_implicit_this_get();
+    let args = global_this_rest_array_values(rest);
+    crate::array::array_proto_mutator(this, "splice", args.as_ptr(), args.len())
+}
+extern "C" fn array_prototype_sort_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    comparator: f64,
+) -> f64 {
+    let this = crate::object::js_implicit_this_get();
+    crate::array::js_arraylike_sort(this, comparator)
+}
+
+/// Real thunks for the generic `Array.prototype` iteration / search methods,
+/// each routing the call-site receiver (IMPLICIT_THIS) through the
+/// `js_arraylike_*` engine. These replace the previous noop thunks so a
+/// reflective resolution — `Array.prototype.map.call(x, …)` through a stored
+/// reference, or a method reached through an object whose [[Prototype]] chain
+/// contains a real array (`foo.prototype = new Array(…)`; test262
+/// filter/15.4.4.20-6-*, some/15.4.4.17-8-*) — runs the real algorithm
+/// instead of returning garbage. Rest-arg shape (like `push`/`splice` above)
+/// keeps the closure call convention independent of the spec `.length`.
+macro_rules! array_proto_arraylike_cb_thunk {
+    ($name:ident, $engine:path) => {
+        extern "C" fn $name(_c: *const crate::closure::ClosureHeader, rest: f64) -> f64 {
+            let this = crate::object::js_implicit_this_get();
+            let args = global_this_rest_array_values(rest);
+            let a = |i: usize| {
+                args.get(i)
+                    .copied()
+                    .unwrap_or(f64::from_bits(crate::value::TAG_UNDEFINED))
+            };
+            $engine(this, a(0), a(1))
+        }
+    };
+}
+array_proto_arraylike_cb_thunk!(
+    array_proto_forEach_thunk,
+    crate::array::js_arraylike_forEach
+);
+array_proto_arraylike_cb_thunk!(array_proto_map_thunk, crate::array::js_arraylike_map);
+array_proto_arraylike_cb_thunk!(array_proto_filter_thunk, crate::array::js_arraylike_filter);
+array_proto_arraylike_cb_thunk!(array_proto_some_thunk, crate::array::js_arraylike_some);
+array_proto_arraylike_cb_thunk!(array_proto_every_thunk, crate::array::js_arraylike_every);
+array_proto_arraylike_cb_thunk!(array_proto_find_thunk, crate::array::js_arraylike_find);
+array_proto_arraylike_cb_thunk!(
+    array_proto_findIndex_thunk,
+    crate::array::js_arraylike_findIndex
+);
+array_proto_arraylike_cb_thunk!(
+    array_proto_findLast_thunk,
+    crate::array::js_arraylike_findLast
+);
+array_proto_arraylike_cb_thunk!(
+    array_proto_findLastIndex_thunk,
+    crate::array::js_arraylike_findLastIndex
+);
+
+macro_rules! array_proto_arraylike_optarg_thunk {
+    ($name:ident, $engine:path) => {
+        extern "C" fn $name(_c: *const crate::closure::ClosureHeader, rest: f64) -> f64 {
+            let this = crate::object::js_implicit_this_get();
+            let args = global_this_rest_array_values(rest);
+            let a = |i: usize| {
+                args.get(i)
+                    .copied()
+                    .unwrap_or(f64::from_bits(crate::value::TAG_UNDEFINED))
+            };
+            $engine(this, a(0), (args.len() > 1) as i32, a(1))
+        }
+    };
+}
+array_proto_arraylike_optarg_thunk!(array_proto_reduce_thunk, reduce_engine);
+array_proto_arraylike_optarg_thunk!(array_proto_reduceRight_thunk, reduce_right_engine);
+
+// `js_arraylike_reduce*` take (recv, cb, has_init, init) — adapt arg order.
+fn reduce_engine(recv: f64, cb: f64, has_init: i32, init: f64) -> f64 {
+    crate::array::js_arraylike_reduce(recv, cb, has_init, init)
+}
+fn reduce_right_engine(recv: f64, cb: f64, has_init: i32, init: f64) -> f64 {
+    crate::array::js_arraylike_reduceRight(recv, cb, has_init, init)
+}
+
+macro_rules! array_proto_arraylike_search_thunk {
+    ($name:ident, $engine:path) => {
+        extern "C" fn $name(_c: *const crate::closure::ClosureHeader, rest: f64) -> f64 {
+            let this = crate::object::js_implicit_this_get();
+            let args = global_this_rest_array_values(rest);
+            let a = |i: usize| {
+                args.get(i)
+                    .copied()
+                    .unwrap_or(f64::from_bits(crate::value::TAG_UNDEFINED))
+            };
+            $engine(this, a(0), a(1), (args.len() > 1) as i32)
+        }
+    };
+}
+array_proto_arraylike_search_thunk!(
+    array_proto_indexOf_thunk,
+    crate::array::js_arraylike_indexOf
+);
+array_proto_arraylike_search_thunk!(
+    array_proto_lastIndexOf_thunk,
+    crate::array::js_arraylike_lastIndexOf
+);
+array_proto_arraylike_search_thunk!(
+    array_proto_includes_thunk,
+    crate::array::js_arraylike_includes
+);
+
+extern "C" fn array_proto_at_thunk(_c: *const crate::closure::ClosureHeader, idx: f64) -> f64 {
+    let this = crate::object::js_implicit_this_get();
+    crate::array::js_arraylike_at(this, idx)
+}
+extern "C" fn array_proto_join_thunk(_c: *const crate::closure::ClosureHeader, sep: f64) -> f64 {
+    let this = crate::object::js_implicit_this_get();
+    crate::array::js_arraylike_join(this, sep)
+}
+extern "C" fn array_prototype_concat_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    let this = crate::object::js_implicit_this_get();
+    let args = global_this_rest_array_values(rest);
+    crate::array::js_arraylike_concat(this, args.as_ptr(), args.len() as i32)
+}
+
 fn array_buffer_receiver_addr() -> Option<usize> {
     let this_bits = IMPLICIT_THIS.with(|c| c.get());
     let this_jsv = JSValue::from_bits(this_bits);
@@ -1433,6 +1976,64 @@ extern "C" fn array_buffer_byte_length_getter_thunk(
             )
         }
         None => array_buffer_brand_error(),
+    }
+}
+
+/// Receiver-address resolver for the `SharedArrayBuffer.prototype.byteLength`
+/// getter. Mirrors `array_buffer_receiver_addr` but accepts only buffers in the
+/// shared registry, so the getter rejects a plain `ArrayBuffer` `this`
+/// (test262 SharedArrayBuffer/prototype/byteLength/this-is-arraybuffer).
+fn shared_array_buffer_receiver_addr() -> Option<usize> {
+    let this_bits = IMPLICIT_THIS.with(|c| c.get());
+    let this_jsv = JSValue::from_bits(this_bits);
+    let raw = if this_jsv.is_pointer() {
+        (this_bits & 0x0000_FFFF_FFFF_FFFF) as usize
+    } else if this_bits >> 48 == 0 && this_bits > 0x10000 {
+        this_bits as usize
+    } else {
+        return None;
+    };
+    if crate::buffer::is_registered_buffer(raw) && crate::buffer::is_shared_array_buffer(raw) {
+        Some(raw)
+    } else {
+        None
+    }
+}
+
+extern "C" fn shared_array_buffer_byte_length_getter_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+) -> f64 {
+    match shared_array_buffer_receiver_addr() {
+        Some(addr) => {
+            let buf = addr as *const crate::buffer::BufferHeader;
+            f64::from_bits(
+                crate::value::JSValue::number(crate::buffer::js_buffer_length(buf) as f64).bits(),
+            )
+        }
+        None => super::object_ops::throw_object_type_error(
+            b"Method get SharedArrayBuffer.prototype.byteLength called on incompatible receiver",
+        ),
+    }
+}
+
+/// `SharedArrayBuffer.prototype.slice(start, end)`. The brand check (the `this`
+/// value must be a SharedArrayBuffer, never a plain ArrayBuffer or a
+/// non-object) lives here so `SharedArrayBuffer.prototype.slice.call(notSab)`
+/// throws a TypeError; the actual byte copy + ToIntegerOrInfinity arg coercion
+/// is shared with the instance dispatch in `buffer_dispatch`.
+extern "C" fn shared_array_buffer_slice_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    start: f64,
+    end: f64,
+) -> f64 {
+    match shared_array_buffer_receiver_addr() {
+        Some(addr) => unsafe {
+            let args = [start, end];
+            super::buffer_dispatch::dispatch_buffer_method(addr, "slice", args.as_ptr(), 2)
+        },
+        None => super::object_ops::throw_object_type_error(
+            b"Method SharedArrayBuffer.prototype.slice called on incompatible receiver",
+        ),
     }
 }
 
@@ -1530,14 +2131,6 @@ fn typed_array_constructor_this_kind() -> Option<u8> {
     let name_value = crate::closure::closure_get_dynamic_prop(ptr, "name");
     let name = string_value_to_owned(f64::from_bits(name_value.to_bits()))?;
     crate::typedarray::kind_for_name(&name)
-}
-
-fn require_typed_array_constructor_this() -> u8 {
-    typed_array_constructor_this_kind().unwrap_or_else(|| {
-        super::object_ops::throw_object_type_error(
-            b"%TypedArray%.from/of requires a concrete typed array constructor",
-        )
-    })
 }
 
 fn typed_array_buffer_value(ta: *const crate::typedarray::TypedArrayHeader) -> f64 {
@@ -1761,12 +2354,27 @@ fn ensure_typed_array_intrinsic() -> (*mut crate::closure::ClosureHeader, *mut O
     // "length")` to keep working.
     install_typed_array_proto_accessors(proto);
     install_typed_array_iterator_symbol(proto);
+    // The per-kind prototypes (`Int8Array.prototype`, …) inherit ALL of their
+    // methods from this shared `%TypedArray%.prototype` (their `[[Prototype]]`),
+    // so `Int8Array.prototype.hasOwnProperty("map") === false` and
+    // `Int8Array.prototype.map === %TypedArray%.prototype.map` (test262's
+    // `prototype/*/inherited.js`).
+    //
+    // NOTE: the generic `Object.prototype` data methods + a `toString` are
+    // intentionally NOT installed here. The intrinsic prototype is allocated
+    // with zero inline field slots and already carries ~34 own properties
+    // (accessors + `@@iterator` + the spec methods below); adding the extra ~6
+    // crosses an inline-storage boundary that trips a latent field-count
+    // overflow (a heap-layout-dependent SIGSEGV under GC pressure). They are not
+    // needed for parity — `toLocaleString` is already a brand-checking method
+    // below, and `hasOwnProperty`/`valueOf`/etc. dispatch natively on instances.
     // Install the brand-checking spec methods on the shared `%TypedArray%`
-    // intrinsic prototype as well. test262's `testTypedArray.js` harness reads
+    // intrinsic prototype. test262's `testTypedArray.js` harness reads
     // `TypedArray.prototype.<m>` (where `TypedArray ===
     // Object.getPrototypeOf(Int8Array)`), so the brand check for
-    // `%TypedArray%.prototype.<m>.call(badReceiver)` must also fire when the
-    // method is read off the intrinsic, not just off a per-kind prototype.
+    // `%TypedArray%.prototype.<m>.call(badReceiver)` must fire when the method
+    // is read off the intrinsic, and the per-kind protos resolve their reads
+    // here via the `[[Prototype]]` chain.
     typed_array_proto_thunks::install_typed_array_proto_methods(proto);
     install_constructor_static_with_call_arity(
         ctor,
@@ -1924,7 +2532,7 @@ fn set_intrinsic_data_prop(
 
 /// Set `obj[Symbol.toStringTag] = tag` (the descriptor is the spec default
 /// `{ writable:false, enumerable:false, configurable:true }`). (#3664)
-fn set_intrinsic_to_string_tag(obj: *mut ObjectHeader, tag: &str) {
+pub(super) fn set_intrinsic_to_string_tag(obj: *mut ObjectHeader, tag: &str) {
     let sym = crate::symbol::well_known_symbol("toStringTag");
     if sym.is_null() {
         return;
@@ -2010,6 +2618,15 @@ fn generator_proto_method(method: &[u8], arg: f64, is_async: bool) -> f64 {
     {
         return bad_receiver(method);
     }
+    // A sync generator instance also owns `next`/`return`/`throw`, so the
+    // structural check above can't tell it from an async generator. The
+    // `%AsyncGenerator.prototype%` methods must reject a sync-generator `this`
+    // (and vice versa): gate on the async request-queue brand.
+    if is_async
+        != super::async_generator_queue::is_async_generator_instance(this_obj as *mut ObjectHeader)
+    {
+        return bad_receiver(method);
+    }
     match own_method(method) {
         Some(own_closure) => crate::closure::js_closure_call1(own_closure, arg),
         None => bad_receiver(method),
@@ -2051,6 +2668,49 @@ extern "C" fn async_generator_proto_throw_thunk(
     arg: f64,
 ) -> f64 {
     generator_proto_method(b"throw", arg, true)
+}
+
+/// `%AsyncGenerator.prototype%[Symbol.asyncIterator]()` returns `this` (spec
+/// inherits this from `%AsyncIteratorPrototype%`). Without it, `for await` /
+/// `GetIterator(obj, async)` over a generator instance can't obtain the async
+/// iterator and either throws or silently produces nothing.
+extern "C" fn async_generator_proto_async_iterator_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    _arg: f64,
+) -> f64 {
+    crate::object::js_implicit_this_get()
+}
+
+/// Install a well-known-symbol-keyed method (returning `this`) on a
+/// generator/async-generator prototype, with the spec descriptor shape
+/// (`name`/`length` own props, non-enumerable value).
+fn install_proto_symbol_self_method(
+    proto: *mut ObjectHeader,
+    symbol_name: &str,
+    display_name: &str,
+    func_ptr: *const u8,
+) {
+    let closure = crate::closure::js_closure_alloc(func_ptr, 0);
+    if closure.is_null() {
+        return;
+    }
+    crate::closure::js_register_closure_arity(func_ptr, 0);
+    super::native_module::set_bound_native_closure_name(closure, display_name);
+    super::native_module::set_builtin_closure_length(closure as usize, 0);
+    let configurable = super::PropertyAttrs::new(false, false, true);
+    super::set_builtin_property_attrs(closure as usize, "name".to_string(), configurable);
+    super::set_builtin_property_attrs(closure as usize, "length".to_string(), configurable);
+    let sym = crate::symbol::well_known_symbol(symbol_name);
+    if sym.is_null() {
+        return;
+    }
+    unsafe {
+        crate::symbol::js_object_set_symbol_property(
+            crate::value::js_nanbox_pointer(proto as i64),
+            f64::from_bits(JSValue::pointer(sym as *const u8).bits()),
+            crate::value::js_nanbox_pointer(closure as i64),
+        );
+    }
 }
 
 /// #4141: link a freshly-built generator/async-generator instance object into
@@ -2120,6 +2780,19 @@ pub extern "C" fn js_generator_attach_closure_prototype(
     let closure = crate::closure::clean_closure_ptr(closure_ptr);
     if closure.is_null() || crate::closure::get_valid_func_ptr(closure).is_null() {
         return obj;
+    }
+
+    // Async-generator instances need the request-queue wrapper installed on
+    // their `next`/`return`/`throw` so same-stack follow-up calls queue (spec
+    // AsyncGeneratorEnqueue) and `.return(v)` awaits `v`. The non-closure
+    // fallback (`js_generator_attach_prototype`) does this when codegen knows
+    // the function is async; on the closure-identity path we read the async
+    // brand from the function's registration (the `async function*` wrapper
+    // symbol is recorded via `js_register_closure_async_generator_function`).
+    if crate::closure::is_registered_async_generator_function(crate::closure::get_valid_func_ptr(
+        closure,
+    )) {
+        super::async_generator_queue::wrap_async_generator_instance(obj_ptr as *mut ObjectHeader);
     }
 
     let Some(proto) = generator_function_prototype_of(closure as usize) else {
@@ -2226,6 +2899,28 @@ fn build_generator_tower(
     install_proto_method(gen_proto, "next", next_thunk, 1);
     install_proto_method(gen_proto, "return", return_thunk, 1);
     install_proto_method(gen_proto, "throw", throw_thunk, 1);
+    // Spec: `%AsyncGenerator.prototype%` inherits `[Symbol.asyncIterator]` from
+    // `%AsyncIteratorPrototype%` (returning `this`). Without it, `for await (x of
+    // gen())` over an async-generator *method instance* can't resolve the async
+    // iterator and hangs/yields nothing (the instance carries no own iterator
+    // symbol). The async-iterator-acquisition path (`js_get_async_iterator`)
+    // sets the implicit-this before invoking this thunk, so it returns the
+    // generator instance.
+    //
+    // Note: the SYNC `%Generator.prototype%` deliberately gets NO own
+    // `[Symbol.iterator]` here — the sync `for-of` iterator-acquisition path
+    // (`js_get_iterator`) does NOT bind implicit-this before invoking a
+    // `[Symbol.iterator]` method, so a `this`-returning thunk would resolve to
+    // `undefined` and break `for (x of gen())`. Sync generators already iterate
+    // through their own `next` via the builtin-iterator recognizers.
+    if is_async {
+        install_proto_symbol_self_method(
+            gen_proto,
+            "asyncIterator",
+            "[Symbol.asyncIterator]",
+            async_generator_proto_async_iterator_thunk as *const u8,
+        );
+    }
     set_intrinsic_to_string_tag(gen_proto, inst_tag);
 
     ctor_slot.store(ctor as i64, Ordering::Release);
@@ -2323,6 +3018,1311 @@ fn install_math_namespace(ns_obj: *mut ObjectHeader) {
     install_proto_method(ns_obj, "f16round", math_f16round_thunk as *const u8, 1);
 }
 
+// ---- TC39 Temporal namespace (#4686) -------------------------------------
+//
+// Each `Temporal.<Type>` constructor is a constructable native closure hung off
+// the `Temporal` namespace object. `new Temporal.Duration(...)` resolves the
+// closure via a normal property read, then `js_new_function_construct` invokes
+// it; the thunk allocates a Temporal cell and returns it, which overrides the
+// empty default `this` (see `constructor_return_overrides_this`). Statics
+// (`from`, `compare`) are installed on the constructor closure with call-arity
+// 0 so every argument lands in the rest array the thunk reads.
+
+extern "C" fn temporal_duration_ctor_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::duration::construct(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_duration_from_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::duration::from_static(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_duration_compare_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::duration::compare_static(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_instant_ctor_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::instant::construct(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_instant_from_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::instant::from_static(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_instant_from_epoch_ms_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::instant::from_epoch_milliseconds_static(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_instant_from_epoch_ns_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::instant::from_epoch_nanoseconds_static(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_instant_compare_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::instant::compare_static(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_plain_date_ctor_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::plain_date::construct(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_plain_date_from_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::plain_date::from_static(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_plain_date_compare_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::plain_date::compare_static(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_plain_time_ctor_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::plain_time::construct(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_plain_time_from_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::plain_time::from_static(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_plain_time_compare_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::plain_time::compare_static(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_plain_date_time_ctor_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::plain_date_time::construct(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_plain_date_time_from_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::plain_date_time::from_static(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_plain_date_time_compare_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::plain_date_time::compare_static(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_plain_year_month_ctor_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::plain_year_month::construct(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_plain_year_month_from_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::plain_year_month::from_static(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_plain_year_month_compare_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::plain_year_month::compare_static(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_plain_month_day_ctor_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::plain_month_day::construct(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_plain_month_day_from_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::plain_month_day::from_static(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_zoned_date_time_ctor_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::zoned_date_time::construct(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_zoned_date_time_from_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::zoned_date_time::from_static(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_zoned_date_time_compare_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::zoned_date_time::compare_static(&global_this_rest_array_values(rest))
+}
+
+// Temporal.Now is a namespace (not a constructor) — method thunks on a plain
+// object, installed like Math. Each reads the host clock fresh.
+extern "C" fn temporal_now_instant_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::now::instant(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_now_timezone_id_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::now::time_zone_id(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_now_plain_date_time_iso_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::now::plain_date_time_iso(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_now_plain_date_iso_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::now::plain_date_iso(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_now_plain_time_iso_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::now::plain_time_iso(&global_this_rest_array_values(rest))
+}
+
+extern "C" fn temporal_now_zoned_date_time_iso_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    crate::temporal::now::zoned_date_time_iso(&global_this_rest_array_values(rest))
+}
+
+/// Build the `Temporal.Now` namespace object (a plain object of method thunks).
+fn build_temporal_now_namespace() -> f64 {
+    let now_obj = js_object_alloc(0, 0);
+    if now_obj.is_null() {
+        return f64::from_bits(crate::value::TAG_UNDEFINED);
+    }
+    for (name, thunk, len) in [
+        ("instant", temporal_now_instant_thunk as *const u8, 0u32),
+        ("timeZoneId", temporal_now_timezone_id_thunk as *const u8, 0),
+        (
+            "plainDateTimeISO",
+            temporal_now_plain_date_time_iso_thunk as *const u8,
+            0,
+        ),
+        (
+            "plainDateISO",
+            temporal_now_plain_date_iso_thunk as *const u8,
+            0,
+        ),
+        (
+            "plainTimeISO",
+            temporal_now_plain_time_iso_thunk as *const u8,
+            0,
+        ),
+        (
+            "zonedDateTimeISO",
+            temporal_now_zoned_date_time_iso_thunk as *const u8,
+            0,
+        ),
+    ] {
+        install_proto_method_rest_with_length(now_obj, name, thunk, len, 0);
+    }
+    set_intrinsic_to_string_tag(now_obj, "Temporal.Now");
+    crate::value::js_nanbox_pointer(now_obj as i64)
+}
+
+/// Install a constructable `Temporal.<name>` constructor closure on the
+/// `Temporal` namespace object and return it so statics can be hung off it.
+/// Variadic (all args in the rest array, call-arity 0). Unlike
+/// `install_constructor_static`, it does NOT mark the closure non-constructable
+/// — `new Temporal.<name>(...)` must dispatch through the generic construct
+/// path and use the returned cell.
+/// Generic accessor-getter thunk shared by every `Temporal.<Type>.prototype`
+/// getter. The property name and expected brand kind are stored on the closure
+/// instance (`__tname` / `__tkind`); the receiver comes from `IMPLICIT_THIS`.
+/// Throws `TypeError` on a non-Temporal or wrong-brand receiver (the getter
+/// `branding.js` tests: `blank.call(undefined)`, `years.call({})`, …).
+extern "C" fn temporal_proto_getter_thunk(closure: *const crate::closure::ClosureHeader) -> f64 {
+    let recv = super::js_implicit_this_get();
+    let cl = closure as usize;
+    let kind = crate::closure::closure_get_dynamic_prop(cl, "__tkind");
+    let expected = crate::value::JSValue::from_bits(kind.to_bits()).to_number() as u8;
+    let name = crate::temporal::dispatch::read_string(crate::closure::closure_get_dynamic_prop(
+        cl, "__tname",
+    ));
+    match crate::temporal::temporal_kind(recv) {
+        Some(k) if k as u8 == expected => crate::temporal::dispatch::get_property(recv, &name)
+            .unwrap_or_else(|| f64::from_bits(crate::value::TAG_UNDEFINED)),
+        _ => crate::object::throw_object_type_error(
+            b"Temporal getter called on an incompatible receiver",
+        ),
+    }
+}
+
+/// Generic method thunk shared by every `Temporal.<Type>.prototype` method.
+/// Rest-ABI (fixed arity 0): all args arrive in `rest`. Brand-checks the
+/// `IMPLICIT_THIS` receiver, then forwards to the per-type dispatch router —
+/// used when a prototype method is invoked through indirection
+/// (`Temporal.Duration.prototype.add.call(d, x)`); the normal `d.add(x)` path
+/// is the brand arm in `js_native_call_method`.
+extern "C" fn temporal_proto_method_thunk(
+    closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    let recv = super::js_implicit_this_get();
+    let cl = closure as usize;
+    let kind = crate::closure::closure_get_dynamic_prop(cl, "__tkind");
+    let expected = crate::value::JSValue::from_bits(kind.to_bits()).to_number() as u8;
+    let name = crate::temporal::dispatch::read_string(crate::closure::closure_get_dynamic_prop(
+        cl, "__tname",
+    ));
+    match crate::temporal::temporal_kind(recv) {
+        Some(k) if k as u8 == expected => {
+            let args = global_this_rest_array_values(rest);
+            crate::temporal::dispatch::call_method(recv, &name, &args)
+        }
+        _ => crate::object::throw_object_type_error(
+            b"Temporal method called on an incompatible receiver",
+        ),
+    }
+}
+
+/// Install a brand-checked accessor getter (`{ get, set: undefined,
+/// enumerable: false, configurable: true }`) on a Temporal prototype.
+fn install_temporal_proto_getter(proto: *mut ObjectHeader, kind: u8, name: &str) {
+    let c = crate::closure::js_closure_alloc(temporal_proto_getter_thunk as *const u8, 0);
+    if c.is_null() {
+        return;
+    }
+    crate::closure::js_register_closure_arity(temporal_proto_getter_thunk as *const u8, 0);
+    let cl = c as usize;
+    crate::closure::closure_set_dynamic_prop(cl, "__tkind", kind as f64);
+    crate::closure::closure_set_dynamic_prop(
+        cl,
+        "__tname",
+        crate::temporal::dispatch::string(name),
+    );
+    super::native_module::set_bound_native_closure_name(c, &format!("get {name}"));
+    super::native_module::set_builtin_closure_length(cl, 0);
+    super::native_module::set_builtin_closure_non_constructable(cl);
+    unsafe {
+        install_builtin_getter(
+            proto,
+            name,
+            crate::value::js_nanbox_pointer(c as i64).to_bits(),
+        );
+    }
+}
+
+/// Install a brand-checked method (`{ writable: true, enumerable: false,
+/// configurable: true }`, non-constructable, with spec `.name`/`.length`) on a
+/// Temporal prototype.
+fn install_temporal_proto_method(proto: *mut ObjectHeader, kind: u8, name: &str, spec_length: u32) {
+    let c = crate::closure::js_closure_alloc(temporal_proto_method_thunk as *const u8, 0);
+    if c.is_null() {
+        return;
+    }
+    // Rest ABI so every argument is bundled regardless of the shared thunk's
+    // fixed signature.
+    crate::closure::js_register_closure_rest(temporal_proto_method_thunk as *const u8, 0);
+    let cl = c as usize;
+    crate::closure::closure_set_dynamic_prop(cl, "__tkind", kind as f64);
+    crate::closure::closure_set_dynamic_prop(
+        cl,
+        "__tname",
+        crate::temporal::dispatch::string(name),
+    );
+    super::native_module::set_bound_native_closure_name(c, name);
+    super::native_module::set_builtin_closure_length(cl, spec_length);
+    super::native_module::set_builtin_closure_non_constructable(cl);
+    let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+    js_object_set_field_by_name(proto, key, crate::value::js_nanbox_pointer(c as i64));
+    super::set_builtin_property_attrs(
+        proto as usize,
+        name.to_string(),
+        super::PropertyAttrs::new(true, false, true),
+    );
+    super::set_builtin_property_attrs(
+        cl,
+        "name".to_string(),
+        super::PropertyAttrs::new(false, false, true),
+    );
+    super::set_builtin_property_attrs(
+        cl,
+        "length".to_string(),
+        super::PropertyAttrs::new(false, false, true),
+    );
+}
+
+/// Build and wire a `Temporal.<Type>.prototype` object: a real object carrying
+/// the type's accessor getters and methods (for reflection + indirect `.call`),
+/// linked to its constructor via `ctor.prototype` / `proto.constructor`.
+fn install_temporal_prototype(
+    ctor: *mut crate::closure::ClosureHeader,
+    kind: u8,
+    getters: &[&str],
+    methods: &[(&str, u32)],
+) {
+    if ctor.is_null() {
+        return;
+    }
+    let proto = js_object_alloc(0, 0);
+    if proto.is_null() {
+        return;
+    }
+    for g in getters {
+        install_temporal_proto_getter(proto, kind, g);
+    }
+    for (m, len) in methods {
+        install_temporal_proto_method(proto, kind, m, *len);
+    }
+    // ctor.prototype = proto  ({ writable:false, enumerable:false, configurable:false })
+    let proto_value = crate::value::js_nanbox_pointer(proto as i64);
+    let proto_key = crate::string::js_string_from_bytes(b"prototype".as_ptr(), 9);
+    js_object_set_field_by_name(ctor as *mut ObjectHeader, proto_key, proto_value);
+    super::set_builtin_property_attrs(
+        ctor as usize,
+        "prototype".to_string(),
+        super::PropertyAttrs::new(false, false, false),
+    );
+    // proto.constructor = ctor  ({ writable:true, enumerable:false, configurable:true })
+    let ctor_value = crate::value::js_nanbox_pointer(ctor as i64);
+    let ctor_key = crate::string::js_string_from_bytes(b"constructor".as_ptr(), 11);
+    js_object_set_field_by_name(proto, ctor_key, ctor_value);
+    super::set_builtin_property_attrs(
+        proto as usize,
+        "constructor".to_string(),
+        super::PropertyAttrs::new(true, false, true),
+    );
+}
+
+fn install_temporal_constructor(
+    ns_obj: *mut ObjectHeader,
+    name: &str,
+    func_ptr: *const u8,
+    spec_length: u32,
+) -> *mut crate::closure::ClosureHeader {
+    let closure = crate::closure::js_closure_alloc(func_ptr, 0);
+    if closure.is_null() {
+        return std::ptr::null_mut();
+    }
+    crate::closure::js_register_closure_rest(func_ptr, 0);
+    super::native_module::set_bound_native_closure_name(closure, name);
+    super::native_module::set_builtin_closure_length(closure as usize, spec_length);
+    let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+    let value = crate::value::js_nanbox_pointer(closure as i64);
+    js_object_set_field_by_name(ns_obj, key, value);
+    super::set_builtin_property_attrs(
+        ns_obj as usize,
+        name.to_string(),
+        super::PropertyAttrs::new(true, false, true),
+    );
+    closure
+}
+
+/// Read a built-in closure's installed `name` dynamic prop as a Rust `String`
+/// (used by the shared Temporal prototype thunks to recover which getter /
+/// method they back). Empty string if absent.
+fn temporal_closure_name(closure: *const crate::closure::ClosureHeader) -> String {
+    let v = crate::closure::closure_get_dynamic_prop(closure as usize, "name");
+    if !JSValue::from_bits(v.to_bits()).is_string() {
+        return String::new();
+    }
+    let ptr = crate::value::js_get_string_pointer_unified(v) as *const crate::string::StringHeader;
+    if ptr.is_null() {
+        return String::new();
+    }
+    unsafe {
+        let len = (*ptr).byte_len as usize;
+        let data = (ptr as *const u8).add(std::mem::size_of::<crate::string::StringHeader>());
+        String::from_utf8_lossy(std::slice::from_raw_parts(data, len)).into_owned()
+    }
+}
+
+/// Throw `TypeError: <type>.prototype.<member> called on incompatible receiver`
+/// for a Temporal prototype getter / method invoked on a non-branded `this`
+/// (the spec brand check). Used by the reflective `.call`/`.apply` paths;
+/// normal `zdt.foo()` dispatches via the brand arm and never reaches here.
+fn temporal_brand_type_error(type_name: &str, member: &str) -> ! {
+    crate::object::throw_object_type_error(
+        format!("{type_name}.prototype.{member} called on incompatible receiver").as_bytes(),
+    )
+}
+
+/// Shared body for a `Temporal.ZonedDateTime.prototype` accessor getter invoked
+/// reflectively. Resolves `this` from `IMPLICIT_THIS`, brand-checks it is a
+/// `ZonedDateTime`, and returns the getter's value.
+extern "C" fn temporal_zdt_proto_getter_thunk(
+    closure: *const crate::closure::ClosureHeader,
+) -> f64 {
+    let this = f64::from_bits(IMPLICIT_THIS.with(|c| c.get()));
+    // The accessor's name is `"get <prop>"`; recover the bare property.
+    let name = temporal_closure_name(closure);
+    let prop = name.strip_prefix("get ").unwrap_or(&name);
+    if crate::temporal::temporal_kind(this) != Some(crate::temporal::TemporalKind::ZonedDateTime) {
+        temporal_brand_type_error("Temporal.ZonedDateTime", prop);
+    }
+    crate::temporal::dispatch::get_property(this, prop)
+        .unwrap_or_else(|| f64::from_bits(crate::value::TAG_UNDEFINED))
+}
+
+/// Shared body for a `Temporal.ZonedDateTime.prototype` method invoked
+/// reflectively (`.prototype.equals.call(zdt, …)`). Brand-checks `this` then
+/// dispatches to the per-type method router.
+extern "C" fn temporal_zdt_proto_method_thunk(
+    closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    let this = f64::from_bits(IMPLICIT_THIS.with(|c| c.get()));
+    let name = temporal_closure_name(closure);
+    if crate::temporal::temporal_kind(this) != Some(crate::temporal::TemporalKind::ZonedDateTime) {
+        temporal_brand_type_error("Temporal.ZonedDateTime", &name);
+    }
+    crate::temporal::dispatch::call_method(this, &name, &global_this_rest_array_values(rest))
+}
+
+/// Install one accessor getter onto a Temporal prototype with the spec
+/// descriptor (`enumerable:false, configurable:true`, `set:undefined`) and the
+/// proper getter `name` (`"get <prop>"`) / `length` (0). Mirrors the RegExp
+/// prototype getter install.
+fn install_temporal_getter(proto: *mut ObjectHeader, prop: &str, func_ptr: *const u8) {
+    unsafe {
+        crate::closure::js_register_closure_arity(func_ptr, 0);
+        let closure = crate::closure::js_closure_alloc(func_ptr, 0);
+        if closure.is_null() {
+            return;
+        }
+        super::native_module::set_bound_native_closure_name(closure, &format!("get {prop}"));
+        super::native_module::set_builtin_closure_length(closure as usize, 0);
+        let key = crate::string::js_string_from_bytes(prop.as_ptr(), prop.len() as u32);
+        super::object_ops::ensure_key_in_keys_array(proto, key);
+        let getter_bits = crate::value::js_nanbox_pointer(closure as i64).to_bits();
+        super::object_ops::install_builtin_getter(proto, prop, getter_bits);
+        super::set_accessor_descriptor(
+            proto as usize,
+            prop.to_string(),
+            super::AccessorDescriptor {
+                get: getter_bits,
+                set: 0,
+            },
+        );
+        super::set_property_attrs(
+            proto as usize,
+            prop.to_string(),
+            super::PropertyAttrs::new(true, false, true),
+        );
+        super::set_builtin_property_attrs(
+            closure as usize,
+            "name".to_string(),
+            super::PropertyAttrs::new(false, false, true),
+        );
+        super::set_builtin_property_attrs(
+            closure as usize,
+            "length".to_string(),
+            super::PropertyAttrs::new(false, false, true),
+        );
+    }
+}
+
+/// Build the `Temporal.ZonedDateTime.prototype` object: every getter as an
+/// accessor property + every method as a non-constructable built-in function,
+/// each with the spec `name`/`length`/descriptor, plus `[Symbol.toStringTag]`.
+/// These satisfy the reflective test262 cases (branding / prop-desc / length /
+/// name / not-a-constructor / builtin); ordinary `zdt.foo()` calls still
+/// dispatch via the Temporal brand arm and never touch this object.
+fn build_zoned_date_time_prototype() -> *mut ObjectHeader {
+    let proto = js_object_alloc(0, 0);
+    if proto.is_null() {
+        return proto;
+    }
+    const GETTERS: &[&str] = &[
+        "year",
+        "month",
+        "monthCode",
+        "day",
+        "hour",
+        "minute",
+        "second",
+        "millisecond",
+        "microsecond",
+        "nanosecond",
+        "era",
+        "eraYear",
+        "epochMilliseconds",
+        "epochNanoseconds",
+        "dayOfWeek",
+        "dayOfYear",
+        "weekOfYear",
+        "yearOfWeek",
+        "daysInWeek",
+        "daysInMonth",
+        "daysInYear",
+        "monthsInYear",
+        "inLeapYear",
+        "hoursInDay",
+        "offset",
+        "offsetNanoseconds",
+        "timeZoneId",
+        "calendarId",
+    ];
+    for g in GETTERS {
+        install_temporal_getter(proto, g, temporal_zdt_proto_getter_thunk as *const u8);
+    }
+    // (name, spec_length)
+    const METHODS: &[(&str, u32)] = &[
+        ("add", 1),
+        ("subtract", 1),
+        ("until", 1),
+        ("since", 1),
+        ("round", 1),
+        ("equals", 1),
+        ("with", 1),
+        ("withCalendar", 1),
+        ("withPlainTime", 0),
+        ("withTimeZone", 1),
+        ("toInstant", 0),
+        ("toPlainDate", 0),
+        ("toPlainTime", 0),
+        ("toPlainDateTime", 0),
+        ("toString", 0),
+        ("toJSON", 0),
+        ("toLocaleString", 0),
+        ("valueOf", 0),
+        ("startOfDay", 0),
+        ("getTimeZoneTransition", 0),
+    ];
+    for (name, len) in METHODS {
+        install_proto_method_rest_with_length(
+            proto,
+            name,
+            temporal_zdt_proto_method_thunk as *const u8,
+            *len,
+            0,
+        );
+    }
+    set_intrinsic_to_string_tag(proto, "Temporal.ZonedDateTime");
+    proto
+}
+
+/// Map a value to the [`TemporalKind`] it constructs *iff* it is one of the
+/// eight `Temporal.<X>` constructor closures (matched by func-ptr, so a
+/// same-named user closure never matches). Used by `instanceof` to make
+/// `zdt instanceof Temporal.ZonedDateTime` resolve to `true` even though
+/// Temporal values dispatch via brand arms, not a real prototype chain.
+pub(crate) fn temporal_ctor_kind(type_ref: f64) -> Option<crate::temporal::TemporalKind> {
+    use crate::temporal::TemporalKind;
+    let jv = JSValue::from_bits(type_ref.to_bits());
+    if !jv.is_pointer() {
+        return None;
+    }
+    let closure = jv.as_pointer::<crate::closure::ClosureHeader>();
+    if closure.is_null() {
+        return None;
+    }
+    let (tag, fp) = unsafe { ((*closure).type_tag, (*closure).func_ptr) };
+    if tag != crate::closure::CLOSURE_MAGIC {
+        return None;
+    }
+    let fp = fp as usize;
+    let table: [(*const u8, TemporalKind); 8] = [
+        (
+            temporal_duration_ctor_thunk as *const u8,
+            TemporalKind::Duration,
+        ),
+        (
+            temporal_instant_ctor_thunk as *const u8,
+            TemporalKind::Instant,
+        ),
+        (
+            temporal_plain_date_ctor_thunk as *const u8,
+            TemporalKind::PlainDate,
+        ),
+        (
+            temporal_plain_time_ctor_thunk as *const u8,
+            TemporalKind::PlainTime,
+        ),
+        (
+            temporal_plain_date_time_ctor_thunk as *const u8,
+            TemporalKind::PlainDateTime,
+        ),
+        (
+            temporal_plain_year_month_ctor_thunk as *const u8,
+            TemporalKind::PlainYearMonth,
+        ),
+        (
+            temporal_plain_month_day_ctor_thunk as *const u8,
+            TemporalKind::PlainMonthDay,
+        ),
+        (
+            temporal_zoned_date_time_ctor_thunk as *const u8,
+            TemporalKind::ZonedDateTime,
+        ),
+    ];
+    table
+        .iter()
+        .find(|(ptr, _)| *ptr as usize == fp)
+        .map(|(_, k)| *k)
+}
+
+/// `Temporal.PlainDate.prototype` accessor getters and method shapes (#4691).
+const PLAIN_DATE_GETTERS: &[&str] = &[
+    "calendarId",
+    "era",
+    "eraYear",
+    "year",
+    "month",
+    "monthCode",
+    "day",
+    "dayOfWeek",
+    "dayOfYear",
+    "weekOfYear",
+    "yearOfWeek",
+    "daysInWeek",
+    "daysInMonth",
+    "daysInYear",
+    "monthsInYear",
+    "inLeapYear",
+];
+const PLAIN_DATE_METHODS: &[(&str, u32)] = &[
+    ("toPlainYearMonth", 0),
+    ("toPlainMonthDay", 0),
+    ("add", 1),
+    ("subtract", 1),
+    ("with", 1),
+    ("withCalendar", 1),
+    ("until", 1),
+    ("since", 1),
+    ("equals", 1),
+    ("toPlainDateTime", 0),
+    ("toZonedDateTime", 1),
+    ("toString", 0),
+    ("toLocaleString", 0),
+    ("toJSON", 0),
+    ("valueOf", 0),
+];
+
+/// `Temporal.PlainDateTime.prototype` accessor getters and method shapes (#4693).
+const PLAIN_DATE_TIME_GETTERS: &[&str] = &[
+    "calendarId",
+    "era",
+    "eraYear",
+    "year",
+    "month",
+    "monthCode",
+    "day",
+    "dayOfWeek",
+    "dayOfYear",
+    "weekOfYear",
+    "yearOfWeek",
+    "daysInWeek",
+    "daysInMonth",
+    "daysInYear",
+    "monthsInYear",
+    "inLeapYear",
+    "hour",
+    "minute",
+    "second",
+    "millisecond",
+    "microsecond",
+    "nanosecond",
+];
+const PLAIN_DATE_TIME_METHODS: &[(&str, u32)] = &[
+    ("with", 1),
+    ("withPlainTime", 0),
+    ("withCalendar", 1),
+    ("add", 1),
+    ("subtract", 1),
+    ("until", 1),
+    ("since", 1),
+    ("round", 1),
+    ("equals", 1),
+    ("toString", 0),
+    ("toLocaleString", 0),
+    ("toJSON", 0),
+    ("valueOf", 0),
+    ("toZonedDateTime", 1),
+    ("toPlainDate", 0),
+    ("toPlainTime", 0),
+];
+
+fn install_temporal_namespace(ns_obj: *mut ObjectHeader) {
+    if ns_obj.is_null() {
+        return;
+    }
+    // Temporal.Duration (#4688)
+    let duration = install_temporal_constructor(
+        ns_obj,
+        "Duration",
+        temporal_duration_ctor_thunk as *const u8,
+        0,
+    );
+    if !duration.is_null() {
+        install_constructor_static_with_call_arity(
+            duration,
+            "from",
+            temporal_duration_from_thunk as *const u8,
+            1,
+            0,
+            true,
+        );
+        install_constructor_static_with_call_arity(
+            duration,
+            "compare",
+            temporal_duration_compare_thunk as *const u8,
+            2,
+            0,
+            true,
+        );
+        install_temporal_prototype(
+            duration,
+            crate::temporal::TemporalKind::Duration as u8,
+            &[
+                "years",
+                "months",
+                "weeks",
+                "days",
+                "hours",
+                "minutes",
+                "seconds",
+                "milliseconds",
+                "microseconds",
+                "nanoseconds",
+                "sign",
+                "blank",
+            ],
+            &[
+                ("with", 1),
+                ("negated", 0),
+                ("abs", 0),
+                ("add", 1),
+                ("subtract", 1),
+                ("round", 1),
+                ("total", 1),
+                ("toString", 0),
+                ("toJSON", 0),
+                ("toLocaleString", 0),
+                ("valueOf", 0),
+            ],
+        );
+    }
+
+    // Temporal.Instant (#4690)
+    let instant = install_temporal_constructor(
+        ns_obj,
+        "Instant",
+        temporal_instant_ctor_thunk as *const u8,
+        1,
+    );
+    if !instant.is_null() {
+        install_temporal_from_compare(
+            instant,
+            temporal_instant_from_thunk as *const u8,
+            temporal_instant_compare_thunk as *const u8,
+        );
+        install_constructor_static_with_call_arity(
+            instant,
+            "fromEpochMilliseconds",
+            temporal_instant_from_epoch_ms_thunk as *const u8,
+            1,
+            0,
+            true,
+        );
+        install_constructor_static_with_call_arity(
+            instant,
+            "fromEpochNanoseconds",
+            temporal_instant_from_epoch_ns_thunk as *const u8,
+            1,
+            0,
+            true,
+        );
+        install_temporal_prototype(
+            instant,
+            crate::temporal::TemporalKind::Instant as u8,
+            &["epochMilliseconds", "epochNanoseconds"],
+            &[
+                ("add", 1),
+                ("subtract", 1),
+                ("until", 1),
+                ("since", 1),
+                ("round", 1),
+                ("equals", 1),
+                ("toZonedDateTimeISO", 1),
+                ("toString", 0),
+                ("toJSON", 0),
+                ("toLocaleString", 0),
+                ("valueOf", 0),
+            ],
+        );
+    }
+
+    // Temporal.PlainDate (#4691)
+    let plain_date = install_temporal_constructor(
+        ns_obj,
+        "PlainDate",
+        temporal_plain_date_ctor_thunk as *const u8,
+        3,
+    );
+    if !plain_date.is_null() {
+        install_temporal_from_compare(
+            plain_date,
+            temporal_plain_date_from_thunk as *const u8,
+            temporal_plain_date_compare_thunk as *const u8,
+        );
+        install_temporal_prototype(
+            plain_date,
+            crate::temporal::TemporalKind::PlainDate as u8,
+            PLAIN_DATE_GETTERS,
+            PLAIN_DATE_METHODS,
+        );
+    }
+
+    // Temporal.PlainTime (#4692)
+    let plain_time = install_temporal_constructor(
+        ns_obj,
+        "PlainTime",
+        temporal_plain_time_ctor_thunk as *const u8,
+        0,
+    );
+    if !plain_time.is_null() {
+        install_temporal_from_compare(
+            plain_time,
+            temporal_plain_time_from_thunk as *const u8,
+            temporal_plain_time_compare_thunk as *const u8,
+        );
+    }
+
+    // Temporal.PlainDateTime (#4693)
+    let plain_date_time = install_temporal_constructor(
+        ns_obj,
+        "PlainDateTime",
+        temporal_plain_date_time_ctor_thunk as *const u8,
+        3,
+    );
+    if !plain_date_time.is_null() {
+        install_temporal_from_compare(
+            plain_date_time,
+            temporal_plain_date_time_from_thunk as *const u8,
+            temporal_plain_date_time_compare_thunk as *const u8,
+        );
+        install_temporal_prototype(
+            plain_date_time,
+            crate::temporal::TemporalKind::PlainDateTime as u8,
+            PLAIN_DATE_TIME_GETTERS,
+            PLAIN_DATE_TIME_METHODS,
+        );
+    }
+
+    // Temporal.PlainYearMonth (#4694)
+    let plain_year_month = install_temporal_constructor(
+        ns_obj,
+        "PlainYearMonth",
+        temporal_plain_year_month_ctor_thunk as *const u8,
+        2,
+    );
+    if !plain_year_month.is_null() {
+        install_temporal_from_compare(
+            plain_year_month,
+            temporal_plain_year_month_from_thunk as *const u8,
+            temporal_plain_year_month_compare_thunk as *const u8,
+        );
+    }
+
+    // Temporal.PlainMonthDay (#4694) — `from` only, no `compare` per spec.
+    let plain_month_day = install_temporal_constructor(
+        ns_obj,
+        "PlainMonthDay",
+        temporal_plain_month_day_ctor_thunk as *const u8,
+        2,
+    );
+    if !plain_month_day.is_null() {
+        install_constructor_static_with_call_arity(
+            plain_month_day,
+            "from",
+            temporal_plain_month_day_from_thunk as *const u8,
+            1,
+            0,
+            true,
+        );
+    }
+
+    // Temporal.ZonedDateTime (#4695)
+    let zoned = install_temporal_constructor(
+        ns_obj,
+        "ZonedDateTime",
+        temporal_zoned_date_time_ctor_thunk as *const u8,
+        2,
+    );
+    if !zoned.is_null() {
+        install_temporal_from_compare(
+            zoned,
+            temporal_zoned_date_time_from_thunk as *const u8,
+            temporal_zoned_date_time_compare_thunk as *const u8,
+        );
+        // Real `Temporal.ZonedDateTime.prototype` with getter/method descriptors
+        // so reflective test262 cases resolve (branding / prop-desc / length /
+        // name / not-a-constructor). `ctor.prototype` is non-writable/non-enum/
+        // non-config; `proto.constructor` is writable/non-enum/config (spec).
+        let proto = build_zoned_date_time_prototype();
+        if !proto.is_null() {
+            let proto_value = crate::value::js_nanbox_pointer(proto as i64);
+            crate::closure::closure_set_dynamic_prop(zoned as usize, "prototype", proto_value);
+            super::set_builtin_property_attrs(
+                zoned as usize,
+                "prototype".to_string(),
+                super::PropertyAttrs::new(false, false, false),
+            );
+            set_intrinsic_data_prop(
+                proto,
+                "constructor",
+                crate::value::js_nanbox_pointer(zoned as i64),
+                super::PropertyAttrs::new(true, false, true),
+            );
+        }
+    }
+
+    // Populate each `Temporal.<Type>.prototype` with real accessor getters,
+    // method functions, `@@toStringTag`, and a `constructor` back-reference so
+    // Test262's prototype introspection (prop-desc / branding / length / name /
+    // builtin / not-a-constructor) sees spec-correct shapes. Instance dispatch
+    // still goes through the brand routers — these are reflection-only.
+    use super::temporal_proto::populate_prototype;
+    populate_prototype(
+        duration,
+        "Temporal.Duration",
+        &[
+            "years",
+            "months",
+            "weeks",
+            "days",
+            "hours",
+            "minutes",
+            "seconds",
+            "milliseconds",
+            "microseconds",
+            "nanoseconds",
+            "sign",
+            "blank",
+        ],
+        &[
+            ("with", 1),
+            ("negated", 0),
+            ("abs", 0),
+            ("add", 1),
+            ("subtract", 1),
+            ("round", 1),
+            ("total", 1),
+            ("toString", 0),
+            ("toJSON", 0),
+            ("toLocaleString", 0),
+            ("valueOf", 0),
+        ],
+    );
+    populate_prototype(
+        instant,
+        "Temporal.Instant",
+        // Per the current Temporal spec, `Temporal.Instant.prototype` exposes
+        // only `epochMilliseconds` and `epochNanoseconds`; the older
+        // `epochSeconds` / `epochMicroseconds` accessors were removed (Node v26
+        // ships neither, and `get()` never implemented them).
+        &["epochMilliseconds", "epochNanoseconds"],
+        &[
+            ("add", 1),
+            ("subtract", 1),
+            ("until", 1),
+            ("since", 1),
+            ("round", 1),
+            ("equals", 1),
+            ("toString", 0),
+            ("toJSON", 0),
+            ("toLocaleString", 0),
+            ("valueOf", 0),
+            ("toZonedDateTimeISO", 1),
+        ],
+    );
+    populate_prototype(
+        plain_date,
+        "Temporal.PlainDate",
+        &[
+            "year",
+            "month",
+            "monthCode",
+            "day",
+            "dayOfWeek",
+            "dayOfYear",
+            "weekOfYear",
+            "yearOfWeek",
+            "daysInWeek",
+            "daysInMonth",
+            "daysInYear",
+            "monthsInYear",
+            "inLeapYear",
+            "calendarId",
+            "era",
+            "eraYear",
+        ],
+        &[
+            ("toPlainYearMonth", 0),
+            ("toPlainMonthDay", 0),
+            ("add", 1),
+            ("subtract", 1),
+            ("with", 1),
+            ("withCalendar", 1),
+            ("until", 1),
+            ("since", 1),
+            ("equals", 1),
+            ("toPlainDateTime", 0),
+            ("toZonedDateTime", 1),
+            ("toString", 0),
+            ("toJSON", 0),
+            ("toLocaleString", 0),
+            ("valueOf", 0),
+        ],
+    );
+    populate_prototype(
+        plain_time,
+        "Temporal.PlainTime",
+        &[
+            "hour",
+            "minute",
+            "second",
+            "millisecond",
+            "microsecond",
+            "nanosecond",
+        ],
+        &[
+            ("add", 1),
+            ("subtract", 1),
+            ("with", 1),
+            ("until", 1),
+            ("since", 1),
+            ("round", 1),
+            ("equals", 1),
+            ("toString", 0),
+            ("toJSON", 0),
+            ("toLocaleString", 0),
+            ("valueOf", 0),
+        ],
+    );
+    populate_prototype(
+        plain_date_time,
+        "Temporal.PlainDateTime",
+        &[
+            "year",
+            "month",
+            "monthCode",
+            "day",
+            "hour",
+            "minute",
+            "second",
+            "millisecond",
+            "microsecond",
+            "nanosecond",
+            "dayOfWeek",
+            "dayOfYear",
+            "weekOfYear",
+            "yearOfWeek",
+            "daysInWeek",
+            "daysInMonth",
+            "daysInYear",
+            "monthsInYear",
+            "inLeapYear",
+            "calendarId",
+            "era",
+            "eraYear",
+        ],
+        &[
+            ("with", 1),
+            ("withPlainTime", 0),
+            ("withCalendar", 1),
+            ("add", 1),
+            ("subtract", 1),
+            ("until", 1),
+            ("since", 1),
+            ("round", 1),
+            ("equals", 1),
+            ("toPlainDate", 0),
+            ("toPlainTime", 0),
+            ("toZonedDateTime", 1),
+            ("toString", 0),
+            ("toJSON", 0),
+            ("toLocaleString", 0),
+            ("valueOf", 0),
+        ],
+    );
+    populate_prototype(
+        plain_year_month,
+        "Temporal.PlainYearMonth",
+        &[
+            "year",
+            "month",
+            "monthCode",
+            "daysInMonth",
+            "daysInYear",
+            "monthsInYear",
+            "inLeapYear",
+            "calendarId",
+            "era",
+            "eraYear",
+        ],
+        &[
+            ("with", 1),
+            ("add", 1),
+            ("subtract", 1),
+            ("until", 1),
+            ("since", 1),
+            ("equals", 1),
+            ("toPlainDate", 1),
+            ("toString", 0),
+            ("toJSON", 0),
+            ("toLocaleString", 0),
+            ("valueOf", 0),
+        ],
+    );
+    populate_prototype(
+        plain_month_day,
+        "Temporal.PlainMonthDay",
+        &["monthCode", "day", "calendarId"],
+        &[
+            ("with", 1),
+            ("equals", 1),
+            ("toPlainDate", 1),
+            ("toString", 0),
+            ("toJSON", 0),
+            ("toLocaleString", 0),
+            ("valueOf", 0),
+        ],
+    );
+    populate_prototype(
+        zoned,
+        "Temporal.ZonedDateTime",
+        &[
+            "year",
+            "month",
+            "monthCode",
+            "day",
+            "hour",
+            "minute",
+            "second",
+            "millisecond",
+            "microsecond",
+            "nanosecond",
+            "epochMilliseconds",
+            "epochNanoseconds",
+            "timeZoneId",
+            "calendarId",
+            "dayOfWeek",
+            "dayOfYear",
+            "weekOfYear",
+            "yearOfWeek",
+            "hoursInDay",
+            "daysInWeek",
+            "daysInMonth",
+            "daysInYear",
+            "monthsInYear",
+            "inLeapYear",
+            "offset",
+            "offsetNanoseconds",
+            "era",
+            "eraYear",
+        ],
+        &[
+            ("with", 1),
+            ("withPlainTime", 0),
+            ("withTimeZone", 1),
+            ("withCalendar", 1),
+            ("add", 1),
+            ("subtract", 1),
+            ("until", 1),
+            ("since", 1),
+            ("round", 1),
+            ("equals", 1),
+            ("startOfDay", 0),
+            ("getTimeZoneTransition", 1),
+            ("toInstant", 0),
+            ("toPlainDate", 0),
+            ("toPlainTime", 0),
+            ("toPlainDateTime", 0),
+            ("toString", 0),
+            ("toJSON", 0),
+            ("toLocaleString", 0),
+            ("valueOf", 0),
+        ],
+    );
+
+    // Temporal.Now namespace (#4689)
+    let now_value = build_temporal_now_namespace();
+    let now_key = crate::string::js_string_from_bytes(b"Now".as_ptr(), 3);
+    js_object_set_field_by_name(ns_obj, now_key, now_value);
+    super::set_builtin_property_attrs(
+        ns_obj as usize,
+        "Now".to_string(),
+        super::PropertyAttrs::new(true, false, true),
+    );
+}
+
+/// Install the standard `from` (spec length 1) and `compare` (spec length 2)
+/// statics — both variadic with call-arity 0 — on a Temporal constructor.
+fn install_temporal_from_compare(
+    ctor: *mut crate::closure::ClosureHeader,
+    from_thunk: *const u8,
+    compare_thunk: *const u8,
+) {
+    install_constructor_static_with_call_arity(ctor, "from", from_thunk, 1, 0, true);
+    install_constructor_static_with_call_arity(ctor, "compare", compare_thunk, 2, 0, true);
+}
+
 /// Populate the freshly-allocated globalThis singleton with built-in
 /// constructor / namespace properties. Called exactly once from the CAS
 /// winner in `js_get_global_this`. Constructors get a ClosureHeader-
@@ -2355,6 +4355,11 @@ pub(crate) fn populate_global_this_builtins(singleton: *mut ObjectHeader) {
         let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
         let value = crate::value::js_nanbox_pointer(singleton as i64);
         js_object_set_field_by_name(singleton, key, value);
+        super::set_builtin_property_attrs(
+            singleton as usize,
+            "global".to_string(),
+            super::PropertyAttrs::new(true, true, true),
+        );
     }
     // #2145: pre-allocate the shared `%TypedArray%` intrinsic so per-kind
     // typed-array constructors can link their `__proto__` to it as they're
@@ -2366,6 +4371,11 @@ pub(crate) fn populate_global_this_builtins(singleton: *mut ObjectHeader) {
     // `%Generator(.prototype)%` chains resolve to real objects.
     ensure_generator_intrinsics();
     // Constructors: ClosureHeader-backed so typeof is "function".
+    // #4533: native error subclasses must link to `Error` / `Error.prototype`.
+    // `Error` is listed before its subclasses in GLOBAL_THIS_BUILTIN_CONSTRUCTORS,
+    // so these are populated before the subclass iterations consume them.
+    let mut error_ctor_bits: Option<u64> = None;
+    let mut error_proto_bits: Option<u64> = None;
     for name in GLOBAL_THIS_BUILTIN_CONSTRUCTORS.iter().copied() {
         if name == "Buffer" {
             let name_bytes = name.as_bytes();
@@ -2497,6 +4507,15 @@ pub(crate) fn populate_global_this_builtins(singleton: *mut ObjectHeader) {
             install_error_static_methods(closure_ptr);
         }
         let ctor_value = crate::value::js_nanbox_pointer(closure_ptr as i64);
+        // #4533: `Object.getPrototypeOf(TypeError) === Error`. The constructor's
+        // `[[Prototype]]` is `Error` itself (not `Function.prototype`).
+        if name == "Error" {
+            error_ctor_bits = Some(ctor_value.to_bits());
+        } else if is_native_error_subclass_constructor(name) {
+            if let Some(proto_bits) = error_ctor_bits {
+                crate::closure::closure_set_static_prototype(closure_ptr as usize, proto_bits);
+            }
+        }
         // Stash `prototype` on the closure's dynamic-prop side table.
         // `js_object_set_field_by_name` detects the CLOSURE_MAGIC tag
         // at offset 12 and dispatches into `closure_set_dynamic_prop`
@@ -2562,6 +4581,23 @@ pub(crate) fn populate_global_this_builtins(singleton: *mut ObjectHeader) {
             // those arms (#970) rebind IMPLICIT_THIS before forwarding.
             populate_builtin_prototype_methods(name, proto_obj);
             install_error_prototype_data_properties(name, proto_obj);
+            // ECMA-262 20.5.6.3: the [[Prototype]] of each NativeError prototype
+            // object is %Error.prototype% (not %Object.prototype%). `Error` is
+            // listed before its subclasses, so its prototype object is stashed
+            // here and linked into each subclass prototype's chain. Without this
+            // `Object.getPrototypeOf(TypeError.prototype) !== Error.prototype`
+            // (test262 NativeErrors/*/prototype/proto.js).
+            if name == "Error" {
+                error_proto_bits =
+                    Some(crate::value::js_nanbox_pointer(proto_obj as i64).to_bits());
+            } else if is_native_error_subclass_constructor(name) {
+                if let Some(proto_bits) = error_proto_bits {
+                    super::prototype_chain::object_set_static_prototype(
+                        proto_obj as usize,
+                        proto_bits,
+                    );
+                }
+            }
             if matches!(name, "MessageChannel" | "MessagePort" | "BroadcastChannel") {
                 crate::messaging::populate_messaging_prototype(name, proto_obj, ctor_value);
             }
@@ -2611,6 +4647,22 @@ pub(crate) fn populate_global_this_builtins(singleton: *mut ObjectHeader) {
                         as *mut crate::gc::GcHeader;
                     (*gc)._reserved |= crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO;
                 }
+                // Record the per-kind proto's `[[Prototype]]` as the shared
+                // `%TypedArray%.prototype` so the ordinary property-get chain
+                // walk (`resolve_inherited_field`) finds the inherited methods
+                // (`map`, `filter`, `toString`, …) that no longer live on the
+                // per-kind proto as own properties. `Object.getPrototypeOf`
+                // already resolves via the flag above; this link drives value
+                // reads like `Int8Array.prototype.map`.
+                let intrinsic_proto =
+                    crate::object::TYPED_ARRAY_INTRINSIC_PROTO_PTR.load(Ordering::Acquire);
+                if intrinsic_proto != 0 {
+                    let proto_bits = crate::value::js_nanbox_pointer(intrinsic_proto).to_bits();
+                    super::prototype_chain::object_set_static_prototype(
+                        proto_obj as usize,
+                        proto_bits,
+                    );
+                }
             }
             // #4140: per-kind `BYTES_PER_ELEMENT` own data property on BOTH the
             // constructor and its prototype, matching Node's descriptor
@@ -2655,43 +4707,67 @@ pub(crate) fn populate_global_this_builtins(singleton: *mut ObjectHeader) {
     // Callable global functions: ClosureHeader-backed values with real
     // dispatch so direct property reads and rebound calls match bare calls.
     for name in GLOBAL_THIS_BUILTIN_FUNCTIONS.iter().copied() {
-        let (func_ptr, arity, has_rest) = match name {
-            "eval" => (global_this_eval_thunk as *const u8, 1, false),
+        let (func_ptr, arity, has_rest, enumerable) = match name {
+            "eval" => (global_this_eval_thunk as *const u8, 1, false, false),
             "fetch" => (
                 super::global_fetch::global_this_fetch_thunk as *const u8,
                 1,
                 true,
+                true,
             ),
-            "structuredClone" => (global_this_structured_clone_thunk as *const u8, 2, false),
-            "atob" => (global_this_atob_thunk as *const u8, 1, false),
-            "btoa" => (global_this_btoa_thunk as *const u8, 1, false),
-            "setTimeout" => (global_this_set_timeout_thunk as *const u8, 2, true),
-            "clearTimeout" => (global_this_clear_timeout_thunk as *const u8, 1, false),
-            "setInterval" => (global_this_set_interval_thunk as *const u8, 2, true),
-            "clearInterval" => (global_this_clear_interval_thunk as *const u8, 1, false),
-            "setImmediate" => (global_this_set_immediate_thunk as *const u8, 1, true),
-            "clearImmediate" => (global_this_clear_immediate_thunk as *const u8, 1, false),
-            "queueMicrotask" => (global_this_queue_microtask_thunk as *const u8, 1, false),
+            "structuredClone" => (
+                global_this_structured_clone_thunk as *const u8,
+                2,
+                false,
+                true,
+            ),
+            "atob" => (global_this_atob_thunk as *const u8, 1, false, true),
+            "btoa" => (global_this_btoa_thunk as *const u8, 1, false, true),
+            "setTimeout" => (global_this_set_timeout_thunk as *const u8, 2, true, true),
+            "clearTimeout" => (global_this_clear_timeout_thunk as *const u8, 1, false, true),
+            "setInterval" => (global_this_set_interval_thunk as *const u8, 2, true, true),
+            "clearInterval" => (
+                global_this_clear_interval_thunk as *const u8,
+                1,
+                false,
+                true,
+            ),
+            "setImmediate" => (global_this_set_immediate_thunk as *const u8, 1, true, true),
+            "clearImmediate" => (
+                global_this_clear_immediate_thunk as *const u8,
+                1,
+                false,
+                true,
+            ),
+            "queueMicrotask" => (
+                global_this_queue_microtask_thunk as *const u8,
+                1,
+                false,
+                true,
+            ),
             // #2905: standard global helper functions.
-            "parseInt" => (global_this_parse_int_thunk as *const u8, 2, false),
-            "parseFloat" => (global_this_parse_float_thunk as *const u8, 1, false),
-            "isNaN" => (global_this_is_nan_thunk as *const u8, 1, false),
-            "isFinite" => (global_this_is_finite_thunk as *const u8, 1, false),
-            "encodeURI" => (global_this_encode_uri_thunk as *const u8, 1, false),
-            "decodeURI" => (global_this_decode_uri_thunk as *const u8, 1, false),
+            "parseInt" => (global_this_parse_int_thunk as *const u8, 2, false, false),
+            "parseFloat" => (global_this_parse_float_thunk as *const u8, 1, false, false),
+            "isNaN" => (global_this_is_nan_thunk as *const u8, 1, false, false),
+            "isFinite" => (global_this_is_finite_thunk as *const u8, 1, false, false),
+            "encodeURI" => (global_this_encode_uri_thunk as *const u8, 1, false, false),
+            "decodeURI" => (global_this_decode_uri_thunk as *const u8, 1, false, false),
             "encodeURIComponent" => (
                 global_this_encode_uri_component_thunk as *const u8,
                 1,
+                false,
                 false,
             ),
             "decodeURIComponent" => (
                 global_this_decode_uri_component_thunk as *const u8,
                 1,
                 false,
+                false,
             ),
             // #4511: legacy escape/unescape (ES Annex B).
-            "escape" => (global_this_escape_thunk as *const u8, 1, false),
-            "unescape" => (global_this_unescape_thunk as *const u8, 1, false),
+            // #4511: legacy escape/unescape (ES Annex B).
+            "escape" => (global_this_escape_thunk as *const u8, 1, false, false),
+            "unescape" => (global_this_unescape_thunk as *const u8, 1, false, false),
             _ => continue,
         };
         let closure_ptr = crate::closure::js_closure_alloc(func_ptr, 0);
@@ -2706,12 +4782,28 @@ pub(crate) fn populate_global_this_builtins(singleton: *mut ObjectHeader) {
         unsafe {
             crate::builtins::js_register_function_name(func_ptr, name.as_ptr(), name.len() as u32);
         }
+        super::native_module::set_builtin_closure_length(closure_ptr as usize, arity);
         let name_bytes = name.as_bytes();
         let name_key =
             crate::string::js_string_from_bytes(name_bytes.as_ptr(), name_bytes.len() as u32);
         let fn_value = crate::value::js_nanbox_pointer(closure_ptr as i64);
         js_object_set_field_by_name(singleton, name_key, fn_value);
+        super::set_builtin_property_attrs(
+            singleton as usize,
+            name.to_string(),
+            super::PropertyAttrs::new(true, enumerable, true),
+        );
     }
+    // ECMA-262 21.1.2.12 / 21.1.2.13: `Number.parseFloat` and `Number.parseInt`
+    // are the SAME function objects as the global `parseFloat` / `parseInt`
+    // (`Number.parseFloat === parseFloat`). The Number constructor statics were
+    // installed above with fresh thunks — before the global helpers existed —
+    // so re-point them now at the global closures we just created on the
+    // singleton. A value-read of `Number.parseFloat` resolves to the Number
+    // constructor's own `parseFloat` field (see expr_member.rs reroute-undo),
+    // which now holds the identical closure the bare `parseFloat` resolves to.
+    alias_number_static_to_global_function(singleton, "parseFloat");
+    alias_number_static_to_global_function(singleton, "parseInt");
     // Namespaces: plain ObjectHeader so typeof is "object" per spec.
     for name in GLOBAL_THIS_BUILTIN_NAMESPACES.iter().copied() {
         let name_bytes = name.as_bytes();
@@ -2745,8 +4837,15 @@ pub(crate) fn populate_global_this_builtins(singleton: *mut ObjectHeader) {
                     install_reflect_namespace_members(ns_obj);
                     set_intrinsic_to_string_tag(ns_obj, "Reflect");
                 }
-                "Atomics" => install_atomics_namespace_members(ns_obj),
+                "Atomics" => {
+                    install_atomics_namespace_members(ns_obj);
+                    set_intrinsic_to_string_tag(ns_obj, "Atomics");
+                }
                 "Intl" => crate::intl::install_intl_namespace(ns_obj),
+                "Temporal" => {
+                    install_temporal_namespace(ns_obj);
+                    set_intrinsic_to_string_tag(ns_obj, "Temporal");
+                }
                 _ => {}
             }
             crate::value::js_nanbox_pointer(ns_obj as i64)
@@ -2816,6 +4915,34 @@ pub(crate) fn populate_global_this_builtins(singleton: *mut ObjectHeader) {
             crate::navigator::navigator_object_with_constructor(f64::from_bits(nav_ctor.bits()));
         js_object_set_field_by_name(singleton, nkey, nval);
     }
+}
+
+/// Re-point a `Number.<name>` static at the global function of the same name so
+/// the two are the identical object (`Number.parseFloat === parseFloat`). Both
+/// the global helper and the `Number` constructor are already installed on the
+/// `singleton` by the time this runs. No-op if either lookup fails.
+fn alias_number_static_to_global_function(singleton: *mut ObjectHeader, name: &str) {
+    let global_key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+    let global_fn = js_object_get_field_by_name(singleton, global_key);
+    if (global_fn.bits() >> 48) != 0x7FFD {
+        return;
+    }
+    let number_key = crate::string::js_string_from_bytes(b"Number".as_ptr(), 6);
+    let number_ctor = js_object_get_field_by_name(singleton, number_key);
+    if (number_ctor.bits() >> 48) != 0x7FFD {
+        return;
+    }
+    let ctor_ptr = (number_ctor.bits() & crate::value::POINTER_MASK) as *mut ObjectHeader;
+    if ctor_ptr.is_null() {
+        return;
+    }
+    let static_key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+    js_object_set_field_by_name(ctor_ptr, static_key, f64::from_bits(global_fn.bits()));
+    super::set_builtin_property_attrs(
+        ctor_ptr as usize,
+        name.to_string(),
+        super::PropertyAttrs::new(true, false, true),
+    );
 }
 
 fn install_error_static_methods(ctor: *mut crate::closure::ClosureHeader) {
@@ -2937,8 +5064,92 @@ extern "C" fn object_freeze_thunk(
 extern "C" fn object_create_thunk(
     _closure: *const crate::closure::ClosureHeader,
     value: f64,
+    props: f64,
 ) -> f64 {
-    super::js_object_create(value)
+    if props.to_bits() == crate::value::TAG_UNDEFINED {
+        super::js_object_create(value)
+    } else {
+        super::js_object_create_with_props(value, props)
+    }
+}
+
+extern "C" fn object_seal_thunk(_closure: *const crate::closure::ClosureHeader, value: f64) -> f64 {
+    super::js_object_seal(value)
+}
+
+extern "C" fn object_is_sealed_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    value: f64,
+) -> f64 {
+    super::js_object_is_sealed(value)
+}
+
+extern "C" fn object_is_frozen_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    value: f64,
+) -> f64 {
+    super::js_object_is_frozen(value)
+}
+
+extern "C" fn object_is_extensible_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    value: f64,
+) -> f64 {
+    super::js_object_is_extensible(value)
+}
+
+extern "C" fn object_prevent_extensions_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    value: f64,
+) -> f64 {
+    super::js_object_prevent_extensions(value)
+}
+
+extern "C" fn object_is_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    a: f64,
+    b: f64,
+) -> f64 {
+    super::js_object_is(a, b)
+}
+
+extern "C" fn object_set_prototype_of_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    obj: f64,
+    proto: f64,
+) -> f64 {
+    super::js_object_set_prototype_of(obj, proto)
+}
+
+extern "C" fn object_get_own_property_symbols_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    value: f64,
+) -> f64 {
+    let arr = unsafe { crate::symbol::js_object_get_own_property_symbols(value) };
+    crate::value::js_nanbox_pointer(arr)
+}
+
+extern "C" fn object_get_own_property_descriptors_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    value: f64,
+) -> f64 {
+    super::js_object_get_own_property_descriptors(value)
+}
+
+extern "C" fn object_define_properties_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    target: f64,
+    descriptors: f64,
+) -> f64 {
+    super::js_object_define_properties(target, descriptors)
+}
+
+extern "C" fn object_group_by_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    items: f64,
+    callback: f64,
+) -> f64 {
+    super::js_object_group_by(items, callback)
 }
 
 extern "C" fn object_get_prototype_of_thunk(
@@ -3012,20 +5223,25 @@ extern "C" fn array_is_array_thunk(
 }
 
 extern "C" fn array_from_thunk(_closure: *const crate::closure::ClosureHeader, value: f64) -> f64 {
-    nanbox_array_or_undef(crate::array::js_array_from_value(value))
+    // Reflective `Array.from.call(C, items)` / `Array.from.apply(C, [items])`
+    // binds `C` as the implicit `this`. Read it FIRST (before any nested call
+    // can overwrite it) and run the spec algorithm — when `C IsConstructor`,
+    // the result is built via `Construct(C)`. A plain reflective call (no
+    // explicit receiver) leaves `this` as undefined / a non-constructor, so
+    // the default `%Array%` path is taken.
+    let c = crate::object::js_implicit_this_get();
+    let undefined = f64::from_bits(crate::value::TAG_UNDEFINED);
+    crate::array::array_from_full(c, value, undefined, undefined)
 }
 
 extern "C" fn array_of_thunk(_closure: *const crate::closure::ClosureHeader, rest: f64) -> f64 {
+    // Reflective `Array.of.call(C, ...items)` binds `C` as the implicit `this`.
+    // Read it FIRST (before any nested call can overwrite it); when `C
+    // IsConstructor` the result is built via `Construct(C, «len»)`, otherwise the
+    // default `%Array%` path is taken. See `array_of_full` (ECMA-262 §23.1.2.3).
+    let c = crate::object::js_implicit_this_get();
     let vals = global_this_rest_array_values(rest);
-    let len = vals.len() as u32;
-    let arr = crate::array::js_array_alloc(len);
-    unsafe {
-        (*arr).length = len;
-        for (i, &v) in vals.iter().enumerate() {
-            crate::array::js_array_set_f64(arr, i as u32, v);
-        }
-    }
-    crate::value::js_nanbox_pointer(arr as i64)
+    crate::array::array_of_full(c, &vals)
 }
 
 extern "C" fn number_is_nan_thunk(
@@ -3245,6 +5461,78 @@ extern "C" fn string_from_code_point_static(
     crate::value::js_nanbox_string(s as i64)
 }
 
+// #4521: reified `Promise` statics so `Promise.all` / `Promise.resolve` / etc.
+// are first-class function values (correct `.name` / `.length`, usable via
+// reference, `.call`, `.apply`, spread). Direct calls (`Promise.all([...])`)
+// still take the codegen fast path in `lower_call/console_promise.rs`; these
+// thunks back value reads and rebound/`.call` usage by delegating to the same
+// runtime entry points the direct-call path emits. Spec-internal observable
+// semantics (per-iteration `this.resolve`, real resolve-element closures with
+// `[[AlreadyCalled]]`, `NewPromiseCapability(this)`) are a follow-up — these
+// thunks intentionally use the native Promise machinery regardless of `this`.
+extern "C" fn promise_resolve_static(
+    _closure: *const crate::closure::ClosureHeader,
+    value: f64,
+) -> f64 {
+    let this_ctor = crate::object::js_implicit_this_get();
+    crate::promise::js_promise_resolve_spec(this_ctor, value)
+}
+
+extern "C" fn promise_reject_static(
+    _closure: *const crate::closure::ClosureHeader,
+    reason: f64,
+) -> f64 {
+    let this_ctor = crate::object::js_implicit_this_get();
+    crate::promise::js_promise_reject_spec(this_ctor, reason)
+}
+
+extern "C" fn promise_all_static(
+    _closure: *const crate::closure::ClosureHeader,
+    iterable: f64,
+) -> f64 {
+    let this_ctor = crate::object::js_implicit_this_get();
+    crate::promise::js_promise_all_spec(this_ctor, iterable)
+}
+
+extern "C" fn promise_race_static(
+    _closure: *const crate::closure::ClosureHeader,
+    iterable: f64,
+) -> f64 {
+    let this_ctor = crate::object::js_implicit_this_get();
+    crate::promise::js_promise_race_spec(this_ctor, iterable)
+}
+
+extern "C" fn promise_all_settled_static(
+    _closure: *const crate::closure::ClosureHeader,
+    iterable: f64,
+) -> f64 {
+    let this_ctor = crate::object::js_implicit_this_get();
+    crate::promise::js_promise_all_settled_spec(this_ctor, iterable)
+}
+
+extern "C" fn promise_any_static(
+    _closure: *const crate::closure::ClosureHeader,
+    iterable: f64,
+) -> f64 {
+    let this_ctor = crate::object::js_implicit_this_get();
+    crate::promise::js_promise_any_spec(this_ctor, iterable)
+}
+
+extern "C" fn promise_with_resolvers_static(_closure: *const crate::closure::ClosureHeader) -> f64 {
+    let this_ctor = crate::object::js_implicit_this_get();
+    crate::promise::js_promise_with_resolvers_spec(this_ctor)
+}
+
+// `Promise.try(fn, ...args)`: call-arity 1 (callback) + rest (forwarded args).
+extern "C" fn promise_try_static(
+    _closure: *const crate::closure::ClosureHeader,
+    callback: f64,
+    rest: f64,
+) -> f64 {
+    let this_ctor = crate::object::js_implicit_this_get();
+    crate::promise::js_promise_try_spec(this_ctor, callback, rest)
+}
+
 // #4627: reified `String.raw(callSite, ...substitutions)` tag function. One
 // fixed param (the template/cooked object) then a rest of substitutions, which
 // `js_string_raw` reads by numeric index — so `rest` (the collected array) is
@@ -3279,22 +5567,167 @@ extern "C" fn typed_array_from_thunk(
     map_fn: f64,
     this_arg: f64,
 ) -> f64 {
-    let kind = require_typed_array_constructor_this();
+    // §%TypedArray%.from step 1-2: `C` is the `this` value; if `IsConstructor(C)`
+    // is false, throw a TypeError — BEFORE the source is read. Invoked as a plain
+    // function (`var from = TA.from; from([])`) the sloppy `this` is `globalThis`
+    // (not a constructor), so this must fire even though a source is supplied
+    // (test262 `from/invoked-as-func`). A concrete TA `this` (kind known) is a
+    // constructor by definition.
+    let kind_opt = typed_array_constructor_this_kind();
+    if kind_opt.is_none() {
+        require_typed_array_from_of_constructor();
+    }
+    // Spec order: validate the map callback BEFORE the source is read.
     let mapped = map_fn.to_bits() != crate::value::TAG_UNDEFINED;
-    let arr = if mapped {
-        crate::array::js_array_from_mapped(source, map_fn, this_arg)
+    let map_closure = if mapped {
+        crate::array::js_validate_array_callback(map_fn) as *const crate::closure::ClosureHeader
     } else {
-        crate::array::js_array_from_value(source)
+        std::ptr::null()
     };
-    let ta = crate::typedarray::js_typed_array_new_from_array(kind as i32, arr);
-    crate::value::js_nanbox_pointer(ta as i64)
+    // Read the source's RAW kValues — its `@@iterator` invoked, or its
+    // `ToLength(length)` + indexed elements evaluated — any throwing user
+    // iterator/getter propagates (test262 from/arylk-*-error).
+    let raw = unsafe { crate::typedarray::typed_array_from_source_raw_values(source) };
+    // Per-element `mappedValue = Call(mapfn, T, «kValue, k»)` then
+    // `Set(target, k, mappedValue)` — the map call and the (observable,
+    // possibly throwing) element coercion INTERLEAVE per spec, so an abrupt
+    // coercion at element k means the map callback never ran for k+1
+    // (test262 from/set-value-abrupt-completion).
+    let map_at = |k: usize, v: f64| -> f64 {
+        if map_closure.is_null() {
+            return v;
+        }
+        let prev = crate::object::js_implicit_this_set(this_arg);
+        let r = crate::closure::js_closure_call2(map_closure, v, k as f64);
+        crate::object::js_implicit_this_set(prev);
+        r
+    };
+    if let Some(kind) = kind_opt {
+        let out = crate::typedarray::typed_array_alloc(kind, raw.len() as u32);
+        for (k, &v) in raw.iter().enumerate() {
+            let m = map_at(k, v);
+            unsafe { crate::typedarray_props::species_result_store(out as usize, k, m) };
+        }
+        return crate::value::js_nanbox_pointer(out as i64);
+    }
+    // Custom `this` constructor: TypedArrayCreate(C, «len») then per-element
+    // [[Set]] (same interleave).
+    let len = raw.len();
+    let len_arg = [f64::from_bits(
+        crate::value::JSValue::number(len as f64).bits(),
+    )];
+    let ctor = crate::object::js_implicit_this_get();
+    let target = unsafe { super::js_new_function_construct(ctor, len_arg.as_ptr(), 1) };
+    let addr = crate::typedarray_props::typed_array_addr_from_value(target).unwrap_or_else(|| {
+        super::object_ops::throw_object_type_error(
+            b"TypedArray.from/of constructor did not return a TypedArray",
+        )
+    });
+    let ta_ptr = addr as *mut crate::typedarray::TypedArrayHeader;
+    let target_len = unsafe { crate::typedarray::js_typed_array_length(ta_ptr) } as usize;
+    if target_len < len {
+        super::object_ops::throw_object_type_error(
+            b"Derived TypedArray constructor created an array which was too small",
+        );
+    }
+    for (k, &v) in raw.iter().enumerate() {
+        let m = map_at(k, v);
+        unsafe { crate::typedarray_props::species_result_store(addr, k, m) };
+    }
+    target
+}
+
+/// `%TypedArray%.from`/`.of` step "If IsConstructor(`this`) is false, throw a
+/// TypeError". Only called when the `this` value is not a concrete typed-array
+/// constructor (kind unknown); a user constructor passes, anything else throws.
+fn require_typed_array_from_of_constructor() {
+    let this_ctor = crate::object::js_implicit_this_get();
+    if !value_is_constructor(this_ctor) {
+        super::object_ops::throw_object_type_error(
+            b"TypedArray.from/of called with a `this` that is not a constructor",
+        );
+    }
+}
+
+/// `IsConstructor(value)` for the typed-array `from`/`of` `this` check: a class
+/// ref, a proxy, or a non-arrow user closure that is not a flagged
+/// non-constructable builtin.
+fn value_is_constructor(value: f64) -> bool {
+    let bits = value.to_bits();
+    if (bits >> 48) == 0x7FFE {
+        return true; // class-ref constructor
+    }
+    if crate::proxy::js_proxy_is_proxy(value) == 1 {
+        return true;
+    }
+    if (bits >> 48) == 0x7FFD {
+        let raw = (bits & crate::value::POINTER_MASK) as usize;
+        if crate::closure::is_closure_ptr(raw) {
+            if crate::closure::closure_is_arrow(raw as *const crate::closure::ClosureHeader) {
+                return false;
+            }
+            return !super::native_module::builtin_closure_is_non_constructable_value(value);
+        }
+    }
+    false
+}
+
+/// Build the result of `%TypedArray%.from` / `%TypedArray%.of` from a
+/// materialized values array, honoring a custom `this` constructor.
+///
+/// When `this` is a concrete typed-array constructor (`Int8Array`, …) the
+/// fast path builds the view directly. Otherwise (`%TypedArray%.from.call(
+/// userCtor, …)`) the spec's `TypedArrayCreate(C, «len»)` is realized by
+/// `Construct(C, [len])` and the values are written into the result via the
+/// element [[Set]] path — so a user constructor that throws propagates, and one
+/// that returns an arbitrary (sufficiently long) typed array is used verbatim
+/// (test262 `from/of` `custom-ctor*`).
+fn typed_array_create_from_values(
+    kind_opt: Option<u8>,
+    arr: *mut crate::array::ArrayHeader,
+) -> f64 {
+    if let Some(kind) = kind_opt {
+        let ta = crate::typedarray::js_typed_array_new_from_array(kind as i32, arr);
+        return crate::value::js_nanbox_pointer(ta as i64);
+    }
+    let ctor = crate::object::js_implicit_this_get();
+    let len = crate::array::js_array_length(arr) as usize;
+    let len_arg = [f64::from_bits(
+        crate::value::JSValue::number(len as f64).bits(),
+    )];
+    let target = unsafe { super::js_new_function_construct(ctor, len_arg.as_ptr(), 1) };
+    // `TypedArrayCreate` requires the constructed object to be a typed array
+    // with at least `len` elements.
+    let addr = crate::typedarray_props::typed_array_addr_from_value(target).unwrap_or_else(|| {
+        super::object_ops::throw_object_type_error(
+            b"TypedArray.from/of constructor did not return a TypedArray",
+        )
+    });
+    let ta_ptr = addr as *mut crate::typedarray::TypedArrayHeader;
+    let target_len = unsafe { crate::typedarray::js_typed_array_length(ta_ptr) } as usize;
+    if target_len < len {
+        // `TypedArrayCreate(C, «len»)` throws a *TypeError* (not RangeError)
+        // when the constructed typed array is shorter than the requested length
+        // (test262 `from/of` `custom-ctor-returns-smaller-instance-throws`).
+        super::object_ops::throw_object_type_error(
+            b"Derived TypedArray constructor created an array which was too small",
+        );
+    }
+    for k in 0..len {
+        let v = crate::array::js_array_get(arr, k as u32);
+        crate::typedarray::js_typed_array_set(ta_ptr, k as i32, f64::from_bits(v.bits()));
+    }
+    target
 }
 
 extern "C" fn typed_array_of_thunk(
     _closure: *const crate::closure::ClosureHeader,
     rest: f64,
 ) -> f64 {
-    let kind = require_typed_array_constructor_this();
+    let kind_opt = typed_array_constructor_this_kind();
+    if kind_opt.is_none() {
+        require_typed_array_from_of_constructor();
+    }
     let vals = global_this_rest_array_values(rest);
     let len = vals.len() as u32;
     let arr = crate::array::js_array_alloc(len);
@@ -3304,8 +5737,75 @@ extern "C" fn typed_array_of_thunk(
             crate::array::js_array_set_f64(arr, i as u32, v);
         }
     }
-    let ta = crate::typedarray::js_typed_array_new_from_array(kind as i32, arr);
-    crate::value::js_nanbox_pointer(ta as i64)
+    typed_array_create_from_values(kind_opt, arr)
+}
+
+fn promise_static_function_spec(name: &str) -> Option<(*const u8, u32, u32, bool)> {
+    // All eight statics use the spec-aware `*_static` thunks, which honor the
+    // `this` constructor via `NewPromiseCapability(this)` — so a `Promise`
+    // subclass (`class P extends Promise{}; P.all([...])`) or a valid custom
+    // constructor (`Promise.all.call(C, ...)`) is accepted, while a
+    // non-constructor `this` throws a TypeError from the capability flow.
+    match name {
+        "resolve" => Some((promise_resolve_static as *const u8, 1, 1, false)),
+        "reject" => Some((promise_reject_static as *const u8, 1, 1, false)),
+        "all" => Some((promise_all_static as *const u8, 1, 1, false)),
+        "race" => Some((promise_race_static as *const u8, 1, 1, false)),
+        "allSettled" => Some((promise_all_settled_static as *const u8, 1, 1, false)),
+        "any" => Some((promise_any_static as *const u8, 1, 1, false)),
+        "withResolvers" => Some((promise_with_resolvers_static as *const u8, 0, 0, false)),
+        "try" => Some((promise_try_static as *const u8, 1, 1, true)),
+        _ => None,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn js_promise_static_function_value(name_ptr: *const u8, name_len: usize) -> f64 {
+    if name_ptr.is_null() || name_len == 0 {
+        return f64::from_bits(crate::value::TAG_UNDEFINED);
+    }
+    let name_bytes = unsafe { std::slice::from_raw_parts(name_ptr, name_len) };
+    let Ok(name) = std::str::from_utf8(name_bytes) else {
+        return f64::from_bits(crate::value::TAG_UNDEFINED);
+    };
+    let Some((func_ptr, spec_length, call_arity, has_rest)) = promise_static_function_spec(name)
+    else {
+        return f64::from_bits(crate::value::TAG_UNDEFINED);
+    };
+
+    let ctor_value = js_get_global_this_builtin_value(b"Promise".as_ptr(), 7);
+    let ctor_ptr =
+        crate::value::js_nanbox_get_pointer(ctor_value) as *mut crate::closure::ClosureHeader;
+    if !ctor_ptr.is_null() {
+        let existing = crate::closure::closure_get_dynamic_prop(ctor_ptr as usize, name);
+        if existing.to_bits() != crate::value::TAG_UNDEFINED {
+            return existing;
+        }
+    }
+
+    let closure = crate::closure::js_closure_alloc(func_ptr, 0);
+    if closure.is_null() {
+        return f64::from_bits(crate::value::TAG_UNDEFINED);
+    }
+    if has_rest {
+        crate::closure::js_register_closure_rest(func_ptr, call_arity);
+    } else {
+        crate::closure::js_register_closure_arity(func_ptr, call_arity);
+    }
+    super::native_module::set_bound_native_closure_name(closure, name);
+    super::native_module::set_builtin_closure_length(closure as usize, spec_length);
+    super::native_module::set_builtin_closure_non_constructable(closure as usize);
+
+    let value = crate::value::js_nanbox_pointer(closure as i64);
+    if !ctor_ptr.is_null() {
+        crate::closure::closure_set_dynamic_prop(ctor_ptr as usize, name, value);
+        super::set_builtin_property_attrs(
+            ctor_ptr as usize,
+            name.to_string(),
+            super::PropertyAttrs::new(true, false, true),
+        );
+    }
+    value
 }
 
 extern "C" fn url_can_parse_thunk(
@@ -3541,7 +6041,72 @@ fn install_builtin_constructor_statics(name: &str, ctor: *mut crate::closure::Cl
                 false,
             );
             install_constructor_static(ctor, "freeze", object_freeze_thunk as *const u8, 1, false);
-            install_constructor_static(ctor, "create", object_create_thunk as *const u8, 1, false);
+            install_constructor_static(ctor, "create", object_create_thunk as *const u8, 2, false);
+            install_constructor_static(ctor, "seal", object_seal_thunk as *const u8, 1, false);
+            install_constructor_static(
+                ctor,
+                "isSealed",
+                object_is_sealed_thunk as *const u8,
+                1,
+                false,
+            );
+            install_constructor_static(
+                ctor,
+                "isFrozen",
+                object_is_frozen_thunk as *const u8,
+                1,
+                false,
+            );
+            install_constructor_static(
+                ctor,
+                "isExtensible",
+                object_is_extensible_thunk as *const u8,
+                1,
+                false,
+            );
+            install_constructor_static(
+                ctor,
+                "preventExtensions",
+                object_prevent_extensions_thunk as *const u8,
+                1,
+                false,
+            );
+            install_constructor_static(ctor, "is", object_is_thunk as *const u8, 2, false);
+            install_constructor_static(
+                ctor,
+                "setPrototypeOf",
+                object_set_prototype_of_thunk as *const u8,
+                2,
+                false,
+            );
+            install_constructor_static(
+                ctor,
+                "getOwnPropertySymbols",
+                object_get_own_property_symbols_thunk as *const u8,
+                1,
+                false,
+            );
+            install_constructor_static(
+                ctor,
+                "getOwnPropertyDescriptors",
+                object_get_own_property_descriptors_thunk as *const u8,
+                1,
+                false,
+            );
+            install_constructor_static(
+                ctor,
+                "defineProperties",
+                object_define_properties_thunk as *const u8,
+                2,
+                false,
+            );
+            install_constructor_static(
+                ctor,
+                "groupBy",
+                object_group_by_thunk as *const u8,
+                2,
+                false,
+            );
             install_constructor_static(
                 ctor,
                 "getPrototypeOf",
@@ -3597,6 +6162,31 @@ fn install_builtin_constructor_statics(name: &str, ctor: *mut crate::closure::Cl
             );
             install_constructor_static(ctor, "from", array_from_thunk as *const u8, 1, false);
             install_constructor_static(ctor, "of", array_of_thunk as *const u8, 0, true);
+        }
+        "Promise" => {
+            for static_name in [
+                "resolve",
+                "reject",
+                "all",
+                "race",
+                "allSettled",
+                "any",
+                "withResolvers",
+                "try",
+            ] {
+                if let Some((func_ptr, spec_length, call_arity, has_rest)) =
+                    promise_static_function_spec(static_name)
+                {
+                    install_constructor_static_with_call_arity(
+                        ctor,
+                        static_name,
+                        func_ptr,
+                        spec_length,
+                        call_arity,
+                        has_rest,
+                    );
+                }
+            }
         }
         "Date" => {
             // `Date.now` / `Date.parse` / `Date.UTC` as real own data props
@@ -3956,6 +6546,11 @@ fn install_noop_proto_methods(proto_obj: *mut ObjectHeader, methods: &[(&str, u3
     for (name, arity) in methods.iter().copied() {
         let func_ptr = match name {
             "isPrototypeOf" => object_prototype_is_prototype_of_thunk as *const u8,
+            // Annex B accessor methods get real thunks (reflective `.call`).
+            "__defineGetter__" => object_prototype_define_getter_thunk as *const u8,
+            "__defineSetter__" => object_prototype_define_setter_thunk as *const u8,
+            "__lookupGetter__" => object_prototype_lookup_getter_thunk as *const u8,
+            "__lookupSetter__" => object_prototype_lookup_setter_thunk as *const u8,
             _ => global_this_builtin_noop_thunk as *const u8,
         };
         install_proto_method(proto_obj, name, func_ptr, arity);
@@ -4007,6 +6602,11 @@ const OBJECT_PROTO_METHODS: &[(&str, u32)] = &[
     ("propertyIsEnumerable", 1),
     ("toLocaleString", 0),
     ("valueOf", 0),
+    // Annex B §B.2.2 legacy accessor helpers.
+    ("__defineGetter__", 2),
+    ("__defineSetter__", 2),
+    ("__lookupGetter__", 1),
+    ("__lookupSetter__", 1),
     // `toString` is installed separately on Object/typed arrays etc. with
     // dedicated thunks; do not include it here to avoid clobbering those.
 ];
@@ -4038,6 +6638,11 @@ fn populate_builtin_prototype_methods(builtin_name: &str, proto_obj: *mut Object
         install_noop_proto_methods(proto_obj, OBJECT_PROTO_METHODS);
         return;
     }
+    // #4795: TC39 explicit-resource-management stacks.
+    if super::disposable_proto_thunks::install_disposable_proto_methods(builtin_name, proto_obj) {
+        install_noop_proto_methods(proto_obj, OBJECT_PROTO_METHODS);
+        return;
+    }
     // #4100: primitive wrapper prototypes need real thunks for their own
     // methods so reflective calls brand-check `this` instead of hitting the
     // generic Object no-op/valueOf fallbacks.
@@ -4066,44 +6671,100 @@ fn populate_builtin_prototype_methods(builtin_name: &str, proto_obj: *mut Object
             install_noop_proto_methods(
                 proto_obj,
                 &[
-                    ("at", 1),
-                    ("concat", 1),
                     ("copyWithin", 2),
                     ("entries", 0),
-                    ("every", 1),
                     ("fill", 1),
-                    ("filter", 1),
-                    ("find", 1),
-                    ("findIndex", 1),
-                    ("findLast", 1),
-                    ("findLastIndex", 1),
                     ("flat", 0),
                     ("flatMap", 1),
-                    ("forEach", 1),
-                    ("includes", 1),
-                    ("indexOf", 1),
-                    ("join", 1),
                     ("keys", 0),
-                    ("lastIndexOf", 1),
-                    ("map", 1),
-                    ("pop", 0),
-                    ("push", 1),
-                    ("reduce", 1),
-                    ("reduceRight", 1),
-                    ("reverse", 0),
-                    ("shift", 0),
-                    ("some", 1),
-                    ("sort", 1),
-                    ("splice", 2),
                     ("toLocaleString", 0),
                     ("toReversed", 0),
                     ("toSorted", 1),
                     ("toSpliced", 2),
                     ("toString", 0),
-                    ("unshift", 1),
                     ("values", 0),
                     ("with", 2),
                 ],
+            );
+            // Generic mutators get REAL thunks (vs the noop above) so a borrowed
+            // reference works: `obj.pop = Array.prototype.pop; obj.pop()` and
+            // `Array.prototype.splice.call(obj, …)`. Each reads IMPLICIT_THIS and
+            // runs the array algorithm on a real array or array-like object.
+            install_proto_method(proto_obj, "pop", array_prototype_pop_thunk as *const u8, 0);
+            install_proto_method(
+                proto_obj,
+                "shift",
+                array_prototype_shift_thunk as *const u8,
+                0,
+            );
+            install_proto_method(
+                proto_obj,
+                "reverse",
+                array_prototype_reverse_thunk as *const u8,
+                0,
+            );
+            install_proto_method_rest_with_length(
+                proto_obj,
+                "push",
+                array_prototype_push_thunk as *const u8,
+                1,
+                0,
+            );
+            install_proto_method_rest_with_length(
+                proto_obj,
+                "unshift",
+                array_prototype_unshift_thunk as *const u8,
+                1,
+                0,
+            );
+            install_proto_method_rest_with_length(
+                proto_obj,
+                "splice",
+                array_prototype_splice_thunk as *const u8,
+                2,
+                0,
+            );
+            // `sort` / `concat` get real thunks too: a borrowed
+            // `obj.sort = Array.prototype.sort; obj.sort()` must run the
+            // generic engine on the receiver (test262 sort/S15.4.4.11_A3_T1,
+            // A4_T3, concat/S15.4.4.4_A2_T1) — the previous noop thunk
+            // silently returned undefined.
+            install_proto_method(
+                proto_obj,
+                "sort",
+                array_prototype_sort_thunk as *const u8,
+                1,
+            );
+            // Iteration / search methods: real generic-engine thunks (rest
+            // shape — spec `.length` recorded separately below).
+            type RestThunk = extern "C" fn(*const crate::closure::ClosureHeader, f64) -> f64;
+            let arraylike_thunks: [(&str, RestThunk, u32); 14] = [
+                ("forEach", array_proto_forEach_thunk, 1),
+                ("map", array_proto_map_thunk, 1),
+                ("filter", array_proto_filter_thunk, 1),
+                ("some", array_proto_some_thunk, 1),
+                ("every", array_proto_every_thunk, 1),
+                ("find", array_proto_find_thunk, 1),
+                ("findIndex", array_proto_findIndex_thunk, 1),
+                ("findLast", array_proto_findLast_thunk, 1),
+                ("findLastIndex", array_proto_findLastIndex_thunk, 1),
+                ("reduce", array_proto_reduce_thunk, 1),
+                ("reduceRight", array_proto_reduceRight_thunk, 1),
+                ("indexOf", array_proto_indexOf_thunk, 1),
+                ("lastIndexOf", array_proto_lastIndexOf_thunk, 1),
+                ("includes", array_proto_includes_thunk, 1),
+            ];
+            for (name, thunk, len) in arraylike_thunks {
+                install_proto_method_rest_with_length(proto_obj, name, thunk as *const u8, len, 0);
+            }
+            install_proto_method(proto_obj, "at", array_proto_at_thunk as *const u8, 1);
+            install_proto_method(proto_obj, "join", array_proto_join_thunk as *const u8, 1);
+            install_proto_method_rest_with_length(
+                proto_obj,
+                "concat",
+                array_prototype_concat_thunk as *const u8,
+                1,
+                0,
             );
             install_noop_proto_methods(proto_obj, OBJECT_PROTO_METHODS);
         }
@@ -4136,6 +6797,47 @@ fn populate_builtin_prototype_methods(builtin_name: &str, proto_obj: *mut Object
                     );
                 }
             }
+            install_noop_proto_methods(proto_obj, OBJECT_PROTO_METHODS);
+        }
+        "SharedArrayBuffer" => {
+            // Mirror the ArrayBuffer.prototype shape: a brand-checking `slice`
+            // (instances dispatch through buffer_dispatch; `.call(notSab)`
+            // throws here), a `byteLength` accessor whose getter brand-checks
+            // the shared registry, and the `Symbol.toStringTag`.
+            install_proto_method(
+                proto_obj,
+                "slice",
+                shared_array_buffer_slice_thunk as *const u8,
+                2,
+            );
+            unsafe {
+                crate::closure::js_register_closure_arity(
+                    shared_array_buffer_byte_length_getter_thunk as *const u8,
+                    0,
+                );
+                let getter = crate::closure::js_closure_alloc(
+                    shared_array_buffer_byte_length_getter_thunk as *const u8,
+                    0,
+                );
+                if !getter.is_null() {
+                    let getter_bits = crate::value::js_nanbox_pointer(getter as i64).to_bits();
+                    install_builtin_getter(proto_obj, "byteLength", getter_bits);
+                    set_accessor_descriptor(
+                        proto_obj as usize,
+                        "byteLength".to_string(),
+                        AccessorDescriptor {
+                            get: getter_bits,
+                            set: 0,
+                        },
+                    );
+                    set_property_attrs(
+                        proto_obj as usize,
+                        "byteLength".to_string(),
+                        PropertyAttrs::new(true, false, true),
+                    );
+                }
+            }
+            set_intrinsic_to_string_tag(proto_obj, "SharedArrayBuffer");
             install_noop_proto_methods(proto_obj, OBJECT_PROTO_METHODS);
         }
         "DataView" => {
@@ -4198,6 +6900,36 @@ fn populate_builtin_prototype_methods(builtin_name: &str, proto_obj: *mut Object
             );
         }
         "Function" => {
+            // `Function.prototype` has own `length` (0) and `name` ("") data
+            // properties, each `{ writable: false, enumerable: false,
+            // configurable: true }` (ECMA-262 20.2.3). Install them first so
+            // `length` precedes `name` in `getOwnPropertyNames` order, matching
+            // the built-in-function property order Test262 checks.
+            {
+                let len_key = crate::string::js_string_from_bytes(b"length".as_ptr(), 6);
+                js_object_set_field_by_name(
+                    proto_obj,
+                    len_key,
+                    f64::from_bits(JSValue::number(0.0).bits()),
+                );
+                super::set_builtin_property_attrs(
+                    proto_obj as usize,
+                    "length".to_string(),
+                    super::PropertyAttrs::new(false, false, true),
+                );
+                let empty = crate::string::js_string_from_bytes(b"".as_ptr(), 0);
+                let name_key = crate::string::js_string_from_bytes(b"name".as_ptr(), 4);
+                js_object_set_field_by_name(
+                    proto_obj,
+                    name_key,
+                    f64::from_bits(JSValue::string_ptr(empty).bits()),
+                );
+                super::set_builtin_property_attrs(
+                    proto_obj as usize,
+                    "name".to_string(),
+                    super::PropertyAttrs::new(false, false, true),
+                );
+            }
             install_proto_method(
                 proto_obj,
                 "apply",
@@ -4228,46 +6960,17 @@ fn populate_builtin_prototype_methods(builtin_name: &str, proto_obj: *mut Object
             install_function_has_instance_symbol(proto_obj);
         }
         "String" => {
-            install_noop_proto_methods(
-                proto_obj,
-                &[
-                    ("at", 1),
-                    ("charAt", 1),
-                    ("charCodeAt", 1),
-                    ("codePointAt", 1),
-                    ("concat", 1),
-                    ("endsWith", 1),
-                    ("includes", 1),
-                    ("indexOf", 1),
-                    ("isWellFormed", 0),
-                    ("lastIndexOf", 1),
-                    ("localeCompare", 1),
-                    ("match", 1),
-                    ("matchAll", 1),
-                    ("normalize", 0),
-                    ("padEnd", 1),
-                    ("padStart", 1),
-                    ("repeat", 1),
-                    ("replace", 2),
-                    ("replaceAll", 2),
-                    ("search", 1),
-                    ("slice", 2),
-                    ("split", 2),
-                    ("startsWith", 1),
-                    ("substr", 2),
-                    ("substring", 2),
-                    ("toLocaleLowerCase", 0),
-                    ("toLocaleUpperCase", 0),
-                    ("toLowerCase", 0),
-                    ("toString", 0),
-                    ("toUpperCase", 0),
-                    ("toWellFormed", 0),
-                    ("trim", 0),
-                    ("trimEnd", 0),
-                    ("trimStart", 0),
-                    ("valueOf", 0),
-                ],
-            );
+            // #4713: generic-`this` char-access methods + `Symbol.iterator`, and
+            // (this change) every other coercing method (slice/indexOf/split/
+            // replace/…) get real reflective thunks (RequireObjectCoercible +
+            // ToString) installed by `install_string_proto_methods` so
+            // `String.prototype.slice.call(receiver, …)` works on a boxed/object
+            // receiver. Only `toString` (and `valueOf`, via OBJECT_PROTO_METHODS)
+            // stay no-op-backed: they are brand-checked (must throw on a
+            // non-String `this`), not ToString-coercing, so a generic coercing
+            // thunk would be wrong.
+            string_proto_thunks::install_string_proto_methods("String", proto_obj);
+            install_noop_proto_methods(proto_obj, &[("toString", 0)]);
             install_noop_proto_methods(proto_obj, OBJECT_PROTO_METHODS);
         }
         "Number" => {
@@ -4432,10 +7135,14 @@ fn populate_builtin_prototype_methods(builtin_name: &str, proto_obj: *mut Object
             );
         }
         "RegExp" => {
-            install_noop_proto_methods(
-                proto_obj,
-                &[("exec", 1), ("test", 1), ("toString", 0), ("compile", 2)],
-            );
+            // Real accessor getters (`source`/`flags`/`global`/…) so reflection
+            // (`getOwnPropertyDescriptor(RegExp.prototype, "source").get`) and
+            // brand-checked `.call(this)` work, and instances inherit them.
+            super::regex_proto_thunks::install_regex_proto_accessors(proto_obj);
+            // Real brand-checking `exec`/`test`/`toString`; `compile` stays a
+            // no-op (Annex B).
+            super::regex_proto_thunks::install_regex_proto_methods(proto_obj);
+            install_noop_proto_methods(proto_obj, &[("compile", 2)]);
             install_noop_proto_methods(proto_obj, OBJECT_PROTO_METHODS);
         }
         "URLPattern" => {
@@ -4662,25 +7369,17 @@ fn populate_builtin_prototype_methods(builtin_name: &str, proto_obj: *mut Object
         "Int8Array" | "Uint8Array" | "Uint8ClampedArray" | "Int16Array" | "Uint16Array"
         | "Int32Array" | "Uint32Array" | "Float16Array" | "Float32Array" | "Float64Array"
         | "BigInt64Array" | "BigUint64Array" => {
-            // `toString` is generic (`%TypedArray%.prototype.toString` is just
-            // `Array.prototype.toString` in the spec — no TypedArray brand
-            // check), so keep it on the shared no-op path for value reads.
-            install_noop_proto_methods(proto_obj, &[("toString", 0)]);
-            // Install the inherited `Object.prototype` data methods FIRST so the
-            // brand-checking typed-array thunks below override the ones that
-            // overlap (e.g. `toLocaleString`, which `%TypedArray%.prototype`
-            // defines with its own ValidateTypedArray brand check rather than
-            // the lenient `Object.prototype` no-op).
-            install_noop_proto_methods(proto_obj, OBJECT_PROTO_METHODS);
-            // Brand-checking thunks for the spec `%TypedArray%.prototype`
-            // methods: a value-path `Int8Array.prototype.map.call(plainArray)`
-            // must throw a `TypeError` (ValidateTypedArray, spec step 1). The
-            // receiver-typed fast path `new Int8Array([…]).map(…)` is lowered
-            // directly to `js_typed_array_*` by codegen and doesn't touch these.
-            // Pre-fix these were `global_this_builtin_noop_thunk`, whose
-            // `.call` re-dispatch landed on the (now array-like-lenient) Array
-            // helper and silently succeeded. #(typedarray-branded-methods).
-            typed_array_proto_thunks::install_typed_array_proto_methods(proto_obj);
+            // Per spec the per-kind prototype is nearly empty: every method,
+            // accessor, `Symbol.iterator`, `Symbol.toStringTag`, `toString`,
+            // and `toLocaleString` lives on the shared `%TypedArray%.prototype`
+            // (this proto's `[[Prototype]]`) and is *inherited*, not own — so
+            // `Int8Array.prototype.hasOwnProperty("map") === false` and
+            // `Int8Array.prototype.map === %TypedArray%.prototype.map`
+            // (test262 `prototype/*/inherited.js`). The only own properties are
+            // `constructor` (set in the constructor-setup path) and
+            // `BYTES_PER_ELEMENT`. The static-prototype link to the intrinsic
+            // is wired alongside the `OBJ_FLAG_TYPED_ARRAY_PROTO` flag so the
+            // generic property-get chain walk resolves the inherited methods.
         }
         _ => {}
     }
@@ -4689,7 +7388,7 @@ fn populate_builtin_prototype_methods(builtin_name: &str, proto_obj: *mut Object
 fn install_error_prototype_data_properties(builtin_name: &str, proto_obj: *mut ObjectHeader) {
     let name = match builtin_name {
         "Error" | "TypeError" | "RangeError" | "SyntaxError" | "ReferenceError"
-        | "AggregateError" | "EvalError" | "URIError" => builtin_name,
+        | "AggregateError" | "EvalError" | "URIError" | "SuppressedError" => builtin_name,
         _ => return,
     };
     if proto_obj.is_null() {

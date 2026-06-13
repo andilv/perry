@@ -22,7 +22,9 @@ pub extern "C" fn js_parse_int(str_ptr: *const StringHeader, radix: f64) -> f64 
         let bytes = std::slice::from_raw_parts(data, len);
 
         if let Ok(s) = std::str::from_utf8(bytes) {
-            let trimmed = s.trim_start();
+            // StrWhiteSpace per spec (NBSP/BOM in, NEL out) — not Rust's
+            // `trim_start`, whose White_Space set diverges from JS's.
+            let trimmed = s.trim_start_matches(crate::string::is_js_whitespace);
             if trimmed.is_empty() {
                 return f64::NAN;
             }
@@ -125,8 +127,12 @@ pub extern "C" fn js_parse_float(str_ptr: *const StringHeader) -> f64 {
 /// Core parseFloat logic operating on raw bytes — no heap allocation.
 /// Exposed as `pub(crate)` so unit tests can call it directly.
 pub(crate) fn parse_float_bytes(bytes: &[u8]) -> f64 {
-    // JS spec: strip leading StrWhiteSpace (ASCII subset covers all common cases)
-    let bytes = bytes.trim_ascii_start();
+    // JS spec: strip leading StrWhiteSpace — the full set (NBSP, VT, LS/PS, BOM,
+    // Unicode space separators), not just ASCII. Trim by char so multi-byte
+    // whitespace (U+00A0, U+2028, …) is consumed (test262 parseFloat A2_T3/5/8/9),
+    // but operate byte-wise so a *trailing* lone surrogate elsewhere in the WTF-8
+    // input doesn't poison the whole parse (A6: `parseFloat("0.1e1" + cu)`).
+    let bytes = trim_leading_js_whitespace(bytes);
     if bytes.is_empty() {
         return f64::NAN;
     }
@@ -155,6 +161,39 @@ pub(crate) fn parse_float_bytes(bytes: &[u8]) -> f64 {
     // from_utf8_unchecked is safe.
     let s = unsafe { std::str::from_utf8_unchecked(&bytes[..end]) };
     s.parse::<f64>().unwrap_or(f64::NAN)
+}
+
+/// Strip leading StrWhiteSpace, decoding one UTF-8 scalar at a time so that
+/// invalid bytes *after* the leading run (e.g. a lone surrogate in WTF-8 input)
+/// don't abort the whole trim. ASCII whitespace is the common case and stays a
+/// single-byte check.
+fn trim_leading_js_whitespace(bytes: &[u8]) -> &[u8] {
+    let mut start = 0;
+    while start < bytes.len() {
+        let b = bytes[start];
+        if b < 0x80 {
+            if crate::string::is_js_whitespace(b as char) {
+                start += 1;
+                continue;
+            }
+            break;
+        }
+        // Multi-byte lead: decode just the next scalar value from the valid
+        // UTF-8 prefix; stop at the first byte that isn't valid UTF-8.
+        let rest = &bytes[start..];
+        let valid = match std::str::from_utf8(rest) {
+            Ok(s) => s,
+            Err(e) if e.valid_up_to() > 0 => unsafe {
+                std::str::from_utf8_unchecked(&rest[..e.valid_up_to()])
+            },
+            Err(_) => break,
+        };
+        match valid.chars().next() {
+            Some(c) if crate::string::is_js_whitespace(c) => start += c.len_utf8(),
+            _ => break,
+        }
+    }
+    &bytes[start..]
 }
 
 /// Returns the byte length of the leading StrDecimalLiteral prefix in `bytes`.
@@ -315,6 +354,23 @@ mod parse_float_tests {
 /// Marked `#[inline]` so the bitcode-link path can inline + DCE the
 /// branches when the input type is statically known.
 #[no_mangle]
+/// ECMA-262 ToIntegerOrInfinity (§7.1.5): ToNumber, then map NaN→0, truncate
+/// toward zero, preserving ±Infinity. Exposed for codegen so Array index
+/// arguments (`fill`/`copyWithin` start/end/target, etc.) fire
+/// `valueOf` / `Symbol.toPrimitive` and propagate their throws (and the
+/// `Symbol`→TypeError) at the spec-mandated point instead of being silently
+/// swallowed by a downstream `is_nan()` shortcut.
+#[no_mangle]
+pub extern "C" fn js_to_integer_or_infinity(value: f64) -> f64 {
+    let n = js_number_coerce(value);
+    if n.is_nan() {
+        0.0
+    } else {
+        n.trunc()
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn js_number_coerce(value: f64) -> f64 {
     let jsval = JSValue::from_bits(value.to_bits());
 
@@ -418,7 +474,9 @@ pub extern "C" fn js_number_coerce(value: f64) -> f64 {
         // identifiers, so test assertions like `typeof x === "number"`
         // hold). Gate on the timer registry so unrelated small handles
         // (UI widgets, drizzle, etc.) still fall through to toPrimitive.
-        if id > 0 && id < 0x100000 && crate::timer::is_known_timer_id(id) {
+        if crate::value::addr_class::is_small_handle(id as usize)
+            && crate::timer::is_known_timer_id(id)
+        {
             return id as f64;
         }
         // Array → ToPrimitive(number) finds no `valueOf` override, so it
@@ -432,6 +490,19 @@ pub extern "C" fn js_number_coerce(value: f64) -> f64 {
             let comma = crate::string::js_string_from_bytes(b",".as_ptr(), 1);
             let joined = unsafe { crate::array::js_array_join(arr_ptr, comma) };
             return js_number_coerce(crate::value::js_nanbox_string(joined as i64));
+        }
+        // TypedArray → OrdinaryToPrimitive(number): a *patched own*
+        // `valueOf`/`toString` expando (stored in the typed-array own-props
+        // side table, invisible to the generic object helpers below) runs
+        // first, with `this` = the typed array and abrupt completions
+        // propagating (test262 ctors/object-arg/throws-setting-obj-*). With
+        // no patch, fall through to the generic path (join + ToNumber).
+        if crate::typedarray::lookup_typed_array_kind(id as usize).is_some() {
+            if let Some(p) = unsafe {
+                crate::typedarray_props::typed_array_own_to_primitive_number(id as usize, value)
+            } {
+                return js_number_coerce(p);
+            }
         }
         // Object → consult [Symbol.toPrimitive]("number") first; if the
         // object has a custom toPrimitive method, recurse with the result.
@@ -455,8 +526,17 @@ pub extern "C" fn js_number_coerce(value: f64) -> f64 {
                 }
                 return f64::NAN;
             }
-            crate::value::OrdinaryToPrimitiveOutcome::TypeError
-            | crate::value::OrdinaryToPrimitiveOutcome::DefaultString => {}
+            crate::value::OrdinaryToPrimitiveOutcome::TypeError => {
+                // ECMA-262 7.1.1 OrdinaryToPrimitive: if both `valueOf` and
+                // `toString` return non-primitive objects, ToPrimitive throws a
+                // TypeError — `Number(obj)` must propagate it rather than fall
+                // through and stringify to NaN (test262 built-ins/Number/
+                // S8.12.8_A4.js).
+                crate::collection_iter::throw_type_error(
+                    "Cannot convert object to primitive value",
+                );
+            }
+            crate::value::OrdinaryToPrimitiveOutcome::DefaultString => {}
         }
         let str_ptr = crate::value::js_jsvalue_to_string(value);
         if str_ptr.is_null() {

@@ -85,6 +85,22 @@ fn workspace_root_from_exe(exe: &Path) -> Option<PathBuf> {
 
 /// Find the Perry workspace root by searching upward from the executable location.
 pub fn find_perry_workspace_root() -> Option<PathBuf> {
+    // Explicit override: npm/homebrew installs place the perry binary
+    // outside the workspace, so neither the exe walk nor the cwd walk
+    // below can ever find the source tree — auto-optimize then silently
+    // falls back to the prebuilt full-feature runtime/stdlib and every
+    // binary ships the whole stdlib (sqlite, crypto, tokio, …). Users
+    // who keep a workspace checkout can point at it explicitly.
+    if let Ok(root) = std::env::var("PERRY_WORKSPACE_ROOT") {
+        let path = PathBuf::from(root);
+        if is_perry_workspace_root(&path) {
+            return Some(path);
+        }
+        eprintln!(
+            "warning: PERRY_WORKSPACE_ROOT is set but does not look like a \
+             Perry workspace (missing crates/perry-runtime); ignoring it"
+        );
+    }
     // First try: relative to the perry executable
     if let Ok(exe) = std::env::current_exe() {
         if let Some(root) = workspace_root_from_exe(&exe) {
@@ -151,24 +167,44 @@ pub(super) fn extract_compile_package_dir(
     resolved_path: &Path,
     package_name: &str,
 ) -> Option<PathBuf> {
-    let path_str = resolved_path.to_string_lossy();
-    let needle = format!("node_modules/{}", package_name);
-    // Use rfind to handle deeply nested node_modules
-    path_str
-        .rfind(&needle)
-        .map(|idx| PathBuf::from(&path_str[..idx + needle.len()]))
+    resolved_path
+        .ancestors()
+        .find(|candidate| is_compile_package_dir(candidate, package_name))
+        .map(Path::to_path_buf)
 }
 
 /// Check if a file path is inside a package listed in compile_packages
 pub(super) fn is_in_compile_package(path: &Path, compile_packages: &HashSet<String>) -> bool {
-    let path_str = path.to_string_lossy();
-    for pkg_name in compile_packages {
-        let pattern = format!("node_modules/{}/", pkg_name);
-        if path_str.contains(&pattern) {
-            return true;
+    compile_packages.iter().any(|pkg_name| {
+        path.ancestors()
+            .any(|candidate| is_compile_package_dir(candidate, pkg_name))
+    })
+}
+
+fn is_compile_package_dir(candidate: &Path, package_name: &str) -> bool {
+    let parts: Vec<&str> = package_name.split('/').collect();
+    match parts.as_slice() {
+        [name] => {
+            candidate.file_name().is_some_and(|part| part == *name)
+                && candidate
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|part| part == "node_modules")
         }
+        [scope, name] => {
+            candidate.file_name().is_some_and(|part| part == *name)
+                && candidate
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|part| part == *scope)
+                && candidate
+                    .parent()
+                    .and_then(Path::parent)
+                    .and_then(Path::file_name)
+                    .is_some_and(|part| part == "node_modules")
+        }
+        _ => false,
     }
-    false
 }
 
 /// Enumerate every installed package name reachable from `project_root`'s
@@ -372,28 +408,57 @@ pub(super) fn resolve_with_extensions(base: &Path) -> Option<PathBuf> {
         return Some(base.to_path_buf());
     }
 
-    // Try with extensions in order of preference (TS before JS)
+    // Try with extensions in order of preference (TS before JS).
+    //
+    // Node module resolution APPENDS the extension to the full specifier
+    // (`./stream-ops.web` -> `./stream-ops.web.js`); it never strips a dotted
+    // segment that isn't a real module extension. `Path::with_extension`
+    // REPLACES the last `.foo` segment, so on `stream-ops.web` it produces
+    // `stream-ops.js` — which, in Next.js's app-render dir, is the *requiring*
+    // module itself (`stream-ops.js` requires `./stream-ops.web`). Returning it
+    // makes the module self-require and its re-export getters recurse forever
+    // (`exports.chainStreams` -> `self.chainStreams` -> ... stack overflow).
+    //
+    // So: always try the APPEND form first. Only fall back to the REPLACE form
+    // when the specifier already ends in a recognized module extension — that
+    // path exists purely for Perry's TS-over-JS preference (`./foo.js` whose
+    // `.js` was pruned but `./foo.ts` is present), never to swap an arbitrary
+    // filename segment like `.web`.
+    let base_ext_is_module = base
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            matches!(
+                e,
+                "js" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts" | "json" | "node"
+            )
+        })
+        .unwrap_or(false);
+    let path_str = base.to_string_lossy().to_string();
     for ext in all_extensions {
-        let with_ext = base.with_extension(ext.trim_start_matches('.'));
-        if with_ext.exists() && with_ext.is_file() {
-            return Some(with_ext);
-        }
-
-        // Also try adding extension to full path (for paths like ./foo.js)
-        let path_str = base.to_string_lossy();
-        let with_ext = PathBuf::from(format!("{}{}", path_str, ext));
-        if with_ext.exists() && with_ext.is_file() {
-            // If we found a JS file, check for TS equivalent first
+        // APPEND: `./stream-ops.web` + `.js` -> `./stream-ops.web.js`.
+        let appended = PathBuf::from(format!("{}{}", path_str, ext));
+        if appended.exists() && appended.is_file() {
+            // If we landed on a JS file, prefer a co-located TS source.
             if matches!(ext, ".js" | ".mjs" | ".cjs") {
-                let stem_str = path_str.to_string();
                 for ts_ext in ts_extensions {
-                    let ts_path = PathBuf::from(format!("{}{}", stem_str, ts_ext));
+                    let ts_path = PathBuf::from(format!("{}{}", path_str, ts_ext));
                     if ts_path.exists() && ts_path.is_file() {
                         return Some(ts_path);
                     }
                 }
             }
-            return Some(with_ext);
+            return Some(appended);
+        }
+
+        // REPLACE: only safe when the specifier already carries a real module
+        // extension (e.g. `./foo.js` -> `./foo.ts`). Skipped for `.web`-style
+        // dotted filenames so we never resolve to a sibling module.
+        if base_ext_is_module {
+            let replaced = base.with_extension(ext.trim_start_matches('.'));
+            if replaced.exists() && replaced.is_file() {
+                return Some(replaced);
+            }
         }
     }
 
@@ -429,7 +494,13 @@ pub(super) fn resolve_package_entry(package_dir: &Path, subpath: Option<&str>) -
     };
 
     if let Some(exports) = pkg.get("exports") {
-        if let Some(entry) = resolve_exports(exports, &export_key) {
+        // Try every condition branch in priority order and take the first
+        // target that exists on disk. A single-winner pick breaks under
+        // Next.js standalone output: its file tracing prunes the package
+        // files the build didn't load, so `@swc/helpers`' `import` target
+        // (`esm/*.js`) is absent while the `default` target (`cjs/*.cjs`)
+        // is present — Node resolves the latter at require time.
+        for entry in resolve_exports_candidates(exports, &export_key) {
             let entry_path = package_dir.join(&entry);
             if entry_path.exists() {
                 return Some(entry_path);
@@ -585,6 +656,93 @@ pub(super) fn resolve_exports(exports: &serde_json::Value, subpath: &str) -> Opt
         subpath,
         &["perry", "import", "module", "default", "require", "node"],
     )
+}
+
+/// Node subpath imports (#5039): resolve a `#`-prefixed specifier through the
+/// importing package's own `package.json` `"imports"` map
+/// (https://nodejs.org/api/packages.html#imports). chalk 5 loads its vendored
+/// dependencies this way (`import ansiStyles from '#ansi-styles'` →
+/// `./source/vendor/ansi-styles/index.js`), so without this every compiled
+/// chalk style table came up empty. The map shares the `exports` value shape
+/// (string / conditional object / `*` patterns), so the same resolver is
+/// reused — with `node` ranked above `default` so conditional pairs like
+/// chalk's `#supports-color` `{ node, default: browser }` pick the node build
+/// for native compilation. Per Node's package-scope rule, only the NEAREST
+/// `package.json` up from the importer is consulted.
+fn resolve_subpath_import(import_source: &str, importer_path: &Path) -> Option<PathBuf> {
+    let mut dir = importer_path.parent();
+    while let Some(d) = dir {
+        let pkg_json = d.join("package.json");
+        if pkg_json.is_file() {
+            let content = std::fs::read_to_string(&pkg_json).ok()?;
+            let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+            let target = resolve_exports_with_conditions(
+                json.get("imports")?,
+                import_source,
+                &["perry", "node", "import", "module", "default", "require"],
+            )?;
+            let base = d.join(target.trim_start_matches("./"));
+            return resolve_with_extensions(&base)
+                .and_then(|p| p.canonicalize().ok())
+                .or_else(|| base.canonicalize().ok());
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// Like [`resolve_exports`], but returns EVERY condition branch's resolution
+/// in priority order instead of only the first. Callers that check disk
+/// existence (`resolve_package_entry`) walk the list so a pruned target
+/// (Next.js standalone file tracing) falls through to the next condition.
+pub(super) fn resolve_exports_candidates(
+    exports: &serde_json::Value,
+    subpath: &str,
+) -> Vec<String> {
+    const CONDITIONS: &[&str] = &["perry", "import", "module", "default", "require", "node"];
+    fn collect(value: &serde_json::Value, subpath: &str, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(s) => {
+                if !out.contains(s) {
+                    out.push(s.clone());
+                }
+            }
+            serde_json::Value::Object(map) => {
+                if let Some(entry) = map.get(subpath) {
+                    collect(entry, subpath, out);
+                    return;
+                }
+                for (key, entry) in map.iter() {
+                    if key.contains('*') {
+                        let parts: Vec<&str> = key.splitn(2, '*').collect();
+                        if parts.len() == 2 {
+                            let (prefix, suffix) = (parts[0], parts[1]);
+                            if subpath.starts_with(prefix) && subpath.ends_with(suffix) {
+                                let matched = &subpath[prefix.len()..subpath.len() - suffix.len()];
+                                let mut templates = Vec::new();
+                                collect(entry, subpath, &mut templates);
+                                for template in templates {
+                                    let resolved = template.replace('*', matched);
+                                    if !out.contains(&resolved) {
+                                        out.push(resolved);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for condition in CONDITIONS {
+                    if let Some(entry) = map.get(*condition) {
+                        collect(entry, subpath, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    collect(exports, subpath, &mut out);
+    out
 }
 
 fn canonical_existing_declaration(path: PathBuf) -> Option<PathBuf> {
@@ -768,9 +926,26 @@ pub(super) fn resolve_import(
         return None; // Native modules are handled by stdlib, not file imports
     }
 
+    // Node subpath imports (`#…`, #5039) resolve through the importing
+    // package's own `"imports"` map and then classify exactly like a relative
+    // import to the mapped file.
+    let subpath_import_target = if import_source.starts_with('#') {
+        match resolve_subpath_import(import_source, importer_path) {
+            Some(canonical) => Some(canonical),
+            None => return None,
+        }
+    } else {
+        None
+    };
+
     // Handle relative imports (./ or ../)
-    if import_source.starts_with("./") || import_source.starts_with("../") {
-        if let Some(canonical) = resolve_relative_import_path(import_source, importer_path) {
+    if import_source.starts_with("./")
+        || import_source.starts_with("../")
+        || subpath_import_target.is_some()
+    {
+        if let Some(canonical) = subpath_import_target
+            .or_else(|| resolve_relative_import_path(import_source, importer_path))
+        {
             // Refs #486: a relative `import './foo.js'` from inside a compile
             // package must classify as NativeCompiled even when the resolved
             // file lives outside the literal `node_modules/<pkg>/` substring

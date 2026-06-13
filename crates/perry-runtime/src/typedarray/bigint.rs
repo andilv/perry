@@ -106,6 +106,38 @@ pub(crate) fn to_bigint_for_store(value: f64) -> f64 {
         let bi = crate::bigint::js_bigint_from_f64(value);
         return crate::value::js_nanbox_bigint(bi as i64);
     }
+    // ToBigInt(object): `ToPrimitive(value, number)` (its `Symbol.toPrimitive` /
+    // `valueOf` / `toString`) then `ToBigInt` on the primitive result. A
+    // Symbol pointer is rejected (handled by the label path below); every other
+    // object — e.g. `bigIntView.fill({ valueOf() { return 7n } })` — must run its
+    // coercion hook rather than throwing "Cannot convert NaN to a BigInt".
+    if jsval.is_pointer() && unsafe { crate::symbol::js_is_symbol(value) } == 0 {
+        // A typed-array source with a *patched own* `valueOf`/`toString`
+        // expando runs it first (test262 ctors-bigint/object-arg/
+        // throws-setting-obj-* — the patch may throw, observably).
+        let addr = (value.to_bits() & 0x0000_FFFF_FFFF_FFFF) as usize;
+        if crate::typedarray::lookup_typed_array_kind(addr).is_some() {
+            if let Some(p) =
+                unsafe { crate::typedarray_props::typed_array_own_to_primitive_number(addr, value) }
+            {
+                return to_bigint_for_store(p);
+            }
+        }
+        match unsafe { crate::value::to_primitive_number(value) } {
+            crate::value::OrdinaryToPrimitiveOutcome::Primitive(p)
+                if p.to_bits() != value.to_bits() =>
+            {
+                return to_bigint_for_store(p);
+            }
+            crate::value::OrdinaryToPrimitiveOutcome::TypeError => {
+                throw_type_error(b"Cannot convert object to primitive value");
+            }
+            // `Primitive` that didn't change (shouldn't happen for an object) and
+            // `DefaultString` (no usable `valueOf`/`toString`) fall through to the
+            // unconvertible-label `TypeError` below.
+            _ => {}
+        }
+    }
     let label = bigint_unconvertible_label(value);
     throw_type_error(format!("Cannot convert {label} to a BigInt").as_bytes());
 }

@@ -29,7 +29,7 @@ use crate::https_server::HttpsServer;
 use crate::request::IncomingMessage;
 use crate::response::ServerResponse;
 use crate::server::HttpServer;
-use crate::types::{read_string_header, POINTER_TAG, PTR_MASK, TAG_UNDEFINED};
+use crate::types::{read_string_header, POINTER_TAG, PTR_MASK, TAG_NULL, TAG_UNDEFINED};
 
 #[repr(C)]
 struct ErrorHeader {
@@ -47,7 +47,18 @@ extern "C" {
         event_name_ptr: *const StringHeader,
         callback: i64,
     ) -> f64;
+    fn js_node_http_server_remove_all_listeners(
+        handle: i64,
+        event_name_ptr: *const StringHeader,
+    ) -> f64;
+    fn js_node_http_server_remove_listener(
+        handle: i64,
+        event_name_ptr: *const StringHeader,
+        callback: i64,
+    ) -> f64;
     fn js_node_http_server_set_timeout_method(handle: i64, msecs: f64, callback: i64) -> i64;
+    fn js_node_http_server_ref(handle: i64) -> i64;
+    fn js_node_http_server_unref(handle: i64) -> i64;
     fn js_node_https_server_listen(server_handle: i64, args_array: i64) -> i64;
     fn js_node_https_server_close(server_handle: i64, callback: i64);
     fn js_node_https_server_close_all_connections(handle: i64);
@@ -59,6 +70,8 @@ extern "C" {
         callback: i64,
     ) -> f64;
     fn js_node_https_server_set_timeout_method(handle: i64, msecs: f64, callback: i64) -> i64;
+    fn js_node_https_server_ref(handle: i64) -> i64;
+    fn js_node_https_server_unref(handle: i64) -> i64;
     fn js_node_http2_server_listen(server_handle: i64, args_array: i64) -> i64;
     fn js_node_http2_server_close(server_handle: i64, callback: i64);
     fn js_node_http2_server_address_json(handle: i64) -> *mut StringHeader;
@@ -98,9 +111,11 @@ extern "C" {
     fn js_node_http_im_complete(handle: i64) -> i32;
     fn js_node_http_im_aborted(handle: i64) -> i32;
     fn js_node_http_im_destroyed(handle: i64) -> i32;
+    fn js_node_http_im_add_header_line(handle: i64, field: f64, value: f64, dest: f64);
     fn js_node_http_im_signal(handle: i64) -> f64;
     fn js_node_http_im_remote_address(handle: i64) -> *mut StringHeader;
     fn js_node_http_im_remote_port(handle: i64) -> f64;
+    fn js_node_http_im_raw_body(handle: i64) -> f64;
     fn js_node_http_im_pause(handle: i64);
     fn js_node_http_im_resume(handle: i64);
     fn js_node_http_im_destroy(handle: i64);
@@ -112,11 +127,7 @@ extern "C" {
     fn js_node_http_res_set_status(handle: i64, code: f64);
     fn js_node_http_res_get_status(handle: i64) -> f64;
     fn js_node_http_res_set_status_message(handle: i64, msg_ptr: *const StringHeader);
-    fn js_node_http_res_set_header(
-        handle: i64,
-        name_ptr: *const StringHeader,
-        value_ptr: *const StringHeader,
-    );
+    fn js_node_http_res_set_header(handle: i64, name_ptr: *const StringHeader, value: f64);
     fn js_node_http_res_get_header(handle: i64, name_ptr: *const StringHeader) -> f64;
     fn js_node_http_res_remove_header(handle: i64, name_ptr: *const StringHeader);
     fn js_node_http_res_has_header(handle: i64, name_ptr: *const StringHeader) -> i32;
@@ -200,7 +211,12 @@ pub const HTTP_SERVER_METHODS: &[&str] = &[
     "address",
     "on",
     "addListener",
+    "removeAllListeners",
+    "removeListener",
+    "off",
     "setTimeout",
+    "ref",
+    "unref",
     "@@__perry_wk_asyncDispose",
 ];
 
@@ -213,7 +229,12 @@ fn http_server_method_bytes(name: &str) -> Option<&'static [u8]> {
         "address" => Some(b"address"),
         "on" => Some(b"on"),
         "addListener" => Some(b"addListener"),
+        "removeAllListeners" => Some(b"removeAllListeners"),
+        "removeListener" => Some(b"removeListener"),
+        "off" => Some(b"off"),
         "setTimeout" => Some(b"setTimeout"),
+        "ref" => Some(b"ref"),
+        "unref" => Some(b"unref"),
         "@@__perry_wk_asyncDispose" => Some(b"@@__perry_wk_asyncDispose"),
         _ => None,
     }
@@ -350,6 +371,30 @@ pub unsafe extern "C" fn js_ext_http_server_dispatch_method(
             }
             self_ref
         }
+        // #4973: `server.removeAllListeners([event])` — http/1 only for now
+        // (https/h2 listener registries wrap an HttpServer base; the http
+        // entry covers the plain `node:http` surface the upgrade tests use).
+        "removeAllListeners" => {
+            let event_ptr = args
+                .first()
+                .map(|&a| string_arg(a))
+                .unwrap_or(std::ptr::null());
+            if !is_h2 && !is_https {
+                js_node_http_server_remove_all_listeners(handle, event_ptr);
+            }
+            self_ref
+        }
+        "removeListener" | "off" if args.len() >= 2 => {
+            let event_ptr = string_arg(args[0]);
+            if event_ptr.is_null() {
+                return self_ref;
+            }
+            let cb = closure_arg(Some(args[1]));
+            if !is_h2 && !is_https {
+                js_node_http_server_remove_listener(handle, event_ptr, cb);
+            }
+            self_ref
+        }
         "setTimeout" => {
             let msecs = args.first().copied().unwrap_or(0.0);
             let cb = closure_arg(args.get(1).copied());
@@ -359,6 +404,26 @@ pub unsafe extern "C" fn js_ext_http_server_dispatch_method(
                 js_node_https_server_set_timeout_method(handle, msecs, cb);
             } else {
                 js_node_http_server_set_timeout_method(handle, msecs, cb);
+            }
+            self_ref
+        }
+        // #5011 — `server.ref()` / `server.unref()` return `this` (the
+        // server) for chaining; `unref()` drops the server out of the
+        // event-loop keepalive set. h2's keepalive is tracked separately
+        // (`has_active_h2_clients`), so for h2 we just return the receiver.
+        "ref" => {
+            if is_https {
+                js_node_https_server_ref(handle);
+            } else if !is_h2 {
+                js_node_http_server_ref(handle);
+            }
+            self_ref
+        }
+        "unref" => {
+            if is_https {
+                js_node_https_server_unref(handle);
+            } else if !is_h2 {
+                js_node_http_server_unref(handle);
             }
             self_ref
         }
@@ -399,7 +464,58 @@ pub unsafe extern "C" fn js_ext_http_server_dispatch_property(
     if let Some(name) = http_server_method_bytes(&property) {
         return bind_handle_method(handle, name);
     }
-    undef
+    let is_https = get_handle::<HttpsServer>(handle).is_some();
+    let is_h2 = get_handle::<Http2SecureServer>(handle).is_some();
+    match property.as_str() {
+        "listening" => bool_value(server_is_listening(handle, is_https, is_h2)),
+        // #4974: `server[kConnectionsCheckingInterval]` — the
+        // `_http_server` introspection key resolves to Node's
+        // connections-checking interval timer; tests assert on its
+        // `_destroyed` flag after `close()`. Perry has no such timer,
+        // so synthesize the minimal Timeout shape from the tracked flag.
+        "@@kConnectionsCheckingInterval" => {
+            let destroyed = if is_h2 {
+                get_handle::<Http2SecureServer>(handle)
+                    .map(|s| s.base.connections_checking_interval_destroyed)
+            } else if is_https {
+                get_handle::<HttpsServer>(handle)
+                    .map(|s| s.base.connections_checking_interval_destroyed)
+            } else {
+                get_handle::<HttpServer>(handle).map(|s| s.connections_checking_interval_destroyed)
+            };
+            match destroyed {
+                Some(d) => {
+                    let json = format!("{{\"_destroyed\":{}}}", d);
+                    json_string_value(alloc_string(&json).as_raw())
+                }
+                None => undef,
+            }
+        }
+        "headersTimeout" => {
+            server_base_property(handle, is_https, is_h2, |s| s.headers_timeout).unwrap_or(undef)
+        }
+        "keepAliveTimeout" => {
+            server_base_property(handle, is_https, is_h2, |s| s.keep_alive_timeout).unwrap_or(undef)
+        }
+        "keepAliveTimeoutBuffer" => {
+            server_base_property(handle, is_https, is_h2, |s| s.keep_alive_timeout_buffer)
+                .unwrap_or(undef)
+        }
+        "requestTimeout" => {
+            server_base_property(handle, is_https, is_h2, |s| s.request_timeout).unwrap_or(undef)
+        }
+        "timeout" => {
+            server_base_property(handle, is_https, is_h2, |s| s.idle_timeout).unwrap_or(undef)
+        }
+        "maxHeadersCount" => {
+            server_base_property(handle, is_https, is_h2, |s| s.max_headers_count).unwrap_or(undef)
+        }
+        "maxRequestsPerSocket" => {
+            server_base_property(handle, is_https, is_h2, |s| s.max_requests_per_socket)
+                .unwrap_or(undef)
+        }
+        _ => undef,
+    }
 }
 
 /// Dispatch a method on a registered server-side `IncomingMessage` handle.
@@ -464,6 +580,12 @@ pub unsafe extern "C" fn js_ext_http_incoming_message_dispatch_method(
         "httpVersion" | "__get_httpVersion" => {
             string_ptr_value(js_node_http_im_http_version(handle))
         }
+        "httpVersionMajor" | "__get_httpVersionMajor" => {
+            crate::request::incoming_http_version_part(handle, false)
+        }
+        "httpVersionMinor" | "__get_httpVersionMinor" => {
+            crate::request::incoming_http_version_part(handle, true)
+        }
         "__get_complete" => bool_value(js_node_http_im_complete(handle) != 0),
         "__get_aborted" => bool_value(js_node_http_im_aborted(handle) != 0),
         "__get_destroyed" => bool_value(js_node_http_im_destroyed(handle) != 0),
@@ -483,7 +605,17 @@ pub unsafe extern "C" fn js_ext_http_incoming_message_dispatch_method(
         "__get_trailersDistinct" | "trailersDistinct" => {
             json_string_value_empty_object(js_node_http_im_trailers_distinct_json(handle))
         }
-        "__get_socket" | "socket" | "__get_connection" | "connection" => self_ref,
+        "__get_socket" | "socket" | "__get_connection" | "connection" => {
+            crate::request::incoming_socket_override(handle).unwrap_or(self_ref)
+        }
+        "__set_socket" | "__set_connection" if !args.is_empty() => {
+            crate::request::incoming_socket_assign(handle, args[0]);
+            undef
+        }
+        "_addHeaderLine" if args.len() >= 3 => {
+            js_node_http_im_add_header_line(handle, args[0], args[1], args[2]);
+            undef
+        }
         "__get_signal" | "signal" => js_node_http_im_signal(handle),
         "__get_remoteAddress" | "remoteAddress" => {
             string_ptr_value(js_node_http_im_remote_address(handle))
@@ -513,11 +645,19 @@ pub unsafe extern "C" fn js_ext_http_server_response_dispatch_method(
     let args = args_slice(args_ptr, args_len);
     let self_ref = handle_to_pointer_f64(handle);
 
+    if server_response_method_bytes(&method).is_some()
+        && server_response_method_bytes_for_handle(handle, &method).is_none()
+    {
+        return undef;
+    }
+
     match method.as_str() {
         "setHeader" if args.len() >= 2 => {
             let name = string_value_arg(args[0]);
             if !name.is_null() {
-                js_node_http_res_set_header(handle, name, string_value_arg(args[1]));
+                // Pass the raw JSValue so array values (Set-Cookie) keep their
+                // per-element structure for one-line-per-element wire output.
+                js_node_http_res_set_header(handle, name, args[1]);
             }
             self_ref
         }
@@ -562,13 +702,40 @@ pub unsafe extern "C" fn js_ext_http_server_response_dispatch_method(
             );
             self_ref
         }
-        "write" if !args.is_empty() => bool_value(js_node_http_res_write(handle, args[0]) != 0),
+        "write" if !args.is_empty() => {
+            // `write(chunk[, encoding][, callback])` — the callback is the
+            // last closure-valued arg (#4904).
+            let cb = args[1..]
+                .iter()
+                .rev()
+                .map(|a| closure_arg(Some(*a)))
+                .find(|c| *c != 0)
+                .unwrap_or(0);
+            bool_value(crate::response::js_node_http_res_write_with_cb(handle, args[0], cb) != 0)
+        }
         "addTrailers" if !args.is_empty() => {
             js_node_http_res_add_trailers(handle, args[0]);
             undef
         }
         "end" => {
-            js_node_http_res_end(handle, args.first().copied().unwrap_or(undef));
+            // `end([chunk][, encoding][, callback])` — `end(cb)` passes the
+            // callback first (#4904).
+            let first = args.first().copied().unwrap_or(undef);
+            let first_cb = closure_arg(Some(first));
+            let (chunk, cb) = if first_cb != 0 {
+                (undef, first_cb)
+            } else {
+                let cb = args
+                    .get(1..)
+                    .unwrap_or(&[])
+                    .iter()
+                    .rev()
+                    .map(|a| closure_arg(Some(*a)))
+                    .find(|c| *c != 0)
+                    .unwrap_or(0);
+                (first, cb)
+            };
+            crate::response::js_node_http_res_end_with_cb(handle, chunk, cb);
             self_ref
         }
         "flushHeaders" => {
@@ -607,6 +774,19 @@ pub unsafe extern "C" fn js_ext_http_server_response_dispatch_method(
             js_node_http_res_write_processing(handle);
             undef
         }
+        "destroy" => self_ref,
+        "assignSocket" if !args.is_empty() => {
+            crate::response::js_node_http_res_assign_socket(handle, args[0]);
+            undef
+        }
+        "detachSocket" => {
+            crate::response::js_node_http_res_detach_socket(
+                handle,
+                args.first().copied().unwrap_or(undef),
+            );
+            undef
+        }
+        "pipe" => undef,
         "on" | "addListener" if args.len() >= 2 => {
             let event_ptr = string_arg(args[0]);
             if event_ptr.is_null() {
@@ -676,6 +856,8 @@ pub unsafe extern "C" fn js_ext_http_incoming_message_dispatch_property(
         "method" => string_ptr_value(js_node_http_im_method(handle)),
         "url" => string_ptr_value(js_node_http_im_url(handle)),
         "httpVersion" => string_ptr_value(js_node_http_im_http_version(handle)),
+        "httpVersionMajor" => crate::request::incoming_http_version_part(handle, false),
+        "httpVersionMinor" => crate::request::incoming_http_version_part(handle, true),
         "headers" => json_string_value(js_node_http_im_headers_json(handle)),
         "rawHeaders" => json_string_value(js_node_http_im_raw_headers_json(handle)),
         "headersDistinct" => json_string_value(js_node_http_im_headers_distinct_json(handle)),
@@ -687,10 +869,13 @@ pub unsafe extern "C" fn js_ext_http_incoming_message_dispatch_property(
         "complete" => bool_value(js_node_http_im_complete(handle) != 0),
         "aborted" => bool_value(js_node_http_im_aborted(handle) != 0),
         "destroyed" => bool_value(js_node_http_im_destroyed(handle) != 0),
-        "socket" | "connection" => handle_to_pointer_f64(handle),
+        "socket" | "connection" => crate::request::incoming_socket_override(handle)
+            .unwrap_or_else(|| handle_to_pointer_f64(handle)),
         "signal" => js_node_http_im_signal(handle),
         "remoteAddress" => string_ptr_value(js_node_http_im_remote_address(handle)),
         "remotePort" => js_node_http_im_remote_port(handle),
+        "rawBody" => js_node_http_im_raw_body(handle),
+        "constructor" => constructor_object("IncomingMessage"),
         _ => undef,
     }
 }
@@ -711,7 +896,7 @@ pub unsafe extern "C" fn js_ext_http_server_response_dispatch_property(
         return undef;
     }
 
-    if let Some(name) = server_response_method_bytes(&property) {
+    if let Some(name) = server_response_method_bytes_for_handle(handle, &property) {
         return bind_handle_method(handle, name);
     }
 
@@ -722,12 +907,39 @@ pub unsafe extern "C" fn js_ext_http_server_response_dispatch_property(
         "writableEnded" => bool_value(js_node_http_res_writable_ended(handle) != 0),
         "writableFinished" => bool_value(js_node_http_res_writable_finished(handle) != 0),
         "finished" => bool_value(js_node_http_res_finished(handle) != 0),
+        "writableCorked" => 0.0,
+        "writableHighWaterMark" => 65_536.0,
+        "writableLength" => get_handle::<ServerResponse>(handle)
+            .map(|sr| sr.buffered_body.len() as f64)
+            .unwrap_or(0.0),
+        "writableObjectMode" => bool_value(false),
+        "writableNeedDrain" => bool_value(false),
         "sendDate" => bool_value(js_node_http_res_send_date(handle) != 0),
         "strictContentLength" => bool_value(js_node_http_res_strict_content_length(handle) != 0),
         "req" => handle_value_or_undefined(js_node_http_res_req_handle(handle)),
         "socket" | "connection" => response_socket_value(handle),
+        // #4909 — `out.constructor.name` discrimination (corpus
+        // outgoing-message tests branch on it).
+        "constructor" => constructor_object("ServerResponse"),
         _ => undef,
     }
+}
+
+/// `{ name: <class name> }` — stands in for `<handle>.constructor` so
+/// `out.constructor.name` reads "ServerResponse"/"IncomingMessage" the way
+/// the corpus outgoing-message tests expect (#4909).
+fn constructor_object(name: &str) -> f64 {
+    let (packed, shape_id) = perry_ffi::build_object_shape(&["name"]);
+    let obj =
+        unsafe { js_object_alloc_with_shape(shape_id, 1, packed.as_ptr(), packed.len() as u32) };
+    if obj.is_null() {
+        return f64::from_bits(TAG_UNDEFINED);
+    }
+    let value = JsValue::from_string_ptr(alloc_string(name).as_raw());
+    unsafe {
+        perry_ffi::js_object_set_field(obj, 0, value);
+    }
+    f64::from_bits(JsValue::from_object_ptr(obj as *mut u8).bits())
 }
 
 /// Dispatch a property write on a registered server-side `ServerResponse`.
@@ -768,6 +980,33 @@ pub unsafe extern "C" fn js_ext_http_server_response_dispatch_property_set(
     }
 }
 
+/// Dispatch a property write on a registered server-side `IncomingMessage`
+/// (#4904). Returns 1 when the property was claimed.
+///
+/// # Safety
+/// FFI entry; pointers must be valid for their stated lengths.
+#[no_mangle]
+pub unsafe extern "C" fn js_ext_http_incoming_message_dispatch_property_set(
+    handle: i64,
+    property_ptr: *const u8,
+    property_len: usize,
+    value: f64,
+) -> i32 {
+    let property = method_name(property_ptr, property_len);
+    match property.as_str() {
+        // Node's `connection` accessor writes `this.socket`; both aliases
+        // land on the same slot.
+        "socket" | "connection" => {
+            if crate::request::incoming_socket_assign(handle, value) {
+                1
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    }
+}
+
 #[inline]
 unsafe fn method_name(ptr: *const u8, len: usize) -> String {
     if ptr.is_null() || len == 0 {
@@ -802,9 +1041,21 @@ fn handle_value_or_undefined(handle: i64) -> f64 {
 
 #[inline]
 fn response_socket_value(handle: i64) -> f64 {
+    // #4904: a standalone response's socket is whatever `assignSocket`
+    // installed (undefined reads as Node's pre-assignment `null`).
+    if let Some(sr) = get_handle::<ServerResponse>(handle) {
+        if sr.standalone {
+            let v = sr.standalone_socket;
+            return if JsValue::from_bits(v.to_bits()).is_undefined() {
+                f64::from_bits(TAG_NULL)
+            } else {
+                v
+            };
+        }
+    }
     let req_handle = unsafe { js_node_http_res_req_handle(handle) };
     if req_handle == 0 {
-        handle_to_pointer_f64(handle)
+        f64::from_bits(TAG_NULL)
     } else {
         handle_to_pointer_f64(req_handle)
     }
@@ -890,6 +1141,9 @@ fn incoming_method_bytes(name: &str) -> Option<&'static [u8]> {
         "resume" => Some(b"resume"),
         "destroy" => Some(b"destroy"),
         "read" => Some(b"read"),
+        // #4904: internal-by-convention header-merge API, exercised
+        // directly by Node's own tests on standalone IncomingMessages.
+        "_addHeaderLine" => Some(b"_addHeaderLine"),
         _ => None,
     }
 }
@@ -908,17 +1162,36 @@ fn server_response_method_bytes(name: &str) -> Option<&'static [u8]> {
         "write" => Some(b"write"),
         "addTrailers" => Some(b"addTrailers"),
         "end" => Some(b"end"),
+        // #4904: standalone-response wiring.
+        "assignSocket" => Some(b"assignSocket"),
+        "detachSocket" => Some(b"detachSocket"),
         "flushHeaders" => Some(b"flushHeaders"),
         "cork" => Some(b"cork"),
         "uncork" => Some(b"uncork"),
+        "destroy" => Some(b"destroy"),
         "setTimeout" => Some(b"setTimeout"),
         "writeEarlyHints" => Some(b"writeEarlyHints"),
         "writeContinue" => Some(b"writeContinue"),
         "writeProcessing" => Some(b"writeProcessing"),
+        "pipe" => Some(b"pipe"),
         "on" => Some(b"on"),
         "addListener" => Some(b"addListener"),
         _ => None,
     }
+}
+
+fn server_response_method_bytes_for_handle(handle: i64, name: &str) -> Option<&'static [u8]> {
+    if get_handle::<ServerResponse>(handle)
+        .map(|sr| sr.outgoing_message_only)
+        .unwrap_or(false)
+        && matches!(
+            name,
+            "writeHead" | "writeEarlyHints" | "writeContinue" | "writeProcessing"
+        )
+    {
+        return None;
+    }
+    server_response_method_bytes(name)
 }
 
 /// Strip a NaN-boxed string arg to the raw `*const StringHeader` pointer the
@@ -943,6 +1216,12 @@ fn closure_arg(value: Option<f64>) -> i64 {
     if tag != 0x7FFD {
         return 0;
     }
+    // #4909 — a Buffer chunk is POINTER_TAG too; `end(buf, cb)` used to
+    // treat the buffer as the `end(cb)` callback form, drop the chunk, and
+    // then call the buffer ("TypeError: value is not a function").
+    if unsafe { crate::types::js_value_is_closure(bits as i64) } == 0 {
+        return 0;
+    }
     (bits & PTR_MASK) as i64
 }
 
@@ -959,6 +1238,19 @@ fn server_is_listening(handle: i64, is_https: bool, is_h2: bool) -> bool {
         get_handle::<HttpServer>(handle)
             .map(|server| server.listening)
             .unwrap_or(false)
+    }
+}
+
+fn server_base_property<F>(handle: i64, is_https: bool, is_h2: bool, f: F) -> Option<f64>
+where
+    F: Fn(&HttpServer) -> f64,
+{
+    if is_h2 {
+        get_handle::<Http2SecureServer>(handle).map(|server| f(&server.base))
+    } else if is_https {
+        get_handle::<HttpsServer>(handle).map(|server| f(&server.base))
+    } else {
+        get_handle::<HttpServer>(handle).map(|server| f(server))
     }
 }
 

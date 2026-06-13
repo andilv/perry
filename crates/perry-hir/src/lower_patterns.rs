@@ -21,9 +21,38 @@ pub(crate) fn unescape_template(s: &str) -> String {
                 Some('n') => result.push('\n'),
                 Some('t') => result.push('\t'),
                 Some('r') => result.push('\r'),
+                Some('b') => result.push('\u{0008}'),
+                Some('f') => result.push('\u{000C}'),
+                Some('v') => result.push('\u{000B}'),
                 Some('\\') => result.push('\\'),
                 Some('$') => result.push('$'),
                 Some('`') => result.push('`'),
+                Some('\'') => result.push('\''),
+                Some('"') => result.push('"'),
+                // `\0` (not followed by another digit) is NUL.
+                Some('0') if !chars.peek().is_some_and(|d| d.is_ascii_digit()) => result.push('\0'),
+                // Line continuation: backslash-newline contributes nothing.
+                Some('\n') => {}
+                Some('\r') => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                }
+                // `\xHH` / `\uHHHH` / `\u{H…}` — #5039: ansi-styles builds its
+                // escape codes as `` `\u001B[${code}m` `` template literals;
+                // falling through to the literal-backslash arm turned every
+                // chalk style into the 6-char literal source text instead of ESC.
+                Some(esc @ ('x' | 'u')) => {
+                    if let Some(decoded) = unescape_hex_escape(esc, &mut chars) {
+                        result.push_str(&decoded);
+                    } else {
+                        // Invalid escape (only reachable in tagged templates,
+                        // where cooked semantics are undefined) — keep the
+                        // original text.
+                        result.push('\\');
+                        result.push(esc);
+                    }
+                }
                 Some(other) => {
                     result.push('\\');
                     result.push(other);
@@ -36,6 +65,75 @@ pub(crate) fn unescape_template(s: &str) -> String {
     }
 
     result
+}
+
+/// Decode the body of a `\xHH`, `\uHHHH`, or `\u{H…}` escape, with `esc`
+/// being the introducer character just consumed (`x` or `u`). A `\uD800–DBFF`
+/// high surrogate followed immediately by an escaped low surrogate decodes as
+/// the combined supplementary code point; a lone surrogate becomes U+FFFD
+/// (Perry strings are UTF-8 — see the WTF-8 categorical gap in CLAUDE.md).
+/// Returns `None` (consuming nothing further) on malformed hex so the caller
+/// can preserve the source text.
+fn unescape_hex_escape(
+    esc: char,
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Option<String> {
+    fn hex_fixed(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, n: usize) -> Option<u32> {
+        let mut value = 0u32;
+        for _ in 0..n {
+            let d = chars.peek()?.to_digit(16)?;
+            chars.next();
+            value = value * 16 + d;
+        }
+        Some(value)
+    }
+    fn hex_braced(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<u32> {
+        chars.next(); // consume '{'
+        let mut value = 0u32;
+        let mut any = false;
+        loop {
+            match chars.peek() {
+                Some('}') => {
+                    chars.next();
+                    return any.then_some(value);
+                }
+                Some(c) => {
+                    let d = c.to_digit(16)?;
+                    chars.next();
+                    any = true;
+                    value = value.checked_mul(16)?.checked_add(d)?;
+                    if value > 0x10FFFF {
+                        return None;
+                    }
+                }
+                None => return None,
+            }
+        }
+    }
+
+    let code = if esc == 'x' {
+        hex_fixed(chars, 2)?
+    } else if chars.peek() == Some(&'{') {
+        hex_braced(chars)?
+    } else {
+        hex_fixed(chars, 4)?
+    };
+
+    // High surrogate: try to pair with an immediately following `\uDC00–DFFF`.
+    if (0xD800..=0xDBFF).contains(&code) {
+        let mut lookahead = chars.clone();
+        if lookahead.next() == Some('\\') && lookahead.next() == Some('u') {
+            if let Some(low) = hex_fixed(&mut lookahead, 4) {
+                if (0xDC00..=0xDFFF).contains(&low) {
+                    *chars = lookahead;
+                    let combined = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+                    return char::from_u32(combined).map(String::from);
+                }
+            }
+        }
+    }
+
+    Some(char::from_u32(code).unwrap_or('\u{FFFD}').to_string())
 }
 
 pub(crate) fn lower_lit(lit: &ast::Lit) -> Result<Expr> {
@@ -102,10 +200,16 @@ pub(crate) fn lower_assign_target_to_expr(
             if let Some(id) = ctx.lookup_local(&name) {
                 Ok(Expr::LocalGet(id))
             } else {
-                Err(anyhow!(
-                    "Undefined variable in compound assignment: {}",
-                    name
-                ))
+                // Unresolved / global compound-assignment target. The current
+                // value is obtained via GetValue on the reference, so the read
+                // must follow the same resolution as a bare identifier read:
+                // known globals resolve to their value, while a truly
+                // unresolvable name lowers to a runtime ReferenceError throw
+                // (GetValue on an unresolvable Reference always throws, in both
+                // strict and sloppy mode — e.g. `x *= 1` with `x` undeclared).
+                // Previously this hard-errored at compile time, turning a
+                // catchable ReferenceError into a SyntaxError.
+                lower_expr(ctx, &ast::Expr::Ident(ident.id.clone()))
             }
         }
         ast::AssignTarget::Simple(ast::SimpleAssignTarget::Member(member)) => {
@@ -354,7 +458,18 @@ fn collect_implicit_assignment_target_names(
     match target {
         ast::AssignTarget::Simple(ast::SimpleAssignTarget::Ident(ident)) => {
             let name = ident.id.sym.to_string();
-            if should_predeclare_implicit_assignment_name(ctx, &name) {
+            // Only a pre-registered hoisted `var` is predeclared here — this is
+            // its var-hoisting materialization, so `index = index` before the
+            // `for (var index …)` reads the hoisted `undefined` instead of a
+            // throwing global read (S12.6.3_A10). A GENUINELY-new sloppy global
+            // (`foo = 1` with no `var` anywhere) is deliberately NOT predeclared:
+            // it lowers to a globalThis property set (#3575), and a backing local
+            // would make `lower_expr_assignment` emit `LocalSet`, hiding the write
+            // from globalThis. Destructuring targets below always predeclare
+            // because their lowering only emits `LocalSet`.
+            if ctx.pre_registered_module_var_decls.contains(&name)
+                && should_predeclare_implicit_assignment_name(ctx, &name)
+            {
                 push_unique_name(names, name);
             }
         }
@@ -836,6 +951,15 @@ pub(crate) fn predeclare_implicit_assignment_targets(
 
     let mut stmts = Vec::new();
     for name in names {
+        // Inside a `with` body, an assignment to an otherwise-undeclared name
+        // must route through the with object's environment record (lowered to
+        // `WithSet`), not be hoisted as an implicit local that would shadow the
+        // with env and capture the write locally. `WithSet` itself falls back
+        // to the outer scope when the object lacks the property, so skipping
+        // predeclaration here is safe for the not-on-object case too.
+        if !ctx.active_with_envs_for_ident(&name).is_empty() {
+            continue;
+        }
         // Inside a closure (scope_depth > 0), an assignment to a name that
         // resolves to a MODULE-LEVEL binding (e.g. a `var` declared later at
         // module scope) must NOT be re-declared as a closure-local: doing so

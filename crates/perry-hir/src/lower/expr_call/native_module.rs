@@ -892,20 +892,28 @@ pub(super) fn try_native_module_methods(
                                 // Static descriptor literal — desugar to a Sequence
                                 // of `defineProperty(target, key, desc)` calls and
                                 // yield `target` as the result value.
-                                let target = target;
-                                let mut exprs: Vec<Expr> = Vec::with_capacity(props.len() + 1);
-                                for (key_name, desc_expr) in props {
-                                    exprs.push(Expr::ObjectDefineProperty(
-                                        Box::new(target.clone()),
-                                        Box::new(Expr::String(key_name.clone())),
-                                        Box::new(desc_expr.clone()),
-                                    ));
+                                //
+                                // An EMPTY literal must NOT fold to a bare `target`:
+                                // `Object.defineProperties(O, {})` still performs the
+                                // spec's step-1 `If Type(O) is not Object, throw a
+                                // TypeError`, so `Object.defineProperties(undefined,
+                                // {})` must throw. With no keys there is no per-key
+                                // `defineProperty` to enforce that, so route the
+                                // empty case through the runtime helper (which
+                                // validates the target).
+                                if !props.is_empty() {
+                                    let target = target;
+                                    let mut exprs: Vec<Expr> = Vec::with_capacity(props.len() + 1);
+                                    for (key_name, desc_expr) in props {
+                                        exprs.push(Expr::ObjectDefineProperty(
+                                            Box::new(target.clone()),
+                                            Box::new(Expr::String(key_name.clone())),
+                                            Box::new(desc_expr.clone()),
+                                        ));
+                                    }
+                                    exprs.push(target);
+                                    return Ok(Ok(Expr::Sequence(exprs)));
                                 }
-                                exprs.push(target);
-                                if exprs.len() == 1 {
-                                    return Ok(Ok(exprs.into_iter().next().unwrap()));
-                                }
-                                return Ok(Ok(Expr::Sequence(exprs)));
                             }
                             return Ok(Ok(Expr::ObjectDefineProperties(
                                 Box::new(target),
@@ -1079,10 +1087,14 @@ pub(super) fn try_native_module_methods(
                             let target = it.next().unwrap_or(Expr::Undefined);
                             let key = it.next().unwrap_or(Expr::Undefined);
                             let value = it.next().unwrap_or(Expr::Undefined);
+                            // Optional `receiver` (4th arg): default `undefined`
+                            // and the runtime substitutes `target`.
+                            let receiver = it.next().unwrap_or(Expr::Undefined);
                             return Ok(Ok(Expr::ReflectSet {
                                 target: Box::new(target),
                                 key: Box::new(key),
                                 value: Box::new(value),
+                                receiver: Box::new(receiver),
                             }));
                         }
                         "has" => {
@@ -1172,18 +1184,13 @@ pub(super) fn try_native_module_methods(
                             return Ok(Ok(Expr::ReflectGetPrototypeOf(Box::new(target))));
                         }
                         "getOwnPropertyDescriptor" => {
-                            // `Reflect.getOwnPropertyDescriptor(target, key)` is the
-                            // ordinary `[[GetOwnProperty]]` — identical to
-                            // `Object.getOwnPropertyDescriptor` for non-Proxy targets.
-                            // Without this arm it fell through to a generic call that
-                            // wasn't callable ("value is not a function").
                             let mut it = args.into_iter();
                             let target = it.next().unwrap_or(Expr::Undefined);
                             let key = it.next().unwrap_or(Expr::Undefined);
-                            return Ok(Ok(Expr::ObjectGetOwnPropertyDescriptor(
-                                Box::new(target),
-                                Box::new(key),
-                            )));
+                            return Ok(Ok(Expr::ReflectGetOwnPropertyDescriptor {
+                                target: Box::new(target),
+                                key: Box::new(key),
+                            }));
                         }
                         "defineMetadata" => {
                             let (key, value, target, property_key) = take_reflect_kvtp_args(args);
@@ -1460,6 +1467,36 @@ pub(super) fn try_native_module_methods(
                                 && matches!(imported_method, Some("EventEmitter"))
                             {
                                 return Ok(Ok(event_emitter_constructor_call(args)));
+                            }
+                            // #4973: named-import form of the inherits
+                            // pattern — `const { Server } = require('http');
+                            // Server.call(this, handler)`. Same extern as
+                            // the dotted `http.Server.call(...)` form in
+                            // module_class_static.rs.
+                            if matches!(normalized_module, "http" | "https")
+                                && matches!(imported_method, Some("Server"))
+                                && !args.is_empty()
+                            {
+                                let mut it = args.into_iter();
+                                let this_arg = it.next().unwrap();
+                                let mut rest: Vec<Expr> = it.collect();
+                                rest.resize(2, Expr::Undefined);
+                                let mut call_args = vec![this_arg];
+                                call_args.extend(rest);
+                                let extern_name = if normalized_module == "https" {
+                                    "js_https_server_construct_with_this"
+                                } else {
+                                    "js_http_server_construct_with_this"
+                                };
+                                return Ok(Ok(Expr::Call {
+                                    callee: Box::new(Expr::ExternFuncRef {
+                                        name: extern_name.to_string(),
+                                        param_types: Vec::new(),
+                                        return_type: Type::Any,
+                                    }),
+                                    args: call_args,
+                                    type_args: Vec::new(),
+                                }));
                             }
                         }
                         // Unimplemented-API gate (#463 / #525) for the 2-deep

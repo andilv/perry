@@ -35,7 +35,7 @@ macro_rules! println {
 #[cfg(feature = "ohos-napi")]
 pub(crate) use println;
 
-pub(crate) use crate::string::{js_string_from_bytes, StringHeader};
+pub(crate) use crate::string::{js_string_from_bytes, js_string_from_wtf8_bytes, StringHeader};
 pub(crate) use crate::JSValue;
 
 mod arithmetic;
@@ -50,8 +50,8 @@ mod table;
 // `crate::builtins::js_*` path).
 
 pub use arithmetic::{
-    js_add, js_div, js_eq, js_ge, js_gt, js_le, js_loose_eq, js_lt, js_mod, js_mul, js_sub,
-    js_value_typeof,
+    js_add, js_div, js_eq, js_ge, js_gt, js_le, js_loose_eq, js_lt, js_mod, js_mul, js_rel_ge,
+    js_rel_gt, js_rel_le, js_rel_lt, js_sub, js_value_typeof,
 };
 
 pub use console::{
@@ -75,9 +75,9 @@ pub(crate) use console::{
 };
 
 pub use formatting::{
-    function_name_for_ptr, function_source_for_func_ptr, js_array_print, js_boxed_bigint_new,
-    js_boxed_boolean_new, js_boxed_number_new, js_boxed_string_new, js_boxed_symbol_new,
-    js_register_function_name, js_register_function_source, js_util_format,
+    function_name_for_ptr, function_source_for_func_ptr, function_source_for_ptr, js_array_print,
+    js_boxed_bigint_new, js_boxed_boolean_new, js_boxed_number_new, js_boxed_string_new,
+    js_boxed_symbol_new, js_register_function_name, js_register_function_source, js_util_format,
     js_util_format_with_options, js_util_inspect, js_util_is_deep_strict_equal,
     js_util_is_deep_strict_equal_skip_prototype, js_util_strip_vt_control_characters,
     register_function_name_if_absent, scan_boxed_primitive_payload_roots_mut,
@@ -103,6 +103,7 @@ pub(crate) use globals::{drain_queued_microtasks_count, queued_microtasks_pendin
 pub use numbers::{
     js_is_finite, js_is_nan, js_number_coerce, js_number_is_finite, js_number_is_integer,
     js_number_is_nan, js_number_is_safe_integer, js_parse_float, js_parse_int, js_string_coerce,
+    js_to_integer_or_infinity,
 };
 
 #[cfg(test)]

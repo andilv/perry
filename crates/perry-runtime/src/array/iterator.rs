@@ -56,22 +56,16 @@ pub extern "C" fn js_for_of_to_array(val_f64: f64) -> f64 {
         return js_nanbox_pointer(arr_i64);
     }
 
-    // Non-pointer scalars (number/bool/null/undefined) are not iterable;
-    // hand back an empty array so the loop runs zero times rather than
-    // dereferencing a non-pointer. Web Streams are the exception here: their
-    // runtime handles are finite numeric ids, but plain `for...of` must still
-    // reject them because they are async-iterable only.
+    // Non-pointer scalars (number/bool/null/undefined/symbol) are not
+    // iterable. Per ECMA-262 §13.7.5.13 (ForIn/OfHeadEvaluation →
+    // GetIterator → ToObject/GetMethod) these MUST throw a TypeError:
+    // `for (x of null)`, `for (x of 37)`, `for (x of false)` all reject
+    // (language/statements/for-of/head-expr-to-obj,
+    // head-expr-primitive-iterator-method). Web Streams are async-iterable
+    // only, so plain `for...of` rejects them here too.
     let raw_ptr = crate::value::js_nanbox_get_pointer(val_f64);
     if raw_ptr == 0 {
-        if val_f64.is_finite()
-            && val_f64 > 0.0
-            && val_f64.fract() == 0.0
-            && crate::object::stream_handle_kind_probe()
-                .is_some_and(|probe| unsafe { probe(val_f64 as usize) != 0 })
-        {
-            throw_not_iterable(val_f64);
-        }
-        return js_nanbox_pointer(js_array_alloc(0) as i64);
+        throw_not_iterable(val_f64);
     }
 
     // Inspect the GC header's object kind to dispatch Array / Map / Set
@@ -128,7 +122,7 @@ pub(crate) fn entries_array_for_small_handle_value(value: f64) -> Option<*mut Ar
 }
 
 pub(crate) fn entries_array_for_small_handle_id(id: i64) -> Option<*mut ArrayHeader> {
-    if id <= 0 || id >= 0x100000 {
+    if id <= 0 || !crate::value::addr_class::is_small_handle(id as usize) {
         return None;
     }
     let dispatch = crate::object::handle_method_dispatch()?;
@@ -179,6 +173,408 @@ fn named_field(value: f64, name: &[u8]) -> f64 {
 
 fn has_named_next(value: f64) -> bool {
     is_callable_value(named_field(value, b"next"))
+}
+
+fn boxed_promise_value(promise: *mut crate::promise::Promise) -> f64 {
+    crate::value::js_nanbox_pointer(promise as i64)
+}
+
+fn async_from_sync_type_error(message: &[u8]) -> f64 {
+    let msg = crate::string::js_string_from_bytes(message.as_ptr(), message.len() as u32);
+    let err = crate::error::js_typeerror_new(msg);
+    crate::value::js_nanbox_pointer(err as i64)
+}
+
+fn async_from_sync_rejected(message: &[u8]) -> f64 {
+    boxed_promise_value(crate::promise::js_promise_rejected(
+        async_from_sync_type_error(message),
+    ))
+}
+
+fn undefined_value() -> f64 {
+    f64::from_bits(crate::value::TAG_UNDEFINED)
+}
+
+fn async_from_sync_iter_result(value: f64, done: bool) -> f64 {
+    let obj = crate::object::js_object_alloc(0, 2);
+    let value_key = crate::string::js_string_from_bytes(b"value".as_ptr(), 5);
+    let done_key = crate::string::js_string_from_bytes(b"done".as_ptr(), 4);
+    crate::object::js_object_set_field_by_name(obj, value_key, value);
+    crate::object::js_object_set_field_by_name(
+        obj,
+        done_key,
+        if done {
+            f64::from_bits(crate::value::TAG_TRUE)
+        } else {
+            f64::from_bits(crate::value::TAG_FALSE)
+        },
+    );
+    crate::value::js_nanbox_pointer(obj as i64)
+}
+
+extern "C" fn async_from_sync_fulfilled(
+    closure: *const crate::closure::ClosureHeader,
+    value: f64,
+) -> f64 {
+    let promise =
+        crate::closure::js_closure_get_capture_ptr(closure, 0) as *mut crate::promise::Promise;
+    let done = crate::closure::js_closure_get_capture_f64(closure, 1) != 0.0;
+    if !promise.is_null() {
+        crate::promise::js_promise_resolve(promise, async_from_sync_iter_result(value, done));
+    }
+    0.0
+}
+
+extern "C" fn async_from_sync_rejected_value(
+    closure: *const crate::closure::ClosureHeader,
+    reason: f64,
+) -> f64 {
+    let promise =
+        crate::closure::js_closure_get_capture_ptr(closure, 0) as *mut crate::promise::Promise;
+    let iter = crate::closure::js_closure_get_capture_f64(closure, 1);
+    let close_on_rejection = crate::closure::js_closure_get_capture_f64(closure, 2) != 0.0;
+    if close_on_rejection {
+        async_from_sync_close(iter);
+    }
+    if !promise.is_null() {
+        crate::promise::js_promise_reject(promise, reason);
+    }
+    0.0
+}
+
+fn async_from_sync_continue(iter: f64, step_result: f64, close_on_rejection: bool) -> f64 {
+    let ptr = crate::value::js_nanbox_get_pointer(step_result);
+    if ptr == 0 {
+        return async_from_sync_rejected(b"Iterator result is not an object");
+    }
+
+    let result_obj = ptr as *const crate::object::ObjectHeader;
+    let done_key = crate::string::js_string_from_bytes(b"done".as_ptr(), 4);
+    let value_key = crate::string::js_string_from_bytes(b"value".as_ptr(), 5);
+    let done = {
+        let done_val = crate::object::js_object_get_field_by_name(result_obj, done_key);
+        let done_f64 = f64::from_bits(done_val.bits());
+        crate::value::js_is_truthy(done_f64) != 0
+    };
+    let value = {
+        let value_val = crate::object::js_object_get_field_by_name(result_obj, value_key);
+        f64::from_bits(value_val.bits())
+    };
+
+    let outer = crate::promise::js_promise_new();
+    let on_fulfilled = crate::closure::js_closure_alloc(async_from_sync_fulfilled as *const u8, 2);
+    let on_rejected =
+        crate::closure::js_closure_alloc(async_from_sync_rejected_value as *const u8, 3);
+    crate::closure::js_closure_set_capture_ptr(on_fulfilled, 0, outer as i64);
+    crate::closure::js_closure_set_capture_f64(on_fulfilled, 1, if done { 1.0 } else { 0.0 });
+    crate::closure::js_closure_set_capture_ptr(on_rejected, 0, outer as i64);
+    crate::closure::js_closure_set_capture_f64(on_rejected, 1, iter);
+    crate::closure::js_closure_set_capture_f64(
+        on_rejected,
+        2,
+        if close_on_rejection { 1.0 } else { 0.0 },
+    );
+
+    let value_promise = crate::promise::js_promise_resolved(value);
+    crate::promise::js_promise_then(value_promise, on_fulfilled, on_rejected);
+    boxed_promise_value(outer)
+}
+
+fn async_from_sync_rest_args(rest: f64) -> (usize, f64) {
+    let ptr = crate::value::js_nanbox_get_pointer(rest) as *const crate::array::ArrayHeader;
+    if ptr.is_null() {
+        return (0, undefined_value());
+    }
+    let len = crate::array::js_array_length(ptr) as usize;
+    let first = if len == 0 {
+        undefined_value()
+    } else {
+        crate::array::js_array_get_f64(ptr, 0)
+    };
+    (len, first)
+}
+
+fn async_from_sync_call_raw(iter: f64, method: &[u8], args: &[f64]) -> Result<Option<f64>, f64> {
+    let method_value = named_field(iter, method);
+    if method_value.to_bits() == crate::value::TAG_UNDEFINED {
+        let raw = crate::value::js_nanbox_get_pointer(iter) as usize;
+        if method != b"next" || !is_builtin_iterator_class_id(raw) {
+            return Ok(None);
+        }
+    } else if !is_callable_value(method_value) {
+        return Err(async_from_sync_type_error(
+            b"Async-from-sync iterator method is not callable",
+        ));
+    }
+
+    let trap_buf = crate::exception::js_try_push();
+    let jumped = unsafe { crate::ffi::setjmp::setjmp(trap_buf as *mut std::os::raw::c_int) };
+    let result = if jumped == 0 {
+        let args_ptr = if args.is_empty() {
+            std::ptr::null()
+        } else {
+            args.as_ptr()
+        };
+        let value = unsafe {
+            crate::object::js_native_call_method(
+                iter,
+                method.as_ptr() as *const i8,
+                method.len(),
+                args_ptr,
+                args.len(),
+            )
+        };
+        Ok(Some(value))
+    } else {
+        let exc = crate::exception::js_get_exception();
+        crate::exception::js_clear_exception();
+        Err(exc)
+    };
+    crate::exception::js_try_end();
+    result
+}
+
+/// Invoke a pre-fetched method value with `this` = `iter`. Mirrors
+/// [`async_from_sync_call_raw`] but skips the per-call property read — used for
+/// the `next` method, whose `[[NextMethod]]` the spec captures ONCE at
+/// CreateAsyncFromSyncIterator time and reuses for every step (ECMA-262
+/// §27.1.4.2). Re-reading `next` per call re-ran the sync iterator's `get next`
+/// accessor on every pull, diverging from Node's operation order
+/// (test262 yield-star-sync-next).
+fn async_from_sync_call_cached_raw(
+    iter: f64,
+    method_value: f64,
+    args: &[f64],
+) -> Result<Option<f64>, f64> {
+    if !is_callable_value(method_value) {
+        return Err(async_from_sync_type_error(
+            b"Async-from-sync iterator method is not callable",
+        ));
+    }
+    let prev_this = crate::object::js_implicit_this_set(iter);
+    let trap_buf = crate::exception::js_try_push();
+    let jumped = unsafe { crate::ffi::setjmp::setjmp(trap_buf as *mut std::os::raw::c_int) };
+    let result = if jumped == 0 {
+        let args_ptr = if args.is_empty() {
+            std::ptr::null()
+        } else {
+            args.as_ptr()
+        };
+        let value =
+            unsafe { crate::closure::js_native_call_value(method_value, args_ptr, args.len()) };
+        Ok(Some(value))
+    } else {
+        let exc = crate::exception::js_get_exception();
+        crate::exception::js_clear_exception();
+        Err(exc)
+    };
+    crate::object::js_implicit_this_set(prev_this);
+    crate::exception::js_try_end();
+    result
+}
+
+fn async_from_sync_close(iter: f64) {
+    let _ = async_from_sync_call_raw(iter, b"return", &[]);
+}
+
+fn async_from_sync_call(iter: f64, method: &[u8], args: &[f64], close_on_rejection: bool) -> f64 {
+    match async_from_sync_call_raw(iter, method, args) {
+        Ok(Some(step)) => async_from_sync_continue(iter, step, close_on_rejection),
+        Ok(None) => async_from_sync_rejected(b"Async-from-sync iterator method is not callable"),
+        Err(reason) => boxed_promise_value(crate::promise::js_promise_rejected(reason)),
+    }
+}
+
+extern "C" fn async_from_sync_next(
+    closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    let iter = crate::closure::js_closure_get_capture_f64(closure, 0);
+    let cached_next = crate::closure::js_closure_get_capture_f64(closure, 1);
+    let (argc, first) = async_from_sync_rest_args(rest);
+    let single = [first];
+    let args: &[f64] = if argc == 0 { &[] } else { &single };
+    // Use the captured `[[NextMethod]]` when it is a readable callable (the
+    // observable-getter case). Builtin iterators (array/map/set/string) expose
+    // no readable own `next` and dispatch through the class-id method tower, so
+    // fall back to the by-name call for them.
+    if is_callable_value(cached_next) {
+        return match async_from_sync_call_cached_raw(iter, cached_next, args) {
+            Ok(Some(step)) => async_from_sync_continue(iter, step, true),
+            Ok(None) => async_from_sync_call(iter, b"next", args, true),
+            Err(reason) => boxed_promise_value(crate::promise::js_promise_rejected(reason)),
+        };
+    }
+    async_from_sync_call(iter, b"next", args, true)
+}
+
+extern "C" fn async_from_sync_return(
+    closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    let iter = crate::closure::js_closure_get_capture_f64(closure, 0);
+    let (argc, first) = async_from_sync_rest_args(rest);
+    let single = [first];
+    let args: &[f64] = if argc == 0 { &[] } else { &single };
+    match async_from_sync_call_raw(iter, b"return", args) {
+        Ok(Some(step)) => async_from_sync_continue(iter, step, false),
+        Ok(None) => {
+            let value = if argc == 0 { undefined_value() } else { first };
+            let done = async_from_sync_iter_result(value, true);
+            boxed_promise_value(crate::promise::js_promise_resolved(done))
+        }
+        Err(reason) => boxed_promise_value(crate::promise::js_promise_rejected(reason)),
+    }
+}
+
+extern "C" fn async_from_sync_throw(
+    closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    let iter = crate::closure::js_closure_get_capture_f64(closure, 0);
+    let (argc, first) = async_from_sync_rest_args(rest);
+    let single = [first];
+    let args: &[f64] = if argc == 0 { &[] } else { &single };
+    match async_from_sync_call_raw(iter, b"throw", args) {
+        Ok(Some(step)) => async_from_sync_continue(iter, step, true),
+        Ok(None) => {
+            async_from_sync_close(iter);
+            async_from_sync_rejected(b"The iterator does not provide a 'throw' method.")
+        }
+        Err(reason) => boxed_promise_value(crate::promise::js_promise_rejected(reason)),
+    }
+}
+
+extern "C" fn async_from_sync_async_iterator(closure: *const crate::closure::ClosureHeader) -> f64 {
+    crate::closure::js_closure_get_capture_f64(closure, 0)
+}
+
+fn register_async_from_sync_thunks_once() {
+    thread_local! {
+        static REGISTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    REGISTERED.with(|flag| {
+        if flag.get() {
+            return;
+        }
+        crate::closure::js_register_closure_rest(async_from_sync_next as *const u8, 0);
+        crate::closure::js_register_closure_rest(async_from_sync_return as *const u8, 0);
+        crate::closure::js_register_closure_rest(async_from_sync_throw as *const u8, 0);
+        crate::closure::js_register_closure_arity(async_from_sync_async_iterator as *const u8, 0);
+        flag.set(true);
+    });
+}
+
+fn install_async_from_sync_method(
+    obj: *mut crate::object::ObjectHeader,
+    name: &[u8],
+    func: extern "C" fn(*const crate::closure::ClosureHeader, f64) -> f64,
+    iter: f64,
+) -> f64 {
+    let closure = crate::closure::js_closure_alloc(func as *const u8, 1);
+    crate::closure::js_closure_set_capture_f64(closure, 0, iter);
+    let value = crate::value::js_nanbox_pointer(closure as i64);
+    let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+    crate::object::js_object_set_field_by_name(obj, key, value);
+    value
+}
+
+/// Install the wrapper's `next` method with TWO captures: the sync iterator
+/// (slot 0) and its pre-fetched `[[NextMethod]]` (slot 1, see
+/// [`async_from_sync_call_cached_raw`]).
+fn install_async_from_sync_next(
+    obj: *mut crate::object::ObjectHeader,
+    iter: f64,
+    cached_next: f64,
+) -> f64 {
+    let closure = crate::closure::js_closure_alloc(async_from_sync_next as *const u8, 2);
+    crate::closure::js_closure_set_capture_f64(closure, 0, iter);
+    crate::closure::js_closure_set_capture_f64(closure, 1, cached_next);
+    let value = crate::value::js_nanbox_pointer(closure as i64);
+    let key = crate::string::js_string_from_bytes(b"next".as_ptr(), 4);
+    crate::object::js_object_set_field_by_name(obj, key, value);
+    value
+}
+
+pub(crate) fn async_from_sync_wrap_iterator(iter: f64) -> f64 {
+    register_async_from_sync_thunks_once();
+    let obj = crate::object::js_object_alloc(0, 0);
+    let wrapper = crate::value::js_nanbox_pointer(obj as i64);
+    // Spec (CreateAsyncFromSyncIterator): the sync iterator record's
+    // `[[NextMethod]]` is read once, here, and reused for every `next()` step.
+    let cached_next = named_field(iter, b"next");
+    install_async_from_sync_next(obj, iter, cached_next);
+    install_async_from_sync_method(obj, b"return", async_from_sync_return, iter);
+    install_async_from_sync_method(obj, b"throw", async_from_sync_throw, iter);
+    let async_iter =
+        crate::closure::js_closure_alloc(async_from_sync_async_iterator as *const u8, 1);
+    crate::closure::js_closure_set_capture_f64(async_iter, 0, wrapper);
+    let sym = crate::symbol::well_known_symbol("asyncIterator");
+    if !sym.is_null() {
+        unsafe {
+            crate::symbol::js_object_set_symbol_property(
+                wrapper,
+                f64::from_bits(crate::value::JSValue::pointer(sym as *const u8).bits()),
+                crate::value::js_nanbox_pointer(async_iter as i64),
+            );
+        }
+    }
+    wrapper
+}
+
+#[no_mangle]
+pub extern "C" fn js_get_async_iterator(value: f64) -> f64 {
+    // GetIterator(value, async) — ECMA-262 §7.4.3.
+    //
+    // Spec ordering matters (test262 yield-star-getiter-async-*): consult
+    // @@asyncIterator with GetMethod semantics FIRST. A method that is present
+    // but not callable is a TypeError; a callable method whose result is not an
+    // Object is a TypeError. Only an ABSENT (undefined/null) @@asyncIterator
+    // falls back to the sync iterator wrapped via CreateAsyncFromSyncIterator —
+    // so e.g. `yield* { [Symbol.asyncIterator]() { return undefined } }` throws
+    // instead of (wrongly) reaching the object's `[Symbol.iterator]`.
+    let sym = crate::symbol::well_known_symbol("asyncIterator");
+    if !sym.is_null() {
+        let sym_f64 = f64::from_bits(crate::value::JSValue::pointer(sym as *const u8).bits());
+        let method = unsafe { crate::symbol::js_object_get_symbol_property(value, sym_f64) };
+        let mb = method.to_bits();
+        if mb != crate::value::TAG_UNDEFINED && mb != crate::value::TAG_NULL {
+            // @@asyncIterator is present: GetMethod requires it be callable.
+            if !is_callable_value(method) {
+                throw_iterator_method_not_callable();
+            }
+            let prev_this = crate::object::js_implicit_this_set(value);
+            let iterator =
+                unsafe { crate::closure::js_native_call_value(method, std::ptr::null(), 0) };
+            crate::object::js_implicit_this_set(prev_this);
+            // GetIterator step 5: the result must be an Object.
+            if !is_async_iterator_object(iterator) {
+                throw_iterator_result_not_object();
+            }
+            return iterator;
+        }
+        // @@asyncIterator absent → fall through to the sync-iterator path.
+    }
+
+    let iter = crate::symbol::js_get_iterator(value);
+    let raw = crate::value::js_nanbox_get_pointer(iter) as usize;
+    if iter.to_bits() == value.to_bits()
+        && !is_builtin_iterator_class_id(raw)
+        && !has_named_next(iter)
+    {
+        throw_not_iterable(value);
+    }
+
+    async_from_sync_wrap_iterator(iter)
+}
+
+/// `Type(x) is Object` for the GetIterator(async) result check: heap
+/// pointer-tagged values that are not registered Symbols (strings, numbers,
+/// booleans, null/undefined, symbols are all NOT objects).
+fn is_async_iterator_object(value: f64) -> bool {
+    let jv = crate::value::JSValue::from_bits(value.to_bits());
+    jv.is_pointer()
+        && !crate::symbol::is_registered_symbol(crate::value::js_nanbox_get_pointer(value) as usize)
 }
 
 #[cold]
@@ -329,7 +725,17 @@ pub extern "C" fn js_array_spread_append(dest: *mut ArrayHeader, source: f64) ->
 /// `js_native_call_method`, so they should be driven directly rather than via the
 /// (now inherited) `[Symbol.iterator]` method.
 pub(crate) fn is_builtin_iterator_class_id(raw_ptr: usize) -> bool {
-    if raw_ptr < crate::gc::GC_HEADER_SIZE + 0x1000 {
+    // Native handle ids (Web-Fetch Headers/Request/Response, streams, ws, DB,
+    // …) are NaN-boxed POINTER values in the small-handle band (see
+    // `value::addr_class`): registry indices, NOT heap pointers. Dereferencing
+    // `raw_ptr - 8` as a GcHeader for one of them reads unmapped memory and
+    // segfaults — e.g. `for (const [k, v] of response.headers)` (#4800), where
+    // the lazy `for…of` protocol (#4786) routes the Headers handle
+    // (id >= 0x40000) through `js_get_iterator`, which calls this check.
+    // Reject the whole handle band, matching `Array.isArray` and
+    // `try_dispatch_instance_method_value`. A real built-in iterator is always
+    // a heap object well above this floor, so this never loses a true match.
+    if crate::value::addr_class::is_handle_band(raw_ptr) {
         return false;
     }
     unsafe {
@@ -608,10 +1014,19 @@ pub extern "C" fn js_iterator_to_array(iter_f64: f64) -> *mut ArrayHeader {
         } else {
             closure::js_closure_call1(next_ptr, f64::from_bits(TAG_UNDEFINED))
         };
-        let result_ptr = js_nanbox_get_pointer(result_f64);
-        if result_ptr == 0 {
-            break;
+        // IteratorNext (ECMA-262 §7.4.2 step 3): if Type(result) is not
+        // Object, throw a TypeError. `is_pointer()` is true only for
+        // POINTER_TAG heap objects/arrays — strings, numbers, booleans,
+        // null and undefined all fail it (and would otherwise be silently
+        // treated as "done"). Symbols are pointer-tagged but are NOT objects,
+        // so exclude registered symbols too.
+        // language/statements/for-of/iterator-next-result-type.
+        let result_is_object = crate::value::JSValue::from_bits(result_f64.to_bits()).is_pointer()
+            && !crate::symbol::is_registered_symbol(js_nanbox_get_pointer(result_f64) as usize);
+        if !result_is_object {
+            throw_iterator_result_not_object();
         }
+        let result_ptr = js_nanbox_get_pointer(result_f64);
         let result_obj = result_ptr as *const ObjectHeader;
 
         // Check .done
@@ -629,6 +1044,23 @@ pub extern "C" fn js_iterator_to_array(iter_f64: f64) -> *mut ArrayHeader {
     }
 
     result
+}
+
+/// `BindingRestElement` / `AssignmentRestElement` iterator drain for
+/// destructuring (`let [...rest] = src`, `method([...rest]) {}`). Spec §8.5.3
+/// ArrayBindingPattern step for a rest element: if the iterator is already
+/// done, the rest is an empty array; otherwise drain the remaining values into
+/// a fresh array (which leaves the iterator exhausted). `done_f64` carries the
+/// destructuring `[[Done]]` flag so a rest after an exhausted iterator
+/// (`let [a, b, ...r] = [1]`) yields `[]` without re-invoking `next()`.
+#[no_mangle]
+pub extern "C" fn js_iterator_rest_to_array(iter_f64: f64, done_f64: f64) -> f64 {
+    if crate::value::js_is_truthy(done_f64) != 0 {
+        let arr = js_array_alloc(0);
+        return crate::value::js_nanbox_pointer(arr as i64);
+    }
+    let arr = js_iterator_to_array(iter_f64);
+    crate::value::js_nanbox_pointer(arr as i64)
 }
 
 fn js_async_iterator_to_array(iter_f64: f64) -> *mut ArrayHeader {

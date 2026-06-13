@@ -361,14 +361,13 @@ pub(crate) fn is_global_this_builtin_name(name: &str) -> bool {
             // #4511: legacy escape/unescape (ES Annex B).
             | "escape"
             | "unescape"
-            // #4511: Node's `global` alias (typeof === "object").
-            | "global"
             // Test262 installs this dynamically on globalThis. Route reads
             // through the singleton so bare `print(...)` can call it once the
             // harness assigns the property.
             | "print"
             // Namespaces (typeof === "object" in spec).
             | "globalThis"
+            | "global"
             | "console"
             | "Math"
             | "JSON"
@@ -376,6 +375,7 @@ pub(crate) fn is_global_this_builtin_name(name: &str) -> bool {
             | "Atomics"
             | "Intl"
             | "WebAssembly"
+            | "Temporal"
             | "performance"
             | "process"
             | "navigator"
@@ -395,12 +395,14 @@ pub(crate) fn is_global_this_builtin_function_name(name: &str) -> bool {
         && !matches!(
             name,
             "globalThis"
+                | "global"
                 | "console"
                 | "Math"
                 | "JSON"
                 | "Reflect"
                 | "Intl"
                 | "WebAssembly"
+                | "Temporal"
                 | "performance"
                 | "process"
                 | "navigator"
@@ -408,8 +410,6 @@ pub(crate) fn is_global_this_builtin_function_name(name: &str) -> bool {
                 | "crypto"
                 | "localStorage"
                 | "sessionStorage"
-                // #4511: `typeof global === "object"`.
-                | "global"
         )
 }
 

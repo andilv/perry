@@ -49,8 +49,35 @@ fn is_date_receiver(ctx: &FnCtx<'_>, object: &Expr) -> bool {
 fn is_inherited_object_prototype_method(name: &str) -> bool {
     matches!(
         name,
-        "hasOwnProperty" | "propertyIsEnumerable" | "isPrototypeOf" | "valueOf"
+        "hasOwnProperty"
+            | "propertyIsEnumerable"
+            | "isPrototypeOf"
+            | "valueOf"
+            // Annex B §B.2.2 legacy accessor helpers — inherited from
+            // Object.prototype by every instance (incl. class instances).
+            | "__defineGetter__"
+            | "__defineSetter__"
+            | "__lookupGetter__"
+            | "__lookupSetter__"
     )
+}
+
+fn class_chain_has_field_named(ctx: &FnCtx<'_>, class_name: &str, property: &str) -> bool {
+    let mut current = Some(class_name.to_string());
+    while let Some(name) = current {
+        let Some(class) = ctx.classes.get(&name) else {
+            return true;
+        };
+        if class
+            .fields
+            .iter()
+            .any(|field| field.key_expr.is_some() || (!field.is_private && field.name == property))
+        {
+            return true;
+        }
+        current = class.extends_name.clone();
+    }
+    false
 }
 
 /// Try to lower a `Call { callee: PropertyGet { .. } }` via the
@@ -302,7 +329,17 @@ pub fn try_lower_property_get_method_call(
             "split" | "charCodeAt" | "charAt" | "trim" | "trimStart" | "trimEnd" | "substring"
             | "substr" | "toLowerCase" | "toUpperCase" | "toLocaleLowerCase"
             | "toLocaleUpperCase" | "replaceAll" | "padStart" | "padEnd" | "repeat"
-            | "normalize" | "codePointAt" | "localeCompare" => true,
+            | "codePointAt" | "localeCompare" => true,
+            // Annex B §B.2.2 HTML wrappers (`bold`, `link`, `anchor`, …) are
+            // string-only in the spec but collide with common user method
+            // names — chalk's `chalk.bold(s)` is a styled-string builder
+            // (#5039). Forcing the string path here coerced the chalk closure
+            // to its source text and wrapped it in `<b>…</b>`. An Any-typed
+            // receiver that really is a string still gets them via the
+            // `jsval.is_string()` arm of `js_native_call_method`.
+            // (`normalize` is intentionally NOT in this unconditional list — the
+            // arg-gated `"normalize" if args.len() <= 1` arm below handles it so
+            // user 2-arg `normalize(pathname, matched)` methods fall through.)
             // Issue #638: `replace` is also string-exclusive, but routing
             // it here unconditionally caused regressions in async dispatch
             // pathways. Only fire when args[1] is statically detectable as
@@ -329,6 +366,11 @@ pub fn try_lower_property_get_method_call(
             // startsWith / endsWith only exist on String — both 1-arg
             // and 2-arg (searchString, position) forms route here.
             "startsWith" | "endsWith" if args.len() == 1 || args.len() == 2 => true,
+            // `normalize` is string-exclusive only at 0/1 args. User classes
+            // commonly define 2-arg `normalize(pathname, matched)` methods
+            // (Next.js route normalizers) — those must fall through to the
+            // runtime dispatcher instead of erroring on String arity.
+            "normalize" if args.len() <= 1 => true,
             "lastIndexOf" if args.len() == 1 => true,
             _ => false,
         };
@@ -977,6 +1019,13 @@ pub fn try_lower_property_get_method_call(
         &ctx.class_ids,
     );
     if let Some(cls_name) = static_dispatch_cls {
+        // `C.prop(args)` where `prop` is a static ACCESSOR reads the accessor and
+        // calls its result — handle before the by-name tower (which would miss).
+        if let Some(v) = super::console_promise::try_lower_class_static_accessor_call(
+            ctx, &cls_name, property, callee, args,
+        )? {
+            return Ok(Some(v));
+        }
         // (fn_name, is_static, declared_param_count, has_rest, is_synthetic_arguments)
         let mut resolved: Option<(String, bool, usize, bool, bool)> = None;
         let mut cur = Some(cls_name.clone());
@@ -1108,6 +1157,21 @@ pub fn try_lower_property_get_method_call(
             let prev_this =
                 ctx.block()
                     .call(DOUBLE, "js_implicit_this_set", &[(DOUBLE, &recv_box)]);
+            // Receiver-sensitive static `this` for plain class-ref receivers:
+            // `D.f()` resolving to a parent's body at compile time must run
+            // with `this === D` (the prologue's `js_static_this_resolve`
+            // consumes this one-shot arm). Dynamic-value receiver shapes
+            // (ClassExprFresh / factory Call / LocalGet) keep their prior
+            // implicit-this-only behavior to avoid disturbing effect's
+            // per-evaluation class-object statics.
+            let plain_class_receiver = matches!(
+                object.as_ref(),
+                Expr::ClassRef(_) | Expr::ExternFuncRef { .. }
+            );
+            if plain_class_receiver {
+                ctx.block()
+                    .call_void("js_static_this_arm_value", &[(DOUBLE, &recv_box)]);
+            }
             let arg_slices: Vec<(crate::types::LlvmType, &str)> =
                 lowered.iter().map(|s| (DOUBLE, s.as_str())).collect();
             let result = ctx.block().call(DOUBLE, &fn_name, &arg_slices);
@@ -1887,6 +1951,8 @@ pub fn try_lower_property_get_method_call(
                 lowered_args.iter().map(|s| (DOUBLE, s.as_str())).collect();
 
             if !method_has_rest {
+                let shape_only_guard =
+                    !class_chain_has_field_named(ctx, &class_name, property.as_str());
                 if let Some(guarded) = emit_guarded_direct_method_call(
                     ctx,
                     &recv_box,
@@ -1895,6 +1961,7 @@ pub fn try_lower_property_get_method_call(
                     &fallback_fn,
                     &arg_slices,
                     &fallback_user_args,
+                    shape_only_guard,
                 ) {
                     return Ok(Some(guarded));
                 }

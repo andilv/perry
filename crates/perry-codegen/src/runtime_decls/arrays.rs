@@ -47,6 +47,10 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
     // Extending variant: returns a possibly-realloc'd pointer that the
     // caller must write back to the local slot.
     module.declare_function("js_array_set_f64_extend", I64, &[I64, I32, DOUBLE]);
+    module.declare_function("js_array_fill_f64_const_extend", I64, &[I64, I32, DOUBLE]);
+    module.declare_function("js_array_fill_f64_iota_extend", I64, &[I64, I32]);
+    module.declare_function("js_array_fill_f64_const_len_extend", I64, &[I64, DOUBLE]);
+    module.declare_function("js_array_fill_f64_iota_len_extend", I64, &[I64]);
     module.declare_function("js_array_set_string_key", I64, &[I64, I64, DOUBLE]);
     module.declare_function("js_array_set_index_or_string", I64, &[I64, DOUBLE, DOUBLE]);
     module.declare_function("js_array_mark_arguments_object", I64, &[I64]);
@@ -95,6 +99,8 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
     module.declare_function("js_write_barrier_root_nanbox", VOID, &[I64]);
     module.declare_function("js_write_barrier_root_heap_word", VOID, &[I64]);
     module.declare_function("js_gc_note_slot_layout", VOID, &[I64, I32, I64]);
+    //   js_gc_note_slot_layout_aware(parent, slot_index, value_bits, old_bits)
+    module.declare_function("js_gc_note_slot_layout_aware", VOID, &[I64, I32, I64, I64]);
     module.declare_function(
         "js_gc_init_typed_shape_layout",
         VOID,
@@ -116,6 +122,11 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
     module.declare_function("js_array_forEach", VOID, &[I64, I64]);
     module.declare_function("js_array_fill", I64, &[I64, DOUBLE]);
     module.declare_function("js_array_fill_range", I64, &[I64, DOUBLE, DOUBLE, DOUBLE]);
+    module.declare_function(
+        "js_array_fill_generic",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, I32, DOUBLE, I32, DOUBLE],
+    );
     module.declare_function("js_array_delete", I32, &[I64, I32]);
     // Closes #304: `arr.length = N` truncate / extend.
     module.declare_function("js_array_set_length", VOID, &[I64, DOUBLE]);
@@ -137,6 +148,57 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
     // #2805: Array.prototype.concat(...args) — non-mutating, variadic, with
     // Symbol.isConcatSpreadable handling. (recv_handle, args_ptr, count).
     module.declare_function("js_array_concat_variadic", I64, &[I64, PTR, I32]);
+    // #4597: generic `Array.prototype.<m>.call/apply(arrayLike, …)` — operate on
+    // the original receiver value (ToObject + LengthOfArrayLike + indexed
+    // Get/HasProperty). All take/return NaN-boxed DOUBLE values.
+    for f in [
+        "js_arraylike_forEach",
+        "js_arraylike_map",
+        "js_arraylike_filter",
+        "js_arraylike_some",
+        "js_arraylike_every",
+        "js_arraylike_find",
+        "js_arraylike_findIndex",
+        "js_arraylike_findLast",
+        "js_arraylike_findLastIndex",
+    ] {
+        module.declare_function(f, DOUBLE, &[DOUBLE, DOUBLE, DOUBLE]);
+    }
+    module.declare_function(
+        "js_arraylike_reduce",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, I32, DOUBLE],
+    );
+    module.declare_function(
+        "js_arraylike_reduceRight",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, I32, DOUBLE],
+    );
+    module.declare_function(
+        "js_arraylike_indexOf",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, DOUBLE, I32],
+    );
+    module.declare_function(
+        "js_arraylike_lastIndexOf",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, DOUBLE, I32],
+    );
+    module.declare_function(
+        "js_arraylike_includes",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, DOUBLE, I32],
+    );
+    module.declare_function("js_arraylike_at", DOUBLE, &[DOUBLE, DOUBLE]);
+    module.declare_function("js_arraylike_join", DOUBLE, &[DOUBLE, DOUBLE]);
+    module.declare_function(
+        "js_arraylike_slice",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, I32, DOUBLE, I32],
+    );
+    module.declare_function("js_arraylike_sort", DOUBLE, &[DOUBLE, DOUBLE]);
+    module.declare_function("js_arraylike_splice", DOUBLE, &[DOUBLE, PTR, I32]);
+    module.declare_function("js_arraylike_concat", DOUBLE, &[DOUBLE, PTR, I32]);
     // Spread `[...x]` — strict GetIterator/materialization.
     module.declare_function("js_array_clone_for_spread", I64, &[DOUBLE]);
     module.declare_function("js_array_spread_append", I64, &[I64, DOUBLE]);
@@ -144,9 +206,11 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
     module.declare_function("js_iterator_to_array", I64, &[DOUBLE]);
     module.declare_function("js_iterator_next_result", DOUBLE, &[DOUBLE]);
     module.declare_function("js_iterator_close_if_not_done", DOUBLE, &[DOUBLE, DOUBLE]);
+    module.declare_function("js_iterator_rest_to_array", DOUBLE, &[DOUBLE, DOUBLE]);
     // #1831: `yield*` iterator resolution — `operand[Symbol.iterator]()` or the
     // operand itself when already an iterator. Returns a NaN-boxed JSValue.
     module.declare_function("js_get_iterator", DOUBLE, &[DOUBLE]);
+    module.declare_function("js_get_async_iterator", DOUBLE, &[DOUBLE]);
     // #321: materialize an untyped `for...of` receiver into a plain Array by
     // inspecting its runtime GC kind (Map/Set/Array/string/iterable).
     // Returns a NaN-boxed array JSValue.

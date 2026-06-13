@@ -49,6 +49,50 @@ use super::{
     I18nLowerCtx,
 };
 
+/// Built-in constructor names (beyond Error/stream/fetch, which have their own
+/// SuperCall arms) that can appear as a class heritage. `super(...)` to these
+/// must NOT be routed through the runtime-value dispatch path
+/// (`js_fetch_or_value_super`), which would invoke e.g. `Map()` without `new`
+/// and throw "Constructor requires 'new'". Perry cannot yet give a subclass
+/// instance the built-in's internal slots, so `super()` is a best-effort no-op
+/// here — enough that `class M extends Map { constructor(){ super(); } }`
+/// constructs without throwing. Refs class/subclass/builtin-objects/*/
+/// super-must-be-called.
+pub(crate) fn is_other_builtin_constructor_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Map"
+            | "Set"
+            | "WeakMap"
+            | "WeakSet"
+            | "Array"
+            | "ArrayBuffer"
+            | "SharedArrayBuffer"
+            | "DataView"
+            | "Boolean"
+            | "Number"
+            | "String"
+            | "Date"
+            | "RegExp"
+            | "Promise"
+            | "Function"
+            | "BigInt"
+            | "Symbol"
+            | "Object"
+            | "Int8Array"
+            | "Uint8Array"
+            | "Uint8ClampedArray"
+            | "Int16Array"
+            | "Uint16Array"
+            | "Int32Array"
+            | "Uint32Array"
+            | "Float32Array"
+            | "Float64Array"
+            | "BigInt64Array"
+            | "BigUint64Array"
+    )
+}
+
 pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
     match expr {
         Expr::This => {
@@ -78,6 +122,73 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         // the lowered super-call args.
         //
         // The current class is the topmost entry in `class_stack`. The
+        // `super(...spread)` — tsc's pass-through ctor (`constructor(){
+        // super(...arguments) }`, zod's ZodNumber/ZodBigInt). The arg
+        // count is dynamic, so the parent ctor can't be inlined; build
+        // the args array and invoke the closest registered ancestor ctor
+        // on the SAME `this` through the CLASS_CONSTRUCTORS registry.
+        Expr::SuperCallSpread(call_args) => {
+            let Some(current_class_name) = ctx.class_stack.last().cloned() else {
+                for a in call_args {
+                    let (perry_hir::CallArg::Expr(e) | perry_hir::CallArg::Spread(e)) = a;
+                    let _ = lower_expr(ctx, e)?;
+                }
+                return Ok(double_literal(0.0));
+            };
+            // Materialize the args array (spread elements appended via
+            // the runtime spread helper).
+            let zero = "0".to_string();
+            let mut arr = ctx.block().call(I64, "js_array_alloc", &[(I32, &zero)]);
+            for a in call_args {
+                match a {
+                    perry_hir::CallArg::Expr(e) => {
+                        let v = lower_expr(ctx, e)?;
+                        arr = ctx.block().call(
+                            I64,
+                            "js_array_push_f64",
+                            &[(I64, &arr), (DOUBLE, &v)],
+                        );
+                    }
+                    perry_hir::CallArg::Spread(e) => {
+                        // `js_array_push_spread_any` also handles the
+                        // arguments OBJECT (array-like, not ArrayHeader) —
+                        // the `super(...arguments)` source.
+                        let v = lower_expr(ctx, e)?;
+                        arr = ctx.block().call(
+                            I64,
+                            "js_array_push_spread_any",
+                            &[(I64, &arr), (DOUBLE, &v)],
+                        );
+                    }
+                }
+            }
+            // Invoke the closest registered ancestor ctor through the
+            // CLASS_CONSTRUCTORS registry. KNOWN GAP: constructions from
+            // METHOD bodies (standalone-ctor path) currently lose the
+            // parent's field writes — see the wall-21 notes; top-level and
+            // arrow-context constructions work.
+            let this_box = match ctx.this_stack.last().cloned() {
+                Some(slot) => ctx.block().load(DOUBLE, &slot),
+                None => double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)),
+            };
+            if let Some(&child_cid) = ctx.class_ids.get(&current_class_name) {
+                let cid_str = child_cid.to_string();
+                let blk = ctx.block();
+                let arr_box = nanbox_pointer_inline(blk, &arr);
+                ctx.block().call_void(
+                    "js_super_construct_apply",
+                    &[(I32, &cid_str), (DOUBLE, &this_box), (DOUBLE, &arr_box)],
+                );
+            }
+            // Spec: subclass field initializers run AFTER super() returns
+            // (mirrors every other super arm).
+            crate::lower_call::apply_field_initializers_recursive(
+                ctx,
+                &current_class_name,
+                crate::lower_call::FieldInitMode::SelfOnly,
+            )?;
+            return Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)));
+        }
         // parent is `current_class.extends_name` (Perry uses the string
         // form for cross-module/late-resolved cases) or
         // `current_class.extends.and_then(class_id_to_name)`. For Phase
@@ -134,24 +245,29 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     // semantics (Error sets this.message + this.name; streams allocate
                     // a registry handle). Anything else with an extends_expr is a
                     // real runtime-value parent and routes through this dispatch.
-                    let is_builtin_parent_name = matches!(
-                        parent_name.as_str(),
-                        "Error"
-                            | "TypeError"
-                            | "RangeError"
-                            | "ReferenceError"
-                            | "SyntaxError"
-                            | "URIError"
-                            | "EvalError"
-                            | "AggregateError"
-                            | "Readable"
-                            | "Writable"
-                            | "Duplex"
-                            | "Transform"
-                            | "ReadableStream"
-                            | "WritableStream"
-                            | "TransformStream"
-                    );
+                    let is_builtin_parent_name =
+                        matches!(
+                            parent_name.as_str(),
+                            "Error"
+                                | "TypeError"
+                                | "RangeError"
+                                | "ReferenceError"
+                                | "SyntaxError"
+                                | "URIError"
+                                | "EvalError"
+                                | "AggregateError"
+                                | "Readable"
+                                | "Writable"
+                                | "Duplex"
+                                | "Transform"
+                                | "ReadableStream"
+                                | "WritableStream"
+                                | "TransformStream"
+                                | "Request"
+                                | "Response"
+                                | "Event"
+                                | "CustomEvent"
+                        ) || is_other_builtin_constructor_name(parent_name.as_str());
                     if !is_builtin_parent_name {
                         if let Some(extends_expr) = current_class.extends_expr.as_deref() {
                             // Lower the super-call args first so they get fresh slots
@@ -204,24 +320,25 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                                     double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED))
                                 }
                             };
-                            let prev_this = ctx.block().call(
-                                DOUBLE,
-                                "js_implicit_this_set",
-                                &[(DOUBLE, &this_box)],
-                            );
+                            // Route runtime-value super() through the
+                            // fetch-aware dispatcher: when `parent_val` is the
+                            // global Request/Response constructor (possibly via
+                            // an alias like `@hono/node-server`'s
+                            // `GlobalRequest = global.Request`), it allocates the
+                            // native fetch handle and stashes it on `this` so
+                            // inherited body methods resolve; otherwise it falls
+                            // back to the ordinary implicit-`this`-bound
+                            // `js_native_call_value` (unchanged behavior for
+                            // every other runtime-value parent).
                             let _ = ctx.block().call(
                                 DOUBLE,
-                                "js_native_call_value",
+                                "js_fetch_or_value_super",
                                 &[
                                     (DOUBLE, &parent_val),
+                                    (DOUBLE, &this_box),
                                     (crate::types::PTR, &args_ptr),
                                     (I64, &args_len),
                                 ],
-                            );
-                            ctx.block().call(
-                                DOUBLE,
-                                "js_implicit_this_set",
-                                &[(DOUBLE, &prev_this)],
                             );
 
                             // Per JS spec: subclass field initializers run AFTER
@@ -241,6 +358,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         }
                     }
                     let node_stream_kind = match parent_name.as_str() {
+                        "Readable" => Some("readable"),
                         "Writable" => Some("writable"),
                         "Duplex" => Some("duplex"),
                         "Transform" => Some("transform"),
@@ -288,6 +406,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     }
                     let node_stream_kind = match parent_name.as_str() {
                         "Readable" => Some("readable"),
+                        "Writable" => Some("writable"),
                         "Duplex" => Some("duplex"),
                         "Transform" => Some("transform"),
                         _ => None,
@@ -302,6 +421,94 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                             crate::lower_call::FieldInitMode::SelfOnly,
                         )?;
                         return Ok(result);
+                    }
+                    // `class X extends Request` / `extends Response`:
+                    // `super(input, init)` allocates the underlying native
+                    // Web-Fetch handle and stashes its id on `this` under
+                    // `__perry_fetch_handle__`. Inherited body methods
+                    // (`text`/`json`/…) and property getters route through that
+                    // handle at runtime (see `fetch_subclass_handle_id`). This
+                    // makes `class Request extends GlobalRequest {}` — exactly
+                    // what `@hono/node-server` does — produce a working Request.
+                    // `class X extends Event` / `extends CustomEvent` (the `ws`
+                    // package's CloseEvent/ErrorEvent/MessageEvent): `super(type,
+                    // options)` initializes the standard Event fields/methods onto
+                    // `this`. The `X → Event` registry edge (registered at class-
+                    // definition time via js_register_class_parent_dynamic) keeps
+                    // `instanceof Event` and EventTarget dispatch acceptance.
+                    if matches!(parent_name.as_str(), "Event" | "CustomEvent") {
+                        let undef = double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
+                        let mut lowered: Vec<String> = Vec::with_capacity(super_args.len());
+                        for a in super_args {
+                            lowered.push(lower_expr(ctx, a)?);
+                        }
+                        let arg0 = lowered.first().cloned().unwrap_or_else(|| undef.clone());
+                        let arg1 = lowered.get(1).cloned().unwrap_or_else(|| undef.clone());
+                        let this_box = match ctx.this_stack.last().cloned() {
+                            Some(slot) => ctx.block().load(DOUBLE, &slot),
+                            None => undef.clone(),
+                        };
+                        let argc = super_args.len().min(2).to_string();
+                        // `extends CustomEvent` → initialize `constructor` +
+                        // `detail` as a CustomEvent, not a plain Event.
+                        let is_custom = if parent_name.as_str() == "CustomEvent" {
+                            "1"
+                        } else {
+                            "0"
+                        }
+                        .to_string();
+                        ctx.block().call(
+                            DOUBLE,
+                            "js_event_subclass_init",
+                            &[
+                                (DOUBLE, &this_box),
+                                (DOUBLE, &arg0),
+                                (DOUBLE, &arg1),
+                                (I32, &argc),
+                                (I32, &is_custom),
+                            ],
+                        );
+                        let current_class_name =
+                            ctx.class_stack.last().cloned().unwrap_or_default();
+                        crate::lower_call::apply_field_initializers_recursive(
+                            ctx,
+                            &current_class_name,
+                            crate::lower_call::FieldInitMode::SelfOnly,
+                        )?;
+                        return Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)));
+                    }
+                    let fetch_subclass_fn = match parent_name.as_str() {
+                        "Request" => Some("js_request_subclass_init"),
+                        "Response" => Some("js_response_subclass_init"),
+                        _ => None,
+                    };
+                    if let Some(runtime_fn) = fetch_subclass_fn {
+                        let undef = double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
+                        let mut lowered: Vec<String> = Vec::with_capacity(super_args.len());
+                        for a in super_args {
+                            lowered.push(lower_expr(ctx, a)?);
+                        }
+                        let arg0 = lowered.first().cloned().unwrap_or_else(|| undef.clone());
+                        let arg1 = lowered.get(1).cloned().unwrap_or_else(|| undef.clone());
+                        let this_box = match ctx.this_stack.last().cloned() {
+                            Some(slot) => ctx.block().load(DOUBLE, &slot),
+                            None => undef.clone(),
+                        };
+                        ctx.block().call(
+                            DOUBLE,
+                            runtime_fn,
+                            &[(DOUBLE, &this_box), (DOUBLE, &arg0), (DOUBLE, &arg1)],
+                        );
+                        // Per JS spec, subclass field initializers run after
+                        // super() returns (mirrors the stream/error arms above).
+                        let current_class_name =
+                            ctx.class_stack.last().cloned().unwrap_or_default();
+                        crate::lower_call::apply_field_initializers_recursive(
+                            ctx,
+                            &current_class_name,
+                            crate::lower_call::FieldInitMode::SelfOnly,
+                        )?;
+                        return Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)));
                     }
                     // Built-in parent (Error, TypeError, RangeError, etc.)
                     // — user classes extending them need `super(message)` to
@@ -342,8 +549,12 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                                 let key_box = blk.load(DOUBLE, &key_handle_global);
                                 let key_bits = blk.bitcast_double_to_i64(&key_box);
                                 let key_raw = blk.and(I64, &key_bits, POINTER_MASK_I64);
+                                // Spec: `super(message)` into a built-in Error
+                                // sets `message` via DefinePropertyOrThrow with
+                                // `{ enumerable: false }` (Test262 NativeError/
+                                // *-message), not an enumerable assignment.
                                 blk.call_void(
-                                    "js_object_set_field_by_name",
+                                    "js_object_set_field_by_name_nonenum",
                                     &[(I64, &this_handle), (I64, &key_raw), (DOUBLE, msg_val)],
                                 );
                             }
@@ -433,6 +644,45 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             }
 
             if let Some(parent_ctor) = &effective_parent_class.constructor {
+                // The parent's synthesized `__perry_cap_*` params (a parent
+                // class that captures enclosing locals) are NOT in the
+                // user-written `super(...)` args. The CHILD's ctor carries
+                // same-named cap params (capture union), bound in the current
+                // scope — append their values by NAME so the binder's
+                // tail-aligned cap binding sees them. Without this,
+                // tail-binding pulled the LAST user arg into the parent's cap
+                // slot and the parent ctor's real params read undefined
+                // (vendored zod: ZodType's `this._def = def` got undefined).
+                let parent_cap_params: Vec<String> = parent_ctor
+                    .params
+                    .iter()
+                    .filter(|p| p.name.starts_with("__perry_cap_"))
+                    .map(|p| p.name.clone())
+                    .collect();
+                if !parent_cap_params.is_empty() {
+                    let child_cap_ids: std::collections::HashMap<String, u32> = ctx
+                        .class_stack
+                        .last()
+                        .and_then(|child| ctx.classes.get(child.as_str()))
+                        .and_then(|c| c.constructor.as_ref())
+                        .map(|ctor| {
+                            ctor.params
+                                .iter()
+                                .filter(|p| p.name.starts_with("__perry_cap_"))
+                                .map(|p| (p.name.clone(), p.id))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    for cap_name in &parent_cap_params {
+                        let val = child_cap_ids
+                            .get(cap_name)
+                            .and_then(|id| ctx.locals.get(id).cloned())
+                            .map(|slot| ctx.block().load(DOUBLE, &slot));
+                        lowered_args.push(val.unwrap_or_else(|| {
+                            double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED))
+                        }));
+                    }
+                }
                 let saved_scope =
                     bind_inline_constructor_params(ctx, &parent_ctor.params, &lowered_args);
 
@@ -494,8 +744,9 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         let key_box = blk.load(DOUBLE, &key_handle_global);
                         let key_bits = blk.bitcast_double_to_i64(&key_box);
                         let key_raw = blk.and(I64, &key_bits, POINTER_MASK_I64);
+                        // Spec: built-in Error sets `message` non-enumerable.
                         blk.call_void(
-                            "js_object_set_field_by_name",
+                            "js_object_set_field_by_name_nonenum",
                             &[(I64, &this_handle), (I64, &key_raw), (DOUBLE, msg_val)],
                         );
                     }

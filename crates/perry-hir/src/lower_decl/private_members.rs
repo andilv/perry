@@ -13,6 +13,60 @@ use crate::lower_types::*;
 
 use super::*;
 
+/// Pre-scan a class body and build the private-name scope for it: every
+/// private field / method / accessor it declares, with its kind and
+/// static-ness. Getter+setter pairs of the same name collapse to
+/// `PrivKind::GetSet`. Used to push a `PrivateScope` for the duration of the
+/// class body lowering so `obj.#name` accesses can brand-check on the correct
+/// declaring class and reject illegal read/write operations.
+pub fn build_private_scope(class: &ast::Class, class_name: &str) -> crate::lower::PrivateScope {
+    use crate::lower::{PrivKind, PrivMember, PrivateScope};
+    let mut members: std::collections::HashMap<String, PrivMember> =
+        std::collections::HashMap::new();
+    for member in &class.body {
+        match member {
+            ast::ClassMember::PrivateProp(prop) => {
+                let name = format!("#{}", prop.key.name);
+                members.insert(
+                    name,
+                    PrivMember {
+                        kind: PrivKind::Field,
+                        is_static: prop.is_static,
+                    },
+                );
+            }
+            ast::ClassMember::PrivateMethod(method) => {
+                let name = format!("#{}", method.key.name);
+                let kind = match method.kind {
+                    ast::MethodKind::Getter => PrivKind::Get,
+                    ast::MethodKind::Setter => PrivKind::Set,
+                    ast::MethodKind::Method => PrivKind::Method,
+                };
+                // Collapse a getter+setter pair declared under the same name
+                // into GetSet so a read or a write is legal for either.
+                let merged = match members.get(&name).map(|m| m.kind) {
+                    Some(PrivKind::Get) if kind == PrivKind::Set => PrivKind::GetSet,
+                    Some(PrivKind::Set) if kind == PrivKind::Get => PrivKind::GetSet,
+                    Some(existing) => existing,
+                    None => kind,
+                };
+                members.insert(
+                    name,
+                    PrivMember {
+                        kind: merged,
+                        is_static: method.is_static,
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+    PrivateScope {
+        class_name: class_name.to_string(),
+        members,
+    }
+}
+
 pub fn lower_private_method(
     ctx: &mut LoweringContext,
     method: &ast::PrivateMethod,
@@ -113,17 +167,47 @@ pub fn lower_private_method(
         Vec::new()
     };
 
+    // Capture the destructuring-prologue length before it is drained into the
+    // body so generator methods can replay param binding synchronously at call
+    // time (see the `gen_param_prologue_len` recording below).
+    let destructuring_prologue_len = destructuring_stmts.len();
     if !destructuring_stmts.is_empty() {
         destructuring_stmts.append(&mut body);
         body = destructuring_stmts;
+    }
+
+    // Default-parameter prologue (`if (p === undefined) p = <default>`) — this
+    // was missing for private methods, so `#m(a = 1)` silently dropped the
+    // default and `#m([x] = [])` left the destructuring source `undefined`
+    // (→ a thrown TypeError under the iterator protocol). Prepend BEFORE the
+    // destructuring prologue, matching the public-method ordering in
+    // `lower_method`.
+    let default_stmts = build_default_param_stmts(&params);
+    let default_prologue_len = default_stmts.len();
+    if !default_stmts.is_empty() {
+        let mut new_body = default_stmts;
+        new_body.extend(body);
+        body = new_body;
     }
 
     ctx.exit_strict_mode();
     ctx.exit_scope(scope_mark);
     ctx.exit_type_param_scope();
 
+    let func_id = ctx.fresh_func();
+    // Record the param-prologue length for private generator methods so the
+    // generator transform replays param binding synchronously at call time
+    // (spec FunctionDeclarationInstantiation order). See the matching comment
+    // in `lower_class_method_with_name` (test262 class/dstr private-gen-meth-*).
+    if method.function.is_generator {
+        let prologue_len = default_prologue_len + destructuring_prologue_len;
+        if prologue_len > 0 {
+            ctx.gen_param_prologue_len.insert(func_id, prologue_len);
+        }
+    }
+
     Ok(Function {
-        id: ctx.fresh_func(),
+        id: func_id,
         name,
         type_params,
         params,
@@ -282,12 +366,29 @@ pub fn lower_private_prop(
             .unwrap_or(Type::Any),
     };
 
-    // Lower initializer expression if present
+    // Lower initializer expression if present — field-initializer context for
+    // the direct-eval `arguments` early error (see `lower_class_prop`).
+    // NamedEvaluation: an anonymous function initializer takes the private
+    // field's name including the `#` (`static #field = function(){}` →
+    // `.name === "#field"`, test262 static-field-anonymous-function-name).
+    let saved_field_init = ctx.in_class_field_init;
+    ctx.in_class_field_init = true;
     let init = prop
         .value
         .as_ref()
-        .map(|e| lower_expr(ctx, e))
-        .transpose()?;
+        .map(|e| {
+            if crate::lower::expr_assign::rhs_accepts_assignment_name(e) {
+                let old = ctx.assignment_inferred_name.replace(name.clone());
+                let result = lower_expr(ctx, e);
+                ctx.assignment_inferred_name = old;
+                result
+            } else {
+                lower_expr(ctx, e)
+            }
+        })
+        .transpose();
+    ctx.in_class_field_init = saved_field_init;
+    let init = init?;
 
     Ok(ClassField {
         name,

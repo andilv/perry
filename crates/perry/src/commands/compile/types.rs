@@ -113,6 +113,16 @@ pub struct CompileArgs {
     #[arg(long)]
     pub target: Option<String>,
 
+    /// C library / linkage for Linux targets: `glibc` (default, dynamic) or
+    /// `musl` (fully static). `--libc musl` upgrades a Linux target
+    /// (`linux` / `linux-aarch64`, or the native-host default) to its musl
+    /// variant, producing a binary with no glibc loader dependency that runs
+    /// on AWS Lambda `provided.al2023`, scratch/distroless containers, Cloud
+    /// Run, etc. Equivalent to passing `--target linux-musl`. Ignored for
+    /// non-Linux targets. See #4826.
+    #[arg(long)]
+    pub libc: Option<String>,
+
     /// App bundle identifier (required for widget targets)
     #[arg(long)]
     pub app_bundle_id: Option<String>,
@@ -292,6 +302,29 @@ pub struct CompileArgs {
     #[arg(long, default_value = "10")]
     pub min_windows_version: String,
 
+    /// Windows PE subsystem for `--target windows` builds. One of `auto`
+    /// (default), `console`, `windows`. Ignored on every non-Windows target.
+    ///
+    /// `auto` keeps the import-driven heuristic: a program that imports
+    /// `perry/ui` links as `/SUBSYSTEM:WINDOWS` (GUI), everything else links
+    /// as `/SUBSYSTEM:CONSOLE` so `console.log` reaches the terminal (the
+    /// issue #120 regression guard).
+    ///
+    /// `windows` forces `/SUBSYSTEM:WINDOWS` — the right choice for a GUI
+    /// app that renders its own window (e.g. a Bloom Engine game) but does
+    /// not import `perry/ui`. Without it Windows allocates a console window
+    /// alongside the game on launch.
+    ///
+    /// `console` forces `/SUBSYSTEM:CONSOLE` even for UI programs.
+    ///
+    /// Precedence: this flag wins when set to `console`/`windows`; left at
+    /// `auto` it falls back to `perry.toml [windows] subsystem`, then to the
+    /// import heuristic. The perry.toml fallback is what survives the
+    /// `perry publish` worker round-trip (the dev shell's flags don't
+    /// transfer, but perry.toml is uploaded with `--project`).
+    #[arg(long, default_value = "auto")]
+    pub windows_subsystem: String,
+
     /// HarmonyOS HAP signing: path to the .p12 keystore file. Falls
     /// through CLI flag → `PERRY_HARMONYOS_P12` env var → saved config
     /// (`~/.perry/config.toml`, populated by `perry setup harmonyos`).
@@ -466,6 +499,8 @@ pub struct CompilationContext {
     pub app_metadata: perry_codegen::AppMetadata,
     /// First-resolved directory for each compile package (deduplication across nested node_modules)
     pub compile_package_dirs: HashMap<String, PathBuf>,
+    /// Compile package roots already checked for unsupported Node native addon markers.
+    pub checked_compile_package_native_addon_roots: HashSet<PathBuf>,
     /// #1680 (Phase 2 of #1677): build-time codegen steps declared in the
     /// host `package.json` `perry.codegen`. Each is a shell command run
     /// (in `codegen_dir`) before module collection, so a codegen library
@@ -527,6 +562,13 @@ pub struct CompilationContext {
     /// #303 + `docs/src/platforms/windows-7.md`. Ignored on non-Windows
     /// targets.
     pub min_windows_version: String,
+    /// Resolved Windows PE subsystem override for `--target windows`. One of
+    /// `"auto"` (default — use the `needs_ui` import heuristic), `"console"`,
+    /// or `"windows"`. Merged from `--windows-subsystem` and perry.toml
+    /// `[windows] subsystem` by `validate_windows_subsystem`. Drives the
+    /// `/SUBSYSTEM:` linker flag via `windows_subsystem_needs_ui`. Ignored on
+    /// non-Windows targets.
+    pub windows_subsystem: String,
     /// Issue #444: canonical path of the user-supplied entry TypeScript
     /// file. `collect_modules` compares each module's canonical path
     /// against this to set `is_entry_module` on the lowering context,
@@ -730,6 +772,7 @@ impl CompilationContext {
             fp_contract_mode: perry_codegen::FpContractMode::Off,
             app_metadata: perry_codegen::AppMetadata::default(),
             compile_package_dirs: HashMap::new(),
+            checked_compile_package_native_addon_roots: HashSet::new(),
             codegen_steps: Vec::new(),
             codegen_dir: None,
             type_checker: None,
@@ -743,6 +786,7 @@ impl CompilationContext {
             needs_thread: false,
             cross_module_class_field_types: HashMap::new(),
             min_windows_version: "10".to_string(),
+            windows_subsystem: "auto".to_string(),
             entry_canonical: None,
             extra_stdlib_features: BTreeSet::new(),
             refuse_dynamic_stdlib_dispatch: true,

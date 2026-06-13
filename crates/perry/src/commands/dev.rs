@@ -285,6 +285,7 @@ fn build_once(
         no_codegen: false,
         enable_wasm_runtime: false,
         target: None,
+        libc: None,
         app_bundle_id: None,
         output_type: "executable".to_string(),
         bundle_extensions: None,
@@ -305,6 +306,7 @@ fn build_once(
         emit_sandbox: false,
         lockdown: false,
         min_windows_version: "10".to_string(),
+        windows_subsystem: "auto".to_string(),
         // Phase 2 v7: harmonyos signing flags. `perry dev` is the watch
         // mode for local iteration; unsigned HAPs are fine, fall through
         // to env / saved config.

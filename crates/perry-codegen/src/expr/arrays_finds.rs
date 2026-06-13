@@ -563,6 +563,12 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             let v = lower_expr(ctx, o)?;
             Ok(ctx.block().call(DOUBLE, "js_get_iterator", &[(DOUBLE, &v)]))
         }
+        Expr::GetAsyncIterator(o) => {
+            let v = lower_expr(ctx, o)?;
+            Ok(ctx
+                .block()
+                .call(DOUBLE, "js_get_async_iterator", &[(DOUBLE, &v)]))
+        }
         Expr::ForOfToArray(o) => {
             // #321: materialize an untyped `for...of` receiver into a plain
             // Array. Runtime inspects the value's GC kind (Map → [k,v]
@@ -573,6 +579,15 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             Ok(ctx
                 .block()
                 .call(DOUBLE, "js_for_of_to_array", &[(DOUBLE, &v)]))
+        }
+        Expr::ForAwaitToArray(o) => {
+            let v = lower_expr(ctx, o)?;
+            let undefined = double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
+            Ok(ctx.block().call(
+                DOUBLE,
+                "js_array_from_async",
+                &[(DOUBLE, &v), (DOUBLE, &undefined), (DOUBLE, &undefined)],
+            ))
         }
         Expr::WeakRefDeref(o) => {
             // `ref.deref()` — returns the wrapped target (or undefined if

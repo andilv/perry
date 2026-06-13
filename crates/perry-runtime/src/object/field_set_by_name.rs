@@ -180,6 +180,46 @@ pub extern "C" fn js_object_set_field_by_name(
     key: *const crate::StringHeader,
     value: f64,
 ) {
+    // `Object.prototype["2"] = v` (stringified-index write) makes the index
+    // visible through array hole/OOB reads. Cheap gate: one relaxed flag
+    // load, then an address compare against the cached canonical
+    // Object.prototype; the digit scan only runs on a match (test262
+    // concat/S15.4.4.4_A3_T3).
+    {
+        let raw = (obj as u64 & 0x0000_FFFF_FFFF_FFFF) as usize;
+        if crate::array::object_prototype_addr_matches(raw) && !key.is_null() {
+            if let Some(name) = unsafe { super::has_own_helpers::str_from_string_header(key) } {
+                if !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()) {
+                    crate::array::note_object_prototype_index_write(raw);
+                }
+            }
+        }
+    }
+    // A `Temporal.*` value is an opaque, immutable NaN-boxed cell that is NOT
+    // an `ObjectHeader` — writing an arbitrary property (e.g. test262's
+    // `instance.constructor = …` subclassing probes) must NOT interpret the
+    // cell as an `ObjectHeader` and corrupt its boxed payload (which segfaults
+    // on the next deref). The cell's `temporal_rs` slots are immutable, but a
+    // user-defined *expando* property is legal and lives in the exotic side
+    // table (like Date/RegExp). `obj` still carries its NaN-box tag here
+    // (`0x7FFD…` for a real cell), so route through `exotic_expando_kind_of_value`,
+    // which checks the tag before masking to the cleaned heap address.
+    if let Some((addr, kind @ super::exotic_expando::ExoticKind::Temporal)) =
+        super::exotic_expando::exotic_expando_kind_of_value(f64::from_bits(obj as u64))
+    {
+        if !key.is_null() {
+            unsafe {
+                let name_ptr = (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
+                let name_len = (*key).byte_len as usize;
+                let name = String::from_utf8_lossy(std::slice::from_raw_parts(name_ptr, name_len))
+                    .into_owned();
+                let receiver = f64::from_bits(obj as u64);
+                let _ =
+                    super::exotic_expando::exotic_set_property(addr, kind, &name, value, receiver);
+            }
+        }
+        return;
+    }
     if let Some(addr) =
         crate::typedarray_props::typed_array_addr_from_value(f64::from_bits(obj as u64))
     {
@@ -209,6 +249,25 @@ pub extern "C" fn js_object_set_field_by_name(
                 let name = std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len))
                     .unwrap_or("")
                     .to_string();
+                // Empty-string is a legal accessor key (`set ''(v)`); the
+                // `!name.is_empty()` guard below skips it, so dispatch a
+                // prototype-ref instance setter / constructor-ref static setter
+                // named "" here (Test262 accessor-name-* literal-string-empty).
+                if name.is_empty() {
+                    let recv = f64::from_bits(bits);
+                    if super::class_prototype_ref_id(recv).is_some()
+                        && super::class_registry::class_instance_setter_apply(
+                            class_id, &name, recv, value,
+                        )
+                    {
+                        return;
+                    }
+                    if super::class_registry::class_static_accessor_setter_apply(
+                        class_id, &name, recv, value,
+                    ) {
+                        return;
+                    }
+                }
                 if !name.is_empty() {
                     if name == "name"
                         && !super::class_registry::class_is_key_deleted(class_id, &name)
@@ -222,6 +281,24 @@ pub extern "C" fn js_object_set_field_by_name(
                             .get(&class_id)
                             .is_some_and(|props| props.contains_key(&name))
                     });
+                    // `C.prototype[key] = v` where `key` is an instance
+                    // `set key(v)` accessor defined on the prototype: invoke the
+                    // setter with `this` = the prototype ref. The prototype ref
+                    // and the constructor ref are both INT32-tagged class refs;
+                    // distinguish via `class_prototype_ref_id`. Instance setters
+                    // live in the vtable; static accessors (below) live in the
+                    // constructor ref's table (Test262 accessor-name-inst).
+                    if !has_own_data
+                        && super::class_prototype_ref_id(f64::from_bits(bits)).is_some()
+                        && super::class_registry::class_instance_setter_apply(
+                            class_id,
+                            &name,
+                            f64::from_bits(bits),
+                            value,
+                        )
+                    {
+                        return;
+                    }
                     if !has_own_data
                         && super::class_registry::class_static_accessor_setter_apply(
                             class_id,
@@ -255,12 +332,12 @@ pub extern "C" fn js_object_set_field_by_name(
             return;
         }
     }
-    // #2089: a `Date` is a NaN-boxed pointer to an 8-byte `DateCell`. Setting
-    // an arbitrary property on it (`date.foo = x`) must NOT deref the small
-    // cell as an `ObjectHeader` below (memory corruption). Perry doesn't model
-    // expando properties on Date objects, so treat it as a no-op — the same
-    // observable result as the old value-type representation (a property set
-    // on a primitive number).
+    // #2089: a `Date` is a NaN-boxed pointer to an 8-byte `DateCell`, and a
+    // RegExp is a `RegExpHeader` — neither is an `ObjectHeader`, so a write
+    // must NOT fall through to the object deref below (memory corruption).
+    // Expando properties on these exotic instances live in the side table
+    // (`object::exotic_expando`), honoring accessor descriptors and
+    // attribute writability installed by `Object.defineProperty`.
     {
         let bits = obj as u64;
         let top16 = bits >> 48;
@@ -271,8 +348,28 @@ pub extern "C" fn js_object_set_field_by_name(
         } else {
             0
         };
-        if addr != 0 && crate::date::is_date_cell_addr(addr) {
-            return;
+        if addr != 0 {
+            if let Some(kind) = super::exotic_expando::exotic_expando_kind(addr) {
+                if !key.is_null() {
+                    unsafe {
+                        let mut sso = [0u8; crate::value::SHORT_STRING_MAX_LEN];
+                        if let Some(name_bytes) = crate::string::js_string_key_bytes(
+                            crate::value::JSValue::string_ptr(key as *mut _),
+                            &mut sso,
+                        ) {
+                            if let Ok(name) = std::str::from_utf8(name_bytes) {
+                                let receiver = f64::from_bits(
+                                    crate::value::JSValue::pointer(addr as *const u8).bits(),
+                                );
+                                let _ = super::exotic_expando::exotic_set_property(
+                                    addr, kind, name, value, receiver,
+                                );
+                            }
+                        }
+                    }
+                }
+                return;
+            }
         }
     }
     // Strip NaN-boxing tags if present (defensive: handle POINTER_TAG, UNDEFINED, NULL, etc.)
@@ -431,10 +528,15 @@ pub extern "C" fn js_object_set_field_by_name(
                 let name_len = (*key).byte_len as usize;
                 let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
                 if let Ok(name_str) = std::str::from_utf8(name_bytes) {
+                    // ECMAScript "poison pill" — assigning `caller`/`arguments`
+                    // on any strict-mode function (Perry compiles everything
+                    // strict: declarations, expressions, bound and built-in
+                    // closures, arrows) throws via the %ThrowTypeError%
+                    // accessor's missing setter. A genuine own data prop of
+                    // that name (defineProperty round-trip) still wins.
+                    // Refs test262 13.2-*-s / StrictFunction_restricted-*.
                     if matches!(name_str, "caller" | "arguments")
-                        && crate::closure::closure_is_arrow(
-                            obj as *const crate::closure::ClosureHeader,
-                        )
+                        && !crate::closure::closure_has_own_dynamic_prop(obj as usize, name_str)
                     {
                         crate::fs::validate::throw_type_error_with_code(
                             "Restricted function property assignment",
@@ -464,10 +566,15 @@ pub extern "C" fn js_object_set_field_by_name(
                 let name_len = (*key).byte_len as usize;
                 let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
                 if let Ok(name_str) = std::str::from_utf8(name_bytes) {
+                    // ECMAScript "poison pill" — assigning `caller`/`arguments`
+                    // on any strict-mode function (Perry compiles everything
+                    // strict: declarations, expressions, bound and built-in
+                    // closures, arrows) throws via the %ThrowTypeError%
+                    // accessor's missing setter. A genuine own data prop of
+                    // that name (defineProperty round-trip) still wins.
+                    // Refs test262 13.2-*-s / StrictFunction_restricted-*.
                     if matches!(name_str, "caller" | "arguments")
-                        && crate::closure::closure_is_arrow(
-                            obj as *const crate::closure::ClosureHeader,
-                        )
+                        && !crate::closure::closure_has_own_dynamic_prop(obj as usize, name_str)
                     {
                         crate::fs::validate::throw_type_error_with_code(
                             "Restricted function property assignment",
@@ -508,6 +615,18 @@ pub extern "C" fn js_object_set_field_by_name(
                 get_module_name_from_namespace(crate::value::js_nanbox_pointer(obj as i64));
             if module_name == "buffer.Buffer" && property_name == "poolSize" {
                 super::set_buffer_pool_size(value);
+                return;
+            }
+            // CommonJS module exports are MUTABLE in Node: monkey-patching
+            // like Next.js's `require('node:timers').setImmediate = patched`
+            // must store the override (read back via `vt_get_own_field`)
+            // instead of falling through to the frozen-object throw.
+            if !module_name.is_empty() && property_name != "__module__" {
+                super::native_module::native_namespace_prop_override_store(
+                    &module_name,
+                    property_name,
+                    value,
+                );
                 return;
             }
         }
@@ -1090,5 +1209,44 @@ pub extern "C" fn js_object_set_field_by_name(
             new_keys as usize,
             new_index as u32,
         );
+    }
+}
+
+/// Set `obj[key] = value` as a non-enumerable (but writable + configurable)
+/// own data property. Used by derived-class `super(message)` into a built-in
+/// `Error`/`NativeError`: the spec sets `message` via DefinePropertyOrThrow
+/// with `{ writable: true, enumerable: false, configurable: true }`, whereas an
+/// ordinary assignment would create an enumerable property. (Test262
+/// subclass/.../NativeError/*-message.)
+#[no_mangle]
+pub extern "C" fn js_object_set_field_by_name_nonenum(
+    obj: *mut ObjectHeader,
+    key: *const crate::StringHeader,
+    value: f64,
+) {
+    js_object_set_field_by_name(obj, key, value);
+    // Only ordinary heap objects carry the attrs side-table. Class refs,
+    // TypedArrays, Temporal cells, etc. are handled by `set_field_by_name`'s own
+    // routing and never reach the ordinary enumerable default, so skip them.
+    let bits = obj as u64;
+    if (bits >> 48) == 0x7FFE
+        || crate::value::addr_class::is_handle_band(obj as usize)
+        || key.is_null()
+    {
+        return;
+    }
+    unsafe {
+        if !crate::object::is_valid_obj_ptr(obj as *const u8) {
+            return;
+        }
+        let name_ptr = (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
+        let name_len = (*key).byte_len as usize;
+        if let Ok(name) = std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len)) {
+            crate::object::set_property_attrs(
+                obj as usize,
+                name.to_string(),
+                crate::object::PropertyAttrs::new(true, false, true),
+            );
+        }
     }
 }

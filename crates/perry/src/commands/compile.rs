@@ -71,7 +71,7 @@ use library_search::{
     find_geisterhand_stdlib, find_geisterhand_ui, find_harmonyos_sdk, find_lld_link,
     find_llvm_tool, find_msvc_lib_paths, find_msvc_link_exe, find_perry_windows_sdk,
     find_runtime_library, find_stdlib_library, find_ui_library, find_wasm_host_library,
-    windows_pe_subsystem_flag,
+    windows_default_output_extension, windows_pe_subsystem_flag, windows_subsystem_needs_ui,
 };
 use link::{build_and_run_link, write_link_cache_manifest};
 pub use lock_scan::collect_native_archives_for_lock;
@@ -93,7 +93,10 @@ use resolve::{
     is_in_compile_package, is_in_perry_native_package, is_js_file, parse_native_library_manifest,
     parse_package_specifier, resolve_import,
 };
-use strip_dedup::{strip_duplicate_objects_from_lib, strip_duplicate_objects_from_well_known_lib};
+use strip_dedup::{
+    dedup_native_lib_for_tier3, dedup_runtime_for_tier3, dedup_stdlib_for_tier3,
+    strip_duplicate_objects_from_lib, strip_duplicate_objects_from_well_known_lib,
+};
 use targets::{
     apple_sdk_version, compile_for_android_widget, compile_for_ios_widget, compile_for_wasm,
     compile_for_watchos_widget, compile_for_wearos_tile, find_visionos_swift_runtime,
@@ -118,6 +121,62 @@ impl NativeObjectArtifact {
     fn materialized_bytes(&self) -> usize {
         self.bytes.as_ref().map_or(0, Vec::len)
     }
+}
+
+fn native_object_file_stem(module_name: &str) -> String {
+    let mut stem = module_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+
+    if stem.is_empty() {
+        stem.push('_');
+    }
+
+    #[cfg(windows)]
+    if is_windows_reserved_file_stem(&stem) {
+        stem.push('_');
+    }
+
+    stem
+}
+
+#[cfg(windows)]
+fn is_windows_reserved_file_stem(stem: &str) -> bool {
+    let lower = stem.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "con"
+            | "prn"
+            | "aux"
+            | "nul"
+            | "com1"
+            | "com2"
+            | "com3"
+            | "com4"
+            | "com5"
+            | "com6"
+            | "com7"
+            | "com8"
+            | "com9"
+            | "lpt1"
+            | "lpt2"
+            | "lpt3"
+            | "lpt4"
+            | "lpt5"
+            | "lpt6"
+            | "lpt7"
+            | "lpt8"
+            | "lpt9"
+    )
 }
 
 fn canonical_class_source_prefix(
@@ -151,6 +210,8 @@ mod tests {
             methods: Vec::new(),
             getters: Vec::new(),
             setters: Vec::new(),
+            static_accessor_names: Vec::new(),
+            static_accessor_fn_ids: Vec::new(),
             static_fields: Vec::new(),
             static_methods: Vec::new(),
             computed_members: Vec::new(),
@@ -175,6 +236,27 @@ mod tests {
             "node_modules_rxjs_src_internal_Observable_ts"
         );
     }
+
+    #[test]
+    fn native_object_file_stem_sanitizes_module_names() {
+        assert_eq!(
+            native_object_file_stem("table-parser/lib/index"),
+            "table_parser_lib_index"
+        );
+        assert_eq!(native_object_file_stem("///"), "_");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_object_file_stem_avoids_windows_reserved_names() {
+        assert_eq!(native_object_file_stem("con"), "con_");
+        assert_eq!(
+            native_object_file_stem("connected-domain"),
+            "connected_domain"
+        );
+        assert_eq!(native_object_file_stem("aux"), "aux_");
+        assert_eq!(native_object_file_stem("COM1"), "COM1_");
+    }
 }
 
 // `inject_ios_deeplinks`, `inject_google_auth_info_plist`, and
@@ -194,6 +276,47 @@ pub fn run(
     verbose: u8,
 ) -> Result<CompileResult> {
     run_with_parse_cache(args, None, format, use_color, verbose)
+}
+
+/// Fold the `--libc <glibc|musl>` flag into the effective `--target` (#4826).
+///
+/// `--libc musl` upgrades a Linux target to its fully-static musl variant:
+/// `linux`/`linux-x86_64`/native-host-default → `linux-musl`, and
+/// `linux-aarch64`/`linux-arm64` → `linux-aarch64-musl`. It is a no-op for an
+/// already-musl target. `glibc`/`gnu` (or no flag) leave the target untouched.
+/// `--libc musl` against a non-Linux target is a hard error rather than a
+/// silently-ignored flag.
+pub(crate) fn apply_libc_to_target(
+    target: Option<String>,
+    libc: Option<&str>,
+) -> Result<Option<String>> {
+    let libc = match libc {
+        None => return Ok(target),
+        Some(l) => l.trim().to_ascii_lowercase(),
+    };
+    match libc.as_str() {
+        // Default / explicit glibc: nothing to do.
+        "glibc" | "gnu" | "" => Ok(target),
+        "musl" => match target.as_deref() {
+            // Default (native host) or explicit x86_64 Linux → x86_64 musl.
+            None | Some("linux") | Some("linux-x86_64") => Ok(Some("linux-musl".to_string())),
+            Some("linux-aarch64") | Some("linux-arm64") => {
+                Ok(Some("linux-aarch64-musl".to_string()))
+            }
+            // Already a musl target — idempotent.
+            Some("linux-musl") | Some("linux-x86_64-musl") | Some("linux-aarch64-musl") => {
+                Ok(target)
+            }
+            Some(other) => anyhow::bail!(
+                "--libc musl only applies to Linux targets, but --target is \
+                 '{other}'. Drop --libc musl, or build a Linux target \
+                 (e.g. --target linux)."
+            ),
+        },
+        other => {
+            anyhow::bail!("unknown --libc value '{other}'. Supported: glibc (default) or musl.")
+        }
+    }
 }
 
 fn object_cache_project_root(input: &Path, fallback_project_root: &Path) -> PathBuf {
@@ -233,6 +356,12 @@ pub fn run_with_parse_cache(
     use_color: bool,
     verbose: u8,
 ) -> Result<CompileResult> {
+    // #4826: fold `--libc musl` into the effective target up-front (before any
+    // downstream code reads `args.target`) so the rest of the pipeline only
+    // ever sees the concrete `linux-musl` triple family.
+    let mut args = args;
+    args.target = apply_libc_to_target(args.target.take(), args.libc.as_deref())?;
+
     // #835 + #846: clear the codegen-side FFI provenance set up-front
     // so any leftover entries from a prior `perry dev` rebuild (or a
     // failed-build early-return that skipped our drain below) don't
@@ -1010,6 +1139,17 @@ pub fn run_with_parse_cache(
                             if let Some(source_exports) = all_module_exports.get(&source_path_str) {
                                 let current_exports = all_module_exports.get(&path_str);
                                 for (name, origin) in source_exports {
+                                    // ESM semantics: `export * from "src"`
+                                    // re-exports every named export EXCEPT
+                                    // `default`. Leaking it made barrels
+                                    // claim a default binding they never
+                                    // define, which breaks the #4872
+                                    // has-default probe that decides whether
+                                    // a default import can bind to
+                                    // `perry_fn_<src>__default`.
+                                    if name == "default" {
+                                        continue;
+                                    }
                                     let already_exists = current_exports
                                         .map(|e| e.contains_key(name))
                                         .unwrap_or(false);
@@ -2067,7 +2207,10 @@ pub fn run_with_parse_cache(
                     }
                 };
                 for import in &hir_module.imports {
-                    if import.is_dynamic || import.type_only {
+                    // `is_deferred_require`: a function-local `require('S')`
+                    // (lazy in Node). S must NOT chain into this module's init
+                    // — it inits only when the require shim is actually called.
+                    if import.is_dynamic || import.type_only || import.is_deferred_require {
                         continue;
                     }
                     if let Some(resolved) = &import.resolved_path {
@@ -2294,8 +2437,36 @@ pub fn run_with_parse_cache(
                     .find(|nl| nl.module == import.source);
 
                 for spec in &import.specifiers {
-                    // Handle namespace imports (import * as X)
-                    if let perry_hir::ImportSpecifier::Namespace { local } = spec {
+                    // Handle namespace imports (import * as X).
+                    //
+                    // Issue #4872: a DEFAULT import of a compiled module that
+                    // has NO `default` export gets the same treatment. The
+                    // CJS wrap lowers every `require('X')` to `import _req_N
+                    // from 'X'`; when X resolves to an ESM barrel with only
+                    // named exports (rxjs's src/index.ts, uid's index.mjs) or
+                    // to a type-only interface surface with no exports at all
+                    // (nestjs dist `*.interface.js`), there is no
+                    // `perry_fn_<src>__default` symbol for the consumer to
+                    // bind — the old fall-through registered the local as a
+                    // callable function import and the link died on
+                    // `__perry_wrap_perry_fn_<src>__default`. Node's
+                    // `require(esm)` semantics hand back the module namespace
+                    // object, so route the local through the namespace
+                    // machinery: member reads resolve per-export to origin
+                    // symbols, and a whole-value read materializes the
+                    // namespace object (empty for zero-export modules).
+                    let namespace_like_local: Option<&String> = match spec {
+                        perry_hir::ImportSpecifier::Namespace { local } => Some(local),
+                        perry_hir::ImportSpecifier::Default { local }
+                            if !all_module_exports
+                                .get(&resolved_path_str)
+                                .is_some_and(|exports| exports.contains_key("default")) =>
+                        {
+                            Some(local)
+                        }
+                        _ => None,
+                    };
+                    if let Some(local) = namespace_like_local {
                         namespace_imports.push(local.clone());
                         // Register all exports from the source module
                         if let Some(exports) = all_module_exports.get(&resolved_path_str) {
@@ -2310,10 +2481,11 @@ pub fn run_with_parse_cache(
                                 // (`export { default as foo }`) needs the
                                 // codegen to call `perry_fn_<origin>__default`
                                 // when the consumer writes `ns.foo()`.
-                                if let Some(origin_name) = all_module_export_origin_names
+                                let resolved_origin_name = all_module_export_origin_names
                                     .get(&resolved_path_str)
                                     .and_then(|m| m.get(export_name))
-                                {
+                                    .cloned();
+                                if let Some(ref origin_name) = resolved_origin_name {
                                     if origin_name != export_name {
                                         import_function_origin_names
                                             .insert(export_name.clone(), origin_name.clone());
@@ -2349,7 +2521,30 @@ pub fn run_with_parse_cache(
                                 // the closure with `args`. Mirrors the
                                 // named-import branch at the var-detection
                                 // arm below.
-                                if exported_var_names.contains(&key) {
+                                //
+                                // Issue #4841: when the namespace member is a
+                                // re-export of a CJS submodule's `default`
+                                // (`import sfy from './sfy'; export { sfy }`,
+                                // where `./sfy` is `module.exports = function`),
+                                // the origin module records the var under its
+                                // "default" suffix — NOT the consumer-visible
+                                // member name. Probe both keys (mirrors the
+                                // named-import arm) so the var-vs-function
+                                // classification fires; otherwise `ns.sfy` takes
+                                // the function path and wraps the default getter
+                                // in a singleton closure, so `ns.sfy(args)`
+                                // RETURNS the function value instead of being it
+                                // (Stripe's `qs.stringify(...)` returned the qs
+                                // function ⇒ `.replace is not a function`).
+                                let origin_key_under_origin_name = resolved_origin_name
+                                    .as_ref()
+                                    .map(|n| (origin_path.clone(), n.clone()));
+                                if exported_var_names.contains(&key)
+                                    || origin_key_under_origin_name
+                                        .as_ref()
+                                        .map(|k| exported_var_names.contains(k))
+                                        .unwrap_or(false)
+                                {
                                     imported_vars.insert(export_name.clone());
                                 }
                                 if let Some(class) = exported_classes.get(&key) {
@@ -3851,11 +4046,7 @@ pub fn run_with_parse_cache(
             } else {
                 (None, None)
             };
-            let obj_name = hir_module
-                .name
-                .replace(|c: char| !c.is_alphanumeric() && c != '_', "_")
-                .trim_matches('_')
-                .to_string();
+            let obj_name = native_object_file_stem(&hir_module.name);
             // In bitcode mode the bytes are .ll text; use .ll extension.
             let ext = if bitcode_link { "ll" } else { "o" };
             let obj_path = object_output_dir.join(format!("{}.{}", obj_name, ext));
@@ -3993,21 +4184,24 @@ pub fn run_with_parse_cache(
         .map(NativeObjectArtifact::materialized_bytes)
         .sum();
 
-    let write_results: Vec<Result<(), std::io::Error>> = artifacts
+    let write_results: Vec<Result<(), (PathBuf, std::io::Error)>> = artifacts
         .par_iter()
         .filter_map(|artifact| {
-            artifact
-                .bytes
-                .as_ref()
-                .map(|bytes| fs::write(&artifact.path, bytes))
+            artifact.bytes.as_ref().map(|bytes| {
+                fs::write(&artifact.path, bytes).map_err(|err| (artifact.path.clone(), err))
+            })
         })
         .collect();
 
     // Bail on first write failure (I/O errors are usually disk-full /
     // permission, not per-file recoverable).
     for r in write_results {
-        if let Err(e) = r {
-            return Err(e.into());
+        if let Err((path, e)) = r {
+            return Err(anyhow!(
+                "failed to write object file {}: {}",
+                path.display(),
+                e
+            ));
         }
     }
 
@@ -4263,8 +4457,9 @@ pub fn run_with_parse_cache(
             .or_else(|| find_runtime_library(target.as_deref()).ok());
         let stdlib_lib_path = stdlib_lib_resolved.clone();
         // Check if stdlib will be linked - if so, it provides perry_runtime symbols (no stubs needed)
-        let target_is_windows = matches!(target.as_deref(), Some("windows"))
-            || (cfg!(target_os = "windows") && target.is_none());
+        let target_is_windows =
+            matches!(target.as_deref(), Some("windows") | Some("windows-winui"))
+                || (cfg!(target_os = "windows") && target.is_none());
         let will_link_stdlib = (ctx.needs_stdlib || target_is_windows) && stdlib_lib_path.is_some();
         // Issue #76 — when the wasm host is
         // being linked, scan its archive so the `perry_wasm_host_*` symbols
@@ -4309,9 +4504,9 @@ pub fn run_with_parse_cache(
             target.as_deref(),
             Some("harmonyos") | Some("harmonyos-simulator")
         );
-        let is_linux = matches!(target.as_deref(), Some("linux"))
+        let is_linux = matches!(target.as_deref(), Some(t) if t.starts_with("linux"))
             || (!cfg!(target_os = "macos") && !cfg!(target_os = "windows") && target.is_none());
-        let is_windows = matches!(target.as_deref(), Some("windows"))
+        let is_windows = matches!(target.as_deref(), Some("windows") | Some("windows-winui"))
             || (cfg!(target_os = "windows") && target.is_none());
         // Symbol prefix depends on object format:
         // Mach-O targets (macOS, iOS, watchOS, tvOS): nm shows `_` prefix
@@ -4616,7 +4811,34 @@ pub fn run_with_parse_cache(
     // fields, not `&CompileArgs`.
     let input_path_owned: PathBuf = args.input.clone();
     let app_bundle_id_owned: Option<String> = args.app_bundle_id.clone();
-    let exe_path = args.output.unwrap_or_else(|| {
+    let exe_path = match args.output {
+        // #4771: a user-supplied `-o NAME` without an extension won't launch
+        // from PowerShell/cmd on a Windows target (and `.dll`/`.lib` are the
+        // expected library shapes). Default the extension to the
+        // target-appropriate one unless the user already gave one (e.g.
+        // `-o app.appx` is respected verbatim). Non-Windows targets keep the
+        // bare name — Unix executables are conventionally extension-less.
+        Some(p) => {
+            let is_windows_output =
+                matches!(target.as_deref(), Some("windows") | Some("windows-winui"))
+                    || (target.is_none() && cfg!(target_os = "windows"));
+            if is_windows_output && p.extension().is_none() {
+                p.with_extension(windows_default_output_extension(is_dylib, is_staticlib))
+            } else {
+                p
+            }
+        }
+        None => default_output_path(is_dylib, is_staticlib, target.as_deref(), stem),
+    };
+
+    // The default output path when no `-o` is given. Extracted to a free fn so
+    // the `-o`-provided extension-defaulting above stays readable.
+    fn default_output_path(
+        is_dylib: bool,
+        is_staticlib: bool,
+        target: Option<&str>,
+        stem: &str,
+    ) -> PathBuf {
         if is_dylib {
             #[cfg(target_os = "macos")]
             {
@@ -4630,30 +4852,27 @@ pub fn run_with_parse_cache(
             // #1088 — Windows hosts expect `.lib`; everywhere else uses
             // the Unix `lib<stem>.a` convention so the archive is reachable
             // from `-l<stem>` at the host's link step.
-            if matches!(target.as_deref(), Some("windows"))
+            if matches!(target, Some("windows") | Some("windows-winui"))
                 || (target.is_none() && cfg!(target_os = "windows"))
             {
                 PathBuf::from(format!("{}.lib", stem))
             } else {
                 PathBuf::from(format!("lib{}.a", stem))
             }
-        } else if matches!(
-            target.as_deref(),
-            Some("harmonyos") | Some("harmonyos-simulator")
-        ) {
+        } else if matches!(target, Some("harmonyos") | Some("harmonyos-simulator")) {
             // HarmonyOS apps ship as .so loaded by the ArkTS runtime via
             // napi_module_register — there is no standalone executable
             // shipping shape. `lib` prefix matches the dlopen name used by
             // the generated ArkTS shim (`import entry from 'libapp.so'`).
             PathBuf::from(format!("lib{}.so", stem))
-        } else if matches!(target.as_deref(), Some("windows"))
+        } else if matches!(target, Some("windows") | Some("windows-winui"))
             || (target.is_none() && cfg!(target_os = "windows"))
         {
             PathBuf::from(format!("{}.exe", stem))
         } else {
             PathBuf::from(stem)
         }
-    });
+    }
 
     if !failed_modules.is_empty() {
         // The loud failure summary + abort already ran earlier (right
@@ -4837,9 +5056,9 @@ pub fn run_with_parse_cache(
         target.as_deref(),
         Some("harmonyos") | Some("harmonyos-simulator")
     );
-    let is_linux = matches!(target.as_deref(), Some("linux"))
+    let is_linux = matches!(target.as_deref(), Some(t) if t.starts_with("linux"))
         || (target.is_none() && cfg!(target_os = "linux"));
-    let _is_windows = matches!(target.as_deref(), Some("windows"))
+    let _is_windows = matches!(target.as_deref(), Some("windows") | Some("windows-winui"))
         || (target.is_none() && cfg!(target_os = "windows"));
     // is_watchos / is_tvos are defined below (near the per-platform link step).
     // The is_cross_* bindings used to live here, but they're now derived
@@ -4852,8 +5071,9 @@ pub fn run_with_parse_cache(
     // emits `perry_module_init` instead of `main` (see is_dylib branch in
     // codegen/entry.rs, which now also covers `staticlib`).
     if is_staticlib {
-        let is_windows_target = matches!(target.as_deref(), Some("windows"))
-            || (target.is_none() && cfg!(target_os = "windows"));
+        let is_windows_target =
+            matches!(target.as_deref(), Some("windows") | Some("windows-winui"))
+                || (target.is_none() && cfg!(target_os = "windows"));
         // Best-effort: drop a stale archive first so `ar` doesn't append to a
         // previous build's contents.
         let _ = fs::remove_file(&exe_path);

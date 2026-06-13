@@ -30,13 +30,44 @@ use super::{
     parse_package_specifier, CompilationContext, JsModule, ParseCache,
 };
 
+mod create_require_transform;
 mod crypto_ns;
+mod dynamic_glob;
+mod native_addon;
 mod parse_error;
+#[cfg(test)]
+mod tests;
 
+use create_require_transform::transform_create_require_literal_requires;
 use crypto_ns::module_uses_global_crypto_namespace;
+use dynamic_glob::expand_dynamic_import_glob;
+use native_addon::refuse_compile_package_native_addon;
 use parse_error::annotate_parse_error;
 
 const MAX_CROSS_MODULE_INLINE_PRIOR_MODULES: usize = 128;
+
+/// #5009: build the bare-name → literal map perry-hir lowering consults to fold
+/// `process.env.<NAME>` reads (`perry_hir::env_define_lookup`). Strips the
+/// `process.env.` prefix the `perry.define` keys carry and converts each
+/// [`super::DefineValue`] to the matching [`perry_hir::EnvDefine`]. Keys that
+/// aren't `process.env.*` are skipped (only env defines are honored today).
+fn env_defines_for_lowering(
+    define: &HashMap<String, super::DefineValue>,
+) -> HashMap<String, perry_hir::EnvDefine> {
+    define
+        .iter()
+        .filter_map(|(key, val)| {
+            let name = key.strip_prefix("process.env.")?;
+            let ev = match val {
+                super::DefineValue::Str(s) => perry_hir::EnvDefine::Str(s.clone()),
+                super::DefineValue::Bool(b) => perry_hir::EnvDefine::Bool(*b),
+                super::DefineValue::Number(n) => perry_hir::EnvDefine::Num(*n),
+                super::DefineValue::Null => perry_hir::EnvDefine::Null,
+            };
+            Some((name.to_string(), ev))
+        })
+        .collect()
+}
 
 /// Issue #818: scan a JS module's source for static ESM imports /
 /// re-exports / string-literal dynamic imports, resolve each one
@@ -185,61 +216,6 @@ pub(super) fn known_node_submodule_key(source: &str) -> Option<&'static str> {
     }
 }
 
-/// #1674 sub-part B: expand a dynamic-`import()` glob pattern
-/// (`<prefix>*<suffix>`, where `prefix` is a relative, directory-anchored
-/// path) into concrete relative specifiers by reading the importing module's
-/// directory. Each returned specifier equals the string the runtime template
-/// produces (`prefix_dir + filename`), so the compile-time candidate keys match
-/// the runtime dispatch arg exactly. Returns specifiers sorted for determinism.
-fn expand_dynamic_import_glob(
-    importing_file: &str,
-    prefix: &str,
-    suffix: &str,
-    cap: usize,
-) -> Vec<String> {
-    // Split the prefix into its directory part (through the last '/') and the
-    // leading filename fragment that survivors must start with.
-    let last_slash = match prefix.rfind('/') {
-        Some(i) => i,
-        None => return Vec::new(),
-    };
-    let prefix_dir = &prefix[..=last_slash]; // e.g. "./plugins/" or "./"
-    let file_prefix = &prefix[last_slash + 1..]; // e.g. "" or "locale_"
-
-    let importing_dir = std::path::Path::new(importing_file)
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let glob_dir = importing_dir.join(prefix_dir);
-
-    let entries = match std::fs::read_dir(&glob_dir) {
-        Ok(e) => e,
-        Err(_) => return Vec::new(),
-    };
-    let min_len = file_prefix.len() + suffix.len();
-    let mut out: Vec<String> = Vec::new();
-    for entry in entries.flatten() {
-        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-            continue;
-        }
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        // The wildcard must match a non-empty middle: `name` strictly longer
-        // than `file_prefix + suffix`, and bracketed by them.
-        if name.len() <= min_len || !name.starts_with(file_prefix) || !name.ends_with(suffix) {
-            continue;
-        }
-        let candidate = format!("{prefix_dir}{name}");
-        if !out.contains(&candidate) {
-            out.push(candidate);
-        }
-        if out.len() > cap {
-            break;
-        }
-    }
-    out.sort();
-    out
-}
-
 /// Collect all modules to compile (transitive closure of imports)
 pub(super) fn collect_modules(
     entry_path: &PathBuf,
@@ -383,16 +359,15 @@ fn collect_module_one(
     // surfaces as an unsupported-module error rather than silently running).
     let should_use_js_runtime =
         (is_js_file(&canonical) && !is_in_compiled_pkg && is_in_node_modules)
-            || is_declaration_file(&canonical)
-            || is_json;
+            || is_declaration_file(&canonical);
 
-    // Skip JSON files — they're data, not code (imported via `with { type: "json" }`)
-    if is_json {
-        return Ok(ModuleDiscovery {
-            finish: None,
-            children: pending,
-        });
-    }
+    // #348 follow-up: JSON module imports (`import data from "./x.json"`,
+    // optionally with `with { type: "json" }`) are NOT skipped — they compile
+    // to a native module whose default export is the parsed data (synthesized
+    // as `export default <json>;` just below). Previously JSON was handed to
+    // the (now-removed) JS runtime / skipped outright, leaving the default
+    // import bound to the empty-module sentinel — which broke cli-boxes (and
+    // thus ink's `borderStyle` box-drawing).
 
     if should_use_js_runtime {
         // Skip declaration files - they're just type information
@@ -489,6 +464,26 @@ fn collect_module_one(
     // It's a TypeScript file to compile natively
     let raw_source = fs::read_to_string(&canonical)
         .map_err(|e| anyhow!("Failed to read {}: {}", canonical.display(), e))?;
+    // JSON module import: turn the data file into a native ESM module whose
+    // default export is the parsed value. JSON is a syntactic subset of a JS
+    // expression, so `export default <json>;` parses and lowers like any other
+    // module. Validate as JSON first so a malformed file yields a clear error
+    // rather than a confusing TS parse failure on the synthesized source.
+    let raw_source = if is_json {
+        if let Err(e) = serde_json::from_str::<serde_json::Value>(&raw_source) {
+            return Err(anyhow!(
+                "Failed to parse JSON module {}: {}",
+                canonical.display(),
+                e
+            ));
+        }
+        format!("export default {};\n", raw_source.trim())
+    } else {
+        raw_source
+    };
+    if is_in_compiled_pkg {
+        refuse_compile_package_native_addon(ctx, &canonical)?;
+    }
 
     // Issue #348: when a `compilePackages` target ships CommonJS (e.g. React
     // 18's `module.exports = require('./cjs/react.production.min.js')`),
@@ -506,10 +501,11 @@ fn collect_module_one(
     let was_cjs_wrapped =
         (is_in_compiled_pkg || !is_in_node_modules) && super::cjs_wrap::is_commonjs(&raw_source);
     let source = if was_cjs_wrapped {
-        super::cjs_wrap::wrap_commonjs(&raw_source, &canonical)
+        super::cjs_wrap::wrap_commonjs_for_target(&raw_source, &canonical, target)
     } else {
         raw_source
     };
+    let source = transform_create_require_literal_requires(&source, &ctx.compile_packages);
 
     // Note (#686): we no longer hash source bytes here. The object cache key
     // is now keyed on a post-transform HIR fingerprint computed inside the
@@ -643,6 +639,14 @@ fn collect_module_one(
     // immediately after the lower call so it can't leak to subsequent
     // unrelated work on the same thread.
     perry_hir::set_compile_packages_override(ctx.compile_packages.clone());
+    // #5009: install the `process.env.<NAME>` build-time defines so a static
+    // `process.env.X` read folds to its `perry.define` literal at lowering —
+    // esbuild-style, in every context and independent of tree-shaking. Keyed
+    // by the bare env var name (the `process.env.` prefix stripped). Cleared
+    // after the lower below (rayon-safe). The runtime-env default
+    // (`NODE_ENV → "production"` for node_modules) stays in the tree-shake
+    // `env_fold` pass; only explicit defines are folded here.
+    perry_hir::set_env_defines(env_defines_for_lowering(&ctx.define));
     // #503: re-install the dynamic-stdlib-dispatch config on the current
     // thread before each lower. Driver may be a rayon worker that didn't
     // inherit the thread-local set on the main thread by `compile.rs`.
@@ -699,6 +703,7 @@ fn collect_module_one(
     perry_hir::clear_compile_packages_override();
     perry_hir::clear_current_module_source();
     perry_hir::clear_precompile_state();
+    perry_hir::clear_env_defines();
     // #2309: drain refusals deferred during this lower and tag them with the
     // canonical module path so the post-collection prune can decide whether
     // they survive. Done before the `?` below so a non-deferrable error can't
@@ -865,10 +870,20 @@ fn collect_module_one(
                     worker_path_sets.push(set);
                 }
                 perry_hir::Resolution::Unresolved(reason) => {
-                    dyn_errors.push(format!(
-                        "worker_threads Worker in module {}: {}",
-                        module_name, reason
-                    ));
+                    // Real-world packages (e.g. Next.js build-time worker
+                    // pools) construct Workers on paths that are never hit
+                    // when the compiled program runs. Warn and let codegen
+                    // lower this WorkerNew to a runtime throw instead of
+                    // failing the whole compile. Push an empty set to keep
+                    // the fill pass aligned with resolved siblings.
+                    if matches!(format, OutputFormat::Text) {
+                        eprintln!(
+                            "  Warning: worker_threads Worker in module {}: {} — \
+                             this Worker will throw if constructed at runtime",
+                            module_name, reason
+                        );
+                    }
+                    worker_path_sets.push(Vec::new());
                 }
             }
         }
@@ -934,6 +949,7 @@ fn collect_module_one(
             type_only: false,
             is_dynamic: true,
             is_dynamic_target: false,
+            is_deferred_require: false,
         });
     }
 
@@ -1394,6 +1410,38 @@ fn collect_module_one(
         }
     }
 
+    // Next.js lazy-require: the CJS→ESM wrap names a binding `_lazyreq_N` when
+    // every `require('S')` call site is inside a function body (lazy in Node).
+    // Tag the import so `classify_eager_modules` leaves the target Deferred —
+    // matching Node, which only loads such a module when the enclosing function
+    // runs (e.g. jsonwebtoken, required only inside Next.js's request handlers).
+    // The require shim triggers the target's `__init` on first `require()`, so
+    // an over-eager classification is self-correcting at runtime. Limited to
+    // Perry-compiled (`NativeCompiled`) targets — native stdlib / V8 modules
+    // have their own init paths.
+    if was_cjs_wrapped {
+        for import in &mut hir_module.imports {
+            if import.type_only
+                || import.is_dynamic
+                || import.is_native
+                || import.module_kind != perry_hir::ModuleKind::NativeCompiled
+            {
+                continue;
+            }
+            let is_lazy = import.specifiers.iter().any(|s| {
+                let local = match s {
+                    perry_hir::ImportSpecifier::Default { local } => local,
+                    perry_hir::ImportSpecifier::Namespace { local } => local,
+                    perry_hir::ImportSpecifier::Named { local, .. } => local,
+                };
+                local.starts_with("_lazyreq_")
+            });
+            if is_lazy {
+                import.is_deferred_require = true;
+            }
+        }
+    }
+
     // Process re-exports
     for export in &hir_module.exports {
         let source = match export {
@@ -1838,195 +1886,4 @@ fn collect_module_finish(
     });
     ctx.native_modules.insert(canonical, hir_module);
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{collect_modules, expand_dynamic_import_glob};
-    use crate::commands::compile::CompilationContext;
-    use crate::commands::progress::VerboseProgress;
-    use crate::OutputFormat;
-    use std::collections::HashSet;
-
-    #[test]
-    fn expands_directory_files_matching_suffix() {
-        // #1674 sub-B: glob `./plugins/*.ts` against the importing module's dir.
-        let base = std::env::temp_dir().join(format!("perry_glob_test_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let plugins = base.join("plugins");
-        std::fs::create_dir_all(&plugins).unwrap();
-        std::fs::write(plugins.join("alpha.ts"), "export const x=1;").unwrap();
-        std::fs::write(plugins.join("beta.ts"), "export const x=2;").unwrap();
-        std::fs::write(plugins.join("notes.md"), "ignored: wrong suffix").unwrap();
-        let importing = base.join("main.ts");
-        std::fs::write(&importing, "").unwrap();
-
-        let got = expand_dynamic_import_glob(importing.to_str().unwrap(), "./plugins/", ".ts", 64);
-        assert_eq!(
-            got,
-            vec![
-                "./plugins/alpha.ts".to_string(),
-                "./plugins/beta.ts".to_string()
-            ]
-        );
-
-        // A directory with no matches yields nothing (→ rejected promise).
-        let none =
-            expand_dynamic_import_glob(importing.to_str().unwrap(), "./plugins/", ".mjs", 64);
-        assert!(none.is_empty());
-
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn dependency_is_transformed_before_importer_for_cross_module_inline() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path();
-        let dep = root.join("dep.ts");
-        let entry = root.join("entry.ts");
-
-        std::fs::write(
-            &dep,
-            r#"
-export class Dep {
-  marker(): number {
-    return 424242;
-  }
-}
-"#,
-        )
-        .expect("write dep");
-        std::fs::write(
-            &entry,
-            r#"
-import { Dep } from "./dep";
-
-const dep = new Dep();
-const got = dep.marker();
-console.log(got);
-"#,
-        )
-        .expect("write entry");
-
-        let mut ctx = CompilationContext::new(root.to_path_buf());
-        ctx.entry_canonical = Some(entry.canonicalize().unwrap());
-        let mut visited = HashSet::new();
-        let mut next_class_id: perry_hir::ClassId = 1;
-        let progress = VerboseProgress::new(OutputFormat::Text, 0);
-
-        collect_modules(
-            &entry,
-            &mut ctx,
-            &mut visited,
-            OutputFormat::Text,
-            None,
-            &mut next_class_id,
-            false,
-            &progress,
-            None,
-        )
-        .expect("collect modules");
-
-        let entry_hir = ctx
-            .native_modules
-            .get(&entry.canonicalize().unwrap())
-            .expect("entry module collected");
-        let entry_debug = format!("{entry_hir:?}");
-
-        assert!(
-            entry_debug.contains("424242"),
-            "entry HIR should contain the dependency method literal after cross-module inlining:\n{entry_debug}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn bun_compile_package_js_esm_realpath_parses_as_module() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path();
-        let node_modules = root.join("node_modules");
-        let glob_pkg = node_modules.join(".bun/glob@13.0.5/node_modules/glob");
-        let esm_dir = glob_pkg.join("dist/esm");
-        std::fs::create_dir_all(&esm_dir).expect("create glob esm dir");
-        std::fs::write(
-            glob_pkg.join("package.json"),
-            r#"{
-  "name": "glob",
-  "version": "13.0.5",
-  "type": "module",
-  "exports": {
-    ".": {
-      "import": {
-        "default": "./dist/esm/index.min.js"
-      },
-      "require": {
-        "default": "./dist/commonjs/index.min.js"
-      }
-    }
-  },
-  "module": "./dist/esm/index.min.js",
-  "main": "./dist/commonjs/index.min.js"
-}"#,
-        )
-        .expect("write package json");
-        std::fs::write(esm_dir.join("package.json"), r#"{ "type": "module" }"#)
-            .expect("write esm package json");
-        std::fs::write(esm_dir.join("dep.js"), "export const dep=41;\n").expect("write dep");
-        std::fs::write(
-            esm_dir.join("index.min.js"),
-            r#"import{dep}from"./dep.js";const value=dep+1;export{value};"#,
-        )
-        .expect("write index");
-
-        std::os::unix::fs::symlink(
-            ".bun/glob@13.0.5/node_modules/glob",
-            node_modules.join("glob"),
-        )
-        .expect("symlink glob");
-
-        let entry = root.join("entry.ts");
-        std::fs::write(
-            &entry,
-            r#"
-import { value } from "glob";
-console.log(value);
-"#,
-        )
-        .expect("write entry");
-
-        let mut ctx = CompilationContext::new(root.to_path_buf());
-        ctx.compile_packages.insert("glob".to_string());
-        ctx.entry_canonical = Some(entry.canonicalize().unwrap());
-        let mut visited = HashSet::new();
-        let mut next_class_id: perry_hir::ClassId = 1;
-        let progress = VerboseProgress::new(OutputFormat::Text, 0);
-
-        collect_modules(
-            &entry,
-            &mut ctx,
-            &mut visited,
-            OutputFormat::Text,
-            None,
-            &mut next_class_id,
-            false,
-            &progress,
-            None,
-        )
-        .expect("collect modules");
-
-        let canonical_index = esm_dir.join("index.min.js").canonicalize().unwrap();
-        let canonical_dep = esm_dir.join("dep.js").canonicalize().unwrap();
-        assert!(
-            ctx.native_modules.contains_key(&canonical_index),
-            "glob ESM entry should be compiled natively from Bun realpath"
-        );
-        assert!(
-            ctx.native_modules.contains_key(&canonical_dep),
-            "glob ESM dependency should be compiled natively from Bun realpath"
-        );
-        assert!(
-            ctx.js_modules.is_empty(),
-            "compilePackages ESM files should not route through JS runtime"
-        );
-    }
 }

@@ -374,6 +374,7 @@ pub fn check_escapes_in_expr(
         | Expr::IsUndefinedOrBareNan(operand)
         | Expr::ParseFloat(operand)
         | Expr::ObjectKeys(operand)
+        | Expr::ForInKeys(operand)
         | Expr::ObjectValues(operand)
         | Expr::ObjectEntries(operand)
         | Expr::SetSize(operand)
@@ -395,7 +396,9 @@ pub fn check_escapes_in_expr(
         | Expr::JsonIsRawJson(operand)
         | Expr::IteratorToArray(operand)
         | Expr::GetIterator(operand)
+        | Expr::GetAsyncIterator(operand)
         | Expr::ForOfToArray(operand)
+        | Expr::ForAwaitToArray(operand)
         | Expr::WeakRefNew(operand)
         | Expr::WeakRefDeref(operand)
         | Expr::FinalizationRegistryNew(operand)
@@ -665,12 +668,16 @@ pub fn check_escapes_in_expr(
             method,
             body,
             headers,
+            headers_dynamic,
         } => {
             check_escapes_in_expr(url, candidates, classes, escaped);
             check_escapes_in_expr(method, candidates, classes, escaped);
             check_escapes_in_expr(body, candidates, classes, escaped);
             for (_, v) in headers {
                 check_escapes_in_expr(v, candidates, classes, escaped);
+            }
+            if let Some(hd) = headers_dynamic {
+                check_escapes_in_expr(hd, candidates, classes, escaped);
             }
         }
         Expr::SuperCall(args)
@@ -817,6 +824,7 @@ pub fn check_escapes_in_expr(
             }
         }
         Expr::ArrayToReversed { array }
+        | Expr::ArrayReverseValue { receiver: array }
         | Expr::ArrayFlat { array }
         | Expr::ArrayEntries(array)
         | Expr::ArrayKeys(array)

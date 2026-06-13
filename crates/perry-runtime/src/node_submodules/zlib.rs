@@ -219,6 +219,20 @@ pub extern "C" fn js_zlib_validate_options(opts: f64, min_window_bits: i32) {
     validate_option_range(ptr, b"strategy", "options.strategy", 0, 4);
     validate_option_chunk_size(ptr);
     validate_option_range(ptr, b"flush", "options.flush", 0, 5);
+
+    // #4917: `level` is honored and the ranged options above are validated,
+    // but a preset `dictionary` is not threaded through flate2. Silently
+    // dropping it would mis-compress against peers that expect it to apply,
+    // so warn once instead.
+    let dict = read_option_field(ptr, b"dictionary");
+    let dv = crate::value::JSValue::from_bits(dict.to_bits());
+    if !dv.is_undefined() && !dv.is_null() {
+        crate::stub_diag::perry_stub_warn(
+            "zlib options.dictionary",
+            "the preset dictionary option is accepted but not applied",
+            Some("#4917"),
+        );
+    }
 }
 
 /// Validate the `buffer` argument to a one-shot zlib codec (`gzipSync`,
@@ -264,6 +278,15 @@ pub extern "C" fn js_zlib_validate_buffer_arg(data_bits: i64) {
     crate::fs::validate::throw_type_error_with_code(&message, "ERR_INVALID_ARG_TYPE");
 }
 
+/// Validate the required callback for async one-shot zlib helpers
+/// (`gzip(data, cb)`, `gunzip(data, cb)`, `brotliDecompress(data, cb)`, ...).
+/// Node throws synchronously before queuing codec work when the callback is
+/// missing or not callable.
+#[no_mangle]
+pub extern "C" fn js_zlib_validate_callback(callback: f64) -> i64 {
+    crate::fs::validate::validate_required_callback("callback", callback) as i64
+}
+
 /// Keep the codegen-emitted symbol alive through the whole-program LLVM
 /// bitcode rebuild performed by auto-optimize (see
 /// `project_auto_optimize_keepalive_3320`). Called only from generated `.o` /
@@ -276,3 +299,5 @@ static KEEP_JS_ZLIB_VALIDATE_PARAMS: extern "C" fn(f64, f64) -> i32 = js_zlib_va
 static KEEP_JS_ZLIB_VALIDATE_OPTIONS: extern "C" fn(f64, i32) = js_zlib_validate_options;
 #[used]
 static KEEP_JS_ZLIB_VALIDATE_BUFFER_ARG: extern "C" fn(i64) = js_zlib_validate_buffer_arg;
+#[used]
+static KEEP_JS_ZLIB_VALIDATE_CALLBACK: extern "C" fn(f64) -> i64 = js_zlib_validate_callback;

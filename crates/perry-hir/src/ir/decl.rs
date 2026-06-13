@@ -116,6 +116,14 @@ pub struct Import {
     /// Always `false` on `is_dynamic` synthetic edges (those are already
     /// dynamic targets by virtue of `is_dynamic`).
     pub is_dynamic_target: bool,
+    /// Next.js lazy-require: this `import _req_N from 'S'` was synthesized by
+    /// the CJS→ESM wrap from a `require('S')` whose every call site is inside a
+    /// FUNCTION body (never module top-level). Node loads such a module lazily
+    /// — only when the enclosing function runs — so it must NOT pin the target
+    /// eager. Like `is_dynamic`, the target still enters the compile graph but
+    /// is left `Deferred` unless some other (top-level) edge reaches it; the
+    /// require shim triggers the target's `__init` on first `require()` call.
+    pub is_deferred_require: bool,
 }
 
 /// Import specifier
@@ -184,10 +192,28 @@ pub struct Class {
     pub constructor: Option<Function>,
     /// Instance methods
     pub methods: Vec<Function>,
-    /// Getter methods (property_name -> function that returns the value)
+    /// Instance getter methods (property_name -> function that returns the value)
     pub getters: Vec<(String, Function)>,
-    /// Setter methods (property_name -> function that takes the value)
+    /// Instance setter methods (property_name -> function that takes the value)
     pub setters: Vec<(String, Function)>,
+    /// Property names of accessors that are `static` (`static get x()` /
+    /// `static set x(v)`). The accessor functions themselves live in `getters`
+    /// / `setters` alongside instance accessors (so every IR pass — async
+    /// lowering, finally-inline, generator id-scan, inlining — processes their
+    /// bodies uniformly); codegen consults this set to register them on the
+    /// class constructor (`CLASS_STATIC_ACCESSORS`) rather than the instance
+    /// vtable, since a static accessor is an own property of `C`, not of
+    /// `C.prototype`/instances.
+    pub static_accessor_names: Vec<String>,
+    /// Function ids of the accessor entries in `getters` / `setters` that are
+    /// `static`. `static_accessor_names` alone cannot disambiguate a name that
+    /// is BOTH a static and an instance accessor (`static get 0(){} get 0(){}`)
+    /// — the by-name check classified the instance entry as static too, so both
+    /// emitted under the same `perry_static_…__get_0` symbol (LLVM "invalid
+    /// redefinition"). Keying the static/instance split on the accessor
+    /// function's unique id is unambiguous. Preserved across monomorphization
+    /// (specialize.rs copies `f.id` verbatim).
+    pub static_accessor_fn_ids: Vec<FuncId>,
     /// Static fields
     pub static_fields: Vec<ClassField>,
     /// Static methods

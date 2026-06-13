@@ -596,6 +596,18 @@ pub(crate) fn substitute_expr(expr: &Expr, substitutions: &HashMap<String, Type>
                 .as_ref()
                 .map(|s| Box::new(substitute_expr(s, substitutions))),
         },
+        Expr::ArrayLikeMethod {
+            method,
+            receiver,
+            args,
+        } => Expr::ArrayLikeMethod {
+            method: method.clone(),
+            receiver: Box::new(substitute_expr(receiver, substitutions)),
+            args: args
+                .iter()
+                .map(|a| substitute_expr(a, substitutions))
+                .collect(),
+        },
         Expr::ArrayFlat { array } => Expr::ArrayFlat {
             array: Box::new(substitute_expr(array, substitutions)),
         },
@@ -630,6 +642,9 @@ pub(crate) fn substitute_expr(expr: &Expr, substitutions: &HashMap<String, Type>
             array: Box::new(substitute_expr(array, substitutions)),
             index: Box::new(substitute_expr(index, substitutions)),
             value: Box::new(substitute_expr(value, substitutions)),
+        },
+        Expr::ArrayReverseValue { receiver } => Expr::ArrayReverseValue {
+            receiver: Box::new(substitute_expr(receiver, substitutions)),
         },
         Expr::ArrayCopyWithin {
             array_id,
@@ -891,6 +906,7 @@ pub(crate) fn substitute_expr(expr: &Expr, substitutions: &HashMap<String, Type>
 
         // Object.keys/values/entries
         Expr::ObjectKeys(obj) => Expr::ObjectKeys(Box::new(substitute_expr(obj, substitutions))),
+        Expr::ForInKeys(obj) => Expr::ForInKeys(Box::new(substitute_expr(obj, substitutions))),
         Expr::ObjectValues(obj) => {
             Expr::ObjectValues(Box::new(substitute_expr(obj, substitutions)))
         }

@@ -31,6 +31,7 @@ fn empty_module() -> Module {
         closure_display_names: std::collections::HashMap::new(),
         closure_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
+        gen_param_prologue_len: std::collections::HashMap::new(),
     }
 }
 
@@ -1334,6 +1335,47 @@ fn calendar_without_literal_args_falls_back_to_today() {
     )));
     let r = emit_index_ets(&mut m).unwrap().unwrap();
     assert!(r.ets_source.contains("CalendarPicker("));
+    assert!(r.ets_source.contains("selected: new Date()"));
+}
+
+#[test]
+fn date_picker_emits_arkui_date_picker() {
+    // Issue #4772 — DatePicker(2026, 5, onChange) → DatePicker
+    // with selected = new Date(2026, 4, 1) (month is 0-indexed in
+    // JS Date) and an onDateChange that converts the Date payload to
+    // an ISO yyyy-MM-dd string before invoking the TS callback.
+    let mut m = empty_module();
+    m.init.push(app_with_body(nmc(
+        "DatePicker",
+        vec![Expr::Number(2026.0), Expr::Number(5.0), closure_stub()],
+    )));
+    let r = emit_index_ets(&mut m).unwrap().unwrap();
+    assert!(r.ets_source.contains("DatePicker("));
+    // 1-based month 5 (May) → 0-based monthIndex 4
+    assert!(r.ets_source.contains("new Date(2026, 4, 1)"));
+    assert!(r.ets_source.contains(".onDateChange((value: Date) => {"));
+    assert!(r.ets_source.contains("value.toISOString().split('T')[0]"));
+    assert!(r
+        .ets_source
+        .contains("perryEntry.invokeCallback1(0, __iso)"));
+    assert_eq!(r.callbacks.len(), 1);
+}
+
+#[test]
+fn date_picker_without_literal_args_falls_back_to_today() {
+    // DatePicker(yearLocal, monthLocal, _) — args don't resolve to
+    // numeric literals, so the selected date defaults to `new Date()`.
+    let mut m = empty_module();
+    m.init.push(app_with_body(nmc(
+        "DatePicker",
+        vec![
+            Expr::String("not-a-number".into()),
+            Expr::String("nope".into()),
+            Expr::Number(0.0),
+        ],
+    )));
+    let r = emit_index_ets(&mut m).unwrap().unwrap();
+    assert!(r.ets_source.contains("DatePicker("));
     assert!(r.ets_source.contains("selected: new Date()"));
 }
 

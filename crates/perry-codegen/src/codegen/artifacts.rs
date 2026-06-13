@@ -226,6 +226,34 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
         for (prop, getter_fn) in &class.getters {
             let mut renamed = getter_fn.clone();
             renamed.name = format!("__get_{}", prop);
+            // Static accessors compile with the static calling convention (no
+            // `this` param; `this` is the implicit-this slot the constructor-ref
+            // dispatch sets) so they match the CLASS_STATIC_ACCESSORS reader,
+            // exactly like static computed accessors below.
+            if class.static_accessor_fn_ids.contains(&getter_fn.id) {
+                compile_static_method(
+                    llmod,
+                    class,
+                    &renamed,
+                    func_names,
+                    strings,
+                    class_table,
+                    method_names,
+                    module_globals,
+                    opts.import_function_prefixes,
+                    enum_table,
+                    static_field_globals,
+                    class_ids,
+                    func_signatures,
+                    func_synthetic_arguments,
+                    module_prefix,
+                    module_boxed_vars,
+                    closure_rest_params,
+                    cross_module,
+                )
+                .with_context(|| format!("lowering static getter '{}::{}'", class.name, prop))?;
+                continue;
+            }
             compile_method(
                 llmod,
                 class,
@@ -251,6 +279,30 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
         for (prop, setter_fn) in &class.setters {
             let mut renamed = setter_fn.clone();
             renamed.name = format!("__set_{}", prop);
+            if class.static_accessor_fn_ids.contains(&setter_fn.id) {
+                compile_static_method(
+                    llmod,
+                    class,
+                    &renamed,
+                    func_names,
+                    strings,
+                    class_table,
+                    method_names,
+                    module_globals,
+                    opts.import_function_prefixes,
+                    enum_table,
+                    static_field_globals,
+                    class_ids,
+                    func_signatures,
+                    func_synthetic_arguments,
+                    module_prefix,
+                    module_boxed_vars,
+                    closure_rest_params,
+                    cross_module,
+                )
+                .with_context(|| format!("lowering static setter '{}::{}'", class.name, prop))?;
+                continue;
+            }
             compile_method(
                 llmod,
                 class,
@@ -473,36 +525,28 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
     // dead-code elimination at link time will remove unused ones.
     for f in &hir.functions {
         let original_name = func_names.get(&f.id).cloned().unwrap();
-        // Wrapper signature: i64 closure_ptr + N doubles for args.
-        // Cap at 5 since js_closure_call only goes up to 5 args.
-        let arity = f.params.len().min(5);
+        // Wrapper signature: i64 closure_ptr + N doubles for args. Cap at 16 to
+        // match the `js_closure_call0..16` dispatch family (the closure-call ABI
+        // tops out at 16 positional args; a function with more must be reached
+        // via a rest-bundling path). Pre-fix this was capped at 5 with a stale
+        // "js_closure_call only goes up to 5 args" comment, so any function
+        // invoked as a closure value (object-literal method, callback, `apply`
+        // target) with 6+ params silently dropped every argument past the 5th
+        // — e.g. test262's `TemporalHelpers.assertDuration(d, y, mo, w, d, h, …)`
+        // (11 args) read `hours` onward as 0.
+        let arity = f.params.len().min(16);
+        let arg_names: Vec<String> = (0..arity).map(|i| format!("%a{}", i)).collect();
         let mut wrap_params: Vec<(LlvmType, String)> = vec![(I64, "%this_closure".to_string())];
-        for i in 0..arity {
-            wrap_params.push((DOUBLE, format!("%a{}", i)));
+        for name in &arg_names {
+            wrap_params.push((DOUBLE, name.clone()));
         }
         let wrap_name = format!("__perry_wrap_{}", original_name);
         let wf = llmod.define_function(&wrap_name, DOUBLE, wrap_params);
         let _ = wf.create_block("entry");
         let blk = wf.block_mut(0).unwrap();
         // Call the underlying function with just the arg doubles.
-        let call_args: Vec<(LlvmType, &str)> = (0..arity)
-            .map(|i| {
-                (
-                    DOUBLE,
-                    if i == 0 {
-                        "%a0"
-                    } else if i == 1 {
-                        "%a1"
-                    } else if i == 2 {
-                        "%a2"
-                    } else if i == 3 {
-                        "%a3"
-                    } else {
-                        "%a4"
-                    },
-                )
-            })
-            .collect();
+        let call_args: Vec<(LlvmType, &str)> =
+            arg_names.iter().map(|n| (DOUBLE, n.as_str())).collect();
         let mut result = blk.call(DOUBLE, &original_name, &call_args);
         if function_body_returns_generator_object(&f.body) {
             result = blk.call(
@@ -576,7 +620,7 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
             // Determine the local target. Prefer a real HIR function;
             // fall back to a no-op (variable/class/type rename).
             if let Some(f) = func_by_local_name.get(local.as_str()) {
-                let arity = f.params.len().min(5);
+                let arity = f.params.len().min(32);
                 let mut wrap_params: Vec<(LlvmType, String)> =
                     vec![(I64, "%this_closure".to_string())];
                 for i in 0..arity {
@@ -807,7 +851,7 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
                         .find(|(n, _)| n == exported)
                         .and_then(|(_, fid)| hir.functions.iter().find(|f| f.id == *fid));
                     if let Some(f) = aliased_func {
-                        let arity = f.params.len().min(5);
+                        let arity = f.params.len().min(32);
                         let mut wrap_params: Vec<(LlvmType, String)> =
                             vec![(I64, "%this_closure".to_string())];
                         for i in 0..arity {
@@ -866,7 +910,7 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
             if !emitted_wrappers.insert(wrap_name.clone()) {
                 continue;
             }
-            let arity = method.params.len().min(5);
+            let arity = method.params.len().min(32);
             let mut wrap_params: Vec<(LlvmType, String)> = vec![(I64, "%this_closure".to_string())];
             for i in 0..arity {
                 wrap_params.push((DOUBLE, format!("%a{}", i)));
@@ -1342,6 +1386,29 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
             }
         }
     }
+    // Strict-mode user functions (file-level `"use strict"` or body
+    // directive), for OrdinaryCallBindThis in `call`/`apply`/`bind`: a
+    // strict callee must observe the raw primitive `thisArg`, a sloppy one
+    // gets it boxed. Same two symbol forms as the generator registries.
+    let mut user_fn_wrapper_strict: std::collections::HashSet<String> = hir
+        .functions
+        .iter()
+        .filter(|f| f.is_strict)
+        .filter_map(|f| {
+            func_names
+                .get(&f.id)
+                .map(|name| format!("__perry_wrap_{}", name))
+        })
+        .collect();
+    for (func_id, expr) in closures {
+        if let perry_hir::Expr::Closure { is_strict, .. } = expr {
+            if *is_strict {
+                user_fn_wrapper_strict
+                    .insert(format!("perry_closure_{}__{}", module_prefix, func_id));
+            }
+        }
+    }
+
     // #3664: async-generator wrapper symbols, identified by the func_ids the
     // generator transform recorded (it cleared `is_async` before we get here,
     // so the body shape alone can't tell async generators from sync ones).
@@ -1497,6 +1564,7 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
         &user_fn_wrapper_async,
         &user_fn_wrapper_generator,
         &user_fn_wrapper_async_generator,
+        &user_fn_wrapper_strict,
         &user_fn_display_names,
         &user_fn_source,
     );

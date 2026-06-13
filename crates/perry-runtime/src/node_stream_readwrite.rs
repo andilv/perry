@@ -76,7 +76,12 @@ pub(super) fn string_value_eq(value: f64, expected: &[u8]) -> bool {
 
 pub(super) fn object_ptr_from_value(value: f64) -> Option<*mut ObjectHeader> {
     let raw = raw_ptr_from_value(value);
-    if raw < 0x10000 || crate::buffer::is_registered_buffer(raw) {
+    // The handle band (EventEmitter ids sit at 0x38000..0x40000,
+    // widget/stream handles lower) is never a heap object. The old 0x10000
+    // floor let an EventEmitter handle through to the GcHeader probe at
+    // raw-8, which is unmapped memory (#4633 SIGSEGV in
+    // events.on(emitter, name, { signal }) target validation).
+    if crate::value::addr_class::is_handle_band(raw) || crate::buffer::is_registered_buffer(raw) {
         return None;
     }
     unsafe {
@@ -171,6 +176,30 @@ pub(super) fn stream_auto_destroy_enabled(stream: f64) -> bool {
     get_hidden_value(stream, hidden_stream_auto_destroy_key())
         .map(|v| v.to_bits() != TAG_FALSE)
         .unwrap_or(true)
+}
+
+pub(super) fn set_stream_emit_close(stream: f64, opts: f64) {
+    let enabled = get_hidden_value(opts, hidden_key(b"emitClose"))
+        .map(|v| v.to_bits() != TAG_FALSE)
+        .unwrap_or(true);
+    set_hidden_value(
+        stream,
+        hidden_stream_emit_close_key(),
+        f64::from_bits(if enabled { TAG_TRUE } else { TAG_FALSE }),
+    );
+}
+
+pub(super) fn stream_emit_close_enabled(stream: f64) -> bool {
+    get_hidden_value(stream, hidden_stream_emit_close_key())
+        .map(|v| v.to_bits() != TAG_FALSE)
+        .unwrap_or(true)
+}
+
+pub(super) fn mark_stream_closed_and_emit_close(stream: f64) {
+    mark_stream_closed(stream);
+    if stream_emit_close_enabled(stream) {
+        let _ = emit_stream_event(stream, string_value(b"close"), &[]);
+    }
 }
 
 pub(super) fn mark_stream_destroyed(stream: f64) {
@@ -432,6 +461,13 @@ pub(super) fn pipe_stream_to_destination(stream: f64, dest: f64, end_dest: bool)
     if !end_dest {
         add_pipe_no_end_destination(stream, dest);
     }
+    // A flowing destination (e.g. a piped-into PassThrough/Duplex) must consume
+    // each chunk from its own readable buffer when it emits 'data' live —
+    // otherwise the chunk lingers in the buffer and the destination's drain
+    // microtask re-emits it, duplicating every piped chunk. `pipeline()` already
+    // marks both ends; `pipe()` needs the same on the destination. (matches
+    // mark_live_pipe_consume_on_emit usage in node_stream_pipeline.rs)
+    mark_live_pipe_consume_on_emit(dest);
     install_pipe_destination_listeners(stream, dest);
     let _ = emit_stream_event(dest, string_value(b"pipe"), &[stream]);
     set_readable_flowing(stream, f64::from_bits(TAG_TRUE));
@@ -779,9 +815,6 @@ pub(super) fn emit_readable_end_once(stream: f64) {
             if !writable_pending {
                 destroy_stream(stream, f64::from_bits(TAG_UNDEFINED));
             }
-        } else if get_hidden_value(stream, hidden_writable_flag_key()).is_none() {
-            mark_stream_closed(stream);
-            let _ = emit_stream_event(stream, string_value(b"close"), &[]);
         }
     }
 }
@@ -839,185 +872,6 @@ pub(super) fn clear_pending_readable_chunks(stream: f64) {
         hidden_readable_pending_key(),
         box_pointer(crate::array::js_array_alloc(0) as *const u8),
     );
-}
-
-pub(super) fn read_stream_with_size_arg(stream: f64, size: f64) -> f64 {
-    let size_value = JSValue::from_bits(size.to_bits());
-    if size_value.is_undefined() || !size_value.is_number() {
-        return read_stream_default_size(stream);
-    }
-    let size = size_value.as_number();
-    if size.is_nan() {
-        return read_stream_default_size(stream);
-    }
-    read_stream_exact_size(stream, size.trunc())
-}
-
-pub(super) fn read_stream_default_size(stream: f64) -> f64 {
-    invoke_read_once(stream);
-    read_stream_available_default(stream)
-}
-
-pub(super) fn read_stream_available_default(stream: f64) -> f64 {
-    if get_hidden_value(stream, hidden_buffered_key()).unwrap_or(0.0) <= 0.0 {
-        if stream_hidden_ended(stream) {
-            cancel_readable_event(stream);
-            refresh_readable_aborted_flag(stream);
-        }
-        return f64::from_bits(TAG_NULL);
-    }
-    if readable_object_mode(stream) {
-        return read_stream_object_mode_chunk(stream);
-    }
-    let mut values = Vec::new();
-    if let Some(chunks) = readable_hidden_chunks(stream) {
-        push_chunk_values(chunks, &mut values, 0);
-    }
-    if values.is_empty() {
-        if stream_hidden_ended(stream) {
-            cancel_readable_event(stream);
-            refresh_readable_aborted_flag(stream);
-        }
-        return f64::from_bits(TAG_NULL);
-    }
-    clear_readable_buffer(stream);
-    mark_disturbed(stream);
-    clear_pending_readable_chunks(stream);
-    if stream_hidden_ended(stream) {
-        queue_readable_event(stream);
-        schedule_readable_end(stream);
-    }
-    let encoded = readable_encoding_tag(stream).is_some();
-    if encoded {
-        let mut decoded = Vec::with_capacity(values.len());
-        for value in values {
-            if let Some(value) = super::decode_readable_chunk_for_encoding(stream, value) {
-                decoded.push(value);
-            }
-        }
-        values = decoded;
-        if values.is_empty() {
-            return f64::from_bits(TAG_NULL);
-        }
-    }
-    if values.len() == 1 {
-        if encoded {
-            return values[0];
-        }
-        return string_chunk_to_buffer(values[0]).unwrap_or(values[0]);
-    }
-    let result = crate::string::js_string_concat_chain(values.as_ptr(), values.len() as i32);
-    if encoded {
-        return f64::from_bits(JSValue::string_ptr(result).bits());
-    }
-    box_pointer(crate::buffer::js_buffer_from_string(result, 0) as *const u8)
-}
-
-pub(super) fn read_stream_exact_size(stream: f64, size: f64) -> f64 {
-    invoke_read_once(stream);
-    if size <= 0.0 {
-        return f64::from_bits(TAG_NULL);
-    }
-    let requested = size as usize;
-    let available = get_hidden_value(stream, hidden_buffered_key())
-        .unwrap_or(0.0)
-        .max(0.0) as usize;
-    if available == 0 {
-        if stream_hidden_ended(stream) {
-            cancel_readable_event(stream);
-            refresh_readable_aborted_flag(stream);
-        }
-        return f64::from_bits(TAG_NULL);
-    }
-    if readable_encoding_tag(stream).is_some() {
-        return read_stream_available_default(stream);
-    }
-    if requested > available && !stream_hidden_ended(stream) {
-        return f64::from_bits(TAG_NULL);
-    }
-    if requested >= available {
-        return read_stream_available_default(stream);
-    }
-
-    let mut bytes = Vec::new();
-    if let Some(chunks) = readable_hidden_chunks(stream) {
-        append_chunk_bytes(chunks, &mut bytes, 0);
-    }
-    if bytes.len() <= requested {
-        return read_stream_available_default(stream);
-    }
-    let result = buffer_value_from_bytes(&bytes[..requested]);
-    set_readable_buffer_bytes(stream, &bytes[requested..]);
-    mark_disturbed(stream);
-    result
-}
-
-pub(super) fn set_readable_buffer_bytes(stream: f64, bytes: &[u8]) {
-    if bytes.is_empty() {
-        clear_readable_buffer(stream);
-        return;
-    }
-    let chunk = buffer_value_from_bytes(bytes);
-    let mut arr = crate::array::js_array_alloc(0);
-    arr = crate::array::js_array_push_f64(arr, chunk);
-    set_hidden_value(stream, hidden_chunks_key(), box_pointer(arr as *const u8));
-    let remaining = bytes.len() as f64;
-    set_hidden_value(stream, hidden_buffered_key(), remaining);
-    set_hidden_value(stream, hidden_key(b"readableLength"), remaining);
-}
-
-pub(super) fn buffer_value_from_bytes(bytes: &[u8]) -> f64 {
-    let buf = crate::buffer::js_buffer_alloc(bytes.len() as i32, 0);
-    if !bytes.is_empty() {
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                crate::buffer::buffer_data_mut(buf),
-                bytes.len(),
-            );
-        }
-    }
-    box_pointer(buf as *const u8)
-}
-
-pub(super) fn read_stream_object_mode_chunk(stream: f64) -> f64 {
-    let Some(chunks) = readable_hidden_chunks(stream) else {
-        return f64::from_bits(TAG_NULL);
-    };
-    if !is_array_like_value(chunks) {
-        clear_readable_buffer(stream);
-        return chunks;
-    }
-    let arr = raw_ptr_from_value(chunks) as *mut crate::array::ArrayHeader;
-    if crate::array::js_array_length(arr) == 0 {
-        clear_readable_buffer(stream);
-        return f64::from_bits(TAG_NULL);
-    }
-    let chunk = crate::array::js_array_shift_f64(arr);
-    let remaining = crate::array::js_array_length(arr) as f64;
-    set_hidden_value(stream, hidden_buffered_key(), remaining);
-    set_hidden_value(stream, hidden_key(b"readableLength"), remaining);
-    mark_disturbed(stream);
-    if stream_hidden_ended(stream) && remaining == 0.0 {
-        clear_pending_readable_chunks(stream);
-        queue_readable_event(stream);
-        schedule_readable_end(stream);
-    }
-    chunk
-}
-
-pub(super) fn string_chunk_to_buffer(value: f64) -> Option<f64> {
-    let jsval = JSValue::from_bits(value.to_bits());
-    if !jsval.is_any_string() {
-        return None;
-    }
-    let ptr = crate::value::js_get_string_pointer_unified(value) as *const crate::StringHeader;
-    if ptr.is_null() || (ptr as usize) < 0x10000 {
-        return None;
-    }
-    Some(box_pointer(
-        crate::buffer::js_buffer_from_string(ptr, 0) as *const u8
-    ))
 }
 
 pub(super) fn drain_readable_from_events(stream: f64) {

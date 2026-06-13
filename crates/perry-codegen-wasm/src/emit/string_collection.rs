@@ -526,6 +526,22 @@ impl WasmModuleEmitter {
                 self.collect_strings_in_expr(index);
                 self.collect_strings_in_expr(value);
             }
+            // #5016: `obj.prop = v` / `obj[i] = v` lower to PutValueSet. Recurse
+            // into all operands so the key string (when an `Expr::String`) and
+            // any string literals in the value/target are interned — the emit
+            // arm reads the key via `string_map`.
+            Expr::PutValueSet {
+                target,
+                key,
+                value,
+                receiver,
+                ..
+            } => {
+                self.collect_strings_in_expr(target);
+                self.collect_strings_in_expr(key);
+                self.collect_strings_in_expr(value);
+                self.collect_strings_in_expr(receiver);
+            }
             Expr::Await(e) | Expr::TypeOf(e) | Expr::Void(e) => {
                 self.collect_strings_in_expr(e);
             }
@@ -834,6 +850,7 @@ impl WasmModuleEmitter {
             | Expr::DateValueOf(e)
             | Expr::DateToDateString(e)
             | Expr::DateToTimeString(e)
+            | Expr::DateToUTCString(e)
             | Expr::DateToLocaleDateString(e)
             | Expr::DateToLocaleTimeString(e)
             | Expr::DateToLocaleString(e)
@@ -953,6 +970,7 @@ impl WasmModuleEmitter {
                 method,
                 body,
                 headers,
+                headers_dynamic,
             } => {
                 self.collect_strings_in_expr(url);
                 self.collect_strings_in_expr(method);
@@ -960,6 +978,9 @@ impl WasmModuleEmitter {
                 for (key, val) in headers {
                     self.intern_string(key);
                     self.collect_strings_in_expr(val);
+                }
+                if let Some(hd) = headers_dynamic {
+                    self.collect_strings_in_expr(hd);
                 }
             }
             Expr::FetchGetWithAuth { url, auth_header } => {

@@ -76,12 +76,14 @@ impl LoweringContext {
             ui_widget_type_aliases: HashMap::new(),
             current_class: None,
             current_class_member_is_static: false,
+            private_scopes: Vec::new(),
             object_super_home_stack: Vec::new(),
             extern_func_types: Vec::new(),
             source_file_path,
             exportable_object_vars: HashSet::new(),
             pending_functions: Vec::new(),
             closure_display_names: HashMap::new(),
+            gen_param_prologue_len: HashMap::new(),
             assignment_inferred_name: None,
             closure_source_text: HashMap::new(),
             func_return_native_instances: Vec::new(),
@@ -93,6 +95,8 @@ impl LoweringContext {
             module_level_ids: HashSet::new(),
             sloppy_implicit_globals: Vec::new(),
             sloppy_implicit_global_ids: HashSet::new(),
+            with_sloppy_implicit_ids: std::collections::HashMap::new(),
+            pending_with_implicit_inits: Vec::new(),
             scope_depth: 0,
             scope_local_marks: Vec::new(),
             inside_block_scope: 0,
@@ -101,11 +105,13 @@ impl LoweringContext {
             module_native_instances: Vec::new(),
             uses_fetch: false,
             uses_webassembly: false,
+            react_default_import_local: None,
             suppress_stdlib_dispatch_guard_once: false,
             lowering_call_callee: false,
             unresolved_ident_as_global: false,
             with_env_stack: Vec::new(),
             var_hoisted_ids: HashSet::new(),
+            lexical_forward_decls: HashMap::new(),
             functions_index: HashMap::new(),
             classes_index: HashMap::new(),
             imported_functions_index: HashMap::new(),
@@ -126,9 +132,12 @@ impl LoweringContext {
             proxy_revoke_locals: HashMap::new(),
             class_expr_aliases: HashMap::new(),
             in_constructor_class: None,
+            current_class_is_derived: false,
+            in_class_field_init: false,
             current_class_super_ident: None,
             mixin_funcs: HashMap::new(),
             anon_shape_classes: HashMap::new(),
+            forward_class_names: std::collections::HashSet::new(),
             next_anon_shape_id: 0,
             class_method_return_types: Vec::new(),
             class_captures: Vec::new(),
@@ -145,6 +154,7 @@ impl LoweringContext {
             strict_mode_stack: Vec::new(),
             is_external_module: false,
             optional_require_try_depth: 0,
+            fn_ctor_env: super::fn_ctor_env::FnCtorEnv::default(),
         }
     }
 
@@ -253,6 +263,29 @@ impl LoweringContext {
         let id = self.next_local_id;
         self.next_local_id += 1;
         id
+    }
+
+    /// Push a private-name scope for a class body (innermost last). Built by
+    /// pre-scanning the class members. See `private_scopes`.
+    pub(crate) fn push_private_scope(&mut self, scope: PrivateScope) {
+        self.private_scopes.push(scope);
+    }
+
+    pub(crate) fn pop_private_scope(&mut self) {
+        self.private_scopes.pop();
+    }
+
+    /// Resolve a private name (`#name`, with the leading `#`) to its declaring
+    /// class and member kind by walking the private-scope stack innermost
+    /// outward — matching the lexical resolution rule for private names. A
+    /// nested class that redeclares the same name shadows the outer one.
+    pub(crate) fn resolve_private(&self, field_name: &str) -> Option<(String, PrivMember)> {
+        for scope in self.private_scopes.iter().rev() {
+            if let Some(m) = scope.members.get(field_name) {
+                return Some((scope.class_name.clone(), *m));
+            }
+        }
+        None
     }
 
     pub(crate) fn mark_local_immutable(&mut self, id: LocalId) {
@@ -890,6 +923,8 @@ impl LoweringContext {
             methods: Vec::new(),
             getters: Vec::new(),
             setters: Vec::new(),
+            static_accessor_names: Vec::new(),
+            static_accessor_fn_ids: Vec::new(),
             static_fields: Vec::new(),
             static_methods: Vec::new(),
             computed_members: Vec::new(),
@@ -1232,10 +1267,14 @@ impl LoweringContext {
 
         // Preserve var-hoisted locals: move any hoisted entries defined after
         // the mark to the position just past the mark, then drop the rest.
+        // Sloppy implicit globals (`undeclared = v` inside the block) are
+        // module-scoped bindings too — keep them visible after the block.
         if self.locals.len() > locals_mark {
             let mut kept: Vec<(String, LocalId, Type)> = Vec::new();
             for entry in self.locals.drain(locals_mark..) {
-                if self.var_hoisted_ids.contains(&entry.1) {
+                if self.var_hoisted_ids.contains(&entry.1)
+                    || self.sloppy_implicit_global_ids.contains(&entry.1)
+                {
                     kept.push(entry);
                 }
             }

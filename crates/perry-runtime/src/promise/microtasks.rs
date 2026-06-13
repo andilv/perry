@@ -30,6 +30,24 @@ thread_local! {
     /// macrotasks, and running them from a nested microtask checkpoint can
     /// build an unbounded stack of exception traps.
     static MICROTASK_RUN_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+
+    /// One-shot: the entry module is ESM and its evaluation checkpoint has
+    /// not happened yet. Consumed by the first `run_microtasks` drain, which
+    /// then finishes promise/queueMicrotask jobs before the nextTick queue
+    /// (Node runs ESM evaluation as a job inside a microtask checkpoint, so
+    /// ticks queued at top level wait for the checkpoint to finish; #788).
+    static ESM_EVAL_CHECKPOINT_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Called once from the compiled entry (before top-level statements) when the
+/// entry module uses import/export syntax — i.e. Node would load it as ESM.
+#[no_mangle]
+pub extern "C" fn js_mark_entry_module_esm() {
+    ESM_EVAL_CHECKPOINT_PENDING.with(|c| c.set(true));
+}
+
+fn consume_esm_eval_checkpoint() -> bool {
+    ESM_EVAL_CHECKPOINT_PENDING.with(|c| c.replace(false))
 }
 
 #[no_mangle]
@@ -41,10 +59,23 @@ pub(crate) fn js_promise_run_microtasks_checkpoint() -> i32 {
     run_microtasks(MicrotaskDrainMode::MicrotasksOnly)
 }
 
+/// Drain pending promise/queueMicrotask jobs WITHOUT giving the nextTick
+/// queue a turn. Used by the await lowering's `drain_once` block: an `await`
+/// of an already-settled promise must let earlier-queued microtasks run
+/// before execution continues, but ticks queued in the same synchronous
+/// stretch wait for the next real tick boundary (event-loop / entry flush) —
+/// Node runs them only after the microtask checkpoint completes (#788).
+#[no_mangle]
+pub extern "C" fn js_promise_run_promise_jobs() -> i32 {
+    run_microtasks(MicrotaskDrainMode::PromiseJobsOnly)
+}
+
 #[derive(Copy, Clone)]
 enum MicrotaskDrainMode {
     AllowTimers,
     MicrotasksOnly,
+    /// Promise/queueMicrotask jobs only — no nextTick drain, no timers.
+    PromiseJobsOnly,
 }
 
 fn run_microtasks(mode: MicrotaskDrainMode) -> i32 {
@@ -155,12 +186,38 @@ fn run_microtasks(mode: MicrotaskDrainMode) -> i32 {
     // Reading the env var directly here was ~30 ns per microtask drain;
     // the atomic load is ~1 ns.
     let prof = mt_profile_enabled();
+    // Node gives the nextTick queue its turn only at "tick boundaries":
+    // after a macrotask callback (timer/immediate — ticks first there, see
+    // the timer pump) or once the V8 microtask queue is exhausted. Two cases
+    // where this drain is entered MID-checkpoint and must therefore finish
+    // promise/queueMicrotask jobs before the first tick drain (#788):
+    //
+    //  1. ESM module evaluation — it runs as a job inside a checkpoint, so
+    //     ticks queued at top level wait for the queue to finish. One-shot
+    //     flag set by the compiled entry when the module uses import/export.
+    //  2. Re-entrant drains from inside a running promise job (the `await`
+    //     pump): ticks queued by the job must not overtake microtasks queued
+    //     by the same job. `CURRENT_MICROTASK_CALLBACK` is non-null exactly
+    //     while a promise/queueMicrotask/async-step callback is executing;
+    //     timer and nextTick callbacks don't set it, so their re-entries
+    //     keep the macrotask-boundary ticks-first ordering.
+    let ticks_allowed = !matches!(mode, MicrotaskDrainMode::PromiseJobsOnly);
+    let mid_promise_job = CURRENT_MICROTASK_CALLBACK.with(|c| !c.get().is_null());
+    let mut esm_defer_tick_drain = if ticks_allowed {
+        consume_esm_eval_checkpoint() || (reentrant && mid_promise_job)
+    } else {
+        // PromiseJobsOnly never drains ticks; leave the one-shot ESM flag
+        // for the first real checkpoint to consume.
+        false
+    };
     loop {
         let ran_before_checkpoint = ran;
 
         // Node runs process.nextTick jobs before regular microtasks, while
         // queueMicrotask jobs share FIFO order with Promise reactions.
-        ran += crate::builtins::drain_queued_microtasks_count();
+        if ticks_allowed && !esm_defer_tick_drain {
+            ran += crate::builtins::drain_queued_microtasks_count();
+        }
 
         loop {
             let t0 = if prof {
@@ -662,6 +719,15 @@ fn run_microtasks(mode: MicrotaskDrainMode) -> i32 {
             }
         }
 
+        // ESM first checkpoint: the promise/queueMicrotask queue has fully
+        // drained (inner loop above); NOW the nextTick queue gets its first
+        // turn, still ahead of any timer. Subsequent iterations use the
+        // normal ticks-first ordering.
+        if esm_defer_tick_drain {
+            esm_defer_tick_drain = false;
+            ran += crate::builtins::drain_queued_microtasks_count();
+        }
+
         if ran == ran_before_checkpoint {
             break;
         }
@@ -716,14 +782,31 @@ fn call_async_step_direct(
 /// generator-state-machine chains.
 #[inline]
 fn propagate_callback_result(result: f64, next: *mut Promise) {
-    if js_value_is_promise(result) != 0 {
-        let inner = crate::value::js_nanbox_get_pointer(result) as *mut Promise;
-        if !inner.is_null() && inner != next {
-            js_promise_resolve_with_promise(next, inner);
-        } else {
-            js_promise_resolve(next, result);
-        }
-    } else {
-        js_promise_resolve(next, result);
+    if next.is_null() {
+        return;
     }
+    // The result-capability's [[Resolve]] is the Promise Resolve Function
+    // (27.2.1.3.2). Two spec steps the old direct-store path skipped:
+    //
+    //   step 6 — SameValue(resolution, promise): a reaction that returns its own
+    //     chained promise is a cycle → reject `next` with a TypeError.
+    //   steps 8-12 — Get(resolution, "then") and, if callable, assimilate the
+    //     thenable (running its `then` as a job) rather than fulfilling with the
+    //     thenable object verbatim. A throwing `then` getter rejects `next`.
+    //
+    // `promise_resolve_assimilating` performs steps 8-12 (and keeps the native-
+    // promise fast adopt path, so the steady-state async case is unchanged).
+    let bits = result.to_bits();
+    if (bits & crate::value::TAG_MASK) == crate::value::POINTER_TAG {
+        let ptr = (bits & crate::value::POINTER_MASK) as usize;
+        if ptr == next as usize {
+            let msg = b"Chaining cycle detected for promise #<Promise>";
+            let s = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
+            let err_ptr = crate::error::js_typeerror_new(s);
+            let err = f64::from_bits(crate::value::JSValue::pointer(err_ptr as *const u8).bits());
+            js_promise_reject(next, err);
+            return;
+        }
+    }
+    crate::promise::combinators::promise_resolve_assimilating(next, result);
 }

@@ -233,6 +233,7 @@ fn collect_used_new_fields_in_expr(
         | Expr::IsUndefinedOrBareNan(operand)
         | Expr::ParseFloat(operand)
         | Expr::ObjectKeys(operand)
+        | Expr::ForInKeys(operand)
         | Expr::ObjectValues(operand)
         | Expr::ObjectEntries(operand)
         | Expr::SetSize(operand)
@@ -254,7 +255,9 @@ fn collect_used_new_fields_in_expr(
         | Expr::JsonIsRawJson(operand)
         | Expr::IteratorToArray(operand)
         | Expr::GetIterator(operand)
+        | Expr::GetAsyncIterator(operand)
         | Expr::ForOfToArray(operand)
+        | Expr::ForAwaitToArray(operand)
         | Expr::WeakRefNew(operand)
         | Expr::WeakRefDeref(operand)
         | Expr::FinalizationRegistryNew(operand)
@@ -598,6 +601,7 @@ fn collect_used_new_fields_in_expr(
             }
         }
         Expr::ArrayToReversed { array }
+        | Expr::ArrayReverseValue { receiver: array }
         | Expr::ArrayFlat { array }
         | Expr::ArrayEntries(array)
         | Expr::ArrayKeys(array)
@@ -747,12 +751,16 @@ fn collect_used_new_fields_in_expr(
             method,
             body,
             headers,
+            headers_dynamic,
         } => {
             collect_used_new_fields_in_expr(url, non_escaping_news, used);
             collect_used_new_fields_in_expr(method, non_escaping_news, used);
             collect_used_new_fields_in_expr(body, non_escaping_news, used);
             for (_, value) in headers {
                 collect_used_new_fields_in_expr(value, non_escaping_news, used);
+            }
+            if let Some(hd) = headers_dynamic {
+                collect_used_new_fields_in_expr(hd, non_escaping_news, used);
             }
         }
         Expr::FetchGetWithAuth { url, auth_header } => {

@@ -40,6 +40,31 @@ fn is_stream_class_ref(expr: &ast::Expr) -> bool {
     matches!(name, "Readable" | "Duplex" | "Transform" | "PassThrough")
 }
 
+fn is_node_readable_receiver(ctx: &LoweringContext, expr: &ast::Expr) -> bool {
+    let ast::Expr::Ident(ident) = unwrap_transparent_expr(expr) else {
+        return false;
+    };
+    let name = ident.sym.as_ref();
+    ctx.lookup_native_instance(name)
+        .is_some_and(|(module, class_name)| {
+            matches!(module, "stream" | "node:stream")
+                && matches!(
+                    class_name,
+                    "Readable" | "Duplex" | "Transform" | "PassThrough"
+                )
+        })
+        || ctx.lookup_local_type(name).is_some_and(|ty| {
+            matches!(
+                ty,
+                Type::Named(class_name)
+                    if matches!(
+                        class_name.as_str(),
+                        "Readable" | "Duplex" | "Transform" | "PassThrough"
+                    )
+            )
+        })
+}
+
 fn is_module_builtin_modules_expr(ctx: &LoweringContext, expr: &ast::Expr) -> bool {
     let ast::Expr::Member(member) = unwrap_transparent_expr(expr) else {
         return false;
@@ -139,21 +164,23 @@ fn is_fs_dir_receiver(ctx: &LoweringContext, expr: &ast::Expr) -> bool {
 }
 
 /// Does this expression's method chain originate from a node:stream
-/// source — `Readable.from(...)` / `Readable.of(...)`, `new Transform()`,
-/// or a chain of lazy iterator helpers (`map`/`filter`/`flatMap`/`take`/
-/// `drop`) on top of one? (#1558)
+/// source — `Readable.from(...)` / `Readable.of(...)`, a local already tagged
+/// as a readable stream, `new Transform()`, or a chain of lazy iterator helpers
+/// (`map`/`filter`/`flatMap`/`take`/`drop`) on top of one? (#1558)
 ///
 /// The lazy stream helpers return another Readable, not an array, so a
 /// chain like `Readable.from(x).map(f).filter(g)` must NOT be folded
 /// into `Expr::Array<Method>` ops — `js_array_map` would read garbage
 /// out of the stream object's header. Detecting the stream root here
 /// keeps such chains on dynamic dispatch so the runtime's stream
-/// iterator-helper stubs run. AST-only (no type info) so it catches the
-/// common inline-chain form without depending on receiver inference.
-fn chain_roots_at_stream(expr: &ast::Expr) -> bool {
+/// iterator-helper stubs run.
+fn chain_roots_at_stream(ctx: &LoweringContext, expr: &ast::Expr) -> bool {
     let expr = unwrap_transparent_expr(expr);
+    if is_node_readable_receiver(ctx, expr) {
+        return true;
+    }
     match expr {
-        ast::Expr::Await(a) => chain_roots_at_stream(&a.arg),
+        ast::Expr::Await(a) => chain_roots_at_stream(ctx, &a.arg),
         ast::Expr::New(new) => is_stream_class_ref(&new.callee),
         ast::Expr::Call(call) => {
             let ast::Callee::Expr(callee) = &call.callee else {
@@ -169,7 +196,9 @@ fn chain_roots_at_stream(expr: &ast::Expr) -> bool {
                 // Static factories that produce a Readable.
                 "from" | "of" => is_stream_class_ref(&m.obj),
                 // Lazy helpers preserve the stream — recurse into the receiver.
-                "map" | "filter" | "flatMap" | "take" | "drop" => chain_roots_at_stream(&m.obj),
+                "map" | "filter" | "flatMap" | "take" | "drop" => {
+                    chain_roots_at_stream(ctx, &m.obj)
+                }
                 _ => false,
             }
         }
@@ -474,9 +503,67 @@ pub(super) fn try_array_only_methods(
                 // would read garbage out of the stream object's header. Bail to
                 // dynamic dispatch so the runtime's iterator-helper stubs run.
                 let recv_is_class = recv_is_class
-                    || chain_roots_at_stream(member_obj)
+                    || chain_roots_at_stream(ctx, member_obj)
                     || chain_roots_at_iterator_from(member_obj)
                     || is_util_mime_params_receiver(ctx, member_obj);
+                // thisArg routing: the dense `Expr::Array<Method>` fast paths
+                // carry only the callback and silently drop a 2nd positional
+                // `thisArg` argument, so `[x].every(cb, thisArg)` ran the
+                // callback with `this === undefined` (test262 §15.4.4.* `-5-*`
+                // / `-7-*`). The generic `Expr::ArrayLikeMethod` lowering binds
+                // the callback `this` via the spec-complete `js_arraylike_*`
+                // runtime entry points (ToObject + LengthOfArrayLike + a
+                // ThisGuard around each invocation), so when an explicit thisArg
+                // is supplied route the callback iterators through it. Gated on
+                // `!recv_is_class` (which already excludes Map/Set/class
+                // receivers — those keep their own forEach contract) and on the
+                // 2nd argument being a plain positional (no spread).
+                // `recv_is_class` does NOT cover Map/Set/URLSearchParams locals,
+                // which keep their own `forEach` contract (callback signature +
+                // thisArg binding via `js_{map,set}_foreach`). Folding a 2-arg
+                // `set.forEach(cb, thisArg)` into the array-like path here ran the
+                // callback against an array view → zero iterations (test262
+                // Set/Map forEach this-arg-explicit). Exclude them explicitly.
+                let recv_is_non_array_collection = {
+                    let is_nac = |ty: &Type| {
+                        matches!(ty, Type::Generic { base, .. } if base == "Map" || base == "Set")
+                            || matches!(ty, Type::Named(n) if n == "URLSearchParams")
+                    };
+                    match member.obj.as_ref() {
+                        ast::Expr::Ident(ident) => {
+                            match ctx.lookup_local_type(ident.sym.as_ref()) {
+                                Some(ty) if is_nac(ty) => true,
+                                Some(Type::Union(variants)) => variants.iter().any(is_nac),
+                                _ => false,
+                            }
+                        }
+                        _ => false,
+                    }
+                };
+                if !recv_is_class
+                    && !recv_is_non_array_collection
+                    && matches!(
+                        method_name,
+                        "map"
+                            | "filter"
+                            | "forEach"
+                            | "find"
+                            | "findIndex"
+                            | "findLast"
+                            | "findLastIndex"
+                            | "some"
+                            | "every"
+                    )
+                    && call.args.len() >= 2
+                    && call.args.iter().all(|a| a.spread.is_none())
+                {
+                    let receiver = Box::new(lower_expr(ctx, &member.obj)?);
+                    return Ok(Ok(Expr::ArrayLikeMethod {
+                        method: method_name.to_string(),
+                        receiver,
+                        args,
+                    }));
+                }
                 match method_name {
                     "reduce" if !args.is_empty() && !recv_is_class => {
                         let array_expr = lower_expr(ctx, &member.obj)?;

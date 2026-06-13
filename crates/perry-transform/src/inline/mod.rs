@@ -37,8 +37,9 @@ pub(crate) use call_inliner::{
 };
 pub(crate) use clamp::{is_clamp3, is_clamp_u8};
 pub(crate) use closure_analysis::{
-    body_contains_closure_capturing, body_contains_super_call, collect_closure_captured_local_ids,
-    find_max_local_id, has_simple_control_flow, is_pure_function,
+    body_contains_closure_capturing, body_contains_super_call, body_references_dynamic_this,
+    collect_closure_captured_local_ids, collect_mutated_local_ids, find_max_local_id,
+    has_simple_control_flow, is_pure_function,
 };
 pub(crate) use cross_module::{
     body_references_class_in_set, collect_nonexported_class_names,
@@ -492,6 +493,7 @@ pub fn inline_functions(
                     type_only: false,
                     is_dynamic: false,
                     is_dynamic_target: false,
+                    is_deferred_require: false,
                 });
             }
         }
@@ -697,6 +699,8 @@ mod tests {
             methods: Vec::new(),
             getters: Vec::new(),
             setters: Vec::new(),
+            static_accessor_names: Vec::new(),
+            static_accessor_fn_ids: Vec::new(),
             static_fields: Vec::new(),
             static_methods: Vec::new(),
             computed_members: Vec::new(),

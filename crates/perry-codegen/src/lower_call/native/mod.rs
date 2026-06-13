@@ -107,6 +107,32 @@ pub(crate) fn lower_native_method_call(
                     &[(DOUBLE, &iter), (DOUBLE, &done)],
                 ));
             }
+            "requireObjectCoercible" => {
+                let val = args.first().map_or_else(
+                    || Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED))),
+                    |arg| lower_expr(ctx, arg),
+                )?;
+                return Ok(ctx.block().call(
+                    DOUBLE,
+                    "js_require_object_coercible",
+                    &[(DOUBLE, &val)],
+                ));
+            }
+            "iteratorRestToArray" => {
+                let iter = args.first().map_or_else(
+                    || Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED))),
+                    |arg| lower_expr(ctx, arg),
+                )?;
+                let done = args.get(1).map_or_else(
+                    || Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED))),
+                    |arg| lower_expr(ctx, arg),
+                )?;
+                return Ok(ctx.block().call(
+                    DOUBLE,
+                    "js_iterator_rest_to_array",
+                    &[(DOUBLE, &iter), (DOUBLE, &done)],
+                ));
+            }
             _ => {}
         }
     }
@@ -2115,6 +2141,41 @@ pub(crate) fn lower_native_method_call(
             method,
             args.len()
         );
+    }
+
+    if module == "array" && method == "fill_generic" {
+        let recv_box = lower_expr(ctx, recv)?;
+        let mut lowered: Vec<String> = Vec::with_capacity(args.len());
+        for arg in args {
+            lowered.push(lower_expr(ctx, arg)?);
+        }
+        let undefined = double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
+        let value = lowered
+            .first()
+            .cloned()
+            .unwrap_or_else(|| undefined.clone());
+        let (has_start, start) = if let Some(start) = lowered.get(1) {
+            ("1".to_string(), start.clone())
+        } else {
+            ("0".to_string(), undefined.clone())
+        };
+        let (has_end, end) = if let Some(end) = lowered.get(2) {
+            ("1".to_string(), end.clone())
+        } else {
+            ("0".to_string(), undefined)
+        };
+        return Ok(ctx.block().call(
+            DOUBLE,
+            "js_array_fill_generic",
+            &[
+                (DOUBLE, &recv_box),
+                (DOUBLE, &value),
+                (I32, &has_start),
+                (DOUBLE, &start),
+                (I32, &has_end),
+                (DOUBLE, &end),
+            ],
+        ));
     }
 
     if module == "array" && method == "push_spread" {

@@ -48,14 +48,18 @@ pub(self) use extract_exports::{
     extract_exports_from_source, extract_named_exports_from_require,
     extract_object_literal_exports_from_require, extract_single_module_exports_assignment,
 };
-pub(self) use extract_requires::{extract_require_aliases_with_ranges, extract_require_specifiers};
+pub(self) use extract_requires::{
+    extract_export_star_specs, extract_require_aliases_with_ranges, extract_require_specifiers,
+    function_local_specs, identifier_is_reassigned,
+};
 pub(self) use hoist_classes::{
     extract_top_level_class_decls, rewrite_module_exports_class_expression,
+    source_has_top_level_return, top_level_class_names,
 };
 
 // Public API consumed by `compile.rs` / `collect_modules.rs`.
 pub(super) use detect::is_commonjs;
-pub(super) use wrap::wrap_commonjs;
+pub(super) use wrap::wrap_commonjs_for_target;
 
 #[cfg(test)]
 mod tests {
@@ -67,7 +71,8 @@ mod tests {
     use super::extract_requires::{
         extract_require_aliases_with_ranges, extract_require_specifiers,
     };
-    use super::wrap::wrap_commonjs;
+    use super::hoist_classes::{source_has_top_level_return, top_level_class_names};
+    use super::wrap::{wrap_commonjs, wrap_commonjs_for_target};
     use std::fs;
     use std::path::PathBuf;
 
@@ -89,6 +94,76 @@ mod tests {
     #[test]
     fn does_not_detect_pure_esm() {
         assert!(!is_commonjs("import x from 'foo'; export const y = 1;"));
+    }
+
+    #[test]
+    fn require_only_file_with_import_word_in_comment_is_cjs() {
+        // Next.js `setup-node-env.external.js`: pure side-effect requires,
+        // but the header comment contains the word "import". The comment
+        // must not flip classification to ESM.
+        let src = r#"// This is a minimal import that initializes the node environment
+"use strict";
+if (process.env.NEXT_RUNTIME !== 'edge') {
+    require('next/dist/server/node-environment');
+}
+"#;
+        assert!(
+            is_commonjs(src),
+            "comment text must not defeat require( arm"
+        );
+    }
+
+    #[test]
+    fn template_literal_esm_codegen_is_still_cjs() {
+        // next/dist/build/utils.js writes an ESM server.js via a template
+        // literal whose column-0 `import path from 'node:path'` line must
+        // not flip this CJS file to the ESM pipeline.
+        let src = "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\nexports.write = function() {\n  return `performance.mark('next-start');\nimport path from 'node:path'\nimport module from 'node:module'\n`;\n};\n";
+        assert!(
+            is_commonjs(src),
+            "template-literal import must not defeat CJS detection"
+        );
+    }
+
+    #[test]
+    fn nested_template_interpolation_stays_masked() {
+        // next/dist/build/utils.js shape: an outer template whose `${…}`
+        // interpolation contains NESTED templates with column-0 `import`
+        // lines. The whole construct must stay masked as string content.
+        let src = "\"use strict\";\nexports.write = (m) => {\n  return `${m ? `x\nimport path from 'node:path'\n` : `const path = require('path')`}\nrest`;\n};\n";
+        assert!(
+            is_commonjs(src),
+            "nested template import lines must not defeat CJS detection"
+        );
+    }
+
+    #[test]
+    fn regex_with_quote_does_not_mask_trailing_module_exports() {
+        // comment-json's bundle shape: regex literals containing quotes
+        // followed by the real `module.exports=` tail. The stripper must
+        // track regex literals or the tail is masked as string content.
+        let src = "const e = s.split(/['\"]/);\nvar i = make();\nmodule.exports = i;\n";
+        assert!(
+            is_commonjs(src),
+            "regex with quote must not hide module.exports"
+        );
+    }
+
+    #[test]
+    fn require_in_string_only_is_not_cjs() {
+        // `require(` appearing only inside a string literal is not evidence
+        // of CommonJS.
+        let src = "const msg = \"call require('x') yourself\";\nconsole.log(msg);\n";
+        assert!(!is_commonjs(src));
+    }
+
+    #[test]
+    fn empty_file_is_cjs() {
+        // Marker packages (react's `client-only`) ship a 0-byte index.js;
+        // its default import must resolve to the wrap's empty exports
+        // object, so empty/whitespace-only sources count as CommonJS.
+        assert!(is_commonjs(""));
+        assert!(is_commonjs("  \n\t\n"));
     }
 
     #[test]
@@ -276,6 +351,126 @@ module.exports = inner;
         assert!(
             wrapped.contains("if (specifier === './dep') return dep;"),
             "expected require dispatch through aliased import, got:\n{}",
+            wrapped
+        );
+    }
+
+    #[test]
+    fn wrap_keeps_reassigned_require_alias_as_mutable_local() {
+        // Issue #5006: a `require()`-initialized alias that is later
+        // *reassigned* (the signal-exit `signals = signals.filter(...)` shape)
+        // must NOT be hoisted into an immutable `import s from '...'` with its
+        // declaration blanked — that makes the reassignment unresolvable
+        // (`ReferenceError: s is not defined`). It must stay a real mutable
+        // local fed by the `_req_N` import.
+        let src = "var s = require('./data.js');\ns = s.filter(function () { return true; });\nmodule.exports = s;";
+        let wrapped = wrap_commonjs(src, &PathBuf::from("/tmp/test.js"));
+        // Falls back to the placeholder import name (alias not adopted)...
+        assert!(
+            wrapped.contains("import _req_0 from './data.js';"),
+            "expected non-adopted _req_0 import, got:\n{}",
+            wrapped
+        );
+        // ...the require dispatches through it...
+        assert!(
+            wrapped.contains("if (specifier === './data.js') return _req_0;"),
+            "expected require dispatch through _req_0, got:\n{}",
+            wrapped
+        );
+        // ...and the original `var s = require('./data.js')` declaration stays
+        // in the IIFE body (not blanked) so `s` is a mutable local.
+        assert!(
+            wrapped.contains("var s = require('./data.js');"),
+            "expected the alias declaration to survive as a mutable local, got:\n{}",
+            wrapped
+        );
+    }
+
+    #[test]
+    fn identifier_is_reassigned_distinguishes_declaration_from_write() {
+        use super::extract_requires::identifier_is_reassigned;
+        // Pure read-only alias: declaration + member reads only.
+        assert!(!identifier_is_reassigned(
+            "var dep = require('./dep'); module.exports = dep.value;",
+            "dep"
+        ));
+        // Reassignment.
+        assert!(identifier_is_reassigned(
+            "var s = require('./d'); s = s.filter(() => true);",
+            "s"
+        ));
+        // Compound assignment.
+        assert!(identifier_is_reassigned(
+            "var n = require('./n'); n += 1;",
+            "n"
+        ));
+        // Comparisons / arrows / member writes must not count as reassignment.
+        assert!(!identifier_is_reassigned(
+            "var s = require('./d'); if (s === other) {} obj.s = 1; cb(() => s);",
+            "s"
+        ));
+    }
+
+    #[test]
+    fn wrap_prunes_dead_process_platform_require_for_windows_target() {
+        let src = r#"
+var terminalCtor;
+if (process.platform === 'win32') {
+    terminalCtor = require('./windowsTerminal').WindowsTerminal;
+}
+else {
+    terminalCtor = require('./unixTerminal').UnixTerminal;
+}
+exports.spawn = function spawn() { return terminalCtor; };
+"#;
+        let wrapped = wrap_commonjs_for_target(
+            src,
+            &PathBuf::from("/tmp/node_modules/node-pty/lib/index.js"),
+            Some("windows"),
+        );
+        assert!(
+            wrapped.contains("import _req_0 from './windowsTerminal';")
+                || wrapped.contains("import terminalCtor from './windowsTerminal';"),
+            "expected live Windows require to stay hoisted, got:\n{}",
+            wrapped
+        );
+        assert!(
+            !wrapped.contains("from './unixTerminal'"),
+            "dead Unix require must not become an eager ESM import on Windows, got:\n{}",
+            wrapped
+        );
+        assert!(
+            !wrapped.contains("if (specifier === './unixTerminal')"),
+            "dead Unix require must not be dispatchable on Windows, got:\n{}",
+            wrapped
+        );
+    }
+
+    #[test]
+    fn wrap_prunes_dead_process_platform_require_for_linux_target() {
+        let src = r#"
+var terminalCtor;
+if (process.platform === 'win32') {
+    terminalCtor = require('./windowsTerminal').WindowsTerminal;
+}
+else {
+    terminalCtor = require('./unixTerminal').UnixTerminal;
+}
+exports.spawn = function spawn() { return terminalCtor; };
+"#;
+        let wrapped = wrap_commonjs_for_target(
+            src,
+            &PathBuf::from("/tmp/node_modules/node-pty/lib/index.js"),
+            Some("linux"),
+        );
+        assert!(
+            wrapped.contains("from './unixTerminal'"),
+            "expected live Unix require to stay hoisted, got:\n{}",
+            wrapped
+        );
+        assert!(
+            !wrapped.contains("from './windowsTerminal'"),
+            "dead Windows require must not become an eager ESM import on Linux, got:\n{}",
             wrapped
         );
     }
@@ -580,6 +775,87 @@ module.exports = SafeBuffer;"#;
             wrapped
         );
         assert!(wrapped.contains("export { Child };"));
+    }
+
+    #[test]
+    fn wrap_flat_emits_class_module_exports_that_closes_over_top_level_const() {
+        // Issue #4933: `module.exports = StackUtils` where the class reads a
+        // top-level `const` (so the #2310 hoist guard refuses to lift it). The
+        // old path degraded to `export default _cjs`, losing class identity —
+        // statics, `.prototype`, and the closure all read `undefined` on the
+        // consumer side. The flat path drops the IIFE so the class stays a real
+        // top-level declaration with full identity.
+        let src = "const natives = ['a', 'b'];\n\
+                   class StackUtils {\n\
+                     static nodeInternals() { return natives.slice(); }\n\
+                     clean(s) { return 'x' + s; }\n\
+                   }\n\
+                   module.exports = StackUtils;";
+        let wrapped = wrap_commonjs(src, &PathBuf::from("/tmp/test.js"));
+        assert!(
+            wrapped.contains("export default StackUtils;"),
+            "expected direct default export of StackUtils, got:\n{}",
+            wrapped
+        );
+        assert!(
+            wrapped.contains("export { StackUtils };"),
+            "expected named export of StackUtils, got:\n{}",
+            wrapped
+        );
+        assert!(
+            !wrapped.contains("export default _cjs;"),
+            "flat emission must not fall back to the opaque _cjs default, got:\n{}",
+            wrapped
+        );
+        assert!(
+            !wrapped.contains("const _cjs = (function()"),
+            "flat emission must drop the IIFE wrapper, got:\n{}",
+            wrapped
+        );
+        // The CommonJS runtime shims still run at module scope.
+        assert!(wrapped.contains("const __cjs_module = { exports: {} };"));
+        assert!(wrapped.contains("const _cjs = __cjs_module.exports;"));
+    }
+
+    #[test]
+    fn top_level_class_names_lists_refused_and_hoisted_classes() {
+        let src = "const t = 1;\nclass A { m(){ return t; } }\nclass B {}\n";
+        let names = top_level_class_names(src);
+        assert_eq!(names, vec!["A".to_string(), "B".to_string()]);
+    }
+
+    #[test]
+    fn top_level_return_detection_ignores_returns_inside_bodies_and_regexes() {
+        // No top-level return: every `return` sits inside a function/class body,
+        // and the regex literal's brackets must not corrupt brace depth.
+        let no_return = "const re = /^(.*?) \\[as (.*?)\\]$/;\n\
+                         class C {\n\
+                           m() { if (true) { return 1; } return 2; }\n\
+                         }\n\
+                         module.exports = C;";
+        assert!(
+            !source_has_top_level_return(no_return),
+            "function-body returns must not count as top-level"
+        );
+        // A genuine module-top return keeps the IIFE.
+        let yes_return = "if (!supported) return;\nmodule.exports = {};";
+        assert!(source_has_top_level_return(yes_return));
+    }
+
+    #[test]
+    fn wrap_keeps_iife_for_class_module_exports_with_top_level_return() {
+        // A top-level `return` is legal in CommonJS but not at ESM module scope,
+        // so the IIFE wrap must be retained even for `module.exports = <Class>`.
+        let src = "const t = 1;\n\
+                   if (!t) return;\n\
+                   class C { m(){ return t; } }\n\
+                   module.exports = C;";
+        let wrapped = wrap_commonjs(src, &PathBuf::from("/tmp/test.js"));
+        assert!(
+            wrapped.contains("const _cjs = (function()"),
+            "module with a top-level return must keep the IIFE, got:\n{}",
+            wrapped
+        );
     }
 
     #[test]
@@ -990,6 +1266,34 @@ module.exports = SafeBuffer;"#;
     }
 
     #[test]
+    fn extract_exports_skips_inner_module_exports_param() {
+        // next/dist/compiled/p-queue: webpack/ncc inner modules write to their
+        // OWN exports object (`e.exports.X = …`), which is not a named export
+        // of the outer bundle. Pre-fix the dot-boundary regex matched it, the
+        // wrap emitted `export const TimeoutError = _cjs.TimeoutError;` at
+        // module scope, and that const shadowed the inner class binding —
+        // every inner reference to `TimeoutError` became undefined.
+        let src = "var mods = { 816: (e, t, n) => {\n\
+                       class TimeoutError extends Error {}\n\
+                       const pTimeout = (p) => p;\n\
+                       e.exports = pTimeout;\n\
+                       e.exports.str = 'hello';\n\
+                       e.exports.TimeoutError = TimeoutError;\n\
+                   }};\n\
+                   exports.real = 1;\n\
+                   module.exports.alsoReal = 2;\n";
+        let names = extract_exports_from_source(src);
+        assert!(
+            !names.contains(&"TimeoutError".to_string()),
+            "`e.exports.X` is an inner module's exports, not ours: {:?}",
+            names
+        );
+        assert!(!names.contains(&"str".to_string()), "got: {:?}", names);
+        assert!(names.contains(&"real".to_string()));
+        assert!(names.contains(&"alsoReal".to_string()));
+    }
+
+    #[test]
     fn wrap_pino_shape_parses_cleanly() {
         // Issue #845 — pino sub-bug: end-to-end check that a pino-shaped
         // CJS module produces parseable wrap output.
@@ -1013,15 +1317,21 @@ module.exports = SafeBuffer;"#;
         );
     }
 
-    /// Issue #2310 — when a top-level class body references a let/const
-    /// declared at the IIFE's top level (the ws/lib/sender.js shape:
-    /// `let randomPoolPointer; class Sender { static frame(){ … r++ } }`),
-    /// hoisting the class out of the IIFE would sever the closure over
-    /// `randomPoolPointer` and the compile hard-errors with
-    /// `Undefined variable in update expression`. Verify the class stays
-    /// inside the IIFE body and is NOT in the hoisted-class block.
+    /// Issue #2310 / #4933 — a top-level class body that references a
+    /// let/const declared at the IIFE's top level (the ws/lib/sender.js shape:
+    /// `let pointer; class Sender { static next(){ … pointer++ } }`) cannot be
+    /// *hoisted* above the IIFE — that would sever the closure and the compile
+    /// hard-errors with `Undefined variable in update expression`.
+    ///
+    /// For a `module.exports = Sender` default-export class, the #4933 flat
+    /// emission supersedes the old IIFE-retention mitigation: dropping the IIFE
+    /// puts BOTH the class and `let pointer` at module scope, so the closure
+    /// (including the `pointer++` mutation) survives AND the class keeps full
+    /// identity — the consumer's default import sees its statics / `.prototype`
+    /// instead of an opaque `_cjs`. Verify the wrap flat-emits the class
+    /// (no IIFE, direct default export) and still parses.
     #[test]
-    fn issue_2310_class_referencing_iife_let_is_not_hoisted() {
+    fn issue_2310_class_referencing_iife_let_flat_emits() {
         let src = "'use strict';\n\
                    const POOL_SIZE = 8;\n\
                    let pointer = 0;\n\
@@ -1030,17 +1340,25 @@ module.exports = SafeBuffer;"#;
                    }\n\
                    module.exports = Sender;\n";
         let wrapped = wrap_commonjs(src, &PathBuf::from("/tmp/sender.js"));
-        // The IIFE body must still contain the class — i.e. the wrap must
-        // not lift it above the `const _cjs = (function() { ... })()` line.
-        let iife_open = wrapped
-            .find("const _cjs = (function()")
-            .expect("wrap must produce the IIFE wrapper");
-        let class_pos = wrapped
-            .find("class Sender")
-            .expect("wrap must keep `class Sender` somewhere");
         assert!(
-            class_pos > iife_open,
-            "expected `class Sender` to stay inside the IIFE for #2310; got:\n{}",
+            wrapped.contains("export default Sender;"),
+            "expected flat default export of Sender, got:\n{}",
+            wrapped
+        );
+        assert!(
+            !wrapped.contains("const _cjs = (function()"),
+            "expected the IIFE to be dropped for the flat default-export class, got:\n{}",
+            wrapped
+        );
+        // `class Sender` and `let pointer` both land at module scope, so the
+        // mutable closure is preserved (behavioral parity verified separately).
+        assert!(wrapped.contains("class Sender"));
+        assert!(wrapped.contains("let pointer = 0;"));
+        let parsed = perry_parser::parse_typescript(&wrapped, "sender.js");
+        assert!(
+            parsed.is_ok(),
+            "flat-emitted sender wrap failed to parse: {:?}\nwrapped:\n{}",
+            parsed.err(),
             wrapped
         );
     }

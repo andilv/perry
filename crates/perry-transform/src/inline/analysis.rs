@@ -109,6 +109,18 @@ pub fn is_inlinable(func: &Function) -> bool {
         return false;
     }
 
+    // Don't inline functions that reference the dynamic `this` / `new.target`
+    // bindings. Those belong to the callee's own invocation, but the inliner
+    // substitutes the body into the CALLER's frame, where `this`/`new.target`
+    // resolve to the caller's binding. A strict callee called as `f()` has
+    // `this === undefined`; inlined into a sloppy caller it would instead read
+    // the caller's `this` (the global object), so `typeof this` flips from
+    // `"undefined"` to `"object"`. Refs test262 language/function-code
+    // `10.4.3-1-*`.
+    if body_references_dynamic_this(&func.body) {
+        return false;
+    }
+
     // Don't inline functions that call themselves. The single-Return-of-Call
     // pattern in `try_inline_simple_call` (and the multi-Let-then-Return
     // pattern) substitutes the body verbatim; when the body is
@@ -235,10 +247,20 @@ pub fn method_lookup_is_unshadowed(classes: &[Class], class_name: &str, method_n
         return false;
     };
 
+    // Index classes by name for O(1) chain-walk lookups instead of an
+    // O(classes) linear scan per level. `entry().or_insert` keeps the FIRST
+    // class for a duplicate name, matching the prior `iter().find()` semantics
+    // (duplicate class names occur cross-module, e.g. Effect's same-named
+    // `Type` in SchemaAST and ParseResult).
+    let mut by_name: HashMap<&str, &Class> = HashMap::with_capacity(classes.len());
+    for c in classes {
+        by_name.entry(c.name.as_str()).or_insert(c);
+    }
+
     let mut cur = Some(class_name);
     let mut depth = 0usize;
     while let Some(name) = cur {
-        let Some(class) = classes.iter().find(|c| c.name == name) else {
+        let Some(class) = by_name.get(name).copied() else {
             return false;
         };
         if class.extends_expr.is_some() || class.native_extends.is_some() {
@@ -296,10 +318,16 @@ pub fn class_chain_property_sets(
     let mut fields = HashSet::new();
     let mut getters = HashSet::new();
     let mut setters = HashSet::new();
+    // Index by name for O(1) chain-walk lookups; `entry().or_insert` keeps the
+    // first class for a duplicate name, matching the prior `iter().find()`.
+    let mut by_name: HashMap<&str, &Class> = HashMap::with_capacity(classes.len());
+    for c in classes {
+        by_name.entry(c.name.as_str()).or_insert(c);
+    }
     let mut cur = Some(class_name);
     let mut depth = 0usize;
     while let Some(name) = cur {
-        let class = classes.iter().find(|c| c.name == name)?;
+        let class = by_name.get(name).copied()?;
         if class.extends_expr.is_some() || class.native_extends.is_some() {
             return None;
         }

@@ -35,6 +35,7 @@ impl SH for Module {
             closure_display_names,
             closure_source_text,
             async_generator_funcs,
+            gen_param_prologue_len,
         } = self;
         name.hash(h);
         imports.hash(h);
@@ -83,6 +84,17 @@ impl SH for Module {
             id.hash(h);
             src.hash(h);
         }
+        // Generator param-prologue lengths drive the transform's prologue lift,
+        // which changes codegen output — include in the stable hash.
+        let mut prologue_pairs: Vec<(u32, usize)> = gen_param_prologue_len
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        prologue_pairs.sort_unstable_by_key(|(k, _)| *k);
+        for (id, len) in prologue_pairs {
+            id.hash(h);
+            (len as u64).hash(h);
+        }
     }
 }
 
@@ -118,6 +130,7 @@ impl SH for Import {
             type_only,
             is_dynamic,
             is_dynamic_target,
+            is_deferred_require,
         } = self;
         source.hash(h);
         specifiers.hash(h);
@@ -127,6 +140,7 @@ impl SH for Import {
         type_only.hash(h);
         is_dynamic.hash(h);
         is_dynamic_target.hash(h);
+        is_deferred_require.hash(h);
     }
 }
 

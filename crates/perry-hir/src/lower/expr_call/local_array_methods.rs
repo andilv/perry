@@ -44,10 +44,20 @@ pub(super) fn try_local_array_methods(
                     type_info,
                     Some(Type::Union(variants)) if variants.iter().any(|v| matches!(v, Type::String))
                 );
+                // A boxed `String` wrapper (`new String("x")`, type `Named("String")`)
+                // is NOT an array: the ambiguous methods shared with Array
+                // (`indexOf`/`includes`/`slice`/`lastIndexOf`) must route to the
+                // string dispatch (which `ToString`-coerces the wrapper), not to
+                // `ArrayIndexOf`/`ArrayIncludes` (which read it as an array and
+                // return -1/false). `search`/`match`/`split` already bypass this
+                // file because they aren't Array methods.
+                let is_boxed_string_wrapper =
+                    matches!(type_info, Some(Type::Named(n)) if n == "String");
                 let is_known_string = type_info
                     .map(|ty| matches!(ty, Type::String))
                     .unwrap_or(false)
-                    || is_union_with_string;
+                    || is_union_with_string
+                    || is_boxed_string_wrapper;
                 // A user-defined class instance is NOT an array — must skip the array
                 // fast path so user-defined methods like Stack<T>.push() are dispatched
                 // to the class method, not runtime js_array_push. Map/Set/Promise are
@@ -117,6 +127,14 @@ pub(super) fn try_local_array_methods(
                     Some(Type::Named(n))
                         if n == "Uint8Array" || n == "Buffer" || n == "Uint8ClampedArray"
                 );
+                let is_node_stream_readable_type = matches!(
+                    type_info,
+                    Some(Type::Named(n))
+                        if matches!(
+                            n.as_str(),
+                            "Readable" | "Duplex" | "Transform" | "PassThrough"
+                        )
+                );
                 let is_ambiguous_method = matches!(
                     method_name,
                     "indexOf" | "includes" | "slice" | "lastIndexOf"
@@ -129,6 +147,8 @@ pub(super) fn try_local_array_methods(
                     false // object type literal — dispatch via method call, not array ops
                 } else if is_buffer_type {
                     false // Buffer/Uint8Array — runtime dispatch handles byte-level methods
+                } else if is_node_stream_readable_type {
+                    false // Node streams expose iterator helpers with Array-like names
                 } else if is_known_not_string {
                     true // definitely not a string, enter array block
                 } else if is_ambiguous_method {
@@ -144,6 +164,52 @@ pub(super) fn try_local_array_methods(
                 // runtime but built-in constructors aren't first-class closure objects.
                 if is_not_string {
                     if let Some(array_id) = ctx.lookup_local(&arr_name) {
+                        // thisArg routing: the dense `Expr::Array<Method>` fast
+                        // paths drop a 2nd positional `thisArg`, so
+                        // `arr.every(cb, thisArg)` ran the callback with
+                        // `this === undefined`. Route the callback iterators
+                        // through the spec-complete `Expr::ArrayLikeMethod`
+                        // lowering (which binds the callback `this`) when an
+                        // explicit thisArg is supplied with no spread.
+                        // Map/Set/URLSearchParams keep their own forEach contract
+                        // (thisArg binding via `js_{map,set}_foreach`); folding
+                        // `set.forEach(cb, thisArg)` into the array-like path ran
+                        // the callback against an array view → zero iterations
+                        // (test262 Set/Map forEach this-arg-explicit). The 1-arg
+                        // `match` below already excludes them; mirror that here.
+                        let recv_is_non_array_collection = {
+                            let is_nac = |ty: &Type| {
+                                matches!(ty, Type::Generic { base, .. } if base == "Map" || base == "Set")
+                                    || matches!(ty, Type::Named(n) if n == "URLSearchParams")
+                            };
+                            match ctx.lookup_local_type(&arr_name) {
+                                Some(ty) if is_nac(ty) => true,
+                                Some(Type::Union(variants)) => variants.iter().any(is_nac),
+                                _ => false,
+                            }
+                        };
+                        if !recv_is_non_array_collection
+                            && matches!(
+                                method_name,
+                                "map"
+                                    | "filter"
+                                    | "forEach"
+                                    | "find"
+                                    | "findIndex"
+                                    | "findLast"
+                                    | "findLastIndex"
+                                    | "some"
+                                    | "every"
+                            )
+                            && call.args.len() >= 2
+                            && call.args.iter().all(|a| a.spread.is_none())
+                        {
+                            return Ok(Ok(Expr::ArrayLikeMethod {
+                                method: method_name.to_string(),
+                                receiver: Box::new(Expr::LocalGet(array_id)),
+                                args,
+                            }));
+                        }
                         match method_name {
                             "push" => {
                                 if args.is_empty() {

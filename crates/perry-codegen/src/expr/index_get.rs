@@ -30,7 +30,7 @@ use crate::type_analysis::{
     is_numeric_expr, is_set_expr, is_string_expr, is_url_search_params_expr, receiver_class_name,
 };
 #[allow(unused_imports)]
-use crate::types::{DOUBLE, I1, I32, I64, I8, PTR};
+use crate::types::{DOUBLE, I1, I16, I32, I64, I8, PTR};
 
 use super::arrays_finds::lower_buffer_index_get_i32;
 #[allow(unused_imports)]
@@ -107,6 +107,64 @@ fn is_async_dispose_symbol_index(index: &Expr) -> bool {
         Expr::WtfString(name) => name.as_slice() == b"@@__perry_wk_asyncDispose",
         _ => false,
     }
+}
+
+/// True when `object` evaluates to an INT32-tagged class ref or class
+/// prototype ref (NaN-box tag `0x7FFE`) rather than a heap-pointer object.
+/// Such values must reach `js_object_get_field_by_name` with their tag bits
+/// intact — masking with `POINTER_MASK_I64` strips the `0x7FFE` tag and the
+/// runtime never routes to the class-static-accessor / prototype-vtable
+/// lookup, so `(class { static get 0(){} })['0']` reads `undefined`.
+///
+/// Covers three shapes:
+///   * `Expr::ClassRef` / imported-class `ExternFuncRef` — a class ref value.
+///   * `LocalGet` of a local aliased to a class (`var C = class {…}` lowers to
+///     `Let { init: ClassRef }`, recording `local_class_aliases["C"] = "C"`).
+///     A literal member name (`C.x`) folds to `PropertyGet` and resolves on its
+///     own, but an integer-like / empty key stays an `IndexGet` and lands here.
+///   * `C.prototype` of either of the above — a prototype ref value, so
+///     `C.prototype['']` reaches the instance-vtable getter.
+pub(crate) fn index_object_is_class_or_proto_ref(ctx: &FnCtx<'_>, object: &Expr) -> bool {
+    match object {
+        Expr::ClassRef(_) => true,
+        Expr::ExternFuncRef { name, .. } => ctx.class_ids.contains_key(name),
+        Expr::LocalGet(id) => ctx
+            .local_id_to_name
+            .get(id)
+            .and_then(|name| ctx.local_class_aliases.get(name))
+            .map(|cls| ctx.class_ids.contains_key(cls))
+            .unwrap_or(false),
+        Expr::PropertyGet {
+            object: inner,
+            property,
+        } if property.as_str() == "prototype" => {
+            index_object_is_class_or_proto_ref(ctx, inner.as_ref())
+        }
+        _ => false,
+    }
+}
+
+/// Compute the receiver handle to pass to `js_object_get_field_by_name`-family
+/// helpers from a NaN-boxed receiver value (`obj_bits`). Heap objects must be
+/// masked to a raw pointer, but an INT32-tagged class ref (`0x7FFE`) must keep
+/// its tag bits so the runtime routes to the static field / method / accessor
+/// tables. When the receiver's class-ref-ness is known at compile time
+/// (`static_known`), pass full bits unconditionally; otherwise branch at runtime
+/// on the tag so a runtime class-ref value (e.g. a function parameter bound to a
+/// class — `function f(C, k){ return C[k]; }`) is handled too. (test262
+/// class/elements propertyHelper `isWritable(C, name)` does `C[name]`.)
+pub(crate) fn classref_preserving_handle(
+    blk: &mut crate::block::LlBlock,
+    obj_bits: &str,
+    static_known: bool,
+) -> String {
+    if static_known {
+        return obj_bits.to_string();
+    }
+    let top16 = blk.lshr(I64, obj_bits, "48");
+    let is_classref = blk.icmp_eq(I64, &top16, "32766"); // 0x7FFE
+    let masked = blk.and(I64, obj_bits, POINTER_MASK_I64);
+    blk.select(crate::types::I1, &is_classref, I64, obj_bits, &masked)
 }
 
 fn lower_class_method_bind(
@@ -320,6 +378,16 @@ fn lower_bounded_array_index_get(
     let fwd_bits = blk.and(I8, &gc_flags, "128"); // GC_FLAG_FORWARDED
     let is_fwd = blk.icmp_ne(I8, &fwd_bits, "0");
     let needs_slow = blk.or(I1, &is_lazy, &is_fwd);
+    // Index accessors / custom attribute descriptors (`Object.defineProperty
+    // (arr, i, { get })`) divert element reads through the descriptor tables —
+    // the raw slot load below would bypass them (test262 sort/precise-*).
+    // GcHeader._reserved (u16 at -6) carries OBJ_FLAG_ARRAY_DESCRIPTORS=0x400.
+    let obj_flags_addr = blk.sub(I64, &arr_handle, "6");
+    let obj_flags_ptr = blk.inttoptr(I64, &obj_flags_addr);
+    let obj_flags = blk.load(I16, &obj_flags_ptr);
+    let desc_bits = blk.and(I16, &obj_flags, "1024");
+    let has_desc = blk.icmp_ne(I16, &desc_bits, "0");
+    let needs_slow = blk.or(I1, &needs_slow, &has_desc);
 
     let lazy_idx = ctx.new_block("bidx.lazy");
     let fast_idx = ctx.new_block("bidx.fast");
@@ -385,6 +453,16 @@ fn lower_legacy_array_index_get(
     let fwd_bits = blk.and(I8, &gc_flags, "128"); // GC_FLAG_FORWARDED
     let is_fwd = blk.icmp_ne(I8, &fwd_bits, "0");
     let needs_slow = blk.or(I1, &is_lazy, &is_fwd);
+    // Index accessors / custom attribute descriptors (`Object.defineProperty
+    // (arr, i, { get })`) divert element reads through the descriptor tables —
+    // the raw slot load below would bypass them (test262 sort/precise-*).
+    // GcHeader._reserved (u16 at -6) carries OBJ_FLAG_ARRAY_DESCRIPTORS=0x400.
+    let obj_flags_addr = blk.sub(I64, &arr_handle, "6");
+    let obj_flags_ptr = blk.inttoptr(I64, &obj_flags_addr);
+    let obj_flags = blk.load(I16, &obj_flags_ptr);
+    let desc_bits = blk.and(I16, &obj_flags, "1024");
+    let has_desc = blk.icmp_ne(I16, &desc_bits, "0");
+    let needs_slow = blk.or(I1, &needs_slow, &has_desc);
 
     let lazy_idx = ctx.new_block("arr.lazy");
     let fast_idx = ctx.new_block("arr.fast");
@@ -770,18 +848,15 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             if let Expr::String(literal) = index.as_ref() {
                 // Static string key: use the interned StringPool entry
                 // so we get the same handle as obj["foo"].
-                let preserve_class_ref_bits = matches!(object.as_ref(), Expr::ClassRef(_))
-                    || matches!(object.as_ref(), Expr::ExternFuncRef { name, .. } if ctx.class_ids.contains_key(name));
+                let preserve_class_ref_bits =
+                    index_object_is_class_or_proto_ref(ctx, object.as_ref());
                 let obj_box = lower_expr(ctx, object)?;
                 let key_idx = ctx.strings.intern(literal);
                 let key_handle_global = format!("@{}", ctx.strings.entry(key_idx).handle_global);
                 let blk = ctx.block();
                 let obj_bits = blk.bitcast_double_to_i64(&obj_box);
-                let obj_handle = if preserve_class_ref_bits {
-                    obj_bits
-                } else {
-                    blk.and(I64, &obj_bits, POINTER_MASK_I64)
-                };
+                let obj_handle =
+                    classref_preserving_handle(blk, &obj_bits, preserve_class_ref_bits);
                 let key_box = blk.load(DOUBLE, &key_handle_global);
                 let key_bits = blk.bitcast_double_to_i64(&key_box);
                 let key_raw = blk.and(I64, &key_bits, POINTER_MASK_I64);
@@ -803,17 +878,14 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 // key may be an SSO value (e.g. from JSON.parse, .slice, or
                 // any short-string-producing op); the runtime fn dereferences
                 // it as `*StringHeader`. Issue #214 SSO bug class.
-                let preserve_class_ref_bits = matches!(object.as_ref(), Expr::ClassRef(_))
-                    || matches!(object.as_ref(), Expr::ExternFuncRef { name, .. } if ctx.class_ids.contains_key(name));
+                let preserve_class_ref_bits =
+                    index_object_is_class_or_proto_ref(ctx, object.as_ref());
                 let obj_box = lower_expr(ctx, object)?;
                 let key_box = lower_expr(ctx, index)?;
                 let blk = ctx.block();
                 let obj_bits = blk.bitcast_double_to_i64(&obj_box);
-                let obj_handle = if preserve_class_ref_bits {
-                    obj_bits
-                } else {
-                    blk.and(I64, &obj_bits, POINTER_MASK_I64)
-                };
+                let obj_handle =
+                    classref_preserving_handle(blk, &obj_bits, preserve_class_ref_bits);
                 let key_handle = unbox_str_handle(blk, &key_box);
                 let site_id = emit_typed_feedback_register_site(
                     ctx,
@@ -831,17 +903,25 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // First runtime-check whether the index is a Symbol; if so,
             // dispatch to the symbol-property side table — mirrors the
             // IndexSet branch. Otherwise fall through to string/numeric.
-            let preserve_class_ref_bits = matches!(object.as_ref(), Expr::ClassRef(_))
-                || matches!(object.as_ref(), Expr::ExternFuncRef { name, .. } if ctx.class_ids.contains_key(name));
+            let preserve_class_ref_bits = index_object_is_class_or_proto_ref(ctx, object.as_ref());
             let obj_box = lower_expr(ctx, object)?;
             let idx_box = lower_expr(ctx, index)?;
+            // RequireObjectCoercible(base): `null[k]` / `undefined[k]` must throw
+            // a TypeError per spec, NOT silently return undefined. The dotted
+            // PropertyGet path already guards nullish receivers; the computed
+            // form fell through to the by-name runtime helper (masked handle
+            // `2`/`1`) which returned undefined. The check fires here — after
+            // both the base and the property-key *expression* are evaluated but
+            // before ToPropertyKey (key coercion / `toString`) — matching the
+            // ECMAScript evaluation order (test262 compound-assignment S11.13.2_A7.*,
+            // prefix/postfix increment A6). A non-nullish receiver passes through
+            // unchanged. (#4918 non-class language remnant.)
+            let obj_box =
+                ctx.block()
+                    .call(DOUBLE, "js_require_object_coercible", &[(DOUBLE, &obj_box)]);
             let blk = ctx.block();
             let obj_bits = blk.bitcast_double_to_i64(&obj_box);
-            let obj_handle = if preserve_class_ref_bits {
-                obj_bits
-            } else {
-                blk.and(I64, &obj_bits, POINTER_MASK_I64)
-            };
+            let obj_handle = classref_preserving_handle(blk, &obj_bits, preserve_class_ref_bits);
             let is_sym_i32 = blk.call(I32, "js_is_symbol", &[(DOUBLE, &idx_box)]);
             let is_sym_bit = blk.icmp_ne(I32, &is_sym_i32, "0");
             let sym_idx = ctx.new_block("iget.sym");

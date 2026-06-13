@@ -87,7 +87,7 @@ pub extern "C" fn js_value_length_f64(value: f64) -> f64 {
             target_os = "visionos",
         )))]
         let heap_min: usize = 0x200_0000_0000;
-        if handle < heap_min || handle >= 0x8000_0000_0000 {
+        if handle < heap_min || (handle as u64) >= 0x8000_0000_0000 {
             return 0.0;
         }
         if let Some(value) = unsafe {
@@ -127,11 +127,38 @@ pub extern "C" fn js_value_length_f64(value: f64) -> f64 {
             crate::gc::GC_TYPE_LAZY_ARRAY => {
                 return unsafe { *(handle as *const u32) } as f64;
             }
-            // Closures, BigInts, Promises, Errors, plain Objects, Maps:
-            // no `.length`. Return 0 to match Perry's existing
-            // fallback for missing fields (JS would produce
-            // `undefined`, but the generic PropertyGet slow path
-            // already degrades to 0 here).
+            // A closure's `.length` is its spec param count (own-property
+            // override first, then the codegen-registered length). Without
+            // this arm a `Function`-typed receiver — e.g. a folded
+            // `new Function("a,b", body)` — would read 0 here. Mirrors the
+            // generic PropertyGet reflection path.
+            crate::gc::GC_TYPE_CLOSURE => {
+                return crate::closure::closure_length(
+                    handle as *const crate::closure::ClosureHeader,
+                )
+                .unwrap_or(0) as f64;
+            }
+            // A plain object CAN carry a `length` property — notably a
+            // variable whose static type was inferred `Array` but was
+            // reassigned to an array-like object (`var x = []; … x = {0:0};
+            // x.splice(1,1); x.length` — test262 splice/S15.4.4.12_A4_T1
+            // #10). Read it like any field; absent stays the 0 fallback.
+            crate::gc::GC_TYPE_OBJECT => {
+                let key = crate::string::js_string_from_bytes(b"length".as_ptr(), 6);
+                let v = crate::object::js_object_get_field_by_name_f64(
+                    handle as *const crate::object::ObjectHeader,
+                    key,
+                );
+                if v.to_bits() == crate::value::TAG_UNDEFINED {
+                    return 0.0;
+                }
+                let n = crate::builtins::js_number_coerce(v);
+                return if n.is_nan() { 0.0 } else { n };
+            }
+            // BigInts, Promises, Errors, Maps: no `.length`.
+            // Return 0 to match Perry's existing fallback for missing fields
+            // (JS would produce `undefined`, but the generic PropertyGet slow
+            // path already degrades to 0 here).
             _ => return 0.0,
         }
     }
@@ -239,7 +266,7 @@ pub unsafe extern "C" fn js_dynamic_object_get_property(
     }
 
     // Check if this is a handle-based object (small integer, not a real heap pointer)
-    if ptr < 0x100000 {
+    if crate::value::addr_class::is_handle_band(ptr as usize) {
         if let Some(dispatch) = crate::object::handle_property_dispatch() {
             return dispatch(ptr, property_name_ptr as *const u8, property_name_len);
         }
@@ -344,6 +371,23 @@ pub unsafe extern "C" fn js_dynamic_object_get_property(
 
     // Handle Error objects specially
     if object_type == crate::error::OBJECT_TYPE_ERROR {
+        // An own expando / accessor property (installed via defineProperty, or a
+        // reassigned `message`/`stack`) lives in the exotic side tables and wins
+        // over the builtin slot. The compiled member-get path consults these,
+        // but this lower-level dynamic getter — used by
+        // `Object.defineProperties` to read each descriptor off the properties
+        // bag — historically dropped straight to `undefined` for any key other
+        // than the five native slots, so an accessor/data expando on an Error
+        // read as `undefined` (and `defineProperties(obj, errObj)` then threw
+        // "Property description must be an object: undefined").
+        if let Some(v) = crate::object::exotic_expando::exotic_get_own_property(
+            ptr as usize,
+            crate::object::exotic_expando::ExoticKind::Error,
+            property_name,
+            obj_value,
+        ) {
+            return v;
+        }
         let error_ptr = ptr as *mut crate::error::ErrorHeader;
         match property_name {
             "message" => {

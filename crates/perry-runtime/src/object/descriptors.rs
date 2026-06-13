@@ -17,7 +17,7 @@ fn property_name_array_index(name: &str) -> Option<u32> {
     Some(value)
 }
 
-fn sort_property_names_ecma(names: &mut Vec<String>) {
+pub(crate) fn sort_property_names_ecma(names: &mut Vec<String>) {
     let mut indexed = Vec::new();
     let mut rest = Vec::new();
     for name in names.drain(..) {
@@ -113,6 +113,38 @@ pub extern "C" fn js_object_get_own_property_descriptor(obj_value: f64, key_valu
             super::has_own_helpers::throw_to_object_nullish_type_error();
         }
 
+        // A Proxy is a small registered id, not a heap object — the ordinary
+        // resolution below would deref the fake pointer and segfault. The
+        // Reflect entry point shares `[[GetOwnProperty]]` semantics (trap +
+        // invariant checks + FromPropertyDescriptor) and forwards non-proxies
+        // straight back here, so there's no recursion. (Proxy crash cluster.)
+        if crate::proxy::js_proxy_is_proxy(obj_value) != 0 {
+            return crate::proxy::js_reflect_get_own_property_descriptor(obj_value, key_value);
+        }
+
+        // Private elements (`#x`) are stored on the static side / in a class
+        // instance's keys_array but are never reflectable own properties, so
+        // their descriptor is always undefined. (Plain `{"#fff": 1}` literals
+        // carry class_id 0 and are handled by the ordinary path below.)
+        {
+            let kjv = crate::JSValue::from_bits(key_value.to_bits());
+            let mut buf = [0u8; crate::value::SHORT_STRING_MAX_LEN];
+            if let Some(b) = crate::string::js_string_key_bytes(kjv, &mut buf) {
+                if b.first() == Some(&b'#') {
+                    let is_class = class_ref_id(obj_value).is_some() || {
+                        let obj = extract_obj_ptr(obj_value);
+                        !obj.is_null()
+                            && (obj as usize) >= crate::gc::GC_HEADER_SIZE + 0x1000
+                            && crate::object::is_valid_obj_ptr(obj as *const u8)
+                            && (*obj).class_id != 0
+                    };
+                    if is_class {
+                        return f64::from_bits(crate::value::TAG_UNDEFINED);
+                    }
+                }
+            }
+        }
+
         // #2818: string primitives box to String objects whose own
         // properties are the index keys "0".."len-1" (writable:false,
         // enumerable:true, configurable:false) plus "length"
@@ -180,11 +212,83 @@ pub extern "C" fn js_object_get_own_property_descriptor(obj_value: f64, key_valu
             );
         }
 
+        // Date / RegExp / Error exotic instances: own properties live in the
+        // expando side tables (plus a few builtin own slots), never in an
+        // `ObjectHeader` — the ordinary path below would bit-cast the cell.
+        if let Some((addr, kind)) = super::exotic_expando::exotic_expando_kind_of_value(obj_value) {
+            use super::exotic_expando::ExoticKind;
+            let Some(name) = super::metadata_key_to_string(key_value) else {
+                return f64::from_bits(crate::value::TAG_UNDEFINED);
+            };
+            if let Some(acc) = super::get_accessor_descriptor(addr, &name) {
+                let attrs = super::get_property_attrs(addr, &name)
+                    .unwrap_or(PropertyAttrs::new(false, false, false));
+                let undef = crate::value::TAG_UNDEFINED;
+                return build_accessor_descriptor(
+                    f64::from_bits(if acc.get == 0 { undef } else { acc.get }),
+                    f64::from_bits(if acc.set == 0 { undef } else { acc.set }),
+                    attrs.enumerable(),
+                    attrs.configurable(),
+                );
+            }
+            if let Some(bits) = super::exotic_expando::value_lookup(kind, addr, &name) {
+                let attrs = super::get_property_attrs(addr, &name)
+                    .unwrap_or(PropertyAttrs::new(true, true, true));
+                return build_data_descriptor(
+                    f64::from_bits(bits),
+                    attrs.writable(),
+                    attrs.enumerable(),
+                    attrs.configurable(),
+                );
+            }
+            // Builtin own slots: RegExp `lastIndex` (writable, non-enum,
+            // non-config) and Error `message`/`stack` (writable, non-enum,
+            // configurable).
+            if kind == ExoticKind::RegExp && name == "lastIndex" {
+                let attrs = super::get_property_attrs(addr, &name)
+                    .unwrap_or(PropertyAttrs::new(true, false, false));
+                let re = addr as *const crate::regex::RegExpHeader;
+                return build_data_descriptor(
+                    f64::from_bits((*re).last_index),
+                    attrs.writable(),
+                    attrs.enumerable(),
+                    attrs.configurable(),
+                );
+            }
+            if kind == ExoticKind::Error && matches!(name.as_str(), "message" | "stack") {
+                let attrs = super::get_property_attrs(addr, &name)
+                    .unwrap_or(PropertyAttrs::new(true, false, true));
+                let err = addr as *mut crate::error::ErrorHeader;
+                let s = if name == "message" {
+                    crate::error::js_error_get_message(err)
+                } else {
+                    crate::error::js_error_get_stack(err)
+                };
+                return build_data_descriptor(
+                    f64::from_bits(crate::js_nanbox_string(s as i64).to_bits()),
+                    attrs.writable(),
+                    attrs.enumerable(),
+                    attrs.configurable(),
+                );
+            }
+            return f64::from_bits(crate::value::TAG_UNDEFINED);
+        }
+
         if let Some(class_id) = class_ref_id(obj_value) {
             let method_name = metadata_key_to_string(key_value);
             if let Some(method_name) = method_name {
                 if super::class_registry::class_is_key_deleted(class_id, &method_name) {
                     return f64::from_bits(crate::value::TAG_UNDEFINED);
+                }
+                // `C.prototype` is a non-writable, non-enumerable, non-configurable
+                // own data property of the class constructor (ECMA-262
+                // MakeConstructor). Only the constructor ref carries it — the
+                // prototype ref's own `prototype` lookup falls through.
+                // (Test262 definition/prototype-property.)
+                if method_name == "prototype" && super::class_prototype_ref_id(obj_value).is_none()
+                {
+                    let proto = super::native_module::class_prototype_ref_value(class_id);
+                    return build_data_descriptor(proto, false, false, false);
                 }
                 if method_name == "name"
                     && super::class_prototype_ref_id(obj_value).is_none()
@@ -203,6 +307,23 @@ pub extern "C" fn js_object_get_own_property_descriptor(obj_value: f64, key_valu
                             true,
                         );
                     }
+                }
+                // Class accessors reflect as accessor descriptors: instance
+                // `get x(){}` is an own property of `C.prototype`, a static
+                // accessor an own property of `C` itself. The raw vtable
+                // func_ptrs are wrapped as callable function values.
+                let accessor = if super::class_prototype_ref_id(obj_value).is_some() {
+                    super::class_registry::class_own_accessor_ptrs(class_id, &method_name)
+                } else {
+                    super::class_registry::class_own_static_accessor_ptrs(class_id, &method_name)
+                };
+                if let Some((g, s)) = accessor {
+                    return build_accessor_descriptor(
+                        super::class_registry::class_accessor_function_value(g, false),
+                        super::class_registry::class_accessor_function_value(s, true),
+                        false,
+                        true,
+                    );
                 }
                 if method_name == "constructor" || class_has_own_method(class_id, &method_name) {
                     let value = if method_name == "constructor"
@@ -231,6 +352,36 @@ pub extern "C" fn js_object_get_own_property_descriptor(obj_value: f64, key_valu
                     *fields.add(3) = f64::from_bits(TAG_TRUE);
                     super::rebuild_object_field_layout(desc, 4);
                     return f64::from_bits((desc as u64) | 0x7FFD_0000_0000_0000);
+                }
+                // Static methods are own properties of the class *constructor*
+                // (not the prototype). `getOwnPropertyDescriptor(C, "m")` for a
+                // `static m() {}` must report a `{ writable, enumerable: false,
+                // configurable }` data property — `hasOwnProperty(C, "m")`
+                // already returns true, so without this the two disagreed and
+                // verifyProperty threw "reading 'enumerable'" on undefined
+                // (Test262 elements/after-same-line-static-*).
+                if super::class_prototype_ref_id(obj_value).is_none()
+                    && super::class_registry::class_has_own_static_method(class_id, &method_name)
+                {
+                    // Bind the static method to the constructor ref to produce a
+                    // callable value, mirroring the `C.m` read path. The name
+                    // bytes are leaked (bounded by the static descriptor set) so
+                    // the pointer js_class_method_bind stashes stays valid.
+                    let leaked: &'static [u8] = method_name.as_bytes().to_vec().leak();
+                    let value =
+                        super::js_class_method_bind(obj_value, leaked.as_ptr(), leaked.len());
+                    return build_data_descriptor(value, true, false, true);
+                }
+                // Static FIELDS are own data properties of the constructor,
+                // created via CreateDataPropertyOrThrow → writable, enumerable,
+                // configurable all true. Codegen registers each declared
+                // static field in CLASS_DYNAMIC_PROPS at module init.
+                if super::class_prototype_ref_id(obj_value).is_none() {
+                    if let Some(v) =
+                        super::class_registry::class_own_static_field_value(class_id, &method_name)
+                    {
+                        return build_data_descriptor(v, true, true, true);
+                    }
                 }
             }
             return f64::from_bits(crate::value::TAG_UNDEFINED);
@@ -416,19 +567,71 @@ pub extern "C" fn js_object_get_own_property_descriptor(obj_value: f64, key_valu
                 };
                 let is_frozen = crate::array::array_is_frozen(arr);
                 if name == "length" {
+                    // `defineProperty(arr, "length", {writable:false})` records
+                    // the flag in the attrs side table — honor it here.
+                    let writable = !is_frozen
+                        && get_property_attrs(obj as usize, "length")
+                            .map(|a| a.writable())
+                            .unwrap_or(true);
                     return build_data_descriptor(
                         crate::array::js_array_length(arr) as f64,
-                        !is_frozen,
+                        writable,
                         false,
                         false,
                     );
                 }
                 if let Some(index) = super::canonical_array_index(name) {
+                    // An array index converted to an accessor via
+                    // `Object.defineProperty(arr, i, { get/set })` is recorded in
+                    // the accessor side table; report it as an accessor descriptor.
+                    if let Some(acc) = get_accessor_descriptor(obj as usize, name) {
+                        let attrs = get_property_attrs(obj as usize, name)
+                            .unwrap_or(PropertyAttrs::new(false, false, false));
+                        let get = if acc.get == 0 {
+                            f64::from_bits(crate::value::TAG_UNDEFINED)
+                        } else {
+                            f64::from_bits(acc.get)
+                        };
+                        let set = if acc.set == 0 {
+                            f64::from_bits(crate::value::TAG_UNDEFINED)
+                        } else {
+                            f64::from_bits(acc.set)
+                        };
+                        return build_accessor_descriptor(
+                            get,
+                            set,
+                            attrs.enumerable(),
+                            attrs.configurable(),
+                        );
+                    }
                     if super::has_own_helpers::array_own_key_present(arr, key_str) {
                         let value = crate::array::js_array_get_f64(arr, index);
-                        return build_data_descriptor(value, !is_frozen, true, !is_frozen);
+                        // A dense element defaults to writable/enumerable/
+                        // configurable (frozen drops writable+configurable). A
+                        // prior `Object.defineProperty(arr, i, {...})` records
+                        // explicit attributes in the side table — honor those.
+                        let attrs = get_property_attrs(obj as usize, name)
+                            .unwrap_or_else(|| PropertyAttrs::new(!is_frozen, true, !is_frozen));
+                        return build_data_descriptor(
+                            value,
+                            attrs.writable(),
+                            attrs.enumerable(),
+                            attrs.configurable(),
+                        );
                     }
                     return f64::from_bits(crate::value::TAG_UNDEFINED);
+                }
+                // Named (non-index) accessor installed via defineProperty.
+                if let Some(acc) = get_accessor_descriptor(obj as usize, name) {
+                    let attrs = get_property_attrs(obj as usize, name)
+                        .unwrap_or(PropertyAttrs::new(false, false, false));
+                    let undef = crate::value::TAG_UNDEFINED;
+                    return build_accessor_descriptor(
+                        f64::from_bits(if acc.get == 0 { undef } else { acc.get }),
+                        f64::from_bits(if acc.set == 0 { undef } else { acc.set }),
+                        attrs.enumerable(),
+                        attrs.configurable(),
+                    );
                 }
                 if let Some(value) = crate::array::array_named_property_get(arr, key_str) {
                     let attrs = get_property_attrs(obj as usize, name)
@@ -512,6 +715,22 @@ pub extern "C" fn js_object_get_own_property_descriptor(obj_value: f64, key_valu
                         return build_data_descriptor(value, false, true, false);
                     }
                     return build_data_descriptor(f64::from_bits(value.bits()), true, true, true);
+                }
+            }
+        }
+
+        // A declared class's materialized `.prototype` object: instance
+        // accessors (`get x(){}`) live in the class vtable, not the object's
+        // fields, but they ARE own properties of the prototype.
+        if let Some(cid) = super::class_registry::class_id_for_decl_prototype_object(obj as usize) {
+            if let Some(ref name) = key_rust {
+                if let Some((g, s)) = super::class_registry::class_own_accessor_ptrs(cid, name) {
+                    return build_accessor_descriptor(
+                        super::class_registry::class_accessor_function_value(g, false),
+                        super::class_registry::class_accessor_function_value(s, true),
+                        false,
+                        true,
+                    );
                 }
             }
         }
@@ -681,9 +900,15 @@ pub extern "C" fn js_object_get_own_property_names(obj_value: f64) -> f64 {
         if obj_jv.is_null() || obj_jv.is_undefined() {
             super::has_own_helpers::throw_to_object_nullish_type_error();
         }
+        // A Proxy is a small registered id, not a heap object — route it to the
+        // `ownKeys` trap (string subset) before the handle-dispatch fallback,
+        // which would mis-read the fake pointer and return an empty array.
+        if crate::proxy::js_proxy_is_proxy(obj_value) != 0 {
+            return crate::proxy::proxy_own_property_names(obj_value);
+        }
         if obj_jv.is_pointer() {
             let raw = crate::value::js_nanbox_get_pointer(obj_value) as usize;
-            if raw > 0 && raw < 0x100000 {
+            if crate::value::addr_class::is_small_handle(raw) {
                 if let Some(dispatch) = super::class_registry::handle_own_property_names_dispatch()
                 {
                     let names = dispatch(raw as i64);
@@ -704,6 +929,28 @@ pub extern "C" fn js_object_get_own_property_names(obj_value: f64) -> f64 {
                 false,
             );
             return f64::from_bits((result as u64) | 0x7FFD_0000_0000_0000);
+        }
+        // Date / RegExp / Error exotic instances: expando keys (including
+        // non-enumerable ones) + per-kind builtin own slots.
+        if let Some((addr, kind)) = super::exotic_expando::exotic_expando_kind_of_value(obj_value) {
+            use super::exotic_expando::ExoticKind;
+            let mut names = match kind {
+                ExoticKind::RegExp => vec!["lastIndex".to_string()],
+                ExoticKind::Error => vec!["message".to_string(), "stack".to_string()],
+                ExoticKind::Date | ExoticKind::Temporal => Vec::new(),
+            };
+            for key in super::exotic_expando::exotic_own_keys(kind, addr, false) {
+                if !names.contains(&key) {
+                    names.push(key);
+                }
+            }
+            let arr = crate::array::js_array_alloc(names.len().max(1) as u32);
+            let mut out = arr;
+            for name in names {
+                let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+                out = crate::array::js_array_push(out, crate::value::JSValue::string_ptr(key));
+            }
+            return f64::from_bits((out as u64) | 0x7FFD_0000_0000_0000);
         }
         if let Some(class_id) = class_ref_id(obj_value) {
             let is_prototype_ref = super::class_prototype_ref_id(obj_value).is_some();
@@ -771,6 +1018,10 @@ pub extern "C" fn js_object_get_own_property_names(obj_value: f64) -> f64 {
                     }
                 });
             }
+            // Private elements (`#x`) live on the static side / prototype
+            // vtable under `#`-prefixed keys but are never reflectable own
+            // properties of `C` or `C.prototype`.
+            names.retain(|n| !n.starts_with('#'));
             sort_property_names_ecma(&mut names);
             let result = crate::array::js_array_alloc(names.len() as u32);
             for name in names {
@@ -816,10 +1067,27 @@ pub extern "C" fn js_object_get_own_property_names(obj_value: f64) -> f64 {
                     }
                     let lk = crate::string::js_string_from_bytes(b"length".as_ptr(), 6);
                     crate::array::js_array_push(result, JSValue::string_ptr(lk));
-                    for name in crate::array::array_named_property_names(ap, false) {
+                    let named = crate::array::array_named_property_names(ap, false);
+                    for name in &named {
                         let k =
                             crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
                         crate::array::js_array_push(result, JSValue::string_ptr(k));
+                    }
+                    // Accessor-only named properties (defineProperty {get/set})
+                    // are own keys too (gOPN includes non-enumerable).
+                    if super::descriptors_in_use() {
+                        for name in super::accessor_descriptor_keys_for_obj(ap as usize) {
+                            if super::canonical_array_index(&name).is_some()
+                                || named.contains(&name)
+                            {
+                                continue;
+                            }
+                            let k = crate::string::js_string_from_bytes(
+                                name.as_ptr(),
+                                name.len() as u32,
+                            );
+                            crate::array::js_array_push(result, JSValue::string_ptr(k));
+                        }
                     }
                 } else {
                     for i in 0..n {
@@ -887,6 +1155,24 @@ pub extern "C" fn js_object_get_own_property_names(obj_value: f64) -> f64 {
             let empty = crate::array::js_array_alloc(0);
             return f64::from_bits((empty as u64) | 0x7FFD_0000_0000_0000);
         }
+        // A heap value that isn't a plain ordinary object (Date `DateCell`,
+        // RegExp, Map/Set, Promise, …) has no `ObjectHeader.keys_array` — reading
+        // one off its header dereferences garbage and segfaults. `Object.create({},
+        // new Date(0))` / `Object.defineProperties(obj, new RegExp())` reach here
+        // with such a value. Perry doesn't model expando properties on these
+        // exotic objects, so report no own keys rather than crashing.
+        if !is_valid_obj_ptr(obj as *const u8) {
+            let empty = crate::array::js_array_alloc(0);
+            return f64::from_bits((empty as u64) | 0x7FFD_0000_0000_0000);
+        }
+        {
+            let gc =
+                (obj as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
+            if (*gc).obj_type != crate::gc::GC_TYPE_OBJECT {
+                let empty = crate::array::js_array_alloc(0);
+                return f64::from_bits((empty as u64) | 0x7FFD_0000_0000_0000);
+            }
+        }
         let keys = (*obj).keys_array;
         if keys.is_null() {
             let empty = crate::array::js_array_alloc(0);
@@ -901,9 +1187,21 @@ pub extern "C" fn js_object_get_own_property_names(obj_value: f64) -> f64 {
                 None => j as u32,
             }
         };
+        // Private elements (`#x`) live in a class instance's keys_array but are
+        // never reflectable own properties. Drop them for class instances
+        // (class_id != 0); plain `{"#fff": 1}` literals keep class_id 0.
+        let hide_private = (*obj).class_id != 0;
         let result = crate::array::js_array_alloc(len as u32);
+        let mut sso_buf = [0u8; crate::value::SHORT_STRING_MAX_LEN];
         for i in 0..len {
             let key_val = crate::array::js_array_get(keys, pos(i));
+            if hide_private {
+                if let Some(b) = crate::string::js_string_key_bytes(key_val, &mut sso_buf) {
+                    if b.first() == Some(&b'#') {
+                        continue;
+                    }
+                }
+            }
             crate::array::js_array_push_f64(result, f64::from_bits(key_val.bits()));
         }
         f64::from_bits((result as u64) | 0x7FFD_0000_0000_0000)
@@ -962,13 +1260,21 @@ pub extern "C" fn js_object_get_own_property_descriptors(obj_value: f64) -> f64 
 /// `TypeError: Object prototype may only be an Object or null`.
 #[no_mangle]
 pub extern "C" fn js_object_create_with_props(proto_value: f64, props_value: f64) -> f64 {
-    // #2816 prototype validation: only an object or `null` is permitted.
+    // #2816 prototype validation: only an object or `null` is permitted. A
+    // Symbol is pointer-tagged but not an object, so reject it explicitly.
     let proto_jv = crate::value::JSValue::from_bits(proto_value.to_bits());
+    let proto_is_symbol = unsafe { crate::symbol::js_is_symbol(proto_value) != 0 };
     let proto_ok = proto_jv.is_null()
-        || unsafe { value_is_object_like(proto_value) }
-        || super::class_ref_id(proto_value).is_some();
+        || (!proto_is_symbol
+            && (unsafe { value_is_object_like(proto_value) }
+                || super::class_ref_id(proto_value).is_some()));
     if !proto_ok {
-        throw_object_type_error(b"Object prototype may only be an Object or null");
+        // V8 renders the offending value: `... an Object or null: 5`.
+        let rendered = unsafe { describe_value_for_type_error(proto_value) };
+        throw_object_type_error_with_suffix(
+            "Object prototype may only be an Object or null: ",
+            &rendered,
+        );
     }
 
     let result = js_object_create(proto_value);

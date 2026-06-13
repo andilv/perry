@@ -16,12 +16,20 @@ fn is_fs_promises_module(module: &str) -> bool {
     module.strip_prefix("node:").unwrap_or(module) == "fs/promises"
 }
 
+fn is_fs_module(module: &str) -> bool {
+    module.strip_prefix("node:").unwrap_or(module) == "fs"
+}
+
 fn filehandle_type() -> Type {
     Type::Named("FileHandle".to_string())
 }
 
 fn dir_type() -> Type {
     Type::Named("Dir".to_string())
+}
+
+fn bigint_result_type_from_operand_types(left: &Type, right: &Type) -> bool {
+    matches!(left, Type::BigInt) || matches!(right, Type::BigInt)
 }
 
 fn typed_array_name_for_name(name: &str) -> Option<&'static str> {
@@ -270,14 +278,33 @@ pub(crate) fn infer_type_from_expr(expr: &ast::Expr, ctx: &LoweringContext) -> T
         // Template literals are always strings
         ast::Expr::Tpl(_) => Type::String,
 
-        // Array literals → infer element type from first element
+        // Array literals → unified element type across ALL elements. Using just
+        // the first element claimed `Array(Number)` for a mixed literal like
+        // `[1, true, "x"]`, and codegen trusted that lie: `a[i] === b[j]`
+        // lowered to a raw `fcmp` where NaN-boxed booleans/strings/undefined
+        // are unordered → strict equality between two mixed-array loads was
+        // always false (test262 sort/S15.4.4.11_A2.1_T3 et al). Divergent
+        // element types now infer `Array(Any)` so the comparison (and every
+        // other consumer) takes the tag-aware path. A spread element's
+        // contribution is unknown statically → Any.
         ast::Expr::Array(arr) => {
-            let elem_ty = arr
-                .elems
-                .iter()
-                .find_map(|e| e.as_ref().map(|elem| infer_type_from_expr(&elem.expr, ctx)))
-                .unwrap_or(Type::Any);
-            Type::Array(Box::new(elem_ty))
+            let mut unified: Option<Type> = None;
+            for e in arr.elems.iter().flatten() {
+                let t = if e.spread.is_some() {
+                    Type::Any
+                } else {
+                    infer_type_from_expr(&e.expr, ctx)
+                };
+                match &unified {
+                    None => unified = Some(t),
+                    Some(u) if *u == t => {}
+                    Some(_) => {
+                        unified = Some(Type::Any);
+                        break;
+                    }
+                }
+            }
+            Type::Array(Box::new(unified.unwrap_or(Type::Any)))
         }
 
         // Variable reference → look up known type
@@ -312,7 +339,9 @@ pub(crate) fn infer_type_from_expr(expr: &ast::Expr, ctx: &LoweringContext) -> T
                 Sub | Mul | Div | Mod | Exp => {
                     let left = infer_type_from_expr(&bin.left, ctx);
                     let right = infer_type_from_expr(&bin.right, ctx);
-                    if matches!(left, Type::Number | Type::Int32)
+                    if bigint_result_type_from_operand_types(&left, &right) {
+                        Type::BigInt
+                    } else if matches!(left, Type::Number | Type::Int32)
                         && matches!(right, Type::Number | Type::Int32)
                     {
                         Type::Number
@@ -321,8 +350,18 @@ pub(crate) fn infer_type_from_expr(expr: &ast::Expr, ctx: &LoweringContext) -> T
                     }
                 }
 
-                // Bitwise operators → Number
-                BitAnd | BitOr | BitXor | LShift | RShift | ZeroFillRShift => Type::Number,
+                // Bitwise operators preserve BigInt when either side is
+                // inferred as BigInt; otherwise they produce Number.
+                BitAnd | BitOr | BitXor | LShift | RShift => {
+                    let left = infer_type_from_expr(&bin.left, ctx);
+                    let right = infer_type_from_expr(&bin.right, ctx);
+                    if bigint_result_type_from_operand_types(&left, &right) {
+                        Type::BigInt
+                    } else {
+                        Type::Number
+                    }
+                }
+                ZeroFillRShift => Type::Number,
 
                 // Logical operators → type of operands (simplified).
                 //
@@ -360,7 +399,15 @@ pub(crate) fn infer_type_from_expr(expr: &ast::Expr, ctx: &LoweringContext) -> T
             ast::UnaryOp::TypeOf => Type::String,
             ast::UnaryOp::Void => Type::Void,
             ast::UnaryOp::Bang => Type::Boolean,
-            ast::UnaryOp::Minus | ast::UnaryOp::Plus | ast::UnaryOp::Tilde => Type::Number,
+            ast::UnaryOp::Minus | ast::UnaryOp::Tilde => {
+                let operand_ty = infer_type_from_expr(&unary.arg, ctx);
+                if matches!(operand_ty, Type::BigInt) {
+                    Type::BigInt
+                } else {
+                    Type::Number
+                }
+            }
+            ast::UnaryOp::Plus => Type::Number,
             _ => Type::Any,
         },
 
@@ -841,6 +888,64 @@ fn ident_has_known_static_method_return(
     false
 }
 
+fn is_node_stream_module_alias(ctx: &LoweringContext, name: &str) -> bool {
+    matches!(
+        ctx.lookup_builtin_module_alias(name),
+        Some("stream" | "node:stream")
+    ) || matches!(
+        ctx.lookup_native_module(name),
+        Some(("stream" | "node:stream", None))
+    )
+}
+
+pub(crate) fn is_node_readable_constructor_ref(ctx: &LoweringContext, expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Ident(ident) => {
+            let name = ident.sym.as_ref();
+            name == "Readable"
+                || matches!(
+                    ctx.lookup_native_module(name),
+                    Some(("stream" | "node:stream", Some("Readable")))
+                )
+        }
+        ast::Expr::Member(member) => {
+            let (ast::Expr::Ident(obj), ast::MemberProp::Ident(prop)) =
+                (member.obj.as_ref(), &member.prop)
+            else {
+                return false;
+            };
+            prop.sym.as_ref() == "Readable" && is_node_stream_module_alias(ctx, obj.sym.as_ref())
+        }
+        ast::Expr::Paren(paren) => is_node_readable_constructor_ref(ctx, &paren.expr),
+        ast::Expr::TsAs(ts_as) => is_node_readable_constructor_ref(ctx, &ts_as.expr),
+        ast::Expr::TsTypeAssertion(ts_assert) => {
+            is_node_readable_constructor_ref(ctx, &ts_assert.expr)
+        }
+        ast::Expr::TsNonNull(non_null) => is_node_readable_constructor_ref(ctx, &non_null.expr),
+        ast::Expr::TsConstAssertion(const_assert) => {
+            is_node_readable_constructor_ref(ctx, &const_assert.expr)
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn is_node_readable_static_factory_call(
+    ctx: &LoweringContext,
+    expr: &ast::Expr,
+) -> bool {
+    let ast::Expr::Call(call) = expr else {
+        return false;
+    };
+    let ast::Callee::Expr(callee) = &call.callee else {
+        return false;
+    };
+    let ast::Expr::Member(member) = callee.as_ref() else {
+        return false;
+    };
+    matches!(&member.prop, ast::MemberProp::Ident(prop) if matches!(prop.sym.as_ref(), "from" | "of"))
+        && is_node_readable_constructor_ref(ctx, member.obj.as_ref())
+}
+
 fn expr_may_have_typed_receiver(expr: &ast::Expr, ctx: &LoweringContext) -> bool {
     match expr {
         ast::Expr::Lit(ast::Lit::Str(_)) => true,
@@ -910,6 +1015,12 @@ pub(crate) fn infer_call_return_type(callee: &ast::Expr, ctx: &LoweringContext) 
                 return Type::Promise(Box::new(dir_type()));
             }
             if matches!(
+                ctx.lookup_native_module(name),
+                Some((module, Some("opendirSync"))) if is_fs_module(module)
+            ) {
+                return dir_type();
+            }
+            if matches!(
                 ctx.lookup_builtin_named_import(name),
                 Some((module, "open")) if is_fs_promises_module(module)
             ) {
@@ -920,6 +1031,12 @@ pub(crate) fn infer_call_return_type(callee: &ast::Expr, ctx: &LoweringContext) 
                 Some((module, "opendir")) if is_fs_promises_module(module)
             ) {
                 return Type::Promise(Box::new(dir_type()));
+            }
+            if matches!(
+                ctx.lookup_builtin_named_import(name),
+                Some((module, "opendirSync")) if is_fs_module(module)
+            ) {
+                return dir_type();
             }
             // Check user-defined function return types
             if let Some(ty) = ctx.lookup_func_return_type(name) {
@@ -939,6 +1056,11 @@ pub(crate) fn infer_call_return_type(callee: &ast::Expr, ctx: &LoweringContext) 
         ast::Expr::Member(member) => {
             if let ast::MemberProp::Ident(method) = &member.prop {
                 let method_name = method.sym.as_ref();
+                if matches!(method_name, "from" | "of")
+                    && is_node_readable_constructor_ref(ctx, &member.obj)
+                {
+                    return Type::Named("Readable".to_string());
+                }
                 if method_name == "open" {
                     if let ast::Expr::Ident(obj) = member.obj.as_ref() {
                         let namespace_is_fs_promises = matches!(
@@ -962,6 +1084,19 @@ pub(crate) fn infer_call_return_type(callee: &ast::Expr, ctx: &LoweringContext) 
                             .is_some_and(is_fs_promises_module);
                         if namespace_is_fs_promises {
                             return Type::Promise(Box::new(dir_type()));
+                        }
+                    }
+                }
+                if method_name == "opendirSync" {
+                    if let ast::Expr::Ident(obj) = member.obj.as_ref() {
+                        let namespace_is_fs = matches!(
+                            ctx.lookup_native_module(obj.sym.as_ref()),
+                            Some((module, None)) if is_fs_module(module)
+                        ) || ctx
+                            .lookup_builtin_module_alias(obj.sym.as_ref())
+                            .is_some_and(is_fs_module);
+                        if namespace_is_fs {
+                            return dir_type();
                         }
                     }
                 }

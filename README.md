@@ -2,9 +2,13 @@
 
 **One codebase. Every platform. Native performance.**
 
+[![Join the Perry Discord community](https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/chEmpGdTtZ)
+
 Perry is a native TypeScript compiler written in Rust. It takes your TypeScript and compiles it straight to native executables — no Node.js, no Electron, no browser engine. Just fast, small binaries that run anywhere.
 
 **Current Version:** 0.5.152 | [Website](https://perryts.com) | [Documentation](https://perryts.github.io/perry/) | [Showcase](https://perryts.com/showcase)
+
+**Community:** [Join the Perry Discord](https://discord.gg/chEmpGdTtZ)
 
 ```bash
 perry compile src/main.ts -o myapp
@@ -173,8 +177,30 @@ cargo build --release
 
 Perry requires a C linker to link compiled executables:
 - **macOS:** Xcode Command Line Tools (`xcode-select --install`)
-- **Linux:** GCC or Clang (`sudo apt install build-essential`)
+- **Linux:** GCC or Clang (see below for your distro)
 - **Windows:** MSVC (Visual Studio Build Tools)
+
+Linux linker by distro:
+
+```bash
+# Debian / Ubuntu / Pop!_OS / Mint
+sudo apt install build-essential
+
+# Arch / Manjaro / CachyOS / EndeavourOS
+sudo pacman -S base-devel gcc
+
+# Fedora / RHEL / CentOS Stream
+sudo dnf install gcc gcc-c++ glibc-devel
+
+# openSUSE
+sudo zypper install -t pattern devel_basis
+
+# Alpine / musl-based
+sudo apk add build-base
+
+# Void Linux
+sudo xbps-install -S base-devel
+```
 
 Run `perry doctor` to verify your environment.
 

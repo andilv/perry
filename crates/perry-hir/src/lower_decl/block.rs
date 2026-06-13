@@ -53,7 +53,7 @@ fn collect_var_binding_names_from_var_decl(var_decl: &ast::VarDecl, out: &mut Ve
     }
 }
 
-fn collect_var_binding_names_from_stmt(stmt: &ast::Stmt, out: &mut Vec<String>) {
+pub(crate) fn collect_var_binding_names_from_stmt(stmt: &ast::Stmt, out: &mut Vec<String>) {
     match stmt {
         ast::Stmt::Block(block) => {
             for stmt in &block.stmts {
@@ -114,11 +114,22 @@ fn collect_var_binding_names_from_stmt(stmt: &ast::Stmt, out: &mut Vec<String>) 
                 }
             }
         }
+        ast::Stmt::With(with_stmt) => collect_var_binding_names_from_stmt(&with_stmt.body, out),
         _ => {}
     }
 }
 
-fn predefine_var_bindings_in_function_body(ctx: &mut LoweringContext, block: &ast::BlockStmt) {
+/// Returns the (name, id) pairs newly created here (i.e. names that did not
+/// already have a binding in the current scope, like a same-named param).
+/// The caller emits an undefined-initialised `Stmt::Let` for each at body
+/// entry: codegen creates local storage at the first `Stmt::Let` for an id,
+/// so a read compiled before the nested decl (`if (c) break;` ahead of
+/// `var c = ...` in the same loop body) would otherwise bake in an
+/// `undefined` constant and never observe the later write.
+fn predefine_var_bindings_in_function_body(
+    ctx: &mut LoweringContext,
+    block: &ast::BlockStmt,
+) -> Vec<(String, LocalId)> {
     let mut names = Vec::new();
     for stmt in &block.stmts {
         collect_var_binding_names_from_stmt(stmt, &mut names);
@@ -126,6 +137,7 @@ fn predefine_var_bindings_in_function_body(ctx: &mut LoweringContext, block: &as
     names.sort();
     names.dedup();
 
+    let mut created = Vec::new();
     let scope_start = ctx.scope_local_marks.last().copied().unwrap_or(0);
     for name in names {
         let existing_current_scope = ctx.locals[scope_start..]
@@ -133,9 +145,14 @@ fn predefine_var_bindings_in_function_body(ctx: &mut LoweringContext, block: &as
             .rev()
             .find(|(n, _, _)| n == &name)
             .map(|(_, id, _)| *id);
-        let local_id = existing_current_scope.unwrap_or_else(|| ctx.define_local(name, Type::Any));
+        let local_id = existing_current_scope.unwrap_or_else(|| {
+            let id = ctx.define_local(name.clone(), Type::Any);
+            created.push((name, id));
+            id
+        });
         ctx.var_hoisted_ids.insert(local_id);
     }
+    created
 }
 
 /// Lower a function-body block, with support for ECMAScript function-decl
@@ -163,17 +180,24 @@ pub fn lower_fn_body_block_stmt(
     let parent_strict = ctx.current_strict;
     ctx.current_strict =
         parent_strict || crate::lower::stmt_list_starts_with_use_strict_directive(&block.stmts);
-    predefine_var_bindings_in_function_body(ctx, block);
+    let hoisted_var_slots = predefine_var_bindings_in_function_body(ctx, block);
 
     // Phase 1: pre-define hoisted FnDecl locals so forward references in
     // any earlier statement resolve via `lookup_local`. Generator and
-    // async-generator FnDecls are excluded — those go through the
-    // hoist-to-top-level + FuncRef path in `lower_body_stmt` and aren't
-    // closure-bound at the source position.
+    // async-generator FnDecls ARE included: `lower_body_stmt` lowers them to
+    // a top-level function plus a source-position `Stmt::Let { init: FuncRef }`
+    // binding the name. Spec function-declaration hoisting still applies to
+    // generators, so a forward reference (`A.gen = gen` ABOVE the
+    // `function* gen(){}` in a webpack/ncc inner module — next/dist/compiled/
+    // edge-runtime's `consumeUint8ArrayReadableStream`) must resolve. We
+    // pre-define the local here (so `lookup_local` succeeds at the forward
+    // reference) and Phase 3 moves the FuncRef `Let` to the front (so it is
+    // initialized before that reference runs). The FuncRef value is pure, so
+    // reordering it ahead of other statements is safe.
     let mut hoisted_id_set: HashSet<LocalId> = HashSet::new();
     for stmt in &block.stmts {
         if let ast::Stmt::Decl(ast::Decl::Fn(fn_decl)) = stmt {
-            if fn_decl.function.body.is_none() || fn_decl.function.is_generator {
+            if fn_decl.function.body.is_none() {
                 continue;
             }
             let name = fn_decl.ident.sym.to_string();
@@ -186,19 +210,107 @@ pub fn lower_fn_body_block_stmt(
         }
     }
 
+    // Phase 1.5: pre-register sibling class DECLARATION names so forward
+    // references inside earlier statements/method bodies resolve to
+    // `ClassRef` instead of the unknown-global sentinel. JS resolves
+    // these at call time (vendored zod: `ZodType.optional()` calls
+    // `ZodOptional.create(...)` declared far below in the same webpack
+    // module function). Scoped: the previous set is restored on exit so
+    // names don't leak across function bodies.
+    let saved_forward_class_names = ctx.forward_class_names.clone();
+    for stmt in &block.stmts {
+        if let ast::Stmt::Decl(ast::Decl::Class(class_decl)) = stmt {
+            ctx.forward_class_names
+                .insert(class_decl.ident.sym.to_string());
+        }
+    }
+
     // Phase 2: lower the body. The inner FnDecl arm in `lower_body_stmt`
     // calls `lookup_local(name)` and reuses our pre-defined id.
-    let body = match lower_block_stmt(ctx, block) {
+    let mut body = match lower_block_stmt(ctx, block) {
         Ok(body) => body,
         Err(err) => {
             ctx.current_strict = parent_strict;
+            ctx.forward_class_names = saved_forward_class_names;
             return Err(err);
         }
     };
+    ctx.forward_class_names = saved_forward_class_names;
+
+    // Re-register capture snapshots for classes declared in this body at
+    // its END. The decl-site `RegisterClassCaptures` runs before later
+    // statements assign captured vars (tsc emits TS-enum namespaces AFTER
+    // the classes that reference them — vendored zod's
+    // ZodFirstPartyTypeKind), so static-method snapshot reads and post-
+    // return dynamic constructions need the FINAL values. Inserted before
+    // a trailing `return` when present; bodies with early returns keep the
+    // decl-site snapshot for those paths.
+    {
+        let mut re_regs: Vec<Stmt> = Vec::new();
+        for stmt in &block.stmts {
+            if let ast::Stmt::Decl(ast::Decl::Class(class_decl)) = stmt {
+                let cname = class_decl.ident.sym.to_string();
+                if let Some(captured) = ctx.lookup_class_captures(&cname) {
+                    if !captured.is_empty() {
+                        let captures: Vec<Expr> =
+                            captured.iter().map(|id| Expr::LocalGet(*id)).collect();
+                        // Sibling code lowered BEFORE this class registered
+                        // its captures (forward refs — zod's
+                        // `function createZodEnum(...) { return new
+                        // ZodEnum({...}) }` declared above the class) has
+                        // `new <class>(…)` sites with NO cap args appended;
+                        // the inline binder then misfills the ctor params.
+                        // Append the raw outer ids now; sites lowered after
+                        // registration already end with exactly these ids
+                        // and are skipped (tail-match guard). Class members
+                        // were handled by `append_self_sites` with remapped
+                        // ids — their tails don't match the raw ids, but
+                        // they ALREADY carry appends; restrict this pass to
+                        // non-member code by walking the lowered body only
+                        // (member bodies live in pending_classes, not here).
+                        let cap_args: Vec<(perry_types::LocalId, perry_types::LocalId)> =
+                            captured.iter().map(|id| (*id, *id)).collect();
+                        for s in body.iter_mut() {
+                            super::class_captures::append_new_args_stmt(s, &cname, &cap_args, true);
+                        }
+                        re_regs.push(Stmt::Expr(Expr::RegisterClassCaptures {
+                            class_name: cname,
+                            captures,
+                        }));
+                    }
+                }
+            }
+        }
+        if !re_regs.is_empty() {
+            let insert_at = if matches!(body.last(), Some(Stmt::Return(_))) {
+                body.len() - 1
+            } else {
+                body.len()
+            };
+            for (i, s) in re_regs.into_iter().enumerate() {
+                body.insert(insert_at + i, s);
+            }
+        }
+    }
+
+    // Undefined-initialised entry slots for hoisted `var`s declared in
+    // nested blocks (see predefine_var_bindings_in_function_body docs).
+    let var_slot_lets: Vec<Stmt> = hoisted_var_slots
+        .into_iter()
+        .map(|(name, id)| Stmt::Let {
+            id,
+            name,
+            ty: Type::Any,
+            mutable: true,
+            init: Some(Expr::Undefined),
+        })
+        .collect();
 
     if hoisted_id_set.is_empty() {
         ctx.current_strict = parent_strict;
-        return Ok(body);
+        let mut result = var_slot_lets;
+        result.extend(body);
+        return Ok(result);
     }
 
     // Phase 3: split — pull every top-level `Stmt::Let` whose id is in the
@@ -206,9 +318,17 @@ pub fn lower_fn_body_block_stmt(
     let mut hoisted_lets: Vec<Stmt> = Vec::new();
     let mut other: Vec<Stmt> = Vec::new();
     for s in body {
+        // A regular/async FnDecl lowers to a `Let { init: Closure }`; a
+        // generator/async-generator FnDecl lowers to a `Let { init: FuncRef }`
+        // (the body lives in a hoisted top-level function). Both forms are
+        // hoisted to the front per spec function-declaration semantics.
         let is_hoisted = matches!(
             &s,
             Stmt::Let { id, init: Some(Expr::Closure { .. }), .. }
+                if hoisted_id_set.contains(id)
+        ) || matches!(
+            &s,
+            Stmt::Let { id, init: Some(Expr::FuncRef(_)), .. }
                 if hoisted_id_set.contains(id)
         );
         if is_hoisted {
@@ -228,6 +348,7 @@ pub fn lower_fn_body_block_stmt(
     if !prealloc.is_empty() {
         result.push(Stmt::PreallocateBoxes(prealloc));
     }
+    result.extend(var_slot_lets);
     result.extend(hoisted_lets);
     result.extend(other);
     ctx.current_strict = parent_strict;
@@ -452,9 +573,10 @@ pub fn lower_block_stmt_scoped(
 /// Bindings whose initializer evaluates to `null` or `undefined` are skipped
 /// per spec (no dispose call, no error). Multi-binding using declarations
 /// (`using a = e1, b = e2`) are unrolled left-to-right with each binding
-/// getting its own try/finally so the rightmost disposes first. SuppressedError
-/// chaining when a body throw is followed by a dispose throw is not yet
-/// implemented — the dispose throw shadows the original.
+/// getting its own try/catch/finally so the rightmost disposes first. When a
+/// body throw (or an earlier dispose throw) is followed by another dispose
+/// throw, the later error is wrapped in a `SuppressedError` whose `.suppressed`
+/// is the accumulated completion (spec `DisposeResources`).
 pub fn lower_stmts_using_aware(
     ctx: &mut LoweringContext,
     stmts: &[ast::Stmt],
@@ -475,24 +597,87 @@ pub fn lower_stmts_using_aware(
                 // for `Type::Named` locals; without inference it stays `Any`
                 // and the call goes nowhere on missing-method).
                 let stmts = lower_var_decl_with_destructuring(ctx, decl, false, false)?;
+                let mut decl_ids: Vec<LocalId> = Vec::new();
                 for s in &stmts {
                     if let Stmt::Let { id, .. } = s {
                         binding_ids.push(*id);
+                        decl_ids.push(*id);
                     }
                 }
                 result.extend(stmts);
+                // Validate disposability at the declaration point (spec
+                // `CreateDisposableResource`): a non-nullish initializer with no
+                // callable `[Symbol.dispose]` / `[Symbol.asyncDispose]` throws a
+                // `TypeError` here, before the block body runs. `null` /
+                // `undefined` are accepted. The runtime `__perry_using_check__`
+                // dispatch validates and returns; primitives throw via the
+                // ordinary "not a function" method-call path.
+                for &id in &decl_ids {
+                    let check_call = Expr::Call {
+                        callee: Box::new(Expr::PropertyGet {
+                            object: Box::new(Expr::LocalGet(id)),
+                            property: "__perry_using_check__".to_string(),
+                        }),
+                        args: vec![Expr::Bool(is_async)],
+                        type_args: Vec::new(),
+                    };
+                    result.push(Stmt::If {
+                        condition: Expr::Logical {
+                            op: LogicalOp::And,
+                            left: Box::new(Expr::Compare {
+                                op: CompareOp::Ne,
+                                left: Box::new(Expr::LocalGet(id)),
+                                right: Box::new(Expr::Null),
+                            }),
+                            right: Box::new(Expr::Compare {
+                                op: CompareOp::Ne,
+                                left: Box::new(Expr::LocalGet(id)),
+                                right: Box::new(Expr::Undefined),
+                            }),
+                        },
+                        then_branch: vec![Stmt::Expr(check_call)],
+                        else_branch: None,
+                    });
+                }
             }
             // Recursively lower remaining stmts as the try body.
             let body_stmts = lower_stmts_using_aware(ctx, &stmts[i + 1..])?;
-            // Wrap each binding in its own try/finally — innermost (rightmost
-            // binding) finally runs first, giving reverse-declaration disposal.
+            // Wrap each binding in its own try/catch/finally — innermost
+            // (rightmost binding) disposes first, giving reverse-declaration
+            // order. Each level captures a thrown body completion into a pair
+            // of locals (`__pending` / `__has`) so the finally can aggregate a
+            // dispose-throw into a `SuppressedError` (spec `DisposeResources`):
+            //
+            //   let __pending; let __has = false;
+            //   try { <inner> }
+            //   catch (__c) { __pending = __c; __has = true; }
+            //   finally {
+            //     try { if (x != null) [await] x.<dispose>(); }
+            //     catch (__d) {
+            //        if (__has) __pending = new SuppressedError(__d, __pending);
+            //        else { __pending = __d; __has = true; }
+            //     }
+            //     if (__has) throw __pending;
+            //   }
+            //
+            // `try`/`finally` (not bare `catch`) is required so the disposal
+            // runs on every abrupt completion of `<inner>` — `return` /
+            // `break` / `continue` as well as `throw`. Nesting composes the
+            // chaining: a body error becomes the innermost `suppressed`, and
+            // each outer dispose-throw wraps the accumulated value, so the
+            // last (outermost, first-declared) dispose throw is `.error`.
             let mut wrapped = body_stmts;
-            for &id in binding_ids.iter().rev() {
+            for (level, &id) in binding_ids.iter().rev().enumerate() {
                 let method_name = if is_async {
                     "__perry_async_dispose__"
                 } else {
                     "__perry_dispose__"
                 };
+                let pending = ctx.fresh_local();
+                let has = ctx.fresh_local();
+                let body_err = ctx.fresh_local();
+                let dispose_err = ctx.fresh_local();
+
                 // if (id !== null && id !== undefined) [await] id.<method>()
                 let null_check = Expr::Logical {
                     op: LogicalOp::And,
@@ -518,16 +703,83 @@ pub fn lower_stmts_using_aware(
                 if is_async {
                     call_expr = Expr::Await(Box::new(call_expr));
                 }
-                let finally_stmts = vec![Stmt::If {
-                    condition: null_check,
-                    then_branch: vec![Stmt::Expr(call_expr)],
-                    else_branch: None,
-                }];
-                wrapped = vec![Stmt::Try {
-                    body: wrapped,
-                    catch: None,
-                    finally: Some(finally_stmts),
-                }];
+
+                // catch (__d) { if (__has) __pending = new SuppressedError(__d,
+                // __pending); else { __pending = __d; __has = true; } }
+                let dispose_catch = CatchClause {
+                    param: Some((dispose_err, format!("__perry_dispose_err_{level}"))),
+                    body: vec![Stmt::If {
+                        condition: Expr::LocalGet(has),
+                        then_branch: vec![Stmt::Expr(Expr::LocalSet(
+                            pending,
+                            Box::new(Expr::New {
+                                class_name: "SuppressedError".to_string(),
+                                args: vec![
+                                    Expr::LocalGet(dispose_err),
+                                    Expr::LocalGet(pending),
+                                    Expr::String(
+                                        "An error was suppressed during disposal".to_string(),
+                                    ),
+                                ],
+                                type_args: Vec::new(),
+                            }),
+                        ))],
+                        else_branch: Some(vec![
+                            Stmt::Expr(Expr::LocalSet(
+                                pending,
+                                Box::new(Expr::LocalGet(dispose_err)),
+                            )),
+                            Stmt::Expr(Expr::LocalSet(has, Box::new(Expr::Bool(true)))),
+                        ]),
+                    }],
+                };
+
+                let finally_stmts = vec![
+                    Stmt::Try {
+                        body: vec![Stmt::If {
+                            condition: null_check,
+                            then_branch: vec![Stmt::Expr(call_expr)],
+                            else_branch: None,
+                        }],
+                        catch: Some(dispose_catch),
+                        finally: None,
+                    },
+                    Stmt::If {
+                        condition: Expr::LocalGet(has),
+                        then_branch: vec![Stmt::Throw(Expr::LocalGet(pending))],
+                        else_branch: None,
+                    },
+                ];
+
+                let body_catch = CatchClause {
+                    param: Some((body_err, format!("__perry_body_err_{level}"))),
+                    body: vec![
+                        Stmt::Expr(Expr::LocalSet(pending, Box::new(Expr::LocalGet(body_err)))),
+                        Stmt::Expr(Expr::LocalSet(has, Box::new(Expr::Bool(true)))),
+                    ],
+                };
+
+                wrapped = vec![
+                    Stmt::Let {
+                        id: pending,
+                        name: format!("__perry_pending_{level}"),
+                        ty: Type::Any,
+                        mutable: true,
+                        init: Some(Expr::Undefined),
+                    },
+                    Stmt::Let {
+                        id: has,
+                        name: format!("__perry_has_err_{level}"),
+                        ty: Type::Any,
+                        mutable: true,
+                        init: Some(Expr::Bool(false)),
+                    },
+                    Stmt::Try {
+                        body: wrapped,
+                        catch: Some(body_catch),
+                        finally: Some(finally_stmts),
+                    },
+                ];
             }
             result.extend(wrapped);
             return Ok(result);

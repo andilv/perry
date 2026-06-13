@@ -60,7 +60,7 @@ use artifacts::{emit_module_artifacts, ModuleArtifactsCtx};
 use function::compile_function;
 use helpers::{
     collect_return_class, emit_buffer_alias_metadata, function_body_returns_generator_object,
-    sanitize, scoped_fn_name, scoped_method_name, scoped_static_method_name,
+    sanitize, sanitize_member, scoped_fn_name, scoped_method_name, scoped_static_method_name,
 };
 
 // Collector and boxing-analysis walkers live in dedicated modules.
@@ -355,6 +355,8 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
                 .collect(),
             getters: Vec::new(),
             setters: Vec::new(),
+            static_accessor_names: Vec::new(),
+            static_accessor_fn_ids: Vec::new(),
             static_fields: Vec::new(),
             static_methods: Vec::new(),
             computed_members: Vec::new(),
@@ -499,6 +501,8 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
     let mut local_async_funcs: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut local_generator_funcs: std::collections::HashSet<u32> =
         std::collections::HashSet::new();
+    let mut funcs_reading_dynamic_this: std::collections::HashSet<u32> =
+        std::collections::HashSet::new();
     for f in &hir.functions {
         // Include both truly-async functions and those transformed from
         // async to generator (was_plain_async=true, is_async=false after
@@ -509,6 +513,9 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         }
         if function_body_returns_generator_object(&f.body) {
             local_generator_funcs.insert(f.id);
+        }
+        if perry_hir::analysis::body_reads_dynamic_this(&f.body) {
+            funcs_reading_dynamic_this.insert(f.id);
         }
     }
 
@@ -1030,6 +1037,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         imported_async_funcs: opts.imported_async_funcs,
         local_async_funcs,
         local_generator_funcs,
+        funcs_reading_dynamic_this,
         type_aliases: opts.type_aliases,
         imported_func_param_counts: opts.imported_func_param_counts,
         import_function_origin_names: opts.import_function_origin_names.clone(),
@@ -1401,6 +1409,15 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
                 module_global_types.insert(*id, ty.clone());
             }
             if referenced_from_fn.contains(id) || exported_var_names.contains(name) {
+                // A `var` redeclared at module scope (`var x = …; … var x = …;`)
+                // lowers to multiple `Stmt::Let` sharing the SAME id. The backing
+                // global (and any exported getter) is keyed by that id, so emit it
+                // exactly once — a second `add_global` for the same symbol is an
+                // LLVM "redefinition of global" hard error. Captured + redeclared
+                // module vars are the trigger (e.g. test262 capability tests).
+                if module_globals.contains_key(id) {
+                    continue;
+                }
                 // Use external linkage for exported vars so other
                 // modules can reference them. Internal for the rest.
                 let is_exported = exported_var_names.contains(name);
@@ -1502,8 +1519,8 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             let name = format!(
                 "perry_static_{}__{}__{}",
                 module_prefix,
-                sanitize(&c.name),
-                sanitize(&sf.name),
+                sanitize_member(&c.name),
+                sanitize_member(&sf.name),
             );
             // External linkage so importing modules can reference the same
             // global. Static class fields are spec-level shared state across
@@ -1540,8 +1557,8 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
                     let global_name = format!(
                         "perry_static_{}__{}__{}",
                         module_prefix,
-                        sanitize(&ic.name),
-                        sanitize(sf_name),
+                        sanitize_member(&ic.name),
+                        sanitize_member(sf_name),
                     );
                     static_field_globals.insert(key, global_name);
                 }
@@ -1555,8 +1572,8 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             let global_name = format!(
                 "perry_static_{}__{}__{}",
                 ic.source_prefix,
-                sanitize(&ic.name),
-                sanitize(sf_name),
+                sanitize_member(&ic.name),
+                sanitize_member(sf_name),
             );
             // Declare external (not define) — the source module owns the
             // defining global. Skip if already declared (multiple imports of
@@ -1716,8 +1733,8 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             let llvm_fn = format!(
                 "perry_method_{}__{}__{}",
                 sanitize(src),
-                sanitize(&ic.name),
-                sanitize(method_name),
+                sanitize_member(&ic.name),
+                sanitize_member(method_name),
             );
             method_names
                 .entry((effective_name.to_string(), method_name.clone()))
@@ -1804,8 +1821,8 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
                 format!(
                     "perry_static_{}__{}__{}",
                     sanitize(src),
-                    sanitize(&ic.name),
-                    sanitize(sm),
+                    sanitize_member(&ic.name),
+                    sanitize_member(sm),
                 )
             };
             method_names
@@ -2142,7 +2159,18 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             }
             walks(s, &module_globals)
         });
-        if crate::collectors::is_integer_specializable(f) && !uses_module_globals {
+        // Skip clamp-shaped functions: their FuncRef call sites with provably
+        // i32 arguments are intrinsified to smax/smin and never call this
+        // symbol, so the only remaining callers are exactly the ones whose
+        // arguments are NOT integers (fractional doubles, NaN-boxed pointers)
+        // — and clamp3 returns an argument verbatim, so the wrapper's
+        // unconditional `fptosi` miscompiles every one of them (#4785 bug
+        // class: `(number).method is not a function`). Those callers need
+        // the real f64 body.
+        let is_clamp_shape =
+            crate::collectors::detect_clamp3(f).is_some() || crate::collectors::detect_clamp_u8(f);
+        if crate::collectors::is_integer_specializable(f) && !uses_module_globals && !is_clamp_shape
+        {
             if let Some(llvm_name) = func_names.get(&f.id) {
                 let i64_name = format!("{}_i64", llvm_name);
                 crate::collectors::emit_i64_function(&mut llmod, f, &i64_name);

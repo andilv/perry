@@ -10,6 +10,26 @@ use perry_types::Type as HirType;
 use crate::expr::FnCtx;
 use crate::type_analysis_net::{net_result_class, net_result_type};
 
+// Class-field layout / declared-type resolution lives in a sibling module
+// (file-size gate). Re-exported here so existing `type_analysis::*` call
+// sites keep resolving, and brought into scope for local callers.
+pub(crate) use crate::type_analysis_class_fields::{
+    class_field_declared_type, class_field_global_index, declared_field_type,
+};
+
+fn function_type_from_decl(function: &perry_hir::Function) -> HirType {
+    HirType::Function(perry_types::FunctionType {
+        params: function
+            .params
+            .iter()
+            .map(|param| (param.name.clone(), param.ty.clone(), false))
+            .collect(),
+        return_type: Box::new(function.return_type.clone()),
+        is_async: function.is_async || function.was_plain_async,
+        is_generator: function.is_generator,
+    })
+}
+
 pub(crate) fn is_global_constructor_expr(e: &Expr, name: &str) -> bool {
     matches!(e, Expr::GlobalGet(_))
         || matches!(
@@ -57,6 +77,24 @@ pub(crate) fn refine_type_from_init(ctx: &FnCtx<'_>, init: &Expr) -> Option<HirT
         | Expr::PodLayoutAlignOf { .. }
         | Expr::PodLayoutOffsetOf { .. } => Some(HirType::Number),
         Expr::Binary { op, left, right } => {
+            if is_bigint_expr(ctx, init)
+                && matches!(
+                    op,
+                    BinaryOp::Add
+                        | BinaryOp::Sub
+                        | BinaryOp::Mul
+                        | BinaryOp::Div
+                        | BinaryOp::Mod
+                        | BinaryOp::Pow
+                        | BinaryOp::BitAnd
+                        | BinaryOp::BitOr
+                        | BinaryOp::BitXor
+                        | BinaryOp::Shl
+                        | BinaryOp::Shr
+                )
+            {
+                return Some(HirType::BigInt);
+            }
             // Numeric arithmetic produces Number when both operands are
             // statically numeric (matches `is_numeric_expr`'s rule).
             // Sub/Mul/Div/etc. always produce Number; Add only does so
@@ -64,6 +102,13 @@ pub(crate) fn refine_type_from_init(ctx: &FnCtx<'_>, init: &Expr) -> Option<HirT
             if is_numeric_expr(ctx, left) && is_numeric_expr(ctx, right) {
                 let _ = op;
                 Some(HirType::Number)
+            } else {
+                None
+            }
+        }
+        Expr::Unary { op, operand } => {
+            if matches!(op, UnaryOp::Neg | UnaryOp::BitNot) && is_bigint_expr(ctx, operand) {
+                Some(HirType::BigInt)
             } else {
                 None
             }
@@ -127,8 +172,10 @@ pub(crate) fn refine_type_from_init(ctx: &FnCtx<'_>, init: &Expr) -> Option<HirT
             base: "Map".into(),
             type_args: Vec::new(),
         }),
-        // Object.keys() always returns string handles.
-        Expr::ObjectKeys(_) => Some(HirType::Array(Box::new(HirType::String))),
+        // Object.keys() / for-in keys always return string handles.
+        Expr::ObjectKeys(_) | Expr::ForInKeys(_) => {
+            Some(HirType::Array(Box::new(HirType::String)))
+        }
         Expr::ObjectGetOwnPropertyNames(_) => Some(HirType::Array(Box::new(HirType::String))),
         Expr::ObjectGetOwnPropertySymbols(_) => Some(HirType::Array(Box::new(HirType::Any))),
         Expr::String(_)
@@ -165,6 +212,7 @@ pub(crate) fn refine_type_from_init(ctx: &FnCtx<'_>, init: &Expr) -> Option<HirT
         | Expr::DateToString(_)
         | Expr::DateToDateString(_)
         | Expr::DateToTimeString(_)
+        | Expr::DateToUTCString(_)
         | Expr::DateToLocaleString(_)
         | Expr::DateToLocaleDateString(_)
         | Expr::DateToLocaleTimeString(_)
@@ -199,6 +247,20 @@ pub(crate) fn refine_type_from_init(ctx: &FnCtx<'_>, init: &Expr) -> Option<HirT
         // local type lets `hr2 >= hr1` route through the BigInt compare
         // fast path (`js_bigint_cmp`) instead of fcmp-on-NaN.
         Expr::ProcessHrtimeBigint => Some(HirType::BigInt),
+        Expr::StaticMethodCall {
+            class_name,
+            method_name,
+            ..
+        } => ctx
+            .classes
+            .get(class_name)
+            .and_then(|class| {
+                class
+                    .static_methods
+                    .iter()
+                    .find(|method| method.name == *method_name)
+            })
+            .map(|method| method.return_type.clone()),
         // `BigInt(x)` / `0n` literal via StringCoerce paths.
         // `BigInt('123')` lowers to BigIntCoerce; refine so `const x = BigInt(str)`
         // gets local type BigInt and `x === y` routes through js_bigint_cmp.
@@ -456,6 +518,11 @@ pub(crate) fn refine_type_from_init(ctx: &FnCtx<'_>, init: &Expr) -> Option<HirT
                     }
                 }
             }
+            if let Some(ret_ty) = static_type_of(ctx, init) {
+                if !matches!(ret_ty, HirType::Any | HirType::Void | HirType::Function(_)) {
+                    return Some(ret_ty);
+                }
+            }
             None
         }
         _ => None,
@@ -607,6 +674,23 @@ pub(crate) fn is_bigint_expr(ctx: &FnCtx<'_>, e: &Expr) -> bool {
         // `BigInt(x)` always returns a bigint.
         Expr::BigIntCoerce(_) => true,
         Expr::LocalGet(id) => matches!(ctx.local_types.get(id), Some(HirType::BigInt)),
+        Expr::StaticMethodCall {
+            class_name,
+            method_name,
+            ..
+        } => ctx
+            .classes
+            .get(class_name)
+            .and_then(|class| {
+                class
+                    .static_methods
+                    .iter()
+                    .find(|method| method.name == *method_name)
+            })
+            .is_some_and(|method| matches!(method.return_type, HirType::BigInt)),
+        Expr::PropertyGet { .. } | Expr::Call { .. } => {
+            matches!(static_type_of(ctx, e), Some(HirType::BigInt))
+        }
         // Nested bigint arithmetic — `(n * 10n) + d` must see the
         // inner `n * 10n` as bigint so the outer `+` routes through
         // the bigint dispatch instead of the float fallback.
@@ -618,6 +702,7 @@ pub(crate) fn is_bigint_expr(ctx: &FnCtx<'_>, e: &Expr) -> bool {
                     | BinaryOp::Mul
                     | BinaryOp::Div
                     | BinaryOp::Mod
+                    | BinaryOp::Pow
                     // Bitwise ops on bigints produce bigints — include
                     // them so `(a * prime) & mask64` where both operands
                     // are bigint stays bigint-typed all the way up the
@@ -629,6 +714,9 @@ pub(crate) fn is_bigint_expr(ctx: &FnCtx<'_>, e: &Expr) -> bool {
                     | BinaryOp::Shl
                     | BinaryOp::Shr
             ) && (is_bigint_expr(ctx, left) || is_bigint_expr(ctx, right))
+        }
+        Expr::Unary { op, operand } => {
+            matches!(op, UnaryOp::Neg | UnaryOp::BitNot) && is_bigint_expr(ctx, operand)
         }
         _ => false,
     }
@@ -1078,40 +1166,6 @@ pub(crate) fn is_definitely_string_expr(ctx: &FnCtx<'_>, e: &Expr) -> bool {
 /// `.stack` / `.name` string assumption) from hijacking a user class
 /// whose own field happens to share that name with a non-string type
 /// (e.g. `effect`'s `RedBlackTreeIterator.stack: Array<...>` — #321).
-pub(crate) fn declared_field_type(ctx: &FnCtx<'_>, object: &Expr, field: &str) -> Option<HirType> {
-    let receiver_class = receiver_class_name(ctx, object)?;
-    if let Some(class) = ctx.classes.get(&receiver_class) {
-        if let Some(f) = class.fields.iter().find(|f| f.name == field) {
-            return Some(f.ty.clone());
-        }
-        // Walk the inheritance chain.
-        let mut parent = class.extends_name.as_deref();
-        while let Some(p) = parent {
-            let Some(pc) = ctx.classes.get(p) else { break };
-            if let Some(f) = pc.fields.iter().find(|f| f.name == field) {
-                return Some(f.ty.clone());
-            }
-            parent = pc.extends_name.as_deref();
-        }
-        return None;
-    }
-    if let Some(iface) = ctx.interfaces.get(&receiver_class) {
-        if let Some(p) = iface.properties.iter().find(|p| p.name == field) {
-            return Some(p.ty.clone());
-        }
-        for ext in &iface.extends {
-            if let HirType::Named(parent_name) = ext {
-                if let Some(parent_iface) = ctx.interfaces.get(parent_name) {
-                    if let Some(p) = parent_iface.properties.iter().find(|p| p.name == field) {
-                        return Some(p.ty.clone());
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
 pub(crate) fn is_string_expr(ctx: &FnCtx<'_>, e: &Expr) -> bool {
     match e {
         Expr::String(_) | Expr::WtfString(_) => true,
@@ -1206,6 +1260,7 @@ pub(crate) fn is_string_expr(ctx: &FnCtx<'_>, e: &Expr) -> bool {
         | Expr::DateToString(_)
         | Expr::DateToDateString(_)
         | Expr::DateToTimeString(_)
+        | Expr::DateToUTCString(_)
         | Expr::DateToLocaleString(_)
         | Expr::DateToLocaleDateString(_)
         | Expr::DateToLocaleTimeString(_)
@@ -1523,118 +1578,6 @@ pub(crate) fn is_promise_expr(ctx: &FnCtx<'_>, e: &Expr) -> bool {
     }
 }
 
-/// Look up a field's global index in the object's slot layout, walking
-/// the inheritance chain. Returns `Some(index)` only if the field is a
-/// plain instance field (no getter/setter shadowing) and the entire
-/// parent chain is resolvable from `ctx.classes`.
-///
-/// Layout convention: parent class fields come first (in declaration
-/// order), then the child's own fields. So `Child` with parent `Base`
-/// and `Base.fields = [a, b]`, `Child.fields = [c]` produces slot order
-/// `[a, b, c]` — `Base.b` is index 1, `Child.c` is index 2.
-///
-/// This mirrors how `js_object_alloc_with_parent` lays out the inline
-/// field array (parent first, then child) and how the constructor
-/// codegen at `lower_call.rs::compile_new` walks parent constructors
-/// before the child's own initializers.
-///
-/// Returns `None` when:
-/// - The class has a getter or setter for this property (the dispatch
-///   path needs to call the synthesized accessor instead).
-/// - The field name doesn't exist anywhere in the chain.
-/// - A parent class isn't in `ctx.classes` (imported class with no HIR).
-pub(crate) fn class_field_global_index(
-    ctx: &FnCtx<'_>,
-    class_name: &str,
-    property: &str,
-) -> Option<u32> {
-    // Walk parent chain to find the field. Parent fields come first in
-    // the slot layout, so we sum parent counts as we descend.
-    //
-    // Refs #420: must skip computed-key fields (`[Symbol.X] = init`) when
-    // counting positions — the inline-slot layout in `packed_keys` only
-    // includes string-keyed fields. If we count computed-key fields here,
-    // the index used for `this.config = {...}` writes shifts past where
-    // readers look for "config", and every cross-module access reads from
-    // an uninitialised slot (raw f64 zero, which presents as `number 0`
-    // when treated as a NaN-boxed value). drizzle's `class ColumnBuilder
-    // { config; $default = this.$defaultFn; $onUpdate = this.$onUpdateFn; }`
-    // shape — where the `config;` declaration sits among method-ref class
-    // fields — surfaces this as `column.config = 0` for every column
-    // builder when read from the importing module.
-    fn count_keyable(fields: &[perry_hir::ClassField]) -> u32 {
-        fields.iter().filter(|f| f.key_expr.is_none()).count() as u32
-    }
-    fn walk(ctx: &FnCtx<'_>, class_name: &str, property: &str, offset: u32) -> Option<u32> {
-        let class = ctx.classes.get(class_name)?;
-        // Bail if a getter/setter shadows the field — those need real
-        // method dispatch, not a direct memory access.
-        if class.getters.iter().any(|(n, _)| n == property)
-            || class.setters.iter().any(|(n, _)| n == property)
-        {
-            return None;
-        }
-        // Compute the byte-offset contribution from this class's parent.
-        let parent_count = if let Some(parent_name) = class.extends_name.as_deref() {
-            let mut p_count = 0u32;
-            let mut p = Some(parent_name.to_string());
-            while let Some(name) = p {
-                if let Some(parent) = ctx.classes.get(&name) {
-                    p_count += count_keyable(&parent.fields);
-                    p = parent.extends_name.clone();
-                } else {
-                    return None; // unresolvable parent — no inline path
-                }
-            }
-            p_count
-        } else {
-            0
-        };
-        // Look for the field on this class first (the most-derived
-        // declaration shadows parents in TypeScript). Position within the
-        // own-fields list must skip computed-key entries to match the
-        // packed_keys layout the runtime sees.
-        let mut own_idx: u32 = 0;
-        for f in &class.fields {
-            if f.key_expr.is_some() {
-                continue;
-            }
-            if f.name == property {
-                return Some(offset + parent_count + own_idx);
-            }
-            own_idx += 1;
-        }
-        // Otherwise walk into the parent chain looking for the field.
-        if let Some(parent_name) = class.extends_name.as_deref() {
-            return walk(ctx, parent_name, property, offset);
-        }
-        None
-    }
-    walk(ctx, class_name, property, 0)
-}
-
-pub(crate) fn class_field_declared_type(
-    ctx: &FnCtx<'_>,
-    class_name: &str,
-    property: &str,
-) -> Option<HirType> {
-    let mut current = ctx.classes.get(class_name).copied();
-    while let Some(cls) = current {
-        if let Some(field) = cls
-            .fields
-            .iter()
-            .find(|field| field.key_expr.is_none() && field.name == property)
-        {
-            return Some(field.ty.clone());
-        }
-        current = cls
-            .extends_name
-            .as_deref()
-            .and_then(|parent| ctx.classes.get(parent).copied());
-    }
-    None
-}
-
 /// If the expression is a known instance of a Named class type, return
 /// the class name. Used by the class method dispatch in lower_call to
 /// pick the right `perry_method_<class>_<name>` function.
@@ -1662,6 +1605,9 @@ pub(crate) fn receiver_class_name(ctx: &FnCtx<'_>, e: &Expr) -> Option<String> {
         // at the top of class_stack (for inlined constructors) or comes
         // from the enclosing method's owning class.
         Expr::This => ctx.class_stack.last().cloned(),
+        // A private-access brand guard returns its receiver unchanged; see
+        // through it so shadowed private-field slot resolution stays accurate.
+        Expr::PrivateGuard { object, .. } => receiver_class_name(ctx, object),
         // `arr[i]` where `arr: ClassFoo[]` — the element type is the
         // array's parameter. Lets `items[2].display()` resolve the
         // method dispatch.
@@ -1806,6 +1752,20 @@ pub(crate) fn static_type_of(ctx: &FnCtx<'_>, e: &Expr) -> Option<HirType> {
         Expr::Number(_) | Expr::Integer(_) => Some(HirType::Number),
         Expr::Bool(_) => Some(HirType::Boolean),
         Expr::LocalGet(id) => ctx.local_types.get(id).cloned(),
+        Expr::StaticMethodCall {
+            class_name,
+            method_name,
+            ..
+        } => ctx
+            .classes
+            .get(class_name)
+            .and_then(|class| {
+                class
+                    .static_methods
+                    .iter()
+                    .find(|method| method.name == *method_name)
+            })
+            .map(|method| method.return_type.clone()),
         e if net_result_type(e).is_some() => net_result_type(e),
         Expr::PropertyGet { object, property } => {
             if property == "length" && expression_has_numeric_length(ctx, object) {
@@ -1822,11 +1782,23 @@ pub(crate) fn static_type_of(ctx: &FnCtx<'_>, e: &Expr) -> Option<HirType> {
             {
                 return Some(HirType::String);
             }
+            if let Some(static_method_ty) = crate::expr::try_static_class_name(object, ctx)
+                .and_then(|class_name| ctx.classes.get(class_name))
+                .and_then(|class| {
+                    class
+                        .static_methods
+                        .iter()
+                        .find(|method| method.name == *property)
+                        .map(function_type_from_decl)
+                })
+            {
+                return Some(static_method_ty);
+            }
             // If the object is a known class instance, look up the field
             // type from the class definition.
             let receiver_class = receiver_class_name(ctx, object)?;
             if let Some(class) = ctx.classes.get(&receiver_class) {
-                return class
+                if let Some(field_ty) = class
                     .fields
                     .iter()
                     .find(|f| f.name == *property)
@@ -1846,7 +1818,18 @@ pub(crate) fn static_type_of(ctx: &FnCtx<'_>, e: &Expr) -> Option<HirType> {
                             }
                         }
                         None
-                    });
+                    })
+                {
+                    return Some(field_ty);
+                }
+                if let Some(method_ty) = class
+                    .methods
+                    .iter()
+                    .find(|method| method.name == *property)
+                    .map(function_type_from_decl)
+                {
+                    return Some(method_ty);
+                }
             }
             // Issue #655: receiver may be typed against a TS `interface`
             // rather than a class. The runtime layout is identical to a
@@ -1857,6 +1840,14 @@ pub(crate) fn static_type_of(ctx: &FnCtx<'_>, e: &Expr) -> Option<HirType> {
             if let Some(iface) = ctx.interfaces.get(&receiver_class) {
                 if let Some(p) = iface.properties.iter().find(|p| p.name == *property) {
                     return Some(p.ty.clone());
+                }
+                if let Some(method) = iface.methods.iter().find(|method| method.name == *property) {
+                    return Some(HirType::Function(perry_types::FunctionType {
+                        params: method.params.clone(),
+                        return_type: Box::new(method.return_type.clone()),
+                        is_async: false,
+                        is_generator: false,
+                    }));
                 }
                 for ext in &iface.extends {
                     if let HirType::Named(parent_name) = ext {
@@ -1893,6 +1884,7 @@ pub(crate) fn static_type_of(ctx: &FnCtx<'_>, e: &Expr) -> Option<HirType> {
         | Expr::ArrayKeys(_)
         | Expr::ArrayValues(_)
         | Expr::ObjectKeys(_)
+        | Expr::ForInKeys(_)
         | Expr::ObjectValues(_)
         | Expr::ObjectEntries(_) => Some(HirType::Array(Box::new(HirType::Any))),
         // `process.argv` is a real Array<string> at runtime (see
@@ -1939,6 +1931,12 @@ pub(crate) fn static_type_of(ctx: &FnCtx<'_>, e: &Expr) -> Option<HirType> {
             ) =>
         {
             Some(HirType::Array(Box::new(HirType::String)))
+        }
+        Expr::Call { callee, .. } => {
+            if let Some(HirType::Function(ft)) = static_type_of(ctx, callee.as_ref()) {
+                return Some((*ft.return_type).clone());
+            }
+            None
         }
         // `arr[i]` where `arr: Array<T>` has static type `T`. This lets
         // nested access like `grid[i][j]` and `grid[i].length` reach

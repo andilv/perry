@@ -232,6 +232,12 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             let handle = blk.call(I64, "js_date_to_time_string", &[(DOUBLE, &v)]);
             Ok(nanbox_string_inline(blk, &handle))
         }
+        Expr::DateToUTCString(o) => {
+            let v = lower_expr(ctx, o)?;
+            let blk = ctx.block();
+            let handle = blk.call(I64, "js_date_to_utc_string", &[(DOUBLE, &v)]);
+            Ok(nanbox_string_inline(blk, &handle))
+        }
         Expr::DateToLocaleDateString(o) => {
             let v = lower_expr(ctx, o)?;
             let blk = ctx.block();
@@ -270,6 +276,12 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 &[(I64, &arr_handle), (DOUBLE, &idx_d), (DOUBLE, &val_d)],
             );
             Ok(nanbox_pointer_inline(blk, &result))
+        }
+        Expr::ArrayReverseValue { receiver } => {
+            let receiver_d = lower_expr(ctx, receiver)?;
+            let blk = ctx.block();
+            let result = blk.call(DOUBLE, "js_array_reverse_value", &[(DOUBLE, &receiver_d)]);
+            Ok(result)
         }
         Expr::ArrayCopyWithin {
             array_id,

@@ -565,6 +565,17 @@ pub extern "C" fn js_bigint_neg(a: *const BigIntHeader) -> *mut BigIntHeader {
     bigint_alloc_with_limbs(result)
 }
 
+/// Bitwise NOT of a BigInt (`~a`).
+#[no_mangle]
+pub extern "C" fn js_bigint_not(a: *const BigIntHeader) -> *mut BigIntHeader {
+    let a_limbs = bigint_limbs_or_zero(a);
+    let mut result = ZERO_LIMBS;
+    for i in 0..BIGINT_LIMBS {
+        result[i] = !a_limbs[i];
+    }
+    bigint_alloc_with_limbs(result)
+}
+
 /// Check if a BigInt is zero (all limbs are zero). Returns 1 for zero, 0 for non-zero.
 #[no_mangle]
 pub extern "C" fn js_bigint_is_zero(a: *const BigIntHeader) -> i32 {
@@ -1100,6 +1111,47 @@ pub extern "C" fn js_bigint_cmp(a: *const BigIntHeader, b: *const BigIntHeader) 
             };
         }
         compare_limbs(&a_limbs, &b_limbs)
+    }
+}
+
+/// `StringToBigInt` (ES2024 §7.1.14), non-throwing. Returns `None` when the
+/// string is not a valid BigInt literal — the abstract relational comparison
+/// treats that as `undefined` (so the comparison yields `false`) rather than a
+/// thrown `SyntaxError`. Leading/trailing whitespace is trimmed, an empty
+/// string is `0n`, and the `0x`/`0o`/`0b` radix prefixes are accepted.
+pub(crate) fn string_to_bigint(raw: &str) -> Option<*mut BigIntHeader> {
+    parse_bigint_string(raw).ok().map(bigint_alloc_with_limbs)
+}
+
+/// Mathematically compare a BigInt `x` against a Number `y` (ES2024 §7.2.13,
+/// the mixed BigInt/Number step). Comparison is exact — no precision loss from
+/// `BigInt → f64` — because `y` is decomposed into its integer floor (converted
+/// to a BigInt without rounding) and any leftover fraction.
+///
+/// Returns `-1` (x < y), `0` (x == y), `1` (x > y), or `2` (undefined: `y` is
+/// `NaN`, the one incomparable case).
+pub(crate) fn bigint_cmp_f64(x: *const BigIntHeader, y: f64) -> i32 {
+    if y.is_nan() {
+        return 2;
+    }
+    if y == f64::INFINITY {
+        return -1; // x < +Infinity for every finite BigInt
+    }
+    if y == f64::NEG_INFINITY {
+        return 1; // x > -Infinity
+    }
+    // `y` is finite. Compare `x` with `floor(y)` as exact integers; if equal,
+    // a positive fractional part of `y` makes `x` strictly smaller.
+    let floor = y.floor();
+    let floor_big = js_bigint_from_f64(floor);
+    let c = js_bigint_cmp(x, floor_big);
+    if c != 0 {
+        return c;
+    }
+    if y > floor {
+        -1
+    } else {
+        0
     }
 }
 
@@ -1728,6 +1780,27 @@ mod tests {
         assert_eq!(read_as_i64(js_bigint_shl(one, four)), 16);
         let two = js_bigint_from_i64(2);
         assert_eq!(read_as_i64(js_bigint_shr(eight, two)), 2);
+    }
+
+    #[test]
+    fn permission_bitwise_values_match_node() {
+        let bitfield = js_bigint_from_i64(9216);
+        let zero = js_bigint_from_i64(0);
+        let one = js_bigint_from_i64(1);
+        let eleven = js_bigint_from_i64(11);
+        let thirteen = js_bigint_from_i64(13);
+
+        let manage_messages = js_bigint_shl(one, thirteen);
+        let send_messages = js_bigint_shl(one, eleven);
+        let and_result = js_bigint_and(bitfield, manage_messages);
+        let or_result = js_bigint_or(zero, send_messages);
+        let not_result = js_bigint_not(send_messages);
+
+        assert_eq!(read_as_i64(manage_messages), 8192);
+        assert_eq!(read_as_i64(send_messages), 2048);
+        assert_eq!(read_as_i64(and_result), 8192);
+        assert_eq!(read_as_i64(or_result), 2048);
+        assert_eq!(read_as_i64(not_result), -2049);
     }
 
     #[test]

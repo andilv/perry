@@ -17,6 +17,22 @@ unsafe fn present_array_element(elements_ptr: *const f64, index: usize) -> Optio
     (element.to_bits() != crate::value::TAG_HOLE).then_some(element)
 }
 
+/// ECMA-262 ToIntegerOrInfinity applied to a possibly non-numeric `fromIndex`
+/// argument. The codegen passes the raw (NaN-boxed) value through, so a string
+/// / boolean / null / object `fromIndex` (`"3E0"`, `"0x0003"`, `true`, `null`,
+/// `{valueOf}`) must be ToNumber-coerced first — the previous `from.is_nan()`
+/// shortcut treated every NaN-boxed value as NaN→0. Returns the truncated
+/// integer (or ±Infinity, whose `trunc()` is itself).
+#[inline]
+pub(crate) fn from_index_to_integer(from: f64) -> f64 {
+    let n = crate::builtins::js_number_coerce(from);
+    if n.is_nan() {
+        0.0
+    } else {
+        n.trunc()
+    }
+}
+
 #[inline(always)]
 unsafe fn array_element_get_value(elements_ptr: *const f64, index: usize) -> f64 {
     let element = *elements_ptr.add(index);
@@ -75,11 +91,7 @@ fn forward_start_index(length: i64, from_index: f64, has_from: i32) -> Option<i6
     if has_from == 0 {
         return Some(0);
     }
-    let n = if from_index.is_nan() {
-        0.0
-    } else {
-        from_index.trunc()
-    };
+    let n = from_index_to_integer(from_index);
     if n >= length as f64 {
         // Covers +Infinity and any fromIndex past the end.
         None
@@ -107,14 +119,24 @@ pub extern "C" fn js_array_indexOf_jsvalue(
     if arr.is_null() {
         return -1;
     }
-    // TypedArray: strict-equality numeric search over the typed store.
+    // TypedArray: strict-equality search over the typed store. `len == 0`
+    // returns BEFORE ToIntegerOrInfinity(fromIndex) per spec (an observable /
+    // throwing coercion never runs on an empty array). `js_jsvalue_equals`
+    // (not `==`) so BigInt elements compare by value — `js_typed_array_get`
+    // on a BigInt64Array returns a freshly boxed BigInt whose bit pattern
+    // never raw-equals the search value.
     if let Some((ta, len)) = as_typed_array(arr) {
+        if len == 0 {
+            return -1;
+        }
         let start = match forward_start_index(len as i64, from_index, has_from) {
             Some(s) => s as i32,
             None => return -1,
         };
         for i in start..len {
-            if crate::typedarray::js_typed_array_get(ta, i) == value {
+            if crate::value::js_jsvalue_equals(crate::typedarray::js_typed_array_get(ta, i), value)
+                == 1
+            {
                 return i;
             }
         }
@@ -122,14 +144,29 @@ pub extern "C" fn js_array_indexOf_jsvalue(
     }
     unsafe {
         let length = (*arr).length as i64;
+        // ECMA-262 §23.1.3.13 step 3: `len == 0 → -1` is checked BEFORE
+        // ToIntegerOrInfinity(fromIndex), so a throwing/observable `fromIndex`
+        // coercion never runs on an empty array.
+        if length == 0 {
+            return -1;
+        }
         let start = match forward_start_index(length, from_index, has_from) {
             Some(s) => s,
             None => return -1,
         };
         let elements_ptr = array_elements_ptr(arr);
+        let exotic = crate::array::array_iteration_is_exotic(arr);
         for i in start..length {
-            let Some(element) = present_array_element(elements_ptr, i as usize) else {
-                continue;
+            let element = if exotic {
+                if !crate::array::array_spec_has_index(arr, i as u32) {
+                    continue;
+                }
+                crate::array::array_spec_get(arr, i as u32)
+            } else {
+                match present_array_element(elements_ptr, i as usize) {
+                    Some(e) => e,
+                    None => continue,
+                }
             };
             if crate::value::js_jsvalue_equals(element, value) == 1 {
                 return i as i32;
@@ -166,11 +203,7 @@ pub extern "C" fn js_array_last_index_of_jsvalue(
         let start: i64 = if has_from == 0 {
             length - 1
         } else {
-            let n = if from_index.is_nan() {
-                0.0
-            } else {
-                from_index.trunc()
-            };
+            let n = from_index_to_integer(from_index);
             if n >= length as f64 {
                 length - 1
             } else if n >= 0.0 {
@@ -183,7 +216,11 @@ pub extern "C" fn js_array_last_index_of_jsvalue(
         };
         let mut i = start;
         while i >= 0 {
-            if crate::typedarray::js_typed_array_get(ta, i as i32) == value {
+            if crate::value::js_jsvalue_equals(
+                crate::typedarray::js_typed_array_get(ta, i as i32),
+                value,
+            ) == 1
+            {
                 return i as i32;
             }
             i -= 1;
@@ -203,11 +240,7 @@ pub extern "C" fn js_array_last_index_of_jsvalue(
         let start: i64 = if has_from == 0 {
             length - 1
         } else {
-            let n = if from_index.is_nan() {
-                0.0
-            } else {
-                from_index.trunc()
-            };
+            let n = from_index_to_integer(from_index);
             if n >= length as f64 {
                 length - 1
             } else if n >= 0.0 {
@@ -219,11 +252,23 @@ pub extern "C" fn js_array_last_index_of_jsvalue(
             }
         };
 
+        let exotic = crate::array::array_iteration_is_exotic(arr);
         let mut i = start;
         while i >= 0 {
-            let Some(element) = present_array_element(elements_ptr, i as usize) else {
-                i -= 1;
-                continue;
+            let element = if exotic {
+                if !crate::array::array_spec_has_index(arr, i as u32) {
+                    i -= 1;
+                    continue;
+                }
+                crate::array::array_spec_get(arr, i as u32)
+            } else {
+                match present_array_element(elements_ptr, i as usize) {
+                    Some(e) => e,
+                    None => {
+                        i -= 1;
+                        continue;
+                    }
+                }
             };
             if crate::value::js_jsvalue_equals(element, value) == 1 {
                 return i as i32;
@@ -264,6 +309,9 @@ pub extern "C" fn js_array_includes_jsvalue(
     // TypedArray: SameValueZero numeric search (so includes(NaN) is true for
     // float typed arrays).
     if let Some((ta, len)) = as_typed_array(arr) {
+        if len == 0 {
+            return 0;
+        }
         let start = match forward_start_index(len as i64, from_index, has_from) {
             Some(s) => s as i32,
             None => return 0,
@@ -278,6 +326,11 @@ pub extern "C" fn js_array_includes_jsvalue(
     }
     unsafe {
         let length = (*arr).length as i64;
+        // §23.1.3.16 step 3: `len == 0 → false` BEFORE ToIntegerOrInfinity
+        // (fromIndex), mirroring `indexOf`.
+        if length == 0 {
+            return 0;
+        }
         let start = match forward_start_index(length, from_index, has_from) {
             Some(s) => s,
             None => return 0,

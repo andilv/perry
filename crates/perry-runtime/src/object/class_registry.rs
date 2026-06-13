@@ -39,6 +39,24 @@ fn is_non_constructable_builtin_function_value(value: f64) -> bool {
     super::native_module::builtin_closure_is_non_constructable_value(value)
 }
 
+/// True when `value` is a bound native-module method/export closure
+/// (`BOUND_METHOD_FUNC_PTR` trampoline — what a `require('stream').Writable`
+/// property read produces). These represent real Node classes/functions and
+/// must be accepted as `extends` targets.
+fn is_bound_native_method_closure_value(value: f64) -> bool {
+    // Gate on the native-module metadata, not the raw BOUND_METHOD_FUNC_PTR
+    // trampoline: reified `Function.prototype.{bind,call,apply}` values
+    // (`reify_function_method_value`) share that trampoline but are NOT native
+    // constructors, so matching the sentinel alone would let `class X extends
+    // obj.method {}` skip the spec-required TypeError and silently stay
+    // parentless. A real native-module export carries a non-empty module name.
+    unsafe {
+        super::native_module::bound_native_callable_module_and_method(value)
+            .map(|(module, _)| !module.is_empty())
+            .unwrap_or(false)
+    }
+}
+
 fn throw_non_constructable_builtin_function() -> ! {
     super::object_ops::throw_object_type_error(b"Function is not a constructor")
 }
@@ -77,6 +95,41 @@ pub(crate) fn class_dynamic_prop_root_store(class_id: u32, name: String, value: 
             .insert(name, value);
     });
     crate::gc::runtime_write_barrier_root_nanbox(value.to_bits());
+}
+
+/// Own static-field value for a class (no parent-chain walk) — the
+/// CLASS_DYNAMIC_PROPS entry codegen registers at module init for every
+/// declared static field. Consulted by `getOwnPropertyDescriptor` on a class
+/// constructor ref so `verifyProperty(C, "field", …)` sees a real data
+/// descriptor (test262 class/elements static-field-declaration & friends).
+pub(crate) fn class_own_static_field_value(class_id: u32, name: &str) -> Option<f64> {
+    CLASS_DYNAMIC_PROPS.with(|m| {
+        m.borrow()
+            .get(&class_id)
+            .and_then(|props| props.get(name).copied())
+    })
+}
+
+/// Enumerable own string keys of a class constructor: the static fields (and
+/// runtime `C.x = …` assignments) recorded in CLASS_DYNAMIC_PROPS. The built-in
+/// `length`/`name`/`prototype` slots and static *methods*/*accessors* are
+/// non-enumerable, so they are intentionally excluded — this is exactly the set
+/// `Object.keys(C)` / `for (k in C)` must yield. Private (`#`) keys are filtered
+/// here too (never reflectable). Returned unsorted; the caller applies ECMA
+/// ordering. (test262 class/elements static-field-declaration & friends.)
+pub(crate) fn class_own_enumerable_field_names(class_id: u32) -> Vec<String> {
+    CLASS_DYNAMIC_PROPS.with(|m| {
+        m.borrow()
+            .get(&class_id)
+            .map(|props| {
+                props
+                    .keys()
+                    .filter(|k| !k.starts_with('#'))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
 }
 
 pub(crate) fn class_delete_own_dynamic_prop(class_id: u32, name: &str) {
@@ -142,6 +195,23 @@ pub static CLASS_STATIC_METHODS: RwLock<Option<HashMap<u32, HashMap<String, (usi
     RwLock::new(None);
 
 pub static CLASS_STATIC_ACCESSORS: RwLock<Option<HashMap<u32, HashMap<String, (usize, usize)>>>> =
+    RwLock::new(None);
+
+/// Spec `Function.prototype.length` per (class_id, method/accessor name) — the
+/// count of formal parameters before the first one with a default or a rest.
+/// The vtable only records the *total* param count (needed for call dispatch),
+/// which overcounts methods with default-valued params; codegen computes the
+/// real `.length` at registration and stashes it here so `C.prototype.m.length`
+/// is exact (Test262 .../class/*/dflt-params-trailing-comma).
+pub static CLASS_METHOD_BIND_LENGTHS: RwLock<Option<HashMap<(u32, String), u32>>> =
+    RwLock::new(None);
+
+/// Default-aware spec `.length` for STATIC methods, keyed (class_id, name).
+/// Distinct from `CLASS_METHOD_BIND_LENGTHS` (instance methods) so a class with
+/// both `static m(a, b = 1)` and `m(c)` keeps independent lengths instead of
+/// colliding on the (class_id, name) key. (Test262 *-method-static
+/// dflt-params-trailing-comma.)
+pub static CLASS_STATIC_METHOD_BIND_LENGTHS: RwLock<Option<HashMap<(u32, String), u32>>> =
     RwLock::new(None);
 
 pub static CLASS_SYMBOL_METHODS: RwLock<Option<HashMap<(u32, usize, bool), (usize, u32, bool)>>> =
@@ -243,6 +313,46 @@ pub(crate) fn class_parent_closure(class_id: u32) -> Option<usize> {
         .and_then(|g| g.as_ref().and_then(|m| m.get(&class_id).copied()))
 }
 
+/// Walk the class parent chain looking for a registered parent-closure edge.
+/// `super()` dispatch needs this because the instance's class_id is the
+/// MOST-DERIVED class, while the closure-parent edge is keyed by the class
+/// that directly `extends <function value>` — possibly an ancestor.
+pub(crate) fn parent_closure_in_chain(class_id: u32) -> Option<usize> {
+    let mut cid = class_id;
+    let mut depth = 0u32;
+    while depth < 32 && cid != 0 {
+        if let Some(addr) = class_parent_closure(cid) {
+            return Some(addr);
+        }
+        match get_parent_class_id(cid) {
+            Some(p) if p != 0 && p != cid => {
+                cid = p;
+                depth += 1;
+            }
+            _ => break,
+        }
+    }
+    None
+}
+
+/// Reverse lookup: which declared class's `.prototype` is this heap object?
+/// Used by `Object.getOwnPropertyDescriptor(C.prototype, name)` to surface
+/// vtable accessors as own properties of the prototype object. Linear scan —
+/// the table is small (one entry per materialized declared-class prototype)
+/// and this only runs on the reflection slow path.
+pub(crate) fn class_id_for_decl_prototype_object(ptr: usize) -> Option<u32> {
+    if ptr == 0 {
+        return None;
+    }
+    CLASS_DECL_PROTOTYPE_OBJECTS
+        .read()
+        .ok()?
+        .as_ref()?
+        .iter()
+        .find(|(_, &p)| p == ptr)
+        .map(|(k, _)| *k)
+}
+
 pub(crate) fn class_decl_prototype_object(class_id: u32) -> *mut ObjectHeader {
     if let Ok(read) = CLASS_DECL_PROTOTYPE_OBJECTS.read() {
         if let Some(map) = read.as_ref() {
@@ -295,6 +405,7 @@ pub(crate) fn class_decl_prototype_value(class_id: u32) -> f64 {
     if proto.is_null() {
         return f64::from_bits(crate::value::TAG_UNDEFINED);
     }
+    invalidate_class_prototype_fast_guards();
     class_decl_prototype_object_root_store(class_id, proto);
 
     let constructor_key =
@@ -360,6 +471,30 @@ pub(crate) fn ensure_function_prototype_object(
     if class_id == 0 {
         return std::ptr::null_mut();
     }
+    // A `Temporal.<X>` constructor pre-populates its `prototype` (a real object
+    // with the type's accessor getters / methods) during globalThis init and
+    // stamps it on the closure's `prototype` dynamic prop — but intentionally
+    // NOT in the GC-scanned class-prototype cache (rooting an init-time arena
+    // object there dangles across the test-suite's arena-fixture swaps). So when
+    // `new Temporal.X()` / a reflective `.prototype` read lands here, return that
+    // pre-set object as-is instead of allocating a fresh empty one (which would
+    // overwrite the populated prototype). Gated on `temporal_ctor_kind` so the
+    // ordinary class-prototype flow (which relies on the cache for method
+    // registration) is unaffected.
+    if super::global_this::temporal_ctor_kind(func_value).is_some() {
+        let fv_bits = func_value.to_bits();
+        let fp = (fv_bits & crate::value::POINTER_MASK) as usize;
+        if fp != 0 {
+            let dyn_proto = crate::closure::closure_get_dynamic_prop(fp, "prototype");
+            let dp = JSValue::from_bits(dyn_proto.to_bits());
+            if dp.is_pointer() {
+                let pp = dp.as_pointer::<ObjectHeader>();
+                if !pp.is_null() {
+                    return pp as *mut ObjectHeader;
+                }
+            }
+        }
+    }
     let existing = class_prototype_object(class_id);
     if !existing.is_null() {
         return existing;
@@ -384,6 +519,23 @@ pub(crate) fn ensure_function_prototype_object(
     }
 
     class_prototype_object_root_store(class_id, proto);
+
+    // #5024: methods registered before the prototype object materialized
+    // (`F.prototype.m = v` typically runs long before any reflective
+    // `F.prototype` read) live only in CLASS_PROTOTYPE_METHODS. Backfill
+    // them as ordinary own properties so enumeration sees them; later
+    // registrations write through via class_prototype_method_root_store.
+    let registered: Vec<(String, u64)> = {
+        let guard = CLASS_PROTOTYPE_METHODS.read().unwrap();
+        guard
+            .as_ref()
+            .and_then(|map| map.get(&class_id))
+            .map(|per_class| per_class.iter().map(|(k, &v)| (k.clone(), v)).collect())
+            .unwrap_or_default()
+    };
+    for (name, value_bits) in registered {
+        unsafe { mirror_prototype_method_on_object(proto, &name, value_bits) };
+    }
 
     let func_bits = func_value.to_bits();
     if (func_bits >> 48) == 0x7FFD {
@@ -427,11 +579,28 @@ pub extern "C" fn js_set_function_prototype(func: f64, proto: f64) -> u32 {
     let proto_bits = proto.to_bits();
     let proto_tag = proto_bits & 0xFFFF_0000_0000_0000;
     const POINTER_TAG: u64 = 0x7FFD_0000_0000_0000;
-    // Both must be heap-allocated pointers. Anything else (primitives,
-    // ClassRef, etc.) is a no-op — preserves the pre-fix baseline
-    // where `<not-a-function>.prototype = X` was just a property write
-    // on a non-function value (effectively no-op in practice).
-    if func_tag != POINTER_TAG || proto_tag != POINTER_TAG {
+    // The function must be a heap-allocated pointer. Anything else (a
+    // primitive `<not-a-function>.prototype = X`) is a no-op — preserves the
+    // pre-fix baseline where it was just a property write on a non-function.
+    if func_tag != POINTER_TAG {
+        return 0;
+    }
+    // A function may legitimately have a *primitive* (e.g. `null`) prototype:
+    // `function f() {} f.prototype = null` — it just doesn't establish an
+    // `instanceof` chain. Store it as a plain `prototype` data property so reads
+    // reflect it (test262 `GetPrototypeFromConstructor` falls back to the
+    // default when `newTarget.prototype` is not an object). Without this the
+    // write was dropped and the stale auto-created prototype object lingered.
+    if proto_tag != POINTER_TAG {
+        let func_ptr = (func_bits & crate::value::POINTER_MASK) as usize;
+        if func_ptr != 0 && crate::closure::is_closure_ptr(func_ptr) {
+            crate::closure::closure_set_dynamic_prop(func_ptr, "prototype", proto);
+            set_builtin_property_attrs(
+                func_ptr,
+                "prototype".to_string(),
+                PropertyAttrs::new(true, false, false),
+            );
+        }
         return 0;
     }
     // Validate the proto pointer points at a real Object. If it's a
@@ -454,7 +623,25 @@ pub extern "C" fn js_set_function_prototype(func: f64, proto: f64) -> u32 {
         }
         let gc_header =
             (proto_ptr as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-        if (*gc_header).obj_type != crate::gc::GC_TYPE_OBJECT {
+        let obj_type = (*gc_header).obj_type;
+        // `foo.prototype = new Array(...)` — a real-array prototype can't join
+        // the class-id machinery (it has no ObjectHeader), but it must not be
+        // DROPPED: store it as the closure's `prototype` dynamic prop so reads
+        // reflect it and `js_new_function_construct` links instances to it
+        // (test262 filter/15.4.4.20-6-*, some/15.4.4.17-8-*, map/15.4.4.19-9-3).
+        if obj_type == crate::gc::GC_TYPE_ARRAY || obj_type == crate::gc::GC_TYPE_LAZY_ARRAY {
+            let func_ptr = (func_bits & crate::value::POINTER_MASK) as usize;
+            if func_ptr != 0 && crate::closure::is_closure_ptr(func_ptr) {
+                crate::closure::closure_set_dynamic_prop(func_ptr, "prototype", proto);
+                set_builtin_property_attrs(
+                    func_ptr,
+                    "prototype".to_string(),
+                    PropertyAttrs::new(true, false, false),
+                );
+            }
+            return 0;
+        }
+        if obj_type != crate::gc::GC_TYPE_OBJECT {
             return 0;
         }
     }
@@ -879,6 +1066,19 @@ pub(super) fn identify_global_builtin_constructor(func_value: f64) -> Option<&'s
             || func_ptr == eval_error_constructor_call_thunk as *const u8 as usize
             || func_ptr == uri_error_constructor_call_thunk as *const u8 as usize
             || func_ptr == webcrypto_illegal_constructor_thunk as *const u8 as usize
+            // Map/Set/WeakMap/WeakSet/WeakRef constructor *values* carry their
+            // own "requires 'new'" thunks (global_this.rs). When obtained as a
+            // value and constructed via `new $WeakMap()` (e.g. qs's
+            // `side-channel`/`get-intrinsic` reads `%WeakMap%` into a variable),
+            // the call lands here, not the static codegen path. Accept the
+            // thunks so the singleton walk recovers the name and the match arms
+            // below dispatch into the real factory instead of invoking the
+            // bare-call thunk (which throws "Constructor WeakMap requires 'new'").
+            || func_ptr == map_constructor_call_thunk as *const u8 as usize
+            || func_ptr == set_constructor_call_thunk as *const u8 as usize
+            || func_ptr == weak_map_constructor_call_thunk as *const u8 as usize
+            || func_ptr == weak_set_constructor_call_thunk as *const u8 as usize
+            || func_ptr == weak_ref_constructor_call_thunk as *const u8 as usize
             || func_ptr
                 == crate::messaging::js_message_channel_constructor_call_error as *const u8
                     as usize
@@ -1118,19 +1318,57 @@ pub unsafe extern "C" fn js_class_register_static_field(
 /// `*ClosureHeader` shapes.
 pub static CLASS_PROTOTYPE_METHODS: RwLock<Option<HashMap<u32, HashMap<String, u64>>>> =
     RwLock::new(None);
+static CLASS_PROTOTYPE_FAST_GUARDS_INVALIDATED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn class_prototype_fast_guards_invalidated() -> bool {
+    CLASS_PROTOTYPE_FAST_GUARDS_INVALIDATED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn invalidate_class_prototype_fast_guards() {
+    CLASS_PROTOTYPE_FAST_GUARDS_INVALIDATED.store(true, std::sync::atomic::Ordering::Release);
+}
 
 pub(crate) fn class_prototype_method_root_store(class_id: u32, name: String, value_bits: u64) {
-    let mut guard = CLASS_PROTOTYPE_METHODS.write().unwrap();
-    if guard.is_none() {
-        *guard = Some(HashMap::new());
+    {
+        let mut guard = CLASS_PROTOTYPE_METHODS.write().unwrap();
+        if guard.is_none() {
+            *guard = Some(HashMap::new());
+        }
+        guard
+            .as_mut()
+            .unwrap()
+            .entry(class_id)
+            .or_insert_with(HashMap::new)
+            .insert(name.clone(), value_bits);
     }
-    guard
-        .as_mut()
-        .unwrap()
-        .entry(class_id)
-        .or_insert_with(HashMap::new)
-        .insert(name, value_bits);
+    invalidate_class_prototype_fast_guards();
     crate::gc::runtime_write_barrier_root_nanbox(value_bits);
+    // #5024: the side table makes the method dispatchable, but own-key
+    // enumeration on the prototype OBJECT (Object.keys / getOwnPropertyNames /
+    // `in` / hasOwnProperty / for-in / Object.assign) consults the object's
+    // keys_array, which the side table never touched — React's
+    // `Object.assign(PureComponent.prototype, Component.prototype)` copied
+    // nothing, so `isReactComponent` vanished and every `extends PureComponent`
+    // class rendered as a function component. Mirror the write onto the
+    // materialized prototype object as an ordinary enumerable own property.
+    let proto = class_prototype_object(class_id);
+    if !proto.is_null() {
+        unsafe { mirror_prototype_method_on_object(proto, &name, value_bits) };
+    }
+}
+
+/// #5024: write a side-table-registered prototype method onto the
+/// materialized prototype object so the key lands in its `keys_array`
+/// (assignment semantics: enumerable data property). Values keep their
+/// full NaN-boxed bits; dispatch paths that find the property on the
+/// object see the same value the side table holds.
+unsafe fn mirror_prototype_method_on_object(proto: *mut ObjectHeader, name: &str, value_bits: u64) {
+    if proto.is_null() || name.is_empty() {
+        return;
+    }
+    let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+    js_object_set_field_by_name(proto, key, f64::from_bits(value_bits));
 }
 
 /// Register a JS-classic prototype-method assignment on a class.
@@ -1145,6 +1383,7 @@ pub unsafe extern "C" fn js_register_prototype_method(
     name_len: usize,
     value: f64,
 ) {
+    invalidate_class_prototype_fast_guards();
     if class_id == 0 || name_ptr.is_null() || name_len == 0 {
         return;
     }
@@ -1152,6 +1391,21 @@ pub unsafe extern "C" fn js_register_prototype_method(
         Ok(s) => s.to_string(),
         Err(_) => return,
     };
+    // `C.prototype.X = v` where X is an instance accessor on the class must
+    // invoke the setter, not overwrite the accessor with a data method. This
+    // write was lowered as a prototype-method monkey-patch because computed-key
+    // accessors (`set [expr](v)`) aren't known at compile time, so the
+    // recogniser couldn't route it to the ordinary setter path. If X has a
+    // setter, invoke it with `this` = the prototype ref; if it's a getter-only
+    // accessor, the (non-strict) assignment is a silent no-op rather than a
+    // clobber (Test262 accessor-name-*/computed setters).
+    let proto_ref = class_prototype_ref_value(class_id);
+    if class_instance_setter_apply(class_id, &name, proto_ref, value) {
+        return;
+    }
+    if class_has_instance_getter(class_id, &name) {
+        return;
+    }
     class_prototype_method_root_store(class_id, name, value.to_bits());
     // Ensure the receiver class can be `typeof`-detected. Method-less
     // classes that only get extended via `Class.prototype.m = fn`
@@ -1204,6 +1458,30 @@ pub unsafe extern "C" fn js_get_function_prototype_method(
         Ok(s) => s,
         Err(_) => return undef,
     };
+    // `f.prototype.constructor` — a *data* property (the prototype's back-pointer
+    // to its constructor), not a registered method, so `lookup_prototype_method`
+    // never finds it and the method allowlist below excludes it. When the inline
+    // `<funcref>.prototype.constructor` read folds to this entry (no separate
+    // `.prototype` access ran to allocate the synthetic class id), `cid` is 0 and
+    // the function returned `undefined`. Route through the real prototype value —
+    // `js_function_prototype_value_for_read` materializes the auto-created
+    // prototype (whose `constructor` is `func_value`) or returns a replaced
+    // `f.prototype = X` — then read its `constructor` field. (Spec
+    // language/statements/function/S13.2_A4_*, S13.2.2_A1_*.)
+    if name == "constructor" {
+        let proto_val = js_function_prototype_value_for_read(func_value);
+        let jv = crate::value::JSValue::from_bits(proto_val.to_bits());
+        if !jv.is_pointer() {
+            return undef;
+        }
+        let pptr = jv.as_pointer::<ObjectHeader>();
+        if pptr.is_null() {
+            return undef;
+        }
+        let key = crate::string::js_string_from_bytes(b"constructor".as_ptr(), 11);
+        let v = js_object_get_field_by_name(pptr, key as *const crate::StringHeader);
+        return f64::from_bits(v.bits());
+    }
     // Look up the (already-allocated) synthetic class id for this
     // function value. Don't allocate one here — reads on a function
     // that never had any `.prototype.x = fn` assignment should
@@ -1233,7 +1511,27 @@ pub unsafe extern "C" fn js_get_function_prototype_method(
             let method = js_class_method_bind(receiver, name_ptr, name_len);
             f64::from_bits(method.to_bits())
         }
-        None => undef,
+        None => {
+            // #5024: properties can land on the prototype OBJECT without a
+            // side-table registration — `Object.assign(F.prototype, src)`
+            // (React's PureComponent setup), a replaced `F.prototype = obj`,
+            // or any generic dynamic write. Read the real prototype value
+            // (replaced object, or the materialized auto-created one) so
+            // the recognised `<func>.prototype.<name>` read shape agrees
+            // with the generic property-get path.
+            let proto_val = js_function_prototype_value_for_read(func_value);
+            let jv = crate::value::JSValue::from_bits(proto_val.to_bits());
+            if !jv.is_pointer() {
+                return undef;
+            }
+            let pptr = jv.as_pointer::<ObjectHeader>();
+            if pptr.is_null() {
+                return undef;
+            }
+            let key = crate::string::js_string_from_bytes(name_ptr, name_len as u32);
+            let v = js_object_get_field_by_name(pptr, key);
+            f64::from_bits(v.bits())
+        }
     }
 }
 
@@ -1340,8 +1638,19 @@ pub unsafe extern "C" fn js_new_function_construct(
             || jv.is_any_string()
             || jv.is_bigint()
         {
-            super::object_ops::throw_object_type_error(b"is not a constructor");
+            let desc = unsafe { super::object_ops::describe_value_for_type_error(func_value) };
+            super::object_ops::throw_object_type_error_with_suffix(
+                &format!("{desc} "),
+                "is not a constructor",
+            );
         }
+    }
+    // `new (new String(""))` / `new (new Number(1))` — a boxed primitive WRAPPER
+    // object is an ordinary object, never a constructor, so `new` on it throws
+    // `TypeError` (Test262 `S15.5.5_A2`). Without this it fell through to the
+    // empty-object construction fallback and silently produced `{}`.
+    if crate::builtins::boxed_primitive_payload(func_value).is_some() {
+        super::object_ops::throw_object_type_error(b"is not a constructor");
     }
     // #3656: `new p()` where `p` is a Proxy dispatches through its `construct`
     // trap (or forwards to the target). Reached when the compiler can't prove
@@ -1360,6 +1669,12 @@ pub unsafe extern "C" fn js_new_function_construct(
     }
     if is_non_constructable_builtin_function_value(func_value) {
         throw_non_constructable_builtin_function();
+    }
+    // `new Function.prototype` — %Function.prototype% is callable but NOT a
+    // constructor (ECMA-262 20.2.3: "does not have a [[Construct]] internal
+    // method").
+    if super::global_this::is_function_prototype_object_value(func_value) {
+        super::object_ops::throw_object_type_error(b"is not a constructor");
     }
     if let Some((module, method)) = bound_native_callable_module_and_method(func_value) {
         if module == "sqlite"
@@ -1501,6 +1816,67 @@ pub unsafe extern "C" fn js_new_function_construct(
                 _ => unreachable!(),
             };
         }
+        // #4904: `new http.Agent(opts)` / `new http.ClientRequest(opts)` /
+        // `new http.IncomingMessage(socket)` / `new http.ServerResponse(req)`
+        // (and `new https.Agent(opts)`) through any value-aliasing path —
+        // `const { Agent } = require('http')`, `const CR =
+        // http.ClientRequest`, etc. The bound export value carries
+        // (module, method); forward construction to the stdlib http
+        // dispatcher exactly like `OutgoingMessage` below.
+        if (module == "http"
+            && matches!(
+                method.as_str(),
+                "OutgoingMessage"
+                    | "Agent"
+                    | "ClientRequest"
+                    | "IncomingMessage"
+                    | "ServerResponse"
+            ))
+            || (module == "https" && method == "Agent")
+        {
+            let ptr =
+                crate::value::JS_NATIVE_HTTP_DISPATCH.load(std::sync::atomic::Ordering::SeqCst);
+            if !ptr.is_null() {
+                let dispatch: unsafe extern "C" fn(
+                    *const u8,
+                    usize,
+                    *const u8,
+                    usize,
+                    *const f64,
+                    usize,
+                ) -> f64 = std::mem::transmute(ptr);
+                return dispatch(
+                    module.as_ptr(),
+                    module.len(),
+                    method.as_ptr(),
+                    method.len(),
+                    args_ptr,
+                    args_len,
+                );
+            }
+        }
+        // #4995: `new EE()` where `EE = require('events')` or came in as a
+        // default / namespace import (`import EE from 'events'`, `import * as
+        // ev from 'events'; new ev.EventEmitter()`). The callee is the bound
+        // `events.EventEmitter` export value; without this arm construction
+        // fell through to the generic empty-object path, so the instance had
+        // no `.on`/`.emit`/`.setMaxListeners` (signal-exit's init throws).
+        // Route to the linked emitter impl (perry-stdlib `bundled-events` or
+        // perry-ext-events) via the construct dispatcher registered at
+        // startup — this crate can't call the constructors directly.
+        if module == "events"
+            && matches!(
+                method.as_str(),
+                "EventEmitter" | "EventEmitterAsyncResource"
+            )
+        {
+            let ptr =
+                crate::value::JS_NATIVE_EVENTS_CONSTRUCT.load(std::sync::atomic::Ordering::SeqCst);
+            if !ptr.is_null() {
+                let dispatch: crate::value::JsNativeEventsConstructFn = std::mem::transmute(ptr);
+                return dispatch(method.as_ptr(), method.len(), args_ptr, args_len);
+            }
+        }
         if module == "zlib" && matches!(method.as_str(), "ZstdCompress" | "ZstdDecompress") {
             let ptr =
                 crate::value::JS_NATIVE_ZLIB_DISPATCH.load(std::sync::atomic::Ordering::SeqCst);
@@ -1581,6 +1957,65 @@ pub unsafe extern "C" fn js_new_function_construct(
                     .copied()
                     .unwrap_or_else(|| f64::from_bits(crate::value::TAG_UNDEFINED));
                 return crate::object::js_object_coerce(value);
+            }
+            // `new $Map()` / `new $Set()` / `new $WeakMap()` / … where the
+            // constructor was obtained as a value (alias variable, intrinsic
+            // lookup, cross-module re-export). Mirror the static codegen
+            // construction in lower_call/builtin.rs: allocate, NaN-box, then
+            // initialize from the optional iterable argument.
+            "Map" => {
+                let map = crate::map::js_map_alloc(4);
+                let boxed = crate::value::js_nanbox_pointer(map as i64);
+                if let Some(&iterable) = args.first() {
+                    let ij = crate::value::JSValue::from_bits(iterable.to_bits());
+                    if !ij.is_undefined() && !ij.is_null() {
+                        let from = crate::map::js_map_from_iterable(iterable);
+                        return crate::value::js_nanbox_pointer(from as i64);
+                    }
+                }
+                return boxed;
+            }
+            "Set" => {
+                let set = crate::set::js_set_alloc(4);
+                let boxed = crate::value::js_nanbox_pointer(set as i64);
+                if let Some(&iterable) = args.first() {
+                    let ij = crate::value::JSValue::from_bits(iterable.to_bits());
+                    if !ij.is_undefined() && !ij.is_null() {
+                        let from = crate::set::js_set_from_iterable(iterable);
+                        return crate::value::js_nanbox_pointer(from as i64);
+                    }
+                }
+                return boxed;
+            }
+            "WeakMap" => {
+                let map = crate::weakref::js_weakmap_new();
+                let boxed = crate::value::js_nanbox_pointer(map as i64);
+                if let Some(&iterable) = args.first() {
+                    let ij = crate::value::JSValue::from_bits(iterable.to_bits());
+                    if !ij.is_undefined() && !ij.is_null() {
+                        return crate::weakref::js_weakmap_init_iterable(boxed, iterable);
+                    }
+                }
+                return boxed;
+            }
+            "WeakSet" => {
+                let set = crate::weakref::js_weakset_new();
+                let boxed = crate::value::js_nanbox_pointer(set as i64);
+                if let Some(&iterable) = args.first() {
+                    let ij = crate::value::JSValue::from_bits(iterable.to_bits());
+                    if !ij.is_undefined() && !ij.is_null() {
+                        return crate::weakref::js_weakset_init_iterable(boxed, iterable);
+                    }
+                }
+                return boxed;
+            }
+            "WeakRef" => {
+                let target = args
+                    .first()
+                    .copied()
+                    .unwrap_or_else(|| f64::from_bits(crate::value::TAG_UNDEFINED));
+                let wr = crate::weakref::js_weakref_new(target);
+                return crate::value::js_nanbox_pointer(wr as i64);
             }
             "Blob" => {
                 let parts = args
@@ -1744,7 +2179,27 @@ pub unsafe extern "C" fn js_new_function_construct(
                 } else {
                     args[0]
                 };
-                let ta = crate::typedarray::js_typed_array_new(kind, arg0);
+                // `new TA(buffer, byteOffset, length?)` via a *dynamic* constructor
+                // value (e.g. test262's `testWithTypedArrayConstructors`, where
+                // `TA` is a variable) must honor the offset/length arguments. The
+                // single-arg `js_typed_array_new` path dropped them, so every
+                // view built this way reported `byteOffset === 0`. Route the
+                // multi-arg form through the view constructor, which records the
+                // backing/offset so `.byteOffset` / `.buffer` are correct and the
+                // result aliases the buffer (mirrors the literal-name codegen
+                // path in `lower_call::builtin`). A non-ArrayBuffer `arg0` falls
+                // back to `js_typed_array_new` inside `js_typed_array_view`.
+                let ta = if args.len() >= 2 {
+                    let undefined = f64::from_bits(crate::value::TAG_UNDEFINED);
+                    crate::typedarray_view::js_typed_array_view(
+                        kind,
+                        arg0,
+                        args[1],
+                        args.get(2).copied().unwrap_or(undefined),
+                    )
+                } else {
+                    crate::typedarray::js_typed_array_new(kind, arg0)
+                };
                 return crate::value::js_nanbox_pointer(ta as i64);
             }
             "TextEncoderStream" => {
@@ -1780,6 +2235,15 @@ pub unsafe extern "C" fn js_new_function_construct(
                     func_value,
                     CLASS_ID_DECOMPRESSION_STREAM,
                 );
+            }
+            // #4950 (secondary note): react-reconciler captures the global
+            // `AbortController` into a local (`AbortControllerLocal = typeof
+            // AbortController !== "undefined" ? AbortController : <shim>`) and
+            // constructs through the variable. Without this arm the dynamic
+            // `new` fell through and threw "AbortController is not a function".
+            "AbortController" => {
+                let controller = crate::url::js_abort_controller_new();
+                return crate::value::js_nanbox_pointer(controller as i64);
             }
             "MessageChannel" => {
                 return crate::messaging::js_message_channel_new();
@@ -1871,6 +2335,16 @@ pub unsafe extern "C" fn js_new_function_construct(
             super::class_constructors::replay_class_object_constructor(
                 func_value, class_cid, inst, args_ptr, args_len,
             );
+            // `class X extends Request/Response {}` constructed via the dynamic
+            // (class-expression value) path: the replayed ctor's `super()`
+            // can't statically route an aliased parent, so attach the native
+            // fetch handle here when the registered parent is a fetch builtin
+            // and the instance didn't already get one. Refs `@hono/node-server`.
+            if let Some(kind) = fetch_parent_kind_in_chain(class_cid) {
+                if super::field_get_set::fetch_subclass_handle_id(inst as usize).is_none() {
+                    super::attach_fetch_handle_for_construction(inst, kind, args_ptr, args_len);
+                }
+            }
             return crate::value::js_nanbox_pointer(inst as i64);
         }
     }
@@ -1896,12 +2370,44 @@ pub unsafe extern "C" fn js_new_function_construct(
     // synthetic class id's entry in CLASS_PROTOTYPE_METHODS.
     let obj_ptr = js_object_alloc(cid, 0);
     let nan_boxed = crate::value::js_nanbox_pointer(obj_ptr as i64);
-    let proto = ensure_function_prototype_object(func_value, cid);
-    if !proto.is_null() {
-        super::prototype_chain::object_set_static_prototype(
-            obj_ptr as usize,
-            crate::value::js_nanbox_pointer(proto as i64).to_bits(),
-        );
+    // A user-assigned `foo.prototype = <obj/array>` lives as the closure's
+    // "prototype" dynamic prop; the instance's [[Prototype]] must be THAT
+    // value — notably a real array (`foo.prototype = new Array(1,2,3)`),
+    // which `ensure_function_prototype_object` would shadow with a fresh
+    // empty object (test262 filter/15.4.4.20-6-*, some/15.4.4.17-8-*).
+    let mut linked_user_proto = false;
+    {
+        let fp = (func_value.to_bits() & crate::value::POINTER_MASK) as usize;
+        if fp != 0 && crate::closure::is_closure_ptr(fp) {
+            let dyn_proto = crate::closure::closure_get_dynamic_prop(fp, "prototype");
+            let dp = JSValue::from_bits(dyn_proto.to_bits());
+            if dp.is_pointer() {
+                let raw = dp.as_pointer::<u8>() as usize;
+                let is_array = raw >= crate::gc::GC_HEADER_SIZE + 0x1000 && {
+                    let hdr = unsafe {
+                        &*((raw - crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader)
+                    };
+                    hdr.obj_type == crate::gc::GC_TYPE_ARRAY
+                        || hdr.obj_type == crate::gc::GC_TYPE_LAZY_ARRAY
+                };
+                if is_array {
+                    super::prototype_chain::object_set_static_prototype(
+                        obj_ptr as usize,
+                        dyn_proto.to_bits(),
+                    );
+                    linked_user_proto = true;
+                }
+            }
+        }
+    }
+    if !linked_user_proto {
+        let proto = ensure_function_prototype_object(func_value, cid);
+        if !proto.is_null() {
+            super::prototype_chain::object_set_static_prototype(
+                obj_ptr as usize,
+                crate::value::js_nanbox_pointer(proto as i64).to_bits(),
+            );
+        }
     }
     // Only run the constructor body when the callee is recognised as
     // a closure shape. The codegen LocalGet path widens the route to
@@ -1932,11 +2438,127 @@ pub unsafe extern "C" fn js_new_function_construct(
     nan_boxed
 }
 
+/// `new <callee>(...spread)` — spread-bearing construction. Codegen builds a
+/// single JS array containing every argument in evaluation order (regular args
+/// pushed, spread sources expanded via `js_array_like_to_array` + concat), then
+/// hands the array here. We materialise it into a flat `f64` buffer and forward
+/// to `js_new_function_construct`, so the full callee-shape dispatch (primitive
+/// → TypeError, proxy `construct` trap, boxed-wrapper TypeError, class refs,
+/// closures, native module constructors) is shared with the non-spread path.
+///
+/// `args_array` is a NaN-boxed Array JSValue (POINTER_TAG). A null/0 handle is
+/// treated as an empty argument list.
+#[no_mangle]
+pub unsafe extern "C" fn js_new_function_construct_apply(func_value: f64, args_array: f64) -> f64 {
+    let arr_ptr = (args_array.to_bits() & crate::value::POINTER_MASK) as *const crate::ArrayHeader;
+    if arr_ptr.is_null() {
+        return js_new_function_construct(func_value, std::ptr::null::<f64>(), 0);
+    }
+    let len = crate::array::js_array_length(arr_ptr) as usize;
+    let mut buf: Vec<f64> = Vec::with_capacity(len);
+    for i in 0..len {
+        let v = crate::array::js_array_get(arr_ptr, i as u32);
+        buf.push(f64::from_bits(v.bits()));
+    }
+    let (ptr, n) = if buf.is_empty() {
+        (std::ptr::null::<f64>(), 0usize)
+    } else {
+        (buf.as_ptr(), buf.len())
+    };
+    js_new_function_construct(func_value, ptr, n)
+}
+
 fn constructor_class_ref_id(value: f64) -> Option<u32> {
     if super::class_prototype_ref_id(value).is_some() {
         return None;
     }
     super::class_ref_id(value)
+}
+
+/// Spec `IsConstructor(value)` — used by `NewPromiseCapability` (the Promise
+/// combinators) to validate the `this` constructor argument. Returns true for
+/// registered class constructors, the reified builtin constructors, and plain
+/// (non-arrow, non-builtin-method) function closures; false for primitives,
+/// arrow functions, and non-constructable builtin functions (e.g. `eval`).
+pub(crate) fn js_value_is_constructor(value: f64) -> bool {
+    if constructor_class_ref_id(value).is_some() {
+        return true;
+    }
+    if crate::proxy::js_proxy_is_proxy(value) == 1 {
+        return true;
+    }
+    if !is_callable_function_value(value) {
+        return false;
+    }
+    if is_arrow_function_value(value) {
+        return false;
+    }
+    if is_non_constructable_builtin_function_value(value) {
+        return false;
+    }
+    true
+}
+
+/// Spec ClassDefinitionEvaluation: a non-`null` superclass that is not a
+/// constructor makes `class X extends <value>` throw a TypeError before any
+/// `.prototype` access. Returns true when `value` is a *definitively* invalid
+/// superclass (so the caller throws). `null` is a valid superclass (creates a
+/// null-`[[Prototype]]` class) and never throws. Ambiguous heap values (not
+/// recognized as callable) return false so legitimate dynamic-extends shapes
+/// (mixins, factory-returned classes) keep their parentless baseline rather
+/// than mis-throwing. (Test262 subclass/superclass-* and definition/invalid-extends.)
+fn extends_target_must_throw(value: f64) -> bool {
+    use crate::value::JSValue;
+    let jv = JSValue::from_bits(value.to_bits());
+    if jv.is_null() {
+        return false;
+    }
+    // Registered class refs / heap class objects are constructors.
+    if constructor_class_ref_id(value).is_some() || is_class_object_value(value) {
+        return false;
+    }
+    // A Proxy is a constructor iff its `[[ProxyTarget]]` is — recurse.
+    if crate::proxy::js_proxy_is_proxy(value) == 1 {
+        return extends_target_must_throw(crate::proxy::js_proxy_target(value));
+    }
+    // Non-object primitives (number, string, boolean, undefined, symbol, bigint)
+    // can never be a superclass.
+    if !jv.is_pointer() {
+        return true;
+    }
+    if is_callable_function_value(value) {
+        if is_arrow_function_value(value) || is_non_constructable_builtin_function_value(value) {
+            return true;
+        }
+        let ptr = jv.as_pointer::<crate::closure::ClosureHeader>();
+        if !ptr.is_null() && is_valid_obj_ptr(ptr as *const u8) {
+            // A bound *method* (class/instance method read as a value) is never
+            // a constructor.
+            if crate::closure::closure_is_bound_method(ptr) {
+                return true;
+            }
+            let fp = crate::closure::get_valid_func_ptr(ptr);
+            // A bound *function* (`fn.bind(...)`) is a constructor iff its bound
+            // target is — recurse on the captured target.
+            if fp == crate::closure::BOUND_FUNCTION_FUNC_PTR {
+                let target = crate::closure::js_closure_get_capture_f64(ptr, 0);
+                return extends_target_must_throw(target);
+            }
+            // Arrow / async / generator / async-generator function bodies are
+            // non-constructors.
+            if crate::closure::is_registered_arrow_function(fp)
+                || crate::closure::is_registered_async_function(fp)
+                || crate::closure::is_registered_generator_function(fp)
+                || crate::closure::is_registered_async_generator_function(fp)
+            {
+                return true;
+            }
+        }
+        // Ordinary function — a constructor.
+        return false;
+    }
+    // A pointer we don't recognize as callable: stay conservative (no throw).
+    false
 }
 
 fn class_object_class_id(value: f64) -> Option<u32> {
@@ -1970,7 +2592,36 @@ unsafe fn construct_registered_class_ref(
     super::class_constructors::replay_registered_class_constructor(
         target_cid, inst, args_ptr, args_len,
     );
+    // ClassRef `new` of a Request/Response subclass — attach the native fetch
+    // handle on the dynamic path (mirrors the class-expression arm above).
+    if let Some(kind) = fetch_parent_kind_in_chain(target_cid) {
+        if super::field_get_set::fetch_subclass_handle_id(inst as usize).is_none() {
+            super::attach_fetch_handle_for_construction(inst, kind, args_ptr, args_len);
+        }
+    }
     crate::value::js_nanbox_pointer(inst as i64)
+}
+
+/// `GetPrototypeFromConstructor(newTarget)` restricted to the "use it only when
+/// it is an object" rule: returns `newTarget.prototype`'s bits when that value
+/// is an object (so a typed-array view should adopt it as its `[[Prototype]]`),
+/// or `None` when it is a primitive (so the default per-kind prototype applies).
+fn new_target_custom_object_prototype(new_target: f64) -> Option<u64> {
+    let bits = new_target.to_bits();
+    if (bits >> 48) != 0x7FFD {
+        return None;
+    }
+    let raw = (bits & crate::value::POINTER_MASK) as usize;
+    if raw == 0 {
+        return None;
+    }
+    let key = crate::string::js_string_from_bytes(b"prototype".as_ptr(), b"prototype".len() as u32);
+    let proto = js_object_get_field_by_name_f64(raw as *const ObjectHeader, key);
+    if unsafe { super::value_is_object_like(proto) } || super::class_ref_id(proto).is_some() {
+        Some(proto.to_bits())
+    } else {
+        None
+    }
 }
 
 fn constructor_prototype_bits(new_target: f64) -> Option<u64> {
@@ -2020,6 +2671,44 @@ pub unsafe extern "C" fn js_new_function_construct_with_new_target(
     if let Some(target_cid) = constructor_class_ref_id(func_value) {
         let instance_cid = new_target_class_id(nt).unwrap_or(target_cid);
         return construct_registered_class_ref(target_cid, instance_cid, args_ptr, args_len);
+    }
+    // `Reflect.construct(Int8Array, [len], newTarget)` — a typed-array
+    // constructor invoked with a distinct newTarget. Build the typed array the
+    // normal way, then honor `GetPrototypeFromConstructor(newTarget)`: when
+    // `newTarget.prototype` is an object other than the default per-kind
+    // prototype, record it as the instance's `[[Prototype]]` so
+    // `Object.getPrototypeOf` and `.constructor` resolve through it (test262
+    // `ctors*/use-custom-proto-if-object` / `use-default-proto-if-…`).
+    if let Some(ta_name) = identify_global_builtin_constructor(func_value) {
+        if matches!(
+            ta_name,
+            "Int8Array"
+                | "Uint8Array"
+                | "Uint8ClampedArray"
+                | "Int16Array"
+                | "Uint16Array"
+                | "Int32Array"
+                | "Uint32Array"
+                | "Float16Array"
+                | "Float32Array"
+                | "Float64Array"
+                | "BigInt64Array"
+                | "BigUint64Array"
+        ) {
+            // Read `newTarget.prototype` (GetPrototypeFromConstructor) BEFORE
+            // building the view: Node evaluates the proto access as part of
+            // AllocateTypedArray, so a throwing `prototype` getter must surface
+            // here even when later steps would also throw (test262
+            // `throw-type-error-before-custom-proto-access` agreement).
+            let proto_bits = new_target_custom_object_prototype(nt);
+            let result = js_new_function_construct(func_value, args_ptr, args_len);
+            if let Some(addr) = crate::typedarray_props::typed_array_addr_from_value(result) {
+                if let Some(proto_bits) = proto_bits {
+                    super::prototype_chain::object_set_static_prototype(addr, proto_bits);
+                }
+            }
+            return result;
+        }
     }
     if !is_callable_function_value(func_value) {
         return js_new_function_construct(func_value, args_ptr, args_len);
@@ -2085,9 +2774,50 @@ fn constructor_return_overrides_this(value: f64) -> bool {
             (raw as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
         matches!(
             (*gc_header).obj_type,
-            crate::gc::GC_TYPE_OBJECT | crate::gc::GC_TYPE_ERROR
+            // Per spec, a constructor returning ANY Object overrides the
+            // implicit `this`. Promises are objects — a user constructor like
+            // `function P(exec){ return new Promise(...) }` (the
+            // `NewPromiseCapability` shape exercised by the Promise-combinator
+            // test262 cases) must yield that Promise, not the empty default.
+            // GC_TYPE_TEMPORAL: `new Temporal.Duration(...)` (and every other
+            // Temporal constructor) is dispatched through this generic path —
+            // the constructor thunk allocates a Temporal cell and returns it, so
+            // that cell must override the empty default `this` (#4687).
+            crate::gc::GC_TYPE_OBJECT
+                | crate::gc::GC_TYPE_ERROR
+                | crate::gc::GC_TYPE_PROMISE
+                | crate::gc::GC_TYPE_TEMPORAL
         )
     }
+}
+
+/// Apply ECMAScript constructor return-override semantics for an inlined
+/// constructor body's explicit `return <value>`. Given the implicit `this`
+/// and the returned value:
+///   - returned value is an Object  → it becomes the construction result;
+///   - returned value is `undefined` → result is `this`;
+///   - returned value is any other primitive → for a derived constructor
+///     (`class X extends Y`) this is a TypeError; for a base constructor the
+///     primitive is ignored and the result is `this`.
+/// `is_derived` is 1 for a class with an `extends` clause, 0 otherwise.
+/// Refs class/subclass/derived-class-return-override-*.
+#[no_mangle]
+pub extern "C" fn js_ctor_return_override(this_val: f64, return_val: f64, is_derived: i32) -> f64 {
+    use crate::value::JSValue;
+    if constructor_return_overrides_this(return_val) {
+        return return_val;
+    }
+    let jv = JSValue::from_bits(return_val.to_bits());
+    if jv.is_undefined() {
+        return this_val;
+    }
+    if is_derived != 0 {
+        crate::collection_iter::throw_type_error(
+            "Derived constructors may only return object or undefined",
+        );
+    }
+    // Base constructor: a returned primitive is ignored.
+    this_val
 }
 
 /// Verify that a JSValue is a NaN-boxed pointer to a registered
@@ -2139,8 +2869,67 @@ fn is_arrow_function_value(value: f64) -> bool {
     crate::closure::closure_is_arrow(ptr)
 }
 
+/// Predicate-only sibling of `ordinary_function_prototype_value_for_read`:
+/// would this function have an own `.prototype` slot? Crucially does NOT
+/// materialize the prototype object — `fn.hasOwnProperty('prototype')` must
+/// not lock the slot's attributes before a later
+/// `Object.defineProperty(fn, "prototype", …)` (TypedArrayConstructors
+/// custom-proto tests).
+pub(crate) fn function_would_have_own_prototype(func_value: f64) -> bool {
+    if !is_callable_function_value(func_value) || is_arrow_function_value(func_value) {
+        return false;
+    }
+    if super::native_module::builtin_closure_is_non_constructable_value(func_value) {
+        return false;
+    }
+    synthetic_class_id_for_function(func_value) != 0
+}
+
 pub(crate) fn ordinary_function_prototype_value_for_read(func_value: f64) -> Option<f64> {
     if !is_callable_function_value(func_value) || is_arrow_function_value(func_value) {
+        return None;
+    }
+    // Bound-method / bound-function values (class method/getter/setter reads via
+    // `C.prototype.m`, instance method reads, `fn.bind(...)`) are non-constructors
+    // and have NO `prototype` own property (`C.prototype.m.prototype === undefined`,
+    // `'prototype' in C.prototype.m === false`). (Test262 definition method/accessor
+    // prop-desc.)
+    //
+    // #4973 exception: bound NATIVE-MODULE *class* exports (`http.Server`,
+    // `https.Server`) are constructors in Node, and the util.inherits-era
+    // subclass pattern reads their `.prototype` as a setPrototypeOf operand
+    // (`Object.setPrototypeOf(testServer.prototype, http.Server.prototype)`).
+    // Returning None here made that read `undefined` and the setPrototypeOf
+    // threw "Object prototype may only be an Object or null". These exports
+    // are cached singleton closures (NATIVE_CALLABLE_EXPORTS), so the
+    // synthetic-class path below gives them a stable prototype object.
+    {
+        let jv = crate::value::JSValue::from_bits(func_value.to_bits());
+        if jv.is_pointer() {
+            let cptr = jv.as_pointer::<crate::closure::ClosureHeader>();
+            if !cptr.is_null()
+                && is_valid_obj_ptr(cptr as *const u8)
+                && crate::closure::closure_is_bound_method(cptr)
+            {
+                let is_native_class_export = unsafe {
+                    super::native_module::bound_native_callable_module_and_method(func_value)
+                }
+                .map(|(module, method)| {
+                    matches!(module.as_str(), "http" | "https") && method == "Server"
+                })
+                .unwrap_or(false);
+                if !is_native_class_export {
+                    return None;
+                }
+            }
+        }
+    }
+    // Built-in methods (`String.prototype.charAt`, `Array.prototype.map`, …) are
+    // not constructors and have NO `prototype` own property — `String.prototype.
+    // charAt.prototype === undefined` (ECMA-262: built-in non-constructor
+    // functions don't get the auto-created `.prototype`). Don't lazily synthesize
+    // one for them.
+    if super::native_module::builtin_closure_is_non_constructable_value(func_value) {
         return None;
     }
     let cid = synthetic_class_id_for_function(func_value);
@@ -2631,6 +3420,7 @@ pub(crate) fn test_clear_class_side_table_roots() {
     if let Ok(mut guard) = CLASS_PROTOTYPE_METHODS.write() {
         *guard = None;
     }
+    CLASS_PROTOTYPE_FAST_GUARDS_INVALIDATED.store(false, std::sync::atomic::Ordering::Release);
     if let Ok(mut guard) = FUNCTION_CLASS_IDS.write() {
         *guard = None;
     }
@@ -2801,7 +3591,9 @@ pub unsafe extern "C" fn js_register_class_method(
     has_synthetic_arguments: i64,
     has_rest: i64,
 ) {
-    let name = if name_ptr.is_null() || name_len <= 0 {
+    // `name_len == 0` is a legal empty-string member key (`get ''()`), so only
+    // reject a negative length / null pointer.
+    let name = if name_ptr.is_null() || name_len < 0 {
         return;
     } else {
         match std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len as usize)) {
@@ -2831,6 +3623,89 @@ pub unsafe extern "C" fn js_register_class_method(
     VTABLE_GEN.fetch_add(1, Ordering::Release);
 }
 
+/// Own (non-inherited) instance accessor func_ptrs for `class_id` + `name`:
+/// `(getter_ptr, setter_ptr)`, each 0 when that half is absent. Consulted by
+/// `Object.getOwnPropertyDescriptor(C.prototype, name)`.
+pub(crate) fn class_own_accessor_ptrs(class_id: u32, name: &str) -> Option<(usize, usize)> {
+    let guard = CLASS_VTABLE_REGISTRY.read().ok()?;
+    let reg = guard.as_ref()?;
+    let vt = reg.get(&class_id)?;
+    let g = vt.getters.get(name).copied().unwrap_or(0);
+    let s = vt.setters.get(name).copied().unwrap_or(0);
+    if g == 0 && s == 0 {
+        None
+    } else {
+        Some((g, s))
+    }
+}
+
+/// Own static accessor func_ptrs for the class *constructor*. Mirrors
+/// `class_own_accessor_ptrs` against `CLASS_STATIC_ACCESSORS`.
+pub(crate) fn class_own_static_accessor_ptrs(class_id: u32, name: &str) -> Option<(usize, usize)> {
+    let guard = CLASS_STATIC_ACCESSORS.read().ok()?;
+    let reg = guard.as_ref()?;
+    let pair = reg.get(&class_id)?.get(name).copied()?;
+    if pair.0 == 0 && pair.1 == 0 {
+        None
+    } else {
+        Some(pair)
+    }
+}
+
+/// Trampoline giving a raw vtable getter func_ptr (`fn(this) -> f64`) the
+/// closure calling convention. The receiver comes from `IMPLICIT_THIS`, set
+/// by the method-call dispatch the closure value travels through.
+extern "C" fn class_accessor_getter_thunk(closure: *const crate::closure::ClosureHeader) -> f64 {
+    let raw = unsafe { crate::closure::js_closure_get_capture_ptr(closure, 0) } as usize;
+    if raw == 0 {
+        return f64::from_bits(crate::value::TAG_UNDEFINED);
+    }
+    let this = crate::object::js_implicit_this_get();
+    let f: extern "C" fn(f64) -> f64 = unsafe { std::mem::transmute(raw) };
+    f(this)
+}
+
+/// Trampoline for a raw vtable setter func_ptr (`fn(this, value) -> f64`).
+extern "C" fn class_accessor_setter_thunk(
+    closure: *const crate::closure::ClosureHeader,
+    value: f64,
+) -> f64 {
+    let raw = unsafe { crate::closure::js_closure_get_capture_ptr(closure, 0) } as usize;
+    if raw == 0 {
+        return f64::from_bits(crate::value::TAG_UNDEFINED);
+    }
+    let this = crate::object::js_implicit_this_get();
+    let f: extern "C" fn(f64, f64) -> f64 = unsafe { std::mem::transmute(raw) };
+    f(this, value)
+}
+
+/// Wrap a raw class accessor func_ptr as a callable function VALUE for
+/// descriptor reflection (`Object.getOwnPropertyDescriptor(C.prototype,
+/// "x").get`). Built-in-shaped: `.length` 0/1, no `.prototype`, native
+/// `toString` form.
+pub(crate) fn class_accessor_function_value(raw_ptr: usize, is_setter: bool) -> f64 {
+    if raw_ptr == 0 {
+        return f64::from_bits(crate::value::TAG_UNDEFINED);
+    }
+    let thunk = if is_setter {
+        class_accessor_setter_thunk as *const u8
+    } else {
+        class_accessor_getter_thunk as *const u8
+    };
+    let closure = crate::closure::js_closure_alloc(thunk, 1);
+    if closure.is_null() {
+        return f64::from_bits(crate::value::TAG_UNDEFINED);
+    }
+    unsafe { crate::closure::js_closure_set_capture_ptr(closure, 0, raw_ptr as i64) };
+    super::native_module::set_builtin_closure_length(
+        closure as usize,
+        if is_setter { 1 } else { 0 },
+    );
+    super::native_module::set_builtin_closure_non_constructable(closure as usize);
+    crate::gc::runtime_write_barrier_root_heap_word(closure as u64);
+    crate::value::js_nanbox_pointer(closure as i64)
+}
+
 /// Register a class getter in the vtable registry.
 #[no_mangle]
 pub unsafe extern "C" fn js_register_class_getter(
@@ -2839,7 +3714,9 @@ pub unsafe extern "C" fn js_register_class_getter(
     name_len: i64,
     func_ptr: i64,
 ) {
-    let name = if name_ptr.is_null() || name_len <= 0 {
+    // `name_len == 0` is a legal empty-string member key (`get ''()`), so only
+    // reject a negative length / null pointer.
+    let name = if name_ptr.is_null() || name_len < 0 {
         return;
     } else {
         match std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len as usize)) {
@@ -2879,7 +3756,9 @@ pub unsafe extern "C" fn js_register_class_setter(
     name_len: i64,
     func_ptr: i64,
 ) {
-    let name = if name_ptr.is_null() || name_len <= 0 {
+    // `name_len == 0` is a legal empty-string member key (`get ''()`), so only
+    // reject a negative length / null pointer.
+    let name = if name_ptr.is_null() || name_len < 0 {
         return;
     } else {
         match std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len as usize)) {
@@ -2898,6 +3777,145 @@ pub unsafe extern "C" fn js_register_class_setter(
         setters: HashMap::new(),
     });
     vtable.setters.insert(name, func_ptr as usize);
+    VTABLE_GEN.fetch_add(1, Ordering::Release);
+}
+
+/// Register a `static get name()` accessor on the class *constructor*
+/// (`CLASS_STATIC_ACCESSORS`), not the instance vtable — a static accessor is
+/// an own property of `C`, reachable via `C.name` / `C[name]`, and must NOT
+/// appear on `C.prototype` or instances. The read/write dispatch already
+/// consults `CLASS_STATIC_ACCESSORS` (`class_static_accessor_getter_value` /
+/// `class_static_accessor_setter_apply`); this populates it.
+#[no_mangle]
+pub unsafe extern "C" fn js_register_class_static_getter(
+    class_id: i64,
+    name_ptr: *const u8,
+    name_len: i64,
+    func_ptr: i64,
+) {
+    register_class_static_accessor_half(class_id, name_ptr, name_len, func_ptr, true);
+}
+
+/// Register a `static set name(v)` accessor. See `js_register_class_static_getter`.
+#[no_mangle]
+pub unsafe extern "C" fn js_register_class_static_setter(
+    class_id: i64,
+    name_ptr: *const u8,
+    name_len: i64,
+    func_ptr: i64,
+) {
+    register_class_static_accessor_half(class_id, name_ptr, name_len, func_ptr, false);
+}
+
+// These two are only ever called from codegen-emitted module-init IR (no Rust
+// caller), so the auto-optimize whole-program-LLVM build would dead-strip them
+// without an anchor. Pin each via a `#[used]` static (mirrors node_v8.rs).
+#[used]
+static KEEP_REGISTER_STATIC_GETTER: unsafe extern "C" fn(i64, *const u8, i64, i64) =
+    js_register_class_static_getter;
+#[used]
+static KEEP_REGISTER_STATIC_SETTER: unsafe extern "C" fn(i64, *const u8, i64, i64) =
+    js_register_class_static_setter;
+
+/// Record the spec `.length` (params before the first default/rest) for a class
+/// method or accessor. Codegen emits one call per method at module init.
+#[no_mangle]
+pub unsafe extern "C" fn js_register_class_method_bind_length(
+    class_id: i64,
+    name_ptr: *const u8,
+    name_len: i64,
+    length: i64,
+) {
+    if name_ptr.is_null() || name_len < 0 {
+        return;
+    }
+    let name = match std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len as usize)) {
+        Ok(s) => s.to_string(),
+        Err(_) => return,
+    };
+    let mut guard = match CLASS_METHOD_BIND_LENGTHS.write() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if guard.is_none() {
+        *guard = Some(HashMap::new());
+    }
+    guard
+        .as_mut()
+        .unwrap()
+        .insert((class_id as u32, name), length as u32);
+}
+
+#[used]
+static KEEP_REGISTER_METHOD_BIND_LENGTH: unsafe extern "C" fn(i64, *const u8, i64, i64) =
+    js_register_class_method_bind_length;
+
+/// Record the spec `.length` for a STATIC method (params before the first
+/// default/rest). Codegen emits one call per static method at module init.
+#[no_mangle]
+pub unsafe extern "C" fn js_register_class_static_method_bind_length(
+    class_id: i64,
+    name_ptr: *const u8,
+    name_len: i64,
+    length: i64,
+) {
+    if name_ptr.is_null() || name_len < 0 {
+        return;
+    }
+    let name = match std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len as usize)) {
+        Ok(s) => s.to_string(),
+        Err(_) => return,
+    };
+    let mut guard = match CLASS_STATIC_METHOD_BIND_LENGTHS.write() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if guard.is_none() {
+        *guard = Some(HashMap::new());
+    }
+    guard
+        .as_mut()
+        .unwrap()
+        .insert((class_id as u32, name), length as u32);
+}
+
+#[used]
+static KEEP_REGISTER_STATIC_METHOD_BIND_LENGTH: unsafe extern "C" fn(i64, *const u8, i64, i64) =
+    js_register_class_static_method_bind_length;
+
+unsafe fn register_class_static_accessor_half(
+    class_id: i64,
+    name_ptr: *const u8,
+    name_len: i64,
+    func_ptr: i64,
+    is_getter: bool,
+) {
+    // Empty-string keys (`static get ''()`) are legal — admit `name_len == 0`
+    // as long as the pointer is non-null.
+    let name = if name_ptr.is_null() || name_len < 0 {
+        return;
+    } else {
+        match std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len as usize)) {
+            Ok(s) => s.to_string(),
+            Err(_) => return,
+        }
+    };
+    let mut guard = CLASS_STATIC_ACCESSORS.write().unwrap();
+    if guard.is_none() {
+        *guard = Some(HashMap::new());
+    }
+    let entry = guard
+        .as_mut()
+        .unwrap()
+        .entry(class_id as u32)
+        .or_default()
+        .entry(name)
+        .or_insert((0, 0));
+    if is_getter {
+        entry.0 = func_ptr as usize;
+    } else {
+        entry.1 = func_ptr as usize;
+    }
     VTABLE_GEN.fetch_add(1, Ordering::Release);
 }
 
@@ -3040,12 +4058,23 @@ pub(crate) unsafe fn call_vtable_method(
     has_synthetic_arguments: bool,
     has_rest: bool,
 ) -> f64 {
+    // A missing trailing argument is `undefined` per spec (NOT NaN): default
+    // parameters lower to a `param === undefined ? <default> : param` check in
+    // the method prologue, so padding a hole with NaN left the default
+    // un-applied (`async method(a, b, c = 99)` called via the dynamic vtable
+    // path — e.g. a detached `C.prototype.method` value — saw `c = NaN`). Pad
+    // with TAG_UNDEFINED so the prologue's default-check fires.
     #[inline(always)]
-    unsafe fn arg_or_nan(args_ptr: *const f64, args_len: usize, idx: usize) -> f64 {
+    unsafe fn arg_or_undefined(args_ptr: *const f64, args_len: usize, idx: usize) -> f64 {
         if idx < args_len {
             *args_ptr.add(idx)
         } else {
-            f64::NAN
+            // A missing argument is `undefined` per spec, not a bare IEEE NaN.
+            // This vtable path is reached without call-site padding when a
+            // method is invoked as a value (`const f = obj.m; f()`, or a bound
+            // method from a getter), so NaN here defeated the callee's
+            // default-param / destructuring prologue (`if (p === undefined)`).
+            f64::from_bits(crate::value::TAG_UNDEFINED)
         }
     }
 
@@ -3100,13 +4129,13 @@ pub(crate) unsafe fn call_vtable_method(
             crate::array::js_array_set_f64(
                 raw_args,
                 slot as u32,
-                arg_or_nan(args_ptr, args_len, i),
+                arg_or_undefined(args_ptr, args_len, i),
             );
         }
         let raw_args_value = crate::value::js_nanbox_pointer(raw_args as i64);
         let mut args = Vec::with_capacity(param_count as usize);
         for i in 0..visible_params {
-            args.push(arg_or_nan(args_ptr, args_len, i));
+            args.push(arg_or_undefined(args_ptr, args_len, i));
         }
         args.push(raw_args_value);
         adjusted_args_storage = Some(args);
@@ -3123,33 +4152,33 @@ pub(crate) unsafe fn call_vtable_method(
         }
         1 => {
             let f: extern "C" fn(f64, f64) -> f64 = std::mem::transmute(func_ptr);
-            f(this_f64, arg_or_nan(call_args_ptr, call_args_len, 0))
+            f(this_f64, arg_or_undefined(call_args_ptr, call_args_len, 0))
         }
         2 => {
             let f: extern "C" fn(f64, f64, f64) -> f64 = std::mem::transmute(func_ptr);
             f(
                 this_f64,
-                arg_or_nan(call_args_ptr, call_args_len, 0),
-                arg_or_nan(call_args_ptr, call_args_len, 1),
+                arg_or_undefined(call_args_ptr, call_args_len, 0),
+                arg_or_undefined(call_args_ptr, call_args_len, 1),
             )
         }
         3 => {
             let f: extern "C" fn(f64, f64, f64, f64) -> f64 = std::mem::transmute(func_ptr);
             f(
                 this_f64,
-                arg_or_nan(call_args_ptr, call_args_len, 0),
-                arg_or_nan(call_args_ptr, call_args_len, 1),
-                arg_or_nan(call_args_ptr, call_args_len, 2),
+                arg_or_undefined(call_args_ptr, call_args_len, 0),
+                arg_or_undefined(call_args_ptr, call_args_len, 1),
+                arg_or_undefined(call_args_ptr, call_args_len, 2),
             )
         }
         4 => {
             let f: extern "C" fn(f64, f64, f64, f64, f64) -> f64 = std::mem::transmute(func_ptr);
             f(
                 this_f64,
-                arg_or_nan(call_args_ptr, call_args_len, 0),
-                arg_or_nan(call_args_ptr, call_args_len, 1),
-                arg_or_nan(call_args_ptr, call_args_len, 2),
-                arg_or_nan(call_args_ptr, call_args_len, 3),
+                arg_or_undefined(call_args_ptr, call_args_len, 0),
+                arg_or_undefined(call_args_ptr, call_args_len, 1),
+                arg_or_undefined(call_args_ptr, call_args_len, 2),
+                arg_or_undefined(call_args_ptr, call_args_len, 3),
             )
         }
         5 => {
@@ -3157,11 +4186,11 @@ pub(crate) unsafe fn call_vtable_method(
                 std::mem::transmute(func_ptr);
             f(
                 this_f64,
-                arg_or_nan(call_args_ptr, call_args_len, 0),
-                arg_or_nan(call_args_ptr, call_args_len, 1),
-                arg_or_nan(call_args_ptr, call_args_len, 2),
-                arg_or_nan(call_args_ptr, call_args_len, 3),
-                arg_or_nan(call_args_ptr, call_args_len, 4),
+                arg_or_undefined(call_args_ptr, call_args_len, 0),
+                arg_or_undefined(call_args_ptr, call_args_len, 1),
+                arg_or_undefined(call_args_ptr, call_args_len, 2),
+                arg_or_undefined(call_args_ptr, call_args_len, 3),
+                arg_or_undefined(call_args_ptr, call_args_len, 4),
             )
         }
         6 => {
@@ -3169,12 +4198,12 @@ pub(crate) unsafe fn call_vtable_method(
                 std::mem::transmute(func_ptr);
             f(
                 this_f64,
-                arg_or_nan(call_args_ptr, call_args_len, 0),
-                arg_or_nan(call_args_ptr, call_args_len, 1),
-                arg_or_nan(call_args_ptr, call_args_len, 2),
-                arg_or_nan(call_args_ptr, call_args_len, 3),
-                arg_or_nan(call_args_ptr, call_args_len, 4),
-                arg_or_nan(call_args_ptr, call_args_len, 5),
+                arg_or_undefined(call_args_ptr, call_args_len, 0),
+                arg_or_undefined(call_args_ptr, call_args_len, 1),
+                arg_or_undefined(call_args_ptr, call_args_len, 2),
+                arg_or_undefined(call_args_ptr, call_args_len, 3),
+                arg_or_undefined(call_args_ptr, call_args_len, 4),
+                arg_or_undefined(call_args_ptr, call_args_len, 5),
             )
         }
         7 => {
@@ -3182,13 +4211,13 @@ pub(crate) unsafe fn call_vtable_method(
                 std::mem::transmute(func_ptr);
             f(
                 this_f64,
-                arg_or_nan(call_args_ptr, call_args_len, 0),
-                arg_or_nan(call_args_ptr, call_args_len, 1),
-                arg_or_nan(call_args_ptr, call_args_len, 2),
-                arg_or_nan(call_args_ptr, call_args_len, 3),
-                arg_or_nan(call_args_ptr, call_args_len, 4),
-                arg_or_nan(call_args_ptr, call_args_len, 5),
-                arg_or_nan(call_args_ptr, call_args_len, 6),
+                arg_or_undefined(call_args_ptr, call_args_len, 0),
+                arg_or_undefined(call_args_ptr, call_args_len, 1),
+                arg_or_undefined(call_args_ptr, call_args_len, 2),
+                arg_or_undefined(call_args_ptr, call_args_len, 3),
+                arg_or_undefined(call_args_ptr, call_args_len, 4),
+                arg_or_undefined(call_args_ptr, call_args_len, 5),
+                arg_or_undefined(call_args_ptr, call_args_len, 6),
             )
         }
         8 => {
@@ -3196,14 +4225,14 @@ pub(crate) unsafe fn call_vtable_method(
                 std::mem::transmute(func_ptr);
             f(
                 this_f64,
-                arg_or_nan(call_args_ptr, call_args_len, 0),
-                arg_or_nan(call_args_ptr, call_args_len, 1),
-                arg_or_nan(call_args_ptr, call_args_len, 2),
-                arg_or_nan(call_args_ptr, call_args_len, 3),
-                arg_or_nan(call_args_ptr, call_args_len, 4),
-                arg_or_nan(call_args_ptr, call_args_len, 5),
-                arg_or_nan(call_args_ptr, call_args_len, 6),
-                arg_or_nan(call_args_ptr, call_args_len, 7),
+                arg_or_undefined(call_args_ptr, call_args_len, 0),
+                arg_or_undefined(call_args_ptr, call_args_len, 1),
+                arg_or_undefined(call_args_ptr, call_args_len, 2),
+                arg_or_undefined(call_args_ptr, call_args_len, 3),
+                arg_or_undefined(call_args_ptr, call_args_len, 4),
+                arg_or_undefined(call_args_ptr, call_args_len, 5),
+                arg_or_undefined(call_args_ptr, call_args_len, 6),
+                arg_or_undefined(call_args_ptr, call_args_len, 7),
             )
         }
         9 => {
@@ -3211,15 +4240,15 @@ pub(crate) unsafe fn call_vtable_method(
                 std::mem::transmute(func_ptr);
             f(
                 this_f64,
-                arg_or_nan(call_args_ptr, call_args_len, 0),
-                arg_or_nan(call_args_ptr, call_args_len, 1),
-                arg_or_nan(call_args_ptr, call_args_len, 2),
-                arg_or_nan(call_args_ptr, call_args_len, 3),
-                arg_or_nan(call_args_ptr, call_args_len, 4),
-                arg_or_nan(call_args_ptr, call_args_len, 5),
-                arg_or_nan(call_args_ptr, call_args_len, 6),
-                arg_or_nan(call_args_ptr, call_args_len, 7),
-                arg_or_nan(call_args_ptr, call_args_len, 8),
+                arg_or_undefined(call_args_ptr, call_args_len, 0),
+                arg_or_undefined(call_args_ptr, call_args_len, 1),
+                arg_or_undefined(call_args_ptr, call_args_len, 2),
+                arg_or_undefined(call_args_ptr, call_args_len, 3),
+                arg_or_undefined(call_args_ptr, call_args_len, 4),
+                arg_or_undefined(call_args_ptr, call_args_len, 5),
+                arg_or_undefined(call_args_ptr, call_args_len, 6),
+                arg_or_undefined(call_args_ptr, call_args_len, 7),
+                arg_or_undefined(call_args_ptr, call_args_len, 8),
             )
         }
         _ => {
@@ -3227,19 +4256,40 @@ pub(crate) unsafe fn call_vtable_method(
                 std::mem::transmute(func_ptr);
             f(
                 this_f64,
-                arg_or_nan(call_args_ptr, call_args_len, 0),
-                arg_or_nan(call_args_ptr, call_args_len, 1),
-                arg_or_nan(call_args_ptr, call_args_len, 2),
-                arg_or_nan(call_args_ptr, call_args_len, 3),
-                arg_or_nan(call_args_ptr, call_args_len, 4),
-                arg_or_nan(call_args_ptr, call_args_len, 5),
-                arg_or_nan(call_args_ptr, call_args_len, 6),
-                arg_or_nan(call_args_ptr, call_args_len, 7),
-                arg_or_nan(call_args_ptr, call_args_len, 8),
-                arg_or_nan(call_args_ptr, call_args_len, 9),
+                arg_or_undefined(call_args_ptr, call_args_len, 0),
+                arg_or_undefined(call_args_ptr, call_args_len, 1),
+                arg_or_undefined(call_args_ptr, call_args_len, 2),
+                arg_or_undefined(call_args_ptr, call_args_len, 3),
+                arg_or_undefined(call_args_ptr, call_args_len, 4),
+                arg_or_undefined(call_args_ptr, call_args_len, 5),
+                arg_or_undefined(call_args_ptr, call_args_len, 6),
+                arg_or_undefined(call_args_ptr, call_args_len, 7),
+                arg_or_undefined(call_args_ptr, call_args_len, 8),
+                arg_or_undefined(call_args_ptr, call_args_len, 9),
             )
         }
     }
+}
+
+/// Walk the class parent chain looking for a recorded fetch-builtin parent
+/// (Request = 1, Response = 2). Returns the kind for the first ancestor (incl.
+/// `class_id` itself) that directly extends a global Request/Response.
+pub(crate) fn fetch_parent_kind_in_chain(class_id: u32) -> Option<u8> {
+    let mut cid = class_id;
+    let mut depth = 0u32;
+    while depth < 32 {
+        if let Some(kind) = super::fetch_parent_kind(cid) {
+            return Some(kind);
+        }
+        match get_parent_class_id(cid) {
+            Some(p) if p != 0 && p != cid => {
+                cid = p;
+                depth += 1;
+            }
+            _ => break,
+        }
+    }
+    None
 }
 
 /// Register a class with its parent class ID in the global registry
@@ -3295,6 +4345,45 @@ pub extern "C" fn js_register_class_parent(class_id: u32, parent_class_id: u32) 
 /// recursive helper that returns its receiver can't create a cycle.
 #[no_mangle]
 pub extern "C" fn js_register_class_parent_dynamic(class_id: u32, parent_value: f64) {
+    // A globalThis builtin constructor closure is a valid superclass
+    // (`class CloseEvent extends Event` — the `ws` package's WebSocket
+    // events). Resolve it through the same name table the dynamic
+    // `instanceof` path uses and register the edge when the builtin has a
+    // runtime class id, so subclass instances satisfy `instanceof Event`
+    // and Event-shaped dispatch gates. Builtins without a class id keep the
+    // parentless baseline (no throw — they ARE constructors).
+    if let Some(name) = identify_global_builtin_constructor(parent_value) {
+        let parent_cid = super::instanceof::global_builtin_constructor_class_id(name);
+        if parent_cid != 0 && parent_cid != class_id {
+            register_class(class_id, parent_cid);
+        }
+        // A dynamic subclass that resolves its parent through this builtin
+        // branch must still record the fetch-parent kind so `new X()` attaches
+        // the native Request/Response handle — the bookkeeping below this
+        // early return would otherwise be skipped.
+        match name {
+            "Request" => super::register_fetch_parent_kind(class_id, 1),
+            "Response" => super::register_fetch_parent_kind(class_id, 2),
+            _ => {}
+        }
+        return;
+    }
+    // A bound native-module export (`const { Writable } = require('stream');
+    // class Receiver extends Writable` — the `ws` package's shape) is a real
+    // Node constructor even though Perry models it as a BOUND_METHOD closure.
+    // Keep the parentless baseline rather than mis-throwing; native-parent
+    // method inheritance is handled by codegen's extends_name machinery, not
+    // by this registry edge.
+    if is_bound_native_method_closure_value(parent_value) {
+        return;
+    }
+    // Spec: a non-`null` superclass that is not a constructor throws a TypeError
+    // at class-definition time (before any `.prototype` access). (Test262
+    // subclass/superclass-* and definition/invalid-extends.)
+    if extends_target_must_throw(parent_value) {
+        super::object_ops::throw_object_type_error(b"Class extends value is not a constructor");
+    }
+
     let bits = parent_value.to_bits();
     let tag = bits & 0xFFFF_0000_0000_0000;
     const INT32_TAG: u64 = 0x7FFE_0000_0000_0000;
@@ -3335,6 +4424,20 @@ pub extern "C" fn js_register_class_parent_dynamic(class_id: u32, parent_value: 
 
     if parent_cid != 0 && parent_cid != class_id {
         register_class(class_id, parent_cid);
+    }
+
+    // Record whether the parent value is the global Request/Response
+    // constructor (possibly via an alias like `GlobalRequest = global.Request`),
+    // resolved here in the scope where the alias is live. The runtime
+    // dynamic-construction path (`new (classExprValue)(...)`) consults this to
+    // attach the underlying native fetch handle on the instance — the static
+    // codegen `super()` path can't, because the textual parent name is the
+    // alias, not "Request". Refs `@hono/node-server`'s `class Request extends
+    // GlobalRequest`.
+    match identify_global_builtin_constructor(parent_value) {
+        Some("Request") => super::register_fetch_parent_kind(class_id, 1),
+        Some("Response") => super::register_fetch_parent_kind(class_id, 2),
+        _ => {}
     }
 
     // #1788: when the parent is a per-evaluation class OBJECT (a class
@@ -3381,15 +4484,14 @@ pub extern "C" fn js_object_mark_class(obj: i64) {
 /// so raw Map/Set/Buffer pointers (no GcHeader) are never misread. Used by
 /// `typeof`, `new`, and `instanceof` to recognize a class value.
 pub fn is_class_object_ptr(ptr: *const u8) -> bool {
-    // Reject anything in the native-module handle range (< 0x100000). Those
-    // are registry ids (net.Socket, zlib stream, crypto, fastify, ioredis,
-    // timers, …) bit-OR'd with POINTER_TAG, not real heap pointers — real
-    // objects always live well above 0x100000. The previous 0x1008 floor only
-    // caught the tiny net/fastify id space; a mid-range handle (e.g. zlib's
-    // zlib stream base, #1843) sailed past it and this function then
-    // segfaulted dereferencing `[handle - 8]` as a GcHeader. 0x100000 is the
-    // same handle/real-pointer threshold `js_native_call_method` already uses.
-    if ptr.is_null() || (ptr as usize) < 0x100000 {
+    // Reject anything in the native-module handle band (see
+    // `value::addr_class`). Those are registry ids (net.Socket, zlib stream,
+    // crypto, fastify, ioredis, timers, …) bit-OR'd with POINTER_TAG, not real
+    // heap pointers — real objects always live above the band. The previous
+    // 0x1008 floor only caught the tiny net/fastify id space; a mid-range
+    // handle (e.g. zlib's stream base, #1843) sailed past it and this function
+    // then segfaulted dereferencing `[handle - 8]` as a GcHeader.
+    if crate::value::addr_class::is_handle_band(ptr as usize) {
         return false;
     }
     unsafe {
@@ -3617,6 +4719,20 @@ pub unsafe extern "C" fn js_register_class_computed_accessor(
 
 /// Look up a static method by name in `CLASS_STATIC_METHODS`, walking the
 /// class_id parent chain (so a subclass inherits a parent's static method).
+/// Own-only static method lookup (no parent-chain walk) — for
+/// `getOwnPropertyDescriptor(C, name)`, where inherited statics must NOT be
+/// reported as own properties of `C`.
+pub(crate) fn class_has_own_static_method(class_id: u32, name: &str) -> bool {
+    CLASS_STATIC_METHODS
+        .read()
+        .ok()
+        .and_then(|g| {
+            g.as_ref()
+                .and_then(|m| m.get(&class_id).map(|inner| inner.contains_key(name)))
+        })
+        .unwrap_or(false)
+}
+
 pub(crate) fn lookup_static_method_in_chain(
     class_id: u32,
     name: &str,
@@ -3848,6 +4964,163 @@ pub(crate) unsafe fn class_static_accessor_setter_apply(
     false
 }
 
+/// Apply an instance `set name(v)` accessor from the class vtable chain,
+/// invoking it with the `(this, value)` calling convention class setters use.
+/// Returns `true` if a setter was found and called. Used when a write targets
+/// a class prototype ref (`C.prototype[key] = v`) whose `key` is an accessor
+/// defined on the prototype itself (Test262 accessor-name-inst setters).
+/// Whether the class (or an ancestor) has an instance `get name()` accessor.
+pub(crate) fn class_has_instance_getter(class_id: u32, name: &str) -> bool {
+    let Ok(guard) = CLASS_VTABLE_REGISTRY.read() else {
+        return false;
+    };
+    let Some(reg) = guard.as_ref() else {
+        return false;
+    };
+    let mut cid = class_id;
+    let mut depth = 0usize;
+    while cid != 0 && depth < 32 {
+        if let Some(vt) = reg.get(&cid) {
+            if vt.getters.contains_key(name) {
+                return true;
+            }
+        }
+        match get_parent_class_id(cid) {
+            Some(p) if p != 0 && p != cid => {
+                cid = p;
+                depth += 1;
+            }
+            _ => break,
+        }
+    }
+    false
+}
+
+pub(crate) unsafe fn class_instance_setter_apply(
+    class_id: u32,
+    name: &str,
+    receiver: f64,
+    value: f64,
+) -> bool {
+    let guard = match CLASS_VTABLE_REGISTRY.read() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let Some(reg) = guard.as_ref() else {
+        return false;
+    };
+    let mut cid = class_id;
+    let mut depth = 0usize;
+    while cid != 0 && depth < 32 {
+        if let Some(vtable) = reg.get(&cid) {
+            if let Some(&setter_ptr) = vtable.setters.get(name) {
+                if setter_ptr != 0 {
+                    let f: extern "C" fn(f64, f64) -> f64 = std::mem::transmute(setter_ptr);
+                    let _ = f(receiver, value);
+                }
+                return true;
+            }
+        }
+        match get_parent_class_id(cid) {
+            Some(p) if p != 0 && p != cid => {
+                cid = p;
+                depth += 1;
+            }
+            _ => break,
+        }
+    }
+    false
+}
+
+/// Spec `Function.prototype.length` for a class method named `name` — the
+/// count of formal parameters, excluding a trailing rest param and the
+/// synthesized `arguments` slot (neither contributes to `.length`). Walks the
+/// instance vtable chain, then the static-method table. Used to stamp the
+/// bound-method closure's length so `C.prototype.m.length` is correct
+/// (Test262 .../class/{gen,async}-method/...-trailing-comma + length tests).
+/// Note: does not subtract for default-valued params (the registry doesn't
+/// record the first-default position); methods with defaults already reported
+/// the wrong length, so this is a strict improvement, never a regression.
+pub(crate) fn class_method_bind_length(class_id: u32, name: &str) -> Option<u32> {
+    // Exact spec length (default-aware) when codegen recorded it; walk the
+    // parent chain so an inherited method's `.length` resolves too.
+    if let Ok(guard) = CLASS_METHOD_BIND_LENGTHS.read() {
+        if let Some(map) = guard.as_ref() {
+            let mut cid = class_id;
+            let mut depth = 0usize;
+            while cid != 0 && depth < 32 {
+                if let Some(&len) = map.get(&(cid, name.to_string())) {
+                    return Some(len);
+                }
+                match get_parent_class_id(cid) {
+                    Some(p) if p != 0 && p != cid => {
+                        cid = p;
+                        depth += 1;
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+    if let Ok(guard) = CLASS_VTABLE_REGISTRY.read() {
+        if let Some(reg) = guard.as_ref() {
+            let mut cid = class_id;
+            let mut depth = 0usize;
+            while cid != 0 && depth < 32 {
+                if let Some(vt) = reg.get(&cid) {
+                    if let Some(e) = vt.methods.get(name) {
+                        let mut len = e.param_count;
+                        if e.has_rest {
+                            len = len.saturating_sub(1);
+                        }
+                        if e.has_synthetic_arguments {
+                            len = len.saturating_sub(1);
+                        }
+                        return Some(len);
+                    }
+                }
+                match get_parent_class_id(cid) {
+                    Some(p) if p != 0 && p != cid => {
+                        cid = p;
+                        depth += 1;
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+    // Static methods: prefer the default-aware spec length recorded by codegen
+    // (params before the first default/rest), walking the parent chain; fall
+    // back to the raw `CLASS_STATIC_METHODS` param_count otherwise.
+    if let Ok(guard) = CLASS_STATIC_METHOD_BIND_LENGTHS.read() {
+        if let Some(map) = guard.as_ref() {
+            let mut cid = class_id;
+            let mut depth = 0usize;
+            while cid != 0 && depth < 32 {
+                if let Some(&len) = map.get(&(cid, name.to_string())) {
+                    return Some(len);
+                }
+                match get_parent_class_id(cid) {
+                    Some(p) if p != 0 && p != cid => {
+                        cid = p;
+                        depth += 1;
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+    // CLASS_STATIC_METHODS stores (func_ptr, param_count, has_rest).
+    if let Some((_, param_count, has_rest)) = lookup_static_method_in_chain(class_id, name) {
+        let mut len = param_count;
+        if has_rest {
+            len = len.saturating_sub(1);
+        }
+        return Some(len);
+    }
+    None
+}
+
 /// Call a static method func_ptr with `args` (no `this` prepend — static
 /// methods read `this` from the implicit-this slot, set by the caller).
 /// Mirrors the arity dispatch of `call_vtable_method` minus the receiver arg.
@@ -3857,12 +5130,14 @@ pub(crate) unsafe fn call_static_method(
     args_len: usize,
     param_count: u32,
 ) -> f64 {
+    // Missing trailing args pad with `undefined` (NOT NaN) so default
+    // parameters fire — see `call_vtable_method::arg_or_undefined`.
     #[inline(always)]
     unsafe fn a(args_ptr: *const f64, args_len: usize, idx: usize) -> f64 {
         if idx < args_len {
             *args_ptr.add(idx)
         } else {
-            f64::NAN
+            f64::from_bits(crate::value::TAG_UNDEFINED)
         }
     }
     match param_count {
@@ -3879,11 +5154,56 @@ pub(crate) unsafe fn call_static_method(
             a(args_ptr, args_len, 1),
             a(args_ptr, args_len, 2),
         ),
-        _ => (std::mem::transmute::<usize, extern "C" fn(f64, f64, f64, f64) -> f64>(func_ptr))(
+        4 => (std::mem::transmute::<usize, extern "C" fn(f64, f64, f64, f64) -> f64>(func_ptr))(
             a(args_ptr, args_len, 0),
             a(args_ptr, args_len, 1),
             a(args_ptr, args_len, 2),
             a(args_ptr, args_len, 3),
+        ),
+        5 => {
+            (std::mem::transmute::<usize, extern "C" fn(f64, f64, f64, f64, f64) -> f64>(func_ptr))(
+                a(args_ptr, args_len, 0),
+                a(args_ptr, args_len, 1),
+                a(args_ptr, args_len, 2),
+                a(args_ptr, args_len, 3),
+                a(args_ptr, args_len, 4),
+            )
+        }
+        6 => (std::mem::transmute::<usize, extern "C" fn(f64, f64, f64, f64, f64, f64) -> f64>(
+            func_ptr,
+        ))(
+            a(args_ptr, args_len, 0),
+            a(args_ptr, args_len, 1),
+            a(args_ptr, args_len, 2),
+            a(args_ptr, args_len, 3),
+            a(args_ptr, args_len, 4),
+            a(args_ptr, args_len, 5),
+        ),
+        7 => {
+            (std::mem::transmute::<usize, extern "C" fn(f64, f64, f64, f64, f64, f64, f64) -> f64>(
+                func_ptr,
+            ))(
+                a(args_ptr, args_len, 0),
+                a(args_ptr, args_len, 1),
+                a(args_ptr, args_len, 2),
+                a(args_ptr, args_len, 3),
+                a(args_ptr, args_len, 4),
+                a(args_ptr, args_len, 5),
+                a(args_ptr, args_len, 6),
+            )
+        }
+        _ => (std::mem::transmute::<
+            usize,
+            extern "C" fn(f64, f64, f64, f64, f64, f64, f64, f64) -> f64,
+        >(func_ptr))(
+            a(args_ptr, args_len, 0),
+            a(args_ptr, args_len, 1),
+            a(args_ptr, args_len, 2),
+            a(args_ptr, args_len, 3),
+            a(args_ptr, args_len, 4),
+            a(args_ptr, args_len, 5),
+            a(args_ptr, args_len, 6),
+            a(args_ptr, args_len, 7),
         ),
     }
 }
@@ -3934,7 +5254,9 @@ unsafe fn try_native_static_method_in_proto_chain(
                 let module = b"buffer.Buffer";
                 let ns = js_create_native_module_namespace(module.as_ptr(), module.len());
                 let ns_obj = JSValue::from_bits(ns.to_bits()).as_pointer::<ObjectHeader>();
-                let result = dispatch_native_module_method(ns_obj, name, args_ptr, args_len);
+                let result = crate::object::native_module::call_native_module_dispatch_hook(
+                    ns_obj, name, args_ptr, args_len,
+                );
                 if !JSValue::from_bits(result.to_bits()).is_undefined() {
                     return Some(result);
                 }
@@ -3945,7 +5267,9 @@ unsafe fn try_native_static_method_in_proto_chain(
             if read_native_module_name(proto_obj as *const ObjectHeader).as_deref()
                 == Some("buffer.Buffer")
             {
-                let result = dispatch_native_module_method(proto_obj, name, args_ptr, args_len);
+                let result = crate::object::native_module::call_native_module_dispatch_hook(
+                    proto_obj, name, args_ptr, args_len,
+                );
                 if !JSValue::from_bits(result.to_bits()).is_undefined() {
                     return Some(result);
                 }
@@ -3996,6 +5320,11 @@ pub unsafe extern "C" fn js_class_static_method_call(
     }
     if let Some((func_ptr, param_count, has_rest)) = lookup_static_method_in_chain(class_id, name) {
         let prev_this = crate::object::js_implicit_this_set(receiver);
+        // Receiver-sensitive static `this`: arm the one-shot override so the
+        // method prologue (`js_static_this_resolve`) sees the DYNAMIC receiver
+        // (e.g. subclass `D` for an inherited `D.f()`). If an outer
+        // call/apply already armed an explicit thisArg, that wins.
+        crate::object::static_this_arm_if_unarmed(receiver);
         let result = if has_rest {
             // `static foo(a, b, ...rest)` / `static pipe(...args)` (effect's
             // `pipe`/`dual`): pass the first `param_count-1` positional args
@@ -4025,6 +5354,7 @@ pub unsafe extern "C" fn js_class_static_method_call(
         } else {
             call_static_method(func_ptr, args_ptr, args_len, param_count)
         };
+        crate::object::static_this_disarm();
         crate::object::js_implicit_this_set(prev_this);
         return result;
     }
@@ -4096,6 +5426,48 @@ pub fn lookup_class_method_in_chain(class_id: u32, name: &str) -> Option<(usize,
                     entry.has_synthetic_arguments,
                     entry.has_rest,
                 ));
+            }
+        }
+        match get_parent_class_id(cur) {
+            Some(pid) if pid != 0 => cur = pid,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// True when `ptr` is the prototype OBJECT of some registered class. Class
+/// methods are installed as own fields on the prototype object, so a method-as-
+/// value read whose receiver *is* the prototype must return the shared canonical
+/// method value (for identity), not the raw stored field — i.e. the own-property
+/// shadow rule applies to genuine instances, not to the prototype itself.
+pub fn is_registered_class_prototype_object(ptr: usize) -> bool {
+    if crate::value::addr_class::is_handle_band(ptr) {
+        return false;
+    }
+    if let Ok(guard) = CLASS_PROTOTYPE_OBJECTS.read() {
+        if let Some(map) = guard.as_ref() {
+            return map.values().any(|&p| p == ptr);
+        }
+    }
+    false
+}
+
+/// Walk the prototype chain of `class_id` and return the id of the class that
+/// actually OWNS the method `name` (the prototype where it is defined). Used to
+/// make method-as-value identity stable: a class method is a single shared
+/// function object, so every read of it — `c.m`, `C.prototype.m`, `c2.m` —
+/// must resolve to the canonical value keyed by the OWNING class, not the
+/// (possibly derived) class of the receiver. Returns `None` when no class in
+/// the chain declares the method.
+pub fn method_owner_class_id(class_id: u32, name: &str) -> Option<u32> {
+    let registry = CLASS_VTABLE_REGISTRY.read().unwrap();
+    let reg = registry.as_ref()?;
+    let mut cur = class_id;
+    for _ in 0..32 {
+        if let Some(vt) = reg.get(&cur) {
+            if vt.methods.contains_key(name) {
+                return Some(cur);
             }
         }
         match get_parent_class_id(cur) {

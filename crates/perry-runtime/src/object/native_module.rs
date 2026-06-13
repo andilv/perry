@@ -36,6 +36,32 @@ thread_local! {
     static MODULE_CJS_GLOBAL_PATHS_VALUE: Cell<u64> = const { Cell::new(0) };
     static NATIVE_MODULE_NAMESPACES: RefCell<HashMap<String, u64>> =
         RefCell::new(HashMap::new());
+    /// User overrides of native-module namespace properties, keyed
+    /// `"{module}\0{prop}"`. CommonJS module exports are MUTABLE in Node —
+    /// monkey-patching like Next.js's
+    /// `require('node:timers').setImmediate = patched` must store and win
+    /// subsequent property reads instead of throwing read-only.
+    static NATIVE_NAMESPACE_PROP_OVERRIDES: RefCell<HashMap<String, u64>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Store a user override for a native-module namespace property
+/// (`require('node:timers').setImmediate = fn`). Wins subsequent reads via
+/// `vt_get_own_field`.
+pub(crate) fn native_namespace_prop_override_store(module: &str, prop: &str, value: f64) {
+    NATIVE_NAMESPACE_PROP_OVERRIDES.with(|m| {
+        m.borrow_mut()
+            .insert(format!("{module}\0{prop}"), value.to_bits());
+    });
+}
+
+/// Read back a stored native-namespace property override, if any.
+pub(crate) fn native_namespace_prop_override_get(module: &str, prop: &str) -> Option<f64> {
+    NATIVE_NAMESPACE_PROP_OVERRIDES.with(|m| {
+        m.borrow()
+            .get(&format!("{module}\0{prop}"))
+            .map(|bits| f64::from_bits(*bits))
+    })
 }
 
 fn bound_native_method_length(name: &str) -> Option<u32> {
@@ -54,6 +80,12 @@ pub extern "C" fn js_vm_create_context(sandbox: f64) -> f64 {
 
 pub fn scan_native_callable_export_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
     NATIVE_CALLABLE_EXPORTS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        for value_bits in cache.values_mut() {
+            visitor.visit_nanbox_u64_slot(value_bits);
+        }
+    });
+    NATIVE_NAMESPACE_PROP_OVERRIDES.with(|cache| {
         let mut cache = cache.borrow_mut();
         for value_bits in cache.values_mut() {
             visitor.visit_nanbox_u64_slot(value_bits);
@@ -897,7 +929,84 @@ pub extern "C" fn js_worker_threads_locks_query() -> f64 {
     worker_threads_locks_query(std::ptr::null())
 }
 
-/// Create a native module namespace object
+/// Linker-strippability vtable for every native-module behavior reachable
+/// from the always-linked generic object paths (method dispatch, own-field
+/// reads, Object.keys, has/in checks). All of these bottom out in large
+/// static (module, method) tables that reference every module's runtime
+/// implementation; a direct call from a generic path pins all of it in
+/// every binary, `-dead_strip` notwithstanding. Namespace-class objects
+/// (NATIVE_MODULE_CLASS_ID) are only created by
+/// `js_create_native_module_namespace` and a handful of in-crate
+/// allocators (node_v8 serializer, perf_hooks observer), all of which
+/// install this vtable first — so a program that never creates one lets
+/// the linker drop the tables wholesale. Relaxed ordering is sufficient:
+/// the store happens-before any namespace object can reach a call site on
+/// the creating thread, and cross-thread publication of the object
+/// pointer itself already synchronizes.
+pub(crate) struct NativeModuleVtable {
+    pub dispatch: unsafe fn(*const ObjectHeader, &str, *const f64, usize) -> f64,
+    pub get_own_field:
+        unsafe fn(*const ObjectHeader, *const crate::StringHeader) -> Option<JSValue>,
+    pub own_keys_array: unsafe fn(*const ObjectHeader) -> Option<*mut crate::array::ArrayHeader>,
+    pub has_enumerable_key: fn(&str, &str) -> bool,
+}
+
+static NATIVE_MODULE_VTABLE_IMPL: NativeModuleVtable = NativeModuleVtable {
+    dispatch: dispatch_native_module_method,
+    get_own_field: vt_get_own_field,
+    own_keys_array: vt_own_keys_array,
+    has_enumerable_key: native_module_has_enumerable_key,
+};
+
+static NATIVE_MODULE_VTABLE_PTR: AtomicPtr<NativeModuleVtable> =
+    AtomicPtr::new(std::ptr::null_mut());
+
+/// Make the native-module vtable reachable. Must be called by every code
+/// path that creates a NATIVE_MODULE_CLASS_ID object — this is the only
+/// static reference to the dispatch/table machinery in the crate.
+pub(crate) fn install_native_module_vtable() {
+    NATIVE_MODULE_VTABLE_PTR.store(
+        &NATIVE_MODULE_VTABLE_IMPL as *const NativeModuleVtable as *mut NativeModuleVtable,
+        Ordering::Relaxed,
+    );
+}
+
+/// `None` until the first namespace object exists; generic paths treat
+/// that as "no native module can be involved" and fall through to their
+/// default behavior.
+#[inline]
+pub(crate) fn native_module_vtable() -> Option<&'static NativeModuleVtable> {
+    let p = NATIVE_MODULE_VTABLE_PTR.load(Ordering::Relaxed);
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { &*(p as *const NativeModuleVtable) })
+    }
+}
+
+/// Route a NATIVE_MODULE_CLASS_ID method call through the vtable. A null
+/// vtable means no namespace object was ever created, so no such object
+/// can exist to dispatch on — unreachable in practice.
+#[inline]
+pub(crate) unsafe fn call_native_module_dispatch_hook(
+    obj: *const ObjectHeader,
+    method_name: &str,
+    args_ptr: *const f64,
+    args_len: usize,
+) -> f64 {
+    match native_module_vtable() {
+        Some(vt) => (vt.dispatch)(obj, method_name, args_ptr, args_len),
+        None => {
+            debug_assert!(
+                false,
+                "native-module method call before any namespace was created"
+            );
+            f64::from_bits(crate::value::TAG_UNDEFINED)
+        }
+    }
+}
+
+/// Create a native module namespace object/// Create a native module namespace object
 /// This is used for `import * as X from 'module'` patterns
 /// The returned object identifies itself as an object (typeof returns "object")
 /// and stores the module name for debugging purposes
@@ -910,6 +1019,9 @@ pub extern "C" fn js_create_native_module_namespace(
     module_name_ptr: *const u8,
     module_name_len: usize,
 ) -> f64 {
+    // Install the vtable the moment the first namespace exists — the only
+    // static reference to the dispatch/table machinery in the crate.
+    install_native_module_vtable();
     let module_name = unsafe {
         std::str::from_utf8(std::slice::from_raw_parts(module_name_ptr, module_name_len))
             .unwrap_or("")
@@ -1789,6 +1901,9 @@ const PROCESS_NAMESPACE_KEYS: &[&[u8]] = &[
     b"setSourceMapsEnabled",
     b"send",
     b"sourceMapsEnabled",
+    b"stderr",
+    b"stdin",
+    b"stdout",
     b"title",
     b"unref",
     b"uptime",
@@ -1870,6 +1985,9 @@ const PROCESS_DEFAULT_KEYS: &[&[u8]] = &[
     b"setSourceMapsEnabled",
     b"send",
     b"sourceMapsEnabled",
+    b"stderr",
+    b"stdin",
+    b"stdout",
     b"title",
     b"uptime",
     b"version",
@@ -2726,6 +2844,7 @@ pub(crate) fn native_module_enumerable_keys(module_name: &str) -> Option<&'stati
             b"createServer",
             b"Server",
             b"IncomingMessage",
+            b"OutgoingMessage",
             b"ServerResponse",
             b"ClientRequest",
             b"Agent",
@@ -2849,6 +2968,18 @@ pub(crate) fn native_module_enumerable_keys(module_name: &str) -> Option<&'stati
             VM_NAMESPACE_KEYS
         }),
         "vm.constants" => Some(VM_CONSTANTS_KEYS),
+        // Plain `timers` was missing — `require('node:timers').setImmediate`
+        // read undefined (Next.js's fast-set-immediate extension reads and
+        // patches it at module init).
+        "timers" => Some(&[
+            b"setTimeout",
+            b"clearTimeout",
+            b"setInterval",
+            b"clearInterval",
+            b"setImmediate",
+            b"clearImmediate",
+            b"promises",
+        ]),
         "timers/promises" => Some(&[b"setTimeout", b"setImmediate", b"setInterval", b"scheduler"]),
         "readline/promises" => Some(&[b"Interface", b"Readline", b"createInterface"]),
         "zlib" => Some(&[b"codes"]),
@@ -3087,6 +3218,10 @@ pub unsafe extern "C" fn js_native_module_property_by_name(
     property_name_ptr: *const u8,
     property_name_len: usize,
 ) -> f64 {
+    // Codegen NativeModuleRef fast path — can mint native-module-backed
+    // values without a namespace object; the vtable must be live for the
+    // generic paths that later touch them.
+    install_native_module_vtable();
     let module_name =
         std::str::from_utf8(std::slice::from_raw_parts(module_name_ptr, module_name_len))
             .unwrap_or("");
@@ -3209,6 +3344,11 @@ pub unsafe extern "C" fn js_native_module_property_by_name(
 }
 
 pub(crate) fn bound_native_callable_export_value(module_name: &str, property_name: &str) -> f64 {
+    // Bound-native closures carry (module, method) metadata that the
+    // generic property/call paths resolve through the vtable — and they
+    // can be minted via the codegen NativeModuleRef fast path without any
+    // namespace object existing. Install here too.
+    install_native_module_vtable();
     let module_name = cjs_default_base_module(module_name).unwrap_or(module_name);
     let module_name = assert_instance_base_module(module_name).unwrap_or(module_name);
     let property_name = canonical_native_callable_property(module_name, property_name);
@@ -3655,10 +3795,18 @@ fn native_callable_export_arity(module: &str, prop: &str) -> Option<u32> {
         // createServer(options,handler)=2.
         ("http2", "connect") => Some(3),
         ("http2", "createServer" | "createSecureServer") => Some(2),
+        ("http", "OutgoingMessage") => Some(1),
+        // #4904: Node `.length` — Agent(options)=1, ClientRequest(input,
+        // options, cb)=3, IncomingMessage(socket)=1, ServerResponse(req)=1.
+        ("http", "Agent" | "IncomingMessage" | "ServerResponse") => Some(1),
+        ("http", "ClientRequest") => Some(3),
         // #3697: node:https module-level exports (Node `.length`).
         ("https", "request") => Some(0),
         ("https", "get") => Some(3),
         ("https", "Agent") => Some(1),
+        // #4904: http twins of the https entries above.
+        ("http", "request") => Some(0),
+        ("http", "get") => Some(3),
         (
             "stream",
             "isDestroyed"
@@ -4441,6 +4589,23 @@ fn attach_module_cjs_constructor_statics(closure_addr: usize) {
             bound_native_callable_export_value("module", name),
         );
     }
+    // `Module.prototype` — Node's require-hook pattern (Next.js):
+    // `const mod = require('module'); const orig = mod.prototype.require;
+    // mod.prototype.require = function(request) {…}`. Expose a plain object
+    // carrying a `require` method so the read+patch round-trips; the patch
+    // is inert under AOT compilation (Perry resolves modules at compile
+    // time), but startup must not throw on the access.
+    let proto = js_object_alloc(0, 1);
+    native_set_field(
+        proto,
+        "require",
+        bound_native_callable_export_value("module", "_load"),
+    );
+    crate::closure::closure_set_dynamic_prop(
+        closure_addr,
+        "prototype",
+        crate::value::js_nanbox_pointer(proto as i64),
+    );
 }
 
 fn native_color_tuple(open: i32, close: i32) -> f64 {
@@ -4649,6 +4814,21 @@ pub(crate) fn set_bound_native_closure_name(
     let ptr = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
     let name_value = f64::from_bits(JSValue::string_ptr(ptr).bits());
     crate::closure::closure_set_dynamic_prop(closure as usize, "name", name_value);
+    // Spec: a function's `name` property is { writable:false, enumerable:false,
+    // configurable:true }. Storing it as a plain dynamic prop left it ENUMERABLE
+    // by default, so `for (k in Buffer)` yielded "name" — even though
+    // `getOwnPropertyDescriptor(Buffer,'name').enumerable` correctly reported
+    // false via the function-name special case. The inconsistency broke
+    // safe-buffer's `copyProps(Buffer, SafeBuffer)` (`for (k in Buffer)
+    // SafeBuffer[k] = Buffer[k]`): it copied "name" onto SafeBuffer, whose own
+    // `name` is read-only, throwing `Cannot assign to read only property 'name'`
+    // in strict mode (jsonwebtoken → Next.js). Pin the proper descriptor so
+    // enumeration matches reflection.
+    crate::object::set_property_attrs(
+        closure as usize,
+        "name".to_string(),
+        crate::object::PropertyAttrs::new(false, false, true),
+    );
 }
 
 thread_local! {
@@ -5605,6 +5785,22 @@ pub(crate) fn is_native_module_callable_export(module: &str, prop: &str) -> bool
             // already lowers through the codegen NATIVE_MODULE_TABLE.
             | ("http", "createServer")
             | ("http", "Server")
+            | ("http", "OutgoingMessage")
+            // #4904: Node exposes these as constructable classes on the
+            // `http` module (`new http.Agent(opts)`, `new ClientRequest(...)`,
+            // `new IncomingMessage(socket)`, `new ServerResponse(req)`), and
+            // tests/userland grab them as values first (`const { Agent } =
+            // require('http')`). Construction routes through
+            // `js_new_function_construct` → the http arm in
+            // class_registry.rs → JS_NATIVE_HTTP_DISPATCH.
+            | ("http", "Agent")
+            | ("http", "ClientRequest")
+            | ("http", "IncomingMessage")
+            | ("http", "ServerResponse")
+            // #4904: `const { get, request } = require('http')` — the https
+            // twins below were already exported; the http side was missed.
+            | ("http", "request")
+            | ("http", "get")
             | ("https", "createServer")
             | ("https", "Server")
             // #3697: `https.request` / `https.get` / `https.Agent` value reads
@@ -5789,7 +5985,7 @@ pub extern "C" fn js_class_method_bind(
                 let bits = instance.to_bits();
                 if (bits >> 48) == 0x7FFD {
                     let id = (bits & 0x0000_FFFF_FFFF_FFFF) as i64;
-                    if id > 0 && id < 0x100000 {
+                    if crate::value::addr_class::is_small_handle(id as usize) {
                         if let Some(dispatch) = handle_property_dispatch() {
                             let value = HANDLE_PROPERTY_BIND_REENTRY.with(|guard| {
                                 if guard.get() {
@@ -5814,6 +6010,84 @@ pub extern "C" fn js_class_method_bind(
         }
     }
 
+    // Method IDENTITY (test262 class/elements): a class method is a single
+    // shared function object, so `c.m`, `c2.m` and `C.prototype.m` must all be
+    // the IDENTICAL value. Route every user-class method-as-value read through
+    // the per-`(owner_class, name)` cached canonical built by
+    // `class_prototype_method_value_for_name` instead of minting a fresh
+    // per-receiver closure here. The canonical captures the OWNER class's
+    // prototype-ref (capture 0); `dispatch_bound_method` recognises that marker
+    // and supplies the call-site `this` (IMPLICIT_THIS) so invocations still see
+    // the right receiver — e.g. the `this.m = this.m.bind(this)` idiom rebinds
+    // correctly, and a bare `const f = c.m; f()` runs with the spec `this`.
+    //
+    // Guard against re-entry from `class_prototype_method_value_for_name`
+    // itself: it builds the canonical by calling `build_bound_method_closure`
+    // directly (NOT this function), so the cache is populated without looping.
+    if !method_name_ptr.is_null() && method_name_len > 0 {
+        if let Ok(name) = unsafe {
+            std::str::from_utf8(std::slice::from_raw_parts(method_name_ptr, method_name_len))
+        } {
+            if bound_native_method_length(name).is_none() {
+                if let Some(class_id) = class_id_from_method_receiver(instance) {
+                    if let Some(owner) =
+                        super::class_registry::method_owner_class_id(class_id, name)
+                    {
+                        // [[Get]] order: an OWN data property of this name
+                        // shadows the prototype method. The ubiquitous
+                        // `this.m = this.m.bind(this)` idiom installs an own `m`
+                        // (a bound function), so `obj.m` must read that own value
+                        // back — not the shared prototype method. Skipping this
+                        // both returned the wrong identity (`obj.m ===
+                        // C.prototype.m` where Node says false) and looped when
+                        // the canonical re-resolved `m` by name. A class
+                        // prototype-ref receiver has no own-property bag, so this
+                        // check is naturally a no-op there.
+                        let recv_jsv = JSValue::from_bits(instance.to_bits());
+                        if recv_jsv.is_pointer()
+                            && !super::class_registry::is_registered_class_prototype_object(
+                                crate::value::js_nanbox_get_pointer(instance) as usize,
+                            )
+                        {
+                            let obj = recv_jsv.as_pointer::<ObjectHeader>();
+                            if crate::value::addr_class::is_above_handle_band(obj as usize) {
+                                let key = crate::string::js_string_from_bytes(
+                                    method_name_ptr,
+                                    method_name_len as u32,
+                                );
+                                if let Some(own) =
+                                    unsafe { super::own_data_field_by_name(obj, key) }
+                                {
+                                    if own.bits() != crate::value::TAG_UNDEFINED {
+                                        return f64::from_bits(own.bits());
+                                    }
+                                }
+                            }
+                        }
+                        let canonical = class_prototype_method_value_for_name(owner, name);
+                        if canonical.to_bits() != crate::value::TAG_UNDEFINED {
+                            return canonical;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    build_bound_method_closure(instance, method_name_ptr, method_name_len)
+}
+
+/// Allocate a BOUND_METHOD closure binding `instance` as the receiver for the
+/// named method, stamping its `.name`/`.length`. This is the raw builder used
+/// by both `js_class_method_bind` (after its canonical-identity short-circuit)
+/// and `class_prototype_method_value_for_name` (which caches one canonical per
+/// `(class_id, name)`). Keeping it separate breaks the recursion that an
+/// unconditional canonical lookup inside `js_class_method_bind` would create.
+pub(crate) fn build_bound_method_closure(
+    instance: f64,
+    method_name_ptr: *const u8,
+    method_name_len: usize,
+) -> f64 {
     let closure = crate::closure::js_closure_alloc(crate::closure::BOUND_METHOD_FUNC_PTR, 3);
     crate::closure::js_closure_set_capture_f64(closure, 0, instance);
     crate::closure::js_closure_set_capture_ptr(closure, 1, method_name_ptr as i64);
@@ -5825,10 +6099,92 @@ pub extern "C" fn js_class_method_bind(
             set_bound_native_closure_name(closure, name);
             if let Some(length) = bound_native_method_length(name) {
                 set_builtin_closure_length(closure as usize, length);
+            } else if let Some(class_id) = class_id_from_method_receiver(instance) {
+                // User class method bound as a value (`C.prototype.m`, `c.m`):
+                // stamp its spec `.length` from the registered param count so
+                // `C.prototype.m.length` reflects the declared arity instead of
+                // the closure's capture count (Test262 method `.length` tests).
+                if let Some(length) =
+                    super::class_registry::class_method_bind_length(class_id, name)
+                {
+                    set_builtin_closure_length(closure as usize, length);
+                }
             }
         }
     }
     crate::value::js_nanbox_pointer(closure as i64)
+}
+
+/// Resolve the owning class id for a `js_class_method_bind` receiver: a class
+/// constructor/prototype ref (INT32-tagged) or a real class instance pointer.
+/// Resolve the effective receiver for a BOUND_METHOD dispatch. When the
+/// captured receiver is a canonical class-method marker (a class prototype-ref,
+/// produced by `class_prototype_method_value_for_name`), substitute the
+/// call-site `this` (IMPLICIT_THIS) provided it is itself a dispatchable class
+/// receiver (an instance or class ref). Otherwise the captured value is the real
+/// receiver and is returned unchanged. See `dispatch_bound_method`.
+/// Is `value` a bound STATIC-method value — a BOUND_METHOD closure whose
+/// captured receiver is a class constructor ref (`C.staticMethod` read as a
+/// value)? Used by the Function.prototype call/apply arms to arm the one-shot
+/// static-`this` override with the explicit thisArg, so the static method body
+/// sees the receiver (`C.m.call({})` → `this === {}`) and static private brand
+/// checks behave per spec.
+pub(crate) fn is_static_bound_method_value(value: f64) -> bool {
+    let jv = JSValue::from_bits(value.to_bits());
+    if !jv.is_pointer() {
+        return false;
+    }
+    let raw = (value.to_bits() & crate::value::POINTER_MASK) as usize;
+    if !crate::closure::is_closure_ptr(raw) {
+        return false;
+    }
+    let closure = raw as *const crate::closure::ClosureHeader;
+    if unsafe { (*closure).func_ptr } as usize != crate::closure::BOUND_METHOD_FUNC_PTR as usize {
+        return false;
+    }
+    let captured = crate::closure::js_closure_get_capture_f64(closure, 0);
+    class_ref_id(captured).is_some() && class_prototype_ref_id(captured).is_none()
+}
+
+pub(crate) fn canonical_bound_method_receiver(captured: f64) -> f64 {
+    if class_prototype_ref_id(captured).is_some() {
+        let call_this = super::js_implicit_this_get();
+        if class_id_from_method_receiver(call_this).is_some() {
+            return call_this;
+        }
+    }
+    captured
+}
+
+fn class_id_from_method_receiver(instance: f64) -> Option<u32> {
+    if let Some(cid) = class_ref_id(instance) {
+        return Some(cid);
+    }
+    let jsv = JSValue::from_bits(instance.to_bits());
+    if jsv.is_pointer() {
+        let obj = jsv.as_pointer::<ObjectHeader>();
+        if crate::value::addr_class::is_above_handle_band(obj as usize) {
+            // A callable (closure / function object) is never a class-method
+            // receiver for bound-method marker substitution. Its allocation is a
+            // `ClosureHeader`, so reading `class_id` off it as an `ObjectHeader`
+            // is a type confusion that can yield a stray non-zero id. Without
+            // this guard, a free call to a `C.prototype.method` bound-method
+            // value made from inside a function-object method body (e.g.
+            // test262's `assert.throws(…, function(){ m(...) })`, where
+            // `IMPLICIT_THIS` is the `assert` function) would mis-substitute the
+            // function object as the receiver and dispatch `assert.method(...)`
+            // instead of `C.prototype.method`, bypassing the generator wrapper's
+            // param prologue. See `canonical_bound_method_receiver`.
+            if crate::closure::is_closure_ptr(obj as usize) {
+                return None;
+            }
+            let cid = unsafe { (*obj).class_id };
+            if cid != 0 {
+                return Some(cid);
+            }
+        }
+    }
+    None
 }
 
 pub(crate) const CLASS_PROTOTYPE_REF_FLAG: u64 = 1u64 << 32;
@@ -5908,7 +6264,11 @@ pub fn class_prototype_method_value_for_name(class_id: u32, method_name: &str) -
     // descriptors. The cache below short-circuits repeat queries.
     let leaked: &'static [u8] = method_name.as_bytes().to_vec().leak();
     let class_ref = class_prototype_ref_value(class_id);
-    let value = js_class_method_bind(class_ref, leaked.as_ptr(), leaked.len());
+    // Build the closure DIRECTLY (not via `js_class_method_bind`, whose
+    // canonical short-circuit would call back into this function and recurse).
+    // The captured receiver is the prototype-ref, which doubles as the
+    // "canonical class method" marker that `dispatch_bound_method` keys on.
+    let value = build_bound_method_closure(class_ref, leaked.as_ptr(), leaked.len());
     class_prototype_method_value_cache_root_store(
         class_id,
         method_name.to_string(),
@@ -5936,7 +6296,7 @@ pub(crate) unsafe fn get_module_name_from_namespace(namespace_obj: f64) -> &'sta
         return "";
     }
     let obj = jsval.as_pointer::<ObjectHeader>();
-    if obj.is_null() || (obj as usize) < 0x100000 {
+    if crate::value::addr_class::is_handle_band(obj as usize) {
         return "";
     }
     let module_field = js_object_get_field(obj as *mut _, 0);
@@ -7348,6 +7708,10 @@ pub(crate) unsafe fn get_native_module_constant(
         // pointer) and hand it back for every read.
         "http" => match property {
             "METHODS" => Some(unsafe { http_methods_array() }),
+            "OutgoingMessage" => Some(bound_native_callable_export_value(
+                "http",
+                "OutgoingMessage",
+            )),
             // #3712: Node's `http.maxHeaderSize` default is 16 KiB (16384).
             "maxHeaderSize" => Some(16384.0),
             // #3712: `http.globalAgent` is an http.Agent with protocol "http:"
@@ -7359,6 +7723,15 @@ pub(crate) unsafe fn get_native_module_constant(
                 b"WebSocket".as_ptr(),
                 "WebSocket".len(),
             )),
+            // #4974: `require('_http_server').kConnectionsCheckingInterval`
+            // (the module aliases to "http" in cjs_wrap). Node exports a
+            // Symbol used as `server[k]` to reach the connections-checking
+            // interval timer; Perry represents it as a sentinel string key
+            // the ext-http server handle dispatch recognizes, mirroring the
+            // `@@__perry_wk_*` well-known-symbol encoding.
+            "kConnectionsCheckingInterval" => {
+                Some(native_string_value("@@kConnectionsCheckingInterval"))
+            }
             _ => None,
         },
         "https" => match property {
@@ -8121,4 +8494,95 @@ unsafe fn create_fs_constants_object() -> f64 {
         Ordering::Relaxed,
     );
     result
+}
+
+// ─── Vtable impls relocated from field_get_set.rs (EN size work) ───────
+// Bodies moved verbatim so their table references are reachable only
+// through the installed vtable. See `NativeModuleVtable`.
+
+/// Own-field read on a namespace object (`fs.constants`, method values,
+/// process IPC props, …). Returns `None` when the receiver carries no
+/// module name — the caller falls through to the generic field scan.
+unsafe fn vt_get_own_field(
+    obj: *const ObjectHeader,
+    key: *const crate::StringHeader,
+) -> Option<JSValue> {
+    let key_ptr = (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
+    let key_len = (*key).byte_len as usize;
+    let nb_ptr = crate::value::js_nanbox_pointer(obj as i64);
+    let module_name = get_module_name_from_namespace(nb_ptr);
+    if module_name.is_empty() {
+        return None;
+    }
+    let property_name =
+        std::str::from_utf8(std::slice::from_raw_parts(key_ptr, key_len)).unwrap_or("");
+    // A user override (`require('node:timers').setImmediate = patched`)
+    // wins all built-in resolution below — CJS exports are mutable in Node.
+    if let Some(value) = native_namespace_prop_override_get(&module_name, property_name) {
+        return Some(JSValue::from_bits(value.to_bits()));
+    }
+    if matches!(
+        module_name,
+        "process" | "process.namespace" | "process.default"
+    ) {
+        if let Some(value) = crate::process::process_ipc_property(property_name) {
+            return Some(JSValue::from_bits(value.to_bits()));
+        }
+    }
+    if let Some(value) = super::field_get_set::native_module_own_field_by_key(obj, key) {
+        return Some(value);
+    }
+    // #3687: node:cluster default-import EventEmitter methods on the
+    // distinct `cluster.default` namespace (see original comment at the
+    // pre-relocation site in field_get_set.rs history).
+    if module_name == "cluster.default" && super::is_cluster_emitter_method(property_name) {
+        return Some(JSValue::from_bits(
+            bound_native_callable_export_value(module_name, property_name).to_bits(),
+        ));
+    }
+    if let Some(val) = get_native_module_constant(module_name, property_name, nb_ptr) {
+        return Some(JSValue::from_bits(val.to_bits()));
+    }
+    if module_name == "crypto.webcrypto" {
+        if let Some(value) = super::global_this::webcrypto_method_value(property_name) {
+            return Some(JSValue::from_bits(value.to_bits()));
+        }
+    }
+    if module_name == "crypto.subtle" {
+        if let Some(value) = super::global_this::subtle_crypto_method_value(property_name) {
+            return Some(JSValue::from_bits(value.to_bits()));
+        }
+    }
+    // Issue #894: callable exports (`("events", "EventEmitter")` …) get a
+    // bound-method closure for require-then-member-access parity.
+    if is_native_module_callable_export(module_name, property_name) {
+        return Some(JSValue::from_bits(
+            bound_native_callable_export_value(module_name, property_name).to_bits(),
+        ));
+    }
+    Some(JSValue::undefined())
+}
+
+/// `Object.keys(namespace)` — fresh array of the module's enumerable
+/// keys. `None` when the module is unknown; caller falls back to the
+/// generic keys_array path.
+unsafe fn vt_own_keys_array(obj: *const ObjectHeader) -> Option<*mut crate::array::ArrayHeader> {
+    let module_name = read_native_module_name(obj)?;
+    let keys = native_module_enumerable_keys(&module_name)?;
+    let include_permission = matches!(
+        module_name.as_str(),
+        "process" | "process.namespace" | "process.default"
+    ) && crate::process::process_permission_enabled();
+    let out = crate::array::js_array_alloc(keys.len() as u32 + include_permission as u32);
+    for key_bytes in keys {
+        let key_str =
+            crate::string::js_string_from_bytes(key_bytes.as_ptr(), key_bytes.len() as u32);
+        crate::array::js_array_push(out, JSValue::string_ptr(key_str));
+    }
+    if include_permission {
+        let key_str =
+            crate::string::js_string_from_bytes(b"permission".as_ptr(), b"permission".len() as u32);
+        crate::array::js_array_push(out, JSValue::string_ptr(key_str));
+    }
+    Some(out)
 }

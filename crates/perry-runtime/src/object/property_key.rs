@@ -41,6 +41,16 @@ pub unsafe extern "C" fn js_object_set_property_key(
     if key_str.is_null() {
         return value;
     }
+    // Class constructor/prototype refs are INT32-tagged values, not real
+    // `ObjectHeader`s — `extract_obj_ptr` returns null for them, so a
+    // `C.prototype[key] = v` / `C[key] = v` write silently no-op'd here. The
+    // get side already passes the raw NaN-boxed bits into the by-name dispatch
+    // (which has a dedicated 0x7FFE class-ref branch); mirror that on the set
+    // side so static-accessor and prototype instance-setter dispatch run.
+    if super::class_ref_id(obj_value).is_some() {
+        js_object_set_field_by_name(obj_value.to_bits() as *mut ObjectHeader, key_str, value);
+        return value;
+    }
     let obj = extract_obj_ptr(obj_value);
     if !obj.is_null() {
         js_object_set_field_by_name(obj, key_str, value);
@@ -58,6 +68,16 @@ pub unsafe extern "C" fn js_object_get_property_key(obj_value: f64, key_value: f
     let key_str = crate::value::js_jsvalue_to_string(key);
     if key_str.is_null() {
         return f64::from_bits(crate::value::TAG_UNDEFINED);
+    }
+    // Class constructor/prototype refs are INT32-tagged, not real
+    // `ObjectHeader`s — pass their raw bits into the by-name dispatch (which has
+    // a dedicated class-ref branch handling static accessors, static methods,
+    // prototype methods, etc.) rather than null'ing them via extract_obj_ptr.
+    // Mirrors the set side (`js_object_set_property_key`).
+    if super::class_ref_id(obj_value).is_some() {
+        return f64::from_bits(
+            js_object_get_field_by_name(obj_value.to_bits() as *const ObjectHeader, key_str).bits(),
+        );
     }
     let obj = extract_obj_ptr(obj_value);
     if obj.is_null() {
@@ -114,6 +134,77 @@ pub unsafe extern "C" fn js_object_super_get(home: f64, key_value: f64, _receive
         return f64::from_bits(crate::value::TAG_UNDEFINED);
     };
     js_object_get_property_key(proto, key_value)
+}
+
+/// `super.prop` GET for class methods: walk the parent class chain from
+/// `parent_class_id` for an accessor (getter) named `key` and invoke it with
+/// `receiver` as `this` (lookup starts at the super prototype, but the getter
+/// runs with the current `this`). If no getter is found, read a data property
+/// off the parent prototype object (`B.prototype.x = 42` then `super.x`).
+/// Refs class/super/in-{constructor,getter,methods,setter}.
+#[no_mangle]
+pub unsafe extern "C" fn js_super_accessor_get(
+    parent_class_id: u32,
+    key: f64,
+    receiver: f64,
+) -> f64 {
+    let key_hdr = crate::builtins::js_string_coerce(key);
+    let key_name: Option<String> = if key_hdr.is_null() {
+        None
+    } else {
+        let p = (key_hdr as *const u8).add(std::mem::size_of::<crate::StringHeader>());
+        let n = (*key_hdr).byte_len as usize;
+        std::str::from_utf8(std::slice::from_raw_parts(p, n))
+            .ok()
+            .map(|s| s.to_string())
+    };
+    if let Some(key_name) = key_name {
+        if let Ok(registry) = crate::object::CLASS_VTABLE_REGISTRY.read() {
+            if let Some(reg) = registry.as_ref() {
+                let mut cid = parent_class_id;
+                let mut depth = 0usize;
+                while cid != 0 && depth < 32 {
+                    if let Some(vtable) = reg.get(&cid) {
+                        let getter_alias = format!("__get_{}", key_name);
+                        if let Some(&getter_ptr) = vtable
+                            .getters
+                            .get(&key_name)
+                            .or_else(|| vtable.getters.get(&getter_alias))
+                        {
+                            let f: extern "C" fn(f64) -> f64 = std::mem::transmute(getter_ptr);
+                            let prev = crate::object::js_implicit_this_set(receiver);
+                            let r = f(receiver);
+                            crate::object::js_implicit_this_set(prev);
+                            return r;
+                        }
+                    }
+                    match crate::object::get_parent_class_id(cid) {
+                        Some(parent) if parent != 0 && parent != cid => {
+                            cid = parent;
+                            depth += 1;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        }
+    }
+    // Prefer the *declared* prototype object (stable heap identity). A dynamic
+    // write `Parent.prototype.foo = v` lands on that object, whereas the older
+    // overloaded `CLASS_PROTOTYPE_OBJECTS` table may hold a distinct synthetic
+    // prototype that never sees such writes — so reading through it returned
+    // `undefined` for data properties added to a parent prototype after the
+    // class declaration (test262 super/prop-{dot,expr}-cls-val). Falls back to
+    // the older table for synthetic-prototype sources that lack a decl entry.
+    let mut proto = crate::object::class_decl_prototype_object(parent_class_id);
+    if proto.is_null() {
+        proto = crate::object::class_prototype_object(parent_class_id);
+    }
+    if !proto.is_null() {
+        let target = crate::value::js_nanbox_pointer(proto as i64);
+        return js_object_get_property_key(target, key);
+    }
+    f64::from_bits(crate::value::TAG_UNDEFINED)
 }
 
 /// `super[key] = value` for object-literal methods using the captured home

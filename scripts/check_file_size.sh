@@ -57,6 +57,20 @@ crates/perry-runtime/src/gc/tests.rs
 crates/perry-codegen-arkts/src/tests.rs
 crates/perry-api-manifest/src/entries.rs
 crates/perry/src/commands/compile.rs
+# node:dns + node:dgram. Crossed 2000 LOC when the loopback fakes became real
+# getaddrinfo/DNS/UDP I/O (#4911) — the in-process/deterministic paths are kept
+# behind PERRY_DETERMINISTIC_NET=1, so each module now carries both the real and
+# the deterministic implementation plus the Node-shaped error/validation surface.
+# Splitting the event-emitter helpers (dgram) and resolve-record JS builders
+# (dns) into siblings is a reasonable follow-up.
+crates/perry-runtime/src/dns.rs
+crates/perry-runtime/src/dgram.rs
+# `PERRY_UI_TABLE` — flat `MethodRow` data table for receiver-less perry/ui
+# calls (one row per constructor/setter). Generated-feel manifest like
+# entries.rs: length reflects widget-API breadth, not complexity, and a single
+# const array can't be split across files without scattering rows that belong
+# next to each other for review. Crossed 2000 LOC on current main.
+crates/perry-dispatch/src/ui_table.rs
 # Native-module dispatch table; one big match by (module, method, class).
 # Splitting per-namespace is tracked under the API-manifest refactor in #793.
 crates/perry-codegen/src/lower_call/native/mod.rs
@@ -79,6 +93,10 @@ crates/perry-runtime/src/object/field_get_set.rs
 # fast-path gate refinements + main's process / fs / perf_hooks Expr
 # additions. Splitting per-builtin family tracked alongside #1435.
 crates/perry-codegen/src/expr/calls.rs
+# Codegen `Expr` lowering trunk (one big match over every `Expr` variant);
+# crossed the limit on current main after recent builtin-Expr additions.
+# Splitting per expression family is tracked alongside #1435.
+crates/perry-codegen/src/expr/mod.rs
 # Dynamic method-call dispatch tower (js_native_call_method); crossed the
 # limit by the 7-line WeakMap/WeakSet dispatch hook in #1757/#1758. Splitting
 # per receiver-kind family tracked alongside #1435.
@@ -113,13 +131,6 @@ crates/perry-runtime/src/object/native_module.rs
 # globalThis constructor/namespace registry; current main crossed the threshold
 # after WebCrypto + DOM/Event global exposure landed. Split tracked under #1435.
 crates/perry-runtime/src/object/global_this.rs
-# console.log / util.inspect value formatter (two big per-tag dispatch
-# towers: format_jsvalue + format_jsvalue_for_json). main had already
-# grown it to 1999 LOC; the #2089 Date-as-reference-type inspect arms
-# (a DateCell pointer must render as its ISO string, not be deref'd as an
-# ObjectHeader) tipped it over. Splitting the two towers into sibling
-# modules is tracked under #1435.
-crates/perry-runtime/src/builtins/formatting.rs
 # Node core native-lowering table; current main crossed the threshold after
 # namespace alias exposure work. Split tracked under #1435.
 crates/perry-codegen/src/lower_call/native_table/node_core.rs
@@ -143,6 +154,11 @@ crates/perry-stdlib/src/sqlite.rs
 # `process_allowed_node_flags_literal`. Splitting the per-namespace literal
 # builders into a sibling module is tracked under #1435.
 crates/perry-hir/src/lower/expr_member.rs
+# Built-in call intrinsic-lowering tower. Crossed the 2000-line gate on current
+# main after the String.prototype generic-`this` + Array/Promise receiver-brand
+# parity arms (#4713/#4720/#4603). Splitting the per-builtin lowering helpers
+# into sibling modules is tracked under #1435.
+crates/perry-hir/src/lower/expr_call/intrinsics.rs
 # Expression lowering entry point — crossed the 2000-line gate when the
 # CJS-default-import allow-list grew to cover all node-core namespaces with
 # `default` namespace shims (#3903). Splitting the per-namespace dispatch
@@ -153,11 +169,11 @@ crates/perry-hir/src/lower/lower_expr.rs
 # destructuring-binding support added the pattern-walk arms. Splitting the
 # export-binding helpers into a sibling module is tracked under #1435.
 crates/perry-hir/src/lower/module_decl.rs
-# Module collection / resolution driver. Crossed the 2000-line gate after the
-# ESM package `.js` detection helpers (package.json `type`/`exports`/`module`
-# probing) landed. Extracting the package-metadata probe into a sibling module
-# is tracked under #1435.
-crates/perry/src/commands/compile/collect_modules.rs
+# Bare-callee intrinsics + CJS/UMD legacy-shape lowering (require/eval/Function
+# folds, IIFE rewrite, RegExp bare-call). Crossed the 2000-line gate (2010 LOC)
+# on current main, independent of this PR. Splitting the per-shape helpers into a
+# sibling module is tracked under #1435.
+crates/perry-hir/src/lower/expr_call/intrinsics.rs
 # node:process surface (env/argv/hrtime/cpuUsage/resourceUsage + EventEmitter
 # wiring + warning/deprecation emit). Crossed the limit at 2047 LOC after the
 # argument-validation batch landed on main without a split (#3493 setuid/setgid/
@@ -240,10 +256,36 @@ crates/perry-runtime/src/node_stream_constructors.rs
 # LOC) on main after recent dispatch-arm additions. Splitting per receiver-type
 # family is tracked under #1435.
 crates/perry-codegen/src/expr/property_get.rs
-# Regex engine wrapper (compile/exec/replace + named-group + lookahead handling).
-# Crossed the 2000-line gate (2026 LOC) after the replace-lookahead additions.
-# Splitting the matcher from the replace machinery is tracked under #1435.
-crates/perry-runtime/src/regex.rs
+# Codegen call-site method-dispatch tower (string/array/class/Map/Set/Promise +
+# static/instance method resolution). Sat at 1998 LOC on main; crossed the
+# 2000-line gate after the class static-accessor call route (test262
+# arguments-object cls-*-static-* getter calls). Splitting the per-receiver-type
+# dispatch helpers into sibling modules is tracked under #1435.
+crates/perry-codegen/src/lower_call/property_get.rs
+# TypedArray root — constructor/view-metadata/element load-store/iterator tower.
+# Crossed the 2000-line gate (2062 LOC) on current main after the #4702
+# %TypedArray%.prototype iterator brand-check + array-like/iterable constructor
+# additions. Splitting per concern is tracked under #1435.
+crates/perry-runtime/src/typedarray/mod.rs
+# Generator/async-generator state-machine lowering core (linearize → states →
+# next/return/throw step closures + async-step driver). Crossed the 2000-line
+# gate after the standalone async-generator parity work: synchronous param-
+# prologue lift (run param binding at call time) + per-yield operand Await.
+# Splitting the state builder from the closure assembly is tracked under #1435.
+crates/perry-transform/src/generator/lower.rs
+# HTTP/2 server-and-client session surface (settings/ping/goaway controls,
+# stream lifecycle, the loopback connect/session event-ordering machinery).
+# Crossed the 2000-line gate after the Node-ordering deferral that emits the
+# server `session` event after the client `connect`. Splitting the session
+# event pump from the handle/settings surface is tracked under #1435.
+crates/perry-ext-http-server/src/http2_server.rs
+# node:events bundled module (EventEmitter handle surface, once/on helpers,
+# AbortSignal wiring, AsyncResource). Crossed the 2000-line gate after the
+# `events.on(...)` real async-iterator rewrite (proper { next, return } over a
+# buffered/pending-promise queue, replacing the bare-array stub). Splitting the
+# on/once iterator machinery into the existing `events/` submodule is tracked
+# under #1435 with the other module-size cleanups.
+crates/perry-stdlib/src/events.rs
 EOF
 )
 

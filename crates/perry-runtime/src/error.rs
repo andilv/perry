@@ -261,28 +261,27 @@ fn intern_error_code(code: &str) -> &'static str {
     })
 }
 
-/// Generic "throw a JS Error subclass carrying a Node `.code`" FFI entry
-/// point for out-of-crate callers (e.g. `perry-ext-http-server`'s http2
-/// settings helpers) that have no direct access to `perry-runtime`'s Rust
-/// API. Building + registering + throwing in this single extern symbol
-/// guarantees the message→code registration and the later `.code` read
-/// resolve through the same runtime copy, avoiding the staticlib
-/// thread-local divergence that split registration/read paths hit.
+/// Generic "build a JS Error subclass carrying a Node `.code`" FFI entry
+/// point for out-of-crate callers that have no direct access to
+/// `perry-runtime`'s Rust API. Building + registering in this single extern
+/// symbol guarantees the message→code registration and the later `.code` read
+/// resolve through the same runtime copy, avoiding the staticlib thread-local
+/// divergence that split registration/read paths hit.
 ///
 /// `kind`: 0 = Error, 1 = TypeError, 2 = RangeError. The message and code
-/// are UTF-8 byte slices. Diverges via `js_throw`.
+/// are UTF-8 byte slices. Returns a NaN-boxed Error value.
 ///
 /// # Safety
 /// `msg_ptr` must point to `msg_len` valid bytes; `code_ptr` must point to
 /// `code_len` valid bytes or be null with `code_len == 0`.
 #[no_mangle]
-pub unsafe extern "C" fn js_throw_error_with_code(
+pub unsafe extern "C" fn js_error_value_with_code(
     msg_ptr: *const u8,
     msg_len: usize,
     code_ptr: *const u8,
     code_len: usize,
     kind: i32,
-) -> ! {
+) -> f64 {
     let msg = js_string_from_bytes(msg_ptr, msg_len as u32);
     if !code_ptr.is_null() && code_len > 0 {
         let code_bytes = std::slice::from_raw_parts(code_ptr, code_len);
@@ -296,13 +295,93 @@ pub unsafe extern "C" fn js_throw_error_with_code(
         2 => js_rangeerror_new(msg),
         _ => js_error_new_with_message(msg),
     };
-    crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64))
+    crate::value::js_nanbox_pointer(err as i64)
 }
 
-// `js_throw_error_with_code` is referenced only from the prebuilt
-// `perry-ext-http-server` archive (linked after the runtime's bitcode is
-// optimized), so the auto-optimize LTO pass would otherwise dead-strip it
-// (see project_auto_optimize_keepalive_3320). The `#[used]` anchor pins it.
+/// Generic "throw a JS Error subclass carrying a Node `.code`" FFI entry
+/// point for out-of-crate callers (e.g. `perry-ext-http-server`'s http2
+/// settings helpers) that have no direct access to `perry-runtime`'s Rust
+/// API. Diverges via `js_throw`.
+///
+/// # Safety
+/// Same pointer validity requirements as [`js_error_value_with_code`].
+#[no_mangle]
+pub unsafe extern "C" fn js_throw_error_with_code(
+    msg_ptr: *const u8,
+    msg_len: usize,
+    code_ptr: *const u8,
+    code_len: usize,
+    kind: i32,
+) -> ! {
+    crate::exception::js_throw(js_error_value_with_code(
+        msg_ptr, msg_len, code_ptr, code_len, kind,
+    ))
+}
+
+/// Build a Node-style system `Error`: `.message` + `.code` (the message→code
+/// side table the `.code` getter reads) plus `.syscall` (string) and `.errno`
+/// (number) own properties. `perry-ext-http` calls this to surface client
+/// transport failures (`ECONNREFUSED`, `ENOTFOUND`, `ECONNRESET`, …) as the
+/// real coded `Error` objects Node hands to `request.on('error')`, instead of
+/// the bare message string the legacy path passed.
+///
+/// The `.syscall`/`.errno` properties land in the `Error` expando side table
+/// (`ERROR_USER_PROPS`) via [`crate::object::js_object_set_field_by_name`],
+/// which recognizes `Error` cells by their NaN-box tag — `ErrorHeader` is not
+/// an `ObjectHeader`, so a raw field write would corrupt it.
+///
+/// # Safety
+/// `msg_ptr`/`code_ptr`/`syscall_ptr` must each point to their stated number of
+/// valid bytes, or be null with the matching length `0`.
+#[no_mangle]
+pub unsafe extern "C" fn js_node_system_error_value(
+    msg_ptr: *const u8,
+    msg_len: usize,
+    code_ptr: *const u8,
+    code_len: usize,
+    syscall_ptr: *const u8,
+    syscall_len: usize,
+    errno: f64,
+) -> f64 {
+    let err_val = js_error_value_with_code(msg_ptr, msg_len, code_ptr, code_len, 0);
+    let obj = err_val.to_bits() as *mut crate::object::ObjectHeader;
+    if !syscall_ptr.is_null() && syscall_len > 0 {
+        let key = js_string_from_bytes(b"syscall".as_ptr(), 7) as *const StringHeader;
+        let sval_str = js_string_from_bytes(syscall_ptr, syscall_len as u32);
+        let sval = crate::value::js_nanbox_string(sval_str as i64);
+        crate::object::js_object_set_field_by_name(obj, key, sval);
+    }
+    {
+        let key = js_string_from_bytes(b"errno".as_ptr(), 5) as *const StringHeader;
+        crate::object::js_object_set_field_by_name(obj, key, errno);
+    }
+    err_val
+}
+
+// These FFI entries are referenced only from extension archives (linked after
+// the runtime's bitcode is optimized), so the auto-optimize LTO pass would
+// otherwise dead-strip them (see project_auto_optimize_keepalive_3320). The
+// `#[used]` anchors pin them.
+#[used]
+static KEEP_JS_NODE_SYSTEM_ERROR_VALUE: unsafe extern "C" fn(
+    *const u8,
+    usize,
+    *const u8,
+    usize,
+    *const u8,
+    usize,
+    f64,
+) -> f64 = js_node_system_error_value;
+
+#[used]
+static KEEP_JS_ERROR_VALUE_WITH_CODE: unsafe extern "C" fn(
+    *const u8,
+    usize,
+    *const u8,
+    usize,
+    i32,
+) -> f64 = js_error_value_with_code;
+
 #[used]
 static KEEP_JS_THROW_ERROR_WITH_CODE: unsafe extern "C" fn(
     *const u8,
@@ -311,6 +390,41 @@ static KEEP_JS_THROW_ERROR_WITH_CODE: unsafe extern "C" fn(
     usize,
     i32,
 ) -> ! = js_throw_error_with_code;
+
+/// Throw `ERR_PERRY_UNIMPLEMENTED` for a registered-but-stub API. Used
+/// by the stub-elimination epic's strict mode (#4918/#4919): a runtime
+/// stub calls [`crate::stub_diag::perry_runtime_stub`] to warn, then —
+/// if `PERRY_STRICT_STUBS=1` — diverges here instead of returning a
+/// fake value. `api` is the JS-facing name; `issue` an optional tag.
+pub fn throw_unimplemented_stub(api: &str, issue: Option<&str>) -> ! {
+    let msg = match issue {
+        Some(tag) => format!(
+            "{} is not implemented in Perry (stub); set PERRY_STRICT_STUBS=0 to allow the fake result — tracking {}",
+            api, tag
+        ),
+        None => format!(
+            "{} is not implemented in Perry (stub); set PERRY_STRICT_STUBS=0 to allow the fake result",
+            api
+        ),
+    };
+    let code = b"ERR_PERRY_UNIMPLEMENTED";
+    // SAFETY: both slices are valid UTF-8 byte ranges living for the
+    // duration of the call; kind 0 = generic Error.
+    unsafe {
+        js_throw_error_with_code(msg.as_ptr(), msg.len(), code.as_ptr(), code.len(), 0);
+    }
+}
+
+/// Convenience for runtime stub sites: warn (first-call) and, under
+/// `PERRY_STRICT_STUBS`, throw `ERR_PERRY_UNIMPLEMENTED`. Returns
+/// normally in non-strict mode so the caller proceeds with its
+/// deterministic/fake fallback. (#4918/#4919)
+pub fn stub_warn_or_throw(api: &'static str, reason: &'static str, issue: Option<&'static str>) {
+    crate::stub_diag::perry_runtime_stub(api, reason, issue);
+    if crate::stub_diag::strict_stubs_enabled() {
+        throw_unimplemented_stub(api, issue);
+    }
+}
 
 /// Create a new SyntaxError with a message
 #[no_mangle]
@@ -630,6 +744,33 @@ pub extern "C" fn js_throw_strict_eval_arguments_syntax_error() -> f64 {
     crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64))
 }
 
+/// PerformEval early errors (super outside its context / undeclared private
+/// name in eval code) — a SyntaxError thrown when the eval call evaluates.
+#[no_mangle]
+pub extern "C" fn js_throw_eval_syntax_error(message: f64) -> f64 {
+    let message = value_to_lossy_string(message);
+    let msg = js_string_from_bytes(message.as_ptr(), message.len() as u32);
+    let err = js_syntaxerror_new(msg);
+    crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64))
+}
+
+// #1561-style force-keep: only generated IR calls this.
+#[used]
+static KEEP_JS_THROW_EVAL_SYNTAX_ERROR: extern "C" fn(f64) -> f64 = js_throw_eval_syntax_error;
+
+#[no_mangle]
+pub extern "C" fn js_throw_restricted_function_property_assignment() -> f64 {
+    crate::fs::validate::throw_type_error_with_code(
+        "Restricted function property assignment",
+        "ERR_INVALID_ARG_TYPE",
+    )
+}
+
+// #1561-style force-keep: only generated IR calls this.
+#[used]
+static KEEP_JS_THROW_RESTRICTED_FN_PROP_ASSIGN: extern "C" fn() -> f64 =
+    js_throw_restricted_function_property_assignment;
+
 #[no_mangle]
 pub extern "C" fn js_throw_math_constructor_type_error() -> f64 {
     throw_builtin_not_constructor("Math")
@@ -692,9 +833,143 @@ pub extern "C" fn js_throw_reference_error_unresolved_get() -> f64 {
     throw_reference_error_message(b"identifier is not defined")
 }
 
+/// Keepalive anchor for the auto-optimize whole-program build (generated-code
+///-only callee; see project_auto_optimize_keepalive_3320).
+#[used]
+static KEEP_JS_GLOBAL_GET_OR_THROW_UNRESOLVED: extern "C" fn(f64) -> f64 =
+    js_global_get_or_throw_unresolved;
+
+/// Read a compile-time-unresolved identifier off `globalThis` (a global the
+/// program created dynamically — `Function("this.y = 2")()` — exists only at
+/// runtime), throwing the spec ReferenceError when no such global property
+/// exists.
+#[no_mangle]
+pub extern "C" fn js_global_get_or_throw_unresolved(name_value: f64) -> f64 {
+    let g = crate::object::js_get_global_this();
+    let gj = crate::value::JSValue::from_bits(g.to_bits());
+    if gj.is_pointer() {
+        let gptr = (gj.bits() & crate::value::POINTER_MASK) as *const crate::object::ObjectHeader;
+        let key = crate::builtins::js_string_coerce(name_value);
+        if !gptr.is_null() && !key.is_null() {
+            let v = unsafe { crate::object::js_object_get_field_by_name(gptr, key) };
+            if !v.is_undefined() {
+                return f64::from_bits(v.bits());
+            }
+        }
+    }
+    let name = value_to_lossy_string(name_value);
+    let msg = format!("{} is not defined", name);
+    let msg_str = js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
+    let err_ptr = js_referenceerror_new(msg_str);
+    crate::exception::js_throw(crate::value::js_nanbox_pointer(err_ptr as i64))
+}
+
+/// Keepalive anchor for the auto-optimize whole-program build (generated-code
+///-only callee; see project_auto_optimize_keepalive_3320).
+#[used]
+static KEEP_JS_GLOBAL_GET_OPTIONAL: extern "C" fn(f64) -> f64 = js_global_get_optional;
+
+#[used]
+static KEEP_JS_GLOBAL_UPDATE: extern "C" fn(f64, f64, f64) -> f64 = js_global_update;
+
+/// `++x` / `x++` / `--x` / `x--` where `x` resolves to no lexical binding —
+/// i.e. a (sloppy) global property reference. Read globalThis[name] (throwing
+/// the spec ReferenceError when the property is absent — a genuinely
+/// unresolvable reference, e.g. `++neverDeclared`), ToNumeric, step by 1 of
+/// its own type, write the result back to globalThis, and return the
+/// post-step value for a prefix op or the pre-step ToNumeric value for a
+/// postfix op (#3575: `for (i = 0; i < n; i++)` with an undeclared `i`).
+/// The boolean flags arrive NaN-boxed (codegen passes HIR `Bool` literals).
+#[no_mangle]
+pub extern "C" fn js_global_update(name_value: f64, is_increment: f64, is_prefix: f64) -> f64 {
+    let is_increment = crate::value::js_is_truthy(is_increment);
+    let is_prefix = crate::value::js_is_truthy(is_prefix) != 0;
+    let g = crate::object::js_get_global_this();
+    let gj = crate::value::JSValue::from_bits(g.to_bits());
+    let key = crate::builtins::js_string_coerce(name_value);
+    let mut present = false;
+    let old = if gj.is_pointer() && !key.is_null() {
+        let gptr = (gj.bits() & crate::value::POINTER_MASK) as *const crate::object::ObjectHeader;
+        if !gptr.is_null() {
+            let v = unsafe { crate::object::js_object_get_field_by_name(gptr, key) };
+            if !v.is_undefined()
+                || unsafe {
+                    crate::object::js_object_has_own(g, name_value).to_bits()
+                        == crate::value::TAG_TRUE
+                }
+            {
+                present = true;
+            }
+            f64::from_bits(v.bits())
+        } else {
+            f64::from_bits(crate::value::TAG_UNDEFINED)
+        }
+    } else {
+        f64::from_bits(crate::value::TAG_UNDEFINED)
+    };
+    if !present {
+        let name = value_to_lossy_string(name_value);
+        let msg = format!("{} is not defined", name);
+        let msg_str = js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
+        let err_ptr = js_referenceerror_new(msg_str);
+        return crate::exception::js_throw(crate::value::js_nanbox_pointer(err_ptr as i64));
+    }
+    let numeric = unsafe { crate::value::js_to_numeric(old) };
+    let stepped = unsafe { crate::value::js_numeric_step(numeric, is_increment) };
+    let gptr = (gj.bits() & crate::value::POINTER_MASK) as *mut crate::object::ObjectHeader;
+    unsafe { crate::object::js_object_set_field_by_name(gptr, key, stepped) };
+    if is_prefix {
+        stepped
+    } else {
+        numeric
+    }
+}
+
+/// Non-throwing variant of [`js_global_get_or_throw_unresolved`] for
+/// `typeof <unresolved ident>`: the spec's GetValue-skips-on-typeof rule means
+/// a missing global yields `undefined` rather than a ReferenceError, but a
+/// global created at RUNTIME (sloppy `foo = 1` lowers to a globalThis
+/// property set — #3575) must still be observed.
+#[no_mangle]
+pub extern "C" fn js_global_get_optional(name_value: f64) -> f64 {
+    let g = crate::object::js_get_global_this();
+    let gj = crate::value::JSValue::from_bits(g.to_bits());
+    if gj.is_pointer() {
+        let gptr = (gj.bits() & crate::value::POINTER_MASK) as *const crate::object::ObjectHeader;
+        let key = crate::builtins::js_string_coerce(name_value);
+        if !gptr.is_null() && !key.is_null() {
+            let v = unsafe { crate::object::js_object_get_field_by_name(gptr, key) };
+            return f64::from_bits(v.bits());
+        }
+    }
+    f64::from_bits(crate::value::TAG_UNDEFINED)
+}
+
 #[no_mangle]
 pub extern "C" fn js_throw_reference_error_unresolved_assignment() -> f64 {
     throw_reference_error_message(b"assignment to undeclared variable")
+}
+
+/// `delete super.prop` / `delete super[expr]` is always a ReferenceError — a
+/// super reference can never be the target of `delete` (spec: the
+/// UnaryExpression `delete` evaluates the SuperProperty reference, and
+/// `Reference.[[Base]]` carries `thisValue` with `IsSuperReference` true, so
+/// the `delete` algorithm throws before attempting the delete). The args are
+/// evaluated for their side effects first by codegen.
+#[no_mangle]
+pub extern "C" fn js_throw_reference_error_super_delete() -> f64 {
+    throw_reference_error_message(b"Unsupported reference to 'super'")
+}
+
+/// A derived constructor whose body never calls `super()` leaves `this`
+/// uninitialized; the implicit `return this` (or any `this` access) throws a
+/// ReferenceError per ECMAScript. Refs class/subclass/builtin-objects/*/
+/// super-must-be-called.
+#[no_mangle]
+pub extern "C" fn js_throw_reference_error_this_before_super() -> f64 {
+    throw_reference_error_message(
+        b"Must call super constructor in derived class before accessing 'this' or returning from derived constructor",
+    )
 }
 
 fn throw_capture_stack_trace_target_type_error() -> ! {
@@ -917,6 +1192,23 @@ pub extern "C" fn js_throw_type_error_not_a_function(
     } else {
         format!("({}).{} is not a function", kind, prop)
     };
+    let msg_str = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
+    let err_ptr = js_typeerror_new(msg_str);
+    let err_value = crate::value::JSValue::pointer(err_ptr as *const u8).bits();
+    crate::exception::js_throw(f64::from_bits(err_value))
+}
+
+/// `new <primitive>(…)` where the callee is a primitive value (number, string,
+/// boolean, null, undefined, bigint) → `TypeError: <x> is not a constructor`.
+///
+/// Codegen calls this for `new`-callee shapes whose value is a NaN-boxed
+/// primitive the runtime construct path can't always tag-distinguish — most
+/// importantly plain `f64` numbers, whose bit pattern overlaps the raw pointer
+/// encoding (`new 1`, `new 1.5`). The thrown TypeError is catchable via Perry's
+/// exception machinery, matching `try { new 1 } catch (e) { … }`.
+#[no_mangle]
+pub extern "C" fn js_throw_not_a_constructor() -> f64 {
+    let msg = b"is not a constructor";
     let msg_str = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
     let err_ptr = js_typeerror_new(msg_str);
     let err_value = crate::value::JSValue::pointer(err_ptr as *const u8).bits();

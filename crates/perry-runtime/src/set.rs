@@ -109,20 +109,27 @@ fn register_set(ptr: *mut SetHeader) {
 }
 
 pub fn is_registered_set(addr: usize) -> bool {
-    // #4004: reject the `< 0x100000` small-handle band (Web Fetch / node:http /
-    // timer ids are NaN-boxed POINTER_TAG values, not heap addresses) before
+    // #4004: reject the small-handle band (Web Fetch / node:http / timer ids
+    // are NaN-boxed POINTER_TAG values, not heap addresses) before
     // dereferencing the GC header. Managed Sets are arena-allocated above the
-    // cutoff. See map::is_registered_map / date::is_date_cell_addr.
-    if addr < 0x100000 {
+    // cutoff. See `value::addr_class` for the band map.
+    if crate::value::addr_class::is_handle_band(addr) {
         return false;
     }
-    unsafe {
-        let header = (addr - crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-        if (*header).obj_type != crate::gc::GC_TYPE_SET {
-            return false;
-        }
+    // Registry FIRST: it is authoritative and dereference-free. Probing the
+    // GC header before consulting the registry dereferenced `addr - 8` for
+    // arbitrary candidate pointers (e.g. garbage read off a TypedArray
+    // header by a mis-typed caller) — segfaults on Linux where freed/foreign
+    // pages get unmapped (mimalloc on macOS retains them, hiding the bug).
+    if !SET_REGISTRY.with(|r| r.borrow().contains(&addr)) {
+        return false;
     }
-    SET_REGISTRY.with(|r| r.borrow().contains(&addr))
+    // A registered address is a live arena Set; the header read is safe and
+    // guards against a stale entry whose memory was reused by another type.
+    match unsafe { crate::value::addr_class::try_read_gc_header(addr) } {
+        Some(header) => header.obj_type == crate::gc::GC_TYPE_SET,
+        None => false,
+    }
 }
 
 /// Resolve a NaN-boxed (or raw-i64) `this` receiver to a registered `Set`

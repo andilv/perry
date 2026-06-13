@@ -50,6 +50,7 @@ impl SH for Expr {
             Expr::Logical { op, left, right } => { tag(h, 17); op.hash(h); left.as_ref().hash(h); right.as_ref().hash(h); }
             Expr::Call { callee, args, type_args, } => { tag(h, 18); callee.as_ref().hash(h); args.hash(h); type_args.hash(h); }
             Expr::CallSpread { callee, args, type_args, } => { tag(h, 19); callee.as_ref().hash(h); args.hash(h); type_args.hash(h); }
+            Expr::SuperCallSpread(args) => { tag(h, 12240); for a in args { match a { CallArg::Expr(e) | CallArg::Spread(e) => e.hash(h), } } }
             Expr::PodLayoutSizeOf { ty } => { tag(h, 12001); ty.hash(h); }
             Expr::PodLayoutAlignOf { ty } => { tag(h, 12002); ty.hash(h); }
             Expr::PodLayoutOffsetOf { ty, field_path } => { tag(h, 12003); ty.hash(h); field_path.hash(h); }
@@ -74,10 +75,12 @@ impl SH for Expr {
             Expr::InstanceOf { expr, ty, ty_expr } => { tag(h, 38); expr.as_ref().hash(h); ty.hash(h); ty_expr.hash(h); }
             Expr::In { property, object } => { tag(h, 39); property.as_ref().hash(h); object.as_ref().hash(h); }
             Expr::PrivateBrandCheck { class_name, field_name, object } => { tag(h, 12401); class_name.hash(h); field_name.hash(h); object.as_ref().hash(h); }
+            Expr::PrivateGuard { class_name, field_name, kind, op, object } => { tag(h, 12402); class_name.hash(h); field_name.hash(h); kind.hash(h); op.hash(h); object.as_ref().hash(h); }
             Expr::Await(e) => { tag(h, 40); e.as_ref().hash(h); }
             Expr::Yield { value, delegate } => { tag(h, 41); value.hash(h); delegate.hash(h); }
             Expr::New { class_name, args, type_args, } => { tag(h, 42); class_name.hash(h); args.hash(h); type_args.hash(h); }
             Expr::NewDynamic { callee, args } => { tag(h, 43); callee.as_ref().hash(h); args.hash(h); }
+            Expr::NewDynamicSpread { callee, args } => { tag(h, 12507); callee.as_ref().hash(h); args.hash(h); }
             Expr::NewTarget => { tag(h, 12301); }
             Expr::ClassRef(s) => { tag(h, 44); s.hash(h); }
             Expr::EnumMember { enum_name, member_name, } => { tag(h, 45); enum_name.hash(h); member_name.hash(h); }
@@ -97,6 +100,7 @@ impl SH for Expr {
             Expr::EnvGetDynamic(e) => { tag(h, 54); e.as_ref().hash(h); }
             Expr::ProcessEnv => tag(h, 55),
             Expr::GlobalThisExpr => tag(h, 474),
+            Expr::ModuleTopThis => tag(h, 4741),
             Expr::ProcessUptime => tag(h, 56),
             Expr::ProcessCwd => tag(h, 57),
             Expr::ProcessArgv => tag(h, 58),
@@ -355,7 +359,7 @@ impl SH for Expr {
             Expr::ChildProcessSpawnBackground { command, args, log_file, env_json, } => { tag(h, 240); command.as_ref().hash(h); args.hash(h); log_file.as_ref().hash(h); env_json.hash(h); }
             Expr::ChildProcessGetProcessStatus(e) => { tag(h, 241); e.as_ref().hash(h); }
             Expr::ChildProcessKillProcess(e) => { tag(h, 242); e.as_ref().hash(h); }
-            Expr::FetchWithOptions { url, method, body, headers, } => { tag(h, 243); url.as_ref().hash(h); method.as_ref().hash(h); body.as_ref().hash(h); headers.hash(h); }
+            Expr::FetchWithOptions { url, method, body, headers, headers_dynamic, } => { tag(h, 243); url.as_ref().hash(h); method.as_ref().hash(h); body.as_ref().hash(h); headers.hash(h); if let Some(hd) = headers_dynamic { tag(h, 1); hd.as_ref().hash(h); } else { tag(h, 0); } }
             Expr::FetchGetWithAuth { url, auth_header } => { tag(h, 244); url.as_ref().hash(h); auth_header.as_ref().hash(h); }
             Expr::FetchPostWithAuth { url, auth_header, body, } => { tag(h, 245); url.as_ref().hash(h); auth_header.as_ref().hash(h); body.as_ref().hash(h); }
             Expr::NetCreateServer { options, connection_listener, } => { tag(h, 246); options.hash(h); connection_listener.hash(h); }
@@ -391,11 +395,13 @@ impl SH for Expr {
             Expr::ArrayToSorted { array, comparator } => { tag(h, 275); array.as_ref().hash(h); comparator.hash(h); }
             Expr::ArrayToSpliced { array, start, delete_count, items, } => { tag(h, 276); array.as_ref().hash(h); start.as_ref().hash(h); delete_count.as_ref().hash(h); items.hash(h); }
             Expr::ArrayWith { array, index, value, } => { tag(h, 277); array.as_ref().hash(h); index.as_ref().hash(h); value.as_ref().hash(h); }
+            Expr::ArrayReverseValue { receiver } => { tag(h, 12092); receiver.as_ref().hash(h); }
             Expr::ArrayCopyWithin { array_id, target, start, end, } => { tag(h, 278); array_id.hash(h); target.as_ref().hash(h); start.as_ref().hash(h); end.hash(h); }
             Expr::ArrayCopyWithinValue { receiver, target, start, end, } => { tag(h, 12091); receiver.as_ref().hash(h); target.as_ref().hash(h); start.as_ref().hash(h); end.hash(h); }
             Expr::ArrayEntries(e) => { tag(h, 279); e.as_ref().hash(h); }
             Expr::ArrayKeys(e) => { tag(h, 280); e.as_ref().hash(h); }
             Expr::ArrayValues(e) => { tag(h, 281); e.as_ref().hash(h); }
+            Expr::ArrayLikeMethod { method, receiver, args } => { tag(h, 12500); method.hash(h); receiver.as_ref().hash(h); args.hash(h); }
             Expr::StringSplit(a, b) => { tag(h, 282); a.as_ref().hash(h); b.as_ref().hash(h); }
             Expr::StringFromCharCode(e) => { tag(h, 283); e.as_ref().hash(h); }
             Expr::StringFromCharCodeSpread(e) => { tag(h, 12045); e.as_ref().hash(h); }
@@ -472,6 +478,7 @@ impl SH for Expr {
             Expr::DateToString(e) => { tag(h, 1339); e.as_ref().hash(h); }
             Expr::DateToDateString(e) => { tag(h, 339); e.as_ref().hash(h); }
             Expr::DateToTimeString(e) => { tag(h, 340); e.as_ref().hash(h); }
+            Expr::DateToUTCString(e) => { tag(h, 12508); e.as_ref().hash(h); }
             Expr::DateToLocaleDateString(e) => { tag(h, 341); e.as_ref().hash(h); }
             Expr::DateToLocaleTimeString(e) => { tag(h, 342); e.as_ref().hash(h); }
             Expr::DateToLocaleString(e) => { tag(h, 343); e.as_ref().hash(h); }
@@ -540,6 +547,7 @@ impl SH for Expr {
             Expr::ObjectIs(a, b) => { tag(h, 389); a.as_ref().hash(h); b.as_ref().hash(h); }
             Expr::ObjectHasOwn(a, b) => { tag(h, 390); a.as_ref().hash(h); b.as_ref().hash(h); }
             Expr::ObjectKeys(e) => { tag(h, 391); e.as_ref().hash(h); }
+            Expr::ForInKeys(e) => { tag(h, 12506); e.as_ref().hash(h); }
             Expr::ObjectValues(e) => { tag(h, 392); e.as_ref().hash(h); }
             Expr::ObjectEntries(e) => { tag(h, 393); e.as_ref().hash(h); }
             Expr::ObjectGroupBy { items, key_fn } => { tag(h, 394); items.as_ref().hash(h); key_fn.as_ref().hash(h); }
@@ -551,7 +559,9 @@ impl SH for Expr {
             Expr::IteratorFrom(e) => { tag(h, 12270); e.as_ref().hash(h); }
             Expr::IteratorToArray(e) => { tag(h, 398); e.as_ref().hash(h); }
             Expr::GetIterator(e) => { tag(h, 11238); e.as_ref().hash(h); }
+            Expr::GetAsyncIterator(e) => { tag(h, 12502); e.as_ref().hash(h); }
             Expr::ForOfToArray(e) => { tag(h, 11243); e.as_ref().hash(h); }
+            Expr::ForAwaitToArray(e) => { tag(h, 12501); e.as_ref().hash(h); }
             Expr::ArrayFromMapped { iterable, map_fn, this_arg } => { tag(h, 399); iterable.as_ref().hash(h); map_fn.as_ref().hash(h); this_arg.is_some().hash(h); if let Some(t) = this_arg { t.as_ref().hash(h); } }
             Expr::ParseInt { string, radix } => { tag(h, 400); string.as_ref().hash(h); radix.hash(h); }
             Expr::ParseFloat(e) => { tag(h, 401); e.as_ref().hash(h); }
@@ -589,7 +599,7 @@ impl SH for Expr {
             Expr::ProxyRevocable { target, handler } => { tag(h, 431); target.as_ref().hash(h); handler.as_ref().hash(h); }
             Expr::ProxyRevoke(e) => { tag(h, 432); e.as_ref().hash(h); }
             Expr::ReflectGet { target, key, receiver } => { tag(h, 433); target.as_ref().hash(h); key.as_ref().hash(h); receiver.as_ref().hash(h); }
-            Expr::ReflectSet { target, key, value } => { tag(h, 434); target.as_ref().hash(h); key.as_ref().hash(h); value.as_ref().hash(h); }
+            Expr::ReflectSet { target, key, value, receiver } => { tag(h, 434); target.as_ref().hash(h); key.as_ref().hash(h); value.as_ref().hash(h); receiver.as_ref().hash(h); }
             Expr::PutValueSet { target, key, value, receiver, strict } => { tag(h, 12235); target.as_ref().hash(h); key.as_ref().hash(h); value.as_ref().hash(h); receiver.as_ref().hash(h); strict.hash(h); }
             Expr::WithGet { object, property, fallback } => { tag(h, 12236); object.as_ref().hash(h); property.hash(h); fallback.as_ref().hash(h); }
             Expr::WithSet { object, property, value, fallback, strict } => { tag(h, 12237); object.as_ref().hash(h); property.hash(h); value.as_ref().hash(h); hash_with_set_fallback(h, fallback); strict.hash(h); }
@@ -599,6 +609,7 @@ impl SH for Expr {
             Expr::ReflectApply { func, this_arg, args, } => { tag(h, 438); func.as_ref().hash(h); this_arg.as_ref().hash(h); args.as_ref().hash(h); }
             Expr::ReflectConstruct { target, args, new_target } => { tag(h, 439); target.as_ref().hash(h); args.as_ref().hash(h); new_target.as_ref().hash(h); }
             Expr::ReflectDefineProperty { target, key, descriptor, } => { tag(h, 440); target.as_ref().hash(h); key.as_ref().hash(h); descriptor.as_ref().hash(h); }
+            Expr::ReflectGetOwnPropertyDescriptor { target, key } => { tag(h, 12505); target.as_ref().hash(h); key.as_ref().hash(h); }
             Expr::ReflectGetPrototypeOf(e) => { tag(h, 441); e.as_ref().hash(h); }
             Expr::ReflectSetPrototypeOf { target, proto } => { tag(h, 12230); target.as_ref().hash(h); proto.as_ref().hash(h); }
             Expr::ReflectIsExtensible(e) => { tag(h, 12048); e.as_ref().hash(h); }
@@ -617,6 +628,8 @@ impl SH for Expr {
             Expr::TaggedTemplateStrings { site_id, cooked, raw } => { tag(h, 445); site_id.hash(h); cooked.hash(h); raw.hash(h); }
             Expr::TemplateRaw(e) => { tag(h, 446); e.as_ref().hash(h); }
             Expr::RegisterClassParentDynamic { class_name, parent_expr, } => { tag(h, 447); class_name.hash(h); parent_expr.as_ref().hash(h); }
+            Expr::RegisterClassCaptures { class_name, captures } => { tag(h, 12241); class_name.hash(h); for c in captures { c.hash(h); } }
+            Expr::ClassCaptureValue { class_name, index } => { tag(h, 12242); class_name.hash(h); index.hash(h); }
             Expr::RegisterClassStaticSymbol { class_name, key_expr, value_expr, } => { tag(h, 12025); class_name.hash(h); key_expr.as_ref().hash(h); value_expr.as_ref().hash(h); }
             Expr::RegisterClassComputedMethod { class_name, key_expr, method_name, is_static, param_count, has_rest } => { tag(h, 12233); class_name.hash(h); key_expr.as_ref().hash(h); method_name.hash(h); is_static.hash(h); param_count.hash(h); has_rest.hash(h); }
             Expr::RegisterClassComputedAccessor { class_name, key_expr, getter_name, setter_name, is_static } => { tag(h, 12234); class_name.hash(h); key_expr.as_ref().hash(h); getter_name.hash(h); setter_name.hash(h); is_static.hash(h); }

@@ -28,33 +28,35 @@ pub(super) fn lower_builtin_new(
     args: &[Expr],
 ) -> Result<Option<String>> {
     // Issue #602: ambiguously-named built-in constructors (Client / Pool /
-    // Database / Redis / MongoClient / Decimal) collide with default-import
-    // aliases from unrelated packages — `import Client from "better-sqlite3"`
-    // would otherwise dispatch through pg's Client arm and emit an undefined
-    // `js_pg_client_new` reference at link time. When `class_name` matches an
-    // ambiguous arm AND we know the import source is NOT the package the arm
-    // is for, return `None` so `lower_new` falls through to the generic path.
-    // Names without a recorded import source (top-level globals, locally-
-    // defined classes already filtered upstream, etc.) keep their pre-#602
-    // behavior — the arm still fires.
+    // Database / Redis / MongoClient / Decimal) collide with bindings from
+    // unrelated packages — `import Client from "better-sqlite3"` would
+    // otherwise dispatch through pg's Client arm and emit an undefined
+    // `js_pg_client_new` reference at link time. None of these names is a
+    // Node global, so the arm fires ONLY on positive evidence: a recorded
+    // import binding whose source is the arm's package (the CJS wrap's
+    // require-adoption records these too). Names without a matching import
+    // source fall through to the generic path — this covers function-scoped
+    // class expressions like undici's `var Client = class _Client …` inside
+    // bundled vendor code (Next.js `@edge-runtime/primitives`), which are
+    // invisible to `ctx.classes` and previously hit pg's arm, breaking the
+    // link of any program that bundles undici without importing pg.
     let import_src = ctx
         .imported_class_sources
         .get(class_name)
         .map(|s| s.as_str());
-    let arm_mismatches_source = match (class_name, import_src) {
-        ("Client", Some(src)) => src != "pg",
-        ("Pool", Some(src)) => src != "pg",
-        ("Database", Some(src)) => src != "better-sqlite3",
-        ("DatabaseSync", Some(src)) => src != "sqlite",
-        ("Session", Some(src)) => src != "sqlite",
-        ("StatementSync", Some(src)) => src != "sqlite",
-        ("Redis", Some(src)) => src != "ioredis" && src != "redis",
-        ("MongoClient", Some(src)) => src != "mongodb",
-        ("Decimal", Some(src)) => src != "decimal.js",
-        _ => false,
+    let required_sources: Option<&[&str]> = match class_name {
+        "Client" | "Pool" => Some(&["pg"]),
+        "Database" => Some(&["better-sqlite3"]),
+        "DatabaseSync" | "Session" | "StatementSync" => Some(&["sqlite", "node:sqlite"]),
+        "Redis" => Some(&["ioredis", "redis"]),
+        "MongoClient" => Some(&["mongodb"]),
+        "Decimal" => Some(&["decimal.js"]),
+        _ => None,
     };
-    if arm_mismatches_source {
-        return Ok(None);
+    if let Some(sources) = required_sources {
+        if !import_src.is_some_and(|src| sources.contains(&src)) {
+            return Ok(None);
+        }
     }
     match class_name {
         "Utf8Stream"
@@ -215,23 +217,26 @@ pub(super) fn lower_builtin_new(
             )))
         }
         "RegExp" => {
+            // Pass the NaN-boxed pattern/flags straight to the full constructor
+            // so a RegExp pattern (flag override / copy), an `undefined` pattern,
+            // or an object `flags` (ToString → SyntaxError) are all handled per
+            // spec. Defaults are `undefined` (NOT 0.0) so `new RegExp()` builds
+            // an empty source.
             let pattern_box = if !args.is_empty() {
                 lower_expr(ctx, &args[0])?
             } else {
-                double_literal(0.0)
+                double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED))
             };
             let flags_box = if args.len() > 1 {
                 lower_expr(ctx, &args[1])?
             } else {
-                double_literal(0.0)
+                double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED))
             };
             let blk = ctx.block();
-            let pattern_handle = unbox_to_i64(blk, &pattern_box);
-            let flags_handle = unbox_to_i64(blk, &flags_box);
             let handle = blk.call(
                 I64,
-                "js_regexp_new",
-                &[(I64, &pattern_handle), (I64, &flags_handle)],
+                "js_regexp_construct",
+                &[(DOUBLE, &pattern_box), (DOUBLE, &flags_box)],
             );
             Ok(Some(nanbox_pointer_inline(blk, &handle)))
         }
@@ -1271,20 +1276,11 @@ pub(super) fn lower_builtin_new(
                 }
             }
             if args.len() >= 2 {
-                if let Some(qprops) = extract_options_fields(ctx, &args[1]) {
-                    for (k, vexpr) in &qprops {
-                        if k == "highWaterMark" {
-                            hwm = lower_expr(ctx, vexpr)?;
-                        }
-                    }
-                } else {
-                    let strategy = lower_expr(ctx, &args[1])?;
-                    hwm = ctx.block().call(
-                        DOUBLE,
-                        "js_streams_strategy_high_water_mark",
-                        &[(DOUBLE, &strategy)],
-                    );
-                }
+                // #4915: pass the whole strategy value through — the runtime
+                // accepts a plain highWaterMark number or a strategy object
+                // (e.g. ByteLengthQueuingStrategy) and reads highWaterMark +
+                // size() from it.
+                hwm = lower_expr(ctx, &args[1])?;
             }
             if let Some(sink) = sink_object {
                 let h = ctx.block().call(
@@ -1337,20 +1333,26 @@ pub(super) fn lower_builtin_new(
                     transformer_object = Some(lower_expr(ctx, &args[0])?);
                 }
             }
+            // #4915: writableStrategy (arg 1) / readableStrategy (arg 2) —
+            // each may be a plain highWaterMark number or a strategy object;
+            // the runtime parses either form.
+            let mut writable_strategy = hwm;
+            let mut readable_strategy = double_literal(1.0);
             if args.len() >= 2 {
-                if let Some(qprops) = extract_options_fields(ctx, &args[1]) {
-                    for (k, vexpr) in &qprops {
-                        if k == "highWaterMark" {
-                            hwm = lower_expr(ctx, vexpr)?;
-                        }
-                    }
-                }
+                writable_strategy = lower_expr(ctx, &args[1])?;
+            }
+            if args.len() >= 3 {
+                readable_strategy = lower_expr(ctx, &args[2])?;
             }
             if let Some(transformer) = transformer_object {
                 let h = ctx.block().call(
                     DOUBLE,
                     "js_transform_stream_new_from_transformer_object",
-                    &[(DOUBLE, &transformer), (DOUBLE, &hwm)],
+                    &[
+                        (DOUBLE, &transformer),
+                        (DOUBLE, &writable_strategy),
+                        (DOUBLE, &readable_strategy),
+                    ],
                 );
                 return Ok(Some(h));
             }
@@ -1361,7 +1363,8 @@ pub(super) fn lower_builtin_new(
                     (DOUBLE, &start),
                     (DOUBLE, &transform),
                     (DOUBLE, &flush),
-                    (DOUBLE, &hwm),
+                    (DOUBLE, &writable_strategy),
+                    (DOUBLE, &readable_strategy),
                 ],
             );
             Ok(Some(h))
@@ -1414,6 +1417,27 @@ pub(super) fn lower_builtin_new(
                 "js_stream_web_decompression_stream_new"
             };
             let h = ctx.block().call(DOUBLE, runtime, &[(DOUBLE, &format)]);
+            Ok(Some(h))
+        }
+
+        // #4915: `new ReadableStreamBYOBReader(stream)` — equivalent to
+        // `stream.getReader({ mode: "byob" })`. The runtime validates that
+        // the argument is a byte stream (TypeError otherwise) and returns a
+        // reader handle whose `read(view)` fills the caller's buffer.
+        "ReadableStreamBYOBReader" => {
+            let stream = if !args.is_empty() {
+                lower_expr(ctx, &args[0])?
+            } else {
+                double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED))
+            };
+            for a in args.iter().skip(1) {
+                let _ = lower_expr(ctx, a)?;
+            }
+            let h = ctx.block().call(
+                DOUBLE,
+                "js_readable_stream_get_byob_reader",
+                &[(DOUBLE, &stream)],
+            );
             Ok(Some(h))
         }
 

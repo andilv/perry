@@ -43,7 +43,7 @@ fn anonymous_class_without_own_static_name(class: &ast::ClassExpr) -> bool {
     })
 }
 
-fn rhs_accepts_assignment_name(expr: &ast::Expr) -> bool {
+pub(crate) fn rhs_accepts_assignment_name(expr: &ast::Expr) -> bool {
     match expr {
         ast::Expr::Arrow(_) => true,
         ast::Expr::Fn(fn_expr) => fn_expr.ident.is_none(),
@@ -75,6 +75,18 @@ fn throw_type_error_const_assignment(name: &str) -> Expr {
             return_type: Type::Any,
         }),
         args: vec![Expr::String(name.to_string())],
+        type_args: vec![],
+    }
+}
+
+fn throw_restricted_function_property_assignment() -> Expr {
+    Expr::Call {
+        callee: Box::new(Expr::ExternFuncRef {
+            name: "js_throw_restricted_function_property_assignment".to_string(),
+            param_types: vec![],
+            return_type: Type::Any,
+        }),
+        args: vec![],
         type_args: vec![],
     }
 }
@@ -125,6 +137,26 @@ fn expr_ident_name(expr: &ast::Expr) -> Option<&str> {
         ast::Expr::TsSatisfies(ts_sat) => expr_ident_name(ts_sat.expr.as_ref()),
         _ => None,
     }
+}
+
+fn logical_assignment_op(op: ast::AssignOp) -> Option<LogicalOp> {
+    match op {
+        ast::AssignOp::AndAssign => Some(LogicalOp::And),
+        ast::AssignOp::OrAssign => Some(LogicalOp::Or),
+        ast::AssignOp::NullishAssign => Some(LogicalOp::Coalesce),
+        _ => None,
+    }
+}
+
+fn lower_logical_assignment(
+    ctx: &mut LoweringContext,
+    assign: &ast::AssignExpr,
+    rhs: Expr,
+    op: LogicalOp,
+) -> Result<Expr> {
+    let left = Box::new(lower_assign_target_to_expr(ctx, &assign.left)?);
+    let right = Box::new(lower_assignment_target(ctx, &assign.left, Box::new(rhs))?);
+    Ok(Expr::Logical { op, left, right })
 }
 
 pub(super) fn lower_assign(ctx: &mut LoweringContext, assign: &ast::AssignExpr) -> Result<Expr> {
@@ -209,54 +241,59 @@ pub(super) fn lower_assign(ctx: &mut LoweringContext, assign: &ast::AssignExpr) 
         .zip(expr_ident_name(assign.right.as_ref()))
         .and_then(|(left, right)| (left == right).then_some(left))
     {
-        if ctx.lookup_local(name).is_none() || ctx.pre_registered_module_var_decls.contains(name) {
+        // `x = x` with no binding anywhere → ReferenceError (the RHS read of
+        // an unresolvable reference throws before the sloppy-global create).
+        // A pre-registered module `var` declared *later* in the source is
+        // still a declared binding (var hoisting) — self-assignment before
+        // the declaration statement is fine and yields undefined.
+        if ctx.lookup_local(name).is_none() {
             return Ok(throw_reference_error_unresolvable_assignment(name));
         }
     }
 
+    // NamedEvaluation also applies to logical assignment (`x ||= function(){}`,
+    // `x &&= () => {}`, `x ??= class {}`): when the LHS is a plain identifier and
+    // the RHS is an anonymous function/class, the function's `.name` becomes the
+    // identifier (ES2024 §13.15.2). Plain compound assignments (`+=`, `*=`, …)
+    // are NOT NamedEvaluation contexts, so they stay name-less.
+    let inferred_name_op = matches!(
+        assign.op,
+        ast::AssignOp::Assign
+            | ast::AssignOp::AndAssign
+            | ast::AssignOp::OrAssign
+            | ast::AssignOp::NullishAssign
+    );
     let rhs = lower_rhs_with_assignment_name(
         ctx,
         &assign.right,
-        (assign.op == ast::AssignOp::Assign)
+        inferred_name_op
             .then(|| assignment_target_inferred_name(&assign.left))
             .flatten(),
     )?;
 
-    // #4586: logical assignments (`&&=`, `||=`, `??=`) to a PROPERTY target
-    // must not store unconditionally. Desugaring to `a.b = (a.b OP rhs)` (the
-    // generic compound-assign shape below) always runs PutValue, which fires
-    // setters spuriously and throws `TypeError: Cannot assign to read only
-    // property` on non-writable `Object.defineProperty` data props — e.g.
-    // Zod v4's `inst._zod ??= {}` where `_zod` is already non-nullish and
+    // #4586 / #4594: logical assignments (`&&=`, `||=`, `??=`) must not store
+    // unconditionally. Desugaring to `a = (a OP rhs)` (the generic
+    // compound-assign shape below) always runs PutValue, which for a property
+    // target fires setters spuriously and throws `TypeError: Cannot assign to
+    // read only property` on non-writable `Object.defineProperty` data props —
+    // e.g. Zod v4's `inst._zod ??= {}` where `_zod` is already non-nullish and
     // read-only, breaking every check/refinement-based schema under
     // `perry.compilePackages`.
     //
     // Per ECMAScript LogicalAssignment, the store (PutValue) must be skipped
-    // entirely when the short-circuit holds. We desugar to
-    // `read(a.b) OP (a.b = rhs)` so the assignment lives on the RHS of the
-    // logical operator and is therefore only evaluated on the branch that
-    // actually needs to write. `rhs` is consumed exactly once.
+    // entirely when the short-circuit holds. `lower_logical_assignment`
+    // desugars to `read(target) OP (target = rhs)` so the assignment lives on
+    // the RHS of the logical operator and is therefore only evaluated on the
+    // branch that actually needs to write. `rhs` is consumed exactly once.
     //
-    // Scoped to `Member` targets: plain `Ident` locals/globals have no
-    // setters and no read-only data descriptors, so an unconditional
-    // `LocalSet` there is observationally identical to the spec — leaving
-    // that path untouched keeps the blast radius minimal.
-    if let ast::AssignTarget::Simple(ast::SimpleAssignTarget::Member(member)) = &assign.left {
-        if let Some(logical_op) = match assign.op {
-            ast::AssignOp::AndAssign => Some(LogicalOp::And),
-            ast::AssignOp::OrAssign => Some(LogicalOp::Or),
-            ast::AssignOp::NullishAssign => Some(LogicalOp::Coalesce),
-            _ => None,
-        } {
-            let read_left = lower_assign_target_to_expr(ctx, &assign.left)?;
-            let target_expr = ast::Expr::Member(member.clone());
-            let store = lower_expr_assignment(ctx, &target_expr, Box::new(rhs))?;
-            return Ok(Expr::Logical {
-                op: logical_op,
-                left: Box::new(read_left),
-                right: Box::new(store),
-            });
-        }
+    // This covers both `Ident` and `Member` targets via the shared
+    // `lower_assignment_target` helper: while plain `Ident` locals have no
+    // setters, routing them through the short-circuit keeps the const-reassign
+    // path spec-correct (the RHS is still evaluated before the
+    // `TypeError: Assignment to constant variable` is thrown) and avoids a
+    // dead, Member-only special case.
+    if let Some(op) = logical_assignment_op(assign.op) {
+        return lower_logical_assignment(ctx, assign, rhs, op);
     }
 
     // Handle compound assignment operators (+=, -=, *=, /=, etc.)
@@ -360,38 +397,22 @@ pub(super) fn lower_assign(ctx: &mut LoweringContext, assign: &ast::AssignExpr) 
                 right: Box::new(rhs),
             })
         }
-        ast::AssignOp::AndAssign => {
-            // a &&= b becomes a = a && b (short-circuit: only evaluates b if a is truthy)
-            let left = Box::new(lower_assign_target_to_expr(ctx, &assign.left)?);
-            Box::new(Expr::Logical {
-                op: LogicalOp::And,
-                left,
-                right: Box::new(rhs),
-            })
-        }
-        ast::AssignOp::OrAssign => {
-            // a ||= b becomes a = a || b (short-circuit: only evaluates b if a is falsy)
-            let left = Box::new(lower_assign_target_to_expr(ctx, &assign.left)?);
-            Box::new(Expr::Logical {
-                op: LogicalOp::Or,
-                left,
-                right: Box::new(rhs),
-            })
-        }
-        ast::AssignOp::NullishAssign => {
-            // a ??= b becomes a = a ?? b (short-circuit: only evaluates b if a is null/undefined)
-            let left = Box::new(lower_assign_target_to_expr(ctx, &assign.left)?);
-            Box::new(Expr::Logical {
-                op: LogicalOp::Coalesce,
-                left,
-                right: Box::new(rhs),
-            })
+        ast::AssignOp::AndAssign | ast::AssignOp::OrAssign | ast::AssignOp::NullishAssign => {
+            unreachable!("logical assignment is lowered before compound assignment")
         } // #853: the match above exhausts every `ast::AssignOp` variant
           // SWC ships today. If SWC adds a new operator, the build breaks
           // here — preferable to a silent runtime error path. No catch-all.
     };
 
-    match &assign.left {
+    lower_assignment_target(ctx, &assign.left, value)
+}
+
+fn lower_assignment_target(
+    ctx: &mut LoweringContext,
+    target: &ast::AssignTarget,
+    value: Box<Expr>,
+) -> Result<Expr> {
+    match target {
         ast::AssignTarget::Simple(ast::SimpleAssignTarget::Ident(ident)) => {
             let name = ident.id.sym.to_string();
             if let Some(env_id) = ctx.active_with_envs_for_ident(&name).into_iter().next() {
@@ -406,7 +427,10 @@ pub(super) fn lower_assign(ctx: &mut LoweringContext, assign: &ast::AssignExpr) 
             }
             if let Some(id) = ctx.lookup_local(&name) {
                 if ctx.is_local_immutable(id) {
-                    return Ok(throw_type_error_const_assignment(&name));
+                    return Ok(Expr::Sequence(vec![
+                        *value,
+                        throw_type_error_const_assignment(&name),
+                    ]));
                 }
                 Ok(Expr::LocalSet(id, value))
             } else if ctx.lookup_class(&name).is_some() || ctx.lookup_func(&name).is_some() {
@@ -430,8 +454,20 @@ pub(super) fn lower_assign(ctx: &mut LoweringContext, assign: &ast::AssignExpr) 
                     "  Warning: Assignment to undeclared variable '{}', creating sloppy global",
                     name
                 );
-                let id = ctx.define_sloppy_implicit_global(name);
-                Ok(Expr::LocalSet(id, value))
+                // Sloppy implicit global — a real globalThis property, not
+                // a module local (see the sibling arm in lower_expr.rs).
+                // NOTE: `GlobalGet(0)` alone is a by-name routing SENTINEL in
+                // codegen (bare reads lower to 0.0) — the write must target
+                // the VALUE globalThis, which the `PropertyGet { GlobalGet(0),
+                // "globalThis" }` shape resolves to the real global object.
+                Ok(Expr::PropertySet {
+                    object: Box::new(Expr::PropertyGet {
+                        object: Box::new(Expr::GlobalGet(0)),
+                        property: "globalThis".to_string(),
+                    }),
+                    property: name,
+                    value,
+                })
             }
         }
         ast::AssignTarget::Simple(ast::SimpleAssignTarget::Member(member)) => {
@@ -463,6 +499,22 @@ pub(super) fn lower_assign(ctx: &mut LoweringContext, assign: &ast::AssignExpr) 
             // Check if this is a static field assignment (e.g., Counter.count = 5)
             if let ast::Expr::Ident(obj_ident) = member.obj.as_ref() {
                 let obj_name = obj_ident.sym.to_string();
+                // `f.caller = v` / `f.arguments = v` on a declared function —
+                // the poisoned setter-less accessor on Function.prototype
+                // throws (strict semantics; Perry-compiled code is strict).
+                // The runtime closure-receiver path covers function VALUES;
+                // this covers `function f(){}` declarations whose property
+                // writes lower before reaching it. Refs test262 13.2-*-s.
+                if ctx.lookup_local(&obj_name).is_none() && ctx.lookup_func(&obj_name).is_some() {
+                    if let ast::MemberProp::Ident(prop_ident) = &member.prop {
+                        if matches!(prop_ident.sym.as_ref(), "caller" | "arguments") {
+                            return Ok(Expr::Sequence(vec![
+                                *value,
+                                throw_restricted_function_property_assignment(),
+                            ]));
+                        }
+                    }
+                }
                 if ctx.lookup_class(&obj_name).is_some() {
                     if let ast::MemberProp::Ident(prop_ident) = &member.prop {
                         let field_name = prop_ident.sym.to_string();
@@ -589,6 +641,19 @@ pub(super) fn lower_assign(ctx: &mut LoweringContext, assign: &ast::AssignExpr) 
                                     && ctx.lookup_local(&cls_name).is_none()
                                     && ctx.lookup_func(&cls_name).is_none()
                                 {
+                                    None
+                                } else if ctx.lookup_class(&cls_name).is_some()
+                                    && ctx.lookup_class_accessor_names(&cls_name).is_some_and(
+                                        |names| names.iter().any(|n| n == &method_name),
+                                    )
+                                {
+                                    // `C.prototype.<accessor> = v` where `<accessor>`
+                                    // is a `set`/`get` declared on the class is an
+                                    // ordinary write that must INVOKE the setter — not
+                                    // a prototype-method monkey-patch. Fall through to
+                                    // the generic PropertySet path (which reaches the
+                                    // runtime prototype-ref setter dispatch). Test262
+                                    // accessor-name-inst setters.
                                     None
                                 } else if ctx.lookup_class(&cls_name).is_some() {
                                     Some(ProtoOwner::Class(cls_name))
@@ -946,8 +1011,16 @@ pub(super) fn lower_assign(ctx: &mut LoweringContext, assign: &ast::AssignExpr) 
                     })
                 }
                 ast::MemberProp::PrivateName(private) => {
-                    // Private field assignment: this.#field = value
+                    // Private field assignment: this.#field = value. Guard the
+                    // receiver so a write to a wrong receiver — or to a
+                    // getter-only accessor / a private method — throws.
                     let property = format!("#{}", private.name);
+                    let object = super::expr_member::wrap_private_guard(
+                        ctx,
+                        object,
+                        &property,
+                        super::expr_member::PRIV_OP_WRITE,
+                    );
                     Ok(Expr::PropertySet {
                         object,
                         property,

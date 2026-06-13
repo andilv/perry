@@ -3,6 +3,7 @@ mod alloc;
 mod concat_reverse;
 mod flat_clone;
 mod from_concat;
+mod generic;
 mod header;
 mod immutable;
 mod indexing;
@@ -15,24 +16,43 @@ mod push_pop;
 mod reduce_right;
 mod search;
 mod sort;
+mod species;
 mod splice_slice;
 
 #[cfg(test)]
 mod tests;
 
+pub(crate) use self::alloc::array_length_range_error;
 pub use self::alloc::{
     js_array_alloc, js_array_alloc_literal, js_array_alloc_with_length,
     js_array_alloc_with_length_longlived, js_array_constructor_single, js_array_create,
     js_array_from_arraylike_holey_value, js_array_from_f64,
 };
 pub use self::concat_reverse::{
-    js_array_concat, js_array_concat_new, js_array_fill, js_array_fill_range, js_array_reverse,
+    js_array_concat, js_array_concat_new, js_array_fill, js_array_fill_generic,
+    js_array_fill_range, js_array_reverse, js_array_reverse_value,
 };
 pub use self::flat_clone::{
     js_array_clone, js_array_entries, js_array_flat, js_array_flat_depth, js_array_keys,
     js_array_values,
 };
-pub use self::from_concat::{js_array_concat_variadic, js_array_from_mapped, js_array_from_value};
+pub use self::from_concat::{
+    array_from_full, array_of_full, js_array_concat_variadic, js_array_from_mapped,
+    js_array_from_value,
+};
+pub use self::generic::array_proto_mutator;
+pub use self::generic::{
+    js_arraylike_at, js_arraylike_concat, js_arraylike_every, js_arraylike_filter,
+    js_arraylike_find, js_arraylike_findIndex, js_arraylike_findLast, js_arraylike_findLastIndex,
+    js_arraylike_forEach, js_arraylike_includes, js_arraylike_indexOf, js_arraylike_join,
+    js_arraylike_lastIndexOf, js_arraylike_map, js_arraylike_reduce, js_arraylike_reduceRight,
+    js_arraylike_slice, js_arraylike_some, js_arraylike_sort, js_arraylike_splice,
+    try_array_proto_chain_method, try_object_arraylike_mutator,
+};
+pub(crate) use self::generic::{
+    non_array_object_receiver, object_pop as generic_object_pop,
+    object_shift as generic_object_shift, object_sort, object_splice, plain_object_value,
+};
 pub(crate) use self::header::{array_has_arguments_object_flag, mark_array_as_arguments_object};
 pub use self::header::{
     js_array_clear_numeric_layout, js_array_is_numeric_f64_layout, js_array_mark_arguments_object,
@@ -44,6 +64,12 @@ pub use self::immutable::{
     js_array_copy_within, js_array_copy_within_value, js_array_to_reversed,
     js_array_to_sorted_default, js_array_to_sorted_with_comparator, js_array_to_spliced,
     js_array_with,
+};
+pub(crate) use self::indexing::{
+    array_has_own_index, array_iteration_is_exotic, array_proto_iterator_modified,
+    array_prototype_addr, array_prototype_has_index_flag, array_spec_get, array_spec_has_index,
+    note_array_proto_iterator_write, note_object_prototype_index_write,
+    object_prototype_addr_matches, object_prototype_has_index_flag,
 };
 pub use self::indexing::{
     js_array_get_element, js_array_get_element_f64, js_array_get_f64, js_array_get_f64_unchecked,
@@ -67,13 +93,18 @@ pub use self::iter_object::{
     ARRAY_ITERATOR_CLASS_ID,
 };
 pub(crate) use self::iterator::is_builtin_iterator_class_id;
-pub use self::iterator::{js_array_spread_append, js_for_of_to_array, js_iterator_to_array};
+pub use self::iterator::{
+    js_array_spread_append, js_for_of_to_array, js_get_async_iterator, js_iterator_to_array,
+};
+pub(crate) use self::sort::object_prototype_has_index_prop;
+pub(crate) use self::sort::object_prototype_index_get as sort_object_prototype_index_get;
 // Issue #1572 — flatten helpers reused by `node_stream::ns_iter_flat_map`
 // so an `async function*` mapper return is driven through the iterator
 // protocol instead of being appended as a single chunk.
 pub(crate) use self::iterator::{
-    async_iterator_to_array_for_flat_map, call_symbol_async_iterator_for_flat_map,
-    entries_array_for_small_handle_id, has_iterator_next, sync_iterator_to_array_if_not_async,
+    async_from_sync_wrap_iterator, async_iterator_to_array_for_flat_map,
+    call_symbol_async_iterator_for_flat_map, entries_array_for_small_handle_id, has_iterator_next,
+    sync_iterator_to_array_if_not_async,
 };
 pub use self::jsvalue_api::{
     js_array_from_jsvalue, js_array_get, js_array_get_jsvalue, js_array_push,

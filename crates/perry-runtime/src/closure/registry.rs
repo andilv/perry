@@ -60,6 +60,14 @@ thread_local! {
     static CLOSURE_ARROW_FUNCTION_REGISTRY: RefCell<crate::fast_hash::PtrHashMap<usize, ()>> =
         RefCell::new(crate::fast_hash::new_ptr_hash_map());
 
+    /// Side-table marking closure body `func_ptr`s whose body is strict-mode
+    /// code (file-level `"use strict"` or a body directive). Drives
+    /// OrdinaryCallBindThis in `call`/`apply`/`bind`: a strict callee
+    /// observes the raw primitive `thisArg`; a sloppy user callee gets it
+    /// boxed once.
+    static CLOSURE_STRICT_FUNCTION_REGISTRY: RefCell<crate::fast_hash::PtrHashMap<usize, ()>> =
+        RefCell::new(crate::fast_hash::new_ptr_hash_map());
+
     /// Side-table marking closure body `func_ptr`s that came from async
     /// functions. `util.types.isAsyncFunction` uses this when the predicate
     /// sees a runtime closure value instead of a statically-known HIR node.
@@ -326,12 +334,48 @@ pub fn is_registered_arrow_function(func_ptr: *const u8) -> bool {
     CLOSURE_ARROW_FUNCTION_REGISTRY.with(|r| r.borrow().contains_key(&(func_ptr as usize)))
 }
 
+/// Register a compiled function address as strict-mode code. Emitted from
+/// module init alongside the arrow-function registration.
+#[no_mangle]
+pub extern "C" fn js_register_closure_strict_function(func_ptr: *const u8) {
+    if func_ptr.is_null() {
+        return;
+    }
+    CLOSURE_STRICT_FUNCTION_REGISTRY.with(|r| {
+        r.borrow_mut().insert(func_ptr as usize, ());
+    });
+}
+
+/// Keepalive anchor for the auto-optimize whole-program build — the strict
+/// registration is emitted only from generated module-init code.
+#[used]
+static KEEP_JS_REGISTER_CLOSURE_STRICT_FUNCTION: extern "C" fn(*const u8) =
+    js_register_closure_strict_function;
+
+#[inline(always)]
+pub fn is_registered_strict_function(func_ptr: *const u8) -> bool {
+    if func_ptr.is_null() {
+        return false;
+    }
+    CLOSURE_STRICT_FUNCTION_REGISTRY.with(|r| r.borrow().contains_key(&(func_ptr as usize)))
+}
+
 pub fn closure_is_arrow(closure: *const ClosureHeader) -> bool {
     let func_ptr = get_valid_func_ptr(closure);
     if func_ptr.is_null() {
         return false;
     }
     is_registered_arrow_function(func_ptr)
+}
+
+/// True if `closure` is a bound-method / bound-function value (its body is the
+/// `BOUND_METHOD_FUNC_PTR` sentinel). Class method/getter/setter values read
+/// via `C.prototype.m`, instance method reads, and `Function.prototype.bind`
+/// results all use this sentinel. None of them are constructors, so they have
+/// no `prototype` own property (ECMA-262: methods, accessors, and bound
+/// functions are non-constructors).
+pub fn closure_is_bound_method(closure: *const ClosureHeader) -> bool {
+    get_valid_func_ptr(closure) == BOUND_METHOD_FUNC_PTR
 }
 
 #[no_mangle]
@@ -399,6 +443,9 @@ pub fn closure_arity(closure: *const ClosureHeader) -> Option<u32> {
 /// at the first default parameter, while the dispatch arity must remain the
 /// full declared parameter count for ABI-safe padding.
 pub fn closure_length(closure: *const ClosureHeader) -> Option<u32> {
+    if let Some(length) = crate::object::builtin_closure_length(closure as usize) {
+        return Some(length);
+    }
     let func_ptr = get_valid_func_ptr(closure);
     if func_ptr.is_null() {
         return None;

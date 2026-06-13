@@ -107,6 +107,7 @@ fn module_with_classes_and_params(
         closure_display_names: std::collections::HashMap::new(),
         closure_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
+        gen_param_prologue_len: std::collections::HashMap::new(),
     }
 }
 
@@ -234,6 +235,8 @@ fn class(id: u32, name: &str, fields: Vec<ClassField>) -> Class {
         methods: Vec::new(),
         getters: Vec::new(),
         setters: Vec::new(),
+        static_accessor_names: Vec::new(),
+        static_accessor_fn_ids: Vec::new(),
         computed_members: Vec::new(),
         static_fields: Vec::new(),
         static_methods: Vec::new(),

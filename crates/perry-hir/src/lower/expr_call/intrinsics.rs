@@ -122,7 +122,7 @@ pub(super) fn try_strict_eval_arguments_assignment(
     ctx: &LoweringContext,
     call: &ast::CallExpr,
 ) -> Option<Expr> {
-    if !ctx.current_strict_mode() || call.args.len() != 1 || call.args[0].spread.is_some() {
+    if call.args.len() != 1 || call.args[0].spread.is_some() {
         return None;
     }
     let ast::Callee::Expr(callee_expr) = &call.callee else {
@@ -146,7 +146,25 @@ pub(super) fn try_strict_eval_arguments_assignment(
         return None;
     };
     let source = source.value.as_str().unwrap_or("");
-    if !strict_eval_source_assigns_arguments(source) {
+    let outer_strict = ctx.current_strict_mode() || ctx.current_strict;
+
+    // Spec early errors for eval code: in strict-mode code (inherited from
+    // the calling context for direct eval, or introduced by a directive in
+    // the eval source itself), binding, assigning, or naming a function
+    // `eval` / `arguments` is a SyntaxError thrown by the eval call.
+    // Parse the source and scan; fall back to the older substring heuristic
+    // when the source doesn't parse here.
+    let parses = perry_parser::parse_typescript(source, "<eval body>.cjs");
+    let violation = match &parses {
+        Ok(module) => eval_module_has_strict_eval_arguments_violation(module, outer_strict),
+        // SWC enforces some strict early errors at parse time (e.g.
+        // `eval = 42` inside a 'use strict' function body). A source that
+        // fails to parse while strict-mode is in play is a SyntaxError at
+        // the eval call. Keep sloppy parse failures on the existing path —
+        // SWC's TS grammar rejects some legal sloppy JS (legacy octal etc.).
+        Err(_) => outer_strict || source.contains("use strict"),
+    };
+    if !violation {
         return None;
     }
     Some(Expr::Call {
@@ -158,6 +176,328 @@ pub(super) fn try_strict_eval_arguments_assignment(
         args: Vec::new(),
         type_args: Vec::new(),
     })
+}
+
+fn is_restricted_name(name: &str) -> bool {
+    name == "eval" || name == "arguments"
+}
+
+fn stmts_start_with_use_strict(stmts: &[ast::Stmt]) -> bool {
+    for stmt in stmts {
+        match stmt {
+            ast::Stmt::Expr(expr_stmt) => match expr_stmt.expr.as_ref() {
+                ast::Expr::Lit(ast::Lit::Str(s)) => {
+                    if s.value.as_str() == Some("use strict") {
+                        return true;
+                    }
+                    // Other directive-prologue strings — keep scanning.
+                }
+                _ => return false,
+            },
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn pat_binds_restricted_name(pat: &ast::Pat) -> bool {
+    match pat {
+        ast::Pat::Ident(ident) => is_restricted_name(ident.id.sym.as_ref()),
+        ast::Pat::Array(arr) => arr.elems.iter().flatten().any(pat_binds_restricted_name),
+        ast::Pat::Object(obj) => obj.props.iter().any(|p| match p {
+            ast::ObjectPatProp::Assign(a) => is_restricted_name(a.key.sym.as_ref()),
+            ast::ObjectPatProp::KeyValue(kv) => pat_binds_restricted_name(&kv.value),
+            ast::ObjectPatProp::Rest(r) => pat_binds_restricted_name(&r.arg),
+        }),
+        ast::Pat::Assign(a) => pat_binds_restricted_name(&a.left),
+        ast::Pat::Rest(r) => pat_binds_restricted_name(&r.arg),
+        _ => false,
+    }
+}
+
+fn collect_param_names(pat: &ast::Pat, out: &mut Vec<String>) {
+    match pat {
+        ast::Pat::Ident(ident) => out.push(ident.id.sym.to_string()),
+        ast::Pat::Array(arr) => {
+            for elem in arr.elems.iter().flatten() {
+                collect_param_names(elem, out);
+            }
+        }
+        ast::Pat::Object(obj) => {
+            for p in &obj.props {
+                match p {
+                    ast::ObjectPatProp::Assign(a) => out.push(a.key.sym.to_string()),
+                    ast::ObjectPatProp::KeyValue(kv) => collect_param_names(&kv.value, out),
+                    ast::ObjectPatProp::Rest(r) => collect_param_names(&r.arg, out),
+                }
+            }
+        }
+        ast::Pat::Assign(a) => collect_param_names(&a.left, out),
+        ast::Pat::Rest(r) => collect_param_names(&r.arg, out),
+        _ => {}
+    }
+}
+
+fn function_has_violation(func: &ast::Function, name: Option<&str>, strict: bool) -> bool {
+    let body_strict = strict
+        || func
+            .body
+            .as_ref()
+            .is_some_and(|b| stmts_start_with_use_strict(&b.stmts));
+    if body_strict {
+        if let Some(n) = name {
+            if is_restricted_name(n) {
+                return true;
+            }
+        }
+        if func
+            .params
+            .iter()
+            .any(|p| pat_binds_restricted_name(&p.pat))
+        {
+            return true;
+        }
+        // Duplicate parameter names are a strict-mode early error
+        // (`function f(param, param) {}` — test262 13.1-2x-s).
+        let mut names = Vec::new();
+        for p in &func.params {
+            collect_param_names(&p.pat, &mut names);
+        }
+        names.sort();
+        if names.windows(2).any(|w| w[0] == w[1]) {
+            return true;
+        }
+    }
+    func.body
+        .as_ref()
+        .is_some_and(|b| b.stmts.iter().any(|s| stmt_has_violation(s, body_strict)))
+}
+
+fn expr_has_violation(expr: &ast::Expr, strict: bool) -> bool {
+    use ast::Expr as E;
+    match expr {
+        E::Assign(assign) => {
+            if strict {
+                if let ast::AssignTarget::Simple(ast::SimpleAssignTarget::Ident(id)) = &assign.left
+                {
+                    if is_restricted_name(id.id.sym.as_ref()) {
+                        return true;
+                    }
+                }
+            }
+            expr_has_violation(&assign.right, strict)
+        }
+        E::Update(update) => {
+            if strict {
+                if let E::Ident(id) = update.arg.as_ref() {
+                    if is_restricted_name(id.sym.as_ref()) {
+                        return true;
+                    }
+                }
+            }
+            expr_has_violation(&update.arg, strict)
+        }
+        E::Fn(fn_expr) => function_has_violation(
+            &fn_expr.function,
+            fn_expr.ident.as_ref().map(|i| i.sym.as_ref()),
+            strict,
+        ),
+        E::Arrow(arrow) => {
+            if strict && arrow.params.iter().any(pat_binds_restricted_name) {
+                return true;
+            }
+            match arrow.body.as_ref() {
+                ast::BlockStmtOrExpr::BlockStmt(b) => {
+                    let body_strict = strict || stmts_start_with_use_strict(&b.stmts);
+                    b.stmts.iter().any(|s| stmt_has_violation(s, body_strict))
+                }
+                ast::BlockStmtOrExpr::Expr(e) => expr_has_violation(e, strict),
+            }
+        }
+        E::Call(call) => {
+            if let ast::Callee::Expr(c) = &call.callee {
+                if matches!(c.as_ref(), E::Ident(i) if i.sym.as_ref() == "Function")
+                    && function_ctor_body_has_violation(call.args.last())
+                {
+                    return true;
+                }
+            }
+            call.args
+                .iter()
+                .any(|a| expr_has_violation(&a.expr, strict))
+                || matches!(&call.callee, ast::Callee::Expr(c) if expr_has_violation(c, strict))
+        }
+        E::New(new_expr) => {
+            // `new Function(p1, …, body)` with a literal body that carries
+            // its own strict directive + violation — the ctor throws the
+            // SyntaxError when the eval body runs (13.0-13/14-s).
+            if matches!(new_expr.callee.as_ref(), E::Ident(i) if i.sym.as_ref() == "Function")
+                && function_ctor_body_has_violation(new_expr.args.as_ref().and_then(|a| a.last()))
+            {
+                return true;
+            }
+            expr_has_violation(&new_expr.callee, strict)
+                || new_expr
+                    .args
+                    .iter()
+                    .flatten()
+                    .any(|a| expr_has_violation(&a.expr, strict))
+        }
+        E::Paren(p) => expr_has_violation(&p.expr, strict),
+        E::Seq(seq) => seq.exprs.iter().any(|e| expr_has_violation(e, strict)),
+        E::Bin(b) => expr_has_violation(&b.left, strict) || expr_has_violation(&b.right, strict),
+        E::Unary(u) => expr_has_violation(&u.arg, strict),
+        E::Cond(c) => {
+            expr_has_violation(&c.test, strict)
+                || expr_has_violation(&c.cons, strict)
+                || expr_has_violation(&c.alt, strict)
+        }
+        E::Member(m) => expr_has_violation(&m.obj, strict),
+        E::Array(arr) => arr
+            .elems
+            .iter()
+            .flatten()
+            .any(|el| expr_has_violation(&el.expr, strict)),
+        E::Object(obj) => obj.props.iter().any(|p| match p {
+            ast::PropOrSpread::Prop(prop) => match prop.as_ref() {
+                ast::Prop::KeyValue(kv) => expr_has_violation(&kv.value, strict),
+                ast::Prop::Method(m) => function_has_violation(&m.function, None, strict),
+                _ => false,
+            },
+            ast::PropOrSpread::Spread(s) => expr_has_violation(&s.expr, strict),
+        }),
+        _ => false,
+    }
+}
+
+/// `Function(p…, body)` / `new Function(p…, body)` with a literal body whose
+/// own directive prologue is 'use strict' and which contains a restricted
+/// eval/arguments binding or assignment. Function-constructor bodies do NOT
+/// inherit outer strictness, so only the body's own directive counts.
+fn function_ctor_body_has_violation(body_arg: Option<&ast::ExprOrSpread>) -> bool {
+    let Some(arg) = body_arg else { return false };
+    let ast::Expr::Lit(ast::Lit::Str(s)) = arg.expr.as_ref() else {
+        return false;
+    };
+    let src = s.value.as_str().unwrap_or("");
+    match perry_parser::parse_typescript(src, "<fn ctor body>.cjs") {
+        Ok(module) => {
+            let owned: Vec<ast::Stmt> = module
+                .body
+                .iter()
+                .filter_map(|item| match item {
+                    ast::ModuleItem::Stmt(stmt) => Some(stmt.clone()),
+                    _ => None,
+                })
+                .collect();
+            let body_strict = stmts_start_with_use_strict(&owned);
+            body_strict && owned.iter().any(|s| stmt_has_violation(s, true))
+        }
+        Err(_) => src.contains("use strict"),
+    }
+}
+
+fn var_decl_has_violation(var_decl: &ast::VarDecl, strict: bool) -> bool {
+    var_decl.decls.iter().any(|d| {
+        (strict && pat_binds_restricted_name(&d.name))
+            || d.init
+                .as_ref()
+                .is_some_and(|e| expr_has_violation(e, strict))
+    })
+}
+
+fn stmt_has_violation(stmt: &ast::Stmt, strict: bool) -> bool {
+    use ast::Stmt as S;
+    match stmt {
+        S::Expr(e) => expr_has_violation(&e.expr, strict),
+        S::Decl(ast::Decl::Var(v)) => var_decl_has_violation(v, strict),
+        S::Decl(ast::Decl::Fn(f)) => {
+            function_has_violation(&f.function, Some(f.ident.sym.as_ref()), strict)
+        }
+        S::Block(b) => b.stmts.iter().any(|s| stmt_has_violation(s, strict)),
+        S::If(i) => {
+            expr_has_violation(&i.test, strict)
+                || stmt_has_violation(&i.cons, strict)
+                || i.alt
+                    .as_ref()
+                    .is_some_and(|a| stmt_has_violation(a, strict))
+        }
+        S::While(w) => expr_has_violation(&w.test, strict) || stmt_has_violation(&w.body, strict),
+        S::DoWhile(w) => expr_has_violation(&w.test, strict) || stmt_has_violation(&w.body, strict),
+        S::For(f) => {
+            f.init.as_ref().is_some_and(|i| match i {
+                ast::VarDeclOrExpr::VarDecl(v) => var_decl_has_violation(v, strict),
+                ast::VarDeclOrExpr::Expr(e) => expr_has_violation(e, strict),
+            }) || f
+                .test
+                .as_ref()
+                .is_some_and(|e| expr_has_violation(e, strict))
+                || f.update
+                    .as_ref()
+                    .is_some_and(|e| expr_has_violation(e, strict))
+                || stmt_has_violation(&f.body, strict)
+        }
+        S::ForIn(f) => stmt_has_violation(&f.body, strict),
+        S::ForOf(f) => stmt_has_violation(&f.body, strict),
+        S::Try(t) => {
+            t.block.stmts.iter().any(|s| stmt_has_violation(s, strict))
+                || t.handler.as_ref().is_some_and(|h| {
+                    (strict && h.param.as_ref().is_some_and(pat_binds_restricted_name))
+                        || h.body.stmts.iter().any(|s| stmt_has_violation(s, strict))
+                })
+                || t.finalizer
+                    .as_ref()
+                    .is_some_and(|f| f.stmts.iter().any(|s| stmt_has_violation(s, strict)))
+        }
+        S::Switch(sw) => sw.cases.iter().any(|c| {
+            c.test
+                .as_ref()
+                .is_some_and(|e| expr_has_violation(e, strict))
+                || c.cons.iter().any(|s| stmt_has_violation(s, strict))
+        }),
+        S::Return(r) => r
+            .arg
+            .as_ref()
+            .is_some_and(|e| expr_has_violation(e, strict)),
+        S::Throw(t) => expr_has_violation(&t.arg, strict),
+        S::Labeled(l) => stmt_has_violation(&l.body, strict),
+        S::With(w) => expr_has_violation(&w.obj, strict) || stmt_has_violation(&w.body, strict),
+        _ => false,
+    }
+}
+
+fn eval_module_has_strict_eval_arguments_violation(
+    module: &ast::Module,
+    outer_strict: bool,
+) -> bool {
+    let stmts: Vec<&ast::Stmt> = module
+        .body
+        .iter()
+        .filter_map(|item| match item {
+            ast::ModuleItem::Stmt(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    let top_strict = outer_strict || {
+        // Directive prologue of the eval source itself.
+        let mut prologue_strict = false;
+        for s in &stmts {
+            match s {
+                ast::Stmt::Expr(e) => match e.expr.as_ref() {
+                    ast::Expr::Lit(ast::Lit::Str(lit)) => {
+                        if lit.value.as_str() == Some("use strict") {
+                            prologue_strict = true;
+                            break;
+                        }
+                    }
+                    _ => break,
+                },
+                _ => break,
+            }
+        }
+        prologue_strict
+    };
+    stmts.iter().any(|s| stmt_has_violation(s, top_strict))
 }
 
 fn strict_eval_source_assigns_arguments(source: &str) -> bool {
@@ -898,20 +1238,37 @@ pub(super) fn try_iife_call_rewrite(
                             let lowered_callee = lower_expr(ctx, inner)?;
                             if let Expr::Closure {
                                 captures_this: false,
+                                is_arrow,
+                                body,
                                 ..
                             } = &lowered_callee
                             {
-                                let rest_args = call
-                                    .args
-                                    .iter()
-                                    .skip(1)
-                                    .map(|arg| lower_expr(ctx, &arg.expr))
-                                    .collect::<Result<Vec<_>>>()?;
-                                return Ok(Some(Expr::Call {
-                                    callee: Box::new(lowered_callee),
-                                    args: rest_args,
-                                    type_args: Vec::new(),
-                                }));
+                                // Dropping the `.call` thisArg is only sound
+                                // when the body never observes `this`. An arrow
+                                // (captures_this == false) has no own `this`. A
+                                // regular function expression ALSO reports
+                                // captures_this == false (it has its own dynamic
+                                // `this`, not a captured one — expr_function.rs),
+                                // so its body may still read `this`; folding
+                                // `(function(){ "use strict"; return this })
+                                // .call(null)` to `fn()` would lose the bound
+                                // receiver (the body would see undefined, not
+                                // null). Require a this-free body there. #3576.
+                                let drops_this_safely =
+                                    *is_arrow || !crate::analysis::closure_uses_this(body);
+                                if drops_this_safely {
+                                    let rest_args = call
+                                        .args
+                                        .iter()
+                                        .skip(1)
+                                        .map(|arg| lower_expr(ctx, &arg.expr))
+                                        .collect::<Result<Vec<_>>>()?;
+                                    return Ok(Some(Expr::Call {
+                                        callee: Box::new(lowered_callee),
+                                        args: rest_args,
+                                        type_args: Vec::new(),
+                                    }));
+                                }
                             }
                         }
                     }
@@ -996,6 +1353,47 @@ pub(super) fn try_native_module_method_apply_call(
         || matches!(ctx.lookup_native_module(ns_name), Some((_, None)));
     if !is_module_ns {
         return Ok(None);
+    }
+
+    // #4973: `http.Server.call(this, handler)` — the util.inherits-era
+    // subclass pattern. For native CLASS exports the thisArg is NOT
+    // irrelevant: Node initializes `this` as the server. Route to the
+    // construct-with-this extern (which constructs the server AND aliases
+    // `this` → handle) instead of dropping the receiver below.
+    if !is_apply && !call.args.is_empty() {
+        let module = ctx
+            .lookup_builtin_module_alias(ns_name)
+            .map(str::to_string)
+            .or_else(|| {
+                ctx.lookup_native_module(ns_name)
+                    .map(|(m, _)| m.to_string())
+            });
+        if let (Some(module), ast::MemberProp::Ident(method_ident)) = (module, &inner.prop) {
+            let normalized = module.strip_prefix("node:").unwrap_or(&module);
+            if matches!(normalized, "http" | "https") && method_ident.sym.as_ref() == "Server" {
+                let mut lowered: Vec<Expr> = call
+                    .args
+                    .iter()
+                    .map(|a| lower_expr(ctx, &a.expr))
+                    .collect::<Result<Vec<_>>>()?;
+                // (this, options?, listener?) — fixed 3-arg extern ABI.
+                lowered.resize(3, Expr::Undefined);
+                let extern_name = if normalized == "https" {
+                    "js_https_server_construct_with_this"
+                } else {
+                    "js_http_server_construct_with_this"
+                };
+                return Ok(Some(Expr::Call {
+                    callee: Box::new(Expr::ExternFuncRef {
+                        name: extern_name.to_string(),
+                        param_types: Vec::new(),
+                        return_type: Type::Any,
+                    }),
+                    args: lowered,
+                    type_args: Vec::new(),
+                }));
+            }
+        }
     }
 
     // Build the synthesized direct-call argument list at the AST level.
@@ -1116,6 +1514,85 @@ fn is_primitive_wrapper_brand_method(recv: &ast::Expr, method: &str) -> bool {
     }
 }
 
+/// True when `recv.<method>` is a `String.prototype` generic-`this` method backed
+/// by a real reflective runtime thunk (RequireObjectCoercible + ToString(this)).
+/// Folding `String.prototype.charAt.call(x)` into `x.charAt()` would re-dispatch
+/// `charAt` *by name on `x`'s own type* — a boolean/number/object has no
+/// `charAt`, so it throws `(boolean).charAt is not a function`. Keeping it
+/// reflective lets the installed thunk coerce `this` to a string. Only the
+/// `String.prototype.<m>` receiver shape is guarded (string-literal receivers
+/// like `"".charAt.call(x)` are vanishingly rare); kept in lock-step with
+/// `string_proto_thunks::install_string_proto_methods`.
+fn is_string_prototype_generic_method(recv: &ast::Expr, method: &str) -> bool {
+    let ast::Expr::Member(member) = recv else {
+        return false;
+    };
+    let ast::MemberProp::Ident(prop) = &member.prop else {
+        return false;
+    };
+    if prop.sym.as_ref() != "prototype" {
+        return false;
+    }
+    let ast::Expr::Ident(base) = member.obj.as_ref() else {
+        return false;
+    };
+    base.sym.as_ref() == "String"
+        && matches!(
+            method,
+            // Char-access (dedicated thunks) + every coercing method installed
+            // as the generic `string_proto_generic_thunk`. Keep in lock-step with
+            // `string_proto_thunks::GENERIC_STRING_PROTO_METHODS`. Excluded:
+            // `toString`/`valueOf` (brand-checked, not ToString-coercing).
+            // Annex B §B.2.2 HTML wrappers.
+            "anchor"
+                | "big"
+                | "blink"
+                | "bold"
+                | "fixed"
+                | "fontcolor"
+                | "fontsize"
+                | "italics"
+                | "link"
+                | "small"
+                | "strike"
+                | "sub"
+                | "sup"
+                | "at"
+                | "charAt"
+                | "charCodeAt"
+                | "codePointAt"
+                | "concat"
+                | "endsWith"
+                | "includes"
+                | "indexOf"
+                | "isWellFormed"
+                | "lastIndexOf"
+                | "localeCompare"
+                | "match"
+                | "matchAll"
+                | "normalize"
+                | "padEnd"
+                | "padStart"
+                | "repeat"
+                | "replace"
+                | "replaceAll"
+                | "search"
+                | "slice"
+                | "split"
+                | "startsWith"
+                | "substr"
+                | "substring"
+                | "toLocaleLowerCase"
+                | "toLocaleUpperCase"
+                | "toLowerCase"
+                | "toUpperCase"
+                | "toWellFormed"
+                | "trim"
+                | "trimEnd"
+                | "trimStart"
+        )
+}
+
 pub(super) fn try_builtin_prototype_method_apply_call(
     ctx: &mut LoweringContext,
     call: &ast::CallExpr,
@@ -1175,6 +1652,13 @@ pub(super) fn try_builtin_prototype_method_apply_call(
             if is_primitive_wrapper_brand_method(inner.obj.as_ref(), method_ident.sym.as_ref()) {
                 return Ok(None);
             }
+            // Generic-`this` String.prototype char-access methods must stay
+            // reflective so the runtime thunk coerces `this` to a string (see
+            // `is_string_prototype_generic_method`). Folding to `x.<m>()` would
+            // dispatch on `x`'s own type and throw.
+            if is_string_prototype_generic_method(inner.obj.as_ref(), method_ident.sym.as_ref()) {
+                return Ok(None);
+            }
             method_ident.clone()
         }
         ast::Expr::Ident(id) => match ctx.builtin_proto_method_locals.get(id.sym.as_ref()) {
@@ -1226,8 +1710,8 @@ pub(super) fn try_builtin_prototype_method_apply_call(
         call.args.iter().skip(1).cloned().collect()
     };
 
-    // `Array.prototype.<m>.call(arrayLike, ...)` — when `<m>` is a known
-    // read-only Array method, this is an explicit, unambiguous request to run
+    // `Array.prototype.<m>.call(arrayLike, ...)` — when `<m>` is a supported
+    // generic Array method, this is an explicit, unambiguous request to run
     // the Array algorithm on a *generic array-like* receiver (a plain object
     // with `length` + indexed keys; ECMA-262 §23.1.3). The default synthesized
     // `(thisArg).<m>(...)` member call below only routes to the Array runtime
@@ -1236,9 +1720,11 @@ pub(super) fn try_builtin_prototype_method_apply_call(
     // field and throws "value is not a function". Build the dedicated
     // `Expr::Array*` variant directly so the receiver flows to `js_array_*`
     // regardless of its static type — the runtime materializes the array-like
-    // (see `normalize_array_receiver`). Only the read-only/returning methods are
-    // handled here; mutators and unsupported shapes fall through to the member
-    // call below (unchanged behavior).
+    // (see `normalize_array_receiver`). Most handled methods are
+    // read-only/returning; the mutators `fill` / `copyWithin` / `reverse` use
+    // dedicated generic helpers because they must write back to the original
+    // receiver rather than a materialized clone. Unsupported mutators fall
+    // through to the member call below (unchanged behavior).
     if let Some(folded) =
         try_arraylike_receiver_method(ctx, method_prop.sym.as_ref(), &this_arg.expr, &rest_args)?
     {
@@ -1265,10 +1751,11 @@ pub(super) fn try_builtin_prototype_method_apply_call(
 /// `thisArg`; `rest_args` are the post-`thisArg` positional arguments (already
 /// expanded from the `.apply` array if applicable).
 ///
-/// Returns `Some(expr)` for a supported read-only/returning method, or `None`
-/// for mutators / unsupported methods (caller falls back to the synthesized
-/// member call). The chosen set mirrors the runtime methods that route through
-/// `normalize_array_receiver`.
+/// Returns `Some(expr)` for a supported read-only/returning method, plus
+/// dedicated generic `fill` / `copyWithin` / `reverse` mutator paths, or `None`
+/// for other mutators / unsupported methods (caller falls back to the
+/// synthesized member call). The read-only set mirrors the runtime methods that
+/// route through `normalize_array_receiver`.
 fn try_arraylike_receiver_method(
     ctx: &mut LoweringContext,
     method: &str,
@@ -1279,6 +1766,25 @@ fn try_arraylike_receiver_method(
     if rest_args.iter().any(|a| a.spread.is_some()) {
         return Ok(None);
     }
+    // `fill` mutates in place but is generic over an array-like receiver; route
+    // to the dedicated generic mutator helper (`js_array_fill_generic`), which
+    // writes back to the original receiver rather than a materialized clone.
+    if method == "fill" {
+        let object = Box::new(lower_expr(ctx, receiver)?);
+        let mut args = Vec::with_capacity(rest_args.len());
+        for a in rest_args {
+            args.push(lower_expr(ctx, &a.expr)?);
+        }
+        return Ok(Some(Expr::NativeMethodCall {
+            module: "array".to_string(),
+            class_name: None,
+            object: Some(object),
+            method: "fill_generic".to_string(),
+            args,
+        }));
+    }
+    // `copyWithin` mutates in place but is generic over an array-like receiver;
+    // keep the dedicated value-receiver lowering.
     if method == "copyWithin" {
         let receiver = Box::new(lower_expr(ctx, receiver)?);
         let arg = |ctx: &mut LoweringContext, i: usize| -> Result<Option<Box<Expr>>> {
@@ -1303,10 +1809,26 @@ fn try_arraylike_receiver_method(
             end,
         }));
     }
-    // Only fold the read-only/returning methods. Bail early for everything else
-    // (mutators, flat, etc.) BEFORE lowering the receiver, so unrelated shapes
-    // keep the existing member-call behavior with no side effects.
-    let supported = matches!(
+    // `reverse` mutates in place and returns the same receiver; route to the
+    // dedicated `js_array_reverse_value` helper (no positional args allowed).
+    if method == "reverse" {
+        if !rest_args.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(Expr::ArrayReverseValue {
+            receiver: Box::new(lower_expr(ctx, receiver)?),
+        }));
+    }
+    // The read-only/returning methods the runtime generic engine implements
+    // directly over an array-like receiver (`js_arraylike_*`, #4597). Unlike
+    // the old materialize-then-call fold, these preserve the original receiver
+    // identity (passed as the callback's 3rd argument) and read live via
+    // `Get(O, k)` / `HasProperty(O, k)` — so they also work on plain objects,
+    // functions (`obj.length`/expando indices), strings, and bare primitives,
+    // and pass the receiver-identity test262 cases that a materialised clone
+    // fails. The hot `arr.<m>(…)` member-call paths are untouched — only the
+    // explicit `.call`/`.apply`/bound-local forms route here.
+    let generic = matches!(
         method,
         "map"
             | "filter"
@@ -1317,7 +1839,6 @@ fn try_arraylike_receiver_method(
             | "findLastIndex"
             | "some"
             | "every"
-            | "flatMap"
             | "reduce"
             | "reduceRight"
             | "indexOf"
@@ -1326,125 +1847,46 @@ fn try_arraylike_receiver_method(
             | "slice"
             | "at"
             | "join"
+            // Generic mutators with dedicated runtime engines (#4597
+            // extension): `sort` sorts the receiver in place via
+            // Get/HasProperty/Set/Delete; `splice`/`concat` apply the spec
+            // algorithms over the array-like (test262 sort/call-with-primitive,
+            // splice/set_length_no_args, concat/call-with-boolean).
+            | "sort"
+            | "splice"
+            | "concat"
     );
-    if !supported {
+    if generic {
+        // Receiver lowers before the positional args, matching source order.
+        let receiver = Box::new(lower_expr(ctx, receiver)?);
+        let mut args = Vec::with_capacity(rest_args.len());
+        for a in rest_args {
+            args.push(lower_expr(ctx, &a.expr)?);
+        }
+        return Ok(Some(Expr::ArrayLikeMethod {
+            method: method.to_string(),
+            receiver,
+            args,
+        }));
+    }
+
+    // `flatMap` has no generic runtime entry yet; keep the holey
+    // materialize-then-call behavior. `Expr::ArrayFromArrayLikeHoley` keeps
+    // absent indexed keys as holes (vs `Array.from({ length })` creating
+    // present undefined slots), so the flatMap callback doesn't visit holes.
+    // Everything else (mutators, flat, etc.) bails BEFORE lowering the receiver
+    // so unrelated shapes keep the existing member-call behavior.
+    if method != "flatMap" {
         return Ok(None);
     }
-    // Materialize the array-like receiver into a REAL array up front, but keep
-    // absent indexed keys as holes. These Array.prototype algorithms use
-    // HasProperty/Get on the receiver; `Array.from({ length: 2 })` would create
-    // present undefined slots, making `indexOf(undefined)` and callback methods
-    // visit holes incorrectly.
-    let array_src = lower_expr(ctx, receiver)?;
-    let array = Box::new(Expr::ArrayFromArrayLikeHoley(Box::new(array_src)));
-    // Lower a positional argument by index, if present.
-    let mut arg = |ctx: &mut LoweringContext, i: usize| -> Result<Option<Box<Expr>>> {
-        match rest_args.get(i) {
-            Some(a) => Ok(Some(Box::new(lower_expr(ctx, &a.expr)?))),
-            None => Ok(None),
-        }
+    let Some(cb) = rest_args.first() else {
+        return Ok(None);
     };
-    // Callback-taking methods require the callback argument to be present.
-    macro_rules! cb_method {
-        ($variant:ident) => {{
-            let Some(cb) = arg(ctx, 0)? else {
-                return Ok(None);
-            };
-            Ok(Some(Expr::$variant {
-                array,
-                callback: cb,
-            }))
-        }};
-    }
-    match method {
-        "map" => cb_method!(ArrayMap),
-        "filter" => cb_method!(ArrayFilter),
-        "forEach" => cb_method!(ArrayForEach),
-        "find" => cb_method!(ArrayFind),
-        "findIndex" => cb_method!(ArrayFindIndex),
-        "findLast" => cb_method!(ArrayFindLast),
-        "findLastIndex" => cb_method!(ArrayFindLastIndex),
-        "some" => cb_method!(ArraySome),
-        "every" => cb_method!(ArrayEvery),
-        "flatMap" => cb_method!(ArrayFlatMap),
-        "reduce" => {
-            let Some(cb) = arg(ctx, 0)? else {
-                return Ok(None);
-            };
-            let initial = arg(ctx, 1)?;
-            Ok(Some(Expr::ArrayReduce {
-                array,
-                callback: cb,
-                initial,
-            }))
-        }
-        "reduceRight" => {
-            let Some(cb) = arg(ctx, 0)? else {
-                return Ok(None);
-            };
-            let initial = arg(ctx, 1)?;
-            Ok(Some(Expr::ArrayReduceRight {
-                array,
-                callback: cb,
-                initial,
-            }))
-        }
-        "indexOf" => {
-            let Some(value) = arg(ctx, 0)? else {
-                return Ok(None);
-            };
-            let from_index = arg(ctx, 1)?;
-            Ok(Some(Expr::ArrayIndexOf {
-                array,
-                value,
-                from_index,
-            }))
-        }
-        "lastIndexOf" => {
-            let Some(value) = arg(ctx, 0)? else {
-                return Ok(None);
-            };
-            let from_index = arg(ctx, 1)?;
-            Ok(Some(Expr::ArrayLastIndexOf {
-                array,
-                value,
-                from_index,
-            }))
-        }
-        "includes" => {
-            let Some(value) = arg(ctx, 0)? else {
-                return Ok(None);
-            };
-            let from_index = arg(ctx, 1)?;
-            Ok(Some(Expr::ArrayIncludes {
-                array,
-                value,
-                from_index,
-            }))
-        }
-        "slice" => {
-            // `slice()` with no args copies from index 0.
-            let start = match arg(ctx, 0)? {
-                Some(s) => s,
-                None => Box::new(Expr::Integer(0)),
-            };
-            let end = arg(ctx, 1)?;
-            Ok(Some(Expr::ArraySlice { array, start, end }))
-        }
-        "at" => {
-            let index = match arg(ctx, 0)? {
-                Some(i) => i,
-                None => Box::new(Expr::Integer(0)),
-            };
-            Ok(Some(Expr::ArrayAt { array, index }))
-        }
-        "join" => {
-            let separator = arg(ctx, 0)?;
-            Ok(Some(Expr::ArrayJoin { array, separator }))
-        }
-        // Unreachable: `supported` gate above filters to exactly these arms.
-        _ => Ok(None),
-    }
+    let array = Box::new(Expr::ArrayFromArrayLikeHoley(Box::new(lower_expr(
+        ctx, receiver,
+    )?)));
+    let callback = Box::new(lower_expr(ctx, &cb.expr)?);
+    Ok(Some(Expr::ArrayFlatMap { array, callback }))
 }
 
 /// #3144: if `init` is a value-read of a builtin prototype method whose
@@ -1470,6 +1912,11 @@ pub(crate) fn as_builtin_proto_method_ref(
     // (see `is_primitive_wrapper_brand_method`). Untracked, the value read goes
     // through the reflective dispatch, which throws correctly.
     if is_primitive_wrapper_brand_method(&member.obj, method.sym.as_ref()) {
+        return None;
+    }
+    // Keep `const m = String.prototype.charAt; m.call(x)` reflective too — the
+    // thunk must coerce `this` (see `is_string_prototype_generic_method`).
+    if is_string_prototype_generic_method(&member.obj, method.sym.as_ref()) {
         return None;
     }
     // For a `<Ctor>.prototype` receiver, any method ident is accepted (mirrors
@@ -1530,12 +1977,17 @@ fn is_builtin_prototype_receiver(ctx: &LoweringContext, recv: &ast::Expr) -> boo
 /// "value is not a function" at the outer call.
 ///
 /// Rewrite at the AST level for the shapes whose intent is unambiguous and
-/// where the `thisArg` is irrelevant (namespace statics don't read `this`):
+/// where the `thisArg` is irrelevant (most namespace statics don't read `this`):
 ///
 ///   `<NS>.<static>.call(thisArg, a, b, …)`     → `<NS>.<static>(a, b, …)`
 ///   `<NS>.<static>.apply(thisArg)`             → `<NS>.<static>()`
 ///   `<NS>.<static>.apply(thisArg, [a, b, …])`  → `<NS>.<static>(a, b, …)`
 ///   `<NS>.<static>.bind(thisArg, …pre)(…rest)` → `<NS>.<static>(…pre, …rest)`
+///
+/// Promise statics are handled only when the borrowed-call receiver is the real
+/// global `Promise` constructor. ECMA-262 reads their `this` value as the
+/// constructor receiver, so `Promise.resolve.call({}, x)` must not become
+/// `Promise.resolve(x)`.
 ///
 /// The deferred-bind shape (`const f = Promise.resolve.bind(Promise);
 /// f(x);`) cannot be rewritten purely at the AST level — that needs a
@@ -1561,6 +2013,13 @@ pub(super) fn try_namespace_static_method_apply_call_bind(
                 _ => None,
             };
             if let Some(is_apply) = mode {
+                if let Some(inner) = match_promise_static_member(ctx, outer.obj.as_ref()) {
+                    if call.args.first().is_some_and(|arg| {
+                        expr_is_global_promise_constructor(ctx, arg.expr.as_ref())
+                    }) {
+                        return rewrite_dropping_this(ctx, call, &inner, is_apply);
+                    }
+                }
                 if let Some(inner) = match_namespace_static_member(ctx, outer.obj.as_ref()) {
                     return rewrite_dropping_this(ctx, call, &inner, is_apply);
                 }
@@ -1579,6 +2038,26 @@ pub(super) fn try_namespace_static_method_apply_call_bind(
                         // understand; require at least `thisArg`.
                         let bind_spread = bind_call.args.iter().any(|a| a.spread.is_some());
                         if !bind_spread && !bind_call.args.is_empty() {
+                            if let Some(inner_member) =
+                                match_promise_static_member(ctx, bind_member.obj.as_ref())
+                            {
+                                if expr_is_global_promise_constructor(
+                                    ctx,
+                                    bind_call.args[0].expr.as_ref(),
+                                ) {
+                                    // Build: <inner_member>(…preBound, …rest)
+                                    let pre_bound: Vec<ast::ExprOrSpread> =
+                                        bind_call.args.iter().skip(1).cloned().collect();
+                                    let mut synth = call.clone();
+                                    synth.callee = ast::Callee::Expr(Box::new(ast::Expr::Member(
+                                        inner_member,
+                                    )));
+                                    let mut combined = pre_bound;
+                                    combined.extend(call.args.iter().cloned());
+                                    synth.args = combined;
+                                    return Ok(Some(super::lower_call(ctx, &synth)?));
+                                }
+                            }
                             if let Some(inner_member) =
                                 match_namespace_static_member(ctx, bind_member.obj.as_ref())
                             {
@@ -1603,8 +2082,54 @@ pub(super) fn try_namespace_static_method_apply_call_bind(
     Ok(None)
 }
 
+fn match_promise_static_member(ctx: &LoweringContext, expr: &ast::Expr) -> Option<ast::MemberExpr> {
+    let ast::Expr::Member(m) = expr else {
+        return None;
+    };
+    let ast::MemberProp::Ident(prop) = &m.prop else {
+        return None;
+    };
+    let ast::Expr::Ident(base) = m.obj.as_ref() else {
+        return None;
+    };
+    let ns = base.sym.as_ref();
+    let name = prop.sym.as_ref();
+    if ns != "Promise" {
+        return None;
+    }
+    if ctx.lookup_local(ns).is_some()
+        || ctx.lookup_func(ns).is_some()
+        || ctx.lookup_imported_func(ns).is_some()
+    {
+        return None;
+    }
+    if !is_known_namespace_static_function(ns, name) {
+        return None;
+    }
+    Some(m.clone())
+}
+
+fn expr_is_global_promise_constructor(ctx: &LoweringContext, expr: &ast::Expr) -> bool {
+    let mut expr = expr;
+    loop {
+        expr = match expr {
+            ast::Expr::TsAs(x) => x.expr.as_ref(),
+            ast::Expr::TsNonNull(x) => x.expr.as_ref(),
+            ast::Expr::TsSatisfies(x) => x.expr.as_ref(),
+            ast::Expr::TsTypeAssertion(x) => x.expr.as_ref(),
+            ast::Expr::TsConstAssertion(x) => x.expr.as_ref(),
+            ast::Expr::Paren(x) => x.expr.as_ref(),
+            _ => break,
+        };
+    }
+    matches!(expr, ast::Expr::Ident(ident) if ident.sym.as_ref() == "Promise")
+        && ctx.lookup_local("Promise").is_none()
+        && ctx.lookup_func("Promise").is_none()
+        && ctx.lookup_imported_func("Promise").is_none()
+}
+
 /// If `expr` is `<NS>.<static>` where `<NS>` is a known namespace-static
-/// holder (Promise/Math/JSON/Number/String/Object/Array) not shadowed by a
+/// holder (Math/JSON/Number/String/Object/Array) not shadowed by a
 /// local, and `<static>` is a known method on it, return a clone of that
 /// MemberExpr so it can be reused as the rewritten callee.
 fn match_namespace_static_member(
@@ -1622,10 +2147,39 @@ fn match_namespace_static_member(
     };
     let ns = base.sym.as_ref();
     let name = prop.sym.as_ref();
+    if ns == "Promise" {
+        return None;
+    }
     if ctx.lookup_local(ns).is_some() || ctx.lookup_func(ns).is_some() {
         return None;
     }
     if !is_known_namespace_static_function(ns, name) {
+        return None;
+    }
+    // #4521: the Promise combinators read the `this` constructor
+    // (`NewPromiseCapability(this)` / `GetPromiseResolve(this)`), so
+    // `Promise.all.call(C, …)` / `.apply` / `.bind` must NOT drop the
+    // thisArg — let them fall through to the generic reified-static dispatch
+    // (which preserves `this` via the implicit-this mechanism).
+    // `resolve` / `reject` are likewise `this`-sensitive: `Promise.{resolve,
+    // reject}.call(C, x)` go through `NewPromiseCapability(C)` (a non-ctor /
+    // non-object `this` throws; a custom constructor's executor runs), so they
+    // must keep their receiver too.
+    if ns == "Promise"
+        && matches!(
+            name,
+            "all" | "race" | "allSettled" | "any" | "resolve" | "reject"
+        )
+    {
+        return None;
+    }
+    // `Array.from` / `Array.of` are `this`-sensitive: per ECMA-262 §23.1.2.1 /
+    // §23.1.2.3 each constructs the result via its `this` value when that is a
+    // constructor (`Array.from.call(C, items)` / `Array.of.call(C, …)` build an
+    // instance of `C`). The `this`-dropping fold below would discard the
+    // receiver, so route these through the dynamic dispatch path (the runtime
+    // thunks read the implicit `this` and run the full algorithm).
+    if ns == "Array" && matches!(name, "from" | "of") {
         return None;
     }
     Some(m.clone())

@@ -48,22 +48,17 @@ pub extern "C" fn js_promise_resolved(value: f64) -> *mut Promise {
     // Issue #586: ECMAScript thenable assimilation. The async-to-generator
     // transform rewrites every `await x` into `Promise.resolve(x).then(...)`
     // — which means thenable assimilation has to happen here, not in the
-    // codegen-side `Expr::Await` lowering. `js_assimilate_thenable` returns
-    // a fresh Promise wrapper that follows the thenable's `.then(resolve,
-    // reject)` callbacks; chain its eventual state into our outer promise
-    // via the same `js_promise_resolve_with_promise` pattern as the real-
-    // Promise arm above. Drizzle's `QueryPromise` (`then` triggers the SQL
-    // round-trip) is the load-bearing motivating case (#488).
-    let assim = js_assimilate_thenable(value);
-    if assim.to_bits() != value.to_bits() && js_value_is_promise(assim) != 0 {
-        let inner = crate::value::js_nanbox_get_pointer(assim) as *mut Promise;
-        if !inner.is_null() && inner != promise {
-            js_promise_resolve_with_promise(promise, inner);
-            return promise;
-        }
-    }
-
-    js_promise_resolve(promise, value);
+    // codegen-side `Expr::Await` lowering. `promise_resolve_assimilating`
+    // implements the spec PromiseResolveThenableJob: a thenable's `.then` is
+    // invoked from a SCHEDULED microtask, never synchronously during resolve.
+    // This matters for `Promise.race`/`Promise.any` over a thenable, where Node
+    // does not call the thenable's `then` until the job runs (so the count of
+    // synchronous `then` invocations stays 0). Primitives (fast path above) and
+    // native Promises (short-circuit above) never reach here, so the per-await
+    // steady state is untouched; only real thenables (drizzle's `QueryPromise`,
+    // object literals with `then`) defer by one microtask — which the await
+    // loop drains, leaving the resolved value identical.
+    super::combinators::promise_resolve_assimilating(promise, value);
     promise
 }
 
@@ -234,6 +229,17 @@ pub extern "C" fn js_async_step_chain(value: f64, step_closure: ClosurePtr) -> *
                     )
                 }
                 PromiseState::Rejected => {
+                    // `await`ing an already-rejected promise delivers its
+                    // reason to this async step (which re-throws it into the
+                    // suspended function body, where a surrounding try/catch
+                    // can catch it) — so the rejection IS handled. The
+                    // Pending arm below routes through `js_promise_then`, which
+                    // marks the rejection handled; this fast path reads the
+                    // reason field directly, so it must mark it explicitly or
+                    // the program-end detector reports a spurious
+                    // "Uncaught (in promise)" for a rejection that `await`
+                    // already consumed (and exits non-zero).
+                    crate::promise::mark_rejection_handled(inner);
                     let reason = unsafe { (*inner).reason };
                     (
                         if can_reuse {
@@ -315,12 +321,58 @@ pub extern "C" fn js_async_step_done(value: f64, step_closure: ClosurePtr) -> *m
     let trap = INLINE_TRAP.with(|c| c.get());
     if !trap.trap_next.is_null() && trap.current_step == step_closure as usize {
         bump(&MT_STEP_DONE_REUSE_HIT);
-        js_promise_resolve(trap.trap_next, value);
+        // Issue #4828: an async fn whose tail is `return <promise>` must
+        // ADOPT the returned promise/thenable's eventual state into its
+        // own result promise (`trap_next`), not store the promise object
+        // as the literal resolution value. The slow path below already
+        // does this via `js_promise_resolved`; the in-place reuse fast
+        // path bypassed it with a raw `js_promise_resolve`, so awaiting
+        // the outer fn yielded the inner Promise object itself (typeof
+        // "object", JSON.stringify === "", every property undefined).
+        // Mirror `js_promise_resolved`'s adoption probes here, but settle
+        // the existing `trap_next` instead of allocating a fresh promise
+        // so the runner's self-chain fast path still fires.
+        resolve_trap_next_with_adoption(trap.trap_next, value);
         trap.trap_next
     } else {
         bump(&MT_STEP_DONE_REUSE_MISS);
         js_promise_resolved(value)
     }
+}
+
+/// Settle `target` with `value`, adopting `value`'s state when it is a
+/// native Promise or an assimilable thenable (ECMAScript "Promise
+/// Resolve Functions" thenable-adoption). Used by the `js_async_step_done`
+/// reuse fast path so `return <promise>` from an async fn unwraps the
+/// inner promise into the outer result promise (Issue #4828). Mirrors the
+/// adoption arms of `js_promise_resolved`, but resolves an existing
+/// `target` rather than constructing a new one.
+fn resolve_trap_next_with_adoption(target: *mut Promise, value: f64) {
+    // Primitives can never be a promise/thenable — settle directly.
+    if is_definitely_primitive(value) {
+        js_promise_resolve(target, value);
+        return;
+    }
+    // Native Promise: chain `target` to follow its eventual state.
+    if js_value_is_promise(value) != 0 {
+        let inner = crate::value::js_nanbox_get_pointer(value) as *mut Promise;
+        if !inner.is_null() && inner != target {
+            js_promise_resolve_with_promise(target, inner);
+            return;
+        }
+    }
+    // User thenable (e.g. Drizzle QueryPromise, #586): assimilate, then
+    // chain the wrapper promise into `target`.
+    let assim = js_assimilate_thenable(value);
+    if assim.to_bits() != value.to_bits() && js_value_is_promise(assim) != 0 {
+        let inner = crate::value::js_nanbox_get_pointer(assim) as *mut Promise;
+        if !inner.is_null() && inner != target {
+            js_promise_resolve_with_promise(target, inner);
+            return;
+        }
+    }
+    // Plain object / non-thenable value: store as-is.
+    js_promise_resolve(target, value);
 }
 
 /// #691 Phase 2 helper. Returns the currently-dispatching step
@@ -587,7 +639,18 @@ fn iterator_value_for_from_async(input: f64) -> Option<f64> {
     if let Some(iter) = crate::array::call_symbol_async_iterator_for_flat_map(input) {
         return Some(iter);
     }
-    crate::array::has_iterator_next(input).then_some(input)
+    if crate::object::is_async_generator_instance_value(input) {
+        return Some(input);
+    }
+    let iter = crate::symbol::js_get_iterator(input);
+    let raw = crate::value::js_nanbox_get_pointer(iter) as usize;
+    if iter.to_bits() != input.to_bits()
+        || crate::array::is_builtin_iterator_class_id(raw)
+        || crate::array::has_iterator_next(iter)
+    {
+        return Some(crate::array::async_from_sync_wrap_iterator(iter));
+    }
+    None
 }
 
 /// `Array.fromAsync(input, mapFn?, thisArg?)` — Node 22+ static method.
