@@ -54,6 +54,17 @@ THRESHOLD="${PERRY_FILE_SIZE_THRESHOLD:-2000}"
 # Allowlist (one file per line; blank lines + `#` comments OK).
 ALLOWLIST=$(cat <<'EOF'
 crates/perry-runtime/src/gc/tests.rs
+# RegExp runtime trunk. Crossed 2000 LOC (2041) when the user's regex engine
+# was gated behind the `regex-engine` cargo feature — the per-fn `#[cfg]`
+# attributes, the no-engine fallbacks, and the `CompiledRegex` header type alias
+# added ~60 lines. The engine itself is already split across the
+# regex/{compile,exec_array,grammar,match_all,replace_expand,replace_fn,escape}
+# submodules; the trunk that remains is the always-compiled identity/display
+# layer (RegExpHeader + accessors + `is_regex_pointer`, referenced by
+# always-linked formatting/dispatch) plus the shared exec/cache state, which
+# can't move without scattering the thread-local last-match state. Further
+# trunk extraction is a reasonable follow-up.
+crates/perry-runtime/src/regex.rs
 crates/perry-codegen-arkts/src/tests.rs
 crates/perry-api-manifest/src/entries.rs
 crates/perry/src/commands/compile.rs
@@ -128,6 +139,13 @@ crates/perry-runtime/src/object/global_this.rs
 # Crossed the limit at 2014 LOC after the #2135 worker_threads
 # value-export arm. Split tracked under #1435.
 crates/perry-runtime/src/object/native_module.rs
+# Per-module native-method dispatch buckets (devirtualization): the old single
+# ~1975-LOC `dispatch_native_module_method` match was split into 37 per-module
+# `nm_dispatch_<bucket>` fns reached through a registry so the linker can
+# dead-strip unimported modules (−20% hello-world __text). The bucket fns repeat
+# the match-arm + closure-prelude shape, so the file grew past 2000; the arms are
+# intentionally kept together (generated, one logical dispatch surface).
+crates/perry-runtime/src/object/native_module_dispatch.rs
 # globalThis constructor/namespace registry; current main crossed the threshold
 # after WebCrypto + DOM/Event global exposure landed. Split tracked under #1435.
 crates/perry-runtime/src/object/global_this.rs

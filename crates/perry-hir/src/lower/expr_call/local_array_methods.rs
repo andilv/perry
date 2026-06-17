@@ -29,6 +29,19 @@ pub(super) fn try_local_array_methods(
             let method_name = method_ident.sym.as_ref();
             if let ast::Expr::Ident(arr_ident) = member.obj.as_ref() {
                 let arr_name = arr_ident.sym.to_string();
+                // #5196: a Proxy-wrapped array routes ALL its method calls
+                // through the proxy member-call path (`ProxyGet` +
+                // `js_native_call_method`), so the method's `this` binds to the
+                // proxy and element reads fire its `get` trap. Folding to the
+                // dense `Expr::Array*` fast paths below would dereference the
+                // proxy id as a real `ArrayHeader` and SIGSEGV. `arr.map`/
+                // `.filter`/`.find` already escaped via the `is_class_instance`
+                // gate (a proxy local is typed `Named("Proxy")`), but
+                // `reduce`/`forEach`/`join`/`sort`/`splice`/… did not — guard
+                // them all here, uniformly, by falling through.
+                if ctx.proxy_locals.contains(&arr_name) {
+                    return Ok(Err(args));
+                }
                 // Check that this is NOT a String type (Array, Set, Map are all OK)
                 // When type is unknown, only enter array block for array-only methods
                 // (push, pop, etc.), NOT for methods shared with strings (indexOf,
@@ -107,6 +120,18 @@ pub(super) fn try_local_array_methods(
                 );
                 let is_unknown_recv =
                     matches!(type_info, None | Some(Type::Any) | Some(Type::Unknown));
+                // #5139: Array-mutator names that a plain object can also own as a
+                // closure-valued property. The runtime's `js_native_call_method`
+                // dispatches all of these correctly on either a real array or a
+                // plain object (see `try_object_arraylike_mutator` + the generic
+                // own-field scan), so for an `any`-typed receiver we defer to it
+                // rather than committing to the array-only fast path. Mirrors the
+                // method set special-cased in
+                // `array::try_object_arraylike_mutator`.
+                let is_arraylike_mutator_method = matches!(
+                    method_name,
+                    "push" | "pop" | "shift" | "unshift" | "reverse" | "splice" | "sort" | "concat"
+                );
                 let is_known_not_string = type_info
                     .map(|ty| !matches!(ty, Type::String | Type::Any | Type::Unknown))
                     .unwrap_or(false)
@@ -155,6 +180,20 @@ pub(super) fn try_local_array_methods(
                     false // type unknown + ambiguous method, skip array block (fall through to general dispatch)
                 } else if is_unknown_recv && is_class_overlapping_method {
                     false // type unknown + method commonly defined on user classes — fall through
+                } else if is_unknown_recv && is_arraylike_mutator_method {
+                    // #5139: type unknown + an Array-mutator name that a plain
+                    // object can legitimately own (`{ push(c) {…} }` passed as
+                    // `any` — e.g. react-dom/server's SSR `destination`). Eagerly
+                    // emitting `Expr::ArrayPush`/etc. reads the object's header as
+                    // an `ArrayHeader` and corrupts it (push returns a bogus length
+                    // and never runs the user method). Fall through to the runtime
+                    // `js_native_call_method` dispatch, which inspects the actual
+                    // receiver shape: real array → dense `js_array_push_f64`; plain
+                    // object with an own callable of this name → that method (this
+                    // case routes via `try_object_arraylike_mutator`, whose
+                    // own-user-method gate returns `None`, then the generic
+                    // own-field scan invokes the closure with `this` = receiver).
+                    false
                 } else {
                     true // type unknown + array-only method (push, pop, etc.), enter array block
                 };

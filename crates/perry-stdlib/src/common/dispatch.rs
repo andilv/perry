@@ -1086,6 +1086,30 @@ pub unsafe extern "C" fn js_handle_method_dispatch(
         }
     }
 
+    // #4975: client-side response (`http.get`/`ClientRequest` `'response'`
+    // callback) is a *distinct* IncomingMessage handle from the server's, and
+    // is registered as an EventEmitter — so `res.on(...)` already routes
+    // through the EventEmitter arm above. But `Readable.pause()`/`.resume()`
+    // aren't EventEmitter methods, the server-IM check above rejects the
+    // client handle, and they fell through to the unknown-handle catch-all
+    // which returns a NaN (`typeof` number). That broke the canonical
+    // `res.resume().on('end', …)` body-drain chain with
+    // `(number).on is not a function` (test-http-write-head-2). Node's
+    // `Readable.pause()/resume()` return `this`; the buffered body already
+    // drains when an `'end'`/`'data'` listener attaches, so returning the
+    // receiver is the whole fix here.
+    #[cfg(feature = "external-http-client-pump")]
+    {
+        extern "C" {
+            fn js_ext_http_client_incoming_message_is_handle(handle: i64) -> i32;
+        }
+        if matches!(method_name, "pause" | "resume")
+            && unsafe { js_ext_http_client_incoming_message_is_handle(handle) } != 0
+        {
+            return nanbox_handle_value(handle);
+        }
+    }
+
     // External net path (v0.5.581): perry-ext-net registers itself when
     // the well-known flip strips bundled-net. Same dispatch contract,
     // but routes through extern "C" symbols perry-ext-net provides.
@@ -1126,7 +1150,7 @@ pub unsafe extern "C" fn js_handle_method_dispatch(
     // `js_native_call_method` → small-handle range check → here. Each helper
     // does its own registry-membership + property-name gate; `None` means
     // "not us, try the next dispatcher or return undefined".
-    #[cfg(feature = "http-client")]
+    #[cfg(feature = "web-fetch")]
     {
         // #1698: Request body methods (`req.json()`/`.text()`/`.arrayBuffer()`)
         // on an any-typed / computed-key receiver. Hono's `HonoRequest.#cachedBody`
@@ -1600,11 +1624,19 @@ unsafe fn dispatch_external_net_socket(handle: i64, method: &str, args: &[f64]) 
         f64::from_bits(0x7FFD_0000_0000_0000u64 | (h as u64 & 0x0000_FFFF_FFFF_FFFF))
     }
     extern "C" {
-        fn js_net_socket_write(handle: i64, buf_ptr: i64);
-        // Issue #1852 — `js_net_socket_end` now takes the optional final
+        // #5021 — route write/end/destroy through perry-ext-net's DISTINCT
+        // `js_ext_net_*` symbols, NOT the shared `js_net_socket_*` names. The
+        // bundled stdlib net exports same-named twins, so in a workspace /
+        // jsruntime build the shared names bind to the bundled twin's EMPTY
+        // socket registry and the command (write bytes / FIN / teardown) is
+        // silently dropped — no `write()` syscall ever fires. The distinct
+        // symbols have no twin and always reach ext-net's own registry.
+        // Mirrors how `js_ext_net_destroy_socket` was already split out (#5010).
+        fn js_ext_net_socket_write(handle: i64, buf_ptr: i64);
+        // Issue #1852 — `js_ext_net_socket_end` takes the optional final
         // chunk (NA_JSV bits) so `socket.end(data)` writes before FIN.
-        fn js_net_socket_end(handle: i64, chunk_bits: i64);
-        fn js_net_socket_destroy(handle: i64);
+        fn js_ext_net_socket_end(handle: i64, chunk_bits: i64);
+        fn js_ext_net_destroy_socket(handle: i64);
         fn js_net_socket_on(handle: i64, event_ptr: i64, cb_ptr: i64);
         fn js_net_socket_method_connect(handle: i64, port: f64, host_ptr: i64);
         fn js_net_socket_upgrade_tls(
@@ -1646,9 +1678,10 @@ unsafe fn dispatch_external_net_socket(handle: i64, method: &str, args: &[f64]) 
     match method {
         "write" if !args.is_empty() => {
             // Issue #1131 — pass the full NaN-box bits, not the
-            // pre-stripped pointer. perry-ext-net's js_net_socket_write
-            // now probes Buffer-vs-string itself.
-            js_net_socket_write(handle, args[0].to_bits() as i64);
+            // pre-stripped pointer. ext-net's write probes Buffer-vs-string
+            // itself. #5021 — distinct symbol so the bytes can't be dropped
+            // into the bundled twin's empty registry.
+            js_ext_net_socket_write(handle, args[0].to_bits() as i64);
             f64::from_bits(0x7FFC_0000_0000_0001)
         }
         "end" => {
@@ -1658,11 +1691,11 @@ unsafe fn dispatch_external_net_socket(handle: i64, method: &str, args: &[f64]) 
                 .first()
                 .copied()
                 .unwrap_or(f64::from_bits(0x7FFC_0000_0000_0001));
-            js_net_socket_end(handle, chunk.to_bits() as i64);
+            js_ext_net_socket_end(handle, chunk.to_bits() as i64);
             f64::from_bits(0x7FFC_0000_0000_0001)
         }
         "destroy" | "destroySoon" => {
-            js_net_socket_destroy(handle);
+            js_ext_net_destroy_socket(handle);
             f64::from_bits(0x7FFC_0000_0000_0001)
         }
         "on" | "addListener" if args.len() >= 2 => {
@@ -2273,6 +2306,75 @@ pub unsafe extern "C" fn js_handle_property_dispatch(
         };
     }
 
+    // #5037 — external-fastify variant of the request/reply property
+    // dispatch above. When the well-known flip routes `fastify` to
+    // perry-ext-fastify (auto-optimize / `--no-default-features`),
+    // `bundled-fastify`/`http-server` are stripped and the bundled
+    // arm above is compiled out. A `request`/`reply` handle that
+    // escaped into a user helper — its static type erased, so codegen
+    // emitted a generic dynamic property read here rather than a
+    // `NativeMethodCall` — then had no dispatch path and read
+    // `undefined` (inline reads in the handler still worked because
+    // codegen recognised the receiver and called `js_fastify_req_*`
+    // directly). The handle lives in perry-ext-fastify's perry-ffi
+    // registry, not perry-stdlib's, so probe membership via the
+    // external `js_ext_fastify_is_context_handle` symbol (resolved at
+    // link time) and forward to the same `js_fastify_req_*` exports
+    // the bundled arm uses. Mirrors the `external-fastify-pump` pump
+    // wiring in `async_bridge.rs`.
+    #[cfg(all(feature = "external-fastify-pump", not(feature = "http-server")))]
+    {
+        extern "C" {
+            fn js_ext_fastify_is_context_handle(handle: i64) -> i32;
+            fn js_fastify_req_query_object(handle: i64) -> f64;
+            fn js_fastify_req_params_object(handle: i64) -> f64;
+            fn js_fastify_req_json(handle: i64) -> f64;
+            fn js_fastify_req_body(handle: i64) -> *mut perry_runtime::StringHeader;
+            fn js_fastify_req_headers(handle: i64) -> i64;
+            fn js_fastify_req_method(handle: i64) -> *mut perry_runtime::StringHeader;
+            fn js_fastify_req_url(handle: i64) -> *mut perry_runtime::StringHeader;
+            fn js_fastify_req_get_user_data(handle: i64) -> f64;
+        }
+        if js_ext_fastify_is_context_handle(handle) != 0 {
+            return match property_name {
+                "query" => js_fastify_req_query_object(handle),
+                "params" => js_fastify_req_params_object(handle),
+                "body" => js_fastify_req_json(handle),
+                "rawBody" | "text" => {
+                    let ptr = js_fastify_req_body(handle);
+                    if ptr.is_null() {
+                        f64::from_bits(0x7FFC_0000_0000_0001)
+                    } else {
+                        f64::from_bits(perry_runtime::JSValue::string_ptr(ptr).bits())
+                    }
+                }
+                "headers" => {
+                    // Returns NaN-boxed JS object bits — use directly.
+                    let bits = js_fastify_req_headers(handle);
+                    f64::from_bits(bits as u64)
+                }
+                "method" => {
+                    let ptr = js_fastify_req_method(handle);
+                    if ptr.is_null() {
+                        f64::from_bits(0x7FFC_0000_0000_0001)
+                    } else {
+                        f64::from_bits(perry_runtime::JSValue::string_ptr(ptr).bits())
+                    }
+                }
+                "url" => {
+                    let ptr = js_fastify_req_url(handle);
+                    if ptr.is_null() {
+                        f64::from_bits(0x7FFC_0000_0000_0001)
+                    } else {
+                        f64::from_bits(perry_runtime::JSValue::string_ptr(ptr).bits())
+                    }
+                }
+                "user" => js_fastify_req_get_user_data(handle),
+                _ => f64::from_bits(0x7FFC_0000_0000_0001), // undefined
+            };
+        }
+    }
+
     // Issue #340: axios response — dispatch `r.status` / `r.data` /
     // `r.statusText` / `r.headers` to the AxiosResponseHandle accessor
     // shims. The handle id is registered in the common HANDLES
@@ -2335,8 +2437,8 @@ pub unsafe extern "C" fn js_handle_property_dispatch(
     // Each helper does its own registry-membership check; the order matches the
     // observed property-name disjointness (`url` / `method` only on Request,
     // `status` / `ok` only on Response, etc.). First match wins.
-    // Gated on `http-client` because fetch.rs itself is gated on that feature.
-    #[cfg(feature = "http-client")]
+    // Gated on `web-fetch` because fetch.rs itself is gated on that feature (#5174).
+    #[cfg(feature = "web-fetch")]
     {
         if let Some(v) = crate::fetch::dispatch_request_property(handle as usize, property_name) {
             return v;
@@ -3035,7 +3137,7 @@ pub unsafe extern "C" fn js_stdlib_init_dispatch() {
             f: unsafe extern "C" fn(i64) -> bool,
         );
         fn js_register_event_emitter_on(f: EventEmitterOn);
-        #[cfg(feature = "http-client")]
+        #[cfg(feature = "web-fetch")]
         fn js_register_global_fetch_with_options(
             f: unsafe extern "C" fn(
                 *const perry_runtime::StringHeader,
@@ -3044,7 +3146,7 @@ pub unsafe extern "C" fn js_stdlib_init_dispatch() {
                 *const perry_runtime::StringHeader,
             ) -> *mut perry_runtime::Promise,
         );
-        #[cfg(feature = "http-client")]
+        #[cfg(feature = "web-fetch")]
         fn js_register_global_fetch_constructors(
             blob_new: unsafe extern "C" fn(f64, f64) -> f64,
             file_new: unsafe extern "C" fn(f64, f64, f64, f64) -> f64,
@@ -3084,8 +3186,13 @@ pub unsafe extern "C" fn js_stdlib_init_dispatch() {
             ) -> f64,
             response_static_error: extern "C" fn() -> f64,
         );
-        #[cfg(feature = "http-client")]
+        #[cfg(feature = "web-fetch")]
         fn js_register_global_fetch_body_init_ptr(f: extern "C" fn(f64) -> i64);
+        // #4965: Headers → `res.setHeaders` entries-JSON producer.
+        #[cfg(feature = "http-client")]
+        fn js_register_global_headers_entries_json(
+            f: extern "C" fn(f64) -> *mut perry_runtime::StringHeader,
+        );
         fn js_register_worker_threads_namespace_getters(
             worker_data: extern "C" fn() -> f64,
             is_main_thread: extern "C" fn() -> f64,
@@ -3104,9 +3211,9 @@ pub unsafe extern "C" fn js_stdlib_init_dispatch() {
     js_register_handle_own_property_names_dispatch(js_handle_own_property_names_dispatch);
     js_register_handle_prototype_dispatch(js_handle_prototype_dispatch);
     crate::string_decoder::string_decoder_prototype_value();
-    #[cfg(feature = "http-client")]
+    #[cfg(feature = "web-fetch")]
     js_register_global_fetch_with_options(crate::fetch::js_fetch_with_options);
-    #[cfg(feature = "http-client")]
+    #[cfg(feature = "web-fetch")]
     js_register_global_fetch_constructors(
         crate::fetch_blob::js_blob_new,
         crate::fetch_blob::js_file_new,
@@ -3118,8 +3225,10 @@ pub unsafe extern "C" fn js_stdlib_init_dispatch() {
         crate::fetch::js_response_static_redirect,
         crate::fetch::js_response_static_error,
     );
-    #[cfg(feature = "http-client")]
+    #[cfg(feature = "web-fetch")]
     js_register_global_fetch_body_init_ptr(crate::fetch::js_response_body_init_ptr);
+    #[cfg(feature = "http-client")]
+    js_register_global_headers_entries_json(crate::fetch::js_headers_setheaders_entries_json);
     // Probe / `on` hook / constructor all route through the shared
     // `extern "C"` events surface declared above dispatch_event_emitter_method
     // (#4995): the linker resolves them to whichever EventEmitter impl is in

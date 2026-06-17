@@ -2,7 +2,7 @@
 
 This page is auto-generated from Perry's compile-time API manifest (`perry-api-manifest::API_MANIFEST`). It is the source of truth for what `perry compile` accepts; references to symbols not listed here produce `R005 UnimplementedApi` (issue #463). Stubs (#464) are flagged ⚠ — they link cleanly but no-op at runtime on the chosen target.
 
-Total: 2802 entries across 115 modules.
+Total: 2808 entries across 115 modules.
 
 ## Modules
 
@@ -394,6 +394,8 @@ Total: 2802 entries across 115 modules.
 ### Methods
 
 - `action` — instance
+- `args` — instance
+- `argument` — instance
 - `command` — instance
 - `description` — instance
 - `name` — instance
@@ -402,6 +404,10 @@ Total: 2802 entries across 115 modules.
 - `parse` — instance
 - `requiredOption` — instance
 - `version` — instance
+
+### Properties
+
+- `args`
 
 ## `console`
 
@@ -3519,9 +3525,12 @@ Total: 2802 entries across 115 modules.
 ### Methods
 
 - `v1` — module
+- `v3` — module
 - `v4` — module
+- `v5` — module
 - `v7` — module
 - `validate` — module
+- `version` — module
 
 ## `v8`
 

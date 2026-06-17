@@ -801,7 +801,12 @@ extern "C" fn process_report_function_write_report(
     let filename = module_value_to_string(file_arg)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(process_report_default_filename);
+    // OFF stub: unreachable in practice (the compiler enables `diagnostics`
+    // whenever a program references `process.report`).
+    #[cfg(feature = "diagnostics")]
     let report_json = process_report_json_string("API", Some(&filename));
+    #[cfg(not(feature = "diagnostics"))]
+    let report_json = String::from("{}");
     if let Err(err) = std::fs::write(&filename, report_json) {
         crate::fs::validate::throw_type_error_with_code(
             &format!("Failed to write diagnostic report to {filename}: {err}"),
@@ -1282,6 +1287,7 @@ fn node_platform_name() -> &'static str {
     }
 }
 
+#[cfg(feature = "diagnostics")]
 fn process_report_json_string(trigger: &str, filename: Option<&str>) -> String {
     let args: Vec<String> = std::env::args().collect();
     let command_line = if args.is_empty() {
@@ -2538,6 +2544,20 @@ fn find_nearest_package_json(specifier: &str, base: &str) -> Option<String> {
             None => return None,
         }
     }
+}
+
+/// Devirt codegen entry for `process.getBuiltinModule(...)`. Arms the install-all
+/// hook (so the dynamically-resolved namespace can dispatch methods) and
+/// delegates. Codegen targets THIS symbol, so `js_nm_enable_install_all` — and
+/// thus the all-buckets `js_nm_install_all` — is referenced only by programs
+/// whose source actually calls `getBuiltinModule`. The plain
+/// `js_process_get_builtin_module` (pinned by the runtime process method table in
+/// every program) stays free of that reference, preserving per-module stripping.
+#[no_mangle]
+pub extern "C" fn js_process_get_builtin_module_devirt(id: f64) -> f64 {
+    crate::object::js_nm_enable_install_all();
+    crate::node_submodules::js_node_submod_enable_install_all();
+    js_process_get_builtin_module(id)
 }
 
 /// process.getBuiltinModule(id) -> module namespace | undefined

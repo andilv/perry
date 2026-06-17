@@ -51,10 +51,10 @@ mod string_pool;
 
 pub use helpers::resolve_target_triple;
 pub(crate) use helpers::{default_target_triple, write_barriers_enabled};
-pub(crate) use opts::CrossModuleCtx;
 pub use opts::{
     AppMetadata, CompileOptions, FpContractMode, ImportedClass, NamespaceEntry, NamespaceEntryKind,
 };
+pub(crate) use opts::{CrossModuleCtx, ImportedCtor};
 
 use artifacts::{emit_module_artifacts, ModuleArtifactsCtx};
 use function::compile_function;
@@ -131,6 +131,15 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
     // becomes part of every emitted global so multi-module programs
     // don't collide on `.str.0.handle`.
     let mut strings = StringPool::with_prefix(module_prefix.clone());
+    // #5247: install per-module source-location context for the dynamic
+    // call-dispatch throw path, but only under `--debug-symbols` (which sets
+    // `opts.debug_locations` + `opts.module_source`). Off by default — no
+    // source clone, no per-call emission.
+    if opts.debug_locations {
+        if let Some(src) = opts.module_source.clone() {
+            strings.set_debug_location_ctx(Some((hir.name.clone(), src)));
+        }
+    }
 
     // Class lookup table for `Expr::New`. Indexed by class name —
     // the HIR has unique names per module.
@@ -1063,7 +1072,12 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
                 let ctor_name = format!("{}__{}_constructor", ic.source_prefix, ic.name);
                 (
                     effective_name.to_string(),
-                    (ctor_name, ic.constructor_param_count),
+                    ImportedCtor {
+                        symbol: ctor_name,
+                        param_count: ic.constructor_param_count,
+                        has_own_constructor: ic.has_own_constructor,
+                        has_instance_fields: ic.has_instance_fields,
+                    },
                 )
             })
             .collect(),

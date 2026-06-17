@@ -725,6 +725,28 @@ unsafe fn date_inspect_string(value: f64) -> String {
         .to_string()
 }
 
+/// `util.inspect` arm for a Temporal cell: `Temporal.X <iso>` (or
+/// `[object Object]` if the cell can't be read). Returns `None` when `addr` is
+/// not a Temporal cell, so the caller's `else if let Some(..)` chain falls
+/// through. Cfg-paired: with the Temporal engine gated off no cell can exist, so
+/// the off twin is a constant `None` (and doesn't reference the gated module).
+#[cfg(feature = "temporal")]
+fn temporal_inspect_arm(addr: usize, value: f64) -> Option<String> {
+    if crate::temporal::is_temporal_cell_addr(addr) {
+        Some(
+            crate::temporal::temporal_inspect_string(value)
+                .unwrap_or_else(|| "[object Object]".to_string()),
+        )
+    } else {
+        None
+    }
+}
+
+#[cfg(not(feature = "temporal"))]
+fn temporal_inspect_arm(_addr: usize, _value: f64) -> Option<String> {
+    None
+}
+
 /// Print multiple values from an array (console.log with spread support)
 /// Takes a pointer to an ArrayHeader containing f64 values
 /// Helper function to format a JSValue as a string (for spread arrays)
@@ -819,12 +841,11 @@ pub(crate) fn format_jsvalue(value: f64, depth: usize) -> String {
                 // `Invalid Date`). Handle before the GC-header object dispatch
                 // below, which would deref the 8-byte cell as an ObjectHeader.
                 date_inspect_string(value)
-            } else if crate::temporal::is_temporal_cell_addr(ptr as usize) {
+            } else if let Some(s) = temporal_inspect_arm(ptr as usize, value) {
                 // Temporal (#4686): `util.inspect` prints `Temporal.Duration
                 // <P1Y…>`. Handle before the GC-header object dispatch (the cell
                 // is smaller than an ObjectHeader).
-                crate::temporal::temporal_inspect_string(value)
-                    .unwrap_or_else(|| "[object Object]".to_string())
+                s
             } else if crate::value::addr_class::is_handle_band(ptr as usize) {
                 // Refs #421: Web Fetch (and other) handles are NaN-boxed
                 // POINTER_TAG values whose payload is a small registry id, NOT
@@ -1265,6 +1286,10 @@ unsafe fn format_object_as_json(
     }
 
     let boxed_base = boxed_primitives::boxed_primitive_base_for_object(obj_ptr);
+    // A boxed `String` exposes its characters as integer-index own properties
+    // (`"0".."len-1"`). Node folds those into the `[String: '…']` base and never
+    // lists them in the `{ … }` body — only extra own keys appear. Skip them.
+    let boxed_string_char_count = boxed_primitives::boxed_string_char_index_count(obj_ptr);
     let class_name = {
         let class_id = (*obj_ptr).class_id;
         if class_id == 0 {
@@ -1279,11 +1304,31 @@ unsafe fn format_object_as_json(
     } else {
         class_name.as_deref()
     };
+    // Node prefixes a null-prototype object with `[Object: null prototype]`
+    // (e.g. `Object.create(null)`), since it has no constructor to name.
+    // The flag is set at allocation by `js_object_alloc_null_proto`.
+    let is_null_proto = {
+        let gc =
+            (obj_ptr as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
+        (*gc)._reserved & crate::gc::OBJ_FLAG_NULL_PROTO != 0
+    };
+    // The display prefix before the `{ … }` body: a real class/constructor
+    // name when present, otherwise `[Object: null prototype]` for a
+    // null-proto plain object, otherwise nothing. (Distinct from
+    // `class_name_ref`/`has_class_name`, which drive the private-field skip
+    // and must reflect only a genuine class.)
+    let name_prefix: Option<String> = match class_name_ref {
+        Some(name) => Some(name.to_string()),
+        None if boxed_base.is_none() && is_null_proto => {
+            Some("[Object: null prototype]".to_string())
+        }
+        None => None,
+    };
     let empty_object = || {
         if let Some(base) = boxed_base.as_deref() {
             return base.to_string();
         }
-        match class_name_ref {
+        match name_prefix.as_deref() {
             Some(name) => format!("{name} {{}}"),
             None => "{}".to_string(),
         }
@@ -1330,6 +1375,16 @@ unsafe fn format_object_as_json(
         // Node's util.inspect never exposes them, even with showHidden.
         if has_class_name && key_str.starts_with('#') {
             continue;
+        }
+
+        // Hide a boxed String's character index properties (`"0".."len-1"`):
+        // they are rendered by the `[String: '…']` base, not the body.
+        if let Some(char_count) = boxed_string_char_count {
+            if let Ok(idx) = key_str.parse::<usize>() {
+                if idx < char_count {
+                    continue;
+                }
+            }
         }
 
         let is_enumerable = if descriptors_in_use {
@@ -1398,7 +1453,7 @@ unsafe fn format_object_as_json(
     if parts.is_empty() {
         return empty_object();
     }
-    let single_line = match (boxed_base.as_deref(), class_name_ref) {
+    let single_line = match (boxed_base.as_deref(), name_prefix.as_deref()) {
         (Some(base), _) => format!("{} {{ {} }}", base, parts.join(", ")),
         (None, Some(name)) => format!("{} {{ {} }}", name, parts.join(", ")),
         (None, None) => format!("{{ {} }}", parts.join(", ")),
@@ -1425,7 +1480,7 @@ unsafe fn format_object_as_json(
         .map(|p| format!("{}{}", indent, p.replace('\n', "\n  ")))
         .collect::<Vec<_>>()
         .join(",\n");
-    match (boxed_base.as_deref(), class_name_ref) {
+    match (boxed_base.as_deref(), name_prefix.as_deref()) {
         (Some(base), _) => format!("{} {{\n{}\n}}", base, body),
         (None, Some(name)) => format!("{} {{\n{}\n}}", name, body),
         (None, None) => format!("{{\n{}\n}}", body),
@@ -1526,10 +1581,9 @@ fn format_jsvalue_for_json(value: f64, depth: usize) -> String {
                     // unquoted (or `Invalid Date`), not the 8-byte cell deref'd
                     // as an object.
                     date_inspect_string(value)
-                } else if crate::temporal::is_temporal_cell_addr(ptr as usize) {
+                } else if let Some(s) = temporal_inspect_arm(ptr as usize, value) {
                     // Temporal value inside an inspected object → `Temporal.X <iso>`.
-                    crate::temporal::temporal_inspect_string(value)
-                        .unwrap_or_else(|| "[object Object]".to_string())
+                    s
                 } else if crate::value::addr_class::is_handle_band(ptr as usize) {
                     "[object Object]".to_string()
                 } else if crate::symbol::is_registered_symbol(ptr as usize)

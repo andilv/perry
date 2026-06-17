@@ -3,6 +3,17 @@ use super::*;
 /// Type ID constant for Buffer/Uint8Array - matches class_id 0xFFFF0004
 pub const BUFFER_TYPE_ID: u32 = 0xFFFF0004;
 
+/// #5067 — throw a catchable `RangeError: Array buffer allocation failed`
+/// (Node/V8's message) when a buffer backing block cannot be allocated,
+/// rather than aborting the process.
+#[cold]
+fn throw_buffer_alloc_failed() -> ! {
+    let msg = b"Array buffer allocation failed";
+    let s = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
+    let err = crate::error::js_rangeerror_new(s);
+    crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64))
+}
+
 /// Buffer header - similar to StringHeader but specifically for binary data
 /// NOTE: Layout must match ArrayHeader (length at offset 0, capacity at offset 4)
 /// because the codegen treats Uint8Array like arrays with hardcoded offsets.
@@ -217,11 +228,20 @@ fn buffer_alloc_small(capacity: u32) -> *mut BufferHeader {
     let needed = std::mem::size_of::<BufferHeader>() + capacity as usize;
     // Round up to 8-byte boundary so every header is naturally aligned.
     let aligned = (needed + 7) & !7;
+    // #5226: reserve an extra `GC_HEADER_SIZE` per buffer for a zeroed sentinel
+    // that precedes the returned pointer (see the `write_bytes` below). Buffers
+    // are off-GC-heap with no real `GcHeader`, but the runtime is littered with
+    // `*(ptr - GC_HEADER_SIZE)` obj_type probes (Promise / Date / Array / class
+    // dispatch). Without the sentinel the back-read crosses outside the slab —
+    // into the unmapped page before a freshly mapped block for the first buffer
+    // — and segfaults. A `0` sentinel matches no `GC_TYPE_*`, so every probe
+    // cleanly classifies the buffer as "not my type".
+    let slot = crate::gc::GC_HEADER_SIZE + aligned;
 
     SMALL_BUF_SLAB.with(|slab_ref| {
         let mut slab = slab_ref.borrow_mut();
 
-        if slab.current + aligned > slab.end {
+        if slab.current + slot > slab.end {
             // Current block exhausted (or first call): allocate a fresh slab.
             let layout = Layout::from_size_align(SLAB_CAPACITY, 8).unwrap();
             let block = unsafe { alloc(layout) };
@@ -238,8 +258,15 @@ fn buffer_alloc_small(capacity: u32) -> *mut BufferHeader {
             slab.end = block_end;
         }
 
-        let ptr = slab.current as *mut BufferHeader;
-        slab.current += aligned;
+        // Zero the 8-byte sentinel, then hand out the pointer just past it. The
+        // sentinel always lands inside the slab block, so `ptr - GC_HEADER_SIZE`
+        // is a mapped read; `is_registered_buffer`'s slab-range check still
+        // covers `ptr` (it stays within `[block_start, block_end)`).
+        let ptr = unsafe {
+            std::ptr::write_bytes(slab.current as *mut u8, 0, crate::gc::GC_HEADER_SIZE);
+            (slab.current + crate::gc::GC_HEADER_SIZE) as *mut BufferHeader
+        };
+        slab.current += slot;
 
         unsafe {
             (*ptr).length = 0;
@@ -527,12 +554,20 @@ pub fn buffer_alloc(capacity: u32) -> *mut BufferHeader {
         register_buffer(ptr);
         return ptr;
     }
-    let layout = buffer_layout(capacity as usize);
+    // #5226: mid-size buffers are raw-`alloc`'d off the GC heap. Reserve a
+    // zeroed `GC_HEADER_SIZE` sentinel before the returned pointer so the
+    // runtime's `*(ptr - GC_HEADER_SIZE)` obj_type probes read a mapped `0`
+    // (matching no `GC_TYPE_*`) instead of faulting at a region boundary.
+    let inner = buffer_layout(capacity as usize);
+    let layout = Layout::from_size_align(crate::gc::GC_HEADER_SIZE + inner.size(), 8).unwrap();
     unsafe {
-        let ptr = alloc(layout) as *mut BufferHeader;
-        if ptr.is_null() {
-            panic!("Failed to allocate buffer");
+        let raw = alloc(layout);
+        if raw.is_null() {
+            // #5067 — surface a catchable `RangeError` instead of aborting.
+            throw_buffer_alloc_failed();
         }
+        std::ptr::write_bytes(raw, 0, crate::gc::GC_HEADER_SIZE);
+        let ptr = raw.add(crate::gc::GC_HEADER_SIZE) as *mut BufferHeader;
         (*ptr).length = 0;
         (*ptr).capacity = capacity;
         register_buffer(ptr);

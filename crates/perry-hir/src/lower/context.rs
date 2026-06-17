@@ -48,7 +48,7 @@ impl LoweringContext {
             next_type_alias_id: 0,
             tagged_template_site_salt,
             next_tagged_template_site_id: 0,
-            locals: Vec::new(),
+            locals: crate::lower::Locals::new(),
             globals: Vec::new(),
             functions: Vec::new(),
             func_defaults: Vec::new(),
@@ -155,6 +155,7 @@ impl LoweringContext {
             is_external_module: false,
             optional_require_try_depth: 0,
             fn_ctor_env: super::fn_ctor_env::FnCtorEnv::default(),
+            expr_lower_depth: 0,
         }
     }
 
@@ -704,15 +705,25 @@ impl LoweringContext {
     }
 
     pub(crate) fn lookup_local(&self, name: &str) -> Option<LocalId> {
-        self.locals
-            .iter()
-            .rev()
-            .find(|(n, _, _)| n == name)
-            .map(|(_, id, _)| *id)
+        self.locals.lookup(name)
     }
 
     fn lookup_local_index(&self, name: &str) -> Option<usize> {
-        self.locals.iter().rposition(|(n, _, _)| n == name)
+        self.locals.lookup_index(name)
+    }
+
+    /// #5216: drop the most-recently-bound local named `name` (if any), e.g. a
+    /// module-var the top-level pre-scan registered for `const ns =
+    /// require("<native>")`. After this, a bare read of `name` resolves to its
+    /// native-module / builtin-alias registration instead of an
+    /// always-`undefined` `LocalGet`, matching how `import * as ns` (which
+    /// never creates a local) behaves. Returns the removed `LocalId`.
+    pub(crate) fn remove_local_binding(&mut self, name: &str) -> Option<LocalId> {
+        let idx = self.lookup_local_index(name)?;
+        let (_, id, _) = self.locals.remove(idx);
+        self.pre_registered_module_vars.remove(name);
+        self.pre_registered_module_var_decls.remove(name);
+        Some(id)
     }
 
     pub(crate) fn push_with_env(&mut self, local_id: LocalId) {
@@ -747,11 +758,7 @@ impl LoweringContext {
     }
 
     pub(crate) fn lookup_local_type(&self, name: &str) -> Option<&Type> {
-        self.locals
-            .iter()
-            .rev()
-            .find(|(n, _, _)| n == name)
-            .map(|(_, _, ty)| ty)
+        self.locals.lookup_type(name)
     }
 
     pub(crate) fn lookup_func(&self, name: &str) -> Option<FuncId> {
@@ -1065,6 +1072,19 @@ impl LoweringContext {
         module_name: String,
         class_name: String,
     ) {
+        // #5137: if the user opted this package into `perry.compilePackages`,
+        // its real npm source is being compiled and the binding resolves to
+        // the compiled-from-source class. Registering a native instance here
+        // would re-route the instance's fluent methods (`new Command()` →
+        // `.name()`/`.option()`/`.parse()`) to the `js_commander_*` native
+        // shim that was deliberately kept off the import path — so the call
+        // emits an FFI reference the source-compile build never links (or, in
+        // a shimless build, returns `undefined`). Back off so the source class
+        // is used. `is_native_module` already makes the same back-off for the
+        // import-resolution side (#665).
+        if is_compile_package_override(&module_name) {
+            return;
+        }
         self.native_instances
             .push((local_name, module_name, class_name));
     }
@@ -1214,7 +1234,7 @@ impl LoweringContext {
         self.scope_local_marks.pop();
         if self.locals.len() > mark.0 {
             let mut kept: Vec<(String, LocalId, Type)> = Vec::new();
-            for entry in self.locals.drain(mark.0..) {
+            for entry in self.locals.drain_from(mark.0) {
                 if self.sloppy_implicit_global_ids.contains(&entry.1) {
                     kept.push(entry);
                 }
@@ -1271,7 +1291,7 @@ impl LoweringContext {
         // module-scoped bindings too — keep them visible after the block.
         if self.locals.len() > locals_mark {
             let mut kept: Vec<(String, LocalId, Type)> = Vec::new();
-            for entry in self.locals.drain(locals_mark..) {
+            for entry in self.locals.drain_from(locals_mark) {
                 if self.var_hoisted_ids.contains(&entry.1)
                     || self.sloppy_implicit_global_ids.contains(&entry.1)
                 {

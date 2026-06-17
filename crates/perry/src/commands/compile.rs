@@ -26,6 +26,7 @@ mod bundle_ios;
 mod cjs_wrap;
 mod codegen_steps;
 mod collect_modules;
+mod compressed_libs;
 mod env_fold;
 mod harmonyos_shim;
 mod host_config;
@@ -90,8 +91,8 @@ pub(crate) use resolve::validate_native_library_manifest_value;
 use resolve::{
     cached_resolve_import, compute_module_prefix, declaration_sidecar_for_resolved_import,
     extract_compile_package_dir, has_perry_native_library, is_declaration_file,
-    is_in_compile_package, is_in_perry_native_package, is_js_file, parse_native_library_manifest,
-    parse_package_specifier, resolve_import,
+    is_in_compile_package, is_in_perry_native_package, is_js_file, is_recognized_text_asset,
+    parse_native_library_manifest, parse_package_specifier, resolve_import,
 };
 use strip_dedup::{
     dedup_native_lib_for_tier3, dedup_runtime_for_tier3, dedup_stdlib_for_tier3,
@@ -1703,6 +1704,7 @@ pub fn run_with_parse_cache(
                 | Some("visionos")
                 | Some("visionos-simulator")
                 | Some("android")
+                | Some("wearos")
                 | Some("watchos")
                 | Some("watchos-simulator")
                 | Some("tvos")
@@ -2563,6 +2565,8 @@ pub fn run_with_parse_cache(
                                             .as_ref()
                                             .map(|c| c.params.len())
                                             .unwrap_or(0),
+                                        has_own_constructor: class.constructor.is_some(),
+                                        has_instance_fields: !class.fields.is_empty(),
                                         method_names: class
                                             .methods
                                             .iter()
@@ -2757,6 +2761,8 @@ pub fn run_with_parse_cache(
                                                 .as_ref()
                                                 .map(|c| c.params.len())
                                                 .unwrap_or(0),
+                                            has_own_constructor: class.constructor.is_some(),
+                                            has_instance_fields: !class.fields.is_empty(),
                                             method_names: class
                                                 .methods
                                                 .iter()
@@ -3003,6 +3009,8 @@ pub fn run_with_parse_cache(
                                     .as_ref()
                                     .map(|c| c.params.len())
                                     .unwrap_or(0),
+                                has_own_constructor: class.constructor.is_some(),
+                                has_instance_fields: !class.fields.is_empty(),
                                 method_names: class
                                     .methods
                                     .iter()
@@ -3067,6 +3075,8 @@ pub fn run_with_parse_cache(
                                 .as_ref()
                                 .map(|c| c.params.len())
                                 .unwrap_or(0),
+                            has_own_constructor: class.constructor.is_some(),
+                            has_instance_fields: !class.fields.is_empty(),
                             method_names: class.methods.iter().map(|m| m.name.clone()).collect(),
                             method_param_counts: class
                                 .methods
@@ -3218,6 +3228,8 @@ pub fn run_with_parse_cache(
                                 .as_ref()
                                 .map(|c| c.params.len())
                                 .unwrap_or(0),
+                            has_own_constructor: class.constructor.is_some(),
+                            has_instance_fields: !class.fields.is_empty(),
                             method_names: class.methods.iter().map(|m| m.name.clone()).collect(),
                             method_param_counts: class
                                 .methods
@@ -3676,6 +3688,8 @@ pub fn run_with_parse_cache(
                                 .as_ref()
                                 .map(|c| c.params.len())
                                 .unwrap_or(0),
+                            has_own_constructor: class.constructor.is_some(),
+                            has_instance_fields: !class.fields.is_empty(),
                             method_names: class.methods.iter().map(|m| m.name.clone()).collect(),
                             method_param_counts: class
                                 .methods
@@ -3868,6 +3882,8 @@ pub fn run_with_parse_cache(
                                 .as_ref()
                                 .map(|c| c.params.len())
                                 .unwrap_or(0),
+                            has_own_constructor: class.constructor.is_some(),
+                            has_instance_fields: !class.fields.is_empty(),
                             method_names: class.methods.iter().map(|m| m.name.clone()).collect(),
                             method_param_counts: class
                                 .methods
@@ -4015,6 +4031,17 @@ pub fn run_with_parse_cache(
                 // alone is insufficient because it's empty when the
                 // target has no `export` statements.
                 is_dynamic_import_target: dyn_target_paths.contains(path),
+                // #5247: source-location tracking for the dynamic call-dispatch
+                // throw path. Gated by `--debug-symbols` so the default build is
+                // unchanged (no source read, no per-call emission). When on, read
+                // the module's original source so codegen can map a Call's byte
+                // offset to a 1-based line.
+                debug_locations: args.debug_symbols,
+                module_source: if args.debug_symbols {
+                    std::fs::read_to_string(path).ok()
+                } else {
+                    None
+                },
             };
             // V2.2 + #686 object cache lookup. The key hashes every
             // codegen-affecting field of `opts` together with this
@@ -4499,7 +4526,7 @@ pub fn run_with_parse_cache(
         }
         // Platform detection for nm tool and symbol prefix
         let _is_ios = matches!(target.as_deref(), Some("ios-simulator") | Some("ios"));
-        let is_android = matches!(target.as_deref(), Some("android"));
+        let is_android = matches!(target.as_deref(), Some("android") | Some("wearos"));
         let is_harmonyos = matches!(
             target.as_deref(),
             Some("harmonyos") | Some("harmonyos-simulator")
@@ -5051,7 +5078,7 @@ pub fn run_with_parse_cache(
         target.as_deref(),
         Some("visionos-simulator") | Some("visionos")
     );
-    let is_android = matches!(target.as_deref(), Some("android"));
+    let is_android = matches!(target.as_deref(), Some("android") | Some("wearos"));
     let is_harmonyos = matches!(
         target.as_deref(),
         Some("harmonyos") | Some("harmonyos-simulator")
@@ -5745,6 +5772,16 @@ pub fn run_with_parse_cache(
 
     cleanup_intermediates(args.keep_intermediates, &obj_cleanup_paths);
 
+    // #5206 / #5230: visible end-of-compile notice listing every
+    // ahead-of-time-unsupported site that was compiled to a deferred runtime
+    // error instead of blocking the build — runtime-unknown `eval(...)` /
+    // `new Function(<dynamic body>)` and non-resolvable dynamic `import(...)`.
+    // Strict mode (`--strict-eval` / `--strict-dynamic-import` / `perry.eval =
+    // "error"` / `perry.dynamicImport = "error"` / `perry.strict`) never reaches
+    // here for a covered site — it fails the build earlier. Text format only
+    // (JSON consumers get a clean machine-readable result on stdout).
+    print_deferred_eval_notice(format);
+
     let final_output_path = result_app_dir.unwrap_or(exe_path);
     let codegen_cache_stats = summarize_codegen_cache_stats(&object_cache);
 
@@ -5757,6 +5794,50 @@ pub fn run_with_parse_cache(
         link_cache_stats: Some(link_cache_status.stats()),
         build_cache_stats: Some(build_cache_stats),
     })
+}
+
+/// #5206 / #5230: print the end-of-compile notice for ahead-of-time-unsupported
+/// sites (runtime-unknown `eval(...)` / `new Function(...)`, and non-resolvable
+/// dynamic `import(...)`) that were compiled to deferred runtime errors. Drains
+/// the shared process-global sink (so re-running a compile in the same process
+/// starts fresh) and prints a single stand-out block. No-op when there are no
+/// such sites or for JSON output.
+fn print_deferred_eval_notice(format: OutputFormat) {
+    let sites = perry_hir::take_deferred_eval_sites();
+    if sites.is_empty() || !matches!(format, OutputFormat::Text) {
+        return;
+    }
+    // Sort for deterministic output (kind then location).
+    let mut sites = sites;
+    sites.sort_by(|a, b| (&a.kind, &a.location).cmp(&(&b.kind, &b.location)));
+    let n = sites.len();
+    let plural = if n == 1 { "site" } else { "sites" };
+    // ANSI yellow + bold so the notice stands out from the surrounding build
+    // log; degrade to plain text when stderr isn't a TTY.
+    let tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let (y, b, r) = if tty {
+        ("\x1b[33m", "\x1b[1m", "\x1b[0m")
+    } else {
+        ("", "", "")
+    };
+    eprintln!();
+    eprintln!(
+        "{y}{b}notice:{r}{y} {n} ahead-of-time-unsupported {plural} compiled to a deferred runtime error (throws only if reached):{r}"
+    );
+    // Align the locations into a column for readability.
+    let kind_width = sites.iter().map(|s| s.kind.len()).max().unwrap_or(0);
+    for s in &sites {
+        eprintln!(
+            "  - {:<width$}   {}",
+            s.kind,
+            s.location,
+            width = kind_width
+        );
+    }
+    eprintln!(
+        "  Pass {b}--strict-eval{r}/{b}--strict-dynamic-import{r} (or set {b}perry.strict = true{r}) to make these a compile-time error instead."
+    );
+    eprintln!();
 }
 
 #[cfg(test)]

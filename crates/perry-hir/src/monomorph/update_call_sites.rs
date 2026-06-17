@@ -135,6 +135,7 @@ fn update_call_sites_in_expr(
             callee,
             args,
             type_args,
+            ..
         } => {
             // First update the callee and args recursively
             update_call_sites_in_expr(callee, ctx, lookup);
@@ -175,6 +176,7 @@ fn update_call_sites_in_expr(
             class_name,
             args,
             type_args,
+            ..
         } => {
             for arg in args.iter_mut() {
                 update_call_sites_in_expr(arg, ctx, lookup);
@@ -495,6 +497,8 @@ fn update_call_sites_in_expr(
         Expr::MathFloor(expr)
         | Expr::MathCeil(expr)
         | Expr::MathRound(expr)
+        | Expr::MathTrunc(expr)
+        | Expr::MathSign(expr)
         | Expr::MathAbs(expr)
         | Expr::MathSqrt(expr)
         | Expr::MathLog(expr)

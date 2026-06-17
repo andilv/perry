@@ -42,12 +42,12 @@ pub use self::from_concat::{
 };
 pub use self::generic::array_proto_mutator;
 pub use self::generic::{
-    js_arraylike_at, js_arraylike_concat, js_arraylike_every, js_arraylike_filter,
-    js_arraylike_find, js_arraylike_findIndex, js_arraylike_findLast, js_arraylike_findLastIndex,
-    js_arraylike_forEach, js_arraylike_includes, js_arraylike_indexOf, js_arraylike_join,
-    js_arraylike_lastIndexOf, js_arraylike_map, js_arraylike_reduce, js_arraylike_reduceRight,
-    js_arraylike_slice, js_arraylike_some, js_arraylike_sort, js_arraylike_splice,
-    try_array_proto_chain_method, try_object_arraylike_mutator,
+    dispatch_arraylike_read_method, js_arraylike_at, js_arraylike_concat, js_arraylike_every,
+    js_arraylike_filter, js_arraylike_find, js_arraylike_findIndex, js_arraylike_findLast,
+    js_arraylike_findLastIndex, js_arraylike_forEach, js_arraylike_includes, js_arraylike_indexOf,
+    js_arraylike_join, js_arraylike_lastIndexOf, js_arraylike_map, js_arraylike_reduce,
+    js_arraylike_reduceRight, js_arraylike_slice, js_arraylike_some, js_arraylike_sort,
+    js_arraylike_splice, try_array_proto_chain_method, try_object_arraylike_mutator,
 };
 pub(crate) use self::generic::{
     non_array_object_receiver, object_pop as generic_object_pop,
@@ -134,7 +134,7 @@ pub(crate) use self::header::{
     array_named_property_get, array_named_property_get_by_name, array_named_property_has,
     array_named_property_names, array_named_property_set, array_numeric_raw_f64_get,
     array_numeric_raw_f64_push_inbounds, array_numeric_raw_f64_set_inbounds, array_object_flags,
-    canonicalize_array_numeric_store_value, clean_arr_ptr, clean_arr_ptr_mut,
+    array_ptr_as_proxy, canonicalize_array_numeric_store_value, clean_arr_ptr, clean_arr_ptr_mut,
     clear_array_numeric_layout, clear_array_numeric_layout_ptr, gc_element_slot_range,
     mark_array_layout_unknown, normalize_array_receiver, note_array_slot,
     note_array_slot_layout_only, rebuild_array_layout, rebuild_array_layout_exact,

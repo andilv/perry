@@ -217,6 +217,7 @@ fn collect_instantiations_in_expr(
             callee,
             args,
             type_args,
+            ..
         } => {
             // First collect in the callee and args
             collect_instantiations_in_expr(callee, ctx, module, idx);
@@ -251,6 +252,7 @@ fn collect_instantiations_in_expr(
             class_name,
             args,
             type_args,
+            ..
         } => {
             for arg in args {
                 collect_instantiations_in_expr(arg, ctx, module, idx);
@@ -563,6 +565,8 @@ fn collect_instantiations_in_expr(
         Expr::MathFloor(expr)
         | Expr::MathCeil(expr)
         | Expr::MathRound(expr)
+        | Expr::MathTrunc(expr)
+        | Expr::MathSign(expr)
         | Expr::MathAbs(expr)
         | Expr::MathSqrt(expr)
         | Expr::MathLog(expr)

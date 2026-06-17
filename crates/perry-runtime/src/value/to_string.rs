@@ -662,6 +662,7 @@ pub extern "C" fn js_jsvalue_to_string(value: f64) -> *mut crate::string::String
             // `temporal.toString()` produce the value's canonical ISO-8601 /
             // IXDTF string, not "[object Object]". Detected here for the same
             // reason as Date — the cell is smaller than an ObjectHeader.
+            #[cfg(feature = "temporal")]
             if crate::temporal::is_temporal_cell_addr(ptr as usize) {
                 if let Some(s) = crate::temporal::temporal_iso_string(value) {
                     return crate::string::js_string_from_bytes(s.as_ptr(), s.len() as u32);
@@ -689,6 +690,36 @@ pub extern "C" fn js_jsvalue_to_string(value: f64) -> *mut crate::string::String
                 if (*obj).class_id == crate::jsx::JSX_NODE_CLASS_ID {
                     let html = crate::object::js_object_get_field(obj, 0);
                     return js_jsvalue_to_string(f64::from_bits(html.bits()));
+                }
+            }
+            // WHATWG `URL` / `URLSearchParams` have native `toString`s
+            // (`href` / the query string) that aren't discoverable as object
+            // fields. They must be checked BEFORE OrdinaryToPrimitive, which
+            // would otherwise find the inherited `Object.prototype.toString`
+            // and return "[object Object]" — so `String(url)`, `` `${url}` ``
+            // and `"" + url` diverged from explicit `url.toString()`. Detected
+            // before the GC-header object dispatch like the other native types.
+            //
+            // Normalize the raw heap pointer to a `POINTER_TAG` value first:
+            // the `+`/template concat path delivers the operand as a raw
+            // pointer (upper-16 == 0), and `js_url_href_if_url`'s
+            // `object_from_f64` only recognizes `POINTER_TAG`. `String(url)`
+            // already arrives tagged. Skip the probe for small-handle values
+            // (sockets / timers / widget handles): those are registry ids, not
+            // heap `ObjectHeader`s, so the shape check would dereference
+            // unmapped memory.
+            if !crate::value::addr_class::is_handle_band(ptr as usize) {
+                let boxed = f64::from_bits(POINTER_TAG | ((ptr as u64) & POINTER_MASK));
+                let url_href = crate::url::url_class::js_url_href_if_url(boxed);
+                if url_href.to_bits() != crate::value::TAG_UNDEFINED {
+                    return js_jsvalue_to_string(url_href);
+                }
+                if crate::url::try_read_as_search_params(ptr as *mut crate::object::ObjectHeader)
+                    .is_some()
+                {
+                    return crate::url::search_params::js_url_search_params_to_string(
+                        ptr as *mut crate::object::ObjectHeader,
+                    );
                 }
             }
             // OrdinaryToPrimitive(obj, "string"): the object has no
@@ -1021,6 +1052,7 @@ pub extern "C" fn js_jsvalue_to_string_radix(
     // the codegen routes any single-arg `.toString(x)` here. Dispatch back to
     // the Temporal method router so the options bag flows through, instead of
     // ToNumber-coercing it as a radix (which throws a spurious RangeError).
+    #[cfg(feature = "temporal")]
     if crate::temporal::is_temporal_value(value) {
         let result = crate::temporal::dispatch::call_method(value, "toString", &[radix_value]);
         let rv = JSValue::from_bits(result.to_bits());

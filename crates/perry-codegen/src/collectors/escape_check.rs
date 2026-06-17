@@ -382,6 +382,8 @@ pub fn check_escapes_in_expr(
         | Expr::MathFloor(operand)
         | Expr::MathCeil(operand)
         | Expr::MathRound(operand)
+        | Expr::MathTrunc(operand)
+        | Expr::MathSign(operand)
         | Expr::MathAbs(operand)
         | Expr::MathF16round(operand)
         | Expr::MathMinSpread(operand)
@@ -657,7 +659,7 @@ pub fn check_escapes_in_expr(
                 check_escapes_in_expr(fi, candidates, classes, escaped);
             }
         }
-        Expr::NewDynamic { callee, args } => {
+        Expr::NewDynamic { callee, args, .. } => {
             check_escapes_in_expr(callee, candidates, classes, escaped);
             for a in args {
                 check_escapes_in_expr(a, candidates, classes, escaped);

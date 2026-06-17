@@ -399,7 +399,7 @@ impl JsEmitter {
                 }
                 self.output.push(')');
             }
-            Expr::NewDynamic { callee, args } => {
+            Expr::NewDynamic { callee, args, .. } => {
                 self.output.push_str("new (");
                 self.emit_expr(callee);
                 self.output.push_str(")(");
@@ -877,6 +877,8 @@ impl JsEmitter {
             Expr::MathFloor(x) => { self.emit_math_unary("Math.floor", x); }
             Expr::MathCeil(x) => { self.emit_math_unary("Math.ceil", x); }
             Expr::MathRound(x) => { self.emit_math_unary("Math.round", x); }
+            Expr::MathTrunc(x) => { self.emit_math_unary("Math.trunc", x); }
+            Expr::MathSign(x) => { self.emit_math_unary("Math.sign", x); }
             Expr::MathAbs(x) => { self.emit_math_unary("Math.abs", x); }
             Expr::MathSqrt(x) => { self.emit_math_unary("Math.sqrt", x); }
             Expr::MathLog(x) => { self.emit_math_unary("Math.log", x); }

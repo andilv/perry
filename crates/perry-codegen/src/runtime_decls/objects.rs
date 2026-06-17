@@ -23,6 +23,12 @@ use super::*;
 /// The inline bump allocator now handles most object allocation directly;
 /// `js_object_alloc(0, N)` is the fallback for dynamic cases.
 pub fn declare_phase_b_objects(module: &mut LlModule) {
+    // #5093: sticky runtime flag (i8, 0 = enabled) gating the codegen-inlined
+    // class-field shape-guard fast path. The inline guard loads this directly
+    // and falls back to the full `js_typed_feedback_class_field_*_guard` call
+    // when it is non-zero (descriptors / typed-feedback in use). Defined in
+    // perry-runtime as `PERRY_CLASS_FIELD_INLINE_GUARD_DISABLED`.
+    module.add_external_global("PERRY_CLASS_FIELD_INLINE_GUARD_DISABLED", I8);
     module.declare_function("js_object_alloc", I64, &[I32, I32]);
     // #3149: `Object(value)` plain-call coercion. Takes & returns a NaN-boxed
     // JSValue (DOUBLE): nullish/primitive -> fresh {}, object passes through.
@@ -58,6 +64,9 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
         VOID,
         &[I64, I64, DOUBLE],
     );
+    // #5127: apply ES2022 `cause` from a `super(message, options)` forward to
+    // a user Error-subclass instance (a generic object). (this_handle, options)
+    module.declare_function("js_error_apply_cause_to_object", VOID, &[I64, DOUBLE]);
     module.declare_function("js_with_has_binding", I32, &[DOUBLE, I64]);
     module.declare_function("js_with_get_binding", DOUBLE, &[DOUBLE, I64]);
     module.declare_function("js_with_set_binding", DOUBLE, &[DOUBLE, I64, DOUBLE, I32]);
@@ -167,6 +176,46 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     // lowered to `0.0` and any subsequent member access returned
     // undefined, tripping the spec property-access throw.
     module.declare_function("js_create_native_module_namespace", DOUBLE, &[PTR, I64]);
+    // Per-module native-module dispatch-install symbols (devirt). Codegen emits
+    // the matching one at each js_create_native_module_namespace site.
+    module.declare_function("js_nm_install_assert", VOID, &[]);
+    module.declare_function("js_nm_install_async_hooks", VOID, &[]);
+    module.declare_function("js_nm_install_bigint", VOID, &[]);
+    module.declare_function("js_nm_install_buffer", VOID, &[]);
+    module.declare_function("js_nm_install_child_process", VOID, &[]);
+    module.declare_function("js_nm_install_cluster", VOID, &[]);
+    module.declare_function("js_nm_install_console", VOID, &[]);
+    module.declare_function("js_nm_install_crypto", VOID, &[]);
+    module.declare_function("js_nm_install_dgram", VOID, &[]);
+    module.declare_function("js_nm_install_dns", VOID, &[]);
+    module.declare_function("js_nm_install_domain", VOID, &[]);
+    module.declare_function("js_nm_install_events", VOID, &[]);
+    module.declare_function("js_nm_install_fs", VOID, &[]);
+    module.declare_function("js_nm_install_http", VOID, &[]);
+    module.declare_function("js_nm_install_inspector", VOID, &[]);
+    module.declare_function("js_nm_install_module", VOID, &[]);
+    module.declare_function("js_nm_install_net", VOID, &[]);
+    module.declare_function("js_nm_install_os", VOID, &[]);
+    module.declare_function("js_nm_install_path", VOID, &[]);
+    module.declare_function("js_nm_install_perf", VOID, &[]);
+    module.declare_function("js_nm_install_process", VOID, &[]);
+    module.declare_function("js_nm_install_punycode", VOID, &[]);
+    module.declare_function("js_nm_install_querystring", VOID, &[]);
+    module.declare_function("js_nm_install_readline", VOID, &[]);
+    module.declare_function("js_nm_install_repl", VOID, &[]);
+    module.declare_function("js_nm_install_sea", VOID, &[]);
+    module.declare_function("js_nm_install_sqlite", VOID, &[]);
+    module.declare_function("js_nm_install_stream", VOID, &[]);
+    module.declare_function("js_nm_install_timers", VOID, &[]);
+    module.declare_function("js_nm_install_tls", VOID, &[]);
+    module.declare_function("js_nm_install_tty", VOID, &[]);
+    module.declare_function("js_nm_install_url", VOID, &[]);
+    module.declare_function("js_nm_install_util", VOID, &[]);
+    module.declare_function("js_nm_install_v8", VOID, &[]);
+    module.declare_function("js_nm_install_vm", VOID, &[]);
+    module.declare_function("js_nm_install_wasi", VOID, &[]);
+    module.declare_function("js_nm_install_zlib", VOID, &[]);
+    module.declare_function("js_nm_install_all", VOID, &[]);
     module.declare_function("js_object_get_field_ic_miss", DOUBLE, &[I64, I64, PTR]);
     // Object rest destructuring: copy all properties from src except excluded keys.
     // Takes a src object ptr and an array of NaN-boxed strings (the excluded keys),

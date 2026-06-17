@@ -58,7 +58,9 @@ mod cycle;
 use cycle::*;
 mod verify;
 pub use verify::*;
+#[cfg(feature = "diagnostics")]
 mod heap_snapshot;
+#[cfg(feature = "diagnostics")]
 pub use heap_snapshot::gc_build_v8_heap_snapshot_json;
 
 pub fn gc_collect_minor() -> u64 {
@@ -360,6 +362,7 @@ pub fn gc_init() {
     // #4911: a bound node:dgram socket is reachable only from the dgram
     // reactor's registry while its recv thread runs; scan + rewrite it so a GC
     // between ticks doesn't reclaim the object whose `message` handlers fire.
+    #[cfg(feature = "mod-dgram")]
     gc_register_mutable_root_scanner(crate::dgram_reactor::scan_roots_mut);
     gc_register_mutable_root_scanner(json_parse_mutable_root_scanner);
     gc_register_mutable_root_scanner(intern_table_mutable_root_scanner);
@@ -436,7 +439,35 @@ pub fn gc_init() {
 #[no_mangle]
 pub extern "C" fn js_gc_init() {
     crate::node_submodules::diagnostics_channel_init_main_thread();
+    // #5093: force every class-field access back through the full guard call —
+    // i.e. disable the codegen-inlined fast path — when:
+    //   - typed-feedback tracing is on (the guard observes every access), or
+    //   - the intact-bit verifier is on (`PERRY_VERIFY_TYPED_INTACT`): the
+    //     verifier lives in the guard's fast contract, so inline hits would skip
+    //     it; disabling the inline path routes every access through it, or
+    //   - the explicit escape hatch `PERRY_DISABLE_CLASS_FIELD_INLINE` is set to
+    //     a truthy value (perf bisection / A-B measurement). `=0`/`=false`/`=off`
+    //     leave the fast path enabled.
+    if crate::typed_feedback::typed_feedback_active()
+        || env_flag_enabled("PERRY_VERIFY_TYPED_INTACT")
+        || env_flag_enabled("PERRY_DISABLE_CLASS_FIELD_INLINE")
+    {
+        crate::object::disable_class_field_inline_guard();
+    }
     gc_init();
+}
+
+/// #5093: parse a boolean-ish env var by value (not mere presence): true for
+/// `1`/`true`/`on`/`yes` (case-insensitive), false for unset / `0`/`false`/`off`
+/// / `no` / empty / anything else.
+fn env_flag_enabled(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        ),
+        Err(_) => false,
+    }
 }
 
 /// FFI: get GC stats

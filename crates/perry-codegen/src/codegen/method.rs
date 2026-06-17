@@ -185,6 +185,7 @@ pub(super) fn compile_method(
         local_closure_func_ids: HashMap::new(),
         local_closure_param_counts: HashMap::new(),
         option_object_locals: HashMap::new(),
+        object_literal_locals: HashSet::new(),
         namespace_imports: &cross_module.namespace_imports,
         namespace_reexport_named_imports: &cross_module.namespace_reexport_named_imports,
         namespace_member_prefixes: &cross_module.namespace_member_prefixes,
@@ -321,7 +322,11 @@ pub(super) fn compile_method(
                     break;
                 };
                 let has_local_body = pc.constructor.is_some();
-                let has_imported_ctor = ctx.imported_class_ctors.contains_key(pname);
+                let has_imported_ctor = ctx
+                    .imported_class_ctors
+                    .get(pname)
+                    .map(|ctor| ctor.stops_constructor_walk())
+                    .unwrap_or(false);
                 if has_local_body || has_imported_ctor {
                     break;
                 }
@@ -376,10 +381,10 @@ pub(super) fn compile_method(
                                 .map(|c| c.params.len())
                                 .unwrap_or(0);
                             (sym, pcount)
-                        } else if let Some((sym, n)) =
+                        } else if let Some(ctor) =
                             ctx.imported_class_ctors.get(&pname_owned).cloned()
                         {
-                            (sym, n)
+                            (ctor.symbol, ctor.param_count)
                         } else {
                             // No callable ctor symbol — bail.
                             stmt::lower_stmts(&mut ctx, &method.body).with_context(|| {
@@ -397,10 +402,8 @@ pub(super) fn compile_method(
                             let _ = std::mem::take(&mut ctx.pending_declares);
                             return Ok(());
                         }
-                    } else if let Some((sym, n)) =
-                        ctx.imported_class_ctors.get(&pname_owned).cloned()
-                    {
-                        (sym, n)
+                    } else if let Some(ctor) = ctx.imported_class_ctors.get(&pname_owned).cloned() {
+                        (ctor.symbol, ctor.param_count)
                     } else {
                         ("".to_string(), 0)
                     };
@@ -692,6 +695,7 @@ pub(super) fn compile_static_method(
         local_closure_func_ids: HashMap::new(),
         local_closure_param_counts: HashMap::new(),
         option_object_locals: HashMap::new(),
+        object_literal_locals: HashSet::new(),
         namespace_imports: &cross_module.namespace_imports,
         namespace_reexport_named_imports: &cross_module.namespace_reexport_named_imports,
         namespace_member_prefixes: &cross_module.namespace_member_prefixes,

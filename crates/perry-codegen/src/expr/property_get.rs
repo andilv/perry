@@ -1193,11 +1193,15 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     // branch still wins because class names get
                     // registered into both maps.
                     if let Some(submod_key) = ctx.namespace_node_submodules.get(name) {
+                        let install_sym = crate::nm_install::nm_submod_install_symbol(submod_key);
                         let submod_label = emit_string_literal_global(ctx, submod_key);
                         let name_label = emit_string_literal_global(ctx, property);
                         let submod_len = submod_key.len();
                         let name_len = property.len();
                         let blk = ctx.block();
+                        if let Some(s) = install_sym {
+                            blk.call_void(s, &[]);
+                        }
                         return Ok(blk.call(
                             DOUBLE,
                             "js_node_submodule_namespace_member",
@@ -1575,7 +1579,10 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         .as_ref()
                         .is_some_and(crate::typed_shape::type_is_raw_f64_candidate);
                         let requires_raw_f64_str = if requires_raw_f64 { "1" } else { "0" };
-                        let (obj_bits, obj_handle, key_raw, guard_ok) = {
+                        // #5093: build the guard operands once, up front, so both
+                        // the inline shape pre-check and the guard-call fallback
+                        // can reference them.
+                        let (obj_bits, obj_handle, key_raw, expected_keys) = {
                             let blk = ctx.block();
                             let obj_bits = blk.bitcast_double_to_i64(&recv_box);
                             let obj_handle = blk.and(I64, &obj_bits, POINTER_MASK_I64);
@@ -1583,28 +1590,45 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                             let key_bits = blk.bitcast_double_to_i64(&key_box);
                             let key_raw = blk.and(I64, &key_bits, POINTER_MASK_I64);
                             let expected_keys = blk.load(I64, &format!("@{}", keys_global_name));
-                            let guard_ok = blk.call(
-                                I32,
-                                "js_typed_feedback_class_field_get_guard",
-                                &[
-                                    (I64, &site_id),
-                                    (DOUBLE, &recv_box),
-                                    (I32, &expected_class_id_str),
-                                    (I64, &expected_keys),
-                                    (I64, &key_raw),
-                                    (I32, &field_idx_str),
-                                    (I32, requires_raw_f64_str),
-                                ],
-                            );
-                            (obj_bits, obj_handle, key_raw, guard_ok)
+                            (obj_bits, obj_handle, key_raw, expected_keys)
                         };
-                        let guard_pass = ctx.block().icmp_ne(I32, &guard_ok, "0");
                         let fast_idx = ctx.new_block("class_field_get.fast");
                         let fallback_idx = ctx.new_block("class_field_get.fallback");
                         let merge_idx = ctx.new_block("class_field_get.merge");
                         let fast_label = ctx.block_label(fast_idx);
                         let fallback_label = ctx.block_label(fallback_idx);
                         let merge_label = ctx.block_label(merge_idx);
+
+                        // #5093: inline shape pre-check. On a monomorphic hit it
+                        // branches straight to the fast slot load, skipping the
+                        // cross-crate guard call; on a miss it leaves the current
+                        // block at the guard-call path below (unchanged).
+                        let _guardcall_label =
+                            crate::expr::class_field_inline_guard::emit_class_field_inline_precheck(
+                                ctx,
+                                &obj_bits,
+                                &obj_handle,
+                                &expected_class_id_str,
+                                &expected_keys,
+                                field_index,
+                                requires_raw_f64,
+                                None,
+                                &fast_label,
+                            );
+                        let guard_ok = ctx.block().call(
+                            I32,
+                            "js_typed_feedback_class_field_get_guard",
+                            &[
+                                (I64, &site_id),
+                                (DOUBLE, &recv_box),
+                                (I32, &expected_class_id_str),
+                                (I64, &expected_keys),
+                                (I64, &key_raw),
+                                (I32, &field_idx_str),
+                                (I32, requires_raw_f64_str),
+                            ],
+                        );
+                        let guard_pass = ctx.block().icmp_ne(I32, &guard_ok, "0");
                         ctx.block()
                             .cond_br(&guard_pass, &fast_label, &fallback_label);
 

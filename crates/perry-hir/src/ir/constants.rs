@@ -77,6 +77,18 @@ pub fn clear_compile_packages_override() {
     COMPILE_PACKAGES_OVERRIDE.with(|cell| cell.borrow_mut().clear());
 }
 
+/// Refs #5137: true when the user explicitly opted `pkg` into
+/// `perry.compilePackages` (the package's real npm source is being
+/// compiled). Native-instance registration and native-shim method
+/// lowering must back off for such packages even when a class name
+/// like `Command` / `Big` would otherwise hit a hardcoded
+/// library-name fallback — otherwise `new Command()` from commander's
+/// own source is still routed to the `js_commander_*` shim instead of
+/// the compiled-from-source class.
+pub fn is_compile_package_override(pkg: &str) -> bool {
+    COMPILE_PACKAGES_OVERRIDE.with(|cell| cell.borrow().contains(pkg))
+}
+
 // ---- #5009 build-time `process.env` define substitution ----
 
 /// #5009: a build-time `process.env.<NAME>` substitution value, esbuild
@@ -144,7 +156,12 @@ thread_local! {
     /// list lives in `lower/expr_member.rs::STDLIB_NAMESPACE_NAMES`. Set
     /// to false by `perry.allowDynamicStdlibDispatch: true` or
     /// `PERRY_ALLOW_DYNAMIC_STDLIB=1`.
-    static REFUSE_DYNAMIC_STDLIB_DISPATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    ///
+    /// #5263: default is now **false** (allow). Dynamic access over the linked
+    /// namespace can only select among already-linked members, so it is safe by
+    /// default; the compile driver re-arms it (`set_refuse_dynamic_stdlib_dispatch(true)`)
+    /// under `--lockdown` or an explicit opt-in.
+    static REFUSE_DYNAMIC_STDLIB_DISPATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
     /// #503: per-thread set of npm package names that opted out of the
     /// dynamic-stdlib-dispatch refusal (`perry.allowDynamicStdlibDispatch:

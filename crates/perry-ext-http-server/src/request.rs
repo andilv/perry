@@ -249,9 +249,77 @@ pub(crate) fn incoming_http_version_part(handle: i64, minor: bool) -> f64 {
 #[no_mangle]
 pub extern "C" fn js_node_http_im_headers_json(handle: i64) -> *mut StringHeader {
     let s = get_handle::<IncomingMessage>(handle)
-        .map(|im| serde_json::to_string(&im.headers).unwrap_or_else(|_| "{}".to_string()))
+        .map(|im| combined_headers_json(&im.raw_headers))
         .unwrap_or_else(|| "{}".to_string());
     alloc_string(&s).as_raw()
+}
+
+/// Single-value request headers: per Node's `_http_incoming.js`
+/// `matchKnownFields`, duplicates of these are discarded (first wins)
+/// rather than joined with `, `. `set-cookie` is excluded — it always
+/// accumulates into an array.
+fn is_single_value_header(name: &str) -> bool {
+    matches!(
+        name,
+        "age"
+            | "authorization"
+            | "content-length"
+            | "content-type"
+            | "etag"
+            | "expires"
+            | "from"
+            | "host"
+            | "if-modified-since"
+            | "if-unmodified-since"
+            | "last-modified"
+            | "location"
+            | "max-forwards"
+            | "proxy-authorization"
+            | "referer"
+            | "retry-after"
+            | "server"
+            | "user-agent"
+    )
+}
+
+/// Build the combined `req.headers` JSON object from the raw
+/// `(name, value)` pairs, applying Node's `matchKnownFields` rules
+/// (#5079): `set-cookie` → string array (even for one cookie),
+/// single-value fields keep-first, everything else joined with `, `.
+/// Keys are lower-cased to match Node's `headers` view.
+fn combined_headers_json(raw: &[(String, String)]) -> String {
+    use serde_json::Value;
+    // Key order in the serialized object is not significant here (the
+    // previous `HashMap` serialization was already unordered); what
+    // matters is that `set-cookie` surfaces as an array and other
+    // duplicates combine per Node's rules.
+    let mut map = serde_json::Map::new();
+    for (name, value) in raw {
+        let key = name.to_ascii_lowercase();
+        if key == "set-cookie" {
+            match map.get_mut(&key) {
+                Some(Value::Array(arr)) => arr.push(Value::String(value.clone())),
+                _ => {
+                    map.insert(key, Value::Array(vec![Value::String(value.clone())]));
+                }
+            }
+            continue;
+        }
+        match map.get_mut(&key) {
+            Some(Value::String(existing)) => {
+                if !is_single_value_header(&key) {
+                    // Node's `matchKnownFields`: duplicate `cookie` headers are
+                    // joined with "; ", everything else with ", ".
+                    existing.push_str(if key == "cookie" { "; " } else { ", " });
+                    existing.push_str(value);
+                }
+            }
+            _ => {
+                map.insert(key, Value::String(value.clone()));
+            }
+        }
+    }
+    serde_json::to_string(&Value::Object(map)).unwrap_or_else(|_| "{}".to_string())
 }
 
 /// `req.rawHeaders` — JSON-stringify the original-case `[name, value, ...]`
@@ -412,6 +480,16 @@ pub extern "C" fn js_node_http_im_pause(handle: i64) {
     }
 }
 
+/// Chainable `req.pause()` — Node's `Readable.pause()` returns `this`, so
+/// `res.pause().on(...)` keeps flowing. Returns the receiver handle (boxed
+/// as a pointer via the `NR_PTR` row) instead of `undefined`/a raw number.
+/// Mirrors `js_node_http_res_set_header_self` (#5011/#2129 self-return).
+#[no_mangle]
+pub extern "C" fn js_node_http_im_pause_self(handle: i64) -> i64 {
+    js_node_http_im_pause(handle);
+    handle
+}
+
 /// `req.resume()` — clear the paused flag. If a `'data'` listener was
 /// registered while paused and we still have body bytes to emit,
 /// the event-loop iterator will pick the request up on its next pass.
@@ -453,6 +531,17 @@ pub extern "C" fn js_node_http_im_resume(handle: i64) {
     if should_emit_end {
         emit_end_to_listeners(&end_listeners);
     }
+}
+
+/// Chainable `req.resume()` — Node's `Readable.resume()` returns `this`, so
+/// the canonical `res.resume().on('end', …)` body-drain chain keeps flowing.
+/// Returns the receiver handle (boxed as a pointer via the `NR_PTR` row)
+/// instead of `undefined`/a raw number. Mirrors
+/// `js_node_http_res_set_header_self` (#5011/#2129 self-return).
+#[no_mangle]
+pub extern "C" fn js_node_http_im_resume_self(handle: i64) -> i64 {
+    js_node_http_im_resume(handle);
+    handle
 }
 
 /// `req.destroy()` — mark destroyed and fire `'close'`.

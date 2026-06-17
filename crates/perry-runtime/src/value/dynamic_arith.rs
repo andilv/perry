@@ -89,6 +89,26 @@ unsafe fn to_primitive_default_for_add(value: f64) -> f64 {
         return crate::value::js_nanbox_string(s as i64);
     }
 
+    // Buffers / TypedArrays carry NO `ObjectHeader` (a `BufferHeader` /
+    // `TypedArrayHeader` has a different, smaller layout). The
+    // `js_url_href_if_url` / `try_read_as_search_params` /
+    // `ordinary_to_primitive_number_for_add` probes below all bit-cast `ptr`
+    // to an `ObjectHeader` and read its fields, so a Buffer/TypedArray operand
+    // would deref a fake header one word before the data and segfault
+    // (issue #5131 — `req.on('data', c => body += c)` on a `node:http` server,
+    // where the chunk is an un-typed Buffer and `body += c` lowers to the
+    // fully-dynamic add path). Detect via the registries (by-value lookups, no
+    // deref) and route to `js_jsvalue_to_string`, which yields the same string
+    // form as an explicit `.toString()` (Buffer→utf8, TypedArray→`join(",")`).
+    // This matches the guards `js_jsvalue_to_string` itself runs before its
+    // ordinary-object dispatch.
+    if crate::buffer::is_registered_buffer(ptr)
+        || crate::typedarray::lookup_typed_array_kind(ptr).is_some()
+    {
+        let s = crate::value::js_jsvalue_to_string(value);
+        return crate::value::js_nanbox_string(s as i64);
+    }
+
     let primitive = crate::symbol::js_to_primitive(value, 0);
     if primitive.to_bits() != value.to_bits() {
         if is_nonprimitive_object_value(primitive) {
@@ -100,6 +120,29 @@ unsafe fn to_primitive_default_for_add(value: f64) -> f64 {
     if crate::date::is_date_cell_addr(ptr) {
         let s = crate::date::js_date_to_string(value);
         return crate::value::js_nanbox_string(s as i64);
+    }
+
+    // WHATWG `URL` / `URLSearchParams` have native `toString`s (`href` / the
+    // query string) that OrdinaryToPrimitive can't see — it would resolve the
+    // inherited `Object.prototype.toString` and yield "[object Object]". Like
+    // the Date special-case above, pre-empt with the real string so
+    // `"" + url` / `` `${url}` `` match explicit `url.toString()` (#URL coercion).
+    // Skip small-handle values (sockets / timers / widget handles): they are
+    // registry ids, not heap `ObjectHeader`s, so the shape probe would
+    // dereference unmapped memory.
+    if !crate::value::addr_class::is_handle_band(ptr) {
+        let boxed =
+            f64::from_bits(crate::value::POINTER_TAG | ((ptr as u64) & crate::value::POINTER_MASK));
+        let href = crate::url::url_class::js_url_href_if_url(boxed);
+        if href.to_bits() != crate::value::TAG_UNDEFINED {
+            let s = js_jsvalue_to_string(href);
+            return crate::value::js_nanbox_string(s as i64);
+        }
+        let obj = ptr as *mut crate::object::ObjectHeader;
+        if crate::url::try_read_as_search_params(obj).is_some() {
+            let s = crate::url::search_params::js_url_search_params_to_string(obj);
+            return crate::value::js_nanbox_string(s as i64);
+        }
     }
 
     match crate::value::ordinary_to_primitive_number_for_add(value) {

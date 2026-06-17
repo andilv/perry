@@ -305,6 +305,9 @@ fn build_once(
         emit_attest: false,
         emit_sandbox: false,
         lockdown: false,
+        strict_eval: false,
+        strict_dynamic_import: false,
+        strict_unimplemented: false,
         min_windows_version: "10".to_string(),
         windows_subsystem: "auto".to_string(),
         // Phase 2 v7: harmonyos signing flags. `perry dev` is the watch

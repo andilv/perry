@@ -18,6 +18,7 @@ use crate::OutputFormat;
 
 use super::apple_info_plist::{
     inject_google_auth_info_plist, inject_ios_app_group_entitlement, inject_ios_deeplinks,
+    inject_ios_push_entitlement,
 };
 use super::resources::stage_native_library_artifacts;
 use super::targets::compile_metallib_for_bundle;
@@ -129,6 +130,19 @@ pub(super) fn build_ios_app_bundle(
     // (#4849: same logic the watchOS/tvOS/visionOS bundlers use).
     let (app_version, app_build_number) = super::bundle_apple::read_apple_app_version(input);
 
+    // CFBundleDisplayName — the name shown under the icon on the Home Screen.
+    // Without it iOS falls back to CFBundleName (the executable stem), so a
+    // project named `bloom-jump` shows up as "bloom-jump". When perry.toml sets
+    // [ios]/[project] display_name, emit it so the Home Screen reads "Bloom Jump".
+    let display_name_block = super::bundle_apple::read_app_display_name(input, "ios")
+        .map(|name| {
+            format!(
+                "<key>CFBundleDisplayName</key>\n<string>{}</string>\n",
+                super::bundle_apple::xml_escape(&name)
+            )
+        })
+        .unwrap_or_default();
+
     let encryption_exempt_plist = (|| -> Option<String> {
         let mut dir = input.canonicalize().ok()?;
         for _ in 0..5 {
@@ -224,7 +238,7 @@ pub(super) fn build_ios_app_bundle(
 <string>{bundle_id}</string>
 <key>CFBundleName</key>
 <string>{exe_stem}</string>
-<key>CFBundleVersion</key>
+{display_name_block}<key>CFBundleVersion</key>
 <string>{app_build_number}</string>
 <key>CFBundleShortVersionString</key>
 <string>{app_version}</string>
@@ -432,6 +446,12 @@ pub(super) fn build_ios_app_bundle(
     // existing entitlements (associated-domains, hand-written
     // entries) intact.
     inject_ios_app_group_entitlement(&app_dir, ctx.app_metadata.app_group.as_deref(), format);
+
+    // #5074 — emit the `aps-environment` entitlement when
+    // `[ios] push_notifications = true` is set in perry.toml. Without it
+    // `registerForRemoteNotifications` always fails and no APNs token is
+    // produced. Idempotent with the deeplinks / app-group passes above.
+    inject_ios_push_entitlement(&input, &app_dir, format);
 
     // #1138 — `[google_auth]` block in perry.toml feeds the
     // GoogleSignIn SDK via Info.plist keys the Swift bridge in

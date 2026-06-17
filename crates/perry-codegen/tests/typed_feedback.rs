@@ -78,6 +78,8 @@ fn empty_opts() -> CompileOptions {
         deferred_module_prefixes: std::collections::HashSet::new(),
         module_init_deps: Vec::new(),
         is_dynamic_import_target: false,
+        debug_locations: false,
+        module_source: None,
     }
 }
 
@@ -238,6 +240,7 @@ fn typed_feedback_instruments_property_and_method_boundaries() {
                 }),
                 args: vec![Expr::Number(2.0)],
                 type_args: Vec::new(),
+                byte_offset: 0,
             }),
             Stmt::Return(Some(Expr::PropertyGet {
                 object: Box::new(Expr::LocalGet(1)),
@@ -328,6 +331,7 @@ fn typed_feedback_guards_direct_class_method_specialization() {
             }),
             args: vec![Expr::Number(5.0)],
             type_args: Vec::new(),
+            byte_offset: 0,
         }))],
     ));
 
@@ -377,6 +381,7 @@ fn typed_feedback_guards_direct_closure_call_specialization() {
                 callee: Box::new(Expr::LocalGet(2)),
                 args: vec![Expr::Number(9.0)],
                 type_args: Vec::new(),
+                byte_offset: 0,
             })),
         ],
     ));
@@ -535,5 +540,9 @@ fn typed_feedback_guards_computed_numeric_array_index_hot_path() {
 
     assert!(ir.contains("call i32 @js_typed_feedback_numeric_array_index_get_guard"));
     assert!(ir.contains("call double @js_typed_feedback_array_index_get_fallback_boxed"));
-    assert!(ir.contains("call double @js_array_numeric_get_f64_unboxed"));
+    // The numeric fast path no longer calls `js_array_numeric_get_f64_unboxed`:
+    // the guard already proved raw-f64 layout + in-bounds, so the slot is loaded
+    // inline (a direct `load double` from the element address).
+    assert!(!ir.contains("call double @js_array_numeric_get_f64_unboxed"));
+    assert!(ir.contains("load double"));
 }

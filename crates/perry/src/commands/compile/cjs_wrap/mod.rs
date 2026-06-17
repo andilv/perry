@@ -252,6 +252,85 @@ module.exports = inner;
     }
 
     #[test]
+    fn issue_5275_detects_bracket_module_exports() {
+        // @colors/colors/lib/custom/trap.js shape: bracket default export.
+        assert!(is_commonjs("module['exports'] = function runTheTrap() {};"));
+        assert!(is_commonjs(
+            "module[\"exports\"] = function runTheTrap() {};"
+        ));
+    }
+
+    #[test]
+    fn issue_5275_detects_bracket_named_exports() {
+        assert!(is_commonjs("exports['foo'] = 1;"));
+        assert!(is_commonjs("exports[\"foo\"] = 1;"));
+    }
+
+    #[test]
+    fn issue_5275_dynamic_bracket_key_is_not_cjs_on_its_own() {
+        // A genuinely dynamic `module[k] = …` (non-literal key) is not a CJS
+        // export signal — without other CJS tokens this stays ESM.
+        assert!(!is_commonjs("const k = 'x';\nmodule[k] = 1;\n"));
+    }
+
+    #[test]
+    fn issue_5275_extracts_bracket_named_exports() {
+        let src = "exports['foo'] = 1;\nexports[\"bar\"] = function(){};";
+        let names = extract_exports_from_source(src);
+        assert_eq!(names, vec!["foo".to_string(), "bar".to_string()]);
+    }
+
+    #[test]
+    fn issue_5275_extracts_bracket_module_exports_dot_named() {
+        let src = "module.exports['foo'] = 1;";
+        let names = extract_exports_from_source(src);
+        assert_eq!(names, vec!["foo".to_string()]);
+    }
+
+    #[test]
+    fn issue_5275_does_not_extract_dynamic_bracket_key() {
+        // `exports[k] = …` with a non-string-literal key must not surface a
+        // named export.
+        let src = "const k = 'x';\nexports[k] = 1;";
+        let names = extract_exports_from_source(src);
+        assert!(names.is_empty(), "expected no names, got {:?}", names);
+    }
+
+    #[test]
+    fn issue_5275_single_module_exports_accepts_bracket_form() {
+        let src = "class Child {}\nmodule['exports'] = Child;";
+        assert_eq!(
+            extract_single_module_exports_assignment(src),
+            Some("Child".to_string())
+        );
+        let src2 = "class Child {}\nmodule[\"exports\"] = Child;";
+        assert_eq!(
+            extract_single_module_exports_assignment(src2),
+            Some("Child".to_string())
+        );
+    }
+
+    #[test]
+    fn issue_5275_wrap_default_export_for_bracket_module_exports() {
+        // The mb repro: `module['exports'] = function greet(){}`. The IIFE
+        // runs the bracket assignment, so `export default _cjs;` resolves to
+        // the function — but the file MUST be wrapped first (detection).
+        let src = "module['exports'] = function greet(n) { return n; };";
+        assert!(is_commonjs(src));
+        let wrapped = wrap_commonjs(src, &PathBuf::from("/tmp/mb/index.js"));
+        assert!(
+            wrapped.contains("export default _cjs;"),
+            "expected default export through _cjs, got:\n{}",
+            wrapped
+        );
+        assert!(
+            perry_parser::parse_typescript(&wrapped, "mb/index.js").is_ok(),
+            "wrapped bracket-export module must parse, got:\n{}",
+            wrapped
+        );
+    }
+
+    #[test]
     fn extracts_module_exports_object_literal_shorthand() {
         // Issue #624: `module.exports = { createContext }`
         let src = "function createContext(v){return v;}\nmodule.exports = { createContext };";
@@ -644,6 +723,55 @@ module.exports = SafeBuffer;"#;
         assert!(
             perry_parser::parse_typescript(&wrapped, "safe-buffer/index.js").is_ok(),
             "wrapped safe-buffer source must parse, got:\n{}",
+            wrapped
+        );
+    }
+
+    #[test]
+    fn issue_5251_class_reading_exports_stays_in_iife() {
+        // #5251: a top-level class whose body reads the cjs_wrap-injected
+        // `exports` binding (`exports.X` inside a method/ctor) must NOT be
+        // hoisted out of the IIFE — hoisting severs its closure over the
+        // injected `var exports`, so `exports.X` resolves as an unknown
+        // global and lowers to the numeric `0` sentinel inside class methods.
+        let src = "\"use strict\";\nexports.TAG = \"hi\";\nclass C { greet() { return exports.TAG + \"!\"; } }\nexports.mk = function () { return new C(); };\n";
+        let wrapped = wrap_commonjs(src, &PathBuf::from("/tmp/app/node_modules/re/index.js"));
+        let iife_start = wrapped
+            .find("const _cjs = (function() {")
+            .expect("expected an IIFE wrap (no flat default class), got:\n");
+        let class_pos = wrapped
+            .find("class C ")
+            .expect("class C must survive in the wrapped output");
+        assert!(
+            class_pos > iife_start,
+            "class reading `exports` must stay INSIDE the IIFE (after its \
+             opener), not hoisted above it, got:\n{}",
+            wrapped
+        );
+        assert!(
+            perry_parser::parse_typescript(&wrapped, "re/index.js").is_ok(),
+            "wrapped module must parse, got:\n{}",
+            wrapped
+        );
+    }
+
+    #[test]
+    fn issue_5251_class_without_exports_still_hoists() {
+        // Regression guard: a top-level class that does NOT touch the injected
+        // `exports`/`module`/`require` bindings must still hoist above the
+        // IIFE (so `import { D } from "pkg"` resolves to the real class).
+        let src = "\"use strict\";\nclass D { val() { return 42; } }\nexports.mkD = function () { return new D(); };\n";
+        let wrapped = wrap_commonjs(src, &PathBuf::from("/tmp/app/node_modules/re/index.js"));
+        let iife_start = wrapped
+            .find("const _cjs = (function() {")
+            .expect("expected an IIFE wrap, got:\n");
+        let class_pos = wrapped
+            .find("class D ")
+            .expect("class D must survive in the wrapped output");
+        assert!(
+            class_pos < iife_start,
+            "a class not referencing exports/module/require must still hoist \
+             above the IIFE, got:\n{}",
             wrapped
         );
     }

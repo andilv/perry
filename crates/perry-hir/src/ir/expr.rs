@@ -113,6 +113,13 @@ pub enum Expr {
         args: Vec<Expr>,
         /// Explicit type arguments (e.g., identity<number>(x))
         type_args: Vec<Type>,
+        /// #5247: byte offset (`call.span.lo.0`) of this call expression in its
+        /// module's source, captured at AST→HIR lowering. Used by codegen (under
+        /// `--debug-symbols`) to attach a `file:line` to the runtime "X is not a
+        /// function" TypeError thrown by the dynamic method-dispatch path. `0`
+        /// when unknown (synthesized calls from transforms/intrinsics, etc.) —
+        /// a 0 sentinel resolves to no location, falling back to `<anonymous>`.
+        byte_offset: u32,
     },
 
     /// Function call with spread arguments (e.g., fn(a, ...arr, b))
@@ -297,6 +304,14 @@ pub enum Expr {
         args: Vec<Expr>,
         /// Explicit type arguments (e.g., new Box<number>(42))
         type_args: Vec<Type>,
+        /// #5253: byte offset (`new_expr.span.lo.0`) of this `new` expression
+        /// in its module's source, captured at AST→HIR lowering. Used by
+        /// codegen (under `--debug-symbols`) to attach a `file:line` to the
+        /// runtime "X is not a constructor" TypeError. `0` when unknown
+        /// (synthesized `new` from transforms/intrinsics) — resolves to no
+        /// location, falling back to `<anonymous>`. Mirrors `Call.byte_offset`
+        /// (#5247) and is excluded from stable-hashing.
+        byte_offset: u32,
     },
 
     /// Dynamic new expression (new with non-identifier callee)
@@ -307,6 +322,11 @@ pub enum Expr {
         callee: Box<Expr>,
         /// Arguments to pass to the constructor
         args: Vec<Expr>,
+        /// #5253: source byte offset of the `new` expression — see
+        /// `New::byte_offset`. The `const X: any = undefined; new X()`
+        /// not-a-constructor case lowers here (callee is `LocalGet`), so this
+        /// is the field that localizes ajv's `undefined is not a constructor`.
+        byte_offset: u32,
     },
 
     /// Dynamic `new` with spread arguments — `new <callee>(...args)`.
@@ -318,6 +338,9 @@ pub enum Expr {
     NewDynamicSpread {
         callee: Box<Expr>,
         args: Vec<CallArg>,
+        /// #5253: source byte offset of the `new` expression — see
+        /// `New::byte_offset`.
+        byte_offset: u32,
     },
 
     /// Runtime `new.target` value for ordinary functions.
@@ -859,6 +882,8 @@ pub enum Expr {
     MathFloor(Box<Expr>),            // Math.floor(x) -> number
     MathCeil(Box<Expr>),             // Math.ceil(x) -> number
     MathRound(Box<Expr>),            // Math.round(x) -> number
+    MathTrunc(Box<Expr>),            // Math.trunc(x) -> number
+    MathSign(Box<Expr>),             // Math.sign(x) -> number
     MathAbs(Box<Expr>),              // Math.abs(x) -> number
     MathSqrt(Box<Expr>),             // Math.sqrt(x) -> number
     MathLog(Box<Expr>),              // Math.log(x) -> number
@@ -2516,6 +2541,20 @@ pub enum Expr {
     DynamicImport {
         paths: Vec<String>,
         arg: Box<Expr>,
+        /// Byte offset (`span.lo.0`) of the `import(...)` call in its module's
+        /// source, captured at lowering time. Used by the driver to resolve a
+        /// `file:line` for the #5230 deferred-site notice (HIR `Expr` carries no
+        /// span otherwise). `0` when unknown.
+        byte_offset: u32,
+        /// #5230: when `Some(msg)`, the path argument was non-resolvable
+        /// (runtime-computed) and this site was *deferred* (the default,
+        /// non-strict policy — the analog of #5206's eval deferral). Codegen
+        /// lowers it to a rejected `Promise` carrying an `Error(msg)`, so
+        /// `await import(spec)` throws a descriptive error *only if reached*
+        /// rather than failing the whole build. `None` is the normal case
+        /// (`paths` resolved to a finite set). In strict mode such a site is a
+        /// compile error instead and never produces a node with this set.
+        deferred_error: Option<String>,
     },
     /// Compile-time-resolved `new Worker(filename, options?)` from
     /// `node:worker_threads`. The filename expression follows the same

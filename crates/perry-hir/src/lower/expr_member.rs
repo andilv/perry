@@ -443,6 +443,7 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                             }),
                             args: vec![],
                             type_args: vec![],
+                            byte_offset: 0,
                         });
                     }
                     _ => {}
@@ -579,6 +580,7 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                             }),
                             args: vec![],
                             type_args: vec![],
+                            byte_offset: 0,
                         });
                     }
                     "on"
@@ -2043,6 +2045,13 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                     // bare `GlobalGet(0)` — otherwise the predicate/dispatch runs
                     // against globalThis. The reroute above already resolved the
                     // receiver to `globalThis.<ctor>`; don't undo it here.
+                    // #5135: `toString` is a universal inherited method too —
+                    // `Function.toString` / `Array.toString` resolve to a real
+                    // function in Node. Without keeping the reified constructor
+                    // receiver the read collapses to `globalThis.toString`,
+                    // which codegen folds to a number, so
+                    // `Function.toString.call(Ctor)` (immer's `isPlainObject`)
+                    // threw "call on a non-function".
                     let outer_is_inherited_object_proto_method = matches!(
                         outer_static_member,
                         Some(
@@ -2050,6 +2059,7 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                                 | "isPrototypeOf"
                                 | "propertyIsEnumerable"
                                 | "toLocaleString"
+                                | "toString"
                                 | "valueOf"
                         )
                     );
@@ -2228,7 +2238,6 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
         (&*object, &member.prop)
     {
         let prop = prop_ident.sym.as_ref();
-        let allow_unimplemented = std::env::var_os("PERRY_ALLOW_UNIMPLEMENTED").is_some();
         // Skip the gate when `member.obj` is an Ident that was a
         // *named* import binding from the module (e.g. `import {
         // EventEmitter } from "node:events"; EventEmitter.prototype`).
@@ -2293,11 +2302,22 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
             },
             _ => false,
         };
-        if !allow_unimplemented
-            && !obj_is_named_import
+        if !obj_is_named_import
             && perry_api_manifest::module_has_any_entries(module)
             && perry_api_manifest::module_has_symbol(module, prop).is_none()
         {
+            // #3896: a bare *value read* of an absent member on a Node
+            // builtin module namespace/default object is an ordinary
+            // property miss → `undefined` (e.g. `dns/promises.ADDRCONFIG`,
+            // which Node also doesn't export but reads as undefined). Calls
+            // (`ns.foo()`) keep going through the gate — `lower_call` set the
+            // callee marker, so `member_is_call_callee` is true there. Only
+            // Node core modules relax; unenumerated npm packages keep the gate.
+            // This is independent of #463/#5245 strict-unimplemented mode (it's
+            // a real Node semantic, not a degraded surface).
+            if !member_is_call_callee && perry_api_manifest::is_node_core_module(module) {
+                return Ok(Expr::Undefined);
+            }
             // #925: when there's a known supported equivalent for this
             // shape, append it to the error so the user doesn't have to
             // grep through the manifest to find the replacement.
@@ -2309,21 +2329,23 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                  or set `PERRY_ALLOW_UNIMPLEMENTED=1` to ignore. (#463){}",
                 module, prop, hint,
             );
-            // #2309: defer when tree-shaking (sink armed for this node_modules
-            // module); re-raised only if the module survives pruning.
-            if !crate::try_defer_refusal(msg.clone(), member.span.lo.0) {
-                // #3896: a bare *value read* of an absent member on a Node
-                // builtin module namespace/default object is an ordinary
-                // property miss → `undefined` (e.g. `dns/promises.ADDRCONFIG`,
-                // which Node also doesn't export but reads as undefined). Calls
-                // (`ns.foo()`) keep rejecting — `lower_call` set the callee
-                // marker, so `member_is_call_callee` is true there. Only Node
-                // core modules relax; unenumerated npm packages keep the strict
-                // gate (and the tree-shaking defer above).
-                if !member_is_call_callee && perry_api_manifest::is_node_core_module(module) {
-                    return Ok(Expr::Undefined);
+            // #5245: defer to a throw-on-reach runtime error by default (record
+            // for the end-of-compile notice); strict-unimplemented mode restores
+            // the hard #463 refusal. #2309 tree-shake deferral is handled inside.
+            let api = format!("{module}.{prop}");
+            let location =
+                crate::eval_classifier::location_string(&ctx.source_file_path, member.span.lo.0);
+            match crate::check_unimplemented_api(&msg, &api, &location, member.span.lo.0) {
+                crate::UnimplementedDecision::Refuse => {
+                    crate::lower_bail!(member.span, "{}", msg);
                 }
-                crate::lower_bail!(member.span, "{}", msg);
+                crate::UnimplementedDecision::DeferToRuntimeError(runtime_msg) => {
+                    return super::const_fold_fn::synth_deferred_throw_value(
+                        ctx,
+                        &runtime_msg,
+                        member.span,
+                    );
+                }
             }
         }
     }
@@ -2347,8 +2369,10 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
             //   - the index is NOT a string literal at the source level
             //     (literal keys are caught by the fold below, and never
             //     constitute string-obfuscation),
-            //   - the refusal pass is enabled (`PERRY_ALLOW_DYNAMIC_STDLIB=0` /
-            //     `perry.allowDynamicStdlibDispatch: false`; on by default),
+            //   - the refusal pass is enabled — OFF by default since #5263,
+            //     re-armed under `--lockdown` / `perry.lockdown` or the explicit
+            //     opt-out `PERRY_ALLOW_DYNAMIC_STDLIB=0` /
+            //     `perry.allowDynamicStdlibDispatch: false`,
             //   - the currently-lowering source file does NOT belong to a
             //     package on the per-package allow-list, and
             //   - there is no `// @perry-allow-dynamic` line annotation on
@@ -2444,6 +2468,30 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
                         property: key.clone(),
                     });
                 }
+            }
+            // `console[dynamicKey]` — the receiver is a bare `console` ident
+            // (not shadowed: a local would have lowered `object` to a
+            // LocalGet, not the `GlobalGet(0)` builtin sentinel). The static
+            // `console.log` value read already resolves to a real bound
+            // closure via `js_native_module_property_by_name`, but the
+            // computed form fell through to `IndexGet { GlobalGet(0), key }`,
+            // i.e. reading the method off numeric 0 — so `console[m](...)`
+            // threw `(number).<m> is not a function` (the Next.js
+            // `prefixedLog` wall). Route the runtime key through the same
+            // native-module resolver so both forms agree.
+            if matches!(&*object, Expr::GlobalGet(0))
+                && matches!(member.obj.as_ref(), ast::Expr::Ident(id) if id.sym.as_ref() == "console")
+            {
+                return Ok(Expr::Call {
+                    callee: Box::new(Expr::ExternFuncRef {
+                        name: "js_console_method_by_value".to_string(),
+                        param_types: vec![Type::Any],
+                        return_type: Type::Any,
+                    }),
+                    args: vec![*index],
+                    type_args: Vec::new(),
+                    byte_offset: 0,
+                });
             }
             Ok(Expr::IndexGet { object, index })
         }

@@ -115,6 +115,7 @@ impl WasmModuleEmitter {
             "math_hypot",
             "math_fround",
             "math_clz32",
+            "math_imul",
             "closure_new",
             "closure_set_capture",
             "closure_call_0",
@@ -959,7 +960,7 @@ impl WasmModuleEmitter {
                     self.collect_strings_in_expr(a);
                 }
             }
-            Expr::NewDynamic { callee, args } => {
+            Expr::NewDynamic { callee, args, .. } => {
                 self.collect_strings_in_expr(callee);
                 for a in args {
                     self.collect_strings_in_expr(a);

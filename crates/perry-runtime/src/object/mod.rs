@@ -12,7 +12,7 @@ use crate::JSValue;
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::RwLock;
 
 // Submodules (issue #1103): behavior-preserving split of the former
@@ -40,6 +40,7 @@ mod field_get_set;
 mod field_set_by_name;
 mod global_fetch;
 mod global_this;
+pub(crate) use global_this::{default_prepare_stack_trace_func_ptr, ERROR_CONSTRUCTOR_PTR};
 mod global_this_tables;
 mod groupby;
 pub(crate) mod has_own_helpers;
@@ -53,10 +54,17 @@ mod native_module_crypto_key_object;
 mod native_module_crypto_random;
 mod native_module_dispatch;
 mod native_module_dispatch_crypto;
+mod native_module_registry;
+pub(crate) use native_module_registry::js_nm_enable_install_all;
+pub(crate) use native_module_registry::nm_ctor_lookup;
+// Re-exported for submodule installers that delegate to a native module
+// (`fs/promises` → `fs.constants`, `sys` → `util`).
+pub(crate) use native_module_registry::{js_nm_install_fs, js_nm_install_util};
 mod native_module_stream;
 mod native_this_alias;
 mod object_literal_ops;
 mod object_ops;
+pub(crate) use object_ops::{ensure_key_in_keys_array, install_builtin_getter};
 mod object_ops_frozen;
 mod polymorphic_index;
 mod primitive_proto_thunks;
@@ -66,6 +74,7 @@ mod prototype_helpers;
 mod reflect_support;
 mod regex_proto_thunks;
 mod string_proto_thunks;
+#[cfg(feature = "temporal")]
 mod temporal_proto;
 mod typed_array_define;
 mod typed_array_proto_thunks;
@@ -678,6 +687,30 @@ pub(crate) fn descriptors_in_use() -> bool {
     GLOBAL_DESCRIPTORS_IN_USE.load(Ordering::Relaxed)
 }
 
+/// #5093: sticky process-global that disables the codegen-inlined class-field
+/// shape-guard fast path. The emitted IR reads this byte directly (a single
+/// relaxed load, hoistable out of hot loops) via the
+/// `@PERRY_CLASS_FIELD_INLINE_GUARD_DISABLED` symbol and falls back to the full
+/// `js_typed_feedback_class_field_{get,set}_guard` call whenever it is non-zero.
+/// It flips to 1 the moment either (a) any accessor / property descriptor comes
+/// into use — the guard then has to perform descriptor-aware dispatch the inline
+/// path doesn't model — or (b) typed-feedback tracing is enabled, where the
+/// guard records observations the inline path would silently skip. Both are
+/// monotonic ("in use" never reverts), so the flag is set-only.
+#[no_mangle]
+pub static PERRY_CLASS_FIELD_INLINE_GUARD_DISABLED: AtomicU8 = AtomicU8::new(0);
+
+/// Disable the codegen-inlined class-field fast path process-wide (see
+/// [`PERRY_CLASS_FIELD_INLINE_GUARD_DISABLED`]). Idempotent.
+pub(crate) fn disable_class_field_inline_guard() {
+    PERRY_CLASS_FIELD_INLINE_GUARD_DISABLED.store(1, Ordering::Relaxed);
+}
+
+/// True when the inline class-field fast path is still permitted.
+pub(crate) fn class_field_inline_guard_enabled() -> bool {
+    PERRY_CLASS_FIELD_INLINE_GUARD_DISABLED.load(Ordering::Relaxed) == 0
+}
+
 /// #5054: a descriptor (any kind) has been installed on the canonical
 /// `Object.prototype` — inherited setters / non-writable data props there
 /// must intercept writes of keys missing on the receiver, so the dynamic
@@ -722,6 +755,7 @@ pub(crate) fn set_property_attrs(obj: usize, key: String, attrs: PropertyAttrs) 
     note_descriptor_target(obj);
     PROPERTY_ATTRS_IN_USE.with(|c| c.set(true));
     GLOBAL_DESCRIPTORS_IN_USE.store(true, Ordering::Relaxed);
+    disable_class_field_inline_guard();
     PROPERTY_DESCRIPTORS.with(|m| {
         m.borrow_mut().insert((obj, key), attrs);
     });
@@ -827,6 +861,7 @@ pub(crate) fn set_accessor_descriptor(obj: usize, key: String, acc: AccessorDesc
     note_descriptor_target(obj);
     ACCESSORS_IN_USE.with(|c| c.set(true));
     GLOBAL_DESCRIPTORS_IN_USE.store(true, Ordering::Relaxed);
+    disable_class_field_inline_guard();
     ACCESSOR_DESCRIPTORS.with(|m| {
         m.borrow_mut().insert((obj, key), acc);
     });

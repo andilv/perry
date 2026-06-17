@@ -302,6 +302,47 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                         }));
                     }
                 }
+                // Static field initializers + static blocks for a
+                // function-nested class. The module-level path
+                // (`lower/stmt.rs`) emits these into `module.init`; here they
+                // belong in the function body so they run when the class
+                // declaration is evaluated. Without this, an in-function
+                // class's `static x = …` fields and `static { … }` blocks
+                // silently stayed at their zero default — only top-level
+                // classes initialized. Mirrors the top-level emission order
+                // (fields then blocks, per ClassDefinitionEvaluation), with
+                // lexical `this` in field initializers bound to the class ref.
+                for sf in &class.static_fields {
+                    if let Some(init) = &sf.init {
+                        let mut init_value = init.clone();
+                        crate::analysis::substitute_lexical_this_in_expr(
+                            &mut init_value,
+                            &Expr::ClassRef(class.name.clone()),
+                        );
+                        if let Some(key) = sf.key_expr.as_ref() {
+                            result.push(Stmt::Expr(Expr::ClassStaticSymbolSet {
+                                class_name: class.name.clone(),
+                                key: Box::new(key.clone()),
+                                value: Box::new(init_value),
+                            }));
+                        } else {
+                            result.push(Stmt::Expr(Expr::StaticFieldSet {
+                                class_name: class.name.clone(),
+                                field_name: sf.name.clone(),
+                                value: Box::new(init_value),
+                            }));
+                        }
+                    }
+                }
+                for sm in &class.static_methods {
+                    if sm.name.starts_with("__perry_static_init_") {
+                        result.push(Stmt::Expr(Expr::StaticMethodCall {
+                            class_name: class.name.clone(),
+                            method_name: sm.name.clone(),
+                            args: Vec::new(),
+                        }));
+                    }
+                }
                 ctx.pending_classes.push(class);
             } else {
                 // Duplicate same-named class: still evaluate its computed
@@ -474,12 +515,38 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                         let is_var = var_decl.kind == ast::VarDeclKind::Var;
                         if is_var {
                             for decl in var_decl.decls.iter() {
-                                let name = get_binding_name(&decl.name)?;
                                 if let Some(init_ast) = decl.init.as_ref() {
                                     result.extend(predeclare_implicit_assignment_targets(
                                         ctx, init_ast,
                                     ));
                                 }
+                                // A destructuring declarator (`for (var {a} = o; …)`)
+                                // routes through the shared pattern-binding helper
+                                // rather than `get_binding_name`, which only handles
+                                // plain idents. The bound ids are var-hoisted so they
+                                // escape the for's block scope, matching plain
+                                // `var`-decl destructuring.
+                                if is_destructuring_pattern(&decl.name) {
+                                    let init_expr = decl
+                                        .init
+                                        .as_ref()
+                                        .map(|e| lower_expr(ctx, e))
+                                        .transpose()?
+                                        .ok_or_else(|| {
+                                            anyhow!("Destructuring requires an initializer")
+                                        })?;
+                                    let stmts = crate::destructuring::lower_pattern_binding(
+                                        ctx, &decl.name, init_expr, true,
+                                    )?;
+                                    for stmt in &stmts {
+                                        if let Stmt::Let { id, .. } = stmt {
+                                            ctx.var_hoisted_ids.insert(*id);
+                                        }
+                                    }
+                                    result.extend(stmts);
+                                    continue;
+                                }
+                                let name = get_binding_name(&decl.name)?;
                                 let init_expr =
                                     decl.init.as_ref().map(|e| lower_expr(ctx, e)).transpose()?;
                                 let id = ctx.define_local(name.clone(), Type::Any);
@@ -495,12 +562,30 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                             None
                         } else {
                             for decl in var_decl.decls.iter().skip(1) {
-                                let name = get_binding_name(&decl.name)?;
                                 if let Some(init_ast) = decl.init.as_ref() {
                                     result.extend(predeclare_implicit_assignment_targets(
                                         ctx, init_ast,
                                     ));
                                 }
+                                // `for (let {a} = o, i = 0; …)` — a destructuring
+                                // declarator binds via the shared helper into the
+                                // pre-loop init block.
+                                if is_destructuring_pattern(&decl.name) {
+                                    let init_expr = decl
+                                        .init
+                                        .as_ref()
+                                        .map(|e| lower_expr(ctx, e))
+                                        .transpose()?
+                                        .ok_or_else(|| {
+                                            anyhow!("Destructuring requires an initializer")
+                                        })?;
+                                    let stmts = crate::destructuring::lower_pattern_binding(
+                                        ctx, &decl.name, init_expr, true,
+                                    )?;
+                                    result.extend(stmts);
+                                    continue;
+                                }
+                                let name = get_binding_name(&decl.name)?;
                                 let init_expr =
                                     decl.init.as_ref().map(|e| lower_expr(ctx, e)).transpose()?;
                                 let id = ctx.define_local(name.clone(), Type::Any);
@@ -513,22 +598,46 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                                 });
                             }
                             if let Some(decl) = var_decl.decls.first() {
-                                let name = get_binding_name(&decl.name)?;
                                 if let Some(init_ast) = decl.init.as_ref() {
                                     result.extend(predeclare_implicit_assignment_targets(
                                         ctx, init_ast,
                                     ));
                                 }
-                                let init_expr =
-                                    decl.init.as_ref().map(|e| lower_expr(ctx, e)).transpose()?;
-                                let id = ctx.define_local(name.clone(), Type::Any);
-                                Some(Box::new(Stmt::Let {
-                                    id,
-                                    name,
-                                    ty: Type::Any,
-                                    mutable: true,
-                                    init: init_expr,
-                                }))
+                                // A destructuring first-declarator can't be a single
+                                // `Stmt::Let` (it lowers to several binds), so emit it
+                                // into the pre-loop init block and leave the for's own
+                                // init empty. It still runs exactly once before the
+                                // first test, preserving for-init semantics.
+                                if is_destructuring_pattern(&decl.name) {
+                                    let init_expr = decl
+                                        .init
+                                        .as_ref()
+                                        .map(|e| lower_expr(ctx, e))
+                                        .transpose()?
+                                        .ok_or_else(|| {
+                                            anyhow!("Destructuring requires an initializer")
+                                        })?;
+                                    let stmts = crate::destructuring::lower_pattern_binding(
+                                        ctx, &decl.name, init_expr, true,
+                                    )?;
+                                    result.extend(stmts);
+                                    None
+                                } else {
+                                    let name = get_binding_name(&decl.name)?;
+                                    let init_expr = decl
+                                        .init
+                                        .as_ref()
+                                        .map(|e| lower_expr(ctx, e))
+                                        .transpose()?;
+                                    let id = ctx.define_local(name.clone(), Type::Any);
+                                    Some(Box::new(Stmt::Let {
+                                        id,
+                                        name,
+                                        ty: Type::Any,
+                                        mutable: true,
+                                        init: init_expr,
+                                    }))
+                                }
                             } else {
                                 None
                             }
@@ -916,6 +1025,7 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                         callee: Box::new(Expr::FuncRef(iter_fn_id)),
                         args: vec![iter_expr_raw],
                         type_args: vec![],
+                        byte_offset: 0,
                     }
                 } else if is_filehandle_readlines_for_await || is_fs_dir_for_await {
                     async_iterator_method_call(iter_expr_raw)
@@ -927,6 +1037,7 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                         }),
                         args: vec![],
                         type_args: vec![],
+                        byte_offset: 0,
                     }
                 } else if is_readline_interface_for_await {
                     Expr::NativeMethodCall {
@@ -960,6 +1071,7 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                     }),
                     args: vec![],
                     type_args: vec![],
+                    byte_offset: 0,
                 };
                 let next_call = if needs_await {
                     Expr::Await(Box::new(raw_next_call))

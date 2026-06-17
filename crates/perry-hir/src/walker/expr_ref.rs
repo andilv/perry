@@ -168,6 +168,8 @@ where
         | Expr::MathFloor(v)
         | Expr::MathCeil(v)
         | Expr::MathRound(v)
+        | Expr::MathTrunc(v)
+        | Expr::MathSign(v)
         | Expr::MathAbs(v)
         | Expr::MathSqrt(v)
         | Expr::MathLog(v)
@@ -892,13 +894,13 @@ where
                 f(v);
             }
         }
-        Expr::NewDynamic { callee, args } => {
+        Expr::NewDynamic { callee, args, .. } => {
             f(callee);
             for a in args {
                 f(a);
             }
         }
-        Expr::NewDynamicSpread { callee, args } => {
+        Expr::NewDynamicSpread { callee, args, .. } => {
             f(callee);
             for a in args {
                 match a {

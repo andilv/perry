@@ -65,6 +65,12 @@ mod tls_client;
 mod plain_client;
 use plain_client::{dispatch_plain_http_request, parse_http_response};
 
+// Raw-socket `Expect: 100-continue` client path (#5080) — flushes the head,
+// observes the interim `100 Continue`, emits `'continue'`, then sends the
+// withheld body. reqwest swallows the interim response, so this bypass is
+// needed to surface it.
+mod continue_client;
+
 // Async reqwest dispatch (`dispatch_request` + TLS-client selection),
 // extracted to keep `lib.rs` under the 2000-line lint cap.
 mod client_dispatch;
@@ -86,6 +92,9 @@ use validation::{validate_client_options, validate_client_url_string};
 // Classifies transport-layer client failures (connect refused, DNS lookup
 // failure, …) into the Node `Error` shape (`.code`/`.syscall`/`.errno`).
 mod transport_error;
+
+mod response_headers;
+use response_headers::build_response_headers_object;
 
 use lazy_static::lazy_static;
 use perry_ffi::{
@@ -164,6 +173,14 @@ pub(crate) enum PendingHttpEvent {
     /// Drains the queued `write(chunk, cb)` callbacks, then `'finish'`,
     /// then the `end(..., cb)` callback — Node's flush ordering.
     Flushed { request_handle: Handle },
+    /// #5080 — the server answered an `Expect: 100-continue` request with
+    /// an interim `100 Continue`. Drains to the request's `'continue'`
+    /// listeners; the canonical handler then sends the withheld body.
+    Continue { request_handle: Handle },
+    /// #5080 — arm the `Expect: 100-continue` head flush on the next event-loop
+    /// tick (Node's nextTick), so post-construction `setHeader(...)` — including
+    /// a late `Expect` — reaches the wire. No-op for non-continue/sent requests.
+    DeferredArmContinue { request_handle: Handle },
 }
 
 lazy_static! {
@@ -317,6 +334,15 @@ pub struct ClientRequestHandle {
     /// `0` until the head is delivered (and always for the full-buffer
     /// delivery paths).
     incoming_handle: Handle,
+    /// #5080 — the request carries `Expect: 100-continue`, so its head was
+    /// flushed up front by the raw-socket continue path and the body is
+    /// withheld until the server's interim `100 Continue` arrives. `end()`
+    /// hands the (now-known) body over the `continue_body_tx` channel
+    /// instead of dispatching a fresh exchange.
+    expects_continue: bool,
+    /// #5080 — set while the continue exchange task is waiting for the
+    /// deferred body; `end()` sends the buffered body here (once).
+    continue_body_tx: Option<tokio::sync::oneshot::Sender<Vec<u8>>>,
 }
 
 // SAFETY: closure pointers point into program-global code/data and
@@ -327,7 +353,12 @@ unsafe impl Sync for ClientRequestHandle {}
 pub struct IncomingMessageHandle {
     pub status_code: u16,
     pub status_message: String,
-    pub headers: HashMap<String, String>,
+    /// Raw `(name, value)` header pairs in arrival order, multiplicity
+    /// preserved. The combined `res.headers` view (Node's
+    /// `matchKnownFields` rules: `set-cookie` → array, single-value
+    /// fields keep-first, everything else joined with `, `) is built
+    /// lazily in [`build_response_headers_object`] (#5079).
+    pub headers: Vec<(String, String)>,
     pub trailers: HashMap<String, String>,
     pub body: Vec<u8>,
     pub listeners: HashMap<String, Vec<i64>>,
@@ -485,6 +516,8 @@ fn make_request_handle(
         agent_handle,
         tls: tls_client::TlsOptions::default(),
         incoming_handle: 0,
+        expects_continue: false,
+        continue_body_tx: None,
     });
     // #4909 — `options.timeout` arms the inactivity timer as soon as the
     // socket exists in Node, not at `end()`; a request that is never
@@ -832,6 +865,7 @@ unsafe fn request_common(arg_f64: f64, callback: i64, default_protocol: &str) ->
     };
     let handle = make_request_handle(method, url, headers, timeout, callback, agent_handle);
     attach_tls_options(handle, arg_f64); // #4906
+    continue_client::defer_arm(handle); // #5080 (next-tick head flush)
     handle
 }
 
@@ -937,6 +971,8 @@ unsafe fn request_overload(args_array: i64, default_protocol: &str, force_get: b
     if force_get {
         // `get()` auto-`end()`s, kicking off the request.
         js_http_client_request_end(handle, f64::from_bits(TAG_UNDEFINED));
+    } else {
+        continue_client::defer_arm(handle); // #5080 (next-tick head flush)
     }
     handle
 }
@@ -1005,6 +1041,37 @@ pub(crate) unsafe fn client_request_end_impl(handle: Handle, body_f64: f64) -> H
         });
     }
 
+    // #5080 — `end()` is a send boundary: arm the continue path now if it
+    // carries `Expect: 100-continue` and the next-tick arm hasn't run yet.
+    continue_client::arm_expect_continue(handle);
+
+    // #5080 — an `Expect: 100-continue` request flushed its head up front;
+    // this `end()` just hands the (now-known) body to the in-flight continue
+    // exchange over the oneshot. The first call fires the flush ordering
+    // (write/finish/end callbacks); a later one is an idempotent no-op.
+    let (is_continue, first_end) = with_handle_mut::<ClientRequestHandle, _, _>(handle, |req| {
+        if !req.expects_continue {
+            return (false, false);
+        }
+        if let Some(tx) = req.continue_body_tx.take() {
+            let body = std::mem::take(&mut req.body);
+            let _ = tx.send(body);
+            req.ended = true;
+            (true, true)
+        } else {
+            (true, false)
+        }
+    })
+    .unwrap_or((false, false));
+    if is_continue {
+        if first_end {
+            push_event(PendingHttpEvent::Flushed {
+                request_handle: handle,
+            });
+        }
+        return handle;
+    }
+
     let snapshot = with_handle_mut::<ClientRequestHandle, _, _>(handle, |req| {
         if req.ended {
             // Already dispatched by `flushHeaders()` — the exchange is in
@@ -1060,6 +1127,13 @@ pub(crate) unsafe fn client_request_end_impl(handle: Handle, body_f64: f64) -> H
 /// dispatch-at-`end()` behavior, since the head can't go out alone.
 pub(crate) unsafe fn client_request_flush_headers(handle: Handle) {
     if client_request_surface::request_destroyed(handle) {
+        return;
+    }
+    // #5080 — `flushHeaders()` is a send boundary; when it arms the continue
+    // path, that exchange owns the head, so don't also dispatch via reqwest.
+    continue_client::arm_expect_continue(handle);
+    if with_handle_mut::<ClientRequestHandle, _, _>(handle, |r| r.expects_continue).unwrap_or(false)
+    {
         return;
     }
     let snapshot = with_handle_mut::<ClientRequestHandle, _, _>(handle, |req| {
@@ -1449,7 +1523,7 @@ pub extern "C" fn js_http_status_message(handle: Handle) -> *mut StringHeader {
 pub extern "C" fn js_http_response_headers(handle: Handle) -> f64 {
     let mut out = f64::from_bits(TAG_UNDEFINED);
     with_handle_mut::<IncomingMessageHandle, _, _>(handle, |res| {
-        out = map_to_js_object(&res.headers);
+        out = build_response_headers_object(&res.headers);
     });
     if out.to_bits() == TAG_UNDEFINED {
         if let Some(server_out) = server_incoming_property(handle, "headers") {
@@ -1614,6 +1688,16 @@ pub unsafe extern "C" fn js_http_process_pending() -> i32 {
             PendingHttpEvent::Flushed { request_handle } => {
                 client_events::handle_flushed_event(request_handle);
             }
+            PendingHttpEvent::Continue { request_handle } => {
+                // #5080 — the server sent an interim `100 Continue`; fire the
+                // request's `'continue'` listeners (the canonical handler then
+                // sends the withheld body via `req.end(...)`).
+                client_events::fire_request_event_listeners(request_handle, "continue");
+            }
+            PendingHttpEvent::DeferredArmContinue { request_handle } => {
+                // #5080 — next-tick arming (see the enum variant docs).
+                continue_client::arm_expect_continue(request_handle);
+            }
         }
     }
 
@@ -1626,6 +1710,10 @@ pub unsafe extern "C" fn js_http_process_pending() -> i32 {
 
 #[cfg(test)]
 mod tests;
+// Test-only `perry_ffi_*` async-bridge shims so the lib test links without the
+// host stdlib archive (mirrors perry-ext-net / perry-ext-http-server).
+#[cfg(test)]
+mod test_async_shims;
 
 // Suppress unused-import warnings for FFI-only types.
 #[allow(dead_code)]
@@ -1633,280 +1721,6 @@ fn _force_link() -> Option<*mut ArrayHeader> {
     None
 }
 
-// #1652: force the linker to retain perry-ext-http-server's `#[no_mangle]`
-// FFI symbols. The `extern crate perry_ext_http_server as _server_link`
-// at the top of this file pulls the rlib into the dependency graph, but
-// the server functions are referenced only by codegen-generated callsites
-// in the *user* program — never by this crate's Rust. Under LTO / staticlib
-// emission they can therefore be dead-stripped, and the final link then
-// fails with `Undefined symbols: _js_node_http_create_server` for any
-// program that does `import { createServer } from 'node:http'` (the failure
-// originally tracked at #589, reopened as #1652). Anchoring their addresses
-// in a `#[used]` table makes the retention explicit so it can't silently
-// regress when nobody's npm import happens to reference a given symbol.
-//
-// Resolution is by symbol name (C ABI): the `()` signatures below are only
-// ever used to take the function's address, never to call it, so they need
-// not match the real definitions — the linker keys off the `#[no_mangle]`
-// symbol name alone.
-//
-// `cfg(not(test))`: the anchor must NOT fire in `cargo test -p perry-ext-http`.
-// Forcing the server functions into the unit-test binary drags in their
-// transitive `perry_ffi_spawn_blocking*` references, which only the host
-// (perry-stdlib) provides at the final perry-compile link — the test binary
-// has no host, so it fails with `undefined symbol: perry_ffi_spawn_blocking`.
-// The staticlib (the real perry-compile artifact) is built without `test`,
-// so retention there is unaffected. Nothing cargo-depends on this crate, so
-// gating on `test` is sufficient.
-#[cfg(not(test))]
-#[allow(dead_code)]
-mod force_link_http_server {
-    extern "C" {
-        // http server + IncomingMessage + ServerResponse entry points.
-        pub fn js_node_http_create_server();
-        pub fn js_node_http_create_server_with_options();
-        pub fn js_node_http_server_listen();
-        pub fn js_node_http_server_listening();
-        pub fn js_node_http_server_close();
-        pub fn js_node_http_server_on();
-        pub fn js_node_http_server_address_json();
-        pub fn js_node_http_server_process_pending();
-        pub fn js_node_http_server_has_active();
-        pub fn js_node_http_server_close_all_connections();
-        pub fn js_node_http_server_close_idle_connections();
-        pub fn js_node_http_server_headers_timeout();
-        pub fn js_node_http_server_set_headers_timeout();
-        pub fn js_node_http_server_keep_alive_timeout();
-        pub fn js_node_http_server_set_keep_alive_timeout();
-        pub fn js_node_http_server_keep_alive_timeout_buffer();
-        pub fn js_node_http_server_set_keep_alive_timeout_buffer();
-        pub fn js_node_http_server_request_timeout();
-        pub fn js_node_http_server_set_request_timeout();
-        pub fn js_node_http_server_idle_timeout();
-        pub fn js_node_http_server_set_idle_timeout();
-        pub fn js_node_http_server_max_headers_count();
-        pub fn js_node_http_server_set_max_headers_count();
-        pub fn js_node_http_server_max_requests_per_socket();
-        pub fn js_node_http_server_set_max_requests_per_socket();
-        pub fn js_node_http_server_set_timeout_method();
-        pub fn js_node_http_server_ref();
-        pub fn js_node_http_server_unref();
-        pub fn js_node_http_res_end();
-        pub fn js_node_http_res_write();
-        pub fn js_node_http_res_write_head();
-        pub fn js_node_http_res_set_header();
-        pub fn js_node_http_res_set_header_self();
-        pub fn js_node_http_res_get_header();
-        pub fn js_node_http_res_get_header_names_json();
-        pub fn js_node_http_res_get_headers_json();
-        pub fn js_node_http_res_has_header();
-        pub fn js_node_http_res_has_header_value();
-        pub fn js_node_http_res_remove_header();
-        pub fn js_node_http_res_append_header();
-        pub fn js_node_http_res_set_headers();
-        pub fn js_node_http_res_set_status();
-        pub fn js_node_http_res_get_status();
-        pub fn js_node_http_res_set_status_message();
-        pub fn js_node_http_res_get_status_message();
-        pub fn js_node_http_res_finished();
-        pub fn js_node_http_res_send_date();
-        pub fn js_node_http_res_set_send_date();
-        pub fn js_node_http_res_strict_content_length();
-        pub fn js_node_http_res_set_strict_content_length();
-        pub fn js_node_http_res_req_handle();
-        pub fn js_node_http_res_headers_sent();
-        pub fn js_node_http_res_writable_ended();
-        pub fn js_node_http_res_writable_finished();
-        pub fn js_node_http_res_flush_headers();
-        pub fn js_node_http_res_add_trailers();
-        pub fn js_node_http_res_cork();
-        pub fn js_node_http_res_uncork();
-        pub fn js_node_http_res_set_timeout();
-        pub fn js_node_http_res_write_early_hints();
-        pub fn js_node_http_res_write_continue();
-        pub fn js_node_http_res_write_processing();
-        pub fn js_node_http_res_on();
-        pub fn js_node_http_im_method();
-        pub fn js_node_http_im_url();
-        pub fn js_node_http_im_http_version();
-        pub fn js_node_http_im_headers_json();
-        pub fn js_node_http_im_raw_headers_json();
-        pub fn js_node_http_im_headers_distinct_json();
-        pub fn js_node_http_im_trailers_json();
-        pub fn js_node_http_im_raw_trailers_json();
-        pub fn js_node_http_im_trailers_distinct_json();
-        pub fn js_node_http_im_remote_address();
-        pub fn js_node_http_im_remote_port();
-        pub fn js_node_http_im_on();
-        pub fn js_node_http_im_read();
-        pub fn js_node_http_im_pause();
-        pub fn js_node_http_im_resume();
-        pub fn js_node_http_im_aborted();
-        pub fn js_node_http_im_complete();
-        pub fn js_node_http_im_destroy();
-        pub fn js_node_http_im_destroyed();
-        pub fn js_node_http_im_set_timeout();
-        // https server.
-        pub fn js_node_https_create_server();
-        pub fn js_node_https_server_listen();
-        pub fn js_node_https_server_close();
-        pub fn js_node_https_server_close_all_connections();
-        pub fn js_node_https_server_close_idle_connections();
-        pub fn js_node_https_server_on();
-        pub fn js_node_https_server_address_json();
-        pub fn js_node_https_server_headers_timeout();
-        pub fn js_node_https_server_set_headers_timeout();
-        pub fn js_node_https_server_keep_alive_timeout();
-        pub fn js_node_https_server_set_keep_alive_timeout();
-        pub fn js_node_https_server_keep_alive_timeout_buffer();
-        pub fn js_node_https_server_set_keep_alive_timeout_buffer();
-        pub fn js_node_https_server_request_timeout();
-        pub fn js_node_https_server_set_request_timeout();
-        pub fn js_node_https_server_idle_timeout();
-        pub fn js_node_https_server_set_idle_timeout();
-        pub fn js_node_https_server_max_headers_count();
-        pub fn js_node_https_server_set_max_headers_count();
-        pub fn js_node_https_server_max_requests_per_socket();
-        pub fn js_node_https_server_set_max_requests_per_socket();
-        pub fn js_node_https_server_set_timeout_method();
-        pub fn js_node_https_server_ref();
-        pub fn js_node_https_server_unref();
-        // http2 secure server.
-        pub fn js_node_http2_create_secure_server();
-        pub fn js_node_http2_server_listen();
-        pub fn js_node_http2_server_close();
-        pub fn js_node_http2_server_on();
-        pub fn js_node_http2_server_address_json();
-        // http2 settings helpers (#3168).
-        pub fn js_node_http2_get_default_settings();
-        pub fn js_node_http2_get_packed_settings();
-        pub fn js_node_http2_get_unpacked_settings();
-    }
-}
-
-/// `#[used]` anchor table referencing every server FFI entry point so the
-/// linker keeps them in `libperry_ext_http.a`. See the module above (#1652).
-/// Gated with the module on `not(test)` so the unit-test binary doesn't drag
-/// in the server's host-provided `perry_ffi_*` symbols.
-#[cfg(not(test))]
-#[used]
-static FORCE_LINK_HTTP_SERVER: &[unsafe extern "C" fn()] = {
-    use force_link_http_server::*;
-    &[
-        js_node_http_create_server,
-        js_node_http_create_server_with_options,
-        js_node_http_server_listen,
-        js_node_http_server_listening,
-        js_node_http_server_close,
-        js_node_http_server_on,
-        js_node_http_server_address_json,
-        js_node_http_server_process_pending,
-        js_node_http_server_has_active,
-        js_node_http_server_close_all_connections,
-        js_node_http_server_close_idle_connections,
-        js_node_http_server_headers_timeout,
-        js_node_http_server_set_headers_timeout,
-        js_node_http_server_keep_alive_timeout,
-        js_node_http_server_set_keep_alive_timeout,
-        js_node_http_server_keep_alive_timeout_buffer,
-        js_node_http_server_set_keep_alive_timeout_buffer,
-        js_node_http_server_request_timeout,
-        js_node_http_server_set_request_timeout,
-        js_node_http_server_idle_timeout,
-        js_node_http_server_set_idle_timeout,
-        js_node_http_server_max_headers_count,
-        js_node_http_server_set_max_headers_count,
-        js_node_http_server_max_requests_per_socket,
-        js_node_http_server_set_max_requests_per_socket,
-        js_node_http_server_set_timeout_method,
-        js_node_http_server_ref,
-        js_node_http_server_unref,
-        js_node_http_res_end,
-        js_node_http_res_write,
-        js_node_http_res_write_head,
-        js_node_http_res_set_header,
-        js_node_http_res_set_header_self,
-        js_node_http_res_get_header,
-        js_node_http_res_get_header_names_json,
-        js_node_http_res_get_headers_json,
-        js_node_http_res_has_header,
-        js_node_http_res_has_header_value,
-        js_node_http_res_remove_header,
-        js_node_http_res_append_header,
-        js_node_http_res_set_headers,
-        js_node_http_res_set_status,
-        js_node_http_res_get_status,
-        js_node_http_res_set_status_message,
-        js_node_http_res_get_status_message,
-        js_node_http_res_finished,
-        js_node_http_res_send_date,
-        js_node_http_res_set_send_date,
-        js_node_http_res_strict_content_length,
-        js_node_http_res_set_strict_content_length,
-        js_node_http_res_req_handle,
-        js_node_http_res_headers_sent,
-        js_node_http_res_writable_ended,
-        js_node_http_res_writable_finished,
-        js_node_http_res_flush_headers,
-        js_node_http_res_add_trailers,
-        js_node_http_res_cork,
-        js_node_http_res_uncork,
-        js_node_http_res_set_timeout,
-        js_node_http_res_write_early_hints,
-        js_node_http_res_write_continue,
-        js_node_http_res_write_processing,
-        js_node_http_res_on,
-        js_node_http_im_method,
-        js_node_http_im_url,
-        js_node_http_im_http_version,
-        js_node_http_im_headers_json,
-        js_node_http_im_raw_headers_json,
-        js_node_http_im_headers_distinct_json,
-        js_node_http_im_trailers_json,
-        js_node_http_im_raw_trailers_json,
-        js_node_http_im_trailers_distinct_json,
-        js_node_http_im_remote_address,
-        js_node_http_im_remote_port,
-        js_node_http_im_on,
-        js_node_http_im_read,
-        js_node_http_im_pause,
-        js_node_http_im_resume,
-        js_node_http_im_aborted,
-        js_node_http_im_complete,
-        js_node_http_im_destroy,
-        js_node_http_im_destroyed,
-        js_node_http_im_set_timeout,
-        js_node_https_create_server,
-        js_node_https_server_listen,
-        js_node_https_server_close,
-        js_node_https_server_close_all_connections,
-        js_node_https_server_close_idle_connections,
-        js_node_https_server_on,
-        js_node_https_server_address_json,
-        js_node_https_server_headers_timeout,
-        js_node_https_server_set_headers_timeout,
-        js_node_https_server_keep_alive_timeout,
-        js_node_https_server_set_keep_alive_timeout,
-        js_node_https_server_keep_alive_timeout_buffer,
-        js_node_https_server_set_keep_alive_timeout_buffer,
-        js_node_https_server_request_timeout,
-        js_node_https_server_set_request_timeout,
-        js_node_https_server_idle_timeout,
-        js_node_https_server_set_idle_timeout,
-        js_node_https_server_max_headers_count,
-        js_node_https_server_set_max_headers_count,
-        js_node_https_server_max_requests_per_socket,
-        js_node_https_server_set_max_requests_per_socket,
-        js_node_https_server_set_timeout_method,
-        js_node_https_server_ref,
-        js_node_https_server_unref,
-        js_node_http2_create_secure_server,
-        js_node_http2_server_listen,
-        js_node_http2_server_close,
-        js_node_http2_server_on,
-        js_node_http2_server_address_json,
-        js_node_http2_get_default_settings,
-        js_node_http2_get_packed_settings,
-        js_node_http2_get_unpacked_settings,
-    ]
-};
+// #1652 / #4975: linker-retention anchors for the server FFI symbols live
+// in force_link.rs (extracted to keep this file under the 2000-line cap).
+mod force_link;

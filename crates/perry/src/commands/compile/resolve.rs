@@ -31,13 +31,14 @@ use anyhow::{anyhow, Result};
 use perry_hir::ModuleKind;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use super::CompilationContext;
 #[cfg(test)]
 use super::{NativeBackend, NativeLibraryManifest};
 
 mod native_library;
+mod tsconfig_paths;
 pub(crate) use native_library::validate_native_library_manifest_value;
 pub(super) use native_library::{
     has_perry_native_library, has_perry_native_module, parse_native_library_manifest,
@@ -500,11 +501,25 @@ pub(super) fn resolve_package_entry(package_dir: &Path, subpath: Option<&str>) -
         // files the build didn't load, so `@swc/helpers`' `import` target
         // (`esm/*.js`) is absent while the `default` target (`cjs/*.cjs`)
         // is present — Node resolves the latter at require time.
-        for entry in resolve_exports_candidates(exports, &export_key) {
-            let entry_path = package_dir.join(&entry);
+        let candidates = resolve_exports_candidates(exports, &export_key);
+        for entry in &candidates {
+            let entry_path = package_dir.join(entry);
             if entry_path.exists() {
                 return Some(entry_path);
             }
+        }
+        // Per Node's resolution algorithm, an applicable `"exports"` entry takes
+        // precedence over the legacy `"module"`/`"main"` fields (#5237). When
+        // `exports` defines this specifier, it is authoritative: never fall
+        // back to `module`/`main` for it, even if no candidate was found on
+        // disk above. Falling through mis-resolved e.g. `y18n` (a `yargs` dep)
+        // to its `"module"` target `./build/lib/index.js` — a named-export-only
+        // file with no `default` — instead of the `exports.import` target
+        // `./index.mjs`. We only return early when `exports` actually produced
+        // a candidate; an empty list means `exports` doesn't cover this
+        // specifier, so the legacy-field fallback below still applies.
+        if let Some(first) = candidates.first() {
+            return resolve_with_extensions(&package_dir.join(first));
         }
     }
 
@@ -607,6 +622,10 @@ fn resolve_exports_with_conditions(
 ) -> Option<String> {
     match exports {
         serde_json::Value::String(s) => Some(s.clone()),
+        // Node "exports" fallback arrays: return the first element that resolves.
+        serde_json::Value::Array(items) => items
+            .iter()
+            .find_map(|item| resolve_exports_with_conditions(item, subpath, conditions)),
         serde_json::Value::Object(map) => {
             // Try the specific subpath first
             if let Some(entry) = map.get(subpath) {
@@ -705,6 +724,16 @@ pub(super) fn resolve_exports_candidates(
             serde_json::Value::String(s) => {
                 if !out.contains(s) {
                     out.push(s.clone());
+                }
+            }
+            // Node "exports" fallback arrays (e.g. y18n's
+            // `[{ "import": "./index.mjs", "require": "./build/index.cjs" }, "./build/index.cjs"]`).
+            // Each element is tried in order; we gather every resolution so the
+            // disk-existence walk in `resolve_package_entry` can pick the first
+            // that is present.
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    collect(item, subpath, out);
                 }
             }
             serde_json::Value::Object(map) => {
@@ -847,10 +876,7 @@ pub(super) fn declaration_sidecar_for_resolved_import(
         return canonical_existing_declaration(resolved_path.to_path_buf());
     }
 
-    if !(import_source.starts_with("./")
-        || import_source.starts_with("../")
-        || import_source.starts_with('/'))
-    {
+    if !(is_relative_specifier(import_source) || import_source.starts_with('/')) {
         let (package_name, subpath) = parse_package_specifier(import_source);
         if let Some(package_dir) = package_dir_for_resolved_path(resolved_path, &package_name) {
             if let Some(sidecar) = resolve_package_declaration_entry(
@@ -870,6 +896,30 @@ pub(super) fn declaration_sidecar_for_resolved_import(
 pub(super) fn is_js_file(path: &Path) -> bool {
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         matches!(ext, "js" | "mjs" | "cjs")
+    } else {
+        false
+    }
+}
+
+/// #5223: Recognized text-asset extensions. An import resolving to one of these
+/// is loaded as a string (its raw contents become the module's default export)
+/// rather than TS-parsed. `.wasm` is intentionally excluded (out of scope).
+pub(super) fn is_recognized_text_asset(path: &Path) -> bool {
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "txt"
+                | "sql"
+                | "md"
+                | "html"
+                | "htm"
+                | "css"
+                | "graphql"
+                | "gql"
+                | "glsl"
+                | "vert"
+                | "frag"
+        )
     } else {
         false
     }
@@ -897,13 +947,91 @@ pub(super) fn resolve_relative_import_path(
     import_source: &str,
     importer_path: &Path,
 ) -> Option<PathBuf> {
-    if !import_source.starts_with("./") && !import_source.starts_with("../") {
+    resolve_relative_import_paths(import_source, importer_path)
+        .map(|resolved| resolved.canonical_path)
+}
+
+pub(super) struct ResolvedPath {
+    pub source_path: PathBuf,
+    pub canonical_path: PathBuf,
+}
+
+pub(super) fn resolve_relative_import_paths(
+    import_source: &str,
+    importer_path: &Path,
+) -> Option<ResolvedPath> {
+    if !is_relative_specifier(import_source) {
         return None;
     }
     let parent = importer_path.parent()?;
     let resolved = parent.join(import_source);
-    let path = resolve_with_extensions(&resolved)?;
-    path.canonicalize().ok()
+    // Source import specifiers are resolved against the path as written by the
+    // program. If that path contains a symlinked component such as /tmp, asking
+    // the filesystem about "a/../b" can follow the symlink before applying ".."
+    // and accidentally probe the canonical sibling.
+    let lexical = normalize_path_lexically(&resolved);
+    let source_path = resolve_with_extensions(&lexical).or_else(|| {
+        if lexical == resolved {
+            None
+        } else {
+            resolve_with_extensions(&resolved)
+        }
+    })?;
+    let canonical_path = source_path.canonicalize().ok()?;
+    Some(ResolvedPath {
+        source_path,
+        canonical_path,
+    })
+}
+
+pub(super) fn resolve_absolute_import_paths(import_source: &str) -> Option<ResolvedPath> {
+    if !import_source.starts_with('/') {
+        return None;
+    }
+    let source_path = resolve_with_extensions(&PathBuf::from(import_source))?;
+    let canonical_path = source_path.canonicalize().ok()?;
+    Some(ResolvedPath {
+        source_path,
+        canonical_path,
+    })
+}
+
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    normalized.pop();
+                } else {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
+}
+
+/// True for ECMAScript relative-import specifiers. Besides the obvious `./x`
+/// and `../x`, the bare `"."` and `".."` are also relative — they resolve to
+/// the current / parent **directory**'s `index` file. `@tanstack/table-core`'s
+/// source uses `import { _getVisibleLeafColumns } from '..'` (the package
+/// barrel); without matching `".."` here it fell through to bare-package
+/// resolution, `import.resolved_path` never matched the index module, and every
+/// name imported through it lowered to an unresolved raw extern symbol → link
+/// failure (`__getVisibleLeafColumns`). Refs #5141.
+pub(super) fn is_relative_specifier(import_source: &str) -> bool {
+    import_source.starts_with("./")
+        || import_source.starts_with("../")
+        || import_source == "."
+        || import_source == ".."
 }
 
 /// Resolve an import specifier to a file path
@@ -938,11 +1066,8 @@ pub(super) fn resolve_import(
         None
     };
 
-    // Handle relative imports (./ or ../)
-    if import_source.starts_with("./")
-        || import_source.starts_with("../")
-        || subpath_import_target.is_some()
-    {
+    // Handle relative imports (./ or ../, plus bare "." / ".." directory imports)
+    if is_relative_specifier(import_source) || subpath_import_target.is_some() {
         if let Some(canonical) = subpath_import_target
             .or_else(|| resolve_relative_import_path(import_source, importer_path))
         {
@@ -1129,6 +1254,27 @@ pub(super) fn resolve_import(
                 return Some((canonical, kind));
             }
         }
+    }
+
+    // Final additive fallback (#5214): tsconfig `compilerOptions.paths` /
+    // `baseUrl`. Consulted only after relative + package + file: resolution
+    // all failed — i.e. exactly the specifiers that would otherwise be
+    // "Could not resolve import". A specifier matched here resolves to a real
+    // file inside the project, so classify it like a relative/user import:
+    // `.ts`/`.tsx` and any user (non-node_modules) file compile natively; only
+    // genuine node_modules JS stays Interpreted.
+    if let Some(canonical) = tsconfig_paths::resolve_tsconfig_paths(import_source, importer_path) {
+        let in_compile_pkg = is_in_compile_package(&canonical, compile_packages)
+            || compile_package_dirs
+                .values()
+                .any(|dir| canonical.starts_with(dir));
+        let in_node_modules = canonical.to_string_lossy().contains("node_modules");
+        let kind = if is_js_file(&canonical) && !in_compile_pkg && in_node_modules {
+            ModuleKind::Interpreted
+        } else {
+            ModuleKind::NativeCompiled
+        };
+        return Some((canonical, kind));
     }
 
     None

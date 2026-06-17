@@ -122,7 +122,8 @@ pub(crate) use write_barrier::{
     emit_array_numeric_write_note_on_block, emit_jsvalue_slot_store_on_block,
     emit_jsvalue_slot_store_scalar_aware_on_block, emit_layout_note_slot_on_block,
     emit_root_heap_word_store_on_block, emit_root_nanbox_store_on_block, emit_write_barrier,
-    emit_write_barrier_slot_on_block, lower_node_stream_super_init, lower_stream_super_init,
+    emit_write_barrier_slot_on_block, lower_event_emitter_subclass_init,
+    lower_node_stream_super_init, lower_stream_super_init,
 };
 
 /// One in-flight inline-constructor return target. See
@@ -334,8 +335,8 @@ pub(crate) struct FnCtx<'a> {
     /// `ctx.classes` chain (which mis-picks same-named cross-module parents).
     pub class_init_chains:
         &'a std::collections::HashMap<String, Vec<(String, Vec<perry_hir::ClassField>)>>,
-    /// Imported class constructor names: class_name → (ctor_fn_name, param_count).
-    pub imported_class_ctors: &'a std::collections::HashMap<String, (String, usize)>,
+    /// Imported class constructor metadata, keyed by effective imported class name.
+    pub imported_class_ctors: &'a std::collections::HashMap<String, crate::codegen::ImportedCtor>,
     /// Per-function param signature: `(declared_param_count,
     /// has_rest_param)`. Used by FuncRef call sites to know whether
     /// to bundle trailing arguments into a rest array.
@@ -398,6 +399,14 @@ pub(crate) struct FnCtx<'a> {
     /// native constructor lowering read `const init = {...}; new Request(url,
     /// init)` with the same field extractor used for inline object literals.
     pub option_object_locals: std::collections::HashMap<u32, Vec<(String, Expr)>>,
+    /// LocalIds of immutable locals provably initialized from an object
+    /// literal (`const o = { … }`, including method-bearing literals that
+    /// lower to an object-building IIFE). #5271: a builtin-named method on
+    /// such a receiver (`o.trim()`, joi's `internals.trim(v, s)`) is the
+    /// object's OWN method, never `String.prototype.<m>` — so the static
+    /// String-method fast path must NOT claim it even when the call's arity
+    /// happens to match the String builtin.
+    pub object_literal_locals: std::collections::HashSet<u32>,
 
     // ── Cross-module import plumbing (Phase F) ──────────────────────
     /// Locals that are namespace imports (`import * as X from "./mod"`).
@@ -1401,7 +1410,7 @@ mod arrays_finds;
 mod bigint_set;
 mod binary;
 mod call_spread;
-mod calls;
+pub(crate) mod calls;
 mod child_proc;
 mod closure;
 mod compare;
@@ -1413,6 +1422,7 @@ mod index_get;
 mod index_set;
 mod instance_misc1;
 pub(crate) use instance_misc1::builtin_parent_reserved_class_id;
+mod class_field_inline_guard;
 mod js_runtime;
 mod literals_vars;
 mod logical_collections;
@@ -1485,6 +1495,8 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         | Expr::MathFloor(..)
         | Expr::MathCeil(..)
         | Expr::MathRound(..)
+        | Expr::MathTrunc(..)
+        | Expr::MathSign(..)
         | Expr::MathAbs(..)
         | Expr::MathLog(..)
         | Expr::MathLog2(..)

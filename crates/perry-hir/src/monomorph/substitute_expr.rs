@@ -55,6 +55,7 @@ pub(crate) fn substitute_expr(expr: &Expr, substitutions: &HashMap<String, Type>
             callee,
             args,
             type_args,
+            byte_offset,
         } => Expr::Call {
             callee: Box::new(substitute_expr(callee, substitutions)),
             args: args
@@ -65,6 +66,7 @@ pub(crate) fn substitute_expr(expr: &Expr, substitutions: &HashMap<String, Type>
                 .iter()
                 .map(|t| substitute_type(t, substitutions))
                 .collect(),
+            byte_offset: *byte_offset,
         },
         Expr::PodLayoutSizeOf { ty } => Expr::PodLayoutSizeOf {
             ty: substitute_type(ty, substitutions),
@@ -257,6 +259,7 @@ pub(crate) fn substitute_expr(expr: &Expr, substitutions: &HashMap<String, Type>
             class_name,
             args,
             type_args,
+            byte_offset,
         } => Expr::New {
             class_name: class_name.clone(),
             args: args
@@ -267,6 +270,7 @@ pub(crate) fn substitute_expr(expr: &Expr, substitutions: &HashMap<String, Type>
                 .iter()
                 .map(|t| substitute_type(t, substitutions))
                 .collect(),
+            byte_offset: *byte_offset,
         },
 
         // Class/Enum references
@@ -757,6 +761,8 @@ pub(crate) fn substitute_expr(expr: &Expr, substitutions: &HashMap<String, Type>
         Expr::MathFloor(expr) => Expr::MathFloor(Box::new(substitute_expr(expr, substitutions))),
         Expr::MathCeil(expr) => Expr::MathCeil(Box::new(substitute_expr(expr, substitutions))),
         Expr::MathRound(expr) => Expr::MathRound(Box::new(substitute_expr(expr, substitutions))),
+        Expr::MathTrunc(expr) => Expr::MathTrunc(Box::new(substitute_expr(expr, substitutions))),
+        Expr::MathSign(expr) => Expr::MathSign(Box::new(substitute_expr(expr, substitutions))),
         Expr::MathAbs(expr) => Expr::MathAbs(Box::new(substitute_expr(expr, substitutions))),
         Expr::MathSqrt(expr) => Expr::MathSqrt(Box::new(substitute_expr(expr, substitutions))),
         Expr::MathPow(base, exp) => Expr::MathPow(

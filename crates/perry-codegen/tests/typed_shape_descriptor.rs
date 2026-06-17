@@ -47,6 +47,8 @@ fn empty_opts() -> CompileOptions {
         deferred_module_prefixes: std::collections::HashSet::new(),
         module_init_deps: Vec::new(),
         is_dynamic_import_target: false,
+        debug_locations: false,
+        module_source: None,
     }
 }
 
@@ -108,6 +110,7 @@ fn module_with_new(class: Class) -> Module {
                 class_name,
                 args: Vec::new(),
                 type_args: Vec::new(),
+                byte_offset: 0,
             }))],
             is_async: false,
             is_generator: false,

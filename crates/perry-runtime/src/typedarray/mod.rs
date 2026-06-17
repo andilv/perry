@@ -175,6 +175,19 @@ pub fn lookup_typed_array_kind(addr: usize) -> Option<u8> {
     TYPED_ARRAY_REGISTRY.with(|r| r.borrow().get(&addr).copied())
 }
 
+/// True for off-GC-heap, header-less allocations — small typed arrays and
+/// `Buffer`s, both raw-`alloc`'d with NO 8-byte `GcHeader` prefix and tracked
+/// only in side tables. The runtime has many type probes of the form
+/// `*(ptr - GC_HEADER_SIZE)` (Promise/Date/Array obj_type checks); each MUST
+/// skip these allocations before that back-read, because reading the
+/// non-existent header crosses outside the block and segfaults when it sits at
+/// the start of a freshly mapped region (#5226). Detection is via the side
+/// tables only — never dereferences `addr`.
+#[inline]
+pub fn is_offheap_sidetable_alloc(addr: usize) -> bool {
+    lookup_typed_array_kind(addr).is_some() || crate::buffer::is_registered_buffer(addr)
+}
+
 pub(crate) fn mark_typed_array_shared_backing(ptr: *const TypedArrayHeader) {
     TYPED_ARRAY_SHARED_BACKING.with(|r| {
         r.borrow_mut().insert(ptr as usize);
@@ -343,6 +356,16 @@ fn typed_array_length_or_throw(val: f64) -> u32 {
             format!("{val}")
         };
         throw_range_error(format!("Invalid typed array length: {shown}").as_bytes());
+    }
+    // #5067 — Perry stores the element count in a `u32` capacity field, so a
+    // length above `u32::MAX` cannot be represented (and the backing block
+    // could never be allocated anyway). Node passes the `<= 2**53-1` length
+    // check for these and then fails the actual allocation, so match its
+    // `RangeError: Array buffer allocation failed` rather than silently
+    // saturating the cast to `u32::MAX` (which produced a wrong-size array
+    // or aborted the process in the allocator).
+    if integer > u32::MAX as f64 {
+        throw_range_error(b"Array buffer allocation failed");
     }
     integer as u32
 }
@@ -532,7 +555,9 @@ pub fn typed_array_alloc(kind: u8, length: u32) -> *mut TypedArrayHeader {
     unsafe {
         let raw = alloc(layout);
         if raw.is_null() {
-            panic!("typed_array_alloc OOM");
+            // #5067 — surface a catchable `RangeError` (Node's
+            // `Array buffer allocation failed`) instead of aborting.
+            throw_range_error(b"Array buffer allocation failed");
         }
         let p = raw as *mut TypedArrayHeader;
         (*p).length = length;

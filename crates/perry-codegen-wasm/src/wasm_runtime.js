@@ -1652,6 +1652,7 @@ const __memDispatch = {
   math_hypot: (a, b) => Math.hypot(a, b),
   math_fround: (x) => Math.fround(x),
   math_clz32: (x) => Math.clz32(x),
+  math_imul: (a, b) => Math.imul(a, b),
   date_now: () => Date.now(),
   js_typeof: (val) => typeof val,
   parse_int: (val) => parseInt(String(val), 10),
@@ -3135,6 +3136,13 @@ function perry_ui_state_bind_toggle(stateH, widgetH) {
     const inp = wrap._inp || wrap.querySelector("input");
     if (inp) { inp.checked = !!s._value; s.subscribers.push(v => { inp.checked = !!v; }); }
   }
+}
+// Issue #5076: programmatically set a Toggle's on/off state (0 = off, non-zero = on).
+function perry_ui_toggle_set_state(widgetH, on) {
+  const wrap = uiGet(widgetH);
+  if (!wrap) return;
+  const inp = wrap._inp || wrap.querySelector("input");
+  if (inp) inp.checked = !!on;
 }
 function perry_ui_state_bind_visibility(stateH, widgetH) {
   const el = uiGet(widgetH), s = uiStates.get(stateH);
@@ -4621,7 +4629,7 @@ const __perryUiDispatch = {
   // Widget creation
   perry_ui_app_create, perry_ui_vstack_create, perry_ui_hstack_create, perry_ui_zstack_create,
   perry_ui_text_create, perry_ui_button_create, perry_ui_textfield_create, perry_ui_securefield_create,
-  perry_ui_toggle_create, perry_ui_slider_create, perry_ui_scrollview_create, perry_ui_spacer_create,
+  perry_ui_toggle_create, perry_ui_toggle_set_state, perry_ui_slider_create, perry_ui_scrollview_create, perry_ui_spacer_create,
   perry_ui_divider_create, perry_ui_progressview_create, perry_ui_image_create, perry_ui_picker_create,
   perry_ui_form_create, perry_ui_section_create, perry_ui_navigationstack_create, perry_ui_canvas_create,
   perry_ui_lazyvstack_create, perry_ui_lazyvstack_update, perry_ui_table_create,
