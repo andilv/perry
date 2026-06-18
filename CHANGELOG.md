@@ -1,3 +1,131 @@
+## v0.5.1180 — ci: warm the main-scoped CI cache so PRs stop building cold
+
+Follow-up to v0.5.1179. Moving sccache to a persisted disk cache was necessary
+but not sufficient: `test.yml` runs only on pull_request + version tags, never
+on push to main. GitHub Actions cache scoping lets a run restore caches from its
+own branch or the default branch (main) — but never another PR's — so with
+nothing running the cache-producing build on main, no main-scoped cache ever
+existed and every PR started cold. (The same flaw silently disabled
+`Swatinem/rust-cache`: its `save-if: refs/heads/main` never fired because
+test.yml doesn't run on main, so target/ was never saved either.)
+
+New `cache-warm.yml`: on every push to main that touches Rust (`crates/**`,
+`Cargo.toml`, `Cargo.lock`), compile — `--no-run` — the test binaries of the
+heaviest crates (`perry-runtime`, `perry-stdlib`, `perry-codegen`, `perry`),
+which pull in essentially the whole dependency graph. It saves under the SAME
+`rust-cache` shared-key (`<os>-perry`) and sccache key prefix
+(`sccache-<os>-perry-`) that test.yml's jobs restore, so the main-scoped caches
+now exist for every PR to pick up. The job is `continue-on-error` (a cache warm,
+never a gate), prunes test binaries between crates to stay within the runner
+disk budget, and uses `concurrency` to cancel superseded warms.
+
+Expected effect: after the first warm run lands on main, PR `cargo-test` should
+restore a warm cache and run ~50-60 min instead of ~90-103 min cold. No
+production code changes.
+
+## v0.5.1179 — ci: move sccache off the GHA backend onto a persisted disk cache (fix cargo-test timeouts)
+
+The `cargo-test` gate was timing out at its 120-min cap on PRs that touch
+`perry-runtime`/`perry-codegen`, and even successful runs were taking 90-103 min
+(not the "~45-50 min" the stale comment claimed). Root cause: sccache was using
+the GitHub Actions cache backend (`SCCACHE_GHA_ENABLED=true`), which stores one
+cache object per compilation unit. GitHub's cache service throttled and
+LRU-evicted the thousands of tiny entries, so a full build wrote ~3.3k objects
+(≈35 min of write time) yet the next run got essentially **zero** Rust cache
+hits (measured on a timed-out run: 3 hits / 3209 misses, 613 write errors). Every
+run effectively recompiled the whole dependency graph cold. `SCCACHE_CACHE_SIZE`
+was a silent no-op under the GHA backend, so the old `2G` never mattered.
+
+Changes (all three sccache jobs — `cargo-test`, `api-docs-drift`,
+`compiler-output-regression` — which compile overlapping crate graphs):
+
+- Switch sccache to a **local disk cache** (`SCCACHE_DIR`, `SCCACHE_GHA_ENABLED=false`,
+  `SCCACHE_CACHE_SIZE=12G`) persisted as a single tarball via `actions/cache@v4`.
+  The cache key is `sccache-<os>-perry-<job>-<run_id>` with a shared
+  `sccache-<os>-perry-` restore-keys prefix, so every run (PRs included) saves
+  its own entry while restoring the most recent one from any of the three jobs —
+  the object cache warms continuously and cross-pollinates instead of starting
+  cold each run.
+- Raise the `cargo-test` `timeout-minutes` 120 → 180 as headroom while the disk
+  cache warms (cold runs are ~90-103 min); can be lowered once warm hit rates are
+  confirmed.
+
+No production code changes.
+
+## v0.5.1178 — perf(codegen): outline per-new-site inline allocator (smaller IR + faster)
+
+`new ClassName(...)` previously emitted the full object-allocation prologue
+inline at every call site. That bloated the IR (and the resulting binary) and
+slowed codegen/compile. The allocation now calls the outlined runtime helper
+`js_object_alloc_class_inline_keys`, so each new-site shrinks to a single call.
+Complementary to #5304 (which outlined the constructor *call*); this outlines
+the *allocation*. The two touch different regions of `lower_call/new.rs`.
+
+Two supporting changes:
+
+- **Runtime (#4717):** folded the field-slot zero-fill into
+  `js_object_alloc_class_inline_keys`. The allocation moved out of per-site
+  codegen, where callers used to zero-fill `max(field_count, 8)` slots by hand;
+  doing it inside the helper keeps every caller — including the outlined `new C()`
+  path — correct by construction. Without it, a field read-before-write or a GC
+  scan of the still-constructing instance could observe stale recycled arena
+  bytes.
+- Split the `FieldInitMode` enum + `apply_field_initializers_recursive` walker
+  out of `lower_call/new.rs` into a sibling `field_init.rs` (pure move) to keep
+  the file under the 2,000-LOC CI size gate.
+
+## v0.5.1177 — fix(codegen): injective function-symbol names (distinct names that sanitize alike)
+
+Two distinct module-level functions could mangle to the same LLVM symbol, so
+clang rejected the module with "invalid redefinition of function". Two root
+causes, both fixed:
+
+- `scoped_fn_name` used the lossy `sanitize` (every non-`[A-Za-z0-9_]` byte →
+  `_`), so minified names like `$Z5` and `_Z5` both became
+  `perry_fn_<mod>___Z5`. Switched to the injective `sanitize_member` (the same
+  mangler `scoped_static_method_name` already uses); byte-identical for the
+  common `[A-Za-z0-9_]` case. `func_names` is keyed by func id and every call
+  site resolves through it, so changing the mangling stays consistent.
+- Minified code reuses short names (`function A`) across scopes, and perry
+  lambda-lifts nested functions to module level, so two module functions can
+  legitimately share a name. `compile_module` now disambiguates collisions
+  with a `__dupN` suffix keyed by the mangled symbol. Exported functions are
+  referenced cross-module by their canonical `scoped_fn_name`, so they reserve
+  their name first and never get suffixed.
+
+Sibling fix to the per-class class-keys-global disambiguation (5ac457967).
+
+## v0.5.1176 — fix(runtime): loose equality (`==`) now treats SSO short strings as strings
+
+`js_jsvalue_loose_equals` (the helper behind `assert.equal`/`assert.deepEqual`
+loose comparison) detected string operands with `is_string()`, which only
+matches heap `STRING_TAG` values and **not** `SHORT_STRING_TAG` SSO-inlined
+strings (length ≤ 5). When both operands were short strings, the function
+matched no arm — not number, not string, not bool — and fell through to
+`return 0`, so `"ab" == "ab"` and loose `assert.equal` on JSON-parsed short
+strings wrongly reported not-equal. The `to_number` coercion helper had the
+same `is_string()` gap, so `"5" == 5` also failed for SSO operands.
+
+Both sites now use `is_any_string()` and decode operands via
+`str_bytes_from_jsvalue` (a stack scratch buffer that handles SSO + heap),
+mirroring the strict-equality (`===`) path, which was already SSO-aware. This
+is a runtime-only change: codegen routes most `==` through other helpers
+(`js_loose_eq`, `js_dynamic_string_equals`), so the user-visible symptom was
+`assert.equal`/`assert.deepEqual` on short strings reporting inequality.
+
+Repro (failed before, passes now, matches `node --experimental-strip-types`):
+
+```ts
+import assert from "node:assert";
+const j: any = JSON.parse('{"k":"ab"}');
+assert.equal(j.k, "ab");                       // was: "Expected values to be loosely equal"
+assert.deepEqual({ x: "ab" }, JSON.parse('{"x":"ab"}'));
+```
+
+Found via an external code audit; verified reproducible before fixing.
+Added `value::equality::loose_eq_sso_tests` (SSO==SSO, SSO==heap, SSO vs
+number, empty-string coercion).
+
 ## v0.5.1175 — fix(http): `IncomingMessage.resume()`/`.pause()` return `this` so `res.resume().on('end', …)` chains (#4975)
 
 Part of the node:http/https behavioral-parity tail (#4975). `Readable.pause()`
