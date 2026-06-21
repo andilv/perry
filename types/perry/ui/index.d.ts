@@ -419,6 +419,35 @@ export function ZStack(): Widget;
  */
 export function Canvas(width: number, height: number): Canvas;
 
+/**
+ * Render-surface host for an external GPU renderer (issue #2395).
+ *
+ * `BloomView(width, height)` reserves a native render-surface view in the Perry
+ * UI view tree. Perry UI does not draw into it — pass the handle returned by
+ * `bloomViewGetHwnd(view)` to a renderer such as the Bloom engine
+ * (`attachToHwnd`), which builds its surface on the view and drives frames.
+ * Available on all native targets (Windows HWND, macOS/iOS/visionOS native
+ * view, GTK4 widget, Android view; tvOS/watchOS link as no-ops).
+ */
+export function BloomView(width: number, height: number): Widget;
+
+/**
+ * The `BloomView`'s native handle as a number — the platform's render-surface
+ * pointer (HWND on Windows, NSView/UIView on Apple, GtkWidget on GTK4). Hand
+ * this to an external renderer's attach call.
+ */
+export function bloomViewGetHwnd(view: Widget): number;
+
+/**
+ * Register a one-shot frame callback (requestAnimationFrame-style). The
+ * callback receives `(timestampMs, deltaMs)`. Re-register from inside the
+ * callback to keep a loop running. Returns an id usable with `cancelFrame`.
+ */
+export function onFrame(callback: (timestampMs: number, deltaMs: number) => void): number;
+
+/** Cancel a pending `onFrame` callback by its id. */
+export function cancelFrame(id: number): void;
+
 /** Dropdown picker. */
 export function Picker(onChange: (index: number) => void): Widget;
 
