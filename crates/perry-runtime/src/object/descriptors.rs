@@ -323,8 +323,12 @@ pub extern "C" fn js_object_get_own_property_descriptor(obj_value: f64, key_valu
                 };
                 if let Some((g, s)) = accessor {
                     return build_accessor_descriptor(
-                        super::class_registry::class_accessor_function_value(g, false),
-                        super::class_registry::class_accessor_function_value(s, true),
+                        super::class_registry::class_accessor_function_value(
+                            g,
+                            false,
+                            &method_name,
+                        ),
+                        super::class_registry::class_accessor_function_value(s, true, &method_name),
                         false,
                         true,
                     );
@@ -728,10 +732,14 @@ pub extern "C" fn js_object_get_own_property_descriptor(obj_value: f64, key_valu
         // fields, but they ARE own properties of the prototype.
         if let Some(cid) = super::class_registry::class_id_for_decl_prototype_object(obj as usize) {
             if let Some(ref name) = key_rust {
-                if let Some((g, s)) = super::class_registry::class_own_accessor_ptrs(cid, name) {
+                if super::class_registry::class_is_key_deleted(cid, name) {
+                    // `delete C.prototype.x` recorded the accessor as removed.
+                } else if let Some((g, s)) =
+                    super::class_registry::class_own_accessor_ptrs(cid, name)
+                {
                     return build_accessor_descriptor(
-                        super::class_registry::class_accessor_function_value(g, false),
-                        super::class_registry::class_accessor_function_value(s, true),
+                        super::class_registry::class_accessor_function_value(g, false, name),
+                        super::class_registry::class_accessor_function_value(s, true, name),
                         false,
                         true,
                     );
@@ -922,6 +930,22 @@ pub extern "C" fn js_object_get_own_property_names(obj_value: f64) -> f64 {
                 }
                 let empty = crate::array::js_array_alloc(0);
                 return f64::from_bits((empty as u64) | 0x7FFD_0000_0000_0000);
+            }
+        }
+        // #5268: a native-module namespace/default object (`fs`, `path`, …)
+        // must enumerate its export surface here, not the internal
+        // `__module__` sentinel that the generic field walk would return.
+        // graceful-fs's `clone.js` does
+        // `getOwnPropertyNames(fs).forEach(k => defineProperty(copy, k,
+        // getOwnPropertyDescriptor(fs, k)))`; with only `__module__` listed,
+        // the clone dropped every fs method (`readFileSync` → undefined).
+        // Mirror `Object.keys` (vt_own_keys_array → native_module_enumerable_keys).
+        if obj_jv.is_pointer() {
+            let obj_ptr = crate::value::js_nanbox_get_pointer(obj_value) as *const ObjectHeader;
+            if !obj_ptr.is_null() {
+                if let Some(arr) = super::native_module::vt_own_keys_array(obj_ptr) {
+                    return f64::from_bits((arr as u64) | 0x7FFD_0000_0000_0000);
+                }
             }
         }
         if let Some(str_value) = boxed_string_payload(obj_value) {

@@ -9,6 +9,7 @@ mod alloc;
 mod dispatch;
 mod dynamic_props;
 mod registry;
+mod unbox;
 mod v8_stubs;
 
 #[cfg(test)]
@@ -50,19 +51,20 @@ pub(crate) use dispatch::{
     coerce_call_this, reify_function_method_value, reset_throw_not_callable_counter,
     resolve_call2_direct,
 };
+pub use unbox::js_closure_unbox_callee_checked;
 
 #[cfg(test)]
 pub(crate) use dynamic_props::test_clear_closure_side_tables;
 pub(crate) use dynamic_props::{
     clone_closure_rebind_this, closure_dynamic_props_owner_moved,
-    visit_closure_dynamic_prop_value_slots_mut, visit_closure_dynamic_prop_values_mut,
-    visit_closure_static_prototype_slot_mut,
+    visit_closure_dynamic_prop_value_slots_mut, visit_closure_static_prototype_slot_mut,
 };
 pub use dynamic_props::{
     closure_delete_own_dynamic_prop, closure_dynamic_props_snapshot, closure_get_dynamic_prop,
     closure_get_own_dynamic_prop, closure_has_own_dynamic_prop, closure_is_key_deleted,
     closure_mark_key_deleted, closure_set_dynamic_prop, closure_set_static_prototype,
-    closure_static_prototype, is_closure_ptr, js_closure_unbind_this,
+    closure_static_prototype, is_closure_ptr, is_module_default_wrapper, js_closure_unbind_this,
+    js_register_module_default_wrapper_value, module_default_wrapper_exports,
     scan_closure_dynamic_props_roots_mut,
 };
 

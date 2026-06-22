@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::collectors::{collect_let_ids, collect_ref_ids_in_stmts};
-use perry_hir::WithSetFallback;
+use perry_hir::{infer_refinable_expr_type, WithSetFallback};
 
 /// Determine which local ids in the given statement sequence need
 /// heap-boxed storage. An id gets boxed when:
@@ -44,6 +44,48 @@ pub(crate) fn collect_boxed_vars(stmts: &[perry_hir::Stmt]) -> HashSet<u32> {
     // (which holds a box pointer, not a usable value).
     collect_prealloc_box_ids_in_stmts(stmts, &mut boxed);
     boxed
+}
+
+/// Determine which *parameter* ids need heap-boxed storage. Mirrors the
+/// (captured AND mutated) rule of `collect_boxed_vars_scope`, but for
+/// function/closure parameters, which never appear in that function's
+/// `declared` (Stmt::Let) set and so were previously never boxed
+/// (boxed_vars.rs's standing "params … we don't box them yet" TODO).
+///
+/// #5521: bcryptjs `_crypt(b, salt, rounds, …)` reassigns `rounds =
+/// (1 << rounds) >>> 0` and the hoisted inner `next()` closure captures
+/// `rounds`. Unboxed, `next()` saw the stale pre-reassignment snapshot
+/// (the original log2 rounds, 12) instead of the live value (4096), so the
+/// key-schedule loop ran 12 iterations and produced a wrong hash.
+///
+/// A param is boxed when it is referenced inside some closure in `body`
+/// AND mutated — either inside a closure or in the enclosing scope. The
+/// synthesized `arguments` param is excluded: it carries its own
+/// mapped-box handling (`materialize_arguments_object`).
+pub(crate) fn collect_boxed_param_ids(
+    params: &[perry_hir::Param],
+    body: &[perry_hir::Stmt],
+) -> HashSet<u32> {
+    let mut out = HashSet::new();
+    if params.is_empty() {
+        return out;
+    }
+    let mut closure_refs: HashSet<u32> = HashSet::new();
+    let mut closure_writes: HashSet<u32> = HashSet::new();
+    collect_closure_refs_and_writes_in_stmts(body, &mut closure_refs, &mut closure_writes);
+    let mut outer_writes: HashSet<u32> = HashSet::new();
+    collect_outer_writes_in_stmts(body, &mut outer_writes);
+    for p in params {
+        if p.arguments_object.is_some() {
+            continue;
+        }
+        if closure_refs.contains(&p.id)
+            && (closure_writes.contains(&p.id) || outer_writes.contains(&p.id))
+        {
+            out.insert(p.id);
+        }
+    }
+    out
 }
 
 fn collect_prealloc_box_ids_in_stmts(stmts: &[perry_hir::Stmt], out: &mut HashSet<u32>) {
@@ -282,7 +324,7 @@ fn collect_nested_closure_boxed_vars_in_stmt(stmt: &perry_hir::Stmt, out: &mut H
 fn collect_nested_closure_boxed_vars_in_expr(expr: &perry_hir::Expr, out: &mut HashSet<u32>) {
     use perry_hir::Expr;
     match expr {
-        Expr::Closure { body, .. } => {
+        Expr::Closure { params, body, .. } => {
             // Each closure is its own lexical scope — run the scope
             // analysis on the body, then recurse into any closures
             // that appear inside it. Issue #633 followup: also collect
@@ -293,6 +335,10 @@ fn collect_nested_closure_boxed_vars_in_expr(expr: &perry_hir::Expr, out: &mut H
             // slot would skip `js_box_get`.
             let inner = collect_boxed_vars_scope(body);
             out.extend(inner);
+            // #5521: a closure parameter captured+mutated by a deeper
+            // nested closure needs the same param boxing as a top-level
+            // function param.
+            out.extend(collect_boxed_param_ids(params, body));
             collect_prealloc_box_ids_in_stmts(body, out);
             collect_nested_closure_boxed_vars_in_stmts(body, out);
         }
@@ -1391,80 +1437,16 @@ fn collect_closure_let_types_in_expr(
 
 /// Mirror of `expr::refine_type_from_init` but without a FnCtx —
 /// used at module-level type collection time before any FnCtx
-/// exists. Conservative: only refines a small set of expression
-/// shapes where the type is obvious from the AST alone.
+/// exists. Conservative: most generic runtime facts come from the shared HIR
+/// type-analysis spine; only codegen-specific/native escape facts remain here.
 fn refine_type_from_init_simple(init: &perry_hir::Expr) -> Option<perry_types::Type> {
     use perry_hir::Expr;
     use perry_types::Type;
     match init {
-        Expr::Array(_) | Expr::ArraySpread(_) => Some(Type::Array(Box::new(Type::Any))),
-        Expr::ArraySlice { .. }
-        | Expr::ArrayMap { .. }
-        | Expr::ArrayFilter { .. }
-        | Expr::ArrayFlat { .. }
-        | Expr::ArrayFlatMap { .. }
-        | Expr::ObjectKeys(_)
-        | Expr::ForInKeys(_)
-        | Expr::ObjectValues(_)
-        | Expr::ObjectEntries(_)
-        | Expr::ArrayEntries { .. }
-        | Expr::ArrayKeys { .. }
-        | Expr::ArrayValues { .. }
-        | Expr::StringMatch { .. } => Some(Type::Array(Box::new(Type::Any))),
+        // `String.prototype.matchAll` returns an iterator, but the current
+        // codegen collector only tracks broad escape-hatch value facts here.
         Expr::StringMatchAll { .. } => Some(Type::Any),
-        Expr::String(_) | Expr::ArrayJoin { .. } | Expr::StringCoerce(_) => Some(Type::String),
-        Expr::Bool(_) => Some(Type::Boolean),
-        Expr::BigInt(_) | Expr::BigIntCoerce(_) => Some(Type::BigInt),
-        Expr::Binary { op, left, right }
-            if matches!(
-                op,
-                perry_hir::BinaryOp::Add
-                    | perry_hir::BinaryOp::Sub
-                    | perry_hir::BinaryOp::Mul
-                    | perry_hir::BinaryOp::Div
-                    | perry_hir::BinaryOp::Mod
-                    | perry_hir::BinaryOp::Pow
-                    | perry_hir::BinaryOp::BitAnd
-                    | perry_hir::BinaryOp::BitOr
-                    | perry_hir::BinaryOp::BitXor
-                    | perry_hir::BinaryOp::Shl
-                    | perry_hir::BinaryOp::Shr
-            ) && matches!(
-                (
-                    refine_type_from_init_simple(left),
-                    refine_type_from_init_simple(right)
-                ),
-                (Some(Type::BigInt), _) | (_, Some(Type::BigInt))
-            ) =>
-        {
-            Some(Type::BigInt)
-        }
-        Expr::Unary { op, operand }
-            if matches!(op, perry_hir::UnaryOp::Neg | perry_hir::UnaryOp::BitNot)
-                && matches!(refine_type_from_init_simple(operand), Some(Type::BigInt)) =>
-        {
-            Some(Type::BigInt)
-        }
-        Expr::New { class_name, .. } => Some(Type::Named(class_name.clone())),
         Expr::NetCreateServer { .. } => Some(Type::Named("Server".to_string())),
-        // `const ta = new Int32Array(n)` — refine to Named("Int32Array") so
-        // that `.length` and method dispatch use the typed-array fast paths.
-        Expr::TypedArrayNew { kind, .. } => {
-            let name = match *kind {
-                0 => "Int8Array",
-                1 => "Uint8Array",
-                2 => "Int16Array",
-                3 => "Uint16Array",
-                4 => "Int32Array",
-                5 => "Uint32Array",
-                6 => "Float32Array",
-                7 => "Float64Array",
-                8 => "Uint8ClampedArray",
-                11 => "Float16Array",
-                _ => return None,
-            };
-            Some(Type::Named(name.to_string()))
-        }
         e if crate::type_analysis_net::net_result_class(e).is_some() => {
             crate::type_analysis_net::net_result_class(e).map(|name| Type::Named(name.to_string()))
         }
@@ -1476,6 +1458,55 @@ fn refine_type_from_init_simple(init: &perry_hir::Expr) -> Option<perry_types::T
         } if module == "buffer" && method == "copyBytesFrom" => {
             Some(Type::Named("Uint8Array".to_string()))
         }
-        _ => None,
+        _ => infer_refinable_type_without_context(init),
+    }
+}
+
+fn infer_refinable_type_without_context(init: &perry_hir::Expr) -> Option<perry_types::Type> {
+    infer_refinable_expr_type(init, &())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use perry_hir::Expr;
+    use perry_types::Type;
+
+    #[test]
+    fn simple_refinement_uses_shared_hir_inference_for_constructed_values() {
+        assert_eq!(
+            refine_type_from_init_simple(&Expr::DateNew(vec![])),
+            Some(Type::Named("Date".to_string()))
+        );
+        assert_eq!(
+            refine_type_from_init_simple(&Expr::Uint8ArrayNew(None)),
+            Some(Type::Named("Uint8Array".to_string()))
+        );
+        assert_eq!(
+            refine_type_from_init_simple(&Expr::CryptoRandomBytes(Box::new(Expr::Integer(8)))),
+            Some(Type::Named("Uint8Array".to_string()))
+        );
+        assert_eq!(
+            refine_type_from_init_simple(&Expr::ArraySlice {
+                array: Box::new(Expr::Array(vec![])),
+                start: Box::new(Expr::Integer(0)),
+                end: None,
+            }),
+            Some(Type::Array(Box::new(Type::Any)))
+        );
+        assert_eq!(
+            refine_type_from_init_simple(&Expr::ArrayJoin {
+                array: Box::new(Expr::Array(vec![])),
+                separator: None,
+            }),
+            Some(Type::String)
+        );
+    }
+
+    #[test]
+    fn simple_refinement_filters_unknown_and_void_results() {
+        assert_eq!(refine_type_from_init_simple(&Expr::LocalGet(404)), None);
+        assert_eq!(refine_type_from_init_simple(&Expr::Undefined), None);
+        assert_eq!(refine_type_from_init_simple(&Expr::ProcessExit(None)), None);
     }
 }

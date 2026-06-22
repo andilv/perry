@@ -1,8 +1,6 @@
 //! Compile command - compiles TypeScript to native executable
 
 use anyhow::{anyhow, Result};
-use clap::Args;
-use perry_hir::{Module as HirModule, ModuleKind};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -53,10 +51,12 @@ use app_metadata::rust_target_triple;
 // compile.rs anymore now that the iOS bundle code moved out).
 pub(crate) use audit_manifest::allowlist_matches;
 use bootstrap::{
-    apply_i18n_pass, bundle_extensions_into_ctx, dump_hir_for_debug, harvest_harmonyos_index_ets,
-    maybe_init_type_checker, rerun_collect_with_class_field_types, run_native_instance_fixups,
-    run_post_collect_preflight,
+    apply_i18n_pass, bundle_extensions_into_ctx, dump_hir_for_debug, maybe_init_type_checker,
+    rerun_collect_with_class_field_types, run_native_instance_fixups, run_post_collect_preflight,
 };
+// HarmonyOS ArkTS harvest only exists when the arkts backend is compiled in.
+#[cfg(feature = "backend-arkts")]
+use bootstrap::harvest_harmonyos_index_ets;
 use build_cache::BuildCacheProbe;
 use bundle_apple::{bundle_for_tvos, bundle_for_visionos, bundle_for_watchos};
 use bundle_ios::build_ios_app_bundle;
@@ -78,6 +78,7 @@ use link::{build_and_run_link, write_link_cache_manifest};
 pub use lock_scan::collect_native_archives_for_lock;
 pub(crate) use lock_scan::run_lock_verify_for_compile;
 pub use object_cache::ObjectCache;
+pub use object_cache::{cache_dir_override, resolve_cache_dir};
 use object_cache::{compute_object_cache_key, djb2_hash};
 use optimized_libs::{build_optimized_libs, OptimizedLibs};
 use parse_cache::parse_cached;
@@ -96,18 +97,41 @@ use resolve::{
 };
 use strip_dedup::{
     dedup_native_lib_for_tier3, dedup_runtime_for_tier3, dedup_stdlib_for_tier3,
-    strip_duplicate_objects_from_lib, strip_duplicate_objects_from_well_known_lib,
+    localize_stdlib_stub_symbols_for_windows, strip_duplicate_objects_from_lib,
+    strip_duplicate_objects_from_well_known_lib,
 };
 use targets::{
-    apple_sdk_version, compile_for_android_widget, compile_for_ios_widget, compile_for_wasm,
-    compile_for_watchos_widget, compile_for_wearos_tile, find_visionos_swift_runtime,
-    find_watchos_swift_runtime, generate_embedded_js_object, generate_js_bundle,
+    apple_sdk_version, find_visionos_swift_runtime, find_watchos_swift_runtime,
+    generate_embedded_js_object, generate_js_bundle,
 };
+// Codegen-backend entrypoints (#5422) — only present when their backend feature
+// is compiled in. The matching `--target` routing below errors cleanly when a
+// backend was built out.
+#[cfg(feature = "backend-glance")]
+use targets::compile_for_android_widget;
+#[cfg(feature = "backend-wasm")]
+use targets::compile_for_wasm;
+#[cfg(feature = "backend-wear-tiles")]
+use targets::compile_for_wearos_tile;
+#[cfg(feature = "backend-swiftui")]
+use targets::{compile_for_ios_widget, compile_for_watchos_widget};
 
 use super::progress::{ProgressSnapshot, VerboseProgress};
 
 mod types;
 pub use types::*;
+
+/// Error text for a `--target` whose codegen backend was compiled out (#5422).
+/// Always defined so the `#[cfg(not(...))]` routing arms can call it; unused in
+/// a full-cli build, hence the allow.
+#[allow(dead_code)]
+fn backend_disabled_msg(target: &str, feature: &str) -> String {
+    format!(
+        "target '{target}' needs the '{feature}' codegen backend, but this perry \
+         was built without it. Rebuild with `--features {feature}` (or the default \
+         `full-cli` / `all-codegen-backends`)."
+    )
+}
 
 struct NativeObjectArtifact {
     path: PathBuf,
@@ -218,6 +242,7 @@ mod tests {
             computed_members: Vec::new(),
             decorators: Vec::new(),
             is_exported: true,
+            is_nested: false,
             aliases: Vec::new(),
         };
         let project_root = PathBuf::from("/repo");
@@ -448,11 +473,29 @@ pub fn run_with_parse_cache(
 
     let mut ctx = CompilationContext::new(project_root.clone());
     ctx.cache_root = object_cache_project_root(&args.input, &project_root);
+    // Resolve the on-disk cache directory ONCE, here, before any cache
+    // consumer runs. Precedence: `--cache-dir` → `PERRY_CACHE_DIR` →
+    // perry.toml `[perry] cacheDir` → package.json `perry.cacheDir` →
+    // default `<cache_root>/node_modules/.cache/perry` (the find-cache-dir
+    // convention). `cache_dir_override` reads the env + perry.toml +
+    // package.json half; the CLI flag wins over all three. Relative
+    // overrides resolve against `cache_root`. Computed here because the
+    // build-cache probe below runs before
+    // `host_config::apply_pkg_and_toml_config`, so the build cache must
+    // already know the dir. host_config re-resolves `ctx.cache_dir` to the
+    // same value when it parses the config alongside its sibling `perry.*`
+    // fields — that pass owns the canonical read.
+    let cache_dir_override = args
+        .cache_dir
+        .clone()
+        .or_else(|| object_cache::cache_dir_override(&ctx.cache_root));
+    ctx.cache_dir = object_cache::resolve_cache_dir(&ctx.cache_root, cache_dir_override.as_deref());
     // #5247: propagate `--debug-symbols` so `collect_modules` records the
     // CJS-wrap source mapping needed to render original-source line numbers.
     ctx.debug_symbols = args.debug_symbols;
 
-    let build_cache_probe = BuildCacheProbe::new(&args, &project_root, &ctx.cache_root);
+    let build_cache_probe =
+        BuildCacheProbe::new(&args, &project_root, &ctx.cache_root, &ctx.cache_dir);
     let mut build_cache_stats = build_cache_probe.probe();
     if build_cache_stats.hit {
         if let OutputFormat::Json = format {
@@ -561,7 +604,17 @@ pub fn run_with_parse_cache(
 
     // --- Web/WASM target: emit WASM binary + JS runtime bridge ---
     if matches!(args.target.as_deref(), Some("web") | Some("wasm")) {
-        return compile_for_wasm(&ctx, &args, format);
+        #[cfg(feature = "backend-wasm")]
+        {
+            return compile_for_wasm(&ctx, &args, format);
+        }
+        #[cfg(not(feature = "backend-wasm"))]
+        {
+            anyhow::bail!(backend_disabled_msg(
+                args.target.as_deref().unwrap_or("wasm"),
+                "backend-wasm",
+            ));
+        }
     }
 
     // --- Widget targets: emit platform-specific source + optional native provider ---
@@ -569,22 +622,51 @@ pub fn run_with_parse_cache(
         args.target.as_deref(),
         Some("ios-widget") | Some("ios-widget-simulator")
     ) {
-        return compile_for_ios_widget(&ctx, &args, format);
+        #[cfg(feature = "backend-swiftui")]
+        {
+            return compile_for_ios_widget(&ctx, &args, format);
+        }
+        #[cfg(not(feature = "backend-swiftui"))]
+        {
+            anyhow::bail!(backend_disabled_msg("ios-widget", "backend-swiftui"));
+        }
     }
     if matches!(
         args.target.as_deref(),
         Some("watchos-widget") | Some("watchos-widget-simulator")
     ) {
-        return compile_for_watchos_widget(&ctx, &args, format);
+        #[cfg(feature = "backend-swiftui")]
+        {
+            return compile_for_watchos_widget(&ctx, &args, format);
+        }
+        #[cfg(not(feature = "backend-swiftui"))]
+        {
+            anyhow::bail!(backend_disabled_msg("watchos-widget", "backend-swiftui"));
+        }
     }
     if args.target.as_deref() == Some("android-widget") {
-        return compile_for_android_widget(&ctx, &args, format);
+        #[cfg(feature = "backend-glance")]
+        {
+            return compile_for_android_widget(&ctx, &args, format);
+        }
+        #[cfg(not(feature = "backend-glance"))]
+        {
+            anyhow::bail!(backend_disabled_msg("android-widget", "backend-glance"));
+        }
     }
     if args.target.as_deref() == Some("wearos-tile") {
-        return compile_for_wearos_tile(&ctx, &args, format);
+        #[cfg(feature = "backend-wear-tiles")]
+        {
+            return compile_for_wearos_tile(&ctx, &args, format);
+        }
+        #[cfg(not(feature = "backend-wear-tiles"))]
+        {
+            anyhow::bail!(backend_disabled_msg("wearos-tile", "backend-wear-tiles"));
+        }
     }
 
     run_native_instance_fixups(&mut ctx);
+    #[cfg(feature = "backend-arkts")]
     harvest_harmonyos_index_ets(&args, &mut ctx, format);
 
     let i18n_table = apply_i18n_pass(&mut ctx, i18n_config.as_ref(), &i18n_translations, format);
@@ -741,7 +823,7 @@ pub fn run_with_parse_cache(
     // Named("BlockTag") -> Union([...]) for correct ABI types in function signatures.
     let mut all_type_aliases: std::collections::BTreeMap<String, perry_types::Type> =
         std::collections::BTreeMap::new();
-    for (_path, hir_module) in &ctx.native_modules {
+    for hir_module in ctx.native_modules.values() {
         for ta in &hir_module.type_aliases {
             if ta.type_params.is_empty() {
                 all_type_aliases.insert(ta.name.clone(), ta.ty.clone());
@@ -773,7 +855,7 @@ pub fn run_with_parse_cache(
     // `hir_module.imports` doesn't even mention the source module.
     let mut all_program_type_names: std::collections::HashSet<String> =
         std::collections::HashSet::new();
-    for (_path, hir_module) in &ctx.native_modules {
+    for hir_module in ctx.native_modules.values() {
         for class in &hir_module.classes {
             all_program_type_names.insert(class.name.clone());
         }
@@ -1019,9 +1101,7 @@ pub fn run_with_parse_cache(
         BTreeMap::new();
     for (path, hir_module) in &ctx.native_modules {
         let path_str = path.to_string_lossy().to_string();
-        let exports = all_module_exports
-            .entry(path_str.clone())
-            .or_insert_with(BTreeMap::new);
+        let exports = all_module_exports.entry(path_str.clone()).or_default();
         // Exported functions
         for func in &hir_module.functions {
             if func.is_exported {
@@ -1110,7 +1190,7 @@ pub fn run_with_parse_cache(
                 {
                     all_module_export_origin_names
                         .entry(path_str.clone())
-                        .or_insert_with(BTreeMap::new)
+                        .or_default()
                         .insert(exported.clone(), local.clone());
                 }
             }
@@ -1292,7 +1372,7 @@ pub fn run_with_parse_cache(
         for (module_path, name, origin, origin_name) in new_export_entries {
             all_module_exports
                 .entry(module_path.clone())
-                .or_insert_with(BTreeMap::new)
+                .or_default()
                 .insert(name.clone(), origin);
             // Only record the origin-name entry when it actually differs
             // from the export name (the common identity case is implicit —
@@ -1302,7 +1382,7 @@ pub fn run_with_parse_cache(
             if origin_name != name {
                 all_module_export_origin_names
                     .entry(module_path)
-                    .or_insert_with(BTreeMap::new)
+                    .or_default()
                     .insert(name, origin_name);
             }
         }
@@ -1810,7 +1890,7 @@ pub fn run_with_parse_cache(
     // mode here so the per-module codegen can emit .ll instead of .o.
     let bitcode_link = std::env::var("PERRY_LLVM_BITCODE_LINK").ok().as_deref() == Some("1");
 
-    // V2.2: Per-module object cache at `.perry-cache/objects/<target>/<key>.o`.
+    // V2.2: Per-module object cache at `<cache_dir>/objects/<target>/<key>.o`.
     // Disabled when the user passed `--no-cache`, when `PERRY_NO_CACHE=1`, or
     // when we're in bitcode-link mode (the artifacts aren't object files), or
     // when native-region verification is enabled and lowering must run.
@@ -1828,7 +1908,7 @@ pub fn run_with_parse_cache(
     // Target dir name for the cache layout. Using the resolved LLVM triple
     // keeps cross-compile caches from colliding with native-host caches.
     let cache_target_dir = target.as_deref().unwrap_or("host");
-    let object_cache = ObjectCache::new(&ctx.cache_root, cache_target_dir, cache_enabled);
+    let object_cache = ObjectCache::new(&ctx.cache_dir, cache_target_dir, cache_enabled);
     let perry_version = env!("CARGO_PKG_VERSION");
 
     // Issue #100: precompute the dynamic-import plumbing so the rayon
@@ -1914,7 +1994,7 @@ pub fn run_with_parse_cache(
     // Set of native-module paths that are dynamic-import targets. We
     // also build a parallel set keyed by Module::name for flatten_exports.
     let mut dyn_target_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-    for (_path, hir_module) in &ctx.native_modules {
+    for hir_module in ctx.native_modules.values() {
         for import in &hir_module.imports {
             // `is_dynamic` covers dynamic-only synthetic edges;
             // `is_dynamic_target` (#1672) covers a static edge that is
@@ -1974,9 +2054,7 @@ pub fn run_with_parse_cache(
                     .iter()
                     .find(|c| c.name == fe.source_local)
                 {
-                    perry_codegen::NamespaceEntryKind::LocalClass {
-                        class_id: class.id as u32,
-                    }
+                    perry_codegen::NamespaceEntryKind::LocalClass { class_id: class.id }
                 } else if let Some(global) = target_hir
                     .globals
                     .iter()
@@ -2013,9 +2091,7 @@ pub fn run_with_parse_cache(
                     } else if let Some(class) =
                         src.classes.iter().find(|c| c.name == fe.source_local)
                     {
-                        perry_codegen::NamespaceEntryKind::LocalClass {
-                            class_id: class.id as u32,
-                        }
+                        perry_codegen::NamespaceEntryKind::LocalClass { class_id: class.id }
                     } else {
                         perry_codegen::NamespaceEntryKind::ForeignVar {
                             source_prefix: source_prefix.clone(),
@@ -2182,6 +2258,24 @@ pub fn run_with_parse_cache(
                 .filter(|(_, m)| m.init_kind == perry_hir::ModuleInitKind::Deferred)
                 .map(|(_, m)| sanitize_name(&m.name))
                 .collect();
+            // Next.js wall 54 (part 2): `(absolute_path, prefix)` for every
+            // `.next/server/**` runtime module so the entry's `main` can record
+            // its `__init` address by path (`js_register_path_init`). Only the
+            // entry emits these; the runtime `require(absolutePath)` shim then
+            // triggers the matching module's lazy init on first load.
+            let nextjs_path_init_modules: Vec<(String, String)> = if is_entry {
+                ctx.native_modules
+                    .iter()
+                    .filter(|(p, _)| {
+                        self::collect_modules::is_nextjs_runtime_module(p)
+                    })
+                    .map(|(p, m)| {
+                        (p.to_string_lossy().into_owned(), sanitize_name(&m.name))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             // Issue #753: prefixes of this module's static-import +
             // re-export source modules (non-entry only — the entry's
             // body is in `main`, not a `__init`). The wrapper at
@@ -2370,7 +2464,7 @@ pub fn run_with_parse_cache(
                 }
                 for spec in &import.specifiers {
                     if let perry_hir::ImportSpecifier::Namespace { local } = spec {
-                        if !namespace_imports.contains(&local) {
+                        if !namespace_imports.contains(local) {
                             namespace_imports.push(local.clone());
                         }
                     }
@@ -2569,6 +2663,11 @@ pub fn run_with_parse_cache(
                                             .map(|c| c.params.len())
                                             .unwrap_or(0),
                                         has_own_constructor: class.constructor.is_some(),
+                                        constructor_has_rest: class
+                                            .constructor
+                                            .as_ref()
+                                            .map(|c| c.params.iter().any(|p| p.is_rest))
+                                            .unwrap_or(false),
                                         has_instance_fields: !class.fields.is_empty(),
                                         method_names: class
                                             .methods
@@ -2765,6 +2864,11 @@ pub fn run_with_parse_cache(
                                                 .map(|c| c.params.len())
                                                 .unwrap_or(0),
                                             has_own_constructor: class.constructor.is_some(),
+                                            constructor_has_rest: class
+                                                .constructor
+                                                .as_ref()
+                                                .map(|c| c.params.iter().any(|p| p.is_rest))
+                                                .unwrap_or(false),
                                             has_instance_fields: !class.fields.is_empty(),
                                             method_names: class
                                                 .methods
@@ -3013,6 +3117,11 @@ pub fn run_with_parse_cache(
                                     .map(|c| c.params.len())
                                     .unwrap_or(0),
                                 has_own_constructor: class.constructor.is_some(),
+                                constructor_has_rest: class
+                                    .constructor
+                                    .as_ref()
+                                    .map(|c| c.params.iter().any(|p| p.is_rest))
+                                    .unwrap_or(false),
                                 has_instance_fields: !class.fields.is_empty(),
                                 method_names: class
                                     .methods
@@ -3079,6 +3188,11 @@ pub fn run_with_parse_cache(
                                 .map(|c| c.params.len())
                                 .unwrap_or(0),
                             has_own_constructor: class.constructor.is_some(),
+                            constructor_has_rest: class
+                                .constructor
+                                .as_ref()
+                                .map(|c| c.params.iter().any(|p| p.is_rest))
+                                .unwrap_or(false),
                             has_instance_fields: !class.fields.is_empty(),
                             method_names: class.methods.iter().map(|m| m.name.clone()).collect(),
                             method_param_counts: class
@@ -3232,6 +3346,11 @@ pub fn run_with_parse_cache(
                                 .map(|c| c.params.len())
                                 .unwrap_or(0),
                             has_own_constructor: class.constructor.is_some(),
+                            constructor_has_rest: class
+                                .constructor
+                                .as_ref()
+                                .map(|c| c.params.iter().any(|p| p.is_rest))
+                                .unwrap_or(false),
                             has_instance_fields: !class.fields.is_empty(),
                             method_names: class.methods.iter().map(|m| m.name.clone()).collect(),
                             method_param_counts: class
@@ -3692,6 +3811,11 @@ pub fn run_with_parse_cache(
                                 .map(|c| c.params.len())
                                 .unwrap_or(0),
                             has_own_constructor: class.constructor.is_some(),
+                            constructor_has_rest: class
+                                .constructor
+                                .as_ref()
+                                .map(|c| c.params.iter().any(|p| p.is_rest))
+                                .unwrap_or(false),
                             has_instance_fields: !class.fields.is_empty(),
                             method_names: class.methods.iter().map(|m| m.name.clone()).collect(),
                             method_param_counts: class
@@ -3886,6 +4010,11 @@ pub fn run_with_parse_cache(
                                 .map(|c| c.params.len())
                                 .unwrap_or(0),
                             has_own_constructor: class.constructor.is_some(),
+                            constructor_has_rest: class
+                                .constructor
+                                .as_ref()
+                                .map(|c| c.params.iter().any(|p| p.is_rest))
+                                .unwrap_or(false),
                             has_instance_fields: !class.fields.is_empty(),
                             method_names: class.methods.iter().map(|m| m.name.clone()).collect(),
                             method_param_counts: class
@@ -4024,6 +4153,7 @@ pub fn run_with_parse_cache(
                     .get(path)
                     .cloned()
                     .unwrap_or_default(),
+                nextjs_path_init_modules,
                 deferred_module_prefixes,
                 module_init_deps,
                 // Issue #842: signal side-effect-only dynamic-import
@@ -4129,11 +4259,11 @@ pub fn run_with_parse_cache(
                     );
                 }
                 // PERRY_CACHE_DEBUG_HIR=1: also dump the post-transform HIR of
-                // misses to .perry-cache/debug/<key>.txt so a user can diff two
+                // misses to <cache_dir>/debug/<key>.txt so a user can diff two
                 // miss-dumps and see exactly what differed. Best-effort — IO
                 // errors never fail the build.
                 if std::env::var("PERRY_CACHE_DEBUG_HIR").as_deref() == Ok("1") {
-                    let dump_dir = ctx.cache_root.join(".perry-cache").join("debug");
+                    let dump_dir = ctx.cache_dir.join("debug");
                     if std::fs::create_dir_all(&dump_dir).is_ok() {
                         let dump_path = dump_dir.join(format!("{:016x}.txt", k));
                         let _ = std::fs::write(
@@ -4182,14 +4312,14 @@ pub fn run_with_parse_cache(
                     stored_cache_path: true,
                 });
             }
-            return Ok(NativeObjectArtifact {
+            Ok(NativeObjectArtifact {
                 path: obj_path,
                 bytes: Some(object_code),
                 fingerprint: object_fingerprint,
                 cleanup_after_link: true,
                 reused_cache_path: false,
                 stored_cache_path: false,
-            });
+            })
         })
         .collect();
 
@@ -5259,7 +5389,64 @@ pub fn run_with_parse_cache(
 
     // For dylib output, skip runtime/stdlib linking — symbols resolve from host at dlopen time
     if is_dylib {
-        let mut cmd = if is_linux {
+        let is_dylib_windows = matches!(target.as_deref(), Some("windows") | Some("windows-winui"))
+            || (target.is_none() && cfg!(target_os = "windows"));
+        let has_plugin_deactivate = ctx
+            .native_modules
+            .values()
+            .any(|m| m.exported_functions.iter().any(|(n, _)| n == "deactivate"));
+        let mut cmd = if is_dylib_windows {
+            // Windows — emit a .dll via lld-link. The plugin DLL's external
+            // references to `perry_*` / `js_*` resolve against the host
+            // process at LoadLibrary time, just like macOS
+            // `-flat_namespace -undefined dynamic_lookup`.
+            //
+            // A .def file IS still needed here — lld-link's default is to
+            // emit an empty export table, and the host's `loadPlugin` calls
+            // `GetProcAddress(handle, "plugin_activate")` to find the
+            // plugin's entry point. The `LIBRARY` directive names the DLL
+            // and the `EXPORTS` section lists the three plugin ABI symbols
+            // that the codegen layer emits for the dylib's entry module
+            // (see `compile_module_entry`). `plugin_deactivate` is
+            // optional and only listed when the user's `deactivate`
+            // function is actually exported.
+            //
+            // `/FORCE:UNRESOLVED` lets the linker produce the DLL even though
+            // every `perry_*` / `js_*` symbol is undefined; the loader fills
+            // them in from the host at LoadLibrary time. Without it, the
+            // link fails with LNK2019 on the first unresolved `js_*` symbol
+            // and no DLL is emitted.
+            //
+            // We use lld-link rather than MSVC link.exe here: lld-link honors
+            // /FORCE:UNRESOLVED on the LLVM .o files that Perry emits (treating
+            // the missing symbols as warnings that produce a runnable DLL),
+            // whereas MSVC link.exe returns 0 without writing the DLL — see
+            // the cross-linker note in `select_linker_command`.
+            let linker = find_lld_link().unwrap_or_else(|| PathBuf::from("lld-link"));
+            let mut c = Command::new(linker);
+            c.arg("/NOLOGO").arg("/DLL").arg("/FORCE:UNRESOLVED");
+            let stem = exe_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("perry_plugin");
+            let def_path = std::env::temp_dir().join(format!(
+                "perry_plugin_dylib_{}_{}.def",
+                std::process::id(),
+                stem
+            ));
+            if let Ok(mut def_file) = std::fs::File::create(&def_path) {
+                use std::io::Write;
+                let _ = writeln!(def_file, "LIBRARY {}", stem);
+                let _ = writeln!(def_file, "EXPORTS");
+                let _ = writeln!(def_file, "    plugin_activate");
+                let _ = writeln!(def_file, "    perry_plugin_abi_version");
+                if has_plugin_deactivate {
+                    let _ = writeln!(def_file, "    plugin_deactivate");
+                }
+            }
+            c.arg(format!("/DEF:{}", def_path.display()));
+            c
+        } else if is_linux {
             let mut c = Command::new("cc");
             c.arg("-shared");
             c
@@ -5277,7 +5464,12 @@ pub fn run_with_parse_cache(
             cmd.arg(obj_path);
         }
 
-        cmd.arg("-o").arg(&exe_path);
+        if is_dylib_windows {
+            // MSVC link.exe takes the output path as `/OUT:<path>`, not `-o`.
+            cmd.arg(format!("/OUT:{}", exe_path.display()));
+        } else {
+            cmd.arg("-o").arg(&exe_path);
+        }
 
         let status = cmd.status()?;
         if !status.success() {

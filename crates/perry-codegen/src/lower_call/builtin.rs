@@ -18,7 +18,7 @@ use perry_hir::Expr;
 
 use crate::expr::{lower_array_literal, lower_expr, nanbox_pointer_inline, unbox_to_i64, FnCtx};
 use crate::nanbox::double_literal;
-use crate::types::{DOUBLE, I32, I64, PTR};
+use crate::types::{DOUBLE, I32, I64};
 
 use super::{build_headers_from_object, extract_options_fields, get_raw_string_ptr};
 
@@ -1089,6 +1089,21 @@ pub(super) fn lower_builtin_new(
             let mut duplex_ptr = "0".to_string();
             let mut signal = double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
 
+            // #5458: when the init isn't a statically-extractable object
+            // literal (e.g. a call-expression result `f()`, a spread `{...e}`,
+            // or a dynamic object), read its fields at runtime instead of
+            // discarding it. Dropping the init silently defaulted `method` back
+            // to "GET", mis-dispatching POST requests to GET handlers in Hono.
+            if args.len() >= 2 && extract_options_fields(ctx, &args[1]).is_none() {
+                let init_val = lower_expr(ctx, &args[1])?;
+                let handle = ctx.block().call(
+                    DOUBLE,
+                    "js_request_new_from_init",
+                    &[(I64, &url_ptr), (DOUBLE, &init_val)],
+                );
+                return Ok(Some(handle));
+            }
+
             if args.len() >= 2 {
                 if let Some(props) = extract_options_fields(ctx, &args[1]) {
                     for (k, vexpr) in &props {
@@ -1309,7 +1324,7 @@ pub(super) fn lower_builtin_new(
             let mut start = double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
             let mut transform = double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
             let mut flush = double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
-            let mut hwm = double_literal(1.0);
+            let hwm = double_literal(1.0);
             let mut transformer_object = None;
             if !args.is_empty() {
                 if let Some(props) = extract_options_fields(ctx, &args[0]) {

@@ -88,13 +88,11 @@ pub(crate) fn collect_for_of_pattern_leaves(
             out.push((name, id));
         }
         ast::Pat::Array(arr_pat) => {
-            for elem in &arr_pat.elems {
-                if let Some(ep) = elem {
-                    if let ast::Pat::Rest(rest) = ep {
-                        collect_for_of_pattern_leaves(ctx, &rest.arg, out);
-                    } else {
-                        collect_for_of_pattern_leaves(ctx, ep, out);
-                    }
+            for ep in arr_pat.elems.iter().flatten() {
+                if let ast::Pat::Rest(rest) = ep {
+                    collect_for_of_pattern_leaves(ctx, &rest.arg, out);
+                } else {
+                    collect_for_of_pattern_leaves(ctx, ep, out);
                 }
             }
         }
@@ -1149,9 +1147,9 @@ pub(crate) fn lower_stmt(
                         }
                     }
                 }
-                ast::Decl::TsModule(ts_module) => {
+                ast::Decl::TsModule(ts_module)
                     // namespace X { ... } — lower as a synthetic class with static members
-                    if !ts_module.declare {
+                    if !ts_module.declare => {
                         if let Some(ref body) = ts_module.body {
                             let ns_name = match &ts_module.id {
                                 ast::TsModuleName::Ident(ident) => ident.sym.to_string(),
@@ -1164,7 +1162,6 @@ pub(crate) fn lower_stmt(
                             push_class_dedup(module, class);
                         }
                     }
-                }
                 // #853: `ast::Decl` is `#[non_exhaustive]` upstream — keep
                 // this catch-all so a future SWC variant is dropped silently
                 // (the supported variants above each have explicit handling).
@@ -1348,7 +1345,7 @@ pub(crate) fn lower_stmt(
                                             anyhow!("Destructuring requires an initializer")
                                         })?;
                                     let stmts = crate::destructuring::lower_pattern_binding(
-                                        ctx, &decl.name, init_expr, true,
+                                        ctx, &decl.name, init_expr, true, true,
                                     )?;
                                     for stmt in &stmts {
                                         if let Stmt::Let { id, .. } = stmt {
@@ -1392,7 +1389,7 @@ pub(crate) fn lower_stmt(
                                             anyhow!("Destructuring requires an initializer")
                                         })?;
                                     let stmts = crate::destructuring::lower_pattern_binding(
-                                        ctx, &decl.name, init_expr, true,
+                                        ctx, &decl.name, init_expr, true, false,
                                     )?;
                                     module.init.extend(stmts);
                                     continue;
@@ -1430,7 +1427,7 @@ pub(crate) fn lower_stmt(
                                             anyhow!("Destructuring requires an initializer")
                                         })?;
                                     let stmts = crate::destructuring::lower_pattern_binding(
-                                        ctx, &decl.name, init_expr, true,
+                                        ctx, &decl.name, init_expr, true, false,
                                     )?;
                                     module.init.extend(stmts);
                                     None

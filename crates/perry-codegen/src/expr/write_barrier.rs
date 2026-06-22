@@ -8,6 +8,7 @@ use perry_hir::Expr;
 use super::{lower_expr, FnCtx};
 use crate::block::LlBlock;
 use crate::nanbox::double_literal;
+use crate::native_value::LoweredValue;
 use crate::types::{DOUBLE, I32, I64};
 
 /// Gen-GC Phase C2 helper: emit a write barrier after heap-store sites
@@ -20,6 +21,19 @@ pub(crate) fn emit_write_barrier(ctx: &mut FnCtx<'_>, parent_bits: &str, child_b
     if !crate::codegen::write_barriers_enabled() {
         return;
     }
+    let child_bits_value = LoweredValue::js_value_bits(child_bits.to_string());
+    ctx.record_lowered_value(
+        "WriteBarrier",
+        None,
+        "write_barrier.child_bits",
+        &child_bits_value,
+        None,
+        None,
+        None,
+        false,
+        false,
+        Vec::new(),
+    );
     ctx.block()
         .call_void("js_write_barrier", &[(I64, parent_bits), (I64, child_bits)]);
 }
@@ -190,6 +204,17 @@ fn emit_jsvalue_slot_store_on_block_inner(
     };
     // GC_STORE_AUDIT(BARRIERED): generated heap JSValue stores route through this shared emitter.
     blk.store(DOUBLE, value_double, slot_ptr);
+    // A uniquely-owned (refcount==1) string written into this slot now aliases
+    // it — demote it to shared so a later in-place `+=` on the source local
+    // allocates fresh instead of mutating the stored element. This is the inline
+    // codegen choke point the runtime store functions (`js_array_push_f64`, …)
+    // are bypassed for on the fast paths. Tag-checked at runtime (a no-op for
+    // SSO / non-string), and only emitted when the value can be a heap pointer
+    // (`layout_note_needed`), so numeric stores pay nothing. Mirrors the
+    // object-field demote in `runtime_store_jsvalue_slot` (#5533).
+    if layout_note_needed {
+        blk.call_void("js_string_addref_if_heap_string", &[(DOUBLE, value_double)]);
+    }
     if !layout_note_needed && !write_barrier_needed {
         return None;
     }
@@ -388,6 +413,35 @@ pub(crate) fn lower_node_stream_super_init(
     };
     ctx.block()
         .call(DOUBLE, runtime_fn, &[(DOUBLE, &this_box), (DOUBLE, &opts)]);
+
+    Ok(undef_lit)
+}
+
+/// `super(n)` for a source-compiled `class X extends Array` (lru-cache's
+/// `ZeroArray` etc.): perry models the instance as a plain object, so size it
+/// and install the Array surface via the runtime `js_array_subclass_init`
+/// (mirrors `lower_node_stream_super_init` / the EventEmitter subclass init).
+pub(crate) fn lower_array_super_init(ctx: &mut FnCtx<'_>, super_args: &[Expr]) -> Result<String> {
+    let undef_lit = double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
+    let n = if let Some(first) = super_args.first() {
+        lower_expr(ctx, first)?
+    } else {
+        undef_lit.clone()
+    };
+    for arg in super_args.iter().skip(1) {
+        let _ = lower_expr(ctx, arg)?;
+    }
+
+    let this_box = match ctx.this_stack.last().cloned() {
+        Some(slot) => ctx.block().load(DOUBLE, &slot),
+        None => undef_lit.clone(),
+    };
+
+    ctx.block().call(
+        DOUBLE,
+        "js_array_subclass_init",
+        &[(DOUBLE, &this_box), (DOUBLE, &n)],
+    );
 
     Ok(undef_lit)
 }

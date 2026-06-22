@@ -30,6 +30,58 @@ pub(crate) fn lower_var_decl_with_destructuring(
                 );
             }
 
+            // A fresh binding of `name` must not inherit a stale
+            // native-instance tag that an UNRELATED earlier binding of the
+            // same name registered (e.g. a minified webpack bundle that
+            // `new FormData()`-binds a local `i` in one factory and reuses
+            // `var i = { exports: {} }` as the require-cache object in
+            // another). `native_instances` is module-global + last-match-wins,
+            // so push a tombstone to shadow the old tag here, BEFORE the
+            // native-instance registration checks below — if THIS init is
+            // itself a native instance, it re-registers after the tombstone
+            // and last-match-wins keeps the correct tag. Without this, a plain
+            // `i.exports` read mis-routes through the stale module's native
+            // method dispatch and folds to 0 (Next.js app-page-turbo `require`
+            // → React's `exports.Fragment = …` "read only property" throw).
+            if ctx.lookup_native_instance(&name).is_some() {
+                ctx.shadow_native_instance(name.clone());
+            }
+
+            // #wall5: same scope-leak for native MODULES. `native_modules_index`
+            // is module-global + first-match-wins (no scope tracking), so a
+            // local re-bind of a name a top-level `const url = require('url')`
+            // registered (e.g. undici's `const util = require('./util')`, or a
+            // local `const url = []` / a URL object) would mis-resolve
+            // `util.isStream` / `url.push` through the node-module dispatch and
+            // fire the unimplemented-API gate (Next.js app-page-turbo: 88× url.push,
+            // 84× util.destroy, the url.o render throw). Shadow the module here —
+            // UNLESS this very decl IS the native-module binding (`= require('url')`
+            // of a node-core module), which must keep resolving as the module.
+            if ctx.lookup_native_module(&name).is_some() {
+                let binds_native_module = decl.init.as_deref().is_some_and(|init| {
+                    if let ast::Expr::Call(call) = init {
+                        if let ast::Callee::Expr(callee) = &call.callee {
+                            if let ast::Expr::Ident(id) = callee.as_ref() {
+                                if &*id.sym == "require" {
+                                    if let Some(ast::Expr::Lit(ast::Lit::Str(s))) =
+                                        call.args.first().map(|a| a.expr.as_ref())
+                                    {
+                                        if let Some(spec) = s.value.as_str() {
+                                            let bare = spec.strip_prefix("node:").unwrap_or(spec);
+                                            return perry_api_manifest::is_node_core_module(bare);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    false
+                });
+                if !binds_native_module {
+                    ctx.shadow_native_module_if_present(&name);
+                }
+            }
+
             // #809: tag locals provably bound to a plain object (an object
             // literal or `Object.create(...)`). `static_receiver_class`
             // consults this so `x.toJSON()` / `.toString()` / `.valueOf()`
@@ -227,17 +279,41 @@ pub(crate) fn lower_var_decl_with_destructuring(
             if let Some(init_expr) = &decl.init {
                 if let ast::Expr::New(new_expr) = init_expr.as_ref() {
                     if let ast::Expr::Ident(class_ident) = new_expr.callee.as_ref() {
-                        let class_name = class_ident.sym.as_ref();
+                        let local_name = class_ident.sym.as_ref();
                         // A user `class Big {...}` in scope shadows the
                         // hardcoded library-name fallback below. Without
                         // this gate `class Big { f0=0; ... } const b = new
                         // Big()` routed through big.js's handle-based
                         // dispatch so every property read returned 0.
-                        let user_class_defined = ctx.classes_index.contains_key(class_name)
-                            || ctx.pending_classes.iter().any(|c| c.name == class_name);
+                        let user_class_defined = ctx.classes_index.contains_key(local_name)
+                            || ctx.pending_classes.iter().any(|c| c.name == local_name);
+                        // #wall: alias-aware native-instance tagging. An
+                        // ALIASED import (`import { BlockList as Wj4 } from
+                        // "net"; const q = new Wj4()`) must register `q` under
+                        // the IMPORTED class ("BlockList"), not the local alias
+                        // ("Wj4"), or `q.addSubnet(...)` dispatch (keyed on
+                        // `("net","BlockList")`) misses and falls to generic
+                        // property access ("addSubnet is not a function").
+                        // `lookup_native_module` is alias-aware (the named
+                        // import registers `local → (module, Some(<imported>))`),
+                        // so resolve the local to its imported export name and
+                        // use THAT as the class name for the hardcoded match and
+                        // the final registration. For the un-aliased case the
+                        // export equals the local, so this is a no-op.
+                        let class_name: &str = ctx
+                            .lookup_native_module(local_name)
+                            .and_then(|(_m, method)| method)
+                            .filter(|export| {
+                                export
+                                    .chars()
+                                    .next()
+                                    .map(|c| c.is_uppercase())
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(local_name);
                         // First try the general native module lookup (covers all imported native classes)
                         let module_name =
-                            if let Some((m, method)) = ctx.lookup_native_module(class_name) {
+                            if let Some((m, method)) = ctx.lookup_native_module(local_name) {
                                 match (m, method) {
                                     ("url", Some("URL" | "URLSearchParams"))
                                     | ("util", Some("TextEncoder" | "TextDecoder")) => None,
@@ -875,39 +951,6 @@ pub(crate) fn lower_var_decl_with_destructuring(
 
             // Check if this is assigning from fetch() or await fetch() - register as fetch Response
             if let Some(init_expr) = &decl.init {
-                // Helper to check if an expression is a fetch-like call
-                // Returns the module name if it matches fetch/fetchWithAuth/fetchPostWithAuth
-                fn get_fetch_module(expr: &ast::Expr) -> Option<&'static str> {
-                    if let ast::Expr::Call(call_expr) = expr {
-                        if let ast::Callee::Expr(callee_expr) = &call_expr.callee {
-                            if let ast::Expr::Ident(ident) = callee_expr.as_ref() {
-                                // Closes #644: all three return the same
-                                // Response handle, so they must register
-                                // under module="fetch". The codegen dispatch
-                                // in `lower_fetch_native_method` gates on
-                                // `module == "fetch"` — pre-fix, registering
-                                // under "fetchWithAuth"/"fetchPostWithAuth"
-                                // missed the gate so a post-narrowing
-                                // `r.status` lowered as a NativeMethodCall
-                                // with module="fetchWithAuth" and fell
-                                // through to a generic 0.0-returning arm.
-                                // (Without narrowing the access went through
-                                // generic PropertyGet → handle dispatch →
-                                // js_fetch_response_status, so the bug only
-                                // surfaced inside an `if r !== null/undefined`
-                                // block.)
-                                return match ident.sym.as_ref() {
-                                    "fetch" | "fetchWithAuth" | "fetchPostWithAuth" => {
-                                        Some("fetch")
-                                    }
-                                    _ => None,
-                                };
-                            }
-                        }
-                    }
-                    None
-                }
-
                 if crate::lower_types::is_node_readable_static_factory_call(ctx, init_expr) {
                     let readable = "Readable".to_string();
                     ty = Type::Named(readable.clone());
@@ -931,6 +974,17 @@ pub(crate) fn lower_var_decl_with_destructuring(
                             "Response".to_string(),
                         );
                     }
+                }
+
+                // #5432: `const res = app.fetch(req)` / `await app.fetch(req)` —
+                // a member-call `.fetch(...)` is the Fetch-API server-handler
+                // convention (Hono `app.fetch`, itty-router, Cloudflare
+                // Workers) and yields a native fetch Response. Record it in a
+                // narrow set (NOT `register_native_instance`, which would hijack
+                // every method on `res`) so only `res.headers.<m>()` bails the
+                // array-method fold. See `fetch_call_response_locals`.
+                if is_member_fetch_call(init_expr) {
+                    ctx.fetch_call_response_locals.insert(name.clone());
                 }
 
                 // Web Fetch API: new Response(...) / new Headers(...) /
@@ -1865,6 +1919,49 @@ pub(crate) fn lower_var_decl_with_destructuring(
                     return Ok(result);
                 }
             }
+            // Next.js / webpack require pattern: `var i = n[e] = {exports:{}}`.
+            // A chained member-assignment whose RHS is an object literal
+            // miscompiles in the full-bundle context: the constructed object's
+            // own field reads back as 0 when the construction flows directly
+            // into both the member store and the binding (the nested webpack
+            // bundle's `exports` then reads 0 → `exports.Fragment = …` throws).
+            // A directly-bound object literal (`var x = {exports:{}}`) is fine,
+            // so hoist the construction to its own `Let` and feed the member-set
+            // and the binding from that temp — mirroring the working form.
+            let init = match init {
+                Some(Expr::PutValueSet {
+                    target,
+                    key,
+                    value,
+                    receiver,
+                    strict,
+                }) if matches!(value.as_ref(), Expr::New { .. } | Expr::Object(_)) => {
+                    let tmp_id = ctx.define_local("__nx_member_init".to_string(), Type::Any);
+                    result.push(Stmt::Let {
+                        id: tmp_id,
+                        name: "__nx_member_init".to_string(),
+                        ty: Type::Any,
+                        mutable: false,
+                        init: Some(*value),
+                    });
+                    result.push(Stmt::Expr(Expr::PutValueSet {
+                        target,
+                        key,
+                        value: Box::new(Expr::LocalGet(tmp_id)),
+                        receiver,
+                        strict,
+                    }));
+                    result.push(Stmt::Let {
+                        id,
+                        name,
+                        ty,
+                        mutable,
+                        init: Some(Expr::LocalGet(tmp_id)),
+                    });
+                    return Ok(result);
+                }
+                other => other,
+            };
             result.push(Stmt::Let {
                 id,
                 name,
@@ -1932,7 +2029,7 @@ pub(crate) fn lower_var_decl_with_destructuring(
                         .transpose()?
                         .ok_or_else(|| anyhow!("Destructuring requires an initializer"))?
                 };
-            let stmts = lower_pattern_binding(ctx, pattern, init_expr, mutable)?;
+            let stmts = lower_pattern_binding(ctx, pattern, init_expr, mutable, is_var_decl)?;
             result.extend(stmts);
         }
         _ => {

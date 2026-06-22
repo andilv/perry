@@ -465,7 +465,7 @@ fn typed_feedback_non_bounded_array_set_guard_failure_uses_jsvalue_object_fallba
     let guard = js_typed_feedback_plain_array_index_set_guard(24, obj_box, 0, 99.0, 0);
     assert_eq!(guard, 0);
 
-    let returned = js_typed_feedback_array_index_set_fallback_boxed(24, obj_box, 0, 99.0);
+    let returned = js_typed_feedback_array_index_set_fallback_boxed(24, obj_box, 0.0, 99.0);
     assert_eq!(returned.to_bits(), obj_box.to_bits());
 
     let key = crate::string::js_string_from_bytes(b"0".as_ptr(), 1);
@@ -476,6 +476,64 @@ fn typed_feedback_non_bounded_array_set_guard_failure_uses_jsvalue_object_fallba
     assert_eq!(site.guard_passes, 0);
     assert_eq!(site.guard_failures, 1);
     assert_eq!(site.fallback_calls, 1);
+}
+
+#[test]
+fn typed_feedback_array_set_guards_reject_frozen_arrays() {
+    let _guard = TYPED_FEEDBACK_TEST_LOCK.lock().unwrap();
+    reset_typed_feedback_for_tests();
+    register(70, TypedFeedbackSiteKind::ArrayElement, "arr[i]=");
+    register(71, TypedFeedbackSiteKind::ArrayElement, "arr[i]=");
+
+    let values = [1.0, 2.0];
+    let arr = crate::array::js_array_from_f64(values.as_ptr(), values.len() as u32);
+    let arr_box = crate::value::js_nanbox_pointer(arr as i64);
+    crate::object::js_object_freeze(arr_box);
+
+    assert_eq!(
+        js_typed_feedback_plain_array_index_set_guard(70, arr_box, 0, 99.0, 1),
+        0
+    );
+    assert_eq!(
+        js_typed_feedback_numeric_array_index_set_guard(71, arr_box, 0, 99.0, 1),
+        0
+    );
+
+    let returned = js_typed_feedback_array_index_set_fallback_boxed(70, arr_box, 0.0, 99.0);
+    assert_eq!(returned.to_bits(), arr_box.to_bits());
+    assert_eq!(
+        crate::array::js_array_get_f64(arr, 0).to_bits(),
+        1.0f64.to_bits()
+    );
+
+    let snapshot = typed_feedback_snapshot();
+    assert_eq!(snapshot.sites[0].guard_failures, 1);
+    assert_eq!(snapshot.sites[1].guard_failures, 1);
+}
+
+#[test]
+fn typed_feedback_array_set_boxed_fallback_preserves_original_index_value() {
+    let _guard = TYPED_FEEDBACK_TEST_LOCK.lock().unwrap();
+    reset_typed_feedback_for_tests();
+    register(72, TypedFeedbackSiteKind::ArrayElement, "arr[i]=");
+
+    let obj = crate::object::js_object_alloc(0, 0);
+    let obj_box = f64::from_bits(crate::value::JSValue::pointer(obj as *const u8).bits());
+    let key = crate::string::js_string_from_bytes(b"foo".as_ptr(), 3);
+    let key_value = crate::value::js_nanbox_string(key as i64);
+
+    let returned = js_typed_feedback_array_index_set_fallback_boxed(72, obj_box, key_value, 77.0);
+    assert_eq!(returned.to_bits(), obj_box.to_bits());
+    assert_eq!(
+        crate::object::js_object_get_field_by_name_f64(obj, key).to_bits(),
+        77.0f64.to_bits()
+    );
+
+    let zero_key = crate::string::js_string_from_bytes(b"0".as_ptr(), 1);
+    assert_eq!(
+        crate::object::js_object_get_field_by_name_f64(obj, zero_key).to_bits(),
+        crate::value::TAG_UNDEFINED
+    );
 }
 
 #[test]
@@ -532,6 +590,50 @@ fn typed_feedback_numeric_array_set_guard_requires_numeric_value_and_layout() {
     assert_eq!(site.guard_passes, 1);
     assert_eq!(site.guard_failures, 2);
     assert_eq!(site.fallback_calls, 0);
+}
+
+#[test]
+fn typed_feedback_numeric_array_guards_reject_registered_class_ref_bits() {
+    let _guard = TYPED_FEEDBACK_TEST_LOCK.lock().unwrap();
+    reset_typed_feedback_for_tests();
+    register(68, TypedFeedbackSiteKind::ArrayElement, "arr[i]=");
+    register(69, TypedFeedbackSiteKind::ArrayElement, "arr.push");
+
+    let class_id = 0x00C0_DE01;
+    unsafe {
+        crate::object::js_register_class_id(class_id);
+    }
+    let class_ref = f64::from_bits(crate::value::INT32_TAG | class_id as u64);
+
+    let values = [1.0, 2.0];
+    let arr = crate::array::js_array_from_f64(values.as_ptr(), values.len() as u32);
+    let arr_box = crate::value::js_nanbox_pointer(arr as i64);
+
+    assert_eq!(
+        js_typed_feedback_numeric_array_index_set_guard(68, arr_box, 1, class_ref, 1),
+        0
+    );
+    assert_eq!(
+        js_typed_feedback_numeric_array_push_guard(69, arr_box, class_ref),
+        0
+    );
+    assert_eq!(crate::array::js_array_is_numeric_f64_layout(arr), 1);
+
+    let snapshot = typed_feedback_snapshot();
+    let set_site = snapshot
+        .sites
+        .iter()
+        .find(|site| site.site_id == 68)
+        .expect("set site");
+    assert_eq!(set_site.guard_passes, 0);
+    assert_eq!(set_site.guard_failures, 1);
+    let push_site = snapshot
+        .sites
+        .iter()
+        .find(|site| site.site_id == 69)
+        .expect("push site");
+    assert_eq!(push_site.guard_passes, 0);
+    assert_eq!(push_site.guard_failures, 1);
 }
 
 #[test]
@@ -1169,4 +1271,66 @@ fn typed_feedback_roots_rewrite_shape_observations() {
     let shape_addr = reg.sites.get(&70).unwrap().observations[0].shape_addr;
     assert_eq!(shape_addr, forwarded_user as usize);
     assert_ne!(shape_addr, shape_user as usize);
+}
+
+/// Typed-feedback method dispatch must never dereference a NaN-boxed *inline*
+/// receiver (SHORT_STRING / INT32) as a heap object. Only POINTER / STRING /
+/// BIGINT tags carry a real, dereferenceable heap pointer in the low 48 bits;
+/// SHORT_STRING (small-string optimization) and INT32 pack their payload
+/// inline, so masking that payload to an "address" and probing `addr - header`
+/// in `object_shape` reads unmapped memory and faults.
+///
+/// Regression: a short receiver string such as `email = "jo"` reaching
+/// `email.includes("@")` through native-method dispatch had its inline bytes
+/// (`0x..6f6a`) treated as a pointer and dereferenced (EXC_BAD_ACCESS in
+/// `object_shape`). The guard returns 0 — the "not a GC object" sentinel — for
+/// every non-heap-pointer tag in the NaN-box band, so dispatch falls back to the
+/// safe generic path. Heap pointers (POINTER/STRING/BIGINT) still pass through.
+#[test]
+fn normalize_raw_object_addr_rejects_inline_nanboxed_receivers() {
+    // The inline payloads below are deliberately >= the native-handle band
+    // ceiling (`addr_class::HANDLE_BAND_MAX`, 0x100000) and < 2^48, i.e. they
+    // alias *plausible heap addresses*. That is the case only the tag check
+    // catches: the downstream `is_handle_band` / `addr >> 48` fallbacks already
+    // reject tiny or out-of-range payloads, so a small value like 0x6f6a would
+    // pass this test even without the guard. A real SSO string's inline bytes
+    // can land anywhere in the 48-bit space, including this dereferenceable-
+    // looking range — which is exactly what faulted.
+
+    // SHORT_STRING (SSO): inline UTF-8 bytes in the low 48 bits, NOT a heap
+    // pointer, but a bit pattern that looks like a valid address. Must
+    // normalize to 0 rather than be dereferenced.
+    let sso = crate::value::SHORT_STRING_TAG | 0x0000_5566_7788_99aa;
+    assert_eq!(
+        normalize_raw_object_addr(sso),
+        0,
+        "short-string receiver must not be dereferenced as an object",
+    );
+
+    // INT32: inline integer payload (max i32, well above the handle band).
+    let int32 = crate::value::INT32_TAG | 0x7fff_ffff;
+    assert_eq!(
+        normalize_raw_object_addr(int32),
+        0,
+        "int32 receiver must not be dereferenced as an object",
+    );
+
+    // POINTER: a genuine heap address (above every native-handle band, below
+    // 2^48) is preserved so real object receivers still dispatch natively.
+    let heap_addr: u64 = 0x0000_0001_0000_0000; // 4 GiB — clear of the handle bands
+    let ptr = crate::value::POINTER_TAG | heap_addr;
+    assert_eq!(
+        normalize_raw_object_addr(ptr),
+        heap_addr as usize,
+        "real heap-pointer receiver must pass through unchanged",
+    );
+
+    // STRING: heap string headers are dereferenceable; the tag passes through.
+    let str_addr: u64 = 0x0000_0002_0000_0000;
+    let strv = crate::value::STRING_TAG | str_addr;
+    assert_eq!(
+        normalize_raw_object_addr(strv),
+        str_addr as usize,
+        "heap-string receiver must pass through unchanged",
+    );
 }

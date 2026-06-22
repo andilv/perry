@@ -4,7 +4,7 @@
 //! Pure mechanical move — match arm bodies are verbatim copies, called from
 //! `lower_expr`'s outer dispatch.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 #[allow(unused_imports)]
 use perry_hir::{BinaryOp, CompareOp, Expr, UnaryOp, UpdateOp};
 #[allow(unused_imports)]
@@ -72,22 +72,18 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 parent = ctx.classes.get(&p).and_then(|c| c.extends_name.clone());
             }
             let Some(fn_name) = resolved_fn else {
-                // Static resolution failed. For a class with a DYNAMIC parent
-                // (`class X extends _mod.default` — the interop ESM
-                // default-export base, wall 38/42), `extends_name` is "default"
-                // and never resolves to a compile-time class, so the chain walk
-                // above finds nothing. Dispatch `super.method(...)` at runtime
-                // via the registered parent edge instead of returning the bogus
-                // numeric `0.0` (which made `super.getRequestHandler()` in
-                // Next.js's `NextNodeServer.makeRequestHandler` yield a number,
-                // and the handler it built threw "value is not a function").
-                let has_dyn_parent = ctx
-                    .classes
-                    .get(&current_class_name)
-                    .map(|c| c.extends_expr.is_some())
-                    .unwrap_or(false);
+                // Compile-time resolution failed (the parent has no INSTANCE
+                // method of this name). This happens for (1) a DYNAMIC parent
+                // (`class X extends _mod.default` — the interop ESM default base,
+                // wall 38/42) whose `extends_name` never resolves to a known
+                // class, and (2) a `super.m()` inside a `static` method, where
+                // the target is the parent's STATIC method (not in the instance
+                // tables walked above). Both are handled by the runtime helper,
+                // which walks the registered parent edge and — when `this` is a
+                // ClassRef — resolves the parent's static method. Routing here
+                // beats the bogus numeric `0.0` ("value is not a function").
                 let cid = ctx.class_ids.get(&current_class_name).copied().unwrap_or(0);
-                if has_dyn_parent && cid != 0 {
+                if cid != 0 {
                     let this_box = match ctx.this_stack.last().cloned() {
                         Some(slot) => ctx.block().load(DOUBLE, &slot),
                         None => double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)),
@@ -146,6 +142,87 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             let arg_slices: Vec<(crate::types::LlvmType, &str)> =
                 lowered.iter().map(|s| (DOUBLE, s.as_str())).collect();
             Ok(ctx.block().call(DOUBLE, &fn_name, &arg_slices))
+        }
+
+        // -------- super.method(...spread) --------
+        // The plain `SuperMethodCall` arm passes each argument positionally, so
+        // a `...rest` spread would be delivered as ONE array argument. When the
+        // resolved super target is a NATIVE base (EventEmitter.prototype.emit
+        // and friends) forwarding a rest param via `super.emit(event, ...args)`
+        // delivered `[payload]` to the listener instead of `payload`. Flatten
+        // every argument (regular + spread-expanded) into a single JS array,
+        // then dispatch through `js_super_method_call_dynamic_apply` — the
+        // runtime helper materialises the array into a flat f64 buffer and
+        // forwards to the same parent-chain resolution used by the non-spread
+        // dynamic path (which handles both native-prototype and user-class
+        // JS parents).
+        Expr::SuperMethodCallSpread { method, args } => {
+            use perry_hir::CallArg;
+            let Some(current_class_name) = ctx.class_stack.last().cloned() else {
+                for a in args {
+                    match a {
+                        CallArg::Expr(e) | CallArg::Spread(e) => {
+                            let _ = lower_expr(ctx, e)?;
+                        }
+                    }
+                }
+                return Ok(double_literal(0.0));
+            };
+            let cid = ctx.class_ids.get(&current_class_name).copied().unwrap_or(0);
+            if cid == 0 {
+                for a in args {
+                    match a {
+                        CallArg::Expr(e) | CallArg::Spread(e) => {
+                            let _ = lower_expr(ctx, e)?;
+                        }
+                    }
+                }
+                return Ok(double_literal(0.0));
+            }
+            let this_box = match ctx.this_stack.last().cloned() {
+                Some(slot) => ctx.block().load(DOUBLE, &slot),
+                None => double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)),
+            };
+            // Build a single args array containing every argument in source
+            // order, expanding spreads via array-like-to-array + concat (the
+            // same machinery the CallSpread method-apply path uses).
+            let mut acc_handle = ctx.block().call(I64, "js_array_alloc", &[(I32, "0")]);
+            for a in args {
+                match a {
+                    CallArg::Expr(e) => {
+                        let v = lower_expr(ctx, e)?;
+                        acc_handle = ctx.block().call(
+                            I64,
+                            "js_array_push_f64",
+                            &[(I64, &acc_handle), (DOUBLE, &v)],
+                        );
+                    }
+                    CallArg::Spread(e) => {
+                        let part_box = lower_expr(ctx, e)?;
+                        let part_handle =
+                            ctx.block()
+                                .call(I64, "js_array_like_to_array", &[(DOUBLE, &part_box)]);
+                        acc_handle = ctx.block().call(
+                            I64,
+                            "js_array_concat",
+                            &[(I64, &acc_handle), (I64, &part_handle)],
+                        );
+                    }
+                }
+            }
+            let args_array = nanbox_pointer_inline(ctx.block(), &acc_handle);
+            let name_global = emit_string_literal_global(ctx, method);
+            Ok(ctx.block().call(
+                DOUBLE,
+                "js_super_method_call_dynamic_apply",
+                &[
+                    (I32, &cid.to_string()),
+                    (PTR, &name_global),
+                    (I64, &method.len().to_string()),
+                    (DOUBLE, &this_box),
+                    (DOUBLE, &args_array),
+                ],
+            ))
         }
 
         // -------- super.<prop> as a value (issue #774) --------

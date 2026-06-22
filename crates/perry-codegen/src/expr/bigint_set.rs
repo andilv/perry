@@ -4,7 +4,7 @@
 //! Pure mechanical move — match arm bodies are verbatim copies, called from
 //! `lower_expr`'s outer dispatch.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 #[allow(unused_imports)]
 use perry_hir::{BinaryOp, CompareOp, Expr, UnaryOp, UpdateOp};
 #[allow(unused_imports)]
@@ -45,6 +45,39 @@ use super::{
     unbox_str_handle, unbox_to_i64, variant_name, ChannelReduction, FlatConstInfo, FnCtx,
     I18nLowerCtx,
 };
+
+fn number_coerce_operand_is_already_primitive_number(ctx: &FnCtx<'_>, operand: &Expr) -> bool {
+    if crate::type_analysis::expr_may_return_boxed_value_from_raw_f64_fallback(ctx, operand)
+        || is_bigint_expr(ctx, operand)
+    {
+        return false;
+    }
+    match operand {
+        Expr::Integer(_)
+        | Expr::Number(_)
+        | Expr::PodLayoutSizeOf { .. }
+        | Expr::PodLayoutAlignOf { .. }
+        | Expr::PodLayoutOffsetOf { .. }
+        | Expr::DateNow
+        | Expr::Uint8ArrayLength(_)
+        | Expr::BufferLength(_) => true,
+        Expr::LocalGet(id) | Expr::Update { id, .. } => ctx.integer_locals.contains(id),
+        Expr::Binary { op, left, right } => match op {
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
+                number_coerce_operand_is_already_primitive_number(ctx, left)
+                    && number_coerce_operand_is_already_primitive_number(ctx, right)
+            }
+            BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor
+            | BinaryOp::Shl
+            | BinaryOp::Shr
+            | BinaryOp::UShr => true,
+            BinaryOp::Pow => false,
+        },
+        _ => false,
+    }
+}
 
 pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
     match expr {
@@ -229,10 +262,15 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
 
         // -------- Number(value) coercion --------
         Expr::NumberCoerce(operand) => {
+            let already_number = number_coerce_operand_is_already_primitive_number(ctx, operand);
             let v = lower_expr(ctx, operand)?;
-            Ok(ctx
-                .block()
-                .call(DOUBLE, "js_number_coerce", &[(DOUBLE, &v)]))
+            if already_number {
+                Ok(v)
+            } else {
+                Ok(ctx
+                    .block()
+                    .call(DOUBLE, "js_number_coerce", &[(DOUBLE, &v)]))
+            }
         }
 
         // -------- set.add(value) — updates the local in place --------
@@ -241,28 +279,21 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             let set_box = lower_expr(ctx, &Expr::LocalGet(*set_id))?;
             let blk = ctx.block();
             let set_handle = unbox_to_i64(blk, &set_box);
+            // `js_set_add` mutates the set in place and ALWAYS returns the same
+            // `SetHeader` pointer it was given — `ensure_capacity` reallocs only
+            // the internal elements buffer, never the header. So there is no
+            // "realloc'd pointer" to write back: the previous writeback to
+            // `set_id`'s storage was vestigial (copied from the array-push
+            // pattern) and actively WRONG for a boxed/mutable closure capture —
+            // it overwrote the capture SLOT (which holds a box pointer) with the
+            // Set value, so the next read dereferenced the Set-as-box and saw
+            // `undefined` (Next.js turbopack runtime: `loadedChunks.add(p)`
+            // silently cleared the module-level `loadedChunks` Set captured by
+            // the chunk-loader closure, SIGSEGV on the next `.add`). GC moves of
+            // the header are handled by root rewriting of the variable slot, not
+            // here.
             let new_handle = blk.call(I64, "js_set_add", &[(I64, &set_handle), (DOUBLE, &v)]);
-            let new_box = nanbox_pointer_inline(blk, &new_handle);
-            // Write back to the storage so subsequent reads see the
-            // possibly-realloc'd pointer.
-            if let Some(&capture_idx) = ctx.closure_captures.get(set_id) {
-                let closure_ptr = ctx
-                    .current_closure_ptr
-                    .clone()
-                    .ok_or_else(|| anyhow!("SetAdd captured but no current_closure_ptr"))?;
-                let idx_str = capture_idx.to_string();
-                ctx.block().call_void(
-                    "js_closure_set_capture_f64",
-                    &[(I64, &closure_ptr), (I32, &idx_str), (DOUBLE, &new_box)],
-                );
-            } else if let Some(slot) = ctx.locals.get(set_id).cloned() {
-                ctx.block().store(DOUBLE, &new_box, &slot);
-            } else if let Some(global_name) = ctx.module_globals.get(set_id).cloned() {
-                let g_ref = format!("@{}", global_name);
-                // GC_STORE_AUDIT(ROOT): module global Set slot is a registered mutable GC root.
-                emit_root_nanbox_store_on_block(ctx.block(), &new_box, &g_ref);
-            }
-            Ok(new_box)
+            Ok(nanbox_pointer_inline(blk, &new_handle))
         }
 
         // -------- set.has(value) -> boolean --------

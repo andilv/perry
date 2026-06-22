@@ -36,24 +36,24 @@
 //!     follows up to a small depth (2 levels) to handle one level of env
 //!     switching; deeper indirection is rare and gets the no-op fallback.
 
-mod detect;
+pub(in crate::commands::compile) mod detect;
 mod extract_exports;
 mod extract_requires;
 mod hoist_classes;
 mod wrap;
 
 // Cross-sibling helpers — siblings reach for these via `use super::*;`.
-pub(self) use detect::is_js_reserved_word;
-pub(self) use extract_exports::{
+use detect::is_js_reserved_word;
+use extract_exports::{
     extract_exports_from_source, extract_named_exports_from_require,
     extract_object_literal_exports_from_require, extract_single_module_exports_assignment,
     module_reexport_specs,
 };
-pub(self) use extract_requires::{
+use extract_requires::{
     extract_export_star_specs, extract_require_aliases_with_ranges, extract_require_specifiers,
     function_local_specs, identifier_is_declared_binding, identifier_is_reassigned,
 };
-pub(self) use hoist_classes::{
+use hoist_classes::{
     extract_top_level_class_decls, rewrite_module_exports_class_expression,
     source_has_top_level_return, top_level_class_names,
 };
@@ -274,6 +274,59 @@ module.exports = inner;
         // Treating it as ESM is the safe call.
         let src = "import('./x');\nmodule.exports = 1;\n";
         assert!(!is_commonjs(src));
+    }
+
+    #[test]
+    fn issue_5498_minified_mid_line_import_is_esm() {
+        // esbuild ESM bundles (the OpenAI Codex CLI) are minified: every
+        // top-level statement is joined onto one giant line, so the real
+        // `import{createRequire …}from"module"` lands mid-line, after a `;`
+        // that terminates the prior statement — never at a line start. A
+        // line-based scan misses it and the file was misclassified as CJS.
+        let src = "var a=Object.create;var Ke=(e=>typeof require<\"u\")(function(){});\
+                   import{createRequire as NDe}from\"module\";var b=1;";
+        assert!(
+            !is_commonjs(src),
+            "minified bundle with a mid-line top-level import must be ESM"
+        );
+    }
+
+    #[test]
+    fn issue_5498_esbuild_cjs_shims_do_not_force_cjs() {
+        // The Codex bundle inlines CJS deps, so esbuild emits its
+        // `__commonJS`/`createRequire`/`require(` helper machinery alongside a
+        // genuine top-level `import`. The top-level import must win — the
+        // helper tokens are just identifiers in nested bodies.
+        let src = "#!/usr/bin/env node\n\
+                   import{createRequire as NDe}from\"module\";\
+                   var __require=NDe(import.meta.url);\
+                   var __commonJS=(cb,mod)=>function(){return mod||(0,cb[__getOwnPropNames(cb)[0]])((mod={exports:{}}).exports,mod),mod.exports};\
+                   var x=__commonJS({\"a.js\"(exports,module){module.exports=require(\"fs\")}});";
+        assert!(
+            !is_commonjs(src),
+            "esbuild ESM bundle with CJS helper shims must be classified as ESM"
+        );
+    }
+
+    #[test]
+    fn issue_5498_shebang_cjs_wraps_and_parses() {
+        // A genuine CommonJS file carrying a leading shebang (CLI entry point)
+        // must still wrap cleanly: the `#!` is neutralized to a `//` line
+        // comment in place so it does not land mid-template as an illegal
+        // token. Without the fix SWC errors `ExpectedIdent` on the buried `#`.
+        let src = "#!/usr/bin/env node\nmodule.exports = function greet(n) { return n; };\n";
+        assert!(is_commonjs(src));
+        let wrapped = wrap_commonjs(src, &PathBuf::from("/tmp/cli/index.js"));
+        assert!(
+            !wrapped.contains("#!"),
+            "shebang must be neutralized, got:\n{}",
+            wrapped
+        );
+        assert!(
+            perry_parser::parse_typescript(&wrapped, "cli/index.js").is_ok(),
+            "wrapped shebang module must parse, got:\n{}",
+            wrapped
+        );
     }
 
     #[test]

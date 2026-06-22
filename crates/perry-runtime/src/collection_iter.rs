@@ -178,7 +178,7 @@ pub(crate) fn require_callable(value: f64, name: &str) -> f64 {
 pub(crate) fn normalize_callable_value(value: f64) -> f64 {
     let raw = js_nanbox_get_pointer(value) & !0x7;
     if raw >= 0x10000 {
-        return crate::value::js_nanbox_pointer(raw as i64);
+        return crate::value::js_nanbox_pointer(raw);
     }
     value
 }
@@ -304,6 +304,7 @@ pub(crate) fn iterator_next_value(iter: f64) -> Option<f64> {
         )
     };
     if !is_entry_object(result) {
+        crate::array::iter_bt_dump("collection_iter_next_value", result);
         throw_type_error("Iterator result is not an object");
     }
     let result_ptr = js_nanbox_get_pointer(result) as *const crate::object::ObjectHeader;

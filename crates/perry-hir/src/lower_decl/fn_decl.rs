@@ -1,14 +1,9 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::Result;
 use perry_types::{LocalId, Type};
 use swc_ecma_ast as ast;
 
-use crate::analysis::*;
-use crate::destructuring::*;
 use crate::ir::*;
-use crate::lower::{
-    capture_function_source, collect_for_of_pattern_leaves, emit_for_of_pattern_binding,
-    lower_expr, LoweringContext,
-};
+use crate::lower::{capture_function_source, LoweringContext};
 use crate::lower_patterns::*;
 use crate::lower_types::*;
 
@@ -31,7 +26,22 @@ fn function_has_use_strict(func: &ast::Function) -> bool {
 
 pub fn lower_fn_decl(ctx: &mut LoweringContext, fn_decl: &ast::FnDecl) -> Result<Function> {
     let name = fn_decl.ident.sym.to_string();
-    let func_id = ctx.lookup_func(&name).unwrap_or_else(|| ctx.fresh_func());
+    // A function declaration's name must be resolvable inside its own body
+    // (recursion / self-reference) and to sibling statements (hoisting). The
+    // pre-scan hoists top-level/shallow decls, but deeply-nested decls inside
+    // closures can slip through — and then `fresh_func()` here would mint an id
+    // WITHOUT registering the name, so `lookup_func(name)` stays None and a
+    // self-reference `o(...)` / member read on the func name lowers to an
+    // unresolved global (→ `ReferenceError: o is not defined` deep in Next.js's
+    // webpack-bundled modules). Register the name now when it wasn't already.
+    let func_id = match ctx.lookup_func(&name) {
+        Some(id) => id,
+        None => {
+            let id = ctx.fresh_func();
+            ctx.register_func(name.clone(), id);
+            id
+        }
+    };
 
     // #4101: retain the original source text so `fn.toString()` reconstructs
     // it. Slice the module source against the function's AST span; prepend the
@@ -104,6 +114,8 @@ pub fn lower_fn_decl(ctx: &mut LoweringContext, fn_decl: &ast::FnDecl) -> Result
         }
         let param_type = extract_param_type_with_ctx(&param.pat, Some(ctx));
         let param_id = ctx.define_local(param_name.clone(), param_type.clone());
+        ctx.shadow_native_instance_if_present(&param_name);
+        ctx.shadow_native_module_if_present(&param_name);
         let is_rest = is_rest_param(&param.pat);
         params.push(Param {
             id: param_id,
@@ -181,6 +193,28 @@ pub fn lower_fn_decl(ctx: &mut LoweringContext, fn_decl: &ast::FnDecl) -> Result
                     module.to_string(),
                     class.to_string(),
                 );
+            }
+        }
+    }
+
+    // Cross-function native-handle propagation: a parameter that receives a
+    // known native handle across a call boundary (e.g. the `("ws","Client")`
+    // upgrade `wsId` passed as `handleConnection(req, wsId)`) is untyped here,
+    // so the type-annotation loop above can't tag it. `pre_scan_cross_fn_native_params`
+    // recorded a `(fn_ident_span_lo, param_index) -> (module, class)` hint before
+    // any body lowered; apply it now (before the body lowers) so `wsId.send(...)`
+    // inside this function dispatches to `js_ws_send_client_i64` like the inline
+    // call. The key is this declaration's identifier span (not its name), so a
+    // hint seeded for a same-named but distinct function never leaks here. Only
+    // registers when the param isn't already a native instance, so an explicit
+    // annotation always wins.
+    if !ctx.param_native_hints.is_empty() {
+        let fn_span_lo = fn_decl.ident.span.lo.0;
+        for (idx, param) in params.iter().enumerate() {
+            if let Some((module, class)) = ctx.param_native_hints.get(&(fn_span_lo, idx)).cloned() {
+                if ctx.lookup_native_instance(&param.name).is_none() {
+                    ctx.register_native_instance(param.name.clone(), module, class);
+                }
             }
         }
     }

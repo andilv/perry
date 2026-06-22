@@ -219,6 +219,7 @@ pub fn expr_uses_this_as_value(e: &perry_hir::Expr, fields: &HashSet<String>) ->
         } => true,
         Expr::SuperCall(_)
         | Expr::SuperMethodCall { .. }
+        | Expr::SuperMethodCallSpread { .. }
         | Expr::SuperPropertySet { .. }
         | Expr::ObjectSuperPropertyGet { .. }
         | Expr::ObjectSuperPropertySet { .. }
@@ -452,6 +453,7 @@ mod tests {
             decorators: Vec::new(),
             is_exported: false,
             aliases: Vec::new(),
+            is_nested: false,
             static_accessor_names: Vec::new(),
             static_accessor_fn_ids: Vec::new(),
         }

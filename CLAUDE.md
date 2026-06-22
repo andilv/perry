@@ -8,12 +8,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Perry is a native TypeScript compiler written in Rust that compiles TypeScript source code directly to native executables. It uses SWC for TypeScript parsing and LLVM for code generation.
 
-**Current Version:** 0.5.1180
+**Current Version:** 0.5.1201
 
 
 ## TypeScript Parity Status
 
-Tracked via the gap test suite (`test-files/test_gap_*.ts`, 28 tests). Compared byte-for-byte against `node --experimental-strip-types`. Run via `/tmp/run_gap_tests.sh` after `cargo build --release -p perry-runtime -p perry-stdlib -p perry`.
+Tracked via the gap test suite (`test-files/test_gap_*.ts`, 235 tests). Compared byte-for-byte against `node --experimental-strip-types`. Run via `./scripts/run_gap_tests.sh` (a thin wrapper over `run_parity_tests.sh --filter test_gap_` that builds the compiler itself and gates on no new untriaged failures).
 
 **Last full sweep:** run `./run_parity_tests.sh` for the current snapshot. The umbrella tracker is #793 (Node.js + TypeScript compatibility roadmap); the previously-cited #447–#452 batch closed on 2026-05-04. Currently-open trackers worth knowing about:
 
@@ -49,7 +49,9 @@ PRs from outside contributors should **not** touch `[workspace.package] version`
 
 ```bash
 cargo build --release                          # Build all crates
+cargo build --profile perry-dev -p perry       # Fast local dev build (#5422; perry-dev profile)
 cargo build --release -p perry-runtime -p perry-stdlib  # Rebuild runtime (MUST rebuild stdlib too!)
+cargo build --release -p perry-runtime-static -p perry-stdlib-static  # Emit libperry_{runtime,stdlib}.a (#5422: runtime/stdlib are now rlib-only; the .a comes from these wrapper crates)
 cargo test --release --workspace \
   --exclude perry-ui-ios --exclude perry-ui-tvos --exclude perry-ui-watchos \
   --exclude perry-ui-visionos --exclude perry-ui-android --exclude perry-ui-windows \

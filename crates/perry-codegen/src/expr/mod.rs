@@ -8,33 +8,23 @@
 //! error so a user running `--backend llvm` on richer TypeScript gets a
 //! one-line explanation instead of a silent broken binary.
 
-use anyhow::{anyhow, bail, Result};
-use perry_hir::{BinaryOp, Expr, UnaryOp};
+use anyhow::{bail, Result};
+use perry_hir::{BinaryOp, Expr};
 use perry_types::Type as HirType;
 
 use crate::block::LlBlock;
 use crate::codegen::AppMetadata;
+use crate::collectors::NativeRegionFactGraph;
 use crate::function::LlFunction;
-use crate::lower_call::{lower_call, lower_native_method_call, lower_new};
-use crate::lower_conditional::{lower_conditional, lower_logical, lower_truthy};
-use crate::lower_string_method::{
-    flatten_string_add_chain, lower_string_coerce_concat, lower_string_concat,
-    lower_string_concat_chain, lower_string_self_append,
-};
-use crate::nanbox::{double_literal, POINTER_MASK_I64};
 use crate::native_value::{
     AliasState, BoundedBufferIndex, BoundsProof, BoundsState, BufferAccessFacts, BufferAccessMode,
-    BufferElem, BufferIndexUnit, BufferViewRep, BufferViewSlot, ExpectedNativeRep,
-    GuardedBufferIndex, LengthSource, LoweredValue, MaterializationReason, NativeAbiTypeRecord,
-    NativeFactUse, NativeOwnedViewFact, NativeRep, NativeRepRecord, NativeValueState,
-    PodLayoutManifest, PodRecordViewManifest, ScalarConversionRecord, SemanticKind,
+    BufferViewSlot, GuardedBufferIndex, LoweredValue, MaterializationReason, NativeAbiTypeRecord,
+    NativeFactUse, NativeRep, NativeRepRecord, NativeValueState, PodLayoutManifest,
+    PodRecordViewManifest, ScalarConversionRecord,
 };
 use crate::strings::StringPool;
-use crate::type_analysis::{
-    compute_auto_captures, is_array_expr, is_bigint_expr, is_bool_expr, is_map_expr,
-    is_numeric_expr, is_set_expr, is_string_expr, is_url_search_params_expr, receiver_class_name,
-};
-use crate::types::{DOUBLE, I1, I32, I64, I8, PTR};
+use crate::type_analysis::is_numeric_expr;
+use crate::types::{DOUBLE, I32, I64, PTR};
 
 // Issue #1098: expr.rs split into expr/ submodules. These are pure
 // mechanical moves of self-contained helper clusters out of this file;
@@ -67,13 +57,12 @@ pub(crate) use array_literal::lower_array_literal;
 pub(crate) use buffer_access::{
     access_facts_for_spec, emit_buffer_access_pointer, lower_buffer_access_proof,
     lower_buffer_load, lower_buffer_store, lower_typed_array_load, lower_typed_array_store,
-    BufferAccessEmission, BufferAccessSpec, StoreResult,
+    BufferAccessSpec,
 };
 pub(crate) use buffer_views::{
     alias_buffer_view_slot, attach_native_owned_view_fact, buffer_access_materialization_reason,
     buffer_view_lowered_value, downgrade_buffer_alias, downgrade_buffer_aliases_in_expr,
-    invalidate_native_owned_views_for_dispose, invalidate_native_owned_views_for_owner,
-    native_arena_canonical_owner_id, native_owned_fact_for_view,
+    invalidate_native_owned_views_for_dispose, native_arena_canonical_owner_id,
     record_native_arena_owner_assignment, update_buffer_view_for_assignment,
 };
 #[allow(unused_imports)] // ChannelReduction kept reachable for surface stability
@@ -85,8 +74,8 @@ pub(crate) use helpers::{
     array_store_needs_layout_note, array_store_needs_write_barrier, buffer_alias_metadata_suffix,
     expr_has_numeric_pointer_free_array_layout, expr_produces_non_pointer_bits_by_construction,
     is_global_this_builtin_function_name, is_global_this_builtin_name,
-    lower_expr_with_expected_type, lower_js_args_array, proxy_build_args_array,
-    type_has_numeric_pointer_free_array_layout, unbox_str_handle, unbox_to_i64,
+    lower_expr_with_expected_type, lower_js_args_array, proxy_build_args_array, unbox_str_handle,
+    unbox_to_i64,
 };
 pub(crate) use i32_fast_path::{
     can_lower_expr_as_i32, is_known_finite, lower_expr_as_i32, lower_expr_native,
@@ -104,15 +93,14 @@ pub(crate) use pod_record::{
     try_lower_pod_field_get, try_lower_pod_field_set,
 };
 pub(crate) use range_facts::{
-    bounds_for_buffer_access, bounds_for_buffer_access_width, effective_alias_state_for_access,
+    bounds_for_buffer_access_width, effective_alias_state_for_access,
     guarded_buffer_indices_for_condition, int_range_expr, invalidate_local_write_facts,
     record_int_facts_for_let, record_int_facts_for_local_set, record_int_facts_for_update,
     while_condition_range_fact, IntRange, IntRangeFact,
 };
 pub(crate) use strings::emit_string_literal_global;
 pub(crate) use typed_feedback::{
-    emit_typed_feedback_observe_helper_return, emit_typed_feedback_register_site,
-    native_region_slug, TypedFeedbackContract, TypedFeedbackKind,
+    emit_typed_feedback_register_site, native_region_slug, TypedFeedbackContract, TypedFeedbackKind,
 };
 pub(crate) use url_helpers::lower_url_string_getter;
 pub(crate) use v8_interop::{
@@ -122,7 +110,7 @@ pub(crate) use write_barrier::{
     emit_array_numeric_write_note_on_block, emit_jsvalue_slot_store_on_block,
     emit_jsvalue_slot_store_scalar_aware_on_block, emit_layout_note_slot_on_block,
     emit_root_heap_word_store_on_block, emit_root_nanbox_store_on_block, emit_write_barrier,
-    emit_write_barrier_slot_on_block, lower_event_emitter_subclass_init,
+    emit_write_barrier_slot_on_block, lower_array_super_init, lower_event_emitter_subclass_init,
     lower_node_stream_super_init, lower_stream_super_init,
 };
 
@@ -155,6 +143,14 @@ pub(crate) struct FnCtx<'a> {
     pub source_function_slug: String,
     /// Stable id for the labeled loop currently being lowered.
     pub active_region_id: Option<String>,
+    /// Full native-region fact graph collected for this lowered HIR region.
+    ///
+    /// Existing fields below borrow individual subgraphs for compatibility
+    /// with older lowering consumers. New native-lowering decisions should
+    /// prefer this structured graph so representation, range, bounds, alias,
+    /// escape, shape, constants, and materialization-hazard facts stay tied
+    /// to the same collector snapshot.
+    pub native_facts: &'a NativeRegionFactGraph,
     /// Map from HIR LocalId → LLVM alloca pointer (e.g. `%r3`).
     pub locals: std::collections::HashMap<u32, String>,
     /// Map from HIR LocalId → static HIR Type. Used by `is_string_expr` and
@@ -786,6 +782,8 @@ pub(crate) struct FnCtx<'a> {
     /// `let arr = [a, b, c]` and emit per-index allocas instead of a
     /// heap array, and by `.length` reads to fold to the constant.
     pub non_escaping_arrays: std::collections::HashMap<u32, u32>,
+    pub non_escaping_array_used_indices:
+        std::collections::HashMap<u32, std::collections::HashSet<u32>>,
 
     /// Non-escaping object literals identified by escape analysis. Maps
     /// local_id → field names (declaration order, deduplicated). Used by
@@ -794,6 +792,8 @@ pub(crate) struct FnCtx<'a> {
     /// already resolve through `scalar_replaced`, so no separate read path
     /// is required.
     pub non_escaping_object_literals: std::collections::HashMap<u32, Vec<String>>,
+    pub non_escaping_object_literal_used_fields:
+        std::collections::HashMap<u32, std::collections::HashSet<String>>,
 
     /// (Issue #50) Module-level const 2D int arrays folded into a flat
     /// `[N x i32]` LLVM constant. Maps local_id → (flat_global_name, rows,
@@ -1551,6 +1551,7 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         | Expr::SetNewFromArray(..) => logical_collections::lower(ctx, expr),
         Expr::StaticMethodCall { .. } => static_method::lower(ctx, expr),
         Expr::SuperMethodCall { .. }
+        | Expr::SuperMethodCallSpread { .. }
         | Expr::SuperPropertyGet { .. }
         | Expr::SuperPropertySet { .. }
         | Expr::ObjectSuperPropertyGet { .. }
@@ -2049,7 +2050,9 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
 
 pub(crate) fn lower_math_operand(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
     let raw = lower_expr(ctx, expr)?;
-    if is_numeric_expr(ctx, expr) {
+    if is_numeric_expr(ctx, expr)
+        && !crate::type_analysis::expr_may_return_boxed_value_from_raw_f64_fallback(ctx, expr)
+    {
         Ok(raw)
     } else {
         Ok(ctx

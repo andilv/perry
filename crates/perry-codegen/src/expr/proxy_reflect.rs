@@ -4,7 +4,7 @@
 //! Pure mechanical move — match arm bodies are verbatim copies, called from
 //! `lower_expr`'s outer dispatch.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::Result;
 #[allow(unused_imports)]
 use perry_hir::{BinaryOp, CompareOp, Expr, UnaryOp, UpdateOp};
 #[allow(unused_imports)]
@@ -21,6 +21,7 @@ use crate::lower_string_method::{
 };
 #[allow(unused_imports)]
 use crate::nanbox::{double_literal, POINTER_MASK_I64};
+use crate::native_value::MaterializationReason;
 #[allow(unused_imports)]
 use crate::type_analysis::{
     compute_auto_captures, is_array_expr, is_bigint_expr, is_bool_expr, is_map_expr,
@@ -31,10 +32,10 @@ use crate::types::{DOUBLE, I1, I32, I64, I8, PTR};
 
 #[allow(unused_imports)]
 use super::{
-    buffer_alias_metadata_suffix, can_lower_expr_as_i32, emit_layout_note_slot_on_block,
-    emit_shadow_slot_clear, emit_shadow_slot_update_for_expr, emit_string_literal_global,
-    emit_v8_export_call, emit_v8_member_method_call, emit_write_barrier,
-    emit_write_barrier_slot_on_block, expr_is_known_non_pointer_shadow_value,
+    buffer_alias_metadata_suffix, can_lower_expr_as_i32, downgrade_buffer_aliases_in_expr,
+    emit_layout_note_slot_on_block, emit_shadow_slot_clear, emit_shadow_slot_update_for_expr,
+    emit_string_literal_global, emit_v8_export_call, emit_v8_member_method_call,
+    emit_write_barrier, emit_write_barrier_slot_on_block, expr_is_known_non_pointer_shadow_value,
     extract_array_of_object_shape, i32_bool_to_nanbox, import_origin_suffix,
     is_global_this_builtin_function_name, is_global_this_builtin_name, is_known_finite,
     lower_array_literal, lower_channel_reduction, lower_expr, lower_expr_as_i32,
@@ -45,6 +46,16 @@ use super::{
     unbox_str_handle, unbox_to_i64, variant_name, ChannelReduction, FlatConstInfo, FnCtx,
     I18nLowerCtx,
 };
+
+fn downgrade_unknown_call_expr(ctx: &mut FnCtx<'_>, expr: &Expr) {
+    downgrade_buffer_aliases_in_expr(ctx, expr, MaterializationReason::UnknownCallEscape);
+}
+
+fn downgrade_unknown_call_args(ctx: &mut FnCtx<'_>, args: &[Expr]) {
+    for arg in args {
+        downgrade_unknown_call_expr(ctx, arg);
+    }
+}
 
 /// `p.call(thisArg, ...rest)` / `p.apply(thisArg, argsArray)` where `p` is a
 /// Proxy (#3656). The HIR lowers the callee to `ProxyGet(p, "call"|"apply")`,
@@ -66,6 +77,8 @@ pub(crate) fn try_lower_proxy_fn_call_apply(
         Expr::String(s) if s == "call" => false,
         _ => return Ok(None),
     };
+    downgrade_unknown_call_expr(ctx, proxy);
+    downgrade_unknown_call_args(ctx, args);
     let p = lower_expr(ctx, proxy)?;
     let this_arg = match args.first() {
         Some(a) => lower_expr(ctx, a)?,
@@ -121,6 +134,8 @@ pub(crate) fn try_lower_proxy_method_call(
     if method_name == "call" || method_name == "apply" {
         return Ok(None);
     }
+    downgrade_unknown_call_expr(ctx, proxy);
+    downgrade_unknown_call_args(ctx, args);
     let recv_box = lower_expr(ctx, proxy)?;
     let mut lowered_args: Vec<String> = Vec::with_capacity(args.len());
     for a in args {
@@ -342,13 +357,47 @@ fn is_numeric_string_key(key: &str) -> bool {
 }
 
 fn put_value_index_fast_path(ctx: &FnCtx<'_>, target: &Expr, key: &Expr, receiver: &Expr) -> bool {
-    if !same_side_effect_free_receiver(target, receiver) || !is_array_expr(ctx, target) {
+    if !same_side_effect_free_receiver(target, receiver) {
         return false;
     }
-    match key {
-        Expr::String(key) => is_numeric_string_key(key),
-        _ => true,
+    if is_array_expr(ctx, target) {
+        return match key {
+            Expr::String(key) => is_numeric_string_key(key),
+            _ => true,
+        };
     }
+    // #5525: `P[i] = v` where `P` is an *untyped* (`Type::Any`/`Type::Unknown`)
+    // receiver. The desugared `PutValueSet` otherwise falls through to the
+    // generic `js_put_value_set` ([[Set]] via `ordinary_set_with_receiver` →
+    // stringify-the-index object dispatch), which dominated the bcrypt write
+    // profile. Routing it to `index_set::lower` instead reaches that file's
+    // matching `recv_unknown` arm, which emits `js_dyn_index_set` — carrying the
+    // #5525 process-global typed-array kind cache + inline
+    // `typed_array_fast_index_set` fast path. This is the write counterpart of
+    // the IndexGet `recv_unknown → js_dyn_index_get` route that bcryptjs's
+    // Blowfish `Int32Array` P/S boxes (reached through untyped `Array.<number>`
+    // params) need. `js_dyn_index_set` carries the full spec dispatch (typed-
+    // array per-kind store, plain-array extend, object by-name set, symbol side-
+    // table) for the cases the fast path defers, so the only keys we keep off it
+    // are statically-known string-literals / symbols (their interned-handle /
+    // symbol-side-table routes below are already optimal). Every statically-
+    // typed receiver is unaffected — `recv_unknown` is false for them.
+    let recv_unknown = matches!(
+        crate::type_analysis::static_type_of(ctx, target),
+        None | Some(perry_types::Type::Any) | Some(perry_types::Type::Unknown)
+    );
+    // Mirror `index_set::lower`'s `recv_unknown` arm: keep statically-known
+    // string-literal / symbol keys on their dedicated routes; route everything
+    // else (numeric, runtime-string, or an unknown-typed index like bcryptjs's
+    // `off + 1` where `off` is an `any` param) to `index_set::lower`, which emits
+    // the `js_dyn_index_set` fast path. The earlier `is_numeric_expr(key)` gate
+    // missed `off + 1` and those ~4M hot `lr[...]` writes stayed on
+    // `js_put_value_set`.
+    let key_is_static_string_or_symbol = matches!(
+        key,
+        Expr::String(_) | Expr::WtfString(_) | Expr::SymbolFor(_)
+    ) || is_string_expr(ctx, key);
+    recv_unknown && !key_is_static_string_or_symbol
 }
 
 fn try_lower_process_env_put_value_set(
@@ -386,6 +435,8 @@ fn try_lower_process_env_put_value_set(
 pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
     match expr {
         Expr::ProxyNew { target, handler } => {
+            downgrade_unknown_call_expr(ctx, target);
+            downgrade_unknown_call_expr(ctx, handler);
             let t = lower_expr(ctx, target)?;
             let h = lower_expr(ctx, handler)?;
             Ok(ctx
@@ -393,6 +444,8 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 .call(DOUBLE, "js_proxy_new", &[(DOUBLE, &t), (DOUBLE, &h)]))
         }
         Expr::ProxyGet { proxy, key } => {
+            downgrade_unknown_call_expr(ctx, proxy);
+            downgrade_unknown_call_expr(ctx, key);
             let p = lower_expr(ctx, proxy)?;
             let k = lower_expr(ctx, key)?;
             Ok(ctx
@@ -400,6 +453,9 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 .call(DOUBLE, "js_proxy_get", &[(DOUBLE, &p), (DOUBLE, &k)]))
         }
         Expr::ProxySet { proxy, key, value } => {
+            downgrade_unknown_call_expr(ctx, proxy);
+            downgrade_unknown_call_expr(ctx, key);
+            downgrade_unknown_call_expr(ctx, value);
             let p = lower_expr(ctx, proxy)?;
             let k = lower_expr(ctx, key)?;
             let v = lower_expr(ctx, value)?;
@@ -411,6 +467,8 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             Ok(v)
         }
         Expr::ProxyHas { proxy, key } => {
+            downgrade_unknown_call_expr(ctx, proxy);
+            downgrade_unknown_call_expr(ctx, key);
             let p = lower_expr(ctx, proxy)?;
             let k = lower_expr(ctx, key)?;
             Ok(ctx
@@ -418,6 +476,8 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 .call(DOUBLE, "js_proxy_has", &[(DOUBLE, &p), (DOUBLE, &k)]))
         }
         Expr::ProxyDelete { proxy, key } => {
+            downgrade_unknown_call_expr(ctx, proxy);
+            downgrade_unknown_call_expr(ctx, key);
             let p = lower_expr(ctx, proxy)?;
             let k = lower_expr(ctx, key)?;
             Ok(ctx
@@ -425,6 +485,8 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 .call(DOUBLE, "js_proxy_delete", &[(DOUBLE, &p), (DOUBLE, &k)]))
         }
         Expr::ProxyApply { proxy, args } => {
+            downgrade_unknown_call_expr(ctx, proxy);
+            downgrade_unknown_call_args(ctx, args);
             let p = lower_expr(ctx, proxy)?;
             let arr_handle = proxy_build_args_array(ctx, args)?;
             let blk = ctx.block();
@@ -437,6 +499,8 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             ))
         }
         Expr::ProxyConstruct { proxy, args } => {
+            downgrade_unknown_call_expr(ctx, proxy);
+            downgrade_unknown_call_args(ctx, args);
             let p = lower_expr(ctx, proxy)?;
             let arr_handle = proxy_build_args_array(ctx, args)?;
             let blk = ctx.block();
@@ -452,6 +516,8 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // #2846: return a real `{ proxy, revoke }` record so `typeof
             // rec.revoke === "function"`, `rec.proxy.a` forwards, and the
             // revoke function survives aliasing/storage.
+            downgrade_unknown_call_expr(ctx, target);
+            downgrade_unknown_call_expr(ctx, handler);
             let t = lower_expr(ctx, target)?;
             let h = lower_expr(ctx, handler)?;
             Ok(ctx
@@ -459,6 +525,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 .call(DOUBLE, "js_proxy_revocable", &[(DOUBLE, &t), (DOUBLE, &h)]))
         }
         Expr::ProxyRevoke(proxy) => {
+            downgrade_unknown_call_expr(ctx, proxy);
             let p = lower_expr(ctx, proxy)?;
             ctx.block().call_void("js_proxy_revoke", &[(DOUBLE, &p)]);
             Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)))
@@ -471,6 +538,9 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // #2766: pass the optional receiver through; the runtime defaults
             // an `undefined` receiver to the target and binds it as `this` for
             // accessor getters.
+            downgrade_unknown_call_expr(ctx, target);
+            downgrade_unknown_call_expr(ctx, key);
+            downgrade_unknown_call_expr(ctx, receiver);
             let t = lower_expr(ctx, target)?;
             let k = lower_expr(ctx, key)?;
             let r = lower_expr(ctx, receiver)?;
@@ -490,6 +560,10 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // `undefined` receiver to the target. A receiver distinct from an
             // Integer-Indexed target redirects the write to the receiver per
             // OrdinarySet (test262 internals/Set/key-is-valid-index-reflect-set).
+            downgrade_unknown_call_expr(ctx, target);
+            downgrade_unknown_call_expr(ctx, key);
+            downgrade_unknown_call_expr(ctx, value);
+            downgrade_unknown_call_expr(ctx, receiver);
             let t = lower_expr(ctx, target)?;
             let k = lower_expr(ctx, key)?;
             let v = lower_expr(ctx, value)?;
@@ -547,6 +621,10 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     },
                 );
             }
+            downgrade_unknown_call_expr(ctx, target);
+            downgrade_unknown_call_expr(ctx, key);
+            downgrade_unknown_call_expr(ctx, value);
+            downgrade_unknown_call_expr(ctx, receiver);
             let t = lower_expr(ctx, target)?;
             let k = lower_expr(ctx, key)?;
             let v = lower_expr(ctx, value)?;
@@ -569,6 +647,8 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             ))
         }
         Expr::ReflectHas { target, key } => {
+            downgrade_unknown_call_expr(ctx, target);
+            downgrade_unknown_call_expr(ctx, key);
             let t = lower_expr(ctx, target)?;
             let k = lower_expr(ctx, key)?;
             Ok(ctx
@@ -576,6 +656,8 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 .call(DOUBLE, "js_reflect_has", &[(DOUBLE, &t), (DOUBLE, &k)]))
         }
         Expr::ReflectDelete { target, key } => {
+            downgrade_unknown_call_expr(ctx, target);
+            downgrade_unknown_call_expr(ctx, key);
             let t = lower_expr(ctx, target)?;
             let k = lower_expr(ctx, key)?;
             Ok(ctx
@@ -583,6 +665,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 .call(DOUBLE, "js_reflect_delete", &[(DOUBLE, &t), (DOUBLE, &k)]))
         }
         Expr::ReflectOwnKeys(target) => {
+            downgrade_unknown_call_expr(ctx, target);
             let t = lower_expr(ctx, target)?;
             Ok(ctx
                 .block()
@@ -593,6 +676,9 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             this_arg,
             args,
         } => {
+            downgrade_unknown_call_expr(ctx, func);
+            downgrade_unknown_call_expr(ctx, this_arg);
+            downgrade_unknown_call_expr(ctx, args);
             let f = lower_expr(ctx, func)?;
             let ta = lower_expr(ctx, this_arg)?;
             let a = lower_expr(ctx, args)?;
@@ -607,6 +693,9 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             args,
             new_target,
         } => {
+            downgrade_unknown_call_expr(ctx, target);
+            downgrade_unknown_call_expr(ctx, args);
+            downgrade_unknown_call_expr(ctx, new_target);
             let t = lower_expr(ctx, target)?;
             let a = lower_expr(ctx, args)?;
             let nt = lower_expr(ctx, new_target)?;
@@ -621,6 +710,9 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             key,
             descriptor,
         } => {
+            downgrade_unknown_call_expr(ctx, target);
+            downgrade_unknown_call_expr(ctx, key);
+            downgrade_unknown_call_expr(ctx, descriptor);
             let t = lower_expr(ctx, target)?;
             let k = lower_expr(ctx, key)?;
             let d = lower_expr(ctx, descriptor)?;
@@ -631,6 +723,8 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             ))
         }
         Expr::ReflectGetOwnPropertyDescriptor { target, key } => {
+            downgrade_unknown_call_expr(ctx, target);
+            downgrade_unknown_call_expr(ctx, key);
             let t = lower_expr(ctx, target)?;
             let k = lower_expr(ctx, key)?;
             Ok(ctx.block().call(
@@ -642,6 +736,8 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         Expr::ReflectSetPrototypeOf { target, proto } => {
             // #2761: Reflect-specific boolean result (false on rejected change)
             // + TypeError on bad args, distinct from Object.setPrototypeOf.
+            downgrade_unknown_call_expr(ctx, target);
+            downgrade_unknown_call_expr(ctx, proto);
             let t = lower_expr(ctx, target)?;
             let p = lower_expr(ctx, proto)?;
             Ok(ctx.block().call(
@@ -656,6 +752,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // `=== Class.prototype` comparison is still folded to a constant
             // bool at lowering time (lower_expr.rs); this path handles every
             // other (value-returning) use.
+            downgrade_unknown_call_expr(ctx, target);
             let t = lower_expr(ctx, target)?;
             Ok(ctx
                 .block()
@@ -664,6 +761,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         Expr::ReflectIsExtensible(target) => {
             // #2762: Reflect-specific — boolean result + TypeError on
             // non-object, distinct from Object.isExtensible.
+            downgrade_unknown_call_expr(ctx, target);
             let t = lower_expr(ctx, target)?;
             Ok(ctx
                 .block()
@@ -673,6 +771,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // #2762: Reflect-specific — boolean result + TypeError on
             // non-object, distinct from Object.preventExtensions (which
             // returns the object).
+            downgrade_unknown_call_expr(ctx, target);
             let t = lower_expr(ctx, target)?;
             Ok(ctx
                 .block()
@@ -684,6 +783,12 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             target,
             property_key,
         } => {
+            downgrade_unknown_call_expr(ctx, key);
+            downgrade_unknown_call_expr(ctx, value);
+            downgrade_unknown_call_expr(ctx, target);
+            if let Some(property_key) = property_key {
+                downgrade_unknown_call_expr(ctx, property_key);
+            }
             let k = lower_expr(ctx, key)?;
             let v = lower_expr(ctx, value)?;
             let t = lower_expr(ctx, target)?;
@@ -703,6 +808,11 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             target,
             property_key,
         } => {
+            downgrade_unknown_call_expr(ctx, key);
+            downgrade_unknown_call_expr(ctx, target);
+            if let Some(property_key) = property_key {
+                downgrade_unknown_call_expr(ctx, property_key);
+            }
             let k = lower_expr(ctx, key)?;
             let t = lower_expr(ctx, target)?;
             let p = property_key
@@ -721,6 +831,11 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             target,
             property_key,
         } => {
+            downgrade_unknown_call_expr(ctx, key);
+            downgrade_unknown_call_expr(ctx, target);
+            if let Some(property_key) = property_key {
+                downgrade_unknown_call_expr(ctx, property_key);
+            }
             let k = lower_expr(ctx, key)?;
             let t = lower_expr(ctx, target)?;
             let p = property_key
@@ -739,6 +854,11 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             target,
             property_key,
         } => {
+            downgrade_unknown_call_expr(ctx, key);
+            downgrade_unknown_call_expr(ctx, target);
+            if let Some(property_key) = property_key {
+                downgrade_unknown_call_expr(ctx, property_key);
+            }
             let k = lower_expr(ctx, key)?;
             let t = lower_expr(ctx, target)?;
             let p = property_key
@@ -757,6 +877,11 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             target,
             property_key,
         } => {
+            downgrade_unknown_call_expr(ctx, key);
+            downgrade_unknown_call_expr(ctx, target);
+            if let Some(property_key) = property_key {
+                downgrade_unknown_call_expr(ctx, property_key);
+            }
             let k = lower_expr(ctx, key)?;
             let t = lower_expr(ctx, target)?;
             let p = property_key
@@ -774,6 +899,10 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             target,
             property_key,
         } => {
+            downgrade_unknown_call_expr(ctx, target);
+            if let Some(property_key) = property_key {
+                downgrade_unknown_call_expr(ctx, property_key);
+            }
             let t = lower_expr(ctx, target)?;
             let p = property_key
                 .as_ref()
@@ -790,6 +919,10 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             target,
             property_key,
         } => {
+            downgrade_unknown_call_expr(ctx, target);
+            if let Some(property_key) = property_key {
+                downgrade_unknown_call_expr(ctx, property_key);
+            }
             let t = lower_expr(ctx, target)?;
             let p = property_key
                 .as_ref()
@@ -807,6 +940,11 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             target,
             property_key,
         } => {
+            downgrade_unknown_call_expr(ctx, key);
+            downgrade_unknown_call_expr(ctx, target);
+            if let Some(property_key) = property_key {
+                downgrade_unknown_call_expr(ctx, property_key);
+            }
             let k = lower_expr(ctx, key)?;
             let t = lower_expr(ctx, target)?;
             let p = property_key

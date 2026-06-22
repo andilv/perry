@@ -504,6 +504,16 @@ pub(crate) fn clean_arr_ptr(arr: *const ArrayHeader) -> *const ArrayHeader {
         }
         arr
     };
+    // #5432: reject small-handle ids (fetch/zlib/proxy/common-registry) that
+    // reached an array helper as the receiver. On non-macOS hosts HEAP_MIN is
+    // 0x1000 — below the handle band — so a handle like a fetch Headers id
+    // (0x40000) passes the window check above, and the forwarding-chain /
+    // obj_type derefs below (`cleaned - 8`) would read unmapped low memory and
+    // SIGSEGV. Magnitude-classify before any deref and null it (safe
+    // empty-result no-op), mirroring the addr_class band-map contract.
+    if crate::value::addr_class::is_handle_band(cleaned as usize) {
+        return std::ptr::null();
+    }
     // Issue #233: follow GC_FLAG_FORWARDED forwarding chains. When
     // an array grows (js_array_grow) we install a forwarding pointer
     // at the OLD location so any stale reference — e.g. an async
@@ -661,7 +671,15 @@ pub(crate) fn normalize_array_receiver(arr: *const ArrayHeader) -> *const ArrayH
     } else {
         bits as usize
     };
-    if raw_addr >= crate::gc::GC_HEADER_SIZE + 0x1000 {
+    // Reject the small-handle band (fetch/zlib/proxy/registry ids, #5432)
+    // BEFORE any GcHeader deref. A folded `headersHandle.forEach(cb)` can reach
+    // here with a fetch Headers handle (0x40000 band) when the static
+    // array-method fold mis-claimed the receiver; `0x40000 - 8` is unmapped low
+    // memory, so the stale `0x1008` floor used to SIGSEGV (the addr_class.rs
+    // band-map documents this exact #4665/#4800/#5432 shape). Treat any
+    // handle-band payload as "not an array" and fall through to clean_arr_ptr,
+    // which nulls it — a safe empty-result no-op instead of a crash.
+    if crate::value::addr_class::is_above_handle_band(raw_addr) {
         // Hot path first: read the GC-header obj_type byte. A genuine Array is
         // GC_TYPE_ARRAY and falls straight through to `clean_arr_ptr` — the
         // only added cost for `[1,2,3].map(...)` etc. is this one byte read and
@@ -672,21 +690,35 @@ pub(crate) fn normalize_array_receiver(arr: *const ArrayHeader) -> *const ArrayH
                 as *const crate::gc::GcHeader;
             (*hdr).obj_type
         };
-        if obj_type == crate::gc::GC_TYPE_OBJECT
-            // Guard out registered typed arrays / buffers that (theoretically)
-            // carry a plain-object GC tag — those have their own delegation arms
-            // in the callers and must not be materialized as array-likes.
-            && crate::typedarray::lookup_typed_array_kind(raw_addr).is_none()
-            && !crate::buffer::is_registered_buffer(raw_addr)
-        {
-            // Generic array-like object receiver
-            // (`Array.prototype.<m>.call({length, 0:…}, …)`): materialize
-            // `length` + indexed keys into a real array and operate on that.
-            return unsafe {
-                crate::array::js_array_from_arraylike(
-                    raw_addr as *const crate::object::ObjectHeader,
-                )
-            } as *const ArrayHeader;
+        // A genuine `Array` is GC_TYPE_ARRAY and skips this whole block (one
+        // compare), keeping the hot `[1,2,3].map(...)` path cheap. Everything
+        // else — generic array-like objects, typed arrays, buffers — resolves
+        // its registry membership once here.
+        if obj_type != crate::gc::GC_TYPE_ARRAY {
+            let is_typed_array = crate::typedarray::lookup_typed_array_kind(raw_addr).is_some();
+            let is_buffer = crate::buffer::is_registered_buffer(raw_addr);
+            if obj_type == crate::gc::GC_TYPE_OBJECT && !is_typed_array && !is_buffer {
+                // Generic array-like object receiver
+                // (`Array.prototype.<m>.call({length, 0:…}, …)`): materialize
+                // `length` + indexed keys into a real array and operate on that.
+                return unsafe {
+                    crate::array::js_array_from_arraylike(
+                        raw_addr as *const crate::object::ObjectHeader,
+                    )
+                } as *const ArrayHeader;
+            }
+            // #5484: a registered typed array / buffer is a valid receiver
+            // regardless of `clean_arr_ptr`'s macOS 2 TB heap-window heuristic.
+            // Typed arrays are old-arena allocations (`arena_alloc_gc_old`) that
+            // can land BELOW that floor, where `clean_arr_ptr` would null them —
+            // yet `clean_ta_ptr` (4 KB floor) accepts the same address, so
+            // `.length`/index access worked while `reduce`/`forEach`/`map`/
+            // `join`/`indexOf` (which funnel through here) silently saw an empty
+            // array. The registry membership IS the liveness check; return the
+            // raw address so the caller's typed-array / buffer dispatch fires.
+            if is_typed_array || is_buffer {
+                return raw_addr as *const ArrayHeader;
+            }
         }
     }
     // Real array / lazy array / typed array / null / garbage: existing path.
@@ -738,6 +770,22 @@ pub(crate) fn value_bits_to_number(value_bits: u64) -> Option<f64> {
     }
     Some(canonical_raw_f64(f64::from_bits(value_bits)))
 }
+
+#[no_mangle]
+pub extern "C" fn js_array_numeric_value_to_raw_f64(value: f64) -> f64 {
+    value_bits_to_number(value.to_bits()).unwrap_or(f64::NAN)
+}
+
+/// Keepalive anchor for the runtime-only link path (generated-code-only callee;
+/// see project_autoopt_ffi_symbol_link_break). Representation-aware numeric array
+/// lowering (#5291) emits calls to `js_array_numeric_value_to_raw_f64` from
+/// generated machine code only — nothing in the runtime crate references it — so
+/// without this `#[used]` anchor the linker dead-strips it from
+/// `libperry_runtime.a`, breaking cold `PERRY_NO_AUTO_OPTIMIZE=1` compiles with
+/// `Undefined symbols: _js_array_numeric_value_to_raw_f64`.
+#[used]
+static KEEP_JS_ARRAY_NUMERIC_VALUE_TO_RAW_F64: extern "C" fn(f64) -> f64 =
+    js_array_numeric_value_to_raw_f64;
 
 #[inline]
 fn canonical_raw_f64(value: f64) -> f64 {

@@ -1076,7 +1076,13 @@ pub extern "C" fn js_object_set_field_by_index(
             let name_len = (*key).byte_len as usize;
             let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
             if let Ok(name) = std::str::from_utf8(name_bytes) {
-                if ACCESSORS_IN_USE.with(|c| c.get()) {
+                // Gate on the per-object descriptor flag: `ACCESSOR_DESCRIPTORS`
+                // is keyed by raw address, so a fresh object reusing a freed
+                // address must not pick up the previous tenant's stale accessor
+                // (it would silently drop `obj.k = v` for a getter-only stale
+                // entry). A fresh allocation has the flag clear.
+                if ACCESSORS_IN_USE.with(|c| c.get()) && super::object_has_descriptors(obj as usize)
+                {
                     if let Some(acc) = get_accessor_descriptor(obj as usize, name) {
                         if acc.set != 0 {
                             let closure = (acc.set & crate::value::POINTER_MASK)
@@ -2281,7 +2287,7 @@ pub extern "C" fn js_object_has_property(obj: f64, key: f64) -> f64 {
         if (bits >> 48) == 0x7FFE {
             let class_id = (bits & 0xFFFF_FFFF) as u32;
             // Symbol key path.
-            if let Some(_) = crate::symbol::class_static_symbol_lookup(class_id, key) {
+            if crate::symbol::class_static_symbol_lookup(class_id, key).is_some() {
                 return nanbox_true;
             }
             // String key path: check CLASS_DYNAMIC_PROPS via the get-by-name fn.
@@ -3470,18 +3476,16 @@ pub extern "C" fn js_object_get_field_by_name(
                     // `name` member (method/field, handled above) still wins.
                     // This is what `assert.throws` reads via
                     // `thrown.constructor.name` to label the thrown error.
-                    if name == "name" && class_id != 0 {
-                        if !super::class_registry::class_is_key_deleted(class_id, name) {
-                            if let Some(cname) = super::class_registry::class_name_for_id(class_id)
-                            {
-                                let s = crate::string::js_string_from_bytes(
-                                    cname.as_ptr(),
-                                    cname.len() as u32,
-                                );
-                                return JSValue::from_bits(
-                                    crate::js_nanbox_string(s as i64).to_bits(),
-                                );
-                            }
+                    if name == "name"
+                        && class_id != 0
+                        && !super::class_registry::class_is_key_deleted(class_id, name)
+                    {
+                        if let Some(cname) = super::class_registry::class_name_for_id(class_id) {
+                            let s = crate::string::js_string_from_bytes(
+                                cname.as_ptr(),
+                                cname.len() as u32,
+                            );
+                            return JSValue::from_bits(crate::js_nanbox_string(s as i64).to_bits());
                         }
                     }
                 }
@@ -3828,6 +3832,90 @@ pub extern "C" fn js_object_get_field_by_name(
                 let val = crate::closure::closure_get_dynamic_prop(obj as usize, name_str);
                 if val.to_bits() != crate::value::TAG_UNDEFINED {
                     return JSValue::from_bits(val.to_bits());
+                }
+                // #5437 (Next.js W6 follow-up): a registered module-default
+                // wrapper whose wrapped CJS `module.exports` IS a plain
+                // function (e.g. `next/dist/compiled/debug` → `createDebug`)
+                // registers the FUNCTION itself as the wrapper. Reading the
+                // CJS-interop `.default` key off it
+                // (`_interop_require_default(require('debug')).default`) must
+                // yield that function value — NOT auto-call it. Calling it
+                // (`createDebug()` with no args) ran `enabled(undefined)` →
+                // `undefined.length` → "Cannot read properties of undefined
+                // (reading 'length')". For a non-ESM module the interop
+                // `default` is `module.exports`, which for the function-export
+                // case is the wrapper closure itself, so return it verbatim.
+                if crate::closure::is_module_default_wrapper(obj as usize) {
+                    // CJS-interop `__esModule` probe
+                    // (`_interop_require_default(require('m'))`): a CJS module
+                    // whose `module.exports` is a function is NOT an ES module,
+                    // so `.__esModule` is `undefined`. Auto-calling the wrapper
+                    // to answer this probe would EXECUTE the exported function
+                    // with no args — e.g. `next/dist/compiled/debug`'s
+                    // `createDebug()` ran `enabled(undefined)` →
+                    // `undefined.length` throw. Short-circuit it to undefined.
+                    if name_str == "__esModule" {
+                        return JSValue::undefined();
+                    }
+                    // The CJS-interop `.default` of such a module is
+                    // `module.exports` itself (the function), so return the
+                    // wrapper closure verbatim rather than auto-calling it.
+                    if name_str == "default" {
+                        return JSValue::from_bits(
+                            crate::value::js_nanbox_pointer(obj as i64).to_bits(),
+                        );
+                    }
+                }
+                // #5437 (Next.js W6): the receiver is a REGISTERED
+                // module-default-export wrapper closure (`const uw =
+                // require('S')` materialized + captured by-value). A member
+                // read like `uw.SharedCacheControls` should resolve against
+                // `module.exports`, not the wrapper function itself. Call the
+                // wrapper once to obtain `module.exports` and re-read the
+                // property off that object. Gated to wrappers codegen
+                // explicitly registered (so an arbitrary user closure is never
+                // auto-called) and to non-function-meta names (`constructor`,
+                // `prototype`, `name`, `length`, `caller`, `arguments`,
+                // `default`, well-known symbols) so a genuine function-property
+                // read still takes its dedicated path below.
+                if !matches!(
+                    name_str,
+                    "constructor"
+                        | "prototype"
+                        | "name"
+                        | "length"
+                        | "caller"
+                        | "arguments"
+                        | "apply"
+                        | "call"
+                        | "bind"
+                        | "default"
+                        | "__esModule"
+                ) && !name_str.starts_with("@@")
+                    && !name_str.starts_with("Symbol(")
+                {
+                    if let Some(exports) =
+                        crate::closure::module_default_wrapper_exports(obj as usize)
+                    {
+                        let exports_bits = exports.to_bits();
+                        // Guard against the wrapper returning itself (would
+                        // recurse) or undefined/null (nothing to read from).
+                        let exports_jsv = JSValue::from_bits(exports_bits);
+                        if exports_bits != (obj as u64)
+                            && exports_bits != crate::value::js_nanbox_pointer(obj as i64).to_bits()
+                            && !exports_jsv.is_undefined()
+                            && !exports_jsv.is_null()
+                        {
+                            let exports_ptr =
+                                crate::value::js_nanbox_get_pointer(exports) as *const ObjectHeader;
+                            if !exports_ptr.is_null() {
+                                let result = js_object_get_field_by_name(exports_ptr, key);
+                                if !result.is_undefined() {
+                                    return result;
+                                }
+                            }
+                        }
+                    }
                 }
                 if name_str == "constructor" {
                     if let Some(ctor) =
@@ -5228,8 +5316,11 @@ pub extern "C" fn js_object_get_field_by_name(
             } else {
                 // Accessor short-circuit: if this (obj, key) has a getter installed,
                 // invoke it instead of reading the slot. The `ACCESSORS_IN_USE`
-                // thread-local gate keeps this off the hot path in the common case.
-                if ACCESSORS_IN_USE.with(|c| c.get()) {
+                // thread-local gate keeps this off the hot path in the common case;
+                // the per-object flag gate avoids invoking a stale getter left by a
+                // freed object whose address this fresh object reused.
+                if ACCESSORS_IN_USE.with(|c| c.get()) && super::object_has_descriptors(obj as usize)
+                {
                     if let Ok(name) = std::str::from_utf8(key_bytes) {
                         if let Some(acc) = get_accessor_descriptor(obj as usize, name) {
                             if acc.get != 0 {
@@ -5255,7 +5346,8 @@ pub extern "C" fn js_object_get_field_by_name(
         // linear scan below (the index is an accelerator, not authoritative).
         if key_count >= WIDE_KEY_INDEX_MIN_KEYS {
             if let Some(i) = wide_key_index_lookup(keys_id, key_bytes, key, keys, key_count) {
-                if ACCESSORS_IN_USE.with(|c| c.get()) {
+                if ACCESSORS_IN_USE.with(|c| c.get()) && super::object_has_descriptors(obj as usize)
+                {
                     if let Ok(name) = std::str::from_utf8(key_bytes) {
                         if let Some(acc) = get_accessor_descriptor(obj as usize, name) {
                             if acc.get != 0 {
@@ -5296,7 +5388,8 @@ pub extern "C" fn js_object_get_field_by_name(
                     wide_key_index_note_hit(keys_id, key_bytes, i as u32);
                 }
                 // Accessor short-circuit (see fast path above).
-                if ACCESSORS_IN_USE.with(|c| c.get()) {
+                if ACCESSORS_IN_USE.with(|c| c.get()) && super::object_has_descriptors(obj as usize)
+                {
                     if let Ok(name) = std::str::from_utf8(key_bytes) {
                         if let Some(acc) = get_accessor_descriptor(obj as usize, name) {
                             if acc.get != 0 {

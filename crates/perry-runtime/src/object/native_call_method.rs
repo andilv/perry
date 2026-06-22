@@ -1306,9 +1306,7 @@ pub(crate) unsafe fn try_dispatch_value_called_proto_method(
     if (*closure).func_ptr != super::global_this::global_this_builtin_noop_thunk as *const u8 {
         return None;
     }
-    if super::native_module::builtin_closure_length(closure as usize).is_none() {
-        return None;
-    }
+    super::native_module::builtin_closure_length(closure as usize)?;
     let name_val = crate::closure::closure_get_dynamic_prop(closure as usize, "name");
     let name_jsv = JSValue::from_bits(name_val.to_bits());
     if !name_jsv.is_any_string() {
@@ -1416,6 +1414,34 @@ pub(crate) unsafe fn try_dispatch_instance_method_value(
         has_synthetic_arguments,
         has_rest,
     ))
+}
+
+/// #wall4: null-safe variant used ONLY by the unknown-native-method fallback in
+/// codegen (`lower_call/native/mod.rs`). The HIR can mis-classify a receiver's
+/// class so an `obj.method()` reaches that fallback; dispatching via
+/// `js_native_call_method` is correct for a REAL receiver (fixes the Next.js
+/// `e.indexOf` mis-typed-as-FormData case where `e` is a real array). But a
+/// genuinely undefined/null receiver must NOT hard-throw "Cannot read
+/// properties of undefined" — the prior `0.0` sentinel let such call sites limp,
+/// and Next's `app-page-turbo.runtime.prod.js` TOP-LEVEL has a nullish-receiver
+/// `.indexOf` that, if it throws, aborts the entire module load (then the
+/// `_not-found` page can't be required → HTTP 500). Returns the SAME `0.0`
+/// sentinel as the old fallback for a nullish receiver (preserving the exact
+/// pre-fix non-crashing behavior — `undefined` instead broke downstream code
+/// that expected a number); otherwise dispatches identically.
+#[no_mangle]
+pub unsafe extern "C" fn js_native_call_method_nullsafe(
+    object: f64,
+    method_name_ptr: *const i8,
+    method_name_len: usize,
+    args_ptr: *const f64,
+    args_len: usize,
+) -> f64 {
+    let v = crate::value::JSValue::from_bits(object.to_bits());
+    if v.is_undefined() || v.is_null() {
+        return 0.0;
+    }
+    js_native_call_method(object, method_name_ptr, method_name_len, args_ptr, args_len)
 }
 
 #[no_mangle]
@@ -1655,7 +1681,14 @@ pub unsafe extern "C" fn js_native_call_method(
             let result = func(object, method_name_ptr, method_name_len, args_ptr, args_len);
             return result;
         }
-        return f64::from_bits(0x7FF8_0000_0000_0001); // undefined
+        // No JS-handle dispatcher: return JS `undefined`. The literal must be
+        // TAG_UNDEFINED (0x7FFC_..._0001); an earlier copy used the bit pattern
+        // 0x7FF8_..._0001, which is a *signaling NaN* (a JS number), not
+        // undefined. A method call that fell through here (e.g. an iterator's
+        // `.next()` whose receiver reached this path) then returned that sNaN,
+        // which the `for…of` lazy-loop's `js_iterator_result_validate` rejected
+        // with "Iterator result is not an object".
+        return f64::from_bits(crate::value::TAG_UNDEFINED);
     }
 
     // #4661 follow-up: a *fused* method call `proxy.method(args)` on a Proxy
@@ -1750,6 +1783,54 @@ pub unsafe extern "C" fn js_native_call_method(
                 args.as_ptr(),
                 args.len(),
             );
+        } else if class_id != 0 && !method_name_ptr.is_null() && method_name_len > 0 {
+            // #5437: `C.viaFn()` where `viaFn` is a static DATA property holding a
+            // callable (`C.viaFn = fn` / `static viaFn = fn`), NOT a registered
+            // static method. A class reference VALUE is an INT32-tagged class id,
+            // not a heap object, so the generic object field-scan below can't deref
+            // it; and these statics live in CLASS_DYNAMIC_PROPS, not the static-
+            // method vtable, so the arm above misses them. The bug surfaced as a
+            // method call on a class returned from / aliased through a function
+            // (`const D = C; D.viaFn()`), where the static analyzer couldn't prove
+            // the receiver is a class object and lowered it to this dynamic path.
+            // Resolve the property exactly as the read-then-call path does
+            // (`js_object_get_field_by_name` walks the class-ref static chain),
+            // then invoke the callable with `this` bound to the class ref —
+            // mirroring `const f = C.viaFn; f()`, which already worked.
+            let key_ptr = crate::string::js_string_from_bytes(
+                method_name_ptr as *const u8,
+                method_name_len as u32,
+            );
+            let prop =
+                js_object_get_field_by_name(object.to_bits() as *const ObjectHeader, key_ptr);
+            let prop_bits = prop.bits();
+            let raw = (prop_bits & crate::value::POINTER_MASK) as usize;
+            if (prop_bits & crate::value::TAG_MASK) == crate::value::POINTER_TAG
+                && crate::closure::is_closure_ptr(raw)
+            {
+                // Rebind the closure's reserved `this` slot to the class ref, as
+                // the prototype/field method-dispatch arms above do. A static
+                // data property holding an object-literal method (`captures_this`)
+                // bakes `this` into a capture slot that `IMPLICIT_THIS` alone
+                // can't override; `clone_closure_rebind_this` is a no-op for
+                // closures that don't capture `this`, so plain functions and
+                // arrows are unaffected.
+                let bound = crate::closure::clone_closure_rebind_this(
+                    prop_bits,
+                    object_handle.get_nanbox_f64(),
+                );
+                let prop_handle = root_scope.root_nanbox_f64(f64::from_bits(bound));
+                let args = refreshed_args();
+                let prev_this =
+                    IMPLICIT_THIS.with(|c| c.replace(object_handle.get_nanbox_f64().to_bits()));
+                let result = crate::closure::js_native_call_value(
+                    prop_handle.get_nanbox_f64(),
+                    args.as_ptr(),
+                    args.len(),
+                );
+                IMPLICIT_THIS.with(|c| c.set(prev_this));
+                return result;
+            }
         }
     }
 
@@ -2234,7 +2315,11 @@ pub unsafe extern "C" fn js_native_call_method(
                 args.len(),
             );
         }
-        return f64::from_bits(0x7FF8_0000_0000_0001); // undefined
+        // No handle dispatcher registered: return JS `undefined`, NOT the
+        // signaling-NaN bit pattern 0x7FF8_..._0001 (a JS *number*) that a prior
+        // copy of this line used. See the JS-handle fallback above for why the
+        // sNaN surfaced as a spurious "Iterator result is not an object".
+        return f64::from_bits(crate::value::TAG_UNDEFINED);
     }
 
     // #1545: Web Streams handles are returned as `id as f64` (a normal float),
@@ -2620,12 +2705,16 @@ pub unsafe extern "C" fn js_native_call_method(
                     return f64::from_bits(JSValue::string_ptr(r).bits());
                 }
                 "substr" => {
-                    // Legacy substr(start, length); negative start from end,
-                    // 2nd arg is a length. i32::MIN = "length omitted" (#2897).
-                    let start = if args_len >= 1 { arg_i32(0) } else { 0 };
-                    let length = if args_len >= 2 { arg_i32(1) } else { i32::MIN };
+                    // Legacy substr(start, length): negative start counts from
+                    // the end, the 2nd arg is a length, and an `undefined`
+                    // length means "rest of string". `js_string_substr` runs
+                    // ToIntegerOrInfinity on the raw values itself (start before
+                    // length), so pass them through un-coerced (#2897).
+                    let undefined = f64::from_bits(JSValue::undefined().bits());
+                    let start_val = arg_at(0).unwrap_or(undefined);
+                    let length_val = arg_at(1).unwrap_or(undefined);
                     let s = receiver_string();
-                    let r = crate::string::js_string_substr(s, start, length);
+                    let r = crate::string::js_string_substr(s, start_val, length_val);
                     return f64::from_bits(JSValue::string_ptr(r).bits());
                 }
                 "toLocaleLowerCase" => {
@@ -2943,8 +3032,11 @@ pub unsafe extern "C" fn js_native_call_method(
                     args_len,
                 );
             }
-            // No dispatcher registered, return undefined
-            return f64::from_bits(0x7FF8_0000_0000_0001);
+            // No dispatcher registered, return JS `undefined`. Must be
+            // TAG_UNDEFINED (0x7FFC_..._0001); the bit pattern 0x7FF8_..._0001 a
+            // prior copy used is a signaling NaN (a JS number), which leaks out
+            // as a non-object and trips `js_iterator_result_validate`.
+            return f64::from_bits(crate::value::TAG_UNDEFINED);
         }
 
         // Guard: null pointer (raw_ptr == 0) means null POINTER_TAG (0x7FFD_0000_0000_0000)
@@ -4448,7 +4540,7 @@ pub unsafe extern "C" fn js_native_call_method(
                     .and_then(super::canonical_array_index)
                     .is_some_and(|idx| {
                         let buf = raw as *const crate::buffer::BufferHeader;
-                        idx < (*buf).length as u32
+                        idx < (*buf).length
                     });
                 return f64::from_bits(JSValue::bool(enumerable).bits());
             }
@@ -4528,7 +4620,7 @@ pub unsafe extern "C" fn js_native_call_method(
             if !own_key_present(obj_ptr as *mut ObjectHeader, key_str) {
                 return f64::from_bits(JSValue::bool(false).bits());
             }
-            let enumerable = get_property_attrs(obj_ptr as usize, &key_name)
+            let enumerable = get_property_attrs(obj_ptr as usize, key_name)
                 .map(|attrs| attrs.enumerable())
                 .unwrap_or(true);
             return f64::from_bits(JSValue::bool(enumerable).bits());
@@ -4637,7 +4729,7 @@ pub unsafe extern "C" fn js_native_call_method(
                 } else {
                     std::ptr::null()
                 };
-                let rest_len = if args_len > 1 { args_len - 1 } else { 0 };
+                let rest_len = args_len.saturating_sub(1);
                 let prev_this = IMPLICIT_THIS.with(|c| c.replace(this_arg.to_bits()));
                 // Static bound-method value (`C.m.call(x)`): arm the one-shot
                 // static-`this` override so the method body sees `x` instead
@@ -4714,15 +4806,24 @@ pub unsafe extern "C" fn js_native_call_method(
                 // synthetic `arguments` array local) — top 16 bits zero.
                 let args_arr_bits = args_arr_val.to_bits();
                 let arr_raw: usize = if args_arr_jsval.is_pointer() {
-                    (args_arr_bits & 0x0000_FFFF_FFFF_FFFF) as usize
+                    // A Symbol is POINTER_TAG'd but is a primitive, not an
+                    // Object — Type(argArray) is not Object, so reject it
+                    // below rather than treating its payload as an array
+                    // pointer (test262 apply/argarray-not-object `Symbol()`).
+                    if crate::symbol::js_is_symbol(args_arr_val) != 0 {
+                        0
+                    } else {
+                        (args_arr_bits & 0x0000_FFFF_FFFF_FFFF) as usize
+                    }
                 } else if (args_arr_bits >> 48) == 0 && args_arr_bits >= 0x1000 {
                     args_arr_bits as usize
                 } else {
                     0
                 };
                 // Spec CreateListFromArrayLike: a non-nullish, non-object
-                // argArray (`fn.apply(null, true)` / `NaN` / `'1,2,3'`) is a
-                // TypeError. null/undefined mean "no arguments".
+                // argArray (`fn.apply(null, true)` / `NaN` / `'1,2,3'` /
+                // `Symbol()`) is a TypeError. null/undefined mean "no
+                // arguments".
                 if arr_raw == 0 && !args_arr_jsval.is_undefined() && !args_arr_jsval.is_null() {
                     throw_type_error_message(b"CreateListFromArrayLike called on non-object");
                 }
@@ -5336,4 +5437,59 @@ pub unsafe extern "C" fn js_native_call_method(
         method_name.as_ptr(),
         method_name.len(),
     );
+}
+
+#[cfg(test)]
+mod undefined_fallback_tests {
+    //! Regression: a method call that falls through to a "no dispatcher →
+    //! return undefined" path must hand back JS `undefined`
+    //! (`TAG_UNDEFINED` = 0x7FFC_..._0001), NOT the bit pattern
+    //! 0x7FF8_..._0001. The latter is a *signaling NaN* — i.e. a JS *number* —
+    //! so it slips past every "is this an object?" check. In a `for…of` loop
+    //! the lazy desugar validates each `iter.next()` result with
+    //! `js_iterator_result_validate`; an sNaN there is reported as the
+    //! confusing `TypeError: Iterator result is not an object`. This bit
+    //! ~9 fallback returns across `native_call_method.rs` and the stdlib handle
+    //! dispatcher; the test pins the JS-handle arm (its dispatcher is null in
+    //! unit tests, so the fallback is taken deterministically).
+
+    #[test]
+    fn js_handle_method_with_no_dispatcher_returns_real_undefined() {
+        // A JS-handle-tagged receiver. `JS_HANDLE_CALL_METHOD` is unset in the
+        // test process, so `js_native_call_method` takes the no-dispatcher
+        // fallback that previously returned an sNaN.
+        let handle = f64::from_bits(crate::value::JS_HANDLE_TAG | 7);
+        let method = b"next";
+        let result = unsafe {
+            super::js_native_call_method(
+                handle,
+                method.as_ptr() as *const i8,
+                method.len(),
+                std::ptr::null(),
+                0,
+            )
+        };
+
+        // Must be exactly JS `undefined`, and crucially must NOT be a number —
+        // an sNaN would pass `is_number()` and masquerade as a value.
+        assert_eq!(
+            result.to_bits(),
+            crate::value::TAG_UNDEFINED,
+            "no-dispatcher handle method call must return TAG_UNDEFINED, got {:#018x}",
+            result.to_bits()
+        );
+        assert!(
+            !crate::value::JSValue::from_bits(result.to_bits()).is_number(),
+            "fallback result must not classify as a JS number (sNaN regression)"
+        );
+
+        // And it must satisfy the iterator-result validator's object check the
+        // same way real `undefined` does (i.e. it is correctly *rejected* as a
+        // non-object, rather than crashing or being misread as a value).
+        assert_ne!(
+            result.to_bits(),
+            0x7FF8_0000_0000_0001,
+            "must not be the signaling-NaN sentinel that tripped for…of"
+        );
+    }
 }

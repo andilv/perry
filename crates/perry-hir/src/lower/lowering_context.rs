@@ -193,6 +193,20 @@ pub struct LoweringContext {
     /// Native class instances: local_name -> (module_name, class_name)
     /// Tracks variables that hold instances of native module classes (e.g., EventEmitter)
     pub(crate) native_instances: Vec<(String, String, String)>,
+    /// Cross-function native-instance hints: (fn_ident_span_lo, param_index) ->
+    /// (module_name, class_name). Populated by `pre_scan_cross_fn_native_params`
+    /// BEFORE any function body is lowered, so `lower_fn_decl` can tag an
+    /// otherwise-untyped parameter as a native instance when a known native
+    /// handle (e.g. the `("ws","Client")` upgrade `wsId`) is passed across the
+    /// call boundary into it. Without this, `wsId.send(...)` inside a helper
+    /// reached as `handleConnection(req, wsId)` lowers to a generic (silent
+    /// no-op) dispatch instead of `js_ws_send_client_i64`.
+    ///
+    /// Keyed by the function declaration's identifier span (its `lo` byte
+    /// offset) — a stable AST identity — rather than its name, so a hint seeded
+    /// for one declaration never leaks onto an unrelated same-named (shadowed or
+    /// redeclared) function.
+    pub(crate) param_native_hints: HashMap<(u32, usize), (String, String)>,
     /// True while lowering code governed by ECMAScript strict mode.
     pub(crate) current_strict: bool,
     /// #1483: type-only perry/ui widget import aliases — local_name ->
@@ -298,6 +312,10 @@ pub struct LoweringContext {
     /// Function-body var prebinding uses the top mark to distinguish
     /// parameters/current-scope locals from outer captures with the same name.
     pub(crate) scope_local_marks: Vec<usize>,
+    /// #wall5: per-scope marks into `module_shadow_stack`, pushed in
+    /// `enter_scope` and popped in `exit_scope` to restore native-module
+    /// shadowing when a scope that re-bound a module name exits.
+    pub(crate) scope_module_shadow_marks: Vec<usize>,
     /// Block scope nesting counter (for bare `{}`, `if`, loops, try/finally).
     /// A local only counts as module-level when both `scope_depth == 0` and
     /// `inside_block_scope == 0`; `const captured = i` inside a top-level for
@@ -403,10 +421,34 @@ pub struct LoweringContext {
     /// truncated). The old lookup scanned FORWARD (first-match-wins), so the
     /// index keeps the FIRST pushed index per name (`entry().or_insert`).
     pub(crate) func_return_native_instances_index: HashMap<String, usize>,
+    /// Param names a pre-scan registered as native instances for the callback
+    /// it is ABOUT to lower (e.g. the `wsId` of `server.on('upgrade', (req,
+    /// wsId, head) => …)` tagged `("ws","Client")`). The callback's own param
+    /// binding then calls `shadow_native_instance_if_present(param)` to tombstone
+    /// stale leaked native tags — but here the tag is the FRESH, intended one,
+    /// so that shadow would wrongly erase it (the `wsId.send`/`.on` dead-channel
+    /// bug). One-shot per name: `shadow_native_instance_if_present` consumes the
+    /// entry and skips the tombstone exactly once.
+    ///
+    /// Each entry is anchored to the CALLBACK's param `scope_depth` (one below
+    /// the caller scope the pre-scan runs in); the consume matches at exactly
+    /// that depth and `exit_scope` drops entries deeper than the surviving depth.
+    /// So a protection whose expected consumer never fires (an unusual callback
+    /// shape, or a binding path that doesn't route through
+    /// `shadow_native_instance_if_present`) is cleared when the callback scope
+    /// exits and cannot leak into the caller scope to wrongly skip a later,
+    /// unrelated same-named binding's tombstone.
+    pub(crate) prescan_protected_native_params: std::collections::HashMap<String, usize>,
     /// Perf index for `native_modules` (push-only, never truncated). The old
     /// `lookup_native_module` scanned FORWARD (first-match-wins), so the index
     /// keeps the FIRST pushed index per name (`entry().or_insert`).
     pub(crate) native_modules_index: HashMap<String, usize>,
+    /// #wall5: scope-stack of native-module names currently SHADOWED by a local
+    /// binding (param / `const`) of the same name. `lookup_native_module`
+    /// returns `None` for shadowed names so a local `url`/`util`/etc. resolves
+    /// as a value, not the node module. Pushed at param/var-decl sites, truncated
+    /// at scope exit (parallel to `native_instances` scoping).
+    pub(crate) module_shadow_stack: Vec<String>,
     /// Perf index for `class_statics` (push-only, never truncated). The old
     /// `has_static_method`/`has_static_field` scanned FORWARD (first-match-wins),
     /// so the index keeps the FIRST pushed index per class name.
@@ -440,6 +482,21 @@ pub struct LoweringContext {
     /// default imports of actual classes (`import { MongoClient }`) are NOT in
     /// this set and keep the static-method path.
     pub(crate) namespace_import_locals: HashSet<String>,
+    /// #5432: locals initialized from a member-call `.fetch(...)` — the
+    /// Fetch-API / WinterCG convention every server framework exposes (Hono
+    /// `app.fetch`, itty-router, Cloudflare Workers handlers) returns a native
+    /// fetch `Response` whose `.headers` is a Headers handle. This set is
+    /// consulted ONLY by the `is_fetch_headers` guard in
+    /// `array_only_methods.rs` so `res.headers.forEach(cb)` /
+    /// `res.headers.entries()` bail the static array-method fold and route
+    /// through the Headers FFI instead of dispatching `js_array_forEach` on a
+    /// handle id (a SIGSEGV). It deliberately does NOT use
+    /// `register_native_instance`, which would hijack EVERY method/property
+    /// access on the local (e.g. a Bookshelf/Backbone `repo.fetch()` returning
+    /// a real array would then mis-route `.map`/`.forEach`). The narrow scope —
+    /// only `<name>.headers.<method>()` is affected — keeps the false-positive
+    /// surface to nil.
+    pub(crate) fetch_call_response_locals: HashSet<String>,
     /// Maps a namespace-import local (`import * as z from "src"`) to its source
     /// module. Used so a later bare `export { z }` re-export of that local routes
     /// to `Export::NamespaceReExport` (equivalent to `export * as z from "src"`)
@@ -531,6 +588,29 @@ pub struct LoweringContext {
     /// call dispatched into `Object.create`. Scoped save/restore in
     /// `lower_fn_body_block_stmt`.
     pub(crate) forward_class_names: std::collections::HashSet<String>,
+    /// Scope-local class-name aliases disambiguating distinct same-named classes
+    /// across nested function/factory scopes within ONE module (class refs are
+    /// name-keyed: `Expr::New { class_name }` / `ClassRef(name)`). When a body
+    /// declares `class X` while an outer/prior `class X` is already registered,
+    /// the body's X is renamed `X$<n>` and `X -> X$<n>` recorded so every
+    /// reference in that body binds to the lexically-correct class. Saved/
+    /// restored per body in both `lower_fn_body_block_stmt` and `lower_fn_expr`.
+    pub(crate) class_renames: std::collections::HashMap<String, String>,
+    /// Monotonic suffix source for `class_renames` unique names.
+    pub(crate) next_class_rename_id: u32,
+    /// Names of TOP-LEVEL `class X { … }` declarations in the module being
+    /// lowered (populated by the module pre-pass). A NAMED class EXPRESSION
+    /// nested in a function body — e.g. minimatch's `defaults()` returns
+    /// `Object.assign(m, { Minimatch: class Minimatch extends orig.Minimatch
+    /// {…} })` — whose name collides with one of these must NOT reuse the
+    /// top-level class's ClassId / module-scope registration: per JS spec a
+    /// class-expression's name binds only inside its own body. Reusing the id
+    /// silently overwrote the real exported class with the (nearly empty)
+    /// nested expression, so `new Minimatch(...)` produced a body-less
+    /// instance (every field/method undefined). This set lets
+    /// `lower_class_from_ast` detect that collision and allocate a fresh,
+    /// uniquely-named class instead.
+    pub(crate) module_class_decl_names: std::collections::HashSet<String>,
     /// Counter for generating anon-class names (`__AnonShape_N`).
     // #854: initialized in `new` but unread — anon-shape classes are now named
     // by content-addressed FNV hash (see `synthesize_anon_shape_class`), not by

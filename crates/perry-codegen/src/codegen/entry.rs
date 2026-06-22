@@ -18,6 +18,92 @@ use super::helpers::{
 };
 use super::opts::CrossModuleCtx;
 
+/// Emit the plugin ABI shim — `perry_plugin_abi_version`, `plugin_activate`,
+/// and (when the user exports `deactivate`) `plugin_deactivate` — for a
+/// dylib/staticlib's **entry** module.
+///
+/// The host's `perry_plugin_load`/`perry_plugin_unload`
+/// (`crates/perry-runtime/src/plugin.rs`) resolve exactly these names via
+/// `dlsym` / `GetProcAddress`, and the Windows link step lists them in the
+/// generated `.def` (see `compile_module_entry`'s caller in
+/// `crates/perry/src/commands/compile.rs`). A plugin dylib must therefore
+/// export them.
+///
+/// These are emitted from the entry module only — the file passed on the
+/// command line, where the dylib's top-level `activate`/`deactivate` exports
+/// live. Issue #5273: this previously sat in the non-entry-module branch, so a
+/// single-file plugin (which IS the entry module) got none of the three
+/// symbols and failed to load, while a hypothetical multi-module plugin would
+/// have emitted `perry_plugin_abi_version` once per non-entry module and failed
+/// to link on the duplicate symbol.
+///
+/// `perry_plugin_abi_version` returns the ABI version the runtime checks
+/// (`PLUGIN_ABI_VERSION` in `plugin.rs` — keep in sync). `plugin_activate`
+/// unwraps the NaN-boxed `api` handle and calls the user's `activate(api)`,
+/// returning 1 on success / 0 if the module doesn't export `activate` (the host
+/// treats 0 / a missing user `activate` as load failure).
+fn emit_plugin_abi_shim(llmod: &mut LlModule, hir: &HirModule, module_prefix: &str) {
+    use crate::codegen::helpers::scoped_fn_name;
+    use crate::nanbox::{POINTER_MASK_I64, POINTER_TAG_I64};
+
+    let has_plugin_activate = hir
+        .exported_functions
+        .iter()
+        .any(|(name, _)| name == "activate");
+    let has_plugin_deactivate = hir
+        .exported_functions
+        .iter()
+        .any(|(name, _)| name == "deactivate");
+
+    {
+        let abi_fn = llmod.define_function("perry_plugin_abi_version", I64, vec![]);
+        let _ = abi_fn.create_block("entry");
+        let blk = abi_fn.block_mut(0).unwrap();
+        blk.ret(I64, "2");
+    }
+
+    if has_plugin_activate {
+        let user_activate = scoped_fn_name(module_prefix, "activate");
+        llmod.declare_function(&user_activate, DOUBLE, &[DOUBLE]);
+        let fn_def = llmod.define_function(
+            "plugin_activate",
+            I64,
+            vec![(I64, "%api_handle".to_string())],
+        );
+        let _ = fn_def.create_block("entry");
+        let blk = fn_def.block_mut(0).unwrap();
+        let lower48 = blk.and(I64, "%api_handle", POINTER_MASK_I64);
+        let tagged = blk.or(I64, &lower48, POINTER_TAG_I64);
+        let boxed = blk.bitcast_i64_to_double(&tagged);
+        let _ = blk.call(DOUBLE, &user_activate, &[(DOUBLE, &boxed)]);
+        blk.ret(I64, "1");
+    } else {
+        let fn_def = llmod.define_function(
+            "plugin_activate",
+            I64,
+            vec![(I64, "%_api_handle".to_string())],
+        );
+        let _ = fn_def.create_block("entry");
+        let blk = fn_def.block_mut(0).unwrap();
+        blk.ret(I64, "0");
+    }
+
+    if has_plugin_deactivate {
+        let user_deactivate = scoped_fn_name(module_prefix, "deactivate");
+        llmod.declare_function(&user_deactivate, DOUBLE, &[]);
+        let fn_def = llmod.define_function("plugin_deactivate", VOID, vec![]);
+        let _ = fn_def.create_block("entry");
+        let blk = fn_def.block_mut(0).unwrap();
+        // The user's `deactivate` is declared/defined as `double ()` (every
+        // lowered TS function returns a NaN-boxed value), so call it as
+        // `double` and discard the result — mirroring the `activate` path
+        // above. A `call_void` here would emit `call void @<deactivate>()`,
+        // a signature mismatch against the `double` definition.
+        let _ = blk.call(DOUBLE, &user_deactivate, &[]);
+        blk.ret_void();
+    }
+}
+
 /// Collect the entry module's top-level `process.env.<NAME> = "<literal>"`
 /// assignments so they can be applied to the OS environment BEFORE eager
 /// module init (see the call site in `compile_module_entry`).
@@ -205,6 +291,22 @@ pub(super) fn compile_module_entry(
                 .filter(|s| !s.is_empty())
                 .map(|suite| llmod.add_string_constant(suite))
         };
+        // Next.js wall 54 (part 2): emit a string constant for every Deferred
+        // `.next/server/**` module path now (before `main` borrows `llmod`); the
+        // registration calls go in the block below. `(string_const_name,
+        // byte_len, sanitized_prefix)`.
+        let nextjs_path_inits: Vec<(String, usize, String)> = if is_dylib {
+            Vec::new()
+        } else {
+            cross_module
+                .nextjs_path_init_modules
+                .iter()
+                .map(|(path, prefix)| {
+                    let (cn, len) = llmod.add_string_constant(path);
+                    (cn, len, prefix.clone())
+                })
+                .collect()
+        };
         let main = if is_dylib {
             llmod.define_function("perry_module_init", VOID, vec![])
         } else {
@@ -316,6 +418,25 @@ pub(super) fn compile_module_entry(
                 }
                 blk.call_void(&format!("{}__init", prefix), &[]);
             }
+            // Next.js wall 54 (part 2): record each Deferred `.next/server/**`
+            // module's `__init` address under its absolute path so a runtime
+            // `require(absolutePath)` (turbopack page/chunk loading) can trigger
+            // its init lazily. No init runs here — only the address is recorded.
+            // The `<prefix>__init` symbols are already declared above for every
+            // non-entry prefix, so `ptrtoint` of the symbol resolves at link.
+            for (const_name, byte_len, prefix) in &nextjs_path_inits {
+                let path_ptr = format!("@{}", const_name);
+                let len_str = byte_len.to_string();
+                let init_addr = format!("ptrtoint (ptr @{}__init to i64)", prefix);
+                blk.call_void(
+                    "js_register_path_init",
+                    &[
+                        (PTR, path_ptr.as_str()),
+                        (I64, len_str.as_str()),
+                        (I64, init_addr.as_str()),
+                    ],
+                );
+            }
         }
         // Mark the boundary between init prelude and user code so
         // hoisted post-init setup (cached `@perry_class_keys_*` loads
@@ -355,6 +476,7 @@ pub(super) fn compile_module_entry(
             source_function: "module_init".to_string(),
             source_function_slug: crate::expr::native_region_slug("module_init"),
             active_region_id: None,
+            native_facts: &main_native_facts,
             locals: HashMap::new(),
             local_types: init_local_types,
             current_block: 0,
@@ -394,7 +516,7 @@ pub(super) fn compile_module_entry(
             func_returns_class: &cross_module.func_returns_class,
             boxed_vars: main_boxed_vars,
             prealloc_boxes: std::collections::HashSet::new(),
-            closure_rest_params: closure_rest_params,
+            closure_rest_params,
             local_closure_func_ids: HashMap::new(),
             local_closure_param_counts: HashMap::new(),
             option_object_locals: HashMap::new(),
@@ -446,7 +568,13 @@ pub(super) fn compile_module_entry(
             non_escaping_news: main_native_facts.non_escaping_news().clone(),
             non_escaping_new_used_fields: main_native_facts.non_escaping_new_used_fields().clone(),
             non_escaping_arrays: main_native_facts.non_escaping_arrays().clone(),
+            non_escaping_array_used_indices: main_native_facts
+                .non_escaping_array_used_indices()
+                .clone(),
             non_escaping_object_literals: main_native_facts.non_escaping_object_literals().clone(),
+            non_escaping_object_literal_used_fields: main_native_facts
+                .non_escaping_object_literal_used_fields()
+                .clone(),
             flat_const_arrays: &cross_module.flat_const_arrays,
             array_row_aliases: HashMap::new(),
             clamp3_functions: &cross_module.clamp3_functions,
@@ -656,6 +784,12 @@ pub(super) fn compile_module_entry(
         for raw in &typed_parse_rodata {
             llmod.add_raw_global(raw.clone());
         }
+        // Plugin ABI shim — emitted once, from the dylib/staticlib's entry
+        // module (this is where the top-level `activate`/`deactivate` exports
+        // live). See `emit_plugin_abi_shim` and issue #5273.
+        if is_dylib {
+            emit_plugin_abi_shim(llmod, hir, module_prefix);
+        }
     } else {
         // Issue #753: idempotent init guard. Every non-entry module gets
         // a one-byte `@__perry_init_done_<prefix>` flag and a thin
@@ -742,7 +876,16 @@ pub(super) fn compile_module_entry(
         let ic_base = llmod.ic_counter;
         let buffer_alias_base = llmod.buffer_alias_counter;
         let init_fn = llmod.define_function(&init_name, VOID, vec![]);
-        init_fn.linkage = "internal".to_string();
+        // `__init_body` is normally only reached through the guarded `__init`
+        // wrapper, so it would be `internal`. But a `worker_threads` Worker
+        // target must re-run its module body ONCE PER worker thread (each
+        // worker has its own thread-local arena), which the process-global
+        // `__perry_init_done_*` guard on `__init` would suppress after the
+        // first worker. Exposing the body with external linkage lets the
+        // worker-spawn codegen call it directly, bypassing the once-guard, so
+        // every spawned worker actually executes its entry. Main-thread import
+        // init is unaffected — it still goes through the guarded wrapper.
+        init_fn.linkage = "external".to_string();
         if is_dylib {
             init_fn.add_pre_return_void_call("js_typed_feedback_maybe_dump_trace");
         }
@@ -794,6 +937,7 @@ pub(super) fn compile_module_entry(
             source_function: "module_init".to_string(),
             source_function_slug: crate::expr::native_region_slug("module_init"),
             active_region_id: None,
+            native_facts: &init_native_facts,
             locals: HashMap::new(),
             local_types: HashMap::new(),
             current_block: 0,
@@ -833,7 +977,7 @@ pub(super) fn compile_module_entry(
             func_returns_class: &cross_module.func_returns_class,
             boxed_vars: init_boxed_vars,
             prealloc_boxes: std::collections::HashSet::new(),
-            closure_rest_params: closure_rest_params,
+            closure_rest_params,
             local_closure_func_ids: HashMap::new(),
             local_closure_param_counts: HashMap::new(),
             option_object_locals: HashMap::new(),
@@ -885,7 +1029,13 @@ pub(super) fn compile_module_entry(
             non_escaping_news: init_native_facts.non_escaping_news().clone(),
             non_escaping_new_used_fields: init_native_facts.non_escaping_new_used_fields().clone(),
             non_escaping_arrays: init_native_facts.non_escaping_arrays().clone(),
+            non_escaping_array_used_indices: init_native_facts
+                .non_escaping_array_used_indices()
+                .clone(),
             non_escaping_object_literals: init_native_facts.non_escaping_object_literals().clone(),
+            non_escaping_object_literal_used_fields: init_native_facts
+                .non_escaping_object_literal_used_fields()
+                .clone(),
             flat_const_arrays: &cross_module.flat_const_arrays,
             array_row_aliases: HashMap::new(),
             clamp3_functions: &cross_module.clamp3_functions,
@@ -975,6 +1125,11 @@ pub(super) fn compile_module_entry(
         for (name, ret, params) in pending {
             llmod.declare_function(&name, ret, &params);
         }
+        // NB: the plugin ABI shim (`perry_plugin_abi_version` /
+        // `plugin_activate` / `plugin_deactivate`) is emitted from the entry
+        // branch above, NOT here — see `emit_plugin_abi_shim` and issue #5273.
+        // A dylib's top-level plugin exports live in its entry module, and the
+        // three symbols must be defined exactly once per shared library.
         for ic_name in &ic_globals {
             llmod.add_raw_global(format!(
                 "@{} = private global [2 x i64] zeroinitializer",

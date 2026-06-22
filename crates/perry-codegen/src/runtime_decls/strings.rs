@@ -61,8 +61,9 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_string_position_to_index", I32, &[DOUBLE]);
     module.declare_function("js_string_slice", I64, &[I64, I32, I32]);
     module.declare_function("js_string_substring", I64, &[I64, I32, I32]);
-    // Legacy substr(start, length); length sentinel i32::MIN = omitted (#2897).
-    module.declare_function("js_string_substr", I64, &[I64, I32, I32]);
+    // Legacy substr(start, length); raw NaN-boxed JS values, ToIntegerOrInfinity
+    // applied in the runtime helper. An `undefined` length means "rest" (#2897).
+    module.declare_function("js_string_substr", I64, &[I64, DOUBLE, DOUBLE]);
     module.declare_function("js_string_split", I64, &[I64, I64]);
     module.declare_function("js_string_split_n", I64, &[I64, I64, I32]);
     // Boxed separator + boxed limit; full ToUint32(limit)/ToString(separator)
@@ -182,6 +183,10 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_register_closure_async_function", VOID, &[PTR]);
     module.declare_function("js_register_closure_generator_function", VOID, &[PTR]);
     module.declare_function("js_register_closure_async_generator_function", VOID, &[PTR]);
+    // #5504: tag-checking unbox for dynamic call callees — throws
+    // `TypeError: value is not a function` instead of masking a
+    // non-pointer value's low 48 bits into a wild closure pointer.
+    module.declare_function("js_closure_unbox_callee_checked", I64, &[DOUBLE]);
     module.declare_function("js_closure_call0", DOUBLE, &[I64]);
     module.declare_function("js_closure_call1", DOUBLE, &[I64, DOUBLE]);
     module.declare_function("js_closure_call2", DOUBLE, &[I64, DOUBLE, DOUBLE]);
@@ -911,6 +916,11 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_inline_arena_state", PTR, &[]);
     module.declare_function("js_inline_arena_slow_alloc", PTR, &[PTR, I64, I64]);
     module.declare_function("js_object_delete_field", I32, &[I64, I64]);
+    // Primitive-safe `delete` wrappers: take the RAW NaN-boxed receiver (DOUBLE)
+    // so `delete (number).x` / `delete (number)[k]` no-op to `true` instead of
+    // unboxing the primitive's bits as a garbage ObjectHeader* (EXC_BAD_ACCESS).
+    module.declare_function("js_object_delete_field_value", I32, &[DOUBLE, I64]);
+    module.declare_function("js_object_delete_dynamic_value", I32, &[DOUBLE, DOUBLE]);
     // Box a `delete` success bit into a JS boolean, throwing TypeError in
     // strict mode when the delete was refused (non-configurable property).
     module.declare_function("js_delete_result", DOUBLE, &[I32, I32]);
@@ -1062,6 +1072,10 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // local failed clang with "use of undefined value
     // @js_string_addref" — pure linker-visible declaration fix.
     module.declare_function("js_string_addref", VOID, &[I64]);
+    // Tag-checked addref taking a NaN-boxed value (DOUBLE): the scalar-replaced
+    // object-field / array-element stores demote a possibly-unique string source
+    // without materializing SSO strings. Same declaration rationale as above.
+    module.declare_function("js_string_addref_if_heap_string", VOID, &[DOUBLE]);
     module.declare_function("js_bigint_from_string", I64, &[PTR, I32]);
     module.declare_function("js_bigint_from_f64", I64, &[DOUBLE]);
     module.declare_function("js_bigint_cmp", I32, &[I64, I64]);
@@ -1157,6 +1171,13 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
         DOUBLE,
         &[I32, PTR, I64, DOUBLE, PTR, I64],
     );
+    // `super.method(...spread)` — flatten the (codegen-built) args array into a
+    // flat f64 buffer and forward to `js_super_method_call_dynamic`.
+    module.declare_function(
+        "js_super_method_call_dynamic_apply",
+        DOUBLE,
+        &[I32, PTR, I64, DOUBLE, DOUBLE],
+    );
     module.declare_function("js_array_push_spread_any", I64, &[I64, DOUBLE]);
     // Issue #711 part 2: prototype-based class declaration via
     // `<func>.prototype = <obj>`. Binds an object as the function's
@@ -1247,6 +1268,13 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // Iterator-protocol result validation (for-of lazy loop).
     module.declare_function("js_iterator_result_validate", DOUBLE, &[DOUBLE]);
     module.declare_function("js_global_get_or_throw_unresolved", DOUBLE, &[DOUBLE]);
+    // Ambient `require` for compiled external / compilePackages modules (#5373):
+    // bind a bare `require` to a createRequire-backed closure instead of throwing
+    // ReferenceError. Takes no base; returns the require closure value.
+    module.declare_function("js_module_ambient_require", DOUBLE, &[]);
+    // #5389 Tier 2: synchronous ambient require(spec) resolution — the codegen
+    // fallthrough when a computed require() didn't const-fold to a compiled target.
+    module.declare_function("js_module_ambient_require_apply", DOUBLE, &[DOUBLE]);
     // Non-throwing global read for `typeof <unresolved>` + global read-modify-
     // write for `i++`/`i--` on a sloppy implicit global (#3575).
     module.declare_function("js_global_get_optional", DOUBLE, &[DOUBLE]);

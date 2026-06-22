@@ -4,7 +4,7 @@
 //! Pure mechanical move — match arm bodies are verbatim copies, called from
 //! `lower_expr`'s outer dispatch.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::Result;
 #[allow(unused_imports)]
 use perry_hir::{BinaryOp, CompareOp, Expr, UnaryOp, UpdateOp};
 #[allow(unused_imports)]
@@ -30,7 +30,7 @@ use crate::type_analysis::{
     is_numeric_expr, is_set_expr, is_string_expr, is_url_search_params_expr, receiver_class_name,
 };
 #[allow(unused_imports)]
-use crate::types::{DOUBLE, I1, I16, I32, I64, I8, PTR};
+use crate::types::{DOUBLE, F32, I1, I16, I32, I64, I8, PTR};
 
 use super::arrays_finds::lower_buffer_index_get_i32;
 #[allow(unused_imports)]
@@ -145,14 +145,32 @@ pub(crate) fn index_object_is_class_or_proto_ref(ctx: &FnCtx<'_>, object: &Expr)
 }
 
 /// Compute the receiver handle to pass to `js_object_get_field_by_name`-family
-/// helpers from a NaN-boxed receiver value (`obj_bits`). Heap objects must be
-/// masked to a raw pointer, but an INT32-tagged class ref (`0x7FFE`) must keep
-/// its tag bits so the runtime routes to the static field / method / accessor
-/// tables. When the receiver's class-ref-ness is known at compile time
-/// (`static_known`), pass full bits unconditionally; otherwise branch at runtime
-/// on the tag so a runtime class-ref value (e.g. a function parameter bound to a
-/// class — `function f(C, k){ return C[k]; }`) is handled too. (test262
-/// class/elements propertyHelper `isWritable(C, name)` does `C[name]`.)
+/// helpers from a NaN-boxed receiver value (`obj_bits`). Only a *genuine heap
+/// pointer* — POINTER_TAG (`0x7FFD`, plain objects/arrays) or STRING_TAG
+/// (`0x7FFF`, heap strings) — may be masked down to a raw pointer for the runtime
+/// to dereference. Every other receiver shape keeps its full NaN-boxed bits:
+///
+/// * an INT32-tagged class ref (`0x7FFE`) keeps its tag so the runtime routes to
+///   the static field / method / accessor tables (test262 class/elements
+///   propertyHelper `isWritable(C, name)` does `C[name]`);
+/// * a plain number, SSO string, bigint, or bool/null/undefined keeps its bits
+///   so the by-name runtime helper recognizes the tag and returns `undefined`
+///   instead of masking the value's low 48 bits into a bogus heap address and
+///   dereferencing it.
+///
+/// The masking-everything-but-classref predecessor crashed on `(<number>)[k]`:
+/// the timestamp float `dayjs(1749820051142)` (`0x4279_7696_70ec_6000`) had its
+/// low 48 bits (`0x7696_70ec_6000`) masked into a plausible-looking heap pointer,
+/// and `js_typed_feedback_object_get_field_by_name_f64` then deref'd `ptr - 8`
+/// for the GcHeader → SIGSEGV (#5429). Keeping full bits routes the number
+/// through `normalize_raw_object_addr`, which rejects it (top16 `0x4279` masks to
+/// `0`), matching the dotted `n.format` path's receiver-tag triage.
+///
+/// When the receiver's heap-pointer-ness is known at compile time
+/// (`static_known` — a class or `.prototype` ref), pass full bits unconditionally;
+/// otherwise branch at runtime on the tag so a runtime class-ref value (e.g. a
+/// function parameter bound to a class — `function f(C, k){ return C[k]; }`) is
+/// handled too.
 pub(crate) fn classref_preserving_handle(
     blk: &mut crate::block::LlBlock,
     obj_bits: &str,
@@ -162,9 +180,12 @@ pub(crate) fn classref_preserving_handle(
         return obj_bits.to_string();
     }
     let top16 = blk.lshr(I64, obj_bits, "48");
-    let is_classref = blk.icmp_eq(I64, &top16, "32766"); // 0x7FFE
+    // (top16 & 0xFFFD) == 0x7FFD is true for exactly POINTER_TAG (0x7FFD) and
+    // STRING_TAG (0x7FFF) — the two heap-pointer-carrying tags.
+    let masked_tag = blk.and(I64, &top16, "65533"); // 0xFFFD
+    let is_heap_ptr = blk.icmp_eq(I64, &masked_tag, "32765"); // 0x7FFD
     let masked = blk.and(I64, obj_bits, POINTER_MASK_I64);
-    blk.select(crate::types::I1, &is_classref, I64, obj_bits, &masked)
+    blk.select(crate::types::I1, &is_heap_ptr, I64, &masked, obj_bits)
 }
 
 fn lower_class_method_bind(
@@ -193,6 +214,7 @@ fn lower_guarded_array_index_get(
     idx_i32: &str,
     block_prefix: &str,
     require_numeric_layout: bool,
+    coerce_numeric_fallback: bool,
 ) -> Result<String> {
     let contract = if require_numeric_layout {
         TypedFeedbackContract::numeric_array_get_index()
@@ -235,7 +257,7 @@ fn lower_guarded_array_index_get(
     ctx.block().cond_br(&guard_ok, &fast_label, &fallback_label);
 
     ctx.current_block = fallback_idx;
-    let fallback_val = ctx.block().call(
+    let fallback_boxed = ctx.block().call(
         DOUBLE,
         "js_typed_feedback_array_index_get_fallback_boxed",
         &[
@@ -244,15 +266,16 @@ fn lower_guarded_array_index_get(
             (DOUBLE, idx_box),
         ],
     );
+    let fallback_val = if require_numeric_layout && coerce_numeric_fallback {
+        ctx.block()
+            .call(DOUBLE, "js_number_coerce", &[(DOUBLE, &fallback_boxed)])
+    } else {
+        fallback_boxed.clone()
+    };
     let fallback_end_label = ctx.block().label.clone();
     ctx.block().br(&merge_label);
     if require_numeric_layout {
-        let fallback = LoweredValue {
-            semantic: SemanticKind::JsValue,
-            rep: NativeRep::JsValue,
-            llvm_ty: DOUBLE,
-            value: fallback_val.clone(),
-        };
+        let fallback = LoweredValue::js_value(fallback_boxed.clone());
         ctx.record_lowered_value_with_access_mode_and_facts(
             "NumericArrayIndexGet",
             None,
@@ -361,6 +384,386 @@ fn lower_guarded_array_index_get(
             (&fallback_val, &fallback_end_label),
         ],
     ))
+}
+
+/// #5525 follow-up: emit a guarded **inline** typed-array element read for an
+/// `obj[i]` whose receiver static type is erased (`any`/unknown) but is, at
+/// runtime, commonly an owning numeric typed array reached through an untyped
+/// param — exactly bcryptjs's `S[i]`/`P[i]` Blowfish boxes (~600M reads for one
+/// cost-12 `compareSync`). Instead of an out-of-line `js_dyn_index_get` call +
+/// `lookup_typed_array_kind` + `js_number_coerce` per element, this inlines:
+///   1. receiver-is-pointer NaN-box guard,
+///   2. a read of the process-global `PERRY_TA_VIEW_GUARD` (must be 0 → every
+///      live typed array uses inline storage, so `data_ptr == header + 16`),
+///   3. a probe of the `PERRY_TA_KIND_CACHE` slot for the receiver address
+///      (matches the cached `(addr << 8) | tag` word; the tag is the element
+///      kind and must be a non-BigInt kind ≤ `KIND_UINT8_CLAMPED`),
+///   4. an index validity + bounds check against the header `length`,
+///   5. a direct per-kind element load + int↔f64 widen,
+/// and falls back to the existing `js_dyn_index_get` slow path on ANY guard
+/// miss (non-pointer, cache miss, view live, BigInt/Float16 kind, OOB /
+/// fractional / negative index, runtime-string or symbol key). Because every
+/// rejected case defers to the unchanged runtime helper, semantics are
+/// identical; only the hot monomorphic numeric-typed-array case is short-cut.
+/// `obj_box` / `idx_d` are the already-lowered receiver and index (DOUBLE).
+fn lower_inline_dyn_typed_array_get(ctx: &mut FnCtx<'_>, obj_box: &str, idx_d: &str) -> String {
+    // TAG_MASK / POINTER_TAG / POINTER_MASK as signed-i64 LLVM literals.
+    let tag_mask = crate::nanbox::i64_literal(crate::nanbox::TAG_MASK);
+    let pointer_tag = crate::nanbox::POINTER_TAG_I64;
+    let pointer_mask = crate::nanbox::POINTER_MASK_I64;
+
+    let fast_idx = ctx.new_block("tav.get.fast");
+    let load_idx = ctx.new_block("tav.get.load");
+    let slow_idx = ctx.new_block("tav.get.slow");
+    let merge_idx = ctx.new_block("tav.get.merge");
+    let fast_label = ctx.block_label(fast_idx);
+    let load_label = ctx.block_label(load_idx);
+    let slow_label = ctx.block_label(slow_idx);
+    let merge_label = ctx.block_label(merge_idx);
+
+    // ---- entry: combined cache/kind/range guard -> fast | slow ----
+    let entry_guard = {
+        let blk = ctx.block();
+        let obj_bits = blk.bitcast_double_to_i64(obj_box);
+        let raw = blk.and(I64, &obj_bits, pointer_mask);
+        // is_pointer: (bits & TAG_MASK) == POINTER_TAG
+        let tagged = blk.and(I64, &obj_bits, &tag_mask);
+        let is_ptr = blk.icmp_eq(I64, &tagged, pointer_tag);
+        // view guard must be 0 (all typed arrays inline-storage)
+        let vg = blk.load(I64, "@PERRY_TA_VIEW_GUARD");
+        let vg_zero = blk.icmp_eq(I64, &vg, "0");
+        // cache slot = (raw >> 3) & 63
+        let slot = blk.lshr(I64, &raw, "3");
+        let slot = blk.and(I64, &slot, "63");
+        let entry_ptr = blk.gep(
+            "[64 x i64]",
+            "@PERRY_TA_KIND_CACHE",
+            &[(I64, "0"), (I64, &slot)],
+        );
+        let entry_val = blk.load(I64, &entry_ptr);
+        // addr match: (entry_val u>> 8) == raw  (also rejects empty slot = 0)
+        let entry_addr = blk.lshr(I64, &entry_val, "8");
+        let addr_match = blk.icmp_eq(I64, &entry_addr, &raw);
+        // kind = entry_val & 0xFF; loadable numeric kind = kind <= 8
+        // (KIND_INT8=0 .. KIND_UINT8_CLAMPED=8; rejects BigInt 9/10,
+        // Float16 11, and the 0xFF "not a typed array" sentinel).
+        let kind = blk.and(I64, &entry_val, "255");
+        let kind_ok = blk.icmp_ule(I64, &kind, "8");
+        // index float-range pre-checks (well-defined on NaN → false): the
+        // fptosi in the load block is only reached when these hold, so its
+        // result is never poison there.
+        let idx_ge0 = blk.fcmp("oge", idx_d, "0.0");
+        let idx_lt = blk.fcmp("olt", idx_d, "4294967296.0");
+        // AND-reduce all guards.
+        let g = blk.and(I1, &is_ptr, &vg_zero);
+        let g = blk.and(I1, &g, &addr_match);
+        let g = blk.and(I1, &g, &kind_ok);
+        let g = blk.and(I1, &g, &idx_ge0);
+        blk.and(I1, &g, &idx_lt)
+    };
+    ctx.block().cond_br(&entry_guard, &fast_label, &slow_label);
+
+    // ---- fast: validate integer index + bounds -> load | slow ----
+    ctx.current_block = fast_idx;
+    let (raw, idx_i64, kind) = {
+        let blk = ctx.block();
+        let obj_bits = blk.bitcast_double_to_i64(obj_box);
+        let raw = blk.and(I64, &obj_bits, pointer_mask);
+        // kind re-read from cache (cheap; keeps the fast block self-contained).
+        let slot = blk.lshr(I64, &raw, "3");
+        let slot = blk.and(I64, &slot, "63");
+        let entry_ptr = blk.gep(
+            "[64 x i64]",
+            "@PERRY_TA_KIND_CACHE",
+            &[(I64, "0"), (I64, &slot)],
+        );
+        let entry_val = blk.load(I64, &entry_ptr);
+        let kind = blk.and(I64, &entry_val, "255");
+        // idx is in [0, 2^32) (entry guard) so fptosi i64 is well-defined.
+        let idx_i64 = blk.fptosi(DOUBLE, idx_d, I64);
+        (raw, idx_i64, kind)
+    };
+    let fast_ok = {
+        let blk = ctx.block();
+        // reject fractional indices: sitofp(idx_i64) == idx_d
+        let idx_back = blk.sitofp(I64, &idx_i64, DOUBLE);
+        let is_int = blk.fcmp("oeq", &idx_back, idx_d);
+        // bounds: idx < header.length (u32 at offset 0)
+        let hdr_ptr = blk.inttoptr(I64, &raw);
+        let len = blk.load(I32, &hdr_ptr);
+        let len_i64 = blk.zext(I32, &len, I64);
+        let in_bounds = blk.icmp_ult(I64, &idx_i64, &len_i64);
+        blk.and(I1, &is_int, &in_bounds)
+    };
+    ctx.block().cond_br(&fast_ok, &load_label, &slow_label);
+
+    // ---- load: per-kind direct element load (data = header + 16) ----
+    ctx.current_block = load_idx;
+    // (value, end_label) for each per-kind load block, collected for the merge.
+    let kind_incoming: Vec<(String, String)>;
+    {
+        // Per-kind load blocks. Each computes the element address from
+        // `data = raw + 16` and `off = idx * elem_size`, loads the native
+        // slot, and widens to f64. We branch on `kind` via a cond_br chain.
+        // kinds: 0 I8, 1 U8, 2 I16, 3 U16, 4 I32, 5 U32, 6 F32, 7 F64,
+        // 8 U8Clamped (== U8 load). All others were excluded by the entry
+        // guard (kind <= 8).
+        let data_base = {
+            let blk = ctx.block();
+            blk.add(I64, &raw, "16")
+        };
+        // Helper closure-like inline: build a block that loads with a given
+        // element byte-width shift + LLVM elem type + widen, then brs to merge.
+        // We emit explicit blocks since closures can't borrow ctx mutably here.
+
+        // Create the per-kind blocks up front.
+        let b_i8 = ctx.new_block("tav.k.i8");
+        let b_u8 = ctx.new_block("tav.k.u8");
+        let b_i16 = ctx.new_block("tav.k.i16");
+        let b_u16 = ctx.new_block("tav.k.u16");
+        let b_i32 = ctx.new_block("tav.k.i32");
+        let b_u32 = ctx.new_block("tav.k.u32");
+        let b_f32 = ctx.new_block("tav.k.f32");
+        let b_f64 = ctx.new_block("tav.k.f64");
+        let l_i8 = ctx.block_label(b_i8);
+        let l_u8 = ctx.block_label(b_u8);
+        let l_i16 = ctx.block_label(b_i16);
+        let l_u16 = ctx.block_label(b_u16);
+        let l_i32 = ctx.block_label(b_i32);
+        let l_u32 = ctx.block_label(b_u32);
+        let l_f32 = ctx.block_label(b_f32);
+        let l_f64 = ctx.block_label(b_f64);
+
+        // Dispatch chain on `kind` (in the load block).
+        let chk = |ctx: &mut FnCtx<'_>, k: &str, hit: &str, next_idx: usize| {
+            let next_label = ctx.block_label(next_idx);
+            let cond = ctx.block().icmp_eq(I64, &kind, k);
+            ctx.block().cond_br(&cond, hit, &next_label);
+        };
+        // 0..7 explicit; kind 8 (U8Clamped) shares the U8 load as the final
+        // else (no further branch needed — entry guard already proved kind<=8).
+        let c1 = ctx.new_block("tav.kd1");
+        let c2 = ctx.new_block("tav.kd2");
+        let c3 = ctx.new_block("tav.kd3");
+        let c4 = ctx.new_block("tav.kd4");
+        let c5 = ctx.new_block("tav.kd5");
+        let c6 = ctx.new_block("tav.kd6");
+        let c7 = ctx.new_block("tav.kd7");
+        chk(ctx, "0", &l_i8, c1);
+        ctx.current_block = c1;
+        chk(ctx, "1", &l_u8, c2);
+        ctx.current_block = c2;
+        chk(ctx, "2", &l_i16, c3);
+        ctx.current_block = c3;
+        chk(ctx, "3", &l_u16, c4);
+        ctx.current_block = c4;
+        chk(ctx, "4", &l_i32, c5);
+        ctx.current_block = c5;
+        chk(ctx, "5", &l_u32, c6);
+        ctx.current_block = c6;
+        chk(ctx, "6", &l_f32, c7);
+        ctx.current_block = c7;
+        // remaining: kind 7 → f64, else (8) → u8.
+        let is_f64 = ctx.block().icmp_eq(I64, &kind, "7");
+        ctx.block().cond_br(&is_f64, &l_f64, &l_u8);
+
+        // Each per-kind block: compute elem addr, load, widen, br merge.
+        // off = idx << shift; addr = data_base + off.
+        let mut incoming: Vec<(String, String)> = Vec::new();
+        // I8 (sext), U8 (zext), I16 (sext), U16 (zext) via the small-int helper.
+        incoming.push(emit_inline_ta_int_load(
+            ctx,
+            b_i8,
+            &idx_i64,
+            &data_base,
+            &merge_label,
+            "0",
+            I8,
+            true,
+        ));
+        incoming.push(emit_inline_ta_int_load(
+            ctx,
+            b_u8,
+            &idx_i64,
+            &data_base,
+            &merge_label,
+            "0",
+            I8,
+            false,
+        ));
+        incoming.push(emit_inline_ta_int_load(
+            ctx,
+            b_i16,
+            &idx_i64,
+            &data_base,
+            &merge_label,
+            "1",
+            I16,
+            true,
+        ));
+        incoming.push(emit_inline_ta_int_load(
+            ctx,
+            b_u16,
+            &idx_i64,
+            &data_base,
+            &merge_label,
+            "1",
+            I16,
+            false,
+        ));
+        // I32: load i32, sitofp directly (sext to i32 is a no-op).
+        {
+            ctx.current_block = b_i32;
+            let blk = ctx.block();
+            let off = blk.shl(I64, &idx_i64, "2");
+            let addr = blk.add(I64, &data_base, &off);
+            let ptr = blk.inttoptr(I64, &addr);
+            let raw_elem = blk.load(I32, &ptr);
+            let val = blk.sitofp(I32, &raw_elem, DOUBLE);
+            let end_label = blk.label.clone();
+            blk.br(&merge_label);
+            incoming.push((val, end_label));
+        }
+        // U32: load i32, treat as unsigned → uitofp.
+        {
+            ctx.current_block = b_u32;
+            let blk = ctx.block();
+            let off = blk.shl(I64, &idx_i64, "2");
+            let addr = blk.add(I64, &data_base, &off);
+            let ptr = blk.inttoptr(I64, &addr);
+            let raw_elem = blk.load(I32, &ptr);
+            let val = blk.uitofp(I32, &raw_elem, DOUBLE);
+            let end_label = blk.label.clone();
+            blk.br(&merge_label);
+            incoming.push((val, end_label));
+        }
+        // F32: load float, fpext.
+        {
+            ctx.current_block = b_f32;
+            let blk = ctx.block();
+            let off = blk.shl(I64, &idx_i64, "2");
+            let addr = blk.add(I64, &data_base, &off);
+            let ptr = blk.inttoptr(I64, &addr);
+            let raw_elem = blk.load(F32, &ptr);
+            let val = blk.fpext(F32, &raw_elem, DOUBLE);
+            let end_label = blk.label.clone();
+            blk.br(&merge_label);
+            incoming.push((val, end_label));
+        }
+        // F64: load double raw.
+        {
+            ctx.current_block = b_f64;
+            let blk = ctx.block();
+            let off = blk.shl(I64, &idx_i64, "3");
+            let addr = blk.add(I64, &data_base, &off);
+            let ptr = blk.inttoptr(I64, &addr);
+            let val = blk.load(DOUBLE, &ptr);
+            let end_label = blk.label.clone();
+            blk.br(&merge_label);
+            incoming.push((val, end_label));
+        }
+
+        // Hand the collected per-kind (value,label) pairs to the final merge.
+        kind_incoming = incoming;
+    }
+
+    // ---- slow: the unchanged runtime dispatcher ----
+    ctx.current_block = slow_idx;
+    let slow_val = ctx.block().call(
+        DOUBLE,
+        "js_dyn_index_get",
+        &[(DOUBLE, obj_box), (DOUBLE, idx_d)],
+    );
+    let slow_end_label = ctx.block().label.clone();
+    ctx.block().br(&merge_label);
+
+    // ---- final merge: one phi over every per-kind fast end + the slow end ----
+    ctx.current_block = merge_idx;
+    let mut incoming_refs: Vec<(&str, &str)> = kind_incoming
+        .iter()
+        .map(|(v, l)| (v.as_str(), l.as_str()))
+        .collect();
+    incoming_refs.push((slow_val.as_str(), slow_end_label.as_str()));
+    ctx.block().phi(DOUBLE, &incoming_refs)
+}
+
+/// Emit one per-kind small-integer (1/2-byte) typed-array element load block for
+/// [`lower_inline_dyn_typed_array_get`]: switches to `blk_idx`, computes the
+/// element address (`data_base + (idx << shift)`), loads `elem_ty`, sign-/zero-
+/// extends to i32, converts to f64, and branches to `merge_label`. Returns the
+/// `(value, end_label)` pair for the merge phi.
+#[allow(clippy::too_many_arguments)]
+fn emit_inline_ta_int_load(
+    ctx: &mut FnCtx<'_>,
+    blk_idx: usize,
+    idx_i64: &str,
+    data_base: &str,
+    merge_label: &str,
+    shift: &str,
+    elem_ty: crate::types::LlvmType,
+    signed: bool,
+) -> (String, String) {
+    ctx.current_block = blk_idx;
+    let blk = ctx.block();
+    let off = blk.shl(I64, idx_i64, shift);
+    let addr = blk.add(I64, data_base, &off);
+    let ptr = blk.inttoptr(I64, &addr);
+    let raw_elem = blk.load(elem_ty, &ptr);
+    let val = if signed {
+        let i32v = blk.sext(elem_ty, &raw_elem, I32);
+        blk.sitofp(I32, &i32v, DOUBLE)
+    } else {
+        let i32v = blk.zext(elem_ty, &raw_elem, I32);
+        blk.uitofp(I32, &i32v, DOUBLE)
+    };
+    let end_label = blk.label.clone();
+    blk.br(merge_label);
+    (val, end_label)
+}
+
+pub(crate) fn lower_numeric_index_get_for_number_context(
+    ctx: &mut FnCtx<'_>,
+    expr: &Expr,
+) -> Result<Option<String>> {
+    let Expr::IndexGet { object, index } = expr else {
+        return Ok(None);
+    };
+    if !is_array_expr(ctx, object) || !expr_has_numeric_pointer_free_array_layout(ctx, object) {
+        return Ok(None);
+    }
+
+    if let (Expr::LocalGet(arr_id), Expr::LocalGet(idx_id)) = (object.as_ref(), index.as_ref()) {
+        if ctx
+            .bounded_index_pairs
+            .iter()
+            .any(|fact| fact.index_local_id == *idx_id && fact.array_local_id == *arr_id)
+        {
+            let arr_box = lower_expr(ctx, object)?;
+            let i32_slot_opt = ctx.i32_counter_slots.get(idx_id).cloned();
+            let idx_i32 = if let Some(ref i32_slot) = i32_slot_opt {
+                ctx.block().load(I32, i32_slot)
+            } else {
+                let idx_double = lower_expr(ctx, index)?;
+                ctx.block().fptosi(DOUBLE, &idx_double, I32)
+            };
+            let idx_double = ctx.block().sitofp(I32, &idx_i32, DOUBLE);
+            return lower_guarded_array_index_get(
+                ctx,
+                &arr_box,
+                &idx_double,
+                &idx_i32,
+                "bidx.num",
+                true,
+                true,
+            )
+            .map(Some);
+        }
+    }
+
+    let arr_box = lower_expr(ctx, object)?;
+    let idx_double = lower_expr(ctx, index)?;
+    let idx_i32 = ctx.block().fptosi(DOUBLE, &idx_double, I32);
+    lower_guarded_array_index_get(ctx, &arr_box, &idx_double, &idx_i32, "arr", true, true).map(Some)
 }
 
 fn lower_bounded_array_index_get(
@@ -678,7 +1081,13 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     if let Some(k) = k {
                         if k < slots.len() {
                             let value = ctx.block().load(DOUBLE, &slots[k]);
-                            let lowered = LoweredValue {
+                            let raw_f64_element =
+                                crate::type_analysis::scalar_replaced_array_element_is_raw_f64(
+                                    ctx,
+                                    object.as_ref(),
+                                    index.as_ref(),
+                                );
+                            let lowered_js = LoweredValue {
                                 semantic: SemanticKind::JsValue,
                                 rep: NativeRep::JsValue,
                                 llvm_ty: DOUBLE,
@@ -688,15 +1097,34 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                                 "ScalarArrayIndexGet",
                                 Some(*id),
                                 "scalar_array_element_load",
-                                &lowered,
+                                &lowered_js,
                                 None,
                                 None,
                                 None,
                                 None,
                                 false,
                                 false,
-                                vec![format!("index={}", k)],
+                                vec![
+                                    format!("index={}", k),
+                                    format!("raw_f64_element={}", raw_f64_element as u8),
+                                ],
                             );
+                            if raw_f64_element {
+                                let lowered_f64 = LoweredValue::f64(value.clone());
+                                ctx.record_lowered_value_with_access_mode(
+                                    "ScalarArrayIndexGet",
+                                    Some(*id),
+                                    "scalar_array_element_load.raw_f64",
+                                    &lowered_f64,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    false,
+                                    false,
+                                    vec![format!("index={}", k), "raw_f64_element=1".to_string()],
+                                );
+                            }
                             return Ok(value);
                         }
                     }
@@ -754,15 +1182,26 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 recv_ty,
                 None | Some(perry_types::Type::Any) | Some(perry_types::Type::Unknown)
             );
-            if recv_unknown && is_numeric_expr(ctx, index) {
+            // #5525: route every non-static-string/symbol read on an unknown
+            // receiver through `js_dyn_index_get` (numeric, runtime-string, and
+            // runtime-symbol are all triaged in the runtime). The earlier
+            // `is_numeric_expr(index)` gate missed `lr[off]`/`lr[off + 1]`
+            // (bcryptjs `_encipher`'s `off` is an `any` param, so `off + 1` is
+            // not provably numeric); statically-known string-literal / symbol
+            // keys keep their dedicated interned-handle / symbol routes below.
+            let index_is_static_string_or_symbol = matches!(
+                index.as_ref(),
+                Expr::String(_) | Expr::WtfString(_) | Expr::SymbolFor(_)
+            ) || is_string_expr(ctx, index);
+            if recv_unknown && !index_is_static_string_or_symbol {
                 let obj_box = lower_expr(ctx, object)?;
                 let idx_d = lower_expr(ctx, index)?;
-                let blk = ctx.block();
-                return Ok(blk.call(
-                    DOUBLE,
-                    "js_dyn_index_get",
-                    &[(DOUBLE, &obj_box), (DOUBLE, &idx_d)],
-                ));
+                // #5525 follow-up: guarded inline typed-array element load at the
+                // access site (cache probe + bounds check + direct slot load),
+                // falling back to `js_dyn_index_get` on any guard miss. Removes
+                // the per-element out-of-line call + `lookup_typed_array_kind` +
+                // `js_number_coerce` on bcrypt's hot Int32Array `S[i]`/`P[i]`.
+                return Ok(lower_inline_dyn_typed_array_get(ctx, &obj_box, &idx_d));
             }
             // Three cases:
             //   1. Receiver is a known array → inline f64 element load
@@ -844,6 +1283,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                                 &idx_i32,
                                 "bidx.num",
                                 true,
+                                false,
                             );
                         }
                         return lower_bounded_array_index_get(ctx, &arr_box, &idx_i32);
@@ -865,6 +1305,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     &idx_i32,
                     "arr",
                     require_numeric_layout,
+                    false,
                 );
             }
             // Generic dynamic object access: stringify the index (no-op

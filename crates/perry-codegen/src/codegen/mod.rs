@@ -37,7 +37,7 @@ use perry_hir::Module as HirModule;
 use crate::module::LlModule;
 use crate::runtime_decls;
 use crate::strings::StringPool;
-use crate::types::{LlvmType, DOUBLE, I64, VOID};
+use crate::types::{LlvmType, DOUBLE, I64};
 
 pub(crate) mod arguments;
 mod artifacts;
@@ -50,7 +50,10 @@ mod opts;
 mod string_pool;
 
 pub use helpers::resolve_target_triple;
-pub(crate) use helpers::{default_target_triple, write_barriers_enabled};
+pub(crate) use helpers::{
+    decide_codegen_units, decide_full_outline_ic, default_target_triple, full_outline_ic_enabled,
+    module_callable_count, set_full_outline_ic, write_barriers_enabled,
+};
 pub use opts::{
     AppMetadata, CompileOptions, FpContractMode, ImportedClass, NamespaceEntry, NamespaceEntryKind,
 };
@@ -64,7 +67,7 @@ use helpers::{
 };
 
 // Collector and boxing-analysis walkers live in dedicated modules.
-use crate::boxed_vars::{collect_boxed_vars, collect_let_types_in_stmts};
+use crate::boxed_vars::{collect_boxed_param_ids, collect_boxed_vars, collect_let_types_in_stmts};
 use crate::collectors::{collect_closures_in_stmts, collect_let_ids, collect_ref_ids_in_stmts};
 
 pub(super) fn spec_function_length(params: &[perry_hir::Param]) -> usize {
@@ -91,6 +94,13 @@ pub(crate) fn static_method_registry_key(method_name: &str) -> String {
 pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> {
     let triple = opts.target.clone().unwrap_or_else(default_target_triple);
     let fp_flags = crate::block::FpFlags::new(opts.fast_math, opts.fp_contract_mode);
+
+    // #5334 lever B: decide ONCE, up front, whether this module is large enough
+    // to full-outline its class-field IC diamonds (read per-site during
+    // lowering via `full_outline_ic_enabled()`). Thread-local, so it must be set
+    // afresh for every module — including the `false` case, to clear any prior
+    // module's decision on this thread.
+    set_full_outline_ic(decide_full_outline_ic(module_callable_count(hir)));
 
     let mut llmod = LlModule::new_with_fp_flags(&triple, fp_flags);
     // Null guard global: a zeroed i32 used as a safe dereference target
@@ -427,6 +437,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             decorators: Vec::new(),
             is_exported: false,
             aliases: Vec::new(),
+            is_nested: false,
         };
         imported_class_stubs.push(stub);
         imported_stub_prefixes.push(ic.source_prefix.clone());
@@ -1162,6 +1173,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
                         param_count: ic.constructor_param_count,
                         has_own_constructor: ic.has_own_constructor,
                         has_instance_fields: ic.has_instance_fields,
+                        has_rest: ic.constructor_has_rest,
                     },
                 )
             })
@@ -1331,6 +1343,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             .collect(),
         namespace_entries: opts.namespace_entries.clone(),
         dynamic_import_path_to_prefix: opts.dynamic_import_path_to_prefix.clone(),
+        nextjs_path_init_modules: opts.nextjs_path_init_modules.clone(),
         deferred_module_prefixes: opts.deferred_module_prefixes.clone(),
         module_init_deps: opts.module_init_deps.clone(),
         is_dynamic_import_target: opts.is_dynamic_import_target,
@@ -1606,6 +1619,12 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
     // <class>__<field>` initialized to 0.0. The init expression runs
     // in compile_module_entry's main/init function before user code.
     let mut static_field_globals: HashMap<(String, String), String> = HashMap::new();
+    // Track which `@perry_static_*` globals we've already emitted (defining or
+    // external) so a repeated symbol — a duplicate static field name within one
+    // class (#5345), or the same imported class pulled in twice — never emits a
+    // second LLVM global, which clang rejects as a redefinition.
+    let mut external_globals_emitted: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for c in &hir.classes {
         for sf in &c.static_fields {
             // Computed-key static fields (`static [Symbol.for(...)] = init`)
@@ -1629,7 +1648,17 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             // when Sub is in a different file from Base; without external
             // linkage, the importing module's `StaticFieldGet { Base, Symbol }`
             // had no symbol to resolve and silently produced 0.0.
-            llmod.add_global(&name, DOUBLE, "0.0");
+            //
+            // #5345: a class may declare the SAME static field name twice
+            // (`static f = 'a'; static f = this.f + 'b';`) — both initializers
+            // run in declaration order against one shared slot (last write
+            // wins). They mangle to the same global symbol, so emit the
+            // defining global only once; clang rejects a redefined `@…__f`.
+            // The init loop still walks every `c.static_fields` entry, so both
+            // assignments execute against this single slot.
+            if external_globals_emitted.insert(name.clone()) {
+                llmod.add_global(&name, DOUBLE, "0.0");
+            }
             static_field_globals.insert((c.name.clone(), sf.name.clone()), name);
         }
     }
@@ -1637,9 +1666,8 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
     // module emits the defining external global (above); the consumer just
     // declares a reference and adds it to its own `static_field_globals` map
     // so `Expr::StaticFieldGet/Set` lowering finds it.
-    // Track which globals we've already emitted to avoid double-declarations.
-    let mut external_globals_emitted: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    // (external_globals_emitted is declared above, shared with the local-class
+    // loop, to avoid double-declarations.)
     for ic in &opts.imported_classes {
         let effective_name = ic.local_alias.as_deref().unwrap_or(&ic.name);
         // Skip imported-class entries whose source matches this module's
@@ -1652,15 +1680,15 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             // by the imported alias resolve to the local definition.
             for sf_name in &ic.static_field_names {
                 let key = (effective_name.to_string(), sf_name.clone());
-                if !static_field_globals.contains_key(&key) {
+                static_field_globals.entry(key).or_insert_with(|| {
                     let global_name = format!(
                         "perry_static_{}__{}__{}",
                         module_prefix,
                         sanitize_member(&ic.name),
                         sanitize_member(sf_name),
                     );
-                    static_field_globals.insert(key, global_name);
-                }
+                    global_name
+                });
             }
             continue;
         }
@@ -1902,13 +1930,20 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         }
 
         // Constructor: declared as
-        // `<source_prefix>__<class>_constructor(i64 this, double arg0, …) → void`
+        // `<source_prefix>__<class>_constructor(double this, double arg0, …) → double`.
+        // The source module's standalone ctor symbol returns DOUBLE — the
+        // ECMAScript constructor return-override value (an explicit
+        // `return <obj/fn>`) or `undefined` for an ordinary ctor. Declaring it
+        // VOID discarded a returned object/function, so `new Chalk(opts)` (whose
+        // ctor `return chalkFactory(opts)`) yielded the empty instance instead of
+        // the factory. The dispatch in `lower_new` applies `js_ctor_return_override`
+        // to this value.
         let ctor_fn = format!("{}__{}_constructor", sanitize(src), sanitize(&ic.name),);
         let mut ctor_params: Vec<crate::types::LlvmType> = vec![DOUBLE];
         for _ in 0..ic.constructor_param_count {
             ctor_params.push(DOUBLE);
         }
-        llmod.declare_function(&ctor_fn, VOID, &ctor_params);
+        llmod.declare_function(&ctor_fn, DOUBLE, &ctor_params);
 
         // Cross-module static methods. Source modules emit these as static
         // functions with no `this` receiver, normally qualified by the source
@@ -2006,25 +2041,37 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
     let mut module_boxed_vars: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for f in &hir.functions {
         module_boxed_vars.extend(collect_boxed_vars(&f.body));
+        // #5521: box captured+mutated params (never in the Stmt::Let
+        // `declared` set, so missed by `collect_boxed_vars`).
+        module_boxed_vars.extend(collect_boxed_param_ids(&f.params, &f.body));
     }
     for c in &hir.classes {
         for m in &c.methods {
             module_boxed_vars.extend(collect_boxed_vars(&m.body));
+            module_boxed_vars.extend(collect_boxed_param_ids(&m.params, &m.body));
         }
         for (_, getter_fn) in &c.getters {
             module_boxed_vars.extend(collect_boxed_vars(&getter_fn.body));
+            module_boxed_vars.extend(collect_boxed_param_ids(&getter_fn.params, &getter_fn.body));
         }
         for (_, setter_fn) in &c.setters {
             module_boxed_vars.extend(collect_boxed_vars(&setter_fn.body));
+            module_boxed_vars.extend(collect_boxed_param_ids(&setter_fn.params, &setter_fn.body));
         }
         for sm in &c.static_methods {
             module_boxed_vars.extend(collect_boxed_vars(&sm.body));
+            module_boxed_vars.extend(collect_boxed_param_ids(&sm.params, &sm.body));
         }
         for member in &c.computed_members {
             module_boxed_vars.extend(collect_boxed_vars(&member.function.body));
+            module_boxed_vars.extend(collect_boxed_param_ids(
+                &member.function.params,
+                &member.function.body,
+            ));
         }
         if let Some(ctor) = &c.constructor {
             module_boxed_vars.extend(collect_boxed_vars(&ctor.body));
+            module_boxed_vars.extend(collect_boxed_param_ids(&ctor.params, &ctor.body));
         }
     }
     module_boxed_vars.extend(collect_boxed_vars(&hir.init));
@@ -2372,15 +2419,34 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             let Some(f) = func_by_id.get(func_id) else {
                 continue;
             };
-            if &f.name == exported_name {
-                continue;
-            }
+            // NOTE: do NOT early-skip when `f.name == exported_name`. The real
+            // body is emitted under `scoped_fn_name` (the INJECTIVE
+            // `sanitize_member`), but cross-module callers and the #461
+            // undefined-stub / #836 verbatim-alias paths compute the symbol via
+            // plain `sanitize`. For a non-plain name like `$constructor`
+            // (`export function $constructor` in zod core, #5431) those two
+            // manglings diverge — body at `perry_fn_<mod>__u__24constructor`,
+            // callers at `perry_fn_<mod>___constructor` — even though local ==
+            // exported. Without a forwarding alias the #461 loop below claims
+            // `_constructor` with an undefined-returning stub and every
+            // cross-module call resolves to it (function reference is fine,
+            // every CALL returns `undefined`). The `alias_sym == target_sym`
+            // check below is the correct guard: it skips the plain-name case
+            // (where both manglings agree) while still emitting the alias when
+            // they differ.
             let alias_sym = format!("perry_fn_{}__{}", module_prefix, sanitize(exported_name));
             let target_sym = match func_names.get(func_id) {
                 Some(s) => s.clone(),
                 None => continue,
             };
             if alias_sym == target_sym {
+                continue;
+            }
+            // Guard against colliding with an already-emitted body symbol. Two
+            // exports whose names sanitize to the same string (`$x` and `_x`)
+            // would otherwise redefine the alias; the body of whichever is plain
+            // already owns `alias_sym`, so skip rather than redefine.
+            if llmod.has_function(&alias_sym) {
                 continue;
             }
             if !emitted_aliases.insert(alias_sym.clone()) {
@@ -2503,6 +2569,32 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         crate::native_value::verify_native_rep_records(&llmod.native_rep_records)?;
     }
 
+    crate::native_value::write_native_rep_artifact_if_enabled(
+        &hir.name,
+        &llmod.native_rep_records,
+    )?;
+
+    // #5391 codegen units: large modules split their object compilation into N
+    // independently-compiled units so clang's peak RSS stays ~whole/N instead of
+    // OOMing on one giant TU. Gated to large modules (default 1 unit = unchanged
+    // behavior). `emit_ir_only` and `PERRY_SAVE_LL` want the whole-module text,
+    // so they take the single-text path; the split path avoids materializing the
+    // full ~1GB IR string at all (which would defeat the memory win).
+    let n_units = if opts.emit_ir_only {
+        1
+    } else {
+        decide_codegen_units(module_callable_count(hir))
+    };
+    if n_units > 1 {
+        let units = llmod.render_codegen_units(n_units);
+        log::debug!(
+            "perry-codegen: split '{}' into {} codegen units",
+            hir.name,
+            units.len()
+        );
+        return crate::linker::compile_units_to_object(&units, opts.target.as_deref());
+    }
+
     let ll_text = llmod.to_ir();
     log::debug!(
         "perry-codegen: emitted {} bytes of LLVM IR for '{}' ({} interned strings)",
@@ -2515,10 +2607,6 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         let filename = format!("{}/{}.ll", save_dir, module_prefix);
         let _ = std::fs::write(&filename, &ll_text);
     }
-    crate::native_value::write_native_rep_artifact_if_enabled(
-        &hir.name,
-        &llmod.native_rep_records,
-    )?;
     if opts.emit_ir_only {
         Ok(ll_text.into_bytes())
     } else {

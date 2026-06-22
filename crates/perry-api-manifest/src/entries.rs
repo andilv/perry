@@ -2037,9 +2037,16 @@ pub static API_MANIFEST: &[ApiEntry] = &[
     method("sharp", "flop", true, None),
     method("sharp", "grayscale", true, None),
     method("sharp", "blur", true, None),
+    method("sharp", "sharpen", true, None),
+    method("sharp", "extract", true, None),
+    method("sharp", "autoOrient", true, None),
+    method("sharp", "extend", true, None),
+    method("sharp", "trim", true, None),
+    method("sharp", "composite", true, None),
     method("sharp", "jpeg", true, None),
     method("sharp", "png", true, None),
     method("sharp", "webp", true, None),
+    method("sharp", "avif", true, None),
     method("sharp", "toFile", true, None),
     method("sharp", "toBuffer", true, None),
     method("sharp", "metadata", true, None),
@@ -2892,6 +2899,14 @@ pub static API_MANIFEST: &[ApiEntry] = &[
     ),
     internal_method_sig("worker_threads", "query", false, None, &[], TypeSpec::Any),
     internal_method("worker_threads", "postMessage", true, None),
+    // Web-style EventTarget methods on `parentPort` / the `Worker` handle.
+    // Like `postMessage`, these are reached through the value-shaped namespace
+    // member path and dispatch dynamically on the real runtime object (which
+    // installs `addEventListener`/`removeEventListener`); registering them here
+    // keeps the #463 unimplemented-API gate from firing for the value-shaped
+    // `parentPort.addEventListener(...)` form.
+    internal_method("worker_threads", "addEventListener", true, None),
+    internal_method("worker_threads", "removeEventListener", true, None),
     method("worker_threads", "on", true, Some("Worker")),
     method("worker_threads", "once", true, Some("Worker")),
     method("worker_threads", "off", true, Some("Worker")),
@@ -4928,6 +4943,11 @@ pub static API_MANIFEST: &[ApiEntry] = &[
     method("perry/ui", "lazyvstackSetScrollEndCallback", false, None),
     method("perry/ui", "Table", false, None),
     method("perry/ui", "Canvas", false, None),
+    // Issue #2395 / #5519 — BloomView (embed an external GPU renderer / Bloom engine)
+    method("perry/ui", "BloomView", false, None),
+    method("perry/ui", "bloomViewGetNativeHandle", false, None),
+    // Deprecated alias for bloomViewGetNativeHandle (#5519).
+    method("perry/ui", "bloomViewGetHwnd", false, None),
     method("perry/ui", "CameraView", false, None),
     method("perry/ui", "cameraStart", false, None),
     method("perry/ui", "cameraStop", false, None),

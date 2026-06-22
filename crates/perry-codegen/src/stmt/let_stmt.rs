@@ -2,7 +2,10 @@
 
 use super::*;
 
-use crate::expr::{emit_root_nanbox_store_on_block, lower_expr_with_expected_type};
+use crate::expr::{
+    emit_root_nanbox_store_on_block, expr_produces_non_pointer_bits_by_construction,
+    lower_expr_with_expected_type,
+};
 use crate::native_value::{
     AliasState, BufferAccessMode, BufferElem, BufferIndexUnit, BufferViewSlot, LengthSource,
     LoweredValue, MaterializationReason, NativeOwnedViewSlot, NativeRep, PodLayoutDecision,
@@ -26,7 +29,7 @@ fn is_object_literal_init(init: &perry_hir::Expr) -> bool {
                 && matches!(
                     callee.as_ref(),
                     Expr::Closure { params, .. }
-                        if params.first().map_or(false, |p| p.name == "__perry_obj_iife")
+                        if params.first().is_some_and(|p| p.name == "__perry_obj_iife")
                 )
         }
         _ => false,
@@ -389,9 +392,33 @@ pub(crate) fn lower_let(
             // result into its slot. Order matches source, so any
             // side effects stay observable in the same sequence the
             // heap-allocating path would have produced.
+            let used_indices = ctx
+                .non_escaping_array_used_indices
+                .get(&id)
+                .cloned()
+                .unwrap_or_default();
             for (i, elem) in elements.iter().enumerate() {
+                let index_is_observed = used_indices.contains(&(i as u32));
+                if !index_is_observed && lower_unused_expr(ctx, elem)? {
+                    continue;
+                }
                 let v = lower_expr(ctx, elem)?;
                 ctx.block().store(DOUBLE, &v, &slots[i]);
+                // A uniquely-owned string captured into this scalar-replaced
+                // array slot aliases its heap buffer; demote it to shared so a
+                // later in-place `+=` on the source local doesn't mutate the
+                // stored element. Only a `LocalGet` can be `+=`'d in place after
+                // the store; gate on "value may be a heap pointer" (not an exact
+                // `string` type) so `any`-typed and union locals are covered too.
+                // The runtime helper is tag-checked (a no-op for SSO / non-string),
+                // and proven-numeric locals are skipped to avoid the call. Mirrors
+                // the object scalar-field demote and the runtime array-store demotes.
+                let needs_string_demote = matches!(elem, perry_hir::Expr::LocalGet(_))
+                    && !expr_produces_non_pointer_bits_by_construction(ctx, elem);
+                if needs_string_demote {
+                    ctx.block()
+                        .call_void("js_string_addref_if_heap_string", &[(DOUBLE, &v)]);
+                }
                 let lowered = LoweredValue {
                     semantic: SemanticKind::JsValue,
                     rep: NativeRep::JsValue,
@@ -446,7 +473,15 @@ pub(crate) fn lower_let(
             // order — duplicate keys naturally do last-write-wins
             // because they share a slot. Side effects of each value
             // expression stay observable in declaration order.
+            let used_fields = ctx
+                .non_escaping_object_literal_used_fields
+                .get(&id)
+                .cloned()
+                .unwrap_or_default();
             for (key, value_expr) in props {
+                if !used_fields.contains(key) && lower_unused_expr(ctx, value_expr)? {
+                    continue;
+                }
                 let v = lower_expr(ctx, value_expr)?;
                 if let Some(slot) = field_slots.get(key).cloned() {
                     ctx.block().store(DOUBLE, &v, &slot);
@@ -1477,6 +1512,9 @@ pub(crate) fn collect_scalar_class_data(
 }
 
 fn lower_unused_expr(ctx: &mut FnCtx<'_>, expr: &perry_hir::Expr) -> Result<bool> {
+    if unused_expr_is_pure_nonthrowing(ctx, expr) {
+        return Ok(true);
+    }
     match expr {
         perry_hir::Expr::New {
             class_name, args, ..
@@ -1520,6 +1558,96 @@ fn lower_unused_expr(ctx: &mut FnCtx<'_>, expr: &perry_hir::Expr) -> Result<bool
         }
         _ => Ok(false),
     }
+}
+
+fn unused_expr_is_pure_nonthrowing(ctx: &FnCtx<'_>, expr: &perry_hir::Expr) -> bool {
+    match expr {
+        perry_hir::Expr::Undefined
+        | perry_hir::Expr::Null
+        | perry_hir::Expr::Bool(_)
+        | perry_hir::Expr::Number(_)
+        | perry_hir::Expr::Integer(_)
+        | perry_hir::Expr::String(_)
+        | perry_hir::Expr::WtfString(_)
+        | perry_hir::Expr::LocalGet(_) => true,
+        perry_hir::Expr::Unary { operand, .. } => {
+            crate::type_analysis::is_numeric_expr(ctx, operand)
+                && unused_expr_is_pure_nonthrowing(ctx, operand)
+        }
+        perry_hir::Expr::Binary { op, left, right } => {
+            unused_binary_is_pure_nonthrowing(ctx, op, left, right)
+                && unused_expr_is_pure_nonthrowing(ctx, left)
+                && unused_expr_is_pure_nonthrowing(ctx, right)
+        }
+        perry_hir::Expr::Compare { left, right, .. } => {
+            unused_primitive_expr_is_nonthrowing(ctx, left)
+                && unused_primitive_expr_is_nonthrowing(ctx, right)
+                && unused_expr_is_pure_nonthrowing(ctx, left)
+                && unused_expr_is_pure_nonthrowing(ctx, right)
+        }
+        perry_hir::Expr::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            unused_expr_is_pure_nonthrowing(ctx, condition)
+                && unused_expr_is_pure_nonthrowing(ctx, then_expr)
+                && unused_expr_is_pure_nonthrowing(ctx, else_expr)
+        }
+        _ => false,
+    }
+}
+
+fn unused_binary_is_pure_nonthrowing(
+    ctx: &FnCtx<'_>,
+    op: &perry_hir::BinaryOp,
+    left: &perry_hir::Expr,
+    right: &perry_hir::Expr,
+) -> bool {
+    match op {
+        perry_hir::BinaryOp::Add => {
+            let l_num = crate::type_analysis::is_numeric_expr(ctx, left);
+            let r_num = crate::type_analysis::is_numeric_expr(ctx, right);
+            if l_num && r_num {
+                return true;
+            }
+            let l_str = crate::type_analysis::is_definitely_string_expr(ctx, left);
+            let r_str = crate::type_analysis::is_definitely_string_expr(ctx, right);
+            (l_str || r_str)
+                && unused_primitive_expr_is_nonthrowing(ctx, left)
+                && unused_primitive_expr_is_nonthrowing(ctx, right)
+        }
+        perry_hir::BinaryOp::Sub
+        | perry_hir::BinaryOp::Mul
+        | perry_hir::BinaryOp::Div
+        | perry_hir::BinaryOp::Mod
+        | perry_hir::BinaryOp::BitAnd
+        | perry_hir::BinaryOp::BitOr
+        | perry_hir::BinaryOp::BitXor
+        | perry_hir::BinaryOp::Shl
+        | perry_hir::BinaryOp::Shr
+        | perry_hir::BinaryOp::UShr => {
+            crate::type_analysis::is_numeric_expr(ctx, left)
+                && crate::type_analysis::is_numeric_expr(ctx, right)
+        }
+        _ => false,
+    }
+}
+
+fn unused_primitive_expr_is_nonthrowing(ctx: &FnCtx<'_>, expr: &perry_hir::Expr) -> bool {
+    crate::type_analysis::is_numeric_expr(ctx, expr)
+        || crate::type_analysis::is_definitely_string_expr(ctx, expr)
+        || crate::type_analysis::is_bool_expr(ctx, expr)
+        || matches!(
+            expr,
+            perry_hir::Expr::Undefined
+                | perry_hir::Expr::Null
+                | perry_hir::Expr::String(_)
+                | perry_hir::Expr::WtfString(_)
+                | perry_hir::Expr::Number(_)
+                | perry_hir::Expr::Integer(_)
+                | perry_hir::Expr::Bool(_)
+        )
 }
 
 fn record_pod_rejection(ctx: &mut FnCtx<'_>, id: u32, reason: String) {

@@ -106,7 +106,14 @@ pub unsafe fn dispatch_bound_function(closure: *const ClosureHeader, args: &[f64
 /// elsewhere), as do existing objects.
 pub(crate) fn coerce_call_this(target: f64, this_arg: f64) -> f64 {
     let jv = crate::value::JSValue::from_bits(this_arg.to_bits());
-    if jv.is_undefined() || jv.is_null() || jv.is_pointer() {
+    // A class ref (#5515) is an INT32-tagged class id but is the constructor
+    // OBJECT, not a primitive — `f.call(C)` binds `this` to C, so leave it
+    // unchanged rather than boxing it as a Number alongside undefined/null/ptr.
+    if jv.is_undefined()
+        || jv.is_null()
+        || jv.is_pointer()
+        || crate::object::class_ref_id(this_arg).is_some()
+    {
         return this_arg;
     }
     let tj = crate::value::JSValue::from_bits(target.to_bits());
@@ -120,7 +127,7 @@ pub(crate) fn coerce_call_this(target: f64, this_arg: f64) -> f64 {
         if closure.is_null() || unsafe { (*closure).type_tag } != CLOSURE_MAGIC {
             return this_arg;
         }
-        if unsafe { (*closure).func_ptr } as usize == BOUND_FUNCTION_FUNC_PTR as usize {
+        if std::ptr::eq(unsafe { (*closure).func_ptr }, BOUND_FUNCTION_FUNC_PTR) {
             let inner = unsafe { js_closure_get_capture_f64(closure, 0) };
             let ij = crate::value::JSValue::from_bits(inner.to_bits());
             if !ij.is_pointer() {
@@ -1332,6 +1339,30 @@ pub unsafe extern "C" fn js_native_call_value(
         return crate::proxy::js_proxy_apply(func_value, this_arg, arr_box);
     }
 
+    // Dynamic `super()` for `class X extends <runtime value holding
+    // events.EventEmitter>` (an import alias `import { EventEmitter as E }` or a
+    // local `const E = EventEmitter`): the parent is a bound-native EventEmitter
+    // export reached through a runtime value, so codegen's compile-time
+    // extends-NAME machinery — which emits `js_event_emitter_subclass_init` for
+    // the direct `class X extends EventEmitter` form (#5137) — never fires, and
+    // `js_register_class_parent_dynamic` early-returns for bound native parents.
+    // The dynamic super lowering (expr/this_super_call.rs) dispatches the parent
+    // VALUE here with IMPLICIT_THIS bound to the fresh subclass instance. Install
+    // the EventEmitter listener/emit methods onto that instance, exactly as the
+    // direct form does, so `this.setMaxListeners(…)`/`.on`/`.emit` resolve.
+    if let Some((module, method)) =
+        unsafe { crate::object::bound_native_callable_module_and_method(func_value) }
+    {
+        if module.trim_start_matches("node:") == "events"
+            && (method == "EventEmitter" || method == "EventEmitterAsyncResource")
+        {
+            let this_val = crate::object::js_implicit_this_get();
+            if JSValue::from_bits(this_val.to_bits()).is_pointer() {
+                return crate::node_stream::js_event_emitter_subclass_init(this_val);
+            }
+        }
+    }
+
     // Get the closure pointer from the value
     // For native compilation, function values are stored as NaN-boxed pointers
     let closure: *const ClosureHeader = if jsval.is_pointer() {
@@ -1386,6 +1417,24 @@ pub unsafe extern "C" fn js_native_call_value(
     // not-callable throw.
     if func_ptr.is_null() && crate::object::is_function_prototype_object_value(func_value) {
         return f64::from_bits(crate::value::TAG_UNDEFINED);
+    }
+    // W2 (Next.js app-page-turbo): a class-object (OBJECT_TYPE_CLASS) can reach
+    // the value-call path — e.g. `new s.RequestCookies(headers)` where the
+    // dynamic callee `s.RequestCookies` resolves (through a webpack lazy-export
+    // getter) to a class object, but the construct site lowered to a call rather
+    // than routing to `js_new_function_construct`. Calling a class object has
+    // exactly one sensible meaning — construct it — so do that here instead of
+    // `throw_not_callable` (which surfaces as "value is not a function").
+    if func_ptr.is_null() && crate::object::is_class_object_value(func_value) {
+        // W4 experiment: a 0-arg call of a class object is most likely a
+        // new-expression CALLEE RESOLUTION (`new s.RequestCookies(headers)` whose
+        // member callee eval'd as a 0-arg call). Returning the class object lets
+        // the OUTER `new` construct it with the real args. A call WITH args is a
+        // direct construct.
+        if args_len == 0 {
+            return f64::from_bits(func_value.to_bits());
+        }
+        return crate::object::js_new_function_construct(func_value, args_ptr, args_len);
     }
     let dispatch_args_len = if !func_ptr.is_null() && lookup_closure_rest(func_ptr).is_none() {
         match lookup_closure_arity(func_ptr) {

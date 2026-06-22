@@ -34,6 +34,13 @@ pub use dispatch::*;
 mod body_metadata;
 pub use body_metadata::*;
 
+// Web Fetch `Request` constructors (`js_request_new` /
+// `js_request_new_from_init`) — split out to keep this file under the
+// 2,000-line lint gate (#5458). Same child-module/`use super::*` contract as
+// `headers`.
+mod request_ctor;
+pub use request_ctor::*;
+
 // Web Fetch constructor validation helpers (#2640 / #2643) — split out to
 // keep this file under the 2,000-line lint gate.
 mod validation;
@@ -1113,7 +1120,10 @@ fn headers_from_header_map(headers: &reqwest::header::HeaderMap) -> HeadersStore
 struct RequestRecord {
     url: String,
     method: String,
-    body: Option<String>,
+    /// Raw body bytes, stored verbatim so a binary (Buffer/Uint8Array) body
+    /// survives byte-for-byte through `arrayBuffer()`/`text()` (#5483). `text()`
+    /// / `json()` still decode lossily via `from_utf8_lossy`, matching Node.
+    body: Option<Vec<u8>>,
     body_used: bool,
     headers: HeadersStore,
     destination: String,
@@ -1217,10 +1227,10 @@ pub unsafe extern "C" fn js_response_new(
     status_text_ptr: *const StringHeader,
     headers_handle: f64,
 ) -> f64 {
-    let body_opt = string_from_header(body_ptr);
+    // Lossless raw-byte read so binary bodies survive byte-for-byte (#5435).
+    let body_opt = dispatch::body_bytes_from_header(body_ptr);
     let body_present = body_opt.is_some();
-    let body_str = body_opt.unwrap_or_default();
-    let body = body_str.into_bytes();
+    let body = body_opt.unwrap_or_default();
     // NaN / 0.0 are the codegen "no status field" sentinels. Node defaults
     // missing status to 200; any explicit value is truncated toward zero
     // then range-checked against 200..=599 (199.9 → RangeError, 599.9 →
@@ -1702,76 +1712,9 @@ pub unsafe extern "C" fn js_response_static_redirect(
 }
 
 // ----------------- Request FFI -----------------
-
-/// new Request(url, methodOpt, bodyOpt, headersHandleOpt)
-#[no_mangle]
-pub unsafe extern "C" fn js_request_new(
-    url_ptr: *const StringHeader,
-    method_ptr: *const StringHeader,
-    body_ptr: *const StringHeader,
-    headers_handle: f64,
-    referrer_ptr: *const StringHeader,
-    referrer_policy_ptr: *const StringHeader,
-    mode_ptr: *const StringHeader,
-    credentials_ptr: *const StringHeader,
-    cache_ptr: *const StringHeader,
-    redirect_ptr: *const StringHeader,
-    integrity_ptr: *const StringHeader,
-    keepalive: f64,
-    duplex_ptr: *const StringHeader,
-    signal: f64,
-) -> f64 {
-    let url = string_from_header(url_ptr).unwrap_or_default();
-    let raw_method = string_from_header(method_ptr).unwrap_or_else(|| "GET".to_string());
-    // Forbidden methods are rejected case-insensitively; the error message
-    // preserves the caller's original casing (Node parity). Refs #2643.
-    if is_forbidden_method(&raw_method.to_ascii_uppercase()) {
-        throw_fetch_type_error(&format!("'{raw_method}' HTTP method is unsupported."));
-    }
-    let method = normalize_method(&raw_method);
-    let body = string_from_header(body_ptr);
-    // GET/HEAD requests may not carry a body (WHATWG fetch). Refs #2643.
-    if body.is_some() && (method == "GET" || method == "HEAD") {
-        throw_fetch_type_error("Request with GET/HEAD method cannot have body.");
-    }
-    let headers_id_in = handle_id(headers_handle);
-    let headers = if headers_id_in != 0 {
-        HEADERS_REGISTRY
-            .lock()
-            .unwrap()
-            .get(&headers_id_in)
-            .cloned()
-            .unwrap_or_default()
-    } else {
-        HeadersStore::default()
-    };
-    let id = alloc_fetch_handle_id();
-    REQUEST_REGISTRY.lock().unwrap().insert(
-        id,
-        RequestRecord {
-            url,
-            method,
-            body,
-            body_used: false,
-            headers,
-            destination: String::new(),
-            referrer: string_from_header(referrer_ptr)
-                .unwrap_or_else(|| "about:client".to_string()),
-            referrer_policy: string_from_header(referrer_policy_ptr).unwrap_or_default(),
-            mode: string_from_header(mode_ptr).unwrap_or_else(|| "cors".to_string()),
-            credentials: string_from_header(credentials_ptr)
-                .unwrap_or_else(|| "same-origin".to_string()),
-            cache: string_from_header(cache_ptr).unwrap_or_else(|| "default".to_string()),
-            redirect: string_from_header(redirect_ptr).unwrap_or_else(|| "follow".to_string()),
-            integrity: string_from_header(integrity_ptr).unwrap_or_default(),
-            keepalive: body_metadata::bool_from_js(keepalive),
-            duplex: string_from_header(duplex_ptr).unwrap_or_else(|| "half".to_string()),
-            signal: body_metadata::signal_or_default(signal),
-            cached_headers_id: None,
-        },
-    );
-    handle_to_f64(id)
-}
+// The `Request` constructors (`js_request_new` / `js_request_new_from_init`)
+// live in the `request_ctor` sibling module (re-exported below) to keep this
+// file under the 2,000-line lint gate (#5458).
 
 /// Shared `request.headers` resolver used by both the typed codegen path
 /// (`js_request_get_headers`) and the untyped property dispatcher. Lazily
@@ -1909,7 +1852,7 @@ fn consume_request_body(handle: f64) -> Result<Vec<u8>, &'static str> {
         return Err(BODY_ALREADY_USED_MESSAGE);
     }
     req.body_used = true;
-    Ok(body.into_bytes())
+    Ok(body)
 }
 
 /// request.text() -> Promise<string>. Mirrors `js_fetch_response_text`: the

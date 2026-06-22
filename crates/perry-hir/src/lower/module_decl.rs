@@ -305,7 +305,18 @@ pub(crate) fn lower_module_decl(
                                 source.clone(),
                                 native_method,
                             );
-                            if source == "process" {
+                            // #5257: a CJS-style Node builtin's default import
+                            // binds the whole module namespace — `const cp =
+                            // require('child_process')` is adopted as `import cp
+                            // from 'child_process'`, and member calls like
+                            // `cp.spawnSync(...)` must resolve through the
+                            // builtin-module alias. The `import * as cp` form
+                            // already registers it (Namespace branch below); the
+                            // default form only did so for `process`, so
+                            // `cp.spawnSync` lowered to nothing and returned
+                            // `undefined` — breaking cross-spawn / execa / which
+                            // (via isexe) under the require() adoption rewrite.
+                            if source == "process" || is_cjs_style_native_default_import(&source) {
                                 ctx.register_builtin_module_alias(local.clone(), source.clone());
                             }
                         } else if node_submodule_default_export_key(&source).is_some() {
@@ -1320,9 +1331,9 @@ pub(crate) fn lower_module_decl(
                         exported: alias_name,
                     });
                 }
-                ast::Decl::TsModule(ts_module) => {
+                ast::Decl::TsModule(ts_module)
                     // export namespace X { ... } — lower as a synthetic class with static members
-                    if !ts_module.declare {
+                    if !ts_module.declare => {
                         if let Some(ref body) = ts_module.body {
                             let ns_name = match &ts_module.id {
                                 ast::TsModuleName::Ident(ident) => ident.sym.to_string(),
@@ -1340,7 +1351,6 @@ pub(crate) fn lower_module_decl(
                             });
                         }
                     }
-                }
                 _ => {}
             }
         }
@@ -1955,9 +1965,7 @@ pub(crate) fn lower_module_decl(
 /// body. `namespace A.B {}` (dotted form) and bodiless `declare` modules return
 /// `None`.
 fn nested_namespace_name(ts_module: &ast::TsModuleDecl) -> Option<String> {
-    if ts_module.body.is_none() {
-        return None;
-    }
+    ts_module.body.as_ref()?;
     match &ts_module.id {
         ast::TsModuleName::Ident(ident) => Some(ident.sym.to_string()),
         ast::TsModuleName::Str(_) => None,
@@ -2048,6 +2056,7 @@ pub(crate) fn lower_namespace_as_class(
                 decorators: Vec::new(),
                 is_exported,
                 aliases: Vec::new(),
+                is_nested: false,
             });
         }
     };
@@ -2076,15 +2085,13 @@ pub(crate) fn lower_namespace_as_class(
         match item {
             ast::ModuleItem::ModuleDecl(ast::ModuleDecl::ExportDecl(export)) => {
                 match &export.decl {
-                    ast::Decl::Fn(fn_decl) => {
-                        if fn_decl.function.body.is_some() {
-                            let name = fn_decl.ident.sym.to_string();
-                            static_method_names.push(name.clone());
-                            // Pre-register exported functions so other namespace members can call them
-                            if ctx.lookup_func(&name).is_none() {
-                                let id = ctx.fresh_func();
-                                ctx.register_func(name, id);
-                            }
+                    ast::Decl::Fn(fn_decl) if fn_decl.function.body.is_some() => {
+                        let name = fn_decl.ident.sym.to_string();
+                        static_method_names.push(name.clone());
+                        // Pre-register exported functions so other namespace members can call them
+                        if ctx.lookup_func(&name).is_none() {
+                            let id = ctx.fresh_func();
+                            ctx.register_func(name, id);
                         }
                     }
                     ast::Decl::Var(var_decl) => {
@@ -2103,32 +2110,30 @@ pub(crate) fn lower_namespace_as_class(
                         }
                     }
                     // #5130: nested `export namespace Inner { ... }`.
-                    ast::Decl::TsModule(ts_module) => {
-                        if !ts_module.declare {
-                            if let Some(name) = nested_namespace_name(ts_module) {
-                                nested_ns_names.push(name);
-                            }
+                    ast::Decl::TsModule(ts_module) if !ts_module.declare => {
+                        if let Some(name) = nested_namespace_name(ts_module) {
+                            nested_ns_names.push(name);
                         }
                     }
                     _ => {}
                 }
             }
             // #5130: nested non-exported `namespace Inner { ... }`.
-            ast::ModuleItem::Stmt(ast::Stmt::Decl(ast::Decl::TsModule(ts_module))) => {
-                if !ts_module.declare {
-                    if let Some(name) = nested_namespace_name(ts_module) {
-                        nested_ns_names.push(name);
-                    }
+            ast::ModuleItem::Stmt(ast::Stmt::Decl(ast::Decl::TsModule(ts_module)))
+                if !ts_module.declare =>
+            {
+                if let Some(name) = nested_namespace_name(ts_module) {
+                    nested_ns_names.push(name);
                 }
             }
             // Pre-register non-exported functions (hoisted like JS)
-            ast::ModuleItem::Stmt(ast::Stmt::Decl(ast::Decl::Fn(fn_decl))) => {
-                if fn_decl.function.body.is_some() {
-                    let name = fn_decl.ident.sym.to_string();
-                    if ctx.lookup_func(&name).is_none() {
-                        let id = ctx.fresh_func();
-                        ctx.register_func(name, id);
-                    }
+            ast::ModuleItem::Stmt(ast::Stmt::Decl(ast::Decl::Fn(fn_decl)))
+                if fn_decl.function.body.is_some() =>
+            {
+                let name = fn_decl.ident.sym.to_string();
+                if ctx.lookup_func(&name).is_none() {
+                    let id = ctx.fresh_func();
+                    ctx.register_func(name, id);
                 }
             }
             // Pre-register non-exported variables
@@ -2348,5 +2353,6 @@ pub(crate) fn lower_namespace_as_class(
         decorators: Vec::new(),
         is_exported,
         aliases: Vec::new(),
+        is_nested: false,
     })
 }

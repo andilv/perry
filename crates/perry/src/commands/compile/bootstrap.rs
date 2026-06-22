@@ -932,7 +932,8 @@ pub(super) fn run_post_collect_preflight(
     enforce_egress_policy(ctx)?;
     enforce_lockdown_policy(ctx)?;
 
-    // #495: emit a behavioral SBOM at `.perry-cache/audit.json`. The
+    // #495: emit a behavioral SBOM at `<cache_dir>/audit.json` (default
+    // `node_modules/.cache/perry/audit.json`). The
     // manifest captures, per source module, the stdlib symbols
     // actually called from the lowered HIR. Foundation for the
     // host-controlled per-package capability enforcement issue (#501)
@@ -1051,6 +1052,7 @@ pub(super) fn run_native_instance_fixups(ctx: &mut CompilationContext) {
 /// Also flips `ctx.needs_ui` back to false so the link path skips the
 /// perry-ui-* lib check (which would fail on the OHOS target since no
 /// such lib exists).
+#[cfg(feature = "backend-arkts")]
 pub(super) fn harvest_harmonyos_index_ets(
     args: &CompileArgs,
     ctx: &mut CompilationContext,

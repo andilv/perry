@@ -7,6 +7,7 @@
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::cell::RefCell;
 use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::typedarray::{self, TypedArrayHeader};
 
@@ -107,7 +108,20 @@ fn unregister_owner(owner: *mut NativeArenaOwnerHeader) {
     });
 }
 
+/// #5525: process-global count of live native typed views. Native arena views
+/// are an exotic perry/ui feature — an ordinary `Int32Array` is never one — but
+/// `is_native_typed_view` is on the hot per-element read path
+/// (`js_typed_array_get`), where it otherwise pays a thread-local
+/// (`_tlv_get_addr`) `RefCell` borrow + hash probe of an almost-always-empty
+/// set. Gating on this counter lets the common case answer "no" with a single
+/// relaxed atomic load and no thread-local access.
+static NATIVE_VIEW_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 fn register_view(view: *mut NativeTypedViewHeader) {
+    NATIVE_VIEW_COUNT.fetch_add(1, Ordering::Relaxed);
+    // #5525 follow-up: a native-arena view resolves its data pointer through the
+    // arena, not inline storage — bar the codegen inline element fast path.
+    typedarray::ta_view_guard_inc();
     VIEW_REGISTRY.with(|r| {
         r.borrow_mut().insert(view as usize);
     });
@@ -115,9 +129,11 @@ fn register_view(view: *mut NativeTypedViewHeader) {
 }
 
 fn unregister_view(view: *mut NativeTypedViewHeader) {
-    VIEW_REGISTRY.with(|r| {
-        r.borrow_mut().remove(&(view as usize));
-    });
+    let removed = VIEW_REGISTRY.with(|r| r.borrow_mut().remove(&(view as usize)));
+    if removed {
+        NATIVE_VIEW_COUNT.fetch_sub(1, Ordering::Relaxed);
+        typedarray::ta_view_guard_dec();
+    }
     typedarray::unregister_typed_array(view as *const TypedArrayHeader);
 }
 
@@ -140,6 +156,11 @@ fn owner_is_registered(owner: *const NativeArenaOwnerHeader) -> bool {
 
 #[inline]
 pub(crate) fn is_native_typed_view(ta: *const TypedArrayHeader) -> bool {
+    // Fast path: no native views exist anywhere → cannot be one, skip the
+    // thread-local set probe entirely (#5525).
+    if NATIVE_VIEW_COUNT.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
     VIEW_REGISTRY.with(|r| r.borrow().contains(&(ta as usize)))
 }
 
@@ -285,7 +306,7 @@ pub extern "C" fn js_native_arena_view(
     let byte_length = length
         .checked_mul(elem_size)
         .unwrap_or_else(|| throw_range_error(b"NativeArena view is out of bounds"));
-    if byte_offset % elem_size != 0 {
+    if !byte_offset.is_multiple_of(elem_size) {
         throw_range_error(b"NativeArena view byteOffset is unaligned");
     }
     let owner = unsafe { clean_owner_ptr(owner_raw) };
@@ -337,7 +358,10 @@ pub extern "C" fn js_native_pod_view(
     let record_count = record_count as u64;
     let stride = stride as u64;
     let alignment = alignment as u64;
-    if !alignment.is_power_of_two() || byte_offset % alignment != 0 || stride % alignment != 0 {
+    if !alignment.is_power_of_two()
+        || !byte_offset.is_multiple_of(alignment)
+        || !stride.is_multiple_of(alignment)
+    {
         throw_range_error(b"NativePodView byteOffset or stride is unaligned");
     }
     let byte_length = record_count
@@ -379,7 +403,7 @@ fn strict_pod_view_from_value(value: f64, expected_layout_id: u64) -> *const Nat
     let bits = value.to_bits();
     let raw_ptr = if crate::value::JSValue::from_bits(bits).is_pointer() {
         (bits & crate::value::POINTER_MASK) as usize
-    } else if !value.is_nan() && bits >= 0x1000 && bits < 0x0001_0000_0000_0000 {
+    } else if !value.is_nan() && (0x1000..0x0001_0000_0000_0000).contains(&bits) {
         bits as usize
     } else {
         0

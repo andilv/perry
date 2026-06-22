@@ -5,8 +5,12 @@ edition.workspace = true
 license.workspace = true
 description = "Runtime library: GC, JSValue, builtins"
 
+# rlib-only (#5422): the staticlib (libperry_runtime.a) is emitted by the
+# perry-runtime-static wrapper crate so a plain `cargo build` of the workspace
+# no longer produces the heavy archive as a side effect. Build the archive
+# explicitly with `cargo build -p perry-runtime-static`.
 [lib]
-crate-type = ["rlib", "staticlib"]
+crate-type = ["rlib"]
 
 [features]
 # `default` keeps the shipped prebuilt libperry_runtime.a and plain
@@ -175,10 +179,14 @@ mimalloc = { version = "0.1", default-features = false }
 
 # Windows raw-mode for perry/tui input (#406). The Unix path uses
 # libc tcsetattr; Windows uses SetConsoleMode via windows-sys.
+# `Win32_System_LibraryLoader` powers `perry_plugin_load` / `perry_plugin_unload`
+# (`LoadLibraryW` / `GetProcAddress` / `FreeLibrary` — the Win32 equivalents of
+# `libc::dlopen` / `dlsym` / `dlclose` that the Unix branch uses).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_System_Console",
     "Win32_Foundation",
+    "Win32_System_LibraryLoader",
 ] }
 
 # #855: libc::mach_host_self is deprecated; the mach2 crate is the

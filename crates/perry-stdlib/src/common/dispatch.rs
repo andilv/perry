@@ -287,6 +287,41 @@ unsafe fn dispatch_event_emitter_property(handle: i64, property: &str) -> Option
     Some(bind_method(method))
 }
 
+/// `AsyncLocalStorage` METHOD-VALUE reads (the property-read counterpart of
+/// `dispatch_async_local_storage_method`). `als.getStore()` (a direct call)
+/// already dispatched, but reading `als.getStore` AS A VALUE (`const gs =
+/// als.getStore`, `{ getStore } = als`, `typeof als.getStore`) returned
+/// `undefined` — there was no property-read dispatch for ALS handles (only
+/// EventEmitter had one, #4995). Next.js' server startup reads `getStore` as a
+/// value (cacheComponents / patch-fetch async-storage setup) and then calls it,
+/// so it threw `TypeError: getStore is not a function` BEFORE `✓ Ready`. Bind
+/// each method to the handle so the read yields a callable bound method, exactly
+/// like `dispatch_event_emitter_property`.
+unsafe fn dispatch_async_local_storage_property(handle: i64, property: &str) -> Option<f64> {
+    if !matches!(
+        property,
+        "run" | "getStore" | "enterWith" | "exit" | "disable"
+    ) {
+        return None;
+    }
+    if get_handle_mut::<crate::async_local_storage::AsyncLocalStorageHandle>(handle).is_none() {
+        return None;
+    }
+    extern "C" {
+        fn js_class_method_bind(
+            instance: f64,
+            method_name_ptr: *const u8,
+            method_name_len: usize,
+        ) -> f64;
+    }
+    let m = property.as_bytes();
+    Some(js_class_method_bind(
+        nanbox_handle_value(handle),
+        m.as_ptr(),
+        m.len(),
+    ))
+}
+
 /// Dispatch a method call on a handle-based object.
 #[no_mangle]
 pub unsafe extern "C" fn js_handle_method_dispatch(
@@ -1192,7 +1227,7 @@ pub unsafe extern "C" fn js_handle_method_dispatch(
     }
 
     // Unknown handle type - return undefined
-    f64::from_bits(0x7FF8_0000_0000_0001)
+    TAG_UNDEFINED_F64
 }
 
 /// Dispatch method calls on Fastify app handles
@@ -1336,7 +1371,7 @@ unsafe fn dispatch_fastify_app(handle: i64, method: &str, args: &[f64]) -> f64 {
             let opts = if args.len() >= 2 {
                 args[1]
             } else {
-                f64::from_bits(0x7FF8_0000_0000_0001)
+                TAG_UNDEFINED_F64
             };
             let result = crate::fastify::js_fastify_register(handle, plugin, opts);
             if result {
@@ -1352,7 +1387,7 @@ unsafe fn dispatch_fastify_app(handle: i64, method: &str, args: &[f64]) -> f64 {
                 0
             };
             crate::fastify::js_fastify_listen(handle, args[0], callback);
-            f64::from_bits(0x7FF8_0000_0000_0001) // undefined (void)
+            TAG_UNDEFINED_F64 // undefined (void)
         }
         "close" => {
             // `app.close()` — shut down every server bound to this
@@ -1363,7 +1398,7 @@ unsafe fn dispatch_fastify_app(handle: i64, method: &str, args: &[f64]) -> f64 {
             // routed here — fell through to "unknown method" and was a
             // no-op, so the server kept the loop alive forever.
             crate::fastify::js_fastify_app_close(handle);
-            f64::from_bits(0x7FF8_0000_0000_0001) // undefined (void)
+            TAG_UNDEFINED_F64 // undefined (void)
         }
         "on" if args.len() >= 2 => {
             // #1113: `app.server.on(event, cb)` — see the function-level
@@ -1385,7 +1420,7 @@ unsafe fn dispatch_fastify_app(handle: i64, method: &str, args: &[f64]) -> f64 {
         }
         _ => {
             // Unknown method - return undefined
-            f64::from_bits(0x7FF8_0000_0000_0001)
+            TAG_UNDEFINED_F64
         }
     }
 }
@@ -1447,7 +1482,7 @@ unsafe fn dispatch_fastify_context(handle: i64, method: &str, args: &[f64]) -> f
         }
         _ => {
             // Unknown method - return undefined
-            f64::from_bits(0x7FF8_0000_0000_0001)
+            TAG_UNDEFINED_F64
         }
     }
 }
@@ -1810,6 +1845,10 @@ pub unsafe extern "C" fn js_handle_property_dispatch(
 
     #[cfg(any(feature = "bundled-events", feature = "external-events-construct"))]
     if let Some(value) = dispatch_event_emitter_property(handle, property_name) {
+        return value;
+    }
+
+    if let Some(value) = dispatch_async_local_storage_property(handle, property_name) {
         return value;
     }
 
@@ -2616,6 +2655,19 @@ pub unsafe extern "C" fn js_handle_property_dispatch(
         return crate::crypto::dispatch_cipher_property(handle, property_name);
     }
 
+    // Generic per-handle expando read: an arbitrary user-assigned own property
+    // (`handle.colors = [...]`) stored by the set-dispatch fallback below. This
+    // is the read half that makes native HANDLE values (Blob / fetch Response /
+    // Web-Streams readers) freely extensible like Node's, so the `debug`
+    // package's `createDebug.colors[...]` reads back the array it assigned
+    // instead of `undefined`. Specific typed properties were all tried above, so
+    // a hit here is always a genuine user expando.
+    if let Some(v) =
+        perry_runtime::object::handle_expando::handle_expando_get(handle, property_name)
+    {
+        return v;
+    }
+
     // Unknown handle type - return undefined
     f64::from_bits(0x7FFC_0000_0000_0001)
 }
@@ -2823,6 +2875,9 @@ pub unsafe extern "C" fn js_handle_property_set_dispatch(
     if with_handle::<crate::fastify::FastifyContext, bool, _>(handle, |_| true).unwrap_or(false) {
         if property_name == "user" {
             crate::fastify::js_fastify_req_set_user_data(handle, value);
+            // Claimed by the typed setter — must not also fall through to the
+            // generic expando store below.
+            return;
         }
     }
 
@@ -2850,6 +2905,8 @@ pub unsafe extern "C" fn js_handle_property_set_dispatch(
                     value,
                 );
             }
+            // Claimed by the typed setter — don't also write a stale expando copy.
+            return;
         }
     }
 
@@ -2915,7 +2972,22 @@ pub unsafe extern "C" fn js_handle_property_set_dispatch(
                     value,
                 );
             }
+            return;
         }
+    }
+
+    // Generic per-handle expando store: an ARBITRARY user-assigned own property
+    // (`handle.colors = [...]`) that none of the typed setters above claimed.
+    // Native HANDLE values are ordinary, extensible objects in Node; this gives
+    // them the same string-keyed own-property storage closures get from
+    // `CLOSURE_PROPS`. The read half (`js_handle_property_dispatch`) consults
+    // every typed property FIRST and only falls back to this expando table, so a
+    // typed property name can never be shadowed by an expando copy. This is what
+    // makes `debug`'s `createDebug.colors = [...]` persist and read back (the
+    // wall: a Blob/Response-tagged `_` whose `.colors` write was silently
+    // dropped, so `selectColor` read `undefined`).
+    if !property_name.is_empty() {
+        perry_runtime::object::handle_expando::handle_expando_set(handle, property_name, value);
     }
 }
 
@@ -3292,6 +3364,42 @@ pub unsafe extern "C" fn js_stdlib_init_dispatch() {
     }
     #[cfg(any(feature = "bundled-events", feature = "external-events-construct"))]
     perry_runtime::js_set_native_events_construct(events_native_construct);
+
+    // Dynamic `new <bound async_hooks ctor>()` -> real handle. Next.js does
+    // `globalThis.AsyncLocalStorage = AsyncLocalStorage` then
+    // `new maybeGlobalAsyncLocalStorage()`; the dynamic callee misses the static
+    // `new AsyncLocalStorage()` codegen arm, so the runtime construct path must
+    // build the handle here (else `.getStore` is undefined at server startup).
+    unsafe extern "C" fn async_hooks_native_construct(
+        method_ptr: *const u8,
+        method_len: usize,
+        args_ptr: *const f64,
+        args_len: usize,
+    ) -> f64 {
+        let method = std::slice::from_raw_parts(method_ptr, method_len);
+        match method {
+            b"AsyncLocalStorage" => {
+                let handle = crate::async_local_storage::js_async_local_storage_new();
+                perry_runtime::js_nanbox_pointer(handle)
+            }
+            b"AsyncResource" => {
+                let type_value = if !args_ptr.is_null() && args_len > 0 {
+                    *args_ptr
+                } else {
+                    TAG_UNDEFINED_F64
+                };
+                let options = if !args_ptr.is_null() && args_len > 1 {
+                    *args_ptr.add(1)
+                } else {
+                    TAG_UNDEFINED_F64
+                };
+                let handle = perry_runtime::async_hooks::js_async_resource_new(type_value, options);
+                perry_runtime::js_nanbox_pointer(handle)
+            }
+            _ => TAG_UNDEFINED_F64,
+        }
+    }
+    perry_runtime::js_set_native_async_hooks_construct(async_hooks_native_construct);
     super::net_socket_bridge::register_net_socket_handle_probe();
     js_register_worker_threads_namespace_getters(
         crate::worker_threads::js_worker_threads_get_worker_data,
@@ -3372,8 +3480,11 @@ pub unsafe extern "C" fn js_stdlib_init_dispatch() {
     // They are pointer-tagged small-integer ids, not heap objects, so the
     // runtime can't walk a prototype chain — register a kind-probe so
     // `x instanceof Response` (Hono's route-fallback guard) resolves. Gated on
-    // the same feature as the fetch module itself.
-    #[cfg(feature = "http-client")]
+    // `web-fetch` — the feature that actually compiles the fetch module and
+    // `js_fetch_handle_kind` (since #5174 split `http-client = ["web-fetch"]`,
+    // auto-optimize enables `web-fetch` directly for bare `new Response()`; the
+    // old `http-client` gate left the probe unregistered in that build).
+    #[cfg(feature = "web-fetch")]
     {
         extern "C" {
             fn js_register_fetch_handle_kind_probe(f: unsafe extern "C" fn(usize) -> u8);
