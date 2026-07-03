@@ -47,6 +47,7 @@ pub(crate) fn internal_promise() -> *mut Promise {
 }
 
 mod byob;
+mod expando;
 mod pipe;
 mod strategy;
 mod subclass;
@@ -66,6 +67,7 @@ pub use self::strategy::{
 };
 use self::strategy::{read_high_water_mark, read_queuing_strategy_size};
 
+pub(crate) use self::expando::stream_expando_get;
 use self::pipe::js_readable_stream_pipe_to;
 use self::subclass::{box_promise, js_stream_unwrap_handle};
 pub(crate) use self::subclass::{dispatch_stream_method, dispatch_stream_property};
@@ -291,6 +293,9 @@ fn ensure_gc_registered() {
             js_readable_stream_get_reader,
             js_reader_read,
         );
+        unsafe {
+            perry_runtime::object::js_register_stream_expando_set(expando::stream_expando_set_hook);
+        }
     });
 }
 
@@ -311,6 +316,7 @@ fn visit_stream_value_slot(
 }
 
 fn scan_stream_roots_mut(visitor: &mut perry_runtime::gc::RuntimeRootVisitor<'_>) {
+    expando::scan_expando_roots(visitor);
     if let Ok(mut map) = READABLE_STREAMS.lock() {
         for s in map.values_mut() {
             visitor.visit_i64_slot(&mut s.start_cb);
@@ -690,17 +696,34 @@ extern "C" fn readable_pull_microtask(closure: *const ClosureHeader) -> f64 {
 }
 
 pub(super) unsafe fn maybe_pull(stream_id: usize) {
+    maybe_pull_inner(stream_id, false);
+}
+
+/// `maybe_pull` that pulls whenever the source can produce more, ignoring the
+/// highWaterMark / read-request gate. Used by the synchronous body drain
+/// (`new Response(stream)` / `new Request(url, { body: stream })`): that drain
+/// has no parked reader, so for a `highWaterMark: 0` stream the normal
+/// `maybe_pull` would refuse to pull and the body would drain EMPTY (CodeRabbit
+/// #5776). Forcing the pull when the queue is empty drives such a stream to
+/// completion regardless of its strategy.
+pub(super) unsafe fn maybe_pull_force(stream_id: usize) {
+    maybe_pull_inner(stream_id, true);
+}
+
+unsafe fn maybe_pull_inner(stream_id: usize, force: bool) {
     // ShouldCallPull (#4915): a parked read request always justifies a
     // pull (this is what drives byte streams with highWaterMark 0 — the
     // pull only fires once a `read()` / `read(view)` is waiting);
-    // otherwise pull while the queue is under the highWaterMark.
+    // otherwise pull while the queue is under the highWaterMark. `force`
+    // (drain path) pulls whenever the queue is empty regardless of strategy.
     let has_byob_pending = byob::has_pending(stream_id);
     let (cb, controller, should_pull, pull_returns_byte_chunk) = {
         let mut g = READABLE_STREAMS.lock().unwrap();
         match g.get_mut(&stream_id) {
             Some(s) if s.state == ReadableState::Readable && !s.pulling && s.started => {
                 let has_read_request = !s.pending_reads.is_empty() || has_byob_pending;
-                let need = has_read_request
+                let need = (force && s.chunks.is_empty())
+                    || has_read_request
                     || (s.chunks.is_empty() && s.high_water_mark > 0.0)
                     || (!s.chunks.is_empty() && s.queue_total_size < s.high_water_mark);
                 if need && s.pull_cb != 0 {
@@ -751,6 +774,9 @@ unsafe fn close_pending(stream_id: usize) {
         js_promise_resolve(p, f64::from_bits(result));
     }
     byob::close_pending_byob(stream_id);
+    // #5437: stream is done — drop any expando entries so the table doesn't
+    // grow one row per stream over the server's lifetime.
+    expando::stream_expando_clear(stream_id);
 }
 
 unsafe fn error_pending(stream_id: usize, reason_bits: u64) {
@@ -765,6 +791,8 @@ unsafe fn error_pending(stream_id: usize, reason_bits: u64) {
         js_promise_reject(p, f64::from_bits(reason_bits));
     }
     byob::error_pending_byob(stream_id, reason_bits);
+    // #5437: stream errored — drop any expando entries (see close_pending).
+    expando::stream_expando_clear(stream_id);
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1814,6 +1842,9 @@ pub unsafe extern "C" fn js_reader_release_lock(reader_handle: f64) -> f64 {
     if let Some(s) = READABLE_STREAMS.lock().unwrap().get_mut(&stream_id) {
         s.reader_handle = None;
     }
+    // #5437: the reader instance is done — drop any expando entries keyed by
+    // its handle id so the table doesn't retain them for the process lifetime.
+    expando::stream_expando_clear(reader_id);
     f64::from_bits(TAG_UNDEFINED)
 }
 

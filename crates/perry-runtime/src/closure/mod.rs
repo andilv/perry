@@ -19,10 +19,11 @@ pub(crate) use alloc::gc_capture_slot_range;
 pub use alloc::{
     closure_alloc_storage, closure_capture_slots_mut, closure_payload_size, js_closure_alloc,
     js_closure_alloc_singleton, js_closure_alloc_with_captures_singleton,
-    js_closure_get_capture_f64, js_closure_get_capture_ptr, js_closure_get_func,
-    js_closure_set_capture_f64, js_closure_set_capture_ptr, note_closure_capture_slot,
-    rebuild_closure_layout_and_barriers, scan_singleton_closure_roots_mut, ClosureHeader,
-    CLOSURE_ALLOC_COUNT, CLOSURE_CAP_SINGLETON_HIT, CLOSURE_CAP_SINGLETON_MISS,
+    js_closure_get_capture_bits, js_closure_get_capture_f64, js_closure_get_capture_ptr,
+    js_closure_get_func, js_closure_set_capture_bits, js_closure_set_capture_f64,
+    js_closure_set_capture_ptr, note_closure_capture_slot, rebuild_closure_layout_and_barriers,
+    scan_singleton_closure_roots_mut, ClosureHeader, CLOSURE_ALLOC_COUNT,
+    CLOSURE_CAP_SINGLETON_HIT, CLOSURE_CAP_SINGLETON_MISS, CLOSURE_TYPE_TAG_OFFSET,
 };
 
 pub use registry::{
@@ -36,7 +37,7 @@ pub use registry::{
     js_register_closure_strict_function, js_register_closure_synthetic_arguments,
     lookup_closure_arity, lookup_closure_length, lookup_closure_rest, lookup_closure_rest_full,
     real_capture_count, resolve_strategy, DispatchStrategy, BOUND_FUNCTION_FUNC_PTR,
-    BOUND_METHOD_FUNC_PTR, CAPTURES_THIS_FLAG, CLOSURE_MAGIC,
+    BOUND_METHOD_FUNC_PTR, CAPTURES_THIS_FLAG, CLOSURE_MAGIC, NO_THIS_REBIND_FLAG,
 };
 
 pub use dispatch::{
@@ -48,8 +49,8 @@ pub use dispatch::{
     js_function_bind, js_native_call_value, throw_not_callable,
 };
 pub(crate) use dispatch::{
-    coerce_call_this, reify_function_method_value, reset_throw_not_callable_counter,
-    resolve_call2_direct,
+    coerce_call_this, rebind_explicit_this, reify_function_method_value,
+    reset_throw_not_callable_counter, resolve_call2_direct,
 };
 pub use unbox::js_closure_unbox_callee_checked;
 
@@ -57,14 +58,14 @@ pub use unbox::js_closure_unbox_callee_checked;
 pub(crate) use dynamic_props::test_clear_closure_side_tables;
 pub(crate) use dynamic_props::{
     clone_closure_rebind_this, closure_dynamic_props_owner_moved,
-    visit_closure_dynamic_prop_value_slots_mut, visit_closure_static_prototype_slot_mut,
+    closure_set_via_function_prototype_descriptor, visit_closure_dynamic_prop_value_slots_mut,
+    visit_closure_static_prototype_slot_mut,
 };
 pub use dynamic_props::{
     closure_delete_own_dynamic_prop, closure_dynamic_props_snapshot, closure_get_dynamic_prop,
     closure_get_own_dynamic_prop, closure_has_own_dynamic_prop, closure_is_key_deleted,
     closure_mark_key_deleted, closure_set_dynamic_prop, closure_set_static_prototype,
-    closure_static_prototype, is_closure_ptr, is_module_default_wrapper, js_closure_unbind_this,
-    js_register_module_default_wrapper_value, module_default_wrapper_exports,
+    closure_static_prototype, is_closure_ptr, js_closure_unbind_this,
     scan_closure_dynamic_props_roots_mut,
 };
 

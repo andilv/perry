@@ -104,19 +104,27 @@ pub unsafe fn js_promise_new_for_native_resolution() -> *mut perry_runtime::Prom
 pub static EXT_BLOCKING_TASKS_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 /// Global tokio runtime for all async stdlib operations.
-/// Falls back to current-thread runtime if multi-thread fails (e.g. on iOS).
+///
+/// Unified single-thread async model: a CURRENT-THREAD runtime, driven one
+/// bounded tick at a time by the main JS event loop (see `stdlib_wait_driver`
+/// and `js_register_wait_driver`). The I/O reactor, timer wheel, and all
+/// spawned native tasks (reqwest / net / ws) run on the main thread interleaved
+/// with JS — Node's model — so a native completion is observed in-thread and
+/// queued with no cross-thread wake to lose. `spawn_blocking` still offloads
+/// genuinely blocking / CPU-bound work to the blocking-thread pool; its result
+/// is delivered back and ends the next tick.
 pub static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+    tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap_or_else(|_| {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create tokio runtime")
-        })
+        .expect("Failed to create tokio current-thread runtime")
 });
+
+/// Fired whenever a producer has queued main-thread-visible work (any
+/// `js_notify_main_thread`, via the wait-driver wake). Ends the current bounded
+/// tick in `stdlib_wait_driver`. `notify_one` coalesces and leaves a permit if
+/// no tick is in progress, so a notify between ticks is not lost.
+static EVENT_READY: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 /// Pending promise resolutions
 /// Format: (promise_ptr, is_success, result_value)
@@ -253,12 +261,133 @@ where
     RUNTIME.block_on(future)
 }
 
+/// Wait-driver SLEEP side — one bounded tick of the current-thread runtime.
+///
+/// Installed via `js_register_wait_driver` and called by the main loop's
+/// `js_wait_for_event` in place of a condvar park. `block_on` drives the I/O
+/// reactor, the timer wheel, and every spawned native task (reqwest / net / ws)
+/// on THIS (main) thread until a producer fires `EVENT_READY` — i.e. a native
+/// task queued a resolution / pushed an event — or `budget_ms` elapses,
+/// whichever first. Because the producing task ran in this same tick, its
+/// completion is observed in-thread and `perry_poll` drains it on the next loop
+/// turn; there is no cross-thread wake to lose. `budget_ms` is the loop's
+/// computed sleep budget (min of the next perry-timer deadline and the 1 s idle
+/// cap); a zero budget is floored to 1 ms so native work still gets one poll
+/// cycle under a hot timer.
+extern "C" fn stdlib_wait_driver(budget_ms: u64) {
+    run_one_tick(budget_ms);
+}
+
+/// One bounded tick of the current-thread runtime: drive the reactor + timers +
+/// spawned native tasks until `EVENT_READY` fires or `budget_ms` (floored to
+/// 1 ms) elapses. Shared by the main-loop wait-driver and `perry_ffi_run_pending`
+/// (a synchronous native API that must let a delivering task run — see
+/// `perry-ffi::run_pending`). Must NOT be called from inside a spawned runtime
+/// task (no nested `block_on`); only from the main thread between ticks.
+pub fn run_one_tick(budget_ms: u64) {
+    extern "C" {
+        fn js_main_thread_notified() -> i32;
+    }
+    let budget = std::time::Duration::from_millis(budget_ms.max(1));
+    RUNTIME.block_on(async {
+        let notified = EVENT_READY.notified();
+        tokio::pin!(notified);
+        // Register as a waiter BEFORE checking the condition: a `notify_waiters`
+        // that lands between the check and the await still wakes us (it wakes only
+        // registered waiters). `enable()` returns false here because the wake side
+        // stores no permit.
+        notified.as_mut().enable();
+        // End immediately if a native result was already queued during this tick
+        // (the durable `NOTIFIED` flag — checked instead of a notify permit so a
+        // stale wake can't make us skip parking on the reactor). The main loop
+        // cleared `NOTIFIED` before this tick, so a set flag is fresh work.
+        if unsafe { js_main_thread_notified() } != 0 {
+            return;
+        }
+        // Otherwise park: `block_on` drives every spawned native task (reqwest /
+        // net / ws) and parks on the I/O reactor on this thread until a producer
+        // queues a result (`notify_waiters` wakes us; we re-check NOTIFIED) or the
+        // budget elapses.
+        let _ = tokio::time::timeout(budget, notified).await;
+    });
+}
+
+/// Drive the runtime for the full `budget_ms` (floored to 1 ms), parking on the
+/// I/O reactor so spawned native tasks make progress. Unlike `run_one_tick` this
+/// does NOT end early on the `NOTIFIED` flag — it is for a *synchronous* native
+/// API (`perry_ffi_run_pending`, e.g. `js_ws_wait_for_message`) that is called
+/// mid-`perry_poll` (where `NOTIFIED` may already be set for unrelated reasons)
+/// and just needs the delivering task to run for a slice before it re-checks its
+/// own condition.
+pub fn drive_pending(budget_ms: u64) {
+    let budget = std::time::Duration::from_millis(budget_ms.max(1));
+    RUNTIME.block_on(async {
+        tokio::time::sleep(budget).await;
+    });
+}
+
+/// Wait-driver WAKE side — ends the current bounded tick. Fired from
+/// `js_notify_main_thread` (via `js_register_wait_driver`) by any producer: the
+/// in-thread native task during a tick, or a blocking-pool thread cross-thread.
+/// Uses `notify_waiters` (NOT `notify_one`) so it stores NO permit: a notify
+/// outside a tick is intentionally dropped (the corresponding `NOTIFIED` flag is
+/// the durable signal the tick re-checks), which is what keeps stale permits from
+/// making every tick return instantly without parking on the reactor.
+extern "C" fn stdlib_wait_wake() {
+    EVENT_READY.notify_waiters();
+}
+
+/// Wait-driver FAST side — a brief native drive invoked by `js_wait_for_event`
+/// when JS work is pending (a notify or queued microtasks). On the single-thread
+/// runtime, in-flight native tasks (a fetch's reqwest `send`, its h2 connection
+/// driver, sibling fetches) run ONLY inside a tick; under constant JS promise
+/// churn the fast-path is taken every iteration, so without this they are starved
+/// forever (the bundle hang). When something native IS in flight, drive one short
+/// (1 ms) tick: `block_on` drains the run queue (starts freshly-spawned sibling
+/// fetches) and parks briefly on the I/O reactor (advancing TLS/h2 round-trips),
+/// ending early if a native result is queued. No-op when nothing native is in
+/// flight, so pure-JS-async pays only an atomic load.
+extern "C" fn stdlib_fast_drive() {
+    let n = EXT_BLOCKING_TASKS_INFLIGHT.load(Ordering::Acquire);
+    let native = n > 0 || ext_http_client_inflight_fast();
+    if !native {
+        return;
+    }
+    RUNTIME.block_on(async {
+        let notified = EVENT_READY.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(1), notified).await;
+    });
+}
+
+#[cfg(feature = "external-http-client-pump")]
+fn ext_http_client_inflight_fast() -> bool {
+    extern "C" {
+        fn js_ext_http_client_inflight() -> i32;
+    }
+    unsafe { js_ext_http_client_inflight() != 0 }
+}
+#[cfg(not(feature = "external-http-client-pump"))]
+fn ext_http_client_inflight_fast() -> bool {
+    false
+}
+
 /// Queue a promise resolution to be processed later
 /// NOTE: Only use this for simple values (numbers, booleans, undefined, null)
 /// that don't involve pointer allocations. For complex values like arrays,
 /// objects, or strings, use queue_deferred_resolution instead.
 pub fn queue_promise_resolution(promise_ptr: usize, is_success: bool, result_bits: u64) {
     ensure_gc_scanner_registered();
+    // The await busy-pump only drains PENDING_RESOLUTIONS via the registered
+    // STDLIB_PUMP_FN. Callers that queue a resolution *without* a preceding
+    // `spawn` (e.g. `js_fetch_with_options`'s early "Invalid URL" reject when
+    // `fetch()` is handed a non-string first arg such as a `Request` object)
+    // would otherwise leave the pump unregistered: `js_stdlib_has_active_handles`
+    // reports the pending entry so the awaiter keeps waiting, but nothing ever
+    // drains it → the awaited Promise stays pending forever (deadlock). Register
+    // the pump here so every queued resolution is guaranteed to be processed.
+    ensure_pump_registered();
     {
         let mut pending = PENDING_RESOLUTIONS.lock().unwrap();
         pending.push(PendingResolution {
@@ -283,6 +412,10 @@ where
     F: FnOnce() -> u64 + Send + 'static,
 {
     ensure_gc_scanner_registered();
+    // Same pump-registration guarantee as `queue_promise_resolution` (above):
+    // a deferred resolution queued without a preceding `spawn` must still be
+    // drained by the await busy-pump.
+    ensure_pump_registered();
     {
         let mut pending = PENDING_DEFERRED.lock().unwrap();
         pending.push(DeferredResolution {
@@ -315,6 +448,18 @@ pub fn ensure_pump_registered() {
             fn js_stdlib_init_dispatch();
         }
         ensure_gc_scanner_registered();
+        // Unified single-thread async model: install the wait-driver so the main
+        // JS loop drives the current-thread tokio runtime one bounded tick per
+        // `js_wait_for_event` (see `stdlib_wait_driver`). Registered here, before
+        // any async work spawns, so the first `js_wait_for_event` after a spawn
+        // already drives the runtime. Forcing RUNTIME now also constructs it on
+        // the main thread up front.
+        perry_runtime::event_pump::js_register_wait_driver(
+            Some(stdlib_wait_driver),
+            Some(stdlib_fast_drive),
+            Some(stdlib_wait_wake),
+        );
+        Lazy::force(&RUNTIME);
         unsafe {
             js_register_stdlib_pump(js_stdlib_process_pending);
             js_register_stdlib_has_active(js_stdlib_has_active_handles);
@@ -345,7 +490,6 @@ pub extern "C" fn js_stdlib_process_pending() -> i32 {
         count += n as i32;
         pending.drain(..).collect()
     };
-
     for resolution in simple_resolutions {
         let scope = perry_runtime::gc::RuntimeHandleScope::new();
         let promise_ptr_usize = resolution.promise_ptr;
@@ -530,27 +674,14 @@ pub extern "C" fn js_stdlib_process_pending() -> i32 {
         count += unsafe { js_ext_zlib_process_pending() };
     }
 
-    // Process pending fastify requests. With the bundled-fastify
-    // adapter, `app.listen()` used to block the main TS thread inside
-    // its own inner event loop forever, so an `await app.listen(...)`
-    // never returned and no subsequent user code (in-process `fetch`,
-    // `app.close()`, etc.) ever ran. The pump now mirrors how
-    // perry-ext-http-server handles dispatch (#604): `listen()` returns
-    // immediately and the per-server mpsc is drained here on each tick.
-    //
-    // Two activation paths:
-    //   * `http-server` — the bundled adapter (`perry-stdlib::fastify`)
-    //     is compiled in. Call its pump directly.
-    //   * `external-fastify-pump` — the well-known flip routed
-    //     `import 'fastify'` to perry-ext-fastify and stripped
-    //     `bundled-fastify`. The symbol is provided by the external
-    //     crate; declare and call it via extern. Mirrors how
-    //     `external-net-pump` and `external-ws-pump` work.
-    #[cfg(feature = "http-server")]
-    {
-        count += crate::fastify::js_fastify_process_pending();
-    }
-    #[cfg(all(feature = "external-fastify-pump", not(feature = "http-server")))]
+    // Process pending fastify requests. `listen()` returns immediately and the
+    // per-server mpsc is drained here each tick (#604), so an `await
+    // app.listen(...)` resumes and subsequent user code (in-process `fetch`,
+    // `app.close()`, async route handlers) runs. fastify is served exclusively by
+    // the external perry-ext-fastify crate (the in-stdlib adapter was removed);
+    // the well-known flip enables `external-fastify-pump` and the symbol is
+    // provided by that crate. Mirrors `external-net-pump` / `external-ws-pump`.
+    #[cfg(feature = "external-fastify-pump")]
     {
         extern "C" {
             fn js_fastify_process_pending() -> i32;
@@ -685,8 +816,16 @@ pub extern "C" fn js_stdlib_has_active_handles() -> i32 {
     {
         extern "C" {
             fn js_http_has_pending() -> i32;
+            fn js_ext_http_client_inflight() -> i32;
         }
         if unsafe { js_http_has_pending() } != 0 {
+            return 1;
+        }
+        // #5779 follow-up — also stay alive for the in-flight window BEFORE the
+        // reqwest task has pushed any event (response received but not yet
+        // delivered), so a single outstanding fetch can't let the loop exit
+        // early and so the idle-kick has a live loop to recover it on.
+        if unsafe { js_ext_http_client_inflight() } != 0 {
             return 1;
         }
     }
@@ -710,23 +849,14 @@ pub extern "C" fn js_stdlib_has_active_handles() -> i32 {
             return 1;
         }
     }
-    // Bundled-fastify — keep the loop alive while any FastifyServerHandle
-    // is in the "listening" state. Paired with
-    // `js_fastify_process_pending` in `js_stdlib_process_pending` above
-    // (closes the compat-sweep timeout for `await app.listen(...)` +
-    // in-process `fetch`).
-    #[cfg(feature = "http-server")]
-    {
-        if crate::fastify::js_fastify_has_active_handles() != 0 {
-            return 1;
-        }
-    }
-    // External fastify (perry-ext-fastify) — when the well-known flip
-    // routes `import 'fastify'` to perry-ext-fastify and strips
-    // `bundled-fastify`, the symbol below is provided by the external
-    // crate at link time. Mirrors the `external-{net,ws,http-server}-pump`
-    // arms above.
-    #[cfg(all(feature = "external-fastify-pump", not(feature = "http-server")))]
+    // External fastify (perry-ext-fastify) — keep the loop alive while any
+    // FastifyServerHandle is "listening". Paired with `js_fastify_process_pending`
+    // in `js_stdlib_process_pending` above (closes the compat-sweep timeout for
+    // `await app.listen(...)` + in-process `fetch`). The in-stdlib adapter was
+    // removed; the well-known flip enables `external-fastify-pump` and the symbol
+    // is provided by perry-ext-fastify at link time. Mirrors the
+    // `external-{net,ws,http-server}-pump` arms above.
+    #[cfg(feature = "external-fastify-pump")]
     {
         extern "C" {
             fn js_fastify_has_active() -> i32;

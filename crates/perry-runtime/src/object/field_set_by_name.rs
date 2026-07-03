@@ -170,6 +170,66 @@ unsafe fn string_key_eq(key: *const crate::StringHeader, expected: &[u8]) -> boo
     std::slice::from_raw_parts(data, len) == expected
 }
 
+/// Shared closure-receiver named-property WRITE path — used by both ways a
+/// closure is recognized in `js_object_set_field_by_name` (a `GC_TYPE_CLOSURE`
+/// GcHeader-typed pointer, and the raw `CLOSURE_MAGIC`-tagged fallback for a
+/// pointer reached without a full GC header). #3143: honors a non-writable
+/// registered descriptor (a built-in method's `.name`/`.length` are spec'd
+/// `writable: false`); `Object.defineProperty(Function.prototype, k, {...})`
+/// round-trips via `closure_set_via_function_prototype_descriptor` before
+/// falling back to a plain own-property write.
+unsafe fn closure_set_field_by_name(
+    obj: *mut ObjectHeader,
+    key: *const crate::StringHeader,
+    value: f64,
+) {
+    if key.is_null() {
+        return;
+    }
+    let name_ptr = (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
+    let name_len = (*key).byte_len as usize;
+    let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
+    let Ok(name_str) = std::str::from_utf8(name_bytes) else {
+        return;
+    };
+    // ECMAScript "poison pill" — assigning `caller`/`arguments` on any
+    // strict-mode function (Perry compiles everything strict: declarations,
+    // expressions, bound and built-in closures, arrows) throws via the
+    // %ThrowTypeError% accessor's missing setter. A genuine own data prop of
+    // that name (defineProperty round-trip) still wins.
+    // Refs test262 13.2-*-s / StrictFunction_restricted-*.
+    if matches!(name_str, "caller" | "arguments")
+        && !crate::closure::closure_has_own_dynamic_prop(obj as usize, name_str)
+    {
+        crate::fs::validate::throw_type_error_with_code(
+            "Restricted function property assignment",
+            "ERR_INVALID_ARG_TYPE",
+        );
+    }
+    if let Some(attrs) = super::get_property_attrs(obj as usize, name_str) {
+        if !attrs.writable() {
+            return;
+        }
+    } else if matches!(name_str, "name" | "length") {
+        return;
+    } else if !crate::closure::closure_has_own_dynamic_prop(obj as usize, name_str)
+        && crate::closure::closure_set_via_function_prototype_descriptor(
+            obj as usize,
+            name_str,
+            value,
+            crate::value::js_nanbox_pointer(obj as i64),
+        )
+    {
+        // Handled by an inherited %Function.prototype% descriptor
+        // (`Object.defineProperty(Function.prototype, k, {...})`) — an
+        // accessor's setter ran (or threw for a getter-only accessor), or a
+        // non-writable data property blocked the write; no own property is
+        // created.
+        return;
+    }
+    crate::closure::closure_set_dynamic_prop(obj as usize, name_str, value);
+}
+
 /// Set a field value by its string key name (dynamic property access)
 /// This searches the keys array for a match and sets the corresponding value.
 /// If the key doesn't exist, it adds it to the object.
@@ -199,6 +259,38 @@ pub extern "C" fn js_object_set_field_by_name(
                 crate::proxy::js_proxy_set(boxed, key_f64, value);
                 return;
             }
+        }
+    }
+    // #5437: a live Web Stream handle arrives here as its raw id in the
+    // stream band (the `stream.prop = v` codegen path). React's
+    // `renderToReadableStream` attaches its shell-ready promise as an
+    // expando (`stream.allReady = ...`); without a store the write was
+    // dropped, which stalled the Next.js dynamic-SSR render. Route to the
+    // stdlib per-stream expando table (GC-traced there).
+    {
+        let addr = obj as usize;
+        if crate::value::addr_class::is_stream_id_band(addr) {
+            if !key.is_null() {
+                if let (Some(probe), Some(setter)) = (
+                    crate::object::stream_handle_probe(),
+                    crate::object::stream_expando_set(),
+                ) {
+                    if unsafe { probe(addr) } {
+                        if let Some(name) =
+                            unsafe { super::has_own_helpers::str_from_string_header(key) }
+                        {
+                            unsafe { setter(addr, name.as_ptr(), name.len(), value) };
+                        }
+                    }
+                }
+            }
+            // A stream-band address is a reserved handle id, never a real
+            // `ObjectHeader`. Stop unconditionally — even when the expando
+            // write was a no-op (dead/unregistered handle, hooks absent, or a
+            // non-UTF-8 key). Falling through would reach the ObjectHeader
+            // path below and deref `addr - GC_HEADER_SIZE` (unmapped) → crash.
+            // Mirrors the reserved small-handle early-return further down.
+            return;
         }
     }
     // `Object.prototype["2"] = v` (stringified-index write) makes the index
@@ -497,6 +589,43 @@ pub extern "C" fn js_object_set_field_by_name(
                 crate::array::js_array_set_f64_extend(arr, index, value);
                 return;
             }
+            // Own-accessor short-circuit — an Array can carry a named accessor
+            // property installed via `Object.defineProperty(arr, k, {get,set})`.
+            // A `[[Set]]` on such a property must invoke the setter (a
+            // getter-only accessor is read-only), exactly as the generic-object
+            // path below does. The array branch otherwise dropped the write at
+            // the writable gate (an accessor has no `[[Writable]]`) and never
+            // ran the setter (test262 Object/defineProperty + defineProperties
+            // accessor-on-Array cases, e.g. 15.2.3.6-4-278).
+            //
+            // Gated on the per-array `OBJ_FLAG_ARRAY_DESCRIPTORS` flag (the
+            // ArrayHeader analogue of `object_has_descriptors` — the ObjectHeader
+            // `OBJ_FLAG_HAS_DESCRIPTORS` is never set for an ArrayHeader). The
+            // flag is set unconditionally by `define_array_property` whenever any
+            // descriptor is installed on the array and travels with it across
+            // evacuation; `ACCESSOR_DESCRIPTORS` is keyed by raw address, so a
+            // fresh array reusing a freed address (its `_reserved` zeroed at
+            // allocation) skips this lookup and can't fire a previous tenant's
+            // stale accessor.
+            if ACCESSORS_IN_USE.with(|c| c.get())
+                && (*gc_header)._reserved & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0
+            {
+                if let Some(acc) = get_accessor_descriptor(obj as usize, name) {
+                    if acc.set != 0 {
+                        let closure = (acc.set & crate::value::POINTER_MASK)
+                            as *const crate::closure::ClosureHeader;
+                        if !closure.is_null() {
+                            let receiver = crate::value::js_nanbox_pointer(obj as i64);
+                            let previous_this = super::js_implicit_this_set(receiver);
+                            crate::closure::js_closure_call1(closure, value);
+                            super::js_implicit_this_set(previous_this);
+                        }
+                    } else {
+                        crate::error::throw_immutable_write(0, name);
+                    }
+                    return;
+                }
+            }
             if let Some(attrs) = super::get_property_attrs(obj as usize, name) {
                 if !attrs.writable() {
                     return;
@@ -544,82 +673,17 @@ pub extern "C" fn js_object_set_field_by_name(
         }
 
         if gc_type == crate::gc::GC_TYPE_CLOSURE {
-            if !key.is_null() {
-                let name_ptr = (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
-                let name_len = (*key).byte_len as usize;
-                let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
-                if let Ok(name_str) = std::str::from_utf8(name_bytes) {
-                    // ECMAScript "poison pill" — assigning `caller`/`arguments`
-                    // on any strict-mode function (Perry compiles everything
-                    // strict: declarations, expressions, bound and built-in
-                    // closures, arrows) throws via the %ThrowTypeError%
-                    // accessor's missing setter. A genuine own data prop of
-                    // that name (defineProperty round-trip) still wins.
-                    // Refs test262 13.2-*-s / StrictFunction_restricted-*.
-                    if matches!(name_str, "caller" | "arguments")
-                        && !crate::closure::closure_has_own_dynamic_prop(obj as usize, name_str)
-                    {
-                        crate::fs::validate::throw_type_error_with_code(
-                            "Restricted function property assignment",
-                            "ERR_INVALID_ARG_TYPE",
-                        );
-                    }
-                    if let Some(attrs) = super::get_property_attrs(obj as usize, name_str) {
-                        if !attrs.writable() {
-                            return;
-                        }
-                    } else if matches!(name_str, "name" | "length") {
-                        return;
-                    }
-                    crate::closure::closure_set_dynamic_prop(obj as usize, name_str, value);
-                }
-            }
+            closure_set_field_by_name(obj, key, value);
             return;
         }
 
         // Check if this is a ClosureHeader — closures support dynamic props via separate storage.
         // ClosureHeader has CLOSURE_MAGIC (0x434C4F53) at offset 12.
         // Without this check, (*obj).keys_array reads capture[0] → corruption/crash.
-        let type_tag_at_12 = *((obj as *const u8).add(12) as *const u32);
+        let type_tag_at_12 =
+            *((obj as *const u8).add(crate::closure::CLOSURE_TYPE_TAG_OFFSET) as *const u32);
         if type_tag_at_12 == crate::closure::CLOSURE_MAGIC {
-            if !key.is_null() {
-                let name_ptr = (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
-                let name_len = (*key).byte_len as usize;
-                let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
-                if let Ok(name_str) = std::str::from_utf8(name_bytes) {
-                    // ECMAScript "poison pill" — assigning `caller`/`arguments`
-                    // on any strict-mode function (Perry compiles everything
-                    // strict: declarations, expressions, bound and built-in
-                    // closures, arrows) throws via the %ThrowTypeError%
-                    // accessor's missing setter. A genuine own data prop of
-                    // that name (defineProperty round-trip) still wins.
-                    // Refs test262 13.2-*-s / StrictFunction_restricted-*.
-                    if matches!(name_str, "caller" | "arguments")
-                        && !crate::closure::closure_has_own_dynamic_prop(obj as usize, name_str)
-                    {
-                        crate::fs::validate::throw_type_error_with_code(
-                            "Restricted function property assignment",
-                            "ERR_INVALID_ARG_TYPE",
-                        );
-                    }
-                    // #3143: honor a non-writable registered descriptor — a
-                    // built-in method's `.name`/`.length` are spec'd
-                    // `writable: false`, so a sloppy-mode write must be a silent
-                    // no-op (this is what Test262's `verifyProperty` checks).
-                    // Only fires when a descriptor was actually recorded for
-                    // this closure+key (built-in proto methods, or a user
-                    // `Object.defineProperty`); plain `fn.x = 1` finds none and
-                    // proceeds. Closure writes are not the object hot path.
-                    if let Some(attrs) = super::get_property_attrs(obj as usize, name_str) {
-                        if !attrs.writable() {
-                            return;
-                        }
-                    } else if matches!(name_str, "name" | "length") {
-                        return;
-                    }
-                    crate::closure::closure_set_dynamic_prop(obj as usize, name_str, value);
-                }
-            }
+            closure_set_field_by_name(obj, key, value);
             return;
         }
 
@@ -1307,6 +1371,47 @@ pub extern "C" fn js_object_set_field_by_name_nonenum(
                 obj as usize,
                 name.to_string(),
                 crate::object::PropertyAttrs::new(true, false, true),
+            );
+        }
+    }
+}
+
+/// Set `obj[key] = value` as a non-configurable (but writable + enumerable)
+/// own data property. Used for `globalThis`'s reflection of a Script's
+/// top-level `function`/`var` declarations: GlobalDeclarationInstantiation's
+/// `CreateGlobalFunctionBinding`/`CreateGlobalVarBinding` call with `D = false`
+/// (unlike sloppy-eval's Annex B.3.3.3 path, which uses `D = true` and already
+/// has its own `Object.defineProperty` HIR synthesis in
+/// `global_eval_hoist.rs`) — an ordinary assignment would instead create a
+/// configurable property. Called once at program start before any user
+/// statement runs, so there's no pre-existing descriptor to preserve or
+/// `CanDeclareGlobalFunction`/`CanDeclareGlobalVar` extensibility check to
+/// replicate here (test262 `language/global-code/decl-func.js`).
+#[no_mangle]
+pub extern "C" fn js_object_set_field_by_name_nonconfigurable(
+    obj: *mut ObjectHeader,
+    key: *const crate::StringHeader,
+    value: f64,
+) {
+    js_object_set_field_by_name(obj, key, value);
+    let bits = obj as u64;
+    if (bits >> 48) == 0x7FFE
+        || crate::value::addr_class::is_handle_band(obj as usize)
+        || key.is_null()
+    {
+        return;
+    }
+    unsafe {
+        if !crate::object::is_valid_obj_ptr(obj as *const u8) {
+            return;
+        }
+        let name_ptr = (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
+        let name_len = (*key).byte_len as usize;
+        if let Ok(name) = std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len)) {
+            crate::object::set_property_attrs(
+                obj as usize,
+                name.to_string(),
+                crate::object::PropertyAttrs::new(true, true, false),
             );
         }
     }

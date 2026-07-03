@@ -84,6 +84,7 @@ impl LoweringContext {
             exportable_object_vars: HashSet::new(),
             pending_functions: Vec::new(),
             closure_display_names: HashMap::new(),
+            class_display_names: HashMap::new(),
             gen_param_prologue_len: HashMap::new(),
             assignment_inferred_name: None,
             closure_source_text: HashMap::new(),
@@ -136,6 +137,7 @@ impl LoweringContext {
             namespace_import_sources: std::collections::HashMap::new(),
             generator_func_names: HashSet::new(),
             async_generator_func_names: HashSet::new(),
+            nested_generator_forward_referenced: HashSet::new(),
             iterator_func_for_class: std::collections::HashMap::new(),
             proxy_locals: HashSet::new(),
             builtin_proto_method_locals: HashMap::new(),
@@ -150,6 +152,7 @@ impl LoweringContext {
             mixin_funcs: HashMap::new(),
             anon_shape_classes: HashMap::new(),
             forward_class_names: std::collections::HashSet::new(),
+            forward_class_decl_depth: std::collections::HashMap::new(),
             class_renames: std::collections::HashMap::new(),
             next_class_rename_id: 0,
             module_class_decl_names: std::collections::HashSet::new(),
@@ -165,6 +168,8 @@ impl LoweringContext {
             object_static_method_aliases: HashMap::new(),
             array_static_method_aliases: HashMap::new(),
             is_entry_module: false,
+            saw_global_this_expr: false,
+            reassigned_top_level_identifiers: HashSet::new(),
             module_strict: false,
             strict_mode_stack: Vec::new(),
             is_external_module: false,
@@ -172,6 +177,7 @@ impl LoweringContext {
             fn_ctor_env: super::fn_ctor_env::FnCtorEnv::default(),
             expr_lower_depth: 0,
             prelowered_member_receiver: None,
+            in_nonarrow_fn: false,
         }
     }
 
@@ -798,6 +804,24 @@ impl LoweringContext {
         self.locals.lookup_index(name)
     }
 
+    /// The function-scope depth at which the nearest local binding of `name`
+    /// was declared, or `None` if there is no such binding. A binding's depth
+    /// is the number of `enter_scope` (function/closure-boundary) marks that
+    /// precede-or-equal its position in the locals stack — i.e. how deeply
+    /// nested the function it lives in is. Used to resolve a bare-ident
+    /// reference between a same-named `class` and a captured outer local by JS
+    /// nearest-binding rules: the binding at the GREATER depth (nearer the
+    /// reference) wins.
+    pub(crate) fn local_decl_scope_depth(&self, name: &str) -> Option<usize> {
+        let pos = self.lookup_local_index(name)?;
+        let depth = self
+            .scope_local_marks
+            .iter()
+            .filter(|&&mark| mark <= pos)
+            .count();
+        Some(depth)
+    }
+
     /// #5216: drop the most-recently-bound local named `name` (if any), e.g. a
     /// module-var the top-level pre-scan registered for `const ns =
     /// require("<native>")`. After this, a bare read of `name` resolves to its
@@ -1011,6 +1035,7 @@ impl LoweringContext {
             extends_name: None,
             native_extends: None,
             extends_expr: None,
+            heritage_lexically_shadowed: false,
             fields,
             constructor: Some(constructor),
             methods: Vec::new(),

@@ -353,6 +353,32 @@ fn leave_timer_callback_dispatch() {
     });
 }
 
+/// #5437: timer tick entry for the codegen `await` busy-wait loop. An `await`
+/// is a yield point — the real event loop would run due timers there — but the
+/// per-thread dispatch guard (`in_timer_callback_dispatch`) blocks the plain
+/// tick fns whenever the awaiting code itself runs inside a timer/setImmediate
+/// callback (every HTTP request handler does). React's server renderer
+/// schedules its render/flush work via `setImmediate`, so a busy-wait await in
+/// the request path deadlocked forever. Suspend the guard for the duration of
+/// this tick round: callbacks fired here still enter/leave the dispatch depth
+/// themselves, so a *plain* nested tick inside one of them stays guarded
+/// exactly as before.
+#[no_mangle]
+pub extern "C" fn js_await_loop_tick_timers() -> i32 {
+    let saved = TIMER_CALLBACK_DISPATCH_DEPTH.with(|depth| {
+        let v = depth.get();
+        depth.set(0);
+        v
+    });
+    let mut fired = js_timer_tick();
+    fired += js_callback_timer_tick();
+    fired += js_interval_timer_tick();
+    TIMER_CALLBACK_DISPATCH_DEPTH.with(|depth| {
+        depth.set(depth.get().saturating_add(saved));
+    });
+    fired
+}
+
 fn timer_handle_value(id: i64) -> f64 {
     f64::from_bits(crate::value::JSValue::pointer(id as *mut u8).bits())
 }
@@ -1120,6 +1146,12 @@ pub extern "C" fn js_callback_timer_tick() -> i32 {
 
     // NOTE: Do NOT call gc_check_trigger() here — same reason as interval
     // tick: register-held values get swept by conservative scanner.
+
+    // #input: dispatch buffered keyboard input on `process.stdin` here, at the
+    // same safe event-loop point as timer callbacks. The reader thread
+    // `js_notify_main_thread()`s on each keypress, so the loop ticks promptly;
+    // this is a cheap empty-buffer check when there's no input.
+    crate::os::pump_process_stdin();
 
     fired
 }

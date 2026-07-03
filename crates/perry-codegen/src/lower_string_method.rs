@@ -695,6 +695,18 @@ pub(crate) fn lower_string_method(
                 );
             }
             let len_d = lower_expr(ctx, &args[0])?;
+            // `ToLength(maxLength)` (ECMA-262 §22.1.3.16 `StringPad` step 1)
+            // must run — including any `valueOf`/`toString` on an object
+            // `maxLength` — BEFORE `ToString(fillString)` below. Coercing
+            // eagerly here (rather than leaving the raw boxed value for the
+            // runtime `to_length` helper to interpret as a plain f64) also
+            // fixes a correctness bug: a non-number `maxLength` (e.g. an
+            // object) was previously read as garbage/NaN bit-pattern instead
+            // of running `ToNumber`.
+            let len_d = {
+                let blk = ctx.block();
+                blk.call(DOUBLE, "js_number_coerce", &[(DOUBLE, &len_d)])
+            };
             // Optional pad string; defaults to " " when missing. A provided
             // fill is `ToString`-coerced (ECMA-262 §22.1.3.16) via
             // `js_string_pad_fill` — `undefined` → null handle (runtime falls
@@ -1006,7 +1018,12 @@ pub(crate) fn lower_string_method(
                 &[(DOUBLE, &other_box), (I32, &method_id)],
             );
             let result_i32 = if let Some(pos_d) = pos_d {
-                let pos_i32 = blk.fptosi(DOUBLE, &pos_d, I32);
+                // ToIntegerOrInfinity(position): route through the runtime
+                // coercion (not a raw `fptosi` on the NaN-boxed value) so a
+                // boolean/numeric-string/`{valueOf}` coerces per spec and a
+                // Symbol position throws a TypeError (matches the dynamic
+                // dispatch path and the `includes` arm below).
+                let pos_i32 = blk.call(I32, "js_string_index_to_i32", &[(DOUBLE, &pos_d)]);
                 let runtime_fn = if property == "startsWith" {
                     "js_string_starts_with_at"
                 } else {

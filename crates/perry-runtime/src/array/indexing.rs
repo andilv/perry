@@ -219,6 +219,9 @@ pub(crate) fn array_iteration_is_exotic(arr: *const ArrayHeader) -> bool {
     if ARRAY_PROTO_HAS_INDEX.load(Ordering::Relaxed) {
         return true;
     }
+    if OBJECT_PROTO_HAS_INDEX.load(Ordering::Relaxed) {
+        return true;
+    }
     // Live indices beyond the dense backing store are stored in the sparse
     // named-property map, which the raw element loop never reads.
     unsafe { (*arr).length > (*arr).capacity }
@@ -300,9 +303,23 @@ unsafe fn array_custom_array_prototype(arr: *const ArrayHeader) -> Option<*const
     if raw < crate::gc::GC_HEADER_SIZE + 0x1000 || raw == arr as usize {
         return None;
     }
-    let hdr = (raw as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
+    // #5625: the recorded prototype may be a *grown* array whose stored pointer
+    // was left FORWARDED by `js_array_grow` — its first 8 bytes now hold the
+    // forwarding pointer to the live head instead of length+capacity. (A real
+    // array grows when `Object.setPrototypeOf(arr, p)` captured `p` before a
+    // later push reallocated it, or the proto itself was built by appends — as
+    // in test262 copyWithin/coerced-values-start-change-start, whose
+    // `longDenseArray()` fills a `[0]` to 1024 elements.) Resolve the chain so
+    // we deref the current array head; reading the defunct old location yields
+    // the forwarding pointer's low 32 bits as a garbage `length`, making
+    // inherited-index reads silently miss (nondeterministic copyWithin output).
+    let resolved = clean_arr_ptr(raw as *const ArrayHeader);
+    if resolved.is_null() || resolved as usize == arr as usize {
+        return None;
+    }
+    let hdr = (resolved as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
     if (*hdr).obj_type == crate::gc::GC_TYPE_ARRAY {
-        Some(raw as *const ArrayHeader)
+        Some(resolved)
     } else {
         None
     }
@@ -752,6 +769,15 @@ pub extern "C" fn js_array_numeric_set_f64_unboxed(
     }
     0
 }
+
+// These raw numeric-array helpers are called from generated code, so release/LTO
+// builds may otherwise internalize and strip the `#[no_mangle]` exports.
+#[used]
+static KEEP_JS_ARRAY_NUMERIC_GET_F64_UNBOXED: extern "C" fn(*mut ArrayHeader, u32) -> f64 =
+    js_array_numeric_get_f64_unboxed;
+#[used]
+static KEEP_JS_ARRAY_NUMERIC_SET_F64_UNBOXED: extern "C" fn(*mut ArrayHeader, u32, f64) -> i32 =
+    js_array_numeric_set_f64_unboxed;
 
 /// Set an element in an array by index
 /// Note: This does NOT extend the array if index >= length

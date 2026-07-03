@@ -737,12 +737,32 @@ pub fn try_lower_native_method_str_dispatch(
                 // missing method as a non-callable property read and throw.
                 | "__perry_using_check__"
         );
+        // A `class X extends Map | Set` instance's collection methods
+        // (`has`/`get`/`set`/`delete`/`clear`/`forEach`/`keys`/`values`/
+        // `entries` and the Set composition methods) are NOT class methods —
+        // they live on the hidden runtime backing installed by
+        // `js_map_set_subclass_init`. The static class-dispatch tower would read
+        // them as a non-callable property and throw "value is not a function",
+        // so route them through `js_native_call_method` (whose `dispatch_map_set`
+        // redirects onto the backing collection). Mirrors the
+        // `is_well_known_proto_method` carve-out.
+        // Only Map/Set subclasses get a runtime backing installed at `super()`
+        // (via `js_map_set_subclass_init`); WeakMap/WeakSet subclasses have NO
+        // backing, so leave their method calls on the NORMAL class-dispatch path
+        // instead of suppressing it toward a non-existent backing (which would
+        // also shadow a user's own override on a WeakMap/WeakSet subclass).
+        let is_collection_subclass_method = class_name_opt
+            .as_deref()
+            .and_then(|n| class_builtin_collection_kind(ctx, n))
+            .filter(|kind| matches!(*kind, "Map" | "Set"))
+            .is_some_and(|kind| is_collection_method_for_kind(kind, property.as_str()));
         let skip_native = matches!(object.as_ref(), Expr::GlobalGet(_))
             || matches!(object.as_ref(), Expr::NativeModuleRef(_))
             || (class_name_opt.is_some()
                 && !is_buffer_class
                 && !class_unknown_to_codegen
-                && !is_well_known_proto_method);
+                && !is_well_known_proto_method
+                && !is_collection_subclass_method);
         if !skip_native {
             // Issue #92 fast path: intrinsify Buffer numeric reads
             // (`buf.readInt32BE(off)` etc.) when the receiver is a tracked
@@ -765,11 +785,17 @@ pub fn try_lower_native_method_str_dispatch(
             for a in args {
                 lowered_args.push(lower_expr(ctx, a)?);
             }
-            // Intern the method name and reference its rodata byte global.
+            // Intern the method name and pass its heap string handle as the
+            // static-name method id. The typed-feedback wrapper resolves the
+            // id to bytes only at the runtime boundary.
             let key_idx = ctx.strings.intern(property);
             let entry = ctx.strings.entry(key_idx);
-            let bytes_global = format!("@{}", entry.bytes_global);
-            let name_len_str = entry.byte_len.to_string();
+            let key_handle_global = format!("@{}", entry.handle_global);
+            let key_box = ctx.block().load(DOUBLE, &key_handle_global);
+            let key_bits = ctx.block().bitcast_double_to_i64(&key_box);
+            let method_id = ctx
+                .block()
+                .and(I64, &key_bits, crate::nanbox::POINTER_MASK_I64);
             // Stack-allocate the args array if any. The alloca MUST live in
             // the function entry block — emitting it into the current block
             // (which may be a loop body) makes LLVM lower it as a runtime
@@ -801,12 +827,11 @@ pub fn try_lower_native_method_str_dispatch(
             let blk = ctx.block();
             return Ok(Some(blk.call(
                 DOUBLE,
-                "js_typed_feedback_native_call_method",
+                "js_typed_feedback_native_call_method_by_id",
                 &[
                     (I64, &site_id),
                     (DOUBLE, &recv_box),
-                    (PTR, &bytes_global),
-                    (I64, &name_len_str),
+                    (I64, &method_id),
                     (PTR, &args_ptr),
                     (I64, &args_len_str),
                 ],
@@ -853,6 +878,79 @@ fn is_message_port_closure_method(object: &Expr, property: &str) -> bool {
 /// call (those miss because the name lives in CLASS_STATIC_ACCESSORS, not
 /// CLASS_STATIC_METHODS). Returns `None` when `prop` is not a static accessor on
 /// the chain. Refs test262 language/arguments-object cls-*-static-* getter calls.
+//
+/// Returns WHICH builtin collection the class ultimately extends — i.e. a
+/// source-compiled `class X extends Map {}` (instances get a hidden Map/Set
+/// backing at `super()` via `js_map_set_subclass_init` and their collection
+/// methods dispatch through the runtime, not the class vtable). The result is
+/// (`"Map"`/`"Set"`/`"WeakMap"`/`"WeakSet"`), or `None`. Method routing is
+/// kind-specific: `class M extends Map`
+/// calling `.add()`/`.union()` (Set methods) must NOT be forced through the Map
+/// backing (which returns `undefined`) — it should fall through to the normal
+/// missing-method / user-method path.
+pub fn class_builtin_collection_kind(ctx: &FnCtx<'_>, cls_name: &str) -> Option<&'static str> {
+    fn normalize(name: &str) -> Option<&'static str> {
+        match name {
+            "Map" => Some("Map"),
+            "Set" => Some("Set"),
+            "WeakMap" => Some("WeakMap"),
+            "WeakSet" => Some("WeakSet"),
+            _ => None,
+        }
+    }
+    let mut cur = Some(cls_name.to_string());
+    let mut depth = 0usize;
+    while let Some(c) = cur {
+        if depth > 32 {
+            break;
+        }
+        let Some(ci) = ctx.classes.get(&c) else {
+            // The chain reached a name codegen doesn't track — it may be the
+            // builtin `Map`/`Set` heritage itself.
+            return normalize(c.as_str());
+        };
+        if let Some(parent) = ci.extends_name.as_deref() {
+            if let Some(kind) = normalize(parent) {
+                return Some(kind);
+            }
+        }
+        cur = ci.extends_name.clone();
+        depth += 1;
+    }
+    None
+}
+
+/// True when `method` is a backing-store collection method for `kind` (the
+/// builtin a class extends). Map/WeakMap-only vs Set/WeakSet-only methods are
+/// kept distinct so `class M extends Map` calling a Set method (`.add`,
+/// `.union`, …) is NOT mis-routed onto the Map backing.
+fn is_collection_method_for_kind(kind: &str, method: &str) -> bool {
+    let shared = matches!(method, "has" | "delete" | "clear" | "forEach");
+    match kind {
+        "Map" => shared || matches!(method, "get" | "set" | "keys" | "values" | "entries"),
+        "WeakMap" => matches!(method, "has" | "get" | "set" | "delete"),
+        "Set" => {
+            shared
+                || matches!(
+                    method,
+                    "add"
+                        | "keys"
+                        | "values"
+                        | "entries"
+                        | "union"
+                        | "intersection"
+                        | "difference"
+                        | "symmetricDifference"
+                        | "isSubsetOf"
+                        | "isSupersetOf"
+                        | "isDisjointFrom"
+                )
+        }
+        "WeakSet" => matches!(method, "has" | "add" | "delete"),
+        _ => false,
+    }
+}
+
 pub fn try_lower_class_static_accessor_call(
     ctx: &mut FnCtx<'_>,
     cls_name: &str,
@@ -937,6 +1035,17 @@ pub fn try_lower_closure_call_fallthrough(
     // `language/{statements,expressions}/class/dstr/async-gen-meth-static-*`
     // (`C.method(g()).next()`). For a side-effecting receiver, evaluate it
     // once here and read the method off that value directly.
+    //
+    // #5247: capture this call's source byte offset NOW, before the receiver
+    // and arguments are lowered (a nested call in either would overwrite the
+    // shared pending offset). The `js_closure_unbox_callee_checked` dispatch
+    // below throws `TypeError: value is not a function` for a non-callable
+    // callee (`const f: any = 5; f()`, nanoid/yup's failure shape), and that
+    // throw renders `CURRENT_CALL_LOCATION` via `make_stack`. Replaying the
+    // offset as `js_set_call_location` right before the dispatch gives the
+    // throw an `at <file>:<line>` frame under `--debug-symbols`. `0` (and the
+    // default build) → no emission, unchanged `<anonymous>` frame.
+    let call_byte_offset = ctx.strings.pending_call_offset();
     let prelowered_recv: Option<(String, String)> =
         if let Expr::PropertyGet { object, property } = callee {
             if receiver_must_eval_once(object.as_ref()) {
@@ -1006,6 +1115,11 @@ pub fn try_lower_closure_call_fallthrough(
         None
     };
 
+    // #5247: record the source location right before the throw-capable
+    // dispatch — after the receiver/args are lowered, so a nested-call
+    // argument's location no longer shadows this one. Applies to both arity
+    // branches below (the checked unbox throws in either). No-op default build.
+    crate::expr::calls::emit_call_location_at(ctx, call_byte_offset);
     let result = if lowered_args.len() <= 16 {
         let blk = ctx.block();
         // #5504: tag-check the callee before masking to a closure pointer.

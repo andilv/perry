@@ -250,6 +250,11 @@ pub struct LoweringContext {
     /// (static property key); flushed into `Module.closure_display_names`
     /// alongside `pending_functions`.
     pub(crate) closure_display_names: HashMap<FuncId, String>,
+    /// #5592: class `.name` overrides keyed by ClassId. Populated when a
+    /// class expression's HIR registration key is uniquified away from its
+    /// JS name (two anonymous class expressions on the same binding); flushed
+    /// into `Module.class_display_names`. See that field's docs.
+    pub(crate) class_display_names: HashMap<ClassId, String>,
     /// Per-generator count of leading parameter-prologue statements (default
     /// guards + destructuring binding stmts) prepended to the body. Flushed
     /// into `Module.gen_param_prologue_len`; the generator transform uses it to
@@ -512,6 +517,16 @@ pub struct LoweringContext {
     /// the for-of generator-call path so it can wrap `__iter.next()` in
     /// `await` (async generators always return `Promise<{value, done}>`).
     pub(crate) async_generator_func_names: HashSet<String>,
+    /// Names of nested `function*` declarations that are referenced by an
+    /// EARLIER sibling statement in the same enclosing function/IIFE body
+    /// (forward reference). Such a generator cannot use the top-level-Function
+    /// hoist path — its `FuncRef` name binding is only registered while lowering
+    /// its own declaration, too late for the earlier reference, which would fall
+    /// through to a `globalThis` read (`ReferenceError: <name> is not defined`).
+    /// Populated by the Phase-1 pre-pass in `lower_fn_body_block_stmt` /
+    /// `lower_fn_expr_anon`; consumed in `lower_body_stmt`'s FnDecl arm to route
+    /// the generator through the closure path instead.
+    pub(crate) nested_generator_forward_referenced: HashSet<String>,
     /// Classes that define `*[Symbol.iterator]()`. Maps class name →
     /// `FuncId` of the synthesized top-level generator function that
     /// takes `this` as its first parameter. Consumed by `for...of` to
@@ -588,6 +603,18 @@ pub struct LoweringContext {
     /// call dispatched into `Object.create`. Scoped save/restore in
     /// `lower_fn_body_block_stmt`.
     pub(crate) forward_class_names: std::collections::HashSet<String>,
+    /// For each name in `forward_class_names`, the `scope_depth` at which the
+    /// `class <name>` declaration was registered. A bare-ident reference may
+    /// only resolve to the class (shadowing an outer-scope local of the same
+    /// name) when the class lexically encloses the reference — i.e. it was
+    /// declared at a scope depth no greater than the reference's. Without this,
+    /// a class in a SIBLING function factory (its name lingering in the
+    /// inherited `forward_class_names` set) wrongly shadowed a legitimate
+    /// captured local of the same name (Next.js app-page-turbo: a route-render
+    /// closure's captured params local `ej` resolved to the `class ej`
+    /// =`NextURL` reference, which then flowed into a WeakMap key and threw
+    /// "Invalid value used as weak map key").
+    pub(crate) forward_class_decl_depth: std::collections::HashMap<String, usize>,
     /// Scope-local class-name aliases disambiguating distinct same-named classes
     /// across nested function/factory scopes within ONE module (class refs are
     /// name-keyed: `Expr::New { class_name }` / `ClassRef(name)`). When a body
@@ -706,6 +733,41 @@ pub struct LoweringContext {
     /// module reports `true` and every imported module reports `false`. Set
     /// by `lower_module_with_class_id_types_seed_and_entry`; default false.
     pub(crate) is_entry_module: bool,
+    /// #5833: true once lowering has produced at least one `Expr::GlobalThisExpr`
+    /// from a top-level `this` (global-script mode, `PERRY_GLOBAL_SCRIPT_THIS`).
+    /// `Module::references_global_this` gates codegen's reflection of
+    /// top-level `function`/`var` declarations onto the global object, but it
+    /// was computed by a plain substring scan for the literal token
+    /// `globalThis` in the module source — a program that reads the global
+    /// object only through top-level `this` (as Test262's `verifyProperty(this,
+    /// ...)` idiom does) never contains that literal, so the reflection
+    /// silently never ran. OR'd into `references_global_this` once lowering
+    /// finishes (test262 `language/global-code/decl-func.js`,
+    /// `language/global-code/decl-var.js`).
+    pub(crate) saw_global_this_expr: bool,
+    /// #5833: names assigned by a **direct top-level** `name = ...`/`name++`
+    /// expression statement — see
+    /// `collect_direct_top_level_reassigned_identifiers`, which deliberately
+    /// does NOT reuse the deeper, name-only (no scope tracking)
+    /// `collect_assigned_function_binding_candidates` scan: that would
+    /// false-positive on a same-named binding shadowed in a nested block.
+    /// Consulted when lowering a top-level `class` declaration: a class name
+    /// is normally
+    /// resolved purely through the class registry (`ctx.lookup_class` /
+    /// `Expr::ClassRef`), with no backing local variable, so every read
+    /// re-derives the same class-id value and every write is a silent no-op
+    /// special-cased in `expr_assign.rs` (the class binding is otherwise
+    /// treated as immutable). GlobalDeclarationInstantiation says a class
+    /// declaration creates a MUTABLE binding, so `Foo = 5` must actually take
+    /// (test262 `language/global-code/decl-lex.js`). Giving *every* class a
+    /// real local would fix that, but it also makes plain reads of the name
+    /// resolve to `Expr::LocalGet` instead of `Expr::ClassRef` everywhere —
+    /// breaking call sites that pattern-match `Expr::ClassRef` after lowering
+    /// a bare class-name identifier (e.g. `export default Widget;`, #665).
+    /// Only seeding a local for names already known to be reassigned keeps
+    /// the overwhelmingly common (never-reassigned) case byte-for-byte
+    /// unchanged.
+    pub(crate) reassigned_top_level_identifiers: HashSet<String>,
     /// Strictness inherited from the module/script directive prologue or from
     /// ECMAScript module syntax. Function lowering consults this before
     /// deciding whether its `arguments` object should be mapped.
@@ -756,4 +818,12 @@ pub struct LoweringContext {
     /// idempotent w.r.t. the value produced (the fluent-success path already
     /// reuses the same lowered receiver), so reusing it is semantics-preserving.
     pub(crate) prelowered_member_receiver: Option<((u32, u32), Expr)>,
+    /// True when the eval call site is lexically inside a non-arrow function
+    /// (ordinary `function` declaration/expression, method, constructor, getter,
+    /// setter, or static block). Used by `check_direct_eval_super_private` to
+    /// enforce the spec rule: `new.target` in a direct eval body is only legal
+    /// when the eval is contained in function code that is NOT an ArrowFunction
+    /// (ES2025 §15.2.1.1, early error for `new.target` in eval). ArrowFunction
+    /// bodies and module/script top-level both leave this false.
+    pub(crate) in_nonarrow_fn: bool,
 }

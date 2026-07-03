@@ -2,6 +2,32 @@
 
 use super::*;
 
+fn finite_nonnegative_i32_index(index: f64) -> Option<i32> {
+    let bits = index.to_bits();
+    if (bits & TAG_MASK) == INT32_TAG {
+        let index = JSValue::from_bits(bits).as_int32();
+        return (index >= 0).then_some(index);
+    }
+    if index.is_finite() && index >= 0.0 && index.fract() == 0.0 && index <= i32::MAX as f64 {
+        Some(index as i32)
+    } else {
+        None
+    }
+}
+
+fn finite_nonnegative_u32_index(index: f64) -> Option<u32> {
+    let bits = index.to_bits();
+    if (bits & TAG_MASK) == INT32_TAG {
+        let index = JSValue::from_bits(bits).as_int32();
+        return (index >= 0).then_some(index as u32);
+    }
+    if index.is_finite() && index >= 0.0 && index.fract() == 0.0 && index < u32::MAX as f64 {
+        Some(index as u32)
+    } else {
+        None
+    }
+}
+
 /// Tag-aware dynamic index dispatch for `obj[key]` where `obj` has unknown
 /// static type. Issue #514. Strings → js_string_char_at; objects stringify
 /// numeric keys (`obj[0]` is `obj["0"]`), while arrays/buffers keep numeric
@@ -106,6 +132,24 @@ pub extern "C" fn js_dyn_index_get(value: f64, index: f64) -> f64 {
             index,
         );
     }
+    if crate::buffer::is_registered_buffer(raw_ptr) {
+        let Some(idx_i32) = finite_nonnegative_i32_index(index) else {
+            return f64::from_bits(TAG_UNDEFINED);
+        };
+        let buf = raw_ptr as *const crate::buffer::BufferHeader;
+        let len = unsafe { (*buf).length };
+        if (idx_i32 as u32) >= len {
+            return f64::from_bits(TAG_UNDEFINED);
+        }
+        let byte_val = crate::buffer::js_buffer_get(buf, idx_i32);
+        return byte_val as f64;
+    }
+    if crate::set::is_registered_set(raw_ptr) || crate::map::is_registered_map(raw_ptr) {
+        let Some(index) = finite_nonnegative_u32_index(index) else {
+            return f64::from_bits(TAG_UNDEFINED);
+        };
+        return crate::array::js_array_get_f64(raw_ptr as *const crate::array::ArrayHeader, index);
+    }
     // Issue #63 / #321 (Effect.runSync→fork SIGBUS): the raw-I64 fallback
     // above accepts arbitrary in-range bits — including denormal f64
     // payloads from non-pointer dataflow (e.g. effect's fiberRefs.ts loop
@@ -155,32 +199,6 @@ pub extern "C" fn js_dyn_index_get(value: f64, index: f64) -> f64 {
             return value;
         }
     }
-    // Registry-backed Buffer (`Buffer.from(...)`, `js_buffer_alloc`, the
-    // `'data'`-event chunk an http/net listener receives). These carry NO
-    // GcHeader (see `crates/perry-runtime/src/buffer.rs` — "Buffers carry
-    // no GcHeader") and store one byte per element after an 8-byte
-    // `BufferHeader { length, capacity }`. The generic fall-through below
-    // does `raw_ptr - GC_HEADER_SIZE` to read an `obj_type` that doesn't
-    // exist for a buffer (garbage that never matches GC_TYPE_ARRAY), then
-    // reads an 8-byte f64 at `raw_ptr + 8 + idx*8` straight out of the
-    // buffer's 1-byte-per-element data region — `chunk[0]` came back as a
-    // denormal/garbage f64 that printed `0`, while `.toString()` /
-    // `.length` / `Array.from(chunk)` (which all probe BUFFER_REGISTRY)
-    // were correct. Probe the registry first and read the byte the same
-    // way the working accessors do (`js_buffer_get` → `buffer_data()`).
-    // Node semantics: in-range → the byte (0..255); out-of-range → undefined.
-    if crate::buffer::is_registered_buffer(raw_ptr) {
-        if idx_i32 < 0 {
-            return f64::from_bits(TAG_UNDEFINED);
-        }
-        let buf = raw_ptr as *const crate::buffer::BufferHeader;
-        let len = unsafe { (*buf).length };
-        if (idx_i32 as u32) >= len {
-            return f64::from_bits(TAG_UNDEFINED);
-        }
-        let byte_val = crate::buffer::js_buffer_get(buf, idx_i32);
-        return byte_val as f64;
-    }
     if raw_ptr >= crate::gc::GC_HEADER_SIZE {
         let gc_hdr = unsafe {
             (raw_ptr as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader
@@ -211,6 +229,18 @@ pub extern "C" fn js_dyn_index_get(value: f64, index: f64) -> f64 {
                 return f64::from_bits(TAG_UNDEFINED);
             }
             let arr = raw_ptr as *const crate::array::ArrayHeader;
+            // When any property descriptor is live, an array element read may
+            // resolve to an index accessor descriptor — own (`Object.define-
+            // Property(arr, "0", {get})`) or inherited from a polluted
+            // `Array.prototype`/`Object.prototype` — rather than the raw slot.
+            // Route through `js_array_get_f64`, which fires the getter and
+            // applies the out-of-bounds prototype fallback. The raw-slot fast
+            // path below is preserved for the common no-descriptor case so the
+            // hot dynamic-index path is unchanged. (test262 Object/define-
+            // Propert{y,ies} Array-index accessor reads.)
+            if crate::object::descriptors_in_use() {
+                return crate::array::js_array_get_f64(arr, idx_i32 as u32);
+            }
             let length = unsafe { (*arr).length };
             if (idx_i32 as u32) >= length {
                 return f64::from_bits(TAG_UNDEFINED);
@@ -343,16 +373,24 @@ pub extern "C" fn js_dyn_index_set(obj: f64, index: f64, value: f64) -> f64 {
         return value;
     }
     if crate::typedarray::lookup_typed_array_kind(raw_ptr).is_some() {
-        if index.is_finite() {
-            let idx_i32 = index as i32;
-            if idx_i32 >= 0 && index == idx_i32 as f64 {
-                crate::typedarray::js_typed_array_set(
-                    raw_ptr as *mut crate::typedarray::TypedArrayHeader,
-                    idx_i32,
-                    value,
-                );
-            }
+        crate::typedarray_props::js_typed_array_index_set_dynamic(
+            raw_ptr as *mut crate::typedarray::TypedArrayHeader,
+            index,
+            value,
+        );
+        return value;
+    }
+    if crate::buffer::is_registered_buffer(raw_ptr) {
+        if let Some(idx_i32) = finite_nonnegative_i32_index(index) {
+            crate::buffer::js_buffer_set(
+                raw_ptr as *mut crate::buffer::BufferHeader,
+                idx_i32,
+                value as i32,
+            );
         }
+        return value;
+    }
+    if crate::set::is_registered_set(raw_ptr) || crate::map::is_registered_map(raw_ptr) {
         return value;
     }
     // Mirror the #63/#321 guard on the get side: heuristic-derived
@@ -360,21 +398,45 @@ pub extern "C" fn js_dyn_index_set(obj: f64, index: f64, value: f64) -> f64 {
     if !jsval.is_pointer() && !crate::object::is_valid_obj_ptr(raw_ptr as *const u8) {
         return value;
     }
-    let idx_i32 = if index.is_nan() || index.is_infinite() {
-        0
-    } else {
-        index as i32
-    };
-    if idx_i32 >= 0
-        && unsafe {
+    // #5579 / Issue #957 (set side): a STRING index (`obj["foo"] = v`) must
+    // route through the ordinary receiver-aware `[[Set]]`, NOT the numeric
+    // element path below. A NaN-boxed string index otherwise reached the
+    // element path — for an arguments object that meant `args["gp"] = v`
+    // clobbered `args[0]` (via `arguments_object_set_index`) and silently
+    // dropped the named property, so test262 propertyHelper's
+    // `isWritable(args, name)` (`args[name] = v` with an untyped `name`
+    // param) reported a writable property as non-writable.
+    // #5544 widened unknown-receiver string-key writes onto this helper,
+    // exposing the gap. `js_put_value_set` is the canonical `[[Set]]` the
+    // pre-#5544 path used: it invokes accessor setters with the correct
+    // receiver and honours data-property writability across arrays / arguments
+    // objects / plain objects / typed arrays, mirroring the IndexGet
+    // string-index arm above (`js_object_get_field_by_name_f64`). Numeric
+    // indices keep the fast element path below (gated by
+    // `finite_nonnegative_u32_index`, so NaN/fractional keys fall through to
+    // the ToString write instead of aliasing element 0), so the #5544 perf
+    // win stands.
+    let idx_top16 = index.to_bits() >> 48;
+    if idx_top16 == 0x7FFF || idx_top16 == 0x7FF9 {
+        // `target`/`receiver` must be a tagged value, not the raw heap address
+        // (`obj` arrives as a module-slot raw I64 when top16 == 0).
+        let target = if jsval.is_pointer() {
+            obj
+        } else {
+            f64::from_bits(crate::value::js_nanbox_pointer(raw_ptr as i64).to_bits())
+        };
+        return crate::proxy::js_put_value_set(target, index, value, target, 0);
+    }
+    if let Some(idx_u32) = finite_nonnegative_u32_index(index) {
+        if unsafe {
             crate::object::arguments_object_set_index(
                 raw_ptr as *mut crate::object::ObjectHeader,
-                idx_i32 as u32,
+                idx_u32,
                 value,
             )
+        } {
+            return value;
         }
-    {
-        return value;
     }
     let is_array = unsafe {
         let gc_header =
@@ -397,9 +459,7 @@ pub extern "C" fn js_dyn_index_set(obj: f64, index: f64, value: f64) -> f64 {
     } else if top16 == 0x7FF9 {
         crate::value::js_get_string_pointer_unified(index) as *const crate::StringHeader
     } else {
-        // Numeric (or other) index — stringify and intern as a UTF-8 key.
-        let s = idx_i32.to_string();
-        crate::string::js_string_from_bytes(s.as_ptr(), s.len() as u32)
+        crate::value::js_jsvalue_to_string(index)
     };
     if key_ptr.is_null() {
         return value;

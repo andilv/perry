@@ -904,6 +904,14 @@ pub fn lower_fn_body_block_stmt(
     // repopulates it for this body below.
     let saved_annexb_block_fn_var_ids = std::mem::take(&mut ctx.annexb_block_fn_var_ids);
     let saved_annexb_block_fn_names_all = std::mem::take(&mut ctx.annexb_block_fn_names_all);
+    // Nested `function*` declarations forward-referenced by an earlier sibling
+    // in THIS body must use the closure-lowering path (see `lower_body_stmt`'s
+    // FnDecl arm). Scope the set to this body and restore on every exit.
+    let saved_nested_gen_fwd = std::mem::take(&mut ctx.nested_generator_forward_referenced);
+    ctx.nested_generator_forward_referenced =
+        crate::lower_decl::forward_referenced_nested_generators(&block.stmts)
+            .into_iter()
+            .collect();
     // Boundary between outer-scope locals (+ this function's params, defined by
     // the caller before entry) and locals defined while lowering THIS body.
     // Used by the Phase 1.6 forward `let`/`const` pre-registration so a const
@@ -951,15 +959,24 @@ pub fn lower_fn_body_block_stmt(
     // module function). Scoped: the previous set is restored on exit so
     // names don't leak across function bodies.
     let saved_forward_class_names = ctx.forward_class_names.clone();
+    let saved_forward_class_decl_depth = ctx.forward_class_decl_depth.clone();
     let saved_class_renames = ctx.class_renames.clone();
+    let cur_scope_depth = ctx.scope_depth;
     for stmt in &block.stmts {
         if let ast::Stmt::Decl(ast::Decl::Class(class_decl)) = stmt {
             // Disambiguate a distinct same-named class declared in this body so
             // its references don't bind to a colliding `class X` elsewhere in
             // the bundled module (see `class_renames`).
             ctx.maybe_rename_colliding_class(class_decl.ident.sym.as_str());
-            ctx.forward_class_names
-                .insert(class_decl.ident.sym.to_string());
+            let cname = class_decl.ident.sym.to_string();
+            // Record the (shallowest) scope depth this class is declared at so a
+            // later bare-ident reference can compare it against a same-named
+            // local by JS nearest-binding rules.
+            ctx.forward_class_decl_depth
+                .entry(cname.clone())
+                .and_modify(|d| *d = (*d).min(cur_scope_depth))
+                .or_insert(cur_scope_depth);
+            ctx.forward_class_names.insert(cname);
         }
     }
 
@@ -1000,13 +1017,16 @@ pub fn lower_fn_body_block_stmt(
         Err(err) => {
             ctx.current_strict = parent_strict;
             ctx.forward_class_names = saved_forward_class_names;
+            ctx.forward_class_decl_depth = saved_forward_class_decl_depth;
             ctx.class_renames = saved_class_renames;
             ctx.annexb_block_fn_var_ids = saved_annexb_block_fn_var_ids;
+            ctx.nested_generator_forward_referenced = saved_nested_gen_fwd;
             ctx.annexb_block_fn_names_all = saved_annexb_block_fn_names_all;
             return Err(err);
         }
     };
     ctx.forward_class_names = saved_forward_class_names;
+    ctx.forward_class_decl_depth = saved_forward_class_decl_depth;
     ctx.class_renames = saved_class_renames;
 
     // Re-register capture snapshots for classes declared in this body at
@@ -1082,6 +1102,7 @@ pub fn lower_fn_body_block_stmt(
         ctx.current_strict = parent_strict;
         ctx.annexb_block_fn_var_ids = saved_annexb_block_fn_var_ids;
         ctx.annexb_block_fn_names_all = saved_annexb_block_fn_names_all;
+        ctx.nested_generator_forward_referenced = saved_nested_gen_fwd;
         let mut result = var_slot_lets;
         result.extend(body);
         return Ok(result);
@@ -1139,6 +1160,7 @@ pub fn lower_fn_body_block_stmt(
     ctx.current_strict = parent_strict;
     ctx.annexb_block_fn_var_ids = saved_annexb_block_fn_var_ids;
     ctx.annexb_block_fn_names_all = saved_annexb_block_fn_names_all;
+    ctx.nested_generator_forward_referenced = saved_nested_gen_fwd;
     Ok(result)
 }
 
@@ -1329,8 +1351,54 @@ fn collect_refs_in_closure_bodies_expr(expr: &Expr, out: &mut std::collections::
 /// NOT recurse into nested blocks (those are block-scoped — their lets
 /// aren't hoisted to function-entry).
 pub fn collect_top_level_let_ids_stmt(stmt: &Stmt, out: &mut std::collections::HashSet<LocalId>) {
-    if let Stmt::Let { id, .. } = stmt {
-        out.insert(*id);
+    match stmt {
+        Stmt::Let { id, .. } => {
+            out.insert(*id);
+        }
+        // Array-destructuring bindings (`let [a, b] = it`) lower to the iterator
+        // protocol wrapped in a `Try` (see
+        // `destructuring::pattern_binding::lower_array_pattern_binding`), so the
+        // leaf `let`s live INSIDE the try body / its `if`s, not at the top level.
+        // Recurse into those so a hoisted FnDecl that captures a destructured var
+        // still gets its box preallocated at function entry. Without this, the
+        // hoisted closure captures the not-yet-assigned, unboxed slot and reads
+        // `undefined` — e.g. `const [K,_] = useState(0)` captured by a hoisted
+        // handler. Loops are intentionally NOT recursed: a per-iteration `let`
+        // needs a fresh box, not a single entry-prealloc.
+        Stmt::Try {
+            body,
+            catch,
+            finally,
+        } => {
+            for s in body {
+                collect_top_level_let_ids_stmt(s, out);
+            }
+            if let Some(c) = catch {
+                for s in &c.body {
+                    collect_top_level_let_ids_stmt(s, out);
+                }
+            }
+            if let Some(f) = finally {
+                for s in f {
+                    collect_top_level_let_ids_stmt(s, out);
+                }
+            }
+        }
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            for s in then_branch {
+                collect_top_level_let_ids_stmt(s, out);
+            }
+            if let Some(eb) = else_branch {
+                for s in eb {
+                    collect_top_level_let_ids_stmt(s, out);
+                }
+            }
+        }
+        _ => {}
     }
 }
 

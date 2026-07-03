@@ -17,7 +17,7 @@ crate-type = ["rlib"]
 default = ["full"]
 
 # Full stdlib - everything included
-full = ["http-server", "http-client", "database", "crypto", "compression", "email", "websocket", "image", "scheduler", "ids", "html-parser", "rate-limit", "validation", "net", "tls", "bundled-dotenv", "bundled-slugify", "bundled-lru-cache", "bundled-exponential-backoff", "bundled-events", "bundled-decimal", "bundled-dayjs", "bundled-moment", "bundled-commander", "bundled-streams", "bundled-fastify"]
+full = ["http-server", "http-client", "external-http-client-pump", "database", "crypto", "compression", "email", "websocket", "image", "scheduler", "ids", "html-parser", "rate-limit", "validation", "net", "tls", "bundled-dotenv", "bundled-slugify", "bundled-lru-cache", "bundled-exponential-backoff", "bundled-events", "bundled-decimal", "bundled-dayjs", "bundled-moment", "bundled-commander", "bundled-streams"]
 
 # Minimal core - just what's needed for basic programs
 core = []
@@ -70,14 +70,11 @@ bundled-commander = []
 
 # HTTP server (hyper-based native framework)
 # Note: dashmap is now always-on (used by core handle registry), no longer listed here.
-# `http-server` umbrella retained for backwards-compat — it now
-# transitively pulls `bundled-fastify` (v0.5.572's per-binding gate
-# the well-known flip toggles for `import 'fastify'`). The
-# `framework` module stays on `http-server` directly so it remains
-# available for non-fastify hyper users; perry-ext-fastify ships
-# its own self-contained surface.
-http-server = ["bundled-fastify", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes", "async-runtime"]
-bundled-fastify = ["dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes", "async-runtime"]
+# Gates the `framework` module (non-fastify hyper plumbing) only. fastify is no
+# longer in-stdlib — `import 'fastify'` is served exclusively by the external
+# perry-ext-fastify crate via the well-known flip (see well_known_bindings.toml);
+# perry-stdlib's per-tick bridge into it lives behind `external-fastify-pump`.
+http-server = ["dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes", "async-runtime"]
 
 # HTTP client (node-fetch, axios) — single umbrella for both. The
 # well-known flip strips this when the user imports either module
@@ -185,9 +182,9 @@ external-http-server-pump = ["async-runtime"]
 # the program exits before any callback fires. Issue #769.
 external-http-client-pump = ["async-runtime"]
 
-# Activated by `optimized_libs::build_optimized_libs` when the well-known
-# flip routes `import 'fastify'` to perry-ext-fastify (which is the
-# default path for the bundled-fastify feature). Tells perry-stdlib's
+# Activated by `optimized_libs::build_optimized_libs` whenever the well-known
+# flip routes `import 'fastify'` to perry-ext-fastify (the only fastify path —
+# the in-stdlib adapter was removed). Tells perry-stdlib's
 # `js_stdlib_process_pending` / `js_stdlib_has_active_handles` to call
 # into perry-ext-fastify's `js_fastify_process_pending` /
 # `js_fastify_has_active` externs each tick. Without this, the
@@ -249,7 +246,7 @@ bundled-mongodb = ["dep:mongodb", "dep:bson", "dep:futures-util", "async-runtime
 # bindings so the well-known flip (#466 Phase 4 step 2) can route them
 # to perry-ext-bcrypt / perry-ext-argon2 without taking the rest of
 # the crypto surface offline.
-crypto = ["dep:sha2", "dep:sha1", "dep:sha3", "dep:sha3_010", "dep:sha3-utils", "dep:rsa-sha1", "dep:md-5", "dep:hex", "dep:hmac", "dep:aes", "dep:cbc", "dep:ecb", "dep:ctr", "dep:scrypt", "dep:pbkdf2", "dep:base64", "dep:x25519-dalek", "dep:x448", "dep:ed25519-dalek", "dep:ed448-goldilocks", "dep:aes-gcm", "dep:chacha20poly1305", "dep:ghash", "dep:aes-kw", "dep:hkdf", "dep:p256", "dep:p384", "dep:p521", "dep:x509-cert", "dep:ml-kem", "async-runtime", "ids", "bundled-bcrypt", "bundled-argon2", "bundled-jsonwebtoken", "bundled-ethers"]
+crypto = ["dep:sha2", "dep:sha1", "dep:sha3", "dep:shake", "dep:sha3_010", "dep:sha3-utils", "dep:rsa-sha1", "dep:md-5", "dep:hex", "dep:hmac", "dep:aes", "dep:cbc", "dep:ecb", "dep:ctr", "dep:scrypt", "dep:pbkdf2", "dep:base64", "dep:x25519-dalek", "dep:x448", "dep:ed25519-dalek", "dep:ed448-goldilocks", "dep:aes-gcm", "dep:chacha20poly1305", "dep:ghash", "dep:aes-kw", "dep:hkdf", "dep:p256", "dep:p384", "dep:p521", "dep:x509-cert", "dep:ml-kem", "async-runtime", "ids", "bundled-bcrypt", "bundled-argon2", "bundled-jsonwebtoken", "bundled-ethers"]
 bundled-bcrypt = ["dep:bcrypt", "async-runtime"]
 bundled-argon2 = ["dep:argon2", "async-runtime"]
 bundled-jsonwebtoken = ["dep:jsonwebtoken", "dep:p256", "dep:rsa", "dep:spki"]
@@ -368,7 +365,7 @@ dashmap = "6.2"
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "http2"], default-features = false, optional = true }
 
 # WebSocket
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"], optional = true }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"], optional = true }
 futures-util = { version = "0.3", optional = true }
 
 # TLS (for net.Socket.upgradeToTLS and tls.connect) — rustls-only, no OpenSSL.
@@ -378,16 +375,18 @@ rustls-native-certs = { version = "0.8", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 
 # Database
-sqlx = { version = "0.8.6", features = ["runtime-tokio", "mysql", "postgres", "chrono"], optional = true }
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "mysql", "postgres", "chrono"], optional = true }
 redis = { version = "1.2", features = ["tokio-comp", "connection-manager"], optional = true }
-mongodb = { version = "3.7", default-features = false, features = ["compat-3-0-0", "rustls-tls", "dns-resolver"], optional = true }
-bson = { version = "2.9", optional = true }
-rusqlite = { version = "0.32.1", features = ["bundled", "column_decltype", "limits", "session"], optional = true }
+mongodb = { version = "3.7", default-features = false, features = ["bson-3", "compat-3-3-0", "rustls-tls", "dns-resolver"], optional = true }
+bson = { version = "3.1", optional = true, features = ["serde"] }
+rusqlite = { version = "0.37", features = ["bundled", "column_decltype", "limits", "session"], optional = true }
 
 # Crypto
 sha2 = { version = "0.11", optional = true }
 sha1 = { version = "0.11", optional = true }
-sha3 = { version = "0.11", optional = true }
+sha3 = { version = "0.12", optional = true }
+# SHAKE128/256 moved out of `sha3`'s root into this crate as of sha3 0.12.
+shake = { version = "0.1", optional = true }
 sha3_010 = { package = "sha3", version = "0.10", optional = true, default-features = false }
 sha3-utils = { version = "0.5", optional = true }
 rsa-sha1 = { package = "sha1", version = "0.10", optional = true }
@@ -444,7 +443,7 @@ scraper = { version = "0.27", optional = true }
 
 # Scheduler
 cron = { version = "0.16", optional = true }
-tokio-cron-scheduler = { version = "0.10", optional = true }
+tokio-cron-scheduler = { version = "0.15", optional = true }
 
 # Rate limiting
 governor = { version = "0.10", optional = true }

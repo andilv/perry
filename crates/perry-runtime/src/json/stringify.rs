@@ -11,205 +11,14 @@ use std::fmt::Write as FmtWrite;
 
 // ─── JSON.stringify ───────────────────────────────────────────────────────────
 
-/// Issue #639: emit a Buffer / Uint8Array as JSON in the Node-compatible shape.
-///
-/// `Buffer.from(...)` returns `{"type":"Buffer","data":[b0,b1,...]}` (Node's
-/// `Buffer.prototype.toJSON()` output). `new Uint8Array(...)` returns
-/// `{"0":b0,"1":b1,...}` (the typed-array shape Node falls through to with
-/// no custom `toJSON`). Distinguished via `is_uint8array_buffer`, which the
-/// Uint8Array constructor path explicitly marks (see `buffer.rs::js_uint8array_*`).
-///
-/// Must be called BEFORE `gc_obj_type(ptr)` — `BufferHeader` has no `GcHeader`,
-/// so reading 8 bytes before the header reads unrelated memory and would
-/// dispatch to the wrong arm (or panic when `is_object_pointer` deref's a
-/// bogus `keys_array` pointer).
-pub(crate) unsafe fn stringify_buffer(ptr: *const u8, buf: &mut String) {
-    let buf_ptr = ptr as *const crate::buffer::BufferHeader;
-    if buf_ptr.is_null() {
-        buf.push_str("null");
-        return;
-    }
-    let len = (*buf_ptr).length as usize;
-    let data = (buf_ptr as *const u8).add(std::mem::size_of::<crate::buffer::BufferHeader>());
-    let bytes = std::slice::from_raw_parts(data, len);
-
-    if crate::buffer::is_uint8array_buffer(ptr as usize) {
-        buf.push('{');
-        for (i, b) in bytes.iter().enumerate() {
-            if i > 0 {
-                buf.push(',');
-            }
-            buf.push('"');
-            let mut idx_buf = itoa::Buffer::new();
-            buf.push_str(idx_buf.format(i));
-            buf.push_str("\":");
-            let mut byte_buf = itoa::Buffer::new();
-            buf.push_str(byte_buf.format(*b));
-        }
-        buf.push('}');
-    } else {
-        buf.push_str(r#"{"type":"Buffer","data":["#);
-        for (i, b) in bytes.iter().enumerate() {
-            if i > 0 {
-                buf.push(',');
-            }
-            let mut byte_buf = itoa::Buffer::new();
-            buf.push_str(byte_buf.format(*b));
-        }
-        buf.push_str("]}");
-    }
-}
-
-/// Issue #5111: serialize a `TypedArrayHeader`-backed typed array (`Int8Array`
-/// … `Float64Array`, `BigInt64Array`/`BigUint64Array`, `Float16Array`, plus the
-/// `map`/`subarray`/`slice`/`filter` results) in Node's shape `{"0":v,…}`.
-///
-/// Like `stringify_buffer`, this MUST run BEFORE `gc_obj_type`: a small typed
-/// array is plain-`alloc`'d with NO `GcHeader`, so the gc-tag read 8 bytes
-/// before the header reads unrelated allocator memory and dispatches to a
-/// random arm — the SIGSEGV reported for `JSON.stringify(ta.map(...))`. Each
-/// element is funneled through `write_number`, which renders `NaN`/`±Infinity`
-/// as `null` and routes a `BigInt64`/`BigUint64` element to the throwing
-/// serializer (Node's "Do not know how to serialize a BigInt" `TypeError`).
-pub(crate) unsafe fn stringify_typed_array(ptr: *const u8, buf: &mut String) {
-    let ta = ptr as *const crate::typedarray::TypedArrayHeader;
-    let len = crate::typedarray::js_typed_array_length(ta);
-    buf.push('{');
-    for i in 0..len {
-        if i > 0 {
-            buf.push(',');
-        }
-        let mut idx_buf = itoa::Buffer::new();
-        buf.push('"');
-        buf.push_str(idx_buf.format(i));
-        buf.push_str("\":");
-        write_number(buf, crate::typedarray::js_typed_array_get(ta, i));
-    }
-    buf.push('}');
-}
-
-/// Pretty-printed (`space`-indented) form of `stringify_typed_array`, matching
-/// the layout of `stringify_buffer_pretty`'s plain-Uint8Array branch.
-pub(crate) unsafe fn stringify_typed_array_pretty(
-    ptr: *const u8,
-    buf: &mut String,
-    indent: &str,
-    depth: usize,
-) {
-    let ta = ptr as *const crate::typedarray::TypedArrayHeader;
-    let len = crate::typedarray::js_typed_array_length(ta);
-    if len <= 0 {
-        buf.push_str("{}");
-        return;
-    }
-    let push_indent = |buf: &mut String, levels: usize| {
-        for _ in 0..levels {
-            buf.push_str(indent);
-        }
-    };
-    buf.push_str("{\n");
-    for i in 0..len {
-        push_indent(buf, depth + 1);
-        let mut idx_buf = itoa::Buffer::new();
-        buf.push('"');
-        buf.push_str(idx_buf.format(i));
-        buf.push_str("\": ");
-        write_number(buf, crate::typedarray::js_typed_array_get(ta, i));
-        if i + 1 < len {
-            buf.push(',');
-        }
-        buf.push('\n');
-    }
-    push_indent(buf, depth);
-    buf.push('}');
-}
-
-/// Pretty-printed (`space`-indented) form of `stringify_buffer`. Emits the
-/// same `{type,data}` (Buffer) / `{index:byte}` (plain Uint8Array) shape as
-/// the compact version but with newlines + indentation, matching Node's
-/// `JSON.stringify(buf, null, n)`. `depth` is the indent level of the value
-/// itself (content sits at `depth + 1`, the closing brace at `depth`),
-/// mirroring `stringify_object_pretty`.
-pub(crate) unsafe fn stringify_buffer_pretty(
-    ptr: *const u8,
-    buf: &mut String,
-    indent: &str,
-    depth: usize,
-) {
-    let buf_ptr = ptr as *const crate::buffer::BufferHeader;
-    if buf_ptr.is_null() {
-        buf.push_str("null");
-        return;
-    }
-    let len = (*buf_ptr).length as usize;
-    let data = (buf_ptr as *const u8).add(std::mem::size_of::<crate::buffer::BufferHeader>());
-    let bytes = std::slice::from_raw_parts(data, len);
-
-    let push_indent = |buf: &mut String, levels: usize| {
-        for _ in 0..levels {
-            buf.push_str(indent);
-        }
-    };
-
-    if len == 0 {
-        // Empty Uint8Array -> "{}"; empty Buffer -> {"type":"Buffer","data":[]}.
-        if crate::buffer::is_uint8array_buffer(ptr as usize) {
-            buf.push_str("{}");
-        } else {
-            buf.push_str("{\n");
-            push_indent(buf, depth + 1);
-            buf.push_str("\"type\": \"Buffer\",\n");
-            push_indent(buf, depth + 1);
-            buf.push_str("\"data\": []\n");
-            push_indent(buf, depth);
-            buf.push('}');
-        }
-        return;
-    }
-
-    if crate::buffer::is_uint8array_buffer(ptr as usize) {
-        // Plain Uint8Array: { "0": b0, "1": b1, ... }
-        buf.push_str("{\n");
-        for (i, b) in bytes.iter().enumerate() {
-            push_indent(buf, depth + 1);
-            let mut idx_buf = itoa::Buffer::new();
-            buf.push('"');
-            buf.push_str(idx_buf.format(i));
-            buf.push_str("\": ");
-            let mut byte_buf = itoa::Buffer::new();
-            buf.push_str(byte_buf.format(*b));
-            if i + 1 < len {
-                buf.push(',');
-            }
-            buf.push('\n');
-        }
-        push_indent(buf, depth);
-        buf.push('}');
-    } else {
-        // Buffer: { "type": "Buffer", "data": [ b0, b1, ... ] }
-        buf.push_str("{\n");
-        push_indent(buf, depth + 1);
-        buf.push_str("\"type\": \"Buffer\",\n");
-        push_indent(buf, depth + 1);
-        buf.push_str("\"data\": [\n");
-        for (i, b) in bytes.iter().enumerate() {
-            push_indent(buf, depth + 2);
-            let mut byte_buf = itoa::Buffer::new();
-            buf.push_str(byte_buf.format(*b));
-            if i + 1 < len {
-                buf.push(',');
-            }
-            buf.push('\n');
-        }
-        push_indent(buf, depth + 1);
-        buf.push_str("]\n");
-        push_indent(buf, depth);
-        buf.push('}');
-    }
-}
-
 #[inline]
 pub(crate) unsafe fn is_object_pointer(ptr: *const u8) -> bool {
+    // A small-handle-band id (revocable-Proxy id, fetch/zlib/stream handle) is
+    // never a real ObjectHeader; reading its `keys_array` field would deref
+    // unmapped memory (#4904/#1843 pattern). Reject by magnitude before any load.
+    if crate::value::addr_class::is_handle_band(ptr as usize) {
+        return false;
+    }
     let obj = ptr as *const crate::ObjectHeader;
     let potential_keys_ptr = (*obj).keys_array as u64;
     let top_16_bits = potential_keys_ptr >> 48;
@@ -268,6 +77,18 @@ pub(crate) unsafe fn write_number(buf: &mut String, value: f64) {
     // reaches here (test262 JSON/stringify/value-bigint `{x: 0n}`).
     if (value.to_bits() & 0xFFFF_0000_0000_0000) == BIGINT_TAG {
         serialize_bigint(value, buf);
+        return;
+    }
+    // An int32 is NaN-boxed (INT32_TAG = 0x7FFE); its bits ARE an IEEE NaN, so it
+    // would otherwise fall into the `is_nan()` → "null" arm below and silently
+    // drop the value. Decode and emit the signed integer. Integer columns from
+    // the sqlite binding (and other int32-tagged numbers) funnel here; numeric
+    // literals are stored as plain f64 doubles by codegen and never take this
+    // branch. Mirrors the BigInt funnel above.
+    if (value.to_bits() & 0xFFFF_0000_0000_0000) == INT32_TAG {
+        let n = (value.to_bits() & INT32_MASK) as u32 as i32;
+        let mut itoa_buf = itoa::Buffer::new();
+        buf.push_str(itoa_buf.format(n));
         return;
     }
     // #2089: a Date is now a NaN-boxed `DateCell` pointer, handled in
@@ -443,10 +264,22 @@ pub(crate) unsafe fn bigint_apply_to_json(value: f64) -> Option<f64> {
     let value_handle = scope.root_nanbox_f64(value);
     let key = js_string_from_bytes(b"toJSON".as_ptr(), 6);
     let key_handle = scope.root_string_ptr(key);
+    // `GetV(value, "toJSON")` (spec) resolves "toJSON" on `BigInt.prototype`
+    // but the accessor's `this` must be the BigInt VALUE, not the prototype
+    // object `js_object_get_field_by_name` derives its receiver from.
+    // `accessor_receiver_override_begin` is the same one-shot override
+    // `resolve_inherited_field` uses for inherited-getter receivers; stash
+    // the real BigInt value so a `toJSON` installed via
+    // `Object.defineProperty(BigInt.prototype, "toJSON", { get() {...} })`
+    // observes the correct receiver (test262
+    // JSON/stringify/value-bigint-tojson-receiver).
+    let prev_override =
+        crate::object::accessor_receiver_override_begin(value_handle.get_nanbox_f64());
     let method = crate::object::js_object_get_field_by_name(
         proto_ptr,
         key_handle.get_raw_const_ptr::<crate::string::StringHeader>(),
     );
+    crate::object::accessor_receiver_override_end(prev_override);
     let method_bits = method.bits();
     if (method_bits & 0xFFFF_0000_0000_0000) != POINTER_TAG {
         return None;
@@ -504,8 +337,28 @@ pub(crate) unsafe fn is_closure_value(bits: u64) -> bool {
             return false;
         }
         // Check for ClosureHeader magic at offset 8 (type_tag field)
-        let type_tag = *((ptr as *const u8).add(12) as *const u32);
+        let type_tag =
+            *((ptr as *const u8).add(crate::closure::CLOSURE_TYPE_TAG_OFFSET) as *const u32);
         type_tag == crate::closure::CLOSURE_MAGIC
+    } else {
+        false
+    }
+}
+
+/// Check if a NaN-boxed value is a Symbol. Per ECMA-262 `SerializeJSONProperty`
+/// step 11, a Symbol is unserializable — treated exactly like a function
+/// (omitted from objects, `null` in arrays, `undefined` at the top level).
+/// Symbols are POINTER_TAG'd (`js_is_symbol`) but allocated as `GC_TYPE_STRING`
+/// (see `symbol.rs::alloc_symbol`) — without this check, a Symbol reaching the
+/// generic `GC_TYPE_STRING` dispatch has its `SymbolHeader` bytes misread as a
+/// `StringHeader` (test262 JSON/stringify/value-symbol).
+#[inline]
+pub(crate) unsafe fn is_symbol_value(bits: u64) -> bool {
+    if let Some(ptr) = extract_pointer(bits) {
+        if crate::value::addr_class::is_handle_band(ptr as usize) {
+            return false;
+        }
+        crate::symbol::is_registered_symbol(ptr as usize)
     } else {
         false
     }
@@ -598,20 +451,55 @@ pub(crate) unsafe fn object_get_to_json(ptr: *const u8) -> Option<f64> {
     Some(result)
 }
 
+/// Check if an array has an own `toJSON` method (an expando property, e.g.
+/// `arr.toJSON = function() {...}`, stored in the array-named-property side
+/// table since an `ArrayHeader` has no `keys_array`) — the array analog of
+/// `object_get_to_json`. Per ECMA-262 §25.5.2.2, `SerializeJSONProperty` step
+/// 2 applies to ANY object, including arrays, BEFORE the `IsArray` check
+/// (step 10) that would otherwise route straight into `SerializeJSONArray`
+/// (test262 JSON/stringify/value-tojson-result,
+/// value-tojson-array-circular). Returns `None` when there's no callable own
+/// `toJSON` (the caller then serializes the array's elements normally).
+#[inline]
+pub(crate) unsafe fn array_get_to_json(arr: *const crate::ArrayHeader) -> Option<f64> {
+    // One-shot suppression — see `object_get_to_json`.
+    if SUPPRESS_NEXT_TO_JSON.with(|c| c.replace(false)) {
+        return None;
+    }
+    let method = crate::array::array_named_property_get_by_name(arr, "toJSON")?;
+    let method_bits = method.to_bits();
+    if (method_bits & 0xFFFF_0000_0000_0000) != POINTER_TAG {
+        return None;
+    }
+    let method_ptr = (method_bits & POINTER_MASK) as usize;
+    if !crate::closure::is_closure_ptr(method_ptr) {
+        return None;
+    }
+    let recv = f64::from_bits(make_pointer_bits(arr as *const u8));
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let recv_handle = scope.root_nanbox_f64(recv);
+    let empty_str = js_string_from_bytes(b"".as_ptr(), 0);
+    let key_f64_arg = f64::from_bits(STRING_TAG | (empty_str as u64 & POINTER_MASK));
+    let prev_this = crate::object::js_implicit_this_set(recv_handle.get_nanbox_f64());
+    let result = crate::closure::js_native_call_value(f64::from_bits(method_bits), &key_f64_arg, 1);
+    crate::object::js_implicit_this_set(prev_this);
+    Some(result)
+}
+
 /// Serialize the RESULT of a `toJSON` call. Per ECMA-262 §25.5.2.2, `toJSON`
 /// runs at most once per value: the returned value is then serialized as an
 /// ordinary object/array WITHOUT re-invoking `toJSON` on it (only its child
-/// properties get their own `toJSON` applied). When the result is an OBJECT we
-/// arm the one-shot `SUPPRESS_NEXT_TO_JSON` guard so the result object's own
-/// probe is skipped, then always disarm it afterward so a result that never
-/// reaches an `object_get_to_json` probe (a plain `class_id == 0` literal with
-/// no own `toJSON` field) can't leak the flag onto an unrelated later object.
-/// Array/primitive results need no guard (arrays don't probe `toJSON` at the
-/// array level; their elements correctly re-apply per-property).
+/// properties get their own `toJSON` applied). When the result is an OBJECT
+/// *or* ARRAY we arm the one-shot `SUPPRESS_NEXT_TO_JSON` guard so the
+/// result's own probe (`object_get_to_json` / `array_get_to_json`) is
+/// skipped, then always disarm it afterward so a result that never reaches
+/// either probe (a plain `class_id == 0` literal with no own `toJSON` field)
+/// can't leak the flag onto an unrelated later object/array.
 #[inline]
 pub(crate) unsafe fn arm_to_json_result_guard(result: f64) {
     if let Some(res_ptr) = extract_pointer(result.to_bits()) {
-        if gc_obj_type(res_ptr) == crate::gc::GC_TYPE_OBJECT
+        let ty = gc_obj_type(res_ptr);
+        if (ty == crate::gc::GC_TYPE_OBJECT || ty == crate::gc::GC_TYPE_ARRAY)
             && !crate::buffer::is_registered_buffer(res_ptr as usize)
         {
             SUPPRESS_NEXT_TO_JSON.with(|c| c.set(true));
@@ -667,11 +555,13 @@ pub(crate) unsafe fn stringify_value(value: f64, type_hint: u32, buf: &mut Strin
     }
 
     if let Some(ptr) = extract_pointer(bits) {
-        // #2154 — see stringify_value_depth: skip native handle ids (small
-        // POINTER_TAG values) that aren't real heap objects, so JSON.stringify
-        // of an object holding e.g. an `http.Agent` emits `null` instead of
-        // segfaulting on a low-memory deref.
-        if (ptr as usize) < 0x1000 {
+        // #2154 — see stringify_value_depth: skip native handle ids that aren't
+        // real heap objects, so JSON.stringify of an object holding e.g. an
+        // `http.Agent`, a fetch/zlib/stream handle, or a revocable-Proxy id
+        // emits `null` instead of segfaulting on the ArrayHeader/keys_array
+        // deref below. The whole small-handle band `[0, 0x100000)` is bogus, not
+        // just the `< 0x1000` low guard (#4904/#1843).
+        if crate::value::addr_class::is_handle_band(ptr as usize) {
             buf.push_str("null");
             return;
         }
@@ -679,6 +569,16 @@ pub(crate) unsafe fn stringify_value(value: f64, type_hint: u32, buf: &mut Strin
         // `Object(1n)`) serializes as its underlying primitive, not the empty
         // wrapper object (which produced `{}`). Recurse on the unwrapped value.
         if let Some(prim) = crate::builtins::boxed_primitive_json_value(value) {
+            // An own `toJSON` expando on the wrapper itself (`str.toJSON =
+            // fn`) must be honored BEFORE the primitive unwrap — a boxed
+            // primitive is a real `ObjectHeader` and can carry one (test262
+            // JSON/stringify/value-tojson-result).
+            if let Some(to_json_val) = object_get_to_json(ptr) {
+                arm_to_json_result_guard(to_json_val);
+                stringify_value(to_json_val, TYPE_UNKNOWN, buf);
+                SUPPRESS_NEXT_TO_JSON.with(|c| c.set(false));
+                return;
+            }
             stringify_value(prim, TYPE_UNKNOWN, buf);
             return;
         }
@@ -738,6 +638,14 @@ pub(crate) unsafe fn stringify_value(value: f64, type_hint: u32, buf: &mut Strin
             stringify_typed_array(ptr, buf);
             return;
         }
+        // A Symbol is POINTER_TAG'd but allocated as GC_TYPE_STRING (see
+        // `is_symbol_value`) — detect it before the GC-tag dispatch below,
+        // which would otherwise misread its SymbolHeader bytes as a
+        // StringHeader (test262 JSON/stringify/value-symbol).
+        if is_symbol_value(bits) {
+            buf.push_str("null");
+            return;
+        }
 
         // Prefer the GC header's obj_type tag for dispatch — the old
         // capacity heuristic (`cap < 10000`) misidentified legitimate
@@ -745,6 +653,12 @@ pub(crate) unsafe fn stringify_value(value: f64, type_hint: u32, buf: &mut Strin
         // `JSON.stringify(arr)` where `arr.length >= 10000` (issue #43).
         match gc_obj_type(ptr) {
             crate::gc::GC_TYPE_ARRAY => stringify_array(ptr, buf),
+            // A function has no ordinary object/array/string/error/map/set
+            // layout; without this arm it falls into the untagged-pointer
+            // fallback below and its ClosureHeader bytes get misread as an
+            // ObjectHeader/ArrayHeader/StringHeader (test262
+            // JSON/stringify/value-function).
+            crate::gc::GC_TYPE_CLOSURE => buf.push_str("null"),
             crate::gc::GC_TYPE_OBJECT => {
                 if crate::node_stream::try_stringify_node_stream_json(ptr, buf) {
                     return;
@@ -897,18 +811,28 @@ pub(crate) unsafe fn stringify_value_depth(
 
     if let Some(ptr) = extract_pointer(bits) {
         // #2154 — a POINTER_TAG value can carry a native *handle id* (a small
-        // integer like `2`, e.g. an `http.Agent` placed in an object literal)
-        // rather than a real heap pointer. Such values aren't JSON-serializable
-        // and dereferencing them (gc_obj_type → is_object_pointer / array probe)
-        // segfaults. Emit `null`, the same way closures are dropped. Real heap
-        // objects live far above this low-memory guard (matches gc_obj_type).
-        if (ptr as usize) < 0x1000 {
+        // integer like `2`, e.g. an `http.Agent` in an object literal, a fetch/
+        // zlib/stream handle, or a revocable-Proxy id) rather than a real heap
+        // pointer. Such values aren't JSON-serializable and dereferencing them
+        // (gc_obj_type → is_object_pointer / array probe) segfaults. Emit `null`,
+        // the same way closures are dropped. The whole small-handle band
+        // `[0, 0x100000)` is bogus, not just the `< 0x1000` low guard
+        // (#4904/#1843 — a Proxy id at 0xF0005 crashed Next.js render).
+        if crate::value::addr_class::is_handle_band(ptr as usize) {
             buf.push_str("null");
             return;
         }
         // #3857: a boxed primitive wrapper serializes as its underlying
         // primitive (see the matching branch in `stringify_value`).
         if let Some(prim) = crate::builtins::boxed_primitive_json_value(value) {
+            // An own `toJSON` expando — see the matching branch in
+            // `stringify_value`.
+            if let Some(to_json_val) = object_get_to_json(ptr) {
+                arm_to_json_result_guard(to_json_val);
+                stringify_value_depth(to_json_val, TYPE_UNKNOWN, buf, depth);
+                SUPPRESS_NEXT_TO_JSON.with(|c| c.set(false));
+                return;
+            }
             stringify_value_depth(prim, TYPE_UNKNOWN, buf, depth);
             return;
         }
@@ -961,9 +885,16 @@ pub(crate) unsafe fn stringify_value_depth(
             stringify_typed_array(ptr, buf);
             return;
         }
+        // A Symbol — see the matching branch in `stringify_value`.
+        if is_symbol_value(bits) {
+            buf.push_str("null");
+            return;
+        }
         match gc_obj_type(ptr) {
             crate::gc::GC_TYPE_OBJECT => stringify_object_inner(ptr, buf, depth),
             crate::gc::GC_TYPE_ARRAY => stringify_array_depth(ptr, buf, depth),
+            // A function — see the matching branch in `stringify_value`.
+            crate::gc::GC_TYPE_CLOSURE => buf.push_str("null"),
             crate::gc::GC_TYPE_STRING => {
                 let str_ptr = ptr as *const StringHeader;
                 if let Some(s) = str_from_header(str_ptr) {
@@ -1186,13 +1117,23 @@ pub(crate) unsafe fn stringify_object_inner(ptr: *const u8, buf: &mut String, de
                 std::ptr::null()
             };
             // #2154 — a POINTER_TAG field can be a native *handle id* (a small
-            // integer, e.g. an `http.Agent` stored in an object literal), not a
-            // real heap pointer. Reading the CLOSURE_MAGIC tag at offset 12 of
-            // such a value segfaults. Skip anything in the low-memory guard
-            // range (matches gc_obj_type); real closures live far above it.
-            if (ptr_candidate as usize) >= 0x1000 {
-                let type_tag = *(ptr_candidate.add(12) as *const u32);
-                if type_tag == crate::closure::CLOSURE_MAGIC {
+            // integer, e.g. an `http.Agent` in an object literal, a fetch/zlib/
+            // stream handle, or a revocable-Proxy id), not a real heap pointer.
+            // Reading the CLOSURE_MAGIC tag at offset 12 of such a value
+            // segfaults. Skip the whole small-handle band `[0, 0x100000)` — not
+            // just the `< 0x1000` low guard (#4904/#1843 — a Proxy id at 0xF000D
+            // in a Next.js render object crashed exactly here). Real closures
+            // live far above the band.
+            if crate::value::addr_class::is_above_handle_band(ptr_candidate as usize) {
+                let type_tag =
+                    *(ptr_candidate.add(crate::closure::CLOSURE_TYPE_TAG_OFFSET) as *const u32);
+                // A Symbol-valued field must also be dropped (test262
+                // JSON/stringify/value-symbol): a Symbol is POINTER_TAG'd but
+                // not a closure, so it needs its own probe alongside the
+                // CLOSURE_MAGIC check.
+                if type_tag == crate::closure::CLOSURE_MAGIC
+                    || crate::symbol::is_registered_symbol(ptr_candidate as usize)
+                {
                     found = true;
                     break;
                 }
@@ -1272,10 +1213,11 @@ pub(crate) unsafe fn stringify_object_inner(ptr: *const u8, buf: &mut String, de
         if field_bits == TAG_UNDEFINED {
             continue;
         }
-        // Skip closures per JSON spec (only possible for pointer-tagged values).
-        // Guarded by has_closure_field: if no field is a closure, the in-loop
-        // check is skipped entirely for every field.
-        if has_closure_field && is_closure_value(field_bits) {
+        // Skip closures and Symbols per JSON spec (only possible for
+        // pointer-tagged values). Guarded by has_closure_field: if no field
+        // is a closure/Symbol, the in-loop check is skipped entirely for
+        // every field.
+        if has_closure_field && (is_closure_value(field_bits) || is_symbol_value(field_bits)) {
             continue;
         }
 
@@ -1293,9 +1235,14 @@ pub(crate) unsafe fn stringify_object_inner(ptr: *const u8, buf: &mut String, de
             key_bits as *const StringHeader
         };
         if let Some(key_str) = str_from_header(key_ptr) {
-            buf.push('"');
-            buf.push_str(key_str);
-            buf.push_str("\":");
+            // A key can itself contain `"`/`\`/control characters (e.g. a
+            // `Symbol`-adjacent computed key or `Object.defineProperty`
+            // literal name) — must go through the same escaper as string
+            // values, not a raw `push_str` (test262
+            // JSON/stringify/value-string-escape-ascii, where the property
+            // name embeds all 32 ASCII control characters).
+            write_escaped_string(buf, key_str);
+            buf.push(':');
         } else {
             let _ = write!(buf, "\"field{}\":", f);
         }
@@ -1606,7 +1553,7 @@ pub(crate) unsafe fn try_emit_shape_element(
         }
         if (fb & 0xFFFF_0000_0000_0000) == POINTER_TAG {
             has_pointer_fields = true;
-            if is_closure_value(fb) {
+            if is_closure_value(fb) || is_symbol_value(fb) {
                 return false;
             }
         }
@@ -1675,6 +1622,17 @@ pub(crate) unsafe fn stringify_array_depth(ptr: *const u8, buf: &mut String, dep
         buf.push_str("[]");
         return;
     }
+    // An own `toJSON` (SerializeJSONProperty step 2) runs BEFORE the
+    // IsArray/SerializeJSONArray dispatch — see `array_get_to_json`. Must run
+    // before the circular-stack push below: a `toJSON` result that re-enters
+    // an array still open on the stack (test262 value-tojson-array-circular)
+    // needs that still-open entry to trip the check.
+    if let Some(to_json_val) = array_get_to_json(arr) {
+        arm_to_json_result_guard(to_json_val);
+        stringify_value(to_json_val, TYPE_UNKNOWN, buf);
+        SUPPRESS_NEXT_TO_JSON.with(|c| c.set(false));
+        return;
+    }
     // Circular-reference detection (ECMA-262 25.5.2 SerializeJSONArray step
     // 1-2). Unlike objects, the compact array path does NOT bump `depth`, so
     // an all-array cycle (`a=[]; a.push(a)`) would otherwise recurse until the
@@ -1712,6 +1670,10 @@ pub(crate) unsafe fn stringify_array_depth(ptr: *const u8, buf: &mut String, dep
             first_bits as *const u8
         };
         if (tag == POINTER_TAG || is_raw_pointer(first_bits))
+            // A small-handle-band id (Proxy id, fetch/zlib/stream handle) is not
+            // an object; building a shape template from it would deref unmapped
+            // memory (#4904/#1843). Fall through to per-element handling.
+            && !crate::value::addr_class::is_handle_band(first_ptr as usize)
             // #2089: a Date element is a small `DateCell`, not an object with a
             // `keys_array` — don't build an object-shape template from it.
             && !crate::date::is_date_cell_addr((first_bits & POINTER_MASK) as usize)
@@ -1790,9 +1752,37 @@ pub(crate) unsafe fn stringify_array_depth(ptr: *const u8, buf: &mut String, dep
             } else {
                 elem_bits as *const u8
             };
+            // A small-handle-band element (revocable-Proxy id, fetch/zlib/stream
+            // handle) is not a serializable heap value; the `gc_obj_type` /
+            // `is_object_pointer` / ArrayHeader-length probes below would deref
+            // unmapped memory. Emit "null" before any load (#4904/#1843 — a
+            // Proxy element in a Next.js render array crashed exactly here).
+            if crate::value::addr_class::is_handle_band(elem_ptr as usize) {
+                buf.push_str("null");
+                continue;
+            }
+            // A function or Symbol element serializes as `null` (ECMA-262
+            // SerializeJSONArray step 8b — SerializeJSONProperty returns
+            // `undefined` for both, and the array walk substitutes `null`).
+            // Neither has a `GC_TYPE_ARRAY`/`GC_TYPE_OBJECT`/`GC_TYPE_STRING`
+            // shape, so without this check they fall into the `gc_obj_type`
+            // match's catch-all below and get misread as an object/string
+            // (test262 JSON/stringify/value-function, value-symbol).
+            if is_closure_value(elem_bits) || is_symbol_value(elem_bits) {
+                buf.push_str("null");
+                continue;
+            }
             // #3857: a boxed primitive wrapper element serializes as its
             // underlying primitive, not the empty wrapper object.
             if let Some(prim) = crate::builtins::boxed_primitive_json_value(elem) {
+                // An own `toJSON` expando — see the matching branch in
+                // `stringify_value` (test262 JSON/stringify/value-tojson-result).
+                if let Some(to_json_val) = object_get_to_json(elem_ptr) {
+                    arm_to_json_result_guard(to_json_val);
+                    stringify_value_depth(to_json_val, TYPE_UNKNOWN, buf, depth);
+                    SUPPRESS_NEXT_TO_JSON.with(|c| c.set(false));
+                    continue;
+                }
                 stringify_value_depth(prim, TYPE_UNKNOWN, buf, depth);
                 continue;
             }
@@ -1873,6 +1863,11 @@ pub(crate) unsafe fn stringify_array_depth(ptr: *const u8, buf: &mut String, dep
 pub(crate) unsafe fn estimate_json_size(value: f64, type_hint: u32) -> usize {
     let bits = value.to_bits();
     if let Some(ptr) = extract_pointer(bits) {
+        // A small-handle-band id is not a heap object; reading its ArrayHeader
+        // length would deref unmapped memory. Use the scalar estimate.
+        if crate::value::addr_class::is_handle_band(ptr as usize) {
+            return 4096;
+        }
         if type_hint == TYPE_ARRAY || (!is_object_pointer(ptr) && type_hint != TYPE_OBJECT) {
             let arr = ptr as *const crate::ArrayHeader;
             let len = (*arr).length as usize;

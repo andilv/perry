@@ -24,6 +24,37 @@ pub struct Module {
     pub globals: Vec<Global>,
     /// Function definitions
     pub functions: Vec<Function>,
+    /// #5579: names + FuncIds of bare top-level `function` declarations, in
+    /// source order. For a *Script* (a non-ESM entry program), these become
+    /// own properties of the global object per GlobalDeclarationInstantiation,
+    /// so `Object.prototype.hasOwnProperty.call(globalThis, name)` is true.
+    /// ESM modules (imports/exports/top-level await) do NOT reflect. Codegen
+    /// consumes this in the entry-module branch to emit the `globalThis[name]
+    /// = <fn>` stores. Only `hir.functions` carries nested closures and
+    /// object-literal methods too, which must NOT be reflected — hence this
+    /// dedicated list populated only at the top-level statement site.
+    pub script_global_functions: Vec<(String, FuncId)>,
+    /// #5579: true iff this module's source references the `globalThis`
+    /// identifier. Codegen reflects `script_global_functions` onto the global
+    /// object only when this holds — otherwise the reflection is unobservable
+    /// (no code reads the global object's function properties) and would only
+    /// add dynamic-property-helper calls to module init for pure programs. Set
+    /// at lowering from the installed module source.
+    pub references_global_this: bool,
+    /// #5848: names of Annex B block-nested top-level `function`
+    /// declarations (`{ function f(){} }`, `if (c) function f(){}`,
+    /// `switch (x) { case 1: function f(){} }`, directly in sloppy global
+    /// code) that need an early `undefined`-valued, non-configurable global
+    /// property — GlobalDeclarationInstantiation's `CreateGlobalVarBinding`
+    /// (B.3.3.2 step 5.b.i) runs before any top-level statement executes, so
+    /// the property must already exist (as `undefined`) ahead of the block
+    /// that later assigns the real function. Excludes names already covered
+    /// by a same-named bare top-level function declaration (already
+    /// reflected with its real value via `script_global_functions`). Codegen
+    /// emits these unconditionally for a non-ESM entry program (not gated on
+    /// `references_global_this`: the pattern is rare enough that the extra
+    /// reflection call is not a meaningful per-program cost).
+    pub annexb_global_undefined_names: Vec<String>,
     /// Top-level statements to execute
     pub init: Vec<Stmt>,
     /// Exported native module instances: (export_name, module_name, class_name)
@@ -83,6 +114,15 @@ pub struct Module {
     /// Keyed by the closure/function's HIR FuncId; consumed by codegen
     /// when emitting `js_register_function_name` calls.
     pub closure_display_names: std::collections::HashMap<perry_types::FuncId, String>,
+    /// #5592: user-visible `.name` overrides for classes whose HIR
+    /// registration key differs from their JS name. The only producer
+    /// today is a second anonymous class expression assigned to a binding
+    /// already claimed by an earlier one (`C = class {}; C = class {}`):
+    /// both infer the name `"C"`, so the second is registered under a
+    /// uniquified key to get its own ClassId, and its true `.name` (`"C"`)
+    /// is recorded here. Keyed by ClassId; consumed by codegen when
+    /// emitting `js_register_class_name`.
+    pub class_display_names: std::collections::HashMap<crate::ClassId, String>,
     /// #4101: original source text for each user function, keyed by HIR
     /// FuncId. Populated at lowering by slicing the module source against the
     /// AST span of every function declaration / expression / arrow. Consumed
@@ -124,6 +164,9 @@ impl Module {
             enums: Vec::new(),
             globals: Vec::new(),
             functions: Vec::new(),
+            script_global_functions: Vec::new(),
+            references_global_this: false,
+            annexb_global_undefined_names: Vec::new(),
             init: Vec::new(),
             exported_native_instances: Vec::new(),
             exported_func_return_native_instances: Vec::new(),
@@ -138,6 +181,7 @@ impl Module {
             init_kind: ModuleInitKind::Eager,
             async_step_closures: std::collections::HashSet::new(),
             closure_display_names: std::collections::HashMap::new(),
+            class_display_names: std::collections::HashMap::new(),
             closure_source_text: std::collections::HashMap::new(),
             async_generator_funcs: std::collections::HashSet::new(),
             gen_param_prologue_len: std::collections::HashMap::new(),

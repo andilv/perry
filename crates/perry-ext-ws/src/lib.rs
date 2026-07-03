@@ -25,6 +25,14 @@
 //! enough for typical WebSocket usage. Cooperative `spawn_async` is
 //! a v0.6.0 followup.
 
+/// SIMD-widened WebSocket frame (un)masking (RFC 6455 §5.3). See
+/// [`mask::apply_mask`] / [`mask::apply_mask_from`]. The hot tungstenite
+/// read/write path masks internally with its own `u32`-blocked routine
+/// (private, no injection seam), so this module is the masker for any
+/// frame bytes perry handles itself — kept byte-identical to the scalar
+/// reference and validated by a property test.
+pub mod mask;
+
 use futures_util::{SinkExt, StreamExt};
 use lazy_static::lazy_static;
 use perry_ffi::{
@@ -515,7 +523,11 @@ pub unsafe extern "C" fn js_ws_wait_for_message(handle: i64, timeout_ms: f64) ->
         if start.elapsed() >= timeout {
             return std::ptr::null_mut();
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        // Unified single-thread model: the WS reader task only advances while the
+        // main thread drives the runtime, so drive one bounded tick here (which
+        // runs the reader and delivers messages) instead of `std::thread::sleep`,
+        // which would block this thread and never let a message arrive.
+        perry_ffi::run_pending(10);
     }
 }
 

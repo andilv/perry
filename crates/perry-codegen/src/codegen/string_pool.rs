@@ -107,6 +107,9 @@ pub(super) fn emit_string_pool(
     class_keys_init_data: &[(String, String, u32, Vec<u64>, Vec<u64>)],
     class_ids: &HashMap<String, u32>,
     classes: &HashMap<String, &perry_hir::Class>,
+    // #5592: user-visible `.name` overrides keyed by ClassId, for classes
+    // whose HIR registration key was uniquified away from their JS name.
+    class_display_names: &HashMap<u32, String>,
     // Wall 51: per-class standalone-constructor arity, accounting for the
     // synthesized `super(...args)` forwarding ctor a no-own-ctor class with
     // heritage inherits (its arity comes from the nearest ancestor ctor, which
@@ -259,7 +262,13 @@ pub(super) fn emit_string_pool(
                 _ => continue,
             };
             if !class_name.starts_with("__AnonShape_") {
-                named.push((cid, class_name.clone()));
+                // #5592: prefer the recorded JS name when the registration
+                // key was uniquified (e.g. a second `C = class {…}`).
+                let js_name = class_display_names
+                    .get(&cid)
+                    .cloned()
+                    .unwrap_or_else(|| class_name.clone());
+                named.push((cid, js_name));
             }
         }
         named.sort_by_key(|a| a.0);
@@ -344,7 +353,16 @@ pub(super) fn emit_string_pool(
         };
         let handle = blk.call(I64, from_bytes_fn, &[(PTR, &bytes_ref), (I32, &len_str)]);
         let nanboxed = blk.call(DOUBLE, "js_nanbox_string", &[(I64, &handle)]);
-        crate::expr::emit_root_nanbox_store_on_block(blk, &nanboxed, &handle_ref);
+        // Plain store, no remembered-set write barrier: the handle slot is
+        // registered as a permanent global root on the very next line (always
+        // scanned by every GC, minor and major), so a remembered-set entry is
+        // redundant. No allocation runs between the store and the registration,
+        // so the fresh string can't be collected in the gap. This is one-time
+        // module init; emitting `js_write_barrier_root_nanbox` here added one
+        // barrier per interned string for no GC benefit (and tripped the
+        // native-region-proof `write_barriers_static` budget — the barriers
+        // landed in `__perry_init_strings_*`, never the hot path).
+        blk.store(DOUBLE, &nanboxed, &handle_ref);
         let addr_i64 = blk.ptrtoint(&handle_ref, I64);
         blk.call_void("js_gc_register_global_root", &[(I64, &addr_i64)]);
     }

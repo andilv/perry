@@ -50,87 +50,6 @@ pub fn closure_is_key_deleted(ptr: usize, key: &str) -> bool {
         .unwrap_or(false)
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// #5437 (Next.js W6): module-default-export WRAPPER-closure registry.
-//
-// Some imported module-default-export VALUE reads (`const uw = require('S')`
-// for a CJS module) materialize as a 0-capture *wrapper closure* whose
-// `func_ptr` forwards to the module's default-export getter
-// (`perry_fn_<src>__default`), which returns `module.exports`. When such a
-// wrapper is then CAPTURED by-value (e.g. into a class's `__perry_cap_*`
-// field) and a member is read off the captured snapshot
-// (`uw.SharedCacheControls`), the read hits the closure itself (a function
-// value) rather than `module.exports`, so the property is `undefined` and
-// `new uw.SharedCacheControls()` throws "undefined is not a constructor".
-//
-// Codegen registers each such wrapper's `func_ptr` here at the wrapper's
-// value-read site (see `js_register_module_default_wrapper_value`). The
-// property-read fallback in `js_object_get_field_by_name` then recognizes a
-// REGISTERED wrapper closure on a property miss, calls it once
-// (`js_closure_call0`) to obtain `module.exports`, and re-reads the property
-// off that object. The registry is keyed by `func_ptr` so it is robust to the
-// many closure-singleton/capture paths that can produce the wrapper — only
-// wrappers explicitly registered by codegen are ever auto-called, so an
-// arbitrary user closure on a property miss is never invoked.
-static MODULE_DEFAULT_WRAPPER_FUNCPTRS: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
-
-fn module_default_wrapper_funcptrs() -> &'static Mutex<HashSet<usize>> {
-    MODULE_DEFAULT_WRAPPER_FUNCPTRS.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-/// Codegen-emitted, value-threading variant: register `value` (a NaN-boxed
-/// JSValue from a module-default-export getter `perry_fn_<src>__default()`) as a
-/// module-default wrapper IF it is a closure, then return it unchanged. Used at
-/// the `imported_vars` getter site for `origin_suffix == "default"` reads, where
-/// a CJS module whose exports are built via `Object.defineProperty(exports, …)`
-/// yields a WRAPPER CLOSURE from the default getter rather than the exports
-/// object. Registering the actual closure's `func_ptr` (whatever it is) makes
-/// the property-read fallback recognize a captured snapshot of it.
-#[no_mangle]
-pub extern "C" fn js_register_module_default_wrapper_value(value: f64) -> f64 {
-    let bits = value.to_bits();
-    // Only POINTER-tagged values can be closures.
-    const POINTER_TAG: u64 = 0x7FFD_0000_0000_0000;
-    const POINTER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
-    if (bits & !POINTER_MASK) == POINTER_TAG {
-        let ptr = (bits & POINTER_MASK) as usize;
-        if is_closure_ptr(ptr) {
-            let func_ptr = unsafe { (*(ptr as *const ClosureHeader)).func_ptr as usize };
-            if func_ptr != 0 {
-                if let Ok(mut set) = module_default_wrapper_funcptrs().lock() {
-                    set.insert(func_ptr);
-                }
-            }
-        }
-    }
-    value
-}
-
-/// True if the closure at `ptr` is a REGISTERED module-default-export wrapper
-/// (its `func_ptr` was registered via `js_register_module_default_wrapper_value`).
-pub fn is_module_default_wrapper(ptr: usize) -> bool {
-    if !is_closure_ptr(ptr) {
-        return false;
-    }
-    let func_ptr = unsafe { (*(ptr as *const ClosureHeader)).func_ptr as usize };
-    module_default_wrapper_funcptrs()
-        .lock()
-        .ok()
-        .map(|set| set.contains(&func_ptr))
-        .unwrap_or(false)
-}
-
-/// Call a registered module-default wrapper closure (`ptr`) and return its
-/// result — `module.exports` for the wrapped module. Returns `None` if `ptr`
-/// is not a registered wrapper closure.
-pub fn module_default_wrapper_exports(ptr: usize) -> Option<f64> {
-    if !is_module_default_wrapper(ptr) {
-        return None;
-    }
-    let closure = ptr as *const ClosureHeader;
-    Some(crate::closure::js_closure_call0(closure))
-}
-
 /// True if `prop` is an OWN dynamic property of the closure at `ptr` (does NOT
 /// walk the static-prototype chain, unlike `closure_get_dynamic_prop`). Used
 /// by `hasOwnProperty`/`getOwnPropertyNames` to report own user props and the
@@ -416,7 +335,7 @@ pub fn is_closure_ptr(ptr: usize) -> bool {
         return false;
     }
     unsafe {
-        let type_tag = *((ptr as *const u8).add(12) as *const u32);
+        let type_tag = *((ptr as *const u8).add(CLOSURE_TYPE_TAG_OFFSET) as *const u32);
         type_tag == CLOSURE_MAGIC
     }
 }
@@ -559,80 +478,139 @@ pub fn closure_get_dynamic_prop(ptr: usize, prop: &str) -> f64 {
         break;
     }
     // Every function's [[Prototype]] is %Function.prototype% — an expando
-    // installed there (`Function.prototype.property = 12`) must be readable
-    // through any closure (`fn.property`, `boundFn.property`,
-    // `Function.indicator`). Synthesized own slots (`prototype`/`name`/
-    // `length`/`caller`/`arguments`/`constructor`) never come from the
-    // expando walk; excluding `prototype` also breaks the recursion through
-    // `builtin_prototype_value` (which reads `Function.prototype` via this
-    // very function). A re-entrancy guard covers the rest of that resolution
-    // cycle.
-    if !matches!(
-        prop,
-        "prototype" | "name" | "length" | "caller" | "arguments" | "constructor"
-    ) && !prop.as_bytes().first().is_some_and(|b| b.is_ascii_digit())
-    {
-        thread_local! {
-            static IN_FN_PROTO_FALLBACK: std::cell::Cell<bool> =
-                const { std::cell::Cell::new(false) };
-        }
-        let reentrant = IN_FN_PROTO_FALLBACK.with(|c| c.replace(true));
-        if !reentrant {
-            let proto_val = crate::object::builtin_prototype_value("Function");
-            IN_FN_PROTO_FALLBACK.with(|c| c.set(false));
-            let proto_jv = crate::value::JSValue::from_bits(proto_val.to_bits());
-            if proto_jv.is_pointer() {
-                let proto_ptr = (proto_jv.bits() & crate::value::POINTER_MASK) as usize;
-                // ONLY user expandos walk through (a `Function.prototype.x
-                // = …` write records no attrs). Methods installed at init
-                // (`apply`, `call`, `hasOwnProperty`, …) stay excluded:
-                // serving those generic thunks to closure reads hijacks the
-                // dedicated dispatch arms (`p.call(...)`'s undefined-read
-                // fallback to method-dispatch-by-name is what routes the
-                // proxy APPLY trap). `fn.apply`-style VALUE reads through a
-                // proxy are reified receiver-correctly by `js_proxy_get`.
-                let routed_method = false;
-                if proto_ptr != 0
-                    && proto_ptr != ptr
-                    && !is_closure_ptr(proto_ptr)
-                    && (routed_method
-                        || crate::object::get_property_attrs(proto_ptr, prop).is_none())
-                {
-                    // A defineProperty accessor on Function.prototype
-                    // (`{ get: () => 12 }`) is invoked with the reading
-                    // closure as receiver.
-                    if !routed_method {
-                        if let Some(acc) = crate::object::get_accessor_descriptor(proto_ptr, prop) {
-                            if acc.get != 0 {
-                                let getter = (acc.get & crate::value::POINTER_MASK)
-                                    as *const crate::closure::ClosureHeader;
-                                if !getter.is_null() {
-                                    let receiver = crate::value::js_nanbox_pointer(ptr as i64);
-                                    let prev = crate::object::js_implicit_this_set(receiver);
-                                    let result = crate::closure::js_closure_call0(getter);
-                                    crate::object::js_implicit_this_set(prev);
-                                    return result;
-                                }
-                            }
-                            return f64::from_bits(crate::value::TAG_UNDEFINED);
-                        }
-                    }
-                    unsafe {
-                        let key_hdr =
-                            crate::string::js_string_from_bytes(prop.as_ptr(), prop.len() as u32);
-                        let v = crate::object::js_object_get_field_by_name(
-                            proto_ptr as *const crate::object::ObjectHeader,
-                            key_hdr as *const crate::StringHeader,
-                        );
-                        if !v.is_undefined() {
-                            return f64::from_bits(v.bits());
-                        }
-                    }
+    // installed there (`Function.prototype.property = 12`), or a property
+    // installed via `Object.defineProperty(Function.prototype, k, {...})`,
+    // must be readable through any closure (`fn.property`, `boundFn.property`,
+    // `Function.indicator`).
+    if let Some(proto_ptr) = function_prototype_fallback_target(ptr, prop) {
+        // A defineProperty accessor on Function.prototype
+        // (`{ get: () => 12 }`) is invoked with the reading
+        // closure as receiver.
+        if let Some(acc) = crate::object::get_accessor_descriptor(proto_ptr, prop) {
+            if acc.get != 0 {
+                let getter =
+                    (acc.get & crate::value::POINTER_MASK) as *const crate::closure::ClosureHeader;
+                if !getter.is_null() {
+                    let receiver = crate::value::js_nanbox_pointer(ptr as i64);
+                    let prev = crate::object::js_implicit_this_set(receiver);
+                    let result = crate::closure::js_closure_call0(getter);
+                    crate::object::js_implicit_this_set(prev);
+                    return result;
                 }
+            }
+            return f64::from_bits(crate::value::TAG_UNDEFINED);
+        }
+        unsafe {
+            let key_hdr = crate::string::js_string_from_bytes(prop.as_ptr(), prop.len() as u32);
+            let v = crate::object::js_object_get_field_by_name(
+                proto_ptr as *const crate::object::ObjectHeader,
+                key_hdr as *const crate::StringHeader,
+            );
+            if !v.is_undefined() {
+                return f64::from_bits(v.bits());
             }
         }
     }
     f64::from_bits(crate::value::TAG_UNDEFINED)
+}
+
+/// Resolve the real, mutable `%Function.prototype%` object pointer for a
+/// closure-receiver fallback (GET or SET), or `None` if `prop` doesn't
+/// qualify — a synthesized own slot, a reified method name (`apply`, `call`,
+/// `bind`, …: serving those generic thunks to closure reads/writes hijacks
+/// the dedicated dispatch arms, e.g. `p.call(...)`'s undefined-read fallback
+/// to method-dispatch-by-name routes the proxy APPLY trap — `fn.apply`-style
+/// VALUE reads through a proxy are reified receiver-correctly by
+/// `js_proxy_get` instead), an array-index-shaped key, or resolving would
+/// recurse back into `Function.prototype` itself. Shared by
+/// [`closure_get_dynamic_prop`]'s expando/defineProperty walk and the
+/// closure SET path in `object::field_set_by_name`, so
+/// `Object.defineProperty(Function.prototype, k, {get,set})` round-trips
+/// through `boundFn.k = v` the same way it does through `boundFn.k`. A
+/// re-entrancy guard covers the recursion through `builtin_prototype_value`
+/// (which reads `Function.prototype` via `closure_get_dynamic_prop` itself).
+pub(crate) fn function_prototype_fallback_target(ptr: usize, prop: &str) -> Option<usize> {
+    if matches!(
+        prop,
+        "prototype" | "name" | "length" | "caller" | "arguments" | "constructor"
+        // Universal Object.prototype method names: every receiver (closures
+        // included) resolves these through a dedicated native dispatch arm,
+        // not a literal field on the walked prototype object. Serving a
+        // generic-lookup result for one of these hijacks that dispatch —
+        // e.g. `m.propertyIsEnumerable` resolved a same-named-but-wrong
+        // value via this fallback, so `m.propertyIsEnumerable("length")`
+        // called the wrong thing (test262 S15.2.4.3_A8 / S15.2.4.4_A8 /
+        // S15.2.4.7_A8 regressions caught after the initial fix).
+        | "toString" | "valueOf" | "hasOwnProperty" | "isPrototypeOf"
+        | "propertyIsEnumerable" | "toLocaleString"
+    ) || crate::object::canonical_array_index(prop).is_some()
+        || crate::object::reified_function_method_name(prop).is_some()
+    {
+        return None;
+    }
+    thread_local! {
+        static IN_FN_PROTO_FALLBACK: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+    let reentrant = IN_FN_PROTO_FALLBACK.with(|c| c.replace(true));
+    if reentrant {
+        return None;
+    }
+    let proto_val = crate::object::builtin_prototype_value("Function");
+    IN_FN_PROTO_FALLBACK.with(|c| c.set(false));
+    let proto_jv = crate::value::JSValue::from_bits(proto_val.to_bits());
+    if !proto_jv.is_pointer() {
+        return None;
+    }
+    let proto_ptr = (proto_jv.bits() & crate::value::POINTER_MASK) as usize;
+    if proto_ptr == 0 || proto_ptr == ptr || is_closure_ptr(proto_ptr) {
+        return None;
+    }
+    Some(proto_ptr)
+}
+
+/// SET-side analog of `closure_get_dynamic_prop`'s inherited-accessor read:
+/// if `prop` resolves to a descriptor installed on the real
+/// `%Function.prototype%` object (`Object.defineProperty(Function.prototype,
+/// k, {...})`), apply spec `[[Set]]` semantics for it and report the write
+/// handled — an ACCESSOR invokes its setter (if any) with `receiver` as
+/// `this`; a non-writable DATA property blocks the write (matches the
+/// silent-no-op convention this file already uses for a non-writable OWN
+/// attrs record, just above this function's callers). Returns `false` when
+/// there's no inherited descriptor at all, or it's a writable DATA property —
+/// an ordinary `[[Set]]` on those creates a new OWN property on the receiver,
+/// which the caller's existing own-dynamic-prop fallback already does
+/// correctly. `ptr` is the closure being checked against (used only to
+/// reject the Function.prototype self-reference); `receiver` is the spec
+/// `[[Set]]` receiver — ordinarily the same object, but callers reached via
+/// `Reflect.set(target, k, v, R)` pass a distinct `R`.
+pub(crate) fn closure_set_via_function_prototype_descriptor(
+    ptr: usize,
+    prop: &str,
+    value: f64,
+    receiver: f64,
+) -> bool {
+    let Some(proto_ptr) = function_prototype_fallback_target(ptr, prop) else {
+        return false;
+    };
+    if let Some(acc) = crate::object::get_accessor_descriptor(proto_ptr, prop) {
+        if acc.set == 0 {
+            // Getter-only: matches `al_set_length`'s getter-only `length` throw
+            // (array/generic.rs) — a strict-mode write to an accessor with no
+            // setter is a TypeError, not a silent no-op.
+            crate::collection_iter::throw_type_error(&format!(
+                "Cannot set property {prop} of #<Function> which has only a getter"
+            ));
+        }
+        unsafe { crate::object::invoke_accessor_setter(acc.set, receiver, value) };
+        return true;
+    }
+    if let Some(attrs) = crate::object::get_property_attrs(proto_ptr, prop) {
+        if !attrs.writable() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Set a dynamic property on a closure.
@@ -724,7 +702,7 @@ pub extern "C" fn js_closure_unbind_this(val: f64) -> f64 {
     }
     // Check CLOSURE_MAGIC
     unsafe {
-        let type_tag = *((ptr as *const u8).add(12) as *const u32);
+        let type_tag = *((ptr as *const u8).add(CLOSURE_TYPE_TAG_OFFSET) as *const u32);
         if type_tag != CLOSURE_MAGIC {
             return val;
         }
@@ -745,8 +723,9 @@ pub extern "C" fn js_closure_unbind_this(val: f64) -> f64 {
         let new_closure = js_closure_alloc(func_ptr, raw_count);
         let source_bits = val_handle.get_nanbox_f64().to_bits();
         let source_ptr = (source_bits & 0x0000_FFFF_FFFF_FFFF) as usize;
-        let source_type_tag =
-            std::ptr::read_volatile((source_ptr as *const u8).add(12) as *const u32);
+        let source_type_tag = std::ptr::read_volatile(
+            (source_ptr as *const u8).add(CLOSURE_TYPE_TAG_OFFSET) as *const u32,
+        );
         if source_type_tag != CLOSURE_MAGIC {
             return val_handle.get_nanbox_f64();
         }
@@ -906,18 +885,40 @@ pub(crate) fn clone_closure_rebind_this(closure_bits: u64, recv_box: f64) -> u64
         return closure_bits;
     }
     let ptr = (closure_bits & 0x0000_FFFF_FFFF_FFFF) as usize;
-    if ptr < 0x10000 {
+    // Validate the payload is a real heap closure BEFORE any header read.
+    // `is_closure_ptr` rejects the native/fetch/proxy small-handle band, any
+    // address outside the platform heap range, misaligned pointers, AND
+    // confirms CLOSURE_MAGIC — so a mis-boxed POINTER_TAG value (a fetch handle,
+    // or an `i32 << 32` style value above the band) can't SIGSEGV the probe
+    // (#4740, #wall2). This subsumes the old hand-rolled band + magic checks.
+    if !is_closure_ptr(ptr) {
         return closure_bits;
     }
     unsafe {
-        let type_tag = std::ptr::read_volatile((ptr as *const u8).add(12) as *const u32);
-        if type_tag != CLOSURE_MAGIC {
+        let header = ptr as *const ClosureHeader;
+        // Arrow functions bind `this` lexically: their `this` capture slot holds
+        // the enclosing instance and must NEVER be overwritten with a call-time
+        // receiver (proxy handler, getter receiver, method-call object, …).
+        // They still carry CAPTURES_THIS_FLAG (the body reads `this`), so the
+        // flag check below does not exclude them — guard explicitly. Without this,
+        // an arrow used as a proxy trap / accessor would observe the rebind
+        // receiver and lose its captured instance's data fields (#wall11).
+        if crate::closure::closure_is_arrow(header) {
             return closure_bits;
         }
-        let header = ptr as *const ClosureHeader;
         let raw_count = (*header).capture_count;
         // No CAPTURES_THIS_FLAG → the closure body doesn't read `this`, no rebind needed.
         if raw_count & CAPTURES_THIS_FLAG == 0 {
+            return closure_bits;
+        }
+        // Generator state-machine step closures (`next`/`return`/`throw`) capture
+        // the generator BODY's `this` lexically — it is fixed at generator
+        // creation and must NOT be re-bound by `.call`/method dispatch. The
+        // `yield* gen` desugar calls `next.call(iter, v)`; rebinding here would
+        // clobber the captured body-`this` with the iterator object. The flag is
+        // stamped on the closure header (per-closure, no global table) by
+        // `js_generator_attach_prototype` when it wires the generator instance.
+        if raw_count & NO_THIS_REBIND_FLAG != 0 {
             return closure_bits;
         }
         let count = real_capture_count(raw_count) as usize;
@@ -932,8 +933,9 @@ pub(crate) fn clone_closure_rebind_this(closure_bits: u64, recv_box: f64) -> u64
         let new_closure = js_closure_alloc(func_ptr, raw_count);
         let source_bits = closure_handle.get_nanbox_u64();
         let source_ptr = (source_bits & 0x0000_FFFF_FFFF_FFFF) as usize;
-        let source_type_tag =
-            std::ptr::read_volatile((source_ptr as *const u8).add(12) as *const u32);
+        let source_type_tag = std::ptr::read_volatile(
+            (source_ptr as *const u8).add(CLOSURE_TYPE_TAG_OFFSET) as *const u32,
+        );
         if source_type_tag != CLOSURE_MAGIC {
             return source_bits;
         }

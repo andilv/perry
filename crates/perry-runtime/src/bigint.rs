@@ -204,6 +204,22 @@ pub extern "C" fn js_bigint_from_i64(value: i64) -> *mut BigIntHeader {
     bigint_alloc_with_limbs(limbs)
 }
 
+/// Create a BigInt from a compiler-owned signed 128-bit temporary, passed as
+/// raw low/high 64-bit words so generated LLVM can keep small BigInt literal
+/// arithmetic native until the JS-visible BigInt object boundary.
+#[no_mangle]
+pub extern "C" fn js_bigint_from_i128_parts(lo: u64, hi: i64) -> *mut BigIntHeader {
+    let bits = ((hi as u64 as u128) << 64) | (lo as u128);
+    let value = bits as i128;
+    let mut limbs = ZERO_LIMBS;
+    write_i128(value, &mut limbs);
+    bigint_alloc_with_limbs(limbs)
+}
+
+#[used]
+static KEEP_JS_BIGINT_FROM_I128_PARTS: extern "C" fn(u64, i64) -> *mut BigIntHeader =
+    js_bigint_from_i128_parts;
+
 /// Create a BigInt from a JS value (the `BigInt(value)` coercion).
 ///
 /// Matches Node/ECMAScript `ToBigInt` semantics (#2754, #2907):
@@ -672,19 +688,33 @@ pub extern "C" fn js_bigint_mul(
         return bigint_alloc_with_limbs(result);
     }
 
-    // Slow path: 16-limb school multiplication (keeping lower 1024 bits).
-    // Skip trailing all-zero limbs on both operands so e.g. multiplying a
-    // value that uses 3 limbs by one that uses 2 only does 3*2 = 6 word
-    // multiplies instead of 16*16 = 256.
-    let a_len = effective_limb_len(&a_limbs);
-    let b_len = effective_limb_len(&b_limbs);
+    // Slow path: unsigned schoolbook multiplication on the magnitudes, then
+    // apply the sign. Using two's-complement limbs directly would require
+    // carrying the sign-extension words through every row of the accumulation,
+    // which is subtle to get right — sign-and-magnitude is cleaner.
+    let a_neg = is_negative(&a_limbs);
+    let b_neg = is_negative(&b_limbs);
+    let a_mag = if a_neg {
+        negate_limbs(&a_limbs)
+    } else {
+        a_limbs
+    };
+    let b_mag = if b_neg {
+        negate_limbs(&b_limbs)
+    } else {
+        b_limbs
+    };
+
+    // Skip trailing all-zero limbs so e.g. multiplying a value that uses 3
+    // limbs by one that uses 2 only does 3×2 = 6 word multiplies.
+    let a_len = effective_limb_len(&a_mag);
+    let b_len = effective_limb_len(&b_mag);
     let mut result = ZERO_LIMBS;
     for i in 0..a_len {
         let mut carry = 0u128;
         let inner_max = b_len.min(BIGINT_LIMBS - i);
         for j in 0..inner_max {
-            let product =
-                (a_limbs[i] as u128) * (b_limbs[j] as u128) + (result[i + j] as u128) + carry;
+            let product = (a_mag[i] as u128) * (b_mag[j] as u128) + (result[i + j] as u128) + carry;
             result[i + j] = product as u64;
             carry = product >> 64;
         }
@@ -697,6 +727,9 @@ pub extern "C" fn js_bigint_mul(
             carry = sum >> 64;
             k += 1;
         }
+    }
+    if a_neg != b_neg {
+        result = negate_limbs(&result);
     }
     bigint_alloc_with_limbs(result)
 }
@@ -1488,6 +1521,30 @@ mod tests {
         let c = js_bigint_mul(a, b);
         unsafe {
             assert_eq!((*c).limbs[0], 2_000_000);
+        }
+    }
+
+    #[test]
+    fn test_bigint_from_i128_parts_preserves_wide_small_result() {
+        let value = (i64::MAX as i128) + 1;
+        let lo = value as u128 as u64;
+        let hi = ((value as u128) >> 64) as u64 as i64;
+        let bi = js_bigint_from_i128_parts(lo, hi);
+        unsafe {
+            assert_eq!((*bi).limbs[0], 0x8000_0000_0000_0000);
+            assert_eq!((*bi).limbs[1], 0);
+            assert!(fits_in_i64(&(*bi).limbs).is_none());
+        }
+
+        let negative = -((i64::MAX as i128) + 2);
+        let lo = negative as u128 as u64;
+        let hi = ((negative as u128) >> 64) as u64 as i64;
+        let bi = js_bigint_from_i128_parts(lo, hi);
+        unsafe {
+            assert_eq!((*bi).limbs[0], 0x7fff_ffff_ffff_ffff);
+            assert_eq!((*bi).limbs[1], u64::MAX);
+            assert_eq!((*bi).limbs[BIGINT_LIMBS - 1], u64::MAX);
+            assert!(fits_in_i64(&(*bi).limbs).is_none());
         }
     }
 

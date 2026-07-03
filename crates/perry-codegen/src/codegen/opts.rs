@@ -91,6 +91,16 @@ pub struct CompileOptions {
     /// `perry_fn_<source_prefix>__<funcname>`. Built by the CLI driver
     /// from each module's `hir.imports` table.
     pub import_function_prefixes: std::collections::HashMap<String, String>,
+    /// Issue #5621: ergonomic camelCase binding → snake_case `js_<pkg>_*`
+    /// FFI symbol, for `perry.nativeLibrary` packages that expose
+    /// spec-faithful camelCase exports (`requestAdapter`) over their
+    /// manifest symbols (`js_webgpu_request_adapter`). `lower_call`
+    /// rewrites the binding to its manifest symbol before consulting
+    /// `ffi_signatures`, so the call is emitted against the real FFI
+    /// symbol. Built by the CLI driver in the per-specifier import loop;
+    /// empty for the byte-for-byte exact-match convention
+    /// (`@perryts/storekit`'s raw ambient `js_storekit_*` exports).
+    pub import_function_ffi_aliases: std::collections::HashMap<String, String>,
     /// Issue #678: for imports that traverse a re-export rename
     /// (e.g. `export { default as render } from './render.js'`), maps the
     /// consumer-visible name (`render`) to the actual export name in the
@@ -705,6 +715,89 @@ pub(crate) struct CrossModuleCtx {
     pub returns_int_functions: std::collections::HashSet<u32>,
     /// Single-argument integer helpers that return the argument coerced to i32.
     pub i32_identity_functions: std::collections::HashSet<u32>,
+    /// User functions that have a generated internal typed-f64 clone. The
+    /// public wrapper keeps the JSValue ABI; direct numeric call sites may call
+    /// the clone.
+    pub typed_f64_functions: std::collections::HashSet<u32>,
+    /// User functions that have a generated internal typed-i32 clone. The
+    /// public wrapper keeps the JSValue ABI; direct call sites may call the
+    /// clone when every argument is proven and guarded as Int32-compatible.
+    pub typed_i32_functions: std::collections::HashSet<u32>,
+    /// User functions that have a generated internal typed-i1 clone. The public
+    /// wrapper keeps the JSValue ABI; direct call sites may call the clone when
+    /// the caller can prove every argument matches the clone's native
+    /// parameter reps.
+    pub typed_i1_functions: std::collections::HashSet<u32>,
+    /// User functions that have a generated internal typed-string clone. The
+    /// public wrapper keeps the JSValue ABI; the clone passes raw
+    /// `StringHeader*` handles as i64 and boxes only at the boundary.
+    pub typed_string_functions: std::collections::HashSet<u32>,
+    /// Per-function typed-i1 clone parameter reps. This lets same-module direct
+    /// calls target mixed native predicate clones such as
+    /// `i1(double, double)` without routing through the public JSValue wrapper.
+    pub typed_i1_function_param_reps:
+        std::collections::HashMap<u32, Vec<super::typed_abi::TypedParamRep>>,
+    /// Own instance methods that have a generated internal typed-f64 clone.
+    /// Runtime vtables still register only the generic method symbols; direct
+    /// same-module call lowering may select these clones after receiver/method
+    /// and numeric argument guards pass.
+    pub typed_f64_methods: std::collections::HashSet<(String, String)>,
+    /// Own instance methods that have a generated internal typed-i32 clone.
+    /// Public method symbols remain JSValue trampolines; exact own-method
+    /// direct calls may select these clones after Int32 argument guards pass.
+    pub typed_i32_methods: std::collections::HashSet<(String, String)>,
+    /// Own instance methods that have a generated internal typed-i1 clone.
+    /// Runtime vtables still register only the generic method symbols; exact
+    /// own-method direct calls may select these clones after receiver/method
+    /// and per-representation typed argument guards pass.
+    pub typed_i1_methods: std::collections::HashSet<(String, String)>,
+    /// Own instance methods that have a generated internal typed-string clone.
+    /// Public method symbols remain JSValue trampolines; exact own-method
+    /// direct calls may select these clones after receiver/method and string
+    /// argument guards pass.
+    pub typed_string_methods: std::collections::HashSet<(String, String)>,
+    /// Per-method typed-i1 clone parameter reps. This lets exact same-module
+    /// method calls target mixed native predicate clones such as
+    /// `i1(double, double)` without routing through the public JSValue wrapper.
+    pub typed_i1_method_param_reps:
+        std::collections::HashMap<(String, String), Vec<super::typed_abi::TypedParamRep>>,
+    /// Own instance methods whose body reads raw numeric fields from the exact
+    /// receiver and has a generated `typed_f64_recv` clone. Call sites must
+    /// prove both method identity and every raw-f64 receiver-field layout before
+    /// calling the clone.
+    pub typed_f64_receiver_methods:
+        std::collections::HashMap<(String, String), super::typed_abi::TypedReceiverMethodInfo>,
+    /// Inline closure bodies that have a generated internal typed-f64 clone.
+    /// Only statically-known local closure calls may select these clones after
+    /// closure identity/arity and numeric argument guards pass.
+    pub typed_f64_closures: std::collections::HashSet<u32>,
+    /// Inline closure bodies that have a generated internal typed-i32 clone.
+    /// Only statically-known local closure calls may select these clones after
+    /// closure identity/arity and Int32 argument guards pass.
+    pub typed_i32_closures: std::collections::HashSet<u32>,
+    /// Inline closure bodies that have a generated internal typed-i1 clone.
+    /// Only statically-known local closure calls may select these clones after
+    /// closure identity/arity and per-representation argument guards pass.
+    pub typed_i1_closures: std::collections::HashSet<u32>,
+    /// Inline closure bodies that have a generated internal typed-string clone.
+    /// Only statically-known local closure calls may select these clones after
+    /// closure identity/arity, string argument guards, and any required string
+    /// capture guards pass.
+    pub typed_string_closures: std::collections::HashSet<u32>,
+    /// Number of immutable string captures consumed by each typed-string
+    /// closure clone. Direct local call sites use this to guard capture slots
+    /// before entering the raw string ABI.
+    pub typed_string_closure_capture_counts: std::collections::HashMap<u32, usize>,
+    /// Per-closure typed-i1 clone parameter reps. This lets direct local
+    /// closure calls target mixed native predicate clones such as
+    /// `i1(i64 closure, double, double)` without routing through the public
+    /// JSValue wrapper.
+    pub typed_i1_closure_param_reps:
+        std::collections::HashMap<u32, Vec<super::typed_abi::TypedParamRep>>,
+    /// Compiler-generated async/generator control locals that can use
+    /// primitive heap cells while preserving closure-shared lifetime.
+    pub compiler_private_async_i32_control_locals: std::collections::HashSet<u32>,
+    pub compiler_private_async_i1_control_locals: std::collections::HashSet<u32>,
     /// Debug/benchmark switch that forces Buffer/Uint8Array accesses through
     /// the generic helper path.
     pub disable_buffer_fast_path: bool,
@@ -727,6 +820,13 @@ pub(crate) struct CrossModuleCtx {
             perry_api_manifest::NativeAbiType,
         ),
     >,
+    /// Issue #5621: ergonomic camelCase binding → manifest `js_<pkg>_*`
+    /// symbol. `lower_call` rewrites a binding through this map before its
+    /// `ffi_signatures` lookups so a camelCase native-library export
+    /// (`requestAdapter`) routes to its real symbol
+    /// (`js_webgpu_request_adapter`). Mirror of
+    /// `CompileOptions::import_function_ffi_aliases`.
+    pub ffi_aliases: std::collections::HashMap<String, String>,
     /// Per-module mapping: local class/binding name → import source spec.
     /// Built once in `compile_module` from `hir.imports`. Used by
     /// `lower_builtin_new` to disambiguate ambiguously-named built-in
@@ -737,6 +837,16 @@ pub(crate) struct CrossModuleCtx {
     /// "Client" arm only fires when the local `Client` was imported from
     /// "pg" (named or default). See issue #602.
     pub imported_class_sources: std::collections::HashMap<String, String>,
+    /// Per-module mapping: local alias → original imported export name, for
+    /// named imports where the binding was renamed (`import { AsyncLocalStorage
+    /// as xQ5 } from "async_hooks"` records `xQ5 -> "AsyncLocalStorage"`). Built
+    /// once in `compile_module` from `hir.imports`. Lets `lower_new` recover the
+    /// real export name so the built-in constructor arms in `lower_builtin_new`
+    /// (keyed on the canonical name like `"AsyncLocalStorage"`) still fire when
+    /// a minified bundle aliases the import. Without this, `new xQ5()` fell
+    /// through to the empty-object placeholder and the instance had no
+    /// `.getStore`/`.run` methods (`TypeError: getStore is not a function`).
+    pub imported_class_original_names: std::collections::HashMap<String, String>,
     /// Issue #655: map from interface name → HIR Interface definition.
     /// Lets `static_type_of` resolve `obj.field` when `obj` is typed
     /// against a TS `interface` (not a `class`). The `class_table`

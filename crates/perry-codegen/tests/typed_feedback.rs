@@ -39,6 +39,7 @@ fn empty_opts() -> CompileOptions {
         is_entry_module: false,
         non_entry_module_prefixes: Vec::new(),
         import_function_prefixes: std::collections::HashMap::new(),
+        import_function_ffi_aliases: std::collections::HashMap::new(),
         import_function_origin_names: std::collections::HashMap::new(),
         import_function_v8_specifiers: std::collections::HashMap::new(),
         import_function_node_submodule: std::collections::HashMap::new(),
@@ -118,6 +119,7 @@ fn class(id: u32, name: &str, fields: Vec<ClassField>) -> Class {
         extends_name: None,
         native_extends: None,
         extends_expr: None,
+        heritage_lexically_shadowed: false,
         fields,
         constructor: None,
         methods: Vec::new(),
@@ -176,6 +178,9 @@ fn module_with_classes(
         exported_func_return_native_instances: Vec::new(),
         exported_objects: Vec::new(),
         exported_functions: Vec::new(),
+        script_global_functions: Vec::new(),
+        references_global_this: false,
+        annexb_global_undefined_names: Vec::new(),
         widgets: Vec::new(),
         uses_fetch: false,
         uses_webassembly: false,
@@ -185,6 +190,7 @@ fn module_with_classes(
         init_kind: ModuleInitKind::Eager,
         async_step_closures: std::collections::HashSet::new(),
         closure_display_names: std::collections::HashMap::new(),
+        class_display_names: std::collections::HashMap::new(),
         closure_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
@@ -303,8 +309,8 @@ fn typed_feedback_guards_direct_class_field_specialization() {
     assert!(ir.contains("js_typed_feedback_class_field_get_guard"));
     assert!(ir.contains("class_field_set.fast"));
     assert!(ir.contains("class_field_set.fallback"));
-    assert!(ir.contains("class_field_get.fast"));
-    assert!(ir.contains("class_field_get.fallback"));
+    assert!(ir.contains("class_field_get_number.fast"));
+    assert!(ir.contains("class_field_get_number.fallback"));
     assert!(ir.contains("store double"));
     assert!(!ir.contains("call void @js_gc_note_slot_layout"));
     // #5334 lever A: the SET fallback arm collapses to one outlined call; the
@@ -316,6 +322,17 @@ fn typed_feedback_guards_direct_class_field_specialization() {
     // js_class_field_set_fallback).
     assert!(ir.contains("call void @js_typed_feedback_record_fallback_call"));
     assert!(ir.contains("call double @js_object_get_field_by_name_f64"));
+    let fallback_pos = ir
+        .find("class_field_get_number.fallback")
+        .expect("raw numeric class-field consumer should keep fallback block");
+    let merge_pos = ir[fallback_pos..]
+        .find("class_field_get_number.merge")
+        .map(|pos| fallback_pos + pos)
+        .expect("raw numeric class-field consumer should keep merge block");
+    assert!(
+        ir[fallback_pos..merge_pos].contains("call double @js_number_coerce"),
+        "class-field raw fallback must be coerced before the numeric merge:\n{ir}"
+    );
     assert!(
         ir.contains("call double @js_number_coerce"),
         "class-field raw fallback must be coerced at numeric consumers:\n{ir}"
@@ -790,9 +807,9 @@ fn typed_feedback_guards_computed_numeric_array_index_hot_path() {
         vec![Stmt::Return(Some(Expr::IndexGet {
             object: Box::new(Expr::LocalGet(1)),
             index: Box::new(Expr::Binary {
-                op: BinaryOp::Mod,
+                op: BinaryOp::BitAnd,
                 left: Box::new(Expr::LocalGet(2)),
-                right: Box::new(Expr::Integer(64)),
+                right: Box::new(Expr::Integer(63)),
             }),
         }))],
     ));

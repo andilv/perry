@@ -8,23 +8,27 @@
 //! error so a user running `--backend llvm` on richer TypeScript gets a
 //! one-line explanation instead of a silent broken binary.
 
-use anyhow::{bail, Result};
-use perry_hir::{BinaryOp, Expr};
+use anyhow::{anyhow, bail, Result};
+use perry_hir::{BinaryOp, CompareOp, Expr, UnaryOp};
 use perry_types::Type as HirType;
 
 use crate::block::LlBlock;
 use crate::codegen::AppMetadata;
 use crate::collectors::NativeRegionFactGraph;
 use crate::function::LlFunction;
+use crate::nanbox::double_literal;
 use crate::native_value::{
     AliasState, BoundedBufferIndex, BoundsProof, BoundsState, BufferAccessFacts, BufferAccessMode,
-    BufferViewSlot, GuardedBufferIndex, LoweredValue, MaterializationReason, NativeAbiTypeRecord,
-    NativeFactUse, NativeRep, NativeRepRecord, NativeValueState, PodLayoutManifest,
-    PodRecordViewManifest, ScalarConversionRecord,
+    BufferViewSlot, ExpectedNativeRep, GuardedBufferIndex, LoweredValue, MaterializationReason,
+    NativeAbiTypeRecord, NativeFactUse, NativeRep, NativeRepRecord, NativeValueState,
+    PodLayoutManifest, PodRecordViewManifest, ScalarConversionRecord,
 };
 use crate::strings::StringPool;
-use crate::type_analysis::is_numeric_expr;
-use crate::types::{DOUBLE, I32, I64, PTR};
+use crate::type_analysis::{
+    compute_auto_captures, is_array_expr, is_bigint_expr, is_bool_expr, is_map_expr,
+    is_numeric_expr, is_set_expr, is_string_expr, is_url_search_params_expr, receiver_class_name,
+};
+use crate::types::{DOUBLE, F32, I1, I32, I64, I8, PTR};
 
 // Issue #1098: expr.rs split into expr/ submodules. These are pure
 // mechanical moves of self-contained helper clusters out of this file;
@@ -52,7 +56,7 @@ mod url_helpers;
 mod v8_interop;
 mod write_barrier;
 
-pub(crate) use crate::native_value::materialize_js_value;
+pub(crate) use crate::native_value::{materialize_js_value, materialize_js_value_without_record};
 pub(crate) use array_literal::lower_array_literal;
 pub(crate) use buffer_access::{
     access_facts_for_spec, emit_buffer_access_pointer, lower_buffer_access_proof,
@@ -78,15 +82,16 @@ pub(crate) use helpers::{
     unbox_to_i64,
 };
 pub(crate) use i32_fast_path::{
-    can_lower_expr_as_i32, is_known_finite, lower_expr_as_i32, lower_expr_native,
-    try_flat_const_2d_int, try_lower_flat_const_index_get,
+    can_lower_expr_as_i32, can_lower_expr_as_i32_in_current_region, is_known_finite,
+    lower_expr_as_i32, lower_expr_native, lower_packed_u32_loop_index_get, try_flat_const_2d_int,
+    try_lower_flat_const_index_get,
 };
 pub(crate) use index::lower_index_set_fast;
 pub(crate) use nanbox_inline::{
-    i32_bool_to_nanbox, nanbox_bigint_inline, nanbox_pointer_inline, nanbox_pointer_inline_pub,
-    nanbox_string_inline,
+    i32_bool_to_nanbox, i32_to_nanbox, nanbox_bigint_inline, nanbox_pointer_inline,
+    nanbox_pointer_inline_pub, nanbox_string_inline,
 };
-pub(crate) use native_record::raw_f64_layout_fact;
+pub(crate) use native_record::{array_kind_fact, effect_fact, raw_f64_layout_fact};
 pub(crate) use object_literal::lower_object_literal;
 pub(crate) use pod_record::{
     lower_and_store_initial_pod_field, lower_pod_local_reassignment, materialize_pod_local,
@@ -95,8 +100,9 @@ pub(crate) use pod_record::{
 pub(crate) use range_facts::{
     bounds_for_buffer_access_width, effective_alias_state_for_access,
     guarded_buffer_indices_for_condition, int_range_expr, invalidate_local_write_facts,
-    record_int_facts_for_let, record_int_facts_for_local_set, record_int_facts_for_update,
-    while_condition_range_fact, IntRange, IntRangeFact,
+    local_value_alias_root, record_int_facts_for_let, record_int_facts_for_local_set,
+    record_int_facts_for_update, record_local_value_alias_for_write, while_condition_range_fact,
+    IntRange, IntRangeFact,
 };
 pub(crate) use strings::emit_string_literal_global;
 pub(crate) use typed_feedback::{
@@ -108,10 +114,25 @@ pub(crate) use v8_interop::{
 };
 pub(crate) use write_barrier::{
     emit_array_numeric_write_note_on_block, emit_jsvalue_slot_store_on_block,
-    emit_jsvalue_slot_store_scalar_aware_on_block, emit_layout_note_slot_on_block,
+    emit_jsvalue_slot_store_scalar_aware_on_block,
+    emit_jsvalue_slot_store_with_value_bits_on_block, emit_layout_note_slot_on_block,
     emit_root_heap_word_store_on_block, emit_root_nanbox_store_on_block, emit_write_barrier,
     emit_write_barrier_slot_on_block, lower_array_super_init, lower_event_emitter_subclass_init,
     lower_node_stream_super_init, lower_stream_super_init,
+};
+
+// Issue #1098 phase 3: the `FnCtx` definition stays in this trunk, but its
+// bulky `record_lowered_value*` method family, the shadow-slot free helpers,
+// and the `lower_expr` dispatch table moved into siblings to keep this file
+// under 2000 lines. Inherent methods (`record_value`) need no re-export.
+mod dispatch;
+mod record_value;
+mod shadow_slot;
+
+pub(crate) use dispatch::{lower_expr, lower_math_operand};
+pub(crate) use shadow_slot::{
+    emit_shadow_slot_bind_for_local, emit_shadow_slot_clear, emit_shadow_slot_update_for_expr,
+    expr_is_known_non_pointer_shadow_value,
 };
 
 /// One in-flight inline-constructor return target. See
@@ -291,7 +312,7 @@ pub(crate) struct FnCtx<'a> {
     pub closure_captures: std::collections::HashMap<u32, u32>,
     /// Inside a closure body, the LLVM SSA value name for the current
     /// closure pointer (`%this_closure`). `Expr::LocalGet` of a captured
-    /// id uses this as the first arg to `js_closure_get_capture_f64`.
+    /// id uses this as the first arg to `js_closure_get_capture_bits`.
     pub current_closure_ptr: Option<String>,
     /// Map from (enum_name, member_name) → enum value. Built once in
     /// `compile_module` from `hir.enums`. Used by `Expr::EnumMember`
@@ -354,7 +375,7 @@ pub(crate) struct FnCtx<'a> {
     /// the produced class's static methods, matching the post-#912
     /// `Cls = make(); Cls.pipe(...)` shape.
     pub func_returns_class: &'a std::collections::HashMap<u32, String>,
-    /// LocalIds that must be stored in heap boxes (`js_box_alloc`)
+    /// LocalIds that must be stored in heap boxes (`js_box_alloc_bits`)
     /// instead of stack allocas. A local gets boxed when at least
     /// one closure captures it AND it's written to (either by the
     /// enclosing function or inside a closure). Boxing guarantees
@@ -363,21 +384,28 @@ pub(crate) struct FnCtx<'a> {
     /// vars` for the detection rule.
     ///
     /// For ids in this set:
-    /// - Stmt::Let allocates a box via `js_box_alloc(init)` and
+    /// - Stmt::Let allocates a box via `js_box_alloc_bits(init_bits)` and
     ///   stores the box pointer (i64) in a local alloca slot.
-    /// - LocalGet reads the slot, unboxes, and calls `js_box_get`.
+    /// - LocalGet reads the slot, unboxes, and calls `js_box_get_bits`.
     /// - LocalSet/Update reads the slot, unboxes, and calls
-    ///   `js_box_set`.
+    ///   `js_box_set_bits`.
     /// - Closure creation captures the box pointer directly so
     ///   the closure body sees the same storage.
     pub boxed_vars: std::collections::HashSet<u32>,
     /// LocalIds whose slot+box was allocated up-front via `Stmt::
     /// PreallocateBoxes` (issue #569). When a later `Stmt::Let` is
     /// processed for an id in this set, codegen skips the slot/box
-    /// allocation and just `js_box_set`s the init value into the
+    /// allocation and just `js_box_set_bits`s the init value into the
     /// pre-allocated box. The id is added to `boxed_vars` automatically
     /// so subsequent `LocalGet`/`LocalSet`/`Update` go through the box.
     pub prealloc_boxes: std::collections::HashSet<u32>,
+    /// Compiler-private async/generator control locals whose closure-shared
+    /// storage is a primitive heap cell instead of a generic JSValue box.
+    /// These ids are emitted by Perry's generator transform, not user source:
+    /// `__gen_state` / `__gen_pending_type` use i32 cells, while
+    /// `__gen_done` / `__gen_executing` use boolean cells.
+    pub compiler_private_async_i32_control_locals: &'a std::collections::HashSet<u32>,
+    pub compiler_private_async_i1_control_locals: &'a std::collections::HashSet<u32>,
     /// Closure rest param index: closure `FuncId` → index of the rest
     /// parameter. Built once in `compile_module` from the collected
     /// closures. Used by the closure call site in `lower_call` to
@@ -489,10 +517,20 @@ pub(crate) struct FnCtx<'a> {
             perry_api_manifest::NativeAbiType,
         ),
     >,
+    /// Issue #5621: ergonomic camelCase binding → manifest `js_<pkg>_*`
+    /// symbol. `try_lower_extern_func_call` rewrites the binding through
+    /// this map so a camelCase native-library export routes to its real
+    /// FFI symbol and the `ffi_signatures` lookups above hit.
+    pub ffi_aliases: &'a std::collections::HashMap<String, String>,
     /// Per-module map: local class/binding name → import source spec.
     /// Used by `lower_builtin_new` to disambiguate ambiguously-named
     /// built-in constructors. See issue #602.
     pub imported_class_sources: &'a std::collections::HashMap<String, String>,
+    /// Per-module alias → original imported export name (renamed named imports
+    /// only). Used by `lower_new` to recover the canonical built-in constructor
+    /// name when a bundle aliases the import (`import { AsyncLocalStorage as xQ5
+    /// }`). See `CompileOptions::imported_class_original_names`.
+    pub imported_class_original_names: &'a std::collections::HashMap<String, String>,
     /// Number of currently-open `try { ... }` blocks at the current
     /// lowering position. Incremented before lowering a try body,
     /// decremented after. `Stmt::Return` emits `js_try_end()` this many
@@ -610,6 +648,14 @@ pub(crate) struct FnCtx<'a> {
     /// IndexSet site can rely on `i < arr.length` without rechecking.
     pub bounded_index_pairs: Vec<BoundedIndexPair>,
 
+    /// Scoped loop-versioning facts for `for (...; i < arr.length; i++)`
+    /// clones guarded by `js_typed_feedback_packed_f64_array_loop_guard`.
+    /// Inside the fast clone, `arr[i]` and `arr[i] = numeric_expr` can lower
+    /// directly to raw `double` load/store because the loop-entry guard proves
+    /// the array is a live packed raw-f64 plain Array and the loop proof keeps
+    /// `i` in bounds.
+    pub packed_f64_loop_facts: Vec<PackedF64LoopFact>,
+
     /// Parallel i32 counter slots for integer loop counters that are
     /// used as bounded array indices. When a for-loop counter is in
     /// `integer_locals` AND appears in `bounded_index_pairs`, `lower_for`
@@ -622,6 +668,13 @@ pub(crate) struct FnCtx<'a> {
     /// on hot array-walking loops like `for (let i = 0; i < arr.length;
     /// i++) arr[i] = expr`.
     pub i32_counter_slots: std::collections::HashMap<u32, String>,
+
+    /// Parallel `i1` slots for ordinary boolean locals that have stayed inside
+    /// the representation-first subset. The generic `double` slot remains as a
+    /// compatibility shadow for existing lowering paths, but typed consumers
+    /// load this slot directly and materialize TAG_TRUE/TAG_FALSE only at a
+    /// JSValue boundary. Unsupported writes remove the entry.
+    pub i1_local_slots: std::collections::HashMap<u32, String>,
 
     /// LocalIds that appear anywhere inside an `index` subexpression of an
     /// array/buffer/typed-array access (`arr[i]`, `buf[k+1]`, `uint8[j]`,
@@ -714,6 +767,14 @@ pub(crate) struct FnCtx<'a> {
     /// check `ctx.local_class_aliases` (which is keyed by name).
     /// Populated by Stmt::Let alongside `ctx.local_class_aliases`.
     pub local_id_to_name: std::collections::HashMap<u32, String>,
+
+    /// Local value aliases created by `let alias = local` or `alias = local`.
+    /// The value is the canonical source local at the time of the write. Loop
+    /// cached-length and bounded-index proofs use this to conservatively reject
+    /// `arr.length` proofs when `arr` has another local name that can mutate the
+    /// same array through `alias.push()`, `alias.length = ...`, or generic
+    /// receiver calls.
+    pub local_value_aliases: std::collections::HashMap<u32, u32>,
 
     /// Names of imports that are exported variables (not functions).
     /// When an ExternFuncRef with one of these names appears as a value,
@@ -809,6 +870,25 @@ pub(crate) struct FnCtx<'a> {
     pub clamp_u8_functions: &'a std::collections::HashSet<u32>,
     pub integer_returning_functions: &'a std::collections::HashSet<u32>,
     pub i32_identity_functions: &'a std::collections::HashSet<u32>,
+    pub typed_f64_functions: &'a std::collections::HashSet<u32>,
+    pub typed_i32_functions: &'a std::collections::HashSet<u32>,
+    pub typed_string_functions: &'a std::collections::HashSet<u32>,
+    pub typed_i1_functions: &'a std::collections::HashSet<u32>,
+    pub typed_i1_function_param_reps:
+        &'a std::collections::HashMap<u32, Vec<crate::codegen::TypedParamRep>>,
+    pub typed_f64_methods: &'a std::collections::HashSet<(String, String)>,
+    pub typed_i32_methods: &'a std::collections::HashSet<(String, String)>,
+    pub typed_i1_methods: &'a std::collections::HashSet<(String, String)>,
+    pub typed_string_methods: &'a std::collections::HashSet<(String, String)>,
+    pub typed_i1_method_param_reps:
+        &'a std::collections::HashMap<(String, String), Vec<crate::codegen::TypedParamRep>>,
+    pub typed_f64_closures: &'a std::collections::HashSet<u32>,
+    pub typed_i32_closures: &'a std::collections::HashSet<u32>,
+    pub typed_i1_closures: &'a std::collections::HashSet<u32>,
+    pub typed_i1_closure_param_reps:
+        &'a std::collections::HashMap<u32, Vec<crate::codegen::TypedParamRep>>,
+    pub typed_string_closures: &'a std::collections::HashSet<u32>,
+    pub typed_string_closure_capture_counts: &'a std::collections::HashMap<u32, usize>,
 
     /// True if `perry_transform::unroll_static_loops` expanded any
     /// static-trip-count for-loop in the function this FnCtx is lowering
@@ -919,85 +999,6 @@ pub(crate) struct FnCtx<'a> {
     pub buffer_alias_base: u32,
 }
 
-pub(crate) fn expr_is_known_non_pointer_shadow_value(ctx: &FnCtx<'_>, expr: &Expr) -> bool {
-    match expr {
-        Expr::Undefined | Expr::Null | Expr::Bool(_) | Expr::Number(_) | Expr::Integer(_) => true,
-        Expr::LocalGet(id) => {
-            // A reserved shadow slot means the local is pointer-possible even
-            // if its initializer refined `local_types` to a scalar.
-            !ctx.shadow_slot_map.contains_key(id)
-                && matches!(
-                    ctx.local_types.get(id),
-                    Some(
-                        HirType::Number
-                            | HirType::Int32
-                            | HirType::Boolean
-                            | HirType::Null
-                            | HirType::Void
-                            | HirType::Never
-                            | HirType::Symbol
-                    )
-                )
-        }
-        Expr::Compare { .. } | Expr::Void(_) => true,
-        Expr::Unary { .. } => true,
-        Expr::Binary { op, .. } => !matches!(op, BinaryOp::Add),
-        Expr::Conditional {
-            then_expr,
-            else_expr,
-            ..
-        } => {
-            expr_is_known_non_pointer_shadow_value(ctx, then_expr)
-                && expr_is_known_non_pointer_shadow_value(ctx, else_expr)
-        }
-        Expr::Sequence(exprs) => exprs
-            .last()
-            .is_some_and(|last| expr_is_known_non_pointer_shadow_value(ctx, last)),
-        _ => false,
-    }
-}
-
-pub(crate) fn emit_shadow_slot_clear(ctx: &mut FnCtx<'_>, slot_idx: u32) {
-    ctx.block().call_void(
-        "js_shadow_slot_set",
-        &[(I32, &slot_idx.to_string()), (I64, "0")],
-    );
-}
-
-pub(crate) fn emit_shadow_slot_bind_for_local(ctx: &mut FnCtx<'_>, local_id: u32) {
-    let Some(slot_idx) = ctx.shadow_slot_map.get(&local_id).copied() else {
-        return;
-    };
-    let Some(local_slot) = ctx.locals.get(&local_id).cloned() else {
-        return;
-    };
-    ctx.block().call_void(
-        "js_shadow_slot_bind",
-        &[(I32, &slot_idx.to_string()), (PTR, &local_slot)],
-    );
-}
-
-pub(crate) fn emit_shadow_slot_update_for_expr(
-    ctx: &mut FnCtx<'_>,
-    local_id: u32,
-    value_reg: &str,
-    rhs: &Expr,
-) {
-    let Some(slot_idx) = ctx.shadow_slot_map.get(&local_id).copied() else {
-        return;
-    };
-    if expr_is_known_non_pointer_shadow_value(ctx, rhs) {
-        emit_shadow_slot_clear(ctx, slot_idx);
-    } else {
-        emit_shadow_slot_bind_for_local(ctx, local_id);
-        let v_i64 = ctx.block().bitcast_double_to_i64(value_reg);
-        ctx.block().call_void(
-            "js_shadow_slot_set",
-            &[(I32, &slot_idx.to_string()), (I64, &v_i64)],
-        );
-    }
-}
-
 /// (Issue #50) Info about a flat-folded const 2D int array.
 #[derive(Debug, Clone)]
 pub struct FlatConstInfo {
@@ -1024,6 +1025,113 @@ pub(crate) struct BoundedIndexPair {
     pub index_local_id: u32,
     pub array_local_id: u32,
     pub scope_id: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PackedNumericLoopKind {
+    F64,
+    I32,
+    U32,
+}
+
+impl PackedNumericLoopKind {
+    pub(crate) fn array_kind_label(self) -> &'static str {
+        match self {
+            Self::F64 => "packed_f64",
+            Self::I32 => "packed_i32",
+            Self::U32 => "packed_u32",
+        }
+    }
+
+    pub(crate) fn loop_label(self) -> &'static str {
+        match self {
+            Self::F64 => "packed_f64",
+            Self::I32 => "packed_i32",
+            Self::U32 => "packed_u32",
+        }
+    }
+
+    pub(crate) fn guard_expr_kind(self) -> &'static str {
+        match self {
+            Self::F64 => "PackedF64LoopGuard",
+            Self::I32 => "PackedI32LoopGuard",
+            Self::U32 => "PackedU32LoopGuard",
+        }
+    }
+
+    pub(crate) fn guard_consumer(self) -> &'static str {
+        match self {
+            Self::F64 => "packed_f64_loop_guard",
+            Self::I32 => "packed_i32_loop_guard",
+            Self::U32 => "packed_u32_loop_guard",
+        }
+    }
+
+    pub(crate) fn fallback_consumer(self) -> &'static str {
+        match self {
+            Self::F64 => "packed_f64_loop_fallback",
+            Self::I32 => "packed_i32_loop_fallback",
+            Self::U32 => "packed_u32_loop_fallback",
+        }
+    }
+
+    pub(crate) fn load_expr_kind(self) -> &'static str {
+        match self {
+            Self::F64 => "PackedF64LoopLoad",
+            Self::I32 => "PackedI32LoopLoad",
+            Self::U32 => "PackedU32LoopLoad",
+        }
+    }
+
+    pub(crate) fn load_consumer_f64(self) -> &'static str {
+        match self {
+            Self::F64 => "packed_f64_loop_load",
+            Self::I32 => "packed_i32_loop_load_f64",
+            Self::U32 => "packed_u32_loop_load_f64",
+        }
+    }
+
+    pub(crate) fn store_expr_kind(self) -> &'static str {
+        match self {
+            Self::F64 => "PackedF64LoopStore",
+            Self::I32 => "PackedI32LoopStore",
+            Self::U32 => "PackedU32LoopStore",
+        }
+    }
+
+    pub(crate) fn store_consumer(self) -> &'static str {
+        match self {
+            Self::F64 => "packed_f64_loop_store",
+            Self::I32 => "packed_i32_loop_store",
+            Self::U32 => "packed_u32_loop_store",
+        }
+    }
+
+    pub(crate) fn store_side_exit_consumer(self) -> &'static str {
+        match self {
+            Self::F64 => "packed_f64_loop_store_side_exit",
+            Self::I32 => "packed_i32_loop_store_side_exit",
+            Self::U32 => "packed_u32_loop_store_side_exit",
+        }
+    }
+
+    pub(crate) fn store_guard_detail(self) -> &'static str {
+        match self {
+            Self::F64 => "packed_f64_loop_store_guard",
+            Self::I32 => "packed_i32_loop_store_guard",
+            Self::U32 => "packed_u32_loop_store_guard",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PackedF64LoopFact {
+    pub index_local_id: u32,
+    pub array_local_id: u32,
+    pub scope_id: u32,
+    pub guard_id: String,
+    pub store_side_exit_label: String,
+    pub array_kind: PackedNumericLoopKind,
 }
 
 impl<'a> FnCtx<'a> {
@@ -1080,328 +1188,6 @@ impl<'a> FnCtx<'a> {
             native_region_slug(label)
         )
     }
-
-    pub fn record_lowered_value(
-        &mut self,
-        expr_kind: impl Into<String>,
-        local_id: Option<u32>,
-        consumer: impl Into<String>,
-        lowered: &LoweredValue,
-        bounds_state: Option<BoundsState>,
-        alias_state: Option<AliasState>,
-        materialization_reason: Option<MaterializationReason>,
-        emitted_inbounds: bool,
-        emitted_noalias: bool,
-        notes: Vec<String>,
-    ) {
-        self.record_lowered_value_with_access_mode(
-            expr_kind,
-            local_id,
-            consumer,
-            lowered,
-            bounds_state,
-            alias_state,
-            None,
-            materialization_reason,
-            emitted_inbounds,
-            emitted_noalias,
-            notes,
-        );
-    }
-
-    pub fn record_lowered_value_with_access_mode(
-        &mut self,
-        expr_kind: impl Into<String>,
-        local_id: Option<u32>,
-        consumer: impl Into<String>,
-        lowered: &LoweredValue,
-        bounds_state: Option<BoundsState>,
-        alias_state: Option<AliasState>,
-        access_mode: Option<BufferAccessMode>,
-        materialization_reason: Option<MaterializationReason>,
-        emitted_inbounds: bool,
-        emitted_noalias: bool,
-        notes: Vec<String>,
-    ) {
-        self.record_lowered_value_with_access_mode_and_conversion(
-            expr_kind,
-            local_id,
-            consumer,
-            lowered,
-            bounds_state,
-            alias_state,
-            access_mode,
-            materialization_reason,
-            None,
-            None,
-            emitted_inbounds,
-            emitted_noalias,
-            notes,
-        );
-    }
-
-    pub fn record_lowered_value_with_access_mode_and_conversion(
-        &mut self,
-        expr_kind: impl Into<String>,
-        local_id: Option<u32>,
-        consumer: impl Into<String>,
-        lowered: &LoweredValue,
-        bounds_state: Option<BoundsState>,
-        alias_state: Option<AliasState>,
-        access_mode: Option<BufferAccessMode>,
-        materialization_reason: Option<MaterializationReason>,
-        scalar_conversion: Option<ScalarConversionRecord>,
-        buffer_access: Option<BufferAccessFacts>,
-        emitted_inbounds: bool,
-        emitted_noalias: bool,
-        notes: Vec<String>,
-    ) {
-        self.record_lowered_value_full(
-            expr_kind,
-            local_id,
-            consumer,
-            lowered,
-            bounds_state,
-            alias_state,
-            access_mode,
-            materialization_reason,
-            scalar_conversion,
-            buffer_access,
-            Vec::new(),
-            Vec::new(),
-            None,
-            emitted_inbounds,
-            emitted_noalias,
-            notes,
-        );
-    }
-
-    pub fn record_lowered_value_with_access_mode_and_facts(
-        &mut self,
-        expr_kind: impl Into<String>,
-        local_id: Option<u32>,
-        consumer: impl Into<String>,
-        lowered: &LoweredValue,
-        bounds_state: Option<BoundsState>,
-        alias_state: Option<AliasState>,
-        access_mode: Option<BufferAccessMode>,
-        materialization_reason: Option<MaterializationReason>,
-        scalar_conversion: Option<ScalarConversionRecord>,
-        buffer_access: Option<BufferAccessFacts>,
-        extra_consumed_facts: Vec<NativeFactUse>,
-        extra_rejected_facts: Vec<NativeFactUse>,
-        emitted_inbounds: bool,
-        emitted_noalias: bool,
-        notes: Vec<String>,
-    ) {
-        self.record_lowered_value_full(
-            expr_kind,
-            local_id,
-            consumer,
-            lowered,
-            bounds_state,
-            alias_state,
-            access_mode,
-            materialization_reason,
-            scalar_conversion,
-            buffer_access,
-            extra_consumed_facts,
-            extra_rejected_facts,
-            None,
-            emitted_inbounds,
-            emitted_noalias,
-            notes,
-        );
-    }
-
-    pub fn record_lowered_value_with_native_abi(
-        &mut self,
-        expr_kind: impl Into<String>,
-        consumer: impl Into<String>,
-        lowered: &LoweredValue,
-        native_abi_type: NativeAbiTypeRecord,
-        notes: Vec<String>,
-    ) {
-        self.record_lowered_value_full(
-            expr_kind,
-            None,
-            consumer,
-            lowered,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            Some(native_abi_type),
-            false,
-            false,
-            notes,
-        );
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn record_lowered_value_with_native_abi_and_pod_layout(
-        &mut self,
-        expr_kind: impl Into<String>,
-        local_id: Option<u32>,
-        consumer: impl Into<String>,
-        lowered: &LoweredValue,
-        native_abi_type: NativeAbiTypeRecord,
-        pod_layout: Option<PodLayoutManifest>,
-        access_mode: Option<BufferAccessMode>,
-        materialization_reason: Option<MaterializationReason>,
-        notes: Vec<String>,
-    ) {
-        self.record_lowered_value_full(
-            expr_kind,
-            local_id,
-            consumer,
-            lowered,
-            None,
-            None,
-            access_mode,
-            materialization_reason,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            Some(native_abi_type),
-            false,
-            false,
-            notes,
-        );
-        if let Some(layout) = pod_layout {
-            if let Some(record) = self.native_rep_records.last_mut() {
-                record.pod_layout = Some(layout);
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn record_lowered_value_with_native_abi_and_pod_view(
-        &mut self,
-        expr_kind: impl Into<String>,
-        local_id: Option<u32>,
-        consumer: impl Into<String>,
-        lowered: &LoweredValue,
-        native_abi_type: NativeAbiTypeRecord,
-        pod_layout: Option<PodLayoutManifest>,
-        pod_record_view: PodRecordViewManifest,
-        access_mode: Option<BufferAccessMode>,
-        materialization_reason: Option<MaterializationReason>,
-        notes: Vec<String>,
-    ) {
-        self.record_lowered_value_full(
-            expr_kind,
-            local_id,
-            consumer,
-            lowered,
-            None,
-            None,
-            access_mode,
-            materialization_reason,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            Some(native_abi_type),
-            false,
-            false,
-            notes,
-        );
-        if let Some(record) = self.native_rep_records.last_mut() {
-            record.pod_layout = pod_layout;
-            record.pod_record_view = Some(pod_record_view);
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn record_lowered_value_full(
-        &mut self,
-        expr_kind: impl Into<String>,
-        local_id: Option<u32>,
-        consumer: impl Into<String>,
-        lowered: &LoweredValue,
-        bounds_state: Option<BoundsState>,
-        alias_state: Option<AliasState>,
-        access_mode: Option<BufferAccessMode>,
-        materialization_reason: Option<MaterializationReason>,
-        scalar_conversion: Option<ScalarConversionRecord>,
-        buffer_access: Option<BufferAccessFacts>,
-        extra_consumed_facts: Vec<NativeFactUse>,
-        extra_rejected_facts: Vec<NativeFactUse>,
-        native_abi_type: Option<NativeAbiTypeRecord>,
-        emitted_inbounds: bool,
-        emitted_noalias: bool,
-        notes: Vec<String>,
-    ) {
-        let block_label = self.current_block_label();
-        let (mut consumed_facts, mut rejected_facts) = native_record::native_fact_uses_for_record(
-            local_id,
-            lowered,
-            bounds_state.as_ref(),
-            alias_state.as_ref(),
-            access_mode.as_ref(),
-            materialization_reason.as_ref(),
-        );
-        consumed_facts.extend(extra_consumed_facts);
-        rejected_facts.extend(extra_rejected_facts);
-        let fallback_reason = if matches!(
-            access_mode.as_ref(),
-            Some(BufferAccessMode::DynamicFallback)
-        ) {
-            materialization_reason.clone()
-        } else {
-            None
-        };
-        let native_value_state = if matches!(
-            access_mode.as_ref(),
-            Some(BufferAccessMode::DynamicFallback)
-        ) {
-            NativeValueState::DynamicFallback
-        } else if materialization_reason.is_some() {
-            NativeValueState::Materialized
-        } else {
-            NativeValueState::RegionLocal
-        };
-        self.native_rep_records.push(NativeRepRecord {
-            function: self.func.name.clone(),
-            block_label: block_label.clone(),
-            region_id: self.active_region_id.clone(),
-            source_function: self.source_function.clone(),
-            lowering_block: block_label,
-            local_id,
-            expr_kind: expr_kind.into(),
-            source_key: None,
-            semantic: lowered.semantic.clone(),
-            native_rep: lowered.rep.clone(),
-            native_rep_name: lowered.rep.name().to_string(),
-            llvm_ty: lowered.llvm_ty,
-            llvm_value: lowered.value.clone(),
-            consumer: consumer.into(),
-            bounds_state,
-            alias_state,
-            access_mode,
-            buffer_access,
-            native_owned_view: None,
-            materialization_reason,
-            fallback_reason,
-            native_value_state,
-            native_abi_transition: scalar_conversion.clone(),
-            scalar_conversion,
-            native_abi_type,
-            pod_layout: None,
-            pod_record_view: None,
-            consumed_facts,
-            rejected_facts,
-            emitted_inbounds,
-            emitted_noalias,
-            notes,
-        });
-    }
 }
 
 // Issue #1098 phase 2: lower_expr arm-bodies extracted into
@@ -1442,621 +1228,1157 @@ mod static_method;
 mod string_regex_proc;
 mod super_method;
 mod this_super_call;
+pub(crate) use this_super_call::is_other_builtin_constructor_name;
 mod unary;
 mod url_main;
 
-/// Lower an expression to a raw LLVM `double` value. Returns the string form
-/// of the value (either a `%rN` register or a literal like `42.0`).
-///
-/// Issue #1098: split into per-chunk sibling modules. The outer match
-/// here is a dispatch table; each module's `lower(ctx, expr)` contains the
-/// original arm bodies verbatim.
-pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
-    match expr {
-        Expr::Integer(..)
-        | Expr::Number(..)
-        | Expr::Bool(..)
-        | Expr::Undefined
-        | Expr::Null
-        | Expr::Void(..)
-        | Expr::TypeOf(..)
-        | Expr::String(..)
-        | Expr::WtfString(..)
-        | Expr::LocalGet(..)
-        | Expr::LocalSet(..)
-        | Expr::Update { .. }
-        | Expr::DateNow => literals_vars::lower(ctx, expr),
-        Expr::Binary { .. } => binary::lower(ctx, expr),
-        Expr::Unary { .. } => unary::lower(ctx, expr),
-        Expr::Compare { .. } => compare::lower(ctx, expr),
-        Expr::Object(..) | Expr::Array(..) | Expr::ArraySpread(..) => {
-            objects_arrays_lit::lower(ctx, expr)
-        }
-        Expr::IndexGet { .. } => index_get::lower(ctx, expr),
-        Expr::IndexSet { .. } => index_set::lower(ctx, expr),
-        Expr::PropertySet { .. } => property_set::lower(ctx, expr),
-        Expr::PropertyGet { .. } => property_get::lower(ctx, expr),
-        Expr::Conditional { .. } => conditional::lower(ctx, expr),
-        Expr::ArrayPush { .. } | Expr::ArrayPushSpread { .. } => array_push::lower(ctx, expr),
-        Expr::Closure { .. } => closure::lower(ctx, expr),
-        Expr::New { .. } | Expr::NewDynamic { .. } | Expr::NewDynamicSpread { .. } => {
-            new_dynamic::lower(ctx, expr)
-        }
-        Expr::This | Expr::NewTarget | Expr::SuperCall(..) | Expr::SuperCallSpread(..) => {
-            this_super_call::lower(ctx, expr)
-        }
-        Expr::IsNaN(..)
-        | Expr::MathPow(..)
-        | Expr::MathImul(..)
-        | Expr::ErrorNew(..)
-        | Expr::ArrayPop(..)
-        | Expr::ArrayMap { .. }
-        | Expr::MapSet { .. }
-        | Expr::MapGet { .. }
-        | Expr::MapHas { .. }
-        | Expr::MathSqrt(..)
-        | Expr::MathFloor(..)
-        | Expr::MathCeil(..)
-        | Expr::MathRound(..)
-        | Expr::MathTrunc(..)
-        | Expr::MathSign(..)
-        | Expr::MathAbs(..)
-        | Expr::MathLog(..)
-        | Expr::MathLog2(..)
-        | Expr::MathLog10(..)
-        | Expr::MathLog1p(..)
-        | Expr::MathRandom
-        | Expr::WebAssemblyValidate(..)
-        | Expr::WebAssemblyCompile(..)
-        | Expr::WebAssemblyModuleNew(..)
-        | Expr::WebAssemblyModuleExports(..)
-        | Expr::WebAssemblyModuleImports(..)
-        | Expr::WebAssemblyModuleCustomSections { .. }
-        | Expr::WebAssemblyInstantiate(..)
-        | Expr::WebAssemblyCallExport { .. }
-        | Expr::JsonStringifyFull(..)
-        | Expr::MapNew => math_simple::lower(ctx, expr),
-        Expr::Logical { .. }
-        | Expr::ArrayFilter { .. }
-        | Expr::FetchWithOptions { .. }
-        | Expr::ArraySome { .. }
-        | Expr::ArrayEvery { .. }
-        | Expr::ArrayJoin { .. }
-        | Expr::MapDelete { .. }
-        | Expr::ObjectKeys(..)
-        | Expr::ForInKeys(..)
-        | Expr::IsFinite(..)
-        | Expr::NumberIsFinite(..)
-        | Expr::IsUndefinedOrBareNan(..)
-        | Expr::MathMin(..)
-        | Expr::MathMinSpread(..)
-        | Expr::MathMax(..)
-        | Expr::MathMaxSpread(..)
-        | Expr::StringCoerce(..)
-        | Expr::ObjectCoerce(..)
-        | Expr::BooleanCoerce(..)
-        | Expr::ArraySlice { .. }
-        | Expr::ArrayShift(..)
-        | Expr::ArrayLikeMethod { .. }
-        | Expr::SetNew
-        | Expr::In { .. }
-        | Expr::PrivateBrandCheck { .. }
-        | Expr::PrivateGuard { .. }
-        | Expr::ParseInt { .. }
-        | Expr::ParseFloat(..)
-        | Expr::RegExp { .. }
-        | Expr::RegExpDynamic { .. }
-        | Expr::ObjectSpread { .. }
-        | Expr::ObjectAssign { .. }
-        | Expr::SetNewFromArray(..) => logical_collections::lower(ctx, expr),
-        Expr::StaticMethodCall { .. } => static_method::lower(ctx, expr),
-        Expr::SuperMethodCall { .. }
-        | Expr::SuperMethodCallSpread { .. }
-        | Expr::SuperPropertyGet { .. }
-        | Expr::SuperPropertySet { .. }
-        | Expr::ObjectSuperPropertyGet { .. }
-        | Expr::ObjectSuperPropertySet { .. }
-        | Expr::ObjectSuperMethodCall { .. }
-        | Expr::FsReadFileBinary(..) => super_method::lower(ctx, expr),
-        Expr::WithGet { .. }
-        | Expr::WithSet { .. }
-        | Expr::InstanceOf { .. }
-        | Expr::Delete(..)
-        | Expr::Sequence(..)
-        | Expr::ArrayFrom(..)
-        | Expr::ArrayFromArrayLikeHoley(..)
-        | Expr::IteratorFrom(..)
-        | Expr::TaggedTemplateStrings { .. }
-        | Expr::TemplateRaw(..)
-        | Expr::ArrayFromMapped { .. }
-        | Expr::Uint8ArrayFrom(..)
-        | Expr::ObjectValues(..)
-        | Expr::ObjectEntries(..)
-        | Expr::PathJoin(..)
-        | Expr::PathWin32Join(..)
-        | Expr::PathWin32 { .. }
-        | Expr::QueueMicrotask(..)
-        | Expr::ProcessNextTick { .. }
-        | Expr::RegExpTest { .. }
-        | Expr::RegExpExec { .. }
-        | Expr::GlobalGet(..)
-        | Expr::PathDirname(..)
-        | Expr::PathRelative(..)
-        | Expr::ArrayIncludes { .. }
-        | Expr::ArraySplice { .. }
-        | Expr::ObjectFromEntries(..)
-        | Expr::ObjectGroupBy { .. }
-        | Expr::MapGroupBy { .. }
-        | Expr::StringMatch { .. }
-        | Expr::StringMatchAll { .. }
-        | Expr::PropertyUpdate { .. }
-        | Expr::IndexUpdate { .. }
-        | Expr::PathBasename(..)
-        | Expr::PathBasenameExt(..)
-        | Expr::PathParse(..)
-        | Expr::JsonParse(..)
-        | Expr::JsonRawJson(..)
-        | Expr::JsonIsRawJson(..)
-        | Expr::JsonParseTyped { .. }
-        | Expr::JsonParseReviver { .. }
-        | Expr::JsonParseWithReviver(..) => instance_misc1::lower(ctx, expr),
-        Expr::DateNew(..)
-        | Expr::BoxedPrimitiveNew { .. }
-        | Expr::ArrayFind { .. }
-        | Expr::ArrayFindIndex { .. }
-        | Expr::ArrayFindLast { .. }
-        | Expr::ArrayFindLastIndex { .. }
-        | Expr::ObjectIs(..)
-        | Expr::NumberIsInteger(..)
-        | Expr::MapClear(..)
-        | Expr::MapEntries(..)
-        | Expr::MapKeys(..)
-        | Expr::MapValues(..)
-        | Expr::MapEntryKeyAt { .. }
-        | Expr::MapEntryValueAt { .. }
-        | Expr::SetValueAt { .. }
-        | Expr::SetValues(..)
-        | Expr::ObjectIsFrozen(..)
-        | Expr::ObjectIsSealed(..)
-        | Expr::ObjectIsExtensible(..)
-        | Expr::FuncRef(..)
-        | Expr::PathExtname(..)
-        | Expr::PathSep
-        | Expr::PathDelimiter
-        | Expr::PathFormat(..)
-        | Expr::PathToNamespacedPath(..)
-        | Expr::PathMatchesGlob(..)
-        | Expr::PathResolveJoin(..)
-        | Expr::ProcessVersion
-        | Expr::ObjectHasOwn(..)
-        | Expr::NumberIsNaN(..)
-        | Expr::FsMkdirSync(..)
-        | Expr::IteratorToArray(..)
-        | Expr::GetIterator(..)
-        | Expr::GetAsyncIterator(..)
-        | Expr::ForOfToArray(..)
-        | Expr::ForAwaitToArray(..)
-        | Expr::WeakRefDeref(..)
-        | Expr::Uint8ArrayNew(..)
-        | Expr::Uint8ArrayLength(..)
-        | Expr::Uint8ArrayGet { .. }
-        | Expr::Uint8ArraySet { .. }
-        | Expr::BufferIndexGet { .. }
-        | Expr::BufferIndexSet { .. }
-        | Expr::TypedArrayNew { .. }
-        | Expr::NativeArenaAlloc(..)
-        | Expr::NativeArenaView { .. }
-        | Expr::NativePodView { .. }
-        | Expr::NativeArenaDispose(..)
-        | Expr::ArrayUnshift { .. }
-        | Expr::ArrayEntries(..)
-        | Expr::ArrayKeys(..)
-        | Expr::ArrayValues(..)
-        | Expr::ClassRef(..) => arrays_finds::lower(ctx, expr),
-        Expr::NativeMemoryFillU32 { .. } | Expr::NativeMemoryCopy { .. } => {
-            native_memory::lower(ctx, expr)
-        }
-        Expr::CallSpread { .. } => call_spread::lower(ctx, expr),
-        Expr::MathFround(..)
-        | Expr::MathF16round(..)
-        | Expr::MapNewFromArray(..)
-        | Expr::DateGetTime(..)
-        | Expr::DateGetTimezoneOffset(..)
-        | Expr::DateUtc(..)
-        | Expr::ObjectDefineProperty(..)
-        | Expr::PathIsAbsolute(..)
-        | Expr::ProcessHrtimeBigint
-        | Expr::ProcessHrtime(..)
-        | Expr::ProcessTitle
-        | Expr::ProcessSetTitle(..)
-        | Expr::RegExpExecIndex
-        | Expr::CryptoRandomUUID
-        | Expr::CryptoRandomUUIDv7
-        | Expr::CryptoRandomBytes(..)
-        | Expr::CryptoSha256(..)
-        | Expr::CryptoMd5(..)
-        | Expr::WebCryptoDigest { .. }
-        | Expr::WebCryptoImportKey { .. }
-        | Expr::WebCryptoExportKey { .. }
-        | Expr::WebCryptoSign { .. }
-        | Expr::WebCryptoVerify { .. }
-        | Expr::WebCryptoDeriveBits { .. }
-        | Expr::WebCryptoDeriveKey { .. }
-        | Expr::WebCryptoEncrypt { .. }
-        | Expr::WebCryptoDecrypt { .. }
-        | Expr::WebCryptoGenerateKey { .. }
-        | Expr::WebCryptoWrapKey { .. }
-        | Expr::WebCryptoUnwrapKey { .. }
-        | Expr::CryptoRandomFillSync { .. }
-        | Expr::ArrayIndexOf { .. }
-        | Expr::ArrayLastIndexOf { .. }
-        | Expr::ArrayForEach { .. }
-        | Expr::ObjectGetOwnPropertyDescriptor(..)
-        | Expr::ObjectGetOwnPropertyDescriptors(..)
-        | Expr::MathCbrt(..)
-        | Expr::DateGetFullYear(..)
-        | Expr::DateGetMonth(..)
-        | Expr::DateGetUtcDay(..)
-        | Expr::DateValueOf(..)
-        | Expr::ProcessOn { .. }
-        | Expr::ProcessOnce { .. }
-        | Expr::ProcessStdinSetRawMode(..)
-        | Expr::ProcessStdinOn { .. }
-        | Expr::ProcessStdinRemoveListener { .. }
-        | Expr::ProcessStdinLifecycle(..)
-        | Expr::ProcessStdoutOn { .. }
-        | Expr::TtyIsAtty(..)
-        | Expr::ProcessStdinIsTTY
-        | Expr::ProcessStdoutIsTTY
-        | Expr::ProcessStderrIsTTY
-        | Expr::ProcessStdoutColumns
-        | Expr::ProcessStdoutRows
-        | Expr::PerformanceNow
-        | Expr::IterResultSet(..)
-        | Expr::IterResultGetValue
-        | Expr::IterResultGetDone
-        | Expr::AsyncStepChain { .. }
-        | Expr::AsyncStepDone { .. }
-        | Expr::CurrentStepClosure
-        | Expr::AsyncFirstCall { .. }
-        | Expr::ObjectGetOwnPropertyNames(..)
-        | Expr::MathHypot(..)
-        | Expr::RegExpExecGroups => misc_methods::lower(ctx, expr),
-        Expr::SetClear(..)
-        | Expr::StringFromCodePoint(..)
-        | Expr::StringFromCharCodeSpread(..)
-        | Expr::StringRaw { .. }
-        | Expr::StringAt { .. }
-        | Expr::StringCodePointAt { .. }
-        | Expr::RegExpSource(..)
-        | Expr::RegExpFlags(..)
-        | Expr::ProcessChdir(..)
-        | Expr::ProcessExit(..)
-        | Expr::ProcessAbort
-        | Expr::ProcessUmask(..)
-        | Expr::ObjectGetPrototypeOf(..)
-        | Expr::ObjectDefineProperties(..)
-        | Expr::ObjectSetPrototypeOf(..)
-        | Expr::MathExpm1(..)
-        | Expr::MathExp(..)
-        | Expr::DateSetUtcFullYear { .. }
-        | Expr::DateGetDate(..)
-        | Expr::DateGetDay(..)
-        | Expr::DateGetUtcDate(..)
-        | Expr::DateGetUtcFullYear(..)
-        | Expr::DateGetUtcMonth(..)
-        | Expr::DateGetHours(..)
-        | Expr::DateGetMinutes(..)
-        | Expr::DateGetSeconds(..)
-        | Expr::DateGetMilliseconds(..)
-        | Expr::DateGetUtcHours(..)
-        | Expr::DateGetUtcMinutes(..)
-        | Expr::DateGetUtcSeconds(..)
-        | Expr::DateGetUtcMilliseconds(..)
-        | Expr::Atob(..)
-        | Expr::Btoa(..)
-        | Expr::ArrayFlat { .. }
-        | Expr::ArrayFlatMap { .. }
-        | Expr::MathSin(..)
-        | Expr::MathCos(..)
-        | Expr::MathSinh(..)
-        | Expr::MathCosh(..)
-        | Expr::MathTanh(..)
-        | Expr::MathTan(..)
-        | Expr::MathAsin(..)
-        | Expr::MathAcos(..)
-        | Expr::MathAtan(..)
-        | Expr::MathAtan2(..)
-        | Expr::StringFromCharCode(..)
-        | Expr::RegExpSetLastIndex { .. }
-        | Expr::ProcessStdin
-        | Expr::ProcessStdout
-        | Expr::ProcessStderr
-        | Expr::MathAsinh(..)
-        | Expr::MathAcosh(..)
-        | Expr::MathAtanh(..)
-        | Expr::DateSetUtcDate { .. }
-        | Expr::DateSetUtcHours { .. }
-        | Expr::ProcessKill { .. }
-        | Expr::SymbolNew(..)
-        | Expr::SymbolFor(..)
-        | Expr::SymbolKeyFor(..)
-        | Expr::SymbolDescription(..)
-        | Expr::RegExpEscape(..)
-        | Expr::SymbolToString(..)
-        | Expr::ObjectGetOwnPropertySymbols(..)
-        | Expr::TextEncoderNew
-        | Expr::TextDecoderNew { .. }
-        | Expr::TextEncoderEncode(..)
-        | Expr::TextEncoderEncodeInto { .. }
-        | Expr::TextDecoderDecode { .. }
-        | Expr::TextDecoderEncoding(..)
-        | Expr::TextDecoderFatal(..)
-        | Expr::TextDecoderIgnoreBom(..)
-        | Expr::OsArch
-        | Expr::OsType
-        | Expr::OsPlatform
-        | Expr::OsRelease
-        | Expr::OsHostname
-        | Expr::OsHomedir
-        | Expr::OsTmpdir
-        | Expr::OsTotalmem
-        | Expr::OsFreemem
-        | Expr::OsUptime
-        | Expr::OsCpus
-        | Expr::OsNetworkInterfaces
-        | Expr::OsUserInfo
-        | Expr::OsUserInfoBuffer
-        | Expr::OsDevNull
-        | Expr::OsAvailableParallelism
-        | Expr::OsEndianness
-        | Expr::OsLoadavg
-        | Expr::OsMachine => string_regex_proc::lower(ctx, expr),
-        Expr::OsVersion
-        | Expr::ProcessMemoryUsage
-        | Expr::ProcessThreadCpuUsage(..)
-        | Expr::ProcessAvailableMemory
-        | Expr::ProcessConstrainedMemory
-        | Expr::ProcessPosixCredential(..)
-        | Expr::ProcessEmitWarning(..)
-        | Expr::ProcessCpuUsage(..)
-        | Expr::ProcessResourceUsage
-        | Expr::ProcessActiveResourcesInfo
-        | Expr::EncodeURI(..)
-        | Expr::DecodeURI(..)
-        | Expr::EncodeURIComponent(..)
-        | Expr::DecodeURIComponent(..)
-        | Expr::DateToString(..)
-        | Expr::DateToDateString(..)
-        | Expr::DateToTimeString(..)
-        | Expr::DateToUTCString(..)
-        | Expr::DateToLocaleDateString(..)
-        | Expr::DateToLocaleTimeString(..)
-        | Expr::DateToJSON(..)
-        | Expr::ArrayReverseValue { .. }
-        | Expr::ArrayWith { .. }
-        | Expr::ArrayCopyWithin { .. }
-        | Expr::ArrayCopyWithinValue { .. }
-        | Expr::ArrayToReversed { .. }
-        | Expr::ArrayToSorted { .. }
-        | Expr::ArrayToSpliced { .. }
-        | Expr::ArrayAt { .. }
-        | Expr::DateSetUtcMinutes { .. }
-        | Expr::DateSetUtcSeconds { .. }
-        | Expr::DateSetUtcMilliseconds { .. }
-        | Expr::Yield { .. }
-        | Expr::TypeErrorNew(..)
-        | Expr::RangeErrorNew(..)
-        | Expr::SyntaxErrorNew(..)
-        | Expr::ReferenceErrorNew(..)
-        | Expr::NumberIsSafeInteger(..)
-        | Expr::ObjectFreeze(..)
-        | Expr::ObjectSeal(..)
-        | Expr::ObjectPreventExtensions(..)
-        | Expr::DateSetUtcMonth { .. }
-        | Expr::DateSetFullYear { .. }
-        | Expr::DateSetMonth { .. }
-        | Expr::DateSetDate { .. }
-        | Expr::DateSetHours { .. }
-        | Expr::DateSetMinutes { .. }
-        | Expr::DateSetSeconds { .. }
-        | Expr::DateSetMilliseconds { .. }
-        | Expr::DateSetTime { .. } => os_uri_dates::lower(ctx, expr),
-        Expr::ArrayIsArray(..)
-        | Expr::AggregateErrorNew { .. }
-        | Expr::RegExpLastIndex(..)
-        | Expr::BufferConcat(..)
-        | Expr::BufferConcatWithLength { .. }
-        | Expr::BufferSlice { .. }
-        | Expr::BufferIsBuffer(..)
-        | Expr::BufferIsEncoding(..)
-        | Expr::StaticPluginResolve(..)
-        | Expr::PathNormalize(..)
-        | Expr::PathResolve(..)
-        | Expr::ObjectCreate(..)
-        | Expr::MathClz32(..)
-        | Expr::FsReadFileSync(..)
-        | Expr::FinalizationRegistryNew(..)
-        | Expr::FinalizationRegistryRegister { .. }
-        | Expr::FinalizationRegistryUnregister { .. }
-        | Expr::ErrorNewWithCause { .. }
-        | Expr::ErrorNewWithOptions { .. }
-        | Expr::EnvGet(..)
-        | Expr::EnvGetDynamic(..)
-        | Expr::ProcessEnv => array_methods::lower(ctx, expr),
-        Expr::GlobalThisExpr
-        | Expr::ModuleTopThis
-        | Expr::DateToISOString(..)
-        | Expr::DateToLocaleString(..)
-        | Expr::FetchGetWithAuth { .. }
-        | Expr::FetchPostWithAuth { .. }
-        | Expr::NetCreateServer { .. }
-        | Expr::DateParse(..)
-        | Expr::ProcessVersions
-        | Expr::ProcessUptime
-        | Expr::ProcessCwd
-        | Expr::OsEOL
-        | Expr::BufferFrom { .. }
-        | Expr::BufferFromArrayBuffer { .. }
-        | Expr::BufferAllocUnsafe(..)
-        | Expr::BufferByteLength { .. }
-        | Expr::BufferAlloc { .. }
-        | Expr::ProcessPid
-        | Expr::ProcessPpid
-        | Expr::ProcessArgv
-        | Expr::StructuredClone { .. }
-        | Expr::WeakRefNew(..) => env_clones::lower(ctx, expr),
-        Expr::FsUnlinkSync(..) | Expr::Await(..) => fs_await::lower(ctx, expr),
-        Expr::StaticFieldGet { .. }
-        | Expr::StaticFieldSet { .. }
-        | Expr::RegisterClassParentDynamic { .. }
-        | Expr::RegisterClassCaptures { .. }
-        | Expr::ClassCaptureValue { .. }
-        | Expr::RegisterClassStaticSymbol { .. }
-        | Expr::RegisterClassComputedMethod { .. }
-        | Expr::RegisterClassComputedAccessor { .. }
-        | Expr::ClassExprFresh { .. }
-        | Expr::SetFunctionPrototype { .. }
-        | Expr::RegisterPrototypeMethod { .. }
-        | Expr::RegisterFunctionPrototypeMethod { .. }
-        | Expr::GetFunctionPrototypeMethod { .. }
-        | Expr::ClassStaticSymbolSet { .. }
-        | Expr::LinkGeneratorPrototype { .. }
-        | Expr::NativeModuleRef(..) => static_field_meta::lower(ctx, expr),
-        Expr::PodLayoutSizeOf { .. }
-        | Expr::PodLayoutAlignOf { .. }
-        | Expr::PodLayoutOffsetOf { .. } => pod_layout_constants::lower(ctx, expr),
-        Expr::ObjectRest { .. }
-        | Expr::BigInt(..)
-        | Expr::BigIntCoerce(..)
-        | Expr::ArraySort { .. }
-        | Expr::ArrayReduce { .. }
-        | Expr::ArrayReduceRight { .. }
-        | Expr::EnumMember { .. }
-        | Expr::FsExistsSync(..)
-        | Expr::NumberCoerce(..)
-        | Expr::SetAdd { .. }
-        | Expr::SetHas { .. }
-        | Expr::SetDelete { .. }
-        | Expr::SetSize(..)
-        | Expr::FsWriteFileSync(..)
-        | Expr::FsAppendFileSync(..) => bigint_set::lower(ctx, expr),
-        Expr::NativeMethodCall { .. } | Expr::Call { .. } => calls::lower(ctx, expr),
-        Expr::ProxyNew { .. }
-        | Expr::ProxyGet { .. }
-        | Expr::ProxySet { .. }
-        | Expr::ProxyHas { .. }
-        | Expr::ProxyDelete { .. }
-        | Expr::ProxyApply { .. }
-        | Expr::ProxyConstruct { .. }
-        | Expr::ProxyRevocable { .. }
-        | Expr::ProxyRevoke(..)
-        | Expr::ReflectGet { .. }
-        | Expr::ReflectSet { .. }
-        | Expr::PutValueSet { .. }
-        | Expr::ReflectHas { .. }
-        | Expr::ReflectDelete { .. }
-        | Expr::ReflectOwnKeys(..)
-        | Expr::ReflectApply { .. }
-        | Expr::ReflectConstruct { .. }
-        | Expr::ReflectDefineProperty { .. }
-        | Expr::ReflectGetOwnPropertyDescriptor { .. }
-        | Expr::ReflectGetPrototypeOf(..)
-        | Expr::ReflectSetPrototypeOf { .. }
-        | Expr::ReflectIsExtensible(..)
-        | Expr::ReflectPreventExtensions(..)
-        | Expr::ReflectDefineMetadata { .. }
-        | Expr::ReflectGetMetadata { .. }
-        | Expr::ReflectGetOwnMetadata { .. }
-        | Expr::ReflectHasMetadata { .. }
-        | Expr::ReflectHasOwnMetadata { .. }
-        | Expr::ReflectGetMetadataKeys { .. }
-        | Expr::ReflectGetOwnMetadataKeys { .. }
-        | Expr::ReflectDeleteMetadata { .. } => proxy_reflect::lower(ctx, expr),
-        Expr::DynamicImport { .. }
-        | Expr::WorkerNew { .. }
-        | Expr::ExternFuncRef { .. }
-        | Expr::I18nString { .. } => dyn_extern_i18n::lower(ctx, expr),
-        Expr::ChildProcessExecSync { .. }
-        | Expr::ChildProcessSpawnSync { .. }
-        | Expr::ChildProcessSpawnBackground { .. }
-        | Expr::ChildProcessSpawn { .. }
-        | Expr::ChildProcessFork { .. }
-        | Expr::ChildProcessExec { .. }
-        | Expr::ChildProcessExecFile { .. }
-        | Expr::ChildProcessExecFileSync { .. }
-        | Expr::ChildProcessGetProcessStatus(..)
-        | Expr::ChildProcessKillProcess(..) => child_proc::lower(ctx, expr),
-        Expr::FileURLToPath(..)
-        | Expr::UrlNew { .. }
-        | Expr::UrlPatternNew { .. }
-        | Expr::UrlGetHref(..)
-        | Expr::UrlGetPathname(..)
-        | Expr::UrlGetProtocol(..)
-        | Expr::UrlGetHost(..)
-        | Expr::UrlGetHostname(..)
-        | Expr::UrlGetPort(..)
-        | Expr::UrlGetSearch(..)
-        | Expr::UrlGetHash(..)
-        | Expr::UrlGetOrigin(..)
-        | Expr::UrlGetSearchParams(..)
-        | Expr::UrlInstanceToString(..)
-        | Expr::UrlInstanceToJSON(..)
-        | Expr::UrlSetPathname { .. }
-        | Expr::UrlSetSearch { .. }
-        | Expr::UrlSetHash { .. }
-        | Expr::UrlSetProtocol { .. }
-        | Expr::UrlSetHostname { .. }
-        | Expr::UrlSetPort { .. }
-        | Expr::UrlSetUsername { .. }
-        | Expr::UrlSetPassword { .. }
-        | Expr::UrlSetHref { .. }
-        | Expr::UrlCanParse(..)
-        | Expr::UrlCanParseWithBase { .. }
-        | Expr::UrlParse(..)
-        | Expr::UrlParseWithBase { .. }
-        | Expr::UrlSearchParamsNew(..)
-        | Expr::UrlSearchParamsMissingArgs { .. }
-        | Expr::UrlSearchParamsGet { .. }
-        | Expr::UrlSearchParamsHas { .. }
-        | Expr::UrlSearchParamsSet { .. }
-        | Expr::UrlSearchParamsAppend { .. }
-        | Expr::UrlSearchParamsDelete { .. }
-        | Expr::UrlSearchParamsToString(..)
-        | Expr::UrlSearchParamsEntries(..)
-        | Expr::UrlSearchParamsKeys(..)
-        | Expr::UrlSearchParamsValues(..)
-        | Expr::UrlSearchParamsSort(..)
-        | Expr::UrlSearchParamsForEach { .. }
-        | Expr::UrlSearchParamsGetAll { .. }
-        | Expr::FsRmRecursive(..) => url_main::lower(ctx, expr),
-        Expr::JsLoadModule { .. }
-        | Expr::JsGetExport { .. }
-        | Expr::JsCallFunction { .. }
-        | Expr::JsCallMethod { .. }
-        | Expr::JsCallValue { .. }
-        | Expr::JsGetProperty { .. }
-        | Expr::JsSetProperty { .. }
-        | Expr::JsNew { .. }
-        | Expr::JsNewFromHandle { .. }
-        | Expr::JsCreateCallback { .. } => js_runtime::lower(ctx, expr),
-        // -------- Unsupported (clear error) --------
-        other => bail!(
-            "perry-codegen Phase 2: expression {} not yet supported",
-            variant_name(other)
-        ),
+fn collection_fact(
+    receiver_kind: &str,
+    fact_suffix: &str,
+    state: &str,
+) -> crate::native_value::NativeFactUse {
+    crate::native_value::NativeFactUse {
+        fact_id: format!("{receiver_kind}.{fact_suffix}"),
+        kind: "type_fact".to_string(),
+        local_id: None,
+        state: state.to_string(),
+        detail: fact_suffix.to_string(),
+        reason: None,
     }
 }
 
-pub(crate) fn lower_math_operand(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
-    let raw = lower_expr(ctx, expr)?;
-    if is_numeric_expr(ctx, expr)
-        && !crate::type_analysis::expr_may_return_boxed_value_from_raw_f64_fallback(ctx, expr)
-    {
-        Ok(raw)
+pub(crate) fn record_collection_string_key_selected(
+    ctx: &mut FnCtx<'_>,
+    expr_kind: &'static str,
+    consumer: &'static str,
+    key_handle: &str,
+    receiver_kind: &'static str,
+    helper: &'static str,
+) {
+    let lowered = LoweredValue::string_ref(key_handle);
+    ctx.record_lowered_value_with_access_mode_and_facts(
+        expr_kind,
+        None,
+        consumer,
+        &lowered,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        vec![collection_fact(
+            receiver_kind,
+            "string_key_helper",
+            "consumed",
+        )],
+        Vec::new(),
+        false,
+        false,
+        vec![
+            format!("selected_helper={helper}"),
+            "key_rep=string_ref".to_string(),
+            "boxed_key_avoided=true".to_string(),
+        ],
+    );
+}
+
+pub(crate) fn record_collection_string_key_value_selected(
+    ctx: &mut FnCtx<'_>,
+    expr_kind: &'static str,
+    consumer: &'static str,
+    lowered_value: &LoweredValue,
+    receiver_kind: &'static str,
+    value_fact_suffix: &'static str,
+    helper: &'static str,
+) {
+    ctx.record_lowered_value_with_access_mode_and_facts(
+        expr_kind,
+        None,
+        consumer,
+        lowered_value,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        vec![
+            collection_fact(receiver_kind, "string_key_helper", "consumed"),
+            collection_fact(receiver_kind, value_fact_suffix, "consumed"),
+        ],
+        Vec::new(),
+        false,
+        false,
+        vec![
+            format!("selected_helper={helper}"),
+            "key_rep=string_ref".to_string(),
+            format!("value_rep={}", lowered_value.rep.name()),
+            "boxed_key_avoided=true".to_string(),
+            "boxed_value_avoided_until_map_slot=true".to_string(),
+        ],
+    );
+}
+
+pub(crate) fn record_collection_string_key_fallback(
+    ctx: &mut FnCtx<'_>,
+    expr_kind: &'static str,
+    consumer: &'static str,
+    key_box: &str,
+    receiver_kind: &'static str,
+    helper: &'static str,
+    reason: &'static str,
+) {
+    let lowered = LoweredValue::js_value(key_box);
+    ctx.record_lowered_value_with_access_mode_and_facts(
+        expr_kind,
+        None,
+        consumer,
+        &lowered,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Vec::new(),
+        vec![collection_fact(
+            receiver_kind,
+            "string_key_helper",
+            "rejected",
+        )],
+        false,
+        false,
+        vec![
+            format!("generic_helper={helper}"),
+            format!("typed_collection_rejected={reason}"),
+            "key_rep=js_value".to_string(),
+        ],
+    );
+}
+
+pub(crate) fn record_collection_number_key_selected(
+    ctx: &mut FnCtx<'_>,
+    expr_kind: &'static str,
+    consumer: &'static str,
+    key_raw: &str,
+    receiver_kind: &'static str,
+    fact_suffix: &'static str,
+    helper: &'static str,
+    key_label: &'static str,
+) {
+    let lowered = LoweredValue::f64(key_raw.to_string());
+    ctx.record_lowered_value_with_access_mode_and_facts(
+        expr_kind,
+        None,
+        consumer,
+        &lowered,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        vec![collection_fact(receiver_kind, fact_suffix, "consumed")],
+        Vec::new(),
+        false,
+        false,
+        vec![
+            format!("selected_helper={helper}"),
+            format!("{key_label}_rep=raw_f64"),
+            format!("{key_label}_guard=js_typed_f64_arg_guard"),
+            "generic_helper_avoided=true".to_string(),
+        ],
+    );
+}
+
+pub(crate) fn record_collection_number_key_fallback(
+    ctx: &mut FnCtx<'_>,
+    expr_kind: &'static str,
+    consumer: &'static str,
+    key_box: &str,
+    receiver_kind: &'static str,
+    fact_suffix: &'static str,
+    helper: &'static str,
+    reason: &'static str,
+    key_label: &'static str,
+) {
+    let lowered = LoweredValue::js_value(key_box);
+    ctx.record_lowered_value_with_access_mode_and_facts(
+        expr_kind,
+        None,
+        consumer,
+        &lowered,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Vec::new(),
+        vec![collection_fact(receiver_kind, fact_suffix, "rejected")],
+        false,
+        false,
+        vec![
+            format!("generic_helper={helper}"),
+            format!("typed_collection_rejected={reason}"),
+            format!("{key_label}_rep=js_value"),
+        ],
+    );
+}
+
+pub(crate) fn record_collection_typed_value_selected(
+    ctx: &mut FnCtx<'_>,
+    expr_kind: &'static str,
+    consumer: &'static str,
+    lowered_value: &LoweredValue,
+    receiver_kind: &'static str,
+    fact_suffix: &'static str,
+    helper: &'static str,
+    slot_boundary: &'static str,
+) {
+    ctx.record_lowered_value_with_access_mode_and_facts(
+        expr_kind,
+        None,
+        consumer,
+        lowered_value,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        vec![collection_fact(receiver_kind, fact_suffix, "consumed")],
+        Vec::new(),
+        false,
+        false,
+        vec![
+            format!("selected_helper={helper}"),
+            format!("value_rep={}", lowered_value.rep.name()),
+            format!("boxed_value_avoided_until_{slot_boundary}=true"),
+        ],
+    );
+}
+
+pub(crate) fn record_collection_typed_value_fallback(
+    ctx: &mut FnCtx<'_>,
+    expr_kind: &'static str,
+    consumer: &'static str,
+    value_box: &str,
+    receiver_kind: &'static str,
+    fact_suffix: &'static str,
+    helper: &'static str,
+    reason: &'static str,
+) {
+    let lowered = LoweredValue::js_value(value_box);
+    ctx.record_lowered_value_with_access_mode_and_facts(
+        expr_kind,
+        None,
+        consumer,
+        &lowered,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Vec::new(),
+        vec![collection_fact(receiver_kind, fact_suffix, "rejected")],
+        false,
+        false,
+        vec![
+            format!("generic_helper={helper}"),
+            format!("typed_collection_rejected={reason}"),
+            "value_rep=js_value".to_string(),
+        ],
+    );
+}
+
+fn is_plain_f64_local(ctx: &FnCtx<'_>, id: u32) -> bool {
+    !ctx.closure_captures.contains_key(&id)
+        && !ctx.boxed_vars.contains(&id)
+        && !ctx.module_globals.contains_key(&id)
+        && !ctx.i32_counter_slots.contains_key(&id)
+        && ctx.locals.contains_key(&id)
+        && matches!(
+            ctx.local_types.get(&id),
+            Some(HirType::Number | HirType::Int32)
+        )
+}
+
+fn is_plain_i1_local(ctx: &FnCtx<'_>, id: u32) -> bool {
+    !ctx.closure_captures.contains_key(&id)
+        && !ctx.boxed_vars.contains(&id)
+        && !ctx.module_globals.contains_key(&id)
+        && ctx.i1_local_slots.contains_key(&id)
+        && matches!(ctx.local_types.get(&id), Some(HirType::Boolean))
+}
+
+pub(crate) fn is_compiler_private_async_i32_control_local(ctx: &FnCtx<'_>, id: u32) -> bool {
+    ctx.boxed_vars.contains(&id) && ctx.compiler_private_async_i32_control_locals.contains(&id)
+}
+
+pub(crate) fn is_compiler_private_async_i1_control_local(ctx: &FnCtx<'_>, id: u32) -> bool {
+    ctx.boxed_vars.contains(&id) && ctx.compiler_private_async_i1_control_locals.contains(&id)
+}
+
+pub(crate) fn load_boxed_local_pointer(ctx: &mut FnCtx<'_>, id: u32) -> Result<Option<String>> {
+    if let Some(&capture_idx) = ctx.closure_captures.get(&id) {
+        let closure_ptr = ctx
+            .current_closure_ptr
+            .clone()
+            .ok_or_else(|| anyhow!("boxed local capture but no current_closure_ptr"))?;
+        let cap_bits = ctx.block().call(
+            I64,
+            "js_closure_get_capture_bits",
+            &[(I64, &closure_ptr), (I32, &capture_idx.to_string())],
+        );
+        return Ok(Some(cap_bits));
+    }
+    if let Some(slot) = ctx.locals.get(&id).cloned() {
+        return Ok(Some(ctx.block().load(I64, &slot)));
+    }
+    Ok(None)
+}
+
+pub(crate) fn box_i1_for_compat_shadow(ctx: &mut FnCtx<'_>, value: &str) -> String {
+    let bits = ctx.block().select(
+        I1,
+        value,
+        I64,
+        crate::nanbox::TAG_TRUE_I64,
+        crate::nanbox::TAG_FALSE_I64,
+    );
+    ctx.block().bitcast_i64_to_double(&bits)
+}
+
+fn i32_constant_expr(expr: &Expr) -> Option<i32> {
+    match expr {
+        Expr::Integer(value) => i32::try_from(*value).ok(),
+        Expr::Number(value) if value.is_finite() && value.fract() == 0.0 => {
+            let int = *value as i64;
+            i32::try_from(int).ok().filter(|_| *value == int as f64)
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn lower_i32_control_store_value(ctx: &mut FnCtx<'_>, value: &Expr) -> Result<String> {
+    if let Some(value) = i32_constant_expr(value) {
+        return Ok(value.to_string());
+    }
+    if let Some(lowered) = lower_expr_value(ctx, value)? {
+        return match lowered.rep {
+            NativeRep::I32 => Ok(lowered.value),
+            NativeRep::U32 => Ok(lowered.value),
+            NativeRep::F64 => Ok(ctx.block().fptosi(DOUBLE, &lowered.value, I32)),
+            _ => {
+                let boxed = materialize_js_value(ctx, lowered, MaterializationReason::RuntimeApi);
+                let number = ctx
+                    .block()
+                    .call(DOUBLE, "js_number_coerce", &[(DOUBLE, &boxed)]);
+                Ok(ctx.block().fptosi(DOUBLE, &number, I32))
+            }
+        };
+    }
+    let boxed = lower_expr(ctx, value)?;
+    let number = ctx
+        .block()
+        .call(DOUBLE, "js_number_coerce", &[(DOUBLE, &boxed)]);
+    Ok(ctx.block().fptosi(DOUBLE, &number, I32))
+}
+
+pub(crate) fn lower_i1_control_store_value(ctx: &mut FnCtx<'_>, value: &Expr) -> Result<String> {
+    if let Some(lowered) = lower_expr_value(ctx, value)? {
+        if matches!(lowered.rep, NativeRep::I1) {
+            return Ok(lowered.value);
+        }
+        let boxed = materialize_js_value(ctx, lowered, MaterializationReason::RuntimeApi);
+        let truthy = crate::lower_conditional::lower_truthy(ctx, &boxed, value);
+        return Ok(truthy);
+    }
+    let boxed = lower_expr(ctx, value)?;
+    Ok(crate::lower_conditional::lower_truthy(ctx, &boxed, value))
+}
+
+fn lower_async_i32_control_const_compare(
+    ctx: &mut FnCtx<'_>,
+    op: CompareOp,
+    left: &Expr,
+    right: &Expr,
+) -> Result<Option<LoweredValue>> {
+    let (id, constant, local_on_left) = match (left, right) {
+        (Expr::LocalGet(id), other) if is_compiler_private_async_i32_control_local(ctx, *id) => {
+            let Some(constant) = i32_constant_expr(other) else {
+                return Ok(None);
+            };
+            (*id, constant, true)
+        }
+        (other, Expr::LocalGet(id)) if is_compiler_private_async_i32_control_local(ctx, *id) => {
+            let Some(constant) = i32_constant_expr(other) else {
+                return Ok(None);
+            };
+            (*id, constant, false)
+        }
+        _ => return Ok(None),
+    };
+    let Some(ptr) = load_boxed_local_pointer(ctx, id)? else {
+        return Ok(None);
+    };
+    let value = ctx.block().call(I32, "js_i32_box_get", &[(I64, &ptr)]);
+    let constant_s = constant.to_string();
+    let (lhs, rhs) = if local_on_left {
+        (value.as_str(), constant_s.as_str())
     } else {
-        Ok(ctx
-            .block()
-            .call(DOUBLE, "js_math_to_number", &[(DOUBLE, &raw)]))
+        (constant_s.as_str(), value.as_str())
+    };
+    let bit = match op {
+        CompareOp::Eq | CompareOp::LooseEq => ctx.block().icmp_eq(I32, lhs, rhs),
+        CompareOp::Ne | CompareOp::LooseNe => ctx.block().icmp_ne(I32, lhs, rhs),
+        CompareOp::Lt => ctx.block().icmp_slt(I32, lhs, rhs),
+        CompareOp::Le => ctx.block().icmp_sle(I32, lhs, rhs),
+        CompareOp::Gt => ctx.block().icmp_sgt(I32, lhs, rhs),
+        CompareOp::Ge => ctx.block().icmp_sge(I32, lhs, rhs),
+    };
+    let lowered = LoweredValue::i1(bit);
+    ctx.record_lowered_value(
+        "Compare",
+        Some(id),
+        "compiler_private_async_control.i32_compare",
+        &lowered,
+        None,
+        None,
+        None,
+        false,
+        false,
+        vec![format!("constant={constant}")],
+    );
+    Ok(Some(lowered))
+}
+
+fn lower_numeric_binary_value(
+    ctx: &mut FnCtx<'_>,
+    op: BinaryOp,
+    left: &Expr,
+    right: &Expr,
+) -> Result<Option<LoweredValue>> {
+    if !matches!(
+        op,
+        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod
+    ) {
+        return Ok(None);
+    }
+    if !is_numeric_expr(ctx, left) || !is_numeric_expr(ctx, right) {
+        return Ok(None);
+    }
+
+    let Some(left) = lower_numeric_operand_value(ctx, left)? else {
+        return Ok(None);
+    };
+    let Some(right) = lower_numeric_operand_value(ctx, right)? else {
+        return Ok(None);
+    };
+    let Some(left_value) = native_number_to_f64(ctx, &left) else {
+        return Ok(None);
+    };
+    let Some(right_value) = native_number_to_f64(ctx, &right) else {
+        return Ok(None);
+    };
+
+    let value = match op {
+        BinaryOp::Add => ctx.block().fadd(&left_value, &right_value),
+        BinaryOp::Sub => ctx.block().fsub(&left_value, &right_value),
+        BinaryOp::Mul => ctx.block().fmul(&left_value, &right_value),
+        BinaryOp::Div => ctx.block().fdiv(&left_value, &right_value),
+        BinaryOp::Mod => ctx.block().frem(&left_value, &right_value),
+        _ => unreachable!("non-arithmetic op filtered above"),
+    };
+    let lowered = LoweredValue::f64(value);
+    ctx.record_lowered_value(
+        "Binary",
+        None,
+        "ordinary_expr_value.numeric_binary_f64",
+        &lowered,
+        None,
+        None,
+        None,
+        false,
+        false,
+        vec![format!("op={op:?}")],
+    );
+    Ok(Some(lowered))
+}
+
+fn lower_numeric_operand_value(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<Option<LoweredValue>> {
+    if let Expr::LocalGet(id) = expr {
+        if let Some(slot) = ctx.i32_counter_slots.get(id).cloned() {
+            let value = ctx.block().load(I32, &slot);
+            let lowered = if ctx.unsigned_i32_locals.contains(id) {
+                LoweredValue::u32(value)
+            } else {
+                LoweredValue::i32(value)
+            };
+            ctx.record_lowered_value(
+                "LocalGet",
+                Some(*id),
+                "ordinary_expr_value.local_i32_operand",
+                &lowered,
+                None,
+                None,
+                None,
+                false,
+                false,
+                Vec::new(),
+            );
+            return Ok(Some(lowered));
+        }
+    }
+    if let Some(lowered) = lower_packed_u32_loop_index_get(ctx, expr)? {
+        return Ok(Some(lowered));
+    }
+    lower_expr_value(ctx, expr)
+}
+
+fn native_number_to_f64(ctx: &mut FnCtx<'_>, lowered: &LoweredValue) -> Option<String> {
+    match &lowered.rep {
+        NativeRep::F64 => Some(lowered.value.clone()),
+        NativeRep::F32 => Some(ctx.block().fpext(F32, &lowered.value, DOUBLE)),
+        NativeRep::I32 => Some(ctx.block().sitofp(I32, &lowered.value, DOUBLE)),
+        NativeRep::U8 => {
+            let widened = ctx.block().zext(I8, &lowered.value, I32);
+            Some(ctx.block().uitofp(I32, &widened, DOUBLE))
+        }
+        NativeRep::U32 | NativeRep::BufferLen => {
+            Some(ctx.block().uitofp(I32, &lowered.value, DOUBLE))
+        }
+        NativeRep::I64 => Some(ctx.block().sitofp(I64, &lowered.value, DOUBLE)),
+        NativeRep::U64 | NativeRep::USize | NativeRep::HandleId => {
+            Some(ctx.block().uitofp(I64, &lowered.value, DOUBLE))
+        }
+        _ => None,
+    }
+}
+
+fn small_bigint_literal_i128(raw: &str) -> Option<i128> {
+    let normalized = raw.replace('_', "");
+    let s = normalized.strip_suffix('n').unwrap_or(&normalized);
+    let (negative, digits) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let (radix, digits) = if let Some(rest) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        (16, rest)
+    } else if let Some(rest) = digits
+        .strip_prefix("0o")
+        .or_else(|| digits.strip_prefix("0O"))
+    {
+        (8, rest)
+    } else if let Some(rest) = digits
+        .strip_prefix("0b")
+        .or_else(|| digits.strip_prefix("0B"))
+    {
+        (2, rest)
+    } else {
+        (10, digits)
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let magnitude = i128::from_str_radix(digits, radix).ok()?;
+    if negative {
+        magnitude.checked_neg()
+    } else {
+        Some(magnitude)
+    }
+}
+
+fn lower_bitwise_operand_i32(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<Option<String>> {
+    if let Expr::Integer(value) = expr {
+        return Ok(Some((*value as i32).to_string()));
+    }
+    if matches!(expr, Expr::IterResultGetValue) {
+        return Ok(Some(
+            lower_expr_native(ctx, expr, ExpectedNativeRep::I32)?.value,
+        ));
+    }
+    if let Expr::LocalGet(id) = expr {
+        if let Some(slot) = ctx.i32_counter_slots.get(id).cloned() {
+            return Ok(Some(ctx.block().load(I32, &slot)));
+        }
+    }
+
+    let Some(lowered) = lower_numeric_operand_value(ctx, expr)? else {
+        return Ok(None);
+    };
+    let value = match lowered.rep {
+        NativeRep::I32 | NativeRep::U32 | NativeRep::BufferLen => lowered.value,
+        NativeRep::U8 => {
+            let raw = lowered.value;
+            ctx.block().zext(I8, &raw, I32)
+        }
+        NativeRep::I1 => {
+            let raw = lowered.value;
+            ctx.block().zext(I1, &raw, I32)
+        }
+        NativeRep::F64 => {
+            if is_known_finite(ctx, expr) {
+                ctx.block().toint32_fast(&lowered.value)
+            } else {
+                ctx.block().toint32_wrap(&lowered.value)
+            }
+        }
+        NativeRep::F32 => {
+            let widened = ctx.block().fpext(F32, &lowered.value, DOUBLE);
+            ctx.block().toint32_wrap(&widened)
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(value))
+}
+
+fn lower_bitwise_binary_value(
+    ctx: &mut FnCtx<'_>,
+    op: BinaryOp,
+    left: &Expr,
+    right: &Expr,
+) -> Result<Option<LoweredValue>> {
+    if !matches!(
+        op,
+        BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor
+            | BinaryOp::Shl
+            | BinaryOp::Shr
+            | BinaryOp::UShr
+    ) {
+        return Ok(None);
+    }
+    if is_bigint_expr(ctx, left) || is_bigint_expr(ctx, right) {
+        return Ok(None);
+    }
+
+    let Some(left_i32) = lower_bitwise_operand_i32(ctx, left)? else {
+        return Ok(None);
+    };
+    let Some(right_i32) = lower_bitwise_operand_i32(ctx, right)? else {
+        return Ok(None);
+    };
+
+    let value = match op {
+        BinaryOp::BitAnd => ctx.block().and(I32, &left_i32, &right_i32),
+        BinaryOp::BitOr => ctx.block().or(I32, &left_i32, &right_i32),
+        BinaryOp::BitXor => ctx.block().xor(I32, &left_i32, &right_i32),
+        // JS masks shift counts to 5 bits (`count & 31`); an LLVM i32 shift
+        // with a count >= 32 is UB, so `x << 40` etc. must mask first.
+        BinaryOp::Shl => {
+            let shift = ctx.block().and(I32, &right_i32, "31");
+            ctx.block().shl(I32, &left_i32, &shift)
+        }
+        BinaryOp::Shr => {
+            let shift = ctx.block().and(I32, &right_i32, "31");
+            ctx.block().ashr(I32, &left_i32, &shift)
+        }
+        BinaryOp::UShr => {
+            let shift = ctx.block().and(I32, &right_i32, "31");
+            ctx.block().lshr(I32, &left_i32, &shift)
+        }
+        _ => unreachable!("non-bitwise op filtered above"),
+    };
+    let lowered = if matches!(op, BinaryOp::UShr) {
+        LoweredValue::u32(value)
+    } else {
+        LoweredValue::i32(value)
+    };
+    ctx.record_lowered_value(
+        "Binary",
+        None,
+        if matches!(op, BinaryOp::UShr) {
+            "ordinary_expr_value.bitwise_u32"
+        } else {
+            "ordinary_expr_value.bitwise_i32"
+        },
+        &lowered,
+        None,
+        None,
+        None,
+        false,
+        false,
+        vec![format!("op={op:?}")],
+    );
+    Ok(Some(lowered))
+}
+
+fn lower_compare_value(
+    ctx: &mut FnCtx<'_>,
+    op: CompareOp,
+    left: &Expr,
+    right: &Expr,
+) -> Result<Option<LoweredValue>> {
+    if let Some(lowered) = lower_async_i32_control_const_compare(ctx, op, left, right)? {
+        return Ok(Some(lowered));
+    }
+    if matches!(op, CompareOp::Eq | CompareOp::Ne)
+        && is_bool_expr(ctx, left)
+        && is_bool_expr(ctx, right)
+    {
+        let Some(left) = lower_expr_value(ctx, left)? else {
+            return Ok(None);
+        };
+        let Some(right) = lower_expr_value(ctx, right)? else {
+            return Ok(None);
+        };
+        if matches!(left.rep, NativeRep::I1) && matches!(right.rep, NativeRep::I1) {
+            let value = if matches!(op, CompareOp::Ne) {
+                ctx.block().icmp_ne(I1, &left.value, &right.value)
+            } else {
+                ctx.block().icmp_eq(I1, &left.value, &right.value)
+            };
+            let lowered = LoweredValue::i1(value);
+            ctx.record_lowered_value(
+                "Compare",
+                None,
+                "ordinary_expr_value.boolean_compare_i1",
+                &lowered,
+                None,
+                None,
+                None,
+                false,
+                false,
+                vec![format!("op={op:?}")],
+            );
+            return Ok(Some(lowered));
+        }
+        return Ok(None);
+    }
+
+    if !is_numeric_expr(ctx, left) || !is_numeric_expr(ctx, right) {
+        return Ok(None);
+    }
+    let Some(left) = lower_expr_value(ctx, left)? else {
+        return Ok(None);
+    };
+    let Some(right) = lower_expr_value(ctx, right)? else {
+        return Ok(None);
+    };
+    if !matches!(left.rep, NativeRep::F64) || !matches!(right.rep, NativeRep::F64) {
+        return Ok(None);
+    }
+    let predicate = match op {
+        CompareOp::Eq | CompareOp::LooseEq => "oeq",
+        CompareOp::Ne | CompareOp::LooseNe => "une",
+        CompareOp::Lt => "olt",
+        CompareOp::Le => "ole",
+        CompareOp::Gt => "ogt",
+        CompareOp::Ge => "oge",
+    };
+    let lowered = LoweredValue::i1(ctx.block().fcmp(predicate, &left.value, &right.value));
+    ctx.record_lowered_value(
+        "Compare",
+        None,
+        "ordinary_expr_value.numeric_compare_i1",
+        &lowered,
+        None,
+        None,
+        None,
+        false,
+        false,
+        vec![format!("op={op:?}")],
+    );
+    Ok(Some(lowered))
+}
+
+/// Lower the representation-first subset of ordinary expressions to a native
+/// value. The compatibility `lower_expr` path below materializes this value
+/// when an existing caller still expects the generic JSValue/`double` ABI.
+pub(crate) fn lower_expr_value(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<Option<LoweredValue>> {
+    match expr {
+        Expr::Bool(value) => {
+            let lowered = LoweredValue::i1(if *value { "true" } else { "false" });
+            ctx.record_lowered_value(
+                "Bool",
+                None,
+                "ordinary_expr_value.boolean_literal_i1",
+                &lowered,
+                None,
+                None,
+                None,
+                false,
+                false,
+                Vec::new(),
+            );
+            Ok(Some(lowered))
+        }
+        Expr::Integer(value) => {
+            let lowered = LoweredValue::f64(double_literal(*value as f64));
+            ctx.record_lowered_value(
+                "Integer",
+                None,
+                "ordinary_expr_value.numeric_literal_f64",
+                &lowered,
+                None,
+                None,
+                None,
+                false,
+                false,
+                Vec::new(),
+            );
+            Ok(Some(lowered))
+        }
+        Expr::Number(value) => {
+            let lowered = LoweredValue::f64(double_literal(*value));
+            ctx.record_lowered_value(
+                "Number",
+                None,
+                "ordinary_expr_value.numeric_literal_f64",
+                &lowered,
+                None,
+                None,
+                None,
+                false,
+                false,
+                Vec::new(),
+            );
+            Ok(Some(lowered))
+        }
+        Expr::BigInt(raw) => {
+            let Some(value) = small_bigint_literal_i128(raw) else {
+                let lowered = LoweredValue::js_value("0.0");
+                ctx.record_lowered_value_with_access_mode(
+                    "BigInt",
+                    None,
+                    "ordinary_expr_value.small_bigint_literal_rejected",
+                    &lowered,
+                    None,
+                    None,
+                    Some(BufferAccessMode::DynamicFallback),
+                    Some(MaterializationReason::RuntimeApi),
+                    false,
+                    false,
+                    vec![
+                        "small_bigint_rejected=literal_outside_i128_or_invalid".to_string(),
+                        "fallback=js_bigint_from_string".to_string(),
+                    ],
+                );
+                return Ok(None);
+            };
+            let lowered = LoweredValue::small_bigint(value.to_string());
+            ctx.record_lowered_value(
+                "BigInt",
+                None,
+                "ordinary_expr_value.small_bigint_literal_i128",
+                &lowered,
+                None,
+                None,
+                None,
+                false,
+                false,
+                vec![
+                    "proof=bigint_literal_fits_i128".to_string(),
+                    "public_semantics=materialize_bigint_object_before_js_boundary".to_string(),
+                ],
+            );
+            Ok(Some(lowered))
+        }
+        Expr::IterResultGetValue => {
+            // Do NOT speculatively lower to the coercing `_f64` variant here.
+            // `lower_expr` tries `lower_expr_value` first for every expression,
+            // so an unconditional f64 lowering would numerically coerce EVERY
+            // await/yield result (the value carried by `AsyncStepChain` /
+            // `AsyncStepDone` and read back into the next step) — turning an
+            // awaited object/string/array into `NaN`. The value is an arbitrary
+            // JSValue, so fall through to the boxed `js_iter_result_get_value`
+            // (misc_methods). Genuinely-numeric consumers (bitwise operands,
+            // `i32_fast_path`) request a native rep explicitly via
+            // `lower_expr_native`, which keeps its own raw-f64/i32/i1 reads.
+            Ok(None)
+        }
+        Expr::LocalGet(id) if is_compiler_private_async_i32_control_local(ctx, *id) => {
+            let Some(ptr) = load_boxed_local_pointer(ctx, *id)? else {
+                return Ok(None);
+            };
+            let value = ctx.block().call(I32, "js_i32_box_get", &[(I64, &ptr)]);
+            let lowered = LoweredValue::i32(value);
+            ctx.record_lowered_value(
+                "LocalGet",
+                Some(*id),
+                "compiler_private_async_control.local_i32",
+                &lowered,
+                None,
+                None,
+                None,
+                false,
+                false,
+                Vec::new(),
+            );
+            Ok(Some(lowered))
+        }
+        Expr::LocalGet(id) if is_compiler_private_async_i1_control_local(ctx, *id) => {
+            let Some(ptr) = load_boxed_local_pointer(ctx, *id)? else {
+                return Ok(None);
+            };
+            let value_i32 = ctx.block().call(I32, "js_bool_box_get", &[(I64, &ptr)]);
+            let value = ctx.block().icmp_ne(I32, &value_i32, "0");
+            let lowered = LoweredValue::i1(value);
+            ctx.record_lowered_value(
+                "LocalGet",
+                Some(*id),
+                "compiler_private_async_control.local_i1",
+                &lowered,
+                None,
+                None,
+                None,
+                false,
+                false,
+                Vec::new(),
+            );
+            Ok(Some(lowered))
+        }
+        Expr::LocalGet(id) if is_plain_i1_local(ctx, *id) => {
+            let slot = ctx
+                .i1_local_slots
+                .get(id)
+                .cloned()
+                .expect("is_plain_i1_local checked local storage");
+            let value = ctx.block().load(I1, &slot);
+            let lowered = LoweredValue::i1(value);
+            ctx.record_lowered_value(
+                "LocalGet",
+                Some(*id),
+                "ordinary_expr_value.local_i1",
+                &lowered,
+                None,
+                None,
+                None,
+                false,
+                false,
+                Vec::new(),
+            );
+            Ok(Some(lowered))
+        }
+        Expr::LocalGet(id) if is_plain_f64_local(ctx, *id) => {
+            let slot = ctx
+                .locals
+                .get(id)
+                .cloned()
+                .expect("is_plain_f64_local checked local storage");
+            let value = ctx.block().load(DOUBLE, &slot);
+            let lowered = LoweredValue::f64(value);
+            ctx.record_lowered_value(
+                "LocalGet",
+                Some(*id),
+                "ordinary_expr_value.local_f64",
+                &lowered,
+                None,
+                None,
+                None,
+                false,
+                false,
+                Vec::new(),
+            );
+            Ok(Some(lowered))
+        }
+        Expr::LocalSet(id, value) if is_compiler_private_async_i32_control_local(ctx, *id) => {
+            invalidate_local_write_facts(ctx, *id);
+            record_local_value_alias_for_write(ctx, *id, value.as_ref());
+            let Some(ptr) = load_boxed_local_pointer(ctx, *id)? else {
+                return Ok(None);
+            };
+            let value_i32 = lower_i32_control_store_value(ctx, value)?;
+            ctx.block()
+                .call_void("js_i32_box_set", &[(I64, &ptr), (I32, &value_i32)]);
+            record_native_arena_owner_assignment(ctx, *id, value.as_ref());
+            record_int_facts_for_local_set(ctx, *id, value);
+            let lowered = LoweredValue::i32(value_i32);
+            ctx.record_lowered_value(
+                "LocalSet",
+                Some(*id),
+                "compiler_private_async_control.local_set_i32",
+                &lowered,
+                None,
+                None,
+                None,
+                false,
+                false,
+                Vec::new(),
+            );
+            Ok(Some(lowered))
+        }
+        Expr::LocalSet(id, value) if is_compiler_private_async_i1_control_local(ctx, *id) => {
+            invalidate_local_write_facts(ctx, *id);
+            record_local_value_alias_for_write(ctx, *id, value.as_ref());
+            let Some(ptr) = load_boxed_local_pointer(ctx, *id)? else {
+                return Ok(None);
+            };
+            let value_i1 = lower_i1_control_store_value(ctx, value)?;
+            let value_i32 = ctx.block().zext(I1, &value_i1, I32);
+            ctx.block()
+                .call_void("js_bool_box_set", &[(I64, &ptr), (I32, &value_i32)]);
+            record_native_arena_owner_assignment(ctx, *id, value.as_ref());
+            let lowered = LoweredValue::i1(value_i1);
+            ctx.record_lowered_value(
+                "LocalSet",
+                Some(*id),
+                "compiler_private_async_control.local_set_i1",
+                &lowered,
+                None,
+                None,
+                None,
+                false,
+                false,
+                Vec::new(),
+            );
+            Ok(Some(lowered))
+        }
+        Expr::LocalSet(id, value) if is_plain_i1_local(ctx, *id) => {
+            invalidate_local_write_facts(ctx, *id);
+            record_local_value_alias_for_write(ctx, *id, value.as_ref());
+            let Some(lowered) = lower_expr_value(ctx, value)? else {
+                ctx.i1_local_slots.remove(id);
+                return Ok(None);
+            };
+            if !matches!(lowered.rep, NativeRep::I1) {
+                ctx.i1_local_slots.remove(id);
+                return Ok(None);
+            }
+            let i1_slot = ctx
+                .i1_local_slots
+                .get(id)
+                .cloned()
+                .expect("is_plain_i1_local checked local storage");
+            ctx.block().store(I1, &lowered.value, &i1_slot);
+            if let Some(slot) = ctx.locals.get(id).cloned() {
+                let shadow = box_i1_for_compat_shadow(ctx, &lowered.value);
+                ctx.block().store(DOUBLE, &shadow, &slot);
+                emit_shadow_slot_update_for_expr(ctx, *id, &shadow, value);
+            }
+            record_native_arena_owner_assignment(ctx, *id, value.as_ref());
+            ctx.record_lowered_value(
+                "LocalSet",
+                Some(*id),
+                "ordinary_expr_value.local_set_i1",
+                &lowered,
+                None,
+                None,
+                None,
+                false,
+                false,
+                Vec::new(),
+            );
+            Ok(Some(lowered))
+        }
+        Expr::LocalSet(id, value) if is_plain_f64_local(ctx, *id) => {
+            invalidate_local_write_facts(ctx, *id);
+            record_local_value_alias_for_write(ctx, *id, value.as_ref());
+            let Some(lowered) = lower_expr_value(ctx, value)? else {
+                return Ok(None);
+            };
+            let Some(stored_value) = native_number_to_f64(ctx, &lowered) else {
+                return Ok(None);
+            };
+            let slot = ctx
+                .locals
+                .get(id)
+                .cloned()
+                .expect("is_plain_f64_local checked local storage");
+            ctx.block().store(DOUBLE, &stored_value, &slot);
+            emit_shadow_slot_update_for_expr(ctx, *id, &stored_value, value);
+            record_native_arena_owner_assignment(ctx, *id, value.as_ref());
+            record_int_facts_for_local_set(ctx, *id, value);
+            ctx.record_lowered_value(
+                "LocalSet",
+                Some(*id),
+                if matches!(lowered.rep, NativeRep::F64) {
+                    "ordinary_expr_value.local_set_f64"
+                } else {
+                    "ordinary_expr_value.local_set_numeric_native"
+                },
+                &lowered,
+                None,
+                None,
+                None,
+                false,
+                false,
+                Vec::new(),
+            );
+            Ok(Some(lowered))
+        }
+        Expr::Compare { op, left, right } => lower_compare_value(ctx, *op, left, right),
+        Expr::Unary {
+            op: UnaryOp::Not,
+            operand,
+        } => {
+            let Some(lowered_operand) = lower_expr_value(ctx, operand)? else {
+                return Ok(None);
+            };
+            if !matches!(lowered_operand.rep, NativeRep::I1) {
+                return Ok(None);
+            }
+            let lowered = LoweredValue::i1(ctx.block().xor(I1, &lowered_operand.value, "true"));
+            ctx.record_lowered_value(
+                "Unary",
+                None,
+                "ordinary_expr_value.boolean_not_i1",
+                &lowered,
+                None,
+                None,
+                None,
+                false,
+                false,
+                Vec::new(),
+            );
+            Ok(Some(lowered))
+        }
+        Expr::BooleanCoerce(operand) if matches!(operand.as_ref(), Expr::IterResultGetValue) => {
+            let value_i32 = ctx.block().call(I32, "js_iter_result_get_value_i1", &[]);
+            let value = ctx.block().icmp_ne(I32, &value_i32, "0");
+            let lowered = LoweredValue::i1(value);
+            ctx.record_lowered_value(
+                "IterResultGetValue",
+                None,
+                "compiler_private_async_iter_result_get_i1",
+                &lowered,
+                None,
+                None,
+                None,
+                false,
+                false,
+                vec!["slot_kind=raw_i1_or_truthy_jsvalue".to_string()],
+            );
+            Ok(Some(lowered))
+        }
+        Expr::BooleanCoerce(operand) => {
+            let Some(lowered_operand) = lower_expr_value(ctx, operand)? else {
+                return Ok(None);
+            };
+            if matches!(lowered_operand.rep, NativeRep::I1) {
+                ctx.record_lowered_value(
+                    "BooleanCoerce",
+                    None,
+                    "ordinary_expr_value.boolean_coerce_i1_identity",
+                    &lowered_operand,
+                    None,
+                    None,
+                    None,
+                    false,
+                    false,
+                    Vec::new(),
+                );
+                return Ok(Some(lowered_operand));
+            }
+            Ok(None)
+        }
+        Expr::Binary { op, left, right } => {
+            if let Some(lowered) = lower_bitwise_binary_value(ctx, *op, left, right)? {
+                return Ok(Some(lowered));
+            }
+            lower_numeric_binary_value(ctx, *op, left, right)
+        }
+        _ => Ok(None),
     }
 }

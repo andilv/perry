@@ -8,6 +8,7 @@
 use super::*;
 
 const CLASS_ID_BOXED_NUMBER: u32 = 0xFFFF_00D0;
+const CLASS_ID_BOXED_STRING: u32 = 0xFFFF_00D1;
 const CLASS_ID_BOXED_BOOLEAN: u32 = 0xFFFF_00D2;
 const CLASS_ID_BOXED_BIGINT: u32 = 0xFFFF_00D3;
 const CLASS_ID_BOXED_SYMBOL: u32 = 0xFFFF_00D4;
@@ -96,6 +97,18 @@ pub(super) fn install_primitive_proto_methods(
                 proto_obj,
                 "valueOf",
                 bigint_proto_value_of_thunk as *const u8,
+                0,
+            );
+            // `.length` is 0 despite the optional `(locales?, options?)`
+            // params (both are optional, so neither counts per the built-in
+            // function `.length` rule) — installed rest-based like
+            // `Date.prototype.toLocaleString` so the fixed call arity stays 0
+            // while `locales`/`options` still arrive via `rest`.
+            super::global_this::install_proto_method_rest_with_length(
+                proto_obj,
+                "toLocaleString",
+                bigint_proto_to_locale_string_thunk as *const u8,
+                0,
                 0,
             );
         }
@@ -230,6 +243,28 @@ fn bigint_receiver_or_throw(method: &str) -> f64 {
     throw_incompatible_receiver("BigInt.prototype", method)
 }
 
+/// ECMA-262 `thisStringValue(value)`: accept a String primitive or a boxed
+/// `String` object; throw `TypeError` for anything else, including `null`,
+/// `undefined`, numbers, booleans, symbols, and plain objects.
+fn string_receiver_or_throw(method: &str) -> f64 {
+    let receiver = receiver_value();
+    let jv = crate::value::JSValue::from_bits(receiver.to_bits());
+    // String primitive (heap or SSO inline).
+    if jv.is_string() || jv.is_short_string() {
+        return receiver;
+    }
+    // Boxed String wrapper (`new String("x")`): return the underlying string.
+    if let Some(payload) = boxed_payload(receiver, CLASS_ID_BOXED_STRING) {
+        return payload;
+    }
+    // `String.prototype` itself is a String exotic object with [[StringData]] = "".
+    if receiver.to_bits() == super::global_this::builtin_prototype_value("String").to_bits() {
+        let empty = crate::string::js_string_from_bytes(std::ptr::null(), 0);
+        return f64::from_bits(crate::value::JSValue::string_ptr(empty).bits());
+    }
+    throw_incompatible_receiver("String.prototype", method)
+}
+
 fn string_value(ptr: *mut crate::string::StringHeader) -> f64 {
     f64::from_bits(crate::value::JSValue::string_ptr(ptr).bits())
 }
@@ -336,4 +371,35 @@ pub(super) extern "C" fn bigint_proto_to_string_thunk(
         bigint_receiver_or_throw("toString"),
         radix,
     ))
+}
+
+pub(super) extern "C" fn bigint_proto_to_locale_string_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    let value = bigint_receiver_or_throw("toLocaleString");
+    let args = super::global_this::global_this_rest_array_values(rest);
+    let undef = f64::from_bits(crate::value::TAG_UNDEFINED);
+    let locales = args.first().copied().unwrap_or(undef);
+    let options = args.get(1).copied().unwrap_or(undef);
+    string_value(crate::intl::bigint_to_locale_string(
+        value, locales, options,
+    ))
+}
+
+/// `String.prototype.toString()` — brand-checked: returns the underlying string
+/// primitive for String primitives and boxed `String` objects; throws a
+/// `TypeError` for any other receiver.
+pub(super) extern "C" fn string_proto_to_string_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+) -> f64 {
+    string_receiver_or_throw("toString")
+}
+
+/// `String.prototype.valueOf()` — brand-checked, identical semantics to
+/// `toString()`: returns the [[StringData]] of the receiver.
+pub(super) extern "C" fn string_proto_value_of_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+) -> f64 {
+    string_receiver_or_throw("valueOf")
 }

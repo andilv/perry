@@ -1,6 +1,6 @@
 // Auto-generated from Perry's API manifest (#465). Do not edit by hand.
 // Source: perry-api-manifest::API_MANIFEST
-// Coverage: 1946 entries across 113 modules
+// Coverage: 1951 entries across 114 modules
 
 type PerryU32 = number & { readonly __perryU32?: never };
 type PerryU64 = number & { readonly __perryU64?: never };
@@ -2320,6 +2320,15 @@ declare module "perf_hooks" {
   export function timerify(...args: any[]): any;
 }
 
+declare module "perry" {
+  /** stdlib */
+  export const isStandaloneExecutable: any;
+  /** stdlib */
+  export function embeddedFiles(...args: any[]): any;
+  /** stdlib */
+  export function readEmbedded(path: string): Buffer;
+}
+
 declare module "perry/ads" {
   /** stdlib */
   export function js_ads_banner_create(...args: any[]): any;
@@ -2329,6 +2338,8 @@ declare module "perry/ads" {
   export function js_ads_interstitial_load(...args: any[]): any;
   /** stdlib */
   export function js_ads_interstitial_show(...args: any[]): any;
+  /** stdlib */
+  export function js_ads_request_consent(...args: any[]): any;
   /** stdlib */
   export function js_ads_rewarded_load(...args: any[]): any;
   /** stdlib */
@@ -2855,6 +2866,8 @@ declare module "perry/ui" {
   export function alert(...args: any[]): any;
   /** stdlib */
   export function alertWithButtons(...args: any[]): any;
+  /** stdlib */
+  export function appSetActivationPolicy(...args: any[]): any;
   /** stdlib */
   export function appSetMaxSize(...args: any[]): any;
   /** stdlib */
