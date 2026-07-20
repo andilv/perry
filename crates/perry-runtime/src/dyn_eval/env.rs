@@ -100,8 +100,7 @@ pub(crate) fn env_new(parent: f64) -> f64 {
 fn env_parent(env: f64) -> Option<f64> {
     let env_idx = root_push(env);
     let key = key_string(PARENT_KEY);
-    let value =
-        crate::object::js_object_get_field_by_name(env_object_ptr(root_get(env_idx)), key);
+    let value = crate::object::js_object_get_field_by_name(env_object_ptr(root_get(env_idx)), key);
     roots_truncate(env_idx);
     let bits = value.bits();
     let v = f64::from_bits(bits);
@@ -124,8 +123,7 @@ fn env_has_own(env: f64, name: &str) -> bool {
 fn env_read(env: f64, name: &str) -> f64 {
     let env_idx = root_push(env);
     let key = key_string(name);
-    let value =
-        crate::object::js_object_get_field_by_name(env_object_ptr(root_get(env_idx)), key);
+    let value = crate::object::js_object_get_field_by_name(env_object_ptr(root_get(env_idx)), key);
     roots_truncate(env_idx);
     f64::from_bits(value.bits())
 }
@@ -181,7 +179,7 @@ fn scope_probe(env: f64, key: *const crate::string::StringHeader) -> ScopeProbe 
         if keys.is_null() {
             return ScopeProbe::Bail;
         }
-        let alloc_limit = std::cmp::max((*o).field_count, 8);
+        let alloc_limit = std::cmp::max((*o).field_count, crate::object::INLINE_SLOT_FLOOR as u32);
         if let Some(idx) = crate::object::prop_plan::read_plan_lookup(keys as usize, key as usize) {
             if idx < alloc_limit {
                 let v = crate::object::js_object_get_field(o, idx);
@@ -226,7 +224,11 @@ fn scope_probe(env: f64, key: *const crate::string::StringHeader) -> ScopeProbe 
 pub(crate) fn lookup(env: f64, name: &str) -> Option<f64> {
     let fast = super::fast_scope_enabled();
     let cur_idx = root_push(env);
-    let key = if fast { key_string(name) } else { std::ptr::null() };
+    let key = if fast {
+        key_string(name)
+    } else {
+        std::ptr::null()
+    };
     loop {
         if fast {
             match scope_probe(root_get(cur_idx), key) {
@@ -273,7 +275,11 @@ pub(crate) fn lookup(env: f64, name: &str) -> Option<f64> {
 pub(crate) fn is_bound(env: f64, name: &str) -> bool {
     let fast = super::fast_scope_enabled();
     let cur_idx = root_push(env);
-    let key = if fast { key_string(name) } else { std::ptr::null() };
+    let key = if fast {
+        key_string(name)
+    } else {
+        std::ptr::null()
+    };
     loop {
         let present = if fast {
             match scope_probe(root_get(cur_idx), key) {
@@ -308,7 +314,11 @@ pub(crate) fn assign(env: f64, name: &str, value: f64) {
     let fast = super::fast_scope_enabled();
     let value_idx = root_push(value);
     let cur_idx = root_push(env);
-    let key = if fast { key_string(name) } else { std::ptr::null() };
+    let key = if fast {
+        key_string(name)
+    } else {
+        std::ptr::null()
+    };
     loop {
         let present = if fast {
             match scope_probe(root_get(cur_idx), key) {

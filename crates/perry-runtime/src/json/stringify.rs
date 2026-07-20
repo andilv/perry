@@ -1041,7 +1041,7 @@ pub(crate) unsafe fn stringify_object_inner(ptr: *const u8, buf: &mut String, de
     // fields and `is_object_pointer`'s `keys_len <= field_count` guard
     // returned false, so `JSON.stringify` emitted the literal string "null"
     // for any parsed object with ≥9 fields.
-    let alloc_limit = std::cmp::max(num_fields, 8);
+    let alloc_limit = std::cmp::max(num_fields, crate::object::INLINE_SLOT_FLOOR as u32);
     let read_field_bits = |f: u32| -> u64 {
         let obj = cur_obj();
         if f < alloc_limit {
@@ -1236,6 +1236,25 @@ pub(crate) unsafe fn stringify_object_inner(ptr: *const u8, buf: &mut String, de
                 member_probed = true;
             }
         }
+
+        // `member_to_json` above may have run a user `toJSON` — a GC /
+        // evacuation point that moves the key string. The raw `key_ptr`
+        // captured before it is then dangling, so re-derive it from the rooted
+        // object header before the property name is written. Without this, a
+        // member whose `toJSON` forces a copying-minor GC (#5909's pre-key
+        // member probe) emitted a corrupted key
+        // (gc::tests …test_json_stringify_object_rederives_fields_after_tojson_minor_gc).
+        let key_ptr = if member_probed {
+            let kb = key_at(f).to_bits();
+            let kt = kb & 0xFFFF_0000_0000_0000;
+            if kt == STRING_TAG || kt == POINTER_TAG {
+                (kb & POINTER_MASK) as *const StringHeader
+            } else {
+                kb as *const StringHeader
+            }
+        } else {
+            key_ptr
+        };
 
         if !first {
             buf.push(',');
