@@ -133,6 +133,27 @@ pub(crate) fn lower_unary_expr(ctx: &mut LoweringContext, unary: &ast::UnaryExpr
                 && !is_known_global_identifier_name(n)
                 && !matches!(n, "undefined" | "null" | "NaN" | "Infinity")
             {
+                // #6062: a forward-referenced lexical (`let`/`const`/`class`
+                // declared LATER in this or an enclosing same-function block) is
+                // not yet a live local, so it reaches this "unresolvable" arm —
+                // but per ECMA-262 `typeof` only skips GetValue for genuinely
+                // UNRESOLVABLE references (undeclared globals). A declared-but-
+                // uninitialized binding in its TDZ must throw ReferenceError,
+                // exactly like a plain read. Route it to the throwing get. (A
+                // `typeof` AFTER the declarator resolves via `lookup_local` and
+                // never reaches here.)
+                if ctx.forward_lexical_names.contains(n) {
+                    return Ok(Expr::TypeOf(Box::new(Expr::Call {
+                        callee: Box::new(Expr::ExternFuncRef {
+                            name: "js_global_get_or_throw_unresolved".to_string(),
+                            param_types: vec![Type::Any],
+                            return_type: Type::Any,
+                        }),
+                        args: vec![Expr::String(n.to_string())],
+                        type_args: Vec::new(),
+                        byte_offset: id.span.lo.0,
+                    })));
+                }
                 // Not foldable to a compile-time "undefined": sloppy
                 // implicit globals are runtime globalThis properties
                 // (#3575), so `g = 5; typeof g` must observe the live
@@ -562,19 +583,18 @@ pub(crate) fn lower_unary_expr(ctx: &mut LoweringContext, unary: &ast::UnaryExpr
                 if ctx.sloppy_implicit_global_ids.contains(&lid) {
                     return Ok(Expr::Bool(true));
                 }
-                // At module top level a bare `x = 1` becomes an ordinary
-                // module-level local indistinguishable from `var x = 1`
-                // (the implicit-global path isn't taken there), so we
-                // can't statically tell a non-configurable `var`/`let`
-                // binding from a configurable implicit global — defer to
-                // the runtime delete (Test262 S11.4.1_A3.2_T1). Inside a
-                // function, an implicit global *does* go through the
-                // sloppy-global set, so a plain local here is a genuine
-                // binding → false.
-                if !ctx.module_level_ids.contains(&lid) {
-                    return Ok(Expr::Bool(false));
-                }
-                // module-level local: fall through to the dynamic path.
+                // Any resolvable binding NOT in the implicit-global set is a
+                // real `var`/`let`/`const`/param declaration — non-configurable,
+                // so `delete <ident>` is `false` (spec 13.5.1.2), at module top
+                // level too. A module-level bare `x = 1` implicit global is
+                // distinguishable: `define_sloppy_implicit_global` records it in
+                // `sloppy_implicit_global_ids` even at scope depth 0, so it took
+                // the `true` arm above (Test262 S11.4.1_A3.2_T1). Reaching here
+                // therefore means a genuine `var x = 1` / `let` / `const`
+                // binding, which must be `false` (Test262 S11.4.1_A3.1) rather
+                // than deferred to a runtime delete that removes it and returns
+                // `true`.
+                return Ok(Expr::Bool(false));
             } else if ctx.lookup_func(name).is_some()
                 || ctx.lookup_class(name).is_some()
                 || ctx.lookup_imported_func(name).is_some()

@@ -58,9 +58,13 @@ pub extern "C" fn js_regexp_compile_value(
         (src_s, flg_s)
     } else {
         // ToString(pattern), with `undefined` -> "" (spec); same for flags.
+        // Abstract ToString (§7.1.17) rejects a Symbol with a `TypeError` — the
+        // lenient `js_string_coerce` would otherwise stringify it to
+        // "Symbol(desc)" (annexB `.../compile/{pattern,flags}-to-string-err`).
         let pat = if pj.is_undefined() {
             String::new()
         } else {
+            crate::builtins::reject_symbol_to_string(pattern_val);
             let p = crate::builtins::js_string_coerce(pattern_val);
             if is_valid_ptr(p) {
                 string_as_str(p).to_string()
@@ -71,6 +75,7 @@ pub extern "C" fn js_regexp_compile_value(
         let flg = if fj.is_undefined() {
             String::new()
         } else {
+            crate::builtins::reject_symbol_to_string(flags_val);
             let f = crate::builtins::js_string_coerce(flags_val);
             if is_valid_ptr(f) {
                 string_as_str(f).to_string()
@@ -125,12 +130,38 @@ pub extern "C" fn js_regexp_compile_value(
         ));
     }
 
+    // The header OWNS leaked `Arc` references to its compiled program(s)
+    // (mirrors `js_regexp_new`), so the capped `REGEX_CACHE`/`FANCY_CACHE`
+    // (see `REGEX_CACHE_MAX_ENTRIES`) can evict without invalidating this
+    // receiver. Refresh `fancy_ptr` too — it must track the NEW pattern, not
+    // the one the receiver was constructed with.
     let arc = get_or_compile_regex(pattern_str, flags_str);
-    let regex_ptr = Arc::as_ptr(&arc) as *mut Regex;
+    let regex_ptr = Arc::into_raw(arc) as *mut Regex;
+    let fancy_ptr: *const () = super::FANCY_CACHE.with(|fc| {
+        match fc
+            .borrow()
+            .get(&(pattern_str.to_string(), flags_str.to_string()))
+        {
+            Some(arc) => Arc::into_raw(arc.clone()) as *const (),
+            None => std::ptr::null(),
+        }
+    });
     let canonical_flags_ptr = js_string_from_str(flags_str);
     let pattern_ptr = js_string_from_str(pattern_str);
     unsafe {
+        let old_regex_ptr = (*re).regex_ptr;
+        let old_fancy_ptr = (*re).fancy_ptr;
         (*re).regex_ptr = regex_ptr;
+        (*re).fancy_ptr = fancy_ptr;
+        // Release the receiver's PREVIOUS owned references now that the new
+        // ones are installed (recompiling the same pattern is fine: the fresh
+        // `into_raw` reference above keeps the shared program alive).
+        if !old_regex_ptr.is_null() {
+            drop(Arc::from_raw(old_regex_ptr as *const Regex));
+        }
+        if !old_fancy_ptr.is_null() {
+            drop(Arc::from_raw(old_fancy_ptr as *const fancy_regex::Regex));
+        }
         (*re).pattern_ptr = pattern_ptr;
         (*re).flags_ptr = canonical_flags_ptr;
         (*re).case_insensitive = flags_str.contains('i');
@@ -140,7 +171,6 @@ pub extern "C" fn js_regexp_compile_value(
         (*re).dot_all = flags_str.contains('s');
         (*re).unicode = flags_str.contains('u') || flags_str.contains('v');
         (*re).has_indices = flags_str.contains('d');
-        (*re).last_index = 0;
         super::REGEX_SOURCE_TABLE.with(|t| {
             t.borrow_mut().insert(
                 re as usize,
@@ -148,5 +178,11 @@ pub extern "C" fn js_regexp_compile_value(
             );
         });
     }
+    // Spec RegExpInitialize step 12: `Set(obj, "lastIndex", 0, true)` runs LAST,
+    // with the *Throw* flag. A user-frozen `lastIndex`
+    // (`Object.defineProperty(re, "lastIndex", { writable: false })`) makes this
+    // a `TypeError` — but only *after* `.source`/`.flags` have already been
+    // updated above (annexB `.../compile/pattern-regexp-immutable-lastindex`).
+    super::set_last_index_throwing(re, 0);
     f64::from_bits(crate::value::JSValue::pointer(re as *const u8).bits())
 }

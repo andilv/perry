@@ -55,6 +55,7 @@ impl WasmModuleEmitter {
             "object_has_property",
             "object_assign",
             "array_new",
+            "array_constructor_single",
             "array_push",
             "array_pop",
             "array_get",
@@ -418,7 +419,7 @@ impl WasmModuleEmitter {
                 }
             }
             Stmt::Break | Stmt::Continue | Stmt::LabeledBreak(_) | Stmt::LabeledContinue(_) => {}
-            Stmt::PreallocateBoxes(_) => {}
+            Stmt::PreallocateBoxes(_) | Stmt::PreallocateTdzBoxes(_) => {}
         }
     }
 
@@ -500,7 +501,9 @@ impl WasmModuleEmitter {
                     self.collect_strings_in_expr(v);
                 }
             }
-            Expr::PropertyGet { object, property } => {
+            Expr::PropertyGet {
+                object, property, ..
+            } => {
                 self.collect_strings_in_expr(object);
                 self.intern_string(property);
             }

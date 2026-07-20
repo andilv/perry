@@ -128,6 +128,12 @@ pub(crate) enum GcMoveHookKind {
     /// move. Used by `GC_TYPE_PROMISE`, whose `status`/`value` expandos
     /// (#5142) live in `object::exotic_expando` keyed by the promise address.
     ExoticExpandoOwner,
+    /// Rekey the error side tables (`node_submodules::diagnostics`:
+    /// ERROR_MESSAGE_{CODES,SYSCALLS,ERRNOS,PATHS,DESTS,HOSTNAMES} and
+    /// ERROR_USER_PROPS — all keyed by the ErrorHeader address) after a
+    /// move. Errors are movable; without this a moved error lost its
+    /// `err.code`/`err.syscall`/user-assigned props.
+    ErrorSideTables,
 }
 
 #[allow(dead_code)]
@@ -135,6 +141,12 @@ pub(crate) enum GcMoveHookKind {
 pub(crate) enum GcRewriteHookKind {
     None,
     SetIndex,
+    /// Rebuild the Map pointer-key lookup index (`map::MAP_PTR_INDEX`) after
+    /// a GC pass rewrote this Map's entry slots: object/bigint keys are
+    /// indexed by their pointer bits (identity) or pointee content (bigints),
+    /// both of which go stale when the referenced allocation is evacuated.
+    /// Mirrors `SetIndex` (#6084).
+    MapIndex,
 }
 
 #[allow(dead_code)]
@@ -148,10 +160,20 @@ pub(crate) enum GcFinalizeHookKind {
     NativeTypedView,
     NativeHandle,
     NativePodView,
+    /// Drop a dead typed array's `TYPED_ARRAY_VIEW_META` entry. The table is
+    /// keyed by the header address and records the array's materialized backing
+    /// ArrayBuffer; leaving the entry behind both keeps that buffer rooted
+    /// forever and lets whatever is allocated at the reused address inherit a
+    /// backing that is not its own.
+    TypedArrayViewMeta,
     /// Drop the embedded `temporal_rs` value in a `GC_TYPE_TEMPORAL` cell so a
     /// heap-owning variant (e.g. a `ZonedDateTime` IANA timezone string) is
     /// released when the cell is swept. POD variants drop to a no-op.
     TemporalCleanup,
+    /// Drop a swept error's entries from the address-keyed error side tables
+    /// so a fresh error allocated at the recycled address doesn't inherit
+    /// the dead error's codes/props.
+    ErrorSideTables,
 }
 
 #[allow(dead_code)]
@@ -310,9 +332,9 @@ pub(super) static GC_TYPE_INFO_BY_ID: [Option<GcTypeInfo>; MALLOC_KIND_BUCKET_CO
         GcExternalBytePolicy::None,
         GcLargeObjectPolicy::OldArenaWhenOverThreshold,
         false,
-        GcMoveHookKind::None,
+        GcMoveHookKind::ErrorSideTables,
         GcRewriteHookKind::None,
-        GcFinalizeHookKind::None,
+        GcFinalizeHookKind::ErrorSideTables,
     )),
     Some(gc_type_info_entry(
         GC_TYPE_MAP,
@@ -326,7 +348,7 @@ pub(super) static GC_TYPE_INFO_BY_ID: [Option<GcTypeInfo>; MALLOC_KIND_BUCKET_CO
         GcLargeObjectPolicy::NotApplicable,
         false,
         GcMoveHookKind::MapSideTables,
-        GcRewriteHookKind::None,
+        GcRewriteHookKind::MapIndex,
         GcFinalizeHookKind::MapSideAllocation,
     )),
     Some(gc_type_info_entry(
@@ -372,7 +394,7 @@ pub(super) static GC_TYPE_INFO_BY_ID: [Option<GcTypeInfo>; MALLOC_KIND_BUCKET_CO
         true,
         GcMoveHookKind::None,
         GcRewriteHookKind::None,
-        GcFinalizeHookKind::None,
+        GcFinalizeHookKind::TypedArrayViewMeta,
     )),
     Some(gc_type_info_entry(
         GC_TYPE_SET,
@@ -456,16 +478,29 @@ pub(super) static GC_TYPE_INFO_BY_ID: [Option<GcTypeInfo>; MALLOC_KIND_BUCKET_CO
         true,
         GcRewriteDescriptorKind::Leaf,
         GcLayoutSlotKind::None,
-        // Non-movable: a Date is referenced by a NaN-boxed pointer kept in a
-        // plain f64/DOUBLE local that codegen does NOT shadow-root. The
-        // conservative stack scan keeps it alive; keeping the address stable
-        // means that un-rooted pointer never goes stale across a GC move.
-        false,
+        // Movable (#6186, 2026-07-09 GC audit). Directly analogous to
+        // `GC_TYPE_PROMISE` above: a pointer-free arena object with
+        // address-keyed exotic-expando properties, rekeyed on relocation by
+        // the `ExoticExpandoOwner` move hook. The `movable` flag only gates
+        // OLD-PAGE DEFRAG (`gc_type_is_movable`, oldgen.rs) — the nursery
+        // copied-minor already evacuates eden objects regardless of it — so a
+        // promoted, long-lived Date could pin its old-gen page from defrag.
+        // Safety: old-page defrag runs only inside MOVING collections (the
+        // precise pump-boundary safepoint, where the JS stack is unwound so no
+        // un-shadow-rooted Date f64 local is live), the SAME collections at
+        // which the nursery already evacuates Dates. Any live reference is a
+        // traced heap slot the copy pass rewrites; a Date pointer parked in an
+        // un-shadow-rooted local only exists mid-frame, never at a safepoint —
+        // the identical invariant that already makes movable Promises sound.
+        true,
         GcExternalBytePolicy::None,
         GcLargeObjectPolicy::NotApplicable,
         // pointer_free: the single `ts` slot is a raw f64, never a JSValue.
         true,
-        GcMoveHookKind::None,
+        // `d.foo = …` expandos live in `object::exotic_expando` keyed by the
+        // Date address; rekey that entry when the cell relocates (mirrors
+        // Promise). Without this a moved Date loses its expando properties.
+        GcMoveHookKind::ExoticExpandoOwner,
         GcRewriteHookKind::None,
         GcFinalizeHookKind::None,
     )),
@@ -476,18 +511,25 @@ pub(super) static GC_TYPE_INFO_BY_ID: [Option<GcTypeInfo>; MALLOC_KIND_BUCKET_CO
         true,
         GcRewriteDescriptorKind::Leaf,
         GcLayoutSlotKind::None,
-        // Non-movable: like Date, a Temporal value is referenced by a NaN-boxed
-        // pointer kept in a plain f64/DOUBLE local that codegen does NOT
-        // shadow-root. The conservative stack scan keeps it alive; a stable
-        // address means that un-rooted pointer never goes stale across a GC.
-        false,
+        // Movable (#6186, completing the Date change from #6214 — the
+        // non-movable rationale above it was disproven there): `movable`
+        // only gates OLD-PAGE DEFRAG, which runs solely inside moving
+        // collections at stack-unwound safepoints; the nursery copied-minor
+        // already relocates Temporal cells. The embedded `temporal_rs` value
+        // survives memcpy (its owned allocations live on the Rust heap and
+        // move by value); from-space bulk resets skip per-object finalizers,
+        // so a moved cell is never double-dropped — `TemporalCleanup` fires
+        // once, wherever the cell finally dies.
+        true,
         GcExternalBytePolicy::None,
         GcLargeObjectPolicy::NotApplicable,
         // pointer_free: the embedded `temporal_rs` value is plain integers +
         // `'static` calendar data, never a JSValue. Any Rust-heap it owns is
         // released by the TemporalCleanup finalize hook, not GC tracing.
         true,
-        GcMoveHookKind::None,
+        // Expando rekey on relocation, mirroring Date: no-op when the cell
+        // has no expando entry.
+        GcMoveHookKind::ExoticExpandoOwner,
         GcRewriteHookKind::None,
         GcFinalizeHookKind::TemporalCleanup,
     )),
@@ -554,6 +596,22 @@ pub(crate) fn gc_type_rewrite_hook_kind(obj_type: u8) -> GcRewriteHookKind {
     gc_type_info(obj_type).map_or(GcRewriteHookKind::None, |info| info.rewrite_hook_kind)
 }
 
+/// Run the post-rewrite hook for `obj_type` after a GC pass changed one or
+/// more of the object's reference slots. Shared by every rewrite call site
+/// (remembered-set dirty-slot scan, copying field scan, verify/force-evacuate
+/// rewrites) so a new hook kind only needs wiring here.
+pub(crate) fn run_gc_rewrite_hook(obj_type: u8, user_ptr: usize) {
+    match gc_type_rewrite_hook_kind(obj_type) {
+        GcRewriteHookKind::None => {}
+        GcRewriteHookKind::SetIndex => {
+            crate::set::rebuild_set_index_for_gc(user_ptr as *mut crate::set::SetHeader);
+        }
+        GcRewriteHookKind::MapIndex => {
+            crate::map::rebuild_map_ptr_index_for_gc(user_ptr as *mut crate::map::MapHeader);
+        }
+    }
+}
+
 pub(crate) fn gc_type_after_payload_move(obj_type: u8, old_user: usize, new_user: usize) {
     match gc_type_info(obj_type).map_or(GcMoveHookKind::None, |info| info.move_hook_kind) {
         GcMoveHookKind::None => {}
@@ -576,6 +634,11 @@ pub(crate) fn gc_type_after_payload_move(obj_type: u8, old_user: usize, new_user
         GcMoveHookKind::ExoticExpandoOwner => {
             crate::object::exotic_expando::exotic_expando_owner_moved(old_user, new_user);
         }
+        GcMoveHookKind::ErrorSideTables => {
+            crate::node_submodules::diagnostics_gc::error_side_tables_owner_moved(
+                old_user, new_user,
+            );
+        }
     }
 }
 
@@ -584,8 +647,16 @@ pub(crate) fn gc_type_clear_dead_payload_side_tables(obj_type: u8, user_ptr: usi
         GcMoveHookKind::ObjectOverflowFields => {
             crate::object::clear_overflow_for_ptr(user_ptr);
         }
+        GcMoveHookKind::ClosureDynamicProps => {
+            // 2026-07-09 GC audit wave 2: previously an explicit no-op — a
+            // dead closure's `fn.prop = …` / `setPrototypeOf(fn, …)` entries
+            // leaked and resurrected on a new closure at the reused address.
+            crate::closure::clear_closure_side_tables_for_dead_ptr(user_ptr);
+        }
+        GcMoveHookKind::ErrorSideTables => {
+            crate::node_submodules::diagnostics_gc::error_side_tables_clear_dead(user_ptr);
+        }
         GcMoveHookKind::None
-        | GcMoveHookKind::ClosureDynamicProps
         | GcMoveHookKind::MapSideTables
         | GcMoveHookKind::SetSideTables
         | GcMoveHookKind::ExoticExpandoOwner => {}
@@ -630,6 +701,12 @@ pub(crate) unsafe fn gc_type_finalize_unmarked_payload(obj_type: u8, user_ptr: *
             crate::temporal::finalize_temporal_cell_for_gc(
                 user_ptr as *mut crate::temporal::TemporalCell,
             );
+        }
+        GcFinalizeHookKind::ErrorSideTables => {
+            crate::node_submodules::diagnostics_gc::error_side_tables_clear_dead(user_ptr as usize);
+        }
+        GcFinalizeHookKind::TypedArrayViewMeta => {
+            crate::typedarray_view::clear_view_meta(user_ptr as usize);
         }
     }
 }
@@ -830,6 +907,13 @@ pub const OBJ_FLAG_ARRAY_DESCRIPTORS: u16 = 0x400;
 // `GC_TYPE_OBJECT`. Set-only (clearing a descriptor leaves it set; the slow
 // path is always correct).
 pub const OBJ_FLAG_HAS_DESCRIPTORS: u16 = 0x800;
+// This specific object's [[Prototype]] was overridden per-instance
+// (`Object.setPrototypeOf` / `__proto__` recording via
+// `object_set_static_prototype`). Class-keyed interception caches
+// (`object::prop_plan`) must not apply a class-chain verdict to an object
+// whose own chain diverges. Bit 12; only meaningful for `GC_TYPE_OBJECT`.
+// Set-only, travels with the object across evacuation.
+pub const OBJ_FLAG_PROTO_OVERRIDE: u16 = 0x1000;
 // #2145: this object is a per-kind `<TypedArrayCtor>.prototype` whose
 // `[[Prototype]]` is the shared `%TypedArray%.prototype` intrinsic.
 // `Object.getPrototypeOf(Int8Array.prototype)` returns the cached
@@ -844,6 +928,16 @@ pub(crate) const GC_ARRAY_RAW_F64_LAYOUT: u16 = 0x80;
 /// meaningful for `GC_TYPE_ARRAY`; it lets `util.types.isArgumentsObject`
 /// distinguish Perry's internal `arguments` arrays from user rest arrays.
 pub(crate) const GC_ARRAY_ARGUMENTS_OBJECT: u16 = 0x200;
+/// #6011: every element slot in `[0, length)` holds either canonical raw-f64
+/// number bits or `TAG_HOLE` — the hole-tolerant sibling of
+/// `GC_ARRAY_RAW_F64_LAYOUT`. Set when `new Array(n)` hole-initializes a
+/// user-facing array (and by the range-loop guard after a hole-seeing verify
+/// pass); cleared alongside the dense flag by `clear_array_numeric_layout`,
+/// which every non-numeric store path already funnels through. Lets the
+/// packed-f64 range-loop guard skip its whole-array verify walk. Bit 12 —
+/// bits 12..13 were the last free `_reserved` bits (see the bit map above).
+/// Only meaningful for `GC_TYPE_ARRAY`.
+pub(crate) const GC_ARRAY_RAW_F64_HOLES: u16 = 0x1000;
 
 pub(super) const POINTER_TAG: u64 = 0x7FFD_0000_0000_0000;
 pub(super) const STRING_TAG: u64 = 0x7FFF_0000_0000_0000;

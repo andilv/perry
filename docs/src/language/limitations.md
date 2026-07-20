@@ -165,20 +165,30 @@ but user-written modules should use static `import` declarations.
 > dynamic `require()`, etc.), but plain JavaScript projects compile and run in
 > most cases.
 
-## Limited Prototype Manipulation
+## Prototype Manipulation
 
-Perry compiles classes to fixed structures. Dynamic prototype modification is not supported:
+Dynamic prototype manipulation is supported for the common patterns:
 
-<!-- intentionally-rejects: this snippet documents code Perry refuses to compile -->
-```text
-// Not supported
-MyClass.prototype.newMethod = function() {};
-Object.setPrototypeOf(obj, proto);
+```ts
+// Supported
+MyClass.prototype.newMethod = function () {};   // prototype method assignment
+Object.setPrototypeOf(obj, proto);              // incl. chains of any length
+Object.setPrototypeOf(Derived, Base);           // transpiled __extends statics link
+Object.getPrototypeOf(obj);                     // inspection
 ```
 
-`Object.getPrototypeOf(...)` and `Reflect.getPrototypeOf(...)` are supported
-for class/prototype inspection patterns, but `Object.setPrototypeOf(...)` /
-`Reflect.setPrototypeOf(...)` do not mutate Perry's fixed class layout.
+Prototype-method assignment routes through a dedicated registry
+(`CLASS_PROTOTYPE_METHODS`) and `Object.setPrototypeOf` performs a real,
+cycle-checked prototype mutation (a genuine cycle still throws `TypeError`).
+
+Remaining known gaps:
+
+- the assignment form `obj.__proto__ = x` on the dynamic write path stores a
+  literal `"__proto__"` property instead of setting the prototype (use
+  `Object.setPrototypeOf`);
+- an object-literal `{ __proto__: [] }` sets the prototype without throwing,
+  but the result is not yet visible to `instanceof` (`… instanceof Array`
+  reports `false`).
 
 ## Weak References Retain Their Targets
 
@@ -226,6 +236,45 @@ values are deep-copied across thread boundaries. The exception is
 Caveat: only the `SharedArrayBuffer` itself shares — a typed-array *view*
 captured directly still deep-copies, so build the view per-agent from the shared
 SAB.
+
+## WebAssembly (#6558)
+
+Perry ships **no WebAssembly engine** in the default build. The current
+policy: **WASM-dependent features degrade gracefully**; full support is
+tracked in [#6558](https://github.com/PerryTS/perry/issues/6558).
+
+The `WebAssembly` global is spec-shaped — every standard member exists with
+the correct type and arity — and fails cleanly rather than crashing:
+
+- `WebAssembly.compile` / `compileStreaming` / `instantiate` /
+  `instantiateStreaming` return a Promise **rejected** with a
+  `WebAssembly.CompileError` whose message points at #6558.
+- `WebAssembly.validate(bytes)` returns `false` — the honest answer for
+  "can I run this module here".
+- `new WebAssembly.Module(...)` throws `CompileError` synchronously;
+  `Instance` throws `LinkError`; `Table` / `Global` throw `RuntimeError`.
+- `new WebAssembly.Memory({ initial })` genuinely works (a real zero-filled
+  `ArrayBuffer` backs it, and `grow()` is supported), so feature-detection
+  code that allocates a page succeeds.
+- `CompileError` / `LinkError` / `RuntimeError` are real error constructors
+  (`instanceof Error` and `instanceof WebAssembly.CompileError` both work).
+
+In practice this means lazy wasm consumers — wasm-bindgen loaders like
+`@silvia-odwyer/photon-node`, `@jsquash/webp` decoders, undici's llhttp
+probe — hit their own catch/fallback paths and the app keeps running with
+that feature degraded.
+
+Two spellings, two paths:
+
+- **Namespace access** (`const WA = globalThis.WebAssembly; WA.compile(...)`,
+  which is also what minified bundles evaluate through a namespace value)
+  uses the graceful surface above and needs nothing at link time.
+- **Literal static calls** (`WebAssembly.instantiate(bytes)` written against
+  the global) lower to the opt-in wasmi host runtime (issue #76,
+  `--enable-wasm-runtime`, auto-linked when usage is detected). These run
+  real WebAssembly through the wasmi interpreter but require
+  `libperry_wasm_host.a` to be built (`cargo build --release -p
+  perry-wasm-host`); without it the build fails with that instruction.
 
 ## npm Package Compatibility
 

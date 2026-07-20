@@ -26,7 +26,11 @@ pub(crate) unsafe fn redirect_lazy_to_materialized(value: f64) -> f64 {
     } else {
         return value;
     };
-    if ptr.is_null() || (ptr as usize) < crate::gc::GC_HEADER_SIZE + 0x1000 {
+    // A synthetic handle-band id (fetch/Blob/socket/… < HANDLE_BAND_MAX) is not
+    // a real heap object; `gc_header = ptr - 8` would deref unmapped memory →
+    // SIGSEGV on e.g. `JSON.stringify(new Blob())` (#6240/#6241). It's never a
+    // LazyArrayHeader, so bail before the header read.
+    if ptr.is_null() || crate::value::addr_class::is_handle_band(ptr as usize) {
         return value;
     }
     let gc_header = ptr.sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
@@ -76,7 +80,9 @@ pub(crate) unsafe fn try_stringify_lazy_array(value: f64) -> Option<*mut StringH
     } else {
         return None;
     };
-    if maybe_ptr.is_null() || (maybe_ptr as usize) < crate::gc::GC_HEADER_SIZE + 0x1000 {
+    // Handle-band synthetic ids are never lazy arrays and must not be deref'd
+    // one word below the id (#6240/#6241).
+    if maybe_ptr.is_null() || crate::value::addr_class::is_handle_band(maybe_ptr as usize) {
         return None;
     }
     let gc_header = maybe_ptr.sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
@@ -156,6 +162,9 @@ pub unsafe extern "C" fn js_json_stringify(value: f64, type_hint: u32) -> *mut S
     // it can't leak across top-level calls.
     if prior_depth == 0 {
         super::SUPPRESS_NEXT_TO_JSON.with(|c| c.set(false));
+        // Arbitrary user code ran since the last stringify, so the cached
+        // `Object.prototype`-has-`toJSON` verdict must be recomputed (#6009).
+        super::invalidate_object_proto_tojson_state();
         // A circular-ref `TypeError` longjmps past the `STRINGIFY_STACK`
         // pops (js_throw doesn't unwind Rust), so a caught throw can leave
         // stale ancestor pointers behind. Clear at the outermost entry so they
@@ -174,6 +183,12 @@ pub unsafe extern "C" fn js_json_stringify(value: f64, type_hint: u32) -> *mut S
     // String::reserve. `push_str` grows on overflow for the rare
     // single-call output that exceeds that, so skip the estimate call
     // (issue #67: it was ~10ns of wasted work per call for small values).
+    //
+    // The root value's `toJSON` key is the empty String (§25.5.2.2). Reset it
+    // unconditionally so a nested `JSON.stringify` inside a `toJSON`/replacer
+    // callback also sees `""` at its own root, and so a key left by a prior
+    // top-level call can't leak in (#5909).
+    super::reset_to_json_key();
     stringify_value(value, type_hint, &mut buf);
     let ptr = json_string_from_output_bytes(buf.as_bytes());
     restore_stringify_buf(buf);
@@ -206,11 +221,13 @@ pub unsafe extern "C" fn js_json_stringify_number(value: f64) -> *mut StringHead
     if value.is_nan() || value.is_infinite() {
         return js_string_from_bytes(b"null".as_ptr(), 4);
     }
-    if value.fract() == 0.0 && value.abs() < (i64::MAX as f64) {
+    if value.fract() == 0.0 && value.abs() < crate::builtins::INT_EXACT_FASTPATH_LIMIT {
         let mut itoa_buf = itoa::Buffer::new();
         let s = itoa_buf.format(value as i64);
         return js_string_from_bytes(s.as_ptr(), s.len() as u32);
     }
+    // #6127: at/above 2^53 the exact integer can carry more digits than the
+    // shortest round-trip (`2**58`), so defer to the shortest-round-trip formatter.
     let s = crate::string::js_format_f64(value);
     js_string_from_bytes(s.as_ptr(), s.len() as u32)
 }

@@ -25,13 +25,25 @@ mod locale;
 mod locales;
 use locales::{get_canonical_locales_thunk, supported_values_of_thunk};
 mod date_collator;
+mod date_names;
+#[cfg(feature = "intl-datetime")]
+pub(crate) mod icu_dtf;
+mod time_zone;
+pub(crate) use time_zone::{canonicalize_named_time_zone, resolved_date_time_zone};
 mod install;
 use install::install_constructor;
+mod subclass;
+pub(crate) use subclass::{intl_instanceof, intl_subclass_super, is_intl_constructor_value};
+use subclass::{locale_instance_tag, push_locale_element};
 mod list_relative_plural;
 mod number_format;
 mod number_format_digits;
 mod number_format_options;
+mod numbering_system;
+use numbering_system::{is_well_formed_numbering_system, resolve_numbering_system};
+mod canon_aliases;
 mod segmenter;
+use canon_aliases::canonicalize_unicode_extension_types;
 
 pub(crate) use date_collator::{
     collator_bound_compare_thunk, collator_bound_resolved_options_thunk, collator_compare_object,
@@ -308,6 +320,21 @@ fn get_option_string(options: f64, key: &str) -> Option<String> {
     coerce_option_string(get_option_value(options, key))
 }
 
+/// Validate the `locales` / `options` arguments of `String.prototype.localeCompare`
+/// exactly as `Construct(%Collator%, « locales, options »)` would (ECMA-402
+/// §22.1.3.10 step 4). Perry's collation ordering stays locale-neutral (full ICU
+/// deferred), so `localeCompare` never actually builds a Collator — but the spec
+/// still requires the *observable throwing* of `CanonicalizeLocaleList(locales)`
+/// followed by `InitializeCollator`'s `CoerceOptionsToObject` + `GetOption` reads
+/// (test262 `localeCompare/throws-same-exceptions-as-Collator`, #5906).
+pub(crate) fn validate_locale_compare(locales: f64, options: f64) {
+    // requestedLocales = ? CanonicalizeLocaleList(locales) — reuse the exact
+    // Intl.getCanonicalLocales machinery for its TypeError/RangeError side effect
+    // (undefined yields an empty list and never throws).
+    let _ = locales::get_canonical_locales(locales);
+    date_collator::validate_collator_options(options);
+}
+
 /// As `get_option_string`, but for the Unicode locale-extension keys (`calendar`,
 /// `numberingSystem`) whose value is validated for *well-formedness* rather than
 /// against a closed enum. ECMA-402 coerces `null` to the string `"null"` — a
@@ -438,50 +465,6 @@ fn currency_fraction_digits(code: &str) -> u32 {
     }
 }
 
-/// A `numberingSystem` value is structurally valid when it is one or more
-/// hyphen-separated subtags of 3–8 alphanumerics (the `type` Unicode nonterminal).
-fn is_well_formed_numbering_system(value: &str) -> bool {
-    !value.is_empty()
-        && value.split('-').all(|sub| {
-            (3..=8).contains(&sub.len()) && sub.bytes().all(|b| b.is_ascii_alphanumeric())
-        })
-}
-
-/// Extract the `-u-nu-<value>` numbering system from a (canonicalized) locale
-/// string, lower-cased. Returns `None` when no `nu` keyword is present.
-fn numbering_system_from_locale(locale: &str) -> Option<String> {
-    let lower = locale.to_ascii_lowercase();
-    let subtags: Vec<&str> = lower.split('-').collect();
-    let u = subtags.iter().position(|s| *s == "u")?;
-    let mut i = u + 1;
-    while i < subtags.len() {
-        let key = subtags[i];
-        // A keyword key is exactly two chars; everything up to the next key is its value.
-        if key.len() == 2 {
-            if key == "nu" {
-                let mut value = String::new();
-                let mut j = i + 1;
-                while j < subtags.len() && subtags[j].len() != 2 {
-                    if !value.is_empty() {
-                        value.push('-');
-                    }
-                    value.push_str(subtags[j]);
-                    j += 1;
-                }
-                return (!value.is_empty()).then_some(value);
-            }
-            i += 1;
-            while i < subtags.len() && subtags[i].len() != 2 {
-                i += 1;
-            }
-        } else {
-            // Hit another singleton extension (e.g. `-t-`); `nu` lives only under `u`.
-            break;
-        }
-    }
-    None
-}
-
 #[cold]
 fn throw_type_error(message: &str) -> ! {
     let msg = js_string_from_bytes(message.as_ptr(), message.len() as u32);
@@ -549,13 +532,15 @@ fn canonicalize_language_tag(tag: &str) -> Option<String> {
     #[cfg(feature = "intl-locale")]
     {
         match icu_locale_core::Locale::normalize(tag) {
-            Ok(canonical) => Some(canonical.into_owned()),
+            Ok(canonical) => Some(canonicalize_unicode_extension_types(
+                &canonical.into_owned(),
+            )),
             Err(_) => None,
         }
     }
     #[cfg(not(feature = "intl-locale"))]
     {
-        canonical_locale(tag)
+        canonical_locale(tag).map(|c| canonicalize_unicode_extension_types(&c))
     }
 }
 
@@ -565,28 +550,6 @@ fn canonicalize_language_tag(tag: &str) -> Option<String> {
 fn js_has_index(obj: f64, index: u32) -> bool {
     let key = string_value(&index.to_string());
     crate::object::js_object_has_property(obj, key).to_bits() == crate::value::TAG_TRUE
-}
-
-/// CanonicalizeLocaleList element handler: a present element must be a String or
-/// an Object (an `Intl.Locale` or anything ToString-able), else `TypeError`; the
-/// resulting tag is canonicalized (`RangeError` if structurally invalid) and
-/// pushed if not already present.
-fn push_locale_element(out: &mut Vec<String>, value: f64) {
-    let jv = JSValue::from_bits(value.to_bits());
-    let tag = if jv.is_any_string() {
-        string_from_string_value(value).unwrap_or_default()
-    } else if object_ptr_from_value(value).is_some() {
-        value_to_string(value)
-    } else {
-        // undefined / null / boolean / number / Symbol element → TypeError.
-        throw_type_error("locale must be a String or Object");
-    };
-    let Some(canonical) = canonicalize_language_tag(&tag) else {
-        throw_invalid_language_tag(&tag);
-    };
-    if !out.iter().any(|existing| existing == &canonical) {
-        out.push(canonical);
-    }
 }
 
 fn locales_from_value(locales: f64) -> Vec<String> {
@@ -602,6 +565,15 @@ fn locales_from_value(locales: f64) -> Vec<String> {
     // A String argument is treated as a single-element list (not iterated by char).
     if js.is_any_string() {
         let tag = string_from_string_value(locales).unwrap_or_default();
+        let Some(canonical) = canonicalize_language_tag(&tag) else {
+            throw_invalid_language_tag(&tag);
+        };
+        return vec![canonical];
+    }
+    // CanonicalizeLocaleList step 2: a value with an `[[InitializedLocale]]`
+    // slot (an `Intl.Locale` / subclass instance) is the single-element list
+    // « locale », read from its slot — not iterated nor `toString`-ed.
+    if let Some(tag) = locale_instance_tag(locales) {
         let Some(canonical) = canonicalize_language_tag(&tag) else {
             throw_invalid_language_tag(&tag);
         };
@@ -930,6 +902,22 @@ fn coerce_options_reject_null(options: f64) -> f64 {
     options
 }
 
+/// `ToObject(options)` for the SupportedLocales option read: `null` / `undefined`
+/// are handled by the caller; a non-object primitive (Boolean, Number, String,
+/// Symbol, BigInt) is boxed into a fresh empty object so that reading an option
+/// key walks the standard prototype chain and fires any `Object.prototype`
+/// getter for that key exactly once (SupportedLocales step 1.a, test262
+/// `supportedLocalesOf/options-toobject.js`). A real object passes through.
+fn to_object_for_options(options: f64) -> f64 {
+    if object_ptr_from_value(options).is_some() {
+        return options;
+    }
+    // Box the primitive: an empty object has no own option keys, so every read
+    // resolves through the prototype chain — matching the boxed-wrapper behaviour
+    // the spec observes (the wrapper carries no `localeMatcher` of its own).
+    js_nanbox_pointer(js_object_alloc(0, 0) as i64)
+}
+
 /// GetBooleanOption(options, key): `undefined` → `None`, otherwise ToBoolean.
 fn get_bool_option(options: f64, key: &str) -> Option<bool> {
     let value = get_option_value(options, key);
@@ -972,71 +960,6 @@ fn dt_component_option(
 /// IANA zone identifiers pass; the malformed names ECMA-402 rejects
 /// (`"MEZ"`, `"invalid"`, `"Europe/İstanbul"`, …) do not. Returns the (best
 /// effort, un-recased) canonical identifier, or `None` to signal `RangeError`.
-fn canonicalize_named_time_zone(tz: &str) -> Option<String> {
-    if tz.eq_ignore_ascii_case("UTC") || tz.eq_ignore_ascii_case("Etc/UTC") {
-        return Some("UTC".to_string());
-    }
-    if !tz.is_ascii() {
-        return None;
-    }
-    // Legacy single-component IANA zones / links that carry no '/'.
-    const SINGLE_WORD_ZONES: &[&str] = &[
-        "GMT",
-        "GMT0",
-        "Zulu",
-        "Universal",
-        "UCT",
-        "Greenwich",
-        "Navajo",
-        "Eire",
-        "Iceland",
-        "Cuba",
-        "Egypt",
-        "Hongkong",
-        "Iran",
-        "Israel",
-        "Japan",
-        "Jamaica",
-        "Libya",
-        "Poland",
-        "Portugal",
-        "PRC",
-        "Singapore",
-        "Turkey",
-        "ROC",
-        "ROK",
-        "W-SU",
-        "Factory",
-        "EST",
-        "MST",
-        "HST",
-        "EST5EDT",
-        "CST6CDT",
-        "MST7MDT",
-        "PST8PDT",
-    ];
-    if SINGLE_WORD_ZONES.iter().any(|z| z.eq_ignore_ascii_case(tz)) {
-        return Some(tz.to_string());
-    }
-    let segments: Vec<&str> = tz.split('/').collect();
-    if segments.len() < 2 {
-        return None;
-    }
-    let mut has_alpha = false;
-    for seg in &segments {
-        if seg.is_empty() {
-            return None;
-        }
-        for b in seg.bytes() {
-            if b.is_ascii_alphabetic() {
-                has_alpha = true;
-            } else if !(b.is_ascii_alphanumeric() || b == b'_' || b == b'+' || b == b'-') {
-                return None;
-            }
-        }
-    }
-    has_alpha.then(|| tz.to_string())
-}
 fn make_instance(closure: *const ClosureHeader, kind: &str, locales: f64, options: f64) -> f64 {
     let locale = locale_or_default(locales);
     let obj = js_object_alloc(0, 8);
@@ -1135,15 +1058,23 @@ fn make_instance(closure: *const ClosureHeader, kind: &str, locales: f64, option
                     )),
                 }
             }
-            // `numberingSystem` must be a well-formed `type` nonterminal.
-            if let Some(ns) = get_locale_extension_option(options, "numberingSystem") {
+            // `numberingSystem` must be a well-formed `type` nonterminal. Read
+            // it here (preserving the GetOption order options-order.js asserts),
+            // then run ResolveLocale for `nu` — reconciling the option with the
+            // locale's `-u-nu-` keyword so `resolvedOptions().locale` /
+            // `.numberingSystem` reflect only the supported value actually used.
+            let dtf_opt_ns = get_locale_extension_option(options, "numberingSystem").map(|ns| {
                 if !is_well_formed_numbering_system(&ns) {
                     throw_range_error(&format!(
                         "Value {ns} out of range for Intl options property numberingSystem"
                     ));
                 }
-                set_internal_field(obj, KEY_NUMBERING_SYSTEM, string_value(&ns));
-            }
+                ns.to_ascii_lowercase()
+            });
+            let (dtf_locale, dtf_numbering) =
+                resolve_numbering_system(&locale, dtf_opt_ns.as_deref());
+            set_internal_field(obj, KEY_LOCALE, string_value(&dtf_locale));
+            set_internal_field(obj, KEY_NUMBERING_SYSTEM, string_value(&dtf_numbering));
             // hour12 (boolean) then hourCycle (enum) — both only surface in
             // `resolvedOptions` when the resolved pattern has an hour field.
             if let Some(h12) = get_bool_option(options, "hour12") {
@@ -1157,24 +1088,14 @@ fn make_instance(closure: *const ClosureHeader, kind: &str, locales: f64, option
                 }
                 set_internal_field(obj, KEY_HOUR_CYCLE, string_value(&hc));
             }
-            let mut time_zone =
-                get_option_string(options, "timeZone").unwrap_or_else(|| "UTC".to_string());
-            // A timeZone that begins with a sign is an offset identifier: it must
-            // be syntactically valid (ECMA-402 rejects malformed offsets with a
-            // RangeError), and is then canonicalized to `±HH:mm` so
-            // `resolvedOptions().timeZone` matches FormatOffsetTimeZoneIdentifier.
-            // Named zones are validated structurally (Perry has no tz database).
-            if matches!(time_zone.as_bytes().first(), Some(b'+') | Some(b'-')) {
-                if !is_valid_offset_time_zone(&time_zone) {
-                    throw_range_error(&format!("Invalid time zone specified: {time_zone}"));
-                }
-                time_zone = canonicalize_offset_time_zone(&time_zone);
-            } else {
-                match canonicalize_named_time_zone(&time_zone) {
-                    Some(canonical) => time_zone = canonical,
-                    None => throw_range_error(&format!("Invalid time zone specified: {time_zone}")),
-                }
-            }
+            // ECMA-402 DefaultTimeZone(): when no `timeZone` option is given, use
+            // the HOST time zone (Node returns e.g. "Europe/Berlin"), not UTC —
+            // and an explicit invalid zone is a RangeError while an unrecognized
+            // host default falls back to UTC. `resolved_date_time_zone` is the
+            // single source of that logic (it canonicalizes offsets to `±HH:mm`
+            // for FormatOffsetTimeZoneIdentifier and validates named zones
+            // structurally, Perry having no tz database).
+            let time_zone = resolved_date_time_zone(options);
             set_internal_field(obj, KEY_TIME_ZONE, string_value(&time_zone));
             // Date/time component options (ECMA-402 Table 7), read in order. Each
             // out-of-range value is a RangeError.
@@ -1607,7 +1528,15 @@ fn make_instance(closure: *const ClosureHeader, kind: &str, locales: f64, option
     if JSValue::from_bits(proto.to_bits()).is_pointer() {
         crate::object::prototype_chain::object_set_static_prototype(obj as usize, proto.to_bits());
     }
-    js_nanbox_pointer(obj as i64)
+    let instance = js_nanbox_pointer(obj as i64);
+    // ChainNumberFormat / ChainDateTimeFormat only (see `chain_legacy_constructed`):
+    // Intl.Collator ignores its this-value, so it is deliberately excluded.
+    if matches!(kind, KIND_NUMBER | KIND_DATE_TIME) {
+        if let Some(this_value) = ctor_guard::chain_legacy_constructed(closure, instance) {
+            return this_value;
+        }
+    }
+    instance
 }
 
 fn install_bound_instance_function(
@@ -1639,11 +1568,17 @@ fn install_bound_instance_function(
     closure
 }
 
-extern "C" fn number_format_constructor_thunk(closure: *const ClosureHeader, rest: f64) -> f64 {
+pub(super) extern "C" fn number_format_constructor_thunk(
+    closure: *const ClosureHeader,
+    rest: f64,
+) -> f64 {
     make_instance(closure, KIND_NUMBER, rest_arg(rest, 0), rest_arg(rest, 1))
 }
 
-extern "C" fn date_time_format_constructor_thunk(closure: *const ClosureHeader, rest: f64) -> f64 {
+pub(super) extern "C" fn date_time_format_constructor_thunk(
+    closure: *const ClosureHeader,
+    rest: f64,
+) -> f64 {
     make_instance(
         closure,
         KIND_DATE_TIME,
@@ -1652,11 +1587,17 @@ extern "C" fn date_time_format_constructor_thunk(closure: *const ClosureHeader, 
     )
 }
 
-extern "C" fn collator_constructor_thunk(closure: *const ClosureHeader, rest: f64) -> f64 {
+pub(super) extern "C" fn collator_constructor_thunk(
+    closure: *const ClosureHeader,
+    rest: f64,
+) -> f64 {
     make_instance(closure, KIND_COLLATOR, rest_arg(rest, 0), rest_arg(rest, 1))
 }
 
-extern "C" fn segmenter_constructor_thunk(closure: *const ClosureHeader, rest: f64) -> f64 {
+pub(super) extern "C" fn segmenter_constructor_thunk(
+    closure: *const ClosureHeader,
+    rest: f64,
+) -> f64 {
     require_new_target("Segmenter");
     make_instance(
         closure,
@@ -1666,7 +1607,10 @@ extern "C" fn segmenter_constructor_thunk(closure: *const ClosureHeader, rest: f
     )
 }
 
-extern "C" fn list_format_constructor_thunk(closure: *const ClosureHeader, rest: f64) -> f64 {
+pub(super) extern "C" fn list_format_constructor_thunk(
+    closure: *const ClosureHeader,
+    rest: f64,
+) -> f64 {
     require_new_target("ListFormat");
     make_instance(
         closure,
@@ -1676,7 +1620,7 @@ extern "C" fn list_format_constructor_thunk(closure: *const ClosureHeader, rest:
     )
 }
 
-extern "C" fn relative_time_format_constructor_thunk(
+pub(super) extern "C" fn relative_time_format_constructor_thunk(
     closure: *const ClosureHeader,
     rest: f64,
 ) -> f64 {
@@ -1689,7 +1633,10 @@ extern "C" fn relative_time_format_constructor_thunk(
     )
 }
 
-extern "C" fn plural_rules_constructor_thunk(closure: *const ClosureHeader, rest: f64) -> f64 {
+pub(super) extern "C" fn plural_rules_constructor_thunk(
+    closure: *const ClosureHeader,
+    rest: f64,
+) -> f64 {
     require_new_target("PluralRules");
     make_instance(
         closure,
@@ -1710,7 +1657,10 @@ fn supported_locales_array(locales: f64, options: f64) -> f64 {
     //      lookup result.
     let requested = locales_from_value(locales);
     if !JSValue::from_bits(options.to_bits()).is_undefined() {
-        let options = coerce_options_reject_null(options);
+        // SupportedLocales step 1.a: ? ToObject(options). null throws; a
+        // primitive is boxed so the localeMatcher read fires an Object.prototype
+        // getter exactly once (options-toobject.js).
+        let options = to_object_for_options(coerce_options_reject_null(options));
         let _ = enum_option_strict(
             options,
             "localeMatcher",

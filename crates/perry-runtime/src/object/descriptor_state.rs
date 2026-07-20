@@ -4,6 +4,7 @@
 use super::*;
 
 use crate::arena::arena_alloc_gc;
+use crate::fast_hash::{new_fast_key_hash_map, FastKeyHashMap};
 use crate::ArrayHeader;
 use crate::JSValue;
 use std::cell::{Cell, RefCell, UnsafeCell};
@@ -52,7 +53,11 @@ impl PropertyAttrs {
 }
 
 thread_local! {
-    pub(crate) static PROPERTY_DESCRIPTORS: RefCell<HashMap<(usize, String), PropertyAttrs>> = RefCell::new(HashMap::new());
+    // Hasher: `FastKeyHasher` (FNV-1a) rather than std's SipHash `RandomState`.
+    // The key is `(owner_addr, key_string)` — a runtime heap pointer plus a
+    // program-supplied property name, so no external input reaches it and
+    // DoS-resistant hashing buys nothing on this hot property-access path.
+    pub(crate) static PROPERTY_DESCRIPTORS: RefCell<FastKeyHashMap<(usize, String), PropertyAttrs>> = RefCell::new(new_fast_key_hash_map());
 }
 
 /// Accessor descriptor storage: maps (obj_ptr, key) -> (get_closure_bits, set_closure_bits).
@@ -67,7 +72,9 @@ pub(crate) struct AccessorDescriptor {
 }
 
 thread_local! {
-    pub(crate) static ACCESSOR_DESCRIPTORS: RefCell<HashMap<(usize, String), AccessorDescriptor>> = RefCell::new(HashMap::new());
+    // Hasher: `FastKeyHasher` (FNV-1a); see `PROPERTY_DESCRIPTORS` above for the
+    // same-shape `(owner_addr, key_string)` key and rationale.
+    pub(crate) static ACCESSOR_DESCRIPTORS: RefCell<FastKeyHashMap<(usize, String), AccessorDescriptor>> = RefCell::new(new_fast_key_hash_map());
     /// Fast-path gate: `false` when no accessor descriptors have ever been installed
     /// on this thread, so hot `js_object_get_field_by_name` / `set_field_by_name`
     /// can skip the `ACCESSOR_DESCRIPTORS` HashMap lookup entirely.
@@ -101,11 +108,14 @@ pub(crate) fn descriptors_in_use() -> bool {
 /// relaxed load, hoistable out of hot loops) via the
 /// `@PERRY_CLASS_FIELD_INLINE_GUARD_DISABLED` symbol and falls back to the full
 /// `js_typed_feedback_class_field_{get,set}_guard` call whenever it is non-zero.
-/// It flips to 1 the moment either (a) any accessor / property descriptor comes
-/// into use — the guard then has to perform descriptor-aware dispatch the inline
-/// path doesn't model — or (b) typed-feedback tracing is enabled, where the
-/// guard records observations the inline path would silently skip. Both are
-/// monotonic ("in use" never reverts), so the flag is set-only.
+/// It flips to 1 the moment either (a) an accessor / property descriptor is
+/// installed on an object the inline path cannot vet per-receiver — a
+/// registered class prototype or the canonical `Object.prototype` (#5654;
+/// receiver-level descriptors are instead rejected by the emitted
+/// `OBJ_FLAG_HAS_DESCRIPTORS` check, so they don't poison the process) — or
+/// (b) typed-feedback tracing is enabled, where the guard records observations
+/// the inline path would silently skip. Both are monotonic ("in use" never
+/// reverts), so the flag is set-only.
 #[no_mangle]
 pub static PERRY_CLASS_FIELD_INLINE_GUARD_DISABLED: AtomicU8 = AtomicU8::new(0);
 
@@ -118,6 +128,38 @@ pub(crate) fn disable_class_field_inline_guard() {
 /// True when the inline class-field fast path is still permitted.
 pub(crate) fn class_field_inline_guard_enabled() -> bool {
     PERRY_CLASS_FIELD_INLINE_GUARD_DISABLED.load(Ordering::Relaxed) == 0
+}
+
+/// #5654: flip the process-wide inline gate only when the descriptor target can
+/// intercept a `this.field` access that the inline precheck cannot reject on
+/// its own. Receiver-level installs are visible to the precheck via
+/// `OBJ_FLAG_HAS_DESCRIPTORS` in the receiver's GcHeader (set by
+/// [`note_descriptor_target`], checked by the emitted IR), so only
+/// prototype-level targets still need the global disable:
+///   - a class prototype — either the reflective decl-prototype object that
+///     `C.prototype` materializes (`CLASS_DECL_PROTOTYPE_OBJECTS`) or a
+///     synthetic `function Base() {}; Base.prototype = obj` prototype
+///     (`CLASS_PROTOTYPE_OBJECTS`) — intercepts `this.field` on every instance
+///     of that class, which the per-receiver flag cannot see;
+///   - the canonical `Object.prototype` sits at the tail of every instance's
+///     chain.
+/// Any other target (plain object, array, closure, builtin namespace) never
+/// appears in the guard's descriptor checks — those walk the receiver and the
+/// class-registry prototype chain only — so unrelated installs (the builtin
+/// setup that runs during every program's startup, `Object.freeze` on a config
+/// object, …) no longer disable the #5093 fast path process-wide.
+///
+/// The prototype-registry probes scan by value (O(#classes)); descriptor
+/// installs are rare and never on the hot property path, so the scan cost is
+/// acceptable. Finer granularity (flip only when the key collides with a
+/// declared field of that class hierarchy) is possible follow-up work.
+pub(crate) fn disable_class_field_inline_guard_for_target(obj: usize) {
+    if crate::array::object_prototype_addr_matches(obj)
+        || class_registry::is_registered_class_prototype_object(obj)
+        || class_registry::class_id_for_decl_prototype_object(obj).is_some()
+    {
+        disable_class_field_inline_guard();
+    }
 }
 
 /// #5054: a descriptor (any kind) has been installed on the canonical
@@ -296,12 +338,82 @@ pub(crate) fn object_has_descriptors(obj: usize) -> bool {
     false
 }
 
+/// #6084 (item 6): can anything intercept a plain-data write of `key` to the
+/// `GC_TYPE_OBJECT` at `addr` (own accessor / non-writable descriptor, or an
+/// inherited setter / non-writable data property), so the dynamic-write
+/// transition-cache fast path must be skipped for THIS write?
+///
+/// Replaces the process-global `GLOBAL_DESCRIPTORS_IN_USE` latch that used to
+/// gate both dynamic-write fast paths. That latch flips on *any* descriptor
+/// install anywhere — so a single `Object.freeze` on a completely unrelated
+/// object (or any library that freezes one config object at import time)
+/// permanently pushed EVERY dynamic property write in the process onto the
+/// O(own-key-count) slow walk. Measured: 1M objects × 3 new props = 5281 ms;
+/// the identical loop after one unrelated `Object.freeze` = 6807 ms (+29%,
+/// and it never recovers).
+///
+/// The vetting here is the same predicate `ordinary_set`'s #5054 fast path
+/// (`proxy.rs`) already applies per receiver, and the same receiver-level /
+/// prototype-level split as the #5654 read-side guard:
+///   - own descriptors are visible per-object in `OBJ_FLAG_HAS_DESCRIPTORS`
+///     (set by [`note_descriptor_target`], travels with the object on
+///     evacuation, and is clear on every fresh allocation);
+///   - only *prototype*-level installs can intercept a write to an object whose
+///     own flag is clear, and those are checked against the actual prototype
+///     chain — `Object.prototype` per-key via [`object_proto_may_intercept_key`]
+///     (a blanket check made wide dynamic builds O(n²), see #5054), a recorded
+///     `setPrototypeOf` target, or the class chain via
+///     [`class_instance_set_may_intercept`].
+///
+/// Conservative in every uncertain case (returns `true` = take the slow path).
+/// `caller` must have already established that `addr` is a `GC_TYPE_OBJECT`
+/// whose frozen/sealed/non-extensible flags are clear.
+pub(crate) unsafe fn plain_data_write_may_intercept(addr: usize, class_id: u32, key: f64) -> bool {
+    // Nothing has ever installed a descriptor or accessor: no per-object work at
+    // all, just the one relaxed load the old gate did.
+    if !descriptors_in_use() {
+        return false;
+    }
+
+    // A descriptor exists SOMEWHERE. Vet this receiver and its prototype chain
+    // instead of latching the whole process onto the slow path.
+
+    // Own accessor / non-writable descriptor on this exact object.
+    if object_has_descriptors(addr) {
+        return true;
+    }
+
+    // `note_descriptor_target` cannot record the per-object flag for typed
+    // arrays (small ones are plain-alloc'd without a GcHeader) or for exotic
+    // expando hosts, so their descriptors are invisible to the flag check
+    // above — never fast-path them once any descriptor exists.
+    if crate::typedarray::lookup_typed_array_kind(addr).is_some() {
+        return true;
+    }
+    let value = crate::value::js_nanbox_pointer(addr as i64);
+    if super::exotic_expando::exotic_expando_kind_of_value(value).is_some() {
+        return true;
+    }
+
+    if class_id == 0 {
+        // Plain object. Its prototype is exactly `Object.prototype` unless a
+        // `setPrototypeOf` target was recorded for it.
+        super::prototype_chain::object_static_prototype(addr).is_some()
+            || object_proto_may_intercept_key(key)
+    } else {
+        // Class instance: an inherited accessor / non-writable data property
+        // anywhere in the chain intercepts the write.
+        class_instance_set_may_intercept(addr, class_id, key)
+    }
+}
+
 /// Store a property descriptor for (obj, key).
 pub(crate) fn set_property_attrs(obj: usize, key: String, attrs: PropertyAttrs) {
+    super::prop_plan::prop_plan_epoch_bump();
     note_descriptor_target(obj);
     PROPERTY_ATTRS_IN_USE.with(|c| c.set(true));
     GLOBAL_DESCRIPTORS_IN_USE.store(true, Ordering::Relaxed);
-    disable_class_field_inline_guard();
+    disable_class_field_inline_guard_for_target(obj);
     PROPERTY_DESCRIPTORS.with(|m| {
         m.borrow_mut().insert((obj, key), attrs);
     });
@@ -310,6 +422,7 @@ pub(crate) fn set_property_attrs(obj: usize, key: String, attrs: PropertyAttrs) 
 /// Remove a customized property descriptor for (obj, key), restoring default
 /// data-property attributes for subsequent writes and reflection.
 pub(crate) fn clear_property_attrs(obj: usize, key: &str) {
+    super::prop_plan::prop_plan_epoch_bump();
     PROPERTY_DESCRIPTORS.with(|m| {
         m.borrow_mut().remove(&(obj, key.to_string()));
     });
@@ -426,12 +539,33 @@ pub(crate) unsafe fn json_object_getter_value(
     Some(result)
 }
 
+/// Monotonic (#6386): has an accessor descriptor keyed `"constructor"` ever
+/// been installed on ANY object? While false, `ArraySpeciesCreate`'s
+/// own-`constructor`-accessor probe on a plain array cannot hit, so the
+/// species fast path skips the `(addr, String)` descriptor-table lookup (a
+/// per-call `String` allocation + SipHash probe). Set (release) before the
+/// insert, so a false (acquire) read can't race a completed install.
+static CONSTRUCTOR_ACCESSOR_EVER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn constructor_accessor_ever_installed() -> bool {
+    CONSTRUCTOR_ACCESSOR_EVER.load(Ordering::Acquire)
+}
+
+fn note_accessor_descriptor_key(key: &str) {
+    if key == "constructor" {
+        CONSTRUCTOR_ACCESSOR_EVER.store(true, Ordering::Release);
+    }
+}
+
 /// Store an accessor descriptor for (obj, key).
 pub(crate) fn set_accessor_descriptor(obj: usize, key: String, acc: AccessorDescriptor) {
+    super::prop_plan::prop_plan_epoch_bump();
     note_descriptor_target(obj);
     ACCESSORS_IN_USE.with(|c| c.set(true));
     GLOBAL_DESCRIPTORS_IN_USE.store(true, Ordering::Relaxed);
-    disable_class_field_inline_guard();
+    disable_class_field_inline_guard_for_target(obj);
+    note_accessor_descriptor_key(&key);
     ACCESSOR_DESCRIPTORS.with(|m| {
         m.borrow_mut().insert((obj, key), acc);
     });
@@ -440,6 +574,7 @@ pub(crate) fn set_accessor_descriptor(obj: usize, key: String, acc: AccessorDesc
 /// Remove an accessor descriptor for (obj, key), letting ordinary data-property
 /// reads and writes use the object's stored field again.
 pub(crate) fn clear_accessor_descriptor(obj: usize, key: &str) {
+    super::prop_plan::prop_plan_epoch_bump();
     ACCESSOR_DESCRIPTORS.with(|m| {
         m.borrow_mut().remove(&(obj, key.to_string()));
     });
@@ -465,6 +600,8 @@ pub(crate) fn set_builtin_accessor_descriptor(
     acc: AccessorDescriptor,
     attrs: PropertyAttrs,
 ) {
+    super::prop_plan::prop_plan_epoch_bump();
+    note_accessor_descriptor_key(&key);
     ACCESSOR_DESCRIPTORS.with(|m| {
         m.borrow_mut().insert((obj, key.clone()), acc);
     });
@@ -489,6 +626,7 @@ pub(crate) fn set_builtin_accessor_descriptor(
 /// `PROPERTY_DESCRIPTORS` per-object and unconditionally. The gate stays
 /// down, so the object get/set hot path is unaffected for every program.
 pub(crate) fn set_builtin_property_attrs(obj: usize, key: String, attrs: PropertyAttrs) {
+    super::prop_plan::prop_plan_epoch_bump();
     note_descriptor_target(obj);
     PROPERTY_DESCRIPTORS.with(|m| {
         m.borrow_mut().insert((obj, key), attrs);
@@ -543,4 +681,103 @@ pub(crate) unsafe fn mark_all_keys(
         }
         set_property_attrs(obj_addr, key_str, attrs);
     }
+}
+
+/// Death pruning for the two descriptor side tables (2026-07-09 GC audit
+/// wave 2). Entries are keyed by `(owner_addr, key)` and were never removed
+/// when the owner died: `Object.freeze(perRequestObj)` leaked one entry per
+/// key per request, accessor closures were immortalized by the root scanner
+/// below, and a fresh object at a recycled address inherited the dead
+/// owner's descriptors (stale "read only property" throws). `is_dead_owner`
+/// is one of the GC's post-trace / copied-minor deadness predicates
+/// (`gc::dead_owner`); each distinct owner is probed once.
+pub(crate) fn prune_dead_descriptor_owner_entries(is_dead_owner: &dyn Fn(usize) -> bool) {
+    let mut verdicts: HashMap<usize, bool> = HashMap::new();
+    let mut is_dead = |owner: usize| -> bool {
+        *verdicts
+            .entry(owner)
+            .or_insert_with(|| is_dead_owner(owner))
+    };
+    PROPERTY_DESCRIPTORS.with(|m| {
+        let mut m = m.borrow_mut();
+        if !m.is_empty() {
+            m.retain(|(owner, _), _| !is_dead(*owner));
+        }
+    });
+    ACCESSOR_DESCRIPTORS.with(|m| {
+        let mut m = m.borrow_mut();
+        if !m.is_empty() {
+            m.retain(|(owner, _), _| !is_dead(*owner));
+        }
+    });
+}
+
+/// Rewrite a descriptor table's owner ADDRESS during the GC metadata-rewrite
+/// phase (evacuation moved the owning object), mirroring the symbol-keyed
+/// twin tables' owner rekey (`symbol/gc_roots.rs`). Outside that phase the
+/// owner is returned unchanged.
+fn rewrite_descriptor_owner(
+    visitor: &mut crate::gc::RuntimeRootVisitor<'_>,
+    owner: usize,
+) -> usize {
+    if !visitor.is_metadata_rewrite_phase() {
+        return owner;
+    }
+    let mut addr = owner;
+    visitor.visit_metadata_usize_slot(&mut addr);
+    addr
+}
+
+/// GC scanner for the string-keyed descriptor side tables (2026-07-02 audit
+/// P0; ported from the stranded be73b4f8d): `ACCESSOR_DESCRIPTORS` holds the
+/// ONLY reference to `Object.defineProperty` getter/setter closures (the
+/// accessor install path stores no field-slot copy), so without visiting
+/// them a minor GC sweeps or moves the closure out from under the next
+/// property read. Owner keys are `(obj_addr, key)` — rekeyed when the owning
+/// object moves, exactly like the symbol-keyed twins, so frozen/non-writable
+/// attrs and accessors don't silently detach (or fire on a new tenant at a
+/// reused address).
+pub(crate) fn scan_descriptor_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
+    PROPERTY_DESCRIPTORS.with(|descriptors| {
+        let mut descriptors = descriptors.borrow_mut();
+        let needs_rebuild = descriptors
+            .keys()
+            .any(|(owner, _)| rewrite_descriptor_owner(visitor, *owner) != *owner);
+        if needs_rebuild {
+            let old = std::mem::take(&mut *descriptors);
+            for ((owner, key), attrs) in old {
+                let owner = rewrite_descriptor_owner(visitor, owner);
+                descriptors.insert((owner, key), attrs);
+            }
+        }
+    });
+
+    ACCESSOR_DESCRIPTORS.with(|descriptors| {
+        let mut descriptors = descriptors.borrow_mut();
+        let needs_rebuild = descriptors
+            .keys()
+            .any(|(owner, _)| rewrite_descriptor_owner(visitor, *owner) != *owner);
+        if needs_rebuild {
+            let old = std::mem::take(&mut *descriptors);
+            for ((owner, key), mut acc) in old {
+                if acc.get != 0 {
+                    visitor.visit_nanbox_u64_slot(&mut acc.get);
+                }
+                if acc.set != 0 {
+                    visitor.visit_nanbox_u64_slot(&mut acc.set);
+                }
+                let owner = rewrite_descriptor_owner(visitor, owner);
+                descriptors.insert((owner, key), acc);
+            }
+        } else {
+            for acc in descriptors.values_mut() {
+                if acc.get != 0 {
+                    visitor.visit_nanbox_u64_slot(&mut acc.get);
+                }
+                if acc.set != 0 {
+                    visitor.visit_nanbox_u64_slot(&mut acc.set);
+                }
+            }
+        }
+    });
 }

@@ -15,8 +15,20 @@ use super::*;
 pub extern "C" fn js_object_define_properties(target: f64, descriptors: f64) -> f64 {
     // #2817: target must be an object (or class-ref). Node throws
     // `Object.defineProperties called on non-object` for primitives.
+    //
+    // #6363: a native HANDLE target (a pointer-tagged registry id — zlib stream,
+    // fetch Headers/Request/Response/Blob, crypto hash, …) is an ordinary
+    // extensible object in Node but is not a heap `ObjectHeader`, so it fails
+    // `value_is_object_like` and used to throw here. Let it through: the per-key
+    // `js_object_define_property` below recognises the handle band and routes
+    // each descriptor to the handle's own-property storage.
     let target_is_class_ref = super::super::class_ref_id(target).is_some();
-    if !target_is_class_ref && !unsafe { value_is_object_like(target) } {
+    let target_is_handle = {
+        let jv = crate::value::JSValue::from_bits(target.to_bits());
+        jv.is_pointer()
+            && crate::value::addr_class::is_small_handle(unsafe { jv.as_pointer::<u8>() } as usize)
+    };
+    if !target_is_class_ref && !target_is_handle && !unsafe { value_is_object_like(target) } {
         throw_object_type_error(b"Object.defineProperties called on non-object");
     }
     // #2817: the properties bag must be coercible to an object. Node throws
@@ -144,11 +156,18 @@ pub extern "C" fn js_object_set_prototype_of(obj_value: f64, proto: f64) -> f64 
 
     // A Proxy receiver is a small registered id, not a heap object — the
     // recording path below would deref the fake pointer and segfault. Route
-    // through the Reflect entry (which resolves the proxy to its target) and
-    // return the proxy per Object.setPrototypeOf's contract. (Proxy crash
-    // cluster.)
+    // through the Reflect entry (which resolves the proxy to its target and
+    // runs the trap chain, recursing through proxy targets). `Object.setPrototypeOf`
+    // must surface a `false` internal-method result as a `TypeError`
+    // (`Reflect.setPrototypeOf` returns the boolean without throwing). Without
+    // this, `Object.setPrototypeOf(proxyOfNonExtensibleProxy, x)` silently
+    // succeeded instead of throwing (test262
+    // Proxy/setPrototypeOf/trap-is-{missing,undefined}-target-is-proxy).
     if crate::proxy::js_proxy_is_proxy(obj_value) != 0 {
-        crate::proxy::js_reflect_set_prototype_of(obj_value, proto);
+        let ok = crate::proxy::js_reflect_set_prototype_of(obj_value, proto);
+        if crate::value::js_is_truthy(ok) == 0 {
+            throw_object_type_error(b"#<Object> is not extensible");
+        }
         return obj_value;
     }
 

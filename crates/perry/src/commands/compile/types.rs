@@ -121,6 +121,20 @@ pub struct CompileArgs {
     #[arg(long)]
     pub libc: Option<String>,
 
+    /// CPU baseline for the generated machine code (#6125). Accepts an LLVM
+    /// CPU name (`x86-64-v2`, `x86-64-v3`, `znver2`, `apple-m1`, …), `native`
+    /// (tune to this machine's full instruction set — the default for host
+    /// builds), or `generic`/`off` (the target architecture's portable
+    /// baseline — the default for cross builds). Pin this when the binary
+    /// will run on other machines: a build box with AVX-512 otherwise bakes
+    /// AVX-512 into a host-native build, which SIGILLs on older x86-64 CPUs.
+    /// Also settable via the `PERRY_TARGET_CPU` env var or perry.toml
+    /// `[build] march`; `[build] native_tuning = false` is shorthand for
+    /// `generic`. Applies to app code, and to the auto-optimized
+    /// runtime/stdlib rebuild via `-C target-cpu`.
+    #[arg(long)]
+    pub march: Option<String>,
+
     /// App bundle identifier (required for widget targets)
     #[arg(long)]
     pub app_bundle_id: Option<String>,
@@ -667,6 +681,12 @@ pub struct CompilationContext {
     /// structural parser). A program that never canonicalizes a locale links a
     /// lighter hand-rolled fallback instead.
     pub uses_intl_locale: bool,
+    /// Whether any TS module localizes a date/time — `Intl.DateTimeFormat`, or
+    /// `Date.prototype.toLocale{,Date,Time}String`. Gates
+    /// `perry-runtime/intl-datetime` (`icu_datetime` + its bundled CLDR
+    /// date-time patterns, for byte-parity locale formatting). When absent the
+    /// runtime links the lighter hand-rolled numeric fallback instead.
+    pub uses_intl_datetime: bool,
     /// Whether any TS module uses a heap-snapshot API (`v8.getHeapSnapshot` /
     /// `v8.writeHeapSnapshot`) or `process.report`. Gates
     /// `perry-runtime/diagnostics` (the cold-path JSON serializers + the
@@ -1005,6 +1025,7 @@ impl CompilationContext {
             uses_string_normalize: false,
             uses_intl_segmenter: false,
             uses_intl_locale: false,
+            uses_intl_datetime: false,
             uses_diagnostics: false,
             uses_dgram: false,
             needs_thread: false,

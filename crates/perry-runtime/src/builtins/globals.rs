@@ -507,24 +507,27 @@ fn record_transfer_clone(src: usize, cloned: usize) {
     });
 }
 
-fn detach_unseen_transferables() {
+/// Detach every transfer-list buffer. Runs only AFTER the whole clone
+/// succeeded (HTML structured-clone semantics): a `DataCloneError` thrown
+/// mid-walk must leave all source buffers attached, so no detachment happens
+/// during cloning itself. Idempotent per buffer.
+fn detach_transferables_after_success() {
     STRUCTURED_CLONE_TRANSFER_STATE.with(|state| {
         if let Some(state) = state.borrow().as_ref() {
             for addr in &state.transferables {
-                if state.clones.contains_key(addr) {
-                    continue;
-                }
-                unsafe {
-                    let src = *addr as *mut crate::buffer::BufferHeader;
-                    (*src).length = 0;
-                    (*src).capacity = 0;
-                }
+                crate::buffer::detach_array_buffer(*addr);
             }
         }
     });
 }
 
 fn clone_buffer_header(addr: usize, detach_source: bool) -> f64 {
+    // An already-detached ArrayBuffer cannot be serialized — transferring it
+    // is rejected earlier by `collect_transfer_list`, and plain cloning must
+    // throw rather than produce a fresh empty buffer.
+    if crate::buffer::is_detached_buffer(addr) {
+        throw_data_clone_error("An ArrayBuffer is detached and could not be cloned");
+    }
     if detach_source {
         if let Some(existing) = transfer_existing_clone(addr) {
             return crate::value::js_nanbox_pointer(existing as i64);
@@ -561,11 +564,10 @@ fn clone_buffer_header(addr: usize, detach_source: bool) -> f64 {
     }
 
     if detach_source {
+        // Record only — detachment is deferred to
+        // `detach_transferables_after_success` so a clone that fails later in
+        // the walk leaves the source attached.
         record_transfer_clone(addr, dst_addr);
-        unsafe {
-            (*src).length = 0;
-            (*src).capacity = 0;
-        }
     }
 
     crate::value::js_nanbox_pointer(dst_addr as i64)
@@ -606,6 +608,9 @@ fn collect_transfer_list(options: f64) -> std::collections::HashSet<usize> {
         {
             throw_data_clone_error("Found invalid value in transferList");
         }
+        if crate::buffer::is_detached_buffer(item_addr) {
+            throw_data_clone_error("ArrayBuffer is already detached");
+        }
         if !out.insert(item_addr) {
             throw_data_clone_error("Transfer list contains duplicate ArrayBuffer");
         }
@@ -632,7 +637,7 @@ pub extern "C" fn js_structured_clone_with_options(value: f64, options: f64) -> 
     });
     let _guard = CloneTransferStateGuard(previous);
     let cloned = js_structured_clone_inner(value);
-    detach_unseen_transferables();
+    detach_transferables_after_success();
     cloned
 }
 
@@ -678,10 +683,17 @@ fn js_structured_clone_inner(value: f64) -> f64 {
         0x7FFD => {
             // POINTER_TAG — could be array/object/Map/Set/RegExp. Deep clone recursively.
             let ptr = (bits & 0x0000_FFFF_FFFF_FFFF) as *const u8;
-            if (ptr as usize) < 0x10000 {
+            let addr = ptr as usize;
+            // Full handle band, not the legacy `< 0x10000` (2026-07-02
+            // audit): a POINTER-tagged fetch/zlib registry id (0x40000+)
+            // reached the raw GcHeader byte read below and deref'd the id
+            // as memory. Registry handles aren't structured-cloneable heap
+            // graphs — return them as-is (matching the unknown-type
+            // fallback; the spec's DataCloneError refinement is tracked
+            // separately).
+            if crate::value::addr_class::is_small_handle(addr) || addr < 0x10000 {
                 return value;
             }
-            let addr = ptr as usize;
             if crate::symbol::is_registered_symbol(addr) {
                 throw_data_clone_error("Symbol could not be cloned");
             }
@@ -725,9 +737,12 @@ fn js_structured_clone_inner(value: f64) -> f64 {
                 return f64::from_bits(new_bits);
             }
             unsafe {
-                // GcHeader is stored BEFORE the user pointer (at ptr - GC_HEADER_SIZE)
-                let gc_header_ptr = (ptr as *const u8).sub(crate::gc::GC_HEADER_SIZE);
-                let gc_type = *gc_header_ptr;
+                // Validated probe (plausibility + band + slab) before reading
+                // header bytes; non-probeable pointers pass through unchanged.
+                let gc_type = match crate::value::addr_class::try_read_gc_header(addr) {
+                    Some(h) => h.obj_type,
+                    None => return value,
+                };
                 if gc_type == crate::gc::GC_TYPE_ARRAY {
                     // Clone array using existing clone, then recursively clone elements
                     let arr = ptr as *const crate::array::ArrayHeader;
@@ -948,7 +963,7 @@ fn queue_microtask_with_type(callback: i64, type_name: &str, args: Vec<f64>) {
         false,
     );
     QUEUED_MICROTASKS.with(|q| {
-        q.borrow_mut().push(QueuedMicrotask {
+        q.borrow_mut().push_back(QueuedMicrotask {
             callback,
             context,
             async_id: ids.async_id,
@@ -967,7 +982,9 @@ pub(crate) struct QueuedMicrotask {
 }
 
 thread_local! {
-    static QUEUED_MICROTASKS: std::cell::RefCell<Vec<QueuedMicrotask>> = const { std::cell::RefCell::new(Vec::new()) };
+    // VecDeque so the drain pops from the front in O(1); a `Vec` + `remove(0)`
+    // is O(n) per job → O(n²) to drain a burst of n nextTick jobs (#6084).
+    static QUEUED_MICROTASKS: std::cell::RefCell<std::collections::VecDeque<QueuedMicrotask>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
     static QUEUED_MICROTASK_PREV_CONTEXTS: std::cell::RefCell<Vec<crate::async_context::AsyncContextSnapshot>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -995,14 +1012,7 @@ pub(crate) fn drain_queued_microtasks_count() -> i32 {
     };
     let mut ran = 0;
     loop {
-        let task = QUEUED_MICROTASKS.with(|q| {
-            let mut queue = q.borrow_mut();
-            if queue.is_empty() {
-                None
-            } else {
-                Some(queue.remove(0))
-            }
-        });
+        let task = QUEUED_MICROTASKS.with(|q| q.borrow_mut().pop_front());
         match task {
             Some(QueuedMicrotask {
                 callback: cb,
@@ -1108,7 +1118,7 @@ pub(crate) fn test_seed_queued_microtask(callback: i64, context_store: f64) {
     QUEUED_MICROTASKS.with(|q| {
         let mut q = q.borrow_mut();
         q.clear();
-        q.push(QueuedMicrotask {
+        q.push_back(QueuedMicrotask {
             callback,
             context,
             async_id: 0,
@@ -1134,7 +1144,7 @@ pub(crate) fn test_queued_microtask_snapshot() -> (usize, u64, u64) {
     QUEUED_MICROTASKS.with(|q| {
         let q = q.borrow();
         let (callback, store_bits) = q
-            .first()
+            .front()
             .map(|task| {
                 (
                     task.callback as usize,

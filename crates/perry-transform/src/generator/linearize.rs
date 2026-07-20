@@ -167,6 +167,7 @@ fn delegate_next_call(del_next_id: LocalId, del_iter_id: LocalId, arg: Expr) -> 
         }),
         then_expr: Box::new(Expr::Call {
             callee: Box::new(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(Expr::LocalGet(del_next_id)),
                 property: "call".to_string(),
             }),
@@ -176,6 +177,7 @@ fn delegate_next_call(del_next_id: LocalId, del_iter_id: LocalId, arg: Expr) -> 
         }),
         else_expr: Box::new(Expr::Call {
             callee: Box::new(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(Expr::LocalGet(del_iter_id)),
                 property: "next".to_string(),
             }),
@@ -221,6 +223,7 @@ fn emit_yield_star_loop(
     current.push(Stmt::Expr(Expr::LocalSet(
         del_next_id,
         Box::new(Expr::PropertyGet {
+            byte_offset: 0,
             object: Box::new(Expr::LocalGet(del_iter_id)),
             property: "next".to_string(),
         }),
@@ -251,6 +254,7 @@ fn emit_yield_star_loop(
         // (via `delegate_await` on the pull below).
         Stmt::Expr(Expr::Yield {
             value: Some(Box::new(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(Expr::LocalGet(del_result_id)),
                 property: "value".to_string(),
             })),
@@ -271,6 +275,7 @@ fn emit_yield_star_loop(
         condition: Expr::Unary {
             op: UnaryOp::Not,
             operand: Box::new(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(Expr::LocalGet(del_result_id)),
                 property: "done".to_string(),
             }),
@@ -320,6 +325,7 @@ fn emit_yield_star_loop(
     current.push(Stmt::Expr(Expr::LocalSet(
         del_value_id,
         Box::new(Expr::PropertyGet {
+            byte_offset: 0,
             object: Box::new(Expr::LocalGet(del_result_id)),
             property: "value".to_string(),
         }),
@@ -559,6 +565,178 @@ pub fn linearize_body(
                     body: std::mem::take(current),
                     exit: StateExit::Done,
                 });
+            }
+
+            // While condition containing a yield (direct-generator
+            // `while (yield …)` / `while ((x = yield …) !== s)`; async fns'
+            // awaited conditions are restructured at the hoist layer before
+            // they become yields, so this arm covers the generator case).
+            // The old path cloned the condition — with its embedded yield —
+            // into the cond_state, where codegen's fallback lowers the
+            // residual `Expr::Yield` to `0.0` (#5933). Restructure to the
+            // per-iteration form and recurse; `hoist_yields_in_stmts`
+            // normalizes the condition's yields to the statement positions
+            // the Let-with-yield arms handle.
+            //
+            //   while (true) {
+            //     let __loop_cond_yield_N = <cond>;
+            //     if (!__loop_cond_yield_N) break;
+            //     <body>
+            //   }
+            Stmt::While { condition, body }
+                if super::hoist_yields::expr_contains_yield(condition) =>
+            {
+                let t = alloc_local(next_local_id);
+                let mut prefix = vec![Stmt::Let {
+                    id: t,
+                    name: format!("__loop_cond_yield_{}", t),
+                    ty: Type::Any,
+                    mutable: true,
+                    init: Some(condition.clone()),
+                }];
+                hoist_yields_in_stmts(&mut prefix, next_local_id);
+                prefix.push(Stmt::If {
+                    condition: Expr::Unary {
+                        op: UnaryOp::Not,
+                        operand: Box::new(Expr::LocalGet(t)),
+                    },
+                    then_branch: vec![Stmt::Break],
+                    else_branch: None,
+                });
+                prefix.extend(body.iter().cloned());
+                let restructured = Stmt::While {
+                    condition: Expr::Bool(true),
+                    body: prefix,
+                };
+                linearize_body(
+                    std::slice::from_ref(&restructured),
+                    states,
+                    current,
+                    state_num,
+                    state_id,
+                    next_local_id,
+                    sent_id,
+                    catches,
+                    finallys,
+                );
+            }
+
+            // do-while with a yield in the condition: first-iteration-flag
+            // desugar (same as the body-yield DoWhile arm below), which puts
+            // the yield into a While condition — the arm above then applies
+            // on recursion, and `continue` correctly falls through to the
+            // condition evaluation.
+            Stmt::DoWhile { body, condition }
+                if super::hoist_yields::expr_contains_yield(condition) =>
+            {
+                let first_id = alloc_local(next_local_id);
+                current.push(Stmt::Expr(Expr::LocalSet(
+                    first_id,
+                    Box::new(Expr::Bool(true)),
+                )));
+                let mut while_body = Vec::with_capacity(body.len() + 1);
+                while_body.push(Stmt::Expr(Expr::LocalSet(
+                    first_id,
+                    Box::new(Expr::Bool(false)),
+                )));
+                while_body.extend(body.iter().cloned());
+                let while_stmt = Stmt::While {
+                    condition: Expr::Logical {
+                        op: LogicalOp::Or,
+                        left: Box::new(Expr::LocalGet(first_id)),
+                        right: Box::new(condition.clone()),
+                    },
+                    body: while_body,
+                };
+                linearize_body(
+                    std::slice::from_ref(&while_stmt),
+                    states,
+                    current,
+                    state_num,
+                    state_id,
+                    next_local_id,
+                    sent_id,
+                    catches,
+                    finallys,
+                );
+            }
+
+            // For-loop with a yield in the CONDITION or UPDATE slot: move
+            // the yielding slot(s) into the body (condition → body-top
+            // check; update → body-end with loop-level `continue`s prefixed
+            // by it so the continue → update → condition order holds), then
+            // recurse — the For/While arms below handle the rest.
+            Stmt::For {
+                init,
+                condition,
+                update,
+                body,
+            } if condition
+                .as_ref()
+                .is_some_and(super::hoist_yields::expr_contains_yield)
+                || (update
+                    .as_ref()
+                    .is_some_and(super::hoist_yields::expr_contains_yield)
+                    && !stmts_have_continue_inside_try_finally(body)) =>
+            {
+                let cond_yields = condition
+                    .as_ref()
+                    .is_some_and(super::hoist_yields::expr_contains_yield);
+                let upd_yields = update
+                    .as_ref()
+                    .is_some_and(super::hoist_yields::expr_contains_yield)
+                    // Abrupt-completion ordering: see the async twin — a
+                    // continue inside try/finally must not have the update
+                    // prefixed ahead of the finally (#5934 review).
+                    && !stmts_have_continue_inside_try_finally(body);
+                let mut new_body = Vec::with_capacity(body.len() + 3);
+                if cond_yields {
+                    let t = alloc_local(next_local_id);
+                    let mut prefix = vec![Stmt::Let {
+                        id: t,
+                        name: format!("__loop_cond_yield_{}", t),
+                        ty: Type::Any,
+                        mutable: true,
+                        init: condition.clone(),
+                    }];
+                    hoist_yields_in_stmts(&mut prefix, next_local_id);
+                    new_body.append(&mut prefix);
+                    new_body.push(Stmt::If {
+                        condition: Expr::Unary {
+                            op: UnaryOp::Not,
+                            operand: Box::new(Expr::LocalGet(t)),
+                        },
+                        then_branch: vec![Stmt::Break],
+                        else_branch: None,
+                    });
+                }
+                let mut taken_body = body.clone();
+                if upd_yields {
+                    let mut upd_stmts = vec![Stmt::Expr(update.clone().unwrap())];
+                    hoist_yields_in_stmts(&mut upd_stmts, next_local_id);
+                    prefix_loop_continues(&mut taken_body, &upd_stmts);
+                    new_body.append(&mut taken_body);
+                    new_body.extend(upd_stmts);
+                } else {
+                    new_body.append(&mut taken_body);
+                }
+                let new_for = Stmt::For {
+                    init: init.clone(),
+                    condition: if cond_yields { None } else { condition.clone() },
+                    update: if upd_yields { None } else { update.clone() },
+                    body: new_body,
+                };
+                linearize_body(
+                    std::slice::from_ref(&new_for),
+                    states,
+                    current,
+                    state_num,
+                    state_id,
+                    next_local_id,
+                    sent_id,
+                    catches,
+                    finallys,
+                );
             }
 
             // For-loop containing yield(s)
@@ -1424,6 +1602,67 @@ fn rewrite_labeled_bc_in_stmts(stmts: &mut [Stmt], label: &str) {
                 }
                 if let Some(f) = finally.as_mut() {
                     rewrite_labeled_bc_in_stmts(f, label);
+                }
+            }
+            // #5975: a `continue <label>` that targets THIS enclosing labeled
+            // loop from inside a nested `switch` case. A switch never captures
+            // `continue`, so it continues the loop — rewrite it to a plain
+            // `continue` here so the loop's linearization (and the #5868
+            // yielding-switch desugar) map it to the loop's re-entry sentinel.
+            // Without this the `LabeledContinue` survives verbatim into the
+            // desugared switch's state machine, where nothing lowers it, and a
+            // `loop: while (…) { switch (…) { case …: yield …; continue loop } }`
+            // (e.g. the `yaml` package's block-scalar / indicator lexer, a
+            // generator) spins forever. `break <label>` is deliberately NOT
+            // rewritten in a nested switch: a switch DOES capture `break`, so a
+            // plain `break` would exit only the switch, not the loop — that is
+            // the pre-existing single-sentinel limitation documented above.
+            Stmt::Switch { cases, .. } => {
+                for case in cases.iter_mut() {
+                    rewrite_labeled_continue_in_stmts(&mut case.body, label);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Rewrite `continue <label>` → plain `continue` for `label`, descending
+/// through `if` / `try` / `switch` (none of which capture `continue`) but
+/// stopping at nested loops (which bind their own `continue`). Unlike
+/// [`rewrite_labeled_bc_in_stmts`] this does NOT touch `break <label>`: it is
+/// used only when recursing into a nested `switch`, where a plain `break`
+/// would be captured by the switch rather than escaping to the loop (#5975).
+fn rewrite_labeled_continue_in_stmts(stmts: &mut [Stmt], label: &str) {
+    for s in stmts.iter_mut() {
+        match s {
+            Stmt::LabeledContinue(l) if l == label => *s = Stmt::Continue,
+            Stmt::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                rewrite_labeled_continue_in_stmts(then_branch, label);
+                if let Some(eb) = else_branch.as_mut() {
+                    rewrite_labeled_continue_in_stmts(eb, label);
+                }
+            }
+            Stmt::Try {
+                body,
+                catch,
+                finally,
+            } => {
+                rewrite_labeled_continue_in_stmts(body, label);
+                if let Some(c) = catch.as_mut() {
+                    rewrite_labeled_continue_in_stmts(&mut c.body, label);
+                }
+                if let Some(f) = finally.as_mut() {
+                    rewrite_labeled_continue_in_stmts(f, label);
+                }
+            }
+            Stmt::Switch { cases, .. } => {
+                for case in cases.iter_mut() {
+                    rewrite_labeled_continue_in_stmts(&mut case.body, label);
                 }
             }
             _ => {}

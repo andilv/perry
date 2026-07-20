@@ -28,7 +28,7 @@ use crate::native_value::{
 use crate::type_analysis::{
     compute_auto_captures, is_array_expr, is_bigint_expr, is_bool_expr, is_map_expr,
     is_numeric_expr, is_numeric_typed_array_class, is_set_expr, is_string_expr,
-    is_url_search_params_expr, receiver_class_name,
+    is_url_search_params_expr, receiver_class_name, receiver_is_error_type,
 };
 #[allow(unused_imports)]
 use crate::types::{DOUBLE, I1, I32, I64, I8, PTR};
@@ -41,6 +41,8 @@ use super::property_get_names::{
 mod generic_dispatch;
 mod globalget;
 mod helpers;
+#[cfg(test)]
+mod nullish_read_location_tests;
 
 pub(crate) use generic_dispatch::lower_generic_property_get;
 pub(crate) use globalget::lower_globalget_property;
@@ -58,8 +60,8 @@ use super::{
     emit_typed_feedback_register_site, emit_v8_export_call, emit_v8_member_method_call,
     emit_write_barrier, emit_write_barrier_slot_on_block, expr_is_known_non_pointer_shadow_value,
     extract_array_of_object_shape, i32_bool_to_nanbox, import_origin_suffix,
-    is_global_this_builtin_function_name, is_global_this_builtin_name, is_known_finite,
-    lower_array_literal, lower_channel_reduction, lower_expr, lower_expr_as_i32,
+    import_origin_suffix_ns, is_global_this_builtin_function_name, is_global_this_builtin_name,
+    is_known_finite, lower_array_literal, lower_channel_reduction, lower_expr, lower_expr_as_i32,
     lower_index_set_fast, lower_js_args_array, lower_object_literal, lower_stream_super_init,
     lower_url_string_getter, nanbox_bigint_inline, nanbox_pointer_inline,
     nanbox_pointer_inline_pub, nanbox_string_inline, proxy_build_args_array, raw_f64_layout_fact,
@@ -70,9 +72,36 @@ use super::{
 };
 
 pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
+    // `split("literal")[constant].length` on a scalar-replaced split can
+    // read the precomputed numeric length directly. The split part itself was
+    // never observable as a string, so materializing a StringHeader would only
+    // create short-lived garbage.
+    if let Expr::PropertyGet {
+        object, property, ..
+    } = expr
+    {
+        if property == "length" {
+            if let Expr::IndexGet { object, index } = object.as_ref() {
+                if let (Expr::LocalGet(id), Some(index)) =
+                    (object.as_ref(), crate::collectors::const_index(index))
+                {
+                    if let Some(slot) = ctx
+                        .scalar_replaced_split_part_lengths
+                        .get(id)
+                        .and_then(|lengths| lengths.get(&index))
+                        .cloned()
+                    {
+                        return Ok(ctx.block().load(DOUBLE, &slot));
+                    }
+                }
+            }
+        }
+    }
+
     match expr {
-        Expr::PropertyGet { object, property }
-            if matches!(object.as_ref(), Expr::LocalGet(id)
+        Expr::PropertyGet {
+            object, property, ..
+        } if matches!(object.as_ref(), Expr::LocalGet(id)
                 if ctx.pod_records.get(id).is_some_and(|local| local
                     .layout
                     .fields
@@ -86,12 +115,13 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             }
             unreachable!("POD field guard should imply a lowered field")
         }
-        Expr::PropertyGet { object, property }
-            if property == "length"
-                && matches!(
-                    object.as_ref(),
-                    Expr::PropertyGet { property: p, .. } if p == "errors"
-                ) =>
+        Expr::PropertyGet {
+            object, property, ..
+        } if property == "length"
+            && matches!(
+                object.as_ref(),
+                Expr::PropertyGet { property: p, .. } if p == "errors"
+            ) =>
         {
             let recv_box = lower_expr(ctx, object)?;
             let blk = ctx.block();
@@ -106,7 +136,17 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         // ArrayHeader pointer from the ErrorHeader struct. Returns a
         // NaN-boxed pointer so downstream length / index operations
         // see an array.
-        Expr::PropertyGet { object, property } if property == "errors" => {
+        //
+        // Gated on a statically-known Error receiver (#6588): the helper's
+        // `ArrayHeader*` return can't represent a stored `null`, so applying
+        // it to a function/plain-object `.errors` expando that holds `null`
+        // produced a bogus pointer sentinel (`f.errors === null` → false,
+        // `String(f.errors)` → "[object Object]"). Non-error receivers fall
+        // through to the generic property read below, which returns the
+        // stored value — including `null` — correctly.
+        Expr::PropertyGet {
+            object, property, ..
+        } if property == "errors" && receiver_is_error_type(ctx, object) => {
             let recv_box = lower_expr(ctx, object)?;
             let blk = ctx.block();
             let recv_handle = unbox_to_i64(blk, &recv_box);
@@ -114,33 +154,35 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             Ok(nanbox_pointer_inline(blk, &arr_handle))
         }
 
-        Expr::PropertyGet { object, property }
-            if is_global_builtin_value_expr(object, "Promise")
-                && matches!(
-                    property.as_str(),
-                    "resolve"
-                        | "reject"
-                        | "all"
-                        | "race"
-                        | "allSettled"
-                        | "any"
-                        | "withResolvers"
-                        | "try"
-                ) =>
+        Expr::PropertyGet {
+            object, property, ..
+        } if is_global_builtin_value_expr(object, "Promise")
+            && matches!(
+                property.as_str(),
+                "resolve"
+                    | "reject"
+                    | "all"
+                    | "race"
+                    | "allSettled"
+                    | "any"
+                    | "withResolvers"
+                    | "try"
+            ) =>
         {
             Ok(lower_global_builtin_static_value(ctx, "Promise", property))
         }
 
-        Expr::PropertyGet { object, property }
-            if property == "length" && promise_static_function_length_expr(object).is_some() =>
-        {
+        Expr::PropertyGet {
+            object, property, ..
+        } if property == "length" && promise_static_function_length_expr(object).is_some() => {
             let len = promise_static_function_length_expr(object).unwrap();
             Ok(double_literal(len as f64))
         }
 
-        Expr::PropertyGet { object, property }
-            if property == "length"
-                && matches!(object.as_ref(), Expr::LocalGet(id)
+        Expr::PropertyGet {
+            object, property, ..
+        } if property == "length"
+            && matches!(object.as_ref(), Expr::LocalGet(id)
                     if ctx.buffer_data_slots.contains_key(id)) =>
         {
             let arr_id = match object.as_ref() {
@@ -195,11 +237,12 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         // TypedArray `.length` can be shadowed by an own property, so use
         // the runtime length helper only when lowering has not already
         // registered the receiver as a native Buffer/TypedArray view above.
-        Expr::PropertyGet { object, property }
-            if property == "length"
-                && receiver_class_name(ctx, object)
-                    .as_deref()
-                    .is_some_and(is_numeric_typed_array_class) =>
+        Expr::PropertyGet {
+            object, property, ..
+        } if property == "length"
+            && receiver_class_name(ctx, object)
+                .as_deref()
+                .is_some_and(is_numeric_typed_array_class) =>
         {
             let recv_box = lower_expr(ctx, object)?;
             Ok(ctx
@@ -214,21 +257,22 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         // `.length` — INLINE for array, string, and interface-typed
         // receivers. Named types (interfaces, class instances) often
         // wrap strings or arrays at runtime, where length is at offset 0.
-        Expr::PropertyGet { object, property }
-            if property == "length"
-                && (is_array_expr(ctx, object)
-                    || is_string_expr(ctx, object)
-                    || match crate::type_analysis::static_type_of(ctx, object) {
-                        // A `Function`-typed receiver is a closure, not a
-                        // String/Array — its `.length` is the spec param
-                        // count, served by the runtime reflection path
-                        // (`closure_length` table). Loading a u32 from
-                        // payload offset 0 here would read 0. Let it fall
-                        // through to the generic property path.
-                        Some(HirType::Named(n)) => n != "Function",
-                        Some(HirType::Tuple(_)) => true,
-                        _ => false,
-                    }) =>
+        Expr::PropertyGet {
+            object, property, ..
+        } if property == "length"
+            && (is_array_expr(ctx, object)
+                || is_string_expr(ctx, object)
+                || match crate::type_analysis::static_type_of(ctx, object) {
+                    // A `Function`-typed receiver is a closure, not a
+                    // String/Array — its `.length` is the spec param
+                    // count, served by the runtime reflection path
+                    // (`closure_length` table). Loading a u32 from
+                    // payload offset 0 here would read 0. Let it fall
+                    // through to the generic property path.
+                    Some(HirType::Named(n)) => n != "Function",
+                    Some(HirType::Tuple(_)) => true,
+                    _ => false,
+                }) =>
         {
             // Scalar-replaced array literal: length is a compile-time
             // constant — no header to load from (the heap array doesn't
@@ -385,18 +429,18 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         // `set.size` / `map.size` — route to runtime helpers. The HIR
         // doesn't synthesize SetSize/MapSize expressions for the
         // property-access form, so we recognize the pattern here.
-        Expr::PropertyGet { object, property }
-            if property == "size" && is_set_expr(ctx, object) =>
-        {
+        Expr::PropertyGet {
+            object, property, ..
+        } if property == "size" && is_set_expr(ctx, object) => {
             let recv_box = lower_expr(ctx, object)?;
             let blk = ctx.block();
             let recv_handle = unbox_to_i64(blk, &recv_box);
             let i32_v = blk.call(I32, "js_set_size", &[(I64, &recv_handle)]);
             Ok(blk.sitofp(I32, &i32_v, DOUBLE))
         }
-        Expr::PropertyGet { object, property }
-            if property == "size" && is_map_expr(ctx, object) =>
-        {
+        Expr::PropertyGet {
+            object, property, ..
+        } if property == "size" && is_map_expr(ctx, object) => {
             let recv_box = lower_expr(ctx, object)?;
             let blk = ctx.block();
             let recv_handle = unbox_to_i64(blk, &recv_box);
@@ -410,16 +454,20 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         // "size"). Routed via `is_url_search_params_expr` so it only
         // fires on receivers we can prove are URLSearchParams (immediate
         // ctor, typed locals, `url.searchParams` accessor).
-        Expr::PropertyGet { object, property }
-            if property == "size" && is_url_search_params_expr(ctx, object) =>
-        {
+        Expr::PropertyGet {
+            object, property, ..
+        } if property == "size" && is_url_search_params_expr(ctx, object) => {
             let recv_box = lower_expr(ctx, object)?;
             let blk = ctx.block();
             let recv_handle = unbox_to_i64(blk, &recv_box);
             let i32_v = blk.call(I32, "js_url_search_params_size", &[(I64, &recv_handle)]);
             Ok(blk.sitofp(I32, &i32_v, DOUBLE))
         }
-        Expr::PropertyGet { object, property } => {
+        Expr::PropertyGet {
+            object,
+            property,
+            byte_offset,
+        } => {
             if property == "prototype"
                 && matches!(object.as_ref(), Expr::FuncRef(_) | Expr::Closure { .. })
             {
@@ -912,10 +960,18 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         // body. The body only runs later when the consumer
                         // actually calls `HashMap.keySet(self)`, by which time
                         // both modules have finished `__init`.
-                        // Issue #678: re-export renames mean the suffix in the
-                        // origin module differs from the consumer-visible name.
-                        let origin_suffix =
-                            import_origin_suffix(ctx.import_function_origin_names, property);
+                        // Issue #678/#5924: re-export renames mean the suffix
+                        // in the origin module differs from the
+                        // consumer-visible name. Namespace-scoped lookup
+                        // first so a rename in a different namespace
+                        // imported into this file can't clobber this
+                        // namespace's unrenamed member of the same name.
+                        let origin_suffix = import_origin_suffix_ns(
+                            ctx.import_function_origin_names,
+                            ctx.namespace_member_origin_names,
+                            _ns_lookup_name.as_deref().unwrap_or(""),
+                            property,
+                        );
                         if ctx.imported_vars.contains(property) {
                             let getter = format!("perry_fn_{}__{}", source_prefix, origin_suffix);
                             ctx.pending_declares.push((getter.clone(), DOUBLE, vec![]));
@@ -1011,7 +1067,13 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         &[(I64, &obj_handle), (I64, &key_handle)],
                     ));
                 }
+                // #6003: `class_name == "Headers"` only means the NATIVE
+                // fetch Headers when the user hasn't defined their own
+                // `class Headers` — a user class of that name owns the
+                // receiver type, so fall through to the user-class
+                // getter/method dispatch below.
                 if class_name == "Headers"
+                    && !ctx.classes.contains_key(&class_name)
                     && matches!(
                         property.as_str(),
                         "append"
@@ -1093,7 +1155,10 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                             "write" | "close" | "abort" | "releaseLock"
                         )
                 );
-                if class_name == "Headers" && is_headers_method_name(property) {
+                if class_name == "Headers"
+                    && !ctx.classes.contains_key(&class_name)
+                    && is_headers_method_name(property)
+                {
                     let recv_box = lower_expr(ctx, object)?;
                     let key_idx = ctx.strings.intern(property);
                     let key_handle_global =
@@ -1139,6 +1204,69 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         ctx.class_ids.get(&class_name),
                         ctx.class_keys_globals.get(&class_name).cloned(),
                     ) {
+                        // #5093 loop versioning: inside the fast clone of a
+                        // class-field versioned loop, a tracked field read on
+                        // the proven receiver lowers to a bare slot load on
+                        // the preheader-cached object pointer — no shape
+                        // check, no guard call, no fallback (the preheader
+                        // proved the shape once and the call-free clone keeps
+                        // it true; see stmt/loops.rs).
+                        let loop_fact_ptr = match object.as_ref() {
+                            Expr::LocalGet(recv_id) => crate::expr::class_field_loop_fact_lookup(
+                                &ctx.class_field_loop_facts,
+                                *recv_id,
+                                &class_name,
+                                property,
+                            )
+                            .filter(|(_, loop_idx)| *loop_idx == field_index)
+                            .map(|(fact, _)| fact.obj_ptr.clone()),
+                            _ => None,
+                        };
+                        if let Some(obj_ptr) = loop_fact_ptr {
+                            let field_idx_str = field_index.to_string();
+                            let blk = ctx.block();
+                            let fields_base = blk.gep(I8, &obj_ptr, &[(I64, "24")]);
+                            let field_ptr = blk.gep(DOUBLE, &fields_base, &[(I64, &field_idx_str)]);
+                            let val = blk.load(DOUBLE, &field_ptr);
+                            let fast = LoweredValue {
+                                semantic: SemanticKind::JsNumber,
+                                rep: NativeRep::F64,
+                                llvm_ty: DOUBLE,
+                                value: val.clone(),
+                            };
+                            ctx.record_lowered_value_with_access_mode_and_facts(
+                                "ClassFieldGet",
+                                None,
+                                "class_field_get.loop_raw_f64_load",
+                                &fast,
+                                Some(BoundsState::Guarded {
+                                    guard_id: "class_field_loop_preheader_check".to_string(),
+                                }),
+                                None,
+                                Some(BufferAccessMode::CheckedNative),
+                                None,
+                                None,
+                                None,
+                                vec![raw_f64_layout_fact(
+                                    None,
+                                    "consumed",
+                                    "class_field_loop_preheader_check",
+                                    None,
+                                )],
+                                Vec::new(),
+                                false,
+                                false,
+                                vec![
+                                    format!("class={}", class_name),
+                                    format!("field={}", property),
+                                    format!("field_index={}", field_idx_str),
+                                    "receiver_proof=loop_preheader_shape_check".to_string(),
+                                    "field_layout=raw_f64_slot_array".to_string(),
+                                    "loop_versioning=class_field_fast_clone".to_string(),
+                                ],
+                            );
+                            return Ok(val);
+                        }
                         let recv_box = lower_expr(ctx, object)?;
                         let key_idx = ctx.strings.intern(property);
                         let key_handle_global =
@@ -1245,10 +1373,20 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                             .cond_br(&guard_pass, &fast_label, &fallback_label);
 
                         ctx.current_block = fast_idx;
+                        // arm64_32 watchOS: the object fields region begins at
+                        // `size_of::<ObjectHeader>()` past the user pointer — 24 on
+                        // 64-bit, 20 on ILP32 (the trailing `keys_array` pointer is 4
+                        // bytes there). A hardcoded 24 reads every class field 4 bytes
+                        // off on a 32-bit watch, so this inline class-field load
+                        // disagreed with the generic-PIC load / runtime setter (both
+                        // target-aware) and typed-object string fields came back as
+                        // word-swapped NaN-boxes. Derive it from the target triple
+                        // (no-op on 64-bit; see `target_layout`).
+                        let header_skip =
+                            crate::target_layout::object_header_size_bytes(ctx.target_triple)
+                                .to_string();
                         let blk = ctx.block();
                         let obj_ptr = blk.inttoptr(I64, &obj_handle);
-                        // Skip the 24-byte ObjectHeader.
-                        let header_skip = "24".to_string();
                         let fields_base = blk.gep(I8, &obj_ptr, &[(I64, &header_skip)]);
                         let field_ptr = blk.gep(DOUBLE, &fields_base, &[(I64, &field_idx_str)]);
                         let val_fast = blk.load(DOUBLE, &field_ptr);
@@ -1381,7 +1519,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     return lower_class_method_bind(ctx, object, property);
                 }
             }
-            lower_generic_property_get(ctx, object, property)
+            lower_generic_property_get(ctx, object, property, *byte_offset)
         }
 
         // -------- Ternary `cond ? a : b` (Phase B.7) --------

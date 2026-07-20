@@ -215,7 +215,7 @@ pub fn check_escapes_in_expr(
         // an uninitialized alloca → segfault. (Method calls are
         // already covered: they're wrapped in `Expr::Call` and the
         // Call/CallSpread arms below mark the receiver escaped.)
-        Expr::PropertyGet { object, property } => {
+        Expr::PropertyGet { object, property, .. } => {
             if let Expr::LocalGet(id) = object.as_ref() {
                 if let Some(class_name) = candidates.get(id) {
                     if is_class_getter(classes, class_name, property) {
@@ -776,8 +776,11 @@ pub fn check_escapes_in_expr(
             check_escapes_in_expr(property, candidates, classes, escaped);
             check_escapes_in_expr(object, candidates, classes, escaped);
         }
-        Expr::InstanceOf { expr, .. } => {
+        Expr::InstanceOf { expr, ty_expr, .. } => {
             check_escapes_in_expr(expr, candidates, classes, escaped);
+            if let Some(t) = ty_expr {
+                check_escapes_in_expr(t, candidates, classes, escaped);
+            }
         }
         Expr::ObjectRest { object, .. } => {
             check_escapes_in_expr(object, candidates, classes, escaped);

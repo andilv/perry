@@ -226,6 +226,7 @@ fn infers_object_and_array_shapes_conservatively() {
     let env = empty_env();
     let object = Expr::Object(vec![("answer".to_string(), Expr::Number(42.0))]);
     let get = Expr::PropertyGet {
+        byte_offset: 0,
         object: Box::new(object),
         property: "answer".to_string(),
     };
@@ -468,6 +469,7 @@ fn infers_passthrough_expression_types() {
         infer_expr_type(
             &Expr::PrivateGuard {
                 class_name: "Widget".to_string(),
+                class_id: 0,
                 field_name: "value".to_string(),
                 kind: 0,
                 op: 0,
@@ -754,6 +756,7 @@ fn infers_named_class_and_interface_property_facts() {
     assert_eq!(
         infer_expr_type(
             &Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(Expr::LocalGet(1)),
                 property: "label".to_string(),
             },
@@ -765,6 +768,7 @@ fn infers_named_class_and_interface_property_facts() {
         infer_expr_type(
             &Expr::Call {
                 callee: Box::new(Expr::PropertyGet {
+                    byte_offset: 0,
                     object: Box::new(Expr::LocalGet(1)),
                     property: "score".to_string(),
                 }),
@@ -800,6 +804,7 @@ fn infers_named_class_and_interface_property_facts() {
     assert_eq!(
         infer_expr_type(
             &Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(Expr::LocalGet(2)),
                 property: "items".to_string(),
             },
@@ -811,6 +816,7 @@ fn infers_named_class_and_interface_property_facts() {
         infer_expr_type(
             &Expr::Call {
                 callee: Box::new(Expr::PropertyGet {
+                    byte_offset: 0,
                     object: Box::new(Expr::LocalGet(2)),
                     property: "done".to_string(),
                 }),
@@ -835,6 +841,7 @@ fn infers_common_constructed_runtime_values() {
                 args: vec![],
                 type_args: vec![],
                 byte_offset: 0,
+                cap_args_appended: 0,
             },
             &env,
         ),
@@ -847,6 +854,7 @@ fn infers_common_constructed_runtime_values() {
                 args: vec![Expr::Integer(4)],
                 type_args: vec![],
                 byte_offset: 0,
+                cap_args_appended: 0,
             },
             &env,
         ),
@@ -1682,6 +1690,7 @@ fn resolves_this_and_super_in_class_context() {
 
     let mut env = HirTypeEnv::from_module(&module);
     let this_label = Expr::PropertyGet {
+        byte_offset: 0,
         object: Box::new(Expr::This),
         property: "label".to_string(),
     };

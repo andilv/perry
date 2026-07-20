@@ -63,7 +63,7 @@ pub(crate) fn auto_optimized_cache_key(
 ) -> String {
     let target_str = target.unwrap_or("host");
     format!(
-        "{}|{}|{}|wasm={}|regex={}|temporal={}|ee={}|url={}|norm={}|seg={}|loc={}|diag={}|dgram={}|v={}",
+        "{}|{}|{}|wasm={}|regex={}|temporal={}|ee={}|url={}|norm={}|seg={}|loc={}|diag={}|dgram={}|http2={}|dyneval={}|v={}",
         feature_arg,
         panic_abort_safe,
         target_str,
@@ -77,6 +77,13 @@ pub(crate) fn auto_optimized_cache_key(
         ctx.uses_intl_locale,
         ctx.uses_diagnostics,
         ctx.uses_dgram,
+        // #6468: an http2 import pulls in `perry-runtime/mod-http2-constants`,
+        // so a runtime built without the constant tables must not be reused for
+        // an http2 program — key the freshness stamp on it like the other gates.
+        ctx.native_module_imports.contains("http2"),
+        // #6559: dyn-eval presence changes the built archive, so it must
+        // key the freshness stamp like every other runtime feature toggle.
+        perry_hir::has_deferred_dynamic_code_sites(),
         env!("CARGO_PKG_VERSION"),
     )
 }
@@ -131,6 +138,9 @@ pub(crate) fn auto_optimized_cross_features(
     if ctx.uses_intl_locale {
         cross_features.push("perry-runtime/intl-locale".to_string());
     }
+    if ctx.uses_intl_datetime {
+        cross_features.push("perry-runtime/intl-datetime".to_string());
+    }
     // Cold-path diagnostic JSON serializers (~95 KB incl. the `serde_json`
     // pulled only by them) — enabled only when the program uses a heap-snapshot
     // API or `process.report`. The env-driven GC/typed-feedback dev trace JSON
@@ -144,6 +154,27 @@ pub(crate) fn auto_optimized_cross_features(
     }
     if ctx.uses_dgram {
         cross_features.push("perry-runtime/mod-dgram".to_string());
+    }
+    // #6468 — the `node:http2` constant tables (`node_http2_constants`, ~20 KB
+    // of NGHTTP2_*/HTTP_STATUS_* cold data) are only reachable through the http2
+    // namespace object, which only exists when the program imports `node:http2`.
+    // `http2` is a stdlib-backed module, so its import is recorded in
+    // `native_module_imports` — a reliable, zero-false-negative activation
+    // signal. A program that never imports it links none of the tables.
+    if ctx.native_module_imports.contains("http2") {
+        cross_features.push("perry-runtime/mod-http2-constants".to_string());
+    }
+    // #6559: a deferred dynamic-code site (`eval(...)` / `new Function(...)`
+    // with a runtime body) means the binary may construct functions from
+    // runtime strings — the optimized runtime must carry the dyn-eval
+    // interpreter. The generated code of the schema-codegen ecosystem (ajv)
+    // also leans on regex literals (`key.replace(/~/g, …)`), so the regex
+    // engine rides along even when the program's own source never uses one.
+    if perry_hir::has_deferred_dynamic_code_sites() {
+        cross_features.push("perry-runtime/dyn-eval".to_string());
+        if !ctx.uses_regex {
+            cross_features.push("perry-runtime/regex-engine".to_string());
+        }
     }
     // Compile OUT perry-runtime's no-op fetch stubs (`js_fetch_with_options` /
     // `js_headers_new` / `js_request_new`, gated `#[cfg(not(feature =
@@ -159,14 +190,147 @@ pub(crate) fn auto_optimized_cross_features(
     cross_features
 }
 
+/// Content fingerprint of every workspace source tree that lands in the
+/// auto-optimized archives: the crates this build compiles (the runtime/stdlib
+/// static wrappers and the tokio-using ext crates) plus their transitive
+/// workspace path-deps, plus the workspace manifests. Embedded in the build
+/// stamp so a `target/perry-auto-<hash>` dir whose archives were built from
+/// DIFFERENT sources can never pass the freshness gate. The mtime check alone
+/// is blind to that: a cache restore can hand back archives "newer" than a
+/// fresh checkout's sources, and Cargo.lock carries no checksum for path deps.
+/// #5892 layer 2 — CI's rust-cache-restored stale dir kept linking pre-#5911
+/// ext archives; same key-blindness as the #5778-era "warm auto-opt cache
+/// ignores perry-ext-http edits" trap.
+pub(crate) fn auto_optimized_source_fingerprint(
+    workspace_root: &Path,
+    tokio_using_bindings: &[(String, String, Option<String>)],
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    // Seed with the crates the auto-optimize cargo invocation builds directly.
+    let mut crates: BTreeSet<String> = [
+        "perry-runtime",
+        "perry-stdlib",
+        "perry-runtime-static",
+        "perry-stdlib-static",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    for (krate, _lib, _tracking) in tokio_using_bindings {
+        crates.insert(krate.clone());
+    }
+
+    // Transitive workspace path-dep closure: any manifest token that names an
+    // existing `crates/<name>` directory is treated as a workspace crate whose
+    // source is compiled into the archives. Over-approximating (e.g. a feature
+    // named like a crate) only hashes extra source — never misses an input.
+    let mut queue: Vec<String> = crates.iter().cloned().collect();
+    while let Some(name) = queue.pop() {
+        let manifest = workspace_root.join("crates").join(&name).join("Cargo.toml");
+        let Ok(text) = fs::read_to_string(&manifest) else {
+            continue;
+        };
+        for line in text.lines() {
+            let line = line.trim();
+            // `perry-foo = { path = ... }` / `perry-foo.workspace = true`
+            // dep lines, and `[dependencies.perry-foo]` section headers.
+            let candidate =
+                if let Some(header) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                    header.rsplit('.').next().unwrap_or("")
+                } else {
+                    let end = line
+                        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+                        .unwrap_or(line.len());
+                    &line[..end]
+                };
+            if candidate.is_empty() || crates.contains(candidate) {
+                continue;
+            }
+            if workspace_root
+                .join("crates")
+                .join(candidate)
+                .join("Cargo.toml")
+                .is_file()
+            {
+                crates.insert(candidate.to_string());
+                queue.push(candidate.to_string());
+            }
+        }
+    }
+
+    fn hash_tree(hasher: &mut Sha256, label: &str, path: &Path) {
+        let Ok(meta) = fs::metadata(path) else {
+            hasher.update(label.as_bytes());
+            hasher.update(b"\0missing\0");
+            return;
+        };
+        if meta.is_file() {
+            hasher.update(label.as_bytes());
+            hasher.update(b"\0");
+            match fs::read(path) {
+                Ok(bytes) => {
+                    hasher.update((bytes.len() as u64).to_le_bytes());
+                    hasher.update(&bytes);
+                }
+                Err(_) => hasher.update(b"unreadable\0"),
+            }
+            return;
+        }
+        if !meta.is_dir() {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(path) else {
+            return;
+        };
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            // Same exclusions as `input_newer_than`.
+            .filter(|n| n != "target" && n != ".git")
+            .collect();
+        names.sort();
+        for name in names {
+            hash_tree(hasher, &format!("{label}/{name}"), &path.join(&name));
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"perry-auto-src-v1\0");
+    hash_tree(
+        &mut hasher,
+        "Cargo.toml",
+        &workspace_root.join("Cargo.toml"),
+    );
+    hash_tree(
+        &mut hasher,
+        "Cargo.lock",
+        &workspace_root.join("Cargo.lock"),
+    );
+    for name in &crates {
+        hash_tree(
+            &mut hasher,
+            &format!("crates/{name}"),
+            &workspace_root.join("crates").join(name),
+        );
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(32);
+    for b in &digest[..16] {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    hex
+}
+
 pub(crate) fn auto_optimized_build_stamp(
     key_input: &str,
     target: Option<&str>,
     cross_features: &[String],
     tokio_using_bindings: &[(String, String, Option<String>)],
+    source_fingerprint: &str,
 ) -> String {
     let mut stamp = String::new();
-    stamp.push_str("perry-auto-optimized-v1\n");
+    stamp.push_str("perry-auto-optimized-v2\n");
     stamp.push_str("key=");
     stamp.push_str(key_input);
     stamp.push('\n');
@@ -190,6 +354,11 @@ pub(crate) fn auto_optimized_build_stamp(
         stamp.push(':');
         stamp.push_str(tracking.as_deref().unwrap_or(""));
     }
+    stamp.push('\n');
+    // Source-content fingerprint (see `auto_optimized_source_fingerprint`):
+    // ties the stamp to WHAT the archives were built from, not just how.
+    stamp.push_str("srcs=");
+    stamp.push_str(source_fingerprint);
     stamp.push('\n');
     stamp
 }

@@ -113,6 +113,29 @@ pub(crate) fn lower_uint8array_get_i32(
         return Ok(value);
     }
 
+    // An UNPROVEN key may be a string at runtime: a Buffer is an ordinary
+    // object in Node, so `buf[k]` with a non-numeric `k` reads a property (an
+    // own expando, else the prototype method), not a byte. Coercing it to i32
+    // read byte 0 and yielded `undefined`, which broke the ubiquitous
+    // feature-probe `typeof obj[k] === "function"` — mysql2's `MockBuffer`
+    // relies on it to neutralize a zero-length Buffer's write methods while
+    // sizing each outgoing packet, so the MySQL handshake died with RangeError
+    // [ERR_OUT_OF_RANGE]. Route to the polymorphic helper (it dispatches
+    // numeric keys to the byte read and string keys to the property path); the
+    // proven-numeric fast paths above are untouched.
+    if !is_numeric_expr(ctx, index) {
+        let a = lower_expr(ctx, array)?;
+        let key = lower_expr(ctx, index)?;
+        let blk = ctx.block();
+        let handle = unbox_to_i64(blk, &a);
+        let result = blk.call(
+            DOUBLE,
+            "js_object_get_index_polymorphic",
+            &[(I64, &handle), (DOUBLE, &key)],
+        );
+        return Ok(LoweredValue::js_value(result));
+    }
+
     let idx_i32 = lower_index_i32(ctx, index)?;
     let a = lower_expr(ctx, array)?;
     let blk = ctx.block();
@@ -771,14 +794,41 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     &[(I64, &handle), (DOUBLE, &key)],
                 ));
             }
-            let value = lower_uint8array_get_i32(ctx, array, index)?;
-            let reason = buffer_access_materialization_reason(ctx, array);
-            Ok(materialize_js_value(ctx, value, reason))
+            // #6088: a proven non-negative integer key whose value is NOT
+            // proven in bounds (the inline load above bailed). The native i32
+            // accessor returns the `0` byte-sentinel for an out-of-range read;
+            // a JS-value `u8[i]` must instead read `undefined` (ECMAScript
+            // IntegerIndexedExotic `[[Get]]`). In-range reads still return the
+            // byte as a number.
+            let a = lower_expr(ctx, array)?;
+            let idx_i32 = lower_index_i32(ctx, index)?;
+            let blk = ctx.block();
+            let handle = unbox_to_i64(blk, &a);
+            Ok(blk.call(
+                DOUBLE,
+                "js_uint8array_index_get_value",
+                &[(I64, &handle), (I32, &idx_i32)],
+            ))
         }
         Expr::BufferIndexGet { buffer, index } => {
-            let value = lower_buffer_index_get_i32(ctx, buffer, index)?;
-            let reason = buffer_access_materialization_reason(ctx, buffer);
-            Ok(materialize_js_value(ctx, value, reason))
+            // Proven-bounds inline load keeps the native fast path.
+            if let Some(value) =
+                lower_buffer_load(ctx, buffer, index, BufferAccessSpec::buffer_index_get())?
+            {
+                let reason = buffer_access_materialization_reason(ctx, buffer);
+                return Ok(materialize_js_value(ctx, value, reason));
+            }
+            // #6088: out-of-range → `undefined`, not the `0` byte-sentinel the
+            // native `js_buffer_get` accessor is forced to return.
+            let a = lower_expr(ctx, buffer)?;
+            let idx_i32 = lower_index_i32(ctx, index)?;
+            let blk = ctx.block();
+            let handle = unbox_to_i64(blk, &a);
+            Ok(blk.call(
+                DOUBLE,
+                "js_buffer_index_get_value",
+                &[(I64, &handle), (I32, &idx_i32)],
+            ))
         }
         Expr::Uint8ArraySet {
             array,
@@ -798,16 +848,32 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 ));
             }
             if !numeric_index_has_integer_array_index_proof(ctx, index) {
+                // A non-numeric key stores an OWN property (Node's Buffer is an
+                // ordinary object, and an own key shadows the same-named
+                // prototype method — mysql2's `MockBuffer` overwrites the write
+                // methods of a zero-length Buffer to size a packet). The
+                // typed-array helper coerces the key to a number and dropped the
+                // store; the polymorphic setter dispatches numeric keys to the
+                // byte write and string keys to the own-prop table.
+                let key_maybe_string = !is_numeric_expr(ctx, index);
                 let a = lower_expr(ctx, array)?;
                 let key = lower_expr(ctx, index)?;
                 let val = lower_expr(ctx, value)?;
                 let blk = ctx.block();
                 let handle = unbox_to_i64(blk, &a);
-                let result = blk.call(
-                    DOUBLE,
-                    "js_typed_array_index_set_dynamic",
-                    &[(I64, &handle), (DOUBLE, &key), (DOUBLE, &val)],
-                );
+                let result = if key_maybe_string {
+                    blk.call_void(
+                        "js_object_set_index_polymorphic",
+                        &[(I64, &handle), (DOUBLE, &key), (DOUBLE, &val)],
+                    );
+                    val.clone()
+                } else {
+                    blk.call(
+                        DOUBLE,
+                        "js_typed_array_index_set_dynamic",
+                        &[(I64, &handle), (DOUBLE, &key), (DOUBLE, &val)],
+                    )
+                };
                 if ctx.discard_expr_value {
                     return Ok(double_literal(0.0));
                 }
@@ -1105,25 +1171,13 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 &[(I64, &arr_handle), (DOUBLE, &v)],
             );
             let new_box = nanbox_pointer_inline(blk, &new_handle);
-            // Write back to the local's storage.
-            if let Some(&capture_idx) = ctx.closure_captures.get(array_id) {
-                let closure_ptr = ctx
-                    .current_closure_ptr
-                    .clone()
-                    .ok_or_else(|| anyhow!("ArrayUnshift captured but no current_closure_ptr"))?;
-                let idx_str = capture_idx.to_string();
-                let new_bits = ctx.block().bitcast_double_to_i64(&new_box);
-                ctx.block().call_void(
-                    "js_closure_set_capture_bits",
-                    &[(I64, &closure_ptr), (I32, &idx_str), (I64, &new_bits)],
-                );
-            } else if let Some(slot) = ctx.locals.get(array_id).cloned() {
-                ctx.block().store(DOUBLE, &new_box, &slot);
-            } else if let Some(global_name) = ctx.module_globals.get(array_id).cloned() {
-                let g_ref = format!("@{}", global_name);
-                // GC_STORE_AUDIT(ROOT): module global array slot is a registered mutable GC root.
-                emit_root_nanbox_store_on_block(ctx.block(), &new_box, &g_ref);
-            }
+            // Write back the (possibly reallocated) head to the receiver's
+            // storage. #6229: this previously handled closure-capture / local /
+            // global but NOT the boxed-var case, so a growing single-arg
+            // `unshift` on a boxed async local overwrote the slot's box pointer
+            // with the array pointer, and the next read decoded the array as a
+            // box → `undefined`. Route through the shared boxed-aware writeback.
+            crate::lower_array_method::emit_grow_mutator_writeback(ctx, *array_id, &new_box)?;
             let blk = ctx.block();
             let len_i32 = blk.call(I32, "js_array_length", &[(I64, &new_handle)]);
             let len_f64 = blk.sitofp(I32, &len_i32, DOUBLE);
@@ -1139,21 +1193,24 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         Expr::ArrayEntries(arr) => {
             let arr_box = lower_expr(ctx, arr)?;
             let blk = ctx.block();
-            let arr_handle = unbox_to_i64(blk, &arr_box);
+            // Full bits, not the 48-bit mask: the runtime router classifies
+            // non-pointer receivers (Web Streams handle ids are plain
+            // doubles whose masked bits look like heap addresses).
+            let arr_handle = blk.bitcast_double_to_i64(&arr_box);
             let result = blk.call(I64, "js_array_entries_iter_obj", &[(I64, &arr_handle)]);
             Ok(nanbox_pointer_inline(blk, &result))
         }
         Expr::ArrayKeys(arr) => {
             let arr_box = lower_expr(ctx, arr)?;
             let blk = ctx.block();
-            let arr_handle = unbox_to_i64(blk, &arr_box);
+            let arr_handle = blk.bitcast_double_to_i64(&arr_box);
             let result = blk.call(I64, "js_array_keys_iter_obj", &[(I64, &arr_handle)]);
             Ok(nanbox_pointer_inline(blk, &result))
         }
         Expr::ArrayValues(arr) => {
             let arr_box = lower_expr(ctx, arr)?;
             let blk = ctx.block();
-            let arr_handle = unbox_to_i64(blk, &arr_box);
+            let arr_handle = blk.bitcast_double_to_i64(&arr_box);
             let result = blk.call(I64, "js_array_values_iter_obj", &[(I64, &arr_handle)]);
             Ok(nanbox_pointer_inline(blk, &result))
         }

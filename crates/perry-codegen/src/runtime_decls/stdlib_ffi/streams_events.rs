@@ -11,6 +11,7 @@ pub(crate) fn declare_streams_events(module: &mut LlModule) {
     module.declare_function("js_event_emitter_subclass_init", DOUBLE, &[DOUBLE]); // #5137 EE subclass init
     module.declare_function("js_array_subclass_init", DOUBLE, &[DOUBLE, DOUBLE]); // class extends Array
     module.declare_function("js_map_set_subclass_init", DOUBLE, &[DOUBLE, I32, DOUBLE]); // class extends Map/Set
+    module.declare_function("js_promise_subclass_init", DOUBLE, &[DOUBLE, DOUBLE]); // class extends Promise
     module.declare_function("js_node_stream_readable_new", DOUBLE, &[DOUBLE]);
     module.declare_function(
         "js_node_stream_readable_subclass_init",
@@ -277,6 +278,9 @@ pub(crate) fn declare_streams_events(module: &mut LlModule) {
     module.declare_function("js_ratelimit_create", I64, &[I64]);
     module.declare_function("js_ratelimit_delete", I64, &[I64, I64]);
     module.declare_function("js_ratelimit_get", I64, &[I64, I64]);
+    // `new RateLimiterMemory({...})` ctor arm in lower_call/builtin.rs —
+    // takes the raw NaN-boxed options object bits.
+    module.declare_function("js_ratelimit_new_from_options", I64, &[I64]);
     module.declare_function("js_ratelimit_penalty", I64, &[I64, I64, DOUBLE]);
     module.declare_function("js_ratelimit_reward", I64, &[I64, I64, DOUBLE]);
 

@@ -44,8 +44,9 @@ pub(crate) use helpers::{
     global_script_this_enabled, is_cjs_style_native_default_import, is_fetch_global_value_name,
     is_known_global_identifier_name, lower_expr_with_json_parse_type_hint,
     native_module_binding_value, opt_call_func_nullish_guard, opt_call_receiver_repeatable,
-    relower_trace, throw_reference_error_expr, typed_parse_codegen_supports,
-    with_implicit_unset_let, with_set_fallback_for_ident, wrap_with_gets,
+    relower_trace, strict_global_assign_existing_or_throw, throw_reference_error_expr,
+    typed_parse_codegen_supports, with_implicit_unset_let, with_set_fallback_for_ident,
+    wrap_with_gets,
 };
 pub(crate) use reactive_text::try_desugar_reactive_text;
 
@@ -238,10 +239,18 @@ fn lower_expr_impl(ctx: &mut LoweringContext, expr: &ast::Expr) -> Result<Expr> 
                         ast::Expr::Ident(id) => id.sym.as_ref() == "String",
                         _ => false,
                     };
-                    let prop_is_raw = match &member.prop {
-                        ast::MemberProp::Ident(id) => id.sym.as_ref() == "raw",
-                        _ => false,
-                    };
+                    // #6697: recognize the computed-key form `String["raw"]`
+                    // (string-literal computed member), not just the dot form.
+                    // Without this, `` String["raw"]`…` `` fell through to the
+                    // general tag-desugar path below, whose `String["raw"]`
+                    // value-read reroute resolves to a non-function when the
+                    // tag is emitted inside a nested closure (top-level worked
+                    // by luck) — "value is not a function". Routing both forms
+                    // through this string-concat fast path keeps them in
+                    // lockstep, mirroring the read-side computed-key
+                    // normalization (#6676/#6677).
+                    let prop_is_raw = expr_member::static_member_prop_name(&member.prop).as_deref()
+                        == Some("raw");
                     obj_is_string && prop_is_raw
                 }
                 _ => false,

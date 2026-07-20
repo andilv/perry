@@ -43,7 +43,31 @@ pub(crate) struct PrivMember {
 #[derive(Debug, Clone)]
 pub(crate) struct PrivateScope {
     pub(crate) class_name: String,
+    /// The declaring class's unique HIR id. Carried alongside `class_name`
+    /// because the name alone is ambiguous: minified bundles reuse class names,
+    /// and codegen's `class_ids` name→id map is last-writer-wins, so resolving a
+    /// private member's declaring class by name can bind to the wrong same-named
+    /// class and make the runtime brand check reject a legal `this.#x` access.
+    pub(crate) class_id: u32,
     pub(crate) members: HashMap<String, PrivMember>,
+}
+
+/// A `function Mixin(B) { return class [Name] extends B { … } }` recorded by
+/// `pre_scan_mixin_functions`, so a `const M = Mixin(Base)` call site can
+/// synthesize a real class extending the concrete base.
+#[derive(Debug, Clone)]
+pub(crate) struct MixinFn {
+    /// The mixin function's single parameter — the name the returned class
+    /// `extends`.
+    pub(crate) param_name: String,
+    /// The returned class EXPRESSION's own name, if it has one (`return class
+    /// Named extends B {}`). `None` for the anonymous form, whose `.name` is
+    /// the empty string per spec — a directly-returned class expression gets
+    /// no NamedEvaluation from the call site's binding.
+    pub(crate) class_expr_name: Option<String>,
+    /// The returned class's AST, copied verbatim; the call site rewrites its
+    /// `extends` clause to the concrete base.
+    pub(crate) class_ast: Box<swc_ecma_ast::Class>,
 }
 
 pub struct LoweringContext {
@@ -216,8 +240,38 @@ pub struct LoweringContext {
     /// exactly like a `canvas: Canvas` param or a `const canvas = Canvas(...)`
     /// local. Type-only native specifiers are otherwise dropped at import.
     pub(crate) ui_widget_type_aliases: HashMap<String, String>,
+    /// A named import from a node-core module whose name is not a *value* export
+    /// of that module — `local -> (imported, raw_source, span)`.
+    ///
+    /// The overwhelmingly common cause is a TYPE name in a mixed import:
+    /// `import { createCipheriv, BinaryLike } from "crypto"` — `BinaryLike` is a
+    /// TS type, not a runtime export. tsc, esbuild, and Bun all erase such a
+    /// specifier (it is never referenced in a value position); only Node's
+    /// non-type-directed `--experimental-strip-types` rejects it, and it demands
+    /// an explicit `import type`. Rejecting it at import time made every such
+    /// file fail to compile.
+    ///
+    /// So the specifier is neither bound nor rejected here — it is recorded, and
+    /// the error is raised from `lower_ident_expr` if (and only if) the local is
+    /// actually referenced as a VALUE. Type annotations are erased before
+    /// expression lowering, so reaching that point proves a genuine bad import
+    /// (`import { nope } from "crypto"; nope()`), which still gets the original
+    /// `U006` diagnostic and still diverges-from-Node-safely.
+    pub(crate) deferred_unknown_native_imports: HashMap<String, (String, String, swc_common::Span)>,
     /// Current class being lowered (for arrow function `this` capture)
     pub(crate) current_class: Option<String>,
+    /// Source-level inner name of the class currently being lowered — the
+    /// binding visible *inside* the class body (`class C {...}` -> `C`,
+    /// `const K = class Named {...}` -> `Named`). Unlike `current_class`
+    /// (which for a class expression may be a synthetic dedup key), this is
+    /// the identifier the user writes. Assigning to it inside the body is a
+    /// `const`-binding violation and must throw a TypeError.
+    pub(crate) current_class_inner_name: Option<String>,
+    /// Set by a class-EXPRESSION caller to the source ident of the class
+    /// about to be lowered, so `lower_class_from_ast` can record the inner
+    /// binding name (the synthetic dedup key it receives is not the
+    /// user-visible name). Consumed (taken) at the start of lowering.
+    pub(crate) pending_class_inner_name: Option<String>,
     /// True while lowering a static class member body.
     pub(crate) current_class_member_is_static: bool,
     /// Lexical stack of private-name scopes — one entry per enclosing class
@@ -264,6 +318,15 @@ pub struct LoweringContext {
     /// identifier lhs can provide the `NamedEvaluation` name for an anonymous
     /// function/class rhs. This slot is set only while lowering that rhs.
     pub(crate) assignment_inferred_name: Option<String>,
+    /// Binding names whose class registration was created BY the binding's
+    /// own class-expression init (`const E2 = class extends Event {}` — the
+    /// anonymous expression claimed the inferred binding name as its
+    /// registration key, and `var K = class Inner {}` registers under the
+    /// bind name too). At a `new <name>()` site, such a name's local provably
+    /// holds that same class, so the static construct path (with its exact
+    /// builtin-parent handling) is correct; any OTHER in-scope local shadows
+    /// whatever same-named class exists and must construct dynamically.
+    pub(crate) inferred_class_bindings: std::collections::HashSet<String>,
     /// #4101: original source text keyed by FuncId, captured by slicing the
     /// module source against each function's AST span at lowering time.
     /// Flushed into `Module.closure_source_text` alongside `pending_functions`.
@@ -374,6 +437,40 @@ pub struct LoweringContext {
     /// continue to lexically shadow the object environment.
     pub(crate) with_env_stack: Vec<WithEnvFrame>,
     pub(crate) var_hoisted_ids: HashSet<LocalId>,
+    /// LocalIds of lexical let/const bindings that are forward-referenced
+    /// (read before their declaration, directly or via a closure) in the
+    /// current function/module body. These get a TDZ-seeded box via
+    /// Stmt::PreallocateTdzBoxes so a read-before-declaration throws a spec
+    /// ReferenceError. A subset of var_hoisted_ids restricted to lexical
+    /// (non-var) bindings. Populated by pre_register_forward_captured_lets
+    /// and drained when the body's prealloc set is assembled.
+    pub(crate) tdz_forward_ids: HashSet<LocalId>,
+    /// Names of lexical `let`/`const`/`class` bindings declared in the current
+    /// (or an enclosing, same-function) block scope that are still resolvable as
+    /// forward references — i.e. a bare read of the name before its declarator
+    /// lowers to a throwing get. Used ONLY by the `typeof` lowering (#6062): a
+    /// `typeof <name>` whose operand isn't yet a live local suppresses the throw
+    /// (spec `GetValue`-skips for unresolvable refs → `"undefined"`), but a
+    /// declared-but-uninitialized lexical in its TDZ must throw. Presence here
+    /// distinguishes a forward lexical (→ throw) from a genuinely undeclared
+    /// global name (→ `"undefined"`). Populated per block by
+    /// `lower_stmts_using_aware` (pre-scan of the block's direct lexical decls)
+    /// and cleared across function boundaries in `enter_scope`/`exit_scope`,
+    /// since a `typeof` inside a nested closure is runtime-timing-dependent and
+    /// must not statically throw. A post-declaration `typeof` never consults this
+    /// — by then the name is a live local and never reaches the suppressing arm.
+    pub(crate) forward_lexical_names: HashSet<String>,
+    /// Function-boundary save stack for `forward_lexical_names` (see above).
+    pub(crate) forward_lexical_saves: Vec<HashSet<String>>,
+    /// Names bound by an enclosing `catch (e)` parameter that is currently in
+    /// scope (a stack, innermost last). Annex B B.3.4: a `var e = init;` whose
+    /// name collides with a live catch parameter assigns to that *catch
+    /// parameter* binding, not the function-scoped hoisted `var` — so the outer
+    /// `var e` keeps its pre-catch value (test262 `annexB/language/statements/
+    /// try/catch-redeclared-var-statement`). `lower_var_decl_with_destructuring`
+    /// consults this to target the shadowing catch binding via `lookup_local`
+    /// instead of reusing the hoisted id. Pushed/popped around the catch body.
+    pub(crate) catch_param_scopes: Vec<HashSet<String>>,
     /// Annex B B.3.3 (#5297): for the function/program scope currently being
     /// lowered, maps each name declared by a *block-nested* `function f(){}`
     /// (legacy sloppy-mode block-level function declaration) to the enclosing-
@@ -400,6 +497,18 @@ pub struct LoweringContext {
     /// declarator reuses the id at its Let site — a shadowing `const` in an
     /// inner block still lowers a fresh binding.
     pub(crate) lexical_forward_decls: HashMap<u32, LocalId>,
+    /// Ids in `lexical_forward_decls` that were pre-registered for a NESTED
+    /// block scope (not the function-body top level) by
+    /// `pre_register_forward_captured_lets`. These are lexical bindings, so
+    /// unlike top-level pre-registrations they must NOT be name-visible for
+    /// the whole body: `lower_block_stmt` / the switch-case lowering re-bind
+    /// them into `ctx.locals` exactly when their block scope is entered, and
+    /// `pop_block_scope` drops them at block exit (overriding the
+    /// `var_hoisted_ids` keep that would otherwise leak them into the
+    /// enclosing scope). Without this, a same-named `let` in a sibling block
+    /// was skipped (deduped by name) and any post-block reference of the name
+    /// resolved to the block's box instead of the outer binding.
+    pub(crate) nested_forward_scope_ids: HashSet<LocalId>,
     /// Shadow index: function name -> index in `functions` Vec (last entry for shadowing)
     pub(crate) functions_index: HashMap<String, usize>,
     /// Shadow index: class name -> index in `classes` Vec
@@ -559,10 +668,12 @@ pub struct LoweringContext {
     /// name, so the New expression points at a real HIR class.
     pub(crate) class_expr_aliases: HashMap<String, String>,
     /// Mixin functions: `function withName<T>(B: Constructor<T>) { return class extends B { ... } }`.
-    /// Maps mixin name → (param_name, captured class AST). Stub field
-    /// added to satisfy in-tree references; full mixin support is a
-    /// separate workstream.
-    pub(crate) mixin_funcs: HashMap<String, (String, Box<swc_ecma_ast::Class>)>,
+    /// Maps mixin name → (param_name, class-expression's own name, captured
+    /// class AST). The class-expression name is `None` for the common
+    /// anonymous `return class extends B {…}` form and drives the synthesized
+    /// class's user-visible `.name` (issue #5952). Stub field added to satisfy
+    /// in-tree references; full mixin support is a separate workstream.
+    pub(crate) mixin_funcs: HashMap<String, MixinFn>,
     /// Set to the class name when lowering inside a class constructor body.
     /// Used to resolve `new.target` to a placeholder object whose `.name`
     /// returns the class name. None outside any constructor.
@@ -594,6 +705,13 @@ pub struct LoweringContext {
     /// field layout. Dedup is per-module only; cross-module dedup would need
     /// a stable hash and is deferred.
     pub(crate) anon_shape_classes: HashMap<String, String>,
+    /// Reverse of `anon_shape_classes`: synthetic `__AnonShape_*` class name ->
+    /// its field names in source-declared order. A closed-shape object literal
+    /// lowers to `New { class_name, args }` with the KEYS stripped into the
+    /// shape class, so a call-site that needs to inspect a config object's keys
+    /// (e.g. recognizing a bundled mysql2 `createPool(config)` by its option
+    /// names) recovers them here.
+    pub(crate) anon_shape_fields: HashMap<String, Vec<String>>,
     /// Class DECLARATION names at the top level of the function body
     /// currently being lowered. JS resolves a method-body reference to a
     /// sibling class declared LATER in the same function at call time
@@ -659,6 +777,23 @@ pub struct LoweringContext {
     /// here so the `Expr::New { class_name }` lowering can append
     /// `LocalGet(id)` for each captured id at every construction site.
     pub(crate) class_captures: Vec<(String, Vec<LocalId>)>,
+    /// #6604: capturing class EXPRESSIONS lowered while the CURRENT function
+    /// body is being lowered — `(registration_name, captured_outer_ids)`,
+    /// pushed by `lower_class_expr` (skipped at module top, where
+    /// `filter_module_level_captures` already strips module-level ids). The
+    /// #6037/#6052 end-of-body capture-refresh machinery previously scanned
+    /// only `ast::Decl::Class` DECLARATION statements, so `var Comparator =
+    /// class _Comparator { … }` (semver's shape in every bundled class file)
+    /// never got refresh statements: a captured var assigned AFTER the class
+    /// (`var parseOptions = require_parse_options()` at file bottom) stayed
+    /// `undefined` in the snapshot forever, and dynamic construction of the
+    /// escaped class value threw "value is not a function" at pi-native init.
+    /// Both body twins (`lower_fn_body_block_stmt` and `lower_fn_expr`) mark
+    /// this list's length at entry and drain their own suffix at body end;
+    /// every other body-lowering path must truncate back to its entry mark so
+    /// entries (whose ids are only meaningful in THEIR OWN function scope)
+    /// never leak into an enclosing body's refresh statements.
+    pub(crate) body_class_expr_captures: Vec<(String, Vec<LocalId>)>,
     /// Issue #740: `let_name → class_name` for `let/const/var <name> = <ClassRef>`
     /// initializers. Lets `Expr::New { class_name }` (where `class_name` is
     /// the source-level identifier of an alias binding) resolve to the

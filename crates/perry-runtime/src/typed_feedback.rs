@@ -1071,6 +1071,18 @@ fn finite_nonnegative_i32_index(index: f64) -> Option<i32> {
     }
 }
 
+/// INVARIANT (load-bearing): every array-like receiver reaching this must carry
+/// a real GcHeader. The address checks below are coarse (band floor, canonical
+/// form, heap range) — none of them proves a header is actually there, and the
+/// `addr - GC_HEADER_SIZE` back-read is taken on faith. Reintroducing an
+/// off-GC-heap allocation tier for small typed arrays or buffers (the pre-#6190
+/// raw-`alloc` tier under the 16 KB threshold) therefore does not fault: it
+/// silently reads whatever heap bytes precede the block, and when they happen to
+/// look like `GC_TYPE_ARRAY` the caller admits a typed array to the inline
+/// plain-`ArrayHeader` raw-slot path, which reinterprets its elements as f64
+/// denormals and sums them as zero (#6136; #6190 made every typed array/buffer a
+/// GC-heap object). Keep that invariant or replace this with an exact registry
+/// lookup — do not weaken it by adding address heuristics here.
 fn gc_header_for_user_addr(addr: usize) -> Option<*const crate::gc::GcHeader> {
     if addr < crate::gc::GC_HEADER_SIZE + 0x1000
         || (addr as u64) >> 48 != 0
@@ -1089,6 +1101,14 @@ fn plain_array_index_guard(arr: *const ArrayHeader, index: u32, require_in_bound
         return false;
     };
     unsafe {
+        // #6518 audit note: the GC_FLAG_FORWARDED arm below is load-bearing
+        // for the stale-grown-pointer family (#6486). A caller-held pre-grow
+        // pointer left by `js_array_grow` (#233) is rejected HERE, before
+        // the raw length/capacity read below — the `len > cap` sanity check
+        // alone is not a reliable defense against forwarding-pointer bit
+        // patterns. Same applies to the sibling check in
+        // `numeric_array_push_guard`. Do not remove either arm without
+        // routing the guard through `clean_arr_ptr`.
         if (*header).obj_type != crate::gc::GC_TYPE_ARRAY
             || (*header).gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
         {
@@ -1188,6 +1208,47 @@ fn packed_f64_array_loop_guard(arr: *const ArrayHeader) -> bool {
         }
     }
     crate::array::js_array_is_numeric_f64_layout(raw_addr as *const ArrayHeader) != 0
+}
+
+/// #6011: entry guard for the packed-f64 *range* versioned loop. Validates the
+/// same plain-array shape as [`packed_f64_array_loop_guard`], then proves the
+/// whole static index range `[min_idx, max_idx_exclusive)` the loop can touch
+/// is inside the array, and finally normalizes the slots hole-tolerantly:
+/// numeric slots are rewritten to raw f64 while `TAG_HOLE` slots stay in place
+/// (the guarded loop's inline loads hole-check and side-exit to the slow loop).
+/// Any slot that is neither numeric nor a hole fails the guard.
+fn packed_f64_array_loop_range_guard(
+    arr: *const ArrayHeader,
+    min_idx: i32,
+    max_idx_exclusive: i32,
+) -> bool {
+    if !plain_array_index_guard(arr, 0, false) {
+        return false;
+    }
+    let raw_addr = normalize_raw_object_addr(arr as u64);
+    let Some(header) = gc_header_for_user_addr(raw_addr) else {
+        return false;
+    };
+    unsafe {
+        let flags = (*header)._reserved;
+        if flags
+            & (crate::gc::OBJ_FLAG_FROZEN
+                | crate::gc::OBJ_FLAG_SEALED
+                | crate::gc::OBJ_FLAG_NO_EXTEND)
+            != 0
+        {
+            return false;
+        }
+        let arr = raw_addr as *mut ArrayHeader;
+        let len = (*arr).length;
+        if len > i32::MAX as u32 {
+            return false;
+        }
+        if min_idx < 0 || i64::from(max_idx_exclusive) > i64::from(len) {
+            return false;
+        }
+        crate::array::rebuild_array_numeric_raw_f64_allow_holes(arr)
+    }
 }
 
 fn packed_i32_array_loop_guard(arr: *const ArrayHeader) -> bool {
@@ -1324,6 +1385,16 @@ fn shape_keyed_object_addr(source: ObservationSource, object_addr: usize) -> usi
 }
 
 fn observe_array(site_id: u64, arr: *const ArrayHeader, index: u32) {
+    // #5094: recording-only helper. When typed-feedback is off (the default),
+    // `observe` records nothing, so the whole body is dead work — and
+    // `classify_array` walks the per-object pointer-slot layout, which is O(len)
+    // for a downgraded (SIDE_MASK) array. This ran per `arr[i] = v` on a
+    // heterogeneous array (via `js_typed_feedback_array_set_index_or_string` and
+    // the polymorphic / string-key set wrappers), making the write loop
+    // quadratic. Bail before the walk, matching every other recording path.
+    if !typed_feedback_enabled() {
+        return;
+    }
     let raw_addr = normalize_raw_object_addr(arr as u64);
     let (class_id, heap_type, aux, element_kind) = classify_array(raw_addr, Some(index));
     observe(
@@ -1348,6 +1419,17 @@ pub extern "C" fn js_typed_feedback_array_get_f64(
     arr: *const ArrayHeader,
     index: u32,
 ) -> f64 {
+    // #5094: when typed-feedback recording is off (the default — `guard_observe`
+    // early-returns with no side effect), the whole classify/observe block is
+    // dead work. `classify_array` walks the per-object pointer-slot layout
+    // (`array_layout_kind` → `layout_visit_pointer_slots`), which is O(len) for a
+    // downgraded (SIDE_MASK) array — so this ran per element and made
+    // `arr[i]` on a heterogeneous array quadratic. Mirror the gate the sibling
+    // guard wrappers already carry (`plain_array_index_get_guard_impl`) and take
+    // the underlying array op directly.
+    if !typed_feedback_enabled() {
+        return crate::array::js_array_get_f64(arr, index);
+    }
     let raw_addr = normalize_raw_object_addr(arr as u64);
     let (class_id, heap_type, aux, element_kind) = classify_array(raw_addr, Some(index));
     let observation = Observation {
@@ -1531,6 +1613,61 @@ pub extern "C" fn js_typed_feedback_packed_f64_array_loop_guard(
         0
     }
 }
+
+/// #6011: FFI wrapper for the packed-f64 range-loop guard. `min_idx` /
+/// `max_idx_exclusive` are the smallest and one-past-largest indices the
+/// candidate fast loop can touch (loop start + smallest offset, loop bound +
+/// largest offset), both precomputed as i32 by codegen.
+#[no_mangle]
+pub extern "C" fn js_typed_feedback_packed_f64_range_loop_guard(
+    site_id: u64,
+    receiver: f64,
+    min_idx: i32,
+    max_idx_exclusive: i32,
+) -> i32 {
+    let raw_addr = normalize_raw_object_addr(receiver.to_bits());
+    if !typed_feedback_enabled() {
+        return packed_f64_array_loop_range_guard(
+            raw_addr as *const ArrayHeader,
+            min_idx,
+            max_idx_exclusive,
+        ) as i32;
+    }
+    let (class_id, heap_type, aux, element_kind) = classify_array(raw_addr, None);
+    let observation = Observation {
+        source: ObservationSource::Array,
+        object_addr: 0,
+        shape_addr: 0,
+        key_hash: 0,
+        class_id,
+        heap_type,
+        aux,
+        value_tag: element_kind,
+    };
+    let pass = guard_observe(
+        site_id,
+        TypedFeedbackSiteKind::ArrayElement,
+        observation,
+        packed_f64_array_loop_range_guard(
+            raw_addr as *const ArrayHeader,
+            min_idx,
+            max_idx_exclusive,
+        ),
+    );
+    if pass {
+        1
+    } else {
+        0
+    }
+}
+
+#[used]
+static KEEP_JS_TYPED_FEEDBACK_PACKED_F64_RANGE_LOOP_GUARD: extern "C" fn(
+    u64,
+    f64,
+    i32,
+    i32,
+) -> i32 = js_typed_feedback_packed_f64_range_loop_guard;
 
 #[no_mangle]
 pub extern "C" fn js_typed_feedback_packed_i32_array_loop_guard(
@@ -1730,6 +1867,13 @@ pub extern "C" fn js_typed_feedback_array_set_f64(
     index: u32,
     value: f64,
 ) {
+    // #5094: skip the dead classify/observe block when recording is off (see
+    // `js_typed_feedback_array_get_f64`). The tail array op is the only
+    // observable effect in that case.
+    if !typed_feedback_enabled() {
+        crate::array::js_array_set_f64(arr, index, value);
+        return;
+    }
     let raw_addr = normalize_raw_object_addr(arr as u64);
     let (class_id, heap_type, aux, _element_kind) = classify_array(raw_addr, Some(index));
     let observation = Observation {
@@ -1761,6 +1905,12 @@ pub extern "C" fn js_typed_feedback_array_set_f64_extend(
     index: u32,
     value: f64,
 ) -> *mut ArrayHeader {
+    // #5094: skip the dead classify/observe block when recording is off (see
+    // `js_typed_feedback_array_get_f64`). Preserve the strict extend semantics
+    // documented below by routing straight to the same tail op.
+    if !typed_feedback_enabled() {
+        return crate::array::js_array_set_f64_extend_strict(arr, index, value);
+    }
     let raw_addr = normalize_raw_object_addr(arr as u64);
     let (class_id, heap_type, aux, _element_kind) = classify_array(raw_addr, Some(index));
     let observation = Observation {
@@ -1782,7 +1932,10 @@ pub extern "C" fn js_typed_feedback_array_set_f64_extend(
     if !pass {
         record_fallback_call(site_id);
     }
-    crate::array::js_array_set_f64_extend(arr, index, value)
+    // This wrapper is only emitted for the source-level `arr[i] = v` assignment,
+    // so it carries strict `Set`-with-`Throw` semantics: a frozen array's element
+    // is non-writable and a non-extensible array rejects a new index → TypeError.
+    crate::array::js_array_set_f64_extend_strict(arr, index, value)
 }
 
 #[no_mangle]
@@ -2029,7 +2182,9 @@ pub extern "C" fn js_typed_feedback_array_set_index_or_string(
     } else {
         record_guard_pass(site_id);
     }
-    crate::array::js_array_set_index_or_string(arr, idx, value)
+    // Assignment-site wrapper → strict `Set` with `Throw = true` (frozen /
+    // non-extensible array element write throws a TypeError).
+    crate::array::js_array_set_index_or_string_strict(arr, idx, value)
 }
 
 #[no_mangle]

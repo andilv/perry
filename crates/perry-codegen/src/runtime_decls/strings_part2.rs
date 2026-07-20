@@ -88,7 +88,9 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     // `new Uint8Array(x)` runtime dispatch — handles the non-literal case
     // where `x` could be a number (length) or an array (source data).
     module.declare_function("js_uint8array_new", I64, &[DOUBLE]);
-    module.declare_function("js_uint8array_view", I64, &[DOUBLE, I32, I32]);
+    // Raw NaN-boxed byteOffset/length (undefined when absent) — the runtime
+    // runs ToIndex and the spec's post-coercion detached/bounds checks.
+    module.declare_function("js_uint8array_view", I64, &[DOUBLE, DOUBLE, DOUBLE]);
     // Generic typed array runtime (Int8/16/32, Uint16/32, Float32/64, Uint8Clamped).
     // Uint8Array piggybacks on the BufferHeader path.
     module.declare_function("js_typed_array_new_empty", I64, &[I32, I32]);
@@ -111,6 +113,7 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
         &[I64, DOUBLE, DOUBLE],
     );
     module.declare_function("js_uint8array_get", I32, &[I64, I32]);
+    module.declare_function("js_uint8array_index_get_value", DOUBLE, &[I64, I32]);
     module.declare_function("js_uint8array_set", VOID, &[I64, I32, I32]);
     module.declare_function("js_native_arena_alloc", I64, &[I64]);
     module.declare_function("js_native_arena_view", I64, &[I64, I32, I64, I64]);
@@ -256,6 +259,8 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     module.declare_function("js_symbol_new", DOUBLE, &[DOUBLE]);
     module.declare_function("js_symbol_new_empty", DOUBLE, &[]);
     module.declare_function("js_symbol_for", DOUBLE, &[DOUBLE]);
+    // #6676: computed `Symbol[key]` (constructor value + runtime key).
+    module.declare_function("js_symbol_computed_member", DOUBLE, &[DOUBLE, DOUBLE]);
     module.declare_function("js_symbol_key_for", DOUBLE, &[DOUBLE]);
     module.declare_function("js_symbol_description", DOUBLE, &[DOUBLE]);
     module.declare_function("js_symbol_to_string", I64, &[DOUBLE]);
@@ -677,6 +682,11 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     // branch so `await thenable` enters the polling path.
     module.declare_function("js_assimilate_thenable", DOUBLE, &[DOUBLE]);
     module.declare_function("js_promise_run_microtasks", I32, &[]);
+    // #6077: the entry event loop's pump — `js_promise_run_microtasks` plus the
+    // unhandled-rejection checkpoint (Node's `processPromiseRejections`) between
+    // the microtask drain and the timer queues. Emitted only by
+    // `codegen::entry`'s event loop, whose JS stack is fully unwound.
+    module.declare_function("js_promise_run_microtasks_event_loop", I32, &[]);
     module.declare_function("js_promise_run_microtasks_await_loop", I32, &[]);
     module.declare_function("js_await_loop_tick_timers", I32, &[]);
     // ESM entry marker: first microtask drain finishes promise jobs before
@@ -696,6 +706,9 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     // after enqueueing onto a queue the pump drains; otherwise sleeps until
     // the next timer deadline (or 1s safety cap).
     module.declare_function("js_wait_for_event", VOID, &[]);
+    // Host-driven event loop flag (watchOS SwiftUI tree shell): the entry's
+    // drain loop exits when perry_ui_app_run marked the loop host-driven.
+    module.declare_function("js_event_loop_host_driven", I32, &[]);
     module.declare_function("js_unsettled_top_level_await_exit", VOID, &[]);
     module.declare_function("js_throw", VOID, &[DOUBLE]);
 
@@ -708,29 +721,16 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     // js_has_exception() returns i32 (1 if exception is active, 0 otherwise).
     // js_enter_finally() / js_leave_finally() bracket finally blocks.
     module.declare_function("js_try_push", PTR, &[]);
-    // setjmp variant selection:
-    //   - Windows MSVC requires _setjmp(buf, frame_ptr)
-    //   - Apple targets: the default C `setjmp(3)` saves the signal mask
-    //     via a `sigprocmask` syscall (and the alt-signal-stack via
-    //     `__sigaltstack`) — together those syscalls dominate CPU for
-    //     async-heavy workloads (~43% of CPU on promise_all_chains.ts
-    //     before the swap). Perry never longjmps out of a signal
-    //     handler, so the fast `_setjmp(3)` (no sigprocmask) is
-    //     functionally equivalent for our exception path. The LLVM-IR
-    //     name `_setjmp` maps to the Mach-O linker symbol `__setjmp`
-    //     (the C ABI prepends an underscore), which is the fast
-    //     variant in libsystem_platform.dylib.
-    //   - Linux glibc: the C `setjmp(3)` already does NOT save the
-    //     signal mask (POSIX leaves it implementation-defined;
-    //     `sigsetjmp(env, 1)` is the signal-saving variant on Linux).
-    //     So `setjmp` on Linux is already the fast path; no swap
-    //     needed.
-    if cfg!(target_os = "windows") {
-        module.declare_function("_setjmp", I32, &[PTR, PTR]);
-    } else if cfg!(target_vendor = "apple") {
-        module.declare_function("_setjmp", I32, &[PTR]);
-    } else {
-        module.declare_function("setjmp", I32, &[PTR]);
+    // setjmp variant selection: decided by `crate::setjmp_abi` from the
+    // compile target's LLVM triple (`module.target_triple`), NOT host
+    // `cfg!` — cross-compiles must declare the *target's* setjmp ABI
+    // (Windows MSVC 2-arg `_setjmp`, Apple fast 1-arg `_setjmp`, plain
+    // `setjmp` elsewhere; full rationale in `crate::setjmp_abi`). The
+    // same `SetjmpAbi` drives the call sites in `stmt/try_stmt.rs`, so
+    // the declaration and the calls can never disagree on name or arity.
+    {
+        let abi = crate::setjmp_abi::setjmp_abi_for_triple(&module.target_triple);
+        module.declare_function(abi.callee(), I32, abi.param_types());
     }
     module.declare_function("js_try_end", VOID, &[]);
     module.declare_function("js_get_exception", DOUBLE, &[]);
@@ -797,6 +797,7 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     module.declare_function("js_buffer_from_arraybuffer_slice", I64, &[I64, I32, I32]);
     module.declare_function("js_buffer_length", I32, &[I64]);
     module.declare_function("js_buffer_get", I32, &[I64, I32]);
+    module.declare_function("js_buffer_index_get_value", DOUBLE, &[I64, I32]);
     module.declare_function("js_native_buffer_data_ptr", PTR, &[DOUBLE]);
     module.declare_function("js_native_buffer_byte_len", I64, &[DOUBLE]);
     // console.time/count runtime functions.
@@ -872,6 +873,7 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     module.declare_function("js_promise_resolve", VOID, &[I64, DOUBLE]);
     module.declare_function("js_promise_reject", VOID, &[I64, DOUBLE]);
     module.declare_function("js_promise_resolved", I64, &[DOUBLE]);
+    module.declare_function("js_async_fn_result", I64, &[DOUBLE]);
     module.declare_function("js_promise_rejected", I64, &[DOUBLE]);
     // Issue #100: build a module-namespace object from parallel key/
     // value arrays. Called from `__perry_init_<prefix>` (populate the
@@ -964,6 +966,7 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     // object at runtime instead of silently dropping them.
     module.declare_function("js_request_new_from_init", DOUBLE, &[I64, DOUBLE]);
     module.declare_function("js_request_get_url", I64, &[DOUBLE]);
+    module.declare_function("js_request_input_to_url", I64, &[DOUBLE]);
     module.declare_function("js_request_get_method", I64, &[DOUBLE]);
     module.declare_function("js_request_get_body", DOUBLE, &[DOUBLE]);
     module.declare_function("js_request_body_used", DOUBLE, &[DOUBLE]);

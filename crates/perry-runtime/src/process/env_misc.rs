@@ -84,8 +84,8 @@ pub extern "C" fn js_process_add_uncaught_exception_capture_callback(callback: f
 #[no_mangle]
 pub extern "C" fn js_process_exit(code: f64) {
     // #3041 — match Node's `parseAndValidateExitCode`:
-    //   * `undefined` / `null`  → exit with the prior `process.exitCode`
-    //     (0 by default here, since the validated path never stored one).
+    //   * `undefined` / `null`  → exit with the stored `process.exitCode`
+    //     (0 when it was never set / was reset to nullish — #6666).
     //   * number                → must be a finite integer, else
     //     RangeError [ERR_OUT_OF_RANGE] ("It must be an integer").
     //   * string                → coerced with `Number()`; empty string or
@@ -93,8 +93,22 @@ pub extern "C" fn js_process_exit(code: f64) {
     //     TypeError [ERR_INVALID_ARG_TYPE], otherwise it is validated as a
     //     number (so `"2.5"` → RangeError, `"2"` → exit 2).
     //   * anything else (boolean/object/array) → TypeError.
-    let exit_code = validate_exit_code(code).unwrap_or_default();
+    //
+    // `validate_exit_code` returns `None` *only* for nullish input, so a bare
+    // `process.exit()` falls back to `process.exitCode` while an explicit arg
+    // (`process.exit(0)`) overrides it — matching Node (#6666).
+    let exit_code = match validate_exit_code(code) {
+        Some(code) => code,
+        None => js_process_pending_exit_code(),
+    };
     js_process_run_finalization_exit();
+    crate::gc::js_gc_release_current_thread_collection_side_allocations();
+    terminate_without_atexit(exit_code)
+}
+
+/// Terminate without running process-wide cleanup after thread-local GC state
+/// has been torn down.
+fn terminate_without_atexit(exit_code: i32) -> ! {
     // Use _exit() instead of std::process::exit() to avoid SIGILL during cleanup.
     // std::process::exit() runs atexit handlers and C++ destructors which can trigger
     // illegal instructions when exception handler state (jmp_buf), GC roots, or
@@ -106,7 +120,7 @@ pub extern "C" fn js_process_exit(code: f64) {
     #[cfg(windows)]
     {
         extern "system" {
-            fn ExitProcess(uExitCode: u32);
+            fn ExitProcess(uExitCode: u32) -> !;
         }
         unsafe {
             ExitProcess(exit_code as u32);
@@ -114,6 +128,15 @@ pub extern "C" fn js_process_exit(code: f64) {
     }
     #[cfg(not(any(unix, windows)))]
     std::process::exit(exit_code);
+}
+
+/// Terminate after releasing current-thread collection storage.
+///
+/// This is used by fatal paths that have already completed their reporting
+/// callbacks and would otherwise bypass the generated executable epilogue.
+pub(crate) fn exit_after_current_thread_collection_teardown(code: i32) -> ! {
+    crate::gc::js_gc_release_current_thread_collection_side_allocations();
+    terminate_without_atexit(code)
 }
 
 /// Validate + coerce a `process.exit(code)` argument the way Node's
@@ -803,20 +826,62 @@ pub extern "C" fn js_process_exit_code_get() -> f64 {
     f64::from_bits(bits)
 }
 
-/// `process.exitCode = v`. Stores the raw NaN-boxed bits verbatim so
-/// the read round-trips byte-for-byte — Node forwards e.g. the string
-/// `"0"` as a string and only coerces when `process.exit()` runs.
+/// `process.exitCode = v`. Node validates + coerces the value *at
+/// assignment time* (`process.set [as exitCode]` → `parseAndValidateExitCode`,
+/// verified against node v26): a nullish value clears the code, a string is
+/// `Number()`-coerced, and a non-integer / NaN-string / wrong-type value
+/// throws synchronously (RangeError [ERR_OUT_OF_RANGE] or
+/// TypeError [ERR_INVALID_ARG_TYPE]). The *stored* value is the coerced
+/// integer, so `process.exitCode = "2"` reads back as the number `2`. We
+/// reuse the same `validate_exit_code` the `process.exit(code)` path uses
+/// (#1350 / #6666).
 ///
-/// Returns `value` so the call site can use it as the result of the
-/// assignment expression (JS assignment evaluates to the RHS value).
-/// That keeps the codegen path uniform with other `js_*` runtime
-/// helpers that return f64 — see `lower_call/extern_func.rs:330` for
-/// the direct-call path.
+/// Returns `value` (the *original* RHS) so the call site uses it as the
+/// assignment-expression result: JS yields the assigned value *before* the
+/// setter's coercion, so `(process.exitCode = "2") === "2"`. That also keeps
+/// the codegen path uniform with other `js_*` runtime helpers that return
+/// f64 — see `lower_call/extern_func.rs:330` for the direct-call path.
 #[no_mangle]
 pub extern "C" fn js_process_exit_code_set(value: f64) -> f64 {
-    PROCESS_EXIT_CODE.with(|c| c.set(value.to_bits()));
+    match validate_exit_code(value) {
+        Some(code) => PROCESS_EXIT_CODE.with(|c| c.set(JSValue::number(code as f64).bits())),
+        // Nullish (`process.exitCode = null` / `undefined`) resets to the
+        // unset state, so natural exit falls back to 0.
+        None => PROCESS_EXIT_CODE.with(|c| c.set(JSValue::undefined().bits())),
+    }
     value
 }
+
+/// Resolve the process's final exit status from the stored `process.exitCode`.
+///
+/// Used on **natural** termination — the event loop drained and generated
+/// `main` returned with no explicit `process.exit()` call — and as the
+/// fallback for a bare `process.exit()` (#6666). The cell holds either
+/// `undefined` (never set / reset → 0) or an already-validated integer (the
+/// setter coerced it), so no re-validation is needed here. Truncating to
+/// `i32` mirrors what `_exit()` does with the value; the OS then reduces it
+/// to the 0-255 wait-status byte, matching Node's modulo-256 (e.g.
+/// `process.exitCode = 257` → status 1, `= -1` → 255).
+#[no_mangle]
+pub extern "C" fn js_process_pending_exit_code() -> i32 {
+    let jv = JSValue::from_bits(PROCESS_EXIT_CODE.with(|c| c.get()));
+    if jv.is_undefined() || jv.is_null() {
+        return 0;
+    }
+    if jv.is_int32() {
+        jv.as_int32()
+    } else {
+        jv.as_number() as i32
+    }
+}
+
+// The natural-exit epilogue emits a call to `js_process_pending_exit_code`
+// unconditionally into generated `_main`, but the only other caller inside the
+// runtime is `js_process_exit`'s nullish fallback. Anchor the symbol so the
+// auto-optimize whole-program dead-strip cannot drop it (same guard the
+// unhandled-rejection reporter uses, #4876).
+#[used]
+static KEEP_PROCESS_PENDING_EXIT_CODE: extern "C" fn() -> i32 = js_process_pending_exit_code;
 
 /// Set an environment variable. Backs `process.env.X = v` (#1344).
 ///
@@ -845,6 +910,9 @@ pub extern "C" fn js_setenv(name_ptr: *const StringHeader, value: f64) {
             Ok(s) => s,
             Err(_) => return,
         };
+        if !env_name_is_settable(name) {
+            return;
+        }
 
         // Coerce value to string. js_jsvalue_to_string handles
         // numbers/booleans/null/undefined and returns a *mut StringHeader.
@@ -867,6 +935,19 @@ pub extern "C" fn js_setenv(name_ptr: *const StringHeader, value: f64) {
             Err(_) => return,
         };
         std::env::set_var(name, v_str);
+        // Keep the cached `process.env` object in step so enumeration
+        // (`Object.keys(process.env)`, `for…in`, spread) sees the new key —
+        // reads go through `js_getenv`, but enumeration walks this object.
+        let cached = CACHED_ENV.with(|c| c.get());
+        if cached != 0.0 {
+            let obj = crate::value::js_nanbox_get_pointer(cached) as *mut crate::ObjectHeader;
+            if !obj.is_null() {
+                let key = js_string_from_bytes(name.as_ptr(), name.len() as u32);
+                let val = js_string_from_bytes(v_str.as_ptr(), v_str.len() as u32);
+                let val_f64 = f64::from_bits(JSValue::string_ptr(val).bits());
+                crate::object::js_object_set_field_by_name(obj, key, val_f64);
+            }
+        }
     }
 }
 
@@ -964,11 +1045,50 @@ pub extern "C" fn js_removeenv(name_ptr: *const StringHeader) {
 /// it straight to subsequent PropertyGet dispatch.
 #[no_mangle]
 pub extern "C" fn js_process_env() -> f64 {
-    use std::cell::Cell;
-    ipc::process_ipc_ensure_initialized();
-    thread_local! {
-        static CACHED_ENV: Cell<f64> = const { Cell::new(0.0) };
+    js_process_env_impl()
+}
+
+thread_local! {
+    static CACHED_ENV: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+}
+
+/// Is `value` the live `process.env` object? Writes to it must reach the real
+/// environment (`js_setenv`), not just the cached field bag: `process.env.X`
+/// READS lower to `js_getenv`, so a field-only store is invisible.
+/// `Object.assign(process.env, parsed)` is how `@next/env` loads `.env` files —
+/// under Perry the keys landed in the object and every read still returned
+/// `undefined`, so a Next.js standalone server saw NONE of its `.env` config
+/// (myairank: `process.env.DATABASE_URL` undefined ⇒ mysql2 connected with an
+/// empty user/database and the MySQL handshake timed out).
+pub fn is_process_env_object(value: f64) -> bool {
+    let cached = CACHED_ENV.with(|c| c.get());
+    cached != 0.0 && cached.to_bits() == value.to_bits()
+}
+
+/// True when `addr` is the heap address of the cached `process.env` object.
+///
+/// The pointer form of [`is_process_env_object`], for call sites that have
+/// already unboxed the target (`Object.assign`'s write funnel).
+pub fn is_process_env_ptr(addr: usize) -> bool {
+    let cached = CACHED_ENV.with(|c| c.get());
+    if cached == 0.0 {
+        return false;
     }
+    crate::value::js_nanbox_get_pointer(cached) as usize == addr
+}
+
+/// `std::env::set_var` PANICS — and, being called from an `extern "C"` frame,
+/// aborts the process — when the name is empty, contains `=`, or contains a NUL
+/// byte. `Object.assign(process.env, parsed)` feeds it arbitrary object keys, so
+/// a single malformed key in a `.env` file would take the whole server down.
+/// Node accepts such an assignment silently, so skip these names rather than
+/// crash.
+fn env_name_is_settable(name: &str) -> bool {
+    !name.is_empty() && !name.contains('=') && !name.contains('\0')
+}
+
+fn js_process_env_impl() -> f64 {
+    ipc::process_ipc_ensure_initialized();
     let cached = CACHED_ENV.with(|c| c.get());
     if cached != 0.0 {
         return cached;

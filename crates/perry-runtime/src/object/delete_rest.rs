@@ -34,6 +34,10 @@ pub extern "C" fn js_object_delete_field(
     if obj.is_null() || key.is_null() {
         return 1;
     }
+    // A delete can rewrite key→slot mappings in place (same keys_array
+    // address), so cached (keys_array, key)→index plans must be flushed
+    // (`object::prop_plan` read-plan cache).
+    super::prop_plan::prop_plan_epoch_bump();
     // A Proxy is a small registered id in the proxy id band, not a heap
     // ObjectHeader. Dereferencing it below (GC header / keys_array reads) would
     // segfault. Route `delete proxy.k` / `delete proxy[k]` through the proxy
@@ -54,7 +58,11 @@ pub extern "C" fn js_object_delete_field(
             }
         }
     }
-    if (obj as usize) < 0x10000 {
+    // The hand-typed 0x10000 floor here was an order of magnitude below the real
+    // boundary (HANDLE_BAND_MAX = 0x100000), so the fetch (0x40000..0xE0000) and
+    // zlib (0xE0000..0xF0000) handle bands fell through to the heap path below
+    // and got dereferenced -> SIGSEGV on Linux. Use the centralized predicate.
+    if crate::value::addr_class::is_handle_band(obj as usize) {
         unsafe {
             if let Some(name) = super::has_own_helpers::str_from_string_header(key) {
                 let class_id = obj as usize as u32;
@@ -62,6 +70,17 @@ pub extern "C" fn js_object_delete_field(
                     super::class_registry::class_delete_own_dynamic_prop(class_id, name);
                     super::class_registry::class_mark_key_deleted(class_id, name);
                 }
+                // #6363: a native HANDLE's own properties are its user expandos.
+                // `delete` used to unconditionally report success while LEAVING
+                // the property in place — `delete headers.foo` returned true and
+                // `headers.foo` still read back its old value. Actually remove
+                // it, and reject (false) a non-configurable one, matching
+                // ordinary `[[Delete]]`. An absent key still reports true, which
+                // is what `delete request.__nope` must do (Node: true).
+                return i32::from(super::handle_expando::handle_expando_delete(
+                    obj as usize as i64,
+                    name,
+                ));
             }
         }
         return 1;
@@ -103,6 +122,13 @@ pub extern "C" fn js_object_delete_field(
                 (obj as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
             if (*gc_header).obj_type == crate::gc::GC_TYPE_ARRAY {
                 if let Some(name) = super::has_own_helpers::str_from_string_header(key) {
+                    // An Array's `length` is a non-configurable exotic own
+                    // property with no descriptor-table entry, so the
+                    // `get_property_attrs` check below misses it. `delete
+                    // arr.length` must report failure (throws in strict mode).
+                    if name == "length" {
+                        return 0;
+                    }
                     if let Some(attrs) = get_property_attrs(obj as usize, name) {
                         if !attrs.configurable() {
                             return 0;
@@ -144,6 +170,21 @@ pub extern "C" fn js_object_delete_field(
         // user-attached props are dropped from the dynamic-prop table outright.
         if crate::closure::is_closure_ptr(obj as usize) {
             if let Some(name) = super::has_own_helpers::str_from_string_header(key) {
+                // A plain (non-arrow, non-bound) function's `prototype` is a
+                // non-configurable own property. `get_property_attrs` only knows
+                // about it once #3655 has lazily registered a descriptor (on first
+                // access), so a fresh `function(){}` whose prototype was never
+                // read would otherwise report a successful delete. Reject it up
+                // front. (test262 Proxy/deleteProperty/*-target-is-proxy exercise
+                // `delete funcProxy.prototype` in strict mode.)
+                if name == "prototype" {
+                    let closure = obj as *const crate::closure::ClosureHeader;
+                    if !crate::closure::closure_is_arrow(closure)
+                        && !crate::closure::closure_is_bound_method(closure)
+                    {
+                        return 0;
+                    }
+                }
                 // A non-configurable slot — e.g. a constructor's `prototype`,
                 // which #3655 registers as `{configurable:false}` — can't be
                 // deleted: leave it intact and report failure (strict mode
@@ -282,6 +323,11 @@ pub extern "C" fn js_object_delete_field(
         //    into slot j. Inline reads/writes for j < alloc_limit;
         //    overflow_get/set otherwise.
         for j in i..new_count {
+            // Read through the index path, which resolves inline-vs-overflow with the
+            // CURRENT (pre-decrement) `field_count` — the same boundary the value was
+            // written under. Reading by NAME here would invoke a getter and store its
+            // result as a data property, silently collapsing accessors (Next's module
+            // exports are `Object.defineProperty(..., {get})`).
             let next = js_object_get_field(obj, (j + 1) as u32);
             // Inline write if target slot < alloc_limit, else overflow.
             if j < alloc_limit {
@@ -312,11 +358,23 @@ pub extern "C" fn js_object_delete_field(
         //    we built the new keys directly with the deleted entry
         //    omitted, so no in-place shift is needed.)
 
-        // 3) Adjust field_count: keep within bounds. If the original
-        //    field_count counted this slot, drop by one.
-        if (i as u32) < field_count {
-            (*obj).field_count = field_count - 1;
-        }
+        // 3) `field_count` is the number of properties resident in the INLINE
+        //    slots — every reader treats `field_index >= field_count` as living in
+        //    the overflow map. It is NOT the property count: an object with 9
+        //    properties and 8 inline slots carries `field_count == 8`, with the 9th
+        //    spilled to overflow.
+        //
+        //    Decrementing it by one was therefore wrong. Deleting one property from
+        //    that 9-property object leaves 8 survivors — all of which now FIT
+        //    inline, so `field_count` must become 8. The old `field_count - 1 = 7`
+        //    pushed the last survivor's index (7) at or past the boundary, so
+        //    reading it went to the overflow map, found nothing, and returned
+        //    `undefined`: the key stayed enumerable while its value vanished.
+        //
+        //    After the rebuild above, the survivors occupy slots `0..new_count`,
+        //    inline up to the allocation's capacity. That is exactly
+        //    `min(new_count, alloc_limit)`.
+        (*obj).field_count = std::cmp::min(new_count, alloc_limit) as u32;
 
         // 4) Invalidate the keys-index sidecar for this object — the
         //    slot map is now stale (entries past `i` have shifted).

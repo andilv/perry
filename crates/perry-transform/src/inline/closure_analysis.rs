@@ -639,7 +639,7 @@ pub fn has_simple_control_flow(stmts: &[Stmt]) -> bool {
             | Stmt::LabeledContinue(_) => {
                 return false;
             }
-            Stmt::PreallocateBoxes(_) => {}
+            Stmt::PreallocateBoxes(_) | Stmt::PreallocateTdzBoxes(_) => {}
         }
     }
     true
@@ -811,7 +811,7 @@ pub fn find_max_local_id(stmts: &[Stmt]) -> LocalId {
                 }
             }
             Stmt::Break | Stmt::Continue | Stmt::LabeledBreak(_) | Stmt::LabeledContinue(_) => {}
-            Stmt::PreallocateBoxes(ids) => {
+            Stmt::PreallocateBoxes(ids) | Stmt::PreallocateTdzBoxes(ids) => {
                 for id in ids {
                     *max_id = (*max_id).max(*id);
                 }
@@ -924,5 +924,75 @@ mod tests {
         }))];
         let param_ids: HashSet<LocalId> = [1].into_iter().collect();
         assert!(body_contains_closure_capturing(&body, &param_ids));
+    }
+}
+
+/// Every binding the function itself introduces: `let`/`const` declarations
+/// (including a `for` init and a `catch` param) and any id the lowering has
+/// already marked for boxing.
+///
+/// These are exactly the ids that do not exist in a caller's scope, so a
+/// closure capturing one of them cannot survive having the body cloned into a
+/// call site — see the closure guard in [`super::analysis::is_inlinable`].
+pub fn collect_declared_local_ids(stmts: &[Stmt], out: &mut std::collections::HashSet<LocalId>) {
+    for s in stmts {
+        match s {
+            Stmt::Let { id, .. } => {
+                out.insert(*id);
+            }
+            Stmt::PreallocateBoxes(ids) | Stmt::PreallocateTdzBoxes(ids) => {
+                out.extend(ids.iter().copied());
+            }
+            Stmt::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                collect_declared_local_ids(then_branch, out);
+                if let Some(else_branch) = else_branch {
+                    collect_declared_local_ids(else_branch, out);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+                collect_declared_local_ids(body, out);
+            }
+            Stmt::For { init, body, .. } => {
+                if let Some(init) = init {
+                    collect_declared_local_ids(std::slice::from_ref(init.as_ref()), out);
+                }
+                collect_declared_local_ids(body, out);
+            }
+            Stmt::Labeled { body, .. } => {
+                collect_declared_local_ids(std::slice::from_ref(body.as_ref()), out);
+            }
+            Stmt::Try {
+                body,
+                catch,
+                finally,
+            } => {
+                collect_declared_local_ids(body, out);
+                if let Some(catch) = catch {
+                    if let Some((id, _)) = &catch.param {
+                        out.insert(*id);
+                    }
+                    collect_declared_local_ids(&catch.body, out);
+                }
+                if let Some(finally) = finally {
+                    collect_declared_local_ids(finally, out);
+                }
+            }
+            Stmt::Switch { cases, .. } => {
+                for case in cases {
+                    collect_declared_local_ids(&case.body, out);
+                }
+            }
+            Stmt::Expr(_)
+            | Stmt::Return(_)
+            | Stmt::Throw(_)
+            | Stmt::Break
+            | Stmt::Continue
+            | Stmt::LabeledBreak(_)
+            | Stmt::LabeledContinue(_) => {}
+        }
     }
 }

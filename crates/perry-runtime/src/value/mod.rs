@@ -56,7 +56,7 @@ mod tests;
 pub(crate) use tags::{
     BIGINT_TAG, INT32_MASK, INT32_TAG, JS_HANDLE_TAG, POINTER_MASK, POINTER_TAG,
     SHORT_STRING_DATA_MASK, SHORT_STRING_LEN_MASK, SHORT_STRING_LEN_SHIFT, SHORT_STRING_TAG,
-    STRING_TAG, TAG_FALSE, TAG_HOLE, TAG_MASK, TAG_NULL, TAG_TRUE, TAG_UNDEFINED,
+    STRING_TAG, TAG_FALSE, TAG_HOLE, TAG_MASK, TAG_NULL, TAG_TDZ, TAG_TRUE, TAG_UNDEFINED,
 };
 pub use tags::{
     JS_HANDLE_CALL_METHOD, JS_HANDLE_TYPEOF, JS_NATIVE_ASYNC_HOOKS_CONSTRUCT,
@@ -103,8 +103,9 @@ pub use nanbox::{
 // ----- Dynamic arithmetic dispatch (BigInt vs float) -----
 pub use dynamic_arith::{
     js_dynamic_add, js_dynamic_bitand, js_dynamic_bitor, js_dynamic_bitxor, js_dynamic_div,
-    js_dynamic_mod, js_dynamic_mul, js_dynamic_neg, js_dynamic_shl, js_dynamic_shr,
-    js_dynamic_string_or_number_add, js_dynamic_sub, js_numeric_step, js_to_numeric,
+    js_dynamic_mod, js_dynamic_mul, js_dynamic_neg, js_dynamic_pow, js_dynamic_shl,
+    js_dynamic_shr, js_dynamic_string_or_number_add, js_dynamic_sub, js_dynamic_ushr,
+    js_numeric_step, js_to_numeric,
 };
 
 // ----- Dynamic index get/set + bare-NaN check -----
@@ -113,7 +114,8 @@ pub use dyn_index::{js_dyn_index_get, js_dyn_index_set, js_is_undefined_or_bare_
 // ----- to-string conversion helpers -----
 pub(crate) use to_string::{
     coerce_validate_radix, function_to_primitive_for_add, function_to_string_method_result,
-    ordinary_to_primitive_number_for_add, to_primitive_number, OrdinaryToPrimitiveOutcome,
+    ordinary_to_primitive_for_toprimitive, ordinary_to_primitive_number_for_add,
+    to_primitive_number, OrdinaryToPrimitiveOutcome,
 };
 pub use to_string::{
     js_ensure_string_ptr, js_jsvalue_to_string, js_jsvalue_to_string_coerce,

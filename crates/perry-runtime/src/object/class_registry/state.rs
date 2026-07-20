@@ -108,6 +108,19 @@ pub(crate) fn class_own_enumerable_field_names(class_id: u32) -> Vec<String> {
     })
 }
 
+/// True when `name` is an own static data property (a static field, or a
+/// runtime `C.x = …` assignment) recorded in `CLASS_DYNAMIC_PROPS`. Presence
+/// only — does not read the value, so it never invokes a static getter. Used by
+/// the `in` operator on a class ref (#6149).
+pub(crate) fn class_has_own_dynamic_prop(class_id: u32, name: &str) -> bool {
+    CLASS_DYNAMIC_PROPS.with(|m| {
+        m.borrow()
+            .get(&class_id)
+            .map(|props| props.contains_key(name))
+            .unwrap_or(false)
+    })
+}
+
 pub(crate) fn class_delete_own_dynamic_prop(class_id: u32, name: &str) {
     CLASS_DYNAMIC_PROPS.with(|m| {
         if let Some(props) = m.borrow_mut().get_mut(&class_id) {
@@ -301,6 +314,47 @@ pub static CLASS_PARENT_CLOSURES: RwLock<Option<HashMap<u32, usize>>> = RwLock::
 /// undefined"). Stored as raw `u64` bits (Send + Sync), covering both ClassRef
 /// (INT32-tagged) and object/closure (POINTER-tagged) parents.
 pub static CLASS_DYNAMIC_PARENT_VALUE: RwLock<Option<HashMap<u32, u64>>> = RwLock::new(None);
+
+/// #6530: maps a template class_id to the raw NaN-boxed POINTER bits of the
+/// per-evaluation CLASS OBJECT the class statement materialized as (marked by
+/// `js_object_mark_class`). A capture-carrying class has no INT32 ClassRef
+/// value at runtime — the class VALUE is this heap object — so
+/// `instance.constructor` must hand back the same object the module scope /
+/// exports hold, or identity checks (`x.constructor === Sub`, bundled zod's
+/// `describe()` re-construction via `this.constructor`) break. Last-wins
+/// across evaluations of the same class statement, matching the template-cid
+/// compromise used by the sibling tables above.
+pub static CLASS_OBJECT_VALUES: RwLock<Option<HashMap<u32, u64>>> = RwLock::new(None);
+
+/// Store the marked class object for its template class id (see
+/// `CLASS_OBJECT_VALUES`).
+pub(crate) fn class_object_value_root_store(class_id: u32, obj_ptr: *mut ObjectHeader) {
+    if class_id == 0 || obj_ptr.is_null() {
+        return;
+    }
+    let bits = crate::value::js_nanbox_pointer(obj_ptr as i64).to_bits();
+    let mut guard = CLASS_OBJECT_VALUES.write().unwrap();
+    if guard.is_none() {
+        *guard = Some(HashMap::new());
+    }
+    guard.as_mut().unwrap().insert(class_id, bits);
+    crate::gc::runtime_write_barrier_root_raw_ptr(obj_ptr);
+}
+
+/// Read back the class object registered for `class_id`, or `None` when the
+/// class never materialized as a per-evaluation object (ordinary
+/// ClassRef-valued classes).
+pub(crate) fn class_object_value_for_cid(class_id: u32) -> Option<f64> {
+    if class_id == 0 {
+        return None;
+    }
+    CLASS_OBJECT_VALUES.read().ok().and_then(|guard| {
+        guard
+            .as_ref()
+            .and_then(|map| map.get(&class_id).copied())
+            .map(f64::from_bits)
+    })
+}
 
 pub(crate) fn class_prototype_object_root_store(class_id: u32, proto_ptr: *mut ObjectHeader) {
     if class_id == 0 || proto_ptr.is_null() {

@@ -33,8 +33,9 @@ pub(crate) use call_inliner::inline_calls_in_stmts;
 pub(crate) use clamp::{is_clamp3, is_clamp_u8};
 pub(crate) use closure_analysis::{
     body_contains_closure_capturing, body_contains_super_call, body_references_dynamic_this,
-    collect_closure_captured_local_ids, collect_mutated_local_ids, find_max_local_id,
-    has_simple_control_flow, is_pure_function, method_body_blocks_this_substitution,
+    collect_closure_captured_local_ids, collect_declared_local_ids, collect_mutated_local_ids,
+    find_max_local_id, has_simple_control_flow, is_pure_function,
+    method_body_blocks_this_substitution,
 };
 pub(crate) use exact_receivers::{
     apply_exact_receiver_stmt_effect, apply_exact_receiver_stmt_effects,
@@ -215,7 +216,7 @@ pub fn inline_functions(
                     }
                 }
                 Stmt::Labeled { body, .. } => walk_stmt_exprs(body.as_ref(), f),
-                Stmt::PreallocateBoxes(_) => {}
+                Stmt::PreallocateBoxes(_) | Stmt::PreallocateTdzBoxes(_) => {}
             }
         }
 
@@ -708,6 +709,7 @@ mod tests {
             args: Vec::new(),
             type_args: Vec::new(),
             byte_offset: 0,
+            cap_args_appended: 0,
         })
     }
 

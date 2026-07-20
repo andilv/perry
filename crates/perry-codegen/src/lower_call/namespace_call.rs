@@ -29,7 +29,10 @@ pub fn try_lower_namespace_member_call(
     // through `js_closure_callN`. If it's a function declaration
     // (`export function make(s)`), call the symbol directly with rest
     // bundling — same as the existing FuncRef path.
-    let Expr::PropertyGet { object, property } = callee else {
+    let Expr::PropertyGet {
+        object, property, ..
+    } = callee
+    else {
         return Ok(None);
     };
     let Expr::ExternFuncRef { name: ns_name, .. } = object.as_ref() else {
@@ -257,11 +260,18 @@ pub fn try_lower_namespace_member_call(
             ctx, &specifier, property, &lowered,
         )));
     }
-    // Issue #678: re-exported names (e.g. `export { default as
+    // Issue #678/#5924: re-exported names (e.g. `export { default as
     // render }`) emit `perry_fn_<src>__default` in the origin —
     // resolve the actual origin suffix before forming the symbol.
-    let origin_suffix =
-        crate::expr::import_origin_suffix(ctx.import_function_origin_names, property);
+    // Namespace-scoped lookup first so a rename in a different namespace
+    // imported into this file can't clobber this namespace's unrenamed
+    // member of the same name.
+    let origin_suffix = crate::expr::import_origin_suffix_ns(
+        ctx.import_function_origin_names,
+        ctx.namespace_member_origin_names,
+        ns_name,
+        property,
+    );
     let symbol = format!("perry_fn_{}__{}", source_prefix, origin_suffix);
     if ctx.imported_vars.contains(property) {
         // Var-shaped export: fetch closure via zero-arg

@@ -172,7 +172,9 @@ fn test_native_module_binding_value_named_import() {
     );
     let value = super::lower_expr::native_module_binding_value(&ctx, "relative");
     match value {
-        crate::ir::Expr::PropertyGet { object, property } => {
+        crate::ir::Expr::PropertyGet {
+            object, property, ..
+        } => {
             assert_eq!(property, "relative");
             assert!(matches!(*object, crate::ir::Expr::NativeModuleRef(ref m) if m == "path"));
         }
@@ -429,4 +431,120 @@ fn test_lower_accepts_chain_under_limit() {
             "a chain under the depth ceiling must lower without error"
         );
     });
+}
+
+/// A `class A extends Base` whose parent Ident is an in-scope LEXICAL LOCAL
+/// (a `let`/`const`/param), not a class, must be lowered with NO static
+/// `extends_name` — the parent is resolved purely dynamically via
+/// `extends_expr`. Retaining a static `extends_name` lets the codegen
+/// parent-chain walks (packed-keys field layout, `js_register_class_parent`
+/// edge, inherited-method / vtable install, type-facts) re-resolve the bare
+/// name through the module-wide name→class map to an UNRELATED same-named class
+/// — e.g. a function-local `class Base` that leaked into that map — corrupting
+/// the subclass's field layout and inheritance. (Regression: a large minified
+/// program's zod `let Y=_?.Parent??Object; class A extends Y{}` wrongly
+/// inherited a captured iterator class `Y`'s private `#q`, throwing "Cannot
+/// access private member from an object whose class did not declare it".)
+#[test]
+fn test_lexically_shadowed_heritage_drops_static_extends_name() {
+    let source = r#"
+        function make(spec) {
+            let Base = (spec && spec.Parent) || Object;
+            class A extends Base {}
+            return A;
+        }
+    "#;
+    let module = perry_parser::parse_typescript(source, "t.ts").expect("source parses");
+    let hir = super::lower_module(&module, "t", "t.ts").expect("source lowers");
+    let a = hir
+        .classes
+        .iter()
+        .find(|c| c.name == "A")
+        .expect("class A is lowered");
+    assert!(
+        a.heritage_lexically_shadowed,
+        "`Base` is a lexical local, so `class A extends Base` is lexically shadowed"
+    );
+    assert_eq!(
+        a.extends_name, None,
+        "a lexically-shadowed heritage must NOT retain a static extends_name — \
+         it would re-resolve to an unrelated same-named class"
+    );
+    assert_eq!(
+        a.extends, None,
+        "no static parent class id for a dynamically-resolved parent"
+    );
+    assert!(
+        a.extends_expr.is_some(),
+        "the parent is resolved dynamically via extends_expr"
+    );
+}
+
+/// A normal subclass whose parent is a CLASS DECLARATION (not a local) is
+/// unaffected by the shadowed-heritage handling: class declarations are not in
+/// `ctx.locals`, so the heritage is NOT lexically shadowed and static parent
+/// resolution (field/method inheritance) is preserved.
+#[test]
+fn test_plain_class_to_class_heritage_keeps_static_extends_name() {
+    let source = r#"
+        class Base { x = 1; }
+        class Sub extends Base { y = 2; }
+    "#;
+    let module = perry_parser::parse_typescript(source, "t.ts").expect("source parses");
+    let hir = super::lower_module(&module, "t", "t.ts").expect("source lowers");
+    let sub = hir
+        .classes
+        .iter()
+        .find(|c| c.name == "Sub")
+        .expect("class Sub is lowered");
+    assert!(
+        !sub.heritage_lexically_shadowed,
+        "a class-declaration parent is not a lexical local"
+    );
+    assert_eq!(
+        sub.extends_name.as_deref(),
+        Some("Base"),
+        "static class-to-class heritage keeps its extends_name"
+    );
+}
+
+/// #6679: a NAMED class EXPRESSION's `.name` is its own explicit name
+/// (`Named` in `const B = class Named {}`), not the outer binding name. Per
+/// spec a named class expression is not an anonymous function definition, so
+/// the assignment's NamedEvaluation (`SetFunctionName` from `const B =`) must
+/// not clobber the declared name. The module-top-level `const X = class {…}`
+/// fast path registers the class under the binding name so `new B()` /
+/// `instanceof B` resolve statically, and records a `class_display_names`
+/// override to the explicit name for codegen to emit as `.name`. An ANONYMOUS
+/// `const A = class {}` takes the inferred binding name and needs no override.
+#[test]
+fn test_named_class_expression_var_decl_reports_explicit_name() {
+    let source = r#"
+        const B = class Named {};
+        const A = class {};
+    "#;
+    let module = perry_parser::parse_typescript(source, "t.ts").expect("source parses");
+    let hir = super::lower_module(&module, "t", "t.ts").expect("source lowers");
+
+    let named = hir
+        .classes
+        .iter()
+        .find(|c| c.name == "B")
+        .expect("class registered under binding name `B`");
+    assert_eq!(
+        hir.class_display_names.get(&named.id).map(String::as_str),
+        Some("Named"),
+        "named class expression must report its explicit name as `.name`"
+    );
+
+    let anon = hir
+        .classes
+        .iter()
+        .find(|c| c.name == "A")
+        .expect("anonymous class registered under inferred name `A`");
+    assert_eq!(
+        hir.class_display_names.get(&anon.id),
+        None,
+        "anonymous class expression uses the inferred binding name, no override"
+    );
 }

@@ -15,6 +15,14 @@ thread_local! {
 pub fn app_create(_title_ptr: *const u8, _width: f64, _height: f64) -> i64 {
     // On watchOS, the app is created by the SwiftUI @main struct.
     // We just return a handle to satisfy the API contract.
+    //
+    // Ask for notification authorization once here (mirrors iOS, which prompts
+    // from `PerryAppDelegate.didFinishLaunching`). This runs during
+    // `perry_main_init` on the Swift main thread, before the WatchKit run loop
+    // starts, so the permission dialog fires at launch rather than on the first
+    // `notificationSend`. Keeping it Rust-side avoids editing the fixed
+    // PerryWatchApp.swift template.
+    crate::notifications::request_authorization();
     1
 }
 
@@ -31,12 +39,19 @@ pub fn app_run(_app_handle: i64) {
     // but on watchOS this is a no-op — the Swift @main struct drives the loop.
     //
     // perry_main_init() is called from Swift before the app body is rendered,
-    // so by the time SwiftUI queries the tree, it's fully built.
+    // so by the time SwiftUI queries the tree, it's fully built. Flag the
+    // event loop as host-driven so the generated entry's drain loop exits
+    // instead of parking on live timers — otherwise perry_main_init never
+    // returns and SwiftUI never renders (the shell drives timer ticks).
+    unsafe { js_set_event_loop_host_driven(1) };
     register_cross_platform_text_handlers();
     install_test_mode_exit_timer();
 }
 
 extern "C" {
+    /// Defined in `perry-runtime/src/event_pump.rs`. Tells the generated
+    /// entry's event-drain loop that the Swift shell owns the run loop.
+    fn js_set_event_loop_host_driven(v: i32);
     /// Defined in `perry-runtime/src/ui_text_registry.rs`. Stores the
     /// passed handler in an AtomicPtr that `perry_arkts_show_toast`
     /// consults on each call. No-op when `ohos-napi` is on.

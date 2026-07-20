@@ -91,6 +91,32 @@ pub(crate) fn lower_string_method(
     property: &str,
     args: &[Expr],
 ) -> Result<String> {
+    // A scalar-replaced uppercase local is only admitted when all reads are
+    // covered by fused operations. Preserve the source value in its own slot
+    // and perform `toUpperCase().indexOf("literal")` without allocating the
+    // intermediate JS string.
+    if property == "indexOf"
+        && matches!(args, [Expr::String(_)])
+        && matches!(object, Expr::LocalGet(_))
+    {
+        let Expr::LocalGet(id) = object else {
+            unreachable!();
+        };
+        if let Some(source_slot) = ctx.scalar_replaced_uppercase_sources.get(id).cloned() {
+            let source_box = ctx.block().load(DOUBLE, &source_slot);
+            let needle_box = lower_expr(ctx, &args[0])?;
+            let blk = ctx.block();
+            let source_handle = unbox_str_handle(blk, &source_box);
+            let needle_handle = unbox_str_handle(blk, &needle_box);
+            let result = blk.call(
+                I32,
+                "js_string_to_upper_case_index_of",
+                &[(I64, &source_handle), (I64, &needle_handle)],
+            );
+            return Ok(blk.sitofp(I32, &result, DOUBLE));
+        }
+    }
+
     let recv_box = lower_expr(ctx, object)?;
     // Optimistic any-typed path: `property_get` routes `(x: any).charAt(i)` /
     // `.split(…)` here even when `x` is not statically a string, because most
@@ -103,8 +129,26 @@ pub(crate) fn lower_string_method(
     let recv_box = if is_string_expr(ctx, object) {
         recv_box
     } else {
+        // A nullish receiver must throw the V8 member-access TypeError —
+        // `undefined.charAt(0)` reads `charAt` off `undefined` FIRST (ECMA-262
+        // §13.3), so it throws `Cannot read properties of undefined (reading
+        // 'charAt')` — NOT coerce `undefined`→`"undefined"` like the general
+        // `js_string_coerce`. The guarded helper does RequireObjectCoercible +
+        // ToString; pass the method name for the diagnostic.
+        let prop_idx = ctx.strings.intern(property);
+        let (prop_global, prop_len) = {
+            let entry = ctx.strings.entry(prop_idx);
+            (
+                format!("@{}", entry.bytes_global),
+                entry.byte_len.to_string(),
+            )
+        };
         let blk = ctx.block();
-        let coerced = blk.call(I64, "js_string_coerce", &[(DOUBLE, &recv_box)]);
+        let coerced = blk.call(
+            I64,
+            "js_string_coerce_method_this",
+            &[(DOUBLE, &recv_box), (PTR, &prop_global), (I64, &prop_len)],
+        );
         nanbox_string_inline(blk, &coerced)
     };
 
@@ -227,6 +271,22 @@ pub(crate) fn lower_string_method(
                     "perry-codegen: String.split expects 0, 1, or 2 args (delimiter[, limit]), got {}",
                     args.len()
                 );
+            }
+            // A literal separator with no `limit` cannot invoke user code,
+            // cannot be a RegExp, and has the unbounded limit directly
+            // expressible by `js_string_split_n`. Avoid the boxed dispatch and
+            // its coercion/undefined/RegExp checks for this common hot path.
+            if args.len() == 1 && matches!(&args[0], Expr::String(_) | Expr::WtfString(_)) {
+                let delim_box = lower_expr(ctx, &args[0])?;
+                let blk = ctx.block();
+                let recv_handle = unbox_str_handle(blk, &recv_box);
+                let delim_handle = unbox_str_handle(blk, &delim_box);
+                let result_arr = blk.call(
+                    I64,
+                    "js_string_split_n",
+                    &[(I64, &recv_handle), (I64, &delim_handle), (I32, "-1")],
+                );
+                return Ok(crate::expr::nanbox_pointer_inline(blk, &result_arr));
             }
             // Route through `js_string_split_value`, which takes the BOXED
             // separator and limit and performs the full spec coercion:
@@ -803,7 +863,22 @@ pub(crate) fn lower_string_method(
             };
             let blk = ctx.block();
             if let Some(loc) = &locales_box {
-                blk.call_void("js_string_validate_locales", &[(DOUBLE, loc)]);
+                // Validate `(locales, options)` exactly as `Construct(%Collator%,
+                // «locales, options»)` would — CanonicalizeLocaleList then the
+                // InitializeCollator GetOption reads — for the throwing side effect
+                // only; collation ordering stays locale-neutral (#2781, #5906).
+                let undef;
+                let opts_ref = match &options_box {
+                    Some(o) => o,
+                    None => {
+                        undef = blk.bitcast_i64_to_double(crate::nanbox::TAG_UNDEFINED_I64);
+                        &undef
+                    }
+                };
+                blk.call_void(
+                    "js_string_validate_collator_args",
+                    &[(DOUBLE, loc), (DOUBLE, opts_ref)],
+                );
             }
             let blk = ctx.block();
             let recv_handle = unbox_str_handle(blk, &recv_box);

@@ -635,7 +635,20 @@ pub unsafe extern "C" fn js_node_http_im_on(
                 encoding_to_emit = im.encoding.clone();
                 should_emit_end = false;
             }
-            "end" if !im.paused && !im.end_emitted => {
+            // Node fires `'end'` at every registered listener; the one-shot
+            // `!im.end_emitted` guard fired only the FIRST `req.on('end', …)`
+            // and silently dropped every later one (stored but never invoked).
+            // A single request stream routinely carries multiple `'end'`
+            // listeners — e.g. Next.js `getCloneableBody` (body-streams.js)
+            // attaches its body-drain `endPromise` resolver as a *second*
+            // `'end'` listener, so on routes that clone the request body that
+            // promise never resolved and the request hung. Fire the
+            // just-registered callback on every non-paused registration; the
+            // buffered request body is already complete when the handler runs,
+            // so each late listener observes `'end'` exactly once. `end_emitted`
+            // still latches so the bulk `resume()`/reaper emit paths (which gate
+            // on it) never double-fire an already-invoked listener.
+            "end" if !im.paused => {
                 im.end_emitted = true;
                 im.complete = true;
                 body_to_emit = None;
@@ -689,22 +702,39 @@ pub extern "C" fn js_node_http_im_set_timeout(handle: i64, _msecs: f64, _callbac
 /// `null` thereafter.
 #[no_mangle]
 pub extern "C" fn js_node_http_im_read(handle: i64) -> f64 {
-    let bytes = match get_handle_mut::<IncomingMessage>(handle) {
+    let (bytes, encoding) = match get_handle_mut::<IncomingMessage>(handle) {
         Some(im) => {
             if im.data_emitted {
                 return f64::from_bits(crate::types::TAG_NULL);
             }
             im.data_emitted = true;
-            im.body_bytes.clone()
+            (im.body_bytes.clone(), im.encoding.clone())
         }
         None => return f64::from_bits(crate::types::TAG_NULL),
     };
     if bytes.is_empty() {
         return f64::from_bits(crate::types::TAG_NULL);
     }
-    let s = String::from_utf8_lossy(&bytes).into_owned();
-    let header = alloc_string(&s);
-    f64::from_bits(STRING_TAG | (header.as_raw() as u64 & PTR_MASK))
+    // #5437 POST-body: Node's `req.read()` returns a Buffer by default and a
+    // string only after `setEncoding()`. `Readable.toWeb(req)` (Next.js App
+    // Router's request-body adapter) and the Web `Request` body reader require
+    // Uint8Array/Buffer chunks — a string chunk is dropped, so `request.json()`
+    // saw `{}`. Mirror `emit_data_to_listeners`: Buffer by default, string only
+    // when an encoding was set.
+    match encoding {
+        Some(_) => {
+            let s = String::from_utf8_lossy(&bytes).into_owned();
+            let header = alloc_string(&s);
+            f64::from_bits(STRING_TAG | (header.as_raw() as u64 & PTR_MASK))
+        }
+        None => {
+            let buf = alloc_buffer(&bytes);
+            if buf.is_null() {
+                return f64::from_bits(crate::types::TAG_NULL);
+            }
+            f64::from_bits(POINTER_TAG | (buf as u64 & PTR_MASK))
+        }
+    }
 }
 
 // ============================================================================

@@ -61,17 +61,12 @@ pub extern "C" fn js_regexp_exec(
         // read above only drives the search start for a stateful regex.
         let last_index = if use_last_index { last_index_read } else { 0 };
 
+        // `lastIndex` is a JS string index — UTF-16 code units, like
+        // `str.length` — so map it back through the UTF-16 ↔ byte conversion
+        // rather than counting `chars()` (which walks one step per astral
+        // scalar instead of two, over-shooting the intended start).
         let search_start_byte = if use_last_index && last_index > 0 {
-            let mut byte_off = 0;
-            let mut char_count = 0;
-            for ch in str_data.chars() {
-                if char_count >= last_index {
-                    break;
-                }
-                byte_off += ch.len_utf8();
-                char_count += 1;
-            }
-            byte_off
+            super::exec_array::utf16_index_to_byte(str_data, last_index)
         } else {
             0
         };
@@ -88,11 +83,13 @@ pub extern "C" fn js_regexp_exec(
         let search_str = &str_data[search_start_byte..];
 
         // Check if this regex has a fancy-regex fallback (lookbehind/lookahead).
-        let fancy_captures = FANCY_CACHE.with(|fc| {
-            let fc = fc.borrow();
-            let pat = string_as_str((*re).pattern_ptr);
-            let flags_str = string_as_str((*re).flags_ptr);
-            if let Some(fre) = fc.get(&(pat.to_string(), flags_str.to_string())) {
+        // Resolved via `lookup_fancy_regex` — the header-resident owned Arc
+        // first, the thread-local FANCY_CACHE second — so the capped cache
+        // (see `REGEX_CACHE_MAX_ENTRIES`) clearing between compile and exec
+        // cannot strand a live fancy regex on the never-matching std
+        // placeholder.
+        let fancy_captures = (|| {
+            if let Some(fre) = lookup_fancy_regex(re) {
                 if let Ok(Some(caps)) = fre.captures(search_str) {
                     let full = caps.get(0).unwrap();
                     // Sticky (`y`) requires the match to start exactly at
@@ -101,7 +98,8 @@ pub extern "C" fn js_regexp_exec(
                         return Some(ptr::null_mut());
                     }
                     let match_byte_offset = full.start() + search_start_byte;
-                    let match_char_offset = str_data[..match_byte_offset].chars().count();
+                    let match_char_offset =
+                        super::exec_array::byte_index_to_utf16_index(str_data, match_byte_offset);
                     let arr = crate::array::js_array_alloc(caps.len() as u32);
                     let scope = crate::gc::RuntimeHandleScope::new();
                     let arr_handle = scope.root_raw_mut_ptr(arr);
@@ -120,8 +118,11 @@ pub extern "C" fn js_regexp_exec(
                         }
                     }
                     if use_last_index {
-                        let match_str = full.as_str();
-                        set_last_index_throwing(re, match_char_offset + match_str.chars().count());
+                        let match_end_byte = full.end() + search_start_byte;
+                        set_last_index_throwing(
+                            re,
+                            super::exec_array::byte_index_to_utf16_index(str_data, match_end_byte),
+                        );
                     }
                     set_exec_array_metadata(
                         arr_handle.get_raw_mut_ptr::<ArrayHeader>(),
@@ -132,7 +133,7 @@ pub extern "C" fn js_regexp_exec(
                     // Extract named-capture groups through the fancy path so
                     // `/(?<=x)(?<y>\d+)/.exec(s).groups` works for patterns the
                     // `regex` crate can't compile.
-                    let groups_obj = build_fancy_groups(fre, &caps, &scope);
+                    let groups_obj = build_fancy_groups(&fre, &caps, &scope);
                     LAST_EXEC_GROUPS.with(|g| *g.borrow_mut() = groups_obj);
                     set_exec_array_groups(arr_handle.get_raw_mut_ptr::<ArrayHeader>(), groups_obj);
                     // Build indices array if `d` flag (hasIndices) is set
@@ -141,7 +142,7 @@ pub extern "C" fn js_regexp_exec(
                             arr_handle.get_raw_mut_ptr::<ArrayHeader>(),
                             str_data,
                             search_start_byte,
-                            fre,
+                            &fre,
                             &caps,
                         );
                     }
@@ -150,7 +151,7 @@ pub extern "C" fn js_regexp_exec(
                 return Some(ptr::null_mut()); // fancy-regex tried but no match
             }
             None // no fancy fallback — use standard regex
-        });
+        })();
         if let Some(result) = fancy_captures {
             if result.is_null() {
                 if use_last_index {
@@ -171,11 +172,13 @@ pub extern "C" fn js_regexp_exec(
         match standard_caps {
             Some(caps) => {
                 let match_byte_offset = caps.get(0).unwrap().start() + search_start_byte;
-                let match_char_offset = str_data[..match_byte_offset].chars().count();
+                let match_char_offset =
+                    super::exec_array::byte_index_to_utf16_index(str_data, match_byte_offset);
 
                 if use_last_index {
                     let match_end_byte = caps.get(0).unwrap().end() + search_start_byte;
-                    let match_end_char = str_data[..match_end_byte].chars().count();
+                    let match_end_char =
+                        super::exec_array::byte_index_to_utf16_index(str_data, match_end_byte);
                     set_last_index_throwing(re, match_end_char);
                 }
 
@@ -190,23 +193,28 @@ pub extern "C" fn js_regexp_exec(
                         let str_ptr = js_string_from_str(m.as_str());
                         let nanboxed = js_nanbox_string(str_ptr as i64);
                         let arr = arr_handle.get_raw_mut_ptr::<ArrayHeader>();
-                        // GC_STORE_AUDIT(BARRIERED): regex exec capture slot uses the shared array slot-store helper.
-                        crate::array::store_array_slot(arr, i, nanboxed.to_bits());
+                        // GC_STORE_AUDIT(INIT): fresh exec-array slot; layout is
+                        // noted per store and the exact layout/barrier rebuild
+                        // below the loop covers a mid-loop tenuring (#6386).
+                        crate::array::note_array_slot_layout_only(arr, i, nanboxed.to_bits());
                     } else {
                         let undefined = f64::from_bits(TAG_UNDEFINED);
                         let arr = arr_handle.get_raw_mut_ptr::<ArrayHeader>();
-                        // GC_STORE_AUDIT(BARRIERED): regex exec unmatched capture slot uses the shared array slot-store helper.
-                        crate::array::store_array_slot(arr, i, undefined.to_bits());
+                        // GC_STORE_AUDIT(INIT): fresh exec-array slot; see above.
+                        crate::array::note_array_slot_layout_only(arr, i, undefined.to_bits());
                     }
                 }
+                // GC_STORE_AUDIT(BARRIERED): one exact rebuild replays any
+                // old-gen barriers for the whole capture prefix.
+                crate::array::rebuild_array_layout_exact(
+                    arr_handle.get_raw_mut_ptr::<ArrayHeader>(),
+                );
 
                 // Store .index in thread-local
                 LAST_EXEC_INDEX.with(|idx| *idx.borrow_mut() = match_char_offset as f64);
-                set_exec_array_metadata(
-                    arr_handle.get_raw_mut_ptr::<ArrayHeader>(),
-                    str_data,
-                    match_char_offset as f64,
-                );
+                // .index/.input attach via the combined fresh-array decoration
+                // below (#6386): one side-table probe for index/input/groups
+                // and a re-boxed (not copied) subject string.
 
                 // Build groups object if named captures exist
                 let group_names: Vec<(&str, Option<regex::Match>)> = regex
@@ -242,14 +250,18 @@ pub extern "C" fn js_regexp_exec(
                         *g.borrow_mut() =
                             groups_handle.get_raw_mut_ptr::<crate::object::ObjectHeader>()
                     });
-                    set_exec_array_groups(
+                    super::exec_array::set_exec_array_metadata_groups_fresh(
                         arr_handle.get_raw_mut_ptr::<ArrayHeader>(),
+                        s,
+                        match_char_offset as f64,
                         groups_handle.get_raw_mut_ptr::<crate::object::ObjectHeader>(),
                     );
                 } else {
                     LAST_EXEC_GROUPS.with(|g| *g.borrow_mut() = ptr::null_mut());
-                    set_exec_array_groups(
+                    super::exec_array::set_exec_array_metadata_groups_fresh(
                         arr_handle.get_raw_mut_ptr::<ArrayHeader>(),
+                        s,
+                        match_char_offset as f64,
                         ptr::null_mut(),
                     );
                 }

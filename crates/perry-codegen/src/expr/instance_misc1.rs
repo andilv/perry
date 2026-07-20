@@ -63,6 +63,10 @@ pub(crate) fn builtin_parent_reserved_class_id(name: &str) -> Option<u32> {
         "AggregateError" => 0xFFFF0014,
         "EvalError" => 0xFFFF0015,
         "URIError" => 0xFFFF0016,
+        // #6364 — keep in sync with the `lower_instanceof` match above and
+        // `CLASS_ID_SUPPRESSED_ERROR` so `class X extends SuppressedError {}`
+        // walks the parent edge and `new X() instanceof SuppressedError` holds.
+        "SuppressedError" => 0xFFFF003E,
         "Date" => 0xFFFF0020,
         "RegExp" => 0xFFFF0021,
         "Map" => 0xFFFF0022,
@@ -329,6 +333,22 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     ));
                 }
             }
+            // A known non-constructor built-in namespace RHS (`Math`, `JSON`,
+            // `Reflect`, `Atomics`) has no [[Call]]/[[Construct]], so
+            // `x instanceof Math` throws a TypeError rather than folding to
+            // `false`. These never map to a real class id, so without this they
+            // would take the `cid == 0` → `js_instanceof(_, 0)` → `false` path.
+            // The LHS `v` was already lowered above (its side effects run), so
+            // just emit the throwing helper. Only fires for a bare identifier
+            // RHS (no member/dynamic `ty_expr`) that isn't shadowed by a user
+            // binding — a user `const Math = class {}` lands in `class_ids`.
+            if matches!(ty.as_str(), "Math" | "JSON" | "Reflect" | "Atomics")
+                && !ctx.class_ids.contains_key(ty)
+            {
+                return Ok(ctx
+                    .block()
+                    .call(DOUBLE, "js_instanceof_noncallable_rhs", &[]));
+            }
             // Built-in Error subclasses have reserved CLASS_ID_* constants
             // in the runtime (see crates/perry-runtime/src/error.rs). Map
             // them by name here so `e instanceof TypeError` works even
@@ -343,7 +363,16 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 .get(ty)
                 .map(|source| source.strip_prefix("node:").unwrap_or(source) == "net")
                 .unwrap_or(false);
+            // #6003: a user-defined class lexically shadows a same-named
+            // built-in (`class Headers {}` vs the fetch global), so the
+            // bare-identifier RHS must resolve to the USER class id before
+            // the reserved built-in mapping below. `class_ids` holds only
+            // user classes (local `hir.classes` + cross-module imported
+            // user classes); plain built-in names never appear in it, so
+            // unshadowed built-ins keep their reserved ids.
+            let user_cid = ctx.class_ids.get(ty).copied();
             let cid = match ty.as_str() {
+                _ if user_cid.is_some() => user_cid.unwrap(),
                 "Error" => 0xFFFF0001u32,
                 "TypeError" => 0xFFFF0010u32,
                 "RangeError" => 0xFFFF0011u32,
@@ -352,6 +381,12 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 "AggregateError" => 0xFFFF0014u32,
                 "EvalError" | "globalThis.EvalError" => 0xFFFF0015u32,
                 "URIError" | "globalThis.URIError" => 0xFFFF0016u32,
+                // #6364 — SuppressedError (TC39 explicit-resource-management).
+                // Must match `CLASS_ID_SUPPRESSED_ERROR` in
+                // perry-runtime/src/disposable.rs. The instance is a
+                // GC_TYPE_OBJECT carrying this class id, so the runtime
+                // class-id chain fast-path matches it (see instanceof.rs).
+                "SuppressedError" => 0xFFFF003Eu32,
                 // Uint8Array / Buffer — runtime detects these via a
                 // thread-local buffer registry (see buffer.rs). The
                 // TextEncoder path registers its ArrayHeader result
@@ -454,6 +489,12 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 "Event" | "globalThis.Event" => 0xFFFF2403u32,
                 "CustomEvent" | "globalThis.CustomEvent" => 0xFFFF2404u32,
                 "DOMException" | "globalThis.DOMException" => 0xFFFF2405u32,
+                // #6301. Keep in sync with
+                // perry-runtime/src/event_target.rs::CLASS_ID_EVENT_TARGET.
+                // A plain `new EventTarget()` carries this id on its header; a
+                // `class X extends EventTarget` instance reaches it through the
+                // parent edge the class registry wires at definition time.
+                "EventTarget" | "globalThis.EventTarget" => 0xFFFF2406u32,
                 // node:fs constructor exports. Keep these ids in sync with
                 // perry-runtime/src/fs/mod.rs and instanceof.rs.
                 "fs.Dir" => 0xFFFF0086u32,
@@ -625,7 +666,9 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     blk.call_void("js_removeenv", &[(I64, &key_handle)]);
                     Ok(blk.bitcast_i64_to_double(crate::nanbox::TAG_TRUE_I64))
                 }
-                Expr::PropertyGet { object, property } => {
+                Expr::PropertyGet {
+                    object, property, ..
+                } => {
                     let obj_box = lower_expr(ctx, object)?;
                     // `delete null.x` / `delete undefined.x` → TypeError. The
                     // `delete` algorithm calls `ToObject(GetBase)` on a property

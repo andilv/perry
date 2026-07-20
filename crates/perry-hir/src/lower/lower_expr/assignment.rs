@@ -4,7 +4,7 @@
 use super::*;
 use crate::lower::*;
 use anyhow::{anyhow, Result};
-use perry_types::{LocalId, Type};
+use perry_types::LocalId;
 use swc_common::Spanned;
 use swc_ecma_ast as ast;
 
@@ -17,68 +17,19 @@ pub(crate) fn lower_expr_assignment(
     value: Box<Expr>,
 ) -> Result<Expr> {
     match expr {
+        // #6300: identifier stores — including the ones reached by unwrapping a
+        // parenthesized / TS-cast assignment target below — go through the one
+        // shared helper, so the `const`-immutability check can't be bypassed by
+        // writing `(c as any) = 9` instead of `c = 9`.
         ast::Expr::Ident(ident) => {
-            let name = ident.sym.to_string();
-            if let Some(env_id) = ctx.active_with_envs_for_ident(&name).into_iter().next() {
-                let fallback = with_set_fallback_for_ident(ctx, &name);
-                return Ok(Expr::WithSet {
-                    object: Box::new(Expr::LocalGet(env_id)),
-                    property: name,
-                    value,
-                    fallback,
-                    strict: ctx.current_strict,
-                });
-            }
-            if let Some(id) = ctx.lookup_local(&name) {
-                Ok(Expr::LocalSet(id, value))
-            } else if ctx.lookup_class(&name).is_some() || ctx.lookup_func(&name).is_some() {
-                // v0.5.757: don't shadow a class/function binding with an
-                // implicit local for `<Name> = X` patterns. Drizzle's
-                // sql.js uses `((sql2) => { ... })(sql || (sql = {}))` —
-                // the binding exists (truthy), the OR short-circuits, and
-                // the assignment is dead. Pre-fix the implicit local hid
-                // the original binding from later reads. Just evaluate
-                // the RHS for side effects. Refs #420.
-                Ok(*value)
-            } else {
-                if ctx.current_strict {
-                    return Ok(Expr::Sequence(vec![
-                        *value,
-                        throw_reference_error_expr(
-                            "js_throw_reference_error_unresolved_assignment",
-                        ),
-                    ]));
-                }
-                eprintln!(
-                    "  Warning: Assignment to undeclared variable '{}', creating sloppy global",
-                    name
-                );
-                // Sloppy implicit global: the binding IS a property of
-                // globalThis (spec CreateGlobalVarBinding on the global
-                // object), so `foo = 1` must be visible as
-                // `globalThis.foo`, write through to a pre-existing global
-                // property, and observe a later `delete globalThis.foo`.
-                // Reads of the name resolve through the
-                // `js_global_get_or_throw_unresolved` fallback, so no
-                // module-local shadow may be created here (a stale local
-                // would keep serving deleted/overwritten values).
-                // NOTE: `GlobalGet(0)` alone is a by-name routing SENTINEL in
-                // codegen (bare reads lower to 0.0) — the write must target
-                // the VALUE globalThis, which the `PropertyGet { GlobalGet(0),
-                // "globalThis" }` shape resolves to the real global object.
-                Ok(Expr::PropertySet {
-                    object: Box::new(Expr::PropertyGet {
-                        object: Box::new(Expr::GlobalGet(0)),
-                        property: "globalThis".to_string(),
-                    }),
-                    property: name,
-                    value,
-                })
-            }
+            crate::lower::expr_assign::lower_ident_assignment(ctx, ident.sym.to_string(), value)
         }
         ast::Expr::Member(member) => {
             if let ast::Expr::Ident(obj_ident) = member.obj.as_ref() {
-                let obj_name = obj_ident.sym.to_string();
+                // #5938 follow-up: resolve scope-local class renames so a
+                // colliding body-local `class X`'s static write targets the
+                // renamed registrant, not the first same-named one.
+                let obj_name = ctx.resolve_class_name(obj_ident.sym.as_ref());
                 if ctx.lookup_class(&obj_name).is_some() {
                     if let ast::MemberProp::Ident(prop_ident) = &member.prop {
                         let field_name = prop_ident.sym.to_string();

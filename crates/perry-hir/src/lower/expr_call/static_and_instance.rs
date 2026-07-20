@@ -149,7 +149,16 @@ pub(super) fn try_static_method_and_instance(
                     .next()
                     .map(|c| c.is_uppercase())
                     .unwrap_or(false);
-            if !local_shadows_class && (ctx.lookup_class(&obj_name).is_some() || is_imported_upper)
+            // #5938 follow-up: a body-local `class X` colliding with an
+            // outer/prior `class X` is registered under a scope-local rename
+            // (`class_renames`), and a later `X.method()` in the same body
+            // must dispatch to the RENAMED class — the raw name binds the
+            // FIRST same-named registrant (factory B's `e.who()` read factory
+            // A's decl-site snapshot). Imports keep the raw name: a renamed
+            // class is by construction body-local, never imported.
+            let resolved_class = ctx.resolve_class_name(&obj_name);
+            if !local_shadows_class
+                && (ctx.lookup_class(&resolved_class).is_some() || is_imported_upper)
             {
                 match &member.prop {
                     ast::MemberProp::Ident(method_ident) => {
@@ -169,11 +178,12 @@ pub(super) fn try_static_method_and_instance(
                                 args,
                             }));
                         }
-                        if (ctx.has_static_method(&obj_name, &method_name) || is_imported_upper)
+                        if (ctx.has_static_method(&resolved_class, &method_name)
+                            || is_imported_upper)
                             && !static_call_has_spread
                         {
                             return Ok(Ok(Expr::StaticMethodCall {
-                                class_name: obj_name,
+                                class_name: resolved_class,
                                 method_name,
                                 args,
                             }));
@@ -182,10 +192,11 @@ pub(super) fn try_static_method_and_instance(
                     // Private static method: WithPrivateStatic.#helper()
                     ast::MemberProp::PrivateName(priv_ident) => {
                         let method_name = format!("#{}", priv_ident.name);
-                        if ctx.has_static_method(&obj_name, &method_name) && !static_call_has_spread
+                        if ctx.has_static_method(&resolved_class, &method_name)
+                            && !static_call_has_spread
                         {
                             return Ok(Ok(Expr::StaticMethodCall {
-                                class_name: obj_name,
+                                class_name: resolved_class,
                                 method_name,
                                 args,
                             }));
@@ -262,6 +273,22 @@ pub(super) fn try_static_method_and_instance(
                         // Fall through — let the regular method-call
                         // dispatch further down handle the user-class
                         // method.
+                    } else if static_call_has_spread {
+                        // A spread argument (`recv.method(...arr)`) cannot be
+                        // represented in `NativeMethodCall`'s positional `args`:
+                        // the pre-lowered `args` already collapsed the spread
+                        // SOURCE into a single element, and the codegen
+                        // `NA_VARARGS` packer then pushes that array as ONE
+                        // argument instead of flattening it. The static-method
+                        // arms above already guard on `static_call_has_spread`
+                        // for the same reason; the instance arm was missing it.
+                        // Concretely, `AsyncLocalStorage.run(store, cb, ...args)`
+                        // handed the callback a single array instead of its
+                        // forwarded arguments. Fall through to the generic
+                        // `CallSpread` path (function tail `Ok(Err(args))`),
+                        // which materialises + flattens the spread via
+                        // `js_array_concat` before dispatching the native method
+                        // by name.
                     } else {
                         // Get the object expression (the instance variable)
                         let object_expr = lower_expr(ctx, &member.obj)?;
@@ -516,6 +543,14 @@ pub(super) fn try_static_method_and_instance(
                         }
                         ("pg", "connect") => Some("PoolClient"),
                         ("ioredis", "duplicate") => Some("Redis"),
+                        // dayjs / moment manipulation methods return a NEW
+                        // date handle — lets `d.add(7, 'day').format(...)`
+                        // dispatch against the result. "App" matches the
+                        // factory-result registration class.
+                        ("dayjs", "add" | "subtract" | "startOf" | "endOf") => Some("App"),
+                        ("moment", "add" | "subtract" | "startOf" | "endOf" | "clone") => {
+                            Some("App")
+                        }
                         _ => None,
                     };
                 if let Some(result_class) = chained_class {

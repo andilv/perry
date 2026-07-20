@@ -196,9 +196,65 @@ pub extern "C" fn js_box_get_bits(ptr: *mut Box) -> i64 {
             // now see `undefined`.
             return crate::value::TAG_UNDEFINED as i64;
         }
-        (*ptr).value as i64
+        let bits = (*ptr).value;
+        // Temporal Dead Zone: a lexical `let`/`const`/`class` box seeded with
+        // the TAG_TDZ sentinel at scope entry throws a spec ReferenceError when
+        // read before its declaration runs (which overwrites the sentinel with
+        // a real value). TAG_TDZ is a reserved bit pattern no legitimate value
+        // ever holds, so this branch is only ever taken on a genuine
+        // read-before-initialization — making the check zero-regression for
+        // every already-initialized box. The name is passed as `undefined`
+        // because this choke point is name-agnostic (it serves direct,
+        // closure-captured, and compound reads alike); the resulting message is
+        // the spec-generic form.
+        if bits == crate::value::TAG_TDZ {
+            // #6044 regression (#6052): Perry-internal materialization reads —
+            // the class-capture decl-site snapshot refreshes emitted after EACH
+            // captured var's assignment (`RegisterClassCaptures`, the #6037
+            // refresh strategy) — legally observe sibling captures that are
+            // still in their dead zone (`const _fs = ..; <refresh reads _path>;
+            // const _path = ..`, the SWC CJS interop shape). Those are not user
+            // reads: pre-TDZ they snapshotted `undefined` and the next refresh
+            // fixed the value up. Inside the codegen-bracketed suppression
+            // window, keep exactly that behavior instead of throwing.
+            if TDZ_SUPPRESS_DEPTH.with(|d| d.get()) > 0 {
+                return crate::value::TAG_UNDEFINED as i64;
+            }
+            crate::error::js_throw_reference_error_tdz(f64::from_bits(crate::value::TAG_UNDEFINED));
+        }
+        bits as i64
     }
 }
+
+thread_local! {
+    /// #6052: >0 while codegen-emitted Perry-internal materialization reads
+    /// (the `RegisterClassCaptures` decl-site snapshot refresh) are running —
+    /// a dead-zone box then reads as `undefined` (pre-#6044 behavior) instead
+    /// of throwing. Never spans user code: the bracketed window contains only
+    /// side-effect-free capture loads.
+    static TDZ_SUPPRESS_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Enter a TDZ-suppression window (see `TDZ_SUPPRESS_DEPTH`). Emitted by
+/// codegen immediately before a `RegisterClassCaptures` snapshot's capture
+/// loads; paired with `js_tdz_suppress_end`.
+#[no_mangle]
+pub extern "C" fn js_tdz_suppress_begin() {
+    TDZ_SUPPRESS_DEPTH.with(|d| d.set(d.get().saturating_add(1)));
+}
+
+/// Leave the TDZ-suppression window opened by `js_tdz_suppress_begin`.
+#[no_mangle]
+pub extern "C" fn js_tdz_suppress_end() {
+    TDZ_SUPPRESS_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+}
+
+/// Keepalive anchors for the auto-optimize whole-program build (generated-code-
+/// only callees — without these the symbols dead-strip and the app link fails).
+#[used]
+static KEEP_JS_TDZ_SUPPRESS_BEGIN: extern "C" fn() = js_tdz_suppress_begin;
+#[used]
+static KEEP_JS_TDZ_SUPPRESS_END: extern "C" fn() = js_tdz_suppress_end;
 
 /// Compatibility wrapper for legacy f64-lowered boxed locals.
 #[no_mangle]
@@ -381,6 +437,36 @@ fn is_registered_box_ptr(ptr: *mut Box) -> bool {
     BOX_REGISTRY.with(|r| r.borrow().contains(&(ptr as usize)))
 }
 
+/// If `slot_bits` (the raw contents of a closure capture slot) is a registered
+/// box pointer, return the JSValue bits stored *inside* that box; otherwise
+/// return `None`.
+///
+/// A closure that captures a boxed local — every body local of an `async`
+/// function (the async-to-generator transform boxes them all), plus any
+/// mutable capture — stores the raw box pointer in its capture slot rather
+/// than a NaN-boxed value (see the codegen closure lowering in
+/// `perry-codegen/src/expr/closure.rs`). That pointer addresses a box in the
+/// *current thread's* thread-local, never-freed `BOX_REGISTRY`, so it is
+/// meaningless on any other thread. The `perry/thread` serializer uses this to
+/// unwrap such a slot to the value the box actually holds before deep-copying
+/// it across the boundary (#6520 — without it the worker read the captured
+/// value as `undefined`/empty).
+///
+/// Registry membership is authoritative: any NaN-boxed value or real double
+/// has its high bits set and fails `is_plausible_box_ptr`, so this only ever
+/// matches a genuine live box pointer, never a coincidental capture value.
+#[inline]
+pub fn box_slot_contents_bits(slot_bits: u64) -> Option<u64> {
+    let ptr = slot_bits as usize as *mut Box;
+    if is_registered_box_ptr(ptr) {
+        // Safety: the address is in BOX_REGISTRY, so it was minted by
+        // `js_box_alloc` and points at a live (never-freed) `Box`.
+        Some(unsafe { (*ptr).value })
+    } else {
+        None
+    }
+}
+
 #[inline]
 fn is_registered_i32_box_ptr(ptr: *mut I32Box) -> bool {
     if !is_plausible_box_ptr(ptr.cast::<Box>()) {
@@ -531,5 +617,34 @@ mod tests {
         assert_eq!(js_i32_box_get(ordinary_box.cast::<I32Box>()), 0);
         js_i32_box_set(ordinary_box.cast::<I32Box>(), 99);
         assert_eq!(js_box_get(ordinary_box), 1.0);
+    }
+
+    /// #6520: the thread-boundary serializer unwraps a capture slot that holds
+    /// a box pointer to the value inside. `box_slot_contents_bits` returns the
+    /// contained JSValue bits for a real box and `None` for anything else — a
+    /// plain NaN-boxed value (high tag bits set → not a plausible box address),
+    /// a plausible-but-unregistered pointer, and a null slot.
+    #[test]
+    fn box_slot_contents_unwraps_only_registered_boxes() {
+        test_clear_box_registry();
+
+        // A real box: returns the bits it holds, not the pointer.
+        let inner = crate::value::JSValue::int32(1234).bits();
+        let b = js_box_alloc_bits(inner as i64);
+        let slot_bits = b as usize as u64; // codegen stores the raw box ptr here
+        assert_eq!(box_slot_contents_bits(slot_bits), Some(inner));
+
+        // A NaN-boxed non-box value (its own tag bits are set) is not a box.
+        assert_eq!(box_slot_contents_bits(inner), None);
+        assert_eq!(box_slot_contents_bits(crate::value::TAG_UNDEFINED), None);
+
+        // A plausible pointer that was never minted as a box.
+        static RODATA: [u64; 2] = [0xDEAD_BEEF, 0xFEED_FACE];
+        let fake = (&RODATA[0] as *const u64) as usize as u64;
+        assert!(is_plausible_box_ptr(fake as usize as *mut Box));
+        assert_eq!(box_slot_contents_bits(fake), None);
+
+        // Null / near-null slots.
+        assert_eq!(box_slot_contents_bits(0), None);
     }
 }

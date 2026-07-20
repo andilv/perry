@@ -21,11 +21,11 @@ fn empty_opts() -> CompileOptions {
         namespace_node_submodules: std::collections::HashMap::new(),
         namespace_v8_specifiers: std::collections::HashMap::new(),
         namespace_member_prefixes: std::collections::HashMap::new(),
+        namespace_member_origin_names: std::collections::HashMap::new(),
         emit_ir_only: true,
         verify_native_regions: false,
         disable_buffer_fast_path: false,
         namespace_imports: Vec::new(),
-        namespace_reexport_named_imports: std::collections::HashSet::new(),
         imported_classes: Vec::new(),
         imported_enums: Vec::new(),
         imported_async_funcs: std::collections::HashSet::new(),
@@ -545,6 +545,7 @@ fn add(left: Expr, right: Expr) -> Expr {
 
 fn length(local_id: u32) -> Expr {
     Expr::PropertyGet {
+        byte_offset: 0,
         object: Box::new(local(local_id)),
         property: "length".to_string(),
     }
@@ -561,6 +562,7 @@ fn buffer_set(buffer_id: u32, index: Expr) -> Stmt {
 fn buffer_read(buffer_id: u32, method: &str, index: Expr) -> Expr {
     call(
         Expr::PropertyGet {
+            byte_offset: 0,
             object: Box::new(local(buffer_id)),
             property: method.to_string(),
         },
@@ -791,6 +793,7 @@ fn artifact_schema_v6_records_c_layout_pod_manifest() {
             value: Box::new(int(9)),
         }),
         Stmt::Return(Some(Expr::PropertyGet {
+            byte_offset: 0,
             object: Box::new(local(1)),
             property: "gain".to_string(),
         })),
@@ -1288,6 +1291,7 @@ fn artifact_schema_v6_records_pod_dynamic_write_fallback() {
             value: Box::new(Expr::String("x".to_string())),
         }),
         Stmt::Return(Some(Expr::PropertyGet {
+            byte_offset: 0,
             object: Box::new(local(1)),
             property: "tag".to_string(),
         })),
@@ -1317,7 +1321,7 @@ fn artifact_schema_v6_records_pod_dynamic_write_fallback() {
 }
 
 #[test]
-fn pod_field_read_after_dynamic_materialization_uses_number_coerce() {
+fn pod_field_read_after_dynamic_materialization_uses_dynamic_numeric_sub() {
     let packet_ty = pod_type(&[
         ("tag", Type::Named("PerryU32".to_string())),
         ("gain", Type::Named("PerryF32".to_string())),
@@ -1337,6 +1341,7 @@ fn pod_field_read_after_dynamic_materialization_uses_number_coerce() {
         Stmt::Return(Some(Expr::Binary {
             op: BinaryOp::Sub,
             left: Box::new(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(local(1)),
                 property: "tag".to_string(),
             }),
@@ -1346,8 +1351,16 @@ fn pod_field_read_after_dynamic_materialization_uses_number_coerce() {
 
     let ir = compile_ir("pod_dynamic_materialized_read_coerce.ts", body);
     assert!(
-        ir.contains("call double @js_number_coerce"),
-        "POD field reads after dynamic materialization must not feed boxed JSValue fallbacks into raw numeric arithmetic:\n{ir}"
+        ir.contains("call double @js_object_get_field_by_name_f64"),
+        "materialized POD field reads must preserve boxed JSValue bits:\n{ir}"
+    );
+    assert!(
+        ir.contains("call double @js_dynamic_sub"),
+        "materialized POD field reads must use coercing dynamic arithmetic:\n{ir}"
+    );
+    assert!(
+        !ir.contains("fsub double"),
+        "materialized POD field reads must not feed boxed JSValue bits into raw arithmetic:\n{ir}"
     );
 }
 
@@ -1479,6 +1492,7 @@ fn scalar_replaced_raw_f64_field_store_keeps_numeric_array_fallback_boxed() {
                 }),
             }),
             Stmt::Return(Some(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(local(2)),
                 property: "gain".to_string(),
             })),
@@ -1514,6 +1528,7 @@ fn artifact_schema_v8_rejects_inexact_pod_initializer_values() {
             ],
         ),
         Stmt::Return(Some(Expr::PropertyGet {
+            byte_offset: 0,
             object: Box::new(local(1)),
             property: "tag".to_string(),
         })),
@@ -1565,6 +1580,7 @@ fn artifact_schema_v6_records_pod_pointerful_field_rejection() {
             vec![("tag", int(7)), ("name", Expr::String("x".to_string()))],
         ),
         Stmt::Return(Some(Expr::PropertyGet {
+            byte_offset: 0,
             object: Box::new(local(1)),
             property: "tag".to_string(),
         })),
@@ -7424,6 +7440,7 @@ fn typed_f64_clone_test_module(use_any_param: bool) -> Module {
         exported_functions: Vec::new(),
         script_global_functions: Vec::new(),
         references_global_this: false,
+        annexb_global_undefined_names: Vec::new(),
         widgets: Vec::new(),
         uses_fetch: false,
         uses_webassembly: false,
@@ -7595,6 +7612,7 @@ fn typed_i1_clone_test_module_named(name: &str) -> Module {
         exported_functions: Vec::new(),
         script_global_functions: Vec::new(),
         references_global_this: false,
+        annexb_global_undefined_names: Vec::new(),
         widgets: Vec::new(),
         uses_fetch: false,
         uses_webassembly: false,
@@ -7686,6 +7704,7 @@ fn typed_string_clone_test_module(case: &str) -> Module {
         exported_functions: Vec::new(),
         script_global_functions: Vec::new(),
         references_global_this: false,
+        annexb_global_undefined_names: Vec::new(),
         widgets: Vec::new(),
         uses_fetch: false,
         uses_webassembly: false,
@@ -7799,6 +7818,7 @@ fn typed_i1_numeric_predicate_module() -> Module {
         exported_functions: Vec::new(),
         script_global_functions: Vec::new(),
         references_global_this: false,
+        annexb_global_undefined_names: Vec::new(),
         widgets: Vec::new(),
         uses_fetch: false,
         uses_webassembly: false,
@@ -7875,6 +7895,7 @@ fn typed_i1_i32_predicate_module() -> Module {
         exported_functions: Vec::new(),
         script_global_functions: Vec::new(),
         references_global_this: false,
+        annexb_global_undefined_names: Vec::new(),
         widgets: Vec::new(),
         uses_fetch: false,
         uses_webassembly: false,
@@ -8000,6 +8021,7 @@ fn typed_i32_return_module(case: &str) -> Module {
         exported_functions: Vec::new(),
         script_global_functions: Vec::new(),
         references_global_this: false,
+        annexb_global_undefined_names: Vec::new(),
         widgets: Vec::new(),
         uses_fetch: false,
         uses_webassembly: false,
@@ -8063,6 +8085,7 @@ fn typed_f64_method_clone_module() -> Module {
         Type::Number,
         vec![Stmt::Return(Some(Expr::Call {
             callee: Box::new(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(local(1)),
                 property: "mix".to_string(),
             }),
@@ -8120,6 +8143,7 @@ fn typed_f64_i32_local_method_clone_module() -> Module {
         Type::Number,
         vec![Stmt::Return(Some(Expr::Call {
             callee: Box::new(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(local(1)),
                 property: "mix".to_string(),
             }),
@@ -8181,6 +8205,7 @@ fn typed_f64_method_negative_module(case: &str) -> Module {
         Type::Number,
         vec![Stmt::Return(Some(Expr::Call {
             callee: Box::new(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(local(1)),
                 property: "mix".to_string(),
             }),
@@ -8193,6 +8218,7 @@ fn typed_f64_method_negative_module(case: &str) -> Module {
 
 fn this_field(name: &str) -> Expr {
     Expr::PropertyGet {
+        byte_offset: 0,
         object: Box::new(Expr::This),
         property: name.to_string(),
     }
@@ -8258,6 +8284,7 @@ fn typed_f64_receiver_method_positive_module() -> Module {
         Type::Number,
         vec![Stmt::Return(Some(Expr::Call {
             callee: Box::new(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(local(1)),
                 property: "score".to_string(),
             }),
@@ -8301,6 +8328,7 @@ fn typed_f64_receiver_method_negative_module(case: &str) -> Module {
         "nested_call" => {
             method_body = vec![Stmt::Return(Some(Expr::Call {
                 callee: Box::new(Expr::PropertyGet {
+                    byte_offset: 0,
                     object: Box::new(Expr::This),
                     property: "other".to_string(),
                 }),
@@ -8352,6 +8380,7 @@ fn typed_f64_receiver_method_negative_module(case: &str) -> Module {
                 Type::Number,
                 vec![Stmt::Return(Some(Expr::Call {
                     callee: Box::new(Expr::PropertyGet {
+                        byte_offset: 0,
                         object: Box::new(local(1)),
                         property: "score".to_string(),
                     }),
@@ -8378,6 +8407,7 @@ fn typed_f64_receiver_method_negative_module(case: &str) -> Module {
         Type::Number,
         vec![Stmt::Return(Some(Expr::Call {
             callee: Box::new(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(local(1)),
                 property: "score".to_string(),
             }),
@@ -8699,6 +8729,7 @@ fn typed_i1_method_clone_module(case: &str) -> Module {
         Type::Boolean,
         vec![Stmt::Return(Some(Expr::Call {
             callee: Box::new(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(local(1)),
                 property: "check".to_string(),
             }),
@@ -8794,6 +8825,7 @@ fn typed_i32_method_clone_module(case: &str) -> Module {
         },
         vec![Stmt::Return(Some(Expr::Call {
             callee: Box::new(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(local(1)),
                 property: "mix_i32".to_string(),
             }),
@@ -8874,6 +8906,7 @@ fn typed_string_method_clone_module(case: &str) -> Module {
         Type::String,
         vec![Stmt::Return(Some(Expr::Call {
             callee: Box::new(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(local(1)),
                 property: "pick".to_string(),
             }),
@@ -8931,6 +8964,7 @@ fn typed_i1_numeric_predicate_method_module() -> Module {
         Type::Boolean,
         vec![Stmt::Return(Some(Expr::Call {
             callee: Box::new(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(local(1)),
                 property: "above".to_string(),
             }),
@@ -9220,10 +9254,12 @@ fn scalar_method_summary_module() -> Module {
         body: vec![Stmt::Return(Some(Expr::Binary {
             op: BinaryOp::Add,
             left: Box::new(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(Expr::This),
                 property: "x".to_string(),
             }),
             right: Box::new(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(Expr::This),
                 property: "y".to_string(),
             }),
@@ -9254,10 +9290,12 @@ fn scalar_method_summary_module() -> Module {
                     args: vec![number(1.25), number(2.75)],
                     type_args: Vec::new(),
                     byte_offset: 0,
+                    cap_args_appended: 0,
                 }),
             },
             Stmt::Return(Some(Expr::Call {
                 callee: Box::new(Expr::PropertyGet {
+                    byte_offset: 0,
                     object: Box::new(local(20)),
                     property: "sum".to_string(),
                 }),
@@ -9297,6 +9335,7 @@ fn scalar_method_numeric_local_temp_module(case: &str, mutable_temp: bool) -> Mo
                 init: Some(Expr::Binary {
                     op: BinaryOp::Add,
                     left: Box::new(Expr::PropertyGet {
+                        byte_offset: 0,
                         object: Box::new(Expr::This),
                         property: "x".to_string(),
                     }),
@@ -9312,6 +9351,7 @@ fn scalar_method_numeric_local_temp_module(case: &str, mutable_temp: bool) -> Mo
                     op: BinaryOp::Mul,
                     left: Box::new(local(130)),
                     right: Box::new(Expr::PropertyGet {
+                        byte_offset: 0,
                         object: Box::new(Expr::This),
                         property: "y".to_string(),
                     }),
@@ -9339,10 +9379,12 @@ fn scalar_method_numeric_local_temp_module(case: &str, mutable_temp: bool) -> Mo
                 args: vec![number(1.25), number(2.75)],
                 type_args: Vec::new(),
                 byte_offset: 0,
+                cap_args_appended: 0,
             }),
         },
         Stmt::Return(Some(Expr::Call {
             callee: Box::new(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(local(20)),
                 property: "weighted".to_string(),
             }),
@@ -9358,6 +9400,7 @@ fn scalar_predicate_method_body(field: &str) -> Expr {
     Expr::Compare {
         op: CompareOp::Gt,
         left: Box::new(Expr::PropertyGet {
+            byte_offset: 0,
             object: Box::new(Expr::This),
             property: field.to_string(),
         }),
@@ -9380,10 +9423,12 @@ fn scalar_method_boolean_predicate_module() -> Module {
                 args: vec![number(4.0), number(2.0)],
                 type_args: Vec::new(),
                 byte_offset: 0,
+                cap_args_appended: 0,
             }),
         },
         Stmt::Return(Some(Expr::Call {
             callee: Box::new(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(local(20)),
                 property: "isAbove".to_string(),
             }),
@@ -9427,10 +9472,12 @@ fn scalar_method_boolean_public_numeric_arg_module(case: &str, arg_ty: Type) -> 
                 args: vec![number(4.0), number(2.0)],
                 type_args: Vec::new(),
                 byte_offset: 0,
+                cap_args_appended: 0,
             }),
         },
         Stmt::Return(Some(Expr::Call {
             callee: Box::new(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(local(20)),
                 property: "isAbove".to_string(),
             }),
@@ -9460,10 +9507,12 @@ fn scalar_method_boolean_public_numeric_expr_arg_module() -> Module {
                 args: vec![number(4.0), number(2.0)],
                 type_args: Vec::new(),
                 byte_offset: 0,
+                cap_args_appended: 0,
             }),
         },
         Stmt::Return(Some(Expr::Call {
             callee: Box::new(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(local(20)),
                 property: "isAbove".to_string(),
             }),
@@ -9535,12 +9584,14 @@ fn scalar_method_int32_bitwise_module(case: &str, field_ty: Type, arg_ty: Type) 
                 left: Box::new(Expr::Binary {
                     op: BinaryOp::BitXor,
                     left: Box::new(Expr::PropertyGet {
+                        byte_offset: 0,
                         object: Box::new(Expr::This),
                         property: "mask".to_string(),
                     }),
                     right: Box::new(local(12)),
                 }),
                 right: Box::new(Expr::PropertyGet {
+                    byte_offset: 0,
                     object: Box::new(Expr::This),
                     property: "salt".to_string(),
                 }),
@@ -9580,10 +9631,12 @@ fn scalar_method_int32_bitwise_module(case: &str, field_ty: Type, arg_ty: Type) 
                     args: vec![int(42), int(7)],
                     type_args: Vec::new(),
                     byte_offset: 0,
+                    cap_args_appended: 0,
                 }),
             },
             Stmt::Return(Some(Expr::Call {
                 callee: Box::new(Expr::PropertyGet {
+                    byte_offset: 0,
                     object: Box::new(local(20)),
                     property: "mix".to_string(),
                 }),
@@ -9611,6 +9664,7 @@ fn scalar_method_int32_unsigned_shift_module() -> Module {
     module.classes[0].methods[0].body = vec![Stmt::Return(Some(Expr::Binary {
         op: BinaryOp::UShr,
         left: Box::new(Expr::PropertyGet {
+            byte_offset: 0,
             object: Box::new(Expr::This),
             property: "mask".to_string(),
         }),
@@ -9630,6 +9684,7 @@ fn scalar_method_int32_bitwise_local_temp_module() -> Module {
             init: Some(Expr::Binary {
                 op: BinaryOp::BitXor,
                 left: Box::new(Expr::PropertyGet {
+                    byte_offset: 0,
                     object: Box::new(Expr::This),
                     property: "mask".to_string(),
                 }),
@@ -9651,6 +9706,7 @@ fn scalar_method_int32_bitwise_local_temp_module() -> Module {
             op: BinaryOp::BitOr,
             left: Box::new(local(131)),
             right: Box::new(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(Expr::This),
                 property: "salt".to_string(),
             }),
@@ -9686,6 +9742,7 @@ fn scalar_method_boolean_negative_module(case: &str) -> Module {
                 params: Vec::new(),
                 return_type: Type::Number,
                 body: vec![Stmt::Return(Some(Expr::PropertyGet {
+                    byte_offset: 0,
                     object: Box::new(Expr::This),
                     property: "x".to_string(),
                 }))],
@@ -9702,6 +9759,7 @@ fn scalar_method_boolean_negative_module(case: &str) -> Module {
                 op: CompareOp::Gt,
                 left: Box::new(Expr::Call {
                     callee: Box::new(Expr::PropertyGet {
+                        byte_offset: 0,
                         object: Box::new(Expr::This),
                         property: "readX".to_string(),
                     }),
@@ -9722,6 +9780,7 @@ fn scalar_method_boolean_negative_module(case: &str) -> Module {
                     params: Vec::new(),
                     return_type: Type::Number,
                     body: vec![Stmt::Return(Some(Expr::PropertyGet {
+                        byte_offset: 0,
                         object: Box::new(Expr::This),
                         property: "x".to_string(),
                     }))],
@@ -9791,10 +9850,12 @@ fn scalar_method_boolean_negative_module(case: &str) -> Module {
                         args: vec![number(4.0), number(2.0)],
                         type_args: Vec::new(),
                         byte_offset: 0,
+                        cap_args_appended: 0,
                     }),
                 },
                 Stmt::Return(Some(Expr::Call {
                     callee: Box::new(Expr::PropertyGet {
+                        byte_offset: 0,
                         object: Box::new(local(20)),
                         property: "isAbove".to_string(),
                     }),
@@ -9817,10 +9878,12 @@ fn scalar_method_boolean_negative_module(case: &str) -> Module {
                         args: vec![number(4.0), number(2.0)],
                         type_args: Vec::new(),
                         byte_offset: 0,
+                        cap_args_appended: 0,
                     }),
                 },
                 Stmt::Return(Some(Expr::Call {
                     callee: Box::new(Expr::PropertyGet {
+                        byte_offset: 0,
                         object: Box::new(local(20)),
                         property: "isAbove".to_string(),
                     }),
@@ -13101,6 +13164,7 @@ fn static_property_access_on_computed_class_uses_property_id_wrappers() {
                 value: Box::new(local(2)),
             }),
             Stmt::Return(Some(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(local(1)),
                 property: "score".to_string(),
             })),
@@ -13127,6 +13191,7 @@ fn static_name_method_fallback_uses_method_id_wrapper() {
         Type::Number,
         vec![Stmt::Return(Some(call(
             Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(local(1)),
                 property: "score".to_string(),
             },
@@ -13157,6 +13222,7 @@ fn static_name_spread_method_fallback_uses_method_id_wrapper() {
         Type::Number,
         vec![Stmt::Return(Some(Expr::CallSpread {
             callee: Box::new(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(local(1)),
                 property: "score".to_string(),
             }),
@@ -13197,6 +13263,7 @@ fn static_name_class_method_value_uses_method_id_bind_wrapper() {
         vec![param(1, "obj", Type::Named("Calc".to_string()))],
         Type::Any,
         vec![Stmt::Return(Some(Expr::PropertyGet {
+            byte_offset: 0,
             object: Box::new(local(1)),
             property: "score".to_string(),
         }))],
@@ -13227,6 +13294,7 @@ fn raw_numeric_class_field_rejects_unknown_or_dynamic_shape_receiver() {
                 value: Box::new(number(7.0)),
             }),
             Stmt::Return(Some(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(local(1)),
                 property: "x".to_string(),
             })),
@@ -13248,6 +13316,7 @@ fn raw_numeric_class_field_rejects_unknown_or_dynamic_shape_receiver() {
                 value: Box::new(number(7.0)),
             }),
             Stmt::Return(Some(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(local(1)),
                 property: "x".to_string(),
             })),
@@ -13270,5 +13339,113 @@ fn raw_numeric_class_field_rejects_unknown_or_dynamic_shape_receiver() {
     }
 }
 
+/// #6299: a numeric array that arrives as a call's return value must still get
+/// the guarded numeric array-index fast path.
+///
+/// `arr[i] = arr[i] + 1` only lowers to `Expr::IndexSet` when the receiver is a
+/// statically-known local array; for a call-returned array the lowerer emits the
+/// spec-compliant `Expr::PutValueSet` instead. `collect_index_used_locals` had no
+/// arm for that variant (it fell into a `_ => {}` catch-all), so the loop counter
+/// never joined `index_used_locals`, lost its i32 shadow slot, and every `arr[i]`
+/// in the loop fell back from `js_typed_feedback_numeric_array_index_{get,set}_guard`
+/// to the generic `js_array_get_index_or_string` path — a 6.8x cliff.
+///
+/// Asserting on the emitted helper (rather than wall-clock time) pins the actual
+/// codegen decision and stays meaningful under any optimization level.
+#[test]
+fn put_value_set_index_keeps_the_numeric_array_fast_path() {
+    // for (let i = 0; i < arr.length; i++) arr[i] = arr[i] + 1;
+    // with `arr: number[]` written through the generic PutValue form.
+    let arr = 1u32;
+    let i = 2u32;
+    let read_arr_i = Expr::IndexGet {
+        object: Box::new(Expr::LocalGet(arr)),
+        index: Box::new(Expr::LocalGet(i)),
+    };
+    let body = vec![
+        Stmt::Let {
+            id: arr,
+            name: "arr".to_string(),
+            ty: Type::Array(Box::new(Type::Number)),
+            mutable: false,
+            init: Some(Expr::Array(vec![])),
+        },
+        // The array escapes into a call — this is what `const arr = build()`
+        // lowers to (the callee fills the array through a return slot). It is
+        // load-bearing for the repro: an array that stays local is still
+        // hoistable, so `stmt/loops.rs` hands the counter an i32 slot from the
+        // length-hoist path and the fast path survives even with the collector
+        // blind spot. Once the array escapes, that path bails and the counter's
+        // only route to an i32 slot is `index_used_locals` — the set this fix
+        // repairs.
+        Stmt::Expr(Expr::Call {
+            callee: Box::new(Expr::FuncRef(1)),
+            args: vec![Expr::LocalGet(arr)],
+            type_args: Vec::new(),
+            byte_offset: 0,
+        }),
+        Stmt::For {
+            init: Some(Box::new(Stmt::Let {
+                id: i,
+                name: "i".to_string(),
+                ty: Type::Any,
+                mutable: true,
+                init: Some(Expr::Integer(0)),
+            })),
+            condition: Some(Expr::Compare {
+                op: CompareOp::Lt,
+                left: Box::new(Expr::LocalGet(i)),
+                right: Box::new(Expr::PropertyGet {
+                    byte_offset: 0,
+                    object: Box::new(Expr::LocalGet(arr)),
+                    property: "length".to_string(),
+                }),
+            }),
+            update: Some(Expr::Update {
+                id: i,
+                op: UpdateOp::Increment,
+                prefix: false,
+            }),
+            body: vec![Stmt::Expr(Expr::PutValueSet {
+                target: Box::new(Expr::LocalGet(arr)),
+                key: Box::new(Expr::LocalGet(i)),
+                value: Box::new(Expr::Binary {
+                    op: BinaryOp::Add,
+                    left: Box::new(read_arr_i),
+                    right: Box::new(Expr::Integer(1)),
+                }),
+                receiver: Box::new(Expr::LocalGet(arr)),
+                strict: false,
+            })],
+        },
+    ];
+
+    let ir = compile_ir("put_value_set_fast_path", body);
+
+    // The loop counter must keep its i32 shadow slot: that is what lets the
+    // guarded helpers take a native i32 index.
+    assert!(
+        ir.contains("alloca i32"),
+        "the `arr[i]` loop counter lost its i32 shadow slot — `index_used_locals` \
+         no longer sees the PutValueSet key (#6299):\n{ir}"
+    );
+    assert!(
+        ir.contains("@js_typed_feedback_numeric_array_index_get_guard"),
+        "`arr[i]` read through PutValueSet's value subtree must keep the guarded \
+         numeric fast path, not fall back to js_array_get_index_or_string (#6299):\n{ir}"
+    );
+    assert!(
+        ir.contains("@js_typed_feedback_numeric_array_index_set_guard"),
+        "`arr[i] = ...` through PutValueSet must keep the guarded numeric store \
+         fast path (#6299):\n{ir}"
+    );
+}
+
 #[path = "native_proof_regressions/invalidation.rs"]
 mod invalidation;
+
+#[path = "native_proof_regressions/integer_modulo.rs"]
+mod integer_modulo;
+
+#[path = "native_proof_regressions/math_mul_fastpath.rs"]
+mod math_mul_fastpath;

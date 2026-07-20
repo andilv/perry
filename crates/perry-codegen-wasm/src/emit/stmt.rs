@@ -425,7 +425,7 @@ impl<'a> FuncEmitCtx<'a> {
             // Issue #569: Wasm backend has no equivalent of LLVM's
             // alloca'd box slot — JS hoisting in the host runtime handles
             // forward refs natively. Emit nothing.
-            Stmt::PreallocateBoxes(_) => {}
+            Stmt::PreallocateBoxes(_) | Stmt::PreallocateTdzBoxes(_) => {}
         }
     }
 
@@ -445,7 +445,10 @@ impl<'a> FuncEmitCtx<'a> {
             }
             // console.log/warn/error via Call + PropertyGet pattern
             Expr::Call { callee, .. } => {
-                if let Expr::PropertyGet { object, property } = callee.as_ref() {
+                if let Expr::PropertyGet {
+                    object, property, ..
+                } = callee.as_ref()
+                {
                     if let Expr::GlobalGet(_) = object.as_ref() {
                         if matches!(property.as_str(), "log" | "warn" | "error") {
                             return false;

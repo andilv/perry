@@ -163,7 +163,8 @@ fn collect_used_object_fields_in_stmts(
             | Stmt::Continue
             | Stmt::LabeledBreak(_)
             | Stmt::LabeledContinue(_)
-            | Stmt::PreallocateBoxes(_) => {}
+            | Stmt::PreallocateBoxes(_)
+            | Stmt::PreallocateTdzBoxes(_) => {}
         }
     }
 }
@@ -174,7 +175,10 @@ fn collect_used_object_fields_in_expr(
     used: &mut HashMap<u32, HashSet<String>>,
 ) {
     use perry_hir::Expr;
-    if let Expr::PropertyGet { object, property } = expr {
+    if let Expr::PropertyGet {
+        object, property, ..
+    } = expr
+    {
         if let Expr::LocalGet(id) = object.as_ref() {
             if let Some(fields) = non_escaping_object_literals.get(id) {
                 if fields.iter().any(|field| field == property) {
@@ -408,7 +412,7 @@ pub fn check_object_literal_escapes_in_expr(
 
     match e {
         // Safe: `o.known_field` read.
-        Expr::PropertyGet { object, property } => {
+        Expr::PropertyGet { object, property, .. } => {
             if let Expr::LocalGet(id) = object.as_ref() {
                 if let Some(keys) = candidates.get(id) {
                     if keys.iter().any(|k| k == property) {

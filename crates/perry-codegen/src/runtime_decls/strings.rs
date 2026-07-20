@@ -66,10 +66,28 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_string_substr", I64, &[I64, DOUBLE, DOUBLE]);
     module.declare_function("js_string_split", I64, &[I64, I64]);
     module.declare_function("js_string_split_n", I64, &[I64, I64, I32]);
+    // Materialize one part of a literal-separator split as a JSValue. Used by
+    // scalar replacement when the split result is non-escaping and only a
+    // constant index is observed.
+    module.declare_function("js_string_split_part_value", DOUBLE, &[I64, I64, I32]);
+    // Direct `.length` of a scalar-replaced split part. Returns a JS number
+    // without allocating the otherwise unobserved substring.
+    module.declare_function(
+        "js_string_split_part_utf16_length",
+        DOUBLE,
+        &[I64, I64, I32],
+    );
+    module.declare_function(
+        "js_string_to_upper_case_split_part_utf16_length",
+        DOUBLE,
+        &[I64, I64, I32],
+    );
+    module.declare_function("js_string_to_upper_case_index_of", I32, &[I64, I64]);
     // Boxed separator + boxed limit; full ToUint32(limit)/ToString(separator)
     // coercion + undefined/RegExp handling (ECMA-262 §22.1.3.21).
     module.declare_function("js_string_split_value", I64, &[I64, DOUBLE, DOUBLE]);
     module.declare_function("js_math_trunc", DOUBLE, &[DOUBLE]);
+    module.declare_function("js_math_round", DOUBLE, &[DOUBLE]);
     module.declare_function("js_math_sign", DOUBLE, &[DOUBLE]);
     module.declare_function("js_math_imul", DOUBLE, &[DOUBLE, DOUBLE]);
     module.declare_function("js_math_pow", DOUBLE, &[DOUBLE, DOUBLE]);
@@ -191,6 +209,13 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // `TypeError: value is not a function` instead of masking a
     // non-pointer value's low 48 bits into a wild closure pointer.
     module.declare_function("js_closure_unbox_callee_checked", I64, &[DOUBLE]);
+    // #6475: receiver-aware variant for member-shaped fused calls — rebinds an
+    // object-literal method's baked `this` slot to the receiver before unboxing.
+    module.declare_function(
+        "js_closure_unbox_callee_checked_rebind",
+        I64,
+        &[DOUBLE, DOUBLE],
+    );
     module.declare_function("js_closure_call0", DOUBLE, &[I64]);
     module.declare_function("js_closure_call1", DOUBLE, &[I64, DOUBLE]);
     module.declare_function("js_closure_call2", DOUBLE, &[I64, DOUBLE, DOUBLE]);
@@ -355,6 +380,11 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_math_min2", DOUBLE, &[DOUBLE, DOUBLE]);
     module.declare_function("js_math_max2", DOUBLE, &[DOUBLE, DOUBLE]);
     module.declare_function("js_string_coerce", I64, &[DOUBLE]);
+    // RequireObjectCoercible + ToString for inline-lowered String.prototype
+    // methods on a non-string receiver: a nullish `this` throws the V8
+    // member-access TypeError instead of coercing undefined→"undefined".
+    // Args: (value, prop_name_ptr, prop_name_len).
+    module.declare_function("js_string_coerce_method_this", I64, &[DOUBLE, PTR, I64]);
     module.declare_function("js_array_slice", I64, &[I64, I32, I32]);
     module.declare_function("js_array_slice_values", I64, &[I64, DOUBLE, DOUBLE]);
     module.declare_function("js_array_shift_f64", DOUBLE, &[I64]);
@@ -364,6 +394,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_map_from_array", I64, &[I64]);
     module.declare_function("js_map_from_iterable", I64, &[DOUBLE]);
     module.declare_function("js_object_has_property", DOUBLE, &[DOUBLE, DOUBLE]);
+    module.declare_function("js_in_operator", DOUBLE, &[DOUBLE, DOUBLE]);
     module.declare_function("js_private_brand_check", DOUBLE, &[DOUBLE, I32, PTR, I32]);
     module.declare_function(
         "js_private_guard",
@@ -575,7 +606,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // NaN-boxed JSValue (string / array / undefined).
     module.declare_function("js_string_to_locale_lower_case", I64, &[I64, DOUBLE]);
     module.declare_function("js_string_to_locale_upper_case", I64, &[I64, DOUBLE]);
-    module.declare_function("js_string_validate_locales", VOID, &[DOUBLE]);
+    module.declare_function("js_string_validate_collator_args", VOID, &[DOUBLE, DOUBLE]);
     module.declare_function("js_string_trim", I64, &[I64]);
     module.declare_function("js_string_trim_start", I64, &[I64]);
     module.declare_function("js_string_trim_end", I64, &[I64]);
@@ -734,6 +765,19 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_util_types_is_map_iterator", DOUBLE, &[DOUBLE]);
     module.declare_function("js_util_types_is_set_iterator", DOUBLE, &[DOUBLE]);
     module.declare_function("js_data_view_new", DOUBLE, &[DOUBLE, DOUBLE, DOUBLE]);
+    // #6386: direct DataView accessor entries for statically-typed receivers
+    // (kind codes = `DataViewKind` repr(i32) discriminants; trailing i32 is
+    // the source-level argc, forwarded for the generic-dispatch fallback).
+    module.declare_function(
+        "js_data_view_get_direct",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, DOUBLE, I32, I32],
+    );
+    module.declare_function(
+        "js_data_view_set_direct",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, DOUBLE, DOUBLE, I32, I32],
+    );
     module.declare_function("js_getenv", I64, &[I64]);
     module.declare_function("js_getenv_value", DOUBLE, &[I64]);
     // #1344: process.env.X = v / delete process.env.X.
@@ -837,6 +881,14 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_process_emit_before_exit", VOID, &[DOUBLE]);
     module.declare_function("js_process_run_finalization_exit", VOID, &[]);
     module.declare_function("js_promise_report_unhandled_rejections", VOID, &[]);
+    // #6666: the natural-exit epilogue returns the stored `process.exitCode`
+    // (default 0) as the process status instead of a hardcoded 0.
+    module.declare_function("js_process_pending_exit_code", I32, &[]);
+    module.declare_function(
+        "js_gc_release_current_thread_collection_side_allocations",
+        VOID,
+        &[],
+    );
     module.declare_function("js_process_remove_listener", DOUBLE, &[I64, I64]);
     module.declare_function("js_process_off", DOUBLE, &[I64, I64]);
     module.declare_function("js_process_remove_all_listeners", DOUBLE, &[I64]);
@@ -1039,6 +1091,10 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // would do. (Map ptr, entry idx) → key / value.
     module.declare_function("js_map_entry_key_at", DOUBLE, &[I64, I32]);
     module.declare_function("js_map_entry_value_at", DOUBLE, &[I64, I32]);
+    // #6075: current index of a key/value (or -1) for the delete-safe for-of
+    // fast path. Takes the NaN-boxed collection + key; strips internally.
+    module.declare_function("js_map_find_key_index", DOUBLE, &[DOUBLE, DOUBLE]);
+    module.declare_function("js_set_find_value_index", DOUBLE, &[DOUBLE, DOUBLE]);
     // Map/Set forEach: (collection_ptr, callback_nanboxed_f64, thisArg_f64) -> void (#2830)
     module.declare_function("js_map_foreach", VOID, &[I64, DOUBLE, DOUBLE]);
     module.declare_function("js_set_foreach", VOID, &[I64, DOUBLE, DOUBLE]);
@@ -1168,6 +1224,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // v0.5.749: dynamic instanceof — `value instanceof type` where type
     // is a runtime expression (function arg holding class ref).
     module.declare_function("js_instanceof_dynamic", DOUBLE, &[DOUBLE, DOUBLE]);
+    module.declare_function("js_instanceof_noncallable_rhs", DOUBLE, &[]);
     module.declare_function("js_register_class_extends_error", VOID, &[I32]);
     module.declare_function("js_register_class_extends_data_view", VOID, &[I32]);
     module.declare_function("js_register_class_id", VOID, &[I32]);
@@ -1210,6 +1267,12 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // Decl-site snapshot of a function-nested class's captured locals —
     // consumed by the dynamic-construction replay (`new mod.C()`).
     module.declare_function("js_class_register_capture_values", VOID, &[I32, PTR, I64]);
+    // #6052: TDZ-suppression window around the snapshot's capture loads — a
+    // refresh emitted between two `let`/`const` initializers (the #6037
+    // refresh-after-each-assignment strategy) legally reads a sibling capture
+    // still in its dead zone; it must snapshot `undefined`, not throw.
+    module.declare_function("js_tdz_suppress_begin", VOID, &[]);
+    module.declare_function("js_tdz_suppress_end", VOID, &[]);
     // Static-method prologue read of one decl-site capture snapshot slot.
     module.declare_function("js_class_capture_value", DOUBLE, &[I32, I32]);
     // #5437: snapshot slot read with a `new`-site appended cap-arg fallback
@@ -1337,10 +1400,31 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // #5389 Tier 2: synchronous ambient require(spec) resolution — the codegen
     // fallthrough when a computed require() didn't const-fold to a compiled target.
     module.declare_function("js_module_ambient_require_apply", DOUBLE, &[DOUBLE]);
+    // #6660: dynamic-`import(spec)` unresolved / no-match fallback — builtins
+    // resolve by string (promise-wrapped), everything else rejects with an
+    // `ERR_MODULE_NOT_FOUND` Error (never literal `undefined`). The deferred
+    // variant carries the #5230 compile-time deferral message for unknown
+    // modules.
+    module.declare_function("js_module_dynamic_import_fallback", DOUBLE, &[DOUBLE]);
+    module.declare_function(
+        "js_module_dynamic_import_deferred",
+        DOUBLE,
+        &[DOUBLE, DOUBLE],
+    );
+    // #6644: `module.createRequire(...)` devirt entry — arms the nm/submod
+    // install-all hooks before delegating (see js_process_get_builtin_module_devirt).
+    module.declare_function("js_module_create_require_devirt", DOUBLE, &[DOUBLE]);
     // Non-throwing global read for `typeof <unresolved>` + global read-modify-
     // write for `i++`/`i--` on a sloppy implicit global (#3575).
     module.declare_function("js_global_get_optional", DOUBLE, &[DOUBLE]);
     module.declare_function("js_global_update", DOUBLE, &[DOUBLE, DOUBLE, DOUBLE]);
+    // #5989: strict-mode `Date = wrapped` — write an EXISTING global
+    // property, throw the spec ReferenceError only when absent.
+    module.declare_function(
+        "js_global_assign_existing_or_throw",
+        DOUBLE,
+        &[DOUBLE, DOUBLE],
+    );
     module.declare_function("js_throw_reference_error_this_before_super", DOUBLE, &[]);
     module.declare_function("js_throw_reference_error_super_delete", DOUBLE, &[]);
     module.declare_function(

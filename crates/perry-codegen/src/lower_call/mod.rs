@@ -32,11 +32,13 @@ use crate::expr::{variant_name, FnCtx};
 //   extraction of the original `lower_call.rs`'s 4.3k-LOC body so
 //   every file in this directory stays under 2000 lines.
 mod atomics;
-mod buffer_intrinsic;
+pub(crate) mod buffer_intrinsic;
 mod builtin;
+mod builtin_table_gate;
 mod capture_writeback;
 mod closure_analysis;
 mod console_promise;
+mod dataview_intrinsic;
 mod early_branches;
 mod event_target;
 mod extern_func;
@@ -49,6 +51,7 @@ mod native;
 mod native_module_dispatch;
 mod native_table;
 mod new;
+mod new_ctor_args;
 mod new_helpers;
 mod omitted_native_params;
 mod options;
@@ -95,7 +98,10 @@ pub(super) use ui_tables::{
 pub(super) use native_module_dispatch::{lower_native_module_dispatch, native_module_lookup};
 // And the closure-analysis helpers — `native.rs` uses them via
 // `super::` for the perry/thread thread-safety check.
-pub(super) use closure_analysis::{collect_closure_introduced_ids, find_outer_writes_stmt};
+pub(super) use closure_analysis::{
+    collect_closure_introduced_ids, find_outer_writes_stmt, find_thread_hazard_in_body,
+    hazardous_module_global_ids, ThreadClosureHazard,
+};
 
 // Re-export pub(crate) so callers outside this module (e.g.
 // `crate::expr::use crate::lower_call::lower_native_method_call;`)
@@ -105,9 +111,9 @@ pub(crate) use native::lower_native_method_call;
 // (codegen.rs / expr.rs / stmt.rs) so `crate::lower_call::lower_new`
 // etc. keep resolving after the split.
 pub(crate) use field_init::{apply_field_initializers_recursive, FieldInitMode};
-pub(crate) use new::{
-    bind_inline_constructor_params, emit_class_capture_writeback, lower_new,
-    lower_new_member_captured, restore_inline_constructor_scope, CaptureFill,
+pub(crate) use new::{emit_class_capture_writeback, lower_new, lower_new_member_captured};
+pub(crate) use new_ctor_args::{
+    bind_inline_constructor_params, restore_inline_constructor_scope, CaptureFill,
 };
 // The derived-ctor no-super static-throw predicates (shared with the
 // standalone-ctor-symbol path in `codegen/method.rs`, which is the default
@@ -118,6 +124,12 @@ pub(crate) use new_helpers::{
     ctor_body_calls_super, ctor_body_closure_calls_super, ctor_body_has_value_return,
     ctor_body_uses_this,
 };
+// #6325 / #6326: the class-chain walk to a native base whose surface perry
+// stamps onto the instance, plus its init emitter. Shared by the implicit
+// (no-own-ctor) `new` path in `new.rs` and the explicit-`super()` arm in
+// `expr/this_super_call.rs`, which are the two places a derived constructor can
+// reach the base.
+pub(crate) use new_helpers::{emit_native_instance_base_init, native_instance_base_in_chain};
 // `extract_options_fields` is consumed by `expr.rs` as
 // `crate::lower_call::extract_options_fields` — keep that path stable.
 pub(crate) use options::extract_options_fields;

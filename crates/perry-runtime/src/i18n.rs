@@ -3,10 +3,16 @@
 //! Provides locale detection and a global locale index used by compiled code
 //! to select translations from the embedded i18n string table.
 
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 /// Global locale index. 0 = default locale. Set once at startup by perry_i18n_init().
 static LOCALE_INDEX: AtomicI32 = AtomicI32::new(0);
+
+/// Whether LOCALE_INDEX has been resolved (via `perry_i18n_init`, an explicit
+/// `perry_i18n_set_locale_index`, or the lazy `perry_i18n_locale_index_for`).
+/// Guards the lazy path so system-locale detection runs at most once and an
+/// explicit set always wins over lazy detection.
+static LOCALE_RESOLVED: AtomicBool = AtomicBool::new(false);
 
 /// Returns the current locale index. Called by compiled code to select
 /// the correct translation from the i18n string table.
@@ -19,22 +25,73 @@ pub extern "C" fn perry_i18n_get_locale_index() -> i32 {
 #[no_mangle]
 pub extern "C" fn perry_i18n_set_locale_index(idx: i32) {
     LOCALE_INDEX.store(idx, Ordering::Relaxed);
+    LOCALE_RESOLVED.store(true, Ordering::Release);
 }
 
-/// Initialize the i18n system. Detects the system locale and matches it against
-/// the configured locale list to set LOCALE_INDEX.
+/// Lazily resolve the locale index for a compiled i18n string table.
+///
+/// Called by the `Expr::I18nString` lowering at each localized-string site
+/// (cheap after the first call). `locales_header` is a StringHeader whose
+/// payload is the comma-separated configured locale list in string-table
+/// row order (e.g. `"en,de,fr"` — one interned literal per binary);
+/// `default_idx` is the configured default locale's row index.
+///
+/// First call detects the system locale (platform APIs, then env vars) and
+/// matches it against the list; no match → `default_idx`. The result is
+/// cached in LOCALE_INDEX, so a preceding `perry_i18n_set_locale_index`
+/// (dynamic switching) always wins.
+#[no_mangle]
+pub extern "C" fn perry_i18n_locale_index_for(
+    locales_header: *const crate::StringHeader,
+    default_idx: i32,
+) -> i32 {
+    if !LOCALE_RESOLVED.load(Ordering::Acquire) {
+        let resolved = (|| -> Option<i32> {
+            if locales_header.is_null() {
+                return None;
+            }
+            let payload = unsafe {
+                let len = (*locales_header).byte_len as usize;
+                let data = locales_header.add(1) as *const u8;
+                std::str::from_utf8(std::slice::from_raw_parts(data, len)).ok()?
+            };
+            let locales: Vec<&str> = payload.split(',').filter(|s| !s.is_empty()).collect();
+            if locales.is_empty() {
+                return None;
+            }
+            let system_locale = detect_system_locale()?;
+            match_locale(&system_locale, &locales).map(|idx| idx as i32)
+        })()
+        .unwrap_or(default_idx);
+        LOCALE_INDEX.store(resolved, Ordering::Relaxed);
+        LOCALE_RESOLVED.store(true, Ordering::Release);
+    }
+    LOCALE_INDEX.load(Ordering::Relaxed)
+}
+
+/// Initialize the i18n system. Registers the configured locale-code list
+/// (used by the plural rules and the locale-aware format wrappers), detects
+/// the system locale, and matches it against the list to set LOCALE_INDEX.
 ///
 /// # Arguments
 /// * `locale_codes` - Array of locale code C-string pointers (e.g., "en\0", "de\0")
 /// * `locale_lens` - Array of locale code lengths (without null terminator)
 /// * `count` - Number of locales
+/// * `default_idx` - Row index of the configured `default_locale` (used when
+///   no configured locale matches the detected system locale — the default
+///   is not necessarily row 0)
 ///
-/// Called once from the entry module's init function.
+/// Called once from the entry module's `main` prelude when the project
+/// configures `[i18n]` in perry.toml. Diagnostics: set `PERRY_I18N_DEBUG=1`
+/// to write the detection log to `$HOME/Documents/i18n-debug.log` (always
+/// written on the embedded Apple targets, where the file is retrieved via
+/// devicectl and env vars don't exist).
 #[no_mangle]
 pub extern "C" fn perry_i18n_init(
     locale_codes: *const *const u8,
     locale_lens: *const u32,
     count: u32,
+    default_idx: i32,
 ) {
     if count == 0 || locale_codes.is_null() || locale_lens.is_null() {
         return;
@@ -57,37 +114,98 @@ pub extern "C" fn perry_i18n_init(
         return;
     }
 
+    // Register the locale-code list so `perry_i18n_plural_category` and the
+    // `get_locale_code`-backed format wrappers can map LOCALE_INDEX back to
+    // a locale code. (`perry_i18n_set_plural_locales` remains available as a
+    // standalone setter, but a single init call covers both jobs.)
+    set_locale_codes(locales.iter().map(|s| s.to_string()).collect());
+
     // Detect system locale
     let system_locale = detect_system_locale();
 
     let mut log = format!("[i18n] configured locales: {:?}\n", locales);
     log += &format!("[i18n] detected system locale: {:?}\n", system_locale);
 
-    if let Some(locale_str) = system_locale {
-        if let Some(idx) = match_locale(&locale_str, &locales) {
-            log += &format!("[i18n] matched locale index: {} ({})\n", idx, locales[idx]);
-            LOCALE_INDEX.store(idx as i32, Ordering::Relaxed);
-        } else {
-            log += "[i18n] no match found, using default (index 0)\n";
-        }
+    let default_idx = if default_idx >= 0 && (default_idx as usize) < locales.len() {
+        default_idx
     } else {
-        log += "[i18n] no system locale detected, using default (index 0)\n";
+        0
+    };
+    let resolved = system_locale
+        .as_deref()
+        .and_then(|locale_str| match_locale(locale_str, &locales))
+        .map(|idx| idx as i32);
+    match resolved {
+        Some(idx) => {
+            log += &format!(
+                "[i18n] matched locale index: {} ({})\n",
+                idx, locales[idx as usize]
+            );
+            LOCALE_INDEX.store(idx, Ordering::Relaxed);
+        }
+        None => {
+            log += &format!(
+                "[i18n] no match found, using default (index {})\n",
+                default_idx
+            );
+            LOCALE_INDEX.store(default_idx, Ordering::Relaxed);
+        }
     }
+    LOCALE_RESOLVED.store(true, Ordering::Release);
     log += &format!(
         "[i18n] final LOCALE_INDEX: {}\n",
         LOCALE_INDEX.load(Ordering::Relaxed)
     );
 
-    // Write to Documents for retrieval via devicectl
-    if let Ok(home) = std::env::var("HOME") {
-        let _ = std::fs::write(format!("{}/Documents/i18n-debug.log", home), log.as_bytes());
+    // Write to Documents for retrieval via devicectl on the embedded Apple
+    // targets; everywhere else only on explicit request. The unconditional
+    // write polluted `~/Documents` on every desktop i18n binary startup.
+    let force_log = cfg!(any(
+        target_os = "ios",
+        target_os = "watchos",
+        target_os = "tvos",
+        target_os = "visionos"
+    ));
+    if force_log || std::env::var_os("PERRY_I18N_DEBUG").is_some() {
+        if let Ok(home) = std::env::var("HOME") {
+            let _ = std::fs::write(format!("{}/Documents/i18n-debug.log", home), log.as_bytes());
+        }
     }
 }
 
 /// Detect the system locale from environment or platform APIs.
 fn detect_system_locale() -> Option<String> {
-    // 1. Platform-native APIs first (most reliable on GUI apps)
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    // 1. Explicit POSIX env overrides first: LANGUAGE (GNU extension,
+    //    colon-separated list), then LC_ALL > LC_MESSAGES > LANG. A user who
+    //    runs `LANG=de_DE.UTF-8 ./app` has stated a preference; platform
+    //    APIs like CFLocaleCopyCurrent would otherwise mask it on macOS,
+    //    which pinned every console binary to the Mac's system language no
+    //    matter what the environment said. GUI launches (Finder,
+    //    SpringBoard, …) don't set these vars, so apps still fall through
+    //    to the platform-native detection below.
+    if let Ok(lang) = std::env::var("LANGUAGE") {
+        if let Some(first) = lang.split(':').next() {
+            if !first.is_empty() && first != "C" && first != "POSIX" {
+                return Some(first.to_string());
+            }
+        }
+    }
+    for var in &["LC_ALL", "LC_MESSAGES", "LANG"] {
+        if let Ok(val) = std::env::var(var) {
+            if !val.is_empty() && val != "C" && val != "POSIX" {
+                return Some(val);
+            }
+        }
+    }
+
+    // 2. Platform-native APIs (GUI apps and env-less environments).
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "watchos",
+        target_os = "tvos",
+        target_os = "visionos"
+    ))]
     {
         if let Some(locale) = detect_apple_locale() {
             return Some(locale);
@@ -105,25 +223,6 @@ fn detect_system_locale() -> Option<String> {
     {
         if let Some(locale) = detect_android_locale() {
             return Some(locale);
-        }
-    }
-
-    // 2. Environment variables (Linux, or fallback on other platforms)
-    // Try LANGUAGE first (GNU extension, colon-separated list)
-    if let Ok(lang) = std::env::var("LANGUAGE") {
-        if let Some(first) = lang.split(':').next() {
-            if !first.is_empty() {
-                return Some(first.to_string());
-            }
-        }
-    }
-
-    // Try LC_ALL, then LC_MESSAGES, then LANG
-    for var in &["LC_ALL", "LC_MESSAGES", "LANG"] {
-        if let Ok(val) = std::env::var(var) {
-            if !val.is_empty() && val != "C" && val != "POSIX" {
-                return Some(val);
-            }
         }
     }
 
@@ -173,10 +272,17 @@ fn match_locale(system_locale: &str, locales: &[&str]) -> Option<usize> {
 // Platform-native locale detection
 // ============================================================================
 
-/// Apple platforms (macOS + iOS): use NSBundle.mainBundle.preferredLocalizations
-/// to respect per-app language settings in iOS Settings.
-/// Falls back to CFLocaleCopyCurrent if NSBundle is unavailable.
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+/// Apple platforms (macOS, iOS, watchOS, tvOS, visionOS): use
+/// NSBundle.mainBundle.preferredLocalizations to respect per-app language
+/// settings in Settings. Falls back to CFLocaleCopyCurrent if NSBundle is
+/// unavailable. Both APIs exist on every Apple OS.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "watchos",
+    target_os = "tvos",
+    target_os = "visionos"
+))]
 fn detect_apple_locale() -> Option<String> {
     type CFTypeRef = *const std::ffi::c_void;
     type CFStringRef = CFTypeRef;
@@ -405,24 +511,21 @@ pub extern "C" fn perry_i18n_interpolate(
 /// Returns the CLDR plural category for a given count in a given locale.
 /// Categories: 0=zero, 1=one, 2=two, 3=few, 4=many, 5=other
 ///
+/// `count` accepts either a plain f64 or a NaN-boxed JSValue (string/int32/
+/// bool boxes coerce through the standard ToNumber ladder), so codegen can
+/// pass the lowered `{count}` parameter value directly.
+///
 /// Based on CLDR plural rules v44.
 #[no_mangle]
 pub extern "C" fn perry_i18n_plural_category(locale_idx: i32, count: f64) -> i32 {
-    // The locale_idx maps to the locale code set during init.
-    // We use a thread-local to store the locale codes for lookup.
-    let category = PLURAL_LOCALE_CODES.with(|codes| {
-        let codes = codes.borrow();
-        let locale = codes
-            .get(locale_idx as usize)
-            .map(|s| s.as_str())
-            .unwrap_or("en");
-        cldr_plural_category(locale, count)
-    });
-    category as i32
+    let n = crate::builtins::js_number_coerce(count);
+    let locale = get_locale_code(locale_idx);
+    cldr_plural_category(&locale, n) as i32
 }
 
 /// Initialize the plural rule locale code list.
-/// Called from codegen init alongside perry_i18n_init.
+/// `perry_i18n_init` registers the same list itself; this standalone setter
+/// remains for callers that manage the locale registry separately.
 #[no_mangle]
 pub extern "C" fn perry_i18n_set_plural_locales(
     locale_codes: *const *const u8,
@@ -440,14 +543,55 @@ pub extern "C" fn perry_i18n_set_plural_locales(
             std::str::from_utf8(bytes).ok().map(|s| s.to_string())
         })
         .collect();
-    PLURAL_LOCALE_CODES.with(|codes| {
-        *codes.borrow_mut() = locales;
-    });
+    set_locale_codes(locales);
 }
 
-use std::cell::RefCell;
-thread_local! {
-    static PLURAL_LOCALE_CODES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+use std::sync::RwLock;
+
+/// Configured locale codes in string-table row order. Process-global (not
+/// thread-local): it is written once at startup by `perry_i18n_init` /
+/// `perry_i18n_set_plural_locales` on the main thread, and `perry/thread`
+/// workers must see the same registry — a thread-local left every spawned
+/// thread with an empty list, silently pinning plurals and format wrappers
+/// to "en" off the main thread.
+static LOCALE_CODES: RwLock<Vec<String>> = RwLock::new(Vec::new());
+
+/// `[i18n.currencies]` overrides from perry.toml: `(locale, ISO 4217 code)`
+/// pairs, written once at startup by `perry_i18n_set_currencies`.
+static CURRENCY_OVERRIDES: RwLock<Vec<(String, String)>> = RwLock::new(Vec::new());
+
+fn set_locale_codes(locales: Vec<String>) {
+    if let Ok(mut codes) = LOCALE_CODES.write() {
+        *codes = locales;
+    }
+}
+
+/// Register the `[i18n.currencies]` map. `pairs` is a comma-separated
+/// `locale=CODE` list (e.g. `"en=USD,de=EUR"`), baked into the binary by
+/// codegen from perry.toml and passed here from the entry `main` prelude.
+#[no_mangle]
+pub extern "C" fn perry_i18n_set_currencies(pairs_ptr: *const u8, pairs_len: u32) {
+    if pairs_ptr.is_null() || pairs_len == 0 {
+        return;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(pairs_ptr, pairs_len as usize) };
+    let Ok(s) = std::str::from_utf8(bytes) else {
+        return;
+    };
+    let parsed: Vec<(String, String)> = s
+        .split(',')
+        .filter_map(|pair| {
+            let (locale, code) = pair.split_once('=')?;
+            let (locale, code) = (locale.trim(), code.trim());
+            if locale.is_empty() || code.is_empty() {
+                return None;
+            }
+            Some((locale.to_string(), code.to_string()))
+        })
+        .collect();
+    if let Ok(mut overrides) = CURRENCY_OVERRIDES.write() {
+        *overrides = parsed;
+    }
 }
 
 /// CLDR plural category constants
@@ -757,13 +901,72 @@ fn locale_format(locale: &str) -> LocaleFormat {
 }
 
 fn get_locale_code(locale_idx: i32) -> String {
-    PLURAL_LOCALE_CODES.with(|codes| {
-        let codes = codes.borrow();
-        codes
-            .get(locale_idx as usize)
-            .cloned()
-            .unwrap_or_else(|| "en".to_string())
-    })
+    LOCALE_CODES
+        .read()
+        .ok()
+        .and_then(|codes| codes.get(locale_idx as usize).cloned())
+        .unwrap_or_else(|| "en".to_string())
+}
+
+/// Map an ISO 4217 currency code to its conventional symbol. Codes without
+/// a well-known single symbol render as the code itself (CLDR does the
+/// same for e.g. CHF).
+fn iso_currency_symbol(code: &str) -> &str {
+    match code.to_ascii_uppercase().as_str() {
+        "USD" => "$",
+        "EUR" => "€",
+        "GBP" => "£",
+        "JPY" | "CNY" => "¥",
+        "KRW" => "₩",
+        "INR" => "₹",
+        "RUB" => "₽",
+        "PLN" => "zł",
+        "CZK" => "Kč",
+        "TRY" => "₺",
+        "UAH" => "₴",
+        "ILS" => "₪",
+        "THB" => "฿",
+        "VND" => "₫",
+        "PHP" => "₱",
+        "NGN" => "₦",
+        "BRL" => "R$",
+        "CAD" => "CA$",
+        "AUD" => "A$",
+        "HKD" => "HK$",
+        "NZD" => "NZ$",
+        "MXN" => "MX$",
+        "SEK" | "NOK" | "DKK" | "ISK" => "kr",
+        _ => code,
+    }
+}
+
+/// Resolve the currency symbol for the active locale: an `[i18n.currencies]`
+/// override (exact locale match first, then base-language match) wins over
+/// the locale's built-in default symbol.
+fn currency_symbol_for(locale: &str, fmt: &LocaleFormat) -> String {
+    let lang = locale
+        .split(&['-', '_'][..])
+        .next()
+        .unwrap_or(locale)
+        .to_lowercase();
+    let overridden = CURRENCY_OVERRIDES.read().ok().and_then(|overrides| {
+        overrides
+            .iter()
+            .find(|(l, _)| l.eq_ignore_ascii_case(locale))
+            .or_else(|| {
+                overrides.iter().find(|(l, _)| {
+                    l.split(&['-', '_'][..])
+                        .next()
+                        .map(|base| base.eq_ignore_ascii_case(&lang))
+                        .unwrap_or(false)
+                })
+            })
+            .map(|(_, code)| code.clone())
+    });
+    match overridden {
+        Some(code) => iso_currency_symbol(&code).to_string(),
+        None => fmt.currency_symbol.to_string(),
+    }
 }
 
 /// Format a number with locale-appropriate grouping and decimal separator.
@@ -828,6 +1031,7 @@ pub extern "C" fn perry_i18n_format_currency(
 ) -> *mut crate::StringHeader {
     let locale = get_locale_code(locale_idx);
     let fmt = locale_format(&locale);
+    let currency_symbol = currency_symbol_for(&locale, &fmt);
 
     let is_negative = value < 0.0;
     let abs = value.abs();
@@ -853,13 +1057,13 @@ pub extern "C" fn perry_i18n_format_currency(
             "{}{}\u{00a0}{}",
             if is_negative { "-" } else { "" },
             number_str,
-            fmt.currency_symbol
+            currency_symbol
         )
     } else {
         format!(
             "{}{}{}",
             if is_negative { "-" } else { "" },
-            fmt.currency_symbol,
+            currency_symbol,
             number_str
         )
     };

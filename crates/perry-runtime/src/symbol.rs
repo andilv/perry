@@ -41,7 +41,7 @@ pub(crate) use properties::{
     get_symbol_property_attrs, inspect_custom_symbol_ptr, js_object_define_symbol_accessor,
     js_object_delete_symbol_property, js_object_has_own_symbol_property,
     reflect_symbol_getter_closure_bits, set_symbol_property_attrs, symbol_accessor_descriptor_bits,
-    symbol_property_is_enumerable, symbol_property_root_bits,
+    symbol_property_is_enumerable, symbol_property_is_non_writable, symbol_property_root_bits,
 };
 pub use properties::{
     class_static_symbol_lookup, js_class_register_static_symbol, js_object_has_own_symbol,
@@ -54,6 +54,7 @@ pub use get::js_object_get_symbol_property;
 pub(crate) use get::{inherited_symbol_property, own_symbol_property};
 
 // Iterator protocol, getOwnPropertySymbols, ToPrimitive.
+pub(crate) use iterator::class_ref_resolves_iterator;
 pub use iterator::{
     js_get_iterator, js_iterator_result_validate, js_object_get_own_property_symbols,
     js_to_primitive,
@@ -226,6 +227,40 @@ pub(crate) fn register_symbol_pointer(ptr: usize) {
     guard.as_mut().unwrap().insert(ptr);
 }
 
+// The `%Intl%.[[FallbackSymbol]]` — a single per-realm symbol whose description
+// is exactly `"IntlLegacyConstructedSymbol"` (no `Symbol.` prefix, so it is
+// *not* a well-known symbol). It is stashed on the receiver when a legacy Intl
+// service constructor (`Intl.NumberFormat` / `Intl.DateTimeFormat`) is called as
+// a plain function whose `this` is on the constructor's prototype chain (the
+// ChainNumberFormat / ChainDateTimeFormat normative-optional path), and read
+// back by the UnwrapXxx step so `nf.resolvedOptions()` on the wrapped object
+// still works.
+static INTL_FALLBACK_SYMBOL: Mutex<Option<usize>> = Mutex::new(None);
+
+/// Return the process-wide `%Intl%.[[FallbackSymbol]]` as a NaN-boxed
+/// (POINTER_TAG) JSValue, allocating & registering it lazily on first use.
+pub fn intl_legacy_constructed_symbol() -> f64 {
+    let mut guard = INTL_FALLBACK_SYMBOL.lock().unwrap();
+    if let Some(ptr) = *guard {
+        return f64::from_bits(POINTER_TAG | (ptr as u64 & POINTER_MASK));
+    }
+    // Persistent (leaked) symbol so it outlives every GC cycle — its identity is
+    // realm-global. Description text lives in REGISTERED_SYMBOL_DESCRIPTIONS
+    // (readers materialize a fresh StringHeader on demand), matching the
+    // well-known-symbol contract.
+    let boxed = Box::new(SymbolHeader {
+        magic: SYMBOL_MAGIC,
+        registered: 0,
+        description: std::ptr::null_mut(),
+        id: next_id(),
+    });
+    let sym_ptr = Box::into_raw(boxed) as usize;
+    record_registered_symbol_description(sym_ptr, "IntlLegacyConstructedSymbol");
+    register_symbol_pointer(sym_ptr);
+    *guard = Some(sym_ptr);
+    f64::from_bits(POINTER_TAG | (sym_ptr as u64 & POINTER_MASK))
+}
+
 /// O(1) check whether a raw pointer (already untagged) is a known Symbol.
 /// Safe to call on any pointer-shaped value — no dereference is performed.
 pub fn is_registered_symbol(ptr: usize) -> bool {
@@ -259,6 +294,57 @@ static SYMBOL_PROPERTIES: Mutex<Option<HashMap<usize, Vec<(usize, u64)>>>> = Mut
 // defaults, so absence here means writable/enumerable/configurable are all true.
 static SYMBOL_PROPERTY_ATTRS: Mutex<Option<HashMap<(usize, usize), crate::object::PropertyAttrs>>> =
     Mutex::new(None);
+
+/// Death pruning for the symbol-keyed property side tables (2026-07-09 GC
+/// audit wave 2). Both tables are PROCESS-global and owner-keyed; the values
+/// are strongly rooted by `symbol/gc_roots.rs`, so entries of a dead owner
+/// immortalized the whole value graph. `is_dead_owner` is one of the GC's
+/// deadness predicates (`gc::dead_owner`), which only attributes THIS
+/// thread's heap addresses — entries owned by other threads' objects are
+/// skipped (documented residual: cross-thread owners are only reclaimed by
+/// the owning thread's own collections; addresses that classify as no-heap
+/// are never pruned).
+pub(crate) fn prune_dead_symbol_property_owners(is_dead_owner: &dyn Fn(usize) -> bool) {
+    let mut verdicts: HashMap<usize, bool> = HashMap::new();
+    {
+        let mut guard = crate::gc::lock_gc_root_registry(&SYMBOL_PROPERTIES);
+        if let Some(map) = guard.as_mut() {
+            map.retain(|owner, _| {
+                !*verdicts
+                    .entry(*owner)
+                    .or_insert_with(|| is_dead_owner(*owner))
+            });
+        }
+    }
+    {
+        let mut guard = crate::gc::lock_gc_root_registry(&SYMBOL_PROPERTY_ATTRS);
+        if let Some(map) = guard.as_mut() {
+            map.retain(|(owner, _), _| {
+                !*verdicts
+                    .entry(*owner)
+                    .or_insert_with(|| is_dead_owner(*owner))
+            });
+        }
+    }
+}
+
+/// Death pruning for `SYMBOL_POINTERS` (2026-07-09 GC audit wave 2): one
+/// entry per `Symbol()` ever created, previously only forward-renamed on
+/// moves and never removed on death — so the set grew monotonically and
+/// `js_is_symbol` aliased later allocations at recycled addresses.
+/// `is_dead_symbol` is a `gc::dead_owner` predicate narrowed to
+/// `GC_TYPE_STRING` (what `alloc_symbol` gc_malloc's). `Box`-leaked
+/// persistent symbols (well-known, `Symbol.for`, the Intl fallback) have no
+/// GcHeader and are skipped by the predicate's heap attribution. Residual:
+/// a symbol freed by a minor malloc sweep between full traces leaves its
+/// entry behind permanently (the address no longer attributes) — fixing
+/// that needs a dedicated symbol GC type with a finalize hook.
+pub(crate) fn prune_dead_symbol_pointers(is_dead_symbol: &dyn Fn(usize) -> bool) {
+    let mut guard = crate::gc::lock_gc_root_registry(&SYMBOL_POINTERS);
+    if let Some(set) = guard.as_mut() {
+        set.retain(|&ptr| !is_dead_symbol(ptr));
+    }
+}
 
 // Monotonic id counter for fresh symbols. Not thread-safe per-thread but
 // Symbol semantics are compatible with coarse locking.
@@ -363,6 +449,48 @@ pub(crate) unsafe fn sym_key_from_f64(sym_f64: f64) -> usize {
     ptr as usize
 }
 
+/// Monotonic gate (#6386): has a `Symbol.isConcatSpreadable`-keyed property
+/// EVER been installed anywhere (instance symbol store, symbol accessor,
+/// symbol defineProperty attrs, class static symbol)? While `false`, the
+/// spreadable read `Array.prototype.concat` performs per argument is
+/// guaranteed to find undefined for any non-proxy value — and to be
+/// side-effect free — so the whole lookup ladder can be skipped.
+static CONCAT_SPREADABLE_EVER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn concat_spreadable_symbol_ever_set() -> bool {
+    CONCAT_SPREADABLE_EVER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Note a symbol-keyed property install. Flips the gate when the key is the
+/// well-known `isConcatSpreadable`. Must be called BEFORE the table insert in
+/// every install funnel, so a `false` (acquire) read can never race a
+/// completed insert.
+pub(crate) fn note_symbol_key_installed(sym_key: usize) {
+    if sym_key == 0 || CONCAT_SPREADABLE_EVER.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    // Non-allocating peek: a stored key can only BE the well-known
+    // `isConcatSpreadable` if that symbol was already materialized (every
+    // user route to it goes through `well_known_symbol`). Never create it
+    // here — this runs on every symbol install and must not perturb
+    // allocation accounting.
+    let wk = well_known_symbol_if_cached("isConcatSpreadable");
+    if !wk.is_null() && sym_key == wk as usize {
+        CONCAT_SPREADABLE_EVER.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// The cached well-known symbol pointer if `short_name` was ever
+/// materialized, else null. Unlike [`well_known_symbol`], never allocates.
+pub(crate) fn well_known_symbol_if_cached(short_name: &str) -> *mut SymbolHeader {
+    let guard = WELL_KNOWN_SYMBOLS.lock().unwrap();
+    guard
+        .as_ref()
+        .and_then(|m| m.get(short_name).copied())
+        .unwrap_or(0) as *mut SymbolHeader
+}
+
 pub(crate) fn publish_symbol_side_table_root_edges(sym_key: usize, value_bits: u64) {
     crate::gc::runtime_write_barrier_root_raw_ptr(sym_key as *const SymbolHeader);
     crate::gc::runtime_write_barrier_root_nanbox(value_bits);
@@ -373,6 +501,7 @@ pub(crate) fn store_object_symbol_property_root(
     sym_key: usize,
     value_bits: u64,
 ) -> bool {
+    note_symbol_key_installed(sym_key);
     {
         let mut guard = crate::gc::lock_gc_root_registry(&SYMBOL_PROPERTIES);
         if guard.is_none() {
@@ -395,6 +524,7 @@ pub(crate) fn store_object_symbol_property_root(
 }
 
 pub(crate) fn store_class_static_symbol_root(class_id: u32, sym_key: usize, value_bits: u64) {
+    note_symbol_key_installed(sym_key);
     {
         let mut guard = crate::gc::lock_gc_root_registry(&CLASS_STATIC_SYMBOLS);
         if guard.is_none() {

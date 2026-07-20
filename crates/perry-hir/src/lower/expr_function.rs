@@ -193,6 +193,10 @@ pub(super) fn lower_arrow(ctx: &mut LoweringContext, arrow: &ast::ArrowExpr) -> 
     // #4101: retain source text for `fn.toString()`.
     capture_function_source(ctx, func_id, &arrow.span, arrow.is_async);
     let scope_mark = ctx.enter_scope();
+    // #6604: truncate mark for capturing class expressions recorded while
+    // lowering THIS arrow — placed at scope entry so default-param
+    // expressions are covered too; see the truncate below the body match.
+    let body_class_expr_captures_mark = ctx.body_class_expr_captures.len();
     let strict = ctx.current_strict_mode()
         || match &*arrow.body {
             ast::BlockStmtOrExpr::BlockStmt(block) => {
@@ -286,6 +290,12 @@ pub(super) fn lower_arrow(ctx: &mut LoweringContext, arrow: &ast::ArrowExpr) -> 
     // Register arrow function parameters with known native types as native instances
     for param in &params {
         if let Type::Named(type_name) = &param.ty {
+            // #6003: a param typed with a USER class that shares a native
+            // name (`class Headers { ... }; (h: Headers) => ...`) must
+            // dispatch through the user class, not the native FFI.
+            if ctx.lookup_class(type_name).is_some() {
+                continue;
+            }
             let native_info = match type_name.as_str() {
                 "PluginApi" => Some(("perry/plugin", "PluginApi")),
                 "WebSocket" | "WebSocketServer" => Some(("ws", type_name.as_str())),
@@ -371,6 +381,17 @@ pub(super) fn lower_arrow(ctx: &mut LoweringContext, arrow: &ast::ArrowExpr) -> 
             vec![Stmt::Return(Some(return_expr))]
         }
     };
+    // #6604: a capturing class expression in an EXPRESSION-bodied arrow
+    // (`x => new (class { … })(x)`) records a body-class-expr entry that no
+    // body twin will drain (the block-bodied arm drains its own inside
+    // `lower_fn_body_block_stmt`; default-param entries are self-truncated by
+    // `get_param_default`). Truncate on exit so the entry — whose ids are
+    // only meaningful in the arrow's own local numbering — never leaks into
+    // the ENCLOSING body's refresh statements. Nothing is lost: a
+    // single-expression body has no later statements that could reassign the
+    // class's captured locals.
+    ctx.body_class_expr_captures
+        .truncate(body_class_expr_captures_mark);
     ctx.current_strict = outer_strict;
 
     // Prepend destructuring statements to body
@@ -573,6 +594,13 @@ fn lower_fn_expr_anon(ctx: &mut LoweringContext, fn_expr: &ast::FnExpr) -> Resul
         fn_expr.function.is_async,
     );
     let scope_mark = ctx.enter_scope();
+    // #6604: capturing class EXPRESSIONS lowered in THIS function register
+    // from here for the end-of-body refresh (twin of
+    // `lower_fn_body_block_stmt`); the mark sits at scope entry so nothing
+    // recorded for this function can leak into the enclosing body.
+    // (Default-param entries never reach the drain — `get_param_default`
+    // self-truncates.)
+    let body_class_expr_captures_mark = ctx.body_class_expr_captures.len();
     // A plain function has its own `arguments` object, so a direct `eval`
     // inside its body may reference `arguments` even when the function sits
     // in a class field initializer. Cleared here, restored at the end.
@@ -781,7 +809,7 @@ fn lower_fn_expr_anon(ctx: &mut LoweringContext, fn_expr: &ast::FnExpr) -> Resul
                                 .lookup_index_in_scope(&name, outer_locals_len)
                                 .is_some();
                             if !already_in_scope {
-                                let id = ctx.define_local(name, Type::Any);
+                                let id = ctx.define_local(name.clone(), Type::Any);
                                 // Mark as hoisted so closures created
                                 // before the var's init expression see
                                 // it through a box (mutable capture),
@@ -808,6 +836,32 @@ fn lower_fn_expr_anon(ctx: &mut LoweringContext, fn_expr: &ast::FnExpr) -> Resul
                                 // sibling-capture symptom, extended to
                                 // forward-var captures).
                                 hoisted_id_set.insert(id);
+                                // Emit an undefined-initialised entry slot,
+                                // exactly like the nested-`var` pre-pass
+                                // below (and `predefine_var_bindings_in_
+                                // function_body` on the fn-decl/arrow path).
+                                // The `hoisted_id_set` box above only covers
+                                // the forward-CAPTURE case (a closure created
+                                // before the decl reads the box). A `var`
+                                // merely READ/WRITTEN before its own textual
+                                // declaration but NOT captured by any closure
+                                // gets no prealloc box, so without this Let
+                                // its slot first materialises at the late
+                                // `var <name> = …` and every earlier read/
+                                // write folds to `undefined`. React's
+                                // cloneElement/createElement do exactly this:
+                                //   for (propName in o) …;  var propName = …;
+                                // one hoisted `propName` used by the for-in
+                                // loop, then redeclared as a number — so the
+                                // loop body's `hasOwnProperty.call(o, propName)`
+                                // saw `undefined` and dropped every prop.
+                                nested_var_prologue.push(Stmt::Let {
+                                    id,
+                                    name,
+                                    ty: Type::Any,
+                                    mutable: true,
+                                    init: Some(Expr::Undefined),
+                                });
                             }
                         }
                     }
@@ -893,6 +947,9 @@ fn lower_fn_expr_anon(ctx: &mut LoweringContext, fn_expr: &ast::FnExpr) -> Resul
                                     // snapshot of the empty slot.
                                     ctx.var_hoisted_ids.insert(id);
                                     hoisted_id_set.insert(id);
+                                    // Lexical let/const forward-decl: TDZ-eligible.
+                                    // A read before the declaration runs throws.
+                                    ctx.tdz_forward_ids.insert(id);
                                     ctx.lexical_forward_decls.insert(ident.id.span.lo.0, id);
                                 }
                             }
@@ -1115,9 +1172,25 @@ fn lower_fn_expr_anon(ctx: &mut LoweringContext, fn_expr: &ast::FnExpr) -> Resul
                     }
                 }
                 prealloc.sort();
-                if !prealloc.is_empty() {
-                    let mut with_prealloc: Vec<Stmt> = Vec::with_capacity(combined.len() + 1);
-                    with_prealloc.push(Stmt::PreallocateBoxes(prealloc));
+                // Split TDZ-seeded lexical `let`/`const` boxes from ordinary
+                // boxes (see block.rs Phase 5 for the rationale).
+                let mut tdz_prealloc: Vec<LocalId> = Vec::new();
+                let mut plain_prealloc: Vec<LocalId> = Vec::new();
+                for id in prealloc {
+                    if ctx.tdz_forward_ids.contains(&id) {
+                        tdz_prealloc.push(id);
+                    } else {
+                        plain_prealloc.push(id);
+                    }
+                }
+                if !plain_prealloc.is_empty() || !tdz_prealloc.is_empty() {
+                    let mut with_prealloc: Vec<Stmt> = Vec::with_capacity(combined.len() + 2);
+                    if !plain_prealloc.is_empty() {
+                        with_prealloc.push(Stmt::PreallocateBoxes(plain_prealloc));
+                    }
+                    if !tdz_prealloc.is_empty() {
+                        with_prealloc.push(Stmt::PreallocateTdzBoxes(tdz_prealloc));
+                    }
                     with_prealloc.extend(combined);
                     combined = with_prealloc;
                 }
@@ -1144,6 +1217,7 @@ fn lower_fn_expr_anon(ctx: &mut LoweringContext, fn_expr: &ast::FnExpr) -> Resul
     // trailing `return`).
     if let Some(ref block) = fn_expr.function.body {
         let mut re_regs: Vec<Stmt> = Vec::new();
+        let mut re_reg_capsets: Vec<(Stmt, std::collections::HashSet<LocalId>)> = Vec::new();
         for stmt in &block.stmts {
             if let ast::Stmt::Decl(ast::Decl::Class(class_decl)) = stmt {
                 // A colliding `class X` may have been renamed during body
@@ -1159,15 +1233,41 @@ fn lower_fn_expr_anon(ctx: &mut LoweringContext, fn_expr: &ast::FnExpr) -> Resul
                         for s in body.iter_mut() {
                             crate::lower_decl::append_new_args_stmt(s, &cname, &cap_args, true);
                         }
-                        re_regs.push(Stmt::Expr(Expr::RegisterClassCaptures {
+                        let re_reg = Stmt::Expr(Expr::RegisterClassCaptures {
                             class_name: cname,
                             captures,
-                        }));
+                        });
+                        re_reg_capsets.push((re_reg.clone(), captured.iter().copied().collect()));
+                        re_regs.push(re_reg);
                     }
                 }
             }
         }
+        // #6604: capturing class EXPRESSIONS lowered directly in this body —
+        // the semver/esbuild `__commonJS` wrapper shape `var Comparator =
+        // class _Comparator { … }; …; var parseOptions = require_…()` — join
+        // the same refresh machinery as class declarations, so the snapshot
+        // tracks captured vars assigned AFTER the class. Recorded by
+        // `lower_class_expr` under the RESOLVED registration name; see the
+        // block-body twin (`lower_fn_body_block_stmt`) for why no
+        // `append_new_args_stmt` pass runs for expressions.
+        for (cname, ids) in ctx
+            .body_class_expr_captures
+            .split_off(body_class_expr_captures_mark)
+        {
+            let captures: Vec<Expr> = ids.iter().map(|id| Expr::LocalGet(*id)).collect();
+            let re_reg = Stmt::Expr(Expr::RegisterClassCaptures {
+                class_name: cname,
+                captures,
+            });
+            re_reg_capsets.push((re_reg.clone(), ids.iter().copied().collect()));
+            re_regs.push(re_reg);
+        }
         if !re_regs.is_empty() {
+            // Audit P0-B twin of the block-body path: refresh after every
+            // same-body assignment to a captured local so mid-body constructs
+            // read the live value through the authoritative snapshot.
+            insert_class_capture_refresh_after_assignments(&mut body, &re_reg_capsets);
             // Refresh the snapshot before EVERY reachable `return` in the body
             // (not only a trailing one): an EARLY `return <class>` after the
             // captured locals are assigned would otherwise return a class with
@@ -1262,7 +1362,7 @@ fn lower_fn_expr_anon(ctx: &mut LoweringContext, fn_expr: &ast::FnExpr) -> Resul
 /// — a closure's `return` exits a different function and must keep its own
 /// snapshot. Each return path then records the live capture values at that
 /// point. See the call site in `lower_fn_expr_anon` (CodeRabbit #5739).
-fn insert_class_capture_refresh_before_returns(stmts: &mut Vec<Stmt>, re_regs: &[Stmt]) {
+pub(crate) fn insert_class_capture_refresh_before_returns(stmts: &mut Vec<Stmt>, re_regs: &[Stmt]) {
     let mut i = 0;
     while i < stmts.len() {
         insert_class_capture_refresh_into_stmt(&mut stmts[i], re_regs);
@@ -1398,4 +1498,110 @@ fn compute_closure_captures(
         .collect();
 
     (captures, mutable_captures)
+}
+
+/// Insert a class-capture refresh immediately AFTER every statement that
+/// assigns one of the class's captured locals (2026-07-02 audit capture
+/// P0-B). The decl-site snapshot is AUTHORITATIVE at construct time (the
+/// appended cap arg can be a mis-boxed multi-level capture — the W6 class),
+/// so a same-body assignment after the class declaration must update the
+/// snapshot or every later construct reads the stale decl-time value and
+/// `emit_class_capture_writeback` then resets the outer local to it:
+///
+///   let x = 1;
+///   class C { m() { return x; } }
+///   x = 2;                    // ← refresh inserted after this statement
+///   new C().m()               // reads 2 (was: 1, and x reset to 1)
+///
+/// Descends into nested statement bodies (assignments inside if/loop arms
+/// get their refresh at that level) but not into closures — a closure's
+/// assignment happens at ITS call time, not lexically here. Refreshes
+/// inserted before the class's own declaration are harmless: the decl-site
+/// registration overwrites them in program order.
+pub(crate) fn insert_class_capture_refresh_after_assignments(
+    stmts: &mut Vec<Stmt>,
+    regs: &[(Stmt, std::collections::HashSet<perry_types::LocalId>)],
+) {
+    let mut i = 0;
+    while i < stmts.len() {
+        // Recurse first so nested bodies get their own refreshes.
+        match &mut stmts[i] {
+            Stmt::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                insert_class_capture_refresh_after_assignments(then_branch, regs);
+                if let Some(eb) = else_branch {
+                    insert_class_capture_refresh_after_assignments(eb, regs);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+                insert_class_capture_refresh_after_assignments(body, regs);
+            }
+            Stmt::For { body, .. } => {
+                insert_class_capture_refresh_after_assignments(body, regs);
+            }
+            Stmt::Try {
+                body,
+                catch,
+                finally,
+            } => {
+                insert_class_capture_refresh_after_assignments(body, regs);
+                if let Some(c) = catch {
+                    insert_class_capture_refresh_after_assignments(&mut c.body, regs);
+                }
+                if let Some(f) = finally {
+                    insert_class_capture_refresh_after_assignments(f, regs);
+                }
+            }
+            Stmt::Switch { cases, .. } => {
+                for case in cases.iter_mut() {
+                    insert_class_capture_refresh_after_assignments(&mut case.body, regs);
+                }
+            }
+            _ => {}
+        }
+        // Does this statement (at THIS level, closures excluded by the
+        // collector) assign any watched capture?
+        let mut assigned = Vec::new();
+        collect_assigned_locals_stmt(&stmts[i], &mut assigned);
+        // #6037: a forward-captured `var`/`let` re-bound later in the same body
+        // — including a DESTRUCTURING leaf (`var { t: dSq } = f()`) — lowers to
+        // a `Stmt::Let` that REUSES the pre-registered forward-decl id (see the
+        // `lexical_forward_decls` / `PreallocateBoxes` machinery). Such a Let
+        // IS an assignment of the captured value, but `collect_assigned_locals_
+        // stmt` classifies every `Let` as a fresh binding and skips it, so the
+        // decl-site snapshot (taken while the forward-decl still held
+        // `undefined`) was never refreshed and the class method read the
+        // capture as undefined (semver's `Comparator` reading `dSq.COMPARATOR`).
+        // A non-`undefined` init re-binding a watched id triggers the refresh;
+        // the `undefined` forward-decl init itself is skipped (it snapshots the
+        // same pre-assignment value the decl-site `RegisterClassCaptures`
+        // already recorded).
+        if let Stmt::Let {
+            id, init: Some(v), ..
+        } = &stmts[i]
+        {
+            if !matches!(v, Expr::Undefined) {
+                assigned.push(*id);
+            }
+        }
+        if !assigned.is_empty() {
+            let mut inserts: Vec<Stmt> = Vec::new();
+            for (re_reg, capset) in regs {
+                if matches!(&stmts[i], Stmt::Expr(Expr::RegisterClassCaptures { .. })) {
+                    continue;
+                }
+                if assigned.iter().any(|id| capset.contains(id)) {
+                    inserts.push(re_reg.clone());
+                }
+            }
+            for (j, s) in inserts.iter().cloned().enumerate() {
+                stmts.insert(i + 1 + j, s);
+            }
+            i += inserts.len();
+        }
+        i += 1;
+    }
 }

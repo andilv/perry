@@ -345,6 +345,19 @@ pub(crate) fn populate_global_this_builtins(singleton: *mut ObjectHeader) {
                     );
                 }
             }
+            // #6674: the TC39 base64/hex conversion methods
+            // (`toBase64`/`toHex`/`setFromBase64`/`setFromHex`) are Uint8Array-ONLY
+            // (they don't exist on other typed arrays), so install them as own
+            // methods on the `Uint8Array` per-kind prototype — not the shared
+            // `%TypedArray%.prototype` intrinsic. This materializes the value read
+            // `typeof Uint8Array.prototype.toBase64 === "function"`; the static
+            // factories `fromBase64`/`fromHex` are installed on the constructor by
+            // `install_builtin_constructor_statics`.
+            if name == "Uint8Array" {
+                super::super::typed_array_proto_thunks::install_uint8array_base64_hex_proto_methods(
+                    proto_obj,
+                );
+            }
             // #4140: per-kind `BYTES_PER_ELEMENT` own data property on BOTH the
             // constructor and its prototype, matching Node's descriptor
             // `{ value, writable:false, enumerable:false, configurable:false }`.
@@ -468,6 +481,15 @@ pub(crate) fn populate_global_this_builtins(singleton: *mut ObjectHeader) {
             crate::builtins::js_register_function_name(func_ptr, name.as_ptr(), name.len() as u32);
         }
         super::super::native_module::set_builtin_closure_length(closure_ptr as usize, arity);
+        // Every global helper installed here (parseInt/parseFloat/isNaN/
+        // isFinite/{en,de}codeURI{,Component}/escape/unescape/setTimeout/…) is a
+        // built-in *non-constructor* function: per spec it has no `.prototype`
+        // (reads back `undefined`) and `new fn()` throws a TypeError. Mark the
+        // closure so the `new`/`.prototype` paths honor that — otherwise these
+        // functions defaulted to an ordinary `.prototype` object and silently
+        // accepted `new` (test262 built-ins/{decodeURI,isNaN,parseFloat,…}
+        // */A5.6/A5.7/A2.6/A2.7/A7.6/A7.7).
+        super::super::native_module::set_builtin_closure_non_constructable(closure_ptr as usize);
         let name_bytes = name.as_bytes();
         let name_key =
             crate::string::js_string_from_bytes(name_bytes.as_ptr(), name_bytes.len() as u32);
@@ -495,6 +517,18 @@ pub(crate) fn populate_global_this_builtins(singleton: *mut ObjectHeader) {
         let name_key =
             crate::string::js_string_from_bytes(name_bytes.as_ptr(), name_bytes.len() as u32);
         let ns_value = if matches!(name, "console" | "process") {
+            // #6230: install the module's runtime dispatch bucket so dynamic
+            // method calls on the namespace *value* resolve — `const p = process;
+            // p.exit(1)`, `process["exit"](1)`, `p.cwd()`, dynamic `console.log`.
+            // These globals are never `import`ed, so nothing else emits the
+            // `js_nm_install_<module>()` call; `import`ed modules get theirs from
+            // the import. Reached only when the globalThis singleton is
+            // materialized — i.e. exactly when process/console are used as values.
+            match name {
+                "process" => crate::object::native_module_registry::js_nm_install_process(),
+                "console" => crate::object::native_module_registry::js_nm_install_console(),
+                _ => {}
+            }
             js_create_native_module_namespace(name_bytes.as_ptr(), name_bytes.len())
         } else if name == "WebAssembly" {
             super::global_this_webassembly::create_webassembly_namespace()

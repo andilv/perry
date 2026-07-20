@@ -46,11 +46,11 @@ fn empty_opts() -> CompileOptions {
         namespace_node_submodules: std::collections::HashMap::new(),
         namespace_v8_specifiers: std::collections::HashMap::new(),
         namespace_member_prefixes: std::collections::HashMap::new(),
+        namespace_member_origin_names: std::collections::HashMap::new(),
         emit_ir_only: true,
         verify_native_regions: false,
         disable_buffer_fast_path: false,
         namespace_imports: Vec::new(),
-        namespace_reexport_named_imports: std::collections::HashSet::new(),
         imported_classes: Vec::new(),
         imported_enums: Vec::new(),
         imported_async_funcs: std::collections::HashSet::new(),
@@ -244,6 +244,7 @@ fn typed_feedback_instruments_property_and_method_boundaries() {
             }),
             Stmt::Expr(Expr::Call {
                 callee: Box::new(Expr::PropertyGet {
+                    byte_offset: 0,
                     object: Box::new(Expr::LocalGet(1)),
                     property: "run".to_string(),
                 }),
@@ -252,6 +253,7 @@ fn typed_feedback_instruments_property_and_method_boundaries() {
                 byte_offset: 0,
             }),
             Stmt::Return(Some(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(Expr::LocalGet(1)),
                 property: "x".to_string(),
             })),
@@ -294,6 +296,7 @@ fn typed_feedback_guards_direct_class_field_specialization() {
             Stmt::Return(Some(Expr::Binary {
                 op: BinaryOp::Sub,
                 left: Box::new(Expr::PropertyGet {
+                    byte_offset: 0,
                     object: Box::new(Expr::LocalGet(1)),
                     property: "x".to_string(),
                 }),
@@ -397,6 +400,7 @@ fn full_outline_ic_collapses_class_field_get_to_single_call() {
             vec![param(1, "p", Type::Named("Point".to_string()))],
             Type::Number,
             vec![Stmt::Return(Some(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(Expr::LocalGet(1)),
                 property: "x".to_string(),
             }))],
@@ -590,6 +594,7 @@ fn typed_feedback_guards_direct_class_method_specialization() {
         Type::Number,
         vec![Stmt::Return(Some(Expr::Call {
             callee: Box::new(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(Expr::LocalGet(1)),
                 property: "inc".to_string(),
             }),

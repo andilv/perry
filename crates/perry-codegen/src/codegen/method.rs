@@ -10,7 +10,7 @@ use crate::expr::FnCtx;
 use crate::module::LlModule;
 use crate::stmt;
 use crate::strings::StringPool;
-use crate::types::{LlvmType, DOUBLE, I1, I32, I64};
+use crate::types::{LlvmType, DOUBLE, I1, I32, I64, PTR};
 
 use super::helpers::scoped_static_method_name;
 use super::opts::CrossModuleCtx;
@@ -291,6 +291,28 @@ pub(super) fn compile_method(
     if typed_public_trampoline.is_some() || force_generic_body {
         lf.linkage = "internal".to_string();
     }
+
+    // gh #6206 / #6081: methods were compiled WITHOUT a shadow frame — same
+    // exact-roots liveness hole as closures (see compile_closure). One extra
+    // slot roots the receiver (`this` is a pointer value reachable from
+    // nothing else when the caller holds it only in a register temp).
+    let shadow_slot_map = if super::helpers::shadow_stack_enabled() {
+        let flat_const_ids: std::collections::HashSet<u32> =
+            cross_module.flat_const_arrays.keys().copied().collect();
+        let m = crate::collectors::collect_pointer_typed_locals(
+            &method.params,
+            &method.body,
+            &flat_const_ids,
+        );
+        lf.enable_shadow_frame(m.len() as u32 + 1);
+        m
+    } else {
+        std::collections::HashMap::new()
+    };
+    let this_shadow_slot_idx = shadow_slot_map.len() as u32;
+    let shadow_slot_clears_after_stmt =
+        crate::collectors::collect_shadow_slot_clear_points(&method.body, &shadow_slot_map);
+
     let _ = lf.create_block("entry");
 
     let mut method_boxed_vars = module_boxed_vars.clone();
@@ -302,10 +324,22 @@ pub(super) fn compile_method(
         let blk = lf.block_mut(0).unwrap();
         let this_slot = blk.alloca(DOUBLE);
         blk.store(DOUBLE, "%this_arg", &this_slot);
+        if super::helpers::shadow_stack_enabled() {
+            blk.call_void(
+                "js_shadow_slot_bind",
+                &[(I32, &this_shadow_slot_idx.to_string()), (PTR, &this_slot)],
+            );
+        }
         let mut map = HashMap::new();
         for p in &method.params {
             let arg_name = format!("%arg{}", p.id);
             let slot = super::arguments::store_param_slot(blk, p, &method_boxed_vars, &arg_name);
+            if let Some(slot_idx) = shadow_slot_map.get(&p.id).copied() {
+                blk.call_void(
+                    "js_shadow_slot_bind",
+                    &[(I32, &slot_idx.to_string()), (PTR, &slot)],
+                );
+            }
             map.insert(p.id, slot);
         }
         (this_slot, map)
@@ -329,13 +363,17 @@ pub(super) fn compile_method(
         cross_module.flat_const_arrays.keys().copied().collect();
     let native_facts = crate::collectors::collect_native_region_fact_graph(
         &method.body,
+        &[],
         &flat_const_ids,
         &clamp_fn_ids,
         &cross_module.clamp3_functions,
         &method_boxed_vars,
         module_globals,
+        // #6369: declared types of module-scope bindings this body reads through.
+        &local_types,
         classes,
         &cross_module.compile_time_constants,
+        &cross_module.module_dispatch,
     );
 
     let mut ctx = FnCtx {
@@ -387,6 +425,7 @@ pub(super) fn compile_method(
         func_returns_class: &cross_module.func_returns_class,
         boxed_vars: method_boxed_vars,
         prealloc_boxes: std::collections::HashSet::new(),
+        tdz_boxes: std::collections::HashSet::new(),
         compiler_private_async_i32_control_locals: &cross_module
             .compiler_private_async_i32_control_locals,
         compiler_private_async_i1_control_locals: &cross_module
@@ -397,11 +436,12 @@ pub(super) fn compile_method(
         option_object_locals: HashMap::new(),
         object_literal_locals: HashSet::new(),
         namespace_imports: &cross_module.namespace_imports,
-        namespace_reexport_named_imports: &cross_module.namespace_reexport_named_imports,
         namespace_member_prefixes: &cross_module.namespace_member_prefixes,
+        namespace_member_origin_names: &cross_module.namespace_member_origin_names,
         imported_async_funcs: &cross_module.imported_async_funcs,
         local_async_funcs: &cross_module.local_async_funcs,
         local_generator_funcs: &cross_module.local_generator_funcs,
+        async_step_closures: &cross_module.async_step_closures,
         funcs_reading_dynamic_this: &cross_module.funcs_reading_dynamic_this,
         type_aliases: &cross_module.type_aliases,
         imported_func_param_counts: &cross_module.imported_func_param_counts,
@@ -419,13 +459,14 @@ pub(super) fn compile_method(
         pending_declares: Vec::new(),
         integer_locals: native_facts.integer_locals(),
         unsigned_i32_locals: native_facts.unsigned_i32_locals(),
-        shadow_slot_map: std::collections::HashMap::new(),
-        shadow_slot_clears_after_stmt: std::collections::HashMap::new(),
+        shadow_slot_map,
+        shadow_slot_clears_after_stmt,
         arena_state_slot: None,
         class_keys_slots: HashMap::new(),
         cached_lengths: HashMap::new(),
         bounded_index_pairs: Vec::new(),
         packed_f64_loop_facts: Vec::new(),
+        class_field_loop_facts: Vec::new(),
         i32_counter_slots: HashMap::new(),
         i1_local_slots: HashMap::new(),
         index_used_locals: native_facts.index_used_locals(),
@@ -444,11 +485,17 @@ pub(super) fn compile_method(
         pod_records: std::collections::HashMap::new(),
         pod_views: std::collections::HashMap::new(),
         scalar_replaced_arrays: std::collections::HashMap::new(),
+        scalar_replaced_split_part_lengths: std::collections::HashMap::new(),
+        scalar_replaced_uppercase_sources: std::collections::HashMap::new(),
         scalar_ctor_target: Vec::new(),
         non_escaping_news: native_facts.non_escaping_news().clone(),
         non_escaping_new_used_fields: native_facts.non_escaping_new_used_fields().clone(),
         non_escaping_arrays: native_facts.non_escaping_arrays().clone(),
         non_escaping_array_used_indices: native_facts.non_escaping_array_used_indices().clone(),
+        non_escaping_array_length_only_indices: native_facts
+            .non_escaping_array_length_only_indices()
+            .clone(),
+        fusible_uppercase_locals: native_facts.fusible_uppercase_locals().clone(),
         non_escaping_object_literals: native_facts.non_escaping_object_literals().clone(),
         non_escaping_object_literal_used_fields: native_facts
             .non_escaping_object_literal_used_fields()
@@ -485,6 +532,7 @@ pub(super) fn compile_method(
         native_arena_owner_aliases: HashMap::new(),
         native_arena_ambiguous_owner_aliases: HashSet::new(),
         disable_buffer_fast_path: cross_module.disable_buffer_fast_path,
+        program_shadows_buffer_read_method: cross_module.program_shadows_buffer_read_method,
         min_length_bounds: HashMap::new(),
         bounded_buffer_index_pairs: Vec::new(),
         guarded_buffer_index_pairs: Vec::new(),
@@ -519,7 +567,14 @@ pub(super) fn compile_method(
         //     later (after super() in own-body case, after explicit parent
         //     ctor call in no-own-body case).
         //   - no extends: apply all (= just self) here.
-        let init_mode = if class.extends_name.is_some() {
+        // A no-own-ctor class with a PURELY dynamic parent (`extends_expr`,
+        // no `extends_name`) now emits a synthesized dynamic super below —
+        // stage its self fields AFTER that call (tail SelfOnly), like any
+        // other heritage class, instead of applying them twice.
+        let no_ctor_dynamic_parent = class.constructor.is_none()
+            && class.extends_name.is_none()
+            && class.extends_expr.is_some();
+        let init_mode = if class.extends_name.is_some() || no_ctor_dynamic_parent {
             crate::lower_call::FieldInitMode::AncestorsOnly
         } else {
             crate::lower_call::FieldInitMode::All
@@ -540,7 +595,9 @@ pub(super) fn compile_method(
         // call to the parent's standalone ctor symbol here, forwarding all
         // args. The walk skips empty-bodied parents (matching the JS spec
         // chain semantics).
-        if class.constructor.is_none() && class.extends_name.is_some() {
+        if class.constructor.is_none()
+            && (class.extends_name.is_some() || class.extends_expr.is_some())
+        {
             let builtin_parent_runtime = match class.extends_name.as_deref() {
                 Some("Writable") => Some("js_node_stream_writable_subclass_init"),
                 Some("Duplex") => Some("js_node_stream_duplex_subclass_init"),
@@ -649,6 +706,61 @@ pub(super) fn compile_method(
                     } else if let Some(ctor) = ctx.imported_class_ctors.get(&pname_owned).cloned() {
                         (ctor.symbol, ctor.param_count)
                     } else {
+                        // #6469: the walk terminated at a native Error-family
+                        // base with no callable ctor symbol — `class X extends
+                        // Error {}` with no own ctor anywhere (effect's
+                        // `makeException` shape). The static-`new` path bakes
+                        // the spec default Error-init at the call site (#573,
+                        // `lower_call/new.rs`); this standalone ctor is the
+                        // only body the DYNAMIC construct replay runs, so
+                        // without the same init `new <classValue>("msg")`
+                        // produced a message-less instance and every effect
+                        // error printed "An error has occurred". Delegate to a
+                        // runtime helper (rather than open-coding like the
+                        // static arm) because the forwarding params here are
+                        // undefined-padded — the helper applies the spec's
+                        // "If message is not undefined" guard so an absent arg
+                        // doesn't shadow `Error.prototype.message` with an own
+                        // undefined.
+                        if matches!(
+                            pname_owned.as_str(),
+                            "Error"
+                                | "TypeError"
+                                | "RangeError"
+                                | "ReferenceError"
+                                | "SyntaxError"
+                                | "URIError"
+                                | "EvalError"
+                                | "AggregateError"
+                        ) {
+                            let undef_lit = crate::nanbox::double_literal(f64::from_bits(
+                                crate::nanbox::TAG_UNDEFINED,
+                            ));
+                            let msg_box = method
+                                .params
+                                .first()
+                                .and_then(|p| ctx.locals.get(&p.id).cloned())
+                                .map(|slot| ctx.block().load(DOUBLE, &slot))
+                                .unwrap_or_else(|| undef_lit.clone());
+                            let this_box = ctx
+                                .this_stack
+                                .last()
+                                .cloned()
+                                .map(|slot| ctx.block().load(DOUBLE, &slot))
+                                .unwrap_or_else(|| undef_lit.clone());
+                            let kind_idx = ctx.strings.intern(&pname_owned);
+                            let kind_handle_global =
+                                format!("@{}", ctx.strings.entry(kind_idx).handle_global);
+                            let blk = ctx.block();
+                            let kind_box = blk.load(DOUBLE, &kind_handle_global);
+                            let kind_bits = blk.bitcast_double_to_i64(&kind_box);
+                            let kind_raw =
+                                blk.and(I64, &kind_bits, crate::nanbox::POINTER_MASK_I64);
+                            blk.call_void(
+                                "js_error_subclass_default_init",
+                                &[(DOUBLE, &this_box), (DOUBLE, &msg_box), (I64, &kind_raw)],
+                            );
+                        }
                         ("".to_string(), 0)
                     };
                     if !ctor_sym.is_empty() {
@@ -1121,6 +1233,7 @@ pub(super) fn compile_static_method(
     classes: &HashMap<String, &perry_hir::Class>,
     methods: &HashMap<(String, String), String>,
     module_globals: &HashMap<u32, String>,
+    module_global_types: &HashMap<u32, perry_types::Type>,
     import_function_prefixes: &HashMap<String, String>,
     enums: &HashMap<(String, String), perry_hir::EnumValue>,
     static_field_globals: &HashMap<(String, String), String>,
@@ -1143,6 +1256,27 @@ pub(super) fn compile_static_method(
     let ic_base = llmod.ic_counter;
     let buffer_alias_base = llmod.buffer_alias_counter;
     let lf = llmod.define_function(&llvm_name, DOUBLE, params);
+
+    // gh #6206 / #6081: same shadow-frame emission as compile_method — static
+    // method bodies were equally invisible to the exact-roots copying minor.
+    // One extra slot roots the resolved receiver: static `this` is usually
+    // the non-pointer INT32 class-ref, but `js_static_this_resolve` returns a
+    // REAL heap receiver for `C.m.call(x)` / `.apply(x)` / inherited `D.m()`
+    // dynamic dispatch, and that object may be reachable only from this slot.
+    let shadow_slot_map = if super::helpers::shadow_stack_enabled() {
+        let flat_const_ids: std::collections::HashSet<u32> =
+            cross_module.flat_const_arrays.keys().copied().collect();
+        let m =
+            crate::collectors::collect_pointer_typed_locals(&f.params, &f.body, &flat_const_ids);
+        lf.enable_shadow_frame(m.len() as u32 + 1);
+        m
+    } else {
+        std::collections::HashMap::new()
+    };
+    let this_shadow_slot_idx = shadow_slot_map.len() as u32;
+    let shadow_slot_clears_after_stmt =
+        crate::collectors::collect_shadow_slot_clear_points(&f.body, &shadow_slot_map);
+
     let _ = lf.create_block("entry");
 
     let mut static_boxed_vars = module_boxed_vars.clone();
@@ -1175,17 +1309,40 @@ pub(super) fn compile_static_method(
             &[(DOUBLE, &class_ref_lit)],
         );
         blk.store(DOUBLE, &resolved_this, &this_slot);
+        if super::helpers::shadow_stack_enabled() {
+            blk.call_void(
+                "js_shadow_slot_bind",
+                &[(I32, &this_shadow_slot_idx.to_string()), (PTR, &this_slot)],
+            );
+        }
         let mut map = HashMap::new();
         for p in &f.params {
             let arg_name = format!("%arg{}", p.id);
             let slot = super::arguments::store_param_slot(blk, p, &static_boxed_vars, &arg_name);
+            if let Some(slot_idx) = shadow_slot_map.get(&p.id).copied() {
+                blk.call_void(
+                    "js_shadow_slot_bind",
+                    &[(I32, &slot_idx.to_string()), (PTR, &slot)],
+                );
+            }
             map.insert(p.id, slot);
         }
         (this_slot, map)
     };
 
-    let local_types: HashMap<u32, perry_types::Type> =
-        f.params.iter().map(|p| (p.id, p.ty.clone())).collect();
+    // Seed with module-global declared types (mirrors compile_method /
+    // compile_function): static-method bodies read module globals through
+    // `@perry_global_*` slots too, and without the types here both the
+    // type-aware dispatch sites and the #6185 perry/thread worker-closure
+    // check (`hazardous_module_global_ids`) were blind inside static
+    // methods. Param types override on collision.
+    let mut local_types: HashMap<u32, perry_types::Type> = module_global_types
+        .iter()
+        .map(|(k, v)| (*k, v.clone()))
+        .collect();
+    for p in &f.params {
+        local_types.insert(p.id, p.ty.clone());
+    }
 
     let clamp_fn_ids: std::collections::HashSet<u32> = cross_module
         .clamp3_functions
@@ -1197,13 +1354,17 @@ pub(super) fn compile_static_method(
         cross_module.flat_const_arrays.keys().copied().collect();
     let native_facts = crate::collectors::collect_native_region_fact_graph(
         &f.body,
+        &[],
         &flat_const_ids,
         &clamp_fn_ids,
         &cross_module.clamp3_functions,
         &static_boxed_vars,
         module_globals,
+        // #6369: declared types of module-scope bindings this body reads through.
+        &local_types,
         classes,
         &cross_module.compile_time_constants,
+        &cross_module.module_dispatch,
     );
 
     let mut ctx = FnCtx {
@@ -1259,6 +1420,7 @@ pub(super) fn compile_static_method(
         func_returns_class: &cross_module.func_returns_class,
         boxed_vars: static_boxed_vars,
         prealloc_boxes: std::collections::HashSet::new(),
+        tdz_boxes: std::collections::HashSet::new(),
         compiler_private_async_i32_control_locals: &cross_module
             .compiler_private_async_i32_control_locals,
         compiler_private_async_i1_control_locals: &cross_module
@@ -1269,11 +1431,12 @@ pub(super) fn compile_static_method(
         option_object_locals: HashMap::new(),
         object_literal_locals: HashSet::new(),
         namespace_imports: &cross_module.namespace_imports,
-        namespace_reexport_named_imports: &cross_module.namespace_reexport_named_imports,
         namespace_member_prefixes: &cross_module.namespace_member_prefixes,
+        namespace_member_origin_names: &cross_module.namespace_member_origin_names,
         imported_async_funcs: &cross_module.imported_async_funcs,
         local_async_funcs: &cross_module.local_async_funcs,
         local_generator_funcs: &cross_module.local_generator_funcs,
+        async_step_closures: &cross_module.async_step_closures,
         funcs_reading_dynamic_this: &cross_module.funcs_reading_dynamic_this,
         type_aliases: &cross_module.type_aliases,
         imported_func_param_counts: &cross_module.imported_func_param_counts,
@@ -1291,13 +1454,14 @@ pub(super) fn compile_static_method(
         pending_declares: Vec::new(),
         integer_locals: native_facts.integer_locals(),
         unsigned_i32_locals: native_facts.unsigned_i32_locals(),
-        shadow_slot_map: std::collections::HashMap::new(),
-        shadow_slot_clears_after_stmt: std::collections::HashMap::new(),
+        shadow_slot_map,
+        shadow_slot_clears_after_stmt,
         arena_state_slot: None,
         class_keys_slots: HashMap::new(),
         cached_lengths: HashMap::new(),
         bounded_index_pairs: Vec::new(),
         packed_f64_loop_facts: Vec::new(),
+        class_field_loop_facts: Vec::new(),
         i32_counter_slots: HashMap::new(),
         i1_local_slots: HashMap::new(),
         index_used_locals: native_facts.index_used_locals(),
@@ -1316,11 +1480,17 @@ pub(super) fn compile_static_method(
         pod_records: std::collections::HashMap::new(),
         pod_views: std::collections::HashMap::new(),
         scalar_replaced_arrays: std::collections::HashMap::new(),
+        scalar_replaced_split_part_lengths: std::collections::HashMap::new(),
+        scalar_replaced_uppercase_sources: std::collections::HashMap::new(),
         scalar_ctor_target: Vec::new(),
         non_escaping_news: native_facts.non_escaping_news().clone(),
         non_escaping_new_used_fields: native_facts.non_escaping_new_used_fields().clone(),
         non_escaping_arrays: native_facts.non_escaping_arrays().clone(),
         non_escaping_array_used_indices: native_facts.non_escaping_array_used_indices().clone(),
+        non_escaping_array_length_only_indices: native_facts
+            .non_escaping_array_length_only_indices()
+            .clone(),
+        fusible_uppercase_locals: native_facts.fusible_uppercase_locals().clone(),
         non_escaping_object_literals: native_facts.non_escaping_object_literals().clone(),
         non_escaping_object_literal_used_fields: native_facts
             .non_escaping_object_literal_used_fields()
@@ -1357,6 +1527,7 @@ pub(super) fn compile_static_method(
         native_arena_owner_aliases: HashMap::new(),
         native_arena_ambiguous_owner_aliases: HashSet::new(),
         disable_buffer_fast_path: cross_module.disable_buffer_fast_path,
+        program_shadows_buffer_read_method: cross_module.program_shadows_buffer_read_method,
         min_length_bounds: HashMap::new(),
         bounded_buffer_index_pairs: Vec::new(),
         guarded_buffer_index_pairs: Vec::new(),

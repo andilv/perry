@@ -34,6 +34,10 @@ extern "C" {
     fn js_callback_timer_tick() -> i32;
     fn js_interval_timer_tick() -> i32;
     fn js_frame_pump_default() -> i32;
+    // perry-runtime's embedder GC stepper: spends up to `budget_us`
+    // advancing an ACTIVE budgeted collection in bounded work units; a
+    // cheap status probe when no cycle is active (out=null is allowed).
+    fn js_gc_step_us(budget_us: u64, out: *mut u8) -> u32;
 }
 
 /// Timer ID for periodic tick that processes setTimeout/setInterval queues.
@@ -425,18 +429,33 @@ pub fn app_run(app_handle: i64) {
                     f: extern "C" fn(*mut usize) -> *mut u8,
                 );
                 fn perry_geisterhand_register_textfield_set_string(f: extern "C" fn(i64, i64));
+                fn perry_geisterhand_register_scroll_set(f: extern "C" fn(i64, f64, f64));
+                fn perry_geisterhand_register_read_value(
+                    f: extern "C" fn(i64, *mut usize) -> *mut u8,
+                );
+                fn perry_geisterhand_register_query_tree(f: extern "C" fn(*mut usize) -> *mut u8);
                 fn perry_geisterhand_register_apply_style(
                     f: extern "C" fn(i64, u32, f64, f64, f64, f64),
                 );
             }
             unsafe {
-                perry_geisterhand_register_state_set(crate::perry_ui_state_set);
+                perry_geisterhand_register_state_set(
+                    crate::ffi::widget_tree_state::perry_ui_state_set,
+                );
                 perry_geisterhand_register_screenshot_capture(
                     crate::screenshot::perry_ui_screenshot_capture,
                 );
                 perry_geisterhand_register_textfield_set_string(
-                    crate::perry_ui_textfield_set_string,
+                    crate::ffi::textfield_scroll::perry_ui_textfield_set_string,
                 );
+                // Assertion-side hooks (query/read/scroll) — macOS has had
+                // these since the geisterhand harness landed; without them
+                // Windows UI state was write-only from a test's viewpoint.
+                perry_geisterhand_register_scroll_set(
+                    crate::widgets::scrollview::perry_ui_scroll_set_offset,
+                );
+                perry_geisterhand_register_read_value(crate::widgets::perry_ui_read_widget_value);
+                perry_geisterhand_register_query_tree(crate::widgets::perry_ui_query_widget_tree);
                 perry_geisterhand_register_apply_style(crate::geisterhand_style::apply_style);
             }
         }
@@ -490,6 +509,14 @@ pub fn app_run(app_handle: i64) {
                         // callbacks. Real DwmFlush-aligned vsync driver is
                         // a follow-up.
                         js_frame_pump_default();
+                        // #6183 (2026-07-09 GC audit): spend a bounded idle
+                        // budget on any active budgeted GC cycle at the pump
+                        // boundary — the JS stack is fully unwound here, so
+                        // this is a precise-root safepoint. A 2 ms slice per
+                        // tick drains collection debt incrementally instead of
+                        // letting an alloc-point collection land unbounded on
+                        // this (main/UI) thread mid-interaction.
+                        js_gc_step_us(2_000, std::ptr::null_mut());
                     }
                 }
                 // perry/media (#351) — UI-thread state poll for active

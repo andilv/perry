@@ -151,13 +151,21 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         );
                     }
                     perry_hir::CallArg::Spread(e) => {
-                        // `js_array_push_spread_any` also handles the
-                        // arguments OBJECT (array-like, not ArrayHeader) —
-                        // the `super(...arguments)` source.
+                        // Route every spread operand through the full iterator
+                        // protocol (`js_array_spread_append` -> `array_from_
+                        // spread_value`): it drives a custom `[Symbol.iterator]`
+                        // (`super(...iter)`), spreads the arguments OBJECT
+                        // (`super(...arguments)`), arrays, sets/maps, typed
+                        // arrays, and strings, AND propagates an abrupt
+                        // completion from a throwing iterator step/value — the
+                        // `call-spread-*-iter` / `call-spread-err-*` cases. The
+                        // old `js_array_push_spread_any` only handled arrays and
+                        // array-like (`.length`) objects, so a plain iterable
+                        // (no `.length`) contributed zero args.
                         let v = lower_expr(ctx, e)?;
                         arr = ctx.block().call(
                             I64,
-                            "js_array_push_spread_any",
+                            "js_array_spread_append",
                             &[(I64, &arr), (DOUBLE, &v)],
                         );
                     }
@@ -253,12 +261,24 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     return Ok(double_literal(0.0));
                 }
             };
-            let Some(parent_name) = current_class.extends_name.as_deref().map(|s| s.to_string())
-            else {
-                for a in super_args {
-                    let _ = lower_expr(ctx, a)?;
+            let parent_name = match current_class.extends_name.as_deref() {
+                Some(s) => s.to_string(),
+                // A lexically-shadowed / fully-dynamic parent carries no
+                // `extends_name` (the parent is a runtime value, not a named
+                // class) but DOES carry `extends_expr`. Proceed with an empty
+                // placeholder name — for this shape `static_parent_lookup` below
+                // is forced to `None` (extends_expr present) and the builtin-name
+                // gate is disabled by `heritage_lexically_shadowed`, so the name
+                // is never consulted; `super()` dispatches via `extends_expr`.
+                // Without this, `super()` in such a subclass silently no-ops and
+                // the (dynamic) parent constructor never runs.
+                None if current_class.extends_expr.is_some() => String::new(),
+                None => {
+                    for a in super_args {
+                        let _ = lower_expr(ctx, a)?;
+                    }
+                    return Ok(double_literal(0.0));
                 }
-                return Ok(double_literal(0.0));
             };
             // #5437 (Next.js p-queue `PQueue`): when HIR captured a dynamic
             // `extends_expr` for this class, the parent is a LEXICAL runtime
@@ -664,6 +684,38 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         )?;
                         return Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)));
                     }
+                    // `class X extends Promise` — `super(executor)` runs the
+                    // ECMA-262 27.2.3.1 Promise constructor against a hidden
+                    // backing `Promise` cell stashed on `this`. Inherited
+                    // `then`/`catch`/`finally` unwrap that cell (see
+                    // `promise::subclass::subclass_backing_promise`), so a
+                    // subclass instance behaves as a promise while keeping its
+                    // own `constructor`/`instanceof` identity.
+                    if parent_name.as_str() == "Promise" {
+                        let undef = double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
+                        let mut lowered: Vec<String> = Vec::with_capacity(super_args.len());
+                        for a in super_args {
+                            lowered.push(lower_expr(ctx, a)?);
+                        }
+                        let executor = lowered.first().cloned().unwrap_or_else(|| undef.clone());
+                        let this_box = match ctx.this_stack.last().cloned() {
+                            Some(slot) => ctx.block().load(DOUBLE, &slot),
+                            None => undef.clone(),
+                        };
+                        ctx.block().call(
+                            DOUBLE,
+                            "js_promise_subclass_init",
+                            &[(DOUBLE, &this_box), (DOUBLE, &executor)],
+                        );
+                        let current_class_name =
+                            ctx.class_stack.last().cloned().unwrap_or_default();
+                        crate::lower_call::apply_field_initializers_recursive(
+                            ctx,
+                            &current_class_name,
+                            crate::lower_call::FieldInitMode::SelfOnly,
+                        )?;
+                        return Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)));
+                    }
                     let fetch_subclass_fn = match parent_name.as_str() {
                         "Request" => Some("js_request_subclass_init"),
                         "Response" => Some("js_response_subclass_init"),
@@ -787,6 +839,46 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             let mut lowered_args: Vec<String> = Vec::with_capacity(super_args.len());
             for a in super_args {
                 lowered_args.push(lower_expr(ctx, a)?);
+            }
+
+            // #6326: the parent is a real user class, but the chain BOTTOMS OUT
+            // in a native base whose surface perry stamps onto the instance —
+            // `class Counter extends B { constructor() { super(); … } }` with
+            // `class B extends EventEmitter {}`. The builtin arms above only fire
+            // when the IMMEDIATE parent name IS the base, so they never see this
+            // shape; and the parent-chain walk below finds no constructor to
+            // inline (no ancestor has one), so `super()` silently no-oped and the
+            // instance came out with no emitter/collection surface at all.
+            //
+            // The walk yields `None` the moment any ancestor has a constructor —
+            // that ancestor's own `super()` installs the base — so this arm fires
+            // exactly when nothing else will.
+            if let Some(base) = crate::lower_call::native_instance_base_in_chain(ctx, current_class)
+            {
+                let this_box = match ctx.this_stack.last().cloned() {
+                    Some(slot) => ctx.block().load(DOUBLE, &slot),
+                    None => double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)),
+                };
+                crate::lower_call::emit_native_instance_base_init(
+                    ctx,
+                    base,
+                    &this_box,
+                    &lowered_args,
+                );
+                // Spec: derived-class field initializers run AFTER `super()`
+                // returns. The native base is the chain root and has no TS
+                // fields, so everything after it still needs initializing —
+                // including ctor-less intermediates, which write no `super()`
+                // of their own and so have no other site that would do it.
+                // `AncestorsOnly` only covers the root, so `SelfOnly` here
+                // would leave a middle class like `B` in
+                // `C -> B -> A -> EventEmitter` uninitialized.
+                crate::lower_call::apply_field_initializers_recursive(
+                    ctx,
+                    &current_class_name,
+                    crate::lower_call::FieldInitMode::AfterRoot,
+                )?;
+                return Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)));
             }
 
             // Inline the parent constructor with the SAME this and a

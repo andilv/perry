@@ -564,15 +564,22 @@ pub(crate) fn populate_builtin_prototype_methods(builtin_name: &str, proto_obj: 
                 date_prototype_to_string_thunk as *const u8,
                 0,
             );
+            // `Date.prototype[Symbol.toPrimitive]` — a generic `OrdinaryToPrimitive`
+            // dispatcher (non-enumerable own method, `.name` "[Symbol.toPrimitive]",
+            // `.length` 1). test262 `built-ins/Date/prototype/Symbol.toPrimitive/*`.
+            date_proto_thunks::install_date_proto_to_primitive(proto_obj);
         }
         "RegExp" => {
             // Real accessor getters (`source`/`flags`/`global`/…) so reflection
             // (`getOwnPropertyDescriptor(RegExp.prototype, "source").get`) and
             // brand-checked `.call(this)` work, and instances inherit them.
             super::super::regex_proto_thunks::install_regex_proto_accessors(proto_obj);
-            // Real brand-checking `exec`/`test`/`toString`; `compile` stays a
-            // no-op (Annex B).
+            // Real brand-checking `exec`/`test`/`toString`/`compile` (Annex B).
             super::super::regex_proto_thunks::install_regex_proto_methods(proto_obj);
+            // `compile` is installed as a real brand-checking thunk by
+            // `install_regex_proto_methods` when `regex-engine` is on; without an
+            // engine it falls back to the Annex-B no-op here.
+            #[cfg(not(feature = "regex-engine"))]
             install_noop_proto_methods(proto_obj, &[("compile", 2)]);
             install_noop_proto_methods(proto_obj, OBJECT_PROTO_METHODS);
         }

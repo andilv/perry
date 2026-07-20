@@ -451,7 +451,8 @@ impl HirTypeEnv {
             | Stmt::Continue
             | Stmt::LabeledBreak(_)
             | Stmt::LabeledContinue(_)
-            | Stmt::PreallocateBoxes(_) => {}
+            | Stmt::PreallocateBoxes(_)
+            | Stmt::PreallocateTdzBoxes(_) => {}
             Stmt::If {
                 condition,
                 then_branch,
@@ -705,7 +706,9 @@ pub fn infer_expr_type<F: HirTypeFacts + ?Sized>(expr: &Expr, env: &F) -> Type {
             env.super_property_type(property).unwrap_or(Type::Any)
         }
 
-        Expr::PropertyGet { object, property } => infer_property_get_type(object, property, env),
+        Expr::PropertyGet {
+            object, property, ..
+        } => infer_property_get_type(object, property, env),
         Expr::PropertySet { value, .. } => infer_expr_type(value, env),
         Expr::PropertyUpdate { .. } => Type::Number,
         Expr::IndexGet { object, .. } => match infer_expr_type(object, env) {

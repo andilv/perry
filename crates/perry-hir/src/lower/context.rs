@@ -75,7 +75,10 @@ impl LoweringContext {
             param_native_hints: HashMap::new(),
             current_strict: false,
             ui_widget_type_aliases: HashMap::new(),
+            deferred_unknown_native_imports: HashMap::new(),
             current_class: None,
+            current_class_inner_name: None,
+            pending_class_inner_name: None,
             current_class_member_is_static: false,
             private_scopes: Vec::new(),
             object_super_home_stack: Vec::new(),
@@ -87,6 +90,7 @@ impl LoweringContext {
             class_display_names: HashMap::new(),
             gen_param_prologue_len: HashMap::new(),
             assignment_inferred_name: None,
+            inferred_class_bindings: std::collections::HashSet::new(),
             closure_source_text: HashMap::new(),
             func_return_native_instances: Vec::new(),
             pending_classes: Vec::new(),
@@ -114,9 +118,14 @@ impl LoweringContext {
             unresolved_ident_as_global: false,
             with_env_stack: Vec::new(),
             var_hoisted_ids: HashSet::new(),
+            tdz_forward_ids: HashSet::new(),
+            forward_lexical_names: HashSet::new(),
+            forward_lexical_saves: Vec::new(),
+            catch_param_scopes: Vec::new(),
             annexb_block_fn_var_ids: HashMap::new(),
             annexb_block_fn_names_all: HashSet::new(),
             lexical_forward_decls: HashMap::new(),
+            nested_forward_scope_ids: HashSet::new(),
             functions_index: HashMap::new(),
             classes_index: HashMap::new(),
             imported_functions_index: HashMap::new(),
@@ -151,6 +160,7 @@ impl LoweringContext {
             current_class_super_ident: None,
             mixin_funcs: HashMap::new(),
             anon_shape_classes: HashMap::new(),
+            anon_shape_fields: HashMap::new(),
             forward_class_names: std::collections::HashSet::new(),
             forward_class_decl_depth: std::collections::HashMap::new(),
             class_renames: std::collections::HashMap::new(),
@@ -159,6 +169,7 @@ impl LoweringContext {
             next_anon_shape_id: 0,
             class_method_return_types: Vec::new(),
             class_captures: Vec::new(),
+            body_class_expr_captures: Vec::new(),
             let_class_aliases: Vec::new(),
             global_this_aliases: HashSet::new(),
             prototype_aliases: HashMap::new(),
@@ -302,10 +313,10 @@ impl LoweringContext {
     /// class and member kind by walking the private-scope stack innermost
     /// outward — matching the lexical resolution rule for private names. A
     /// nested class that redeclares the same name shadows the outer one.
-    pub(crate) fn resolve_private(&self, field_name: &str) -> Option<(String, PrivMember)> {
+    pub(crate) fn resolve_private(&self, field_name: &str) -> Option<(String, u32, PrivMember)> {
         for scope in self.private_scopes.iter().rev() {
             if let Some(m) = scope.members.get(field_name) {
-                return Some((scope.class_name.clone(), *m));
+                return Some((scope.class_name.clone(), scope.class_id, *m));
             }
         }
         None
@@ -937,7 +948,14 @@ impl LoweringContext {
             shape_key.push(',');
         }
 
+        // Field names in source order, so a call-site can recover a config
+        // object's keys after the literal is lowered to `New { class_name }`.
+        let field_names: Vec<String> = field_shapes.iter().map(|(name, _)| name.clone()).collect();
+
         if let Some(existing) = self.anon_shape_classes.get(&shape_key) {
+            self.anon_shape_fields
+                .entry(existing.clone())
+                .or_insert(field_names);
             return existing.clone();
         }
 
@@ -1056,6 +1074,8 @@ impl LoweringContext {
 
         self.anon_shape_classes
             .insert(shape_key, class_name.clone());
+        self.anon_shape_fields
+            .insert(class_name.clone(), field_names);
         class_name
     }
 
@@ -1128,6 +1148,13 @@ impl LoweringContext {
             .iter()
             .find(|(n, _, _)| n == name)
             .map(|(_, params, ret)| (params, ret))
+    }
+
+    /// Stable per-module salt for class-capture field names (see
+    /// `crate::cap_fields`). Reuses the tagged-template site salt — a stable
+    /// hash of the module's source path.
+    pub(crate) fn cap_salt(&self) -> u64 {
+        self.tagged_template_site_salt
     }
 
     pub(crate) fn register_native_module(
@@ -1511,6 +1538,13 @@ impl LoweringContext {
 
     pub(crate) fn enter_scope(&mut self) -> (usize, usize, usize) {
         // Function/closure boundary: new locals are no longer module-level.
+        // #6062: a `typeof <name>` inside a nested closure is runtime-timing-
+        // dependent (the closure may run before OR after the outer lexical is
+        // initialized), so the enclosing block's forward-lexical set must not
+        // statically force a throw inside it. Save and clear across the
+        // boundary; the nested body repopulates its own via `lower_stmts_using_aware`.
+        self.forward_lexical_saves
+            .push(std::mem::take(&mut self.forward_lexical_names));
         let local_mark = self.locals.len();
         self.scope_depth += 1;
         self.scope_local_marks.push(local_mark);
@@ -1527,6 +1561,9 @@ impl LoweringContext {
 
     pub(crate) fn exit_scope(&mut self, mark: (usize, usize, usize)) {
         debug_assert!(self.scope_depth > 0, "exit_scope called at module depth");
+        // #6062: restore the enclosing block's forward-lexical set saved in the
+        // matching `enter_scope`.
+        self.forward_lexical_names = self.forward_lexical_saves.pop().unwrap_or_default();
         self.scope_depth = self.scope_depth.saturating_sub(1);
         // Drop any pre-scan param protections registered in a scope deeper than
         // the one we just returned to — their expected consumer (the callback's
@@ -1596,10 +1633,14 @@ impl LoweringContext {
         // the mark to the position just past the mark, then drop the rest.
         // Sloppy implicit globals (`undeclared = v` inside the block) are
         // module-scoped bindings too — keep them visible after the block.
+        // Nested-scope forward-captured `let`/`const` pre-registrations are in
+        // `var_hoisted_ids` only for box-at-entry allocation; they are lexical
+        // bindings, so their block-entry rebinding must die with the block.
         if self.locals.len() > locals_mark {
             let mut kept: Vec<(String, LocalId, Type)> = Vec::new();
             for entry in self.locals.drain_from(locals_mark) {
-                if self.var_hoisted_ids.contains(&entry.1)
+                if (self.var_hoisted_ids.contains(&entry.1)
+                    && !self.nested_forward_scope_ids.contains(&entry.1))
                     || self.sloppy_implicit_global_ids.contains(&entry.1)
                 {
                     kept.push(entry);

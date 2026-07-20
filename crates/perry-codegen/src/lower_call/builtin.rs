@@ -51,6 +51,8 @@ pub(super) fn lower_builtin_new(
         "Redis" => Some(&["ioredis", "redis"]),
         "MongoClient" => Some(&["mongodb"]),
         "Decimal" => Some(&["decimal.js"]),
+        "RateLimiterMemory" => Some(&["rate-limiter-flexible"]),
+        "CronJob" => Some(&["cron", "node-cron"]),
         _ => None,
     };
     if let Some(sources) = required_sources {
@@ -137,19 +139,27 @@ pub(super) fn lower_builtin_new(
             Ok(Some(nanbox_pointer_inline(blk, &handle)))
         }
         "Uint8Array" if args.len() >= 2 => {
+            // Pass the raw NaN-boxed offset/length (undefined when absent),
+            // same as the non-Uint8Array view kinds below: the runtime runs
+            // ToIndex — which can execute user `valueOf` code — and applies
+            // the spec's post-coercion detached/bounds checks. The old
+            // `fptosi` cast silently turned object arguments into garbage
+            // without ever running their coercion.
             let source = lower_expr(ctx, &args[0])?;
-            let offset = lower_expr(ctx, &args[1])?;
-            let offset_i32 = ctx.block().fptosi(DOUBLE, &offset, I32);
-            let length_i32 = if args.len() >= 3 {
-                let length = lower_expr(ctx, &args[2])?;
-                ctx.block().fptosi(DOUBLE, &length, I32)
+            let offset_box = lower_expr(ctx, &args[1])?;
+            let length_box = if args.len() >= 3 {
+                lower_expr(ctx, &args[2])?
             } else {
-                "-1".to_string()
+                double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED))
             };
             let handle = ctx.block().call(
                 I64,
                 "js_uint8array_view",
-                &[(DOUBLE, &source), (I32, &offset_i32), (I32, &length_i32)],
+                &[
+                    (DOUBLE, &source),
+                    (DOUBLE, &offset_box),
+                    (DOUBLE, &length_box),
+                ],
             );
             Ok(Some(nanbox_pointer_inline(ctx.block(), &handle)))
         }
@@ -690,6 +700,74 @@ pub(super) fn lower_builtin_new(
             let handle = blk.call(I64, "js_ioredis_new", &[(I64, "0")]);
             Ok(Some(nanbox_pointer_inline(blk, &handle)))
         }
+        // rate-limiter-flexible `new RateLimiterMemory({ points, duration })`.
+        // Gated on the import source above. The options object crosses as
+        // raw NaN-box bits (i64) so the runtime parses `points`/`duration`
+        // by name; missing arg → TAG_UNDEFINED → npm defaults (4 points /
+        // 1 s). Pre-fix this fell to the js_object_alloc(0,0) placeholder
+        // and every method call dispatched against `{}`. Instance methods
+        // (consume/get/delete/block/penalty/reward) are wired in
+        // NATIVE_MODULE_TABLE for module "rate-limiter-flexible".
+        "RateLimiterMemory" => {
+            let options = if let Some(arg) = args.first() {
+                lower_expr(ctx, arg)?
+            } else {
+                double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED))
+            };
+            for arg in args.iter().skip(1) {
+                let _ = lower_expr(ctx, arg)?;
+            }
+            let blk = ctx.block();
+            let options_bits = blk.bitcast_double_to_i64(&options);
+            let handle = blk.call(
+                I64,
+                "js_ratelimit_new_from_options",
+                &[(I64, &options_bits)],
+            );
+            Ok(Some(nanbox_pointer_inline(blk, &handle)))
+        }
+        // npm `cron` package: `new CronJob(cronTime, onTick, onComplete?,
+        // start?)`. Gated on the import source above. Unlike node-cron's
+        // `schedule()` factory (which auto-starts), a CronJob only begins
+        // firing when the 4th argument is truthy or `job.start()` is
+        // called — `js_cron_job_new` implements that. The onTick closure
+        // is UNBOXED to a raw ClosureHeader pointer (unbox_to_i64): the
+        // cron tick calls it via js_closure_call0 on the raw pointer, so
+        // tagged NaN-box bits would throw "value is not a function" on
+        // the first fire. onComplete is lowered for side effects only.
+        // start/stop/isRunning/nextDate dispatch via the existing
+        // ("cron", true, …) NATIVE_MODULE_TABLE rows.
+        "CronJob" => {
+            let expr_ptr = if let Some(arg) = args.first() {
+                get_raw_string_ptr(ctx, arg)?
+            } else {
+                "0".to_string()
+            };
+            let on_tick = if let Some(arg) = args.get(1) {
+                lower_expr(ctx, arg)?
+            } else {
+                double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED))
+            };
+            if let Some(arg) = args.get(2) {
+                let _ = lower_expr(ctx, arg)?;
+            }
+            let start = if let Some(arg) = args.get(3) {
+                lower_expr(ctx, arg)?
+            } else {
+                double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED))
+            };
+            for arg in args.iter().skip(4) {
+                let _ = lower_expr(ctx, arg)?;
+            }
+            let blk = ctx.block();
+            let cb_ptr = unbox_to_i64(blk, &on_tick);
+            let handle = blk.call(
+                I64,
+                "js_cron_job_new",
+                &[(I64, &expr_ptr), (I64, &cb_ptr), (DOUBLE, &start)],
+            );
+            Ok(Some(nanbox_pointer_inline(blk, &handle)))
+        }
         // async_hooks.AsyncLocalStorage — `new AsyncLocalStorage()` produces a
         // real handle so `.run(store, cb)` / `.getStore()` / `.enterWith(store)`
         // / `.exit(cb)` / `.disable()` find their registered store stack.
@@ -1069,8 +1147,22 @@ pub(super) fn lower_builtin_new(
 
         "Request" => {
             // new Request(url, init?) — init = Fetch RequestInit subset.
+            // The spec runs ToString on `input` when it isn't already a Request,
+            // so a URL object must stringify to its href. `get_raw_string_ptr`
+            // (js_get_string_pointer_unified) only unwraps an actual string value
+            // — handed a URL object (a heap ObjectHeader) it read the object
+            // pointer as a string and produced "", so `new Request(new URL(u)).url`
+            // was empty. Auth.js v5 builds its session request as `new
+            // Request(fu("session", …))` where `fu` returns a URL object, so the
+            // session lookup got an empty URL, returned 400 "Bad request.", and
+            // `auth()` yielded that string instead of null — the authenticated-page
+            // guard then never redirected and fell through to a DB-pool init that
+            // threw. Route through `js_jsvalue_to_string`, which invokes `toString`
+            // on an object (URL → href) and passes a real string straight through.
             let url_ptr = if !args.is_empty() {
-                get_raw_string_ptr(ctx, &args[0])?
+                let v = lower_expr(ctx, &args[0])?;
+                ctx.block()
+                    .call(I64, "js_request_input_to_url", &[(DOUBLE, &v)])
             } else {
                 "0".to_string()
             };

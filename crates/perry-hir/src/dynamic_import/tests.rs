@@ -157,6 +157,7 @@ fn closed_chunk_registry() -> Expr {
         ],
         type_args: Vec::new(),
         byte_offset: 0,
+        cap_args_appended: 0,
     }
 }
 
@@ -187,6 +188,7 @@ fn resolve_registry_computed_key_enumerates_all() {
 fn resolve_registry_static_property_enumerates_all() {
     // `import(R.a)` — over-approximate to the whole (relative) chunk set.
     assert_resolves_both_chunks(&Expr::PropertyGet {
+        byte_offset: 0,
         object: Box::new(Expr::LocalGet(5)),
         property: "a".to_string(),
     });
@@ -274,6 +276,7 @@ fn resolve_chained_distinct_registries_resolves() {
     let b = Expr::Object(vec![(
         "y".to_string(),
         Expr::PropertyGet {
+            byte_offset: 0,
             object: Box::new(Expr::LocalGet(1)),
             property: "x".to_string(),
         },
@@ -296,6 +299,7 @@ fn resolve_chained_distinct_registries_resolves() {
 fn resolve_non_registry_member_access_defers() {
     // `import(cfg.path)` where cfg is opaque — must keep deferring, not panic.
     let arg = Expr::PropertyGet {
+        byte_offset: 0,
         object: Box::new(Expr::LocalGet(7)),
         property: "path".to_string(),
     };
@@ -653,6 +657,7 @@ fn resolve_cjs_path_default_join_over_replaced_dirname_local() {
         mutable: true,
         init: Some(Expr::Call {
             callee: Box::new(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(Expr::String(
                     "D:\\tmp\\probe\\node_modules\\node-pty\\lib".to_string(),
                 )),
@@ -669,7 +674,9 @@ fn resolve_cjs_path_default_join_over_replaced_dirname_local() {
 
     let filename = Expr::Call {
         callee: Box::new(Expr::PropertyGet {
+            byte_offset: 0,
             object: Box::new(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(Expr::NativeModuleRef("path".to_string())),
                 property: "default".to_string(),
             }),
@@ -939,6 +946,202 @@ fn flatten_export_all_cycle_safe() {
     let names: Vec<String> = flat.iter().map(|e| e.name.clone()).collect();
     assert!(names.contains(&"fromA".to_string()));
     assert!(names.contains(&"fromB".to_string()));
+}
+
+/// #6304 test scaffolding: a module that DEFINES `name` as an exported
+/// function, so origin resolution has something real to stop on.
+fn module_defining_fn(module: &str, name: &str) -> Module {
+    let mut m = Module::new(module);
+    m.functions.push(crate::ir::Function {
+        id: 0,
+        name: name.into(),
+        type_params: vec![],
+        params: vec![],
+        return_type: Type::Any,
+        body: vec![],
+        is_async: false,
+        is_generator: false,
+        is_strict: false,
+        is_exported: true,
+        captures: vec![],
+        decorators: vec![],
+        was_plain_async: false,
+        was_unrolled: false,
+    });
+    m.exports.push(Export::Named {
+        local: name.into(),
+        exported: name.into(),
+    });
+    m
+}
+
+/// #6304: a plain non-native named import of `imported` from `source`.
+fn named_import(source: &str, imported: &str, local: &str) -> crate::ir::Import {
+    crate::ir::Import {
+        source: source.into(),
+        specifiers: vec![crate::ir::ImportSpecifier::Named {
+            imported: imported.into(),
+            local: local.into(),
+        }],
+        is_native: false,
+        module_kind: crate::ir::ModuleKind::NativeCompiled,
+        resolved_path: None,
+        type_only: false,
+        is_dynamic: false,
+        is_dynamic_target: false,
+        is_deferred_require: false,
+        is_adopted_require: false,
+    }
+}
+
+#[test]
+fn flatten_reexport_only_chunk_resolves_to_defining_module() {
+    // #6304 — the canonical esbuild/bun `--splitting` shared-chunk shape:
+    //
+    //   // agent-VP4LHHJR.js
+    //   import { run } from "./chunk-XXXX.js";
+    //   export { run };
+    //
+    // `run` is an IMPORT binding, not a definition. Pre-fix this flattened to
+    // `source_module = agent`, the driver found no local `run` there, and the
+    // namespace entry degraded to an undefined-returning stub — so `ns.run`
+    // came out `undefined` for the whole chunk.
+    let chunk = module_defining_fn("chunk", "run");
+    let mut agent = Module::new("agent");
+    agent.imports.push(named_import("chunk", "run", "run"));
+    agent.exports.push(Export::Named {
+        local: "run".into(),
+        exported: "run".into(),
+    });
+    let map = std::collections::HashMap::from([
+        ("chunk".to_string(), chunk),
+        ("agent".to_string(), agent),
+    ]);
+    let lookup = |s: &str| map.get(s);
+    let flat = flatten_exports("agent", &lookup);
+    assert_eq!(flat.len(), 1);
+    assert_eq!(flat[0].name, "run");
+    // The value lives in `chunk`, NOT in `agent`.
+    assert_eq!(flat[0].source_module, "chunk");
+    assert_eq!(flat[0].source_local, "run");
+    assert_eq!(flat[0].nested_namespace_of, None);
+}
+
+#[test]
+fn flatten_reexport_only_chunk_honours_import_rename() {
+    // `import { run as go } from "./chunk"; export { go as run }` — the export
+    // key is the consumer-visible `run`, but the binding in `chunk` is `run`
+    // (the import's ORIGINAL name), not the local alias `go`.
+    let chunk = module_defining_fn("chunk", "run");
+    let mut agent = Module::new("agent");
+    agent.imports.push(named_import("chunk", "run", "go"));
+    agent.exports.push(Export::Named {
+        local: "go".into(),
+        exported: "run".into(),
+    });
+    let map = std::collections::HashMap::from([
+        ("chunk".to_string(), chunk),
+        ("agent".to_string(), agent),
+    ]);
+    let lookup = |s: &str| map.get(s);
+    let flat = flatten_exports("agent", &lookup);
+    assert_eq!(flat.len(), 1);
+    assert_eq!(flat[0].name, "run");
+    assert_eq!(flat[0].source_module, "chunk");
+    assert_eq!(flat[0].source_local, "run");
+}
+
+#[test]
+fn flatten_reexport_chain_reaches_ultimate_owner() {
+    // A chain of forwarding chunks must land on the module that actually
+    // defines the binding, not on the first hop (which would itself only
+    // forward, yielding another undefined stub).
+    //   outer -> mid (import+export) -> impl (definition)
+    let impl_mod = module_defining_fn("impl", "run");
+    let mut mid = Module::new("mid");
+    mid.imports.push(named_import("impl", "run", "run"));
+    mid.exports.push(Export::Named {
+        local: "run".into(),
+        exported: "run".into(),
+    });
+    let mut outer = Module::new("outer");
+    outer.imports.push(named_import("mid", "run", "run"));
+    outer.exports.push(Export::Named {
+        local: "run".into(),
+        exported: "run".into(),
+    });
+    let map = std::collections::HashMap::from([
+        ("impl".to_string(), impl_mod),
+        ("mid".to_string(), mid),
+        ("outer".to_string(), outer),
+    ]);
+    let lookup = |s: &str| map.get(s);
+    let flat = flatten_exports("outer", &lookup);
+    assert_eq!(flat.len(), 1);
+    assert_eq!(flat[0].source_module, "impl");
+    assert_eq!(flat[0].source_local, "run");
+}
+
+#[test]
+fn flatten_local_definition_still_wins_over_same_named_import() {
+    // A module that DEFINES the name it exports must keep pointing at itself —
+    // the redirect only fires for bindings this module does not define.
+    let mut m = module_defining_fn("m", "run");
+    // A same-named import would be invalid TS, but assert the definition wins
+    // regardless so the redirect can never hijack a real local body.
+    m.imports.push(named_import("other", "run", "run"));
+    let other = module_defining_fn("other", "run");
+    let map = std::collections::HashMap::from([("m".to_string(), m), ("other".to_string(), other)]);
+    let lookup = |s: &str| map.get(s);
+    let flat = flatten_exports("m", &lookup);
+    assert_eq!(flat.len(), 1);
+    assert_eq!(flat[0].source_module, "m");
+    assert_eq!(flat[0].source_local, "run");
+}
+
+#[test]
+fn flatten_reexport_of_native_import_is_not_redirected() {
+    // `import { readFile } from "fs"; export { readFile }` — "fs" is a native
+    // module with no HIR and no `perry_fn_*` symbols. Redirecting there would
+    // name a module that does not exist in the graph, so the native import is
+    // skipped and the entry keeps its pre-existing local shape.
+    let mut m = Module::new("m");
+    let mut imp = named_import("fs", "readFile", "readFile");
+    imp.is_native = true;
+    m.imports.push(imp);
+    m.exports.push(Export::Named {
+        local: "readFile".into(),
+        exported: "readFile".into(),
+    });
+    let map = std::collections::HashMap::from([("m".to_string(), m)]);
+    let lookup = |s: &str| map.get(s);
+    let flat = flatten_exports("m", &lookup);
+    assert_eq!(flat.len(), 1);
+    assert_eq!(flat[0].source_module, "m");
+    assert_eq!(flat[0].source_local, "readFile");
+}
+
+#[test]
+fn flatten_reexport_binding_cycle_terminates() {
+    // Two chunks that forward the same name to each other — must not loop.
+    let mut a = Module::new("a");
+    a.imports.push(named_import("b", "v", "v"));
+    a.exports.push(Export::Named {
+        local: "v".into(),
+        exported: "v".into(),
+    });
+    let mut b = Module::new("b");
+    b.imports.push(named_import("a", "v", "v"));
+    b.exports.push(Export::Named {
+        local: "v".into(),
+        exported: "v".into(),
+    });
+    let map = std::collections::HashMap::from([("a".to_string(), a), ("b".to_string(), b)]);
+    let lookup = |s: &str| map.get(s);
+    let flat = flatten_exports("a", &lookup);
+    // Terminates (no stack overflow / hang) and still yields the name.
+    assert_eq!(flat.len(), 1);
+    assert_eq!(flat[0].name, "v");
 }
 
 #[test]

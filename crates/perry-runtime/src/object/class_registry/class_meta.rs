@@ -30,9 +30,16 @@ pub static CLASS_NAMES: RwLock<Option<HashMap<u32, String>>> = RwLock::new(None)
 
 /// Register the user-visible name of a class so the V8 bridge can label
 /// the V8-side wrapper for nice `metatype.name` reads. Idempotent.
+///
+/// A zero-length name is a legitimate registration, not a no-op: an anonymous
+/// class expression's `.name` IS the empty string per spec (issue #5952 —
+/// `const M = Mixin(Base)` over `function Mixin(B) { return class extends B {} }`
+/// binds a class whose `name` is `""`). Membership in `CLASS_NAMES` means "this
+/// id is a real class", which stays true for an anonymous one; only the null
+/// pointer and the reserved id 0 are rejected.
 #[no_mangle]
 pub unsafe extern "C" fn js_register_class_name(class_id: u32, name_ptr: *const u8, name_len: u32) {
-    if class_id == 0 || name_ptr.is_null() || name_len == 0 {
+    if class_id == 0 || name_ptr.is_null() {
         return;
     }
     let slice = std::slice::from_raw_parts(name_ptr, name_len as usize);
@@ -199,6 +206,11 @@ pub(crate) fn identify_global_builtin_constructor(func_value: f64) -> Option<&'s
             || func_ptr == weak_map_constructor_call_thunk as *const u8 as usize
             || func_ptr == weak_set_constructor_call_thunk as *const u8 as usize
             || func_ptr == weak_ref_constructor_call_thunk as *const u8 as usize
+            // `class X extends Promise` needs its parent VALUE recognized as the
+            // Promise constructor (for the runtime `new Subclass` /
+            // `NewPromiseCapability(Subclass)` path). The Promise ctor value
+            // carries `promise_constructor_call_thunk`.
+            || func_ptr == promise_constructor_call_thunk as *const u8 as usize
             || func_ptr
                 == crate::messaging::js_message_channel_constructor_call_error as *const u8
                     as usize
@@ -209,6 +221,71 @@ pub(crate) fn identify_global_builtin_constructor(func_value: f64) -> Option<&'s
                     as usize;
         if !is_global_builtin_func {
             return None;
+        }
+        // #5989: dedicated per-builtin thunks map to their name DIRECTLY —
+        // without consulting globalThis. The name-record/singleton-walk
+        // fallbacks below break the moment user code REASSIGNS the global
+        // binding (Next.js 16's cacheComponents extensions install a `Date`
+        // wrapper via `Date = createDate(Date)`; the wrapper's captured
+        // ORIGINAL constructor then no longer matches any globalThis key,
+        // identification returned None, and `Reflect.construct(original,
+        // args, newTarget)` fell to the generic tail → unbranded "Invalid
+        // Date" instances). Only the SHARED thunks (noop, typed-array)
+        // still need the walk.
+        let direct: Option<&'static str> =
+            if func_ptr == global_this_date_thunk as *const u8 as usize {
+                Some("Date")
+            } else if func_ptr == global_this_array_thunk as *const u8 as usize {
+                Some("Array")
+            } else if func_ptr == global_this_object_thunk as *const u8 as usize {
+                Some("Object")
+            } else if func_ptr == global_this_string_thunk as *const u8 as usize {
+                Some("String")
+            } else if func_ptr == global_this_number_thunk as *const u8 as usize {
+                Some("Number")
+            } else if func_ptr == global_this_boolean_thunk as *const u8 as usize {
+                Some("Boolean")
+            } else if func_ptr == global_this_blob_thunk as *const u8 as usize {
+                Some("Blob")
+            } else if func_ptr == global_this_file_thunk as *const u8 as usize {
+                Some("File")
+            } else if func_ptr == global_this_headers_thunk as *const u8 as usize {
+                Some("Headers")
+            } else if func_ptr == global_this_request_thunk as *const u8 as usize {
+                Some("Request")
+            } else if func_ptr == global_this_response_thunk as *const u8 as usize {
+                Some("Response")
+            } else if func_ptr == error_constructor_call_thunk as *const u8 as usize {
+                Some("Error")
+            } else if func_ptr == type_error_constructor_call_thunk as *const u8 as usize {
+                Some("TypeError")
+            } else if func_ptr == range_error_constructor_call_thunk as *const u8 as usize {
+                Some("RangeError")
+            } else if func_ptr == reference_error_constructor_call_thunk as *const u8 as usize {
+                Some("ReferenceError")
+            } else if func_ptr == syntax_error_constructor_call_thunk as *const u8 as usize {
+                Some("SyntaxError")
+            } else if func_ptr == eval_error_constructor_call_thunk as *const u8 as usize {
+                Some("EvalError")
+            } else if func_ptr == uri_error_constructor_call_thunk as *const u8 as usize {
+                Some("URIError")
+            } else if func_ptr == map_constructor_call_thunk as *const u8 as usize {
+                Some("Map")
+            } else if func_ptr == set_constructor_call_thunk as *const u8 as usize {
+                Some("Set")
+            } else if func_ptr == weak_map_constructor_call_thunk as *const u8 as usize {
+                Some("WeakMap")
+            } else if func_ptr == weak_set_constructor_call_thunk as *const u8 as usize {
+                Some("WeakSet")
+            } else if func_ptr == weak_ref_constructor_call_thunk as *const u8 as usize {
+                Some("WeakRef")
+            } else if func_ptr == promise_constructor_call_thunk as *const u8 as usize {
+                Some("Promise")
+            } else {
+                None
+            };
+        if direct.is_some() {
+            return direct;
         }
     }
     // Prefer the per-closure built-in `.name` record. Full-suite Rust tests

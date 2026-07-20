@@ -115,11 +115,27 @@ pub(crate) fn is_native_dispatch_member(module: &str, class: &str, prop: &str) -
             "Agent" => matches!(prop, "createConnection" | "createSocket"),
             _ => true,
         },
+        // #6117 — ws client instances: `readyState` is a native data getter
+        // (npm ws: CONNECTING=0 / OPEN=1 / CLOSING=2 / CLOSED=3) dispatched
+        // to `js_ws_ready_state`. Server instances expose no readyState, and
+        // every other bare member read stays a plain PropertyGet (method
+        // CALLS like `ws.send(..)` arrive via the call-expression path, not
+        // this bare-read block).
+        "ws" => prop == "readyState" && !matches!(class, "WebSocketServer" | "Server"),
         // events / net instances dispatch their EventEmitter / socket methods
         // and getters through the class_filter table. These modules expose no
         // user own-property surface in the bundle walls, so keep dispatching
         // for any member to preserve existing behaviour.
         "events" | "net" => true,
+        // #6364 — DisposableStack / AsyncDisposableStack: `disposed` is the
+        // only native data getter (its value comes from the FFI helper
+        // `js_disposable_stack_disposed`), so a bare read must dispatch as a
+        // 0-arg `NativeMethodCall` through the `__disposable__` NativeModSig
+        // row. Every other member (`use`/`adopt`/`defer`/`dispose`/
+        // `disposeAsync`/`move`) is a method: a method CALL arrives via the
+        // call-expression path, and a bare method-VALUE read must stay a plain
+        // PropertyGet (a bound-method read), never a 0-arg invoking dispatch.
+        "__disposable__" => prop == "disposed",
         // Other native modules historically routed every uncovered member to
         // the dispatching fallback. They have no observed user-own-property
         // surface, so preserve that: dispatch any member not handled by the

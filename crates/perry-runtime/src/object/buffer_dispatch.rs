@@ -360,6 +360,23 @@ pub unsafe fn dispatch_buffer_method(
     } else {
         &[]
     };
+    // An OWN property shadows the prototype method of the same name (Node's
+    // Buffer is an ordinary Uint8Array). mysql2's `MockBuffer` overwrites the
+    // write methods of a zero-length Buffer with a no-op to MEASURE a packet
+    // before allocating it; dispatching the native method regardless would
+    // write into the empty buffer and throw RangeError [ERR_OUT_OF_RANGE].
+    if let Some(own) = crate::buffer::buffer_get_own_prop(addr, method_name) {
+        let jv = JSValue::from_bits(own.to_bits());
+        if jv.is_pointer() {
+            let ptr = jv.as_pointer::<u8>() as usize;
+            if crate::closure::is_closure_ptr(ptr) {
+                let prev_this = crate::object::js_implicit_this_set(buf_f64);
+                let r = crate::closure::js_native_call_value(own, args_ptr, args_len);
+                crate::object::js_implicit_this_set(prev_this);
+                return r;
+            }
+        }
+    }
     let arg_i32 = |i: usize| -> i32 {
         if i < args.len() {
             args[i] as i32
@@ -466,11 +483,32 @@ pub unsafe fn dispatch_buffer_method(
         "inspect" => {
             crate::builtins::js_util_inspect(buf_f64, f64::from_bits(crate::value::TAG_UNDEFINED))
         }
+        // ES2024 `ArrayBuffer.prototype.transfer` / `transferToFixedLength`.
+        // Scoped to plain ArrayBuffers: SharedArrayBuffer and Uint8Array/Buffer
+        // receivers don't have these methods in Node, so they keep falling
+        // through to the catch-all like any other unknown method.
+        "transfer" | "transferToFixedLength"
+            if crate::buffer::is_array_buffer(addr)
+                && !crate::buffer::is_shared_array_buffer(addr)
+                && !crate::buffer::is_data_view(addr) =>
+        {
+            crate::buffer::array_buffer_transfer(addr, args)
+        }
         "slice" | "subarray" => {
             let len = (*buf_ptr).length as i32;
             let (start, end) = if crate::buffer::is_array_buffer(addr)
                 || crate::buffer::is_shared_array_buffer(addr)
             {
+                // A detached ArrayBuffer refuses slice with a TypeError
+                // (ES2024 DetachArrayBuffer; `transfer` is the only detach
+                // source in Perry).
+                if crate::buffer::is_detached_buffer(addr)
+                    && !crate::buffer::is_shared_array_buffer(addr)
+                {
+                    crate::collection_iter::throw_type_error(
+                        "Cannot perform ArrayBuffer.prototype.slice on a detached ArrayBuffer",
+                    );
+                }
                 // ArrayBuffer / SharedArrayBuffer.prototype.slice: ToIntegerOrInfinity
                 // on `start` (always) and `end` (defaults to len when undefined),
                 // running an object arg's `valueOf` in left-to-right order. Plain
@@ -1062,7 +1100,7 @@ pub unsafe fn dispatch_buffer_method(
         // non-callable callback) nor iterating. Delegate any method the Buffer
         // API doesn't claim to the shared uint8 typed-array dispatcher (it
         // validates callbacks and reads the typed store); it returns `None` for
-        // names it doesn't implement, preserving the `undefined` fallback.
+        // names it doesn't implement.
         _ => {
             if super::typed_array_proto_thunks::is_typed_array_buffer(addr) {
                 if let Some(r) = super::typed_array_proto_thunks::dispatch_uint8_buffer_method(
@@ -1073,7 +1111,26 @@ pub unsafe fn dispatch_buffer_method(
                     return r;
                 }
             }
-            f64::from_bits(crate::value::TAG_UNDEFINED)
+            // Internal perry hooks (`using` disposal probes and friends) may
+            // reach any receiver; they are duck-typed and must stay non-throwing.
+            if method_name.starts_with("__perry_") {
+                return f64::from_bits(crate::value::TAG_UNDEFINED);
+            }
+            // A method neither the Buffer API nor %TypedArray%.prototype
+            // implements must throw like Node (`buf.charCodeAt is not a
+            // function`), not silently return undefined. The silent fallback
+            // turned a readFileSync-now-returns-Buffer migration into invisible
+            // data corruption downstream: `content.charCodeAt(i)` yielded
+            // undefined in every comparison, so e.g. a NUL-byte binary-file
+            // scan misclassified every text file while the program kept
+            // running as if the calls had worked. Same shape as the string /
+            // number primitive catch-alls, which already route here.
+            crate::error::js_throw_type_error_not_a_function(
+                b"Buffer".as_ptr(),
+                6,
+                method_name.as_ptr(),
+                method_name.len(),
+            )
         }
     }
 }

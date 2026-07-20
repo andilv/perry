@@ -25,31 +25,24 @@ use super::*;
 /// pre-setjmp values. The standard `blk.call()` doesn't support call
 /// attributes, so the instruction is emitted manually.
 ///
-/// setjmp variant selection — must match the declaration in
-/// `runtime_decls.rs`:
-///   - Apple: `_setjmp` (LLVM-IR name) → linker `__setjmp` = fast variant
-///     (skips the sigprocmask / sigaltstack syscalls, ~500 ns each on
-///     macOS arm64).
-///   - Linux: `setjmp` is already fast — no swap needed.
-///   - Windows: `_setjmp(buf, frame_ptr)` (different ABI).
-fn emit_setjmp_dispatch(ctx: &mut FnCtx<'_>, exc_label: &str, normal_label: &str) {
+/// setjmp variant selection — decided by `crate::setjmp_abi` from the
+/// compile target's LLVM triple (`ctx.target_triple`), NOT host `cfg!`,
+/// so cross-compiles emit the target's ABI. The same `SetjmpAbi` drives
+/// the extern declaration in `runtime_decls/strings_part2.rs`, so the
+/// call and the prototype can't diverge. See `crate::setjmp_abi` for the
+/// per-target rationale (Windows 2-arg `_setjmp`, Apple fast `_setjmp`,
+/// plain `setjmp` elsewhere).
+///
+/// Also used by the async rejection boundary in `stmt/mod.rs`
+/// (`lower_async_rejecting_stmts_inner`) — same setjmp, different
+/// exception continuation.
+pub(super) fn emit_setjmp_dispatch(ctx: &mut FnCtx<'_>, exc_label: &str, normal_label: &str) {
     use crate::types::{I32, PTR};
+    let abi = crate::setjmp_abi::setjmp_abi_for_triple(ctx.target_triple);
     let blk = ctx.block();
     let jmpbuf = blk.call(PTR, "js_try_push", &[]);
     let sjr_reg = blk.next_reg();
-    if cfg!(target_os = "windows") {
-        blk.emit_raw(format!(
-            "{} = call i32 @_setjmp(ptr {}, ptr null) #0",
-            sjr_reg, jmpbuf
-        ));
-    } else if cfg!(target_vendor = "apple") {
-        blk.emit_raw(format!(
-            "{} = call i32 @_setjmp(ptr {}) #0",
-            sjr_reg, jmpbuf
-        ));
-    } else {
-        blk.emit_raw(format!("{} = call i32 @setjmp(ptr {}) #0", sjr_reg, jmpbuf));
-    }
+    blk.emit_raw(abi.call_instruction(&sjr_reg, &jmpbuf));
     let is_exc = blk.icmp_ne(I32, &sjr_reg, "0");
     blk.cond_br(&is_exc, exc_label, normal_label);
 }
@@ -60,12 +53,20 @@ pub(crate) fn lower_try(
     catch: Option<&perry_hir::CatchClause>,
     finally: Option<&[perry_hir::Stmt]>,
 ) -> Result<()> {
-    // Mark the enclosing function so IR emission adds `#1`
-    // (noinline optnone). At -O2 on aarch64, LLVM's mem2reg/SROA will
-    // otherwise promote allocas to SSA registers across the setjmp
-    // call — making mutations performed in the try body invisible in
-    // the catch block after longjmp. `returns_twice` on the setjmp
-    // call site alone is not sufficient.
+    // Mark the enclosing function so IR emission adds `#1` (noinline) and
+    // runs the setjmp volatile-promotion pass.
+    //
+    // At -O2 on aarch64, LLVM's mem2reg/SROA would otherwise promote allocas
+    // to SSA registers across the setjmp call, and `longjmp` — which restores
+    // the callee-saved registers snapshotted by `setjmp` — would revert the
+    // mutations the try body made, so the catch block reads stale values.
+    // `returns_twice` on the setjmp call site alone is not sufficient.
+    //
+    // The fix is C's `volatile` rule, not `optnone`: the
+    // `enter_try_region`/`exit_try_region` brackets below record every store
+    // the try body emits, and `LlFunction::to_ir` gives just those allocas
+    // volatile accesses. Everything else in the function — loop counters,
+    // arithmetic, compares, branches — stays fully optimizable (#6385).
     ctx.func.has_try = true;
 
     // Allocate blocks.
@@ -86,7 +87,12 @@ pub(crate) fn lower_try(
     // pops it via `js_try_end` before falling through to the function's
     // ret. Decremented after the body finishes lowering.
     ctx.try_depth += 1;
+    // Everything lowered from here on runs between the setjmp above and a
+    // possible longjmp into `try.catch`, so its stores must survive that
+    // longjmp (#6385).
+    ctx.func.enter_try_region();
     lower_stmts(ctx, body)?;
+    ctx.func.exit_try_region();
     ctx.try_depth -= 1;
     if !ctx.block().is_terminated() {
         ctx.block().call_void("js_try_end", &[]);
@@ -126,7 +132,13 @@ pub(crate) fn lower_try(
 
             ctx.current_block = cbody_idx;
             ctx.try_depth += 1;
+            // The catch body sits inside its OWN setjmp (the one just emitted):
+            // a throw escaping it longjmps to `try.catch.fail`, which re-runs
+            // the finally and reads locals. So its stores are also
+            // "modified between setjmp and longjmp" (#6385).
+            ctx.func.enter_try_region();
             lower_stmts(ctx, &clause.body)?;
+            ctx.func.exit_try_region();
             ctx.try_depth -= 1;
             if !ctx.block().is_terminated() {
                 ctx.block().call_void("js_try_end", &[]);

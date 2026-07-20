@@ -108,9 +108,9 @@ pub(super) unsafe fn rewrite_heap_object_fields(
         rewrite_slot(slot.slot, valid_ptrs);
         changed |= *slot.slot != before;
     });
-    if changed && gc_type_rewrite_hook_kind((*header).obj_type) == GcRewriteHookKind::SetIndex {
+    if changed {
         let user_ptr = (header as *mut u8).add(GC_HEADER_SIZE);
-        crate::set::rebuild_set_index_for_gc(user_ptr as *mut crate::set::SetHeader);
+        run_gc_rewrite_hook((*header).obj_type, user_ptr as usize);
     }
 }
 
@@ -128,7 +128,11 @@ pub(super) unsafe fn remember_evacuated_old_to_young_slot(
         return;
     }
     let child_addr = decode_heap_addr(*slot);
-    if child_addr == 0 || !crate::arena::pointer_in_nursery(child_addr) {
+    // Nursery AND malloc-GC children both need their pages kept dirty:
+    // minors sweep the malloc registry too, and old parents are black
+    // leaves — dropping an old→malloc page here would free the malloc
+    // child on the next minor (see remembered_child_needs_tracking).
+    if child_addr == 0 || !crate::gc::barrier::remembered_child_needs_tracking(child_addr) {
         return;
     }
     let external = !matches!(
@@ -282,6 +286,7 @@ pub(super) struct OldToYoungRememberedRebuildState {
     arena_cursor: Option<crate::arena::ArenaObjectCursor>,
     arena_done: bool,
     malloc_index: usize,
+    objects_scanned: usize,
     done: bool,
 }
 
@@ -295,8 +300,16 @@ impl OldToYoungRememberedRebuildState {
             )),
             arena_done: false,
             malloc_index: 0,
+            objects_scanned: 0,
             done: false,
         }
+    }
+
+    /// Number of heap objects this whole-heap rebuild walk has visited. Used
+    /// by the GC trace to prove that minors do NOT run this O(all-objects)
+    /// walk (#6181): full cycles report the walked object count, minors 0.
+    pub(super) fn objects_scanned(&self) -> usize {
+        self.objects_scanned
     }
 
     pub(super) fn step(&mut self, budget: usize) -> bool {
@@ -316,6 +329,7 @@ impl OldToYoungRememberedRebuildState {
                 break;
             };
             remaining -= 1;
+            self.objects_scanned += 1;
             let header = header_ptr as *mut GcHeader;
             unsafe {
                 remember_retained_old_to_young_slots(&mut self.sticky, header, self.require_marked);
@@ -333,6 +347,7 @@ impl OldToYoungRememberedRebuildState {
             };
             self.malloc_index += 1;
             remaining -= 1;
+            self.objects_scanned += 1;
             unsafe {
                 remember_retained_old_to_young_slots(&mut self.sticky, header, self.require_marked);
             }
@@ -449,13 +464,34 @@ pub(super) unsafe fn verify_old_young_slot_covered(
         return;
     }
     let child_addr = decode_heap_addr(*slot);
-    if child_addr == 0 || !crate::arena::pointer_in_nursery(child_addr) {
+    if child_addr == 0 || !crate::gc::barrier::remembered_child_needs_tracking(child_addr) {
         return;
     }
     stats.checked_old_to_young_edges = stats.checked_old_to_young_edges.saturating_add(1);
     let parent_addr = parent_header as usize;
     if !old_young_slot_covered(snapshot, parent_addr, slot) {
-        stats.record_missing(parent_addr, slot as usize, child_addr);
+        // gh #6206: record parent/child GC types so the panic below can
+        // print per-type histograms of the dropped edges.
+        let parent_obj_type = (*parent_header).obj_type;
+        let parent_marked = (*parent_header).gc_flags & (GC_FLAG_MARKED | GC_FLAG_PINNED) != 0;
+        let parent_user = (parent_header as *mut u8).add(GC_HEADER_SIZE) as usize;
+        let parent_is_old_arena = matches!(
+            crate::arena::classify_heap_generation(parent_user),
+            crate::arena::HeapGeneration::Old
+        );
+        let child_obj_type = {
+            let ch = (child_addr as *const u8).sub(GC_HEADER_SIZE) as *const GcHeader;
+            (*ch).obj_type
+        };
+        stats.record_missing_diag(
+            parent_addr,
+            slot as usize,
+            child_addr,
+            parent_obj_type,
+            child_obj_type,
+            parent_is_old_arena,
+            parent_marked,
+        );
     }
 }
 
@@ -480,19 +516,43 @@ pub(super) unsafe fn verify_old_young_parent_slots_covered(
 #[cold]
 pub(super) fn panic_old_young_edge_verifier_failed(stats: OldYoungEdgeVerifyStats) -> ! {
     let missing = stats.first_missing.unwrap_or_default();
+    // gh #6206: readable per-type histograms of the missing edges.
+    let type_name = |t: u8| -> &'static str { gc_type_info(t).map_or("?", |i| i.name) };
+    let mut parent_hist = String::new();
+    let mut child_hist = String::new();
+    for t in 0u8..32 {
+        let p = stats.missing_by_parent_type[t as usize];
+        if p != 0 {
+            parent_hist.push_str(&format!(" {}({})={}", type_name(t), t, p));
+        }
+        let c = stats.missing_by_child_type[t as usize];
+        if c != 0 {
+            child_hist.push_str(&format!(" {}({})={}", type_name(t), t, c));
+        }
+    }
     panic!(
-        "old-young-edge-verifier failed: checked_old_objects={} checked_remembered_pages={} checked_old_to_young_edges={} missing_edges={} first_missing_parent=0x{:x} first_missing_slot=0x{:x} first_missing_child=0x{:x}",
+        "old-young-edge-verifier failed: checked_old_objects={} checked_remembered_pages={} checked_old_to_young_edges={} missing_edges={} malloc_parents={} unmarked_parents={}\n  first_missing: parent=0x{:x} type={}({}) old_arena={} marked={} slot=0x{:x} child=0x{:x} child_type={}({})\n  missing_by_parent_type:{}\n  missing_by_child_type:{}",
         stats.checked_old_objects,
         stats.checked_remembered_pages,
         stats.checked_old_to_young_edges,
         stats.missing_edges,
+        stats.missing_parent_malloc,
+        stats.missing_parent_unmarked,
         missing.parent,
+        type_name(missing.parent_obj_type),
+        missing.parent_obj_type,
+        missing.parent_is_old_arena,
+        missing.parent_marked,
         missing.slot,
-        missing.child
+        missing.child,
+        type_name(missing.child_obj_type),
+        missing.child_obj_type,
+        parent_hist,
+        child_hist,
     );
 }
 
-pub(super) fn verify_old_to_young_edges_covered() -> OldYoungEdgeVerifyStats {
+pub(super) fn verify_old_to_young_edges_collect() -> OldYoungEdgeVerifyStats {
     let snapshot = remembered_dirty_snapshot();
     let mut stats = OldYoungEdgeVerifyStats {
         checked_remembered_pages: snapshot.dirty_pages.len(),
@@ -509,8 +569,27 @@ pub(super) fn verify_old_to_young_edges_covered() -> OldYoungEdgeVerifyStats {
             }
         }
     });
+    stats
+}
+
+pub(super) fn verify_old_to_young_edges_covered() -> OldYoungEdgeVerifyStats {
+    let stats = verify_old_to_young_edges_collect();
     if stats.missing_edges != 0 {
-        panic_old_young_edge_verifier_failed(stats);
+        // gh #6206: this check runs at AtomicFinalize, AFTER the mark phase
+        // consumed the dirty logs, so its "missing" edges can be a
+        // measurement artifact. PERRY_GC_VERIFY_RS_NONFATAL=1 demotes it to
+        // a warning so the stale-forwarded-refs verifier (which runs later
+        // in the same cycle) can be reached.
+        use std::sync::OnceLock;
+        static NONFATAL: OnceLock<bool> = OnceLock::new();
+        if *NONFATAL.get_or_init(|| std::env::var_os("PERRY_GC_VERIFY_RS_NONFATAL").is_some()) {
+            eprintln!(
+                "[gc-verify] old-young-edge-verifier (non-fatal): missing_edges={}",
+                stats.missing_edges
+            );
+        } else {
+            panic_old_young_edge_verifier_failed(stats);
+        }
     }
     stats
 }
@@ -603,6 +682,126 @@ pub(super) fn verify_marked_heap_no_unmarked_children() -> MarkInvariantVerifySt
         panic_mark_invariant_verifier_failed(stats);
     }
     stats
+}
+
+/// Non-fatal mark-invariant probe (`PERRY_GC_VERIFY_MARK`): walks the marked
+/// heap and, instead of panicking, logs the first marked→UNMARKED-child edge
+/// with parent/child obj_types. Lets the bundle be driven to reproduce a
+/// swept-live-child (freed Map value) without aborting. Diagnostic only.
+pub(super) fn verify_marked_heap_report_nonfatal(phase: &str) {
+    let mut stats = MarkInvariantVerifyStats::default();
+    crate::arena::arena_walk_objects(|hp| unsafe {
+        verify_marked_object_child_marks(&mut stats, hp as *mut GcHeader);
+    });
+    MALLOC_STATE.with(|s| {
+        let s = s.borrow();
+        for &header in s.objects.iter() {
+            unsafe {
+                verify_marked_object_child_marks(&mut stats, header);
+            }
+        }
+    });
+    let tn = |t: u8| gc_type_info(t).map_or("?", |i| i.name);
+    if let Some(m) = stats.first_missing {
+        let (ptype, ctype) = unsafe {
+            let ph = (m.parent as *const u8).sub(GC_HEADER_SIZE) as *const GcHeader;
+            let ch = (m.child as *const u8).sub(GC_HEADER_SIZE) as *const GcHeader;
+            ((*ph).obj_type, (*ch).obj_type)
+        };
+        eprintln!(
+            "[gc-mark-verify:{}] marked->UNMARKED edges={} checked_marked={} checked_edges={} | first parent=0x{:x} ptype={}({}) slot=0x{:x} child=0x{:x} ctype={}({})",
+            phase,
+            stats.missing_edges,
+            stats.checked_marked_objects,
+            stats.checked_edges,
+            m.parent,
+            tn(ptype),
+            ptype,
+            m.slot,
+            m.child,
+            tn(ctype),
+            ctype,
+        );
+    } else {
+        eprintln!(
+            "[gc-mark-verify:{}] OK (no marked->unmarked) checked_marked={} checked_edges={}",
+            phase, stats.checked_marked_objects, stats.checked_edges,
+        );
+    }
+}
+
+/// Non-fatal minor-sweep probe (`PERRY_GC_VERIFY_MARK`): at the minor's
+/// AtomicFinalize→Sweep boundary (marks final, nothing freed yet), walk every
+/// OLD-gen parent (implicitly live in a minor) and report any child slot that
+/// points at a sweep-eligible (young/malloc) object which is UNMARKED — i.e.
+/// about to be freed while its parent survives. This is the direct signature
+/// of a dropped remembered-set edge. Logs a per-(parent,child)-type histogram
+/// plus the first edge; diagnostic only.
+pub(super) fn verify_minor_unmarked_young_children_report(phase: &str) {
+    let mut missing = 0usize;
+    let mut checked_parents = 0usize;
+    let mut checked_edges = 0usize;
+    let mut first: Option<(usize, usize, usize, u8, u8)> = None;
+    let mut hist: std::collections::HashMap<(u8, u8), usize> = std::collections::HashMap::new();
+    let mut visit_parent = |header: *mut GcHeader| unsafe {
+        if header.is_null() || (*header).gc_flags & GC_FLAG_FORWARDED != 0 {
+            return;
+        }
+        let user = (header as *mut u8).add(GC_HEADER_SIZE) as usize;
+        if !matches!(
+            crate::arena::classify_heap_generation(user),
+            crate::arena::HeapGeneration::Old
+        ) {
+            return;
+        }
+        checked_parents += 1;
+        visit_gc_rewrite_slots(header, |slot| unsafe {
+            if crate::weakref::is_weak_target_trace_slot(header, slot.slot) {
+                return;
+            }
+            slot.record_layout_read();
+            let child_addr = decode_heap_addr(*slot.slot);
+            if child_addr == 0 || !crate::gc::barrier::remembered_child_needs_tracking(child_addr) {
+                return;
+            }
+            checked_edges += 1;
+            let ch = (child_addr as *const u8).sub(GC_HEADER_SIZE) as *const GcHeader;
+            if (*ch).gc_flags & (GC_FLAG_MARKED | GC_FLAG_PINNED) == 0 {
+                missing += 1;
+                *hist
+                    .entry(((*header).obj_type, (*ch).obj_type))
+                    .or_insert(0) += 1;
+                if first.is_none() {
+                    first = Some((
+                        header as usize,
+                        slot.slot as usize,
+                        child_addr,
+                        (*header).obj_type,
+                        (*ch).obj_type,
+                    ));
+                }
+            }
+        });
+    };
+    crate::arena::old_arena_walk_objects(|hp| {
+        visit_parent(hp as *mut GcHeader);
+    });
+    let tn = |t: u8| gc_type_info(t).map_or("?", |i| i.name);
+    if let Some((p, s, c, pt, ct)) = first {
+        let mut hist_str = String::new();
+        for ((pt, ct), n) in &hist {
+            hist_str.push_str(&format!(" {}({})->{}({})={}", tn(*pt), pt, tn(*ct), ct, n));
+        }
+        eprintln!(
+            "[gc-mark-verify:{}] SWEEP-LIVE-CHILD edges={} parents={} young_edges={} | first parent=0x{:x} ptype={}({}) slot=0x{:x} child=0x{:x} ctype={}({}) | hist:{}",
+            phase, missing, checked_parents, checked_edges, p, tn(pt), pt, s, c, tn(ct), ct, hist_str,
+        );
+    } else {
+        eprintln!(
+            "[gc-mark-verify:{}] OK parents={} young_edges={}",
+            phase, checked_parents, checked_edges,
+        );
+    }
 }
 
 pub(super) unsafe fn verify_heap_object_fields(

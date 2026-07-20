@@ -137,7 +137,7 @@ fn malloc_sweep_pauses_mid_list_and_eventually_frees_dead_malloc() {
     }
     let dead_headers = allocate_dead_malloc_churn_headers(32);
 
-    let mut sweep = IncrementalSweepState::new(false, false, None, true);
+    let mut sweep = IncrementalSweepState::new(false, false, None, true, false);
     assert!(!sweep.step(1));
     assert!(
         tracked_malloc_headers_matching(&dead_headers) > 0,
@@ -238,7 +238,7 @@ fn arena_sweep_pauses_before_block_cleanup_and_preserves_live_objects() {
     }
     let in_use_after_alloc = crate::arena::arena_in_use_bytes();
 
-    let mut sweep = IncrementalSweepState::new(true, false, None, false);
+    let mut sweep = IncrementalSweepState::new(true, false, None, false, true);
     assert!(
         !sweep.step(1),
         "first tiny step should only enter arena sweep"
@@ -295,6 +295,7 @@ fn old_generation_targeted_and_full_reclaim_are_bounded_and_publish_telemetry() 
         false,
         Some(targeted_blocks.block_indices.clone()),
         false,
+        false,
     );
     assert!(
         !targeted_sweep.step(1),
@@ -315,7 +316,7 @@ fn old_generation_targeted_and_full_reclaim_are_bounded_and_publish_telemetry() 
     let _full_dead_a = crate::arena::arena_alloc_gc_old(900 * 1024, 8, GC_TYPE_STRING) as usize;
     let _full_dead_b = crate::arena::arena_alloc_gc_old(900 * 1024, 8, GC_TYPE_STRING) as usize;
     crate::arena::old_pages_begin_gc_cycle();
-    let mut full_sweep = IncrementalSweepState::new(false, true, None, false);
+    let mut full_sweep = IncrementalSweepState::new(false, true, None, false, false);
     assert!(
         !full_sweep.step(1),
         "full old reclaim should not complete in one work unit"
@@ -543,7 +544,7 @@ fn budgeted_reclaim_slices_conservative_pin_cleanup() {
 }
 
 #[test]
-fn budgeted_reclaim_skips_process_malloc_trim() {
+fn budgeted_reclaim_runs_process_malloc_trim() {
     let _trace_guard = TestGcTraceCaptureGuard::force_enabled();
     let _guard = CopyingNurseryTestGuard::new(1);
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
@@ -561,23 +562,23 @@ fn budgeted_reclaim_skips_process_malloc_trim() {
 
     let completed = complete_budgeted_gc_cycle();
     assert_eq!(completed.status, JS_GC_STEP_STATUS_COMPLETED);
-    assert_eq!(
-        test_malloc_trim_call_count(),
-        0,
-        "ordinary budgeted reclaim must not invoke process-wide malloc_trim"
+    assert!(
+        test_malloc_trim_call_count() >= 1,
+        "budgeted reclaim must invoke allocator trim (#6180 RSS floor)"
     );
     assert!(gc_collection_count() > before);
     assert_eq!(tracked_malloc_headers_matching(&dead_headers), 0);
     assert_eq!(js_shadow_slot_get(0) & POINTER_MASK, live as u64);
 
     let event = take_test_last_gc_trace_json().expect("budgeted reclaim should emit trace JSON");
-    assert_eq!(
-        event["allocator_maintenance"]["malloc_trim"]["status"].as_str(),
-        Some("skipped")
-    );
-    assert_eq!(
-        event["allocator_maintenance"]["malloc_trim"]["reason"].as_str(),
-        Some("ordinary_budgeted")
-    );
-    assert_eq!(event["phase_us"]["malloc_trim"].as_u64(), Some(0));
+    // #6180 RSS floor: budgeted cycles now RUN allocator trim (the audit
+    // found long-lived incremental processes never returned freed allocator
+    // pages to the OS). Outcome is platform-dependent (executed on glibc,
+    // unsupported elsewhere) — never the old budgeted skip.
+    let trim = &event["allocator_maintenance"]["malloc_trim"];
+    assert_ne!(trim["reason"].as_str(), Some("ordinary_budgeted"));
+    assert!(matches!(
+        trim["status"].as_str(),
+        Some("executed") | Some("unsupported")
+    ));
 }

@@ -68,7 +68,13 @@ pub(crate) fn lower_class_expr(
             match inferred {
                 // First class expression to claim this inferred binding name —
                 // reuse it directly as the registration key (and thus `.name`).
-                Some(name) if ctx.lookup_class(&name).is_none() => name,
+                Some(name) if ctx.lookup_class(&name).is_none() => {
+                    // Record that this binding's local holds ITS OWN class, so
+                    // `new <name>()` keeps the exact static construct path
+                    // (see `inferred_class_bindings`).
+                    ctx.inferred_class_bindings.insert(name.clone());
+                    name
+                }
                 // #5592: a second anonymous class expression assigned to the
                 // SAME binding (`C = class {…}; C = class {…}`) infers the same
                 // name. Reusing the key would alias both onto one ClassId
@@ -77,6 +83,12 @@ pub(crate) fn lower_class_expr(
                 // registration key but keep its user-visible `.name` as the
                 // binding name.
                 Some(name) => {
+                    // The binding's local still holds ITS OWN class even when
+                    // the registration key is disambiguated (#5592) — or when
+                    // the Phase-1.5 pre-scan already claimed the inferred name
+                    // for this same expression. Record the BINDING name so
+                    // `new <name>()` keeps the static construct path.
+                    ctx.inferred_class_bindings.insert(name.clone());
                     display_override = Some(name.clone());
                     format!("{}__anon_dup_{}", name, ctx.fresh_class())
                 }
@@ -84,6 +96,9 @@ pub(crate) fn lower_class_expr(
             }
         }
     };
+    // Record the source-level inner binding name for the const-assignment
+    // guard (assigning to it inside the body throws a TypeError).
+    ctx.pending_class_inner_name = class_expr.ident.as_ref().map(|i| i.sym.to_string());
     let class = lower_class_from_ast(ctx, &class_expr.class, &synthetic_name, false)?;
     if let Some(display) = display_override {
         ctx.class_display_names.insert(class.id, display);
@@ -171,12 +186,55 @@ pub(crate) fn lower_class_expr(
     // expressions inside a function body (factories like effect's
     // `make()`), which produce a distinct class object per call.
     let at_module_top = ctx.scope_depth == 0 && ctx.inside_block_scope == 0;
+    // #6604: register this capturing class EXPRESSION with the enclosing
+    // body's end-of-body capture-refresh machinery (#6037/#6052), which
+    // previously scanned class DECLARATION statements only. Without the
+    // refresh, a captured var assigned AFTER the class expression (semver's
+    // `var Comparator = class _Comparator { … }; …; var parseOptions =
+    // require_parse_options()`) stays `undefined` in the decl-site snapshot,
+    // and dynamic construction of the escaped class value replays that stale
+    // snapshot. Recording the RESOLVED registration name here (post
+    // rename/dedup) sidesteps re-deriving it from the AST at body end. Module
+    // top is skipped — module-level ids are stripped from capture lists by
+    // `filter_module_level_captures`, so there is nothing to refresh.
+    if !at_module_top && !captured_args.is_empty() {
+        if let Some(ids) = ctx.lookup_class_captures(&synthetic_name) {
+            ctx.body_class_expr_captures
+                .push((synthetic_name.clone(), ids.to_vec()));
+        }
+    }
     if !at_module_top
-        && parent_expr.is_none()
         && (!named_statics.is_empty()
             || !static_symbol_registrations.is_empty()
             || !captured_args.is_empty())
     {
+        // #6438: a class expression WITH heritage (`class extends <expr>`) used
+        // to be excluded here and fell back to the shared-template `ClassRef`
+        // path — the very thing #1772's comment above warns about: it "shares
+        // one template class and `.ast` is undefined/clobbered". effect's
+        // Schema.ts hits exactly that shape:
+        //
+        //   function makeDeclareClass(typeParameters, ast) {
+        //     return class DeclareClass extends make(ast) {
+        //       static typeParameters = [...typeParameters]
+        //     }
+        //   }
+        //
+        // `makeDeclareClass` runs 5+ times during Schema.ts init, so all five
+        // DeclareClasses shared ONE `@perry_static_…__DeclareClass__typeParameters`
+        // module global whose initializer is hoisted to module init — where the
+        // enclosing `typeParameters` parameter is not in scope. Every instance
+        // then read `undefined`, and `this.typeParameters` inside the inherited
+        // static `annotations` fed `[...undefined]` → "TypeError: undefined is
+        // not iterable", taking down the whole @effect/platform HttpApi server.
+        //
+        // Heritage is orthogonal to per-evaluation static storage: sequence the
+        // dynamic-parent registration (which wires the runtime parent edge for
+        // method dispatch, exactly as the shared-template path below does)
+        // AHEAD of the fresh class object, so the parent edge is registered
+        // before the object is materialized and the Sequence still yields the
+        // class value as its last element.
+        //
         // #1787: snapshot the class's captured outer-scope values so a
         // later `new <classObjectValue>()` can run the instance-field
         // initializers / constructor body with the right environment.
@@ -186,15 +244,22 @@ pub(crate) fn lower_class_expr(
         // that same order as `LocalGet(outer_id)`, evaluated here where
         // the captures are still live.
         let fresh_expr = Expr::ClassExprFresh {
-            template: synthetic_name,
+            template: synthetic_name.clone(),
             named_statics,
             symbol_statics: static_symbol_registrations,
             captured_args,
         };
-        if computed_member_registrations.is_empty() {
+        let mut seq: Vec<Expr> = Vec::new();
+        if let Some(p) = parent_expr {
+            seq.push(Expr::RegisterClassParentDynamic {
+                class_name: synthetic_name,
+                parent_expr: p,
+            });
+        }
+        seq.extend(computed_member_registrations);
+        if seq.is_empty() {
             return Ok(fresh_expr);
         }
-        let mut seq = computed_member_registrations;
         seq.push(fresh_expr);
         return Ok(Expr::Sequence(seq));
     }

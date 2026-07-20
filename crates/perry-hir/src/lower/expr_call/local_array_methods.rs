@@ -127,6 +127,17 @@ pub(super) fn try_local_array_methods(
                         ctx.lookup_class(name).is_some()
                             || ctx.is_interface_type(name)
                             || is_imported_class_name(name)
+                            // A `function Q() {…}` used as a constructor (`new Q()`)
+                            // types its instances `Named("Q")`, but it is not a class
+                            // decl, so `lookup_class` misses it. Its methods live on
+                            // `Q.prototype` (registered via
+                            // `Expr::RegisterFunctionPrototypeMethod`), and when one of
+                            // them shares an Array name — `Q.prototype.push`, the shape
+                            // denque uses for mysql2's command queue — the array fast
+                            // path folded `q.push(x)` to `Expr::ArrayPush`, read the
+                            // instance's ObjectHeader as an ArrayHeader (silently
+                            // corrupting it) and never ran the method.
+                            || ctx.functions_index.contains_key(name.as_str())
                     }
                     Some(Type::Generic { base, .. }) => {
                         !builtin_generic_bases.contains(&base.as_str())
@@ -302,9 +313,21 @@ pub(super) fn try_local_array_methods(
                         match method_name {
                             "push" => {
                                 if args.is_empty() {
-                                    return Ok(Ok(Expr::PropertyGet {
-                                        object: Box::new(Expr::LocalGet(array_id)),
-                                        property: "length".to_string(),
+                                    // `arr.push()` with no items still performs
+                                    // `Set(O,"length",…,true)` (ECMA-262
+                                    // §23.1.3.21 step 6), so a frozen array or one
+                                    // whose `length` is non-writable must throw a
+                                    // TypeError — it is NOT a pure `length` read
+                                    // (test262 push/set-length-zero-array-is-frozen
+                                    // and set-length-zero-array-length-is-non-writable).
+                                    // Route through the native push dispatch, which
+                                    // emits `js_array_push_guard`.
+                                    return Ok(Ok(Expr::NativeMethodCall {
+                                        module: "array".to_string(),
+                                        class_name: None,
+                                        object: Some(Box::new(Expr::LocalGet(array_id))),
+                                        method: "push".to_string(),
+                                        args: vec![],
                                     }));
                                 }
                                 // Check if any argument has spread operator —

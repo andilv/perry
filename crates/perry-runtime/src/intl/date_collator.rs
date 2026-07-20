@@ -136,13 +136,31 @@ fn date_time_format_to_parts_value(obj: *const ObjectHeader, value: f64) -> f64 
 }
 
 /// Decompose the formatted output into typed parts matching `format_ms_with_dtf_obj`.
+/// Shift a UTC epoch-second count into the DTF instance's configured time zone,
+/// so `timestamp_to_components` yields the zone-local wall-clock fields. Only
+/// applied to plain `Date`/timestamp values — Temporal values carry their own
+/// zone/date semantics — so callers pass `temporal_kind` and get `secs`
+/// unchanged for any Temporal input.
+fn dtf_zone_local_secs(
+    obj: *const ObjectHeader,
+    secs: i64,
+    temporal_kind: Option<crate::temporal::TemporalKind>,
+) -> i64 {
+    if temporal_kind.is_some() {
+        return secs;
+    }
+    let tz = get_string_field(obj, KEY_TIME_ZONE)
+        .unwrap_or_else(|| crate::date::host_time_zone_name().to_string());
+    secs + crate::date::zone_offset_seconds(&tz, secs)
+}
+
 fn format_parts_with_dtf_obj(
     obj: *const ObjectHeader,
     ms: f64,
     temporal_kind: Option<crate::temporal::TemporalKind>,
 ) -> Vec<(&'static str, String)> {
     use crate::temporal::TemporalKind::*;
-    let secs = (ms as i64).div_euclid(1000);
+    let secs = dtf_zone_local_secs(obj, (ms as i64).div_euclid(1000), temporal_kind);
     let (year, month, day, hour, minute, second) = crate::date::timestamp_to_components(secs);
     let mi = month.saturating_sub(1).min(11) as usize;
 
@@ -419,6 +437,8 @@ fn format_parts_with_dtf_obj(
             let weekday_opt = get_string_field(obj, KEY_WEEKDAY);
             let era_opt = get_string_field(obj, KEY_ERA);
             let day_period_opt = get_string_field(obj, KEY_DAY_PERIOD);
+            let fractional_digits =
+                get_number_field(obj, KEY_FRACTIONAL).map(|n| (n as u8).clamp(1, 3));
             build_parts_from_components(
                 year,
                 month,
@@ -427,6 +447,7 @@ fn format_parts_with_dtf_obj(
                 minute,
                 second,
                 secs,
+                ms,
                 mi,
                 year_opt.as_deref(),
                 month_opt.as_deref(),
@@ -437,6 +458,7 @@ fn format_parts_with_dtf_obj(
                 weekday_opt.as_deref(),
                 era_opt.as_deref(),
                 day_period_opt.as_deref(),
+                fractional_digits,
                 use_24h,
             )
         }
@@ -444,6 +466,7 @@ fn format_parts_with_dtf_obj(
 }
 
 /// Build `formatToParts` parts from individual component options (no dateStyle/timeStyle).
+#[allow(clippy::too_many_arguments)]
 fn build_parts_from_components(
     year: i32,
     month: u32,
@@ -452,6 +475,7 @@ fn build_parts_from_components(
     minute: u32,
     second: u32,
     secs: i64,
+    ms: f64,
     mi: usize,
     year_opt: Option<&str>,
     month_opt: Option<&str>,
@@ -462,6 +486,7 @@ fn build_parts_from_components(
     weekday_opt: Option<&str>,
     era_opt: Option<&str>,
     day_period_opt: Option<&str>,
+    fractional_digits: Option<u8>,
     use_24h: bool,
 ) -> Vec<(&'static str, String)> {
     let mut parts: Vec<(&'static str, String)> = Vec::new();
@@ -547,70 +572,66 @@ fn build_parts_from_components(
     }
 
     if has_time {
+        let inc_hour = hour_opt.is_some();
         let inc_secs = second_opt.is_some();
         let inc_mins = minute_opt.is_some() || inc_secs;
-        if use_24h {
-            if let Some(h_s) = hour_opt {
-                let h_str = if h_s == "2-digit" {
+        let (h12, ampm) = if hour == 0 {
+            (12u32, "AM")
+        } else if hour < 12 {
+            (hour, "AM")
+        } else if hour == 12 {
+            (12, "PM")
+        } else {
+            (hour - 12, "PM")
+        };
+        // Emit hour / minute / second parts (only those requested), colon-joined.
+        let mut emitted_time = false;
+        if let Some(h_s) = hour_opt {
+            let h_str = if use_24h {
+                if h_s == "2-digit" {
                     format!("{:02}", hour)
                 } else {
                     hour.to_string()
-                };
-                parts.push(("hour", h_str));
-            }
-            if inc_mins {
-                if hour_opt.is_some() {
-                    parts.push(("literal", ":".to_string()));
                 }
-                parts.push(("minute", format!("{:02}", minute)));
-            }
-            if inc_secs {
-                parts.push(("literal", ":".to_string()));
-                parts.push(("second", format!("{:02}", second)));
-            }
-            if let Some(dp_s) = day_period_opt {
-                if hour_opt.is_some() || inc_mins {
-                    parts.push(("literal", " ".to_string()));
-                }
-                parts.push(("dayPeriod", day_period_string(hour, dp_s).to_string()));
-            }
-        } else {
-            let (h, ampm) = if hour == 0 {
-                (12u32, "AM")
-            } else if hour < 12 {
-                (hour, "AM")
-            } else if hour == 12 {
-                (12, "PM")
+            } else if h_s == "2-digit" {
+                format!("{:02}", h12)
             } else {
-                (hour - 12, "PM")
+                h12.to_string()
             };
-            if let Some(h_s) = hour_opt {
-                let h_str = if h_s == "2-digit" {
-                    format!("{:02}", h)
-                } else {
-                    h.to_string()
-                };
-                parts.push(("hour", h_str));
-            }
-            if inc_mins {
-                if hour_opt.is_some() {
-                    parts.push(("literal", ":".to_string()));
-                }
-                parts.push(("minute", format!("{:02}", minute)));
-            }
-            if inc_secs {
+            parts.push(("hour", h_str));
+            emitted_time = true;
+        }
+        if inc_mins {
+            if emitted_time {
                 parts.push(("literal", ":".to_string()));
-                parts.push(("second", format!("{:02}", second)));
             }
-            if let Some(dp_s) = day_period_opt {
-                if hour_opt.is_some() || inc_mins {
-                    parts.push(("literal", " ".to_string()));
-                }
-                parts.push(("dayPeriod", day_period_string(hour, dp_s).to_string()));
-            } else if hour_opt.is_some() || inc_mins {
+            parts.push(("minute", format!("{:02}", minute)));
+            emitted_time = true;
+        }
+        if inc_secs {
+            if emitted_time {
+                parts.push(("literal", ":".to_string()));
+            }
+            parts.push(("second", format!("{:02}", second)));
+            emitted_time = true;
+            // fractionalSecondDigits: a `.` literal then a `fractionalSecond` part.
+            if let Some(digits) = fractional_digits {
+                parts.push(("literal", ".".to_string()));
+                parts.push(("fractionalSecond", fractional_seconds_str(ms, digits)));
+            }
+        }
+        // Day period: an explicit `dayPeriod` option always surfaces; the 12-hour
+        // clock adds AM/PM only when an hour was actually requested.
+        if let Some(dp_s) = day_period_opt {
+            if emitted_time {
                 parts.push(("literal", " ".to_string()));
-                parts.push(("dayPeriod", ampm.to_string()));
             }
+            parts.push(("dayPeriod", day_period_string(hour, dp_s).to_string()));
+        } else if inc_hour && !use_24h {
+            if emitted_time {
+                parts.push(("literal", " ".to_string()));
+            }
+            parts.push(("dayPeriod", ampm.to_string()));
         }
     }
 
@@ -790,42 +811,13 @@ fn validate_temporal_dtf_overlap(kind: crate::temporal::TemporalKind, obj: *cons
 }
 
 // ---- Locale-aware date/time formatting (DTF and Temporal.toLocaleString) ---
-
-const MONTH_FULL: &[&str] = &[
-    "January",
-    "February",
-    "March",
-    "April",
-    "May",
-    "June",
-    "July",
-    "August",
-    "September",
-    "October",
-    "November",
-    "December",
-];
-const MONTH_ABBR: &[&str] = &[
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
-const WEEKDAY_FULL: &[&str] = &[
-    "Sunday",
-    "Monday",
-    "Tuesday",
-    "Wednesday",
-    "Thursday",
-    "Friday",
-    "Saturday",
-];
+use super::date_names::{MONTH_ABBR, MONTH_FULL, WEEKDAY_ABBR, WEEKDAY_FULL, WEEKDAY_NARROW};
 
 /// Weekday index (0=Sunday…6=Saturday) from a UTC epoch-seconds value.
 /// 1970-01-01 was Thursday = index 4.
 fn weekday_index(secs: i64) -> usize {
     ((secs.div_euclid(86400) + 4).rem_euclid(7)) as usize
 }
-
-const WEEKDAY_ABBR: &[&str] = &["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const WEEKDAY_NARROW: &[&str] = &["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
 
 fn weekday_name(secs: i64, style: &str) -> String {
     let wi = weekday_index(secs);
@@ -884,6 +876,117 @@ fn era_string(year: i32, style: &str) -> &'static str {
             }
         }
     }
+}
+
+/// Format a `dateStyle`/`timeStyle` combination via icu4x (CLDR patterns).
+/// Returns `None` when the icu feature is off, the caller opted out (`enabled`
+/// = false, e.g. a Temporal partial), or the option combination is unmapped
+/// (notably a `long`/`full` timeStyle, which carries a localized time-zone
+/// name) — the caller then falls back to the bespoke formatters below.
+#[cfg(feature = "intl-datetime")]
+#[allow(clippy::too_many_arguments)]
+fn icu_style(
+    enabled: bool,
+    locale: &str,
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+    date_style: Option<&str>,
+    time_style: Option<&str>,
+    hour_cycle: Option<&str>,
+    hour12: Option<bool>,
+) -> Option<String> {
+    use super::icu_dtf::{self, Len, Req};
+    if !enabled {
+        return None;
+    }
+    icu_dtf::format(&Req {
+        locale,
+        year,
+        month: month as u8,
+        day: day as u8,
+        hour: hour as u8,
+        minute: minute as u8,
+        second: second as u8,
+        date_style: date_style.and_then(Len::parse),
+        time_style: time_style.and_then(Len::parse),
+        hour_cycle,
+        hour12,
+    })
+}
+
+#[cfg(not(feature = "intl-datetime"))]
+#[allow(clippy::too_many_arguments)]
+fn icu_style(
+    _enabled: bool,
+    _locale: &str,
+    _year: i32,
+    _month: u32,
+    _day: u32,
+    _hour: u32,
+    _minute: u32,
+    _second: u32,
+    _date_style: Option<&str>,
+    _time_style: Option<&str>,
+    _hour_cycle: Option<&str>,
+    _hour12: Option<bool>,
+) -> Option<String> {
+    None
+}
+
+/// Format a date-only, name-bearing component set via icu4x. `None` when the
+/// feature is off or icu can't reproduce the combo (numeric-only, narrow,
+/// structurally inexpressible), so the caller falls back.
+#[cfg(feature = "intl-datetime")]
+#[allow(clippy::too_many_arguments)]
+fn icu_components(
+    locale: &str,
+    year: i32,
+    month: u32,
+    day: u32,
+    year_opt: Option<&str>,
+    month_opt: Option<&str>,
+    day_opt: Option<&str>,
+    weekday_opt: Option<&str>,
+) -> Option<String> {
+    use super::icu_dtf::{self, CompReq};
+    icu_dtf::format_components(&CompReq {
+        locale,
+        year,
+        month: month as u8,
+        day: day as u8,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        has_year: year_opt.is_some(),
+        has_month: month_opt.is_some(),
+        has_day: day_opt.is_some(),
+        month_style: month_opt,
+        weekday_style: weekday_opt,
+        has_hour: false,
+        has_minute: false,
+        has_second: false,
+        hour_cycle: None,
+        hour12: None,
+    })
+}
+
+#[cfg(not(feature = "intl-datetime"))]
+#[allow(clippy::too_many_arguments)]
+fn icu_components(
+    _locale: &str,
+    _year: i32,
+    _month: u32,
+    _day: u32,
+    _year_opt: Option<&str>,
+    _month_opt: Option<&str>,
+    _day_opt: Option<&str>,
+    _weekday_opt: Option<&str>,
+) -> Option<String> {
+    None
 }
 
 fn format_date_style(year: i32, month: u32, day: u32, secs: i64, style: &str) -> String {
@@ -968,7 +1071,22 @@ fn resolve_24h(hour12: Option<bool>, hour_cycle: Option<&str>) -> bool {
 }
 
 /// Format date+time components from the individual component options (no style).
+/// Render the first `digits` (1..=3) of the sub-second millisecond fraction of
+/// `ms`, zero-padded and truncated (round-down), for `fractionalSecondDigits`.
+/// e.g. ms whose millisecond component is 234 → `"2"` / `"23"` / `"234"`.
+fn fractional_seconds_str(ms: f64, digits: u8) -> String {
+    // Millisecond-of-second in [0, 999]. `ms` may be negative (pre-epoch);
+    // rem_euclid keeps the fraction non-negative and clock-aligned.
+    let millis = (ms as i64).rem_euclid(1000) as u32;
+    let three = format!("{:03}", millis);
+    let n = (digits as usize).min(3).max(1);
+    three[..n].to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn format_components(
+    locale: &str,
     year: i32,
     month: u32,
     day: u32,
@@ -976,6 +1094,7 @@ fn format_components(
     minute: u32,
     second: u32,
     secs: i64,
+    ms: f64,
     year_opt: Option<&str>,
     month_opt: Option<&str>,
     day_opt: Option<&str>,
@@ -985,6 +1104,7 @@ fn format_components(
     weekday_opt: Option<&str>,
     era_opt: Option<&str>,
     day_period_opt: Option<&str>,
+    fractional_digits: Option<u8>,
     use_24h: bool,
 ) -> String {
     let has_date = year_opt.is_some() || month_opt.is_some() || day_opt.is_some();
@@ -992,6 +1112,28 @@ fn format_components(
         || minute_opt.is_some()
         || second_opt.is_some()
         || day_period_opt.is_some();
+
+    // A date-only, name-bearing component set (a spelled month or a weekday)
+    // localizes cleanly through icu4x — correct month/weekday names AND the
+    // locale's field order (`5. Januar 2026`, `2026年1月5日`), which the numeric
+    // hand assembly below can't do. icu returns None for numeric-only / narrow
+    // combos, and we skip it when era/fractional-second options are in play
+    // (unmodeled) or a time part is present (hour-cycle handling stays on the
+    // fallback) — so those fall through unchanged.
+    if has_date && !has_time && era_opt.is_none() && fractional_digits.is_none() {
+        if let Some(s) = icu_components(
+            locale,
+            year,
+            month,
+            day,
+            year_opt,
+            month_opt,
+            day_opt,
+            weekday_opt,
+        ) {
+            return s;
+        }
+    }
 
     let date_part = if has_date {
         let has_m = month_opt.is_some();
@@ -1044,54 +1186,60 @@ fn format_components(
     };
 
     let time_part = if has_time {
+        // Compose only the requested components, colon-joined. The hour appears
+        // *only* when `hour` was requested — a `{minute, second}`-only DTF must
+        // render `mm:ss`, never inject an hour or an AM/PM. `fractionalSecondDigits`
+        // appends `.<n digits>` after the seconds (round-down / truncate).
+        let inc_hour = hour_opt.is_some();
         let inc_secs = second_opt.is_some();
         let inc_mins = minute_opt.is_some() || inc_secs;
-        Some(if use_24h {
-            if inc_secs {
-                let base = format!("{:02}:{:02}:{:02}", hour, minute, second);
-                match day_period_opt {
-                    Some(s) => format!("{} {}", base, day_period_string(hour, s)),
-                    None => base,
-                }
-            } else if inc_mins {
-                let base = format!("{:02}:{:02}", hour, minute);
-                match day_period_opt {
-                    Some(s) => format!("{} {}", base, day_period_string(hour, s)),
-                    None => base,
-                }
-            } else if hour_opt.is_some() {
-                let base = format!("{:02}", hour);
-                match day_period_opt {
-                    Some(s) => format!("{} {}", base, day_period_string(hour, s)),
-                    None => base,
-                }
-            } else {
-                // dayPeriod-only (no hour/minute/second requested).
-                day_period_string(hour, day_period_opt.unwrap_or("long")).to_string()
-            }
+        // 12-hour clock only shows AM/PM alongside an hour; an explicit
+        // `dayPeriod` option surfaces it independently.
+        let (h12, ampm) = if hour == 0 {
+            (12u32, "AM")
+        } else if hour < 12 {
+            (hour, "AM")
+        } else if hour == 12 {
+            (12, "PM")
         } else {
-            let (h, ampm) = if hour == 0 {
-                (12u32, "AM")
-            } else if hour < 12 {
-                (hour, "AM")
-            } else if hour == 12 {
-                (12, "PM")
+            (hour - 12, "PM")
+        };
+        let mut segs: Vec<String> = Vec::new();
+        if inc_hour {
+            if use_24h {
+                segs.push(format!("{:02}", hour));
+            } else if hour_opt == Some("2-digit") {
+                segs.push(format!("{:02}", h12));
             } else {
-                (hour - 12, "PM")
-            };
-            let suffix = day_period_opt
-                .map(|s| day_period_string(hour, s))
-                .unwrap_or(ampm);
-            if inc_secs {
-                format!("{}:{:02}:{:02} {}", h, minute, second, suffix)
-            } else if inc_mins {
-                format!("{}:{:02} {}", h, minute, suffix)
-            } else if hour_opt.is_some() {
-                format!("{} {}", h, suffix)
-            } else {
-                // dayPeriod-only (no hour/minute/second requested).
-                suffix.to_string()
+                segs.push(h12.to_string());
             }
+        }
+        if inc_mins {
+            segs.push(format!("{:02}", minute));
+        }
+        if inc_secs {
+            let mut s = format!("{:02}", second);
+            if let Some(digits) = fractional_digits {
+                s.push('.');
+                s.push_str(&fractional_seconds_str(ms, digits));
+            }
+            segs.push(s);
+        }
+        let base = segs.join(":");
+        // Determine the trailing day-period label, if any.
+        let suffix = if let Some(dp_s) = day_period_opt {
+            Some(day_period_string(hour, dp_s).to_string())
+        } else if inc_hour && !use_24h {
+            Some(ampm.to_string())
+        } else {
+            None
+        };
+        Some(match (base.is_empty(), suffix) {
+            (false, Some(sfx)) => format!("{} {}", base, sfx),
+            (false, None) => base,
+            (true, Some(sfx)) => sfx,
+            // No component and no dayPeriod: fall back to a bare dayPeriod label.
+            (true, None) => day_period_string(hour, "long").to_string(),
         })
     } else {
         None
@@ -1148,7 +1296,7 @@ fn format_ms_with_dtf_obj(
     temporal_kind: Option<crate::temporal::TemporalKind>,
 ) -> String {
     use crate::temporal::TemporalKind::*;
-    let secs = (ms as i64).div_euclid(1000);
+    let secs = dtf_zone_local_secs(obj, (ms as i64).div_euclid(1000), temporal_kind);
     let (year, month, day, hour, minute, second) = crate::date::timestamp_to_components(secs);
 
     let date_style = get_string_field(obj, KEY_DATE_STYLE);
@@ -1163,6 +1311,15 @@ fn format_ms_with_dtf_obj(
     };
     let hour_cycle = get_string_field(obj, KEY_HOUR_CYCLE);
     let use_24h = resolve_24h(hour12_v, hour_cycle.as_deref());
+    let locale = get_string_field(obj, KEY_LOCALE).unwrap_or_else(|| "en-US".to_string());
+    // The icu path receives the caller's explicit `hourCycle` / `hour12` verbatim
+    // (both absent → icu applies its own CLDR locale default, matching Node);
+    // it maps an explicit hourCycle to the exact clock family rather than
+    // collapsing it through `use_24h`.
+    // Route ordinary `Date`/`DateTime` styling through icu4x (byte-parity CLDR
+    // patterns + locale-correct date⇄time separators). Temporal partials
+    // (PlainYearMonth/MonthDay/Time) keep the bespoke formatters below.
+    let use_icu = matches!(temporal_kind, None | Some(PlainDate) | Some(PlainDateTime));
 
     // When both dateStyle and timeStyle are set for a date-only or time-only
     // Temporal value, the spec says the inapplicable style is silently ignored.
@@ -1187,17 +1344,61 @@ fn format_ms_with_dtf_obj(
     };
 
     match (eff_date_style, eff_time_style) {
-        (Some(ds), Some(ts)) => format!(
-            "{}, {}",
-            format_date_style(year, month, day, secs, ds),
-            format_time_style(hour, minute, second, ts, use_24h),
-        ),
+        (Some(ds), Some(ts)) => icu_style(
+            use_icu,
+            &locale,
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            Some(ds),
+            Some(ts),
+            hour_cycle.as_deref(),
+            hour12_v,
+        )
+        .unwrap_or_else(|| {
+            format!(
+                "{}, {}",
+                format_date_style(year, month, day, secs, ds),
+                format_time_style(hour, minute, second, ts, use_24h),
+            )
+        }),
         (Some(ds), None) => match temporal_kind {
             Some(PlainYearMonth) => format_year_month_style(year, month, ds),
             Some(PlainMonthDay) => format_month_day_style(month, day, ds),
-            _ => format_date_style(year, month, day, secs, ds),
+            _ => icu_style(
+                use_icu,
+                &locale,
+                year,
+                month,
+                day,
+                hour,
+                minute,
+                second,
+                Some(ds),
+                None,
+                hour_cycle.as_deref(),
+                hour12_v,
+            )
+            .unwrap_or_else(|| format_date_style(year, month, day, secs, ds)),
         },
-        (None, Some(ts)) => format_time_style(hour, minute, second, ts, use_24h),
+        (None, Some(ts)) => icu_style(
+            use_icu,
+            &locale,
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            None,
+            Some(ts),
+            hour_cycle.as_deref(),
+            hour12_v,
+        )
+        .unwrap_or_else(|| format_time_style(hour, minute, second, ts, use_24h)),
         (None, None) => {
             let is_default = get_field(obj, KEY_DT_IS_DEFAULT).to_bits() == crate::value::TAG_TRUE;
             // Also treat DTFs that only have supplementary options (era, timeZoneName)
@@ -1260,7 +1461,10 @@ fn format_ms_with_dtf_obj(
             let weekday_opt = get_string_field(obj, KEY_WEEKDAY);
             let era_opt = get_string_field(obj, KEY_ERA);
             let day_period_opt = get_string_field(obj, KEY_DAY_PERIOD);
+            let fractional_digits =
+                get_number_field(obj, KEY_FRACTIONAL).map(|n| (n as u8).clamp(1, 3));
             format_components(
+                &locale,
                 year,
                 month,
                 day,
@@ -1268,6 +1472,7 @@ fn format_ms_with_dtf_obj(
                 minute,
                 second,
                 secs,
+                ms,
                 year_opt.as_deref(),
                 month_opt.as_deref(),
                 day_opt.as_deref(),
@@ -1277,6 +1482,7 @@ fn format_ms_with_dtf_obj(
                 weekday_opt.as_deref(),
                 era_opt.as_deref(),
                 day_period_opt.as_deref(),
+                fractional_digits,
                 use_24h,
             )
         }
@@ -1288,240 +1494,8 @@ fn opt_string(raw: f64) -> Option<String> {
     string_from_string_value(raw)
 }
 
-/// Context tag for [`temporal_locale_string`] — which Temporal type is being formatted.
-/// Controls default options, type-specific TypeError guards, and timezone handling.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TemporalLocaleCtx {
-    PlainDate,
-    PlainDateTime,
-    PlainTime,
-    PlainYearMonth,
-    PlainMonthDay,
-    Instant,
-    ZonedDateTime,
-}
-
-/// Shared `toLocaleString` implementation for all Temporal types.
-///
-/// Parses `locale_arg` / `opts_arg`, validates option conflicts and
-/// type-specific restrictions (TypeError), applies type-appropriate defaults,
-/// then formats `epoch_ms` using the same logic as `Intl.DateTimeFormat.format`.
-pub(crate) fn temporal_locale_string(
-    epoch_ms: f64,
-    locale_arg: f64,
-    opts_arg: f64,
-    ctx: TemporalLocaleCtx,
-) -> f64 {
-    // ---- parse options object ----
-    let opts_obj = object_ptr_from_value(opts_arg);
-
-    let get_opt =
-        |key: &str| -> Option<String> { opts_obj.and_then(|o| opt_string(get_field(o, key))) };
-    let get_bool_opt = |key: &str| -> Option<bool> {
-        let raw = opts_obj
-            .map(|o| get_field(o, key))
-            .unwrap_or_else(undefined);
-        let v = JSValue::from_bits(raw.to_bits());
-        if v.is_bool() {
-            Some(v.as_bool())
-        } else {
-            None
-        }
-    };
-
-    let mut date_style = get_opt("dateStyle");
-    let mut time_style = get_opt("timeStyle");
-    let year_opt = get_opt("year");
-    let month_opt = get_opt("month");
-    let day_opt = get_opt("day");
-    let hour_opt = get_opt("hour");
-    let minute_opt = get_opt("minute");
-    let second_opt = get_opt("second");
-    let hour12 = get_bool_opt("hour12");
-    let hour_cycle = get_opt("hourCycle");
-    let weekday_opt = get_opt("weekday");
-    let era_opt = get_opt("era");
-    let day_period_opt = get_opt("dayPeriod");
-    let tz_name_opt = get_opt("timeZoneName");
-    let tz_opt = get_opt("timeZone");
-
-    let has_style = date_style.is_some() || time_style.is_some();
-    let has_component = year_opt.is_some()
-        || month_opt.is_some()
-        || day_opt.is_some()
-        || hour_opt.is_some()
-        || minute_opt.is_some()
-        || second_opt.is_some()
-        || weekday_opt.is_some()
-        || era_opt.is_some()
-        || day_period_opt.is_some()
-        || tz_name_opt.is_some();
-
-    // ---- validate option conflicts ----
-
-    // dateStyle/timeStyle cannot mix with explicit components (DTF constructor rule).
-    if has_style && has_component {
-        throw_type_error(
-            "dateStyle and timeStyle cannot be used with explicit date-time component options",
-        );
-    }
-
-    // Type-specific restrictions:
-    match ctx {
-        TemporalLocaleCtx::PlainDate
-        | TemporalLocaleCtx::PlainYearMonth
-        | TemporalLocaleCtx::PlainMonthDay => {
-            // ECMA-402: timeStyle is invalid when there is no date component
-            // overlap. But when dateStyle is ALSO present the spec says the
-            // timeStyle is silently ignored (the date-only value is formatted
-            // using dateStyle alone). Only throw when timeStyle is the sole
-            // style selector (no dateStyle to fall back on).
-            if time_style.is_some() && date_style.is_none() {
-                throw_type_error(
-                    "timeStyle option is not valid for this Temporal type (no time component)",
-                );
-            }
-            // Silence timeStyle so downstream formatting uses date-only logic.
-            if time_style.is_some() && date_style.is_some() {
-                time_style = None;
-            }
-        }
-        TemporalLocaleCtx::PlainTime => {
-            // Symmetric: dateStyle alone throws; combined → drop dateStyle.
-            if date_style.is_some() && time_style.is_none() {
-                throw_type_error(
-                    "dateStyle option is not valid for Temporal.PlainTime (no date component)",
-                );
-            }
-            if date_style.is_some() && time_style.is_some() {
-                date_style = None;
-            }
-        }
-        TemporalLocaleCtx::ZonedDateTime => {
-            // The timeZone option is disallowed (ZDT carries its own timezone).
-            if tz_opt.is_some() {
-                throw_type_error(
-                    "timeZone option is not allowed when formatting Temporal.ZonedDateTime",
-                );
-            }
-        }
-        _ => {}
-    }
-
-    // ---- apply type-appropriate defaults when no style/component is given ----
-    let (eff_date_style, eff_time_style, eff_year, eff_month, eff_day, eff_hour, eff_min, eff_sec) =
-        if has_style || has_component {
-            (
-                date_style.as_deref(),
-                time_style.as_deref(),
-                year_opt.as_deref(),
-                month_opt.as_deref(),
-                day_opt.as_deref(),
-                hour_opt.as_deref(),
-                minute_opt.as_deref(),
-                second_opt.as_deref(),
-            )
-        } else {
-            // No options given — apply per-type ECMA-402 / Temporal-spec
-            // defaults.  `ToDateTimeOptions(options, required, defaults)` sets
-            // the default fields differently per type:
-            //   PlainDate         → required="date",  defaults="date"
-            //   PlainDateTime     → required="any",   defaults="any"   (date+time)
-            //   PlainTime         → required="time",  defaults="time"
-            //   PlainYearMonth    → required="year month", defaults="year month"
-            //   PlainMonthDay     → required="month day",  defaults="month day"
-            //   Instant           → required="any",   defaults="all"   (date+time)
-            //   ZonedDateTime     → required="any",   defaults="all"   (date+time)
-            match ctx {
-                TemporalLocaleCtx::PlainDate => (
-                    None,
-                    None,
-                    Some("numeric"),
-                    Some("numeric"),
-                    Some("numeric"),
-                    None,
-                    None,
-                    None,
-                ),
-                TemporalLocaleCtx::PlainDateTime
-                | TemporalLocaleCtx::Instant
-                | TemporalLocaleCtx::ZonedDateTime => (
-                    None,
-                    None,
-                    Some("numeric"),
-                    Some("numeric"),
-                    Some("numeric"),
-                    Some("numeric"),
-                    Some("2-digit"),
-                    Some("2-digit"),
-                ),
-                TemporalLocaleCtx::PlainTime => (
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some("numeric"),
-                    Some("2-digit"),
-                    Some("2-digit"),
-                ),
-                TemporalLocaleCtx::PlainYearMonth => (
-                    None,
-                    None,
-                    Some("numeric"),
-                    Some("numeric"),
-                    None,
-                    None,
-                    None,
-                    None,
-                ),
-                TemporalLocaleCtx::PlainMonthDay => (
-                    None,
-                    None,
-                    None,
-                    Some("numeric"),
-                    Some("numeric"),
-                    None,
-                    None,
-                    None,
-                ),
-            }
-        };
-
-    let use_24h = resolve_24h(hour12, hour_cycle.as_deref());
-    let secs = (epoch_ms as i64).div_euclid(1000);
-    let (year, month, day, hour, minute, second) = crate::date::timestamp_to_components(secs);
-
-    let result = match (eff_date_style, eff_time_style) {
-        (Some(ds), Some(ts)) => format!(
-            "{}, {}",
-            format_date_style(year, month, day, secs, ds),
-            format_time_style(hour, minute, second, ts, use_24h),
-        ),
-        (Some(ds), None) => format_date_style(year, month, day, secs, ds),
-        (None, Some(ts)) => format_time_style(hour, minute, second, ts, use_24h),
-        (None, None) => format_components(
-            year,
-            month,
-            day,
-            hour,
-            minute,
-            second,
-            secs,
-            eff_year,
-            eff_month,
-            eff_day,
-            eff_hour,
-            eff_min,
-            eff_sec,
-            weekday_opt.as_deref(),
-            era_opt.as_deref(),
-            day_period_opt.as_deref(),
-            use_24h,
-        ),
-    };
-    string_value(&result)
-}
+mod temporal;
+pub(crate) use temporal::{temporal_locale_string, TemporalLocaleCtx};
 
 /// Shared steps 4–7 of `Intl.DateTimeFormat.prototype.formatRange` /
 /// `formatRangeToParts`: reject `undefined` endpoints (TypeError), coerce each
@@ -1733,7 +1707,10 @@ pub(crate) fn date_time_format_resolved_options_object(obj: *const ObjectHeader)
     set_field(
         out,
         "timeZone",
-        string_value(&get_string_field(obj, KEY_TIME_ZONE).unwrap_or_else(|| "UTC".to_string())),
+        string_value(
+            &get_string_field(obj, KEY_TIME_ZONE)
+                .unwrap_or_else(|| crate::date::host_time_zone_name().to_string()),
+        ),
     );
     // hourCycle / hour12 surface only when an hour field is present. With no tz
     // /CLDR data, the default cycle is the 12-hour clock (`h11` for `ja`, else
@@ -1843,6 +1820,55 @@ pub(crate) fn compare_strings(locale: &str, left: &str, right: &str) -> f64 {
         std::cmp::Ordering::Equal => 0.0,
         std::cmp::Ordering::Greater => 1.0,
     }
+}
+
+/// `GetOption(options, key, "string", allowed, undefined)` for a Collator string
+/// option: only `undefined` selects the default (absent); every other value —
+/// `null` included — is coerced via `ToString` and rejected with a RangeError
+/// when it is not in `allowed`.
+fn collator_enum_option(options: f64, key: &str, allowed: &[&str]) {
+    if let Some(value) = get_option_string(options, key) {
+        if !allowed.contains(&value.as_str()) {
+            throw_range_error(&format!(
+                "Value {value} out of range for Intl.Collator options property {key}"
+            ));
+        }
+    }
+}
+
+/// `InitializeCollator` option reads, run for their observable throwing side
+/// effects only (Perry's collation is locale-neutral, so the resolved values are
+/// discarded). `CoerceOptionsToObject` returns an empty bag for `undefined` and
+/// otherwise `ToObject`s the argument — which wraps primitives (numbers, strings,
+/// booleans, bigints) rather than throwing, and only rejects `null`. Each
+/// `GetOption` then runs in spec order so the first invalid option is the one
+/// that throws; a primitive/array/function argument simply has no matching own
+/// properties, so every read is absent and nothing throws.
+pub(super) fn validate_collator_options(options: f64) {
+    let js = JSValue::from_bits(options.to_bits());
+    if js.is_undefined() {
+        return;
+    }
+    // CoerceOptionsToObject delegates to ToObject, which throws only for `null`
+    // (`undefined` handled above). A wrapped primitive exposes no option props,
+    // so `get_option_*` reads below return `undefined` and never throw.
+    if js.is_null() {
+        throw_type_error("Cannot convert undefined or null to object");
+    }
+    collator_enum_option(options, "usage", &["sort", "search"]);
+    collator_enum_option(options, "localeMatcher", &["lookup", "best fit"]);
+    // `collation` (string, no enum), `numeric` / `ignorePunctuation` (boolean via
+    // ToBoolean) never throw for an in-range value; read them so the GetOption
+    // getter sequence still matches, but coerce a Symbol `collation` per ToString.
+    let _ = get_option_string(options, "collation");
+    let _ = get_option_value(options, "numeric");
+    collator_enum_option(options, "caseFirst", &["upper", "lower", "false"]);
+    collator_enum_option(
+        options,
+        "sensitivity",
+        &["base", "accent", "case", "variant"],
+    );
+    let _ = get_option_value(options, "ignorePunctuation");
 }
 
 pub(crate) extern "C" fn collator_compare_thunk(

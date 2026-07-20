@@ -375,6 +375,68 @@ pub(super) fn compile_module_entry(
                 .filter(|s| !s.is_empty())
                 .map(|suite| llmod.add_string_constant(suite))
         };
+        // i18n startup init: when the project configures `[i18n]`, bake the
+        // configured locale-code list (and the optional `[i18n.currencies]`
+        // map) into `main`'s prelude as a single `perry_i18n_init` call —
+        // this registers the locale registry the plural rules and format
+        // wrappers read, and eagerly resolves the runtime locale index at
+        // startup instead of leaving it pinned to the default row. Non-i18n
+        // projects (`cross_module.i18n` is `None`) emit nothing. Constants
+        // and raw ptr/len arrays are allocated up-front while `llmod` is
+        // still mutable — `main` claims the borrow below.
+        //
+        // (ptrs_global, lens_global, count, default_idx, currencies_const)
+        let i18n_startup: Option<(String, String, usize, usize, Option<(String, usize)>)> =
+            if is_dylib {
+                None
+            } else {
+                cross_module
+                    .i18n
+                    .as_ref()
+                    .filter(|i| !i.locale_codes.is_empty())
+                    .map(|i18n| {
+                        let mut ptr_elems: Vec<String> = Vec::new();
+                        let mut len_elems: Vec<String> = Vec::new();
+                        for code in &i18n.locale_codes {
+                            let (name, len) = llmod.add_string_constant(code);
+                            ptr_elems.push(format!("ptr @{}", name));
+                            len_elems.push(format!("i32 {}", len));
+                        }
+                        let count = i18n.locale_codes.len();
+                        let ptrs_global = "__perry_i18n_locale_ptrs".to_string();
+                        let lens_global = "__perry_i18n_locale_lens".to_string();
+                        llmod.add_raw_global(format!(
+                            "@{} = private unnamed_addr constant [{} x ptr] [{}]",
+                            ptrs_global,
+                            count,
+                            ptr_elems.join(", ")
+                        ));
+                        llmod.add_raw_global(format!(
+                            "@{} = private unnamed_addr constant [{} x i32] [{}]",
+                            lens_global,
+                            count,
+                            len_elems.join(", ")
+                        ));
+                        let currencies = if i18n.currencies.is_empty() {
+                            None
+                        } else {
+                            let joined = i18n
+                                .currencies
+                                .iter()
+                                .map(|(l, c)| format!("{}={}", l, c))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            Some(llmod.add_string_constant(&joined))
+                        };
+                        (
+                            ptrs_global,
+                            lens_global,
+                            count,
+                            i18n.default_locale_idx,
+                            currencies,
+                        )
+                    })
+            };
         // Next.js wall 54 (part 2): emit a string constant for every Deferred
         // `.next/server/**` module path now (before `main` borrows `llmod`); the
         // registration calls go in the block below. `(string_const_name,
@@ -431,6 +493,34 @@ pub(super) fn compile_module_entry(
                     "perry_app_group_init",
                     &[(PTR, suite_ptr.as_str()), (I32, len_str.as_str())],
                 );
+            }
+            // i18n: register the configured locale list + resolve the runtime
+            // locale BEFORE any module init runs, so module-top-level `t()`
+            // calls and format wrappers already see the detected locale.
+            if let Some((ptrs_global, lens_global, count, default_idx, currencies)) =
+                i18n_startup.as_ref()
+            {
+                let ptrs_ref = format!("@{}", ptrs_global);
+                let lens_ref = format!("@{}", lens_global);
+                let count_str = count.to_string();
+                let default_str = default_idx.to_string();
+                blk.call_void(
+                    "perry_i18n_init",
+                    &[
+                        (PTR, ptrs_ref.as_str()),
+                        (PTR, lens_ref.as_str()),
+                        (I32, count_str.as_str()),
+                        (I32, default_str.as_str()),
+                    ],
+                );
+                if let Some((const_name, byte_len)) = currencies {
+                    let pairs_ptr = format!("@{}", const_name);
+                    let pairs_len = byte_len.to_string();
+                    blk.call_void(
+                        "perry_i18n_set_currencies",
+                        &[(PTR, pairs_ptr.as_str()), (I32, pairs_len.as_str())],
+                    );
+                }
             }
             // Wire up stdlib HANDLE_METHOD_DISPATCH eagerly when stdlib is
             // linked. Previously this was only called from
@@ -496,6 +586,23 @@ pub(super) fn compile_module_entry(
             // the startup cost. The extern declaration at line ~3947
             // still emits for every non-entry prefix so the dispatch
             // site can resolve the symbol at link time.
+            // Seed `globalThis.AsyncLocalStorage` BEFORE any module init:
+            // Next.js modules (dist and the bundled app-page runtime alike)
+            // snapshot it at module scope, and the eager init order can run
+            // those snapshots before node-environment-baseline.js's own
+            // assignment — leaving a FakeAsyncLocalStorage that throws
+            // Next error E504 on the first request.
+            //
+            // Emitted ONLY for Next.js-shaped programs (the wall-54
+            // `.next/server/**` path-init list is non-empty). Node itself has
+            // NO `globalThis.AsyncLocalStorage` — Next's baseline assigns it
+            // at runtime — so seeding unconditionally diverges from node for
+            // ordinary programs AND installs the async_hooks surface at every
+            // program's entry (the native-ABI proof workload's write-barrier
+            // budget went 8 → 7921 on exactly that).
+            if !nextjs_path_inits.is_empty() {
+                blk.call_void("js_globalthis_seed_async_local_storage", &[]);
+            }
             for prefix in non_entry_module_prefixes {
                 if cross_module.deferred_module_prefixes.contains(prefix) {
                     continue;
@@ -544,13 +651,18 @@ pub(super) fn compile_module_entry(
             .collect();
         let main_native_facts = crate::collectors::collect_native_region_fact_graph(
             &hir.init,
+            &[],
             &flat_const_ids,
             &clamp_fn_ids,
             &cross_module.clamp3_functions,
             &main_boxed_vars,
             module_globals,
+            // Module scope IS this body: its `Stmt::Let`s are walked directly, so
+            // there is nothing to seed from an enclosing scope (#6369).
+            &HashMap::new(),
             classes,
             &cross_module.compile_time_constants,
+            &cross_module.module_dispatch,
         );
         let mut init_local_types: HashMap<u32, perry_types::Type> = HashMap::new();
         crate::boxed_vars::collect_let_types_in_stmts(&hir.init, &mut init_local_types);
@@ -600,6 +712,7 @@ pub(super) fn compile_module_entry(
             func_returns_class: &cross_module.func_returns_class,
             boxed_vars: main_boxed_vars,
             prealloc_boxes: std::collections::HashSet::new(),
+            tdz_boxes: std::collections::HashSet::new(),
             compiler_private_async_i32_control_locals: &cross_module
                 .compiler_private_async_i32_control_locals,
             compiler_private_async_i1_control_locals: &cross_module
@@ -610,11 +723,12 @@ pub(super) fn compile_module_entry(
             option_object_locals: HashMap::new(),
             object_literal_locals: HashSet::new(),
             namespace_imports: &cross_module.namespace_imports,
-            namespace_reexport_named_imports: &cross_module.namespace_reexport_named_imports,
             namespace_member_prefixes: &cross_module.namespace_member_prefixes,
+            namespace_member_origin_names: &cross_module.namespace_member_origin_names,
             imported_async_funcs: &cross_module.imported_async_funcs,
             local_async_funcs: &cross_module.local_async_funcs,
             local_generator_funcs: &cross_module.local_generator_funcs,
+            async_step_closures: &cross_module.async_step_closures,
             funcs_reading_dynamic_this: &cross_module.funcs_reading_dynamic_this,
             type_aliases: &cross_module.type_aliases,
             imported_func_param_counts: &cross_module.imported_func_param_counts,
@@ -639,6 +753,7 @@ pub(super) fn compile_module_entry(
             cached_lengths: HashMap::new(),
             bounded_index_pairs: Vec::new(),
             packed_f64_loop_facts: Vec::new(),
+            class_field_loop_facts: Vec::new(),
             i32_counter_slots: HashMap::new(),
             i1_local_slots: HashMap::new(),
             index_used_locals: main_native_facts.index_used_locals(),
@@ -657,6 +772,8 @@ pub(super) fn compile_module_entry(
             pod_records: std::collections::HashMap::new(),
             pod_views: std::collections::HashMap::new(),
             scalar_replaced_arrays: std::collections::HashMap::new(),
+            scalar_replaced_split_part_lengths: std::collections::HashMap::new(),
+            scalar_replaced_uppercase_sources: std::collections::HashMap::new(),
             scalar_ctor_target: Vec::new(),
             non_escaping_news: main_native_facts.non_escaping_news().clone(),
             non_escaping_new_used_fields: main_native_facts.non_escaping_new_used_fields().clone(),
@@ -664,6 +781,10 @@ pub(super) fn compile_module_entry(
             non_escaping_array_used_indices: main_native_facts
                 .non_escaping_array_used_indices()
                 .clone(),
+            non_escaping_array_length_only_indices: main_native_facts
+                .non_escaping_array_length_only_indices()
+                .clone(),
+            fusible_uppercase_locals: main_native_facts.fusible_uppercase_locals().clone(),
             non_escaping_object_literals: main_native_facts.non_escaping_object_literals().clone(),
             non_escaping_object_literal_used_fields: main_native_facts
                 .non_escaping_object_literal_used_fields()
@@ -700,6 +821,7 @@ pub(super) fn compile_module_entry(
             native_arena_owner_aliases: HashMap::new(),
             native_arena_ambiguous_owner_aliases: HashSet::new(),
             disable_buffer_fast_path: cross_module.disable_buffer_fast_path,
+            program_shadows_buffer_read_method: cross_module.program_shadows_buffer_read_method,
             min_length_bounds: HashMap::new(),
             bounded_buffer_index_pairs: Vec::new(),
             guarded_buffer_index_pairs: Vec::new(),
@@ -810,17 +932,33 @@ pub(super) fn compile_module_entry(
                 //   loop_body:   tick all queues, sleep 10ms, jump to header
                 //   loop_exit:   ret 0
                 let header_idx = ctx.new_block("event_loop.header");
+                let pending_idx = ctx.new_block("event_loop.check_pending");
+                let host_ret_idx = ctx.new_block("event_loop.host_return");
                 let body_idx = ctx.new_block("event_loop.body");
                 let exit_idx = ctx.new_block("event_loop.exit");
                 let header_label = ctx.block_label(header_idx);
+                let pending_label = ctx.block_label(pending_idx);
+                let host_ret_label = ctx.block_label(host_ret_idx);
                 let body_label = ctx.block_label(body_idx);
                 let exit_label = ctx.block_label(exit_idx);
 
                 // Initial microtask flush (4 rounds) before entering the
                 // event loop — handles fire-and-forget .then() chains that
                 // don't need the full event loop.
+                //
+                // #6077: `js_promise_run_microtasks_event_loop` is
+                // `js_promise_run_microtasks` plus the unhandled-rejection
+                // checkpoint (Node's `processPromiseRejections`), which runs
+                // between the microtask drain and the timer queues. Only the
+                // codegen event loop may use it: this is the one pump whose
+                // caller has a fully unwound JS stack, so "no handler yet" here
+                // really means "no handler this turn" — the runtime's busy-wait
+                // pumps (`for await` over a stream, fs.cp) drain microtasks with
+                // a suspended JS frame on the stack and must NOT report.
                 for _ in 0..4 {
-                    let _ = ctx.block().call(I32, "js_promise_run_microtasks", &[]);
+                    let _ = ctx
+                        .block()
+                        .call(I32, "js_promise_run_microtasks_event_loop", &[]);
                     let _ = ctx.block().call(I32, "js_timer_tick_if_refed", &[]);
                     let _ = ctx.block().call(I32, "js_callback_timer_tick", &[]);
                     let _ = ctx.block().call(I32, "js_interval_timer_tick", &[]);
@@ -828,11 +966,50 @@ pub(super) fn compile_module_entry(
                 ctx.block().call_void("js_run_stdlib_pump", &[]);
                 ctx.block().br(&header_label);
 
-                // loop_header: check if there's any reason to keep running
+                // loop_header: host-driven shells (watchOS SwiftUI tree
+                // renderer) flag the loop via js_set_event_loop_host_driven
+                // from perry_ui_app_run: the shell owns the run loop and
+                // ticks timers itself, so the entry must return (Swift calls
+                // it as perry_main_init and renders only after it comes back)
+                // even while timers are live. Return PLAINLY — the process is
+                // not exiting, so the drained-exit epilogue below (beforeExit,
+                // exit finalization, unhandled-rejection reporting) must not
+                // run at what is effectively app launch.
                 ctx.current_block = header_idx;
+                let zero = "0".to_string();
+                let host_driven = ctx.block().call(I32, "js_event_loop_host_driven", &[]);
+                let host_cmp = ctx.block().icmp_ne(I32, &host_driven, &zero);
+                ctx.block()
+                    .cond_br(&host_cmp, &host_ret_label, &pending_label);
+
+                // host_return: hand control back to the host shell without
+                // the drained-exit epilogue.
+                ctx.current_block = host_ret_idx;
+                ctx.block().ret(I32, "0");
+
+                // check_pending: is there any reason to keep running?
+                ctx.current_block = pending_idx;
                 let has_timers = ctx.block().call(I32, "js_timer_has_pending", &[]);
                 let has_callbacks = ctx.block().call(I32, "js_callback_timer_has_pending", &[]);
                 let has_intervals = ctx.block().call(I32, "js_interval_timer_has_pending", &[]);
+                // Cron jobs (node-cron schedule() / npm cron's CronJob).
+                // Guarded on `needs_stdlib` like js_stdlib_init_dispatch
+                // above — the runtime-only link doesn't carry the cron
+                // symbols (and a cron import always pulls stdlib in).
+                // With stdlib linked the symbol always resolves:
+                // perry-ext-cron or the bundled scheduler provide the
+                // real queue; perry-stdlib exports a 0-returning stub
+                // otherwise. Without this gate (and the tick in
+                // loop_body below) a program whose only live work is a
+                // running cron job exits immediately and scheduled
+                // callbacks never fire — the CRON_TIMERS machinery
+                // existed but nothing in the generated event loop drove
+                // it.
+                let has_cron = if cross_module.needs_stdlib {
+                    ctx.block().call(I32, "js_cron_timer_has_pending", &[])
+                } else {
+                    "0".to_string()
+                };
                 let has_stdlib = ctx.block().call(I32, "js_stdlib_has_active_handles", &[]);
                 // #591: TASK_QUEUE may carry a pending `.then` continuation
                 // that was queued by `js_run_stdlib_pump`'s resolution path
@@ -844,17 +1021,22 @@ pub(super) fn compile_module_entry(
                 let any1 = ctx.block().or(I32, &has_timers, &has_callbacks);
                 let any2 = ctx.block().or(I32, &has_intervals, &has_stdlib);
                 let any3 = ctx.block().or(I32, &any1, &any2);
-                let any = ctx.block().or(I32, &any3, &has_microtasks);
-                let zero = "0".to_string();
+                let any4 = ctx.block().or(I32, &any3, &has_cron);
+                let any = ctx.block().or(I32, &any4, &has_microtasks);
                 let cmp = ctx.block().icmp_ne(I32, &any, &zero);
                 ctx.block().cond_br(&cmp, &body_label, &exit_label);
 
                 // loop_body: tick everything, sleep, loop
                 ctx.current_block = body_idx;
-                let _ = ctx.block().call(I32, "js_promise_run_microtasks", &[]);
+                let _ = ctx
+                    .block()
+                    .call(I32, "js_promise_run_microtasks_event_loop", &[]);
                 let _ = ctx.block().call(I32, "js_timer_tick", &[]);
                 let _ = ctx.block().call(I32, "js_callback_timer_tick", &[]);
                 let _ = ctx.block().call(I32, "js_interval_timer_tick", &[]);
+                if cross_module.needs_stdlib {
+                    let _ = ctx.block().call(I32, "js_cron_timer_tick", &[]);
+                }
                 ctx.block().call_void("js_run_stdlib_pump", &[]);
                 // Issue #84: condvar-backed wait. Returns immediately when
                 // a tokio worker (net/ws/http/fetch/redis/spawn) notifies
@@ -869,16 +1051,18 @@ pub(super) fn compile_module_entry(
                 // we ret. Mirrors Node's "event loop drained → one
                 // beforeExit pass" semantics.
                 //
-                // We pass `0` as the code today: Perry doesn't yet wire
-                // `process.exitCode` into this codegen path, and the test
-                // surface in #2135 only pins the firing + the default
-                // code. Explicit `process.exit(N)` bypasses this whole
-                // block via libc::_exit.
+                // We still pass `0` to the `beforeExit` emit (the #2135 test
+                // surface only pins the firing + default code); the *process*
+                // status, by contrast, now consults `process.exitCode` at the
+                // `ret` below (#6666). Explicit `process.exit(N)` bypasses this
+                // whole block via libc::_exit.
                 ctx.current_block = exit_idx;
                 let zero_code = "0x0".to_string();
                 ctx.block()
                     .call_void("js_process_emit_before_exit", &[(DOUBLE, &zero_code)]);
-                let _ = ctx.block().call(I32, "js_promise_run_microtasks", &[]);
+                let _ = ctx
+                    .block()
+                    .call(I32, "js_promise_run_microtasks_event_loop", &[]);
                 let _ = ctx.block().call(I32, "js_timer_tick_if_refed", &[]);
                 let _ = ctx.block().call(I32, "js_callback_timer_tick", &[]);
                 let _ = ctx.block().call(I32, "js_interval_timer_tick", &[]);
@@ -889,7 +1073,22 @@ pub(super) fn compile_module_entry(
                 // oracle for `Promise.reject`/combinator-reject programs).
                 ctx.block()
                     .call_void("js_promise_report_unhandled_rejections", &[]);
-                ctx.block().ret(I32, "0");
+                // The Unix main thread is not guaranteed to run Rust TLS
+                // destructors. Release registry-owned collection buffers at
+                // the real process-exit boundary, after all exit callbacks.
+                ctx.block().call_void(
+                    "js_gc_release_current_thread_collection_side_allocations",
+                    &[],
+                );
+                // #6666: natural exit (event loop drained / main returned with
+                // no explicit `process.exit()`) returns the stored
+                // `process.exitCode` (default 0), matching Node. An uncaught
+                // throw (exits 1 via `js_throw`) or an unhandled rejection
+                // (exits 1 via `js_promise_report_unhandled_rejections` above)
+                // has already terminated the process before reaching here, so
+                // those keep their own status and never fall through to this.
+                let final_exit_code = ctx.block().call(I32, "js_process_pending_exit_code", &[]);
+                ctx.block().ret(I32, &final_exit_code);
             }
         }
         let ic_globals = std::mem::take(&mut ctx.ic_globals);
@@ -1053,13 +1252,17 @@ pub(super) fn compile_module_entry(
             .collect();
         let init_native_facts = crate::collectors::collect_native_region_fact_graph(
             &hir.init,
+            &[],
             &flat_const_ids,
             &clamp_fn_ids,
             &cross_module.clamp3_functions,
             &init_boxed_vars,
             module_globals,
+            // Module scope IS this body — see the `main` fact graph above (#6369).
+            &HashMap::new(),
             classes,
             &cross_module.compile_time_constants,
+            &cross_module.module_dispatch,
         );
         let mut ctx = FnCtx {
             func: init_fn,
@@ -1107,6 +1310,7 @@ pub(super) fn compile_module_entry(
             func_returns_class: &cross_module.func_returns_class,
             boxed_vars: init_boxed_vars,
             prealloc_boxes: std::collections::HashSet::new(),
+            tdz_boxes: std::collections::HashSet::new(),
             compiler_private_async_i32_control_locals: &cross_module
                 .compiler_private_async_i32_control_locals,
             compiler_private_async_i1_control_locals: &cross_module
@@ -1117,11 +1321,12 @@ pub(super) fn compile_module_entry(
             option_object_locals: HashMap::new(),
             object_literal_locals: HashSet::new(),
             namespace_imports: &cross_module.namespace_imports,
-            namespace_reexport_named_imports: &cross_module.namespace_reexport_named_imports,
             namespace_member_prefixes: &cross_module.namespace_member_prefixes,
+            namespace_member_origin_names: &cross_module.namespace_member_origin_names,
             imported_async_funcs: &cross_module.imported_async_funcs,
             local_async_funcs: &cross_module.local_async_funcs,
             local_generator_funcs: &cross_module.local_generator_funcs,
+            async_step_closures: &cross_module.async_step_closures,
             funcs_reading_dynamic_this: &cross_module.funcs_reading_dynamic_this,
             type_aliases: &cross_module.type_aliases,
             imported_func_param_counts: &cross_module.imported_func_param_counts,
@@ -1146,6 +1351,7 @@ pub(super) fn compile_module_entry(
             cached_lengths: HashMap::new(),
             bounded_index_pairs: Vec::new(),
             packed_f64_loop_facts: Vec::new(),
+            class_field_loop_facts: Vec::new(),
             i32_counter_slots: HashMap::new(),
             i1_local_slots: HashMap::new(),
             index_used_locals: init_native_facts.index_used_locals(),
@@ -1164,6 +1370,8 @@ pub(super) fn compile_module_entry(
             pod_records: std::collections::HashMap::new(),
             pod_views: std::collections::HashMap::new(),
             scalar_replaced_arrays: std::collections::HashMap::new(),
+            scalar_replaced_split_part_lengths: std::collections::HashMap::new(),
+            scalar_replaced_uppercase_sources: std::collections::HashMap::new(),
             scalar_ctor_target: Vec::new(),
             non_escaping_news: init_native_facts.non_escaping_news().clone(),
             non_escaping_new_used_fields: init_native_facts.non_escaping_new_used_fields().clone(),
@@ -1171,6 +1379,10 @@ pub(super) fn compile_module_entry(
             non_escaping_array_used_indices: init_native_facts
                 .non_escaping_array_used_indices()
                 .clone(),
+            non_escaping_array_length_only_indices: init_native_facts
+                .non_escaping_array_length_only_indices()
+                .clone(),
+            fusible_uppercase_locals: init_native_facts.fusible_uppercase_locals().clone(),
             non_escaping_object_literals: init_native_facts.non_escaping_object_literals().clone(),
             non_escaping_object_literal_used_fields: init_native_facts
                 .non_escaping_object_literal_used_fields()
@@ -1207,6 +1419,7 @@ pub(super) fn compile_module_entry(
             native_arena_owner_aliases: HashMap::new(),
             native_arena_ambiguous_owner_aliases: HashSet::new(),
             disable_buffer_fast_path: cross_module.disable_buffer_fast_path,
+            program_shadows_buffer_read_method: cross_module.program_shadows_buffer_read_method,
             min_length_bounds: HashMap::new(),
             bounded_buffer_index_pairs: Vec::new(),
             guarded_buffer_index_pairs: Vec::new(),
@@ -1297,3 +1510,6 @@ pub(super) fn compile_module_entry(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

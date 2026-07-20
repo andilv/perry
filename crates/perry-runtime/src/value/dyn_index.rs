@@ -28,6 +28,37 @@ fn finite_nonnegative_u32_index(index: f64) -> Option<u32> {
     }
 }
 
+/// A canonical non-negative integer array-index string ("0", "2", "10", …) —
+/// how a `Buffer`/`Uint8Array` `[[Get]]` treats a STRING key: it reads the byte
+/// at that index rather than a named property (`buf["2"]` === `buf[2]`).
+/// Leading-zero forms (`"01"`), signs, fractions, and values past `i32::MAX`
+/// are ordinary property names, not indices. Reads the `StringHeader` bytes
+/// directly (valid for heap and materialized short strings alike).
+unsafe fn canonical_buffer_index(key_ptr: *const crate::StringHeader) -> Option<u32> {
+    if key_ptr.is_null() {
+        return None;
+    }
+    let len = (*key_ptr).byte_len as usize;
+    if len == 0 || len > 10 {
+        return None;
+    }
+    let bytes = std::slice::from_raw_parts(
+        (key_ptr as *const u8).add(std::mem::size_of::<crate::StringHeader>()),
+        len,
+    );
+    if bytes[0] == b'0' && len > 1 {
+        return None;
+    }
+    let mut val: u64 = 0;
+    for &b in bytes {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        val = val * 10 + u64::from(b - b'0');
+    }
+    (val <= i32::MAX as u64).then_some(val as u32)
+}
+
 /// Tag-aware dynamic index dispatch for `obj[key]` where `obj` has unknown
 /// static type. Issue #514. Strings → js_string_char_at; objects stringify
 /// numeric keys (`obj[0]` is `obj["0"]`), while arrays/buffers keep numeric
@@ -68,20 +99,18 @@ pub extern "C" fn js_dyn_index_get(value: f64, index: f64) -> f64 {
         }
     }
     if jsval.is_string() || jsval.is_short_string() {
+        // Spec: string INDEXING `s[i]` returns `undefined` for a non-canonical
+        // or out-of-bounds index — unlike `s.charAt(i)`, which returns "".
+        // Route through the canonical-index helper (`js_string_index_get`,
+        // #3987) so an OOB read here is `undefined`. Calling `js_string_char_at`
+        // directly (charAt semantics) returned "" for OOB, which every
+        // generator/async LOCAL string read hit: the CPS box pass erases the
+        // local's static type, so `line[i]` reaches this dyn path instead of the
+        // `is_string_expr` static path — the `yaml` lexer's `parseDocument`
+        // `switch (line[n])` then never observed `undefined` at line-ends and
+        // its `*lex` state machine spun forever (#6067).
         let s_ptr = js_get_string_pointer_unified(value) as *const crate::StringHeader;
-        if s_ptr.is_null() {
-            return f64::from_bits(TAG_UNDEFINED);
-        }
-        let idx_i32 = if index.is_nan() || index.is_infinite() {
-            0
-        } else {
-            index as i32
-        };
-        let result = crate::string::js_string_char_at(s_ptr, idx_i32);
-        if result.is_null() {
-            return f64::from_bits(TAG_UNDEFINED);
-        }
-        return f64::from_bits(JSValue::string_ptr(result).bits());
+        return crate::string::js_string_index_get(s_ptr, index);
     }
     // Class-ref value (INT32-tagged, top16 == 0x7FFE): `C[key]` where `C` is a
     // runtime class-ref value (e.g. a function parameter). Member-expression
@@ -107,20 +136,47 @@ pub extern "C" fn js_dyn_index_get(value: f64, index: f64) -> f64 {
             key_ptr,
         );
     }
+    // A non-NaN-boxed f64 reaching here is a plain `number` (its `[idx]` is
+    // `undefined` per JS). The old code kept a "raw I64 pointer passed as
+    // DOUBLE" heuristic — `bits < 2^48 && (bits & 3) == 0 && bits >= 0x10000` —
+    // that treated such a number's bits as a heap pointer, a relic of the
+    // now-removed module-var raw-I64 representation (module vars are uniform
+    // NaN-boxed doubles today, so a real object always takes the `is_pointer()`
+    // branch above). The heuristic only ever MISfired on numbers whose f64 bits
+    // land in that band — e.g. a subnormal `~1.7e-314` (bits `0x8_0000_0000`).
+    // On the macOS host the resulting address was below the heap range so
+    // `is_valid_obj_ptr` rejected it and this returned `undefined`; on Linux
+    // (`HEAP_MIN = 0x1000`, needed for Android/Scudo low allocations) the same
+    // address is *in range*, so it was dereferenced as an `ObjectHeader` →
+    // garbage/crash. Drop the heuristic: a non-pointer receiver is a number and
+    // its indexed read is `undefined` on every platform (#63/#321 denormal-safe).
     let raw_ptr = if jsval.is_pointer() {
         (bits & POINTER_MASK) as usize
-    } else if !value.is_nan()
-        && bits != 0
-        && bits < 0x0001_0000_0000_0000
-        && (bits & 0x3) == 0
-        && bits >= 0x10000
-    {
-        bits as usize
     } else {
         return f64::from_bits(TAG_UNDEFINED);
     };
-    if raw_ptr < 0x10000 {
-        return f64::from_bits(TAG_UNDEFINED);
+    if crate::value::addr_class::is_small_handle(raw_ptr) {
+        // #5989: registry HANDLES (fetch/native ids) live below HANDLE_BAND_MAX
+        // (0x100000). The old guard only excluded the first 64KB, so a handle
+        // in [0x10000, 0x100000) indexed as `h[key]` fell through to the raw
+        // ObjectHeader walk below and dereferenced the id as a pointer —
+        // react-server-dom's flight wake path indexes a handle-valued object
+        // and segfaulted at the handle address. Route through the by-name read,
+        // which triages small handles (HANDLE_PROPERTY_DISPATCH, recorded
+        // prototypes) without ever dereferencing the id.
+        let idx_top16 = index.to_bits() >> 48;
+        let key_ptr = if idx_top16 == 0x7FFF || idx_top16 == 0x7FF9 {
+            js_get_string_pointer_unified(index) as *const crate::StringHeader
+        } else {
+            crate::builtins::js_string_coerce(index) as *const crate::StringHeader
+        };
+        if key_ptr.is_null() {
+            return f64::from_bits(TAG_UNDEFINED);
+        }
+        return crate::object::js_object_get_field_by_name_f64(
+            raw_ptr as *const crate::object::ObjectHeader,
+            key_ptr,
+        );
     }
     // TypedArrays carry element-typed storage, not boxed ArrayHeader slots.
     // Probe the registry before any GC-header or raw ArrayHeader fallback so
@@ -133,16 +189,45 @@ pub extern "C" fn js_dyn_index_get(value: f64, index: f64) -> f64 {
         );
     }
     if crate::buffer::is_registered_buffer(raw_ptr) {
-        let Some(idx_i32) = finite_nonnegative_i32_index(index) else {
-            return f64::from_bits(TAG_UNDEFINED);
-        };
         let buf = raw_ptr as *const crate::buffer::BufferHeader;
-        let len = unsafe { (*buf).length };
-        if (idx_i32 as u32) >= len {
-            return f64::from_bits(TAG_UNDEFINED);
+        if let Some(idx_i32) = finite_nonnegative_i32_index(index) {
+            let len = unsafe { (*buf).length };
+            if (idx_i32 as u32) >= len {
+                return f64::from_bits(TAG_UNDEFINED);
+            }
+            let byte_val = crate::buffer::js_buffer_get(buf, idx_i32);
+            return byte_val as f64;
         }
-        let byte_val = crate::buffer::js_buffer_get(buf, idx_i32);
-        return byte_val as f64;
+        // A non-numeric (string) key: Node's Buffer is an ordinary Uint8Array
+        // object, so `buf[k]` with a string-valued `k` reads an OWN property
+        // (else the shadowed prototype method) — NOT a byte. This arm used to
+        // return `undefined`, so `(buf as any)[k] = v; (buf as any)[k]` — with
+        // `k` statically `any` but a string at runtime — read back `undefined`
+        // even though the write stored the own prop via
+        // `js_object_set_index_polymorphic` → `buffer_set_own_prop` (#6412).
+        // Route through the by-name getter, which resolves buffer own props +
+        // bound method values (`buffer_own_prop_or_method`), matching the
+        // dotted `buf.k` read and the static-string-key `buf["k"]` fold. A
+        // canonical numeric-index string (`buf["2"]`) is still a byte read,
+        // not a named property (IntegerIndexedExotic `[[Get]]`).
+        let key_jsval = JSValue::from_bits(index.to_bits());
+        if key_jsval.is_string() || key_jsval.is_short_string() {
+            let key_ptr = js_get_string_pointer_unified(index) as *const crate::StringHeader;
+            if !key_ptr.is_null() {
+                if let Some(canon) = unsafe { canonical_buffer_index(key_ptr) } {
+                    let len = unsafe { (*buf).length };
+                    if canon >= len {
+                        return f64::from_bits(TAG_UNDEFINED);
+                    }
+                    return crate::buffer::js_buffer_get(buf, canon as i32) as f64;
+                }
+                return crate::object::js_object_get_field_by_name_f64(
+                    raw_ptr as *const crate::object::ObjectHeader,
+                    key_ptr,
+                );
+            }
+        }
+        return f64::from_bits(TAG_UNDEFINED);
     }
     if crate::set::is_registered_set(raw_ptr) || crate::map::is_registered_map(raw_ptr) {
         let Some(index) = finite_nonnegative_u32_index(index) else {

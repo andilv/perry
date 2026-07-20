@@ -108,6 +108,61 @@ fn parse_int_digit(byte: u8) -> Option<u32> {
     }
 }
 
+/// Correctly-rounded (round-to-nearest, ties-to-even) conversion of a
+/// power-of-two-radix integer literal (`0x…`/`0o…`/`0b…`, radix 16/8/2) to f64,
+/// matching V8's ToNumber. `digits` are the raw ASCII digit bytes after the
+/// prefix; an out-of-radix byte yields NaN. Accumulates significant bits in a
+/// u128, folding anything that overflows into a sticky bit, then rounds — a
+/// naive `value*radix + digit` in f64 rounds every step and mis-rounds past 2^53.
+fn parse_nondecimal_to_f64(digits: &[u8], radix: u32) -> f64 {
+    let radix128 = radix as u128;
+    let mut m: u128 = 0; // significant bits collected so far; value = m * 2^e
+    let mut e: i32 = 0;
+    let mut sticky = false; // any 1-bit dropped below m's LSB
+    for &b in digits {
+        let d = match (b as char).to_digit(radix) {
+            Some(d) => d as u128,
+            None => return f64::NAN,
+        };
+        // Keep m < 2^124 so `m * radix + d` (radix ≤ 16) can't overflow u128;
+        // bits shifted off the bottom become sticky and raise the exponent.
+        while m >= (1u128 << 124) {
+            sticky |= (m & 1) != 0;
+            m >>= 1;
+            e += 1;
+        }
+        m = m * radix128 + d;
+    }
+    if m == 0 {
+        return 0.0;
+    }
+    // Reduce the mantissa to ≤ 54 bits (53 + 1 round bit), folding the discarded
+    // low bits into `sticky`.
+    let sig = 128 - m.leading_zeros();
+    if sig > 54 {
+        let drop = sig - 54;
+        sticky |= (m & ((1u128 << drop) - 1)) != 0;
+        m >>= drop;
+        e += drop as i32;
+    }
+    // Round the 54th (round) bit to nearest, ties-to-even.
+    if 128 - m.leading_zeros() == 54 {
+        let round = m & 1;
+        m >>= 1;
+        e += 1;
+        if round == 1 && (sticky || (m & 1) == 1) {
+            m += 1;
+            if m == (1u128 << 53) {
+                m >>= 1;
+                e += 1;
+            }
+        }
+    }
+    // m ≤ 2^53 is exact in f64; 2^e overflows to Infinity for literals beyond
+    // f64::MAX, which is the correct result.
+    (m as f64) * (2.0f64).powi(e)
+}
+
 /// parseFloat(string) -> number
 /// Parses a string and returns a floating-point number.
 #[no_mangle]
@@ -428,11 +483,18 @@ pub extern "C" fn js_number_coerce(value: f64) -> f64 {
                     };
                     if let Some(radix) = radix {
                         // Empty digits ("0x") or out-of-radix digits ("0b12")
-                        // are errors → NaN, matching Node.
-                        return match u64::from_str_radix(&trimmed[2..], radix) {
-                            Ok(n) => n as f64,
-                            Err(_) => f64::NAN,
-                        };
+                        // are errors → NaN, matching Node. ECMAScript's
+                        // NonDecimalIntegerLiteral has no width limit, so a value
+                        // above u64::MAX must round to the nearest f64 (like
+                        // ToNumber), NOT become NaN. A naive `value*radix + digit`
+                        // in f64 rounds at every step and mis-rounds past 2^53
+                        // (e.g. 0x3fffffffffffff8); use a correctly-rounded
+                        // (round-to-nearest-even) bit accumulation instead.
+                        let digits = &trimmed[2..];
+                        if digits.is_empty() {
+                            return f64::NAN;
+                        }
+                        return parse_nondecimal_to_f64(digits.as_bytes(), radix);
                     }
                     // Rust's f64::from_str accepts `inf`/`infinity`/`INFINITY`
                     // case-insensitively, but ECMAScript StrNumericLiteral only
@@ -609,6 +671,33 @@ pub extern "C" fn js_string_coerce(value: f64) -> *mut StringHeader {
     };
 
     js_string_from_bytes(result.as_ptr(), result.len() as u32)
+}
+
+/// `RequireObjectCoercible(this)` + `ToString(this)` for the inline-lowered
+/// `String.prototype` methods (`charAt` / `charCodeAt` / `codePointAt` /
+/// `split` / `toUpperCase` / …) when the receiver is NOT statically
+/// string-typed. `codegen`'s `lower_string_method` optimistically routes any
+/// receiver here, but a nullish receiver must throw the V8 member-access
+/// `TypeError` — `x.charAt(0)` reads `charAt` off `x` FIRST (ECMA-262 §13.3),
+/// so `undefined`/`null` throws `Cannot read properties of undefined (reading
+/// 'charAt')` — NOT coerce `undefined`→`"undefined"` like the general
+/// `js_string_coerce` used for `String(x)` / `'' + x`. `prop_name_*` carries
+/// the static method name for the diagnostic.
+#[no_mangle]
+pub extern "C" fn js_string_coerce_method_this(
+    value: f64,
+    prop_name_ptr: *const u8,
+    prop_name_len: usize,
+) -> *mut StringHeader {
+    let jsval = JSValue::from_bits(value.to_bits());
+    if jsval.is_undefined() || jsval.is_null() {
+        crate::error::js_throw_type_error_property_access(
+            jsval.is_null() as u32,
+            prop_name_ptr,
+            prop_name_len,
+        );
+    }
+    js_string_coerce(value)
 }
 
 /// Spec `ToString` (ECMA-262 §7.1.17) rejects a Symbol with a `TypeError`.

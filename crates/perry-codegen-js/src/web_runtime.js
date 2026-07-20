@@ -680,6 +680,29 @@ function perry_system_preferences_set(key, value) {
     localStorage.setItem(key, value);
 }
 
+// perry/system hapticPlay — Vibration API. Pattern lengths approximate
+// the native semantics (error = double buzz). Silently a no-op in
+// browsers without navigator.vibrate (Safari, all iOS browsers) and in
+// non-window contexts, matching the "no haptic engine" API contract.
+function perry_system_haptic_play(type) {
+    if (typeof navigator === "undefined" || typeof navigator.vibrate !== "function") return;
+    const patterns = {
+        success: 50,
+        error: [50, 80, 50],
+        warning: [30, 50, 30],
+        light: 10,
+        medium: 20,
+        heavy: 40,
+        click: 10,
+        selection: 10,
+        directionUp: 15,
+        directionDown: 15,
+        start: 25,
+        stop: 25,
+    };
+    try { navigator.vibrate(patterns[type] ?? 10); } catch (e) { /* no-op */ }
+}
+
 // --- Audio Capture (Web Audio API) ---
 let _perry_audio_ctx = null;
 let _perry_audio_analyser = null;
@@ -3130,7 +3153,19 @@ function perry_get_scale_factor()  { return window.devicePixelRatio || 1; }
 function perry_has_hardware_keyboard() { return true; }
 function perry_get_platform() { return "web"; }
 function perry_get_orientation() { return window.innerWidth > window.innerHeight ? "landscape" : "portrait"; }
-function perry_get_device_idiom() { return 0; } // 0 = not a tablet/phone on web
+// Broad form factor per the perry/system contract: "phone" | "pad" |
+// "mac" | "tv" | "watch" | "vision" | "desktop" (was the numeric 0).
+function perry_get_device_idiom() {
+    const ua = (typeof navigator !== "undefined" && navigator.userAgent) || "";
+    // iPadOS 13+ Safari reports "Macintosh" in its desktop-mode UA; the
+    // touch-point count is the standard tell.
+    const touchPoints = (typeof navigator !== "undefined" && navigator.maxTouchPoints) || 0;
+    if (/iPad/i.test(ua) || (/Macintosh/i.test(ua) && touchPoints > 1)) return "pad";
+    if (/Android/i.test(ua) && !/Mobile/i.test(ua)) return "pad";
+    if (/iPhone|Android|Mobile/i.test(ua)) return "phone";
+    if (/Macintosh/i.test(ua)) return "mac";
+    return "desktop";
+}
 function perry_on_layout_change(callback) {
     if (typeof callback === "function") {
         window.addEventListener("resize", function() { callback(); });
@@ -3664,6 +3699,7 @@ window.__perry = {
     perry_system_is_dark_mode,
     perry_system_preferences_get,
     perry_system_preferences_set,
+    perry_system_haptic_play,
     perry_system_keychain_save,
     perry_system_keychain_get,
     perry_system_keychain_delete,

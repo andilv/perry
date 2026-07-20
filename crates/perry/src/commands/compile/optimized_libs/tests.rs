@@ -112,7 +112,9 @@ fn build_optimized_libs_reuses_fresh_auto_archives_without_cargo() {
     write_file(&runtime, b"!<arch>\n");
     write_file(&stdlib, b"!<arch>\n");
     let cross_features = auto_optimized_cross_features(&ctx, &features, &[]);
-    let stamp = auto_optimized_build_stamp(&key_input, None, &cross_features, &[]);
+    let source_fingerprint = auto_optimized_source_fingerprint(&workspace_root, &[]);
+    let stamp =
+        auto_optimized_build_stamp(&key_input, None, &cross_features, &[], &source_fingerprint);
     write_file(
         &target_dir.join(".perry-auto-build.stamp"),
         stamp.as_bytes(),
@@ -196,6 +198,98 @@ fn auto_optimized_freshness_ignores_nested_target_dirs() {
     ));
 }
 
+/// #5892 layer 2 / #5778 warm-cache trap: the auto-opt freshness gate must be
+/// keyed on the CONTENT of every source tree that lands in the archives — an
+/// ext-crate edit must rotate the fingerprint even when mtimes lie (cache
+/// restores, fresh checkouts), and rewriting identical bytes must NOT.
+#[test]
+fn source_fingerprint_tracks_ext_crate_content_not_mtimes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    minimal_auto_workspace(dir.path());
+    write_file(
+        &dir.path().join("crates/perry-ext-http/Cargo.toml"),
+        b"[package]\n",
+    );
+    write_file(
+        &dir.path().join("crates/perry-ext-http/src/lib.rs"),
+        b"pub fn http() {}\n",
+    );
+    let bindings = vec![(
+        "perry-ext-http".to_string(),
+        "perry_ext_http".to_string(),
+        None,
+    )];
+
+    let fp1 = auto_optimized_source_fingerprint(dir.path(), &bindings);
+
+    // Rewriting identical bytes (mtime-only churn) must not rotate the key.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    write_file(
+        &dir.path().join("crates/perry-ext-http/src/lib.rs"),
+        b"pub fn http() {}\n",
+    );
+    assert_eq!(
+        fp1,
+        auto_optimized_source_fingerprint(dir.path(), &bindings)
+    );
+
+    // A content edit in the ext crate must rotate it — this is exactly the
+    // stale-archive reuse that masked #5911 in CI.
+    write_file(
+        &dir.path().join("crates/perry-ext-http/src/lib.rs"),
+        b"pub fn http_changed() {}\n",
+    );
+    let fp2 = auto_optimized_source_fingerprint(dir.path(), &bindings);
+    assert_ne!(fp1, fp2);
+
+    // A binding crate that isn't routed must not affect the key.
+    assert_ne!(
+        auto_optimized_source_fingerprint(dir.path(), &[]),
+        fp2,
+        "fingerprint should include routed binding crates"
+    );
+}
+
+/// The fingerprint must follow transitive workspace path-deps: an edit in a
+/// crate reachable only through another crate's manifest (here perry-ext-net
+/// via perry-ext-http) still lands in the archives, so it must rotate the key.
+#[test]
+fn source_fingerprint_follows_workspace_dep_closure() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    minimal_auto_workspace(dir.path());
+    write_file(
+        &dir.path().join("crates/perry-ext-http/Cargo.toml"),
+        b"[package]\n[dependencies]\nperry-ext-net = { path = \"../perry-ext-net\" }\n",
+    );
+    write_file(
+        &dir.path().join("crates/perry-ext-http/src/lib.rs"),
+        b"pub fn http() {}\n",
+    );
+    write_file(
+        &dir.path().join("crates/perry-ext-net/Cargo.toml"),
+        b"[package]\n",
+    );
+    write_file(
+        &dir.path().join("crates/perry-ext-net/src/lib.rs"),
+        b"pub fn net() {}\n",
+    );
+    let bindings = vec![(
+        "perry-ext-http".to_string(),
+        "perry_ext_http".to_string(),
+        None,
+    )];
+
+    let fp1 = auto_optimized_source_fingerprint(dir.path(), &bindings);
+    write_file(
+        &dir.path().join("crates/perry-ext-net/src/lib.rs"),
+        b"pub fn net_changed() {}\n",
+    );
+    assert_ne!(
+        fp1,
+        auto_optimized_source_fingerprint(dir.path(), &bindings)
+    );
+}
+
 /// Closes #507. The well-known flip's "shared tokio" allowlist
 /// must match the set of perry-ext-* crates whose own
 /// `Cargo.toml` pulls tokio. If a new wrapper is added that uses
@@ -248,6 +342,56 @@ fn explicit_node_fetch_import_still_routes_to_well_known_fetch() {
     let modules = well_known_iteration_set(&ctx);
 
     assert!(modules.contains("node-fetch"));
+}
+
+#[test]
+fn http2_import_enables_http2_constants_cross_feature() {
+    // #6468: importing `node:http2` records "http2" in `native_module_imports`,
+    // which must flip on `perry-runtime/mod-http2-constants` so the constant
+    // tables (`node_http2_constants`) are linked. A program that never imports
+    // it must leave the feature off so the tables dead-strip.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let empty_features: std::collections::BTreeSet<&'static str> =
+        std::collections::BTreeSet::new();
+
+    let mut with_http2 = CompilationContext::new(dir.path().to_path_buf());
+    with_http2.native_module_imports.insert("http2".to_string());
+    let cross_on = auto_optimized_cross_features(&with_http2, &empty_features, &[]);
+    assert!(
+        cross_on
+            .iter()
+            .any(|f| f == "perry-runtime/mod-http2-constants"),
+        "http2 import should enable mod-http2-constants, got {cross_on:?}"
+    );
+
+    let without = CompilationContext::new(dir.path().to_path_buf());
+    let cross_off = auto_optimized_cross_features(&without, &empty_features, &[]);
+    assert!(
+        !cross_off
+            .iter()
+            .any(|f| f == "perry-runtime/mod-http2-constants"),
+        "no http2 import should leave mod-http2-constants off, got {cross_off:?}"
+    );
+}
+
+#[test]
+fn http2_import_changes_optimized_libs_cache_key() {
+    // #6468: the http2-constants usage bit participates in the auto-build cache
+    // key, so a runtime built without the constant tables is never reused for a
+    // program that imports `node:http2`.
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let base = CompilationContext::new(dir.path().to_path_buf());
+    let key_without = auto_optimized_cache_key("", true, None, &base);
+
+    let mut with_http2 = CompilationContext::new(dir.path().to_path_buf());
+    with_http2.native_module_imports.insert("http2".to_string());
+    let key_with = auto_optimized_cache_key("", true, None, &with_http2);
+
+    assert_ne!(
+        key_without, key_with,
+        "an http2 import must change the auto-optimized cache key"
+    );
 }
 
 #[test]

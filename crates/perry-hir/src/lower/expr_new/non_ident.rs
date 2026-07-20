@@ -132,7 +132,27 @@ pub(crate) fn lower_new_non_ident(
     };
     if let Some(class_expr) = class_expr_opt {
         let synthetic_name = format!("__anon_class_{}", ctx.fresh_class());
+        ctx.pending_class_inner_name = class_expr.ident.as_ref().map(|i| i.sym.to_string());
         let class = lower_class_from_ast(ctx, &class_expr.class, &synthetic_name, false)?;
+        // #6336: a class expression's `Subclass → Parent` registry edge is a SIDE
+        // EFFECT of evaluating the expression — `lower_class_expr` sequences a
+        // `RegisterClassParentDynamic` in front of the `ClassRef` it yields
+        // (`const K = class extends Event {}` works because of it). This arm
+        // never went through `lower_class_expr`: it lowers the class straight to
+        // a `New` on the synthetic name, so for a class expression constructed
+        // IN PLACE the registration never ran and the instance came out
+        // parentless — `new (class extends Event {})("tick") instanceof Event`
+        // was `false`, and every chain walk that identifies a receiver by its
+        // base (`instanceof`, the native-base init, Event/EventTarget dispatch)
+        // bailed. Sequence the same registration in front of the `New` so the
+        // edge is wired before the constructor runs.
+        //
+        // Only heritage that resolves to a runtime VALUE carries `extends_expr`
+        // (a builtin like `Event`, a factory call, a captured local). A parent
+        // that is a known user class in this module carries a static `extends`
+        // link instead and needs no registration — which is why the user-parent
+        // form of this shape already worked.
+        let parent_expr = class.extends_expr.clone();
         ctx.pending_classes.push(class);
         let mut args: Vec<Expr> = new_expr
             .args
@@ -159,6 +179,9 @@ pub(crate) fn lower_new_non_ident(
             .lookup_class_captures(&synthetic_name)
             .map(|c| c.to_vec())
             .unwrap_or_default();
+        // #6538: record the appended cap-forward count explicitly (see the
+        // named-class arm in `expr_new.rs` and the `Expr::New` docs).
+        let cap_args_appended = class_captures.len() as u32;
         for cid in class_captures {
             args.push(Expr::LocalGet(cid));
         }
@@ -172,12 +195,26 @@ pub(crate) fn lower_new_non_ident(
                     .collect()
             })
             .unwrap_or_default();
-        return Ok(Expr::New {
-            class_name: synthetic_name,
+        let construct = Expr::New {
+            class_name: synthetic_name.clone(),
             args,
             type_args,
             byte_offset: new_byte_offset,
-        });
+            cap_args_appended,
+        };
+        // The `Sequence` yields its LAST element, so the `new` site still sees
+        // the constructed instance — the registration is pure side effect,
+        // ordered before it.
+        let Some(parent_expr) = parent_expr else {
+            return Ok(construct);
+        };
+        return Ok(Expr::Sequence(vec![
+            Expr::RegisterClassParentDynamic {
+                class_name: synthetic_name,
+                parent_expr,
+            },
+            construct,
+        ]));
     }
 
     let callee = Box::new(lower_expr(ctx, callee_expr)?);
@@ -191,7 +228,10 @@ pub(crate) fn lower_new_non_ident(
         })
         .transpose()?
         .unwrap_or_default();
-    if let Expr::PropertyGet { object, property } = callee.as_ref() {
+    if let Expr::PropertyGet {
+        object, property, ..
+    } = callee.as_ref()
+    {
         if is_global_object_expr(ctx, object.as_ref())
             && matches!(property.as_str(), "Symbol" | "BigInt" | "Math")
         {
@@ -211,6 +251,7 @@ pub(crate) fn lower_new_non_ident(
                 args,
                 type_args: Vec::new(),
                 byte_offset: new_byte_offset,
+                cap_args_appended: 0,
             });
         }
         if matches!(object.as_ref(), Expr::NativeModuleRef(module)
@@ -223,6 +264,7 @@ pub(crate) fn lower_new_non_ident(
                 args,
                 type_args: Vec::new(),
                 byte_offset: new_byte_offset,
+                cap_args_appended: 0,
             });
         }
     }

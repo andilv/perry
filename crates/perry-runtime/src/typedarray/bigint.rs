@@ -21,6 +21,14 @@ pub(crate) fn is_bigint_kind(kind: u8) -> bool {
 
 #[cold]
 pub(crate) fn throw_bigint_number_mix() -> ! {
+    // PERRY_BIGINT_MIX_DIAG=1: print a native backtrace before throwing so a
+    // compiled bundle's stackless "Cannot mix BigInt" error can be traced to
+    // its JS frame (same diagnostic hook as dynamic_arith's mixed-operand
+    // gate; used to root-cause #6649).
+    if std::env::var_os("PERRY_BIGINT_MIX_DIAG").is_some() {
+        eprintln!("[bigint-mix-diag] typedarray mix gate");
+        eprintln!("{}", std::backtrace::Backtrace::force_capture());
+    }
     throw_type_error(b"Cannot mix BigInt and other types, use explicit conversions")
 }
 
@@ -78,7 +86,7 @@ pub(super) fn bigint_slot_bits(value: f64) -> u64 {
 /// `ToBigInt`), or a plain numeric f64 (via `ToNumber`) for every other kind.
 /// Used by the array/array-like construction and `set()` paths so a bigint view
 /// keeps real BigInt elements instead of `jsvalue_to_f64`-mangling them to NaN.
-pub(super) fn coerce_for_kind(dst_kind: u8, raw: f64) -> f64 {
+pub(crate) fn coerce_for_kind(dst_kind: u8, raw: f64) -> f64 {
     if dst_kind == KIND_BIGINT64 || dst_kind == KIND_BIGUINT64 {
         to_bigint_for_store(raw)
     } else {

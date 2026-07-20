@@ -108,7 +108,10 @@ pub(crate) fn lower_var_decl_with_destructuring(
                         }
                     }
                     Some(Expr::NewDynamic { callee, .. }) => {
-                        if let Expr::PropertyGet { object, property } = callee.as_ref() {
+                        if let Expr::PropertyGet {
+                            object, property, ..
+                        } = callee.as_ref()
+                        {
                             if matches!(object.as_ref(), Expr::NativeModuleRef(module) if module == "net" || module == "node:net")
                                 && matches!(property.as_str(), "BlockList" | "SocketAddress")
                             {
@@ -136,7 +139,24 @@ pub(crate) fn lower_var_decl_with_destructuring(
                     ctx.async_generator_func_names.insert(name.clone());
                 }
             }
-            let id = if let Some(pid) = pre_id {
+            // Annex B B.3.4: a `var <name> = init` whose name shadows a live
+            // `catch (<name>)` parameter assigns to the catch binding, so the
+            // function-scoped hoisted `var` keeps its pre-catch value. Target the
+            // catch parameter (innermost `lookup_local`) instead of reusing the
+            // hoisted id. Only a simple `var x = init` (a plain ident declarator
+            // with an initializer); a bare `var x;` re-declaration is inert and a
+            // destructuring pattern never names the catch param directly.
+            let shadows_catch_param = is_var_decl
+                && init.is_some()
+                && matches!(&decl.name, ast::Pat::Ident(_))
+                && ctx
+                    .catch_param_scopes
+                    .iter()
+                    .any(|scope| scope.contains(&name));
+            let id = if shadows_catch_param {
+                ctx.lookup_local(&name)
+                    .unwrap_or_else(|| ctx.define_local(name.clone(), ty.clone()))
+            } else if let Some(pid) = pre_id {
                 pid
             } else if ctx.scope_depth == 0
                 && ctx.inside_block_scope == 0

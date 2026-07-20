@@ -21,11 +21,11 @@ fn empty_opts() -> CompileOptions {
         namespace_node_submodules: std::collections::HashMap::new(),
         namespace_v8_specifiers: std::collections::HashMap::new(),
         namespace_member_prefixes: std::collections::HashMap::new(),
+        namespace_member_origin_names: std::collections::HashMap::new(),
         emit_ir_only: true,
         verify_native_regions: false,
         disable_buffer_fast_path: false,
         namespace_imports: Vec::new(),
-        namespace_reexport_named_imports: std::collections::HashSet::new(),
         imported_classes: Vec::new(),
         imported_enums: Vec::new(),
         imported_async_funcs: std::collections::HashSet::new(),
@@ -101,6 +101,7 @@ fn module_with_init(init: Vec<Stmt>) -> Module {
 fn string_trim_with_extra_arg_compiles() {
     let stmt = Stmt::Expr(Expr::Call {
         callee: Box::new(Expr::PropertyGet {
+            byte_offset: 0,
             object: Box::new(Expr::String("  x  ".to_string())),
             property: "trim".to_string(),
         }),
@@ -124,6 +125,7 @@ fn string_trim_with_extra_arg_compiles() {
 fn array_pop_with_extra_arg_compiles() {
     let stmt = Stmt::Expr(Expr::Call {
         callee: Box::new(Expr::PropertyGet {
+            byte_offset: 0,
             object: Box::new(Expr::Array(vec![Expr::Number(1.0)])),
             property: "pop".to_string(),
         }),

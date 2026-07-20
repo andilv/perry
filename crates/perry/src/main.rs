@@ -161,6 +161,7 @@ enum Commands {
     /// `perry updater keygen` — generate Ed25519 keypair.
     /// `perry updater sign`   — sign a binary for a v2 manifest entry.
     /// `perry updater verify` — sanity-check a v2 signature locally.
+    /// `perry updater sign-cli-manifest` — sign an authenticated CLI update manifest.
     #[cfg(feature = "updater-cli")]
     Updater(commands::updater::UpdaterArgs),
 
@@ -267,10 +268,45 @@ fn main() -> Result<()> {
     // large codebases. Bumped from 64 MB in v0.5.973 — ioredis-via-
     // compilePackages (~30 transitive CJS modules) overflowed 64 MB in the
     // collect/lower walk on the perry-main thread.
+    //
+    // PERRY_MAIN_STACK_MB overrides the size (in MB) without a rebuild —
+    // useful both for diagnosing suspected-unbounded recursion (bump it and
+    // see whether the overflow moves, #6593) and as an escape hatch for
+    // legitimately deep inputs that outgrow the default (already happened
+    // twice: v0.5.973, #6593). Invalid or zero values fall back to 128;
+    // values above 16384 (16 GB) clamp so the MB→bytes conversion cannot
+    // overflow usize and the spawn below cannot fail on an absurd request.
+    const MAX_STACK_MB: usize = 16 * 1024;
+    let stack_mb: usize = std::env::var("PERRY_MAIN_STACK_MB")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|mb| *mb > 0)
+        .map(|mb: usize| {
+            if mb > MAX_STACK_MB {
+                eprintln!(
+                    "perry: PERRY_MAIN_STACK_MB={mb} exceeds the {MAX_STACK_MB} MB ceiling; clamping"
+                );
+                MAX_STACK_MB
+            } else {
+                mb
+            }
+        })
+        .unwrap_or(128);
+    let stack_bytes = stack_mb
+        .checked_mul(1024 * 1024)
+        .expect("stack size in bytes fits usize (clamped above)");
     let builder = std::thread::Builder::new()
         .name("perry-main".into())
-        .stack_size(128 * 1024 * 1024);
-    let handler = builder.spawn(main_inner).unwrap();
+        .stack_size(stack_bytes);
+    let handler = match builder.spawn(main_inner) {
+        Ok(handler) => handler,
+        Err(err) => {
+            return Err(anyhow::anyhow!(
+                "failed to spawn the perry-main compiler thread \
+                 (stack size {stack_mb} MB; try a smaller PERRY_MAIN_STACK_MB): {err}"
+            ));
+        }
+    };
     match handler.join() {
         Ok(result) => result,
         Err(panic_payload) => {
@@ -317,6 +353,14 @@ fn install_panic_hook() {
 
 fn main_inner() -> Result<()> {
     env_logger::init();
+    #[cfg(windows)]
+    {
+        let raw_args: Vec<String> = std::env::args().collect();
+        if let Some(result) = update_checker::maybe_run_windows_update_helper(&raw_args) {
+            return result;
+        }
+    }
+    update_checker::recover_interrupted_self_update()?;
 
     // Handle legacy invocation (perry file.ts -o out)
     let args: Vec<String> = std::env::args().collect();
@@ -447,7 +491,9 @@ fn main_inner() -> Result<()> {
         Commands::Publish(args) => commands::publish::run(args, cli.format, use_color, cli.verbose),
         #[cfg(feature = "mobile-cli")]
         Commands::Setup(args) => commands::setup::run(args),
-        Commands::Update(args) => commands::update::run(args, cli.format, use_color, cli.verbose),
+        Commands::Update(args) => {
+            commands::update::run(args, cli.format, use_color, cli.verbose, cli.quiet)
+        }
         #[cfg(feature = "audit-cli")]
         Commands::Audit(args) => commands::audit::run(args, cli.format, use_color),
         #[cfg(feature = "audit-cli")]

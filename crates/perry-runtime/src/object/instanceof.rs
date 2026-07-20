@@ -94,6 +94,52 @@ fn is_native_module_namespace_value(value: f64, expected: &str) -> bool {
 /// JS spec: `1 instanceof 2` throws, but Perry returns false defensively).
 /// Refs #420 / #618 followup.
 #[no_mangle]
+/// Map a builtin constructor VALUE (the `ClosureHeader`-backed function installed
+/// on `globalThis`) back to the class id that codegen passes to `js_instanceof`
+/// for the static `x instanceof <Identifier>` form.
+///
+/// Only the natively-backed builtins need this: their instances are handles
+/// (stream / fetch registries), not heap objects with a real prototype chain, so
+/// `js_instanceof` brand-checks them via the kind probes rather than a chain walk.
+/// Heap-backed builtins already resolve through the class-id / prototype paths.
+fn builtin_ctor_class_id_from_value(type_ref: f64) -> Option<u32> {
+    let closure =
+        crate::value::js_nanbox_get_pointer(type_ref) as *const crate::closure::ClosureHeader;
+    if closure.is_null() {
+        return None;
+    }
+    if unsafe { (*closure).type_tag } != crate::closure::CLOSURE_MAGIC {
+        return None;
+    }
+    let name_value = crate::closure::closure_get_dynamic_prop(closure as usize, "name");
+    let mut scratch = [0u8; crate::value::SHORT_STRING_MAX_LEN];
+    let (ptr, len) = crate::string::str_bytes_from_jsvalue(name_value, &mut scratch)?;
+    if ptr.is_null() {
+        return None;
+    }
+    let name =
+        std::str::from_utf8(unsafe { std::slice::from_raw_parts(ptr, len as usize) }).ok()?;
+    let class_id = match name {
+        "ReadableStream" => 0xFFFF_0060,
+        "WritableStream" => 0xFFFF_0061,
+        "TransformStream" => 0xFFFF_0062,
+        "Response" => 0xFFFF_0028,
+        "Request" => 0xFFFF_0029,
+        "Headers" => 0xFFFF_002A,
+        "Blob" => 0xFFFF_0026,
+        _ => return None,
+    };
+    // The name alone is forgeable (`function Response() {}` in user code).
+    // Require IDENTITY with the builtin constructor installed on
+    // `globalThis`: only the genuine builtin value brand-checks instances.
+    let global_ctor = crate::object::js_get_global_this_builtin_value(name.as_ptr(), name.len());
+    if crate::value::js_nanbox_get_pointer(global_ctor) as usize != closure as usize {
+        return None;
+    }
+    Some(class_id)
+}
+
+#[no_mangle]
 pub extern "C" fn js_instanceof_dynamic(value: f64, type_ref: f64) -> f64 {
     const TAG_FALSE: u64 = 0x7FFC_0000_0000_0003;
     // `proxy instanceof C` uses the proxy's `[[GetPrototypeOf]]`, which (absent a
@@ -205,6 +251,44 @@ pub extern "C" fn js_instanceof_dynamic(value: f64, type_ref: f64) -> f64 {
         if class_id != 0 {
             return js_instanceof(value, class_id);
         }
+    }
+    // A builtin constructor held in a VARIABLE — `const RS = ReadableStream; body
+    // instanceof RS` — arrives here as the ClosureHeader-backed function installed
+    // on `globalThis`, so none of the class-id paths above match and the prototype
+    // walk below returns false. Codegen only special-cases the *static identifier*
+    // form (`body instanceof ReadableStream`), where it hands the builtin class id
+    // straight to `js_instanceof`, which brand-checks these natively-backed values
+    // via the stream / fetch kind probes (their instances are handles, not heap
+    // objects with a real prototype chain).
+    //
+    // Minified bundles almost always alias constructors into locals, so the
+    // variable form is the common one in the wild: `x instanceof <alias>` for
+    // ReadableStream / Response / Headers silently returned `false` while Node
+    // returns `true`. That made a large esbuild-bundled CLI app mis-detect its
+    // `fetch()` body, throw "The first argument must be a Readable, a
+    // ReadableStream, or an async iterable", and abort its background
+    // tar-stream downloads entirely.
+    //
+    // Recover the builtin's name from the constructor closure (recorded by
+    // `set_bound_native_closure_name` when globalThis is populated) and reuse the
+    // static path's class id, so both spellings agree.
+    if let Some(class_id) = builtin_ctor_class_id_from_value(type_ref) {
+        return js_instanceof(value, class_id);
+    }
+    // #6558: `e instanceof WebAssembly.CompileError` (and LinkError /
+    // RuntimeError). These constructors live on the WebAssembly NAMESPACE —
+    // not on `globalThis`, so the builtin-name path above never resolves
+    // them — and their instances are ErrorHeader-backed values with no
+    // prototype chain reaching the namespace ctor's `.prototype`, so the
+    // ordinary prototype walk below can't brand them either. Identify the
+    // ctor by its dedicated thunk func_ptr (GC-move-safe) and brand-check
+    // the instance by its error `.name`.
+    if let Some(matches) = super::global_this::webassembly_error_ctor_instanceof(value, type_ref) {
+        return f64::from_bits(if matches {
+            crate::value::TAG_TRUE
+        } else {
+            crate::value::TAG_FALSE
+        });
     }
     if let Some((module, method)) = unsafe { bound_native_callable_module_and_method(type_ref) } {
         if module == "stream"
@@ -343,11 +427,35 @@ pub extern "C" fn js_instanceof_dynamic(value: f64, type_ref: f64) -> f64 {
         }
         let class_id = global_builtin_constructor_class_id(name);
         if class_id != 0 {
-            return js_instanceof(value, class_id);
+            let r = js_instanceof(value, class_id);
+            if r.to_bits() == crate::value::TAG_TRUE {
+                return r;
+            }
+            // #5989: an object that inherits a builtin's prototype via
+            // `Fn.prototype = Object.create(Builtin.prototype)` is `instanceof
+            // Builtin` per the spec even though it carries no builtin class id —
+            // react-server-dom's flight Chunk inherits `Promise.prototype` this
+            // way, so `chunk instanceof Promise` must be true. Walk the real
+            // [[Prototype]] chain against `Builtin.prototype` before answering
+            // false.
+            if ordinary_has_instance_prototype_walk(value, type_ref) {
+                return f64::from_bits(crate::value::TAG_TRUE);
+            }
+            return f64::from_bits(TAG_FALSE);
         }
     }
     if crate::node_submodules::is_diagnostics_channel_constructor_value(type_ref) {
         return if crate::node_submodules::diagnostics_channel_is_channel_instance_value(value) {
+            f64::from_bits(crate::value::TAG_TRUE)
+        } else {
+            f64::from_bits(TAG_FALSE)
+        };
+    }
+    // `inst instanceof Intl.<Ctor>`: Intl instances are plain heap objects whose
+    // `[[Prototype]]` is `Intl.<Ctor>.prototype` but carry no class-id, so the
+    // arms above can't match them. Walk their static-prototype chain.
+    if let Some(is_inst) = crate::intl::intl_instanceof(value, type_ref) {
+        return if is_inst {
             f64::from_bits(crate::value::TAG_TRUE)
         } else {
             f64::from_bits(TAG_FALSE)
@@ -408,6 +516,13 @@ pub(crate) fn global_builtin_constructor_class_id(name: &str) -> u32 {
         "Event" => crate::event_target::CLASS_ID_EVENT,
         "CustomEvent" => crate::event_target::CLASS_ID_CUSTOM_EVENT,
         "DOMException" => crate::event_target::CLASS_ID_DOM_EXCEPTION,
+        // #6301: the `X → EventTarget` edge is what makes a user
+        // `class Bus extends EventTarget {}` instance resolve the inherited
+        // `addEventListener`/`removeEventListener`/`dispatchEvent` surface
+        // (see `event_target::class_chain_is_event_target`). Without an id
+        // here `js_register_class_parent_dynamic` left the subclass
+        // parentless and it inherited nothing.
+        "EventTarget" => crate::event_target::CLASS_ID_EVENT_TARGET,
         // TypedArray constructors used as runtime *values* (a dynamic
         // `x instanceof TA` where `TA` is a variable — e.g. test262's
         // `testWithTypedArrayConstructors`). Mirrors the per-kind synthetic
@@ -440,7 +555,22 @@ fn js_instanceof_dynamic_tail(value: f64, type_ref: f64) -> f64 {
     // inside a `new`-invoked body instead of recursing forever (#838 followup).
     let synthetic_cid = synthetic_class_id_for_function(type_ref);
     if synthetic_cid != 0 {
-        return js_instanceof(value, synthetic_cid);
+        let r = js_instanceof(value, synthetic_cid);
+        if r.to_bits() == crate::value::TAG_TRUE {
+            return r;
+        }
+        // #5989: the synthetic class-id chain is stamped at construction and does
+        // NOT reflect a prototype installed later via
+        // `Fn.prototype = Object.create(Base.prototype)` — the classic ES5
+        // inheritance idiom react-server-dom's flight Chunk uses to inherit
+        // `Promise.prototype` (so `chunk instanceof Promise` wrongly returned
+        // false). Fall back to the spec `OrdinaryHasInstance` prototype-chain
+        // walk: Perry already walks the real chain for method lookup and
+        // `getPrototypeOf`, so only this id-based shortcut missed it.
+        if ordinary_has_instance_prototype_walk(value, type_ref) {
+            return f64::from_bits(crate::value::TAG_TRUE);
+        }
+        return f64::from_bits(TAG_FALSE);
     }
     // #2909: nothing recognized the RHS as a constructor/class. Per the
     // ECMAScript `InstanceofOperator`, the right operand must be an object
@@ -461,6 +591,94 @@ fn js_instanceof_dynamic_tail(value: f64, type_ref: f64) -> f64 {
         return f64::from_bits(TAG_FALSE);
     }
     throw_invalid_instanceof_rhs(type_ref)
+}
+
+/// Spec `OrdinaryHasInstance(C, O)` prototype-chain walk (ECMA-262 7.3.20 steps
+/// 4-7): `P = Get(C, "prototype")`; walk `O`'s `[[Prototype]]` chain and return
+/// `true` iff some link is identical to `P`. Used as a fallback for the
+/// synthetic class-id shortcut, which is stamped at construction and misses a
+/// prototype installed via `Fn.prototype = Object.create(Base.prototype)`.
+fn ordinary_has_instance_prototype_walk(value: f64, type_ref: f64) -> bool {
+    extern "C" {
+        fn js_object_get_prototype_of(obj_value: f64) -> f64;
+    }
+    // OrdinaryHasInstance(C, O) step 3 (ECMA-262 7.3.21): "If Type(O) is not
+    // Object, return false." A primitive left operand is never `instanceof`
+    // anything, so guard it here BEFORE the `js_object_get_prototype_of(value)`
+    // walk below. Routing a primitive into that walk is wrong two ways:
+    //   * `null`/`undefined` THROW `TypeError: Cannot convert undefined or null
+    //     to object` (#6587: find-my-way@9's `FindMyWay(opts)` is called without
+    //     `new`, so its `Router` body evaluates `this instanceof Router` with
+    //     `this === undefined` — a function-value RHS routes through
+    //     `js_instanceof_dynamic`'s synthetic-class-id tail into this walk, and
+    //     the unguarded getPrototypeOf aborted module init before any route was
+    //     registered);
+    //   * a heap-allocated string/bigint/symbol gets ToObject-wrapped by
+    //     getPrototypeOf, so the walk climbs the wrapper chain and can spuriously
+    //     match (`Symbol() instanceof Object` wrongly returned `true`).
+    // Every tag below is checked without dereferencing. Real f64 numbers are
+    // already answered `false` by the primitive fast paths before this point and
+    // share tag-space with raw heap pointers (a bare `is_number()` would
+    // misclassify a module-level object var), so they are intentionally left to
+    // those paths rather than guarded here.
+    {
+        let jv = crate::value::JSValue::from_bits(value.to_bits());
+        if jv.is_null()
+            || jv.is_undefined()
+            || jv.is_bool()
+            || jv.is_int32()
+            || jv.is_any_string()
+            || jv.is_bigint()
+            || unsafe { crate::symbol::js_is_symbol(value) != 0 }
+        {
+            return false;
+        }
+    }
+    // P = type_ref.prototype (the constructor's `.prototype` data property).
+    let proto = unsafe {
+        crate::value::js_dynamic_object_get_property(
+            type_ref,
+            b"prototype".as_ptr() as *const i8,
+            9,
+        )
+    };
+    let target = proto_identity_addr(proto);
+    if target == 0 {
+        return false; // non-object `.prototype` can never be on the chain
+    }
+    // Walk `value`'s real [[Prototype]] chain looking for identity with P.
+    let mut cur = unsafe { js_object_get_prototype_of(value) };
+    let mut depth = 0usize;
+    while depth < 100_000 {
+        if crate::value::JSValue::from_bits(cur.to_bits()).is_null() {
+            return false;
+        }
+        let cur_addr = proto_identity_addr(cur);
+        if cur_addr == 0 {
+            return false;
+        }
+        if cur_addr == target {
+            return true;
+        }
+        cur = unsafe { js_object_get_prototype_of(cur) };
+        depth += 1;
+    }
+    false
+}
+
+/// Normalize a value to its heap-pointer address for prototype identity
+/// comparison — a NaN-boxed `POINTER_TAG` value or a raw heap pointer both
+/// resolve to their address; any non-pointer yields 0.
+fn proto_identity_addr(v: f64) -> usize {
+    let bits = v.to_bits();
+    let top16 = bits >> 48;
+    if top16 == 0x7FFD {
+        (bits & crate::value::POINTER_MASK) as usize
+    } else if top16 == 0 && bits >= 0x1000 {
+        bits as usize
+    } else {
+        0
+    }
 }
 
 #[cold]
@@ -619,6 +837,22 @@ fn is_event_emitter_async_resource_instance_value(value: f64) -> bool {
         return unsafe { probe(handle) };
     }
     false
+}
+
+/// `x instanceof <non-constructor built-in>` — the RHS (e.g. `Math`, `JSON`,
+/// `Reflect`, `Atomics`) is a namespace object with no `[[Call]]`/`[[Construct]]`,
+/// so `InstanceofOperator` throws a `TypeError` ("Right-hand side ... is not
+/// callable") regardless of the LHS. The codegen recognizes these statically
+/// (they never map to a real class id) and calls this instead of the
+/// `js_instanceof(_, 0)` fold, which would wrongly return `false`. Honors the
+/// `SUPPRESS_INSTANCEOF_RHS_THROW` scope used by `Symbol.hasInstance` helpers.
+#[no_mangle]
+pub extern "C" fn js_instanceof_noncallable_rhs() -> f64 {
+    const TAG_FALSE: u64 = 0x7FFC_0000_0000_0003;
+    if SUPPRESS_INSTANCEOF_RHS_THROW.with(|c| c.get()) {
+        return f64::from_bits(TAG_FALSE);
+    }
+    throw_type_error(b"Right-hand side of 'instanceof' is not callable");
 }
 
 /// Check if a value is an instance of a class with the given class_id
@@ -1089,6 +1323,13 @@ pub extern "C" fn js_instanceof(value: f64, class_id: u32) -> f64 {
     const CLASS_ID_OBJECT: u32 = 0xFFFF0050;
     if class_id == CLASS_ID_OBJECT {
         if jsval.is_pointer() {
+            // A Symbol is a POINTER_TAG heap allocation but a PRIMITIVE, not an
+            // object, so `Symbol() instanceof Object` is false (the comment
+            // above says "any non-primitive"). Every other primitive is
+            // non-pointer-tagged and already falls through below. #6587 review.
+            if unsafe { crate::symbol::js_is_symbol(value) != 0 } {
+                return false_val;
+            }
             // Covers every heap object, including a Date (now a NaN-boxed
             // `DateCell` pointer — #2089) and an Invalid Date.
             return true_val;
@@ -1298,5 +1539,43 @@ pub extern "C" fn js_instanceof(value: f64, class_id: u32) -> f64 {
         }
 
         false_val
+    }
+}
+
+#[cfg(test)]
+mod null_lhs_tests {
+    use super::*;
+
+    /// `OrdinaryHasInstance` with a primitive left operand must answer `false`,
+    /// never throw or spuriously match. The guard is purely tag-based and
+    /// short-circuits before any prototype access, so the RHS is irrelevant and
+    /// no arena/runtime state is touched.
+    ///
+    /// * `null`/`undefined` — #6587: previously threw `Cannot convert undefined
+    ///   or null to object` (find-my-way@9's `FindMyWay(opts)` called without
+    ///   `new` evaluates `this instanceof Router` with `this === undefined`).
+    /// * boolean / int32 / string / bigint — a primitive is never `instanceof`
+    ///   anything; a string's ToObject wrapper chain must not spuriously match.
+    ///
+    /// (Symbols are also guarded, but constructing one needs the runtime arena,
+    /// so that arm is covered by the behavioral e2e/compiled tests instead.)
+    #[test]
+    fn ordinary_has_instance_walk_is_false_for_primitive_lhs() {
+        let cases = [
+            f64::from_bits(crate::value::TAG_UNDEFINED),
+            f64::from_bits(crate::value::TAG_NULL),
+            f64::from_bits(crate::value::TAG_TRUE),
+            f64::from_bits(crate::value::INT32_TAG | 5), // int32 5
+            f64::from_bits(crate::value::STRING_TAG | 0x1000), // string tag (addr never deref'd)
+            f64::from_bits(crate::value::BIGINT_TAG | 0x1000), // bigint tag (addr never deref'd)
+        ];
+        for lhs in cases {
+            // A dummy non-object RHS is never consulted for a non-object LHS.
+            assert!(
+                !ordinary_has_instance_prototype_walk(lhs, 0.0),
+                "primitive LHS {:#018x} must not be instanceof anything",
+                lhs.to_bits()
+            );
+        }
     }
 }

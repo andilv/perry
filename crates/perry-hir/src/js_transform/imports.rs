@@ -460,7 +460,7 @@ pub fn transform_stmt(
             }
         }
         Stmt::Break | Stmt::Continue | Stmt::LabeledBreak(_) | Stmt::LabeledContinue(_) => {}
-        Stmt::PreallocateBoxes(_) => {}
+        Stmt::PreallocateBoxes(_) | Stmt::PreallocateTdzBoxes(_) => {}
     }
 }
 
@@ -546,7 +546,7 @@ pub fn transform_expr(
         // Call expressions - may be method calls on JS objects or direct function calls
         Expr::Call { callee, args, .. } => {
             // First check if this is a method call on a JS object: obj.method(args)
-            if let Expr::PropertyGet { object, property } = callee.as_mut() {
+            if let Expr::PropertyGet { object, property, .. } = callee.as_mut() {
                 // Transform the object first
                 transform_expr(object.as_mut(), js_imports, extern_func_to_js, local_name_to_js, tracker);
 
@@ -728,7 +728,7 @@ pub fn transform_expr(
         }
 
         // Property access - may be on JS objects
-        Expr::PropertyGet { object, property } => {
+        Expr::PropertyGet { object, property, .. } => {
             transform_expr(object, js_imports, extern_func_to_js, local_name_to_js, tracker);
 
             // Check if the object is a JS value
@@ -842,8 +842,15 @@ pub fn transform_expr(
         Expr::TypeOf(inner) => {
             transform_expr(inner, js_imports, extern_func_to_js, local_name_to_js, tracker);
         }
-        Expr::InstanceOf { expr: inner, .. } => {
+        Expr::InstanceOf {
+            expr: inner,
+            ty_expr,
+            ..
+        } => {
             transform_expr(inner, js_imports, extern_func_to_js, local_name_to_js, tracker);
+            if let Some(t) = ty_expr {
+                transform_expr(t, js_imports, extern_func_to_js, local_name_to_js, tracker);
+            }
         }
         Expr::Await(inner) => {
             transform_expr(inner, js_imports, extern_func_to_js, local_name_to_js, tracker);

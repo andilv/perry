@@ -4,6 +4,7 @@ use super::*;
 
 #[path = "global_this_webassembly.rs"]
 mod global_this_webassembly;
+pub(crate) use global_this_webassembly::webassembly_error_ctor_instanceof;
 
 // Topical sub-modules split out of the original monolithic `global_this.rs`
 // (pure code move; see the per-module re-exports below for the resolving paths).
@@ -50,9 +51,9 @@ pub(crate) use bigint_promise::{
     object_hasown_thunk, object_is_extensible_thunk, object_is_frozen_thunk,
     object_is_sealed_thunk, object_is_thunk, object_keys_thunk, object_prevent_extensions_thunk,
     object_seal_thunk, object_set_prototype_of_thunk, object_values_thunk,
-    promise_static_function_spec, reflect_apply_thunk, string_from_char_code_static,
-    string_from_code_point_static, string_raw_static, symbol_for_thunk, symbol_key_for_thunk,
-    typed_array_from_thunk, typed_array_of_thunk,
+    promise_static_function_spec, reflect_apply_thunk, reflect_construct_thunk,
+    string_from_char_code_static, string_from_code_point_static, string_raw_static,
+    symbol_for_thunk, symbol_key_for_thunk, typed_array_from_thunk, typed_array_of_thunk,
 };
 pub use bigint_promise::{js_bigint_as_int_n_call, js_bigint_as_uint_n_call};
 pub use builtin_thunks::js_function_ctor_from_strings;
@@ -65,9 +66,9 @@ pub(crate) use builtin_thunks::{
     global_this_is_finite_thunk, global_this_is_nan_thunk, global_this_number_thunk,
     global_this_object_thunk, global_this_parse_float_thunk, global_this_parse_int_thunk,
     global_this_string_thunk, global_this_structured_clone_thunk, global_this_unescape_thunk,
-    math_atan2_thunk, math_clz32_thunk, math_f16round_thunk, math_hypot_thunk, math_imul_thunk,
-    math_max_thunk, math_min_thunk, math_pow_thunk, math_random_thunk, math_round_thunk,
-    math_sign_thunk, proxy_revocable_thunk,
+    js_math_round_value, math_atan2_thunk, math_clz32_thunk, math_f16round_thunk, math_hypot_thunk,
+    math_imul_thunk, math_max_thunk, math_min_thunk, math_pow_thunk, math_random_thunk,
+    math_round_thunk, math_sign_thunk, proxy_revocable_thunk,
 };
 pub use ctor_thunks::js_webcrypto_illegal_constructor;
 pub(crate) use ctor_thunks::{

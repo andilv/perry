@@ -531,17 +531,72 @@ fn hoist_awaits_in_stmt(mut stmt: Stmt, next_id: &mut LocalId, hoisted: &mut Vec
             }
         }
         Stmt::While { condition, body } => {
-            // While condition: fully hoist all awaits. The hoisted
-            // lets land before the while statement, but re-evaluating
-            // them on each iteration requires the await to fire each
-            // pass. JS spec: condition with await runs on every
-            // iteration. We don't currently support this — see the
-            // limitation in the doc comment. Single hoist per loop
-            // entry is the safe-but-incomplete approximation.
+            if expr_contains_await(condition) {
+                // JS spec: a `while` condition containing `await` runs the
+                // await on EVERY iteration. The old single hoist-before-the-
+                // loop evaluated it once (#5933): a truthy first value looped
+                // forever on stale state, a falsy one never entered — async
+                // drain loops (`while ((v = await q.next()) !== undefined)`)
+                // never re-awaited. Restructure instead of hoisting out:
+                //
+                //   while (true) {
+                //     let __loop_cond_await_N = <condition>;
+                //     if (!__loop_cond_await_N) break;
+                //     <body>
+                //   }
+                //
+                // `continue` re-enters at the condition evaluation (loop
+                // top), matching spec; `break` is unchanged. Re-entering the
+                // hoist then normalizes the awaits inside the new `let` (and
+                // the body) to statement positions INSIDE the loop.
+                let cond = std::mem::replace(condition, Expr::Bool(true));
+                let taken_body = std::mem::take(body);
+                let restructured = restructure_awaited_loop_cond(cond, taken_body, next_id);
+                return hoist_awaits_in_stmt(restructured, next_id, hoisted);
+            }
             hoist_awaits_in_expr_full(condition, next_id, hoisted);
             hoist_awaits_in_stmts(body, next_id);
         }
         Stmt::DoWhile { body, condition } => {
+            if expr_contains_await(condition) {
+                // do-while with an awaited condition: apply the linearizer's
+                // first-iteration-flag desugar here so the condition lands in
+                // a `while` head, then the While arm's restructure applies on
+                // re-entry. The flag keeps do-while semantics: the body's
+                // first run precedes the first condition evaluation
+                // (short-circuited by the flag), and `continue` falls through
+                // to the condition evaluation (the flag is already false).
+                //
+                //   let __dw_first_N = true;          (before the loop)
+                //   while (__dw_first_N || <cond>) {  → restructured again
+                //     __dw_first_N = false;
+                //     <body>
+                //   }
+                let first = alloc_local(next_id);
+                hoisted.push(Stmt::Let {
+                    id: first,
+                    name: format!("__dw_first_{}", first),
+                    ty: Type::Any,
+                    mutable: true,
+                    init: Some(Expr::Bool(true)),
+                });
+                let cond = std::mem::replace(condition, Expr::Bool(true));
+                let mut new_body = Vec::with_capacity(body.len() + 1);
+                new_body.push(Stmt::Expr(Expr::LocalSet(
+                    first,
+                    Box::new(Expr::Bool(false)),
+                )));
+                new_body.append(body);
+                let while_stmt = Stmt::While {
+                    condition: Expr::Logical {
+                        op: LogicalOp::Or,
+                        left: Box::new(Expr::LocalGet(first)),
+                        right: Box::new(cond),
+                    },
+                    body: new_body,
+                };
+                return hoist_awaits_in_stmt(while_stmt, next_id, hoisted);
+            }
             hoist_awaits_in_stmts(body, next_id);
             hoist_awaits_in_expr_full(condition, next_id, hoisted);
         }
@@ -551,6 +606,70 @@ fn hoist_awaits_in_stmt(mut stmt: Stmt, next_id: &mut LocalId, hoisted: &mut Vec
             update,
             body,
         } => {
+            let cond_awaits = condition.as_ref().is_some_and(|c| expr_contains_await(c));
+            let upd_awaits = update.as_ref().is_some_and(|u| expr_contains_await(u));
+            // A continue inside try{..}finally{..} is an abrupt completion:
+            // the finally must run BEFORE the update (and can override it).
+            // prefix_loop_continues would insert the update before the
+            // finally, so keep the previous lowering for that rare shape
+            // instead of reordering it (CodeRabbit review on #5934).
+            let upd_movable =
+                upd_awaits && !crate::generator::stmts_have_continue_inside_try_finally(body);
+            if cond_awaits || upd_movable {
+                // Awaited condition/update must run on every iteration
+                // (#5933). Keep the `For` (so `continue` still routes
+                // through update-then-condition per spec), but move the
+                // awaited slot(s) into the body:
+                //   - awaited condition → body-top
+                //     `let __t = C; if (!__t) break;` with the For's
+                //     condition slot emptied (an empty condition is
+                //     always-true);
+                //   - awaited update → body-end statement, with every
+                //     loop-level `continue` prefixed by the update so
+                //     continue → update → condition order holds.
+                // The init keeps its run-once semantics via the recursive
+                // call's normal For handling.
+                let cond_taken = if cond_awaits { condition.take() } else { None };
+                let upd_taken = if upd_movable { update.take() } else { None };
+                let mut new_body = Vec::with_capacity(body.len() + 3);
+                if let Some(c) = cond_taken {
+                    let t = alloc_local(next_id);
+                    new_body.push(Stmt::Let {
+                        id: t,
+                        name: format!("__loop_cond_await_{}", t),
+                        ty: Type::Any,
+                        mutable: true,
+                        init: Some(c),
+                    });
+                    new_body.push(Stmt::If {
+                        condition: Expr::Unary {
+                            op: UnaryOp::Not,
+                            operand: Box::new(Expr::LocalGet(t)),
+                        },
+                        then_branch: vec![Stmt::Break],
+                        else_branch: None,
+                    });
+                }
+                let mut taken_body = std::mem::take(body);
+                if let Some(u) = upd_taken {
+                    let upd_stmt = Stmt::Expr(u);
+                    crate::generator::prefix_loop_continues(
+                        &mut taken_body,
+                        std::slice::from_ref(&upd_stmt),
+                    );
+                    new_body.append(&mut taken_body);
+                    new_body.push(upd_stmt);
+                } else {
+                    new_body.append(&mut taken_body);
+                }
+                let new_for = Stmt::For {
+                    init: init.take(),
+                    condition: condition.take(),
+                    update: update.take(),
+                    body: new_body,
+                };
+                return hoist_awaits_in_stmt(new_for, next_id, hoisted);
+            }
             if let Some(i) = init {
                 let mut inner_hoisted = Vec::new();
                 let i_replaced = hoist_awaits_in_stmt((**i).clone(), next_id, &mut inner_hoisted);
@@ -631,6 +750,25 @@ fn hoist_awaits_in_expr_full(expr: &mut Expr, next_id: &mut LocalId, hoisted: &m
     // with a temp before the general hoisting walks into it.
     if matches!(expr, Expr::Logical { .. }) && logical_rhs_contains_await(expr) {
         lift_logical_with_await_rhs(expr, next_id, hoisted);
+        return;
+    }
+    // A sequence like `this.l = new L, this.p = await this.l.start()`
+    // would otherwise have the await hoisted above the containing
+    // statement, evaluating the awaited operand BEFORE the sequence's
+    // earlier operands ran — the awaited receiver reads its
+    // pre-assignment value (issue #5925; minifiers emit this shape
+    // constantly). Lift the non-final operands to statements first, in
+    // evaluation order, then continue with the final operand.
+    if matches!(expr, Expr::Sequence(_)) && expr_contains_await(expr) {
+        lift_sequence_with_await(expr, next_id, hoisted);
+        hoist_awaits_in_expr_full(expr, next_id, hoisted);
+        return;
+    }
+    // `{ a: f(), v: await p, ...src }` — the object-with-spread lowering
+    // wraps the build in a synthetic IIFE, trapping the await inside a
+    // NON-async closure the pre-pass would otherwise skip. Inline it so
+    // the awaits reach the enclosing async context (see the fn comment).
+    if inline_obj_iife_with_await(expr, next_id, hoisted) {
         return;
     }
     // Recurse into children first (innermost-first hoisting).
@@ -765,11 +903,128 @@ fn hoist_awaits_avoiding_top_level(
         lift_logical_with_await_rhs(expr, next_id, hoisted);
         return;
     }
+    // Top-level sequence with an await, e.g. the minified
+    // `this.l = new L, this.p = await this.l.start();` — see the matching
+    // note in `hoist_awaits_in_expr_full` (issue #5925). Lift the earlier
+    // operands to statements, then re-process the final operand as the new
+    // top-level expression (it may itself be a directly-handled await).
+    if matches!(expr, Expr::Sequence(_)) && expr_contains_await(expr) {
+        lift_sequence_with_await(expr, next_id, hoisted);
+        hoist_awaits_avoiding_top_level(expr, next_id, hoisted);
+        return;
+    }
+    // Top-level awaited obj-IIFE, e.g. `return { v: await p, ...src };` —
+    // see the matching arm in `hoist_awaits_in_expr_full`.
+    if inline_obj_iife_with_await(expr, next_id, hoisted) {
+        return;
+    }
     // Outer is NOT an await. Children may contain awaits which ARE
     // nested — fully hoist them.
     perry_hir::walker::walk_expr_children_mut(expr, &mut |child| {
         hoist_awaits_in_expr_full(child, next_id, hoisted);
     });
+}
+
+/// `{ a: f(), v: await p, ...src }` lowers (lower/expr_object.rs) to a
+/// synthetic single-param IIFE (`__perry_obj_iife`) that builds the object —
+/// which traps a property-value `await` inside a NON-async closure. The
+/// pre-pass (correctly) never descends into closures, so that await stayed
+/// raw and codegen's fallback BLOCKED the frame on the re-entrant microtask
+/// pump — draining unrelated tasks mid-expression (the Next.js Flight
+/// row-reorder: next-intl's provider wrapper has exactly this shape). The
+/// IIFE runs exactly once at its own sequence point and HIR closure bodies
+/// reference enclosing locals by their original ids, so inline it: bind the
+/// seed object to the param's id, replay the body statements in evaluation
+/// order (hoisting their awaits into the enclosing async context), and
+/// replace the call with a read of the object local. Non-await obj-IIFEs
+/// keep the closure form untouched.
+fn inline_obj_iife_with_await(
+    expr: &mut Expr,
+    next_id: &mut LocalId,
+    hoisted: &mut Vec<Stmt>,
+) -> bool {
+    {
+        let Expr::Call { callee, args, .. } = &*expr else {
+            return false;
+        };
+        let Expr::Closure {
+            params,
+            body,
+            is_async,
+            is_generator,
+            ..
+        } = callee.as_ref()
+        else {
+            return false;
+        };
+        if *is_async
+            || *is_generator
+            || params.len() != 1
+            || args.len() != 1
+            || params[0].name != "__perry_obj_iife"
+            || !body_contains_await(body)
+        {
+            return false;
+        }
+    }
+    let Expr::Call { callee, args, .. } = expr else {
+        unreachable!()
+    };
+    let Expr::Closure { params, body, .. } = callee.as_mut() else {
+        unreachable!()
+    };
+    let obj_id = params[0].id;
+    let seed = args.remove(0);
+    hoisted.push(Stmt::Let {
+        id: obj_id,
+        name: "__perry_obj_iife".to_string(),
+        ty: Type::Any,
+        mutable: false,
+        init: Some(seed),
+    });
+    let stmts = std::mem::take(body);
+    for mut stmt in stmts {
+        match &mut stmt {
+            // The synthesized body ends with `return __perry_obj_iife` —
+            // any return terminates the replay.
+            Stmt::Return(_) => break,
+            Stmt::Expr(e) => {
+                hoist_awaits_in_expr_full(e, next_id, hoisted);
+                hoisted.push(stmt);
+            }
+            // Lowered obj-IIFE bodies are flat Expr/Return statements today;
+            // forward anything else untouched.
+            _ => hoisted.push(stmt),
+        }
+    }
+    *expr = Expr::LocalGet(obj_id);
+    true
+}
+
+/// Lift a sequence (comma) expression's non-final operands into statements
+/// pushed onto `hoisted`, leaving `expr` as the final operand (issue #5925).
+///
+/// Each lifted operand is itself fully hoisted first, so awaits inside
+/// earlier operands suspend in evaluation order, before anything in the
+/// final operand. With the operands lifted, the `let __await_N = await …`
+/// the caller hoists for the final operand lands AFTER them — preserving JS
+/// comma semantics (`a = new X, b = await a.m()` must run the assignment
+/// before evaluating `a.m()`), where previously the await jumped the whole
+/// sequence.
+fn lift_sequence_with_await(expr: &mut Expr, next_id: &mut LocalId, hoisted: &mut Vec<Stmt>) {
+    let Expr::Sequence(ops) = expr else {
+        return;
+    };
+    let mut ops = std::mem::take(ops);
+    let Some(last) = ops.pop() else {
+        *expr = Expr::Undefined;
+        return;
+    };
+    for mut op in ops {
+        hoist_awaits_in_expr_full(&mut op, next_id, hoisted);
+        hoisted.push(Stmt::Expr(op));
+    }
+    *expr = last;
 }
 
 /// Returns true if either branch of `expr` (assumed `Expr::Conditional`)
@@ -790,7 +1045,14 @@ fn expr_contains_await(expr: &Expr) -> bool {
     if matches!(expr, Expr::Await(_)) {
         return true;
     }
-    if matches!(expr, Expr::Closure { .. }) {
+    if let Expr::Closure { params, body, .. } = expr {
+        // The synthetic object-with-spread IIFE executes inline at its own
+        // sequence point — an await inside it IS an await of the enclosing
+        // function (`inline_obj_iife_with_await` surfaces it during the
+        // hoist). Every other closure owns its awaits.
+        if params.len() == 1 && params[0].name == "__perry_obj_iife" {
+            return body_contains_await(body);
+        }
         return false;
     }
     let mut found = false;
@@ -800,6 +1062,43 @@ fn expr_contains_await(expr: &Expr) -> bool {
         }
     });
     found
+}
+
+/// Build the per-iteration form for a loop condition containing `await`
+/// (#5933):
+///
+///   while (true) {
+///     let __loop_cond_await_N = <cond>;
+///     if (!__loop_cond_await_N) break;
+///     <body>
+///   }
+///
+/// The caller re-enters the hoist on the result so the awaits inside the
+/// new `let` (a top-level-await-friendly position) and the body are
+/// normalized to statement form INSIDE the loop.
+fn restructure_awaited_loop_cond(cond: Expr, body: Vec<Stmt>, next_id: &mut LocalId) -> Stmt {
+    let t = alloc_local(next_id);
+    let mut new_body = Vec::with_capacity(body.len() + 2);
+    new_body.push(Stmt::Let {
+        id: t,
+        name: format!("__loop_cond_await_{}", t),
+        ty: Type::Any,
+        mutable: true,
+        init: Some(cond),
+    });
+    new_body.push(Stmt::If {
+        condition: Expr::Unary {
+            op: UnaryOp::Not,
+            operand: Box::new(Expr::LocalGet(t)),
+        },
+        then_branch: vec![Stmt::Break],
+        else_branch: None,
+    });
+    new_body.extend(body);
+    Stmt::While {
+        condition: Expr::Bool(true),
+        body: new_body,
+    }
 }
 
 /// Replace `cond ? then_e : else_e` (where then_e or else_e contains an
@@ -1137,7 +1436,10 @@ fn try_strip_promise_resolve(expr: &Expr, non_promise: &HashSet<LocalId>) -> Opt
     if args.len() != 1 {
         return None;
     }
-    let Expr::PropertyGet { object, property } = callee.as_ref() else {
+    let Expr::PropertyGet {
+        object, property, ..
+    } = callee.as_ref()
+    else {
         return None;
     };
     if property != "resolve" {
@@ -1477,7 +1779,17 @@ fn expr_contains_await_shallow(expr: &Expr, found: &mut bool) -> bool {
         *found = true;
         return true;
     }
-    if matches!(expr, Expr::Closure { .. }) {
+    if let Expr::Closure { params, body, .. } = expr {
+        // See `expr_contains_await`: the synthetic object-with-spread IIFE's
+        // awaits belong to the enclosing function — without this, an async
+        // closure whose ONLY awaits sit in an obj-IIFE never enters the
+        // collect work set, stays un-rewritten, and its raw awaits BLOCK the
+        // frame on the busy-wait pump (next-intl's provider wrapper in the
+        // Next.js Flight row-reorder).
+        if params.len() == 1 && params[0].name == "__perry_obj_iife" && body_contains_await(body) {
+            *found = true;
+            return true;
+        }
         return false;
     }
     perry_hir::walker::walk_expr_children(expr, &mut |e| {

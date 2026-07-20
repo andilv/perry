@@ -13,6 +13,10 @@ pub const GC_LAYOUT_STATE_MASK: u16 = 0xC000;
 pub(super) const GC_LAYOUT_UNKNOWN: u16 = 0x0000;
 pub const GC_LAYOUT_POINTER_FREE: u16 = 0x4000;
 pub(crate) const GC_LAYOUT_SIDE_MASK: u16 = 0x8000;
+// A side-layout payload whose entire live prefix contains pointers. Bit 13 is
+// independent from the two high state bits and travels with `_reserved` when
+// copying GC moves the object, avoiding a per-array side-table entry.
+pub(crate) const GC_LAYOUT_ALL_POINTERS: u16 = 0x2000;
 
 // #5093: per-object "typed shape layout intact" flag, stored in a free bit of
 // `GcHeader._reserved` (bit 12; bits 0..11 are object freeze/seal/proto/
@@ -60,6 +64,12 @@ pub(super) fn clear_typed_layout_intact_for_user(user_ptr: usize) {
 pub(super) enum LayoutSlotMask {
     Inline(u64),
     Heap(Vec<u64>),
+    /// Every currently-live slot is pointer-bearing. This is useful for
+    /// runtime-produced arrays such as `String.prototype.split` results: the
+    /// array grows its visible length only after each string has been stored,
+    /// so the collector can visit `0..length` directly without allocating or
+    /// updating a side-table bit for every element.
+    AllPointers,
 }
 
 impl LayoutSlotMask {
@@ -94,6 +104,7 @@ impl LayoutSlotMask {
                 }
                 words[word] |= 1u64 << (slot_index % 64);
             }
+            LayoutSlotMask::AllPointers => {}
         }
     }
 
@@ -116,6 +127,12 @@ impl LayoutSlotMask {
                     }
                 }
             }
+            // `layout_note_slot` must downgrade an all-pointer layout before
+            // clearing a slot, because this variant intentionally stores no
+            // per-slot bitmap from which to reconstruct the remaining set.
+            LayoutSlotMask::AllPointers => {
+                unreachable!("all-pointer layouts must be downgraded before clearing a slot")
+            }
         }
     }
 
@@ -124,6 +141,7 @@ impl LayoutSlotMask {
         match self {
             LayoutSlotMask::Inline(bits) => *bits == 0,
             LayoutSlotMask::Heap(words) => words.iter().all(|&w| w == 0),
+            LayoutSlotMask::AllPointers => false,
         }
     }
 
@@ -165,6 +183,11 @@ impl LayoutSlotMask {
                     }
                 }
             }
+            LayoutSlotMask::AllPointers => {
+                for slot in 0..slot_count {
+                    visit(slot);
+                }
+            }
         }
     }
 
@@ -195,6 +218,7 @@ impl LayoutSlotMask {
                 let word = slot_index / 64;
                 word < words.len() && (words[word] & (1u64 << (slot_index % 64))) != 0
             }
+            LayoutSlotMask::AllPointers => true,
         }
     }
 
@@ -246,6 +270,7 @@ impl LayoutSlotMask {
                 }
                 None
             }
+            LayoutSlotMask::AllPointers => (cursor < slot_count).then_some(cursor),
         }
     }
 }
@@ -274,8 +299,8 @@ pub(super) unsafe fn header_from_user_ptr(user_ptr: *const u8) -> *mut GcHeader 
 
 #[inline]
 pub(super) unsafe fn set_layout_state(header: *mut GcHeader, state: u16) {
-    (*header)._reserved =
-        ((*header)._reserved & !GC_LAYOUT_STATE_MASK) | (state & GC_LAYOUT_STATE_MASK);
+    (*header)._reserved = ((*header)._reserved & !(GC_LAYOUT_STATE_MASK | GC_LAYOUT_ALL_POINTERS))
+        | (state & GC_LAYOUT_STATE_MASK);
 }
 
 #[inline]
@@ -356,6 +381,26 @@ pub(crate) unsafe fn layout_init_pointer_free(user_ptr: *mut u8) {
     header_clear_typed_layout_intact(header);
 }
 
+/// Declare that every currently-live slot of a fresh array-like payload holds
+/// a pointer. Callers must keep `length` at the initialized prefix while the
+/// payload is being filled; the header flag then remains precise across any GC
+/// that runs between element allocations.
+#[inline]
+pub(crate) unsafe fn layout_init_all_pointer_slots(user_ptr: *mut u8) {
+    let Some(header) = layout_header_for_user(user_ptr as usize) else {
+        return;
+    };
+    header_clear_typed_layout_intact(header);
+    TYPED_LAYOUTS.with(|m| {
+        m.borrow_mut().remove(&(user_ptr as usize));
+    });
+    LAYOUT_SLOT_MASKS.with(|m| {
+        m.borrow_mut().remove(&(user_ptr as usize));
+    });
+    set_layout_state(header, GC_LAYOUT_SIDE_MASK);
+    (*header)._reserved |= GC_LAYOUT_ALL_POINTERS;
+}
+
 pub(crate) unsafe fn layout_mark_unknown(user_ptr: *mut u8) {
     let Some(header) = layout_header_for_user(user_ptr as usize) else {
         return;
@@ -397,13 +442,22 @@ pub(crate) fn layout_clear_for_ptr(user_ptr: usize) {
         m.borrow_mut().remove(&user_ptr);
     });
     clear_typed_layout_intact_for_user(user_ptr);
+    if user_ptr >= GC_HEADER_SIZE + 0x1000 {
+        unsafe {
+            (*header_from_user_ptr(user_ptr as *const u8))._reserved &= !GC_LAYOUT_ALL_POINTERS;
+        }
+    }
 }
 
+/// True when `user_ptr`'s object currently has a canonical `TypedLayoutDescriptor`
+/// installed in `TYPED_LAYOUTS`. Reads the O(1) `GC_OBJ_TYPED_LAYOUT_INTACT`
+/// header bit instead of probing the thread-local map: the bit is maintained in
+/// lock-step with every map insert/remove (intact set ⟺ descriptor present — see
+/// the invariant documented on `GC_OBJ_TYPED_LAYOUT_INTACT`), so it answers the
+/// same question without a per-call TLS hashmap touch. This is on the dynamic
+/// object-store hot path via `mark_object_dynamic_shape_unknown` (#5094).
 pub(crate) fn layout_has_typed_descriptor(user_ptr: usize) -> bool {
-    if user_ptr == 0 {
-        return false;
-    }
-    TYPED_LAYOUTS.with(|m| m.borrow().contains_key(&user_ptr))
+    layout_typed_intact_for_user(user_ptr)
 }
 
 pub(super) unsafe fn layout_set_typed_unknown(header: *mut GcHeader, user_ptr: usize) {
@@ -436,25 +490,49 @@ pub(crate) fn layout_note_slot(parent_user: usize, slot_index: usize, value_bits
         if (*header)._reserved & GC_LAYOUT_STATE_MASK == GC_LAYOUT_UNKNOWN {
             return;
         }
-        if let Some(typed) = TYPED_LAYOUTS.with(|m| m.borrow().get(&parent_user).cloned()) {
-            if slot_index >= typed.slot_count {
-                layout_set_typed_unknown(header, parent_user);
-                return;
-            }
-            if typed.raw_f64_mask.contains_slot(slot_index) {
-                if !layout_raw_f64_bits(value_bits) {
+        // The canonical typed-shape descriptor probe below is a thread-local
+        // hashmap lookup, paid on every field/element store. Gate it on the
+        // O(1) `GC_OBJ_TYPED_LAYOUT_INTACT` header bit: that bit is set and
+        // cleared in lock-step with every `TYPED_LAYOUTS` insert/remove (see the
+        // invariant documented on `GC_OBJ_TYPED_LAYOUT_INTACT`), so a clear bit
+        // proves the map has no entry for this object — the probe would return
+        // `None` and fall through to the pointer-mask path below. Skipping it
+        // removes the per-write TLS touch on the common dynamic-shape /
+        // pointer-free object and array store path (#5094). The inner `if let`
+        // still tolerates a `None` defensively, so a transiently desynced bit
+        // can only cost an extra fall-through, never mis-track a slot.
+        if (*header)._reserved & GC_OBJ_TYPED_LAYOUT_INTACT != 0 {
+            if let Some(typed) = TYPED_LAYOUTS.with(|m| m.borrow().get(&parent_user).cloned()) {
+                if slot_index >= typed.slot_count {
                     layout_set_typed_unknown(header, parent_user);
+                    return;
+                }
+                if typed.raw_f64_mask.contains_slot(slot_index) {
+                    if !layout_raw_f64_bits(value_bits) {
+                        layout_set_typed_unknown(header, parent_user);
+                    }
+                    return;
+                }
+                let pointer = layout_pointer_bearing_bits(value_bits);
+                if pointer && !typed.pointer_mask.contains_slot(slot_index) {
+                    layout_set_typed_unknown(header, parent_user);
+                    return;
                 }
                 return;
             }
-            let pointer = layout_pointer_bearing_bits(value_bits);
-            if pointer && !typed.pointer_mask.contains_slot(slot_index) {
-                layout_set_typed_unknown(header, parent_user);
-                return;
-            }
-            return;
         }
         let pointer = layout_pointer_bearing_bits(value_bits);
+        // A result array built by a runtime helper can declare that its live
+        // prefix is pointer-only once, instead of growing a HashMap-backed
+        // bitmap for every inserted element. Runtime construction bypasses
+        // this generic write path; any later ordinary array write may create
+        // holes or replace an element, so conservatively fall back to the
+        // generic scan path regardless of the stored value.
+        let all_pointer_layout = (*header)._reserved & GC_LAYOUT_ALL_POINTERS != 0;
+        if all_pointer_layout {
+            layout_mark_unknown(parent_user as *mut u8);
+            return;
+        }
         if !pointer && (*header)._reserved & GC_LAYOUT_STATE_MASK == GC_LAYOUT_POINTER_FREE {
             return;
         }
@@ -763,7 +841,11 @@ pub(crate) unsafe fn layout_transfer(old_user: *mut u8, new_user: *mut u8) {
         return;
     };
     let state = (*old_header)._reserved & GC_LAYOUT_STATE_MASK;
+    let all_pointers = (*old_header)._reserved & GC_LAYOUT_ALL_POINTERS != 0;
     set_layout_state(new_header, state);
+    if all_pointers {
+        (*new_header)._reserved |= GC_LAYOUT_ALL_POINTERS;
+    }
     if (*old_header).obj_type == GC_TYPE_ARRAY && (*new_header).obj_type == GC_TYPE_ARRAY {
         crate::array::transfer_array_numeric_layout(old_user as usize, new_user as usize);
     } else {
@@ -810,6 +892,12 @@ pub(super) fn layout_visit_pointer_slots<F: FnMut(usize)>(
         match (*header)._reserved & GC_LAYOUT_STATE_MASK {
             GC_LAYOUT_POINTER_FREE => true,
             GC_LAYOUT_SIDE_MASK => {
+                if (*header)._reserved & GC_LAYOUT_ALL_POINTERS != 0 {
+                    for slot in 0..slot_count {
+                        visit(slot);
+                    }
+                    return true;
+                }
                 let mask = LAYOUT_SLOT_MASKS.with(|m| m.borrow().get(&user_ptr).cloned());
                 let Some(mask) = mask else {
                     set_layout_state(header, GC_LAYOUT_UNKNOWN);
@@ -1074,6 +1162,14 @@ pub(super) unsafe fn heap_payload_slot_selection(
             raw_numeric_object_slots,
         },
         GC_LAYOUT_SIDE_MASK => {
+            if (*header)._reserved & GC_LAYOUT_ALL_POINTERS != 0 {
+                return HeapPayloadSlotSelection::Masked {
+                    mask: LayoutSlotMask::AllPointers,
+                    cursor: 0,
+                    raw_numeric_object_slots,
+                    raw_numeric_recorded: false,
+                };
+            }
             let mask = LAYOUT_SLOT_MASKS.with(|m| m.borrow().get(&user_ptr).cloned());
             match mask {
                 Some(mask) => HeapPayloadSlotSelection::Masked {
@@ -1315,7 +1411,13 @@ pub(super) unsafe fn visit_gc_rewrite_slot_descriptors(
             let map = user_ptr as *mut crate::map::MapHeader;
             let size = (*map).size;
             let capacity = (*map).capacity;
-            if size > capacity || size > 100_000 || (*map).entries.is_null() {
+            // Corruption guard only: mirror Set's 16M bound (set.rs
+            // gc_element_slot_range). Every GC walk (mark, copy, rewrite,
+            // dirty-scan, verify) funnels through this descriptor, so a
+            // lower cap makes larger maps invisible to the collector —
+            // entries reachable only through a >cap map would be swept
+            // while live and never rewritten after a move.
+            if size > capacity || size > 16_000_000 || (*map).entries.is_null() {
                 return;
             }
             visit(GcMutableSlotDescriptor::Range {

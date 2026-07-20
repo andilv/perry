@@ -139,7 +139,7 @@ pub extern "C" fn js_stream_handle_kind(id: usize) -> u8 {
 /// `js_handle_method_dispatch` with a bare numeric handle.
 ///
 /// Because every Web Streams handle now lives in one shared id space based at
-/// `STREAM_HANDLE_ID_START` (see `NEXT_STREAM_ID`), the handle is (a)
+/// `STREAM_HANDLE_ID_START` (see `idalloc::next_stream_id`), the handle is (a)
 /// recognisable by range and (b) present in exactly one of the five registries,
 /// so routing by
 /// `(registry-membership, method-name)` is unambiguous and can never collide
@@ -412,6 +412,8 @@ pub fn drain_readable_into_bytes(stream_id: usize) -> Vec<u8> {
                 None => break,
             }
         };
+        // Consumer progress: release transform writes parked on backpressure.
+        unsafe { super::transform::transform_release_writes(stream_id) };
         let mut got_chunk = false;
         for chunk in chunks {
             unsafe {

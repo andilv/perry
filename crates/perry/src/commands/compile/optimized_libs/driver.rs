@@ -432,13 +432,13 @@ pub(crate) fn build_optimized_libs(
     }
     // perry-stdlib unconditionally re-bundles perry-updater (so user code
     // calling `perry/updater` resolves at link time without extra wiring).
-    // perry-updater's `perry_updater_verify_signature_v2` references the
-    // extern `js_crypto_ed25519_verify`, which lives in perry-stdlib's
-    // crypto module — gated by `#[cfg(feature = "crypto")]`. With
-    // --no-default-features the symbol is absent and the link fails on
-    // every program (regardless of whether the user touched crypto APIs).
-    // Force `crypto` on whenever the auto-optimize path rebuilds stdlib
-    // so the bundled updater always has a resolvable target.
+    // perry-updater used to reference the extern `js_crypto_ed25519_verify`
+    // from perry-stdlib's `crypto` feature, which is why `crypto` is forced
+    // on here. The updater now verifies in-crate via ed25519-dalek (the
+    // extern is gone — it broke the Windows CLI link, LNK2019), so this
+    // force is no longer load-bearing for the updater; it is kept
+    // conservatively until the no-crypto auto-optimize path is audited
+    // separately for other stragglers.
     features.insert("crypto");
     let feature_arg = features_to_cargo_arg(&features);
 
@@ -583,8 +583,18 @@ pub(crate) fn build_optimized_libs(
     };
     let runtime_path = release_dir.join(runtime_name);
     let stdlib_path = release_dir.join(stdlib_name);
-    let build_stamp =
-        auto_optimized_build_stamp(&key_input, target, &cross_features, &tokio_using_bindings);
+    // Content fingerprint of the sources that land in the archives — makes the
+    // stamp (and therefore the freshness gate) immune to mtime scrambling from
+    // cache restores / fresh checkouts (#5892 layer 2, #5778 warm-cache trap).
+    let source_fingerprint =
+        auto_optimized_source_fingerprint(&workspace_root, &tokio_using_bindings);
+    let build_stamp = auto_optimized_build_stamp(
+        &key_input,
+        target,
+        &cross_features,
+        &tokio_using_bindings,
+        &source_fingerprint,
+    );
     let build_stamp_path = target_dir.join(".perry-auto-build.stamp");
 
     // Closes #25 (the v0.5.384 NJOBS 6->3 retreat): serialize parallel
@@ -760,11 +770,29 @@ pub(crate) fn build_optimized_libs(
     // and cargo correctly reuses incremental artifacts that were built with
     // the same RUSTFLAGS. The hash-keyed CARGO_TARGET_DIR keeps builds with
     // distinct flag sets from clobbering each other's cache.
-    let mut rustflags: Vec<&str> = Vec::new();
+    let mut rustflags: Vec<String> = Vec::new();
     if panic_abort_safe {
         // Override the workspace profile's `panic = "unwind"` for the
         // duration of this invocation.
-        rustflags.push("-C panic=abort");
+        rustflags.push("-C panic=abort".to_string());
+    }
+    // #6125: pin the Rust-side CPU baseline to the same PERRY_TARGET_CPU
+    // knob codegen's clang invocation honors, so the rebuilt runtime/stdlib
+    // (which is what runs before the app's first print — exactly where the
+    // reported SIGILLs landed) obeys the requested portable baseline too.
+    // A `generic`-family value adds no flag but still forces RUSTFLAGS to be
+    // set explicitly below, so an ambient `-C target-cpu=native` (shell rc,
+    // CI image, build-server environment) can't leak the build box's ISA
+    // into libraries that ship to other machines.
+    let requested_cpu = std::env::var("PERRY_TARGET_CPU")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(cpu) = &requested_cpu {
+        match cpu.as_str() {
+            "generic" | "off" | "none" | "0" | "false" => {}
+            cpu => rustflags.push(format!("-C target-cpu={cpu}")),
+        }
     }
     // #1529 — Android loads `libperry_app.so` via `dlopen` at runtime
     // (PerryActivity's System.loadLibrary), but Rust's default TLS model for
@@ -779,9 +807,14 @@ pub(crate) fn build_optimized_libs(
         target,
         Some("android") | Some("android-x86_64") | Some("wearos")
     ) {
-        rustflags.push(android_global_dynamic_tls_rustflag(&mut cargo_cmd));
+        rustflags.push(android_global_dynamic_tls_rustflag(&mut cargo_cmd).to_string());
     }
-    if !rustflags.is_empty() {
+    // Set RUSTFLAGS whenever we have flags to pass, and also whenever a CPU
+    // baseline was requested at all (#6125): explicitly setting the env var —
+    // even to a flag list without a `-C target-cpu` — overrides any inherited
+    // RUSTFLAGS from the parent environment, which is exactly the isolation a
+    // pinned-baseline build needs.
+    if !rustflags.is_empty() || requested_cpu.is_some() {
         cargo_cmd.env("RUSTFLAGS", rustflags.join(" "));
     }
 
@@ -910,6 +943,17 @@ pub(crate) fn build_optimized_libs(
             bc_rustflags.push_str("-C panic=abort ");
         }
         bc_rustflags.push_str("-C codegen-units=1");
+        // #6125: the bitcode-LTO path must obey the same CPU baseline as the
+        // staticlib build above, or the LTO'd binary re-imports the build
+        // box's ISA through the runtime bitcode.
+        if let Some(cpu) = &requested_cpu {
+            match cpu.as_str() {
+                "generic" | "off" | "none" | "0" | "false" => {}
+                cpu => {
+                    bc_rustflags.push_str(&format!(" -C target-cpu={cpu}"));
+                }
+            }
+        }
 
         let emit_bc = |crate_name: &str| -> Option<PathBuf> {
             let mut cmd = Command::new("cargo");
@@ -1059,7 +1103,7 @@ pub(crate) fn build_optimized_libs(
         runtime_bc,
         stdlib_bc,
         extra_bc,
+        prefer_well_known_before_stdlib: !well_known_libs.is_empty(),
         well_known_libs,
-        prefer_well_known_before_stdlib: false,
     }
 }

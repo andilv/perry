@@ -70,7 +70,8 @@ pub fn arena_alloc_gc_longlived(size: usize, align: usize, obj_type: u8) -> *mut
     unsafe {
         let header = raw as *mut GcHeader;
         (*header).obj_type = obj_type;
-        (*header).gc_flags = GC_FLAG_ARENA;
+        (*header).gc_flags = GC_FLAG_ARENA | crate::gc::gc_birth_extra_flags();
+        crate::gc::gc_note_black_birth(header);
         (*header)._reserved = 0;
         (*header).size = total as u32;
     }
@@ -120,7 +121,8 @@ pub fn arena_alloc_gc_old(size: usize, align: usize, obj_type: u8) -> *mut u8 {
     unsafe {
         let header = raw as *mut GcHeader;
         (*header).obj_type = obj_type;
-        (*header).gc_flags = GC_FLAG_ARENA;
+        (*header).gc_flags = GC_FLAG_ARENA | crate::gc::gc_birth_extra_flags();
+        crate::gc::gc_note_black_birth(header);
         (*header)._reserved = 0;
         (*header).size = total as u32;
     }
@@ -144,7 +146,8 @@ pub(crate) fn arena_alloc_gc_old_excluding_pages(
     unsafe {
         let header = raw as *mut GcHeader;
         (*header).obj_type = obj_type;
-        (*header).gc_flags = GC_FLAG_ARENA;
+        (*header).gc_flags = GC_FLAG_ARENA | crate::gc::gc_birth_extra_flags();
+        crate::gc::gc_note_black_birth(header);
         (*header)._reserved = 0;
         (*header).size = total as u32;
     }
@@ -191,7 +194,8 @@ pub(crate) fn arena_alloc_gc_survivor(size: usize, align: usize, obj_type: u8) -
     unsafe {
         let header = raw as *mut GcHeader;
         (*header).obj_type = obj_type;
-        (*header).gc_flags = GC_FLAG_ARENA;
+        (*header).gc_flags = GC_FLAG_ARENA | crate::gc::gc_birth_extra_flags();
+        crate::gc::gc_note_black_birth(header);
         (*header)._reserved = 0;
         (*header).size = total as u32;
     }
@@ -268,7 +272,8 @@ pub fn arena_alloc_gc(size: usize, align: usize, obj_type: u8) -> *mut u8 {
         unsafe {
             let header = user_ptr.sub(GC_HEADER_SIZE) as *mut GcHeader;
             (*header).obj_type = obj_type;
-            (*header).gc_flags = GC_FLAG_ARENA;
+            (*header).gc_flags = GC_FLAG_ARENA | crate::gc::gc_birth_extra_flags();
+            crate::gc::gc_note_black_birth(header);
             (*header)._reserved = 0;
             // size field already set from original allocation
         }
@@ -299,7 +304,8 @@ pub fn arena_alloc_gc(size: usize, align: usize, obj_type: u8) -> *mut u8 {
     unsafe {
         let header = raw as *mut GcHeader;
         (*header).obj_type = obj_type;
-        (*header).gc_flags = GC_FLAG_ARENA;
+        (*header).gc_flags = GC_FLAG_ARENA | crate::gc::gc_birth_extra_flags();
+        crate::gc::gc_note_black_birth(header);
         (*header)._reserved = 0;
         (*header).size = total as u32;
     }

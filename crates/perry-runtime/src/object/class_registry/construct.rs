@@ -784,6 +784,28 @@ pub unsafe extern "C" fn js_new_function_construct(
                 let encoder = crate::text::js_text_encoder_new();
                 return crate::value::js_nanbox_pointer(encoder);
             }
+            // `new P(executor)` where `P` holds the global Promise constructor
+            // VALUE (`const P = Promise;` / a polyfill alias). Without this arm
+            // the match fell through to the closure fallback, which CALLED
+            // `promise_constructor_call_thunk` as a plain function — throwing
+            // "Constructor Promise requires 'new'". Route to the same executor
+            // construction as the static literal lowering.
+            "Promise" => {
+                let executor = args
+                    .first()
+                    .copied()
+                    .unwrap_or_else(|| f64::from_bits(crate::value::TAG_UNDEFINED));
+                let bits = executor.to_bits();
+                let exec_ptr = if (bits & crate::value::TAG_MASK) == crate::value::POINTER_TAG {
+                    (bits & crate::value::POINTER_MASK) as *const crate::closure::ClosureHeader
+                } else {
+                    // Non-callable executor: `js_promise_new_with_executor`
+                    // validates and throws the spec TypeError synchronously.
+                    std::ptr::null()
+                };
+                let promise = crate::promise::js_promise_new_with_executor(exec_ptr);
+                return crate::value::js_nanbox_pointer(promise as i64);
+            }
             "TextDecoder" => {
                 let label = args
                     .first()
@@ -845,7 +867,10 @@ pub unsafe extern "C" fn js_new_function_construct(
             crate::value::JSValue::from_bits(func_value.to_bits()).as_pointer::<ObjectHeader>();
         let class_cid = js_object_get_class_id(obj);
         if class_cid != 0 {
-            let inst = js_object_alloc(class_cid, 0);
+            let inst = js_object_alloc(
+                class_cid,
+                crate::object::learned_inline_field_count(class_cid),
+            );
             // Replay the class's registered constructor (instance-field
             // initializers + body) on the fresh instance, filling the
             // capture params from the snapshotted `__perry_ctor_caps`. The
@@ -891,7 +916,9 @@ pub unsafe extern "C" fn js_new_function_construct(
     // constructor body fills `this.<field>` writes through
     // PropertySet, and prototype-method dispatch consults the
     // synthetic class id's entry in CLASS_PROTOTYPE_METHODS.
-    let obj_ptr = js_object_alloc(cid, 0);
+    // Learned inline sizing: a class that overflowed once pre-sizes every
+    // later instance so all its fields land inline (object/mod.rs).
+    let obj_ptr = js_object_alloc(cid, crate::object::learned_inline_field_count(cid));
     let nan_boxed = crate::value::js_nanbox_pointer(obj_ptr as i64);
     // A user-assigned `foo.prototype = <obj/array>` lives as the closure's
     // "prototype" dynamic prop; the instance's [[Prototype]] must be THAT
@@ -927,7 +954,7 @@ pub unsafe extern "C" fn js_new_function_construct(
                         )
                     });
                 if has_user_proto {
-                    super::super::prototype_chain::object_set_static_prototype(
+                    super::super::prototype_chain::object_link_class_default_prototype(
                         obj_ptr as usize,
                         dyn_proto.to_bits(),
                     );
@@ -939,7 +966,7 @@ pub unsafe extern "C" fn js_new_function_construct(
     if !linked_user_proto {
         let proto = ensure_function_prototype_object(func_value, cid);
         if !proto.is_null() {
-            super::super::prototype_chain::object_set_static_prototype(
+            super::super::prototype_chain::object_link_class_default_prototype(
                 obj_ptr as usize,
                 crate::value::js_nanbox_pointer(proto as i64).to_bits(),
             );
@@ -1158,7 +1185,7 @@ fn bound_function_target_ptr(value: f64) -> Option<*mut crate::closure::ClosureH
     }
 }
 
-fn is_bound_function_closure_value(value: f64) -> bool {
+pub(crate) fn is_bound_function_closure_value(value: f64) -> bool {
     bound_function_target_ptr(value).is_some()
 }
 
@@ -1248,6 +1275,34 @@ fn new_target_class_id(new_target: f64) -> Option<u32> {
     constructor_class_ref_id(new_target).or_else(|| class_object_class_id(new_target))
 }
 
+/// True when class `cid` (or an ancestor) `extends Promise` — its registered
+/// dynamic-parent value resolves to the intrinsic `Promise` constructor. Used to
+/// run `js_promise_subclass_init` on the dynamic (runtime) `new Subclass(exec)`
+/// path, where codegen's `super()` Promise branch never emitted the init (e.g.
+/// `NewPromiseCapability(Subclass)` inside a combinator, which calls the runtime
+/// `js_new_function_construct` directly rather than a compiled `new`).
+pub(crate) fn promise_parent_in_chain(class_id: u32) -> bool {
+    let mut cid = class_id;
+    let mut depth = 0u32;
+    while depth < 32 && cid != 0 {
+        let parent_val = js_get_dynamic_parent_value(cid);
+        if matches!(
+            identify_global_builtin_constructor(parent_val),
+            Some("Promise")
+        ) {
+            return true;
+        }
+        match get_parent_class_id(cid) {
+            Some(p) if p != 0 && p != cid => {
+                cid = p;
+                depth += 1;
+            }
+            _ => break,
+        }
+    }
+    false
+}
+
 unsafe fn construct_registered_class_ref(
     target_cid: u32,
     instance_cid: u32,
@@ -1258,7 +1313,10 @@ unsafe fn construct_registered_class_ref(
     let inst = if let Some((keys_array, field_count)) = registered_class_keys_array(instance_cid) {
         js_object_alloc_class_inline_keys(instance_cid, 0, field_count, keys_array)
     } else {
-        js_object_alloc(instance_cid, 0)
+        js_object_alloc(
+            instance_cid,
+            crate::object::learned_inline_field_count(instance_cid),
+        )
     };
     // #2768: a registered-class constructor reached through this path — static
     // `new ClassName()`, a first-class ClassRef `new`, or `Reflect.construct`
@@ -1291,6 +1349,20 @@ unsafe fn construct_registered_class_ref(
     if let Some(kind) = fetch_parent_kind_in_chain(target_cid) {
         if super::super::field_get_set::fetch_subclass_handle_id(inst as usize).is_none() {
             super::super::attach_fetch_handle_for_construction(inst, kind, args_ptr, args_len);
+        }
+    }
+    // ClassRef `new` of a Promise subclass — run the Promise constructor against
+    // a hidden backing cell (only when the compiled ctor's `super()` didn't
+    // already attach one). `NewPromiseCapability(Subclass)` reaches here.
+    if promise_parent_in_chain(target_cid) {
+        let inst_val = crate::value::js_nanbox_pointer(inst as i64);
+        if crate::promise::subclass_backing_promise(inst_val).is_none() {
+            let executor = if args_len >= 1 && !args_ptr.is_null() {
+                *args_ptr
+            } else {
+                f64::from_bits(crate::value::TAG_UNDEFINED)
+            };
+            crate::promise::js_promise_subclass_init(inst_val, executor);
         }
     }
     crate::value::js_nanbox_pointer(inst as i64)
@@ -1396,6 +1468,27 @@ pub unsafe extern "C" fn js_new_function_construct_with_new_target(
     // `Object.getPrototypeOf` and `.constructor` resolve through it (test262
     // `ctors*/use-custom-proto-if-object` / `use-default-proto-if-…`).
     if let Some(ta_name) = identify_global_builtin_constructor(func_value) {
+        // `Reflect.construct(Date, args, newTarget)` (#5989) — Next.js 16's
+        // cacheComponents Date extension constructs through exactly this
+        // shape: its installed wrapper runs
+        // `Reflect.construct(OriginalDate, arguments, new.target)`. The
+        // generic tail below allocates a PLAIN object and invokes the Date
+        // thunk against it, yielding an unbranded date (`getTime()` broken /
+        // "Invalid Date"). Build the real branded Date, then honor
+        // `GetPrototypeFromConstructor(newTarget)` like the typed-array arm
+        // below so `instanceof newTarget` and subclass prototypes hold.
+        if ta_name == "Date" {
+            let proto_bits = new_target_custom_object_prototype(nt);
+            let result = js_new_function_construct(func_value, args_ptr, args_len);
+            if let Some(proto_bits) = proto_bits {
+                let jv = crate::value::JSValue::from_bits(result.to_bits());
+                if jv.is_pointer() {
+                    let addr = (jv.bits() & crate::value::POINTER_MASK) as usize;
+                    super::super::prototype_chain::object_set_static_prototype(addr, proto_bits);
+                }
+            }
+            return result;
+        }
         if matches!(
             ta_name,
             "Int8Array"
@@ -1464,7 +1557,9 @@ pub unsafe extern "C" fn js_new_function_construct_with_new_target(
     // the synthetic per-function id applies. (The real `[[Prototype]]` link is
     // still set below from `newTarget.prototype`.)
     let cid = new_target_class_id(nt).unwrap_or_else(|| synthetic_class_id_for_function(nt));
-    let obj_ptr = js_object_alloc(cid, 0);
+    // Learned inline sizing: a class that overflowed once pre-sizes every
+    // later instance so all its fields land inline (object/mod.rs).
+    let obj_ptr = js_object_alloc(cid, crate::object::learned_inline_field_count(cid));
     let nan_boxed = crate::value::js_nanbox_pointer(obj_ptr as i64);
     if let Some(proto_bits) = constructor_prototype_bits(nt) {
         super::super::prototype_chain::object_set_static_prototype(obj_ptr as usize, proto_bits);

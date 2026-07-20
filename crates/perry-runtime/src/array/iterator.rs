@@ -73,6 +73,22 @@ pub extern "C" fn js_for_of_to_array(val_f64: f64) -> f64 {
         return js_nanbox_pointer(arr_i64);
     }
 
+    // #6454: a class DECLARATION is an INT32-tagged ClassRef whose low bits are
+    // the class id — `js_nanbox_get_pointer` below would misread that id as a
+    // heap address and the GC-header sniff would dereference `id - 8`. Resolve
+    // its (possibly inherited, #36/#321) `[Symbol.iterator]` and drive it;
+    // a class with none is not iterable, exactly like node
+    // (`for (const x of Plain) {}` → TypeError). Must run BEFORE the raw-pointer
+    // logic below.
+    if crate::object::class_ref_id(val_f64).is_some() {
+        if crate::symbol::class_ref_resolves_iterator(val_f64) {
+            let iter = crate::symbol::js_get_iterator(val_f64);
+            let arr = js_iterator_to_array(iter);
+            return js_nanbox_pointer(arr as i64);
+        }
+        throw_not_iterable(val_f64);
+    }
+
     // Non-pointer scalars (number/bool/null/undefined/symbol) are not
     // iterable. Per ECMA-262 §13.7.5.13 (ForIn/OfHeadEvaluation →
     // GetIterator → ToObject/GetMethod) these MUST throw a TypeError:
@@ -703,6 +719,18 @@ pub(crate) fn array_from_spread_value(value: f64) -> *mut ArrayHeader {
         return crate::string::js_string_to_char_array(str_bits as i64) as *mut ArrayHeader;
     }
 
+    // #6454: `[...SomeClass]` / `fn(...SomeClass)` on a class DECLARATION — an
+    // INT32-tagged ClassRef. Drive its (possibly inherited) `[Symbol.iterator]`;
+    // with none it is not iterable, like node. Must run before the raw-pointer
+    // reads below, which would misread the class id as a heap address.
+    if crate::object::class_ref_id(value).is_some() {
+        if crate::symbol::class_ref_resolves_iterator(value) {
+            let iter = crate::symbol::js_get_iterator(value);
+            return js_iterator_to_array(iter);
+        }
+        throw_not_iterable(value);
+    }
+
     let raw_ptr = js_nanbox_get_pointer(value) as usize;
     if raw_ptr == 0 {
         throw_not_iterable(value);
@@ -734,6 +762,19 @@ pub(crate) fn array_from_spread_value(value: f64) -> *mut ArrayHeader {
             return crate::set::js_set_to_array(s as *const crate::set::SetHeader);
         }
         None => {}
+    }
+    // `class X extends Array` instance — object-backed; spread (`[...sub]`,
+    // `fn(...sub)`) over a dense snapshot of its indexed elements. The generic
+    // `[Symbol.iterator]` lookup below would resolve the inherited array
+    // iterator, which misreads the plain object as a dense `ArrayHeader`.
+    // Matches the Map/Set-subclass branch above. Skipped when the subclass
+    // declared its own `[Symbol.iterator]`, so the override drives the spread
+    // via the generic symbol lookup below.
+    if crate::array::is_array_subclass_instance(value)
+        && !crate::array::array_subclass_has_iterator_override(value)
+    {
+        let snap = crate::array::array_subclass_dense_snapshot(value);
+        return crate::value::js_nanbox_get_pointer(snap) as *mut ArrayHeader;
     }
     if crate::typedarray::lookup_typed_array_kind(raw_ptr).is_some() {
         return crate::typedarray::typed_array_to_array(

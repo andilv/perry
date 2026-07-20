@@ -34,6 +34,7 @@ pub(crate) unsafe fn set_symbol_accessor_property(
     if obj_key == 0 || sym_key == 0 {
         return;
     }
+    crate::symbol::note_symbol_key_installed(sym_key);
     {
         let mut props = crate::gc::lock_gc_root_registry(&SYMBOL_PROPERTIES);
         if let Some(map) = props.as_mut() {
@@ -132,6 +133,49 @@ pub(super) fn scan_symbol_accessor_roots_mut(visitor: &mut crate::gc::RuntimeRoo
     for (old_key, new_key) in rewrites {
         if let Some(acc) = map.remove(&old_key) {
             map.insert(new_key, acc);
+        }
+    }
+}
+
+/// Snapshot of the accessor table's keys for the budgeted step scanner.
+pub(super) fn accessor_property_keys() -> Vec<(usize, usize)> {
+    let guard = crate::gc::lock_gc_root_registry(&SYMBOL_ACCESSOR_PROPERTIES);
+    guard
+        .as_ref()
+        .map(|m| m.keys().copied().collect())
+        .unwrap_or_default()
+}
+
+/// Step twin of `scan_symbol_accessor_roots_mut` for one snapshot key:
+/// strong-visits the get/set closures and rekeys owner/sym on a move.
+/// Cycle-based collections run ONLY the step scanner, so before this
+/// existed, symbol-keyed getter/setter closures reachable solely through
+/// this table were swept by every full/fallback collection.
+pub(super) fn scan_symbol_accessor_root_slot(
+    visitor: &mut crate::gc::RuntimeRootVisitor<'_>,
+    owner: usize,
+    sym_key: usize,
+) {
+    let mut guard = crate::gc::lock_gc_root_registry(&SYMBOL_ACCESSOR_PROPERTIES);
+    let Some(map) = guard.as_mut() else {
+        return;
+    };
+    let Some(acc) = map.get_mut(&(owner, sym_key)) else {
+        return;
+    };
+    let mut new_owner = owner;
+    let mut new_sym_key = sym_key;
+    let owner_changed = visitor.visit_metadata_usize_slot(&mut new_owner) && new_owner != owner;
+    let sym_changed = visitor.visit_usize_slot(&mut new_sym_key) && new_sym_key != sym_key;
+    if acc.get != 0 {
+        visitor.visit_nanbox_u64_slot(&mut acc.get);
+    }
+    if acc.set != 0 {
+        visitor.visit_nanbox_u64_slot(&mut acc.set);
+    }
+    if owner_changed || sym_changed {
+        if let Some(acc) = map.remove(&(owner, sym_key)) {
+            map.insert((new_owner, new_sym_key), acc);
         }
     }
 }

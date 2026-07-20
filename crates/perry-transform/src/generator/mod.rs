@@ -18,6 +18,7 @@ mod id_scan;
 mod iter_result_rewrite;
 mod linearize;
 mod lower;
+mod per_iteration;
 mod rewrite_returns;
 
 // Explicit named re-exports so siblings can reach each other via
@@ -26,7 +27,8 @@ mod rewrite_returns;
 pub(crate) use break_continue::{
     body_contains_yield, collect_hoisted_vars, fix_break_continue_sentinels,
     fix_break_continue_sentinels_in_catches, fix_break_continue_sentinels_in_stmts,
-    fix_placeholder_state, rewrite_break_continue_in_stmts,
+    fix_placeholder_state, prefix_loop_continues, rewrite_break_continue_in_stmts,
+    stmts_have_continue_inside_try_finally,
 };
 pub(crate) use helpers::{
     alloc_local, make_iter_result, rewrite_hoisted_lets_in_stmts, wrap_returns_in_promise,
@@ -39,6 +41,10 @@ pub(crate) use linearize::{
 };
 pub(crate) use lower::{
     transform_generator_function, transform_generator_function_with_extra_captures,
+};
+pub(crate) use per_iteration::{
+    collect_per_iteration_ids, collect_written_suspended_loop_captures,
+    rewrite_written_captures_to_cells, snapshot_suspended_loop_captures,
 };
 pub(crate) use rewrite_returns::{
     body_contains_return, prepend_done_before_returns, rewrite_catch_returns_to_iter_result,

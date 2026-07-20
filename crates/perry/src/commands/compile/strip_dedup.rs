@@ -268,6 +268,53 @@ fn collect_archive_symbols_flat(
         .unwrap_or_default()
 }
 
+/// Flat union of every *external* symbol defined anywhere in the archive.
+/// Distinct from [`collect_archive_symbols_flat`], which includes local
+/// definitions: a local definition cannot satisfy a cross-object reference,
+/// so callers deciding "can this reference resolve from that archive
+/// instead?" must use this variant.
+fn collect_archive_global_symbols_flat(
+    llvm_nm: &Path,
+    archive: &Path,
+) -> std::collections::HashSet<String> {
+    let out = match Command::new(llvm_nm)
+        .arg("--defined-only")
+        .arg("--extern-only")
+        .arg("--format=bsd")
+        .arg(archive)
+        .output()
+    {
+        Ok(out) if out.status.success() => out,
+        _ => return Default::default(),
+    };
+    parse_nm_archive_output(&String::from_utf8_lossy(&out.stdout))
+        .into_values()
+        .flatten()
+        .collect()
+}
+
+/// Run `nm --undefined-only` on an archive and parse the output into a
+/// per-member map of the symbols each member *references* but does not define.
+/// Same parse as [`collect_archive_symbols_by_member`]; returns `None` if nm
+/// fails so callers can fall back to keeping the archive untouched.
+fn collect_archive_undefined_by_member(
+    llvm_nm: &Path,
+    archive: &Path,
+) -> Option<std::collections::HashMap<String, std::collections::HashSet<String>>> {
+    let out = Command::new(llvm_nm)
+        .arg("--undefined-only")
+        .arg("--format=bsd")
+        .arg(archive)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(parse_nm_archive_output(&String::from_utf8_lossy(
+        &out.stdout,
+    )))
+}
+
 /// On Windows, build a trimmed UI lib using the rlib (not staticlib).
 ///
 /// perry-ui-windows builds as both rlib and staticlib. The staticlib bundles
@@ -797,422 +844,518 @@ pub(super) fn strip_duplicate_objects_from_well_known_lib(lib_path: &PathBuf) ->
     Ok(trimmed_lib)
 }
 
-/// Symbols defined by perry-runtime's `stdlib_stubs` module (the
-/// `#[cfg(not(feature = "stdlib"))]` no-op fallbacks). The standalone
-/// `perry_runtime.lib` ships with these so runtime-only Windows builds still
-/// link; perry-stdlib provides the real implementations. Keep in sync with
-/// `crates/perry-runtime/src/stdlib_stubs.rs`.
-const STDLIB_STUB_SYMBOLS: &[&str] = &[
-    // stdlib dispatch (wires the fetch/ws main-thread pumps)
-    "js_stdlib_init_dispatch",
-    "js_stdlib_process_pending",
-    // global fetch / Response / Request / Headers / Blob (#5000)
-    "js_fetch_with_options",
-    "js_blob_new",
-    "js_headers_new",
-    "js_headers_init_from_value",
-    "js_request_new",
-    "js_response_new",
-    "js_response_static_json",
-    "js_response_static_redirect",
-    "js_response_static_error",
-    // WebSocket
-    "js_ws_connect",
-    "js_ws_connect_start",
-    "js_ws_send",
-    "js_ws_close",
-    "js_ws_is_open",
-    "js_ws_message_count",
-    "js_ws_receive",
-    "js_ws_wait_for_message",
-    "js_ws_on",
-    "js_ws_server_new",
-    "js_ws_server_close",
-    "js_ws_process_pending",
-    // readline (#347)
-    "js_readline_set_raw_mode",
-    "js_readline_stdin_on",
-    "js_readline_stdin_remove_listener",
-    "js_readline_stdin_pause",
-    "js_readline_stdin_resume",
-    "js_readline_stdin_unref",
-    "js_readline_stdin_ref",
-    "js_readline_stdin_destroy",
-];
-
-/// Locate an LLVM binutil, falling back to the directory that holds the
-/// resolved `lld-link`. `find_llvm_tool` already covers the env-var /
-/// rust-sysroot / PATH cases; a prebuilt install (no Rust toolchain) whose
-/// `C:\Program Files\LLVM\bin` is on none of those still resolves lld-link via
-/// [`find_lld_link`]'s standard-location probe, and llvm-ar / llvm-nm /
-/// llvm-objcopy live right beside it.
-fn find_llvm_tool_or_beside_lld(tool: &str) -> Option<PathBuf> {
-    if let Some(p) = find_llvm_tool(tool).or_else(|| find_path_tool(tool)) {
-        return Some(p);
-    }
-    let lld = find_lld_link()?;
-    let dir = lld.parent()?;
-    let candidate = dir.join(format!("{tool}{}", std::env::consts::EXE_SUFFIX));
-    candidate.is_file().then_some(candidate)
-}
-
-/// #5000 — localize perry-runtime's `stdlib_stubs` no-op symbols in the
-/// standalone Windows runtime archive so perry-stdlib's real
-/// fetch / WebSocket / readline / dispatch implementations win the link.
+/// Drop a well-known wrapper's bundled `perry_runtime-*` codegen unit(s) when
+/// the perry-stdlib archive that follows on the link line bundles the same
+/// unit.
 ///
-/// On Windows the standalone `perry_runtime.lib` is linked FIRST so its
-/// canonical `js_*` beat the possibly-stale perry-runtime copies bundled in
-/// `perry_stdlib.lib` / `perry_ui_windows.lib` (see the runtime-first block in
-/// `link/mod.rs` and #880). But the standalone runtime is built WITHOUT the
-/// `stdlib` Cargo feature, so it ALSO defines the no-op `stdlib_stubs`
-/// symbols; linked first they shadow perry-stdlib's real ones and `fetch()`
-/// silently no-ops (`response.json()` then fails with "Invalid response
-/// handle").
+/// Wrapper staticlibs (perry-ext-http, …) bundle their whole Rust dep graph,
+/// including a full copy of perry-runtime. In the wrappers-BEFORE-stdlib link
+/// shapes (`prefer_well_known_before_stdlib`: out-of-tree prebuilt stdlib and
+/// the auto-optimize archives-fresh fast path), that bundled copy becomes the
+/// first-definition winner for every extern runtime symbol the user object
+/// references (`js_wait_for_event`, `js_promise_run_microtasks`, …). Meanwhile
+/// perry-stdlib's own code keeps using ITS bundled runtime copy through
+/// LTO-promoted internal references (`.llvm.`-suffixed names resolve only
+/// intra-archive). The process then runs TWO disjoint copies of the runtime's
+/// mutable globals — two event-pump wait-driver slots, two microtask queues,
+/// two exception states. Concretely: an async task spawned by stdlib code
+/// (fetch) registers its wait-driver in stdlib's copy, the main loop's
+/// `js_wait_for_event` — resolved from the wrapper's copy — reads a
+/// never-written slot, falls back to the condvar park, and every spawned task
+/// starves forever.
 ///
-/// We rewrite a temp copy of the runtime archive, removing each
-/// [`STDLIB_STUB_SYMBOLS`] entry that the runtime defines AND perry-stdlib
-/// also provides from its member's symbol table via `llvm-objcopy
-/// --strip-symbol` (COFF's `lld-link`/`llvm-objcopy` reject the ELF/Mach-O
-/// `--localize-symbol`/`--weaken-symbol`, but `--strip-symbol` is supported).
-/// The stub's `.text` stays in the object but no longer claims the symbol, so
-/// lld-link resolves those references from `perry_stdlib.lib` instead and
-/// `/OPT:REF` drops the now-unreferenced stub body. Every other runtime symbol
-/// keeps its first-definition win. The stdlib cross-check guarantees we never
-/// strip a symbol that only the runtime provides, so no reference is left
-/// unresolved.
+/// Decision rule (evidence-based, per the v0.5.331 dedup standard — see
+/// [`strip_duplicate_objects_from_lib`]): a `perry_runtime-*` member is
+/// dropped only when BOTH hold:
+///  1. the stdlib archive bundles the same codegen unit — matched by member
+///     name containment, since stdlib's packaging renames members to
+///     `perry_stdlib-<hash>.<original-member-name>.rcgu.o` (same crate + cgu
+///     hash ⇒ same rlib input, identical extern surface);
+///  2. every symbol it defines that a *sibling* member references is also
+///     defined by the stdlib archive (a sibling referencing one of the copy's
+///     LTO-promoted `.llvm.` internals would go undefined — keep the member).
+/// Anything the user object needs beyond stdlib's copy is provided by the
+/// standalone `libperry_runtime.a` gap-filler linked after stdlib (the
+/// long-standing DCE-fallback contract in `build_and_run_link`).
 ///
-/// Best-effort: a missing LLVM tool or any failed sub-step returns the
-/// original `runtime_lib` path unchanged, preserving the pre-fix behavior
-/// rather than failing the build.
-pub(super) fn localize_stdlib_stub_symbols_for_windows(
-    runtime_lib: &Path,
+/// Non-fatal by construction: any nm/ar failure or rule miss returns the
+/// original archive unchanged.
+pub(super) fn strip_bundled_runtime_from_well_known_lib(
+    lib_path: &PathBuf,
     stdlib_lib: &Path,
-) -> PathBuf {
-    match try_localize_stdlib_stub_symbols(runtime_lib, stdlib_lib) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("[strip-dedup] runtime stdlib-stub localize skipped (non-fatal): {e}");
-            runtime_lib.to_path_buf()
-        }
-    }
-}
+) -> Result<PathBuf> {
+    let lib_name = lib_path.file_name().and_then(|f| f.to_str()).unwrap_or("?");
 
-fn try_localize_stdlib_stub_symbols(runtime_lib: &Path, stdlib_lib: &Path) -> Result<PathBuf> {
-    let lib_name = runtime_lib
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap_or("perry_runtime.lib");
-
-    let llvm_ar = find_llvm_tool_or_beside_lld("llvm-ar")
-        .or_else(|| find_path_tool("ar"))
-        .ok_or_else(|| anyhow::anyhow!("llvm-ar not found"))?;
-    let objcopy = find_llvm_tool_or_beside_lld("llvm-objcopy")
-        .or_else(|| find_path_tool("objcopy"))
-        .ok_or_else(|| anyhow::anyhow!("llvm-objcopy not found"))?;
-    let nm = find_llvm_tool_or_beside_lld("llvm-nm")
-        .or_else(|| find_path_tool("nm"))
-        .ok_or_else(|| anyhow::anyhow!("llvm-nm not found"))?;
-
-    let abs_runtime = std::fs::canonicalize(runtime_lib)?;
-    let abs_stdlib = std::fs::canonicalize(stdlib_lib)?;
-
-    let stub_set: std::collections::HashSet<&str> = STDLIB_STUB_SYMBOLS.iter().copied().collect();
-
-    // Per-member symbols of the runtime archive → which members define a stub.
-    // Scan the runtime FIRST: the auto-optimize rebuild builds it with the
-    // `stdlib` feature (cargo feature unification through perry-stdlib), so it
-    // defines no stubs and we bail before the more expensive stdlib scan. Only
-    // the prebuilt distribution's standalone runtime (default features) carries
-    // them, which is the configuration #5000 reports.
-    let runtime_member_syms = collect_archive_symbols_by_member(&nm, &abs_runtime)
-        .ok_or_else(|| anyhow::anyhow!("failed to inspect {lib_name} symbols"))?;
-    let mut candidates: std::collections::BTreeMap<String, Vec<String>> =
-        std::collections::BTreeMap::new();
-    for (member, syms) in &runtime_member_syms {
-        let hits: Vec<String> = syms
-            .iter()
-            .filter(|s| stub_set.contains(s.as_str()))
-            .cloned()
-            .collect();
-        if !hits.is_empty() {
-            candidates.insert(member.clone(), hits);
-        }
-    }
-    if candidates.is_empty() {
-        // Runtime already built without the stubs (e.g. `stdlib` feature on).
-        return Ok(runtime_lib.to_path_buf());
-    }
-
-    // Cross-check against perry-stdlib: only strip a stub the real stdlib also
-    // provides, so we never turn a runtime-only symbol into an undefined ref.
-    let stdlib_syms = collect_archive_symbols_flat(&nm, &abs_stdlib);
-    if stdlib_syms.is_empty() {
-        return Err(anyhow::anyhow!(
-            "llvm-nm reported no symbols for {}",
-            abs_stdlib.display()
-        ));
-    }
-    let mut to_localize: std::collections::BTreeMap<String, Vec<String>> =
-        std::collections::BTreeMap::new();
-    for (member, hits) in candidates {
-        let mut kept: Vec<String> = hits
-            .into_iter()
-            .filter(|s| stdlib_syms.contains(s))
-            .collect();
-        if !kept.is_empty() {
-            kept.sort();
-            kept.dedup();
-            to_localize.insert(member, kept);
-        }
-    }
-    if to_localize.is_empty() {
-        // Runtime has stubs but stdlib provides none of them — nothing to do.
-        return Ok(runtime_lib.to_path_buf());
-    }
-
-    let tmp_base = std::env::temp_dir().join(format!("perry_strip_{}", std::process::id()));
-    std::fs::create_dir_all(&tmp_base).ok();
-    let extract_dir = tmp_base.join(format!("_{lib_name}_stub_strip_extract"));
-    let _ = std::fs::remove_dir_all(&extract_dir);
-    std::fs::create_dir_all(&extract_dir)?;
-    let trimmed_lib = tmp_base.join(format!("_{lib_name}_stub_stripped.lib"));
-    let _ = std::fs::remove_file(&trimmed_lib);
-
-    // Work on a copy and REPLACE only the handful of stub members in place.
-    // Extracting every member and rebuilding the whole archive overflows the
-    // Windows command-line limit — perry_runtime.lib has hundreds of members
-    // (os error 206). `llvm-ar r` rewrites just the named member and keeps the
-    // rest untouched.
-    std::fs::copy(&abs_runtime, &trimmed_lib)?;
-
-    let mut localized = 0usize;
-    for (member, symbols) in &to_localize {
-        // Extract just this member next to the copy, strip its stub symbols,
-        // then splice it back over the original member.
-        let extract_out = Command::new(&llvm_ar)
-            .arg("x")
-            .arg(&abs_runtime)
-            .arg(member)
-            .current_dir(&extract_dir)
-            .output()?;
-        if !extract_out.status.success() {
-            let stderr = String::from_utf8_lossy(&extract_out.stderr);
-            return Err(anyhow::anyhow!("failed to extract {member}: {stderr}"));
-        }
-        let member_path = extract_dir.join(member);
-        if !member_path.exists() {
-            // `llvm-ar x` returned success but produced no file (e.g. a member
-            // name that doesn't round-trip as a path). Don't silently skip: that
-            // would return a "localized" archive with this member's stubs still
-            // global. Fail so the caller falls back to the untouched runtime.
-            return Err(anyhow::anyhow!(
-                "failed to extract {member}: member file was not created"
-            ));
-        }
-        let mut objcopy_cmd = Command::new(&objcopy);
-        for symbol in symbols {
-            objcopy_cmd.arg("--strip-symbol").arg(symbol);
-        }
-        let out = objcopy_cmd.arg(&member_path).output()?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(anyhow::anyhow!(
-                "failed to strip stub symbols from {member}: {stderr}"
-            ));
-        }
-        let replace_out = Command::new(&llvm_ar)
-            .arg("r")
-            .arg(&trimmed_lib)
-            .arg(&member_path)
-            .output()?;
-        if !replace_out.status.success() {
-            let stderr = String::from_utf8_lossy(&replace_out.stderr);
-            return Err(anyhow::anyhow!("failed to splice {member}: {stderr}"));
-        }
-        localized += symbols.len();
-    }
-
-    // Regenerate the archive symbol index so lld-link no longer sees the
-    // stripped stub symbols as provided by the rewritten member(s).
-    let index_out = Command::new(&llvm_ar).arg("s").arg(&trimmed_lib).output()?;
-    if !index_out.status.success() {
-        let stderr = String::from_utf8_lossy(&index_out.stderr);
-        return Err(anyhow::anyhow!("failed to reindex {lib_name}: {stderr}"));
-    }
-
-    eprintln!(
-        "[strip-dedup] {lib_name}: stripped {localized} stdlib-stub symbol def(s) \
-         so perry-stdlib wins the link (#5000)"
-    );
-    let _ = std::fs::remove_dir_all(&extract_dir);
-    Ok(trimmed_lib)
-}
-
-/// macOS/Linux (#5000) equivalent of [`localize_stdlib_stub_symbols_for_windows`].
-///
-/// The prebuilt standalone `libperry_runtime.a` is built WITHOUT the `stdlib`
-/// Cargo feature, so it defines the no-op `stdlib_stubs` symbols. On the
-/// macOS/Linux link line it is linked alongside the auto-optimized perry-stdlib
-/// (which carries the REAL `js_fetch_with_options` / `js_headers_new` / `js_ws_*`
-/// / `js_readline_*`), and with archive first-definition-wins the runtime stub
-/// can satisfy the user's fetch reference first — so `fetch()` silently no-ops
-/// (`[perry] warning: js_headers_new is a no-op stub`) and a program awaiting the
-/// fetch hangs. Unlike COFF, ELF/Mach-O accept `--localize-symbol`, so localize
-/// (global→local) exactly those stub symbols the runtime defines AND perry-stdlib
-/// also provides; the now-local stub no longer satisfies the external reference,
-/// the linker resolves it from perry-stdlib, and `-dead_strip`/`--gc-sections`
-/// drops the unreferenced stub body. The stdlib cross-check guarantees a
-/// runtime-only symbol is never localized. Best-effort: returns `runtime_lib`
-/// unchanged on any failure, preserving pre-fix behavior.
-pub(super) fn localize_stdlib_stub_symbols(runtime_lib: &Path, stdlib_lib: &Path) -> PathBuf {
-    match try_localize_stdlib_stub_symbols_unix(runtime_lib, stdlib_lib) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("[strip-dedup] runtime stdlib-stub localize skipped (non-fatal): {e}");
-            runtime_lib.to_path_buf()
-        }
-    }
-}
-
-fn try_localize_stdlib_stub_symbols_unix(runtime_lib: &Path, stdlib_lib: &Path) -> Result<PathBuf> {
-    let lib_name = runtime_lib
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap_or("libperry_runtime.a");
-
-    // Mach-O requires a matched-LLVM `llvm-objcopy` for `--localize-symbol`
-    // (a mismatched one rejects it on Mach-O / `llvm-nm` mis-reads nightly
-    // bitcode), so prefer the nightly toolchain tool, mirroring
-    // `strip_duplicate_objects_from_well_known_lib`.
     let llvm_ar = find_llvm_tool("llvm-ar")
         .or_else(|| find_path_tool("ar"))
-        .ok_or_else(|| anyhow::anyhow!("llvm-ar not found"))?;
-    let objcopy = find_nightly_llvm_tool("llvm-objcopy")
-        .or_else(|| find_llvm_tool("llvm-objcopy"))
-        .or_else(|| find_path_tool("objcopy"))
-        .ok_or_else(|| anyhow::anyhow!("llvm-objcopy not found"))?;
+        .ok_or_else(|| anyhow::anyhow!("ar not found"))?;
     let nm = find_nightly_llvm_tool("llvm-nm")
         .or_else(|| find_llvm_tool("llvm-nm"))
         .or_else(|| find_path_tool("nm"))
-        .ok_or_else(|| anyhow::anyhow!("llvm-nm not found"))?;
+        .ok_or_else(|| anyhow::anyhow!("nm not found"))?;
 
-    let abs_runtime = std::fs::canonicalize(runtime_lib)?;
+    let abs_lib = std::fs::canonicalize(lib_path)?;
     let abs_stdlib = std::fs::canonicalize(stdlib_lib)?;
 
-    let stub_set: std::collections::HashSet<&str> = STDLIB_STUB_SYMBOLS.iter().copied().collect();
-
-    let runtime_member_syms = collect_archive_symbols_by_member(&nm, &abs_runtime)
-        .ok_or_else(|| anyhow::anyhow!("failed to inspect {lib_name} symbols"))?;
-    let mut candidates: std::collections::BTreeMap<String, Vec<String>> =
-        std::collections::BTreeMap::new();
-    for (member, syms) in &runtime_member_syms {
-        let hits: Vec<String> = syms
-            .iter()
-            .filter(|s| stub_set.contains(s.as_str()))
-            .cloned()
-            .collect();
-        if !hits.is_empty() {
-            candidates.insert(member.clone(), hits);
+    let list_members = |archive: &Path| -> Result<Vec<String>> {
+        let out = Command::new(&llvm_ar).arg("t").arg(archive).output()?;
+        if !out.status.success() {
+            return Err(anyhow::anyhow!(
+                "failed to list members of {}",
+                archive.display()
+            ));
         }
-    }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.to_string())
+            .collect())
+    };
+
+    let members = list_members(&abs_lib)?;
+    let candidates: Vec<String> = members
+        .iter()
+        .filter(|m| m.starts_with("perry_runtime-"))
+        .cloned()
+        .collect();
     if candidates.is_empty() {
-        // Runtime built without the stubs (e.g. `stdlib` feature on).
-        return Ok(runtime_lib.to_path_buf());
+        return Ok(lib_path.clone());
     }
 
-    // Cross-check against perry-stdlib: only localize a stub the real stdlib also
-    // provides, so we never turn a runtime-only symbol into an undefined ref.
-    let stdlib_syms = collect_archive_symbols_flat(&nm, &abs_stdlib);
-    if stdlib_syms.is_empty() {
+    // Rule 1: stdlib must bundle the same codegen unit (renamed member
+    // contains the original member name verbatim).
+    let stdlib_members = list_members(&abs_stdlib)?;
+    let candidates: Vec<String> = candidates
+        .into_iter()
+        .filter(|c| stdlib_members.iter().any(|s| s.contains(c.as_str())))
+        .collect();
+    if candidates.is_empty() {
+        return Ok(lib_path.clone());
+    }
+
+    // Rule 2: no sibling member may depend on a symbol only this copy defines.
+    let defined_by_member = collect_archive_symbols_by_member(&nm, &abs_lib)
+        .ok_or_else(|| anyhow::anyhow!("failed to inspect defined symbols of {lib_name}"))?;
+    let undefined_by_member = collect_archive_undefined_by_member(&nm, &abs_lib)
+        .ok_or_else(|| anyhow::anyhow!("failed to inspect undefined symbols of {lib_name}"))?;
+    let stdlib_defined = collect_archive_symbols_flat(&nm, &abs_stdlib);
+    if stdlib_defined.is_empty() {
         return Err(anyhow::anyhow!(
-            "llvm-nm reported no symbols for {}",
-            abs_stdlib.display()
+            "failed to inspect stdlib symbols (empty set)"
         ));
     }
-    let mut to_localize: std::collections::BTreeMap<String, Vec<String>> =
-        std::collections::BTreeMap::new();
-    for (member, hits) in candidates {
-        let mut kept: Vec<String> = hits
-            .into_iter()
-            .filter(|s| stdlib_syms.contains(s))
-            .collect();
-        if !kept.is_empty() {
-            kept.sort();
-            kept.dedup();
-            to_localize.insert(member, kept);
-        }
-    }
-    if to_localize.is_empty() {
-        return Ok(runtime_lib.to_path_buf());
+    let candidate_set: std::collections::BTreeSet<&String> = candidates.iter().collect();
+    let sibling_undefined: std::collections::HashSet<&String> = undefined_by_member
+        .iter()
+        .filter(|(m, _)| !candidate_set.contains(m))
+        .flat_map(|(_, syms)| syms.iter())
+        .collect();
+    let empty = std::collections::HashSet::new();
+    let removable: Vec<&String> = candidates
+        .iter()
+        .filter(|c| {
+            let defined = defined_by_member.get(*c).unwrap_or(&empty);
+            let unsatisfied: Vec<&&String> = sibling_undefined
+                .iter()
+                .filter(|s| defined.contains(**s) && !stdlib_defined.contains(**s))
+                .collect();
+            if !unsatisfied.is_empty() {
+                eprintln!(
+                    "[strip-dedup] {lib_name}: keeping bundled {c} — {} sibling-referenced \
+                     symbol(s) not provided by stdlib (e.g. {})",
+                    unsatisfied.len(),
+                    unsatisfied[0]
+                );
+            }
+            unsatisfied.is_empty()
+        })
+        .collect();
+    if removable.is_empty() {
+        return Ok(lib_path.clone());
     }
 
     let tmp_base = std::env::temp_dir().join(format!("perry_strip_{}", std::process::id()));
     std::fs::create_dir_all(&tmp_base).ok();
-    let extract_dir = tmp_base.join(format!("_{lib_name}_stub_localize_extract"));
+    let extract_dir = tmp_base.join(format!("_{lib_name}_noruntime_extract"));
     let _ = std::fs::remove_dir_all(&extract_dir);
     std::fs::create_dir_all(&extract_dir)?;
-    let trimmed_lib = tmp_base.join(format!("_{lib_name}_stub_localized.a"));
+    let trimmed_lib = tmp_base.join(format!("_{lib_name}_noruntime.lib"));
     let _ = std::fs::remove_file(&trimmed_lib);
-    std::fs::copy(&abs_runtime, &trimmed_lib)?;
 
-    let mut localized = 0usize;
-    for (member, symbols) in &to_localize {
-        let extract_out = Command::new(&llvm_ar)
-            .arg("x")
-            .arg(&abs_runtime)
-            .arg(member)
-            .current_dir(&extract_dir)
-            .output()?;
-        if !extract_out.status.success() {
-            let stderr = String::from_utf8_lossy(&extract_out.stderr);
-            return Err(anyhow::anyhow!("failed to extract {member}: {stderr}"));
-        }
-        let member_path = extract_dir.join(member);
-        if !member_path.exists() {
-            // `llvm-ar x` returned success but produced no file (e.g. a member
-            // name that doesn't round-trip as a path). Don't silently skip: that
-            // would return a "localized" archive with this member's stubs still
-            // global. Fail so the caller falls back to the untouched runtime.
-            return Err(anyhow::anyhow!(
-                "failed to extract {member}: member file was not created"
-            ));
-        }
-        let mut objcopy_cmd = Command::new(&objcopy);
-        for symbol in symbols {
-            objcopy_cmd.arg("--localize-symbol").arg(symbol);
-        }
-        let out = objcopy_cmd.arg(&member_path).output()?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(anyhow::anyhow!(
-                "failed to localize stub symbols in {member}: {stderr}"
-            ));
-        }
-        let replace_out = Command::new(&llvm_ar)
-            .arg("r")
-            .arg(&trimmed_lib)
-            .arg(&member_path)
-            .output()?;
-        if !replace_out.status.success() {
-            let stderr = String::from_utf8_lossy(&replace_out.stderr);
-            return Err(anyhow::anyhow!("failed to splice {member}: {stderr}"));
-        }
-        localized += symbols.len();
+    let extract_out = Command::new(&llvm_ar)
+        .arg("x")
+        .arg(&abs_lib)
+        .current_dir(&extract_dir)
+        .output()?;
+    if !extract_out.status.success() {
+        let stderr = String::from_utf8_lossy(&extract_out.stderr);
+        return Err(anyhow::anyhow!("failed to extract {lib_name}: {stderr}"));
     }
 
-    let index_out = Command::new(&llvm_ar).arg("s").arg(&trimmed_lib).output()?;
-    if !index_out.status.success() {
-        let stderr = String::from_utf8_lossy(&index_out.stderr);
-        return Err(anyhow::anyhow!("failed to reindex {lib_name}: {stderr}"));
+    let remove_set: std::collections::BTreeSet<&String> = removable.iter().copied().collect();
+    let mut ar_cmd = Command::new(&llvm_ar);
+    ar_cmd.arg("crs").arg(&trimmed_lib);
+    for member in &members {
+        if remove_set.contains(member) {
+            continue;
+        }
+        ar_cmd.arg(extract_dir.join(member));
+    }
+    let ar_out = ar_cmd.output()?;
+    if !ar_out.status.success() {
+        let stderr = String::from_utf8_lossy(&ar_out.stderr);
+        return Err(anyhow::anyhow!(
+            "failed to create runtime-stripped archive for {lib_name}: {stderr}"
+        ));
     }
 
     eprintln!(
-        "[strip-dedup] {lib_name}: localized {localized} stdlib-stub symbol(s) \
-         so perry-stdlib wins the link (#5000, macOS/Linux)"
+        "[strip-dedup] {lib_name}: dropped {} bundled perry-runtime member(s) \
+         (stdlib provides the single runtime copy)",
+        remove_set.len()
     );
     let _ = std::fs::remove_dir_all(&extract_dir);
     Ok(trimmed_lib)
 }
+
+/// Mach-O companion to the well-known dropper for the prebuilt UI staticlib.
+/// The UI lib ships from the release bundle, so every dependency copy it
+/// bundles — perry-runtime, std, itoa, data-encoding, … — comes from a
+/// foreign crate graph: member names can never match the (auto-optimized,
+/// locally rebuilt) stdlib's bundled copies, Rule 1 of
+/// [`strip_bundled_runtime_from_well_known_lib`] can't fire, and on Mach-O —
+/// where ld64.lld has no `--allow-multiple-definition` — both copies load and
+/// the link dies with duplicate `_js_*` / std / itoa externs.
+///
+/// The bundled members cannot simply be dropped: sibling UI members reach
+/// shared-generic monomorphizations instantiated inside them
+/// (`RawVec::grow_one`, `hashbrown::…::reserve_rehash`) whose symbol hashes
+/// embed the foreign crate fingerprint — no locally rebuilt archive can ever
+/// provide those. Instead, LOCALIZE every global a member defines that the
+/// actually-linked stdlib/runtime archives also export: sibling references
+/// rebind to the single linked copy (one set of runtime/std mutable state —
+/// the #5920 invariant), each member keeps exporting only its unique
+/// generics, and whatever becomes unreferenced dead-strips
+/// (SUBSECTIONS_VIA_SYMBOLS). No global remains defined on both sides, so
+/// the duplicate-symbol errors are structurally gone.
+///
+/// Non-fatal by construction: any nm/ar/objcopy failure returns the original
+/// archive unchanged at the callsite.
+pub(super) fn dedup_ui_lib_against_linked_libs(
+    lib_path: &PathBuf,
+    reference_libs: &[&Path],
+) -> Result<PathBuf> {
+    let lib_name = lib_path.file_name().and_then(|f| f.to_str()).unwrap_or("?");
+
+    let llvm_ar = find_llvm_tool("llvm-ar")
+        .or_else(|| find_path_tool("ar"))
+        .ok_or_else(|| anyhow::anyhow!("ar not found"))?;
+    let objcopy = find_nightly_llvm_tool("llvm-objcopy")
+        .or_else(|| find_llvm_tool("llvm-objcopy"))
+        .or_else(|| find_path_tool("objcopy"))
+        .ok_or_else(|| anyhow::anyhow!("objcopy not found"))?;
+    let nm = find_nightly_llvm_tool("llvm-nm")
+        .or_else(|| find_llvm_tool("llvm-nm"))
+        .or_else(|| find_path_tool("nm"))
+        .ok_or_else(|| anyhow::anyhow!("nm not found"))?;
+
+    let abs_lib = std::fs::canonicalize(lib_path)?;
+
+    let out = Command::new(&llvm_ar).arg("t").arg(&abs_lib).output()?;
+    if !out.status.success() {
+        return Err(anyhow::anyhow!("failed to list members of {lib_name}"));
+    }
+    let members: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.to_string())
+        .collect();
+
+    // Union of the external symbols provided by the archives actually on the
+    // link line (auto-optimized or prebuilt stdlib + the standalone runtime
+    // gap-filler). Extern-only: a local definition over there cannot satisfy
+    // a reference rebound away from the bundled copy.
+    let mut linked_globals: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for reference in reference_libs {
+        let abs_ref = std::fs::canonicalize(reference)?;
+        linked_globals.extend(collect_archive_global_symbols_flat(&nm, &abs_ref));
+    }
+    if linked_globals.is_empty() {
+        return Err(anyhow::anyhow!(
+            "failed to inspect linked stdlib/runtime symbols (empty set)"
+        ));
+    }
+
+    let defined_by_member = collect_archive_symbols_by_member(&nm, &abs_lib)
+        .ok_or_else(|| anyhow::anyhow!("failed to inspect defined symbols of {lib_name}"))?;
+
+    let mut to_localize_by_member: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let mut total_localized = 0usize;
+    for member in &members {
+        let Some(defined) = defined_by_member.get(member) else {
+            continue;
+        };
+        let mut duplicated: Vec<String> = defined
+            .iter()
+            .filter(|s| linked_globals.contains(*s))
+            .cloned()
+            .collect();
+        if duplicated.is_empty() {
+            continue;
+        }
+        duplicated.sort();
+        total_localized += duplicated.len();
+        to_localize_by_member.insert(member.clone(), duplicated);
+    }
+    if to_localize_by_member.is_empty() {
+        return Ok(lib_path.clone());
+    }
+    eprintln!(
+        "[strip-dedup] {lib_name}: localizing {total_localized} bundled global(s) across \
+         {} member(s) already provided by the linked stdlib/runtime",
+        to_localize_by_member.len()
+    );
+
+    let tmp_base = std::env::temp_dir().join(format!("perry_strip_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_base).ok();
+    let extract_dir = tmp_base.join(format!("_{lib_name}_uiruntime_extract"));
+    let _ = std::fs::remove_dir_all(&extract_dir);
+    std::fs::create_dir_all(&extract_dir)?;
+    let trimmed_lib = tmp_base.join(format!("_{lib_name}_uiruntime.lib"));
+    let _ = std::fs::remove_file(&trimmed_lib);
+
+    let extract_out = Command::new(&llvm_ar)
+        .arg("x")
+        .arg(&abs_lib)
+        .current_dir(&extract_dir)
+        .output()?;
+    if !extract_out.status.success() {
+        let stderr = String::from_utf8_lossy(&extract_out.stderr);
+        return Err(anyhow::anyhow!("failed to extract {lib_name}: {stderr}"));
+    }
+
+    for (member, symbols) in &to_localize_by_member {
+        let member_path = extract_dir.join(member);
+        let list_path = extract_dir.join(format!("{member}.localize-list"));
+        std::fs::write(&list_path, symbols.join("\n"))?;
+        let out = Command::new(&objcopy)
+            .arg(format!("--localize-symbols={}", list_path.display()))
+            .arg(&member_path)
+            .output()?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(anyhow::anyhow!(
+                "failed to localize bundled runtime globals in {member}: {stderr}"
+            ));
+        }
+        let _ = std::fs::remove_file(&list_path);
+    }
+
+    let mut ar_cmd = Command::new(&llvm_ar);
+    ar_cmd.arg("crs").arg(&trimmed_lib);
+    for member in &members {
+        ar_cmd.arg(extract_dir.join(member));
+    }
+    let ar_out = ar_cmd.output()?;
+    if !ar_out.status.success() {
+        let stderr = String::from_utf8_lossy(&ar_out.stderr);
+        return Err(anyhow::anyhow!(
+            "failed to create runtime-localized archive for {lib_name}: {stderr}"
+        ));
+    }
+
+    let _ = std::fs::remove_dir_all(&extract_dir);
+    Ok(trimmed_lib)
+}
+
+/// Issue #5928 (companion to #5920/#5921): `strip_bundled_runtime_from_well_known_lib`
+/// only targets `perry_runtime-*` codegen-unit members. When a program links
+/// MULTIPLE well-known libraries that each independently bundle a full
+/// "shared tokio" HTTP-client stack (e.g. both `http` and `fastify` need
+/// tokio/hyper_util/h2/rustls/reqwest/ring), the SAME duplication shape
+/// recurs for every shared transitive dependency those libraries have in
+/// common with `libperry_stdlib.a` (which also bundles its own copies for
+/// fetch/https/websocket support) — `std`/`core`/`alloc` themselves included.
+/// macOS's current linker has no `-multiply_defined suppress` / `-ld_classic`
+/// escape hatch anymore (verified obsolete on current toolchains), so these
+/// surface as hard `ld: duplicate symbol` link failures rather than
+/// first-definition-wins warnings.
+///
+/// This applies the SAME two safety rules as
+/// `strip_bundled_runtime_from_well_known_lib` (stdlib bundles the identical
+/// codegen unit; no OTHER kept member depends on a symbol only the
+/// duplicate-candidate provides) to EVERY member, not just `perry_runtime-`
+/// ones — a naive one-shot widening is NOT safe (candidates can depend on
+/// EACH OTHER, e.g. `hyper_util`'s object referencing a symbol only
+/// `tokio`'s object defines, both bundled in the same well-known lib and
+/// both initially flagged as removable — removing both in one pass without
+/// checking inter-candidate edges can silently drop something still
+/// needed), so this is a FIXED-POINT iteration: each round recomputes
+/// "undefined symbol references from every member NOT currently marked for
+/// removal" against the SHRINKING kept-set, and protects (un-marks) any
+/// still-marked candidate whose defined symbols are needed by that kept-set
+/// and aren't covered by stdlib. Repeats until no candidate is newly
+/// protected in a round. Verified safe against the `issue_5920_wrapper_
+/// bundled_runtime_async_starvation` regression test (that test requires
+/// `PERRY_LLVM_OBJCOPY`/`PERRY_LLVM_NM`/`PERRY_LLVM_AR` — or `llvm-objcopy`/
+/// `llvm-nm`/`llvm-ar` on `PATH` — to actually exercise the strip-dedup
+/// path at all; without them it silently no-ops and produces a much later,
+/// confusing "N duplicate symbols" `ld` failure with no indication dedup
+/// was skipped).
+///
+/// Reduces, but does not always fully eliminate, duplicate symbols for
+/// programs needing several LARGE, deeply-interconnected well-known
+/// libraries simultaneously (e.g. both `http` and `fastify`, each pulling
+/// in the full reqwest/hyper_util/h2/rustls stack) — Rule 2 conservatively
+/// protects more members as the dependency graph within a single archive
+/// grows, since more of them turn out to be referenced by a sibling that
+/// itself can't be removed. Fully eliminates duplicates for simpler
+/// well-known libraries (e.g. `ioredis`, `net`, `ws`) whose bundled
+/// dependency graphs are smaller.
+pub(super) fn strip_bundled_shared_deps_from_well_known_lib(
+    lib_path: &PathBuf,
+    stdlib_lib: &Path,
+) -> Result<PathBuf> {
+    let lib_name = lib_path.file_name().and_then(|f| f.to_str()).unwrap_or("?");
+
+    let llvm_ar = find_llvm_tool("llvm-ar")
+        .or_else(|| find_path_tool("ar"))
+        .ok_or_else(|| anyhow::anyhow!("ar not found"))?;
+    let nm = find_nightly_llvm_tool("llvm-nm")
+        .or_else(|| find_llvm_tool("llvm-nm"))
+        .or_else(|| find_path_tool("nm"))
+        .ok_or_else(|| anyhow::anyhow!("nm not found"))?;
+
+    let abs_lib = std::fs::canonicalize(lib_path)?;
+    let abs_stdlib = std::fs::canonicalize(stdlib_lib)?;
+
+    let list_members = |archive: &Path| -> Result<Vec<String>> {
+        let out = Command::new(&llvm_ar).arg("t").arg(archive).output()?;
+        if !out.status.success() {
+            return Err(anyhow::anyhow!(
+                "failed to list members of {}",
+                archive.display()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.to_string())
+            .collect())
+    };
+
+    let members = list_members(&abs_lib)?;
+
+    // Rule 1: stdlib must bundle the identical codegen unit (its renamed
+    // member contains this well-known lib's member name verbatim). No
+    // crate-name restriction — the fixed-point loop below is what makes
+    // considering every member safe.
+    let stdlib_members = list_members(&abs_stdlib)?;
+    let candidates: std::collections::BTreeSet<String> = members
+        .iter()
+        .filter(|m| stdlib_members.iter().any(|s| s.contains(m.as_str())))
+        .cloned()
+        .collect();
+    if candidates.is_empty() {
+        return Ok(lib_path.clone());
+    }
+
+    let defined_by_member = collect_archive_symbols_by_member(&nm, &abs_lib)
+        .ok_or_else(|| anyhow::anyhow!("failed to inspect defined symbols of {lib_name}"))?;
+    let undefined_by_member = collect_archive_undefined_by_member(&nm, &abs_lib)
+        .ok_or_else(|| anyhow::anyhow!("failed to inspect undefined symbols of {lib_name}"))?;
+    let stdlib_defined = collect_archive_symbols_flat(&nm, &abs_stdlib);
+    if stdlib_defined.is_empty() {
+        return Err(anyhow::anyhow!(
+            "failed to inspect stdlib symbols (empty set)"
+        ));
+    }
+    let empty = std::collections::HashSet::new();
+
+    // Fixed-point loop: start by assuming every candidate is removable, then
+    // repeatedly protect (un-mark) any candidate whose symbols are still
+    // needed by the current kept-set (members - to_remove), until a round
+    // protects nothing new.
+    let mut to_remove: std::collections::BTreeSet<String> = candidates.clone();
+    loop {
+        let kept_undefined: std::collections::HashSet<&String> = undefined_by_member
+            .iter()
+            .filter(|(m, _)| !to_remove.contains(m.as_str()))
+            .flat_map(|(_, syms)| syms.iter())
+            .collect();
+        let mut protected_this_round = false;
+        for c in to_remove.clone().iter() {
+            let defined = defined_by_member.get(c).unwrap_or(&empty);
+            let still_needed = kept_undefined
+                .iter()
+                .any(|s| defined.contains(*s) && !stdlib_defined.contains(*s));
+            if still_needed {
+                to_remove.remove(c);
+                protected_this_round = true;
+            }
+        }
+        if !protected_this_round {
+            break;
+        }
+    }
+    if to_remove.is_empty() {
+        return Ok(lib_path.clone());
+    }
+    for c in &candidates {
+        if !to_remove.contains(c) {
+            eprintln!(
+                "[strip-dedup] {lib_name}: keeping bundled {c} — needed by a kept \
+                 sibling and not provided by stdlib"
+            );
+        }
+    }
+
+    let tmp_base = std::env::temp_dir().join(format!("perry_strip_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_base).ok();
+    let extract_dir = tmp_base.join(format!("_{lib_name}_nosharedeps_extract"));
+    let _ = std::fs::remove_dir_all(&extract_dir);
+    std::fs::create_dir_all(&extract_dir)?;
+    let trimmed_lib = tmp_base.join(format!("_{lib_name}_nosharedeps.lib"));
+    let _ = std::fs::remove_file(&trimmed_lib);
+
+    let extract_out = Command::new(&llvm_ar)
+        .arg("x")
+        .arg(&abs_lib)
+        .current_dir(&extract_dir)
+        .output()?;
+    if !extract_out.status.success() {
+        let stderr = String::from_utf8_lossy(&extract_out.stderr);
+        return Err(anyhow::anyhow!("failed to extract {lib_name}: {stderr}"));
+    }
+
+    let mut ar_cmd = Command::new(&llvm_ar);
+    ar_cmd.arg("crs").arg(&trimmed_lib);
+    for member in &members {
+        if to_remove.contains(member) {
+            continue;
+        }
+        ar_cmd.arg(extract_dir.join(member));
+    }
+    let ar_out = ar_cmd.output()?;
+    if !ar_out.status.success() {
+        let stderr = String::from_utf8_lossy(&ar_out.stderr);
+        return Err(anyhow::anyhow!(
+            "failed to create shared-deps-stripped archive for {lib_name}: {stderr}"
+        ));
+    }
+
+    eprintln!(
+        "[strip-dedup] {lib_name}: dropped {} bundled member(s) also provided by stdlib \
+         (shared transitive deps, fixed-point safe)",
+        to_remove.len()
+    );
+    let _ = std::fs::remove_dir_all(&extract_dir);
+    Ok(trimmed_lib)
+}
+
+mod stub_symbols;
+use stub_symbols::strip_members_present_in_reference;
+pub(super) use stub_symbols::{
+    localize_stdlib_stub_symbols, localize_stdlib_stub_symbols_for_windows,
+};
 
 /// Tier-3 (tvOS/watchOS, no prebuilt std): perry-stdlib is built with
 /// `-Zbuild-std` and bundles its own copy of std's allocator/panic runtime
@@ -1298,109 +1441,6 @@ pub(super) fn dedup_native_lib_for_tier3(
     } else {
         lib
     }
-}
-
-/// Remove from `lib_path` every archive member whose name (a) starts with
-/// `name_prefix` and (b) also appears in `reference_lib`, returning the path to
-/// a rebuilt archive.
-///
-/// Used on tier-3 (tvOS/watchOS) to drop the perry-runtime object(s) that the
-/// auto-optimized perry-stdlib bundles. The auto-optimizer rebuilds perry-stdlib
-/// *and* perry-runtime from the same `-Zbuild-std` crate graph, so a
-/// perry-runtime codegen unit (e.g.
-/// `perry_runtime-<hash>.perry_runtime.<hash>-cgu.0.rcgu.o`) lands in BOTH
-/// archives. They are byte-identical (the hashes in the member name encode the
-/// content), and perry-runtime is linked separately right after stdlib, so the
-/// stdlib copy is pure duplication. ld64 (Mach-O) has no `/FORCE:MULTIPLE`, so an
-/// identical object reachable from two archives is a fatal "duplicate symbol".
-///
-/// The `name_prefix` filter is essential: only the `perry_runtime-*` members are
-/// pure duplication. The `std-*` / `alloc-*` / `core-*` members are also shared,
-/// but stdlib's copies are *load-bearing* — being earliest on the link line they
-/// satisfy std symbols first, which stops ld64 from pulling the std objects out
-/// of perry-runtime AND the bundling native lib for the same symbols (those two
-/// would then collide on e.g. `__rdl_alloc`). So we keep stdlib's std/alloc/core
-/// objects and strip only its redundant perry-runtime objects.
-pub(super) fn strip_members_present_in_reference(
-    lib_path: &Path,
-    reference_lib: &Path,
-    name_prefix: &str,
-) -> Result<PathBuf> {
-    let lib_name = lib_path.file_name().and_then(|f| f.to_str()).unwrap_or("?");
-    let llvm_ar = find_llvm_tool("llvm-ar")
-        .or_else(|| find_path_tool("ar"))
-        .ok_or_else(|| anyhow::anyhow!("ar not found"))?;
-
-    let abs_lib = std::fs::canonicalize(lib_path)?;
-    let abs_ref = std::fs::canonicalize(reference_lib)?;
-
-    let list_members = |archive: &Path| -> Result<Vec<String>> {
-        let out = Command::new(&llvm_ar).arg("t").arg(archive).output()?;
-        if !out.status.success() {
-            return Err(anyhow::anyhow!(
-                "failed to list members of {}",
-                archive.display()
-            ));
-        }
-        Ok(String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(|l| l.to_string())
-            .collect())
-    };
-
-    let ref_members: std::collections::BTreeSet<String> =
-        list_members(&abs_ref)?.into_iter().collect();
-    let members = list_members(&abs_lib)?;
-    let remove_set: std::collections::BTreeSet<&String> = members
-        .iter()
-        .filter(|m| m.starts_with(name_prefix) && ref_members.contains(*m))
-        .collect();
-    if remove_set.is_empty() {
-        return Ok(lib_path.to_path_buf());
-    }
-
-    let tmp_base = std::env::temp_dir().join(format!("perry_strip_{}", std::process::id()));
-    std::fs::create_dir_all(&tmp_base).ok();
-    let extract_dir = tmp_base.join(format!("_{lib_name}_refdiff_extract"));
-    let _ = std::fs::remove_dir_all(&extract_dir);
-    std::fs::create_dir_all(&extract_dir)?;
-    let trimmed_lib = tmp_base.join(format!("_{lib_name}_refdiff.lib"));
-    let _ = std::fs::remove_file(&trimmed_lib);
-
-    let extract_out = Command::new(&llvm_ar)
-        .arg("x")
-        .arg(&abs_lib)
-        .current_dir(&extract_dir)
-        .output()?;
-    if !extract_out.status.success() {
-        let stderr = String::from_utf8_lossy(&extract_out.stderr);
-        return Err(anyhow::anyhow!("failed to extract {lib_name}: {stderr}"));
-    }
-
-    let mut ar_cmd = Command::new(&llvm_ar);
-    ar_cmd.arg("crs").arg(&trimmed_lib);
-    let mut kept = 0usize;
-    for member in &members {
-        if remove_set.contains(member) {
-            continue;
-        }
-        ar_cmd.arg(extract_dir.join(member));
-        kept += 1;
-    }
-    let ar_out = ar_cmd.output()?;
-    if !ar_out.status.success() {
-        let stderr = String::from_utf8_lossy(&ar_out.stderr);
-        return Err(anyhow::anyhow!(
-            "failed to create ref-diff archive for {lib_name}: {stderr}"
-        ));
-    }
-    eprintln!(
-        "[strip-dedup] {lib_name}: removed {} member(s) also present in {} (kept {kept})",
-        remove_set.len(),
-        abs_ref.file_name().and_then(|f| f.to_str()).unwrap_or("?")
-    );
-    let _ = std::fs::remove_dir_all(&extract_dir);
-    Ok(trimmed_lib)
 }
 
 #[cfg(test)]

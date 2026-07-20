@@ -18,6 +18,7 @@ pub fn synthesize_class_captures(
     constructor: &mut Option<Function>,
     static_methods: &mut Vec<Function>,
 ) {
+    let cap_salt = ctx.cap_salt();
     let module_level_ids = ctx.module_level_ids.clone();
     let outer_scope_ids: std::collections::HashSet<LocalId> =
         ctx.locals.iter().map(|(_, id, _)| *id).collect();
@@ -140,7 +141,9 @@ pub fn synthesize_class_captures(
     let inherited_cap_ids: std::collections::HashSet<LocalId> = captures_vec
         .iter()
         .copied()
-        .filter(|cid| inherited_cap_field_names.contains(&format!("__perry_cap_{}", cid)))
+        .filter(|cid| {
+            inherited_cap_field_names.contains(&crate::cap_fields::cap_field_name(cap_salt, *cid))
+        })
         .collect();
 
     // 1. Hidden fields keyed by outer id, skipping inherited.
@@ -149,7 +152,7 @@ pub fn synthesize_class_captures(
             continue;
         }
         fields.push(ClassField {
-            name: format!("__perry_cap_{}", cid),
+            name: crate::cap_fields::cap_field_name(cap_salt, cid),
             key_expr: None,
             ty: Type::Any,
             init: None,
@@ -161,7 +164,7 @@ pub fn synthesize_class_captures(
     if let Some(existing) = ctx.lookup_class_field_names(name) {
         let mut updated: Vec<String> = existing.to_vec();
         for &cid in &captures_vec {
-            let field_name = format!("__perry_cap_{}", cid);
+            let field_name = crate::cap_fields::cap_field_name(cap_salt, cid);
             if !updated.contains(&field_name) {
                 updated.push(field_name);
             }
@@ -203,7 +206,7 @@ pub fn synthesize_class_captures(
     // enough to defer to a follow-up.
     let field_propagation: std::collections::HashMap<LocalId, String> = captures_vec
         .iter()
-        .map(|&cid| (cid, format!("__perry_cap_{}", cid)))
+        .map(|&cid| (cid, crate::cap_fields::cap_field_name(cap_salt, cid)))
         .collect();
 
     // Helper closure: build a fresh-id map for one function's body,
@@ -234,15 +237,16 @@ pub fn synthesize_class_captures(
             // (same machinery as the ctor param rebinds above).
             prologue.push(Stmt::Let {
                 id: new_id,
-                name: format!("__perry_cap_{}", outer_id),
+                name: crate::cap_fields::cap_field_name(cap_salt, outer_id),
                 ty,
                 mutable: true,
                 init: Some(Expr::ClassCaptureValue {
                     class_name: name.to_string(),
                     index: index as u32,
                     fallback: Some(Box::new(Expr::PropertyGet {
+                        byte_offset: 0,
                         object: Box::new(Expr::This),
-                        property: format!("__perry_cap_{}", outer_id),
+                        property: crate::cap_fields::cap_field_name(cap_salt, outer_id),
                     })),
                     prefer_fallback: true,
                 }),
@@ -334,7 +338,7 @@ pub fn synthesize_class_captures(
             id_map.insert(outer_id, new_id);
             prologue.push(Stmt::Let {
                 id: new_id,
-                name: format!("__perry_cap_{}", outer_id),
+                name: crate::cap_fields::cap_field_name(cap_salt, outer_id),
                 ty: captured_outer_types
                     .get(&outer_id)
                     .cloned()
@@ -377,7 +381,7 @@ pub fn synthesize_class_captures(
             id_map.insert(outer_id, new_id);
             prologue.push(Stmt::Let {
                 id: new_id,
-                name: format!("__perry_cap_{}", outer_id),
+                name: crate::cap_fields::cap_field_name(cap_salt, outer_id),
                 ty: captured_outer_types
                     .get(&outer_id)
                     .cloned()
@@ -414,63 +418,42 @@ pub fn synthesize_class_captures(
     let mut ctor = match constructor.take() {
         Some(c) => c,
         None => {
-            // The spec default ctor FORWARDS its args:
-            // `constructor(...args) { super(...args) }`. A bare
-            // `SuperCall([])` dropped the construction-site user args, so
-            // `new Derived({def})` left the parent ctor's params undefined
-            // (vendored zod: ZodString.create → new ZodString({...}) →
-            // ZodType ctor never saw `def`, `this._def` stayed undefined).
-            // Synthesize explicit forwarding params matching the closest
-            // pending-ancestor ctor's USER arity (its `__perry_cap_*`
-            // params excluded). Ancestors outside `pending_classes`
-            // (module-level / native parents) keep the no-arg baseline.
-            let parent_user_arity = if has_heritage {
-                let mut arity = 0usize;
-                let mut walker: Option<String> = extends_name.map(|s| s.to_string());
-                while let Some(pname) = walker.take() {
-                    let Some(pc) = ctx.pending_classes.iter().find(|c| c.name == pname) else {
-                        break;
-                    };
-                    if let Some(pctor) = pc.constructor.as_ref() {
-                        arity = pctor
-                            .params
-                            .iter()
-                            .filter(|p| !p.name.starts_with("__perry_cap_"))
-                            .count();
-                        break;
-                    }
-                    walker = pc.extends_name.clone();
-                }
-                arity
-            } else {
-                0
-            };
-            let mut params: Vec<Param> = Vec::with_capacity(parent_user_arity);
-            let mut super_args: Vec<Expr> = Vec::with_capacity(parent_user_arity);
-            for i in 0..parent_user_arity {
+            // #5957: synthesize the REAL spec default ctor,
+            // `constructor(...args) { super(...args) }`. The previous
+            // fixed-arity approximation walked the nearest pending-ancestor
+            // ctor's USER arity and minted that many positional params — a
+            // REST-param ancestor counted as arity 1 (`new Drain("a","b","c")`
+            // forwarded only "a"), and an extends-EXPR / non-pending parent
+            // walked to arity 0 (ALL user args dropped: the #806 mixin's
+            // `seed` was undefined). One rest param + `SuperCallSpread`
+            // forwards everything for every parent shape; the spread-super
+            // dispatchers split user/cap slots by the registered signature cap
+            // count and pack ancestor rest params via the closure-rest table.
+            let (params, body) = if has_heritage {
                 let pid = ctx.fresh_local();
-                params.push(Param {
+                let params = vec![Param {
                     id: pid,
-                    name: format!("__perry_dflt_arg_{}", i),
+                    name: "__perry_dflt_args".to_string(),
                     ty: Type::Any,
                     default: None,
                     decorators: Vec::new(),
-                    is_rest: false,
+                    is_rest: true,
                     arguments_object: None,
-                });
-                super_args.push(Expr::LocalGet(pid));
-            }
+                }];
+                let body = vec![Stmt::Expr(Expr::SuperCallSpread(vec![CallArg::Spread(
+                    Expr::LocalGet(pid),
+                )]))];
+                (params, body)
+            } else {
+                (Vec::new(), Vec::new())
+            };
             Function {
                 id: ctx.fresh_func(),
                 name: format!("{}::constructor", name),
                 type_params: Vec::new(),
                 params,
                 return_type: Type::Void,
-                body: if has_heritage {
-                    vec![Stmt::Expr(Expr::SuperCall(super_args))]
-                } else {
-                    Vec::new()
-                },
+                body,
                 is_async: false,
                 is_generator: false,
                 is_strict: true,
@@ -515,7 +498,7 @@ pub fn synthesize_class_captures(
             .unwrap_or(Type::Any);
         ctor.params.push(Param {
             id: fresh_param_id,
-            name: format!("__perry_cap_{}", outer_id),
+            name: crate::cap_fields::cap_field_name(cap_salt, outer_id),
             ty,
             default: None,
             decorators: Vec::new(),
@@ -539,7 +522,7 @@ pub fn synthesize_class_captures(
         )));
         assignment_stmts.push(Stmt::Expr(Expr::PropertySet {
             object: Box::new(Expr::This),
-            property: format!("__perry_cap_{}", outer_id),
+            property: crate::cap_fields::cap_field_name(cap_salt, outer_id),
             value: Box::new(Expr::LocalGet(fresh_param_id)),
         }));
     }
@@ -834,6 +817,7 @@ pub(crate) fn append_new_args_stmt(
         | Stmt::Continue
         | Stmt::LabeledBreak(_)
         | Stmt::LabeledContinue(_)
-        | Stmt::PreallocateBoxes(_) => {}
+        | Stmt::PreallocateBoxes(_)
+        | Stmt::PreallocateTdzBoxes(_) => {}
     }
 }

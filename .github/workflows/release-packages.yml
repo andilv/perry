@@ -168,6 +168,9 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     env:
+      # Public, rotation-capable CLI update keyring baked into every release.
+      # It is intentionally a repository variable (not fetched at runtime).
+      PERRY_CLI_UPDATE_PUBLIC_KEYS: ${{ vars.PERRY_CLI_UPDATE_PUBLIC_KEYS }}
       # Pin the macOS deployment target so bottle object files carry a
       # stable LC_VERSION_MIN / LC_BUILD_VERSION tag regardless of which
       # GitHub runner OS built them. Otherwise users linking against the
@@ -630,6 +633,53 @@ jobs:
           "$hash  ${{ matrix.artifact }}.zip" | Out-File -Encoding ascii "${{ matrix.artifact }}.zip.sha256"
           Get-Content "${{ matrix.artifact }}.zip.sha256"
 
+      # The archive SHA sidecar helps package managers but is not an update
+      # authority. Sign a domain-separated, version/platform/URL/digest/size
+      # bound manifest with the protected Ed25519 release key instead.
+      - name: Sign authenticated CLI update manifest (Unix)
+        if: runner.os != 'Windows' && (github.event_name == 'release' || github.event_name == 'workflow_dispatch')
+        env:
+          PERRY_CLI_UPDATE_SIGNING_KEY: ${{ secrets.PERRY_CLI_UPDATE_SIGNING_KEY }}
+          PERRY_CLI_UPDATE_KEY_ID: ${{ vars.PERRY_CLI_UPDATE_KEY_ID }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${PERRY_CLI_UPDATE_SIGNING_KEY:?configure the protected 32-byte base64 Ed25519 signing secret}"
+          : "${PERRY_CLI_UPDATE_KEY_ID:?configure the matching trusted public-key id}"
+          : "${PERRY_CLI_UPDATE_PUBLIC_KEYS:?configure the compiled public-key keyring}"
+          jq -e --arg id "$PERRY_CLI_UPDATE_KEY_ID" '.[] | select(.key_id == $id and (.public_key | length > 0))' <<< "$PERRY_CLI_UPDATE_PUBLIC_KEYS" >/dev/null
+          TAG="$RELEASE_TAG"
+          if [ -z "$TAG" ]; then TAG=$(gh release list -R "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName'); fi
+          ARCHIVE="${{ matrix.artifact }}.tar.gz"
+          URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/${ARCHIVE}"
+          "target/${{ matrix.target }}/dist/perry" updater sign-cli-manifest \
+            --artifact "$ARCHIVE" --platform "$ARCHIVE" --url "$URL" \
+            --release-version "${TAG#v}" --key-id "$PERRY_CLI_UPDATE_KEY_ID" \
+            --secret-key-b64 "$PERRY_CLI_UPDATE_SIGNING_KEY" > "$ARCHIVE.update.json"
+
+      - name: Sign authenticated CLI update manifest (Windows)
+        if: runner.os == 'Windows' && (github.event_name == 'release' || github.event_name == 'workflow_dispatch')
+        env:
+          PERRY_CLI_UPDATE_SIGNING_KEY: ${{ secrets.PERRY_CLI_UPDATE_SIGNING_KEY }}
+          PERRY_CLI_UPDATE_KEY_ID: ${{ vars.PERRY_CLI_UPDATE_KEY_ID }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:PERRY_CLI_UPDATE_SIGNING_KEY) { throw 'configure PERRY_CLI_UPDATE_SIGNING_KEY' }
+          if (-not $env:PERRY_CLI_UPDATE_KEY_ID) { throw 'configure PERRY_CLI_UPDATE_KEY_ID' }
+          if (-not $env:PERRY_CLI_UPDATE_PUBLIC_KEYS) { throw 'configure PERRY_CLI_UPDATE_PUBLIC_KEYS' }
+          if (-not (($env:PERRY_CLI_UPDATE_PUBLIC_KEYS | ConvertFrom-Json) | Where-Object { $_.key_id -eq $env:PERRY_CLI_UPDATE_KEY_ID -and $_.public_key })) { throw 'configured key id is not in PERRY_CLI_UPDATE_PUBLIC_KEYS' }
+          $tag = $env:RELEASE_TAG
+          if (-not $tag) { $tag = (gh release list -R "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName') }
+          $archive = "${{ matrix.artifact }}.zip"
+          $url = "https://github.com/${{ github.repository }}/releases/download/$tag/$archive"
+          & "target/${{ matrix.target }}/dist/perry.exe" updater sign-cli-manifest `
+            --artifact $archive --platform $archive --url $url `
+            --release-version $tag.TrimStart('v') --key-id $env:PERRY_CLI_UPDATE_KEY_ID `
+            --secret-key-b64 $env:PERRY_CLI_UPDATE_SIGNING_KEY | Out-File -Encoding utf8 "$archive.update.json"
+
       - name: Upload release asset (Unix)
         if: runner.os != 'Windows' && (github.event_name == 'release' || github.event_name == 'workflow_dispatch')
         env:
@@ -644,11 +694,12 @@ jobs:
           # upload step entirely.
           TAG="${{ github.event.release.tag_name }}"
           if [ -z "$TAG" ]; then
-            TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
+            TAG=$(gh release list -R "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')
             echo "workflow_dispatch fallback: uploading to latest release tag $TAG"
           fi
           gh release upload "$TAG" "${{ matrix.artifact }}.tar.gz" --clobber
           gh release upload "$TAG" "${{ matrix.artifact }}.tar.gz.sha256" --clobber
+          gh release upload "$TAG" "${{ matrix.artifact }}.tar.gz.update.json" --clobber
 
       - name: Upload release asset (Windows)
         if: runner.os == 'Windows' && (github.event_name == 'release' || github.event_name == 'workflow_dispatch')
@@ -658,11 +709,12 @@ jobs:
         run: |
           $tag = "${{ github.event.release.tag_name }}"
           if (-not $tag) {
-            $tag = (gh release list --limit 1 --json tagName --jq '.[0].tagName')
+            $tag = (gh release list -R "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')
             Write-Host "workflow_dispatch fallback: uploading to latest release tag $tag"
           }
           gh release upload "$tag" "${{ matrix.artifact }}.zip" --clobber
           gh release upload "$tag" "${{ matrix.artifact }}.zip.sha256" --clobber
+          gh release upload "$tag" "${{ matrix.artifact }}.zip.update.json" --clobber
 
       - name: Upload build artifact (Unix, for deb + npm-publish jobs)
         if: runner.os != 'Windows'
@@ -1060,7 +1112,7 @@ jobs:
           set -euo pipefail
           TAG="${{ github.event.release.tag_name }}"
           if [ -z "$TAG" ]; then
-            TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
+            TAG=$(gh release list -R "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')
             echo "workflow_dispatch fallback: uploading to latest release tag $TAG"
           fi
           ARCHIVE="perry-cross-${{ matrix.target }}.tar.gz"
@@ -1075,7 +1127,7 @@ jobs:
         run: |
           $tag = "${{ github.event.release.tag_name }}"
           if (-not $tag) {
-            $tag = (gh release list --limit 1 --json tagName --jq '.[0].tagName')
+            $tag = (gh release list -R "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')
             Write-Host "workflow_dispatch fallback: uploading to latest release tag $tag"
           }
           $archive = "perry-cross-${{ matrix.target }}.tar.gz"
@@ -1112,7 +1164,7 @@ jobs:
           # upload step uses (see v0.5.392 for the publish-jobs sweep).
           TAG="${{ github.event.release.tag_name }}"
           if [ -z "$TAG" ]; then
-            TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
+            TAG=$(gh release list -R "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')
             echo "workflow_dispatch fallback: using latest release tag $TAG"
           fi
           VERSION="${TAG#v}"
@@ -1237,7 +1289,7 @@ jobs:
         run: |
           TAG="${{ github.event.release.tag_name }}"
           if [ -z "$TAG" ]; then
-            TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
+            TAG=$(gh release list -R "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')
             echo "workflow_dispatch fallback: using latest release tag $TAG"
           fi
           VERSION="${TAG#v}"
@@ -1438,7 +1490,7 @@ jobs:
         run: |
           TAG="${{ github.event.release.tag_name }}"
           if [ -z "$TAG" ]; then
-            TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
+            TAG=$(gh release list -R "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')
             echo "workflow_dispatch fallback: using latest release tag $TAG"
           fi
           VERSION="${TAG#v}"
@@ -1548,7 +1600,7 @@ jobs:
         run: |
           $tag = "${{ github.event.release.tag_name }}"
           if (-not $tag) {
-            $tag = (gh release list --limit 1 --json tagName --jq '.[0].tagName')
+            $tag = (gh release list -R "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')
             Write-Host "workflow_dispatch fallback: using latest release tag $tag"
           }
           $version = $tag -replace '^v', ''
@@ -1606,7 +1658,7 @@ jobs:
         run: |
           TAG="${{ github.event.release.tag_name }}"
           if [ -z "$TAG" ]; then
-            TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
+            TAG=$(gh release list -R "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')
             echo "workflow_dispatch fallback: using latest release tag $TAG"
           fi
           VERSION="${TAG#v}"
@@ -1642,7 +1694,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v6
+      # DELIBERATE EXEMPTION from the repo-wide .node-version pin: this Node is a
+      # *publishing* toolchain (npm registry auth), not a test oracle — it never
+      # runs a parity diff, so the gap suite's Node version is irrelevant here.
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
@@ -1685,8 +1740,15 @@ jobs:
         # died on the first package with "You cannot publish over the
         # previously published versions" — the remaining six packages could
         # never go out (run 27239815088).
+        # One platform's failure must not starve the packages after it in
+        # glob order (with `set -e` a single E413/transient registry error
+        # aborted the loop mid-way — exactly how linux/windows sat at a stale
+        # version for weeks while darwin kept updating). Record failures,
+        # keep publishing, fail the step at the end with the full list; the
+        # already-published skip above keeps re-runs idempotent.
         run: |
           set -e
+          failed=""
           for pkg in ./npm/perry-*; do
             name=$(node -p "require('$pkg/package.json').name")
             ver=$(node -p "require('$pkg/package.json').version")
@@ -1695,8 +1757,15 @@ jobs:
               continue
             fi
             echo "=== publishing $pkg ==="
-            npm publish "$pkg" --access public --provenance
+            if ! npm publish "$pkg" --access public --provenance; then
+              echo "::error::npm publish failed for $name@$ver — continuing with remaining packages"
+              failed="$failed $name@$ver"
+            fi
           done
+          if [ -n "$failed" ]; then
+            echo "::error::failed platform packages:$failed"
+            exit 1
+          fi
 
       - name: Publish wrapper (@perryts/perry) last
         run: |

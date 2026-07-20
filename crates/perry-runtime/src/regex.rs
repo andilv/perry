@@ -43,14 +43,20 @@ mod match_all;
 mod replace_expand;
 mod replace_fn;
 #[cfg(feature = "regex-engine")]
+mod unicode17;
+#[cfg(feature = "regex-engine")]
+mod unicode17_data;
+mod utf16;
+#[cfg(feature = "regex-engine")]
 use class_range_validate::has_out_of_order_double_dash_class_range;
 #[cfg(feature = "regex-engine")]
 pub use compile::js_regexp_compile_value;
 pub use escape::js_regexp_escape;
 #[cfg(feature = "regex-engine")]
 use exec_array::{
-    byte_index_to_char_index, char_index_to_byte, set_exec_array_groups, set_exec_array_indices,
-    set_exec_array_indices_fancy, set_exec_array_metadata,
+    byte_index_to_utf16_index, set_exec_array_groups, set_exec_array_indices,
+    set_exec_array_indices_fancy, set_exec_array_metadata, set_exec_array_metadata_value,
+    utf16_index_to_byte,
 };
 #[cfg(feature = "regex-engine")]
 use grammar::{
@@ -234,58 +240,131 @@ pub(crate) fn build_fancy_regex(pattern: &str) -> Result<fancy_regex::Regex, fan
         .build()
 }
 
+/// Entry cap for `REGEX_CACHE`/`FANCY_CACHE` (2026-07-09 GC audit: one entry
+/// per distinct `(pattern, flags)` ever compiled, no cap of any kind, entries
+/// up to [`REGEX_SIZE_LIMIT`] — `new RegExp(userInput)` was an attacker-driven
+/// OOM). When an insert would exceed the cap the whole map is cleared — the
+/// `PARSE_KEY_CACHE` precedent: cheap, no LRU bookkeeping, recompilation is
+/// the fallback. Live `RegExpHeader`s are unaffected: each header OWNS a
+/// leaked `Arc` reference to its compiled program(s) (`regex_ptr`/`fancy_ptr`),
+/// so dropping the cache's references cannot free a program still in use.
+#[cfg(feature = "regex-engine")]
+const REGEX_CACHE_MAX_ENTRIES: usize = 512;
+
+/// Clear-on-overflow guard shared by both compiled-regex caches: make room
+/// for one more entry, wiping the map when it is at capacity.
+#[cfg(feature = "regex-engine")]
+fn evict_regex_cache_if_full<V>(cache: &mut HashMap<(String, String), V>) {
+    if cache.len() >= REGEX_CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
+}
+
+/// Compile `(pattern, flags)` into the caches if absent, reporting whether
+/// SOME engine accepted the flag-prefixed pattern. One NFA build total —
+/// `js_regexp_new` used to build every unique pattern TWICE (once discarded
+/// for validation at construction, once here for the cache), which doubled
+/// regex cost during bundle startup where every module-level literal
+/// constructs eagerly (the emoji-regex class of pattern costs milliseconds
+/// per build).
+///
+/// Returns `true` when the pattern is usable: compiled by the `regex` crate
+/// (cached in `REGEX_CACHE`), or by `fancy-regex` (cached in `FANCY_CACHE`,
+/// with the never-match placeholder in `REGEX_CACHE` so non-fancy callers
+/// don't crash — the fancy fallback is handled in `js_regexp_exec_fancy`).
+/// Returns `false` when BOTH engines reject it — nothing is cached and the
+/// caller decides whether that is a SyntaxError (see `js_regexp_new`'s
+/// bare-pattern fallback for the flag-prefix size edge).
+#[cfg(feature = "regex-engine")]
+fn compile_and_cache_regex_checked(pattern: &str, flags: &str) -> bool {
+    let already = REGEX_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .contains_key(&(pattern.to_string(), flags.to_string()))
+    });
+    if already {
+        return true;
+    }
+    // Translate JS regex to Rust-compatible pattern
+    let translated = js_regex_to_rust(pattern);
+    let case_insensitive = flags.contains('i');
+    let multiline = flags.contains('m');
+    // #2828: the `s` (dotAll) flag maps directly onto the Rust `regex`
+    // crate's `(?s)` inline mode, so `.` matches newlines.
+    let dot_all = flags.contains('s');
+    let regex_pattern = if case_insensitive || multiline || dot_all {
+        let mut prefix = String::from("(?");
+        if case_insensitive {
+            prefix.push('i');
+        }
+        if multiline {
+            prefix.push('m');
+        }
+        if dot_all {
+            prefix.push('s');
+        }
+        prefix.push(')');
+        format!("{}{}", prefix, translated)
+    } else {
+        translated
+    };
+    let regex = match build_std_regex(&regex_pattern) {
+        Ok(re) => re,
+        Err(_) => {
+            // Pattern has features regex crate doesn't support
+            // (lookbehind, lookahead). Try fancy-regex which supports
+            // the full JS regex feature set, and if it compiles, wrap
+            // the result via a find-and-replace approach at the exec
+            // call sites. Store a never-matching pattern so existing
+            // callers don't crash.
+            let fancy_ok = FANCY_CACHE.with(|fc| {
+                if let Ok(fre) = build_fancy_regex(&regex_pattern) {
+                    let mut fc = fc.borrow_mut();
+                    evict_regex_cache_if_full(&mut fc);
+                    fc.insert(
+                        (pattern.to_string(), flags.to_string()),
+                        std::sync::Arc::new(fre),
+                    );
+                    true
+                } else {
+                    false
+                }
+            });
+            if !fancy_ok {
+                return false;
+            }
+            Regex::new(r"[^\s\S]").unwrap()
+        }
+    };
+    REGEX_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        evict_regex_cache_if_full(&mut cache);
+        cache.insert((pattern.to_string(), flags.to_string()), Arc::new(regex));
+    });
+    true
+}
+
 #[cfg(feature = "regex-engine")]
 fn get_or_compile_regex(pattern: &str, flags: &str) -> Arc<Regex> {
+    let hit = REGEX_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .get(&(pattern.to_string(), flags.to_string()))
+            .cloned()
+    });
+    if let Some(re) = hit {
+        return re;
+    }
+    let _ = compile_and_cache_regex_checked(pattern, flags);
     REGEX_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some(re) = cache.get(&(pattern.to_string(), flags.to_string())) {
             return re.clone();
         }
-        // Translate JS regex to Rust-compatible pattern
-        let translated = js_regex_to_rust(pattern);
-        let case_insensitive = flags.contains('i');
-        let multiline = flags.contains('m');
-        // #2828: the `s` (dotAll) flag maps directly onto the Rust `regex`
-        // crate's `(?s)` inline mode, so `.` matches newlines.
-        let dot_all = flags.contains('s');
-        let regex_pattern = if case_insensitive || multiline || dot_all {
-            let mut prefix = String::from("(?");
-            if case_insensitive {
-                prefix.push('i');
-            }
-            if multiline {
-                prefix.push('m');
-            }
-            if dot_all {
-                prefix.push('s');
-            }
-            prefix.push(')');
-            format!("{}{}", prefix, translated)
-        } else {
-            translated
-        };
-        let regex = match build_std_regex(&regex_pattern) {
-            Ok(re) => re,
-            Err(_) => {
-                // Pattern has features regex crate doesn't support
-                // (lookbehind, lookahead). Try fancy-regex which supports
-                // the full JS regex feature set, and if it compiles, wrap
-                // the result via a find-and-replace approach at the exec
-                // call sites. For now, store a never-matching pattern so
-                // existing callers don't crash — the fancy-regex fallback
-                // is handled in js_regexp_exec_fancy below.
-                FANCY_CACHE.with(|fc| {
-                    if let Ok(fre) = build_fancy_regex(&regex_pattern) {
-                        fc.borrow_mut().insert(
-                            (pattern.to_string(), flags.to_string()),
-                            std::sync::Arc::new(fre),
-                        );
-                    }
-                });
-                Regex::new(r"[^\s\S]").unwrap()
-            }
-        };
-        let arc = Arc::new(regex);
+        // Both engines rejected it (validation normally throws before this
+        // point) — keep the historical behavior: cache + return never-match.
+        let arc = Arc::new(Regex::new(r"[^\s\S]").unwrap());
+        evict_regex_cache_if_full(&mut cache);
         cache.insert((pattern.to_string(), flags.to_string()), arc.clone());
         arc
     })
@@ -622,23 +701,37 @@ pub extern "C" fn js_regexp_new(
                     pattern_str
                 ));
             }
-            // The expensive part of validation: compile the pattern with both
-            // engines just to confirm it is well-formed.
-            let translated = js_regex_to_rust(pattern_str);
-            if build_std_regex(&translated).is_err() && build_fancy_regex(&translated).is_err() {
-                throw_regexp_syntax_error(&format!(
-                    "Invalid regular expression: /{}/: invalid pattern",
-                    pattern_str
-                ));
+            // The expensive part of validation: compile the pattern. This
+            // BUILDS AND CACHES in one step (`compile_and_cache_regex_checked`)
+            // so the `get_or_compile_regex` below is a guaranteed cache hit —
+            // previously every unique pattern was NFA-compiled twice (once
+            // discarded here, once for the cache), doubling startup regex cost.
+            if !compile_and_cache_regex_checked(pattern_str, flags_str) {
+                // Preserve the historical edge: validation used to test the
+                // BARE translated pattern (no `(?ims)` prefix). A pattern that
+                // compiles bare but blows the size limit with the flag prefix
+                // must stay a silent never-match (matching prior behavior),
+                // not a SyntaxError.
+                let translated = js_regex_to_rust(pattern_str);
+                if build_std_regex(&translated).is_err() && build_fancy_regex(&translated).is_err()
+                {
+                    throw_regexp_syntax_error(&format!(
+                        "Invalid regular expression: /{}/: invalid pattern",
+                        pattern_str
+                    ));
+                }
             }
         }
     }
 
-    // Get or compile the regex from the cache. The returned Arc is stored
-    // in the cache indefinitely, so the raw pointer we extract stays valid
-    // for the lifetime of the process.
+    // Get or compile the regex from the cache. The header OWNS a leaked `Arc`
+    // reference (`Arc::into_raw`) to the compiled program — mirroring
+    // `fancy_ptr` below — so the pointer stays valid even after the capped
+    // `REGEX_CACHE` (see `REGEX_CACHE_MAX_ENTRIES`) evicts its own reference.
+    // Previously this borrowed `Arc::as_ptr` and relied on the cache never
+    // dropping an entry.
     let arc = get_or_compile_regex(pattern_str, flags_str);
-    let regex_ptr = Arc::as_ptr(&arc) as *mut Regex;
+    let regex_ptr = Arc::into_raw(arc) as *mut Regex;
 
     // Allocate the header via gc_malloc so it's tracked by the GC and gets
     // freed when no longer referenced. Previously this used raw alloc() and
@@ -664,6 +757,35 @@ pub extern "C" fn js_regexp_new(
         (*ptr).regex_ptr = regex_ptr;
         (*ptr).pattern_ptr = pattern;
         (*ptr).flags_ptr = canonical_flags_ptr;
+        // `pattern_ptr` / `flags_ptr` are GC-managed StringHeaders — the GC scans
+        // this 2-slot payload range via the magic-tagged RegExp layout, and
+        // `canonical_flags_ptr` (js_string_from_str above) is a freshly-allocated
+        // YOUNG string. They are stored into this malloc'd (old-generation) header
+        // by raw writes; without a write barrier the old→young edge is never
+        // remembered, so a copying minor GC sweeps the string while the retained
+        // RegExp still points at it. The evacuation verifier reports this as an
+        // uncovered object→string edge, and it crashes for real when the freed
+        // slot is later scanned/read (a heavy regex workload — e.g. ANSI/emoji
+        // parsing in a terminal UI — hits it within seconds). Remember both edges,
+        // mirroring every other native-header pointer store (closure captures,
+        // object prototype slots, array headers). `runtime_write_barrier_gc_slot`
+        // detects the malloc parent and only remembers genuinely-young children,
+        // so an already-old/interned `pattern` is a harmless no-op.
+        let regexp_parent_addr = ptr as usize;
+        if !pattern.is_null() {
+            crate::gc::runtime_write_barrier_gc_slot(
+                regexp_parent_addr,
+                std::ptr::addr_of!((*ptr).pattern_ptr) as usize,
+                js_nanbox_string(pattern as i64).to_bits(),
+            );
+        }
+        if !canonical_flags_ptr.is_null() {
+            crate::gc::runtime_write_barrier_gc_slot(
+                regexp_parent_addr,
+                std::ptr::addr_of!((*ptr).flags_ptr) as usize,
+                js_nanbox_string(canonical_flags_ptr as i64).to_bits(),
+            );
+        }
         (*ptr).case_insensitive = case_insensitive;
         (*ptr).global = global;
         (*ptr).multiline = multiline;
@@ -1276,7 +1398,7 @@ pub extern "C" fn js_string_search_regex(s: *const StringHeader, re: *const RegE
         // placeholder in `regex_ptr` would always report -1 otherwise.
         if let Some(fre) = lookup_fancy_regex(re) {
             return match fre.find(str_data) {
-                Ok(Some(m)) => str_data[..m.start()].chars().count() as i32,
+                Ok(Some(m)) => byte_index_to_utf16_index(str_data, m.start()) as i32,
                 _ => -1,
             };
         }
@@ -1284,11 +1406,9 @@ pub extern "C" fn js_string_search_regex(s: *const StringHeader, re: *const RegE
         let regex = &*(*re).regex_ptr;
         match regex.find(str_data) {
             Some(m) => {
-                // Convert byte offset to char offset (JS indices are UTF-16 code units,
-                // but for ASCII/BMP this matches char offset)
-                let byte_offset = m.start();
-                let char_offset = str_data[..byte_offset].chars().count();
-                char_offset as i32
+                // `String.prototype.search` returns a JS string index — UTF-16
+                // code units, matching `.index` / `lastIndex` / `str.length`.
+                byte_index_to_utf16_index(str_data, m.start()) as i32
             }
             None => -1,
         }

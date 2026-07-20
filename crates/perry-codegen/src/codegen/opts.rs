@@ -175,6 +175,16 @@ pub struct CompileOptions {
     /// it dispatched `tracer.make(Math.random())` instead of
     /// `random.make(Math.random())`.
     pub namespace_member_prefixes: std::collections::HashMap<(String, String), String>,
+    /// Issue #5924 (companion to #680/#678): per-namespace origin-name
+    /// resolution. Keyed by `(namespace_local_name, member_name)` →
+    /// `origin_name`. `import_function_origin_names` is a flat map, so when
+    /// two namespaces imported into the same file both have a member with
+    /// the same name and only one of them is a re-export rename, the
+    /// rename's origin-name override clobbers the other namespace's
+    /// (correct, unrenamed) suffix — `import { Effect, Context } from
+    /// "effect"` broke `Context.Service` because `Effect`'s own re-exported
+    /// `Service` clobbered the flat map first.
+    pub namespace_member_origin_names: std::collections::HashMap<(String, String), String>,
     /// When true, `compile_module` returns the textual LLVM IR (`.ll`)
     /// as bytes instead of invoking `clang -c` to produce an object file.
     /// Used by the bitcode-link path (`PERRY_LLVM_BITCODE_LINK=1`).
@@ -193,21 +203,6 @@ pub struct CompileOptions {
     /// Codegen uses this to know that `X.foo()` should be dispatched as
     /// a cross-module call rather than an object method call.
     pub namespace_imports: Vec<String>,
-    /// Issue #321: subset of `namespace_imports` populated by the
-    /// "named import resolves to a `export * as Foo from "./Foo"`" branch
-    /// in `compile.rs`. When the user wrote `import { Effect } from
-    /// "effect"` and effect's index.ts has `export * as Effect from
-    /// "./Effect.js"`, Effect lands in `namespace_imports` (so member
-    /// dispatch works) AND in this set (so the StaticMethodCall codegen
-    /// arm knows it's safe to route var-shape members through
-    /// `js_closure_callN`). Plain `import * as Effect from "./Effect"`
-    /// (used heavily by effect's INTERNAL modules) populates only
-    /// `namespace_imports`, NOT this set — the pre-existing direct-call
-    /// path preserves their long-standing silently-wrong-but-doesn't-throw
-    /// behavior on var-shape static calls (the right fix there is a
-    /// broader audit; doing it together with the named-import fix
-    /// surfaces init-order issues hiding behind the silent-wrong shape).
-    pub namespace_reexport_named_imports: std::collections::HashSet<String>,
     /// Imported class definitions from other native modules, keyed by
     /// the local alias (or original name when no alias). Each entry
     /// carries the class HIR, the module prefix of its origin, and an
@@ -291,17 +286,28 @@ pub struct CompileOptions {
         perry_api_manifest::NativeAbiType,
     )>,
     /// i18n translation table snapshot — `(translations, key_count,
-    /// locale_count, locale_codes, default_locale_idx)`. The
+    /// locale_count, locale_codes, default_locale_idx, currencies)`. The
     /// `default_locale_idx` is the row index used at compile time to
     /// resolve `Expr::I18nString` to the right translation — without
     /// it, the lowering would have to either pick locale 0 blindly or
-    /// fall back to the verbatim key.
+    /// fall back to the verbatim key. `currencies` is the sorted
+    /// `[i18n.currencies]` map (`locale → ISO 4217 code`) baked into the
+    /// entry `main` prelude's `perry_i18n_set_currencies` call.
     /// Tier 4.6 (v0.5.336): wrapped in `Arc` so the per-module clone
     /// in the `compile_module` rayon worker is a cheap reference bump
     /// instead of duplicating the (potentially large) `Vec<String>` of
-    /// every translated string. The tuple shape is unchanged for the
-    /// downstream destructure at `compile_module` line 597.
-    pub i18n_table: Option<std::sync::Arc<(Vec<String>, usize, usize, Vec<String>, usize)>>,
+    /// every translated string.
+    #[allow(clippy::type_complexity)]
+    pub i18n_table: Option<
+        std::sync::Arc<(
+            Vec<String>,
+            usize,
+            usize,
+            Vec<String>,
+            usize,
+            Vec<(String, String)>,
+        )>,
+    >,
 
     /// When true, emit LLVM `reassoc` per-instruction fast-math flags on
     /// every f64 op. Off by default — Perry produces bit-exact output
@@ -559,11 +565,12 @@ impl ImportedCtor {
 /// Built once in `compile_module` from `CompileOptions`.
 pub(crate) struct CrossModuleCtx {
     pub namespace_imports: std::collections::HashSet<String>,
-    /// Issue #321: see `CompileOptions::namespace_reexport_named_imports`.
-    pub namespace_reexport_named_imports: std::collections::HashSet<String>,
     /// Issue #680: per-namespace member resolution. See doc on
     /// `CompileOptions::namespace_member_prefixes`.
     pub namespace_member_prefixes: std::collections::HashMap<(String, String), String>,
+    /// Issue #5924: per-namespace origin-name resolution. See doc on
+    /// `CompileOptions::namespace_member_origin_names`.
+    pub namespace_member_origin_names: std::collections::HashMap<(String, String), String>,
     pub imported_async_funcs: std::collections::HashSet<String>,
     /// FuncIds of locally-defined async functions in this module. Populated
     /// from `hir.functions.is_async`. Used by `is_promise_expr` to refine
@@ -575,6 +582,15 @@ pub(crate) struct CrossModuleCtx {
     /// from the lowered iterator-return body shape and used by call lowering
     /// to attach instances to the closure-owned `g.prototype`.
     pub local_generator_funcs: std::collections::HashSet<u32>,
+    /// FuncIds of closures that were `async` in the source and got CPS-
+    /// rewritten into async-step state machines. The rewrite clears
+    /// `Expr::Closure.is_async`, so the flag alone can't identify them at
+    /// codegen time. Copied from `hir.async_step_closures`. Used by the
+    /// perry/thread worker-closure safety check (#6185): an async worker
+    /// closure's await machinery would drain the process-global
+    /// completion/timer queues on the worker thread and alias the main
+    /// thread's heap.
+    pub async_step_closures: std::collections::HashSet<u32>,
     /// FuncIds of locally-defined plain functions whose body reads the
     /// dynamic `this` binding (directly or via a this-capturing arrow).
     /// Bare `f()` call sites to these must reset the runtime IMPLICIT_THIS
@@ -706,6 +722,12 @@ pub(crate) struct CrossModuleCtx {
     pub target_triple: String,
     /// App metadata backing compile-time `perry/system` introspection APIs.
     pub app_metadata: AppMetadata,
+    /// Issue #5872: module-wide record of the prototype mutations that can
+    /// change what `obj.method` resolves to. Scalar replacement consults this
+    /// before it lets a summarized method call keep its receiver off the heap —
+    /// the mutation usually lives in a *different* function (or a constructor,
+    /// or a field initializer) than the `new`, so a per-function walk misses it.
+    pub module_dispatch: crate::collectors::ModuleDispatchFacts,
     /// Functions with a 3-param clamp pattern: fid → true. Call sites
     /// emit `@llvm.smax.i32` + `@llvm.smin.i32` instead of a function call.
     pub clamp3_functions: std::collections::HashSet<u32>,
@@ -801,6 +823,10 @@ pub(crate) struct CrossModuleCtx {
     /// Debug/benchmark switch that forces Buffer/Uint8Array accesses through
     /// the generic helper path.
     pub disable_buffer_fast_path: bool,
+    /// #6405: set when this module assigns a Buffer numeric read-method name as
+    /// an own property (`buf.readUInt8 = fn`). Threaded into every FnCtx so the
+    /// inline read intrinsic deopts to own-prop-aware runtime dispatch.
+    pub program_shadows_buffer_read_method: bool,
     /// (Issue #50) Module-level `const` 2D int arrays folded into flat
     /// `[N x i32]` LLVM constants. Maps local_id → info. Populated by
     /// scanning `hir.init`; threaded through every FnCtx so the IndexGet

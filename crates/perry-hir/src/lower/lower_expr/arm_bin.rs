@@ -48,7 +48,13 @@ pub(crate) fn lower_bin_expr(ctx: &mut LoweringContext, bin: &ast::BinExpr) -> R
         // lowering time when we recognise the receiver.
         if let ast::Expr::Ident(class_ident) = bin.right.as_ref() {
             let class_name = class_ident.sym.as_ref();
-            if class_name == "WeakRef" || class_name == "FinalizationRegistry" {
+            // #6233: only fold when the RHS really is the GLOBAL WeakRef /
+            // FinalizationRegistry — a user `class WeakRef {}` (or a local/
+            // function/import of that name) shadows the global, and its
+            // instances must take the generic instanceof path below.
+            if (class_name == "WeakRef" || class_name == "FinalizationRegistry")
+                && !ctx.shadows_unqualified_global(class_name)
+            {
                 if let ast::Expr::Ident(left_ident) = bin.left.as_ref() {
                     let local_name = left_ident.sym.to_string();
                     let is_match = (class_name == "WeakRef"
@@ -62,7 +68,19 @@ pub(crate) fn lower_bin_expr(ctx: &mut LoweringContext, bin: &ast::BinExpr) -> R
         let expr = Box::new(lower_expr(ctx, &bin.left)?);
         // Right side can be an identifier (ClassName) or member expression (Module.ClassName)
         let ty = match bin.right.as_ref() {
-            ast::Expr::Ident(ident) => ident.sym.to_string(),
+            // Honor a scope-local class rename: when two same-named classes
+            // collide (e.g. a bundler flattens two module factories that each
+            // declare `class l`), the SECOND is registered under a suffixed
+            // name (`l$0`) and `class_renames` maps the raw name to it. `extends`
+            // / `new` already resolve through this map, but `instanceof <name>`
+            // used the RAW ident — so `x instanceof l` resolved to the OTHER
+            // factory's `l` (class_id mismatch) and returned false even though
+            // the prototype chain was correct. This broke Auth.js's
+            // `error instanceof AuthError` guard (AuthError was the renamed
+            // class), so a `CredentialsSignin` was mis-wrapped in a
+            // `CallbackRouteError` and the login redirect fell back to
+            // `?error=Configuration` instead of `?error=CredentialsSignin`.
+            ast::Expr::Ident(ident) => ctx.resolve_class_name(ident.sym.as_ref()),
             ast::Expr::Member(member) => {
                 // Handle Module.ClassName - extract the full qualified name
                 let obj_name = if let ast::Expr::Ident(obj_ident) = member.obj.as_ref() {

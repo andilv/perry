@@ -23,6 +23,14 @@ use crate::OutputFormat;
 
 use super::{CompilationContext, CompileArgs, CompileResult, NativeBackend};
 
+/// Historical leftover from the pre-#1696 V8/`deno_core` fallback runtime
+/// (`perry-jsruntime`, removed). `ctx.js_modules` is only ever populated
+/// alongside `ctx.js_runtime_importers` (see `collect_modules.rs`), and
+/// `enforce_js_runtime_gate` (`bootstrap.rs`) hard-errors the build as soon
+/// as `js_runtime_importers` is non-empty — well before this function's
+/// caller runs. In current builds `ctx.js_modules` is therefore always
+/// empty here, so this function is effectively dead code kept around
+/// for the (currently unreachable) day a JS engine ships again.
 pub(super) fn generate_js_bundle(ctx: &CompilationContext, output_dir: &Path) -> Result<PathBuf> {
     let bundle_path = output_dir.join("__perry_js_bundle.js");
 
@@ -50,17 +58,21 @@ pub(super) fn generate_js_bundle(ctx: &CompilationContext, output_dir: &Path) ->
     Ok(bundle_path)
 }
 
-/// Issue #818 follow-up: emit a generated C file whose constructor
-/// registers every bundled JS module (and bare-specifier alias) into
-/// `perry-jsruntime`'s embedded-module map at startup. Returns the path
-/// to the compiled `.o`, ready to be appended to `obj_paths` ahead of
-/// the final link. The result is a self-contained binary: the V8
-/// fallback `ModuleLoader` consults the in-memory map before touching
-/// disk, so `node_modules/` is no longer required at runtime.
+/// Issue #818 follow-up, now historical: this generated a C constructor
+/// that registered every bundled JS module (and bare-specifier alias)
+/// into `perry-jsruntime`'s embedded-module map at startup, so the V8
+/// fallback `ModuleLoader` could consult the in-memory map before
+/// touching disk. `perry-jsruntime` (V8 via `deno_core`) was removed in
+/// #1696 — Perry ships no JS engine and compiles TypeScript ahead-of-time
+/// only, so `js_register_embedded_module`/`js_register_embedded_alias`
+/// (declared as `extern` below) no longer have any implementation to
+/// link against.
 ///
-/// Constructor priority `101` lands before any normal user constructors
-/// and before `main`'s call to `js_runtime_init`, so by the time the
-/// runtime asks for a module the map is fully populated.
+/// Like `generate_js_bundle` above, this function is effectively dead
+/// code today: `ctx.js_modules` can't be non-empty by the time its
+/// caller runs, because `enforce_js_runtime_gate` hard-errors the build
+/// as soon as any entry lands in `ctx.js_modules` (see that function's
+/// doc comment). Kept for reference / in case a JS engine returns.
 pub(super) fn generate_embedded_js_object(
     ctx: &CompilationContext,
     output_dir: &Path,
@@ -667,6 +679,48 @@ pub(super) fn compile_for_watchos_widget(
             format,
         )?;
         built_binary = Some(appex_path.clone());
+
+        // #675 — sign the widget `.appex` with the App Group entitlement so
+        // the WidgetKit extension can read the shared `NSUserDefaults` suite
+        // the app writes. Only when a widget declares `appGroup`; otherwise
+        // the appex stays unsigned (unchanged). Mirrors the watch app path:
+        // ad-hoc for the simulator, `[watchos]` identity + profile on device.
+        // One entitlement is emitted per `.appex`, so all widgets bundled in it
+        // must share a single App Group — otherwise the widgets whose group is
+        // dropped silently lose shared-suite access. Reject the conflict.
+        let widget_app_groups = widgets
+            .iter()
+            .filter_map(|w| w.app_group.as_deref())
+            .filter(|group| !group.is_empty())
+            .collect::<std::collections::BTreeSet<_>>();
+        if widget_app_groups.len() > 1 {
+            anyhow::bail!(
+                "watchOS widgets in the same extension must declare the same appGroup; found: {}",
+                widget_app_groups
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        let widget_app_group = widget_app_groups.iter().next().copied();
+        if super::apple_info_plist::inject_app_group_entitlement(
+            &appex_path,
+            widget_app_group,
+            format,
+        )
+        .is_some()
+        {
+            let signing_cfg = super::apple_codesign::read_watch_signing_config(&args.input);
+            super::apple_codesign::codesign_apple_bundle(
+                &appex_path,
+                &appex_path.join("app.entitlements"),
+                is_simulator,
+                &signing_cfg,
+                format,
+            )?;
+        }
+
         match format {
             OutputFormat::Text => {
                 println!("watchOS complication built: {}", appex_path.display());
@@ -726,7 +780,17 @@ pub(super) fn find_watchos_swift_runtime() -> Option<PathBuf> {
         }
     }
 
-    // 2. Check in the source tree (development builds)
+    // 2. Check the workspace checkout (PERRY_WORKSPACE_ROOT / exe / cwd
+    // walk) so npm/homebrew installs pointed at a source tree resolve the
+    // Swift shell the same way they resolve runtime/stdlib.
+    if let Some(root) = super::find_perry_workspace_root() {
+        let candidate = root.join("crates/perry-ui-watchos/swift/PerryWatchApp.swift");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    // 3. Check in the source tree (development builds)
     let source_candidate = PathBuf::from("crates/perry-ui-watchos/swift/PerryWatchApp.swift");
     if source_candidate.exists() {
         return Some(source_candidate);
@@ -752,6 +816,13 @@ pub(super) fn find_visionos_swift_runtime() -> Option<PathBuf> {
                     return Some(candidate);
                 }
             }
+        }
+    }
+
+    if let Some(root) = super::find_perry_workspace_root() {
+        let candidate = root.join("crates/perry-ui-visionos/swift/PerryVisionApp.swift");
+        if candidate.exists() {
+            return Some(candidate);
         }
     }
 

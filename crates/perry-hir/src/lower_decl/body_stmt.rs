@@ -87,6 +87,7 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                                                 ty: Type::Array(Box::new(Type::Any)),
                                                 mutable: true,
                                                 init: Some(Expr::PropertyGet {
+                                                    byte_offset: 0,
                                                     object: Box::new(Expr::This),
                                                     property: field_name.clone(),
                                                 }),
@@ -141,6 +142,14 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                     // This is a destructuring assignment at statement level
                     // We can emit proper Let statements for temporaries
                     let stmts = lower_destructuring_assignment_stmt(ctx, pat, &assign.right)?;
+                    result.extend(stmts);
+                    return Ok(result);
+                }
+                // #6071: compound member/index assignment — spill base + computed
+                // key into Let temps so each is evaluated exactly once.
+                if let Some(stmts) =
+                    crate::lower::expr_assign::hoist_compound_member_assign(ctx, assign)?
+                {
                     result.extend(stmts);
                     return Ok(result);
                 }
@@ -301,16 +310,40 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                 // class VALUE (`exports.C = C; new mod.C()`) can fill the
                 // synthesized `__perry_cap_<id>` ctor params. Static `new C()`
                 // sites still pass captures as trailing args directly.
-                if let Some(captured) = ctx.lookup_class_captures(&class.name) {
-                    if !captured.is_empty() {
-                        let captures: Vec<Expr> =
-                            captured.iter().map(|id| Expr::LocalGet(*id)).collect();
-                        result.push(Stmt::Expr(Expr::RegisterClassCaptures {
-                            class_name: class.name.clone(),
-                            captures,
-                        }));
-                    }
+                let captured_exprs: Vec<Expr> = ctx
+                    .lookup_class_captures(&class.name)
+                    .map(|ids| ids.iter().map(|id| Expr::LocalGet(*id)).collect())
+                    .unwrap_or_default();
+                if !captured_exprs.is_empty() {
+                    result.push(Stmt::Expr(Expr::RegisterClassCaptures {
+                        class_name: class.name.clone(),
+                        captures: captured_exprs.clone(),
+                    }));
                 }
+                // #6465: a capturing class DECLARATION in a factory needs
+                // per-evaluation semantics, same as a class expression.
+                // `RegisterClassCaptures` above is a class-id-keyed,
+                // last-wins registry — when the enclosing function runs more
+                // than once (effect's `makeException`, called once per
+                // exception kind), every escaped class value replayed the
+                // LAST call's captures: all of effect's core error classes
+                // reported `_tag` "TimeoutException", masking the real error
+                // in any `Cause.pretty` output and breaking every
+                // `catchTag`-style dispatch. Bind the declared name to a
+                // `ClassExprFresh` value (the #1772/#1787 machinery class
+                // EXPRESSIONS already use) so each evaluation carries its own
+                // captured environment on its own heap class object. Scoped
+                // to capture-only classes: one with static state keeps the
+                // shared-template path, whose interleaved static-init
+                // statements below target the template by name. Prototype
+                // identity is still shared per template — the remaining gap
+                // tracked on #6465.
+                let has_static_state = !class.static_fields.is_empty()
+                    || class
+                        .static_methods
+                        .iter()
+                        .any(|m| m.name.starts_with("__perry_static_init_"));
+                let fresh_binding = !captured_exprs.is_empty() && !has_static_state;
                 // Static field initializers + static blocks for a
                 // function-nested class. The module-level path
                 // (`lower/stmt.rs`) emits these into `module.init`; here they
@@ -327,7 +360,31 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                     &class.static_fields,
                     &class.static_methods,
                 ));
+                let template_name = class.name.clone();
                 ctx.pending_classes.push(class);
+                // #6465 (see `fresh_binding` above): bind the declared name to
+                // a per-evaluation heap class object. The local shadows the
+                // class-registry fallback for every in-scope read — including
+                // the factory's `return C` — so the escaped value carries THIS
+                // evaluation's captures instead of the registry's last-wins
+                // snapshot. `new C()` sites that statically resolve the
+                // template still pass the live captures as trailing args, so
+                // in-factory construction is per-evaluation on both paths.
+                if fresh_binding {
+                    let class_local = ctx.define_local(class_name.clone(), Type::Any);
+                    result.push(Stmt::Let {
+                        id: class_local,
+                        name: class_name.clone(),
+                        ty: Type::Any,
+                        init: Some(Expr::ClassExprFresh {
+                            template: template_name,
+                            named_statics: Vec::new(),
+                            symbol_statics: Vec::new(),
+                            captured_args: captured_exprs,
+                        }),
+                        mutable: false,
+                    });
+                }
                 // #5251 follow-up — a function-nested `class X { … }` whose
                 // name collides with an OUTER same-named local must SHADOW
                 // that local within this scope, exactly as a nested
@@ -346,7 +403,7 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                 // `local_class_aliases`) so the in-scope read resolves to the
                 // class. Gated on a pre-existing outer binding so working
                 // packages (no collision) are byte-for-byte unaffected.
-                if ctx.lookup_local(&class_name).is_some() {
+                if !fresh_binding && ctx.lookup_local(&class_name).is_some() {
                     let class_local = ctx.define_local(class_name.clone(), Type::Any);
                     result.push(Stmt::Let {
                         id: class_local,
@@ -809,6 +866,13 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
             let discriminant = lower_expr(ctx, &switch_stmt.discriminant)?;
             let mut cases = Vec::new();
             let switch_scope_mark = ctx.push_block_scope();
+            // Case statement-lists share the switch's block scope without
+            // being a `BlockStmt`, so they don't pass through
+            // `lower_block_stmt` — re-bind their pre-registered
+            // forward-captured lets here (all cases up front: one scope).
+            for case in &switch_stmt.cases {
+                crate::lower_decl::rebind_nested_forward_scope_lets(ctx, &case.cons);
+            }
 
             for case in &switch_stmt.cases {
                 let test = case.test.as_ref().map(|e| lower_expr(ctx, e)).transpose()?;
@@ -927,7 +991,7 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                         name: format!("__res_{}", res_id),
                         ty: Type::Any,
                         mutable: true,
-                        init: Some(read_call()),
+                        init: Some(Expr::Undefined),
                     });
 
                     let item_name = if let ast::ForHead::VarDecl(var_decl) = &for_of_stmt.left {
@@ -952,23 +1016,32 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                         ty: Type::Any,
                         mutable: false,
                         init: Some(Expr::PropertyGet {
+                            byte_offset: 0,
                             object: Box::new(Expr::LocalGet(res_id)),
                             property: "value".to_string(),
                         }),
                     });
                     let user_body = lower_body_stmt(ctx, &for_of_stmt.body)?;
                     body_stmts.extend(user_body);
-                    body_stmts.push(Stmt::Expr(Expr::LocalSet(res_id, Box::new(read_call()))));
 
-                    result.push(Stmt::While {
-                        condition: Expr::Unary {
-                            op: UnaryOp::Not,
-                            operand: Box::new(Expr::PropertyGet {
+                    // Advance-at-top driver (see lower_decl/body_stmt/for_await.rs):
+                    // `continue` must re-run the read, not re-process the same chunk.
+                    let mut loop_body = vec![
+                        Stmt::Expr(Expr::LocalSet(res_id, Box::new(read_call()))),
+                        Stmt::If {
+                            condition: Expr::PropertyGet {
+                                byte_offset: 0,
                                 object: Box::new(Expr::LocalGet(res_id)),
                                 property: "done".to_string(),
-                            }),
+                            },
+                            then_branch: vec![Stmt::Break],
+                            else_branch: None,
                         },
-                        body: body_stmts,
+                    ];
+                    loop_body.extend(body_stmts);
+                    result.push(Stmt::While {
+                        condition: Expr::Bool(true),
+                        body: loop_body,
                     });
 
                     // reader.releaseLock(); — best-effort cleanup so the
@@ -1096,6 +1169,7 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                 } else if is_node_readable_for_await {
                     Expr::Call {
                         callee: Box::new(Expr::PropertyGet {
+                            byte_offset: 0,
                             object: Box::new(iter_expr_raw),
                             property: "iterator".to_string(),
                         }),
@@ -1130,6 +1204,7 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                     .push((format!("__result_{}", result_id), result_id, Type::Any));
                 let raw_next_call = Expr::Call {
                     callee: Box::new(Expr::PropertyGet {
+                        byte_offset: 0,
                         object: Box::new(Expr::LocalGet(iter_id)),
                         property: "next".to_string(),
                     }),
@@ -1147,7 +1222,7 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                     name: format!("__result_{}", result_id),
                     ty: Type::Any,
                     mutable: true,
-                    init: Some(next_call.clone()),
+                    init: Some(Expr::Undefined),
                 });
 
                 let binding_pat: Option<&ast::Pat> =
@@ -1157,6 +1232,7 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                         None
                     };
                 let value_expr = Expr::PropertyGet {
+                    byte_offset: 0,
                     object: Box::new(Expr::LocalGet(result_id)),
                     property: "value".to_string(),
                 };
@@ -1207,17 +1283,25 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                     insert_iterator_return_before_abrupts(&mut user_body, iter_id, needs_await);
                 }
                 body_stmts.extend(user_body);
-                body_stmts.push(Stmt::Expr(Expr::LocalSet(result_id, Box::new(next_call))));
 
-                result.push(Stmt::While {
-                    condition: Expr::Unary {
-                        op: UnaryOp::Not,
-                        operand: Box::new(Expr::PropertyGet {
+                // Advance-at-top driver (see lower_decl/body_stmt/for_await.rs):
+                // `continue` must re-run `next()`, not re-process the same result.
+                let mut loop_body = vec![
+                    Stmt::Expr(Expr::LocalSet(result_id, Box::new(next_call))),
+                    Stmt::If {
+                        condition: Expr::PropertyGet {
+                            byte_offset: 0,
                             object: Box::new(Expr::LocalGet(result_id)),
                             property: "done".to_string(),
-                        }),
+                        },
+                        then_branch: vec![Stmt::Break],
+                        else_branch: None,
                     },
-                    body: body_stmts,
+                ];
+                loop_body.extend(body_stmts);
+                result.push(Stmt::While {
+                    condition: Expr::Bool(true),
+                    body: loop_body,
                 });
 
                 ctx.pop_block_scope(scope_mark);
@@ -1759,17 +1843,26 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                 loop_body.insert(i, stmt);
             }
 
-            // Loop bound: Map/Set fast paths use `.size` (codegen-recognized,
-            // lowered to js_map_size / js_set_size), regular path uses .length.
-            let bound_expr = if map_kv_fastpath || set_fastpath {
-                Expr::PropertyGet {
-                    object: Box::new(Expr::LocalGet(arr_id)),
-                    property: "size".to_string(),
-                }
+            // Map/Set fast path re-derives the cursor each iteration so a mid-loop
+            // `delete` (which compacts the entries array) can't skip an entry
+            // (#6075). Array/String/iterator paths keep `idx < length`.
+            let condition = if map_kv_fastpath || set_fastpath {
+                let (init_lets, cond, prefix) =
+                    crate::lower::map_set_delete_safe_for_of(ctx, arr_id, idx_id, set_fastpath);
+                result.extend(init_lets);
+                let mut body = prefix;
+                body.append(&mut loop_body);
+                loop_body = body;
+                cond
             } else {
-                Expr::PropertyGet {
-                    object: Box::new(Expr::LocalGet(arr_id)),
-                    property: "length".to_string(),
+                Expr::Compare {
+                    op: CompareOp::Lt,
+                    left: Box::new(Expr::LocalGet(idx_id)),
+                    right: Box::new(Expr::PropertyGet {
+                        byte_offset: 0,
+                        object: Box::new(Expr::LocalGet(arr_id)),
+                        property: "length".to_string(),
+                    }),
                 }
             };
             // Create the for loop
@@ -1781,11 +1874,7 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                     mutable: true,
                     init: Some(Expr::Number(0.0)),
                 })),
-                condition: Some(Expr::Compare {
-                    op: CompareOp::Lt,
-                    left: Box::new(Expr::LocalGet(idx_id)),
-                    right: Box::new(bound_expr),
-                }),
+                condition: Some(condition),
                 update: Some(Expr::Update {
                     id: idx_id,
                     op: UpdateOp::Increment,
@@ -1802,10 +1891,20 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
             let head_binding =
                 crate::lower::predefine_for_head(ctx, &for_in_stmt.left, Type::String)?;
 
+            // Spill the receiver into a temp so each iteration can re-check
+            // that the current key still exists (for-in deletion semantics).
             let obj_expr = lower_expr(ctx, &for_in_stmt.right)?;
+            let obj_id = ctx.fresh_local();
+            result.push(Stmt::Let {
+                id: obj_id,
+                name: format!("__forin_obj_{}", obj_id),
+                ty: Type::Any,
+                mutable: false,
+                init: Some(obj_expr),
+            });
             // for-in: own + inherited enumerable keys, nullish-safe (no throw).
             // See lower/stmt_loops.rs::lower_stmt_for_in for the rationale.
-            let keys_expr = Expr::ForInKeys(Box::new(obj_expr));
+            let keys_expr = Expr::ForInKeys(Box::new(Expr::LocalGet(obj_id)));
             let keys_id = ctx.fresh_local();
             let idx_id = ctx.fresh_local();
 
@@ -1830,6 +1929,9 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                 loop_body.insert(i, stmt);
             }
 
+            // Skip keys deleted from the receiver before they are visited.
+            let loop_body = crate::lower::guard_for_in_body(obj_id, keys_id, idx_id, loop_body);
+
             // Create the for loop
             result.push(Stmt::For {
                 init: Some(Box::new(Stmt::Let {
@@ -1843,6 +1945,7 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                     op: CompareOp::Lt,
                     left: Box::new(Expr::LocalGet(idx_id)),
                     right: Box::new(Expr::PropertyGet {
+                        byte_offset: 0,
                         object: Box::new(Expr::LocalGet(keys_id)),
                         property: "length".to_string(),
                     }),

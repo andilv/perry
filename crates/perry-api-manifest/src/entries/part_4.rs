@@ -471,6 +471,21 @@ pub(crate) const API_MANIFEST_PART_4: &[ApiEntry] = &[
     method("perry/system", "keychainDelete", false, None),
     method("perry/system", "preferencesGet", false, None),
     method("perry/system", "preferencesSet", false, None),
+    // Haptic feedback: hapticPlay("success" | "warning" | "error" |
+    // "light" | "medium" | "heavy" | "click" | "selection" |
+    // "directionUp" | "directionDown" | "start" | "stop"). Maps to
+    // WKInterfaceDevice playHaptic: (watchOS), UIFeedbackGenerator
+    // (iOS), VibrationEffect (Android), NSHapticFeedbackManager
+    // (macOS), navigator.vibrate (Web); no-op on platforms without a
+    // haptic engine (tvOS, visionOS, GTK4, Windows).
+    method_sig(
+        "perry/system",
+        "hapticPlay",
+        false,
+        None,
+        &[p_str("type")],
+        TypeSpec::Void,
+    ),
     method("perry/system", "notificationSend", false, None),
     method("perry/system", "notificationCancel", false, None),
     method("perry/system", "notificationOnTap", false, None),
@@ -682,9 +697,18 @@ pub(crate) const API_MANIFEST_PART_4: &[ApiEntry] = &[
     method("date-fns", "startOfDay", false, None),
     method("date-fns", "endOfDay", false, None),
     // --- rate-limiter-flexible — perry-ext-ratelimit. Surface mirrors
-    //     the npm package's RateLimiterMemory class. ---
+    //     the npm package's RateLimiterMemory class. Construction is a
+    //     lower_builtin_new arm (js_ratelimit_new_from_options); the
+    //     instance methods dispatch via the NATIVE_MODULE_TABLE rows in
+    //     lower_call/native_table/extras.rs. ---
     class("rate-limiter-flexible", "RateLimiterMemory"),
     class("rate-limiter-flexible", "RateLimiterAbstract"),
+    method("rate-limiter-flexible", "consume", true, None),
+    method("rate-limiter-flexible", "get", true, None),
+    method("rate-limiter-flexible", "delete", true, None),
+    method("rate-limiter-flexible", "block", true, None),
+    method("rate-limiter-flexible", "penalty", true, None),
+    method("rate-limiter-flexible", "reward", true, None),
     // --- fetch — well-known alias for perry-ext-fetch. Same surface
     //     as node-fetch (the more common alias above). ---
     method("fetch", "default", false, None),
@@ -1019,4 +1043,19 @@ pub(crate) const API_MANIFEST_PART_4: &[ApiEntry] = &[
     method("perry/ads", "js_ads_banner_create", false, None),
     method("perry/ads", "js_ads_banner_destroy", false, None),
     method("perry/ads", "js_ads_request_consent", false, None),
+    // --- "bun" module / Bun globals shim pack (issue #6560) ---
+    // Tier 0 of Bun-app support (driver: opencode). `Bun.stringWidth`,
+    // `Bun.file` / `Bun.write`, `Bun.stdin/stdout/stderr`, `Bun.hash`
+    // (Zig-std wyhash, BigInt result), and the module-level
+    // `pathToFileURL` / `fileURLToPath` aliases of node:url.
+    // Implementation: perry-runtime `bun_compat`.
+    method("bun", "stringWidth", false, None),
+    method("bun", "hash", false, None),
+    method("bun", "file", false, None),
+    method("bun", "write", false, None),
+    method("bun", "pathToFileURL", false, None),
+    method("bun", "fileURLToPath", false, None),
+    property("bun", "stdin"),
+    property("bun", "stdout"),
+    property("bun", "stderr"),
 ];

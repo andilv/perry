@@ -9,11 +9,20 @@ pub static PERRY_SYSTEM_TABLE: &[MethodRow] = &[
         args: &[],
         ret: ReturnKind::F64,
     },
+    // Returns the broad device form factor as a JS string: "phone",
+    // "pad", "mac", "tv", "watch", "vision", or "desktop" — the contract
+    // documented in types/perry/system/index.d.ts and docs/src/system/.
+    // The platform FFIs return a raw `*mut StringHeader` (i64) via
+    // `js_string_from_bytes`, so the return kind MUST be `Str` (NaN-box
+    // with STRING_TAG) — same shape as `getDeviceModel` below. This row
+    // was `F64` while the impls returned numeric codes (0 = phone,
+    // 1 = pad, 4 = watch) that nothing ever mapped to the documented
+    // strings, so `getDeviceIdiom() === "mac"` could never be true.
     MethodRow {
         method: "getDeviceIdiom",
         runtime: "perry_get_device_idiom",
         args: &[],
-        ret: ReturnKind::F64,
+        ret: ReturnKind::Str,
     },
     // #1475 — safe-area insets. Returns `{ top, right, bottom, left }` (points)
     // read from `UIWindow.safeAreaInsets` (iOS) / `WindowInsets.systemBars()`
@@ -100,6 +109,18 @@ pub static PERRY_SYSTEM_TABLE: &[MethodRow] = &[
         args: &[ArgKind::Str, ArgKind::F64],
         ret: ReturnKind::Void,
     },
+    // Haptic feedback — plays a system haptic effect. The single Str
+    // arg is the HapticType name ("success", "error", "light", ...);
+    // the platform FFI parses it and maps to the native haptic engine
+    // (WKInterfaceDevice / UIFeedbackGenerator / VibrationEffect /
+    // NSHapticFeedbackManager / navigator.vibrate). No-op on platforms
+    // without a haptic engine.
+    MethodRow {
+        method: "hapticPlay",
+        runtime: "perry_system_haptic_play",
+        args: &[ArgKind::Str],
+        ret: ReturnKind::Void,
+    },
     MethodRow {
         method: "notificationSend",
         runtime: "perry_system_notification_send",
@@ -166,21 +187,28 @@ pub static PERRY_SYSTEM_TABLE: &[MethodRow] = &[
         args: &[ArgKind::F64],
         ret: ReturnKind::F64,
     },
+    // Returns the device model identifier (e.g. "iPhone15,2") as a JS
+    // string. The runtime fn returns a raw `*mut StringHeader` (i64) via
+    // `js_string_from_bytes`, so the return kind MUST be `Str` (NaN-box
+    // with STRING_TAG) — same as `getLocale` below. `F64` would pass the
+    // raw pointer bits through as a double → `NaN`, and any downstream use
+    // (e.g. `table[getDeviceModel()]`) then dereferences NaN as a string
+    // pointer and segfaults (#5972).
     MethodRow {
         method: "getDeviceModel",
         runtime: "perry_system_get_device_model",
         args: &[],
-        ret: ReturnKind::F64,
+        ret: ReturnKind::Str,
     },
-    // Bug-report-flow utility: stable OS-version string per
-    // platform. Returns a NaN-boxed JS string the user can splice
-    // into crash reports / telemetry. Same dispatch shape as
-    // getDeviceModel.
+    // Bug-report-flow utility: stable OS-version string per platform,
+    // for splicing into crash reports / telemetry. Same raw
+    // `*mut StringHeader` return shape as `getDeviceModel` — must be
+    // `Str`, not `F64` (#5972).
     MethodRow {
         method: "getOSVersion",
         runtime: "perry_system_get_os_version",
         args: &[],
-        ret: ReturnKind::F64,
+        ret: ReturnKind::Str,
     },
     MethodRow {
         method: "audioSetOutputFilename",

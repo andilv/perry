@@ -31,7 +31,14 @@ pub fn walk_expr_children_mut(e: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
 /// the seed for fresh-id allocation when adding synthetic params /
 /// temporaries.
 pub fn max_local_id(module: &Module) -> LocalId {
-    let mut max_id: LocalId = 0;
+    // 2026-07-02 audit (#5143 family): this walk's `max_in_expr` delegates to
+    // walk_expr_children, which does NOT descend closure bodies, and the
+    // class walk missed field initializers — deforest runs FIRST in the
+    // pipeline and mints out-param ids at max+1, so a module whose highest
+    // ids live inside closures (virtually all real modules) got aliasing
+    // ids. Anchor on the generator pass's hardened exhaustive scan (#5293)
+    // and keep the legacy walk as belt-and-braces.
+    let mut max_id: LocalId = crate::generator::compute_max_local_id(module);
     for f in &module.functions {
         for p in &f.params {
             max_id = max_id.max(p.id);
@@ -158,7 +165,7 @@ pub fn max_in_stmt(stmt: &Stmt, max_id: &mut LocalId) {
             }
         }
         Stmt::Labeled { body, .. } => max_in_stmt(body, max_id),
-        Stmt::PreallocateBoxes(ids) => {
+        Stmt::PreallocateBoxes(ids) | Stmt::PreallocateTdzBoxes(ids) => {
             for id in ids {
                 *max_id = (*max_id).max(*id);
             }

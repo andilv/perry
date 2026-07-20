@@ -151,7 +151,10 @@ pub fn try_lower_console_call(
     // already adds a newline, so multi-arg console.log will be
     // separated by newlines instead of spaces. Spec-compliant
     // separator handling lives in a future Phase I tweak.
-    if let Expr::PropertyGet { object, property } = callee {
+    if let Expr::PropertyGet {
+        object, property, ..
+    } = callee
+    {
         if matches!(object.as_ref(), Expr::GlobalGet(_))
             && matches!(
                 property.as_str(),
@@ -521,7 +524,10 @@ pub fn try_lower_promise_static_call(
     // The HIR doesn't have dedicated PromiseResolve/Reject variants. Depending
     // on the lowering path they appear either as a bare GlobalGet receiver or
     // as `globalThis.Promise.<method>`.
-    if let Expr::PropertyGet { object, property } = callee {
+    if let Expr::PropertyGet {
+        object, property, ..
+    } = callee
+    {
         if is_global_constructor_expr(object, "Promise") {
             match property.as_str() {
                 "resolve" => {
@@ -657,7 +663,10 @@ pub fn try_lower_native_method_str_dispatch(
     // method name as a raw rodata byte pointer (the StringPool already
     // emits the bytes as `[N+1 x i8]` for every interned string), and
     // materialize the args into a stack `[N x double]` slot.
-    if let Expr::PropertyGet { object, property } = callee {
+    if let Expr::PropertyGet {
+        object, property, ..
+    } = callee
+    {
         if is_message_port_closure_method(object, property) {
             return Ok(None);
         }
@@ -756,13 +765,30 @@ pub fn try_lower_native_method_str_dispatch(
             .and_then(|n| class_builtin_collection_kind(ctx, n))
             .filter(|kind| matches!(*kind, "Map" | "Set"))
             .is_some_and(|kind| is_collection_method_for_kind(kind, property.as_str()));
+        // A `class X extends Array` instance's inherited Array methods
+        // (`push`/`map`/`join`/…) are NOT class methods — they live on the
+        // runtime's spec-generic array-like engine over the plain `ObjectHeader`
+        // instance. The static class-dispatch tower above finds no method entry
+        // (Array is not a user class) and returns None, so without this carve-out
+        // the call falls into the closure-call fallthrough, which reads the
+        // method as a non-callable property and throws "value is not a function".
+        // Route it through `js_native_call_method` (whose relaxed plain-object
+        // mutator guard + Array-subclass read arm handle it). A user-defined
+        // override of the same name resolves earlier via the static tower, so it
+        // never reaches here. Mirrors the `is_collection_subclass_method`
+        // carve-out for Map/Set subclasses.
+        let is_array_subclass_method = class_name_opt
+            .as_deref()
+            .is_some_and(|n| class_extends_builtin_array(ctx, n))
+            && is_array_like_method(property.as_str());
         let skip_native = matches!(object.as_ref(), Expr::GlobalGet(_))
             || matches!(object.as_ref(), Expr::NativeModuleRef(_))
             || (class_name_opt.is_some()
                 && !is_buffer_class
                 && !class_unknown_to_codegen
                 && !is_well_known_proto_method
-                && !is_collection_subclass_method);
+                && !is_collection_subclass_method
+                && !is_array_subclass_method);
         if !skip_native {
             // Issue #92 fast path: intrinsify Buffer numeric reads
             // (`buf.readInt32BE(off)` etc.) when the receiver is a tracked
@@ -778,6 +804,28 @@ pub fn try_lower_native_method_str_dispatch(
                         crate::native_value::MaterializationReason::FunctionAbi,
                     );
                     return Ok(Some(materialized));
+                }
+            }
+            // #6386 fast path: `dv.getFloat64(off, le)` / `dv.setInt32(off, v)`
+            // lowers to one `js_data_view_{get,set}_direct` call instead of
+            // the generic dispatch tower. Fires for a statically-typed
+            // DataView receiver AND for an unknown-typed receiver (a mutable
+            // `var v = new DataView(b)` is widened to Any by the local-type
+            // fixpoint) whose method name matches the accessor family — the
+            // runtime entry re-validates the receiver against the DataView
+            // registry and re-enters `js_native_call_method` otherwise, so a
+            // non-DataView receiver that happens to share the method name
+            // keeps its generic dispatch semantics (same #5525 guarded-
+            // fast-path shape as typed-array index access).
+            if matches!(class_name_opt.as_deref(), Some("DataView") | None) {
+                if let Some(reg) = super::dataview_intrinsic::try_emit_data_view_accessor(
+                    ctx,
+                    object,
+                    property,
+                    args,
+                    call_byte_offset,
+                )? {
+                    return Ok(Some(reg));
                 }
             }
             let recv_box = lower_expr(ctx, object)?;
@@ -951,6 +999,81 @@ fn is_collection_method_for_kind(kind: &str, method: &str) -> bool {
     }
 }
 
+/// True when `cls_name` is a user class that (transitively) extends the builtin
+/// `Array` — `class Stack extends Array`, `class B extends Stack`, … The chain
+/// walk mirrors [`class_builtin_collection_kind`]: any ancestor whose
+/// `extends_name` is `Array` (or `ReadonlyArray`) marks the class as an Array
+/// subclass. `Array` itself is not a user class (never in `ctx.classes`), so the
+/// heritage is detected by name at the end of the chain.
+pub fn class_extends_builtin_array(ctx: &FnCtx<'_>, cls_name: &str) -> bool {
+    fn is_array_name(name: &str) -> bool {
+        matches!(name, "Array" | "ReadonlyArray")
+    }
+    // A receiver whose static type IS `Array` is a real array, not a subclass —
+    // it has its own array-method lowering and must not be treated here.
+    if is_array_name(cls_name) {
+        return false;
+    }
+    let mut cur = Some(cls_name.to_string());
+    let mut depth = 0usize;
+    while let Some(c) = cur {
+        if depth > 32 {
+            break;
+        }
+        let Some(ci) = ctx.classes.get(&c) else {
+            // Reached a name codegen doesn't track — it may be the builtin
+            // `Array` heritage itself.
+            return is_array_name(c.as_str());
+        };
+        if let Some(parent) = ci.extends_name.as_deref() {
+            if is_array_name(parent) {
+                return true;
+            }
+        }
+        cur = ci.extends_name.clone();
+        depth += 1;
+    }
+    false
+}
+
+/// The inherited `Array.prototype` methods the runtime's spec-generic array-like
+/// engine handles for a `class X extends Array` instance (union of the mutator
+/// and read dispatch families in `perry-runtime`'s `array::generic`). A method
+/// name outside this set is left on the normal class-dispatch path (a genuine
+/// user method already resolved earlier; anything else keeps its prior behavior).
+fn is_array_like_method(method: &str) -> bool {
+    matches!(
+        method,
+        // mutators (try_object_arraylike_mutator / run_object_mutator)
+        "push"
+            | "pop"
+            | "shift"
+            | "unshift"
+            | "reverse"
+            | "splice"
+            | "sort"
+            | "concat"
+            // reads (dispatch_arraylike_read_method)
+            | "forEach"
+            | "map"
+            | "filter"
+            | "some"
+            | "every"
+            | "find"
+            | "findIndex"
+            | "findLast"
+            | "findLastIndex"
+            | "reduce"
+            | "reduceRight"
+            | "indexOf"
+            | "lastIndexOf"
+            | "includes"
+            | "at"
+            | "join"
+            | "slice"
+    )
+}
+
 pub fn try_lower_class_static_accessor_call(
     ctx: &mut FnCtx<'_>,
     cls_name: &str,
@@ -1047,7 +1170,10 @@ pub fn try_lower_closure_call_fallthrough(
     // default build) → no emission, unchanged `<anonymous>` frame.
     let call_byte_offset = ctx.strings.pending_call_offset();
     let prelowered_recv: Option<(String, String)> =
-        if let Expr::PropertyGet { object, property } = callee {
+        if let Expr::PropertyGet {
+            object, property, ..
+        } = callee
+        {
             if receiver_must_eval_once(object.as_ref()) {
                 Some((lower_expr(ctx, object)?, property.clone()))
             } else {
@@ -1128,11 +1254,29 @@ pub fn try_lower_closure_call_fallthrough(
         // `js_closure_callN` as a wild `*const ClosureHeader` and SIGSEGV on
         // the header read. The checked unbox throws `TypeError: value is not
         // a function` for any non-`POINTER_TAG` value.
-        let closure_handle = blk.call(
-            I64,
-            "js_closure_unbox_callee_checked",
-            &[(DOUBLE, &recv_box)],
-        );
+        // #6475: a member-shaped call (`o.m(args)`) must rebind an
+        // object-literal method's baked `this` capture slot to the receiver —
+        // the slot wins over the IMPLICIT_THIS cell set above, so a method
+        // inherited via `Object.setPrototypeOf(obj, proto)` otherwise runs
+        // with `this` bound to the proto literal (effect's Pipeable
+        // `TagClass.pipe(...)` composed against the wrong `this` and
+        // HttpApiBuilder.group returned a curried function instead of a
+        // Layer). The rebind variant is a no-op for closures that don't
+        // capture `this`, so plain functions and arrows are untouched;
+        // receiverless calls keep the plain checked unbox.
+        let closure_handle = if let Some(ref this_val) = method_recv {
+            blk.call(
+                I64,
+                "js_closure_unbox_callee_checked_rebind",
+                &[(DOUBLE, &recv_box), (DOUBLE, this_val)],
+            )
+        } else {
+            blk.call(
+                I64,
+                "js_closure_unbox_callee_checked",
+                &[(DOUBLE, &recv_box)],
+            )
+        };
         let runtime_fn = format!("js_closure_call{}", lowered_args.len());
         let mut call_args: Vec<(crate::types::LlvmType, &str)> = vec![(I64, &closure_handle)];
         for v in &lowered_args {
@@ -1158,11 +1302,29 @@ pub fn try_lower_closure_call_fallthrough(
         // `js_closure_callN` as a wild `*const ClosureHeader` and SIGSEGV on
         // the header read. The checked unbox throws `TypeError: value is not
         // a function` for any non-`POINTER_TAG` value.
-        let closure_handle = blk.call(
-            I64,
-            "js_closure_unbox_callee_checked",
-            &[(DOUBLE, &recv_box)],
-        );
+        // #6475: a member-shaped call (`o.m(args)`) must rebind an
+        // object-literal method's baked `this` capture slot to the receiver —
+        // the slot wins over the IMPLICIT_THIS cell set above, so a method
+        // inherited via `Object.setPrototypeOf(obj, proto)` otherwise runs
+        // with `this` bound to the proto literal (effect's Pipeable
+        // `TagClass.pipe(...)` composed against the wrong `this` and
+        // HttpApiBuilder.group returned a curried function instead of a
+        // Layer). The rebind variant is a no-op for closures that don't
+        // capture `this`, so plain functions and arrows are untouched;
+        // receiverless calls keep the plain checked unbox.
+        let closure_handle = if let Some(ref this_val) = method_recv {
+            blk.call(
+                I64,
+                "js_closure_unbox_callee_checked_rebind",
+                &[(DOUBLE, &recv_box), (DOUBLE, this_val)],
+            )
+        } else {
+            blk.call(
+                I64,
+                "js_closure_unbox_callee_checked",
+                &[(DOUBLE, &recv_box)],
+            )
+        };
         let argc = n.to_string();
         blk.call(
             DOUBLE,

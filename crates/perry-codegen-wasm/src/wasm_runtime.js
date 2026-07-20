@@ -274,6 +274,21 @@ function buildImports() {
 
       array_new: () => nanboxPointer(allocHandle([])),
 
+      // `new Array(x)` — ES2015 §22.1.1: a single NUMBER argument is a
+      // length (must be a non-negative integer < 2^32), anything else is a
+      // one-element array. Mirrors js_array_constructor_single in the
+      // native runtime.
+      array_constructor_single: (value) => {
+        const v = toJsValue(value);
+        if (typeof v === 'number') {
+          if (!Number.isInteger(v) || v < 0 || v > 0xFFFFFFFF) {
+            throw new RangeError('Invalid array length');
+          }
+          return nanboxPointer(allocHandle(new Array(v)));
+        }
+        return nanboxPointer(allocHandle([v]));
+      },
+
       // array_push(handle, value) -> handle (for chaining)
       array_push: (handle, value) => {
         const arr = getHandle(handle);
@@ -1694,6 +1709,16 @@ const __memDispatch = {
 
   // Arrays — args are plain JS values (arr is the array itself, etc.)
   array_new: () => [],
+  // `new Array(x)`: single number = length (ES2015 §22.1.1), else element.
+  array_constructor_single: (value) => {
+    if (typeof value === 'number') {
+      if (!Number.isInteger(value) || value < 0 || value > 0xFFFFFFFF) {
+        throw new RangeError('Invalid array length');
+      }
+      return new Array(value);
+    }
+    return [value];
+  },
   array_push: (arr, value) => { if (Array.isArray(arr)) arr.push(value); return arr; },
   array_pop: (arr) => { if (!Array.isArray(arr) || arr.length === 0) return undefined; return arr.pop(); },
   array_get: (arr, index) => {
@@ -3778,6 +3803,16 @@ function perry_system_open_url(url) { window.open(url, "_blank"); }
 function perry_system_is_dark_mode() { return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? 1 : 0; }
 function perry_system_preferences_get(key) { return localStorage.getItem(key) || ""; }
 function perry_system_preferences_set(key, value) { localStorage.setItem(key, value); }
+// perry/system hapticPlay — Vibration API (no-op where unsupported, e.g. Safari).
+function perry_system_haptic_play(type) {
+  if (typeof navigator === "undefined" || typeof navigator.vibrate !== "function") return;
+  const patterns = {
+    success: 50, error: [50, 80, 50], warning: [30, 50, 30],
+    light: 10, medium: 20, heavy: 40, click: 10, selection: 10,
+    directionUp: 15, directionDown: 15, start: 25, stop: 25,
+  };
+  try { navigator.vibrate(patterns[type] ?? 10); } catch (e) { /* no-op */ }
+}
 function perry_system_keychain_save(key, value) { try { localStorage.setItem("__pk_" + key, value); } catch(e) {} }
 function perry_system_keychain_get(key) { return localStorage.getItem("__pk_" + key) || ""; }
 function perry_system_keychain_delete(key) { localStorage.removeItem("__pk_" + key); }
@@ -4734,7 +4769,8 @@ const __perryUiDispatch = {
   perry_ui_app_on_activate, perry_ui_app_on_terminate, perry_ui_app_set_timer,
   // System
   perry_system_open_url, perry_system_is_dark_mode, perry_system_preferences_get,
-  perry_system_preferences_set, perry_system_keychain_save, perry_system_keychain_get,
+  perry_system_preferences_set, perry_system_haptic_play,
+  perry_system_keychain_save, perry_system_keychain_get,
   perry_system_keychain_delete, perry_system_notification_send,
   // Frame split
   perry_ui_frame_split_create, perry_ui_frame_split_add_child,

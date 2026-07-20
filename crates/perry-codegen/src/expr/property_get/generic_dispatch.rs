@@ -43,8 +43,18 @@ pub(crate) fn lower_generic_property_get(
     ctx: &mut FnCtx<'_>,
     object: &Expr,
     property: &str,
+    byte_offset: u32,
 ) -> Result<String> {
     let obj_box = lower_expr(ctx, object)?;
+    // #5247: record this access's source location right after the receiver is
+    // evaluated and before the nullish-receiver throw path (the inline diamond
+    // OR the full-outline `js_object_get_field_ic` helper — both throw "Cannot
+    // read properties of null/undefined"). No-op unless compiled with
+    // `--debug-symbols` (the offset resolves to `None` without the debug
+    // context) or when `byte_offset` is 0 (a synthesized node). Emitted after
+    // the receiver so a nested `a.b.c` chain keeps the inner `.b` access's more
+    // specific location when *it* is the throwing read.
+    crate::expr::calls::emit_call_location_at(ctx, byte_offset);
     let key_idx = ctx.strings.intern(property);
     let key_handle_global = format!("@{}", ctx.strings.entry(key_idx).handle_global);
     let blk = ctx.block();
@@ -315,6 +325,25 @@ pub(crate) fn lower_generic_property_get(
     let object_type = ctx.block().load(I32, &object_type_ptr);
     let object_type_ok = ctx.block().icmp_eq(I32, &object_type, "1");
     let is_object = ctx.block().and(I1, &is_object, &object_type_ok);
+
+    // #6080: a receiver that has ever had a property/accessor descriptor
+    // installed (`Object.defineProperty`) needs descriptor-aware dispatch —
+    // an accessor must fire on reads, a non-writable slot must reject stores.
+    // The PIC hit path is a raw slot load: if the site was primed on a plain
+    // data property and `defineProperty` later converts that key to a getter
+    // (or a different descriptor), `keys_array` is unchanged, so the stale
+    // hit path would return the raw slot and bypass the getter entirely.
+    // OBJ_FLAG_HAS_DESCRIPTORS lives in the GcHeader `_reserved` i16 at
+    // offset -6; force a miss (→ `js_object_get_field_ic_miss`, which honors
+    // descriptors) whenever it is set. Mirrors the guard in
+    // `class_field_inline_guard.rs`. Cost: 1 sub + load i16 + and + cmp,
+    // folded into the existing `hit` cond_br.
+    let reserved_addr = ctx.block().sub(I64, &safe_obj_handle, "6");
+    let reserved_ptr = ctx.block().inttoptr(I64, &reserved_addr);
+    let reserved = ctx.block().load(crate::types::I16, &reserved_ptr);
+    let has_desc = ctx.block().and(crate::types::I16, &reserved, "2048"); // OBJ_FLAG_HAS_DESCRIPTORS (0x800)
+    let no_desc = ctx.block().icmp_eq(crate::types::I16, &has_desc, "0");
+    let is_object = ctx.block().and(I1, &is_object, &no_desc);
 
     // Load obj->keys_array at offset 16 of ObjectHeader.
     let keys_addr = ctx.block().add(I64, &safe_obj_handle, "16");

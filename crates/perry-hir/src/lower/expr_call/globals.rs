@@ -19,6 +19,8 @@ pub(super) fn try_global_builtins(
     // Check for global built-in function calls (parseInt, parseFloat, Number, String, isNaN, isFinite)
     if let ast::Expr::Ident(ident) = expr {
         let func_name = ident.sym.as_ref();
+        // #6668: used by the crypto named-import spread guard below.
+        let has_spread = call.args.iter().any(|a| a.spread.is_some());
         if ctx.lookup_local(func_name).is_some()
             || ctx.lookup_func(func_name).is_some()
             || ctx.lookup_imported_func(func_name).is_some()
@@ -133,21 +135,28 @@ pub(super) fn try_global_builtins(
                     args,
                     type_args: Vec::new(),
                     byte_offset: 0,
+                    cap_args_appended: 0,
                 }));
             }
+            // A missing argument to these is NOT an error in JS — the parameter is
+            // simply `undefined`, and each has well-defined behavior for it
+            // (`isNaN() === true`, `isFinite() === false`, `encodeURI() === "undefined"`,
+            // …, all verified against Node). Rejecting the call at COMPILE time made
+            // perry refuse to compile legal JS. Lower the omitted argument to
+            // `Expr::Undefined` and let the existing intrinsic produce Node's answer.
+            //
+            // NOT extended to `atob`/`btoa`/`structuredClone`: those are WebIDL
+            // required-argument throws where `f()` and `f(undefined)` genuinely
+            // DIFFER (`atob()` → TypeError but `atob(undefined)` → InvalidCharacterError;
+            // `btoa()` → TypeError but `btoa(undefined)` → "dW5kZWZpbmVk"), so they
+            // cannot be modelled by padding and need real arity plumbing. See #6366.
             "isNaN" => {
-                if !args.is_empty() {
-                    return Ok(Ok(Expr::IsNaN(Box::new(args.remove(0)))));
-                } else {
-                    return Err(anyhow!("isNaN requires one argument"));
-                }
+                let arg = arg_or_undefined(&mut args);
+                return Ok(Ok(Expr::IsNaN(Box::new(arg))));
             }
             "isFinite" => {
-                if !args.is_empty() {
-                    return Ok(Ok(Expr::IsFinite(Box::new(args.remove(0)))));
-                } else {
-                    return Err(anyhow!("isFinite requires one argument"));
-                }
+                let arg = arg_or_undefined(&mut args);
+                return Ok(Ok(Expr::IsFinite(Box::new(arg))));
             }
             "atob" => {
                 if !args.is_empty() {
@@ -164,32 +173,20 @@ pub(super) fn try_global_builtins(
                 }
             }
             "encodeURI" => {
-                if !args.is_empty() {
-                    return Ok(Ok(Expr::EncodeURI(Box::new(args.remove(0)))));
-                } else {
-                    return Err(anyhow!("encodeURI requires one argument"));
-                }
+                let arg = arg_or_undefined(&mut args);
+                return Ok(Ok(Expr::EncodeURI(Box::new(arg))));
             }
             "decodeURI" => {
-                if !args.is_empty() {
-                    return Ok(Ok(Expr::DecodeURI(Box::new(args.remove(0)))));
-                } else {
-                    return Err(anyhow!("decodeURI requires one argument"));
-                }
+                let arg = arg_or_undefined(&mut args);
+                return Ok(Ok(Expr::DecodeURI(Box::new(arg))));
             }
             "encodeURIComponent" => {
-                if !args.is_empty() {
-                    return Ok(Ok(Expr::EncodeURIComponent(Box::new(args.remove(0)))));
-                } else {
-                    return Err(anyhow!("encodeURIComponent requires one argument"));
-                }
+                let arg = arg_or_undefined(&mut args);
+                return Ok(Ok(Expr::EncodeURIComponent(Box::new(arg))));
             }
             "decodeURIComponent" => {
-                if !args.is_empty() {
-                    return Ok(Ok(Expr::DecodeURIComponent(Box::new(args.remove(0)))));
-                } else {
-                    return Err(anyhow!("decodeURIComponent requires one argument"));
-                }
+                let arg = arg_or_undefined(&mut args);
+                return Ok(Ok(Expr::DecodeURIComponent(Box::new(arg))));
             }
             "structuredClone" => {
                 if !args.is_empty() {
@@ -231,6 +228,27 @@ pub(super) fn try_global_builtins(
                     object: None,
                     method: "requireJsonDisk".to_string(),
                     args: vec![specifier],
+                }));
+            }
+            // require.resolve fallback: node_modules subpath probing for
+            // specifiers never statically required (styled-jsx/package.json).
+            "__perry_require_resolve_node_modules" => {
+                let from = if !args.is_empty() {
+                    args.remove(0)
+                } else {
+                    Expr::Undefined
+                };
+                let specifier = if !args.is_empty() {
+                    args.remove(0)
+                } else {
+                    Expr::Undefined
+                };
+                return Ok(Ok(Expr::NativeMethodCall {
+                    module: "__perry_runtime".to_string(),
+                    class_name: None,
+                    object: None,
+                    method: "requireResolveNodeModules".to_string(),
+                    args: vec![from, specifier],
                 }));
             }
             // Wall 54: register an AOT-compiled module's exports under its
@@ -499,6 +517,19 @@ pub(super) fn try_global_builtins(
             // aliased local (`p`) matched no arm and fell through to a generic
             // path that evaluated to `undefined` — e.g. `p(home, ".x").normalize()`.
             let func_name = method.unwrap_or(func_name);
+            // #6668: a spread call of a crypto method imported by name
+            // (`import { hkdf } from "crypto"; hkdf(...args, cb)`) must not be
+            // collapsed by the per-module fast-path arms below nor the generic
+            // `Expr::NativeMethodCall` further down — a spread operand would be
+            // passed as the array itself, so the codegen fast-path sees too few
+            // args and silently no-ops (the callback never fires). Decline so the
+            // generic tail builds an `Expr::CallSpread`, routed through the same
+            // bound-native dispatch the value-read form (`const f = hkdf; f(...)`)
+            // already uses. Scoped to crypto — the reported module, whose runtime
+            // dispatcher resolves every callable export by name.
+            if has_spread && module_name == "crypto" {
+                return Ok(Err(args));
+            }
             if module_name == "child_process" {
                 match func_name {
                     "execSync" if !args.is_empty() => {
@@ -824,6 +855,7 @@ pub(super) fn try_global_builtins(
                         }
                         return Ok(Ok(Expr::Call {
                             callee: Box::new(Expr::PropertyGet {
+                                byte_offset: 0,
                                 object: Box::new(Expr::NativeModuleRef("crypto".to_string())),
                                 property: "createSecretKey".to_string(),
                             }),
@@ -844,6 +876,7 @@ pub(super) fn try_global_builtins(
                         let options_arg = iter.next().unwrap();
                         return Ok(Ok(Expr::Call {
                             callee: Box::new(Expr::PropertyGet {
+                                byte_offset: 0,
                                 object: Box::new(Expr::NativeModuleRef("crypto".to_string())),
                                 property: "generateKeySync".to_string(),
                             }),
@@ -956,4 +989,14 @@ pub(super) fn try_global_builtins(
     // receiver in a fluent generic chain and turns `a.b().c().d()` into an
     // exponential lowering walk.
     Ok(Err(args))
+}
+
+/// An omitted argument to a JS global is `undefined`, not an error — mirrors the
+/// `parseInt` / `parseFloat` / `BigInt` / `Object` padding above.
+fn arg_or_undefined(args: &mut Vec<Expr>) -> Expr {
+    if args.is_empty() {
+        Expr::Undefined
+    } else {
+        args.remove(0)
+    }
 }

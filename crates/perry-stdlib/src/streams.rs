@@ -48,13 +48,18 @@ pub(crate) fn internal_promise() -> *mut Promise {
 
 mod byob;
 mod expando;
+mod idalloc;
 mod pipe;
 mod strategy;
 mod subclass;
+mod tee;
 #[cfg(test)]
 mod tests;
 mod transform;
 mod writable;
+
+pub use tee::js_readable_stream_tee;
+use tee::{tee_branches_of, tee_error_branches, tee_source_of};
 
 pub use self::byob::{
     js_readable_stream_controller_byob_request, js_readable_stream_get_byob_reader,
@@ -266,14 +271,16 @@ lazy_static::lazy_static! {
     static ref TRANSFORM_STREAMS: Mutex<HashMap<usize, TransformStreamData>> = Mutex::new(HashMap::new());
     static ref READERS: Mutex<HashMap<usize, ReaderData>> = Mutex::new(HashMap::new());
     static ref WRITERS: Mutex<HashMap<usize, WriterData>> = Mutex::new(HashMap::new());
-    // #1545: ONE id counter shared across all five Web Streams registries.
-    // Stream handles are raw numeric f64 values, not POINTER_TAG small handles,
-    // so they live just above the runtime's `< 0x100000` small-handle band.
-    // That keeps them disjoint from Fetch/native/proxy pointer-tagged ids while
-    // the runtime's finite-number stream probes still route dynamic calls like
-    // `src.pipeThrough(ts).getReader()`.
-    static ref NEXT_STREAM_ID: Mutex<usize> = Mutex::new(STREAM_HANDLE_ID_START);
 }
+
+// #1545: ONE id allocator shared across all five Web Streams registries.
+// Stream handles are raw numeric f64 values, not POINTER_TAG small handles,
+// so they live just above the runtime's `< 0x100000` small-handle band. That
+// keeps them disjoint from Fetch/native/proxy pointer-tagged ids while the
+// runtime's finite-number stream probes still route dynamic calls like
+// `src.pipeThrough(ts).getReader()`. #6602: ids of terminal objects recycle
+// through `idalloc` so the finite band survives long-running servers.
+use self::idalloc::next_stream_id;
 
 static GC_REGISTERED: std::sync::Once = std::sync::Once::new();
 
@@ -362,6 +369,24 @@ fn scan_stream_roots_mut(visitor: &mut perry_runtime::gc::RuntimeRootVisitor<'_>
             visitor.visit_i64_slot(&mut t.flush_cb);
         }
     }
+    // Parked/deferred transform promises are held only as raw addresses in
+    // these maps (an unawaited write/close has no other root).
+    if let Ok(mut map) = transform::TRANSFORM_WRITE_RELEASES.lock() {
+        for promises in map.values_mut() {
+            for slot in promises.iter_mut() {
+                let mut p = *slot as *mut Promise;
+                visitor.visit_raw_mut_ptr_slot(&mut p);
+                *slot = p as usize;
+            }
+        }
+    }
+    if let Ok(mut map) = transform::TRANSFORM_PENDING_CLOSE.lock() {
+        for slot in map.values_mut() {
+            let mut p = *slot as *mut Promise;
+            visitor.visit_raw_mut_ptr_slot(&mut p);
+            *slot = p as usize;
+        }
+    }
     if let Ok(mut map) = READERS.lock() {
         for r in map.values_mut() {
             visitor.visit_raw_mut_ptr_slot(&mut r.closed_promise);
@@ -378,16 +403,6 @@ fn scan_stream_roots_mut(visitor: &mut perry_runtime::gc::RuntimeRootVisitor<'_>
 // ─────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────
-
-fn next_id(slot: &Mutex<usize>) -> usize {
-    let mut guard = slot.lock().unwrap();
-    let id = *guard;
-    if id >= STREAM_HANDLE_ID_END {
-        panic!("Web Streams handle id range exhausted");
-    }
-    *guard += 1;
-    id
-}
 
 unsafe fn closure_from_bits(bits: u64) -> i64 {
     if bits == TAG_UNDEFINED || bits == TAG_NULL || bits == 0 {
@@ -568,7 +583,7 @@ fn alloc_readable_with_strategy(
     is_byte_stream: bool,
     strategy_size_cb: i64,
 ) -> usize {
-    let id = next_id(&NEXT_STREAM_ID);
+    let id = next_stream_id();
     READABLE_STREAMS.lock().unwrap().insert(
         id,
         ReadableStreamData {
@@ -620,7 +635,7 @@ fn alloc_writable_with_strategy(
     hwm: f64,
     strategy_size_cb: i64,
 ) -> usize {
-    let id = next_id(&NEXT_STREAM_ID);
+    let id = next_stream_id();
     let ready = internal_promise();
     let closed = internal_promise();
     js_promise_resolve(ready, f64::from_bits(TAG_UNDEFINED));
@@ -696,6 +711,17 @@ extern "C" fn readable_pull_microtask(closure: *const ClosureHeader) -> f64 {
 }
 
 pub(super) unsafe fn maybe_pull(stream_id: usize) {
+    // #5989: a read on a tee branch pulls its SOURCE — the branch carries no
+    // `pull_cb` of its own; the source's enqueue fans the chunk out to both
+    // branches. `force` so a highWaterMark-0 flight producer actually pulls.
+    if let Some(source) = tee_source_of(stream_id) {
+        // Tick parity: a demand-initiated pull travels TWO microtask cycles
+        // (Node's sourceReader.read() resolution + .then(fanout) reaction);
+        // buffered chunks + close discovery included. A live producer is
+        // driven from the pull job.
+        tee::tee_schedule_pull_demand(source);
+        return;
+    }
     maybe_pull_inner(stream_id, false);
 }
 
@@ -777,6 +803,7 @@ unsafe fn close_pending(stream_id: usize) {
     // #5437: stream is done — drop any expando entries so the table doesn't
     // grow one row per stream over the server's lifetime.
     expando::stream_expando_clear(stream_id);
+    idalloc::retire_readable_terminal(stream_id);
 }
 
 unsafe fn error_pending(stream_id: usize, reason_bits: u64) {
@@ -793,6 +820,7 @@ unsafe fn error_pending(stream_id: usize, reason_bits: u64) {
     byob::error_pending_byob(stream_id, reason_bits);
     // #5437: stream errored — drop any expando entries (see close_pending).
     expando::stream_expando_clear(stream_id);
+    idalloc::retire_readable_terminal(stream_id);
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -949,6 +977,13 @@ pub unsafe extern "C" fn js_readable_stream_get_reader_with_options(
     stream_handle: f64,
     options: f64,
 ) -> f64 {
+    if std::env::var("PERRY_JSON_PATH").as_deref() == Ok("1") {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 40 {
+            eprintln!("[STREAM] get_reader stream={:#x}", stream_handle.to_bits());
+        }
+    }
     let stream_handle = js_stream_unwrap_handle(stream_handle);
     let byob_requested = option_string_equals(options, b"mode", b"byob");
     let id = stream_handle as usize;
@@ -973,7 +1008,7 @@ pub unsafe extern "C" fn js_readable_stream_get_reader_with_options(
         if s.reader_handle.is_some() {
             true
         } else {
-            let reader_id = next_id(&NEXT_STREAM_ID);
+            let reader_id = next_stream_id();
             let closed_p = internal_promise();
             if s.state == ReadableState::Closed {
                 js_promise_resolve(closed_p, f64::from_bits(TAG_UNDEFINED));
@@ -1472,6 +1507,17 @@ pub unsafe extern "C" fn js_readable_stream_controller_enqueue(
     stream_handle: f64,
     chunk: f64,
 ) -> f64 {
+    if std::env::var("PERRY_JSON_PATH").as_deref() == Ok("1") {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 40 {
+            eprintln!(
+                "[STREAM] enqueue stream={:#x} chunk_bits={:#018x}",
+                (stream_handle as usize),
+                chunk.to_bits()
+            );
+        }
+    }
     let id = stream_handle as usize;
     let chunk_bits = chunk.to_bits();
     let is_byte_stream = {
@@ -1482,6 +1528,12 @@ pub unsafe extern "C" fn js_readable_stream_controller_enqueue(
         throw_invalid_arg_type(
             "The \"buffer\" argument must be an instance of Buffer, TypedArray, or DataView",
         );
+    }
+    // #5989 + Node tick parity: a tee'd source's enqueue stays in the SOURCE
+    // queue; branches receive chunks only through the demand-driven pull
+    // cycle (see `tee::tee_source_enqueue`).
+    if tee::tee_source_enqueue(id, chunk, chunk_bits, is_byte_stream) {
+        return f64::from_bits(TAG_UNDEFINED);
     }
     // A pending BYOB read (byte streams only) takes the chunk before the
     // default-read queue: the bytes land directly in the caller's view.
@@ -1534,6 +1586,29 @@ pub unsafe extern "C" fn js_readable_stream_controller_enqueue(
 #[no_mangle]
 pub unsafe extern "C" fn js_readable_stream_controller_close(stream_handle: f64) -> f64 {
     let id = stream_handle as usize;
+    if std::env::var("PERRY_JSON_PATH").as_deref() == Ok("1") {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 40 {
+            eprintln!("[STREAM] controller_close stream={id:#x}");
+        }
+    }
+    // #5989 + Node tick parity: closing a tee'd source marks it Closed; the
+    // branch close is DISCOVERED by the pull cycle draining the source queue
+    // empty (byte tee: prompt; default tee: nextTick-deferred) — never
+    // delivered eagerly ahead of undrained chunks.
+    if tee_branches_of(id).is_some() {
+        {
+            let mut g = READABLE_STREAMS.lock().unwrap();
+            if let Some(s) = g.get_mut(&id) {
+                if s.state == ReadableState::Readable {
+                    s.state = ReadableState::Closed;
+                }
+            }
+        }
+        tee::tee_schedule_pull(id);
+        return f64::from_bits(TAG_UNDEFINED);
+    }
     {
         let mut g = READABLE_STREAMS.lock().unwrap();
         if let Some(s) = g.get_mut(&id) {
@@ -1569,6 +1644,11 @@ pub unsafe extern "C" fn js_readable_stream_controller_error(
     reason: f64,
 ) -> f64 {
     let id = stream_handle as usize;
+    // #5989: erroring a tee'd source errors both branches.
+    if tee_branches_of(id).is_some() {
+        tee_error_branches(id, reason.to_bits());
+        return f64::from_bits(TAG_UNDEFINED);
+    }
     error_readable_stream(id, reason.to_bits());
     f64::from_bits(TAG_UNDEFINED)
 }
@@ -1610,6 +1690,13 @@ extern "C" fn readable_from_chunk_rejected(closure: *const ClosureHeader, reason
 }
 
 unsafe fn resolve_reader_read_value(promise: *mut Promise, value_bits: u64) {
+    if std::env::var("PERRY_JSON_PATH").as_deref() == Ok("1") {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 40 {
+            eprintln!("[STREAM] read RESOLVED value_bits={value_bits:#018x}");
+        }
+    }
     let value = f64::from_bits(value_bits);
     if perry_runtime::promise::js_value_is_promise(value) == 0 {
         let result = build_iter_result(value_bits, false);
@@ -1654,6 +1741,13 @@ pub unsafe extern "C" fn js_reader_read(reader_handle: f64) -> *mut Promise {
     let promise = js_promise_new();
     let reader_handle = js_stream_unwrap_handle(reader_handle);
     let reader_id = reader_handle as usize;
+    if std::env::var("PERRY_JSON_PATH").as_deref() == Ok("1") {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 40 {
+            eprintln!("[STREAM] reader_read reader_id={reader_id:#x}");
+        }
+    }
     let stream_id = match READERS.lock().unwrap().get(&reader_id) {
         Some(r) if r.locked => r.stream_handle,
         Some(_) => {
@@ -1698,6 +1792,10 @@ pub unsafe extern "C" fn js_reader_read(reader_handle: f64) -> *mut Promise {
             None => Some((TAG_UNDEFINED, true, false)),
         }
     };
+    // Consumer progress: if this readable is a transform's output and its
+    // queue just drained (pop emptied it, or the read parked on an empty
+    // queue), release write promises parked on backpressure.
+    transform::transform_release_writes(stream_id);
     if let Some((reader_id, reason)) = closed_rejection {
         let p = READERS
             .lock()
@@ -1845,6 +1943,7 @@ pub unsafe extern "C" fn js_reader_release_lock(reader_handle: f64) -> f64 {
     // #5437: the reader instance is done — drop any expando entries keyed by
     // its handle id so the table doesn't retain them for the process lifetime.
     expando::stream_expando_clear(reader_id);
+    idalloc::retire_reader_if_released(reader_id);
     f64::from_bits(TAG_UNDEFINED)
 }
 
@@ -1878,76 +1977,6 @@ pub unsafe extern "C" fn js_reader_cancel(reader_handle: f64, reason: f64) -> *m
 // ─────────────────────────────────────────────────────────────────────
 // tee / pipeTo / pipeThrough
 // ─────────────────────────────────────────────────────────────────────
-
-/// `stream.tee()` — returns an array of two new ReadableStreams. Both
-/// branches drain the SOURCE eagerly into separate per-branch queues at
-/// tee time. This is correct for the buffered consumers Perry exposes
-/// (`blob.stream()` / `response.body` are pre-buffered) and the "user
-/// source already enqueued everything synchronously in start" pattern.
-/// Streams that lazily produce chunks via `pull` after tee will only see
-/// chunks present at the tee call — the same trade-off Node's
-/// `Readable.from([...]).tee()` makes for already-buffered iterables.
-#[no_mangle]
-pub unsafe extern "C" fn js_readable_stream_tee(stream_handle: f64) -> f64 {
-    let id = stream_handle as usize;
-    let mut was_locked = false;
-    let mut is_byte_stream = false;
-    let chunks: Vec<u64> = {
-        let mut g = READABLE_STREAMS.lock().unwrap();
-        match g.get_mut(&id) {
-            Some(s) if s.reader_handle.is_none() => {
-                is_byte_stream = s.is_byte_stream;
-                let drained = s.drain_chunks();
-                s.state = ReadableState::Closed;
-                drained
-            }
-            Some(_) => {
-                was_locked = true;
-                Vec::new()
-            }
-            None => Vec::new(),
-        }
-    };
-    if was_locked {
-        throw_type_error("ReadableStream is locked");
-    }
-
-    let id_a = next_id(&NEXT_STREAM_ID);
-    let id_b = next_id(&NEXT_STREAM_ID);
-    {
-        let mut g = READABLE_STREAMS.lock().unwrap();
-        for new_id in [id_a, id_b] {
-            g.insert(
-                new_id,
-                ReadableStreamData {
-                    state: ReadableState::Closed,
-                    chunks: chunks.iter().copied().collect(),
-                    chunk_sizes: chunks.iter().map(|_| 1.0).collect(),
-                    queue_total_size: chunks.len() as f64,
-                    pending_reads: VecDeque::new(),
-                    start_cb: 0,
-                    pull_cb: 0,
-                    cancel_cb: 0,
-                    strategy_size_cb: 0,
-                    high_water_mark: 1.0,
-                    is_byte_stream,
-                    pull_returns_byte_chunk: false,
-                    pulling: false,
-                    started: true,
-                    reader_handle: None,
-                    error_value: 0,
-                    pending_error_after_chunks: None,
-                    canceled: false,
-                },
-            );
-        }
-    }
-
-    let arr = js_array_alloc(2);
-    js_array_push(arr, JSValue::from_bits(f64::to_bits(id_a as f64)));
-    js_array_push(arr, JSValue::from_bits(f64::to_bits(id_b as f64)));
-    f64::from_bits(JSValue::object_ptr(arr as *mut u8).bits())
-}
 
 /// `readable.pipeThrough({readable, writable})` — pipeTo into the
 /// transform's writable side, return its readable side. Caller already

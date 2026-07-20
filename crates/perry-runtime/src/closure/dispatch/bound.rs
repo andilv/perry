@@ -13,6 +13,55 @@ pub unsafe fn dispatch_bound_method(closure: *const ClosureHeader, args: &[f64])
     let method_name_ptr = js_closure_get_capture_ptr(closure, 1) as *const i8;
     let method_name_len = js_closure_get_capture_ptr(closure, 2) as usize;
 
+    // #6173: a SYMBOL-keyed class method read as a value — there is no name to
+    // re-resolve; the captures carry the already-resolved func_ptr + arity
+    // meta (see `SYMBOL_BOUND_METHOD_NAME` for the layout). Discriminated by
+    // pointer identity with the static marker, and it MUST run before any
+    // name-based interpretation of the captures below (slots 3/4 are not part
+    // of the name layout).
+    if method_name_ptr == crate::object::SYMBOL_BOUND_METHOD_NAME.as_ptr() as *const i8 {
+        return dispatch_symbol_bound_method(closure, namespace_obj, args);
+    }
+
+    // Private-method value (`const f = this.#m; f.call(o)`): a `#`-named method
+    // read off an instance yields the OWNER class's method function. Unlike a
+    // public method, its invocation must dispatch the OWNER's `#m` body with the
+    // call-time `this` — NOT re-resolve `#m` on the receiver's own class (a plain
+    // object has no `#m`, so the by-name path throws "#m is not a function").
+    // The brand check already happened at the READ site (`this.#m`), so here we
+    // simply bind the owner's body to whatever `this` the call supplies (spec:
+    // `PrivateMethodOrAccessorAdd` installs the shared function; calling it does
+    // no brand check). The canonical closure captures the owner class's
+    // prototype-ref in slot 0, which carries the owner id.
+    if method_name_len > 0 && !method_name_ptr.is_null() {
+        if let Ok(name) = std::str::from_utf8(std::slice::from_raw_parts(
+            method_name_ptr as *const u8,
+            method_name_len,
+        )) {
+            if name.starts_with('#') {
+                if let Some(owner_id) = crate::object::class_prototype_ref_id(namespace_obj) {
+                    if let Some((func_ptr, param_count, has_synth_args, has_rest)) =
+                        crate::object::lookup_class_method_in_chain(owner_id, name)
+                    {
+                        // The call-time `this` (IMPLICIT_THIS) is the receiver the
+                        // private method body runs against — for `f.call(o)` it is
+                        // `o`, for a bare `f()` it is undefined.
+                        let call_this = crate::object::js_implicit_this_get();
+                        return crate::object::call_vtable_method(
+                            func_ptr,
+                            call_this.to_bits() as i64,
+                            args.as_ptr(),
+                            args.len(),
+                            param_count,
+                            has_synth_args,
+                            has_rest,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // Canonical class method value (test262 method identity): a class method is
     // a single shared function object whose captured receiver is the OWNER
     // class's prototype-ref — a marker, not the real `this`. The actual receiver
@@ -22,7 +71,46 @@ pub unsafe fn dispatch_bound_method(closure: *const ClosureHeader, args: &[f64])
     // the rebind targets the right object. Ordinary `obj.method(args)` calls do
     // NOT reach here (they lower straight to `js_native_call_method`), so this
     // only governs method-as-value invocations.
-    namespace_obj = crate::object::canonical_bound_method_receiver(namespace_obj);
+    // The captured slot-0 prototype-ref names the OWNER class. A method value is a
+    // FIXED function object (spec: reading `C.prototype.m` yields *that* function;
+    // invoking it later does not re-resolve `m` against whatever receiver it is
+    // called on), so dispatch the OWNER's body with the call-time `this` rather than
+    // re-resolving the name on the RECEIVER's class below.
+    //
+    // Re-resolution breaks as soon as the value is COPIED onto another class's
+    // prototype — `Execute.prototype.resultsetHeader = Query.prototype.resultsetHeader`,
+    // the block copy mysql2's Command state machine performs. Invoking it on an
+    // `Execute` then re-resolved "resultsetHeader" against Execute, found the copy
+    // (this very closure), and recursed until the call-depth guard returned the null
+    // object — user-visible as `[object Object]` instead of the method's result,
+    // exactly the failure the comment below describes for the self-shadowing `bind`
+    // case.
+    let owner_proto_ref = namespace_obj;
+    let call_receiver = crate::object::canonical_bound_method_receiver(owner_proto_ref);
+    if method_name_len > 0 && !method_name_ptr.is_null() {
+        if let Some(owner_id) = crate::object::class_prototype_ref_id(owner_proto_ref) {
+            if let Ok(name) = std::str::from_utf8(std::slice::from_raw_parts(
+                method_name_ptr as *const u8,
+                method_name_len,
+            )) {
+                if let Some((func_ptr, param_count, has_synth_args, has_rest)) =
+                    crate::object::lookup_class_method_in_chain(owner_id, name)
+                {
+                    return crate::object::call_vtable_method(
+                        func_ptr,
+                        call_receiver.to_bits() as i64,
+                        args.as_ptr(),
+                        args.len(),
+                        param_count,
+                        has_synth_args,
+                        has_rest,
+                    );
+                }
+            }
+        }
+    }
+
+    namespace_obj = call_receiver;
 
     // A bound-method VALUE (`const f = obj.method`) is resolved at READ time and
     // must always invoke that method — even if `obj.method` is later reassigned.
@@ -54,6 +142,57 @@ pub unsafe fn dispatch_bound_method(closure: *const ClosureHeader, args: &[f64])
         args.as_ptr(),
         args.len(),
     )
+}
+
+/// #6173: invoke a symbol-bound class-method closure. `receiver` is capture
+/// slot 0 (a NaN-boxed instance/prototype-ref, or the INT32 class ref for a
+/// static method); the resolved func_ptr and packed param_count/has_rest/
+/// is_static meta live in slots 3/4 (see `SYMBOL_BOUND_METHOD_NAME`).
+/// Mirrors the direct-call symbol dispatch in `js_native_call_method_value`.
+unsafe fn dispatch_symbol_bound_method(
+    closure: *const ClosureHeader,
+    receiver: f64,
+    args: &[f64],
+) -> f64 {
+    let func_ptr = js_closure_get_capture_ptr(closure, 3) as usize;
+    let meta = js_closure_get_capture_ptr(closure, 4) as u64;
+    if func_ptr == 0 {
+        // A mis-shaped closure (e.g. a 3-capture name closure whose name
+        // pointer somehow aliased the marker) reads bounds-checked zeros here
+        // — fail soft rather than calling a null fn pointer.
+        return f64::from_bits(crate::value::TAG_UNDEFINED);
+    }
+    let param_count = (meta & 0xFFFF_FFFF) as u32;
+    let has_rest = (meta >> 32) & 1 == 1;
+    let is_static = (meta >> 33) & 1 == 1;
+    if is_static {
+        // Bind IMPLICIT_THIS to the class ref for the duration, exactly like
+        // the direct-call path. The one-shot static-`this` override (armed by
+        // the Function.prototype call/apply arms for a static bound-method
+        // value) still wins in the static-method prologue.
+        let prev_this = crate::object::js_implicit_this_set(receiver);
+        let result = crate::object::call_registered_static_method(
+            func_ptr,
+            args.as_ptr(),
+            args.len(),
+            param_count,
+            has_rest,
+        );
+        crate::object::js_implicit_this_set(prev_this);
+        result
+    } else {
+        // Computed symbol methods never synthesize an `arguments` object but
+        // DO carry `has_rest` — mirrors the direct-call path.
+        crate::object::call_vtable_method(
+            func_ptr,
+            receiver.to_bits() as i64,
+            args.as_ptr(),
+            args.len(),
+            param_count,
+            false,
+            has_rest,
+        )
+    }
 }
 
 /// Dispatch a `Function.prototype.bind` result (BOUND_FUNCTION_FUNC_PTR

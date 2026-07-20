@@ -169,6 +169,15 @@ pub enum Expr {
     PropertyGet {
         object: Box<Expr>,
         property: String,
+        /// #5247: byte offset (`member.span.lo.0`) of this member access in its
+        /// module source, captured at AST→HIR lowering. Codegen (under
+        /// `--debug-symbols`) resolves it to `file:line` and attaches it to the
+        /// runtime "Cannot read properties of null/undefined" TypeError thrown
+        /// when the receiver is nullish, so `.stack` shows `at <file>:<line>`
+        /// instead of `<anonymous>`. `0` when unknown (nodes synthesized by
+        /// transforms/desugaring) — resolves to no location. Mirrors
+        /// `Call.byte_offset` / `New::byte_offset`; excluded from stable-hashing.
+        byte_offset: u32,
     },
     PropertySet {
         object: Box<Expr>,
@@ -283,6 +292,13 @@ pub enum Expr {
     /// `op` are the wire codes defined by `PrivKind` / 0=get,1=set.
     PrivateGuard {
         class_name: String,
+        /// The declaring class's unique HIR id. Codegen uses this directly as
+        /// the brand's `declaring_class_id` rather than resolving `class_name`
+        /// through the `class_ids` map, whose name keys collapse duplicate
+        /// (minified) class names last-writer-wins and would otherwise bind the
+        /// brand to the wrong same-named class. 0 means "unresolved" (guard
+        /// degrades to a no-op).
+        class_id: u32,
         field_name: String,
         kind: u8,
         op: u8,
@@ -312,6 +328,23 @@ pub enum Expr {
         /// location, falling back to `<anonymous>`. Mirrors `Call.byte_offset`
         /// (#5247) and is excluded from stable-hashing.
         byte_offset: u32,
+        /// #6538: how many of the TRAILING `args` are compiler-appended
+        /// class-capture forwards, NOT user arguments. When a class nested in
+        /// a function captures enclosing-scope locals, `lower_class_decl`
+        /// synthesizes one `__perry_cap_<id>` constructor param per captured
+        /// id, and the bare-identifier `new C(...)` / anonymous-class arms
+        /// (`expr_new.rs`, `expr_new/non_ident.rs`) push one `LocalGet(<id>)`
+        /// per captured id after the user args. This count records that
+        /// provenance EXPLICITLY so codegen no longer has to infer it from the
+        /// arg shape (the old `new_site_args_carry_appended_caps` heuristic,
+        /// which could misfire on a forward-referenced capture class whose
+        /// user args happened to be exactly its captured locals). `0` for
+        /// every other `new` site — non-capturing classes, member-callee
+        /// `new ns.C(...)` (caps filled from the decl-site snapshot instead),
+        /// synthesized options-object shapes, and transform-created nodes.
+        /// Excluded from stable-hashing (derived metadata, like `byte_offset`;
+        /// the appended `LocalGet` args it counts are themselves hashed).
+        cap_args_appended: u32,
     },
 
     /// Dynamic new expression (new with non-identifier callee)

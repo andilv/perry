@@ -195,6 +195,43 @@ pub extern "C" fn js_promise_resolved_then(
 ///   - One fewer closure dispatch per microtask (was: `then_v_arrow`
 ///     body called `step_closure`; is now `step_closure` is invoked
 ///     directly by the runner).
+///
+/// #5437: register the resume thunks on `awaited` AND keep the machine's
+/// result promise consistent so `js_async_step_done`'s reuse gate can
+/// settle it. When this machine was entered via `js_async_first_call`
+/// (which nulls `trap_next` per #691), a plain `js_promise_then` here
+/// yields a result promise that `done` cannot match (its reuse gate needs
+/// a non-null `trap_next`), so `done` mints a fresh promise and ORPHANS
+/// the result the caller awaits → the awaiter hangs (the Next.js SSR
+/// render deadlock). Allocate the result explicitly, back-patch the
+/// thunks' captured `trap_next` (capture slot 1) to it, and attach the
+/// handlers WITHOUT a chained `next` (a chained `next` would make a
+/// mid-chain await self-resolve → "Chaining cycle detected").
+fn then_backpatch_result(
+    awaited: *mut Promise,
+    fulfill: ClosurePtr,
+    reject: ClosurePtr,
+    trap_next: *mut Promise,
+) -> *mut Promise {
+    if trap_next.is_null() {
+        let result = super::then::js_promise_new_with_parent(awaited);
+        crate::closure::js_closure_set_capture_ptr(
+            fulfill as *mut crate::closure::ClosureHeader,
+            1,
+            result as i64,
+        );
+        crate::closure::js_closure_set_capture_ptr(
+            reject as *mut crate::closure::ClosureHeader,
+            1,
+            result as i64,
+        );
+        super::then::js_promise_attach_handlers(awaited, fulfill, reject);
+        result
+    } else {
+        js_promise_then(awaited, fulfill, reject)
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn js_async_step_chain(value: f64, step_closure: ClosurePtr) -> *mut Promise {
     // PR #1004 followup: if `value` is a JS_HANDLE_TAG handle to a V8
@@ -296,14 +333,14 @@ pub extern "C" fn js_async_step_chain(value: f64, step_closure: ClosurePtr) -> *
                     // that will queue the right Task when called.
                     bump(&MT_STEP_CHAIN_REUSE_MISS);
                     let (fulfill, reject) = build_async_step_thunks(step_closure, trap_next);
-                    return js_promise_then(inner, fulfill, reject);
+                    return then_backpatch_result(inner, fulfill, reject, trap_next);
                 }
             }
         } else {
             bump(&MT_STEP_CHAIN_REUSE_MISS);
             let (fulfill, reject) = build_async_step_thunks(step_closure, trap_next);
             let p = js_promise_resolved(value);
-            return js_promise_then(p, fulfill, reject);
+            return then_backpatch_result(p, fulfill, reject, trap_next);
         }
     } else {
         // Pointer-tagged but not a Promise (thenable etc.). Take the
@@ -311,7 +348,7 @@ pub extern "C" fn js_async_step_chain(value: f64, step_closure: ClosurePtr) -> *
         bump(&MT_STEP_CHAIN_REUSE_MISS);
         let (fulfill, reject) = build_async_step_thunks(step_closure, trap_next);
         let p = js_promise_resolved(value);
-        return js_promise_then(p, fulfill, reject);
+        return then_backpatch_result(p, fulfill, reject, trap_next);
     };
 
     TASK_QUEUE.with(|q| {
@@ -343,6 +380,27 @@ pub extern "C" fn js_async_step_chain(value: f64, step_closure: ClosurePtr) -> *
 /// function) or step_closure doesn't match (nested async-fn call,
 /// where the outer activation's `next` must NOT be settled here).
 /// Fall back to `js_promise_resolved(value)`.
+/// Codegen entry for the return value of an await-less async fn (the
+/// transform leaves those un-converted; `Stmt::Return` wraps the value
+/// directly). Differs from `js_promise_resolved` in one spec-visible way: an
+/// async fn always returns a FRESH promise, and `return <promise>` ADOPTS the
+/// inner via the two-tick job (V8 hop parity; hops.js
+/// `asyncfn-return-resolved-promise` = t0 t1 t2 X in Node) — the #2823
+/// `Promise.resolve(p) === p` identity does not apply to async returns.
+#[no_mangle]
+pub extern "C" fn js_async_fn_result(value: f64) -> *mut Promise {
+    let value = adapt_foreign_promise_value(value);
+    if js_value_is_promise(value) != 0 {
+        let inner = crate::value::js_nanbox_get_pointer(value) as *mut Promise;
+        if !inner.is_null() {
+            let fresh = js_promise_new();
+            super::assimilate::enqueue_native_adoption_job(fresh, inner);
+            return fresh;
+        }
+    }
+    js_promise_resolved(value)
+}
+
 #[no_mangle]
 pub extern "C" fn js_async_step_done(value: f64, step_closure: ClosurePtr) -> *mut Promise {
     // PR #1004 followup (sibling to js_async_step_chain): adapt a
@@ -372,6 +430,19 @@ pub extern "C" fn js_async_step_done(value: f64, step_closure: ClosurePtr) -> *m
         trap.trap_next
     } else {
         bump(&MT_STEP_DONE_REUSE_MISS);
+        // An async fn always returns a FRESH promise — `js_promise_resolved`'s
+        // #2823 identity short-circuit (Promise.resolve(p) === p) must not
+        // apply to `return <promise>` from an async fn, which instead adopts
+        // the inner promise via the two-tick job (V8 hop parity; hops.js
+        // `asyncfn-return-resolved-promise` = t0 t1 t2 X in Node).
+        if js_value_is_promise(value) != 0 {
+            let inner = crate::value::js_nanbox_get_pointer(value) as *mut Promise;
+            if !inner.is_null() {
+                let fresh = js_promise_new();
+                super::assimilate::enqueue_native_adoption_job(fresh, inner);
+                return fresh;
+            }
+        }
         js_promise_resolved(value)
     }
 }
@@ -389,11 +460,13 @@ fn resolve_trap_next_with_adoption(target: *mut Promise, value: f64) {
         js_promise_resolve(target, value);
         return;
     }
-    // Native Promise: chain `target` to follow its eventual state.
+    // Native Promise: adopt via the native job — `return <promise>` from an
+    // async fn is observable two ticks later in V8 (hop parity; see
+    // `enqueue_native_adoption_job`).
     if js_value_is_promise(value) != 0 {
         let inner = crate::value::js_nanbox_get_pointer(value) as *mut Promise;
         if !inner.is_null() && inner != target {
-            js_promise_resolve_with_promise(target, inner);
+            super::assimilate::enqueue_native_adoption_job(target, inner);
             return;
         }
     }
@@ -403,7 +476,7 @@ fn resolve_trap_next_with_adoption(target: *mut Promise, value: f64) {
     if assim.to_bits() != value.to_bits() && js_value_is_promise(assim) != 0 {
         let inner = crate::value::js_nanbox_get_pointer(assim) as *mut Promise;
         if !inner.is_null() && inner != target {
-            js_promise_resolve_with_promise(target, inner);
+            super::assimilate::enqueue_native_adoption_job(target, inner);
             return;
         }
     }
@@ -581,7 +654,49 @@ extern "C" fn async_step_fulfill_thunk(
     });
     let result = crate::closure::js_closure_call2(step, value, false_bits);
     INLINE_TRAP.with(|c| c.set(prev));
+    forward_swallowed_rejection(result, captured_trap_next);
     result
+}
+
+/// #5941: a thunk-resumed step that exits through its internal catch arm
+/// (a `throw` after the await, or an awaited rejection with no matching
+/// catch route) returns a FRESH rejected promise
+/// (`return Promise.reject(e)` in the step body's catch) — historically
+/// DISCARDED by the thunks, so the machine's real result promise (the
+/// captured per-activation `trap_next`, #5485) stayed Pending and every
+/// awaiter of the async fn hung instead of observing the throw. On the
+/// first_call path the wrapper returns the rejected promise to the caller
+/// directly, so only the resumed path leaked. Forward the rejection into
+/// the activation's result. The normal resume paths return `trap_next`
+/// itself (chain/done reuse) and are skipped by the identity check;
+/// `js_async_step_done`'s non-reuse arm returning a user
+/// `return <rejected promise>` also lands here, which matches spec (the
+/// async fn's result rejects with the inner reason).
+fn forward_swallowed_rejection(result: f64, trap_next: *mut Promise) {
+    if trap_next.is_null() {
+        return;
+    }
+    let bits = result.to_bits();
+    if bits & 0xFFFF_0000_0000_0000 != 0x7FFD_0000_0000_0000 {
+        return;
+    }
+    if js_value_is_promise(result) == 0 {
+        return;
+    }
+    let ret = (bits & 0x0000_FFFF_FFFF_FFFF) as *mut Promise;
+    if ret.is_null() || ret == trap_next {
+        return;
+    }
+    unsafe {
+        if (*ret).state != PromiseState::Rejected || (*trap_next).state != PromiseState::Pending {
+            return;
+        }
+        let reason = (*ret).reason;
+        // The rejection is consumed by forwarding it into the result —
+        // the discarded wrapper must not be reported as unhandled.
+        crate::promise::mark_rejection_handled(ret);
+        js_promise_reject(trap_next, reason);
+    }
 }
 
 extern "C" fn async_step_reject_thunk(
@@ -606,6 +721,7 @@ extern "C" fn async_step_reject_thunk(
     });
     let result = crate::closure::js_closure_call2(step, value, true_bits);
     INLINE_TRAP.with(|c| c.set(prev));
+    forward_swallowed_rejection(result, captured_trap_next);
     result
 }
 

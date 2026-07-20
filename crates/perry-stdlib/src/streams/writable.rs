@@ -102,7 +102,7 @@ pub unsafe extern "C" fn js_writable_stream_get_writer(stream_handle: f64) -> f6
         drop(g);
         throw_type_error("WritableStream is locked");
     }
-    let writer_id = next_id(&NEXT_STREAM_ID);
+    let writer_id = next_stream_id();
     s.writer_handle = Some(writer_id);
     let closed_p = s.closed_promise;
     let ready_p = s.ready_promise;
@@ -219,6 +219,7 @@ pub(super) unsafe fn js_writable_stream_abort_inner(
     }
     // #5437: writable stream aborted (terminal Errored) — drop expandos.
     super::expando::stream_expando_clear(id);
+    super::idalloc::retire_writable_terminal(id);
     js_promise_resolve(promise, f64::from_bits(TAG_UNDEFINED));
     promise
 }
@@ -469,6 +470,7 @@ unsafe fn finish_writable_close_success(stream_id: usize, promise: *mut Promise)
     }
     // #5437: writable stream reached its terminal Closed state — drop expandos.
     super::expando::stream_expando_clear(stream_id);
+    super::idalloc::retire_writable_terminal(stream_id);
 }
 
 unsafe fn finish_writable_close_error(stream_id: usize, promise: *mut Promise, reason: f64) {
@@ -496,6 +498,7 @@ unsafe fn finish_writable_close_error(stream_id: usize, promise: *mut Promise, r
     }
     // #5437: writable stream reached its terminal Errored state — drop expandos.
     super::expando::stream_expando_clear(stream_id);
+    super::idalloc::retire_writable_terminal(stream_id);
 }
 
 pub(super) unsafe fn run_writable_write(
@@ -585,23 +588,15 @@ pub(super) unsafe fn writable_stream_write(
         install_writable_backpressure_ready(stream_id, writer_id);
     }
     if let Some((cb, chunk, write_promise)) = start_write {
-        let start_fn = writable_write_start_microtask as *const u8;
-        perry_runtime::closure::js_register_closure_arity(start_fn, 0);
-        let start = perry_runtime::closure::js_closure_alloc(start_fn, 5);
-        perry_runtime::closure::js_closure_set_capture_ptr(
-            start,
-            0,
-            (stream_id as f64).to_bits() as i64,
-        );
-        perry_runtime::closure::js_closure_set_capture_ptr(
-            start,
-            1,
-            (writer_id as f64).to_bits() as i64,
-        );
-        perry_runtime::closure::js_closure_set_capture_ptr(start, 2, cb);
-        perry_runtime::closure::js_closure_set_capture_ptr(start, 3, chunk.to_bits() as i64);
-        perry_runtime::closure::js_closure_set_capture_ptr(start, 4, write_promise as i64);
-        perry_runtime::builtins::js_queue_microtask(start as i64);
+        // Spec/Node tick parity: with no write in flight, `writer.write(chunk)`
+        // invokes the sink's `write()` SYNCHRONOUSLY in the same job
+        // (WritableStreamDefaultControllerProcessWrite) — deferring it through
+        // a microtask cost one tick per write, which let a tee sibling's
+        // reader outrun a pipeTo pump (teepipe.js; Next.js cold-start head
+        // reorder). All registry locks are released above; `run_writable_write`
+        // re-enters the FFI safely (it is the same body the queued microtask
+        // ran).
+        run_writable_write(stream_id, writer_id, cb, chunk, write_promise);
     }
     promise
 }
@@ -695,6 +690,7 @@ unsafe fn finish_writable_write_error(stream_id: usize, promise: *mut Promise, r
     if !closed.is_null() {
         js_promise_reject(closed, reason);
     }
+    super::idalloc::retire_writable_terminal(stream_id);
 }
 
 #[no_mangle]
@@ -776,6 +772,7 @@ pub unsafe extern "C" fn js_writer_release_lock(writer_handle: f64) -> f64 {
     // #5437: writer instance done — drop its expando entries (see the reader
     // release path in streams.rs).
     super::expando::stream_expando_clear(writer_id);
+    super::idalloc::retire_writer_if_released(writer_id);
     f64::from_bits(TAG_UNDEFINED)
 }
 

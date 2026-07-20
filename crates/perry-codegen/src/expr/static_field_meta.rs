@@ -69,7 +69,10 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             let key = (class_name.clone(), field_name.clone());
             if let Some(global_name) = ctx.static_field_globals.get(&key).cloned() {
                 let g_ref = format!("@{}", global_name);
-                // GC_STORE_AUDIT(ROOT): static field global slot is registered as a mutable GC root.
+                // GC_STORE_AUDIT(ROOT): static field global slot is registered as a mutable GC root
+                // (register_module_globals_as_gc_roots walks ctx.static_field_globals since the
+                // 2026-07-02 audit fix; before that this comment was aspirational and the slot
+                // was unrooted).
                 emit_root_nanbox_store_on_block(ctx.block(), &v, &g_ref);
             }
             // v0.5.747: also register the static field in the runtime
@@ -132,10 +135,21 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             class_name,
             captures,
         } => {
+            // #6052: the snapshot refresh emitted after EACH captured var's
+            // assignment (#6037) can legally read a SIBLING capture whose
+            // `let`/`const` has not run yet (`const _fs = ..; <refresh>;
+            // const _path = ..` — the SWC CJS interop shape). Those loads are
+            // Perry-internal materialization, not user reads: bracket them in
+            // a TDZ-suppression window so a dead-zone box snapshots as
+            // `undefined` (a later refresh fixes it up) instead of throwing
+            // the #6044 ReferenceError. The window holds only these
+            // side-effect-free capture loads — no user code runs inside it.
+            ctx.block().call_void("js_tdz_suppress_begin", &[]);
             let mut lowered: Vec<String> = Vec::with_capacity(captures.len());
             for c in captures {
                 lowered.push(lower_expr(ctx, c)?);
             }
+            ctx.block().call_void("js_tdz_suppress_end", &[]);
             if let Some(&class_id) = ctx.class_ids.get(class_name) {
                 if class_id != 0 && !lowered.is_empty() {
                     let n = lowered.len();
@@ -381,6 +395,19 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // class_id from this object rather than treating it as an instance.
             ctx.block()
                 .call_void("js_object_mark_class", &[(I64, &obj)]);
+            // #6438: pin THIS evaluation's parent onto the object. The lowering
+            // sequences `RegisterClassParentDynamic` immediately ahead of this
+            // node, so `CLASS_DYNAMIC_PARENT_VALUE[template]` still holds this
+            // evaluation's parent; later evaluations overwrite it, but each
+            // object keeps its own edge. Without this, a factory invoked more
+            // than once (effect's `class DeclareClass extends make(ast) { … }`)
+            // has every instance walk to the LAST parent — reading that
+            // evaluation's `static ast` instead of its own. No-op when the class
+            // expression has no heritage.
+            ctx.block().call_void(
+                "js_class_object_pin_parent",
+                &[(I64, &obj), (I32, &tcid_str)],
+            );
             for (name, init) in named_statics {
                 let key_idx = ctx.strings.intern(name);
                 let key_handle_global = format!("@{}", ctx.strings.entry(key_idx).handle_global);
@@ -402,7 +429,21 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // inlining can't do once the class escapes its defining scope.
             if !captured_args.is_empty() {
                 let cap_len = captured_args.len().to_string();
+                let mut lowered_caps: Vec<String> = Vec::with_capacity(captured_args.len());
                 let mut caps_arr = ctx.block().call(I64, "js_array_alloc", &[(I32, &cap_len)]);
+                // #6523: these capture loads are Perry-internal materialization
+                // at the class's DEFINITION site, same as the
+                // `RegisterClassCaptures` snapshot loads above (#6052). A
+                // captured `const` declared AFTER the class (bundled semver's
+                // `class Comparator` + trailing debug/require consts) is still
+                // in its dead zone here — legal JS, since TDZ applies at
+                // method-call time. Without the suppression window the checked
+                // box read threw "Cannot access undefined before
+                // initialization" while merely DEFINING the class. Suppressed
+                // loads snapshot `undefined`; the #6037 refresh statements
+                // re-register the live values right after each captured
+                // binding's initializer runs.
+                ctx.block().call_void("js_tdz_suppress_begin", &[]);
                 for arg in captured_args {
                     let v = lower_expr(ctx, arg)?;
                     caps_arr = ctx.block().call(
@@ -410,7 +451,9 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         "js_array_push_f64",
                         &[(I64, &caps_arr), (DOUBLE, &v)],
                     );
+                    lowered_caps.push(v);
                 }
+                ctx.block().call_void("js_tdz_suppress_end", &[]);
                 let caps_box = nanbox_pointer_inline(ctx.block(), &caps_arr);
                 let key_idx = ctx.strings.intern("__perry_ctor_caps");
                 let key_handle_global = format!("@{}", ctx.strings.entry(key_idx).handle_global);
@@ -422,6 +465,39 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     "js_object_set_field_by_name",
                     &[(I64, &obj), (I64, &key_raw), (DOUBLE, &caps_box)],
                 );
+                // #685: ALSO register this evaluation's captures as the
+                // template's CLASS_CAPTURE_VALUES snapshot. The static blocks
+                // invoked below run compiled static-method bodies whose
+                // enclosing-scope reads resolve through
+                // `js_param_or_class_capture_value` — i.e. the name-keyed
+                // snapshot — not `__perry_ctor_caps` (that array only feeds
+                // constructor replay). Same write-right-before-use pattern
+                // (and same documented per-evaluation overwrite limitation)
+                // as the shared-template path's `RegisterClassCaptures`.
+                if template_cid != 0 {
+                    let n = lowered_caps.len();
+                    let buf = ctx.func.alloca_entry_array(DOUBLE, n);
+                    for (i, v) in lowered_caps.iter().enumerate() {
+                        let slot =
+                            ctx.block()
+                                .gep(DOUBLE, &buf, &[(crate::types::I64, &i.to_string())]);
+                        ctx.block().store(DOUBLE, v, &slot);
+                    }
+                    let ptr_reg = ctx.block().next_reg();
+                    ctx.block().emit_raw(format!(
+                        "{} = getelementptr [{} x double], ptr {}, i64 0, i64 0",
+                        ptr_reg, n, buf
+                    ));
+                    let len_str = n.to_string();
+                    ctx.block().call_void(
+                        "js_class_register_capture_values",
+                        &[
+                            (crate::types::I32, &tcid_str),
+                            (crate::types::PTR, &ptr_reg),
+                            (crate::types::I64, &len_str),
+                        ],
+                    );
+                }
             }
             let obj_box = nanbox_pointer_inline(ctx.block(), &obj);
             for (key, init) in symbol_statics {
@@ -432,6 +508,42 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     "js_object_set_symbol_property",
                     &[(DOUBLE, &obj_box), (DOUBLE, &k), (DOUBLE, &v)],
                 );
+            }
+            // #685: run the class's `static { … }` blocks NOW — at the class
+            // expression's evaluation, with `this` = THIS fresh class object.
+            // The `ClassExprFresh` fast path previously never invoked them
+            // (they are also skipped by the module-init fallback when another
+            // evaluation site invokes them inline), so `return class { static
+            // { this.viaBlock = tag } }` factories produced objects whose
+            // blocks simply never ran. Arm the one-shot static-`this`
+            // override before each call so the compiled body's
+            // `js_static_this_resolve` prologue binds `this` to the fresh
+            // object (writes land as own properties of this evaluation's
+            // object, not the shared template). Blocks run after the named
+            // static fields above — the source interleaving of fields and
+            // blocks is not reproduced on this path (pre-existing limitation).
+            let block_fns: Vec<String> = ctx
+                .classes
+                .get(template)
+                .map(|c| {
+                    c.static_methods
+                        .iter()
+                        .filter(|m| m.name.starts_with("__perry_static_init_"))
+                        .filter_map(|m| {
+                            ctx.methods
+                                .get(&(
+                                    template.clone(),
+                                    crate::codegen::static_method_registry_key(&m.name),
+                                ))
+                                .cloned()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            for fn_name in block_fns {
+                ctx.block()
+                    .call_void("js_static_this_arm_value", &[(DOUBLE, &obj_box)]);
+                ctx.block().call(DOUBLE, &fn_name, &[]);
             }
             Ok(obj_box)
         }

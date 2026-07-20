@@ -5,6 +5,7 @@
 
 pub mod analysis;
 pub mod audit;
+pub mod cap_fields;
 pub mod capability;
 mod class_accessors;
 pub mod deferral;
@@ -47,7 +48,8 @@ pub use enums::fix_imported_enums;
 pub use eval_classifier::{
     check_unimplemented_api, classify as classify_eval_surface, location_string,
     record_deferred_aot_site, set_eval_strict_mode, set_unimplemented_strict_mode,
-    take_deferred_eval_sites, DeferredEvalSite, EvalBucket, EvalClassification, EvalDecision,
+    has_deferred_dynamic_code_sites, take_deferred_eval_sites, DeferredEvalSite, EvalBucket,
+    EvalClassification, EvalDecision,
     EvalSurface, UnimplementedDecision, UNIMPLEMENTED_API_KIND,
 };
 pub use ir::*;

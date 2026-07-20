@@ -58,9 +58,10 @@ jobs:
         # Node 26 is the oracle the node_suite_baseline.json floors were
         # captured on; running any other major would compare against the
         # wrong reference and produce spurious regressions.
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
-          node-version: "26"
+          # Single source of truth: .node-version at the repo root.
+          node-version-file: .node-version
 
       - name: Build Perry release binary
         run: cargo build --release -p perry -p perry-runtime -p perry-stdlib -p perry-runtime-static -p perry-stdlib-static

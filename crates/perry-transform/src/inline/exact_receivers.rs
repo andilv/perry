@@ -17,7 +17,9 @@ pub fn resolve_receiver_class(
     match obj {
         Expr::LocalGet(id) => local_types.get(id).map(|cn| (cn.clone(), Some(*id))),
         Expr::This => enclosing_class.map(|cn| (cn.to_string(), None)),
-        Expr::PropertyGet { object, property } => {
+        Expr::PropertyGet {
+            object, property, ..
+        } => {
             // Recursive resolution: get the inner receiver's class, then
             // look up the field on that class. Field-walking chains like
             // `world.commandBuffer.set(...)` benefit — without this the
@@ -72,7 +74,7 @@ pub fn apply_exact_receiver_stmt_effect(stmt: &Stmt, facts: &mut ExactReceiverFa
         | Stmt::Continue
         | Stmt::LabeledBreak(_)
         | Stmt::LabeledContinue(_) => {}
-        Stmt::PreallocateBoxes(ids) => {
+        Stmt::PreallocateBoxes(ids) | Stmt::PreallocateTdzBoxes(ids) => {
             for id in ids {
                 facts.remove(id);
             }
@@ -277,7 +279,8 @@ pub fn collect_exact_receiver_refs_in_stmt(
         | Stmt::Continue
         | Stmt::LabeledBreak(_)
         | Stmt::LabeledContinue(_)
-        | Stmt::PreallocateBoxes(_) => {}
+        | Stmt::PreallocateBoxes(_)
+        | Stmt::PreallocateTdzBoxes(_) => {}
     }
 }
 

@@ -19,15 +19,112 @@ unsafe fn coerce_to_bigint_ptr(val: f64) -> *mut crate::bigint::BigIntHeader {
     }
 }
 
+/// Describe a mixed-BigInt-throw operand for the `PERRY_BIGINT_MIX_DIAG=1`
+/// stderr dump (tag class + value preview). Diagnostic aid for "Cannot mix
+/// BigInt" throws in compiled bundles, where the JS stack is unavailable —
+/// pairing the operand dump with the native backtrace pinpointed the #6649
+/// pi-bundle init throw (TypeBox FNV-1a `Accumulator * Prime` with `Prime`
+/// compiled to `undefined`) in a single run. Only reachable from the `#[cold]`
+/// throw path, and only active when the env var is set.
+#[cold]
+unsafe fn describe_mix_operand(v: f64) -> String {
+    let jv = JSValue::from_bits(v.to_bits());
+    if jv.is_bigint() {
+        let s = crate::bigint::js_bigint_to_string(jv.as_bigint_ptr());
+        format!("bigint({}n)", crate::exception::string_header_to_string(s))
+    } else if jv.is_int32() {
+        format!("int32({})", jv.as_int32())
+    } else if jv.is_bool() {
+        format!("bool({})", jv.as_bool())
+    } else if jv.is_undefined() {
+        "undefined".to_string()
+    } else if jv.is_null() {
+        "null".to_string()
+    } else if jv.is_any_string() {
+        let ptr = js_get_string_pointer_unified(v) as *const crate::string::StringHeader;
+        let mut s = crate::exception::string_header_to_string(ptr);
+        // Char-boundary-safe preview cap: byte-index truncate panics when the
+        // 80th byte lands inside a multi-byte UTF-8 sequence.
+        if s.len() > 80 {
+            let cut = (0..=80).rev().find(|i| s.is_char_boundary(*i)).unwrap_or(0);
+            s.truncate(cut);
+        }
+        format!("string({s:?})")
+    } else if jv.is_pointer() {
+        format!("pointer(0x{:x})", jv.as_pointer::<u8>() as usize)
+    } else {
+        format!("number({v}) bits=0x{:016x}", v.to_bits())
+    }
+}
+
 /// Throw `TypeError: Cannot mix BigInt and other types, use explicit
 /// conversions`, matching Node when a BigInt operand is combined with a
 /// non-BigInt operand in an arithmetic / bitwise operation (#2908).
 #[cold]
-unsafe fn throw_mix_bigint() -> ! {
+unsafe fn throw_mix_bigint(a: f64, b: f64) -> ! {
+    if std::env::var_os("PERRY_BIGINT_MIX_DIAG").is_some() {
+        // describe_mix_operand can allocate (BigInt → decimal string); root
+        // both operands and reload `b` through its handle so the first
+        // describe's allocations cannot leave the second reading a stale
+        // pointer. Cold diagnostic path — the scope cost is irrelevant.
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let a_handle = scope.root_nanbox_f64(a);
+        let b_handle = scope.root_nanbox_f64(b);
+        let a_desc = describe_mix_operand(a_handle.get_nanbox_f64());
+        let b_desc = describe_mix_operand(b_handle.get_nanbox_f64());
+        eprintln!("[bigint-mix-diag] a={a_desc} b={b_desc}");
+        eprintln!("{}", std::backtrace::Backtrace::force_capture());
+    }
     let msg = b"Cannot mix BigInt and other types, use explicit conversions";
     let s = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
     let err = crate::error::js_typeerror_new(s);
     crate::exception::js_throw(js_nanbox_pointer(err as i64))
+}
+
+/// `ToNumeric(value)` (ES §7.1.3): `ToPrimitive(value, number)` then, if the
+/// primitive is a BigInt, keep it — otherwise `ToNumber`. This is the coercion
+/// the numeric binary operators run on each operand *before* the both-BigInt
+/// check, so a boxed BigInt (`Object(1n)`) unwraps to a BigInt (not a Number),
+/// and a `Symbol.toPrimitive`/`valueOf` that yields a BigInt participates in
+/// BigInt arithmetic (test262 `bigint-non-primitive`, `bigint-and-number`).
+///
+/// A plain primitive short-circuits (no allocation, no method lookup). Only an
+/// object operand takes the ToPrimitive path; a non-object result of that
+/// (string, bool, …) still goes through `js_number_coerce`, matching a bare
+/// primitive of the same shape.
+#[inline]
+unsafe fn to_numeric(value: f64) -> f64 {
+    let jsval = JSValue::from_bits(value.to_bits());
+    if jsval.is_bigint() {
+        return value;
+    }
+    // Non-object primitives (number/int32/string/bool/null/undefined) never
+    // become a BigInt; defer to the existing ToNumber coercion.
+    if !jsval.is_pointer() {
+        return crate::builtins::js_number_coerce(value);
+    }
+    // Symbols are pointers but ToNumber(Symbol) throws — let js_number_coerce
+    // raise that (it brand-checks). Other objects: ToPrimitive(number) first.
+    if crate::symbol::js_is_symbol(value) != 0 {
+        return crate::builtins::js_number_coerce(value);
+    }
+    match crate::value::to_string::to_primitive_number(value) {
+        crate::value::to_string::OrdinaryToPrimitiveOutcome::Primitive(p) => {
+            // A BigInt primitive stays a BigInt (that's the whole point of
+            // ToNumeric); anything else re-coerces via ToNumber.
+            if JSValue::from_bits(p.to_bits()).is_bigint() {
+                p
+            } else {
+                crate::builtins::js_number_coerce(p)
+            }
+        }
+        crate::value::to_string::OrdinaryToPrimitiveOutcome::DefaultString => {
+            crate::builtins::js_number_coerce(value)
+        }
+        crate::value::to_string::OrdinaryToPrimitiveOutcome::TypeError => {
+            throw_add_type_error(b"Cannot convert object to primitive value")
+        }
+    }
 }
 
 /// Enforce Node's rule that BigInt operators require *both* operands to be
@@ -41,7 +138,7 @@ unsafe fn both_bigint_or_throw(a: f64, b: f64) -> bool {
     if a_big && b_big {
         true
     } else if a_big || b_big {
-        throw_mix_bigint();
+        throw_mix_bigint(a, b);
     } else {
         false
     }
@@ -129,8 +226,44 @@ unsafe fn to_primitive_default_for_add(value: f64) -> f64 {
         return crate::value::function_to_primitive_for_add(value);
     }
 
+    // A `RegExpHeader` is NOT an `ObjectHeader` either, and — unlike Buffer /
+    // TypedArray / Date above — it had no guard here at all: `"" + re` fell
+    // through to `ordinary_to_primitive_number_for_add`, which bit-casts `ptr`
+    // to an `ObjectHeader` and reads `valueOf`/`toString` out of garbage field
+    // slots. It came back `undefined`, so `"" + /c/gi` printed "undefined"
+    // instead of "/c/gi" (release builds; the read is UB, and a lower opt level
+    // happened to mask it). Route the regex through the same ToPrimitive steps
+    // the spec prescribes (#6370):
+    //
+    //   OrdinaryToPrimitive(re, "default") = valueOf, then toString.
+    //
+    // `RegExp.prototype` has no `valueOf`, so only an OWN `valueOf` can win the
+    // first step (`re.valueOf = () => "V"; re + ""` → "V"); otherwise the
+    // `toString` step runs, and `js_jsvalue_to_string` performs it — own
+    // override first (data or accessor), else the `/source/flags` literal.
+    // `Symbol.toPrimitive` was already consulted by `js_to_primitive` above.
+    if crate::regex::is_regex_pointer(ptr as *const u8) {
+        if let Some(primitive) = crate::value::to_string::exotic_own_value_of_primitive(
+            ptr,
+            crate::object::exotic_expando::ExoticKind::RegExp,
+            value,
+        ) {
+            return primitive;
+        }
+        let s = crate::value::js_jsvalue_to_string(value);
+        return crate::value::js_nanbox_string(s as i64);
+    }
+
     if crate::date::is_date_cell_addr(ptr) {
-        let s = crate::date::js_date_to_string(value);
+        // `Date.prototype[@@toPrimitive]` maps the "default" hint to "string",
+        // so `"" + date` is OrdinaryToPrimitive(date, "string") — an own
+        // `toString` (data or accessor) shadows `Date.prototype.toString` here
+        // exactly as it does for `String(date)` (#6370). Route through
+        // `js_jsvalue_to_string`, whose date arm now performs that own-property
+        // lookup and otherwise still yields `js_date_to_string`. (An own
+        // `valueOf` correctly does NOT win: the string hint tries `toString`
+        // first and the built-in one already returns a primitive.)
+        let s = crate::value::js_jsvalue_to_string(value);
         return crate::value::js_nanbox_string(s as i64);
     }
 
@@ -226,6 +359,8 @@ fn numify_arith_operand(v: f64) -> f64 {
 /// Dynamic multiply: BigInt * BigInt if either operand is BigInt, else f64 * f64.
 #[no_mangle]
 pub unsafe extern "C" fn js_dynamic_mul(a: f64, b: f64) -> f64 {
+    let a = to_numeric(a);
+    let b = to_numeric(b);
     if both_bigint_or_throw(a, b) {
         return dynamic_bigint_binary_op(a, b, crate::bigint::js_bigint_mul);
     }
@@ -404,6 +539,8 @@ pub unsafe extern "C" fn js_dynamic_string_or_number_add(a: f64, b: f64) -> f64 
 /// Dynamic subtract: BigInt - BigInt if either operand is BigInt, else f64 - f64.
 #[no_mangle]
 pub unsafe extern "C" fn js_dynamic_sub(a: f64, b: f64) -> f64 {
+    let a = to_numeric(a);
+    let b = to_numeric(b);
     if both_bigint_or_throw(a, b) {
         return dynamic_bigint_binary_op(a, b, crate::bigint::js_bigint_sub);
     }
@@ -413,6 +550,8 @@ pub unsafe extern "C" fn js_dynamic_sub(a: f64, b: f64) -> f64 {
 /// Dynamic divide: BigInt / BigInt if either operand is BigInt, else f64 / f64.
 #[no_mangle]
 pub unsafe extern "C" fn js_dynamic_div(a: f64, b: f64) -> f64 {
+    let a = to_numeric(a);
+    let b = to_numeric(b);
     if both_bigint_or_throw(a, b) {
         return dynamic_bigint_binary_op(a, b, crate::bigint::js_bigint_div);
     }
@@ -422,13 +561,20 @@ pub unsafe extern "C" fn js_dynamic_div(a: f64, b: f64) -> f64 {
 /// Dynamic modulo: BigInt % BigInt if either operand is BigInt, else f64 % f64.
 #[no_mangle]
 pub unsafe extern "C" fn js_dynamic_mod(a: f64, b: f64) -> f64 {
+    let a = to_numeric(a);
+    let b = to_numeric(b);
     if both_bigint_or_throw(a, b) {
         return dynamic_bigint_binary_op(a, b, crate::bigint::js_bigint_mod);
     }
-    // Float modulo: a - trunc(a / b) * b
     let a = numify_arith_operand(a);
     let b = numify_arith_operand(b);
-    a - (a / b).trunc() * b
+    // JS `%` is C `fmod`: the result takes the *sign of the dividend*, so
+    // `-1 % -1` is `-0`, not `+0`. The old `a - (a / b).trunc() * b` closed-form
+    // lost that (`-1.0 - 1.0 * -1.0 == +0.0`) and also returned `NaN` for
+    // `x % Infinity` (should be `x`). Rust's `f64 % f64` *is* `fmod`, matching
+    // the spec exactly on the sign of zero, `x % ±Inf`, and `±Inf % y` / `x % 0`
+    // → `NaN` (test262 compound-assignment `mod-whitespace`: `-0` expected).
+    a % b
 }
 
 /// Dynamic negate: -BigInt if operand is BigInt, else -f64.
@@ -465,67 +611,96 @@ pub unsafe extern "C" fn js_dynamic_bitnot(a: f64) -> f64 {
     // toward zero and reduce modulo 2^32. `as i64` is NOT equivalent — it
     // saturates for |v| >= 2^63, so `~(1e20)` came out as `~(-1)` == 0
     // instead of -1661992961 (CodeRabbit review on #5466).
-    let a_i32 = if a_num.is_nan() || !a_num.is_finite() {
-        0i32
+    (!dyn_to_int32(a_num)) as f64
+}
+
+/// ES ToInt32 (7.1.6): truncate toward zero, reduce modulo 2^32, reinterpret as
+/// signed. NaN / ±0 / ±Infinity map to 0. `v as i64 as i32` is WRONG — Rust's
+/// float→int cast SATURATES for |v| >= 2^63, so e.g. ToInt32(1e20) came out as
+/// -1 instead of 1661992960 (#6079).
+#[inline]
+fn dyn_to_int32(v: f64) -> i32 {
+    if !v.is_finite() {
+        0
     } else {
-        a_num.trunc().rem_euclid(4294967296.0) as u32 as i32
-    };
-    (!a_i32) as f64
+        (v.trunc().rem_euclid(4_294_967_296.0) as u32) as i32
+    }
+}
+
+/// ES ToUint32 (7.1.7): as ToInt32 but reinterpreted as unsigned.
+#[inline]
+fn dyn_to_uint32(v: f64) -> u32 {
+    if !v.is_finite() {
+        0
+    } else {
+        v.trunc().rem_euclid(4_294_967_296.0) as u32
+    }
 }
 
 /// Dynamic right shift: BigInt >> if either operand is BigInt, else i32 >> for numbers.
 #[no_mangle]
 pub unsafe extern "C" fn js_dynamic_shr(a: f64, b: f64) -> f64 {
+    let a = to_numeric(a);
+    let b = to_numeric(b);
     if both_bigint_or_throw(a, b) {
         return dynamic_bigint_binary_op(a, b, crate::bigint::js_bigint_shr);
     }
-    // JS ToInt32: f64 -> i64 -> i32 (wrapping), NOT f64 -> i32 (saturating).
-    // Rust `f64 as i32` saturates at i32::MAX for values >= 2^31, but JS wraps.
-    let ai = (a as i64) as i32;
-    let bi = ((b as i64) as i32) & 0x1f;
+    // JS ToInt32(a); ToUint32(b) & 0x1F for the shift count (#6079).
+    let ai = dyn_to_int32(a);
+    let bi = dyn_to_uint32(b) & 0x1f;
     (ai >> bi) as f64
 }
 
 /// Dynamic left shift: BigInt << if either operand is BigInt, else i32 << for numbers.
 #[no_mangle]
 pub unsafe extern "C" fn js_dynamic_shl(a: f64, b: f64) -> f64 {
+    let a = to_numeric(a);
+    let b = to_numeric(b);
     if both_bigint_or_throw(a, b) {
         return dynamic_bigint_binary_op(a, b, crate::bigint::js_bigint_shl);
     }
-    // JS ToInt32: f64 -> i64 -> i32 (wrapping), NOT f64 -> i32 (saturating).
-    let ai = (a as i64) as i32;
-    let bi = ((b as i64) as i32) & 0x1f;
+    // JS ToInt32(a); ToUint32(b) & 0x1F for the shift count (#6079).
+    let ai = dyn_to_int32(a);
+    let bi = dyn_to_uint32(b) & 0x1f;
     (ai << bi) as f64
 }
 
 /// Dynamic bitwise AND: BigInt & if either operand is BigInt, else i32 & for numbers.
 #[no_mangle]
 pub unsafe extern "C" fn js_dynamic_bitand(a: f64, b: f64) -> f64 {
+    // ToNumeric both operands first so a boxed BigInt/Number (`Object(1n)`)
+    // resolves to its primitive type before the both-BigInt check.
+    let a = to_numeric(a);
+    let b = to_numeric(b);
     if both_bigint_or_throw(a, b) {
         return dynamic_bigint_binary_op(a, b, crate::bigint::js_bigint_and);
     }
-    // JS ToInt32: f64 -> i64 -> i32 (wrapping), NOT f64 -> i32 (saturating).
-    (((a as i64) as i32) & ((b as i64) as i32)) as f64
+    // JS ToInt32 both operands (#6079).
+    (dyn_to_int32(a) & dyn_to_int32(b)) as f64
 }
 
 /// Dynamic bitwise OR: BigInt | if either operand is BigInt, else i32 | for numbers.
 #[no_mangle]
 pub unsafe extern "C" fn js_dynamic_bitor(a: f64, b: f64) -> f64 {
+    let a = to_numeric(a);
+    let b = to_numeric(b);
     if both_bigint_or_throw(a, b) {
         return dynamic_bigint_binary_op(a, b, crate::bigint::js_bigint_or);
     }
-    // JS ToInt32: f64 -> i64 -> i32 (wrapping), NOT f64 -> i32 (saturating).
-    (((a as i64) as i32) | ((b as i64) as i32)) as f64
+    // JS ToInt32 both operands (#6079).
+    (dyn_to_int32(a) | dyn_to_int32(b)) as f64
 }
 
 /// Dynamic bitwise XOR: BigInt ^ if either operand is BigInt, else i32 ^ for numbers.
 #[no_mangle]
 pub unsafe extern "C" fn js_dynamic_bitxor(a: f64, b: f64) -> f64 {
+    let a = to_numeric(a);
+    let b = to_numeric(b);
     if both_bigint_or_throw(a, b) {
         return dynamic_bigint_binary_op(a, b, crate::bigint::js_bigint_xor);
     }
-    // JS ToInt32: f64 -> i64 -> i32 (wrapping), NOT f64 -> i32 (saturating).
-    (((a as i64) as i32) ^ ((b as i64) as i32)) as f64
+    // JS ToInt32 both operands (#6079).
+    (dyn_to_int32(a) ^ dyn_to_int32(b)) as f64
 }
 
 /// Dynamic exponentiation: `BigInt ** BigInt` when both operands are BigInt
@@ -534,6 +709,8 @@ pub unsafe extern "C" fn js_dynamic_bitxor(a: f64, b: f64) -> f64 {
 /// `js_bigint_pow`).
 #[no_mangle]
 pub unsafe extern "C" fn js_dynamic_pow(a: f64, b: f64) -> f64 {
+    let a = to_numeric(a);
+    let b = to_numeric(b);
     if both_bigint_or_throw(a, b) {
         return dynamic_bigint_binary_op(a, b, crate::bigint::js_bigint_pow);
     }
@@ -541,21 +718,35 @@ pub unsafe extern "C" fn js_dynamic_pow(a: f64, b: f64) -> f64 {
 }
 
 /// Dynamic unsigned right shift. BigInts have no `>>>` operator in
-/// ECMAScript, so any BigInt operand throws TypeError (#2908); otherwise
-/// numeric ToUint32 `>>>`.
+/// ECMAScript, so two BigInt operands throw the dedicated "no unsigned right
+/// shift" TypeError (#2908) — but a MIXED bigint/other pair throws the
+/// standard mixed-operand TypeError first, exactly like Node (the spec's
+/// both-BigInt type check precedes the operator lookup; #6649 parity
+/// fixture bigint/arithmetic/mixed-operand-errors.ts). Otherwise numeric
+/// ToUint32 `>>>`.
 #[no_mangle]
 pub unsafe extern "C" fn js_dynamic_ushr(a: f64, b: f64) -> f64 {
-    let a_big = JSValue::from_bits(a.to_bits()).is_bigint();
-    let b_big = JSValue::from_bits(b.to_bits()).is_bigint();
-    if a_big || b_big {
+    // Root both operands across the coercions: to_numeric(a) can invoke a
+    // user ToPrimitive (allocate → GC → evacuation), which would leave the
+    // raw NaN-boxed `b` — and the freshly coerced `a`, if it is a BigInt
+    // pointer — dangling. Reload through the handles after each GC-capable
+    // call (same discipline as dynamic_bigint_binary_op above).
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let a_in = scope.root_nanbox_f64(a);
+    let b_in = scope.root_nanbox_f64(b);
+    let a_num = to_numeric(a_in.get_nanbox_f64());
+    let a_handle = scope.root_nanbox_f64(a_num);
+    let b = to_numeric(b_in.get_nanbox_f64());
+    let a = a_handle.get_nanbox_f64();
+    if both_bigint_or_throw(a, b) {
         let msg = b"BigInts have no unsigned right shift, use >> instead";
         let s = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
         let err = crate::error::js_typeerror_new(s);
         crate::exception::js_throw(js_nanbox_pointer(err as i64));
     }
-    // JS ToUint32 then logical shift, count masked to 5 bits.
-    let ai = (a as i64) as u32;
-    let bi = ((b as i64) as i32 as u32) & 0x1f;
+    // JS ToUint32(a) then logical shift; ToUint32(b) & 0x1F count (#6079).
+    let ai = dyn_to_uint32(a);
+    let bi = dyn_to_uint32(b) & 0x1f;
     (ai >> bi) as f64
 }
 

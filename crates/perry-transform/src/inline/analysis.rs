@@ -6,7 +6,17 @@ use std::collections::{HashMap, HashSet};
 use super::*;
 
 pub fn find_max_local_id_in_module(module: &Module) -> LocalId {
-    let mut max_id: LocalId = 0;
+    // 2026-07-02 audit (#5143 family, prime #684/S1 suspect): this private
+    // scan missed class fields[].init / static_fields[].init /
+    // computed_members / extends_expr — containers whose closures CAN hold
+    // the module's numerically-highest LocalIds (they are the last-lowered
+    // constructs of a big module). The inliner mints ids at max+1, so a miss
+    // aliases a live id and the module-global loader silently skips loading
+    // (locals.contains_key already true) — reading the wrong value. Take the
+    // max of the legacy walk and the generator pass's hardened exhaustive
+    // scan (single source of truth; #5293) so no container is missed.
+    let hardened = crate::generator::compute_max_local_id(module);
+    let mut max_id: LocalId = hardened;
     max_id = max_id.max(find_max_local_id(&module.init));
     for func in &module.functions {
         for param in &func.params {
@@ -95,10 +105,27 @@ pub fn is_inlinable(func: &Function) -> bool {
         return false;
     }
 
-    // Don't inline functions that return closures capturing parameters
-    // When inlined, the parameter IDs won't exist in the outer context
-    let param_ids: std::collections::HashSet<LocalId> = func.params.iter().map(|p| p.id).collect();
-    if body_contains_closure_capturing(&func.body, &param_ids) {
+    // Don't inline a function whose body builds a closure over one of the
+    // callee's OWN bindings — a parameter or a local. Those ids do not exist in
+    // the caller's scope.
+    //
+    // Parameters were already excluded. Locals are the same hazard, and worse:
+    // a captured-and-mutated local is *boxed*, and the caller has no idea. The
+    // closure body is compiled once, from the original function, and reads its
+    // capture slot as a box pointer (`js_closure_get_capture_bits` ->
+    // `js_box_get_bits`). Cloning the body into a call site re-derives the
+    // local there as a plain slot, so the call site stores the local's *value*
+    // into the capture slot instead of a box. The closure then dereferences
+    // that value as a box pointer: every read comes back `undefined` and every
+    // write from inside the closure is lost.
+    //
+    //     function mk() { let k = 0; return () => { for (const x of [1]) { k = 7; } return k; }; }
+    //     const g = mk();
+    //     g();   // undefined, expected 7
+    let mut callee_bindings: std::collections::HashSet<LocalId> =
+        func.params.iter().map(|p| p.id).collect();
+    collect_declared_local_ids(&func.body, &mut callee_bindings);
+    if body_contains_closure_capturing(&func.body, &callee_bindings) {
         return false;
     }
 
@@ -471,7 +498,7 @@ pub fn construction_stmt_can_affect_method_lookup(
             getter_names,
             setter_names,
         ),
-        Stmt::PreallocateBoxes(_) => false,
+        Stmt::PreallocateBoxes(_) | Stmt::PreallocateTdzBoxes(_) => false,
         Stmt::While { .. }
         | Stmt::DoWhile { .. }
         | Stmt::For { .. }
@@ -491,7 +518,9 @@ pub fn construction_expr_can_affect_method_lookup(
 ) -> bool {
     match expr {
         Expr::This => true,
-        Expr::PropertyGet { object, property } if matches!(object.as_ref(), Expr::This) => {
+        Expr::PropertyGet {
+            object, property, ..
+        } if matches!(object.as_ref(), Expr::This) => {
             property == method_name
                 || !data_fields.contains(property)
                 || getter_names.contains(property)

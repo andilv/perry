@@ -138,10 +138,24 @@ pub(crate) extern "C" fn math_round_thunk(
     value: f64,
 ) -> f64 {
     let x = math_number_arg(value);
+    js_math_round_value(x)
+}
+
+/// ECMA-262 21.3.2.28 `Math.round`. The naive `floor(x + 0.5)` is wrong for
+/// two families the spec calls out (test262 Math/round/S15.8.2.15_A7):
+///   * `x = 0.5 - ε/4` (just under a half): `x + 0.5` rounds *up* to exactly
+///     `1.0` in f64, so `floor` yields 1 — but the true value is < 0.5 and must
+///     round to +0.
+///   * large odd integers where `x + 0.5 == x` loses the `.5`.
+/// Rounding via `r = floor(x)` then comparing the *exact* fractional part
+/// `x - r` against 0.5 avoids the pre-rounding of the `+ 0.5` add. Half rounds
+/// toward +∞ (the larger integer), and the `[-0.5, -0)` band returns -0.
+pub(crate) fn js_math_round_value(x: f64) -> f64 {
     if x == 0.0 || x.is_nan() || x.is_infinite() {
         return x;
     }
-    let rounded = (x + 0.5).floor();
+    let r = x.floor();
+    let rounded = if x - r >= 0.5 { r + 1.0 } else { r };
     if rounded == 0.0 && x.is_sign_negative() {
         -0.0
     } else {
@@ -436,29 +450,43 @@ pub extern "C" fn js_function_ctor_from_strings(args_ptr: *const f64, args_len: 
             }
         }
     }
-    // Unrecognized dynamic-Function shape. Perry is ahead-of-time compiled and
-    // cannot compile a code string built from runtime data. THROW (rather than
-    // return a placeholder object) — this is the honest signal, and it lets
-    // feature-detecting libraries take their non-`Function` fallback. zod 4's
-    // JIT does `try { new Function(""), true } catch { false }` and switches to
-    // its interpreter when this throws, clearing the entire zod-object-validation
-    // wall with no native validator needed. (A placeholder made the feature-test
-    // *succeed*, forcing the JIT path that then crashes.) The eprintln names the
-    // offending library for diagnostics; it fires once per distinct feature-test.
-    let body = if args_len > 0 {
-        arg_str(args_len - 1)
-    } else {
-        String::new()
-    };
-    let preview: String = body.chars().take(160).collect();
-    eprintln!(
-        "[perry] dynamic Function refused (AOT) — {} arg(s); body[..160]={:?}",
-        args_len, preview
-    );
-    super::super::object_ops::throw_object_type_error(
-        b"Function: dynamic code generation from a runtime string is not supported \
-          in an ahead-of-time compiled binary",
-    )
+    // #6559: unrecognized dynamic-Function shape → the scoped interpreter.
+    // The generated source is parsed with perry-parser (the compiler's own
+    // SWC front end) and evaluated by the tree-walking interpreter in
+    // `crate::dyn_eval`; the returned value is a first-class runtime closure.
+    // This is what ajv / fast-json-stringify / find-my-way (fastify) need —
+    // their codegen has NO non-`Function` fallback. Constructs outside the
+    // interpreter subset throw a diagnostic TypeError naming the construct;
+    // sources that don't parse throw a SyntaxError (matching Node) — so
+    // feature-probing libraries (zod's JIT probe, #6031) still get an honest
+    // signal: the probe now SUCCEEDS and their generated code runs
+    // interpreted.
+    #[cfg(feature = "dyn-eval")]
+    {
+        let args_vec: Vec<String> = (0..args_len).map(arg_str).collect();
+        return crate::dyn_eval::dyn_function_from_strings(&args_vec);
+    }
+    // Without the `dyn-eval` feature (size-optimized builds that carry no
+    // dynamic-eval site), keep the historical clean throw: it lets
+    // feature-detecting libraries take their non-`Function` fallback. The
+    // eprintln names the offending library for diagnostics.
+    #[cfg(not(feature = "dyn-eval"))]
+    {
+        let body = if args_len > 0 {
+            arg_str(args_len - 1)
+        } else {
+            String::new()
+        };
+        let preview: String = body.chars().take(160).collect();
+        eprintln!(
+            "[perry] dynamic Function refused (AOT, dyn-eval feature off) — {} arg(s); body[..160]={:?}",
+            args_len, preview
+        );
+        super::super::object_ops::throw_object_type_error(
+            b"Function: dynamic code generation from a runtime string is not supported \
+              in an ahead-of-time compiled binary",
+        )
+    }
 }
 
 /// depd `wrapfunction` outer `(fn, log, deprecate, message, site) => wrapper`.

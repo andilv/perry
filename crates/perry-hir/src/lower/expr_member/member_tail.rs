@@ -46,6 +46,7 @@ pub(crate) fn lower_member_tail(
                 let obj_name = obj_ident.sym.as_ref();
                 if crate::analysis::is_builtin_global_value_name(obj_name) {
                     object_expr = Expr::PropertyGet {
+                        byte_offset: 0,
                         object: Box::new(Expr::GlobalGet(0)),
                         property: obj_name.to_string(),
                     };
@@ -105,6 +106,7 @@ pub(crate) fn lower_member_tail(
     if let Expr::PropertyGet {
         object: inner,
         property,
+        ..
     } = &object_expr
     {
         if matches!(inner.as_ref(), Expr::GlobalGet(0))
@@ -134,10 +136,14 @@ pub(crate) fn lower_member_tail(
                     // would drop the receiver, and codegen lowers
                     // `globalThis.__proto__` through the no-name path → literal
                     // `0.0` (a number), which is the symptom reported in #2145.
+                    // Accept BOTH `Ctor.prototype` and `Ctor[\"prototype\"]`
+                    // (string-literal computed key) — the reified constructor
+                    // receiver must survive for either form, else the read
+                    // collapses to `globalThis.prototype` (undefined). Test262
+                    // property-accessors `Ctor[\"prototype\"]`.
                     let outer_is_prototype_or_proto = matches!(
-                        &member.prop,
-                        ast::MemberProp::Ident(p) if p.sym.as_ref() == "prototype"
-                            || p.sym.as_ref() == "__proto__"
+                        static_member_prop_name(&member.prop).as_deref(),
+                        Some("prototype") | Some("__proto__")
                     );
                     let receiver_is_namespace_value = matches!(
                         property.as_str(),
@@ -329,8 +335,51 @@ pub(crate) fn lower_member_tail(
                     );
                     let outer_is_inherited_function_proto_method =
                         matches!(outer_static_member, Some("bind" | "call" | "apply"));
+                    // #5897: `RegExp` has NO intrinsic static-member fast path in
+                    // Perry — nothing downstream keys on the collapsed
+                    // `GlobalGet(0).<prop>` shape for it (no reified statics are
+                    // installed for `RegExp`, and its `.prototype` / `.length` /
+                    // `.name` reads are folded by the dedicated arms above and
+                    // below, off the AST receiver rather than `object_expr`).
+                    // Collapsing can therefore only LOSE the receiver: an
+                    // unrecognized static read resolved against `globalThis`
+                    // instead of the constructor, so after
+                    // `Function.prototype.indicator = 1` the spec-mandated
+                    // `RegExp.indicator` (inherited from `Function.prototype`,
+                    // which is `RegExp`'s [[Prototype]]) came back `undefined`
+                    // rather than `1` (test262 built-ins/RegExp/S15.10.5_A2_T2).
+                    // Keeping the receiver lets the runtime walk the constructor's
+                    // prototype chain, which already resolves inherited props.
+                    //
+                    // The same receiver-drop affects the OTHER built-in
+                    // constructors (`Array.indicator`, `Object.indicator`, …), but
+                    // there the collapsed shape IS load-bearing — the intrinsic
+                    // call/constant-fold paths for `Array.isArray`, `Object.keys`,
+                    // `Math.PI`, … depend on it — so lifting it for those needs a
+                    // complete per-builtin intrinsic-member table and is tracked
+                    // separately.
+                    //
+                    // #5908: the `Function` constructor is the same safe case as
+                    // `RegExp`. It has no intrinsic static-member fast path keyed
+                    // on the collapsed shape (`Function.length` folds off either
+                    // the bare `GlobalGet(0)` or the `PropertyGet { GlobalGet(0),
+                    // "Function" }` value-form in the `.length` arm below, and
+                    // `Function.name` / `Function.prototype` / `Function.{call,
+                    // apply,bind}` are handled by their own dedicated arms), so
+                    // collapsing only LOSES the receiver — after
+                    // `Function.prototype.indicator = 1`, reading `Function.indicator`
+                    // (inherited via the ctor's [[Prototype]] = `%Function.prototype%`)
+                    // came back `undefined` instead of `1` (test262
+                    // built-ins/Function/S15.3.3_A2_T2). Keeping the receiver lets the
+                    // runtime walk the prototype chain, which already resolves the
+                    // inherited property (`closure_get_dynamic_prop`'s
+                    // `function_prototype_fallback_target`).
+                    let receiver_is_regexp_ctor = property == "RegExp";
+                    let receiver_is_function_ctor = property == "Function";
                     if !outer_is_prototype_or_proto
                         && !receiver_is_namespace_value
+                        && !receiver_is_regexp_ctor
+                        && !receiver_is_function_ctor
                         && !outer_is_websocket_static
                         && !outer_is_reified_object_static_value
                         && !outer_is_reified_builtin_static_value
@@ -397,9 +446,9 @@ pub(crate) fn lower_member_tail(
                 // so the fold is correctly skipped.
                 let is_global_builtin = match &object_expr {
                     Expr::GlobalGet(0) => true,
-                    Expr::PropertyGet { object, property } => {
-                        matches!(object.as_ref(), Expr::GlobalGet(0)) && property.as_str() == name
-                    }
+                    Expr::PropertyGet {
+                        object, property, ..
+                    } => matches!(object.as_ref(), Expr::GlobalGet(0)) && property.as_str() == name,
                     _ => false,
                 };
                 if is_global_builtin {
@@ -413,6 +462,7 @@ pub(crate) fn lower_member_tail(
             if let Expr::PropertyGet {
                 object: inner,
                 property,
+                ..
             } = &object_expr
             {
                 if matches!(inner.as_ref(), Expr::GlobalGet(0)) {
@@ -450,6 +500,7 @@ pub(crate) fn lower_member_tail(
                 Expr::PropertyGet {
                     object: inner,
                     property,
+                    ..
                 } => {
                     if matches!(inner.as_ref(), Expr::GlobalGet(0)) {
                         if let ast::Expr::Member(inner_member) = member.obj.as_ref() {
@@ -627,7 +678,13 @@ pub(crate) fn lower_member_tail(
     match &member.prop {
         ast::MemberProp::Ident(ident) => {
             let property = ident.sym.to_string();
-            Ok(Expr::PropertyGet { object, property })
+            Ok(Expr::PropertyGet {
+                // #5247: carry the member access's source offset so a nullish
+                // receiver ("Cannot read properties of undefined") localizes.
+                byte_offset: member.span.lo.0,
+                object,
+                property,
+            })
         }
         ast::MemberProp::Computed(computed) => {
             // #503: refuse compile-time dynamic dispatch on stdlib namespace
@@ -709,7 +766,29 @@ pub(crate) fn lower_member_tail(
             // would return NaN-boxed pointer bits as a denormal f64.
             if let Expr::LocalGet(id) = &*object {
                 if let Some((_, _, ty)) = ctx.locals.iter().find(|(_, lid, _)| lid == id) {
-                    if matches!(ty, Type::Named(n) if n == "Uint8Array" || n == "Buffer") {
+                    // …but ONLY for a numeric key. A Buffer is an ordinary
+                    // object in Node (a Uint8Array), so a STRING key reads a
+                    // property, not a byte: `buf["writeInt8"]` is the method,
+                    // `buf[k] = v` (k non-numeric) an expando. Folding those to
+                    // the byte path returned `undefined` (an out-of-range byte
+                    // read), which broke the ubiquitous feature-probe idiom
+                    // `typeof obj[k] === "function"` — mysql2's `MockBuffer`
+                    // uses it to neutralize the write methods of a zero-length
+                    // Buffer while sizing a packet, so every outgoing MySQL
+                    // packet was measured against a live (empty) buffer and the
+                    // handshake died with RangeError [ERR_OUT_OF_RANGE].
+                    let key_is_string = matches!(index.as_ref(), Expr::String(_))
+                        || matches!(
+                            index.as_ref(),
+                            Expr::LocalGet(kid) if ctx
+                                .locals
+                                .iter()
+                                .find(|(_, lid, _)| lid == kid)
+                                .is_some_and(|(_, _, kty)| matches!(kty, Type::String))
+                        );
+                    if !key_is_string
+                        && matches!(ty, Type::Named(n) if n == "Uint8Array" || n == "Buffer")
+                    {
                         return Ok(Expr::Uint8ArrayGet {
                             array: object,
                             index,
@@ -738,6 +817,9 @@ pub(crate) fn lower_member_tail(
                     && !(key.len() > 1 && key.starts_with('0'));
                 if !is_numeric_string {
                     return Ok(Expr::PropertyGet {
+                        // #5247: `obj["prop"]` folds to a PropertyGet — carry the
+                        // member offset so a nullish receiver localizes too.
+                        byte_offset: member.span.lo.0,
                         object,
                         property: key.clone(),
                     });
@@ -775,7 +857,13 @@ pub(crate) fn lower_member_tail(
             // member on a wrong receiver throws TypeError per spec.
             let property = format!("#{}", private.name);
             let object = wrap_private_guard(ctx, object, &property, PRIV_OP_READ);
-            Ok(Expr::PropertyGet { object, property })
+            Ok(Expr::PropertyGet {
+                // #5247: `this.#field` — carry the member offset for nullish-receiver
+                // localization (consistency with the public-property path).
+                byte_offset: member.span.lo.0,
+                object,
+                property,
+            })
         }
     }
 }

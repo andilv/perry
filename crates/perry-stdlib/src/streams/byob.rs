@@ -36,6 +36,15 @@ lazy_static::lazy_static! {
         Mutex::new(HashMap::new());
 }
 
+/// #6602: eviction hook — drop the (drained) BYOB queue slot of an evicted id.
+pub(super) fn evict_ids(batch: &[usize]) {
+    if let Ok(mut map) = BYOB_PENDING.lock() {
+        for id in batch {
+            map.remove(id);
+        }
+    }
+}
+
 /// True while at least one `read(view)` is parked on this stream — feeds
 /// the ShouldCallPull check in `maybe_pull`.
 pub(super) fn has_pending(stream_id: usize) -> bool {
@@ -100,6 +109,16 @@ unsafe fn view_info(view_bits: u64) -> Option<ViewInfo> {
 
 /// `chunk.byteLength` for desiredSize accounting on byte streams; 1.0 for
 /// values whose byte length can't be derived (matches the count fallback).
+/// Clone a byte chunk as a fresh Uint8Array (spec `CloneAsUint8Array`, used by
+/// the byte-stream tee so branches never share a mutable buffer). Non-byte
+/// values pass through unchanged.
+pub(super) unsafe fn clone_byte_chunk(chunk_bits: u64) -> u64 {
+    match read_bytes_from_chunk(chunk_bits) {
+        Some(bytes) => alloc_uint8array_from_bytes(&bytes),
+        None => chunk_bits,
+    }
+}
+
 pub(super) unsafe fn chunk_byte_length(chunk_bits: u64) -> f64 {
     match read_bytes_from_chunk(chunk_bits) {
         Some(bytes) => bytes.len() as f64,
@@ -211,7 +230,7 @@ pub(super) unsafe fn get_reader_for_stream(stream_id: usize, is_byob: bool) -> u
         drop(g);
         throw_type_error("ReadableStream is locked");
     }
-    let reader_id = next_id(&NEXT_STREAM_ID);
+    let reader_id = next_stream_id();
     let closed_p = internal_promise();
     if s.state == ReadableState::Closed {
         js_promise_resolve(closed_p, f64::from_bits(TAG_UNDEFINED));
@@ -302,6 +321,10 @@ pub unsafe extern "C" fn js_reader_read_with_view(reader_handle: f64, view: f64)
     }
 
     let filled = fill_view_from_queue(stream_id, &info);
+    // A BYOB drain (or an about-to-park read on an empty queue) is consumer
+    // progress on this readable — release transform writes parked on
+    // backpressure, mirroring the default-reader path in `js_reader_read`.
+    super::transform::transform_release_writes(stream_id);
     if filled > 0 {
         let bytes = std::slice::from_raw_parts(info.data, filled);
         let value = alloc_view_of_kind(info.kind, info.elem_size, bytes);

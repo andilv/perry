@@ -1,3 +1,423 @@
+## v0.5.1263 — fix(cache): key the object cache on all codegen-affecting env vars (#6394, PR #6526)
+
+The per-module object cache (`node_modules/.cache/perry`) keyed on a curated
+but incomplete set of codegen environment variables. ~16 `PERRY_*` vars that
+`perry-codegen` reads at compile time and that change the emitted `.o` —
+typed-feedback site emission, IC and method-dispatch outlining, inline `new`/ctor,
+string-init chunking, per-unit `-O0`/`-Os` selection, entry-symbol rename,
+codegen-unit partitioning, volatile-setjmp promotion, loop GC-poll emission — were
+absent from the key, so setting any of them against a warm cache silently reused an
+object built without it (the switch appears to do nothing; any A/B built on it is
+vacuous). Added to `compute_object_cache_key_with_env`. Deliberately excluded:
+runtime-global `@PERRY_*` loads (`CLASS_FIELD_INLINE_GUARD_DISABLED`,
+`TA_VIEW_GUARD`, `TA_KIND_CACHE` — codegen emits them identically regardless of the
+compile-time env), diagnostics-only vars, the final-link `PERRY_LD`, and vars already
+captured via the resolved target triple or the HIR fingerprint.
+
+## v0.5.1262 — refactor(hir): split widget_decl.rs under the 2000-line file-size cap (PR #6531)
+
+`crates/perry-hir/src/lower/widget_decl.rs` reached 2372 lines, over the
+`check_file_size.sh` cap (2000). Pure mechanical split, no logic change, into the
+`foo.rs` + `foo/` submodule layout the repo already uses:
+`widget_decl/reactive_animate.rs` (`collect_state_value_reads` +
+`try_desugar_reactive_animate`) and `widget_decl/tests.rs` (the `#[cfg(test)]`
+module). `try_desugar_reactive_animate` is re-exported from `widget_decl.rs` as
+`pub(crate)` so `lower/mod.rs`'s `pub(crate) use widget_decl::*` still resolves it.
+`widget_decl.rs` drops to 1665 lines.
+
+## v0.5.1261 — fix(bench): version-invariant Cargo.toml fingerprint in the public-baseline gate (PR #6528)
+
+The public-benchmark-evidence freshness gate (the lint job's "Public benchmark
+evidence freshness" step) fingerprinted `Cargo.toml` over its whole bytes, so every
+workspace version bump invalidated the recorded baseline and reddened lint on every
+subsequent PR until the baseline was regenerated (a full, environment-gated benchmark
+run). Normalized the volatile `[workspace.package] version` line out of the
+`Cargo.toml` contribution to the source fingerprint (dependency/profile/edition
+changes still move it), and refreshed the recorded source + harness fingerprints in
+the artifact. Benchmark measurements are unchanged — a version bump does not affect
+performance; only the fingerprint bookkeeping is corrected.
+
+## v0.5.1260 — fix(hir): abstract class fields are type-only, emit no runtime slot (#6498, PR #6499)
+
+`abstract readonly _tag: string;` on a base class was lowered into a real
+runtime property slot. TypeScript treats abstract members as type-only and
+erases them (`node --experimental-strip-types` emits no runtime slot). When a
+subclass declared the same field with an initializer, the instance carried two
+physical slots of the same name (`Object.keys` → `_tag|_tag`); a read through a
+base- or union-typed local variable resolved to the phantom (undefined) base
+slot instead of the concrete subclass value. Reads via `any` or a function
+parameter typed as the base/union were unaffected — only a local statically
+typed as the base/union hit the wrong slot.
+
+This is the exact shape of `@effect/platform`'s `HttpBody`
+(`abstract class BodyBase { abstract readonly _tag }` with concrete
+`Uint8ArrayImpl` / `EmptyImpl` / `RawImpl`). The Node HTTP response writer does
+`switch (body._tag)` with no default; with `_tag` reading `undefined` the switch
+fell through, the `Effect.suspend` thunk returned `undefined`, and the fiber
+runtime reported `Not a valid effect: undefined` — an Effect HTTP server
+(`HttpLayerRouter` / `HttpApi`) answered `500` to every request. Since
+`HttpBody.text` / `.html` / `.json` / `.uint8Array` all produce `Uint8Array`-tagged
+bodies, this affected essentially all response bodies.
+
+Fix: skip abstract instance fields during class lowering, exactly as `declare`
+fields are already skipped, at both lowering entry points in
+`crates/perry-hir/src/lower_decl/class_decl.rs`. Abstract fields cannot carry
+initializers and are always overridden by a concrete subclass, so removing the
+phantom slot is semantically safe. `is_abstract` was previously unused across
+the compiler. Regression test:
+`test-files/test_gap_abstract_field_shadow_union_read.ts` (byte-identical to
+`node --experimental-strip-types`).
+
+Completes the Effect web-server campaign: all four effect example apps
+(logger / forking / api / web) now match Node byte-for-byte. web.ts serves its
+homepage and JSON API responses identically; the only residual difference is a
+non-deterministic tracer span duration (`http.span.1=Nms`).
+
+## v0.5.1259 — fix: static/namespace resolution for effect Tag & Schema — web.ts server starts (#6475, PR #6496)
+
+Five fixes that let an Effect HTTP server start under Perry:
+
+- Bind `this` to the receiver on both proto-method call paths.
+- Substitute a function-object call-site `this` for canonical bound class
+  methods, so a method looked up on a callable function object still runs with
+  the caller's receiver.
+- Invalidate the cached dispatch strategy on every closure registration, so a
+  re-registered closure can't keep serving a stale resolution.
+- Static-member CALL now walks the parent-closure chain: `class X extends Tag(id)()`
+  (effect's `Context.Tag` / `HttpRouter.Tag`) inherits static `use` / `serve`
+  from the parent function's own properties instead of returning the class ref.
+- Namespace-member spread call resolves the function, not a same-named class:
+  `Schema.Union(...arr)` no longer bakes an unrelated `Union` class ref as the
+  spread callee.
+
+## v0.5.1258 — fix(thread): compile-time containment for perry/thread worker closures (#6185 Tier 1, PR #6276)
+
+The closure passed to `spawn` / `parallelMap` / `parallelFilter` is now
+rejected at compile time when it hits one of the three cross-heap
+unsoundness triggers catalogued in the 2026-07-09 GC audit (#6185):
+
+1. **Async work** — an async worker closure, a nested async closure, or a
+   stray `await`. The codegen await loop is emitted into every function
+   containing `await`, unconditional on which OS thread runs it, so a worker
+   doing async work pumps the process-global `PENDING_THREAD_RESULTS` /
+   timer queues: it can steal another thread's completion, deserialize it
+   into the worker's arena, and resolve a main-heap promise with a pointer
+   into an arena that is unmapped at worker exit (use-after-free). Detection
+   is `is_async || func_id ∈ hir.async_step_closures` — the
+   async-to-generator transform CLEARS `is_async` when it CPS-rewrites an
+   await-containing closure into a state machine, so the flag alone can't
+   identify one at codegen time; the registry is now threaded through
+   `CrossModuleCtx` into `FnCtx`.
+2. **Nested thread primitives** inside a worker body — same queue-pumping
+   problem, triggered from the worker side.
+3. **Reads of heap-typed module-scope bindings** (object/array literals,
+   `const f = () => ...` helpers, Map/Set, class instances). Module globals
+   are process-wide `@perry_global_*` slots read in place —
+   `compute_auto_captures` deliberately excludes them from capture slots —
+   so a worker aliases the main thread's heap with no synchronization and no
+   rewrite when a moving cycle relocates the object. Primitive globals
+   (number/string/boolean/bigint) stay allowed; `SharedArrayBuffer` globals
+   are exempt (process-global, never-freed `shared_sab` backing — cross-agent
+   sharing is its documented purpose, and the shipped Atomics cross-thread
+   suite reads a top-level SAB from workers).
+
+The walk (`lower_call/closure_analysis.rs::find_thread_hazard_in_body`, wired
+into the existing perry/thread check site in `lower_call/native/mod.rs`)
+recurses into nested closures — anything defined in the worker body executes
+on the worker thread — and delegates expression descent to
+`perry_hir::walker::walk_expr_children`, so a new `Expr` variant can't
+silently skip it. Best-effort by design: an AST walk cannot see through a
+named callee defined outside the worker body; the runtime serializer guards
+(#6188 / #6212) remain the backstop. Owner-tagged runtime dispatch — with the
+Android `nativePumpTick` UI-thread pump special-cased — stays open as the
+Wave-4 follow-up on #6185.
+
+Also: `compile_static_method` now seeds its `FnCtx.local_types` from
+`module_global_types` (mirroring `compile_method` / `compile_function`). It
+previously built the map from params alone, so inside a static method the new
+module-global classifier saw no type information and allowed everything;
+type-aware dispatch in static-method bodies gains the same information.
+
+Behavior change: previously-compiling worker closures doing any of the three
+now fail to compile, with diagnostics naming the sanctioned rewrite (bind the
+global to a function-scope local so it is captured and deep-copied, or declare
+module-level helpers with `function name(...)`). One in-repo casualty:
+`test-parity/node-suite/fs-promises/thread/filehandle-thread-detached-returned.ts`
+read a module-scope `FileHandle` from the worker; rewritten to capture the
+handle through a function-scope binding (byte-identical stdout against the
+checked-in expectation, matching its `-captured` sibling).
+
+New integration suite `crates/perry/tests/issue_6185_thread_worker_closure_guards.rs`
+— 7 negative-compile cases (async worker, awaiting worker, nested async
+closure, nested spawn, module-object read, module-arrow-helper read,
+static-method module-object read) and 5 sanctioned patterns (primitive
+globals, primitive global in a static method, local-copy capture, `function`
+helper, `await spawn(...)` in the enclosing scope). Docs: the threading
+overview gains "Workers Are Synchronous" and "Module-Scope Objects Stay Home".
+
+## v0.5.1257 — feat(runtime): ArrayBuffer.prototype.transfer (ES2024) + perry/gc explicit GC control (#6273)
+
+`transfer(newLength?)` / `transferToFixedLength(newLength?)` / `detached` with
+real memory release: detach zeroes the source header and every registered
+view's length (views report length 0 like Node; `ArrayBuffer.prototype.slice`
+copies — the only view-table entries marked as ArrayBuffers — are skipped and
+survive), records the buffer in a detached side-registry (pruned in
+`finalize_collected_dead_buffer` against the #6080 ABA class), and hands the
+page-aligned interior of the payload back to the OS (`MADV_FREE_REUSABLE` →
+`MADV_FREE` on macOS, `MADV_DONTNEED` on Linux). Buffer bytes live inline in
+the GC old arena, so this is what makes "detach = release" true immediately: a
+256 MB buffer drops the process footprint 291 → 32 MB the moment `transfer(0)`
+runs, while the detached object is still reachable. The GcHeader `size` stays
+untouched — the arena sweep walks the full allocation; only pages entirely
+inside the payload are decommitted. Note macOS accounting: `phys_footprint`
+(Activity Monitor, `vmmap`) drops instantly; `task_info` `resident_size` (what
+`process.memoryUsage().rss` reads) lags until reuse/pressure.
+
+Spec ToIndex ordering honored across the detach surface (CodeRabbit review):
+`ToIndex(newLength/byteOffset/length)` runs BEFORE the IsDetachedBuffer check —
+user `valueOf` code can detach the buffer mid-call — in `transfer`, the
+DataView constructor (including the spec's second re-check after `byteLength`
+coercion), and typed-array view construction. `new Uint8Array(buffer,
+byteOffset, length?)` previously codegen'd a raw `fptosi` cast (object offsets
+never ran `valueOf`; `undefined` length was a -1 sentinel) — it now passes raw
+NaN-boxed args like every other typed-array view kind. structuredClone:
+transfer shares the same detach path (`detached` reports true), cloning an
+already-detached buffer throws `DataCloneError`, transferring one is rejected
+in `collect_transfer_list`, and transfer-list detachment is deferred until the
+whole clone succeeds so a failed clone leaves sources attached.
+
+New `perry/gc` built-in module (runtime-only, `perry/thread` pattern; does not
+resolve under Node/Bun): `collect()` full collection (same as global `gc()`),
+`minor()` synchronous nursery collection returning freed bytes (manual-gc
+guards: unsafe-zone skip + forced conservative scan per #4977), and
+`idleHint()` — runs `gc_check_trigger()` at a caller-declared idle point
+(frame boundary) and reports whether a collection ran; O(1) when nothing is
+due, no new GC invariants. Wired end-to-end: NATIVE_MODULES +
+RUNTIME_ONLY_MODULES + manifest signatures (API docs regenerated), codegen
+native-table rows (buffer proto methods need NO codegen wiring — dispatch is
+by name), `types/perry/gc/index.d.ts` written by `perry init`/`perry types`,
+docs page `docs/src/internals/explicit-memory.md`.
+
+Validation: `test-files/test_gap_arraybuffer_transfer.ts` byte-for-byte vs
+node v26 (move/grow/shrink, error cases, valueOf-detach ordering,
+structuredClone semantics); `test-files/test_perry_gc_module.ts` perry-only
+functional test; full gap suite zero regressions (all 19 mismatches reproduce
+identically on unmodified pre-PR main — 16 triaged, 3 verified pre-existing
+via in-place A/B revert: disposablestack_2875, events_import_4995,
+http_overloads_3226plus).
+
+## v0.5.1256 — fix(hir): user class shadowing a global name loses to the intrinsic in `new` expressions (#6233, PR #6270)
+
+A module-scope `class Symbol extends Base {}` legally shadows the global
+`Symbol`, but the built-in constructor arms in `lower_new`
+(perry-hir `lower/expr_new.rs`) fired by name alone, so `new Symbol()` bound
+to the intrinsic and threw "Symbol is not a constructor" at module init —
+effect's `SchemaAST.ts` declares AST node classes named `Symbol` and `BigInt`,
+so importing the effect barrel crashed under `perry.compilePackages`.
+Depending on the name this crashed (Symbol/BigInt/Proxy/WeakRef/
+FinalizationRegistry/AggregateError) or silently constructed the wrong object
+(Map/Set/Date/Number/String/Boolean/Error/TypeError/Uint8Array/Int32Array:
+native instance, field initializers never ran, `instanceof` the user class
+false). 16 of the issue's 22 blast-radius shapes misbehaved.
+
+Same family as #5912/#5913 (`new URL()`) and #6003 (`class Headers`). Fixes:
+
+- `lower/expr_new.rs`: a `shadowed_by_user_binding` snapshot (class / local /
+  function / imported binding / forward-declared sibling class) taken once at
+  the ident-arm top now gates every built-in constructor arm; the existing
+  Object/Function/URL/URLSearchParams/URLPattern/TextEncoder/TextDecoder
+  guards are unified onto it.
+- Type inference (`lower_types.rs` + `destructuring/var_decl/type_infer.rs`):
+  `new Map()` was typed as the builtin `Generic { base: "Map" }` by name,
+  routing the binding's method calls down the collection intrinsic fast paths
+  (SIGSEGV on a user-class instance). A user class now wins; non-class
+  shadowing bindings (a local, `function Map() {}`, an import) get `Any`,
+  scoped to a conservative `builtin_constructor_inference_name` set so
+  module-export names that legitimately arrive through locals (`Buffer`, the
+  stream/event classes) keep their fast paths. The user-class check is also
+  hoisted above the explicit-type-args early return so a generic user
+  `class Map<T>` never produces the collection-recognizer `Generic` shape.
+- `lower/lower_expr/arm_bin.rs`: the `x instanceof WeakRef |
+  FinalizationRegistry` compile-time fold backs off when the name is shadowed.
+- `lower/pre_scan.rs`: the weak-locals pre-scan no longer tags
+  `const w = new WeakRef(x)` as a native weak instance when a user declaration
+  shadows the constructor name, so `w.deref()` dispatches to the user method.
+- `lower_types.rs` split into `lower_types.rs` + `lower_types/extract.rs`
+  (TS-annotation extraction + decorator lowering) to stay under the
+  2000-line lint cap; pure move with named re-exports.
+
+Regression tests `test_issue_6233_shadowed_global_class_new.ts` (issue repro +
+22-name blast-radius matrix + reserved method names + instanceof) and
+`test_issue_6233_shadowed_global_fn_new.ts` (function/const constructors named
+after builtins) match node byte-for-byte. Targeted parity sweep (~160
+collection/error/weak/url/typed-array tests): no regressions.
+
+## v0.5.1255 — chore(deps): bump crossbeam-epoch 0.9.18 → 0.9.20 (RUSTSEC-2026-0204)
+
+RUSTSEC-2026-0204 (published 2026-07-06) flags crossbeam-epoch < 0.9.20 for an
+invalid pointer dereference in the `fmt::Pointer` impl for `Atomic`/`Shared`
+when the underlying pointer is invalid. crossbeam-epoch is a transitive dep
+(rayon → crossbeam-deque), so this is a `Cargo.lock`-only bump — no manifest
+changes. The advisory was failing the required `security-audit` check on every
+open PR (first seen on #6097/#6098).
+
+## v0.5.1254 — metadata catch-up fold (PRs #6036–#6054)
+
+Consolidated version bump documenting the code-only merges that landed on `main` since v0.5.1240. Each PR carries its own detailed rationale in its description and commit body.
+
+- fix: #5957 — default-derived ctor forwarding part 2 (rest + dynamic-parent mixin) (#6036)
+- fix(hir): #6037 — refresh class-capture snapshot after a forward-captured var is re-bound by destructuring (#6038)
+- fix(codegen): #5982 — module-global captures must not feed the typed-ABI closure specialization (#5466 regression) (#6039)
+- fix(codegen): resolve method dispatch on a monomorphized generic-class receiver (#6041)
+- ci(#9): shard the gap-suite conformance gate across 8 runners + fan-in (#6042)
+- fix(codegen): #6040 — resolve monomorphized-generic receiver to its specialization for scalar method dispatch (#6043)
+- feat(runtime): Temporal Dead Zone for forward-referenced lexical let/const (#6044)
+- fix(hir): #5835 — zero-arg new Function() must not trip the CSP codegen-probe throw (#6045)
+- fix(runtime): AbortSignal parity — accept in events helpers + dynamic method dispatch (#6046)
+- ci: give conformance-smoke shards timeout headroom (40 -> 55 min) for the now-required gap gate (#6047)
+- test(#5951): guard class-capture behavior + pin the shared-mutable split-cell bug (#6048)
+- fix(runtime): Date.prototype.toString brand-check + own-expando method shadow (#6050)
+- fix(link): #6023 — LNK1158 'cannot run mt.exe' on Windows MSVC UI builds (#6051)
+- fix(hir): #5951 — share a mutated class capture via a one-element array box (#6054)
+
+**Notable this window:** the gap-suite conformance check became a **required** PR gate (#6042/#6047 sharded it 8-way; #9), and immediately caught the #5835 `new Function()` regression (#6045). #5951 (shared-mutable class-capture split cell) is fixed by desugaring to a one-element array box.
+
+## v0.5.1240 — metadata catch-up fold (PRs #5996–#6034)
+
+Consolidated version bump documenting the code-only merges that landed on `main` since v0.5.1239 during a rapid parallel-merge window where per-PR metadata folding was deferred. All entries are the merged PRs verbatim (conventional-commit subjects); each PR carries its own detailed rationale in its description and commit body.
+
+- fix(runtime,codegen): #5907 — class X extends Promise subclass support (#5991)
+- fix(intl): canonicalize deprecated Unicode-extension type values (#5992)
+- fix(watchos): make the SwiftUI tree-shell pipeline work end-to-end (#5973)
+- fix(runtime): restore exact BigInt-vs-large-Number equality at 2^1023 boundary (#5993)
+- fix(intl): ToObject primitive options in SupportedLocalesOf (#5995)
+- fix(intl): RelativeTimeFormat.format(0, symbol) is a TypeError (#5996)
+- fix(intl): ListFormat StringListFromIterable stops at first non-string (#5998)
+- fix(runtime,transform): #5941 — eliminate the async-step deadlock class (#5988)
+- fix(runtime): js_dynamic_mod preserves sign of zero (fmod semantics) (#5999)
+- fix(intl): Spanish (es) ListFormat unit list patterns (#6000)
+- fix(runtime): guard URLSearchParams shape probe against non-object receivers (#5997)
+- fix(temporal): PlainDateTime/PlainTime toLocaleString keep sub-second fraction (#6002)
+- fix(runtime): dispatch user-assigned callable methods on exotic receivers (#6004)
+- fix(runtime): proxy [[Get]] forwarding for numeric keys and proxy prototypes (#6005)
+- fix(runtime): enforce preventExtensions/seal on function objects (#6007)
+- fix(runtime): latch array iterator done state after exhaustion (#6008)
+- revert: remove the #5874 payload from main — restore 322 test262 regressions (#6015)
+- fix(runtime): #6006 — content-validate shape transition-cache edges (stale-pointer false match) (#6012)
+- fix(hir,runtime): #5989 — Next.js cacheComponents boot-chain subset (#6014)
+- fix(runtime): fire process.stdin 'end'/'close' listeners on EOF (#6017)
+- fix(build,compile): #5928 — codegen-units alignment + cold-build dedup fix for well-known libs (#5980)
+- fix(compile): #5984 — computed-key static fields leak synthetic name into cross-module externs (#5985)
+- fix(codegen,runtime): super(...spread) dropped spread args and skipped custom iterators (#6018)
+- fix(system): getDeviceModel/getOSVersion return a string, not NaN (#5972) (#6016)
+- fix(hir): bracket access with a string-literal key missed builtin static folds (#6019)
+- fix(compile): #5987 — guard class_canonical_path against ClassId collisions (#6001)
+- fix(hir): delete of a module-level var/let/const binding wrongly returned true (#6020)
+- fix(http): gate reqwest proxy env on NODE_USE_ENV_PROXY to match Node (#5889)
+- fix(hir): class own-name binding is const inside the class body (#6021)
+- fix(runtime): class constructor .caller/.arguments are poison-pill accessors (#6022)
+- fix(runtime): `in` operator throws TypeError on a non-object right operand (#6024)
+- fix(hir): emit computed-key static fields that have no initializer (#6025)
+- fix(runtime): strict arr[i]=v / arr.length=n on a frozen array throws TypeError (#6026)
+- fix(hir): capture forward-refs bound later in the same `let` declaration (#6028)
+- perf(json): #6009 — fast-negative toJSON probe: small-object JSON.stringify ~40x faster (#6027)
+- fix(runtime): test262 built-ins value/throw bugs — primitive brand, valueOf shadow, Math.round, Error.toString, radix coercion (#6030)
+- fix(hir): report dynamic-codegen unavailable to `new Function("")` probes by default (#6031)
+- fix(hir): propertyIsEnumerable on built-in prototypes returned non-boolean (#6032)
+- perf(codegen,runtime): #6011 — packed-f64 range-loop versioning: scalar-bound multi-array loops run inline (#6033)
+- fix(gc): #6010 — Map/Set external buffers exert GC pressure; dead collections finalize everywhere (#6034)
+
+## v0.5.1239 — stdlib `full` drops external-http-client-pump: ext-http link lockstep restored
+
+#5831 added `external-http-client-pump` to perry-stdlib's `full` feature, but the pump cfg declares externs (`js_ext_http_agent_*`, `js_ext_http_client_*`, `js_http_has_pending`, …) defined only in perry-ext-http — which the compile driver links per-program, never stdlib's own artifacts. `cargo test -p perry-stdlib` could not link (red since 45e67736d) and cache-warm's heavy-crates step failed on every run, blocking the v0.5.1233 smoke variant priming. The feature was never needed in `full`: `optimized_libs/driver.rs` activates the pump exactly when a program imports node:http/https with perry-ext-http in the link surface. Verified via stdlib test link + unit suite + an http client/server round-trip e2e through the driver-activated path.
+
+## v0.5.1238 — array higher-order methods re-derive element pointers through rooted handles
+
+Every callback-looping array method (forEach/map/map_discard/filter/find/findIndex/findLast/findLastIndex/some/every/flatMap/reduce/reduceRight) hoisted `elements_ptr` before the loop — and map/filter/flatMap additionally cached result pointers, reduce/reduceRight the accumulator, flatMap the callback-returned sub-array — across user callbacks that can trigger a MOVING collection. Elements live inline after the header, so a moved array left the hoisted pointer reading from-space garbage; a moved result array took writes through a stale pointer; a heap-valued accumulator went stale in a Rust local (an exotic getter's GC exposes that even without the callback). New `RootedIterArray` helper: the receiver (and each result/accumulator/sub-array) is held in a `RuntimeHandleScope` root and re-derived per access. E2e `gc_array_iter_rooted` runs 11 methods with `gc()` inside EVERY callback under allocation pressure — byte-for-byte with `node --expose-gc`. Closes the 2026-07-02 audit's GC deep set. (Metadata folded post-merge: the #5981 squash landed code-only.)
+
+## v0.5.1237 — error side tables get GC move/finalize hooks + a user-props root scanner
+
+Errors are movable arena objects, and all seven address-keyed side tables in `node_submodules::diagnostics` (`ERROR_MESSAGE_{CODES,SYSCALLS,ERRNOS,PATHS,DESTS,HOSTNAMES}` + `ERROR_USER_PROPS`) were GC-blind: a moved error lost its `err.code`/`err.syscall`/user props; a fresh error at a recycled address inherited a dead error's entries; and an object-valued user prop (`err.cause = {...}`) was stored as raw bits invisible to GC — collectable while reachable. New `ErrorSideTables` move hook (rekeys all seven on move), finalize hook (old-gen sweep + clear-dead arm + copied-minor from-space finalize mirroring the map/set pattern, dead-error predicate via `addr_class::try_read_gc_header`), and a registered mutable-root scanner for `ErrUserProp::Bits` values (tag-aware). The GC block lives in a new `diagnostics_gc.rs` (2000-line gate). Three unit tests + type-metadata contract update.
+
+## v0.5.1236 — P0: compiled programs never GC'd on nursery pressure; copied-minor weak-slot semantics
+
+**P0.** Since the budgeted-GC slicing (897f50c8b, 2026-05-30), `gc_check_trigger` routed ArenaBytes/MallocCount pressure exclusively through the budgeted mutator-assist stepper — which `registered_root_scanners_block_budgeted_gc` permanently blocks in every compiled program (codegen registers synchronous-only root scanners at startup). The stepper never started, the assist step no-op'd, and allocation pressure accumulated forever: a 4M-small-allocation probe ran ZERO collection cycles and grew to 1.93 GB RSS. #5476 had patched the identical hole for the OldReclaim trigger only. Fix mirrors that arm: when a nursery-churn trigger is due and the budgeted machinery is structurally unavailable, run the direct synchronous minor under `force_full_scan` (conservative retention at the allocation point; copied-minor ineligible for that cycle, so the non-moving minor runs). After: 14 cycles, 539 MB RSS. New compiled-binary e2e (`gc_nursery_trigger_compiled`) pins the contract.
+
+**Copied-minor weak slots.** The scan evacuated THROUGH weak target slots (WeakRef referent / WeakMap-WeakSet entry key / FinalizationRegistry record target) — strengthening the weak edge — and the fast path bypasses the WeakProcessing subphase, so nothing ever tombstoned. The scan now records weak slots without evacuating, repairs forwarded targets after the final drain, and runs `process_weak_targets_after_mark` before the from-space flip, gated on a weak-holder latch so weak-free programs skip the arena walk. Three unit tests with a negative control.
+
+## v0.5.1235 — renamed colliding classes: static calls + static field get/set resolve `class_renames`
+
+Follow-up to v0.5.1230's capture-snapshot work, fixing its own acceptance test (`same_class_name_across_factories_keeps_snapshots_separate`, red on main — invisible to PR CI per the #5960 blind spot): a body-local `class X` colliding with an outer/prior `class X` registers under a scope-local rename, and bare-ident references + `new X()` already resolve it — but the static-method-call arm (Ident + #private) and the static-field get/set arms looked up the raw name, binding the FIRST same-named registrant. Factory B's `e.who()` dispatched to factory A's static and read A's snapshot. All four arms now resolve the rename before the class lookups; imports keep the raw name. Adds `renamed_class_statics_dispatch_to_renamed_registrant` (statics + construction across two factories); full class/static/capture/5437/w6 e2e sweep green.
+
+## v0.5.1234 — #806: no-own-ctor walk binds the ancestor ctor with caps-absent semantics
+
+The parent walk for a ctor-free subclass forwarded the `new`-site's `caps_absent_from_args` into the ancestor's `CaptureFill`, deriving the user/cap tail-split from the ANCESTOR's cap params. But a bare-ident site appends the LEAF's captures, and a capturing leaf always synthesizes an own ctor — a leaf reaching the walk appended nothing, so trailing user args were eaten into cap slots (the decl-site snapshot silently rescued the cap itself; only the user args were lost). `new WrappedLogged("alpha")` bound the mixin ctor's `seed` to undefined. The ancestor fill is now unconditionally caps-absent.
+
+New e2e suite `issue_806_default_derived_ctor_forwarding` (5 node-validated cases; 3 green). Two sibling shapes remain `#[ignore]`d with traced mechanisms — the HIR fixed-arity default-ctor synthesis (rest/extends-expr parents truncate or drop forwarded args) and the sig-cap/rest gaps in the runtime construct dispatchers — tracked as #5957. `run_class_constructor_on_this_flat` gains the same `PERRY_SUPER_DEBUG` diagnostics `js_super_construct_apply` already had.
+
+## v0.5.1233 — CI: cache-warm primes the release compiler + gap-suite auto-opt variants
+
+The conformance-smoke job restored the shared rust-cache with a full match and still hit its 60-minute timeout: the warmed DEBUG units share nothing with its RELEASE build, and every gap test whose auto-optimize feature combination had no `target/perry-auto-<hash>` archive kicked off an in-job cargo build of the runtime (orphan cargo/rustc still compiling at cancellation). cache-warm now builds the release compiler and runs the gap suite once per main merge so every variant lands under the shared key; code-only PRs carry main's `CARGO_PKG_VERSION`, so their smoke jobs restore exact variant matches until the next merge re-warms (job timeout 120 → 150 for the cold first run).
+
+Also brings the version stream back in sync with two code-only fleet merges that landed without metadata: #5953 (#5898 — mutating array methods throw on frozen/non-writable length) and #5954 (#5909 — `JSON.stringify` of a toJSON-returned cycle throws instead of SIGSEGV).
+
+## v0.5.1232 — anchor inliner + deforest max-LocalId scans on the hardened id_scan
+
+The inliner (`inline/analysis.rs`) and deforestation (`deforest/walk.rs`) each carried their own ad-hoc max-LocalId scan to mint fresh locals; both were shallower than `generator::compute_max_local_id` (the scan hardened for #5143 to cover class field/static/computed-member/extends closures). A fresh local minted from an under-counting scan can collide with a LocalId owned by a closure the scan missed — the same defect class as #5143's FuncId collision. Both passes now seed from `crate::generator::compute_max_local_id(module)` and only extend it with their local maxima, so every future descent fix to the shared scan protects all three passes at once.
+
+## v0.5.1231 — #5869 residual: boxed locals must not feed the typed-ABI closure specializations
+
+A BOXED local's slot holds a box POINTER, never the typed value — but its declared type stayed in `module_local_types`, so the typed-ABI closure specialization (`__typed_f64`/i1/i32/string capture reps) read the capture RAW while only the generic variant went through `js_box_get`; the dispatcher picked the typed body and calls returned box-pointer bits as a denormal number (`2.58e-311` instead of `42`). Exposed by #5871's Labeled-descent fix, which made the type visible for closures inside labeled blocks. Fix: filter boxed ids out of `module_local_types` (`crates/perry-codegen/src/codegen/mod.rs`), so every type-directed unboxed access on a boxed slot is disqualified in one place and falls back to the generic box-aware paths. Un-ignores the `closure_inside_labeled_block_counts_as_capture` e2e.
+
+## v0.5.1230 — class-capture snapshot P0 pair: resolved-name re-registration + same-body assignment tracking
+
+Two defects in the decl-site class-capture snapshot (`js_class_register_capture_values`), both extracted from the #5437 Next.js branch:
+
+1. **End-of-body re-registration used the SOURCE class name while the body was compiled under the RENAMED one.** When a function-nested class collides with another declaration (`class_renames` in play), the end-of-body capture re-registration ran after the rename map was restored, so it registered under the wrong name and the refresh never reached the renamed class's id. Re-registration now happens before the `class_renames` restore and goes through `resolve_class_name`. (`crates/perry-hir/src/lower_decl/block.rs`, `crates/perry-hir/src/lower/expr_function.rs`)
+2. **The snapshot only refreshed before `return` statements — a captured local ASSIGNED after the class decl in the same body kept its stale decl-time value.** `insert_class_capture_refresh_after_assignments` now re-snapshots after every top-level assignment/update of a captured local that follows the class declaration in the same body (companion to the existing before-returns refresh).
+
+Salvages the stranded `issue_5437_incremental_cache_get_chain` e2e from the probe branch and adds `capture_rereg_renamed_class` (4 tests). Verified: parity vs the 2026-07-03 baseline shows 0 real newly-failing (one fs-fd flake ruled out by 6/6 local matches) and 6 newly-passing.
+
+## v0.5.1229 — write-path hardening slice 2: transition_fast tags, structuredClone band, rejection printer (#5948)
+
+Continuation of #5943 (2026-07-02 audit §6). js_object_set_field_by_name_transition_fast — the first thing every generic `obj.field = v` hits until any defineProperty runs — admitted SSO strings/tag remnants via a `top16 >= 0x7FF8` catch-all then deref'd a bare GcHeader floor (a 2–5-char SSO payload lands in the 2–5.5TB range and passes the macOS heap floor — the write-side #5429 twin); now POINTER-tag-only, full handle band, try_read_gc_header, with return-0 deferring to the full dynamic path. structuredClone deref'd any POINTER payload ≥0x10000 as GcHeader bytes after the registry probes (fetch/zlib registry ids crashed); full-band gate + validated header probe, pass-through unchanged for non-probeables. The unhandled-rejection printer deref'd POINTER-tagged reasons with a bare ≥0x10000 (a thrown fetch Response id crashed instead of printing); is_plausible_heap_addr gate. e2e: write_path_band_slice2.rs.
+
+## v0.5.1228 — conformance-smoke calibrated: standing gap failures triaged with provenance (#5947)
+
+The new every-PR gap-suite job (#5936) gated against a 4-entry known_failures.json while main carries 28 STANDING gap failures (per the #5917 parity baseline), so the smoke was red on every PR since it landed. All 28 are now triaged with the schema's full provenance (issue numbers encoded in the test names — 2159/2514/2754/2874/2781/3082/3088/3137/3183/3285/3680/3698/3828/4916/5433 — else #5917 as the standing-tail worklist; categories per test-parity/README). The smoke now fires only on genuinely NEW untriaged failures. Wall-time note for the required-flip: 57m22s on a cold rust-cache is too slow for a required gate; re-measure after main-push runs prime the shared cache key.
+
+## v0.5.1227 — spread sources validated; full handle band + no type-pun on the dynamic set path (#5943)
+
+First slice of the 2026-07-02 audit's write-path family (the GET side was hardened by the #5429 fix; the write/spread side was not). `{...expr}` (js_object_copy_own_fields) deref'd ANY value ≥0x10000 as an ObjectHeader via a `top16 >= 0x7FF8` catch-all — spreading a fetch-band handle or SSO string hit non-heap memory (Linux SIGSEGV), spreading a Map walked MapHeader bytes as object fields; sources are now POINTER-tagged, outside the handle band, and try_read_gc_header-verified GC_TYPE_OBJECT (documented safe-now gap: string spread should yield index props). js_object_set_field_by_name routed handles with a `< 0x10000` guard — one zero short of HANDLE_BAND_MAX — so POINTER-tagged fetch/zlib ids skipped handle dispatch and hit the raw GcHeader deref (`response.myProp = v` deref'd the id as memory); both routing sites now use addr_class::is_small_handle. The object_type pun is closed: a one-entry Map has MapHeader.size aliasing OBJECT_TYPE_REGULAR, so `m.customProp = 5` corrupted the Map's bytes — recognized non-object gc_types now return early (Map/Set expando writes are safely dropped; ExoticKind::Map/Set stores are the tracked follow-up, with the ~30-file 0x10000-idiom sweep). e2e: spread_and_setpath_band_safety.rs.
+
+## v0.5.1226 — per-invocation object staging; per-run parity scratch dir (#5940)
+
+The two concurrent-compile contamination P0s from the 2026-07-02 audit (the documented events.once-era trap, critical now that multiple dev agents compile in sibling worktrees daily). Per-module objects landed at CWD-relative name-only paths (object_output_dir = current_dir()), so two concurrent compiles sharing a working directory overwrote each other's <module>.o mid-link and each deleted the other's intermediates — deterministically wrong binaries on any object-cache bypass — and the fixed-name _perry_stubs.o/_perry_failed_stubs.o collided even with the cache ON. Objects now stage under temp_dir()/perry-objs-<pid>-<nanos> (the linker.rs #509 discipline; embedded-asset objects inherit the fix; dir removed with the intermediates). run_parity_tests.sh compiled every test to a fixed /tmp/perry_parity_<id> path — two concurrent suite runs executed each other's compiler output; binaries now live in a per-run mktemp dir (trap-cleaned). Follow-ups: shared cache-key env allowlist; port-parameterize the TLS-upgrade fixture's 17892.
+
+## v0.5.1225 — GC scans descriptor/proxy side tables; static-field globals rooted (#5937)
+
+Three GC P0s from the 2026-07-02 audit (the #5042/#5142 family: a side table holds the only live reference and GC can't see it). ACCESSOR_DESCRIPTORS holds the ONLY reference to Object.defineProperty getter/setter closures — unscanned, a minor GC swept or moved them and the next property read invoked freed memory; PROPERTY_DESCRIPTORS owner keys went stale on evacuation (frozen/non-writable attrs silently detached or fired on a new tenant at a reused address). PROXIES target/handler are commonly reachable only through the registry; REFLECT_METADATA keys go stale on target moves. New scan_descriptor_roots_mut + scan_proxy_roots_mut (semantically ported from the stranded codex-branch be73b4f8d, rewritten against main's current table shapes; the codex policy hunk is superseded by main's registered_root_scanners_block_budgeted_gc guards) visit the closure/target/handler slots and rekey owners in the metadata-rewrite phase, mirroring the symbol-keyed twins. @perry_static_<mod>__<Class>__<field> globals — NaN-boxed any-values whose GC_STORE_AUDIT(ROOT) comment was aspirational — are now registered via register_module_globals_as_gc_roots walking ctx.static_field_globals (deduped; cross-module duplicates harmless). e2e gc_side_table_roots_evacuation.rs: accessor + proxy + static-field object survive 20k-allocation churn + gc() under PERRY_GC_FORCE_EVACUATE=1 with PERRY_GC_VERIFY_EVACUATION=1 armed; gc-stress green on the labeled run.
+
+## v0.5.1224 — gap-suite conformance smoke on every PR (#5936)
+
+New `conformance-smoke` CI job: every pull_request and push runs `scripts/run_gap_tests.sh` — 258 gap tests AOT-compiled and diffed byte-for-byte against node, failing on any failure not triaged in test-parity/known_failures.json. Closes the audit's headline CI gap: nothing on the default PR path exercised TypeScript semantics, which is how the 2026-06 test262 regression (851 cases) and the #5763 setPrototypeOf boot breakage merged through green required checks. Measurement phase: continue-on-error and not yet in the branch-protection required set — flip it required (add `conformance-smoke` to protected contexts) once wall-time on real PRs is confirmed.
+
+## v0.5.1223 — audit-found capability-doc drift corrected; npm publish loop survives per-package failures (#5935)
+
+Docs: lookbehind regex WORKS (regex→fancy-regex hybrid) — removed from CLAUDE.md categorical gaps and rewritten in porting.md (section/table/scan-list); CLAUDE.md GC facts refreshed (~55 registered scanners, conservative scan production-off, module vars uniformly NaN-boxed + rooted — module_var_data_ids is long gone); limitations.md prototype section rewritten around reality (prototype-method assignment + setPrototypeOf supported; the two real gaps: `obj.__proto__ = x` assignment form, literal `{__proto__: []}` not visible to instanceof); gap-suite count 235→258. CI: release-packages.yml platform-publish loop no longer aborts on the first failure under set -e (the mechanism that left npm linux/windows stale while darwin updated) — failures are recorded, the loop continues, the step fails at the end with the full list.
+
+## v0.5.1222 — await/yield in loop condition/update runs per iteration (#5934, fixes #5933)
+
+The async hoist's single pre-loop hoist (its own comment: "safe-but-incomplete approximation") evaluated a loop condition's await ONCE — async drain loops (`while ((v = await q.next()) !== undefined)`) never re-awaited (truthy first value spun forever on stale state, falsy never entered), `do…while` evaluated the condition before the first body run, and generators had the sibling defect at the linearize layer (`while (yield …)` cloned the condition into the cond state where residual yields lower to `0.0`). Restructured instead of hoisting out, preserving break/continue: `while (C)` → `while(true){ let t = C; if (!t) break; body }` (continue re-enters at the condition eval, per spec); `do B while (C)` → first-iteration flag + `while (first || C)` (body precedes first cond eval; continue falls through to the eval); `for (init; C; U)` keeps the For — awaited C moves to a body-top check with the condition slot emptied, awaited U moves to body end with every loop-level continue prefixed by it (new shared `prefix_loop_continues`). Linearize gains the three guarded yield-twin arms for direct generators. Review hardening: the update move bails to the previous lowering when a `continue` sits inside `try{}finally{}` (abrupt completion — the finally must run before the update and may override it), including the linearize arm guard so a fully-bailed For can't re-match its own desugar. e2e: `issue_5933_loop_condition_await.rs` (8 scenarios byte-for-byte vs node).
+
+## v0.5.1221 — #5892 follow-ups: HTTP-client exit-gate guard + content-keyed auto-opt cache
+
+Closes out the #5892 investigation (#5929, #5930). **#5929 (ext-http):** the main reqwest dispatch and Expect-100-continue paths never held a `ClientInflightGuard` — only the agent-socket path did. `spawn_blocking_with_reactor`'s `EXT_BLOCKING` gate covers only the outer closure (which just spawns the detached task), so from its return until the task's first `push_event` an in-flight client exchange was invisible to `js_stdlib_has_active_handles`. An in-process server+client program whose server just `close()`d could observe an all-zero exit gate while the response sat unread in the socket and clean-exit before `'response'` fired — the `issue_4909` `write_end_callbacks_fire_in_flush_order_with_backpressure` red ("status 200" missing, exit 0) that outlived the v0.5.1219/1220 hang fixes. Both detached tasks now carry the guard for the exchange's full lifetime; deterministic unit regression test included (spawned-but-never-polled task on an entered current-thread runtime must keep the gate union nonzero until ResponseEnd queues, then release). The bundled stdlib client was never affected (`async_bridge::spawn` holds `EXT_BLOCKING` for the whole future, #921). **#5930 (compile):** the auto-opt freshness gate compared a config-only stamp plus mtimes, which cache restores and fresh checkouts scramble (the layer that kept CI linking pre-#5911 archives, and the #5778-era warm-cache trap). The build stamp (now v2) embeds a SHA-256 `srcs=` fingerprint over the workspace manifests and every source tree that lands in the archives — the built crates plus their transitive workspace path-dep closure — so archives built from different sources can never pass the gate; the dir-name hash is unchanged (rebuilds stay in-place/incremental). Validation: full-suite Tests dispatch on the #5929 branch — `issue_4903` + `issue_4909` green, suite completed in ~59 min (vs the former 180-min hang); its one failure (`issue_4915_streams_byob` truncated output) reproduces deterministically on main without these changes and is tracked separately.
+
+## v0.5.1220 — wrappers-first link dedup + release-packaging dispatch fixes
+
+Distribution follow-up to v0.5.1219 (whose brew/apt/winget/workers legs never published: the release-packages workflow_dispatch tag fallback ran `gh release list` before any checkout and died on "not a git repository" — first real exercise of that code path; fixed by pinning `-R`). Ships #5921 (dedup wrapper-bundled perry-runtime in wrappers-first links) and #5926 (keep comma-sequence operands ahead of hoisted awaits), plus the #5892 CI auto-opt-cache eviction. npm already carries v0.5.1219; the remaining channels ship v0.5.1220 directly.
+
 ## v0.5.1219 — perry_ffi test shims no longer ship in production ext archives (#5892, #5911)
 
 perry-ext-http and perry-ext-http-server compiled their `test_async_shims` modules into production staticlibs (`mod test_async_shims;` missing the `#[cfg(test)]` gate perry-ext-net already had). The shims define the same `#[no_mangle]` symbols as perry-stdlib's real perry-ffi async bridge with test-only semantics: `perry_ffi_spawn_blocking_with_reactor`/`spawn_blocking` run the closure inline (no runtime context, no pump/wait-driver registration) and `perry_ffi_spawn_async` silently drops the task. When the linker's single-pass archive scan resolved these from an ext archive (the referencing member and the shim member sit in the same archive; sensitive to how the archives were built — test.yml's per-package loop produced the bad order, auto-opt was immune via strip-dedup's duplicate-global localization #5000/#5685), the #5831 current-thread runtime was never driven: the wait-driver never registered, `js_wait_for_event` fell back to the 1s condvar park, and any in-process server+client program parked forever. This was the deterministic full-workspace cargo-test hang in `issue_4903_listen_callback_deferred` that blocked every nightly and release-tag Tests gate since #5831 (#5892). Diagnosis: CI hang-lab on `debug/5892-hang-lab` — gdb/proc dumps (single thread, timed futex cycling 1s, zero client connections), `/proc/pid/syscall` + strace discrimination, md5 corruption check, PERRY_LINK_MAP. Fix: gate both modules `#[cfg(test)]`, matching perry-ext-net; after the gate these symbols have exactly one definition in the workspace.

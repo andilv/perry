@@ -15,6 +15,26 @@ pub(crate) fn lower_ident_expr(ctx: &mut LoweringContext, ident: &ast::Ident) ->
     let expr_ident = ast::Expr::Ident(ident.clone());
     let expr = &expr_ident;
     let name = ident.sym.to_string();
+    // A named import from a node-core module that is not a value export of that
+    // module was deferred (neither bound nor rejected) at import lowering — see
+    // `LoweringContext::deferred_unknown_native_imports`. Type annotations are
+    // erased before expression lowering, so reaching this arm means the local is
+    // genuinely used as a VALUE (`import { nope } from "crypto"; nope()`), not a
+    // TS type in a mixed import (`import { createCipheriv, BinaryLike }`). Raise
+    // the original diagnostic now, at the real point of use. A same-named local
+    // that shadows the specifier resolves normally and is untouched.
+    if ctx.lookup_local(&name).is_none() {
+        if let Some((imported, raw_source, span)) =
+            ctx.deferred_unknown_native_imports.get(&name).cloned()
+        {
+            crate::lower_bail!(
+                span,
+                "The requested module '{}' does not provide an export named '{}'",
+                raw_source,
+                imported
+            );
+        }
+    }
     let with_envs = ctx.active_with_envs_for_ident(&name);
     if !with_envs.is_empty() {
         let saved_with_envs = std::mem::take(&mut ctx.with_env_stack);
@@ -185,6 +205,7 @@ pub(crate) fn lower_ident_expr(ctx: &mut LoweringContext, ident: &ast::Ident) ->
         // have matched `ctx.lookup_local` earlier and never reached
         // here.
         Ok(Expr::PropertyGet {
+            byte_offset: 0,
             object: Box::new(Expr::GlobalGet(0)),
             property: name,
         })
@@ -217,12 +238,36 @@ pub(crate) fn lower_ident_expr(ctx: &mut LoweringContext, ident: &ast::Ident) ->
         // parent PropertyGet/Call/Member context. Bare uses lower to
         // 0.0 (perry-codegen/src/expr.rs Expr::GlobalGet arm).
         let known_global = is_known_global_identifier_name(&name);
-        if !known_global && !ctx.unresolved_ident_as_global {
+        if !known_global {
             // A global created at RUNTIME (sloppy `this.y = 2` with
             // `this` = globalThis inside a dynamic function) is
             // invisible to compile-time resolution — look it up on
             // globalThis first; only a true miss throws the spec
             // ReferenceError, with the identifier in the message.
+            //
+            // #6652: this by-name runtime lookup applies in member-OBJECT
+            // position too (`ctx.unresolved_ident_as_global`). Pre-fix,
+            // member-object lowering collapsed the unknown ident to the bare
+            // `GlobalGet(0)` sentinel — which IS globalThis — so the ident
+            // name was discarded and the MEMBER dispatched against
+            // globalThis: `hasOwnProperty.call(o, k)` read `globalThis.call`
+            // (undefined → "TypeError: value is not a function", @babel/types
+            // placeholders.js in the pi bundle) and a runtime-created
+            // `myGlobal.prop` read `globalThis.prop`. The lookup resolves
+            // through `js_object_get_field_by_name` on globalThis, which
+            // serves Object.prototype-INHERITED members (`hasOwnProperty`,
+            // `toString`, `valueOf`, …) with identity preserved — exactly
+            // Node's global-scope resolution. Bare CALLS of such idents get
+            // `this = undefined` (spec: the global environment record's
+            // WithBaseObject is undefined; Node: `toString()` →
+            // "[object Undefined]" even in sloppy CJS), which the generic
+            // call path already provides.
+            if ctx.unresolved_ident_as_global {
+                eprintln!(
+                    "  Warning: unknown identifier '{}' — assuming global; resolved by name on globalThis (incl. Object.prototype-inherited members) at runtime",
+                    name
+                );
+            }
             return Ok(Expr::Call {
                 callee: Box::new(Expr::ExternFuncRef {
                     name: "js_global_get_or_throw_unresolved".to_string(),
@@ -235,12 +280,6 @@ pub(crate) fn lower_ident_expr(ctx: &mut LoweringContext, ident: &ast::Ident) ->
                 // this identifier's source position (winston `module`).
                 byte_offset: ident.span.lo.0,
             });
-        }
-        if !known_global {
-            eprintln!(
-                "  Warning: unknown identifier '{}' — assuming global; member access will dispatch by name at runtime, bare reads lower to 0",
-                name
-            );
         }
         // Bare built-in constructor identifiers (`Date`, `Array`,
         // `Object`, ...) used as VALUES (not method receivers /
@@ -260,6 +299,7 @@ pub(crate) fn lower_ident_expr(ctx: &mut LoweringContext, ident: &ast::Ident) ->
                 ctx.uses_fetch = true;
             }
             return Ok(Expr::PropertyGet {
+                byte_offset: 0,
                 object: Box::new(Expr::GlobalGet(0)),
                 property: name,
             });

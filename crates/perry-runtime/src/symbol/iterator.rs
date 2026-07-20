@@ -130,6 +130,24 @@ fn throw_value_not_iterable() -> ! {
     crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64));
 }
 
+/// #6454: does this value — already known to be a *registered class ref*
+/// (INT32-tagged, `class_ref_id(..).is_some()`) — resolve a `[Symbol.iterator]`
+/// method? Used by the eager materializers (`array_from_spread_value`,
+/// `js_array_from_value`, `js_for_of_to_array`) to decide between driving the
+/// iterator and their per-construct fallback (spread/for-of throw, `Array.from`
+/// takes its array-like branch), mirroring node. The resolution walks the same
+/// chain `js_get_iterator`'s generic tail uses: own static symbols →
+/// `resolve_proto_chain_symbol` → `class_parent_closure` (#36/#321).
+pub(crate) fn class_ref_resolves_iterator(val_f64: f64) -> bool {
+    let iter_wk = well_known_symbol("iterator");
+    if iter_wk.is_null() {
+        return false;
+    }
+    let sym_f64 = f64::from_bits(crate::value::JSValue::pointer(iter_wk as *const u8).bits());
+    let method = unsafe { js_object_get_symbol_property(val_f64, sym_f64) };
+    method.to_bits() != TAG_UNDEFINED
+}
+
 /// Spec IteratorNext / IteratorClose step "If innerResult is not an Object,
 /// throw a TypeError". The for-of lazy-loop desugar wraps each `__iter.next()`
 /// / guarded `__iter.return()` call in this validator. Returns the result
@@ -168,7 +186,20 @@ pub extern "C" fn js_iterator_result_validate(result: f64) -> f64 {
 /// array-memcpy / index-loop arms) so they don't reach this helper.
 #[no_mangle]
 pub extern "C" fn js_get_iterator(val_f64: f64) -> f64 {
-    if crate::array::js_array_is_array(val_f64).to_bits() == crate::value::TAG_TRUE {
+    // `class X extends Array` — the instance is object-backed (a plain
+    // `ObjectHeader` with indexed fields + `length`), but `array_values_iter`
+    // reads a dense `ArrayHeader`. `js_array_is_array` now reports true for such
+    // an instance, so the array branch below would misread it. Iterate a dense
+    // snapshot of its elements instead — UNLESS the subclass declared its own
+    // `[Symbol.iterator]`, in which case fall through (past the `is_array` branch,
+    // which is guarded below) to the generic symbol lookup that resolves the
+    // user's iterator.
+    if crate::array::is_array_subclass_instance(val_f64) {
+        if !crate::array::array_subclass_has_iterator_override(val_f64) {
+            let snapshot = crate::array::array_subclass_dense_snapshot(val_f64);
+            return crate::array::array_values_iter(snapshot);
+        }
+    } else if crate::array::js_array_is_array(val_f64).to_bits() == crate::value::TAG_TRUE {
         if !crate::array::array_proto_iterator_modified() {
             return crate::array::array_values_iter(val_f64);
         }
@@ -243,6 +274,26 @@ pub extern "C" fn js_get_iterator(val_f64: f64) -> f64 {
     // drive `.next()`. Matches the builtins' default iterator. Skipped when the
     // subclass overrides `[Symbol.iterator]`, so we fall through to the generic
     // symbol lookup below (which resolves the user's `@@iterator` method).
+    //
+    // A URLSearchParams object (shape-detected: `_entries` + `_owner` fields)
+    // has no symbol-table `[Symbol.iterator]` entry — its default iterator
+    // yields `[key, value]` pairs (`%URLSearchParamsIteratorPrototype%`).
+    // Without this branch the generic lookup below finds nothing and returns
+    // the params object as its own "iterator"; the lazy for-of then calls
+    // `.next()` on it → "next is not a function" (mysql2's `parseUrl` does
+    // `for (const [key, value] of url.searchParams)`, so `createPool` with a
+    // `uri:` option died on this).
+    {
+        let jsv = crate::value::JSValue::from_bits(val_f64.to_bits());
+        if jsv.is_pointer() {
+            let obj =
+                jsv.as_pointer::<crate::object::ObjectHeader>() as *mut crate::object::ObjectHeader;
+            if crate::url::search_params::shape_is_url_search_params(obj) {
+                let entries = crate::url::js_url_search_params_entries_arr(obj);
+                return crate::array::array_values_iter(entries);
+            }
+        }
+    }
     match crate::object::map_set_subclass::subclass_backing_for_default_iteration(val_f64) {
         Some(crate::object::map_set_subclass::CollectionBacking::Map(m)) => {
             return crate::value::js_nanbox_pointer(
@@ -261,10 +312,35 @@ pub extern "C" fn js_get_iterator(val_f64: f64) -> f64 {
     // lookup, which would otherwise dereference a raw (non-NaN-boxed) double as
     // an object pointer and crash (`for (x of 37) {}`). Strings ARE iterable, so
     // they fall through to the symbol lookup below.
+    //
+    // #6454: a class DECLARATION is an INT32-tagged ClassRef, not a pointer, so
+    // this guard used to reject it as a primitive number — `yield* SomeTag` /
+    // `for (const x of SomeClass)` threw "is not iterable" without ever reaching
+    // the lookup at the bottom, even though `js_object_get_symbol_property`
+    // resolves class refs (own static symbols → `resolve_proto_chain_symbol` →
+    // `class_parent_closure`, the last of which exists precisely for effect's
+    // `class Svc extends Context.Tag(id)<...>() {}`, #36/#321). Let a registered
+    // class ref through to that lookup; if it resolves no `[Symbol.iterator]` it
+    // still throws, at the tail of this function.
+    //
+    // Note `INT32_TAG | 2` (the number 2) and a ClassRef with `class_id == 2`
+    // are bit-identical — `class_ref_id`'s registry check is the only thing
+    // separating them. That is why the tail must throw rather than return the
+    // value as its own iterator: it keeps `for (const x of 37) {}` a TypeError
+    // even when class id 37 happens to be registered.
+    //
+    // The `class_ref_id` registry probe (an RwLock read + hash lookup) is paid
+    // ONLY by values this guard was already about to throw on — every pointer /
+    // string receiver, i.e. every array, object and string for-of, skips it. The
+    // hot path costs exactly what it did before #6454.
+    let mut is_registered_class_ref = false;
     {
         let jsv = crate::value::JSValue::from_bits(val_f64.to_bits());
         if !jsv.is_pointer() && !jsv.is_any_string() {
-            throw_value_not_iterable();
+            is_registered_class_ref = crate::object::class_ref_id(val_f64).is_some();
+            if !is_registered_class_ref {
+                throw_value_not_iterable();
+            }
         }
     }
     // A string PRIMITIVE (heap STRING_TAG or inline SSO short string) iterates
@@ -350,6 +426,16 @@ pub extern "C" fn js_get_iterator(val_f64: f64) -> f64 {
             throw_value_not_iterable();
         }
     }
+    // #6454: the class ref admitted past the primitive guard above resolved no
+    // `[Symbol.iterator]`, so it is genuinely not iterable — `class C {}` with no
+    // iterator, or (because the encodings are bit-identical) a plain number whose
+    // value collides with a registered class id. Returning it would hand the
+    // caller an INT32 as its own "iterator" and surface a misleading
+    // "next is not a function" later; throw here, exactly as before #6454 for
+    // every non-pointer value.
+    if is_registered_class_ref {
+        throw_value_not_iterable();
+    }
     val_f64
 }
 
@@ -398,6 +484,20 @@ pub unsafe extern "C" fn js_to_primitive(value: f64, hint: i32) -> f64 {
             return crate::value::js_nanbox_string(p as i64);
         }
     }
+    // A `Date` is a `DateCell` cell, NOT an `ObjectHeader`. `Date.prototype`
+    // now carries an installed `[Symbol.toPrimitive]` (its own reflective
+    // `.call(obj, hint)` surface), but implicit `+`/`String()`/template
+    // coercion of a Date is already handled by the dedicated Date fast paths
+    // downstream (`js_add_coerce_to_primitive` string-coerces via
+    // `js_date_to_string`; `js_number_coerce` reads the timestamp). Returning
+    // the value unchanged here keeps that proven coercion path — and the
+    // installed method is still reachable through the explicit read+call form
+    // (`d[Symbol.toPrimitive](hint)` / `Date.prototype[@@toPrimitive].call(…)`),
+    // which does not route through `js_to_primitive`. This mirrors the Temporal
+    // short-circuit above and avoids re-routing a hot, well-tested path.
+    if crate::date::is_date_value(value) {
+        return value;
+    }
     // Look up obj[Symbol.toPrimitive].
     let wk_ptr = well_known_symbol("toPrimitive");
     let sym_f64 = f64::from_bits(POINTER_TAG | (wk_ptr as u64 & POINTER_MASK));
@@ -413,17 +513,6 @@ pub unsafe extern "C" fn js_to_primitive(value: f64, hint: i32) -> f64 {
         return value_handle.get_nanbox_f64();
     }
     let method_handle = scope.root_nanbox_f64(method);
-    let closure_ptr = (method_bits & POINTER_MASK) as *const crate::closure::ClosureHeader;
-    if closure_ptr.is_null() || (closure_ptr as usize) < 0x1000 {
-        return value_handle.get_nanbox_f64();
-    }
-    // Validate CLOSURE_MAGIC before calling.
-    let type_tag = std::ptr::read_volatile(
-        (closure_ptr as *const u8).add(crate::closure::CLOSURE_TYPE_TAG_OFFSET) as *const u32,
-    );
-    if type_tag != crate::closure::CLOSURE_MAGIC {
-        return value_handle.get_nanbox_f64();
-    }
     let hint_str: &[u8] = match hint {
         1 => b"number",
         2 => b"string",
@@ -431,10 +520,45 @@ pub unsafe extern "C" fn js_to_primitive(value: f64, hint: i32) -> f64 {
     };
     let hint_ptr = js_string_from_bytes(hint_str.as_ptr(), hint_str.len() as u32);
     let hint_handle = scope.root_string_ptr(hint_ptr);
+
+    // #6320: `obj[Symbol.toPrimitive]` may hold a *Proxy* of a function. A
+    // proxy is a small registry id NaN-boxed under POINTER_TAG (`PROXY_ID_BAND_
+    // START + id`), NOT a `ClosureHeader*` — the CLOSURE_MAGIC probe below used
+    // to accept anything above an 0x1000 floor, so it read `*(0xF000D + 12)` and
+    // SIGSEGV'd (`EXC_BAD_ACCESS at 0x000f000d`). Node calls the proxy's
+    // `[[Call]]` here (`Call(method, obj, «hint»)`), so route it through the
+    // apply trap / target forwarding with `this` bound to the object, exactly
+    // like a closure method would be. A proxy whose (possibly nested) target is
+    // not callable falls through to the "not a method" return below, matching
+    // how this path already treats a non-callable `@@toPrimitive` value.
+    let method_now = method_handle.get_nanbox_f64();
+    if crate::proxy::js_proxy_is_proxy(method_now) == 1 {
+        if !crate::proxy::proxy_wraps_callable(method_now) {
+            return value_handle.get_nanbox_f64();
+        }
+        let hint_f64 = f64::from_bits(
+            STRING_TAG | (hint_handle.get_raw_const_ptr::<StringHeader>() as u64 & POINTER_MASK),
+        );
+        return crate::proxy::call_proxy_value_with_this(
+            method_handle.get_nanbox_f64(),
+            value_handle.get_nanbox_f64(),
+            &[hint_f64],
+        );
+    }
+
+    // Not a proxy: validate a real heap `ClosureHeader` (band-safe floor +
+    // CLOSURE_MAGIC) before calling. Every other small-handle band (fetch,
+    // zlib, stdlib registry ids) is rejected here too — none of them is a
+    // closure, and all of them fault when probed at `+12`.
+    // (`method_bits` above is stale — the hint-string allocation may have moved
+    // the closure — so re-read every operand from its handle.)
+    let method_bits = method_handle.get_nanbox_f64().to_bits();
+    if !crate::closure::is_closure_ptr((method_bits & POINTER_MASK) as usize) {
+        return value_handle.get_nanbox_f64();
+    }
     let hint_f64 = f64::from_bits(
         STRING_TAG | (hint_handle.get_raw_const_ptr::<StringHeader>() as u64 & POINTER_MASK),
     );
-    let method_bits = method_handle.get_nanbox_f64().to_bits();
     let closure_ptr = (method_bits & POINTER_MASK) as *const crate::closure::ClosureHeader;
 
     // Spec says the return value must be a primitive; if it's still an

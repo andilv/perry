@@ -83,6 +83,8 @@ pub(crate) struct EscapeFacts {
     pub non_escaping_new_used_fields: HashMap<u32, HashSet<String>>,
     pub non_escaping_arrays: HashMap<u32, u32>,
     pub non_escaping_array_used_indices: HashMap<u32, HashSet<u32>>,
+    pub non_escaping_array_length_only_indices: HashMap<u32, HashSet<u32>>,
+    pub fusible_uppercase_locals: HashSet<u32>,
     pub non_escaping_object_literals: HashMap<u32, Vec<String>>,
     pub non_escaping_object_literal_used_fields: HashMap<u32, HashSet<String>>,
 }
@@ -135,6 +137,18 @@ impl TypeFacts {
         self.array_kind(local_id) == ArrayKindFact::PackedF64
             && self.proves_noalias_array(local_id)
             && self.proves_array_length_stable(local_id)
+            && !self.has_materialization_hazard(local_id)
+    }
+
+    /// #6011: packed-f64 eligibility for arrays *written* by the range-guarded
+    /// versioned loop. Unlike [`Self::proves_packed_f64_array`] this does NOT
+    /// require length stability — an `arr[i] = …` in the loop body marks the
+    /// local as length-mutating even though the range guard proves every such
+    /// store is in-bounds (and therefore length-preserving) at loop entry.
+    /// Kind + noalias + no-hazard is what the guarded store path needs.
+    pub(crate) fn packed_f64_eligible_for_guarded_store(&self, local_id: u32) -> bool {
+        self.array_kind(local_id) == ArrayKindFact::PackedF64
+            && self.proves_noalias_array(local_id)
             && !self.has_materialization_hazard(local_id)
     }
 
@@ -208,6 +222,14 @@ impl TypeFacts {
         &self.escape.non_escaping_array_used_indices
     }
 
+    pub(crate) fn non_escaping_array_length_only_indices(&self) -> &HashMap<u32, HashSet<u32>> {
+        &self.escape.non_escaping_array_length_only_indices
+    }
+
+    pub(crate) fn fusible_uppercase_locals(&self) -> &HashSet<u32> {
+        &self.escape.fusible_uppercase_locals
+    }
+
     pub(crate) fn non_escaping_object_literals(&self) -> &HashMap<u32, Vec<String>> {
         &self.escape.non_escaping_object_literals
     }
@@ -276,13 +298,16 @@ impl TypeFacts {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_type_facts(
     stmts: &[Stmt],
+    params: &[perry_hir::Param],
     flat_const_ids: &HashSet<u32>,
     clamp_fn_ids: &HashSet<u32>,
     arg_dependent_clamp_fn_ids: &HashSet<u32>,
     boxed_vars: &HashSet<u32>,
     module_globals: &HashMap<u32, String>,
+    binding_types: &HashMap<u32, perry_types::Type>,
     classes: &HashMap<String, &perry_hir::Class>,
     compile_time_constants: &HashMap<u32, f64>,
+    module_dispatch: &super::ModuleDispatchFacts,
 ) -> TypeFacts {
     let integer_locals = super::integer_locals::collect_integer_locals(
         stmts,
@@ -291,7 +316,8 @@ pub(crate) fn collect_type_facts(
         arg_dependent_clamp_fn_ids,
     );
     let unsigned_i32_locals = super::i32_locals::collect_unsigned_i32_locals(stmts);
-    let (array_facts, effect_facts, materialization_hazards) = collect_array_facts(stmts);
+    let (array_facts, effect_facts, materialization_hazards) =
+        collect_array_facts(stmts, params, module_globals, binding_types);
     let index_used_locals = super::index_uses::collect_index_used_locals(stmts);
     let strictly_i32_bounded_locals = super::i32_locals::collect_strictly_i32_bounded_locals(
         stmts,
@@ -300,14 +326,30 @@ pub(crate) fn collect_type_facts(
         clamp_fn_ids,
     );
     let known_noalias_buffer_locals = collect_known_noalias_buffer_locals(stmts);
-    let non_escaping_news =
-        super::escape_news::collect_non_escaping_news(stmts, boxed_vars, module_globals, classes);
+    let non_escaping_news = super::escape_news::collect_non_escaping_news(
+        stmts,
+        boxed_vars,
+        module_globals,
+        classes,
+        module_dispatch,
+    );
     let non_escaping_new_used_fields =
         super::escape_news::collect_non_escaping_new_used_fields(stmts, &non_escaping_news);
     let non_escaping_arrays =
         super::escape_arrays::collect_non_escaping_arrays(stmts, boxed_vars, module_globals);
     let non_escaping_array_used_indices =
         super::escape_arrays::collect_non_escaping_array_used_indices(stmts, &non_escaping_arrays);
+    let non_escaping_array_length_only_indices =
+        super::escape_arrays::collect_non_escaping_array_length_only_indices(
+            stmts,
+            &non_escaping_arrays,
+        );
+    let fusible_uppercase_locals = super::uppercase_strings::collect_fusible_uppercase_locals(
+        stmts,
+        &non_escaping_arrays,
+        &non_escaping_array_used_indices,
+        &non_escaping_array_length_only_indices,
+    );
     let non_escaping_object_literals = super::escape_objects::collect_non_escaping_object_literals(
         stmts,
         boxed_vars,
@@ -345,6 +387,8 @@ pub(crate) fn collect_type_facts(
             non_escaping_new_used_fields,
             non_escaping_arrays,
             non_escaping_array_used_indices,
+            non_escaping_array_length_only_indices,
+            fusible_uppercase_locals,
             non_escaping_object_literals,
             non_escaping_object_literal_used_fields,
         },
@@ -371,23 +415,29 @@ pub(crate) fn collect_type_facts(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_native_region_fact_graph(
     stmts: &[Stmt],
+    params: &[perry_hir::Param],
     flat_const_ids: &HashSet<u32>,
     clamp_fn_ids: &HashSet<u32>,
     arg_dependent_clamp_fn_ids: &HashSet<u32>,
     boxed_vars: &HashSet<u32>,
     module_globals: &HashMap<u32, String>,
+    binding_types: &HashMap<u32, perry_types::Type>,
     classes: &HashMap<String, &perry_hir::Class>,
     compile_time_constants: &HashMap<u32, f64>,
+    module_dispatch: &super::ModuleDispatchFacts,
 ) -> NativeRegionFactGraph {
     collect_type_facts(
         stmts,
+        params,
         flat_const_ids,
         clamp_fn_ids,
         arg_dependent_clamp_fn_ids,
         boxed_vars,
         module_globals,
+        binding_types,
         classes,
         compile_time_constants,
+        module_dispatch,
     )
 }
 
@@ -401,6 +451,7 @@ pub(crate) fn collect_hir_facts(
 ) -> TypeFacts {
     collect_type_facts(
         stmts,
+        &[],
         flat_const_ids,
         clamp_fn_ids,
         &HashSet::new(),
@@ -408,6 +459,10 @@ pub(crate) fn collect_hir_facts(
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &HashMap::new(),
+        // No class table here, so no scalar-method summary can apply; the
+        // conservative default keeps it that way if one ever could.
+        &super::ModuleDispatchFacts::default(),
     )
 }
 
@@ -506,7 +561,8 @@ fn collect_owned_buffer_lets(
             | Stmt::LabeledBreak(_)
             | Stmt::LabeledContinue(_)
             | Stmt::Throw(_)
-            | Stmt::PreallocateBoxes(_) => {}
+            | Stmt::PreallocateBoxes(_)
+            | Stmt::PreallocateTdzBoxes(_) => {}
         }
     }
 }
@@ -548,8 +604,15 @@ fn is_fresh_uint8array_length_literal(expr: &Expr) -> bool {
     }
 }
 
-fn collect_array_facts(stmts: &[Stmt]) -> (ArrayFacts, EffectFacts, MaterializationHazardFacts) {
+fn collect_array_facts(
+    stmts: &[Stmt],
+    params: &[perry_hir::Param],
+    module_globals: &HashMap<u32, String>,
+    binding_types: &HashMap<u32, perry_types::Type>,
+) -> (ArrayFacts, EffectFacts, MaterializationHazardFacts) {
     let mut collector = ArrayFactCollector::default();
+    collector.seed_params(params);
+    collector.seed_module_bindings(module_globals, binding_types);
     collector.collect_stmts(stmts);
     collector.finish()
 }
@@ -561,11 +624,76 @@ struct ArrayFactCollector {
     aliased_locals: HashSet<u32>,
     length_mutation_locals: HashSet<u32>,
     materialization_hazard_locals: HashSet<u32>,
+    /// #6011/#6369: ids seeded purely from a *declared* `Packed*` array type —
+    /// function params, and module-scope bindings read from an enclosing scope.
+    /// Neither can be proven packed from this body alone (a param receives any
+    /// array at runtime; a module global can be rewritten by another function),
+    /// so these seeds are only versioning hints for the runtime-guard-validated
+    /// packed loop matcher; body-observed mutations still downgrade them like
+    /// any tracked local.
+    declared_type_seeded_locals: HashSet<u32>,
     unknown_call_escape: bool,
     async_microtask_escape: bool,
 }
 
 impl ArrayFactCollector {
+    /// #6011: seed `local_kinds` for function params whose *declared* type is
+    /// a packed numeric array (e.g. `prices: number[]`). Only the numeric
+    /// `Packed*` kinds are seeded — a `PackedValue`/`HoleyValue` param fact
+    /// enables no consumer and would only widen the conservative-downgrade
+    /// surface. Seeding happens before the body walk so every mutation the
+    /// walk observes (push, aliasing, length writes, …) downgrades the param
+    /// exactly like a `Stmt::Let`-declared array.
+    fn seed_params(&mut self, params: &[perry_hir::Param]) {
+        for param in params {
+            if param.is_rest {
+                continue;
+            }
+            self.seed_declared_array_type(param.id, &param.ty);
+        }
+    }
+
+    /// #6369: same declared-type seed for a MODULE-SCOPE binding this body only
+    /// *reads through* — `const prices: number[] = […]` at module scope, used
+    /// inside a function or closure. Without it the binding has no array fact at
+    /// all in this body, so the packed-numeric loop matchers reject it and a
+    /// captured `number[]` is stuck one tier below the identical array passed as
+    /// a parameter (which #6011 already seeds this exact way).
+    ///
+    /// Soundness is the same as the param seed's, and rests on the same two
+    /// pillars: (1) the loop's entry guard
+    /// (`js_typed_feedback_packed_*_loop_guard`) re-validates the *actual*
+    /// runtime array — kind, packed-ness and the whole index window — and side
+    /// exits to the generic loop when it does not hold, so a wrong seed costs a
+    /// guard, never correctness; (2) the matched loop body is walked and admits
+    /// only pure element reads/writes and scalar updates — no call, no `await`,
+    /// no closure — so nothing reachable from the body can rebind the global or
+    /// change the array's shape between the guard and the last iteration. Any
+    /// mutation the body walk *does* see (push, alias, `length` write, identity
+    /// escape) downgrades the seed exactly like a `Stmt::Let`-declared array.
+    fn seed_module_bindings(
+        &mut self,
+        module_globals: &HashMap<u32, String>,
+        binding_types: &HashMap<u32, perry_types::Type>,
+    ) {
+        for id in module_globals.keys() {
+            if let Some(ty) = binding_types.get(id) {
+                self.seed_declared_array_type(*id, ty);
+            }
+        }
+    }
+
+    fn seed_declared_array_type(&mut self, id: u32, ty: &perry_types::Type) {
+        let kind = array_kind_from_declared_type(ty);
+        if matches!(
+            kind,
+            ArrayKindFact::PackedI32 | ArrayKindFact::PackedU32 | ArrayKindFact::PackedF64
+        ) {
+            self.local_kinds.insert(id, kind);
+            self.declared_type_seeded_locals.insert(id);
+        }
+    }
+
     fn collect_stmts(&mut self, stmts: &[Stmt]) {
         for stmt in stmts {
             self.collect_stmt(stmt);
@@ -656,7 +784,8 @@ impl ArrayFactCollector {
             | Stmt::Continue
             | Stmt::LabeledBreak(_)
             | Stmt::LabeledContinue(_)
-            | Stmt::PreallocateBoxes(_) => {}
+            | Stmt::PreallocateBoxes(_)
+            | Stmt::PreallocateTdzBoxes(_) => {}
         }
     }
 
@@ -1095,7 +1224,18 @@ impl ArrayFactCollector {
         self.unknown_call_escape = true;
         let ids: Vec<u32> = self.local_kinds.keys().copied().collect();
         for id in ids {
-            self.mark_array_materialization_hazard(id);
+            // #6011: declared-type-seeded facts still lose their packed kind on
+            // an unknown call (conservative for every fact consumer), but do NOT
+            // gain a materialization hazard — params (and, #6369, module-scope
+            // bindings) were never hazard-tracked before seeding existed, and
+            // hazards feed non-fact consumers
+            // (`array_length_receiver_is_loop_local`'s length-hoist gate) that
+            // must not regress for `i < param.length` loops in call-bearing
+            // bodies. Explicit hazards (freeze/defineProperty/identity escape
+            // on the binding itself) still mark normally.
+            if !self.declared_type_seeded_locals.contains(&id) {
+                self.mark_array_materialization_hazard(id);
+            }
             self.update_array_kind_for_local(id, ArrayKindFact::Unknown);
         }
     }
@@ -1129,12 +1269,44 @@ fn array_kind_from_declared_type(ty: &perry_types::Type) -> ArrayKindFact {
             ArrayKindFact::PackedF64
         }
         perry_types::Type::Array(_) => ArrayKindFact::PackedValue,
+        // #6011: `new Array<number>(n)` declares/infers as
+        // `Generic { base: "Array", type_args: [Number] }` rather than
+        // `Array(Number)` — classify the generic spelling identically.
+        perry_types::Type::Generic { base, type_args }
+            if base == "Array" && type_args.len() == 1 =>
+        {
+            match &type_args[0] {
+                perry_types::Type::Int32 => ArrayKindFact::PackedI32,
+                perry_types::Type::Named(name) if name == "PerryU32" => ArrayKindFact::PackedU32,
+                perry_types::Type::Number => ArrayKindFact::PackedF64,
+                _ => ArrayKindFact::PackedValue,
+            }
+        }
+        perry_types::Type::Generic { base, .. } if base == "Array" => ArrayKindFact::PackedValue,
         _ => ArrayKindFact::Unknown,
     }
 }
 
 fn array_kind_from_initializer(expr: &Expr) -> ArrayKindFact {
     match expr {
+        // #6011: `new Array()` / `new Array(n)` allocations. Zero args is an
+        // empty array; one arg is (almost always) a length — all slots start
+        // as TAG_HOLE, which the hole-tolerant packed-f64 range guard accepts.
+        // A single NON-numeric arg (`new Array("x")`) actually stores the arg
+        // at element 0, making the array non-numeric — that is still fine to
+        // seed as PackedF64 because this fact is only a versioning hint: the
+        // runtime guard revalidates every slot at loop entry and falls back
+        // to the slow loop. Multiple args become elements, so they must all
+        // be literal numbers for the packed-f64 seed.
+        Expr::New {
+            class_name, args, ..
+        } if class_name == "Array" => {
+            if args.len() <= 1 || args.iter().all(expr_is_literal_number) {
+                ArrayKindFact::PackedF64
+            } else {
+                ArrayKindFact::PackedValue
+            }
+        }
         Expr::Array(elements) if elements.iter().all(expr_is_literal_i32) => {
             ArrayKindFact::PackedI32
         }
@@ -1530,13 +1702,16 @@ mod tests {
                 1,
                 Expr::Uint8ArrayNew(Some(Box::new(Expr::Integer(8)))),
             )],
+            &[],
             &HashSet::new(),
             &pure_helpers,
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
             &constants,
+            &crate::collectors::ModuleDispatchFacts::default(),
         );
 
         assert!(graph.known_noalias_buffer_locals().contains(&1));
@@ -1618,6 +1793,7 @@ mod tests {
 
         let graph = collect_native_region_fact_graph(
             &stmts,
+            &[],
             &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
@@ -1625,6 +1801,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
+            &crate::collectors::ModuleDispatchFacts::default(),
         );
 
         assert!(graph.integer_locals().contains(&1));
@@ -1812,6 +1990,7 @@ mod tests {
                 else_branch: Some(vec![Stmt::Expr(Expr::LocalSet(
                     1,
                     Box::new(Expr::PropertyGet {
+                        byte_offset: 0,
                         object: Box::new(Expr::LocalGet(99)),
                         property: "value".to_string(),
                     }),
@@ -1889,6 +2068,7 @@ mod tests {
             Stmt::Expr(Expr::LocalSet(
                 1,
                 Box::new(Expr::PropertyGet {
+                    byte_offset: 0,
                     object: Box::new(Expr::LocalGet(99)),
                     property: "value".to_string(),
                 }),
@@ -1940,6 +2120,7 @@ mod tests {
             Stmt::Expr(Expr::LocalSet(
                 1,
                 Box::new(Expr::PropertyGet {
+                    byte_offset: 0,
                     object: Box::new(Expr::LocalGet(99)),
                     property: "value".to_string(),
                 }),
@@ -2009,6 +2190,7 @@ mod tests {
             Stmt::Expr(Expr::LocalSet(
                 1,
                 Box::new(Expr::PropertyGet {
+                    byte_offset: 0,
                     object: Box::new(Expr::LocalGet(99)),
                     property: "value".to_string(),
                 }),
@@ -2039,6 +2221,7 @@ mod tests {
             Stmt::Expr(Expr::LocalSet(
                 1,
                 Box::new(Expr::PropertyGet {
+                    byte_offset: 0,
                     object: Box::new(Expr::LocalGet(99)),
                     property: "value".to_string(),
                 }),

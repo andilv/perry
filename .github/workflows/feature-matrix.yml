@@ -41,9 +41,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
-          node-version: "26"
+          # Single source of truth: .node-version at the repo root.
+          node-version-file: .node-version
 
       - name: Build Perry release binary
         run: cargo build --release -p perry -p perry-runtime -p perry-stdlib -p perry-runtime-static -p perry-stdlib-static

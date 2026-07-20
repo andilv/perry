@@ -47,6 +47,8 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     // (object_type = OBJECT_TYPE_CLASS) so typeof → "function" and
     // new/instanceof read class_id from it.
     module.declare_function("js_object_mark_class", VOID, &[I64]);
+    // #6438: pin a per-evaluation class object's own parent edge.
+    module.declare_function("js_class_object_pin_parent", VOID, &[I64, I32]);
     // Shape-cache-aware variant: pre-populates keys_array via SHAPE_INLINE_CACHE,
     // so subsequent field stores can use index-based set_field (skipping the
     // per-call linear key-search done by js_object_set_field_by_name).
@@ -78,6 +80,13 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
         "js_object_set_field_by_name_nonenum",
         VOID,
         &[I64, I64, DOUBLE],
+    );
+    // #6469: spec default Error-init for the synthesized standalone ctor of a
+    // no-own-ctor `class X extends Error {}` (this, message, name-string ptr).
+    module.declare_function(
+        "js_error_subclass_default_init",
+        VOID,
+        &[DOUBLE, DOUBLE, I64],
     );
     module.declare_function(
         "js_object_set_field_by_name_nonconfigurable",
@@ -216,6 +225,9 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     );
     module.declare_function("js_object_get_index_polymorphic", DOUBLE, &[I64, DOUBLE]);
     module.declare_function("js_object_get_field_by_name_f64", DOUBLE, &[I64, I64]);
+    // Boxed receiver: validates it is an object and returns undefined for a
+    // non-object instead of dereferencing (Response.json(x, <non-object>)).
+    module.declare_function("js_object_get_field_by_name_boxed", DOUBLE, &[DOUBLE, I64]);
     module.declare_function(
         "js_object_get_field_by_property_id_f64",
         DOUBLE,
@@ -243,6 +255,9 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     module.declare_function("js_nm_install_async_hooks", VOID, &[]);
     module.declare_function("js_nm_install_bigint", VOID, &[]);
     module.declare_function("js_nm_install_buffer", VOID, &[]);
+    module.declare_function("js_nm_install_bun", VOID, &[]);
+    // #6562: bun:ffi dispatch bucket.
+    module.declare_function("js_nm_install_bun_ffi", VOID, &[]);
     module.declare_function("js_nm_install_child_process", VOID, &[]);
     module.declare_function("js_nm_install_cluster", VOID, &[]);
     module.declare_function("js_nm_install_console", VOID, &[]);
@@ -256,6 +271,7 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     module.declare_function("js_nm_install_inspector", VOID, &[]);
     module.declare_function("js_nm_install_module", VOID, &[]);
     module.declare_function("js_nm_install_net", VOID, &[]);
+    module.declare_function("js_nm_install_node_pty", VOID, &[]);
     module.declare_function("js_nm_install_os", VOID, &[]);
     module.declare_function("js_nm_install_path", VOID, &[]);
     module.declare_function("js_nm_install_perf", VOID, &[]);
@@ -291,6 +307,8 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     module.declare_function("js_require_object_coercible", DOUBLE, &[DOUBLE]);
     // Next.js wall 53: runtime `require(absolutePath.json)` disk fallback.
     module.declare_function("js_require_json_disk", DOUBLE, &[DOUBLE]);
+    module.declare_function("js_require_resolve_node_modules", DOUBLE, &[DOUBLE, DOUBLE]);
+    module.declare_function("js_globalthis_seed_async_local_storage", VOID, &[]);
     // Next.js wall 54: runtime `require(absolutePath.js)` -> AOT-compiled module.
     module.declare_function("js_register_path_module", VOID, &[DOUBLE, DOUBLE]);
     module.declare_function("js_require_path_module", DOUBLE, &[DOUBLE]);
@@ -316,6 +334,13 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
         "js_typed_feedback_packed_f64_array_loop_guard",
         I32,
         &[I64, DOUBLE],
+    );
+    // #6011: range-preguarded packed-f64 loop — validates a whole
+    // [min_idx, max_idx_exclusive) index window (hole-tolerant) at loop entry.
+    module.declare_function(
+        "js_typed_feedback_packed_f64_range_loop_guard",
+        I32,
+        &[I64, DOUBLE, I32, I32],
     );
     module.declare_function(
         "js_typed_feedback_packed_u32_array_loop_guard",

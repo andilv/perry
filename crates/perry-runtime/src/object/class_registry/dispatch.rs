@@ -31,6 +31,19 @@ use std::sync::RwLock;
 
 pub(crate) static VTABLE_GEN: AtomicU64 = AtomicU64::new(1);
 
+/// Current vtable generation — consumed by caches (method IC below, the
+/// store-plan cache in `object::prop_plan`) that must invalidate on any
+/// class registration/mutation.
+#[inline]
+pub(crate) fn vtable_generation() -> u64 {
+    VTABLE_GEN.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn test_bump_vtable_generation() {
+    VTABLE_GEN.fetch_add(1, Ordering::Release);
+}
+
 const VTABLE_IC_SIZE: usize = 4096;
 const VTABLE_IC_MASK: usize = VTABLE_IC_SIZE - 1;
 
@@ -59,9 +72,11 @@ const EMPTY_VTABLE_IC_ENTRY: VTableICEntry = VTableICEntry {
 };
 
 thread_local! {
-    static VTABLE_IC: UnsafeCell<[VTableICEntry; VTABLE_IC_SIZE]> = const {
-        UnsafeCell::new([EMPTY_VTABLE_IC_ENTRY; VTABLE_IC_SIZE])
-    };
+    // arm64_32 fix: HEAP-allocate (Box) this ~160KB cache instead of inline TLS.
+    // Oversized `#[thread_local]` storage overflows the ILP32 TLS layout and its
+    // writes corrupt adjacent thread-locals. Boxing keeps only a pointer in TLS.
+    static VTABLE_IC: UnsafeCell<Box<[VTableICEntry]>> =
+        UnsafeCell::new(vec![EMPTY_VTABLE_IC_ENTRY; VTABLE_IC_SIZE].into_boxed_slice());
 }
 
 #[inline(always)]
@@ -87,7 +102,7 @@ pub(crate) unsafe fn vtable_ic_lookup(
     let cur_gen = VTABLE_GEN.load(Ordering::Relaxed);
     let slot = vtable_ic_slot(class_id, method_name_ptr);
     VTABLE_IC.with(|cell| {
-        let cache = &*cell.get();
+        let cache = &**cell.get();
         let entry = &cache[slot];
         if entry.gen == cur_gen
             && entry.class_id == class_id
@@ -120,7 +135,7 @@ pub(crate) unsafe fn vtable_ic_insert(
     let cur_gen = VTABLE_GEN.load(Ordering::Relaxed);
     let slot = vtable_ic_slot(class_id, method_name_ptr);
     VTABLE_IC.with(|cell| {
-        let cache = &mut *cell.get();
+        let cache = &mut **cell.get();
         cache[slot] = VTableICEntry {
             gen: cur_gen,
             class_id,
