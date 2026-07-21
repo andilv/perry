@@ -9,10 +9,10 @@
 use crate::arena::arena_alloc_gc;
 use crate::ArrayHeader;
 use crate::JSValue;
-use std::cell::{Cell, RefCell, UnsafeCell};
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::RwLock;
 
 /// Minimum number of inline field slots every object is allocated with, even
@@ -63,9 +63,7 @@ mod native_module;
 pub(crate) use native_module::class_instance_has_member;
 pub(crate) use native_module::class_ref_id;
 pub(crate) use native_module::install_native_module_vtable;
-pub(crate) use native_module::{
-    build_bound_method_closure, class_prototype_ref_id, SYMBOL_BOUND_METHOD_NAME,
-};
+pub(crate) use native_module::{class_prototype_ref_id, SYMBOL_BOUND_METHOD_NAME};
 mod native_module_crypto_key_object;
 mod native_module_crypto_random;
 mod native_module_dispatch;
@@ -164,16 +162,15 @@ pub use class_meta_registry::{
 };
 pub use descriptor_state::PERRY_CLASS_FIELD_INLINE_GUARD_DISABLED;
 pub(crate) use descriptor_state::{
-    accessor_descriptor_keys_for_obj, class_field_inline_guard_enabled,
-    class_instance_set_may_intercept, clear_accessor_descriptor, clear_property_attrs,
-    constructor_accessor_ever_installed, descriptors_in_use, disable_class_field_inline_guard,
-    get_accessor_descriptor, get_property_attrs, json_object_getter_value, mark_all_keys,
-    note_descriptor_target, object_has_descriptors, object_proto_descriptors_in_use,
+    accessor_descriptor_keys_for_obj, class_instance_set_may_intercept, clear_accessor_descriptor,
+    clear_property_attrs, constructor_accessor_ever_installed, descriptors_in_use,
+    disable_class_field_inline_guard, get_accessor_descriptor, get_property_attrs,
+    json_object_getter_value, mark_all_keys, object_has_descriptors,
     object_proto_may_intercept_key, plain_data_write_may_intercept,
     prune_dead_descriptor_owner_entries, reflect_getter_closure_bits, set_accessor_descriptor,
     set_builtin_accessor_descriptor, set_builtin_property_attrs, set_property_attrs,
     AccessorDescriptor, PropertyAttrs, ACCESSORS_IN_USE, ACCESSOR_DESCRIPTORS,
-    GLOBAL_DESCRIPTORS_IN_USE, PROPERTY_ATTRS_IN_USE, PROPERTY_DESCRIPTORS,
+    PROPERTY_ATTRS_IN_USE, PROPERTY_DESCRIPTORS,
 };
 pub use this_binding::{
     js_implicit_this_get, js_implicit_this_get_sloppy, js_implicit_this_set, js_new_target_get,
@@ -182,10 +179,10 @@ pub use this_binding::{
 };
 pub(crate) use this_binding::{
     scan_implicit_this_roots_mut, static_this_arm, static_this_arm_if_unarmed, static_this_disarm,
-    IMPLICIT_THIS, NEW_TARGET,
+    IMPLICIT_THIS,
 };
 pub use to_string_tag::js_object_to_string;
-pub(crate) use to_string_tag::{typed_array_to_string_tag_name, web_stream_to_string_tag};
+pub(crate) use to_string_tag::typed_array_to_string_tag_name;
 
 static HTTP_METHODS_CACHE: AtomicU64 = AtomicU64::new(0);
 static FS_CONSTANTS_CACHE: AtomicU64 = AtomicU64::new(0);
@@ -1411,6 +1408,19 @@ pub(crate) fn test_overflow_field_bits(owner: usize, index: usize) -> u64 {
 }
 
 #[cfg(test)]
+pub(crate) fn test_seed_keys_index_entry(owner: usize) {
+    KEYS_INDEX.with(|m| {
+        m.borrow_mut()
+            .insert(owner, (0, std::collections::HashMap::new()));
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn test_keys_index_entry_exists(owner: usize) -> bool {
+    KEYS_INDEX.with(|m| m.borrow().get(&owner).is_some())
+}
+
+#[cfg(test)]
 pub(crate) fn test_seed_object_cache_roots(object_cache_bits: [u64; 7], global_this_ptr: i64) {
     // GC_STORE_AUDIT(ROOT): test seed mirrors object cache roots scanned by scan_object_cache_roots_mut.
     crate::gc::runtime_store_root_atomic_nanbox_u64(
@@ -1529,6 +1539,21 @@ pub fn clear_overflow_for_ptr(obj_ptr: usize) {
         if (*c.get()).0 == obj_ptr {
             *c.get() = (0, std::ptr::null_mut());
         }
+    });
+}
+
+/// Remove the `KEYS_INDEX` sidecar entry for a freed object pointer.
+/// Sibling of `clear_overflow_for_ptr`: called from the same GC
+/// dead-owner dispatch when a `GC_TYPE_OBJECT` header is reclaimed.
+/// `KEYS_INDEX` is keyed on the object address, so without this prune
+/// the entry (a whole `HashMap<u64, Vec<u32>>`) would persist forever
+/// keyed by a recycled address — a monotonic leak over a long-running
+/// process, and a stale index a fresh object at the same address could
+/// read. Unlike `clear_overflow_for_ptr` there is no last-accessed
+/// cache to invalidate: `keys_index_lookup` always goes through the map.
+pub fn clear_keys_index_for_ptr(obj_ptr: usize) {
+    KEYS_INDEX.with(|m| {
+        m.borrow_mut().remove(&obj_ptr);
     });
 }
 

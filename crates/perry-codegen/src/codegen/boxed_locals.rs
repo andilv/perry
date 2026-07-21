@@ -6,21 +6,12 @@
 //! the module init — and accumulate a single flat set/map keyed by HIR
 //! LocalId (which is globally unique within the module).
 
-use super::*;
-
 use std::collections::HashMap;
 
-use anyhow::{Context, Result};
 use perry_hir::Module as HirModule;
-
-use crate::module::LlModule;
-use crate::runtime_decls;
-use crate::strings::StringPool;
-use crate::types::{LlvmType, DOUBLE, I64};
 
 // Collector and boxing-analysis walkers live in dedicated modules.
 use crate::boxed_vars::{collect_boxed_param_ids, collect_boxed_vars, collect_let_types_in_stmts};
-use crate::collectors::{collect_closures_in_stmts, collect_let_ids, collect_ref_ids_in_stmts};
 
 /// Module-level boxed_vars: union of every per-function/method/
 /// closure/module-init boxed set. We compute this once because
@@ -65,6 +56,32 @@ pub(crate) fn collect_module_boxed_vars(hir: &HirModule) -> std::collections::Ha
         if let Some(ctor) = &c.constructor {
             module_boxed_vars.extend(collect_boxed_vars(&ctor.body));
             module_boxed_vars.extend(collect_boxed_param_ids(&ctor.params, &ctor.body));
+        }
+        // #6728: instance + static FIELD initializers can hold async closures
+        // (`f = async () => { await x }`). `async_to_generator` rewrites those
+        // into async-step state machines whose state locals (`__state`,
+        // `__done`, `__sent`, …) are MUTATED across resumes and CAPTURED by the
+        // step closure — so they MUST be boxed (shared heap cells) exactly like
+        // the same closure written as `const f = …` (module init) or `this.f = …`
+        // (ctor body), both walked above. Field initializers were the one
+        // closure-bearing member kind this module-wide boxed-var scan missed, so
+        // a field-init async closure's step locals were emitted as raw (unboxed)
+        // captures: the wrapper boxed them but the step closure overwrote the
+        // capture slots with raw values, desyncing the state machine — calling
+        // the closure ran no body and the `await` on it resolved immediately.
+        // Walk the inits (wrapped as a statement, mirroring the closure/global
+        // collectors) so their nested closures' boxed locals are seen too.
+        for field in c.fields.iter().chain(c.static_fields.iter()) {
+            if let Some(init) = &field.init {
+                module_boxed_vars.extend(collect_boxed_vars(std::slice::from_ref(
+                    &perry_hir::Stmt::Expr(init.clone()),
+                )));
+            }
+            if let Some(key_expr) = &field.key_expr {
+                module_boxed_vars.extend(collect_boxed_vars(std::slice::from_ref(
+                    &perry_hir::Stmt::Expr(key_expr.clone()),
+                )));
+            }
         }
     }
     module_boxed_vars.extend(collect_boxed_vars(&hir.init));
@@ -120,6 +137,23 @@ pub(crate) fn collect_module_local_types(hir: &HirModule) -> HashMap<u32, perry_
                 module_local_types.insert(p.id, p.ty.clone());
             }
             collect_let_types_in_stmts(&member.function.body, &mut module_local_types);
+        }
+        // #6728: field / static-field initializers can hold async closures whose
+        // nested step-machine locals need their types known at their capture
+        // sites (see the matching walk in `collect_module_boxed_vars`).
+        for field in c.fields.iter().chain(c.static_fields.iter()) {
+            if let Some(init) = &field.init {
+                collect_let_types_in_stmts(
+                    std::slice::from_ref(&perry_hir::Stmt::Expr(init.clone())),
+                    &mut module_local_types,
+                );
+            }
+            if let Some(key_expr) = &field.key_expr {
+                collect_let_types_in_stmts(
+                    std::slice::from_ref(&perry_hir::Stmt::Expr(key_expr.clone())),
+                    &mut module_local_types,
+                );
+            }
         }
     }
     module_local_types

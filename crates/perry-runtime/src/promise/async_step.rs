@@ -5,6 +5,65 @@
 
 use super::*;
 
+// ── PERRY_TRACE_ASYNC: lost-continuation diagnostics ──────────────────────
+// Opt-in (`PERRY_TRACE_ASYNC=1`). Logs each `await`-SUSPEND on a *pending*
+// promise (with a backtrace of the await site) and each SETTLE of a
+// suspended-on promise. A SUSPEND with no matching SETTLE is a LOST
+// continuation: the awaited promise never settled, so the async fn never
+// resumes — the "the async request handler never returns / the response
+// evaporates" signature. Find it by diffing the unmatched-await backtraces of
+// a working run against a hanging one; the SUSPEND line carries the site.
+// A no-op (one cached bool check) when the env var is unset.
+thread_local! {
+    static TRACE_ASYNC_ON: std::cell::Cell<i8> = const { std::cell::Cell::new(-1) };
+    static TRACE_ASYNC_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static TRACE_ASYNC_AWAITED: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+#[inline]
+fn trace_async_enabled() -> bool {
+    TRACE_ASYNC_ON.with(|c| {
+        let v = c.get();
+        if v >= 0 {
+            v == 1
+        } else {
+            let e = std::env::var("PERRY_TRACE_ASYNC").as_deref() == Ok("1");
+            c.set(if e { 1 } else { 0 });
+            e
+        }
+    })
+}
+
+/// An async fn is suspending, awaiting `inner` (a pending promise). Record it
+/// and log the await site so a never-settled `inner` can be identified.
+pub(crate) fn trace_async_suspend(inner: *const Promise) {
+    if inner.is_null() || !trace_async_enabled() {
+        return;
+    }
+    let id = TRACE_ASYNC_SEQ.with(|c| {
+        let n = c.get().wrapping_add(1);
+        c.set(n);
+        n
+    });
+    TRACE_ASYNC_AWAITED.with(|s| s.borrow_mut().insert(inner as usize));
+    eprintln!(
+        "[ASYNC-SUSP #{id} P={inner:p}]\n{}",
+        std::backtrace::Backtrace::force_capture()
+    );
+}
+
+/// A promise settled. If an async fn was suspended awaiting it, note the resume.
+pub(crate) fn trace_async_settle(promise: *const Promise, how: &str) {
+    if promise.is_null() || !trace_async_enabled() {
+        return;
+    }
+    let was = TRACE_ASYNC_AWAITED.with(|s| s.borrow_mut().remove(&(promise as usize)));
+    if was {
+        eprintln!("[ASYNC-SETTLE {how} P={promise:p}]");
+    }
+}
+
 /// Inverse of `then::arg_to_closure` — reboxes an already-unboxed
 /// `ClosurePtr` handler arg back into a boxed `f64` JS value so it can be
 /// forwarded to `js_promise_then_checked`. Null (the "no handler" sentinel)
@@ -228,7 +287,28 @@ fn then_backpatch_result(
         super::then::js_promise_attach_handlers(awaited, fulfill, reject);
         result
     } else {
-        js_promise_then(awaited, fulfill, reject)
+        // #6728: `trap_next` non-null means this is a SUBSEQUENT `await` (the
+        // 2nd or later) in the activation — the result promise already exists
+        // and the resume thunks already carry it (capture slot 1, set by
+        // `build_async_step_thunks`). Attach the thunks to `awaited` WITHOUT a
+        // chained then-result promise, exactly like the first-await
+        // (`trap_next.is_null()`) branch above, and return `trap_next` (which is
+        // what the reuse fast paths in `js_async_step_chain` return too).
+        //
+        // A plain `js_promise_then` here mints an intermediate then-result
+        // promise. When the resumed step later THROWS — a `throw` reached after
+        // two-or-more awaits — its fulfill thunk returns the step body's fresh
+        // `Promise.reject(e)` (see `forward_swallowed_rejection`), and that
+        // then-result promise ADOPTS the rejection, becoming a REJECTED promise
+        // with NO handler attached. The orphan surfaces a spurious
+        // "Uncaught (in promise)" (and exits the process non-zero) even though a
+        // surrounding `try/catch` already handled the throw via `trap_next`.
+        // The first-await path never hit this because it uses `attach_handlers`
+        // (`next` = null, nothing to propagate the thunk's rejected return to);
+        // extend the same shape to every await so multi-await async functions
+        // that throw reject exactly one promise — the activation result.
+        super::then::js_promise_attach_handlers(awaited, fulfill, reject);
+        trap_next
     }
 }
 
@@ -332,6 +412,7 @@ pub extern "C" fn js_async_step_chain(value: f64, step_closure: ClosurePtr) -> *
                     // the inner settles; install fulfill/reject thunks
                     // that will queue the right Task when called.
                     bump(&MT_STEP_CHAIN_REUSE_MISS);
+                    trace_async_suspend(inner);
                     let (fulfill, reject) = build_async_step_thunks(step_closure, trap_next);
                     return then_backpatch_result(inner, fulfill, reject, trap_next);
                 }
@@ -558,6 +639,46 @@ pub extern "C" fn js_async_first_call(step_closure_nanbox: f64) -> f64 {
     INLINE_TRAP.with(|c| c.set(prev));
     result
 }
+
+/// #6709. Entry point for an async-generator activation. Like
+/// `js_async_first_call`, but the caller supplies the resume `value` and an
+/// `is_error` flag instead of the hard-coded `(undefined, false)`.
+///
+/// Each `gen.next(v)` / `gen.throw(e)` / `.return(v)` on a lowered async
+/// generator starts a fresh async-step activation that resumes the SHARED
+/// state machine (the generator's `__state`/`__done`/`__sent` boxes persist
+/// across calls). The activation's step body reads its resumed value from the
+/// first arg (delivered to `__sent`) and routes an error (`is_error = true`) at
+/// the current suspend state; it returns either an already-settled Promise
+/// (synchronous yield/completion), a fresh pending Promise (the body suspended
+/// at an inner `await` via `js_async_step_chain`), or a rejected Promise (an
+/// uncaught throw). The `trap_next = null` reset mirrors `js_async_first_call`
+/// so a nested async fn/gen the body invokes cannot prematurely settle THIS
+/// activation's result promise; `prev` is restored on exit for composition.
+#[no_mangle]
+pub extern "C" fn js_async_generator_resume(
+    step_closure_nanbox: f64,
+    value: f64,
+    is_error: f64,
+) -> f64 {
+    let ptr = crate::value::js_nanbox_get_pointer(step_closure_nanbox)
+        as *mut crate::closure::ClosureHeader;
+    let prev = INLINE_TRAP.with(|c| {
+        let old = c.get();
+        c.set(InlineTrap {
+            trap_next: std::ptr::null_mut(),
+            current_step: ptr as usize,
+        });
+        old
+    });
+    let result = crate::closure::js_closure_call2(ptr, value, is_error);
+    INLINE_TRAP.with(|c| c.set(prev));
+    result
+}
+
+#[used]
+static KEEP_JS_ASYNC_GENERATOR_RESUME: extern "C" fn(f64, f64, f64) -> f64 =
+    js_async_generator_resume;
 
 // Thread-local single-slot cache for async-step thunks. Keyed by the
 // step closure pointer. When the same step closure is used across

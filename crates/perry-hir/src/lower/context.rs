@@ -4,12 +4,8 @@
 //! visibility and are re-exported from `lower/mod.rs` so the existing
 //! `expr_*` submodules and the rest of the crate keep compiling unchanged.
 
-#![allow(unused_imports)]
-
-use anyhow::{anyhow, Result};
-use perry_types::{FuncId, FunctionType, GlobalId, LocalId, Type, TypeParam};
+use perry_types::{FuncId, LocalId, Type, TypeParam};
 use std::collections::{HashMap, HashSet};
-use swc_ecma_ast as ast;
 
 use super::*;
 use crate::ir::*;
@@ -116,6 +112,7 @@ impl LoweringContext {
             suppress_stdlib_dispatch_guard_once: false,
             lowering_call_callee: false,
             unresolved_ident_as_global: false,
+            global_intrinsic_new_once: false,
             with_env_stack: Vec::new(),
             var_hoisted_ids: HashSet::new(),
             tdz_forward_ids: HashSet::new(),

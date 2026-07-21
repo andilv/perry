@@ -4,9 +4,8 @@
 //! async-step, slugify, class registration, runtime init/module-loader,
 //! well-known Symbol hooks, Object.groupBy, JSX runtime adapter.
 
-use super::*;
 use crate::module::LlModule;
-use crate::types::{DOUBLE, F32, I1, I16, I32, I64, I8, PTR, VOID};
+use crate::types::{DOUBLE, I32, I64, PTR, VOID};
 
 pub(crate) fn declare_core(module: &mut LlModule) {
     // ========== Date ==========
@@ -303,6 +302,14 @@ pub(crate) fn declare_core(module: &mut LlModule) {
     // the right pointer on the very first state. Saves/restores
     // INLINE_TRAP across the call for nested-async composition.
     module.declare_function("js_async_first_call", DOUBLE, &[DOUBLE]);
+    // #6709: async-generator activation entry. Like js_async_first_call but
+    // the caller supplies the resume value + is_error flag (gen.next(v) /
+    // gen.throw(e)) instead of the hard-coded (undefined, false).
+    module.declare_function(
+        "js_async_generator_resume",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, DOUBLE],
+    );
 
     // ========== Slugify ==========
     module.declare_function("js_slugify", I64, &[I64]);
