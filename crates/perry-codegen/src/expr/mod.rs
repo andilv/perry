@@ -662,6 +662,12 @@ pub(crate) struct FnCtx<'a> {
     /// the array is a live packed raw-f64 plain Array and the loop proof keeps
     /// `i` in bounds.
     pub packed_f64_loop_facts: Vec<PackedF64LoopFact>,
+    pub masked_window_array_facts: Vec<MaskedWindowArrayFact>,
+    /// #6750 follow-up: locals currently flow-refined to Number inside a
+    /// masked-window region fast copy — their shadow slots were cleared at
+    /// the refinement point and per-statement shadow updates are suppressed
+    /// until the refinement is dropped (`expr::shadow_slot`).
+    pub masked_region_scalar_locals: std::collections::HashSet<u32>,
 
     /// #5093: scoped loop-versioning facts for monomorphic class-field loops.
     /// Pushed only around the FAST clone of `lower_class_field_versioned_for`
@@ -1191,6 +1197,58 @@ pub(crate) struct PackedF64LoopFact {
     /// RHS is numeric bits (side-exiting otherwise) and skip the per-iteration
     /// store guard — the range guard already proved bounds and mutability.
     pub allow_holes: bool,
+    /// True when a *range* guard (hole-tolerant or dense) validated the whole
+    /// constant-offset index window `[start + min_offset, bound + max_offset)`
+    /// at loop entry — `arr[i ± c]` loads may use non-zero offsets even
+    /// without hole tolerance (`allow_holes: false` + `window_validated: true`
+    /// is the dense range loop: the window is additionally hole-free, so
+    /// loads carry no hole check at all).
+    pub window_validated: bool,
+}
+
+/// Element storage a masked-window fact's entry guard proved (#6750
+/// follow-up). The plain tier keeps deriving the slot address from the boxed
+/// array handle; the typed-array tiers load through the data pointer the
+/// preheader probe hoisted (`js_typed_array_masked_window_data_ptr` — stable
+/// for the whole call-free fast copy).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum MaskedWindowElem {
+    /// Plain array with raw-f64 numeric slots: `handle + 8 + idx * 8`.
+    PlainF64,
+    /// Int32Array: `load i32` at `data_ptr + idx * 4`; every element is an
+    /// exact i32 by construction.
+    TaI32 { data_ptr: String },
+    /// Uint32Array: `load i32` at `data_ptr + idx * 4`, materialized
+    /// UNSIGNED (`uitofp`) — elements may exceed `i32::MAX`, so the fact
+    /// never sets `values_i32`.
+    TaU32 { data_ptr: String },
+    /// Float64Array: `load double` at `data_ptr + idx * 8`.
+    TaF64 { data_ptr: String },
+}
+
+/// Read-only masked-index window fact for the dense packed-f64 range loop:
+/// the entry guard (`js_typed_feedback_packed_f64_range_loop_guard_dense`
+/// for the plain tiers, `js_typed_feedback_masked_window_ta_kind` for the
+/// typed-array tiers) proved `array_local_id` is a numeric array whose
+/// `[min_idx, max_idx_exclusive)` slots are all in-bounds numbers (no holes).
+/// Any read whose index has a static value window inside this range (e.g.
+/// `S[x & 1023]`, `S[256 + ((x >>> 16) & 0xff)]` — see
+/// `collectors::static_index_window`) lowers to a bare element load whose
+/// width/signedness follows `elem`.
+#[derive(Debug, Clone)]
+pub(crate) struct MaskedWindowArrayFact {
+    pub array_local_id: u32,
+    pub scope_id: u32,
+    pub guard_id: String,
+    pub min_idx: i64,
+    pub max_idx_exclusive: i64,
+    /// True in the i32-tier fast copies: the guard proved every window slot
+    /// holds an i32-representable integer (plain dense-i32 tier), or the
+    /// element type is exactly i32 (Int32Array tier), so loads may
+    /// materialize elements as native `i32`.
+    pub values_i32: bool,
+    /// Storage layout the guard proved — selects the inline load shape.
+    pub elem: MaskedWindowElem,
 }
 
 /// #5093: one fact per (receiver, versioned loop). See
@@ -1308,7 +1366,9 @@ mod dyn_extern_i18n;
 mod env_clones;
 mod fs_await;
 mod index_get;
+mod masked_window;
 pub(crate) use index_get::packed_f64_loop_index_parts;
+pub(crate) use masked_window::masked_window_fact_for_index;
 mod index_set;
 mod instance_misc1;
 pub(crate) use instance_misc1::builtin_parent_reserved_class_id;

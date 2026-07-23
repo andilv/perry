@@ -129,7 +129,7 @@ fn packed_f64_loop_fact_for_index(
 ) -> Option<(PackedF64LoopFact, u32, i32)> {
     let (idx_id, offset) = packed_f64_loop_index_parts(index)?;
     let fact = packed_f64_loop_fact(ctx, arr_id, idx_id)?;
-    if offset != 0 && !fact.allow_holes {
+    if offset != 0 && !fact.allow_holes && !fact.window_validated {
         return None;
     }
     Some((fact, idx_id, offset))
@@ -953,6 +953,21 @@ pub(crate) fn lower_numeric_index_get_for_number_context(
     let Expr::IndexGet { object, index } = expr else {
         return Ok(None);
     };
+    // Masked-window fast path first: the dense range guard proved the whole
+    // static index window at loop entry, so the read needs neither the static
+    // layout proof below nor a per-access guard. The fact can only exist for
+    // a range-loop-eligible binding (never scalar-replaced or aliased).
+    if let Expr::LocalGet(arr_id) = object.as_ref() {
+        if let Some(fact) =
+            super::masked_window::masked_window_fact_for_index(ctx, *arr_id, index.as_ref())
+        {
+            let arr_box = lower_expr(ctx, object)?;
+            let idx_i32 = lower_expr_as_i32(ctx, index)?;
+            return Ok(Some(super::masked_window::lower_masked_window_index_get(
+                ctx, *arr_id, &arr_box, &idx_i32, &fact,
+            )));
+        }
+    }
     if !is_array_expr(ctx, object) || !expr_has_numeric_pointer_free_array_layout(ctx, object) {
         return Ok(None);
     }
@@ -1053,6 +1068,17 @@ pub(crate) fn lower_unknown_local_index_get_for_number_context(
     let Expr::LocalGet(id) = object.as_ref() else {
         return Ok(None);
     };
+    // #6750 follow-up: an active masked-window fact wins over the guarded
+    // inline-TA probe — the fact's entry guard already proved storage + the
+    // whole index window, so the read needs no per-access cache probe at all.
+    if let Some(fact) = super::masked_window::masked_window_fact_for_index(ctx, *id, index.as_ref())
+    {
+        let arr_box = lower_expr(ctx, object)?;
+        let idx_i32 = lower_expr_as_i32(ctx, index)?;
+        return Ok(Some(super::masked_window::lower_masked_window_index_get(
+            ctx, *id, &arr_box, &idx_i32, &fact,
+        )));
+    }
     let recv_unknown = matches!(
         crate::type_analysis::static_type_of(ctx, object),
         None | Some(HirType::Any) | Some(HirType::Unknown)
@@ -1514,6 +1540,23 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     &[(I64, &s_handle), (DOUBLE, &idx_d)],
                 ));
             }
+            // #6750 follow-up: a masked-window fact (dense range-loop or
+            // straight-line region fast copy) covering this access means the
+            // entry guard already proved the receiver's storage layout and
+            // the whole static index window — the read is a bare inline load
+            // even though the STATIC type is erased (`any` parameter). Must
+            // run before the unknown-receiver `js_dyn_index_get` route below.
+            if let Expr::LocalGet(arr_id) = object.as_ref() {
+                if let Some(fact) =
+                    super::masked_window::masked_window_fact_for_index(ctx, *arr_id, index.as_ref())
+                {
+                    let arr_box = lower_expr(ctx, object)?;
+                    let idx_i32 = lower_expr_as_i32(ctx, index)?;
+                    return Ok(super::masked_window::lower_masked_window_index_get(
+                        ctx, *arr_id, &arr_box, &idx_i32, &fact,
+                    ));
+                }
+            }
             // Issue #514: when the receiver's static type is genuinely
             // unknown (`Type::Any` / `Type::Unknown`) and the index is
             // numeric, route through the runtime tag-aware dispatcher.
@@ -1620,6 +1663,17 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                                 ctx, *arr_id, &arr_box, &idx_i32, &fact,
                             ));
                         }
+                    }
+                    if let Some(fact) = super::masked_window::masked_window_fact_for_index(
+                        ctx,
+                        *arr_id,
+                        index.as_ref(),
+                    ) {
+                        let arr_box = lower_expr(ctx, object)?;
+                        let idx_i32 = lower_expr_as_i32(ctx, index)?;
+                        return Ok(super::masked_window::lower_masked_window_index_get(
+                            ctx, *arr_id, &arr_box, &idx_i32, &fact,
+                        ));
                     }
                 }
                 if let (Expr::LocalGet(arr_id), Expr::LocalGet(idx_id)) =

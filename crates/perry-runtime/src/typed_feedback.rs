@@ -720,6 +720,13 @@ fn object_shape(addr: usize) -> (usize, u32, u16) {
             return (0, 0, gc_type);
         }
         let class_id = (*ptr).class_id;
+        // #6759 C3b note: this token is equality-compared only, and the
+        // header-stamped stable shape id (C3c-r) would be a stabler token —
+        // but LAZY stamping means early observations of a shape use the
+        // keys address while later ones would use the id, splitting one
+        // logical shape into two tokens per site (spurious polymorphism).
+        // Switching this token to ids requires EAGER stamping at
+        // allocation (the codegen-assisted remainder of C3c).
         let shape = (*ptr).keys_array as usize;
         (shape, class_id, gc_type)
     }
@@ -1249,6 +1256,211 @@ fn packed_f64_array_loop_range_guard(
         }
         crate::array::rebuild_array_numeric_raw_f64_allow_holes(arr)
     }
+}
+
+/// Dense-window variant of [`packed_f64_array_loop_range_guard`] for the
+/// read-only masked-index range loop: identical shape/window validation, but
+/// the window must additionally be hole-free (the guarded loop's inline loads
+/// carry no hole check and no side exit — its multi-statement body cannot be
+/// safely re-executed mid-iteration).
+fn packed_f64_array_loop_range_guard_dense(
+    arr: *const ArrayHeader,
+    min_idx: i32,
+    max_idx_exclusive: i32,
+) -> bool {
+    if !plain_array_index_guard(arr, 0, false) {
+        return false;
+    }
+    let raw_addr = normalize_raw_object_addr(arr as u64);
+    let Some(header) = gc_header_for_user_addr(raw_addr) else {
+        return false;
+    };
+    unsafe {
+        let flags = (*header)._reserved;
+        if flags
+            & (crate::gc::OBJ_FLAG_FROZEN
+                | crate::gc::OBJ_FLAG_SEALED
+                | crate::gc::OBJ_FLAG_NO_EXTEND)
+            != 0
+        {
+            return false;
+        }
+        let arr = raw_addr as *mut ArrayHeader;
+        let len = (*arr).length;
+        if len > i32::MAX as u32 {
+            return false;
+        }
+        if min_idx < 0 || i64::from(max_idx_exclusive) > i64::from(len) {
+            return false;
+        }
+        crate::array::rebuild_array_numeric_raw_f64_dense_window(arr, min_idx, max_idx_exclusive)
+    }
+}
+
+/// i32 tier of [`packed_f64_array_loop_range_guard_dense`]: the window must
+/// additionally hold only i32-representable integers, so the guarded loop's
+/// inline loads can use a bare exact `fptosi`.
+fn packed_f64_array_loop_range_guard_dense_i32(
+    arr: *const ArrayHeader,
+    min_idx: i32,
+    max_idx_exclusive: i32,
+) -> bool {
+    if !packed_f64_array_loop_range_guard_dense(arr, min_idx, max_idx_exclusive) {
+        return false;
+    }
+    let raw_addr = normalize_raw_object_addr(arr as u64);
+    unsafe {
+        crate::array::rebuild_array_numeric_raw_f64_dense_window_i32(
+            raw_addr as *mut ArrayHeader,
+            min_idx,
+            max_idx_exclusive,
+        )
+    }
+}
+
+fn packed_f64_range_dense_guard_impl(
+    site_id: u64,
+    receiver: f64,
+    min_idx: i32,
+    max_idx_exclusive: i32,
+    guard: fn(*const ArrayHeader, i32, i32) -> bool,
+) -> i32 {
+    let raw_addr = normalize_raw_object_addr(receiver.to_bits());
+    if !typed_feedback_enabled() {
+        return guard(raw_addr as *const ArrayHeader, min_idx, max_idx_exclusive) as i32;
+    }
+    let (class_id, heap_type, aux, element_kind) = classify_array(raw_addr, None);
+    let observation = Observation {
+        source: ObservationSource::Array,
+        object_addr: 0,
+        shape_addr: 0,
+        key_hash: 0,
+        class_id,
+        heap_type,
+        aux,
+        value_tag: element_kind,
+    };
+    let pass = guard_observe(
+        site_id,
+        TypedFeedbackSiteKind::ArrayElement,
+        observation,
+        guard(raw_addr as *const ArrayHeader, min_idx, max_idx_exclusive),
+    );
+    if pass {
+        1
+    } else {
+        0
+    }
+}
+
+/// FFI wrapper for [`packed_f64_array_loop_range_guard_dense`] — the entry
+/// guard of the read-only masked-index packed-f64 range loop (f64 tier).
+#[no_mangle]
+pub extern "C" fn js_typed_feedback_packed_f64_range_loop_guard_dense(
+    site_id: u64,
+    receiver: f64,
+    min_idx: i32,
+    max_idx_exclusive: i32,
+) -> i32 {
+    packed_f64_range_dense_guard_impl(
+        site_id,
+        receiver,
+        min_idx,
+        max_idx_exclusive,
+        packed_f64_array_loop_range_guard_dense,
+    )
+}
+
+/// FFI wrapper for [`packed_f64_array_loop_range_guard_dense_i32`] — the i32
+/// tier of the dense range-loop guard.
+#[no_mangle]
+pub extern "C" fn js_typed_feedback_packed_f64_range_loop_guard_dense_i32(
+    site_id: u64,
+    receiver: f64,
+    min_idx: i32,
+    max_idx_exclusive: i32,
+) -> i32 {
+    packed_f64_range_dense_guard_impl(
+        site_id,
+        receiver,
+        min_idx,
+        max_idx_exclusive,
+        packed_f64_array_loop_range_guard_dense_i32,
+    )
+}
+
+/// Kind codes returned by [`js_typed_feedback_masked_window_ta_kind`]. The
+/// codegen tier dispatch branches on these exact values — keep in sync with
+/// the masked-window TA tiers in `perry-codegen/src/stmt/loops.rs`.
+pub const MASKED_WINDOW_TA_KIND_NONE: i32 = 0;
+pub const MASKED_WINDOW_TA_KIND_I32: i32 = 1;
+pub const MASKED_WINDOW_TA_KIND_U32: i32 = 2;
+pub const MASKED_WINDOW_TA_KIND_F64: i32 = 3;
+
+/// Masked-window typed-array probe (#6750 follow-up): classify a receiver
+/// whose static type the compiler could not prove (an `any` function
+/// parameter — the bcryptjs S-box shape) as a typed array whose whole static
+/// index window `[min_idx, max_idx_exclusive)` is in bounds. O(1): a registry
+/// lookup plus a length compare — no window scan, so re-entering a short hot
+/// loop (one probe per accessed array per entry) stays cheap.
+///
+/// A view over a detached ArrayBuffer has `length == 0`
+/// (`zero_views_of_detached_backing`), so the window check also rejects
+/// detached backings. Kinds outside {Int32, Uint32, Float64} return NONE and
+/// fall through to the plain-array guard tiers / the slow loop.
+fn masked_window_ta_kind(addr: usize, min_idx: i32, max_idx_exclusive: i32) -> i32 {
+    if min_idx < 0 {
+        return MASKED_WINDOW_TA_KIND_NONE;
+    }
+    let Some(kind) = crate::typedarray::lookup_typed_array_kind(addr) else {
+        return MASKED_WINDOW_TA_KIND_NONE;
+    };
+    let code = match kind {
+        crate::typedarray::KIND_INT32 => MASKED_WINDOW_TA_KIND_I32,
+        crate::typedarray::KIND_UINT32 => MASKED_WINDOW_TA_KIND_U32,
+        crate::typedarray::KIND_FLOAT64 => MASKED_WINDOW_TA_KIND_F64,
+        _ => return MASKED_WINDOW_TA_KIND_NONE,
+    };
+    let len = unsafe { (*(addr as *const crate::typedarray::TypedArrayHeader)).length };
+    if i64::from(max_idx_exclusive) > i64::from(len) {
+        return MASKED_WINDOW_TA_KIND_NONE;
+    }
+    code
+}
+
+/// FFI wrapper for [`masked_window_ta_kind`] — the typed-array tier probe of
+/// the read-only masked-index range loop. Returns the `MASKED_WINDOW_TA_KIND_*`
+/// code; the codegen requires every accessed array to probe to the same
+/// non-NONE code before entering the matching typed-array fast copy.
+#[no_mangle]
+pub extern "C" fn js_typed_feedback_masked_window_ta_kind(
+    site_id: u64,
+    receiver: f64,
+    min_idx: i32,
+    max_idx_exclusive: i32,
+) -> i32 {
+    let raw_addr = normalize_raw_object_addr(receiver.to_bits());
+    let code = masked_window_ta_kind(raw_addr, min_idx, max_idx_exclusive);
+    if typed_feedback_enabled() {
+        let (class_id, heap_type, aux, element_kind) = classify_array(raw_addr, None);
+        let observation = Observation {
+            source: ObservationSource::Array,
+            object_addr: 0,
+            shape_addr: 0,
+            key_hash: 0,
+            class_id,
+            heap_type,
+            aux,
+            value_tag: element_kind,
+        };
+        guard_observe(
+            site_id,
+            TypedFeedbackSiteKind::ArrayElement,
+            observation,
+            code != MASKED_WINDOW_TA_KIND_NONE,
+        );
+    }
+    code
 }
 
 fn packed_i32_array_loop_guard(arr: *const ArrayHeader) -> bool {
