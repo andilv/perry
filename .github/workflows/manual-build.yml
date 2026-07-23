@@ -126,18 +126,31 @@ jobs:
       - name: Build runtime
         if: steps.filter.outputs.run == 'true'
         run: |
-          cargo build --${{ github.event.inputs.profile }} --target ${{ steps.target.outputs.triple }} -p perry-runtime
-          cargo build --${{ github.event.inputs.profile }} --target ${{ steps.target.outputs.triple }} -p perry-stdlib
+          cargo build --${{ github.event.inputs.profile }} --target ${{ steps.target.outputs.triple }} -p perry-runtime -p perry-runtime-static
+          cargo build --${{ github.event.inputs.profile }} --target ${{ steps.target.outputs.triple }} -p perry-stdlib -p perry-stdlib-static
+
+      - name: Build native ext libraries (Unix)
+        if: steps.filter.outputs.run == 'true' && runner.os != 'Windows'
+        run: |
+          for d in crates/perry-ext-*; do
+            [ -d "$d" ] || continue
+            cargo build --${{ github.event.inputs.profile }} --target ${{ steps.target.outputs.triple }} -p "$(basename "$d")" || true
+          done
 
       - name: Package (Unix)
         if: steps.filter.outputs.run == 'true' && runner.os != 'Windows'
         run: |
           mkdir -p staging
           cp target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/perry staging/
-          for lib in libperry_runtime.a libperry_stdlib.a libperry_ui_macos.a libperry_ui_gtk4.a; do
-            if [ -f "target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/$lib" ]; then
+          for lib in libperry_runtime.a libperry_stdlib.a; do
+            cp "target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/$lib" staging/
+          done
+          for lib in target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/libperry_ext_*.a; do
+            [ -f "$lib" ] && cp "$lib" staging/
+          done
+          for lib in libperry_ui_macos.a libperry_ui_gtk4.a; do
+            [ -f "target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/$lib" ] && \
               cp "target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/$lib" staging/
-            fi
           done
           cd staging
           tar czf ../${{ matrix.artifact }}.tar.gz *
@@ -152,6 +165,9 @@ jobs:
           foreach ($lib in $libs) {
             $path = "target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/$lib"
             if (Test-Path $path) { Copy-Item $path staging/ }
+          }
+          Get-ChildItem "target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/perry_ext_*.lib" -ErrorAction SilentlyContinue | ForEach-Object {
+            Copy-Item $_.FullName staging/
           }
           Compress-Archive -Path staging/* -DestinationPath "${{ matrix.artifact }}.zip"
 
