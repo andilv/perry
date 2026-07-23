@@ -199,7 +199,7 @@ pub(crate) fn spawn_in_pty(req: &PtySpawnRequest) -> io::Result<PtyChild> {
             // Child. Async-signal-safe calls ONLY from here to execve.
             unsafe {
                 libc::setsid();
-                libc::ioctl(slave, libc::TIOCSCTTY as libc::c_ulong, 0);
+                libc::ioctl(slave, libc::TIOCSCTTY as libc::Ioctl, 0);
                 libc::dup2(slave, 0);
                 libc::dup2(slave, 1);
                 libc::dup2(slave, 2);
@@ -255,7 +255,7 @@ pub(crate) fn wait_child(pid: i32) -> (Option<i32>, Option<i32>) {
 /// foreground process group.
 pub(crate) fn resize_pty(master: RawFd, cols: u16, rows: u16) -> bool {
     let ws = winsize(cols, rows);
-    unsafe { libc::ioctl(master, libc::TIOCSWINSZ as libc::c_ulong, &ws) == 0 }
+    unsafe { libc::ioctl(master, libc::TIOCSWINSZ as libc::Ioctl, &ws) == 0 }
 }
 
 /// `kill(2)` — deliver `signo` to `pid`.
