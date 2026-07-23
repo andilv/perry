@@ -182,7 +182,15 @@ impl Observation {
     }
 
     fn roots_shape_addr(&self) -> bool {
-        self.is_shape_keyed() && self.shape_addr != 0
+        // #6804: an id token is NOT a heap address — visiting it would let
+        // the GC mark garbage or, worse, rewrite the token if a moved
+        // object's from-space address numerically collided with the id
+        // range. Address tokens (class instances' keys arrays) keep the
+        // visit; a skipped low-address token can only go stale, which the
+        // equality-only usage reads as a benign mismatch.
+        self.is_shape_keyed()
+            && self.shape_addr != 0
+            && !crate::object::shapes::is_shape_id_token(self.shape_addr)
     }
 
     // #854: in-progress typed-feedback shape-change tracking
@@ -720,16 +728,56 @@ fn object_shape(addr: usize) -> (usize, u32, u16) {
             return (0, 0, gc_type);
         }
         let class_id = (*ptr).class_id;
-        // #6759 C3b note: this token is equality-compared only, and the
-        // header-stamped stable shape id (C3c-r) would be a stabler token —
-        // but LAZY stamping means early observations of a shape use the
-        // keys address while later ones would use the id, splitting one
-        // logical shape into two tokens per site (spurious polymorphism).
-        // Switching this token to ids requires EAGER stamping at
-        // allocation (the codegen-assisted remainder of C3c).
-        let shape = (*ptr).keys_array as usize;
+        // #6804: plain objects canonicalize the token on the stable
+        // ShapeId. Shape-cached literals are stamped at birth; anything
+        // else is stamped HERE on first observation (self-healing), so one
+        // logical shape can never split into a pre-stamp address token and
+        // a post-stamp id token within a site. Class instances keep the
+        // keys-address token (their `parent_class_id` is inheritance data).
+        let shape = if class_id == 0 {
+            let stamp = (*ptr).parent_class_id;
+            if crate::object::shapes::is_shape_id(stamp) {
+                stamp as usize
+            } else if crate::regex::regex_header_has_magic(
+                addr as *const crate::regex::RegExpHeader,
+            ) {
+                // RegExpHeader aliases GC_TYPE_OBJECT with a different
+                // layout — never write through the ObjectHeader view; keep
+                // the legacy (equality-only) address token.
+                (*ptr).keys_array as usize
+            } else {
+                let keys = (*ptr).keys_array;
+                if let Some(keys_header) =
+                    crate::value::addr_class::try_read_gc_header(keys as usize)
+                {
+                    if keys_header.obj_type == crate::gc::GC_TYPE_ARRAY
+                        || keys_header.obj_type == crate::gc::GC_TYPE_LAZY_ARRAY
+                    {
+                        let id =
+                            crate::object::shapes::shape_id_for_keys_ensure(keys, (*keys).length);
+                        if id != 0 {
+                            (*(ptr as *mut ObjectHeader)).parent_class_id = id;
+                            id as usize
+                        } else {
+                            keys as usize
+                        }
+                    } else {
+                        keys as usize
+                    }
+                } else {
+                    keys as usize
+                }
+            }
+        } else {
+            (*ptr).keys_array as usize
+        };
         (shape, class_id, gc_type)
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_object_shape_token(addr: usize) -> usize {
+    object_shape(addr).0
 }
 
 fn observe(site_id: u64, fallback_kind: TypedFeedbackSiteKind, observation: Observation) {
@@ -853,6 +901,9 @@ fn observe_property(
     obj_bits: u64,
     key: *const crate::StringHeader,
 ) {
+    if site_id == 0 || !typed_feedback_enabled() {
+        return;
+    }
     let object_addr = normalize_raw_object_addr(obj_bits);
     let (shape_addr, class_id, gc_type) = object_shape(object_addr);
     observe(
@@ -957,6 +1008,12 @@ pub extern "C" fn js_typed_feedback_object_set_field_by_name_fast(
     key: *const crate::StringHeader,
     value: f64,
 ) {
+    if !typed_feedback_enabled() {
+        if crate::object::js_object_set_field_by_name_transition_fast(obj, key, value) == 0 {
+            crate::object::js_object_set_field_by_name(obj, key, value);
+        }
+        return;
+    }
     let object_addr = normalize_raw_object_addr(obj as u64);
     let (shape_addr, class_id, gc_type) = object_shape(object_addr);
     let handled = crate::object::js_object_set_field_by_name_transition_fast(obj, key, value) != 0;
@@ -1150,8 +1207,25 @@ fn plain_array_index_guard(arr: *const ArrayHeader, index: u32, require_in_bound
 }
 
 fn numeric_array_index_guard(arr: *const ArrayHeader, index: u32, require_in_bounds: bool) -> bool {
-    plain_array_index_guard(arr, index, require_in_bounds)
-        && crate::array::js_array_is_numeric_f64_layout(arr) != 0
+    if !plain_array_index_guard(arr, index, require_in_bounds) {
+        return false;
+    }
+    let raw_addr = normalize_raw_object_addr(arr as u64);
+    let Some(header) = gc_header_for_user_addr(raw_addr) else {
+        return false;
+    };
+    // Numeric arrays produced by literals/push already carry the raw-layout
+    // bit. Read it from the header that the plain-array guard just validated
+    // instead of entering `js_array_is_numeric_f64_layout`, which cleans the
+    // pointer and re-reads the header on every element access. Preserve the
+    // slower verify/rewrite path for arrays not marked yet.
+    unsafe {
+        if (*header)._reserved & crate::gc::GC_ARRAY_RAW_F64_LAYOUT != 0 {
+            true
+        } else {
+            crate::array::js_array_is_numeric_f64_layout(raw_addr as *const ArrayHeader) != 0
+        }
+    }
 }
 
 fn plain_array_index_set_guard(
@@ -1186,8 +1260,20 @@ fn numeric_array_index_set_guard(
     index: u32,
     require_in_bounds: bool,
 ) -> bool {
-    plain_array_index_set_guard(arr, index, require_in_bounds)
-        && crate::array::js_array_is_numeric_f64_layout(arr) != 0
+    if !plain_array_index_set_guard(arr, index, require_in_bounds) {
+        return false;
+    }
+    let raw_addr = normalize_raw_object_addr(arr as u64);
+    let Some(header) = gc_header_for_user_addr(raw_addr) else {
+        return false;
+    };
+    unsafe {
+        if (*header)._reserved & crate::gc::GC_ARRAY_RAW_F64_LAYOUT != 0 {
+            true
+        } else {
+            crate::array::js_array_is_numeric_f64_layout(raw_addr as *const ArrayHeader) != 0
+        }
+    }
 }
 
 fn packed_f64_array_loop_guard(arr: *const ArrayHeader) -> bool {
@@ -1573,7 +1659,10 @@ fn object_key_matches_field(
             return false;
         }
         let keys = (*obj).keys_array;
-        if keys.is_null() || (keys as usize) != shape_addr {
+        // #6804: `shape_addr` is an opaque TOKEN (a stable ShapeId for
+        // stamped plain objects), not necessarily the keys address — the
+        // actual contract is carried by the key/slot validation below.
+        if keys.is_null() {
             return false;
         }
         if !plain_array_index_guard(keys, field_index, true) {

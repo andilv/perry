@@ -147,6 +147,16 @@ pub(crate) fn class_field_inline_guard_enabled() -> bool {
 #[cfg(test)]
 pub(crate) fn test_reset_class_field_inline_guard() {
     PERRY_CLASS_FIELD_INLINE_GUARD_DISABLED.store(0, Ordering::Relaxed);
+    // Also clear the C5a per-key vetting sets (production-monotonic, so
+    // without this a key name reused across tests in one process would
+    // inherit an earlier test's declared-field / installed-key state and
+    // make the disable decision order-dependent (CodeRabbit on #6802).
+    if let Ok(mut guard) = DECLARED_FIELD_NAME_HASHES.write() {
+        guard.take();
+    }
+    if let Ok(mut guard) = PROTO_DESCRIPTOR_KEY_HASHES.write() {
+        guard.take();
+    }
 }
 
 /// #5654: flip the process-wide inline gate only when the descriptor target can
@@ -855,8 +865,9 @@ pub(crate) fn clear_accessor_descriptor(obj: usize, key: &str) {
 ///
 /// `Object.getOwnPropertyDescriptor` reads `ACCESSOR_DESCRIPTORS` and
 /// `PROPERTY_DESCRIPTORS` *unconditionally*, so the descriptor is fully
-/// reflectable — but the hot object get/set paths (which only consult the
-/// side tables once a gate has flipped) keep skipping the HashMap lookup.
+/// reflectable. The owning object's `OBJ_FLAG_HAS_DESCRIPTORS` bit lets direct
+/// reads/writes consult the side tables without flipping a process-wide gate;
+/// unrelated objects keep skipping the HashMap lookup.
 /// This matters because built-in prototype accessors such as
 /// `%TypedArray%.prototype.length` are installed lazily at globalThis
 /// init for *every* program that merely touches a builtin global; flipping
@@ -870,6 +881,7 @@ pub(crate) fn set_builtin_accessor_descriptor(
     attrs: PropertyAttrs,
 ) {
     super::prop_plan::prop_plan_epoch_bump();
+    note_descriptor_target(obj);
     note_accessor_descriptor_key(&key);
     // #6759 Phase C2: the meta summary must over-approximate the tables
     // even for gate-neutral builtin installs — the (unconditionally
