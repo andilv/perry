@@ -408,8 +408,8 @@ fn for_each_expr_in_stmt(stmt: &Stmt, f: &mut dyn FnMut(&Expr)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use perry_hir::types::Type;
     use perry_hir::{ClassField, Function};
-    use perry_types::Type;
 
     const RECEIVER: u32 = 1;
 
@@ -465,6 +465,7 @@ mod tests {
             decorators: Vec::new(),
             is_exported: false,
             is_nested: false,
+            alloc_width_hint: 0,
             aliases: Vec::new(),
         }
     }

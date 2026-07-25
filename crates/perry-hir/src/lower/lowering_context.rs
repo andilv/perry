@@ -6,7 +6,7 @@
 //! field visibility stays `pub(crate)`; downstream code keeps reaching
 //! the struct via `crate::lower::LoweringContext`.
 
-use perry_types::{FuncId, GlobalId, LocalId, Type, TypeParam};
+use crate::types::{FuncId, GlobalId, LocalId, Type, TypeParam};
 use std::collections::{HashMap, HashSet};
 
 use crate::ir::*;
@@ -178,7 +178,7 @@ pub struct LoweringContext {
     /// lowers to `Array<Object{fields}>` instead of `Array<Named("Item")>`.
     /// Without this, codegen sees only `Named` and can't extract the
     /// shape, so the specialized parse path never fires.
-    pub(crate) interface_object_types: std::collections::HashMap<String, perry_types::ObjectType>,
+    pub(crate) interface_object_types: std::collections::HashMap<String, crate::types::ObjectType>,
     /// Imported functions: local_name -> original_name (the exported name in the source module)
     pub(crate) imported_functions: Vec<(String, String)>,
     /// Built-in named imports: local_name -> (module_name, exported_name).
@@ -291,6 +291,11 @@ pub struct LoweringContext {
     pub(crate) extern_func_types: Vec<(String, Vec<Type>, Type)>,
     /// Source file path (for import.meta.url)
     pub(crate) source_file_path: String,
+    /// #6812 (w16): span.lo of empty object literals whose builder width the
+    /// pre-lowering scan proved (`builder_fold::empty_builder_width_hints`)
+    /// → final width. Consumed by `lower_object`'s empty-literal branch to
+    /// set `Class::alloc_width_hint` on the per-site anon-shape class.
+    pub(crate) empty_site_width_hints: std::collections::HashMap<u32, u32>,
     /// Variables that hold closures or other values needing cross-module export globals
     /// (arrow functions, object literals, call expressions, arrays, new expressions)
     // #854: initialized in `new` but not yet read on this lowering path.
@@ -648,7 +653,7 @@ pub struct LoweringContext {
     /// `FuncId` of the synthesized top-level generator function that
     /// takes `this` as its first parameter. Consumed by `for...of` to
     /// dispatch through the iterator protocol via a direct FuncRef call.
-    pub(crate) iterator_func_for_class: std::collections::HashMap<String, perry_types::FuncId>,
+    pub(crate) iterator_func_for_class: std::collections::HashMap<String, crate::types::FuncId>,
     pub(crate) proxy_locals: HashSet<String>,
     /// #3144: local name -> builtin prototype method name, for bindings like
     /// `const m = [].map` / `const s = "".slice`. Lets the `.call`/`.apply`

@@ -4,7 +4,7 @@
 //! visibility and are re-exported from `lower/mod.rs` so the existing
 //! `expr_*` submodules and the rest of the crate keep compiling unchanged.
 
-use perry_types::{FuncId, LocalId, Type, TypeParam};
+use crate::types::{FuncId, LocalId, Type, TypeParam};
 use std::collections::{HashMap, HashSet};
 
 use super::*;
@@ -80,6 +80,7 @@ impl LoweringContext {
             object_super_home_stack: Vec::new(),
             extern_func_types: Vec::new(),
             source_file_path,
+            empty_site_width_hints: std::collections::HashMap::new(),
             exportable_object_vars: HashSet::new(),
             pending_functions: Vec::new(),
             closure_display_names: HashMap::new(),
@@ -214,7 +215,7 @@ impl LoweringContext {
         // Constraint table mirrors the same scope so `is_type_param(name)`
         // and `resolve_type_param_constraint(name)` agree on visibility.
         // Only params with a declared upper bound contribute an entry.
-        let constraints: HashMap<String, perry_types::Type> = type_params
+        let constraints: HashMap<String, crate::types::Type> = type_params
             .iter()
             .filter_map(|p| {
                 p.constraint
@@ -248,7 +249,7 @@ impl LoweringContext {
     /// the chance to substitute a concrete type).
     ///
     /// Innermost scope wins (shadowing).
-    pub(crate) fn resolve_type_param_constraint(&self, name: &str) -> Option<perry_types::Type> {
+    pub(crate) fn resolve_type_param_constraint(&self, name: &str) -> Option<crate::types::Type> {
         for scope in self.type_param_constraints.iter().rev() {
             if let Some(ty) = scope.get(name) {
                 // Only return constraints whose runtime shape is
@@ -261,11 +262,11 @@ impl LoweringContext {
                 // instance tagging / class-id propagation still work.
                 let useful = matches!(
                     ty,
-                    perry_types::Type::String
-                        | perry_types::Type::Number
-                        | perry_types::Type::Boolean
-                        | perry_types::Type::BigInt
-                        | perry_types::Type::Array(_)
+                    crate::types::Type::String
+                        | crate::types::Type::Number
+                        | crate::types::Type::Boolean
+                        | crate::types::Type::BigInt
+                        | crate::types::Type::Array(_)
                 );
                 if useful {
                     return Some(ty.clone());
@@ -281,7 +282,7 @@ impl LoweringContext {
     /// This is used during type extraction to resolve type aliases like
     /// `type BlockTag = 'latest' | number | string` so the compiler sees
     /// the underlying Union type instead of Named("BlockTag").
-    pub(crate) fn resolve_type_alias(&self, name: &str) -> Option<perry_types::Type> {
+    pub(crate) fn resolve_type_alias(&self, name: &str) -> Option<crate::types::Type> {
         self.type_aliases
             .iter()
             .find(|(alias_name, _, type_params, _)| alias_name == name && type_params.is_empty())
@@ -944,7 +945,38 @@ impl LoweringContext {
             shape_key.push_str(tag(ty));
             shape_key.push(',');
         }
+        self.mint_anon_shape_class(shape_key, field_shapes, 0)
+    }
 
+    /// #6812 (w16): mint a UNIQUE per-source-site 0-field anon-shape class
+    /// for an EMPTY object literal (`{}`). Unlike
+    /// [`Self::synthesize_anon_shape_class`], the dedup key is the SITE
+    /// (source path + byte offset), not the field shape — every `{}`
+    /// occurrence gets its own class_id. That gives builder-pattern objects
+    /// a learnable identity: the runtime's learned inline sizing
+    /// (`note_learned_inline_fields` / `learned_inline_field_count`, keyed
+    /// by class_id) can attribute overflow growth to this site and
+    /// right-size later allocations so all fields land inline, and the
+    /// static-key write PIC's `class_id != 0` gate admits the objects. An
+    /// empty literal that never grows allocates exactly as before (learned
+    /// width 0 keeps the INLINE_SLOT_FLOOR minimum).
+    /// `width_hint` (#6812 w16): compile-time proven builder width — see
+    /// [`crate::Class::alloc_width_hint`]. 0 = rely on runtime learning only.
+    pub(crate) fn synthesize_empty_site_class(
+        &mut self,
+        byte_offset: u32,
+        width_hint: u32,
+    ) -> String {
+        let site_key = format!("@empty-site:{}:{}", self.source_file_path, byte_offset);
+        self.mint_anon_shape_class(site_key, &[], width_hint)
+    }
+
+    fn mint_anon_shape_class(
+        &mut self,
+        shape_key: String,
+        field_shapes: &[(String, Type)],
+        alloc_width_hint: u32,
+    ) -> String {
         // Field names in source order, so a call-site can recover a config
         // object's keys after the literal is lowered to `New { class_name }`.
         let field_names: Vec<String> = field_shapes.iter().map(|(name, _)| name.clone()).collect();
@@ -1067,6 +1099,7 @@ impl LoweringContext {
             // Synthetic anon-shape class; no static fields, so static-init
             // timing is irrelevant.
             is_nested: false,
+            alloc_width_hint,
         });
 
         self.anon_shape_classes

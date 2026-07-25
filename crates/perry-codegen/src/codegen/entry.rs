@@ -664,7 +664,7 @@ pub(super) fn compile_module_entry(
             &cross_module.compile_time_constants,
             &cross_module.module_dispatch,
         );
-        let mut init_local_types: HashMap<u32, perry_types::Type> = HashMap::new();
+        let mut init_local_types: HashMap<u32, perry_hir::types::Type> = HashMap::new();
         crate::boxed_vars::collect_let_types_in_stmts(&hir.init, &mut init_local_types);
         let mut ctx = FnCtx {
             func: main,
@@ -675,6 +675,8 @@ pub(super) fn compile_module_entry(
             native_facts: &main_native_facts,
             locals: HashMap::new(),
             local_types: init_local_types,
+            const_string_locals: HashMap::new(),
+            const_number_locals: HashMap::new(),
             current_block: 0,
             discard_expr_value: false,
             func_names,
@@ -1109,7 +1111,7 @@ pub(super) fn compile_module_entry(
         }
         for ic_name in &ic_globals {
             llmod.add_raw_global(format!(
-                "@{} = private global [2 x i64] zeroinitializer",
+                "@{} = private global [8 x i64] zeroinitializer",
                 ic_name
             ));
         }
@@ -1276,6 +1278,8 @@ pub(super) fn compile_module_entry(
             native_facts: &init_native_facts,
             locals: HashMap::new(),
             local_types: HashMap::new(),
+            const_string_locals: HashMap::new(),
+            const_number_locals: HashMap::new(),
             current_block: 0,
             discard_expr_value: false,
             func_names,
@@ -1506,7 +1510,7 @@ pub(super) fn compile_module_entry(
         // three symbols must be defined exactly once per shared library.
         for ic_name in &ic_globals {
             llmod.add_raw_global(format!(
-                "@{} = private global [2 x i64] zeroinitializer",
+                "@{} = private global [8 x i64] zeroinitializer",
                 ic_name
             ));
         }
