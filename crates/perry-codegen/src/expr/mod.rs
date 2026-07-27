@@ -45,6 +45,7 @@ mod object_literal;
 mod pod_layout_constants;
 mod pod_record;
 mod property_get_names;
+mod proven_view_access;
 mod range_facts;
 mod strings;
 mod typed_feedback;
@@ -55,9 +56,9 @@ mod write_barrier;
 pub(crate) use crate::native_value::{materialize_js_value, materialize_js_value_without_record};
 pub(crate) use array_literal::lower_array_literal;
 pub(crate) use buffer_access::{
-    access_facts_for_spec, emit_buffer_access_pointer, lower_buffer_access_proof,
-    lower_buffer_load, lower_buffer_store, lower_typed_array_load, lower_typed_array_store,
-    BufferAccessSpec,
+    access_facts_for_spec, can_lower_integer_typed_array_store_value, emit_buffer_access_pointer,
+    lower_buffer_access_proof, lower_buffer_load, lower_buffer_store, lower_typed_array_load,
+    lower_typed_array_store, BufferAccessSpec,
 };
 pub(crate) use buffer_views::{
     alias_buffer_view_slot, attach_native_owned_view_fact, buffer_access_materialization_reason,
@@ -77,9 +78,10 @@ pub(crate) use helpers::{
     unbox_to_i64,
 };
 pub(crate) use i32_fast_path::{
-    can_lower_expr_as_i32, can_lower_expr_as_i32_in_current_region, is_known_finite,
-    lower_expr_as_i32, lower_expr_native, lower_packed_u32_loop_index_get, try_flat_const_2d_int,
-    try_lower_flat_const_index_get,
+    can_lower_expr_as_i32, can_lower_expr_as_i32_in_current_region,
+    imul_operand_i32_lowerable_in_current_region, is_known_finite, lower_expr_as_i32,
+    lower_expr_native, lower_imul_operand_i32, lower_packed_u32_loop_index_get,
+    try_flat_const_2d_int, try_lower_flat_const_index_get,
 };
 pub(crate) use index::lower_index_set_fast;
 pub(crate) use nanbox_inline::{
@@ -91,6 +93,10 @@ pub(crate) use object_literal::lower_object_literal;
 pub(crate) use pod_record::{
     lower_and_store_initial_pod_field, lower_pod_local_reassignment, materialize_pod_local,
     try_lower_pod_field_get, try_lower_pod_field_set,
+};
+pub(crate) use proven_view_access::{
+    index_is_exact_i32_shape, local_is_proven_int_store_view,
+    try_lower_proven_view_checked_f64_load, try_lower_proven_view_checked_store,
 };
 pub(crate) use range_facts::{
     bounds_for_buffer_access_width, effective_alias_state_for_access,
@@ -125,6 +131,12 @@ pub(crate) use write_barrier::{
 mod dispatch;
 mod record_value;
 mod shadow_slot;
+mod slot_rep;
+pub(crate) use slot_rep::{
+    canonical_i32_locals_enabled, canonical_local_i32_slot, collect_closure_referenced_locals,
+    load_canonical_local_boxed, note_canonical_i32_local, store_canonical_local_from_double,
+    SlotRep,
+};
 
 pub(crate) use dispatch::{lower_expr, lower_math_operand};
 pub(crate) use shadow_slot::{
@@ -598,6 +610,17 @@ pub(crate) struct FnCtx<'a> {
     /// values above INT32_MAX remain observable as unsigned numbers.
     pub unsigned_i32_locals: &'a std::collections::HashSet<u32>,
 
+    /// LocalIds whose runtime value provably can never be a BigInt: every
+    /// assignment to the local is a non-BigInt expression (an `Int32Array`
+    /// element, a bitwise result, a comparison, …). Computed once per region by
+    /// `collect_not_bigint_locals`. Consumed by `is_provably_not_bigint` to
+    /// authorize the inline non-BigInt bitwise fast path for `Any`-typed
+    /// accumulators (bcryptjs's Feistel `l`/`r`) that `is_numeric_expr` can't
+    /// prove numeric. Never treat this as "finite" — an out-of-bounds
+    /// typed-array read is `undefined`/NaN (still non-BigInt), so the bitwise
+    /// lowering keeps the NaN-safe guarded `toint32_wrap` for these.
+    pub not_bigint_locals: &'a std::collections::HashSet<u32>,
+
     /// Gen-GC Phase A sub-phase 3a: pointer-typed local → shadow-
     /// frame slot index. Empty when `PERRY_SHADOW_STACK` is off.
     /// Sub-phase 3b uses this map at `Stmt::Let` / `LocalSet`
@@ -615,6 +638,13 @@ pub(crate) struct FnCtx<'a> {
     /// cleared after lowering that statement. Built once per user function
     /// from HIR local-reference last-use information.
     pub shadow_slot_clears_after_stmt: std::collections::HashMap<usize, Vec<u32>>,
+    /// Slot indices that have had at least one `js_shadow_slot_bind` (or
+    /// value-set) emitted so far. Slots start zeroed and are only ever
+    /// written through the bind/set helpers, so a scheduled CLEAR of a
+    /// never-bound slot is a provable no-op (`js_shadow_slot_set(idx, 0)` on
+    /// a slot that already holds 0) — `emit_shadow_slot_clear` skips it.
+    /// Seeded at construction with the entry-bound parameter slots.
+    pub shadow_slots_bound: std::collections::HashSet<u32>,
 
     /// Cached pointer to this function's `InlineArenaState` slot —
     /// allocated lazily on the first `new ClassName()` site that uses
@@ -682,6 +712,17 @@ pub(crate) struct FnCtx<'a> {
     /// until the refinement is dropped (`expr::shadow_slot`).
     pub masked_region_scalar_locals: std::collections::HashSet<u32>,
 
+    /// #6794 follow-up (b): shadow slots that a masked-window region fast copy
+    /// has already cleared to 0 for a currently-suppressed local. Because
+    /// `emit_shadow_slot_update_for_expr` skips every write to a local in
+    /// `masked_region_scalar_locals`, such a slot provably stays 0 for the rest
+    /// of the suppression window — so every later per-statement clear of it (the
+    /// `_tlv_get_addr`-heavy `js_shadow_slot_set(slot, 0)` that dominated
+    /// bcryptjs `_encipher` profiles) is a redundant no-op. `emit_shadow_slot_clear`
+    /// skips slots in this set; entries are added right after the first clear and
+    /// removed the moment the local leaves `masked_region_scalar_locals`.
+    pub suppressed_cleared_shadow_slots: std::collections::HashSet<u32>,
+
     /// #5093: scoped loop-versioning facts for monomorphic class-field loops.
     /// Pushed only around the FAST clone of `lower_class_field_versioned_for`
     /// (`stmt/loops.rs`): the loop preheader already proved the receiver's
@@ -708,6 +749,48 @@ pub(crate) struct FnCtx<'a> {
     /// on hot array-walking loops like `for (let i = 0; i < arr.length;
     /// i++) arr[i] = expr`.
     pub i32_counter_slots: std::collections::HashMap<u32, String>,
+
+    /// Representation-selection Phase 1 (RFC `docs/representation-selection-
+    /// rfc.md`): LocalId → selected slot representation. Absent = `Boxed`
+    /// (double slot in `ctx.locals`, exactly the pre-phase behavior). An
+    /// `I32`/`U32` entry means the i32 alloca registered in
+    /// `ctx.i32_counter_slots` is the CANONICAL AND ONLY storage for the
+    /// local: there is no double slot, no dual writes, and no shadow-stack GC
+    /// binding — a boxed double is materialized (`sitofp`/`uitofp`) only at
+    /// genuinely-boxed use sites. See `expr/slot_rep.rs` for the mechanism,
+    /// eligibility, and the range-soundness audit.
+    pub local_slot_reps: std::collections::HashMap<u32, SlotRep>,
+
+    /// Whether this function context permits canonical-i32 storage selection.
+    /// False for async / generator / `was_plain_async` bodies (the async-to-
+    /// generator transform boxes body locals into shared cells) and for module
+    /// init. Checked at the `Stmt::Let` eligibility site together with the
+    /// `PERRY_CANONICAL_I32_LOCALS` env gate.
+    pub repsel_context_allows_canonical_i32: bool,
+
+    /// Locals referenced anywhere inside a nested closure body (including
+    /// explicit capture lists). Excluded from canonical-i32 selection — the
+    /// capture machinery stays on the boxed protocol. Empty when
+    /// `repsel_context_allows_canonical_i32` is false.
+    pub repsel_closure_ref_locals: std::collections::HashSet<u32>,
+
+    /// Representation-selection Phase 2 (`codegen/spec_abi.rs`): FuncId →
+    /// specialization plan for functions that have an emitted specialized
+    /// entry in this module. Direct `FuncRef` call sites consult this to
+    /// dispatch statically-proven sites to the raw-ABI symbol.
+    pub spec_abi_functions: &'a std::collections::HashMap<u32, crate::codegen::SpecFnPlan>,
+
+    /// Phase 2 pre-pass output (`collectors/spec_abi_sites.rs`): LocalIds
+    /// proven to permanently hold one specific non-view typed array. A call
+    /// arg `LocalGet(id)` matches a `TaPtr` slot only when `id` is here AND in
+    /// `spec_ta_ready` (its binding statement already lowered at top level).
+    pub spec_ta_bindings: &'a std::collections::HashMap<u32, crate::collectors::SpecTaBinding>,
+
+    /// Dominance mirror for `spec_ta_bindings`: ids whose top-level binding
+    /// `Stmt::Let` has been lowered in THIS body (inserted by
+    /// `stmt::lower_top_level_stmts`). A proven binding is only usable at call
+    /// sites it dominates; closure bodies get their own (empty) set.
+    pub spec_ta_ready: std::collections::HashSet<u32>,
 
     /// Parallel `i1` slots for ordinary boolean locals that have stayed inside
     /// the representation-first subset. The generic `double` slot remains as a
@@ -1380,6 +1463,7 @@ mod env_clones;
 mod fs_await;
 mod index_get;
 mod masked_window;
+mod ta_param_f64_read;
 pub(crate) use index_get::packed_f64_loop_index_parts;
 pub(crate) use masked_window::masked_window_fact_for_index;
 mod index_set;

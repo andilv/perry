@@ -376,6 +376,17 @@ pub(super) fn compile_method(
         &cross_module.module_dispatch,
     );
 
+    // Representation-selection Phase 1 context gate (see codegen/function.rs).
+    let repsel_allows = crate::expr::canonical_i32_locals_enabled()
+        && !method.is_async
+        && !method.is_generator
+        && !method.was_plain_async;
+    let repsel_closure_refs = if repsel_allows {
+        crate::expr::collect_closure_referenced_locals(&method.body)
+    } else {
+        std::collections::HashSet::new()
+    };
+
     let mut ctx = FnCtx {
         func: lf,
         module_slug: crate::expr::native_region_slug(strings.module_prefix()),
@@ -460,7 +471,11 @@ pub(super) fn compile_method(
         try_depth: 0,
         pending_declares: Vec::new(),
         integer_locals: native_facts.integer_locals(),
+        not_bigint_locals: native_facts.not_bigint_locals(),
         unsigned_i32_locals: native_facts.unsigned_i32_locals(),
+        // Conservative: treat every slot as possibly-bound (param binds are
+        // emitted before FnCtx exists here), so clears never get skipped.
+        shadow_slots_bound: shadow_slot_map.values().copied().collect(),
         shadow_slot_map,
         persistent_shadow_slots: std::collections::HashSet::new(),
         shadow_slot_clears_after_stmt,
@@ -471,8 +486,15 @@ pub(super) fn compile_method(
         packed_f64_loop_facts: Vec::new(),
         masked_window_array_facts: Vec::new(),
         masked_region_scalar_locals: std::collections::HashSet::new(),
+        suppressed_cleared_shadow_slots: std::collections::HashSet::new(),
         class_field_loop_facts: Vec::new(),
         i32_counter_slots: HashMap::new(),
+        local_slot_reps: HashMap::new(),
+        repsel_context_allows_canonical_i32: repsel_allows,
+        repsel_closure_ref_locals: repsel_closure_refs,
+        spec_abi_functions: &cross_module.spec_abi_functions,
+        spec_ta_bindings: &cross_module.spec_ta_bindings,
+        spec_ta_ready: std::collections::HashSet::new(),
         i1_local_slots: HashMap::new(),
         index_used_locals: native_facts.index_used_locals(),
         strictly_i32_bounded_locals: native_facts.strictly_i32_bounded_locals(),
@@ -1373,6 +1395,17 @@ pub(super) fn compile_static_method(
         &cross_module.module_dispatch,
     );
 
+    // Representation-selection Phase 1 context gate (see codegen/function.rs).
+    let repsel_allows = crate::expr::canonical_i32_locals_enabled()
+        && !f.is_async
+        && !f.is_generator
+        && !f.was_plain_async;
+    let repsel_closure_refs = if repsel_allows {
+        crate::expr::collect_closure_referenced_locals(&f.body)
+    } else {
+        std::collections::HashSet::new()
+    };
+
     let mut ctx = FnCtx {
         func: lf,
         module_slug: crate::expr::native_region_slug(strings.module_prefix()),
@@ -1461,7 +1494,11 @@ pub(super) fn compile_static_method(
         try_depth: 0,
         pending_declares: Vec::new(),
         integer_locals: native_facts.integer_locals(),
+        not_bigint_locals: native_facts.not_bigint_locals(),
         unsigned_i32_locals: native_facts.unsigned_i32_locals(),
+        // Conservative: treat every slot as possibly-bound (param binds are
+        // emitted before FnCtx exists here), so clears never get skipped.
+        shadow_slots_bound: shadow_slot_map.values().copied().collect(),
         shadow_slot_map,
         persistent_shadow_slots: std::collections::HashSet::new(),
         shadow_slot_clears_after_stmt,
@@ -1472,8 +1509,15 @@ pub(super) fn compile_static_method(
         packed_f64_loop_facts: Vec::new(),
         masked_window_array_facts: Vec::new(),
         masked_region_scalar_locals: std::collections::HashSet::new(),
+        suppressed_cleared_shadow_slots: std::collections::HashSet::new(),
         class_field_loop_facts: Vec::new(),
         i32_counter_slots: HashMap::new(),
+        local_slot_reps: HashMap::new(),
+        repsel_context_allows_canonical_i32: repsel_allows,
+        repsel_closure_ref_locals: repsel_closure_refs,
+        spec_abi_functions: &cross_module.spec_abi_functions,
+        spec_ta_bindings: &cross_module.spec_ta_bindings,
+        spec_ta_ready: std::collections::HashSet::new(),
         i1_local_slots: HashMap::new(),
         index_used_locals: native_facts.index_used_locals(),
         strictly_i32_bounded_locals: native_facts.strictly_i32_bounded_locals(),

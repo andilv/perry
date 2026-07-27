@@ -126,6 +126,13 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("llvm.bswap.i16", I16, &[I16]);
     module.declare_function("llvm.bswap.i32", I32, &[I32]);
     module.declare_function("llvm.bswap.i64", I64, &[I64]);
+    // ARMv8.3 FEAT_JSCVT: spec-exact single-instruction ECMAScript ToInt32,
+    // emitted by `LlBlock::toint32_wrap` on apple-arm64 targets only (the
+    // declare is target-conditional — an aarch64 intrinsic in an x86 module
+    // would be rejected by the backend).
+    if crate::codegen::helpers::jscvt_enabled() {
+        module.declare_function("llvm.aarch64.fjcvtzs", I32, &[DOUBLE]);
+    }
     module.declare_function("llvm.memset.p0.i64", VOID, &[PTR, I8, I64, I1]);
     module.declare_function("llvm.memmove.p0.p0.i64", VOID, &[PTR, PTR, I64, I1]);
     // Keep js_math_pow for now — Math.pow has overflow / NaN
@@ -630,6 +637,10 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // #3987: `s[key]` canonical-index read — returns the char (NaN-boxed string)
     // for a valid array index, else NaN-boxed `undefined`. Takes the raw key.
     module.declare_function("js_string_index_get", DOUBLE, &[I64, DOUBLE]);
+    // SSO-safe variant: takes the receiver NaN-boxed so an inline
+    // SHORT_STRING_TAG value is decoded by tag instead of being mask-cast into
+    // a bogus pointer (which segfaulted on `(a + b)[0]`).
+    module.declare_function("js_string_index_get_boxed", DOUBLE, &[DOUBLE, DOUBLE]);
     // #2787: NaN-safe JS index coercion (undefined/NaN -> 0, trunc, clamp) for
     // the char-access methods, replacing a raw `fptosi` that is UB on a NaN.
     module.declare_function("js_string_index_to_i32", I32, &[DOUBLE]);
