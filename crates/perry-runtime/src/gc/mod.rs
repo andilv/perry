@@ -50,6 +50,11 @@ mod malloc;
 pub use malloc::*;
 mod roots;
 pub use roots::*;
+// The one decoder shared by the mark, rewrite and incremental-barrier paths
+// for words that may hold a heap reference (#6910). Declared before its
+// consumers for readability only — Rust module order is irrelevant.
+mod root_words;
+use root_words::*;
 mod layout;
 pub use layout::*;
 mod trace;
@@ -566,7 +571,11 @@ pub extern "C" fn js_gc_init() {
     // mapped before this call (early Rust startup) keep tag 100; the bulk
     // of the heap (arena blocks, GC metadata) maps afterwards. Idempotent,
     // like the rest of this function.
-    #[cfg(all(target_pointer_width = "64", target_vendor = "apple"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        target_vendor = "apple",
+        feature = "alloc-mimalloc"
+    ))]
     if std::env::var_os("MIMALLOC_OS_TAG").is_none() {
         unsafe { libmimalloc_sys::mi_option_set(libmimalloc_sys::mi_option_os_tag, 240) };
     }

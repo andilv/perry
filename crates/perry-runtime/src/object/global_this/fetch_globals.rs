@@ -43,9 +43,9 @@ pub extern "C" fn js_module_top_this() -> f64 {
 
 /// Keepalive anchor: `js_module_top_this` is referenced only from
 /// codegen-generated `.o` files, so the auto-optimize whole-program LLVM
-/// rebuild would dead-strip it without this `#[used]` pin (see
+/// rebuild would dead-strip it without this `#[cfg_attr(feature = "keepalive-anchors", used)]` pin (see
 /// project_auto_optimize_keepalive_3320).
-#[used]
+#[cfg_attr(feature = "keepalive-anchors", used)]
 static KEEP_JS_MODULE_TOP_THIS: extern "C" fn() -> f64 = js_module_top_this;
 
 /// Issue #611: lazily allocate `globalThis` for computed global access.
@@ -74,8 +74,9 @@ pub extern "C" fn js_get_global_this() -> f64 {
     // already been rekeyed to the moved copy — the reads return `undefined`.
     // Register the cache slot as a mutable global root (mirroring
     // `js_module_top_this`) so the collector rewrites it to the forwarding
-    // address on every move; raw-pointer slots are handled by
-    // `mark_global_root_bits` / `rewrite_value_bits`.
+    // address on every move; bare-pointer slots are handled by
+    // `mark_mutable_root_bits` / `rewrite_value_bits` (both decode through
+    // `gc::root_words::decode_root_word`).
     crate::gc::runtime_write_barrier_root_heap_word(new_ptr as u64);
     let cache_slot = THREAD_GLOBAL_THIS.with(|c| c.as_ptr() as usize);
     crate::gc::js_gc_register_global_root(cache_slot as i64);
@@ -480,10 +481,10 @@ pub extern "C" fn js_response_subclass_init(this_box: f64, body: f64, init: f64)
 // `Expr::SuperCall` Request/Response arm); pin them so the auto-optimize
 // bitcode rebuild's dead-strip can't drop them (see
 // project_auto_optimize_keepalive_3320).
-#[used]
+#[cfg_attr(feature = "keepalive-anchors", used)]
 static KEEP_JS_REQUEST_SUBCLASS_INIT: extern "C" fn(f64, f64, f64) -> f64 =
     js_request_subclass_init;
-#[used]
+#[cfg_attr(feature = "keepalive-anchors", used)]
 static KEEP_JS_RESPONSE_SUBCLASS_INIT: extern "C" fn(f64, f64, f64) -> f64 =
     js_response_subclass_init;
 
@@ -828,7 +829,7 @@ pub unsafe extern "C" fn js_fetch_or_value_super(
     }
 }
 
-#[used]
+#[cfg_attr(feature = "keepalive-anchors", used)]
 static KEEP_JS_FETCH_OR_VALUE_SUPER: unsafe extern "C" fn(f64, f64, *const f64, usize) -> f64 =
     js_fetch_or_value_super;
 

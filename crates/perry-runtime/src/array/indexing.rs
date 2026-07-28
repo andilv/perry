@@ -440,7 +440,7 @@ pub(crate) unsafe fn keys_array_len_capped_to_capacity(arr: *const ArrayHeader) 
 /// native-region wrappers (`__perry_wrap_*`) and elsewhere, so it must be a
 /// `#[no_mangle]` C export AND survive dead-stripping even when no Rust caller
 /// keeps it referenced — mirroring the neighbouring `js_array_push`.
-#[used]
+#[cfg_attr(feature = "keepalive-anchors", used)]
 static KEEP_ARRAY_LENGTH: extern "C" fn(*const ArrayHeader) -> u32 = js_array_length;
 
 #[no_mangle]
@@ -852,10 +852,10 @@ pub extern "C" fn js_array_numeric_set_f64_unboxed(
 
 // These raw numeric-array helpers are called from generated code, so release/LTO
 // builds may otherwise internalize and strip the `#[no_mangle]` exports.
-#[used]
+#[cfg_attr(feature = "keepalive-anchors", used)]
 static KEEP_JS_ARRAY_NUMERIC_GET_F64_UNBOXED: extern "C" fn(*mut ArrayHeader, u32) -> f64 =
     js_array_numeric_get_f64_unboxed;
-#[used]
+#[cfg_attr(feature = "keepalive-anchors", used)]
 static KEEP_JS_ARRAY_NUMERIC_SET_F64_UNBOXED: extern "C" fn(*mut ArrayHeader, u32, f64) -> i32 =
     js_array_numeric_set_f64_unboxed;
 
@@ -1095,12 +1095,19 @@ pub extern "C" fn js_array_set_f64_extend(
         // arrays serialized as `[0, 0, ...]` instead of `[null, null,
         // ...]`. Read paths translate TAG_HOLE → TAG_UNDEFINED via
         // `js_array_get_f64`'s post-#323 hole handling.
+        //
+        // Repsel 4a.2 (#6904): the gap fill goes through the hole-aware
+        // note — TAG_HOLE is part of the raw-f64-or-holes invariant, so it
+        // must not clear the layout flags the way a genuine non-numeric
+        // store does. When the array carried a raw-f64 invariant before the
+        // extend AND the stored value is numeric, the invariant still holds
+        // afterwards: record it (dense drops to holes) instead of demoting
+        // to the permanent O(n) verify walk.
+        let had_raw_layout = crate::array::header::array_has_raw_f64_layout_or_holes(arr);
         let elements_ptr = (arr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut f64;
-        let hole = f64::from_bits(crate::value::TAG_HOLE);
         for i in length..index {
-            // GC_STORE_AUDIT(BARRIERED): sparse gap sentinel is immediately recorded via note_array_slot.
-            ptr::write(elements_ptr.add(i as usize), hole);
-            note_array_slot(arr, i as usize, crate::value::TAG_HOLE);
+            // GC_STORE_AUDIT(BARRIERED): sparse gap sentinel is layout-noted + barriered by the hole-aware note.
+            crate::array::header::note_array_hole_fill_slot(arr, i as usize);
         }
 
         // Set the value
@@ -1110,6 +1117,12 @@ pub extern "C" fn js_array_set_f64_extend(
         ptr::write(elements_ptr.add(index as usize), value);
         note_array_slot(arr, index as usize, value_bits);
         (*arr).length = new_length;
+        if had_raw_layout
+            && index > length
+            && crate::array::header::value_bits_are_numeric(value_bits)
+        {
+            crate::array::header::demote_array_raw_f64_dense_to_holes(arr);
+        }
 
         arr
     }
@@ -1437,27 +1450,27 @@ pub extern "C" fn js_array_numeric_range_add_len(receiver: f64, start: f64, delt
     array_numeric_range_add_impl(receiver, start, None, delta)
 }
 
-#[used]
+#[cfg_attr(feature = "keepalive-anchors", used)]
 static KEEP_ARRAY_FILL_F64_CONST_EXTEND: extern "C" fn(
     *mut ArrayHeader,
     u32,
     f64,
 ) -> *mut ArrayHeader = js_array_fill_f64_const_extend;
-#[used]
+#[cfg_attr(feature = "keepalive-anchors", used)]
 static KEEP_ARRAY_FILL_F64_IOTA_EXTEND: extern "C" fn(*mut ArrayHeader, u32) -> *mut ArrayHeader =
     js_array_fill_f64_iota_extend;
-#[used]
+#[cfg_attr(feature = "keepalive-anchors", used)]
 static KEEP_ARRAY_FILL_F64_CONST_LEN_EXTEND: extern "C" fn(
     *mut ArrayHeader,
     f64,
 ) -> *mut ArrayHeader = js_array_fill_f64_const_len_extend;
-#[used]
+#[cfg_attr(feature = "keepalive-anchors", used)]
 static KEEP_ARRAY_FILL_F64_IOTA_LEN_EXTEND: extern "C" fn(*mut ArrayHeader) -> *mut ArrayHeader =
     js_array_fill_f64_iota_len_extend;
-#[used]
+#[cfg_attr(feature = "keepalive-anchors", used)]
 static KEEP_ARRAY_NUMERIC_RANGE_ADD: extern "C" fn(f64, f64, f64, f64) -> i64 =
     js_array_numeric_range_add;
-#[used]
+#[cfg_attr(feature = "keepalive-anchors", used)]
 static KEEP_ARRAY_NUMERIC_RANGE_ADD_LEN: extern "C" fn(f64, f64, f64) -> i64 =
     js_array_numeric_range_add_len;
 

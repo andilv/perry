@@ -1206,6 +1206,15 @@ fn plain_array_index_guard(arr: *const ArrayHeader, index: u32, require_in_bound
     }
 }
 
+#[cfg(test)]
+pub(crate) fn numeric_array_index_guard_for_tests(
+    arr: *const ArrayHeader,
+    index: u32,
+    require_in_bounds: bool,
+) -> bool {
+    numeric_array_index_guard(arr, index, require_in_bounds)
+}
+
 fn numeric_array_index_guard(arr: *const ArrayHeader, index: u32, require_in_bounds: bool) -> bool {
     if !plain_array_index_guard(arr, index, require_in_bounds) {
         return false;
@@ -1963,7 +1972,7 @@ pub extern "C" fn js_typed_feedback_packed_f64_range_loop_guard(
     }
 }
 
-#[used]
+#[cfg_attr(feature = "keepalive-anchors", used)]
 static KEEP_JS_TYPED_FEEDBACK_PACKED_F64_RANGE_LOOP_GUARD: extern "C" fn(
     u64,
     f64,
@@ -2004,7 +2013,7 @@ pub extern "C" fn js_typed_feedback_packed_i32_array_loop_guard(
     }
 }
 
-#[used]
+#[cfg_attr(feature = "keepalive-anchors", used)]
 static KEEP_JS_TYPED_FEEDBACK_PACKED_I32_ARRAY_LOOP_GUARD: extern "C" fn(u64, f64) -> i32 =
     js_typed_feedback_packed_i32_array_loop_guard;
 
@@ -2041,7 +2050,7 @@ pub extern "C" fn js_typed_feedback_packed_u32_array_loop_guard(
     }
 }
 
-#[used]
+#[cfg_attr(feature = "keepalive-anchors", used)]
 static KEEP_JS_TYPED_FEEDBACK_PACKED_U32_ARRAY_LOOP_GUARD: extern "C" fn(u64, f64) -> i32 =
     js_typed_feedback_packed_u32_array_loop_guard;
 

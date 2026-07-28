@@ -72,6 +72,7 @@ pub(crate) use channel::{
 };
 pub(crate) use helpers::{
     array_store_needs_layout_note, array_store_needs_write_barrier, buffer_alias_metadata_suffix,
+    class_field_store_needs_layout_note, class_field_store_needs_string_addref,
     expr_has_numeric_pointer_free_array_layout, expr_produces_non_pointer_bits_by_construction,
     is_global_this_builtin_function_name, is_global_this_builtin_name,
     lower_expr_with_expected_type, lower_js_args_array, proxy_build_args_array, unbox_str_handle,
@@ -117,7 +118,7 @@ pub(crate) use v8_interop::{
 };
 pub(crate) use write_barrier::{
     emit_array_numeric_write_note_on_block, emit_jsvalue_slot_store_on_block,
-    emit_jsvalue_slot_store_scalar_aware_on_block,
+    emit_jsvalue_slot_store_scalar_aware_on_block, emit_jsvalue_slot_store_with_flags_on_block,
     emit_jsvalue_slot_store_with_value_bits_on_block, emit_root_heap_word_store_on_block,
     emit_root_nanbox_store_on_block, emit_write_barrier, emit_write_barrier_slot_on_block,
     lower_array_super_init, lower_event_emitter_subclass_init, lower_node_stream_super_init,
@@ -133,9 +134,10 @@ mod record_value;
 mod shadow_slot;
 mod slot_rep;
 pub(crate) use slot_rep::{
-    canonical_i32_locals_enabled, canonical_local_i32_slot, collect_closure_referenced_locals,
-    load_canonical_local_boxed, note_canonical_i32_local, store_canonical_local_from_double,
-    SlotRep,
+    canonical_i32_locals_enabled, canonical_local_i32_slot, canonical_str_locals_enabled,
+    collect_canonical_str_ineligible_locals, collect_closure_referenced_locals,
+    load_canonical_local_boxed, local_is_canonical_str, local_rep_is_canonical_i32,
+    note_canonical_local, store_canonical_local_from_double, SlotRep,
 };
 
 pub(crate) use dispatch::{lower_expr, lower_math_operand};
@@ -773,6 +775,21 @@ pub(crate) struct FnCtx<'a> {
     /// capture machinery stays on the boxed protocol. Empty when
     /// `repsel_context_allows_canonical_i32` is false.
     pub repsel_closure_ref_locals: std::collections::HashSet<u32>,
+
+    /// Representation-selection Phase 3a: whether this function context
+    /// permits canonical-Str selection. Mirrors
+    /// `repsel_context_allows_canonical_i32` (sync bodies only, no module
+    /// init) but gated on `PERRY_CANONICAL_STR_LOCALS` instead, so the two
+    /// phases can be A/B-tested independently.
+    pub repsel_context_allows_canonical_str: bool,
+
+    /// Phase 3a eligibility pre-pass result
+    /// (`collect_canonical_str_ineligible_locals`): locals with a
+    /// non-string-proven reassignment, an equality compare against a
+    /// non-proven-string operand (the `other_side_is_any` hazard), or a
+    /// catch binding. Never selected canonical-Str. Empty when
+    /// `repsel_context_allows_canonical_str` is false.
+    pub repsel_str_ineligible_locals: std::collections::HashSet<u32>,
 
     /// Representation-selection Phase 2 (`codegen/spec_abi.rs`): FuncId →
     /// specialization plan for functions that have an emitted specialized
@@ -1463,6 +1480,7 @@ mod env_clones;
 mod fs_await;
 mod index_get;
 mod masked_window;
+mod ptr_numarray_access;
 mod ta_param_f64_read;
 pub(crate) use index_get::packed_f64_loop_index_parts;
 pub(crate) use masked_window::masked_window_fact_for_index;
