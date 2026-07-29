@@ -154,6 +154,15 @@ jobs:
           done
           cd staging
           tar czf ../${{ matrix.artifact }}.tar.gz *
+          cd ..
+          # Lite bundle - perry + stdlib + runtime only, no ext/UI libs
+          mkdir -p staging-lite
+          cp target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/perry staging-lite/
+          for lib in libperry_runtime.a libperry_stdlib.a; do
+            cp "target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/$lib" staging-lite/
+          done
+          cd staging-lite
+          tar czf ../${{ matrix.artifact }}-lite.tar.gz *
 
       - name: Package (Windows)
         if: steps.filter.outputs.run == 'true' && runner.os == 'Windows'
@@ -170,6 +179,14 @@ jobs:
             Copy-Item $_.FullName staging/
           }
           Compress-Archive -Path staging/* -DestinationPath "${{ matrix.artifact }}.zip"
+          # Lite bundle - perry + stdlib + runtime only, no ext/UI libs
+          New-Item -ItemType Directory -Force -Path staging-lite
+          Copy-Item "target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/perry.exe" staging-lite/
+          foreach ($lib in $libs) {
+            $path = "target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/$lib"
+            if (Test-Path $path) { Copy-Item $path staging-lite/ }
+          }
+          Compress-Archive -Path staging-lite/* -DestinationPath "${{ matrix.artifact }}-lite.zip"
 
       - name: Upload artifact (Unix)
         if: steps.filter.outputs.run == 'true' && runner.os != 'Windows'
@@ -178,9 +195,23 @@ jobs:
           name: ${{ matrix.artifact }}
           path: "*.tar.gz"
 
+      - name: Upload lite artifact (Unix)
+        if: steps.filter.outputs.run == 'true' && runner.os != 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}-lite
+          path: "*-lite.tar.gz"
+
       - name: Upload artifact (Windows)
         if: steps.filter.outputs.run == 'true' && runner.os == 'Windows'
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: "*.zip"
+
+      - name: Upload lite artifact (Windows)
+        if: steps.filter.outputs.run == 'true' && runner.os == 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}-lite
+          path: "*-lite.zip"
