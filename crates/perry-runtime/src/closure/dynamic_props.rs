@@ -422,7 +422,7 @@ pub fn is_closure_ptr(ptr: usize) -> bool {
 /// raw bits) is a closure/function — a `POINTER_TAG` value whose pointee
 /// carries `CLOSURE_MAGIC` — and 0 for objects, arrays, strings, numbers, and
 /// everything else. Exposed for external wrapper crates that link the runtime
-/// only by C ABI (e.g. perry-ext-http-server's `parse_listen_args`, #2041),
+/// only by C ABI (e.g. perry-ext-http's `parse_listen_args`, #2041),
 /// which need to tell a callback argument apart from an options-object
 /// argument without a Cargo dependency on perry-runtime.
 #[no_mangle]
@@ -554,7 +554,7 @@ pub fn closure_get_dynamic_prop(ptr: usize, prop: &str) -> f64 {
             crate::object::js_implicit_this_set(prev);
             return result;
         }
-        unsafe {
+        {
             let key_hdr = crate::string::js_string_from_bytes(prop.as_ptr(), prop.len() as u32);
             let v = crate::object::js_object_get_field_by_name(
                 proto_ptr as *const crate::object::ObjectHeader,
@@ -589,7 +589,7 @@ pub fn closure_get_dynamic_prop(ptr: usize, prop: &str) -> f64 {
             }
             return f64::from_bits(crate::value::TAG_UNDEFINED);
         }
-        unsafe {
+        {
             let key_hdr = crate::string::js_string_from_bytes(prop.as_ptr(), prop.len() as u32);
             let v = crate::object::js_object_get_field_by_name(
                 proto_ptr as *const crate::object::ObjectHeader,

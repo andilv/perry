@@ -4,6 +4,8 @@
 //! the same inherited Unix fd convention used by its `child_process.fork()`
 //! parent side and speaks newline-delimited JSON frames for this cut.
 
+#![cfg_attr(not(feature = "proc-ipc"), allow(dead_code))]
+
 use crate::closure::{
     js_closure_alloc, js_closure_get_capture_ptr, js_closure_set_capture_ptr, js_native_call_value,
     js_register_closure_arity, js_register_closure_length, ClosureHeader,
@@ -202,6 +204,17 @@ fn ipc_is_connected() -> bool {
     state.available && state.connected
 }
 
+/// IPC-backed `process` properties. Behind `proc-ipc` (default-on, compiler
+/// detected): with the feature off the channel can never be used by this
+/// program, so returning `None` keeps the always-live process-namespace
+/// lookup from statically pinning the IPC send path and, through it, the JSON
+/// serializer.
+#[cfg(not(feature = "proc-ipc"))]
+pub(crate) fn process_ipc_property(_name: &str) -> Option<f64> {
+    None
+}
+
+#[cfg(feature = "proc-ipc")]
 pub(crate) fn process_ipc_property(name: &str) -> Option<f64> {
     match name {
         "send" | "disconnect" | "connected" | "channel" => {}

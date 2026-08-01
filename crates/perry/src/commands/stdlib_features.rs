@@ -33,17 +33,21 @@ pub fn module_to_features(module: &str) -> &'static [&'static str] {
         // spellings need the same feature for auto-optimized stdlib builds.
         "streams" | "stream/web" | "stream_web" | "fs/promises" => &["bundled-streams"],
 
-        // ── HTTP client (reqwest) ─────────────────────────────────────
-        // `http` / `https` / `http2` join the `http-client` umbrella since
-        // they bottom out in reqwest just like axios + node-fetch — and
-        // perry-ext-http-server (issue #577) needs the same async-runtime
-        // bridge for `perry_ffi_spawn_blocking_with_reactor`. The
-        // well-known flip swaps perry-stdlib's http.rs for perry-ext-http
-        // (v0.5.571); `http2` flips to the same staticlib via the rlib
-        // dep on perry-ext-http-server. Programs that import `streams`
-        // should NOT also use the well-known flip — streams stays in
-        // perry-stdlib until its own port lands.
-        "axios" | "node-fetch" | "http" | "https" | "http2" => &["http-client"],
+        // ── Web Fetch and Axios compatibility surface ────────────────
+        // Node HTTP/HTTPS/HTTP2 are provided by perry-ext-http and need
+        // no perry-stdlib feature. Axios and node-fetch still use the
+        // legacy umbrella for compatibility.
+        "axios" | "node-fetch" => &["http-client"],
+
+        // `undici` (#466) has no perry-stdlib copy to strip — the wrapper
+        // crate (perry-ext-undici) is thin glue over the native Web Fetch
+        // stack. The wrapper's `setGlobalDispatcher` writes proxy state
+        // through `js_fetch_set_global_proxy`, which lives in stdlib's
+        // `web-fetch` module; the well-known flip re-asserts `web-fetch`
+        // for undici imports (see optimized_libs/driver.rs) rather than
+        // naming it here, because everything named here gets STRIPPED by
+        // the flip loop.
+        "undici" => &[],
 
         // ── WebSocket ─────────────────────────────────────────────────
         // `websocket` umbrella retained for backwards-compat;
@@ -92,7 +96,7 @@ pub fn module_to_features(module: &str) -> &'static [&'static str] {
         // `database-redis` umbrella retained for backwards-compat;
         // per-binding gate is `bundled-ioredis` (v0.5.565) so the
         // well-known flip can route to perry-ext-ioredis.
-        "ioredis" | "redis" => &["bundled-ioredis"],
+        "ioredis" | "redis" | "iovalkey" => &["bundled-ioredis"],
         // `database-mongodb` umbrella retained for backwards-compat;
         // per-binding gate is `bundled-mongodb` (v0.5.568) so the
         // well-known flip can route to perry-ext-mongodb.
@@ -122,7 +126,18 @@ pub fn module_to_features(module: &str) -> &'static [&'static str] {
         "perry/updater" => &["crypto"],
 
         // ── Compression (zlib) ────────────────────────────────────────
-        "zlib" => &["compression"],
+        // Per-codec split (stdlib cherry-pick): a `node:zlib` import only
+        // guarantees the gzip/deflate family (`compression-gzip`, which
+        // gates `pub mod zlib` itself). The Brotli / zstd codec backends
+        // (`compression-brotli` / `compression-zstd`, each implying
+        // `compression-gzip`) are added by `build_optimized_libs` when
+        // HIR usage detection saw a Brotli / zstd API token
+        // (`ctx.uses_zlib_brotli` / `ctx.uses_zlib_zstd`, set in
+        // `collect_modules/feature_detect.rs`) — and unconditionally
+        // when deferred dynamic code could name a codec at runtime.
+        // The `compression` umbrella (= all three) stays for
+        // backwards-compat `--features compression` callers.
+        "zlib" => &["compression-gzip"],
 
         // ── Email (lettre) ────────────────────────────────────────────
         // `email` umbrella retained for backwards-compat; per-binding
@@ -222,17 +237,16 @@ pub fn module_to_features(module: &str) -> &'static [&'static str] {
         // events won't propagate to user callbacks.
         "readline" => &["async-runtime"],
 
-        // Modules with no optional perry-stdlib dependency (decimal.js,
-        // bignumber.js, lru-cache, commander, exponential-backoff, http,
-        // https, events, async_hooks, worker_threads, …) — handled by
-        // always-on stdlib code.
+        // Modules with no optional perry-stdlib dependency (http, https,
+        // http2, events, async_hooks, worker_threads, …) are provided by
+        // external bindings or always-on runtime code.
         _ => &[],
     }
 }
 
 /// Compute the union of perry-stdlib features required to cover every
 /// native module the project imports, plus features needed to satisfy
-/// non-import-based usage flags (e.g. `uses_fetch` ⇒ `http-client`).
+/// non-import-based usage flags (e.g. `uses_fetch` ⇒ `web-fetch`).
 pub fn compute_required_features(
     native_module_imports: &BTreeSet<String>,
     uses_fetch: bool,
@@ -245,13 +259,8 @@ pub fn compute_required_features(
         }
     }
     // Built-in `fetch()` / `node-fetch` and the WHATWG data types
-    // (`Headers` / `Request` / `Response` / `Blob`) bottom out in reqwest
-    // but do NOT need perry-stdlib's bundled node:http client. #5174: ask
-    // for `web-fetch` (just `src/fetch/` + `src/fetch_blob.rs`), not the
-    // `http-client` umbrella that also pulls in `src/http.rs` / `src/axios.rs`.
-    // When the program ALSO imports `node:http`, that import adds
-    // `http-client` separately and the well-known flip strips it down to
-    // `web-fetch` — so the bundled client never collides with perry-ext-http.
+    // (`Headers` / `Request` / `Response` / `Blob`) use the Web Fetch
+    // feature directly, without enabling Axios.
     if uses_fetch {
         features.insert("web-fetch");
     }
@@ -274,6 +283,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn zlib_import_maps_to_gzip_base_only() {
+        // Per-codec cherry-pick: `node:zlib` selects the gzip/deflate base;
+        // Brotli / zstd are layered on by `build_optimized_libs` from the
+        // `ctx.uses_zlib_brotli` / `ctx.uses_zlib_zstd` HIR gates. The
+        // legacy `compression` umbrella must NOT be selected here — it
+        // would defeat the split by always pulling all three codecs.
+        assert_eq!(module_to_features("zlib"), &["compression-gzip"]);
+        assert_eq!(module_to_features("node:zlib"), &["compression-gzip"]);
+
+        let mut imports = BTreeSet::new();
+        imports.insert("zlib".to_string());
+        let features = compute_required_features(&imports, false, false);
+        assert!(features.contains("compression-gzip"));
+        assert!(!features.contains("compression"));
+        assert!(!features.contains("compression-brotli"));
+        assert!(!features.contains("compression-zstd"));
+    }
+
+    #[test]
+    fn crypto_features_join_only_on_crypto_usage() {
+        // The stdlib cherry-pick removed the driver's unconditional
+        // `crypto` force — the feature must now come exclusively from the
+        // import mapping or the builtin-usage flag (plus the codegen
+        // `js_crypto_*` prefix net, tested in perry-codegen).
+        let no_imports = BTreeSet::new();
+        let features = compute_required_features(&no_imports, false, false);
+        assert!(!features.contains("crypto"));
+
+        let features = compute_required_features(&no_imports, false, true);
+        assert!(features.contains("crypto"));
+
+        let mut imports = BTreeSet::new();
+        imports.insert("crypto".to_string());
+        let features = compute_required_features(&imports, false, false);
+        assert!(features.contains("crypto"));
+    }
+
+    #[test]
     fn stream_web_imports_enable_bundled_streams() {
         assert_eq!(module_to_features("stream/web"), &["bundled-streams"]);
         assert_eq!(module_to_features("stream_web"), &["bundled-streams"]);
@@ -285,5 +332,22 @@ mod tests {
 
         let features = compute_required_features(&imports, false, false);
         assert!(features.contains("bundled-streams"));
+    }
+
+    #[test]
+    fn node_http_uses_external_binding_without_legacy_client_feature() {
+        assert!(module_to_features("http").is_empty());
+        assert!(module_to_features("node:https").is_empty());
+        assert!(module_to_features("http2").is_empty());
+        assert_eq!(module_to_features("axios"), &["http-client"]);
+    }
+
+    #[test]
+    fn undici_maps_to_no_stdlib_features() {
+        // perry-ext-undici owns the whole undici surface; there's no
+        // stdlib copy for the well-known flip to strip. The `web-fetch`
+        // dependency of its setGlobalDispatcher glue is re-asserted by
+        // the flip loop in optimized_libs/driver.rs, not named here.
+        assert_eq!(module_to_features("undici"), &[] as &[&str]);
     }
 }

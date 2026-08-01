@@ -104,7 +104,7 @@ pub struct CompileArgs {
     pub enable_wasm_runtime: bool,
 
     /// Target platform: ios-simulator, ios, visionos-simulator, visionos,
-    /// android, ios-widget, ios-widget-simulator, watchos-widget,
+    /// android, android-x86_64, ios-widget, ios-widget-simulator, watchos-widget,
     /// watchos-widget-simulator, android-widget, wearos-tile, web, wasm,
     /// windows, linux (default: native host). See docs/src/cli/flags.md
     /// for the full target table.
@@ -473,6 +473,36 @@ pub struct CompileArgs {
     /// dump. No effect unless `--trace hir` (or `--print-hir`) is set.
     #[arg(long, value_name = "NAME")]
     pub focus: Option<String>,
+
+    /// Report which values Perry could NOT statically type, why, and whether
+    /// you can do anything about it (#6952) — the representation-selection
+    /// analogue of LLVM's `-Rpass-missed` remarks.
+    ///
+    /// Perry's speed comes from proving static types and selecting unboxed
+    /// representations; when a proof fails the value stays NaN-boxed and the
+    /// fast paths silently do not fire. This prints, per value: its position
+    /// (local / param / return / allocation site), the representation it got,
+    /// the collector rule that denied it, an actionability tier, and a static
+    /// hotness proxy. Wins are reported too, so you can see the ratio.
+    ///
+    /// `--opt-report` prints human-readable text; `--opt-report=json` emits a
+    /// stable schema for tooling (CI can diff two builds to catch a silent
+    /// representation regression). Also settable via `PERRY_OPT_REPORT=1`.
+    ///
+    /// Observational only — emitted code is byte-identical with the flag on
+    /// and off. It does disable build/object cache reuse for its own run, so
+    /// that codegen actually executes and has something to report.
+    #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "text")]
+    pub opt_report: Option<OptReportFormat>,
+}
+
+/// Output format for `--opt-report`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum OptReportFormat {
+    /// Human-readable, ranked, grouped by actionability tier.
+    Text,
+    /// Stable JSON schema for tooling.
+    Json,
 }
 
 /// Information about a JavaScript module that will be interpreted at runtime
@@ -566,6 +596,8 @@ pub struct CompilationContext {
     /// expanding globs/directories. The embed-relative name (e.g.
     /// `dist/index.html`) is the runtime registry key and `$perryfs/` virtual
     /// path suffix.
+    #[allow(dead_code)]
+    // #5731 embed-assets context contract; pub field populated on the embed path, not read here
     pub embedded_assets: Vec<(String, PathBuf)>,
     /// #1681 (Phase 3 of #1677): true when this is the build-time capture
     /// stage (the `current_exe` subprocess), so `precompile(EXPR)` sites
@@ -637,6 +669,16 @@ pub struct CompilationContext {
     /// `CryptoSha256`/`CryptoMd5` which dispatch to runtime symbols that
     /// live behind the perry-stdlib `crypto` feature.
     pub uses_crypto_builtins: bool,
+    /// Whether any TS module references a `node:zlib` Brotli API token
+    /// (`brotliCompressSync`, `createBrotliDecompress`, `BROTLI_*`
+    /// constants, …). Adds `compression-brotli` on top of the
+    /// `compression-gzip` base a `node:zlib` import selects, so gzip-only
+    /// programs never link the Brotli tables (stdlib cherry-pick).
+    pub uses_zlib_brotli: bool,
+    /// Same as `uses_zlib_brotli`, for the zstd codec family
+    /// (`zstdCompressSync`, `createZstdCompress`, `ZSTD_*`, …) →
+    /// `compression-zstd` (the bundled zstd C library).
+    pub uses_zlib_zstd: bool,
     /// Whether any TS module needs the regular-expression engine — a regex
     /// literal / `RegExp`, a regex-coercing string method (`.match` /
     /// `.matchAll` / `.search`), or a glob API (`path.matchesGlob` /
@@ -680,6 +722,28 @@ pub struct CompilationContext {
     /// `perry-runtime/intl-locale` (`icu_locale_core`'s data-free BCP-47 / UTS #35
     /// structural parser). A program that never canonicalizes a locale links a
     /// lighter hand-rolled fallback instead.
+    /// The program can reach the `Intl.*` namespace surface (any `Intl`
+    /// token or locale-formatting API). Gates `perry-runtime/intl-namespace`
+    /// (~219 KB of constructor/option/format machinery). Over-approximates:
+    /// a dynamic-code site forces it on.
+    pub uses_intl_namespace: bool,
+    /// Per-namespace `globalThis` member tables (`Math`/`JSON`/`Reflect`/
+    /// `Atomics`). Each gates the matching `perry-runtime/global-*` feature;
+    /// set when the program mentions the name at all (call sites lower to
+    /// intrinsics, so a mention means it may be used as a VALUE).
+    pub uses_global_math: bool,
+    pub uses_global_json: bool,
+    pub uses_global_reflect: bool,
+    pub uses_global_atomics: bool,
+    /// Per-group `globalThis` web-platform member tables (URL / Text* /
+    /// WebSocket / webcrypto / fetch value types).
+    pub uses_global_url: bool,
+    pub uses_global_text: bool,
+    pub uses_global_websocket: bool,
+    pub uses_global_webcrypto: bool,
+    pub uses_global_webfetch: bool,
+    /// `process.send`/`disconnect`/`connected`/`channel` — gates `proc-ipc`.
+    pub uses_proc_ipc: bool,
     pub uses_intl_locale: bool,
     /// Whether any TS module localizes a date/time — `Intl.DateTimeFormat`, or
     /// `Date.prototype.toLocale{,Date,Time}String`. Gates
@@ -963,6 +1027,8 @@ pub enum SideEffects {
     Unknown,
     /// `"sideEffects": ["glob", ...]` — only files matching a glob have side
     /// effects; others are droppable. Globs are relative to the package dir.
+    #[allow(dead_code)]
+    // #2309 PR1: glob list captured for future per-file matching, not yet read
     Globs(Vec<String>),
 }
 
@@ -1022,12 +1088,25 @@ impl CompilationContext {
             native_module_imports: BTreeSet::new(),
             uses_fetch: false,
             uses_crypto_builtins: false,
+            uses_zlib_brotli: false,
+            uses_zlib_zstd: false,
             uses_regex: false,
             uses_temporal: false,
             uses_event_emitter: false,
             uses_url: false,
             uses_string_normalize: false,
             uses_intl_segmenter: false,
+            uses_intl_namespace: false,
+            uses_global_math: false,
+            uses_global_json: false,
+            uses_global_reflect: false,
+            uses_global_atomics: false,
+            uses_global_url: false,
+            uses_global_text: false,
+            uses_global_websocket: false,
+            uses_global_webcrypto: false,
+            uses_global_webfetch: false,
+            uses_proc_ipc: false,
             uses_intl_locale: false,
             uses_intl_datetime: false,
             uses_diagnostics: false,

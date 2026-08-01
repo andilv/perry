@@ -1,12 +1,7 @@
 //! Compile command - compiles TypeScript to native executable
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use rayon::prelude::*;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::OutputFormat;
 
@@ -14,6 +9,7 @@ use crate::OutputFormat;
 // `compile/` directory. The `compile.rs` orchestrator stays as the
 // public API surface; helpers move to focused modules so unrelated
 // changes don't churn this file.
+pub(crate) mod android_target;
 mod app_metadata;
 mod apple_codesign;
 mod apple_info_plist;
@@ -46,13 +42,16 @@ mod parse_cache;
 mod post_link;
 mod precompile_capture;
 mod reachability;
-mod resolve;
+// pub(crate): commands/deps.rs (the `check --check-deps` dependency checker)
+// reuses the subpath-imports + tsconfig-paths resolvers for `#` specifiers.
+pub(crate) mod resolve;
 mod resources;
 mod sandbox_buildrs;
 mod strip_dedup;
 mod targets;
 pub mod well_known;
 pub(crate) mod widget_build;
+use android_target::{android_target, is_android_target};
 use app_metadata::rust_target_triple;
 // apple_info_plist helpers used through bundle_ios (no direct uses in
 // compile.rs anymore now that the iOS bundle code moved out).
@@ -142,9 +141,8 @@ mod run_pipeline;
 #[cfg(windows)]
 pub(crate) use helpers::is_windows_reserved_file_stem;
 pub(crate) use helpers::{
-    apply_libc_to_target, backend_disabled_msg, canonical_class_source_prefix,
-    native_object_file_stem, object_cache_project_root, print_deferred_eval_notice,
-    NativeObjectArtifact,
+    apply_libc_to_target, canonical_class_source_prefix, native_object_file_stem,
+    object_cache_project_root, print_deferred_eval_notice, NativeObjectArtifact,
 };
 pub use run_pipeline::run_with_parse_cache;
 

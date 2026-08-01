@@ -8,7 +8,7 @@
 //! error so a user running `--backend llvm` on richer TypeScript gets a
 //! one-line explanation instead of a silent broken binary.
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use perry_hir::types::Type as HirType;
 use perry_hir::{BinaryOp, CompareOp, Expr, UnaryOp};
 
@@ -131,19 +131,38 @@ pub(crate) use write_barrier::{
 // under 2000 lines. Inherent methods (`record_value`) need no re-export.
 mod dispatch;
 mod record_value;
+mod repsel_gates;
+mod scalar_slot_root;
+pub(crate) mod shadow_inline;
 mod shadow_slot;
 mod slot_rep;
+pub(crate) mod temp_root;
+// #7128: the env-knob table and the pure `gates -> context flags` derivation.
+// Every `FnCtx` construction site goes through `RepselContextFlags` so that a
+// knob cannot silently acquire a second representation's sites again.
+pub(crate) use repsel_gates::{static_string_lowering_enabled, RepselContextFlags};
+// `body_context_denial` / `report_context_denial` / `MODULE_INIT_CONTEXT` are
+// deliberately NOT re-exported: since #7128 the only legitimate consumer is
+// `repsel_gates::RepselContextFlags::derive`, and a `FnCtx` construction site
+// that reaches for the structural rule directly is exactly how the two gates
+// drifted back into one bool the last two times.
 pub(crate) use slot_rep::{
     canonical_i32_locals_enabled, canonical_local_i32_slot, canonical_str_locals_enabled,
     collect_canonical_str_ineligible_locals, collect_closure_referenced_locals,
-    load_canonical_local_boxed, local_is_canonical_str, local_rep_is_canonical_i32,
-    note_canonical_local, store_canonical_local_from_double, SlotRep,
+    deny_canonical_context, deny_canonical_i32, load_canonical_local_boxed, local_is_canonical_str,
+    local_rep_is_canonical_i32, note_canonical_local, ptr_shape_context_rule_text,
+    store_canonical_local_from_double, CanonicalI32Denial, SlotRep, PTR_SHAPE_SCALAR_REPLACED,
 };
 
 pub(crate) use dispatch::{lower_expr, lower_math_operand};
+pub(crate) use scalar_slot_root::{
+    root_scalar_replaced_slot, root_scalar_replaced_slot_unconditional,
+};
 pub(crate) use shadow_slot::{
+    current_closure_ptr_value, emit_persistent_shadow_root_barrier,
     emit_shadow_slot_bind_for_local, emit_shadow_slot_clear, emit_shadow_slot_update_for_expr,
     enable_persistent_shadow_slot_for_array_alias, expr_is_known_non_pointer_shadow_value,
+    try_current_closure_ptr_value,
 };
 
 /// One in-flight inline-constructor return target. See
@@ -190,6 +209,13 @@ pub(crate) struct FnCtx<'a> {
     /// tracking" extension). Populated from function params and `Stmt::Let`
     /// declarations as they're lowered.
     pub local_types: std::collections::HashMap<u32, HirType>,
+    /// Bindings assigned after declaration anywhere in this region.
+    ///
+    /// A TypeScript annotation describes the source-level contract, but an
+    /// `as any` assignment can replace the runtime value with an unrelated
+    /// class. Class-keyed lowering must therefore ignore `local_types` for
+    /// these ids and use runtime dispatch (#6906).
+    pub reassigned_locals: std::collections::HashSet<u32>,
     /// Immutable locals whose initializer is a string literal. These values
     /// can be resolved to the module's interned string global at a use site;
     /// unlike a runtime dynamic-key cache, this does not retain a movable
@@ -330,7 +356,23 @@ pub(crate) struct FnCtx<'a> {
     /// Inside a closure body, the LLVM SSA value name for the current
     /// closure pointer (`%this_closure`). `Expr::LocalGet` of a captured
     /// id uses this as the first arg to `js_closure_get_capture_bits`.
+    ///
+    /// Prefer [`current_closure_ptr_value`] over reading this directly — the
+    /// raw SSA parameter is NOT a GC root and goes stale the moment a
+    /// relocating collection runs inside the body (#7055).
     pub current_closure_ptr: Option<String>,
+    /// Inside a closure body, the entry-block alloca holding the NaN-boxed
+    /// `%this_closure` pointer, bound to a shadow-stack slot so the moving
+    /// collector marks AND rewrites it (#7055).
+    ///
+    /// `%this_closure` itself lives only in a register, and the copying minor
+    /// at a loop back-edge poll (`js_gc_loop_safepoint`) runs with precise
+    /// roots and no conservative stack scan — so a closure relocated mid-body
+    /// left every later `js_closure_get_capture_bits` reading recycled
+    /// from-space memory, silently returning 0 and turning every capture
+    /// read/write into a no-op. Reload through this slot at every capture
+    /// access instead.
+    pub current_closure_slot: Option<String>,
     /// Map from (enum_name, member_name) → enum value. Built once in
     /// `compile_module` from `hir.enums`. Used by `Expr::EnumMember`
     /// to lower enum references to constants.
@@ -764,11 +806,75 @@ pub(crate) struct FnCtx<'a> {
     pub local_slot_reps: std::collections::HashMap<u32, SlotRep>,
 
     /// Whether this function context permits canonical-i32 storage selection.
-    /// False for async / generator / `was_plain_async` bodies (the async-to-
-    /// generator transform boxes body locals into shared cells) and for module
-    /// init. Checked at the `Stmt::Let` eligibility site together with the
-    /// `PERRY_CANONICAL_I32_LOCALS` env gate.
+    /// False for async / generator / `was_plain_async` bodies — the async-to-
+    /// generator transform boxes body locals into shared cells, which the
+    /// canonical model must not touch. Checked at the `Stmt::Let` eligibility
+    /// site together with the `PERRY_CANONICAL_I32_LOCALS` env gate.
+    ///
+    /// #7109: module-init / program-entry bodies are no longer excluded. They
+    /// are ordinary straight-line synchronous bodies lowered by the same
+    /// `stmt::lower_stmts_inner` as a function body, so the same per-value
+    /// rules decide. See [`crate::expr::MODULE_INIT_CONTEXT`] for the audit and
+    /// for what stays excluded there.
     pub repsel_context_allows_canonical_i32: bool,
+
+    /// Whether this context permits codegen to ACT on a `Ptr<Shape>` receiver
+    /// proof ([`FnCtx::ptr_shape_receiver_fact`]).
+    ///
+    /// Split out from `repsel_context_allows_canonical_i32` by #7109. Phase 5a
+    /// reused that flag, so lifting the module-init gate for canonical i32/Str
+    /// would silently have turned guard-free `Ptr<Shape>` field access on in
+    /// entry bodies too — a different representation, with a live rooting bug
+    /// of its own (#6991: a compiled receiver goes stale across the
+    /// `globalThis`-population collection, which is exactly what runs around
+    /// module init). The two are now independent, and this one keeps the
+    /// pre-#7109 value everywhere: `false` in entry bodies, and elsewhere the
+    /// same "sync body AND `PERRY_CANONICAL_I32_LOCALS` on" condition it had
+    /// when it was the same field. Re-coupling it to `PERRY_PTR_SHAPE_LOCALS`
+    /// instead is #7115-adjacent follow-up work, deliberately not done here.
+    pub repsel_context_allows_ptr_shape: bool,
+
+    /// Why this context forbids codegen from acting on a `Ptr<Shape>` receiver
+    /// proof, for the `--opt-report` unconsumed-promotion record; `None` when it
+    /// permits it. Same split as `repsel_context_allows_ptr_shape` — before
+    /// #7109 this read `repsel_context_denial`, which no longer names a rule in
+    /// entry bodies because canonical selection is allowed there now.
+    pub repsel_ptr_shape_context_denial: Option<&'static str>,
+
+    /// Why this context forbids canonical (i32/u32/Str) selection, for
+    /// `--opt-report` (#6952) and the promotion census (#7106); `None` when it
+    /// permits it.
+    ///
+    /// The two `repsel_context_allows_*` flags are taken *before* any per-value
+    /// rule runs, so a suppressed context recorded nothing at all — neither a
+    /// selection nor a denial. In the report that is indistinguishable from "the
+    /// program has no candidate values", which is exactly the ambiguity the
+    /// census exists to remove, one stage upstream. Carrying the reason lets the
+    /// `Stmt::Let` site record a denial for every local that WOULD have been
+    /// eligible, so "module init is excluded" is a named rule with a count
+    /// instead of a silent zero.
+    ///
+    /// Deliberately `None` when the only thing that is off is the
+    /// `PERRY_CANONICAL_{I32,STR}_LOCALS` env gate: that is a bisection knob,
+    /// and its arms must not grow report entries the default build lacks.
+    pub repsel_context_denial: Option<&'static str>,
+
+    /// Representation-selection Phase 5a (`collectors/proven_this.rs`): when
+    /// this body is a proven-`this` method clone, the `Ptr<Shape>` proof
+    /// carried by `this`. Consumed by [`FnCtx::ptr_shape_receiver_fact`], which
+    /// is what makes every `this.field` in the clone lower to the bare
+    /// fixed-offset form instead of the per-access guard diamond.
+    ///
+    /// `None` in every ordinary body — including the PUBLIC method body, which
+    /// keeps today's guarded lowering because its receiver is unproven.
+    pub proven_this: Option<crate::collectors::PtrShapeLocal>,
+
+    /// Phase 5a: `(class, method)` pairs with an emitted proven-`this` clone.
+    /// The two proven call sites consult this before routing; a hit also
+    /// proves the receiver's exact class DECLARES the method (own
+    /// declarations only), which is what rules out a subclass `this`.
+    pub pshape_methods:
+        &'a std::collections::HashMap<(String, String), crate::collectors::PtrShapeLocal>,
 
     /// Locals referenced anywhere inside a nested closure body (including
     /// explicit capture lists). Excluded from canonical-i32 selection — the
@@ -778,9 +884,10 @@ pub(crate) struct FnCtx<'a> {
 
     /// Representation-selection Phase 3a: whether this function context
     /// permits canonical-Str selection. Mirrors
-    /// `repsel_context_allows_canonical_i32` (sync bodies only, no module
-    /// init) but gated on `PERRY_CANONICAL_STR_LOCALS` instead, so the two
-    /// phases can be A/B-tested independently.
+    /// `repsel_context_allows_canonical_i32` (sync bodies only; #7109 lifted
+    /// the module-init exclusion from both together) but gated on
+    /// `PERRY_CANONICAL_STR_LOCALS` instead, so the two phases can be
+    /// A/B-tested independently.
     pub repsel_context_allows_canonical_str: bool,
 
     /// Phase 3a eligibility pre-pass result
@@ -987,6 +1094,14 @@ pub(crate) struct FnCtx<'a> {
     /// A non-escaping uppercase result represented by a slot holding its
     /// original receiver. Only fused string operations may consume it.
     pub scalar_replaced_uppercase_sources: std::collections::HashMap<u32, String>,
+
+    /// Shadow-frame slot reserved for a scalar-replacement alloca, keyed by
+    /// the alloca's SSA name (#6968). These allocas belong to no HIR local,
+    /// so `collect_pointer_typed_locals` cannot see them and the frame is
+    /// grown on demand — see `expr::scalar_slot_root`. Populated the first
+    /// time a possibly-pointer value is stored into the alloca; a field that
+    /// only ever holds numbers never appears here and costs nothing.
+    pub scalar_slot_shadow_slots: std::collections::HashMap<String, u32>,
 
     /// Non-escaping array literals identified by escape analysis. Maps
     /// local_id → length. Used by the Stmt::Let lowering to intercept
@@ -1406,6 +1521,128 @@ pub(crate) fn class_field_loop_fact_lookup<'f>(
 }
 
 impl<'a> FnCtx<'a> {
+    /// The `Ptr<Shape>` proof for a receiver expression, if any — the single
+    /// entry point every representation-selection object site consults.
+    ///
+    /// * `Expr::LocalGet` — Phase 3b: a shape-proven local
+    ///   (`collectors/ptr_shape.rs`), proven by provenance + containment.
+    /// * `Expr::This` — Phase 5a: the proven receiver of a proven-`this`
+    ///   method clone (`collectors/proven_this.rs`), proven by the routing call
+    ///   site's class-id + keys-token guard.
+    ///
+    /// Both carry the identical storage contract (a shadow-bound,
+    /// tagged-at-rest NaN-boxed slot), so consumers need no case analysis:
+    /// re-derive the raw pointer from the slot at every access.
+    pub(crate) fn ptr_shape_receiver_fact(
+        &self,
+        e: &perry_hir::Expr,
+    ) -> Option<&crate::collectors::PtrShapeLocal> {
+        if !self.repsel_context_allows_ptr_shape {
+            // #7106 follow-up: this early return is the whole of mechanism 2.
+            // The fact EXISTS — `collect_shape_proven_ptr_locals` already ran
+            // and already recorded a `select()` for it — and every access site
+            // below silently falls through to the guarded diamond. Recording
+            // it is what stops a proven-and-wasted value from reading exactly
+            // like a proven-and-applied one in the census.
+            if crate::opt_report::enabled() {
+                self.report_ptr_shape_context_drop(e);
+            }
+            return None;
+        }
+        match e {
+            perry_hir::Expr::LocalGet(id) => self.native_facts.shape_proven_ptr_local(*id),
+            perry_hir::Expr::This => self.proven_this.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The `Ptr<Shape>` fact for `e` ignoring the context gate — the proof the
+    /// analysis actually produced, as opposed to the proof codegen is allowed
+    /// to act on. Report-only.
+    fn ptr_shape_fact_ignoring_context(
+        &self,
+        e: &perry_hir::Expr,
+    ) -> Option<&crate::collectors::PtrShapeLocal> {
+        match e {
+            perry_hir::Expr::LocalGet(id) => self.native_facts.shape_proven_ptr_local(*id),
+            perry_hir::Expr::This => self.proven_this.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Record that a selected `Ptr<Shape>` proof was dropped by the context
+    /// gate (`repsel_context_allows_ptr_shape == false`).
+    ///
+    /// Deliberately silent when the context permits the representation and only
+    /// the `PERRY_CANONICAL_I32_LOCALS` bisection knob turned it off: that arm
+    /// must produce the default build's entries minus the selections, never a
+    /// class of entry the default build cannot emit (same rule as
+    /// `slot_rep::body_context_denial`).
+    fn report_ptr_shape_context_drop(&self, e: &perry_hir::Expr) {
+        let Some(rule) = self.repsel_ptr_shape_context_denial else {
+            return;
+        };
+        let Some(fact) = self.ptr_shape_fact_ignoring_context(e) else {
+            return;
+        };
+        let (position, fallback) = match e {
+            perry_hir::Expr::This => (crate::opt_report::Position::Param, "this"),
+            _ => (crate::opt_report::Position::Local, "<local>"),
+        };
+        let local_id = match e {
+            perry_hir::Expr::LocalGet(id) => Some(*id),
+            _ => None,
+        };
+        let name = fact.report_name.as_deref().unwrap_or(fallback);
+        let (reason, issue) = crate::expr::ptr_shape_context_rule_text(rule);
+        crate::opt_report::unconsumed(crate::opt_report::Unconsumed {
+            position,
+            name,
+            local_id,
+            analysis: crate::opt_report::Analysis::PtrShape,
+            rep: "Ptr<Shape>",
+            rule,
+            reason,
+            tier: crate::opt_report::Tier::CompilerLimitation,
+            issue: Some(issue),
+            detail: Some(format!(
+                "proven Ptr<Shape> of class {}; every access site keeps the guard diamond",
+                fact.class_name
+            )),
+        });
+    }
+
+    /// Record that codegen COMMITTED to a `Ptr<Shape>` lowering for `e`.
+    ///
+    /// Call from the taken branch of a site that has already decided to emit
+    /// the guard-free form — never from the accessor, which answers `Some` at
+    /// sites that then reject the fact on a class or numeric-field mismatch and
+    /// emit the guarded diamond anyway.
+    pub(crate) fn note_ptr_shape_consumed(&self, e: &perry_hir::Expr, site: &'static str) {
+        if !crate::opt_report::enabled() {
+            return;
+        }
+        let Some(fact) = self.ptr_shape_fact_ignoring_context(e) else {
+            return;
+        };
+        let (position, fallback) = match e {
+            perry_hir::Expr::This => (crate::opt_report::Position::Param, "this"),
+            _ => (crate::opt_report::Position::Local, "<local>"),
+        };
+        let local_id = match e {
+            perry_hir::Expr::LocalGet(id) => Some(*id),
+            _ => None,
+        };
+        crate::opt_report::consume(
+            position,
+            fact.report_name.as_deref().unwrap_or(fallback),
+            local_id,
+            crate::opt_report::Analysis::PtrShape,
+            "Ptr<Shape>",
+            site,
+        );
+    }
+
     pub fn next_loop_proof_scope_id(&mut self) -> u32 {
         let id = self.next_loop_proof_scope_id;
         self.next_loop_proof_scope_id = self
@@ -1800,10 +2037,7 @@ pub(crate) fn is_compiler_private_async_i1_control_local(ctx: &FnCtx<'_>, id: u3
 
 pub(crate) fn load_boxed_local_pointer(ctx: &mut FnCtx<'_>, id: u32) -> Result<Option<String>> {
     if let Some(&capture_idx) = ctx.closure_captures.get(&id) {
-        let closure_ptr = ctx
-            .current_closure_ptr
-            .clone()
-            .ok_or_else(|| anyhow!("boxed local capture but no current_closure_ptr"))?;
+        let closure_ptr = current_closure_ptr_value(ctx, "boxed local capture")?;
         let cap_bits = ctx.block().call(
             I64,
             "js_closure_get_capture_bits",

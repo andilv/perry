@@ -42,6 +42,9 @@ mod extract_requires;
 mod hoist_classes;
 mod wrap;
 
+#[cfg(test)]
+mod issue_6585_tests;
+
 // Cross-sibling helpers — siblings reach for these via `use super::*;`.
 use detect::is_js_reserved_word;
 use extract_exports::{
@@ -640,6 +643,33 @@ module.exports = inner;
         assert!(
             wrapped.contains("export const Warning = _cjs.Warning;"),
             "expected ordinary `export const Warning`, got:\n{}",
+            wrapped
+        );
+    }
+
+    #[test]
+    fn wrap_does_not_shadow_global_this_named_export() {
+        // Regression (a rolldown-bundled primordials capture in a
+        // hardened-runtime helper package):
+        // `exports.globalThis = capturedGlobalThis;`. Emitting
+        // `export const globalThis = _cjs.globalThis;` shadows the REAL
+        // `globalThis` for every `globalThis.<prop>` read in the body — all
+        // of which evaluate before the IIFE returns — so module init read
+        // `undefined.atob` and threw.
+        let src = "const capturedGlobalThis = globalThis;\n\
+                   const atob = globalThis.atob;\n\
+                   exports.atob = atob;\n\
+                   exports.globalThis = capturedGlobalThis;";
+        let wrapped = wrap_commonjs(src, &PathBuf::from("/tmp/pkg/globals.js"));
+        assert!(
+            !wrapped.contains("export const globalThis = _cjs.globalThis;"),
+            "must NOT emit a shadowing `export const globalThis`, got:\n{}",
+            wrapped
+        );
+        assert!(
+            wrapped.contains("const __cjsexp_globalThis = _cjs.globalThis;")
+                && wrapped.contains("export { __cjsexp_globalThis as globalThis };"),
+            "expected mangled re-export of the globalThis-named export, got:\n{}",
             wrapped
         );
     }

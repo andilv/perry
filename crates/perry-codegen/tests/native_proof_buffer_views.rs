@@ -1,3 +1,9 @@
+// The `native_proof_*` integration tests share one hand-written HIR builder
+// toolkit, and each file drives a different subset of it. Per-file pruning
+// would make the next test in this family re-add the builder it needs, so the
+// toolkit stays whole.
+#![allow(dead_code)]
+
 use perry_codegen::{compile_module, AppMetadata, CompileOptions};
 use perry_hir::types::{FunctionType, ObjectType, PropertyInfo, Type};
 use perry_hir::{
@@ -1649,6 +1655,13 @@ fn uint8array_const_local_length_uses_inline_byte_get_set() {
     assert!(
         !ir.contains("call i32 @js_uint8array_get"),
         "inline Uint8Array get should not call the runtime helper:\n{ir}"
+    );
+    // The JS-value getter is the other way this could fall back after
+    // #6088/#6092; without naming it here the negative assertion above would
+    // miss a regression that took the slow path.
+    assert!(
+        !ir.contains("call double @js_uint8array_index_get_value"),
+        "inline Uint8Array get should not call the JS-value runtime helper:\n{ir}"
     );
 }
 

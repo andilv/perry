@@ -114,13 +114,23 @@ fn async_hooks_static_method_value(
     length: u32,
 ) -> f64 {
     crate::closure::js_register_closure_rest(func_ptr, fixed_arity);
+    let scope = crate::gc::RuntimeHandleScope::new();
     let closure = crate::closure::js_closure_alloc(func_ptr, 0);
     if closure.is_null() {
         return f64::from_bits(crate::value::TAG_UNDEFINED);
     }
-    set_bound_native_closure_name(closure, name);
-    set_builtin_closure_length(closure as usize, length);
-    crate::value::js_nanbox_pointer(closure as i64)
+    let closure_handle = scope.root_raw_mut_ptr(closure);
+    set_bound_native_closure_name(
+        closure_handle.get_raw_mut_ptr::<crate::closure::ClosureHeader>(),
+        name,
+    );
+    set_builtin_closure_length(
+        closure_handle.get_raw_mut_ptr::<crate::closure::ClosureHeader>() as usize,
+        length,
+    );
+    crate::value::js_nanbox_pointer(
+        closure_handle.get_raw_mut_ptr::<crate::closure::ClosureHeader>() as i64,
+    )
 }
 
 extern "C" fn fs_namespace_descriptor_getter_thunk(
@@ -246,7 +256,7 @@ fn native_callable_export_arity_reference(module: &str, prop: &str) -> Option<u3
         ("querystring", "escape") => Some(1),
         ("querystring", "stringify" | "parse") => Some(4),
         ("async_hooks", "AsyncLocalStorage") => Some(0),
-        ("async_hooks", "AsyncResource") => Some(2),
+        ("async_hooks", "AsyncResource") => Some(1),
         ("async_hooks", "createHook") => Some(1),
         ("async_hooks", "executionAsyncId") => Some(0),
         ("async_hooks", "triggerAsyncId") => Some(0),
@@ -258,6 +268,7 @@ fn native_callable_export_arity_reference(module: &str, prop: &str) -> Option<u3
             Some(1)
         }
         ("tls", "checkServerIdentity") => Some(2),
+        ("tls", "convertALPNProtocols") => Some(2),
         ("tls", "SecureContext") => Some(1),
         // #3726: `crypto.Cipheriv` / `crypto.Decipheriv` constructor exports —
         // `(cipher, key, iv, options)` arity matches Node's length 4.
@@ -370,22 +381,7 @@ fn native_callable_export_arity_reference(module: &str, prop: &str) -> Option<u3
         // #4904: http twins of the https entries above.
         ("http", "request") => Some(0),
         ("http", "get") => Some(3),
-        (
-            "stream",
-            "isDestroyed"
-            | "isDisturbed"
-            | "isErrored"
-            | "isReadable"
-            | "isWritable"
-            | "getDefaultHighWaterMark"
-            | "_isArrayBufferView"
-            | "_isUint8Array"
-            | "_uint8ArrayToBuffer",
-        ) => Some(1),
-        ("stream", "finished") => Some(3),
-        ("stream", "addAbortSignal" | "destroy" | "setDefaultHighWaterMark") => Some(2),
-        ("stream", "compose" | "pipeline") => Some(0),
-        ("stream", "duplexPair") => Some(1),
+        ("stream", "destroy") => Some(2),
         // #3712: node:http module-level helper exports.
         ("http", "validateHeaderName" | "validateHeaderValue") => Some(2),
         ("http", "setMaxIdleHTTPParsers" | "setGlobalProxyFromEnv") => Some(1),
@@ -431,7 +427,6 @@ fn native_callable_export_arity_reference(module: &str, prop: &str) -> Option<u3
         ("fs", "Stats") => Some(18),
         ("fs", "mkdtempDisposableSync") => Some(2),
         ("fs", "openAsBlob") => Some(1),
-        ("fs", "_toUnixTimestamp") => Some(1),
         ("events", "init") => Some(1),
         ("repl", "Recoverable") => Some(1),
         ("repl", "REPLServer" | "start") => Some(6),
@@ -450,7 +445,6 @@ fn native_callable_export_arity_reference(module: &str, prop: &str) -> Option<u3
         ("module", "flushCompileCache") => Some(0),
         ("module", "getCompileCacheDir") => Some(0),
         ("module", "getSourceMapsSupport") => Some(0),
-        ("module", "Module") => Some(0),
         ("module", "_findPath") => Some(3),
         ("module", "_initPaths") => Some(0),
         ("module", "_load") => Some(3),
@@ -1405,27 +1399,187 @@ pub(crate) fn timers_promises_parent_namespace() -> f64 {
     })
 }
 
-extern "C" fn util_debuglog_logger_thunk(
-    _closure: *const crate::closure::ClosureHeader,
-    _arg: f64,
-) -> f64 {
-    f64::from_bits(crate::value::TAG_UNDEFINED)
-}
-
-pub(crate) fn util_debuglog_logger_value() -> f64 {
-    let func_ptr = util_debuglog_logger_thunk as *const u8;
-    crate::closure::js_register_closure_arity(func_ptr, 1);
-    let closure = crate::closure::js_closure_alloc_singleton(func_ptr);
-    set_bound_native_closure_name(closure, "debuglog");
-    crate::value::js_nanbox_pointer(closure as i64)
-}
-
 fn attach_tty_stream_prototype(constructor_value: f64, name: &str) {
     crate::tty::attach_tty_constructor_prototype(constructor_value, name);
 }
 
 fn attach_tls_secure_context_prototype(constructor_value: f64) {
     crate::tls::attach_secure_context_constructor_prototype(constructor_value);
+}
+
+const TLS_SOCKET_PROTOTYPE_METHODS: &[(&str, u32)] = &[
+    ("setKeyCert", 1),
+    ("getSharedSigalgs", 0),
+    ("getX509Certificate", 0),
+    ("getPeerX509Certificate", 0),
+];
+
+thread_local! {
+    static TLS_DERIVED_PROTOTYPES: RefCell<Vec<(u64, u8)>> = const { RefCell::new(Vec::new()) };
+}
+
+const TLS_PARENT_EVENT_EMITTER: u8 = 1;
+const TLS_PARENT_DUPLEX: u8 = 2;
+
+pub(crate) fn scan_tls_derived_prototype_roots_mut(
+    visitor: &mut crate::gc::RuntimeRootVisitor<'_>,
+) {
+    TLS_DERIVED_PROTOTYPES.with(|prototypes| {
+        for (bits, _) in prototypes.borrow_mut().iter_mut() {
+            visitor.visit_nanbox_u64_slot(bits);
+        }
+    });
+}
+
+extern "C" fn tls_prototype_method_thunk(
+    closure: *const crate::closure::ClosureHeader,
+    rest: f64,
+) -> f64 {
+    unsafe {
+        let name_ptr = crate::closure::js_closure_get_capture_ptr(closure, 0) as *const i8;
+        let name_len = crate::closure::js_closure_get_capture_ptr(closure, 1) as usize;
+        let receiver = crate::object::js_implicit_this_get();
+        let args_array = crate::value::js_nanbox_get_pointer(rest);
+        crate::object::js_native_call_method_apply(receiver, name_ptr, name_len, args_array)
+    }
+}
+
+fn attach_tls_constructor_prototype(constructor_value: f64, constructor_name: &str) -> f64 {
+    let methods = if constructor_name == "TLSSocket" {
+        TLS_SOCKET_PROTOTYPE_METHODS
+    } else {
+        &[]
+    };
+    let constructor_js = JSValue::from_bits(constructor_value.to_bits());
+    if !constructor_js.is_pointer() {
+        return constructor_value;
+    }
+    let constructor = constructor_js.as_pointer::<crate::closure::ClosureHeader>() as usize;
+    if constructor == 0 {
+        return constructor_value;
+    }
+
+    // Every allocator below can move objects. Hold only updateable handles
+    // across allocations and reload the current address at each use.
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let constructor_handle =
+        scope.root_raw_mut_ptr(constructor as *mut crate::closure::ClosureHeader);
+    let prototype = js_object_alloc(0, 0);
+    if prototype.is_null() {
+        return crate::value::js_nanbox_pointer(
+            constructor_handle.get_raw_mut_ptr::<crate::closure::ClosureHeader>() as i64,
+        );
+    }
+    let prototype_handle = scope.root_raw_mut_ptr(prototype);
+    let constructor_key =
+        crate::string::js_string_from_bytes(b"constructor".as_ptr(), "constructor".len() as u32);
+    let constructor_key_handle = scope.root_string_ptr(constructor_key);
+    js_object_set_field_by_name(
+        prototype_handle.get_raw_mut_ptr(),
+        constructor_key_handle.get_raw_mut_ptr(),
+        crate::value::js_nanbox_pointer(
+            constructor_handle.get_raw_mut_ptr::<crate::closure::ClosureHeader>() as i64,
+        ),
+    );
+    super::super::set_builtin_property_attrs(
+        prototype_handle.get_raw_mut_ptr::<ObjectHeader>() as usize,
+        "constructor".to_string(),
+        super::super::PropertyAttrs::new(true, false, true),
+    );
+
+    let thunk = tls_prototype_method_thunk as *const u8;
+    crate::closure::js_register_closure_rest(thunk, 0);
+    for &(name, length) in methods {
+        let method = crate::closure::js_closure_alloc(thunk, 2);
+        if method.is_null() {
+            continue;
+        }
+        let method_handle = scope.root_raw_mut_ptr(method);
+        crate::closure::js_closure_set_capture_ptr(
+            method_handle.get_raw_mut_ptr(),
+            0,
+            name.as_ptr() as i64,
+        );
+        crate::closure::js_closure_set_capture_ptr(
+            method_handle.get_raw_mut_ptr(),
+            1,
+            name.len() as i64,
+        );
+        let name_string = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+        let name_handle = scope.root_string_ptr(name_string);
+        crate::closure::closure_set_dynamic_prop(
+            method_handle.get_raw_mut_ptr::<crate::closure::ClosureHeader>() as usize,
+            "name",
+            f64::from_bits(JSValue::string_ptr(name_handle.get_raw_mut_ptr()).bits()),
+        );
+        super::super::set_builtin_property_attrs(
+            method_handle.get_raw_mut_ptr::<crate::closure::ClosureHeader>() as usize,
+            "name".to_string(),
+            super::super::PropertyAttrs::new(false, false, true),
+        );
+        set_builtin_closure_length(
+            method_handle.get_raw_mut_ptr::<crate::closure::ClosureHeader>() as usize,
+            length,
+        );
+        js_object_set_field_by_name(
+            prototype_handle.get_raw_mut_ptr(),
+            name_handle.get_raw_mut_ptr(),
+            crate::value::js_nanbox_pointer(
+                method_handle.get_raw_mut_ptr::<crate::closure::ClosureHeader>() as i64,
+            ),
+        );
+        super::super::set_builtin_property_attrs(
+            prototype_handle.get_raw_mut_ptr::<ObjectHeader>() as usize,
+            name.to_string(),
+            super::super::PropertyAttrs::new(true, false, true),
+        );
+    }
+
+    crate::closure::closure_set_dynamic_prop(
+        constructor_handle.get_raw_mut_ptr::<crate::closure::ClosureHeader>() as usize,
+        "prototype",
+        crate::value::js_nanbox_pointer(prototype_handle.get_raw_mut_ptr::<ObjectHeader>() as i64),
+    );
+    let parent_kind = match constructor_name {
+        "Server" => TLS_PARENT_EVENT_EMITTER,
+        "TLSSocket" => TLS_PARENT_DUPLEX,
+        _ => 0,
+    };
+    if parent_kind != 0 {
+        let bits = crate::value::js_nanbox_pointer(
+            prototype_handle.get_raw_mut_ptr::<ObjectHeader>() as i64,
+        )
+        .to_bits();
+        crate::gc::runtime_write_barrier_root_nanbox(bits);
+        TLS_DERIVED_PROTOTYPES.with(|prototypes| {
+            let mut prototypes = prototypes.borrow_mut();
+            if !prototypes.iter().any(|(existing, _)| *existing == bits) {
+                prototypes.push((bits, parent_kind));
+            }
+        });
+    }
+    super::super::set_builtin_property_attrs(
+        constructor_handle.get_raw_mut_ptr::<crate::closure::ClosureHeader>() as usize,
+        "prototype".to_string(),
+        super::super::PropertyAttrs::new(true, false, false),
+    );
+    crate::value::js_nanbox_pointer(
+        constructor_handle.get_raw_mut_ptr::<crate::closure::ClosureHeader>() as i64,
+    )
+}
+
+pub(crate) fn tls_constructor_prototype_is_instance_of(value: f64, parent_name: &str) -> bool {
+    let parent_kind = match parent_name {
+        "EventEmitter" => TLS_PARENT_EVENT_EMITTER,
+        "Duplex" => TLS_PARENT_DUPLEX,
+        _ => return false,
+    };
+    TLS_DERIVED_PROTOTYPES.with(|prototypes| {
+        prototypes
+            .borrow()
+            .iter()
+            .any(|(bits, kind)| *bits == value.to_bits() && *kind == parent_kind)
+    })
 }
 
 pub(crate) unsafe fn bound_native_callable_module_and_method(
@@ -1479,9 +1633,16 @@ pub(crate) fn set_bound_native_closure_name(
     closure: *mut crate::closure::ClosureHeader,
     name: &str,
 ) {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let closure_handle = scope.root_raw_mut_ptr(closure);
     let ptr = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
-    let name_value = f64::from_bits(JSValue::string_ptr(ptr).bits());
-    crate::closure::closure_set_dynamic_prop(closure as usize, "name", name_value);
+    let name_handle = scope.root_string_ptr(ptr);
+    let name_value = f64::from_bits(JSValue::string_ptr(name_handle.get_raw_mut_ptr()).bits());
+    crate::closure::closure_set_dynamic_prop(
+        closure_handle.get_raw_mut_ptr::<crate::closure::ClosureHeader>() as usize,
+        "name",
+        name_value,
+    );
     // Spec: a function's `name` property is { writable:false, enumerable:false,
     // configurable:true }. Storing it as a plain dynamic prop left it ENUMERABLE
     // by default, so `for (k in Buffer)` yielded "name" — even though
@@ -1504,7 +1665,7 @@ pub(crate) fn set_bound_native_closure_name(
     // table unconditionally, so the builtin variant preserves the
     // safe-buffer semantics above.
     crate::object::set_builtin_property_attrs(
-        closure as usize,
+        closure_handle.get_raw_mut_ptr::<crate::closure::ClosureHeader>() as usize,
         "name".to_string(),
         crate::object::PropertyAttrs::new(false, false, true),
     );
@@ -1606,6 +1767,8 @@ pub(crate) unsafe fn nm_attach_tls(
 ) -> f64 {
     if property_name == "SecureContext" {
         attach_tls_secure_context_prototype(value);
+    } else if matches!(property_name, "Server" | "TLSSocket") {
+        value = attach_tls_constructor_prototype(value, property_name);
     }
     value
 }
@@ -1715,43 +1878,59 @@ pub(crate) unsafe fn nm_attach_perf_hooks(
 pub(crate) unsafe fn nm_attach_async_hooks(
     property_name: &str,
     mut value: f64,
-    closure_addr: usize,
+    _closure_addr: usize,
 ) -> f64 {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let constructor_handle = scope.root_nanbox_f64(value);
     if property_name == "AsyncLocalStorage" {
-        crate::closure::closure_set_dynamic_prop(
-            closure_addr,
-            "bind",
-            async_hooks_static_method_value(
-                crate::async_hooks::js_async_local_storage_static_bind_method as *const u8,
-                "bind",
-                1,
-                1,
+        constructor_handle.set_nanbox_f64(
+            super::async_hooks_exports::attach_async_local_storage_prototype(
+                constructor_handle.get_nanbox_f64(),
             ),
         );
+        let bind = scope.root_nanbox_f64(async_hooks_static_method_value(
+            crate::async_hooks::js_async_local_storage_static_bind_method as *const u8,
+            "bind",
+            1,
+            1,
+        ));
         crate::closure::closure_set_dynamic_prop(
-            closure_addr,
+            crate::value::js_nanbox_get_pointer(constructor_handle.get_nanbox_f64()) as usize,
+            "bind",
+            bind.get_nanbox_f64(),
+        );
+        let snapshot = scope.root_nanbox_f64(async_hooks_static_method_value(
+            crate::async_hooks::js_async_local_storage_static_snapshot_method as *const u8,
             "snapshot",
-            async_hooks_static_method_value(
-                crate::async_hooks::js_async_local_storage_static_snapshot_method as *const u8,
-                "snapshot",
-                0,
-                0,
-            ),
+            0,
+            0,
+        ));
+        crate::closure::closure_set_dynamic_prop(
+            crate::value::js_nanbox_get_pointer(constructor_handle.get_nanbox_f64()) as usize,
+            "snapshot",
+            snapshot.get_nanbox_f64(),
         );
     }
 
     if property_name == "AsyncResource" {
-        crate::closure::closure_set_dynamic_prop(
-            closure_addr,
-            "bind",
-            async_hooks_static_method_value(
-                crate::async_hooks::js_async_resource_static_bind_method as *const u8,
-                "bind",
-                3,
-                3,
+        constructor_handle.set_nanbox_f64(
+            super::async_hooks_exports::attach_async_resource_prototype(
+                constructor_handle.get_nanbox_f64(),
             ),
         );
+        let bind = scope.root_nanbox_f64(async_hooks_static_method_value(
+            crate::async_hooks::js_async_resource_static_bind_method as *const u8,
+            "bind",
+            3,
+            3,
+        ));
+        crate::closure::closure_set_dynamic_prop(
+            crate::value::js_nanbox_get_pointer(constructor_handle.get_nanbox_f64()) as usize,
+            "bind",
+            bind.get_nanbox_f64(),
+        );
     }
+    value = constructor_handle.get_nanbox_f64();
     value
 }
 
@@ -1849,7 +2028,7 @@ static CALLABLE_EXPORT_ARITY_TABLE: &[(&str, &[(&str, u32)])] = &[
         "async_hooks",
         &[
             ("AsyncLocalStorage", 0),
-            ("AsyncResource", 2),
+            ("AsyncResource", 1),
             ("createHook", 1),
             ("executionAsyncId", 0),
             ("executionAsyncResource", 0),
@@ -2135,6 +2314,7 @@ static CALLABLE_EXPORT_ARITY_TABLE: &[(&str, &[(&str, u32)])] = &[
             ("TLSSocket", 2),
             ("checkServerIdentity", 2),
             ("connect", 4),
+            ("convertALPNProtocols", 2),
             ("createSecureContext", 1),
             ("createServer", 2),
             ("getCACertificates", 1),
@@ -2251,5 +2431,51 @@ mod callable_export_arity_table_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn tls_constructor_prototypes_match_node_parent_classes() {
+        let server = bound_native_callable_export_value("tls", "Server");
+        let server_addr = (server.to_bits() & crate::value::POINTER_MASK) as usize;
+        let server_proto = crate::closure::closure_get_dynamic_prop(server_addr, "prototype");
+        assert!(tls_constructor_prototype_is_instance_of(
+            server_proto,
+            "EventEmitter"
+        ));
+        assert_eq!(
+            crate::object::js_instanceof(server_proto, 0xFFFF_0076).to_bits(),
+            crate::value::TAG_TRUE
+        );
+        let event_emitter = bound_native_callable_export_value("events", "EventEmitter");
+        assert_eq!(
+            crate::object::js_instanceof_dynamic(server_proto, event_emitter).to_bits(),
+            crate::value::TAG_TRUE
+        );
+
+        let socket = bound_native_callable_export_value("tls", "TLSSocket");
+        let socket_addr = (socket.to_bits() & crate::value::POINTER_MASK) as usize;
+        let socket_proto = crate::closure::closure_get_dynamic_prop(socket_addr, "prototype");
+        assert!(tls_constructor_prototype_is_instance_of(
+            socket_proto,
+            "Duplex"
+        ));
+        let socket_proto_obj =
+            JSValue::from_bits(socket_proto.to_bits()).as_pointer::<ObjectHeader>();
+        for &(name, length) in TLS_SOCKET_PROTOTYPE_METHODS {
+            let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+            let method = crate::object::js_object_get_field_by_name(socket_proto_obj, key);
+            let method_addr = method.as_pointer::<crate::closure::ClosureHeader>() as usize;
+            assert!(crate::closure::is_closure_ptr(method_addr), "{name}");
+            assert_eq!(builtin_closure_length(method_addr), Some(length), "{name}");
+        }
+        assert_eq!(
+            crate::object::js_instanceof(socket_proto, 0xFFFF_0073).to_bits(),
+            crate::value::TAG_TRUE
+        );
+        let duplex = bound_native_callable_export_value("stream", "Duplex");
+        assert_eq!(
+            crate::object::js_instanceof_dynamic(socket_proto, duplex).to_bits(),
+            crate::value::TAG_TRUE
+        );
     }
 }

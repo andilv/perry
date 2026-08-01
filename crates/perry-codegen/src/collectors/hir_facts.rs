@@ -47,6 +47,23 @@ pub(crate) struct RepresentationFacts {
     /// strictly-i32-bounded — the box `slot.ts` mix shape (`let l = P[0]` from
     /// an Int32Array PARAM, bitwise-only updates and observations).
     pub int_valued_ta_locals: HashSet<u32>,
+    /// Locals proven to stay inside i32 range by the monotone loop-induction
+    /// argument (#7110): single literal initialiser, every write a step whose
+    /// direction agrees with a constant-bounded guard on the immediately
+    /// enclosing loop, both interval endpoints inside i32. Like
+    /// `int_valued_ta_locals` this is a canonical-storage-only admission term
+    /// — it never widens the parallel-shadow `needs_i32_slot` gate. See
+    /// `collectors/loop_bounded_i32.rs`.
+    pub loop_bounded_i32_locals: HashSet<u32>,
+    /// Locals whose canonical-i32 promotion is PROVABLE but not PROFITABLE
+    /// (#7128): written after declaration, no i32-consuming read anywhere in
+    /// the body, and at least one double-consuming read inside a loop — so the
+    /// i32 slot only ever converts back, emitting strictly more work than the
+    /// boxed representation. A refusal set, subtracted from the canonical-i32
+    /// eligibility conjunction and from nothing else. See
+    /// `collectors/repsel_benefit.rs` for the +14.87% `15_mandelbrot`
+    /// measurement that motivates it.
+    pub unprofitable_canonical_i32_locals: HashSet<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +170,14 @@ impl TypeFacts {
 
     pub(crate) fn int_valued_ta_locals(&self) -> &HashSet<u32> {
         &self.representation.int_valued_ta_locals
+    }
+
+    pub(crate) fn loop_bounded_i32_locals(&self) -> &HashSet<u32> {
+        &self.representation.loop_bounded_i32_locals
+    }
+
+    pub(crate) fn unprofitable_canonical_i32_locals(&self) -> &HashSet<u32> {
+        &self.representation.unprofitable_canonical_i32_locals
     }
 
     pub(crate) fn not_bigint_locals(&self) -> &HashSet<u32> {
@@ -378,16 +403,50 @@ pub(crate) fn collect_type_facts(
             binding_types,
             spec_ta_lens,
         );
+        // `--opt-report` (#6952) / promotion census (#7106): the win column
+        // for this analysis, recorded at the ONE site where a candidate
+        // actually becomes a fact, so the report can never claim a promotion
+        // the codegen did not take (or miss one it did). Both name walks are
+        // skipped entirely when the report is off.
+        let (names, depths) = if crate::opt_report::enabled() {
+            (
+                super::ptr_shape_report::local_names(stmts),
+                super::ptr_shape_report::loop_depths(stmts),
+            )
+        } else {
+            (HashMap::new(), HashMap::new())
+        };
         for id in extra {
             if !boxed_vars.contains(&id) && !module_globals.contains_key(&id) {
                 integer_locals.insert(id);
                 // Retained as its own fact for repsel Phase 1 eligibility —
                 // see `RepresentationFacts::int_valued_ta_locals`.
                 int_valued_ta_locals.insert(id);
+                if crate::opt_report::enabled() {
+                    let fallback = format!("<local {id}>");
+                    let name = names.get(&id).map(String::as_str).unwrap_or(&fallback);
+                    crate::opt_report::select(
+                        crate::opt_report::Position::Local,
+                        name,
+                        Some(id),
+                        crate::opt_report::Analysis::IntValuedTa,
+                        "IntValued",
+                        depths.get(&id).copied().unwrap_or(0),
+                        None,
+                    );
+                }
             }
         }
     }
     let unsigned_i32_locals = super::i32_locals::collect_unsigned_i32_locals(stmts);
+    // #7110: the monotone loop-induction i32 range proof. Skipped entirely when
+    // canonical selection is off, so the `PERRY_CANONICAL_I32_LOCALS=0`
+    // bisection arm reproduces the pre-phase model with no analysis run at all.
+    let loop_bounded_i32_locals = if crate::expr::canonical_i32_locals_enabled() {
+        super::loop_bounded_i32::collect_loop_bounded_i32_locals(stmts, compile_time_constants)
+    } else {
+        HashSet::new()
+    };
     let not_bigint_locals =
         super::not_bigint_locals::collect_not_bigint_locals(stmts, params, binding_types);
     let (array_facts, effect_facts, materialization_hazards) =
@@ -410,6 +469,26 @@ pub(crate) fn collect_type_facts(
         clamp_fn_ids,
         strict_int_ta_views,
     );
+    // #7128: the profitability half of canonical-i32 selection. Every term
+    // above answers "may we?"; this one answers "should we?", and it is
+    // computed here — after the storage facts it consults — rather than folded
+    // into any of them, so a future widening of a range proof cannot silently
+    // move the benefit verdict (and vice versa). Skipped entirely when
+    // canonical selection is off: that arm selects nothing, so a refusal set
+    // for it would be dead work.
+    let unprofitable_canonical_i32_locals = if crate::expr::canonical_i32_locals_enabled() {
+        super::repsel_benefit::collect_unprofitable_canonical_i32_locals(
+            stmts,
+            &super::repsel_benefit::I32StorageFacts {
+                index_used: &index_used_locals,
+                strictly_bounded: &strictly_i32_bounded_locals,
+                unsigned: &unsigned_i32_locals,
+                int_valued_ta: &int_valued_ta_locals,
+            },
+        )
+    } else {
+        HashSet::new()
+    };
     let known_noalias_buffer_locals = collect_known_noalias_buffer_locals(stmts);
     let non_escaping_news = super::escape_news::collect_non_escaping_news(
         stmts,
@@ -478,6 +557,8 @@ pub(crate) fn collect_type_facts(
             unsigned_i32_locals,
             not_bigint_locals,
             int_valued_ta_locals,
+            loop_bounded_i32_locals,
+            unprofitable_canonical_i32_locals,
         },
         arrays: array_facts,
         effect: effect_facts,

@@ -112,6 +112,18 @@ Generational mark-sweep GC in `crates/perry-runtime/src/gc.rs` (default since v0
 
 **Escape hatches**: `PERRY_GEN_GC=0`/`off`/`false` reverts to full mark-sweep (bisection only). `PERRY_GEN_GC_EVACUATE=0`/`off`/`false` disables policy evacuation; `=1`/`on`/`true` is accepted as auto-policy allowed, not unconditional evacuation. `PERRY_GC_FORCE_EVACUATE=1` stress-copies every marked non-pinned nursery object only when generated write barriers are active and policy evacuation is allowed. `PERRY_GC_VERIFY_EVACUATION=1` panics if any mutable live slot still points at a forwarded nursery object after an evacuation/rewrite cycle. `PERRY_WRITE_BARRIERS=0`/`off`/`false` disables codegen-emitted write barriers at compile time and runtime exact helper barriers at runtime for benchmark/debug bisection; unset, `=1`/`on`/`true` keep barriers enabled. `PERRY_GC_DIAG=1` prints per-cycle diagnostics, including evacuation-policy decisions for considered cycles and `barriers_inactive` skips.
 
+### GC knob kill-policy (binding)
+
+**Every GC env knob either has a required CI arm exercising its OFF state, or it is deleted after one release of soak.** At most one diagnostic-only knob may exist at a time, and it must be labelled untested.
+
+This is not tidiness. An unexercised mode is a configuration nobody has verified, and this project has repeatedly paid for that:
+
+- `PERRY_GC_FORCE_EVACUATE` was **inert** for every `gc()`-driven test — it is read only on the minor path, while `gc()` runs a full mark-sweep with a forced conservative scan (#6942/#6946). Months of "passes under evacuation" meant nothing.
+- The matrix's `--pressure` knob **disabled the very path it was measuring** — the defer hard cap and the arena-trigger ceiling shared a formula and collapsed together, so the `default` arm ran zero copying minors on all 22 rows (#7024).
+- `gc_incremental_enabled`'s doc said "EXPERIMENTAL — default OFF" eight lines above a body comment saying "DEFAULT ON" (#6987). A merge decision was made on the wrong one.
+
+**A mode that still exists is a decision that hasn't been made.** When a knob's off-state stops being exercised, delete the off-state and the branch behind it — the losing mode should stop compiling, not linger as an untested configuration that a future bisect will trust.
+
 ## Threading (`perry/thread`)
 
 Single-threaded by default. `perry/thread` provides:
@@ -189,6 +201,17 @@ Build outputs are invisible to `git status`, so a clean tree tells you nothing a
 - **addr-class ratchet** (`scripts/addr_class_inventory.py`) — a file gaining a bare-address site fails `lint`.
 - **`conformance-smoke` shards are flaky.** Before believing a red shard, re-run it and A/B the named tests against a pristine `main` build; several are already in `test-parity/known_failures.json`.
 - **Integration suites under `crates/*/tests/*.rs` do not run per-PR** (nightly/tag only) — a regression there can land green and sit red for days. Prefer putting acceptance coverage in `cargo-test`-visible unit tests (#5960).
+
+### ★ Four ways a gate can be unable to fail
+
+All four look fine on the Actions page. None can turn a merge red. When adding or reviewing a gate, check all four — each has bitten this repo, three of them within one week:
+
+1. **`continue-on-error: true`** — `gc-stress` carried it for months while being the only job covering GC correctness.
+2. **Not in branch protection's required contexts** — `gc-stress` again. This is why #6925's `PERRY_PTR_SHAPE_LOCALS=0` regression landed visibly red and survived three merges. A job that reports failure without blocking is documentation, not a gate.
+3. **`concurrency` with unconditional `cancel-in-progress`** — on a branch with a slow runner queue, every new merge cancels the previous run before it reaches a runner. `gc-ratchet` had three consecutive `main` runs cancelled, zero executed. Scope cancellation to `pull_request` and let `main` runs queue.
+4. **The gate runs but its subject never did** — the most dangerous, because the job is genuinely green. `PERRY_GC_FORCE_EVACUATE` was inert for every `gc()`-driven test (#6942/#6946); the matrix's `--pressure` knob disabled the very path it was measuring (#7024); its `moved=` counter summed two different collectors, so a cell could pass having run zero copying minors (#7025). **A gate must assert its subject was live**, not merely that nothing threw — e.g. `copied_objects > 0` before a green verdict.
+
+Corollary: a *new* gate has never been green, so promoting it to required immediately blocks every open PR. Run it once, then promote. Leaving that second step undone is how (2) happens.
 
 ### Known-weak areas (symptom is often not the bug)
 - **Async-to-generator transform, body locals.** It boxes every body local into a shared mutable cell typed `Any`. Two consequences seen in the wild: per-iteration `let`/`const` bindings collapse for closures created in a loop, and computed numeric-key calls (`arr[i](x)`) lose their type proof and silently resolve by *method name*, evaporating the call.

@@ -1,16 +1,15 @@
 use super::*;
 
-use std::collections::BTreeSet;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
-use std::time::SystemTime;
 
 use crate::commands::stdlib_features::{compute_required_features, features_to_cargo_arg};
 use crate::OutputFormat;
 
-use super::super::library_search::{find_harmonyos_sdk, harmonyos_cross_env};
-use super::super::{find_perry_workspace_root, rust_target_triple, CompilationContext};
+use super::super::library_search::{find_harmonyos_sdk, harmonyos_cross_env, host_target_triple};
+use super::super::{
+    find_perry_workspace_root, is_android_target, rust_target_triple, CompilationContext,
+};
 
 /// Rebuild perry-runtime + perry-stdlib in a single cargo invocation with
 /// the chosen Cargo features and panic mode, and return paths to the
@@ -44,6 +43,18 @@ pub(crate) fn build_optimized_libs(
     let imports_fastify = iteration_set
         .iter()
         .any(|m| m.strip_prefix("node:").unwrap_or(m) == "fastify");
+    let imports_undici = iteration_set
+        .iter()
+        .any(|m| m.strip_prefix("node:").unwrap_or(m) == "undici");
+    if imports_undici && !use_well_known {
+        eprintln!(
+            "error: `import 'undici'` requires the external perry-ext-undici wrapper, but the \
+             well-known flip is disabled (PERRY_DISABLE_WELL_KNOWN). There is no in-stdlib undici \
+             namespace fallback; unset PERRY_DISABLE_WELL_KNOWN so undici routes to \
+             perry-ext-undici."
+        );
+        std::process::exit(1);
+    }
     if imports_fastify && !use_well_known {
         eprintln!(
             "error: `import 'fastify'` requires the external perry-ext-fastify wrapper, but the \
@@ -143,23 +154,8 @@ pub(crate) fn build_optimized_libs(
     // through perry-stdlib's tokio. Their workspace-built .a stays
     // fine.
     let mut tokio_using_bindings: Vec<(String, String, Option<String>)> = Vec::new();
-    // Closes #589: hono + node:http combinations dropped js_headers_new /
-    // js_response_new / js_request_new at link time. The well-known flip
-    // strips perry-stdlib's `http-client` feature when `node:http` is
-    // imported and routes to perry-ext-http — but perry-ext-http only
-    // exports the HTTP-client surface (`js_http_*` / `js_node_http_*`),
-    // not the Web Fetch ctors that hono's compiled output references.
-    //
-    // When the user's TS code (or any compilePackages-resolved module like
-    // hono) constructs `new Headers(...)` / `new Request(...)` / `new Response(...)`,
-    // the HIR sets `ctx.uses_fetch = true` (see
-    // `crates/perry-hir/src/destructuring.rs::1469-1492` + the explicit
-    // `fetch(...)` arms in `lower/expr_call.rs`). Keep `http-client` below
-    // so perry-stdlib supplies both the constructors and the erased-type
-    // Request/Response/Headers/Blob dispatch registries. Do not synthesize
-    // the `"fetch"` well-known binding from `uses_fetch`: perry-ext-fetch has
-    // separate registries, so a builtin `new Request()` constructed there
-    // would make `(req as any).url` miss stdlib's dispatch path.
+    // Web Fetch is selected independently from the external node:http
+    // binding. `uses_fetch` adds `web-fetch` in compute_required_features.
     if use_well_known {
         for module in &iteration_set {
             let module_normalized = module.strip_prefix("node:").unwrap_or(module);
@@ -248,31 +244,6 @@ pub(crate) fn build_optimized_libs(
             // `compute_required_features` consulted above, so we
             // know exactly what to remove.
             for feat in crate::commands::stdlib_features::module_to_features(module_normalized) {
-                // Fix #589 / #5174: `node:http` / `node:https` /
-                // `node:http2` map to `http-client`, but that umbrella
-                // covers BOTH the bundled node:http client
-                // (`src/http.rs` + `src/axios.rs`) AND the Web Fetch
-                // FFIs (`js_headers_new`, `js_response_new`,
-                // `js_request_new`, …). When a program uses
-                // `new Headers()` / `new Response()` (directly or via a
-                // compilePackages package like hono) while also
-                // importing `node:http`, we must keep the Web Fetch
-                // half but drop the bundled client — otherwise its
-                // `js_http_process_pending` (and the rest of the
-                // `js_http_*` surface) duplicate perry-ext-http's
-                // symbols, and perry-ext-http's aux-pump call binds to
-                // perry-stdlib's empty-queue copy, wedging the
-                // in-process response pump (#5174). Since `http-client
-                // = ["web-fetch"]`, strip the umbrella and re-assert
-                // `web-fetch`: fetch.rs/fetch_blob.rs stay,
-                // http.rs/axios.rs go. The well-known staticlib
-                // (perry-ext-http / perry-ext-http-server) is still
-                // added for the actual node:http surface.
-                if *feat == "http-client" && ctx.uses_fetch {
-                    features.remove("http-client");
-                    features.insert("web-fetch");
-                    continue;
-                }
                 // Refs #643: keep `database-sqlite` enabled even when
                 // `better-sqlite3` routes to perry-ext-better-sqlite3.
                 // perry-stdlib's `dispatch_sqlite_stmt` (the dynamic
@@ -325,6 +296,18 @@ pub(crate) fn build_optimized_libs(
             }) {
                 features.insert("async-runtime");
             }
+            // `undici` (#466): perry-ext-undici is thin glue over the
+            // native Web Fetch stack. Its `setGlobalDispatcher` writes
+            // the proxy config through `js_fetch_set_global_proxy`,
+            // defined in perry-stdlib's `web-fetch` module (and mirrored
+            // by perry-ext-fetch). A ProxyAgent-only program never calls
+            // `fetch()` in a way `uses_fetch` detects, so re-assert
+            // `web-fetch` here or the wrapper's extern reference dangles
+            // at link time. (`web-fetch` implies `async-runtime`, which
+            // the wrapper's JsPromise surface needs anyway.)
+            if module_normalized == "undici" {
+                features.insert("web-fetch");
+            }
             // v0.5.579 — when the flip strips `bundled-net`, activate
             // `external-net-pump` so perry-stdlib's
             // `js_stdlib_process_pending` knows to call into
@@ -333,15 +316,28 @@ pub(crate) fn build_optimized_libs(
             if original_features.contains(&"bundled-net") {
                 features.insert("external-net-pump");
             }
-            // #1843 — when the flip strips `compression` and routes
-            // `node:zlib` to perry-ext-zlib, activate `external-zlib-pump`
-            // so perry-stdlib's main-thread pump + active-handles gate drain
-            // perry-ext-zlib's deferred stream-event queue and route
-            // `gz.write()`/`.on()`/`.pipe()` (lost-static-type) calls into its
-            // `js_ext_zlib_dispatch_method`. Without this the events stay
-            // queued forever (`createGzip().on('data')` never fires).
-            if original_features.contains(&"compression") {
+            // #1843 — when the flip strips the compression base feature and
+            // routes `node:zlib` to perry-ext-zlib, activate
+            // `external-zlib-pump` so perry-stdlib's main-thread pump +
+            // active-handles gate drain perry-ext-zlib's deferred
+            // stream-event queue and route `gz.write()`/`.on()`/`.pipe()`
+            // (lost-static-type) calls into its `js_ext_zlib_dispatch_method`.
+            // Without this the events stay queued forever
+            // (`createGzip().on('data')` never fires). `module_to_features`
+            // maps `zlib` to `compression-gzip` since the per-codec split;
+            // keep matching the legacy `compression` umbrella too so a
+            // future mapping change can't silently drop the pump.
+            if original_features.contains(&"compression-gzip")
+                || original_features.contains(&"compression")
+            {
                 features.insert("external-zlib-pump");
+                // The per-codec add-ons imply `compression-gzip` at the Cargo
+                // level, so leaving them enabled would compile the bundled
+                // zlib module back in and duplicate perry-ext-zlib's
+                // `js_zlib_*` symbols at link. The ext crate carries all
+                // codecs, so nothing is lost by dropping them here.
+                features.remove("compression-brotli");
+                features.remove("compression-zstd");
             }
             // Closes #606 — same shape for ws. When the well-known flip
             // strips `bundled-ws` and routes to perry-ext-ws, activate
@@ -377,10 +373,10 @@ pub(crate) fn build_optimized_libs(
                 features.insert("external-fastify-pump");
             }
             // Closes #604 — when the well-known flip routes `node:http` /
-            // `node:https` / `node:http2` to perry-ext-http (which bundles
-            // perry-ext-http-server), activate `external-http-server-pump`
+            // `node:https` / `node:http2` to perry-ext-http, activate
+            // `external-http-server-pump`
             // so perry-stdlib's main-thread pump and active-handles gate
-            // call into perry-ext-http-server's queue each tick. Without
+            // call into perry-ext-http's queue each tick. Without
             // this, the http server's accept-loop tokio task pushes
             // requests that nobody drains, and the program hangs (pre-#604
             // listen() blocked the main thread; post-#604 listen() is
@@ -430,16 +426,49 @@ pub(crate) fn build_optimized_libs(
     if ctx.needs_ui {
         features.insert("async-runtime");
     }
+    // zlib per-codec cherry-pick: `import 'node:zlib'` only selected the
+    // gzip/deflate base above (`compression-gzip`). Layer the Brotli / zstd
+    // backends on when HIR usage detection saw a matching API token, and
+    // fall back to the full set when a deferred dynamic-code site could
+    // name a codec from a runtime string (`zlib[name](...)` after `eval`).
+    // Gated on the base feature still being present: if the well-known flip
+    // routed `node:zlib` to perry-ext-zlib, the sub-features would imply
+    // `compression-gzip` back on and duplicate the ext crate's `js_zlib_*`
+    // symbols at link.
+    if features.contains("compression-gzip") {
+        if ctx.uses_zlib_brotli || perry_hir::has_deferred_dynamic_code_sites() {
+            features.insert("compression-brotli");
+        }
+        if ctx.uses_zlib_zstd || perry_hir::has_deferred_dynamic_code_sites() {
+            features.insert("compression-zstd");
+        }
+    }
     // perry-stdlib unconditionally re-bundles perry-updater (so user code
     // calling `perry/updater` resolves at link time without extra wiring).
     // perry-updater used to reference the extern `js_crypto_ed25519_verify`
-    // from perry-stdlib's `crypto` feature, which is why `crypto` is forced
-    // on here. The updater now verifies in-crate via ed25519-dalek (the
-    // extern is gone — it broke the Windows CLI link, LNK2019), so this
-    // force is no longer load-bearing for the updater; it is kept
-    // conservatively until the no-crypto auto-optimize path is audited
-    // separately for other stragglers.
-    features.insert("crypto");
+    // from perry-stdlib's `crypto` feature, which is why `crypto` used to be
+    // force-inserted here for EVERY auto-optimized build. The updater now
+    // verifies in-crate via ed25519-dalek, and the remaining crypto entry
+    // points are covered by three detection layers, so the force is gone
+    // (stdlib cherry-pick — non-crypto programs save the whole crypto
+    // surface: RSA/EC/Ed25519/Ed448/ML-KEM/x509/JWT/bcrypt/argon2 + tokio):
+    //   1. `import 'node:crypto'` / bcrypt / jsonwebtoken / … →
+    //      `module_to_features` (compute_required_features above);
+    //   2. bare `crypto.*` builtins and the WebCrypto namespace →
+    //      `ctx.uses_crypto_builtins` (collect_modules/feature_detect.rs);
+    //   3. any OTHER codegen-emitted `js_crypto_*` / `js_webcrypto_*` call
+    //      (compiled-package lowering with no import in the entry module) →
+    //      the prefix rule in `perry_codegen::ext_registry::record_ffi_call`
+    //      feeds `ctx.extra_stdlib_features`, unioned in above.
+    //
+    // `async-runtime` stays force-on: perry-stdlib's ALWAYS-ON modules
+    // (worker_threads' promise bridge, readline's pump) compile against
+    // `common::async_bridge`, which is `async-runtime`-gated — a bare
+    // `--no-default-features` stdlib has never compiled, and the crypto
+    // force used to satisfy the gate transitively. Tokio was therefore in
+    // every stdlib-linking binary before the cherry-pick too; the win here
+    // is dropping the crypto/codec crates, not the runtime bridge.
+    features.insert("async-runtime");
     let feature_arg = features_to_cargo_arg(&features);
 
     // panic = "abort" is safe whenever no `catch_unwind` callers are
@@ -456,6 +485,10 @@ pub(crate) fn build_optimized_libs(
     // and the matching landing pads / Drop glue.
     let panic_abort_safe =
         !ctx.needs_ui && !ctx.needs_thread && !ctx.needs_plugins && !ctx.needs_geisterhand;
+    // Keep the opt-in immediate-abort strategy behind the same reachability
+    // proof as ordinary panic=abort. UI/thread/plugin callbacks still rely on
+    // unwinding, so disabling their unwind tables would be unsound.
+    let panic_immediate = effective_size_panic_immediate_abort(panic_abort_safe);
 
     // Locate the workspace. Without source we can't rebuild — fall back
     // to whatever's prebuilt next to perry on disk. The fallback names are
@@ -497,8 +530,8 @@ pub(crate) fn build_optimized_libs(
             // we can't rebuild perry-stdlib with a stripped feature set,
             // so the link uses the prebuilt full `libperry_stdlib.a`.
             // That full stdlib does NOT carry the `perry-ext-*` host
-            // functions — `node:http`'s server lives in perry-ext-http /
-            // perry-ext-http-server, which aren't perry-stdlib deps — so
+            // functions — `node:http`'s server lives in perry-ext-http,
+            // which isn't a perry-stdlib dependency — so
             // an out-of-box `node:http` server otherwise fails to link
             // with `Undefined symbols: _js_node_http_create_server…`.
             // Resolve the well-known ext staticlibs the program needs
@@ -557,14 +590,44 @@ pub(crate) fn build_optimized_libs(
     // "undefined symbol" link failure for exactly the newly-added entrypoints.
     // Keying on the version forces a matching rebuild whenever perry upgrades.
     // Cheap djb2 — no need for the SipHash overhead.
-    let key_input = auto_optimized_cache_key(&feature_arg, panic_abort_safe, target, ctx);
+    let key_input =
+        auto_optimized_cache_key(&feature_arg, panic_abort_safe, panic_immediate, target, ctx);
     let mut hash: u64 = 5381;
     for b in key_input.as_bytes() {
         hash = hash.wrapping_mul(33).wrapping_add(*b as u64);
     }
     let (target_dir, cargo_env_dir) = auto_target_dir_paths(&workspace_root, hash);
-    let cross_features = auto_optimized_cross_features(ctx, &features, cli_features);
-    let release_dir = if let Some(triple) = rust_target_triple(target) {
+    let mut cross_features = auto_optimized_cross_features(ctx, &features, cli_features);
+    // Binary/workspace skew guard: the baked-in list above tracks the branch
+    // this `perry` was built from, but cargo resolves it against the checkout
+    // on disk. One unknown `perry-runtime/<feat>` fails the whole resolve, and
+    // the prebuilt fallback below then links without the ext-pump entrypoints
+    // — undefined-`js_*` errors two stages away from the cause. Filter before
+    // the build stamp so the stamp keys on what actually gets built.
+    let dropped_features = retain_workspace_declared_features(&workspace_root, &mut cross_features);
+    if !dropped_features.is_empty() && matches!(format, OutputFormat::Text) {
+        eprintln!(
+            "  auto-optimize: dropping feature(s) this workspace does not declare: {} \
+             (this perry binary was likely built from a different branch than the \
+             checkout at {})",
+            dropped_features.join(", "),
+            workspace_root.display()
+        );
+    }
+    let cross_features = cross_features;
+    // `-Zbuild-std` (the `PERRY_SIZE_PANIC=abort-immediate` path) requires an
+    // explicit `--target`, and passing one relocates cargo's output into
+    // `target/<triple>/release`. Resolve the effective triple ONCE so the
+    // cargo args and this path can never disagree (they did in development:
+    // the archives built fine and the link then reported them missing).
+    let effective_triple: Option<&str> = rust_target_triple(target).or_else(|| {
+        if panic_immediate {
+            host_target_triple()
+        } else {
+            None
+        }
+    });
+    let release_dir = if let Some(triple) = effective_triple {
         target_dir.join(triple).join("release")
     } else {
         target_dir.join("release")
@@ -665,7 +728,13 @@ pub(crate) fn build_optimized_libs(
     }
 
     if matches!(format, OutputFormat::Text) {
-        let panic_str = if panic_abort_safe { "abort" } else { "unwind" };
+        let panic_str = if panic_immediate {
+            "immediate-abort"
+        } else if panic_abort_safe {
+            "abort"
+        } else {
+            "unwind"
+        };
         let feat_str = if features.is_empty() {
             "(no optional features)".to_string()
         } else {
@@ -686,7 +755,7 @@ pub(crate) fn build_optimized_libs(
     );
 
     let mut cargo_cmd = Command::new("cargo");
-    if is_tier3 {
+    if is_tier3 || panic_immediate {
         cargo_cmd.arg("+nightly");
     }
     cargo_cmd
@@ -719,6 +788,13 @@ pub(crate) fn build_optimized_libs(
     if is_tier3 {
         cargo_cmd.arg("-Zbuild-std=std,panic_abort");
     }
+    if panic_immediate && !is_tier3 {
+        // Rebuild std with the panic path collapsed to a bare `abort`: drops
+        // the backtrace symbolizer (gimli/addr2line/rustc_demangle) and the
+        // default hook's formatting machinery. `--target` is required for
+        // `-Zbuild-std`, so pin the host triple when the caller didn't cross.
+        cargo_cmd.arg("-Zbuild-std=std,panic_abort");
+    }
     // Both perry-runtime and perry-stdlib accept their own feature lists.
     // Cargo's `--features` takes `crate/feature` syntax for cross-crate
     // selection — we always enable perry-stdlib's stdlib-side bridge so
@@ -727,7 +803,7 @@ pub(crate) fn build_optimized_libs(
     if !cross_features.is_empty() {
         cargo_cmd.arg("--features").arg(cross_features.join(","));
     }
-    if let Some(triple) = rust_target_triple(target) {
+    if let Some(triple) = effective_triple {
         cargo_cmd.arg("--target").arg(triple);
     }
     // HarmonyOS cross-compile needs the OHOS SDK's clang on PATH for C
@@ -754,10 +830,7 @@ pub(crate) fn build_optimized_libs(
     // #1508: same shape for Android — cc-rs can't find the NDK clang
     // otherwise (silent on Unix where `clang` happens to exist, hard fail
     // on Windows with `clang.exe not found`).
-    if matches!(
-        target,
-        Some("android") | Some("android-x86_64") | Some("wearos")
-    ) {
+    if is_android_target(target) {
         if let Some(ndk) = std::env::var_os("ANDROID_NDK_HOME") {
             for (k, v) in
                 super::super::library_search::android_cross_env(std::path::Path::new(&ndk), target)
@@ -773,8 +846,16 @@ pub(crate) fn build_optimized_libs(
     let mut rustflags: Vec<String> = Vec::new();
     if panic_abort_safe {
         // Override the workspace profile's `panic = "unwind"` for the
-        // duration of this invocation.
-        rustflags.push("-C panic=abort".to_string());
+        // duration of this invocation. `immediate-abort` (nightly, opt-in via
+        // `PERRY_SIZE_PANIC`) goes further: the panic path collapses to a bare
+        // `abort` with no message/backtrace formatting, which is what lets the
+        // symbolizer dead-strip. It supersedes plain `abort`.
+        if panic_immediate {
+            rustflags.push("-Zunstable-options".to_string());
+            rustflags.push("-C panic=immediate-abort".to_string());
+        } else {
+            rustflags.push("-C panic=abort".to_string());
+        }
     }
     // PERRY_SIZE_OPT=z|s — rebuild the auto-optimized runtime/stdlib at
     // `-C opt-level=z`/`s` instead of the profile's `3`. RUSTFLAGS is
@@ -795,6 +876,12 @@ pub(crate) fn build_optimized_libs(
     // leaf staticlib runs the fat-LTO pass).
     if size_lto_fat() {
         cargo_cmd.env("CARGO_PROFILE_RELEASE_LTO", "fat");
+    }
+    if panic_immediate {
+        // With panics collapsed to `abort` there is nothing to unwind, so the
+        // per-function unwind tables (`__unwind_info` / `__eh_frame`, ~54 KB
+        // measured) are dead weight too.
+        rustflags.push("-C force-unwind-tables=no".to_string());
     }
     // #6125: pin the Rust-side CPU baseline to the same PERRY_TARGET_CPU
     // knob codegen's clang invocation honors, so the rebuilt runtime/stdlib
@@ -823,10 +910,7 @@ pub(crate) fn build_optimized_libs(
     // shadow stack), so those IE TLS relocations get baked into the final
     // cdylib. Force global-dynamic so the dynamic linker can resolve TLS
     // slots after the process has started.
-    if matches!(
-        target,
-        Some("android") | Some("android-x86_64") | Some("wearos")
-    ) {
+    if is_android_target(target) {
         rustflags.push(android_global_dynamic_tls_rustflag(&mut cargo_cmd).to_string());
     }
     // Set RUSTFLAGS whenever we have flags to pass, and also whenever a CPU
@@ -854,8 +938,12 @@ pub(crate) fn build_optimized_libs(
     if !status.success() {
         if matches!(format, OutputFormat::Text) {
             eprintln!(
-                "  auto-optimize: cargo build failed (exit {}), \
-                 using prebuilt libraries",
+                "  auto-optimize: cargo build failed ({}), \
+                 using prebuilt libraries. The prebuilt archives may lack the \
+                 feature-gated `js_*` entrypoints this compile routed to ext \
+                 crates; if the link fails with undefined symbols, fix the \
+                 cargo error above (or rebuild the workspace so it matches \
+                 this perry binary) and re-run.",
                 status
             );
         }
@@ -958,32 +1046,18 @@ pub(crate) fn build_optimized_libs(
             println!("  auto-optimize: emitting LLVM bitcode for whole-program LTO");
         }
 
-        let mut bc_rustflags = String::new();
-        if panic_abort_safe {
-            bc_rustflags.push_str("-C panic=abort ");
-        }
-        // Mirror the size-optimized opt level into the bitcode emission so
-        // the merged whole-program module is built from the same tuning as
-        // the staticlib archives (last `-C opt-level` wins over the
-        // profile's, same as the archive rebuild above).
-        if let Some(level) = size_opt_level() {
-            bc_rustflags.push_str(&format!("-C opt-level={level} "));
-        }
-        bc_rustflags.push_str("-C codegen-units=1");
-        // #6125: the bitcode-LTO path must obey the same CPU baseline as the
-        // staticlib build above, or the LTO'd binary re-imports the build
-        // box's ISA through the runtime bitcode.
-        if let Some(cpu) = &requested_cpu {
-            match cpu.as_str() {
-                "generic" | "off" | "none" | "0" | "false" => {}
-                cpu => {
-                    bc_rustflags.push_str(&format!(" -C target-cpu={cpu}"));
-                }
-            }
-        }
+        // Start from the exact archive-build flags so panic strategy, unwind
+        // tables, size tuning, target CPU, and platform TLS remain identical.
+        // Bitcode emission adds only its single-codegen-unit requirement.
+        let mut bc_rustflags = rustflags.clone();
+        bc_rustflags.push("-C codegen-units=1".to_string());
+        let bc_rustflags = bc_rustflags.join(" ");
 
         let emit_bc = |crate_name: &str| -> Option<PathBuf> {
             let mut cmd = Command::new("cargo");
+            if is_tier3 || panic_immediate {
+                cmd.arg("+nightly");
+            }
             cmd.current_dir(&workspace_root)
                 .env("CARGO_TARGET_DIR", &cargo_env_dir)
                 .env("RUSTFLAGS", &bc_rustflags)
@@ -992,10 +1066,13 @@ pub(crate) fn build_optimized_libs(
                 .arg("-p")
                 .arg(crate_name)
                 .arg("--no-default-features");
+            if is_tier3 || panic_immediate {
+                cmd.arg("-Zbuild-std=std,panic_abort");
+            }
             if !cross_features.is_empty() {
                 cmd.arg("--features").arg(cross_features.join(","));
             }
-            if let Some(triple) = rust_target_triple(target) {
+            if let Some(triple) = effective_triple {
                 cmd.arg("--target").arg(triple);
             }
             cmd.arg("--").arg("--emit=llvm-bc,link");
@@ -1086,7 +1163,7 @@ pub(crate) fn build_optimized_libs(
                 | Some("ios-widget")
                 | Some("ios-widget-simulator") => "perry-ui-ios",
                 Some("visionos-simulator") | Some("visionos") => "perry-ui-visionos",
-                Some("android") | Some("wearos") => "perry-ui-android",
+                target if is_android_target(target) => "perry-ui-android",
                 Some("watchos-simulator") | Some("watchos") => "perry-ui-watchos",
                 Some("tvos-simulator") | Some("tvos") => "perry-ui-tvos",
                 Some("linux") => "perry-ui-gtk4",

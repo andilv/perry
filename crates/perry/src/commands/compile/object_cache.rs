@@ -794,6 +794,13 @@ fn compute_object_cache_key_with_env(
         "env_shadow_stack",
         env_var("PERRY_SHADOW_STACK").as_deref().unwrap_or(""),
     );
+    // #7088: flips the shadow-slot store between an inline sequence and the
+    // `js_shadow_slot_*` calls. Two arms that shared a cached object would
+    // silently measure the same code.
+    h.field(
+        "env_inline_shadow_slot",
+        env_var("PERRY_INLINE_SHADOW_SLOT").as_deref().unwrap_or(""),
+    );
     h.field(
         "env_disable_buffer_fast_path",
         env_var("PERRY_DISABLE_BUFFER_FAST_PATH")
@@ -971,14 +978,27 @@ fn compute_object_cache_key_with_env(
             .unwrap_or(""),
     );
     // Representation-selection Phase 3a — canonical string locals
-    // (tagged-at-rest): `=0`/`off`/`false` reverts the Str-gated lowerings
-    // (`+=` tag-dispatch, inline `.length`, direct string compares, the
-    // char-access receiver fast arm, and the inline StringRef retag) back to
-    // the pre-phase sequences, which changes the emitted IR / .o bytes — a
-    // warm cache must not serve an object built under the other setting.
+    // (tagged-at-rest): `=0`/`off`/`false` reverts the lowerings that consult a
+    // SELECTED `Str` local (`+=` tag-dispatch, direct string compares, the
+    // char-access receiver fast arm) back to the pre-phase sequences, which
+    // changes the emitted IR / .o bytes — a warm cache must not serve an object
+    // built under the other setting.
     h.field(
         "env_canonical_str_locals",
         env_var("PERRY_CANONICAL_STR_LOCALS")
+            .as_deref()
+            .unwrap_or(""),
+    );
+    // #7128 — string fast paths that key on a value's STATIC string type and
+    // never on a canonical-`Str` selection: the inline `StringRef` retag, the
+    // proven-heap string operand handle, and the tag-dispatched `.length`.
+    // They shipped under `PERRY_CANONICAL_STR_LOCALS`, which made that knob
+    // move 24 of 26 census workloads and stop being evidence about the
+    // representation it names. `=0`/`off`/`false` reverts all three, which
+    // changes the emitted IR / .o bytes — so it keys the cache too.
+    h.field(
+        "env_static_string_lowering",
+        env_var("PERRY_STATIC_STRING_LOWERING")
             .as_deref()
             .unwrap_or(""),
     );
@@ -1005,6 +1025,13 @@ fn compute_object_cache_key_with_env(
     h.field(
         "env_ptr_shape_locals",
         env_var("PERRY_PTR_SHAPE_LOCALS").as_deref().unwrap_or(""),
+    );
+    // Representation-selection Phase 5a — proven-`this` method clones. Off
+    // removes the `__pshape` bodies and routes both proven call sites back to
+    // the public guarded body, changing the emitted IR / .o bytes.
+    h.field(
+        "env_ptr_shape_this",
+        env_var("PERRY_PTR_SHAPE_THIS").as_deref().unwrap_or(""),
     );
     // Representation-selection Phase 4a.3 — Ptr<NumArray> locals:
     // `=0`/`off`/`false` reverts proven numeric-array locals from guard-free
@@ -1166,6 +1193,7 @@ impl ObjectCache {
     /// reading the object bytes into memory. We still open the file once so
     /// unreadable cache entries fall back to a fresh compile just like
     /// `lookup` would.
+    #[allow(dead_code)] // exercised by #[cfg(test)] object_cache_tests; prod uses lookup_path_with_ffi
     pub fn lookup_path(&self, key: u64) -> Option<PathBuf> {
         let path = self.path_for(key)?;
         match fs::File::open(&path).and_then(|f| f.metadata()) {

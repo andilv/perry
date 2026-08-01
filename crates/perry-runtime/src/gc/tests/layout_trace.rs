@@ -464,6 +464,243 @@ fn test_typed_shape_descriptor_tracks_raw_numeric_slots() {
     clear_mark_seeds();
 }
 
+/// #6957 regression guard: the typed descriptor of a **shape-keyed** object must
+/// be visible to the layout query helpers.
+///
+/// #6893 keys the canonical descriptor by the shared `keys_array` (`SHAPE_LAYOUTS`)
+/// and deletes the per-object `TYPED_LAYOUTS` entry — so every class instance
+/// (the only objects that carry a keys_array) moved to the shared map. Every
+/// other test in this file allocates with `js_object_alloc` (class 0, no
+/// keys_array), which still takes the per-object path; that is precisely why the
+/// query helpers could go blind on real class instances with the whole layout
+/// suite green.
+#[test]
+fn test_typed_shape_descriptor_visible_for_shape_keyed_objects() {
+    clear_marks();
+    clear_mark_seeds();
+
+    let packed = b"x\0y\0";
+    let keys = crate::object::js_build_class_keys_array(
+        0x6957_01,
+        2,
+        packed.as_ptr(),
+        packed.len() as u32,
+    );
+    let first = crate::object::js_object_alloc_class_inline_keys(0x6957_01, 0, 2, keys);
+    let second = crate::object::js_object_alloc_class_inline_keys(0x6957_01, 0, 2, keys);
+    unsafe {
+        assert_eq!(
+            (*first).keys_array,
+            (*second).keys_array,
+            "same-shape objects must share one canonical keys array"
+        );
+    }
+
+    let raw_mask = [0b01u64];
+    for object in [first, second] {
+        crate::object::js_object_set_unboxed_f64_field(object, 0, 1.5);
+        crate::object::js_object_set_field(object, 1, crate::value::JSValue::number(2.5));
+        js_gc_init_typed_shape_layout(
+            object as u64,
+            2,
+            raw_mask.as_ptr(),
+            raw_mask.len() as u32,
+            std::ptr::null(),
+            0,
+        );
+    }
+
+    for object in [first, second] {
+        let user = object as usize;
+        assert!(
+            layout_typed_intact_for_user(user),
+            "the shared shape install must set the intact bit"
+        );
+        assert!(
+            layout_typed_raw_f64_slot_for_user(user, 0),
+            "slot 0 is raw-f64 in the shape descriptor"
+        );
+        assert!(!layout_typed_raw_f64_slot_for_user(user, 1));
+        assert!(
+            layout_slot_is_raw_f64_typed(user, 0),
+            "the store fast path must agree with layout_note_slot's own resolution"
+        );
+        assert!(
+            layout_typed_accepts_finite_number_slot_for_user(user, 1),
+            "an ordinary JSValue slot of an intact descriptor accepts finite numbers"
+        );
+    }
+
+    // A contradicting store downgrades ONLY the object that made it. The shared
+    // entry cannot be removed (it still describes every sibling), so the intact
+    // bit is what separates the two — assert both halves.
+    let payload = crate::string::js_string_from_bytes(b"boxed".as_ptr(), 5);
+    crate::object::js_object_set_field(first, 0, crate::value::JSValue::string_ptr(payload));
+
+    assert!(
+        !layout_typed_raw_f64_slot_for_user(first as usize, 0),
+        "a boxed store into a raw-f64 slot must evict this object's descriptor"
+    );
+    assert!(!layout_slot_is_raw_f64_typed(first as usize, 0));
+    assert!(
+        !layout_typed_accepts_finite_number_slot_for_user(first as usize, 0),
+        "a downgraded object must not keep reading its shape's stale descriptor"
+    );
+    assert!(
+        layout_typed_raw_f64_slot_for_user(second as usize, 0),
+        "the sibling never diverged and must keep the shared shape descriptor"
+    );
+    assert!(layout_slot_is_raw_f64_typed(second as usize, 0));
+
+    clear_marks();
+    clear_mark_seeds();
+}
+
+/// #6964: `layout_transfer` resolved the moved object's typed descriptor only
+/// through the per-object `TYPED_LAYOUTS` map. #6893 moved the canonical
+/// descriptor of every object carrying a `keys_array` (i.e. every class
+/// instance) into the shape-keyed `SHAPE_LAYOUTS` map and DELETED the per-object
+/// entry, so that lookup missed and the relocated copy had a still-valid
+/// `GC_OBJ_TYPED_LAYOUT_INTACT` bit cleared.
+///
+/// Deliberately a *shape-keyed* object: every pre-existing `layout_transfer`
+/// test allocates with `js_object_alloc` (class 0, no keys_array), which keeps
+/// its per-object entry and therefore takes the surviving path. That gap is why
+/// #6893 merged green.
+#[test]
+fn test_shape_keyed_typed_layout_survives_layout_transfer() {
+    clear_marks();
+    clear_mark_seeds();
+
+    let packed = b"x\0y\0";
+    let keys = crate::object::js_build_class_keys_array(
+        0x6964_01,
+        2,
+        packed.as_ptr(),
+        packed.len() as u32,
+    );
+    let src = crate::object::js_object_alloc_class_inline_keys(0x6964_01, 0, 2, keys);
+    crate::object::js_object_set_unboxed_f64_field(src, 0, 1.5);
+    crate::object::js_object_set_field(src, 1, crate::value::JSValue::number(2.5));
+    let raw_mask = [0b01u64];
+    js_gc_init_typed_shape_layout(
+        src as u64,
+        2,
+        raw_mask.as_ptr(),
+        raw_mask.len() as u32,
+        std::ptr::null(),
+        0,
+    );
+    assert!(layout_typed_intact_for_user(src as usize));
+    assert!(layout_typed_raw_f64_slot_for_user(src as usize, 0));
+
+    // Model an evacuation copy the way every caller performs it: a destination
+    // of the same shape, payload copied verbatim, `_reserved` propagated, then
+    // `layout_transfer`.
+    let dst = crate::object::js_object_alloc_class_inline_keys(0x6964_01, 0, 2, keys);
+    unsafe {
+        let header_size = std::mem::size_of::<crate::object::ObjectHeader>();
+        std::ptr::copy_nonoverlapping(
+            src as *const u8,
+            dst as *mut u8,
+            header_size + 2 * std::mem::size_of::<crate::value::JSValue>(),
+        );
+        let src_header = header_from_user_ptr(src as *const u8);
+        let dst_header = header_from_user_ptr(dst as *const u8);
+        (*(dst_header as *mut GcHeader))._reserved = (*src_header)._reserved;
+        layout_transfer(src as *mut u8, dst as *mut u8);
+    }
+
+    assert!(
+        layout_typed_intact_for_user(dst as usize),
+        "a relocated shape-keyed object must keep GC_OBJ_TYPED_LAYOUT_INTACT — its \
+         SHAPE_LAYOUTS descriptor is keyed by the shared keys_array, which the copy carries"
+    );
+    assert!(
+        layout_typed_raw_f64_slot_for_user(dst as usize, 0),
+        "slot 0 is still raw-f64 after relocation"
+    );
+    assert!(!layout_typed_raw_f64_slot_for_user(dst as usize, 1));
+    assert!(
+        layout_slot_is_raw_f64_typed(dst as usize, 0),
+        "the store fast path must agree with the descriptor after relocation"
+    );
+
+    // The source is downgraded on transfer (it is dead / a forwarding stub), and
+    // that must NOT take the shared entry with it: an untouched sibling still
+    // reads the shape descriptor.
+    let sibling = crate::object::js_object_alloc_class_inline_keys(0x6964_01, 0, 2, keys);
+    crate::object::js_object_set_unboxed_f64_field(sibling, 0, 7.5);
+    crate::object::js_object_set_field(sibling, 1, crate::value::JSValue::number(8.5));
+    js_gc_init_typed_shape_layout(
+        sibling as u64,
+        2,
+        raw_mask.as_ptr(),
+        raw_mask.len() as u32,
+        std::ptr::null(),
+        0,
+    );
+    assert!(layout_typed_raw_f64_slot_for_user(sibling as usize, 0));
+
+    clear_marks();
+    clear_mark_seeds();
+}
+
+/// #6964, but driven through the real evacuation path (`gc/copying.rs`'s
+/// `layout_transfer` call site) instead of calling the helper directly.
+#[test]
+fn test_shape_keyed_typed_layout_survives_copying_minor() {
+    let _guard = CopyingNurseryTestGuard::new(1);
+    let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+
+    let packed = b"x\0y\0";
+    let keys = crate::object::js_build_class_keys_array(
+        0x6964_02,
+        2,
+        packed.as_ptr(),
+        packed.len() as u32,
+    );
+    let obj = crate::object::js_object_alloc_class_inline_keys(0x6964_02, 0, 2, keys);
+    crate::object::js_object_set_unboxed_f64_field(obj, 0, 10.5);
+    crate::object::js_object_set_field(obj, 1, crate::value::JSValue::number(-3.25));
+    let raw_mask = [0b01u64];
+    js_gc_init_typed_shape_layout(
+        obj as u64,
+        2,
+        raw_mask.as_ptr(),
+        raw_mask.len() as u32,
+        std::ptr::null(),
+        0,
+    );
+    assert!(layout_typed_intact_for_user(obj as usize));
+    assert!(layout_typed_raw_f64_slot_for_user(obj as usize, 0));
+    js_shadow_slot_set(0, ptr_bits(obj as usize));
+
+    let trace = collect_minor_trace(GcTriggerKind::Direct);
+    assert_copied_minor_trace(&trace, true, CopiedMinorFallbackReason::None, false);
+
+    let after = (js_shadow_slot_get(0) & POINTER_MASK) as usize;
+    assert_ne!(
+        after, obj as usize,
+        "the copying minor must actually relocate the instance — an inert arm proves nothing"
+    );
+
+    let fields = unsafe {
+        (after as *const u8).add(std::mem::size_of::<crate::object::ObjectHeader>()) as *const u64
+    };
+    assert_eq!(f64::from_bits(unsafe { *fields.add(0) }), 10.5);
+
+    assert!(
+        layout_typed_intact_for_user(after),
+        "#6964: the relocated class instance must keep its shape-keyed typed layout"
+    );
+    assert!(
+        layout_typed_raw_f64_slot_for_user(after, 0),
+        "#6964: the shape descriptor still describes slot 0 as raw-f64 after relocation"
+    );
+    assert!(layout_slot_is_raw_f64_typed(after, 0));
+}
+
 #[test]
 fn test_typed_shape_raw_numeric_slots_accept_pointer_like_f64_bits() {
     clear_marks();

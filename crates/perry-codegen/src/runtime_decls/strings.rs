@@ -439,6 +439,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
         &[DOUBLE, DOUBLE, DOUBLE],
     );
     module.declare_function("js_fs_promises_mkdir", DOUBLE, &[DOUBLE, DOUBLE]);
+    module.declare_function("js_fs_promises_rmdir", DOUBLE, &[DOUBLE, DOUBLE]);
     // fs.mkdirSync(path) — returns i32 status (1=success).
     module.declare_function("js_fs_mkdir_sync", I32, &[DOUBLE]);
     module.declare_function("js_fs_mkdir_sync_options", I32, &[DOUBLE, DOUBLE]);
@@ -898,6 +899,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_process_emit", DOUBLE, &[I64, I64]);
     module.declare_function("js_process_emit_before_exit", VOID, &[DOUBLE]);
     module.declare_function("js_process_run_finalization_exit", VOID, &[]);
+    module.declare_function("js_trace_events_flush_output", VOID, &[]);
     module.declare_function("js_promise_report_unhandled_rejections", VOID, &[]);
     // #6666: the natural-exit epilogue returns the stored `process.exitCode`
     // (default 0) as the process status instead of a hardcoded 0.
@@ -1285,6 +1287,11 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // Decl-site snapshot of a function-nested class's captured locals —
     // consumed by the dynamic-construction replay (`new mod.C()`).
     module.declare_function("js_class_register_capture_values", VOID, &[I32, PTR, I64]);
+    module.declare_function(
+        "js_class_object_refresh_capture_values",
+        VOID,
+        &[DOUBLE, I64, DOUBLE],
+    );
     // #6052: TDZ-suppression window around the snapshot's capture loads — a
     // refresh emitted between two `let`/`const` initializers (the #6037
     // refresh-after-each-assignment strategy) legally reads a sibling capture
@@ -1293,6 +1300,11 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_tdz_suppress_end", VOID, &[]);
     // Static-method prologue read of one decl-site capture snapshot slot.
     module.declare_function("js_class_capture_value", DOUBLE, &[I32, I32]);
+    module.declare_function(
+        "js_class_capture_value_for_receiver",
+        DOUBLE,
+        &[DOUBLE, I32, I32],
+    );
     // #5437: snapshot slot read with a `new`-site appended cap-arg fallback
     // (used when no decl-site snapshot was registered for the class).
     module.declare_function("js_class_capture_value_or", DOUBLE, &[I32, I32, DOUBLE]);

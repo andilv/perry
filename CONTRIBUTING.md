@@ -22,10 +22,12 @@ Prerequisites match what CI installs — see [`.github/workflows/test.yml`](.git
 
 | Component | Version | Needed for |
 |---|---|---|
-| Rust | stable | Everything |
+| Rust | stable (≥ 1.94) | Everything. The workspace pins no toolchain, so an older `stable` fails deep in the dependency graph with a `sqlx@0.9.0 requires rustc 1.94.0` MSRV error rather than a clear message — `rustup update stable` fixes it. |
 | Rust nightly + `rust-src` | latest | tvOS / watchOS cross-compile only (`-Zbuild-std`) |
-| Node.js | 22 | Parity tests (`run_parity_tests.sh`) |
+| Node.js | see [`.node-version`](.node-version) | Parity tests (`run_parity_tests.sh`). Use that exact version — an older Node makes the harness classify tests `node_fail` and silently DROP them from the gate instead of failing. |
 | C linker | any | Linking compiled binaries (`xcode-select --install` / `build-essential` / MSVC) |
+| **libclang** | any | `bindgen`, via the `libsqlite3-sys` build script. Without it the build dies with `Unable to find libclang`. Debian/Ubuntu: `libclang-dev`; Fedora: `clang-devel`; Arch: `clang`. If it lives somewhere non-standard, point at it with `LIBCLANG_PATH=/path/to/dir` (and, if bindgen then can't find `stdarg.h`, `BINDGEN_EXTRA_CLANG_ARGS="-isystem /path/to/clang/<ver>/include"`). |
+| clang | ≥ 15 | Perry's own LLVM codegen shells out to `clang -c`. Separate from the linker above — see the [installation guide](docs/src/getting-started/installation.md). `perry doctor` verifies it. |
 
 Platform-specific extras — only required if you're touching that backend:
 
@@ -35,14 +37,23 @@ Platform-specific extras — only required if you're touching that backend:
 - **Linux UI** (`perry-ui-gtk4`): `libgtk-4-dev libadwaita-1-dev libpulse-dev pkg-config` (Xvfb for headless UI tests)
 - **Windows UI** (`perry-ui-windows`): MSVC (`ilammy/msvc-dev-cmd` or a `vcvars64.bat` session)
 
-Build and test the default (platform-independent) workspace:
+Build the default (platform-independent) workspace and run the affected crates'
+fast unit tests:
 
 ```bash
 cargo build --release
-cargo test --workspace \
-  --exclude perry-ui-ios --exclude perry-ui-tvos --exclude perry-ui-watchos \
-  --exclude perry-ui-gtk4 --exclude perry-ui-android --exclude perry-ui-windows
+./scripts/test_affected_crates.sh --base origin/main
 ```
+
+The runner includes committed, staged, and unstaged paths relative to the base
+revision; stage new files before running it because untracked paths are ignored.
+Use `--dry-run` to inspect its per-crate Cargo commands, or set
+`PERRY_TEST_BASE` to change the default base. It mirrors CI's
+`scripts/ci_test_scope.py` selection and unit-target filtering, including the
+single-threaded `perry-runtime` run. It deliberately skips integration tests
+under `crates/*/tests/`; CI runs those through its scoped and nightly jobs.
+Never replace it with `cargo test --workspace`: Perry's per-crate feature sets
+must remain isolated.
 
 For a faster inner loop, `cargo check -p perry` (correctness only) or
 `cargo build --profile perry-dev -p perry` (optimized local dev build). The
@@ -52,6 +63,13 @@ need `libperry_{runtime,stdlib}.a`. See `docs/src/contributing/building.md` for
 the full dev/release/dist taxonomy and the slim `--features dev-cli` CLI (#5422).
 
 The full README [Development](README.md#development) section has more `cargo run` recipes (HIR dumps, per-crate rebuilds).
+
+For fixture-only parity reruns, `PERRY_SKIP_BUILD=1 ./run_parity_tests.sh`
+reuses `PERRY_BIN` and the matching runtime/stdlib archives from
+`PERRY_RUNTIME_DIR` (or the binary's directory) with auto-optimization disabled.
+Rebuild instead whenever Rust or Cargo inputs, or compiler, runtime, stdlib, or
+required extension sources differ; reuse does not prove that prebuilt artifacts
+match the checkout.
 
 ## Making changes
 
@@ -77,15 +95,37 @@ We loosely follow [Conventional Commits](https://www.conventionalcommits.org/) �
 
 Comment on the issue saying you'd like to take it. We'll assign it to you. If you go quiet for a week or two, we may un-assign to let someone else pick it up — no hard feelings, just keeping the board moving.
 
-## Running the full CI suite locally
+## Running CI's checks locally
 
-Mirroring CI before pushing saves a round trip:
+Most red PRs come from gates that `cargo build` never looks at — a file
+that crossed the 2000-line cap, fmt drift, or an unbarriered GC store site.
+Run the fast, non-compiling subset with:
 
 ```bash
-cargo build --release                               # All crates
-./run_parity_tests.sh                               # Perry vs Node parity (needs Node 22)
+./scripts/pre-tag-check.sh --quick
+```
+
+That is every gate in the `lint` job that doesn't compile anything, so it
+costs seconds. Drop `--quick` to add the docs linter, `cargo check`, and
+Clippy; it also runs `cargo deny` when installed. The script prints every
+failure in one pass rather than one per push.
+
+Behavioral changes (HIR, codegen, runtime) also need the conformance suite,
+which diffs compiled programs byte-for-byte against Node:
+
+```bash
+./scripts/run_gap_tests.sh                          # 401 tests; ~1h serially
 ./scripts/run_doc_tests.sh                          # Compile + run every docs/examples/*.ts
 ```
+
+**Use the Node version pinned in `.node-version`, not whatever you have.**
+Node is the oracle the suite diffs against, so its version is a correctness
+input: on a Node too old for a test, *node* fails, the harness classifies the
+test `node_fail`, and it is dropped from the run instead of going red. CI sat
+on Node 22 while the suite grew Node 24/26 features and hid 14 tests that way.
+
+Any PR touching `crates/` also needs a `changelog.d/<PR-number>-<slug>.md`
+fragment; see [changelog.d/README.md](changelog.d/README.md).
 
 UI doc-tests launch real windows. On headless hosts, wrap in `xvfb-run -a` (Linux) or rely on `PERRY_UI_TEST_MODE=1` which auto-exits after one frame.
 

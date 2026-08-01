@@ -452,7 +452,20 @@ pub(crate) fn lower_let(
             };
             let source = lower_expr(ctx, object)?;
             let source_slot = ctx.func.alloca_entry(DOUBLE);
+            // See the array-element slots below: the root bind is hoisted to
+            // function entry, so this alloca is a live root before the store
+            // below runs. Give it a decodable `undefined` first.
+            let source_undef =
+                crate::nanbox::double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
+            ctx.func
+                .entry_allocas_push_store(DOUBLE, &source_undef, &source_slot);
             ctx.block().store(DOUBLE, &source, &source_slot);
+            // #6968: the whole point of capturing the receiver here is that the
+            // source local may be overwritten afterwards — at which moment this
+            // alloca holds the ONLY reference to that string, across every
+            // collection until the fused consumer reads it. Same unrooted-alloca
+            // hole as the object/array field slots below.
+            crate::expr::root_scalar_replaced_slot(ctx, &source_slot, object);
             let dummy_slot = ctx.func.alloca_entry(DOUBLE);
             let undef = crate::nanbox::double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
             ctx.func
@@ -562,7 +575,13 @@ pub(crate) fn lower_let(
                             (I32, &index.to_string()),
                         ],
                     );
-                    ctx.block().store(DOUBLE, &value, &slots[index as usize]);
+                    let part_slot = slots[index as usize].clone();
+                    ctx.block().store(DOUBLE, &value, &part_slot);
+                    // #6968: `js_string_split_part_value` hands back a fresh
+                    // heap string whose only reference is this alloca. There
+                    // is no HIR expression to gate on — the value is
+                    // synthesized by codegen — and it is always a string.
+                    crate::expr::root_scalar_replaced_slot_unconditional(ctx, &part_slot);
                 }
             }
             ctx.scalar_replaced_arrays.insert(id, slots);
@@ -587,8 +606,18 @@ pub(crate) fn lower_let(
         if ctx.non_escaping_arrays.contains_key(&id) {
             let n = elements.len();
             let mut slots: Vec<String> = Vec::with_capacity(n);
+            // Initialize to `undefined` in the entry block, like the
+            // object-literal field slots below. `root_scalar_replaced_slot`
+            // binds a pointer-capable element's alloca as a GC root once at
+            // function entry, which makes the collector dereference it from
+            // entry onward — before the element store runs, and on paths where
+            // it never runs at all. An uninitialized alloca would feed the
+            // root-word decoder stack garbage.
+            let undef = crate::nanbox::double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
             for _ in 0..n {
-                slots.push(ctx.func.alloca_entry(DOUBLE));
+                let slot = ctx.func.alloca_entry(DOUBLE);
+                ctx.func.entry_allocas_push_store(DOUBLE, &undef, &slot);
+                slots.push(slot);
             }
             // Evaluate each element expression first; store the
             // result into its slot. Order matches source, so any
@@ -606,6 +635,11 @@ pub(crate) fn lower_let(
                 }
                 let v = lower_expr(ctx, elem)?;
                 ctx.block().store(DOUBLE, &v, &slots[i]);
+                // #6968: same rooting hole as the object-literal fields —
+                // the element alloca is the only reference to a heap value
+                // stored here, and no HIR local names it.
+                let elem_slot = slots[i].clone();
+                crate::expr::root_scalar_replaced_slot(ctx, &elem_slot, elem);
                 // A uniquely-owned string captured into this scalar-replaced
                 // array slot aliases its heap buffer; demote it to shared so a
                 // later in-place `+=` on the source local doesn't mutate the
@@ -687,6 +721,10 @@ pub(crate) fn lower_let(
                 let v = lower_expr(ctx, value_expr)?;
                 if let Some(slot) = field_slots.get(key).cloned() {
                     ctx.block().store(DOUBLE, &v, &slot);
+                    // #6968: the field alloca is this heap value's only
+                    // reference — there is no object for #6951/#6972's
+                    // handle rooting to cover — so bind it as a precise root.
+                    crate::expr::root_scalar_replaced_slot(ctx, &slot, value_expr);
                     let lowered = LoweredValue {
                         semantic: SemanticKind::JsValue,
                         rep: NativeRep::JsValue,
@@ -744,6 +782,22 @@ pub(crate) fn lower_let(
             let scalar_data = collect_scalar_class_data(ctx, class_name);
 
             if let Some((all_fields, ctor)) = scalar_data {
+                // #7106 follow-up, mechanism 3: this binding is about to stop
+                // being an object at all. If `Ptr<Shape>` also proved it, the
+                // report already counted a promotion that cannot emit
+                // anything — no property access will ever reach a
+                // representation-selection lowering, because there is no
+                // property access left. On `07_object_create` and
+                // `12_binary_trees` that is literally the case: `--opt-report`
+                // says `selected=1` while both arms of a
+                // PERRY_PTR_SHAPE_LOCALS A/B emit byte-identical objects.
+                //
+                // Scalar replacement winning here is the BETTER outcome, not a
+                // defect; the defect is that it was indistinguishable in the
+                // report from a proof that was simply wasted.
+                if crate::opt_report::enabled() {
+                    note_ptr_shape_scalar_replaced(ctx, id, name);
+                }
                 // Create per-field allocas. For synthetic anonymous-shape
                 // classes, scalar replacement may only need fields that are
                 // observed after construction; unused constructor stores still
@@ -797,6 +851,10 @@ pub(crate) fn lower_let(
                         let arg_val = lower_expr(ctx, arg)?;
                         if let Some(slot) = slot {
                             ctx.block().store(DOUBLE, &arg_val, &slot);
+                            // #6968: anonymous-shape scalar replacement stores
+                            // constructor arguments straight into per-field
+                            // allocas — same unrooted-heap-value hole.
+                            crate::expr::root_scalar_replaced_slot(ctx, &slot, arg);
                             let lowered = LoweredValue {
                                 semantic: SemanticKind::JsValue,
                                 rep: NativeRep::JsValue,
@@ -1198,25 +1256,89 @@ pub(crate) fn lower_let(
     // (array-valued), and async/generator contexts (gated at FnCtx build).
     // See `expr/slot_rep.rs` for the mechanism and range-soundness audit.
     //
-    // Canonical-only safety term: an `int_valued_ta_locals` member (#6898) is
-    // eligible even when neither index-used nor strictly-i32-bounded — its
-    // whole-function proof (every write i32-producing or an int-kind TA read,
-    // every observation ToInt32-coercing) makes canonical-i32 storage
-    // output-invariant with the NaN-safe entry conversion. The parallel-shadow
-    // gate (`needs_i32_slot` below) is deliberately NOT widened, so the
-    // flag-off model stays exactly the pre-phase one.
-    let canonical_safe_local =
-        i32_safe_local || ctx.native_facts.int_valued_ta_locals().contains(&id);
-    let canonical_i32 = (ctx.integer_locals.contains(&id) || is_unsigned_i32_local)
+    // Canonical-only safety terms. The parallel-shadow gate (`needs_i32_slot`
+    // above) is deliberately NOT widened by either, so the flag-off model stays
+    // exactly the pre-phase one.
+    //
+    // * `int_valued_ta_locals` (#6898): every write i32-producing or an int-kind
+    //   TA read, every observation ToInt32-coercing — which makes canonical-i32
+    //   storage output-invariant with the NaN-safe entry conversion.
+    // * `loop_bounded_i32_locals` (#7110): a monotone induction variable whose
+    //   whole reachable interval is a pair of compile-time i32 constants —
+    //   single literal init, every write a step dominated by a constant-bounded
+    //   guard on the immediately enclosing loop. This is the term that admits a
+    //   plain `for (let i = 0; i < 1000000; i++)` counter, which satisfies
+    //   neither `index_used_locals` (nothing is indexed) nor
+    //   `strictly_i32_bounded_locals` (`i++` disqualifies there, #6072).
+    //   See `collectors/loop_bounded_i32.rs` for the interval argument — and
+    //   for why a bare accumulator is NOT admitted by it.
+    let canonical_safe_local = i32_safe_local
+        || ctx.native_facts.int_valued_ta_locals().contains(&id)
+        || ctx.native_facts.loop_bounded_i32_locals().contains(&id);
+    // And one PROFITABILITY term, which is not a safety term at all (#7128).
+    // Every rule above answers "may we?"; this one answers "should we?". A
+    // local written after its declaration, with no i32-consuming read anywhere
+    // and at least one double-consuming read inside a loop, pays a
+    // `sitofp`/`uitofp` per iteration and buys nothing back — measured at
+    // +14.87% instructions retired on `benchmarks/suite/15_mandelbrot.ts`,
+    // where the mixed representation additionally costs the loop its
+    // single-basic-block `fcmp`/`fccmp` exit. See `collectors/repsel_benefit.rs`.
+    let unprofitable = ctx
+        .native_facts
+        .unprofitable_canonical_i32_locals()
+        .contains(&id);
+    // Split into the VALUE-level proof and the CONTEXT gate so a context-level
+    // exclusion can be reported (#7106). `canonical_i32` is the conjunction, so
+    // selection behaviour is unchanged.
+    let canonical_i32_value_eligible = (ctx.integer_locals.contains(&id) || is_unsigned_i32_local)
         && canonical_safe_local
+        && !unprofitable
         && init_in_i32_range
         && !matches!(refined_ty, perry_hir::types::Type::BigInt)
         && !ctx.boxed_vars.contains(&id)
         && !ctx.module_globals.contains_key(&id)
         && !ctx.i32_counter_slots.contains_key(&id)
-        && ctx.repsel_context_allows_canonical_i32
         && !ctx.repsel_closure_ref_locals.contains(&id)
         && !ctx.array_row_aliases.contains_key(&id);
+    let canonical_i32 = canonical_i32_value_eligible && ctx.repsel_context_allows_canonical_i32;
+    // #7106: name the rule for every PROVEN-INTEGER local that stayed boxed.
+    //
+    // A local that satisfied every value-level rule and lost only to the
+    // context used to produce no report entry at all, which is
+    // indistinguishable from "no candidate existed" — the exact ambiguity the
+    // promotion census was built to remove, one stage upstream. So did a local
+    // that failed a value-level rule: the analysis had a proof obligation and a
+    // verdict, and the report threw the verdict away.
+    //
+    // Scoped to `integer_locals ∪ unsigned_i32_locals` — locals Perry has
+    // already PROVEN integer-valued — so this reports near-misses, not every
+    // binding in the program.
+    if !canonical_i32
+        && (ctx.integer_locals.contains(&id) || is_unsigned_i32_local)
+        && !ctx.i32_counter_slots.contains_key(&id)
+        && crate::expr::canonical_i32_locals_enabled()
+        && crate::opt_report::enabled()
+    {
+        crate::expr::deny_canonical_i32(
+            ctx,
+            id,
+            name,
+            crate::expr::CanonicalI32Denial {
+                // Ordered most- to least-actionable; the FIRST failing rule is
+                // the one reported, so a local with two problems names the one
+                // worth fixing first.
+                bigint: matches!(refined_ty, perry_hir::types::Type::BigInt),
+                init_out_of_range: !init_in_i32_range,
+                boxed_var: ctx.boxed_vars.contains(&id),
+                module_global: ctx.module_globals.contains_key(&id),
+                closure_referenced: ctx.repsel_closure_ref_locals.contains(&id),
+                array_row_alias: ctx.array_row_aliases.contains_key(&id),
+                not_index_used_or_bounded: !canonical_safe_local,
+                no_i32_consuming_use: unprofitable,
+                context: ctx.repsel_context_denial,
+            },
+        );
+    }
     if canonical_i32 {
         let rep = if is_unsigned_i32_local {
             crate::expr::SlotRep::U32
@@ -1280,17 +1402,23 @@ pub(crate) fn lower_let(
     // (`+=` self-append, `.length`, `===`/`<`, `charCodeAt`-family), which
     // tag-dispatch on the slot bits inline instead of routing operands
     // through `js_get_string_pointer_unified`. See `expr/slot_rep.rs`.
-    let canonical_str = ctx.repsel_context_allows_canonical_str
-        && matches!(
-            refined_ty,
-            perry_hir::types::Type::String | perry_hir::types::Type::StringLiteral(_)
-        )
-        && !ctx.local_slot_reps.contains_key(&id)
+    // Value-level proof and context gate split, as for canonical-i32 (#7106).
+    let canonical_str_value_eligible = matches!(
+        refined_ty,
+        perry_hir::types::Type::String | perry_hir::types::Type::StringLiteral(_)
+    ) && !ctx.local_slot_reps.contains_key(&id)
         && !ctx.boxed_vars.contains(&id)
         && !ctx.module_globals.contains_key(&id)
         && !ctx.repsel_closure_ref_locals.contains(&id)
         && !ctx.repsel_str_ineligible_locals.contains(&id)
         && !ctx.i32_counter_slots.contains_key(&id);
+    let canonical_str = canonical_str_value_eligible && ctx.repsel_context_allows_canonical_str;
+    if canonical_str_value_eligible && !canonical_str && crate::expr::canonical_str_locals_enabled()
+    {
+        if let Some(rule) = ctx.repsel_context_denial {
+            crate::expr::deny_canonical_context(ctx, id, name, rule, crate::expr::SlotRep::Str);
+        }
+    }
     if canonical_str {
         ctx.local_slot_reps.insert(id, crate::expr::SlotRep::Str);
         crate::expr::note_canonical_local(ctx, id, name, crate::expr::SlotRep::Str);
@@ -1833,4 +1961,34 @@ fn record_pod_rejection(ctx: &mut FnCtx<'_>, id: u32, reason: String) {
         false,
         vec![format!("reason={}", reason)],
     );
+}
+
+/// #7106 follow-up: record that a `Ptr<Shape>`-proven local was scalar-replaced,
+/// so its promotion can never be consumed.
+///
+/// Report-only; the caller has already gated on `opt_report::enabled()`. The
+/// fact is read through the context-free accessor on purpose — whether the
+/// enclosing body would have ALLOWED consumption is a different mechanism with
+/// a different rule name, and a value can lose to both.
+fn note_ptr_shape_scalar_replaced(ctx: &crate::expr::FnCtx<'_>, id: u32, name: &str) {
+    let Some(fact) = ctx.native_facts.shape_proven_ptr_local(id) else {
+        return;
+    };
+    let (reason, issue) =
+        crate::expr::ptr_shape_context_rule_text(crate::expr::PTR_SHAPE_SCALAR_REPLACED);
+    crate::opt_report::unconsumed(crate::opt_report::Unconsumed {
+        position: crate::opt_report::Position::Local,
+        name,
+        local_id: Some(id),
+        analysis: crate::opt_report::Analysis::PtrShape,
+        rep: "Ptr<Shape>",
+        rule: crate::expr::PTR_SHAPE_SCALAR_REPLACED,
+        reason,
+        tier: crate::opt_report::Tier::CompilerLimitation,
+        issue: Some(issue),
+        detail: Some(format!(
+            "class {} scalar-replaced into per-field allocas; the allocation is gone",
+            fact.class_name
+        )),
+    });
 }

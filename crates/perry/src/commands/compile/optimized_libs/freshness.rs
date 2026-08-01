@@ -1,16 +1,11 @@
-use super::*;
-
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::SystemTime;
 
-use crate::commands::stdlib_features::{compute_required_features, features_to_cargo_arg};
 use crate::OutputFormat;
 
-use super::super::library_search::{find_harmonyos_sdk, harmonyos_cross_env};
-use super::super::{find_perry_workspace_root, rust_target_triple, CompilationContext};
+use super::super::{rust_target_triple, CompilationContext};
 
 fn needs_http2_constants(ctx: &CompilationContext) -> bool {
     ctx.native_module_imports.contains("http2") || ctx.uses_get_builtin_module
@@ -72,6 +67,26 @@ pub(crate) fn size_opt_level() -> Option<&'static str> {
 /// a single codegen unit. Slower build, smaller/faster archive; only
 /// meaningful together with `size_opt_level`. Keyed into the cache like the
 /// opt level.
+/// `PERRY_SIZE_PANIC=abort-immediate` — size mode only. Rebuilds the Rust
+/// standard library from source with `panic_immediate_abort`, which removes
+/// the backtrace symbolizer (gimli + addr2line + rustc_demangle + the default
+/// panic hook's formatting: ~159 KB measured) and drops unwind tables. A Rust
+/// panic then aborts without printing a symbolized Rust backtrace — the JS
+/// error surface is unaffected, but internal-error diagnostics get terser, so
+/// this stays opt-in on top of `PERRY_SIZE_OPT`. Requires a nightly toolchain
+/// (`-Zbuild-std`); the build falls back to the prebuilt libraries with a note
+/// if nightly is unavailable.
+pub(crate) fn size_panic_immediate_abort() -> bool {
+    std::env::var("PERRY_SIZE_PANIC").ok().as_deref() == Some("abort-immediate")
+        && size_opt_level().is_some()
+}
+
+/// Immediate-abort may only replace the normal panic strategy when the same
+/// reachability analysis that permits `panic=abort` found no unwind consumers.
+pub(crate) fn effective_size_panic_immediate_abort(panic_abort_safe: bool) -> bool {
+    panic_abort_safe && size_panic_immediate_abort()
+}
+
 pub(crate) fn size_lto_fat() -> bool {
     std::env::var("PERRY_SIZE_LTO").ok().as_deref() == Some("fat")
 }
@@ -83,12 +98,13 @@ pub(crate) fn size_lto_fat() -> bool {
 pub(crate) fn auto_optimized_cache_key(
     feature_arg: &str,
     panic_abort_safe: bool,
+    panic_immediate: bool,
     target: Option<&str>,
     ctx: &CompilationContext,
 ) -> String {
     let target_str = target.unwrap_or("host");
     format!(
-        "{}|{}|{}|wasm={}|regex={}|temporal={}|ee={}|url={}|norm={}|seg={}|loc={}|diag={}|dgram={}|http2={}|dyneval={}|sizeopt={}|anchors={}|v={}",
+        "{}|{}|{}|wasm={}|regex={}|temporal={}|ee={}|url={}|norm={}|seg={}|loc={}|intlns={}|gns={}{}{}{}{}{}{}{}{}{}|diag={}|dgram={}|http2={}|dyneval={}|sizeopt={}|anchors={}|v={}",
         feature_arg,
         panic_abort_safe,
         target_str,
@@ -100,6 +116,17 @@ pub(crate) fn auto_optimized_cache_key(
         ctx.uses_string_normalize,
         ctx.uses_intl_segmenter,
         ctx.uses_intl_locale,
+        ctx.uses_intl_namespace,
+        ctx.uses_global_math,
+        ctx.uses_global_json,
+        ctx.uses_global_reflect,
+        ctx.uses_global_atomics,
+        ctx.uses_global_url,
+        ctx.uses_global_text,
+        ctx.uses_global_websocket,
+        ctx.uses_global_webcrypto,
+        ctx.uses_global_webfetch,
+        ctx.uses_proc_ipc,
         ctx.uses_diagnostics,
         ctx.uses_dgram,
         // HTTP/2 imports and dynamic builtin resolution pull in
@@ -110,9 +137,14 @@ pub(crate) fn auto_optimized_cache_key(
         // key the freshness stamp like every other runtime feature toggle.
         perry_hir::has_deferred_dynamic_code_sites(),
         format!(
-            "{}{}",
+            "{}{}{}",
             size_opt_level().unwrap_or("off"),
-            if size_lto_fat() { "+fatlto" } else { "" }
+            if size_lto_fat() { "+fatlto" } else { "" },
+            if panic_immediate {
+                "+panicimm"
+            } else {
+                ""
+            }
         ),
         std::env::var("PERRY_LLVM_BITCODE_LINK").ok().as_deref() == Some("1"),
         env!("CARGO_PKG_VERSION"),
@@ -165,6 +197,32 @@ pub(crate) fn auto_optimized_cross_features(
     }
     if ctx.uses_intl_segmenter {
         cross_features.push("perry-runtime/intl-segmenter".to_string());
+    }
+    // `Intl.*` namespace surface — see perry-runtime's `intl-namespace`.
+    // A deferred dynamic-code site can construct `Intl.…` from a runtime
+    // string, so force it on there too (mirrors the dyn-eval regex rule).
+    if ctx.uses_intl_namespace || perry_hir::has_deferred_dynamic_code_sites() {
+        cross_features.push("perry-runtime/intl-namespace".to_string());
+    }
+    // Per-namespace globalThis member tables — see perry-runtime's `global-*`.
+    // A deferred dynamic-code site can reach any namespace by runtime string,
+    // so force all four on there (mirrors the intl-namespace rule).
+    let dynamic_code = perry_hir::has_deferred_dynamic_code_sites();
+    for (used, feat) in [
+        (ctx.uses_global_math, "global-math"),
+        (ctx.uses_global_json, "global-json"),
+        (ctx.uses_global_reflect, "global-reflect"),
+        (ctx.uses_global_atomics, "global-atomics"),
+        (ctx.uses_global_url, "global-url"),
+        (ctx.uses_global_text, "global-text"),
+        (ctx.uses_global_websocket, "global-websocket"),
+        (ctx.uses_global_webcrypto, "global-webcrypto"),
+        (ctx.uses_global_webfetch, "global-webfetch"),
+        (ctx.uses_proc_ipc, "proc-ipc"),
+    ] {
+        if used || dynamic_code {
+            cross_features.push(format!("perry-runtime/{feat}"));
+        }
     }
     if ctx.uses_intl_locale {
         cross_features.push("perry-runtime/intl-locale".to_string());
@@ -235,6 +293,80 @@ pub(crate) fn auto_optimized_cross_features(
         cross_features.push("perry-runtime/external-fetch-symbols".to_string());
     }
     cross_features
+}
+
+/// Feature names a workspace crate's `Cargo.toml` can satisfy in a
+/// `--features <crate>/<name>` request: the `[features]` table keys plus every
+/// optional dependency whose implicit same-named feature has not been hidden
+/// by a `dep:<name>` reference. `None` when the manifest is missing or
+/// unparseable, so callers skip filtering rather than dropping features a
+/// manifest they couldn't read might well declare.
+fn declared_feature_names(workspace_root: &Path, krate: &str) -> Option<BTreeSet<String>> {
+    let manifest_path = workspace_root.join("crates").join(krate).join("Cargo.toml");
+    let manifest: toml::Value = toml::from_str(&fs::read_to_string(manifest_path).ok()?).ok()?;
+    let feature_table = manifest.get("features").and_then(|value| value.as_table());
+    let mut names: BTreeSet<String> = feature_table
+        .into_iter()
+        .flat_map(|table| table.keys().cloned())
+        .collect();
+    let hidden_implicit_features: BTreeSet<&str> = feature_table
+        .into_iter()
+        .flat_map(|table| table.values())
+        .filter_map(|value| value.as_array())
+        .flatten()
+        .filter_map(|value| value.as_str())
+        .filter_map(|feature| feature.strip_prefix("dep:"))
+        .collect();
+    let mut collect_optional = |deps: Option<&toml::Value>| {
+        let Some(table) = deps.and_then(|d| d.as_table()) else {
+            return;
+        };
+        for (name, spec) in table {
+            if spec.get("optional").and_then(|o| o.as_bool()) == Some(true)
+                && !hidden_implicit_features.contains(name.as_str())
+            {
+                names.insert(name.clone());
+            }
+        }
+    };
+    collect_optional(manifest.get("dependencies"));
+    if let Some(targets) = manifest.get("target").and_then(|t| t.as_table()) {
+        for target_spec in targets.values() {
+            collect_optional(target_spec.get("dependencies"));
+        }
+    }
+    Some(names)
+}
+
+/// The `perry` binary's baked-in cross-feature list tracks the branch the
+/// binary was BUILT from, while the auto-optimize cargo build resolves against
+/// the workspace found on disk — and the two can skew (binary from branch A,
+/// checkout on branch B). One `perry-runtime/<feat>` the checkout doesn't
+/// declare fails the entire cargo resolve, and the silent prebuilt fallback
+/// then links without the ext-pump entrypoints the well-known routing loop
+/// already stripped stdlib features for — surfacing as undefined-`js_*` link
+/// errors far from the cause. Drop the unknown names instead (a feature the
+/// checkout never heard of gates nothing in its sources) and return them so
+/// the caller can say what was dropped.
+pub(crate) fn retain_workspace_declared_features(
+    workspace_root: &Path,
+    cross_features: &mut Vec<String>,
+) -> Vec<String> {
+    let mut dropped = Vec::new();
+    for krate in ["perry-runtime", "perry-stdlib"] {
+        let Some(declared) = declared_feature_names(workspace_root, krate) else {
+            continue;
+        };
+        let prefix = format!("{krate}/");
+        cross_features.retain(|entry| match entry.strip_prefix(&prefix) {
+            Some(feat) if !declared.contains(feat) => {
+                dropped.push(entry.clone());
+                false
+            }
+            _ => true,
+        });
+    }
+    dropped
 }
 
 /// Content fingerprint of every workspace source tree that lands in the
@@ -533,6 +665,12 @@ pub(crate) fn binding_needs_shared_tokio(module: &str) -> bool {
         | "axios"
         | "node-fetch"
         | "fetch"
+        // undici — glue over the native fetch stack (network I/O family).
+        // The wrapper itself has no tokio dep today, but it rides the
+        // shared build so the driver auto-builds its archive alongside
+        // the runtime, and so a future `request()` implementation that
+        // pulls tokio/reqwest can't silently hit the CONTEXT collision.
+        | "undici"
         // HTTP server (hyper)
         | "fastify"
         // Database drivers (mongodb, sqlx, redis)

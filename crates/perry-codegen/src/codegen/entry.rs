@@ -649,6 +649,11 @@ pub(super) fn compile_module_entry(
             .chain(cross_module.returns_int_functions.iter())
             .copied()
             .collect();
+        // `--opt-report` (#6952) attribution scope; no-op when off.
+        let _opt_report_scope = crate::opt_report::enter_region(
+            "module_init",
+            crate::opt_report::RegionKind::ModuleInit,
+        );
         let main_native_facts = crate::collectors::collect_native_region_fact_graph(
             &hir.init,
             &[],
@@ -664,6 +669,28 @@ pub(super) fn compile_module_entry(
             &cross_module.compile_time_constants,
             &cross_module.module_dispatch,
         );
+        // #7109: the program-entry body participates in canonical (i32/u32/Str)
+        // selection on exactly the per-value rules a function body uses. There
+        // is no structural context reason to deny — see
+        // `expr::MODULE_INIT_CONTEXT` for the audit — so the only remaining
+        // gates are the two bisection env knobs.
+        // #7128: one derivation, each flag reading its own knob. `Entry`
+        // pins `allows_ptr_shape` off structurally (see below).
+        let repsel_flags = crate::expr::RepselContextFlags::for_entry();
+        let repsel_allows = repsel_flags.allows_canonical_i32;
+        let repsel_str_allows = repsel_flags.allows_canonical_str;
+        // The two value-level screens the `Stmt::Let` site consults (#7106
+        // collected them for the report only; now they are load-bearing).
+        let repsel_closure_refs = if repsel_allows || repsel_str_allows {
+            crate::expr::collect_closure_referenced_locals(&hir.init)
+        } else {
+            std::collections::HashSet::new()
+        };
+        let repsel_str_ineligible = if repsel_str_allows {
+            crate::expr::collect_canonical_str_ineligible_locals(&hir.init)
+        } else {
+            std::collections::HashSet::new()
+        };
         let mut init_local_types: HashMap<u32, perry_hir::types::Type> = HashMap::new();
         crate::boxed_vars::collect_let_types_in_stmts(&hir.init, &mut init_local_types);
         let mut ctx = FnCtx {
@@ -675,6 +702,7 @@ pub(super) fn compile_module_entry(
             native_facts: &main_native_facts,
             locals: HashMap::new(),
             local_types: init_local_types,
+            reassigned_locals: crate::collectors::reassigned_locals(&hir.init),
             const_string_locals: HashMap::new(),
             const_number_locals: HashMap::new(),
             current_block: 0,
@@ -700,6 +728,7 @@ pub(super) fn compile_module_entry(
             namespace_v8_specifiers: &cross_module.namespace_v8_specifiers,
             closure_captures: HashMap::new(),
             current_closure_ptr: None,
+            current_closure_slot: None,
             enums,
             is_async_fn: false,
             is_strict_fn: false,
@@ -764,13 +793,24 @@ pub(super) fn compile_module_entry(
             class_field_loop_facts: Vec::new(),
             i32_counter_slots: HashMap::new(),
             local_slot_reps: HashMap::new(),
-            // Representation-selection Phase 1: module-init contexts keep the
-            // boxed/parallel-shadow model (top-level locals interleave with
-            // import/init machinery; the win lives in function bodies).
-            repsel_context_allows_canonical_i32: false,
-            repsel_closure_ref_locals: std::collections::HashSet::new(),
-            repsel_context_allows_canonical_str: false,
-            repsel_str_ineligible_locals: std::collections::HashSet::new(),
+            // #7109: this entry body selects canonical i32/u32/Str on the same
+            // per-value rules as a function body. Phase 1 (#6903) excluded it
+            // on the premise that "the win lives in function bodies"; 9 of the
+            // 17 suite benchmarks put their entire hot loop at module top
+            // level, so it does not. `expr::MODULE_INIT_CONTEXT` carries the
+            // audit of every entry-body property that made the exclusion look
+            // load-bearing.
+            repsel_context_allows_canonical_i32: repsel_allows,
+            repsel_context_denial: None,
+            // Ptr<Shape> stays off here, on its own flag now: Phase 5a reused
+            // the canonical-i32 gate, and #6991 is a live rooting bug for a
+            // compiled receiver held across the globalThis-population
+            // collection — which runs around module init.
+            repsel_context_allows_ptr_shape: repsel_flags.allows_ptr_shape,
+            repsel_ptr_shape_context_denial: repsel_flags.ptr_shape_denial,
+            repsel_closure_ref_locals: repsel_closure_refs,
+            repsel_context_allows_canonical_str: repsel_str_allows,
+            repsel_str_ineligible_locals: repsel_str_ineligible,
             spec_abi_functions: &cross_module.spec_abi_functions,
             spec_ta_bindings: &cross_module.spec_ta_bindings,
             spec_ta_ready: std::collections::HashSet::new(),
@@ -793,6 +833,7 @@ pub(super) fn compile_module_entry(
             scalar_replaced_arrays: std::collections::HashMap::new(),
             scalar_replaced_split_part_lengths: std::collections::HashMap::new(),
             scalar_replaced_uppercase_sources: std::collections::HashMap::new(),
+            scalar_slot_shadow_slots: std::collections::HashMap::new(),
             scalar_ctor_target: Vec::new(),
             non_escaping_news: main_native_facts.non_escaping_news().clone(),
             non_escaping_new_used_fields: main_native_facts.non_escaping_new_used_fields().clone(),
@@ -820,6 +861,8 @@ pub(super) fn compile_module_entry(
             typed_i1_functions: &cross_module.typed_i1_functions,
             typed_i1_function_param_reps: &cross_module.typed_i1_function_param_reps,
             typed_f64_methods: &cross_module.typed_f64_methods,
+            pshape_methods: &cross_module.pshape_methods,
+            proven_this: None,
             typed_i32_methods: &cross_module.typed_i32_methods,
             typed_i1_methods: &cross_module.typed_i1_methods,
             typed_string_methods: &cross_module.typed_string_methods,
@@ -1087,6 +1130,7 @@ pub(super) fn compile_module_entry(
                 let _ = ctx.block().call(I32, "js_interval_timer_tick", &[]);
                 ctx.block()
                     .call_void("js_process_run_finalization_exit", &[]);
+                ctx.block().call_void("js_trace_events_flush_output", &[]);
                 // After the event loop drains, surface any still-unhandled
                 // promise rejection (Node exits non-zero; this matches the
                 // oracle for `Promise.reject`/combinator-reject programs).
@@ -1269,6 +1313,11 @@ pub(super) fn compile_module_entry(
             .chain(cross_module.returns_int_functions.iter())
             .copied()
             .collect();
+        // `--opt-report` (#6952) attribution scope; no-op when off.
+        let _opt_report_scope = crate::opt_report::enter_region(
+            "module_init",
+            crate::opt_report::RegionKind::ModuleInit,
+        );
         let init_native_facts = crate::collectors::collect_native_region_fact_graph(
             &hir.init,
             &[],
@@ -1283,6 +1332,28 @@ pub(super) fn compile_module_entry(
             &cross_module.compile_time_constants,
             &cross_module.module_dispatch,
         );
+        // #7109: the module-init body participates in canonical (i32/u32/Str)
+        // selection on exactly the per-value rules a function body uses. There
+        // is no structural context reason to deny — see
+        // `expr::MODULE_INIT_CONTEXT` for the audit — so the only remaining
+        // gates are the two bisection env knobs.
+        // #7128: one derivation, each flag reading its own knob. `Entry`
+        // pins `allows_ptr_shape` off structurally (see below).
+        let repsel_flags = crate::expr::RepselContextFlags::for_entry();
+        let repsel_allows = repsel_flags.allows_canonical_i32;
+        let repsel_str_allows = repsel_flags.allows_canonical_str;
+        // The two value-level screens the `Stmt::Let` site consults (#7106
+        // collected them for the report only; now they are load-bearing).
+        let repsel_closure_refs = if repsel_allows || repsel_str_allows {
+            crate::expr::collect_closure_referenced_locals(&hir.init)
+        } else {
+            std::collections::HashSet::new()
+        };
+        let repsel_str_ineligible = if repsel_str_allows {
+            crate::expr::collect_canonical_str_ineligible_locals(&hir.init)
+        } else {
+            std::collections::HashSet::new()
+        };
         let mut ctx = FnCtx {
             func: init_fn,
             module_slug: crate::expr::native_region_slug(strings.module_prefix()),
@@ -1292,6 +1363,7 @@ pub(super) fn compile_module_entry(
             native_facts: &init_native_facts,
             locals: HashMap::new(),
             local_types: HashMap::new(),
+            reassigned_locals: crate::collectors::reassigned_locals(&hir.init),
             const_string_locals: HashMap::new(),
             const_number_locals: HashMap::new(),
             current_block: 0,
@@ -1317,6 +1389,7 @@ pub(super) fn compile_module_entry(
             namespace_v8_specifiers: &cross_module.namespace_v8_specifiers,
             closure_captures: HashMap::new(),
             current_closure_ptr: None,
+            current_closure_slot: None,
             enums,
             is_async_fn: false,
             is_strict_fn: false,
@@ -1381,13 +1454,24 @@ pub(super) fn compile_module_entry(
             class_field_loop_facts: Vec::new(),
             i32_counter_slots: HashMap::new(),
             local_slot_reps: HashMap::new(),
-            // Representation-selection Phase 1: module-init contexts keep the
-            // boxed/parallel-shadow model (top-level locals interleave with
-            // import/init machinery; the win lives in function bodies).
-            repsel_context_allows_canonical_i32: false,
-            repsel_closure_ref_locals: std::collections::HashSet::new(),
-            repsel_context_allows_canonical_str: false,
-            repsel_str_ineligible_locals: std::collections::HashSet::new(),
+            // #7109: this entry body selects canonical i32/u32/Str on the same
+            // per-value rules as a function body. Phase 1 (#6903) excluded it
+            // on the premise that "the win lives in function bodies"; 9 of the
+            // 17 suite benchmarks put their entire hot loop at module top
+            // level, so it does not. `expr::MODULE_INIT_CONTEXT` carries the
+            // audit of every entry-body property that made the exclusion look
+            // load-bearing.
+            repsel_context_allows_canonical_i32: repsel_allows,
+            repsel_context_denial: None,
+            // Ptr<Shape> stays off here, on its own flag now: Phase 5a reused
+            // the canonical-i32 gate, and #6991 is a live rooting bug for a
+            // compiled receiver held across the globalThis-population
+            // collection — which runs around module init.
+            repsel_context_allows_ptr_shape: repsel_flags.allows_ptr_shape,
+            repsel_ptr_shape_context_denial: repsel_flags.ptr_shape_denial,
+            repsel_closure_ref_locals: repsel_closure_refs,
+            repsel_context_allows_canonical_str: repsel_str_allows,
+            repsel_str_ineligible_locals: repsel_str_ineligible,
             spec_abi_functions: &cross_module.spec_abi_functions,
             spec_ta_bindings: &cross_module.spec_ta_bindings,
             spec_ta_ready: std::collections::HashSet::new(),
@@ -1410,6 +1494,7 @@ pub(super) fn compile_module_entry(
             scalar_replaced_arrays: std::collections::HashMap::new(),
             scalar_replaced_split_part_lengths: std::collections::HashMap::new(),
             scalar_replaced_uppercase_sources: std::collections::HashMap::new(),
+            scalar_slot_shadow_slots: std::collections::HashMap::new(),
             scalar_ctor_target: Vec::new(),
             non_escaping_news: init_native_facts.non_escaping_news().clone(),
             non_escaping_new_used_fields: init_native_facts.non_escaping_new_used_fields().clone(),
@@ -1437,6 +1522,8 @@ pub(super) fn compile_module_entry(
             typed_i1_functions: &cross_module.typed_i1_functions,
             typed_i1_function_param_reps: &cross_module.typed_i1_function_param_reps,
             typed_f64_methods: &cross_module.typed_f64_methods,
+            pshape_methods: &cross_module.pshape_methods,
+            proven_this: None,
             typed_i32_methods: &cross_module.typed_i32_methods,
             typed_i1_methods: &cross_module.typed_i1_methods,
             typed_string_methods: &cross_module.typed_string_methods,

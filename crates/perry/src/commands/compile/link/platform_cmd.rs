@@ -590,17 +590,20 @@ pub fn select_linker_command(
         })?;
         // #1508 (per-host toolchain tag) + #5740 (drive `clang` directly rather
         // than the NDK's `.cmd`/shell wrapper) — see `ndk_clang_path`. The
-        // `-target aarch64-linux-android24` below is what the wrapper would have
-        // added, so nothing else changes.
+        // The explicit architecture-specific `-target` below is what the
+        // per-target wrapper would have added, so nothing else changes.
         let clang = ndk_clang_path(&ndk_home);
         if !PathBuf::from(&clang).exists() {
             return Err(anyhow!("Android NDK clang not found at: {}", clang));
         }
         let mut c = Command::new(clang);
+        let clang_target = android_target(target)
+            .expect("Android linker branch requires a recognized Android target")
+            .clang_target;
         c.arg("-shared")
             .arg("-fPIC")
             .arg("-target")
-            .arg("aarch64-linux-android24")
+            .arg(clang_target)
             .arg("-Wl,-z,max-page-size=16384")
             .arg("-Wl,-z,separate-loadable-segments")
             // Prevent ELF symbol interposition: bind all symbols within the .so
@@ -727,6 +730,9 @@ pub fn select_linker_command(
         // When cross-compiling from macOS, use clang + ld.lld + a glibc
         // sysroot pointed to by PERRY_LINUX_SYSROOT (matching the
         // PERRY_IOS_SYSROOT/PERRY_WINDOWS_SYSROOT builder pattern).
+        // Only the cross-compile block below mutates `c`; building on Linux
+        // hands back a bare `cc`.
+        #[cfg_attr(target_os = "linux", allow(unused_mut))]
         let mut c = Command::new("cc");
         #[cfg(not(target_os = "linux"))]
         {
@@ -833,8 +839,10 @@ pub fn select_linker_command(
         // `editbin /STACK:67108864` post-link step users previously had to
         // run by hand.
         .arg("/STACK:67108864")
-        // Native libs (hone_editor_windows etc) bundle perry_runtime objects
-        // that can't be fully stripped. Identical symbols are safe to merge.
+        // Native libs and retained mixed-symbol UI objects can still contain
+        // duplicate definitions after evidence-based archive trimming. The
+        // canonical runtime is linked first; allow only those remaining
+        // definitions to merge behind it.
         .arg("/FORCE:MULTIPLE")
         // #6023: /FORCE:MULTIPLE makes the duplicate-definition merge
         // deliberate, but link.exe still prints one LNK4006 line per merged

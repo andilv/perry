@@ -221,6 +221,19 @@ pub(crate) fn lower_module_decl(
                                     ("punycode.ucs2".to_string(), None)
                                 } else if source == "inspector" && imported == "Network" {
                                     ("inspector.Network".to_string(), None)
+                                } else if matches!(source.as_str(), "fs" | "dns" | "stream")
+                                    && imported == "promises"
+                                {
+                                    // `import { promises } from "node:fs"` binds the
+                                    // promises SUBMODULE namespace — route it exactly
+                                    // like `import * as x from "node:fs/promises"`.
+                                    // The generic arm below made it a native METHOD
+                                    // (`fs.promises`), so `promises.realpath(p)`
+                                    // dispatched the callback-API `fs.realpath` and
+                                    // resolved `undefined` (the compiled CLI's file cache
+                                    // normalized every path to `undefined` and every
+                                    // later fs call threw).
+                                    (format!("{source}/promises"), None)
                                 } else {
                                     (source.clone(), Some(imported.clone()))
                                 };
@@ -810,20 +823,16 @@ pub(crate) fn lower_module_decl(
                                         if let Some((module_name, Some(method_name))) =
                                             ctx.lookup_native_module(func_name)
                                         {
-                                            if module_name == "perry/ui" {
-                                                match method_name {
-                                                    "Canvas" | "State" | "Sheet" | "Toolbar"
-                                                    | "Window" | "LazyVStack"
-                                                    | "NavigationStack" | "Picker" | "Table"
-                                                    | "TabBar" => {
-                                                        ctx.register_native_instance(
-                                                            name.clone(),
-                                                            module_name.to_string(),
-                                                            method_name.to_string(),
-                                                        );
-                                                    }
-                                                    _ => {}
-                                                }
+                                            if module_name == "perry/ui"
+                                                && super::context::perry_ui_factory_returns_handle(
+                                                    method_name,
+                                                )
+                                            {
+                                                ctx.register_native_instance(
+                                                    name.clone(),
+                                                    module_name.to_string(),
+                                                    method_name.to_string(),
+                                                );
                                             }
                                         }
                                         // node:http server (issue #577) — named-import factory:

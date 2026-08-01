@@ -240,8 +240,8 @@ const FFI_REGISTRY: &[(&str, OwnerKind)] = &[
     ("js_http_client_request_socket",               OwnerKind::WellKnown("http")),
 
     // ── #846: node:http server ───────────────────────────────────────
-    // `perry-ext-http-server` defines `js_node_http_*`. It's pulled in
-    // transitively via `perry-ext-http` (rlib dep), and the well-known
+    // `perry-ext-http` defines `js_node_http_*` in its internal server
+    // module, and the well-known
     // table already has `[bindings.http]` / `[bindings.https]` /
     // `[bindings.http2]` → `perry-ext-http`. So tagging these as
     // `WellKnown("http")` makes the existing flip do the right thing:
@@ -586,23 +586,23 @@ const FFI_REGISTRY: &[(&str, OwnerKind)] = &[
 /// optimization horizon worth measuring.
 static USED_PROVIDERS: Mutex<Option<HashSet<OwnerKind>>> = Mutex::new(None);
 
-/// Per-module capture buffer, active only between [`begin_module_capture`]
-/// and [`take_module_capture`] on the same thread.
-///
-/// Why a thread-local rather than another field on [`USED_PROVIDERS`]:
-/// the object cache (`crates/perry/src/commands/compile/object_cache.rs`)
-/// needs to know which registry symbols *this one module* emitted, so it
-/// can persist them next to the module's cached `.o` and replay them on a
-/// later cache hit. [`USED_PROVIDERS`] is process-wide and rayon compiles
-/// many modules concurrently, so it cannot attribute a symbol to a module.
-/// `perry-codegen` itself never uses rayon and `compile_module` runs start
-/// to finish on its caller's worker thread, so a thread-local scoped
-/// around that one call captures exactly this module's emissions.
-///
-/// We record the matched symbol *names* rather than [`OwnerKind`]s: replay
-/// re-runs them through [`record_ffi_call`], so the symbol→owner mapping is
-/// always the one in today's table, never a stale routing decision baked
-/// into a cache entry written by an older perry.
+// Per-module capture buffer, active only between [`begin_module_capture`]
+// and [`take_module_capture`] on the same thread.
+//
+// Why a thread-local rather than another field on [`USED_PROVIDERS`]:
+// the object cache (`crates/perry/src/commands/compile/object_cache.rs`)
+// needs to know which registry symbols *this one module* emitted, so it
+// can persist them next to the module's cached `.o` and replay them on a
+// later cache hit. [`USED_PROVIDERS`] is process-wide and rayon compiles
+// many modules concurrently, so it cannot attribute a symbol to a module.
+// `perry-codegen` itself never uses rayon and `compile_module` runs start
+// to finish on its caller's worker thread, so a thread-local scoped
+// around that one call captures exactly this module's emissions.
+//
+// We record the matched symbol *names* rather than [`OwnerKind`]s: replay
+// re-runs them through [`record_ffi_call`], so the symbol→owner mapping is
+// always the one in today's table, never a stale routing decision baked
+// into a cache entry written by an older perry.
 thread_local! {
     static MODULE_CAPTURE: RefCell<Option<HashSet<&'static str>>> = const { RefCell::new(None) };
 }
@@ -625,6 +625,36 @@ pub(crate) fn record_ffi_call(symbol: &str) {
             });
             return;
         }
+    }
+
+    // Prefix safety net (stdlib cherry-pick): the auto-optimize driver no
+    // longer force-enables perry-stdlib's `crypto` feature for every build,
+    // so ANY codegen-emitted call into the node:crypto / WebCrypto surface
+    // must flip the feature here — the import mapping and the
+    // `uses_crypto_builtins` HIR gate cover the known shapes, and this rule
+    // covers everything else (compiled-package lowering, future HIR
+    // variants) without maintaining a per-symbol table: every FFI defined
+    // by perry-stdlib's crypto/webcrypto modules carries one of these two
+    // prefixes. `js_webcrypto_illegal_constructor` is excluded — it lives
+    // in perry-runtime (object/global_this/ctor_thunks.rs), so emitting it
+    // needs no stdlib feature. The MODULE_CAPTURE marker is the prefix
+    // itself: replaying it through this function (object-cache manifest,
+    // #6439) re-enters this arm and reproduces the same owner.
+    if symbol.starts_with("js_crypto_")
+        || (symbol.starts_with("js_webcrypto_") && symbol != "js_webcrypto_illegal_constructor")
+    {
+        let owner = OwnerKind::Stdlib {
+            feature: Some("crypto"),
+        };
+        {
+            let mut guard = USED_PROVIDERS.lock().expect("USED_PROVIDERS poisoned");
+            guard.get_or_insert_with(HashSet::new).insert(owner);
+        }
+        MODULE_CAPTURE.with(|cell| {
+            if let Some(set) = cell.borrow_mut().as_mut() {
+                set.insert("js_crypto_");
+            }
+        });
     }
 }
 
@@ -834,7 +864,7 @@ mod tests {
     }
 
     /// #3954 regression: HTTP-suite native-table rows can emit newer
-    /// `perry-ext-http`, `perry-ext-http-server`, or `perry-ext-net`
+    /// `perry-ext-http` or `perry-ext-net`
     /// symbols without the module-import path being visible to collection.
     /// Each emitted external symbol must independently flip its well-known
     /// owner so the wrapper joins the link line.
@@ -870,6 +900,67 @@ mod tests {
             };
             assert_symbol_routes_to(symbol, owner);
         }
+    }
+
+    /// Stdlib cherry-pick: the driver no longer force-enables perry-stdlib's
+    /// `crypto` feature, so every codegen-emitted `js_crypto_*` /
+    /// `js_webcrypto_*` call must flip it through the prefix net — including
+    /// the `"js_crypto_"` marker persisted to (and replayed from) the object
+    /// cache's FFI manifest. `js_webcrypto_illegal_constructor` lives in
+    /// perry-runtime and must NOT flip the feature.
+    #[test]
+    fn emitted_crypto_symbols_route_to_stdlib_crypto_feature() {
+        let _guard = PROVIDER_TEST_LOCK
+            .lock()
+            .expect("provider test lock poisoned");
+        let crypto_owner = OwnerKind::Stdlib {
+            feature: Some("crypto"),
+        };
+        for symbol in [
+            "js_crypto_sha256",
+            "js_crypto_create_hash",
+            "js_crypto_ed25519_verify",
+            "js_webcrypto_digest",
+            // Object-cache replay marker (see record_ffi_call).
+            "js_crypto_",
+        ] {
+            assert_symbol_routes_to(symbol, crypto_owner);
+        }
+
+        let _ = take_used_providers();
+        record_ffi_call("js_webcrypto_illegal_constructor");
+        let got = take_used_providers();
+        assert!(
+            !got.contains(&crypto_owner),
+            "js_webcrypto_illegal_constructor is a perry-runtime thunk and must \
+             not flip the stdlib crypto feature, got {got:?}"
+        );
+    }
+
+    /// The prefix net must persist a replayable marker in the per-module
+    /// capture so a warm object cache reproduces the same feature flip
+    /// (#6439 shape).
+    #[test]
+    fn crypto_prefix_net_marker_survives_module_capture_replay() {
+        let _guard = PROVIDER_TEST_LOCK
+            .lock()
+            .expect("provider test lock poisoned");
+        let _ = take_used_providers();
+
+        begin_module_capture();
+        record_ffi_call("js_crypto_pbkdf2");
+        let captured = take_module_capture();
+        assert_eq!(captured, vec!["js_crypto_"]);
+
+        let _ = take_used_providers();
+        replay_ffi_symbols(captured);
+        let got = take_used_providers();
+        assert!(
+            got.contains(&OwnerKind::Stdlib {
+                feature: Some("crypto")
+            }),
+            "replaying the captured marker must reproduce the crypto flip, got {got:?}"
+        );
     }
 
     /// #5140 regression: `new EventEmitter()` / `.on` / `.emit` /

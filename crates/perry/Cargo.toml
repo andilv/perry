@@ -5,6 +5,13 @@ edition.workspace = true
 license.workspace = true
 description = "Native TypeScript compiler - CLI driver"
 
+[package.metadata.winresource]
+CompanyName = "PerryTS"
+FileDescription = "Perry native TypeScript compiler"
+LegalCopyright = "Copyright © PerryTS contributors"
+OriginalFilename = "perry.exe"
+ProductName = "Perry"
+
 [lints]
 workspace = true
 
@@ -84,7 +91,7 @@ fslock = "0.2"
 ed25519-dalek = { version = "2.1", features = ["rand_core"], optional = true }
 sha2 = "0.11"
 hex.workspace = true
-rand = { version = "0.9", optional = true }
+rand = { version = "0.10", optional = true }
 # chrono is already a transitive dep through perry-stdlib; listing it
 # here makes the year accessor available to `perry native init`'s
 # LICENSE template substitution.
@@ -156,3 +163,6 @@ all-codegen-backends = [
 [dev-dependencies]
 tempfile.workspace = true
 swc_common.workspace = true
+
+[build-dependencies]
+winresource = "0.1.31"

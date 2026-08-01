@@ -4,11 +4,13 @@ use std::any::Any;
 mod runtime_handles;
 mod scanner_shims;
 mod shadow_stack;
+mod temp_roots;
 
 pub(super) use runtime_handles::{
     new_runtime_handle_root_scan_state, scan_runtime_handle_roots_mut,
     scan_runtime_handle_roots_mut_step,
 };
+pub(crate) use runtime_handles::{runtime_handle_stack_restore, runtime_handle_stack_savepoint};
 pub use runtime_handles::{RuntimeHandle, RuntimeHandleScope};
 pub use scanner_shims::{
     async_context_mutable_root_scanner, async_context_root_scanner,
@@ -22,11 +24,27 @@ pub use scanner_shims::{
 };
 pub(crate) use shadow_stack::shadow_stack_has_active_frame;
 pub(crate) use shadow_stack::SHADOW;
+#[allow(unused_imports)]
+pub(crate) use shadow_stack::{bound_slot_meta, ShadowEntry, SLOT_ACTIVE, SLOT_PTR_MASK};
 pub use shadow_stack::{
-    js_shadow_frame_pop, js_shadow_frame_push, js_shadow_slot_bind, js_shadow_slot_get,
-    js_shadow_slot_set, shadow_stack_depth, SHADOW_STACK_GROW_RESERVE, SHADOW_STACK_HEADER_SLOTS,
+    js_shadow_frame_enter, js_shadow_frame_pop, js_shadow_frame_push, js_shadow_slot_bind,
+    js_shadow_slot_get, js_shadow_slot_set, js_shadow_state_addr, shadow_stack_depth,
+    ShadowStackState, SHADOW_ENTRY_META_OFFSET, SHADOW_ENTRY_SIZE, SHADOW_SLOT_ACTIVE_BIT,
+    SHADOW_STACK_GROW_RESERVE, SHADOW_STACK_HEADER_SLOTS, SHADOW_STATE_FRAME_TOP_OFFSET,
+    SHADOW_STATE_LEN_OFFSET, SHADOW_STATE_PTR_OFFSET,
 };
 pub(crate) use shadow_stack::{shadow_stack_restore, shadow_stack_savepoint, ShadowSavepoint};
+#[cfg(test)]
+pub(crate) use temp_roots::reset_temp_roots;
+#[cfg(test)]
+pub(super) use temp_roots::temp_root_depth;
+pub use temp_roots::{
+    js_array_push_f64_temp_rooted, js_gc_temp_root_get, js_gc_temp_root_push, js_gc_temp_root_set,
+    js_gc_temp_root_truncate,
+};
+pub(super) use temp_roots::{
+    new_temp_root_scan_state, scan_temp_roots_mut, scan_temp_roots_mut_step,
+};
 
 pub type MutableRootScanner = for<'a> fn(&mut RuntimeRootVisitor<'a>);
 pub(crate) type BudgetedMutableRootScanner =
@@ -180,6 +198,7 @@ thread_local! {
 
 /// Set (or clear) this thread's conservative-scan mode override, returning the
 /// previous value.
+#[allow(dead_code)] // test-only scaffolding: GC unit tests (gc/tests) pin the scan mode via this override
 pub(crate) fn set_conservative_stack_scan_override(
     mode: Option<ConservativeStackScanMode>,
 ) -> Option<ConservativeStackScanMode> {
@@ -1479,29 +1498,34 @@ impl MutableRootSlot {
 pub(super) fn visit_shadow_stack_root_slots(mut visit: impl FnMut(MutableRootSlot)) {
     SHADOW.with(|cell| unsafe {
         let s = &mut *cell.get();
-        if s.stack.is_empty() {
+        if s.len == 0 || s.ptr.is_null() {
             return;
         }
         let mut top = s.frame_top;
         while top != usize::MAX && top >= SHADOW_STACK_HEADER_SLOTS {
             let header_base = top - SHADOW_STACK_HEADER_SLOTS;
-            if header_base + 1 >= s.stack.len() {
+            if header_base >= s.len {
                 break;
             }
-            let slot_count = s.stack[header_base + 1] as usize;
+            let header = *s.ptr.add(header_base);
+            let slot_count = header.meta;
             let slots_end = top + slot_count;
-            if slots_end > s.stack.len() {
+            if slots_end > s.len {
                 break;
             }
-            let base = s.stack.as_mut_ptr().add(top);
+            let base = s.ptr.add(top);
             for i in 0..slot_count {
-                let slot_idx = top + i;
-                if !s.active.get(slot_idx).copied().unwrap_or(false) {
+                let entry = base.add(i);
+                if !(*entry).is_active() {
                     continue;
                 }
-                let bound_ptr = s.slot_ptrs.get(slot_idx).copied().unwrap_or(0) as *mut u64;
+                let bound_ptr = (*entry).bound_ptr();
+                // Unbound entries expose the mirror word itself. `ShadowEntry`
+                // is `#[repr(C)]` with `value` at offset 0, so this is a
+                // correctly-aligned `*mut u64` into the buffer — the same
+                // storage the pre-#7079 parallel-`Vec` layout handed out.
                 let ptr = if bound_ptr.is_null() {
-                    base.add(i)
+                    std::ptr::addr_of_mut!((*entry).value)
                 } else {
                     bound_ptr
                 };
@@ -1510,7 +1534,7 @@ pub(super) fn visit_shadow_stack_root_slots(mut visit: impl FnMut(MutableRootSlo
                     ptr,
                 });
             }
-            top = s.stack[header_base] as usize;
+            top = header.value as usize;
         }
     });
 }

@@ -74,6 +74,28 @@ pub(super) fn shadow_stack_enabled() -> bool {
     })
 }
 
+/// Inline shadow-slot store gate (#7088). Default ON.
+///
+/// When enabled, a store to a GC-rooted local is emitted as an address
+/// computation and a pair of stores against this thread's `ShadowStackState`
+/// instead of a call to `js_shadow_slot_bind` / `js_shadow_slot_set`. The
+/// runtime entry points stay exported, and are what the emitted code falls
+/// back to when no state pointer is available for the activation.
+///
+/// `PERRY_INLINE_SHADOW_SLOT=0`/`off`/`false` reverts to the calls, for
+/// bisection. Independent of `PERRY_SHADOW_STACK`, which switches root
+/// emission off entirely; with the shadow stack off there is nothing to inline.
+pub(crate) fn inline_shadow_slot_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        !matches!(
+            std::env::var("PERRY_INLINE_SHADOW_SLOT").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        )
+    })
+}
+
 /// Inline-hot-small gate. Default ON. When enabled, small functions
 /// (`INLINE_HOT_SMALL_MIN ..= SIZE_CAP` statements) that have ≥1 call site
 /// inside a loop get LLVM's `inlinehint` — a *bounded* nudge that raises the
@@ -1082,57 +1104,6 @@ pub(super) fn init_static_fields_late(
         }
     }
     Ok(())
-}
-
-/// Returns true if `stmt` contains, at any nesting depth (through
-/// if/while/do-while/for/labeled/try/switch bodies), an `Expr(
-/// StaticMethodCall)` invoking the (`class_name`, `method_name`) pair —
-/// the shape HIR lowering emits at the class-decl position for each
-/// `__perry_static_init_*` synthetic method. Used by
-/// `init_static_fields_late` to skip per-(class, block) pairs that
-/// have already been invoked inline. (#2278)
-///
-/// Must recurse: a class declared inside `try { class C { static {...}
-/// } }` (test262 static-init-abrupt.js wraps its whole class this way)
-/// lowers its inline `StaticMethodCall` into the `Try`'s `body`, not at
-/// `hir.init`'s top level. A shallow top-level-only scan missed it, so
-/// this late fallback re-invoked the block a second time — outside the
-/// user's `try`, so a throwing block's second run surfaced as an
-/// uncaught exception instead of staying silently absent.
-fn init_calls_static_block(stmt: &perry_hir::Stmt, class_name: &str, method_name: &str) -> bool {
-    use perry_hir::Stmt;
-    let any_calls = |stmts: &[Stmt]| {
-        stmts
-            .iter()
-            .any(|s| init_calls_static_block(s, class_name, method_name))
-    };
-    match stmt {
-        Stmt::Expr(perry_hir::Expr::StaticMethodCall {
-            class_name: c,
-            method_name: m,
-            ..
-        }) => c == class_name && m == method_name,
-        Stmt::If {
-            then_branch,
-            else_branch,
-            ..
-        } => any_calls(then_branch) || else_branch.as_ref().is_some_and(|b| any_calls(b)),
-        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::For { body, .. } => {
-            any_calls(body)
-        }
-        Stmt::Labeled { body, .. } => init_calls_static_block(body, class_name, method_name),
-        Stmt::Try {
-            body,
-            catch,
-            finally,
-        } => {
-            any_calls(body)
-                || catch.as_ref().is_some_and(|c| any_calls(&c.body))
-                || finally.as_ref().is_some_and(|f| any_calls(f))
-        }
-        Stmt::Switch { cases, .. } => cases.iter().any(|case| any_calls(&case.body)),
-        _ => false,
-    }
 }
 
 /// #5989: collect every `(class, method)` invoked via a `StaticMethodCall`

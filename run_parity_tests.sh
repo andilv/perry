@@ -7,11 +7,60 @@ TEST_DIR="$SCRIPT_DIR/test-files"
 NODE_SUITE_DIR="$SCRIPT_DIR/test-parity/node-suite"
 OUTPUT_DIR="$SCRIPT_DIR/test-parity/output"
 REPORT_DIR="$SCRIPT_DIR/test-parity/reports"
+
+# Normalize the host once. `uname` under Git Bash reports MINGW/MSYS rather
+# than Windows, while CI metadata and the parity allowlists use stable,
+# lowercase platform names. PERRY_HOST_PLATFORM is also a deliberate test hook
+# for exercising the Windows shell path on non-Windows hosts.
+if [[ -n "${PERRY_HOST_PLATFORM:-}" ]]; then
+    HOST_PLATFORM="$PERRY_HOST_PLATFORM"
+else
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) HOST_PLATFORM="windows" ;;
+        Darwin) HOST_PLATFORM="macos" ;;
+        Linux) HOST_PLATFORM="linux" ;;
+        *) HOST_PLATFORM="other" ;;
+    esac
+fi
+case "$HOST_PLATFORM" in
+    windows|macos|linux|other) ;;
+    *)
+        echo "Invalid PERRY_HOST_PLATFORM '$HOST_PLATFORM' (want windows, macos, linux, or other)" >&2
+        exit 1
+        ;;
+esac
+
+# Git Bash exposes the native TEMP/TMP directories even when TMPDIR is unset.
+# Prefer those before the Unix fallback, and translate a native `C:\...` path
+# into the POSIX spelling expected by Bash utilities.
+TEMP_ROOT="${TMPDIR:-${TEMP:-${TMP:-/tmp}}}"
+if [[ "$HOST_PLATFORM" == "windows" ]] && command -v cygpath &>/dev/null; then
+    TEMP_ROOT="$(cygpath -u "$TEMP_ROOT")"
+fi
+mkdir -p "$TEMP_ROOT"
+
+PYTHON_CMD=""
+if command -v python3 &>/dev/null; then
+    PYTHON_CMD="python3"
+elif command -v python &>/dev/null; then
+    # GitHub's Windows image exposes the setup-python shim as `python` on
+    # some revisions and `python3` on others.
+    PYTHON_CMD="python"
+fi
+if [[ -z "$PYTHON_CMD" ]]; then
+    echo "Python 3 is required by the parity output normalizer" >&2
+    exit 1
+fi
+PERRY_RUN_TIMEOUT="${PERRY_RUN_TIMEOUT:-10}"
+if [[ ! "$PERRY_RUN_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Invalid PERRY_RUN_TIMEOUT '$PERRY_RUN_TIMEOUT' (want a positive integer)" >&2
+    exit 1
+fi
 # Per-run scratch dir for compiled test binaries (2026-07-02 audit): the old
 # fixed /tmp/perry_parity_<test-id> paths meant two concurrent suite runs
 # (two agents / two worktrees on one machine) executed EACH OTHER'S compiler
 # output — cross-contaminated pass/fail attributed to the wrong build.
-PARITY_TMP="$(mktemp -d "${TMPDIR:-/tmp}/perry-parity.XXXXXX")"
+PARITY_TMP="$(mktemp -d "$TEMP_ROOT/perry-parity.XXXXXX")"
 trap 'rm -rf "$PARITY_TMP"' EXIT
 
 # LLVM is the only backend post-Phase K hard cutover. The --llvm /
@@ -85,13 +134,14 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
-# Find timeout command (GNU coreutils on Linux, gtimeout on macOS via Homebrew)
+# Find a native timeout command where available. Git Bash may resolve
+# Windows' unrelated timeout.exe (or no timeout at all), so Windows always
+# uses the Python process-tree fallback in run_with_timeout.
 if command -v timeout &> /dev/null; then
     TIMEOUT_CMD="timeout"
 elif command -v gtimeout &> /dev/null; then
     TIMEOUT_CMD="gtimeout"
 else
-    # No timeout available - run without timeout
     TIMEOUT_CMD=""
 fi
 
@@ -118,11 +168,55 @@ perry_abnormal_exit() {
 run_with_timeout() {
     local seconds=$1
     shift
-    if [[ -n "$TIMEOUT_CMD" ]]; then
+    if [[ "$HOST_PLATFORM" != "windows" && -n "$TIMEOUT_CMD" ]]; then
         $TIMEOUT_CMD "$seconds" "$@"
-    else
-        "$@"
+        return
     fi
+
+    # Python is already a required harness dependency. Start the test in its
+    # own process group and kill the entire tree on expiry; returning 124
+    # matches GNU timeout so the existing crash classifier stays unchanged.
+    "$PYTHON_CMD" -c '
+import os
+import signal
+import subprocess
+import sys
+
+seconds = int(sys.argv[1])
+command = sys.argv[2:]
+options = {}
+if os.name == "nt":
+    options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+else:
+    options["start_new_session"] = True
+
+process = subprocess.Popen(command, **options)
+try:
+    returncode = process.wait(timeout=seconds)
+except subprocess.TimeoutExpired:
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+    raise SystemExit(124)
+
+if returncode < 0:
+    raise SystemExit(128 - returncode)
+raise SystemExit(returncode)
+' "$seconds" "$@"
 }
 
 wait_for_tcp_port() {
@@ -130,7 +224,7 @@ wait_for_tcp_port() {
     local port=$2
     local attempts=$3
     local delay=${4:-0.1}
-    python3 - "$host" "$port" "$attempts" "$delay" <<'PY'
+    "$PYTHON_CMD" - "$host" "$port" "$attempts" "$delay" <<'PY'
 import socket
 import sys
 import time
@@ -160,15 +254,15 @@ TLS_UPGRADE_SERVER_PID=""
 
 start_tls_upgrade_server() {
     local server_script="$SCRIPT_DIR/test-files/test_net_upgrade_tls_server.py"
-    if ! command -v python3 &>/dev/null; then
-        echo -e "${YELLOW}WARN${NC}  python3 not found — test_net_upgrade_tls will fail parity" >&2
+    if [[ -z "$PYTHON_CMD" ]]; then
+        echo -e "${YELLOW}WARN${NC}  python not found — test_net_upgrade_tls will fail parity" >&2
         return 1
     fi
     if [[ ! -f "$server_script" ]]; then
         echo -e "${YELLOW}WARN${NC}  $server_script not found — test_net_upgrade_tls will fail parity" >&2
         return 1
     fi
-    python3 "$server_script" --port 17892 &
+    "$PYTHON_CMD" "$server_script" --port 17892 &
     TLS_UPGRADE_SERVER_PID=$!
     # Wait up to 3 s for the port to open.
     wait_for_tcp_port 127.0.0.1 17892 30 0.1 && return 0
@@ -295,6 +389,17 @@ cap_output() {
     '
 }
 
+# Unimported globals fixtures exercise script semantics. The repository root
+# marks `.ts` files as ESM, which makes Node run those scripts in strict mode.
+# Retry only a failed, import-free globals fixture as a `.cts` copy so both
+# Node and Perry use CommonJS without changing ESM fixtures or source files.
+can_retry_node_globals_as_commonjs() {
+    local test_id=$1
+    local test_file=$2
+    [[ "$test_id" == node-suite/globals/* && "$test_file" == *.ts ]] || return 1
+    ! grep -qE '^[[:space:]]*(import|export)[[:space:]{]' "$test_file"
+}
+
 # Function to normalize output for comparison
 normalize_output() {
     local input="$1"
@@ -303,15 +408,15 @@ normalize_output() {
     # while-read loop with `decoded+="$line"\n` per iteration. That's
     # O(n²) on input size: 5.7M lines × 2.85M-char-average tail ≈ 16T
     # bytes of string concatenation, which burned ~3 hours on CI before
-    # the runner was killed. Replaced with a single python3 pass —
+    # the runner was killed. Replaced with a single Python 3 pass —
     # linear time, decodes `<Buffer XX XX ...>` to its UTF-8 bytes in
-    # one walk. python3 is preinstalled on every ubuntu/macos runner.
+    # one walk. Python 3 is preinstalled on the hosted CI runners.
     #
     # The decode is bytes-faithful: invalid UTF-8 sequences become U+FFFD
     # via `errors="replace"`, matching the pre-fix `xxd -r -p` behavior
     # for arbitrary binary content.
     local decoded
-    decoded=$(printf '%s' "$input" | python3 -c '
+    decoded=$(printf '%s' "$input" | "$PYTHON_CMD" -c '
 import sys
 for raw in sys.stdin:
     line = raw.rstrip("\n").rstrip("\r")
@@ -406,11 +511,83 @@ echo ""
 # release binary the prior step had just produced, and (b) adds cargo's own
 # per-invocation overhead × ~150 tests.
 TARGET_DIR="${CARGO_TARGET_DIR:-$SCRIPT_DIR/target}"
-PERRY_BIN="$TARGET_DIR/release/perry"
-echo "Building compiler (release)..."
+if [[ "$HOST_PLATFORM" == "windows" ]] && command -v cygpath &>/dev/null; then
+    TARGET_DIR="$(cygpath -u "$TARGET_DIR")"
+fi
+PERRY_EXE_SUFFIX=""
+if [[ "$HOST_PLATFORM" == "windows" ]]; then
+    PERRY_EXE_SUFFIX=".exe"
+fi
+PERRY_SKIP_BUILD="${PERRY_SKIP_BUILD:-0}"
+case "$PERRY_SKIP_BUILD" in
+    0|1) ;;
+    *)
+        echo -e "${RED}Invalid PERRY_SKIP_BUILD '$PERRY_SKIP_BUILD' (want 0 or 1)${NC}" >&2
+        exit 1
+        ;;
+esac
+
+if [[ "$PERRY_SKIP_BUILD" == "1" ]]; then
+    PERRY_BIN="${PERRY_BIN:-$TARGET_DIR/release/perry$PERRY_EXE_SUFFIX}"
+    if [[ "$HOST_PLATFORM" == "windows" ]] && command -v cygpath &>/dev/null; then
+        PERRY_BIN="$(cygpath -u "$PERRY_BIN")"
+    fi
+    if [[ ! -x "$PERRY_BIN" ]]; then
+        echo -e "${RED}PERRY_BIN is not executable: $PERRY_BIN${NC}" >&2
+        exit 1
+    fi
+    PERRY_RUNTIME_DIR="${PERRY_RUNTIME_DIR:-$(cd "$(dirname "$PERRY_BIN")" && pwd)}"
+    if [[ "$HOST_PLATFORM" == "windows" ]] && command -v cygpath &>/dev/null; then
+        PERRY_RUNTIME_DIR="$(cygpath -u "$PERRY_RUNTIME_DIR")"
+    fi
+    if [[ "$HOST_PLATFORM" == "windows" ]]; then
+        runtime_lib=perry_runtime.lib
+        stdlib_lib=perry_stdlib.lib
+    else
+        runtime_lib=libperry_runtime.a
+        stdlib_lib=libperry_stdlib.a
+    fi
+    if [[ ! -f "$PERRY_RUNTIME_DIR/$runtime_lib" || ! -f "$PERRY_RUNTIME_DIR/$stdlib_lib" ]]; then
+        echo -e "${RED}PERRY_RUNTIME_DIR must contain $runtime_lib and $stdlib_lib: $PERRY_RUNTIME_DIR${NC}" >&2
+        exit 1
+    fi
+    PERRY_RUNTIME_DIR_SHELL="$PERRY_RUNTIME_DIR"
+    if [[ "$HOST_PLATFORM" == "windows" ]] && command -v cygpath &>/dev/null; then
+        # Native Windows processes do not receive Git Bash's argv path
+        # conversion for arbitrary environment variables.
+        PERRY_RUNTIME_DIR="$(cygpath -w "$PERRY_RUNTIME_DIR")"
+    fi
+    export PERRY_RUNTIME_DIR PERRY_NO_AUTO_OPTIMIZE=1
+    echo "Using prebuilt compiler: $PERRY_BIN"
+    echo "Using prebuilt runtime archives: $PERRY_RUNTIME_DIR_SHELL"
+else
+    PERRY_BIN="$TARGET_DIR/release/perry$PERRY_EXE_SUFFIX"
+    echo "Building compiler (release)..."
+fi
 BUILD_PACKAGES=(-p perry -p perry-runtime -p perry-stdlib -p perry-runtime-static -p perry-stdlib-static)
 BUILD_FEATURES=()
 needs_wasm_host=0
+# The default `test-files/` corpus (the gap suite) under PERRY_NO_AUTO_OPTIMIZE
+# links the prebuilt `full` stdlib, which is NOT compiled with the
+# `external-*` pump features. Any test whose module routes through a
+# well-known ext wrapper (events / http / net / ws / zlib) then links against
+# a stdlib with no pump and fails — reported as an untriaged NEW gap failure
+# with no hint that the run mode caused it. Measured: 7 such false regressions
+# (test_gap_events_import_4995, 5x http/fetch, test_gap_net_connect_bound_value),
+# all of which pass with auto-optimize. node-suite already compensates below;
+# do the same here. There is no MODULE_FILTER for this suite, so build the
+# whole well-known set rather than switching on it.
+if [[ -n "${PERRY_NO_AUTO_OPTIMIZE:-}" && "$TEST_SUITE" == "all" ]]; then
+    BUILD_PACKAGES+=(-p perry-ext-events -p perry-ext-http -p perry-ext-net -p perry-ext-ws -p perry-ext-zlib)
+    BUILD_FEATURES+=(
+        perry-stdlib/external-events-construct
+        perry-stdlib/external-http-server-pump
+        perry-stdlib/external-http-client-pump
+        perry-stdlib/external-net-pump
+        perry-stdlib/external-ws-pump
+        perry-stdlib/external-zlib-pump
+    )
+fi
 if [[ -n "${PERRY_NO_AUTO_OPTIMIZE:-}" && "$TEST_SUITE" == "node-suite" ]]; then
     case "$MODULE_FILTER" in
         ""|http|http/*|https|https/*|http2|http2/*)
@@ -466,11 +643,11 @@ if [[ "${#BUILD_FEATURES[@]}" -gt 0 ]]; then
     feature_csv=$(IFS=,; echo "${BUILD_FEATURES[*]}")
     BUILD_FEATURE_ARGS=(--features "$feature_csv")
 fi
-if ! cargo build --release --quiet "${BUILD_PACKAGES[@]}" "${BUILD_FEATURE_ARGS[@]}" 2>/dev/null; then
+if [[ "$PERRY_SKIP_BUILD" == "0" ]] && ! cargo build --release --quiet "${BUILD_PACKAGES[@]}" "${BUILD_FEATURE_ARGS[@]}" 2>/dev/null; then
     echo -e "${RED}Failed to build compiler/runtime archives${NC}"
     exit 1
 fi
-if [[ "$needs_wasm_host" -eq 1 ]]; then
+if [[ "$PERRY_SKIP_BUILD" == "0" && "$needs_wasm_host" -eq 1 ]]; then
     # WebAssembly metadata fixtures exercise the real host shims. Build the
     # wasm-enabled runtime staticlib after the CLI build above; enabling this
     # feature while building the `perry` binary would make the CLI link against
@@ -481,7 +658,7 @@ if [[ "$needs_wasm_host" -eq 1 ]]; then
         exit 1
     fi
 fi
-if [[ "$needs_ext_net" -eq 1 ]]; then
+if [[ "$PERRY_SKIP_BUILD" == "0" && "$needs_ext_net" -eq 1 ]]; then
     echo "Building net extension (release)..."
     ext_net_jobs="${CARGO_BUILD_JOBS:-1}"
     if ! cargo build --release --quiet -p perry-ext-net -j "$ext_net_jobs" 2>/dev/null; then
@@ -494,7 +671,11 @@ if [[ ! -x "$PERRY_BIN" ]]; then
     exit 1
 fi
 
-echo -e "${GREEN}Compiler and runtime archives built successfully${NC}"
+if [[ "$PERRY_SKIP_BUILD" == "0" ]]; then
+    echo -e "${GREEN}Compiler and runtime archives built successfully${NC}"
+else
+    echo -e "${GREEN}Prebuilt compiler and runtime archives verified${NC}"
+fi
 echo ""
 echo "Running parity tests (backend: $BACKEND_LABEL, suite: $TEST_SUITE${MODULE_FILTER:+, module: $MODULE_FILTER})..."
 echo ""
@@ -509,15 +690,15 @@ ECHO_SERVER_PID=""
 ECHO_SERVER_SCRIPT="$SCRIPT_DIR/test-files/test_net_echo_server.py"
 
 start_echo_server() {
-    if ! command -v python3 &>/dev/null; then
-        echo "Warning: python3 not found — test_net_min / test_net_socket will fail parity"
+    if [[ -z "$PYTHON_CMD" ]]; then
+        echo "Warning: python not found — test_net_min / test_net_socket will fail parity"
         return
     fi
     if [[ ! -f "$ECHO_SERVER_SCRIPT" ]]; then
         echo "Warning: $ECHO_SERVER_SCRIPT not found — test_net_min / test_net_socket will fail parity"
         return
     fi
-    python3 "$ECHO_SERVER_SCRIPT" &
+    "$PYTHON_CMD" "$ECHO_SERVER_SCRIPT" &
     ECHO_SERVER_PID=$!
     # Poll up to 5 s (50 × 100 ms) for the server to accept connections.
     local ready=0
@@ -539,7 +720,14 @@ stop_echo_server() {
     fi
 }
 
-trap stop_echo_server EXIT
+cleanup_parity_run() {
+    stop_echo_server
+    rm -rf "$PARITY_TMP"
+}
+
+# Supersede the scratch-only trap installed immediately after mktemp now that
+# the optional echo server also has lifecycle state to clean.
+trap cleanup_parity_run EXIT
 
 # The granular node-suite starts with deterministic module cases (path, url,
 # etc.) that do not need the legacy top-level net echo server. Future net
@@ -632,7 +820,9 @@ for test_file in "${TEST_FILES[@]}"; do
     safe_test_id="${test_id//\//__}"
     node_output_file="$OUTPUT_DIR/node/${safe_test_id}.txt"
     perry_output_file="$OUTPUT_DIR/perry/${safe_test_id}.txt"
-    perry_binary="$PARITY_TMP/perry_parity_$safe_test_id"
+    perry_binary="$PARITY_TMP/perry_parity_$safe_test_id$PERRY_EXE_SUFFIX"
+    parity_test_file="$test_file"
+    perry_compile_command=()
     parity_argv_line=$(sed -n -E 's|^[[:space:]]*//[[:space:]]*parity-argv:[[:space:]]*(.*)$|\1|p' "$test_file" | head -1)
     parity_node_argv_line=$(sed -n -E 's|^[[:space:]]*//[[:space:]]*parity-node-argv:[[:space:]]*(.*)$|\1|p' "$test_file" | head -1)
     parity_env_line=$(sed -n -E 's|^[[:space:]]*//[[:space:]]*parity-env:[[:space:]]*(.*)$|\1|p' "$test_file" | head -1)
@@ -671,10 +861,18 @@ for test_file in "${TEST_FILES[@]}"; do
     # memory and DOS the runner. PIPESTATUS doesn't propagate across
     # `$(...)`, so capturing the exit code requires the file detour
     # rather than a `cmd | cap_output` pipeline.
-    node_tmp=$(mktemp)
-    run_with_timeout 10 env FORCE_COLOR=0 NO_COLOR=1 NODE_DISABLE_COLORS=1 \
+    node_tmp="$PARITY_TMP/${safe_test_id}.node-output"
+    run_with_timeout "$PERRY_RUN_TIMEOUT" env FORCE_COLOR=0 NO_COLOR=1 NODE_DISABLE_COLORS=1 \
         node --experimental-strip-types "${node_argv[@]}" "$test_file" "${test_argv[@]}" > "$node_tmp" 2>&1
     node_exit=$?
+    if [[ $node_exit -ne 0 ]] && can_retry_node_globals_as_commonjs "$test_id" "$test_file"; then
+        parity_test_file="$PARITY_TMP/${safe_test_id}.cts"
+        cp "$test_file" "$parity_test_file"
+        perry_compile_command=(compile)
+        run_with_timeout "$PERRY_RUN_TIMEOUT" env FORCE_COLOR=0 NO_COLOR=1 NODE_DISABLE_COLORS=1 \
+            node --experimental-strip-types "${node_argv[@]}" "$parity_test_file" "${test_argv[@]}" > "$node_tmp" 2>&1
+        node_exit=$?
+    fi
     node_output=$(cap_output < "$node_tmp")
     rm -f "$node_tmp"
 
@@ -720,10 +918,10 @@ for test_file in "${TEST_FILES[@]}"; do
     # be pulling QuickJS in), and if the error names `perry-jsruntime`,
     # retry once with `--enable-js-runtime`. Avoids hand-curating a list
     # of test names that need V8.
-    compile_output=$(env $compile_env "${parity_env[@]}" "$PERRY_BIN" "${compile_flags[@]}" "$test_file" -o "$perry_binary" 2>&1)
+    compile_output=$(env $compile_env "${parity_env[@]}" "$PERRY_BIN" "${perry_compile_command[@]}" "${compile_flags[@]}" "$parity_test_file" -o "$perry_binary" 2>&1)
     compile_exit=$?
     if [[ $compile_exit -ne 0 ]] && grep -q "perry-jsruntime" <<<"$compile_output"; then
-        compile_output=$(env $compile_env "${parity_env[@]}" "$PERRY_BIN" "${compile_flags[@]}" --enable-js-runtime "$test_file" -o "$perry_binary" 2>&1)
+        compile_output=$(env $compile_env "${parity_env[@]}" "$PERRY_BIN" "${perry_compile_command[@]}" "${compile_flags[@]}" --enable-js-runtime "$parity_test_file" -o "$perry_binary" 2>&1)
         compile_exit=$?
     fi
 
@@ -750,9 +948,60 @@ for test_file in "${TEST_FILES[@]}"; do
     # Perry's `[perry] warning: ... is a stub` lines. They'd otherwise show
     # up on the 2>&1-captured stream for any test that exercises a flagged
     # API (dns/dgram loopback, v8 heap snapshot, …) and diff against Node.
-    perry_tmp=$(mktemp)
-    run_with_timeout 10 env PERRY_STUB_DIAG=off "${parity_env[@]}" "$perry_binary" "${test_argv[@]}" > "$perry_tmp" 2>&1
+    perry_tmp="$PARITY_TMP/${safe_test_id}.perry-output"
+    # Cap the test binary's fork budget at current-user-tasks + 50: legit
+    # multi-process tests (cluster/child_process) fit easily, while a
+    # fork-bombing test (cluster re-exec loop, 2026-07-22) stalls at ~50
+    # orphans instead of saturating the user process limit — which would
+    # starve the harness itself out of fork() and kill the whole run.
+    # If the proc count can't be measured or the cap can't be applied, abort
+    # this test before exec: an uncapped run could recreate the fork bomb this
+    # containment layer exists to prevent. The budget is per-UID, not per-tree,
+    # so a concurrent heavy job can transiently eat the +50 headroom; recomputing
+    # per test keeps that window small, and the worst case is one test
+    # classified as crash rather than a wedged machine.
+    if [[ "$HOST_PLATFORM" == "windows" ]]; then
+        # Git Bash has no enforceable RLIMIT_NPROC (`ulimit -u`) for native
+        # Windows processes. The Python-backed timeout starts a fresh process
+        # group and kills its tree, even when GNU timeout is unavailable.
+        run_with_timeout "$PERRY_RUN_TIMEOUT" env PERRY_STUB_DIAG=off "${parity_env[@]}" \
+            "$perry_binary" "${test_argv[@]}" > "$perry_tmp" 2>&1
+    else
+        run_with_timeout "$PERRY_RUN_TIMEOUT" "$BASH" -c '
+            if [ "$(uname -s)" = "Linux" ]; then
+                proc_list=$(ps -u "$(id -u)" -L -o lwp= 2>/dev/null)
+            else
+                proc_list=$(ps -u "$(id -u)" -o pid= 2>/dev/null)
+            fi || {
+                echo "failed to measure the current user process count" >&2
+                exit 125
+            }
+            nproc_now=$(printf "%s\n" "$proc_list" | awk "NF { count++ } END { print count + 0 }") || {
+                echo "failed to count the current user processes" >&2
+                exit 125
+            }
+            if ! [ "$nproc_now" -gt 0 ] 2>/dev/null; then
+                echo "invalid current user process count: $nproc_now" >&2
+                exit 125
+            fi
+            if ! ulimit -u $(( nproc_now + 50 )) 2>/dev/null; then
+                echo "failed to apply the per-test process limit" >&2
+                exit 125
+            fi
+            exec "$@"' _ env PERRY_STUB_DIAG=off "${parity_env[@]}" "$perry_binary" "${test_argv[@]}" > "$perry_tmp" 2>&1
+    fi
     perry_exit=$?
+    # Reap orphaned Unix children of the test binary (cluster tests fork
+    # workers that survive the timeout kill of the direct child and can
+    # fork-bomb the machine — 2026-07-22). Scoped to this run's tmp dir, so
+    # concurrent suite runs are unaffected. Git Bash does not provide a
+    # process-tree primitive equivalent to a Windows Job Object, so its
+    # supported CI subset relies on the job timeout documented above.
+    if [[ "$HOST_PLATFORM" != "windows" ]] && command -v pkill &>/dev/null; then
+        # pkill -f treats the pattern as a regex; escape the path's
+        # metacharacters (the mktemp dir contains a dot).
+        pkill -9 -f "$(printf '%s/' "$PARITY_TMP" | sed 's/[][\.*^$()+?{|]/\\&/g')" 2>/dev/null
+    fi
     perry_output=$(cap_output < "$perry_tmp")
     rm -f "$perry_tmp"
 
@@ -838,7 +1087,8 @@ done
 # Calculate parity percentage
 TOTAL_RUN=$((PARITY_PASS + PARITY_FAIL + CRASH_FAIL))
 if [[ $TOTAL_RUN -gt 0 ]]; then
-    PARITY_PCT=$(echo "scale=1; $PARITY_PASS * 100 / $TOTAL_RUN" | bc)
+    PARITY_TENTHS=$((PARITY_PASS * 1000 / TOTAL_RUN))
+    PARITY_PCT="$((PARITY_TENTHS / 10)).$((PARITY_TENTHS % 10))"
 else
     PARITY_PCT="0.0"
 fi
@@ -890,6 +1140,7 @@ RESULTS_JSON=$(printf '%s\n' "${TEST_RESULTS[@]}" | paste -sd, -)
 cat > "$REPORT_FILE" << EOF
 {
   "generated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "platform": "$HOST_PLATFORM",
   "summary": {
     "parity_pass": $PARITY_PASS,
     "parity_fail": $PARITY_FAIL,
@@ -926,8 +1177,9 @@ if [[ -n "${PERRY_TEST_SUMMARY_OUT:-}" ]]; then
 EOF
 fi
 
-# Exit with error if parity is below threshold (80%)
-if (( $(echo "$PARITY_PCT < 80" | bc -l) )); then
+# Exit with error if parity is below threshold (80%). Integer arithmetic keeps
+# the Git Bash path independent of `bc`, which Git for Windows does not ship.
+if (( TOTAL_RUN == 0 || PARITY_PASS * 100 < TOTAL_RUN * 80 )); then
     echo -e "${RED}Parity below 80% threshold${NC}"
     exit 1
 fi

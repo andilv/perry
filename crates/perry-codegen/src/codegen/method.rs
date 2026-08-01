@@ -261,6 +261,7 @@ pub(super) fn compile_method(
     cross_module: &CrossModuleCtx,
     typed_public_trampoline: Option<TypedFunctionTrampolineKind>,
     force_generic_body: bool,
+    proven_this: Option<crate::collectors::PtrShapeLocal>,
 ) -> Result<()> {
     let public_llvm_name = methods
         .get(&(class.name.clone(), method.name.clone()))
@@ -272,7 +273,15 @@ pub(super) fn compile_method(
                 method.name
             )
         })?;
-    let llvm_name = if typed_public_trampoline.is_some() || force_generic_body {
+    // Representation-selection Phase 5a: the proven-`this` clone is a SECOND,
+    // additive body compiled from the same HIR through the same statement
+    // lowerer. It never replaces the public symbol and never participates in
+    // the typed-trampoline / generic-body split — those are emitted by the
+    // primary (`proven_this: None`) invocation for this same method.
+    let is_pshape_clone = proven_this.is_some();
+    let llvm_name = if is_pshape_clone {
+        crate::collectors::pshape_method_name(&public_llvm_name)
+    } else if typed_public_trampoline.is_some() || force_generic_body {
         generic_method_body_name(&public_llvm_name)
     } else {
         public_llvm_name.clone()
@@ -288,7 +297,7 @@ pub(super) fn compile_method(
     let ic_base = llmod.ic_counter;
     let buffer_alias_base = llmod.buffer_alias_counter;
     let lf = llmod.define_function(&llvm_name, DOUBLE, params);
-    if typed_public_trampoline.is_some() || force_generic_body {
+    if is_pshape_clone || typed_public_trampoline.is_some() || force_generic_body {
         lf.linkage = "internal".to_string();
     }
 
@@ -361,6 +370,11 @@ pub(super) fn compile_method(
         .collect();
     let flat_const_ids: std::collections::HashSet<u32> =
         cross_module.flat_const_arrays.keys().copied().collect();
+    // `--opt-report` (#6952) attribution scope; no-op when off.
+    let _opt_report_scope = crate::opt_report::enter_region(
+        &format!("{}.{}", class.name, method.name),
+        crate::opt_report::RegionKind::Method,
+    );
     let native_facts = crate::collectors::collect_native_region_fact_graph(
         &method.body,
         &[],
@@ -376,22 +390,23 @@ pub(super) fn compile_method(
         &cross_module.module_dispatch,
     );
 
-    // Representation-selection Phase 1 context gate (see codegen/function.rs).
-    let repsel_allows = crate::expr::canonical_i32_locals_enabled()
-        && !method.is_async
-        && !method.is_generator
-        && !method.was_plain_async;
-    // Phase 3a: same context restrictions, independent env gate.
-    let repsel_str_allows = crate::expr::canonical_str_locals_enabled()
-        && !method.is_async
-        && !method.is_generator
-        && !method.was_plain_async;
-    let repsel_closure_refs = if repsel_allows || repsel_str_allows {
+    // Representation-selection context gates (see codegen/function.rs).
+    let repsel_flags = crate::expr::RepselContextFlags::for_body(
+        method.is_async,
+        method.is_generator,
+        method.was_plain_async,
+    );
+    let repsel_allows = repsel_flags.allows_canonical_i32;
+    let repsel_str_allows = repsel_flags.allows_canonical_str;
+    // #7106: report the structural context exclusion at the `Stmt::Let` site.
+    let repsel_context_denial = repsel_flags.canonical_denial;
+    let report_denial = repsel_flags.report_denial();
+    let repsel_closure_refs = if repsel_allows || repsel_str_allows || report_denial {
         crate::expr::collect_closure_referenced_locals(&method.body)
     } else {
         std::collections::HashSet::new()
     };
-    let repsel_str_ineligible = if repsel_str_allows {
+    let repsel_str_ineligible = if repsel_str_allows || report_denial {
         crate::expr::collect_canonical_str_ineligible_locals(&method.body)
     } else {
         std::collections::HashSet::new()
@@ -409,6 +424,7 @@ pub(super) fn compile_method(
         native_facts: &native_facts,
         locals,
         local_types,
+        reassigned_locals: crate::collectors::reassigned_locals(&method.body),
         const_string_locals: std::collections::HashMap::new(),
         const_number_locals: std::collections::HashMap::new(),
         current_block: 0,
@@ -434,6 +450,7 @@ pub(super) fn compile_method(
         namespace_v8_specifiers: &cross_module.namespace_v8_specifiers,
         closure_captures: HashMap::new(),
         current_closure_ptr: None,
+        current_closure_slot: None,
         enums,
         is_async_fn: method.is_async,
         is_strict_fn: true,
@@ -501,6 +518,13 @@ pub(super) fn compile_method(
         i32_counter_slots: HashMap::new(),
         local_slot_reps: HashMap::new(),
         repsel_context_allows_canonical_i32: repsel_allows,
+        // #7109 split the FIELD out of `repsel_context_allows_canonical_i32`;
+        // #7128 split the VALUE, which is what the knob actually reads. Until
+        // then this was still `repsel_allows`, so `PERRY_CANONICAL_I32_LOCALS=0`
+        // disabled every Ptr<Shape> consumption in the program.
+        repsel_context_allows_ptr_shape: repsel_flags.allows_ptr_shape,
+        repsel_ptr_shape_context_denial: repsel_flags.ptr_shape_denial,
+        repsel_context_denial,
         repsel_closure_ref_locals: repsel_closure_refs,
         repsel_context_allows_canonical_str: repsel_str_allows,
         repsel_str_ineligible_locals: repsel_str_ineligible,
@@ -526,6 +550,7 @@ pub(super) fn compile_method(
         scalar_replaced_arrays: std::collections::HashMap::new(),
         scalar_replaced_split_part_lengths: std::collections::HashMap::new(),
         scalar_replaced_uppercase_sources: std::collections::HashMap::new(),
+        scalar_slot_shadow_slots: std::collections::HashMap::new(),
         scalar_ctor_target: Vec::new(),
         non_escaping_news: native_facts.non_escaping_news().clone(),
         non_escaping_new_used_fields: native_facts.non_escaping_new_used_fields().clone(),
@@ -551,6 +576,8 @@ pub(super) fn compile_method(
         typed_i1_functions: &cross_module.typed_i1_functions,
         typed_i1_function_param_reps: &cross_module.typed_i1_function_param_reps,
         typed_f64_methods: &cross_module.typed_f64_methods,
+        pshape_methods: &cross_module.pshape_methods,
+        proven_this,
         typed_i32_methods: &cross_module.typed_i32_methods,
         typed_i1_methods: &cross_module.typed_i1_methods,
         typed_string_methods: &cross_module.typed_string_methods,
@@ -1025,10 +1052,15 @@ pub(super) fn compile_method(
     for raw in &typed_parse_rodata {
         llmod.add_raw_global(raw.clone());
     }
-    if let Some(kind) = typed_public_trampoline {
-        emit_public_typed_method_trampoline(llmod, method, &public_llvm_name, &llvm_name, kind);
-    } else if force_generic_body {
-        emit_public_generic_method_forwarder(llmod, method, &public_llvm_name, &llvm_name);
+    // The Phase 5a clone is purely additive: the public symbol (and its
+    // trampoline/forwarder, if any) belongs to the primary invocation. Emitting
+    // it again here would define the same symbol twice.
+    if !is_pshape_clone {
+        if let Some(kind) = typed_public_trampoline {
+            emit_public_typed_method_trampoline(llmod, method, &public_llvm_name, &llvm_name, kind);
+        } else if force_generic_body {
+            emit_public_generic_method_forwarder(llmod, method, &public_llvm_name, &llvm_name);
+        }
     }
     Ok(())
 }
@@ -1392,6 +1424,11 @@ pub(super) fn compile_static_method(
         .collect();
     let flat_const_ids: std::collections::HashSet<u32> =
         cross_module.flat_const_arrays.keys().copied().collect();
+    // `--opt-report` (#6952) attribution scope; no-op when off.
+    let _opt_report_scope = crate::opt_report::enter_region(
+        &format!("{}.{} (static)", class.name, f.name),
+        crate::opt_report::RegionKind::Method,
+    );
     let native_facts = crate::collectors::collect_native_region_fact_graph(
         &f.body,
         &[],
@@ -1407,22 +1444,20 @@ pub(super) fn compile_static_method(
         &cross_module.module_dispatch,
     );
 
-    // Representation-selection Phase 1 context gate (see codegen/function.rs).
-    let repsel_allows = crate::expr::canonical_i32_locals_enabled()
-        && !f.is_async
-        && !f.is_generator
-        && !f.was_plain_async;
-    // Phase 3a: same context restrictions, independent env gate.
-    let repsel_str_allows = crate::expr::canonical_str_locals_enabled()
-        && !f.is_async
-        && !f.is_generator
-        && !f.was_plain_async;
-    let repsel_closure_refs = if repsel_allows || repsel_str_allows {
+    // Representation-selection context gates (see codegen/function.rs).
+    let repsel_flags =
+        crate::expr::RepselContextFlags::for_body(f.is_async, f.is_generator, f.was_plain_async);
+    let repsel_allows = repsel_flags.allows_canonical_i32;
+    let repsel_str_allows = repsel_flags.allows_canonical_str;
+    // #7106: report the structural context exclusion at the `Stmt::Let` site.
+    let repsel_context_denial = repsel_flags.canonical_denial;
+    let report_denial = repsel_flags.report_denial();
+    let repsel_closure_refs = if repsel_allows || repsel_str_allows || report_denial {
         crate::expr::collect_closure_referenced_locals(&f.body)
     } else {
         std::collections::HashSet::new()
     };
-    let repsel_str_ineligible = if repsel_str_allows {
+    let repsel_str_ineligible = if repsel_str_allows || report_denial {
         crate::expr::collect_canonical_str_ineligible_locals(&f.body)
     } else {
         std::collections::HashSet::new()
@@ -1440,6 +1475,7 @@ pub(super) fn compile_static_method(
         native_facts: &native_facts,
         locals,
         local_types,
+        reassigned_locals: crate::collectors::reassigned_locals(&f.body),
         const_string_locals: std::collections::HashMap::new(),
         const_number_locals: std::collections::HashMap::new(),
         current_block: 0,
@@ -1469,6 +1505,7 @@ pub(super) fn compile_static_method(
         namespace_v8_specifiers: &cross_module.namespace_v8_specifiers,
         closure_captures: HashMap::new(),
         current_closure_ptr: None,
+        current_closure_slot: None,
         enums,
         is_async_fn: f.is_async,
         is_strict_fn: f.is_strict,
@@ -1536,6 +1573,13 @@ pub(super) fn compile_static_method(
         i32_counter_slots: HashMap::new(),
         local_slot_reps: HashMap::new(),
         repsel_context_allows_canonical_i32: repsel_allows,
+        // #7109 split the FIELD out of `repsel_context_allows_canonical_i32`;
+        // #7128 split the VALUE, which is what the knob actually reads. Until
+        // then this was still `repsel_allows`, so `PERRY_CANONICAL_I32_LOCALS=0`
+        // disabled every Ptr<Shape> consumption in the program.
+        repsel_context_allows_ptr_shape: repsel_flags.allows_ptr_shape,
+        repsel_ptr_shape_context_denial: repsel_flags.ptr_shape_denial,
+        repsel_context_denial,
         repsel_closure_ref_locals: repsel_closure_refs,
         repsel_context_allows_canonical_str: repsel_str_allows,
         repsel_str_ineligible_locals: repsel_str_ineligible,
@@ -1561,6 +1605,7 @@ pub(super) fn compile_static_method(
         scalar_replaced_arrays: std::collections::HashMap::new(),
         scalar_replaced_split_part_lengths: std::collections::HashMap::new(),
         scalar_replaced_uppercase_sources: std::collections::HashMap::new(),
+        scalar_slot_shadow_slots: std::collections::HashMap::new(),
         scalar_ctor_target: Vec::new(),
         non_escaping_news: native_facts.non_escaping_news().clone(),
         non_escaping_new_used_fields: native_facts.non_escaping_new_used_fields().clone(),
@@ -1586,6 +1631,8 @@ pub(super) fn compile_static_method(
         typed_i1_functions: &cross_module.typed_i1_functions,
         typed_i1_function_param_reps: &cross_module.typed_i1_function_param_reps,
         typed_f64_methods: &cross_module.typed_f64_methods,
+        pshape_methods: &cross_module.pshape_methods,
+        proven_this: None,
         typed_i32_methods: &cross_module.typed_i32_methods,
         typed_i1_methods: &cross_module.typed_i1_methods,
         typed_string_methods: &cross_module.typed_string_methods,

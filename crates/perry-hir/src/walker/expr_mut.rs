@@ -28,7 +28,6 @@ where
         | Expr::NewTarget
         | Expr::ClassRef(_)
         | Expr::This
-        | Expr::NewTarget
         | Expr::SuperPropertyGet { .. }
         | Expr::EnumMember { .. }
         | Expr::StaticFieldGet { .. }
@@ -582,6 +581,15 @@ where
             f(parent_expr);
         }
         Expr::RegisterClassCaptures { captures, .. } => {
+            for c in captures {
+                f(c);
+            }
+        }
+        Expr::RefreshClassExprCaptures {
+            class_value,
+            captures,
+        } => {
+            f(class_value);
             for c in captures {
                 f(c);
             }

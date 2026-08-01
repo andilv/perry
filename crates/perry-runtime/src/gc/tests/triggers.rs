@@ -157,6 +157,15 @@ fn test_gc_bump_medium_parse_allows_one_arena_bump_per_gc_cycle() {
 
 #[test]
 fn test_gc_bump_never_lowers_existing_arena_trigger() {
+    // The "never lower" invariant is asserted against the RAW trigger cell, whose
+    // relationship to the bump target only holds under legacy pacing: with moving
+    // mode on, `effective_next_arena_trigger` is clamped to the small nursery cap,
+    // so a bump target above that cap legitimately re-arms the cell (without ever
+    // lowering the EFFECTIVE, capped trigger). Pin legacy to keep asserting the
+    // raw-cell arithmetic this test was written for. (The new nursery-cap value
+    // itself is asserted under the default by
+    // `test_effective_arena_trigger_respects_armed_values`.)
+    let _legacy_pacing = crate::gc::policy::force_legacy_gc_pacing();
     let existing_trigger = GC_TRIGGER_ABSOLUTE_CEILING + (32 * 1024 * 1024);
     let _guard = GcBumpTriggerTestGuard::new(existing_trigger, GC_THRESHOLD_INITIAL_BYTES);
     let bytes_now = GC_TRIGGER_ABSOLUTE_CEILING + (16 * 1024 * 1024);
@@ -241,6 +250,129 @@ fn test_budget_scaled_clamps_only_under_budget() {
     assert_eq!(budget_scaled_with(Some(MB), 128 * MB, 1, 4, 2 * MB), 2 * MB);
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// #7024: the alloc-point deferral must be REACHABLE at the moment a nursery
+// trigger becomes due, at every heap budget.
+//
+// `gc_budgeted_due_trigger()` reports `ArenaBytes` due exactly when
+// `arena_total_bytes() >= effective_next_arena_trigger()`. The deferral that
+// hands the collection to the precise-root safepoint (and therefore to the
+// COPYING minor) used to be guarded by `arena_total_bytes() < <absolute cap>`,
+// where the cap came from `budget_scaled(128 MB, 1, 4, 2 MB)` — byte-for-byte
+// the trigger-ceiling formula. Under any budget small enough for the ceiling to
+// sit at or below the nursery cap the two are the same number, so the two
+// predicates are exact complements: the deferral is refused at precisely the
+// arena size that makes the trigger due, and the copying minor never runs.
+// Measured consequence: the stress matrix's `default` arm ran zero copying
+// minors on all 22 corpus rows.
+//
+// These tests fail against the pre-#7024 predicate (`arena_total < cap`) and
+// pass against the slack-from-the-deferral-point predicate.
+// ───────────────────────────────────────────────────────────────────────────
+#[test]
+fn test_moving_defer_reachable_when_the_arena_trigger_is_due() {
+    use super::super::heap_budget::budget_scaled_with;
+    use super::super::policy::{
+        moving_defer_within_slack, GC_MOVING_DEFER_SLACK_BYTES, GC_TRIGGER_ABSOLUTE_CEILING,
+    };
+    const MB: usize = 1024 * 1024;
+    // `gc_scavenge_nursery_cap_bytes()`'s default; moving mode clamps the
+    // effective trigger to it (`effective_next_arena_trigger`).
+    const NURSERY_CAP: usize = 16 * MB;
+
+    for budget in [
+        None,
+        Some(2 * MB),
+        Some(8 * MB), // the stress matrix's `--pressure 8`
+        Some(16 * MB),
+        Some(32 * MB),
+        Some(64 * MB),
+        Some(128 * MB),
+        Some(512 * MB),
+    ] {
+        let ceiling = budget_scaled_with(budget, GC_TRIGGER_ABSOLUTE_CEILING, 1, 4, 2 * MB);
+        let slack = budget_scaled_with(budget, GC_MOVING_DEFER_SLACK_BYTES, 1, 3, MB);
+        // The smallest `arena_total` at which `gc_budgeted_due_trigger()`
+        // reports ArenaBytes, in moving mode.
+        let due_at = ceiling.min(NURSERY_CAP);
+
+        // The collapse premise, asserted rather than assumed: whenever the
+        // budget pulls the ceiling to or below the nursery cap — every device
+        // budget ≤ 64 MB, and every `--pressure` setting the matrix uses — the
+        // pre-#7024 absolute cap is already reached at `due_at`, so the old
+        // guard `arena_total < cap` was FALSE exactly when the trigger fired.
+        let legacy_cap = budget_scaled_with(budget, 128 * MB, 1, 4, 2 * MB);
+        if ceiling <= NURSERY_CAP {
+            assert!(
+                due_at >= legacy_cap,
+                "budget {budget:?}: expected the pre-#7024 absolute cap ({legacy_cap}) to be \
+                 unreachable at the due point ({due_at})"
+            );
+        }
+
+        // The fix: the first deferral of a cycle is unconditional, so the
+        // copying minor is reachable at every budget.
+        assert!(
+            moving_defer_within_slack(due_at, None, slack),
+            "budget {budget:?}: a nursery trigger due at {due_at} bytes must be deferrable"
+        );
+        // …and it stays deferrable for a whole slack of further growth, so a
+        // loop back-edge poll has room to drain it.
+        assert!(
+            moving_defer_within_slack(due_at + slack - 1, Some(due_at), slack),
+            "budget {budget:?}: deferral must survive until the slack is spent"
+        );
+    }
+}
+
+#[test]
+fn test_moving_defer_slack_still_has_a_safety_valve() {
+    use super::super::policy::moving_defer_within_slack;
+    const MB: usize = 1024 * 1024;
+    let slack = 4 * MB;
+    let base = 2 * MB;
+
+    // No deferral outstanding: always allowed, however large the arena. This is
+    // the sound path (precise, rewritable roots at a real safepoint); the
+    // alloc-point fallback exists only to bound growth when nothing drains it.
+    assert!(moving_defer_within_slack(0, None, slack));
+    assert!(moving_defer_within_slack(4 * 1024 * MB, None, slack));
+
+    // Deferral outstanding: bounded overshoot, measured from the deferral point.
+    assert!(moving_defer_within_slack(base, Some(base), slack));
+    assert!(moving_defer_within_slack(
+        base + slack - 1,
+        Some(base),
+        slack
+    ));
+    assert!(!moving_defer_within_slack(base + slack, Some(base), slack));
+    assert!(!moving_defer_within_slack(
+        base + slack + MB,
+        Some(base),
+        slack
+    ));
+
+    // The valve is relative, not absolute: a program whose live set already
+    // sits far above any fixed cap still gets its slack (and therefore still
+    // gets copying minors) instead of being pinned on the non-moving path.
+    let big = 900 * MB;
+    assert!(moving_defer_within_slack(big, None, slack));
+    assert!(moving_defer_within_slack(big + slack - 1, Some(big), slack));
+    assert!(!moving_defer_within_slack(big + slack, Some(big), slack));
+
+    // Overflow-safe.
+    assert!(moving_defer_within_slack(
+        usize::MAX - 1,
+        Some(usize::MAX),
+        slack
+    ));
+    assert!(!moving_defer_within_slack(
+        usize::MAX,
+        Some(usize::MAX),
+        slack
+    ));
+}
+
 // The un-armed trigger cell (desktop-default const initializer) reads as
 // the device ceiling; an armed trigger above the ceiling is legitimate
 // (headroom floor over a big live set) and must NOT be clamped.
@@ -248,26 +380,49 @@ fn test_budget_scaled_clamps_only_under_budget() {
 fn test_effective_arena_trigger_respects_armed_values() {
     use super::super::heap_budget::gc_trigger_absolute_ceiling_bytes;
     use super::super::policy::{
-        effective_next_arena_trigger, GC_NEXT_TRIGGER_BYTES, GC_TRIGGER_ARMED,
+        effective_next_arena_trigger, gc_moving_loop_polls_enabled, gc_scavenge_nursery_cap_bytes,
+        GC_NEXT_TRIGGER_BYTES, GC_TRIGGER_ARMED,
     };
+    // `effective_next_arena_trigger` additionally clamps to the small nursery cap
+    // whenever moving mode is active (the default-on evacuating scavenge) or the
+    // PERRY_GC_SCAVENGE de-risking flag is set; otherwise it clamps only the
+    // UN-armed cell to the device ceiling and lets an armed trigger exceed it.
+    // Assert the value correct for the mode this process runs in, so the NEW
+    // nursery-cap behavior is exercised under the default and the legacy ceiling
+    // behavior under the PERRY_GC_MOVING_LOOP_POLLS=0 kill switch. This mirrors
+    // the gate in `effective_next_arena_trigger` exactly.
+    let nursery_capped = super::super::gc_scavenge_enabled() || gc_moving_loop_polls_enabled();
+    let ceiling = gc_trigger_absolute_ceiling_bytes();
+    let nursery_cap = gc_scavenge_nursery_cap_bytes();
+
     let prev_trigger = GC_NEXT_TRIGGER_BYTES.with(|c| c.get());
     let prev_armed = GC_TRIGGER_ARMED.with(|c| c.get());
 
     GC_TRIGGER_ARMED.with(|c| c.set(false));
     GC_NEXT_TRIGGER_BYTES.with(|c| c.set(usize::MAX / 2));
+    let expected_unarmed = if nursery_capped {
+        ceiling.min(nursery_cap)
+    } else {
+        ceiling
+    };
     assert_eq!(
         effective_next_arena_trigger(),
-        gc_trigger_absolute_ceiling_bytes(),
-        "un-armed trigger must clamp to the device ceiling"
+        expected_unarmed,
+        "un-armed trigger must clamp to the device ceiling (further to the nursery cap when moving)"
     );
 
     GC_TRIGGER_ARMED.with(|c| c.set(true));
-    let above_ceiling = gc_trigger_absolute_ceiling_bytes() * 3;
+    let above_ceiling = ceiling * 3;
     GC_NEXT_TRIGGER_BYTES.with(|c| c.set(above_ceiling));
+    let expected_armed = if nursery_capped {
+        above_ceiling.min(nursery_cap)
+    } else {
+        above_ceiling
+    };
     assert_eq!(
         effective_next_arena_trigger(),
-        above_ceiling,
-        "armed triggers above the ceiling are legitimate and must survive"
+        expected_armed,
+        "armed triggers above the ceiling survive under legacy pacing and clamp to the nursery cap when moving"
     );
 
     GC_NEXT_TRIGGER_BYTES.with(|c| c.set(prev_trigger));

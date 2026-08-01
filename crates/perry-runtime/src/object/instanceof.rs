@@ -296,11 +296,15 @@ pub extern "C" fn js_instanceof_dynamic(value: f64, type_ref: f64) -> f64 {
                 method.as_str(),
                 "Readable" | "Writable" | "Duplex" | "Transform" | "PassThrough" | "Stream"
             )
-            && crate::node_stream::is_classic_stream_instance_of(value, method.as_str())
+            && (crate::node_stream::is_classic_stream_instance_of(value, method.as_str())
+                || super::tls_constructor_prototype_is_instance_of(value, method.as_str()))
         {
             return f64::from_bits(crate::value::TAG_TRUE);
         }
-        if module == "events" && method == "EventEmitter" && is_event_emitter_instance_value(value)
+        if module == "events"
+            && method == "EventEmitter"
+            && (is_event_emitter_instance_value(value)
+                || super::tls_constructor_prototype_is_instance_of(value, method.as_str()))
         {
             return f64::from_bits(crate::value::TAG_TRUE);
         }
@@ -454,6 +458,11 @@ pub extern "C" fn js_instanceof_dynamic(value: f64, type_ref: f64) -> f64 {
     // `inst instanceof Intl.<Ctor>`: Intl instances are plain heap objects whose
     // `[[Prototype]]` is `Intl.<Ctor>.prototype` but carry no class-id, so the
     // arms above can't match them. Walk their static-prototype chain.
+    // `Intl.*` brand checks. Behind `intl-namespace`: with the feature off no
+    // Intl constructor value can exist (the namespace install is a no-op), so
+    // the probe could never match — and skipping it keeps this always-live
+    // dispatcher from statically pinning every Intl constructor thunk (~204 KB).
+    #[cfg(feature = "intl-namespace")]
     if let Some(is_inst) = crate::intl::intl_instanceof(value, type_ref) {
         return if is_inst {
             f64::from_bits(crate::value::TAG_TRUE)
@@ -1002,14 +1011,18 @@ pub extern "C" fn js_instanceof(value: f64, class_id: u32) -> f64 {
         _ => None,
     };
     if let Some(name) = classic_stream_name {
-        return if crate::node_stream::is_classic_stream_instance_of(value, name) {
+        return if crate::node_stream::is_classic_stream_instance_of(value, name)
+            || super::tls_constructor_prototype_is_instance_of(value, name)
+        {
             true_val
         } else {
             false_val
         };
     }
     if class_id == CLASS_ID_EVENT_EMITTER {
-        return if is_event_emitter_instance_value(value) {
+        return if is_event_emitter_instance_value(value)
+            || super::tls_constructor_prototype_is_instance_of(value, "EventEmitter")
+        {
             true_val
         } else {
             false_val

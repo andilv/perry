@@ -108,19 +108,13 @@ impl DependencyResolver {
     pub fn resolve_package(&self, package_name: &str) -> Option<PathBuf> {
         let node_modules = self.find_node_modules()?;
 
-        // Handle scoped packages (@org/pkg)
-        let package_path = if package_name.starts_with('@') {
-            let parts: Vec<&str> = package_name.splitn(2, '/').collect();
-            if parts.len() == 2 {
-                node_modules.join(parts[0]).join(parts[1])
-            } else {
-                node_modules.join(package_name)
-            }
-        } else {
-            // Handle subpath imports (lodash/map -> lodash)
-            let base_package = package_name.split('/').next().unwrap_or(package_name);
-            node_modules.join(base_package)
-        };
+        // The package name is the first segment (`lodash/map` -> `lodash`),
+        // or the first TWO segments for a scoped specifier
+        // (`@acme/toolkit/fs/safe` -> `@acme/toolkit`); the
+        // remainder is a subpath resolved against the package's `exports`
+        // map at compile time, never a directory under node_modules.
+        let base_package = package_base_name(package_name);
+        let package_path = node_modules.join(base_package);
 
         if package_path.exists() {
             Some(package_path)
@@ -141,6 +135,49 @@ impl DependencyResolver {
 
         // Skip relative imports - those are project files
         if import_source.starts_with('.') {
+            return;
+        }
+
+        // Node subpath imports (`#…`) resolve through the importing package's
+        // own `package.json` `"imports"` map, never through node_modules —
+        // treating them as package names produced false R003 "Package '#…'
+        // not found in node_modules" errors. Resolve them with the same
+        // spec resolver the compiler uses (see resolve/subpath_imports.rs).
+        if import_source.starts_with('#') {
+            use super::compile::resolve::subpath_imports::{
+                resolve_subpath_import, SubpathImportOutcome, DEFAULT_CONDITIONS,
+            };
+            match resolve_subpath_import(import_source, importing_file, DEFAULT_CONDITIONS) {
+                // Maps to a real file inside the package: resolved.
+                Ok(SubpathImportOutcome::File(_)) => return,
+                // Maps to a bare package specifier: verify THAT package the
+                // way any other bare import is verified.
+                Ok(SubpathImportOutcome::External(spec)) => {
+                    if is_node_builtin(&spec)
+                        || is_perry_builtin(&spec)
+                        || self.resolve_package(&spec).is_some()
+                    {
+                        return;
+                    }
+                }
+                // Not defined by an `imports` map (or spec-invalid): mirror
+                // the compile resolver's ordering and give the tsconfig
+                // `paths` fallback a chance before flagging it unresolved.
+                Ok(SubpathImportOutcome::NotDefined) | Err(_) => {
+                    if super::compile::resolve::tsconfig_paths::resolve_tsconfig_paths(
+                        import_source,
+                        importing_file,
+                    )
+                    .is_some()
+                    {
+                        return;
+                    }
+                }
+            }
+            self.unresolved_imports
+                .entry(import_source.to_string())
+                .or_default()
+                .push(importing_file.to_path_buf());
             return;
         }
 
@@ -194,15 +231,15 @@ impl DependencyResolver {
         let packages: HashSet<String> = self
             .all_imports
             .iter()
-            .filter(|s| !s.starts_with('.') && !is_node_builtin(s) && !is_perry_builtin(s))
-            .map(|s| {
-                // Extract base package name
-                if s.starts_with('@') {
-                    s.splitn(3, '/').take(2).collect::<Vec<_>>().join("/")
-                } else {
-                    s.split('/').next().unwrap_or(s).to_string()
-                }
+            .filter(|s| {
+                // `#` subpath imports are package-internal mappings, not
+                // node_modules packages — nothing to compatibility-scan.
+                !s.starts_with('.')
+                    && !s.starts_with('#')
+                    && !is_node_builtin(s)
+                    && !is_perry_builtin(s)
             })
+            .map(|s| package_base_name(s).to_string())
             .collect();
 
         for package_name in packages {
@@ -214,6 +251,22 @@ impl DependencyResolver {
         }
 
         Ok(results)
+    }
+}
+
+/// Extract the npm package name from an import specifier: the first
+/// path segment, or the first two for a scoped package
+/// (`@scope/name/sub/path` -> `@scope/name`).
+fn package_base_name(specifier: &str) -> &str {
+    let mut slashes = specifier.match_indices('/');
+    let cut = if specifier.starts_with('@') {
+        slashes.nth(1)
+    } else {
+        slashes.next()
+    };
+    match cut {
+        Some((idx, _)) => &specifier[..idx],
+        None => specifier,
     }
 }
 
@@ -809,6 +862,50 @@ pub fn compatibility_to_diagnostics(packages: &[PackageCompatibility]) -> Diagno
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scoped specifier's package name is the first TWO segments; the
+    /// remainder is an `exports` subpath, not a node_modules directory
+    /// (`@acme/toolkit/fs/safe` was reported as R003 "package not
+    /// found" because the full specifier was joined as a path).
+    #[test]
+    fn package_base_name_splits_scoped_subpath_exports() {
+        assert_eq!(package_base_name("@acme/toolkit/fs/safe"), "@acme/toolkit");
+        assert_eq!(package_base_name("@acme/toolkit"), "@acme/toolkit");
+        assert_eq!(package_base_name("@scope/name/a/b/c"), "@scope/name");
+        assert_eq!(package_base_name("lodash/map"), "lodash");
+        assert_eq!(package_base_name("lodash"), "lodash");
+    }
+
+    /// The R003 path end-to-end: `record_import` resolves a scoped subpath
+    /// specifier through `resolve_package`, which must look up
+    /// `node_modules/@scope/pkg` — not join the full specifier as a
+    /// directory — so an installed package's subpath export is never
+    /// reported unresolved.
+    #[test]
+    fn scoped_subpath_import_resolves_against_installed_package() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pkg_dir = dir.path().join("node_modules/@scope/pkg");
+        std::fs::create_dir_all(&pkg_dir).expect("create @scope/pkg");
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            "{\"name\":\"@scope/pkg\",\"version\":\"1.0.0\"}\n",
+        )
+        .expect("write package.json");
+
+        let mut resolver = DependencyResolver::new(dir.path().to_path_buf());
+        assert_eq!(
+            resolver.resolve_package("@scope/pkg/sub/path"),
+            Some(pkg_dir),
+            "subpath specifier resolves to the installed package directory"
+        );
+
+        resolver.record_import("@scope/pkg/sub/path", Path::new("src/main.ts"));
+        assert!(
+            resolver.get_unresolved_imports().is_empty(),
+            "installed scoped subpath must not be reported as R003 unresolved: {:?}",
+            resolver.get_unresolved_imports()
+        );
+    }
 
     /// D005 must key off the *argument*, not the line's formatting. Both call
     /// shapes below appear in the same file in the Vercel CLI

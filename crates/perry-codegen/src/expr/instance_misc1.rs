@@ -4,7 +4,7 @@
 //! Pure mechanical move — match arm bodies are verbatim copies, called from
 //! `lower_expr`'s outer dispatch.
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use perry_hir::{BinaryOp, Expr, WithSetFallback};
 
 use crate::nanbox::{double_literal, i64_literal, POINTER_MASK_I64};
@@ -82,10 +82,7 @@ fn emit_with_key(ctx: &mut FnCtx<'_>, property: &str) -> (String, String) {
 fn store_prelowered_local(ctx: &mut FnCtx<'_>, id: u32, value: &str) -> Result<String> {
     super::invalidate_local_write_facts(ctx, id);
     if let Some(&capture_idx) = ctx.closure_captures.get(&id) {
-        let closure_ptr = ctx
-            .current_closure_ptr
-            .clone()
-            .ok_or_else(|| anyhow!("captured with-fallback set but no current_closure_ptr"))?;
+        let closure_ptr = super::current_closure_ptr_value(ctx, "captured with-fallback set")?;
         let idx_str = capture_idx.to_string();
         if ctx.boxed_vars.contains(&id) {
             let blk = ctx.block();
@@ -1406,9 +1403,11 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // The store keeps the raw-slot plain-finite discipline (an
             // Inf-crossing update side-exits to the by-name setter, which
             // performs the layout downgrade the GC scan relies on).
-            if let Expr::LocalGet(recv_id) = object.as_ref() {
-                if ctx.repsel_context_allows_canonical_i32 {
-                    let fact = ctx.native_facts.shape_proven_ptr_local(*recv_id).cloned();
+            // (Phase 5a's proven `this` never claims numeric fields, so this
+            // site remains Phase-3b-local-only in practice.)
+            {
+                let fact = ctx.ptr_shape_receiver_fact(object.as_ref()).cloned();
+                {
                     if let Some(fact) = fact {
                         if fact.numeric_fields.contains(property.as_str()) {
                             if let Some(field_index) =
@@ -1418,6 +1417,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                                     property,
                                 )
                             {
+                                ctx.note_ptr_shape_consumed(object.as_ref(), "ptr_shape_update");
                                 let recv_box = lower_expr(ctx, object)?;
                                 let field_idx_str = field_index.to_string();
                                 let header_skip = crate::target_layout::object_header_size_bytes(

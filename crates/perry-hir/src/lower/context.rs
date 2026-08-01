@@ -1234,17 +1234,6 @@ impl LoweringContext {
         }
     }
 
-    /// Current depth of the module-shadow stack (a scope mark).
-    pub(crate) fn module_shadow_mark(&self) -> usize {
-        self.module_shadow_stack.len()
-    }
-
-    /// Restore the module-shadow stack to `mark`, re-exposing modules whose
-    /// shadowing local bindings went out of scope.
-    pub(crate) fn truncate_module_shadow(&mut self, mark: usize) {
-        self.module_shadow_stack.truncate(mark);
-    }
-
     pub(crate) fn register_builtin_module_alias(
         &mut self,
         local_name: String,
@@ -1708,7 +1697,8 @@ impl LoweringContext {
 pub(crate) fn perry_ui_handle_widget(name: &str) -> bool {
     matches!(
         name,
-        "Canvas"
+        "Widget"
+            | "Canvas"
             | "State"
             | "Sheet"
             | "Toolbar"
@@ -1719,4 +1709,18 @@ pub(crate) fn perry_ui_handle_widget(name: &str) -> bool {
             | "Table"
             | "TabBar"
     )
+}
+
+/// True when a named `perry/ui` function returns an opaque handle that can
+/// dispatch receiver methods through `PERRY_UI_INSTANCE_TABLE`.
+///
+/// Keep factory classification tied to the shared dispatch table rather than
+/// maintaining another constructor allowlist in HIR. `VStack`, `HStack`,
+/// `Button`, `ForEach`, and `WebView` are the only exceptions: their overloaded,
+/// callback-driven, or option-bag argument shapes have dedicated native-codegen
+/// branches, so they intentionally have no generic dispatch-table rows.
+pub(crate) fn perry_ui_factory_returns_handle(name: &str) -> bool {
+    matches!(name, "VStack" | "HStack" | "Button" | "ForEach" | "WebView")
+        || perry_dispatch::perry_ui_lookup(name)
+            .is_some_and(|row| row.ret == perry_dispatch::ReturnKind::Widget)
 }

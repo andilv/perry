@@ -38,15 +38,16 @@ members = [
     "crates/perry-ext-pg",
     "crates/perry-ext-mysql2",
     "crates/perry-ext-fetch",
+    "crates/perry-ext-undici",
     "crates/perry-ext-mongodb",
     "crates/perry-ext-ws",
     "crates/perry-ext-net",
     "crates/perry-ext-http",
-    "crates/perry-ext-http-server",
     "crates/perry-ext-streams",
     "crates/perry-ext-fastify",
     "crates/perry-ext-pdf",
     "crates/perry-ext-ads",
+    "crates/perry-ext-node-forge",
     "crates/perry-wasm-host",
     "crates/perry-container-compose",
     "crates/perry-container-e2e",
@@ -84,6 +85,7 @@ members = [
 # Build each platform package explicitly for its applicable target.
 default-members = [
     "crates/perry",
+    "crates/perry-container-compose",
 ]
 
 # Aggressive release optimizations for small, fast binaries
@@ -197,6 +199,8 @@ codegen-units = 16
 codegen-units = 16
 [profile.release.package.perry-ext-net]
 codegen-units = 16
+[profile.release.package.perry-ext-undici]
+codegen-units = 16
 [profile.release.package.perry-ext-ws]
 codegen-units = 16
 
@@ -281,6 +285,8 @@ codegen-units = 16
 [profile.dist.package.perry-ext-ioredis]
 codegen-units = 16
 [profile.dist.package.perry-ext-net]
+codegen-units = 16
+[profile.dist.package.perry-ext-undici]
 codegen-units = 16
 [profile.dist.package.perry-ext-ws]
 codegen-units = 16
@@ -371,6 +377,13 @@ similar = "2.4"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "blocking"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+hyper = "1.4"
+hyper-util = "0.1"
+http-body-util = "0.1"
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pemfile = "2"
+socket2 = "0.6"
 futures-util = "0.3"
 url = "2"
 dirs = "6"
@@ -443,15 +456,16 @@ perry-ext-ioredis = { path = "crates/perry-ext-ioredis" }
 perry-ext-pg = { path = "crates/perry-ext-pg" }
 perry-ext-mysql2 = { path = "crates/perry-ext-mysql2" }
 perry-ext-fetch = { path = "crates/perry-ext-fetch" }
+perry-ext-undici = { path = "crates/perry-ext-undici" }
 perry-ext-mongodb = { path = "crates/perry-ext-mongodb" }
 perry-ext-ws = { path = "crates/perry-ext-ws" }
 perry-ext-net = { path = "crates/perry-ext-net" }
 perry-ext-http = { path = "crates/perry-ext-http" }
-perry-ext-http-server = { path = "crates/perry-ext-http-server" }
 perry-ext-streams = { path = "crates/perry-ext-streams" }
 perry-ext-fastify = { path = "crates/perry-ext-fastify" }
 perry-ext-pdf = { path = "crates/perry-ext-pdf" }
 perry-ext-ads = { path = "crates/perry-ext-ads" }
+perry-ext-node-forge = { path = "crates/perry-ext-node-forge" }
 perry-stdlib = { path = "crates/perry-stdlib" }
 perry-diagnostics = { path = "crates/perry-diagnostics" }
 perry-ui-model = { path = "crates/perry-ui-model" }

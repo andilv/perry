@@ -32,13 +32,18 @@ use perry_hir::ModuleKind;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use super::CompilationContext;
 #[cfg(test)]
 use super::{NativeBackend, NativeLibraryManifest};
 
 mod native_library;
-mod tsconfig_paths;
+// pub(crate): the `check --check-deps` dependency checker (commands/deps.rs)
+// consults both resolvers so `#` subpath imports and tsconfig-aliased
+// specifiers stop reporting false R003 "not found in node_modules" errors.
+pub(crate) mod subpath_imports;
+pub(crate) mod tsconfig_paths;
 pub(crate) use native_library::validate_native_library_manifest_value;
 pub(super) use native_library::{
     ergonomic_export_alias, has_perry_native_library, has_perry_native_module,
@@ -133,7 +138,12 @@ mod tests;
 /// Packages that Perry provides built-in native extensions for.
 /// These must never be loaded into V8 — Perry's codegen intercepts all imports
 /// from these packages and replaces them with native calls.
-const PERRY_NATIVE_EXTENSION_PACKAGES: &[&str] = &["ioredis", "ethers", "mysql2", "ws", "dotenv"];
+// `undici` is here because it's an extremely common transitive install:
+// without the guard, a deep import reached through another package's
+// compiled JS would make the walker read undici's real sources (llhttp
+// wasm) instead of routing to perry-ext-undici.
+const PERRY_NATIVE_EXTENSION_PACKAGES: &[&str] =
+    &["ioredis", "ethers", "mysql2", "ws", "dotenv", "undici"];
 
 /// Check if a file path is inside a Perry native extension package (has built-in stdlib support)
 /// or a package that has perry.nativeLibrary in its package.json.
@@ -334,6 +344,33 @@ pub(super) fn find_node_modules(start: &Path) -> Option<PathBuf> {
         }
         if !current.pop() {
             return None;
+        }
+    }
+}
+
+/// Every `node_modules` directory on the ancestor chain of `start`, nearest
+/// first. Node's resolution algorithm consults each one until the package is
+/// found — not only the nearest. pnpm layouts hit the difference constantly:
+/// a package's own `node_modules` usually holds only `.bin`, while its real
+/// dependencies live in the `.pnpm/<pkg>@<version>/node_modules` sibling one
+/// level further up. Stopping at the first directory made every transitive
+/// dependency of a compiled pnpm package unresolvable, so their call sites
+/// lowered to raw extern symbols and the link failed (undefined `_toNumber` /
+/// `_isUnsafe` across the fast-xml-parser graph).
+pub(super) fn ancestor_node_modules_dirs(start: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut current = start.to_path_buf();
+    loop {
+        // A dir literally named `node_modules` hosts packages itself; its
+        // `node_modules/node_modules` join below would never exist.
+        if current.file_name().is_some_and(|n| n != "node_modules") {
+            let node_modules = current.join("node_modules");
+            if node_modules.is_dir() {
+                dirs.push(node_modules);
+            }
+        }
+        if !current.pop() {
+            return dirs;
         }
     }
 }
@@ -706,12 +743,69 @@ fn original_source_via_map(entry: &Path) -> Option<PathBuf> {
     original_source_from_map_file(&append_map_extension(entry))
 }
 
+/// A published CommonJS package can ship the TypeScript input to its CJS emit.
+/// Some such inputs are intentionally hybrid: normal ESM declarations for
+/// TypeScript plus a top-level `module.exports = ...` interop epilogue. The
+/// source is not a directly executable module in Perry: ESM classification
+/// leaves `module` unbound, while CJS wrapping would move its `export`
+/// declarations inside an IIFE. Node loads the emitted JS entry, so keep that
+/// entry instead of following its source map for this narrow shape (#6586).
+fn is_hybrid_cjs_emit_input(path: &Path) -> bool {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+
+    let Ok(path) = fs::canonicalize(path) else {
+        return false;
+    };
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(cached) = cache.lock().expect("hybrid source cache").get(&path) {
+        return *cached;
+    }
+
+    let Ok(source) = fs::read_to_string(&path) else {
+        return false;
+    };
+    let stripped = super::cjs_wrap::detect::strip_comments_and_strings(&source);
+    let hybrid = super::cjs_wrap::detect::has_top_level_esm(&stripped)
+        && super::cjs_wrap::detect::has_top_level_module_exports_assignment(&stripped);
+    cache
+        .lock()
+        .expect("hybrid source cache")
+        .insert(path, hybrid);
+    hybrid
+}
+
+/// If a package's root TypeScript source is a hybrid CJS-emit input, keep the
+/// entire package graph on its published JavaScript. Mixing a `dist` root with
+/// source-mapped TypeScript subpaths creates duplicate module identities and
+/// reintroduces source-only semantics that Node never executes (Ajv's
+/// `dist/ajv.js` plus `lib/compile/codegen/index.ts` was the #6585/#6586
+/// combination).
+fn package_entry_requires_cjs_emit(package_dir: &Path) -> bool {
+    if let Some(entry) = resolve_package_entry(package_dir, None) {
+        if is_js_file(&entry) {
+            if original_source_via_map(&entry).is_some_and(|src| is_hybrid_cjs_emit_input(&src)) {
+                return true;
+            }
+        } else if is_hybrid_cjs_emit_input(&entry) {
+            return true;
+        }
+    }
+
+    let src_index = package_dir.join("src").join("index");
+    resolve_with_extensions(&src_index)
+        .is_some_and(|src| !is_js_file(&src) && is_hybrid_cjs_emit_input(&src))
+}
+
 /// Resolve package entry preferring TypeScript source over compiled JS output.
 /// Used for compile_packages where we want to compile from TS source, not bundled JS.
 pub(super) fn resolve_package_source_entry(
     package_dir: &Path,
     subpath: Option<&str>,
 ) -> Option<PathBuf> {
+    if package_entry_requires_cjs_emit(package_dir) {
+        return None;
+    }
+
     let normal_entry = resolve_package_entry(package_dir, subpath);
 
     // #2569 step 5: the most authoritative pointer to a package's original
@@ -723,7 +817,9 @@ pub(super) fn resolve_package_source_entry(
     if let Some(entry) = normal_entry.as_ref() {
         if is_js_file(entry) {
             if let Some(original) = original_source_via_map(entry) {
-                return Some(original);
+                if !is_hybrid_cjs_emit_input(&original) {
+                    return Some(original);
+                }
             }
         }
     }
@@ -732,7 +828,7 @@ pub(super) fn resolve_package_source_entry(
     if let Some(sub) = subpath {
         let src_path = package_dir.join("src").join(sub);
         if let Some(resolved) = resolve_with_extensions(&src_path) {
-            if !is_js_file(&resolved) {
+            if !is_js_file(&resolved) && !is_hybrid_cjs_emit_input(&resolved) {
                 return Some(resolved);
             }
         }
@@ -741,7 +837,7 @@ pub(super) fn resolve_package_source_entry(
     // Try src/index.ts (most common TS source entry)
     let src_index = package_dir.join("src").join("index");
     if let Some(resolved) = resolve_with_extensions(&src_index) {
-        if !is_js_file(&resolved) {
+        if !is_js_file(&resolved) && !is_hybrid_cjs_emit_input(&resolved) {
             return Some(resolved);
         }
     }
@@ -751,7 +847,7 @@ pub(super) fn resolve_package_source_entry(
     if is_js_file(&normal_entry) {
         // Try .ts equivalent of the .js entry
         let ts_path = normal_entry.with_extension("ts");
-        if ts_path.exists() {
+        if ts_path.exists() && !is_hybrid_cjs_emit_input(&ts_path) {
             return Some(ts_path);
         }
         // Check src/ directory mirror of lib/ or dist/ path
@@ -765,7 +861,7 @@ pub(super) fn resolve_package_source_entry(
                 };
                 if let Ok(rest) = stripped {
                     let src_equiv = package_dir.join("src").join(rest).with_extension("ts");
-                    if src_equiv.exists() {
+                    if src_equiv.exists() && !is_hybrid_cjs_emit_input(&src_equiv) {
                         return Some(src_equiv);
                     }
                 }
@@ -850,39 +946,6 @@ pub(super) fn resolve_exports(exports: &serde_json::Value, subpath: &str) -> Opt
     )
 }
 
-/// Node subpath imports (#5039): resolve a `#`-prefixed specifier through the
-/// importing package's own `package.json` `"imports"` map
-/// (https://nodejs.org/api/packages.html#imports). chalk 5 loads its vendored
-/// dependencies this way (`import ansiStyles from '#ansi-styles'` →
-/// `./source/vendor/ansi-styles/index.js`), so without this every compiled
-/// chalk style table came up empty. The map shares the `exports` value shape
-/// (string / conditional object / `*` patterns), so the same resolver is
-/// reused — with `node` ranked above `default` so conditional pairs like
-/// chalk's `#supports-color` `{ node, default: browser }` pick the node build
-/// for native compilation. Per Node's package-scope rule, only the NEAREST
-/// `package.json` up from the importer is consulted.
-fn resolve_subpath_import(import_source: &str, importer_path: &Path) -> Option<PathBuf> {
-    let mut dir = importer_path.parent();
-    while let Some(d) = dir {
-        let pkg_json = d.join("package.json");
-        if pkg_json.is_file() {
-            let content = std::fs::read_to_string(&pkg_json).ok()?;
-            let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-            let target = resolve_exports_with_conditions(
-                json.get("imports")?,
-                import_source,
-                &["perry", "node", "import", "module", "default", "require"],
-            )?;
-            let base = d.join(target.trim_start_matches("./"));
-            return resolve_with_extensions(&base)
-                .and_then(|p| p.canonicalize().ok())
-                .or_else(|| base.canonicalize().ok());
-        }
-        dir = d.parent();
-    }
-    None
-}
-
 /// Like [`resolve_exports`], but returns EVERY condition branch's resolution
 /// in priority order instead of only the first. Callers that check disk
 /// existence (`resolve_package_entry`) walk the list so a pruned target
@@ -920,22 +983,30 @@ pub(super) fn resolve_exports_candidates(
                     collect(entry, subpath, out);
                     return;
                 }
-                for (key, entry) in map.iter() {
-                    if key.contains('*') {
-                        let parts: Vec<&str> = key.splitn(2, '*').collect();
-                        if parts.len() == 2 {
-                            let (prefix, suffix) = (parts[0], parts[1]);
-                            if subpath.starts_with(prefix) && subpath.ends_with(suffix) {
-                                let matched = &subpath[prefix.len()..subpath.len() - suffix.len()];
-                                let mut templates = Vec::new();
-                                collect(entry, subpath, &mut templates);
-                                for template in templates {
-                                    let resolved = template.replace('*', matched);
-                                    if !out.contains(&resolved) {
-                                        out.push(resolved);
-                                    }
-                                }
-                            }
+                let mut patterns: Vec<_> = map
+                    .iter()
+                    .filter_map(|(key, entry)| {
+                        let (prefix, suffix) = key.split_once('*')?;
+                        let end = subpath.len().checked_sub(suffix.len())?;
+                        (subpath.starts_with(prefix)
+                            && subpath.ends_with(suffix)
+                            && prefix.len() <= end)
+                            .then_some((prefix, suffix, end, entry))
+                    })
+                    .collect();
+                patterns.sort_by(|a, b| {
+                    b.0.len()
+                        .cmp(&a.0.len())
+                        .then_with(|| (b.0.len() + b.1.len()).cmp(&(a.0.len() + a.1.len())))
+                });
+                for (prefix, _, end, entry) in patterns {
+                    let matched = &subpath[prefix.len()..end];
+                    let mut templates = Vec::new();
+                    collect(entry, subpath, &mut templates);
+                    for template in templates {
+                        let resolved = template.replace('*', matched);
+                        if !out.contains(&resolved) {
+                            out.push(resolved);
                         }
                     }
                 }
@@ -1233,13 +1304,48 @@ pub(super) fn resolve_import(
         return None; // Native modules are handled by stdlib, not file imports
     }
 
-    // Node subpath imports (`#…`, #5039) resolve through the importing
-    // package's own `"imports"` map and then classify exactly like a relative
-    // import to the mapped file.
+    // Node subpath imports (`#…`, #5039): resolve through the importing
+    // package's own `package.json` `"imports"` map with full
+    // PACKAGE_IMPORTS_RESOLVE semantics (see subpath_imports.rs), then
+    // classify exactly like a relative import to the mapped file. This runs
+    // BEFORE the tsconfig-paths fallback so spec-defined resolution wins over
+    // tsconfig aliasing; when no `imports` field governs the importer the
+    // specifier falls through, so a tsconfig `paths` alias covering `#…`
+    // keeps working.
     let subpath_import_target = if import_source.starts_with('#') {
-        match resolve_subpath_import(import_source, importer_path) {
-            Some(canonical) => Some(canonical),
-            None => return None,
+        use subpath_imports::SubpathImportOutcome;
+        match subpath_imports::resolve_subpath_import(
+            import_source,
+            importer_path,
+            subpath_imports::DEFAULT_CONDITIONS,
+        ) {
+            Ok(SubpathImportOutcome::File(canonical)) => Some(canonical),
+            // Bare-package target: re-enter resolution with the mapped
+            // specifier, which resolves through node_modules per spec (or the
+            // stdlib for `node:` builtins).
+            Ok(SubpathImportOutcome::External(spec)) => {
+                return resolve_import(
+                    &spec,
+                    importer_path,
+                    project_root,
+                    compile_packages,
+                    compile_package_dirs,
+                );
+            }
+            // Not covered by an `imports` map — fall through (the tsconfig
+            // `paths` fallback below may still alias it).
+            Ok(SubpathImportOutcome::NotDefined) => None,
+            // Spec-defined hard errors (`#` / `#/…`, escaping targets, …)
+            // must be surfaced, not silently degraded to tsconfig aliasing.
+            Err(err) => {
+                eprintln!(
+                    "warning: cannot resolve '{}' (imported from {}): {}",
+                    import_source,
+                    importer_path.display(),
+                    err
+                );
+                return None;
+            }
         }
     } else {
         None
@@ -1316,63 +1422,62 @@ pub(super) fn resolve_import(
     };
 
     for start in search_paths.iter().flatten() {
-        if let Some(node_modules) = find_node_modules(start) {
+        for node_modules in ancestor_node_modules_dirs(start) {
             let package_dir = node_modules.join(&package_name);
-            if package_dir.is_dir() {
-                if let Some(entry) = resolve_package_entry(&package_dir, subpath.as_deref()) {
-                    // Packages with perry.nativeLibrary are compiled natively (Rust FFI)
-                    if has_perry_native_library(&package_dir) {
-                        return Some((entry.canonicalize().ok()?, ModuleKind::NativeCompiled));
-                    }
-                    // Packages with perry.nativeModule: true contain Perry-compatible
-                    // TypeScript that must be compiled natively (e.g. perry-react).
-                    if has_perry_native_module(&package_dir) {
-                        return Some((entry.canonicalize().ok()?, ModuleKind::NativeCompiled));
-                    }
-                    // Packages listed in perry.compilePackages are compiled natively
-                    if compile_packages.contains(&package_name) {
-                        // Deduplicate: if we've already resolved this package from a
-                        // different node_modules location, use the first-found directory
-                        // to avoid duplicate symbols from identical package copies
-                        let effective_dir = compile_package_dirs
-                            .get(&package_name)
-                            .unwrap_or(&package_dir);
-                        // Prefer TypeScript source over compiled JS
-                        if let Some(src_entry) =
-                            resolve_package_source_entry(effective_dir, subpath.as_deref())
-                        {
-                            return Some((
-                                src_entry.canonicalize().ok()?,
-                                ModuleKind::NativeCompiled,
-                            ));
-                        }
-                        // Fall back to normal resolution but still mark as NativeCompiled
-                        if let Some(fallback_entry) =
-                            resolve_package_entry(effective_dir, subpath.as_deref())
-                        {
-                            return Some((
-                                fallback_entry.canonicalize().ok()?,
-                                ModuleKind::NativeCompiled,
-                            ));
-                        }
-                        // If effective_dir failed (shouldn't happen), try the local dir
-                        return Some((entry.canonicalize().ok()?, ModuleKind::NativeCompiled));
-                    }
-                    // For other node_modules packages, classify by file
-                    // extension. `.ts` / `.tsx` sources are compiled natively.
-                    // `.js` / `.mjs` / `.cjs` and other shapes stay Interpreted;
-                    // since runtime-JS (V8) support was removed, reaching one of
-                    // these is a hard error surfaced by the V8-free gate after
-                    // module collection.
-                    let canonical = entry.canonicalize().ok()?;
-                    let kind = if is_ts_file(&canonical) {
-                        ModuleKind::NativeCompiled
-                    } else {
-                        ModuleKind::Interpreted
-                    };
-                    return Some((canonical, kind));
-                }
+            if !package_dir.is_dir() {
+                continue;
             }
+            let Some(entry) = resolve_package_entry(&package_dir, subpath.as_deref()) else {
+                continue;
+            };
+            // Packages with perry.nativeLibrary are compiled natively (Rust FFI)
+            if has_perry_native_library(&package_dir) {
+                return Some((entry.canonicalize().ok()?, ModuleKind::NativeCompiled));
+            }
+            // Packages with perry.nativeModule: true contain Perry-compatible
+            // TypeScript that must be compiled natively (e.g. perry-react).
+            if has_perry_native_module(&package_dir) {
+                return Some((entry.canonicalize().ok()?, ModuleKind::NativeCompiled));
+            }
+            // Packages listed in perry.compilePackages are compiled natively
+            if compile_packages.contains(&package_name) {
+                // Deduplicate: if we've already resolved this package from a
+                // different node_modules location, use the first-found directory
+                // to avoid duplicate symbols from identical package copies
+                let effective_dir = compile_package_dirs
+                    .get(&package_name)
+                    .unwrap_or(&package_dir);
+                // Prefer TypeScript source over compiled JS
+                if let Some(src_entry) =
+                    resolve_package_source_entry(effective_dir, subpath.as_deref())
+                {
+                    return Some((src_entry.canonicalize().ok()?, ModuleKind::NativeCompiled));
+                }
+                // Fall back to normal resolution but still mark as NativeCompiled
+                if let Some(fallback_entry) =
+                    resolve_package_entry(effective_dir, subpath.as_deref())
+                {
+                    return Some((
+                        fallback_entry.canonicalize().ok()?,
+                        ModuleKind::NativeCompiled,
+                    ));
+                }
+                // If effective_dir failed (shouldn't happen), try the local dir
+                return Some((entry.canonicalize().ok()?, ModuleKind::NativeCompiled));
+            }
+            // For other node_modules packages, classify by file
+            // extension. `.ts` / `.tsx` sources are compiled natively.
+            // `.js` / `.mjs` / `.cjs` and other shapes stay Interpreted;
+            // since runtime-JS (V8) support was removed, reaching one of
+            // these is a hard error surfaced by the V8-free gate after
+            // module collection.
+            let canonical = entry.canonicalize().ok()?;
+            let kind = if is_ts_file(&canonical) {
+                ModuleKind::NativeCompiled
+            } else {
+                ModuleKind::Interpreted
+            };
+            return Some((canonical, kind));
         }
     }
 

@@ -18,6 +18,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from parity_known_failures import normalize_platform
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_REPORT = REPO_ROOT / "test-parity" / "reports" / "latest.json"
@@ -27,7 +29,7 @@ DEFAULT_OUTPUT_DIR = REPO_ROOT / "test-parity" / "output"
 DEFAULT_JSON = REPO_ROOT / "test-parity" / "reports" / "parity_matrix_latest.json"
 DEFAULT_MARKDOWN = REPO_ROOT / "test-parity" / "reports" / "parity_matrix_latest.md"
 
-FAIL_STATUSES = {"parity_fail", "compile_fail", "node_fail"}
+FAIL_STATUSES = {"parity_fail", "compile_fail", "crash", "node_fail"}
 
 
 @dataclass
@@ -82,11 +84,29 @@ def diff_line_count(node_lines: list[str] | None, perry_lines: list[str] | None)
     return count
 
 
-def known_failures(path: Path) -> set[str]:
+def known_failures(path: Path, platform: str | None = None) -> set[str]:
     if not path.exists():
         return set()
     data = load_json(path)
-    return {key for key in data if key != "_schema"}
+    selected_platform = normalize_platform(platform or sys.platform)
+    selected = set()
+    for key, record in data.items():
+        if key == "_schema":
+            continue
+        if not isinstance(record, dict):
+            continue
+        platforms = record.get("platforms")
+        if platforms is None or (
+            isinstance(platforms, list)
+            and selected_platform
+            in {
+                normalize_platform(item)
+                for item in platforms
+                if isinstance(item, str)
+            }
+        ):
+            selected.add(key)
+    return selected
 
 
 def report_results(report: dict) -> list[dict[str, str]]:
@@ -112,6 +132,9 @@ def report_results(report: dict) -> list[dict[str, str]]:
     for test_id in failures.get("compile", []) or []:
         if test_id:
             out.append({"id": test_id, "status": "compile_fail"})
+    for test_id in failures.get("crash", []) or []:
+        if test_id:
+            out.append({"id": test_id, "status": "crash"})
     return out
 
 
@@ -245,11 +268,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--output-json", type=Path, default=DEFAULT_JSON)
     parser.add_argument("--output-md", type=Path, default=DEFAULT_MARKDOWN)
+    parser.add_argument(
+        "--platform",
+        help="Override the report platform (linux, macos, windows, or other).",
+    )
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args(argv)
 
     report = load_json(args.report)
-    known = known_failures(args.known)
+    report_platform = report.get("platform")
+    platform = args.platform or (report_platform if isinstance(report_platform, str) else None)
+    known = known_failures(args.known, platform)
     baseline = load_baseline(args.baseline)
     records = build_records(report, known, args.output_dir)
     problems = check_records(records, baseline) if args.check else []

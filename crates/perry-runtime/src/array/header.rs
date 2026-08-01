@@ -171,7 +171,8 @@ pub extern "C" fn js_tagged_template_get_or_init(
     cooked_handle.get_raw_mut_ptr::<ArrayHeader>()
 }
 
-#[cfg_attr(feature = "keepalive-anchors", used)]
+#[cfg(feature = "keepalive-anchors")]
+#[used]
 static KEEP_TAGGED_TEMPLATE_GET_OR_INIT: extern "C" fn(
     u64,
     *mut ArrayHeader,
@@ -341,6 +342,7 @@ pub(crate) unsafe fn array_named_property_set(
 /// bypassing `js_array_set_string_key`'s guard ladder sound. Keys must not be
 /// numeric index strings or `"length"` (those live in element storage /
 /// the header, not this side table).
+#[cfg(feature = "regex-engine")]
 pub(crate) unsafe fn array_named_props_install_fresh(
     arr: *mut ArrayHeader,
     entries: &[(&'static str, f64)],
@@ -507,8 +509,9 @@ pub(crate) fn test_template_raw_roots() -> (usize, usize) {
 /// <= capacity <= 16M (same bound as the GC tracer's sanity guard).
 #[inline(always)]
 pub(crate) fn clean_arr_ptr(arr: *const ArrayHeader) -> *const ArrayHeader {
-    // Heap window varies by OS: macOS mimalloc lands in the 3-5 TB range;
-    // Android scudo + Linux glibc allocate MUCH lower (often < 1 TB); Windows
+    // Heap window varies by allocator and run: macOS mimalloc can land well
+    // below 2 TB (observed around 45 GB in the Rust test harness);
+    // Android scudo + Linux glibc also allocate MUCH lower (often < 1 TB); Windows
     // mimalloc lands well under 1 TB (often in the GB-to-tens-of-GB range).
     // iOS / tvOS / watchOS / visionOS *device* targets use libsystem_malloc
     // (mimalloc is host-side only) and allocate in the same low range —
@@ -526,6 +529,7 @@ pub(crate) fn clean_arr_ptr(arr: *const ArrayHeader) -> *const ArrayHeader {
     // GcHeader / obj_type validation downstream.
     #[cfg(any(
         target_os = "android",
+        target_os = "macos",
         target_os = "linux",
         target_os = "windows",
         target_os = "ios",
@@ -536,6 +540,7 @@ pub(crate) fn clean_arr_ptr(arr: *const ArrayHeader) -> *const ArrayHeader {
     const HEAP_MIN: u64 = 0x1000; // 4 KB (classic user-space floor)
     #[cfg(not(any(
         target_os = "android",
+        target_os = "macos",
         target_os = "linux",
         target_os = "windows",
         target_os = "ios",
@@ -543,7 +548,7 @@ pub(crate) fn clean_arr_ptr(arr: *const ArrayHeader) -> *const ArrayHeader {
         target_os = "watchos",
         target_os = "visionos",
     )))]
-    const HEAP_MIN: u64 = 0x200_0000_0000; // 2 TB — above observed corrupt handles on macOS
+    const HEAP_MIN: u64 = 0x200_0000_0000; // 2 TB — retained for unlisted targets
     const HEAP_MAX: u64 = 0x8000_0000_0000; // 47-bit userspace cap
     let bits = arr as u64;
     let top16 = bits >> 48;
@@ -1484,22 +1489,28 @@ pub extern "C" fn js_array_is_numeric_f64_layout(arr: *const ArrayHeader) -> i32
 
 // These raw numeric-array helpers are called from generated code, so release/LTO
 // builds may otherwise internalize and strip the `#[no_mangle]` exports.
-#[cfg_attr(feature = "keepalive-anchors", used)]
+#[cfg(feature = "keepalive-anchors")]
+#[used]
 static KEEP_JS_ARRAY_NUMERIC_VALUE_TO_RAW_F64: extern "C" fn(f64) -> f64 =
     js_array_numeric_value_to_raw_f64;
-#[cfg_attr(feature = "keepalive-anchors", used)]
+#[cfg(feature = "keepalive-anchors")]
+#[used]
 static KEEP_JS_ARRAY_MARK_NUMERIC_F64_LAYOUT: extern "C" fn(*mut ArrayHeader) -> i32 =
     js_array_mark_numeric_f64_layout;
-#[cfg_attr(feature = "keepalive-anchors", used)]
+#[cfg(feature = "keepalive-anchors")]
+#[used]
 static KEEP_JS_ARRAY_CLEAR_NUMERIC_LAYOUT: extern "C" fn(*mut ArrayHeader) =
     js_array_clear_numeric_layout;
-#[cfg_attr(feature = "keepalive-anchors", used)]
+#[cfg(feature = "keepalive-anchors")]
+#[used]
 static KEEP_JS_ARRAY_NOTE_NUMERIC_WRITE: extern "C" fn(*mut ArrayHeader, u64) =
     js_array_note_numeric_write;
-#[cfg_attr(feature = "keepalive-anchors", used)]
+#[cfg(feature = "keepalive-anchors")]
+#[used]
 static KEEP_JS_ARRAY_IS_NUMERIC_F64_LAYOUT: extern "C" fn(*const ArrayHeader) -> i32 =
     js_array_is_numeric_f64_layout;
-#[cfg_attr(feature = "keepalive-anchors", used)]
+#[cfg(feature = "keepalive-anchors")]
+#[used]
 static KEEP_JS_ARRAY_REFRESH_LOCAL_HEAD: extern "C" fn(f64) -> f64 = js_array_refresh_local_head;
 
 /// Calculate the byte size for an array with N elements capacity

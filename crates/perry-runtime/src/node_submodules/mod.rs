@@ -31,6 +31,7 @@ use crate::closure::{
 };
 use crate::object::{
     js_object_alloc, js_object_get_field_by_name_f64, js_object_set_field_by_name, ObjectHeader,
+    PropertyAttrs,
 };
 use crate::string::js_string_from_bytes;
 use crate::value::JSValue;
@@ -75,7 +76,7 @@ impl ExportThunk {
 /// `(submodule_key, export_name)` and falls back to `TAG_TRUE` if no
 /// matching entry is found (preserving the pre-#841 behavior for any
 /// future export Perry doesn't yet know about).
-struct SubmoduleSpec {
+pub(super) struct SubmoduleSpec {
     /// Stable key — matches the prefix used in the generated FFI symbol
     /// names (`js_node_submod_<key>_export_<name>`).
     key: &'static str,
@@ -93,6 +94,7 @@ struct SubmoduleSpec {
 
 macro_rules! thunk {
     ($name:ident, $msg:expr) => {
+        #[allow(non_snake_case)] // thunk name mirrors JS API surface
         pub(crate) extern "C" fn $name(
             _closure: *const crate::closure::ClosureHeader,
             _arg: f64,
@@ -161,6 +163,7 @@ use timers::{
     timers_promises_scheduler, timers_promises_scheduler_wait, timers_promises_scheduler_yield,
     timers_promises_set_immediate, timers_promises_set_interval, timers_promises_set_timeout,
 };
+pub(crate) use trace_events::{flush_trace_events_output, init_trace_events_runtime};
 use trace_events::{thunk_trace_events_createTracing, thunk_trace_events_getEnabledCategories};
 
 // node:sys is a deprecated alias for node:util. Known util-backed
@@ -1142,8 +1145,13 @@ fn ensure_export_singleton(
     submod: &'static SubmoduleSpec,
     export: &'static ExportSpec,
 ) -> *mut ClosureHeader {
-    let key_name = if submod.key == "test" && matches!(export.name, "default" | "test") {
-        find_export(submod, "test")
+    let key_name = if submod.key == "test" {
+        let canonical = match export.name {
+            "default" | "test" | "it" => "test",
+            "suite" | "describe" => "suite",
+            _ => export.name,
+        };
+        find_export(submod, canonical)
             .map(|canonical| canonical.name)
             .unwrap_or(export.name)
     } else {
@@ -1180,14 +1188,31 @@ fn ensure_export_singleton(
             f64::from_bits(JSValue::pointer(yield_fn as *const u8).bits()),
         );
     }
-    if submod.key == "test"
+    let allocated = if submod.key == "trace_events" {
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let allocated_handle = scope.root_raw_mut_ptr(allocated);
+        crate::object::set_bound_native_closure_name(
+            allocated_handle.get_raw_mut_ptr(),
+            export.name,
+        );
+        crate::object::set_builtin_closure_length(
+            allocated_handle.get_raw_mut_ptr::<ClosureHeader>() as usize,
+            export_rest_fixed_arity(submod.key, export.name).unwrap_or(export.thunk.arity()),
+        );
+        crate::object::set_builtin_closure_non_constructable(
+            allocated_handle.get_raw_mut_ptr::<ClosureHeader>() as usize,
+        );
+        allocated_handle.get_raw_mut_ptr()
+    } else if submod.key == "test"
         && matches!(
             export.name,
             "default" | "test" | "suite" | "describe" | "it"
         )
     {
-        test::decorate_test_export(allocated);
-    }
+        test::decorate_test_export(allocated, key_name == "test")
+    } else {
+        allocated
+    };
     EXPORT_SINGLETONS.with(|m| {
         m.borrow_mut().insert(key, allocated);
     });
@@ -1237,9 +1262,7 @@ fn fs_promises_constants_value() -> f64 {
 fn set_named_value(obj: *mut ObjectHeader, name: &str, value: f64) {
     let name_bytes = name.as_bytes();
     let name_header = js_string_from_bytes(name_bytes.as_ptr(), name_bytes.len() as u32);
-    unsafe {
-        crate::object::js_object_set_field_by_name(obj, name_header, value);
-    }
+    crate::object::js_object_set_field_by_name(obj, name_header, value);
 }
 
 fn submodule_export_value(submod: &'static SubmoduleSpec, spec: &'static ExportSpec) -> f64 {
@@ -1341,9 +1364,7 @@ fn ensure_namespace_singleton(submod: &'static SubmoduleSpec) -> *mut ObjectHead
         let value = value_from_ptr(obj as *const u8);
         let name = b"default";
         let name_header = js_string_from_bytes(name.as_ptr(), name.len() as u32);
-        unsafe {
-            crate::object::js_object_set_field_by_name(obj, name_header, value);
-        }
+        crate::object::js_object_set_field_by_name(obj, name_header, value);
     }
     if submod.key == "timers" {
         let value = crate::object::timers_promises_parent_namespace();
@@ -1352,6 +1373,13 @@ fn ensure_namespace_singleton(submod: &'static SubmoduleSpec) -> *mut ObjectHead
         crate::object::js_object_set_field_by_name(obj, name_header, value);
     }
     if submod.key == "trace_events" {
+        for spec in submod.exports {
+            crate::object::set_property_attrs(
+                obj as usize,
+                spec.name.to_string(),
+                PropertyAttrs::new(true, true, true),
+            );
+        }
         let default_obj = js_object_alloc(0, submod.exports.len() as u32);
         for spec in submod.exports {
             let closure_ptr = ensure_export_singleton(submod, spec);
@@ -1366,6 +1394,11 @@ fn ensure_namespace_singleton(submod: &'static SubmoduleSpec) -> *mut ObjectHead
             obj,
             name_header,
             f64::from_bits(JSValue::pointer(default_obj as *const u8).bits()),
+        );
+        crate::object::set_property_attrs(
+            obj as usize,
+            "default".to_string(),
+            PropertyAttrs::new(true, true, true),
         );
     }
     if let Some(default_value) = submodule_default_object_value(submod) {

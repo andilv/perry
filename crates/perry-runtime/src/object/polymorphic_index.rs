@@ -10,12 +10,74 @@
 
 use super::*;
 
-unsafe fn property_key_string_ptr(value: f64) -> *mut crate::StringHeader {
-    let key = crate::object::js_to_property_key(value);
+/// `obj[key]` READ through a non-canonical (object / exotic) key, with the
+/// receiver rooted across the coercion (#6935).
+///
+/// Both entry points below reach the key coercion only on their
+/// NON-canonical-key arms — which is exactly where an object key lands.
+/// `ToPropertyKey` then runs a user `Symbol.toPrimitive` / `toString` /
+/// `valueOf`, allocates, and can trigger a GC that **evacuates** the receiver.
+/// `raw` is a bare `u64` address in a Rust local — not a GC root and not a
+/// shadow slot — so it has to be re-read through a handle afterwards.
+///
+/// #6945 / CodeRabbit: if ToPropertyKey yields a Symbol (e.g. `@@toPrimitive`
+/// returns one), route through the symbol side-table — never stringify the
+/// Symbol and never treat the Symbol case as "no key" (the old
+/// `property_key_string_ptr` null-out silently returned `undefined`).
+unsafe fn rooted_property_key_get(raw: u64, idx: f64) -> f64 {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let recv = scope.root_raw_mut_ptr(raw as *mut ObjectHeader);
+    let key = crate::object::js_to_property_key(idx);
+    let key_h = scope.root_nanbox_f64(key);
+    let key = key_h.get_nanbox_f64();
+    let recv_bits =
+        crate::value::js_nanbox_pointer(recv.get_raw_const_ptr::<ObjectHeader>() as i64);
     if crate::symbol::js_is_symbol(key) != 0 {
-        return std::ptr::null_mut();
+        return crate::symbol::js_object_get_symbol_property(recv_bits, key);
     }
-    crate::value::js_jsvalue_to_string(key)
+    let key_ptr = crate::value::js_get_string_pointer_unified(key) as *const crate::StringHeader;
+    if key_ptr.is_null() {
+        return f64::from_bits(crate::value::TAG_UNDEFINED);
+    }
+    let key_handle = scope.root_string_ptr(key_ptr);
+    let v = js_object_get_field_by_name(
+        recv.get_raw_mut_ptr::<ObjectHeader>(),
+        key_handle.get_raw_const_ptr::<crate::StringHeader>(),
+    );
+    f64::from_bits(v.bits())
+}
+
+/// `obj[key] = value` WRITE counterpart of [`rooted_property_key_get`].
+///
+/// This is the corruption half: the coercion sits between the receiver/value
+/// arriving and the store, so pre-fix a stale receiver dropped the write onto a
+/// forwarding stub and a stale `value` planted a dangling pointer *inside* a
+/// live object, outliving the call. Symbol-yielding ToPropertyKey routes to
+/// the symbol store (#6945 / CodeRabbit).
+unsafe fn rooted_property_key_set(raw: u64, idx: f64, value: f64) {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let recv = scope.root_raw_mut_ptr(raw as *mut ObjectHeader);
+    let value_handle = scope.root_nanbox_f64(value);
+    let key = crate::object::js_to_property_key(idx);
+    let key_h = scope.root_nanbox_f64(key);
+    let key = key_h.get_nanbox_f64();
+    let value = value_handle.get_nanbox_f64();
+    let recv_bits =
+        crate::value::js_nanbox_pointer(recv.get_raw_const_ptr::<ObjectHeader>() as i64);
+    if crate::symbol::js_is_symbol(key) != 0 {
+        crate::symbol::js_object_set_symbol_property(recv_bits, key, value);
+        return;
+    }
+    let key_ptr = crate::value::js_get_string_pointer_unified(key) as *const crate::StringHeader;
+    if key_ptr.is_null() {
+        return;
+    }
+    let key_handle = scope.root_string_ptr(key_ptr);
+    js_object_set_field_by_name(
+        recv.get_raw_mut_ptr::<ObjectHeader>(),
+        key_handle.get_raw_const_ptr::<crate::StringHeader>(),
+        value,
+    );
 }
 
 fn numeric_key_u32_index(value: f64) -> Option<u32> {
@@ -63,17 +125,28 @@ fn numeric_key_i32_index(value: f64) -> Option<i32> {
 pub extern "C" fn js_object_get_index_polymorphic(obj_handle: i64, idx: f64) -> f64 {
     let raw = if (obj_handle as u64) >> 48 >= 0x7FF8 {
         // NaN-boxed: only POINTER_TAG (0x7FFD) and STRING_TAG (0x7FFF) carry a
-        // heap pointer in the low 48 bits. INT32 (0x7FFE), BIGINT (0x7FFA) and
-        // the undefined/null/bool tags (0x7FFC) are PRIMITIVES — indexing them
-        // yields `undefined` per JS (`(983055)[0] === undefined`). Treating an
-        // INT32's integer payload as a pointer derefs a wild address → SIGSEGV.
-        // This is the Next.js app-page-turbo render crash: a NaN-boxed-int
-        // receiver (0xf000f = 983055) indexed inside a class `get` method
-        // (js_object_get_index_polymorphic read its GcHeader at raw-8). Reject
-        // non-pointer/non-string NaN-boxed receivers up front (cross-platform —
-        // not dependent on a heap-address floor).
+        // heap pointer in the low 48 bits. INT32 (0x7FFE) is usually a primitive
+        // number — BUT a registered **class-ref** is also INT32-tagged, and
+        // `C[k]` with a non-string key (object ToPropertyKey, numeric static
+        // name, …) reaches this helper from codegen's IndexGet last-resort
+        // path. Class refs must NOT be rejected as primitives: route them
+        // through `js_dyn_index_get`, which has the dedicated class-ref arm
+        // (static methods / CLASS_DYNAMIC_PROPS / ToString key). (#6945)
+        // BIGINT (0x7FFA) and the undefined/null/bool tags (0x7FFC) remain
+        // primitives — indexing them yields `undefined` per JS. Treating an
+        // INT32 *number* payload as a pointer would SIGSEGV (Next.js
+        // app-page-turbo: 0xf000f indexed inside a class `get`); only a
+        // *registered* class-id takes the class-ref arm.
         match (obj_handle as u64) >> 48 {
             0x7FFD | 0x7FFF => (obj_handle as u64) & 0x0000_FFFF_FFFF_FFFF,
+            0x7FFE => {
+                let class_id = (obj_handle as u64 & 0xFFFF_FFFF) as u32;
+                if class_id != 0 && crate::object::class_registry::is_class_id_registered(class_id)
+                {
+                    return crate::value::js_dyn_index_get(f64::from_bits(obj_handle as u64), idx);
+                }
+                return f64::from_bits(crate::value::TAG_UNDEFINED);
+            }
             _ => return f64::from_bits(crate::value::TAG_UNDEFINED),
         }
     } else {
@@ -170,21 +243,11 @@ pub extern "C" fn js_object_get_index_polymorphic(obj_handle: i64, idx: f64) -> 
         if let Some(index) = numeric_key_u32_index(idx) {
             return crate::array::js_array_get_f64(raw as *mut crate::array::ArrayHeader, index);
         } else {
-            let key = unsafe { property_key_string_ptr(idx) };
-            if key.is_null() {
-                return f64::from_bits(crate::value::TAG_UNDEFINED);
-            }
-            let v = js_object_get_field_by_name(raw as *mut ObjectHeader, key);
-            return f64::from_bits(v.bits());
+            return unsafe { rooted_property_key_get(raw, idx) };
         }
     }
     if gc_type == crate::gc::GC_TYPE_OBJECT || gc_type == crate::gc::GC_TYPE_CLOSURE {
-        let key = unsafe { property_key_string_ptr(idx) };
-        if key.is_null() {
-            return f64::from_bits(crate::value::TAG_UNDEFINED);
-        }
-        let v = js_object_get_field_by_name(raw as *mut ObjectHeader, key);
-        return f64::from_bits(v.bits());
+        return unsafe { rooted_property_key_get(raw, idx) };
     }
     if crate::set::is_registered_set(raw as usize) || crate::map::is_registered_map(raw as usize) {
         let Some(index) = numeric_key_u32_index(idx) else {
@@ -239,6 +302,13 @@ pub extern "C" fn js_object_set_index_polymorphic(obj_handle: i64, idx: f64, val
     } else {
         obj_handle as u64
     };
+    // A proxy is a small tagged handle, not a heap header. Rebuild the tag so
+    // unknown-typed computed stores use its [[Set]] path.
+    let boxed = f64::from_bits(crate::value::POINTER_TAG | raw);
+    if crate::proxy::js_proxy_is_proxy(boxed) != 0 {
+        crate::proxy::js_proxy_set(boxed, idx, value);
+        return;
+    }
     if raw < 0x1000 {
         return;
     }
@@ -315,10 +385,7 @@ pub extern "C" fn js_object_set_index_polymorphic(obj_handle: i64, idx: f64, val
             );
             return;
         } else {
-            let key = unsafe { property_key_string_ptr(idx) };
-            if !key.is_null() {
-                js_object_set_field_by_name(raw as *mut ObjectHeader, key, value);
-            }
+            unsafe { rooted_property_key_set(raw, idx, value) };
             return;
         }
     }
@@ -326,10 +393,7 @@ pub extern "C" fn js_object_set_index_polymorphic(obj_handle: i64, idx: f64, val
         // Stringify the index and route through the object field setter,
         // which handles shape transitions, frozen/sealed/extensible checks,
         // overflow into out-of-line storage, and accessor descriptors.
-        let key = unsafe { property_key_string_ptr(idx) };
-        if !key.is_null() {
-            js_object_set_field_by_name(raw as *mut ObjectHeader, key, value);
-        }
+        unsafe { rooted_property_key_set(raw, idx, value) };
         return;
     }
     // Buffer / typed-array were handled above. Map / Set are collection

@@ -2,6 +2,7 @@ use super::super::*;
 use super::support::*;
 use std::cell::Cell;
 mod callback_scanners;
+mod prototype_addr_cache;
 mod string_slice;
 
 fn assert_panics_with(expected: &str, f: impl FnOnce()) {
@@ -322,6 +323,55 @@ fn test_runtime_root_visitor_marks_and_rewrites_nanbox_slot() {
     assert_eq!(
         slot.to_bits(),
         POINTER_TAG | (old_user as u64 & POINTER_MASK)
+    );
+}
+
+#[test]
+fn test_prototype_resolution_stack_rewrites_owner_for_gc_reentry() {
+    let base_depth = crate::object::prototype_chain::resolution_stack_savepoint();
+    let nursery_owner = crate::arena::arena_alloc_gc(64, 8, GC_TYPE_OBJECT);
+    let valid_ptrs = build_valid_pointer_set();
+    let relocated_owner = crate::arena::arena_alloc_gc_old(64, 8, GC_TYPE_OBJECT);
+    unsafe {
+        set_forwarding_address(
+            header_from_user_ptr(nursery_owner) as *mut GcHeader,
+            relocated_owner,
+        );
+    }
+
+    assert!(
+        crate::object::prototype_chain::test_resolution_stack_enter_and_forget(
+            nursery_owner as usize,
+        )
+    );
+    crate::object::prototype_chain::scan_prototype_resolution_stack_roots_mut(
+        &mut RuntimeRootVisitor::for_rewrite(&valid_ptrs),
+    );
+    let reentry_was_blocked =
+        !crate::object::prototype_chain::test_resolution_stack_enter_and_forget(
+            relocated_owner as usize,
+        );
+    crate::object::prototype_chain::resolution_stack_restore(base_depth);
+
+    assert!(
+        reentry_was_blocked,
+        "a post-GC reentrant lookup must match the rewritten active-owner slot"
+    );
+}
+
+#[test]
+fn test_prototype_resolution_stack_scanner_is_registered() {
+    crate::gc::gc_init();
+    let registered = crate::gc::roots::MUTABLE_ROOT_SCANNERS.with(|scanners| {
+        scanners.borrow().iter().any(|entry| {
+            entry.scanner as usize
+                == crate::object::prototype_chain::scan_prototype_resolution_stack_roots_mut
+                    as MutableRootScanner as usize
+        })
+    });
+    assert!(
+        registered,
+        "the active prototype-resolution identities must be visible to moving GC"
     );
 }
 
@@ -987,6 +1037,7 @@ fn test_set_gc_field_rewrite_reindexes_elements() {
 
 #[test]
 fn test_transient_runtime_handle_string_concat_gc() {
+    let _legacy_pacing = crate::gc::policy::force_legacy_gc_pacing();
     let _guard = CopyingNurseryTestGuard::new(0);
     let trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     register_runtime_handle_root_scanner_for_tests();
@@ -1016,6 +1067,7 @@ fn test_transient_runtime_handle_string_concat_gc() {
 
 #[test]
 fn test_dynamic_string_add_roots_left_string_across_rhs_coercion_gc() {
+    let _legacy_pacing = crate::gc::policy::force_legacy_gc_pacing();
     let _guard = CopyingNurseryTestGuard::new(0);
     let trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     register_runtime_handle_root_scanner_for_tests();
@@ -1053,6 +1105,7 @@ fn test_dynamic_string_add_roots_left_string_across_rhs_coercion_gc() {
 
 #[test]
 fn test_dynamic_bigint_add_roots_both_bigint_across_gc() {
+    let _legacy_pacing = crate::gc::policy::force_legacy_gc_pacing();
     // #2908: a BigInt operator now requires BOTH operands to be BigInt
     // (`1n + 1` throws TypeError instead of coercing). This test exercises
     // the same GC-rooting guarantee — the left BigInt must survive a minor
@@ -1102,6 +1155,7 @@ fn test_dynamic_bigint_add_roots_both_bigint_across_gc() {
 
 #[test]
 fn test_bigint_method_add_roots_receiver_across_rhs_number_coercion_gc() {
+    let _legacy_pacing = crate::gc::policy::force_legacy_gc_pacing();
     let _guard = CopyingNurseryTestGuard::new(0);
     let trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     register_runtime_handle_root_scanner_for_tests();
@@ -1145,6 +1199,7 @@ fn test_bigint_method_add_roots_receiver_across_rhs_number_coercion_gc() {
 
 #[test]
 fn test_string_method_split_roots_receiver_across_separator_materialization_gc() {
+    let _legacy_pacing = crate::gc::policy::force_legacy_gc_pacing();
     let _guard = CopyingNurseryTestGuard::new(0);
     let trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     activate_malloc_registry_for_tests();
@@ -1189,6 +1244,7 @@ fn test_string_method_split_roots_receiver_across_separator_materialization_gc()
 
 #[test]
 fn test_string_method_replace_roots_receiver_across_pattern_materialization_gc() {
+    let _legacy_pacing = crate::gc::policy::force_legacy_gc_pacing();
     let _guard = CopyingNurseryTestGuard::new(0);
     let trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     activate_malloc_registry_for_tests();
@@ -1232,6 +1288,7 @@ fn test_string_method_replace_roots_receiver_across_pattern_materialization_gc()
 
 #[test]
 fn test_transient_runtime_handle_array_push_gc() {
+    let _legacy_pacing = crate::gc::policy::force_legacy_gc_pacing();
     let _guard = CopyingNurseryTestGuard::new(0);
     let trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     register_runtime_handle_root_scanner_for_tests();
@@ -1261,6 +1318,7 @@ fn test_transient_runtime_handle_array_push_gc() {
 
 #[test]
 fn test_transient_runtime_handle_object_set_gc() {
+    let _legacy_pacing = crate::gc::policy::force_legacy_gc_pacing();
     let _guard = CopyingNurseryTestGuard::new(1);
     let trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     register_runtime_handle_root_scanner_for_tests();
@@ -1297,6 +1355,7 @@ fn test_transient_runtime_handle_object_set_gc() {
 
 #[test]
 fn test_transient_runtime_handle_closure_captures_gc() {
+    let _legacy_pacing = crate::gc::policy::force_legacy_gc_pacing();
     extern "C" fn captured_func(_closure: *const crate::closure::ClosureHeader) -> f64 {
         0.0
     }
@@ -1571,6 +1630,7 @@ fn drain_promise_microtasks_for_test() {
 
 #[test]
 fn test_async_hook_option_lookup_roots_callbacks_across_copied_minor_gc() {
+    let _legacy_pacing = crate::gc::policy::force_legacy_gc_pacing();
     let _async_hook_guard = AsyncHookRuntimeTestGuard::new();
     let _guard = CopyingNurseryTestGuard::new(0);
     let trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
@@ -1592,6 +1652,7 @@ fn test_async_hook_option_lookup_roots_callbacks_across_copied_minor_gc() {
 
 #[test]
 fn test_closure_rest_dispatch_roots_args_during_rest_array_alloc_gc() {
+    let _legacy_pacing = crate::gc::policy::force_legacy_gc_pacing();
     let _async_hook_guard = AsyncHookRuntimeTestGuard::new();
     let _guard = CopyingNurseryTestGuard::new(0);
     let trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();

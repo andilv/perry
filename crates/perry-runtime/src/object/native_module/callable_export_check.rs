@@ -156,7 +156,6 @@ pub(crate) fn is_native_module_callable_export_reference(module: &str, prop: &st
             | ("http", "_connectionListener")
             | ("module", "Module")
             | ("module", "createRequire")
-            | ("module", "Module")
             | ("module", "findPackageJSON")
             | ("module", "findSourceMap")
             | ("module", "flushCompileCache")
@@ -284,6 +283,7 @@ pub(crate) fn is_native_module_callable_export_reference(module: &str, prop: &st
             | ("net", "_normalizeArgs")
             | ("net", "_createServerHandle")
             | ("tls", "connect")
+            | ("tls", "convertALPNProtocols")
             | ("tls", "createServer")
             | ("tls", "Server")
             | ("tls", "TLSSocket")
@@ -494,7 +494,6 @@ pub(crate) fn is_native_module_callable_export_reference(module: &str, prop: &st
             | ("fs", "unlinkSync")
             | ("fs", "utimes")
             | ("fs", "utimesSync")
-            | ("fs", "_toUnixTimestamp")
             | ("fs", "watch")
             | ("fs", "watchFile")
             | ("fs", "unwatchFile")
@@ -908,15 +907,6 @@ pub(crate) fn is_native_module_callable_export_reference(module: &str, prop: &st
             | ("zlib", "createUnzip")
             | ("zlib", "createBrotliCompress")
             | ("zlib", "createBrotliDecompress")
-            | ("zlib", "Deflate")
-            | ("zlib", "DeflateRaw")
-            | ("zlib", "Gzip")
-            | ("zlib", "Gunzip")
-            | ("zlib", "Inflate")
-            | ("zlib", "InflateRaw")
-            | ("zlib", "Unzip")
-            | ("zlib", "BrotliCompress")
-            | ("zlib", "BrotliDecompress")
             // #2533: node:http/https/http2 server factories read as callable
             // values so `const createServer = createServerHTTP` (and
             // `@hono/node-server`'s `options.createServer || createServerHTTP`)
@@ -1845,6 +1835,7 @@ static CALLABLE_EXPORT_TABLE: &[(&str, &[&str])] = &[
             "TLSSocket",
             "checkServerIdentity",
             "connect",
+            "convertALPNProtocols",
             "createSecureContext",
             "createServer",
             "getCACertificates",

@@ -191,24 +191,33 @@ pub extern "C" fn js_object_has_property(obj: f64, key: f64) -> f64 {
 
     let obj_val = JSValue::from_bits(obj.to_bits());
 
-    // `in` runs ToPropertyKey on the key. Object property names are strings, so a
-    // NUMBER key must be coerced to its string form before the lookup — `307 in
-    // {307: …}` is `"307" in {…}` and must be true. Without this the string-only
-    // lookup below never matched a numeric key against a numeric-string property,
-    // so `307 in obj` was false while `"307" in obj` was true. Next.js's
-    // `isRedirectError` does `Number(digest.at(-2)) in RedirectStatusCode` (a
-    // `{307: …, 308: …}` map), so a `redirect()` thrown from a Server Component
-    // was not recognized as a redirect — Next treated it as a real error and a
-    // concurrently-rendered sibling's `session.user` read (guarded by that same
-    // redirect on the happy path) surfaced as a fatal 500 instead of a 307.
-    // (Symbols and strings pass through unchanged; a proxy/handle receiver is
-    // handled below with the coerced key.)
-    let key = {
+    // `in` runs ToPropertyKey on the key for EVERY key type: per spec,
+    // `RelationalExpression in ShiftExpression` is `ToPropertyKey(lval)`, so an
+    // object key must have its `Symbol.toPrimitive` / `toString` / `valueOf`
+    // invoked — exactly once, and even when the property is absent, because the
+    // coercion is observable (#6944). Only strings (heap or SSO) and symbols
+    // are already property keys; for them the coercion is identity and
+    // allocates nothing, so it is skipped. Everything else goes through
+    // `js_to_property_key` before the lookup: numbers (`307 in {307: …}` is
+    // `"307" in {…}` — Next.js's `isRedirectError` does `Number(digest.at(-2))
+    // in RedirectStatusCode`), booleans, null, undefined, BigInt, and objects.
+    // (A proxy/handle receiver is handled below with the coerced key.)
+    //
+    // #6935: that coercion ALLOCATES the stringified key, and for an object key
+    // it also runs user JS, so it can trigger a GC that evacuates the receiver
+    // — and `obj` / `obj_val` are raw locals captured above. Root the receiver
+    // across the coercion and read it back through the handle, mirroring
+    // `js_object_get_property_key` / `js_object_set_property_key`.
+    let (obj, obj_val, key) = {
         let kv = JSValue::from_bits(key.to_bits());
-        if kv.is_number() {
-            unsafe { crate::object::js_to_property_key(key) }
+        if kv.is_any_string() || unsafe { crate::symbol::js_is_symbol(key) } != 0 {
+            (obj, obj_val, key)
         } else {
-            key
+            let scope = crate::gc::RuntimeHandleScope::new();
+            let obj_handle = scope.root_heap_word_u64(obj.to_bits());
+            let key = unsafe { crate::object::js_to_property_key(key) };
+            let obj = f64::from_bits(obj_handle.get_heap_word_u64());
+            (obj, JSValue::from_bits(obj.to_bits()), key)
         }
     };
     let key_val = JSValue::from_bits(key.to_bits());
@@ -554,7 +563,7 @@ pub extern "C" fn js_object_has_property(obj: f64, key: f64) -> f64 {
         // (bounds) and the own/inherited members property-get can resolve.
         if crate::buffer::is_registered_buffer(obj_addr as usize) {
             let buf = obj_addr as *const crate::buffer::BufferHeader;
-            let len = unsafe { crate::buffer::js_buffer_length(buf) };
+            let len = crate::buffer::js_buffer_length(buf);
             if key_val.is_int32() {
                 let idx = key_val.as_int32();
                 return if idx >= 0 && idx < len {
@@ -917,6 +926,16 @@ unsafe fn object_string_key_has_property(
     let nanbox_false = f64::from_bits(0x7FFC_0000_0000_0003u64); // TAG_FALSE
     let nanbox_true = f64::from_bits(0x7FFC_0000_0000_0004u64); // TAG_TRUE
 
+    let env_key = crate::value::js_get_string_pointer_unified(key) as *const crate::StringHeader;
+    if let Some(present) = crate::process::process_env_has_field(obj_ptr, env_key) {
+        if present {
+            return nanbox_true;
+        }
+        // An absent environment key can still be inherited from
+        // Object.prototype (`"toString" in process.env`), so only the positive
+        // OS-backed result is terminal here.
+    }
+
     // `class X extends Request/Response` instances forward native members
     // (`body`/`method`/…) through their stashed fetch handle. Gated: programs
     // that never construct a fetch subclass skip the per-call key alloc +
@@ -1274,7 +1293,6 @@ pub(crate) unsafe fn native_module_own_field_by_key(
 // accelerator, never authoritative — and a scan hit back-fills the map so
 // interleaved appends stay amortized O(1).
 pub(crate) const WIDE_KEY_INDEX_MIN_KEYS: usize = 257;
-const WIDE_KEY_INDEX_CAPACITY: usize = 4;
 
 // #6759 C1: the wide-object key index folded into the shape records
 // (`object::shapes`, keyed on keys_array identity, unbounded — the old

@@ -35,6 +35,7 @@ const BUILD_CACHE_ENV_VARS: &[&str] = &[
     "PERRY_LLVM_CLANG",
     "PERRY_WRITE_BARRIERS",
     "PERRY_SHADOW_STACK",
+    "PERRY_INLINE_SHADOW_SLOT",
     "PERRY_DISABLE_BUFFER_FAST_PATH",
     "PERRY_VERIFY_NATIVE_REGIONS",
     "PERRY_UNBOXED_OBJECT_FIELDS",
@@ -110,9 +111,14 @@ impl BuildCacheProbe {
             .join("build")
             .join(args.target.as_deref().unwrap_or("native"))
             .join(manifest_name);
-        let eligible = eligibility(args, project_root);
+        // Embed patterns, package hooks, and resource directories are rooted at
+        // the walked-up config root, not the entry file's parent directory.
+        // Keep cache eligibility/keying aligned with run_pipeline's embed
+        // resolution so `src/main.ts --embed ./dist/**` cannot reuse a binary
+        // keyed against the nonexistent `src/dist`.
+        let eligible = eligibility(args, cache_root);
         Self {
-            args_key: args_key(args, &output_path, project_root),
+            args_key: args_key(args, &output_path, cache_root),
             manifest_path,
             output_path,
             target_name: args.target.clone().unwrap_or_else(|| "native".to_string()),
@@ -387,6 +393,11 @@ fn eligibility(args: &CompileArgs, project_root: &Path) -> Result<(), String> {
     }
     if args.explain_lowering {
         return Err("explain-lowering".to_string());
+    }
+    // #6952: a cached build reuses the finished binary and never runs codegen,
+    // so the report would be empty. Same reasoning as explain-lowering above.
+    if args.opt_report.is_some() || std::env::var("PERRY_OPT_REPORT").is_ok() {
+        return Err("opt-report".to_string());
     }
     if args.verify_native_regions || args.emit_attest || args.emit_sandbox {
         return Err("sidecar-or-verify".to_string());

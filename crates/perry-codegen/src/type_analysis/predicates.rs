@@ -244,11 +244,41 @@ pub(crate) fn receiver_is_error_type(ctx: &FnCtx<'_>, e: &Expr) -> bool {
     false
 }
 
+/// Does a local's DECLARED type take precedence over its Phase 3b
+/// provenance proof?
+///
+/// The original rule excluded every `Named(_)` annotation, on the intent that
+/// an explicit class annotation should win over the inferred provenance class.
+/// But a TypeScript `Named` annotation is just as often an INTERFACE or a type
+/// alias — `const o: SomeIface = new C()` — and for those the name is not a
+/// class at all: excluding them dropped the `Ptr<Shape>` proof and sent the
+/// access back through by-name get and the dynamic-dispatch tower, even though
+/// the provenance proof was perfectly good (and strictly more precise than the
+/// interface, which names no layout).
+///
+/// Narrowed to "declared `Named(n)` where `n` is a known class": explicit
+/// class annotations still win, interface- and alias-annotated locals with
+/// `new` provenance keep their guard-free access. `Generic { .. }` keeps its
+/// blanket exclusion — the monomorphized-specialization resolution below is
+/// what those must go through (#6040).
+fn declared_type_overrides_shape_proof(ctx: &FnCtx<'_>, id: &u32) -> bool {
+    match ctx.local_types.get(id) {
+        Some(HirType::Named(name)) => ctx.classes.contains_key(name),
+        Some(HirType::Generic { .. }) => true,
+        _ => false,
+    }
+}
+
 /// If the expression is a known instance of a Named class type, return
 /// the class name. Used by the class method dispatch in lower_call to
 /// pick the right `perry_method_<class>_<name>` function.
 pub(crate) fn receiver_class_name(ctx: &FnCtx<'_>, e: &Expr) -> Option<String> {
     match e {
+        // A declared class/typed-array type is not a lifetime proof. An
+        // `as any` reassignment can replace the binding with a different
+        // runtime value, so class-specific field/index/method lowering would
+        // be unsound for every use of a reassigned local (#6906).
+        Expr::LocalGet(id) if ctx.reassigned_locals.contains(id) => None,
         // Representation-selection Phase 3b: a shape-proven Ptr<Shape> local
         // (or one of its const aliases — the exact-receiver inliner's
         // `__cmpd_base_N` receivers are typed `Any`) has a provenance-exact
@@ -257,10 +287,8 @@ pub(crate) fn receiver_class_name(ctx: &FnCtx<'_>, e: &Expr) -> Option<String> {
         // whole lifetime (collectors/ptr_shape.rs), so class-keyed dispatch
         // (field offsets, method resolution) is authoritative for it.
         Expr::LocalGet(id)
-            if !matches!(
-                ctx.local_types.get(id),
-                Some(HirType::Named(_)) | Some(HirType::Generic { .. })
-            ) && ctx.native_facts.shape_proven_ptr_local(*id).is_some() =>
+            if !declared_type_overrides_shape_proof(ctx, id)
+                && ctx.native_facts.shape_proven_ptr_local(*id).is_some() =>
         {
             ctx.native_facts
                 .shape_proven_ptr_local(*id)

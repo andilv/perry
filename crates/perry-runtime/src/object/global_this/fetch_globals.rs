@@ -43,9 +43,10 @@ pub extern "C" fn js_module_top_this() -> f64 {
 
 /// Keepalive anchor: `js_module_top_this` is referenced only from
 /// codegen-generated `.o` files, so the auto-optimize whole-program LLVM
-/// rebuild would dead-strip it without this `#[cfg_attr(feature = "keepalive-anchors", used)]` pin (see
+/// rebuild would dead-strip it without this `#[used]` pin (see
 /// project_auto_optimize_keepalive_3320).
-#[cfg_attr(feature = "keepalive-anchors", used)]
+#[cfg(feature = "keepalive-anchors")]
+#[used]
 static KEEP_JS_MODULE_TOP_THIS: extern "C" fn() -> f64 = js_module_top_this;
 
 /// Issue #611: lazily allocate `globalThis` for computed global access.
@@ -91,7 +92,14 @@ pub extern "C" fn js_get_global_this() -> f64 {
     // reads without changing bare `new Array`.
     populate_global_this_builtins(new_ptr as *mut ObjectHeader);
     GLOBAL_THIS_READY.store(true, Ordering::Release);
-    crate::value::js_nanbox_pointer(new_ptr)
+    // #6982: population allocates heavily, so an evacuating minor may have moved
+    // the singleton since `new_ptr` was taken. The registered root slot above is
+    // rewritten to the forwarding address by the collector, so re-read it rather
+    // than handing back the stale from-space pointer. (`GLOBAL_THIS_PTR` is
+    // likewise rewritten by `scan_object_cache_roots_mut`.) Falling back to
+    // `new_ptr` keeps the pre-existing behaviour if the cache was cleared.
+    let current = THREAD_GLOBAL_THIS.with(|c| c.get());
+    crate::value::js_nanbox_pointer(if current != 0 { current } else { new_ptr })
 }
 
 #[no_mangle]
@@ -481,10 +489,12 @@ pub extern "C" fn js_response_subclass_init(this_box: f64, body: f64, init: f64)
 // `Expr::SuperCall` Request/Response arm); pin them so the auto-optimize
 // bitcode rebuild's dead-strip can't drop them (see
 // project_auto_optimize_keepalive_3320).
-#[cfg_attr(feature = "keepalive-anchors", used)]
+#[cfg(feature = "keepalive-anchors")]
+#[used]
 static KEEP_JS_REQUEST_SUBCLASS_INIT: extern "C" fn(f64, f64, f64) -> f64 =
     js_request_subclass_init;
-#[cfg_attr(feature = "keepalive-anchors", used)]
+#[cfg(feature = "keepalive-anchors")]
+#[used]
 static KEEP_JS_RESPONSE_SUBCLASS_INIT: extern "C" fn(f64, f64, f64) -> f64 =
     js_response_subclass_init;
 
@@ -589,6 +599,10 @@ pub unsafe extern "C" fn js_fetch_or_value_super(
     // and construct it with `new.target` set, re-homing the instance's brand +
     // methods onto `this`. `parent_val` can arrive stale for an aliased heritage
     // (`const L = Intl.Locale; class X extends L`); recover the decl-time parent.
+    // Behind `intl-namespace`: with the feature off no Intl constructor value
+    // exists, so this probe can never match — and skipping it keeps this
+    // always-live construct path from pinning the Intl web.
+    #[cfg(feature = "intl-namespace")]
     {
         let intl_parent = if crate::intl::is_intl_constructor_value(parent_val) {
             parent_val
@@ -829,7 +843,8 @@ pub unsafe extern "C" fn js_fetch_or_value_super(
     }
 }
 
-#[cfg_attr(feature = "keepalive-anchors", used)]
+#[cfg(feature = "keepalive-anchors")]
+#[used]
 static KEEP_JS_FETCH_OR_VALUE_SUPER: unsafe extern "C" fn(f64, f64, *const f64, usize) -> f64 =
     js_fetch_or_value_super;
 

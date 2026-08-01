@@ -570,13 +570,6 @@ pub extern "C" fn js_stdlib_process_pending() -> i32 {
         count += ws_count;
     }
 
-    // Process pending HTTP events (http/https client callbacks)
-    #[cfg(feature = "http-client")]
-    {
-        let http_count = unsafe { crate::http::js_http_process_pending() };
-        count += http_count;
-    }
-
     // Process pending raw TCP socket events (net.Socket).
     // v0.5.579 — gate now fires for `bundled-net` (perry-stdlib's
     // own implementation) AND `external-net-pump` (which the
@@ -609,7 +602,7 @@ pub extern "C" fn js_stdlib_process_pending() -> i32 {
         count += unsafe { crate::tls::js_tls_process_pending() };
     }
 
-    // Process pending HTTP server requests + WS upgrades (perry-ext-http-server).
+    // Process pending HTTP server requests + WS upgrades (perry-ext-http).
     // Closes #604 — pre-fix `js_node_http_server_listen` blocked the
     // main TS thread inside an inner event_loop, so axios.get/etc.
     // after a `server.listen(port, () => resolve())` callback never
@@ -660,7 +653,7 @@ pub extern "C" fn js_stdlib_process_pending() -> i32 {
     // buffer input across `.write()` and queue 'data'/'end' on `.end()`;
     // drained + dispatched to listeners (and forwarded to `.pipe()` dests)
     // here on the main thread. Bundled path (perry-stdlib's own zlib mod):
-    #[cfg(feature = "compression")]
+    #[cfg(feature = "compression-gzip")]
     {
         count += unsafe { crate::zlib::js_zlib_process_pending() };
     }
@@ -869,7 +862,7 @@ pub extern "C" fn js_stdlib_has_active_handles() -> i32 {
     // 'data'/'end' events are still waiting to be drained, so a purely-
     // synchronous `createGzip().write(x).end()` program doesn't exit before
     // its listeners fire. Bundled path:
-    #[cfg(feature = "compression")]
+    #[cfg(feature = "compression-gzip")]
     {
         if crate::zlib::js_zlib_has_active_handles() != 0 {
             return 1;

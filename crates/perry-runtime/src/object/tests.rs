@@ -245,9 +245,30 @@ fn builtin_prototype_methods_reject_dynamic_new() {
 }
 
 #[test]
+fn recorded_prototype_constructor_overrides_plain_object_constructor() {
+    unsafe {
+        let prototype = js_object_alloc(0, 1);
+        let class_id = 9_999_999;
+        js_register_class_id(class_id);
+        let instance = js_object_alloc(class_id, 0);
+        let constructor_key = crate::string::js_string_from_bytes(b"constructor".as_ptr(), 11);
+        js_object_set_field_by_name(prototype, constructor_key, 42.0);
+        crate::object::prototype_chain::object_set_static_prototype(
+            instance as usize,
+            crate::value::js_nanbox_pointer(prototype as i64).to_bits(),
+        );
+
+        assert_eq!(
+            js_object_get_field_by_name(instance, constructor_key).as_number(),
+            42.0
+        );
+    }
+}
+
+#[test]
 fn closure_name_and_length_ignore_plain_assignment() {
     crate::closure::test_clear_closure_side_tables();
-    unsafe {
+    {
         let closure = crate::closure::js_closure_alloc(
             crate::object::global_this_builtin_noop_thunk as *const u8,
             0,
@@ -281,7 +302,7 @@ fn closure_name_and_length_ignore_plain_assignment() {
 #[test]
 fn closure_name_can_be_redefined_with_define_property() {
     crate::closure::test_clear_closure_side_tables();
-    unsafe {
+    {
         let closure = crate::closure::js_closure_alloc(
             crate::object::global_this_builtin_noop_thunk as *const u8,
             0,
@@ -589,7 +610,7 @@ fn text_encoding_stream_globals_construct_readable_writable_shape() {
 
 #[test]
 fn navigator_global_constructor_identity_shape() {
-    unsafe {
+    {
         let ctor_raw = test_global_this_builtin_constructor_value("Navigator");
         let ctor = JSValue::from_bits(ctor_raw.to_bits());
         assert!(ctor.is_pointer());
@@ -742,7 +763,7 @@ fn transition_cache_lookup_rejects_grown_shared_target() {
 fn entries_and_values_skip_non_enumerable_descriptor_slots() {
     // #5046: Object.defineProperty(o, 'hidden', { value: 1 }) defaults to
     // enumerable: false. Object.keys filtered it; entries/values did not.
-    unsafe {
+    {
         let obj = js_object_alloc(0, 0);
         let hidden_key = crate::string::js_string_from_bytes(b"hidden".as_ptr(), 6);
         let shown_key = crate::string::js_string_from_bytes(b"shown".as_ptr(), 5);
@@ -788,7 +809,7 @@ fn entries_and_values_skip_non_enumerable_descriptor_slots() {
 /// the dynamic-write fast path must still respect descriptors installed later.
 #[test]
 fn wide_object_index_reads_and_descriptor_writes() {
-    unsafe {
+    {
         let obj = js_object_alloc(0, 0);
         let n = 600u32;
         for i in 0..n {

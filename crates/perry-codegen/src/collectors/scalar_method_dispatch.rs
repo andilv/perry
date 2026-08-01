@@ -64,6 +64,28 @@ pub struct ModuleDispatchFacts {
     /// runtime pollution byte — any such site disables all `Ptr<NumArray>`
     /// promotion in the module. See `collectors/ptr_numarray.rs`.
     numarray_prototype_index_barriers: bool,
+    /// Representation-selection Phase 5a: the module contains at least one
+    /// `Object.freeze` / `Object.seal` / `Object.preventExtensions` site.
+    ///
+    /// This is deliberately NOT part of `shape_barrier_sites`. For a Phase 3b
+    /// `Ptr<Shape>` LOCAL the freeze family needs no module-wide kill: the
+    /// containment walk proves no alias to the object exists at all, and a
+    /// freeze of the local itself disqualifies it directly
+    /// (`ptr_shape.rs`'s `Expr::ObjectFreeze` arm). A proven `this` has no
+    /// such containment — the receiver is owned by the CALLER and is
+    /// therefore aliased by construction, so `Object.freeze(c)` followed by
+    /// `c.m()` would let a guard-free raw store silently succeed where the
+    /// spec requires a strict-mode `TypeError`. Any freeze-family site in the
+    /// module therefore disables proven-`this` clones **that contain a
+    /// `this.field` write**; read-only clones are unaffected.
+    freeze_barrier_sites: bool,
+    /// Representation-selection Phase 3b, #7034 §4: **return-shape facts**.
+    /// `FuncId` -> the exact class every value this module-level function can
+    /// return. Populated only for functions that provably hand back a FRESH,
+    /// UNALIASED object of one class on every return path
+    /// (`collectors/ptr_shape_returns.rs`); a call to such a function is then
+    /// a rule-1 provenance seed exactly as `new C(...)` is.
+    return_shape_functions: HashMap<u32, String>,
 }
 
 impl Default for ModuleDispatchFacts {
@@ -75,6 +97,8 @@ impl Default for ModuleDispatchFacts {
             opaque_prototype_mutation: true,
             shape_barrier_sites: true,
             numarray_prototype_index_barriers: true,
+            freeze_barrier_sites: true,
+            return_shape_functions: HashMap::new(),
         }
     }
 }
@@ -124,6 +148,13 @@ impl ModuleDispatchFacts {
         self.numarray_prototype_index_barriers
     }
 
+    /// Representation-selection Phase 5a: does the module contain any
+    /// `Object.freeze`/`seal`/`preventExtensions` site? Gates guard-free
+    /// STORES through a proven `this` (see the field's doc comment).
+    pub(crate) fn has_freeze_barrier_sites(&self) -> bool {
+        self.freeze_barrier_sites
+    }
+
     /// Does the module NAME a prototype object it cannot attribute to a
     /// declared class (`const p = Array.prototype`, `x.constructor.prototype`,
     /// …)? Such a reference can be aliased into a local and written through
@@ -131,6 +162,16 @@ impl ModuleDispatchFacts {
     /// consult the runtime prototype-pollution byte) must stand down.
     pub(crate) fn has_opaque_prototype_mutation(&self) -> bool {
         self.opaque_prototype_mutation
+    }
+
+    /// Representation-selection Phase 3b, #7034 §4: the exact class a call to
+    /// module function `func_id` provably returns, when that call is a rule-1
+    /// provenance seed. `None` for every other function — including every
+    /// function in a module that carries a §5.2 barrier.
+    pub(crate) fn return_shape_class(&self, func_id: u32) -> Option<&str> {
+        self.return_shape_functions
+            .get(&func_id)
+            .map(String::as_str)
     }
 }
 
@@ -143,6 +184,8 @@ pub fn collect_module_dispatch_facts(hir: &Module) -> ModuleDispatchFacts {
         opaque_prototype_mutation: false,
         shape_barrier_sites: false,
         numarray_prototype_index_barriers: false,
+        freeze_barrier_sites: false,
+        return_shape_functions: HashMap::new(),
     };
 
     note_stmts(&hir.init, &mut facts);
@@ -176,6 +219,15 @@ pub fn collect_module_dispatch_facts(hir: &Module) -> ModuleDispatchFacts {
         }
     }
 
+    // Representation-selection Phase 3b, #7034 §4. Computed LAST, and read
+    // through the partially-built `facts` — the barrier flags above must
+    // already be final, because a §5.2 barrier anywhere in the module denies
+    // every return-shape fact. `facts.return_shape_functions` is still empty
+    // while this runs, so the per-function proof (which re-enters
+    // `collect_shape_proven_ptr_locals`) can never seed itself recursively.
+    facts.return_shape_functions =
+        super::ptr_shape_returns::collect_return_shape_functions(&facts, hir);
+
     facts
 }
 
@@ -188,6 +240,9 @@ fn note_stmts(stmts: &[Stmt], facts: &mut ModuleDispatchFacts) {
         if super::ptr_numarray::expr_is_numarray_prototype_index_barrier(expr) {
             facts.numarray_prototype_index_barriers = true;
         }
+        if super::proven_this::expr_is_freeze_barrier(expr) {
+            facts.freeze_barrier_sites = true;
+        }
     });
 }
 
@@ -199,6 +254,9 @@ fn note_expr_tree(expr: &Expr, facts: &mut ModuleDispatchFacts) {
         }
         if super::ptr_numarray::expr_is_numarray_prototype_index_barrier(node) {
             facts.numarray_prototype_index_barriers = true;
+        }
+        if super::proven_this::expr_is_freeze_barrier(node) {
+            facts.freeze_barrier_sites = true;
         }
     });
 }
@@ -378,7 +436,7 @@ fn for_each_expr(expr: &Expr, f: &mut dyn FnMut(&Expr)) {
     }
 }
 
-fn for_each_expr_in_stmts(stmts: &[Stmt], f: &mut dyn FnMut(&Expr)) {
+pub(super) fn for_each_expr_in_stmts(stmts: &[Stmt], f: &mut dyn FnMut(&Expr)) {
     for stmt in stmts {
         for_each_expr_in_stmt(stmt, f);
     }
@@ -583,6 +641,8 @@ mod tests {
             opaque_prototype_mutation: false,
             shape_barrier_sites: false,
             numarray_prototype_index_barriers: false,
+            freeze_barrier_sites: false,
+            return_shape_functions: HashMap::new(),
         }
     }
 

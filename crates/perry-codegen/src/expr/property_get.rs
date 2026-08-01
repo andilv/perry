@@ -271,9 +271,12 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     return Ok(ctx.block().load(DOUBLE, &slot));
                 }
             }
-            // Representation-selection Phase 3a: `.length` on a statically-
-            // string receiver (canonical-Str local, `string[]` element,
-            // string-returning expression). The receiver bits are freshly
+            // `.length` on a statically-string receiver (`string`-typed local,
+            // `string[]` element, string-returning expression). #7128: this
+            // arrived in Phase 3a but keys on `is_string_expr` — the receiver's
+            // static TYPE — and never on a canonical-`Str` selection, so it is
+            // on `PERRY_STATIC_STRING_LOWERING`, not on the `Str` knob.
+            // The receiver bits are freshly
             // produced with no safepoint before the header read (no
             // forwarding hazard — evacuation rewrites slots/returns before
             // the mutator resumes), so the ~18-op generic tower below
@@ -285,7 +288,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // receiver) → the same `js_value_length_f64` slow call the
             // generic tower's slow arm uses.
             {
-                if crate::expr::canonical_str_locals_enabled()
+                if crate::expr::static_string_lowering_enabled()
                     && is_string_expr(ctx, object)
                     && !is_array_expr(ctx, object)
                 {
@@ -1309,16 +1312,17 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         // out of alias analysis) → bitcast → POINTER_MASK →
                         // gep header → gep index → load. No volatile gate, no
                         // header checks, no fallback arm, no phi.
-                        let ptr_shape_fact = match object.as_ref() {
-                            Expr::LocalGet(recv_id) if ctx.repsel_context_allows_canonical_i32 => {
-                                ctx.native_facts
-                                    .shape_proven_ptr_local(*recv_id)
-                                    .filter(|fact| fact.class_name == class_name)
-                                    .cloned()
-                            }
-                            _ => None,
-                        };
+                        // Phase 5a extends the same proof to `this` inside a
+                        // proven-`this` method clone (collectors/proven_this.rs).
+                        let ptr_shape_fact = ctx
+                            .ptr_shape_receiver_fact(object.as_ref())
+                            .filter(|fact| fact.class_name == class_name)
+                            .cloned();
                         if let Some(fact) = ptr_shape_fact {
+                            ctx.note_ptr_shape_consumed(
+                                object.as_ref(),
+                                "class_field_get.shape_proven_load",
+                            );
                             let recv_box = lower_expr(ctx, object)?;
                             let field_idx_str = field_index.to_string();
                             let header_skip =

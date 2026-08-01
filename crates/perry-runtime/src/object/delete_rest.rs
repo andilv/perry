@@ -34,6 +34,9 @@ pub extern "C" fn js_object_delete_field(
     if obj.is_null() || key.is_null() {
         return 1;
     }
+    if let Some(result) = crate::process::process_env_delete_field(obj, key) {
+        return result;
+    }
     // A delete can rewrite key→slot mappings in place (same keys_array
     // address), so cached (keys_array, key)→index plans must be flushed
     // (`object::prop_plan` read-plan cache).
@@ -484,7 +487,16 @@ pub extern "C" fn js_object_delete_dynamic(obj: *mut ObjectHeader, key: f64) -> 
         return js_object_delete_field(obj, key_str);
     }
 
+    // #6935: the string-key case returned above, so `key` here is a number, a
+    // BigInt, a boolean, `null`/`undefined` — or an OBJECT, whose
+    // `Symbol.toPrimitive` / `toString` / `valueOf` runs user JS. Either way
+    // `js_to_property_key` allocates and can trigger a GC that **evacuates**
+    // the receiver, and `obj` is a bare Rust local across it. Root it and read
+    // it back through the handle for both the symbol and string delete arms.
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let obj_handle = scope.root_raw_mut_ptr(obj);
     let property_key = unsafe { js_to_property_key(key) };
+    let obj = obj_handle.get_raw_mut_ptr::<ObjectHeader>();
     if unsafe { crate::symbol::js_is_symbol(property_key) } != 0 {
         // Symbol-keyed delete (`delete obj[Symbol.iterator]`). Previously this
         // fell through to the vacuous `return 1`, so the delete *reported*
@@ -496,9 +508,13 @@ pub extern "C" fn js_object_delete_dynamic(obj: *mut ObjectHeader, key: f64) -> 
         let obj_f64 = crate::value::js_nanbox_pointer(obj as i64);
         return unsafe { crate::symbol::js_object_delete_symbol_property(obj_f64, property_key) };
     }
-    let key_str = crate::value::js_jsvalue_to_string(property_key);
+    let property_key_handle = scope.root_nanbox_f64(property_key);
+    let key_str = crate::value::js_jsvalue_to_string(property_key_handle.get_nanbox_f64());
     if !key_str.is_null() {
-        return js_object_delete_field(obj, key_str as *const crate::StringHeader);
+        return js_object_delete_field(
+            obj_handle.get_raw_mut_ptr::<ObjectHeader>(),
+            key_str as *const crate::StringHeader,
+        );
     }
 
     // For other types, delete succeeds vacuously
@@ -595,7 +611,7 @@ mod sso_tests_1781 {
     /// vacuously") and the property stayed put.
     #[test]
     fn delete_dynamic_removes_property_via_sso_key() {
-        unsafe {
+        {
             let obj = crate::object::js_object_alloc(0, 0);
             let key = crate::string::js_string_from_bytes(b"id".as_ptr(), 2);
             crate::object::js_object_set_field_by_name(obj, key, 42.0);

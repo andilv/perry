@@ -22,22 +22,6 @@ fn typed_i1_method_signature_note(reps: &[crate::codegen::TypedParamRep]) -> Str
     }
 }
 
-fn typed_i32_method_signature_note(arg_count: usize) -> String {
-    if arg_count <= 1 {
-        "typed_signature=i32(i32)->i32".to_string()
-    } else {
-        "typed_signature=i32(i32, ...)->i32".to_string()
-    }
-}
-
-fn typed_string_method_signature_note(arg_count: usize) -> String {
-    if arg_count <= 1 {
-        "typed_signature=string(string)->string".to_string()
-    } else {
-        "typed_signature=string(string, ...)->string".to_string()
-    }
-}
-
 fn typed_method_signature_note(ret: &str, reps: &[crate::codegen::TypedParamRep]) -> String {
     let first = reps.first().map(|rep| rep.label()).unwrap_or("void");
     if reps.len() <= 1 {
@@ -751,7 +735,42 @@ pub(super) fn emit_guarded_direct_method_call(
             );
             result
         } else {
-            ctx.block().call(DOUBLE, direct_fn, direct_arg_slices)
+            // Representation-selection Phase 5a: this arm is reached ONLY
+            // after `js_method_direct_shape_guard` /
+            // `js_typed_feedback_method_direct_call_guard` matched the exact
+            // class id AND the keys token — i.e. the receiver's shape is
+            // already proven, and the proof is then thrown away by calling the
+            // guard-ridden public body. Route to the proven-`this` clone
+            // instead; identical ABI, so only the callee name changes.
+            //
+            // A `pshape_methods` hit additionally proves `receiver_class_name`
+            // DECLARES `property` (the map holds own declarations of
+            // module-local classes only), so the clone's `this` is exactly the
+            // class it was compiled for — an inherited `Base::m` reached
+            // through a subclass receiver never routes here.
+            //
+            // NOTE: the per-field `js_typed_feedback_class_field_get_guard`
+            // loop above is deliberately LEFT IN PLACE. It guards the
+            // `__typed_f64_recv` clone's bare `load double` field access, and
+            // the whole-object shape guard does NOT subsume it: an external
+            // `obj.f = "s"` preserves both the class id and the key set while
+            // downgrading the slot's raw-f64 layout. The `__pshape` clone
+            // needs no such guard because it never claims `JsNumber` — its
+            // bare loads carry generic `JsValue` semantics (see
+            // `collectors/proven_this.rs`).
+            // The `perry_static_` exclusion is carried forward from the
+            // guard-free site (the #1787 static-receiver bug): those targets
+            // need `js_class_static_method_call`, not a plain `call double`,
+            // and no proven-`this` clone is ever emitted for them. Belt and
+            // braces — a static's registry key is distinct from an instance
+            // method's, so the two maps cannot currently disagree.
+            let pshape_target = (!direct_fn.starts_with("perry_static_")
+                && ctx
+                    .pshape_methods
+                    .contains_key(&(receiver_class_name.to_string(), property.to_string())))
+            .then(|| crate::collectors::pshape_method_name(direct_fn));
+            let target = pshape_target.as_deref().unwrap_or(direct_fn);
+            ctx.block().call(DOUBLE, target, direct_arg_slices)
         }
     };
     let after_fast = ctx.block().label.clone();

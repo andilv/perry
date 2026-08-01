@@ -269,6 +269,45 @@ pub extern "C" fn js_dyn_index_get(value: f64, index: f64) -> f64 {
         }
         return f64::from_bits(TAG_UNDEFINED);
     }
+    // #6945: a non-string, non-numeric index must run ToPropertyKey (object
+    // keys invoke `toString`/`valueOf`/`@@toPrimitive`; booleans/null/
+    // undefined/bigint stringify) before the by-name get. The arms below
+    // cast `index as i32` / `format!("{}", index)`, which treat an object
+    // NaN-box as a float and never call user coercion — so
+    // `proto[{toString(){return "k"}}]` missed a write that
+    // `proto.k` / `proto["k"]` could see. Mirrors the set-side
+    // `js_jsvalue_to_string` path in `js_dyn_index_set`.
+    {
+        let idx_js = JSValue::from_bits(idx_bits);
+        // INT32-tagged keys are integer property names (and class-ref values
+        // used as keys, rare); pure f64 numbers keep the element path. Every
+        // other tag is a ToPropertyKey case.
+        if !idx_js.is_number() && !idx_js.is_int32() {
+            let scope = crate::gc::RuntimeHandleScope::new();
+            let recv = scope.root_raw_mut_ptr(raw_ptr as *mut crate::object::ObjectHeader);
+            // Prefer `js_to_property_key` so a Symbol-returning toString is
+            // preserved (and then routed via the symbol arm). Root the
+            // coerced key: ToPropertyKey can allocate / run user JS.
+            let key = unsafe { crate::object::js_to_property_key(index) };
+            let key_h = scope.root_nanbox_f64(key);
+            let key = key_h.get_nanbox_f64();
+            if unsafe { crate::symbol::js_is_symbol(key) } != 0 {
+                let recv_bits = crate::value::js_nanbox_pointer(
+                    recv.get_raw_const_ptr::<crate::object::ObjectHeader>() as i64,
+                );
+                return unsafe { crate::symbol::js_object_get_symbol_property(recv_bits, key) };
+            }
+            let key_ptr =
+                crate::value::js_get_string_pointer_unified(key) as *const crate::StringHeader;
+            if key_ptr.is_null() {
+                return f64::from_bits(TAG_UNDEFINED);
+            }
+            return crate::object::js_object_get_field_by_name_f64(
+                recv.get_raw_const_ptr::<crate::object::ObjectHeader>(),
+                key_ptr,
+            );
+        }
+    }
     let idx_i32 = if index.is_nan() || index.is_infinite() {
         return f64::from_bits(TAG_UNDEFINED);
     } else {
@@ -337,9 +376,15 @@ pub extern "C" fn js_dyn_index_get(value: f64, index: f64) -> f64 {
             } else {
                 format!("{}", index)
             };
+            // #6935: `js_string_from_bytes` ALLOCATES, so the numeric→string key
+            // conversion can trigger a GC that evacuates the receiver. `raw_ptr`
+            // is a bare Rust local — neither a root nor a shadow slot — so it
+            // must be re-read through a handle after the allocation.
+            let scope = crate::gc::RuntimeHandleScope::new();
+            let recv = scope.root_raw_mut_ptr(raw_ptr as *mut crate::object::ObjectHeader);
             let key = crate::string::js_string_from_bytes(s.as_ptr(), s.len() as u32);
             let v = crate::object::js_object_get_field_by_name_f64(
-                raw_ptr as *const crate::object::ObjectHeader,
+                recv.get_raw_const_ptr::<crate::object::ObjectHeader>(),
                 key,
             );
             // An indexed property inherited from the canonical
@@ -382,6 +427,12 @@ pub extern "C" fn js_dyn_index_get(value: f64, index: f64) -> f64 {
 pub extern "C" fn js_dyn_index_set(obj: f64, index: f64, value: f64) -> f64 {
     let bits = obj.to_bits();
     let jsval = JSValue::from_bits(bits);
+    // Proxies use small tagged handles rather than heap addresses. They must
+    // take their [[Set]] path before any direct-property fast path.
+    if crate::proxy::js_proxy_is_proxy(obj) != 0 {
+        crate::proxy::js_proxy_set(obj, index, value);
+        return value;
+    }
     // #5525: a Symbol *index* (`obj[sym] = v`) routes to the symbol side-table,
     // mirroring the get side. Codegen sends all non-string-literal unknown-
     // receiver writes here, so the runtime owns the symbol triage.
@@ -428,11 +479,26 @@ pub extern "C" fn js_dyn_index_set(obj: f64, index: f64, value: f64) -> f64 {
     // method as non-writable. (Mirrors the get arm above.)
     if (bits >> 48) == 0x7FFE {
         let idx_top16 = index.to_bits() >> 48;
-        let key_ptr = if idx_top16 == 0x7FFF || idx_top16 == 0x7FF9 {
-            js_get_string_pointer_unified(index) as *const crate::StringHeader
-        } else {
-            crate::builtins::js_string_coerce(index) as *const crate::StringHeader
-        };
+        if idx_top16 == 0x7FFF || idx_top16 == 0x7FF9 {
+            let key_ptr = js_get_string_pointer_unified(index) as *const crate::StringHeader;
+            if !key_ptr.is_null() {
+                crate::object::js_object_set_field_by_name(
+                    bits as *mut crate::object::ObjectHeader,
+                    key_ptr,
+                    value,
+                );
+            }
+            return value;
+        }
+        // #6935: `js_string_coerce` on an object index runs a user `toString` /
+        // `valueOf` (and allocates even for primitive indices), so it can GC and
+        // evacuate. The receiver here is an INT32 class-ref — not a heap object,
+        // so it cannot move — but `value` IS the thing being written into the
+        // class's dynamic-prop table, and it was a raw local across the coercion.
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let value_handle = scope.root_nanbox_f64(value);
+        let key_ptr = crate::builtins::js_string_coerce(index) as *const crate::StringHeader;
+        let value = value_handle.get_nanbox_f64();
         if !key_ptr.is_null() {
             crate::object::js_object_set_field_by_name(
                 bits as *mut crate::object::ObjectHeader,
@@ -539,19 +605,59 @@ pub extern "C" fn js_dyn_index_set(obj: f64, index: f64, value: f64) -> f64 {
     // Non-array object: stringify the index and write via the object setter.
     let bits = index.to_bits();
     let top16 = bits >> 48;
-    let key_ptr: *const crate::StringHeader = if top16 == 0x7FFF {
-        (bits & 0x0000_FFFF_FFFF_FFFF) as *const crate::StringHeader
-    } else if top16 == 0x7FF9 {
-        crate::value::js_get_string_pointer_unified(index) as *const crate::StringHeader
-    } else {
-        crate::value::js_jsvalue_to_string(index)
-    };
+    if top16 == 0x7FFF || top16 == 0x7FF9 {
+        let key_ptr: *const crate::StringHeader = if top16 == 0x7FFF {
+            (bits & 0x0000_FFFF_FFFF_FFFF) as *const crate::StringHeader
+        } else {
+            crate::value::js_get_string_pointer_unified(index) as *const crate::StringHeader
+        };
+        if key_ptr.is_null() {
+            return value;
+        }
+        crate::object::js_object_set_field_by_name(
+            raw_ptr as *mut crate::object::ObjectHeader,
+            key_ptr,
+            value,
+        );
+        return value;
+    }
+    // #6935: ToPropertyKey (below) runs a user `toString` / `valueOf` /
+    // `@@toPrimitive` for an object index (`obj[{toString(){...}}] = v`) and
+    // allocates for every other shape, so it can GC and EVACUATE. Both the
+    // receiver `raw_ptr` and the `value` being stored were raw Rust locals
+    // across it: a stale receiver dropped the write onto a forwarding stub, and
+    // a stale `value` wrote a dangling pointer INTO a live object, where it
+    // outlives the call.
+    //
+    // #6945 / CodeRabbit: use `js_to_property_key` (not `js_jsvalue_to_string`)
+    // so an `@@toPrimitive` that returns a Symbol is preserved and routed to
+    // the symbol store — matching the get-side fallback. Stringifying that
+    // Symbol would miss the target property (and Spec ToPropertyKey must not
+    // turn a Symbol result into a string).
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let recv = scope.root_raw_mut_ptr(raw_ptr as *mut crate::object::ObjectHeader);
+    let value_handle = scope.root_nanbox_f64(value);
+    let key = unsafe { crate::object::js_to_property_key(index) };
+    let key_h = scope.root_nanbox_f64(key);
+    let key = key_h.get_nanbox_f64();
+    let value = value_handle.get_nanbox_f64();
+    if unsafe { crate::symbol::js_is_symbol(key) } != 0 {
+        let recv_bits = crate::value::js_nanbox_pointer(
+            recv.get_raw_const_ptr::<crate::object::ObjectHeader>() as i64,
+        );
+        unsafe {
+            crate::symbol::js_object_set_symbol_property(recv_bits, key, value);
+        }
+        return value;
+    }
+    let key_ptr = crate::value::js_get_string_pointer_unified(key) as *const crate::StringHeader;
     if key_ptr.is_null() {
         return value;
     }
+    let key_handle = scope.root_string_ptr(key_ptr);
     crate::object::js_object_set_field_by_name(
-        raw_ptr as *mut crate::object::ObjectHeader,
-        key_ptr,
+        recv.get_raw_mut_ptr::<crate::object::ObjectHeader>(),
+        key_handle.get_raw_const_ptr::<crate::StringHeader>(),
         value,
     );
     value
@@ -598,9 +704,12 @@ pub extern "C" fn js_is_undefined_or_bare_nan(value: f64) -> i32 {
 // link keeps these exports via the program's own undefined references, so
 // the anchors compile out there. Function-pointer types are `Sync`, so no
 // wrapper is needed.
-#[cfg_attr(feature = "keepalive-anchors", used)]
+#[cfg(feature = "keepalive-anchors")]
+#[used]
 static KEEP_JS_DYN_INDEX_GET: extern "C" fn(f64, f64) -> f64 = js_dyn_index_get;
-#[cfg_attr(feature = "keepalive-anchors", used)]
+#[cfg(feature = "keepalive-anchors")]
+#[used]
 static KEEP_JS_DYN_INDEX_SET: extern "C" fn(f64, f64, f64) -> f64 = js_dyn_index_set;
-#[cfg_attr(feature = "keepalive-anchors", used)]
+#[cfg(feature = "keepalive-anchors")]
+#[used]
 static KEEP_JS_IS_UNDEFINED_OR_BARE_NAN: extern "C" fn(f64) -> i32 = js_is_undefined_or_bare_nan;

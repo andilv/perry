@@ -125,7 +125,18 @@ pub(crate) fn reassigned_locals(stmts: &[Stmt]) -> HashSet<u32> {
     scan.writes
 }
 
+/// Every local reassigned in any executable body in `hir`.
+///
+/// Closure codegen seeds receiver types from module-wide declarations, so it
+/// must pair that oracle with the equally broad reassignment set. Otherwise a
+/// closure can specialize a captured receiver from its declared type even
+/// after an enclosing body has replaced the binding with another value.
+pub(crate) fn reassigned_locals_in_module(hir: &Module) -> HashSet<u32> {
+    scan_whole_module(hir).writes
+}
+
 /// Single-id convenience over [`reassigned_locals`].
+#[cfg(test)]
 pub(crate) fn local_is_reassigned(stmts: &[Stmt], id: u32) -> bool {
     reassigned_locals(stmts).contains(&id)
 }
@@ -197,8 +208,10 @@ fn record_expr_use(e: &Expr, depth: u32, scan: &mut ModuleScan) {
             receiver,
             ..
         } => {
-            record_receiver_use(target, depth, scan);
-            record_receiver_use(receiver, depth, scan);
+            // Ordinary [[Set]] can invoke proxies/accessors and otherwise
+            // expose either object, so neither position is length-safe.
+            record_expr_use(target, depth, scan);
+            record_expr_use(receiver, depth, scan);
             record_expr_use(key, depth, scan);
             record_expr_use(value, depth, scan);
         }

@@ -1,6 +1,6 @@
+use super::no_auto::build_missing_prebuilt_ext_lib;
 use super::*;
-use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::path::Path;
 
 use crate::commands::stdlib_features::{compute_required_features, features_to_cargo_arg};
 use crate::OutputFormat;
@@ -82,19 +82,23 @@ fn build_optimized_libs_reuses_fresh_auto_archives_without_cargo() {
     // the archives we plant (instead of hardcoding a key string that drifts
     // whenever the cache-key inputs change).
     // Mirror build_optimized_libs's feature derivation for this import-free
-    // ctx: it always force-adds `crypto` (perry-stdlib's crypto module is
-    // unconditionally linked into the auto-optimize rebuild), and the
-    // import-/fetch-driven unions don't fire for a fresh ctx.
+    // ctx: since the stdlib cherry-pick, `crypto` is no longer force-added
+    // (it only joins via imports, `uses_crypto_builtins`, or the codegen
+    // `js_crypto_*` prefix net); only the `async-runtime` floor (required
+    // by the always-on worker_threads/readline async bridge) is forced, and
+    // the import-/fetch-driven unions don't fire for a fresh ctx.
     let mut features = compute_required_features(
         &ctx.native_module_imports,
         ctx.uses_fetch,
         ctx.uses_crypto_builtins,
     );
-    features.insert("crypto");
+    features.insert("async-runtime");
     let feature_arg = features_to_cargo_arg(&features);
     let panic_abort_safe =
         !ctx.needs_ui && !ctx.needs_thread && !ctx.needs_plugins && !ctx.needs_geisterhand;
-    let key_input = auto_optimized_cache_key(&feature_arg, panic_abort_safe, None, &ctx);
+    let panic_immediate = effective_size_panic_immediate_abort(panic_abort_safe);
+    let key_input =
+        auto_optimized_cache_key(&feature_arg, panic_abort_safe, panic_immediate, None, &ctx);
     let mut hash: u64 = 5381;
     for b in key_input.as_bytes() {
         hash = hash.wrapping_mul(33).wrapping_add(*b as u64);
@@ -309,6 +313,13 @@ fn cpu_only_wrappers_do_not_need_shared_tokio() {
 }
 
 #[test]
+fn undici_needs_shared_tokio() {
+    // perry-ext-undici is network-I/O-family glue over the native fetch
+    // stack; it rides the shared build (see the freshness.rs comment).
+    assert!(binding_needs_shared_tokio("undici"));
+}
+
+#[test]
 fn unknown_modules_default_to_workspace_path() {
     // Defensive default: if a module isn't in the allowlist,
     // treat it as CPU-only (existing v0.5.586 behavior).
@@ -338,6 +349,17 @@ fn explicit_node_fetch_import_still_routes_to_well_known_fetch() {
     let modules = well_known_iteration_set(&ctx);
 
     assert!(modules.contains("node-fetch"));
+}
+
+#[test]
+fn explicit_undici_import_routes_to_well_known_undici() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut ctx = CompilationContext::new(dir.path().to_path_buf());
+    ctx.native_module_imports.insert("undici".to_string());
+
+    let modules = well_known_iteration_set(&ctx);
+
+    assert!(modules.contains("undici"));
 }
 
 #[test]
@@ -388,11 +410,11 @@ fn http2_import_changes_optimized_libs_cache_key() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     let base = CompilationContext::new(dir.path().to_path_buf());
-    let key_without = auto_optimized_cache_key("", true, None, &base);
+    let key_without = auto_optimized_cache_key("", true, false, None, &base);
 
     let mut with_http2 = CompilationContext::new(dir.path().to_path_buf());
     with_http2.native_module_imports.insert("http2".to_string());
-    let key_with = auto_optimized_cache_key("", true, None, &with_http2);
+    let key_with = auto_optimized_cache_key("", true, false, None, &with_http2);
 
     assert_ne!(
         key_without, key_with,
@@ -403,9 +425,34 @@ fn http2_import_changes_optimized_libs_cache_key() {
     dynamic.uses_get_builtin_module = true;
     assert_ne!(
         key_without,
-        auto_optimized_cache_key("", true, None, &dynamic),
+        auto_optimized_cache_key("", true, false, None, &dynamic),
         "getBuiltinModule must change the auto-optimized cache key"
     );
+}
+
+#[test]
+fn immediate_abort_requires_unwind_safe_reachability_and_changes_cache_identity() {
+    let _guard = env_lock();
+    let old_size_opt = std::env::var("PERRY_SIZE_OPT").ok();
+    let old_size_panic = std::env::var("PERRY_SIZE_PANIC").ok();
+    set_env_var("PERRY_SIZE_OPT", Some("z"));
+    set_env_var("PERRY_SIZE_PANIC", Some("abort-immediate"));
+
+    let ctx = CompilationContext::new(std::env::current_dir().expect("cwd"));
+    let safe_mode = effective_size_panic_immediate_abort(true);
+    let unsafe_mode = effective_size_panic_immediate_abort(false);
+    let ordinary_key = auto_optimized_cache_key("", true, false, None, &ctx);
+    let immediate_key = auto_optimized_cache_key("", true, safe_mode, None, &ctx);
+    let unsafe_key = auto_optimized_cache_key("", false, unsafe_mode, None, &ctx);
+
+    set_env_var("PERRY_SIZE_OPT", old_size_opt.as_deref());
+    set_env_var("PERRY_SIZE_PANIC", old_size_panic.as_deref());
+
+    assert!(safe_mode);
+    assert!(!unsafe_mode);
+    assert_ne!(ordinary_key, immediate_key);
+    assert!(immediate_key.contains("+panicimm"));
+    assert!(!unsafe_key.contains("+panicimm"));
 }
 
 #[test]
@@ -634,4 +681,87 @@ printf '!<arch>\n' > "$CARGO_TARGET_DIR/release/libperry_ext_http.a"
         got.expect("missing archive should be built from workspace source"),
         target_dir.join("release/libperry_ext_http.a")
     );
+}
+
+/// Binary/workspace skew: a cross-feature the on-disk checkout's
+/// perry-runtime doesn't declare must be dropped (and reported), not passed
+/// through to fail the entire cargo resolve — that failure's prebuilt
+/// fallback links without the routed ext entrypoints and dies with
+/// undefined `js_*` symbols far from the cause.
+#[test]
+fn retain_workspace_declared_features_drops_unknown_names() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("crates/perry-runtime/Cargo.toml"),
+        b"[package]\nname = \"perry-runtime\"\n\n[features]\nfull = [\"dep:hidden-allocator\"]\nregex-engine = []\n\n[dependencies]\nmimalloc = { version = \"0.1\", optional = true }\nhidden-allocator = { version = \"0.1\", optional = true }\n",
+    );
+    write_file(
+        &dir.path().join("crates/perry-stdlib/Cargo.toml"),
+        b"[package]\nname = \"perry-stdlib\"\n\n[features]\ncrypto = []\n",
+    );
+
+    let mut cross_features = vec![
+        "perry-runtime/full".to_string(),
+        "perry-runtime/alloc-mimalloc".to_string(),
+        "perry-runtime/mimalloc".to_string(),
+        "perry-runtime/hidden-allocator".to_string(),
+        "perry-stdlib/crypto".to_string(),
+        "perry-stdlib/web-fetch".to_string(),
+    ];
+    let dropped = retain_workspace_declared_features(dir.path(), &mut cross_features);
+
+    // `full` and `crypto` are declared features; `mimalloc` is an optional
+    // dep with an implicit feature. `hidden-allocator` is referenced through
+    // `dep:`, so Cargo does not expose an implicit same-named feature.
+    assert_eq!(
+        cross_features,
+        vec![
+            "perry-runtime/full".to_string(),
+            "perry-runtime/mimalloc".to_string(),
+            "perry-stdlib/crypto".to_string(),
+        ]
+    );
+    assert_eq!(
+        dropped,
+        vec![
+            "perry-runtime/alloc-mimalloc".to_string(),
+            "perry-runtime/hidden-allocator".to_string(),
+            "perry-stdlib/web-fetch".to_string(),
+        ]
+    );
+}
+
+/// A manifest without an explicit `[features]` table still declares implicit
+/// features for optional dependencies, but must reject every other stale name.
+#[test]
+fn retain_workspace_declared_features_handles_missing_feature_table() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("crates/perry-runtime/Cargo.toml"),
+        b"[package]\nname = \"perry-runtime\"\n\n[dependencies]\nmimalloc = { version = \"0.1\", optional = true }\n",
+    );
+
+    let mut cross_features = vec![
+        "perry-runtime/mimalloc".to_string(),
+        "perry-runtime/stale".to_string(),
+    ];
+    let dropped = retain_workspace_declared_features(dir.path(), &mut cross_features);
+
+    assert_eq!(cross_features, vec!["perry-runtime/mimalloc".to_string()]);
+    assert_eq!(dropped, vec!["perry-runtime/stale".to_string()]);
+}
+
+/// Fail-open: with no readable manifest (release tarball, partial checkout)
+/// there is nothing trustworthy to filter against — every requested feature
+/// must survive.
+#[test]
+fn retain_workspace_declared_features_keeps_all_without_manifests() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut cross_features = vec![
+        "perry-runtime/full".to_string(),
+        "perry-runtime/alloc-mimalloc".to_string(),
+    ];
+    let dropped = retain_workspace_declared_features(dir.path(), &mut cross_features);
+    assert!(dropped.is_empty());
+    assert_eq!(cross_features.len(), 2);
 }

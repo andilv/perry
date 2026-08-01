@@ -790,8 +790,9 @@ pub extern "C" fn js_date_utc(args_ptr: *const f64, argc: i32) -> f64 {
 
 /// Keepalive anchor for `js_date_utc` — codegen-only `#[no_mangle]` symbols
 /// get dead-stripped by the auto-optimize whole-program LLVM bitcode rebuild
-/// without a `#[cfg_attr(feature = "keepalive-anchors", used)]` reference (see project_auto_optimize_keepalive_3320).
-#[cfg_attr(feature = "keepalive-anchors", used)]
+/// without a `#[used]` reference (see project_auto_optimize_keepalive_3320).
+#[cfg(feature = "keepalive-anchors")]
+#[used]
 static KEEP_JS_DATE_UTC: extern "C" fn(*const f64, i32) -> f64 = js_date_utc;
 
 /// Coerce a NaN-boxed JS value to a number (ECMAScript ToNumber, restricted
@@ -870,13 +871,6 @@ fn jsvalue_to_number(v: f64) -> f64 {
         }
         _ => v, // plain f64 double
     }
-}
-
-/// True if a NaN-boxed JS value is `undefined`.
-#[inline]
-fn jsvalue_is_undefined(v: f64) -> bool {
-    let bits = v.to_bits();
-    ((bits >> 48) & 0xFFFF) == 0x7FFC && (bits & 0xFF) == 0x01
 }
 
 /// `Date.prototype.set*` family with optional trailing arguments (#2851).
@@ -1008,7 +1002,8 @@ pub extern "C" fn js_date_apply_setter(
     }
 }
 
-#[cfg_attr(feature = "keepalive-anchors", used)]
+#[cfg(feature = "keepalive-anchors")]
+#[used]
 static KEEP_JS_DATE_APPLY_SETTER: extern "C" fn(f64, i32, i32, *const f64, i32) -> f64 =
     js_date_apply_setter;
 
@@ -1079,7 +1074,12 @@ pub extern "C" fn js_date_new_local_components(
     alloc_date_cell(time_clip(local_ms - (tz_offset * 1000) as f64))
 }
 
-// --- UTC getters: same impl as the regular getters since we store UTC internally ---
+// --- UTC getters -----------------------------------------------------------
+//
+// Date cells store a UTC timestamp, but the regular getters intentionally
+// convert that timestamp through `localtime`. UTC getters must decompose the
+// stored timestamp directly; delegating to `getFullYear`/`getMonth`/`getDate`
+// makes them silently timezone-dependent (#6967).
 
 #[no_mangle]
 pub extern "C" fn js_date_get_utc_day(timestamp: f64) -> f64 {
@@ -1095,19 +1095,34 @@ pub extern "C" fn js_date_get_utc_day(timestamp: f64) -> f64 {
 #[no_mangle]
 pub extern "C" fn js_date_get_utc_full_year(timestamp: f64) -> f64 {
     let timestamp = date_cell_timestamp(timestamp);
-    js_date_get_full_year(timestamp)
+    if timestamp.is_nan() {
+        return f64::NAN;
+    }
+    let secs = (timestamp as i64).div_euclid(1000);
+    let (year, _, _, _, _, _) = timestamp_to_components(secs);
+    year as f64
 }
 
 #[no_mangle]
 pub extern "C" fn js_date_get_utc_month(timestamp: f64) -> f64 {
     let timestamp = date_cell_timestamp(timestamp);
-    js_date_get_month(timestamp)
+    if timestamp.is_nan() {
+        return f64::NAN;
+    }
+    let secs = (timestamp as i64).div_euclid(1000);
+    let (_, month, _, _, _, _) = timestamp_to_components(secs);
+    (month - 1) as f64
 }
 
 #[no_mangle]
 pub extern "C" fn js_date_get_utc_date(timestamp: f64) -> f64 {
     let timestamp = date_cell_timestamp(timestamp);
-    js_date_get_date(timestamp)
+    if timestamp.is_nan() {
+        return f64::NAN;
+    }
+    let secs = (timestamp as i64).div_euclid(1000);
+    let (_, _, day, _, _, _) = timestamp_to_components(secs);
+    day as f64
 }
 
 #[no_mangle]
@@ -1692,6 +1707,31 @@ mod tests {
         // Test 2024-01-15 12:30:45 UTC (timestamp: 1705321845)
         let (y, m, d, h, min, s) = timestamp_to_components(1705321845);
         assert_eq!((y, m, d, h, min, s), (2024, 1, 15, 12, 30, 45));
+    }
+
+    #[test]
+    fn utc_getters_ignore_process_timezone() {
+        const CHILD_MARKER: &str = "PERRY_DATE_UTC_GETTER_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            // 2025-06-20T00:00:00.000Z is still June 19 in Los Angeles.
+            // The three UTC calendar getters must nevertheless keep the UTC
+            // date, while the old delegation to local getters returned 19.
+            let timestamp = 1_750_377_600_000.0;
+            assert_eq!(js_date_get_date(timestamp), 19.0);
+            assert_eq!(js_date_get_utc_full_year(timestamp), 2025.0);
+            assert_eq!(js_date_get_utc_month(timestamp), 5.0);
+            assert_eq!(js_date_get_utc_date(timestamp), 20.0);
+            return;
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().expect("current test exe"))
+            .arg("date::tests::utc_getters_ignore_process_timezone")
+            .arg("--exact")
+            .env("TZ", "America/Los_Angeles")
+            .env(CHILD_MARKER, "1")
+            .status()
+            .expect("spawn timezone-isolated date getter test");
+        assert!(status.success(), "timezone-isolated child failed");
     }
 
     // Helpers for the setter API: a plain f64 is already its own NaN-boxed

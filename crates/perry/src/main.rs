@@ -4,6 +4,8 @@
 
 mod commands;
 mod compat_reports;
+#[cfg(test)]
+mod shadow_layout_contract;
 mod telemetry;
 #[cfg(test)]
 mod test_env_lock;
@@ -205,8 +207,8 @@ fn is_legacy_invocation(args: &[String]) -> bool {
         if arg.starts_with('-') {
             continue;
         }
-        // Check if it looks like a .ts file (and not a subcommand)
-        if arg.ends_with(".ts") {
+        // Check if it looks like a TypeScript file (and not a subcommand)
+        if arg.ends_with(".ts") || arg.ends_with(".mts") || arg.ends_with(".cts") {
             return true;
         }
         // If it's a known subcommand, not legacy

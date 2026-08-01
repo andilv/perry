@@ -31,7 +31,10 @@ impl JmpBuf {
     }
 }
 
-use crate::gc::{shadow_stack_restore, shadow_stack_savepoint, ShadowSavepoint};
+use crate::gc::{
+    runtime_handle_stack_restore, runtime_handle_stack_savepoint, shadow_stack_restore,
+    shadow_stack_savepoint, ShadowSavepoint,
+};
 
 extern "C" {
     fn longjmp(env: *mut i32, val: i32) -> !;
@@ -50,14 +53,14 @@ const MAX_TRY_DEPTH: usize = 1024;
 /// B (its stack frame doesn't exist there) — so the buffers, the depth
 /// counter, the current exception, and the finally-flag all have to
 /// live in TLS once `perry/thread` workers can run user code that
-/// throws. Previously all five were process-wide `static mut`s and would
+/// throws. Previously this state was process-wide `static mut` data and would
 /// corrupt under any concurrent throw.
-// arm64_32 fix: the three per-depth arrays are HEAP-allocated (`Box<[..]>`)
+// arm64_32 fix: the per-depth arrays are HEAP-allocated (`Box<[..]>`)
 // instead of stored inline in TLS. At MAX_TRY_DEPTH=1024 they are ~280KB of
 // initialized thread-local data (`jump_buffers` alone is 1024 * 256B = 256KB),
 // which overflows ld64's 64KB `__thread_data` cap for arm64_32 (and the ILP32
-// TLS layout generally). Boxing leaves only three fat pointers + scalars inline
-// in TLS; the arrays live on the heap. `[T]` indexing on `Box<[T]>` is
+// TLS layout generally). Boxing leaves only fat pointers + scalars inline in
+// TLS; the arrays live on the heap. `[T]` indexing on `Box<[T]>` is
 // unchanged, so the accessors below need no edits. (Mirrors the
 // TRANSITION_CACHE / VTABLE_IC / INTERN_TABLE boxing.)
 struct ExceptionState {
@@ -67,6 +70,10 @@ struct ExceptionState {
     /// `js_throw` / issue #1830). Indexed by try-depth, in lockstep with
     /// `jump_buffers`.
     shadow_savepoints: Box<[ShadowSavepoint]>,
+    /// Runtime-handle stack depth captured with each `try`. A `longjmp` skips
+    /// `RuntimeHandleScope` drops, so stale roots must be removed before the
+    /// catch path can allocate or trigger GC.
+    runtime_handle_savepoints: Box<[usize]>,
     /// `js_native_call_method` recursion depth captured when each `try` was
     /// pushed. A throw `longjmp`s past the in-flight method frames, skipping
     /// their `CallMethodDepthGuard` `Drop`s; the unwind path restores this so
@@ -74,6 +81,10 @@ struct ExceptionState {
     /// `call_method_depth_*`). Indexed by try-depth, in lockstep with
     /// `jump_buffers`.
     call_method_depths: Box<[u32]>,
+    /// Recorded-prototype lookup stack depth. A getter can throw while
+    /// `resolve_inherited_field` is recursively walking; longjmp skips its
+    /// guard drops, so restore the stack to this try-entry savepoint.
+    prototype_resolution_depths: Box<[usize]>,
     /// #6559: dyn-eval interpreter state (rooted-stack length + interpreter
     /// call depth, packed) captured when each `try` was pushed. A throw
     /// `longjmp`s past interpreter Rust frames without running their
@@ -95,7 +106,9 @@ impl ExceptionState {
         ExceptionState {
             jump_buffers: vec![JmpBuf::new(); MAX_TRY_DEPTH].into_boxed_slice(),
             shadow_savepoints: vec![ShadowSavepoint::EMPTY; MAX_TRY_DEPTH].into_boxed_slice(),
+            runtime_handle_savepoints: vec![0usize; MAX_TRY_DEPTH].into_boxed_slice(),
             call_method_depths: vec![0u32; MAX_TRY_DEPTH].into_boxed_slice(),
+            prototype_resolution_depths: vec![0usize; MAX_TRY_DEPTH].into_boxed_slice(),
             #[cfg(feature = "dyn-eval")]
             dyn_eval_savepoints: vec![0u64; MAX_TRY_DEPTH].into_boxed_slice(),
             try_depth: 0,
@@ -129,10 +142,13 @@ pub extern "C" fn js_try_push() -> *mut i32 {
         // can push any callee frames, so the unwind path can restore to
         // exactly this point and drop the frames `longjmp` orphans (#1830).
         (*s).shadow_savepoints[depth] = shadow_stack_savepoint();
+        (*s).runtime_handle_savepoints[depth] = runtime_handle_stack_savepoint();
         // Capture the method-dispatch recursion depth too, so a throw caught by
         // this `try` can restore it — `longjmp` skips the `CallMethodDepthGuard`
         // `Drop`s of the method frames it unwinds (#5591).
         (*s).call_method_depths[depth] = crate::object::call_method_depth_savepoint();
+        (*s).prototype_resolution_depths[depth] =
+            crate::object::prototype_chain::resolution_stack_savepoint();
         // #6559: capture the dyn-eval interpreter's rooted-stack length +
         // call depth, so a caught throw restores interpreter state exactly
         // like the shadow stack.
@@ -234,12 +250,16 @@ pub extern "C" fn js_throw(value: f64) -> ! {
         // already-unwound stack frames (#1830). Restore to the depth captured
         // when this `try` was pushed.
         shadow_stack_restore((*s).shadow_savepoints[depth]);
+        runtime_handle_stack_restore((*s).runtime_handle_savepoints[depth]);
         // Restore the method-dispatch recursion depth captured when this `try`
         // was pushed. The frames we are about to `longjmp` past never run their
         // `CallMethodDepthGuard` `Drop`s, so without this the counter leaks one
         // per caught throw and eventually wedges every method call into the
         // depth-guard fallback (#5591).
         crate::object::call_method_depth_restore((*s).call_method_depths[depth]);
+        crate::object::prototype_chain::resolution_stack_restore(
+            (*s).prototype_resolution_depths[depth],
+        );
         // #6559: restore the dyn-eval interpreter's rooted stack + call depth
         // (interpreter Rust frames unwound by this longjmp never run their
         // truncate/decrement epilogues).
@@ -438,6 +458,10 @@ pub(crate) fn test_unwind_innermost_shadow_restore() {
         assert!((*s).try_depth > 0, "no open try to unwind");
         let depth = (*s).try_depth - 1;
         shadow_stack_restore((*s).shadow_savepoints[depth]);
+        runtime_handle_stack_restore((*s).runtime_handle_savepoints[depth]);
+        crate::object::prototype_chain::resolution_stack_restore(
+            (*s).prototype_resolution_depths[depth],
+        );
     });
 }
 
@@ -446,6 +470,7 @@ mod tests {
     use super::*;
     use crate::gc::{
         js_shadow_frame_pop, js_shadow_frame_push, js_shadow_slot_set, shadow_stack_depth,
+        RuntimeHandleScope,
     };
 
     // Issue #1830: js_try_push must capture a shadow-stack savepoint, and the
@@ -488,6 +513,22 @@ mod tests {
 
         js_shadow_frame_pop(run_frame);
         assert_eq!(shadow_stack_depth(), base_depth);
+    }
+
+    #[test]
+    fn js_throw_path_restores_runtime_handles_across_unwound_frames() {
+        let base_try = test_try_depth();
+        let base_handles = RuntimeHandleScope::active_len_for_tests();
+        let _jb = js_try_push();
+        let scope = RuntimeHandleScope::new();
+        let _orphaned = scope.root_nanbox_f64(f64::from_bits(0x7FFD_0000_0000_00A1));
+        assert!(RuntimeHandleScope::active_len_for_tests() > base_handles);
+
+        test_unwind_innermost_shadow_restore();
+        js_try_end();
+
+        assert_eq!(test_try_depth(), base_try);
+        assert_eq!(RuntimeHandleScope::active_len_for_tests(), base_handles);
     }
 
     #[test]

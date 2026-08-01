@@ -39,6 +39,13 @@ pub extern "C" fn js_object_get_field_by_name(
     if key.is_null() {
         return JSValue::undefined();
     }
+    // `process.env` is a live OS-backed exotic object. Direct reads are
+    // codegen-specialized, but an alias (`const env = process.env; env.X`)
+    // reaches this generic path. On Windows the OS lookup also supplies the
+    // required case-insensitivity (`env.Path === env.PATH`).
+    if let Some(value) = crate::process::process_env_get_field(obj, key) {
+        return value;
+    }
     // #2846: the receiver may be a Proxy value that arrived through a generic
     // property read (e.g. `rec.proxy.a` where `rec = Proxy.revocable(...)`).
     // Proxies are encoded as small fake pointers; deref-ing one as an
@@ -506,10 +513,12 @@ pub extern "C" fn js_object_get_field_by_name(
                                 super::super::prototype_chain::object_static_prototype(addr)
                             {
                                 if proto_bits != crate::value::TAG_NULL {
-                                    let proto = JSValue::from_bits(proto_bits);
-                                    if proto.is_pointer() {
-                                        let p = proto.as_pointer::<ObjectHeader>();
-                                        return super::super::js_object_get_field_by_name(p, key);
+                                    if let Some(inherited) =
+                                        super::super::prototype_chain::resolve_inherited_field(
+                                            addr, key,
+                                        )
+                                    {
+                                        return inherited;
                                     }
                                 }
                             }
@@ -533,6 +542,39 @@ pub extern "C" fn js_object_get_field_by_name(
                             return JSValue::from_bits(ctor.to_bits());
                         }
                         _ => {}
+                    }
+
+                    // A typed array reached through an `any`-typed value uses
+                    // this generic property getter instead of codegen's typed
+                    // method path. Resolve inherited methods/accessors through
+                    // the instance's actual prototype, preserving custom
+                    // `Reflect.construct` prototypes before the intrinsic
+                    // per-kind prototype fallback. Without this,
+                    // structured-cloned views had the right brand and bytes
+                    // but reads such as `cloned.join` returned `undefined`.
+                    match super::super::prototype_chain::object_static_prototype(addr) {
+                        Some(crate::value::TAG_NULL) => {}
+                        Some(_) => {
+                            if let Some(inherited) =
+                                super::super::prototype_chain::resolve_inherited_field(addr, key)
+                            {
+                                return inherited;
+                            }
+                        }
+                        None => {
+                            let proto = crate::object::builtin_prototype_value(
+                                crate::typedarray::name_for_kind(kind),
+                            );
+                            if let Some(inherited) = super::super::prototype_chain::
+                                resolve_inherited_field_from_prototype(
+                                    addr,
+                                    proto.to_bits(),
+                                    key,
+                                )
+                            {
+                                return inherited;
+                            }
+                        }
                     }
                 } else {
                     let buf = addr as *const crate::buffer::BufferHeader;
@@ -572,6 +614,33 @@ pub extern "C" fn js_object_get_field_by_name(
                             return JSValue::from_bits(ctor.to_bits());
                         }
                         _ => {}
+                    }
+
+                    // Buffer-backed Uint8Arrays share the intrinsic
+                    // Uint8Array prototype. Like the TypedArrayHeader branch
+                    // above, this is required when the receiver's static type
+                    // has been erased (for example by structured clone).
+                    match super::super::prototype_chain::object_static_prototype(addr) {
+                        Some(crate::value::TAG_NULL) => {}
+                        Some(_) => {
+                            if let Some(inherited) =
+                                super::super::prototype_chain::resolve_inherited_field(addr, key)
+                            {
+                                return inherited;
+                            }
+                        }
+                        None => {
+                            let proto = crate::object::builtin_prototype_value("Uint8Array");
+                            if let Some(inherited) = super::super::prototype_chain::
+                                resolve_inherited_field_from_prototype(
+                                    addr,
+                                    proto.to_bits(),
+                                    key,
+                                )
+                            {
+                                return inherited;
+                            }
+                        }
                     }
                 }
             }
@@ -1423,7 +1492,7 @@ mod null_key_guard_5972 {
     /// SIGSEGV by dereferencing `(*key).byte_len` at offset 4.
     #[test]
     fn null_key_returns_undefined_not_segfault() {
-        unsafe {
+        {
             let obj = crate::object::js_object_alloc(0, 0);
             let key = crate::string::js_string_from_bytes(b"present".as_ptr(), 7);
             crate::object::js_object_set_field_by_name(obj, key, 42.0);

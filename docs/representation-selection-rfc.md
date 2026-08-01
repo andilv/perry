@@ -109,6 +109,29 @@ control flow (a value's representation at a `catch` join is the meet over all po
 paths — in practice `Boxed` unless all throwing paths agree). The inference treats each of these as
 a hard meet-to-`Boxed` edge; none of them may be "optimized through."
 
+**Profitability is a second, separate question (#7128).** Everything above answers *may we
+select this representation*. Nothing in it answers *should we*, and the two have different
+failure modes: an unsound selection is a wrong answer, an unprofitable one is a slower answer
+that no test can see. #7128 measured the consequence — after #7110 widened the i32 range proof
+and #7121 removed the module-init exclusion, `benchmarks/suite/15_mandelbrot.ts` promoted three
+provably-bounded loop counters, none of which is ever used as an integer, and paid **+14.87%
+instructions retired** for them (invisible in wall time: the workload is FP-latency-bound).
+
+For an i32-range value, `double` is a lossless and equal-cost representation of `+`, `-` and
+comparison. `I32` only *buys* something where the consumer cannot take a double without a
+conversion — array/typed-array indexing, bitwise operands, `Math.imul` — which is the same list
+§5.3 already gives for where `I32` semantics are exact. It becomes a *cost* the moment any hot
+consumer needs the double back. So selection carries one profitability term alongside the
+soundness terms: a value written after its declaration, with no i32-consuming read anywhere and
+at least one double-consuming read inside a loop, stays `Boxed`
+(`collectors/repsel_benefit.rs`). The term only ever refuses, so every uncertainty resolves
+toward "not a cost"; a missed refusal is the pre-existing behaviour.
+
+The same shape exists for the other representations and is not yet modelled: #7128 found every
+`__pshape` clone dead-stripped before the object (finding C) and `Ptr<NumArray>` emitting nothing
+outside its own fixture (finding D). Both are "selected, and no byte changed" — the cheap end of
+the same gap.
+
 ### 5.3 Representation-selected lowering & operation semantics
 Locals and params get native slots per representation; loop phis are typed; ops stay native
 end-to-end. **Operation semantics are representation-preserving — lowering may never change an
@@ -185,6 +208,40 @@ pointer-rep rules:
   same rebase-after-safepoint contract the masked-window region code uses today.
 - Unwinding runs the existing frame-pop path; registered slots die with the frame — no new
   exception machinery.
+
+#### 5.6.1 Enforcement — the GC x representation matrix
+
+Each representation above shipped its GC-safety argument in its own PR, verified once by hand at
+merge time, while the collector changed underneath all of them (#6910 mark/rewrite root-word
+parity, #6921 typed-shape layout on the ctor exit, #6892 minor-sweep finalization, #6655 operand
+rooting). Nobody verified the cross-product. It is now a maintained gate rather than a set of
+one-time arguments:
+
+- **The matrix.** `scripts/gc_repsel_matrix.sh` runs the whole representation corpus against every
+  GC arm — `PERRY_GC_FORCE_EVACUATE`, `PERRY_GC_VERIFY_EVACUATION`, `PERRY_GEN_GC=0`,
+  `PERRY_WRITE_BARRIERS=0`, `PERRY_CONSERVATIVE_STACK_SCAN=off`, `PERRY_GC_MOVING_LOOP_POLLS=1`,
+  their combinations, and *each representation flag OFF x evacuation* — byte-exact against the
+  pinned Node oracle. Wired into the `gc-stress` CI job: a fast 4-arm subset gates every PR, the
+  full arm list runs on push.
+- **A NEW REPRESENTATION MUST REGISTER ITS GAP FILE** in `test-parity/gc_repsel_corpus.txt`. The
+  script fails when a `test_gap_repsel_*` / `test_gap_specabi_*` file exists that is not registered.
+  This is the GC-side counterpart of the single-decoder refactor #6910 established for mark/rewrite:
+  adding a representation teaches all the paths at once, or CI says so.
+- **Liveness is part of the result.** Setting a GC env var does not prove the GC did anything. The
+  first automatic collection needs ~1M escaping allocations, so a small gap test performs *zero*
+  collections and every GC arm against it is inert (#6942, #6946, #6950). The harness therefore
+  asserts liveness from the collector's own `PERRY_GC_TRACE` / `PERRY_GC_DIAG` output and reports an
+  output-matching cell under an inert arm as **UNVERIFIED**, never green.
+  `test-files/test_gap_repsel_gc_stress.ts` is the corpus member built to be live: it holds each
+  representation's local across escaping allocation churn heavy enough to reach the collector. A new
+  representation should extend *that* file as well as adding its own, or its GC arms stay inert.
+- **What the matrix cannot verify today.** No reachable configuration in an AOT-compiled program
+  performs an *evacuating minor*: every automatic collection is a full mark-sweep taken under
+  `ManualGcScanGuard::force_full_scan()`, which additionally pins raw locals conservatively (#6950,
+  extending #6946 from the `gc()` path). The rebase-after-safepoint contract in the bullets above —
+  the core GC claim of every pointer representation — is therefore still argued, not tested. #6942
+  tracks making it testable; when that lands, the matrix's evacuating arms flip from UNVERIFIED to
+  green with no change to the harness.
 
 ### 5.7 Typed heap (Phase 4)
 Unboxed storage extends to heap slots where the *container's* shape is proven and stable:

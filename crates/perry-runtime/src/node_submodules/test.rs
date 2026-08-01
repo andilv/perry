@@ -17,6 +17,9 @@ use crate::object::{js_object_alloc, js_object_set_field_by_name};
 use crate::string::js_string_from_bytes;
 use crate::value::{JSValue, POINTER_MASK, TAG_UNDEFINED};
 
+#[path = "test_property.rs"]
+mod property_mock;
+
 const REPORTER_SPEC: i32 = 0;
 const REPORTER_TAP: i32 = 1;
 const REPORTER_DOT: i32 = 2;
@@ -332,7 +335,11 @@ extern "C" fn mock_timers_enable(_closure: *const ClosureHeader, options: f64) -
 }
 
 extern "C" fn mock_timers_tick(_closure: *const ClosureHeader, ms: f64) -> f64 {
-    let delay = validate_mock_timer_number("time", ms);
+    let delay = if is_undefined_value(ms) {
+        1.0
+    } else {
+        validate_mock_timer_number("time", ms)
+    };
     crate::timer::js_mock_timers_tick(delay);
     undefined_value()
 }
@@ -372,7 +379,7 @@ fn validate_mock_timer_number(arg: &str, value: f64) -> f64 {
 
 fn parse_mock_timer_options(options: f64) -> (u32, f64) {
     let mut apis_value = options;
-    let mut now = crate::timer::js_mock_timers_real_now_ms();
+    let mut now = 0.0;
     let js = JSValue::from_bits(options.to_bits());
     if js.is_undefined() {
         return (crate::timer::MOCK_TIMERS_ALL_APIS, now);
@@ -434,7 +441,7 @@ struct MockState {
     id: i64,
     original: f64,
     implementation: f64,
-    once: Vec<f64>,
+    once: Vec<(usize, f64)>,
     calls: f64,
     context: f64,
     function: f64,
@@ -498,6 +505,90 @@ fn accessor_function_value(bits: u64) -> f64 {
     }
 }
 
+#[derive(Clone, Copy)]
+struct MockMethodOptions {
+    getter: bool,
+    setter: bool,
+}
+
+fn is_non_null_object(value: f64) -> bool {
+    let js = JSValue::from_bits(value.to_bits());
+    js.is_pointer() && !is_callable_value(value)
+}
+
+fn mock_option_bool(options: f64, name: &str, default: bool) -> bool {
+    let Some(value) = object_property(options, name.as_bytes()) else {
+        return default;
+    };
+    match value.to_bits() {
+        crate::value::TAG_TRUE => true,
+        crate::value::TAG_FALSE => false,
+        crate::value::TAG_UNDEFINED => default,
+        _ => throw_invalid_arg_type(&format!("options.{name}"), "boolean", value),
+    }
+}
+
+fn parse_mock_method_options(
+    options: f64,
+    default_getter: bool,
+    default_setter: bool,
+) -> MockMethodOptions {
+    if is_undefined_value(options) {
+        return MockMethodOptions {
+            getter: default_getter,
+            setter: default_setter,
+        };
+    }
+    if !is_non_null_object(options) {
+        throw_invalid_arg_type("options", "object", options);
+    }
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let options = scope.root_nanbox_f64(options);
+    let getter = mock_option_bool(options.get_nanbox_f64(), "getter", default_getter);
+    let setter = mock_option_bool(options.get_nanbox_f64(), "setter", default_setter);
+    MockMethodOptions { getter, setter }
+}
+
+fn normalize_mock_method_args(implementation: f64, options: f64) -> (f64, f64) {
+    if is_non_null_object(implementation) {
+        (undefined_value(), implementation)
+    } else {
+        (implementation, options)
+    }
+}
+
+fn throw_invalid_mock_option_value(arg: &str, value: f64, reason: &str) -> ! {
+    crate::validators::throw_invalid_arg_value(
+        arg,
+        reason,
+        &crate::fs::validate::describe_received(value),
+    );
+}
+
+fn validate_mock_accessor_options(options: MockMethodOptions, kind: &str) {
+    if kind == "getter" && !options.getter {
+        throw_invalid_mock_option_value(
+            "options.getter",
+            f64::from_bits(crate::value::TAG_FALSE),
+            "cannot be false",
+        );
+    }
+    if kind == "setter" && !options.setter {
+        throw_invalid_mock_option_value(
+            "options.setter",
+            f64::from_bits(crate::value::TAG_FALSE),
+            "cannot be false",
+        );
+    }
+    if options.getter && options.setter {
+        throw_invalid_mock_option_value(
+            "options.setter",
+            f64::from_bits(crate::value::TAG_TRUE),
+            "cannot be used with 'options.getter'",
+        );
+    }
+}
+
 fn install_accessor_mock(target: f64, property: &str, accessor: crate::object::AccessorDescriptor) {
     let raw = object_target_addr(target);
     let key = js_string_from_bytes(property.as_ptr(), property.len() as u32);
@@ -556,7 +647,7 @@ fn mock_context_object(id: i64, calls: f64, include_call_tracking: bool) -> f64 
         set_field(
             obj,
             "mockImplementationOnce",
-            closure_value_with_id(mock_context_mock_implementation_once as *const u8, 1, id),
+            closure_value_with_id(mock_context_mock_implementation_once as *const u8, 2, id),
         );
     }
     set_field(
@@ -567,6 +658,20 @@ fn mock_context_object(id: i64, calls: f64, include_call_tracking: bool) -> f64 
     boxed_ptr(obj)
 }
 
+fn mock_function_metadata(original: f64) -> (String, u32) {
+    if !is_callable_value(original) {
+        return ("mockFn".to_string(), 0);
+    }
+    let closure = raw_ptr_from_value(original) as *const ClosureHeader;
+    let dynamic_name = crate::closure::closure_get_own_dynamic_prop(closure as usize, "name")
+        .and_then(value_to_string);
+    let name = dynamic_name
+        .or_else(|| unsafe { crate::builtins::function_name_for_ptr((*closure).func_ptr as usize) })
+        .unwrap_or_default();
+    let length = crate::closure::closure_length(closure).unwrap_or(0);
+    (name, length)
+}
+
 fn create_mock_function(original: f64, implementation: f64, restore: MockRestoreTarget) -> f64 {
     if !JSValue::from_bits(original.to_bits()).is_undefined() {
         assert_callable_arg("original", original);
@@ -575,53 +680,81 @@ fn create_mock_function(original: f64, implementation: f64, restore: MockRestore
         assert_callable_arg("implementation", implementation);
     }
 
+    let (name, length) = mock_function_metadata(original);
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let original = scope.root_nanbox_f64(original);
+    let implementation = scope.root_nanbox_f64(implementation);
     let id = next_mock_id();
-    let calls = boxed_ptr(crate::array::js_array_alloc(0));
-    let context = mock_context_object(id, calls, true);
-    let function = rest_closure_value_with_id(mock_function_invoke as *const u8, 0, id);
-    let closure_ptr = raw_ptr_from_value(function);
+    let calls = scope.root_nanbox_f64(boxed_ptr(crate::array::js_array_alloc(0)));
+    let context = scope.root_nanbox_f64(mock_context_object(id, calls.get_nanbox_f64(), true));
+    let function = scope.root_nanbox_f64(rest_closure_value_with_id(
+        mock_function_invoke as *const u8,
+        0,
+        id,
+    ));
+    let closure_ptr = raw_ptr_from_value(function.get_nanbox_f64());
     if closure_ptr != 0 {
-        crate::object::set_bound_native_closure_name(closure_ptr as *mut ClosureHeader, "mockFn");
-        crate::closure::closure_set_dynamic_prop(closure_ptr, "mock", context);
+        crate::object::set_bound_native_closure_name(closure_ptr as *mut ClosureHeader, &name);
+        let closure_ptr = raw_ptr_from_value(function.get_nanbox_f64());
+        crate::object::set_builtin_closure_length(closure_ptr, length);
+        crate::object::set_builtin_property_attrs(
+            closure_ptr,
+            "length".to_string(),
+            crate::object::PropertyAttrs::new(false, false, true),
+        );
+        crate::closure::closure_set_dynamic_prop(closure_ptr, "mock", context.get_nanbox_f64());
     }
 
     MOCK_STATES.with(|states| {
         states.borrow_mut().push(MockState {
             id,
-            original,
-            implementation,
+            original: original.get_nanbox_f64(),
+            implementation: implementation.get_nanbox_f64(),
             once: Vec::new(),
-            calls,
-            context,
-            function,
+            calls: calls.get_nanbox_f64(),
+            context: context.get_nanbox_f64(),
+            function: function.get_nanbox_f64(),
             restore,
         });
     });
-    function
-}
-
-fn create_restore_context(restore: MockRestoreTarget) -> f64 {
-    let id = next_mock_id();
-    let calls = boxed_ptr(crate::array::js_array_alloc(0));
-    let context = mock_context_object(id, calls, false);
-    MOCK_STATES.with(|states| {
-        states.borrow_mut().push(MockState {
-            id,
-            original: undefined_value(),
-            implementation: undefined_value(),
-            once: Vec::new(),
-            calls,
-            context,
-            function: undefined_value(),
-            restore,
-        });
-    });
-    context
+    function.get_nanbox_f64()
 }
 
 fn reset_mock_state_calls(state: &mut MockState) {
     state.calls = boxed_ptr(crate::array::js_array_alloc(0));
     update_mock_context_calls(state.context, state.calls);
+}
+
+fn mock_state_call_count(state: &MockState) -> usize {
+    if !is_array_value(state.calls) {
+        return 0;
+    }
+    crate::array::js_array_length(
+        raw_ptr_from_value(state.calls) as *const crate::array::ArrayHeader
+    ) as usize
+}
+
+fn schedule_mock_implementation_once(state: &mut MockState, call: usize, implementation: f64) {
+    if let Some((_, existing)) = state.once.iter_mut().find(|(index, _)| *index == call) {
+        *existing = implementation;
+    } else {
+        state.once.push((call, implementation));
+    }
+    crate::gc::runtime_write_barrier_root_nanbox(implementation.to_bits());
+}
+
+fn take_mock_implementation(state: &mut MockState) -> f64 {
+    let call = mock_state_call_count(state);
+    if let Some(position) = state.once.iter().position(|(index, _)| *index == call) {
+        state.once.remove(position).1
+    } else {
+        state.implementation
+    }
+}
+
+fn prepare_mock_state_restore(state: &mut MockState) -> MockRestoreTarget {
+    state.implementation = state.original;
+    state.restore.clone()
 }
 
 fn restore_mock_state(id: i64) {
@@ -630,10 +763,7 @@ fn restore_mock_state(id: i64) {
         let Some(state) = states.iter_mut().find(|state| state.id == id) else {
             return None;
         };
-        state.implementation = state.original;
-        state.once.clear();
-        reset_mock_state_calls(state);
-        Some(state.restore.clone())
+        Some(prepare_mock_state_restore(state))
     });
     match restore {
         Some(MockRestoreTarget::ObjectProperty {
@@ -704,6 +834,10 @@ fn record_mock_call(id: i64, args_value: f64, this_value: f64, result: f64, erro
     });
 }
 
+#[cfg(test)]
+#[path = "test_metadata_unit_tests.rs"]
+mod metadata_tests;
+
 extern "C" fn mock_function_invoke(closure: *const ClosureHeader, rest: f64) -> f64 {
     let id = closure_id(closure);
     let args = array_values(rest).unwrap_or_default();
@@ -712,11 +846,7 @@ extern "C" fn mock_function_invoke(closure: *const ClosureHeader, rest: f64) -> 
         let Some(state) = states.iter_mut().find(|state| state.id == id) else {
             return undefined_value();
         };
-        if !state.once.is_empty() {
-            state.once.remove(0)
-        } else {
-            state.implementation
-        }
+        take_mock_implementation(state)
     });
 
     let this_value = crate::object::js_implicit_this_get();
@@ -811,12 +941,31 @@ extern "C" fn mock_context_mock_implementation(
 extern "C" fn mock_context_mock_implementation_once(
     closure: *const ClosureHeader,
     implementation: f64,
+    on_call: f64,
 ) -> f64 {
     assert_callable_arg("implementation", implementation);
     let id = closure_id(closure);
+    let next_call = MOCK_STATES.with(|states| {
+        states
+            .borrow()
+            .iter()
+            .find(|state| state.id == id)
+            .map(mock_state_call_count)
+            .unwrap_or(0)
+    });
+    let call = if is_undefined_value(on_call) {
+        next_call
+    } else {
+        crate::validators::validate_integer(
+            on_call,
+            "onCall",
+            next_call as f64,
+            crate::validators::MAX_SAFE_INTEGER,
+        ) as usize
+    };
     MOCK_STATES.with(|states| {
         if let Some(state) = states.borrow_mut().iter_mut().find(|state| state.id == id) {
-            state.once.push(implementation);
+            schedule_mock_implementation_once(state, call, implementation);
         }
     });
     undefined_value()
@@ -852,34 +1001,54 @@ extern "C" fn mock_method_thunk(
     target: f64,
     property: f64,
     implementation: f64,
+    options: f64,
 ) -> f64 {
-    let property = property_name(property);
-    let original = get_property_value(target, &property);
-    let implementation = if is_undefined_value(implementation) {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let target = scope.root_nanbox_f64(target);
+    let property = scope.root_nanbox_f64(property);
+    let implementation = scope.root_nanbox_f64(implementation);
+    let options = scope.root_nanbox_f64(options);
+    let (implementation, options) =
+        normalize_mock_method_args(implementation.get_nanbox_f64(), options.get_nanbox_f64());
+    let implementation = scope.root_nanbox_f64(implementation);
+    let options = parse_mock_method_options(options, false, false);
+    validate_mock_accessor_options(options, "method");
+    if options.getter {
+        return create_getter_mock(
+            target.get_nanbox_f64(),
+            property.get_nanbox_f64(),
+            implementation.get_nanbox_f64(),
+        );
+    }
+    if options.setter {
+        return create_setter_mock(
+            target.get_nanbox_f64(),
+            property.get_nanbox_f64(),
+            implementation.get_nanbox_f64(),
+        );
+    }
+    let property_name = property_name(property.get_nanbox_f64());
+    let original = get_property_value(target.get_nanbox_f64(), &property_name);
+    let implementation = if is_undefined_value(implementation.get_nanbox_f64()) {
         original
     } else {
-        implementation
+        implementation.get_nanbox_f64()
     };
     assert_callable_arg("implementation", implementation);
     let function = create_mock_function(
         original,
         implementation,
         MockRestoreTarget::ObjectProperty {
-            target,
-            property: property.clone(),
+            target: target.get_nanbox_f64(),
+            property: property_name.clone(),
             original,
         },
     );
-    set_property_value(target, &property, function);
+    set_property_value(target.get_nanbox_f64(), &property_name, function);
     function
 }
 
-extern "C" fn mock_getter_thunk(
-    _closure: *const ClosureHeader,
-    target: f64,
-    property: f64,
-    implementation: f64,
-) -> f64 {
+fn create_getter_mock(target: f64, property: f64, implementation: f64) -> f64 {
     let property = property_name(property);
     let raw = object_target_addr(target);
     let original_accessor = crate::object::get_accessor_descriptor(raw, &property);
@@ -919,12 +1088,31 @@ extern "C" fn mock_getter_thunk(
     function
 }
 
-extern "C" fn mock_setter_thunk(
+extern "C" fn mock_getter_thunk(
     _closure: *const ClosureHeader,
     target: f64,
     property: f64,
     implementation: f64,
+    options: f64,
 ) -> f64 {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let target = scope.root_nanbox_f64(target);
+    let property = scope.root_nanbox_f64(property);
+    let implementation = scope.root_nanbox_f64(implementation);
+    let options = scope.root_nanbox_f64(options);
+    let (implementation, options) =
+        normalize_mock_method_args(implementation.get_nanbox_f64(), options.get_nanbox_f64());
+    let implementation = scope.root_nanbox_f64(implementation);
+    let options = parse_mock_method_options(options, true, false);
+    validate_mock_accessor_options(options, "getter");
+    create_getter_mock(
+        target.get_nanbox_f64(),
+        property.get_nanbox_f64(),
+        implementation.get_nanbox_f64(),
+    )
+}
+
+fn create_setter_mock(target: f64, property: f64, implementation: f64) -> f64 {
     let property = property_name(property);
     let raw = object_target_addr(target);
     let original_accessor = crate::object::get_accessor_descriptor(raw, &property);
@@ -964,20 +1152,28 @@ extern "C" fn mock_setter_thunk(
     function
 }
 
-extern "C" fn mock_property_thunk(
+extern "C" fn mock_setter_thunk(
     _closure: *const ClosureHeader,
     target: f64,
     property: f64,
-    value: f64,
+    implementation: f64,
+    options: f64,
 ) -> f64 {
-    let property = property_name(property);
-    let original = get_property_value(target, &property);
-    set_property_value(target, &property, value);
-    create_restore_context(MockRestoreTarget::ObjectProperty {
-        target,
-        property,
-        original,
-    })
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let target = scope.root_nanbox_f64(target);
+    let property = scope.root_nanbox_f64(property);
+    let implementation = scope.root_nanbox_f64(implementation);
+    let options = scope.root_nanbox_f64(options);
+    let (implementation, options) =
+        normalize_mock_method_args(implementation.get_nanbox_f64(), options.get_nanbox_f64());
+    let implementation = scope.root_nanbox_f64(implementation);
+    let options = parse_mock_method_options(options, false, true);
+    validate_mock_accessor_options(options, "setter");
+    create_setter_mock(
+        target.get_nanbox_f64(),
+        property.get_nanbox_f64(),
+        implementation.get_nanbox_f64(),
+    )
 }
 
 extern "C" fn mock_reset_thunk(_closure: *const ClosureHeader) -> f64 {
@@ -988,6 +1184,7 @@ extern "C" fn mock_reset_thunk(_closure: *const ClosureHeader) -> f64 {
             reset_mock_state_calls(state);
         }
     });
+    property_mock::restore_all();
     undefined_value()
 }
 
@@ -1002,6 +1199,7 @@ extern "C" fn mock_restore_all_thunk(_closure: *const ClosureHeader) -> f64 {
     for id in ids {
         restore_mock_state(id);
     }
+    property_mock::restore_all();
     undefined_value()
 }
 
@@ -1042,23 +1240,19 @@ fn mock_object_value() -> f64 {
         set_field(
             mock,
             "method",
-            closure_value(mock_method_thunk as *const u8, 3),
+            closure_value(mock_method_thunk as *const u8, 4),
         );
         set_field(
             mock,
             "getter",
-            closure_value(mock_getter_thunk as *const u8, 3),
+            closure_value(mock_getter_thunk as *const u8, 4),
         );
         set_field(
             mock,
             "setter",
-            closure_value(mock_setter_thunk as *const u8, 3),
+            closure_value(mock_setter_thunk as *const u8, 4),
         );
-        set_field(
-            mock,
-            "property",
-            closure_value(mock_property_thunk as *const u8, 3),
-        );
+        set_field(mock, "property", property_mock::tracker_property_value());
         set_field(
             mock,
             "reset",
@@ -1128,9 +1322,14 @@ fn test_context_value(name: &str) -> f64 {
     let ctx = js_object_alloc(0, 8);
     let test_fn = closure_value(thunk_test as *const u8, 3);
     let test_fn_ptr = raw_ptr_from_value(test_fn);
-    if test_fn_ptr >= 0x10000 {
-        decorate_test_export(test_fn_ptr as *mut ClosureHeader);
-    }
+    let test_fn = if crate::value::addr_class::is_plausible_heap_addr(test_fn_ptr) {
+        boxed_ptr(decorate_test_export(
+            test_fn_ptr as *mut ClosureHeader,
+            false,
+        ))
+    } else {
+        test_fn
+    };
     set_field(ctx, "name", string_value(name));
     set_field(ctx, "assert", boxed_ptr(assert));
     set_field(ctx, "mock", mock_object_value());
@@ -1475,23 +1674,48 @@ pub extern "C" fn js_node_test_mock_fn(
 }
 
 #[no_mangle]
-pub extern "C" fn js_node_test_mock_method(target: f64, property: f64, implementation: f64) -> f64 {
-    mock_method_thunk(std::ptr::null(), target, property, implementation)
+pub extern "C" fn js_node_test_mock_method(
+    target: f64,
+    property: f64,
+    implementation: f64,
+    options: f64,
+) -> f64 {
+    mock_method_thunk(std::ptr::null(), target, property, implementation, options)
 }
 
 #[no_mangle]
-pub extern "C" fn js_node_test_mock_getter(target: f64, property: f64, implementation: f64) -> f64 {
-    mock_getter_thunk(std::ptr::null(), target, property, implementation)
+pub extern "C" fn js_node_test_mock_getter(
+    target: f64,
+    property: f64,
+    implementation: f64,
+    options: f64,
+) -> f64 {
+    mock_getter_thunk(std::ptr::null(), target, property, implementation, options)
 }
 
 #[no_mangle]
-pub extern "C" fn js_node_test_mock_setter(target: f64, property: f64, implementation: f64) -> f64 {
-    mock_setter_thunk(std::ptr::null(), target, property, implementation)
+pub extern "C" fn js_node_test_mock_setter(
+    target: f64,
+    property: f64,
+    implementation: f64,
+    options: f64,
+) -> f64 {
+    mock_setter_thunk(std::ptr::null(), target, property, implementation, options)
 }
 
 #[no_mangle]
 pub extern "C" fn js_node_test_mock_property(target: f64, property: f64, value: f64) -> f64 {
-    mock_property_thunk(std::ptr::null(), target, property, value)
+    property_mock::create(target, property, true, value)
+}
+
+#[no_mangle]
+pub extern "C" fn js_node_test_mock_property_with_presence(
+    target: f64,
+    property: f64,
+    value: f64,
+    value_present: i32,
+) -> f64 {
+    property_mock::create(target, property, value_present != 0, value)
 }
 
 #[no_mangle]
@@ -1539,23 +1763,32 @@ pub extern "C" fn js_node_test_mock_timers_reset() -> f64 {
     mock_timers_reset(std::ptr::null())
 }
 
-pub(crate) fn decorate_test_export(closure: *mut ClosureHeader) {
-    let owner = closure as usize;
-    crate::closure::closure_set_dynamic_prop(
-        owner,
-        "skip",
-        closure_value(thunk_test_skip as *const u8, 3),
-    );
-    crate::closure::closure_set_dynamic_prop(
-        owner,
-        "todo",
-        closure_value(thunk_test_todo as *const u8, 3),
-    );
-    crate::closure::closure_set_dynamic_prop(
-        owner,
-        "only",
-        closure_value(thunk_test_only as *const u8, 3),
-    );
+pub(crate) fn decorate_test_export(
+    closure: *mut ClosureHeader,
+    include_test_alias: bool,
+) -> *mut ClosureHeader {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let closure_handle = scope.root_raw_mut_ptr(closure);
+    if include_test_alias {
+        crate::closure::closure_set_dynamic_prop(
+            closure_handle.get_raw_mut_ptr::<ClosureHeader>() as usize,
+            "test",
+            boxed_ptr(closure_handle.get_raw_mut_ptr::<ClosureHeader>()),
+        );
+    }
+    for (name, func) in [
+        ("skip", thunk_test_skip as *const u8),
+        ("todo", thunk_test_todo as *const u8),
+        ("only", thunk_test_only as *const u8),
+    ] {
+        let method = scope.root_nanbox_f64(closure_value(func, 3));
+        crate::closure::closure_set_dynamic_prop(
+            closure_handle.get_raw_mut_ptr::<ClosureHeader>() as usize,
+            name,
+            method.get_nanbox_f64(),
+        );
+    }
+    closure_handle.get_raw_mut_ptr()
 }
 
 pub(crate) fn test_special_export_value(name: &str) -> Option<f64> {
@@ -1589,7 +1822,7 @@ pub(crate) fn scan_test_module_roots_mut(visitor: &mut crate::gc::RuntimeRootVis
             visitor.visit_nanbox_f64_slot(&mut state.calls);
             visitor.visit_nanbox_f64_slot(&mut state.context);
             visitor.visit_nanbox_f64_slot(&mut state.function);
-            for implementation in state.once.iter_mut() {
+            for (_, implementation) in state.once.iter_mut() {
                 visitor.visit_nanbox_f64_slot(implementation);
             }
             if let MockRestoreTarget::ObjectProperty {
@@ -1601,7 +1834,16 @@ pub(crate) fn scan_test_module_roots_mut(visitor: &mut crate::gc::RuntimeRootVis
             }
         }
     });
+    property_mock::scan_roots_mut(visitor);
 }
+
+#[cfg(test)]
+#[path = "test_unit_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "test_once_unit_tests.rs"]
+mod once_tests;
 
 fn reporter_with_kind(kind: i32, source: f64) -> f64 {
     if JSValue::from_bits(source.to_bits()).is_undefined() {
@@ -1610,11 +1852,6 @@ fn reporter_with_kind(kind: i32, source: f64) -> f64 {
     let events = collect_event_values(source);
     let output = format_reporter_events(kind, &events);
     readable_from_text(output)
-}
-
-pub(crate) extern "C" fn thunk_reporter(closure: *const ClosureHeader, source: f64) -> f64 {
-    let kind = js_closure_get_capture_f64(closure, 0) as i32;
-    reporter_with_kind(kind, source)
 }
 
 pub(crate) extern "C" fn thunk_reporter_spec(_closure: *const ClosureHeader, source: f64) -> f64 {

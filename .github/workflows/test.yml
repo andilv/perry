@@ -147,6 +147,15 @@ jobs:
       - name: File size limit
         run: ./scripts/check_file_size.sh
 
+      # Well-known binding provenance pins: every third-party binding in
+      # well_known_bindings.toml must carry an [bindings.<name>.upstream]
+      # pin, and the lock-step rule (ported-at == version) must hold, so a
+      # pin bump can't outrun the wrapper review it demands. Offline/CI-safe
+      # (no network); the weekly update runs `--check --refresh` to surface
+      # newly-soaked upstream releases as advisories.
+      - name: Binding upstream pins (lock-step)
+        run: node scripts/binding_pins.mjs --check
+
       # GC write-barrier store-site inventory: every raw heap-slot store in
       # perry-codegen / perry-runtime / perry-stdlib must be barriered or
       # carry a justified GC_STORE_AUDIT(...) marker (or a justified entry
@@ -168,6 +177,15 @@ jobs:
         run: |
           python3 scripts/addr_class_inventory.py --self-test
           python3 scripts/addr_class_inventory.py
+
+      # The gap-suite ratchet decides whether conformance-smoke goes red, so
+      # its own logic is unit-checked on the cheap job rather than only being
+      # exercised 8 shards deep.
+      - name: Gap snapshot checker self-test
+        run: python3 scripts/gap_snapshot.py --self-test
+
+      - name: Platform-aware parity allowlist self-test
+        run: python3 scripts/parity_known_failures.py --self-test
 
   # ---------------------------------------------------------------------------
   # Clippy — enforces the deny-level lints in [workspace.lints] (root
@@ -228,6 +246,73 @@ jobs:
               cargo_args+=(--exclude "$package")
             done
             cargo clippy "${cargo_args[@]}"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # rustc warnings gate
+  #
+  # `cargo check` with `-D warnings`, so a PR cannot add a rustc warning. This
+  # is deliberately separate from the clippy job above: clippy's own warn-level
+  # lints are informational here, while rustc's are not.
+  #
+  # Both legs are needed because they compile different code. `perry` depends on
+  # perry-runtime with `default-features = false`, so the product leg sees a
+  # runtime with regex-engine, diagnostics and temporal off, where items the
+  # workspace leg finds live are dead. The workspace leg passes `--all-targets`
+  # so test and bench targets count too — without it, test-only code drifts.
+  #
+  # perry-ui-macos is in the excluded scope (this runs on ubuntu), so its
+  # warnings are not gated here.
+  # ---------------------------------------------------------------------------
+  rustc-warnings:
+    name: Warnings (${{ matrix.scope }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        scope: [product, host-compatible]
+    env:
+      RUSTFLAGS: -D warnings
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "false"
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      SCCACHE_CACHE_SIZE: "12G"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Cache sccache objects
+        uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: sccache-${{ runner.os }}-perry-${{ github.job }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-${{ runner.os }}-perry-
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "${{ runner.os }}-perry"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Check for rustc warnings
+        run: |
+          if [[ "${{ matrix.scope }}" == "product" ]]; then
+            cargo check -p perry --bins
+          else
+            mapfile -t excluded < <(python3 scripts/workspace_architecture.py \
+              --print-excluded-scope host-compatible)
+            cargo_args=(--workspace --all-targets)
+            for package in "${excluded[@]}"; do
+              cargo_args+=(--exclude "$package")
+            done
+            cargo check "${cargo_args[@]}"
           fi
 
   # ---------------------------------------------------------------------------
@@ -729,6 +814,11 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "${{ runner.os }}-perry"
@@ -737,10 +827,61 @@ jobs:
       # perry-dev (see Cargo.toml [profile.perry-dev]) trades peak optimization
       # for build speed. The package set covers the compiler binary (link
       # gate), the runtime/stdlib pair (the usual source of cfg(windows)
-      # externs), and both Windows UI crates — the ones cargo-test's ubuntu
+      # externs), their static-library wrappers (used by the parity smoke
+      # below), and both Windows UI crates — the ones cargo-test's ubuntu
       # runner must exclude and therefore never compiles.
       - name: Build compiler + runtime + Windows UI crates (perry-dev)
-        run: cargo build --profile perry-dev -p perry -p perry-runtime -p perry-stdlib -p perry-ui-windows -p perry-ui-windows-winui
+        run: cargo build --profile perry-dev -p perry -p perry-runtime -p perry-stdlib -p perry-runtime-static -p perry-stdlib-static -p perry-ui-windows -p perry-ui-windows-winui
+
+      # Small deterministic subset: verifies the Git Bash driver itself,
+      # `.exe`/`.lib` discovery, native TEMP paths, compilation, execution,
+      # and Node/Perry comparison on a real Windows host.
+      - name: Windows parity harness smoke
+        shell: bash
+        run: |
+          PERRY_SKIP_BUILD=1 \
+          PERRY_BIN="$PWD/target/perry-dev/perry.exe" \
+          PERRY_RUNTIME_DIR="$PWD/target/perry-dev" \
+          ./run_parity_tests.sh \
+            --suite node-suite \
+            --module process \
+            --filter process/env/access
+
+      - name: Verify perry.exe VERSIONINFO resource
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binary = 'target/perry-dev/perry.exe'
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $expectedVersion = ($metadata.packages | Where-Object name -eq 'perry').version
+          $version = (Get-Item $binary).VersionInfo
+
+          $expectedFields = @{
+            CompanyName      = 'PerryTS'
+            FileDescription  = 'Perry native TypeScript compiler'
+            OriginalFilename = 'perry.exe'
+            ProductName      = 'Perry'
+          }
+          foreach ($field in $expectedFields.Keys) {
+            if ($version.$field -ne $expectedFields[$field]) {
+              throw "$field missing or incorrect in ${binary}: '$($version.$field)'"
+            }
+          }
+          if (-not $version.FileVersion.StartsWith($expectedVersion) -or
+              -not $version.ProductVersion.StartsWith($expectedVersion)) {
+            throw "VERSIONINFO does not match Cargo version $expectedVersion (file=$($version.FileVersion), product=$($version.ProductVersion))"
+          }
+
+      - name: Test COFF duplicate-symbol archive trimming
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --profile perry-dev -p perry --bin perry \
+            coff_archive_dedup_drops_only_fully_provided_members 2>&1 | tee test-output.log
+          grep -q 'test result: ok. 1 passed; 0 failed' test-output.log || {
+            echo "::error::expected COFF dedup test did not run exactly once"
+            exit 1
+          }
 
   # ---------------------------------------------------------------------------
   # GC write-barrier stress (optional / non-blocking)
@@ -752,18 +893,34 @@ jobs:
   # poor fit for the blocking per-PR `cargo-test` gate (one flake blocked
   # every unrelated PR). They are `#[ignore]`d there and run here instead.
   #
-  # Opt-in + informational: `continue-on-error` so a flake never fails the
-  # workflow; triggered by the `run-extended-tests` PR label, a
-  # `workflow_dispatch` with `run_extended_tests=true`, or a tag push.
+  # The write-barrier stress tests stay opt-in + informational
+  # (`continue-on-error` on THEIR step, so a flake never fails the workflow).
+  #
+  # The job itself is no longer informational. It also runs the GC x
+  # representation-selection stress matrix (`scripts/gc_repsel_matrix.sh`),
+  # which IS a gate: until it existed, a representation could regress GC
+  # correctness and no CI job would say a word. Three weaknesses were fixed
+  # deliberately, and re-introducing any of them re-opens that hole:
+  #   1. job-level `continue-on-error: true` is gone (a gate that cannot fail
+  #      is not a gate); it now sits on the legacy write-barrier step only;
+  #   2. the `if:` no longer requires a `run-extended-tests` label, which is
+  #      why this job "skipped" on the representation PRs (#6911, #6925);
+  #   3. it no longer runs write-barrier stress *only* — nothing about the
+  #      representation corpus was covered before.
+  #
+  # Cost split: a PR runs the 4-arm subset, whose arms all share one
+  # compile-time environment, so the corpus is compiled ONCE and run four
+  # times. push / workflow_dispatch run the full arm list (19 arms, 9 compile
+  # groups) as the deeper net. NOTE: this job is not yet in branch protection's
+  # required contexts — adding it there is what makes the gate blocking.
   # ---------------------------------------------------------------------------
   gc-stress:
-    continue-on-error: true
     if: >-
       github.event_name == 'push' ||
-      (github.event_name == 'workflow_dispatch' && inputs.run_extended_tests) ||
-      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-extended-tests'))
+      github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
 
@@ -780,12 +937,53 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          # Single source of truth: .node-version at the repo root. Node is the
+          # matrix oracle (we byte-diff against it), so the version is a
+          # correctness input. scripts/gc_repsel_matrix.sh refuses to run when
+          # the running node disagrees with the pin — a test the oracle cannot
+          # run would drop out of the gate silently.
+          node-version-file: .node-version
+
+      - name: Build perry + runtime staticlibs (release)
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C linker-features=-lld"
+        run: |
+          cargo build --release \
+            -p perry -p perry-runtime -p perry-stdlib \
+            -p perry-runtime-static -p perry-stdlib-static
+
+      # GATING. Fails the job on any new untriaged red cell. Cells whose GC arm
+      # was measurably inert are reported UNVERIFIED, never green (#6942,
+      # #6946, #6950) — the script asserts liveness from the collector's own
+      # PERRY_GC_TRACE / PERRY_GC_DIAG output rather than trusting the env var.
+      - name: GC x representation-selection matrix (PR subset)
+        if: github.event_name == 'pull_request'
+        run: ./scripts/gc_repsel_matrix.sh --no-build --arms pr --json gc-repsel-matrix.json
+
+      - name: GC x representation-selection matrix (full)
+        if: github.event_name != 'pull_request'
+        run: ./scripts/gc_repsel_matrix.sh --no-build --arms all --json gc-repsel-matrix.json
+
       - name: Run GC write-barrier stress tests
+        # Informational: these are ~200s nondeterministic corruption-window
+        # hunts (#5029). Kept out of the gate so a flake never blocks a PR.
+        continue-on-error: true
         env:
           # Match the cargo-test gate's linker workaround (lld SIGBUS on the
           # shared runner during large test links).
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C linker-features=-lld"
         run: cargo test -p perry --test gc_write_barrier_stress -- --ignored
+
+      - name: Upload matrix report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gc-repsel-matrix
+          path: gc-repsel-matrix.json
+          if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
   # Compiler-output regression gate
@@ -938,6 +1136,150 @@ jobs:
         with:
           name: compiler-output-regression
           path: target/compiler-output-regression/
+
+  # ---------------------------------------------------------------------------
+  # Representation-selection promotion census (#7106)
+  #
+  # Counts, per workload and PER REPRESENTATION, how many values got each
+  # unboxed representation, and compares each count against a ratcheted floor
+  # (benchmarks/repsel_census/baseline.json).
+  #
+  # Why this job exists: #7034 discovered by hand-instrumenting the compiler
+  # that `Ptr<Shape>` promotes NOTHING on `batch.ts` — the object-heavy
+  # workload it exists for — and that only 3 of 17 suite benchmarks promote a
+  # single shape local each. Nothing in CI could have told anyone that.
+  #
+  # What it counts is CONSUMPTION, not selection. An analysis proving a value
+  # and codegen emitting something for it are different events, and #7107 found
+  # by reading IR that `batch.ts` proves two `Ptr<Shape>` values and applies
+  # one: `totals` is proven, reported as a win, and keeps the guarded diamond at
+  # every access site. `07_object_create` and `12_binary_trees` are worse -- they
+  # report a promotion each while `PERRY_PTR_SHAPE_LOCALS=0` produces a
+  # byte-identical object. So `ptr-shape` and `ptr-shape-consumed` are separate
+  # columns with separate floors, and every unconsumed promotion must name the
+  # mechanism that ate it (#7109 / #7115).
+  #
+  # Why it can fail (CLAUDE.md, "Four ways a gate can be unable to fail"):
+  # floors alone would not be enough, because the honest floor for
+  # `Ptr<Shape>` on real code is zero today and a zero floor can never go red.
+  # The corpus therefore includes hand-written liveness fixtures whose
+  # minimums live in `scripts/compiler_output_harness/repsel_census.py`, NOT in
+  # the regenerable baseline, plus a corpus-wide assertion that no census key
+  # reads zero everywhere. Verified by sabotage in both directions: each of
+  # PERRY_PTR_SHAPE_LOCALS / PERRY_PTR_NUMARRAY_LOCALS /
+  # PERRY_CANONICAL_I32_LOCALS / PERRY_CANONICAL_STR_LOCALS /
+  # PERRY_INT_VALUED_LOCALS set to 0 turns this job red; the default build is
+  # green.
+  #
+  # DELIBERATELY NOT a required status check on its first landing — a gate
+  # that has never been green would block every open PR. Promoting it is a
+  # follow-up, and CLAUDE.md failure mode (2) is what happens if that
+  # follow-up is skipped.
+  # ---------------------------------------------------------------------------
+  repsel-census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "false"
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      SCCACHE_CACHE_SIZE: "12G"
+      CARGO_INCREMENTAL: "0"
+      # The census only needs codegen (`--no-link`), never a linked binary, so
+      # it cannot be fooled by a stale libperry_runtime.a. Auto-optimize is off
+      # because it rebuilds runtime libs the census never links.
+      PERRY_NO_AUTO_OPTIMIZE: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Cache sccache objects
+        uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: sccache-${{ runner.os }}-perry-${{ github.job }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-${{ runner.os }}-perry-
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "${{ runner.os }}-perry"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Verdict logic first, cheaply: if the census can't tell a regression
+      # from a pass, the compile-based run below is not worth the minutes.
+      - name: Census verdict self-test
+        run: |
+          python3 scripts/compiler_output_regression.py census-self-test
+          python3 -m unittest tests.test_repsel_census
+
+      - name: Build compiler
+        run: cargo build -p perry
+
+      - name: Promotion census
+        run: |
+          python3 scripts/compiler_output_regression.py census \
+            --perry target/debug/perry \
+            --keep-reports target/repsel-census/reports \
+            --gate
+
+      # Prove the gate's subject was live: with `Ptr<Shape>` selection
+      # disabled the census MUST go red. A census that reports zero and exits
+      # green is worth nothing, and this step is what stops that from being
+      # possible. `!` because a green run here is the failure.
+      - name: Sabotage check (the gate must be able to fail)
+        run: |
+          set +e
+          out="$(python3 scripts/compiler_output_regression.py census \
+            --perry target/debug/perry \
+            --env PERRY_PTR_SHAPE_LOCALS=0 \
+            --gate 2>&1)"
+          status=$?
+          set -e
+          printf '%s\n' "$out"
+          # Exit 1 is the gate's verdict; exit 2 is a harness error (a compile
+          # that fell over, a schema mismatch). Only the former proves the
+          # census observed the sabotage, so insist on the code AND the reason.
+          if [ "$status" -ne 1 ]; then
+            echo "::error::Sabotage run exited $status, expected 1 (a gate verdict)."
+            echo "::error::Exit 0 means the census cannot see Ptr<Shape> promotion at all."
+            exit 1
+          fi
+          if ! printf '%s' "$out" | grep -q "fixture_ptr_shape: ptr-shape promoted 0"; then
+            echo "::error::Sabotage run failed for some reason OTHER than the"
+            echo "::error::ptr-shape fixture losing its promotion. The gate is red,"
+            echo "::error::but not for the reason that proves its subject was live."
+            exit 1
+          fi
+          # The consumed column is a SEPARATE counter fed from separate codegen
+          # sites, so it needs its own liveness assertion. A `ptr-shape-consumed`
+          # that stayed at its floor while `ptr-shape` went to zero would be a
+          # number disconnected from the compiler -- and it is the column the
+          # performance claims now rest on.
+          if ! printf '%s' "$out" | grep -q "fixture_ptr_shape: ptr-shape-consumed promoted 0"; then
+            echo "::error::ptr-shape went to zero but ptr-shape-consumed did not."
+            echo "::error::The consumption counter is not tracking the compiler."
+            exit 1
+          fi
+          if ! printf '%s' "$out" | grep -q "CONSUMPTION SITE NEVER EXERCISED"; then
+            echo "::error::No consumption site went dark with Ptr<Shape> disabled."
+            echo "::error::The per-site coverage gate is not tracking the compiler:"
+            echo "::error::two of the six recorders had never fired before it existed."
+            exit 1
+          fi
+          echo "Census correctly went red with PERRY_PTR_SHAPE_LOCALS=0."
+
+      - name: Upload census reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: repsel-census
+          path: target/repsel-census/
 
   # ---------------------------------------------------------------------------
   # Native ABI evidence packet
@@ -1181,44 +1523,10 @@ jobs:
           exit "$status"
 
       - name: Check for new failures
-        run: |
-          REPORT="test-parity/reports/latest.json"
-          KNOWN="test-parity/known_failures.json"
-
-          # Filter empty strings — `run_parity_tests.sh` emits `compile: [""]`
-          # when there are zero compile failures (a printf+sed quirk in the
-          # JSON generator), and that empty entry would propagate to a
-          # spurious "NEW FAILURES:  - " line and fail this gate.
-          jq -r '(.failures.parity // []) + (.failures.compile // []) | .[] | select(. != "")' "$REPORT" | sort -u > /tmp/all_fails.txt
-          if [[ -f "$KNOWN" ]]; then
-            # Issue #797 — known_failures.json moved from flat strings to
-            # structured records. Keep the audit metadata (the `_schema`
-            # key at the top of the file) out of the test-name set so
-            # CI doesn't try to match a real test against it.
-            jq -r 'keys[] | select(. != "_schema")' "$KNOWN" | sort -u > /tmp/known.txt
-
-            # Schema sanity check — every non-_schema entry must be an
-            # object with non-empty `category` and `reason`. Fails the
-            # build on malformed entries so the format doesn't silently
-            # drift back to the legacy flat-string shape.
-            bad="$(jq -r 'to_entries | map(select(.key != "_schema")) | .[] | select((.value | type) != "object" or (.value.category // "") == "" or (.value.reason // "") == "") | .key' "$KNOWN")"
-            if [[ -n "$bad" ]]; then
-              echo "Malformed known_failures.json entries (missing category/reason or not an object):"
-              echo "$bad" | sed 's/^/  - /'
-              exit 1
-            fi
-          else
-            : > /tmp/known.txt
-          fi
-
-          TOTAL=$(wc -l < /tmp/all_fails.txt | tr -d ' ')
-          comm -23 /tmp/all_fails.txt /tmp/known.txt > /tmp/new.txt
-          if [[ -s /tmp/new.txt ]]; then
-            echo "NEW FAILURES (not in known_failures.json):"
-            sed 's/^/  - /' /tmp/new.txt
-            exit 1
-          fi
-          echo "All ${TOTAL} failures are known/triaged."
+        run: >-
+          python3 scripts/parity_known_failures.py
+          --report test-parity/reports/latest.json
+          --known test-parity/known_failures.json
 
       - name: Generate parity matrix trend
         run: |
@@ -1896,9 +2204,8 @@ jobs:
   # demand. PR authors and maintainers can both apply labels.
   # ---------------------------------------------------------------------------
   doc-tests:
-    # Release-publish decoupling (see `parity` above): aspirational extended
-    # suite, informational only — does not block package publishing.
-    continue-on-error: true
+    # Blocking host runs and the portable cross-compile subset gate the job.
+    # Known platform-tail failures remain advisory at their individual steps.
     if: >-
       github.event_name == 'push' ||
       (github.event_name == 'workflow_dispatch' && inputs.run_extended_tests) ||
@@ -1913,7 +2220,7 @@ jobs:
             # stdlib/http/snippets.ts excluded since v0.5.886: it links
             # against js_axios_response_data_parsed +
             # js_node_http2_create_secure_server which live in
-            # perry-ext-axios / perry-ext-http-server. v0.5.885's
+            # perry-ext-axios / perry-ext-http. v0.5.885's
             # PERRY_NO_AUTO_OPTIMIZE skips the well-known-binding probe
             # that would route those .a files into the link surface.
             # Proper fix: hoist well-known-binding lookup out of
@@ -1952,20 +2259,22 @@ jobs:
           #   cmd_xcompile_blocking: "./scripts/run_doc_tests.sh --verbose --xcompile-only --xcompile-only-target=web --xcompile-only-target=wasm --xcompile-only-target=ios-simulator"
           #   cmd_xcompile_advisory: "./scripts/run_doc_tests.sh --verbose --xcompile-only"
           #   gallery_advisory: false
-          # windows-2022 doc-tests for perry-ui-windows temporarily disabled:
-          # 30+ doc-test snippets COMPILE_FAIL on the Windows runner with
-          # perry exit 1 (mix of platform-banner gaps and #463-unimplemented
-          # node:* surface). Tracked separately; re-enable once the snippet
-          # set + perry-ui-windows compile paths are reconciled. macOS
-          # doc-tests still gate the release.
-          # - os: windows-2022
-          #   ui_backend: perry-ui-windows
-          #   shell: pwsh
-          #   cmd_exclude_gallery: "./scripts/run_doc_tests.ps1 --verbose --skip-xcompile --filter-exclude ui/gallery.ts"
-          #   cmd_gallery: "./scripts/run_doc_tests.ps1 --verbose --skip-xcompile --filter ui/gallery.ts"
-          #   cmd_xcompile_blocking: "./scripts/run_doc_tests.ps1 --verbose --xcompile-only --xcompile-only-target=web --xcompile-only-target=wasm --xcompile-only-target=ios-simulator"
-          #   cmd_xcompile_advisory: "./scripts/run_doc_tests.ps1 --verbose --xcompile-only"
-          #   gallery_advisory: false
+          # Re-enabled for #6624. The old 30+ COMPILE_FAIL cluster was mostly
+          # one staticlib-boundary link gap: WinHTTP + SHCreateMemStream import
+          # metadata did not reach Perry's final MSVC link. The compiler now
+          # supplies winhttp.lib + shlwapi.lib explicitly, while later API
+          # work closed the stale #463/WebView failures from that run.
+          - os: windows-2022
+            ui_backend: perry-ui-windows
+            shell: pwsh
+            # The well-known HTTP aggregate remains excluded on every host
+            # while its no-auto ext-archive routing issue is tracked.
+            cmd_exclude_gallery: "./scripts/run_doc_tests.ps1 --verbose --skip-xcompile --filter-exclude ui/gallery.ts --filter-exclude stdlib/http/snippets.ts"
+            cmd_gallery: "./scripts/run_doc_tests.ps1 --verbose --skip-xcompile --filter ui/gallery.ts"
+            cmd_xcompile_blocking: "./scripts/run_doc_tests.ps1 --verbose --xcompile-only --xcompile-only-target=web --xcompile-only-target=wasm"
+            cmd_xcompile_advisory: "./scripts/run_doc_tests.ps1 --verbose --xcompile-only"
+            # Baseline captured from run #24735151417 (900x788).
+            gallery_advisory: false
     runs-on: ${{ matrix.os }}
     defaults:
       run:

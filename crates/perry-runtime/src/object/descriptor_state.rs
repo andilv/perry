@@ -285,6 +285,15 @@ pub(crate) fn object_proto_descriptors_in_use() -> bool {
 /// has an own property for THIS key; an absent key cannot be intercepted, so the
 /// fast path stays safe even while unrelated descriptors exist on the prototype.
 pub(crate) fn object_proto_may_intercept_key(key: f64) -> bool {
+    // #6828: `%Object.prototype%` always owns the Annex-B `__proto__`
+    // accessor, even though Perry implements that intrinsic in the ordinary
+    // [[Set]] walk rather than materializing a closure-backed descriptor.
+    // Treat it as an interceptor so the plain-object direct-store lane cannot
+    // create an own enumerable `"__proto__"` property before the walk gets a
+    // chance to invoke the intrinsic setter.
+    if unsafe { reflect_support::key_to_rust_string(key) }.as_deref() == Some("__proto__") {
+        return true;
+    }
     if !object_proto_descriptors_in_use() {
         return false;
     }
@@ -730,7 +739,17 @@ pub(crate) fn reflect_getter_closure_bits(value: f64, key: f64) -> Option<u64> {
     if !state().descriptors.accessors_in_use.get() {
         return None;
     }
-    let key_str = crate::builtins::js_string_coerce(key);
+    // #6943: `js_string_coerce` allocates for every non-heap-string key and can
+    // run a user `toString` / `valueOf` for an object key, so it can trigger a
+    // GC that **evacuates**. `value` (the prototype-chain walk's starting
+    // receiver, dereferenced by `extract_obj_ptr` below) and `key` (re-read at
+    // the own-property shadow check inside the loop) were raw Rust locals
+    // across it. Both stay rooted for the walk.
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let value_handle = scope.root_heap_word_u64(value.to_bits());
+    let key_handle = scope.root_nanbox_f64(key);
+    let key_str = crate::builtins::js_string_coerce(key_handle.get_nanbox_f64());
+    let value = f64::from_bits(value_handle.get_heap_word_u64());
     if key_str.is_null() {
         return None;
     }
@@ -749,10 +768,14 @@ pub(crate) fn reflect_getter_closure_bits(value: f64, key: f64) -> Option<u64> {
     // some level shadows inherited accessors, so stop the walk there and let
     // the caller fall back to an ordinary (receiver-aware) field read. (test262
     // Reflect/get/return-value-from-receiver: inherited-getter-via-receiver.)
-    let mut current = value;
+    // `current` walks the chain through its own handle: `obj_value_has_own_key`
+    // and `js_object_get_prototype_of` both allocate, so the link a raw local
+    // held could be evacuated out from under the next iteration (#6943).
+    let current_handle = scope.root_heap_word_u64(value.to_bits());
     // Bounded to guard against a cyclic prototype side-table; real chains are
     // a handful of links deep.
     for _ in 0..10_000 {
+        let current = f64::from_bits(current_handle.get_heap_word_u64());
         let obj = unsafe { extract_obj_ptr(current) };
         if obj.is_null() {
             return None;
@@ -768,14 +791,15 @@ pub(crate) fn reflect_getter_closure_bits(value: f64, key: f64) -> Option<u64> {
             };
         }
         // An own (data) property at this level shadows any inherited accessor.
-        if obj_value_has_own_key(current, key) {
+        if obj_value_has_own_key(current, key_handle.get_nanbox_f64()) {
             return None;
         }
+        let current = f64::from_bits(current_handle.get_heap_word_u64());
         let proto = crate::object::js_object_get_prototype_of(current);
         if unsafe { extract_obj_ptr(proto) }.is_null() {
             return None;
         }
-        current = proto;
+        current_handle.set_heap_word_u64(proto.to_bits());
     }
     None
 }

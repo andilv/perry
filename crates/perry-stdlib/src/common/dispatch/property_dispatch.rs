@@ -36,16 +36,6 @@ pub unsafe extern "C" fn js_handle_property_dispatch(
         return value;
     }
 
-    #[cfg(feature = "http-client")]
-    if let Some(value) = crate::http::dispatch_agent_property(handle, property_name) {
-        return value;
-    }
-
-    #[cfg(feature = "http-client")]
-    if let Some(value) = crate::http::dispatch_client_request_property(handle, property_name) {
-        return value;
-    }
-
     #[cfg(all(feature = "tls", not(target_os = "ios"), not(target_os = "android")))]
     if let Some(value) = crate::tls::dispatch_tls_property(handle, property_name) {
         return value;
@@ -76,7 +66,7 @@ pub unsafe extern "C" fn js_handle_property_dispatch(
     // "function". The actual call dispatch is HANDLE_METHOD_DISPATCH
     // (above), but feature-checks read through the property table — we
     // bind a closure here so the typeof short-circuit sees "function".
-    #[cfg(feature = "compression")]
+    #[cfg(feature = "compression-gzip")]
     if crate::zlib::is_zlib_stream_handle(handle) {
         if property_name == "bytesWritten" {
             return crate::zlib::zlib_stream_bytes_written(handle);

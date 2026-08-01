@@ -43,6 +43,52 @@ pub extern "C" fn js_typed_array_get(ta: *const TypedArrayHeader, index: i32) ->
     }
 }
 
+/// Read the exact raw lane bits of a BigInt64Array/BigUint64Array element.
+///
+/// Cross-crate structured-clone snapshots use this instead of
+/// `js_typed_array_get`, whose JS-facing result is a freshly allocated
+/// NaN-boxed BigInt pointer. Returning the stored lane avoids retaining a
+/// transient heap pointer and preserves all 64 bits.
+pub fn bigint_lane_bits(ta: *const TypedArrayHeader, index: i32) -> Option<u64> {
+    let ta = clean_ta_ptr(ta);
+    if ta.is_null() || index < 0 {
+        return None;
+    }
+    unsafe {
+        if crate::native_arena::is_native_typed_view(ta) {
+            crate::native_arena::validate_view_alive(
+                crate::native_arena::native_view_from_typed_array(ta),
+            );
+        }
+        if index as u32 >= (*ta).length || !matches!((*ta).kind, KIND_BIGINT64 | KIND_BIGUINT64) {
+            return None;
+        }
+        let slot = data_ptr(ta).add(index as usize * (*ta).elem_size as usize);
+        Some(*(slot as *const u64))
+    }
+}
+
+/// Restore one exact raw BigInt64Array/BigUint64Array lane.
+pub fn set_bigint_lane_bits(ta: *mut TypedArrayHeader, index: i32, bits: u64) -> bool {
+    let ta = clean_ta_ptr(ta) as *mut TypedArrayHeader;
+    if ta.is_null() || index < 0 {
+        return false;
+    }
+    unsafe {
+        if crate::native_arena::is_native_typed_view(ta as *const TypedArrayHeader) {
+            crate::native_arena::validate_view_alive(
+                crate::native_arena::native_view_from_typed_array(ta as *const TypedArrayHeader),
+            );
+        }
+        if index as u32 >= (*ta).length || !matches!((*ta).kind, KIND_BIGINT64 | KIND_BIGUINT64) {
+            return false;
+        }
+        let slot = data_ptr(ta).add(index as usize * (*ta).elem_size as usize);
+        *(slot as *mut u64) = bits;
+        true
+    }
+}
+
 /// Cold fallback for the codegen inline **checked i32** typed-array element read
 /// (integer-kind receivers reached through an erased / typed parameter — e.g.
 /// `function f(S: Int32Array){ return S[i] | 0 }`). The inline path serves the
@@ -86,8 +132,9 @@ pub extern "C" fn js_typed_array_read_int32(ta: *const TypedArrayHeader, index: 
 // Codegen-only export: the inline checked-i32 read emits the call in
 // `perry-codegen/src/expr/i32_fast_path.rs`; a whole-program bitcode link is
 // otherwise free to internalize and dead-strip it (it has no internal Rust
-// caller). The `#[cfg_attr(feature = "keepalive-anchors", used)]` anchor pins it, mirroring the getter above.
-#[cfg_attr(feature = "keepalive-anchors", used)]
+// caller). The `#[used]` anchor pins it, mirroring the getter above.
+#[cfg(feature = "keepalive-anchors")]
+#[used]
 static KEEP_JS_TYPED_ARRAY_READ_INT32: extern "C" fn(*const TypedArrayHeader, i32) -> i32 =
     js_typed_array_read_int32;
 
@@ -120,7 +167,8 @@ pub extern "C" fn js_typed_array_read_f64(ta: *const TypedArrayHeader, index: i3
 }
 
 // Codegen-only export (see the i32 sibling above): pin under whole-program LTO.
-#[cfg_attr(feature = "keepalive-anchors", used)]
+#[cfg(feature = "keepalive-anchors")]
+#[used]
 static KEEP_JS_TYPED_ARRAY_READ_F64: extern "C" fn(*const TypedArrayHeader, i32) -> f64 =
     js_typed_array_read_f64;
 
@@ -149,8 +197,9 @@ pub extern "C" fn js_typed_array_index_get_dynamic(ta: *const TypedArrayHeader, 
 // `js_dyn_index_get`, this export has zero internal Rust callers — it is only
 // invoked from generated LLVM IR (codegen emits the call in
 // `perry-codegen/src/expr/index_get.rs`), so a whole-program bitcode link is
-// free to internalize and dead-strip it. The `#[cfg_attr(feature = "keepalive-anchors", used)]` anchor pins it.
-#[cfg_attr(feature = "keepalive-anchors", used)]
+// free to internalize and dead-strip it. The `#[used]` anchor pins it.
+#[cfg(feature = "keepalive-anchors")]
+#[used]
 static KEEP_JS_TYPED_ARRAY_INDEX_GET_DYNAMIC: extern "C" fn(*const TypedArrayHeader, f64) -> f64 =
     js_typed_array_index_get_dynamic;
 
@@ -561,7 +610,8 @@ pub extern "C" fn js_uint8array_index_get_value(
 // #6088: force-keep the JS-value Uint8Array index getter under LTO /
 // auto-optimize — it has zero internal Rust callers (codegen emits the only
 // call), so a whole-program bitcode link is otherwise free to dead-strip it.
-#[cfg_attr(feature = "keepalive-anchors", used)]
+#[cfg(feature = "keepalive-anchors")]
+#[used]
 static KEEP_JS_UINT8ARRAY_INDEX_GET_VALUE: extern "C" fn(*const TypedArrayHeader, i32) -> f64 =
     js_uint8array_index_get_value;
 

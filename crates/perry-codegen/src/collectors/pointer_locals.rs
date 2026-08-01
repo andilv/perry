@@ -181,6 +181,31 @@ impl HirTypeFacts for PointerAnalysisFacts<'_> {
     }
 }
 
+/// Types that can NEVER hold a heap pointer, and therefore cost a local its
+/// shadow-stack slot in [`collect_pointer_typed_locals`].
+///
+/// **This is the single definition.** It used to be a nested `fn` inside
+/// `collect_pointer_typed_locals`; it is module-level and `pub(crate)` because
+/// anything that decides a value may be treated as a rooted pointer has to
+/// agree with the pass that actually assigns the root slot. A second copy
+/// drifting by one `Type` variant would mean a value this collector left
+/// unrooted while another pass treated it as a live, movable pointer — a
+/// use-after-move under the evacuating minor (#7019), not a cosmetic
+/// inconsistency. `collectors/ptr_shape_returns.rs` (#7034 §4) is the current
+/// second caller.
+pub(crate) fn is_definitely_non_pointer_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Number
+            | Type::Int32
+            | Type::Boolean
+            | Type::Null
+            | Type::Void
+            | Type::Never
+            | Type::Symbol
+    ) || matches!(ty, Type::Union(variants) if variants.iter().all(is_definitely_non_pointer_type))
+}
+
 pub fn collect_pointer_typed_locals(
     params: &[perry_hir::Param],
     stmts: &[perry_hir::Stmt],
@@ -191,29 +216,35 @@ pub fn collect_pointer_typed_locals(
         matches!(
             ty,
             Type::String
+                // A string-LITERAL type (`"foo"`, or a `"a" | "b"` discriminant
+                // union member) is a heap String at runtime — it needs a root
+                // slot exactly like `Type::String`, or the moving-GC precise scan
+                // reaps a live string → silent corruption.
+                | Type::StringLiteral(_)
                 | Type::Array(_)
                 | Type::Tuple(_)
                 | Type::Object(_)
                 | Type::Named(_)
+                // An unresolved generic type parameter (`T`) can bind to any
+                // heap type; treat it as a pointer (fail-safe).
+                | Type::TypeVar(_)
                 | Type::Promise(_)
                 | Type::Function(_)
+                // A generic instantiation (`Map<K,V>`, `Set<T>`, `WeakMap`,
+                // `Box<T>`, `Array<T>`, a user generic class, …) is always a
+                // heap-reference type. Without this, a `Map`/`Set`-typed local
+                // got NO shadow-stack slot, so the PRECISE moving-GC root scan
+                // never saw it — the object was reaped as dead while still live
+                // (crash: "grown Map must retain its side-allocation owner
+                // record"). The non-moving default GC hid this via its
+                // conservative C-stack scan. Treating a rare non-pointer generic
+                // value as a root is harmless: the GC decode rejects any slot
+                // value that isn't a live heap pointer.
+                | Type::Generic { .. }
                 | Type::BigInt
                 | Type::Any
                 | Type::Unknown
         ) || matches!(ty, Type::Union(variants) if variants.iter().any(is_ptr_typed))
-    }
-
-    fn is_definitely_non_pointer_type(ty: &Type) -> bool {
-        matches!(
-            ty,
-            Type::Number
-                | Type::Int32
-                | Type::Boolean
-                | Type::Null
-                | Type::Void
-                | Type::Never
-                | Type::Symbol
-        ) || matches!(ty, Type::Union(variants) if variants.iter().all(is_definitely_non_pointer_type))
     }
 
     fn expr_value_type(

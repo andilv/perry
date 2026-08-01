@@ -45,7 +45,7 @@ pub(crate) use fastify_net_zlib::dispatch_external_net_socket;
     not(target_os = "android")
 ))]
 pub(crate) use fastify_net_zlib::dispatch_net_socket;
-#[cfg(feature = "compression")]
+#[cfg(feature = "compression-gzip")]
 pub(crate) use fastify_net_zlib::dispatch_zlib_stream;
 
 pub(crate) type EventEmitterOn = unsafe extern "C" fn(i64, i64, i64) -> i64;
@@ -72,17 +72,17 @@ pub(crate) unsafe fn pack_args_array(args: &[f64]) -> *mut perry_runtime::ArrayH
     arr_handle.get_raw_mut_ptr::<perry_runtime::ArrayHeader>()
 }
 
-/// Shared `extern "C"` surface of the EventEmitter implementation. Both
-/// perry-stdlib (`bundled-events`) and perry-ext-events export these exact
-/// symbols, kept byte-identical per #3072. The dispatch arms below call
-/// through the linker-resolved symbol instead of `crate::events::*` so that
-/// when the well-known flip links perry-ext-events, dynamic dispatch
-/// consults the SAME handle registry the constructors used. An in-crate call
-/// always hit perry-stdlib's registry and returned `None` for ext-events
-/// handles — every dynamic `.on`/`.emit`/`.setMaxListeners` on an emitter
-/// silently no-op'd and method-value reads came back `undefined` (#4995).
-/// Mirrors the sqlite duplicate-symbol contract noted in
-/// `compile/optimized_libs.rs` (#643).
+// Shared `extern "C"` surface of the EventEmitter implementation. Both
+// perry-stdlib (`bundled-events`) and perry-ext-events export these exact
+// symbols, kept byte-identical per #3072. The dispatch arms below call
+// through the linker-resolved symbol instead of `crate::events::*` so that
+// when the well-known flip links perry-ext-events, dynamic dispatch
+// consults the SAME handle registry the constructors used. An in-crate call
+// always hit perry-stdlib's registry and returned `None` for ext-events
+// handles — every dynamic `.on`/`.emit`/`.setMaxListeners` on an emitter
+// silently no-op'd and method-value reads came back `undefined` (#4995).
+// Mirrors the sqlite duplicate-symbol contract noted in
+// `compile/optimized_libs.rs` (#643).
 #[cfg(any(feature = "bundled-events", feature = "external-events-construct"))]
 extern "C" {
     pub(crate) fn js_event_emitter_is_handle(handle: i64) -> bool;

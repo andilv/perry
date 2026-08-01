@@ -14,21 +14,94 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 /// Cached result of the pre-flight clang probe — evaluated once per process.
 /// `Some(default_triple)` if the probe succeeded, `None` if it failed.
 static CLANG_PROBE: OnceLock<Option<String>> = OnceLock::new();
 
-/// Strictly-monotonic per-process counter mixed into temp .ll/.o paths so two
-/// rayon codegen workers calling `compile_ll_to_object` concurrently can never
-/// land on the same path. SystemTime::now().as_nanos() alone isn't enough —
-/// macOS clocks resolve to microseconds, and rayon happily schedules sibling
-/// modules within the same microsecond, producing identical paths. When that
-/// happens, both workers overwrite the same .ll, both invoke clang on it, and
-/// both read back identical bytes — leaving sibling .o files with one
-/// module's symbols stamped onto the other's filename. (Closes #509.)
+/// Strictly-monotonic per-process counter mixed into **output** temp paths
+/// (`.o`, multi-unit partial-link staging, etc.) so two rayon codegen workers
+/// can never clobber each other's objects. (Closes #509.)
+///
+/// The **input** `.ll` basename is deliberately **not** mixed with this
+/// counter or wall-clock time: clang records the source path into the emitted
+/// object (on ELF, into the object bytes themselves), so a pid/nanos/counter
+/// in the `.ll` name made two identical compiles produce different objects on
+/// Linux (#7131). The `.ll` is content-addressed instead; uniqueness of
+/// concurrent same-content writes is handled by an atomic rename.
 static TEMP_NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// FNV-1a 64-bit over `ll_text`. Stable across platforms and rustc versions
+/// (unlike `DefaultHasher`), used only to content-address temp IR filenames so
+/// clang embeds a deterministic source path (#7131). Collision risk is
+/// acceptable for `/tmp` scratch files of compiler IR.
+fn ll_content_hash(ll_text: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in ll_text.as_bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// Content-addressed `.ll` path + unique `.o` path under `tmp_dir`.
+///
+/// The `.ll` basename is a function of the IR bytes alone so two compiles of
+/// the same module record the same source name in the object (Linux ELF
+/// determinism, #7131). The `.o` basename still carries a per-call counter so
+/// concurrent workers never race the clang output file (#509).
+/// Returns `(ll_path, obj_path, counter)` — `counter` is also used for the
+/// atomic-write staging filename.
+fn llvm_temp_paths(tmp_dir: &Path, ll_text: &str) -> (PathBuf, PathBuf, u64) {
+    let hash = ll_content_hash(ll_text);
+    let counter = TEMP_NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let ll_path = tmp_dir.join(format!("perry_llvm_{hash:016x}.ll"));
+    let obj_path = tmp_dir.join(format!("perry_llvm_{hash:016x}_{counter:x}.o"));
+    (ll_path, obj_path, counter)
+}
+
+/// Write `ll_text` to a content-addressed path. Concurrent workers with the
+/// same IR may race; we write via a unique `.tmp` then `rename` into place so
+/// readers never see a partial file. A lost race (dest already exists) is fine
+/// — the winner already wrote the same content.
+fn write_ll_atomically(ll_path: &Path, ll_text: &str, counter: u64) -> Result<()> {
+    // Fast path: already present (common under parallel multi-module compile
+    // when two units share nothing but we re-hit the same hash only on true
+    // content match — overwrite is still safe because the content is identical).
+    if ll_path.is_file() {
+        // Refresh contents in case a stale hash collision left wrong bytes
+        // (vanishingly rare). Same-content rewrite is a no-op for readers that
+        // already hold a descriptor open.
+        if let Ok(existing) = fs::read(ll_path) {
+            if existing == ll_text.as_bytes() {
+                return Ok(());
+            }
+        }
+    }
+    let tmp = ll_path.with_extension(format!("ll.tmp.{counter}"));
+    {
+        let mut f = fs::File::create(&tmp)
+            .with_context(|| format!("Failed to create temp .ll file at {}", tmp.display()))?;
+        f.write_all(ll_text.as_bytes())?;
+    }
+    match fs::rename(&tmp, ll_path) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // Another worker won the rename, or dest exists. Prefer dest if it
+            // already has the right bytes; otherwise fall back to a direct write.
+            let _ = fs::remove_file(&tmp);
+            if let Ok(existing) = fs::read(ll_path) {
+                if existing == ll_text.as_bytes() {
+                    return Ok(());
+                }
+            }
+            fs::write(ll_path, ll_text.as_bytes()).with_context(|| {
+                format!("Failed to write temp .ll file at {}", ll_path.display())
+            })
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct ClangCompilePlan {
@@ -266,26 +339,9 @@ fn build_clang_compile_plan(
 /// resulting `.o`, and clean up both on success. On failure the temp files
 /// are left behind for debugging — the caller can `grep /tmp/perry_llvm_*`.
 pub fn compile_ll_to_object(ll_text: &str, target_triple: Option<&str>) -> Result<Vec<u8>> {
-    let tmp_dir = env::temp_dir();
-    let pid = std::process::id();
-    // Per-call unique counter — strictly monotonic, no collisions across
-    // rayon workers in the same process. We still mix in the wall-clock
-    // nanos for cross-process distinctness (two `perry` invocations can
-    // share /tmp), but the counter is what guarantees in-process safety.
-    let counter = TEMP_NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let wall_nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let ll_path = tmp_dir.join(format!("perry_llvm_{}_{}_{}.ll", pid, wall_nonce, counter));
-    let obj_path = tmp_dir.join(format!("perry_llvm_{}_{}_{}.o", pid, wall_nonce, counter));
-
-    {
-        let mut f = fs::File::create(&ll_path)
-            .with_context(|| format!("Failed to create temp .ll file at {}", ll_path.display()))?;
-        f.write_all(ll_text.as_bytes())?;
-    }
-
+    // Validate the toolchain before creating the potentially large `.ll`
+    // scratch file. Unsupported clang releases should fail without leaving
+    // an artifact that was never passed to the compiler.
     let clang = find_clang().context(if cfg!(windows) {
         "clang not found. Install LLVM with one of:\n\
          \n\
@@ -306,6 +362,13 @@ pub fn compile_ll_to_object(ll_text: &str, target_triple: Option<&str>) -> Resul
          (e.g. `apt install clang`, `dnf install clang`, `pacman -S clang`) or set \
          PERRY_LLVM_CLANG to the path of clang. Run `perry doctor` to verify the install."
     })?;
+    ensure_supported_clang(&clang)?;
+
+    let tmp_dir = env::temp_dir();
+    // #7131: content-address the `.ll` basename (clang embeds it into the
+    // object on ELF). #509: keep the `.o` unique via the per-call counter.
+    let (ll_path, obj_path, write_nonce) = llvm_temp_paths(&tmp_dir, ll_text);
+    write_ll_atomically(&ll_path, ll_text, write_nonce)?;
 
     let plan = build_clang_compile_plan(
         clang.clone(),
@@ -386,8 +449,13 @@ pub fn compile_ll_to_object(ll_text: &str, target_triple: Option<&str>) -> Resul
     let bytes = fs::read(&obj_path)
         .with_context(|| format!("Failed to read clang output at {}", obj_path.display()))?;
 
-    // Clean up temp files on success — unless PERRY_LLVM_KEEP_IR is set, in
-    // which case we leave the .ll around for debugging and print the path.
+    // Clean up on success. The content-addressed `.ll` is **shared** across
+    // concurrent `compile_ll_to_object` calls with identical IR (#7131), so we
+    // must NOT delete it here — a sibling worker may still have clang open on
+    // that path (CodeRabbit). Only the unique `.o` is removed. The `.ll` is
+    // left in the process temp dir (same content is reused on cache misses;
+    // OS temp cleanup / `PERRY_LLVM_KEEP_IR` handle the rest). When KEEP_IR is
+    // set we also retain the object and write compile metadata.
     let keep = env::var_os("PERRY_LLVM_KEEP_IR").is_some();
     if keep {
         let _ = fs::write(&plan.stderr_remarks_path, &output.stderr);
@@ -400,7 +468,6 @@ pub fn compile_ll_to_object(ll_text: &str, target_triple: Option<&str>) -> Resul
             metadata_path.display()
         );
     } else {
-        let _ = fs::remove_file(&plan.ll_path);
         let _ = fs::remove_file(&plan.obj_path);
     }
 
@@ -651,6 +718,101 @@ fn build_clang_failure_hint(stderr: &str, clang_version: &str, requested_triple:
     lines.join("\n")
 }
 
+/// Oldest clang release that accepts Perry's opaque-pointer LLVM IR without
+/// an opt-in flag.
+pub const MINIMUM_CLANG_MAJOR: u32 = 15;
+
+/// Return the complete `clang --version` output, preferring stdout but
+/// accepting wrappers that write their version banner to stderr.
+pub fn clang_version_output(clang: &Path) -> Option<String> {
+    let output = Command::new(clang).arg("--version").output().ok()?;
+    select_clang_version_output(
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+fn select_clang_version_output(stdout: &str, stderr: &str) -> Option<String> {
+    let stdout = stdout.trim();
+    let stderr = stderr.trim();
+    if parse_clang_major_version(stdout).is_some() {
+        return Some(stdout.to_string());
+    }
+    if parse_clang_major_version(stderr).is_some() {
+        return Some(stderr.to_string());
+    }
+    if !stdout.is_empty() {
+        return Some(stdout.to_string());
+    }
+    (!stderr.is_empty()).then(|| stderr.to_string())
+}
+
+/// Parse the major release from standard clang version banners, including
+/// distro-prefixed and Apple clang variants.
+pub fn parse_clang_major_version(version_output: &str) -> Option<u32> {
+    version_output.lines().find_map(|line| {
+        let marker = "clang version ";
+        let start = line.find(marker)? + marker.len();
+        let digits: String = line[start..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect();
+        if digits.is_empty() {
+            None
+        } else {
+            digits.parse().ok()
+        }
+    })
+}
+
+fn clang_major_version(clang: &Path) -> Option<u32> {
+    clang_version_output(clang).and_then(|output| parse_clang_major_version(&output))
+}
+
+fn ensure_supported_clang(clang: &Path) -> Result<()> {
+    ensure_supported_clang_major(clang, clang_major_version(clang))
+}
+
+fn ensure_supported_clang_major(clang: &Path, major: Option<u32>) -> Result<()> {
+    let Some(major) = major else {
+        // Some toolchain wrappers do not expose a conventional version
+        // banner. Let the real compilation attempt decide whether they work.
+        return Ok(());
+    };
+    if major < MINIMUM_CLANG_MAJOR {
+        bail!(
+            "clang at `{}` is too old ({} < {}). Perry emits opaque-pointer LLVM IR, \
+             which requires clang {} or newer. Install clang-{}+ and put it first on \
+             PATH, or set PERRY_LLVM_CLANG to a supported clang binary.",
+            clang.display(),
+            major,
+            MINIMUM_CLANG_MAJOR,
+            MINIMUM_CLANG_MAJOR,
+            MINIMUM_CLANG_MAJOR,
+        );
+    }
+    Ok(())
+}
+
+fn select_clang_candidate_with<F>(
+    candidates: impl IntoIterator<Item = PathBuf>,
+    mut version_probe: F,
+) -> Option<PathBuf>
+where
+    F: FnMut(&Path) -> Option<u32>,
+{
+    let mut fallback = None;
+    for candidate in candidates {
+        if fallback.is_none() {
+            fallback = Some(candidate.clone());
+        }
+        if version_probe(&candidate).is_some_and(|major| major >= MINIMUM_CLANG_MAJOR) {
+            return Some(candidate);
+        }
+    }
+    fallback
+}
+
 pub fn find_clang() -> Option<PathBuf> {
     // Honor explicit override first — useful on systems with multiple clang
     // installs (e.g. Homebrew LLVM vs Xcode).
@@ -660,21 +822,42 @@ pub fn find_clang() -> Option<PathBuf> {
             return Some(candidate);
         }
     }
-    // Check PATH (with .exe extension handling on Windows).
-    if which("clang") {
-        return Some(PathBuf::from("clang"));
+
+    let mut candidates = Vec::new();
+    // Keep the ordinary PATH spelling first when it is already supported.
+    // If it points to clang 14 (Ubuntu 22.04), candidate selection continues
+    // through versioned Debian/Ubuntu binaries before falling back to it.
+    if let Some(candidate) = which_path("clang") {
+        candidates.push(candidate);
     }
+    for major in (MINIMUM_CLANG_MAJOR..=40).rev() {
+        if let Some(candidate) = which_path(&format!("clang-{major}")) {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
+    // Keep old versioned-only installations discoverable so doctor/compiler
+    // can report "too old" instead of the misleading "clang not found".
+    for major in (3..MINIMUM_CLANG_MAJOR).rev() {
+        if let Some(candidate) = which_path(&format!("clang-{major}")) {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
+
     // Check well-known install locations.
     #[cfg(windows)]
     {
         // Standalone LLVM installer (llvm.org)
         let standalone = PathBuf::from(r"C:\Program Files\LLVM\bin\clang.exe");
         if standalone.exists() {
-            return Some(standalone);
+            candidates.push(standalone);
         }
         // MSVC Build Tools bundled clang (via "C++ Clang Compiler" component)
         if let Some(path) = find_msvc_bundled_clang() {
-            return Some(path);
+            candidates.push(path);
         }
     }
     #[cfg(not(windows))]
@@ -690,11 +873,24 @@ pub fn find_clang() -> Option<PathBuf> {
         ] {
             let candidate = PathBuf::from(prefix).join("clang");
             if candidate.exists() && is_executable(&candidate) {
-                return Some(candidate);
+                candidates.push(candidate);
+            }
+        }
+        for major in (MINIMUM_CLANG_MAJOR..=40).rev() {
+            let candidate = PathBuf::from(format!("/usr/lib/llvm-{major}/bin/clang"));
+            if candidate.exists() && is_executable(&candidate) && !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+        for major in (3..MINIMUM_CLANG_MAJOR).rev() {
+            let candidate = PathBuf::from(format!("/usr/lib/llvm-{major}/bin/clang"));
+            if candidate.exists() && is_executable(&candidate) && !candidates.contains(&candidate) {
+                candidates.push(candidate);
             }
         }
     }
-    None
+
+    select_clang_candidate_with(candidates, clang_major_version)
 }
 
 /// Search for clang.exe bundled with Visual Studio Build Tools / Community.
@@ -750,26 +946,26 @@ fn find_msvc_bundled_clang() -> Option<PathBuf> {
     None
 }
 
-fn which(name: &str) -> bool {
+fn which_path(name: &str) -> Option<PathBuf> {
     let path_var = match env::var_os("PATH") {
         Some(p) => p,
-        None => return false,
+        None => return None,
     };
     for dir in env::split_paths(&path_var) {
         let candidate = dir.join(name);
         if candidate.exists() && is_executable(&candidate) {
-            return true;
+            return Some(candidate);
         }
         // On Windows, executables have .exe extension
         #[cfg(windows)]
         {
             let with_exe = dir.join(format!("{}.exe", name));
             if with_exe.exists() && is_executable(&with_exe) {
-                return true;
+                return Some(with_exe);
             }
         }
     }
-    false
+    None
 }
 
 #[cfg(unix)]
@@ -811,8 +1007,8 @@ fn find_llvm_tool(tool: &str) -> Option<PathBuf> {
             return Some(candidate);
         }
     }
-    if which(tool) {
-        return Some(PathBuf::from(tool));
+    if let Some(path) = which_path(tool) {
+        return Some(path);
     }
     None
 }
@@ -964,6 +1160,78 @@ mod tests {
 
     fn version_block(target_line: &str) -> String {
         format!("clang version 18.0.0\n{}\nThread model: posix", target_line)
+    }
+
+    #[test]
+    fn parses_common_clang_version_banners() {
+        assert_eq!(
+            parse_clang_major_version("Ubuntu clang version 14.0.0-1ubuntu1.1"),
+            Some(14)
+        );
+        assert_eq!(
+            parse_clang_major_version("Apple clang version 17.0.0 (clang-1700.0.13.5)"),
+            Some(17)
+        );
+        assert_eq!(
+            parse_clang_major_version("Debian clang version 18.1.8\nTarget: x86_64-linux-gnu"),
+            Some(18)
+        );
+        assert_eq!(parse_clang_major_version("not a clang banner"), None);
+    }
+
+    #[test]
+    fn version_banner_on_stderr_wins_over_stdout_wrapper_noise() {
+        let selected = select_clang_version_output(
+            "wrapper: selecting system toolchain",
+            "Ubuntu clang version 14.0.0-1ubuntu1.1",
+        );
+        assert_eq!(
+            selected.as_deref(),
+            Some("Ubuntu clang version 14.0.0-1ubuntu1.1")
+        );
+        assert_eq!(
+            select_clang_version_output("clang version 18.1.8", "warning").as_deref(),
+            Some("clang version 18.1.8")
+        );
+    }
+
+    #[test]
+    fn prefers_supported_versioned_clang_over_old_path_default() {
+        let candidates = vec![
+            PathBuf::from("/usr/bin/clang"),
+            PathBuf::from("/usr/bin/clang-18"),
+            PathBuf::from("/usr/bin/clang-15"),
+        ];
+        let selected =
+            select_clang_candidate_with(candidates, |path| match path.file_name()?.to_str()? {
+                "clang" => Some(14),
+                "clang-18" => Some(18),
+                "clang-15" => Some(15),
+                _ => None,
+            });
+        assert_eq!(selected, Some(PathBuf::from("/usr/bin/clang-18")));
+    }
+
+    #[test]
+    fn retains_first_candidate_to_report_an_old_only_install() {
+        let candidates = vec![
+            PathBuf::from("/usr/bin/clang"),
+            PathBuf::from("/usr/bin/clang-14"),
+        ];
+        let selected = select_clang_candidate_with(candidates, |_| Some(14));
+        assert_eq!(selected, Some(PathBuf::from("/usr/bin/clang")));
+    }
+
+    #[test]
+    fn old_clang_preflight_explains_the_opaque_pointer_requirement() {
+        let error = ensure_supported_clang_major(Path::new("/usr/bin/clang"), Some(14))
+            .expect_err("clang 14 must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("too old (14 < 15)"));
+        assert!(message.contains("opaque-pointer LLVM IR"));
+        assert!(message.contains("PERRY_LLVM_CLANG"));
+        assert!(ensure_supported_clang_major(Path::new("/usr/bin/clang-15"), Some(15)).is_ok());
+        assert!(ensure_supported_clang_major(Path::new("/toolchain-wrapper"), None).is_ok());
     }
 
     #[test]
@@ -1216,16 +1484,8 @@ mod tests {
     fn temp_nonce_counter_is_unique_across_concurrent_calls() {
         // Regression test for #509: two rayon workers calling
         // `compile_ll_to_object` concurrently must NOT generate the same
-        // temp-file path. Pre-fix, the path was `perry_llvm_<pid>_<nanos>`
-        // where `nanos` came from `SystemTime::now().as_nanos()`. On macOS
-        // that resolves to microseconds, so two threads racing the path
-        // construction in the same microsecond produced identical paths,
-        // both overwrote the same .ll, and both clang invocations compiled
-        // the same IR — leaving sibling .o files with identical bytes.
-        //
-        // The fix mixes `TEMP_NONCE_COUNTER.fetch_add(1, Relaxed)` into
-        // the path. We verify here that 256 concurrent fetches produce
-        // 256 distinct values, regardless of clock resolution.
+        // **output** temp-file path. The counter is mixed into the `.o`
+        // basename (the `.ll` is content-addressed — see #7131).
         use std::collections::HashSet;
         use std::thread;
 
@@ -1251,5 +1511,50 @@ mod tests {
             all.len(),
             unique.len(),
         );
+    }
+
+    #[test]
+    fn ll_temp_basename_is_content_addressed_not_clocked() {
+        // #7131: two calls with identical IR must produce the same `.ll`
+        // basename (so clang embeds a deterministic source path). The `.o`
+        // basename still differs via the counter.
+        let tmp = env::temp_dir();
+        let ir = "define void @f() {\n  ret void\n}\n";
+        let (ll_a, obj_a, _) = llvm_temp_paths(&tmp, ir);
+        let (ll_b, obj_b, _) = llvm_temp_paths(&tmp, ir);
+        assert_eq!(
+            ll_a.file_name(),
+            ll_b.file_name(),
+            "same IR must share the content-addressed .ll basename"
+        );
+        assert_ne!(
+            obj_a.file_name(),
+            obj_b.file_name(),
+            ".o basenames must stay unique across calls (#509)"
+        );
+        // Different IR → different .ll basename.
+        let (ll_c, _, _) = llvm_temp_paths(&tmp, "define void @g() {\n  ret void\n}\n");
+        assert_ne!(ll_a.file_name(), ll_c.file_name());
+        // No pid / wall-clock digits of variable width — only hex hash.
+        let name = ll_a.file_name().unwrap().to_string_lossy();
+        assert!(
+            name.starts_with("perry_llvm_") && name.ends_with(".ll"),
+            "unexpected .ll name: {name}"
+        );
+        let hex = name
+            .trim_start_matches("perry_llvm_")
+            .trim_end_matches(".ll");
+        assert_eq!(hex.len(), 16, "hash must be 16 lowercase hex digits: {hex}");
+        assert!(
+            hex.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash must be hex: {hex}"
+        );
+    }
+
+    #[test]
+    fn ll_content_hash_is_stable_for_fixed_input() {
+        // Pin the FNV-1a value so a future hash swap is intentional.
+        assert_eq!(ll_content_hash(""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(ll_content_hash("a"), 0xaf63_dc4c_8601_ec8c);
     }
 }

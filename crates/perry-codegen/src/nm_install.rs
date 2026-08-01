@@ -34,7 +34,9 @@ pub(crate) fn nm_install_symbol(name: &str) -> Option<&'static str> {
         // #6563: node-pty + the API-identical @lydell fork share one bucket.
         "node-pty" | "@lydell/node-pty" => Some("js_nm_install_node_pty"),
         "os" => Some("js_nm_install_os"),
-        "path" | "path.posix" | "path.win32" => Some("js_nm_install_path"),
+        "path" | "path/posix" | "path/win32" | "path.posix" | "path.win32" => {
+            Some("js_nm_install_path")
+        }
         "perf_histogram" | "perf_hooks" | "perf_observer" | "perf_observer_list" => {
             Some("js_nm_install_perf")
         }
@@ -46,6 +48,11 @@ pub(crate) fn nm_install_symbol(name: &str) -> Option<&'static str> {
         "sea" => Some("js_nm_install_sea"),
         "sqlite" => Some("js_nm_install_sqlite"),
         "stream" => Some("js_nm_install_stream"),
+        // `node:test` is exposed as a top-level core module in HIR, but its
+        // callable exports live in the submodule registry. Value reads such as
+        // the default import must arm that registry before asking the generic
+        // native-module property dispatcher for `default` / `test`.
+        "test" => Some("js_node_submod_install_test"),
         "timers" => Some("js_nm_install_timers"),
         "tls" => Some("js_nm_install_tls"),
         "tty" => Some("js_nm_install_tty"),
@@ -68,6 +75,7 @@ pub(crate) fn nm_install_symbol(name: &str) -> Option<&'static str> {
 
 /// All dispatch-install symbols + the dynamic fallback — declared so codegen can
 /// emit calls to them.
+#[allow(dead_code)] // consumed only by codegen configurations that emit dispatch declarations
 pub(crate) const NM_INSTALL_SYMBOLS: &[&str] = &[
     "js_nm_install_assert",
     "js_nm_install_async_hooks",
@@ -137,6 +145,7 @@ pub(crate) fn nm_submod_install_symbol(key: &str) -> Option<&'static str> {
     }
 }
 
+#[allow(dead_code)] // consumed only by codegen configurations that emit dispatch declarations
 pub(crate) const NM_SUBMOD_INSTALL_SYMBOLS: &[&str] = &[
     "js_node_submod_install_vm",
     "js_node_submod_install_timers",
@@ -156,3 +165,29 @@ pub(crate) const NM_SUBMOD_INSTALL_SYMBOLS: &[&str] = &[
     "js_node_submod_install_all",
     "js_node_submod_enable_install_all",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::nm_install_symbol;
+
+    #[test]
+    fn top_level_test_module_installs_its_submodule_registry() {
+        assert_eq!(
+            nm_install_symbol("test"),
+            Some("js_node_submod_install_test")
+        );
+        assert_eq!(
+            nm_install_symbol("node:test"),
+            Some("js_node_submod_install_test")
+        );
+    }
+
+    #[test]
+    fn path_slash_submodules_install_the_path_dispatch_bucket() {
+        assert_eq!(nm_install_symbol("path/posix"), Some("js_nm_install_path"));
+        assert_eq!(
+            nm_install_symbol("node:path/win32"),
+            Some("js_nm_install_path")
+        );
+    }
+}
