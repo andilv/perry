@@ -46,7 +46,10 @@ pub extern "C" fn js_child_process_exec_sync(
     // Execute the command using the shell, honoring `cwd`/`env` options.
     #[cfg(unix)]
     let mut command = {
-        let mut c = Command::new("sh");
+        // Absolute path (Node's `exec` shell) keeps std on `posix_spawn`
+        // instead of the `fork`+`exec` fallback a bare "sh" + `env` triggers
+        // (the macOS fork/dyld deadlock fix — see `cp_command_for_program`).
+        let mut c = Command::new("/bin/sh");
         c.arg("-c").arg(&cmd_str);
         c
     };
@@ -58,7 +61,8 @@ pub extern "C" fn js_child_process_exec_sync(
     };
     cp_apply_options(&mut command, opts_val);
 
-    let run_options = cp_read_sync_stdio_run_options(opts_val);
+    let mut run_options = cp_read_sync_stdio_run_options(opts_val);
+    run_options.mark_shell_command();
     let run = cp_run_to_completion(command, &run_options);
     let stdout_box = cp_box_run_output(&run.stdout, run.stdout_piped, &mode);
     if run.success() {
@@ -89,11 +93,7 @@ pub extern "C" fn js_child_process_spawn_sync(
         String::from_utf8_lossy(std::slice::from_raw_parts(cmd_data, cmd_len)).into_owned()
     };
 
-    let opts_val = if options_ptr.is_null() {
-        cp_undefined()
-    } else {
-        cp_box_ptr(options_ptr as *const u8)
-    };
+    let opts_val = cp_options_from_raw_args(args_ptr as i64, options_ptr as i64);
     let mode = cp_read_output_mode(opts_val, false);
 
     // Build command (run the file directly — spawnSync does not use a shell
@@ -280,7 +280,10 @@ pub extern "C" fn js_child_process_exec(cmd_ptr: *const StringHeader, arg1: f64,
     // `env` from the options are applied here.
     #[cfg(unix)]
     let mut command = {
-        let mut c = Command::new("sh");
+        // Absolute path (Node's `exec` shell) keeps std on `posix_spawn`
+        // instead of the `fork`+`exec` fallback a bare "sh" + `env` triggers
+        // (the macOS fork/dyld deadlock fix — see `cp_command_for_program`).
+        let mut c = Command::new("/bin/sh");
         c.arg("-c").arg(&cmd_str);
         c
     };
@@ -291,7 +294,8 @@ pub extern "C" fn js_child_process_exec(cmd_ptr: *const StringHeader, arg1: f64,
         c
     };
     cp_apply_options(&mut command, arg1);
-    let run_options = cp_read_async_run_options(arg1);
+    let mut run_options = cp_read_async_run_options(arg1);
+    run_options.mark_shell_command();
 
     if cb.is_null() {
         // Legacy no-callback shape — run synchronously and return stdout
@@ -356,7 +360,7 @@ pub extern "C" fn js_child_process_exec_file(
 
     // `cwd`/`env` come from the options slot; when `opts_val` is the callback
     // (`execFile(file, args, cb)`) it's a closure, so the helper no-ops.
-    let mut command = Command::new(&file_str);
+    let mut command = cp_command_for_program(&file_str, opts_val);
     command.args(&arg_strs);
     cp_apply_options(&mut command, opts_val);
     let run_options = cp_read_async_run_options(opts_val);
@@ -395,7 +399,7 @@ pub extern "C" fn js_child_process_exec_file_sync(
         return cp_box_output(b"", &mode);
     }
     let arg_strs = cp_args_from_value(args_val);
-    let mut command = Command::new(&file_str);
+    let mut command = cp_command_for_program(&file_str, opts_val);
     command.args(&arg_strs);
     cp_apply_argv0(&mut command, opts_val);
     cp_apply_options(&mut command, opts_val);
@@ -468,7 +472,13 @@ fn cp_promisified_run(command: Command, cmd_str: String, opts: f64) -> f64 {
     let cb = js_closure_alloc(cp_promise_settle_cb as *const u8, 1);
     js_closure_set_capture_ptr(cb, 0, cp_box_ptr(promise as *const u8).to_bits() as i64);
     let cb_val = crate::value::js_nanbox_pointer(cb as i64);
-    reactor::cp_exec_async(command, cmd_str, cb_val, run_options, mode);
+    let child = reactor::cp_exec_async(command, cmd_str, cb_val, run_options, mode);
+    crate::object::exotic_expando::value_store(
+        crate::object::exotic_expando::ExoticKind::Promise,
+        promise as usize,
+        "child",
+        child.to_bits(),
+    );
     crate::value::js_nanbox_pointer(promise as i64)
 }
 
@@ -476,7 +486,10 @@ extern "C" fn cp_promisified_exec(_closure: *const ClosureHeader, cmd_val: f64, 
     let cmd = cp_value_to_string(cmd_val).unwrap_or_default();
     #[cfg(unix)]
     let mut command = {
-        let mut c = Command::new("sh");
+        // Absolute path (Node's `exec` shell) keeps std on `posix_spawn`
+        // instead of the `fork`+`exec` fallback a bare "sh" + `env` triggers
+        // (the macOS fork/dyld deadlock fix — see `cp_command_for_program`).
+        let mut c = Command::new("/bin/sh");
         c.arg("-c").arg(&cmd);
         c
     };
@@ -497,7 +510,9 @@ extern "C" fn cp_promisified_exec_file(
 ) -> f64 {
     let file = cp_value_to_string(file_val).unwrap_or_default();
     let arg_strs = cp_args_from_value(args_val);
-    let mut command = Command::new(&file);
+    // The 2-arg promisify(execFile) wrapper has no options slot; resolve a bare
+    // program against the parent PATH to keep std on `posix_spawn`.
+    let mut command = cp_command_for_program(&file, cp_undefined());
     command.args(&arg_strs);
     // The 2-arg promisify(execFile) wrapper has no options slot.
     cp_promisified_run(

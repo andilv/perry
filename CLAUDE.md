@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Perry is a native TypeScript compiler written in Rust that compiles TypeScript source code directly to native executables. It uses SWC for TypeScript parsing and LLVM for code generation.
 
-**Current Version:** 0.5.1265
+**Current Version:** 0.5.1277
 
 
 ## TypeScript Parity Status
@@ -26,6 +26,26 @@ Two workflows are deliberately exempt and say so inline: `node-core-subset.yml` 
 - **Compile-as-package** — `#348` (ink TUI end-to-end), `#488/#489` (Drizzle + MySQL), `#678` (linker emits native callsites for V8-fallback modules).
 - **Test/CI mechanics** — `#794` (per-category parity thresholds), `#796` (gap-suite output truncation + O(n²) `normalize_output`), `#812` (42-module behavioral matrix), `#806/#807/#808` (test harnesses for mixins / async context / ≥300-init scale).
 - **Skip-list audit** — `#797` covers `test-parity/known_failures.json` provenance (issue # + date per entry).
+
+### Node builtin compatibility matrix (`scripts/node_compat_matrix.mjs`)
+
+Breadth sweep over EVERY `require("module").builtinModules` entry, both import forms (`M` and `node:M`), against a **pinned, SRI-verified Node** (the "latest stable" oracle, pinned in `external-tools.json` `tools.node.version` — currently **26.5.1**, independent of the `.node-version` gap-suite oracle). It compares Perry's export-SHAPE fingerprint (sorted `name:typeof` over the module namespace + the default export's typeof) to the oracle's. This is the systematic version of the #812 "42-module behavioral matrix" — shape, not deep behavior (behavioral cases stay in the node-suite).
+
+```bash
+# FAST LOOP — reach for this first when iterating on ONE builtin:
+node scripts/node_compat_matrix.mjs --module fs                      # one module, both forms
+node scripts/node_compat_matrix.mjs --module fs,path,crypto          # a few
+node scripts/node_compat_matrix.mjs --module fs --method readFileSync,promises  # only these exports
+node scripts/node_compat_matrix.mjs --only fs.readFileSync,path.join # combined mod.export form
+# (the pinned Node download is skipped once cached under .cache/node-pin/)
+
+# FULL SWEEP + GATE:
+node scripts/node_compat_matrix.mjs                 # whole matrix + summary table
+node scripts/node_compat_matrix.mjs --check         # CI gate: exit 1 on regressions vs the baseline
+node scripts/node_compat_matrix.mjs --update-baseline   # rewrite test-parity/node-compat-matrix.baseline.json
+```
+
+A `--module` selector scopes `--check`/`--update-baseline` to just that slice (a single-module refresh never rewrites the whole baseline). A `--method`/`--only` subset is a print-only fast diagnostic (it narrows the fingerprint, so it is refused for `--check`/`--update-baseline`). **Bump the pinned Node** by editing `tools.node.version` in `external-tools.json` (add per-platform sha512 SRI), then `--update-baseline` and review the diff. Needs the release binary (`cargo build --release -p perry`). Full page: `docs/src/testing/node-compat-matrix.md`.
 
 **Known categorical gaps**: `console.dir`/`console.group*` formatting, lone surrogate handling (WTF-8). (Lookbehind regex is NOT a gap anymore: `perry-runtime/src/regex.rs` falls back from the `regex` crate to `fancy-regex` for lookbehind/backreferences, with capture-group translation and replacement expansion.)
 
@@ -111,6 +131,19 @@ Key functions: `js_nanbox_string/pointer/bigint`, `js_nanbox_get_pointer`, `js_g
 Generational mark-sweep GC in `crates/perry-runtime/src/gc.rs` (default since v0.5.237 / Phase D). Two regions in the per-thread arena: nursery (`ARENA`, fills with new allocations, swept on minor GC) and old-gen (`OLD_ARENA`, holds tenured/evacuated objects). Precise shadow-stack roots + ~55 registered side-table scanners (`gc/mod.rs:298+`); a conservative stack scan exists but production mode resolves to SkipDisabled, so liveness rests on codegen shadow-stack spilling plus `RuntimeHandleScope` in runtime helpers. Write barriers populate a remembered set so minor GC can avoid retracing the old-gen. Two-bit aging (`HAS_SURVIVED` / `TENURED`) promotes nursery survivors after 2 minor cycles; the C4b evacuation policy moves non-pinned tenured objects into old-gen with full reference rewriting only when generated write barriers are active and nursery/RSS pressure plus measured movable candidates justify the work. Idle nursery blocks observed empty for 2 GC cycles are `dealloc`'d back to the OS (C4b-δ, v0.5.235), and the next-trigger calc is hard-capped at the initial threshold (64 MB) so >90%-freed step-doubling can't blow up peak occupancy (C4b-δ-tune, v0.5.236). Triggers on arena block allocation (1 MB blocks since v0.5.196), malloc count threshold, or explicit `gc()` call. 8-byte GcHeader per allocation.
 
 **Escape hatches**: `PERRY_GEN_GC=0`/`off`/`false` reverts to full mark-sweep (bisection only). `PERRY_GEN_GC_EVACUATE=0`/`off`/`false` disables policy evacuation; `=1`/`on`/`true` is accepted as auto-policy allowed, not unconditional evacuation. `PERRY_GC_FORCE_EVACUATE=1` stress-copies every marked non-pinned nursery object only when generated write barriers are active and policy evacuation is allowed. `PERRY_GC_VERIFY_EVACUATION=1` panics if any mutable live slot still points at a forwarded nursery object after an evacuation/rewrite cycle. `PERRY_WRITE_BARRIERS=0`/`off`/`false` disables codegen-emitted write barriers at compile time and runtime exact helper barriers at runtime for benchmark/debug bisection; unset, `=1`/`on`/`true` keep barriers enabled. `PERRY_GC_DIAG=1` prints per-cycle diagnostics, including evacuation-policy decisions for considered cycles and `barriers_inactive` skips.
+
+### Rooting-bug instruments (#7154 family) — what each knob ACTUALLY gates
+
+A "GC value live but not rooted across a collection point" bug is invisible at collection time: there is nothing for the collector to find. It surfaces one or more cycles later, in a different function, as `TypeError: value is not a function`. These three knobs exist to collapse that latency. **All default-off; every boolean knob's OFF state is asserted in `gc/tests/fromspace_protect.rs`** (`…_DEPTH` is a magnitude, not a mode, so its floor and default are asserted instead). The instruments are **sabotage-tested**, not merely exercised: `quarantine_catches_a_planted_stale_from_space_deref` plants a #7184/#7192-shaped stale from-space pointer and asserts the instrument distinguishes it from the live object that would otherwise be recycled into those bytes — so a green protected run means the detector works, not that nothing was tried.
+
+| knob | gates EXACTLY | does NOT |
+|---|---|---|
+| `PERRY_GC_PROTECT_FROMSPACE=1` (or `poison`) | the from-space reset performed by the **copying minor** (`arena::copying_reset_from_spaces_and_flip`). Retired Eden + active-survivor blocks are detached into a bounded quarantine, poison-filled (`0xDEADBEEFBAADF0DE`, `obj_type = 0xDE`) and, at `=1`, `mprotect(PROT_NONE)`d. A stale deref then SIGSEGVs at the faulting instruction; the installed reporter names the address, the retiring minor, and the last-known object's `obj_type`/size, then restores `SIG_DFL` and re-faults so a core/debugger still sees the real site. `poison` skips `mprotect`. | change the non-moving minor's `arena_reset_empty_blocks`, the full mark-sweep's reclaim, old-gen defrag, or the malloc sweep. **A run with zero copying minors protects nothing** — check that `PERRY_GC_DIAG=1` prints a `[gc-fromspace-protect] retired_set=#N` line. |
+| `PERRY_GC_PROTECT_FROMSPACE_DEPTH=N` (default 4) | how many retired page-sets stay quarantined. Evicted sets are restored to RW and **recycled back into Eden**, never `dealloc`'d, so footprint is bounded at `N × from-space bytes`. `0` is clamped to 1 — a depth of 0 would read as ON and protect nothing. **Raise this when a suspected bug does not fault**: a value can cross hundreds of collections between its last valid observation and its stale use (one per back-edge poll under zeal). #7154's `new C(…)` reproducer needs `800` — its constructor crosses 600 polls, so the default 4 misses it silently. | — |
+| `PERRY_GC_ZEAL=1` | forces an evacuating minor at every **GC safepoint**: `js_gc_loop_safepoint` (loop back-edge) and the outermost microtask-pump safepoint. It bypasses exactly two things — the `GC_SAFEPOINT_PENDING` requirement in `js_gc_loop_safepoint`, and the `gc_budgeted_due_trigger()` "is anything due?" test in `gc_safepoint_moving_minor`. Also makes `gc_force_evacuate_enabled()` true, so survivors actually MOVE. | bypass `gc_safepoint_moving_minor`'s **entry guards**: a safepoint reached mid-allocation (`GC_FLAG_IN_ALLOC`), suppressed (`GC_FLAG_SUPPRESSED`), inside an unsafe FFI zone, under a non-zero `GC_ROOT_LOCK_DEPTH`, or during a budgeted cycle still returns without collecting. Nor does it override an explicit `PERRY_GEN_GC_EVACUATE=0` — that wins, and with it set zeal moves nothing and surfaces nothing. Nor does it emit loop polls — those need the **compile-time** `PERRY_GC_MOVING_LOOP_POLLS=1` (default off since #7161). Zeal on a binary compiled without polls only fires at event-loop boundaries; a compute-only loop never collects. Check `crate::gc::zeal_forced_collections()` is nonzero. There is deliberately **no level 2**: the alloc-point arm forces a conservative stack scan, which makes the copying minor ineligible, so an "every allocation" zeal would run non-moving minors and move nothing. |
+| `PERRY_GC_FROMSPACE_SCAN_ABORT=1` | now **implies** `PERRY_GC_FROMSPACE_SCAN=1`. It used to be inert alone (the scan never ran, so nothing aborted, and the run reported success). | — |
+
+`PERRY_GC_ZEAL=1 PERRY_GC_PROTECT_FROMSPACE=1` together is the pairing that turns a #7154 bug into an immediate precise fault. Compile *and* run with `PERRY_GC_MOVING_LOOP_POLLS=1` for in-loop coverage.
 
 ### GC knob kill-policy (binding)
 
@@ -217,3 +250,4 @@ Corollary: a *new* gate has never been green, so promoting it to required immedi
 - **Async-to-generator transform, body locals.** It boxes every body local into a shared mutable cell typed `Any`. Two consequences seen in the wild: per-iteration `let`/`const` bindings collapse for closures created in a loop, and computed numeric-key calls (`arr[i](x)`) lose their type proof and silently resolve by *method name*, evaporating the call.
 - **Native base-class subclassing.** A native base's surface is installed at `super()` time and its parent edge lives in the class registry; keying any of that on a literal `extends` name loses it for fieldless classes, indirect subclasses, and class expressions.
 - **Two prototype-resolution paths.** `CLASS_PROTOTYPE_OBJECTS` (synthetic: `Object.create`, plain-function ctors) vs `CLASS_DECL_PROTOTYPE_OBJECTS` (declared classes). `in`/`for…in` and `getPrototypeOf` have disagreed about the same chain.
+- **Root-store dominance in codegen.** *A GC-managed value's root store must **dominate** every subsequent site that can collect.* Three ways it has broken, all shipped: the store's slot index fell outside the pushed shadow frame so `js_shadow_slot_bind` bounds-checked it into a silent no-op (#7184); the store was emitted in-frame but **after** a call that allocates (#7192); and the value lives in a plain `alloca_entry` that is neither a shadow slot nor a temp root, so the collector never rewrites it (`lower_call/new.rs`'s inline-ctor `this_slot`, still open). All three present identically — a *rooted* slot holding a dangling pointer, surfacing cycles later as `TypeError: value is not a function` — and **none is visible to any runtime GC probe**, because at the moment of the collection there is nothing for the collector to find. That is why #7154's from-space scan only ever saw offenders whose targets had already died. The instrument is static: `scripts/gc_root_dominance_check.py` over `--trace llvm` output (`--self-test` proves it can still fail). Only bites under `PERRY_GC_MOVING_LOOP_POLLS=1`, off by default since #7161 — so a green default run says nothing about this class.

@@ -48,6 +48,15 @@ test_gap_repsel_ptr_shape_barriers
 # is exactly the claim this phase's GC contract makes.
 test_gap_repsel_return_shape
 
+# --- Phase 3b / #7034 §3: array-element shape facts -------------------------
+# `rows.push(row)` no longer disqualifies `row`, and `const r = rows[i]` under
+# an `i < rows.length` loop is rule-1 provenance. Every element local is an
+# ordinary shadow-bound NaN-boxed slot re-derived per access, so `churn`
+# deliberately allocates 200 objects BETWEEN two field reads of the same
+# element local: the evacuating arms are the ones that can catch a raw pointer
+# cached across that safepoint.
+test_gap_repsel_ptr_shape_elements
+
 # --- Phase 4a / 4a.3: Ptr<NumArray> numeric arrays (#6915, #6916) -----------
 test_gap_repsel_p4a_holes_axis
 test_gap_repsel_p4a_inline_tiers
@@ -65,6 +74,17 @@ test_gap_repsel_p4b_field_store_elision
 # script exits 3 on an unregistered `test_gap_repsel_*` file, so `gc-stress`
 # was failing on main for every PR until this line landed.
 test_gap_repsel_proven_this_frozen
+
+# --- Phase 5a routing: class-id dispatch tower -> proven `this` (#7142) ------
+# The tower case proves `class_id`, which `delete` preserves while compacting
+# the packed slots, so the route carries an INLINE keys-token check. Registered
+# because the routed path has its own GC contract: the receiver is re-derived
+# from the NaN-boxed argument at the call site and the clone shadow-binds its
+# own receiver slot (#6925/#6990 -- `GC_TYPE_OBJECT` is movable, the `TaPtr`
+# no-bind shortcut does not transfer). `churn()` allocates past the matrix's
+# `--pressure 8` heap limit with `rows` live across it, so the evacuating arms
+# have a receiver to move rather than reporting the file inert.
+test_gap_repsel_pshape_tower_delete
 
 # --- Typed-array constructor source rooting (#6981) --------------------------
 # Not a representation file, so the UNREGISTERED gate does not auto-detect it:
@@ -116,6 +136,33 @@ test_gap_repsel_scalar_replaced_locals
 # the evacuating arms in that frame, not only inside a callee.
 test_gap_repsel_module_init_canonical
 
+# --- Raw pointer publishes into traced payload slots (#7154) -----------------
+# Not a representation file, so registered explicitly per the header rule.
+# Three runtime helpers published a pointer into a GC-traced slot with a raw
+# `*slot = bits`, skipping `layout_note_slot` (so the holder stayed
+# `POINTER_FREE` and `heap_payload_slot_selection` skipped its WHOLE payload)
+# and the write barrier (so an old->young edge never reached the remembered
+# set). Every subject is read AFTER the churn that drives collection, so a
+# non-moving collection cannot satisfy it. Verified to FAIL on the pre-fix
+# stores (SIGBUS, exit 138) and pass after.
+#
+# ***THIS FILE IS LIVE ONLY ON THE MOVING ARMS, AND THAT IS THE POINT.***
+# Measured 33 copying minors under `PERRY_GC_MOVING_LOOP_POLLS=1` /
+# `evac_minor` / `force_evac`, and ZERO under the shipped default -- because
+# #7161 flipped the evacuating minor off by default pending #7154. So its
+# `default` / `verify_evac` / `cons_scan_off*` cells are UNVER, correctly: the
+# bug it guards cannot manifest without a moving collector, and a PASS there
+# would be the false confidence this harness exists to remove.
+#
+# The consequence to keep in view: `loop_polls` (and the other `requires=move`
+# arms) are now the ONLY place this file bites end to end. If #7161 is ever
+# reverted the cells flip to PASS on their own; if instead the moving-loop knob
+# is deleted, this file goes dark and must be re-tuned or retired with it. The
+# collector-side coverage does NOT depend on that knob: the three Rust tests in
+# `gc/tests/copying/pointer_publish_7154.rs` call `gc_collect_minor` directly,
+# which takes the copying path regardless, and each asserts `copied_objects > 0`.
+test_gap_gc_pointer_publish
+
 # --- The GC-live member ------------------------------------------------------
 # Every file above performs ZERO collections (measured, #6950), which makes the
 # GC arms inert against them. This one holds each representation's local live
@@ -123,3 +170,42 @@ test_gap_repsel_module_init_canonical
 # "collect" arms actually bite. Keep it registered and keep it collecting.
 test_gap_repsel_gc_stress
 
+
+# --- The three residual root-store holes (#7200, #7201, #7202) --------------
+# Not representation files, so registered explicitly per the header rule.
+#
+# ***ALL THREE ARE LIVE ONLY ON THE `requires=move` ARMS, AND THAT IS THE
+# POINT.*** Each is clean under the shipped default, because #7161 flipped the
+# evacuating minor off pending #7154 — so their `default` / `verify_evac` /
+# `cons_scan_off*` cells are UNVER, correctly. `loop_polls` is where they bite
+# end to end today; when #7161 is reverted the rest flip to PASS on their own.
+#
+# Measured on `origin/main` (3a983ca6a), compiled AND run with
+# `PERRY_GC_MOVING_LOOP_POLLS=1`:
+#   spread_accessor_rooting     exit=139 (SIGSEGV) 3/3
+#   static_block_this_rooting   `bad 4` 3/3 (deterministic)
+#   inline_ctor_this_rooting    green — see its own header; it is a STATIC
+#                               gate, pinned by the codegen test and by
+#                               `gc_root_dominance_check.py --unrooted-allocas`
+test_gap_gc_spread_accessor_rooting
+test_gap_gc_static_block_this_rooting
+test_gap_gc_inline_ctor_this_rooting
+
+# --- The catch parameter and the closure `this` capture (#7209, #7208) -------
+# Two more sites from the #7202 bare-alloca enumeration, both reserved-or-
+# missing shadow slots rather than late root stores.
+#
+# Measured on `origin/main` (1679e22b4), compiled AND run with
+# `PERRY_GC_MOVING_LOOP_POLLS=1`:
+#   catch_param_rooting          `message 8 field 8` of 400, 3/3 deterministic
+#   closure_this_capture_rooting exit=139 (SIGSEGV) 3/3; `bad 4` on the
+#                                evacuating arm
+#
+# `catch_param_rooting` is the one file in this corpus that can go wrong under a
+# NON-moving precise-roots collection as well: `js_clear_exception()` drops the
+# runtime's own reference before the catch body runs, so with the slot unbound
+# the exception is reachable from nothing the collector scans and can be SWEPT,
+# not merely relocated. Keep it exercised on `cons_scan_off`, not only on the
+# `requires=move` arms.
+test_gap_gc_catch_param_rooting
+test_gap_gc_closure_this_capture_rooting

@@ -26,6 +26,7 @@
   - [`perry-ffi` ABI Reference](native-libraries/abi.md)
   - [Manifest Schema (spec v1)](native-libraries/manifest-v1.md)
   - [Upstream Provenance Pins](native-libraries/upstream-pins.md)
+  - [Zero-config Bindings and Faithfulness](native-libraries/zero-config-and-faithfulness.md)
 
 # Multi-Threading
 
@@ -147,6 +148,7 @@
 # Testing
 
 - [Geisterhand (UI Fuzzer)](testing/geisterhand.md)
+- [Node Compatibility Matrix](testing/node-compat-matrix.md)
 
 # CLI Reference
 
