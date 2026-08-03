@@ -301,12 +301,44 @@ pub(super) struct NativeStackFallbackTraceStats {
 }
 
 #[derive(Clone, Copy, Default)]
+pub(super) struct NativeStackMapTraceStats {
+    pub(super) walks: usize,
+    pub(super) frames_visited: usize,
+    pub(super) records_matched: usize,
+    pub(super) locations_visited: usize,
+    pub(super) fp_walks: usize,
+    pub(super) fallback_walks: usize,
+}
+
+impl NativeStackMapTraceStats {
+    #[inline]
+    pub(super) fn record_walk(
+        &mut self,
+        walks: usize,
+        frames_visited: usize,
+        records_matched: usize,
+        locations_visited: usize,
+        fp_walks: usize,
+        fallback_walks: usize,
+    ) {
+        self.walks = self.walks.saturating_add(walks);
+        self.frames_visited = self.frames_visited.saturating_add(frames_visited);
+        self.records_matched = self.records_matched.saturating_add(records_matched);
+        self.locations_visited = self.locations_visited.saturating_add(locations_visited);
+        self.fp_walks = self.fp_walks.saturating_add(fp_walks);
+        self.fallback_walks = self.fallback_walks.saturating_add(fallback_walks);
+    }
+}
+
+#[derive(Clone, Copy, Default)]
 pub(super) struct RootSourcesTraceStats {
     pub(super) compiled_shadow: RootSourceSlotTraceStats,
+    pub(super) compiled_native: RootSourceSlotTraceStats,
     pub(super) module_globals: RootSourceSlotTraceStats,
     pub(super) runtime_handles: RootSourceSlotTraceStats,
     pub(super) runtime_mutable_scanners: RootSourceSlotTraceStats,
     pub(super) ffi_mutable_scanners: RootSourceSlotTraceStats,
+    pub(super) native_stack_maps: NativeStackMapTraceStats,
     pub(super) native_stack_fallback: NativeStackFallbackTraceStats,
 }
 
@@ -480,8 +512,13 @@ pub(super) struct BarrierTraceCounters {
     pub(super) remembered_set_insert_attempts: u64,
     pub(super) new_inserts: u64,
     pub(super) dirty_page_mark_attempts: u64,
+    /// #7187 Phase B: dirty-page mark attempts short-circuited by the
+    /// "already dirty" page cache. Counted INSIDE `dirty_page_mark_attempts`,
+    /// so `attempts - cache_hits` is what still reaches the modbuf.
+    pub(super) dirty_page_cache_hits: u64,
     pub(super) new_dirty_pages: u64,
     pub(super) conservative_parent_span_marks: u64,
+    pub(super) unarmed_skips: u64,
 }
 
 impl BarrierTraceCounters {
@@ -496,8 +533,10 @@ impl BarrierTraceCounters {
             remembered_set_insert_attempts: 0,
             new_inserts: 0,
             dirty_page_mark_attempts: 0,
+            dirty_page_cache_hits: 0,
             new_dirty_pages: 0,
             conservative_parent_span_marks: 0,
+            unarmed_skips: 0,
         }
     }
 }
@@ -513,8 +552,18 @@ pub(super) enum BarrierTraceCounter {
     RememberedSetInsertAttempts,
     NewInserts,
     DirtyPageMarkAttempts,
+    /// #7187 Phase B: a `mark_dirty_old_page` call the "already dirty" cache
+    /// answered without touching the modbuf or the arena page metadata. Bumps
+    /// `dirty_page_mark_attempts` as well, so that counter keeps meaning
+    /// "calls" and stays comparable with pre-Phase-B measurements.
+    DirtyPageCacheHits,
     NewDirtyPages,
     ConservativeParentSpanMarks,
+    /// #7187: a barrier call whose child WAS a heap pointer but which exited
+    /// before any remembered-set work because the barrier is not armed yet.
+    /// This is the count the lazy-arming lever removes; on a program that
+    /// never collects it equals `calls - non_pointer_child_skips`.
+    UnarmedSkips,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -984,6 +1033,11 @@ impl GcCycleTrace {
             "retained_forwarded_stub_objects": self.sweep.retained_forwarded_stub_objects,
             "retained_forwarded_stub_bytes": self.sweep.retained_forwarded_stub_bytes,
         });
+        // #7187 census. `armed` / `reconstructs` are what let the lazy-arming
+        // gate observe its own subject: a cycle reporting `unarmed_skips > 0`
+        // with `reconstructs == 0` would mean the reconstruct never ran and
+        // the collection is reading an incomplete log.
+        let reconstruct_census = crate::gc::remembered_reconstruct_census();
         let write_barrier_json = serde_json::json!({
             "calls": self.write_barrier.calls,
             "non_pointer_parent_skips": self.write_barrier.non_pointer_parent_skips,
@@ -994,8 +1048,14 @@ impl GcCycleTrace {
             "remembered_set_insert_attempts": self.write_barrier.remembered_set_insert_attempts,
             "new_inserts": self.write_barrier.new_inserts,
             "dirty_page_mark_attempts": self.write_barrier.dirty_page_mark_attempts,
+            "dirty_page_cache_hits": self.write_barrier.dirty_page_cache_hits,
             "new_dirty_pages": self.write_barrier.new_dirty_pages,
             "conservative_parent_span_marks": self.write_barrier.conservative_parent_span_marks,
+            "unarmed_skips": self.write_barrier.unarmed_skips,
+            "armed": crate::gc::barrier_remembering_armed(),
+            "reconstructs": reconstruct_census.reconstructs,
+            "reconstruct_recovered_old_pages": reconstruct_census.recovered_old_pages,
+            "reconstruct_recovered_external_pages": reconstruct_census.recovered_external_pages,
         });
         let trigger_json = serde_json::json!({
             "kind": self.trigger_kind.as_str(),
@@ -1289,10 +1349,19 @@ pub(super) fn root_source_slot_json(stats: RootSourceSlotTraceStats) -> serde_js
 pub(super) fn root_sources_json(stats: RootSourcesTraceStats) -> serde_json::Value {
     serde_json::json!({
         "compiled_shadow": root_source_slot_json(stats.compiled_shadow),
+        "compiled_native": root_source_slot_json(stats.compiled_native),
         "module_globals": root_source_slot_json(stats.module_globals),
         "runtime_handles": root_source_slot_json(stats.runtime_handles),
         "runtime_mutable_scanners": root_source_slot_json(stats.runtime_mutable_scanners),
         "ffi_mutable_scanners": root_source_slot_json(stats.ffi_mutable_scanners),
+        "native_stack_maps": {
+            "walks": stats.native_stack_maps.walks,
+            "frames_visited": stats.native_stack_maps.frames_visited,
+            "records_matched": stats.native_stack_maps.records_matched,
+            "locations_visited": stats.native_stack_maps.locations_visited,
+            "fp_walks": stats.native_stack_maps.fp_walks,
+            "fallback_walks": stats.native_stack_maps.fallback_walks,
+        },
         "native_stack_fallback": {
             "decision": stats.native_stack_fallback.decision.as_str(),
             "scanned": stats.native_stack_fallback.scanned,

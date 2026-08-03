@@ -92,7 +92,18 @@ default-members = [
 [profile.release]
 lto = "thin"          # Thin LTO for faster builds and fewer duplicate symbols
 codegen-units = 1     # Better optimization, slower compile
-panic = "unwind"      # Allow catch_unwind for graceful error recovery
+# panic=abort (#7302): the invoke/landingpad exception transport requires the
+# unwinder to step THROUGH runtime Rust frames with longjmp-equivalent
+# semantics — no cleanups, and no RFC-2945 abort-on-unwind guards (which
+# panic=unwind plants in every extern "C" helper and which a JS throw
+# crossing a helper frame would trip). Must be paired with
+# `-C force-unwind-tables=yes` (.cargo/config.toml) or the unwinder cannot
+# step the frames at all — js_eh_try_push self-checks this at runtime and
+# fails loudly. Cost: catch_unwind-based panic recovery (spawn workers,
+# worker_threads, UI callbacks) no longer catches — a runtime panic aborts
+# the process. On the main JS→helper path panics already aborted (the
+# RFC-2945 guards); cargo test is unaffected (test builds force unwind).
+panic = "abort"
 strip = true          # Strip symbols automatically
 opt-level = 3         # Maximum optimization
 
@@ -226,7 +237,19 @@ opt-level = 1
 inherits = "release"
 lto = "thin"
 codegen-units = 1
-panic = "unwind"
+# MUST match [profile.release] (#7302). `dist` is what release-packages.yml
+# builds the SHIPPED libperry_{runtime,stdlib}.a with, and the exception
+# transport requires the unwinder to step runtime Rust frames with
+# longjmp-equivalent semantics. Under panic="unwind" rustc plants RFC-2945
+# abort-on-unwind guards in every `extern "C"` helper that contains an
+# interior Rust call, so a JS throw crossing such a helper — a throwing
+# getter, a JSON.parse error, a throwing map callback — aborts the process
+# instead of being caught. This line said "unwind" and so overrode the
+# inherited value: it made the shipped runtime, and only the shipped
+# runtime, fail that way. Paired with -C force-unwind-tables=yes from
+# .cargo/config.toml; the runtime self-checks for the tables on the first
+# `try` and aborts loudly if they are missing.
+panic = "abort"
 strip = true
 opt-level = 3
 
@@ -292,7 +315,7 @@ codegen-units = 16
 codegen-units = 16
 
 [workspace.package]
-version = "0.5.1277"
+version = "0.5.1280"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/PerryTS/perry"

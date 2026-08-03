@@ -9,6 +9,14 @@ use std::rc::Rc;
 use crate::block::{FpFlags, LlBlock, RegCounter};
 use crate::types::LlvmType;
 
+/// Precise GC roots lowered onto the native frame (statepoints / RS4GC,
+/// #7173 / #7174). A sibling file only because of the 2,000-line cap.
+mod precise_roots;
+
+use precise_roots::{
+    lower_precise_roots_to_native_stack, retype_landing_pads_for_statepoints, PreciseRootBackend,
+};
+
 pub struct LlFunction {
     pub name: String,
     pub return_type: LlvmType,
@@ -16,23 +24,6 @@ pub struct LlFunction {
     /// Optional LLVM linkage string, e.g. `"internal"` or `"private"`. Empty
     /// string means external (default) linkage.
     pub linkage: String,
-    /// When true, the function body contains a `try` statement (setjmp/longjmp),
-    /// so the definition gets `#1` (`noinline`) and `to_ir` runs the volatile
-    /// promotion pass.
-    ///
-    /// The setjmp hazard: `longjmp` restores the callee-saved registers and
-    /// stack pointer that `setjmp` snapshotted, so any local LLVM parked in a
-    /// register across the setjmp call reverts to its setjmp-time value when
-    /// the exception fires — the try body's mutations vanish in the catch.
-    /// `returns_twice` on the setjmp call is not sufficient at -O2 on aarch64.
-    ///
-    /// This used to be handled by stamping `optnone` on the whole function,
-    /// which is correct (at -O0 every value is frame-resident) but cost ~5x on
-    /// the surrounding code even when nothing ever throws (#6385). We now apply
-    /// C's `volatile` rule precisely instead: only the allocas the try body
-    /// actually stores into get volatile accesses, and everything else in the
-    /// function stays optimizable. See [`crate::volatile_setjmp`].
-    pub has_try: bool,
     /// When true, emit `alwaysinline` attribute. Forces LLVM to inline this
     /// function at every call site, exposing integer operations to the
     /// caller's optimizer context (critical for vectorization of clamp patterns).
@@ -45,9 +36,14 @@ pub struct LlFunction {
     /// gets inlined into its loop without the binary-size blowup an
     /// unconditional `alwaysinline` threshold bump causes. See the
     /// inline-hot-small heuristic in `codegen/function.rs`. `alwaysinline`
-    /// already implies the hint, so the two are never emitted together, and
-    /// `has_try` (noinline) still wins over both in `to_ir`.
+    /// already implies the hint, so the two are never emitted together.
     pub inline_hint: bool,
+    /// Invoke-EH (#7302): this function contains landing pads (Itanium) or
+    /// funclet pads (SEH), so its `define` line must carry
+    /// `personality ptr @<name>` — `perry_eh_personality` on Mach-O/ELF,
+    /// `__C_specific_handler` on windows-msvc. Set by the try/async-boundary
+    /// dispatch (which knows the target triple).
+    pub personality: Option<&'static str>,
     blocks: Vec<LlBlock>,
     block_counter: u32,
     reg_counter: Rc<RegCounter>,
@@ -127,6 +123,14 @@ pub struct LlFunction {
     shadow_frame_push: Option<ShadowFramePush>,
     /// Slot count currently baked into that push line.
     shadow_frame_slot_count: u32,
+    /// Research backend: preserve the existing precise-root slot numbering,
+    /// but encode the slots in LLVM stack maps instead of allocating a
+    /// parallel runtime shadow frame.
+    stack_map_requested: bool,
+    /// Logical root slots reserved by the existing liveness analysis. The
+    /// final IR pass resolves these indices to the native allocas named by
+    /// `js_shadow_slot_bind` calls, removes the calls, and emits stack maps.
+    stack_map_slot_count: u32,
     /// Runtime hooks emitted immediately before each non-pointer `ret`.
     /// Entry/module-init functions use this for process-level diagnostics
     /// that must run regardless of which block reaches the normal epilogue.
@@ -211,9 +215,9 @@ impl LlFunction {
             return_type,
             params,
             linkage: String::new(),
-            has_try: false,
             force_inline: false,
             inline_hint: false,
+            personality: None,
             blocks: Vec::new(),
             block_counter: 0,
             reg_counter: Rc::new(RegCounter::new()),
@@ -227,6 +231,8 @@ impl LlFunction {
             shadow_frame_post_init_region: false,
             shadow_frame_push: None,
             shadow_frame_slot_count: 0,
+            stack_map_requested: false,
+            stack_map_slot_count: 0,
             pre_return_void_calls: Vec::new(),
         }
     }
@@ -267,6 +273,13 @@ impl LlFunction {
     }
 
     fn enable_shadow_frame_inner(&mut self, slot_count: u32, post_init: bool) {
+        if crate::codegen::helpers::native_stack_roots_enabled() {
+            self.shadow_frame_requested = true;
+            self.shadow_frame_post_init_region = post_init;
+            self.stack_map_requested = slot_count != 0;
+            self.stack_map_slot_count = slot_count;
+            return;
+        }
         if self.shadow_frame_slot.is_some() {
             return;
         }
@@ -354,6 +367,12 @@ impl LlFunction {
         if !self.shadow_frame_requested {
             return None;
         }
+        if crate::codegen::helpers::native_stack_roots_enabled() {
+            let idx = self.stack_map_slot_count;
+            self.stack_map_slot_count += 1;
+            self.stack_map_requested = true;
+            return Some(idx);
+        }
         if self.shadow_frame_push.is_none() {
             let post_init = self.shadow_frame_post_init_region;
             self.emit_shadow_frame_push(0, post_init);
@@ -394,22 +413,15 @@ impl LlFunction {
         self.pre_return_void_calls.push(func_name.into());
     }
 
-    /// Open a setjmp-protected region (#6385). Every `store` emitted into any
-    /// block of this function until the matching [`exit_try_region`] is
-    /// recorded as "modified between the setjmp and a possible longjmp", and
-    /// the alloca behind it is given volatile accesses by `to_ir`.
-    ///
-    /// Call this around the lowering of a `try` body and of a `catch` body
-    /// that a `finally` re-protects — i.e. exactly the code that a `longjmp`
-    /// can cut short. Regions nest; the depth counter handles that.
-    ///
-    /// [`exit_try_region`]: LlFunction::exit_try_region
-    pub fn enter_try_region(&self) {
-        self.reg_counter.enter_try_region();
+    /// Invoke-EH (#7302): enter/leave a handler scope. While a scope is
+    /// active, every potentially-throwing call any block of this function
+    /// emits carries an unwind edge to the scope's landing-pad label.
+    pub fn push_eh_scope(&self, lpad_label: String) {
+        self.reg_counter.push_eh_scope(lpad_label);
     }
 
-    pub fn exit_try_region(&self) {
-        self.reg_counter.exit_try_region();
+    pub fn pop_eh_scope(&self) {
+        self.reg_counter.pop_eh_scope();
     }
 
     /// Allocate a fresh stack slot in the function entry block. Returns
@@ -472,6 +484,8 @@ impl LlFunction {
     /// emitted at the top of the entry block with the other entry setup.
     pub fn entry_setup_call_void(&mut self, func_name: &str, args: &[(LlvmType, &str)]) {
         crate::ext_registry::record_ffi_call(func_name);
+        self.reg_counter
+            .note_shadow_slot_bind(func_name, args.get(1).map(|(_, v)| *v));
         let arg_str = args
             .iter()
             .map(|(ty, value)| format!("{} {}", ty, value))
@@ -561,6 +575,58 @@ impl LlFunction {
         &self.blocks
     }
 
+    /// Mutable block list, for the whole-function passes that run after
+    /// lowering. See [`crate::root_reload`].
+    pub(crate) fn blocks_mut(&mut self) -> &mut Vec<LlBlock> {
+        &mut self.blocks
+    }
+
+    pub(crate) fn reg_counter(&self) -> &RegCounter {
+        &self.reg_counter
+    }
+
+    pub(crate) fn reg_counter_rc(&self) -> Rc<RegCounter> {
+        self.reg_counter.clone()
+    }
+
+    /// Index in block 0 where `entry_post_init_setup` is spliced, if this
+    /// function has an init prelude. See [`note_entry_block_insertions`].
+    ///
+    /// [`note_entry_block_insertions`]: LlFunction::note_entry_block_insertions
+    pub(crate) fn entry_init_boundary(&self) -> Option<usize> {
+        self.entry_init_boundary
+    }
+
+    /// Tell the function that `n` instructions were inserted into block 0 **at
+    /// or above** the splice point, so the splice still lands in the same place
+    /// relative to the prelude.
+    ///
+    /// ★ The count must be exactly the insertions at index ≤ the boundary.
+    /// Neither error is cosmetic:
+    ///
+    /// - **under-counting** leaves the splice too early, and the tail of the
+    ///   init prelude ends up below it — a `keys_array` global read hoisted
+    ///   above the `__perry_init_strings_*` call that populates it, i.e. a
+    ///   zero, silently;
+    /// - **over-counting** — bumping by every insertion, including the ones
+    ///   below the boundary — leaves the splice too LATE, and `to_ir` clamps an
+    ///   out-of-range boundary with `.min(instruction_count())`, which moves the
+    ///   whole post-init region to the END of the entry block. For a function
+    ///   built by `enable_post_init_shadow_frame` that region contains the
+    ///   `js_shadow_frame_enter` call itself, so every `js_shadow_slot_bind`
+    ///   in the body then runs with no frame pushed and roots NOTHING. Measured:
+    ///   the allocation-point acceptance arm went 30/30 → 0/30 with
+    ///   `TypeError: value is not a function`, which reads exactly like the
+    ///   rooting bug the pass was written to fix.
+    pub(crate) fn note_entry_block_insertions(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        if let Some(b) = self.entry_init_boundary.as_mut() {
+            *b += n;
+        }
+    }
+
     pub fn num_blocks(&self) -> usize {
         self.blocks.len()
     }
@@ -580,7 +646,7 @@ impl LlFunction {
         let body: usize = self
             .blocks
             .iter()
-            .map(|b| b.instructions_iter().map(|i| i.len() + 1).sum::<usize>() + b.label.len() + 4)
+            .map(|b| b.insts().iter().map(|i| i.text_len() + 1).sum::<usize>() + b.label.len() + 4)
             .sum();
         let allocas: usize = self.entry_allocas.iter().map(|a| a.len() + 1).sum();
         body + allocas + self.name.len() + 64
@@ -600,136 +666,287 @@ impl LlFunction {
             format!("{} ", self.linkage)
         };
 
-        let attrs = if self.has_try {
-            // noinline (setjmp/volatile/async-rejecting boundary) always wins,
-            // even if an inline attribute was optimistically set before body
-            // lowering discovered the try.
-            " #1"
-        } else if self.force_inline {
+        let attrs = if self.force_inline {
             " alwaysinline"
         } else if self.inline_hint {
             " inlinehint"
         } else {
             ""
         };
+        // The native-stack walker recovers frames through the x29 chain, so
+        // every generated function must link one; without the attribute,
+        // textual-IR input gets no frame-pointer default from the clang
+        // driver and LLVM may omit the chain even while saving x29.
+        let frame_pointer = if crate::codegen::helpers::native_stack_roots_enabled() {
+            " \"frame-pointer\"=\"non-leaf\""
+        } else {
+            ""
+        };
+        // #7174: the `!has_try` exclusion is gone with the field. Try/catch no
+        // longer lowers to setjmp/longjmp (#7302), so nothing can jump past a
+        // `gc.relocate` any more and statepoints cover every function.
+        let gc_strategy = if self.stack_map_requested
+            && (crate::codegen::helpers::statepoints_enabled()
+                || crate::codegen::helpers::rs4gc_enabled())
+        {
+            " gc \"statepoint-example\""
+        } else {
+            ""
+        };
+        // Invoke-EH (#7302): functions containing landing/funclet pads name
+        // their personality on the define line. LLVM's grammar orders these
+        // `[fn attrs] [gc] [personality]`, so the strategy precedes it.
+        let personality = match self.personality {
+            Some(p) => format!(" personality ptr @{}", p),
+            None => String::new(),
+        };
         let mut ir = format!(
-            "define {}{} @{}({}){} {{\n",
-            linkage, self.return_type, self.name, param_str, attrs
+            "define {}{} @{}({}){}{}{}{} {{\n",
+            linkage,
+            self.return_type,
+            self.name,
+            param_str,
+            attrs,
+            frame_pointer,
+            gc_strategy,
+            personality
         );
-
-        for (i, blk) in self.blocks.iter().enumerate() {
-            if i > 0 {
-                ir.push('\n');
-            }
-            // Block 0 (entry) gets two splices in its body:
-            //   1. `entry_allocas`: hoisted allocas + a few simple init
-            //      sequences. These go at the very top, between the
-            //      label line and any block instructions, so they
-            //      dominate every reachable use in the function.
-            //   2. `entry_post_init_setup`: hoisted setup that must
-            //      run AFTER the init prelude (gc_init / init_strings
-            //      calls) so it sees the up-to-date module state. The
-            //      splice point is `entry_init_boundary`, which the
-            //      codegen marks immediately after emitting the
-            //      prelude.
-            // Both splices are textual: we re-render the block label,
-            // the prefix instructions (up to the boundary), the
-            // post-init setup, and then the rest of the block body.
-            if i == 0 && (!self.entry_allocas.is_empty() || !self.entry_post_init_setup.is_empty())
-            {
-                ir.push_str(&blk.label);
-                ir.push_str(":\n");
-                // 1. Allocas + simple inits at the very top.
-                for alloca in &self.entry_allocas {
-                    ir.push_str(alloca);
-                    ir.push('\n');
-                }
-                // 2. Render the block instructions, with the post-init
-                //    splice at the boundary index.
-                let boundary = self
-                    .entry_init_boundary
-                    .unwrap_or(0)
-                    .min(blk.instruction_count());
-                let mut idx = 0;
-                for inst in blk.instructions_iter() {
-                    if idx == boundary {
-                        for line in &self.entry_post_init_setup {
-                            ir.push_str(line);
-                            ir.push('\n');
-                        }
-                    }
-                    ir.push_str(inst);
-                    ir.push('\n');
-                    idx += 1;
-                }
-                // Boundary at end-of-block (or empty block).
-                if idx == boundary {
-                    for line in &self.entry_post_init_setup {
-                        ir.push_str(line);
-                        ir.push('\n');
-                    }
-                }
-            } else {
-                ir.push_str(&blk.to_ir());
-                ir.push('\n');
-            }
-        }
-
+        self.for_each_final_line::<std::convert::Infallible>(&mut |line| {
+            ir.push_str(line);
+            ir.push('\n');
+            Ok(())
+        })
+        .unwrap_or_else(|e| match e {});
         ir.push_str("}\n");
 
-        // Return-site rewrite hooks.
+        // The return-site rewrite hooks (shadow-stack pop, entry diagnostics)
+        // live in `for_each_final_item`, which the loop above already streamed
+        // through. This branch used to re-apply them here; after main moved
+        // them, doing both emitted `%shadow_pop_l_0` twice in the same
+        // function and clang rejected every module with a shadow frame.
+
+        // Research backend: turn the existing shadow-slot binding IR into
+        // native-frame stack maps only after lowering is complete, when every
+        // lazily-reserved scalar root and every call site is visible.
         //
-        // Shadow-stack pop (gen-GC Phase A sub-phase 2) and entry
-        // diagnostics both need to run before every normal return,
-        // regardless of which lowering path emitted it. Textual rewrite
-        // on the full IR catches implicit returns, Stmt::Return, and any
-        // hand-emitted `ret`.
-        let ir = if self.shadow_frame_slot.is_some() || !self.pre_return_void_calls.is_empty() {
-            let mut out = String::with_capacity(ir.len() + 512);
-            let mut seq: u32 = 0;
-            for line in ir.lines() {
-                let trimmed = line.trim_start();
-                if (trimmed.starts_with("ret ") || trimmed == "ret void")
-                    && !trimmed.starts_with("ret ptr ")
-                // skip rare ptr rets
-                {
-                    for func_name in &self.pre_return_void_calls {
-                        out.push_str(&format!("  call void @{}()\n", func_name));
-                    }
-                    if let Some(handle_slot) = &self.shadow_frame_slot {
-                        let load_reg = format!("%shadow_pop_l_{}", seq);
-                        seq += 1;
-                        out.push_str(&format!("  {} = load i64, ptr {}\n", load_reg, handle_slot));
-                        out.push_str(&format!(
-                            "  call void @js_shadow_frame_pop(i64 {})\n",
-                            load_reg
-                        ));
-                    }
-                }
-                out.push_str(line);
-                out.push('\n');
-            }
-            out
+        let ir = if self.stack_map_requested {
+            let backend = if crate::codegen::helpers::rs4gc_enabled() {
+                PreciseRootBackend::Rs4gc
+            } else {
+                // Not `StackMap`: that variant is gone. Both sites that set
+                // `stack_map_requested` are guarded by
+                // `native_stack_roots_enabled()`, which is exactly
+                // `statepoints_enabled() || rs4gc_enabled()`, so this branch
+                // is only reachable with statepoints on.
+                PreciseRootBackend::Statepoint
+            };
+            lower_precise_roots_to_native_stack(&ir, &self.name, self.stack_map_slot_count, backend)
         } else {
             ir
         };
 
-        // setjmp volatile promotion (#6385).
+        // RS4GC uses the unwind destination's landing pad **as the token** for
+        // the relocates it inserts on the exceptional edge, so
+        // `statepoint-example` requires that pad to be `landingpad token`.
+        // Perry emits the Itanium `{ ptr, i32 }` form, which makes RS4GC
+        // produce `gc.relocate({ ptr, i32 } %lpad, ...)` and the verifier
+        // reject the module — a try-carrying function simply fails to compile.
         //
-        // Runs LAST so it sees every instruction, including the ones the
-        // return-site rewrite above just spliced in. Any alloca this function
-        // stores into between a `setjmp` and its `longjmp` (recorded by
-        // `LlBlock::emit` while a try region was open) gets `volatile` loads
-        // and stores, which is what stops mem2reg/SROA from promoting it into
-        // a register that `longjmp` would revert. This replaces the old
-        // `optnone`-the-whole-function hammer.
-        if self.has_try {
-            let try_stores = self.reg_counter.try_region_stores();
-            if !try_stores.is_empty() {
-                return crate::volatile_setjmp::apply_setjmp_volatile(&ir, &try_stores);
-            }
+        // Retyping is safe because the pad's value is dead: `try_stmt` emits it
+        // purely to anchor the edge and branches straight on, taking the
+        // exception from the runtime rather than the pad payload. Only the type
+        // is load-bearing, and only to RS4GC.
+        //
+        // Conditioned on the same fact as `gc_strategy` above — a function that
+        // does not carry the strategy must keep the Itanium form, or its pad
+        // becomes untypeable for ordinary EH lowering.
+        let ir = if !gc_strategy.is_empty() && crate::codegen::helpers::rs4gc_enabled() {
+            retype_landing_pads_for_statepoints(&ir)
+        } else {
+            ir
+        };
+
+        // Invoke-EH (#7302): inline invoke splits move a block's true CFG
+        // tail behind `eh.contN:` labels; phi incoming-edge labels captured
+        // at emit time must follow. Runs last so it sees the streamed text.
+        if self.personality.is_some() && ir.contains("eh.cont") {
+            return crate::eh_mode::rewrite_phi_predecessors(&ir);
         }
 
         ir
     }
+
+    /// Stream every finalized BODY line of this function (block labels,
+    /// entry-alloca and post-init splices, instructions, return-site
+    /// rewrites; blank separator lines between blocks) in exactly the order
+    /// [`to_ir`] renders them — `to_ir` IS this visitor plus the define
+    /// header, closing brace, and the invoke-EH phi-predecessor rewrite
+    /// (which needs whole-function analysis and therefore text; native
+    /// construction bails on personality-carrying functions and takes the
+    /// textual path — see codegen/mod.rs).
+    ///
+    /// This is the seam the native backend consumes: per finalized line,
+    /// no per-function text materialization.
+    pub fn for_each_final_line<E>(
+        &self,
+        sink: &mut dyn FnMut(&str) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut buf = String::new();
+        self.for_each_final_item::<E>(&mut |item| {
+            buf.clear();
+            match item {
+                FinalItem::Label(l) => {
+                    buf.push_str(l);
+                    buf.push(':');
+                }
+                FinalItem::Blank => {}
+                FinalItem::Text(t) => buf.push_str(t),
+                FinalItem::Inst(i) => i.render_into(&mut buf),
+            }
+            sink(&buf)
+        })
+    }
+
+    /// Item-granular twin of [`for_each_final_line`], and the seam the native
+    /// backend consumes: typed instructions arrive as [`FinalItem::Inst`] and
+    /// are constructed directly, with no per-line text; only labels, entry
+    /// splices, synthesized return-site rewrites, and `Raw` payload splits
+    /// arrive as text. The two visitors cannot drift: the line visitor is a
+    /// rendering adapter over this one.
+    pub fn for_each_final_item<E>(
+        &self,
+        sink: &mut dyn FnMut(FinalItem<'_>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let rewrite_rets =
+            self.shadow_frame_slot.is_some() || !self.pre_return_void_calls.is_empty();
+        let mut seq: u32 = 0;
+        for (i, blk) in self.blocks.iter().enumerate() {
+            if i > 0 {
+                sink(FinalItem::Blank)?;
+            }
+            sink(FinalItem::Label(&blk.label))?;
+            let is_entry = i == 0;
+            if is_entry {
+                for alloca in &self.entry_allocas {
+                    self.text_item(alloca, rewrite_rets, &mut seq, sink)?;
+                }
+            }
+            let boundary = if is_entry {
+                self.entry_init_boundary
+                    .unwrap_or(0)
+                    .min(blk.instruction_count())
+            } else {
+                usize::MAX
+            };
+            let mut idx = 0usize;
+            for inst in blk.insts() {
+                if idx == boundary {
+                    for line in &self.entry_post_init_setup {
+                        self.text_item(line, rewrite_rets, &mut seq, sink)?;
+                    }
+                }
+                self.inst_item(inst, rewrite_rets, &mut seq, sink)?;
+                idx += 1;
+            }
+            if is_entry && idx == boundary {
+                for line in &self.entry_post_init_setup {
+                    self.text_item(line, rewrite_rets, &mut seq, sink)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn inst_item<E>(
+        &self,
+        inst: &crate::inst::LlInst,
+        rewrite_rets: bool,
+        seq: &mut u32,
+        sink: &mut dyn FnMut(FinalItem<'_>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        use crate::inst::LlInst;
+        // Multi-line raw payloads split exactly like text rendering followed
+        // by the line-based rewrite pass would.
+        if let LlInst::Raw(s) = inst {
+            if s.contains('\n') {
+                for l in s.split('\n') {
+                    self.text_item(l, rewrite_rets, seq, sink)?;
+                }
+                return Ok(());
+            }
+        }
+        if rewrite_rets {
+            let is_rewritable_ret = match inst {
+                LlInst::Ret { ty, .. } => *ty != "ptr",
+                LlInst::RetVoid => true,
+                LlInst::Raw(s) => {
+                    let t = s.trim_start();
+                    (t.starts_with("ret ") || t == "ret void") && !t.starts_with("ret ptr ")
+                }
+                _ => false,
+            };
+            if is_rewritable_ret {
+                self.yield_ret_prologue(seq, sink)?;
+            }
+        }
+        sink(FinalItem::Inst(inst))
+    }
+
+    /// Return-site rewrite, streamed: before every `ret` (except `ret ptr`),
+    /// inject the pre-return void calls and the shadow-frame pop. Byte-equal
+    /// to the old whole-text line scan.
+    fn text_item<E>(
+        &self,
+        line: &str,
+        rewrite_rets: bool,
+        seq: &mut u32,
+        sink: &mut dyn FnMut(FinalItem<'_>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        if rewrite_rets {
+            let trimmed = line.trim_start();
+            if (trimmed.starts_with("ret ") || trimmed == "ret void")
+                && !trimmed.starts_with("ret ptr ")
+            {
+                self.yield_ret_prologue(seq, sink)?;
+            }
+        }
+        sink(FinalItem::Text(line))
+    }
+
+    fn yield_ret_prologue<E>(
+        &self,
+        seq: &mut u32,
+        sink: &mut dyn FnMut(FinalItem<'_>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        for func_name in &self.pre_return_void_calls {
+            sink(FinalItem::Text(&format!("  call void @{}()", func_name)))?;
+        }
+        if let Some(handle_slot) = &self.shadow_frame_slot {
+            let load_reg = format!("%shadow_pop_l_{}", seq);
+            *seq += 1;
+            sink(FinalItem::Text(&format!(
+                "  {} = load i64, ptr {}",
+                load_reg, handle_slot
+            )))?;
+            sink(FinalItem::Text(&format!(
+                "  call void @js_shadow_frame_pop(i64 {})",
+                load_reg
+            )))?;
+        }
+        Ok(())
+    }
+}
+
+/// One finalized item of a function body. See
+/// [`LlFunction::for_each_final_item`].
+pub enum FinalItem<'a> {
+    /// Block label (no trailing colon).
+    Label(&'a str),
+    /// Blank separator line between blocks.
+    Blank,
+    /// A pre-rendered text line (entry splices, return-site rewrites,
+    /// multi-line raw payload splits).
+    Text(&'a str),
+    /// A typed instruction — the native backend constructs it directly.
+    Inst(&'a crate::inst::LlInst),
 }

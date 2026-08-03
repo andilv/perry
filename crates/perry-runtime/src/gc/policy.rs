@@ -536,7 +536,7 @@ impl GcCollectionKind {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(super) enum GcTriggerKind {
     ArenaBytes,
     MallocCount,
@@ -681,6 +681,101 @@ thread_local! {
     /// last set — the baseline the deferral slack is measured from (#7024).
     /// Meaningless while `GC_SAFEPOINT_PENDING` is false.
     pub(super) static GC_SAFEPOINT_DEFER_ARENA_BASE: Cell<usize> = const { Cell::new(0) };
+    /// True while a DECLARED safepoint drain is running: a loop back-edge
+    /// poll, the outermost microtask-pump moving minor, or an explicit
+    /// `gc()`. Consumed by the `PERRY_GC_SAFEPOINT_ONLY` contract assert in
+    /// the root-scan subphase.
+    pub(super) static GC_AT_DECLARED_SAFEPOINT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// `PERRY_GC_SAFEPOINT_ONLY` — research contract for the native-root modes
+/// (`exp/stackmap-viability`): a collection that skips the conservative stack
+/// scan consumes only precise roots, and with native stack maps active those
+/// roots exist only at mapped PCs — so such a collection may begin only at a
+/// declared safepoint; anywhere else it must scan conservatively. Codegen
+/// reads the same env to stop emitting statepoints around audited
+/// allocate-but-never-reenter helpers; the enforcement in `cycle.rs` is what
+/// turns the property from emergent (every possibly-collecting call happens
+/// to be mapped) into enforced.
+///
+/// `1`/`on`/`true` — HEAL: an undeclared precise-root cycle has the
+/// conservative scan forced for that cycle (sound: the scan restores
+/// liveness, and a conservatively-scanned cycle is non-moving). This is the
+/// measuring mode: alloc-point full collections are legitimate today and
+/// simply pay the scan.
+/// `strict` — PANIC on any undeclared precise-root cycle. This is the gate
+/// mode that proves the enforcement is live.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SafepointOnlyContract {
+    Off,
+    Heal,
+    Strict,
+}
+
+pub(super) fn gc_safepoint_only_contract() -> SafepointOnlyContract {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<SafepointOnlyContract> = OnceLock::new();
+    *CACHED.get_or_init(
+        || match std::env::var("PERRY_GC_SAFEPOINT_ONLY").as_deref() {
+            Ok("1") | Ok("on") | Ok("true") => SafepointOnlyContract::Heal,
+            Ok("strict") => SafepointOnlyContract::Strict,
+            _ => SafepointOnlyContract::Off,
+        },
+    )
+}
+
+/// Contract enforcement chokepoint, called once at every synchronous
+/// collection entry. When an undeclared precise-root collection is about to
+/// begin, heal mode returns a scan-override guard that must be held for the
+/// WHOLE collection: it flips the thread-local override that every consumer
+/// of `conservative_stack_scan_decision()` reads — the root-scan subphase,
+/// copying-minor eligibility, and the evacuation verifier alike. A previous
+/// revision healed by overriding a local variable inside the root-scan
+/// subphase only; copying-minor eligibility still read the global decision,
+/// concluded there were no conservative roots to pin, and forced evacuation
+/// moved objects that raw native-stack words still pointed at.
+pub(super) fn contract_scan_heal_guard() -> Option<super::roots::ManualGcScanGuard> {
+    if gc_safepoint_only_contract() == SafepointOnlyContract::Off {
+        return None;
+    }
+    if !super::roots::native_stack_maps_active() || GC_AT_DECLARED_SAFEPOINT.with(Cell::get) {
+        return None;
+    }
+    if matches!(
+        super::roots::conservative_stack_scan_decision(),
+        super::roots::ConservativeStackScanDecision::Scan
+    ) {
+        return None;
+    }
+    if gc_safepoint_only_contract() == SafepointOnlyContract::Strict {
+        panic!(
+            "PERRY_GC_SAFEPOINT_ONLY: precise-root collection began outside \
+             a declared safepoint"
+        );
+    }
+    Some(super::roots::ManualGcScanGuard::force_full_scan(
+        super::ConservativeScanSite::SafepointContractHeal,
+    ))
+}
+
+/// RAII marker for a declared-safepoint drain. Nesting-safe: restores the
+/// previous value so a poll firing inside a manual `gc()` cannot clear it.
+pub(super) struct DeclaredSafepointGuard {
+    prev: bool,
+}
+
+impl DeclaredSafepointGuard {
+    pub(super) fn enter() -> Self {
+        let prev = GC_AT_DECLARED_SAFEPOINT.with(|flag| flag.replace(true));
+        Self { prev }
+    }
+}
+
+impl Drop for DeclaredSafepointGuard {
+    fn drop(&mut self) {
+        let prev = self.prev;
+        GC_AT_DECLARED_SAFEPOINT.with(|flag| flag.set(prev));
+    }
 }
 
 /// Committed arena bytes a deferred nursery trigger may allocate **past the
@@ -1415,7 +1510,26 @@ pub fn gc_check_trigger() {
     // register-imprecise alloc point. Unlike `gc_scavenge_enabled()` (which skips
     // the conservative scan HERE — sound only if the alloc point is precise), the
     // loop-polls path never reaches the skip: it always defers to a real
-    // safepoint, so it is sound by construction.
+    // safepoint.
+    //
+    // #7280: that used to read "so it is sound by construction". IT IS NOT, and
+    // the overclaim is the kind that stops the next person looking. What
+    // deferring to `js_gc_loop_safepoint` buys is precise *codegen* roots — the
+    // loop body has completed, so every live value the COMPILED frame holds is a
+    // named local on the shadow stack. It buys nothing for a value parked in a
+    // RUNTIME (Rust) frame, which the precise walk does not visit at all: no
+    // shadow slot, no temp root, no registered scanner. A back-edge poll that
+    // fires while `js_new_function_construct` is midway through a user
+    // constructor body relocates the instance that helper is holding in a plain
+    // `let`, and no safepoint's root set covers it. That was measured, not
+    // argued — four reproducers in
+    // `test-files/test_gap_gc_dynamic_construct_receiver_rooting.ts`, 200/200
+    // iterations wrong per route before the `RuntimeHandleScope` routing in
+    // `object/class_registry/construct.rs`. The correct statement is: the
+    // loop-polls route makes the COLLECTION POINT precise; keeping runtime
+    // frames rooted across it is a separate obligation, discharged by
+    // `RuntimeHandleScope`, and every runtime helper that calls back into user
+    // JS owes it.
     if !gc_budgeted_cycle_active()
         && (super::gc_scavenge_enabled()
             || gc_moving_loop_polls_enabled()
@@ -1697,6 +1811,7 @@ pub(crate) fn gc_safepoint_moving_minor() {
     // We are handling this safepoint (collect or find nothing due): clear the
     // deferral flag set by the alloc-point arm (Phase 2/3).
     GC_SAFEPOINT_PENDING.with(|p| p.set(false));
+    let _declared = DeclaredSafepointGuard::enter();
     let kind = match gc_budgeted_due_trigger() {
         Some(BudgetedGcTrigger::ArenaBytes) => GcTriggerKind::ArenaBytes,
         Some(BudgetedGcTrigger::MallocCount) => GcTriggerKind::MallocCount,

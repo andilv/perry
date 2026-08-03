@@ -67,9 +67,97 @@ pub(super) fn shadow_stack_enabled() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        !matches!(
+        let on = !matches!(
             std::env::var("PERRY_SHADOW_STACK").as_deref(),
             Ok("0") | Ok("off") | Ok("false")
+        );
+        // #7326: the statepoint backends are an alternative *lowering* of this
+        // analysis, not an independent mechanism. `reserve_shadow_slot()` is
+        // the single entry point that, under `native_stack_roots_enabled()`,
+        // allocates a stack-map slot instead of a shadow-stack slot — and the
+        // caller of that analysis returns empty maps outright when this is off.
+        //
+        // So switching the shadow stack off switches the statepoint roots off
+        // with it, and the result is a binary with NO precise frame roots that
+        // still runs and prints the right answer: measured, no `__perry_gcmap`
+        // section at all, same size as a plain shadow-off build. Nothing about
+        // the run distinguishes it from a correct one until a collection frees
+        // a live object.
+        //
+        // Refuse, rather than emit it. The bisection knob keeps its meaning on
+        // its own; it simply cannot be combined with a backend that depends on
+        // the analysis it disables.
+        if !on && native_stack_roots_enabled() {
+            panic!(
+                "perry: PERRY_SHADOW_STACK=0 cannot be combined with \
+                 PERRY_STATEPOINTS/PERRY_RS4GC. The statepoint backends reuse the \
+                 shadow stack's root-set analysis to decide what to root, so \
+                 disabling it produces a binary with no precise frame roots at all \
+                 — silently, since such a binary still runs correctly until a \
+                 collection moves something live (#7326). Drop one of the two."
+            );
+        }
+        on
+    })
+}
+
+/// Research-only moving-GC backend using LLVM's explicit statepoint
+/// relocation sequence (`PERRY_STATEPOINTS=1`).
+///
+/// The standalone plain-stack-map mode (`PERRY_STACK_MAPS`) was deleted per
+/// the GC knob kill-policy after the quiet-host matrix: statepoints matched
+/// it within timer quantization, and it is structurally unsound — LLVM's
+/// stackmap intrinsic can record a root slot's address as `Register R#N`
+/// (caller-saved, unrecoverable at collection time), making those roots
+/// invisible to the collector by construction. The plain-map LOWERING
+/// survives only as this mode's internal fallback for `try`/setjmp
+/// functions and unsupported call forms. The Register hazard exists there
+/// too, which is why shrinking the fallback set is the remaining
+/// correctness work for this backend, tracked in the experiment doc.
+pub(crate) fn statepoints_enabled() -> bool {
+    matches!(
+        std::env::var("PERRY_STATEPOINTS").as_deref(),
+        Ok("1") | Ok("on") | Ok("true")
+    )
+}
+
+/// `PERRY_RS4GC=1` — research pipeline for #7174: root allocas become
+/// `ptr addrspace(1)`, functions are tagged `gc "statepoint-example"`, and
+/// each module is piped through `opt -passes='function(mem2reg),
+/// rewrite-statepoints-for-gc'` before clang. LLVM then inserts every
+/// statepoint, relocation, and downstream-use rewrite itself — replacing the
+/// explicit bridge's hand emission and its conservative CFG-union liveness.
+/// Requires an `opt` binary (`PERRY_LLVM_OPT`, Homebrew LLVM, or PATH).
+pub(crate) fn rs4gc_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        matches!(
+            std::env::var("PERRY_RS4GC").as_deref(),
+            Ok("1") | Ok("on") | Ok("true")
+        )
+    })
+}
+
+/// Whether precise roots should use a native-stack metadata backend rather
+/// than Perry's heap-backed shadow frame.
+pub(crate) fn native_stack_roots_enabled() -> bool {
+    statepoints_enabled() || rs4gc_enabled()
+}
+
+/// `PERRY_GC_SAFEPOINT_ONLY=1` — the explicit-safepoint collection contract
+/// (research, `exp/stackmap-viability`). The runtime enforces that a
+/// precise-root collection only begins at a declared safepoint; under that
+/// guarantee, audited allocate-but-never-reenter helpers
+/// (`GcCallEffect::AllocNoReentry`) need no statepoint. Participates in both
+/// build and object cache keys.
+pub(crate) fn gc_safepoint_only_contract_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        matches!(
+            std::env::var("PERRY_GC_SAFEPOINT_ONLY").as_deref(),
+            Ok("1") | Ok("on") | Ok("true") | Ok("strict")
         )
     })
 }

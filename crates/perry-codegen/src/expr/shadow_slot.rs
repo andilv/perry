@@ -44,19 +44,28 @@ pub(crate) fn expr_is_known_non_pointer_shadow_value(ctx: &FnCtx<'_>, expr: &Exp
         Expr::LocalGet(id) => {
             // A reserved shadow slot means the local is pointer-possible even
             // if its initializer refined `local_types` to a scalar.
+            //
+            // #7236: this list also carried `HirType::Symbol`, and it is a
+            // SEPARATE hazard from the missing shadow slot — a `true` here
+            // suppresses `temp_root`'s argument/operand rooting, so
+            // `obj[s] = alloc()` with `s: symbol` left the movable symbol
+            // unrooted across the allocating call even once the local itself
+            // had a slot. `lower_call/closure_analysis.rs`'s
+            // `local_is_inert_primitive` never listed `Symbol`; this copy and
+            // `collectors/pointer_locals.rs` were the two that did.
+            //
+            // Derived from the one definition rather than restated, but kept
+            // NON-`Union` on purpose: `type_is_pointer_bearing` answers `false`
+            // for an all-scalar union (`number | undefined`), which would
+            // WIDEN this suppression to locals it never covered. That is a
+            // plausible optimisation and an unmeasured one; it is not this
+            // change. The guard makes the arm exactly the old list minus
+            // `Symbol`.
             !ctx.shadow_slot_map.contains_key(id)
-                && matches!(
-                    ctx.local_types.get(id),
-                    Some(
-                        HirType::Number
-                            | HirType::Int32
-                            | HirType::Boolean
-                            | HirType::Null
-                            | HirType::Void
-                            | HirType::Never
-                            | HirType::Symbol
-                    )
-                )
+                && ctx.local_types.get(id).is_some_and(|ty| {
+                    !matches!(ty, HirType::Union(_))
+                        && !crate::typed_shape::type_is_pointer_bearing(ty)
+                })
         }
         Expr::Compare { .. } | Expr::Void(_) => true,
         Expr::Unary { .. } => true,
@@ -197,6 +206,19 @@ pub(crate) fn emit_shadow_slot_bind_for_local(ctx: &mut FnCtx<'_>, local_id: u32
         return;
     };
     ctx.shadow_slots_bound.insert(slot_idx);
+    if crate::codegen::helpers::native_stack_roots_enabled() {
+        // Kept temporarily as a textual marker: LlFunction's final stack-map
+        // lowering records `slot_idx -> local_slot` and removes this call.
+        // The incremental root barrier remains real because the native slot
+        // can be updated after an in-flight cycle scanned this frame.
+        ctx.block().call_void(
+            "js_shadow_slot_bind",
+            &[(I32, &slot_idx.to_string()), (PTR, &local_slot)],
+        );
+        let value_bits = ctx.block().load(I64, &local_slot);
+        emit_persistent_shadow_root_barrier(ctx, &value_bits);
+        return;
+    }
     // #7088: the hot per-store root write. Emitted inline against this
     // activation's cached `ShadowStackState` pointer when it has one; falls
     // through to the call otherwise.

@@ -78,13 +78,58 @@ pub(crate) unsafe fn ptr_is_raw_json_wrapper(ptr: *const u8) -> bool {
         && (*obj).class_id == RAW_JSON_CLASS_ID
 }
 
+// #7211: same defect as the `typeof` string cache, found by grepping for the
+// shape once that one was diagnosed — a thread-local holding a raw nursery
+// `StringHeader*` with nothing registering it as a root. Allocated once,
+// referenced by nothing else, so the first minor sweeps or evacuates it and
+// every later `JSON.rawJSON(...)` writes its own property under a from-space
+// key. Hoisted out of the function body so `scan_raw_json_key_root_mut` can
+// reach it.
+thread_local! {
+    static RAW_JSON_KEY: std::cell::Cell<*mut StringHeader> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// GC mutable-root scanner for the cached `"rawJSON"` key (#7211). Marks it so
+/// it is not swept and rewrites it so an evacuating minor cannot leave the cell
+/// naming from-space.
+pub fn scan_raw_json_key_root_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
+    RAW_JSON_KEY.with(|cell| {
+        let mut ptr = cell.get() as *const StringHeader;
+        if ptr.is_null() {
+            return;
+        }
+        if visitor.visit_tagged_raw_const_ptr_slot(&mut ptr, crate::value::STRING_TAG) {
+            cell.set(ptr as *mut StringHeader);
+        }
+    });
+}
+
+/// Populate the cache the way `js_json_raw_json` does, and hand back the
+/// pointer it cached. Test-only.
+#[cfg(test)]
+pub(crate) fn raw_json_key_populate_for_test() -> *mut StringHeader {
+    raw_json_key() as *mut StringHeader
+}
+
+/// Read the cell WITHOUT populating it. Test-only.
+#[cfg(test)]
+pub(crate) fn raw_json_key_peek_for_test() -> *mut StringHeader {
+    RAW_JSON_KEY.with(|c| c.get())
+}
+
+/// Drop the cached key. Test-only, and the mirror of
+/// `builtins::arithmetic::reset_typeof_string_cache_for_test` — a rooting test
+/// has to start from an empty cache so the string it then allocates is its
+/// own, in a known arena.
+#[cfg(test)]
+pub(crate) fn reset_raw_json_key_cache_for_test() {
+    RAW_JSON_KEY.with(|c| c.set(std::ptr::null_mut()));
+}
+
 /// Cached `"rawJSON"` key string used for the wrapper's own property.
 fn raw_json_key() -> *const StringHeader {
-    use std::cell::Cell;
-    thread_local! {
-        static KEY: Cell<*mut StringHeader> = const { Cell::new(std::ptr::null_mut()) };
-    }
-    KEY.with(|c| {
+    RAW_JSON_KEY.with(|c| {
         let p = c.get();
         if !p.is_null() {
             return p as *const StringHeader;

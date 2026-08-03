@@ -44,6 +44,39 @@ fn strip_leading_linkage(s: &str) -> &str {
 /// single copy when the same global is emitted into multiple units. `external`
 /// declarations (no initializer) are returned unchanged — duplicating a
 /// declaration is harmless.
+
+/// Symbol name of a global/string definition line (`@name = ...`).
+fn global_symbol_name(line: &str) -> Option<&str> {
+    let line = line.trim_start();
+    if !line.starts_with('@') {
+        return None;
+    }
+    let end = line.find(" = ")?;
+    Some(&line[..end])
+}
+
+/// Collect every `@symbol` referenced in a chunk of IR text.
+fn collect_symbol_refs(text: &str, out: &mut HashSet<String>) {
+    let b = text.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'@' {
+            let start = i;
+            i += 1;
+            while i < b.len()
+                && (b[i].is_ascii_alphanumeric() || matches!(b[i], b'_' | b'.' | b'$' | b'-'))
+            {
+                i += 1;
+            }
+            if i > start + 1 {
+                out.insert(text[start..i].to_string());
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
 fn promote_global_for_units(line: &str) -> String {
     if line.contains(" = external ") {
         return line.to_string();
@@ -97,7 +130,7 @@ fn promote_global_for_units(line: &str) -> String {
 /// * Anything that can allocate or trigger GC gets NO group — the moving
 ///   GC's shadow-stack reload discipline depends on those calls staying
 ///   maximally clobbering.
-/// * Anything that can reach `js_throw` (setjmp/longjmp) gets NO group —
+/// * Anything that can reach `js_throw` (raises through the unwinder) gets NO group —
 ///   `willreturn` would let DCE delete a throwing call whose result is
 ///   unused, silently dropping the exception.
 ///
@@ -109,7 +142,7 @@ fn promote_global_for_units(line: &str) -> String {
 /// string/object paths read+parse and reach ToPrimitive),
 /// `js_value_length_f64` (Buffer/TypedArray registry lookups take locks —
 /// a lock acquisition writes memory).
-fn helper_decl_attrs(name: &str) -> &'static str {
+pub(crate) fn helper_decl_attrs(name: &str) -> &'static str {
     match name {
         // PURE — each verified: pure bit tests/masking on the f64/i64 args,
         // total over arbitrary bits, no memory access anywhere in the body.
@@ -159,19 +192,14 @@ fn helper_decl_attrs(name: &str) -> &'static str {
 /// Synthesize an external `declare` line matching a locally-defined function's
 /// signature, so a codegen unit that calls it (but does not define it) resolves
 /// the call at link time.
-fn declare_line_for(f: &LlFunction) -> String {
+pub(crate) fn declare_line_for(f: &LlFunction) -> String {
     let params = f
         .params
         .iter()
         .map(|(t, _)| t.to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    let attrs = if f.name == "setjmp" || f.name == "_setjmp" {
-        " #0"
-    } else {
-        ""
-    };
-    format!("declare {} @{}({}){}", f.return_type, f.name, params, attrs)
+    format!("declare {} @{}({})", f.return_type, f.name, params)
 }
 
 /// Render a function with external linkage forced, promoting an `internal` /
@@ -183,6 +211,30 @@ fn render_fn_external(f: &LlFunction) -> String {
         return ir.replacen(&format!("define {} ", f.linkage), "define ", 1);
     }
     ir
+}
+
+fn push_statepoint_declarations(ir: &mut String) {
+    ir.push_str(
+        "declare token @llvm.experimental.gc.statepoint.p0(i64 immarg, i32 immarg, ptr, \
+         i32 immarg, i32 immarg, ...)\n\
+         declare ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token, i32 immarg, \
+         i32 immarg)\n",
+    );
+    for (suffix, ty) in [
+        ("i1", "i1"),
+        ("i8", "i8"),
+        ("i16", "i16"),
+        ("i32", "i32"),
+        ("i64", "i64"),
+        ("i128", "i128"),
+        ("f32", "float"),
+        ("f64", "double"),
+        ("p0", "ptr"),
+    ] {
+        ir.push_str(&format!(
+            "declare {ty} @llvm.experimental.gc.result.{suffix}(token)\n"
+        ));
+    }
 }
 
 pub struct LlModule {
@@ -256,24 +308,80 @@ impl LlModule {
         }
         self.declared_names.insert(name.to_string());
         let param_str = param_types.join(", ");
-        // setjmp needs the `returns_twice` attribute to prevent
-        // LLVM from promoting alloca slots to SSA registers across
-        // the setjmp boundary. Without it, local variables modified
-        // between setjmp and longjmp are clobbered when the second
-        // return (via longjmp) happens.
-        //
         // Verified-pure runtime helpers get the #2/#3 optimization groups
         // (#6082) — see `helper_decl_attrs` for the audit invariants. The
         // lookup is name-keyed here in the single declaration funnel so
         // every declaration path agrees on the attributes.
-        let attrs = if name == "setjmp" || name == "_setjmp" {
-            " #0"
-        } else {
-            helper_decl_attrs(name)
-        };
+        let attrs = helper_decl_attrs(name);
         self.declarations.push((
             name.to_string(),
             format!("declare {} @{}({}){}", return_type, name, param_str, attrs),
+        ));
+    }
+
+    /// SEH funclets (#7302): true when this module targets windows-msvc AND
+    /// contains try/catch, i.e. when its EH lowering is
+    /// `catchswitch`/`catchpad`/`catchret` rather than Itanium landing pads.
+    ///
+    /// The in-process LLVM reader can build `invoke`/`landingpad` but NOT
+    /// the funclet forms: inkwell 0.9 exposes no `build_catch_switch` /
+    /// `build_catch_pad` / `build_catch_ret` (only an opcode enum for
+    /// reading them), so constructing them needs raw `llvm-sys` FFI. Until
+    /// that lands, such modules take the textual path — declining costs
+    /// nothing but the in-process speedup, whereas letting the reader hit
+    /// the instruction is a hard compile error.
+    pub fn needs_eh_funclets(&self) -> bool {
+        self.target_triple.contains("-windows-")
+            && self.functions.iter().any(|f| f.personality.is_some())
+    }
+
+    /// Invoke-EH (#7302): declare the personality routine referenced by
+    /// every `define ... personality ptr @perry_eh_personality`. Declared
+    /// varargs — the symbol is only ever *named* on define lines and in the
+    /// unwind tables; generated code never calls it.
+    pub fn declare_personality(&mut self) {
+        if self.declared_names.contains("perry_eh_personality") {
+            return;
+        }
+        self.declared_names
+            .insert("perry_eh_personality".to_string());
+        self.declarations.push((
+            "perry_eh_personality".to_string(),
+            "declare i32 @perry_eh_personality(...)".to_string(),
+        ));
+    }
+
+    /// Invoke-EH on windows-msvc (#7302): the SEH personality plus the
+    /// module-local `__except` filter every catchpad names. The filter
+    /// accepts exactly Perry's `RaiseException` code 0xE0504A53 ("PJS" |
+    /// 0xE0000000, `perry-runtime/src/eh.rs`), so foreign SEH exceptions
+    /// (access violations etc.) keep unwinding past JS handlers — the
+    /// setjmp path never caught those either. Rendered among the
+    /// declarations; LLVM accepts interleaved declares/defines.
+    pub fn declare_seh_machinery(&mut self) {
+        if self.declared_names.contains("__C_specific_handler") {
+            return;
+        }
+        self.declared_names
+            .insert("__C_specific_handler".to_string());
+        self.declarations.push((
+            "__C_specific_handler".to_string(),
+            "declare i32 @__C_specific_handler(...)".to_string(),
+        ));
+        self.declared_names.insert("perry_seh_filter".to_string());
+        self.declarations.push((
+            "perry_seh_filter".to_string(),
+            concat!(
+                "define internal i32 @perry_seh_filter(ptr %eptrs, ptr %frame) {\n",
+                "entry:\n",
+                "  %rec = load ptr, ptr %eptrs\n",
+                "  %code = load i32, ptr %rec\n",
+                "  %ok = icmp eq i32 %code, -531609005\n",
+                "  %r = zext i1 %ok to i32\n",
+                "  ret i32 %r\n",
+                "}"
+            )
+            .to_string(),
         ));
     }
 
@@ -326,6 +434,17 @@ impl LlModule {
 
     pub fn function_mut(&mut self, idx: usize) -> Option<&mut LlFunction> {
         self.functions.get_mut(idx)
+    }
+
+    /// Every defined function, mutably — for the whole-module passes that run
+    /// after lowering and before any rendering path. See
+    /// [`crate::root_reload`], and note that "before ANY rendering path" is the
+    /// load-bearing part: the text renderer (`to_ir`, `render_codegen_units`)
+    /// and the in-process constructor (`for_each_final_line`) are separate
+    /// consumers, so a pass living inside one of them would silently not apply
+    /// to the other.
+    pub(crate) fn functions_mut(&mut self) -> impl Iterator<Item = &mut LlFunction> {
+        self.functions.iter_mut()
     }
 
     /// Number of functions defined so far. Used to recover the index of a
@@ -435,7 +554,7 @@ impl LlModule {
     /// dispatch ambiguity limited to genuinely name-colliding members — proper
     /// disambiguation by class id is a separate concern). Shared by [`to_ir`]
     /// and [`render_codegen_units`] so both paths agree on the symbol set.
-    fn deduped_function_refs(&self) -> Vec<&LlFunction> {
+    pub(crate) fn deduped_function_refs(&self) -> Vec<&LlFunction> {
         let mut seen: HashSet<&str> = HashSet::with_capacity(self.functions.len());
         self.functions
             .iter()
@@ -443,11 +562,64 @@ impl LlModule {
             .collect()
     }
 
+    /// The module *skeleton*: everything [`to_ir`] emits EXCEPT function
+    /// definitions — header, string constants, globals, declarations (still
+    /// filtered against defined names, which the native path adds via the C
+    /// API), attribute groups and metadata.
+    ///
+    /// This is the only text the native construction path
+    /// (`PERRY_LLVM_INPROCESS=native`) still parses: a few KB of module
+    /// scaffolding, while every function body is built in memory. It must
+    /// stay in lockstep with [`to_ir`] — both are thin loops over the same
+    /// fields, and `native_emit`'s differential mode diffs the two paths'
+    /// printed modules to catch drift.
+    #[cfg(feature = "llvm-inprocess")]
+    pub(crate) fn skeleton_ir(&self) -> String {
+        let mut ir = String::new();
+        ir.push_str("; Generated by perry-codegen\n");
+        ir.push_str(&format!("target triple = \"{}\"\n\n", self.target_triple));
+        for sc in &self.string_constants {
+            ir.push_str(sc);
+            ir.push('\n');
+        }
+        ir.push('\n');
+        for g in &self.globals {
+            ir.push_str(g);
+            ir.push('\n');
+        }
+        ir.push('\n');
+        let defined: HashSet<&str> = self
+            .deduped_function_refs()
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        for (name, decl) in &self.declarations {
+            if defined.contains(name.as_str()) {
+                continue;
+            }
+            ir.push_str(decl);
+            ir.push('\n');
+        }
+        ir.push('\n');
+        self.push_attrs_and_metadata(&mut ir);
+        ir
+    }
+
     /// Serialize the module to a complete `.ll` file.
     pub fn to_ir(&self) -> String {
         let mut ir = String::new();
         ir.push_str("; Generated by perry-codegen\n");
         ir.push_str(&format!("target triple = \"{}\"\n\n", self.target_triple));
+        if crate::codegen::helpers::native_stack_roots_enabled()
+            && self.target_triple.contains("apple")
+        {
+            // LLVM emits one local `__LLVM_StackMaps` atom per object. Perry's
+            // normal `-dead_strip` link otherwise discards those unreferenced
+            // atoms. This Mach-O directive marks each local atom live without
+            // globalizing the repeated symbol (which would collide across
+            // codegen units).
+            ir.push_str("module asm \".no_dead_strip __LLVM_StackMaps\"\n\n");
+        }
 
         for sc in &self.string_constants {
             ir.push_str(sc);
@@ -473,6 +645,12 @@ impl LlModule {
             ir.push_str(decl);
             ir.push('\n');
         }
+        if crate::codegen::helpers::native_stack_roots_enabled() {
+            ir.push_str("declare void @llvm.experimental.stackmap(i64, i32, ...)\n");
+        }
+        if crate::codegen::helpers::statepoints_enabled() {
+            push_statepoint_declarations(&mut ir);
+        }
         ir.push('\n');
 
         for func in &funcs {
@@ -490,33 +668,6 @@ impl LlModule {
     /// same attributes and metadata (so `#0`/`#1` and `!N` references resolve in
     /// every unit). Over-emitting an unused attribute group is harmless.
     fn push_attrs_and_metadata(&self, ir: &mut String) {
-        // Attribute group for setjmp's `returns_twice` marker. Only emit if
-        // setjmp (any variant) was declared. Apple declares `_setjmp`, Windows
-        // `_setjmp` (2-arg ABI), Linux `setjmp` — all need `returns_twice`.
-        if self.declared_names.contains("setjmp") || self.declared_names.contains("_setjmp") {
-            ir.push_str("\nattributes #0 = { returns_twice }\n");
-            // Functions containing a `try` are marked `#1`.
-            //
-            // This group used to carry `optnone` as well, to stop mem2reg/SROA
-            // from promoting allocas across the setjmp call (a promoted local
-            // lives in a callee-saved register, which `longjmp` restores to its
-            // setjmp-time value — so try-body mutations were invisible to the
-            // catch). That worked, but it deoptimized the ENTIRE function: just
-            // having a `try` cost ~5x on the surrounding loop even when nothing
-            // ever threw (#6385).
-            //
-            // The promotion is now blocked surgically instead, by emitting
-            // `volatile` loads/stores for exactly the allocas the try body
-            // writes (see `crate::volatile_setjmp`) — LLVM refuses to promote
-            // an alloca with any volatile access. Everything else optimizes.
-            //
-            // `noinline` stays. LLVM's `isInlineViable` already refuses to
-            // inline a function that contains a `returns_twice` call, so this
-            // is belt-and-braces rather than load-bearing — but it keeps the
-            // setjmp frame's identity from depending on an internal inliner
-            // policy, at zero cost.
-            ir.push_str("attributes #1 = { noinline }\n");
-        }
         // Verified runtime-helper groups (#6082) — emitted only when a
         // declaration actually references them (mirrors the setjmp gating
         // above). See `helper_decl_attrs` for the audit invariants.
@@ -569,13 +720,18 @@ impl LlModule {
     ///     `internal` init/wrapper is promoted so cross-unit calls bind);
     ///   * the shared attribute groups + metadata (so `#N`/`!N` refs resolve).
     ///
-    /// `n <= 1` (or a single-function module) returns one text identical to
-    /// [`to_ir`]. The caller compiles each text to an object and combines them
-    /// (`ld -r`) into one object, keeping `compile_module`'s single-object API.
-    pub fn render_codegen_units(&self, n: usize) -> Vec<String> {
+    /// `n <= 1` (or a single-function module) returns a single part whose
+    /// `funcs` are all functions (callers use the whole-module path). The
+    /// text caller compiles each rendered part and combines them (`ld -r`)
+    /// into one object, keeping `compile_module`'s single-object API.
+    pub(crate) fn codegen_unit_parts(&self, n: usize) -> Vec<CodegenUnitPart<'_>> {
         let funcs = self.deduped_function_refs();
         if n <= 1 || funcs.len() <= 1 {
-            return vec![self.to_ir()];
+            return vec![CodegenUnitPart {
+                pre: String::new(),
+                post: String::new(),
+                funcs,
+            }];
         }
         let n = n.min(funcs.len());
 
@@ -628,44 +784,187 @@ impl LlModule {
                 .or_insert_with(|| declare_line_for(f));
         }
 
-        let mut units = Vec::with_capacity(n);
-        for bucket in &buckets {
+        // #7174 (real-app scaling): render each bucket's functions first, then
+        // give every global/string exactly ONE defining unit and hand the rest
+        // an `external` declaration. Replicating all definitions into every
+        // unit made per-unit IR grow with unit COUNT — on the 13 MB Claude Code
+        // bundle that meant ~400 MB units and `clang: translation unit is too
+        // large ... ran out of source locations`, no matter how finely it was
+        // split. Definitions are already `linkonce_odr` (visible), so an
+        // external declaration resolves to the same symbol at link time.
+        let bucket_texts: Vec<String> = buckets
+            .iter()
+            .map(|bucket| {
+                let mut t = String::new();
+                for func in bucket {
+                    t.push_str(&render_fn_external(func));
+                    t.push('\n');
+                }
+                t
+            })
+            .collect();
+        let bucket_refs: Vec<HashSet<String>> = bucket_texts
+            .iter()
+            .map(|t| {
+                let mut refs = HashSet::new();
+                collect_symbol_refs(t, &mut refs);
+                refs
+            })
+            .collect();
+
+        // A global is emitted into every unit that REFERENCES it — normally
+        // exactly one, and `linkonce_odr` lets the linker fold the rare
+        // multi-unit case. Definition-in-one-unit + `external` elsewhere was
+        // tried first and is subtly wrong under `-dead_strip`: the sole
+        // definition can be discarded with its unit's atoms while a live
+        // reference survives in another object.
+        let all_globals: Vec<&String> =
+            shared_strings.iter().chain(shared_globals.iter()).collect();
+        // Globals reference OTHER globals in their initializers (a string
+        // header pointing at its `.bytes` payload, a closure record naming its
+        // thunk). Function-text references alone therefore under-approximate
+        // what a unit needs — the first cut emitted `@....str.N.bytes` nowhere
+        // and clang rejected the unit with "use of undefined value". Close the
+        // reference set transitively per unit before deciding what to emit.
+        let global_index: std::collections::HashMap<&str, usize> = all_globals
+            .iter()
+            .enumerate()
+            .filter_map(|(i, def)| global_symbol_name(def).map(|nm| (nm, i)))
+            .collect();
+        let global_refs: Vec<HashSet<String>> = all_globals
+            .iter()
+            .map(|def| {
+                let mut refs = HashSet::new();
+                collect_symbol_refs(def, &mut refs);
+                refs
+            })
+            .collect();
+        let bucket_needs: Vec<HashSet<usize>> = bucket_refs
+            .iter()
+            .map(|refs| {
+                let mut need: HashSet<usize> = refs
+                    .iter()
+                    .filter_map(|nm| global_index.get(nm.as_str()).copied())
+                    .collect();
+                let mut work: Vec<usize> = need.iter().copied().collect();
+                while let Some(gi) = work.pop() {
+                    for nm in &global_refs[gi] {
+                        if let Some(&next) = global_index.get(nm.as_str()) {
+                            if need.insert(next) {
+                                work.push(next);
+                            }
+                        }
+                    }
+                }
+                need
+            })
+            .collect();
+        let referenced_anywhere: Vec<bool> = (0..all_globals.len())
+            .map(|gi| bucket_needs.iter().any(|need| need.contains(&gi)))
+            .collect();
+
+        let mut post = String::new();
+        self.push_attrs_and_metadata(&mut post);
+
+        let mut parts = Vec::with_capacity(n);
+        for (bi, bucket) in buckets.into_iter().enumerate() {
             let defined: HashSet<&str> = bucket.iter().map(|f| f.name.as_str()).collect();
-            let mut ir = String::new();
-            ir.push_str("; Generated by perry-codegen (codegen unit)\n");
-            ir.push_str(&format!("target triple = \"{}\"\n\n", self.target_triple));
-
-            for sc in &shared_strings {
-                ir.push_str(sc);
-                ir.push('\n');
+            let mut pre = String::new();
+            pre.push_str("; Generated by perry-codegen (codegen unit)\n");
+            pre.push_str(&format!("target triple = \"{}\"\n\n", self.target_triple));
+            if crate::codegen::helpers::native_stack_roots_enabled()
+                && self.target_triple.contains("apple")
+            {
+                pre.push_str("module asm \".no_dead_strip __LLVM_StackMaps\"\n\n");
             }
-            ir.push('\n');
-            for g in &shared_globals {
-                ir.push_str(g);
-                ir.push('\n');
-            }
-            ir.push('\n');
 
-            // Declares for everything this unit references but does not define.
+            for (gi, def) in all_globals.iter().enumerate() {
+                let referenced = bucket_needs[bi].contains(&gi);
+                // Unreferenced globals (anchors, `llvm.*`, appending lists)
+                // keep a home in unit 0 so nothing is lost.
+                if referenced || (!referenced_anywhere[gi] && bi == 0) {
+                    pre.push_str(def);
+                    pre.push('\n');
+                }
+            }
+            pre.push('\n');
+
+            // Declares for everything this unit REFERENCES but does not
+            // define. Emitting the whole module's declaration list into every
+            // unit left a per-unit floor that splitting cannot reduce: a
+            // 24-function benchmark carried 2,972 declares (149 KB) per unit,
+            // and the 13 MB Claude Code bundle carried ~16,700 — which is how
+            // units stayed above a gigabyte and hit clang's 2^31 source-location
+            // ceiling ("translation unit is too large ... ran out of source
+            // locations") regardless of unit count. Referenced names include
+            // those reached through the initializers of the globals this unit
+            // emits, so the closure computed above feeds this filter too.
+            // `collect_symbol_refs` yields `@name`; `decl_by_name` is keyed on
+            // the bare name, so strip the sigil or nothing ever matches.
+            let mut needed: HashSet<&str> = bucket_refs[bi]
+                .iter()
+                .map(|nm| nm.trim_start_matches('@'))
+                .collect();
+            for gi in &bucket_needs[bi] {
+                for nm in &global_refs[*gi] {
+                    needed.insert(nm.trim_start_matches('@'));
+                }
+            }
             for (name, decl) in &decl_by_name {
-                if defined.contains(name) {
+                if defined.contains(name) || !needed.contains(*name) {
                     continue;
                 }
-                ir.push_str(decl);
-                ir.push('\n');
+                pre.push_str(decl);
+                pre.push('\n');
             }
-            ir.push('\n');
-
-            for func in bucket {
-                ir.push_str(&render_fn_external(func));
-                ir.push('\n');
+            if crate::codegen::helpers::native_stack_roots_enabled() {
+                pre.push_str("declare void @llvm.experimental.stackmap(i64, i32, ...)\n");
             }
+            if crate::codegen::helpers::statepoints_enabled() {
+                push_statepoint_declarations(&mut pre);
+            }
+            pre.push('\n');
 
-            self.push_attrs_and_metadata(&mut ir);
-            units.push(ir);
+            parts.push(CodegenUnitPart {
+                pre,
+                post: post.clone(),
+                funcs: bucket,
+            });
         }
-        units
+        parts
     }
+
+    /// Render this module as `n` independent codegen-unit `.ll` texts (#5391).
+    /// Thin text renderer over [`codegen_unit_parts`]; the native construction
+    /// path consumes the parts directly.
+    pub fn render_codegen_units(&self, n: usize) -> Vec<String> {
+        let parts = self.codegen_unit_parts(n);
+        if parts.len() == 1 {
+            return vec![self.to_ir()];
+        }
+        parts
+            .into_iter()
+            .map(|part| {
+                let mut ir = part.pre;
+                for func in &part.funcs {
+                    ir.push_str(&render_fn_external(func));
+                    ir.push('\n');
+                }
+                ir.push_str(&part.post);
+                ir
+            })
+            .collect()
+    }
+}
+
+/// One codegen unit, pre-render: the textual skeleton around the functions
+/// (`pre` = header/strings/globals/cross-unit declares; `post` = shared
+/// attribute groups + metadata) plus the functions themselves, un-rendered so
+/// the native backend can construct them directly.
+pub(crate) struct CodegenUnitPart<'m> {
+    pub pre: String,
+    pub post: String,
+    pub funcs: Vec<&'m LlFunction>,
 }
 
 #[cfg(test)]
@@ -715,11 +1014,41 @@ mod tests {
             .unwrap();
         assert!(u_with_f.contains("declare double @perry_fn_m__g()"));
 
-        // Shared globals appear in BOTH units, promoted to linkonce_odr.
+        // #7174: each shared global is DEFINED exactly once across units;
+        // units that reference it get an `external` declaration instead of a
+        // copy. Replicating definitions made per-unit IR grow with the unit
+        // count and broke clang's translation-unit limit on real bundles.
+        let global_defs = units
+            .iter()
+            .filter(|u| u.contains("@perry_global_x = linkonce_odr global double 0.0"))
+            .count();
+        assert_eq!(global_defs, 1, "global must be defined in exactly one unit");
+        let str_defs = units
+            .iter()
+            .filter(|u| u.contains("@.str.0 = linkonce_odr unnamed_addr constant"))
+            .count();
+        assert_eq!(str_defs, 1, "string must be defined in exactly one unit");
+
+        // Every unit that mentions the symbol either defines it or declares it
+        // external — never neither.
         for u in &units {
-            assert!(u.contains("@perry_global_x = linkonce_odr global double 0.0"));
-            assert!(u.contains("@.str.0 = linkonce_odr unnamed_addr constant"));
-            assert!(u.contains("declare void @js_console_log_number(double)"));
+            if u.contains("@perry_global_x") {
+                assert!(
+                    u.contains("@perry_global_x = linkonce_odr global double 0.0")
+                        || u.contains("@perry_global_x = external global double"),
+                    "referencing unit must define or externally declare the global"
+                );
+            }
+            // Declares are now scoped to what a unit references (the
+            // whole-module declaration list was a per-unit floor that
+            // splitting could not reduce). A unit that calls the helper must
+            // still declare it.
+            if u.contains("call void @js_console_log_number") {
+                assert!(
+                    u.contains("declare void @js_console_log_number(double)"),
+                    "a unit calling the helper must declare it"
+                );
+            }
             assert!(u.contains("target triple = \"arm64-apple-macosx15.0.0\""));
         }
     }
@@ -871,7 +1200,12 @@ mod tests {
         m.declare_function("js_is_truthy", I32, &[DOUBLE]);
         for k in 0..2 {
             let f = m.define_function(format!("perry_fn_m__f{k}"), DOUBLE, vec![]);
-            f.create_block("entry").ret(DOUBLE, "0.0");
+            let b = f.create_block("entry");
+            // Reference the helper so the declare is genuinely needed: declares
+            // are scoped per unit now, and a test whose units never call the
+            // helper would assert nothing about its attribute group.
+            b.call(I32, "js_is_truthy", &[(DOUBLE, "0.0")]);
+            b.ret(DOUBLE, "0.0");
         }
         let units = m.render_codegen_units(2);
         assert_eq!(units.len(), 2);

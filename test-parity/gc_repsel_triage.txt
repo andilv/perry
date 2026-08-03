@@ -15,3 +15,84 @@
 # temporary. Do not re-triage it without a new issue number and a reason.
 
 test_gap_repsel_ptr_shape_locals | rep_ptr_shape_off | #6976 -- REGRESSION IN THE REPRESENTATION'S OWN OFF-SWITCH, not a defect in this PR. Bisected: passes at 8327ced52, fails at 1a533a3a8 (#6925, repsel Phase 5a proven `this`). With PERRY_PTR_SHAPE_LOCALS=0 the program dies partway with `TypeError: Cannot read properties of undefined (reading 'area')`, losing its last five output lines. It was invisible until now because #6925 also left test_gap_repsel_proven_this_frozen.ts unregistered, which makes this script exit 3 before it runs anything -- the gate was dark, not green. REMOVE THIS ENTRY when #6976 is fixed; an OFF arm is supposed to be the safest cell in the matrix.
+
+# --- #7216's Object.assign witness on the ALLOCATION-POINT arms (#7248) ------
+# RETARGETED FROM #7217, AND ITS STATED CAUSE WAS WRONG.
+#
+# #7217 is fixed: the allocation-point failure it names was minor #0 landing
+# inside the lazy `globalThis` bootstrap, whose installers thread raw
+# `*mut ObjectHeader` locals across their own allocations. That bootstrap now
+# runs in a no-move window. It fixed `spread_accessor_rooting` (exit=139 ->
+# clean, 10/10) and `static_block_this_rooting` (`bad 1` -> `bad 0`, 10/10).
+#
+# It did NOT fix this file, and it moved the number rather than the verdict:
+#
+#   merge-base 8b024958f, perry-dev, idle    -> `bad char 3 count 3`, 10/10
+#   with the #7217 no-move window            -> `bad char 1 count 1`, 10/10
+#   loop_polls (safepoint route)             -> PASS, copy-minor > 0
+#   shipped default                          -> `bad char 0 count 0`
+#
+# Two of the three bad iterations were the bootstrap. The residual one is NOT in
+# `js_object_assign_one` / `object_assign_string_source` at all -- the old
+# triage text asserting "allocation-point relocation inside js_object_assign_one
+# ... interning and keys-array growth" is not what the quarantine shows. Under
+# `PERRY_GC_PROTECT_FROMSPACE=1` the fault is in the test's OWN assertion:
+#
+#   js_jsvalue_equals + 332  <- js_eq + 20  <- main       obj_type=3 (string)
+#   retired_by_minor=#2  (not #0 -- which is why the bootstrap fix missed it)
+#
+# and the emitted IR names it exactly: `got` is loaded into a register above the
+# allocating `js_string_index_get_boxed` lowering of `ALPHA[i % 26]` and handed
+# to `js_eq` below it, never re-read. That is the #7206/#7214 codegen operand
+# family, filed as #7248 with the IR.
+#
+# THE FILE IS NOT DARK WHILE THESE ENTRIES EXIST -- it is a hard gate on
+# `loop_polls`, which .github/workflows/gc-moving-witnesses.yml runs on every
+# collector-touching PR.
+#
+# DELETE ALL TEN when #7248 is fixed.
+test_gap_gc_assign_string_source_rooting | evac_minor           | #7248 -- stale `js_eq` left operand in the test's own assertion (was mis-attributed to #7217/js_object_assign_one). `bad char 1 count 1`, 10/10. Clean on the safepoint route (loop_polls) and on the shipped default.
+test_gap_gc_assign_string_source_rooting | force_evac           | #7248 -- same allocation-point window, with force-evacuate on top.
+test_gap_gc_assign_string_source_rooting | force_verify         | #7248 -- same allocation-point window, force + verify.
+test_gap_gc_assign_string_source_rooting | rep_i32_off          | #7248 -- %E% allocation-point window; the repsel knob is not the discriminator.
+test_gap_gc_assign_string_source_rooting | rep_str_off          | #7248 -- %E% allocation-point window. Green on the first sweep and red on the third, same binary and idle host: sampled, not fixed.
+test_gap_gc_assign_string_source_rooting | rep_str_static_off   | #7248 -- %E% allocation-point window; see rep_i32_off.
+test_gap_gc_assign_string_source_rooting | rep_ptr_shape_off    | #7248 -- %E% allocation-point window; see rep_i32_off.
+test_gap_gc_assign_string_source_rooting | rep_ptr_numarray_off | #7248 -- %E% allocation-point window; see rep_i32_off.
+test_gap_gc_assign_string_source_rooting | rep_spec_abi_off     | #7248 -- %E% allocation-point window; see rep_i32_off.
+test_gap_gc_assign_string_source_rooting | rep_int_valued_off   | #7248 -- %E% allocation-point window; see rep_i32_off.
+# --- The regexp receiver on the ALLOCATION-POINT arms (#7247) ----------------
+# RETARGETED FROM #7217. #7217 is fixed (the lazy `globalThis` bootstrap now runs
+# in a no-move window) and this file is UNCHANGED by it:
+#
+#   merge-base 8b024958f, perry-dev, idle -> exit=139, no output, 10/10
+#   with the #7217 no-move window         -> exit=139, no output, 10/10
+#   compiled+run PERRY_GC_MOVING_LOOP_POLLS=1  -> `bad 0`
+#   shipped default                            -> `bad 0`
+#
+# It is a separate site, and #7196's quarantine names it:
+#
+#   LocalKey<RefCell<HashMap<(String,String), Arc<fancy_regex::Regex>>>>::with
+#     <- js_regexp_new + 1396   obj_type=3 (string)  retired_by_minor=#0
+#
+# `js_regexp_new` (`regex.rs:616`) opens with `string_as_str(pattern)` /
+# `string_as_str(flags)` -- `&str` borrows INTO the movable `StringHeader`
+# payload -- and holds them across the whole body, including the `REGEX_CACHE`
+# probe's `.to_string()` calls and the `RegExpHeader` allocation. That is the
+# #7215 borrow shape, the one #7216 fixed for `object_assign_string_source` with
+# one owned copy. Filed as #7247.
+#
+# THIS FILE IS A HARD GATE ON `loop_polls` and stays one: PASS 8/8 there, which
+# .github/workflows/gc-moving-witnesses.yml runs on every collector-touching PR.
+#
+# DELETE ALL TEN when #7247 is fixed.
+test_gap_gc_regexp_receiver_rooting | evac_minor           | #7247 -- `&str` borrowed into a movable StringHeader across js_regexp_new's body. The #7227 fix is verified on the safepoint route (loop_polls, 8/8) and not claimed here. exit=139, deterministic 10/10.
+test_gap_gc_regexp_receiver_rooting | force_evac           | #7247 -- same allocation-point window, with force-evacuate on top.
+test_gap_gc_regexp_receiver_rooting | force_verify         | #7247 -- same allocation-point window, force + verify.
+test_gap_gc_regexp_receiver_rooting | rep_i32_off          | #7247 -- %E% allocation-point window; the repsel knob is not the discriminator (identical evidence on all ten).
+test_gap_gc_regexp_receiver_rooting | rep_str_off          | #7247 -- %E% allocation-point window; see rep_i32_off.
+test_gap_gc_regexp_receiver_rooting | rep_str_static_off   | #7247 -- %E% allocation-point window; see rep_i32_off.
+test_gap_gc_regexp_receiver_rooting | rep_ptr_shape_off    | #7247 -- %E% allocation-point window; see rep_i32_off.
+test_gap_gc_regexp_receiver_rooting | rep_ptr_numarray_off | #7247 -- %E% allocation-point window; see rep_i32_off.
+test_gap_gc_regexp_receiver_rooting | rep_spec_abi_off     | #7247 -- %E% allocation-point window; see rep_i32_off.
+test_gap_gc_regexp_receiver_rooting | rep_int_valued_off   | #7247 -- %E% allocation-point window; see rep_i32_off.

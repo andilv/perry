@@ -102,6 +102,62 @@ pub(crate) fn temp_root_truncate(ctx: &mut FnCtx<'_>, idx: &str) {
         .call_void("js_gc_temp_root_truncate", &[(I32, idx)]);
 }
 
+/// A saved implicit `this`, held in a temp-root slot for the duration of a
+/// dispatch (#7211).
+///
+/// `js_implicit_this_set` swaps the `IMPLICIT_THIS` cell and returns what was
+/// there. That cell is a registered MUTABLE root — `scan_implicit_this_roots_mut`
+/// (`object/this_binding.rs:176`) marks it and rewrites it on an evacuating
+/// cycle — and the swap has already overwritten it, so the returned value is
+/// now held ONLY in an SSA register, across the whole call the bind exists to
+/// scope. A minor inside that call moves the object and rewrites every root
+/// that names it, leaving this register on from-space; the restore then writes
+/// that pre-move address BACK INTO the cell, so the corruption outlives the
+/// call and lands on whatever reads `this` next.
+///
+/// Seven lowerings emit this save/restore pair — `js_closure_callN`, the
+/// `js_native_call_value` override arms in `method_override.rs` and both
+/// `property_get` dispatchers, the static-dispatch arm, the direct-call
+/// `#3576` reset in `func_ref.rs` and the two closure-call arms in
+/// `early_branches.rs`. They had seven copies of the same three lines and
+/// therefore seven copies of the same bug, which is why this is a helper
+/// rather than seven edits: the next lowering that needs the pair gets the
+/// root for free.
+///
+/// Unconditional, unlike [`RootedOperands`]: the window is a user or native
+/// call, so [`operand_protection`]'s "can this window collect?" test has
+/// exactly one answer and there is nothing to gate on.
+pub(crate) struct ImplicitThisSave {
+    slot: String,
+}
+
+/// Bind `new_this` as the implicit `this` and root the value it displaced.
+pub(crate) fn implicit_this_save(ctx: &mut FnCtx<'_>, new_this: &str) -> ImplicitThisSave {
+    let prev = ctx
+        .block()
+        .call(DOUBLE, "js_implicit_this_set", &[(DOUBLE, new_this)]);
+    let slot = temp_root_push_double(ctx, &prev);
+    ImplicitThisSave { slot }
+}
+
+/// Restore the saved implicit `this`, re-read from its root.
+///
+/// Reading the slot rather than the register is the fix, not a precaution: the
+/// slot is a mutable root, so an evacuating cycle inside the dispatch rewrote
+/// it and the register pushed beforehand names from-space.
+///
+/// The truncate is emitted BEFORE the restore call so that nested saves — an
+/// override arm inside an outer bind — release inner to outer.
+/// `js_gc_temp_root_truncate` drops everything at or above its argument, so a
+/// caller holding a LOWER group (`RootedOperands`) may release it afterwards
+/// and drop this slot again harmlessly.
+pub(crate) fn implicit_this_restore(ctx: &mut FnCtx<'_>, save: ImplicitThisSave) {
+    let prev = temp_root_get_double(ctx, &save.slot);
+    temp_root_truncate(ctx, &save.slot);
+    ctx.block()
+        .call(DOUBLE, "js_implicit_this_set", &[(DOUBLE, &prev)]);
+}
+
 /// Push `value` onto the array held in temp-root slot `idx`, writing the
 /// possibly-reallocated array pointer back into the slot.
 pub(crate) fn temp_rooted_array_push(ctx: &mut FnCtx<'_>, idx: &str, value: &str) {
@@ -524,18 +580,40 @@ impl RootedOperands {
         operands: &[&Expr],
     ) -> anyhow::Result<Vec<String>> {
         let mut out = Vec::with_capacity(self.values.len());
-        for (i, original) in self.values.iter().enumerate() {
-            let value = match &self.slots[i] {
-                Some(idx) => {
-                    let idx = idx.clone();
-                    temp_root_get_double(ctx, &idx)
-                }
-                None if self.reloadable[i] => super::lower_expr(ctx, operands[i])?,
-                None => original.clone(),
-            };
-            out.push(value);
+        for i in 0..self.values.len() {
+            out.push(self.reread_one(ctx, operands, i)?);
         }
         Ok(out)
+    }
+
+    /// Re-read ONE operand, at a point the caller picks.
+    ///
+    /// [`RootedOperands::reread`] re-reads the whole group at a single point,
+    /// which is right when one collection point separates the group from its
+    /// consumer. It is wrong when the operands are consumed by *different*
+    /// instructions with a collection point between them — the generic
+    /// dynamic-call lowering is exactly that shape (#7154): the callee and the
+    /// `this` receiver are consumed by `js_closure_unbox_callee_checked_rebind`,
+    /// that rebind CLONES a `this`-capturing closure and therefore allocates,
+    /// and only then does `js_closure_callN` consume the arguments. Re-reading
+    /// the arguments above the rebind would put them right back in the window
+    /// the roots exist to close.
+    ///
+    /// Same three cases as [`RootedOperands::reread`]; see its documentation.
+    pub(crate) fn reread_one(
+        &self,
+        ctx: &mut FnCtx<'_>,
+        operands: &[&Expr],
+        i: usize,
+    ) -> anyhow::Result<String> {
+        Ok(match &self.slots[i] {
+            Some(idx) => {
+                let idx = idx.clone();
+                temp_root_get_double(ctx, &idx)
+            }
+            None if self.reloadable[i] => super::lower_expr(ctx, operands[i])?,
+            None => self.values[i].clone(),
+        })
     }
 
     /// True when this group actually pushed slots — the signal a caller uses to
@@ -549,6 +627,20 @@ impl RootedOperands {
     /// allocates while reading these values.
     pub(crate) fn release(self, ctx: &mut FnCtx<'_>) {
         temp_root_release(ctx, self.guard);
+    }
+
+    /// The group's guard slot, for a caller that must release it together with
+    /// slots it pushed ITSELF.
+    ///
+    /// [`RootedOperands::release`] is the ordinary exit and consumes the group.
+    /// The rest-argument lowering cannot use it: it pushes accumulator slots
+    /// ([`rooted_array_begin`]) *above* this group, and because
+    /// [`temp_root_truncate`] is a stack cut, one truncate at the LOWEST index
+    /// drops both. So that caller needs the index rather than the act — and it
+    /// must not release early, since the accumulator has to stay rooted across
+    /// the consuming call too.
+    pub(crate) fn guard(&self) -> Option<String> {
+        self.guard.clone()
     }
 }
 
