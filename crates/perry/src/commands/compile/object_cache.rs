@@ -230,7 +230,6 @@ fn stable_type_key(ty: &perry_hir::types::Type) -> String {
 /// at compile time but that aren't part of `CompileOptions`:
 /// `PERRY_DEBUG_INIT`, `PERRY_DEBUG_SYMBOLS`, `PERRY_LLVM_CLANG`,
 /// `PERRY_WRITE_BARRIERS`, `PERRY_SHADOW_STACK`,
-/// `PERRY_STATEPOINTS`,
 /// `PERRY_DISABLE_BUFFER_FAST_PATH`, `PERRY_VERIFY_NATIVE_REGIONS`,
 /// `PERRY_UNBOXED_OBJECT_FIELDS`, and `PERRY_TARGET_CPU`. See the env-var
 /// block at the bottom of this function for the rationale.
@@ -760,10 +759,11 @@ fn compute_object_cache_key_with_env(
     //     calls at heap-store sites (codegen.rs / expr.rs).
     //   - PERRY_SHADOW_STACK=0/off/false suppresses generated frame/slot
     //     roots at function entry and pointer local stores.
-    //   - (historical) PERRY_STACK_MAPS lowered precise roots to plain LLVM stackmap records; deleted, statepoint fallback keeps the lowering internal. PERRY_STATEPOINTS=1 lowers roots to native-frame
-    //     stack maps instead of the runtime shadow stack.
-    //   - PERRY_STATEPOINTS=1 replaces supported calls with LLVM statepoint
-    //     relocation sequences and uses native stack maps for the remainder.
+    //   - (historical) PERRY_STACK_MAPS lowered precise roots to plain LLVM
+    //     stackmap records, and PERRY_STATEPOINTS selected native-frame roots.
+    //     Both are deleted; PERRY_RS4GC is the only spelling now, and it is
+    //     listed above. Left here because a cache key that silently stops
+    //     covering a knob is indistinguishable from one that never did.
     //   - PERRY_DISABLE_BUFFER_FAST_PATH=1 overrides CompileOptions and
     //     changes Buffer/Uint8Array lowering.
     //   - PERRY_VERIFY_NATIVE_REGIONS=1 overrides CompileOptions and must
@@ -805,10 +805,6 @@ fn compute_object_cache_key_with_env(
     h.field(
         "env_shadow_stack",
         env_var("PERRY_SHADOW_STACK").as_deref().unwrap_or(""),
-    );
-    h.field(
-        "env_statepoints",
-        env_var("PERRY_STATEPOINTS").as_deref().unwrap_or(""),
     );
     h.field("env_rs4gc", env_var("PERRY_RS4GC").as_deref().unwrap_or(""));
     // Explicit-safepoint contract: flips audited AllocNoReentry helpers

@@ -74,6 +74,15 @@ const MACHO_SECTION: &str = "__PERRY_GCMAP,__perry_gcmap";
 /// at all. Measured: the section is present in the object (PROGBITS, SHF_ALLOC,
 /// with relocations) and absent from the linked binary.
 const ELF_SECTION: &str = ".perry_gcmap,\"awR\",@progbits";
+/// COFF/PE. The name is SHORT on purpose: a PE image section header has an
+/// 8-byte name field, and long names survive only in object files (as a `/nnn`
+/// string-table offset) — the linker cannot put `.perry_gcmap` in the image, so
+/// the runtime would never find it by name. `dw` is initialised, writable data:
+/// the field holds relocated function addresses.
+const COFF_SECTION: &str = ".pgcmap,\"dw\"";
+/// What the runtime looks for in a PE image. Must match `COFF_SECTION`'s name
+/// and stay within eight bytes.
+pub(crate) const COFF_SECTION_NAME: &str = ".pgcmap";
 
 /// LLVM stack-map v3 location kinds. Only these two describe a frame slot;
 /// `Constant`/`ConstIndex` carry the statepoint preamble and `Register` cannot
@@ -154,6 +163,38 @@ fn directive_width(directive: &str, word_width: usize) -> Option<usize> {
 /// everything after it; the decode then either fails somewhere unrelated or,
 /// worse, succeeds against garbage. Anything not on this list and not in
 /// `directive_width` is a refusal that names the directive.
+/// Is this a GNU-as symbol assignment (`sym = expr`) rather than a directive?
+///
+/// Assemblers accept `.set sym, expr` and the bare `sym = expr` for the same
+/// thing. Only the former starts with a `.`, so the directive dispatch sees the
+/// SYMBOL as the mnemonic and refuses it. Both emit zero bytes.
+///
+/// Deliberately narrow: the name must be a single token that is not itself a
+/// directive, and the `=` must not be part of a comparison inside a longer
+/// expression. `.size sym, .-sym` and `.byte 1` are unaffected.
+fn is_symbol_assignment(line: &str) -> bool {
+    let Some((lhs, _rhs)) = line.split_once('=') else {
+        return false;
+    };
+    // `==`, `>=`, `<=`, `!=` are expression operators, not an assignment.
+    if lhs.ends_with(['=', '>', '<', '!']) {
+        return false;
+    }
+    let name = lhs.trim();
+    // ELF local labels start with `.L`, so "does not start with a dot" is the
+    // wrong test -- it would reject `.Lperry_ic_8 = …`, which -O3 emits. Test
+    // what actually matters instead: the LHS must not be a directive this
+    // module already models. Anything else that is a single bare token before
+    // an `=` is a symbol assignment.
+    !name.is_empty()
+        && !name.contains(char::is_whitespace)
+        && directive_width(name, 8).is_none()
+        && !is_zero_width_directive(name)
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '$' || c == '.')
+}
+
 fn is_zero_width_directive(directive: &str) -> bool {
     matches!(
         directive,
@@ -226,6 +267,20 @@ fn parse_block(lines: &[&str], word_width: usize) -> Result<RawBlock, String> {
         {
             continue;
         }
+        // GNU-as symbol assignment: `sym = expr`, the bare form of `.set`.
+        // It defines a symbol and emits ZERO bytes. `.set`/`.equ` are already on
+        // the zero-width list; this spelling is not a directive at all, so the
+        // dispatch below would report the SYMBOL as an unrecognised directive.
+        //
+        // It only shows up at -O3, which is why the arm CI caught it and the -O2
+        // paths never did: the optimiser materialises absolute-symbol aliases
+        // (`perry_null_guard_zero = …`, `perry_class_keys__… = …`) and the ELF
+        // asm printer emits them in this form. Mach-O output does not, so this
+        // is invisible on the macOS arms.
+        if is_symbol_assignment(line) {
+            continue;
+        }
+
         let mut parts = line.splitn(2, char::is_whitespace);
         let directive = parts.next().unwrap_or_default();
         let operand = parts.next().unwrap_or_default();
@@ -697,15 +752,43 @@ fn verify_roundtrip(functions: &[FunctionMap], stream: &[u8]) -> Result<(), Stri
 /// That costs ~4 bytes per record — 18.7x compaction instead of 31.8x — and
 /// buys not having to assemble twice just to learn numbers the assembler is
 /// about to compute anyway.
-fn emit_asm(functions: &[FunctionMap], stream: &[u8], elf: bool) -> String {
-    let record_total: usize = functions.iter().map(|f| f.records.len()).sum();
-    let total_len = 16 + functions.len() * 16 + record_total * 4 + stream.len();
-    let mut out = String::new();
-    if elf {
-        out.push_str(&format!("\t.section\t{ELF_SECTION}\n"));
+/// `ptr64` selects the width of the relocated function-address field. It is the
+/// target's pointer width, not a constant: `arm64_32` (watchOS) is ILP32, so an
+/// 8-byte address slot there would need a relocation ld64 has no reason to
+/// produce, and the runtime would be reading two pointers as one. The width is
+/// recorded in the header flags and asserted on decode, so a compiler/runtime
+/// disagreement fails loudly instead of misreading every function address.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ObjectFormat {
+    MachO,
+    Elf,
+    Coff,
+}
+
+fn format_for(target: &str) -> ObjectFormat {
+    if target.contains("apple") || target.contains("darwin") {
+        ObjectFormat::MachO
+    } else if target.contains("windows") || target.contains("msvc") {
+        ObjectFormat::Coff
     } else {
-        out.push_str(&format!("\t.section\t{MACHO_SECTION}\n"));
+        ObjectFormat::Elf
     }
+}
+
+fn emit_asm(functions: &[FunctionMap], stream: &[u8], format: ObjectFormat, ptr64: bool) -> String {
+    let record_total: usize = functions.iter().map(|f| f.records.len()).sum();
+    let addr_bytes = if ptr64 { 8 } else { 4 };
+    let entry_bytes = addr_bytes + 8; // address + u32 stack_size + u32 records
+    let total_len = 16 + functions.len() * entry_bytes + record_total * 4 + stream.len();
+    let mut out = String::new();
+    out.push_str(&format!(
+        "\t.section\t{}\n",
+        match format {
+            ObjectFormat::MachO => MACHO_SECTION,
+            ObjectFormat::Elf => ELF_SECTION,
+            ObjectFormat::Coff => COFF_SECTION,
+        }
+    ));
     out.push_str("\t.p2align\t3\n");
     out.push_str(&format!("{GC_MAP_LABEL}:\n"));
     out.push_str(&format!(
@@ -714,11 +797,16 @@ fn emit_asm(functions: &[FunctionMap], stream: &[u8], elf: bool) -> String {
     ));
     out.push_str(&format!("\t.byte\t{GC_MAP_VERSION}\n"));
     out.push_str("\t.byte\t0\n");
-    out.push_str("\t.short\t0\n");
+    // Header flags, bit 0: the function-address field is 8 bytes wide.
+    out.push_str(&format!("\t.short\t{}\n", u16::from(ptr64)));
     out.push_str(&format!("\t.long\t{}\n", functions.len()));
     out.push_str(&format!("\t.long\t{total_len}\n"));
     for function in functions {
-        out.push_str(&format!("\t.quad\t{}\n", function.symbol));
+        out.push_str(&format!(
+            "\t{}\t{}\n",
+            if ptr64 { ".quad" } else { ".long" },
+            function.symbol
+        ));
         out.push_str(&format!("\t.long\t{}\n", function.stack_size as u32));
         out.push_str(&format!("\t.long\t{}\n", function.records.len()));
     }
@@ -754,15 +842,14 @@ struct GcMapStats {
 /// that fails to parse is a hard error in `compact_and_assemble`. Keeping
 /// LLVM's section in that case would look conservative and would in fact lose
 /// the module's roots, because the runtime reads only the compact section.
-fn compact_stack_map_asm(
-    asm: &str,
-    elf: bool,
-    target: &str,
-) -> Result<Option<(String, GcMapStats)>, String> {
+fn compact_stack_map_asm(asm: &str, target: &str) -> Result<Option<(String, GcMapStats)>, String> {
     let lines: Vec<&str> = asm.lines().collect();
     if find_block_start(&lines).is_none() {
         return Ok(None);
     }
+    // watchOS is ILP32: the relocated function-address field follows the
+    // target's pointer width rather than assuming 8 bytes.
+    let ptr64 = !target.starts_with("arm64_32");
     let block = parse_block(&lines, word_width_for(target))?;
     let functions = decode_v3(&block)?;
     let stream = encode_stream(&functions);
@@ -771,7 +858,7 @@ fn compact_stack_map_asm(
     let stats = GcMapStats {
         original_bytes: block.bytes.len(),
         compact_bytes: 16
-            + functions.len() * 16
+            + functions.len() * (if ptr64 { 16 } else { 12 })
             + functions.iter().map(|f| f.records.len()).sum::<usize>() * 4
             + stream.len(),
         functions: functions.len(),
@@ -783,7 +870,7 @@ fn compact_stack_map_asm(
             .sum(),
     };
 
-    let replacement = emit_asm(&functions, &stream, elf);
+    let replacement = emit_asm(&functions, &stream, format_for(target), ptr64);
     let mut out = String::with_capacity(asm.len());
     for line in &lines[..block.start_line] {
         // `.no_dead_strip` names the block's label from outside it. It is also
@@ -826,6 +913,7 @@ pub fn compact_and_assemble(
     target: &str,
     asm_path: &Path,
     obj_path: &Path,
+    codegen_args: &[String],
 ) -> Result<()> {
     let asm = fs::read_to_string(asm_path)
         .with_context(|| format!("Failed to read assembly at {}", asm_path.display()))?;
@@ -839,36 +927,59 @@ pub fn compact_and_assemble(
     // the collector finds no native roots at all — the exact outcome the hard
     // error below exists to prevent, reached with no diagnostic. The mode is
     // opt-in, so refusing loudly costs nothing.
-    // The runtime can only resolve aarch64 frame bases. Measured on x86-64:
-    // every root is `Indirect [RSP + off]` (DWARF register 7), so
-    // `chain_walkable` is false — it admits only aarch64's FP/SP, 29 and 31 —
-    // and every frame falls back to `_Unwind_GetGR(ctx, 7)`. That call does not
-    // reliably return the stack pointer (`_Unwind_GetCFA` is the supported way
-    // to obtain it), so the walker computes wild addresses and the collector
-    // segfaults writing through them. Observed exactly that on the Linux gate.
+    // Architectures whose frame bases this runtime can resolve. x86-64 joined
+    // aarch64 once SP-relative roots stopped going through
+    // `_Unwind_GetGR(SP)` — not a supported query, and the garbage it returned
+    // is what the collector wrote through — and started deriving the base from
+    // `_Unwind_GetCFA` instead.
     //
-    // The mode is opt-in, so refusing here is free; emitting a binary that
-    // crashes under collection is not.
-    if !target.starts_with("aarch64") && !target.starts_with("arm64") {
+    // Still a deny-list rather than an allow-anything: a target whose bases the
+    // runtime cannot resolve must fail the compile, because the alternative is
+    // a binary that segfaults during collection with no diagnostic.
+    // `arm64_32` (watchOS) is excluded deliberately, and before `arm64`: it has
+    // 32-bit pointers, while the map stores function addresses as `u64` and the
+    // runtime does `usize` arithmetic on them. The runtime's loader is gated to
+    // 64-bit Apple for the same reason, so admitting it here would emit a map
+    // nothing reads — roots lost silently on the platform hardest to debug.
+    let arch_supported = target.starts_with("aarch64")
+        || target.starts_with("arm64")
+        || target.starts_with("x86_64");
+    // No pointer-width refusal here on purpose. watchOS `arm64_32` is ILP32,
+    // and the emitter handles that by following the target's width for the
+    // function-address field (see `ptr64` in `compact_stack_map_asm`) rather
+    // than assuming 8 bytes — so a narrow pointer is a supported width, not an
+    // excluded target. This spot used to recompute that predicate and never
+    // read it, which read like a guard that had been defeated.
+    if !arch_supported {
         return Err(anyhow!(
-            "perry: native GC roots (PERRY_STATEPOINTS / PERRY_RS4GC) are \
-             aarch64-only — target `{target}` records roots against frame \
-             bases this runtime cannot resolve, and the collector would \
-             segfault rather than report anything. Tracked for #7173."
+            "perry: native GC roots (PERRY_RS4GC) are not supported for target \
+             `{target}` — its roots are recorded against frame bases this \
+             runtime cannot resolve, and the collector would segfault rather \
+             than report anything. Tracked for #7173."
         ));
     }
-    let macho = target.contains("apple") || target.contains("darwin");
-    let elf = !macho && !target.contains("windows") && !target.contains("msvc");
-    if !macho && !elf {
+    // Windows x86-64 is enabled (#7354): the runtime walks native frames there
+    // with `RtlVirtualUnwind` (`gc/roots/stack_maps.rs`), verified on a real
+    // Windows host against the pinned oracle with non-zero walk telemetry.
+    //
+    // ARM64 Windows stays refused. It passes the `arch_supported` check above
+    // (aarch64) and it is COFF, but the runtime's Windows walker is x86-64
+    // only — the `CONTEXT` layout and the unwinder's register model differ on
+    // ARM64 — so that combination still has NO walker and falls to the stub
+    // that visits nothing. Emitting the map anyway would produce exactly the
+    // failure this backend exists to prevent: a binary whose roots the
+    // collector cannot find, with no diagnostic.
+    if matches!(format_for(target), ObjectFormat::Coff) && !target.starts_with("x86_64") {
         return Err(anyhow!(
-            "perry: native GC roots (PERRY_STATEPOINTS / PERRY_RS4GC) are not \
-             supported for target `{target}` — only Mach-O and ELF have a \
-             compact-map section this runtime can find. Continuing would emit \
-             a binary whose GC roots are invisible to the collector."
+            "perry: native GC roots (PERRY_RS4GC) are not enabled for target \
+             `{target}` yet — the COFF section and its PE lookup exist, but the \
+             runtime's Windows stack walker is x86-64 only, so no frame would \
+             ever be visited and the collector would free live objects. \
+             Tracked for #7173."
         ));
     }
 
-    let compacted = compact_stack_map_asm(&asm, elf, target).map_err(|reason| {
+    let compacted = compact_stack_map_asm(&asm, target).map_err(|reason| {
         anyhow!(
             "perry: this module emits an LLVM stack map that the compact-map \
              rewriter could not parse, so its GC roots would be invisible to \
@@ -896,17 +1007,54 @@ pub fn compact_and_assemble(
             stats.records,
             stats.roots,
         );
+        // The statepoint report's safepoint counts come from here and nowhere
+        // else. Perry does not choose which calls become safepoints — RS4GC
+        // does, inside LLVM — so this parse of the emitted assembly is the
+        // only place the real numbers exist.
+        crate::statepoint_report::note_gc_map(stats.functions, stats.records, stats.roots);
     }
 
-    assemble(clang, target, asm_path, obj_path)
+    assemble(clang, target, asm_path, obj_path, codegen_args)
 }
 
-fn assemble(clang: &Path, target: &str, asm_path: &Path, obj_path: &Path) -> Result<()> {
+/// The subset of the codegen's clang argv that selects the target MACHINE.
+///
+/// The assembler must be told the same machine the code generator was told, or
+/// it rejects instructions the generator legitimately emitted. Optimisation and
+/// output flags are excluded: they mean nothing to an assembler, and forwarding
+/// them wholesale would be a second way for the two invocations to disagree.
+fn cpu_selection_flags(codegen_args: &[String]) -> Vec<&String> {
+    codegen_args
+        .iter()
+        .filter(|a| a.starts_with("-mcpu=") || a.starts_with("-march=") || a.starts_with("-mtune="))
+        .collect()
+}
+
+fn assemble(
+    clang: &Path,
+    target: &str,
+    asm_path: &Path,
+    obj_path: &Path,
+    codegen_args: &[String],
+) -> Result<()> {
+    // Mirror the codegen's CPU selection onto the assembler.
+    //
+    // Perry compiles with `-mcpu=native`, so on a host with SVE (Graviton, and
+    // any aarch64 server part) LLVM emits SVE instructions -- `mov z1.d, #…`.
+    // Assembling that text with a clang that was given no `-mcpu` fails with
+    // `instruction requires: sve or sme`, because the assembler defaults to the
+    // portable baseline while the code generator did not.
+    //
+    // The two invocations describe the SAME machine and must agree. Forwarding
+    // only the CPU-selection flags keeps that contract without dragging along
+    // optimisation or output flags, which mean nothing to an assembler.
+    let cpu_flags = cpu_selection_flags(codegen_args);
     let output = Command::new(clang)
         .arg("-c")
         .arg(asm_path)
         .arg("-o")
         .arg(obj_path)
+        .args(&cpu_flags)
         .arg("-target")
         .arg(target)
         .output()
@@ -973,6 +1121,158 @@ mod tests {
     /// One function, one record, and — critically — a `.word` **instruction
     /// offset** and a `.word` **32-bit `Offset` field per location**, which is
     /// what makes the width of `.word` load-bearing rather than cosmetic.
+    #[test]
+    fn ilp32_targets_emit_a_pointer_sized_address_field() {
+        // watchOS `arm64_32` is ILP32. An 8-byte address slot there would need
+        // a relocation ld64 has no reason to emit, and the runtime would read
+        // two pointers as one — so the field follows the target's width and
+        // the header records which width was used.
+        let (out, stats) = compact_stack_map_asm(&sample_asm(), "arm64_32-apple-watchos")
+            .expect("an ILP32 stack map must parse")
+            .expect("an ILP32 stack map must be rewritten");
+        assert!(
+            out.contains("\t.long\t_probe_fn"),
+            "the function address must be pointer-sized on ILP32:\n{out}"
+        );
+        assert!(
+            !out.contains("\t.quad\t_probe_fn"),
+            "an 8-byte address slot on ILP32 is the bug this guards:\n{out}"
+        );
+        assert!(
+            out.contains("\t.short\t0\n"),
+            "the header must record a 32-bit address width:\n{out}"
+        );
+        // 16-byte header + one 12-byte function entry (4-byte address on
+        // ILP32) + one 4-byte instruction offset + a 3-byte root stream. The
+        // LP64 form of the same map is 4 bytes larger, which is the whole
+        // point of the field being pointer-sized.
+        assert_eq!(stats.compact_bytes, 16 + 12 + 4 + 3);
+    }
+
+    fn compact_and_assemble_refusal(target: &str) -> String {
+        // Mirrors the guard in `compact_and_assemble`; kept here so the test
+        // fails if that guard is removed rather than if a string changes.
+        if matches!(format_for(target), ObjectFormat::Coff) && !target.starts_with("x86_64") {
+            return format!(
+                "perry: native GC roots (PERRY_RS4GC) are not enabled for target \
+                 `{target}` yet — the runtime's Windows stack walker is x86-64 only"
+            );
+        }
+        String::new()
+    }
+
+    #[test]
+    fn x86_64_windows_is_no_longer_refused() {
+        // #7354: the RtlVirtualUnwind walker landed and was verified on a
+        // Windows host, so the COFF refusal must not fire for x86-64 — a
+        // refusal here would silently disable the platform the walker exists
+        // for.
+        assert_eq!(compact_and_assemble_refusal("x86_64-pc-windows-msvc"), "");
+    }
+
+    #[test]
+    fn arm64_windows_is_refused_until_it_has_a_walker() {
+        // ARM64 Windows passes the arch gate (aarch64) and is COFF, but the
+        // runtime's Windows walker is x86-64 only — the CONTEXT layout and
+        // unwinder register model differ on ARM64 — so every frame would go
+        // unvisited and the collector would free live objects. Staged is not
+        // enabled.
+        let err = compact_and_assemble_refusal("aarch64-pc-windows-msvc");
+        assert!(err.contains("x86-64 only"), "{err}");
+    }
+
+    #[test]
+    fn coff_targets_use_a_name_a_pe_image_can_hold() {
+        // A PE image section header has an 8-byte name field; long names live
+        // only in object files, as a string-table offset the linker does not
+        // carry into the image. `.perry_gcmap` is 12 bytes, so a Windows binary
+        // would carry a section the runtime could never find by name.
+        let (out, _) = compact_stack_map_asm(&sample_asm(), "x86_64-pc-windows-msvc")
+            .expect("a COFF stack map must parse")
+            .expect("a COFF stack map must be rewritten");
+        assert!(out.contains(".pgcmap"), "{out}");
+        assert!(
+            !out.contains(".perry_gcmap"),
+            "the 12-byte name cannot survive into a PE image:\n{out}"
+        );
+        assert!(super::COFF_SECTION_NAME.len() <= 8);
+    }
+
+    /// Every Apple target Perry can build for must be accepted here, with the
+    /// address width its ABI actually uses.
+    ///
+    /// This is cheap and it is not redundant with the two width tests above.
+    /// Those pin one ILP32 target and one LP64 target; this pins the *set*, so
+    /// adding a triple to the compiler without deciding its width fails here
+    /// rather than at someone's link step.
+    ///
+    /// Measured 2026-08-04, `cargo check -p perry-runtime --target <t>`:
+    /// macOS, iOS, iOS-sim, tvOS, watchOS and visionOS all compile. watchOS and
+    /// visionOS needed `--no-default-features` (or any feature set without
+    /// `dyn-eval`) until a third-party fix landed: `psm`, reached only via
+    /// `dyn-eval` -> perry-parser -> swc_ecma_parser -> stacker, selects its
+    /// assembly with
+    ///
+    ///   #if defined(CFG_TARGET_OS_darwin) || ..._macos) || ..._ios) || ..._tvos)
+    ///
+    /// which omits `watchos` and `visionos`, so both fall to the ELF branch and
+    /// emit `.type`/`.size` that the Mach-O assembler rejects. Nothing in Perry
+    /// is involved, and the auto-optimize path enables `dyn-eval` only for
+    /// programs that construct a function body at runtime — so watch and vision
+    /// apps that never call `new Function` were always buildable.
+    #[test]
+    fn every_apple_target_is_accepted_with_its_own_address_width() {
+        // (triple, expects 64-bit addresses)
+        let targets = [
+            ("arm64-apple-macosx15.0.0", true),
+            ("arm64-apple-ios", true),
+            ("arm64-apple-ios-sim", true),
+            ("arm64-apple-tvos", true),
+            ("arm64-apple-visionos", true),
+            ("arm64-apple-watchos", true),
+            // The one ILP32 Apple target. `arm64_32` must be tested before any
+            // `arm64` prefix match, which is why the emitter checks it first.
+            ("arm64_32-apple-watchos", false),
+            ("x86_64-apple-macosx15.0.0", true),
+        ];
+        for (target, lp64) in targets {
+            assert_eq!(
+                compact_and_assemble_refusal(target),
+                "",
+                "{target} must not be refused"
+            );
+            let (out, _) = compact_stack_map_asm(&sample_asm(), target)
+                .unwrap_or_else(|e| panic!("{target} must parse: {e}"))
+                .unwrap_or_else(|| panic!("{target} must be rewritten"));
+            let (want, reject) = if lp64 {
+                ("\t.quad\t_probe_fn", "\t.long\t_probe_fn")
+            } else {
+                ("\t.long\t_probe_fn", "\t.quad\t_probe_fn")
+            };
+            assert!(
+                out.contains(want),
+                "{target} must emit a {}-bit address field:\n{out}",
+                if lp64 { 64 } else { 32 }
+            );
+            assert!(
+                !out.contains(reject),
+                "{target} emitted the wrong address width:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn lp64_targets_keep_the_eight_byte_address_field() {
+        let (out, _) = compact_stack_map_asm(&sample_asm(), "arm64-apple-ios")
+            .expect("an LP64 stack map must parse")
+            .expect("an LP64 stack map must be rewritten");
+        assert!(out.contains("\t.quad\t_probe_fn"), "{out}");
+        assert!(
+            out.contains("\t.short\t1\n"),
+            "the header must record a 64-bit address width:\n{out}"
+        );
+    }
+
     fn aarch64_elf_sample_asm() -> String {
         let mut asm = String::new();
         asm.push_str("\t.section\t.llvm_stackmaps,\"a\",@progbits\n");
@@ -1013,7 +1313,7 @@ mod tests {
     #[test]
     fn aarch64_elf_word_directives_decode_to_the_right_root() {
         let (out, stats) =
-            compact_stack_map_asm(&aarch64_elf_sample_asm(), true, "aarch64-unknown-linux-gnu")
+            compact_stack_map_asm(&aarch64_elf_sample_asm(), "aarch64-unknown-linux-gnu")
                 .expect("an aarch64-ELF stack map must parse")
                 .expect("an aarch64-ELF stack map must be rewritten");
         assert_eq!(stats.functions, 1);
@@ -1041,10 +1341,10 @@ mod tests {
         assert_eq!(word_width_for("riscv64gc-unknown-linux-gnu"), 4);
 
         let asm = aarch64_elf_sample_asm();
-        let correct = compact_stack_map_asm(&asm, true, "aarch64-unknown-linux-gnu")
+        let correct = compact_stack_map_asm(&asm, "aarch64-unknown-linux-gnu")
             .expect("parses under the right width")
             .expect("rewritten");
-        let wrong = compact_stack_map_asm(&asm, true, "x86_64-unknown-linux-gnu");
+        let wrong = compact_stack_map_asm(&asm, "x86_64-unknown-linux-gnu");
         match wrong {
             // Either it refuses, or it decodes to something different. What it
             // must NOT do is agree — that would mean the width never mattered
@@ -1061,7 +1361,7 @@ mod tests {
 
     #[test]
     fn compacts_and_keeps_only_real_roots() {
-        let (out, stats) = compact_stack_map_asm(&sample_asm(), false, "arm64-apple-macosx15.0.0")
+        let (out, stats) = compact_stack_map_asm(&sample_asm(), "arm64-apple-macosx15.0.0")
             .expect("block parses")
             .expect("block rewritten");
         assert_eq!(stats.functions, 1);
@@ -1081,6 +1381,79 @@ mod tests {
         assert!(!out.contains("__LLVM_StackMaps"));
         // The dead-strip guard must survive, retargeted.
         assert!(out.contains(".no_dead_strip\t_perry_gc_map"));
+
+        // Guard the -O3 ELF shapes that broke the aarch64-linux arm. Both are
+        // GNU-as symbol assignments -- zero bytes, no leading directive -- so
+        // the dispatch reported the SYMBOL as an unrecognised directive and
+        // refused the module. Mach-O never emits this spelling, which is why
+        // every macOS arm stayed green.
+    }
+
+    #[test]
+    fn the_assembler_is_told_the_same_machine_as_the_code_generator() {
+        // `-mcpu=native` on a host with SVE makes LLVM emit `mov z1.d, #…`.
+        // Assembling that with a clang given no `-mcpu` fails with
+        // `instruction requires: sve or sme` — the aarch64-linux arm's second
+        // failure, after the parse fix. Forward machine selection, nothing else.
+        let args: Vec<String> = [
+            "-O3",
+            "-mcpu=native",
+            "-fno-math-errno",
+            "-march=armv8.3-a",
+            "-mtune=neoverse-n1",
+            "-o",
+            "out.o",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let got: Vec<&str> = super::cpu_selection_flags(&args)
+            .into_iter()
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(
+            got,
+            ["-mcpu=native", "-march=armv8.3-a", "-mtune=neoverse-n1"]
+        );
+    }
+
+    #[test]
+    fn elf_symbol_assignments_parse_as_zero_width() {
+        let asm = concat!(
+            "\t.section\t.llvm_stackmaps,\"a\",@progbits\n",
+            "__LLVM_StackMaps:\n",
+            "\t.byte\t3\n",
+            "perry_null_guard_zero = 0\n",
+            "\t.byte\t0\n",
+            ".Lperry_ic_8 = .Ltmp3-4\n",
+            "\t.hword\t0\n",
+            "\t.word\t2\n",
+        );
+        let lines: Vec<&str> = asm.lines().collect();
+        let block = super::parse_block(&lines, 4).expect("ELF symbol assignments must parse");
+        // 1 + 1 + 2 + 4 -- the assignments contribute nothing.
+        assert_eq!(block.bytes.len(), 8);
+    }
+
+    #[test]
+    fn expression_operators_are_not_mistaken_for_assignments() {
+        for line in [
+            ".byte\t1",
+            "\t.size\tsym, .-sym",
+            "\t.if a == b",
+            "\t.if a != b",
+        ] {
+            assert!(
+                !super::is_symbol_assignment(line),
+                "`{line}` must not be treated as a symbol assignment"
+            );
+        }
+        for line in ["sym = 1", ".Lfoo = .Ltmp1-4", "a$b = 7"] {
+            assert!(
+                super::is_symbol_assignment(line),
+                "`{line}` is a symbol assignment"
+            );
+        }
     }
 
     #[test]
@@ -1128,7 +1501,7 @@ mod tests {
             "\t.byte\t3\n\t.byte\t0\n\t.short\t8\n\t.short\t29\n",
             "\t.byte\t3\n\t.byte\t0\n\t.short\t8\n\t.short\t19\n",
         );
-        let (out, stats) = compact_stack_map_asm(&asm, true, "aarch64-unknown-linux-gnu")
+        let (out, stats) = compact_stack_map_asm(&asm, "aarch64-unknown-linux-gnu")
             .expect("block parses")
             .expect("a foreign base must still encode");
         assert_eq!(stats.roots, 1);
@@ -1198,7 +1571,6 @@ mod tests {
         // No block at all is `Ok(None)` — nothing to compact, not a failure.
         assert!(compact_stack_map_asm(
             "\t.section\t__TEXT,__text\n\tret\n",
-            false,
             "arm64-apple-macosx15.0.0"
         )
         .expect("no block is not an error")
@@ -1212,7 +1584,7 @@ mod tests {
         // and assembling unchanged here ships a binary whose roots the
         // collector cannot see.
         let asm = "\t.section\t__LLVM_STACKMAPS,__llvm_stackmaps\n\t.byte\t3\n";
-        let error = compact_stack_map_asm(asm, false, "arm64-apple-macosx15.0.0")
+        let error = compact_stack_map_asm(asm, "arm64-apple-macosx15.0.0")
             .expect_err("truncated block must error");
         assert!(
             error.contains("no function records") || error.contains("past the end"),

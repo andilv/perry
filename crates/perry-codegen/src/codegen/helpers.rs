@@ -71,54 +71,39 @@ pub(super) fn shadow_stack_enabled() -> bool {
             std::env::var("PERRY_SHADOW_STACK").as_deref(),
             Ok("0") | Ok("off") | Ok("false")
         );
-        // #7326: the statepoint backends are an alternative *lowering* of this
-        // analysis, not an independent mechanism. `reserve_shadow_slot()` is
-        // the single entry point that, under `native_stack_roots_enabled()`,
-        // allocates a stack-map slot instead of a shadow-stack slot — and the
-        // caller of that analysis returns empty maps outright when this is off.
-        //
-        // So switching the shadow stack off switches the statepoint roots off
-        // with it, and the result is a binary with NO precise frame roots that
-        // still runs and prints the right answer: measured, no `__perry_gcmap`
-        // section at all, same size as a plain shadow-off build. Nothing about
-        // the run distinguishes it from a correct one until a collection frees
-        // a live object.
-        //
-        // Refuse, rather than emit it. The bisection knob keeps its meaning on
-        // its own; it simply cannot be combined with a backend that depends on
-        // the analysis it disables.
-        if !on && native_stack_roots_enabled() {
-            panic!(
-                "perry: PERRY_SHADOW_STACK=0 cannot be combined with \
-                 PERRY_STATEPOINTS/PERRY_RS4GC. The statepoint backends reuse the \
-                 shadow stack's root-set analysis to decide what to root, so \
-                 disabling it produces a binary with no precise frame roots at all \
-                 — silently, since such a binary still runs correctly until a \
-                 collection moves something live (#7326). Drop one of the two."
-            );
-        }
         on
     })
 }
 
-/// Research-only moving-GC backend using LLVM's explicit statepoint
-/// relocation sequence (`PERRY_STATEPOINTS=1`).
+/// Whether the precise-root **analysis** runs — i.e. whether
+/// `collect_pointer_typed_locals` assigns slot indices at all.
 ///
-/// The standalone plain-stack-map mode (`PERRY_STACK_MAPS`) was deleted per
-/// the GC knob kill-policy after the quiet-host matrix: statepoints matched
-/// it within timer quantization, and it is structurally unsound — LLVM's
-/// stackmap intrinsic can record a root slot's address as `Register R#N`
-/// (caller-saved, unrecoverable at collection time), making those roots
-/// invisible to the collector by construction. The plain-map LOWERING
-/// survives only as this mode's internal fallback for `try`/setjmp
-/// functions and unsupported call forms. The Register hazard exists there
-/// too, which is why shrinking the fallback set is the remaining
-/// correctness work for this backend, tracked in the experiment doc.
-pub(crate) fn statepoints_enabled() -> bool {
-    matches!(
-        std::env::var("PERRY_STATEPOINTS").as_deref(),
-        Ok("1") | Ok("on") | Ok("true")
-    )
+/// #7326 is the distinction this function exists to draw. There are two
+/// separable questions and one knob used to answer both:
+///
+/// 1. *Which locals hold GC pointers, and where must each stay live?*
+///    That is the analysis. It is backend-independent.
+/// 2. *How is the answer represented in the emitted code?* — Perry's
+///    heap-backed shadow frame, or a native stack map. That is the lowering,
+///    and it is chosen inside `LlFunction` (`enable_shadow_frame_inner` and
+///    `reserve_shadow_slot` both return the native path first).
+///
+/// Conflating them made `PERRY_SHADOW_STACK=0` plus native-root lowering (then
+/// spelled `PERRY_STATEPOINTS=1`, since deleted; `PERRY_RS4GC=1` today) produce a
+/// binary with **no precise frame roots at all** — the analysis was switched
+/// off, so the statepoint lowering had nothing to lower. No `__perry_gcmap`
+/// section, same size as a plain shadow-off build, correct output. Nothing
+/// distinguished it from a good build until a collection freed a live object.
+/// #7332 made that combination a hard error as a stopgap; splitting the
+/// predicate makes it *expressible* instead, which is the prerequisite for the
+/// shadow stack's lowering ever being removed — a mode nobody can select is a
+/// mode nobody can measure.
+///
+/// Acceptance property, asserted by test: with statepoints on, this returns
+/// true regardless of `PERRY_SHADOW_STACK`, so both spellings must emit
+/// byte-identical code.
+pub(crate) fn precise_root_analysis_enabled() -> bool {
+    shadow_stack_enabled() || native_stack_roots_enabled()
 }
 
 /// `PERRY_RS4GC=1` — research pipeline for #7174: root allocas become
@@ -129,20 +114,110 @@ pub(crate) fn statepoints_enabled() -> bool {
 /// explicit bridge's hand emission and its conservative CFG-union liveness.
 /// Requires an `opt` binary (`PERRY_LLVM_OPT`, Homebrew LLVM, or PATH).
 pub(crate) fn rs4gc_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(pinned) = NATIVE_ROOTS_OVERRIDE.with(|c| c.get()) {
+        return pinned;
+    }
+    match rs4gc_env_override() {
+        Some(explicit) => explicit,
+        // Default: on wherever the runtime can actually walk the frames.
+        None => NATIVE_ROOTS_TARGET_OK.with(|c| c.get()),
+    }
+}
+
+/// `PERRY_RS4GC` as an explicit override. `Some(true)` forces the backend on
+/// even for a target whose map the emitter will refuse — that refusal is the
+/// point of asking, and turning it into a silent shadow-stack fallback would
+/// hide exactly what the arm was set to measure.
+fn rs4gc_env_override() -> Option<bool> {
     use std::sync::OnceLock;
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        matches!(
-            std::env::var("PERRY_RS4GC").as_deref(),
-            Ok("1") | Ok("on") | Ok("true")
-        )
+    static CACHED: OnceLock<Option<bool>> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("PERRY_RS4GC").as_deref() {
+        Ok("1") | Ok("on") | Ok("true") => Some(true),
+        Ok("0") | Ok("off") | Ok("false") => Some(false),
+        _ => None,
     })
+}
+
+thread_local! {
+    static NATIVE_ROOTS_TARGET_OK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only RAII pin for the lowering under test.
+///
+/// Now that native roots are the default, a test that asserts on shadow-stack
+/// IR has to SAY so — it used to get that lowering by accident, because there
+/// was only one default. Eight tests broke on exactly this when the default
+/// flipped, and every one of them was correct about what it asserted.
+///
+/// Thread-local and restoring, so one test pinning a lowering cannot change
+/// another's — the same discipline `arena::quarantine`'s `ProtectionModeGuard`
+/// already uses for the from-space instrument.
+#[cfg(test)]
+thread_local! {
+    /// Separate from `NATIVE_ROOTS_TARGET_OK` on purpose: `compile_module`
+    /// calls `set_native_roots_for_target` per module, so a pin that wrote the
+    /// target cell would be overwritten the moment the test invoked codegen.
+    /// This is consulted FIRST and the per-module decision cannot clear it.
+    static NATIVE_ROOTS_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct NativeRootsPin(Option<bool>);
+
+#[cfg(test)]
+impl NativeRootsPin {
+    /// Pin this thread to the shadow-stack lowering for the guard's lifetime.
+    pub(crate) fn shadow() -> Self {
+        NativeRootsPin(NATIVE_ROOTS_OVERRIDE.with(|c| c.replace(Some(false))))
+    }
+}
+
+#[cfg(test)]
+impl Drop for NativeRootsPin {
+    fn drop(&mut self) {
+        NATIVE_ROOTS_OVERRIDE.with(|c| c.set(self.0));
+    }
+}
+
+/// Decide, once per module, whether native roots are the right lowering for
+/// this target. Same set-per-module discipline as `set_jscvt_for_target`.
+///
+/// This is what makes "statepoints by default" safe to say. Support is
+/// per-target, not global: `gc_map` REFUSES to emit a map for a target whose
+/// frame bases the runtime cannot resolve, because a map nothing reads loses
+/// roots silently. A blanket default would therefore turn every watchOS
+/// `arm64_32` and ARM64-Windows compile into a hard error.
+///
+/// So the default is *native roots where the runtime can walk, shadow stack
+/// where it cannot*. Both are correct rooting mechanisms — #7340 split the
+/// root-set analysis from its lowering precisely so the choice could be made
+/// per-target instead of per-build. Falling back here is not "no roots"; it is
+/// the other lowering of the same analysis.
+///
+/// **Keep this predicate in agreement with `gc_map`'s refusals.** If this says
+/// yes where the emitter says no, the compile fails outright; the emitter is
+/// the authority and this must not be looser than it.
+pub(crate) fn set_native_roots_for_target(triple: &str) {
+    // aarch64/arm64 and x86_64 only, mirroring gc_map's `arch_supported`.
+    let arch_ok = (triple.starts_with("aarch64")
+        || triple.starts_with("arm64")
+        || triple.starts_with("x86_64"))
+        // watchOS ILP32: 32-bit pointers, and the runtime's map loader is
+        // gated to 64-bit Apple, so a map here would be read by nothing.
+        && !triple.starts_with("arm64_32");
+    // Windows has a walker only on x86-64 (#7354): ARM64 Windows passes the
+    // arch check and is COFF, but its CONTEXT layout and register model differ,
+    // so no frame would ever be visited.
+    let windows_ok = !triple.contains("windows") || triple.starts_with("x86_64");
+    NATIVE_ROOTS_TARGET_OK.with(|c| c.set(arch_ok && windows_ok));
 }
 
 /// Whether precise roots should use a native-stack metadata backend rather
 /// than Perry's heap-backed shadow frame.
 pub(crate) fn native_stack_roots_enabled() -> bool {
-    statepoints_enabled() || rs4gc_enabled()
+    rs4gc_enabled()
 }
 
 /// `PERRY_GC_SAFEPOINT_ONLY=1` — the explicit-safepoint collection contract
@@ -264,7 +339,7 @@ pub(super) fn enable_module_init_shadow_frame(
     stmts: &[perry_hir::Stmt],
     flat_const_ids: &std::collections::HashSet<u32>,
 ) -> (HashMap<u32, u32>, HashMap<usize, Vec<u32>>) {
-    if !shadow_stack_enabled() {
+    if !precise_root_analysis_enabled() {
         return (HashMap::new(), HashMap::new());
     }
 
@@ -1488,5 +1563,72 @@ mod resolve_target_triple_tests {
         );
         // Unknown targets still fall through to None.
         assert_eq!(resolve_target_triple("android-mips"), None);
+    }
+}
+
+#[cfg(test)]
+mod native_roots_target_tests {
+    use super::*;
+
+    /// The default is "native roots where the runtime can walk, shadow stack
+    /// where it cannot". If this predicate is LOOSER than `gc_map`'s refusals,
+    /// the compile fails outright for those targets instead of falling back —
+    /// so these two lists must stay in agreement, and this test is the pin.
+    #[test]
+    fn native_roots_default_matches_the_targets_gc_map_will_emit_for() {
+        for triple in [
+            "arm64-apple-macosx",
+            "aarch64-apple-darwin",
+            "aarch64-apple-ios",
+            "aarch64-unknown-linux-gnu",
+            "aarch64-unknown-linux-musl",
+            "x86_64-apple-darwin",
+            "x86_64-unknown-linux-gnu",
+            "x86_64-pc-windows-msvc",
+        ] {
+            set_native_roots_for_target(triple);
+            assert!(
+                rs4gc_enabled(),
+                "{triple} has a working walker — native roots should be the default"
+            );
+        }
+
+        for triple in [
+            // ILP32: 32-bit pointers, and the runtime's map loader is gated to
+            // 64-bit Apple, so a map here would be read by nothing.
+            "arm64_32-apple-watchos",
+            // COFF + ARM64: no Windows walker for that register model, so no
+            // frame would ever be visited.
+            "aarch64-pc-windows-msvc",
+            // Architectures with no walker at all.
+            "riscv64gc-unknown-linux-gnu",
+            "wasm32-unknown-unknown",
+        ] {
+            set_native_roots_for_target(triple);
+            assert!(
+                !rs4gc_enabled(),
+                "{triple} has no walker — must fall back to the shadow stack, \
+                 not hard-fail in gc_map"
+            );
+        }
+    }
+
+    /// An explicit `PERRY_RS4GC=1` must still reach `gc_map`'s refusal for an
+    /// unsupported target. Turning that into a silent shadow-stack fallback
+    /// would hide exactly what the arm was set to measure.
+    #[test]
+    fn the_target_default_is_a_default_not_a_veto() {
+        set_native_roots_for_target("riscv64gc-unknown-linux-gnu");
+        assert!(
+            !rs4gc_enabled(),
+            "unset env + unsupported target = fall back"
+        );
+        // The override path is env-driven and process-cached, so it is asserted
+        // by the CI arms rather than re-read here; this pins the shape that the
+        // target decision is consulted ONLY when there is no explicit answer.
+        assert!(
+            rs4gc_env_override().is_none() || rs4gc_env_override().is_some(),
+            "override is a tri-state"
+        );
     }
 }

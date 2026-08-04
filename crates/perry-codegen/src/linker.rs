@@ -275,6 +275,24 @@ fn cpu_tuning_arg_for(
         }
     };
     match requested.map(str::trim).filter(|s| !s.is_empty()) {
+        // Apple aarch64 pins an explicit baseline instead of trusting
+        // `-mcpu=native`. Codegen decides whether to emit
+        // `llvm.aarch64.fjcvtzs` (FEAT_JSCVT) from the TRIPLE alone, because
+        // clang's default CPU for `arm64-apple-*` is `apple-m1` — see
+        // `inprocess::default_cpu_for_triple`, the other half of that pair.
+        // `native` breaks the pair wherever CPU detection disagrees with that
+        // assumption: on a virtualised macOS CI runner it resolved to a CPU
+        // without the feature and every compile died with
+        // `Cannot select: intrinsic %llvm.aarch64.fjcvtzs`, while the same
+        // command worked on a physical Mac. Naming the baseline makes what we
+        // emit and what we target the same decision.
+        None if target_triple.is_none()
+            && (effective_target.starts_with("arm64")
+                || effective_target.starts_with("aarch64"))
+            && effective_target.contains("apple") =>
+        {
+            Some(arch_flag("apple-m1"))
+        }
         None => target_triple
             .is_none()
             .then(|| native_tuning_arg_for_host().to_string()),
@@ -405,8 +423,7 @@ fn build_clang_compile_plan(
     // the statepoint backends emit a stack map, so only they pay for it, and
     // the cost is small: `-S` takes the same time as `-c` (codegen is the
     // cost, printing text is free) and assembling is ~0.02s per module.
-    let compact_gc_map =
-        crate::codegen::helpers::statepoints_enabled() || crate::codegen::helpers::rs4gc_enabled();
+    let compact_gc_map = crate::codegen::helpers::native_stack_roots_enabled();
     let asm_path = compact_gc_map.then(|| PathBuf::from(format!("{}.s", obj_path.display())));
 
     let mut clang_args = vec![
@@ -479,8 +496,53 @@ fn build_clang_compile_plan(
 /// relocation, and downstream-use rewrite. Fails the compile loudly when no
 /// `opt` is available or the pass pipeline errors — a silent skip would be a
 /// vacuous mode.
+/// The refusal for a module whose EH lowered to WinEH funclet pads under
+/// RS4GC, or `None` when the module is safe to pipe through the pass.
+///
+/// windows-msvc `try` lowers to `catchswitch`/`catchpad` funclets (#7302), and
+/// LLVM's `rewrite-statepoints-for-gc` does not support funclet EH: it crashes
+/// outright — measured on opt 22.1.3 as an access violation (0xC0000005) with
+/// a symbol-less stack dump, reproducible from an eight-line module carrying
+/// one `invoke` that unwinds to a `catchswitch` (#7354). Detect the shape
+/// BEFORE spawning the pass and name the actual limitation; the alternative on
+/// the external path is a crash pointing at LLVM's bug tracker, and on the
+/// in-process path it would take the whole compiler process down.
+///
+/// Matched on the ` within ` instruction syntax rather than the bare opcode
+/// names so a user string literal containing "catchpad" cannot trip it.
+pub(crate) fn rs4gc_funclet_refusal(ll_text: &str) -> Option<String> {
+    [
+        "catchswitch within ",
+        "catchpad within ",
+        "cleanuppad within ",
+    ]
+    .iter()
+    .any(|needle| ll_text.contains(needle))
+    .then(|| {
+        "PERRY_RS4GC: this module contains a `try`/`catch` that lowered to \
+             WinEH funclet pads (catchswitch/catchpad — the windows-msvc EH \
+             shape), and LLVM's rewrite-statepoints-for-gc pass does not \
+             support funclet EH: it crashes with an access violation rather \
+             than reporting anything. Refusing before the pass runs. \
+             Compile without PERRY_RS4GC, or keep `try` out of RS4GC-compiled \
+             modules on Windows. Tracked in #7354."
+            .to_string()
+    })
+}
+
 fn maybe_rs4gc_preprocess(ll_text: &str) -> Result<Option<String>> {
     if !crate::codegen::helpers::rs4gc_enabled() {
+        return Ok(None);
+    }
+    if let Some(refusal) = rs4gc_funclet_refusal(ll_text) {
+        return Err(anyhow!(refusal));
+    }
+    // The in-process backend runs RS4GC itself, against the same LLVM that
+    // emits the object (see `inprocess::optimize_and_emit`). Shelling out to a
+    // separate `opt` here as well would both duplicate the rewrite and
+    // reintroduce the version skew the in-process path exists to remove.
+    #[cfg(feature = "llvm-inprocess")]
+    if inprocess_requested() {
         return Ok(None);
     }
     let opt = std::env::var("PERRY_LLVM_OPT")
@@ -520,8 +582,26 @@ fn maybe_rs4gc_preprocess(ll_text: &str) -> Result<Option<String>> {
         .write_all(ll_text.as_bytes())?;
     let output = child.wait_with_output()?;
     if !output.status.success() {
+        // The IR went to `opt` through a pipe, so unlike a failed clang
+        // compile nothing was on disk to debug from — an `opt` crash (probe
+        // 09 on Windows: access violation inside rewrite-statepoints-for-gc)
+        // left only a symbol-less stack dump. Write the exact input next to
+        // the other failure artifacts and name it, so the crash is
+        // reproducible with one command.
+        let ir_path = env::temp_dir().join(format!("perry_rs4gc_failed_{}.ll", std::process::id()));
+        let ir_note = match fs::write(&ir_path, ll_text) {
+            Ok(()) => format!("input IR left at: {}", ir_path.display()),
+            Err(error) => format!("(could not write input IR: {error})"),
+        };
         return Err(anyhow!(
-            "PERRY_RS4GC: opt pipeline failed:\n{}",
+            "PERRY_RS4GC: opt pipeline failed ({}).\n{}\n\
+             reproduce: {} -passes='function(mem2reg),rewrite-statepoints-for-gc' -S {}\n\
+             \n\
+             stderr:\n{}",
+            output.status,
+            ir_note,
+            opt.display(),
+            ir_path.display(),
             String::from_utf8_lossy(&output.stderr)
         ));
     }
@@ -591,14 +671,37 @@ pub(crate) fn native_plan_args(
     (plan.effective_target, plan.clang_args)
 }
 
-/// exp/llvm-inprocess: truthy `PERRY_LLVM_INPROCESS` routes `.ll -> .o`
-/// through the LLVM C API inside this process (no clang subprocess, no `.ll`
-/// on disk). The flag participates in both the build cache and the object
-/// cache keys, so the two backends can never share a cached object.
+/// Route `.ll -> .o` through the LLVM C API inside this process (no clang
+/// subprocess, no `.ll` on disk).
+///
+/// **ON BY DEFAULT.** Perry links LLVM 22 statically and ships self-contained,
+/// so there is no "find a compatible clang" step to get wrong. It is also
+/// load-bearing rather than a preference: the explicit statepoint bridge is
+/// gone (#7348), leaving RS4GC as the only native-root backend, and RS4GC
+/// cannot round-trip its IR through an external `opt` + a different clang
+/// (#7339).
+///
+/// `PERRY_LLVM_INPROCESS=0`/`off`/`false` reverts to the clang subprocess for
+/// bisection. `=native` additionally builds function bodies through the C API
+/// instead of rendering per-function text; that is byte-identical on the
+/// 81-module zod corpus but has narrower CI coverage, so it stays opt-in until
+/// that widens.
+///
+/// The value participates in both the build cache and the object cache keys,
+/// so the backends can never share a cached object.
 fn inprocess_requested() -> bool {
     match env::var("PERRY_LLVM_INPROCESS").as_deref() {
-        Ok("") | Ok("0") | Ok("off") | Ok("false") | Err(_) => false,
+        Ok("0") | Ok("off") | Ok("false") => false,
+        // Explicitly asked for: honour it even without the feature, so the
+        // stub below can say "rebuild with the feature" instead of silently
+        // serving the text path to an A/B arm that asked for this backend.
         Ok(_) => true,
+        // Unset means ON *iff* the backend is actually compiled in. It is a
+        // default feature, so that is the normal case — but a
+        // `--no-default-features` build must keep working, and defaulting to
+        // `true` there would route every compile into the not-built-in stub
+        // and fail the build outright.
+        Err(_) => cfg!(feature = "llvm-inprocess"),
     }
 }
 
@@ -648,7 +751,66 @@ fn compile_ll_inprocess_in(
         &plan.clang_args,
         &module_name,
     ) {
-        Ok(bytes) => Ok(bytes),
+        // The statepoint backends ask for `-S`, because #7314's compact-map
+        // rewriter rewrites `.llvm_stackmaps` at ASSEMBLY time — that is where
+        // LLVM prints function addresses as symbol names, so one text parser
+        // replaces Mach-O and ELF relocation parsing plus a second link pass.
+        //
+        // So what came back is assembly, not an object. Write it where the
+        // clang path would have, run the same rewrite-and-assemble step, and
+        // return the resulting object. Skipping this wrote assembly text into a
+        // `.o` and the link died with `ld: unknown file type`.
+        Ok(bytes) if plan.asm_path.is_some() => {
+            let asm_path = plan.asm_path.as_ref().expect("checked");
+            if let Some(parent) = asm_path.parent() {
+                fs::create_dir_all(parent).ok();
+            }
+            fs::write(asm_path, &bytes)
+                .with_context(|| format!("Failed to write {}", asm_path.display()))?;
+            // `plan.clang` is the literal `(in-process)` placeholder here, so
+            // resolve a real assembler. Using the system clang for this step is
+            // sound: the version skew that motivated the in-process backend was
+            // an *IR* parse failure (`unterminated attribute group`), and by
+            // this point the IR is gone — what is being assembled is text this
+            // LLVM just printed, which any contemporary assembler accepts.
+            let assembler = find_clang().context(
+                "the statepoint compact-map rewrite needs an assembler to turn \
+                 the emitted assembly into an object, and no clang was found",
+            )?;
+            crate::gc_map::compact_and_assemble(
+                &assembler,
+                &plan.effective_target,
+                asm_path,
+                &plan.obj_path,
+                &plan.clang_args,
+            )?;
+            let obj = fs::read(&plan.obj_path)
+                .with_context(|| format!("Failed to read assembled {}", plan.obj_path.display()))?;
+            if !policy.keep {
+                let _ = fs::remove_file(asm_path);
+                let _ = fs::remove_file(&plan.obj_path);
+            }
+            Ok(obj)
+        }
+        Ok(bytes) => {
+            // `PERRY_LLVM_KEEP_IR` promises the whole scratch dir, `.o`
+            // included. The clang path gets that for free because the object
+            // IS a file; in-process returns bytes and would silently drop it —
+            // degrading a debugging aid at exactly the moment someone is
+            // debugging. Now that this backend is the default, write it.
+            if policy.keep {
+                let _ = fs::create_dir_all(&paths.scratch_dir);
+                if let Err(e) = fs::write(&plan.obj_path, &bytes) {
+                    eprintln!(
+                        "[perry-codegen] could not keep {}: {e}",
+                        plan.obj_path.display()
+                    );
+                } else {
+                    eprintln!("[perry-codegen] kept object: {}", plan.obj_path.display());
+                }
+            }
+            Ok(bytes)
+        }
         Err(e) => {
             // Same contract as a failed clang compile: the IR that produced
             // the failure is left on disk and named in the error.
@@ -817,6 +979,7 @@ fn compile_ll_to_object_in(
             &plan.effective_target,
             asm_path,
             &obj_path,
+            &plan.clang_args,
         )?;
     }
 

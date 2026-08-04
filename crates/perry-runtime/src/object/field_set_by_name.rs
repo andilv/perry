@@ -1304,6 +1304,8 @@ pub extern "C" fn js_object_set_field_by_name(
 
         let mut prev_keys_usize = keys as usize;
 
+        // #7341: call after ANY allocating step, before the next use of
+        // obj/key/value. Rationale in changelog.d/7381-*, 7383-*.
         macro_rules! refresh_roots_after_alloc {
             () => {{
                 obj = obj_handle.get_raw_mut_ptr::<ObjectHeader>();
@@ -1404,6 +1406,7 @@ pub extern "C" fn js_object_set_field_by_name(
                 // (bundled zod assigns `create` onto ~40 sibling class
                 // objects), so from the SECOND class on the write lands
                 // here — the mirror must fire on this path too.
+                refresh_roots_after_alloc!();
                 mirror_class_object_static_write(obj, key, value);
                 return;
             }
@@ -1439,6 +1442,7 @@ pub extern "C" fn js_object_set_field_by_name(
                 (*obj).field_count = 1;
             }
             js_object_set_field(obj, 0, JSValue::from_bits(value.to_bits()));
+            refresh_roots_after_alloc!();
             mirror_class_object_static_write(obj, key, value);
             // Record the null→single-key transition so the next object
             // that starts with `{}` and sets the same first key hits the
@@ -1552,6 +1556,7 @@ pub extern "C" fn js_object_set_field_by_name(
                     };
                     overflow_set(obj as usize, i, vbits);
                 }
+                refresh_roots_after_alloc!();
                 mirror_class_object_static_write(obj, key, value);
                 return;
             }
@@ -1622,6 +1627,7 @@ pub extern "C" fn js_object_set_field_by_name(
                     super::shapes::shape_keys_grown(prev_keys_usize, new_keys);
                 }
                 overflow_set(obj as usize, new_index, vbits);
+                refresh_roots_after_alloc!();
                 mirror_class_object_static_write(obj, key, value);
                 transition_cache_insert(
                     prev_keys_usize,
@@ -1663,6 +1669,7 @@ pub extern "C" fn js_object_set_field_by_name(
                 (*obj).field_count = new_index as u32 + 1;
             }
             js_object_set_field(obj, new_index as u32, JSValue::from_bits(value.to_bits()));
+            refresh_roots_after_alloc!();
             mirror_class_object_static_write(obj, key, value);
             transition_cache_insert(
                 prev_keys_usize,
@@ -1733,6 +1740,7 @@ pub extern "C" fn js_object_set_field_by_name(
                     };
                     overflow_set(obj as usize, i, vbits);
                 }
+                refresh_roots_after_alloc!();
                 mirror_class_object_static_write(obj, key, value);
                 return;
             }
@@ -1821,6 +1829,7 @@ pub extern "C" fn js_object_set_field_by_name(
                 super::shapes::shape_keys_grown(prev_keys_usize, new_keys);
             }
             overflow_set(obj as usize, new_index, vbits);
+            refresh_roots_after_alloc!();
             mirror_class_object_static_write(obj, key, value);
             // Record the shape transition so the next object sharing
             // `prev_keys` that adds the same key hits the fast path.
@@ -1864,6 +1873,7 @@ pub extern "C" fn js_object_set_field_by_name(
             (*obj).field_count = new_index as u32 + 1;
         }
         js_object_set_field(obj, new_index as u32, JSValue::from_bits(value.to_bits()));
+        refresh_roots_after_alloc!();
         mirror_class_object_static_write(obj, key, value);
         // Record the shape transition — see above for semantics.
         transition_cache_insert(

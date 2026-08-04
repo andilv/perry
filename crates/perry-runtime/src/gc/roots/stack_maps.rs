@@ -1,20 +1,31 @@
-//! Research precise-root backend for LLVM stack maps.
+//! Precise GC roots read from native frames, via LLVM statepoints.
 //!
-//! The plain-map prototype places `llvm.experimental.stackmap` immediately
-//! before mapped calls and records the address of each native root alloca.
-//! The statepoint prototype instead records LLVM-owned spill slots for
-//! `gc.relocate` values. Both are writable frame-register-relative locations
-//! in the emitted stack-map section.
+//! Under `PERRY_RS4GC=1` the compiler runs `RewriteStatepointsForGC`, which
+//! records each live root as an LLVM-owned spill slot for a `gc.relocate`
+//! value: a writable, frame-register-relative location in the emitted
+//! stack-map section. This module finds that section in the running image,
+//! walks the native frames, and hands each live slot to the collector as a
+//! `MutableRootSlot` — mutable because evacuation rewrites through it.
 //!
-//! This first implementation deliberately targets macOS, where the experiment
-//! is being measured. It discovers the concatenated `__PERRY_GCMAP` section
-//! in the main Mach-O image and uses the platform unwinder to recover the
-//! frame-register value for each active generated frame. Unsupported targets
-//! return no roots; neither native-stack experiment may be used for correctness
-//! there.
+//! A second lowering used to exist, placing `llvm.experimental.stackmap`
+//! before mapped calls and recording alloca addresses directly. It was
+//! unsound and is deleted; only the statepoint path remains, so there is no
+//! backend selection here and no fallback between them.
+//!
+//! Platform support is per-shape, not one target: Apple (macOS/iOS/iPadOS/
+//! tvOS/watchOS) reads a concatenated `__PERRY_GCMAP` Mach-O section, Linux
+//! reads `.perry_gcmap` from ELF, and Windows reads `.pgcmap` from the PE
+//! image. Frame walking is per-platform too — an x29 chain walk where the
+//! map proves every frame is chain-walkable, the Itanium unwinder elsewhere
+//! on Unix, and `RtlVirtualUnwind` on Windows. Targets outside that set
+//! return no roots, and the compiler refuses to emit a map for them rather
+//! than producing a binary whose collector would silently free live objects.
 
 use super::{MutableRootSlot, MutableRootSlotKind};
 use crate::gc::telemetry::RootSourcesTraceStats;
+// The Windows walker spells `core::ffi::c_void` inline; this import serves
+// the Itanium/pthread declarations, which do not exist there.
+#[cfg(not(target_os = "windows"))]
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
@@ -40,6 +51,14 @@ struct StackMapRecord {
     /// location needs the FP-to-SP offset (see `fp_to_sp_offset`).
     function_address: usize,
     /// The containing function's total frame size from the function table.
+    ///
+    /// Decoded because the map carries it and `parse_gc_map`'s tests pin that
+    /// the field is read at the right offset — NOT because a walker may build
+    /// a root's base out of it. The unwinder fallback used to compute
+    /// `CFA - stack_size` and that was #7392: the CFA a backtrace callback
+    /// reports IS the frame's stack pointer, so the subtraction put every
+    /// SP-relative root one frame too low.
+    #[allow(dead_code)]
     stack_size: u64,
     /// Half-open range into `StackMapIndex::roots`.
     ///
@@ -82,8 +101,61 @@ impl StackMapIndex {
 
 static STACK_MAPS: OnceLock<StackMapIndex> = OnceLock::new();
 
+// The two register numbers the compact format's short base tags stand for.
+// These are aarch64's by definition of the FORMAT, on every architecture — see
+// `gc_map.rs`, which deliberately keeps them literal so the compiler's idea of
+// the target and this runtime's `target_arch` can never disagree.
 const DWARF_REG_FP_AARCH64: u16 = 29;
 const DWARF_REG_SP_AARCH64: u16 = 31;
+
+// A frame record is two 64-bit words, so it needs EIGHT-byte alignment, not
+// sixteen.
+//
+// The stack pointer is 16-byte aligned at a public interface on both supported
+// ABIs, and on Darwin the frame record sits at the top of the frame, so there
+// x29 is always 16-aligned as well and a `fp & 0xF` test never fires. AAPCS64
+// does not promise that: §6.4.6 fixes the record's CONTENTS and leaves its
+// location within the frame unspecified, and LLVM's AArch64 **ELF** frame
+// lowering puts the `x29,x30` pair *below* the other callee-saved GPRs. With an
+// odd number of those, the pair lands 8 mod 16.
+//
+// Measured on aarch64-unknown-linux-gnu (#7392), from the `.eh_frame` of a
+// runtime frame that saves x19..x23 and v8:
+//
+//     LOC        CFA      x19  x20  x21  x22  x23  x29  ra   v8
+//     ...        x29+56   c-8  c-16 c-24 c-32 c-40 c-56 c-48 c-64
+//
+// x29 = CFA - 56, and CFA is 16-aligned, so x29 ≡ 8 (mod 16) — a legal frame
+// record the 16-byte test rejected. That abandoned the fast walk mid-stack and
+// fell back to the unwinder, which had its own SP-base bug (see
+// `unwind::walk_frame`), so the frame's roots were never rewritten after an
+// evacuation and the mutator then dereferenced a stale from-space pointer.
+//
+// Only the fp-chain walker reads it, and that walker exists on aarch64 Unix
+// alone — the same cfg, spelled out rather than approximated, so an x86-64 or
+// Windows build does not warn on a constant it has no walker for.
+#[cfg_attr(
+    not(all(
+        any(target_vendor = "apple", target_os = "linux"),
+        target_arch = "aarch64"
+    )),
+    allow(dead_code)
+)]
+const FRAME_RECORD_ALIGN_MASK: usize = 0x7;
+
+// Which DWARF register is the stack pointer on the machine this runtime was
+// built for. Distinct from the format constants above and used only to choose
+// how a base is resolved: `_Unwind_GetGR` is not a supported query for the SP
+// column, so an SP-relative root must come from the CFA instead. On x86-64
+// every root is `Indirect [RSP + off]` — DWARF 7, measured 56 of 56 on one
+// probe — and reading it with `GetGR` returned garbage the collector then
+// wrote through, which is the segfault the Linux gate hit.
+#[cfg(target_arch = "aarch64")]
+const ARCH_DWARF_SP: u16 = 31;
+#[cfg(target_arch = "x86_64")]
+const ARCH_DWARF_SP: u16 = 7;
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+const ARCH_DWARF_SP: u16 = u16::MAX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WalkerMode {
@@ -224,22 +296,45 @@ fn index_records(records: Vec<StackMapRecord>, roots: Vec<StackMapLocation>) -> 
 /// there and the fast chain previously fell back to the DWARF unwinder for
 /// every collection (~22% of samples on a Pi 5).
 ///
-/// Instruction encoding: ADD (immediate, 64-bit, shift 0) with Rn = 31 (sp)
-/// and Rd = 29 (fp) — `word & 0xFFC0_03FF == 0x9100_03FD`, immediate in bits
-/// [21:10]. Scans a bounded prologue window and fails closed (`None`) if the
-/// pattern is absent, in which case the caller uses the platform unwinder.
+/// Instruction encoding: ADD (immediate, 64-bit) with Rn = 31 (sp) and
+/// Rd = 29 (fp) — `word & 0xFF80_03FF == 0x9100_03FD`, immediate in bits
+/// [21:10] and its `lsl #12` flag in bit 22. Scans a bounded prologue window
+/// and fails closed (`None`) if the pattern is absent, in which case the
+/// caller uses the platform unwinder.
 #[cfg(target_arch = "aarch64")]
 fn fp_to_sp_offset(function_address: usize) -> Option<usize> {
-    const ADD_FP_SP_MASK: u32 = 0xFFC0_03FF;
+    // The `sh` bit (22) selects `lsl #12` on the immediate and is therefore
+    // NOT part of the opcode match — masking it in (`0xFFC0_….`) restricts the
+    // decoder to frames smaller than 4 KiB. See `immediate_of` below.
+    const ADD_FP_SP_MASK: u32 = 0xFF80_03FF;
     const ADD_FP_SP_PATTERN: u32 = 0x9100_03FD;
     const PROLOGUE_WINDOW_INSNS: usize = 24;
     if function_address == 0 || function_address & 0x3 != 0 {
         return None;
     }
-    // SUB (immediate, 64-bit, shift 0) with Rn = Rd = 31 (sp):
-    // `word & 0xFFC0_03FF == 0xD100_03FF`, immediate in bits [21:10].
-    const SUB_SP_SP_MASK: u32 = 0xFFC0_03FF;
+    // SUB (immediate, 64-bit) with Rn = Rd = 31 (sp):
+    // `word & 0xFF80_03FF == 0xD100_03FF`, immediate in bits [21:10].
+    const SUB_SP_SP_MASK: u32 = 0xFF80_03FF;
     const SUB_SP_SP_PATTERN: u32 = 0xD100_03FF;
+
+    /// Decode an ADD/SUB (immediate) operand: `imm12` in bits [21:10], scaled
+    /// by 4096 when the `sh` bit (22) is set.
+    ///
+    /// #7394: LLVM switches to `lsl #12` the moment a frame needs 4 KiB or
+    /// more, and a generated function that spills several `[32 x double]`
+    /// concat buffers crosses that line routinely — 80 of them in one gap-test
+    /// binary. Ignoring `sh` did not merely lose the shifted term: the
+    /// shifted `sub` failed the opcode match, which *ended the accumulation
+    /// run*, so every later `sub sp` in the same prologue was dropped too.
+    fn immediate_of(word: u32) -> usize {
+        const SHIFT_12_BIT: u32 = 1 << 22;
+        let imm12 = ((word >> 10) & 0xFFF) as usize;
+        if word & SHIFT_12_BIT != 0 {
+            imm12 << 12
+        } else {
+            imm12
+        }
+    }
 
     let mut fp_offset = None;
     for i in 0..PROLOGUE_WINDOW_INSNS {
@@ -247,7 +342,7 @@ fn fp_to_sp_offset(function_address: usize) -> Option<usize> {
         match fp_offset {
             None => {
                 if word & ADD_FP_SP_MASK == ADD_FP_SP_PATTERN {
-                    fp_offset = Some(((word >> 10) & 0xFFF) as usize);
+                    fp_offset = Some(immediate_of(word));
                 }
             }
             // #7328: `add x29, sp, #imm` is NOT always the last stack
@@ -266,8 +361,7 @@ fn fp_to_sp_offset(function_address: usize) -> Option<usize> {
             // is not the default. Accumulate every trailing `sub sp, sp, #imm`.
             Some(offset) => {
                 if word & SUB_SP_SP_MASK == SUB_SP_SP_PATTERN {
-                    let imm = ((word >> 10) & 0xFFF) as usize;
-                    fp_offset = Some(offset + imm);
+                    fp_offset = Some(offset + immediate_of(word));
                     continue;
                 }
                 // The prologue's stack adjustments are contiguous; the first
@@ -447,17 +541,27 @@ fn parse_gc_map(bytes: &[u8]) -> Option<(Vec<StackMapRecord>, Vec<StackMapLocati
         }
         let function_count = read_u32(bytes, base + 8)? as usize;
         let total_len = read_u32(bytes, base + 12)? as usize;
+        // Header flags, bit 0: the function-address field is 8 bytes wide. The
+        // emitter writes the TARGET's pointer width (watchOS `arm64_32` is
+        // ILP32), and compile target and run target are the same machine — so
+        // a mismatch here means the binary's map was produced for a different
+        // width and every function address would be misread. Fail closed.
+        let flags = read_u16(bytes, base + 6)?;
+        if (flags & 1 == 1) != (std::mem::size_of::<usize>() == 8) {
+            return None;
+        }
+        let entry = if flags & 1 == 1 { 16 } else { 12 };
         // A blob must at least cover its header and function table. Without
         // this, a `total_len` of 0 leaves `base` unchanged — and because the
         // magic still matches at that offset the resynchronisation path below
         // is never reached, so the loop spins forever. This runs inside
         // `OnceLock::get_or_init`, so that is a process hang at the first
         // collection rather than the fail-closed panic in `stack_maps`.
-        if total_len < 16 + function_count.checked_mul(16)? {
+        if total_len < 16 + function_count.checked_mul(entry)? {
             return None;
         }
         let table = base.checked_add(16)?;
-        let stream_start = table.checked_add(function_count.checked_mul(16)?)?;
+        let stream_start = table.checked_add(function_count.checked_mul(entry)?)?;
         let blob_end = base.checked_add(total_len)?;
         if blob_end > bytes.len() || stream_start > blob_end {
             return None;
@@ -484,10 +588,17 @@ fn parse_gc_map(bytes: &[u8]) -> Option<(Vec<StackMapRecord>, Vec<StackMapLocati
         let mut record_index = 0usize;
 
         for index in 0..function_count {
-            let entry = table + index * 16;
-            let function_address = read_u64(bytes, entry)? as usize;
-            let stack_size = u64::from(read_u32(bytes, entry + 8)?);
-            let record_count = read_u32(bytes, entry + 12)? as usize;
+            // Address width follows the header flag checked above, so the
+            // stack-size and record-count offsets move with it.
+            let base_off = table + index * entry;
+            let addr_bytes = entry - 8;
+            let function_address = if addr_bytes == 8 {
+                read_u64(bytes, base_off)? as usize
+            } else {
+                read_u32(bytes, base_off)? as usize
+            };
+            let stack_size = u64::from(read_u32(bytes, base_off + addr_bytes)?);
+            let record_count = read_u32(bytes, base_off + addr_bytes + 4)? as usize;
 
             let mut previous: Option<(u32, u32)> = None;
             for _ in 0..record_count {
@@ -584,11 +695,9 @@ fn read_u8(bytes: &[u8], offset: usize) -> Option<u8> {
     bytes.get(offset).copied()
 }
 
-/// ELF section headers store their counts and offsets as 16-bit fields, so
-/// this is used only by `elf_section_vaddr`. Gated to Linux because the
-/// compact GC map itself needs no 16-bit reads — deleting it as "orphaned"
-/// after a macOS-only `cargo check` is what broke the Linux build.
-#[cfg(target_os = "linux")]
+/// Used by the map header's flags field and by ELF section headers. It was
+/// briefly Linux-gated, which broke the Linux build the moment the map itself
+/// needed a 16-bit read — keep it unconditional.
 fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
     Some(u16::from_le_bytes(
         bytes.get(offset..offset + 2)?.try_into().ok()?,
@@ -607,7 +716,17 @@ fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
     ))
 }
 
-#[cfg(target_os = "macos")]
+/// Every 64-bit Apple platform, not only macOS. iOS, iPadOS (which reports as
+/// iOS), tvOS and visionOS are all aarch64 + Mach-O and share this loader
+/// verbatim; gating it to `target_os = "macos"` sent them to the stub below,
+/// where the section is never found and the index is empty — a collector with
+/// no native roots, silently, on exactly the platforms that cannot be debugged
+/// easily.
+///
+/// 64-bit only: watchOS's `arm64_32` has 32-bit pointers, while the map stores
+/// function addresses as `u64` and this code does `usize` arithmetic on them.
+/// The compiler refuses that target for the same reason.
+#[cfg(target_vendor = "apple")]
 fn loaded_stack_map_section() -> Option<&'static [u8]> {
     use mach2::dyld::{_dyld_get_image_header, _dyld_get_image_vmaddr_slide};
 
@@ -788,12 +907,81 @@ fn main_object_load_bias() -> Option<usize> {
     (bias != usize::MAX).then_some(bias)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// Windows/PE: the `.pgcmap` section of the running image.
+///
+/// The name is seven bytes because a PE image section header has an 8-byte name
+/// field — `.perry_gcmap` would be truncated on the way into the image and the
+/// lookup below could never match it. `gc_map::COFF_SECTION_NAME` is the
+/// compiler-side half of that agreement.
+///
+/// `GetModuleHandleW(NULL)` returns the image base, which is also a valid
+/// `IMAGE_DOS_HEADER`; the section table follows the optional header, whose
+/// size the file header records rather than being fixed.
+#[cfg(target_os = "windows")]
+fn loaded_stack_map_section() -> Option<&'static [u8]> {
+    const IMAGE_DOS_SIGNATURE: u16 = 0x5A4D; // "MZ"
+    const IMAGE_NT_SIGNATURE: u32 = 0x0000_4550; // "PE\0\0"
+    const SECTION_HEADER_SIZE: usize = 40;
+    const SECTION_NAME: &[u8] = b".pgcmap";
+
+    unsafe extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> *mut core::ffi::c_void;
+    }
+
+    unsafe {
+        let base = GetModuleHandleW(std::ptr::null()) as *const u8;
+        if base.is_null() {
+            return None;
+        }
+        if std::ptr::read_unaligned(base as *const u16) != IMAGE_DOS_SIGNATURE {
+            return None;
+        }
+        // e_lfanew sits at offset 0x3C of the DOS header.
+        let nt_offset = std::ptr::read_unaligned(base.add(0x3C) as *const u32) as usize;
+        let nt = base.add(nt_offset);
+        if std::ptr::read_unaligned(nt as *const u32) != IMAGE_NT_SIGNATURE {
+            return None;
+        }
+        // IMAGE_FILE_HEADER follows the 4-byte signature: NumberOfSections at
+        // +2, SizeOfOptionalHeader at +16.
+        let file_header = nt.add(4);
+        let section_count = std::ptr::read_unaligned(file_header.add(2) as *const u16) as usize;
+        let optional_size = std::ptr::read_unaligned(file_header.add(16) as *const u16) as usize;
+        let sections = file_header.add(20).add(optional_size);
+
+        for index in 0..section_count {
+            let header = sections.add(index * SECTION_HEADER_SIZE);
+            let name = std::slice::from_raw_parts(header, 8);
+            // Names shorter than eight bytes are NUL-padded.
+            let trimmed = match name.iter().position(|b| *b == 0) {
+                Some(end) => &name[..end],
+                None => name,
+            };
+            if trimmed != SECTION_NAME {
+                continue;
+            }
+            let virtual_size = std::ptr::read_unaligned(header.add(8) as *const u32) as usize;
+            let virtual_address = std::ptr::read_unaligned(header.add(12) as *const u32) as usize;
+            if virtual_size == 0 || virtual_address == 0 {
+                return None;
+            }
+            return Some(std::slice::from_raw_parts(
+                base.add(virtual_address),
+                virtual_size,
+            ));
+        }
+    }
+    None
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "windows")))]
 fn loaded_stack_map_section() -> Option<&'static [u8]> {
     None
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+// Same platform set as the loader above: the Itanium unwinder personality and
+// `_Unwind_*` API are present on every Apple platform, not just macOS.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 mod unwind {
     use super::*;
 
@@ -809,6 +997,10 @@ mod unwind {
         ) -> i32;
         fn _Unwind_GetIP(context: *mut UnwindContext) -> usize;
         fn _Unwind_GetGR(context: *mut UnwindContext, register: i32) -> usize;
+        /// The frame's canonical frame address — the supported way to reach a
+        /// frame's stack pointer. `_Unwind_GetGR` on the SP column is not a
+        /// supported query and returns garbage on x86-64.
+        fn _Unwind_GetCFA(context: *mut UnwindContext) -> usize;
     }
 
     struct WalkState<'a, F> {
@@ -853,7 +1045,34 @@ mod unwind {
         for record in matched {
             for location in state.index.locations(record) {
                 state.stats.locations_visited = state.stats.locations_visited.saturating_add(1);
-                let base = _Unwind_GetGR(context, i32::from(location.dwarf_reg));
+                // SP-relative roots take the CFA as their base VERBATIM.
+                //
+                // Not `CFA - stack_size`, which is what the DWARF definition of
+                // a CFA suggests and what this code used to compute. What
+                // `_Unwind_GetCFA` returns inside an `_Unwind_Backtrace`
+                // callback is the body stack pointer of the frame whose return
+                // address `_Unwind_GetIP` just reported, so subtracting the
+                // frame size lands one whole frame too low.
+                //
+                // MEASURED (#7392) by `unwind_cfa_is_the_frames_stack_pointer`
+                // below, which records each frame's real SP and matches it
+                // against the walk: the identity holds on aarch64 Linux
+                // (libgcc), aarch64 macOS (Apple libunwind) and x86-64 Linux
+                // alike — so there is no return-address adjustment to make and
+                // no per-architecture constant left to get wrong.
+                //
+                // It stayed invisible because this is the FALLBACK path: on
+                // aarch64 the x29 chain walk normally answers, and wherever it
+                // bailed this read unrelated words instead of the roots, which
+                // nothing downstream can notice — no code knows what a root slot
+                // is supposed to contain. Cross-checked directly on
+                // `02_survivor_promotion`: at the CFA the slot holds a NaN-boxed
+                // pointer (`0x7ffd…`); one frame lower it holds a stack address.
+                let base = if location.dwarf_reg == ARCH_DWARF_SP {
+                    _Unwind_GetCFA(context)
+                } else {
+                    _Unwind_GetGR(context, i32::from(location.dwarf_reg))
+                };
                 let address = if location.offset < 0 {
                     base.checked_sub(location.offset.unsigned_abs() as usize)
                 } else {
@@ -875,7 +1094,227 @@ mod unwind {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// Windows x86-64 (#7354): walk native frames with `RtlVirtualUnwind`, the
+/// documented Win64 unwinder. `_Unwind_Backtrace` does not exist here.
+///
+/// `RtlLookupFunctionEntry` + `RtlVirtualUnwind` step a `CONTEXT` outward one
+/// frame at a time, and each step yields the frame's `Rip`, `Rsp` and `Rbp`
+/// **directly** — so unlike the Itanium path above there is no CFA derivation:
+/// an SP-relative root's base is the real `Rsp` the unwinder just restored.
+/// (`Rip` after a step is the return address, same as `_Unwind_GetIP`, which
+/// is what `match_records`' ±16 window plus containment check expects.)
+///
+/// Fail-closed contract, stricter than the Itanium module because a wrong base
+/// here has no verifying backstop: any anomaly — a base register the virtual
+/// unwind cannot have restored, a slot outside this thread's stack, a frame
+/// with no unwind info, a step that does not move outward — abandons the walk
+/// and returns, rather than visiting a slot the collector would then *write*
+/// through.
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+mod unwind {
+    use super::*;
+
+    /// x86-64 `CONTEXT` (winnt.h): 1232 bytes, 16-byte aligned. Declared by
+    /// hand because perry-runtime links no Windows API crate; only the
+    /// integer registers are read, so the FP/vector tail is opaque padding.
+    /// The compile-time asserts below pin the offsets this module relies on.
+    #[repr(C, align(16))]
+    struct Context {
+        p_home: [u64; 6],
+        context_flags: u32,
+        mx_csr: u32,
+        seg: [u16; 6],
+        e_flags: u32,
+        dr: [u64; 6],
+        rax: u64,
+        rcx: u64,
+        rdx: u64,
+        rbx: u64,
+        rsp: u64,
+        rbp: u64,
+        rsi: u64,
+        rdi: u64,
+        r8: u64,
+        r9: u64,
+        r10: u64,
+        r11: u64,
+        r12: u64,
+        r13: u64,
+        r14: u64,
+        r15: u64,
+        rip: u64,
+        /// XMM_SAVE_AREA32 (512) + 26 `M128A` vector registers (416) +
+        /// VectorControl/DebugControl/LastBranch and LastException pairs (48).
+        tail: [u8; 512 + 26 * 16 + 6 * 8],
+    }
+
+    // A drifted field offset would hand every walk garbage registers, so pin
+    // the layout at compile time rather than trusting the declaration above.
+    const _: () = assert!(std::mem::size_of::<Context>() == 1232);
+    const _: () = assert!(std::mem::offset_of!(Context, rax) == 0x78);
+    const _: () = assert!(std::mem::offset_of!(Context, rsp) == 0x98);
+    const _: () = assert!(std::mem::offset_of!(Context, rbp) == 0xA0);
+    const _: () = assert!(std::mem::offset_of!(Context, rip) == 0xF8);
+    const _: () = assert!(std::mem::offset_of!(Context, tail) == 0x100);
+
+    const UNW_FLAG_NHANDLER: u32 = 0;
+
+    unsafe extern "system" {
+        fn RtlCaptureContext(context: *mut Context);
+        fn RtlLookupFunctionEntry(
+            control_pc: u64,
+            image_base: *mut u64,
+            history_table: *mut core::ffi::c_void,
+        ) -> *mut core::ffi::c_void;
+        fn RtlVirtualUnwind(
+            handler_type: u32,
+            image_base: u64,
+            control_pc: u64,
+            function_entry: *mut core::ffi::c_void,
+            context: *mut Context,
+            handler_data: *mut *mut core::ffi::c_void,
+            establisher_frame: *mut u64,
+            context_pointers: *mut core::ffi::c_void,
+        ) -> *mut core::ffi::c_void;
+        fn GetCurrentThreadStackLimits(low_limit: *mut usize, high_limit: *mut usize);
+    }
+
+    /// The frame's value of a root's base register, or `None` for a register
+    /// the virtual unwind cannot have restored.
+    ///
+    /// Register numbers are SysV x86-64 DWARF numbers — LLVM's stack maps use
+    /// that numbering on every x86-64 OS, Windows included (measured: every
+    /// probe root arrives as `Indirect [RSP + off]`, DWARF 7). Only the Win64
+    /// *nonvolatile* set is trustworthy after an unwind step: RtlVirtualUnwind
+    /// restores exactly what the frame's unwind codes saved, and a nonvolatile
+    /// register a callee did not save was by definition not modified by it —
+    /// while a volatile register's `CONTEXT` slot still holds some inner
+    /// frame's value. Handing one out as a root base would give the collector
+    /// a wild address it then writes through, so the caller abandons the walk.
+    fn frame_base(context: &Context, dwarf_reg: u16) -> Option<usize> {
+        let value = match dwarf_reg {
+            3 => context.rbx,
+            4 => context.rsi,
+            5 => context.rdi,
+            6 => context.rbp,
+            ARCH_DWARF_SP => context.rsp,
+            12 => context.r12,
+            13 => context.r13,
+            14 => context.r14,
+            15 => context.r15,
+            _ => return None,
+        };
+        Some(value as usize)
+    }
+
+    /// This thread's committed stack bounds, `[low, high)`. Every candidate
+    /// slot must fall inside them — a mapped root lives in its own frame.
+    fn stack_limits() -> Option<(usize, usize)> {
+        let mut low = 0usize;
+        let mut high = 0usize;
+        unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
+        (low != 0 && low < high).then_some((low, high))
+    }
+
+    pub(super) fn visit<F: FnMut(MutableRootSlot)>(
+        index: &StackMapIndex,
+        visit: &mut F,
+    ) -> NativeStackWalkStats {
+        let mut stats = NativeStackWalkStats {
+            walks: 1,
+            ..NativeStackWalkStats::default()
+        };
+        let Some((stack_low, stack_high)) = stack_limits() else {
+            return stats;
+        };
+        // Zero-initialised is fine: RtlCaptureContext overwrites the whole
+        // structure, ContextFlags included.
+        let mut context: Context = unsafe { std::mem::zeroed() };
+        unsafe { RtlCaptureContext(&mut context) };
+
+        loop {
+            stats.frames_visited = stats.frames_visited.saturating_add(1);
+            let matched = index.match_records(context.rip as usize);
+            if !matched.is_empty() {
+                stats.records_matched = stats.records_matched.saturating_add(matched.len());
+                for record in matched {
+                    for location in index.locations(record) {
+                        stats.locations_visited = stats.locations_visited.saturating_add(1);
+                        let Some(base) = frame_base(&context, location.dwarf_reg) else {
+                            return stats;
+                        };
+                        let address = if location.offset < 0 {
+                            base.checked_sub(location.offset.unsigned_abs() as usize)
+                        } else {
+                            base.checked_add(location.offset as usize)
+                        };
+                        let Some(address) = address else {
+                            return stats;
+                        };
+                        if address < stack_low
+                            || address.saturating_add(std::mem::size_of::<u64>()) > stack_high
+                            || address & (std::mem::align_of::<u64>() - 1) != 0
+                        {
+                            return stats;
+                        }
+                        visit(MutableRootSlot {
+                            kind: MutableRootSlotKind::NativeStack,
+                            ptr: address as *mut u64,
+                        });
+                    }
+                }
+            }
+
+            let mut image_base = 0u64;
+            let entry = unsafe {
+                RtlLookupFunctionEntry(context.rip, &mut image_base, std::ptr::null_mut())
+            };
+            if entry.is_null() {
+                // No unwind info. On Win64 only the innermost frame can be a
+                // leaf (a function that has performed a call must carry
+                // .pdata), and frame 0 here is this Rust function, which
+                // called RtlCaptureContext — so this is either the end of the
+                // walkable stack or an unrecognised frame. Do not attempt the
+                // leaf `[Rsp]` pop heuristic mid-walk; stop.
+                break;
+            }
+            let previous_sp = context.rsp;
+            let mut handler_data: *mut core::ffi::c_void = std::ptr::null_mut();
+            let mut establisher_frame = 0u64;
+            unsafe {
+                RtlVirtualUnwind(
+                    UNW_FLAG_NHANDLER,
+                    image_base,
+                    context.rip,
+                    entry,
+                    &mut context,
+                    &mut handler_data,
+                    &mut establisher_frame,
+                    std::ptr::null_mut(),
+                );
+            }
+            if context.rip == 0 {
+                // Walked off the outermost frame — the ordinary end.
+                break;
+            }
+            let sp = context.rsp as usize;
+            // The stack grows down, so each caller's SP is strictly higher
+            // than its callee's. This check is also the loop's termination
+            // guarantee: SP increases monotonically and is bounded by the
+            // stack top, so the walk cannot cycle.
+            if context.rsp <= previous_sp || sp < stack_low || sp >= stack_high || sp & 7 != 0 {
+                break;
+            }
+        }
+        stats
+    }
+}
+
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    all(target_os = "windows", target_arch = "x86_64")
+)))]
 mod unwind {
     use super::*;
 
@@ -901,7 +1340,10 @@ mod unwind {
 /// whole scan through the platform unwinder. Slot visitation is idempotent
 /// (a rewritten slot no longer points at a forwarded object), so a partial
 /// fast walk followed by a full unwinder walk is safe.
-#[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
+#[cfg(all(
+    any(target_vendor = "apple", target_os = "linux"),
+    target_arch = "aarch64"
+))]
 mod fp_chain {
     use super::*;
 
@@ -913,7 +1355,10 @@ mod fp_chain {
         fp
     }
 
-    #[cfg(target_os = "macos")]
+    // `pthread_get_stackaddr_np` is Apple-wide, not macOS-only. Gating it to
+    // macOS is what broke the iOS build outright — which is the good outcome:
+    // the alternative was this module quietly not existing there.
+    #[cfg(target_vendor = "apple")]
     fn stack_top() -> usize {
         unsafe extern "C" {
             fn pthread_self() -> usize;
@@ -976,7 +1421,7 @@ mod fp_chain {
         let high_pc = index.max_pc.saturating_add(MAX_SAFEPOINT_RETURN_DELTA);
         let mut fp = current_frame_pointer();
         while fp != 0 {
-            if fp & 0xF != 0 || fp.checked_add(16)? > top {
+            if fp & FRAME_RECORD_ALIGN_MASK != 0 || fp.checked_add(16)? > top {
                 return None;
             }
             let return_address = unsafe { *((fp + 8) as *const usize) };
@@ -1003,7 +1448,7 @@ mod fp_chain {
                         // outside the stack that the collector then reads and
                         // rewrites. Fail closed to the platform unwinder.
                         if caller_fp == 0
-                            || caller_fp & 0xF != 0
+                            || caller_fp & FRAME_RECORD_ALIGN_MASK != 0
                             || caller_fp <= fp
                             || caller_fp.checked_add(16)? > top
                         {
@@ -1056,7 +1501,10 @@ mod fp_chain {
     }
 }
 
-#[cfg(not(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64")))]
+#[cfg(not(all(
+    any(target_vendor = "apple", target_os = "linux"),
+    target_arch = "aarch64"
+)))]
 mod fp_chain {
     use super::*;
 
@@ -1067,6 +1515,18 @@ mod fp_chain {
         None
     }
 }
+
+// The contract the Itanium fallback rests on, asserted against a real walk
+// rather than against DWARF's definition of a CFA — the two disagree, and
+// believing the definition was #7392. Its own file because this one is close to
+// the 2000-line cap.
+#[cfg(all(
+    test,
+    any(target_vendor = "apple", target_os = "linux"),
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+#[path = "stack_maps_unwind_contract.rs"]
+mod unwind_contract;
 
 #[cfg(test)]
 mod tests {
@@ -1116,14 +1576,23 @@ mod tests {
             }
         }
 
-        let total_len = 16 + 16 + offsets.len() + stream.len();
+        // Build for THIS host's pointer width, mirroring the emitter: the
+        // decoder rejects a blob whose recorded width disagrees with its own.
+        let ptr64 = std::mem::size_of::<usize>() == 8;
+        let entry = if ptr64 { 16 } else { 12 };
+        let total_len = 16 + entry + offsets.len() + stream.len();
         let mut bytes = Vec::new();
         bytes.extend_from_slice(GC_MAP_MAGIC);
         bytes.push(GC_MAP_VERSION);
-        bytes.extend_from_slice(&[0, 0, 0]);
+        bytes.push(0);
+        bytes.extend_from_slice(&u16::from(ptr64).to_le_bytes());
         bytes.extend_from_slice(&1u32.to_le_bytes());
         bytes.extend_from_slice(&(total_len as u32).to_le_bytes());
-        bytes.extend_from_slice(&function.to_le_bytes());
+        if ptr64 {
+            bytes.extend_from_slice(&function.to_le_bytes());
+        } else {
+            bytes.extend_from_slice(&(function as u32).to_le_bytes());
+        }
         bytes.extend_from_slice(&32u32.to_le_bytes());
         bytes.extend_from_slice(&(records.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&offsets);
@@ -1250,6 +1719,21 @@ mod tests {
             }],
         );
         assert!(!index.chain_walkable);
+    }
+
+    #[test]
+    fn rejects_a_blob_built_for_the_other_pointer_width() {
+        // The header records the width the emitter used. A blob claiming the
+        // other width would have every function address misread, so it must be
+        // refused rather than decoded — watchOS `arm64_32` is ILP32 while every
+        // other supported target is LP64.
+        let mut bytes = simple(0x1000, 0x10, -8);
+        let flags = u16::from_le_bytes([bytes[6], bytes[7]]);
+        bytes[6..8].copy_from_slice(&(flags ^ 1).to_le_bytes());
+        assert!(
+            parse_gc_map(&bytes).is_none(),
+            "a map built for the other pointer width must be refused"
+        );
     }
 
     #[test]
@@ -1411,6 +1895,17 @@ mod fp_offset_trailing_sub_tests {
     const RET: u32 = 0xD65F_03C0;
     const NOP: u32 = 0xD503_201F;
 
+    // The three prologue words #7394 was measured on, read out of
+    // `perry_fn_test_gap_gc_call_argument_rooting_ts__run` at +0x20:
+    //
+    //     9101c3fd   add x29, sp, #0x70
+    //     d14007ff   sub sp, sp, #0x1, lsl #12
+    //     d12103ff   sub sp, sp, #0x840
+    const ADD_X29_SP_0X70: u32 = 0x9101_C3FD;
+    const SUB_SP_SP_1_LSL12: u32 = 0xD140_07FF;
+    const SUB_SP_SP_0X840: u32 = 0xD121_03FF;
+    const ADD_X29_SP_2_LSL12: u32 = 0x9140_0BFD; // add x29, sp, #0x2, lsl #12
+
     /// #7328: `add x29, sp, #imm` is not always the last stack adjustment.
     /// LLVM emits a further `sub sp, sp, #N` after establishing the frame
     /// pointer, and reading only the `add` left the fast walker N bytes high
@@ -1448,5 +1943,52 @@ mod fp_offset_trailing_sub_tests {
     #[test]
     fn a_leaf_without_fp_setup_still_fails_closed() {
         assert_eq!(decode(&[NOP, RET]), None);
+    }
+
+    /// #7394: a trailing `sub sp, sp, #imm, lsl #12` must contribute
+    /// `imm << 12`. #7328's decoder masked the `sh` bit into the opcode
+    /// comparison, so a shifted `sub` did not match at all.
+    #[test]
+    fn a_shifted_trailing_sub_is_included() {
+        assert_eq!(
+            decode(&[ADD_X29_SP_0X70, SUB_SP_SP_1_LSL12, NOP, RET]),
+            Some(0x70 + 0x1000),
+            "`sub sp, sp, #0x1, lsl #12` must contribute 4096, not 1"
+        );
+    }
+
+    /// The measured shape. The shifted `sub` is not the last one, so failing
+    /// to match it also **ended the accumulation run** and dropped the
+    /// `sub sp, sp, #0x840` behind it: the decoder reported 0x70 for a frame
+    /// whose body SP is 0x18B0 below the frame pointer, and the walker
+    /// enumerated — and the collector wrote through — addresses 6208 bytes
+    /// off. That is CLAUDE.md's fourth gate-failure mode: a live walker
+    /// visiting the wrong stack.
+    #[test]
+    fn a_shifted_sub_does_not_end_the_accumulation_run() {
+        assert_eq!(
+            decode(&[
+                ADD_X29_SP_0X70,
+                SUB_SP_SP_1_LSL12,
+                SUB_SP_SP_0X840,
+                NOP,
+                RET
+            ]),
+            Some(0x70 + 0x1000 + 0x840),
+            "every `sub sp` in the contiguous prologue run must be folded in"
+        );
+    }
+
+    /// The `sh` bit is decoded on the `add` that establishes the frame
+    /// pointer too — the same masking bug applied there, where it would have
+    /// made the decoder skip the fp setup entirely and report a later
+    /// instruction's offset (or `None`).
+    #[test]
+    fn a_shifted_fp_setup_is_decoded() {
+        assert_eq!(
+            decode(&[ADD_X29_SP_2_LSL12, NOP, RET]),
+            Some(0x2000),
+            "`add x29, sp, #0x2, lsl #12` establishes fp 8192 above sp"
+        );
     }
 }
