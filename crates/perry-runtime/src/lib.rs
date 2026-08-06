@@ -87,6 +87,7 @@ pub mod macos_bundle;
 pub mod map;
 pub mod math;
 pub mod messaging;
+pub mod mimalloc_os_tag;
 pub mod module_require;
 pub mod native_abi;
 pub mod native_arena;
@@ -141,8 +142,15 @@ pub mod symbol;
 /// TC39 Temporal API (#4686): `Temporal.Duration`, `Temporal.Instant`,
 /// `Temporal.PlainDate`, … wrapping the pure-Rust `temporal_rs` engine.
 pub mod temporal;
+/// Cross-module test-only serialization primitives (#6965). Nothing here
+/// exists outside `cfg(test)`; production code must not grow a dependency on
+/// it.
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod text;
 pub mod timer;
+/// #7469: one `_tlv_get_addr` for the whole allocation hot path.
+pub(crate) mod tls_hot;
 pub mod typed_feedback;
 pub mod typedarray;
 pub mod typedarray_half;
@@ -278,9 +286,8 @@ pub use object::js_object_set_field_by_name;
 pub use object::{
     js_object_alloc, js_object_alloc_null_proto, js_object_alloc_with_shape, js_object_entries,
     js_object_get_field, js_object_get_field_by_name, js_object_get_field_by_name_f64,
-    js_object_get_own_field_or_undef, js_object_get_unboxed_f64_field, js_object_keys,
-    js_object_set_field, js_object_set_field_f64, js_object_set_keys,
-    js_object_set_unboxed_f64_field, js_object_values,
+    js_object_get_own_field_or_undef, js_object_keys, js_object_set_field, js_object_set_field_f64,
+    js_object_set_keys, js_object_values,
 };
 pub use promise::{js_is_promise, js_promise_run_microtasks, js_promise_state, js_promise_value};
 pub use promise::{

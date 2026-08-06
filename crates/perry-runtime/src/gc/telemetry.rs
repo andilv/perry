@@ -22,7 +22,16 @@ impl GcStats {
     /// Single funnel for per-collection accounting: last/max pause and the
     /// recent-pause ring advance together with the counters, so no future
     /// collection path can update one without the others.
+    ///
+    /// #6080a: the read-PIC epoch bump rides the same funnel — every
+    /// completed collection may have freed or moved a keys array whose raw
+    /// address is primed in a `@perry_ic_N` cache no GC scanner can see, so
+    /// pointer-token primes must stop hitting from here on. (Budgeted cycles
+    /// bump a second time at sweep ENTRY — see `step_sweep` — because their
+    /// sweep slices interleave with the mutator before this funnel runs.
+    /// Double-bumping is harmless: it only costs one extra re-prime.)
     pub(super) fn record_collection(&mut self, freed_bytes: u64, elapsed_us: u64) {
+        crate::object::pic_epoch_bump();
         self.collection_count += 1;
         self.total_freed_bytes = self.total_freed_bytes.saturating_add(freed_bytes);
         self.last_pause_us = elapsed_us;
@@ -198,6 +207,15 @@ pub(super) struct CopyingNurseryTraceStats {
     pub(super) copied_bytes: usize,
     pub(super) promoted_objects: usize,
     pub(super) promoted_bytes: usize,
+    /// Effective tenuring threshold (survival count) this cycle promoted at
+    /// (gc/tenuring.rs adaptive loop; 0 on rows where no copying minor ran).
+    pub(super) tenuring_survivals: u8,
+    /// Live bytes moved out of Eden this cycle (copied to a survivor space or
+    /// promoted) — the adaptive loop's influx signal.
+    pub(super) eden_live_bytes: usize,
+    /// Live bytes re-copied/promoted out of the from-survivor space this
+    /// cycle — the re-copy tax the adaptive loop exists to bound.
+    pub(super) survivor_live_bytes: usize,
     pub(super) large_excluded_objects: usize,
     pub(super) large_excluded_bytes: usize,
     pub(super) reset_blocks: usize,
@@ -982,6 +1000,9 @@ impl GcCycleTrace {
             "copied_bytes": self.copying_nursery.copied_bytes,
             "promoted_objects": self.copying_nursery.promoted_objects,
             "promoted_bytes": self.copying_nursery.promoted_bytes,
+            "tenuring_survivals": self.copying_nursery.tenuring_survivals,
+            "eden_live_bytes": self.copying_nursery.eden_live_bytes,
+            "survivor_live_bytes": self.copying_nursery.survivor_live_bytes,
             "large_excluded_objects": self.copying_nursery.large_excluded_objects,
             "large_excluded_bytes": self.copying_nursery.large_excluded_bytes,
             "reset_blocks": self.copying_nursery.reset_blocks,

@@ -82,7 +82,7 @@ pub(crate) fn classify_direct_callee(name: &str) -> GcCallEffect {
         | "js_gc_note_slot_layout"
         | "js_gc_note_slot_layout_aware"
         | "js_gc_init_typed_shape_layout"
-        | "js_gc_init_unboxed_object_layout"
+        | "js_gc_declare_typed_shape_layout"
         // `typed_feedback.rs`: counters/registries only. This intentionally
         // does not include feedback wrappers that perform the actual object
         // get/set operation.
@@ -104,6 +104,10 @@ pub(crate) fn classify_direct_callee(name: &str) -> GcCallEffect {
         | "js_array_clear_numeric_layout"
         | "js_array_note_numeric_write"
         | "js_array_is_numeric_f64_layout"
+        // #7469: two header-bit writes plus the same `layout_forget_object`
+        // side-table remove `layout_init_pointer_free` already does on every
+        // allocation. No Perry allocation, no re-entry into generated code.
+        | "js_array_declare_all_pointer_elements"
         // TLS dynamic-call context only.
         | "js_implicit_this_set"
         | "js_new_target_get"

@@ -1,6 +1,8 @@
 //! Array representation for Perry — split into topical sub-modules.
 mod alloc;
 mod concat_reverse;
+mod element_shape;
+mod fill_extend;
 mod flat_clone;
 mod from_concat;
 mod generic;
@@ -23,6 +25,8 @@ mod splice_slice;
 mod subclass;
 
 #[cfg(test)]
+mod spread_dense_tests;
+#[cfg(test)]
 mod tests;
 
 pub(crate) use self::alloc::{array_length_range_error, js_array_alloc_pointer_elements};
@@ -35,6 +39,16 @@ pub use self::concat_reverse::{
     js_array_concat, js_array_concat_new, js_array_fill, js_array_fill_generic,
     js_array_fill_range, js_array_reverse, js_array_reverse_value,
 };
+pub(crate) use self::element_shape::{
+    clear_element_shape_ptr, forget_element_shape, invalidate_all_element_shapes,
+    note_element_store, prune_dead_element_shape_owners, transfer_element_shape,
+};
+pub use self::element_shape::{
+    js_array_element_shape_check, js_array_element_shape_class, js_array_element_shape_epoch,
+    js_array_element_shape_version, js_array_ensure_element_shape,
+};
+#[cfg(test)]
+pub(crate) use self::element_shape::{test_element_shape_record_exists, test_serialize};
 pub use self::flat_clone::{
     js_array_clone, js_array_entries, js_array_flat, js_array_flat_depth, js_array_keys,
     js_array_values,
@@ -69,7 +83,8 @@ pub(crate) use self::header::{
     rebuild_array_numeric_raw_f64_dense_window, rebuild_array_numeric_raw_f64_dense_window_i32,
 };
 pub use self::header::{
-    js_array_clear_numeric_layout, js_array_is_numeric_f64_layout, js_array_mark_arguments_object,
+    js_array_clear_numeric_layout, js_array_declare_all_pointer_elements,
+    js_array_is_numeric_f64_layout, js_array_mark_arguments_object,
     js_array_mark_numeric_f64_layout, js_array_note_numeric_write, js_tagged_template_get_or_init,
     js_tagged_template_register_raw, js_template_raw, scan_template_raw_roots,
     scan_template_raw_roots_mut, ArrayHeader,
@@ -81,7 +96,7 @@ pub(crate) use self::header::{
 pub use self::immutable::{
     js_array_copy_within, js_array_copy_within_value, js_array_to_reversed,
     js_array_to_sorted_default, js_array_to_sorted_with_comparator, js_array_to_spliced,
-    js_array_with,
+    js_array_with, js_arraylike_copy_within,
 };
 pub(crate) use self::indexing::{
     array_has_own_index, array_iteration_is_exotic, array_proto_iterator_modified,
@@ -159,7 +174,7 @@ pub use self::splice_slice::{
 
 pub(crate) use self::alloc::array_length_from_property_value_or_throw;
 pub(crate) use self::alloc::{js_array_from_arraylike, js_array_from_string_codepoints};
-pub(crate) use self::flat_clone::flattenable_array_ptr;
+pub(crate) use self::flat_clone::{dense_spread_copy, dense_spread_source, flattenable_array_ptr};
 pub(crate) use self::header::{
     array_byte_size, array_is_frozen, array_is_sealed_or_no_extend, array_named_property_delete,
     array_named_property_get, array_named_property_get_by_name, array_named_property_has,

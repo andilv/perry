@@ -5,6 +5,7 @@
 //! v0.5.1019 to satisfy the file-size CI gate. mod.rs is a re-export
 //! hub — public-API shape (`crate::collectors::*`) is preserved.
 
+mod all_pointer_arrays;
 mod cjs_scaffolding;
 mod clamp_detect;
 mod class_accessors;
@@ -17,6 +18,7 @@ mod hir_facts;
 mod hot_callees;
 mod i32_locals;
 mod index_uses;
+mod int_valued_i64_locals;
 mod int_valued_ta_locals;
 mod integer_locals;
 mod local_refs;
@@ -62,6 +64,7 @@ pub(crate) use i32_locals::{
     collect_integer_let_ids, collect_localset_ids_in_stmts, is_strictly_i32_bounded_expr,
     is_ushr_zero,
 };
+pub(crate) use int_valued_i64_locals::ceil_log2_abs;
 pub(crate) use integer_locals::{
     collect_flat_row_aliases, is_int32_producing_expr, static_index_window,
 };
@@ -70,7 +73,7 @@ pub(crate) use mutation::has_any_mutation;
 pub(crate) use param_ranges::{collect_param_int_ranges, ParamIntRanges};
 pub(crate) use pointer_locals::collect_pointer_typed_locals;
 pub(crate) use proven_this::{
-    method_proven_this, prune_colliding_clones, pshape_method_name,
+    method_proven_this, prune_unregistered_clones, pshape_method_name,
     tower_route_profitable as pshape_tower_route_profitable,
 };
 pub(crate) use ptr_numarray::{NumArrayDensity, NumArrayLocal};

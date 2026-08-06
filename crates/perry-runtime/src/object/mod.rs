@@ -46,6 +46,7 @@ mod descriptors;
 mod disposable_proto_thunks;
 pub(crate) mod exotic_expando;
 mod field_get_set;
+pub(crate) use field_get_set::pic_epoch_bump;
 pub(crate) use field_get_set::scan_accessor_receiver_override_root_mut;
 mod field_set_by_name;
 mod global_fetch;
@@ -54,7 +55,8 @@ mod global_this;
 pub mod handle_expando;
 pub(crate) mod prop_plan;
 pub(crate) use global_this::{
-    default_prepare_stack_trace_func_ptr, scan_error_constructor_root_mut, ERROR_CONSTRUCTOR_PTR,
+    default_prepare_stack_trace_func_ptr, is_array_prototype_method_value,
+    scan_error_constructor_root_mut, ERROR_CONSTRUCTOR_PTR,
 };
 mod global_this_tables;
 mod groupby;
@@ -102,6 +104,8 @@ mod spill;
 pub(crate) use spill::{learned_inline_field_count, overflow_get, overflow_set};
 #[cfg(test)]
 use spill::{object_spill_enabled, spill_capable_owner, spill_get, SPILL_MAX_FIELD_INDEX};
+#[cfg(test)]
+pub(crate) use spill::{test_set_spill_safepoint_hook, SpillSafepointHook};
 mod string_proto_thunks;
 #[cfg(feature = "temporal")]
 mod temporal_proto;

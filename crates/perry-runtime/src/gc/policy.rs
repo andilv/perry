@@ -77,14 +77,44 @@ pub(super) const GC_TRIGGER_ABSOLUTE_CEILING: usize = 128 * 1024 * 1024;
 /// ceiling — headroom floor over a big live set, medium-parse bumps), the
 /// device-derived ceiling while the cell still holds its desktop-default
 /// const initializer.
-pub(super) fn effective_next_arena_trigger() -> usize {
-    let base = if GC_TRIGGER_ARMED.with(|a| a.get()) {
+/// The adaptive/armed arena trigger WITHOUT the scavenge nursery cap:
+/// compared against `arena_total_bytes()` (all generations), as it always
+/// was. The cap is deliberately not part of this value — it is
+/// young-generation-scoped and lives in [`young_scavenge_cap_due`].
+pub(super) fn next_arena_trigger_base() -> usize {
+    if GC_TRIGGER_ARMED.with(|a| a.get()) {
         GC_NEXT_TRIGGER_BYTES.with(|c| c.get())
     } else {
         GC_NEXT_TRIGGER_BYTES
             .with(|c| c.get())
             .min(gc_trigger_absolute_ceiling_bytes())
-    };
+    }
+}
+
+/// True when the young generation (Eden + active survivor space) has
+/// reached the effective scavenge nursery cap.
+///
+/// The basis is young-gen occupancy, NOT `arena_total_bytes()`. Comparing
+/// the cap against the total put every old-gen byte on the young budget:
+/// once old-gen in-use crossed 16 MB, every fresh 1 MB Eden block
+/// re-crossed the trigger, degenerating the scavenge cadence to
+/// once-per-block on any program with a large tenured set. That cadence is
+/// the actual mechanism behind the tree.ts survivor-saturation regression
+/// — objects were scavenged ~1 MB of allocation after birth, so almost
+/// nothing had time to die: measured 1.05 MB of survivors per 1 MB block
+/// (near-zero infant mortality), a saturated survivor space, and 1427
+/// collections for a run that allocates ~1.4 GB.
+pub(super) fn young_scavenge_cap_due() -> bool {
+    #[cfg(test)]
+    if GC_NURSERY_CAP_TEST_SUPPRESSED.with(Cell::get) {
+        return false;
+    }
+    crate::arena::copying_from_space_in_use_bytes()
+        >= super::tenuring::scavenge_nursery_cap_effective_bytes()
+}
+
+pub(super) fn effective_next_arena_trigger() -> usize {
+    let base = next_arena_trigger_base();
     // A minor is O(live) — it copies ~1k live objects out of millions
     // allocated — so the 128 MB-and-doubling adaptive trigger, tuned for the
     // OLD world where a minor was an expensive O(heap) sweep and the advice was
@@ -131,7 +161,12 @@ pub(super) fn effective_next_arena_trigger() -> usize {
     if GC_NURSERY_CAP_TEST_SUPPRESSED.with(Cell::get) {
         return base;
     }
-    base.min(gc_scavenge_nursery_cap_bytes())
+    // The cap the clamp applies is the *effective* one: the configured base
+    // times the influx-driven scale from gc/tenuring.rs, which grows it
+    // (bounded, ×2 steps) on live-set-bound workloads where a fixed 16 MB
+    // multiplies the per-collection fixed cost by an enormous collection
+    // count. Small-live-set workloads never leave the base value.
+    base.min(super::tenuring::scavenge_nursery_cap_effective_bytes())
 }
 
 /// Nursery high-water cap used only when `PERRY_GC_SCAVENGE` is on (default
@@ -1120,6 +1155,16 @@ pub fn gc_schedule_parse_boundary_collection_if_pressure() {
     GC_SUPPRESSED_TINY_PARSE_COLLECTION_PENDING.with(|pending| pending.set(true));
 }
 
+/// Old-gen pressure the reclaim arms act on: block-offset in-use minus the
+/// swept holes the free list can already hand back (#7437). Before hole
+/// reuse existed, dead-but-unreclaimable bytes counted as pressure, so
+/// old-reclaim kept re-firing full collections that could not actually
+/// lower the number they were watching (probe 12: 49/50 blocks pinned by
+/// scattered survivors, in-use immovable at ~105 MB).
+pub(super) fn old_gen_reclaimable_pressure_bytes() -> usize {
+    crate::arena::old_gen_in_use_bytes().saturating_sub(super::old_free_bytes())
+}
+
 #[inline]
 pub(super) fn old_reclaim_pressure_due(old_in_use: usize, baseline: usize) -> bool {
     (old_in_use >= gc_old_gen_reclaim_threshold_dyn_bytes()
@@ -1157,7 +1202,10 @@ pub(super) fn copied_minor_promotable_active_survivor_bytes() -> usize {
                 }
                 let prior_age = copied_survival_age((*header)._reserved, flags);
                 let next_age = prior_age.saturating_add(1);
-                if flags & GC_FLAG_TENURED != 0 || next_age >= GC_COPY_PROMOTION_SURVIVALS {
+                // Mirror move_young's promotion predicate, including the
+                // adaptive threshold (gc/tenuring.rs), so this pacing estimate
+                // matches what the next copying minor will actually promote.
+                if flags & GC_FLAG_TENURED != 0 || next_age >= tenuring_survivals() {
                     promotable = promotable.saturating_add((*header).size as usize);
                 }
             }
@@ -1180,7 +1228,7 @@ pub(super) fn copied_minor_promotion_handoff_due(trigger_kind: GcTriggerKind) ->
     }
     let promotable = copied_minor_promotable_active_survivor_bytes();
     let old_in_use =
-        crate::arena::old_gen_in_use_bytes().saturating_add(external_side_live_bytes());
+        old_gen_reclaimable_pressure_bytes().saturating_add(external_side_live_bytes());
     let baseline = GC_LAST_OLD_RECLAIM_IN_USE_BYTES.with(|bytes| bytes.get());
     copied_minor_promotion_handoff_pressure_due(promotable, old_in_use, baseline)
 }
@@ -1191,7 +1239,7 @@ pub(super) fn maybe_schedule_old_reclaim_after_copied_minor() {
     // reclaim's old-gen sweep finalizes it, so the buffer bytes must be
     // able to escalate that reclaim.
     let old_in_use =
-        crate::arena::old_gen_in_use_bytes().saturating_add(external_side_live_bytes());
+        old_gen_reclaimable_pressure_bytes().saturating_add(external_side_live_bytes());
     let baseline = GC_LAST_OLD_RECLAIM_IN_USE_BYTES.with(|bytes| bytes.get());
     if old_reclaim_pressure_due(old_in_use, baseline) {
         GC_OLD_RECLAIM_PENDING.with(|pending| pending.set(true));
@@ -1202,7 +1250,7 @@ pub(super) fn finish_full_old_reclaim_baseline() {
     // Baseline includes external side-buffer bytes (#6010) so the growth
     // delta in `old_reclaim_pressure_due` stays unit-consistent.
     let old_in_use =
-        crate::arena::old_gen_in_use_bytes().saturating_add(external_side_live_bytes());
+        old_gen_reclaimable_pressure_bytes().saturating_add(external_side_live_bytes());
     GC_LAST_OLD_RECLAIM_IN_USE_BYTES.with(|bytes| bytes.set(old_in_use));
     // Record the TOTAL post-full live set for major-GC pacing (young+old): the
     // full sweep is the only collection that frees forwarding stubs, so this is
@@ -1831,14 +1879,21 @@ fn gc_budgeted_due_trigger() -> Option<BudgetedGcTrigger> {
     let old_pending = GC_OLD_RECLAIM_PENDING.with(Cell::get);
     // #6010: external Map/Set side-buffer bytes escalate to OldReclaim too.
     let old_in_use =
-        crate::arena::old_gen_in_use_bytes().saturating_add(external_side_live_bytes());
+        old_gen_reclaimable_pressure_bytes().saturating_add(external_side_live_bytes());
     let old_baseline = GC_LAST_OLD_RECLAIM_IN_USE_BYTES.with(|bytes| bytes.get());
     if old_pending || old_reclaim_pressure_due(old_in_use, old_baseline) {
         return Some(BudgetedGcTrigger::OldReclaim);
     }
 
+    // Two separately-scoped arena arms (see `young_scavenge_cap_due` for why
+    // they must not share a basis): the adaptive base trigger against the
+    // whole arena, and the scavenge nursery cap against the young generation
+    // only.
     let total = crate::arena::arena_total_bytes();
-    if total >= effective_next_arena_trigger() {
+    if total >= next_arena_trigger_base() {
+        return Some(BudgetedGcTrigger::ArenaBytes);
+    }
+    if young_scavenge_cap_due() {
         return Some(BudgetedGcTrigger::ArenaBytes);
     }
 

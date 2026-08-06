@@ -353,6 +353,14 @@ ALLOC_RE = re.compile(
     # fresh strings. Every one of these returns a *mut StringHeader the
     # caller holds raw; `string_coerce` and `jsvalue_to_string_coerce` are
     # the two the `/re/` lowerings feed.
+    # `url_coerce_string` is the third `coerce -> *mut StringHeader` helper
+    # (`crates/perry-runtime/src/url/mod.rs:116`); the other two are already
+    # covered by `string_coerce` and `jsvalue_to_string\w*` above. It does not
+    # match either, because after `js_` it reads `url_coerce_string`. That gap
+    # is why the checker did not flag #7453, where `new URL(input, base)` held
+    # its coerced pointer across the lowering of `base`. Verified to exist
+    # before being added, per the extrapolated-suffix warning below.
+    r"url_coerce_string|"
     r"string_concat\w*|string_coerce|string_from\w*|string_append|"
     r"jsvalue_to_string\w*|value_to_string\w*|number_to_string\w*|"
     r"string_repeat|string_slice|string_substring|string_substr|"
@@ -2009,27 +2017,47 @@ def _probe_class_keys_longlived():
     return (True, "%d longlived allocation(s)" % len(allocs))
 
 
+# The defrag gate moved from `gc/oldgen.rs` to `gc/oldgen_defrag.rs` in #7443.
+# Search both rather than hardcoding one: this probe FAILING does not merely
+# turn the job red, it declares the reports it suppresses to be real again, so
+# a file rename silently converts a passing audit into a wall of false
+# positives. Listing candidates keeps the next split cheap, and the
+# "not found in ANY of" message names them so the fix is obvious. (#7540)
+_OLD_DEFRAG_SOURCES = (
+    "crates/perry-runtime/src/gc/oldgen_defrag.rs",
+    "crates/perry-runtime/src/gc/oldgen.rs",
+)
+
+
 def _probe_old_defrag_off_by_default():
     """Old-page defrag still returns an empty selection unless opted in."""
-    try:
-        with open("crates/perry-runtime/src/gc/oldgen.rs",
-                  encoding="utf-8", errors="replace") as fh:
-            src = fh.read()
-    except OSError:
-        return (False, "crates/perry-runtime/src/gc/oldgen.rs not readable")
-    if "PERRY_GC_OLD_DEFRAG" not in src:
-        return (False, "gc/oldgen.rs no longer mentions PERRY_GC_OLD_DEFRAG; "
-                       "old-page defrag may now be unconditional")
-    body = rust_fn_body("crates/perry-runtime/src/gc/oldgen.rs",
-                        "select_old_page_defrag_pages")
+    src = None
+    src_path = None
+    for cand in _OLD_DEFRAG_SOURCES:
+        try:
+            with open(cand, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        if "PERRY_GC_OLD_DEFRAG" in text:
+            src, src_path = text, cand
+            break
+    if src is None:
+        return (False, "PERRY_GC_OLD_DEFRAG not mentioned in any of %s; "
+                       "old-page defrag may now be unconditional (or the file "
+                       "moved again -- add it to _OLD_DEFRAG_SOURCES)"
+                       % ", ".join(_OLD_DEFRAG_SOURCES))
+    body = rust_fn_body(src_path, "select_old_page_defrag_pages")
     if body is None:
-        return (False, "select_old_page_defrag_pages not found in gc/oldgen.rs")
+        return (False,
+                "select_old_page_defrag_pages not found in %s" % src_path)
     if not re.search(r"if\s+!old_page_defrag_enabled\(\)\s*\{\s*\n\s*return\s+"
                      r"OldPageDefragSelection::default\(\);", body):
         return (False, "select_old_page_defrag_pages no longer short-circuits "
                        "to an empty selection when defrag is disabled — "
                        "old-arena objects may relocate on a default build")
-    return (True, "gated on PERRY_GC_OLD_DEFRAG, empty selection when off")
+    return (True, "gated on PERRY_GC_OLD_DEFRAG in %s, empty selection when off"
+            % src_path)
 
 
 def _probe_class_keys_global_is_a_root():

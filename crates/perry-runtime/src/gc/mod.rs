@@ -48,6 +48,11 @@ mod telemetry;
 pub use telemetry::*;
 mod malloc;
 pub use malloc::*;
+/// #7469: the `gc` half of the hot-thread-local address cache. Split out of
+/// `barrier.rs` / `layout.rs` / `malloc.rs` so each stays under the repo's
+/// 2000-line-per-file cap.
+mod hot_tls;
+pub(crate) use hot_tls::*;
 mod roots;
 pub use roots::*;
 /// #7148: the census of conservative-scan fallbacks and the precise-safepoint
@@ -61,7 +66,18 @@ pub(crate) use scan_fallback::*;
 mod root_words;
 use root_words::*;
 mod layout;
+mod layout_slot_visit;
+pub(crate) use layout_slot_visit::*;
+/// #7510: the per-object slot-layout side tables and the emptiness flag that
+/// keeps them off the allocation, store, death and trace paths. Split out of
+/// `layout.rs` so it stays under the repo's 2000-line-per-file cap.
+mod layout_tables;
+/// #7510 item 1: the construction-side memo that turns an already-installed
+/// typed shape into two header bit-writes instead of a descriptor build plus a
+/// `SHAPE_LAYOUTS` round-trip.
+mod shape_install;
 pub use layout::*;
+pub(crate) use shape_install::shape_install_memo_hot_addr;
 mod trace;
 pub(crate) use trace::*;
 mod barrier;
@@ -83,8 +99,15 @@ use copying::*;
 // pass in `crate::weakref` (#6182), which lives outside the gc module.
 pub(crate) use copying::CopyingPointerSet;
 mod dead_owner;
+mod old_free;
+use old_free::*;
+pub(crate) use old_free::{old_free_bytes, old_free_filter_range, old_free_take_exact};
+mod tenuring;
+use tenuring::*;
 mod oldgen;
 use oldgen::*;
+mod oldgen_defrag;
+use oldgen_defrag::*;
 mod cycle;
 use cycle::*;
 mod verify;
@@ -764,25 +787,16 @@ pub extern "C" fn js_gc_init() {
     // a second js_gc_init on another thread is harmless.
     #[cfg(windows)]
     crate::win_console::enable_vt_output();
-    // #6882: mimalloc (the global allocator, #62) tags its OS mappings with
-    // VM tag 100, which macOS tooling — vmmap, Instruments' VM Tracker,
-    // `footprint` — decodes as `IOAccelerator`: the entire JS heap renders
-    // as GPU-driver memory (644 MB of "IOAccelerator" on an allocation-heavy
-    // benchmark). Retag to VM_MEMORY_APPLICATION_SPECIFIC_1 (240) so heap
-    // regions show up as a neutral, distinctive "Memory Tag 240" instead.
-    // An explicit `MIMALLOC_OS_TAG` env setting still wins — skip the
-    // override so profilers can keep steering the tag themselves. Regions
-    // mapped before this call (early Rust startup) keep tag 100; the bulk
-    // of the heap (arena blocks, GC metadata) maps afterwards. Idempotent,
-    // like the rest of this function.
-    #[cfg(all(
-        target_pointer_width = "64",
-        target_vendor = "apple",
-        feature = "alloc-mimalloc"
-    ))]
-    if std::env::var_os("MIMALLOC_OS_TAG").is_none() {
-        unsafe { libmimalloc_sys::mi_option_set(libmimalloc_sys::mi_option_os_tag, 240) };
-    }
+    // #6882/#7450: macOS decodes mimalloc's default VM tag (100) as
+    // `IOAccelerator`, so the whole JS heap renders as GPU-driver memory in
+    // vmmap/Instruments/`footprint`. The retag to tag 240 that fixes this
+    // cannot live here — mimalloc reserves its 1 GiB arena during Rust's
+    // pre-`main` startup and every later allocation just commits pages inside
+    // that already-tagged mapping, so a retag at `js_gc_init` time reaches
+    // nothing (#7450). It now runs from a `__DATA,__mod_init_func`
+    // constructor; this call keeps that constructor in the link and re-applies
+    // the option idempotently. See `crate::mimalloc_os_tag`.
+    crate::mimalloc_os_tag::ensure_mimalloc_os_tag_applied();
     crate::node_submodules::diagnostics_channel_init_main_thread();
     crate::node_submodules::init_trace_events_runtime();
     // #5093: force every class-field access back through the full guard call —

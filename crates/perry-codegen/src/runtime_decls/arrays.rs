@@ -78,6 +78,11 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
     // re-boxed live head (identity for everything else).
     module.declare_function("js_array_refresh_local_head", DOUBLE, &[DOUBLE]);
     module.declare_function("js_array_note_numeric_write", VOID, &[I64, I64]);
+    // #7469: at-allocation all-pointer element-layout declaration for a
+    // proven `[]` + push-loop array. Emitted once per allocation site; the
+    // per-push layout note it retires is re-armed by the header test in
+    // `expr/array_push.rs` whenever the declaration is not (or no longer) live.
+    module.declare_function("js_array_declare_all_pointer_elements", VOID, &[I64]);
     module.declare_function("js_array_length", I32, &[I64]);
     // Array.isArray runtime dispatch for values with indeterminate
     // static type (e.g. JSON.parse results, closure captures, any/
@@ -142,7 +147,6 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
     //   js_write_barrier_root_heap_word(child_bits: u64)
     //   js_gc_note_slot_layout(parent_bits: u64, slot_index: u32, value_bits: u64)
     //   js_gc_init_typed_shape_layout(obj: u64, slot_count: u32, raw_f64_mask_words: *const u64, raw_f64_mask_word_count: u32, pointer_mask_words: *const u64, pointer_mask_word_count: u32)
-    //   js_gc_init_unboxed_object_layout(obj: u64, slot_count: u32, raw_f64_mask: u64, pointer_mask: u64)
     module.declare_function("js_write_barrier", VOID, &[I64, I64]);
     module.declare_function("js_write_barrier_slot", VOID, &[I64, I64, I64]);
     module.declare_function("js_write_barrier_root_nanbox", VOID, &[I64]);
@@ -155,12 +159,14 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
         VOID,
         &[I64, I32, PTR, I32, PTR, I32],
     );
+    // #7510: same signature, but for a FRESHLY ALLOCATED instance whose slots
+    // are still the allocator's fill — it declares the layout instead of
+    // validating it, so a constructor's own field stores can see it.
     module.declare_function(
-        "js_gc_init_unboxed_object_layout",
+        "js_gc_declare_typed_shape_layout",
         VOID,
-        &[I64, I32, I64, I64],
+        &[I64, I32, PTR, I32, PTR, I32],
     );
-
     // Array methods (Phase B.12).
     // - js_array_pop_f64(arr) -> f64    (last element, NaN if empty)
     // - js_array_join(arr, sep) -> *mut StringHeader (i64)

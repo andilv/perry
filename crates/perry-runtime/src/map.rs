@@ -156,7 +156,31 @@ thread_local! {
         RefCell::new(crate::fast_hash::new_ptr_hash_map());
 }
 
+/// Has any thread ever registered a `Map`?
+///
+/// Monotone — set at the one registration site below, never cleared, so it can
+/// only ever be *conservatively* true. False proves this thread's
+/// `MAP_REGISTRY` is empty, because a `Map` is only ever queried from the
+/// thread that registered it (arenas are per-thread; values cross threads by
+/// deep copy) and that thread's store precedes its own query in program order.
+///
+/// #7469: `js_array_length` probes both this registry and the `Set` one on
+/// every call — `arr.length` in a loop condition. On `churn.ts`, which creates
+/// no `Map` and no `Set`, those two probes were 78 of the 520 remaining
+/// `_tlv_get_addr` samples plus their hash cost, all to prove an empty map
+/// stays empty. This turns both into a relaxed load of a static.
+static MAP_REGISTRY_EVER_USED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// True when no `Map` has ever been registered, so `is_registered_map` can
+/// answer without touching the thread-local registry.
+#[inline(always)]
+fn map_registry_never_used() -> bool {
+    !MAP_REGISTRY_EVER_USED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn register_map(ptr: *mut MapHeader, entries: *mut f64, capacity: usize) {
+    MAP_REGISTRY_EVER_USED.store(true, std::sync::atomic::Ordering::Relaxed);
     MAP_REGISTRY.with(|r| {
         let mut registry = r.borrow_mut();
         assert!(
@@ -168,6 +192,12 @@ fn register_map(ptr: *mut MapHeader, entries: *mut f64, capacity: usize) {
 }
 
 pub fn is_registered_map(addr: usize) -> bool {
+    // #7469: nothing has ever been registered ⟹ nothing can be found. Checked
+    // first because it is the only arm that costs neither a thread-local
+    // resolution nor a hash.
+    if map_registry_never_used() {
+        return false;
+    }
     // #4004: small-handle registry ids (Web Fetch, perry-ffi/node:http, timers,
     // …) are NaN-boxed POINTER_TAG values living below the small-handle
     // cutoff; they are not heap addresses. Managed Maps are arena-allocated
@@ -1929,8 +1959,9 @@ pub extern "C" fn js_map_entries(map: *const MapHeader) -> *mut crate::array::Ar
             // to MIN_ARRAY_CAPACITY), then write key/value/length directly.
             // Skips the two `js_array_push_f64` calls per pair (each does
             // its own bounds + capacity check).
-            let pair = crate::array::js_array_alloc(2);
-            let map = map_handle.get_raw_const_ptr::<MapHeader>();
+            // Allocating pair array + map re-read as one combinator (#7341).
+            let (pair, map) =
+                map_handle.across_const::<MapHeader, _>(|| crate::array::js_array_alloc(2));
             let entries = entries_ptr(map);
             let key = ptr::read(entries.add(i * 2));
             let value = ptr::read(entries.add(i * 2 + 1));

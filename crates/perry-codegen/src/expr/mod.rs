@@ -73,10 +73,11 @@ pub(crate) use channel::{
 pub(crate) use helpers::{
     array_store_needs_layout_note, array_store_needs_write_barrier, buffer_alias_metadata_suffix,
     class_field_store_needs_layout_note, class_field_store_needs_string_addref,
-    expr_has_numeric_pointer_free_array_layout, expr_produces_non_pointer_bits_by_construction,
+    emit_all_pointer_array_declaration, expr_has_numeric_pointer_free_array_layout,
+    expr_produces_fresh_heap_allocation, expr_produces_non_pointer_bits_by_construction,
     is_global_this_builtin_function_name, is_global_this_builtin_name,
-    lower_expr_with_expected_type, lower_js_args_array, proxy_build_args_array, unbox_str_handle,
-    unbox_to_i64,
+    lower_expr_with_expected_type, lower_js_args_array, proxy_build_args_array,
+    store_needs_string_addref, unbox_str_handle, unbox_to_i64,
 };
 pub(crate) use i32_fast_path::{
     can_lower_expr_as_i32, can_lower_expr_as_i32_in_current_region,
@@ -118,11 +119,11 @@ pub(crate) use v8_interop::{
 };
 pub(crate) use write_barrier::{
     emit_array_numeric_write_note_on_block, emit_jsvalue_slot_store_on_block,
-    emit_jsvalue_slot_store_scalar_aware_on_block, emit_jsvalue_slot_store_with_flags_on_block,
-    emit_jsvalue_slot_store_with_value_bits_on_block, emit_root_heap_word_store_on_block,
-    emit_root_nanbox_store_on_block, emit_write_barrier, emit_write_barrier_slot_on_block,
-    lower_array_super_init, lower_event_emitter_subclass_init, lower_node_stream_super_init,
-    lower_stream_super_init,
+    emit_jsvalue_slot_store_pointer_tested, emit_jsvalue_slot_store_scalar_aware_on_block,
+    emit_jsvalue_slot_store_with_flags_on_block, emit_jsvalue_slot_store_with_value_bits_on_block,
+    emit_root_heap_word_store_on_block, emit_root_nanbox_store_on_block, emit_write_barrier,
+    emit_write_barrier_slot_on_block, lower_array_super_init, lower_event_emitter_subclass_init,
+    lower_node_stream_super_init, lower_stream_super_init,
 };
 
 // Issue #1098 phase 3: the `FnCtx` definition stays in this trunk, but its
@@ -648,6 +649,17 @@ pub(crate) struct FnCtx<'a> {
     /// (`sum += i % 1000` in a 100M loop) from 1550ms → ~150ms on ARM.
     pub integer_locals: &'a std::collections::HashSet<u32>,
 
+    /// LocalIds that are integer-valued within **i64** range but not provably
+    /// within i32 range, mapped to a conservative `log2(|value|)` bound.
+    ///
+    /// `integer_locals` above is an i32-RANGE set — it gates i32 shadow slots,
+    /// so it must stay narrow. The `%` fast path converts with
+    /// `fptosi double -> i64` and only needs i64-range integrality, so it
+    /// additionally consults this map. Sole consumer:
+    /// `type_analysis::numeric::integer_magnitude_bits`. Populated per function
+    /// by `collectors::int_valued_i64_locals::collect_int_valued_i64_locals`.
+    pub int_valued_i64_locals: &'a std::collections::HashMap<u32, u32>,
+
     /// LocalIds whose writes are all explicit `>>> 0` u32 casts. These locals
     /// can use the same i32 bit-pattern slot as signed integer locals for
     /// bitwise consumers, but ordinary JS reads must convert with `uitofp` so
@@ -689,6 +701,11 @@ pub(crate) struct FnCtx<'a> {
     /// a slot that already holds 0) — `emit_shadow_slot_clear` skips it.
     /// Seeded at construction with the entry-bound parameter slots.
     pub shadow_slots_bound: std::collections::HashSet<u32>,
+
+    /// #7469: pooled frame-rooted allocas for expression temporaries — see
+    /// [`temp_root::TempRootPool`]. Starts empty; grows on the first
+    /// protected temporary this function lowers.
+    pub temp_roots: temp_root::TempRootPool,
 
     /// Cached pointer to this function's `InlineArenaState` slot —
     /// allocated lazily on the first `new ClassName()` site that uses
@@ -2215,6 +2232,30 @@ fn lower_numeric_binary_value(
             Expr::Integer(value)
                 if i32::try_from(*value).is_ok_and(|divisor| divisor > 0)
         )
+    {
+        return Ok(None);
+    }
+
+    // #7404: the same hand-off for a remainder whose operands the integer
+    // fast path can prove, but whose dividend has no i32 counter slot — the
+    // `bench_bitwise` shape (`let a = 12345678; … a = a + 1; a % 1000`).
+    //
+    // The condition above only recognises an `i32_counter_slots` dividend, so
+    // an i64-range integer local fell through to the `frem double` below,
+    // which on AArch64 is a `bl _fmod` libm call.
+    //
+    // The DIVISOR is restricted to a non-zero integer literal, exactly like the
+    // hand-off above. That is not incidental tidiness: `binary::lower`'s own
+    // Mod gate accepts any `integer_locals` divisor, and `srem(x, 0)` is UB in
+    // LLVM while JS requires NaN. A decrementing counter that walks through
+    // zero (`for (let d = 10; d >= 0; d--) … x % d`) IS in `integer_locals`,
+    // so widening the hand-off to non-literal divisors would newly route it
+    // into `srem` — main keeps it on `frem` only because this hand-off never
+    // fires for it. Literal divisors cannot be zero here, so the dividend is
+    // the only side this widens.
+    if matches!(op, BinaryOp::Mod)
+        && matches!(right, Expr::Integer(divisor) if *divisor != 0)
+        && crate::type_analysis::is_integer_valued_expr(ctx, left)
     {
         return Ok(None);
     }

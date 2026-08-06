@@ -11,10 +11,13 @@ use crate::expr::{lower_expr, lower_expr_value, materialize_js_value, FnCtx};
 use crate::native_value::{LoweredValue, MaterializationReason};
 use crate::types::DOUBLE;
 
+#[cfg(test)]
+mod class_field_loop_tests;
 mod counter_range;
 mod if_stmt;
 mod let_buffer_views;
 mod let_stmt;
+mod let_stmt_facts;
 mod loops;
 mod masked_window_region;
 mod switch_stmt;

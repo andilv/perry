@@ -114,7 +114,7 @@ pub(crate) fn precise_root_analysis_enabled() -> bool {
 /// explicit bridge's hand emission and its conservative CFG-union liveness.
 /// Requires an `opt` binary (`PERRY_LLVM_OPT`, Homebrew LLVM, or PATH).
 pub(crate) fn rs4gc_enabled() -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     if let Some(pinned) = NATIVE_ROOTS_OVERRIDE.with(|c| c.get()) {
         return pinned;
     }
@@ -143,38 +143,61 @@ thread_local! {
     static NATIVE_ROOTS_TARGET_OK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Test-only RAII pin for the lowering under test.
-///
-/// Now that native roots are the default, a test that asserts on shadow-stack
-/// IR has to SAY so — it used to get that lowering by accident, because there
-/// was only one default. Eight tests broke on exactly this when the default
-/// flipped, and every one of them was correct about what it asserted.
-///
-/// Thread-local and restoring, so one test pinning a lowering cannot change
-/// another's — the same discipline `arena::quarantine`'s `ProtectionModeGuard`
-/// already uses for the from-space instrument.
-#[cfg(test)]
+// The pin's backing cell. Separate from `NATIVE_ROOTS_TARGET_OK` on purpose:
+// `compile_module` calls `set_native_roots_for_target` per module, so a pin
+// that wrote the target cell would be overwritten the moment the test invoked
+// codegen. This is consulted FIRST and the per-module decision cannot clear it.
+#[cfg(any(test, feature = "testing"))]
 thread_local! {
-    /// Separate from `NATIVE_ROOTS_TARGET_OK` on purpose: `compile_module`
-    /// calls `set_native_roots_for_target` per module, so a pin that wrote the
-    /// target cell would be overwritten the moment the test invoked codegen.
-    /// This is consulted FIRST and the per-module decision cannot clear it.
     static NATIVE_ROOTS_OVERRIDE: std::cell::Cell<Option<bool>> =
         const { std::cell::Cell::new(None) };
 }
 
-#[cfg(test)]
-pub(crate) struct NativeRootsPin(Option<bool>);
+/// Test-support RAII pin for the root lowering under test.
+///
+/// Now that native roots are the default, a test that asserts on shadow-stack
+/// IR has to SAY so — it used to get that lowering by accident, because there
+/// was only one default. Eight in-crate tests broke on exactly this when the
+/// default flipped, and every one of them was correct about what it asserted;
+/// five integration suites broke the same way and stayed red for weeks, because
+/// this type was `#[cfg(test)]` and they could not reach it (#7493).
+///
+/// Thread-local and restoring, so one test pinning a lowering cannot change
+/// another's — the same discipline `arena::quarantine`'s `ProtectionModeGuard`
+/// already uses for the from-space instrument. Safe under `cargo test`'s
+/// default parallelism.
+///
+/// Reachable from `tests/*.rs` as `perry_codegen::testing::NativeRootsPin`; see
+/// [`crate::testing`] for why that is behind a cargo feature rather than an
+/// unconditional `pub`.
+#[cfg(any(test, feature = "testing"))]
+pub struct NativeRootsPin(Option<bool>);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 impl NativeRootsPin {
-    /// Pin this thread to the shadow-stack lowering for the guard's lifetime.
-    pub(crate) fn shadow() -> Self {
+    /// Pin this thread to the **shadow-stack** lowering for the guard's
+    /// lifetime — Perry's heap-backed shadow frame, `js_shadow_frame_enter` +
+    /// per-slot binds.
+    pub fn shadow() -> Self {
         NativeRootsPin(NATIVE_ROOTS_OVERRIDE.with(|c| c.replace(Some(false))))
+    }
+
+    /// Pin this thread to the **native-roots** (RS4GC statepoint) lowering:
+    /// `ptr addrspace(1)` root allocas, `gc "statepoint-example"`, relocations
+    /// inserted by LLVM.
+    ///
+    /// This is today's default on every target the runtime can walk, so a test
+    /// that wants it does not strictly *need* the pin — but a pin is not
+    /// redundant: it also overrides `PERRY_RS4GC` from the environment, so the
+    /// assertion means the same thing during a `PERRY_RS4GC=0` bisection run as
+    /// it does in CI. Without it, a whole-suite sweep under the process-global
+    /// env knob silently retargets every unpinned test at the other lowering.
+    pub fn native() -> Self {
+        NativeRootsPin(NATIVE_ROOTS_OVERRIDE.with(|c| c.replace(Some(true))))
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 impl Drop for NativeRootsPin {
     fn drop(&mut self) {
         NATIVE_ROOTS_OVERRIDE.with(|c| c.set(self.0));
@@ -666,6 +689,13 @@ pub(super) fn scoped_method_name(
 /// a digit, so prefix with `_` if the first character would be one (this
 /// happens with module names like `05_fibonacci.ts`).
 ///
+/// The output alphabet being strictly `[A-Za-z0-9_]` is a load-bearing
+/// invariant (issue #6927): `$` is reserved for compiler-generated clone /
+/// uniquifier suffixes (`$generic`, `$typed_*`, `$dupN`, the spec-ABI and
+/// proven-`this` suffixes), so a user-derived symbol component can never
+/// forge a generated symbol. Never emit `$` from this function or from
+/// [`sanitize_member`].
+///
 /// NOTE: this mapping is *lossy* — every special character collapses to `_`,
 /// so distinct inputs can share an output. That is fine for the module-prefix
 /// and static-field components (whose values are recorded once and re-derived
@@ -713,6 +743,9 @@ pub(super) fn sanitize(name: &str) -> String {
 ///
 /// Must be applied at BOTH the definition site and every reference site for a
 /// given symbol component, or the symbols desync and the linker fails.
+///
+/// Like [`sanitize`], the output is strictly `[A-Za-z0-9_]` — `$` is reserved
+/// for generated suffixes and must never appear here (issue #6927).
 pub(super) fn sanitize_member(name: &str) -> String {
     let is_plain = name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
     if is_plain {
@@ -1541,6 +1574,42 @@ pub(super) fn emit_namespace_populator(
     crate::expr::emit_root_nanbox_store_on_block(blk, &result, &format!("@{}", ns_name));
     let addr_i64 = blk.ptrtoint(&format!("@{}", ns_name), I64);
     blk.call_void("js_gc_register_global_root", &[(I64, &addr_i64)]);
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::{sanitize, sanitize_member, scoped_fn_name, scoped_method_name};
+
+    /// Issue #6927: the generated-clone namespace (`{public}$<suffix>`) is
+    /// unforgeable ONLY because these two functions never emit `$`. If either
+    /// ever lets a `$` through, a user member could compose a public symbol
+    /// equal to a generated clone symbol and silently usurp it
+    /// (`deduped_function_refs` keeps the first definition).
+    #[test]
+    fn sanitize_never_emits_the_reserved_generated_suffix_separator() {
+        for hostile in [
+            "foo$generic",
+            "$dup1",
+            "a$b$c",
+            "foo__generic", // old forgeable spelling — plain, passes through, harmless now
+            "#$",
+            "℘$typed_f64",
+        ] {
+            assert!(
+                !sanitize(hostile).contains('$'),
+                "sanitize({hostile:?}) leaked a `$`: {:?}",
+                sanitize(hostile)
+            );
+            assert!(
+                !sanitize_member(hostile).contains('$'),
+                "sanitize_member({hostile:?}) leaked a `$`: {:?}",
+                sanitize_member(hostile)
+            );
+        }
+        // And therefore no composed public symbol contains one either.
+        assert!(!scoped_fn_name("m", "add$typed_f64").contains('$'));
+        assert!(!scoped_method_name("m", "C$x", "foo$generic").contains('$'));
+    }
 }
 
 #[cfg(test)]

@@ -7,11 +7,194 @@
 //! `this` per the requested mode.
 
 use anyhow::Result;
-use perry_hir::Expr;
+use perry_hir::{Expr, Stmt};
 
 use crate::expr::{lower_expr, FnCtx};
 use crate::nanbox::{double_literal, POINTER_MASK_I64};
 use crate::types::{DOUBLE, I32, I64};
+
+/// The field name a constructor-prologue statement assigns from a plain
+/// parameter, or `None` if the statement is not of that shape.
+///
+/// **Two HIR shapes mean the same thing here, and matching only one of them is
+/// what #7512 was** (`new Node(v, w)` measured 63% slower than the equivalent
+/// `{v, w}` literal, the reverse of the expected ordering):
+///
+/// - `Expr::PropertySet` is what the compiler SYNTHESIZES. Every anon-shape
+///   object-literal constructor (`lower/context.rs::mint_anon_shape_class`)
+///   and the destructuring lowering emit it directly.
+/// - `Expr::PutValueSet` is what USER SOURCE lowers to. `lower_expr`'s
+///   assignment arm (`perry-hir/src/lower/lower_expr/assignment.rs`) turns
+///   *every* source-level `obj.prop = value` — `this.v = v` in a hand-written
+///   constructor included — into the spec `PutValue` node. Nothing a user can
+///   type produces `Expr::PropertySet`.
+///
+/// So #7469's elision, which only ever matched `PropertySet`, fired on the
+/// synthesized literal ctor and was structurally unreachable for the declared
+/// class it was documented as covering. The class paid two extra full
+/// class-field-set IC diamonds per construction — a guard call plus a
+/// by-name `js_class_field_set_fallback` each, since a fresh instance has no
+/// typed-shape descriptor yet and the raw-f64 guard therefore cannot pass —
+/// writing a compile-time-constant `undefined` that the next two statements
+/// overwrite.
+///
+/// The proof obligation is identical for both shapes and is entirely about the
+/// *operand* expressions, not the store opcode: `This` and `LocalGet(<plain
+/// param>)` cannot throw, allocate, or observe `this`, so the assignment is
+/// reached before any other effect of the constructor.
+///
+/// **What the elided write is NOT** (the obvious objection, and it is
+/// measurably wrong — `test-files/test_class_field_init_proto_setter.ts`): it
+/// is not an observable `[[Set]]`, so eliding it cannot change how many times
+/// an accessor runs. A class field declaration is a `CreateDataProperty` — a
+/// DEFINE — per `ClassFieldDefinitionRecord` evaluation, so it never consults
+/// an inherited accessor, and it installs an OWN data property that the
+/// prologue's assignment then writes directly rather than dispatching past.
+/// A setter installed on the prototype *after* compilation (which the
+/// `class.setters` check below cannot see, by construction) runs **zero**
+/// times either way, matching Node exactly. The reading in which the field
+/// init is a `[[Set]]` and the setter therefore fires twice is the legacy
+/// `useDefineForClassFields: false` behaviour, which neither this compiler nor
+/// Node implements. The `class.setters` refusal below exists for the separate
+/// case of a setter the class DECLARES, where Perry's own class-field-set
+/// lowering does dispatch to the synthesized `__set_<name>` method.
+///
+/// `PutValueSet` additionally requires a constant string key (a computed key
+/// is an arbitrary expression that can run user code) and `receiver` to be
+/// `This` as well, since codegen evaluates both.
+fn prologue_assigned_field<'a>(
+    stmt: &'a Stmt,
+    param_ids: &std::collections::HashSet<u32>,
+) -> Option<&'a str> {
+    let is_plain_param = |e: &Expr| matches!(e, Expr::LocalGet(id) if param_ids.contains(id));
+    match stmt {
+        // Synthesized (anon-shape ctor, destructuring lowering).
+        Stmt::Expr(Expr::PropertySet {
+            object,
+            property,
+            value,
+        }) if matches!(object.as_ref(), Expr::This) && is_plain_param(value.as_ref()) => {
+            Some(property.as_str())
+        }
+        // User-written `this.f = p;`.
+        Stmt::Expr(Expr::PutValueSet {
+            target,
+            key,
+            value,
+            receiver,
+            strict: _,
+        }) if matches!(target.as_ref(), Expr::This)
+            && matches!(receiver.as_ref(), Expr::This)
+            && is_plain_param(value.as_ref()) =>
+        {
+            match key.as_ref() {
+                Expr::String(property) => Some(property.as_str()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Field names whose default-`undefined` initializer write is provably dead
+/// because the class's own constructor unconditionally overwrites them before
+/// anything can observe `this` (#7469; extended to user-written constructors
+/// by #7512).
+///
+/// A field declared without an initializer must normally be written as
+/// `undefined` in the init phase (#486: `new C().x === undefined` is spec, not
+/// zero-bytes-from-the-allocator). But the most common constructor shape —
+/// every synthesized anon-shape literal ctor
+/// (`lower/context.rs::mint_anon_shape_class`), and the hand-written
+/// `constructor(v, w) { this.v = v; this.w = w }` — opens with a run of plain
+/// `this.f = <param>` statements. For those fields the `undefined` write is a
+/// dead store: it is overwritten before any code that could read `this.f`
+/// runs. On `churn.ts` that dead store was 2 of the 4 guarded field-store
+/// sequences per object literal — a set-guard FFI call, a string addref, and a
+/// layout note per field, 20M times, all storing a compile-time constant that
+/// the very next statements overwrite. (On the `js_object_alloc_class_inline_keys`
+/// allocation path the slots are ALREADY `undefined`-prefilled (#4717), making
+/// the write doubly dead — but this elision does not rely on that: the
+/// prologue overwrite guarantee is allocator-independent.)
+///
+/// Returns the empty set — i.e. elides nothing — unless every condition holds:
+///
+/// - **The class extends nothing** (`extends`/`extends_name`/`native_extends`/
+///   `extends_expr` all `None`). A base class is still fine to *be* extended:
+///   its field-init phase and ctor body may then be separated by a derived
+///   ctor's pre-`super()` statements, but those cannot touch `this` (TDZ), so
+///   the skipped slot stays unobservable. What this condition excludes is the
+///   class having its OWN super machinery in between.
+/// - **No field anywhere on the class carries an initializer expression or a
+///   computed key, and the class and its fields are undecorated.** Initializer
+///   and key expressions run during the init phase and may legally read
+///   `this.<f>` of an earlier field — eliding f's `undefined` write would let
+///   them observe whatever the allocator left in the slot. All-`init: None`
+///   fields mean the init phase contains no user expression at all.
+/// - **Every constructor parameter is plain**: no default (a default expression
+///   evaluates before the prologue and, in the general lowering, could observe
+///   `this`), no rest, no decorators, no `arguments` materialization.
+/// - **No setter shares a name with a prologue-assigned field** — the store
+///   would dispatch to the setter instead of writing the slot, and the elided
+///   `undefined` write was the only slot write.
+/// - The field itself is public and non-computed (`is_private` false,
+///   `key_expr` none).
+///
+/// The prologue is the maximal leading run of statements that
+/// [`prologue_assigned_field`] recognizes as `this.<f> = <plain param>`. A
+/// `LocalGet` of a plain parameter cannot throw, allocate, or observe `this`,
+/// so every field it assigns is written before ANY other effect of the
+/// constructor — which is exactly the guarantee that makes the earlier
+/// `undefined` write dead.
+pub(crate) fn ctor_prologue_param_assigned_fields(
+    class: &perry_hir::Class,
+) -> std::collections::HashSet<String> {
+    let empty = std::collections::HashSet::new();
+    if class.extends.is_some()
+        || class.extends_name.is_some()
+        || class.native_extends.is_some()
+        || class.extends_expr.is_some()
+        || !class.decorators.is_empty()
+    {
+        return empty;
+    }
+    let Some(ctor) = class.constructor.as_ref() else {
+        return empty;
+    };
+    let all_fields_bare = class.fields.iter().all(|f| {
+        f.init.is_none() && f.key_expr.is_none() && f.decorators.is_empty() && !f.is_private
+    });
+    if !all_fields_bare {
+        return empty;
+    }
+    let params_plain = ctor.params.iter().all(|p| {
+        p.default.is_none() && !p.is_rest && p.decorators.is_empty() && p.arguments_object.is_none()
+    });
+    if !params_plain {
+        return empty;
+    }
+    let param_ids: std::collections::HashSet<_> = ctor.params.iter().map(|p| p.id).collect();
+    let mut assigned = std::collections::HashSet::new();
+    for stmt in &ctor.body {
+        match prologue_assigned_field(stmt, &param_ids) {
+            Some(property) => {
+                assigned.insert(property.to_string());
+            }
+            None => break,
+        }
+    }
+    if assigned.is_empty() {
+        return empty;
+    }
+    if class
+        .setters
+        .iter()
+        .any(|(name, _)| assigned.contains(name))
+    {
+        return empty;
+    }
+    assigned
+}
 
 /// Walk the inheritance chain from the root down and apply each class's
 /// field initializers to `this`. Call this inside `lower_new` after the
@@ -193,6 +376,17 @@ pub(crate) fn apply_field_initializers_recursive(
         // in hono's Context. Lower the missing-init case to
         // `Expr::Undefined` so the constructor writes the spec-correct
         // value into the field slot. Refs #486.
+        // #7469: default-`undefined` writes that the class's own ctor prologue
+        // provably overwrites are dead — see the function doc for the proof
+        // obligations. Computed from the leaf-authoritative `ctx.classes` entry
+        // (an ancestor resolved only through `chain_field_override` has no
+        // visible ctor here and gets the conservative empty set).
+        let prologue_assigned = ctx
+            .classes
+            .get(&class_name_in_chain)
+            .copied()
+            .map(ctor_prologue_param_assigned_fields)
+            .unwrap_or_default();
         let mut init_pairs: Vec<(String, Expr)> = Vec::new();
         let mut init_pairs_computed: Vec<(Expr, Expr)> = Vec::new();
         for field in &class_fields {
@@ -210,6 +404,17 @@ pub(crate) fn apply_field_initializers_recursive(
             // writer (verified: captures are correct at the parent ctor end and
             // only vanish during the derived ctor's post-super field-init).
             if field.key_expr.is_none() && field.name.starts_with("__perry_cap_") {
+                continue;
+            }
+            // #7469: skip the dead default write for prologue-overwritten
+            // fields. `ctor_prologue_param_assigned_fields` returns non-empty
+            // only when EVERY field on the class is bare (`init: None`, named
+            // key, undecorated, public), so this arm can only ever drop
+            // `Expr::Undefined` writes — never a real initializer.
+            if field.init.is_none()
+                && field.key_expr.is_none()
+                && prologue_assigned.contains(&field.name)
+            {
                 continue;
             }
             let init = match &field.init {
@@ -323,3 +528,6 @@ pub(crate) fn apply_field_initializers_recursive(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

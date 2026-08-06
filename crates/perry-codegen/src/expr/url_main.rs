@@ -39,15 +39,42 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 .block()
                 .call(I64, "js_url_coerce_string", &[(DOUBLE, &url_v)]);
             let obj = if let Some(base) = base {
+                // `js_url_coerce_string` returns a RAW `StringHeader` pointer,
+                // not a NaN-boxed value, so nothing else keeps it alive. Two
+                // collection points then stand between it and its use:
+                // lowering `base` runs arbitrary user code, and the second
+                // coercion allocates whenever `base` is not already a string.
+                // An evacuating cycle in either window leaves `url_ptr`
+                // pointing at a forwarded object and
+                // `js_url_new_with_base` parses freed bytes.
+                //
+                // Root before the first collection point and re-read after the
+                // last, per `docs/src/internals/gc-rooting-invariant.md` — the
+                // ordering is the whole fix; adding the root after the coercion
+                // would root an already-stale pointer.
+                let url_slot = super::temp_root::temp_root_push_i64(ctx, &url_ptr);
                 let base_v = lower_expr(ctx, base)?;
-                let base_ptr = ctx
-                    .block()
-                    .call(I64, "js_url_coerce_string", &[(DOUBLE, &base_v)]);
-                ctx.block().call(
+                // Layer 1 migration (#7459): `call_rooted` emits the collecting
+                // call and roots its result in one step, so no unrooted
+                // register for `base_ptr` ever exists to be held across a later
+                // collection point. The window that made #7453 a bug is not
+                // expressible here.
+                let base_slot = crate::rooting::call_rooted(
+                    ctx,
+                    I64,
+                    "js_url_coerce_string",
+                    &[(DOUBLE, &base_v)],
+                );
+                let url_ptr = super::temp_root::temp_root_get_i64(ctx, &url_slot);
+                let base_ptr = base_slot.read(ctx);
+                let obj = ctx.block().call(
                     I64,
                     "js_url_new_with_base",
                     &[(I64, &url_ptr), (I64, &base_ptr)],
-                )
+                );
+                base_slot.release(ctx);
+                super::temp_root::temp_root_truncate(ctx, &url_slot);
+                obj
             } else {
                 ctx.block().call(I64, "js_url_new", &[(I64, &url_ptr)])
             };
@@ -55,17 +82,29 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         }
 
         Expr::UrlPatternNew { input, base } => {
-            let input_v = lower_expr(ctx, input)?;
-            let base_v = if let Some(base) = base {
-                lower_expr(ctx, base)?
+            // Same window as `UrlNew` above: `input_v` is a NaN-boxed heap
+            // value held in a register while `base` lowers, which can run user
+            // code and collect. `lower_exprs_rooted` protects each operand
+            // whose later siblings may trigger GC and hands back reloaded
+            // values, so nothing crosses the window in a bare register.
+            let (input_v, base_v, operand_guard) = if let Some(base) = base {
+                let (vals, guard) = super::temp_root::lower_exprs_rooted(ctx, &[input, base])?;
+                (vals[0].clone(), vals[1].clone(), guard)
             } else {
-                double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED))
+                let input_v = lower_expr(ctx, input)?;
+                (
+                    input_v,
+                    double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)),
+                    None,
+                )
             };
             let obj = ctx.block().call(
                 I64,
                 "js_url_pattern_new",
                 &[(DOUBLE, &input_v), (DOUBLE, &base_v)],
             );
+            // Released only after the last use of both operands.
+            super::temp_root::temp_root_release(ctx, operand_guard);
             Ok(nanbox_pointer_inline(ctx.block(), &obj))
         }
 
@@ -119,11 +158,16 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 Expr::UrlSetHref { .. } => "js_url_set_href",
                 _ => unreachable!(),
             };
-            let url_v = lower_expr(ctx, url)?;
+            // Same window as the URLSearchParams family (#7462/#7463), and it
+            // covers all nine setters at once: `url_handle` is a raw heap
+            // pointer and lowering `value` runs arbitrary user code that can
+            // collect. Root both, unbox from the reloaded receiver.
+            let (vals, operand_guard) = super::temp_root::lower_exprs_rooted(ctx, &[url, value])?;
+            let (url_v, val_v) = (vals[0].clone(), vals[1].clone());
             let url_handle = unbox_to_i64(ctx.block(), &url_v);
-            let val_v = lower_expr(ctx, value)?;
             ctx.block()
                 .call_void(runtime_fn, &[(I64, &url_handle), (DOUBLE, &val_v)]);
+            super::temp_root::temp_root_release(ctx, operand_guard);
             // Assignment expression evaluates to the value on the RHS.
             Ok(val_v)
         }
@@ -257,14 +301,22 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         }
 
         Expr::UrlSearchParamsGet { params, name } => {
-            let p_v = lower_expr(ctx, params)?;
+            // #7453's shape: `p_ptr` — and the tagged `p_v` it is masked from —
+            // is a heap pointer, and lowering `name` runs arbitrary user code
+            // that can collect. Root both operands first and unbox from the
+            // reloaded receiver, so neither crosses the window in a register.
+            // The guard lives to the end of the arm: every use below is a use
+            // of one of the two rooted values.
+            let (vals, operand_guard) = super::temp_root::lower_exprs_rooted(ctx, &[params, name])?;
+            let (p_v, n_v) = (vals[0].clone(), vals[1].clone());
             let p_ptr = unbox_to_i64(ctx.block(), &p_v);
-            let n_v = lower_expr(ctx, name)?;
             let str_ptr = ctx.block().call(
                 I64,
                 "js_url_search_params_get",
                 &[(I64, &p_ptr), (DOUBLE, &n_v)],
             );
+            // Released after the consuming call, which itself allocates.
+            super::temp_root::temp_root_release(ctx, operand_guard);
             // Runtime returns a null pointer when the key is absent;
             // JS expects `null` in that case, not an empty string.
             let blk = ctx.block();
@@ -282,14 +334,28 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             name,
             value,
         } => {
-            let p_v = lower_expr(ctx, params)?;
+            // #7453's shape: `p_ptr` — and the tagged `p_v` it is masked from —
+            // is a heap pointer, and lowering `name` runs arbitrary user code
+            // that can collect. Root both operands first and unbox from the
+            // reloaded receiver, so neither crosses the window in a register.
+            // The guard lives to the end of the arm: every use below is a use
+            // of one of the two rooted values.
+            // All operands rooted together, `value` included when present, so
+            // nothing crosses its lowering in a register. #7462 rooted only
+            // `params`+`name` and left this path with the window it was meant
+            // to close.
+            let mut operand_exprs: Vec<&Expr> = vec![params, name];
+            if let Some(v_expr) = value {
+                operand_exprs.push(v_expr);
+            }
+            let (vals, operand_guard) = super::temp_root::lower_exprs_rooted(ctx, &operand_exprs)?;
+            let (p_v, n_v) = (vals[0].clone(), vals[1].clone());
             let p_ptr = unbox_to_i64(ctx.block(), &p_v);
-            let n_v = lower_expr(ctx, name)?;
             // Runtime returns 0.0 / 1.0 as a plain f64 — not NaN-boxed.
             // Translate to TAG_TRUE / TAG_FALSE so `typeof` and strict-eq
             // behave correctly.
-            let raw = if let Some(v_expr) = value {
-                let v_v = lower_expr(ctx, v_expr)?;
+            let raw = if value.is_some() {
+                let v_v = vals[2].clone();
                 ctx.block().call(
                     DOUBLE,
                     "js_url_search_params_has2",
@@ -302,6 +368,8 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     &[(I64, &p_ptr), (DOUBLE, &n_v)],
                 )
             };
+            // Released after the consuming call, which itself allocates.
+            super::temp_root::temp_root_release(ctx, operand_guard);
             let blk = ctx.block();
             let is_true = blk.fcmp("une", &raw, &double_literal(0.0));
             let tagged = blk.select(
@@ -319,14 +387,26 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             name,
             value,
         } => {
-            let p_v = lower_expr(ctx, params)?;
+            // #7453's shape: `p_ptr` — and the tagged `p_v` it is masked from —
+            // is a heap pointer, and lowering `name` runs arbitrary user code
+            // that can collect. Root both operands first and unbox from the
+            // reloaded receiver, so neither crosses the window in a register.
+            // The guard lives to the end of the arm: every use below is a use
+            // of one of the two rooted values.
+            // All operands are rooted together: `value` is lowered too, so
+            // nothing crosses it in a register. #7462 rooted only
+            // `params`+`name`, which left the three-operand path with the same
+            // window it was meant to close.
+            let (vals, operand_guard) =
+                super::temp_root::lower_exprs_rooted(ctx, &[params, name, value])?;
+            let (p_v, n_v, val_v) = (vals[0].clone(), vals[1].clone(), vals[2].clone());
             let p_ptr = unbox_to_i64(ctx.block(), &p_v);
-            let n_v = lower_expr(ctx, name)?;
-            let val_v = lower_expr(ctx, value)?;
             ctx.block().call_void(
                 "js_url_search_params_set",
                 &[(I64, &p_ptr), (DOUBLE, &n_v), (DOUBLE, &val_v)],
             );
+            // Released after the consuming call, which itself allocates.
+            super::temp_root::temp_root_release(ctx, operand_guard);
             Ok(ctx
                 .block()
                 .bitcast_i64_to_double(crate::nanbox::TAG_UNDEFINED_I64))
@@ -337,14 +417,26 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             name,
             value,
         } => {
-            let p_v = lower_expr(ctx, params)?;
+            // #7453's shape: `p_ptr` — and the tagged `p_v` it is masked from —
+            // is a heap pointer, and lowering `name` runs arbitrary user code
+            // that can collect. Root both operands first and unbox from the
+            // reloaded receiver, so neither crosses the window in a register.
+            // The guard lives to the end of the arm: every use below is a use
+            // of one of the two rooted values.
+            // All operands are rooted together: `value` is lowered too, so
+            // nothing crosses it in a register. #7462 rooted only
+            // `params`+`name`, which left the three-operand path with the same
+            // window it was meant to close.
+            let (vals, operand_guard) =
+                super::temp_root::lower_exprs_rooted(ctx, &[params, name, value])?;
+            let (p_v, n_v, val_v) = (vals[0].clone(), vals[1].clone(), vals[2].clone());
             let p_ptr = unbox_to_i64(ctx.block(), &p_v);
-            let n_v = lower_expr(ctx, name)?;
-            let val_v = lower_expr(ctx, value)?;
             ctx.block().call_void(
                 "js_url_search_params_append",
                 &[(I64, &p_ptr), (DOUBLE, &n_v), (DOUBLE, &val_v)],
             );
+            // Released after the consuming call, which itself allocates.
+            super::temp_root::temp_root_release(ctx, operand_guard);
             Ok(ctx
                 .block()
                 .bitcast_i64_to_double(crate::nanbox::TAG_UNDEFINED_I64))
@@ -355,11 +447,25 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             name,
             value,
         } => {
-            let p_v = lower_expr(ctx, params)?;
-            let p_ptr = unbox_to_i64(ctx.block(), &p_v);
-            let n_v = lower_expr(ctx, name)?;
+            // #7453's shape: `p_ptr` — and the tagged `p_v` it is masked from —
+            // is a heap pointer, and lowering `name` runs arbitrary user code
+            // that can collect. Root both operands first and unbox from the
+            // reloaded receiver, so neither crosses the window in a register.
+            // The guard lives to the end of the arm: every use below is a use
+            // of one of the two rooted values.
+            // All operands rooted together, `value` included when present, so
+            // nothing crosses its lowering in a register. #7462 rooted only
+            // `params`+`name` and left this path with the window it was meant
+            // to close.
+            let mut operand_exprs: Vec<&Expr> = vec![params, name];
             if let Some(v_expr) = value {
-                let v_v = lower_expr(ctx, v_expr)?;
+                operand_exprs.push(v_expr);
+            }
+            let (vals, operand_guard) = super::temp_root::lower_exprs_rooted(ctx, &operand_exprs)?;
+            let (p_v, n_v) = (vals[0].clone(), vals[1].clone());
+            let p_ptr = unbox_to_i64(ctx.block(), &p_v);
+            if value.is_some() {
+                let v_v = vals[2].clone();
                 ctx.block().call_void(
                     "js_url_search_params_delete2",
                     &[(I64, &p_ptr), (DOUBLE, &n_v), (DOUBLE, &v_v)],
@@ -370,6 +476,11 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     &[(I64, &p_ptr), (DOUBLE, &n_v)],
                 );
             }
+            // Released after the consuming call on BOTH arms. #7462's automated
+            // placement put this inside the `else` only, so the with-value path
+            // pushed two temp roots per execution and never truncated them —
+            // unbounded growth in a loop, and it compiled without a warning.
+            super::temp_root::temp_root_release(ctx, operand_guard);
             Ok(ctx
                 .block()
                 .bitcast_i64_to_double(crate::nanbox::TAG_UNDEFINED_I64))
@@ -427,11 +538,18 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             callback,
             this_arg,
         } => {
-            let p_v = lower_expr(ctx, params)?;
+            // Two windows here, not one: `p_ptr` crosses the `callback`
+            // lowering, and both it and `cb_v` cross `this_arg`'s. Root every
+            // operand together and unbox from the reloaded receiver.
+            let mut operand_exprs: Vec<&Expr> = vec![params, callback];
+            if let Some(this_arg) = this_arg {
+                operand_exprs.push(this_arg);
+            }
+            let (vals, operand_guard) = super::temp_root::lower_exprs_rooted(ctx, &operand_exprs)?;
+            let (p_v, cb_v) = (vals[0].clone(), vals[1].clone());
             let p_ptr = unbox_to_i64(ctx.block(), &p_v);
-            let cb_v = lower_expr(ctx, callback)?;
-            let this_v = if let Some(this_arg) = this_arg {
-                lower_expr(ctx, this_arg)?
+            let this_v = if this_arg.is_some() {
+                vals[2].clone()
             } else {
                 double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED))
             };
@@ -439,15 +557,22 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 "js_url_search_params_for_each",
                 &[(I64, &p_ptr), (DOUBLE, &cb_v), (DOUBLE, &this_v)],
             );
+            super::temp_root::temp_root_release(ctx, operand_guard);
             Ok(ctx
                 .block()
                 .bitcast_i64_to_double(crate::nanbox::TAG_UNDEFINED_I64))
         }
 
         Expr::UrlSearchParamsGetAll { params, name } => {
-            let p_v = lower_expr(ctx, params)?;
+            // #7453's shape: `p_ptr` — and the tagged `p_v` it is masked from —
+            // is a heap pointer, and lowering `name` runs arbitrary user code
+            // that can collect. Root both operands first and unbox from the
+            // reloaded receiver, so neither crosses the window in a register.
+            // The guard lives to the end of the arm: every use below is a use
+            // of one of the two rooted values.
+            let (vals, operand_guard) = super::temp_root::lower_exprs_rooted(ctx, &[params, name])?;
+            let (p_v, n_v) = (vals[0].clone(), vals[1].clone());
             let p_ptr = unbox_to_i64(ctx.block(), &p_v);
-            let n_v = lower_expr(ctx, name)?;
             // Returns f64 with the raw array pointer bit-cast in; the runtime
             // does not NaN-box it, so tag it here with POINTER_TAG.
             let raw_f64 = ctx.block().call(
@@ -455,6 +580,8 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 "js_url_search_params_get_all",
                 &[(I64, &p_ptr), (DOUBLE, &n_v)],
             );
+            // Released after the consuming call, which itself allocates.
+            super::temp_root::temp_root_release(ctx, operand_guard);
             let bits = ctx.block().bitcast_double_to_i64(&raw_f64);
             Ok(nanbox_pointer_inline(ctx.block(), &bits))
         }

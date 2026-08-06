@@ -284,8 +284,10 @@ pub extern "C" fn js_object_get_own_property_descriptor(obj_value: f64, key_valu
             // `TypedArrayHeader` after it.
             let scope = crate::gc::RuntimeHandleScope::new();
             let addr_handle = scope.root_raw_mut_ptr(addr as *mut u8);
-            let key_str = crate::builtins::js_string_coerce(key_value);
-            let addr = addr_handle.get_raw_mut_ptr::<u8>() as usize;
+            // Allocating coercion + re-read as one combinator (#7341).
+            let (key_str, addr_ptr) =
+                addr_handle.across_mut::<u8, _>(|| crate::builtins::js_string_coerce(key_value));
+            let addr = addr_ptr as usize;
             if key_str.is_null() {
                 return f64::from_bits(crate::value::TAG_UNDEFINED);
             }
@@ -491,8 +493,10 @@ pub extern "C" fn js_object_get_own_property_descriptor(obj_value: f64, key_valu
                     // the `func_ptr` read) *after* the GC-capable coercion below.
                     let scope = crate::gc::RuntimeHandleScope::new();
                     let ptr_handle = scope.root_raw_mut_ptr(ptr as *mut u8);
-                    let key_str = crate::builtins::js_string_coerce(key_value);
-                    let ptr = ptr_handle.get_raw_mut_ptr::<u8>() as usize;
+                    // Allocating coercion + re-read as one combinator (#7341).
+                    let (key_str, ptr_raw) = ptr_handle
+                        .across_mut::<u8, _>(|| crate::builtins::js_string_coerce(key_value));
+                    let ptr = ptr_raw as usize;
                     if key_str.is_null() {
                         return f64::from_bits(crate::value::TAG_UNDEFINED);
                     }
@@ -649,8 +653,10 @@ pub extern "C" fn js_object_get_own_property_descriptor(obj_value: f64, key_valu
         } else {
             let scope = crate::gc::RuntimeHandleScope::new();
             let obj_handle = scope.root_raw_mut_ptr(obj);
-            let key_str = crate::builtins::js_string_coerce(key_value);
-            (obj_handle.get_raw_mut_ptr::<ObjectHeader>(), key_str)
+            // Allocating coercion + re-read as one combinator (#7341).
+            let (key_str, obj_now) = obj_handle
+                .across_mut::<ObjectHeader, _>(|| crate::builtins::js_string_coerce(key_value));
+            (obj_now, key_str)
         };
         if key_str.is_null() {
             return f64::from_bits(crate::value::TAG_UNDEFINED);
@@ -1385,6 +1391,65 @@ pub extern "C" fn js_object_get_own_property_names(obj_value: f64) -> f64 {
     }
 }
 
+/// `Object.getOwnPropertyDescriptors` for a Proxy receiver: one `ownKeys`
+/// trap, then the per-key `getOwnPropertyDescriptor` trap reads in the trap's
+/// verbatim key order (strings and symbols interleaved as returned). Split out
+/// of the generic path so a proxy never observes the extra `ownKeys` the
+/// two-helper enumeration there would fire.
+unsafe fn proxy_get_own_property_descriptors(obj_value: f64) -> f64 {
+    const POINTER_TAG: u64 = 0x7FFD_0000_0000_0000;
+    // The per-key descriptor read runs a user trap that can GC, so the
+    // receiver, key list, result object, and per-iteration key/descriptor all
+    // live in handles (same discipline as the generic path below).
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let obj_handle = scope.root_nanbox_f64(obj_value);
+    let keys_boxed = crate::proxy::js_proxy_own_keys(obj_value);
+    let keys_arr =
+        (keys_boxed.to_bits() & crate::value::POINTER_MASK) as *mut crate::array::ArrayHeader;
+    let keys_handle = scope.root_raw_mut_ptr(keys_arr);
+    let result_handle = scope.root_raw_mut_ptr(js_object_alloc(0, 0));
+    let key_handle = scope.root_nanbox_f64(f64::from_bits(crate::value::TAG_UNDEFINED));
+    let desc_handle = scope.root_nanbox_f64(f64::from_bits(crate::value::TAG_UNDEFINED));
+    let len =
+        crate::array::js_array_length(keys_handle.get_raw_const_ptr::<crate::array::ArrayHeader>());
+    for i in 0..len {
+        let key_val = crate::array::js_array_get(
+            keys_handle.get_raw_const_ptr::<crate::array::ArrayHeader>(),
+            i,
+        );
+        key_handle.set_nanbox_u64(key_val.bits());
+        let desc = js_object_get_own_property_descriptor(
+            obj_handle.get_nanbox_f64(),
+            key_handle.get_nanbox_f64(),
+        );
+        // Spec step: skip keys whose descriptor read comes back undefined
+        // (removed by the trap between key collection and this read).
+        if desc.to_bits() == crate::value::TAG_UNDEFINED {
+            continue;
+        }
+        desc_handle.set_nanbox_f64(desc);
+        if crate::symbol::js_is_symbol(key_handle.get_nanbox_f64()) != 0 {
+            let result_value = f64::from_bits(
+                (result_handle.get_raw_mut_ptr::<ObjectHeader>() as u64) | POINTER_TAG,
+            );
+            crate::symbol::js_object_set_symbol_property(
+                result_value,
+                key_handle.get_nanbox_f64(),
+                desc_handle.get_nanbox_f64(),
+            );
+        } else {
+            // Allocating coercion + receiver re-read as one combinator (#7341).
+            let (key_str, result_ptr) = result_handle.across_mut::<ObjectHeader, _>(|| {
+                crate::builtins::js_string_coerce(key_handle.get_nanbox_f64())
+            });
+            if !key_str.is_null() {
+                js_object_set_field_by_name(result_ptr, key_str, desc_handle.get_nanbox_f64());
+            }
+        }
+    }
+    f64::from_bits((result_handle.get_raw_mut_ptr::<ObjectHeader>() as u64) | POINTER_TAG)
+}
+
 /// Object.getOwnPropertyDescriptors(obj) — returns a new object whose own
 /// property keys (the same set `Object.getOwnPropertyNames` reports, including
 /// non-enumerable keys and class-ref method names) each map to the property
@@ -1399,6 +1464,15 @@ pub extern "C" fn js_object_get_own_property_names(obj_value: f64) -> f64 {
 pub extern "C" fn js_object_get_own_property_descriptors(obj_value: f64) -> f64 {
     const POINTER_TAG: u64 = 0x7FFD_0000_0000_0000;
     unsafe {
+        // A Proxy receiver gets its own arm: the spec performs ONE
+        // [[OwnPropertyKeys]] (`ownKeys` trap), then a [[GetOwnProperty]]
+        // (`getOwnPropertyDescriptor` trap) per key. The generic path below
+        // enumerates string and symbol keys through two separate helpers,
+        // each firing its own `ownKeys` trap — an observably extra call
+        // (test262 getOwnPropertyDescriptors/observable-operations).
+        if crate::proxy::js_proxy_is_proxy(obj_value) != 0 {
+            return proxy_get_own_property_descriptors(obj_value);
+        }
         // Enumerate own keys exactly like Object.getOwnPropertyNames — this
         // handles class refs and plain objects, and includes non-enumerable
         // keys, matching the spec's [[OwnPropertyKeys]] string-key set.
@@ -1454,13 +1528,12 @@ pub extern "C" fn js_object_get_own_property_descriptors(obj_value: f64) -> f64 
                     continue;
                 }
                 desc_handle.set_nanbox_f64(desc);
-                let key_str = crate::builtins::js_string_coerce(key_handle.get_nanbox_f64());
+                // Allocating coercion + receiver re-read as one combinator (#7341).
+                let (key_str, result_ptr) = result_handle.across_mut::<ObjectHeader, _>(|| {
+                    crate::builtins::js_string_coerce(key_handle.get_nanbox_f64())
+                });
                 if !key_str.is_null() {
-                    js_object_set_field_by_name(
-                        result_handle.get_raw_mut_ptr::<ObjectHeader>(),
-                        key_str,
-                        desc_handle.get_nanbox_f64(),
-                    );
+                    js_object_set_field_by_name(result_ptr, key_str, desc_handle.get_nanbox_f64());
                 }
             }
         }

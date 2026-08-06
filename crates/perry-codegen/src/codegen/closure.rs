@@ -967,11 +967,13 @@ pub(super) fn compile_closure(
         try_depth: 0,
         pending_declares: Vec::new(),
         integer_locals: native_facts.integer_locals(),
+        int_valued_i64_locals: native_facts.int_valued_i64_locals(),
         not_bigint_locals: native_facts.not_bigint_locals(),
         unsigned_i32_locals: native_facts.unsigned_i32_locals(),
         // Conservative: treat every slot as possibly-bound (param binds are
         // emitted before FnCtx exists here), so clears never get skipped.
         shadow_slots_bound: shadow_slot_map.values().copied().collect(),
+        temp_roots: crate::expr::temp_root::TempRootPool::default(),
         shadow_slot_map,
         persistent_shadow_slots: std::collections::HashSet::new(),
         shadow_slot_clears_after_stmt,
@@ -1317,7 +1319,7 @@ mod tests {
         let _shadow = crate::codegen::helpers::NativeRootsPin::shadow();
         let ir = one_capture_closure_ir();
         // The public `perry_closure_*` symbol can be a typed trampoline over a
-        // straight-line `__typed_f64` clone; the real body is the one that
+        // straight-line `$typed_f64` clone; the real body is the one that
         // carries a shadow frame. (The typed clone lowers arithmetic-only,
         // loop-free, call-free statements — `lower_typed_f64_body_*` bails on
         // anything else — so it contains no safepoint and its `%this_closure`

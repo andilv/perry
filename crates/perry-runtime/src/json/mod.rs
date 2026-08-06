@@ -549,12 +549,62 @@ pub(crate) unsafe fn str_from_header<'a>(ptr: *const StringHeader) -> Option<&'a
     Some(std::str::from_utf8_unchecked(bytes))
 }
 
+/// Minimum alignment of a GC allocation's *user* address. Every arena object
+/// is `header + GC_HEADER_SIZE` with an 8-aligned header (`arena_alloc_gc`
+/// pads `total` to `max(align, 8)`), and `gc_malloc` inherits the system
+/// allocator's ≥16-byte alignment, so a misaligned word is never one.
+const RAW_POINTER_ALIGN: u64 = 8;
+
+/// True when `bits` carry no NaN-box tag and *could* address a heap object:
+/// no tag bits set, non-zero, and [`RAW_POINTER_ALIGN`]-aligned.
+///
+/// NECESSARY, NEVER SUFFICIENT — this is a cheap pre-filter, not a decision.
+/// Call sites must use [`is_raw_pointer`]; see its doc for why.
 #[inline]
-pub(crate) fn is_raw_pointer(bits: u64) -> bool {
-    let exponent = (bits >> 52) & 0x7FF;
-    let mantissa = bits & 0x000F_FFFF_FFFF_FFFF;
-    let sign = bits >> 63;
-    exponent == 0 && mantissa != 0 && sign == 0
+pub(crate) fn untagged_pointer_bits(bits: u64) -> bool {
+    // Every NaN-box tag lives in the top 12 bits (`0x7FF9`..=`0x7FFF`, plus the
+    // sign bit for negative NaNs), so an untagged pointer has `bits >> 52 == 0`.
+    // `0` is `+0.0`, never a pointer.
+    bits >> 52 == 0 && bits != 0 && bits % RAW_POINTER_ALIGN == 0
+}
+
+/// True when `bits` — which carry no NaN-box tag — name a heap object that the
+/// JSON walk may dereference.
+///
+/// ## Why the bit pattern alone is not an answer (remote-triggerable SIGSEGV)
+///
+/// The historical test was `exponent == 0 && mantissa != 0 && sign == 0`, which
+/// is bit-for-bit the IEEE-754 definition of a **positive subnormal double**.
+/// Every positive denormal reaching `JSON.stringify` was therefore classified
+/// as an untagged heap pointer and dereferenced. `JSON.stringify(1e-317)`
+/// SIGSEGV'd and `JSON.stringify(5e-324)` printed `null` — both reachable from
+/// untrusted input as `JSON.stringify(JSON.parse(text))`.
+///
+/// No bit-pattern test can fix that, and narrowing the mask is not a fix. A raw
+/// untagged pointer and a positive subnormal occupy the *same* bit patterns by
+/// construction; that is a property of the value representation, not a wrong
+/// constant. `addr_class::is_plausible_heap_addr` does not help either — it is
+/// `0x1000..0x8000_0000_0000` on macOS/Linux, while positive subnormals span
+/// `0..0x0010_0000_0000_0000`, so the overlap is nearly the whole band. The
+/// #3576 module-slot object pointers this branch exists to serve live squarely
+/// inside the subnormal range, so any bit test wide enough to admit them still
+/// admits denormals.
+///
+/// The decision therefore has to come from *outside* the bits: ask whether the
+/// address is an allocation the GC actually tracks.
+/// [`stringify::ptr_is_tracked_heap_object`] answers that from the arena page
+/// map and the malloc-object registry — set-membership lookups, no dereference
+/// — so a denormal is rejected without ever touching memory and falls through
+/// to the `write_number` arm that should have had it all along.
+///
+/// What remains is exactly the irreducible ambiguity of the representation: a
+/// denormal whose bits *equal* a live tracked allocation's address is still
+/// indistinguishable from that pointer. Removing that residue means tagging
+/// these values at the producer (see `value::equality::normalize_raw_object_bits`
+/// / #3576), not writing a better predicate here.
+#[inline]
+pub(crate) unsafe fn is_raw_pointer(bits: u64) -> bool {
+    untagged_pointer_bits(bits) && stringify::ptr_is_tracked_heap_object(bits as *const u8)
 }
 
 #[inline]
@@ -652,6 +702,93 @@ mod tests {
         let valid = br#"{"a":[1,2,3]}"#;
         let text = js_string_from_bytes(valid.as_ptr(), valid.len() as u32);
         assert!(unsafe { js_json_parse_result(text) }.is_ok());
+    }
+
+    /// The bare bit test is *exactly* the IEEE-754 positive-subnormal
+    /// predicate. Pinning that here so nobody "simplifies"
+    /// `untagged_pointer_bits` back into a sufficient condition: whatever it
+    /// accepts, it accepts real `Number`s too, which is why `is_raw_pointer`
+    /// must consult the GC's allocation set.
+    #[test]
+    fn untagged_pointer_bits_cannot_separate_pointers_from_subnormals() {
+        for v in [5e-324f64, 1e-320, 1e-317, 1e-310, 2.2250738585072009e-308] {
+            assert!(v.is_subnormal() && v > 0.0);
+            let bits = v.to_bits();
+            let old_predicate = (bits >> 52) & 0x7FF == 0 && bits & 0x000F_FFFF_FFFF_FFFF != 0;
+            assert!(
+                old_predicate,
+                "{v:e} is a positive subnormal, so the pre-fix bit test called it a pointer"
+            );
+        }
+        // ...and the bit test still admits the aligned ones. Only the
+        // GC-tracking check below rejects them.
+        assert!(untagged_pointer_bits(0x0000_0012_3456_7888));
+        assert!(!untagged_pointer_bits(0));
+        assert!(!untagged_pointer_bits(1.5f64.to_bits()));
+        assert!(!untagged_pointer_bits(POINTER_TAG | 0x1000));
+    }
+
+    /// A positive subnormal `Number` must serialize as that number. Pre-fix
+    /// `5e-324` printed `null` (its bits, `1`, landed in the handle band) and
+    /// `1e-317` SIGSEGV'd (its bits pass every magnitude check but address an
+    /// unmapped page). Both are reachable from untrusted input via
+    /// `JSON.stringify(JSON.parse(text))`.
+    #[test]
+    fn stringify_positive_subnormal_is_a_number_not_a_pointer() {
+        unsafe {
+            for (value, expected) in [
+                (5e-324f64, "5e-324"),
+                (1e-320, "1e-320"),
+                (1e-317, "1e-317"),
+                (1e-310, "1e-310"),
+                (-1e-310, "-1e-310"),
+                (2.2250738585072009e-308, "2.225073858507201e-308"),
+            ] {
+                let output = js_json_stringify(value, TYPE_UNKNOWN);
+                assert_eq!(
+                    str_from_header(output).unwrap(),
+                    expected,
+                    "JSON.stringify({value:e})"
+                );
+            }
+        }
+    }
+
+    /// Subnormals nested where the object/array field decoders read them —
+    /// the `is_raw_pointer` call sites in `stringify.rs` /
+    /// `stringify_shape_template.rs`, not just the top-level dispatch.
+    #[test]
+    fn stringify_subnormal_object_and_array_members() {
+        let input = br#"{"n":1e-310,"m":5e-324,"a":[1e-317,1.5],"s":"hi"}"#;
+        let text = js_string_from_bytes(input.as_ptr(), input.len() as u32);
+        let value = unsafe { js_json_parse(text) };
+        let output = unsafe { js_json_stringify(f64::from_bits(value.bits()), TYPE_UNKNOWN) };
+        assert_eq!(
+            unsafe { str_from_header(output) }.unwrap(),
+            r#"{"n":1e-310,"m":5e-324,"a":[1e-317,1.5],"s":"hi"}"#
+        );
+    }
+
+    /// The branch `is_raw_pointer` exists for: an object whose heap pointer
+    /// travels UNTAGGED in an f64 slot (#3576 module-level object/array
+    /// variables). Rejecting subnormals must not reject these — the fix keys
+    /// on GC allocation membership, so a real allocation still resolves.
+    #[test]
+    fn stringify_untagged_raw_object_pointer_still_serializes() {
+        let input = br#"{"a":1,"b":"two"}"#;
+        let text = js_string_from_bytes(input.as_ptr(), input.len() as u32);
+        let value = unsafe { js_json_parse(text) };
+        let addr = value.bits() & POINTER_MASK;
+        // No tag at all — exactly the shape a module-slot object variable has.
+        assert!(
+            unsafe { is_raw_pointer(addr) },
+            "0x{addr:x} must be admitted"
+        );
+        let output = unsafe { js_json_stringify(f64::from_bits(addr), TYPE_UNKNOWN) };
+        assert_eq!(
+            unsafe { str_from_header(output) }.unwrap(),
+            r#"{"a":1,"b":"two"}"#
+        );
     }
 
     #[test]
@@ -1088,6 +1225,80 @@ mod tests {
             assert_eq!(
                 str_from_header(output).unwrap(),
                 r#"[{"a":1,"b":2},{"a":10,"b":11}]"#
+            );
+        }
+    }
+
+    /// #7477: the DirectParser must produce bit-identical f64s to the tape
+    /// materializer, whose number path is `str::parse::<f64>()` (correctly
+    /// rounded, matches V8's strtod for round-trippable inputs). The
+    /// DirectParser's small fixed-point fast path computed
+    /// `int as f64 + (frac as f64 / 10^k)` — TWO IEEE roundings (the division
+    /// rounds, then the addition rounds again), which is off by one ulp for
+    /// some literals. Node agrees with the tape, so the DirectParser is the
+    /// wrong one.
+    ///
+    /// `260.75197` (= 83 * 3.14159 in f64) is the minimal diverging literal
+    /// from `bench_field_access`: correct bits 0x1.04c0811b1d92bp+8, the
+    /// double-rounded fast path returned 0x1.04c0811b1d92cp+8 — whose
+    /// shortest round-trip stringification is "260.75197000000004", which is
+    /// how a pure parse divergence surfaced as a stringify-length checksum
+    /// mismatch (2552986400 vs node's 2552985550).
+    #[test]
+    fn direct_parser_number_bits_match_strtod() {
+        let parse_direct = |s: &str| -> u64 {
+            let bytes = s.as_bytes();
+            let mut parser = DirectParser::new(bytes);
+            let value = unsafe { parser.parse_number() };
+            assert!(
+                !parser.has_trailing_content(),
+                "parse_number left trailing input on {s:?}"
+            );
+            value.bits()
+        };
+        let mut cases: Vec<String> = vec![
+            // The two bench_field_access literals that diverged (#7477),
+            // plus their negations.
+            "260.75197".to_string(),
+            "521.50394".to_string(),
+            "-260.75197".to_string(),
+            "-521.50394".to_string(),
+            // Assorted shapes through every parse_number arm: integer fast
+            // path, fixed-point fast path, exponent / long-token fallback.
+            "0".to_string(),
+            "-0".to_string(),
+            "0.1".to_string(),
+            "-0.1".to_string(),
+            "0.3".to_string(),
+            "3.14159".to_string(),
+            "1.0000001".to_string(),
+            "123.456".to_string(),
+            "999999999999999.9".to_string(),
+            "9007199254740993.1".to_string(),
+            "0.000000001".to_string(),
+            "12345678901234567890".to_string(),
+            "1e10".to_string(),
+            "-2.5e-3".to_string(),
+            "1.7976931348623157e308".to_string(),
+        ];
+        // The full bench_field_access value space: shortest round-trip
+        // renderings of i * 3.14159. Two of these (i = 83, 166) diverged
+        // under the double-rounding fast path.
+        for i in 0..10000 {
+            cases.push(format!("{}", i as f64 * 3.14159));
+        }
+        for s in &cases {
+            let want: f64 = s.parse().unwrap();
+            let got = parse_direct(s);
+            assert_eq!(
+                got,
+                want.to_bits(),
+                "DirectParser::parse_number({s:?}) = {:#018x} ({}), \
+                 str::parse (tape/node) = {:#018x} ({})",
+                got,
+                f64::from_bits(got),
+                want.to_bits(),
+                want,
             );
         }
     }

@@ -899,7 +899,7 @@ unsafe fn array_slots_are_numeric(arr: *const ArrayHeader) -> bool {
 }
 
 #[inline]
-unsafe fn array_gc_header(arr: *const ArrayHeader) -> Option<*mut crate::gc::GcHeader> {
+pub(super) unsafe fn array_gc_header(arr: *const ArrayHeader) -> Option<*mut crate::gc::GcHeader> {
     if arr.is_null() || (arr as usize) < crate::gc::GC_HEADER_SIZE + 0x1000 {
         return None;
     }
@@ -1233,6 +1233,12 @@ pub(crate) unsafe fn set_array_numeric_layout(arr: *mut ArrayHeader, layout: Num
     match layout {
         NumericArrayLayout::RawF64 => set_array_raw_f64_layout_flag(arr),
     }
+    // #7480: the numeric and element-shape invariants are mutually exclusive
+    // — an element-shape array's slots are NaN-boxed pointers, which no
+    // raw-f64 layout admits. This is also what covers the bulk numeric
+    // producers (`js_array_fill_f64_*_extend`) that write slots directly and
+    // then declare the layout.
+    super::element_shape::clear_element_shape(arr);
     crate::gc::layout_init_pointer_free(arr as *mut u8);
 }
 
@@ -1447,6 +1453,55 @@ pub extern "C" fn js_array_note_numeric_write(arr: *mut ArrayHeader, value_bits:
     }
 }
 
+/// #7469 — declare ONCE, at allocation, that every element this array will
+/// hold is a heap pointer, so the per-store pointer-mask bookkeeping
+/// (`layout_note_slot`, and the `LAYOUT_SLOT_MASKS` entry it grows) is not
+/// needed for the stores codegen has proven pointer-valued.
+///
+/// Emitted by codegen at the `[]` literal that binds an array local whose every
+/// store it can prove pointer-by-construction; see
+/// `perry-codegen/src/collectors/all_pointer_arrays.rs` for the proof and
+/// `expr/array_push.rs` for the header test that re-validates the declaration
+/// at every elided store.
+///
+/// Two things happen here, and both are load-bearing:
+///
+/// 1. **The raw-f64 numeric layout is cleared.** `js_array_alloc` publishes
+///    every fresh array as `RawF64` + `POINTER_FREE` — the numeric fast paths
+///    read such an array's slots back as raw doubles, which for a pointer
+///    payload is a reinterpretation of a heap address as a number. The
+///    all-pointer declaration and the raw-f64 flag are mutually exclusive
+///    claims about the same bytes, and the codegen-side header test refuses the
+///    elided store unless BOTH raw-f64 bits are clear, so this clear is what
+///    keeps that test satisfiable.
+/// 2. **`GC_LAYOUT_SIDE_MASK | GC_LAYOUT_ALL_POINTERS` replaces
+///    `GC_LAYOUT_POINTER_FREE`.** For the collector that swaps "skip the whole
+///    payload" for "visit every slot in `0..length`" — the same set of slots
+///    `GC_LAYOUT_UNKNOWN` visits, so the declaration is conservative in the
+///    only direction that matters: a wrong element type costs a rejected slot
+///    read (`mark_field_into_worklist` re-validates every word), never a
+///    stranded live child.
+///
+/// Refused on a non-empty array: the claim covers `0..length`, and only on an
+/// empty array is it vacuously true of what is already stored. A refusal is
+/// silent and safe — the header keeps whatever layout it had, and the codegen
+/// header test then declines the elided store and routes the push through
+/// `js_array_push_f64`, which notes every slot as it always did.
+#[no_mangle]
+pub extern "C" fn js_array_declare_all_pointer_elements(arr: *mut ArrayHeader) {
+    let arr = clean_arr_ptr_mut(arr);
+    if arr.is_null() {
+        return;
+    }
+    unsafe {
+        if (*arr).length != 0 {
+            return;
+        }
+        clear_array_numeric_layout(arr);
+        crate::gc::layout_init_all_pointer_slots(arr as *mut u8);
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn js_array_is_numeric_f64_layout(arr: *const ArrayHeader) -> i32 {
     let arr = clean_arr_ptr(arr);
@@ -1507,6 +1562,10 @@ static KEEP_JS_ARRAY_NOTE_NUMERIC_WRITE: extern "C" fn(*mut ArrayHeader, u64) =
     js_array_note_numeric_write;
 #[cfg(feature = "keepalive-anchors")]
 #[used]
+static KEEP_JS_ARRAY_DECLARE_ALL_POINTER_ELEMENTS: extern "C" fn(*mut ArrayHeader) =
+    js_array_declare_all_pointer_elements;
+#[cfg(feature = "keepalive-anchors")]
+#[used]
 static KEEP_JS_ARRAY_IS_NUMERIC_F64_LAYOUT: extern "C" fn(*const ArrayHeader) -> i32 =
     js_array_is_numeric_f64_layout;
 #[cfg(feature = "keepalive-anchors")]
@@ -1520,7 +1579,7 @@ pub(crate) fn array_byte_size(capacity: usize) -> usize {
 }
 
 #[inline]
-unsafe fn array_elements_ptr(arr: *mut ArrayHeader) -> *mut u64 {
+pub(super) unsafe fn array_elements_ptr(arr: *mut ArrayHeader) -> *mut u64 {
     (arr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut u64
 }
 
@@ -1604,6 +1663,13 @@ pub(crate) unsafe fn rebuild_array_layout(arr: *mut ArrayHeader) {
     if arr.is_null() {
         return;
     }
+    // #7480: this is the post-hoc funnel every bulk element mutator uses —
+    // `shift`, `unshift`, `splice`, `fill`, `copyWithin`, `reverse`, and the
+    // dense `sort` write-back all mutate slots with bare `ptr::write` /
+    // `ptr::copy` and then land here. They are permutations or arbitrary
+    // rewrites, so the element-shape proof is dropped conservatively; a
+    // still-homogeneous array re-earns it on the next `ensure`.
+    super::element_shape::clear_element_shape(arr);
     let length = (*arr).length as usize;
     let capacity = (*arr).capacity as usize;
     if length > capacity || length > 16_000_000 {
@@ -1627,6 +1693,8 @@ pub(crate) unsafe fn rebuild_array_layout_exact(arr: *mut ArrayHeader) {
     if arr.is_null() {
         return;
     }
+    // #7480: same conservative drop as `rebuild_array_layout` — see there.
+    super::element_shape::clear_element_shape(arr);
     let length = (*arr).length as usize;
     let capacity = (*arr).capacity as usize;
     if length > capacity || length > 16_000_000 {
