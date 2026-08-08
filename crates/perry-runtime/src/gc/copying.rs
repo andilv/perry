@@ -1272,10 +1272,23 @@ pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
             deallocated_bytes: reset.deallocated_bytes,
             retained_forwarded_stub_objects: 0,
             retained_forwarded_stub_bytes: 0,
+            // The copying minor's Eden census is `stats.eden_live_bytes`, fed
+            // to `retune_after_scavenge` directly; the #7598 sweep seed covers
+            // the collections that run NO copying minor.
+            eden_live_bytes: 0,
+            eden_dead_bytes: 0,
         };
         trace.pause_us = start.elapsed().as_micros() as u64;
         trace.capture_layout_scans();
     }
+    // #7592: this is the promotion the survivor-promotion handoff exists to
+    // enable, so it releases the latch that suppressed a repeat handoff.
+    note_copying_minor_completed();
+    // #7592: promoted bytes are live by construction — credit them to the
+    // old-reclaim baseline BEFORE the pressure check below, or the check reads
+    // the stale baseline and schedules a full that is guaranteed to free
+    // nothing (see `credit_promoted_bytes_to_old_baseline`).
+    credit_promoted_bytes_to_old_baseline(collector.stats.promoted_bytes);
     maybe_schedule_old_reclaim_after_copied_minor();
     retune_after_scavenge(
         collector.stats.eden_live_bytes,

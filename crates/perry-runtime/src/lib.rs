@@ -82,6 +82,7 @@ pub mod frame;
 pub mod fs;
 pub mod gc;
 pub mod intl;
+pub mod iter_result;
 pub mod iterator_helpers;
 pub mod macos_bundle;
 pub mod map;
@@ -192,6 +193,7 @@ pub mod i18n;
 pub mod ios_game_loop;
 pub mod json;
 pub mod json_tape;
+pub(crate) mod json_tape_store;
 pub mod jsx;
 /// HarmonyOS streaming media playback (`perry/media`) — drain-queue
 /// bridge to `@ohos.multimedia.media.AVPlayer`. Symbols mirror the per-

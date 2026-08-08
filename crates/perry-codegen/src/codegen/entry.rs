@@ -707,6 +707,7 @@ pub(super) fn compile_module_entry(
             const_number_locals: HashMap::new(),
             current_block: 0,
             discard_expr_value: false,
+            discard_this_expr: false,
             func_names,
             strings,
             loop_targets: Vec::new(),
@@ -793,6 +794,7 @@ pub(super) fn compile_module_entry(
             masked_region_scalar_locals: std::collections::HashSet::new(),
             suppressed_cleared_shadow_slots: std::collections::HashSet::new(),
             class_field_loop_facts: Vec::new(),
+            element_shape_loop_facts: Vec::new(),
             i32_counter_slots: HashMap::new(),
             local_slot_reps: HashMap::new(),
             // #7109: this entry body selects canonical i32/u32/Str on the same
@@ -1372,6 +1374,7 @@ pub(super) fn compile_module_entry(
             const_number_locals: HashMap::new(),
             current_block: 0,
             discard_expr_value: false,
+            discard_this_expr: false,
             func_names,
             strings,
             loop_targets: Vec::new(),
@@ -1458,6 +1461,7 @@ pub(super) fn compile_module_entry(
             masked_region_scalar_locals: std::collections::HashSet::new(),
             suppressed_cleared_shadow_slots: std::collections::HashSet::new(),
             class_field_loop_facts: Vec::new(),
+            element_shape_loop_facts: Vec::new(),
             i32_counter_slots: HashMap::new(),
             local_slot_reps: HashMap::new(),
             // #7109: this entry body selects canonical i32/u32/Str on the same

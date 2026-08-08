@@ -28,6 +28,22 @@ Measured on the pinned quiet host, 3 independent sessions x 7 repeats:
     allocation sequence and collector policy, independent of CPU speed, core
     count, and machine load.
 
+    ★ **Deterministic is not the same as semantic (#7559).** An explicit
+    ``gc()`` is the one site in Perry that *forces* the conservative
+    native-stack scan (``ManualGcScanGuard``, #4977; production resolves to
+    ``SkipDisabled``), so this reading is taken under a root set nothing else in
+    the language uses, and it includes whatever the native stack happened to
+    look like a heap pointer to. ``js_arena_stats`` then sums each block's
+    **bump-pointer offset**, and a block cannot be reset while it holds one
+    marked object — so one stale stack word costs a whole 1 MiB nursery block.
+    Measured across the 74 commits between the 2026-08-05 pin and v0.5.1321:
+    the precise (scan-off) retention was byte-identical on 10 of 12 probes and
+    fell on the other two, while this number moved on five, always by whole
+    blocks. ``05_closure_capture``'s +16.44% breach was precisely that: precise
+    retention 5,329,880 at *both* endpoints, false-root residue 1 -> 2 blocks.
+    Run ``gc_ratchet.py classify`` before treating a retention row as a
+    collector regression.
+
 ``gc``  ``minor_cycles``, ``copied_objects``, ``copied_bytes``,
         ``promoted_objects``, ``promoted_bytes``, ``freed_bytes``, ``step_cycles``
     Parsed from ``PERRY_GC_DIAG=1`` output in a separate, untimed pass.
@@ -56,6 +72,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import dataclasses
 import json
 import math
 import os
@@ -81,7 +98,14 @@ DEFAULT_TOLERANCES = HERE / "tolerances.json"
 
 GCMETRIC_RE = re.compile(r"^#gcmetric\s+([a-z0-9_]+)=(-?[0-9]+)\s*$")
 COPY_MINOR_RE = re.compile(r"^\[gc-copy-minor\]\s+ran\s+(.*)$")
+SCAN_FALLBACK_RE = re.compile(
+    r"^\[gc-scan-fallback\]\s+site=(\w+)\s+automatic=(true|false)\s+count=(\d+)\s*$"
+)
 GC_STEP_PREFIX = "[gc-step]"
+
+#: Runtime knob that turns the conservative native-stack scan off. See
+#: ``classify`` for why this harness cares.
+SCAN_MODE_ENV = "PERRY_CONSERVATIVE_STACK_SCAN"
 
 RETENTION_METRICS = ("heap_used_bytes", "heap_total_bytes")
 GC_METRICS = (
@@ -101,11 +125,97 @@ ALL_METRICS = RETENTION_METRICS + GC_METRICS + MEMORY_METRICS + TIMING_METRICS
 #: Metrics collected once per repeat from a normal (untraced) run.
 SAMPLED_METRICS = RETENTION_METRICS + MEMORY_METRICS + TIMING_METRICS
 
+#: Metrics whose gating premise is *bit-identity*, not a noise allowance. Their
+#: bands in ``tolerances.json`` are justified by an observed spread of 0.000%
+#: over 21 runs, so a pinned probe whose samples disagree is not merely noisy:
+#: it contradicts the reason its band is that tight. Such a cell may not be
+#: gating (see ``validate_artifact`` and ``probe_overrides``).
+DETERMINISTIC_METRICS = RETENTION_METRICS + GC_METRICS
+
 PROFILES = ("shared_ci", "pinned_host")
+
+#: Top-level keys ``tolerances.json`` may contain. Anything else is refused
+#: rather than ignored: a mistyped ``probe_override`` section would silently not
+#: apply, which is a gate quietly measuring something other than what its file
+#: says it measures.
+TOLERANCE_SECTIONS = frozenset(("_readme", "probe_overrides", *PROFILES))
+
+#: Minimum repeats behind a probe-override exclusion. ``tolerances.json``
+#: justifies every *inclusion* on 21 runs (3 sessions x 7); an *exclusion* is
+#: the same claim with the opposite sign and is held to the same evidence.
+MIN_EXCLUSION_RUNS = 21
 
 
 class RatchetError(RuntimeError):
     """Raised when measurement, artifact validation, or comparison fails."""
+
+
+@dataclass(frozen=True)
+class ArtifactDefect:
+    """One thing wrong with the pinned artifact, and how much of it that voids.
+
+    WHY THIS IS A TYPE AND NOT AN EXCEPTION
+    ---------------------------------------
+    Artifact defects used to be raised one at a time from ``validate_artifact``,
+    which meant the *first* one aborted everything. That is how #7554 cost three
+    days of coverage: one cell — ``12_large_live_set.heap_used_bytes``, spread
+    6,768 bytes — failed the artifact-validation step, and because that step runs
+    *before* the measurement step, none of the twelve probes executed on any
+    branch for three days. Two GC pacing changes (#7594, #7596) merged in that
+    window and each had to substitute a hand-run both-arms A/B for the gate.
+
+    The defect that caused it was a statement about **one cell**: this metric on
+    this workload is not bit-identical, so the band whose premise is bit-identity
+    cannot rest on it. Nothing about that claim voids the other 143 cells, and
+    nothing about it makes the probes unrunnable. Collapsing the whole gate on it
+    was a blast radius nobody chose.
+
+    So a defect now carries its own scope, and the scope decides the blast
+    radius:
+
+    ``artifact``
+        The artifact cannot be interpreted or has been tampered with: wrong
+        schema, missing metric, a summary that disagrees with its own samples.
+        Comparing anything against it would be meaningless, so this stays fatal
+        and stays in preflight.
+    ``probe``
+        One probe was pinned unfit — no oracle diff, or no collection. Its rows
+        are not evidence; the other probes' still are. The probe is demoted out
+        of the gating family for the run and named as a failure.
+    ``cell``
+        One (probe, metric) cell contradicts the premise of its own band. The
+        cell is demoted; every other cell is still gated.
+
+    A demotion is NOT an excuse. Every non-fatal defect is still reported and
+    still turns ``check`` red — it just does so *after* the probes have run, with
+    the full table attached, so a regression somewhere else in the matrix is
+    named in the same run instead of being hidden behind the abort. Fail-open per
+    cell, fail-closed on the verdict.
+    """
+
+    scope: str
+    message: str
+    probe: str | None = None
+    metric: str | None = None
+
+    #: Scopes in widening order of blast radius.
+    SCOPES = ("cell", "probe", "artifact")
+
+    @property
+    def fatal(self) -> bool:
+        """True when the defect voids the whole artifact rather than part of it."""
+        return self.scope == "artifact"
+
+    @property
+    def where(self) -> str:
+        if self.scope == "cell":
+            return f"{self.probe}.{self.metric}"
+        if self.scope == "probe":
+            return str(self.probe)
+        return "artifact"
+
+    def describe(self) -> str:
+        return f"UNFIT PINNED {self.scope.upper()} `{self.where}` — {self.message}"
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +394,10 @@ def run_once(
         _, status, usage = os.wait4(process.pid, 0)
         wall_ms = (time.monotonic() - started) * 1000.0
         returncode = os.waitstatus_to_exitcode(status)
+        # os.wait4 reaped the child behind Popen's back, so Popen still thinks
+        # it is running and its finalizer emits a ResourceWarning per probe run.
+        # Tell it the outcome instead: this is bookkeeping, not a second wait.
+        process.returncode = returncode
         out_file.seek(0)
         err_file.seek(0)
         stdout, stderr = out_file.read(), err_file.read()
@@ -333,6 +447,27 @@ def parse_gc_diag(stderr: str) -> dict[str, int]:
         elif line.startswith(GC_STEP_PREFIX):
             counters["step_cycles"] += 1
     return {metric: int(counters.get(metric, 0)) for metric in GC_METRICS}
+
+
+def parse_scan_fallbacks(stderr: str) -> dict[str, dict[str, Any]]:
+    """Which conservative native-stack scans a traced run actually performed.
+
+    ``[gc-scan-fallback] site=<name> automatic=<bool> count=<n>`` is printed
+    once per scan, with ``count`` running per site, so the largest ``count`` for
+    a site is how often it fired. ``automatic`` separates the scans a program
+    pays for without asking (allocation-point old-gen reclaim, the nursery-churn
+    slack valve, emergency reclaim) from the ones user code requested by calling
+    ``gc()`` — which is the distinction ``classify`` exists to surface.
+    """
+    sites: dict[str, dict[str, Any]] = {}
+    for line in stderr.splitlines():
+        match = SCAN_FALLBACK_RE.match(line.strip())
+        if not match:
+            continue
+        name, automatic, count = match.group(1), match.group(2) == "true", int(match.group(3))
+        entry = sites.setdefault(name, {"automatic": automatic, "count": 0})
+        entry["count"] = max(entry["count"], count)
+    return sites
 
 
 def distribution(values: Sequence[float]) -> dict[str, Any]:
@@ -516,6 +651,165 @@ def measure(
 
 
 # ---------------------------------------------------------------------------
+# Classifying a retention breach (#7559)
+# ---------------------------------------------------------------------------
+
+
+def classify(
+    *, perry: Path, probes_dir: Path, repeats: int = 3, warmup: int = 1
+) -> dict[str, Any]:
+    """Split each probe's retention into real retention and false-root residue.
+
+    WHY THIS EXISTS
+    ---------------
+    ``heap_used_bytes`` is read from ``process.memoryUsage()`` immediately after
+    the probe's own explicit ``gc()``, and an explicit ``gc()`` is the one place
+    in Perry that *forces* the conservative native-stack scan (``#4977``'s
+    ``ManualGcScanGuard``; the production default is ``Auto``, which skips it).
+    So every probe's headline retention number is measured under a root set
+    nothing else in the language uses, and it includes whatever the native stack
+    happened to look like a heap pointer to at that instant.
+
+    That residue is not small and it is not proportional. ``js_arena_stats``
+    sums each arena block's **bump-pointer offset**, and a block cannot be reset
+    while it holds one marked object, so a single stale stack word costs a whole
+    1 MiB nursery block. Measured on ``05_closure_capture`` (#7559): the false
+    residue moved 1 MiB across a 74-commit window in which the same probe's
+    precise retention was byte-identical — 5,329,880 at both endpoints — which
+    is a +16.44% "regression" with every collector counter at +0.00%.
+
+    So: ``conservative`` is what the gate compares, ``precise`` is what the
+    collector actually retained, and ``excess`` is the difference. A retention
+    breach whose ``excess`` moved and whose ``precise`` did not is a false-root
+    artifact, not a collector regression.
+
+    WHAT IT ASSERTS
+    ---------------
+    Turning the scan off must not change what a probe computes. If it does, the
+    scan was load-bearing for that probe's correctness and its precise number is
+    not evidence about anything — so a stdout difference is an error, not a row.
+
+    The *precise* reading must additionally be bit-identical across repeats: it
+    is the number this tool asks the reader to believe, so a run-to-run spread
+    in it is an error rather than a row. The *conservative* reading is allowed
+    to vary and its spread is reported instead — on ``12_large_live_set`` that
+    spread is the whole reason #7554 had to stop gating the cell, and hiding it
+    behind an exception would remove the evidence.
+    """
+    if repeats < 1:
+        raise RatchetError("classify needs at least one repeat per scan mode")
+
+    sources = probe_sources(probes_dir)
+    rows: list[dict[str, Any]] = []
+    with tempfile.TemporaryDirectory(prefix="gc-ratchet-classify-") as tmp:
+        out_dir = Path(tmp)
+        for source in sources:
+            name = source.stem
+            binary = compile_probe(perry, source, out_dir)
+            for _ in range(warmup):
+                run_once([str(binary)])
+
+            modes: dict[str, list[dict[str, int]]] = {}
+            stdouts: dict[str, str] = {}
+            for label, env in (("conservative", None), ("precise", {SCAN_MODE_ENV: "off"})):
+                seen: list[dict[str, int]] = []
+                for _ in range(repeats):
+                    run = run_once([str(binary)], extra_env=env)
+                    if run["returncode"] != 0:
+                        raise RatchetError(
+                            f"{name}: probe exited {run['returncode']} with "
+                            f"{SCAN_MODE_ENV}={'off' if env else '<default>'}\n{run['stderr']}"
+                        )
+                    emitted = parse_gcmetrics(run["stderr"])
+                    for metric in RETENTION_METRICS:
+                        if emitted.get(metric, 0) <= 0:
+                            raise RatchetError(f"{name}: probe emitted no {metric} ({label})")
+                    seen.append({metric: emitted[metric] for metric in RETENTION_METRICS})
+                    stdouts.setdefault(label, run["stdout"])
+                modes[label] = seen
+
+            precise_samples = [sample["heap_used_bytes"] for sample in modes["precise"]]
+            if len(set(precise_samples)) != 1:
+                raise RatchetError(
+                    f"{name}: precise retention is not bit-identical across {repeats} runs "
+                    f"({precise_samples}); it is the number this tool asks the reader to "
+                    f"believe, so it may not be reported as a spread"
+                )
+
+            if stdouts["conservative"] != stdouts["precise"]:
+                raise RatchetError(
+                    f"{name}: probe output changes when the conservative stack scan is "
+                    f"disabled, so the scan is load-bearing for this probe and its precise "
+                    f"retention is not evidence about the collector"
+                )
+
+            sites = parse_scan_fallbacks(
+                run_once([str(binary)], extra_env={"PERRY_GC_DIAG": "1"})["stderr"]
+            )
+            conservative_samples = [sample["heap_used_bytes"] for sample in modes["conservative"]]
+            conservative = int(statistics.median(conservative_samples))
+            precise = precise_samples[0]
+            rows.append(
+                {
+                    "probe": name,
+                    "heap_used_bytes": conservative,
+                    "heap_used_samples": conservative_samples,
+                    "heap_used_spread_bytes": max(conservative_samples) - min(conservative_samples),
+                    "heap_used_precise_bytes": precise,
+                    "false_root_excess_bytes": conservative - precise,
+                    "false_root_excess_pct": _clean(
+                        100.0 * (conservative - precise) / conservative if conservative else 0.0
+                    ),
+                    "heap_total_bytes": modes["conservative"][0]["heap_total_bytes"],
+                    "heap_total_precise_bytes": modes["precise"][0]["heap_total_bytes"],
+                    "scan_fallback_sites": sites,
+                    "automatic_scan_sites": sorted(
+                        site for site, entry in sites.items() if entry["automatic"]
+                    ),
+                }
+            )
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "gc-ratchet-classification",
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "platform": platform_key(),
+        "host": host_description(),
+        "run_config": {"repeats": repeats, "warmup": warmup, "scan_mode_env": SCAN_MODE_ENV},
+        "probes": rows,
+    }
+
+
+def render_classification(payload: Mapping[str, Any]) -> str:
+    lines = [
+        "## GC ratchet retention classification",
+        "",
+        "`conservative` is what `heap_used_bytes` gates on: measured after the probe's",
+        f"own `gc()`, which forces the conservative native-stack scan. `precise` is the",
+        f"same reading with `{SCAN_MODE_ENV}=off`, i.e. the retention the",
+        "collector's own roots account for. `excess` is false-root residue, and it is",
+        "quantised to whole arena blocks because `heap_used_bytes` sums block offsets:",
+        "one stale stack word pins a whole 1 MiB nursery block.",
+        "",
+        "| Probe | conservative | spread | precise | excess | excess % | scan sites |",
+        "|-------|-------------:|-------:|--------:|-------:|---------:|------------|",
+    ]
+    for row in payload["probes"]:
+        sites = ", ".join(
+            f"{site}×{entry['count']}{'' if entry['automatic'] else ' (explicit gc())'}"
+            for site, entry in sorted(row["scan_fallback_sites"].items())
+        )
+        lines.append(
+            f"| `{row['probe']}` | {row['heap_used_bytes']:,} | "
+            f"{row['heap_used_spread_bytes']:,} | "
+            f"{row['heap_used_precise_bytes']:,} | {row['false_root_excess_bytes']:,} | "
+            f"{row['false_root_excess_pct']:.2f}% | {sites or 'none'} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Tolerances
 # ---------------------------------------------------------------------------
 
@@ -580,7 +874,158 @@ def _tolerance_from_json(metric: str, raw: Mapping[str, Any]) -> Tolerance:
     )
 
 
+@dataclass(frozen=True)
+class ProbeOverride:
+    """One (probe, metric) cell removed from the gating family, with its reason.
+
+    ``tolerances.json`` is keyed per metric per profile, which is the right
+    granularity for a *band*: the band expresses a machine class's noise floor.
+    It is the wrong granularity for the question "can this metric carry a gate
+    at all on this workload", because that is a property of the workload. When
+    those two got conflated the only available lever was to stop gating a metric
+    on all twelve probes because one of them had become sample-dependent (#7554).
+
+    So an override may only ever *remove* a cell from the gating family, never
+    add one — re-gating is the profile's job — and it may not touch the band.
+    A non-gating row is still measured, still compared, and still printed; it
+    just cannot turn the job red.
+
+    ``evidence`` is mandatory and is checked, not merely stored. An exclusion
+    claims a metric is not deterministic on this probe; that claim needs at
+    least as many runs behind it as the inclusion it overrules, and a spread
+    that is actually non-zero. A silent exclusion is how gates rot.
+    """
+
+    probe: str
+    metric: str
+    rationale: str
+    observed_runs: int
+    observed_spread: float
+    measured_on: str
+    issue: str
+
+    def applied_to(self, base: Tolerance) -> Tolerance:
+        """The profile's band, with gating removed and the reason substituted."""
+        return Tolerance(
+            pct=base.pct,
+            abs=base.abs,
+            direction=base.direction,
+            gating=False,
+            rationale=self.rationale,
+        )
+
+
+def _probe_override_from_json(probe: str, metric: str, raw: Mapping[str, Any]) -> ProbeOverride:
+    where = f"probe_overrides.{probe}.{metric}"
+    if metric not in ALL_METRICS:
+        raise RatchetError(f"{where}: unknown metric")
+    unknown = sorted(set(raw) - {"gating", "rationale", "evidence"})
+    if unknown:
+        raise RatchetError(f"{where}: unexpected field(s) {unknown}")
+    if raw.get("gating") is not False:
+        raise RatchetError(
+            f"{where}: an override may only set gating to false. It exists to take a cell "
+            "out of a gating family; putting one back is the profile's job, and a band that "
+            "gates on one probe but not another belongs in the profile where it can be read."
+        )
+    rationale = str(raw.get("rationale", "")).strip()
+    if not rationale:
+        raise RatchetError(
+            f"{where}: has no rationale. Recording that a cell is non-gating without "
+            "recording why is a silent exclusion, which is how gates rot."
+        )
+    evidence = raw.get("evidence")
+    if not isinstance(evidence, Mapping):
+        raise RatchetError(f"{where}: has no evidence block")
+    unknown_evidence = sorted(
+        set(evidence) - {"observed_runs", "observed_spread", "measured_on", "issue"}
+    )
+    if unknown_evidence:
+        raise RatchetError(f"{where}: evidence has unexpected field(s) {unknown_evidence}")
+    for field in ("observed_runs", "observed_spread", "measured_on", "issue"):
+        if field not in evidence:
+            raise RatchetError(f"{where}: evidence is missing {field}")
+    runs = int(evidence["observed_runs"])
+    if runs < MIN_EXCLUSION_RUNS:
+        raise RatchetError(
+            f"{where}: evidence rests on {runs} runs; at least {MIN_EXCLUSION_RUNS} are "
+            "required, the same number every band in this file is justified by. Fewer runs "
+            "cannot distinguish a non-deterministic metric from one bad sample."
+        )
+    spread = float(evidence["observed_spread"])
+    if spread <= 0:
+        raise RatchetError(
+            f"{where}: evidence records a spread of {spread:g}. A metric that was observed "
+            "to be deterministic has not been shown to be ungateable; it must stay gated."
+        )
+    for field in ("measured_on", "issue"):
+        if not str(evidence[field]).strip():
+            raise RatchetError(f"{where}: evidence.{field} is blank")
+    return ProbeOverride(
+        probe=probe,
+        metric=metric,
+        rationale=rationale,
+        observed_runs=runs,
+        observed_spread=spread,
+        measured_on=str(evidence["measured_on"]).strip(),
+        issue=str(evidence["issue"]).strip(),
+    )
+
+
+def probe_overrides_from_json(payload: Mapping[str, Any]) -> dict[str, dict[str, ProbeOverride]]:
+    """Parse the optional ``probe_overrides`` section.
+
+    Deliberately *not* nested per profile. An override answers "is this metric
+    deterministic enough to gate on this workload", which is a property of the
+    probe and the collector, not of the machine the numbers were taken on. Bands
+    stay per profile; gateability does not.
+    """
+    raw = payload.get("probe_overrides", {})
+    if not isinstance(raw, Mapping):
+        raise RatchetError("probe_overrides must be an object keyed by probe name")
+    overrides: dict[str, dict[str, ProbeOverride]] = {}
+    for probe, metrics in raw.items():
+        if not isinstance(metrics, Mapping) or not metrics:
+            raise RatchetError(f"probe_overrides.{probe} must be a non-empty object")
+        overrides[probe] = {
+            metric: _probe_override_from_json(probe, metric, entry)
+            for metric, entry in metrics.items()
+        }
+    return overrides
+
+
+def resolve_tolerance(
+    profile_tolerances: Mapping[str, Tolerance],
+    overrides: Mapping[str, Mapping[str, ProbeOverride]],
+    probe: str,
+    metric: str,
+) -> Tolerance:
+    override = overrides.get(probe, {}).get(metric)
+    base = profile_tolerances[metric]
+    return override.applied_to(base) if override else base
+
+
+def gated_anywhere(
+    profiles: Mapping[str, Mapping[str, Tolerance]],
+    overrides: Mapping[str, Mapping[str, ProbeOverride]],
+    probe: str,
+    metric: str,
+) -> bool:
+    """True when this cell can turn the job red under at least one profile."""
+    return any(
+        resolve_tolerance(profiles[profile], overrides, probe, metric).gating
+        for profile in profiles
+    )
+
+
 def tolerances_from_json(payload: Mapping[str, Any]) -> dict[str, dict[str, Tolerance]]:
+    unknown_sections = sorted(set(payload) - TOLERANCE_SECTIONS)
+    if unknown_sections:
+        raise RatchetError(
+            f"tolerances have unknown top-level section(s) {unknown_sections}; a mistyped "
+            "section would be silently ignored and the gate would not do what the file says"
+        )
+    probe_overrides_from_json(payload)
     profiles: dict[str, dict[str, Tolerance]] = {}
     for profile in PROFILES:
         if profile not in payload:
@@ -645,45 +1090,185 @@ def assemble(
     return artifact
 
 
-def validate_artifact(artifact: Mapping[str, Any]) -> None:
+def _validate_probe_overrides(
+    profiles: Mapping[str, Mapping[str, Tolerance]],
+    overrides: Mapping[str, Mapping[str, ProbeOverride]],
+    probes: Mapping[str, Any],
+) -> None:
+    """Cross-check the override set against the probes it claims to describe.
+
+    Two rules, both aimed at the same rot. An override that matches nothing is a
+    failure, not a no-op — the same rule ``scripts/gc_root_dominance_allowlist.json``
+    carries, so deleting a probe (or fixing the non-determinism and renaming it)
+    forces the exclusion to be revisited instead of outliving its reason. And an
+    override set that covers every probe for a metric has achieved, one cell at a
+    time, exactly what ``"gating": false`` at profile level would have done, only
+    without saying so anywhere a reader would look.
+    """
+    for probe, metrics in sorted(overrides.items()):
+        if probe not in probes:
+            raise RatchetError(
+                f"probe_overrides names {probe!r}, which is not in this artifact "
+                f"(probes: {', '.join(sorted(probes))}). An exclusion that matches nothing "
+                "must be deleted, not left behind to outlive its reason."
+            )
+        for metric in sorted(metrics):
+            if metric not in probes[probe].get("metrics", {}):
+                raise RatchetError(f"probe_overrides.{probe}.{metric} is not a recorded metric")
+
+    for profile, entries in sorted(profiles.items()):
+        for metric, tolerance in sorted(entries.items()):
+            if not tolerance.gating:
+                continue
+            if not any(
+                resolve_tolerance(entries, overrides, probe, metric).gating for probe in probes
+            ):
+                raise RatchetError(
+                    f"{profile}: {metric} is marked gating but every probe overrides it to "
+                    "non-gating, so it can never fail. Say that once at profile level, with "
+                    "the reason, instead of assembling it out of per-probe exclusions."
+                )
+
+
+def inspect_artifact(artifact: Mapping[str, Any]) -> list[ArtifactDefect]:
+    """Collect *every* defect in the pinned artifact, each tagged with its scope.
+
+    This never stops at the first problem. Two reasons, and the second is the
+    one that cost real coverage.
+
+    A maintainer re-pinning an artifact wants the whole list, not a fixpoint loop
+    where each run reveals one more thing. And, more importantly, an aborting
+    validator cannot distinguish "this artifact is unusable" from "one cell of
+    this artifact is unusable" — so it treated the second as the first, and
+    #7554's single bad cell zeroed the gate's coverage for three days. See
+    ``ArtifactDefect`` for the scope taxonomy and what each scope voids.
+
+    Unreadable *tolerances* are the one thing that still raises rather than
+    returning a defect: without parseable bands there is no gating family to
+    scope a defect against, so there is nothing to be partial about.
+    """
+    defects: list[ArtifactDefect] = []
+
+    def artifact_defect(message: str) -> None:
+        defects.append(ArtifactDefect(scope="artifact", message=message))
+
+    def probe_defect(probe: str, message: str) -> None:
+        defects.append(ArtifactDefect(scope="probe", message=message, probe=probe))
+
+    def cell_defect(probe: str, metric: str, message: str) -> None:
+        defects.append(ArtifactDefect(scope="cell", message=message, probe=probe, metric=metric))
+
+    # Identity and shape. Each of these makes everything below it unreadable, so
+    # they short-circuit — a defect list built from a payload that is not even a
+    # baseline would be noise, not information.
     if artifact.get("schema_version") != SCHEMA_VERSION:
-        raise RatchetError(f"unsupported schema_version {artifact.get('schema_version')!r}")
+        artifact_defect(f"unsupported schema_version {artifact.get('schema_version')!r}")
+        return defects
     if artifact.get("kind") != "gc-ratchet-baseline":
-        raise RatchetError("artifact is not a gc-ratchet baseline")
+        artifact_defect("artifact is not a gc-ratchet baseline")
+        return defects
     for field in ("commit", "generated_at", "platform"):
         if not isinstance(artifact.get(field), str) or not artifact[field].strip():
-            raise RatchetError(f"artifact has an invalid {field}")
+            artifact_defect(f"artifact has an invalid {field}")
     probes = artifact.get("probes")
     if not isinstance(probes, Mapping) or not probes:
-        raise RatchetError("artifact records no probes")
+        artifact_defect("artifact records no probes")
+        return defects
     expected = artifact.get("run_config", {}).get("probes")
     if not isinstance(expected, list) or sorted(expected) != sorted(probes):
-        raise RatchetError("artifact probe set does not match its run_config")
-    tolerances_from_json(artifact.get("tolerances", {}))
+        artifact_defect("artifact probe set does not match its run_config")
+
+    tolerance_payload = artifact.get("tolerances", {})
+    profiles = tolerances_from_json(tolerance_payload)
+    overrides = probe_overrides_from_json(tolerance_payload)
+    _validate_probe_overrides(profiles, overrides, probes)
+
     for name, entry in probes.items():
         metrics = entry.get("metrics")
         if not isinstance(metrics, Mapping):
-            raise RatchetError(f"{name}: no metrics recorded")
+            artifact_defect(f"{name}: no metrics recorded")
+            continue
+
+        # Integrity of the recorded numbers. A missing metric or a summary that
+        # disagrees with its own samples is tampering or corruption, not
+        # unfitness: it stays fatal, because a partially-trusted artifact is not
+        # a thing this gate should ever compare against.
+        unreadable = False
         for metric in ALL_METRICS:
             if metric not in metrics:
-                raise RatchetError(f"{name}: baseline is missing {metric}")
+                artifact_defect(f"{name}: baseline is missing {metric}")
+                unreadable = True
+                continue
             recorded = metrics[metric]
             samples = recorded.get("samples")
             if not isinstance(samples, list) or len(samples) < 2:
-                raise RatchetError(f"{name}: {metric} has too few samples")
+                artifact_defect(f"{name}: {metric} has too few samples")
+                unreadable = True
+                continue
             if recorded != distribution(samples):
-                raise RatchetError(f"{name}: {metric} summary is inconsistent with its samples")
+                artifact_defect(f"{name}: {metric} summary is inconsistent with its samples")
+                unreadable = True
+        if unreadable:
+            continue
+
         # A baseline may only be pinned from an oracle-verified run: "unchecked"
         # is as unacceptable here as "fail", because the whole artifact's
         # authority rests on the probes having been shown to compute the right
-        # thing at the moment they were frozen.
+        # thing at the moment they were frozen. Scoped to the probe: an
+        # unverified probe is not evidence, but it says nothing about the other
+        # eleven.
         if entry.get("correctness", {}).get("status") != "pass":
-            raise RatchetError(
-                f"{name}: baseline was pinned without a passing Node oracle diff "
-                f"(status={entry.get('correctness', {}).get('status')!r})"
+            probe_defect(
+                name,
+                "baseline was pinned without a passing Node oracle diff "
+                f"(status={entry.get('correctness', {}).get('status')!r}), so this probe's "
+                "rows are not evidence about the collector",
             )
         if metrics["minor_cycles"]["median"] < 1:
-            raise RatchetError(f"{name}: baseline pinned a probe that ran no minor collection")
+            probe_defect(
+                name,
+                "baseline pinned a probe that ran no minor collection, so there is no "
+                "evacuating-minor behaviour here to ratchet against",
+            )
+
+        # The bit-identity rule, enforced at PINNING time rather than only in
+        # the unit tests. It used to live only in tests/test_gc_ratchet.py, so
+        # #7446 was able to write an artifact whose 12_large_live_set retention
+        # spread was 6,768 bytes; the test then failed in the CI step that runs
+        # *before* the measurement step, and the ratchet measured nothing at all
+        # for three days (#7554). It is scoped to the CELL because that is the
+        # size of the claim: this metric on this workload is not bit-identical.
+        # `assemble` still refuses outright (see `validate_artifact`), so a
+        # maintainer cannot pin one by accident; `check` demotes it and carries
+        # on, so an artifact that is already in the tree cannot zero the gate.
+        for metric in DETERMINISTIC_METRICS:
+            spread = metrics[metric]["spread"]
+            if spread and gated_anywhere(profiles, overrides, name, metric):
+                cell_defect(
+                    name,
+                    metric,
+                    f"spread {spread:g} when pinned, but its band is justified by "
+                    "bit-identity, not by a noise allowance. Either re-pin on a quiet host, "
+                    "or take this one cell out of the gating family with a probe_overrides "
+                    "entry that records the evidence.",
+                )
+
+    return defects
+
+
+def validate_artifact(artifact: Mapping[str, Any]) -> None:
+    """Refuse an artifact with ANY defect. This is the PIN-time contract.
+
+    ``assemble`` calls this, so a maintainer cannot freeze an unfit artifact:
+    the failure lands on their machine at the moment the judgement is being
+    made. ``check`` deliberately does not call it — an artifact already in the
+    tree must not be able to zero the gate's coverage, so there the non-fatal
+    defects demote cells instead of aborting the run. Same defects, different
+    blast radius, because pinning and comparing are different acts.
+    """
+    defects = inspect_artifact(artifact)
+    if defects:
+        raise RatchetError("; ".join(defect.message for defect in defects))
 
 
 # ---------------------------------------------------------------------------
@@ -719,8 +1304,23 @@ def evaluate(
     drops the workload it was watching is exactly the shape of the ``gc-stress``
     hole this ratchet exists to close — that job was ``continue-on-error: true``
     and a regression sat behind it through three merges.
+
+    An unfit *pinned* cell is handled differently from an unfit measurement, and
+    this is the #7554 repair. It does not abort: it demotes that cell (or probe)
+    out of the gating family for this run and is reported as a failure like any
+    other. So the run still measures all twelve probes, still evaluates the other
+    143 cells, and still names a regression anywhere else in the matrix — while
+    the defect itself keeps the job red. Aborting instead is what made one bad
+    cell cost three days of total coverage.
     """
-    validate_artifact(baseline)
+    defects = inspect_artifact(baseline)
+    fatal = [defect for defect in defects if defect.fatal]
+    if fatal:
+        raise RatchetError("; ".join(defect.message for defect in fatal))
+    unfit = [defect for defect in defects if not defect.fatal]
+    unfit_probes = {defect.probe for defect in unfit if defect.scope == "probe"}
+    unfit_cells = {(defect.probe, defect.metric) for defect in unfit if defect.scope == "cell"}
+
     if profile not in PROFILES:
         raise RatchetError(f"unknown profile {profile!r}; expected one of {PROFILES}")
     if current.get("kind") != "gc-ratchet-measurement":
@@ -729,6 +1329,12 @@ def evaluate(
     failures: list[str] = []
     rows: list[Row] = []
     tolerances = tolerances_from_json(baseline["tolerances"])[profile]
+    overrides = probe_overrides_from_json(baseline["tolerances"])
+
+    # Reported first, so the reason a cell shows up demoted in the table is
+    # already on screen by the time the reader reaches it.
+    for defect in unfit:
+        failures.append(defect.describe())
 
     if baseline["platform"] != current.get("platform"):
         message = (
@@ -776,8 +1382,37 @@ def evaluate(
             reason = correctness.get("reason") or "no correctness report"
             failures.append(f"{name}: correctness was not verified against the Node oracle ({reason})")
 
+        # Liveness, asserted rather than inferred from the bands. A ratchet over
+        # the evacuating minor is meaningless if the evacuating minor did not
+        # run, and the tolerance arithmetic cannot be relied on to notice: six
+        # of the twelve probes pin `minor_cycles` at 1, where the allowance
+        # floor is also 1, so a collapse from 1 to 0 is `delta == -allowance`
+        # and scores "ok". A probe that stopped collecting would have been
+        # reported as passing — CLAUDE.md's fourth failure mode (the gate runs
+        # but its subject never did) sitting inside the gate meant to close it.
+        for metric, what in (
+            ("minor_cycles", "ran no minor collection"),
+            ("copied_objects", "evacuated nothing"),
+        ):
+            if base_entry["metrics"][metric]["median"] > 0 and (
+                cur_entry["metrics"][metric]["median"] <= 0
+            ):
+                failures.append(
+                    f"{name}: {what} in this run ({metric} "
+                    f"{base_entry['metrics'][metric]['median']:,.0f} -> 0). The baseline it is "
+                    "being compared against measures a collector that did; there is nothing "
+                    "here to compare."
+                )
+
         for metric in ALL_METRICS:
-            tolerance = tolerances[metric]
+            tolerance = resolve_tolerance(tolerances, overrides, name, metric)
+            # A cell the pinned artifact cannot support is demoted rather than
+            # trusted: comparing against a number whose own premise failed would
+            # dress a defect up as a verdict. The defect is already in
+            # `failures`, so demoting it here loses no red.
+            quarantined = name in unfit_probes or (name, metric) in unfit_cells
+            if quarantined:
+                tolerance = dataclasses.replace(tolerance, gating=False)
             base_median = float(base_entry["metrics"][metric]["median"])
             cur_median = float(cur_entry["metrics"][metric]["median"])
             delta = cur_median - base_median
@@ -791,8 +1426,12 @@ def evaluate(
             else:
                 breach = False
 
-            if breach:
+            if breach and quarantined:
+                status = "UNFIT (pinned cell unusable)"
+            elif breach:
                 status = "REGRESSION" if tolerance.gating else "drift (informational)"
+            elif quarantined:
+                status = "unfit (pinned cell unusable)"
             elif delta < -allowance:
                 status = "improvement"
             else:
@@ -845,6 +1484,37 @@ def render(rows: Iterable[Row], baseline: Mapping[str, Any], profile: str) -> st
             f"| `{row.probe}` | {row.metric} | {row.baseline:,.0f} | {row.current:,.0f} | "
             f"{delta} | {row.allowance:,.0f} | {'yes' if row.gating else 'no'} | {row.status} |"
         )
+    # An "unfit" row is a *defect in the baseline*, not a property of this run,
+    # and the two are easy to confuse in a 144-row table. Name them separately
+    # with what has to happen to clear them.
+    unfit = [defect for defect in inspect_artifact(baseline) if not defect.fatal]
+    if unfit:
+        lines += [
+            "",
+            "### Pinned cells that could not be gated (baseline defects)",
+            "",
+            "These are demoted for this run so one bad cell cannot zero the gate's",
+            "coverage (#7554). They still fail the job — fix by re-pinning on a quiet",
+            "host, or by recording a `probe_overrides` entry with its evidence.",
+            "",
+        ]
+        for defect in sorted(unfit, key=lambda d: (d.scope, d.where)):
+            lines.append(f"- {defect.describe()}")
+
+    # Print the exclusions with their reasons on every run. A reader who sees a
+    # "no" in the Gating column must be able to find out why it is a no without
+    # opening another file, or the exclusion is effectively invisible.
+    overrides = probe_overrides_from_json(baseline.get("tolerances", {}))
+    if overrides:
+        lines += ["", "### Cells excluded from the gating family by probe override", ""]
+        for probe in sorted(overrides):
+            for metric in sorted(overrides[probe]):
+                override = overrides[probe][metric]
+                lines.append(
+                    f"- `{probe}`.{metric} — {override.rationale} "
+                    f"(observed spread {override.observed_spread:,.0f} over "
+                    f"{override.observed_runs} runs, {override.measured_on}; {override.issue})"
+                )
     return "\n".join(lines) + "\n"
 
 
@@ -909,6 +1579,23 @@ def cmd_measure(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_classify(args: argparse.Namespace) -> int:
+    perry = Path(args.perry).resolve()
+    if not perry.exists():
+        raise RatchetError(f"perry binary not found at {perry}")
+    payload = classify(
+        perry=perry,
+        probes_dir=Path(args.probes_dir).resolve(),
+        repeats=args.repeats,
+        warmup=args.warmup,
+    )
+    if args.output:
+        _write(Path(args.output), payload)
+        print(f"gc-ratchet: wrote classification to {args.output}")
+    print(render_classification(payload))
+    return 0
+
+
 def cmd_assemble(args: argparse.Namespace) -> int:
     artifact = assemble(
         measurement=_load(Path(args.measurement)),
@@ -960,8 +1647,48 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
-    validate_artifact(_load(Path(args.artifact)))
-    print(f"gc-ratchet: {args.artifact} is a valid pinned baseline")
+    """Report artifact defects, at a scope the caller chooses.
+
+    ``--scope all`` (the default, and what a maintainer wants) fails on any
+    defect. ``--scope structural`` fails only on defects that void the whole
+    artifact, and is what the CI preflight uses.
+
+    The distinction is the #7554 repair. Preflight runs BEFORE the measurement
+    step, so anything it fails on costs the entire run's coverage — twelve
+    probes that never execute. That price is right for "this artifact is
+    unreadable or tampered with" and wrong for "one of its 144 cells is not
+    bit-identical". Under ``structural`` the latter is printed loudly and passed
+    over, and ``check`` then fails on it *after* the probes have run.
+
+    This is not a hole: ``check`` re-derives the same defect list and reports
+    every one of them as a failure, so nothing ``structural`` waves through can
+    reach a green job. ``test_structural_preflight_defers_every_defect_it_waves_through``
+    asserts exactly that coupling, one planted defect at a time — without it,
+    this flag would be indistinguishable from suppression.
+    """
+    artifact = _load(Path(args.artifact))
+    defects = inspect_artifact(artifact)
+    fatal = [defect for defect in defects if defect.fatal]
+    unfit = [defect for defect in defects if not defect.fatal]
+
+    for defect in unfit:
+        print(f"gc-ratchet: {defect.describe()}", file=sys.stderr)
+    if fatal:
+        raise RatchetError("; ".join(defect.message for defect in fatal))
+    if unfit and args.scope == "all":
+        print(
+            f"gc-ratchet: {args.artifact} has {len(unfit)} unfit cell(s); "
+            "re-pin them or record a probe_overrides entry",
+            file=sys.stderr,
+        )
+        return 1
+    if unfit:
+        print(
+            f"gc-ratchet: {len(unfit)} unfit cell(s) deferred to `check` "
+            "(--scope structural); they will fail the job there, after the probes run",
+            file=sys.stderr,
+        )
+    print(f"gc-ratchet: {args.artifact} is structurally valid")
     return 0
 
 
@@ -977,6 +1704,17 @@ def build_parser() -> argparse.ArgumentParser:
     measure_cmd.add_argument("--node", default=None)
     measure_cmd.add_argument("--output", required=True)
     measure_cmd.set_defaults(func=cmd_measure)
+
+    classify_cmd = sub.add_parser(
+        "classify",
+        help="split each probe's retention into real retention and false-root residue",
+    )
+    classify_cmd.add_argument("--perry", required=True)
+    classify_cmd.add_argument("--probes-dir", default=str(PROBES_DIR))
+    classify_cmd.add_argument("--repeats", type=int, default=3)
+    classify_cmd.add_argument("--warmup", type=int, default=1)
+    classify_cmd.add_argument("--output", default=None)
+    classify_cmd.set_defaults(func=cmd_classify)
 
     assemble_cmd = sub.add_parser("assemble", help="build the pinned baseline artifact")
     assemble_cmd.add_argument("--measurement", required=True)
@@ -997,6 +1735,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     validate_cmd = sub.add_parser("validate", help="structural check of the pinned artifact")
     validate_cmd.add_argument("--artifact", default=str(DEFAULT_ARTIFACT))
+    validate_cmd.add_argument(
+        "--scope",
+        choices=("all", "structural"),
+        default="all",
+        help=(
+            "'all' fails on any artifact defect (default; what a maintainer wants). "
+            "'structural' fails only on defects that void the whole artifact, leaving "
+            "per-cell defects for `check` to report after the probes have run — so one "
+            "unfit cell cannot zero the gate's coverage (#7554)."
+        ),
+    )
     validate_cmd.set_defaults(func=cmd_validate)
 
     return parser

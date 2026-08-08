@@ -176,6 +176,11 @@ pub(super) fn gc_collect_minor_with_trigger(trigger: GcTriggerSnapshot) -> GcCol
         prev & GC_FLAG_IN_ALLOC
     });
     if copied_minor_promotion_handoff_due(trigger.kind) {
+        // #7592: latch before running it. This full is non-moving and promotes
+        // nothing, so it cannot relieve the survivor pressure that scheduled
+        // it; without the latch the predicate is still true at the next minor
+        // and the collector livelocks on fulls that free nothing.
+        note_survivor_promotion_handoff_full();
         let outcome = gc_collect_full_mark_sweep_with_trigger(GcTriggerSnapshot::capture(
             GcTriggerKind::SurvivorPromotionBytes,
         ));
@@ -648,6 +653,14 @@ pub fn gc_init() {
     gc_register_mutable_root_scanner(crate::dgram_reactor::scan_roots_mut);
     gc_register_mutable_root_scanner(json_parse_mutable_root_scanner);
     gc_register_mutable_root_scanner(intern_table_mutable_root_scanner);
+    // #7564: the per-thread `{ value, done }` / `{ done, value }` keys arrays
+    // shared by every iterator result the runtime builds. Nothing else in the
+    // heap references them — the result objects that use them are short-lived
+    // while the cache outlives them — so without this scanner they would be
+    // swept and the next `.next()` would install a freed keys array. It also
+    // REWRITES: an evacuating collection moves them like any other array, and
+    // the thread-local slot is the only place the new address can be recorded.
+    gc_register_mutable_root_scanner(crate::iter_result::scan_iter_result_keys_roots_mut);
     gc_register_mutable_root_scanner(small_int_cache_mutable_root_scanner);
     gc_register_mutable_root_scanner(crate::builtins::scan_console_log_singleton_roots_mut);
     gc_register_mutable_root_scanner(crate::builtins::scan_boxed_primitive_payload_roots_mut);
@@ -817,15 +830,16 @@ pub extern "C" fn js_gc_init() {
     gc_init();
 }
 
-/// Release external Map/Set storage owned by the current thread.
+/// Release external Map/Set/JSON-tape storage owned by the current thread.
 ///
 /// This is intentionally narrower than a general heap teardown: the arena
-/// headers remain owned by the arena, while the collection registries own the
-/// separately allocated buffers. The operation is idempotent and is called
+/// headers remain owned by the arena, while the side-allocation registries own
+/// the separately allocated buffers. The operation is idempotent and is called
 /// only once no more JavaScript work can run on this thread.
 #[no_mangle]
 pub extern "C" fn js_gc_release_current_thread_collection_side_allocations() {
     crate::map::release_current_thread_map_side_allocations();
+    crate::json_tape_store::release_current_thread_lazy_tapes();
     crate::set::release_current_thread_set_side_allocations();
 }
 
@@ -901,6 +915,33 @@ pub extern "C" fn js_gc_pause_stats(
             }
         }
     });
+}
+
+/// Stamp a freshly built, runtime-owned keys array as copy-on-write shared.
+///
+/// The `*mut GcHeader` cast lives HERE, in `gc/`, rather than at the call site.
+/// `scripts/addr_class_inventory.py` refuses a bare `as *mut GcHeader` outside
+/// `gc/` and `value/addr_class.rs`, and every one of the ~126 grandfathered
+/// entries in `scripts/addr_class_allowlist.txt` carries the same promise —
+/// "migrate to a helper in a follow-up". This is that helper for the one thing
+/// those call sites actually do: set a flag.
+///
+/// `addr_class::try_read_gc_header` cannot serve them, and that is not an
+/// oversight — it returns `&'static GcHeader`, a SHARED reference, precisely so
+/// that a probe of an untrusted address can never write through it. A flag
+/// write needs `*mut`, so it needs a separate, narrower entry point with a
+/// stronger precondition, which is what this is.
+///
+/// # Safety
+/// `user_ptr` must be the user pointer of a live GC object this thread has just
+/// allocated — never an address decoded from a NaN-box payload. That is the
+/// same discipline the arena walkers are allowlisted under: an address obtained
+/// from allocation or block iteration cannot be in the handle band, so there is
+/// nothing for `try_read_gc_header`'s band check to reject.
+#[inline]
+pub(crate) unsafe fn mark_shape_shared(user_ptr: *mut u8) {
+    let header = layout::header_from_user_ptr(user_ptr);
+    (*header).gc_flags |= GC_FLAG_SHAPE_SHARED;
 }
 
 #[cfg(test)]

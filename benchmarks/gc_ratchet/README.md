@@ -190,6 +190,144 @@ collector, not a score. A collector that suddenly copies fewer objects has
 changed — plausibly because objects are now pinned — and must be re-pinned
 deliberately rather than silently congratulated.
 
+## Taking one cell out of the gating family (`probe_overrides`)
+
+`tolerances.json` is keyed per metric per profile. That is the right
+granularity for a *band*, which expresses a machine class's noise floor. It is
+the wrong granularity for "can this metric carry a gate at all on this
+workload", which is a property of the workload — and the two were conflated
+until #7554.
+
+The symptom: `12_large_live_set` retention stopped being bit-identical, the
+pinned artifact recorded a non-zero spread, and the assertion that refuses to
+gate a metric on a spread it cannot support fired — **in the CI step that runs
+before the measurement step**, so all twelve probes stopped running on every
+branch for two days. The prescribed fix, "take this metric out of the gating
+family for this probe", could not be expressed: the only lever turned
+`heap_used_bytes` gating off for all twelve.
+
+So `tolerances.json` has a `probe_overrides` section:
+
+```json
+"probe_overrides": {
+  "12_large_live_set": {
+    "heap_used_bytes": {
+      "gating": false,
+      "rationale": "NOT GATED ON THIS PROBE. …why…",
+      "evidence": {
+        "observed_runs": 21,
+        "observed_spread": 4536,
+        "measured_on": "…host, commit, build…",
+        "issue": "https://github.com/PerryTS/perry/issues/7554"
+      }
+    }
+  }
+}
+```
+
+Deliberate properties, each of them a refusal:
+
+- **It may only set `gating` to `false`.** An override exists to remove a cell
+  from a gating family. Putting one back is the profile's job, where a reader
+  looking for what is gated will find it.
+- **It never touches the band.** An excluded cell is still measured, still
+  compared, and still printed — a breach shows as `drift (informational)`
+  rather than vanishing. `check` also prints every override with its reason
+  under the table, so a `no` in the Gating column can be explained without
+  opening another file.
+- **The evidence is checked, not merely stored.** At least 21 runs — the same
+  number every band in the file is justified by — and a spread that is
+  actually non-zero. You cannot exclude a metric you have not shown is
+  ungateable.
+- **An override that matches no probe fails**, the same rule
+  `scripts/gc_root_dominance_allowlist.json` carries. Fixing the
+  non-determinism means deleting the entry, not leaving it to outlive its
+  reason.
+- **Overriding every probe for a metric fails.** Assembled one cell at a time,
+  that is a profile-level `"gating": false` with nowhere to read the reason.
+
+The bit-identity rule itself now lives in `validate_artifact`, so an artifact
+carrying a non-deterministic gating cell cannot be *pinned*. Before #7554 the
+rule existed only in `tests/test_gc_ratchet.py`, which is why a bad pin could
+be committed and only wedge CI afterwards.
+
+`heap_total_bytes`, `minor_cycles`, `copied_objects`, `promoted_bytes` and
+`freed_bytes` on `12_large_live_set` all remain gating, so a real over-retention
+regression on that probe still goes red.
+
+### What that probe's non-determinism actually is
+
+Worth knowing, because it is a property of the *metric* rather than of the
+collector's steady state. Every probe reads `process.memoryUsage()` after an
+explicit `gc()`, and an explicit `gc()` runs a full mark-sweep with a **forced
+conservative stack scan** — `PERRY_GC_DIAG` prints `[gc-scan-fallback]
+site=manual_collect automatic=false` on every run. A conservative scan retains
+whatever the native stack happens to look like a pointer to, and the stack
+residue at that moment differs between runs.
+
+Diffing two full traces that disagree shows this directly: the minors, the
+tenuring decisions, the step cycles and every copy/promote counter match
+exactly, and the only difference is in the *last* collection's `freed_bytes`.
+And with `PERRY_CONSERVATIVE_STACK_SCAN=off` the probe reports **51,668,688
+bytes on 8 consecutive runs, bit-identical**.
+
+Two things follow. The variance is entirely false roots, so it is bounded by
+how much a handful of stale stack words can pin — a few kilobytes here. And
+the conservative scan is retaining **8.28 MB, 16% of this probe's reported
+retention**, systematically. The eleven small probes stay bit-identical because
+their live sets are one to two orders of magnitude smaller, so a stale stack
+word is far less likely to alias a plausible heap address at all.
+
+### The measurement must show the collector ran
+
+`check` fails a probe whose current run reports `minor_cycles == 0` or
+`copied_objects == 0` where the baseline reports more, rather than leaving that
+to the tolerance arithmetic. The arithmetic could not catch it: six probes pin
+`minor_cycles` at 1 and the allowance floor is also 1, so a collapse from 1 to 0
+is `delta == -allowance` and scored `ok`. The largest regression this ratchet
+exists to catch — a collector that stops running copying minors — was being
+reported as passing.
+
+## A defect in the artifact costs one cell, not the whole gate (#7554)
+
+Artifact validation used to abort on the first problem it found, and it runs
+*before* the measurement step. So one cell — `12_large_live_set.heap_used_bytes`,
+spread 6,768 bytes — meant none of the twelve probes executed on any branch for
+three days. Two GC pacing changes (#7594, #7596) merged inside that window and
+each had to hand-run a both-arms A/B in place of the gate. The claim that caused
+it was about **one cell**; nothing about it voided the other 143 or made the
+probes unrunnable.
+
+Defects now carry a scope, and the scope is the blast radius:
+
+| scope | examples | what it voids |
+|---|---|---|
+| `artifact` | wrong schema, missing metric, a summary that disagrees with its own samples | everything — still fatal, still in preflight |
+| `probe` | pinned without an oracle diff, pinned with no collection | that probe's rows |
+| `cell` | spread ≠ 0 on a metric whose band's premise is bit-identity | that one cell |
+
+A `probe`- or `cell`-scoped defect **demotes** its subject out of the gating
+family for the run and is reported as a failure. So `check` still measures all
+twelve probes, still evaluates the other cells, and still names a regression
+elsewhere in the matrix — while the defect itself keeps the job red. Fail-open
+per cell, fail-closed on the verdict.
+
+The CI preflight runs `validate --scope structural`, which fails only on the
+fatal kind. That is not a hole: `check` re-derives the same defect list and fails
+on every entry, and
+`tests/test_gc_ratchet.py::FailOpenPerCellTests::test_structural_preflight_defers_every_defect_it_waves_through`
+asserts that coupling one planted defect shape at a time. Without it the flag
+would be indistinguishable from suppression.
+
+`assemble` is deliberately *not* fail-open: pinning refuses any defect outright,
+so a maintainer cannot freeze an unfit artifact. The lenient path exists only for
+an artifact already in the tree, where the alternative is measuring nothing.
+
+```bash
+python3 benchmarks/gc_ratchet/gc_ratchet.py validate               # strict: any defect fails
+python3 benchmarks/gc_ratchet/gc_ratchet.py validate --scope structural   # what CI preflight runs
+```
+
 ## Running it
 
 Checking on the pinned quiet host, with memory and time gated:
@@ -216,15 +354,80 @@ python3 benchmarks/gc_ratchet/gc_ratchet.py measure \
 python3 benchmarks/gc_ratchet/gc_ratchet.py check --current /tmp/current.json
 ```
 
+## What `heap_used_bytes` actually contains (#7559)
+
+**A retention row is not evidence of a collector regression until it has been
+classified.** Two properties of the measurement point make this metric move for
+reasons that have nothing to do with what the collector retained:
+
+1. **The measurement forces the conservative native-stack scan.** Every probe
+   reads `process.memoryUsage()` immediately after an explicit `gc()`, and an
+   explicit `gc()` is the one site in Perry that forces that scan
+   (`ManualGcScanGuard`, #4977 — the production default is `Auto`, which skips
+   it). So the reading is taken under a root set nothing else in the language
+   uses, and it includes whatever the native stack happened to look like a heap
+   pointer to at that instant.
+2. **`js_arena_stats` sums block *offsets*, not live bytes.** A block's
+   bump pointer never moves backwards, and a block holding one marked object
+   cannot be reset — so a single stale stack word costs a whole **1 MiB nursery
+   block**, an amplification of roughly 26,000x. (This is the nursery's version
+   of the old-generation accounting bug #7437/#7443 fixed by subtracting swept
+   holes.)
+
+Measured across the 74 commits between the 2026-08-05 pin (`5e236e6e2`) and
+v0.5.1321, both endpoints built identically and both reproducing the pinned
+artifact byte-for-byte on all twelve probes:
+
+| | probes moved | direction |
+|---|---|---|
+| `heap_used_bytes` (what the gate compares) | **5 of 12**, always by whole blocks | 3 down, 2 up |
+| retention with the scan off (what the collector kept) | **2 of 12** | both **down** |
+
+`05_closure_capture`'s `+16.44%` breach is the extreme case: its precise
+retention was **5,329,880 bytes at both endpoints, to the byte**, while its
+false-root residue went from one 1 MiB block to two. `02_survivor_promotion`'s
+`+2.77%` is the same shape one survivor block down (256 KiB), and its precise
+retention *fell* by 1,600 bytes. Neither is a collector regression.
+
+The probe's own live set is not what is being reported either: sweeping
+`05_closure_capture`'s `BATCHES` from 690 to 710 — a workload whose live set is
+approximately zero at the measurement point for every value — moves
+`heap_used_bytes` between 6,501,264 and 7,426,960 in a 1 MiB sawtooth, because
+what is left over is the un-reset tail blocks' bump pointers.
+
+### `classify` — split residue from retention in one command
+
+```bash
+PERRY_RUNTIME_DIR=$PWD/target/release PERRY_NO_AUTO_OPTIMIZE=1 \
+python3 benchmarks/gc_ratchet/gc_ratchet.py classify --perry target/release/perry
+```
+
+It runs every probe twice — once as the gate does, once with
+`PERRY_CONSERVATIVE_STACK_SCAN=off` — and prints the split, plus the census of
+which conservative-scan sites actually fired. It refuses to tabulate a probe
+whose *output* changes when the scan is disabled (the scan was load-bearing for
+that probe's correctness, so its precise number is not evidence), and it refuses
+to report a precise reading that is not bit-identical across repeats. The
+conservative reading is allowed to vary and its spread is reported instead —
+that spread on `12_large_live_set` is why #7554 had to stop gating the cell.
+
+A row whose `excess` moved and whose `precise` did not is a false-root artifact.
+A row whose `precise` moved is a real retention change and the rest of this
+document applies to it.
+
 ## When the gate goes red
 
 1. **Read the table.** The failing rows name the probe and the metric. Retention
    up means something is being kept alive that used to be collected.
    `copied_objects` down means objects that used to be evacuated no longer are.
    `freed_bytes` down means the same allocation sequence reclaimed less.
-2. **Reproduce locally** with the ad-hoc commands above. Retention and GC
+2. **Classify a retention row before believing it** — `gc_ratchet.py classify`,
+   above. This step is not optional: #7559 was a `+16.44%` retention breach with
+   every collector counter at `+0.00%`, and the answer was that nothing was
+   retained that had not been retained before.
+3. **Reproduce locally** with the ad-hoc commands above. Retention and GC
    counters do not need a quiet box — they are load-independent.
-3. **Fix it, or accept it.** If the shift is intentional and reviewed, re-pin:
+4. **Fix it, or accept it.** If the shift is intentional and reviewed, re-pin:
 
    ```bash
    PERRY_BIN=... PERRY_RUNTIME_DIR=... \
@@ -250,7 +453,7 @@ must trigger at least one minor collection or the harness refuses to pin it.
 | Path | Purpose |
 |---|---|
 | `probes/*.ts` | the workloads |
-| `gc_ratchet.py` | measure / assemble / check / validate |
+| `gc_ratchet.py` | measure / classify / assemble / check / validate |
 | `tolerances.json` | every band, with the variance it was derived from |
 | `baseline/gc-ratchet-v1.json` | the pinned artifact |
 | `run_gc_ratchet_baseline.sh` | quiet-host driver (`--check` / `--pin`) |

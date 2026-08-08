@@ -122,8 +122,9 @@ pub(crate) use write_barrier::{
     emit_jsvalue_slot_store_pointer_tested, emit_jsvalue_slot_store_scalar_aware_on_block,
     emit_jsvalue_slot_store_with_flags_on_block, emit_jsvalue_slot_store_with_value_bits_on_block,
     emit_root_heap_word_store_on_block, emit_root_nanbox_store_on_block, emit_write_barrier,
-    emit_write_barrier_slot_on_block, lower_array_super_init, lower_event_emitter_subclass_init,
-    lower_node_stream_super_init, lower_stream_super_init,
+    emit_write_barrier_slot_generation_tested, emit_write_barrier_slot_on_block,
+    lower_array_super_init, lower_event_emitter_subclass_init, lower_node_stream_super_init,
+    lower_stream_super_init,
 };
 
 // Issue #1098 phase 3: the `FnCtx` definition stays in this trunk, but its
@@ -229,6 +230,26 @@ pub(crate) struct FnCtx<'a> {
     /// True while lowering an expression statement whose resulting JS value
     /// will be discarded.
     pub discard_expr_value: bool,
+
+    /// #7590: is the expression **currently being dispatched** one whose value
+    /// is discarded — as opposed to [`Self::discard_expr_value`], which says
+    /// only that the enclosing STATEMENT's value is discarded?
+    ///
+    /// The two are not the same, and reading the wrong one is a silent
+    /// wrong-value bug. `discard_expr_value` is set once per `Stmt::Expr` and
+    /// is never cleared as `lower_expr` recurses, so it is still set while
+    /// lowering the operands of `sink(buf[0] = 5);` — where the store's value
+    /// is very much consumed. Four sites read it as if it meant this field and
+    /// returned `0.0`, making a typed-array store used as an expression
+    /// evaluate to `0` instead of the assigned value (ES2024 §13.15.2).
+    ///
+    /// This one is **taken** (`mem::take`) at the top of
+    /// [`dispatch::lower_expr`], so it reaches exactly one expression — the one
+    /// the statement is made of — and every operand lowered beneath it reads
+    /// `false`. Handlers that need it receive it as a parameter rather than
+    /// reading the field, because they consult it *after* lowering their
+    /// operands, by which point the field has been taken again.
+    pub discard_this_expr: bool,
     /// HIR FuncId → LLVM function name. Resolved at the top of
     /// `compile_module` so `FuncRef(id)` calls know what to emit.
     pub func_names: &'a std::collections::HashMap<u32, String>,
@@ -797,6 +818,15 @@ pub(crate) struct FnCtx<'a> {
     /// slow clone's preheader BEFORE committing any side effect of the
     /// current iteration.
     pub class_field_loop_facts: Vec<ClassFieldLoopFact>,
+
+    /// repsel #7480 / #5093: scoped loop-versioning facts for element-shape
+    /// loops (`for (…) sum += arr[i].field`). Pushed only around the FAST
+    /// clone of `lower_element_shape_versioned_for`
+    /// (`stmt/element_shape_loop.rs`). Inside that clone `arr[i].field`
+    /// lowers to a bare element load plus a small residual per-element check
+    /// with a single side exit — no element-read tier, no guard call, no
+    /// per-access volatile gate load.
+    pub element_shape_loop_facts: Vec<ElementShapeLoopFact>,
 
     /// Parallel i32 counter slots for integer loop counters that are
     /// used as bounded array indices. When a for-loop counter is in
@@ -1531,6 +1561,69 @@ pub(crate) struct ClassFieldLoopFact {
     pub fields: std::collections::BTreeMap<String, u32>,
 }
 
+/// #5093 / repsel #7480: one fact per (array, counter, versioned loop) — the
+/// element-shape clone's licence to read `arr[i].field` with no guard.
+///
+/// Pushed only around the FAST clone of `lower_element_shape_versioned_for`
+/// (`stmt/element_shape_loop.rs`). See that module for the full safety
+/// argument; the short version is that the preheader proved
+///
+/// * `arr` is a genuine `GC_TYPE_ARRAY` (never an `Array` subclass, which is
+///   a plain `ObjectHeader` — #7573/#7603),
+/// * the runtime's homogeneous element-shape invariant holds for `arr` at
+///   exactly `class_name`'s class id (`js_array_ensure_element_shape`),
+/// * the verified prefix covers every index the loop reads,
+///
+/// and the lowering proved the fast clone is call-free, so nothing can revoke
+/// the invariant or move the array while the clone runs.
+#[derive(Debug, Clone)]
+pub(crate) struct ElementShapeLoopFact {
+    /// LocalId of the loop-invariant array the preheader guarded.
+    pub array_local_id: u32,
+    /// LocalId of the loop counter used as the element index.
+    pub index_local_id: u32,
+    pub scope_id: u32,
+    /// Class the preheader proved every element in the verified prefix has.
+    pub class_name: String,
+    /// SSA name of the elements base pointer (`arr_handle + 8`), derived in
+    /// the preheader AFTER the guard call, so it cannot be a pre-move address.
+    pub elements_base: String,
+    /// SSA name of the hoisted `@perry_class_keys_<class>` load.
+    pub expected_keys: String,
+    /// Slow clone's preheader label. The per-element residual check (see
+    /// `expr::element_shape_guard`) branches here on a miss; the slow clone
+    /// re-executes the current iteration, which is safe because the matcher
+    /// admits no body that commits an effect before the read.
+    pub side_exit_label: String,
+    /// property name -> packed slot index, every entry a declared raw-f64
+    /// candidate validated by the matcher.
+    pub fields: std::collections::BTreeMap<String, u32>,
+    /// Largest packed slot index the loop touches — the per-element
+    /// `field_count` check covers every tracked access with one compare.
+    pub max_field_index: u32,
+}
+
+/// Find the innermost active element-shape loop fact covering
+/// `(array_local_id, index_local_id, class_name, property)`. Returns the fact
+/// and the packed slot index of the field.
+pub(crate) fn element_shape_loop_fact_lookup<'f>(
+    facts: &'f [ElementShapeLoopFact],
+    array_local_id: u32,
+    index_local_id: u32,
+    class_name: &str,
+    property: &str,
+) -> Option<(&'f ElementShapeLoopFact, u32)> {
+    facts.iter().rev().find_map(|fact| {
+        if fact.array_local_id != array_local_id
+            || fact.index_local_id != index_local_id
+            || fact.class_name != class_name
+        {
+            return None;
+        }
+        fact.fields.get(property).map(|idx| (fact, *idx))
+    })
+}
+
 /// Find the innermost active class-field loop fact covering
 /// `(recv_local_id, class_name, property)`. Returns the fact and the packed
 /// slot index of the field.
@@ -1760,6 +1853,7 @@ mod index_set_typed_array;
 mod instance_misc1;
 pub(crate) use instance_misc1::builtin_parent_reserved_class_id;
 pub(crate) mod class_field_inline_guard;
+pub(crate) mod element_shape_guard;
 mod js_runtime;
 mod literals_vars;
 mod logical_collections;

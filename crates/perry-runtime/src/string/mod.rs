@@ -280,6 +280,18 @@ pub(crate) fn materialize_dispatch_key(key: PerryStringRef) -> *const StringHead
     }
 }
 
+/// Intern a short ASCII literal into the current thread's intern table.
+///
+/// Allocates only on the first call per thread per content; afterwards it is a
+/// hash probe returning the canonical pointer, which the intern table's root
+/// scanner already keeps marked and rewritten. Used for runtime-owned constant
+/// property names (`"value"` / `"done"` — see [`crate::iter_result`]) so they
+/// are pointer-identical to the same literals elsewhere in the program.
+#[inline]
+pub(crate) fn intern_ascii_literal(bytes: &[u8]) -> *const StringHeader {
+    intern::intern_dispatch_bytes(0, bytes.as_ptr(), bytes.len(), 0, false)
+}
+
 /// Header for heap-allocated strings
 ///
 /// `utf16_len` is at offset 0 so codegen can inline `.length` as a single i32 load.
@@ -305,6 +317,29 @@ pub struct StringHeader {
     /// Bit flags: STRING_FLAG_HAS_LONE_SURROGATES = 1
     pub flags: u32,
 }
+
+/// ABI pin for the codegen-side inline string fast paths.
+///
+/// `perry-codegen` emits raw loads at these offsets instead of calling into
+/// the runtime — `expr/property_get.rs` reads `utf16_len` for the inline
+/// `.length`, and `lower_string_method.rs`'s inline `charCodeAt` (#7592)
+/// additionally reads `byte_len` (for the runtime's own
+/// `is_ascii_string` predicate, `utf16_len == byte_len`) and the payload at
+/// `size_of::<StringHeader>()`.
+///
+/// `perry-codegen` does not depend on `perry-runtime`, so the two sides
+/// cannot share a constant. This assertion is the link: reordering, resizing,
+/// or padding this struct fails the runtime BUILD here, at the definition,
+/// rather than silently miscompiling every `.length` and `charCodeAt` in
+/// every user program. The literals are duplicated in
+/// `lower_string_method.rs`'s `STRING_HEADER_*` constants, which name this
+/// item.
+const STRING_HEADER_ABI_MATCHES_CODEGEN: () = {
+    assert!(std::mem::size_of::<StringHeader>() == 20);
+    assert!(std::mem::offset_of!(StringHeader, utf16_len) == 0);
+    assert!(std::mem::offset_of!(StringHeader, byte_len) == 4);
+};
+const _: () = STRING_HEADER_ABI_MATCHES_CODEGEN;
 
 // ── UTF-8 ↔ UTF-16 conversion helpers ──────────────────────────────────
 

@@ -1310,3 +1310,117 @@ fn global_builtin_constructor_values_are_not_redispatched_by_name() {
         "#7518: EventTarget must keep its spec `.length`"
     );
 }
+
+/// #7548: the array branches of `Object.*` reinterpreted the caller's
+/// `ObjectHeader` pointer as an `ArrayHeader` with a bare cast. When a JS
+/// binding still holds an array's PRE-GROW address, that pointer is a #233
+/// forwarding stub whose first 8 bytes — exactly `length` and `capacity` —
+/// have been overwritten with the forwarding POINTER, so `(*arr).length` read
+/// back a heap address (~6·10^8 in the wild) instead of the real length.
+///
+/// Two loops are driven by that value and became bounded-but-unreachable
+/// walks — one `to_string()` plus a side-table probe per index, hundreds of
+/// millions of iterations, which presents as a hang:
+///   * `mark_all_array_props`          — `Object.freeze` / `Object.seal`.
+///   * `array_set_length_from_descriptor` — ArraySetLength's shrink walk, the
+///     `Set(receiver, "length", …)` tail of a Proxy-receiver `splice` that grows.
+///
+/// The header read is asserted FIRST and directly: a regression must fail fast
+/// here rather than hang the suite in one of the walks below.
+#[test]
+fn stale_pre_grow_array_pointer_reads_the_real_length_in_object_ops() {
+    let mut arr = crate::array::js_array_alloc(0);
+    let stale = arr;
+    let capacity = unsafe { (*arr).capacity };
+    for i in 0..capacity {
+        arr = crate::array::js_array_push_f64(arr, i as f64);
+    }
+    // One more push exceeds the dense capacity: the array is reallocated and a
+    // forwarding stub is left behind at `stale`.
+    let grown = crate::array::js_array_push_f64(arr, capacity as f64);
+    assert_ne!(
+        grown as usize, stale as usize,
+        "pushing past capacity must reallocate — otherwise no stub exists and \
+         this test proves nothing"
+    );
+    let real_len = crate::array::js_array_length(grown);
+    assert_eq!(real_len, capacity + 1);
+
+    // Non-vacuity: the stub's payload must really be clobbered, or the bare
+    // cast below would have been harmless all along.
+    let raw_len = unsafe { (*(stale as *const crate::array::ArrayHeader)).length };
+    assert_ne!(
+        raw_len, real_len,
+        "the forwarding stub's length word must be clobbered for this test to \
+         exercise #7548"
+    );
+
+    // The fix: resolve the chain before reading the header.
+    let resolved = unsafe { super::array_object_ops::array_header(stale as *const ObjectHeader) };
+    assert_eq!(
+        unsafe { (*resolved).length },
+        real_len,
+        "#7548: a stale pre-grow array pointer must resolve to the array's \
+         current home before its length is read"
+    );
+
+    // `Object.freeze`'s index walk now terminates at the real length: it must
+    // record attrs for every real index and none beyond it.
+    unsafe {
+        super::array_object_ops::mark_all_array_props(stale as *mut ObjectHeader, true, true);
+    }
+    let addr = stale as usize;
+    assert!(
+        crate::object::get_property_attrs(addr, &(real_len - 1).to_string()).is_some(),
+        "the freeze walk must reach the array's last real index"
+    );
+    assert!(
+        crate::object::get_property_attrs(addr, &real_len.to_string()).is_none(),
+        "the freeze walk must not run past the array's real length"
+    );
+}
+
+/// #7563: an ARRAY receiver must never be read back as a class instance.
+///
+/// `ObjectHeader` is `{ object_type: u32, class_id: u32, … }` and `ArrayHeader`
+/// is `{ length: u32, capacity: u32 }`, so the two u32s at offset 4 alias — an
+/// array read as an `ObjectHeader` reports its **capacity** as a `class_id`.
+///
+/// That mattered because `arr[Symbol.iterator]` resolves through
+/// `js_class_method_bind(arr, "values")`, whose receiver→class step used a bare
+/// `(*obj).class_id` read instead of the guarded `js_object_get_class_id`. Any
+/// class whose id equalled the array's capacity and which owned a `values`
+/// method therefore captured the array's iterator. When that class was the
+/// *calling* class — `class C { values() { return [x][Symbol.iterator](); } }`
+/// — `values` re-entered `values` until the stack guard page, i.e. a SIGSEGV
+/// with no `Map` anywhere in the program.
+#[test]
+fn array_receiver_is_never_read_as_a_class_id() {
+    let arr = crate::array::js_array_alloc(3);
+    assert!(!arr.is_null());
+    // Impersonate exactly the class id this array's bytes would have yielded.
+    let impersonated = unsafe { (*arr).capacity };
+    assert_ne!(
+        impersonated, 0,
+        "the test is vacuous unless the capacity is a non-zero (i.e. lookup-able) class id"
+    );
+
+    let arr_value = crate::value::js_nanbox_pointer(arr as i64);
+    assert_eq!(
+        super::native_module::class_id_from_method_receiver(arr_value),
+        None,
+        "an array is not a class instance: its capacity must not be read as a class id"
+    );
+
+    // The guard must not over-narrow. A genuine class instance carrying the
+    // very same id still resolves, so the bound-method identity path (#446)
+    // keeps working.
+    let obj = js_object_alloc(impersonated, 0);
+    assert!(!obj.is_null());
+    let obj_value = crate::value::js_nanbox_pointer(obj as i64);
+    assert_eq!(
+        super::native_module::class_id_from_method_receiver(obj_value),
+        Some(impersonated),
+        "a real class instance must still resolve to its class id"
+    );
+}
