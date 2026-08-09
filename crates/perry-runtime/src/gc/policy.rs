@@ -105,12 +105,46 @@ pub(super) fn next_arena_trigger_base() -> usize {
 /// (near-zero infant mortality), a saturated survivor space, and 1427
 /// collections for a run that allocates ~1.4 GB.
 pub(super) fn young_scavenge_cap_due() -> bool {
-    #[cfg(test)]
-    if GC_NURSERY_CAP_TEST_SUPPRESSED.with(Cell::get) {
+    if !nursery_cap_active() {
         return false;
     }
     crate::arena::copying_from_space_in_use_bytes()
         >= super::tenuring::scavenge_nursery_cap_effective_bytes()
+}
+
+/// Is the scavenge nursery cap in force?
+///
+/// **Only when the collection it schedules can EVACUATE**, which for nursery
+/// pressure means only when `gc_moving_loop_polls_enabled()` routes it to a
+/// precise-root safepoint. #7056's own 2x2 says the cap and the evacuating
+/// minor "ship together, because either alone is a bad trade"; this is that
+/// sentence made load-bearing rather than advisory, and #7682 is the bill for
+/// its being advisory.
+///
+/// The cap's basis is `copying_from_space_in_use_bytes()`, and **a non-moving
+/// minor does not reduce it** — it sweeps in place into per-block free lists
+/// and from-space stays occupied. So a capped trigger that fires a non-moving
+/// minor is due again the instant the next block is taken: one whole-arena
+/// collection per 1 MB allocated, O(n^2) in the live set. That is not the
+/// "+23% wall for -33% RSS" the cap-only cell of the 2x2 measured (every
+/// collection there still evacuated) — measured on the quiet host after #7682
+/// forced the alloc-point minor non-moving, `test_gap_gc_index_get_receiver_rooting`
+/// went 0.66 s -> 6.6 s, and with the cap lifted it runs in 0.13 s. It is the
+/// same livelock shape as #7592, whose fix was likewise to key a band on
+/// something a collection actually moves.
+///
+/// So this restores the pre-#7056 gating, deliberately and with a different
+/// argument than #7056 removed it under. #7056 decoupled the cap because both
+/// gates were off in shipped builds and the cap was therefore dead — a fair
+/// reading of a world in which the alloc-point minor evacuated. It no longer
+/// does. When `PERRY_GC_MOVING_LOOP_POLLS` goes default-ON again the cap comes
+/// back with it, automatically and in the configuration it was measured in.
+fn nursery_cap_active() -> bool {
+    #[cfg(test)]
+    if GC_NURSERY_CAP_TEST_SUPPRESSED.with(Cell::get) {
+        return false;
+    }
+    gc_moving_loop_polls_enabled()
 }
 
 pub(super) fn effective_next_arena_trigger() -> usize {
@@ -123,12 +157,11 @@ pub(super) fn effective_next_arena_trigger() -> usize {
     // the cap instead of ballooning to 128–260 MB between the ~8 collections
     // the adaptive trigger otherwise allows.
     //
-    // APPLIED UNCONDITIONALLY (#7056). This used to be gated behind
-    // `PERRY_GC_SCAVENGE` / `PERRY_GC_MOVING_LOOP_POLLS`, both of which default
-    // OFF — so the cap was never active in a shipped build, and shipped Perry
-    // paid the full adaptive-trigger footprint. #7056 measured that the cap is
-    // the entire RSS win and recommended decoupling it from those gates; this
-    // is that decoupling.
+    // APPLIED WHEN THE COLLECTION IT SCHEDULES CAN EVACUATE — see
+    // [`nursery_cap_active`], which is where that condition and its evidence
+    // live. #7056 applied it unconditionally on the reading that the
+    // alloc-point minor evacuated; since #7682 it does not, and a capped
+    // trigger firing a non-moving minor is a livelock rather than a trade.
     //
     // Re-derived on the statepoint-default collector, 8 gc_ratchet probes,
     // as a full 2x2 rather than a single comparison — because the one-armed
@@ -157,8 +190,7 @@ pub(super) fn effective_next_arena_trigger() -> usize {
     //
     // `PERRY_GC_SCAVENGE_NURSERY_MB` still tunes the value; it is a
     // measurement dial, not an on/off mode, so it needs no kill-policy arm.
-    #[cfg(test)]
-    if GC_NURSERY_CAP_TEST_SUPPRESSED.with(Cell::get) {
+    if !nursery_cap_active() {
         return base;
     }
     // The cap the clamp applies is the *effective* one: the configured base
@@ -442,22 +474,22 @@ pub(crate) fn gc_incremental_enabled() -> bool {
 /// of collecting non-moving mid-expression, so reallocation-heavy loops evacuate
 /// (bounded RSS) instead of leaking.
 ///
-/// **DEFAULT OFF (stopgap for #7154).** This was flipped default-ON in #7019, but
-/// the evacuating minor it makes primary has a use-after-free: a young closure
-/// referenced from a dynamically-added object field (`field[1]`, holders built in
-/// `proxy::create_or_update_receiver_property`) is reclaimed while still live, so
-/// the field dangles and a later call dies with `TypeError: value is not a
-/// function`. This reproduces in the DEFAULT config (no env) — the shipped binary
-/// corrupts the heap. `PERRY_GC_MOVING_LOOP_POLLS=0` is confirmed to eliminate it,
-/// so until #7154 is root-caused we default OFF (restoring the previously-correct
-/// non-moving minor) and keep the moving-loop path behind an explicit
-/// `PERRY_GC_MOVING_LOOP_POLLS=1`/`on`/`true` opt-in. Reverting the default costs
-/// #7019's minor-GC RSS/throughput win but not correctness.
+/// **DEFAULT ON.** The kill switch is `PERRY_GC_MOVING_LOOP_POLLS=0`/`off`/`false`.
+/// See [`moving_loop_polls_enabled_from_env`] for the decision and its evidence;
+/// #7161's stopgap default-OFF (pending #7154) is discharged there.
 ///
 /// MUST match codegen `moving_safepoint_polls_enabled` (same env) so the deferral
 /// and the polls that drain it stay coherent — a runtime default that disagrees
 /// with the codegen default would defer collections that never drain (or drain
-/// collections that were never deferred).
+/// collections that were never deferred). That disagreement is not hypothetical:
+/// it shipped. #7690 wrote the default-ON argument into the doc below and left
+/// both bodies matching `1|on|true`, so the runtime deferred nursery pressure to
+/// a safepoint codegen never emitted. Combined with #7687 (the alloc-point minor
+/// must not move), the shipped collector had NO nursery evacuation at all —
+/// `churn_alloc` ran 13 whole-arena full collections where it had run 105 copying
+/// minors, and `tree` spent 4.1 s of its 5.1 s wall in GC pause. Both predicates
+/// are now pinned by tests, and `polls_default_matches_codegen_mirror` pins that
+/// they agree.
 pub(crate) fn gc_moving_loop_polls_enabled() -> bool {
     // Test-only mode override (see `force_legacy_gc_pacing`). Consulted BEFORE
     // the process-wide OnceLock so a single test can pin a specific pacing mode
@@ -478,12 +510,42 @@ pub(crate) fn gc_moving_loop_polls_enabled() -> bool {
 
 /// Pure env→enable decision for the moving-loop minor, factored out so the
 /// default is unit-testable without touching process env / the cached `OnceLock`.
-/// **Default OFF (#7154 stopgap):** an unset var (or any value other than an
-/// explicit opt-in) selects the non-evacuating minor; only `1`/`on`/`true`
-/// enables the moving-loop path. Codegen's `moving_safepoint_polls_enabled`
-/// mirrors this exactly (same env, same predicate).
+///
+/// **Default ON since #7682.** The kill switch is `0`/`off`/`false`; anything
+/// else, including unset, selects the moving-loop path. Codegen's
+/// `moving_safepoint_polls_enabled` mirrors this exactly (same env, same
+/// predicate) — they MUST agree, or a deferred collection has no drain.
+///
+/// #7161 flipped this OFF as a stopgap, and named both conditions for putting
+/// it back. Both are met:
+///
+///  * **Its correctness reason is closed.** #7161's own title is "pending
+///    #7154"; #7154 closed on 2026-08-01. The class it belongs to now has a
+///    static gate (`gc-root-dominance.yml` over
+///    `scripts/gc_root_dominance_corpus.sh`) whose allowlist is EMPTY, so a new
+///    instance is a red build rather than a field report.
+///  * **Its codegen-quality reason is discharged.** The other half of the
+///    stopgap was that a poll at every back-edge defeats auto-vectorization;
+///    `emit_gc_loop_safepoint` now emits one only where
+///    `loop_purity::loop_may_allocate` says the body can allocate, so
+///    numeric/vectorizable loops stay call-free. A loop that cannot allocate
+///    cannot arm a trigger, so skipping it there is not a coverage hole.
+///
+/// And leaving it off had become the more dangerous state, which is the actual
+/// reason this moves now. Nursery pressure has exactly two precise collection
+/// points — this poll and the outermost microtask-pump boundary — and a
+/// compute-only program reaches neither with polls off. Every nursery
+/// collection therefore happened at the register-imprecise allocation point,
+/// where #7682 showed it must not move. So "polls off" does not mean "collect
+/// later, precisely"; it means "never collect precisely at all".
+///
+/// #7690 wrote every paragraph above and then did not change this line, and
+/// nothing failed — the function was factored out expressly to make the default
+/// "unit-testable without touching process env", and no test ever pinned it in
+/// either direction. `polls_default_is_on` and its codegen mirror exist so that
+/// the next edit to this predicate has to be deliberate.
 pub(crate) fn moving_loop_polls_enabled_from_env(value: Option<&str>) -> bool {
-    matches!(value, Some("1") | Some("on") | Some("true"))
+    !matches!(value, Some("0") | Some("off") | Some("false"))
 }
 
 #[cfg(test)]
@@ -559,6 +621,39 @@ pub(super) fn force_moving_gc_pacing() -> LegacyGcPacingGuard {
         cell.set(Some(true));
         previous
     });
+    let cap_previous = GC_NURSERY_CAP_TEST_SUPPRESSED.with(|cell| cell.replace(false));
+    let scavenge_previous = super::GC_SCAVENGE_TEST_OVERRIDE.with(|cell| cell.replace(Some(true)));
+    LegacyGcPacingGuard {
+        previous,
+        cap_previous,
+        scavenge_previous,
+    }
+}
+
+/// Pin the one pacing combination in which nursery pressure reaches the DIRECT
+/// allocation-point minor: moving-loop polls OFF (so nothing defers) and
+/// scavenge ON (so the arm in `gc_check_trigger` is open at all).
+///
+/// **This is the `PERRY_GC_MOVING_LOOP_POLLS=0` kill-switch configuration, and
+/// it is deliberately NOT called "shipped default" any more.** It *was* the
+/// shipped default — polls OFF since #7161, scavenge ON since #7056 — and it is
+/// the combination #7682 was found in. The follow-up that turned polls back ON
+/// made that name a lie in the same PR that introduced it, which is the kind of
+/// stale claim this whole line of work is about. A test naming this guard is
+/// asserting something about the kill switch; a test that wants the default
+/// must take no pacing guard at all.
+///
+/// The third combination is what needed a guard in the first place.
+/// [`force_legacy_gc_pacing`] pins polls OFF *and* scavenge OFF;
+/// [`force_moving_gc_pacing`] pins both ON. Every test in this crate therefore
+/// declared a pacing mode in which the two flags AGREED — and the
+/// alloc-point/deferral interaction that broke is precisely the one where they
+/// disagree: scavenge routes nursery pressure to the direct alloc-point minor,
+/// while the deferral that was supposed to move that collection to a precise
+/// safepoint is gated on the polls flag.
+#[cfg(test)]
+pub(super) fn force_alloc_point_minor_pacing() -> LegacyGcPacingGuard {
+    let previous = GC_MOVING_LOOP_POLLS_TEST_OVERRIDE.with(|cell| cell.replace(Some(false)));
     let cap_previous = GC_NURSERY_CAP_TEST_SUPPRESSED.with(|cell| cell.replace(false));
     let scavenge_previous = super::GC_SCAVENGE_TEST_OVERRIDE.with(|cell| cell.replace(Some(true)));
     LegacyGcPacingGuard {
@@ -1739,8 +1834,12 @@ pub fn gc_check_trigger() {
     // fall through to the budgeted mutator-assist step below, which is
     // deliberately non-moving (`low_pause_non_moving = is_budgeted()`), so a
     // reallocation-heavy loop's minors free nothing. Route those triggers to the
-    // direct (non-budgeted, atomic) minor here instead so the copying/evacuating
-    // fast path can run (see the `force_full_scan` skip below).
+    // direct (non-budgeted, atomic) minor here instead, so the collection is an
+    // atomic minor that actually reclaims rather than a budgeted step that
+    // does not. It is NOT an evacuating one: since #7682 the guard below is
+    // unconditional, so a collection that happens here is always non-moving.
+    // Scavenge is a PACING knob and nothing more; it used to also skip that
+    // guard, which is the bug.
     // `gc_moving_loop_polls_enabled()`: the SOUND moving-nursery path. When loop
     // polls are on, entering this block routes nursery pressure AWAY from the
     // budgeted non-moving stepper (which would otherwise own it and free nothing
@@ -1748,10 +1847,9 @@ pub fn gc_check_trigger() {
     // GC_SAFEPOINT_PENDING and returns — the collection then runs as an
     // evacuating MOVING minor at the next precise loop back-edge safepoint
     // (`js_gc_loop_safepoint` → `gc_safepoint_moving_minor`), NOT here at the
-    // register-imprecise alloc point. Unlike `gc_scavenge_enabled()` (which skips
-    // the conservative scan HERE — sound only if the alloc point is precise), the
-    // loop-polls path never reaches the skip: it always defers to a real
-    // safepoint.
+    // register-imprecise alloc point. That deferral is the ONLY route by which
+    // nursery pressure becomes a moving collection, and it is why the polls
+    // flag and the scavenge flag are not interchangeable.
     //
     // #7280: that used to read "so it is sound by construction". IT IS NOT, and
     // the overclaim is the kind that stops the next person looking. What
@@ -1822,14 +1920,23 @@ pub fn gc_check_trigger() {
             }
             let pre_in_use = crate::arena::arena_in_use_bytes();
             let pre_malloc_count = malloc_object_count();
-            // PERRY_GC_SCAVENGE (Phase-1 de-risking, OFF by default): skip the
-            // conservative native-stack scan so this direct minor runs with the
-            // PRECISE shadow-stack roots and the copying fast path becomes
-            // eligible (an evacuating scavenge that resets the whole young arena
-            // in O(live)). The default path keeps `force_full_scan` — at an
-            // arbitrary alloc point a value mid-construction may live only in
-            // registers, which the conservative scan retains (and which makes
-            // copied-minor ineligible, so the non-moving minor runs).
+            // THE ALLOC POINT IS REGISTER-IMPRECISE, SO THIS MINOR MUST NOT
+            // MOVE. Unconditional, and the unconditionality is the fix for
+            // #7682.
+            //
+            // Reaching this line means the collection is happening HERE, at an
+            // arbitrary allocation point inside a half-built expression — not
+            // at a declared safepoint. Neither root lowering describes that
+            // point: the shadow stack only names values codegen has already
+            // stored to a slot, and RS4GC only relocates values it can type as
+            // `ptr addrspace(1)`, which a NaN-boxed `double` operand in an SSA
+            // register is not. A value that exists ONLY in a register here is
+            // therefore invisible to both, so an evacuating minor relocates the
+            // object and leaves the register naming the pre-move address. The
+            // conservative native-stack scan is what covers exactly that gap:
+            // it retains such values AND makes the copying minor ineligible
+            // (`CopiedMinorFallbackReason::ConservativeStack`), so the
+            // non-moving in-place minor runs and nothing relocates.
             //
             // ★ #7148 disposition: **keep as the bounded valve, now counted.**
             // The deferral above is the primary path and is sound by
@@ -1842,16 +1949,31 @@ pub fn gc_check_trigger() {
             // reached" is: this arm runs, and it is the reason RSS stays
             // bounded. Making it *imprecise* instead (collecting without the
             // scan) is the one thing #7148 rules out — it would trade a cost
-            // problem for a soundness problem. Making it **countable** is what
-            // turns "unreachable in practice" into a measurement:
-            // `ConservativeScanSite::NurseryChurnSlackValve` is 0 on all eight
-            // ratchet probes and across the stress matrix, and the drain
-            // counter proves the deferral ran instead.
-            let _scan = (!super::gc_scavenge_enabled()).then(|| {
-                super::roots::ManualGcScanGuard::force_full_scan(
-                    super::ConservativeScanSite::NurseryChurnSlackValve,
-                )
-            });
+            // problem for a soundness problem.
+            //
+            // #7682 is that trade, shipped. `PERRY_GC_SCAVENGE` used to gate
+            // this guard off, on the strength of a doc comment claiming the
+            // flag was "OFF by default … for measurement only" and a body
+            // comment saying it also "defers alloc-point collections to a
+            // precise safepoint". Neither held in the shipped configuration:
+            // the flag has been ON by default since #7056, and the deferral
+            // above is gated on `gc_moving_loop_polls_enabled()`, which is OFF
+            // by default since #7161. So the default build collected — and
+            // EVACUATED — right here, with no scan and no deferral. A
+            // tree-walking interpreter (`test_gap_gc_alloc_point_no_move.ts`)
+            // then read a relocated heap string out of a stale register and
+            // silently returned the wrong number.
+            //
+            // The scan-skip cannot be recovered by asking "is scavenge on?":
+            // that question is about pacing, and the precondition being
+            // asserted here is about the PRECISION OF THIS PROGRAM POINT,
+            // which no pacing knob can change. Scavenge keeps its other job —
+            // routing nursery-churn triggers to this direct minor instead of
+            // the budgeted non-moving stepper — and the moving minor keeps
+            // running at the precise safepoints, where the root set is real.
+            let _scan = super::roots::ManualGcScanGuard::force_full_scan(
+                super::ConservativeScanSite::NurseryChurnSlackValve,
+            );
             let outcome = super::gc_collect_minor_with_trigger(GcTriggerSnapshot::capture(kind));
             // Re-baseline the arming trigger after the direct minor, mirroring
             // `gc_finish_budgeted_cycle`. This arm is taken whenever
@@ -2132,6 +2254,9 @@ pub extern "C" fn js_gc_loop_safepoint() {
     if !gc_moving_loop_polls_enabled() {
         return;
     }
+    // #7604: the only reliable answer to "did the compile-time half take
+    // effect". Past the opt-in, so a default binary never touches it.
+    super::note_loop_poll_reached();
     // Zeal (#7154 tooling) collects at EVERY poll, not only when the alloc-point
     // arm already deferred one. Zeal cannot conjure a poll codegen never emitted,
     // so the `gc_moving_loop_polls_enabled()` gate above still applies — see
@@ -2211,7 +2336,11 @@ fn gc_start_budgeted_minor_fallback_cycle_with_snapshot(
     let previous_pause_us = gc_last_pause_us();
     let current_rss_bytes = crate::process::get_rss_bytes();
     let low_pause_non_moving = progress_kind.is_budgeted();
-    let evacuation_policy_allowed = !low_pause_non_moving && gen_gc_evacuate_enabled();
+    // #7611: `low_pause_non_moving` is now the ONLY controller of this flag —
+    // the `PERRY_GEN_GC_EVACUATE` conjunct that used to be here was deleted as
+    // an untested configuration, and this arm is the one with a behavioural
+    // test (`budgeted_low_pause_minor_does_not_evacuate`).
+    let evacuation_policy_allowed = !low_pause_non_moving;
     let force_evacuation = !low_pause_non_moving && gc_force_evacuate_enabled();
     let evacuation_policy_disabled_reason = if low_pause_non_moving {
         EVACUATION_POLICY_LOW_PAUSE_NON_MOVING_REASON
@@ -2657,31 +2786,63 @@ pub extern "C" fn js_gc_collect() {
     manual_gc_collect_now();
 }
 
-/// Run an explicit (`gc()`) full collection. The `gc()` callsite may hold live
-/// module-init/top-level locals only on the native stack, so the collection
-/// forces the conservative native-stack scan (#4977); see `ManualGcScanGuard`.
+/// Run an explicit (`gc()`) full collection, with **precise roots** — the same
+/// root set every automatic collection in a production binary already uses
+/// (`conservative_stack_scan_mode()` resolves to `Auto`, i.e. `SkipDisabled`).
 ///
-/// ★ #7148 disposition: **keep, observable.** Unlike the four automatic sites
-/// this is not a collection the program pays for without asking. `gc()` is a
-/// user request with synchronous semantics — `gc(); assertFreed()` is the
-/// shape every test and every ratchet probe uses — so deferring it to the next
-/// safepoint would change the observable contract of the API, not just its
-/// cost. It is counted (`ConservativeScanSite::ManualCollect`) so its share of
-/// any census is attributable: all eight `gc_ratchet` probes end with an
-/// explicit full `gc()`, so this site fires at least once per probe *by
-/// construction*, and a census that did not separate it from the automatic
-/// sites would look alarming for no reason.
+/// ★ #7558: this site used to take `ManualGcScanGuard::force_full_scan`. It no
+/// longer does, and the removal is deliberate rather than incidental — read
+/// this before adding one back.
 ///
-/// The known cost is #6942/#6946: forcing the scan makes this path non-moving,
-/// which is why `PERRY_GC_FORCE_EVACUATE` was inert for every `gc()`-driven
-/// test. Removing the scan here needs precise roots at the `gc()` callsite PC
-/// — the safepoint contract in `docs/statepoint-gc-experiment.md` on branch
-/// `exp/stackmap-viability` (not on `main`) — not a
-/// deferral.
+/// **What the scan was for.** #4977: `const keep = {…}; gc(); keep.nested.deep`
+/// read dangling-pointer garbage, because a module-init/top-level local was
+/// held only as a native-stack alloca that neither the shadow stack nor the
+/// module-var scanners covered. Forcing the conservative scan retained it. That
+/// was a *workaround for a precise-rooting hole*, applied at the one collection
+/// site that could be made to hide it — not a statement that `gc()` needs a
+/// different root set from every other collection.
+///
+/// **Why it is no longer needed.** The hole was closed by the 2026-06→08
+/// rooting campaign, from a different direction: pointer-typed locals get a
+/// persistent shadow slot bound in the function-entry setup (#6968's
+/// `expr::scalar_slot_root`, #6951/#6972's object-literal rooting), module-level
+/// bindings are `@perry_global_*` cells registered with
+/// `js_gc_register_global_root`, and `scripts/gc_root_dominance_check.py` gates
+/// the invariant that a root store must dominate every collection point — with
+/// an **empty** allowlist. `js_gc_collect` is a collection point by that
+/// invariant like any other; nothing about it is special. #4977's own repro
+/// (`test-files/test_issue_4977_gc_toplevel_locals.ts`) prints the right answer
+/// with the scan disabled.
+///
+/// **What it cost.** A conservative scan retains whatever the native stack
+/// happens to look like a pointer to, so the reading every retained-heap number
+/// in this project is taken through — `process.memoryUsage()` after `gc()` —
+/// carried a stack-residue tax. Measured with `gc_ratchet.py classify` on
+/// `main` at `961777904`: non-zero on **nine of the twelve** ratchet probes,
+/// and 28.63% / 28.24% / 29.71% / 31.03% of reported retention on
+/// `01_nursery_churn`, `05_closure_capture`, `06_string_retention` and
+/// `11_collect_at_depth` respectively (13.80%, 8,273,888 bytes, on
+/// `12_large_live_set` — the case #7558 was filed for was the *smallest* of the
+/// four). It was also non-deterministic run to run, because stack residue is,
+/// which is why `benchmarks/gc_ratchet` had to stop gating that cell (#7554)
+/// and why retention rows were unbelievable without a manual `classify`
+/// cross-check (#7559). And it made this path non-moving, which is why
+/// `PERRY_GC_FORCE_EVACUATE` was inert for every `gc()`-driven test
+/// (#6942/#6946).
+///
+/// **A second-order effect worth knowing about.** `gc/tenuring.rs` deliberately
+/// refuses to seed the adaptive tenuring threshold from a cycle that ran the
+/// conservative scan, so on any `gc()`-driven workload that seed had never
+/// fired. It fires now. On two ratchet probes `tenuring_survivals` falls
+/// `4 -> 1` and survivors are promoted on first copy rather than copied into
+/// survivor space; the copying minor still runs and moves *more* objects.
+/// Removing a conservative scan is not only a retention change.
+///
+/// **What is unchanged.** `gc()` is still synchronous — #7148's disposition
+/// that it must not be *deferred* to a safepoint stands, because
+/// `gc(); assertFreed()` is the shape every test and every ratchet probe uses.
+/// This changes the root set, not the timing.
 fn manual_gc_collect_now() {
-    let _scan = super::roots::ManualGcScanGuard::force_full_scan(
-        super::ConservativeScanSite::ManualCollect,
-    );
     // NOTE: pending finalization jobs from earlier AUTOMATIC cycles are NOT
     // cleared here — each record enqueues exactly once (its pending flag is
     // reset at enqueue time), so dropping the vec would lose those callbacks
@@ -2694,6 +2855,39 @@ fn manual_gc_collect_now() {
     // never dropped. A full cycle reclaims them, matching V8/Node `--expose-gc`
     // semantics where `gc()` is a full collection. Automatic threshold-driven
     // minors are unaffected.
+    //
+    // ★ #6946: under forced evacuation, run an EVACUATING minor FIRST.
+    //
+    // `PERRY_GC_FORCE_EVACUATE` is read only on the minor path, so every test
+    // of the shape `gc(); assertFreed()` under that knob looked like evacuation
+    // stress coverage and was a full mark-sweep that moved nothing —
+    // CLAUDE.md's hazard 4, and one of the three worked examples in it. Five
+    // suites still drive collection exactly that way
+    // (`gc_property_key_operand_rooting_6935`,
+    // `gc_dynamic_arith_operand_rooting_6655`,
+    // `gc_string_coerce_property_key_rooting_6943`,
+    // `gc_side_table_roots_evacuation`, and `gc/tests/cycle_state.rs`).
+    //
+    // What made this impossible before and does not any more: this site used to
+    // take `ManualGcScanGuard::force_full_scan`, and a forced conservative scan
+    // makes the copying minor ineligible outright
+    // (`CopiedMinorFallbackReason::ConservativeStack`). #7657 removed it — see
+    // the doc comment above — so `gc()` now runs on precise roots and a copying
+    // minor here is exactly as sound as the full mark-sweep below.
+    //
+    // `FullEscalation::Refused`, because the two throughput-pacing predicates
+    // would hand this call a full sweep: a NON-MOVING collection under a knob
+    // whose entire name is about relocation, which is the original bug in a new
+    // place. The full sweep follows immediately anyway, so refusing the
+    // escalation here costs nothing it was protecting.
+    //
+    // Default-off knob, so nothing about an ordinary `gc()` changes.
+    if super::gc_force_evacuate_enabled() {
+        super::gc_collect_forced_evacuating_minor(GcTriggerSnapshot::capture(
+            GcTriggerKind::Manual,
+        ))
+        .emit_after_current();
+    }
     gc_collect_full_mark_sweep_with_trigger(GcTriggerSnapshot::capture(GcTriggerKind::Manual))
         .emit_after_current();
     crate::weakref::queue_pending_finalization_callbacks_after_gc();

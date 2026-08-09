@@ -82,6 +82,9 @@ mod trace;
 pub(crate) use trace::*;
 mod barrier;
 pub use barrier::*;
+/// #7630: the runtime slot-store helpers, split from `barrier.rs` (2000-line cap).
+mod barrier_store;
+pub use barrier_store::*;
 mod dirty_page_cache;
 // #7187 Phase B: `crate::arena`'s page-metadata module invalidates the
 // barrier's "already dirty" page cache when it un-stamps or discards a page.
@@ -93,6 +96,17 @@ mod barrier_arming;
 // rustc warned. A plain `use` brings them into `gc`'s namespace, which is all
 // the in-module callers (`telemetry.rs`, `cycle.rs`) actually need.
 use barrier_arming::*;
+/// #7645: `GC_FLAG_PINNED` custody + the young-pin latch the copying minor's
+/// eligibility preflight is skipped on. Every write of the bit goes through
+/// `pin::pin_object`; `scripts/gc_pin_sites.py` enforces that in `lint`.
+mod pin;
+#[cfg(test)]
+pub(crate) use pin::test_reset_young_pin_latch;
+pub use pin::{
+    copied_minor_preflight_skips, copied_minor_preflight_walks, pin_object, pin_object_non_young,
+    unpin_object,
+};
+use pin::{note_preflight_skipped, note_preflight_walked, young_pin_latch_armed};
 mod copying;
 use copying::*;
 // The copied-minor pointer classifier is consumed by the weak-holder registry
@@ -120,8 +134,11 @@ mod fromspace_scan;
 /// value dies/moves on its FIRST exposure. Debug-only (`PERRY_GC_ZEAL=1`).
 mod zeal;
 pub use verify::*;
-pub use zeal::zeal_forced_collections;
-pub(crate) use zeal::{gc_zeal_enabled, note_zeal_forced_collection};
+pub use zeal::{
+    copying_minor_cycles, loop_polls_reached, moved_objects_total, zeal_forced_collections,
+    zeal_liveness_report,
+};
+pub(crate) use zeal::{gc_zeal_enabled, note_loop_poll_reached, note_zeal_forced_collection};
 #[cfg(feature = "diagnostics")]
 mod heap_snapshot;
 #[cfg(feature = "diagnostics")]
@@ -136,6 +153,38 @@ pub fn gc_collect_minor() -> u64 {
 }
 
 pub(super) fn gc_collect_minor_with_trigger(trigger: GcTriggerSnapshot) -> GcCollectOutcome {
+    gc_collect_minor_with_trigger_inner(trigger, FullEscalation::Allowed)
+}
+
+/// May this minor be escalated to a full mark-sweep by the two THROUGHPUT
+/// PACING predicates (`copied_minor_promotion_handoff_due`,
+/// `arena_growth_full_escalation_due`)?
+///
+/// Both exist so a long-running mutator does not accumulate array-growth stubs
+/// the non-moving minor cannot reclaim, and on every automatic path the answer
+/// is `Allowed`. `Refused` exists for exactly one caller: the explicit `gc()`
+/// under `PERRY_GC_FORCE_EVACUATE`, which asked for a *moving* collection and
+/// is followed immediately by a full mark-sweep anyway (#6946). A full sweep
+/// moves nothing, so an escalation there hands the caller a non-moving
+/// collection under a knob whose whole name is about relocation — which is
+/// precisely how that knob came to be inert for every `gc()`-driven test.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum FullEscalation {
+    Allowed,
+    Refused,
+}
+
+/// The minor an explicit `gc()` runs first when forced evacuation is on
+/// (#6946). Refuses the pacing escalation, so the caller gets the moving
+/// collection the knob promises rather than a full sweep that moves nothing.
+pub(super) fn gc_collect_forced_evacuating_minor(trigger: GcTriggerSnapshot) -> GcCollectOutcome {
+    gc_collect_minor_with_trigger_inner(trigger, FullEscalation::Refused)
+}
+
+fn gc_collect_minor_with_trigger_inner(
+    trigger: GcTriggerSnapshot,
+    escalation: FullEscalation,
+) -> GcCollectOutcome {
     // PERRY_GC_SAFEPOINT_ONLY: held for the whole collection so every
     // consumer of the scan decision (root scan, copying eligibility,
     // evacuation pinning, verifier) sees the same healed answer.
@@ -175,7 +224,8 @@ pub(super) fn gc_collect_minor_with_trigger(trigger: GcTriggerSnapshot) -> GcCol
         f.set(prev | GC_FLAG_IN_ALLOC);
         prev & GC_FLAG_IN_ALLOC
     });
-    if copied_minor_promotion_handoff_due(trigger.kind) {
+    let may_escalate = escalation == FullEscalation::Allowed;
+    if may_escalate && copied_minor_promotion_handoff_due(trigger.kind) {
         // #7592: latch before running it. This full is non-moving and promotes
         // nothing, so it cannot relieve the survivor pressure that scheduled
         // it; without the latch the predicate is still true at the next minor
@@ -192,7 +242,7 @@ pub(super) fn gc_collect_minor_with_trigger(trigger: GcTriggerSnapshot) -> GcCol
     // only a full mark-sweep reclaims stubs. Escalate to a full once the arena's
     // live bytes exceed K× the last full's live set (belt-and-suspenders for
     // callers that reach a minor outside the budgeted pressure path).
-    if arena_growth_full_escalation_due() {
+    if may_escalate && arena_growth_full_escalation_due() {
         let outcome =
             gc_collect_full_mark_sweep_with_trigger(GcTriggerSnapshot::capture(trigger.kind));
         restore_minor_in_alloc(prev_in_alloc);
@@ -203,9 +253,13 @@ pub(super) fn gc_collect_minor_with_trigger(trigger: GcTriggerSnapshot) -> GcCol
     crate::arena::old_pages_begin_gc_cycle();
     let previous_pause_us = gc_last_pause_us();
     let current_rss_bytes = crate::process::get_rss_bytes();
-    let evacuation_policy_allowed = gen_gc_evacuate_enabled();
+    // Not budgeted, so the low-pause veto does not apply and the policy is
+    // always allowed to run here (#7611 deleted the env veto that used to sit
+    // in this slot). The variable stays rather than being folded away: it is
+    // recorded in the cycle trace and read back by the evacuation-policy tests.
+    let evacuation_policy_allowed = true;
     let force_evacuation = gc_force_evacuate_enabled();
-    let old_page_selection = if evacuation_policy_allowed && old_to_young_tracking_complete() {
+    let old_page_selection = if old_to_young_tracking_complete() {
         select_old_page_defrag_pages(force_evacuation)
     } else {
         OldPageDefragSelection::default()
@@ -276,33 +330,56 @@ pub fn gen_gc_enabled() -> bool {
     })
 }
 
-/// Gen-GC Phase C4b: evacuation is policy-driven by default.
-/// `PERRY_GEN_GC_EVACUATE=0`, `=false`, or `=off` disables the
-/// policy. `=1`, `=true`, and `=on` are accepted for compatibility
-/// but mean "allow the auto-policy", not unconditional evacuation.
-pub fn gen_gc_evacuate_enabled() -> bool {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        !matches!(
-            std::env::var("PERRY_GEN_GC_EVACUATE").as_deref(),
-            Ok("0") | Ok("off") | Ok("false")
-        )
-    })
-}
+// ★ `PERRY_GEN_GC_EVACUATE` was DELETED here (#7611). Read this before adding
+// an "escape hatch" back.
+//
+// It used to gate `evacuation_policy_allowed` — the C4b tenured→old-gen policy
+// evacuation and the old-page defrag selection — and to veto
+// `gc_force_evacuate_enabled()` below.
+//
+// **It was measured inert where anyone was looking.** On the pinned quiet host,
+// identical binaries and protocol, the only difference being the knob, a
+// cell-by-cell diff over all 12 gc-ratchet probes × 8 counters
+// (`minor_cycles`, `step_cycles`, `copied_objects`, `copied_bytes`,
+// `promoted_objects`, `promoted_bytes`, `freed_bytes`, `heap_used_bytes`)
+// reported **0 of 96 cells moved** — bit-identical medians, and
+// `gc_ratchet.py check` exit 0 with the knob set. For contrast the same
+// procedure with `PERRY_GEN_GC=0` moved 79 cells and returned 90 findings, so
+// the harness was sensitive and this knob specifically was not. The mechanism:
+// the counters the ratchet reads come from the COPYING minor
+// (`gc_collect_minor_copying_fast_path`), which this knob never gated; what it
+// gated is the non-copying fallback's policy evacuation, which those probes do
+// not reach.
+//
+// **Its one unique live effect was a footgun.** Vetoing
+// `gc_force_evacuate_enabled()` meant an ambient `PERRY_GEN_GC_EVACUATE=0`
+// silently disarmed `PERRY_GC_ZEAL` — the #7154 instrument — so a zeal run
+// could report "clean" having moved nothing. CLAUDE.md documented that as a
+// caveat rather than treating it as the defect it is. Deleting the knob deletes
+// the way to disarm the instrument by accident.
+//
+// **The branch it gated is NOT deleted with it, because the branch has another
+// controller that IS exercised.** `evacuation_policy_allowed` is still false on
+// every budgeted low-pause cycle (`low_pause_non_moving` in
+// `gc_start_budgeted_minor_fallback_cycle_with_snapshot`), and
+// `budgeted_low_pause_minor_does_not_evacuate` asserts that arm behaviourally —
+// nothing moved, no forwarding stub, old-page selection skipped, and
+// `trace.evacuation_policy.reason == "low_pause_non_moving"`. So the losing
+// mode still compiles and still has a test; what stopped existing is the
+// untested *configuration*.
+//
+// Per CLAUDE.md's binding GC knob kill-policy: "a mode that still exists is a
+// decision that hasn't been made".
 
 fn gc_force_evacuate_enabled() -> bool {
     // `PERRY_GC_ZEAL=1` implies forced evacuation (#7154 tooling): a zealous
     // minor that leaves survivors in place would move nothing, and "an unrooted
     // value moves on its first exposure" is the entire contract of zeal mode.
-    // Still subject to `gen_gc_evacuate_enabled()` — an explicit
-    // `PERRY_GEN_GC_EVACUATE=0` wins, so the two knobs cannot silently disagree.
-    gen_gc_evacuate_enabled()
-        && (gc_zeal_enabled()
-            || matches!(
-                std::env::var("PERRY_GC_FORCE_EVACUATE").as_deref(),
-                Ok("1") | Ok("on") | Ok("true")
-            ))
+    gc_zeal_enabled()
+        || matches!(
+            std::env::var("PERRY_GC_FORCE_EVACUATE").as_deref(),
+            Ok("1") | Ok("on") | Ok("true")
+        )
 }
 
 fn gc_verify_evacuation_enabled() -> bool {
@@ -312,18 +389,61 @@ fn gc_verify_evacuation_enabled() -> bool {
     )
 }
 
-/// Phase-1 de-risking flag (OFF by default). When set, the alloc-point
-/// nursery-churn arm (`gc_check_trigger`) runs its direct minor with the
-/// PRECISE shadow-stack roots instead of forcing the conservative native
-/// scan. The conservative scan makes the copying fast path ineligible
-/// (`CopiedMinorFallbackReason::ConservativeStack`), pinning the minor to the
-/// non-moving in-place sweep that cannot reclaim array-growth stubs; skipping
-/// it lets the evacuating scavenge run and reset the whole young arena in
-/// O(live). NOT sound as a production default yet — the alloc point can be
-/// register-imprecise — so it stays behind this flag for measurement +
-/// `PERRY_GC_VERIFY_EVACUATION` probing only. Pairs with
-/// `PERRY_GC_MAJOR_PACING_FLOOR_MB=0` so the #6939 pacing doesn't escalate the
-/// minor to a full before the copying path is reached.
+/// `PERRY_GC_SCAVENGE` — **ON by default since #7056**, kill switch
+/// `PERRY_GC_SCAVENGE=0`/`off`/`false`. It is a PACING knob: it routes
+/// nursery-churn triggers to the direct minor in `gc_check_trigger` instead of
+/// the budgeted non-moving stepper, which on a reallocation-heavy loop frees
+/// nothing. Paired with the nursery cap in `policy::effective_next_arena_trigger`
+/// that is the -69% RSS result quoted on the getter below.
+///
+/// It does **not** decide whether the alloc-point minor may move, and #7682 is
+/// what that confusion cost. The flag used to gate the `force_full_scan()` on
+/// that arm off, so the shipped default ran an EVACUATING minor at an arbitrary
+/// allocation point — a program point neither root lowering describes — and
+/// values held only in registers were relocated behind their holders' backs.
+/// The guard is now unconditional; see the comment at its site in
+/// `policy::gc_check_trigger` for why no pacing knob can answer the question it
+/// asks.
+///
+/// This doc comment previously read "Phase-1 de-risking flag (OFF by default)
+/// … NOT sound as a production default yet". Both halves were false for two
+/// hundred releases, eight lines above a body comment saying "ON BY DEFAULT" —
+/// the #6987 shape CLAUDE.md warns about, and this time the stale half was the
+/// one carrying the soundness argument.
+///
+/// **Kill-policy disposition, stated rather than left implicit — and stated
+/// for the configuration that now ships.** The flag's only production reader is
+/// the arm condition in `gc_check_trigger`, a three-way disjunction:
+/// `gc_scavenge_enabled() || gc_moving_loop_polls_enabled() ||
+/// registered_root_scanners_block_budgeted_gc()`.
+///
+///  * **With polls ON (the default since #7682's follow-up)** the second
+///    disjunct carries the arm, and this flag decides nothing. It is redundant,
+///    not load-bearing.
+///  * **With `PERRY_GC_MOVING_LOOP_POLLS=0`** it is the only thing holding the
+///    arm open, and dropping it would route nursery pressure to the budgeted
+///    stepper, which is non-moving *and* reclaims almost nothing on a
+///    reallocation loop. The third disjunct does NOT rescue that case: under
+///    `gc_incremental_enabled()` (the default) it reduces to "any COPY-ONLY
+///    scanner", and a compiled program has none — the reasoning
+///    `test-parity/gc_matrix_inert_arms.txt` recorded for the `cons_scan_off`
+///    arm, and the thing that made a first attempt at repairing
+///    `generator_attach_prototype` fail for a third distinct reason.
+///
+/// So the honest summary is: this knob is now a modifier on the kill switch,
+/// not a mode of its own. By CLAUDE.md's rule that is a candidate for deletion —
+/// fold its behaviour into the polls-off path and stop having two flags whose
+/// interaction nobody exercises. Deliberately NOT done here: this PR already
+/// changes two defaults, and a third would make one bisect answer three
+/// questions. The decision wants the arm condition's three disjuncts measured
+/// on real programs, which is a separate change with a separate A/B.
+///
+/// An earlier draft of this comment claimed the knob was "very close to inert
+/// for a compiled binary" on the strength of the third disjunct holding for
+/// every compiled program. That is wrong under the default incremental stepper,
+/// for the reason above. It is recorded rather than quietly deleted because
+/// this whole PR exists because a stale half of a doc comment kept carrying a
+/// soundness argument after it stopped being true.
 #[cfg(test)]
 thread_local! {
     /// Test-only override, consulted BEFORE the process-wide OnceLock so a
@@ -359,10 +479,17 @@ pub(super) fn gc_scavenge_enabled() -> bool {
         // them evacuating (O(live) copying) rather than O(heap) sweeps — so the
         // frequency is cheap instead of expensive.
         //
-        // Enabling this also defers alloc-point collections to a precise
-        // safepoint rather than collecting behind a forced conservative scan.
-        // That is newly reasonable: native roots became the default in #7370, so
-        // a precise safepoint is what the shipped configuration now has.
+        // What this does NOT do, despite what this comment used to claim: it
+        // does not defer alloc-point collections to a precise safepoint. That
+        // deferral is gated on `gc_moving_loop_polls_enabled()`, a DIFFERENT
+        // flag, and for the whole #7161 stopgap the two disagreed — the
+        // deferral was dead and the alloc-point minor ran right there, moving
+        // objects at a register-imprecise point. That is #7682.
+        //
+        // The deferral is live again now that polls default ON, so the shipped
+        // default does reach a precise safepoint — but not because of THIS
+        // flag, and the alloc-point minor is sound on its own terms either way,
+        // by being non-moving (`force_full_scan`).
         !matches!(
             std::env::var("PERRY_GC_SCAVENGE").as_deref(),
             Ok("0") | Ok("off") | Ok("false")
@@ -836,11 +963,48 @@ pub extern "C" fn js_gc_init() {
 /// headers remain owned by the arena, while the side-allocation registries own
 /// the separately allocated buffers. The operation is idempotent and is called
 /// only once no more JavaScript work can run on this thread.
+///
+/// ★ It is also where the **zeal liveness verdict** is emitted (#7604). Codegen
+/// calls this exactly once, at the real process-exit boundary after every exit
+/// callback (`codegen/entry.rs`), which is the one point in a compiled program
+/// where "what did this run actually exercise" is answerable. See
+/// `emit_zeal_liveness_verdict`.
 #[no_mangle]
 pub extern "C" fn js_gc_release_current_thread_collection_side_allocations() {
     crate::map::release_current_thread_map_side_allocations();
     crate::json_tape_store::release_current_thread_lazy_tapes();
     crate::set::release_current_thread_set_side_allocations();
+    emit_zeal_liveness_verdict();
+}
+
+/// Print what `PERRY_GC_ZEAL=1` actually did, and **fail the process** when the
+/// answer is "nothing" (#7604).
+///
+/// This is the "assert the subject was live" rule turned on the instrument
+/// itself. A zeal run that forced zero collections, or whose every forced
+/// collection was escalated to a non-moving full mark-sweep, has exercised
+/// nothing — and until now it exited 0 and looked exactly like a run that had.
+/// That is the fourth way a gate cannot fail, applied to a debug knob whose
+/// entire purpose is to make a class of bug reproducible.
+///
+/// Exiting non-zero rather than warning is deliberate. Zeal is never on in
+/// production — the whole knob is debug-only, off by default, and set by hand
+/// or by a CI stress arm. In both of those contexts a vacuous run is a result
+/// the operator must not be allowed to read as a pass.
+///
+/// Known limitation, stated rather than hidden: `process.exit()` terminates via
+/// `libc::_exit` and never reaches this boundary, so a zeal run that ends that
+/// way gets no verdict. An uncaught throw is the same. Both already bypass
+/// every other exit callback.
+fn emit_zeal_liveness_verdict() {
+    match zeal_liveness_report() {
+        None => {}
+        Some(Ok(summary)) => eprintln!("{summary}"),
+        Some(Err(complaint)) => {
+            eprintln!("{complaint}");
+            std::process::exit(70);
+        }
+    }
 }
 
 /// #5093: parse a boolean-ish env var by value (not mere presence): true for

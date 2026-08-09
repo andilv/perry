@@ -3,6 +3,25 @@
 //! Extracted from `expr/mod.rs` to keep that file under the 2000-line cap.
 //! Pure mechanical move — match arm bodies are verbatim copies, called from
 //! `lower_expr`'s outer dispatch.
+//!
+//! # Rooting (Layer 1, slice 4)
+//!
+//! Listed in `crate::rooting`'s `MIGRATED_MODULES`, and the listing is
+//! **vacuous on the committed source**: this module has never named an
+//! `expr::temp_root` symbol, so only the sabotage arm makes the line an
+//! assertion. Say what it is rather than banking the count.
+//!
+//! The audit that earned it. A dotted `obj.k` has exactly ONE user expression
+//! to lower — the receiver — and the property name is a compile-time string
+//! interned into the pool, not an operand. So the sibling-window shape that
+//! `index_get.rs` has (base lowered, then key lowered, then base used) cannot
+//! arise: the receiver is lowered LAST and nothing follows it.
+//!
+//! The three `.call(I64, "js_*")` sites the campaign map counts —
+//! `js_error_get_errors`, `js_process_version`, `js_closure_alloc_singleton` —
+//! each hand their raw pointer straight to a `nanbox_*_inline` in the same
+//! block, with no emission in between. `call_rooted` has no site here: rooting
+//! them would add temp-root traffic to close a window that does not exist.
 
 use anyhow::Result;
 use perry_hir::types::Type as HirType;
@@ -1641,7 +1660,11 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
 
                         ctx.current_block = lookup_idx;
                         let blk = ctx.block();
-                        blk.call_void("js_typed_feedback_record_fallback_call", &[(I64, &site_id)]);
+                        crate::expr::emit_typed_feedback_record_call(
+                            blk,
+                            "js_typed_feedback_record_fallback_call",
+                            &[(I64, &site_id)],
+                        );
                         let val_fallback_js = blk.call(
                             DOUBLE,
                             "js_object_get_field_by_name_f64",

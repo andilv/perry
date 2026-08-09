@@ -407,7 +407,7 @@ pub fn try_lower_closure_typed_local_call(
                     // so the slot index crosses the diamond exactly as the
                     // bare register used to.
                     let prev_this = if callee_reads_this {
-                        Some(crate::expr::temp_root::implicit_this_save(ctx, &undef_this))
+                        Some(crate::rooting::implicit_this_save(ctx, &undef_this))
                     } else {
                         None
                     };
@@ -923,13 +923,16 @@ pub fn try_lower_closure_typed_local_call(
                     }
 
                     ctx.current_block = fallback_idx;
-                    ctx.block()
-                        .call_void("js_typed_feedback_record_fallback_call", &[(I64, &site_id)]);
+                    crate::expr::emit_typed_feedback_record_call(
+                        ctx.block(),
+                        "js_typed_feedback_record_fallback_call",
+                        &[(I64, &site_id)],
+                    );
                     // Guard failed: the receiver is some OTHER closure whose
                     // body codegen never saw — reset `this` here (and only
                     // here) when the static gating skipped the outer reset.
                     let fallback_prev_this = if prev_this.is_none() {
-                        Some(crate::expr::temp_root::implicit_this_save(ctx, &undef_this))
+                        Some(crate::rooting::implicit_this_save(ctx, &undef_this))
                     } else {
                         None
                     };
@@ -944,7 +947,7 @@ pub fn try_lower_closure_typed_local_call(
                     // slot (restored in the merge block) is still live and the
                     // temp-root depth matches on both paths into the merge.
                     if let Some(prev) = fallback_prev_this {
-                        crate::expr::temp_root::implicit_this_restore(ctx, prev);
+                        crate::rooting::implicit_this_restore(ctx, prev);
                     }
                     let after_fallback = ctx.block().label.clone();
                     if !ctx.block().is_terminated() {
@@ -960,7 +963,7 @@ pub fn try_lower_closure_typed_local_call(
                         ],
                     );
                     if let Some(prev) = prev_this {
-                        crate::expr::temp_root::implicit_this_restore(ctx, prev);
+                        crate::rooting::implicit_this_restore(ctx, prev);
                     }
                     return Ok(Some(merged));
                 }
@@ -969,14 +972,14 @@ pub fn try_lower_closure_typed_local_call(
             // params, or arity mismatch): the runtime-resolved callee may
             // read `this`, so the reset is unconditional here.
             // #7211: rooted save/restore across the runtime-resolved callee.
-            let prev_this = crate::expr::temp_root::implicit_this_save(ctx, &undef_this);
+            let prev_this = crate::rooting::implicit_this_save(ctx, &undef_this);
             let runtime_fn = format!("js_closure_call{}", lowered_args.len());
             let mut call_args: Vec<(crate::types::LlvmType, &str)> = vec![(I64, &closure_handle)];
             for v in &lowered_args {
                 call_args.push((DOUBLE, v.as_str()));
             }
             let result = ctx.block().call(DOUBLE, &runtime_fn, &call_args);
-            crate::expr::temp_root::implicit_this_restore(ctx, prev_this);
+            crate::rooting::implicit_this_restore(ctx, prev_this);
             return Ok(Some(result));
         }
     }

@@ -42,7 +42,7 @@ struct Timer {
 unsafe impl Send for Timer {}
 
 // Global timer queues (Mutex-protected for cross-thread access)
-static TIMER_QUEUE: Mutex<Vec<Timer>> = Mutex::new(Vec::new());
+per_test_global!(static TIMER_QUEUE: Mutex<Vec<Timer>> = Mutex::new(Vec::new()));
 static START_TIME: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Initialize the timer system (called once at startup)
@@ -374,7 +374,7 @@ static MOCK_TIMERS: Mutex<MockTimersState> = Mutex::new(MockTimersState {
     intervals: Vec::new(),
 });
 
-static CALLBACK_TIMERS: Mutex<Vec<CallbackTimer>> = Mutex::new(Vec::new());
+per_test_global!(static CALLBACK_TIMERS: Mutex<Vec<CallbackTimer>> = Mutex::new(Vec::new()));
 // Shared id counter across callback timers AND intervals so a handle id is
 // globally unique. Node treats Timeout/Interval as the same internal Timer
 // type, so `clearTimeout(intervalHandle)` and `clearInterval(timeoutHandle)`
@@ -388,6 +388,8 @@ static NEXT_TIMER_ID: Mutex<i64> = Mutex::new(1);
 mod gc_scan;
 mod ownership;
 mod ref_states;
+#[cfg(test)] // #7680: not re-exported; reach via `crate::timer::test_shared_queues::`
+pub(crate) mod test_shared_queues;
 
 pub(crate) use ownership::purge_agent_timers;
 use ownership::{has_refed_callback_timer, has_refed_interval_timer, has_refed_promise_timer};
@@ -941,7 +943,8 @@ fn raw_closure_pointer(bits: u64) -> Option<usize> {
         return None;
     }
     let ptr = bits as usize;
-    if ptr < crate::gc::GC_HEADER_SIZE + 0x1000 {
+    // #7531: band, not magnitude floor (0x1008 admitted every handle band).
+    if !crate::value::addr_class::is_plausible_heap_addr(ptr) {
         return None;
     }
     let header_addr = ptr - crate::gc::GC_HEADER_SIZE;
@@ -1402,7 +1405,7 @@ struct IntervalTimer {
 // what makes the cross-thread pointers here sound.
 unsafe impl Send for IntervalTimer {}
 
-static INTERVAL_TIMERS: Mutex<Vec<IntervalTimer>> = Mutex::new(Vec::new());
+per_test_global!(static INTERVAL_TIMERS: Mutex<Vec<IntervalTimer>> = Mutex::new(Vec::new()));
 
 /// JS-style setInterval that takes a callback function and interval
 /// The callback is a closure pointer that will be called repeatedly

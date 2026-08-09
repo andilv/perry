@@ -18,6 +18,35 @@ pub(super) const GC_COPY_PROMOTION_SURVIVALS: u8 = 4;
 // Low bits remain object freeze/seal/preventExtensions flags.
 pub const GC_LAYOUT_STATE_MASK: u16 = 0xC000;
 pub(super) const GC_LAYOUT_UNKNOWN: u16 = 0x0000;
+/// No payload slot holds a pointer, so `heap_payload_slot_selection` skips the
+/// WHOLE payload without consulting any mask. This is the one layout state that
+/// is not a precision hint: marking, the evacuation rewrite and the
+/// remembered-set dirty scan all funnel through that same enumeration, so an
+/// object left here while holding a heap pointer loses that child outright — it
+/// is neither kept alive nor rewritten when it moves.
+///
+/// **How to verify a change to this state (#7635).** The end-to-end knobs do
+/// catch a misdeclaration, but only if the workload actually holds a misdeclared
+/// object across a collection, and it is easy to build one that never does:
+/// #7635 forced every JSON-parsed record to `POINTER_FREE` while it held heap
+/// strings and got byte-identical correct output under `PERRY_GC_ZEAL=1
+/// PERRY_GC_PROTECT_FROMSPACE=1` and `PERRY_GC_FORCE_EVACUATE=1`, because
+/// `js_json_parse` is LAZY for 1 KB–16 MB top-level arrays (`json_tape`) and the
+/// probe read its records only after the last GC. Under `PERRY_JSON_TAPE=0` the
+/// same sabotage SIGSEGVs. So:
+///
+/// - "clean under zeal + from-space protect" is evidence only once you have
+///   shown the misdeclared object EXISTED during a collection;
+/// - `PERRY_GC_FROMSPACE_SCAN=1` is the instrument to prefer — its
+///   whole-payload word scan consults no layout state, and it reported the
+///   stranded children at exactly `dangling=8000 owners=4000`;
+/// - `PERRY_GC_VERIFY_EVACUATION` is blind here by construction: it walks the
+///   same enumeration the rewrite pass walks, which is to say it asks this
+///   state which slots exist.
+///
+/// The workload-free detectors are the child-slot enumerator and relocation
+/// across a copying minor; worked example, sabotage-verified in both
+/// directions: `gc/tests/copying/deferred_finalize_7635.rs`.
 pub const GC_LAYOUT_POINTER_FREE: u16 = 0x4000;
 pub(crate) const GC_LAYOUT_SIDE_MASK: u16 = 0x8000;
 // A side-layout payload whose entire live prefix contains pointers. Bit 13 is
@@ -403,13 +432,6 @@ unsafe fn with_shape_shared_descriptor<R>(
     Some(f(desc))
 }
 
-/// Cloning form of [`with_shape_shared_descriptor`], for the callers that need
-/// to keep the descriptor past the `SHAPE_LAYOUTS` borrow.
-#[inline]
-unsafe fn shape_shared_descriptor(user_ptr: usize) -> Option<TypedLayoutDescriptor> {
-    with_shape_shared_descriptor(user_ptr, |desc| desc.clone())
-}
-
 /// Answer a *query* about `user_ptr`'s current canonical typed layout, whichever
 /// map holds it: the per-object `TYPED_LAYOUTS` entry (objects that diverged
 /// from their shape, or carry no keys_array), else — and only while the object
@@ -463,7 +485,11 @@ unsafe fn shape_shared_pointer_mask(
     if (*header)._reserved & GC_OBJ_TYPED_LAYOUT_INTACT == 0 {
         return None;
     }
-    shape_shared_descriptor(user_ptr).map(|d| d.pointer_mask)
+    // Clone the ONE mask we return, not the whole descriptor. `LayoutSlotMask`
+    // is `Heap(Vec<u64>)` above 64 slots, so `shape_shared_descriptor`'s
+    // `desc.clone()` allocated and freed a second vector — the `raw_f64_mask`
+    // we immediately drop — once per traced wide object per GC walk.
+    with_shape_shared_descriptor(user_ptr, |d| d.pointer_mask.clone())
 }
 
 /// Install `descriptor` as the canonical layout for `keys` and set the object's
@@ -551,7 +577,7 @@ pub(super) fn strip_nanbox_user_ptr(bits: u64) -> usize {
 }
 
 #[inline]
-pub(super) fn layout_pointer_bearing_bits(bits: u64) -> bool {
+pub(in crate::gc) fn layout_pointer_bearing_bits(bits: u64) -> bool {
     let tag = bits & TAG_MASK;
     if tag == POINTER_TAG || tag == STRING_TAG || tag == BIGINT_TAG {
         return bits & POINTER_MASK != 0;
@@ -607,6 +633,29 @@ pub(crate) unsafe fn layout_init_all_pointer_slots(user_ptr: *mut u8) {
     layout_forget_object(user_ptr as usize);
     set_layout_state(header, GC_LAYOUT_SIDE_MASK);
     (*header)._reserved |= GC_LAYOUT_ALL_POINTERS;
+}
+
+/// #7630: settle a materialiser-built object's layout state ONCE, after its
+/// construction loop elided the per-slot notes
+/// (`runtime_store_jsvalue_slot_layout_deferred`). Two exact outcomes:
+///
+/// - **No pointer was stored**: the `layout_init_pointer_free` birth state is
+///   still the truth, and it is the valuable one — the tracer skips the whole
+///   payload. Nothing to do.
+/// - **Any pointer was stored**: `GC_LAYOUT_UNKNOWN`, the tag-checked
+///   scan-all-slots state. For a cohort whose every slot is a NaN-boxed
+///   `JSValue`, a pointer mask can never skip anything a tag check would not
+///   reject anyway — the mask machinery (per-object side-table entry, hashmap
+///   round-trip per store, `layout_transfer` per promotion,
+///   `layout_forget_object` per death) buys nothing here. Routed through
+///   `layout_mark_unknown`, not a bare state store, so a mask that a
+///   slow-path by-name store DID create mid-construction (shape-overflow
+///   records) is removed with the state change rather than stranded.
+pub(crate) unsafe fn layout_finish_deferred_boxed_object(user_ptr: usize, saw_pointer: bool) {
+    if !saw_pointer {
+        return;
+    }
+    layout_mark_unknown(user_ptr as *mut u8);
 }
 
 pub(crate) unsafe fn layout_mark_unknown(user_ptr: *mut u8) {
@@ -1660,11 +1709,22 @@ pub(super) unsafe fn heap_payload_slot_selection(
         return HeapPayloadSlotSelection::Empty;
     }
     let user_ptr = (header as *mut u8).add(GC_HEADER_SIZE) as usize;
-    let raw_numeric_object_slots = if (*header).obj_type == GC_TYPE_OBJECT {
-        layout_typed_raw_f64_slot_count_for_user(user_ptr, payload.slot_count())
-    } else {
-        0
-    };
+    // `raw_numeric_object_slots` feeds exactly one consumer:
+    // `record_layout_raw_numeric_object_field_range_skipped`, a counter that
+    // returns on its first line unless `PERRY_GC_LAYOUT_SCAN_TRACE` armed
+    // `layout_scan_trace_active()`. Computing it costs
+    // `with_typed_descriptor_for_query` — a per-object map probe and, for every
+    // class instance, a `SHAPE_LAYOUTS` hash lookup behind a TLS `RefCell`
+    // borrow — and this function runs once per traced object per GC walk
+    // (mark, rewrite, verify). So the shipped collector paid a hash lookup per
+    // object to produce a number nothing read. Same shape as #7702: a facility
+    // already disabled at runtime, whose *argument* was still being evaluated.
+    let raw_numeric_object_slots =
+        if (*header).obj_type == GC_TYPE_OBJECT && layout_scan_trace_active() {
+            layout_typed_raw_f64_slot_count_for_user(user_ptr, payload.slot_count())
+        } else {
+            0
+        };
     match (*header)._reserved & GC_LAYOUT_STATE_MASK {
         GC_LAYOUT_POINTER_FREE => HeapPayloadSlotSelection::PointerFree {
             emitted: false,

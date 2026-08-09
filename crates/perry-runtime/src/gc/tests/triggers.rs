@@ -504,14 +504,19 @@ fn test_effective_arena_trigger_respects_armed_values() {
         GC_NEXT_TRIGGER_BYTES, GC_TRIGGER_ARMED,
     };
     // `effective_next_arena_trigger` additionally clamps to the small nursery cap
-    // whenever moving mode is active (the default-on evacuating scavenge) or the
-    // PERRY_GC_SCAVENGE de-risking flag is set; otherwise it clamps only the
-    // UN-armed cell to the device ceiling and lets an armed trigger exceed it.
-    // Assert the value correct for the mode this process runs in, so the NEW
-    // nursery-cap behavior is exercised under the default and the legacy ceiling
-    // behavior under the PERRY_GC_MOVING_LOOP_POLLS=0 kill switch. This mirrors
-    // the gate in `effective_next_arena_trigger` exactly.
-    let nursery_capped = super::super::gc_scavenge_enabled() || gc_moving_loop_polls_enabled();
+    // whenever the collection that clamp schedules can EVACUATE; otherwise it
+    // clamps only the UN-armed cell to the device ceiling and lets an armed
+    // trigger exceed it. Assert the value correct for the mode this process runs
+    // in, so the nursery-cap behavior is exercised under moving pacing and the
+    // ceiling behavior under the PERRY_GC_MOVING_LOOP_POLLS=0 kill switch. This
+    // mirrors the gate in `policy::nursery_cap_active` exactly.
+    //
+    // `gc_scavenge_enabled()` used to be ORed in here, mirroring the gate as it
+    // stood. It is not part of that gate since #7682: scavenge routes nursery
+    // pressure to the direct alloc-point minor, and that minor is now always
+    // non-moving, so a cap keyed on it schedules a collection that cannot lower
+    // the cap's own basis.
+    let nursery_capped = gc_moving_loop_polls_enabled();
     let ceiling = gc_trigger_absolute_ceiling_bytes();
     let nursery_cap = gc_scavenge_nursery_cap_bytes();
 
@@ -549,31 +554,17 @@ fn test_effective_arena_trigger_respects_armed_values() {
     GC_TRIGGER_ARMED.with(|c| c.set(prev_armed));
 }
 
-// #7154 stopgap: the moving-loop (evacuating) minor must be OFF by default.
-// #7019 flipped it default-on, but the evacuating minor has a use-after-free
-// that corrupts the heap in the default config, so the default must select the
-// non-evacuating minor; the moving path stays reachable only via an explicit
-// PERRY_GC_MOVING_LOOP_POLLS=1/on/true opt-in.
-#[test]
-fn test_moving_loop_minor_off_by_default_7154() {
-    use super::super::policy::moving_loop_polls_enabled_from_env as enabled;
-    // Default (unset) is non-evacuating.
-    assert!(
-        !enabled(None),
-        "moving-loop minor must be OFF by default (#7154)"
-    );
-    // Kill-switch values remain off.
-    assert!(!enabled(Some("0")));
-    assert!(!enabled(Some("off")));
-    assert!(!enabled(Some("false")));
-    // Unknown / garbage values fall back to the safe default (off).
-    assert!(!enabled(Some("")));
-    assert!(!enabled(Some("2")));
-    // Explicit opt-in enables the moving path.
-    assert!(enabled(Some("1")));
-    assert!(enabled(Some("on")));
-    assert!(enabled(Some("true")));
-}
+// #7682: the moving-loop (evacuating) minor is ON by default again, and the
+// SAFE fallback direction has inverted with it.
+//
+// Under #7161's stopgap the safe direction was "off": a garbage value selected
+// the non-evacuating minor. It is now "on", and that is not a weakening. With
+// polls off, nursery pressure has NO precise collection point in a compute-only
+// program — neither this poll nor the microtask-pump boundary is reached — so
+// every nursery collection lands at the register-imprecise allocation point,
+// which #7682 established must not move. Off is the state in which the
+// collector cannot do its job precisely at all; a typo in the env var should
+// not select it.
 
 // #6184: the OS memory-pressure entry must run a real collection when the
 // thread is at a safe point, and must lower+arm the arena trigger.
@@ -605,4 +596,74 @@ fn test_memory_pressure_collects_and_clamps_trigger() {
     GC_NEXT_TRIGGER_BYTES.with(|c| c.set(prev_trigger));
     GC_TRIGGER_ARMED.with(|c| c.set(prev_armed));
     assert_eq!(js_gc_memory_pressure(0), 0);
+}
+
+/// #7690 shipped its entire default-ON argument in doc comments and left the
+/// predicate matching `1|on|true`. Nothing failed, because the function that was
+/// factored out expressly to make the default "unit-testable without touching
+/// process env" had no test. This is that test.
+///
+/// A default of OFF is not a slower configuration, it is a different collector:
+/// with no poll there is no precise safepoint, so after #7687 made the
+/// alloc-point minor non-moving the nursery is never evacuated at all. Measured
+/// on the quiet bench host at `12e48edd6`, `churn_alloc` ran 13 whole-arena full
+/// collections (0.477 s of pause) where the same program at `a853135aa` ran 105
+/// copying minors (0.016 s), and `tree` spent 4.1 s of a 5.1 s wall in GC.
+#[test]
+fn polls_default_is_on() {
+    assert!(
+        moving_loop_polls_enabled_from_env(None),
+        "unset PERRY_GC_MOVING_LOOP_POLLS must select the moving-loop path — \
+         a default of OFF leaves the nursery with no precise safepoint to evacuate at"
+    );
+    for kill in ["0", "off", "false"] {
+        assert!(
+            !moving_loop_polls_enabled_from_env(Some(kill)),
+            "PERRY_GC_MOVING_LOOP_POLLS={kill} must remain the kill switch"
+        );
+    }
+    for on in ["1", "on", "true"] {
+        assert!(
+            moving_loop_polls_enabled_from_env(Some(on)),
+            "PERRY_GC_MOVING_LOOP_POLLS={on} must stay an explicit opt-in"
+        );
+    }
+    // An unrecognised value is ON, like every other non-kill value. Spelled out
+    // because the pre-#7690 predicate answered OFF here, so this is the arm that
+    // silently changes meaning if the `matches!` is ever inverted back.
+    assert!(
+        moving_loop_polls_enabled_from_env(Some("yes")),
+        "only the documented kill-switch spellings may disable polls"
+    );
+}
+
+/// The runtime decides whether to DEFER a nursery collection; codegen decides
+/// whether to emit the poll that DRAINS it. They read the same env var from two
+/// crates that cannot share a symbol, and a disagreement is silent in both
+/// directions — polls nothing consumes, or a deferral nothing drains. #7690 left
+/// them agreeing at OFF while documenting ON; this pins them as a pair against a
+/// copy of codegen's table.
+#[test]
+fn polls_default_matches_codegen_mirror() {
+    // Mirrors `perry_codegen::stmt::loops::moving_safepoint_polls_enabled_from_env`.
+    fn codegen_mirror(value: Option<&str>) -> bool {
+        !matches!(value, Some("0") | Some("off") | Some("false"))
+    }
+    for value in [
+        None,
+        Some("0"),
+        Some("off"),
+        Some("false"),
+        Some("1"),
+        Some("on"),
+        Some("true"),
+        Some(""),
+        Some("yes"),
+    ] {
+        assert_eq!(
+            moving_loop_polls_enabled_from_env(value),
+            codegen_mirror(value),
+            "runtime and codegen must agree on PERRY_GC_MOVING_LOOP_POLLS={value:?}"
+        );
+    }
 }
