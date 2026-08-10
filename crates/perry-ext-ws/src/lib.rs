@@ -1118,6 +1118,15 @@ pub unsafe extern "C" fn js_ws_handle_upgrade(
 
 // ── Event-loop tick ───────────────────────────────────────────────
 
+/// NaN-box a numeric ws id with POINTER_TAG so a value handed to user TS
+/// unboxes back to the same id via the standard `unbox_to_i64` receiver
+/// contract (`bits & POINTER_MASK`). The `new WebSocket` ctor path boxes
+/// its handle the same way (lower_call/builtin.rs), so a raw f64 here
+/// would unbox to 0 at the first method call site.
+fn ws_handle_boxed(id: usize) -> f64 {
+    f64::from_bits(POINTER_TAG | ((id as u64) & POINTER_MASK))
+}
+
 /// Drain pending events and dispatch to user-registered listeners.
 /// Called by perry-codegen's main-thread event-loop pump.
 #[no_mangle]
@@ -1137,9 +1146,10 @@ pub extern "C" fn js_ws_process_pending() -> i32 {
                 for cb in listeners {
                     if cb != 0 {
                         let closure = unsafe { JsClosure::from_raw(cb as *const RawClosureHeader) };
-                        // Pass client_id as f64 so user handler can
-                        // pass it back to js_ws_send_to_client etc.
-                        let _ = unsafe { closure.call1(client_id as f64) };
+                        // Box the id with POINTER_TAG (like the WebSocket
+                        // ctor does) so `sock.on/.send/.close` unbox to the
+                        // real ws_id instead of 0.
+                        let _ = unsafe { closure.call1(ws_handle_boxed(client_id)) };
                         fired += 1;
                     }
                 }
@@ -1166,7 +1176,7 @@ pub extern "C" fn js_ws_process_pending() -> i32 {
                             if cb != 0 {
                                 let closure =
                                     unsafe { JsClosure::from_raw(cb as *const RawClosureHeader) };
-                                let _ = unsafe { closure.call2(ws_id as f64, msg_f64) };
+                                let _ = unsafe { closure.call2(ws_handle_boxed(ws_id), msg_f64) };
                                 fired += 1;
                             }
                         }
@@ -1193,7 +1203,7 @@ pub extern "C" fn js_ws_process_pending() -> i32 {
                             if cb != 0 {
                                 let closure =
                                     unsafe { JsClosure::from_raw(cb as *const RawClosureHeader) };
-                                let _ = unsafe { closure.call1(ws_id as f64) };
+                                let _ = unsafe { closure.call1(ws_handle_boxed(ws_id)) };
                                 fired += 1;
                             }
                         }

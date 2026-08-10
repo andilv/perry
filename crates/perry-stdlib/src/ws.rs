@@ -1310,6 +1310,14 @@ pub unsafe extern "C" fn js_ws_process_pending() -> i32 {
 
     let count = events.len() as i32;
 
+    /// NaN-box a numeric ws id with POINTER_TAG so a value handed to user
+    /// TS unboxes back to the same id via the standard `unbox_to_i64`
+    /// receiver contract (`bits & POINTER_MASK`). Mirrors perry-ext-ws's
+    /// `ws_handle_boxed`.
+    fn ws_handle_boxed(id: usize) -> f64 {
+        f64::from_bits(0x7FFD_0000_0000_0000u64 | ((id as u64) & 0x0000_FFFF_FFFF_FFFF))
+    }
+
     for event in events.drain(..) {
         match event {
             PendingWsEvent::Connection(server_handle, client_ws_id) => {
@@ -1319,7 +1327,7 @@ pub unsafe extern "C" fn js_ws_process_pending() -> i32 {
                     .unwrap_or_default();
 
                 // Pass ws_id as a regular f64 number (not NaN-boxed) so === comparison works
-                let client_handle_f64 = client_ws_id as f64;
+                let client_handle_f64 = ws_handle_boxed(client_ws_id);
 
                 for cb in listeners {
                     if cb != 0 {
@@ -1360,7 +1368,7 @@ pub unsafe extern "C" fn js_ws_process_pending() -> i32 {
                                 .and_then(|s| s.listeners.get("message").cloned())
                                 .unwrap_or_default();
                         // Pass ws_id as regular f64 number (not NaN-boxed) so === comparison works
-                        let client_handle_f64 = ws_id as f64;
+                        let client_handle_f64 = ws_handle_boxed(ws_id);
                         for cb in server_listeners {
                             if cb != 0 {
                                 let closure = cb as *const ClosureHeader;
@@ -1394,7 +1402,7 @@ pub unsafe extern "C" fn js_ws_process_pending() -> i32 {
                             get_handle_mut::<WsServerHandle>(server_handle)
                                 .and_then(|s| s.listeners.get("close").cloned())
                                 .unwrap_or_default();
-                        let client_handle_f64 = ws_id as f64;
+                        let client_handle_f64 = ws_handle_boxed(ws_id);
                         for cb in server_listeners {
                             if cb != 0 {
                                 let closure = cb as *const ClosureHeader;
@@ -1435,7 +1443,7 @@ pub unsafe extern "C" fn js_ws_process_pending() -> i32 {
                             get_handle_mut::<WsServerHandle>(server_handle)
                                 .and_then(|s| s.listeners.get("client_error").cloned())
                                 .unwrap_or_default();
-                        let client_handle_f64 = ws_id as f64;
+                        let client_handle_f64 = ws_handle_boxed(ws_id);
                         for cb in server_listeners {
                             if cb != 0 {
                                 let closure = cb as *const ClosureHeader;
