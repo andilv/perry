@@ -1529,6 +1529,10 @@ pub(super) fn finish_full_old_reclaim_baseline() {
     GC_LAST_FULL_ARENA_IN_USE_BYTES.with(|bytes| bytes.set(post_in_use));
     update_major_pacing_backoff(post_in_use);
     GC_OLD_RECLAIM_PENDING.with(|pending| pending.set(false));
+    // #7742: the dead bytes that whole-block promotion parked in old-gen are
+    // exactly what this collection just reclaimed, so the running budget that
+    // caps them starts over.
+    super::note_full_collection_reclaimed_old_gen();
 }
 
 /// Percent of the pre-full live set a full must reclaim to count as productive.
@@ -1584,7 +1588,43 @@ fn update_major_pacing_backoff(post_in_use: usize) {
 /// nothing about arena-growth pacing, and whose repeated use would otherwise
 /// drive the shift to its cap — never moves the backoff.
 fn note_full_cycle_started() {
-    GC_FULL_CYCLE_PRE_IN_USE_BYTES.with(|bytes| bytes.set(crate::arena::arena_in_use_bytes()));
+    GC_FULL_CYCLE_PRE_IN_USE_BYTES.with(|bytes| bytes.set(pacing_arena_in_use_bytes()));
+}
+
+/// The arena reading BOTH halves of arena-growth pacing must use: the
+/// escalation predicate's comparison against the boundary, and the pre-full
+/// reading `note_full_cycle_started` records for `update_major_pacing_backoff`
+/// to price the result against.
+///
+/// `update_major_pacing_backoff`'s doc already says these are "deliberately
+/// measured on the SAME metric ... so the two cannot disagree about whether a
+/// full helped". Reading `arena_in_use_bytes()` twice made that a convention;
+/// one accessor makes it structural (#7737).
+///
+/// It is also the injection point the positive-direction test needs. Forcing a
+/// `true` verdict from the REAL predicate otherwise requires an arena above
+/// `PERRY_GC_MAJOR_PACING_FLOOR_MB` (32 MB by default), and the floor cannot be
+/// lowered per-test: `major_pacing_config` is a process-wide `OnceLock`, so an
+/// env var only takes effect if this test happens to run first. A 32 MB live
+/// heap in a unit test is what `major_pacing_escalation_threshold_for` was
+/// factored out to avoid, so the seam goes here instead — `#[cfg(test)]`, so it
+/// compiles out of every shipping build and is not a mode anything can be
+/// configured into (CLAUDE.md's GC knob kill-policy is about runtime knobs;
+/// this is not one).
+fn pacing_arena_in_use_bytes() -> usize {
+    #[cfg(test)]
+    if let Some(bytes) = TEST_PACING_ARENA_IN_USE.with(|cell| cell.get()) {
+        return bytes;
+    }
+    crate::arena::arena_in_use_bytes()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override for [`pacing_arena_in_use_bytes`]. Thread-local, so
+    /// concurrently-running tests cannot see each other's value.
+    static TEST_PACING_ARENA_IN_USE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Current arena-growth escalation backoff shift.
@@ -1593,18 +1633,25 @@ pub(super) fn major_pacing_backoff_shift() -> u32 {
     GC_MAJOR_PACING_BACKOFF_SHIFT.with(|shift| shift.get())
 }
 
-/// `(post-full baseline bytes, backoff shift, arena in-use bytes needed to
-/// escalate the next minor to a full)` — emitted in the GC trace so a gate can
-/// prove the backoff actually engaged rather than merely that nothing threw.
-/// A zero baseline means no full has run yet, and the threshold is reported as
-/// 0 because the `baseline == 0` clause escalates unconditionally.
-#[cfg(feature = "diagnostics")]
-pub(super) fn major_pacing_snapshot() -> (usize, u32, usize) {
-    let (_floor, growth_num) = major_pacing_config();
+/// `(post-full baseline bytes, backoff shift, arena in-use bytes at or above
+/// which the next minor escalates to a full)` — emitted in the GC trace so a
+/// gate can prove the backoff actually engaged rather than merely that nothing
+/// threw.
+///
+/// The third element is [`major_pacing_escalation_threshold_bytes`] verbatim,
+/// i.e. the boundary `arena_growth_full_escalation_due` actually tests, **floor
+/// included**. `None` means arena-growth pacing is disabled
+/// (`PERRY_GC_MAJOR_PACING_FLOOR_MB=0`) and no reading escalates; a zero
+/// baseline (no full yet) reports the floor, which is the reading that
+/// escalates — not `0`, which is what it used to say.
+// `test` as well as `diagnostics` (matching `major_pacing_backoff_shift`), so
+// the test that pins snapshot-vs-predicate agreement still builds under
+// `--no-default-features`, where the trace itself is compiled out.
+#[cfg(any(feature = "diagnostics", test))]
+pub(super) fn major_pacing_snapshot() -> (usize, u32, Option<usize>) {
     let baseline = GC_LAST_FULL_ARENA_IN_USE_BYTES.with(|bytes| bytes.get());
     let shift = major_pacing_backoff_shift();
-    let threshold = baseline.saturating_mul(growth_num.saturating_mul(1usize << shift));
-    (baseline, shift, threshold)
+    (baseline, shift, major_pacing_escalation_threshold_bytes())
 }
 
 #[cfg(test)]
@@ -1625,6 +1672,18 @@ pub(super) fn test_major_pacing_pre_in_use_bytes() -> usize {
 #[cfg(test)]
 pub(super) fn test_set_major_pacing_baseline(bytes: usize) -> usize {
     GC_LAST_FULL_ARENA_IN_USE_BYTES.with(|cell| {
+        let previous = cell.get();
+        cell.set(bytes);
+        previous
+    })
+}
+
+/// Override the arena reading arena-growth pacing sees, for the duration of a
+/// test. `None` restores the real `arena_in_use_bytes()`. Returns the previous
+/// value so a test can restore it rather than assume it was unset.
+#[cfg(test)]
+pub(super) fn test_set_pacing_arena_in_use(bytes: Option<usize>) -> Option<usize> {
+    TEST_PACING_ARENA_IN_USE.with(|cell| {
         let previous = cell.get();
         cell.set(bytes);
         previous
@@ -1817,7 +1876,13 @@ fn gc_finish_arena_trigger_collection(pre_in_use: usize, outcome: GcCollectOutco
     let stepped = new_total.saturating_add(step);
     let capped = stepped.min(gc_trigger_absolute_ceiling_bytes());
     let floor = new_total.saturating_add(gc_trigger_headroom_floor_bytes());
-    let next_trigger = std::cmp::max(capped, floor);
+    // #7742: whole-block promotion hands Eden's blocks to old-gen instead of
+    // recycling them, so the free young capacity that would have carried the
+    // mutator to the next collection is gone from `new_total`. Give it back as
+    // headroom (consumed once) rather than by re-reserving the blocks, which
+    // would map memory the program may never reach.
+    let next_trigger =
+        std::cmp::max(capped, floor).saturating_add(super::take_promoted_young_capacity_credit());
     GC_NEXT_TRIGGER_BYTES.with(|c| c.set(next_trigger));
     GC_TRIGGER_ARMED.with(|a| a.set(true));
     // Rebaseline the malloc-count trigger only if this collection
@@ -2340,6 +2405,16 @@ pub(crate) fn gc_safepoint_moving_minor() {
     }
     // We are handling this safepoint (collect or find nothing due): clear the
     // deferral flag set by the alloc-point arm (Phase 2/3).
+    //
+    // #7154 tooling: this is also the one place the seeded GC-schedule counter
+    // advances — after the entry guards, so a safepoint that could not have
+    // collected never consumes a schedule slot, and once per handled safepoint
+    // whichever arm reached us (loop back-edge poll or microtask-pump boundary).
+    // Inert (one cached-`Option` load) unless `PERRY_GC_SCHEDULE_SEED` is set.
+    let scheduled = super::schedule::schedule_tick();
+    // `set_safepoint_pending`, not a raw `.set(false)`: since #7735 the pending
+    // flag is mirrored into the poll arming word, and clearing it behind the
+    // mirror would leave the back-edge poll armed forever.
     set_safepoint_pending(false);
     let _declared = DeclaredSafepointGuard::enter();
     let kind = match gc_budgeted_due_trigger() {
@@ -2372,10 +2447,20 @@ pub(crate) fn gc_safepoint_moving_minor() {
             // mode is to collect anyway so an unrooted value moves on its first
             // exposure. `gc_force_evacuate_enabled()` is true under zeal, so
             // this minor MOVES survivors rather than sweeping in place.
-            if !super::gc_zeal_enabled() {
+            //
+            // ...or unless the seeded schedule selected this safepoint, which is
+            // the same bargain at a tunable density instead of all-or-nothing.
+            // `gc_force_evacuate_enabled()` is true in that mode too, for the
+            // same reason. Zeal wins when both are set: it is the strictly
+            // denser schedule, and attributing the collection to the mode that
+            // actually determined it keeps both live-subject counters honest.
+            if super::gc_zeal_enabled() {
+                super::note_zeal_forced_collection();
+            } else if scheduled {
+                super::schedule::note_schedule_forced_collection();
+            } else {
                 return;
             }
-            super::note_zeal_forced_collection();
             GcTriggerKind::ArenaBytes
         }
     };
@@ -2486,6 +2571,18 @@ fn js_gc_loop_safepoint_armed() {
     // it did before, and the deferral-drain path below is untouched.
     if !GC_SAFEPOINT_PENDING.with(Cell::get) {
         if !super::gc_zeal_enabled() {
+            // The seeded schedule (`PERRY_GC_SCHEDULE_SEED`) needs the same
+            // bypass as zeal, and needs it here rather than at the decision
+            // point: a schedule cannot select a safepoint this gate already
+            // returned from. The decision itself — and the counter tick it is
+            // a function of — happens inside `gc_safepoint_moving_minor`, past
+            // the entry guards. Same compile-time caveat as zeal. When both
+            // modes are set, zeal's paced path below runs instead and the
+            // schedule ticks on each collection it forces (zeal wins — it is
+            // the strictly denser schedule).
+            if super::schedule::gc_schedule_enabled() {
+                gc_safepoint_moving_minor();
+            }
             return;
         }
         if !super::zeal::zeal_poll_collection_due(crate::arena::copying_from_space_in_use_bytes()) {
@@ -2645,7 +2742,7 @@ pub(super) fn test_start_budgeted_minor_fallback_state_with_trace(
 /// parse / String alloc. The env vars are for tuning and measurement (read at
 /// process start); defaults chosen so churn oscillates ~baseline..2×baseline
 /// and stays below node's peak.
-fn major_pacing_config() -> (usize, usize) {
+pub(super) fn major_pacing_config() -> (usize, usize) {
     use std::sync::OnceLock;
     static CONFIG: OnceLock<(usize, usize)> = OnceLock::new();
     let &(floor_bytes, growth_num) = CONFIG.get_or_init(|| {
@@ -2685,25 +2782,70 @@ pub(super) fn arena_growth_full_escalation_due() -> bool {
 }
 
 fn arena_growth_full_escalation_due_inner() -> bool {
+    match major_pacing_escalation_threshold_bytes() {
+        // `PERRY_GC_MAJOR_PACING_FLOOR_MB=0` disables the pacing: no reading
+        // escalates, so there is no boundary to compare against.
+        None => false,
+        Some(threshold) => pacing_arena_in_use_bytes() >= threshold,
+    }
+}
+
+/// The smallest `arena_in_use_bytes()` reading that escalates the next minor to
+/// a full, or `None` when arena-growth pacing is disabled outright and no
+/// reading escalates.
+///
+/// **This is the only definition of that boundary.**
+/// `arena_growth_full_escalation_due_inner` is now literally
+/// `in_use >= this`, and `major_pacing_snapshot` reports exactly this — so the
+/// decision and the diagnostic cannot drift apart, rather than merely agreeing
+/// today. #7733 added the snapshot so the pacing subject could be asserted live
+/// in the GC trace, and it recomputed the boundary as `baseline × growth` with
+/// the floor dropped on the ground (`let (_floor, growth_num) = …`). Wherever
+/// the floor dominates — the entire pre-first-full phase, where the old
+/// snapshot reported `0`, and any baseline below `floor / growth` — the trace
+/// named a boundary the collector does not use. A probe that misreports the
+/// quantity it exists to prove is this repo's most expensive recurring bug, so
+/// the fix is one source of truth, not two that match.
+fn major_pacing_escalation_threshold_bytes() -> Option<usize> {
     let (floor_bytes, growth_num) = major_pacing_config();
-    if floor_bytes == 0 {
-        return false; // PERRY_GC_MAJOR_PACING_FLOOR_MB=0 disables the pacing
-    }
-    let in_use = crate::arena::arena_in_use_bytes();
-    if in_use < floor_bytes {
-        return false;
-    }
     let baseline = GC_LAST_FULL_ARENA_IN_USE_BYTES.with(|bytes| bytes.get());
-    // No full yet (baseline 0): bound the initial growth once we clear the floor.
-    if baseline == 0 {
-        return true;
-    }
     // Yield-adaptive: a full that reclaimed almost nothing pushes the next
     // escalation out (`GC_MAJOR_PACING_BACKOFF_SHIFT`). Shift the multiplier,
     // not the baseline, so one productive full restores the original pacing.
     let shift = GC_MAJOR_PACING_BACKOFF_SHIFT.with(|shift| shift.get());
+    major_pacing_escalation_threshold_for(floor_bytes, growth_num, baseline, shift)
+}
+
+/// Pure `(config, state) → boundary`, factored out so the floor/growth
+/// interaction is unit-testable without a 32 MB live heap (which is what left
+/// the original divergence untested: every reachable unit test sat below the
+/// floor, where the two formulas' disagreement is invisible to a `bool`).
+///
+/// `None` means "no arena reading escalates" — either pacing is off, or the
+/// growth term overflowed `usize`, which is the same statement about the world.
+pub(super) fn major_pacing_escalation_threshold_for(
+    floor_bytes: usize,
+    growth_num: usize,
+    baseline: usize,
+    shift: u32,
+) -> Option<usize> {
+    if floor_bytes == 0 {
+        return None; // PERRY_GC_MAJOR_PACING_FLOOR_MB=0 disables the pacing
+    }
+    // No full yet (baseline 0): bound the initial growth once we clear the
+    // floor, so the floor alone is the boundary.
+    if baseline == 0 {
+        return Some(floor_bytes);
+    }
     let growth = growth_num.saturating_mul(1usize << shift);
-    in_use > baseline.saturating_mul(growth)
+    // `+1` because the growth clause is a strict `>` while the floor clause is
+    // a `>=`; taking the max of the two is what the snapshot used to omit.
+    // `checked_*` rather than `saturating_*`: a growth term that does not fit
+    // in a `usize` is a boundary no arena reading can reach, which is exactly
+    // what `None` says — saturating would report `usize::MAX` and then claim an
+    // arena of `usize::MAX` escalates, which the `>` clause never would.
+    let growth_boundary = baseline.checked_mul(growth)?.checked_add(1)?;
+    Some(floor_bytes.max(growth_boundary))
 }
 
 fn gc_start_budgeted_cycle_for_pressure(progress_kind: GcProgressKind) -> Option<BudgetedGcCycle> {

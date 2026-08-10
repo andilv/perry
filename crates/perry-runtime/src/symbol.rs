@@ -137,7 +137,7 @@ pub(crate) fn registered_symbol_description(sym_ptr: usize) -> Option<std::sync:
     guard.as_ref().and_then(|m| m.get(&sym_ptr).cloned())
 }
 
-thread_local! {
+crate::perry_thread_local! {
     /// ★ #7246: descriptions of FRESH (`Symbol("x")`) symbols, off the GC heap.
     ///
     /// A `SymbolHeader` used to store its description as a `*mut StringHeader`
@@ -329,7 +329,20 @@ pub fn is_well_known_symbol(ptr: usize) -> bool {
     false
 }
 
+/// Monotone "this process has ever created a `Symbol`" latch.
+///
+/// `is_registered_symbol` is asked about ordinary pointer-shaped values on the
+/// property/method dispatch paths, and until this latch existed it took a
+/// *process-global* `Mutex` to answer — the most expensive miss in the type-probe
+/// family, and 0.71% of an async-pipeline program that never mentions `Symbol`.
+/// See `crate::registry_latch` for the ordering rule.
+static SYMBOL_EVER_REGISTERED: crate::registry_latch::RegistryLatch =
+    crate::registry_latch::RegistryLatch::new();
+
 pub(crate) fn register_symbol_pointer(ptr: usize) {
+    // Arm before taking the lock, so the entry is never reachable while the
+    // latch still reads idle.
+    SYMBOL_EVER_REGISTERED.arm();
     let mut guard = crate::gc::lock_gc_root_registry(&SYMBOL_POINTERS);
     if guard.is_none() {
         *guard = Some(HashSet::new());
@@ -373,7 +386,18 @@ pub fn intl_legacy_constructed_symbol() -> f64 {
 
 /// O(1) check whether a raw pointer (already untagged) is a known Symbol.
 /// Safe to call on any pointer-shaped value — no dereference is performed.
+#[inline]
 pub fn is_registered_symbol(ptr: usize) -> bool {
+    // No symbol has ever been allocated ⟹ nothing to find, and in particular no
+    // reason to take the process-global registry mutex.
+    if SYMBOL_EVER_REGISTERED.is_idle() {
+        return false;
+    }
+    is_registered_symbol_slow(ptr)
+}
+
+#[inline(never)]
+fn is_registered_symbol_slow(ptr: usize) -> bool {
     if ptr < 0x10000 {
         return false;
     }
@@ -686,8 +710,18 @@ pub(crate) fn store_object_symbol_property_root(
     true
 }
 
+/// Idle until a class declares a static Symbol-keyed member.
+///
+/// `js_instanceof` consults `CLASS_STATIC_SYMBOLS` for a `Symbol.hasInstance`
+/// override on EVERY evaluation, which meant a process-global `Mutex` plus a
+/// SipHash probe of an empty map for every `x instanceof C` in a program that
+/// never mentions a Symbol (#7769).
+pub(crate) static CLASS_STATIC_SYMBOLS_LATCH: crate::registry_latch::RegistryLatch =
+    crate::registry_latch::RegistryLatch::new();
+
 pub(crate) fn store_class_static_symbol_root(class_id: u32, sym_key: usize, value_bits: u64) {
     note_symbol_key_installed(sym_key);
+    CLASS_STATIC_SYMBOLS_LATCH.arm();
     {
         let mut guard = crate::gc::lock_gc_root_registry(&CLASS_STATIC_SYMBOLS);
         if guard.is_none() {

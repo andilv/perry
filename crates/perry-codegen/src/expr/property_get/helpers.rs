@@ -351,58 +351,89 @@ pub(crate) fn lower_raw_f64_class_field_get_for_number_context(
         crate::expr::element_shape_loop_fact_for_property_get(ctx, object, property)
             .map(|(fact, idx)| (fact.clone(), idx))
     {
-        if let Expr::IndexGet { object: array, .. } = object.as_ref() {
-            if let Expr::LocalGet(arr_id) = array.as_ref() {
-                // The counter's canonical i32 slot is what the matcher
-                // required; without it there is nothing to index with.
-                if let Some(slot) = ctx.i32_counter_slots.get(&fact.index_local_id).cloned() {
-                    let idx_i32 = ctx.block().load(I32, &slot);
-                    let value = crate::expr::element_shape_guard::emit_element_shape_field_load(
-                        ctx,
-                        &fact,
-                        &idx_i32,
-                        field_index,
-                    );
-                    let lowered = LoweredValue {
-                        semantic: SemanticKind::JsNumber,
-                        rep: NativeRep::F64,
-                        llvm_ty: DOUBLE,
-                        value: value.clone(),
-                    };
-                    ctx.record_lowered_value_with_access_mode_and_facts(
-                        "ElementShapeFieldGet",
-                        Some(*arr_id),
-                        "element_shape_loop.raw_f64_load",
-                        &lowered,
-                        Some(BoundsState::Guarded {
-                            guard_id: "element_shape_loop_preheader_check".to_string(),
-                        }),
+        // Both receiver spellings — `arr[j].field` and #7771's `r.field`
+        // through the clone's element binding — resolve to the fact's own
+        // array; the report below must not re-derive it from the expression
+        // shape, which the binding form does not carry.
+        let arr_id = fact.array_local_id;
+        // The counter's canonical i32 slot is what the matcher required;
+        // without it there is nothing to index with.
+        if let Some(slot) = ctx.i32_counter_slots.get(&fact.index_local_id).cloned() {
+            let idx_i32 = ctx.block().load(I32, &slot);
+            let value = crate::expr::element_shape_guard::emit_element_shape_field_load(
+                ctx,
+                &fact,
+                &idx_i32,
+                field_index,
+            );
+            let lowered = LoweredValue {
+                semantic: SemanticKind::JsNumber,
+                rep: NativeRep::F64,
+                llvm_ty: DOUBLE,
+                value: value.clone(),
+            };
+            ctx.record_lowered_value_with_access_mode_and_facts(
+                "ElementShapeFieldGet",
+                Some(arr_id),
+                "element_shape_loop.raw_f64_load",
+                &lowered,
+                Some(BoundsState::Guarded {
+                    guard_id: "element_shape_loop_preheader_check".to_string(),
+                }),
+                None,
+                Some(BufferAccessMode::CheckedNative),
+                None,
+                None,
+                None,
+                vec![raw_f64_layout_fact(
+                    Some(arr_id),
+                    "consumed",
+                    "element_shape_loop_preheader_check",
+                    None,
+                )],
+                Vec::new(),
+                false,
+                false,
+                vec![
+                    format!("field={property}"),
+                    format!("class={}", fact.class_name),
+                    "loop_versioning=element_shape".to_string(),
+                    "index_range=nonnegative_i32".to_string(),
+                    "length_range=guarded_i32".to_string(),
+                    "element_shape=homogeneous_class".to_string(),
+                ],
+            );
+            // `--opt-report` consumption (#7766): the selection recorded at
+            // clone emission was APPLIED here. Without this row a build under
+            // the report would print "selected, consumed 0" — the wasted-proof
+            // outcome — for a proof that is in fact doing the work.
+            if crate::opt_report::enabled() {
+                let (name, local_id) = match fact.element_binding {
+                    Some(id) => (
+                        ctx.local_id_to_name
+                            .get(&id)
+                            .cloned()
+                            .unwrap_or_else(|| format!("<local {id}>")),
+                        Some(id),
+                    ),
+                    None => (
+                        ctx.local_id_to_name
+                            .get(&arr_id)
+                            .map(|n| format!("elements of `{n}`"))
+                            .unwrap_or_else(|| format!("elements of <local {arr_id}>")),
                         None,
-                        Some(BufferAccessMode::CheckedNative),
-                        None,
-                        None,
-                        None,
-                        vec![raw_f64_layout_fact(
-                            Some(*arr_id),
-                            "consumed",
-                            "element_shape_loop_preheader_check",
-                            None,
-                        )],
-                        Vec::new(),
-                        false,
-                        false,
-                        vec![
-                            format!("field={property}"),
-                            format!("class={}", fact.class_name),
-                            "loop_versioning=element_shape".to_string(),
-                            "index_range=nonnegative_i32".to_string(),
-                            "length_range=guarded_i32".to_string(),
-                            "element_shape=homogeneous_class".to_string(),
-                        ],
-                    );
-                    return Ok(Some(value));
-                }
+                    ),
+                };
+                crate::opt_report::consume(
+                    crate::opt_report::Position::Local,
+                    &name,
+                    local_id,
+                    crate::opt_report::Analysis::PtrShape,
+                    "Ptr<Shape>",
+                    "element_shape_loop.raw_f64_load",
+                );
             }
+            return Ok(Some(value));
         }
     }
 

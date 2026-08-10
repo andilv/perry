@@ -139,6 +139,9 @@ pub mod pty;
 pub mod punycode;
 pub mod readline_helpers;
 pub mod regex;
+pub mod registry_latch;
+#[cfg(test)]
+mod registry_latch_probes;
 pub mod safe_area;
 pub mod set;
 pub mod shared_sab;
@@ -156,7 +159,8 @@ pub(crate) mod test_support;
 pub mod text;
 pub mod timer;
 /// #7469: one `_tlv_get_addr` for the whole allocation hot path.
-pub(crate) mod tls_hot;
+#[doc(hidden)]
+pub mod tls_hot;
 pub mod typed_feedback;
 pub mod typedarray;
 pub mod typedarray_half;
@@ -310,10 +314,10 @@ pub use value::{
     js_set_handle_array_get, js_set_handle_array_length, js_set_handle_call_method,
     js_set_handle_object_get_property, js_set_handle_to_string, js_set_handle_typeof,
     js_set_native_async_hooks_construct, js_set_native_crypto_dispatch,
-    js_set_native_domain_dispatch, js_set_native_events_construct, js_set_native_http_dispatch,
-    js_set_native_module_js_loader, js_set_native_querystring_dispatch,
-    js_set_native_sqlite_dispatch, js_set_native_tls_dispatch, js_set_native_webcrypto_dispatch,
-    js_set_native_zlib_dispatch, js_set_new_from_handle_v8,
+    js_set_native_domain_dispatch, js_set_native_events_construct, js_set_native_events_dispatch,
+    js_set_native_http_dispatch, js_set_native_module_js_loader,
+    js_set_native_querystring_dispatch, js_set_native_sqlite_dispatch, js_set_native_tls_dispatch,
+    js_set_native_webcrypto_dispatch, js_set_native_zlib_dispatch, js_set_new_from_handle_v8,
 };
 
 // Extension pump registration — allows extensions to register pump functions
