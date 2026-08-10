@@ -584,6 +584,27 @@ impl Drop for LegacyGcPacingGuard {
     }
 }
 
+/// Pin moving-loop polls ON for the duration of the returned guard, so a test
+/// can drive `js_gc_loop_safepoint` without depending on the process-wide
+/// default (which the `OnceLock` fixes from the environment once per test
+/// binary — exactly the ambient dependency #7728's own regression hid behind).
+#[cfg(test)]
+pub(super) struct MovingLoopPollsGuard(Option<bool>);
+
+#[cfg(test)]
+impl MovingLoopPollsGuard {
+    pub(super) fn on() -> Self {
+        Self(GC_MOVING_LOOP_POLLS_TEST_OVERRIDE.with(|cell| cell.replace(Some(true))))
+    }
+}
+
+#[cfg(test)]
+impl Drop for MovingLoopPollsGuard {
+    fn drop(&mut self) {
+        GC_MOVING_LOOP_POLLS_TEST_OVERRIDE.with(|cell| cell.set(self.0));
+    }
+}
+
 /// Pin legacy GC pacing (moving-loop polls OFF) for the duration of the returned
 /// guard. See [`LegacyGcPacingGuard`] and [`gc_moving_loop_polls_enabled`].
 #[cfg(test)]
@@ -865,6 +886,26 @@ thread_local! {
     /// Total arena in-use bytes measured right after the last FULL mark-sweep —
     /// the baseline for major-GC pacing (`arena_growth_full_escalation_due`).
     pub(super) static GC_LAST_FULL_ARENA_IN_USE_BYTES: Cell<usize> = const { Cell::new(0) };
+    /// Total arena in-use bytes measured when the last FULL mark-sweep STARTED.
+    /// Paired with `GC_LAST_FULL_ARENA_IN_USE_BYTES` to price what that full
+    /// actually reclaimed — see `GC_MAJOR_PACING_BACKOFF_SHIFT`.
+    pub(super) static GC_FULL_CYCLE_PRE_IN_USE_BYTES: Cell<usize> = const { Cell::new(0) };
+    /// Yield-adaptive backoff for major-GC pacing (#7726).
+    ///
+    /// `arena_growth_full_escalation_due` escalates a minor to a full once the
+    /// arena's live bytes pass K× the last full's live set. On a workload whose
+    /// live set genuinely GROWS — every record retained, nothing to reclaim —
+    /// that gate fires on the growth itself and buys nothing: measured on
+    /// `gc-handoff/bench/retain.ts`, the two escalated fulls cost 644 ms of a
+    /// 1.31 s run and moved arena in-use by 4 MB total, the second one by zero.
+    ///
+    /// So price each full by what it reclaimed and shift K left when the answer
+    /// is "almost nothing". A churn workload's fulls reclaim most of the heap,
+    /// keep the shift at 0, and pace exactly as before. The shift is capped and
+    /// resets on the first productive full, and it does not touch the
+    /// `OldReclaim` escalation — old-gen garbage still forces a full through
+    /// `old_reclaim_pressure_due` regardless of this backoff.
+    pub(super) static GC_MAJOR_PACING_BACKOFF_SHIFT: Cell<u32> = const { Cell::new(0) };
     /// Re-entrancy guard for the #5476 direct old-gen reclaim driven from
     /// `gc_check_trigger`: the full collection must not recursively trigger
     /// another reclaim if a hook it runs allocates.
@@ -881,6 +922,15 @@ thread_local! {
     /// next precise-root safepoint (event-loop boundary or a codegen loop
     /// back-edge poll) so the copying minor can MOVE survivors instead of the
     /// conservative non-moving minor running mid-expression.
+    ///
+    /// **Write it only through [`super::set_safepoint_pending`].** The poll's
+    /// fast path cannot afford to read a thread-local (on Darwin that is a call
+    /// to `_tlv_get_addr`), so this `Cell` has a process-global shadow —
+    /// `gc::poll_arm::PERRY_GC_POLL_ARMED` — that codegen loads inline to decide
+    /// whether the poll is worth calling. A `set` that bypasses the helper
+    /// leaves the shadow reading zero, and a deferred collection whose drain
+    /// point has been optimised away is stranded until the next event-loop
+    /// boundary.
     pub(super) static GC_SAFEPOINT_PENDING: Cell<bool> = const { Cell::new(false) };
     /// `arena_total_bytes()` sampled at the moment `GC_SAFEPOINT_PENDING` was
     /// last set — the baseline the deferral slack is measured from (#7024).
@@ -1475,8 +1525,116 @@ pub(super) fn finish_full_old_reclaim_baseline() {
     // Record the TOTAL post-full live set for major-GC pacing (young+old): the
     // full sweep is the only collection that frees forwarding stubs, so this is
     // the "clean" size the arena returns to and the base for the K× growth gate.
-    GC_LAST_FULL_ARENA_IN_USE_BYTES.with(|bytes| bytes.set(crate::arena::arena_in_use_bytes()));
+    let post_in_use = crate::arena::arena_in_use_bytes();
+    GC_LAST_FULL_ARENA_IN_USE_BYTES.with(|bytes| bytes.set(post_in_use));
+    update_major_pacing_backoff(post_in_use);
     GC_OLD_RECLAIM_PENDING.with(|pending| pending.set(false));
+}
+
+/// Percent of the pre-full live set a full must reclaim to count as productive.
+/// Below this the next arena-growth escalation is pushed out (see
+/// `GC_MAJOR_PACING_BACKOFF_SHIFT`).
+/// Deliberately low. A full that reclaims 20% of the heap is still doing real
+/// work, and pushing its successor out would carry that garbage twice as long;
+/// the shape this exists for reclaims single-digit percent (5.9% and 0.0% on
+/// `retain.ts`). Raising it trades RSS for pause time.
+const MAJOR_PACING_PRODUCTIVE_YIELD_PCT: usize = 20;
+
+/// Cap on the backoff shift: the escalation multiplier tops out at
+/// `growth_num << 2`, i.e. 8× with the default `growth_num` of 2. Bounded so a
+/// long run of low-yield fulls cannot disable arena-growth pacing outright.
+const MAJOR_PACING_BACKOFF_SHIFT_MAX: u32 = 2;
+
+/// Record what the just-finished full reclaimed and adjust the pacing backoff.
+///
+/// `pre` is the arena in-use reading captured when the full cycle started
+/// (`note_full_cycle_started`); a full that shrinks it by less than
+/// `MAJOR_PACING_PRODUCTIVE_YIELD_PCT` shifts the next escalation threshold
+/// left by one, a productive full resets the shift to 0. Deliberately measured
+/// on the SAME metric the escalation gate reads (`arena_in_use_bytes`) so the
+/// two cannot disagree about whether a full helped.
+fn update_major_pacing_backoff(post_in_use: usize) {
+    let pre_in_use = GC_FULL_CYCLE_PRE_IN_USE_BYTES.with(|bytes| bytes.get());
+    if pre_in_use == 0 {
+        // No start reading (a full driven from a path that does not announce
+        // itself): leave the shift alone rather than guess a yield.
+        return;
+    }
+    GC_FULL_CYCLE_PRE_IN_USE_BYTES.with(|bytes| bytes.set(0));
+    let reclaimed = pre_in_use.saturating_sub(post_in_use);
+    let productive =
+        reclaimed.saturating_mul(100) / pre_in_use >= MAJOR_PACING_PRODUCTIVE_YIELD_PCT;
+    GC_MAJOR_PACING_BACKOFF_SHIFT.with(|shift| {
+        if productive {
+            shift.set(0);
+        } else {
+            shift.set(
+                shift
+                    .get()
+                    .saturating_add(1)
+                    .min(MAJOR_PACING_BACKOFF_SHIFT_MAX),
+            );
+        }
+    });
+}
+
+/// Announce the start of an ESCALATED full mark-sweep so
+/// `update_major_pacing_backoff` can price what it reclaimed. Called only from
+/// `arena_growth_full_escalation_due`, so an explicit `gc()` — whose yield says
+/// nothing about arena-growth pacing, and whose repeated use would otherwise
+/// drive the shift to its cap — never moves the backoff.
+fn note_full_cycle_started() {
+    GC_FULL_CYCLE_PRE_IN_USE_BYTES.with(|bytes| bytes.set(crate::arena::arena_in_use_bytes()));
+}
+
+/// Current arena-growth escalation backoff shift.
+#[cfg(any(feature = "diagnostics", test))]
+pub(super) fn major_pacing_backoff_shift() -> u32 {
+    GC_MAJOR_PACING_BACKOFF_SHIFT.with(|shift| shift.get())
+}
+
+/// `(post-full baseline bytes, backoff shift, arena in-use bytes needed to
+/// escalate the next minor to a full)` — emitted in the GC trace so a gate can
+/// prove the backoff actually engaged rather than merely that nothing threw.
+/// A zero baseline means no full has run yet, and the threshold is reported as
+/// 0 because the `baseline == 0` clause escalates unconditionally.
+#[cfg(feature = "diagnostics")]
+pub(super) fn major_pacing_snapshot() -> (usize, u32, usize) {
+    let (_floor, growth_num) = major_pacing_config();
+    let baseline = GC_LAST_FULL_ARENA_IN_USE_BYTES.with(|bytes| bytes.get());
+    let shift = major_pacing_backoff_shift();
+    let threshold = baseline.saturating_mul(growth_num.saturating_mul(1usize << shift));
+    (baseline, shift, threshold)
+}
+
+#[cfg(test)]
+pub(super) fn test_reset_major_pacing_backoff() {
+    GC_MAJOR_PACING_BACKOFF_SHIFT.with(|shift| shift.set(0));
+    GC_FULL_CYCLE_PRE_IN_USE_BYTES.with(|bytes| bytes.set(0));
+}
+
+/// The pre-full arena reading `arena_growth_full_escalation_due` recorded, or 0
+/// if it declined to escalate. Non-zero is the proof that the escalation is
+/// PRICED — without it the backoff cannot fire and the pacing silently reverts
+/// to the unconditional K× rule.
+#[cfg(test)]
+pub(super) fn test_major_pacing_pre_in_use_bytes() -> usize {
+    GC_FULL_CYCLE_PRE_IN_USE_BYTES.with(|bytes| bytes.get())
+}
+
+#[cfg(test)]
+pub(super) fn test_set_major_pacing_baseline(bytes: usize) -> usize {
+    GC_LAST_FULL_ARENA_IN_USE_BYTES.with(|cell| {
+        let previous = cell.get();
+        cell.set(bytes);
+        previous
+    })
+}
+
+#[cfg(test)]
+pub(super) fn test_note_full_cycle_reclaimed(pre_in_use: usize, post_in_use: usize) {
+    GC_FULL_CYCLE_PRE_IN_USE_BYTES.with(|bytes| bytes.set(pre_in_use));
+    update_major_pacing_backoff(post_in_use);
 }
 
 pub(super) fn gc_bump_malloc_trigger_with_snapshot(current: usize, bytes_now: usize) -> bool {
@@ -1907,7 +2065,7 @@ pub fn gc_check_trigger() {
                 ) {
                     if !already_deferred {
                         GC_SAFEPOINT_DEFER_ARENA_BASE.with(|base| base.set(arena_total));
-                        GC_SAFEPOINT_PENDING.with(|p| p.set(true));
+                        set_safepoint_pending(true);
                     }
                     return;
                 }
@@ -1916,7 +2074,7 @@ pub fn gc_check_trigger() {
                 // pending would pin `GC_SAFEPOINT_DEFER_ARENA_BASE` at a stale,
                 // already-exceeded baseline and disable deferral for the rest of
                 // the process (the same "the branch is dead" shape as #7024).
-                GC_SAFEPOINT_PENDING.with(|p| p.set(false));
+                set_safepoint_pending(false);
             }
             let pre_in_use = crate::arena::arena_in_use_bytes();
             let pre_malloc_count = malloc_object_count();
@@ -2182,7 +2340,7 @@ pub(crate) fn gc_safepoint_moving_minor() {
     }
     // We are handling this safepoint (collect or find nothing due): clear the
     // deferral flag set by the alloc-point arm (Phase 2/3).
-    GC_SAFEPOINT_PENDING.with(|p| p.set(false));
+    set_safepoint_pending(false);
     let _declared = DeclaredSafepointGuard::enter();
     let kind = match gc_budgeted_due_trigger() {
         Some(BudgetedGcTrigger::ArenaBytes) => GcTriggerKind::ArenaBytes,
@@ -2240,29 +2398,106 @@ pub(crate) fn gc_safepoint_moving_minor() {
     super::record_safepoint_drain(super::SafepointDrainKind::NurseryMinor);
 }
 
+/// The ONLY writer of `GC_SAFEPOINT_PENDING`.
+///
+/// The flag has a process-global shadow, `gc::poll_arm::PERRY_GC_POLL_ARMED`,
+/// because the back-edge poll's fast path may not read a thread-local — on
+/// Darwin that is a call to `_tlv_get_addr`, and at 20 M back-edges per
+/// `churn_alloc.ts` run it cost 3 ns each (see `gc/poll_arm.rs`). Keeping the
+/// two in step is this function's whole job: the `Cell` is the truth for THIS
+/// thread, the counter is a conservative superset over all of them, and only
+/// transitions move it, so the count is threads-with-a-deferral rather than
+/// deferral-events.
+pub(crate) fn set_safepoint_pending(pending: bool) {
+    GC_SAFEPOINT_PENDING.with(|flag| {
+        if flag.get() == pending {
+            return;
+        }
+        flag.set(pending);
+        if pending {
+            super::arm_poll();
+        } else {
+            super::disarm_poll();
+        }
+    });
+}
+
 /// Phase 2 of the moving-GC project: codegen emits a call to this at loop
-/// back-edges — but ONLY when the compiler was invoked with the moving-safepoint
-/// opt-in, so default binaries carry zero loop overhead. At a back-edge the
-/// loop-body expression has completed, so no heap value lives in an unspilled
-/// register (every live value is a named local on the shadow stack): a
-/// precise-root safepoint. If moving mode is on and an alloc-point nursery
-/// trigger deferred a collection (`GC_SAFEPOINT_PENDING`), drain it here so the
-/// copying minor MOVES survivors. Cheap no-op otherwise (one cached-bool load +
-/// one thread-local read).
+/// back-edges. At a back-edge the loop-body expression has completed, so no
+/// heap value lives in an unspilled register (every live value is a named local
+/// on the shadow stack): a precise-root safepoint. If moving mode is on and an
+/// alloc-point nursery trigger deferred a collection (`GC_SAFEPOINT_PENDING`),
+/// drain it here so the copying minor MOVES survivors.
+///
+/// **The `armed` load is the entire function on the overwhelmingly common
+/// path**, and that is a deliberate structure rather than a micro-optimisation.
+/// Every allocating loop back-edge in the program lands here — 20 million times
+/// in `bench/churn_alloc.ts` — so this is a per-iteration cost of the language,
+/// paid whether or not any collection is ever due. #7721 turned the polls on by
+/// default (correctly: they are the only precise nursery-collection point a
+/// compute-only program reaches) with the body below still doing two `OnceLock`
+/// acquire loads, an unconditional atomic increment and a thread-local read,
+/// and that cost `churn_alloc` 0.36 s → 0.42, `push_cls` 0.34 → 0.40 and
+/// `push_num` 0.13 → 0.17. `gc/poll_arm.rs` carries the measurement and the
+/// invariant; `PERRY_GC_POLL_ARMED == 0` is a proof there is nothing to do.
+///
+/// Codegen normally makes even this call disappear — it loads the same word
+/// inline and branches around the call — so reaching this body at all means
+/// either the word was armed or the module came from a path that emits the
+/// bare call. Both must still work, which is why the check is repeated here
+/// rather than delegated to the compiler.
 #[no_mangle]
 pub extern "C" fn js_gc_loop_safepoint() {
+    if !super::poll_armed() {
+        return;
+    }
+    js_gc_loop_safepoint_armed();
+}
+
+/// Out of line so the hot entry point above stays a load, a compare and a
+/// return — no frame, no spills.
+#[inline(never)]
+fn js_gc_loop_safepoint_armed() {
+    // Releases the startup seed unless zeal wants every poll. Must run before
+    // the opt-in check below: a build with the polls killed still has to get
+    // the word back to zero, or every back-edge keeps paying for the call.
+    super::resolve_poll_seed();
     if !gc_moving_loop_polls_enabled() {
         return;
     }
     // #7604: the only reliable answer to "did the compile-time half take
-    // effect". Past the opt-in, so a default binary never touches it.
+    // effect". Exhaustive exactly under zeal, which is where `zeal_verdict`
+    // reads it — see `resolve_poll_seed` and `loop_polls_reached`.
     super::note_loop_poll_reached();
-    // Zeal (#7154 tooling) collects at EVERY poll, not only when the alloc-point
-    // arm already deferred one. Zeal cannot conjure a poll codegen never emitted,
-    // so the `gc_moving_loop_polls_enabled()` gate above still applies — see
-    // `gc/zeal.rs` for why that means "compile AND run with
-    // `PERRY_GC_MOVING_LOOP_POLLS=1`".
-    if !GC_SAFEPOINT_PENDING.with(Cell::get) && !super::gc_zeal_enabled() {
+    // Zeal (#7154 tooling) collects at polls the deferral flag would skip, not
+    // only when the alloc-point arm already deferred one. Zeal cannot conjure a
+    // poll codegen never emitted, so the `gc_moving_loop_polls_enabled()` gate
+    // above still applies — see `gc/zeal.rs` for why that means "compile AND run
+    // with `PERRY_GC_MOVING_LOOP_POLLS=1`".
+    //
+    // ★ #7728: "at polls", not "at EVERY poll". Unpaced, this arm cost ~511 µs
+    // per loop iteration to relocate a mean of 5.9 objects, which made zeal
+    // unusable on any real workload the moment #7721 turned back-edge polls on
+    // by default (24 minutes for a 19 s program). The stride is a bound on
+    // forced collections, not a heuristic — see `gc/zeal.rs`.
+    //
+    // The zeal work all sits inside the `!pending` branch on purpose: a default
+    // (zeal-off) build reaches exactly the same one cached-bool read and return
+    // it did before, and the deferral-drain path below is untouched.
+    if !GC_SAFEPOINT_PENDING.with(Cell::get) {
+        if !super::gc_zeal_enabled() {
+            return;
+        }
+        if !super::zeal::zeal_poll_collection_due(crate::arena::copying_from_space_in_use_bytes()) {
+            super::zeal::note_zeal_poll_paced();
+            return;
+        }
+        gc_safepoint_moving_minor();
+        // Rearm from the level measured AFTER the collection, so the next
+        // forced one costs a full stride of new allocation on top of whatever
+        // survived — see `gc/zeal.rs` for why this is a high-water mark and not
+        // a delta.
+        super::zeal::note_zeal_poll_collection(crate::arena::copying_from_space_in_use_bytes());
         return;
     }
     gc_safepoint_moving_minor();
@@ -2404,11 +2639,13 @@ pub(super) fn test_start_budgeted_minor_fallback_state_with_trace(
 /// pay for a full, and by the K× ratio so a workload with a legitimately large
 /// *stable* live set (retain-style) does not over-escalate — its arena hovers
 /// near its own baseline, well under K×.
-pub(super) fn arena_growth_full_escalation_due() -> bool {
-    // Config is parsed ONCE — this runs on the minor-GC path, so no per-call
-    // env lookup / parse / String alloc. The env vars are for tuning and
-    // measurement (read at process start); defaults chosen so churn oscillates
-    // ~baseline..2×baseline and stays below node's peak.
+/// `(floor_bytes, growth_num)` for major-GC pacing.
+///
+/// Parsed ONCE — this runs on the minor-GC path, so no per-call env lookup /
+/// parse / String alloc. The env vars are for tuning and measurement (read at
+/// process start); defaults chosen so churn oscillates ~baseline..2×baseline
+/// and stays below node's peak.
+fn major_pacing_config() -> (usize, usize) {
     use std::sync::OnceLock;
     static CONFIG: OnceLock<(usize, usize)> = OnceLock::new();
     let &(floor_bytes, growth_num) = CONFIG.get_or_init(|| {
@@ -2426,6 +2663,29 @@ pub(super) fn arena_growth_full_escalation_due() -> bool {
             .unwrap_or(DEFAULT_GROWTH_NUM);
         (floor_bytes, growth_num)
     });
+    (floor_bytes, growth_num)
+}
+
+/// Every caller acts on a `true` by running a FULL immediately, so the pre-full
+/// arena reading is recorded HERE rather than at the call sites — that is what
+/// keeps the escalation and the pricing of its result from drifting apart.
+///
+/// The first cut of #7726 wired the two `gc_start_budgeted_cycle_for_pressure`
+/// sites by hand and missed the one in `gc::gc_collect_minor_with_trigger_inner`
+/// — which is the site the shipped safepoint path actually takes. The backoff
+/// then never fired, and the whole change measured as a 30 ms no-op on
+/// `retain.ts` while every test still passed. Recording inside the predicate
+/// makes a future call site correct by construction.
+pub(super) fn arena_growth_full_escalation_due() -> bool {
+    let due = arena_growth_full_escalation_due_inner();
+    if due {
+        note_full_cycle_started();
+    }
+    due
+}
+
+fn arena_growth_full_escalation_due_inner() -> bool {
+    let (floor_bytes, growth_num) = major_pacing_config();
     if floor_bytes == 0 {
         return false; // PERRY_GC_MAJOR_PACING_FLOOR_MB=0 disables the pacing
     }
@@ -2435,7 +2695,15 @@ pub(super) fn arena_growth_full_escalation_due() -> bool {
     }
     let baseline = GC_LAST_FULL_ARENA_IN_USE_BYTES.with(|bytes| bytes.get());
     // No full yet (baseline 0): bound the initial growth once we clear the floor.
-    baseline == 0 || in_use > baseline.saturating_mul(growth_num)
+    if baseline == 0 {
+        return true;
+    }
+    // Yield-adaptive: a full that reclaimed almost nothing pushes the next
+    // escalation out (`GC_MAJOR_PACING_BACKOFF_SHIFT`). Shift the multiplier,
+    // not the baseline, so one productive full restores the original pacing.
+    let shift = GC_MAJOR_PACING_BACKOFF_SHIFT.with(|shift| shift.get());
+    let growth = growth_num.saturating_mul(1usize << shift);
+    in_use > baseline.saturating_mul(growth)
 }
 
 fn gc_start_budgeted_cycle_for_pressure(progress_kind: GcProgressKind) -> Option<BudgetedGcCycle> {

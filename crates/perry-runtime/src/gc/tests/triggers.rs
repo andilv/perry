@@ -667,3 +667,215 @@ fn polls_default_matches_codegen_mirror() {
         );
     }
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// Yield-adaptive major-GC pacing (#7726).
+//
+// `arena_growth_full_escalation_due` escalates a minor to a FULL once arena
+// live-bytes pass K× the last full's live set. On a monotonically growing
+// all-live heap that gate fires on the growth itself and reclaims ~nothing:
+// measured on `gc-handoff/bench/retain.ts`, the two escalated fulls cost 644 ms
+// of a 1.31 s run and moved arena in-use by 4 MB total — the second by zero.
+// So price each full by what it reclaimed and push the next escalation out when
+// the answer is "almost nothing".
+//
+// These assert the DECISION FUNCTION over recorded (pre, post) pairs, which is
+// the part a benchmark cannot pin: a green retain time proves the backoff fired
+// on that one shape, not that a productive full still resets it.
+// ───────────────────────────────────────────────────────────────────────────
+#[test]
+fn major_pacing_backoff_defaults_to_zero_and_needs_a_recorded_cycle_start() {
+    use super::super::policy::{
+        major_pacing_backoff_shift, test_note_full_cycle_reclaimed, test_reset_major_pacing_backoff,
+    };
+    test_reset_major_pacing_backoff();
+    assert_eq!(
+        major_pacing_backoff_shift(),
+        0,
+        "default pacing must be exactly today's: escalate at K× the baseline"
+    );
+    // A full with no recorded start (`note_full_cycle_started` never ran — an
+    // explicit `gc()`, not an arena-growth escalation) must not move the shift:
+    // its yield says nothing about the gate this backoff paces.
+    test_note_full_cycle_reclaimed(0, 0);
+    assert_eq!(major_pacing_backoff_shift(), 0);
+    test_reset_major_pacing_backoff();
+}
+
+#[test]
+fn major_pacing_backs_off_on_futile_fulls_and_resets_on_a_productive_one() {
+    use super::super::policy::{
+        major_pacing_backoff_shift, test_note_full_cycle_reclaimed, test_reset_major_pacing_backoff,
+    };
+    const MB: usize = 1024 * 1024;
+    test_reset_major_pacing_backoff();
+
+    // retain.ts's own two fulls: 67 MB → 63 MB (5.9%) and 204 MB → 204 MB (0%).
+    test_note_full_cycle_reclaimed(67 * MB, 63 * MB);
+    assert_eq!(
+        major_pacing_backoff_shift(),
+        1,
+        "a 5.9%-yield full backs off"
+    );
+    test_note_full_cycle_reclaimed(204 * MB, 204 * MB);
+    assert_eq!(
+        major_pacing_backoff_shift(),
+        2,
+        "a 0%-yield full backs off again"
+    );
+
+    // Capped: a long run of futile fulls must not disable pacing outright.
+    test_note_full_cycle_reclaimed(400 * MB, 400 * MB);
+    test_note_full_cycle_reclaimed(800 * MB, 800 * MB);
+    assert_eq!(major_pacing_backoff_shift(), 2, "the shift is capped");
+
+    // A churn-shaped full reclaims most of the heap and restores the original
+    // pacing immediately — the backoff is not a ratchet.
+    test_note_full_cycle_reclaimed(800 * MB, 200 * MB);
+    assert_eq!(
+        major_pacing_backoff_shift(),
+        0,
+        "a productive full resets the backoff in one step"
+    );
+
+    // Exactly at the threshold counts as productive (>=, not >).
+    test_note_full_cycle_reclaimed(100 * MB, 80 * MB);
+    assert_eq!(major_pacing_backoff_shift(), 0);
+    // One percent under it does not.
+    test_note_full_cycle_reclaimed(100 * MB, 81 * MB);
+    assert_eq!(major_pacing_backoff_shift(), 1);
+    test_reset_major_pacing_backoff();
+}
+
+/// The escalation and the pricing of its result must not be separable.
+///
+/// #7726's first cut recorded the pre-full reading at the two
+/// `gc_start_budgeted_cycle_for_pressure` call sites and missed the one in
+/// `gc::gc_collect_minor_with_trigger_inner` — the site the shipped safepoint
+/// path actually takes. Every test still passed, the decision function was
+/// correct in isolation, and the change measured as a 30 ms no-op on a
+/// benchmark it should have taken 480 ms off. The recording now lives INSIDE
+/// `arena_growth_full_escalation_due`; this pins that coupling, in the one
+/// direction a unit test can force without a 32 MB heap.
+#[test]
+fn declining_to_escalate_records_no_pre_full_reading() {
+    use super::super::policy::{
+        arena_growth_full_escalation_due, test_major_pacing_pre_in_use_bytes,
+        test_reset_major_pacing_backoff, test_set_major_pacing_baseline,
+    };
+    test_reset_major_pacing_backoff();
+    // A baseline no live arena can exceed forces the verdict to `false`.
+    let previous = test_set_major_pacing_baseline(usize::MAX / 4);
+    let due = arena_growth_full_escalation_due();
+    let recorded = test_major_pacing_pre_in_use_bytes();
+    test_set_major_pacing_baseline(previous);
+    test_reset_major_pacing_backoff();
+    assert!(!due, "an unreachable baseline must not escalate");
+    assert_eq!(
+        recorded, 0,
+        "a declined escalation must leave no pre-full reading behind — a stale \
+         one would price the NEXT full against the wrong heap"
+    );
+}
+
+// ---------------------------------------------- the poll's arming word -----
+
+/// The deferral flag and `PERRY_GC_POLL_ARMED` are one piece of state with two
+/// representations, and only the second one is visible to the code that decides
+/// whether to call the poll at all. This pins the transition in both directions.
+///
+/// The unsound direction is a `set` that bypasses `set_safepoint_pending`: the
+/// word stays zero, codegen's inline guard branches around the call, and the
+/// deferred collection is stranded until the next event-loop boundary — which a
+/// compute-only program never reaches. That is #7690's failure mode (a collector
+/// with no nursery evacuation) arriving through a different door, and it is
+/// invisible to every existing test, because a program with no collections still
+/// produces the right answer.
+#[test]
+fn a_deferral_arms_the_poll_word_and_draining_disarms_it() {
+    let _isolation = GcTestIsolationGuard::new();
+    crate::gc::set_safepoint_pending(false);
+    let base = crate::gc::PERRY_GC_POLL_ARMED.load(std::sync::atomic::Ordering::Relaxed);
+
+    crate::gc::set_safepoint_pending(true);
+    assert_eq!(
+        crate::gc::PERRY_GC_POLL_ARMED.load(std::sync::atomic::Ordering::Relaxed),
+        base + 1,
+        "arming a deferral must make the poll's global word non-zero — it is \
+         the ONLY thing a codegen-emitted back-edge consults"
+    );
+
+    // Idempotent: the flag is a bool, so a second set is not a second arm.
+    crate::gc::set_safepoint_pending(true);
+    assert_eq!(
+        crate::gc::PERRY_GC_POLL_ARMED.load(std::sync::atomic::Ordering::Relaxed),
+        base + 1,
+        "only TRANSITIONS may move the counter, or a thread that defers twice \
+         leaks an arm and pins the poll on for the life of the process"
+    );
+
+    crate::gc::set_safepoint_pending(false);
+    assert_eq!(
+        crate::gc::PERRY_GC_POLL_ARMED.load(std::sync::atomic::Ordering::Relaxed),
+        base,
+        "draining must give the arm back"
+    );
+}
+
+/// A poll whose word reads zero must do NOTHING — not even the bookkeeping.
+///
+/// This is the assertion that makes the optimisation real rather than
+/// decorative. `note_loop_poll_reached` is an unconditional atomic RMW on a
+/// process-shared line; leaving it above the gate would keep the most expensive
+/// single instruction of the old fast path on every back-edge while looking, in
+/// every other test, exactly like this one.
+#[test]
+fn an_unarmed_poll_touches_nothing() {
+    let _isolation = GcTestIsolationGuard::new();
+    let _zeal = super::super::zeal::ZealGuard::set(false);
+    crate::gc::set_safepoint_pending(false);
+    let restore = crate::gc::PERRY_GC_POLL_ARMED.load(std::sync::atomic::Ordering::Relaxed);
+    crate::gc::PERRY_GC_POLL_ARMED.store(0, std::sync::atomic::Ordering::Relaxed);
+
+    let polls_before = crate::gc::loop_polls_reached();
+    let collections_before = gc_collection_count();
+    js_gc_loop_safepoint();
+    js_gc_loop_safepoint();
+    let polls_after = crate::gc::loop_polls_reached();
+    let collections_after = gc_collection_count();
+
+    crate::gc::PERRY_GC_POLL_ARMED.store(restore, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        polls_after, polls_before,
+        "an unarmed poll must not reach the counter — reaching it means the \
+         atomic increment is still on every back-edge"
+    );
+    assert_eq!(
+        collections_after, collections_before,
+        "and it certainly must not collect"
+    );
+}
+
+/// Zeal's contract is a collection at EVERY safepoint, not only at ones an
+/// alloc-point trigger already deferred. That is expressible only if the word
+/// stays armed with nothing pending, so zeal owns a permanent arm.
+///
+/// Without this, `PERRY_GC_ZEAL=1` would silently become a no-op on the poll
+/// path: every back-edge would read zero, skip the call, and force nothing —
+/// and `zeal_liveness_report` would be left to report the vacuity after the
+/// fact instead of the instrument simply working.
+#[test]
+fn zeal_holds_the_poll_word_armed_with_nothing_pending() {
+    let _isolation = GcTestIsolationGuard::new();
+    crate::gc::set_safepoint_pending(false);
+    {
+        let _zeal = super::super::zeal::ZealGuard::set(true);
+        assert!(
+            crate::gc::PERRY_GC_POLL_ARMED.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "zeal must keep the poll reachable even with no deferral outstanding"
+        );
+    }
+    // And it gives the arm back, so one zeal test does not leave every later
+    // test in this binary paying for the slow path.
+    crate::gc::set_safepoint_pending(false);
+}
