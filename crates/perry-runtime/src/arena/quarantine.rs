@@ -848,12 +848,17 @@ extern "C" fn fromspace_fault_handler(
     }
 }
 
-#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    unix,
+    any(target_os = "macos", all(target_os = "linux", not(target_env = "musl")))
+))]
 fn emit_native_backtrace() {
     const MAX_FRAMES: usize = 64;
     let mut frames = [std::ptr::null_mut::<libc::c_void>(); MAX_FRAMES];
     // SAFETY: `backtrace`/`backtrace_symbols_fd` are the async-signal-safe pair
-    // (`_fd` writes directly and does not call `malloc`).
+    // (`_fd` writes directly and does not call `malloc`). musl has no
+    // execinfo, so the stub below omits the trace rather than allocate in
+    // a signal handler.
     unsafe {
         let n = libc::backtrace(frames.as_mut_ptr(), MAX_FRAMES as libc::c_int);
         if n > 0 {
@@ -862,7 +867,10 @@ fn emit_native_backtrace() {
     }
 }
 
-#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", all(target_os = "linux", not(target_env = "musl"))))
+))]
 fn emit_native_backtrace() {}
 
 #[cfg(test)]
