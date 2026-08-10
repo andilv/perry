@@ -102,6 +102,20 @@ pub(super) const NET_EVENTS_ROWS: &[NativeModSig] = &[
         args: &[NA_STR, NA_PTR],
         ret: NR_PTR,
     },
+    // `new WebSocketServer({...})` instances (class "WebSocketServer") —
+    // `wss.close()` must reach js_ws_server_close, not the client-only
+    // js_ws_close that the generic entry above wires (a server handle is
+    // never in WS_CONNECTIONS, so the generic entry silently no-ops and
+    // WS_ACTIVE_SERVERS keeps the event loop alive forever).
+    NativeModSig {
+        module: "ws",
+        has_receiver: true,
+        method: "close",
+        class_filter: Some("WebSocketServer"),
+        runtime: "js_ws_server_close",
+        args: &[],
+        ret: NR_VOID,
+    },
     // Server-side helpers — the user receives a client handle as a plain
     // f64 number from `wss.on('connection', (handle) => …)`, then passes
     // it back to these free functions to write/close that specific peer.
