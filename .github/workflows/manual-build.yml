@@ -91,6 +91,9 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - uses: ./.github/actions/setup-llvm22
+        if: steps.filter.outputs.run == 'true'
+
       - uses: Swatinem/rust-cache@v2
         if: steps.filter.outputs.run == 'true'
         with:
