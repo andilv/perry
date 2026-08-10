@@ -1,0 +1,1 @@
+Install LLVM 22 in the manual-build workflow (`setup-llvm22`) so manual `workflow_dispatch` builds compile and link against the LLVM that perry's codegen requires instead of failing on runners without it preinstalled.
