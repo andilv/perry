@@ -21,3 +21,38 @@ global-min-publish-age = "7 days"
 # aborts loudly if the tables are missing (perry-runtime/src/eh.rs).
 [build]
 rustflags = ["-C", "force-unwind-tables=yes"]
+
+# Static-musl link fix (#7353 in-process LLVM): the final perry link pulls
+# llvm-config's --system-libs search dirs, and on ARM64 hosts apt.llvm.org's
+# llvm-config emits `-L/usr/lib/aarch64-linux-gnu` (the GLIBC multiarch dir).
+# Build-script -L dirs land BEFORE rustc's musl self-contained dir, so `-lc`
+# resolves to glibc's static libc.a and the link dies on
+# `libc.a(iofclose.o): undefined reference to '__gcc_personality_v0'`.
+# Prepending the musl libc dir (musl-tools installs it) makes `-lc` hit
+# musl's libc.a first. Target rustflags append after [build] rustflags.
+#
+# NOTE: this only fixes the LIBRARY-SELECTION failure. glibc-built LLVM
+# objects also carry versioned refs (`__isoc23_strtoull@@GLIBC_2.38`) and the
+# system libs (-lz3 -lxml2 -lffi ...) that a musl binary cannot satisfy at
+# runtime — a musl+glibc mixed process segfaults at startup. Musl targets
+# must therefore be built WITHOUT the llvm-inprocess feature (see the musl
+# feature handling in .github/workflows/manual-build.yml and
+# release-packages.yml), keeping the binary pure static musl.
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-L", "native=/usr/lib/aarch64-linux-musl"]
+
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-L", "native=/usr/lib/x86_64-linux-musl"]
+
+# Ubuntu gcc 13 defaults to -D_FORTIFY_SOURCE=3, and on aarch64 its codegen
+# turns memcpy into __memcpy_chk calls in zstd's C sources (x86_64 proves the
+# object sizes and emits plain memcpy). musl's libc.a provides no *_chk
+# symbols, so the musl link dies with
+# `zstd_v01.c: undefined reference to '__memcpy_chk'` on arm64 hosts. Kill
+# fortify for musl-target C compiles only (the cc crate reads these per-target
+# env vars); glibc targets keep the distro default.
+[env]
+CFLAGS_aarch64_unknown_linux_musl = "-U_FORTIFY_SOURCE"
+CXXFLAGS_aarch64_unknown_linux_musl = "-U_FORTIFY_SOURCE"
+CFLAGS_x86_64_unknown_linux_musl = "-U_FORTIFY_SOURCE"
+CXXFLAGS_x86_64_unknown_linux_musl = "-U_FORTIFY_SOURCE"
