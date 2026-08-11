@@ -24,7 +24,11 @@ perry-parser.workspace = true
 swc_ecma_ast.workspace = true
 perry-hir.workspace = true
 perry-transform.workspace = true
-perry-codegen.workspace = true
+# Not inherited (workspace = true) on purpose: `{ workspace = true,
+# default-features = false }` is ignored by cargo (defaults stay ON), so the
+# musl builds could not drop perry-codegen's llvm-inprocess default. See the
+# llvm-inprocess feature note below.
+perry-codegen = { path = "../perry-codegen", default-features = false }
 perry-runtime.workspace = true
 perry-diagnostics.workspace = true
 perry-updater.workspace = true
@@ -103,7 +107,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 [features]
 # The default build is the full official CLI — every command and codegen
 # backend. The shipped binary is unchanged from before #5422.
-default = ["full-cli"]
+default = ["full-cli", "llvm-inprocess"]
 
 full-cli = [
     "dev-cli",
@@ -141,9 +145,19 @@ updater-cli = ["dep:ed25519-dalek", "dep:rand"]
 native-cli = []
 
 # Compile .ll -> .o through the LLVM C API in-process instead of a `clang -c`
-# subprocess. ON BY DEFAULT via perry-codegen's own default feature — Perry
-# links LLVM 22 statically and ships self-contained. See that crate's manifest
-# for why this is load-bearing rather than an optimization.
+# subprocess. ON BY DEFAULT (via `default` below) — Perry links LLVM 22
+# statically and ships self-contained. See perry-codegen's manifest for why
+# this is load-bearing rather than an optimization.
+#
+# Musl targets MUST build without it: apt.llvm.org's LLVM 22 objects are
+# glibc-built (versioned `__isoc23_*@@GLIBC_2.38` refs + -lz3/-lxml2/-lffi
+# system libs), which a musl binary cannot resolve — the link dies on
+# `undefined reference to '__isoc23_strtoull@@GLIBC_2.38'`, and even a forced
+# link produces a musl+glibc mixed process that segfaults at startup. The
+# musl legs of manual-build.yml / release-packages.yml therefore build
+# `--no-default-features --features full-cli` (the in-process backend is not
+# in full-cli) — the shipped musl binary is pure static musl and shells out
+# to the LLVM tools (opt/llc) at compile time, like pre-#7353 builds.
 llvm-inprocess = ["perry-codegen/llvm-inprocess"]
 
 # Codegen backends for non-native targets. Each enables one backend crate;

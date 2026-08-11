@@ -55,10 +55,12 @@ jobs:
             target: x86_64-unknown-linux-musl
             artifact: perry-linux-x86_64-musl
             platform: linux
+            musl: true
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             artifact: perry-linux-aarch64-musl
             platform: linux
+            musl: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: perry-windows-x86_64
@@ -124,7 +126,30 @@ jobs:
 
       - name: Build perry
         if: steps.filter.outputs.run == 'true'
-        run: cargo build --${{ github.event.inputs.profile }} --target ${{ steps.target.outputs.triple }} -p perry
+        run: |
+          FEATURES=""
+          if [ "${{ matrix.musl }}" = "true" ]; then
+            # Musl legs cannot statically link the glibc-built in-process LLVM
+            # (#7353): its objects carry versioned glibc refs (__isoc23_*@@GLIBC_2.38)
+            # and -lz3/-lxml2/-lffi system libs — neither links into musl, and a
+            # forced link produces a musl+glibc mixed process that segfaults at
+            # startup. Build the pure-static variant (no llvm-inprocess feature):
+            # perry then shells out to the LLVM tools (opt/llc) at compile time,
+            # like pre-#7353 builds. See .cargo/config.toml for the matching
+            # per-target rustflags (musl libc.a search order + fortify off).
+            FEATURES="--no-default-features --features full-cli"
+          fi
+          cargo build --${{ github.event.inputs.profile }} --target ${{ steps.target.outputs.triple }} $FEATURES -p perry
+
+      - name: Verify musl binary is fully static
+        if: steps.filter.outputs.run == 'true' && matrix.musl == true
+        run: |
+          BIN="target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/perry"
+          file "$BIN" | grep -q static || { echo "::error::$BIN is not statically linked"; exit 1; }
+          if readelf -l "$BIN" | grep -q INTERP; then
+            echo "::error::$BIN has a dynamic interpreter — musl artifact regressed to glibc-hybrid"
+            exit 1
+          fi
 
       - name: Build runtime
         if: steps.filter.outputs.run == 'true'
