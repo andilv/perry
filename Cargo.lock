@@ -5777,6 +5777,7 @@ version = "0.5.1478"
 dependencies = [
  "argon2",
  "perry-ffi",
+ "rand_core 0.6.4",
 ]
 
 [[package]]
