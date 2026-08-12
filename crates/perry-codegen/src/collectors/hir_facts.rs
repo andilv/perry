@@ -409,6 +409,7 @@ pub(crate) fn collect_type_facts(
     compile_time_constants: &HashMap<u32, f64>,
     module_dispatch: &super::ModuleDispatchFacts,
     spec_ta_lens: &HashMap<u32, i64>,
+    spec_i32_params: &HashSet<u32>,
 ) -> TypeFacts {
     // #7700: which locals hold a NUMBER, so a `u8[k]` keyed on one is a byte
     // read rather than a property read. Computed once here because
@@ -416,12 +417,13 @@ pub(crate) fn collect_type_facts(
     // above all the counter in `for (let i = …) sum += buf[i]`, have to be
     // walked for or the hottest buffer shape loses its i32 representation.
     let numeric_locals = super::collect_numeric_typed_locals(stmts, params, binding_types);
-    let mut integer_locals = super::integer_locals::collect_integer_locals(
+    let mut integer_locals = super::integer_locals::collect_integer_locals_with_seeds(
         stmts,
         flat_const_ids,
         clamp_fn_ids,
         arg_dependent_clamp_fn_ids,
         &numeric_locals,
+        spec_i32_params,
     );
     // Native-i32 residency for integer-valued locals whose init/writes include a
     // possibly-out-of-bounds INT typed-array element read (bcryptjs `_encipher`
@@ -482,6 +484,12 @@ pub(crate) fn collect_type_facts(
     } else {
         HashSet::new()
     };
+    // #7123: this set now includes accumulators whose integer-ness and full
+    // range were proved together (for example `sum += i % 1000`). The older
+    // integer provenance collector deliberately does not accept bare `%`, so
+    // feed the stronger fact into its downstream consumers explicitly. This
+    // is a consequence of the range proof, not an additional assumption.
+    integer_locals.extend(loop_bounded_i32_locals.iter().copied());
     let not_bigint_locals =
         super::not_bigint_locals::collect_not_bigint_locals(stmts, params, binding_types);
     let (mut array_facts, effect_facts, materialization_hazards) =
@@ -679,7 +687,7 @@ pub(crate) fn collect_native_region_fact_graph(
     compile_time_constants: &HashMap<u32, f64>,
     module_dispatch: &super::ModuleDispatchFacts,
 ) -> NativeRegionFactGraph {
-    collect_native_region_fact_graph_with_spec_lens(
+    collect_native_region_fact_graph_with_spec_params(
         stmts,
         params,
         flat_const_ids,
@@ -692,15 +700,15 @@ pub(crate) fn collect_native_region_fact_graph(
         compile_time_constants,
         module_dispatch,
         &HashMap::new(),
+        &HashSet::new(),
     )
 }
 
-/// Variant carrying spec-ABI `TaPtr` parameter lengths (representation-
-/// selection Phase 2): the call-site pre-pass proved these params hold
-/// non-view typed arrays with these constant element counts, which unlocks
-/// the wrap-i32 additive admission's in-bounds operand proof.
+/// Variant carrying spec-ABI parameter facts (representation-selection Phase
+/// 2): `TaPtr` lengths unlock in-bounds proofs, while raw-i32 params seed the
+/// ordinary integer-local fixed point so derived index temps stay native.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn collect_native_region_fact_graph_with_spec_lens(
+pub(crate) fn collect_native_region_fact_graph_with_spec_params(
     stmts: &[Stmt],
     params: &[perry_hir::Param],
     flat_const_ids: &HashSet<u32>,
@@ -713,6 +721,7 @@ pub(crate) fn collect_native_region_fact_graph_with_spec_lens(
     compile_time_constants: &HashMap<u32, f64>,
     module_dispatch: &super::ModuleDispatchFacts,
     spec_ta_lens: &HashMap<u32, i64>,
+    spec_i32_params: &HashSet<u32>,
 ) -> NativeRegionFactGraph {
     collect_type_facts(
         stmts,
@@ -727,6 +736,7 @@ pub(crate) fn collect_native_region_fact_graph_with_spec_lens(
         compile_time_constants,
         module_dispatch,
         spec_ta_lens,
+        spec_i32_params,
     )
 }
 
@@ -753,6 +763,7 @@ pub(crate) fn collect_hir_facts(
         // conservative default keeps it that way if one ever could.
         &super::ModuleDispatchFacts::default(),
         &HashMap::new(),
+        &HashSet::new(),
     )
 }
 
@@ -1989,6 +2000,45 @@ mod tests {
         );
 
         assert!(!facts.unsigned_i32_locals().contains(&2));
+    }
+
+    #[test]
+    fn bounded_modulo_accumulator_seeds_integer_provenance() {
+        // The pre-#7123 integer collector deliberately rejects bare `%`.
+        // Once trip-count x magnitude proves the whole accumulator range, that
+        // stronger fact must reach the ordinary integer-storage gate too.
+        let stmts = vec![
+            mutable_number_let(1, Expr::Integer(0)),
+            Stmt::For {
+                init: Some(Box::new(mutable_number_let(2, Expr::Integer(0)))),
+                condition: Some(Expr::Compare {
+                    op: perry_hir::CompareOp::Lt,
+                    left: Box::new(Expr::LocalGet(2)),
+                    right: Box::new(Expr::Integer(1000)),
+                }),
+                update: Some(Expr::Update {
+                    id: 2,
+                    op: perry_hir::UpdateOp::Increment,
+                    prefix: false,
+                }),
+                body: vec![Stmt::Expr(Expr::LocalSet(
+                    1,
+                    Box::new(Expr::Binary {
+                        op: BinaryOp::Add,
+                        left: Box::new(Expr::LocalGet(1)),
+                        right: Box::new(Expr::Binary {
+                            op: BinaryOp::Mod,
+                            left: Box::new(Expr::LocalGet(2)),
+                            right: Box::new(Expr::Integer(10)),
+                        }),
+                    }),
+                ))],
+            },
+        ];
+        let facts = collect_hir_facts(&stmts, &HashSet::new(), &HashSet::new());
+
+        assert!(facts.loop_bounded_i32_locals().contains(&1));
+        assert!(facts.integer_locals().contains(&1));
     }
 
     #[test]

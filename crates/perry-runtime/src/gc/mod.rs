@@ -128,7 +128,13 @@ use pin::{note_preflight_skipped, note_preflight_walked, young_pin_latch_armed};
 mod prefetch;
 
 mod copying;
+mod copying_first_cycle;
+/// Per-scanner root attribution for the copied-minor root scan (#7915).
+mod scanner_profile;
+mod sticky_remembered;
 use copying::*;
+use copying_first_cycle::*;
+use sticky_remembered::*;
 // The copied-minor pointer classifier is consumed by the weak-holder registry
 // pass in `crate::weakref` (#6182), which lives outside the gc module.
 pub(crate) use copying::CopyingPointerSet;
@@ -158,8 +164,8 @@ mod fromspace_scan;
 mod promote_in_place;
 use promote_in_place::*;
 pub use promote_in_place::{
-    in_place_promoted_objects, in_place_promotion_cycles, untraced_promoted_objects,
-    untraced_promotion_cycles,
+    first_cycle_promotion_attempts, first_cycle_promotion_rollbacks, in_place_promoted_objects,
+    in_place_promotion_cycles, untraced_promoted_objects, untraced_promotion_cycles,
 };
 /// Instrument-liveness counters (#7604): copying minors completed, objects
 /// relocated, loop back-edge polls reached. Mode-independent — they count what
@@ -303,13 +309,6 @@ fn gc_collect_minor_with_trigger_inner(
     // recorded in the cycle trace and read back by the evacuation-policy tests.
     let evacuation_policy_allowed = true;
     let force_evacuation = gc_force_evacuate_enabled();
-    let old_page_selection = if old_to_young_tracking_complete() {
-        select_old_page_defrag_pages(force_evacuation)
-    } else {
-        OldPageDefragSelection::default()
-    };
-    let old_page_source_blocks =
-        crate::arena::old_arena_source_blocks_for_pages(&old_page_selection.pages);
     // MARK_SEEDS persists across GC cycles. Clear before any try_mark
     // call so trace sees only this cycle's freshly-marked headers.
     clear_mark_seeds();
@@ -333,6 +332,18 @@ fn gc_collect_minor_with_trigger_inner(
         };
     }
     clear_mark_seeds();
+    // Old-page defrag belongs to the non-copying fallback below. Snapshotting
+    // and sorting all old-page metadata before trying the copying fast path
+    // charged every ordinary minor an O(old pages) cost even though that path
+    // cannot consume the selection. Defer both selection and source-block
+    // expansion until the fast path has declined the collection.
+    let old_page_selection = if old_to_young_tracking_complete() {
+        select_old_page_defrag_pages(force_evacuation)
+    } else {
+        OldPageDefragSelection::default()
+    };
+    let old_page_source_blocks =
+        crate::arena::old_arena_source_blocks_for_pages(&old_page_selection.pages);
     GcCycleState::new_minor_fallback(
         trigger,
         trace,
@@ -416,6 +427,10 @@ pub fn gen_gc_enabled() -> bool {
 // decision that hasn't been made".
 
 fn gc_force_evacuate_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = knob_overrides::FORCE_EVACUATE_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
     // `PERRY_GC_SCHEDULE_SEED` implies forced evacuation (#7154 tooling): a
     // scheduled minor that leaves survivors in place would move nothing, and
     // "an unrooted value moves on its first exposure" is the entire contract of
@@ -430,10 +445,81 @@ fn gc_force_evacuate_enabled() -> bool {
 }
 
 fn gc_verify_evacuation_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = knob_overrides::VERIFY_EVACUATION_TEST_OVERRIDE.with(std::cell::Cell::get)
+    {
+        return forced;
+    }
     matches!(
         std::env::var("PERRY_GC_VERIFY_EVACUATION").as_deref(),
         Ok("1") | Ok("on") | Ok("true")
     )
+}
+
+/// Per-thread test overrides for the two collector knobs the unit suite needs
+/// to turn ON mid-run (#7946).
+///
+/// **A test may not reach for the process environment to do this.** `set_var`
+/// is process-wide, so a `PERRY_GC_FORCE_EVACUATE=1` held for one test's
+/// duration is read by every other libtest thread — and `gc_force_evacuate_
+/// enabled()` is an input to `should_promote_young_in_place()`, so it silently
+/// turned in-place promotion OFF underneath `gc::tests::promote_in_place`'s
+/// policy cases. Measured at 5 failed runs in 100 across three of them
+/// (`a_promoting_cycle_still_measures_so_the_predictor_cannot_go_stale`,
+/// `dead_byte_budget_stops_promotion_until_a_full_reclaims`,
+/// `untraced_budget_forces_a_measuring_cycle_and_a_measurement_clears_it`); the
+/// arm that skipped the env-setting tests dropped that family to zero.
+///
+/// The old `gc::tests::support::EnvVarGuard` took a mutex, which serialized the
+/// *setters* against each other and did nothing at all for the ~2 200 readers.
+/// That is the opt-in-defence shape `per_test_global!`'s module docs argue
+/// against; per-thread storage is the same answer in a different place.
+///
+/// `ScheduleGuard` (thread-local) was already doing this for forced evacuation
+/// via `PERRY_GC_SCHEDULE_SEED` — see
+/// `gc::tests::evacuation::explicit_gc_under_forced_evacuation_runs_a_moving_minor`,
+/// whose comment says in as many words that "an `EnvVarGuard` would set a
+/// process-global every other test in this crate shares".
+#[cfg(test)]
+pub(super) mod knob_overrides {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static FORCE_EVACUATE_TEST_OVERRIDE: Cell<Option<bool>> =
+            const { Cell::new(None) };
+        pub(super) static VERIFY_EVACUATION_TEST_OVERRIDE: Cell<Option<bool>> =
+            const { Cell::new(None) };
+    }
+
+    /// Pin `gc_force_evacuate_enabled()` for this thread only.
+    pub(crate) struct ForcedEvacuationTestGuard(Option<bool>);
+
+    impl ForcedEvacuationTestGuard {
+        pub(crate) fn on() -> Self {
+            Self(FORCE_EVACUATE_TEST_OVERRIDE.with(|c| c.replace(Some(true))))
+        }
+    }
+
+    impl Drop for ForcedEvacuationTestGuard {
+        fn drop(&mut self) {
+            FORCE_EVACUATE_TEST_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+
+    /// Pin `gc_verify_evacuation_enabled()` for this thread only.
+    pub(crate) struct VerifyEvacuationTestGuard(Option<bool>);
+
+    impl VerifyEvacuationTestGuard {
+        pub(crate) fn on() -> Self {
+            Self(VERIFY_EVACUATION_TEST_OVERRIDE.with(|c| c.replace(Some(true))))
+        }
+    }
+
+    impl Drop for VerifyEvacuationTestGuard {
+        fn drop(&mut self) {
+            VERIFY_EVACUATION_TEST_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
 }
 
 /// `PERRY_GC_SCAVENGE` — **ON by default since #7056**, kill switch
@@ -684,6 +770,29 @@ pub(crate) fn ensure_gc_initialized() {
     }
 }
 
+/// Register a mutable root scanner, tagging it with its own path as the
+/// attribution name (`gc/scanner_profile.rs`, #7915). Root-scan cost on
+/// promise-heavy workloads is per registered root, so "which registry" is the
+/// first question any investigation asks; deriving the name from the
+/// registration site keeps the answer from drifting away from the list.
+macro_rules! reg_scanner {
+    ($scanner:expr $(,)?) => {
+        gc_register_named_mutable_root_scanner(stringify!($scanner), $scanner)
+    };
+}
+
+macro_rules! reg_budgeted_scanner {
+    ($scanner:expr, $step:expr, $state:expr, $source:expr $(,)?) => {
+        gc_register_budgeted_named_mutable_root_scanner_with_source(
+            stringify!($scanner),
+            $scanner,
+            $step,
+            $state,
+            $source,
+        )
+    };
+}
+
 pub fn gc_init() {
     // Idempotent per thread: production calls this at startup, and
     // `ensure_gc_initialized` calls it lazily on threads that don't. Latch the
@@ -693,7 +802,7 @@ pub fn gc_init() {
         return;
     }
     crate::perf_hooks::init_time_origin();
-    gc_register_budgeted_mutable_root_scanner_with_source(
+    reg_budgeted_scanner!(
         scan_runtime_handle_roots_mut,
         scan_runtime_handle_roots_mut_step,
         new_runtime_handle_root_scan_state,
@@ -703,20 +812,20 @@ pub fn gc_init() {
     // across a collection point. Same standing as the shadow stack — a precise
     // mutable root that is marked AND rewritten — and, like the shadow stack,
     // load-bearing the moment the conservative native-stack scan is off.
-    gc_register_budgeted_mutable_root_scanner_with_source(
+    reg_budgeted_scanner!(
         scan_temp_roots_mut,
         scan_temp_roots_mut_step,
         new_temp_root_scan_state,
         MutableRootScannerSource::RuntimeMutableScanner,
     );
-    gc_register_mutable_root_scanner(crate::promise::scan_native_async_completion_roots_mut);
-    gc_register_budgeted_mutable_root_scanner_with_source(
+    reg_scanner!(crate::promise::scan_native_async_completion_roots_mut);
+    reg_budgeted_scanner!(
         promise_mutable_root_scanner,
         crate::promise::scan_promise_roots_mut_step,
         crate::promise::new_promise_root_scan_state,
         MutableRootScannerSource::RuntimeMutableScanner,
     );
-    gc_register_budgeted_mutable_root_scanner_with_source(
+    reg_budgeted_scanner!(
         timer_mutable_root_scanner,
         crate::timer::scan_timer_roots_mut_step,
         crate::timer::new_timer_root_scan_state,
@@ -726,24 +835,22 @@ pub fn gc_init() {
     // tables (defineProperty accessors/attrs) and the proxy registry +
     // reflect-metadata store were invisible to GC — values swept/moved under
     // live references, owner keys stale after evacuation.
-    gc_register_mutable_root_scanner(crate::object::descriptor_state::scan_descriptor_roots_mut);
+    reg_scanner!(crate::object::descriptor_state::scan_descriptor_roots_mut);
     // #6759 Phase C3a: shape records follow their keys array across
     // evacuation (metadata-rewrite rekey only; the records hold no heap
     // references and mark nothing).
-    gc_register_mutable_root_scanner(crate::object::shapes::scan_shape_table_rekey_mut);
-    gc_register_mutable_root_scanner(crate::proxy::scan_proxy_roots_mut);
+    reg_scanner!(crate::object::shapes::scan_shape_table_rekey_mut);
+    reg_scanner!(crate::proxy::scan_proxy_roots_mut);
     // Object/string-valued `err.<prop> = v` user props live as raw bits in
     // ERROR_USER_PROPS — invisible to GC without this scanner (collectable
     // while reachable; stale addresses after a move). The address KEYS are
     // maintained by the ErrorSideTables move/finalize hooks.
-    gc_register_mutable_root_scanner(
-        crate::node_submodules::diagnostics_gc::scan_error_user_props_roots_mut,
-    );
-    gc_register_mutable_root_scanner(exception_mutable_root_scanner);
-    gc_register_mutable_root_scanner(async_context_mutable_root_scanner);
-    gc_register_mutable_root_scanner(async_hooks_mutable_root_scanner);
-    gc_register_mutable_root_scanner(shape_cache_mutable_root_scanner);
-    gc_register_mutable_root_scanner(crate::regex::scan_last_exec_groups_root_mut);
+    reg_scanner!(crate::node_submodules::diagnostics_gc::scan_error_user_props_roots_mut,);
+    reg_scanner!(exception_mutable_root_scanner);
+    reg_scanner!(async_context_mutable_root_scanner);
+    reg_scanner!(async_hooks_mutable_root_scanner);
+    reg_scanner!(shape_cache_mutable_root_scanner);
+    reg_scanner!(crate::regex::scan_last_exec_groups_root_mut);
     // #7211: the eight interned `typeof` result strings, and JSON.rawJSON's
     // interned `"rawJSON"` key. Both are thread-local caches of a RAW
     // `StringHeader*` allocated in the nursery and referenced by nothing else,
@@ -754,44 +861,42 @@ pub fn gc_init() {
     // `PERRY_GC_MOVING_LOOP_POLLS=1` build failed 10/10 rather than
     // intermittently, and why the from-space reporter blamed
     // `retired_by_minor=#0`.
-    gc_register_mutable_root_scanner(crate::builtins::arithmetic::scan_typeof_string_roots_mut);
-    gc_register_mutable_root_scanner(crate::json::raw_json::scan_raw_json_key_root_mut);
-    gc_register_mutable_root_scanner(crate::object::scan_exotic_expando_roots_mut);
-    gc_register_mutable_root_scanner(crate::array::scan_template_raw_roots_mut);
+    reg_scanner!(crate::builtins::arithmetic::scan_typeof_string_roots_mut);
+    reg_scanner!(crate::json::raw_json::scan_raw_json_key_root_mut);
+    reg_scanner!(crate::object::scan_exotic_expando_roots_mut);
+    reg_scanner!(crate::array::scan_template_raw_roots_mut);
     // #6981: the memoized `Array.prototype` / `Object.prototype` addresses in
     // `array::indexing`. Raw addresses of movable objects — a relocating cycle
     // that does not rewrite them leaves the hole/OOB read fallback comparing a
     // stale address against a forwarding-resolved receiver, which defeats its
     // own self-recursion guard and drives the mutator into unbounded recursion.
-    gc_register_mutable_root_scanner(crate::array::scan_prototype_addr_cache_roots_mut);
+    reg_scanner!(crate::array::scan_prototype_addr_cache_roots_mut);
     // #6763: inherited-property resolution retains an owner while an accessor
     // or Proxy trap can re-enter after moving GC. Rewrite that temporary
     // identity so malformed prototype cycles remain bounded.
-    gc_register_mutable_root_scanner(
-        crate::object::prototype_chain::scan_prototype_resolution_stack_roots_mut,
-    );
-    gc_register_mutable_root_scanner(crate::map::scan_map_iterator_array_roots_mut);
-    gc_register_mutable_root_scanner(crate::set::scan_set_iterator_array_roots_mut);
-    gc_register_mutable_root_scanner(crate::perf_hooks::scan_perf_entries_roots_mut);
-    gc_register_mutable_root_scanner(crate::v8::scan_v8_promise_hook_roots_mut);
-    gc_register_mutable_root_scanner(crate::typed_feedback::scan_typed_feedback_roots_mut);
-    gc_register_mutable_root_scanner(crate::typedarray_props::scan_typed_array_own_props_roots_mut);
+    reg_scanner!(crate::object::prototype_chain::scan_prototype_resolution_stack_roots_mut,);
+    reg_scanner!(crate::map::scan_map_iterator_array_roots_mut);
+    reg_scanner!(crate::set::scan_set_iterator_array_roots_mut);
+    reg_scanner!(crate::perf_hooks::scan_perf_entries_roots_mut);
+    reg_scanner!(crate::v8::scan_v8_promise_hook_roots_mut);
+    reg_scanner!(crate::typed_feedback::scan_typed_feedback_roots_mut);
+    reg_scanner!(crate::typedarray_props::scan_typed_array_own_props_roots_mut);
     // A typed array's materialized backing ArrayBuffer lives only as a raw
     // address in TYPED_ARRAY_VIEW_META — collectable/stale under a live typed
     // array, which made `subarray` hand back a garbage-length view.
-    gc_register_mutable_root_scanner(crate::typedarray_view::scan_typed_array_view_meta_roots_mut);
-    gc_register_mutable_root_scanner(transition_cache_mutable_root_scanner);
-    gc_register_mutable_root_scanner(crate::object::scan_object_cache_roots_mut);
-    gc_register_mutable_root_scanner(crate::object::scan_arguments_object_roots_mut);
+    reg_scanner!(crate::typedarray_view::scan_typed_array_view_meta_roots_mut);
+    reg_scanner!(transition_cache_mutable_root_scanner);
+    reg_scanner!(crate::object::scan_object_cache_roots_mut);
+    reg_scanner!(crate::object::scan_arguments_object_roots_mut);
     // bun:ffi (#6562): the cached FFIType enum object.
-    gc_register_mutable_root_scanner(crate::bun_ffi::scan_bun_ffi_roots_mut);
-    gc_register_budgeted_mutable_root_scanner_with_source(
+    reg_scanner!(crate::bun_ffi::scan_bun_ffi_roots_mut);
+    reg_budgeted_scanner!(
         crate::object::scan_class_side_table_roots_mut,
         crate::object::scan_class_side_table_roots_mut_step,
         crate::object::new_class_side_table_root_scan_state,
         MutableRootScannerSource::RuntimeMutableScanner,
     );
-    gc_register_budgeted_mutable_root_scanner_with_source(
+    reg_budgeted_scanner!(
         crate::symbol::scan_symbol_side_table_roots_mut,
         crate::symbol::scan_symbol_side_table_roots_mut_step,
         crate::symbol::new_symbol_side_table_root_scan_state,
@@ -802,10 +907,10 @@ pub fn gc_init() {
     // that body (e.g. @perryts/mysql Pool.acquire → handshake → nativeScramble
     // under concurrent load) must rewrite the cell, or the body's next
     // `this`-derived dispatch derefs a relocated receiver → SIGSEGV.
-    gc_register_mutable_root_scanner(crate::object::scan_implicit_this_roots_mut);
+    reg_scanner!(crate::object::scan_implicit_this_roots_mut);
     // Connected inspector sessions are retained only by the inspector's
     // thread-local registry while they receive protocol notifications.
-    gc_register_mutable_root_scanner(crate::node_inspector::scan_inspector_roots_mut);
+    reg_scanner!(crate::node_inspector::scan_inspector_roots_mut);
     // Issue #1790 (epic #1785 class-object dispatch / design #1772): the class
     // static-inheritance side-tables CLASS_PROTOTYPE_OBJECTS and
     // CLASS_PARENT_CLOSURES hold the heap parent (`class Sub extends make(...)`
@@ -813,23 +918,23 @@ pub fn gc_init() {
     // them so a parent reachable only through the table survives collection and
     // its address is fixed up after a copying-nursery / evacuation move,
     // keeping `Sub.ast` and inherited static methods resolvable.
-    gc_register_mutable_root_scanner(crate::object::scan_class_inheritance_roots_mut);
+    reg_scanner!(crate::object::scan_class_inheritance_roots_mut);
     // #1934: live `child_process.spawn` ChildProcess objects are reachable only
     // from the reactor's registry (the event loop holds no JSValue root for a
     // fire-and-forget spawn). Scan + rewrite them so a GC between ticks doesn't
     // reclaim the object whose `data`/`exit` handlers are still pending.
-    gc_register_mutable_root_scanner(crate::child_process::reactor::cp_reactor_scan_roots_mut);
+    reg_scanner!(crate::child_process::reactor::cp_reactor_scan_roots_mut);
     // #6563: live node-pty IPty objects are likewise reachable only from the
     // pty reactor's registry while their onData/onExit handlers are pending.
     #[cfg(unix)]
-    gc_register_mutable_root_scanner(crate::pty::reactor::pty_reactor_scan_roots_mut);
+    reg_scanner!(crate::pty::reactor::pty_reactor_scan_roots_mut);
     // #4911: a bound node:dgram socket is reachable only from the dgram
     // reactor's registry while its recv thread runs; scan + rewrite it so a GC
     // between ticks doesn't reclaim the object whose `message` handlers fire.
     #[cfg(feature = "mod-dgram")]
-    gc_register_mutable_root_scanner(crate::dgram_reactor::scan_roots_mut);
-    gc_register_mutable_root_scanner(json_parse_mutable_root_scanner);
-    gc_register_mutable_root_scanner(intern_table_mutable_root_scanner);
+    reg_scanner!(crate::dgram_reactor::scan_roots_mut);
+    reg_scanner!(json_parse_mutable_root_scanner);
+    reg_scanner!(intern_table_mutable_root_scanner);
     // #7564: the per-thread `{ value, done }` / `{ done, value }` keys arrays
     // shared by every iterator result the runtime builds. Nothing else in the
     // heap references them — the result objects that use them are short-lived
@@ -837,61 +942,59 @@ pub fn gc_init() {
     // swept and the next `.next()` would install a freed keys array. It also
     // REWRITES: an evacuating collection moves them like any other array, and
     // the thread-local slot is the only place the new address can be recorded.
-    gc_register_mutable_root_scanner(crate::iter_result::scan_iter_result_keys_roots_mut);
-    gc_register_mutable_root_scanner(small_int_cache_mutable_root_scanner);
-    gc_register_mutable_root_scanner(crate::builtins::scan_console_log_singleton_roots_mut);
-    gc_register_mutable_root_scanner(crate::builtins::scan_boxed_primitive_payload_roots_mut);
-    gc_register_mutable_root_scanner(crate::weakref::scan_pending_finalization_jobs_roots_mut);
+    reg_scanner!(crate::iter_result::scan_iter_result_keys_roots_mut);
+    reg_scanner!(small_int_cache_mutable_root_scanner);
+    reg_scanner!(crate::builtins::scan_console_log_singleton_roots_mut);
+    reg_scanner!(crate::builtins::scan_boxed_primitive_payload_roots_mut);
+    reg_scanner!(crate::weakref::scan_pending_finalization_jobs_roots_mut);
     // #6182: keep the weak-holder registry's stored holder ADDRESSES current
     // across evacuation. Metadata-only (non-rooting) — it rewrites forwarded
     // addresses in rewrite phases and emits nothing during mark, so it never
     // keeps a dead holder alive. Copied-minor liveness/prune is driven by
     // `process_weak_targets_from_registry`; this covers full-cycle currency.
-    gc_register_mutable_root_scanner(crate::weakref::scan_weak_holders_roots_mut);
+    reg_scanner!(crate::weakref::scan_weak_holders_roots_mut);
     // Issue #841: GC roots for the per-(submodule, export) function
     // singletons + per-submodule namespace stub objects allocated by
     // `node_submodules.rs`. Without this scanner the next GC cycle
     // after first import-binding use would reclaim the singletons
     // (nothing else holds them — they live for the program's lifetime
     // via codegen `getter` calls, not via a user-visible JSValue root).
-    gc_register_mutable_root_scanner(
-        crate::node_submodules::scan_node_submodule_singleton_roots_mut,
-    );
+    reg_scanner!(crate::node_submodules::scan_node_submodule_singleton_roots_mut,);
     // Box-capture root scanner (mutable closure captures, esp. the
     // generator state-machine's `__iter` and `__step` boxes that hold
     // the iter object + step closure across awaits).
-    gc_register_mutable_root_scanner(crate::r#box::scan_box_roots_mut);
+    reg_scanner!(crate::r#box::scan_box_roots_mut);
     // Iter-result scratch slot — the async-step fast path stows the
     // generator's most recent yield value here; it stays live until
     // the step driver reads it back.
-    gc_register_mutable_root_scanner(crate::promise::scan_iter_result_root_mut);
+    reg_scanner!(crate::promise::scan_iter_result_root_mut);
     // Async-step thunk single-slot cache (build_async_step_thunks).
-    gc_register_mutable_root_scanner(crate::promise::scan_async_step_thunk_cache_mut);
+    reg_scanner!(crate::promise::scan_async_step_thunk_cache_mut);
     // Closure singleton caches. Captured-closure cache keys mirror closure
     // capture heap words, so copied-minor must rewrite them after moving
     // captured young values or future cache hits miss on stale addresses.
-    gc_register_mutable_root_scanner(crate::closure::scan_singleton_closure_roots_mut);
-    gc_register_mutable_root_scanner(crate::closure::scan_closure_dynamic_props_roots_mut);
-    gc_register_mutable_root_scanner(crate::buffer::scan_buffer_own_props_roots_mut);
+    reg_scanner!(crate::closure::scan_singleton_closure_roots_mut);
+    reg_scanner!(crate::closure::scan_closure_dynamic_props_roots_mut);
+    reg_scanner!(crate::buffer::scan_buffer_own_props_roots_mut);
     // Generic per-handle expando properties (`blob.colors = [...]` and other
     // arbitrary own props on native HANDLE values). Keys are stable small handle
     // ids; only the stored VALUES are JS references that must be traced.
-    gc_register_mutable_root_scanner(crate::object::handle_expando::scan_handle_expando_roots_mut);
+    reg_scanner!(crate::object::handle_expando::scan_handle_expando_roots_mut);
     // Native-module callable export singletons and process stdio stream
     // singletons store heap pointers in TLS caches; keep them live and rewrite
     // them if a copying collection moves their backing allocations.
-    gc_register_mutable_root_scanner(crate::object::scan_native_callable_export_roots_mut);
-    gc_register_mutable_root_scanner(crate::object::scan_class_capture_value_roots_mut);
-    gc_register_mutable_root_scanner(crate::node_vm::scan_vm_roots_mut);
+    reg_scanner!(crate::object::scan_native_callable_export_roots_mut);
+    reg_scanner!(crate::object::scan_class_capture_value_roots_mut);
+    reg_scanner!(crate::node_vm::scan_vm_roots_mut);
     // #6559: the dyn-eval interpreter's rooted value stack (environments,
     // temporaries, arguments of in-flight interpreted frames). Mark +
     // REWRITE — interpreter state must survive moving collections triggered
     // from inside interpreted code.
     #[cfg(feature = "dyn-eval")]
-    gc_register_mutable_root_scanner(crate::dyn_eval::scan_dyn_eval_roots_mut);
-    gc_register_mutable_root_scanner(crate::tls::scan_tls_roots_mut);
-    gc_register_mutable_root_scanner(crate::process::scan_process_finalization_roots_mut);
-    gc_register_mutable_root_scanner(crate::process::scan_process_module_loader_roots_mut);
+    reg_scanner!(crate::dyn_eval::scan_dyn_eval_roots_mut);
+    reg_scanner!(crate::tls::scan_tls_roots_mut);
+    reg_scanner!(crate::process::scan_process_finalization_roots_mut);
+    reg_scanner!(crate::process::scan_process_module_loader_roots_mut);
     // #7231: the materialize-once `process.*` caches. Each is a thread-local
     // cell holding a NURSERY-allocated object that nothing else refers to —
     // `process.env` / `.permission` / `.report` are getter CALLS, not fields
@@ -901,22 +1004,22 @@ pub fn gc_init() {
     // `CACHED_ENV` is the load-bearing one: `process.env` is touched by nearly
     // every real Node program, and every `process.env.X = v` after the first
     // collection wrote through a dangling pointer.
-    gc_register_mutable_root_scanner(crate::process::scan_process_env_cache_roots_mut);
-    gc_register_mutable_root_scanner(crate::process::scan_permission_cache_roots_mut);
-    gc_register_mutable_root_scanner(crate::process::scan_report_cache_roots_mut);
+    reg_scanner!(crate::process::scan_process_env_cache_roots_mut);
+    reg_scanner!(crate::process::scan_permission_cache_roots_mut);
+    reg_scanner!(crate::process::scan_report_cache_roots_mut);
     // #7231: the raw `Error` constructor address behind
     // `Error.prepareStackTrace`. The closure is reachable through `globalThis`
     // so it is not swept, but this duplicate lives outside the object graph
     // and goes stale on a move.
-    gc_register_mutable_root_scanner(crate::object::scan_error_constructor_root_mut);
+    reg_scanner!(crate::object::scan_error_constructor_root_mut);
     // #7231: native callback slots that bypass their rooted sibling
     // structures. `RESIZE_CALLBACK` bypasses the EventEmitter listener array;
     // `FRAME_CALLBACKS` is rooted only transiently by a `RuntimeHandleScope`
     // during registration; `INPUT_HANDLER` holds the `useInput` arrow, which
     // in idiomatic inline form has no other reference at all.
-    gc_register_mutable_root_scanner(crate::tty::scan_tty_resize_callback_root_mut);
-    gc_register_mutable_root_scanner(crate::frame::scan_frame_callback_roots_mut);
-    gc_register_mutable_root_scanner(crate::tui::input::scan_tui_input_handler_root_mut);
+    reg_scanner!(crate::tty::scan_tty_resize_callback_root_mut);
+    reg_scanner!(crate::frame::scan_frame_callback_roots_mut);
+    reg_scanner!(crate::tui::input::scan_tui_input_handler_root_mut);
     // #7231: three in-flight cells that hold a NaN-boxed heap value across a
     // window in which user code can run. Each is a second copy of a value
     // whose original is rooted elsewhere, or the only copy for the length of
@@ -924,21 +1027,21 @@ pub fn gc_init() {
     // CELL is the half a scanner can close — the displaced value each
     // save/restore idiom parks in a bare Rust local is noted at each
     // declaration and needs `RuntimeHandleScope` plumbing, not a scanner.
-    gc_register_mutable_root_scanner(crate::object::scan_current_new_target_root_mut);
-    gc_register_mutable_root_scanner(crate::object::scan_accessor_receiver_override_root_mut);
-    gc_register_mutable_root_scanner(crate::object::scan_pending_fetch_signal_root_mut);
-    gc_register_mutable_root_scanner(crate::os::scan_process_event_listener_roots_mut);
+    reg_scanner!(crate::object::scan_current_new_target_root_mut);
+    reg_scanner!(crate::object::scan_accessor_receiver_override_root_mut);
+    reg_scanner!(crate::object::scan_pending_fetch_signal_root_mut);
+    reg_scanner!(crate::os::scan_process_event_listener_roots_mut);
     // #6077: keep promises tracked for an unhandled rejection alive + address-
     // stable until reported, so the program-end report is not a stale/UAF read.
-    gc_register_mutable_root_scanner(crate::promise::scan_unhandled_rejection_roots_mut);
-    gc_register_mutable_root_scanner(crate::os::scan_process_stream_singleton_roots_mut);
-    gc_register_mutable_root_scanner(crate::fs::scan_fs_handle_roots_mut);
-    gc_register_mutable_root_scanner(crate::fs::scan_fs_stream_roots_mut);
-    gc_register_mutable_root_scanner(crate::fs::scan_fs_watcher_roots_mut);
+    reg_scanner!(crate::promise::scan_unhandled_rejection_roots_mut);
+    reg_scanner!(crate::os::scan_process_stream_singleton_roots_mut);
+    reg_scanner!(crate::fs::scan_fs_handle_roots_mut);
+    reg_scanner!(crate::fs::scan_fs_stream_roots_mut);
+    reg_scanner!(crate::fs::scan_fs_watcher_roots_mut);
     #[cfg(feature = "full")]
-    gc_register_mutable_root_scanner(crate::plugin::scan_plugin_roots_mut);
-    gc_register_mutable_root_scanner(crate::geisterhand_registry::scan_geisterhand_roots_mut);
-    gc_register_mutable_root_scanner(crate::ui_text_registry::scan_ui_text_registry_roots_mut);
+    reg_scanner!(crate::plugin::scan_plugin_roots_mut);
+    reg_scanner!(crate::geisterhand_registry::scan_geisterhand_roots_mut);
+    reg_scanner!(crate::ui_text_registry::scan_ui_text_registry_roots_mut);
     // perry/tui hook + state slot pools — they store raw NaN-boxed
     // value bits but the GC has no other way to know which slots hold
     // heap pointers (arrays/objects/strings stashed via setState /
@@ -947,20 +1050,20 @@ pub fn gc_init() {
     // the next allocation triggered minor GC, and the array was
     // reclaimed because nothing else held it — `messages.map(…)` on
     // the stale pointer produced an empty render.
-    gc_register_budgeted_mutable_root_scanner_with_source(
+    reg_budgeted_scanner!(
         crate::tui::hooks::scan_hook_slot_roots_mut,
         crate::tui::hooks::scan_hook_slot_roots_mut_step,
         crate::tui::hooks::new_hook_slot_root_scan_state,
         MutableRootScannerSource::RuntimeMutableScanner,
     );
-    gc_register_budgeted_mutable_root_scanner_with_source(
+    reg_budgeted_scanner!(
         crate::tui::state::scan_state_slot_roots_mut,
         crate::tui::state::scan_state_slot_roots_mut_step,
         crate::tui::state::new_state_slot_root_scan_state,
         MutableRootScannerSource::RuntimeMutableScanner,
     );
     #[cfg(feature = "ohos-napi")]
-    gc_register_mutable_root_scanner(crate::arkts_callbacks::arkts_callbacks_root_scanner_mut);
+    reg_scanner!(crate::arkts_callbacks::arkts_callbacks_root_scanner_mut);
 }
 
 #[no_mangle]
@@ -1031,7 +1134,95 @@ pub extern "C" fn js_gc_release_current_thread_collection_side_allocations() {
     // safepoints the schedule actually saw. Inert (one cached-`Option` load) and
     // once-only when the mode is off.
     schedule::report_exit_summary();
+    emit_incremental_liveness_diag();
     emit_schedule_liveness_verdict();
+}
+
+/// `PERRY_GC_DIAG=1`: what the INCREMENTAL collector charged this run, whether
+/// or not any cycle completed (#7909).
+///
+/// Every other GC diagnostic is emitted per completed cycle, so a run that
+/// starts a budgeted cycle and never finishes it prints nothing at all — the
+/// `asyncpipe` shape, where the collector's own output is empty while a third
+/// of the leaf profile is collector machinery. `cycle_starts > completions`
+/// with a large `steps` is exactly that state, and it is only visible here.
+fn emit_incremental_liveness_diag() {
+    if !telemetry::gc_diag_enabled() {
+        return;
+    }
+    if !crate::native_handle::is_main_thread_or_unrecorded() {
+        return;
+    }
+    static EMITTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if EMITTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let (reentrant, no_trigger, start_blocked, resume_blocked) = instruments::budgeted_step_skips();
+    let (blocked_alloc, blocked_unsafe_zone, blocked_root_lock) =
+        instruments::moving_safepoints_blocked_by_other_guards();
+    eprintln!(
+        "[gc-incremental] cycle_starts={} steps={} completions={} active_at_exit={} \
+         mark_barrier_arms={} mark_barrier_armed_us={} \
+         skips(reentrant={reentrant} no_trigger={no_trigger} start_blocked={start_blocked} \
+         resume_blocked={resume_blocked} nursery_cap_deferred={}) \
+         safepoints_blocked_by_budgeted={} \
+         safepoints_blocked(in_alloc={blocked_alloc} unsafe_zone={blocked_unsafe_zone} \
+         root_lock={blocked_root_lock}) \
+         copying_minors={} loop_polls={} poll_arm_events={} \
+         poll_armed_at_exit={}",
+        instruments::incremental_cycle_starts(),
+        instruments::incremental_steps(),
+        instruments::incremental_completions(),
+        policy::gc_budgeted_cycle_active(),
+        instruments::mark_barrier_arm_events(),
+        instruments::mark_barrier_armed_us(),
+        instruments::budgeted_step_nursery_cap_deferrals(),
+        instruments::moving_safepoints_blocked_by_budgeted(),
+        instruments::copying_minor_cycles(),
+        instruments::loop_polls_reached(),
+        poll_arm::poll_arm_events(),
+        poll_arm::poll_armed_count(),
+    );
+    emit_step_bounds_diag();
+}
+
+/// What the "time-budgeted" collector actually cost, as opposed to what it was
+/// asked to cost (#7903).
+///
+/// `js_gc_step_us` and mutator assist can only consult the clock BETWEEN work
+/// units, so a budget is only as good as the largest single unit. These are the
+/// measured maxima plus the liveness counters for the sliced weak path:
+///
+/// * `step_max_us` — longest single budgeted step.
+/// * `final_remark_max_us` / `final_remarks` — the deliberately ATOMIC phase,
+///   reported separately so a heap-sized pause cannot hide inside the general
+///   maximum.
+/// * `weak_records` / `weak_max_records_per_step` — FinalizationRegistry
+///   records scanned, and the worst single step's share of them. Before #7903
+///   one registry was one work unit, so this maximum was the whole registry.
+/// * `weak_steps_sliced` — steps that ended PARTWAY THROUGH a registry. **This
+///   is the subject-was-live counter**: a run reporting zero has not exercised
+///   the sliced path, whatever else it reports. A NONZERO value proves less
+///   than it looks — a step can end mid-registry at the entry park, before any
+///   record is scanned — so pair it with `weak_max_records_per_step`, which is
+///   what actually distinguishes a sliced array from a swallowed one.
+/// * `weak_registry_restarts` / `weak_registry_atomic_finishes` — cursors
+///   invalidated by mutator restructuring, and the bounded fallback taken when
+///   one registry exhausted its restart budget.
+fn emit_step_bounds_diag() {
+    eprintln!(
+        "[gc-step-bounds] step_max_us={} final_remark_max_us={} final_remarks={} \
+         weak_records={} weak_max_records_per_step={} weak_steps_sliced={} \
+         weak_registry_restarts={} weak_registry_atomic_finishes={}",
+        instruments::step_max_us(),
+        instruments::final_remark_max_us(),
+        instruments::final_remark_count(),
+        instruments::weak_records_scanned(),
+        instruments::weak_max_records_per_step(),
+        instruments::weak_steps_sliced(),
+        instruments::weak_registry_restarts(),
+        instruments::weak_registry_atomic_finishes(),
+    );
 }
 
 /// Print what the rate-1 schedule endpoint actually did, and **fail the

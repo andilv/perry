@@ -46,7 +46,12 @@ on:
 # only backstop for integration-suite regressions a scoped PR run can't see, so
 # it must always reach a conclusion.
 concurrency:
-  group: test-${{ github.event_name }}-${{ github.ref }}
+  # #7966: keyed per RUN for non-PR events. A group that is constant across
+  # scheduled runs lets only the first one execute -- GitHub keeps at most one
+  # PENDING run per group and cancels the rest with `jobs: 0`, regardless of
+  # `cancel-in-progress`. PR runs keep the shared per-ref group so superseded
+  # pushes still coalesce. Enforced by scripts/gc_gate_wiring_check.py.
+  group: test-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -243,6 +248,65 @@ jobs:
         run: |
           python3 scripts/check_gc_env_knobs.py --self-test
           python3 scripts/check_gc_env_knobs.py
+
+      # #7877, second round. The knob audit above covers env-var names; it says
+      # nothing about the paths and numbers the same pages state. Both drifted:
+      # the memory-model source map pointed at a `gc.rs` deleted in the module
+      # split (with line numbers), and CLAUDE.md carried "~55 registered
+      # scanners" against a population of 123 in two places, of which only one
+      # got corrected by hand. Numbers on the current pages now carry `gc-fact`
+      # markers naming the constant they came from, and this re-derives them.
+      # Build-free, so it belongs in `lint`, which IS a required context.
+      - name: GC documentation claim audit
+        if: ${{ !cancelled() }}
+        run: |
+          python3 scripts/check_gc_doc_claims.py --self-test
+          python3 scripts/check_gc_doc_claims.py
+
+      # #7977. The audits above ALSO run as `windows-build`'s first step, where
+      # a bare `read_text()` decodes cp1252 and dies on the 15 runtime sources
+      # carrying 0x81/0x8d/0x8f/0x90/0x9d. That took the whole Windows job down
+      # — including the only Windows run of the perry-runtime unit tests —
+      # before any of it executed. #7882 fixed three of the four readers; this
+      # is what stops the fourth miss from being found on Windows again.
+      #
+      # It runs HERE, on Linux, in a REQUIRED context, precisely because the
+      # defect is invisible on Linux at runtime: the scan is static, so the
+      # class is caught per-PR rather than only when a Windows runner gets to
+      # it. `--self-test` plants each shape, so the checker can say no.
+      - name: Windows-portable text I/O in the Windows-CI audits
+        if: ${{ !cancelled() }}
+        run: |
+          python3 scripts/check_locale_independent_io.py --self-test
+          python3 scripts/check_locale_independent_io.py
+
+      # #7970. `gc_evacuation_liveness_assert.py` is the liveness gate for every
+      # forced-evacuation arm, and it reads ONLY `[gc-copy-minor]` lines, which
+      # exist only under `PERRY_GC_DIAG=1`. When an arm forgot that flag the
+      # assert reported "the forced-evacuation arm evacuated NOTHING" — sending
+      # readers to debug a collector that was in fact evacuating 16277 objects
+      # per run. It now separates "the instrument was off" from "the subject was
+      # dead", and this proves it still can, in both directions. Hermetic and
+      # instant, so it belongs in `lint` (a REQUIRED context) rather than only
+      # in the GC gate it serves — which is itself still red.
+      - name: GC evacuation-liveness assert can say no
+        if: ${{ !cancelled() }}
+        run: python3 scripts/gc_evacuation_liveness_assert.py --self-test
+
+      # Node is a correctness input (see CLAUDE.md "TypeScript Parity Status"):
+      # an oracle that cannot run a gap test drops it from the gate instead of
+      # failing it. #6367 made `.node-version` the single pin, and the pin has
+      # leaked twice since -- CLAUDE.md's prose drifted off the file (#7599), and
+      # npm-launcher.yml was created the same day as #6367 and kept that day's
+      # ambient "22.23.1" literal by omission. This re-derives every restatement
+      # from the file it quotes and requires every literal `node-version:` in a
+      # workflow to be a registered exemption with a reason. Build-free, so it
+      # belongs in `lint`, which IS a required context.
+      - name: Node version consistency
+        if: ${{ !cancelled() }}
+        run: |
+          python3 scripts/check_node_version_consistency.py --self-test
+          python3 scripts/check_node_version_consistency.py
 
       # #7341 layer 3. A RuntimeHandleScope gives an object liveness; it does
       # nothing for a raw pointer already read out of the slot. Every rooting bug
@@ -1077,10 +1141,21 @@ jobs:
 
       - name: GC structural audits (Windows)
         shell: bash
+        env:
+          # #7977 belt-and-braces. These scripts read Rust sources that contain
+          # bytes cp1252 has no mapping for; the ACTUAL fix is an explicit
+          # `encoding="utf-8"` at every call site, enforced on Linux by
+          # `scripts/check_locale_independent_io.py` in `lint`. This makes a
+          # future miss in a script that gate does not yet cover degrade to
+          # "works anyway" instead of taking the whole job — and with it the
+          # only Windows run of the perry-runtime unit tests — down at step one.
+          PYTHONUTF8: "1"
         run: |
           set -euo pipefail
           python scripts/gc_runtime_root_holders.py --self-test
           python scripts/gc_runtime_root_holders.py
+          python scripts/check_gc_doc_claims.py --self-test
+          python scripts/check_gc_doc_claims.py
           python scripts/check_thread_locals.py --self-test
           python scripts/check_thread_locals.py
           python -m unittest discover -s tests -p 'test_gc_ratchet.py' -v

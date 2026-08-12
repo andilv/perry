@@ -24,7 +24,7 @@ fn general_block_offset(idx: usize) -> usize {
     ARENA.with(|a| unsafe { (&*a.get()).blocks[idx].offset })
 }
 
-fn run_with_fresh_arenas(test: impl FnOnce() + Send + 'static) {
+pub(super) fn run_with_fresh_arenas(test: impl FnOnce() + Send + 'static) {
     std::thread::spawn(test)
         .join()
         .expect("arena test panicked");
@@ -1470,6 +1470,23 @@ fn deferred_registration_flush_sites() {
              between the walk's start and its end allocates into old-gen",
         ),
         (
+            "register_promoted_page_headers",
+            "the TRACED promotion's eager arm, split out of \
+             register_promoted_page_run. Same argument: one call per PAGE from \
+             `finish_in_place_promotion`'s single linear walk, which flushes \
+             once before the whole walk, and nothing between the walk's start \
+             and its end allocates into old-gen",
+        ),
+        (
+            "expand_promoted_run",
+            "expands a DESCRIBED promoted page into the object list. Every \
+             caller has already flushed: the four readers/removers do so as \
+             their #7624 obligation, `materialize_all_promoted_page_runs` runs \
+             immediately after `old_pages_begin_gc_cycle`, and \
+             `register_promoted_page_run` is inside the promotion walk covered \
+             by the entry above",
+        ),
+        (
             "flush_deferred_old_page_registrations",
             "the flush entry point",
         ),
@@ -1810,5 +1827,81 @@ fn batched_flush_matches_eager_registration() {
             "page object_count must match the eager path's, counting the \
              re-registered address exactly once"
         );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// #7912: `arena_alloc_gc_no_collect` — the "allocate without a collection
+// point" entry point.
+//
+// Its whole value is a guarantee, not a speed: a caller holding raw heap
+// pointers it has not rooted may allocate through it and, on a non-null
+// return, KNOW nothing moved. That is only true if it REFUSES rather than
+// reaching `gc_check_trigger()` when the open block cannot serve the request,
+// so that is what these tests pin.
+//
+// ★ An earlier cut of this coverage asserted only "a small concat reached no
+// trigger", which is vacuous: a small allocation into a block with room does
+// not reach the trigger through `arena_alloc` either. Replacing the entry's
+// body with the COLLECTING `arena_alloc` left that test green. These two
+// drive the block to the point where the two entries must diverge.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn no_collect_alloc_refuses_a_full_block_instead_of_collecting() {
+    run_with_fresh_arenas(|| {
+        reset_gc_trigger_arena_probe();
+        // Comfortably under LARGE_OBJECT_THRESHOLD_BYTES, so every request
+        // takes the nursery bump path rather than old-gen birth.
+        let chunk = LARGE_OBJECT_THRESHOLD_BYTES / 4;
+        let bound = 8 * BLOCK_SIZE / chunk;
+        let mut served = 0usize;
+        let mut refused = false;
+        for _ in 0..bound {
+            if arena_alloc_gc_no_collect(chunk, 8, GC_TYPE_STRING).is_null() {
+                refused = true;
+                break;
+            }
+            served += 1;
+        }
+        assert!(
+            refused,
+            "the no-collect entry must REFUSE once the open block is full — it \
+             served {served} chunks of {chunk} B without ever declining, which \
+             means it reached the block-reservation/collection path it exists \
+             to avoid"
+        );
+        assert!(
+            served > 0,
+            "test premise: the entry must serve from an open block at all"
+        );
+        assert_eq!(
+            gc_trigger_arena_calls(),
+            0,
+            "the no-collect entry reached the allocation-point GC trigger; \
+             every raw pointer a caller read before it is now potentially \
+             from-space"
+        );
+        // A refusal is a refusal, not damage: the same request through the
+        // collecting entry still works, which is the caller's fallback.
+        assert!(
+            !arena_alloc_gc(chunk, 8, GC_TYPE_STRING).is_null(),
+            "the collecting fallback must still serve after a refusal"
+        );
+    });
+}
+
+#[test]
+fn no_collect_alloc_refuses_an_oversized_request() {
+    run_with_fresh_arenas(|| {
+        reset_gc_trigger_arena_probe();
+        // Old-gen birth walks page lists and can reserve, so it is outside the
+        // contract even though it is not itself `gc_check_trigger`.
+        assert!(
+            arena_alloc_gc_no_collect(LARGE_OBJECT_THRESHOLD_BYTES * 2, 8, GC_TYPE_STRING)
+                .is_null(),
+            "a large-object request must be refused, not born tenured"
+        );
+        assert_eq!(gc_trigger_arena_calls(), 0);
     });
 }

@@ -303,9 +303,11 @@ pub fn run_with_parse_cache(
         .clone()
         .or_else(|| object_cache::cache_dir_override(&ctx.cache_root));
     ctx.cache_dir = object_cache::resolve_cache_dir(&ctx.cache_root, cache_dir_override.as_deref());
-    // #5247: propagate `--debug-symbols` so `collect_modules` records the
-    // CJS-wrap source mapping needed to render original-source line numbers.
-    ctx.debug_symbols = args.debug_symbols;
+    // #5247 / #7036: ask `collect_modules` to retain the CJS wrapper source
+    // mapping whenever a later consumer needs original-source line numbers.
+    // Text opt reports use the mapping for declaration snippets but do not
+    // otherwise enable debug locations or symbols.
+    ctx.debug_symbols = args.debug_symbols || opt_report_format == Some(OptReportFormat::Text);
 
     let build_cache_probe =
         BuildCacheProbe::new(&args, &project_root, &ctx.cache_root, &ctx.cache_dir);
@@ -4304,15 +4306,19 @@ pub fn run_with_parse_cache(
                 // the module's original source so codegen can map a Call's byte
                 // offset to a 1-based line.
                 debug_locations: args.debug_symbols,
-                // #5247: source consulted to turn a node's `byte_offset` into a
-                // line. For a CommonJS module the offsets are in WRAPPED-source
+                // #5247 / #7036: source consulted to turn a node's `byte_offset`
+                // into a debug frame or opt-report snippet. For a CommonJS
+                // module the offsets are in WRAPPED-source
                 // coordinates (perry parsed the injected-IIFE text), so we hand
                 // codegen the WRAPPED source — counting newlines up to a wrapped
                 // offset against the original would be off by the preamble byte
                 // length. `debug_source_line_offset` (below) then converts the
                 // wrapped line back to the original line. Non-wrapped modules
-                // read the original from disk.
-                module_source: if args.debug_symbols {
+                // read the original from disk. Text reports need this source;
+                // JSON reports only need the offset already carried by HIR.
+                module_source: if args.debug_symbols
+                    || opt_report_format == Some(OptReportFormat::Text)
+                {
                     match ctx.cjs_wrap_debug_sources.get(path) {
                         Some(w) => Some(w.wrapped_source.clone()),
                         None => std::fs::read_to_string(path).ok(),
@@ -4325,7 +4331,9 @@ pub fn run_with_parse_cache(
                 // Codegen subtracts this from the wrapped line number so the
                 // rendered location is in original-source coordinates. `0` for
                 // non-wrapped modules (and the entire default build).
-                debug_source_line_offset: if args.debug_symbols {
+                debug_source_line_offset: if args.debug_symbols
+                    || opt_report_format == Some(OptReportFormat::Text)
+                {
                     ctx.cjs_wrap_debug_sources
                         .get(path)
                         .map(|w| w.prefix_line_count)
@@ -6176,64 +6184,7 @@ pub fn run_with_parse_cache(
         // For Windows/Linux (non-bundle targets), copy asset directories next to the exe
         // so that resolve_asset_path can find them relative to the executable.
         if let Some(output_dir) = exe_path.parent() {
-            let source_dir = args
-                .input
-                .canonicalize()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-            if let Some(src_dir) = source_dir {
-                let mut project_root = src_dir.clone();
-                for _ in 0..5 {
-                    if project_root.join("package.json").exists() {
-                        break;
-                    }
-                    if let Some(parent) = project_root.parent() {
-                        project_root = parent.to_path_buf();
-                    } else {
-                        break;
-                    }
-                }
-                fn copy_dir_recursive_standalone(
-                    src: &std::path::Path,
-                    dst: &std::path::Path,
-                ) -> std::io::Result<()> {
-                    fs::create_dir_all(dst)?;
-                    for entry in fs::read_dir(src)? {
-                        let entry = entry?;
-                        let ty = entry.file_type()?;
-                        let dest_path = dst.join(entry.file_name());
-                        if ty.is_dir() {
-                            copy_dir_recursive_standalone(&entry.path(), &dest_path)?;
-                        } else {
-                            fs::copy(entry.path(), &dest_path)?;
-                        }
-                    }
-                    Ok(())
-                }
-                // Resolve output_dir: exe_path.parent() returns "" for bare filenames like "Mango"
-                let output_resolved = if output_dir.as_os_str().is_empty() {
-                    std::path::PathBuf::from(".")
-                } else {
-                    output_dir.to_path_buf()
-                };
-                let output_canon = output_resolved
-                    .canonicalize()
-                    .unwrap_or_else(|_| output_resolved.clone());
-                let project_canon = project_root
-                    .canonicalize()
-                    .unwrap_or_else(|_| project_root.to_path_buf());
-                // Skip asset copying if output dir IS the project root
-                // (fs::copy to self truncates files to 0 bytes)
-                if output_canon != project_canon {
-                    for dir_name in &["logo", "assets", "resources", "images"] {
-                        let resource_dir = project_root.join(dir_name);
-                        if resource_dir.is_dir() {
-                            let dest = output_dir.join(dir_name);
-                            let _ = copy_dir_recursive_standalone(&resource_dir, &dest);
-                        }
-                    }
-                }
-            }
+            resources::copy_standalone_resource_dirs(&args.input, output_dir);
             if !is_harmonyos {
                 resources::stage_native_library_artifacts(&ctx, output_dir, format)?;
             }

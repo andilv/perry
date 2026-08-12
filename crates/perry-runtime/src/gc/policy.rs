@@ -108,8 +108,55 @@ pub(super) fn young_scavenge_cap_due() -> bool {
     if !nursery_cap_active() {
         return false;
     }
-    crate::arena::copying_from_space_in_use_bytes()
-        >= super::tenuring::scavenge_nursery_cap_effective_bytes()
+    crate::arena::copying_from_space_in_use_bytes() >= scavenge_nursery_cap_dueness_bytes()
+}
+
+/// The cap value [`young_scavenge_cap_due`] compares against.
+///
+/// Split out only so a test can make the cap due without allocating the real
+/// 16 MB — a PER-THREAD override next to the reader, the shape support.rs
+/// mandates for anything a test needs to move (never the process environment,
+/// which is shared by every libtest thread; see #7946). It deliberately does
+/// NOT feed `effective_next_arena_trigger`: this is about *dueness*, and a test
+/// that also moved the trigger clamp would be changing two things at once.
+fn scavenge_nursery_cap_dueness_bytes() -> usize {
+    #[cfg(test)]
+    if let Some(bytes) = GC_NURSERY_CAP_TEST_DUE_BYTES.with(Cell::get) {
+        return bytes;
+    }
+    super::tenuring::scavenge_nursery_cap_effective_bytes()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override for [`scavenge_nursery_cap_dueness_bytes`].
+    static GC_NURSERY_CAP_TEST_DUE_BYTES: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// RAII override making the young-gen scavenge cap due at `bytes` of from-space
+/// occupancy on this thread (#7909).
+#[cfg(test)]
+pub(super) struct ScavengeNurseryCapTestGuard {
+    previous: Option<usize>,
+}
+
+#[cfg(test)]
+impl ScavengeNurseryCapTestGuard {
+    pub(super) fn due_at_bytes(bytes: usize) -> Self {
+        let previous = GC_NURSERY_CAP_TEST_DUE_BYTES.with(|cell| {
+            let previous = cell.get();
+            cell.set(Some(bytes));
+            previous
+        });
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScavengeNurseryCapTestGuard {
+    fn drop(&mut self) {
+        GC_NURSERY_CAP_TEST_DUE_BYTES.with(|cell| cell.set(self.previous));
+    }
 }
 
 /// Is the scavenge nursery cap in force?
@@ -201,9 +248,15 @@ pub(super) fn effective_next_arena_trigger() -> usize {
     base.min(super::tenuring::scavenge_nursery_cap_effective_bytes())
 }
 
+/// Default base nursery high-water cap, in MiB. Named rather than inline
+/// because `docs/src/internals/garbage-collector.md` documents it and
+/// `scripts/check_gc_doc_claims.py` re-derives the documented number from this
+/// definition.
+pub(super) const SCAVENGE_NURSERY_CAP_DEFAULT_MB: usize = 16;
+
 /// Nursery high-water cap used only when `PERRY_GC_SCAVENGE` is on (default
-/// 16 MB; override with `PERRY_GC_SCAVENGE_NURSERY_MB`). See
-/// `effective_next_arena_trigger`.
+/// [`SCAVENGE_NURSERY_CAP_DEFAULT_MB`]; override with
+/// `PERRY_GC_SCAVENGE_NURSERY_MB`). See `effective_next_arena_trigger`.
 pub(super) fn gc_scavenge_nursery_cap_bytes() -> usize {
     use std::sync::OnceLock;
     static CACHED: OnceLock<usize> = OnceLock::new();
@@ -212,7 +265,7 @@ pub(super) fn gc_scavenge_nursery_cap_bytes() -> usize {
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
             .filter(|&mb| mb > 0)
-            .unwrap_or(16)
+            .unwrap_or(SCAVENGE_NURSERY_CAP_DEFAULT_MB)
             .saturating_mul(1024 * 1024)
     })
 }
@@ -1398,8 +1451,33 @@ pub(super) fn gc_old_reclaim_growth_band_bytes(baseline: usize) -> usize {
 
 #[inline]
 pub(super) fn old_reclaim_pressure_due(old_in_use: usize, baseline: usize) -> bool {
-    (old_in_use >= gc_old_gen_reclaim_threshold_dyn_bytes()
-        && baseline < gc_old_gen_reclaim_threshold_dyn_bytes())
+    let threshold = gc_old_gen_reclaim_threshold_dyn_bytes();
+    // #7937: the absolute first-crossing arm is exempted while the heap is
+    // measurably RETAINING, for the reason #7592 already exempted the
+    // proportional arm two functions down — and it is the arm that actually
+    // fires.
+    //
+    // `baseline` is credited by every promotion
+    // (`credit_promoted_bytes_to_old_baseline`), so `old_in_use >= T &&
+    // baseline < T` is a race between two quantities that move in the same
+    // direction at different granularities. Whether it fires therefore depends
+    // on the SIZE OF THE PROMOTION STEPS, not on any property of the heap.
+    // Measured on `retain.ts` (#7937, `gc-handoff/CYCLE0-NOTES.md`): same
+    // program, same live set, same total promotion — changing the schedule from
+    // (18.7 MB, 34.6 MB) to (17.7 MB, 17.8 MB) makes it fire twice and buys two
+    // full mark-sweeps costing 588 ms against a 55 ms GC budget, at
+    // `old_in_use=52.3 MB, baseline=35.5 MB, T=48 MB` with the proportional arm
+    // correctly declining (`band=128 MB`) and `retaining=true`.
+    //
+    // That is the futile-full shape #7592 removed one trigger over: a heap
+    // whose young generation is not dying is retaining live data, and a full
+    // mark-sweep cannot lower the number being watched. The proportional arm
+    // still bounds the exposure, so this defers reclamation, it does not remove
+    // it — the same trade the RETAINING multiplier already makes.
+    let crossed_absolute_threshold = old_in_use >= threshold
+        && baseline < threshold
+        && !GC_MAJOR_PACING_RETAINING.with(|c| c.get());
+    crossed_absolute_threshold
         || old_in_use.saturating_sub(baseline) >= gc_old_reclaim_growth_band_bytes(baseline)
 }
 
@@ -1546,6 +1624,39 @@ pub(super) fn copied_minor_promotion_handoff_due(trigger_kind: GcTriggerKind) ->
 /// quickly now wait for the growth band instead of the next threshold
 /// crossing. That is deliberate — a promoted-then-dead cohort big enough to
 /// matter moves the band by its own size.
+///
+/// # ★ Every promotion is credited, including an UNTRACED one (#7965)
+///
+/// #7902 made the call site skip this for a `PromotionLiveness::AssumeAllLive`
+/// promotion, reasoning that "live by construction" is a marked-liveness claim
+/// an untraced cycle does not make. The premise is right and the conclusion
+/// does not follow, because **this baseline is not a liveness claim**. It is
+/// the base of a growth measurement: `old_in_use - baseline` is meant to read
+/// "how much has old-gen grown since the last reclaim decision", and bytes a
+/// minor has just relocated there are growth that decision has already seen.
+///
+/// Withholding it does not defer a little reclamation, it degenerates the
+/// predicate. A fully-live young generation promotes untraced on *every*
+/// cycle, so on exactly the workloads that reach the untraced path nothing
+/// else credits the baseline and it stays pinned at 0. Then
+/// `old_in_use - baseline` collapses into `old_in_use` — absolute occupancy,
+/// not growth — and [`gc_old_reclaim_growth_band_bytes`]'s proportional half
+/// (`baseline / OLD_RECLAIM_GROWTH_DIVISOR`) collapses with it, leaving the
+/// constant floor. **A constant band pacing a collector whose per-cycle cost is
+/// O(live)** is the quadratic shape #7592 removed here and #7594 removed one
+/// generation down. Measured on `retain` (#7965): 0 fulls → 1–2 fulls,
+/// 2 841 M → 8 237 M instructions retired, +25% peak RSS, and the same on
+/// `retain1` / `retain_wide` / `retain_wide1` / `deeplist`.
+///
+/// The uncertain cohort #7902 is right to worry about — assumed-live bytes
+/// parked in old-gen by a predictor that has since been contradicted — is
+/// bounded by the three instruments #7902 itself added, none of which paces on
+/// this quantity: `untraced_promotion_budget_bytes` forces a measuring cycle,
+/// `implied_dead_bytes` charges that run against `PROMOTED_DEAD_BUDGET_BYTES`,
+/// and [`request_old_reclaim_for_untraced_promotions`] schedules the reclaim
+/// outright when the measurement contradicts the predictor. Those act on
+/// evidence about the cohort; a pinned pacing base acts on every program that
+/// retains, whether or not anything about it is uncertain.
 pub(super) fn credit_promoted_bytes_to_old_baseline(promoted_bytes: usize) {
     if promoted_bytes == 0 {
         return;
@@ -1605,6 +1716,22 @@ pub(super) fn maybe_schedule_old_reclaim_after_copied_minor() {
     if old_reclaim_pressure_due(old_in_use, baseline) {
         GC_OLD_RECLAIM_PENDING.with(|pending| pending.set(true));
     }
+}
+
+/// #7902: a traced cycle contradicted the predictor that admitted `bytes` of
+/// untraced (assumed-live) promotion, so schedule the old-gen reclaim that can
+/// actually decide their liveness.
+///
+/// Nothing else will: the traced cycle measures only its own young generation,
+/// so it can neither identify nor reclaim a cohort the preceding untraced
+/// cycles already moved into old-gen. Left alone the bytes sit there until
+/// growth pressure fires — which it may not, because a phase-changed program's
+/// heap has stopped growing.
+pub(super) fn request_old_reclaim_for_untraced_promotions(bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    GC_OLD_RECLAIM_PENDING.with(|pending| pending.set(true));
 }
 
 pub(super) fn finish_full_old_reclaim_baseline() {
@@ -2264,7 +2391,14 @@ pub fn gc_check_trigger() {
             || super::roots::registered_root_scanners_block_budgeted_gc())
     {
         let direct_kind = match gc_budgeted_due_trigger() {
-            Some(BudgetedGcTrigger::ArenaBytes) => Some(GcTriggerKind::ArenaBytes),
+            // #7909: `YoungScavengeCap` is a nursery-churn trigger exactly like
+            // `ArenaBytes` here — this arm's whole job is to route nursery
+            // pressure to a collection that can actually reclaim it, so the two
+            // must not diverge at THIS site. They diverge only at the budgeted
+            // stepper's start decision.
+            Some(BudgetedGcTrigger::ArenaBytes | BudgetedGcTrigger::YoungScavengeCap) => {
+                Some(GcTriggerKind::ArenaBytes)
+            }
             Some(BudgetedGcTrigger::MallocCount) => Some(GcTriggerKind::MallocCount),
             _ => None,
         };
@@ -2471,10 +2605,20 @@ struct BudgetedGcCycle {
     rebaseline: BudgetedGcRebaseline,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BudgetedGcTrigger {
     OldReclaim,
     ArenaBytes,
+    /// The young-generation scavenge cap ([`young_scavenge_cap_due`]).
+    ///
+    /// Split out of `ArenaBytes` by #7909. Every *collection* treats the two
+    /// identically — the split exists solely so the budgeted stepper can tell
+    /// them apart at the moment it decides whether to START a cycle, because
+    /// the quantity this one tests (`copying_from_space_in_use_bytes`) is one
+    /// a budgeted low-pause NON-MOVING cycle cannot lower. See
+    /// [`nursery_cap_active`] for why: a non-moving minor sweeps in place and
+    /// leaves from-space occupied.
+    YoungScavengeCap,
     MallocCount,
 }
 
@@ -2532,7 +2676,7 @@ fn gc_budgeted_due_trigger() -> Option<BudgetedGcTrigger> {
         return Some(BudgetedGcTrigger::ArenaBytes);
     }
     if young_scavenge_cap_due() {
-        return Some(BudgetedGcTrigger::ArenaBytes);
+        return Some(BudgetedGcTrigger::YoungScavengeCap);
     }
 
     let malloc_count = malloc_object_count();
@@ -2573,6 +2717,15 @@ pub(crate) fn gc_safepoint_moving_minor() -> bool {
     if in_alloc || unsafe_zone || root_lock || budgeted {
         // Blocked right now — leave GC_SAFEPOINT_PENDING set so the next poll
         // retries; do not clear it here.
+        //
+        // #7909: `budgeted` is the arm that can be PERMANENT. A budgeted cycle
+        // started for nursery pressure that this pump's cadence cannot finish
+        // rejects every later safepoint here, forever, so it is counted apart
+        // from the transient arms.
+        if budgeted {
+            super::instruments::note_moving_safepoint_blocked_by_budgeted();
+        }
+        super::instruments::note_moving_safepoint_blocked(in_alloc, unsafe_zone, root_lock);
         return false;
     }
     // We are handling this safepoint (collect or find nothing due): clear the
@@ -2590,7 +2743,11 @@ pub(crate) fn gc_safepoint_moving_minor() -> bool {
     set_safepoint_pending(false);
     let _declared = DeclaredSafepointGuard::enter();
     let kind = match gc_budgeted_due_trigger() {
-        Some(BudgetedGcTrigger::ArenaBytes) => GcTriggerKind::ArenaBytes,
+        // #7909: the nursery cap and the whole-arena trigger are the same
+        // collection here — this IS the evacuating collector the cap is for.
+        Some(BudgetedGcTrigger::ArenaBytes | BudgetedGcTrigger::YoungScavengeCap) => {
+            GcTriggerKind::ArenaBytes
+        }
         Some(BudgetedGcTrigger::MallocCount) => GcTriggerKind::MallocCount,
         // ★ #7148: old-gen reclaim used to be the alloc-point arm's business
         // exclusively — it ran a direct full mark-sweep behind a forced
@@ -3038,7 +3195,10 @@ fn gc_start_budgeted_cycle_for_pressure(progress_kind: GcProgressKind) -> Option
                 progress_kind,
             )
         }
-        BudgetedGcTrigger::ArenaBytes => {
+        // #7909: identical treatment — a cycle that DOES start for nursery
+        // pressure (a non-budgeted one, which can evacuate) is the same
+        // arena-bytes collection it always was.
+        BudgetedGcTrigger::ArenaBytes | BudgetedGcTrigger::YoungScavengeCap => {
             let rebaseline = BudgetedGcRebaseline::ArenaBytes {
                 pre_in_use: crate::arena::arena_in_use_bytes(),
             };
@@ -3211,6 +3371,19 @@ fn gc_budgeted_step_work_units_inner(work_units: usize) -> JsGcStepResult {
     gc_budgeted_step_work_units_inner_with_progress(work_units, GcProgressKind::NormalIncremental)
 }
 
+/// #7909: arm the precise-root safepoint for nursery pressure the budgeted
+/// stepper just declined, mirroring `gc_check_trigger`'s deferral arm exactly
+/// (including the arena baseline the slack valve measures from — leaving that
+/// stale would make `moving_defer_within_slack` read an already-exceeded
+/// baseline and disable deferral for the rest of the process, the #7024 shape).
+fn defer_nursery_cap_to_precise_safepoint() {
+    if GC_SAFEPOINT_PENDING.with(Cell::get) {
+        return;
+    }
+    GC_SAFEPOINT_DEFER_ARENA_BASE.with(|base| base.set(crate::arena::arena_total_bytes()));
+    set_safepoint_pending(true);
+}
+
 fn gc_budgeted_step_work_units_inner_with_progress(
     work_units: usize,
     start_progress_kind: GcProgressKind,
@@ -3220,14 +3393,65 @@ fn gc_budgeted_step_work_units_inner_with_progress(
     }
 
     let Some(_guard) = BudgetedGcStepGuard::enter() else {
+        super::instruments::note_budgeted_step_skip(
+            super::instruments::BudgetedStepSkip::Reentrant,
+        );
         return gc_budgeted_skipped_result();
     };
 
     if !gc_budgeted_cycle_active() {
-        if gc_budgeted_due_trigger().is_none() {
+        let Some(due) = gc_budgeted_due_trigger() else {
+            super::instruments::note_budgeted_step_skip(
+                super::instruments::BudgetedStepSkip::NoTrigger,
+            );
+            return gc_idle_step_result();
+        };
+        if due == BudgetedGcTrigger::YoungScavengeCap && start_progress_kind.is_budgeted() {
+            // ★ #7909. Starting a budgeted cycle here is strictly worse than
+            // starting nothing, and it is self-sustaining.
+            //
+            // A budgeted cycle is `low_pause_non_moving` by construction
+            // (`progress_kind.is_budgeted()` at the collection site), so it
+            // sweeps in place and CANNOT lower
+            // `copying_from_space_in_use_bytes()` — the exact quantity
+            // `young_scavenge_cap_due()` tests. So the trigger it was started
+            // for survives the cycle. Worse, while the cycle is open
+            // `gc_safepoint_moving_minor` rejects every precise safepoint at
+            // its `budgeted` entry guard, so the ONE collector that can lower
+            // that quantity is locked out for the cycle's whole life. If the
+            // host's step cadence cannot finish the cycle — 2048 work units
+            // per microtask drain, and `asyncpipe` reaches ~15 drains after the
+            // cap goes due — the cycle never completes, is never cancelled, and
+            // the composition is permanent: cap due -> cycle started -> moving
+            // minor blocked -> nothing reclaims -> cap still due. The mutator
+            // then pays the SATB mark barrier for the rest of the process
+            // (measured: 22.9-42.5 ms of a ~127 ms program) for a collection
+            // that reclaims nothing, and the `[gc]` trace stays EMPTY because
+            // it is written by the completion path.
+            //
+            // The alloc-point arm already routes nursery pressure away from
+            // this stepper for the same reason (`gc_check_trigger`'s direct /
+            // deferred arm, which runs before the mutator assist). This is that
+            // asymmetry closed: the host-safepoint path now defers nursery
+            // pressure to the precise safepoint too, where the copying minor
+            // runs with rewritable roots and actually reclaims it.
+            //
+            // Note what is NOT skipped: `young_scavenge_cap_due()` is false
+            // unless `nursery_cap_active()`, which IS
+            // `gc_moving_loop_polls_enabled()`. So the cap can only be the due
+            // trigger in exactly the configuration where the precise route
+            // exists. When it does not, this branch is unreachable and the cap
+            // never fires at all.
+            super::instruments::note_budgeted_step_skip(
+                super::instruments::BudgetedStepSkip::NurseryCapUndischargeable,
+            );
+            defer_nursery_cap_to_precise_safepoint();
             return gc_idle_step_result();
         }
         if gc_budgeted_start_blocked() {
+            super::instruments::note_budgeted_step_skip(
+                super::instruments::BudgetedStepSkip::StartBlocked,
+            );
             return gc_budgeted_skipped_result();
         }
         let cycle = gc_start_budgeted_cycle_for_pressure(start_progress_kind)
@@ -3236,9 +3460,13 @@ fn gc_budgeted_step_work_units_inner_with_progress(
             *slot.borrow_mut() = Some(cycle);
         });
         GC_BUDGETED_CYCLE_ACTIVE.with(|active| active.set(true));
+        super::instruments::note_incremental_cycle_start();
     }
 
     if gc_budgeted_resume_blocked() {
+        super::instruments::note_budgeted_step_skip(
+            super::instruments::BudgetedStepSkip::ResumeBlocked,
+        );
         return gc_budgeted_skipped_result();
     }
 
@@ -3249,8 +3477,17 @@ fn gc_budgeted_step_work_units_inner_with_progress(
             return BudgetedStepOutcome::Result(gc_idle_step_result());
         };
 
+        // #7903: the step's own wall duration, not the budget that was asked
+        // for. `js_gc_step_us` can only consult its clock BETWEEN units, so the
+        // only honest statement about pause is a measured maximum.
+        let step_started = std::time::Instant::now();
         let step = cycle.state.step(GcWorkBudget::bounded(work_units));
+        super::instruments::note_budgeted_step_duration(
+            step_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+        );
+        super::instruments::note_incremental_step();
         if step.completed {
+            super::instruments::note_incremental_completion();
             BudgetedStepOutcome::Completed(slot.take().expect("active budgeted GC cycle exists"))
         } else {
             BudgetedStepOutcome::Result(gc_cycle_step_result(
@@ -3522,7 +3759,43 @@ pub extern "C" fn js_gc_module_idle_hint() -> f64 {
 }
 
 pub(super) fn gc_blocked_by_unsafe_zone() -> bool {
+    #[cfg(test)]
+    if let Some(blocked) = unsafe_zone_test_override::OVERRIDE.with(std::cell::Cell::get) {
+        return blocked;
+    }
     GC_UNSAFE_ZONES.load(std::sync::atomic::Ordering::Acquire) > 0
+}
+
+/// Per-thread override of [`gc_blocked_by_unsafe_zone`] for the unit suite
+/// (#7946).
+///
+/// [`GC_UNSAFE_ZONES`] is genuinely process-wide in production — the whole
+/// point is that a *worker thread* holding JSValues on an unscannable stack
+/// stops the main thread collecting. In a test binary that same property makes
+/// `GC_UNSAFE_ZONES.store(1)` a global stop-the-collector: every concurrent
+/// libtest thread's `gc_budgeted_start_blocked()` / `gc_budgeted_resume_
+/// blocked()` starts answering "blocked", and any test driving a budgeted cycle
+/// to completion gets `JS_GC_STEP_STATUS_SKIPPED` instead. That is exactly what
+/// `gc::tests::root_words::bare_address_in_{shadow_slot,global_root}_survives_
+/// a_real_collection` failed with ("budgeted GC cycle stopped before
+/// completion: status 3"), 3 runs in 100.
+///
+/// The unsafe-zone tests are all single-threaded — they set the zone and then
+/// assert about a collection on the same thread — so a per-thread pin tests the
+/// same predicate without reaching outside the test.
+#[cfg(test)]
+pub(super) mod unsafe_zone_test_override {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+
+    /// Pin (or unpin) `gc_blocked_by_unsafe_zone()` for this thread, returning
+    /// the previous pin so a guard can restore it.
+    pub(crate) fn set_unsafe_zone_blocked_for_test(blocked: Option<bool>) -> Option<bool> {
+        OVERRIDE.with(|c| c.replace(blocked))
+    }
 }
 
 pub(super) fn manual_gc_blocked_by_unsafe_zone() -> bool {

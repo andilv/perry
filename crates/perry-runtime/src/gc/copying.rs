@@ -373,55 +373,6 @@ impl CopyingNurseryPreflight {
     }
 }
 
-#[derive(Default)]
-pub(super) struct StickyRememberedSet {
-    pub(super) old_pages: crate::fast_hash::PtrHashSet<usize>,
-    pub(super) external_pages: Vec<(usize, usize)>,
-}
-
-impl StickyRememberedSet {
-    pub(super) fn remember_slot(
-        &mut self,
-        parent_header: *mut GcHeader,
-        slot: *mut u64,
-        external: bool,
-    ) {
-        if parent_header.is_null() || slot.is_null() {
-            return;
-        }
-        let page = crate::arena::generation_page_for_addr(slot as usize);
-        if external {
-            // #7538: an owner's external buffer can contribute thousands of
-            // slots (a lazy JSON array's sparse element cache is one 8-byte
-            // slot per element), and they are visited in address order — so
-            // one adjacent-duplicate check collapses a whole page's worth of
-            // pushes into a single entry. `restore` dedupes again inside
-            // `mark_dirty_external_slot_page`; this keeps the intermediate
-            // Vec from growing with the element count.
-            let entry = (parent_header as usize, page);
-            if self.external_pages.last() != Some(&entry) {
-                self.external_pages.push(entry);
-            }
-        } else {
-            self.old_pages.insert(page);
-        }
-    }
-
-    pub(super) fn restore(&self) {
-        for &page in &self.old_pages {
-            mark_dirty_old_page(page);
-        }
-        for &(header, page) in &self.external_pages {
-            mark_dirty_external_slot_page(header, page);
-        }
-    }
-
-    pub(super) fn extend(&mut self, other: StickyRememberedSet) {
-        self.old_pages.extend(other.old_pages);
-        self.external_pages.extend(other.external_pages);
-    }
-}
-
 pub(super) struct CopyingNurseryCollector {
     pub(super) ptrs: CopyingPointerSet,
     pub(super) worklist: Vec<*mut GcHeader>,
@@ -968,11 +919,50 @@ unsafe fn clear_marks_in(headers: &[*mut GcHeader]) {
 /// subject was live" rule names. `PERRY_GC_FORCE_EVACUATE` (and every mode
 /// that implies it) is not listed because it already vetoes in-place promotion
 /// outright, which is a precondition here.
-fn untraced_promotion_instrument_veto() -> bool {
-    gc_verify_evacuation_enabled()
-        || super::fromspace_scan::fromspace_scan_enabled()
-        || std::env::var_os("PERRY_GC_VERIFY_MARK").is_some()
-        || super::barrier::incremental_mark_in_progress()
+///
+/// Returns the NAME of the armed instrument rather than a bool (#7946): the
+/// veto is the only input to the untraced decision that another thread can
+/// move, so when `an_untraced_promotion_indexes_the_objects_it_could_not_prove_
+/// live` fails with `cycles=0, objects=0` the first question is always which of
+/// these was on. Same short-circuit order and cost as the bool it replaced.
+fn untraced_promotion_instrument_veto() -> Option<&'static str> {
+    if gc_verify_evacuation_enabled() {
+        return Some("verify_evacuation");
+    }
+    if super::fromspace_scan::fromspace_scan_enabled() {
+        return Some("fromspace_scan");
+    }
+    if std::env::var_os("PERRY_GC_VERIFY_MARK").is_some() {
+        return Some("verify_mark");
+    }
+    if super::barrier::incremental_mark_in_progress_on_this_thread() {
+        return Some("incremental_mark_in_progress");
+    }
+    None
+}
+
+/// The veto as the cycle sees it, for
+/// `gc::tests::promote_in_place::another_agents_incremental_cycle_does_not_veto_
+/// this_threads_untraced_promotion`.
+#[cfg(test)]
+pub(super) fn test_untraced_promotion_instrument_veto() -> Option<&'static str> {
+    untraced_promotion_instrument_veto()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Why the last copying minor on this thread did NOT take the untraced
+    /// promotion path. `""` while it did. Read by
+    /// `gc::tests::promote_in_place`; see
+    /// [`untraced_promotion_instrument_veto`].
+    static UNTRACED_DECLINE_REASON: std::cell::Cell<&'static str> = const {
+        std::cell::Cell::new("no copying minor has run on this thread")
+    };
+}
+
+#[cfg(test)]
+pub(super) fn last_untraced_decline_reason() -> &'static str {
+    UNTRACED_DECLINE_REASON.with(std::cell::Cell::get)
 }
 
 pub(super) fn scan_remembered_dirty_slots_copying(
@@ -1261,7 +1251,10 @@ impl CopiedMinorEligibility {
         {
             let mut visitor = RuntimeRootVisitor::for_copying_check(&mut checker);
             for entry in scanners {
-                (entry.scanner)(&mut visitor);
+                let (_, nanos) = super::scanner_profile::record_scanner(|| {
+                    (entry.scanner)(&mut visitor);
+                });
+                super::scanner_profile::note_scanner(entry.name, nanos, 0, 0, 0);
             }
             visit_ffi_mutable_registered_roots(&mut visitor);
         }
@@ -1318,12 +1311,13 @@ pub(super) fn gc_collect_minor_copying_fast_path(
     gc_collect_minor_copying_fast_path_with_eligibility(trace, start, eligibility, trigger_kind)
 }
 
-pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
+pub(super) fn run_copied_minor_attempt(
     trace: &mut Option<GcCycleTrace>,
     start: Instant,
     eligibility: CopiedMinorEligibility,
     _trigger_kind: GcTriggerKind,
-) -> Option<CopiedMinorFastPathOutcome> {
+    may_speculate: bool,
+) -> CopiedMinorAttempt {
     if let Some(trace) = trace.as_mut() {
         trace.copying_nursery = eligibility.trace_stats();
         trace.legacy_copy_only_scanner_pinned = eligibility.legacy_root_stats;
@@ -1354,7 +1348,7 @@ pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
         );
     }
     if !eligibility.eligible {
-        return None;
+        return CopiedMinorAttempt::Done(None);
     }
     let preflight_skipped = eligibility.preflight_skipped;
     let malloc_sweep_due = eligibility.malloc_sweep_due;
@@ -1365,14 +1359,27 @@ pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
     let phase_start = trace_phase_start(trace);
     let from_space_bytes = crate::arena::copying_from_space_in_use_bytes();
     let pre_collection_live_bytes = crate::arena::arena_live_allocated_bytes();
+    // #7901: the LIVE share of from-space inside `pre_collection_live_bytes`.
+    // Captured here, before anything moves or resets.
+    let pre_from_space_live_bytes = crate::arena::arena_live_from_space_bytes();
     // #7742: decide BEFORE anything classifies, then retag the young blocks so
     // every classification for the rest of this cycle already reads the
     // generation those objects will have when it ends. The eligibility
     // preflight above ran against the pre-retag labels, which is correct — it
     // answers "may this cycle move objects at all", a question the retag does
     // not change.
-    let promotion = if super::should_promote_young_in_place() {
-        crate::arena::retag_young_for_in_place_promotion()
+    // #7937: the FIRST copying minor has no previous cycle to read, so the
+    // steady-state policy above always declines. It may instead ATTEMPT the
+    // promotion and decide from its own trace — see
+    // `should_attempt_first_cycle_promotion` for why, and for why both extra
+    // preconditions here are about making the ROLLBACK's obligations provably
+    // empty rather than about liveness.
+    let speculate_first_cycle = may_speculate
+        && ptrs.malloc_registry_empty_at_start
+        && untraced_promotion_instrument_veto().is_none()
+        && super::should_attempt_first_cycle_promotion();
+    let promotion = if super::should_promote_young_in_place() || speculate_first_cycle {
+        crate::arena::retag_young_for_in_place_promotion(speculate_first_cycle)
     } else {
         crate::arena::InPlacePromotion::default()
     };
@@ -1385,6 +1392,11 @@ pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
     collector.stats.malloc_sweep_due = malloc_sweep_due;
     collector.stats.preflight_skipped = preflight_skipped;
     collector.stats.in_place_promotion = promoting_in_place;
+    // `may_speculate` is false on exactly one path: the retry the wrapper runs
+    // after a rollback. So this pair is exact without threading extra state
+    // through, and it survives the retry overwriting the trace.
+    collector.stats.first_cycle_promotion_attempted = speculate_first_cycle || !may_speculate;
+    collector.stats.first_cycle_promotion_rolled_back = !may_speculate;
     collector.stats.in_place_promoted_blocks = promotion.block_count();
     // See `CopyingNurseryCollector::skip_remembering` for the proof.
     collector.skip_remembering =
@@ -1424,11 +1436,31 @@ pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
     // That leaves liveness for the old-gen page index (answered by
     // `PromotionLiveness::AssumeAllLive`) and the survival ratio itself, which
     // is what `should_promote_young_untraced`'s budget bounds.
+    let instrument_veto = untraced_promotion_instrument_veto();
     let untraced = promoting_in_place
         && collector.skip_remembering
         && !crate::weakref::weak_target_holders_allocated()
-        && !untraced_promotion_instrument_veto()
+        && instrument_veto.is_none()
         && super::should_promote_young_untraced();
+    #[cfg(test)]
+    UNTRACED_DECLINE_REASON.with(|slot| {
+        // `instrument_veto` is the CAPTURED answer, not a re-evaluation: it is
+        // the racy one, and asking again after the fact would report whatever
+        // the other thread is doing now instead of what decided this cycle.
+        slot.set(if untraced {
+            ""
+        } else if !promoting_in_place {
+            "not promoting in place"
+        } else if !collector.skip_remembering {
+            "remembering not skipped (malloc registry non-empty at start)"
+        } else if crate::weakref::weak_target_holders_allocated() {
+            "a weak-target holder is registered on this thread"
+        } else if let Some(instrument) = instrument_veto {
+            instrument
+        } else {
+            "policy (should_promote_young_untraced)"
+        })
+    });
     collector.stats.reset_blocks += crate::arena::copying_prepare_to_space();
 
     let native_stack_walk = if untraced {
@@ -1496,9 +1528,13 @@ pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
                 },
                 None => None,
             };
+            let before = super::scanner_profile::snapshot_stats(stats);
             let previous = visitor.set_root_source_stats(stats);
-            (entry.scanner)(&mut visitor);
+            let (_, nanos) = super::scanner_profile::record_scanner(|| {
+                (entry.scanner)(&mut visitor);
+            });
             visitor.set_root_source_stats(previous);
+            super::scanner_profile::note_stats_delta(entry.name, nanos, before, stats);
         }
         visit_ffi_mutable_registered_roots_with_sources(&mut visitor, root_sources);
     }
@@ -1568,13 +1604,39 @@ pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
                 },
                 None => None,
             };
+            let before = super::scanner_profile::snapshot_stats(stats);
             let previous = visitor.set_root_source_stats(stats);
-            (entry.scanner)(&mut visitor);
+            let (_, nanos) = super::scanner_profile::record_scanner(|| {
+                (entry.scanner)(&mut visitor);
+            });
             visitor.set_root_source_stats(previous);
+            super::scanner_profile::note_stats_delta(entry.name, nanos, before, stats);
         }
         visit_ffi_mutable_registered_roots_with_sources(&mut visitor, root_sources);
     }
     trace_phase_record(trace, "copying_nursery", phase_start);
+
+    // #7937: the attempt's own trace has finished, so the ratio it was missing
+    // now exists. Nothing has been handed to old-gen yet, so rolling back
+    // restores the pre-cycle state, and the list is exactly two long: the retag
+    // (the only physical commitment) and the marks. Everything else the attempt
+    // did is a PROVABLE no-op on a promoting cycle — after the retag no address
+    // classifies as `Nursery`, so `move_young` is unreachable and every root
+    // and slot rewrite is a no-op, and `skip_remembering` (a precondition of
+    // attempting) means no remembered-set entry was created or consumed.
+    // `remembered_set_clear()` and the from-space reset are both below here.
+    if speculate_first_cycle && promoting_in_place {
+        let holds_up =
+            super::first_cycle_promotion_holds_up(from_space_bytes, collector.live_from_bytes);
+        super::note_first_cycle_promotion(!holds_up);
+        if !holds_up {
+            unsafe {
+                collector.clear_marks();
+            }
+            crate::arena::undo_in_place_promotion_retag(&promotion);
+            return CopiedMinorAttempt::RolledBack;
+        }
+    }
 
     // Weak semantics for the copied-minor fast path. This path bypasses
     // cycle.rs's `WeakProcessing` subphase entirely, so before this block
@@ -1688,6 +1750,8 @@ pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
         .bytes
         .saturating_sub(promotion_stats.live_bytes);
     collector.stats.in_place_sparse_blocks = promotion_stats.sparse_blocks;
+    collector.stats.in_place_dead_blocks = promotion_stats.dead_blocks;
+    collector.stats.in_place_dead_block_bytes = promotion_stats.dead_block_bytes;
     if let Some(trace) = trace.as_mut() {
         trace.old_pages = crate::arena::old_page_summary();
     }
@@ -1772,7 +1836,10 @@ pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
             // the collections that run NO copying minor.
             eden_live_bytes: 0,
             eden_dead_bytes: 0,
+            // The copied minor publishes its census directly (below), not
+            // through these sweep fields.
             arena_live_bytes: 0,
+            arena_live_from_space_bytes: 0,
         };
         trace.pause_us = start.elapsed().as_micros() as u64;
         trace.capture_layout_scans();
@@ -1787,25 +1854,48 @@ pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
         collector.stats.copied_objects,
         collector.stats.promoted_objects,
     );
-    // #7592: promoted bytes are live by construction — credit them to the
-    // old-reclaim baseline BEFORE the pressure check below, or the check reads
-    // the stale baseline and schedules a full that is guaranteed to free
-    // nothing (see `credit_promoted_bytes_to_old_baseline`).
+    // #7592: credit the bytes this minor moved into old-gen to the old-reclaim
+    // baseline BEFORE the pressure check below, or the check reads a stale
+    // baseline and schedules a full that is guaranteed to free nothing (see
+    // `credit_promoted_bytes_to_old_baseline`).
+    //
+    // #7965: UNCONDITIONAL, including for an untraced promotion — see
+    // `credit_promoted_bytes_to_old_baseline`, which carries the argument. In
+    // one line: the baseline is the base of a GROWTH measurement, not a
+    // liveness claim, and withholding it pins that base at 0 on exactly the
+    // workloads that reach this path.
     credit_promoted_bytes_to_old_baseline(collector.stats.promoted_bytes);
     // Everything outside from-space retains its pre-minor accounting. Remove
-    // the entire Eden/active-survivor high-water, then add back exactly the
+    // the from-space share of that accounting, then add back exactly the
     // objects that survived by copy or promotion. This also preserves objects
     // promoted by an EARLIER minor: old-page cycle summaries do not retain a
     // complete allocated-byte census across later cycles (#7879 A/B caught
     // `12_large_live_set` dropping ~38 MiB of prior promotions from heapUsed).
-    // Whole-block promotion is covered too: subtracting the full from-space
-    // high-water excludes its dead bytes, while `promoted_bytes` adds back only
-    // marked objects. No second object walk is needed.
+    //
+    // #7901: subtract the LIVE from-space share, not `from_space_bytes` (the
+    // block high-water captured above for fragmentation telemetry). After a
+    // non-moving sweep the high-water still covers dead holes beside surviving
+    // objects — holes the exact census already excluded — so subtracting it
+    // charges the same garbage twice, and `saturating_sub` then quietly eats
+    // unrelated old-gen occupancy out of `heapUsed` and major-GC pacing.
+    debug_assert!(
+        pre_from_space_live_bytes <= from_space_bytes,
+        "live from-space bytes ({pre_from_space_live_bytes}) exceeded the from-space \
+         high-water ({from_space_bytes}) — the census split is inconsistent"
+    );
+    debug_assert!(
+        pre_from_space_live_bytes <= pre_collection_live_bytes,
+        "a from-space subtraction ({pre_from_space_live_bytes}) larger than the whole \
+         live census ({pre_collection_live_bytes}) would consume unrelated generations"
+    );
     let arena_live_bytes = pre_collection_live_bytes
-        .saturating_sub(from_space_bytes)
+        .saturating_sub(pre_from_space_live_bytes)
         .saturating_add(collector.stats.copied_bytes)
         .saturating_add(collector.stats.promoted_bytes);
-    crate::arena::record_arena_live_census(arena_live_bytes);
+    // `None`: to-space is compacted by construction — Eden is empty after the
+    // flip and the new active survivor holds only the copies, so from-space
+    // live == from-space high-water.
+    crate::arena::record_arena_live_census(arena_live_bytes, None);
     note_collection_finished_arena_occupancy();
     // The same argument one trigger over: a young generation that did not die
     // is a heap growing by LIVE data, so arena-growth pacing must not read that
@@ -1813,6 +1903,21 @@ pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
     // re-baseline sees post-collection live allocation rather than high-water.
     note_copying_minor_young_survival(collector.stats.young_survival_permille);
     maybe_schedule_old_reclaim_after_copied_minor();
+    // #7929: the object denomination of the nursery constant band, fed BEFORE
+    // the tenuring loop so every number `retune_after_scavenge` derives from
+    // the effective cap (desired survivor occupancy, the cap-scale band) reads
+    // one consistent factor. Both tenuring ratios are representation-invariant
+    // by cancellation, so this only re-denominates the constant band itself.
+    super::tenuring::note_surviving_object_census(
+        collector
+            .stats
+            .copied_bytes
+            .saturating_add(collector.stats.promoted_bytes),
+        collector
+            .stats
+            .copied_objects
+            .saturating_add(collector.stats.promoted_objects),
+    );
     retune_after_scavenge(
         collector.stats.eden_live_bytes,
         collector.stats.copied_bytes,
@@ -1840,10 +1945,11 @@ pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
             super::policy::GC_AT_DECLARED_SAFEPOINT.with(std::cell::Cell::get)
         );
     }
-    Some(CopiedMinorFastPathOutcome {
+    super::scanner_profile::report_and_reset("copying_minor");
+    CopiedMinorAttempt::Done(Some(CopiedMinorFastPathOutcome {
         freed_bytes,
         malloc_swept: malloc_sweep_due,
-    })
+    }))
 }
 
 fn finalize_dead_copied_minor_from_space_side_allocations() {

@@ -18,9 +18,10 @@ use crate::types::{DOUBLE, I1, I32, I64, I8, PTR};
 /// **Must equal `perry_runtime::object::field_get_set::PIC_CACHE_WORDS`** —
 /// the runtime writes this memory through a `*mut [i64; PIC_CACHE_WORDS]`, so a
 /// smaller global here is an out-of-bounds store. perry-codegen does not depend
-/// on perry-runtime (the same reason `INLINE_SLOT_FLOOR` is spelled `4` inline
-/// below), so the pairing is held by `pic_cache_layout_matches_runtime` here and
-/// `pic_cache_words_match_codegen` in the runtime: change one and both fail.
+/// on perry-runtime (the same reason `INLINE_SLOT_FLOOR` is duplicated in
+/// `target_layout`), so the pairing is held by `pic_cache_layout_matches_runtime`
+/// here and `pic_cache_words_match_codegen` in the runtime: change one and both
+/// fail.
 pub(crate) const PIC_CACHE_WORDS: usize = 12;
 /// First word of the polymorphic way array (words 0..2 are the MRU entry and
 /// word 3 is the gate). Mirrors the runtime's `PIC_WAY_BASE`.
@@ -32,6 +33,26 @@ pub(crate) const PIC_WAYS: usize = 4;
 /// are worth running; `0` (fresh / epoch-wiped) and `-1` (sticky megamorphic)
 /// both skip them. Mirrors the runtime's `PIC_WAY_STATE`.
 pub(crate) const PIC_WAY_STATE: usize = 3;
+
+/// `slot < max(field_count, INLINE_SLOT_FLOOR)` — the per-receiver
+/// inline-capacity bound both the MRU hit path and the polymorphic ways apply
+/// to a cached slot (#6804).
+///
+/// Spelled as the equivalent disjunction `slot < FLOOR || slot < field_count`
+/// rather than as a `max` followed by one compare. The predicate is identical
+/// for every input (`x < max(a, b)` ⟺ `x < a ∨ x < b`), but the `max` had to be
+/// materialised — `mov w, #FLOOR` / `cmp` / `csel` — and that `csel` was the
+/// single hottest instruction in `interp.ts` (4.65% of `evalNode`, #7907),
+/// because it sits on the dependency chain out of the `field_count` load. The
+/// disjunction has no such node: LLVM folds the pair into `cmp` + `ccmp`, and
+/// the `slot < FLOOR` half does not depend on the load at all.
+fn emit_slot_in_bounds(ctx: &mut FnCtx<'_>, slot: &str, field_count: &str) -> String {
+    let below_floor = ctx
+        .block()
+        .icmp_ult(I64, slot, crate::target_layout::INLINE_SLOT_FLOOR_LIT);
+    let below_count = ctx.block().icmp_ult(I64, slot, field_count);
+    ctx.block().or(I1, &below_floor, &below_count)
+}
 
 /// The generic per-site monomorphic inline-cache dispatch for `obj.property`.
 /// This is the fall-through tail of the general catch-all arm: all earlier
@@ -153,6 +174,33 @@ pub(crate) fn lower_generic_property_get(
     let invalid_label = ctx.block_label(invalid_idx);
     let class_ref_label = ctx.block_label(class_ref_idx);
     let final_merge_label = ctx.block_label(final_merge_idx);
+    // `.length` on a receiver whose static type is not a proven string.
+    //
+    // The three-arm string-length dispatch in `property_get.rs` (SSO length
+    // byte / heap `utf16_len` load / property-semantic slow call) is already
+    // fully RUNTIME-guarded — it tests the NaN-box tag and only takes an
+    // inline arm for a value that IS a string — yet it is gated on
+    // `is_string_expr`, a compile-time proof. A receiver the front end cannot
+    // type (`rec.tag.length` where `rec` is an object-literal type, a JSON
+    // `any`, an array element) therefore lands in this generic tower instead,
+    // where a heap string can never be served: the PIC requires a
+    // GC_TYPE_OBJECT receiver by construction (#72), so EVERY such read misses
+    // to `js_object_get_field_ic_miss` and walks a ladder built for objects —
+    // closure-magic deref, buffer and typed-array registry probes, then
+    // `js_object_get_field_by_name`'s own dispatch, which decodes the key with
+    // `str::from_utf8` again before reaching the string arm. On `pipeline.ts`
+    // that one read was ~9% of total run time.
+    //
+    // Both string tags are disjoint from POINTER_TAG, so serving them here is
+    // a pure short-circuit: a primitive string's `length` is non-writable and
+    // non-configurable, cannot be shadowed by an own property, and is exactly
+    // what the runtime ladder computes. Everything else keeps the tower.
+    let inline_string_length = property == "length";
+    let strlen_heap_idx = if inline_string_length {
+        Some(ctx.new_block("pget.strlen_heap"))
+    } else {
+        None
+    };
     // #7883: the POINTER/STRING test goes FIRST, and the two rare tags are
     // discriminated in a cold block off its false edge. The three tag classes
     // are pairwise disjoint — `is_valid` is `(tag & 0xFFFD) == 0x7FFD`, true
@@ -204,6 +252,22 @@ pub(crate) fn lower_generic_property_get(
             (I64, &key_handle),
         ],
     );
+
+    // Split the heap-string receiver off before the PIC. Placed AFTER the
+    // typed-feedback observation on purpose: the site keeps recording every
+    // receiver it sees, so a mixed object/string site cannot be mis-profiled
+    // as monomorphic-object by the arm that is no longer traced here.
+    if let Some(heap_idx) = strlen_heap_idx {
+        let strlen_heap_label = ctx.block_label(heap_idx);
+        let not_string_idx = ctx.new_block("pget.recv_obj");
+        let not_string_label = ctx.block_label(not_string_idx);
+        let is_heap_string =
+            ctx.block()
+                .icmp_eq(I64, &obj_tag, crate::nanbox::STRING_TAG_TOP16_I64);
+        ctx.block()
+            .cond_br(&is_heap_string, &strlen_heap_label, &not_string_label);
+        ctx.current_block = not_string_idx;
+    }
 
     // Issue #51: monomorphic inline cache. Per-site `[8 x i64]` global
     // holds [shape_token, cached_slot_index, primed_epoch, ...unused].
@@ -286,9 +350,16 @@ pub(crate) fn lower_generic_property_get(
     // what the flat predicate computed there).
     let hit_idx = ctx.new_block("pic.hit");
     let miss_idx = ctx.new_block("pic.miss");
+    // #7907: the two receiver-validation failures get their own landing block
+    // so `pic.miss` is dominated by `pic.token`. See the comment on
+    // `pic.miss.cold` below for why that is the whole point of this split.
+    let cold_idx = ctx.new_block("pic.miss.cold");
+    let call_idx = ctx.new_block("pic.miss.call");
     let merge_idx = ctx.new_block("pic.merge");
     let hit_label = ctx.block_label(hit_idx);
     let miss_label = ctx.block_label(miss_idx);
+    let cold_label = ctx.block_label(cold_idx);
+    let call_label = ctx.block_label(call_idx);
     let merge_label = ctx.block_label(merge_idx);
     let hdr_idx = ctx.new_block("pic.recv_hdr");
     let hdr_label = ctx.block_label(hdr_idx);
@@ -301,8 +372,10 @@ pub(crate) fn lower_generic_property_get(
     // materialisation) in front of every real object read. The miss path
     // still substitutes the sentinel, because the way compares below load
     // `field_count` unconditionally.
-    // (edge labels are no longer needed: the miss block recomputes.)
-    ctx.block().cond_br(&is_real_ptr, &hdr_label, &miss_label);
+    // A small-handle receiver can never resolve a way (`way_hit` requires a
+    // real object), so it leaves for `pic.miss.cold` and never enters the
+    // block the ways live in.
+    ctx.block().cond_br(&is_real_ptr, &hdr_label, &cold_label);
     ctx.current_block = hdr_idx;
 
     // GcHeader sits 8 bytes before the user pointer; obj_type is the
@@ -378,7 +451,13 @@ pub(crate) fn lower_generic_property_get(
     // below: the keys load, the token select and the two epoch loads all
     // hang off the same predicate, so a non-object receiver used to execute
     // them before the flat `hit` could reject it.
-    ctx.block().cond_br(&is_object, &tok_label, &miss_label);
+    //
+    // #7907: the false edge goes to `pic.miss.cold`, not `pic.miss` — a
+    // receiver that is not a plain descriptor-free `ObjectHeader` fails
+    // `way_hit` by construction, so consulting the ways for it was always dead
+    // work, and keeping it out is what lets `pic.miss` reuse this block's
+    // values instead of re-deriving them.
+    ctx.block().cond_br(&is_object, &tok_label, &cold_label);
     ctx.current_block = tok_idx;
 
     // Load obj->keys_array at offset 16 of ObjectHeader.
@@ -459,7 +538,7 @@ pub(crate) fn lower_generic_property_get(
     // slots live in its OVERFLOW map) — a slot primed from a
     // larger-capacity sibling must not drive a raw load past this
     // receiver's field region. `alloc_limit = max(field_count,
-    // INLINE_SLOT_FLOOR=4)` mirrors the miss handler's cacheability
+    // INLINE_SLOT_FLOOR)` mirrors the miss handler's cacheability
     // rule; an out-of-bounds slot falls to the miss path, which reads
     // the overflow map correctly (and records the guard failure —
     // `record_guard_pass` only fires after the bounds check passes).
@@ -467,9 +546,7 @@ pub(crate) fn lower_generic_property_get(
     let fc_ptr = ctx.block().inttoptr(I64, &fc_addr);
     let fc = ctx.block().load(I32, &fc_ptr);
     let fc64 = ctx.block().zext(I32, &fc, I64);
-    let fc_floor = ctx.block().icmp_ult(I64, &fc64, "4"); // INLINE_SLOT_FLOOR
-    let limit = ctx.block().select(I1, &fc_floor, I64, "4", &fc64);
-    let slot_in_bounds = ctx.block().icmp_ult(I64, &slot, &limit);
+    let slot_in_bounds = emit_slot_in_bounds(ctx, &slot, &fc64);
     let bounds_hit = ctx.new_block("pic.hit.load");
     let bounds_hit_label = ctx.block_label(bounds_hit);
     ctx.block()
@@ -514,62 +591,34 @@ pub(crate) fn lower_generic_property_get(
     // way hit still reports guard-fail + fallback-call exactly as it did when
     // it was a real miss — the feedback heuristics see an unchanged signal
     // (the site IS polymorphic; only the cost of that changed).
-    ctx.current_block = miss_idx;
-    // #7883: the guard chain now branches out at three points, so the values
-    // the polymorphic way compares consult are no longer live on every edge
-    // into this block — and phi-ing them would drag their materialisation
-    // (`cset`/`csinc` per value) back onto the hot path, which is the whole
-    // point of branching. They are recomputed here instead, from the SAME
-    // memory with no intervening store, so every one is bit-identical to
-    // what the pre-#7883 flat predicate computed. This block is cold — every
-    // path out of it either loads a way slot or calls the miss handler.
     //
-    // The small-handle sentinel substitution lives here for the same reason:
-    // the way compares load `field_count` unconditionally, and a native
-    // registry-id receiver reaches this block without ever being a pointer.
-    let cache_addr = ctx.block().ptrtoint(&cache_ref, I64);
-    let safe_obj_handle = ctx
-        .block()
-        .select(I1, &is_real_ptr, I64, &obj_handle, &cache_addr);
-    let m_gc_type_addr = ctx.block().sub(I64, &safe_obj_handle, "8");
-    let m_gc_type_ptr = ctx.block().inttoptr(I64, &m_gc_type_addr);
-    let m_gc_type = ctx.block().load(I8, &m_gc_type_ptr);
-    let m_gc_type_ok = ctx.block().icmp_eq(I8, &m_gc_type, "2");
-    let is_object = ctx.block().and(I1, &is_real_ptr, &m_gc_type_ok);
-    let m_magic_addr = ctx.block().add(I64, &safe_obj_handle, "12");
-    let m_magic_ptr = ctx.block().inttoptr(I64, &m_magic_addr);
-    let m_magic = ctx.block().load(I32, &m_magic_ptr);
-    let m_is_closure = ctx.block().icmp_eq(I32, &m_magic, "1129268819");
-    let m_not_closure = ctx.block().xor(I1, &m_is_closure, "true");
-    let is_object = ctx.block().and(I1, &is_object, &m_not_closure);
-    let m_ot_ptr = ctx.block().inttoptr(I64, &safe_obj_handle);
-    let m_ot = ctx.block().load(I32, &m_ot_ptr);
-    let m_ot_ok = ctx.block().icmp_eq(I32, &m_ot, "1");
-    let is_object = ctx.block().and(I1, &is_object, &m_ot_ok);
-    let m_res_addr = ctx.block().sub(I64, &safe_obj_handle, "6");
-    let m_res_ptr = ctx.block().inttoptr(I64, &m_res_addr);
-    let m_res = ctx.block().load(crate::types::I16, &m_res_ptr);
-    let m_has_desc = ctx.block().and(crate::types::I16, &m_res, "2048");
-    let m_no_desc = ctx.block().icmp_eq(crate::types::I16, &m_has_desc, "0");
-    let is_object = ctx.block().and(I1, &is_object, &m_no_desc);
-    let m_keys_addr = ctx.block().add(I64, &safe_obj_handle, "16");
-    let m_keys_ptr = ctx.block().inttoptr(I64, &m_keys_addr);
-    let m_keys = ctx.block().load(I64, &m_keys_ptr);
-    let m_pcid_addr = ctx.block().add(I64, &safe_obj_handle, "8");
-    let m_pcid_ptr = ctx.block().inttoptr(I64, &m_pcid_addr);
-    let m_pcid = ctx.block().load(I32, &m_pcid_ptr);
-    let m_pcid_rel = ctx.block().add(I32, &m_pcid, "-2147483648");
-    let m_is_stamp = ctx.block().icmp_ult(I32, &m_pcid_rel, "1073741824");
-    let m_pcid64 = ctx.block().zext(I32, &m_pcid, I64);
-    let m_id_token = ctx.block().or(I64, &m_pcid64, "4611686018427387904");
-    let token = ctx
-        .block()
-        .select(I1, &m_is_stamp, I64, &m_id_token, &m_keys);
-    let token_nonnull = ctx.block().icmp_ne(I64, &token, "0");
-    let m_cache_epoch_ptr = ctx.block().gep(I64, &cache_ref, &[(I64, "2")]);
-    let m_cache_epoch = ctx.block().load(I64, &m_cache_epoch_ptr);
-    let m_live_epoch = ctx.block().load(I64, "@PERRY_IC_EPOCH");
-    let epoch_eq = ctx.block().icmp_eq(I64, &m_cache_epoch, &m_live_epoch);
+    // # Why this block is DOMINATED by `pic.token` (#7907)
+    //
+    // Its only predecessors are `pic.token` (the MRU token did not match) and
+    // `pic.hit` (it matched but the cached slot is outside this receiver's
+    // inline capacity), and `pic.hit` is itself dominated by `pic.token`. So
+    // `token`, `token_nonnull` and `epoch_eq` — everything the way compares
+    // need — are already in scope here, and `is_object` is statically TRUE.
+    //
+    // #7883 could not rely on that: it routed the two receiver-validation
+    // failures here as well, which left the values live on only some edges, so
+    // the block **re-derived them** — four header loads, the `keys_array` and
+    // `parent_class_id` loads, the token select, a second pair of epoch loads,
+    // and a `select` substituting a safe address for a small-handle receiver.
+    // That was correct, and it was justified as cold. It is not cold: on a site
+    // whose receiver rotates over more shapes than the MRU entry holds — the
+    // shape #7753's ways exist for — this block runs on nearly every read, so
+    // the duplicate ladder sat on the hot path. Measured on `interp.ts`'s
+    // `evalNode`, the single hottest instruction in the whole program was the
+    // `csel` materialising `max(field_count, INLINE_SLOT_FLOOR)` *inside this
+    // recomputation*.
+    //
+    // Sending the two validation failures to `pic.miss.cold` instead is what
+    // establishes the dominance. Nothing about the predicate changed: a
+    // receiver that fails either check also fails `way_hit` (which ANDs
+    // `is_object` in), so it could never have resolved a way — the compares
+    // were dead work for it.
+    ctx.current_block = miss_idx;
     crate::expr::emit_typed_feedback_record_call(
         ctx.block(),
         "js_typed_feedback_record_guard_fail",
@@ -612,16 +661,23 @@ pub(crate) fn lower_generic_property_get(
     let way_state = ctx.block().load(I64, &state_ptr);
     let ways_live = ctx.block().icmp_sgt(I64, &way_state, "0");
     let ways_idx = ctx.new_block("pic.ways");
-    let call_idx = ctx.new_block("pic.miss.call");
     let ways_label = ctx.block_label(ways_idx);
-    let call_label = ctx.block_label(call_idx);
     ctx.block().cond_br(&ways_live, &ways_label, &call_label);
 
     ctx.current_block = ways_idx;
-    let mut way_hit = ctx.block().and(I1, &is_object, &epoch_eq);
-    way_hit = ctx.block().and(I1, &way_hit, &token_nonnull);
-    let mut way_any = String::from("false");
-    let mut way_slot = String::from("0");
+    // `is_object` is not ANDed in any more: it is statically true on every edge
+    // that reaches here (#7907 — see the dominance note above). `epoch_eq` and
+    // `token_nonnull` are the values `pic.token` computed, from the same memory
+    // with no intervening store, so the predicate is unchanged.
+    let mut way_hit = ctx.block().and(I1, &epoch_eq, &token_nonnull);
+    // Reduced as a BALANCED TREE, not as a left fold. At most one way can hold
+    // a given token (`pic_prime_get` evicts a duplicate before it writes one,
+    // and a zero token is excluded by `token_nonnull`), so the association is
+    // free to change — but the fold made `way_slot` a chain of `PIC_WAYS`
+    // dependent `csel`s whose last node is the operand of the bounds compare
+    // that gates the branch out of this block. On `interp.ts` that node was the
+    // hottest instruction in `evalNode` (#7907). The tree halves the chain.
+    let mut lanes: Vec<(String, String)> = Vec::with_capacity(PIC_WAYS);
     for w in 0..PIC_WAYS {
         let tok_ptr = ctx.block().gep(
             I64,
@@ -636,20 +692,40 @@ pub(crate) fn lower_generic_property_get(
             &[(I64, &(PIC_WAY_BASE + w * 2 + 1).to_string())],
         );
         let way_slot_val = ctx.block().load(I64, &slot_ptr);
-        way_slot = ctx.block().select(I1, &eq, I64, &way_slot_val, &way_slot);
-        way_any = ctx.block().or(I1, &way_any, &eq);
+        let lane_slot = ctx.block().select(I1, &eq, I64, &way_slot_val, "0");
+        lanes.push((eq, lane_slot));
     }
+    while lanes.len() > 1 {
+        let mut merged: Vec<(String, String)> = Vec::with_capacity(lanes.len().div_ceil(2));
+        for pair in lanes.chunks(2) {
+            match pair {
+                [(a_any, a_slot), (b_any, b_slot)] => {
+                    let any = ctx.block().or(I1, a_any, b_any);
+                    let slot = ctx.block().select(I1, a_any, I64, a_slot, b_slot);
+                    merged.push((any, slot));
+                }
+                [single] => merged.push(single.clone()),
+                _ => unreachable!("chunks(2) yields one or two elements"),
+            }
+        }
+        lanes = merged;
+    }
+    let (way_any, way_slot) = lanes
+        .pop()
+        .expect("PIC_WAYS is non-zero, so the reduction leaves exactly one lane");
     way_hit = ctx.block().and(I1, &way_hit, &way_any);
     // Same per-receiver inline-capacity bound the MRU hit path applies: a slot
     // primed from a larger-capacity sibling of the same shape must not drive a
     // raw load past this receiver's field region (#6804).
-    let way_fc_addr = ctx.block().add(I64, &safe_obj_handle, "12");
+    //
+    // The load is off `obj_handle` rather than the deleted small-handle
+    // sentinel, so it is the SAME address `pic.recv_hdr` already read for the
+    // closure-magic check and GVN folds the two together.
+    let way_fc_addr = ctx.block().add(I64, &obj_handle, "12");
     let way_fc_ptr = ctx.block().inttoptr(I64, &way_fc_addr);
     let way_fc = ctx.block().load(I32, &way_fc_ptr);
     let way_fc64 = ctx.block().zext(I32, &way_fc, I64);
-    let way_fc_floor = ctx.block().icmp_ult(I64, &way_fc64, "4"); // INLINE_SLOT_FLOOR
-    let way_limit = ctx.block().select(I1, &way_fc_floor, I64, "4", &way_fc64);
-    let way_in_bounds = ctx.block().icmp_ult(I64, &way_slot, &way_limit);
+    let way_in_bounds = emit_slot_in_bounds(ctx, &way_slot, &way_fc64);
     let way_ok = ctx.block().and(I1, &way_hit, &way_in_bounds);
     let way_load_idx = ctx.new_block("pic.way.load");
     let way_load_label = ctx.block_label(way_load_idx);
@@ -663,6 +739,26 @@ pub(crate) fn lower_generic_property_get(
     let val_way = ctx.block().load(DOUBLE, &way_field_ptr);
     let way_end_label = ctx.block().label.clone();
     ctx.block().br(&merge_label);
+
+    // #7907: receiver-validation failure. `way_hit` requires a real pointer to
+    // a plain descriptor-free `ObjectHeader`, so a receiver that got here can
+    // never match a way — it goes straight to the handler, which reproduces the
+    // whole ladder anyway (proxy band, closure magic, buffer/typed-array
+    // registries, small-handle dispatch). The typed-feedback counters are the
+    // same two `pic.miss` records on the same edges, so the feedback signal is
+    // byte-identical to what the merged block reported.
+    ctx.current_block = cold_idx;
+    crate::expr::emit_typed_feedback_record_call(
+        ctx.block(),
+        "js_typed_feedback_record_guard_fail",
+        &[(I64, &feedback_site_id)],
+    );
+    crate::expr::emit_typed_feedback_record_call(
+        ctx.block(),
+        "js_typed_feedback_record_fallback_call",
+        &[(I64, &feedback_site_id)],
+    );
+    ctx.block().br(&call_label);
 
     // PIC miss: slow path with cache population.
     ctx.current_block = call_idx;
@@ -757,24 +853,49 @@ pub(crate) fn lower_generic_property_get(
     // the PIC entirely (PIC would read garbage memory). The
     // key handle has already been extracted above.
     ctx.current_block = sso_idx;
-    let sso_val = ctx.block().call(
-        DOUBLE,
-        "js_object_get_field_by_name_f64",
-        &[(I64, &obj_bits), (I64, &key_handle)],
-    );
+    let sso_val = if inline_string_length {
+        // `.length` of an SSO string is the length byte in bits 40..47 of the
+        // NaN-box itself — the same extract `js_object_get_field_by_name_f64`
+        // performs, minus the call and the key decode.
+        let len_shifted = ctx.block().lshr(I64, &obj_bits, "40");
+        let len_byte = ctx.block().and(I64, &len_shifted, "255");
+        ctx.block().uitofp(I64, &len_byte, DOUBLE)
+    } else {
+        ctx.block().call(
+            DOUBLE,
+            "js_object_get_field_by_name_f64",
+            &[(I64, &obj_bits), (I64, &key_handle)],
+        )
+    };
     let sso_end_label = ctx.block().label.clone();
     ctx.block().br(&final_merge_label);
 
+    // Heap string `.length`: `utf16_len` is the leading `u32` of
+    // `StringHeader` — the identical load the proven-string lowering in
+    // `property_get.rs` emits (`strlen.heap`). `safe_load_i32_from_ptr`
+    // keeps a sub-page handle off the load.
+    let strlen_heap_arm = if let Some(heap_idx) = strlen_heap_idx {
+        ctx.current_block = heap_idx;
+        let len_i32 = ctx.block().safe_load_i32_from_ptr(&obj_handle);
+        let heap_len = ctx.block().uitofp(I32, &len_i32, DOUBLE);
+        let heap_end_label = ctx.block().label.clone();
+        ctx.block().br(&final_merge_label);
+        Some((heap_len, heap_end_label))
+    } else {
+        None
+    };
+
     // Outer merge joins PIC result + invalid-receiver undefined
-    // + SSO result + class-ref dispatch result.
+    // + SSO result + class-ref dispatch result (+ heap-string `.length`).
     ctx.current_block = final_merge_idx;
-    Ok(ctx.block().phi(
-        DOUBLE,
-        &[
-            (&pic_val, &pic_end_label),
-            (&undef_val, &invalid_end_label),
-            (&sso_val, &sso_end_label),
-            (&class_ref_result, &class_ref_end_label),
-        ],
-    ))
+    let mut incoming: Vec<(&str, &str)> = vec![
+        (&pic_val, &pic_end_label),
+        (&undef_val, &invalid_end_label),
+        (&sso_val, &sso_end_label),
+        (&class_ref_result, &class_ref_end_label),
+    ];
+    if let Some((heap_len, heap_end_label)) = strlen_heap_arm.as_ref() {
+        incoming.push((heap_len, heap_end_label));
+    }
+    Ok(ctx.block().phi(DOUBLE, &incoming))
 }

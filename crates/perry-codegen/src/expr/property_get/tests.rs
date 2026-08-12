@@ -269,6 +269,118 @@ fn generic_property_get_tries_ways_before_calling_the_miss_handler() {
     );
 }
 
+/// #7907: `pic.miss` must be DOMINATED by `pic.token`, so the way compares can
+/// use the values that block already computed instead of re-deriving them.
+///
+/// #7883 routed all four failure edges — small-handle receiver, non-object
+/// receiver, MRU token mismatch, cached slot out of bounds — into one block,
+/// which left `token` / `token_nonnull` / `epoch_eq` live on only some of them
+/// and forced the block to reload the whole header ladder. That block is not
+/// cold: on a receiver rotation wider than the MRU entry it runs on nearly
+/// every read, so the duplicate ladder was hot code. The fix is purely
+/// structural — send the two receiver-validation failures to `pic.miss.cold`
+/// (they can never resolve a way, since `way_hit` requires a real object) and
+/// the dominance follows.
+///
+/// Assert the *consequences*, not the block names alone: a re-derivation would
+/// show up as a second `@PERRY_IC_EPOCH` load and as the small-handle sentinel
+/// `select`, and both must be gone.
+#[test]
+fn pic_miss_reuses_the_token_blocks_values_instead_of_re_deriving_them() {
+    let ir = emit(false, None);
+    assert!(
+        ir.contains("@perry_ic_"),
+        "test premise: the generic read reaches the inline PIC:\n{ir}"
+    );
+    assert!(
+        ir.contains("\npic.miss.cold"),
+        "the two receiver-validation failures need their own landing block, \
+         otherwise pic.miss is not dominated by pic.token:\n{ir}"
+    );
+    let epoch_loads = ir.matches("load i64, ptr @PERRY_IC_EPOCH").count();
+    assert_eq!(
+        epoch_loads, 1,
+        "one generic read must load @PERRY_IC_EPOCH exactly once; a second \
+         load means the way block re-derived the epoch predicate:\n{ir}"
+    );
+    assert!(
+        !ir.contains("ptrtoint ptr @perry_ic_"),
+        "the small-handle sentinel select only existed because an invalid \
+         receiver could reach the way compares; it must be gone:\n{ir}"
+    );
+    // The header predicates: each load/compare pair must appear exactly once.
+    for (needle, what) in [
+        ("icmp eq i8 ", "the GC_TYPE_OBJECT compare"),
+        ("icmp eq i32 %", "the closure-magic / object_type compares"),
+    ] {
+        let n = ir.matches(needle).count();
+        assert!(
+            n <= 2,
+            "{what} appears {n} times — the miss block is re-deriving the \
+             receiver header again:\n{ir}"
+        );
+    }
+}
+
+/// #7907: the cached-slot bound is `slot < FLOOR || slot < field_count`, not
+/// `slot < max(field_count, FLOOR)`.
+///
+/// Identical predicate; the point is that the `max` had to be materialised, and
+/// the `csel` that did it sat on the dependency chain out of the `field_count`
+/// load — the single hottest instruction in `interp.ts`'s `evalNode`. If
+/// someone "simplifies" this back to a `max`, nothing else in the suite
+/// notices.
+#[test]
+fn cached_slot_bound_is_a_disjunction_not_a_materialised_max() {
+    let floor = crate::target_layout::INLINE_SLOT_FLOOR_LIT;
+    let ir = emit(false, None);
+    assert!(
+        ir.lines()
+            .any(|l| l.contains("icmp ult i64 ") && l.ends_with(&format!(", {floor}"))),
+        "test premise: the emitted bound compares a slot against \
+         INLINE_SLOT_FLOOR ({floor}):\n{ir}"
+    );
+    assert!(
+        !ir.contains(&format!(", i64 {floor}, i64 %")),
+        "a `select …, i64 {floor}, i64 %fc` is the materialised max this \
+         deliberately does not emit:\n{ir}"
+    );
+}
+
+/// #7907: the way `(token, slot)` reduction is a balanced tree, so the slot
+/// select chain is `log2(PIC_WAYS)` deep instead of `PIC_WAYS` deep. Its last
+/// node feeds the bounds compare that gates the branch out of `pic.ways`, so
+/// the chain depth is directly on the critical path.
+///
+/// At most one way can hold a given token — `pic_prime_get` evicts a duplicate
+/// before writing one, and a zero token is excluded by `token_nonnull` — so
+/// reassociating is value-preserving.
+#[test]
+fn way_slot_reduction_is_a_balanced_tree() {
+    use crate::expr::property_get::generic_dispatch::PIC_WAYS;
+    let ir = emit(false, None);
+    let ways = ir
+        .find("\npic.ways")
+        .unwrap_or_else(|| panic!("expected a pic.ways block:\n{ir}"));
+    // Block labels carry a numeric suffix (`pic.ways.16:`), so the search for
+    // the NEXT block has to start past this one's own label or it matches
+    // itself and slices an empty body — which reads as "the tree is missing".
+    let end = ir[ways + 1..]
+        .find("\npic.")
+        .map(|o| o + ways + 1)
+        .unwrap_or(ir.len());
+    let body = &ir[ways..end];
+    // A left fold emits PIC_WAYS selects whose 3rd operand is the previous
+    // select; the tree emits PIC_WAYS lane selects against the literal 0 plus
+    // PIC_WAYS-1 merges. Count the "select against 0" lanes: a fold has one.
+    let lanes = body.matches(", i64 0\n").count();
+    assert_eq!(
+        lanes, PIC_WAYS,
+        "expected one `select … , i64 <slot>, i64 0` per way (a balanced tree); \
+         a left fold produces exactly one:\n{body}"
+    );
+}
+
 /// #7189 — `B.ns` where the imported module says `export * as ns from "./m.ts"`.
 ///
 /// The member's value is another module's namespace OBJECT, so there is no
@@ -528,4 +640,101 @@ fn generic_property_get_slot_load_is_reached_only_through_every_guard() {
              conditions: {conds:?}\nreached def chain:\n{chain}\n\nIR:\n{func}"
         );
     }
+}
+
+/// A module whose init reads `o.<property>` where `o` is an `Any` local — the
+/// generic tower, same shape as `module_with_nullish_read` but with a
+/// caller-chosen key.
+fn module_reading(property: &str) -> Module {
+    let mut m = Module::new("read.ts");
+    m.init = vec![
+        Stmt::Let {
+            id: 1,
+            name: "o".to_string(),
+            ty: perry_hir::types::Type::Any,
+            mutable: false,
+            init: Some(Expr::Undefined),
+        },
+        Stmt::Expr(Expr::PropertyGet {
+            object: Box::new(Expr::LocalGet(1)),
+            property: property.to_string(),
+            byte_offset: 0,
+        }),
+    ];
+    m.init_kind = ModuleInitKind::Eager;
+    m
+}
+
+fn emit_read(property: &str) -> String {
+    String::from_utf8(compile_module(&module_reading(property), ir_opts(false, None)).unwrap())
+        .expect("LLVM IR should be UTF-8")
+}
+
+/// A `.length` read whose receiver codegen cannot prove is a string must still
+/// serve a string inline.
+///
+/// The proven-string lowering in `property_get.rs` already emits a
+/// runtime-guarded three-arm dispatch, but it is gated on `is_string_expr` — a
+/// compile-time proof. Without a proof the read lands in this tower, where a
+/// heap string can never hit the PIC (it requires a GC_TYPE_OBJECT receiver by
+/// construction, #72) and every read pays the full
+/// `js_object_get_field_ic_miss` object ladder. Assert BOTH string arms exist:
+/// the heap block, and the SSO arm's inline length-byte extract in place of the
+/// `js_object_get_field_by_name_f64` call.
+#[test]
+fn generic_length_read_serves_a_string_inline() {
+    let ir = emit_read("length");
+    assert!(
+        ir.contains("\npget.strlen_heap"),
+        "a `.length` read must split heap strings off before the PIC:\n{ir}"
+    );
+    // 32767 = STRING_TAG >> 48. The split must test the tag, not something the
+    // optimiser could fold away.
+    assert!(
+        ir.contains("icmp eq i64") && ir.contains("32767"),
+        "the heap-string split must compare the receiver tag to STRING_TAG:\n{ir}"
+    );
+    let sso = ir
+        .find("\npget.recv_sso")
+        .unwrap_or_else(|| panic!("expected an SSO receiver block:\n{ir}"));
+    let sso_body = &ir[sso..];
+    let sso_end = sso_body[1..]
+        .find("\n\n")
+        .map(|i| i + 1)
+        .unwrap_or(sso_body.len());
+    let sso_body = &sso_body[..sso_end];
+    assert!(
+        sso_body.contains("lshr i64") && sso_body.contains(", 40"),
+        "the SSO arm must extract the inline length byte, not call the \
+         by-name helper:\n{sso_body}"
+    );
+    assert!(
+        !sso_body.contains("js_object_get_field_by_name_f64"),
+        "the SSO `.length` arm must not call back into the runtime:\n{sso_body}"
+    );
+    // Everything that is NOT a string keeps the tower.
+    assert!(
+        ir.contains("@perry_ic_") && ir.contains("js_object_get_field_ic_miss"),
+        "non-string receivers must still reach the inline PIC and its miss \
+         handler:\n{ir}"
+    );
+}
+
+/// The short-circuit is keyed on the property name: any other key on a string
+/// receiver (`s.charCodeAt`, `s.constructor`) still needs the runtime, so no
+/// other read may grow the string blocks.
+#[test]
+fn generic_non_length_read_keeps_the_whole_tower() {
+    let ir = emit_read("charCodeAt");
+    assert!(
+        !ir.contains("pget.strlen_heap"),
+        "only `.length` may take the inline string arm:\n{ir}"
+    );
+    let sso = ir
+        .find("\npget.recv_sso")
+        .unwrap_or_else(|| panic!("expected an SSO receiver block:\n{ir}"));
+    assert!(
+        ir[sso..].contains("js_object_get_field_by_name_f64"),
+        "a non-`length` SSO read must still call the by-name helper:\n{ir}"
+    );
 }

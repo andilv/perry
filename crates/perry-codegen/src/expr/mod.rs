@@ -127,8 +127,8 @@ pub(crate) use write_barrier::{
     emit_layout_note_slot_on_block, emit_may_carry_heap_pointer_check,
     emit_root_heap_word_store_on_block, emit_root_nanbox_store_on_block, emit_write_barrier,
     emit_write_barrier_slot_generation_tested, emit_write_barrier_slot_on_block,
-    lower_array_super_init, lower_event_emitter_subclass_init, lower_node_stream_super_init,
-    lower_stream_super_init,
+    emit_write_barrier_slot_value_and_generation_tested, lower_array_super_init,
+    lower_event_emitter_subclass_init, lower_node_stream_super_init, lower_stream_super_init,
 };
 
 // Issue #1098 phase 3: the `FnCtx` definition stays in this trunk, but its
@@ -140,6 +140,8 @@ mod array_push_guard_tests;
 #[cfg(test)]
 mod class_field_barrier_tests;
 mod dispatch;
+#[cfg(test)]
+mod index_set_barrier_tests;
 mod record_value;
 mod repsel_gates;
 mod scalar_slot_root;
@@ -176,7 +178,8 @@ pub(crate) use slot_rep::{
 
 pub(crate) use dispatch::{lower_expr, lower_math_operand};
 pub(crate) use scalar_slot_root::{
-    root_entry_alloca, root_scalar_replaced_slot, root_scalar_replaced_slot_unconditional,
+    entry_init_load_rooted_global, root_entry_alloca, root_scalar_replaced_slot,
+    root_scalar_replaced_slot_unconditional,
 };
 pub(crate) use shadow_slot::{
     current_closure_ptr_value, emit_persistent_shadow_root_barrier,
@@ -1944,6 +1947,8 @@ mod dyn_extern_i18n;
 mod env_clones;
 mod fs_await;
 mod index_get;
+#[cfg(test)]
+mod index_get_claim_tests;
 mod masked_window;
 mod ptr_numarray_access;
 mod ta_param_f64_read;

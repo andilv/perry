@@ -20,8 +20,33 @@ use std::sync::RwLock;
 /// every field get/set bounds check, and every direct-slot read MUST use the
 /// SAME floor, or a write/read past the allocated slots corrupts the heap. It is
 /// centralized here so all sites move in lockstep. (Also mirrored in
-/// perry-codegen `lower_call/new.rs` MIN_FIELD_SLOTS for the PERRY_INLINE_NEW path.)
-pub(crate) const INLINE_SLOT_FLOOR: usize = 4;
+/// perry-codegen `lower_call/new_alloc.rs` MIN_FIELD_SLOTS for the inline-`new`
+/// path and `expr::inline_slot_floor::INLINE_SLOT_FLOOR` for the emitted bounds
+/// checks; paired by `inline_slot_floor_matches_codegen` here and
+/// `inline_slot_floor_matches_runtime` there.)
+///
+/// # Why this number is a footprint dial, not a safety one (#7916)
+///
+/// It is *the* padding term in a small object's size:
+/// `8 (GcHeader) + 32 (ObjectHeader) + 8 * max(field_count, INLINE_SLOT_FLOOR)`.
+/// At 4, a two-field literal `{a, b}` costs **72 bytes to store 16 bytes of
+/// payload**, of which 16 bytes are slots 2–3 that the shape can never use —
+/// `gc-handoff/bench/retain.ts` writes 216 MB to store 48 MB of doubles.
+///
+/// Lowering it is sound at any value because `field_count` is *capped* by the
+/// same expression it feeds: the by-name append path
+/// (`field_set_by_name/tail.rs`) only bumps `field_count` for a slot it placed
+/// INLINE, and anything at or past `alloc_limit` spills to overflow storage
+/// instead. So `alloc_limit` is a fixed point of the allocation — it can never
+/// grow past the physical slot count — and the floor is purely a
+/// *growth-headroom* dial for objects that gain properties by name after birth.
+/// (#6712 moved it 8 → 4 on the same reasoning; #7916 moved it 4 → 2.)
+///
+/// 2 rather than 1 or 0: those three are indistinguishable in footprint for
+/// every shape in the perf corpus (a 2-field literal allocates 2 slots under
+/// all of them), so 2 is chosen as the one that keeps the most inline headroom
+/// for a dynamically-grown `{}` at zero byte cost.
+pub(crate) const INLINE_SLOT_FLOOR: usize = 2;
 
 // Submodules (issue #1103): behavior-preserving split of the former
 // 11.2k-line object.rs. Public re-exports keep FFI symbols stable.
@@ -84,7 +109,7 @@ pub(crate) use native_module_registry::nm_ctor_lookup;
 // (`fs/promises` → `fs.constants`, `sys` → `util`).
 pub(crate) use native_module_registry::{js_nm_install_fs, js_nm_install_util};
 mod native_module_stream;
-mod native_this_alias;
+pub(crate) mod native_this_alias;
 mod object_literal_ops;
 mod object_ops;
 pub(crate) use object_ops::{ensure_key_in_keys_array, install_builtin_getter};
@@ -116,6 +141,7 @@ mod temporal_proto;
 mod typed_array_define;
 mod typed_array_proto_thunks;
 mod util_types;
+mod weakref_proto_thunks;
 mod websocket_global;
 mod with_env;
 // Issue #1103 follow-up: behavior-preserving split of the residual top-level
@@ -172,6 +198,12 @@ pub(crate) use typed_array_define::{
     TypedArrayOwnIndex,
 };
 pub use util_types::*;
+// #7947: weak-wrapper method dispatch (moved out of `weakref.rs`, which is at
+// the 2000-line gate) plus the WeakRef/FinalizationRegistry arms and thunks.
+pub use weakref_proto_thunks::{
+    delegate_if_not_weak_collection, dispatch_foreign_weak_receiver, is_weak_wrapper,
+    try_weak_method_dispatch, weak_class_id_from_receiver, weak_wrapper_class_id,
+};
 pub use with_env::*;
 // Re-exports for the residual-helper split (issue #1103 follow-up). Explicit
 // named re-exports keep existing `crate::object::X` / bare-name call sites in
@@ -1635,19 +1667,21 @@ pub(crate) unsafe fn gc_object_meta_slot(user_ptr: usize) -> Option<*mut u64> {
 
 #[inline]
 unsafe fn set_object_keys_array(obj: *mut ObjectHeader, keys_array: *mut ArrayHeader) {
-    // #6759 C3c: a stamped shape id (plain objects reuse the otherwise-dead
-    // `parent_class_id` word) described the OLD keys array — clear it on a
-    // pointer CHANGE so the stamp invariant (`stamp != 0 ⟹ stamp == id of
-    // current keys`) holds; the resolve paths re-stamp on their next
-    // successful lookup. A same-pointer update (in-place append) keeps the
-    // stamp: slots are append-only, existing mappings stay valid — and the
-    // C3a grow-migration keeps the id itself alive across reallocs, so the
-    // fresh stamp after a grow resolves to the SAME id.
-    if (*obj).class_id == 0
-        && (*obj).keys_array != keys_array
-        && shapes::is_shape_id((*obj).parent_class_id)
-    {
-        (*obj).parent_class_id = 0;
+    // #6759 C3c: a stamped shape id (carried in the `parent_class_id` word)
+    // described the OLD keys array — clear it on a pointer CHANGE so the stamp
+    // invariant (`stamp != 0 ⟹ stamp == id of current keys`) holds; the resolve
+    // paths re-stamp on their next successful lookup. A same-pointer update
+    // (in-place append) keeps the stamp: slots are append-only, existing
+    // mappings stay valid — and the C3a grow-migration keeps the id itself
+    // alive across reallocs, so the fresh stamp after a grow resolves to the
+    // SAME id.
+    //
+    // #6759 C3 rung 1: no `class_id == 0` gate. The word is a ShapeId iff
+    // `is_shape_id` says so, for class instances too — and `clear_object_shape_stamp`
+    // tests exactly that, so an instance still carrying its allocation-time
+    // `parent_class_id` (never in the ShapeId range) is left alone.
+    if (*obj).keys_array != keys_array {
+        shapes::clear_object_shape_stamp(obj);
     }
     // #6893: the object's typed-shape layout descriptor is keyed by its
     // keys_array (shared per shape via SHAPE_LAYOUTS). A keys_array pointer

@@ -47,6 +47,8 @@ How it fails
 
 * a new uncovered holder with no inventory entry -> exit 1
 * an inventory entry that no longer matches a declaration -> exit 1
+* an `open_gap` or `unverified` verdict -> exit 1; old-page relocation ships
+  enabled, so a known or unevaluated movable-address holder cannot be exempted
 * fewer than MIN_HOLDERS declarations matched -> exit 2, because a regex that
   stopped matching would otherwise report a clean, empty, green run
 * fewer than MIN_REGISTERED registered scanners found -> exit 2, same reason:
@@ -152,7 +154,18 @@ ALLOCATOR_TOKENS = (
 # "stdlib:worker_threads:workers", scan_worker_roots_mut)` puts the scanner
 # SECOND, and a first-argument-only regex silently reported every holder that
 # scanner covers as uncovered — six of them, in one file.
-REGISTER_CALL = re.compile(r"gc_register_\w*root_scanner\w*\s*\((?P<args>[^;()]*)\)", re.S)
+#
+# `reg_scanner!` / `reg_budgeted_scanner!` are `gc_init`'s wrappers (#7915):
+# they exist only to attach `stringify!`'d registration-site names, and they
+# expand to the same `gc_register_*` calls. They must be matched here or every
+# holder reached only from `gc_init` reads as uncovered — which is exactly what
+# happened when they were introduced, and the MIN_REGISTERED floor below is
+# what caught it.
+REGISTER_CALL = re.compile(
+    r"(?:gc_register_\w*root_scanner\w*|reg_scanner!|reg_budgeted_scanner!)"
+    r"\s*\((?P<args>[^;()]*)\)",
+    re.S,
+)
 FN_DEF = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+|extern\s+\"C\"\s+)*fn\s+(\w+)")
 IDENT = re.compile(r"\b[A-Za-z_]\w*\b")
 
@@ -467,6 +480,12 @@ def inventory_problems(inventory: list[dict]) -> list[str]:
             )
         if verdict == "open_gap" and not (entry.get("issue") or "").strip():
             problems.append(f"{label}: open_gap must cite an `issue`")
+        if verdict in {"open_gap", "unverified"}:
+            problems.append(
+                f"{label}: `{verdict}` is not a shippable old-page relocation verdict. "
+                "Rewrite/invalidate the holder, prove it cannot hold a movable GC address, "
+                "or keep relocation disabled."
+            )
         if verdict == "unverified":
             unverified += 1
     if unverified > MAX_UNVERIFIED:
@@ -690,7 +709,11 @@ def _scan_tree(extra: dict[str, str] | None = None) -> list[dict]:
         for rel, body in tree.items():
             path = root / rel
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(body)
+            # Explicit UTF-8: a bare write_text() encodes with the host locale
+            # (cp1252 on a Windows runner), which is the #7977 class. The
+            # fixtures are ASCII today, so this is the latent half — the read
+            # side of the same shape is what took `windows-build` down.
+            path.write_text(body, encoding="utf-8", newline="")
         holders, _ = scan(root)
         return holders
 

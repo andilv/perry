@@ -6,6 +6,7 @@
 
 use crate::types::{LocalId, Type};
 use anyhow::Result;
+use swc_common::Spanned;
 use swc_ecma_ast as ast;
 
 use super::*;
@@ -1191,6 +1192,7 @@ pub(crate) fn lower_module_decl(
                             } else {
                                 ctx.define_local(name.clone(), ty.clone())
                             };
+                            ctx.record_local_source_span(id, decl.name.span());
                             module.init.push(Stmt::Let {
                                 id,
                                 name: name.clone(),
@@ -1269,6 +1271,7 @@ pub(crate) fn lower_module_decl(
                             } else {
                                 ctx.define_local(name.clone(), ty.clone())
                             };
+                            ctx.record_local_source_span(id, decl.name.span());
                             module.init.push(Stmt::Let {
                                 id,
                                 name: name.clone(),
@@ -1598,6 +1601,12 @@ pub(crate) fn lower_module_decl(
                                             | Expr::BigInt(_)
                                             | Expr::Null
                                             | Expr::Undefined
+                                            // #7964: renamed RegExp literals are values too.
+                                            // Zod exports `_null as null` and `_undefined as
+                                            // undefined`; omitting these from exported_objects
+                                            // leaves the namespace populator calling getters
+                                            // that the producer never emits.
+                                            | Expr::RegExp { .. }
                                             // Refs #420 (drizzle): `const entityKind = Symbol.for(...)`
                                             // followed by `export { entityKind }` must register the
                                             // local as an exported variable so importing modules

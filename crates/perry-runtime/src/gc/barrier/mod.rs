@@ -761,6 +761,7 @@ pub(super) fn incremental_mark_barrier_enable(valid_ptrs: &ValidPointerSet, mino
     // its insertion barrier — a lost mark, i.e. a live object swept.
     let newly_active = INCREMENTAL_MARK_BARRIER_VALID_PTRS.with(|cell| cell.get().is_null());
     if newly_active {
+        super::instruments::note_mark_barrier_armed();
         PERRY_INCREMENTAL_MARK_BARRIER_ACTIVE_COUNT.fetch_add(1, Ordering::SeqCst);
     }
     INCREMENTAL_MARK_BARRIER_VALID_PTRS.with(|cell| cell.set(valid_ptrs as *const ValidPointerSet));
@@ -773,6 +774,7 @@ pub(super) fn incremental_mark_barrier_disable() {
         was_active
     });
     if was_active {
+        super::instruments::note_mark_barrier_disarmed();
         let _ = PERRY_INCREMENTAL_MARK_BARRIER_ACTIVE_COUNT.fetch_update(
             Ordering::SeqCst,
             Ordering::SeqCst,
@@ -798,13 +800,23 @@ pub(super) fn incremental_mark_barrier_disable() {
 /// pointer. Non-zero is conservative and falls through to the thread-local
 /// read, which then finds its own null and returns.
 ///
+/// `Relaxed` is sufficient here. The counter publishes no accompanying data:
+/// it only decides whether to pay for a thread-local read and barrier call.
+/// Atomic coherence ensures that a thread which has incremented the counter
+/// before installing its own pointer cannot later observe a value preceding
+/// that increment; while its pointer remains installed, later counter values
+/// also remain non-zero because that thread has not removed its contribution.
+/// A zero observed by a thread with a null pointer merely skips a call that
+/// would have returned immediately. No acquire/release relationship with
+/// `ValidPointerSet` is required because that pointer is thread-local.
+///
 /// #7469: the point is to skip the *thread-local* read. On Darwin that read is
 /// an out-of-line `_tlv_get_addr` call on every heap-pointer store, and it was
 /// 91 of the 653 attributed `_tlv_get_addr` samples on `churn.ts` — all of them
 /// spent proving a null pointer was still null. This is a relaxed load of a
 /// static: `adrp` + `ldr` and a perfectly-predicted branch.
 #[inline(always)]
-fn incremental_mark_barrier_globally_idle() -> bool {
+pub(crate) fn incremental_mark_barrier_globally_idle() -> bool {
     PERRY_INCREMENTAL_MARK_BARRIER_ACTIVE_COUNT.load(Ordering::Relaxed) == 0
 }
 
@@ -841,8 +853,8 @@ pub(crate) fn gc_note_black_birth(header: *mut GcHeader) {
     push_mark_seed(header);
 }
 
-/// Is an incremental mark cycle in progress anywhere, or is this thread
-/// currently birthing objects black?
+/// Is an incremental mark cycle in progress **on this thread**, or is this
+/// thread currently birthing objects black?
 ///
 /// #7888 uses this to refuse the untraced promotion path. An allocate-black
 /// birth puts `GC_FLAG_MARKED` on a NURSERY object, and a cycle that neither
@@ -850,9 +862,28 @@ pub(crate) fn gc_note_black_birth(header: *mut GcHeader) {
 /// mark reads as "live" to the next full sweep. The untraced path makes no
 /// liveness claim, so it must not be running while anything else is making one
 /// through the mark bit.
+///
+/// ★ #7946: **this thread's**, not "anywhere". It used to read
+/// `!incremental_mark_barrier_globally_idle()` directly, which is the
+/// deliberately-conservative cross-thread approximation
+/// [`PERRY_INCREMENTAL_MARK_BARRIER_ACTIVE_COUNT`] exists to give the write
+/// barrier's fast path — where a false positive costs one call that returns.
+/// Here a false positive costs a *policy decision*, and it is unfounded:
+/// arenas are per-thread, `hot_birth_extra_flags` is per-thread, and only the
+/// thread holding the barrier's `valid_ptrs` pointer can shade anything, so
+/// another agent's cycle cannot put a mark on this thread's nursery. Single
+/// threaded the two are identical ([`incremental_mark_barrier_active`]
+/// short-circuits on the same global load); with `perry/thread` agents the old
+/// form let one agent's cycle disable another's promotion policy outright.
+///
+/// It was also a live test flake: under `cargo test` "anywhere" means "any of
+/// the other 2 200 tests", and
+/// `gc::tests::promote_in_place::an_untraced_promotion_indexes_the_objects_it_
+/// could_not_prove_live` failed 25 runs in 200 with `cycles=0, objects=0`
+/// because some unrelated thread happened to be marking.
 #[inline]
-pub(super) fn incremental_mark_in_progress() -> bool {
-    !incremental_mark_barrier_globally_idle() || gc_birth_extra_flags() != 0
+pub(super) fn incremental_mark_in_progress_on_this_thread() -> bool {
+    incremental_mark_barrier_active() || gc_birth_extra_flags() != 0
 }
 
 #[inline]
@@ -967,6 +998,23 @@ pub(super) fn incremental_mark_barrier_value(value_bits: u64) -> bool {
     }
     let valid_ptrs = unsafe { &*ptr };
     incremental_mark_barrier_value_with_valid_ptrs(value_bits, valid_ptrs)
+}
+
+/// Weak-to-strong READ barrier (#7900): shade a value word that a weak slot is
+/// about to hand the mutator as a strong reference.
+///
+/// This is the same shade-and-seed the store barrier performs, exposed to
+/// `crate::weakref` because the *read* side of a weak edge is the one
+/// white-to-strong transition neither the store barrier nor allocate-black
+/// birth accounting can observe — and budgeted cycles keep opening mutator
+/// windows AFTER `FinalRootRemark`, i.e. after the last root observation that
+/// could otherwise have discovered the new reference. See
+/// `crate::weakref::read_barrier` for the full argument.
+///
+/// Returns `true` when a previously-white object was marked.
+#[inline]
+pub(crate) fn gc_weak_read_shade(value_bits: u64) -> bool {
+    incremental_mark_barrier_value(value_bits)
 }
 
 #[allow(dead_code)]

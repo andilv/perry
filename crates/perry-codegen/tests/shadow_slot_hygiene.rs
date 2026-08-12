@@ -162,6 +162,7 @@ fn shadow_hygiene_module() -> Module {
         class_display_names: std::collections::HashMap::new(),
         closure_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
+        local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
     }
 }
@@ -220,6 +221,7 @@ fn top_level_shadow_module(name: &str) -> Module {
         class_display_names: std::collections::HashMap::new(),
         closure_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
+        local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
     }
 }
@@ -339,6 +341,7 @@ fn flat_const_row_alias_shadow_module() -> Module {
         class_display_names: std::collections::HashMap::new(),
         closure_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
+        local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
     }
 }
@@ -399,6 +402,7 @@ fn reassigned_any_shadow_module() -> Module {
         class_display_names: std::collections::HashMap::new(),
         closure_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
+        local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
     }
 }
@@ -474,6 +478,7 @@ fn mixed_any_alias_shadow_module() -> Module {
         class_display_names: std::collections::HashMap::new(),
         closure_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
+        local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
     }
 }
@@ -557,6 +562,7 @@ fn closure_captured_write_shadow_module() -> Module {
         class_display_names: std::collections::HashMap::new(),
         closure_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
+        local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
     }
 }
@@ -885,9 +891,10 @@ fn immutable_index_alias_binds_once_but_keeps_incremental_root_barrier() {
     );
     assert!(
         main_ir.contains(
-            "load atomic i32, ptr @PERRY_INCREMENTAL_MARK_BARRIER_ACTIVE_COUNT seq_cst, align 4"
+            "load atomic i32, ptr @PERRY_INCREMENTAL_MARK_BARRIER_ACTIVE_COUNT monotonic, align 4"
         ) && main_ir.contains("shadow.root.barrier"),
-        "an inactive incremental collector should skip the TLS-backed root barrier call"
+        "the relaxed global gate should let an inactive incremental collector skip the \
+         TLS-backed root barrier call"
     );
 }
 
@@ -1114,6 +1121,7 @@ fn canonical_str_shadow_module() -> Module {
         class_display_names: std::collections::HashMap::new(),
         closure_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
+        local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
     }
 }

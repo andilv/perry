@@ -165,6 +165,7 @@ impl BlockPersistCycleState {
                     }
                     self.stats.marked_objects =
                         self.stats.marked_objects.saturating_add(self.newly_marked);
+                    super::trace::note_block_persist_force_marks(self.newly_marked);
                     if self.newly_marked == 0 {
                         self.subphase = BlockPersistSubphase::Done;
                         return true;
@@ -857,11 +858,11 @@ enum AtomicFinalizeSubphase {
     /// one-shot scan and would be swept live. Re-scan all roots with the
     /// marks nearly final, then drain the resulting seeds, so WeakProcessing
     /// and Sweep read a complete mark set. Bounded by root-set size (shadow
-    /// stack + globals + registered scanners), not heap size. From this
-    /// subphase to the Sweep transition the minor path runs ATOMICALLY (no
-    /// mutator windows); the full path's sliced RememberedSetRebuild is the
-    /// one post-remark window, and it is store-covered by the still-active
-    /// mark barrier.
+    /// stack + globals + registered scanners), not heap size. This is the LAST
+    /// root observation of the cycle: everything after it (the full path's
+    /// sliced RememberedSetRebuild, and WeakProcessing on both paths) still
+    /// opens mutator windows, so every white-to-strong transition there must be
+    /// barrier-covered — stores, black births, and weak reads (#7900).
     FinalRootRemark,
     RememberedSetRebuild,
     DisableBarrier,
@@ -931,6 +932,9 @@ impl GcCycleState {
         let trace = GcCycleTrace::new(GcCollectionKind::Full, trigger);
         let start = Instant::now();
         crate::arena::old_pages_begin_gc_cycle();
+        // The one constructor that sweeps old-gen, so the one that invalidates
+        // a promoted run's bounds. See the fn's doc for why no minor needs it.
+        crate::arena::materialize_all_promoted_page_runs();
         clear_mark_seeds();
         // Allocate-black for the WHOLE cycle, from the first build slice on:
         // the mark barrier only engages at the END of BuildValidPointerSet
@@ -984,16 +988,9 @@ impl GcCycleState {
     ) -> Self {
         let malloc_sweep_due = copied_minor_malloc_sweep_due(trigger.kind);
         let trigger_kind = trigger.kind;
-        // Allocate-black for the WHOLE cycle, from the first build slice on:
-        // the mark barrier only engages at the END of BuildValidPointerSet
-        // (the longest phase), so an object born during a build slice and
-        // installed via a runtime-internal raw store would be swept live
-        // (measured: identical 2,890-node loss with barrier-window-only
-        // birth flags). Cleared when the barrier disables at sweep entry
-        // (post-snapshot births cannot be reached by the in-flight sweep,
-        // and a mark they carried would leak into the next cycle as
-        // "already traced"). Every black birth is also pushed as a mark
-        // seed — see `gc_note_black_birth`.
+        // Allocate-black for the WHOLE cycle — see `new_full` above for why the
+        // barrier window alone is not enough, and `gc_note_black_birth` for why
+        // every black birth is also seeded.
         super::barrier::GC_BIRTH_EXTRA_FLAGS.with(|cell| cell.set(GC_FLAG_MARKED));
         Self {
             collection_kind: GcCollectionKind::Minor,
@@ -1322,10 +1319,10 @@ impl GcCycleState {
                 .expect("atomic finalize state exists")
                 .subphase;
             // SLICED subphases honor the caller's budget and may return to the
-            // mutator. WeakProcessing is safe to slice while the barrier and
-            // allocate-black births stay active: a target the mutator can
-            // still name was marked at remark or was born black, and holders
-            // born after the registry snapshot wait for the next cycle.
+            // mutator. Post-remark windows are sound only because EVERY way the
+            // mutator can acquire a heap reference is shaded: stores by the
+            // incremental mark barrier, births by allocate-black, and weak
+            // READS by `weakref::read_barrier` (#7900 — that arm was missing).
             let sliced = matches!(
                 subphase,
                 AtomicFinalizeSubphase::BarrierSeedDrain
@@ -1366,27 +1363,28 @@ impl GcCycleState {
                 if budget == 0 {
                     return;
                 }
-                // Re-scan every root with the marks nearly final (see the
-                // enum doc). Reuses the RootScan machinery unbudgeted —
-                // bounded by root-set size, not heap size. consider_evacuation
-                // is false: pinning decisions were made in the original scan,
-                // and budgeted cycles are non-moving anyway.
+                // Re-scan every root with the marks nearly final (see the enum
+                // doc). DELIBERATELY ATOMIC and NOT bounded by the step budget:
+                // the scan is bounded by root-set size, but the drain below is
+                // bounded by the newly-reachable graph, which a root installed
+                // after the initial scan can make arbitrarily large. Measured
+                // rather than claimed — `final_remark_max_us` in
+                // `[gc-step-bounds]`; docs/src/internals/gc-step-bounds.md has
+                // the bound and rejected alternatives (#7903).
+                // consider_evacuation is false: pinning was decided already.
                 {
+                    let _remark_timer = instruments::FinalRemarkTimer::start();
                     let valid_ptrs = self.valid_ptrs.as_ref().expect("valid pointer set built");
                     let minor_only = self.minor.is_some();
                     let remark_scan = self.root_scan.get_or_insert_with(RootScanCycleState::new);
-                    loop {
-                        if remark_scan.step_current_subphase(
-                            valid_ptrs,
-                            &mut self.trace,
-                            /* consider_evacuation = */ false,
-                            usize::MAX,
-                            /* allow_synchronous_scanners = */ true,
-                            minor_only,
-                        ) {
-                            break;
-                        }
-                    }
+                    while !remark_scan.step_current_subphase(
+                        valid_ptrs,
+                        &mut self.trace,
+                        /* consider_evacuation = */ false,
+                        usize::MAX,
+                        /* allow_synchronous_scanners = */ true,
+                        minor_only,
+                    ) {}
                     self.root_scan = None;
                     // Trace everything the remark newly discovered so
                     // WeakProcessing (and the full path's RS rebuild) read a
@@ -1944,11 +1942,17 @@ impl GcCycleState {
             trace.pause_us = elapsed_us;
             trace.capture_layout_scans();
         }
-        let arena_live_bytes = self
-            .sweep
-            .map(|sweep| sweep.arena_live_bytes as usize)
-            .unwrap_or_else(crate::arena::arena_live_allocated_bytes);
-        crate::arena::record_arena_live_census(arena_live_bytes);
+        // #7901: a non-moving sweep leaves dead holes beside survivors, so it
+        // must publish the LIVE from-space share alongside the total; a
+        // following copied minor subtracts that instead of the high-water.
+        let (arena_live_bytes, from_space_live) = match self.sweep {
+            Some(sweep) => (
+                sweep.arena_live_bytes as usize,
+                Some(sweep.arena_live_from_space_bytes as usize),
+            ),
+            None => (crate::arena::arena_live_allocated_bytes(), None),
+        };
+        crate::arena::record_arena_live_census(arena_live_bytes, from_space_live);
         // #7865: arena-growth pacing tests a POST-collection occupancy, which
         // is the same kind of quantity as its post-full baseline. Recorded here
         // rather than per-kind because this is the one site both kinds reach.

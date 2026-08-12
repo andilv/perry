@@ -61,7 +61,8 @@
 //! running total and reports it in the GC trace.
 
 use super::page_meta::{
-    generation_page_base, register_promoted_page_run, retag_block_space, GENERATION_PAGE_SIZE,
+    generation_page_base, register_promoted_page_headers, register_promoted_page_run,
+    retag_block_space, retag_block_space_deferring_old_page_registration, GENERATION_PAGE_SIZE,
 };
 use super::*;
 
@@ -160,6 +161,11 @@ pub(crate) struct InPlacePromotionStats {
     /// Blocks whose live fraction was below 50% — the shape that would have
     /// been better served by evacuation. Zero on every benchmark measured.
     pub(crate) sparse_blocks: usize,
+    /// Blocks with ZERO live objects, and their bytes. These are the blocks a
+    /// promotion keeps for nothing: no live object needs their addresses held
+    /// still, so the ordinary from-space reset would have recycled them.
+    pub(crate) dead_blocks: usize,
+    pub(crate) dead_block_bytes: usize,
 }
 
 /// Retag every in-use young block as old-gen `PromotedYoung`.
@@ -167,7 +173,13 @@ pub(crate) struct InPlacePromotionStats {
 /// Returns the blocks captured. An empty result means there was nothing to
 /// promote and the caller must fall back to the ordinary copying path (in
 /// particular it must NOT skip the from-space reset).
-pub(crate) fn retag_young_for_in_place_promotion() -> InPlacePromotion {
+/// `defer_old_page_registration` is for the speculative first-cycle attempt,
+/// which may undo this retag — see
+/// [`retag_block_space_deferring_old_page_registration`] for why it is sound
+/// exactly there and for what it costs when it is not deferred.
+pub(crate) fn retag_young_for_in_place_promotion(
+    defer_old_page_registration: bool,
+) -> InPlacePromotion {
     sync_inline_arena_state();
     let mut promotion = InPlacePromotion::default();
 
@@ -192,14 +204,54 @@ pub(crate) fn retag_young_for_in_place_promotion() -> InPlacePromotion {
     }
 
     for block in &promotion.blocks {
-        retag_block_space(
-            block.base,
-            block.size,
-            HeapGeneration::Old,
-            HeapSpace::PromotedYoung,
-        );
+        if defer_old_page_registration {
+            retag_block_space_deferring_old_page_registration(
+                block.base,
+                block.size,
+                HeapGeneration::Old,
+                HeapSpace::PromotedYoung,
+            );
+        } else {
+            retag_block_space(
+                block.base,
+                block.size,
+                HeapGeneration::Old,
+                HeapSpace::PromotedYoung,
+            );
+        }
     }
     promotion
+}
+
+/// Put every block [`retag_young_for_in_place_promotion`] captured back in the
+/// young generation, in the space it came from (#7937).
+///
+/// This is the whole of the physical rollback for a speculative first-cycle
+/// promotion, and it is complete because the retag is the whole of the physical
+/// commitment: nothing moved, no block changed arenas, no bump pointer moved,
+/// and `finish_in_place_promotion` — the only step that hands a block to
+/// `OLD_ARENA` — has not run. The caller owns the two remaining obligations
+/// (clear the marks the trace set, and do not consume the remembered set); see
+/// `gc::copying`'s rollback for why the list is exactly that long.
+///
+/// ★ The retag is NOT only a relabel — an `Old` retag also mints an old-gen
+/// page-metadata entry per 4 KB of the block. This undo does not have to take
+/// them away, because the speculative attempt never mints them: it retags
+/// through [`retag_block_space_deferring_old_page_registration`], which is
+/// sound exactly there and saves 1–6 MB of peak RSS that removing the entries
+/// afterwards would NOT have saved (a `HashMap` never returns its capacity).
+/// `a_first_cycle_attempt_that_its_own_trace_refutes_rolls_back_and_evacuates`
+/// asserts the old-gen page count is unchanged across a rollback, so a future
+/// retag that starts minting them again turns that test red.
+pub(crate) fn undo_in_place_promotion_retag(promotion: &InPlacePromotion) {
+    for block in &promotion.blocks {
+        let space = match block.source {
+            PromotionSource::Eden => HeapSpace::NurseryEden,
+            PromotionSource::Survivor(0) => HeapSpace::Survivor0,
+            PromotionSource::Survivor(_) => HeapSpace::Survivor1,
+        };
+        retag_block_space(block.base, block.size, HeapGeneration::Nursery, space);
+    }
 }
 
 /// Bytes still in use in blocks that classify as young generation. The premise
@@ -278,6 +330,10 @@ pub(crate) fn finish_in_place_promotion(
         if taken.offset > 0 && live_bytes * 2 < taken.offset {
             stats.sparse_blocks += 1;
         }
+        if taken.offset > 0 && live_objects == 0 {
+            stats.dead_blocks += 1;
+            stats.dead_block_bytes += taken.offset;
+        }
         moved_blocks.push(taken);
     }
 
@@ -354,6 +410,26 @@ fn install_block_into(arena: &mut Arena, block: ArenaBlock) {
     arena.blocks.push(block);
 }
 
+/// Hand one page's finished run to the index, either DESCRIBED (untraced
+/// promotion — the parse can reconstruct it) or STORED (traced promotion — only
+/// the about-to-be-cleared marks know which objects are live).
+#[allow(clippy::too_many_arguments)]
+fn flush_page_run(
+    describe: bool,
+    page: usize,
+    first: usize,
+    last: usize,
+    count: usize,
+    headers: &[usize],
+    bytes: usize,
+) {
+    if describe {
+        register_promoted_page_run(page, first, last, count, bytes);
+    } else {
+        register_promoted_page_headers(page, headers, bytes);
+    }
+}
+
 /// Linear walk of one promoted block: stamp `GC_FLAG_TENURED` on every header,
 /// and register the live ones with the old-gen page index in per-page bulk
 /// runs. Returns `(objects, live_objects, live_bytes)`.
@@ -372,11 +448,23 @@ fn stamp_and_index_block(block: &ArenaBlock, liveness: PromotionLiveness) -> (us
     let mut live_objects = 0usize;
     let mut live_bytes = 0usize;
 
-    // One page's worth of live headers, flushed whenever the page changes. The
-    // walk is in address order, so a page's headers are contiguous in it.
+    // One page's worth of live headers, flushed whenever the page changes.
+    // The walk is in address order, so a page's headers are a contiguous
+    // ascending run.
+    //
+    // On the UNTRACED path (`AssumeAllLive`) that run is DESCRIBED by its first
+    // and last address instead of stored — every walkable object between them
+    // is on the page, so the pair is exact and the list is re-derivable by the
+    // same parse the sweep already uses. On the TRACED path the marks are the
+    // only record of which objects are live and `clear_marks` destroys them, so
+    // the list is stored as before. See `register_promoted_page_run`.
+    let describe = matches!(liveness, PromotionLiveness::AssumeAllLive);
     let mut run_page: Option<usize> = None;
-    let mut run_headers: Vec<usize> = Vec::new();
+    let mut run_first = 0usize;
+    let mut run_last = 0usize;
+    let mut run_count = 0usize;
     let mut run_bytes = 0usize;
+    let mut run_headers: Vec<usize> = Vec::new();
 
     let mut offset = 0usize;
     while offset < block.offset {
@@ -427,20 +515,42 @@ fn stamp_and_index_block(block: &ArenaBlock, liveness: PromotionLiveness) -> (us
                 }
                 if run_page != Some(page) {
                     if let Some(previous) = run_page {
-                        register_promoted_page_run(previous, &run_headers, run_bytes);
+                        flush_page_run(
+                            describe,
+                            previous,
+                            run_first,
+                            run_last,
+                            run_count,
+                            &run_headers,
+                            run_bytes,
+                        );
                     }
                     run_page = Some(page);
-                    run_headers.clear();
+                    run_first = header_addr;
+                    run_count = 0;
                     run_bytes = 0;
+                    run_headers.clear();
                 }
-                run_headers.push(header_addr);
+                run_last = header_addr;
+                run_count += 1;
                 run_bytes += overlap_end - overlap_start;
+                if !describe {
+                    run_headers.push(header_addr);
+                }
             }
         }
         offset = aligned + total;
     }
     if let Some(previous) = run_page {
-        register_promoted_page_run(previous, &run_headers, run_bytes);
+        flush_page_run(
+            describe,
+            previous,
+            run_first,
+            run_last,
+            run_count,
+            &run_headers,
+            run_bytes,
+        );
     }
     debug_assert_eq!(
         offset, block.offset,

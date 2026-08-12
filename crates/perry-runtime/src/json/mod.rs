@@ -556,6 +556,17 @@ pub fn scan_parse_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
             visitor.visit_tagged_raw_const_ptr_slot(ptr, crate::value::STRING_TAG);
         }
     });
+    // PARSE_KEY_RING mirrors the cache's hottest values. It does not own
+    // their liveness, but its duplicate addresses must follow an old-page
+    // move after PARSE_KEY_CACHE has kept the strings alive.
+    PARSE_KEY_RING.with(|ring| {
+        for ptr in ring.borrow_mut().iter_mut() {
+            let mut addr = *ptr as usize;
+            if visitor.visit_metadata_usize_slot(&mut addr) {
+                *ptr = addr as *const StringHeader;
+            }
+        }
+    });
     PARSE_SHAPE_CACHE.with(|c| {
         for entry in c.borrow_mut().iter_mut() {
             visitor.visit_raw_mut_ptr_slot(&mut entry.keys_array);
@@ -619,6 +630,20 @@ pub(crate) fn test_seed_parse_roots(value: f64, key_ptr: *const StringHeader) {
         c.clear();
         c.insert(b"test".to_vec(), key_ptr);
     });
+}
+
+#[cfg(test)]
+pub(crate) fn test_seed_parse_key_ring(key_ptr: *const StringHeader) {
+    PARSE_KEY_RING.with(|ring| {
+        let mut ring = ring.borrow_mut();
+        ring.clear();
+        ring.push(key_ptr);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn test_parse_key_ring_snapshot() -> Vec<usize> {
+    PARSE_KEY_RING.with(|ring| ring.borrow().iter().map(|&ptr| ptr as usize).collect())
 }
 
 /// Seed the stringify-side shape cache with a template keyed on `keys_arr`,
@@ -1350,7 +1375,7 @@ mod tests {
         // The array fast path built its shape template with
         // `min(keys_len, field_count)`. `field_count` is PHYSICAL — it never
         // exceeds the object's inline slot allocation, so an object grown by
-        // name past `INLINE_SLOT_FLOOR` reports the floor (4) while the
+        // name past `INLINE_SLOT_FLOOR` reports the floor while the
         // remaining values live in overflow storage. `JSON.parse`'s tape
         // materializer produces exactly that shape (`js_object_alloc(0, 0)` +
         // `js_object_set_field_by_name` per key), so `JSON.stringify` of a
