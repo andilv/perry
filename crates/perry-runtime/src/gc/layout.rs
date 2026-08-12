@@ -29,13 +29,13 @@ pub(super) const GC_LAYOUT_UNKNOWN: u16 = 0x0000;
 /// catch a misdeclaration, but only if the workload actually holds a misdeclared
 /// object across a collection, and it is easy to build one that never does:
 /// #7635 forced every JSON-parsed record to `POINTER_FREE` while it held heap
-/// strings and got byte-identical correct output under `PERRY_GC_ZEAL=1
+/// strings and got byte-identical correct output under `PERRY_GC_SCHEDULE_RATE=1
 /// PERRY_GC_PROTECT_FROMSPACE=1` and `PERRY_GC_FORCE_EVACUATE=1`, because
 /// `js_json_parse` is LAZY for 1 KB–16 MB top-level arrays (`json_tape`) and the
 /// probe read its records only after the last GC. Under `PERRY_JSON_TAPE=0` the
 /// same sabotage SIGSEGVs. So:
 ///
-/// - "clean under zeal + from-space protect" is evidence only once you have
+/// - "clean at rate 1 + from-space protect" is evidence only once you have
 ///   shown the misdeclared object EXISTED during a collection;
 /// - `PERRY_GC_FROMSPACE_SCAN=1` is the instrument to prefer — its
 ///   whole-payload word scan consults no layout state, and it reported the
@@ -103,226 +103,9 @@ pub(super) fn clear_typed_layout_intact_for_user(user_ptr: usize) {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub(super) enum LayoutSlotMask {
-    Inline(u64),
-    Heap(Vec<u64>),
-    /// Every currently-live slot is pointer-bearing. This is useful for
-    /// runtime-produced arrays such as `String.prototype.split` results: the
-    /// array grows its visible length only after each string has been stored,
-    /// so the collector can visit `0..length` directly without allocating or
-    /// updating a side-table bit for every element.
-    AllPointers,
-}
+mod slot_mask;
 
-impl LayoutSlotMask {
-    pub(super) fn from_words(words: &[u64]) -> Self {
-        let mut trimmed = words.len();
-        while trimmed > 0 && words[trimmed - 1] == 0 {
-            trimmed -= 1;
-        }
-        match trimmed {
-            0 => LayoutSlotMask::Inline(0),
-            1 => LayoutSlotMask::Inline(words[0]),
-            _ => LayoutSlotMask::Heap(words[..trimmed].to_vec()),
-        }
-    }
-
-    #[inline]
-    pub(super) fn set_slot(&mut self, slot_index: usize) {
-        match self {
-            LayoutSlotMask::Inline(bits) if slot_index < 64 => {
-                *bits |= 1u64 << slot_index;
-            }
-            LayoutSlotMask::Inline(bits) => {
-                let mut words = vec![0; slot_index / 64 + 1];
-                words[0] = *bits;
-                words[slot_index / 64] |= 1u64 << (slot_index % 64);
-                *self = LayoutSlotMask::Heap(words);
-            }
-            LayoutSlotMask::Heap(words) => {
-                let word = slot_index / 64;
-                if words.len() <= word {
-                    words.resize(word + 1, 0);
-                }
-                words[word] |= 1u64 << (slot_index % 64);
-            }
-            LayoutSlotMask::AllPointers => {}
-        }
-    }
-
-    #[inline]
-    pub(super) fn clear_slot(&mut self, slot_index: usize) {
-        match self {
-            LayoutSlotMask::Inline(bits) if slot_index < 64 => {
-                *bits &= !(1u64 << slot_index);
-            }
-            LayoutSlotMask::Inline(_) => {}
-            LayoutSlotMask::Heap(words) => {
-                let word = slot_index / 64;
-                if word < words.len() {
-                    words[word] &= !(1u64 << (slot_index % 64));
-                    while words.last().copied() == Some(0) {
-                        words.pop();
-                    }
-                    if words.len() == 1 {
-                        *self = LayoutSlotMask::Inline(words[0]);
-                    }
-                }
-            }
-            // `layout_note_slot` must downgrade an all-pointer layout before
-            // clearing a slot, because this variant intentionally stores no
-            // per-slot bitmap from which to reconstruct the remaining set.
-            LayoutSlotMask::AllPointers => {
-                unreachable!("all-pointer layouts must be downgraded before clearing a slot")
-            }
-        }
-    }
-
-    #[inline]
-    pub(super) fn is_empty(&self) -> bool {
-        match self {
-            LayoutSlotMask::Inline(bits) => *bits == 0,
-            LayoutSlotMask::Heap(words) => words.iter().all(|&w| w == 0),
-            LayoutSlotMask::AllPointers => false,
-        }
-    }
-
-    pub(super) fn visit_slots<F: FnMut(usize)>(&self, slot_count: usize, mut visit: F) {
-        match self {
-            LayoutSlotMask::Inline(bits) => {
-                let limit = slot_count.min(64);
-                let mask = if limit == 64 {
-                    u64::MAX
-                } else if limit == 0 {
-                    0
-                } else {
-                    (1u64 << limit) - 1
-                };
-                let mut word = *bits & mask;
-                while word != 0 {
-                    let bit = word.trailing_zeros() as usize;
-                    visit(bit);
-                    word &= word - 1;
-                }
-            }
-            LayoutSlotMask::Heap(words) => {
-                let word_count = slot_count.div_ceil(64);
-                for (word_index, &raw_word) in words.iter().take(word_count).enumerate() {
-                    let remaining = slot_count.saturating_sub(word_index * 64);
-                    let limit = remaining.min(64);
-                    let mask = if limit == 64 {
-                        u64::MAX
-                    } else if limit == 0 {
-                        0
-                    } else {
-                        (1u64 << limit) - 1
-                    };
-                    let mut word = raw_word & mask;
-                    while word != 0 {
-                        let bit = word.trailing_zeros() as usize;
-                        visit(word_index * 64 + bit);
-                        word &= word - 1;
-                    }
-                }
-            }
-            LayoutSlotMask::AllPointers => {
-                for slot in 0..slot_count {
-                    visit(slot);
-                }
-            }
-        }
-    }
-
-    pub(super) fn count_slots(&self, slot_count: usize) -> usize {
-        let mut count = 0usize;
-        self.visit_slots(slot_count, |_| {
-            count += 1;
-        });
-        count
-    }
-
-    /// Reference implementation only. The construction path asks this question
-    /// of the raw mask words (`shape_install::words_intersect`) rather than of
-    /// two built masks — see that module's "mask words" section — and
-    /// `shape_install::tests::mask_word_helpers_agree_with_layout_slot_mask`
-    /// pins the two together, which is what this now exists for.
-    #[cfg(test)]
-    pub(super) fn intersects(&self, other: &Self, slot_count: usize) -> bool {
-        let mut found = false;
-        self.visit_slots(slot_count, |slot| {
-            if other.contains_slot(slot) {
-                found = true;
-            }
-        });
-        found
-    }
-
-    #[inline]
-    pub(super) fn contains_slot(&self, slot_index: usize) -> bool {
-        match self {
-            LayoutSlotMask::Inline(bits) if slot_index < 64 => (*bits & (1u64 << slot_index)) != 0,
-            LayoutSlotMask::Inline(_) => false,
-            LayoutSlotMask::Heap(words) => {
-                let word = slot_index / 64;
-                word < words.len() && (words[word] & (1u64 << (slot_index % 64))) != 0
-            }
-            LayoutSlotMask::AllPointers => true,
-        }
-    }
-
-    pub(super) fn next_slot_at_or_after(&self, cursor: usize, slot_count: usize) -> Option<usize> {
-        if cursor >= slot_count {
-            return None;
-        }
-        match self {
-            LayoutSlotMask::Inline(bits) => {
-                if cursor >= 64 {
-                    return None;
-                }
-                let limit = slot_count.min(64);
-                let limit_mask = if limit == 64 {
-                    u64::MAX
-                } else if limit == 0 {
-                    0
-                } else {
-                    (1u64 << limit) - 1
-                };
-                let cursor_mask = u64::MAX << cursor;
-                let word = *bits & limit_mask & cursor_mask;
-                (word != 0).then(|| word.trailing_zeros() as usize)
-            }
-            LayoutSlotMask::Heap(words) => {
-                let mut word_index = cursor / 64;
-                let word_count = slot_count.div_ceil(64);
-                while word_index < word_count && word_index < words.len() {
-                    let word_start = word_index * 64;
-                    let remaining = slot_count.saturating_sub(word_start);
-                    let limit = remaining.min(64);
-                    let limit_mask = if limit == 64 {
-                        u64::MAX
-                    } else if limit == 0 {
-                        0
-                    } else {
-                        (1u64 << limit) - 1
-                    };
-                    let cursor_mask = if word_index == cursor / 64 {
-                        u64::MAX << (cursor % 64)
-                    } else {
-                        u64::MAX
-                    };
-                    let word = words[word_index] & limit_mask & cursor_mask;
-                    if word != 0 {
-                        return Some(word_start + word.trailing_zeros() as usize);
-                    }
-                    word_index += 1;
-                }
-                None
-            }
-            LayoutSlotMask::AllPointers => (cursor < slot_count).then_some(cursor),
-        }
-    }
-}
+pub(in crate::gc) use slot_mask::LayoutSlotMask;
 
 /// What a single store means for the object's canonical typed descriptor.
 /// Computed while the descriptor is still borrowed, acted on after
@@ -909,11 +692,36 @@ pub(crate) fn layout_note_slot(parent_user: usize, slot_index: usize, value_bits
                         set_layout_state(header, GC_LAYOUT_SIDE_MASK);
                     }
                 } else if (*header)._reserved & GC_LAYOUT_STATE_MASK == GC_LAYOUT_POINTER_FREE {
-                    let mut mask = LayoutSlotMask::Inline(0);
-                    mask.set_slot(slot_index);
-                    masks.insert(parent_user, mask);
-                    mark_per_object_layouts_nonempty();
-                    set_layout_state(header, GC_LAYOUT_SIDE_MASK);
+                    if super::layout_tables::immortal_layout_scope_active()
+                        || super::layout_tables::layout_prefers_scan_over_mask(
+                            header,
+                            parent_user,
+                            slot_index,
+                        )
+                    {
+                        // Two reasons to decline the mask, one fallback. An
+                        // object built inside an `ImmortalLayoutScope` is
+                        // rooted for the life of the process, so the entry it
+                        // would mint here is never removed — and one such
+                        // entry disables `PER_OBJECT_LAYOUTS_NONEMPTY` for
+                        // every allocation the program will ever make (see
+                        // `ImmortalLayoutScope`). And a payload too small for
+                        // the mask to earn its side-table entry
+                        // (`layout_prefers_scan_over_mask`) skips nothing the
+                        // tag-checked scan would not check anyway. Both take
+                        // the same `GC_LAYOUT_UNKNOWN` fallback the `else`
+                        // arm below uses for this exact situation.
+                        set_layout_state(header, GC_LAYOUT_UNKNOWN);
+                    } else {
+                        let mut mask = LayoutSlotMask::Inline(0);
+                        mask.set_slot(slot_index);
+                        masks.insert(parent_user, mask);
+                        mark_per_object_layouts_nonempty();
+                        // The one insert site that holds its own `borrow_mut`,
+                        // so it maintains the address filter inline too.
+                        super::layout_tables::layout_addr_filter_note(parent_user);
+                        set_layout_state(header, GC_LAYOUT_SIDE_MASK);
+                    }
                 } else {
                     set_layout_state(header, GC_LAYOUT_UNKNOWN);
                 }
@@ -1338,6 +1146,22 @@ pub(super) unsafe fn layout_rebuild_from_slots_with_policy(
     if mask.is_empty() {
         set_layout_state(header, GC_LAYOUT_POINTER_FREE);
         slot_masks_remove(user_ptr as usize);
+    } else if super::layout_tables::immortal_layout_scope_active()
+        || slot_count < super::layout_tables::layout_mask_min_slots()
+    {
+        // Same two reasons as the `layout_note_slot` branch, same fallback. An
+        // object built inside an `ImmortalLayoutScope` never dies, so the mask
+        // it would install here is a permanent tenant of a side table whose
+        // emptiness is a process-wide fast path; and too few slots means the
+        // mask cannot earn its side-table entry — the tag-checked scan is
+        // exact and costs the program nothing globally. Falling back is sound
+        // *for this rebuild specifically* because the mask above is itself
+        // derived from `layout_pointer_bearing_bits` — exactly the test
+        // `GC_LAYOUT_UNKNOWN` re-runs per slot. (This is why the scope may not
+        // be applied to a TYPED descriptor, whose raw-f64 slots the tag test
+        // would misread; see `ImmortalLayoutScope`.)
+        set_layout_state(header, GC_LAYOUT_UNKNOWN);
+        slot_masks_remove(user_ptr as usize);
     } else {
         set_layout_state(header, GC_LAYOUT_SIDE_MASK);
         slot_masks_insert(user_ptr as usize, mask);
@@ -1570,6 +1394,22 @@ pub(super) enum HeapPayloadSlotScan {
         raw_numeric_array: bool,
         raw_numeric_object_slots: usize,
     },
+    /// [`LayoutSlotMask::AllPointers`]: the mask selects EVERY live payload
+    /// slot, so the slot set is a contiguous range and the descriptor visitor
+    /// emits one `Range` rather than `slot_count` individual `Slot`s.
+    ///
+    /// This is not a micro-optimisation. `scan_dirty_object_slots`'s `Slot` arm
+    /// answers "is this slot on a dirty page?" with a hash-set probe **per
+    /// slot**, so a 3M-element array of pointers cost 3M probes on every minor
+    /// — O(live array) rather than O(dirty pages) — even though the remembered
+    /// set knew only a few hundred of its pages were dirty. Its `Range` arm
+    /// intersects the range with the dirty-page set directly
+    /// (`dirty_slot_ranges_for`), which is what `dirty_slot_ranges_scanned == 0`
+    /// in every `retain.ts` GC trace was recording: the cheap arm was never
+    /// reached, because an all-pointer array is `Masked`, not `All` (#7787).
+    AllPointers {
+        raw_numeric_object_slots: usize,
+    },
     Masked,
     All(HeapSlotRange),
 }
@@ -1649,6 +1489,22 @@ impl HeapChildSlotIterator {
             } => HeapPayloadSlotScan::PointerFree {
                 raw_numeric_array,
                 raw_numeric_object_slots,
+            },
+            HeapPayloadSlotSelection::Masked {
+                mask: LayoutSlotMask::AllPointers,
+                raw_numeric_object_slots,
+                raw_numeric_recorded,
+                ..
+            } => HeapPayloadSlotScan::AllPointers {
+                // Mirror the iterator's one-shot accounting: `next` records the
+                // raw-numeric skip on its first call and never again, so a
+                // descriptor visit that replaces the whole iteration records it
+                // exactly once too.
+                raw_numeric_object_slots: if raw_numeric_recorded {
+                    0
+                } else {
+                    raw_numeric_object_slots
+                },
             },
             HeapPayloadSlotSelection::Masked { .. } => HeapPayloadSlotScan::Masked,
             HeapPayloadSlotSelection::All { .. } => HeapPayloadSlotScan::All(self.payload),

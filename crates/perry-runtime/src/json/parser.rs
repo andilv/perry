@@ -56,6 +56,61 @@ pub(crate) struct ObjectShapeHint {
     pub(crate) field_count: u32,
 }
 
+/// The deepest `[`/`{` nesting handled by the recursive fast path.
+///
+/// Both the `serde_json` validation pass and Perry's direct value parser recurse
+/// once per container, so their cutoff is sized for Perry's smallest worker
+/// stack rather than the main thread's larger stack (#7792).
+///
+/// Deeper documents switch to the flat-tape parser and iterative materializer,
+/// so this is a native-stack safety threshold rather than an input limit.
+pub(crate) const MAX_RECURSIVE_NESTING_DEPTH: usize = 1_000;
+
+/// Heap-stack safety ceiling. This remains well above Node-parity cases such as
+/// #7817's 300,000-level document, while bounding the tape, pending-frame stack,
+/// and runtime-container amplification for unusually deep input.
+pub(crate) const MAX_ITERATIVE_NESTING_DEPTH: usize = 500_000;
+
+/// Does `bytes` nest deeper than `limit`?
+///
+/// Iterative on purpose. A recursive depth check would be the very thing it
+/// exists to prevent, and it would crash on exactly the documents it is
+/// supposed to reject.
+///
+/// Bracket bytes inside strings do not count, so a document that is one long
+/// `"[[[[[[…"` string is not mistaken for deep nesting. This runs before any
+/// syntax validation, so it must not assume the input is well-formed — an
+/// unbalanced `]` clamps at zero rather than underflowing.
+pub(crate) fn nesting_depth_exceeds(bytes: &[u8], limit: usize) -> bool {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &byte in bytes {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth += 1;
+                if depth > limit {
+                    return true;
+                }
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    false
+}
+
 pub(crate) struct DirectParser<'a> {
     input: &'a [u8],
     pos: usize,

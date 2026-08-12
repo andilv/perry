@@ -114,6 +114,14 @@ pub(super) struct SweepTraceStats {
     pub(super) reusable_bytes: usize,
     pub(super) returned_bytes: usize,
     pub(super) reset_blocks: usize,
+    pub(super) removed_blocks: usize,
+    pub(super) removed_bytes: usize,
+    pub(super) pooled_blocks: usize,
+    pub(super) pooled_bytes: usize,
+    /// Pooled mappings explicitly deallocated after a critical-pressure or
+    /// allocation-failure full cycle. Included in returned/deallocated totals.
+    pub(super) pool_drained_blocks: usize,
+    pub(super) pool_drained_bytes: usize,
     pub(super) deallocated_blocks: usize,
     // Compatibility alias for returned_bytes.
     pub(super) deallocated_bytes: usize,
@@ -124,6 +132,9 @@ pub(super) struct SweepTraceStats {
     /// documents the policy and why the signal is not self-referential.
     pub(super) eden_live_bytes: u64,
     pub(super) eden_dead_bytes: u64,
+    /// Header-inclusive bytes this arena walk classified live. Unlike block
+    /// offsets, this excludes dead objects stranded beside a tiny survivor.
+    pub(super) arena_live_bytes: u64,
 }
 
 pub(super) fn evacuation_policy_initial_decision(
@@ -749,6 +760,7 @@ fn legacy_sweep_with_age_bump_and_old_reclaim_targets(
     };
     let mut retained_forwarded_stub_objects: usize = 0;
     let mut retained_forwarded_stub_bytes: usize = 0;
+    let mut arena_live_bytes: u64 = 0;
 
     // Sweep arena objects. Two-phase strategy:
     //
@@ -853,6 +865,7 @@ fn legacy_sweep_with_age_bump_and_old_reclaim_targets(
                 return;
             }
             if flags & GC_FLAG_PINNED != 0 {
+                arena_live_bytes = arena_live_bytes.saturating_add((*header).size as u64);
                 if block_idx >= old_block_start {
                     crate::arena::old_page_account_swept_object(
                         header as usize,
@@ -890,6 +903,13 @@ fn legacy_sweep_with_age_bump_and_old_reclaim_targets(
                     || (block_idx < resettable_general_n
                         && crate::arena::general_block_in_recent_window(block_idx));
                 if retain_stub {
+                    // A full collection can leave an unmarked stub in the
+                    // recent-block safety window without mistaking it for a
+                    // live object. Keep the block/header, but do not charge
+                    // that proven-dead stub to the live census.
+                    if do_age_bump || flags & GC_FLAG_MARKED != 0 {
+                        arena_live_bytes = arena_live_bytes.saturating_add((*header).size as u64);
+                    }
                     if block_idx >= old_block_start {
                         crate::arena::old_page_account_swept_object(
                             header as usize,
@@ -964,6 +984,7 @@ fn legacy_sweep_with_age_bump_and_old_reclaim_targets(
                     invalidate_dead_old_arena_header(header, total_size);
                 }
             } else {
+                arena_live_bytes = arena_live_bytes.saturating_add((*header).size as u64);
                 if block_idx >= old_block_start {
                     crate::arena::old_page_account_swept_object(
                         header as usize,
@@ -1041,6 +1062,22 @@ fn legacy_sweep_with_age_bump_and_old_reclaim_targets(
             .reusable_bytes
             .saturating_add(survivor_reset.reusable_bytes)
             .saturating_add(old_reset.reusable_bytes),
+        removed_blocks: nursery_reset
+            .removed_blocks
+            .saturating_add(survivor_reset.removed_blocks)
+            .saturating_add(old_reset.removed_blocks),
+        removed_bytes: nursery_reset
+            .removed_bytes
+            .saturating_add(survivor_reset.removed_bytes)
+            .saturating_add(old_reset.removed_bytes),
+        pooled_blocks: nursery_reset
+            .pooled_blocks
+            .saturating_add(survivor_reset.pooled_blocks)
+            .saturating_add(old_reset.pooled_blocks),
+        pooled_bytes: nursery_reset
+            .pooled_bytes
+            .saturating_add(survivor_reset.pooled_bytes)
+            .saturating_add(old_reset.pooled_bytes),
         deallocated_blocks: nursery_reset
             .deallocated_blocks
             .saturating_add(survivor_reset.deallocated_blocks)
@@ -1057,6 +1094,12 @@ fn legacy_sweep_with_age_bump_and_old_reclaim_targets(
         reusable_bytes: reset.reusable_bytes,
         returned_bytes: reset.deallocated_bytes,
         reset_blocks: reset.reset_blocks,
+        removed_blocks: reset.removed_blocks,
+        removed_bytes: reset.removed_bytes,
+        pooled_blocks: reset.pooled_blocks,
+        pooled_bytes: reset.pooled_bytes,
+        pool_drained_blocks: 0,
+        pool_drained_bytes: 0,
         deallocated_blocks: reset.deallocated_blocks,
         deallocated_bytes: reset.deallocated_bytes,
         retained_forwarded_stub_objects,
@@ -1065,6 +1108,7 @@ fn legacy_sweep_with_age_bump_and_old_reclaim_targets(
         // the #7598 seed.
         eden_live_bytes: 0,
         eden_dead_bytes: 0,
+        arena_live_bytes,
     }
 }
 
@@ -1230,12 +1274,19 @@ impl IncrementalSweepState {
                         reusable_bytes: reset.reusable_bytes,
                         returned_bytes: reset.deallocated_bytes,
                         reset_blocks: reset.reset_blocks,
+                        removed_blocks: reset.removed_blocks,
+                        removed_bytes: reset.removed_bytes,
+                        pooled_blocks: reset.pooled_blocks,
+                        pooled_bytes: reset.pooled_bytes,
+                        pool_drained_blocks: 0,
+                        pool_drained_bytes: 0,
                         deallocated_blocks: reset.deallocated_blocks,
                         deallocated_bytes: reset.deallocated_bytes,
                         retained_forwarded_stub_objects: self.arena.retained_forwarded_stub_objects,
                         retained_forwarded_stub_bytes: self.arena.retained_forwarded_stub_bytes,
                         eden_live_bytes: self.arena.eden_live_bytes,
                         eden_dead_bytes: self.arena.eden_dead_bytes,
+                        arena_live_bytes: self.arena.arena_live_bytes,
                     };
                     self.subphase = SweepCycleSubphase::Done;
                     return true;
@@ -1300,6 +1351,7 @@ struct ArenaSweepObjectsState {
     /// #7598 Eden census: see `SweepTraceStats`.
     eden_live_bytes: u64,
     eden_dead_bytes: u64,
+    arena_live_bytes: u64,
 }
 
 impl ArenaSweepObjectsState {
@@ -1331,6 +1383,7 @@ impl ArenaSweepObjectsState {
             retained_forwarded_stub_bytes: 0,
             eden_live_bytes: 0,
             eden_dead_bytes: 0,
+            arena_live_bytes: 0,
         }
     }
 
@@ -1401,7 +1454,7 @@ impl ArenaSweepObjectsState {
                 return;
             }
             if flags & GC_FLAG_PINNED != 0 {
-                self.keep_live_object(header, block_idx, flags, age_bump_this, true);
+                self.keep_live_object(header, block_idx, flags, age_bump_this, true, true);
                 return;
             }
             if flags & GC_FLAG_FORWARDED != 0 {
@@ -1411,7 +1464,7 @@ impl ArenaSweepObjectsState {
             if flags & GC_FLAG_MARKED == 0 && self.unmarked_is_provably_dead(block_idx) {
                 self.reclaim_dead_object(header, block_idx);
             } else {
-                self.keep_live_object(header, block_idx, flags, age_bump_this, false);
+                self.keep_live_object(header, block_idx, flags, age_bump_this, false, true);
             }
         }
     }
@@ -1448,6 +1501,7 @@ impl ArenaSweepObjectsState {
         flags: u8,
         age_bump_this: bool,
         pinned: bool,
+        count_in_live_census: bool,
     ) {
         if block_idx >= self.old_block_start {
             crate::arena::old_page_account_swept_object(
@@ -1462,6 +1516,9 @@ impl ArenaSweepObjectsState {
         }
         if block_idx < self.resettable_general_n {
             self.eden_live_bytes = self.eden_live_bytes.saturating_add((*header).size as u64);
+        }
+        if count_in_live_census {
+            self.arena_live_bytes = self.arena_live_bytes.saturating_add((*header).size as u64);
         }
         if age_bump_this && flags & GC_FLAG_TENURED == 0 {
             if flags & GC_FLAG_HAS_SURVIVED != 0 {
@@ -1489,7 +1546,11 @@ impl ArenaSweepObjectsState {
             || (block_idx < self.resettable_general_n
                 && crate::arena::general_block_in_recent_window(block_idx));
         if retain_stub {
-            self.keep_live_object(header, block_idx, flags, false, false);
+            // A full collection can leave an unmarked stub in the recent-block
+            // safety window. It still pins the block, but it is proven dead and
+            // therefore excluded from live-allocation accounting.
+            let count_in_live_census = self.minor_sweep || flags & GC_FLAG_MARKED != 0;
+            self.keep_live_object(header, block_idx, flags, false, false, count_in_live_census);
             if block_idx < self.resettable_general_n {
                 self.retained_forwarded_stub_objects =
                     self.retained_forwarded_stub_objects.saturating_add(1);
@@ -1630,6 +1691,10 @@ fn add_reset_stats(
     crate::arena::ArenaResetStats {
         reset_blocks: lhs.reset_blocks.saturating_add(rhs.reset_blocks),
         reusable_bytes: lhs.reusable_bytes.saturating_add(rhs.reusable_bytes),
+        removed_blocks: lhs.removed_blocks.saturating_add(rhs.removed_blocks),
+        removed_bytes: lhs.removed_bytes.saturating_add(rhs.removed_bytes),
+        pooled_blocks: lhs.pooled_blocks.saturating_add(rhs.pooled_blocks),
+        pooled_bytes: lhs.pooled_bytes.saturating_add(rhs.pooled_bytes),
         deallocated_blocks: lhs
             .deallocated_blocks
             .saturating_add(rhs.deallocated_blocks),

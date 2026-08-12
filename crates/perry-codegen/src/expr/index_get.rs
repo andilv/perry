@@ -31,12 +31,13 @@ use crate::type_analysis::{is_array_expr, is_numeric_expr, is_string_expr, recei
 use crate::types::{DOUBLE, I1, I16, I32, I64, I8};
 
 use super::{
-    array_kind_fact, buffer_access_materialization_reason, emit_typed_feedback_register_site,
-    expr_has_numeric_pointer_free_array_layout, int_range_expr, lower_buffer_load, lower_expr,
-    lower_expr_as_i32, lower_typed_array_load, materialize_js_value, raw_f64_layout_fact,
-    try_lower_flat_const_index_get, typed_feedback_emission_enabled, unbox_str_handle,
-    unbox_to_i64, BufferAccessSpec, FnCtx, PackedF64LoopFact, TypedFeedbackContract,
-    TypedFeedbackKind,
+    array_kind_fact, attach_buffer_view_pointer_state_for_expr,
+    buffer_access_materialization_reason, emit_typed_feedback_register_site,
+    expr_has_numeric_pointer_free_array_layout, int_range_expr, invalidate_buffer_view_pointer,
+    lower_buffer_load, lower_expr, lower_expr_as_i32, lower_typed_array_load, materialize_js_value,
+    raw_f64_layout_fact, try_lower_flat_const_index_get, typed_feedback_emission_enabled,
+    unbox_str_handle, unbox_to_i64, BufferAccessSpec, FnCtx, PackedF64LoopFact,
+    TypedFeedbackContract, TypedFeedbackKind,
 };
 
 mod guarded_array;
@@ -215,6 +216,40 @@ fn numeric_index_needs_runtime_key(ctx: &FnCtx<'_>, object: &Expr, index: &Expr)
 fn typed_array_index_needs_runtime_key(ctx: &FnCtx<'_>, object: &Expr, index: &Expr) -> bool {
     !numeric_index_has_integer_array_index_proof(ctx, index)
         && !numeric_index_has_loop_array_index_proof(ctx, object, index)
+}
+
+fn is_proven_canonical_numeric_string_literal(key: &[u8]) -> bool {
+    if matches!(key, b"-0" | b"NaN" | b"Infinity" | b"-Infinity") {
+        return true;
+    }
+
+    let digits = key.strip_prefix(b"-").unwrap_or(key);
+    if digits.is_empty()
+        || (digits.len() > 1 && digits[0] == b'0')
+        || !digits.iter().all(u8::is_ascii_digit)
+    {
+        return false;
+    }
+
+    // Decimal integers through Number.MAX_SAFE_INTEGER are exact, and this
+    // range is below the threshold where JS Number#toString switches to
+    // exponent notation. Their source spelling therefore proves
+    // CanonicalNumericIndexString without invoking runtime conversion.
+    digits
+        .iter()
+        .try_fold(0_u64, |value, digit| {
+            value.checked_mul(10)?.checked_add(u64::from(digit - b'0'))
+        })
+        .is_some_and(|value| value <= 9_007_199_254_740_991)
+}
+
+fn runtime_key_may_expose_typed_array_backing_buffer(index: &Expr) -> bool {
+    match index {
+        Expr::String(key) => !is_proven_canonical_numeric_string_literal(key.as_bytes()),
+        Expr::WtfString(key) => !is_proven_canonical_numeric_string_literal(key),
+        Expr::Integer(_) | Expr::Number(_) => false,
+        _ => true,
+    }
 }
 
 fn lower_array_index_get_via_runtime_key(
@@ -825,6 +860,17 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     return Ok(v);
                 }
                 if typed_array_index_needs_runtime_key(ctx, object.as_ref(), index.as_ref()) {
+                    if runtime_key_may_expose_typed_array_backing_buffer(index) {
+                        if let Expr::LocalGet(id) = object.as_ref() {
+                            if ctx.buffer_view_slots.contains_key(id) {
+                                invalidate_buffer_view_pointer(
+                                    ctx,
+                                    *id,
+                                    MaterializationReason::MutableAlias,
+                                );
+                            }
+                        }
+                    }
                     let arr_box = lower_expr(ctx, object)?;
                     let key_box = lower_expr(ctx, index)?;
                     let blk = ctx.block();
@@ -849,6 +895,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         false,
                         vec!["typed_array_fallback=untracked_or_unproven".to_string()],
                     );
+                    attach_buffer_view_pointer_state_for_expr(ctx, object);
                     return Ok(result);
                 }
 
@@ -893,6 +940,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     false,
                     vec!["typed_array_fallback=untracked_or_unproven".to_string()],
                 );
+                attach_buffer_view_pointer_state_for_expr(ctx, object);
                 return Ok(result);
             }
             if is_uint8array_receiver(ctx, object) && is_numeric_expr(ctx, index) {
@@ -1089,6 +1137,37 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 index.as_ref(),
                 Expr::String(_) | Expr::WtfString(_) | Expr::SymbolFor(_)
             ) || is_string_expr(ctx, index);
+            // #7854 recovered a receiver's declared array type for a LOCAL
+            // (`const names = e.names`), never for the read used directly as a
+            // receiver (`e.vals[i]`, `p.toks[p.pos]`) — the HIR types a
+            // `PropertyGet` off a UNION receiver as `Any`, so those land in the
+            // `recv_unknown` arm below and pay `js_dyn_index_get` plus the
+            // `js_array_length` its miss path calls.
+            //
+            // A declared property type is a CLAIM. It is admissible here and
+            // only here because the tier this unlocks —
+            // `lower_guarded_array_index_get` — re-checks `GC_TYPE_ARRAY`, the
+            // forwarding flag, descriptors, the prototype latch and the bounds
+            // on the receiver itself and routes every failure to the boxed
+            // fallback. A violated claim costs a branch, not an answer. (#6132
+            // records that the same guard is what makes a typed-array-valued
+            // member receiver safe on this path.)
+            //
+            // Restricted to a NON-string, NON-symbol key, and that restriction is
+            // load-bearing rather than tidy. The string-key arm of the array
+            // branch is `js_array_get_index_or_string`, whose string half calls
+            // `js_object_get_field_by_name` on the receiver — and that answers
+            // `undefined` for `s["0"]` on a heap STRING receiver, where JS
+            // answers the character. That is a pre-existing wrong answer on
+            // `main` — reachable today through a plain non-union declared
+            // receiver, filed as #7891 with a minimal repro — and a claim must
+            // not widen the set of shapes that reach it. With
+            // the restriction, a string or symbol key takes exactly the generic
+            // path it takes today; only the numeric read moves.
+            let claimed_array = recv_unknown
+                && !index_is_static_string_or_symbol
+                && crate::type_analysis::declared_array_property_claim(ctx, object);
+            let recv_unknown = recv_unknown && !claimed_array;
             if recv_unknown && !index_is_static_string_or_symbol {
                 // #7640 section B: receiver live across an unconstrained index.
                 return rooting::with_operands_rooted(ctx, &[object, index], |ctx, vals| {
@@ -1109,7 +1188,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             //      generic object field access via js_object_get_field_by_name_f64
             //   3. Anything else → fall back to dynamic object field
             //      access by stringifying the index at runtime
-            if is_array_expr(ctx, object) {
+            if is_array_expr(ctx, object) || claimed_array {
                 // #321: a symbol-keyed array read (`arr[Symbol.iterator]`) must
                 // NOT take the numeric fast path below — `fptosi` on the symbol
                 // value yields a garbage index (returned a number). Route symbol

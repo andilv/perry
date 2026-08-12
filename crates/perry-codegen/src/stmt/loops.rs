@@ -4569,7 +4569,7 @@ fn dynamic_bound_private_counter_is_safe(
     advanced_by_increment && !stmts_mutate_local(body, counter_id)
 }
 
-pub(super) fn emit_js_value_is_number(ctx: &mut FnCtx<'_>, value: &str) -> String {
+pub(crate) fn emit_js_value_is_number(ctx: &mut FnCtx<'_>, value: &str) -> String {
     let n_bits = ctx.block().bitcast_double_to_i64(value);
     let tag = ctx.block().and(
         I64,
@@ -5425,8 +5425,8 @@ pub(crate) fn emit_gc_loop_safepoint(
 /// return without doing anything (`perry-runtime/src/gc/poll_arm.rs`), so the
 /// guard is not a heuristic and does not change when a collection happens: the
 /// word is armed by the same transition that sets `GC_SAFEPOINT_PENDING`, and
-/// under `PERRY_GC_ZEAL` it is armed for the life of the process so zeal still
-/// forces a collection at every poll.
+/// under `PERRY_GC_SCHEDULE_SEED` it is armed for the life of the process so the
+/// seeded schedule still sees every poll it is entitled to select.
 ///
 /// The load is **volatile** for one reason: this word is written by the runtime
 /// from calls LLVM cannot see through, and a poll whose load got hoisted out of

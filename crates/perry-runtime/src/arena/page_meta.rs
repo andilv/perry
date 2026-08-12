@@ -294,6 +294,7 @@ pub(crate) struct OldPageSummary {
     pub(crate) live_bytes: usize,
     pub(crate) dead_bytes: usize,
     pub(crate) reusable_bytes: usize,
+    pub(crate) pooled_bytes: usize,
     pub(crate) returned_bytes: usize,
     pub(crate) pinned_bytes: usize,
     pub(crate) object_count: usize,
@@ -326,6 +327,7 @@ thread_local! {
         RefCell::new(crate::fast_hash::new_ptr_hash_map());
 
     pub(crate) static OLD_GEN_RECLAIM_REUSABLE_BYTES: Cell<usize> = const { Cell::new(0) };
+    pub(crate) static OLD_GEN_RECLAIM_POOLED_BYTES: Cell<usize> = const { Cell::new(0) };
     pub(crate) static OLD_GEN_RECLAIM_RETURNED_BYTES: Cell<usize> = const { Cell::new(0) };
 
     /// Monotonic per-cycle epoch for old-page `dirty_slots` (#6181). Bumped
@@ -690,7 +692,13 @@ pub(crate) fn classify_heap_space(addr: usize) -> HeapSpace {
 /// a range base); the base is precisely the guard that keeps a *garbage*
 /// candidate address at the very start of a range from turning into a read of
 /// the unmapped page below it (#7742).
-#[inline]
+/// Split hit/miss exactly like [`classify_heap_generation`] above, and for the
+/// same reason (#7469): with the map-lookup arm inlined alongside it, the whole
+/// function stayed out of line and every call paid its own `_tlv_get_addr` for
+/// the cache base. This one is the copying minor's inner loop —
+/// `CopyingPointerSet::classify_arena` calls it once per visited slot — so on a
+/// promotion-heavy cycle it runs millions of times per collection.
+#[inline(always)]
 pub(crate) fn classify_heap_space_in_range(addr: usize) -> Option<(HeapSpace, usize)> {
     if addr == 0 {
         return None;
@@ -700,18 +708,20 @@ pub(crate) fn classify_heap_space_in_range(addr: usize) -> Option<(HeapSpace, us
     if let Some(range) = unsafe { (*hot_page_generation_cache()).lookup(key, addr) } {
         return Some((range.space, range.base));
     }
+    classify_heap_space_in_range_uncached(addr, key)
+}
 
+/// Cache-miss arm of [`classify_heap_space_in_range`].
+#[inline(never)]
+fn classify_heap_space_in_range_uncached(addr: usize, key: usize) -> Option<(HeapSpace, usize)> {
     let found = {
         let pages = hot_page_generations().borrow();
         pages.get(&key).and_then(|slot| slot.find(addr))
     };
-    if let Some(range) = found {
-        // SAFETY: as above.
-        unsafe { (*hot_page_generation_cache()).insert(key, range) };
-        Some((range.space, range.base))
-    } else {
-        None
-    }
+    let range = found?;
+    // SAFETY: thread-local, single-threaded, and the borrow ends here.
+    unsafe { (*hot_page_generation_cache()).insert(key, range) };
+    Some((range.space, range.base))
 }
 
 pub(crate) fn old_object_page_overlaps(
@@ -1003,6 +1013,7 @@ pub(crate) fn old_pages_begin_gc_cycle() {
     // it on first touch this cycle (`old_page_account_dirty_slot`).
     OLD_GEN_PAGE_DIRTY_EPOCH.with(|epoch| epoch.set(epoch.get().wrapping_add(1)));
     OLD_GEN_RECLAIM_REUSABLE_BYTES.with(|bytes| bytes.set(0));
+    OLD_GEN_RECLAIM_POOLED_BYTES.with(|bytes| bytes.set(0));
     OLD_GEN_RECLAIM_RETURNED_BYTES.with(|bytes| bytes.set(0));
 }
 
@@ -1088,18 +1099,30 @@ pub(crate) fn old_page_account_dirty_slot(slot_addr: usize) {
     if slot_addr == 0 {
         return;
     }
-    let page = generation_page_for_addr(slot_addr);
+    old_page_account_dirty_slots(generation_page_for_addr(slot_addr), 1);
+}
+
+/// Batched form of [`old_page_account_dirty_slot`] for a run of `count` slots
+/// already known to lie on `page`.
+///
+/// The dirty scan walks contiguous, ascending slot ranges, so ~512 consecutive
+/// slots share one 4 KiB page. Per-slot this was one hash-map probe each; the
+/// counter it maintains is per-page, so the run can be folded into a single
+/// probe. Same epoch semantics as the per-slot form — the first run seen this
+/// cycle re-stamps and starts the count over, later runs on the same page
+/// accumulate (#6181).
+pub(crate) fn old_page_account_dirty_slots(page: usize, count: usize) {
+    if count == 0 {
+        return;
+    }
     let current_epoch = old_gen_page_dirty_epoch();
     OLD_GEN_PAGE_META.with(|meta| {
         if let Some(page_meta) = meta.borrow_mut().get_mut(&page) {
-            // First dirty slot seen this cycle re-stamps and starts from 1
-            // (the lazy equivalent of the old per-cycle reset-to-zero);
-            // subsequent slots on the same page accumulate (#6181).
             if page_meta.dirty_slots_epoch == current_epoch {
-                page_meta.dirty_slots = page_meta.dirty_slots.saturating_add(1);
+                page_meta.dirty_slots = page_meta.dirty_slots.saturating_add(count);
             } else {
                 page_meta.dirty_slots_epoch = current_epoch;
-                page_meta.dirty_slots = 1;
+                page_meta.dirty_slots = count;
             }
         }
     });
@@ -1148,6 +1171,7 @@ pub(crate) fn old_page_summary() -> OldPageSummary {
             }
         }
         summary.reusable_bytes = OLD_GEN_RECLAIM_REUSABLE_BYTES.with(|bytes| bytes.get());
+        summary.pooled_bytes = OLD_GEN_RECLAIM_POOLED_BYTES.with(|bytes| bytes.get());
         summary.returned_bytes = OLD_GEN_RECLAIM_RETURNED_BYTES.with(|bytes| bytes.get());
         summary
     })

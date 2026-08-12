@@ -33,6 +33,7 @@ fn ir_opts(debug_locations: bool, module_source: Option<&str>) -> CompileOptions
         verify_native_regions: false,
         disable_buffer_fast_path: false,
         namespace_imports: Vec::new(),
+        namespace_member_nested: Vec::new(),
         imported_classes: Vec::new(),
         imported_enums: Vec::new(),
         imported_async_funcs: std::collections::HashSet::new(),
@@ -266,4 +267,265 @@ fn generic_property_get_tries_ways_before_calling_the_miss_handler() {
         ir.contains(&format!("i64 {PIC_WAY_STATE}\n")),
         "the megamorphic gate must read the way-state word:\n{ir}"
     );
+}
+
+/// #7189 — `B.ns` where the imported module says `export * as ns from "./m.ts"`.
+///
+/// The member's value is another module's namespace OBJECT, so there is no
+/// `perry_fn_<mod>__ns` symbol for it. Every other namespace-member arm
+/// resolves to a symbol, so before this the read fell through to the generic
+/// path and produced `undefined` — which is how `z.coerce`, `z.iso`, `z.core`
+/// and `z.locales` all came back undefined under zod.
+mod nested_namespace_members {
+    use super::*;
+
+    fn nested_opts() -> CompileOptions {
+        let mut opts = ir_opts(false, None);
+        opts.namespace_imports = vec!["B".to_string()];
+        opts.namespace_member_prefixes
+            .insert(("B".to_string(), "deep".to_string()), "ns2_ts".to_string());
+        opts.namespace_member_prefixes
+            .insert(("B".to_string(), "gamma".to_string()), "ns3_ts".to_string());
+        opts.namespace_member_nested = vec![("B".to_string(), "deep".to_string())];
+        opts
+    }
+
+    fn module_reading(member: &str) -> Module {
+        let mut m = Module::new("nsmain.ts");
+        m.init = vec![Stmt::Expr(Expr::PropertyGet {
+            object: Box::new(Expr::ExternFuncRef {
+                name: "B".to_string(),
+                param_types: Vec::new(),
+                return_type: perry_hir::types::Type::Any,
+            }),
+            property: member.to_string(),
+            byte_offset: 0,
+        })];
+        m.init_kind = ModuleInitKind::Eager;
+        m
+    }
+
+    fn emit_read(member: &str) -> String {
+        String::from_utf8(compile_module(&module_reading(member), nested_opts()).unwrap())
+            .expect("LLVM IR should be UTF-8")
+    }
+
+    /// Slice out the body that actually runs the module's statements.
+    ///
+    /// Assertions have to be made HERE and not against the whole module. The
+    /// declaration pass emits `@__perry_ns_ns2_ts = external` on its own, so a
+    /// test that searched the whole IR passed with the read-site fix removed —
+    /// it was confirming the declaration existed, not that anything used it.
+    ///
+    /// For an entry module the statements land in `@main`; `<mod>__init` is an
+    /// empty stub. Slicing the stub is its own way of asserting nothing, which
+    /// is the mistake this helper exists to avoid making twice.
+    fn entry_body(ir: &str) -> String {
+        let start = ir.find("define i32 @main()").expect("main must be emitted");
+        let end = ir[start..].find("\n}").expect("main must terminate") + start;
+        ir[start..end].to_string()
+    }
+
+    #[test]
+    fn a_nested_namespace_member_loads_the_target_namespace_global() {
+        let ir = emit_read("deep");
+        let body = entry_body(&ir);
+        assert!(
+            body.contains("load double, ptr @__perry_ns_ns2_ts"),
+            "the read must load the target module's namespace object:\n{body}"
+        );
+        // The target's init has to run first, or the namespace is read before
+        // it has been populated and every member comes back undefined.
+        assert!(
+            body.contains("call void @ns2_ts__init()"),
+            "the target's init must run before its namespace is loaded:\n{body}"
+        );
+        // The global lives in another module, so this one must declare it or
+        // LLVM refuses to parse the IR at all.
+        assert!(
+            ir.contains("@__perry_ns_ns2_ts = external"),
+            "the foreign namespace global must be declared, not just referenced:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_namespace_member_is_untouched() {
+        // The guard against over-reaching: a normal member still resolves the
+        // way it always did, through its origin module's symbol rather than a
+        // namespace object.
+        let body = entry_body(&emit_read("gamma"));
+        assert!(
+            !body.contains("load double, ptr @__perry_ns_ns3_ts"),
+            "a plain member must not be turned into a namespace load:\n{body}"
+        );
+    }
+}
+
+/// #7883: the inline PIC's guard chain is a chain of BRANCHES, not one flat
+/// `and`, so a presence assertion on the individual predicates is no longer
+/// evidence of anything — hard-wiring any of the branches to `true` leaves
+/// every predicate in the IR as dead code and a "the mask is emitted" test
+/// stays green (round 5's first sabotage failed exactly this way).
+///
+/// This walks the CFG **backwards** from the block that performs the raw
+/// inline slot load to the PIC entry, and requires that
+///
+///   1. every edge on that path is the **true** edge of a `cond_br`
+///      (so swapping a branch's successors turns it red), and
+///   2. the transitive def chain of those branch conditions contains every
+///      guard the raw load depends on for safety (so replacing any condition
+///      with a constant, or deleting a predicate, turns it red).
+#[test]
+fn generic_property_get_slot_load_is_reached_only_through_every_guard() {
+    let ir = emit(false, None);
+
+    // Register names restart at %r1 in every function, so the walk MUST be
+    // scoped to one function or the def map silently resolves a condition to
+    // an identically-named register in a different body (this test read a
+    // string-handle `ptrtoint` as the receiver-tag test before it was fixed).
+    let func = ir
+        .split("\ndefine ")
+        .find(|f| f.contains("pic.hit.load"))
+        .unwrap_or_else(|| panic!("no function contains a PIC hit load:\n{ir}"))
+        .to_string();
+
+    let mut blocks: Vec<(String, Vec<String>)> = Vec::new();
+    let mut cur: Option<(String, Vec<String>)> = None;
+    for line in func.lines() {
+        let t = line.trim_end();
+        if let Some(lbl) = t.strip_suffix(':') {
+            if !lbl.is_empty() && !t.starts_with(' ') && !t.starts_with('\t') {
+                if let Some(b) = cur.take() {
+                    blocks.push(b);
+                }
+                cur = Some((lbl.to_string(), Vec::new()));
+                continue;
+            }
+        }
+        if let Some((_, body)) = cur.as_mut() {
+            body.push(t.to_string());
+        }
+    }
+    if let Some(b) = cur.take() {
+        blocks.push(b);
+    }
+    let load_label = blocks
+        .iter()
+        .find(|(l, _)| l.starts_with("pic.hit.load"))
+        .map(|(l, _)| l.clone())
+        .unwrap_or_else(|| panic!("no `pic.hit.load` block:\n{func}"));
+
+    let mut defs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (_, body) in &blocks {
+        for l in body {
+            if let Some((lhs, rhs)) = l.trim().split_once(" = ") {
+                if lhs.starts_with('%') {
+                    defs.insert(lhs.to_string(), rhs.to_string());
+                }
+            }
+        }
+    }
+
+    // Backwards walk to the entry block, collecting the condition of every
+    // `cond_br` whose TRUE edge we arrived on.
+    let mut conds: Vec<String> = Vec::new();
+    let mut at = load_label.clone();
+    let mut steps = 0;
+    loop {
+        steps += 1;
+        assert!(steps < 32, "runaway CFG walk at `{at}`:\n{func}");
+        let preds: Vec<&(String, Vec<String>)> = blocks
+            .iter()
+            .filter(|(_, body)| {
+                body.iter().any(|l| {
+                    l.trim_start().starts_with("br ") && l.contains(&format!("label %{at}"))
+                })
+            })
+            .collect();
+        if preds.is_empty() {
+            break; // reached the entry block
+        }
+        assert_eq!(
+            preds.len(),
+            1,
+            "the guard chain must be a chain — `{at}` has {} predecessors:\n{func}",
+            preds.len()
+        );
+        let (pred_label, pred_body) = preds[0];
+        let term = pred_body
+            .iter()
+            .rev()
+            .find(|l| l.trim_start().starts_with("br "))
+            .unwrap_or_else(|| panic!("`{pred_label}` has no terminator:\n{func}"));
+        let t = term.trim();
+        if let Some(rest) = t.strip_prefix("br i1 ") {
+            let parts: Vec<&str> = rest.split(", ").collect();
+            assert_eq!(parts.len(), 3, "malformed cond_br in `{pred_label}`: {t}");
+            let cond = parts[0].to_string();
+            let true_target = parts[1].trim_start_matches("label %").to_string();
+            assert_eq!(
+                true_target, at,
+                "`{pred_label}` must reach `{at}` on its TRUE edge — a swapped \
+                 cond_br would run the inline slot load when the guard FAILS:\n{t}"
+            );
+            assert!(
+                cond.starts_with('%'),
+                "`{pred_label}`'s branch condition is the constant `{cond}` — the \
+                 guard decides nothing:\n{func}"
+            );
+            conds.push(cond);
+        }
+        at = pred_label.clone();
+    }
+    assert!(
+        conds.len() >= 5,
+        "expected at least five guard branches between the PIC entry and the \
+         inline slot load, found {}: {conds:?}\n{func}",
+        conds.len()
+    );
+
+    // Transitive def closure of every collected condition.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut reached: Vec<String> = Vec::new();
+    let mut work = conds.clone();
+    while let Some(v) = work.pop() {
+        if !seen.insert(v.clone()) {
+            continue;
+        }
+        let Some(rhs) = defs.get(&v) else { continue };
+        reached.push(rhs.clone());
+        let chars: Vec<char> = rhs.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '%' {
+                let mut j = i + 1;
+                while j < chars.len()
+                    && (chars[j].is_alphanumeric() || chars[j] == '.' || chars[j] == '_')
+                {
+                    j += 1;
+                }
+                work.push(chars[i..j].iter().collect());
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    let chain = reached.join("\n");
+    for (needle, what) in [
+        ("32765", "the POINTER/STRING receiver-tag test"),
+        ("1048575", "the small-handle (native registry id) test"),
+        ("icmp eq i8", "the GcHeader obj_type == GC_TYPE_OBJECT test"),
+        ("1129268819", "the CLOSURE_MAGIC test"),
+        ("2048", "the OBJ_FLAG_HAS_DESCRIPTORS test"),
+        ("@PERRY_IC_EPOCH", "the read-PIC epoch gate"),
+        ("@perry_ic_", "the per-site cached shape-token compare"),
+    ] {
+        assert!(
+            chain.contains(needle),
+            "the inline slot load must be gated on {what}, but no branch \
+             condition on the path to `{load_label}` depends on it.\n\
+             conditions: {conds:?}\nreached def chain:\n{chain}\n\nIR:\n{func}"
+        );
+    }
 }

@@ -41,8 +41,33 @@ pub(crate) fn emit_write_barrier(ctx: &mut FnCtx<'_>, parent_bits: &str, child_b
         false,
         Vec::new(),
     );
+    // Same gate #7511 put on the class-field slot store, applied to the
+    // opaque-store wrapper. `write_barrier_slot_inner`'s FIRST action is
+    // `barrier_child_prologue(child)?` — a non-pointer child returns before it
+    // touches the incremental-mark latch, the parent decode or the remembered
+    // set — so for every numeric store this call does nothing but cost a call.
+    //
+    // An array element store pays it unconditionally today: `this.vals[i] = v`
+    // in `gc-handoff/apps/pipeline.ts`'s `Registry` emits
+    // `js_typed_feedback_array_set_f64_extend` immediately followed by a bare
+    // `js_write_barrier`, on a `number[]`.
+    //
+    // `emit_may_carry_heap_pointer_check` is a deliberate SUPERSET of the
+    // runtime predicate (its doc records why the direction is load-bearing,
+    // and `gc::tests::inline_pointer_bearing_contract` enumerates the whole
+    // 16-bit tag space against it), so this can only skip calls that would
+    // have returned immediately.
+    let maybe_idx = ctx.new_block("wb.maybe");
+    let done_idx = ctx.new_block("wb.done");
+    let maybe_l = ctx.block_label(maybe_idx);
+    let done_l = ctx.block_label(done_idx);
+    let may_carry = emit_may_carry_heap_pointer_check(ctx.block(), child_bits);
+    ctx.block().cond_br(&may_carry, &maybe_l, &done_l);
+    ctx.current_block = maybe_idx;
     ctx.block()
         .call_void("js_write_barrier", &[(I64, parent_bits), (I64, child_bits)]);
+    ctx.block().br(&done_l);
+    ctx.current_block = done_idx;
 }
 
 pub(crate) fn emit_write_barrier_slot_on_block(
@@ -497,6 +522,33 @@ pub(crate) fn emit_may_carry_heap_pointer_check(blk: &mut LlBlock, value_bits: &
 /// Callers that already proved the value statically pass all three flags
 /// `false`; then no test and no blocks are emitted at all, and lever D's
 /// existing elision is unchanged.
+///
+/// ## The parent's half of the same question (#7871)
+///
+/// The value test answers "does this store publish a heap pointer at all". It
+/// does not answer "does anyone need to know" — and for the shape this emitter
+/// exists to serve, the answer is almost always no. HIR rewrites every
+/// closed-shape object literal into a `new` of a synthesized anon-shape class
+/// (`lower/context.rs::mint_anon_shape_class`), so `{ kind: "num", num: n }`
+/// reaches the shared `<class>_constructor` and writes its fields into an
+/// instance allocated a few instructions earlier **in the nursery**. A nursery
+/// parent is fully retraced by every minor GC, so the edge it publishes is
+/// rediscovered and the remembered-set record is pure cost.
+///
+/// The pointer-bearing arm is therefore itself gated on
+/// [`emit_parent_may_need_remembering_check`] — the identical predicate
+/// `expr/array_push.rs` has carried since #7511, resting on the identical
+/// argument. `Old ⟹ TENURED`, so `!TENURED` can only skip a subset of what the
+/// runtime already skips; and the predicate's second disjunct is the
+/// incremental-cycle count, because skipping the call also skips
+/// `barrier_child_prologue`'s SATB shading, which is not a generational
+/// question.
+///
+/// It is a LIVE header test, never a static claim (#7501's shape): a parent
+/// promoted between its allocation and this store reads `TENURED` here and
+/// takes the barrier. The failure direction is the safe one — a receiver whose
+/// generation the compiler cannot see is exactly a receiver whose header it
+/// reads.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_jsvalue_slot_store_pointer_tested(
     ctx: &mut FnCtx<'_>,
@@ -582,12 +634,31 @@ pub(crate) fn emit_jsvalue_slot_store_pointer_tested(
         let blk = ctx.block();
         emit_layout_note_slot_on_block(blk, layout_parent_bits, slot_index, &value_bits);
     }
-    {
-        let blk = ctx.block();
-        if write_barrier_emitted {
-            emit_write_barrier_slot_on_block(blk, barrier_parent_bits, slot_addr, &value_bits);
+    if write_barrier_emitted {
+        // #7871: the parent's half. `layout_parent_bits` is the receiver's
+        // validated, non-forwarded GC USER POINTER — the conforming check above
+        // dereferences it at `-6`, and `emit_layout_note_slot_on_block` decodes
+        // it the same way — so it is exactly what
+        // `emit_parent_may_need_remembering_check` documents as its input.
+        //
+        // The barrier keeps its own block so an IR census can see whether the
+        // gate was reached at all: a `cond_br` INTO `class_field_set.barrier` is
+        // the difference between "guarded" and "silently deleted".
+        let barrier_idx = ctx.new_block("class_field_set.barrier");
+        let barrier_label = ctx.block_label(barrier_idx);
+        {
+            let blk = ctx.block();
+            let needed = emit_parent_may_need_remembering_check(blk, layout_parent_bits);
+            blk.cond_br(&needed, &barrier_label, &done_label);
         }
-        blk.br(&done_label);
+        ctx.current_block = barrier_idx;
+        {
+            let blk = ctx.block();
+            emit_write_barrier_slot_on_block(blk, barrier_parent_bits, slot_addr, &value_bits);
+            blk.br(&done_label);
+        }
+    } else {
+        ctx.block().br(&done_label);
     }
     ctx.current_block = done_idx;
     Some(value_bits)

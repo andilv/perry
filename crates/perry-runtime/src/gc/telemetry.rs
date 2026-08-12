@@ -3,6 +3,14 @@ use super::*;
 /// Number of most-recent pause samples retained per thread (#6187).
 pub const GC_RECENT_PAUSE_WINDOW: usize = 32;
 
+/// Is `PERRY_GC_DIAG` set? Read once and cached, so a diagnostic call site can
+/// sit on a path that runs before/around `main` without paying a `getenv` each
+/// time. Diagnostic-only: nothing may branch on this for behaviour.
+pub fn gc_diag_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PERRY_GC_DIAG").is_some())
+}
+
 pub struct GcStats {
     pub collection_count: u64,
     pub total_freed_bytes: u64,
@@ -436,9 +444,24 @@ thread_local! {
         const { Cell::new(LayoutScanTraceStats::zero()) };
 }
 
+/// Has ANY thread ever armed the layout-scan trace?
+///
+/// `layout_scan_trace_active()` is read once per traced object
+/// (`heap_payload_slot_selection`) and once per pointer slot
+/// (`record_layout_child_slot_read`), and on Darwin a `thread_local!` read is
+/// an out-of-line `_tlv_get_addr` call — so a facility that is OFF for the
+/// entire process still cost two calls per promoted object. This is the #7834
+/// `PERRY_PER_OBJECT_LAYOUTS_ANY` pattern: a monotone process-global that
+/// proves the thread-local is `false` without resolving it. It is never
+/// cleared, which is sound because it only ever short-circuits to the
+/// thread-local answer.
+static LAYOUT_SCAN_TRACE_ARMED_ANY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[inline]
 pub(super) fn begin_layout_scan_trace() {
     LAYOUT_SCAN_TRACE_STATS.with(|stats| stats.set(LayoutScanTraceStats::zero()));
+    LAYOUT_SCAN_TRACE_ARMED_ANY.store(true, std::sync::atomic::Ordering::Release);
     LAYOUT_SCAN_TRACE_ACTIVE.with(|active| active.set(true));
 }
 
@@ -459,6 +482,11 @@ pub(super) fn finish_layout_scan_trace() -> LayoutScanTraceStats {
 
 #[inline]
 pub(super) fn layout_scan_trace_active() -> bool {
+    // Store-before-arm (`Release` in `begin_layout_scan_trace`) makes a `false`
+    // read a proof that this thread's `LAYOUT_SCAN_TRACE_ACTIVE` is false too.
+    if !LAYOUT_SCAN_TRACE_ARMED_ANY.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
     LAYOUT_SCAN_TRACE_ACTIVE.with(Cell::get)
 }
 
@@ -954,6 +982,7 @@ impl GcCycleTrace {
             "live_bytes": self.old_pages.live_bytes,
             "dead_bytes": self.old_pages.dead_bytes,
             "reusable_bytes": self.old_pages.reusable_bytes,
+            "pooled_bytes": self.old_pages.pooled_bytes,
             "returned_bytes": self.old_pages.returned_bytes,
             "pinned_bytes": self.old_pages.pinned_bytes,
             "object_count": self.old_pages.object_count,
@@ -1082,6 +1111,12 @@ impl GcCycleTrace {
             "reusable_bytes": self.sweep.reusable_bytes,
             "returned_bytes": self.sweep.returned_bytes,
             "reset_blocks": self.sweep.reset_blocks,
+            "removed_blocks": self.sweep.removed_blocks,
+            "removed_bytes": self.sweep.removed_bytes,
+            "pooled_blocks": self.sweep.pooled_blocks,
+            "pooled_bytes": self.sweep.pooled_bytes,
+            "pool_drained_blocks": self.sweep.pool_drained_blocks,
+            "pool_drained_bytes": self.sweep.pool_drained_bytes,
             "deallocated_blocks": self.sweep.deallocated_blocks,
             "deallocated_bytes": self.sweep.deallocated_bytes,
             "retained_forwarded_stub_objects": self.sweep.retained_forwarded_stub_objects,
@@ -1154,6 +1189,17 @@ impl GcCycleTrace {
             "baseline_bytes": pacing_baseline,
             "backoff_shift": pacing_shift,
             "escalate_at_or_above_bytes": pacing_threshold,
+            // Which arm paced this cycle. Without it a run that never armed the
+            // survival-adaptive band is indistinguishable from one that did and
+            // simply had nothing to skip.
+            "retaining": super::policy::major_pacing_retaining(),
+            // #7865: the reading actually compared against
+            // `escalate_at_or_above_bytes`. Emitted because the two used to be
+            // different KINDS of quantity — a post-full live baseline against a
+            // pre-collection allocated reading — and nothing in the trace said
+            // so. A gate that cannot see the left-hand side cannot prove which
+            // way the comparison went.
+            "escalation_reading_bytes": super::policy::pacing_escalation_reading_bytes(),
         });
         serde_json::json!({
             "event": "gc_cycle",
@@ -1486,6 +1532,7 @@ pub(super) fn arena_snapshot_json(
         "longlived": arena_region_json(snapshot.longlived),
         "old": arena_region_json(snapshot.old),
         "total_in_use_bytes": snapshot.total_in_use_bytes,
+        "total_live_allocated_bytes": snapshot.total_live_allocated_bytes,
         "total_reserved_bytes": snapshot.total_reserved_bytes,
         "total_block_count": snapshot.total_block_count,
     })

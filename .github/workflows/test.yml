@@ -234,6 +234,16 @@ jobs:
           python3 scripts/gc_runtime_root_holders.py --self-test
           python3 scripts/gc_runtime_root_holders.py
 
+      # #7877. A deleted GC knob left executable CI arms that still looked
+      # distinct but selected the same collector. Derive the accepted names
+      # from live runtime/codegen parsers; historical journals are path-exact
+      # exemptions and cannot license a current script or reference page.
+      - name: GC environment-knob drift audit
+        if: ${{ !cancelled() }}
+        run: |
+          python3 scripts/check_gc_env_knobs.py --self-test
+          python3 scripts/check_gc_env_knobs.py
+
       # #7341 layer 3. A RuntimeHandleScope gives an object liveness; it does
       # nothing for a raw pointer already read out of the slot. Every rooting bug
       # in the quarantine sweep had rooting ALREADY -- what was missing was
@@ -246,6 +256,25 @@ jobs:
         run: |
           python3 scripts/raw_handle_debt.py --self-test
           python3 scripts/raw_handle_debt.py
+
+      # #7659: the step above compares the count against a baseline the SAME
+      # DIFF is free to move -- add bare reads, raise the recorded number to
+      # match, and it passes. `--update` refuses to raise, but nothing made CI
+      # run `--update`. This compares the recorded files against the pull
+      # request's merge base, so the number can only fall across a PR boundary.
+      #
+      # Gated on the event rather than on an empty variable: a `push` build has
+      # no merge base, but a `pull_request` build with an unresolvable one is a
+      # comparison that did not happen, and the script fails on that rather
+      # than passing (see `git_show`).
+      - name: Raw-handle debt ratchet vs. merge base
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null \
+            || git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          python3 scripts/raw_handle_debt.py --no-raise-vs "$BASE_SHA"
 
       # The gap-suite ratchet decides whether conformance-smoke goes red, so
       # its own logic is unit-checked on the cheap job rather than only being
@@ -1046,6 +1075,17 @@ jobs:
           # (zizmor "artipacked", flagged by review on #6610).
           persist-credentials: false
 
+      - name: GC structural audits (Windows)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/gc_runtime_root_holders.py --self-test
+          python scripts/gc_runtime_root_holders.py
+          python scripts/check_thread_locals.py --self-test
+          python scripts/check_thread_locals.py
+          python -m unittest discover -s tests -p 'test_gc_ratchet.py' -v
+          python benchmarks/gc_ratchet/gc_ratchet.py validate --scope structural
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - uses: ./.github/actions/setup-llvm22
@@ -1244,16 +1284,20 @@ jobs:
 
       # GATING, and deliberately so. CLAUDE.md's GC knob kill-policy requires
       # every GC knob to have an arm that exercises it; the #7154 instruments
-      # (PERRY_GC_PROTECT_FROMSPACE, PERRY_GC_ZEAL) would otherwise be dark
-      # knobs on the subsystem with this repo's worst history of configuration
-      # rot. This asserts BOTH defaults — inert with the knobs unset, live with
-      # them set — and refuses to pass unless the zeal arm forced strictly more
-      # collections than the pressure-only arm, so it cannot go green having
-      # run zero copying minors (the #6942 / #7024 / #7025 failure mode).
+      # (PERRY_GC_PROTECT_FROMSPACE, PERRY_GC_SCHEDULE_SEED)
+      # would otherwise be dark knobs on the subsystem with this repo's worst
+      # history of configuration rot. This asserts BOTH defaults — inert with
+      # the knobs unset, live with them set — and refuses to pass unless the
+      # stress arms (the rate-1 seeded schedule, and the #7254 RATE=1 +
+      # VERIFY_EVACUATION pairing)
+      # forced strictly more collections than the pressure-only arm, so it
+      # cannot go green having run zero copying minors (the #6942 / #7024 /
+      # #7025 failure mode).
       # The detection property itself is a required-gate unit test:
       # gc/tests/fromspace_protect.rs::quarantine_catches_a_planted_stale_from_space_deref.
       # Arms 1-3/5 use a fixture sized for ~1200 back-edge polls (not #7154's
-      # 240k), pinned to every-poll zeal. Arm 6 (#7728) is the budgeted one:
+      # 240k), pinned to every-poll candidacy
+      # (PERRY_GC_SCHEDULE_ALLOC_KB=0). Arm 6 (#7728) is the budgeted one:
       # a realistic poll count at the SHIPPED default, which is the axis that
       # a ~1200-poll fixture structurally cannot see.
       - name: GC rooting-bug instruments (inert-when-off, live-when-on)
@@ -2256,10 +2300,10 @@ jobs:
       # of allocate-and-discard (would catch a future block-pinning /
       # cache-leak / tenuring-trap regression in the gen-GC work), and
       # (2) crashes when gc() is forced aggressively during JSON parse,
-      # deep recursion, or closure init. Each test runs under default,
-      # PERRY_GEN_GC=1, and PERRY_GEN_GC=1 PERRY_WRITE_BARRIERS=1 so a
-      # regression in any GC mode is caught. Linux-only because /usr/bin/time
-      # availability + RSS reporting differs on Windows runners.
+      # deep recursion, or closure init. Each test runs under the default,
+      # full mark-sweep, explicit generational, and forced-evacuation verifier
+      # configurations. Linux/macOS only because /usr/bin/time availability +
+      # RSS reporting differs on Windows runners.
       - name: Memory stability tests
         if: runner.os == 'Linux' || runner.os == 'macOS'
         env:

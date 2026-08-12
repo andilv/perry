@@ -290,6 +290,29 @@ pub(crate) fn lower_let(
         ty.clone()
     };
 
+    // #7773/#7506: a numeric local inherits a DECLARED-ONLY proof from its
+    // initializer. `const v = o.x` reaches this as `Any` refined to `Number`,
+    // while TypeScript's inferred `const sum = o.x + o.y` already reaches the
+    // HIR as `Number`; neither form proves what the runtime slots contain.
+    // Record both as violable so a later arithmetic consumer re-checks the
+    // local instead of laundering a possibly boxed value through its type.
+    if matches!(
+        refined_ty,
+        perry_hir::types::Type::Number | perry_hir::types::Type::Int32
+    ) {
+        if init.is_some_and(|e| crate::type_analysis::numeric_proof_is_declared_only(ctx, e)) {
+            ctx.declared_only_numeric_locals.insert(id);
+        }
+    }
+
+    // (#7854 also recorded the array/string half of this — a local whose
+    // `Array`/`String` type came only from the RECEIVER'S ANNOTATION — in
+    // `declared_only_array_locals`, so the `.length` fast arm could refuse it.
+    // #7862 gave that arm a property-semantic fallback, which is what the
+    // refusal existed to avoid, so both the set and its one consumer are gone;
+    // see the `.length` arm in `expr/property_get.rs`. The NUMERIC half above
+    // stays: its consumer is an arithmetic op with no guarded fallback.)
+
     // Track closure func_id → local_id mapping so the closure
     // call site in lower_call can look up rest param info.
     if let Some(perry_hir::Expr::Closure {

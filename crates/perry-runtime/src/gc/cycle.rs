@@ -872,6 +872,7 @@ struct AtomicFinalizeCycleState {
     subphase: AtomicFinalizeSubphase,
     barrier_drain: Option<TraceWorklistCycleState>,
     remembered_rebuild: Option<OldToYoungRememberedRebuildState>,
+    weak_processing: Option<crate::weakref::FullWeakProcessingState>,
     /// Budgeted cycles insert FinalRootRemark after BarrierSeedDrain;
     /// synchronous cycles have no mutator windows and skip it.
     remark: bool,
@@ -890,6 +891,7 @@ impl AtomicFinalizeCycleState {
             subphase: AtomicFinalizeSubphase::BarrierSeedDrain,
             barrier_drain: None,
             remembered_rebuild: None,
+            weak_processing: None,
             remark,
         }
     }
@@ -1033,6 +1035,20 @@ impl GcCycleState {
 
     pub(super) fn phase(&self) -> GcCyclePhase {
         self.phase
+    }
+
+    #[cfg(test)]
+    pub(super) fn atomic_finalize_subphase_for_tests(&self) -> Option<&'static str> {
+        let subphase = self.atomic_finalize.as_ref()?.subphase;
+        Some(match subphase {
+            AtomicFinalizeSubphase::WeakProcessing => "weak_processing",
+            AtomicFinalizeSubphase::MinorPrelude => "minor_prelude",
+            AtomicFinalizeSubphase::BarrierSeedDrain => "barrier_seed_drain",
+            AtomicFinalizeSubphase::FinalRootRemark => "final_root_remark",
+            AtomicFinalizeSubphase::RememberedSetRebuild => "remembered_set_rebuild",
+            AtomicFinalizeSubphase::DisableBarrier => "disable_barrier",
+            AtomicFinalizeSubphase::Done => "done",
+        })
     }
 
     pub(super) fn collection_kind(&self) -> GcCollectionKind {
@@ -1305,15 +1321,16 @@ impl GcCycleState {
                 .as_ref()
                 .expect("atomic finalize state exists")
                 .subphase;
-            // SLICED subphases (seed drain, full-cycle RS rebuild) honor the
-            // caller's budget and may return to the mutator; the ATOMIC TAIL
-            // (remark → weak → barrier-off → Sweep) runs to the phase
-            // transition in this single pause so no mutator window can
-            // invalidate the near-final mark set.
+            // SLICED subphases honor the caller's budget and may return to the
+            // mutator. WeakProcessing is safe to slice while the barrier and
+            // allocate-black births stay active: a target the mutator can
+            // still name was marked at remark or was born black, and holders
+            // born after the registry snapshot wait for the next cycle.
             let sliced = matches!(
                 subphase,
                 AtomicFinalizeSubphase::BarrierSeedDrain
                     | AtomicFinalizeSubphase::RememberedSetRebuild
+                    | AtomicFinalizeSubphase::WeakProcessing
             );
             let sub_budget = if sliced {
                 budget.work_units
@@ -1399,18 +1416,30 @@ impl GcCycleState {
                 // record is guaranteed by the record's pending-flag reset;
                 // delivery happens at the explicit-`gc()` tail or the next
                 // microtask-pump drain (`drain_pending_finalization_jobs`).
-                crate::weakref::process_weak_targets_after_mark(
-                    valid_ptrs, minor_only, /* enqueue_callbacks = */ true,
-                );
-                let next = if minor_only {
-                    AtomicFinalizeSubphase::MinorPrelude
-                } else {
-                    AtomicFinalizeSubphase::DisableBarrier
+                let done = {
+                    let state = self
+                        .atomic_finalize
+                        .as_mut()
+                        .expect("atomic finalize state exists");
+                    let weak = state
+                        .weak_processing
+                        .get_or_insert_with(crate::weakref::FullWeakProcessingState::new);
+                    weak.step(
+                        valid_ptrs, minor_only, /* enqueue_callbacks = */ true, budget,
+                    )
                 };
-                self.atomic_finalize
-                    .as_mut()
-                    .expect("atomic finalize state exists")
-                    .subphase = next;
+                if done {
+                    let state = self
+                        .atomic_finalize
+                        .as_mut()
+                        .expect("atomic finalize state exists");
+                    state.weak_processing = None;
+                    state.subphase = if minor_only {
+                        AtomicFinalizeSubphase::MinorPrelude
+                    } else {
+                        AtomicFinalizeSubphase::DisableBarrier
+                    };
+                }
             }
             AtomicFinalizeSubphase::MinorPrelude => {
                 if budget == 0 {
@@ -1840,6 +1869,26 @@ impl GcCycleState {
                 }
                 ReclaimSubphase::MallocTrim => {
                     let reclaim_start = trace_phase_start(&self.trace);
+                    // #7875: a critical-pressure / allocation-failure request
+                    // drains only after a FULL sweep has released all idle
+                    // arena blocks, and before allocator pressure relief so
+                    // the newly-deallocated mappings participate in the trim.
+                    if self.minor.is_none() {
+                        let drained: crate::arena::BlockPoolDrainStats =
+                            crate::arena::drain_block_pool_if_requested();
+                        if let Some(trace) = self.trace.as_mut() {
+                            trace.sweep.pool_drained_blocks = drained.blocks;
+                            trace.sweep.pool_drained_bytes = drained.bytes;
+                            trace.sweep.returned_bytes =
+                                trace.sweep.returned_bytes.saturating_add(drained.bytes);
+                            trace.sweep.deallocated_blocks = trace
+                                .sweep
+                                .deallocated_blocks
+                                .saturating_add(drained.blocks);
+                            trace.sweep.deallocated_bytes =
+                                trace.sweep.deallocated_bytes.saturating_add(drained.bytes);
+                        }
+                    }
                     let trim = run_malloc_trim(self.progress_kind);
                     if let Some(trace) = self.trace.as_mut() {
                         if trim.status == AllocatorMaintenanceStatus::Executed {
@@ -1895,6 +1944,15 @@ impl GcCycleState {
             trace.pause_us = elapsed_us;
             trace.capture_layout_scans();
         }
+        let arena_live_bytes = self
+            .sweep
+            .map(|sweep| sweep.arena_live_bytes as usize)
+            .unwrap_or_else(crate::arena::arena_live_allocated_bytes);
+        crate::arena::record_arena_live_census(arena_live_bytes);
+        // #7865: arena-growth pacing tests a POST-collection occupancy, which
+        // is the same kind of quantity as its post-full baseline. Recorded here
+        // rather than per-kind because this is the one site both kinds reach.
+        super::policy::note_collection_finished_arena_occupancy();
         if self.minor.is_none() {
             finish_full_old_reclaim_baseline();
         }

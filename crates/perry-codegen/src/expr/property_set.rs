@@ -54,7 +54,7 @@ fn canonicalize_raw_f64_numeric_store_value(
     )
 }
 
-fn class_has_computed_runtime_members(ctx: &FnCtx<'_>, class_name: &str) -> bool {
+pub(crate) fn class_has_computed_runtime_members(ctx: &FnCtx<'_>, class_name: &str) -> bool {
     ctx.classes
         .get(class_name)
         .is_some_and(|class| !class.computed_members.is_empty())
@@ -280,6 +280,13 @@ pub(crate) fn try_lower_sloppy_class_field_store(
 
     // Emits the shape/flags/value precheck and branches to `fast_label` on a
     // hit; leaves `ctx.current_block` on the freshly created miss block.
+    let subclass_arms = crate::expr::class_field_inline_guard::class_field_subclass_arms(
+        ctx,
+        &class_name,
+        property,
+        field_index,
+        true,
+    );
     let _miss_label = crate::expr::class_field_inline_guard::emit_class_field_inline_precheck(
         ctx,
         &obj_bits,
@@ -290,6 +297,7 @@ pub(crate) fn try_lower_sloppy_class_field_store(
         true,
         Some(&val_bits),
         &fast_label,
+        &subclass_arms,
     );
 
     // Miss: the strict-aware runtime with `strict = 0`, so a rejected write
@@ -408,6 +416,13 @@ fn try_lower_sloppy_class_field_boxed_store(
 
     // `set_value_bits` is `Some` so the not-frozen check is emitted;
     // `require_raw_f64` is false, so the plain-finite value check is not.
+    let subclass_arms = crate::expr::class_field_inline_guard::class_field_subclass_arms(
+        ctx,
+        class_name,
+        property,
+        field_index,
+        false,
+    );
     let _miss_label = crate::expr::class_field_inline_guard::emit_class_field_inline_precheck(
         ctx,
         &obj_bits,
@@ -418,6 +433,7 @@ fn try_lower_sloppy_class_field_boxed_store(
         false,
         Some(&val_bits),
         &fast_label,
+        &subclass_arms,
     );
 
     {
@@ -1253,26 +1269,70 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         let fallback_label = ctx.block_label(fallback_idx);
                         let merge_label = ctx.block_label(merge_idx);
 
-                        // #5093: inline shape pre-check, raw-f64 fields only. The
-                        // boxed-store path keeps the guard call (its setter-in-
+                        // #5093: inline shape pre-check. On a hit this branches
+                        // straight to the store, skipping the call; on a miss the
+                        // guard-call path below runs unchanged.
+                        //
+                        // #7854: this used to be gated on `requires_raw_f64`,
+                        // leaving every BOXED declared field (`string`, a class
+                        // type, a union — i.e. most fields of most objects) paying
+                        // an unconditional cross-crate
+                        // `js_typed_feedback_class_field_set_guard` call per
+                        // store, including the synthesized
+                        // `__AnonShape_*_constructor` that every closed-shape
+                        // object literal runs. The stated reason — "its setter-in-
                         // chain handling and write barrier aren't reproduced
-                        // inline). On a hit this branches straight to the raw
-                        // store, skipping the call; on a miss the guard-call path
-                        // below runs unchanged.
-                        if requires_raw_f64 {
-                            let _guardcall_label =
-                                crate::expr::class_field_inline_guard::emit_class_field_inline_precheck(
-                                    ctx,
-                                    &obj_bits,
-                                    &obj_handle,
-                                    &expected_class_id_str,
-                                    &expected_keys,
-                                    field_index,
-                                    true,
-                                    Some(&val_bits),
-                                    &fast_label,
-                                );
-                        }
+                        // inline" — is answered by
+                        // `try_lower_sloppy_class_field_boxed_store`, which has
+                        // taken the boxed inline precheck since #7288: the write
+                        // barrier, layout note and string demote come from
+                        // `emit_jsvalue_slot_store_pointer_tested` (which the
+                        // shared `fast_label` block below calls, with the very
+                        // same value-side predicates), NOT from the guard; and a
+                        // setter in the chain is already refused upstream by
+                        // `class_field_global_index`'s `accessor_in_chain`.
+                        //
+                        // What the precheck proves is a strict subset of the
+                        // runtime `class_field_fast_contract`: on a hit the guard
+                        // call would have answered "fast" too, so this only
+                        // removes a call, never changes which store happens. Every
+                        // miss still lands on the guardcall block and the
+                        // unchanged strict fallback, so `[[Set]]` rejection and
+                        // descriptor dispatch are untouched. `require_raw_f64` is
+                        // forwarded rather than hardcoded, so a boxed slot skips
+                        // the plain-finite value test (a boxed slot accepts any
+                        // `JSValue`) but still proves not-frozen / no per-object
+                        // descriptors via `set_value_bits: Some`.
+                        //
+                        // #7861: and the shape test it emits is widened from the
+                        // DECLARED class to that class's subclass closure. Without
+                        // this the boxed arm #7854 just un-gated would still miss
+                        // 100% of the time for a store in a base class's own
+                        // constructor, where `this` is only ever a subclass. The
+                        // arms are computed with `requires_raw_f64` rather than a
+                        // literal, so a candidate whose declared type disagrees
+                        // about the slot's representation is dropped.
+                        let subclass_arms =
+                            crate::expr::class_field_inline_guard::class_field_subclass_arms(
+                                ctx,
+                                &class_name,
+                                property,
+                                field_index,
+                                requires_raw_f64,
+                            );
+                        let _guardcall_label =
+                            crate::expr::class_field_inline_guard::emit_class_field_inline_precheck(
+                                ctx,
+                                &obj_bits,
+                                &obj_handle,
+                                &expected_class_id_str,
+                                &expected_keys,
+                                field_index,
+                                requires_raw_f64,
+                                Some(&val_bits),
+                                &fast_label,
+                                &subclass_arms,
+                            );
                         let guard_ok = ctx.block().call(
                             I32,
                             "js_typed_feedback_class_field_set_guard",

@@ -63,8 +63,9 @@ pub(crate) use buffer_access::{
     lower_typed_array_store, BufferAccessSpec,
 };
 pub(crate) use buffer_views::{
-    alias_buffer_view_slot, attach_native_owned_view_fact, buffer_access_materialization_reason,
-    buffer_view_lowered_value, downgrade_buffer_alias, downgrade_buffer_aliases_in_expr,
+    alias_buffer_view_slot, attach_buffer_view_facts, attach_buffer_view_pointer_state_for_expr,
+    buffer_access_materialization_reason, buffer_view_lowered_value, downgrade_buffer_alias,
+    downgrade_buffer_aliases_in_expr, invalidate_buffer_view_pointer,
     invalidate_native_owned_views_for_dispose, native_arena_canonical_owner_id,
     record_native_arena_owner_assignment, update_buffer_view_for_assignment,
 };
@@ -123,6 +124,7 @@ pub(crate) use write_barrier::{
     emit_array_numeric_write_note_on_block, emit_jsvalue_slot_store_on_block,
     emit_jsvalue_slot_store_pointer_tested, emit_jsvalue_slot_store_scalar_aware_on_block,
     emit_jsvalue_slot_store_with_flags_on_block, emit_jsvalue_slot_store_with_value_bits_on_block,
+    emit_layout_note_slot_on_block, emit_may_carry_heap_pointer_check,
     emit_root_heap_word_store_on_block, emit_root_nanbox_store_on_block, emit_write_barrier,
     emit_write_barrier_slot_generation_tested, emit_write_barrier_slot_on_block,
     lower_array_super_init, lower_event_emitter_subclass_init, lower_node_stream_super_init,
@@ -133,6 +135,10 @@ pub(crate) use write_barrier::{
 // bulky `record_lowered_value*` method family, the shadow-slot free helpers,
 // and the `lower_expr` dispatch table moved into siblings to keep this file
 // under 2000 lines. Inherent methods (`record_value`) need no re-export.
+#[cfg(test)]
+mod array_push_guard_tests;
+#[cfg(test)]
+mod class_field_barrier_tests;
 mod dispatch;
 mod record_value;
 mod repsel_gates;
@@ -545,6 +551,10 @@ pub(crate) struct FnCtx<'a> {
     /// by namespace member access lowering to disambiguate when the same
     /// export name appears in multiple `import * as X / Y` sources.
     pub namespace_member_prefixes: &'a std::collections::HashMap<(String, String), String>,
+    /// #7189: `(namespace local, member)` pairs whose member is another
+    /// module's namespace object rather than a binding. See the doc on
+    /// `CompileOptions::namespace_member_nested`.
+    pub namespace_member_nested: &'a std::collections::HashSet<(String, String)>,
     /// Issue #5924: per-namespace origin-name resolution. Keyed by
     /// `(namespace_local_name, member_name)` → `origin_name`. Consulted
     /// before `import_function_origin_names` when computing the symbol
@@ -739,6 +749,24 @@ pub(crate) struct FnCtx<'a> {
     /// [`crate::rooting::TempRootPool`]. Starts empty; grows on the first
     /// protected temporary this function lowers.
     pub temp_roots: crate::rooting::TempRootPool,
+
+    /// #7773/#7506: LocalIds whose `Number`/`Int32` value came from an
+    /// initializer whose numeric answer is only a declared type — `const v =
+    /// o.x` on an `x: number` field, or `const sum = o.x + o.y`. This includes
+    /// both `Any` locals refined by codegen and locals the HIR already typed as
+    /// numeric.
+    ///
+    /// The `Any` refinement remains load-bearing (without it every ordinary
+    /// field read loses the numeric fast path), but both it and an HIR numeric
+    /// type can copy a declared field type rather than prove a runtime value.
+    /// The local then reads as `is_numeric_expr`, which licenses a bare `fadd`
+    /// / `fmul` on whatever the slot holds — and arithmetic on a NaN-boxed
+    /// value PRESERVES ITS PAYLOAD, so a string laundered in through `as any`
+    /// came back out of a multiply still tagged as a string.
+    ///
+    /// Consumed by `type_analysis::numeric_proof_is_declared_only`, which turns
+    /// the trust into a four-instruction runtime tag test instead.
+    pub declared_only_numeric_locals: std::collections::HashSet<u32>,
 
     /// Cached pointer to this function's `InlineArenaState` slot —
     /// allocated lazily on the first `new ClassName()` site that uses
@@ -1926,6 +1954,7 @@ pub(crate) use masked_window::masked_window_fact_for_index;
 #[cfg(test)]
 mod computed_store_rooting_tests;
 mod index_set;
+mod index_set_guarded;
 mod index_set_typed_array;
 mod instance_misc1;
 mod member_update;
@@ -1941,7 +1970,7 @@ mod new_dynamic;
 mod objects_arrays_lit;
 mod os_uri_dates;
 pub(crate) mod property_get;
-mod property_set;
+pub(crate) mod property_set;
 pub(crate) mod proxy_reflect;
 mod static_field_meta;
 mod static_method;
@@ -2386,6 +2415,26 @@ fn lower_numeric_binary_value(
         return Ok(None);
     }
     if !is_numeric_expr(ctx, left) || !is_numeric_expr(ctx, right) {
+        return Ok(None);
+    }
+
+    // #7773: `is_numeric_expr` answering `true` is not always a PROOF — for a
+    // class-field read, an array element, or a local refined from one, it is
+    // just the declared type repeated back, and nothing enforces declared types
+    // at runtime. This tier emits a bare `fadd`/`fmul` with no residual coerce
+    // at all, and arithmetic on a NaN-BOXED value propagates the payload
+    // instead of producing NaN — so a string laundered into a `x: number` slot
+    // came back out of `v * 2` still a string (`typeof` said `"string"`).
+    //
+    // Hand those to `binary::lower`, which has both remedies: the runtime tag
+    // test that keeps `+` on the spec's string-concat dispatch, and the
+    // residual `js_number_coerce` that gives every other operator its
+    // `ToNumber`. Same hand-off shape as the two Mod cases below, and for the
+    // same reason — it must run before operand lowering so an `Ok(None)` emits
+    // no dead loads or duplicate records.
+    if crate::type_analysis::numeric_proof_is_declared_only(ctx, left)
+        || crate::type_analysis::numeric_proof_is_declared_only(ctx, right)
+    {
         return Ok(None);
     }
 

@@ -27,6 +27,8 @@ pub(crate) const INLINE_SLOT_FLOOR: usize = 4;
 // 11.2k-line object.rs. Public re-exports keep FFI symbols stable.
 mod alloc;
 mod arguments;
+#[cfg(test)]
+mod arguments_latch_tests;
 mod array_object_ops;
 mod assert;
 mod async_generator_queue;
@@ -566,6 +568,15 @@ crate::perry_thread_local! {
     /// `name`). Mirrors the closure deleted-key side table for ClassRef values,
     /// which are tagged integers rather than ObjectHeader/ClosureHeader values.
     pub(crate) static CLASS_DELETED_KEYS: std::cell::RefCell<std::collections::HashMap<u32, std::collections::HashSet<String>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+
+    /// #7190: `(writable, enumerable)` for static own keys installed by
+    /// `Object.defineProperty(C, k, desc)`. They live in `CLASS_DYNAMIC_PROPS`
+    /// next to `static x = …` fields, which are writable AND enumerable by
+    /// CreateDataPropertyOrThrow — a data descriptor defaults to neither. An
+    /// ABSENT entry therefore means "declared static field", and keeps the
+    /// previous `(true, true)` reporting untouched.
+    pub(crate) static CLASS_STATIC_DEFINED_ATTRS: std::cell::RefCell<std::collections::HashMap<u32, std::collections::HashMap<String, (bool, bool, bool)>>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 

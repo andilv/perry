@@ -32,9 +32,11 @@ pub(crate) use allocators::{
     inactive_survivor_index, with_survivor_arena, with_survivor_arena_mut,
 };
 pub(crate) use block::{
-    arena_cell_alloc, block_pool_put, old_gen_in_use_bytes_sub, Arena, ArenaBlock, ACTIVE_SURVIVOR,
-    ARENA, ARENA_TOTAL_BYTES, BLOCK_SIZE, FRESH_GENERAL_BLOCK_MIN_USED_BYTES, INLINE_STATE,
-    LONGLIVED_ARENA, OLD_ARENA, OLD_GEN_IN_USE_BYTES, SURVIVOR_ARENA_0, SURVIVOR_ARENA_1,
+    arena_cell_alloc, drain_block_pool_if_requested, old_gen_in_use_bytes_sub, release_arena_block,
+    request_block_pool_drain, Arena, ArenaBlock, ArenaBlockRelease, BlockPoolDrainStats,
+    ACTIVE_SURVIVOR, ARENA, ARENA_TOTAL_BYTES, BLOCK_SIZE, FRESH_GENERAL_BLOCK_MIN_USED_BYTES,
+    INLINE_STATE, LONGLIVED_ARENA, OLD_ARENA, OLD_GEN_IN_USE_BYTES, SURVIVOR_ARENA_0,
+    SURVIVOR_ARENA_1,
 };
 /// #7469 hot-TLS plumbing — see `crate::tls_hot`. The `*_hot_addr` half is
 /// consumed by `tls_hot::fill`; the `hot_*` half is the cached accessor the
@@ -42,13 +44,14 @@ pub(crate) use block::{
 pub(crate) use block::{arena_hot_addr, hot_arena, hot_inline_state, inline_state_hot_addr};
 #[cfg(test)]
 pub(crate) use block::{
-    block_pool_bytes_for_test, force_next_block_alloc_failure, gc_trigger_arena_borrow_depth,
-    gc_trigger_arena_calls, reset_gc_trigger_arena_probe,
+    block_pool_bytes_for_test, block_pool_explicit_drained_bytes_for_test, block_pool_put,
+    force_next_block_alloc_failure, gc_trigger_arena_borrow_depth, gc_trigger_arena_calls,
+    reset_gc_trigger_arena_probe,
 };
 pub(crate) use page_meta::{
     address_span_overlaps_pages, defer_old_object_page_registration, register_block_space,
     register_old_object_pages, unregister_block_generation, unregister_old_block_pages,
-    OLD_GEN_RECLAIM_RETURNED_BYTES, OLD_GEN_RECLAIM_REUSABLE_BYTES,
+    OLD_GEN_RECLAIM_POOLED_BYTES, OLD_GEN_RECLAIM_RETURNED_BYTES, OLD_GEN_RECLAIM_REUSABLE_BYTES,
 };
 pub(crate) use page_meta::{page_generation_cache_hot_addr, page_generations_hot_addr};
 
@@ -99,7 +102,7 @@ pub use reset::{arena_reset_all_blocks_to_zero, arena_reset_empty_blocks};
 pub(crate) use promote::young_in_use_bytes_after_retag;
 pub(crate) use promote::{
     finish_in_place_promotion, retag_young_for_in_place_promotion, InPlacePromotion,
-    InPlacePromotionStats,
+    InPlacePromotionStats, PromotionLiveness,
 };
 
 // quarantine.rs (#7154 from-space protection; default-off)
@@ -112,10 +115,11 @@ pub(crate) use quarantine::{
 pub use quarantine::{quarantine_stats, QuarantineStats};
 
 // stats.rs
+pub(crate) use stats::record_arena_live_census;
 pub(crate) use stats::{active_survivor_space, inactive_survivor_space};
 pub use stats::{
-    js_arena_stats, longlived_in_use_bytes, old_gen_in_use_bytes, pointer_in_nursery,
-    pointer_in_old_gen,
+    arena_live_allocated_bytes, js_arena_stats, longlived_in_use_bytes, old_gen_in_use_bytes,
+    pointer_in_nursery, pointer_in_old_gen,
 };
 #[cfg(test)]
 pub(crate) use stats::{old_gen_in_use_bytes_recomputed, old_gen_in_use_bytes_resync};
@@ -125,11 +129,11 @@ pub(crate) use page_meta::{
     classify_heap_generation, classify_heap_space, classify_heap_space_in_range,
     generation_page_for_addr, old_arena_page_index_remove_object,
     old_arena_source_blocks_for_pages, old_arena_walk_objects_on_pages, old_object_page_overlaps,
-    old_page_account_dirty_slot, old_page_account_promoted_object, old_page_account_swept_object,
-    old_page_clear_dirty, old_page_mark_dirty, old_page_meta_snapshot, old_page_summary,
-    old_pages_begin_gc_cycle, old_pages_reset_sweep_accounting, unregister_old_object_pages,
-    HeapGeneration, HeapSpace, OldArenaPageObjectCursor, OldArenaSourceBlockSelection, OldPageMeta,
-    OldPageSummary,
+    old_page_account_dirty_slot, old_page_account_dirty_slots, old_page_account_promoted_object,
+    old_page_account_swept_object, old_page_clear_dirty, old_page_mark_dirty,
+    old_page_meta_snapshot, old_page_summary, old_pages_begin_gc_cycle,
+    old_pages_reset_sweep_accounting, unregister_old_object_pages, HeapGeneration, HeapSpace,
+    OldArenaPageObjectCursor, OldArenaSourceBlockSelection, OldPageMeta, OldPageSummary,
 };
 
 #[cfg(test)]

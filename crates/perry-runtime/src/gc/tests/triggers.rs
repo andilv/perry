@@ -370,6 +370,21 @@ fn test_budget_scaled_clamps_only_under_budget() {
     assert_eq!(budget_scaled_with(Some(MB), 128 * MB, 1, 4, 2 * MB), 2 * MB);
 }
 
+#[test]
+fn test_block_pool_allowance_scales_below_small_heap_budgets() {
+    use super::super::heap_budget::gc_block_pool_cap_with_budget;
+    const MB: usize = 1024 * 1024;
+
+    assert_eq!(gc_block_pool_cap_with_budget(None), 64 * MB);
+    assert_eq!(gc_block_pool_cap_with_budget(Some(64 * MB)), 8 * MB);
+    assert_eq!(gc_block_pool_cap_with_budget(Some(32 * MB)), 4 * MB);
+    assert_eq!(gc_block_pool_cap_with_budget(Some(8 * MB)), MB);
+    assert!(
+        gc_block_pool_cap_with_budget(Some(32 * MB)) < 32 * MB,
+        "a small PERRY_GC_HEAP_LIMIT cannot coexist with the fixed 64 MiB reserve"
+    );
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // #7024: the alloc-point deferral must be REACHABLE at the moment a nursery
 // trigger becomes due, at every heap budget.
@@ -1134,7 +1149,7 @@ fn a_deferral_arms_the_poll_word_and_draining_disarms_it() {
 #[test]
 fn an_unarmed_poll_touches_nothing() {
     let _isolation = GcTestIsolationGuard::new();
-    let _zeal = super::super::zeal::ZealGuard::set(false);
+    let _schedule = super::super::schedule::ScheduleGuard::off();
     crate::gc::set_safepoint_pending(false);
     let restore = crate::gc::PERRY_GC_POLL_ARMED.load(std::sync::atomic::Ordering::Relaxed);
     crate::gc::PERRY_GC_POLL_ARMED.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -1158,53 +1173,77 @@ fn an_unarmed_poll_touches_nothing() {
     );
 }
 
-/// Zeal's contract is a collection at EVERY safepoint, not only at ones an
-/// alloc-point trigger already deferred. That is expressible only if the word
-/// stays armed with nothing pending, so zeal owns a permanent arm.
+/// The seeded schedule selects among safepoints an alloc-point trigger did NOT
+/// already defer. That is expressible only if the poll word stays armed with
+/// nothing pending, so a resolved seed owns a permanent arm — and a run
+/// WITHOUT a seed must give that arm back, or every program pays for the slow
+/// path forever.
 ///
-/// Without this, `PERRY_GC_ZEAL=1` would silently become a no-op on the poll
-/// path: every back-edge would read zero, skip the call, and force nothing —
-/// and `zeal_liveness_report` would be left to report the vacuity after the
+/// Without the first half, `PERRY_GC_SCHEDULE_SEED` silently becomes a no-op on
+/// the poll path: every back-edge reads zero, skips the call and forces
+/// nothing, leaving `schedule_liveness_report` to report the vacuity after the
 /// fact instead of the instrument simply working.
 ///
-/// The release half is asserted, not narrated. `ZealGuard::set(true)` arms the
-/// process-global word; if its `Drop` ever stopped giving that arm back, the
-/// word would stay non-zero for the life of the test binary and every later
-/// test would silently take the poll's slow path — with this test still green,
-/// because it only ever looked INSIDE the scope. A test that cannot fail is not
-/// a test.
+/// Both directions run the REAL resolution (`resolve_poll_seed`) rather than
+/// reading the startup value, because the startup value is 1 whatever the mode
+/// is — an assertion against it passes without the guard having done anything,
+/// and fails outright if some earlier test in this binary already resolved the
+/// seed. That is why the resolution is a resettable flag rather than a
+/// `std::sync::Once`.
 #[test]
-fn zeal_holds_the_poll_word_armed_with_nothing_pending() {
+fn the_startup_seed_is_kept_only_for_a_resolved_seed() {
     let _isolation = GcTestIsolationGuard::new();
     crate::gc::set_safepoint_pending(false);
-    let base = crate::gc::PERRY_GC_POLL_ARMED.load(std::sync::atomic::Ordering::Relaxed);
+
+    // The word is process-global; put it back whatever this test proves.
+    let restore = crate::gc::PERRY_GC_POLL_ARMED.load(std::sync::atomic::Ordering::Relaxed);
+    let seed_armed = |armed: u32| {
+        crate::gc::PERRY_GC_POLL_ARMED.store(armed, std::sync::atomic::Ordering::Relaxed);
+        super::super::poll_arm::reset_poll_seed_for_test();
+    };
+
+    // WITH a seed: resolution must KEEP the startup arm.
+    seed_armed(1);
     {
-        let _zeal = super::super::zeal::ZealGuard::set(true);
-        assert_eq!(
-            crate::gc::PERRY_GC_POLL_ARMED.load(std::sync::atomic::Ordering::Relaxed),
-            base + 1,
-            "zeal must keep the poll reachable even with no deferral outstanding"
+        let _schedule = super::super::schedule::ScheduleGuard::set(
+            7,
+            super::super::schedule::rate_threshold(1.0),
+        );
+        super::super::poll_arm::resolve_poll_seed();
+        assert!(
+            crate::gc::PERRY_GC_POLL_ARMED.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "a resolved seed must keep the poll reachable with no deferral \
+             outstanding — released, every back-edge reads zero and the mode \
+             selects nothing at all"
         );
     }
-    // And it gives the arm back, so one zeal test does not leave every later
-    // test in this binary paying for the slow path.
-    assert_eq!(
-        crate::gc::PERRY_GC_POLL_ARMED.load(std::sync::atomic::Ordering::Relaxed),
-        base,
-        "dropping the ZealGuard must release the arm it took — a leaked arm \
-         pins the poll on for the rest of the process, and nothing else in this \
-         binary would notice"
-    );
+
+    // WITHOUT one: resolution must RELEASE it, or the poll's fast path stays
+    // needlessly live for the rest of the process.
+    seed_armed(1);
+    {
+        let _schedule = super::super::schedule::ScheduleGuard::off();
+        super::super::poll_arm::resolve_poll_seed();
+        assert_eq!(
+            crate::gc::PERRY_GC_POLL_ARMED.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "with no seed resolved the startup arm must be given back"
+        );
+    }
+
+    crate::gc::PERRY_GC_POLL_ARMED.store(restore, std::sync::atomic::Ordering::Relaxed);
+    super::super::poll_arm::reset_poll_seed_for_test();
     crate::gc::set_safepoint_pending(false);
 }
 
-/// #7781: the schedule's mirror of the zeal test above, and the regression
+/// #7781: the regression
 /// test for the gap that made `PERRY_GC_SCHEDULE_RATE=1` an event-loop-only
-/// instrument: on #7606's reproduction it saw SIX safepoints against zeal's
-/// 9,648 loop polls, because nothing armed the poll word for the mode whose
-/// decision lives inside the safepoint the word gates.
+/// instrument: on #7606's reproduction it saw SIX safepoints against the
+/// 9,648 loop polls the retired every-safepoint instrument reached, because
+/// nothing armed the poll word for the mode whose decision lives inside the
+/// safepoint the word gates.
 #[test]
-fn the_schedule_holds_the_poll_word_armed_like_zeal() {
+fn the_schedule_holds_the_poll_word_armed() {
     let _isolation = GcTestIsolationGuard::new();
     crate::gc::set_safepoint_pending(false);
     let base = crate::gc::PERRY_GC_POLL_ARMED.load(std::sync::atomic::Ordering::Relaxed);
@@ -1221,5 +1260,185 @@ fn the_schedule_holds_the_poll_word_armed_like_zeal() {
         crate::gc::PERRY_GC_POLL_ARMED.load(std::sync::atomic::Ordering::Relaxed),
         base,
         "dropping the ScheduleGuard must release the arm it took"
+    );
+}
+
+/// The survival-adaptive arm must CHANGE a verdict, in both directions, from
+/// the same arena reading.
+///
+/// A test that only armed the retaining flag and checked the boundary grew
+/// would pass on a build where the flag never reaches the predicate — the
+/// #7024/#6942 shape this repo keeps paying for. So the assertion is on
+/// `arena_growth_full_escalation_due()` itself, at a reading chosen to sit
+/// strictly between the un-retained boundary and the retained one: today's
+/// policy escalates there, and the retaining arm is the only thing that can
+/// make it decline.
+#[test]
+fn retaining_survival_widens_the_escalation_band_and_low_survival_restores_it() {
+    use super::super::policy::{
+        arena_growth_full_escalation_due, major_pacing_config, major_pacing_retaining,
+        note_copying_minor_young_survival, test_major_pacing_pre_in_use_bytes,
+        test_reset_major_pacing_backoff, test_set_major_pacing_baseline,
+        test_set_pacing_arena_in_use,
+    };
+
+    let (floor_bytes, growth_num) = major_pacing_config();
+    if floor_bytes == 0 {
+        return; // pacing disabled outright: no boundary to widen
+    }
+
+    test_reset_major_pacing_backoff();
+    // Baseline high enough that the growth clause, not the floor, is the
+    // boundary — the floor would mask the multiplier entirely.
+    let baseline = floor_bytes;
+    let previous_baseline = test_set_major_pacing_baseline(baseline);
+    // Above `growth_num × baseline` (today's boundary), below `4 ×` that.
+    let reading = baseline * growth_num + 1;
+    let previous_reading = test_set_pacing_arena_in_use(Some(reading));
+
+    // 1. Not retaining (the OFF state): this reading escalates, as before.
+    note_copying_minor_young_survival(0);
+    let off_retaining = major_pacing_retaining();
+    let off_due = arena_growth_full_escalation_due();
+    test_reset_major_pacing_backoff();
+    test_set_major_pacing_baseline(baseline);
+
+    // 2. Retaining: the same reading no longer escalates. Re-arm the reading
+    //    first — the retaining path re-baselines from it, and `max` keeps the
+    //    baseline where it is here (reading > baseline would raise it, which is
+    //    itself part of the effect being asserted).
+    note_copying_minor_young_survival(1000);
+    let on_retaining = major_pacing_retaining();
+    let on_due = arena_growth_full_escalation_due();
+    let on_recorded = test_major_pacing_pre_in_use_bytes();
+
+    // 3. A single low-survival minor disarms it again, same reading.
+    note_copying_minor_young_survival(0);
+    let back_retaining = major_pacing_retaining();
+
+    test_set_pacing_arena_in_use(previous_reading);
+    test_set_major_pacing_baseline(previous_baseline);
+    test_reset_major_pacing_backoff();
+
+    assert!(!off_retaining, "survival 0 must not arm the retaining arm");
+    assert!(
+        off_due,
+        "the reading must escalate WITHOUT the retaining arm, or this test \
+         proves nothing about the arm"
+    );
+    assert!(on_retaining, "survival 1000 must arm the retaining arm");
+    assert!(
+        !on_due,
+        "a retaining heap must not escalate at a reading only the un-widened \
+         growth band rejects"
+    );
+    assert_eq!(
+        on_recorded, 0,
+        "a declined escalation must leave no pre-full reading behind"
+    );
+    assert!(
+        !back_retaining,
+        "one non-retaining minor must disarm the band immediately — a decayed \
+         window would keep pacing a churning heap as if it were retaining"
+    );
+}
+
+/// The retaining re-baseline is a ratchet, never a decrease: a minor must not
+/// be able to pull the boundary in below what the last full established.
+#[test]
+fn retaining_rebaseline_never_lowers_the_pacing_baseline() {
+    use super::super::policy::{
+        major_pacing_snapshot, note_copying_minor_young_survival, test_reset_major_pacing_backoff,
+        test_set_major_pacing_baseline, test_set_pacing_arena_in_use,
+    };
+
+    test_reset_major_pacing_backoff();
+    let high = 512 * 1024 * 1024;
+    let previous_baseline = test_set_major_pacing_baseline(high);
+    let previous_reading = test_set_pacing_arena_in_use(Some(1024));
+
+    note_copying_minor_young_survival(1000);
+    let (after_low, _, _) = major_pacing_snapshot();
+
+    test_set_pacing_arena_in_use(Some(high * 2));
+    note_copying_minor_young_survival(1000);
+    let (after_high, _, _) = major_pacing_snapshot();
+
+    test_set_pacing_arena_in_use(previous_reading);
+    test_set_major_pacing_baseline(previous_baseline);
+    test_reset_major_pacing_backoff();
+
+    assert_eq!(
+        after_low, high,
+        "a small post-minor occupancy must not lower the baseline"
+    );
+    assert_eq!(
+        after_high,
+        high * 2,
+        "a larger post-minor occupancy must raise it"
+    );
+}
+
+/// #7865 — arena-growth pacing must escalate on **bytes a collection could not
+/// reclaim**, not on allocation volume.
+///
+/// The baseline (`GC_LAST_FULL_ARENA_IN_USE_BYTES`) is a post-full reading, so
+/// it is LIVE bytes. Testing it against `arena_in_use_bytes()` at the moment a
+/// trigger fires compared it against ALLOCATED bytes — the whole un-collected
+/// nursery. `gc-handoff/bench/tree.ts` reads 37.7 MB against the 32 MB floor on
+/// every cycle, so all 40 of its collections escalated to a whole-heap
+/// mark-sweep (1.76 s of pause on the dev host) and the copying minor that
+/// would have reclaimed the same bytes was never attempted. Worse, the
+/// escalation perpetuates itself: `note_copying_minor_young_survival` is the
+/// only thing that can widen the band, and it runs only when a copying minor
+/// runs.
+///
+/// Both directions are asserted, because only the pair distinguishes the fix
+/// from "escalation switched off": a heap the last collection LEFT full still
+/// escalates — that is the array-growth-forwarding-stub case the escalation was
+/// written for, and stubs survive a non-moving minor precisely by staying in
+/// this reading.
+#[test]
+fn escalation_reads_what_the_last_collection_failed_to_reclaim() {
+    use super::super::policy::{
+        arena_growth_full_escalation_due, major_pacing_config, test_reset_major_pacing_backoff,
+        test_set_collection_post_in_use_bytes, test_set_major_pacing_baseline,
+        test_set_pacing_arena_in_use,
+    };
+
+    let (floor_bytes, _growth_num) = major_pacing_config();
+    if floor_bytes == 0 {
+        return; // pacing disabled outright: no boundary to test
+    }
+
+    // The `#[cfg(test)]` injection seam short-circuits the real reading, so it
+    // has to be OFF for this test to exercise the path it is about.
+    let previous_seam = test_set_pacing_arena_in_use(None);
+    test_reset_major_pacing_backoff();
+    let previous_baseline = test_set_major_pacing_baseline(0); // boundary == floor
+
+    // A nursery-churn workload: the last collection emptied the arena. The
+    // program may have allocated gigabytes since; none of it is evidence that a
+    // full is needed.
+    let previous_post = test_set_collection_post_in_use_bytes(0);
+    let emptied_due = arena_growth_full_escalation_due();
+
+    // A stub-pinned workload: the last collection ran and the arena is STILL at
+    // the floor. That is the escalation's subject and it must still fire.
+    test_set_collection_post_in_use_bytes(floor_bytes);
+    let retained_due = arena_growth_full_escalation_due();
+
+    test_set_collection_post_in_use_bytes(previous_post);
+    test_set_major_pacing_baseline(previous_baseline);
+    test_set_pacing_arena_in_use(previous_seam);
+    test_reset_major_pacing_backoff();
+
+    assert!(
+        !emptied_due,
+        "a collection that emptied the arena must not escalate the next one"
+    );
+    assert!(
+        retained_due,
+        "an arena still at the floor after a collection must still escalate"
     );
 }

@@ -41,7 +41,8 @@
 //!   promotion until a full runs and actually reclaims them, so a workload
 //!   that sits just above the threshold forever cannot bleed footprint
 //!   indefinitely.
-//! * `PERRY_GC_FORCE_EVACUATE` / `PERRY_GC_ZEAL` turn it off outright. Those
+//! * `PERRY_GC_FORCE_EVACUATE` — and every mode that implies it, a resolved
+//!   `PERRY_GC_SCHEDULE_SEED` included — turns it off outright. Those
 //!   knobs exist to make objects MOVE; a promoting cycle moves nothing, and an
 //!   instrument that silently stops exercising its subject is exactly the
 //!   failure mode CLAUDE.md's "a gate must assert its subject was live" rule
@@ -57,6 +58,53 @@ use super::*;
 /// garbage, which against the 64 MB young-cap ceiling is ≤ 3.2 MB before the
 /// re-measured ratio turns the policy off.
 pub(super) const PROMOTE_SURVIVAL_THRESHOLD_PERMILLE: u64 = 950;
+
+/// Young-survival ratio, in permille, at or above which a promoting cycle may
+/// skip the TRACE as well as the copy (#7888).
+///
+/// Deliberately stricter than [`PROMOTE_SURVIVAL_THRESHOLD_PERMILLE`]: a
+/// promoting cycle that still traces knows exactly which objects are garbage
+/// and pays only footprint for a misprediction, while an untraced one assumes
+/// the whole young generation is live. Only the regime the measurement calls
+/// *fully* live earns that; the bimodal population's live mode sits at
+/// **992–1000** and its garbage mode at 0–4, three orders of magnitude apart.
+///
+/// # Why this is 990 and not the 999 it was introduced at (#7888)
+///
+/// 999 was read off `retain`/`retain_wide`/`deeplist`, whose every cycle
+/// measured exactly 999 or 1000 — and **that reading was partly an artifact of
+/// the flat 16 KB born-tenured threshold.** `all.push(rec)` grows its backing
+/// store by doubling, and every intermediate store over 16 KB was born in
+/// old-gen, so the garbage those growths abandon was never in the young
+/// generation to be counted. With pointer-bearing objects nursery-resident up
+/// to 128 KB the abandoned stores land where they belong, and `retain`'s FIRST
+/// cycle now measures **992** — deterministically, on all four `retain*`
+/// variants and on `phase_flip`. Every LATER cycle measures 1000 rather than
+/// 999, i.e. the estimator is strictly more confident once the startup garbage
+/// has actually been collected.
+///
+/// At 999 that one permille costs exactly one traced cycle per program, worth
+/// `retain1` +15.7% and `retain_wide1` +11.3% on the quiet mini. The threshold
+/// was over-fitted to a measurement that has since become more accurate.
+///
+/// The exposure this widens is small and already bounded twice.
+/// [`note_untraced_promotion`] charges `promoted × (1000 − permille) / 1000`
+/// against [`PROMOTED_DEAD_BUDGET_BYTES`], so an untraced run capped at
+/// [`UNTRACED_PROMOTION_FLOOR_BYTES`] (128 MB) carries at most **1.28 MB** of
+/// assumed-live-but-dead bytes here against 0.128 MB at 999 — both far under
+/// the 32 MB cap, which means the binding bound is the untraced-bytes budget in
+/// either case, and that is unchanged.
+pub(super) const UNTRACED_PROMOTION_SURVIVAL_PERMILLE: u64 = 990;
+
+/// Floor for the untraced-promotion budget — see
+/// [`untraced_promotion_budget_bytes`].
+///
+/// Two young-cap ceilings (2 × 64 MB). The traced path's own misprediction
+/// bound is "at most ONE nursery of retained garbage before the policy turns
+/// itself off" (see the module docs); this is that bound doubled, which is
+/// what buys a fully-live workload a whole run of free cycles instead of
+/// re-measuring every other one.
+pub(super) const UNTRACED_PROMOTION_FLOOR_BYTES: usize = 128 * 1024 * 1024;
 
 /// Running cap on dead bytes promoted in place since the last full collection.
 ///
@@ -84,6 +132,17 @@ thread_local! {
     /// next arena-bytes trigger as headroom. See
     /// `arena::InPlacePromotion::reserved_bytes`.
     static YOUNG_CAPACITY_CREDIT: Cell<usize> = const { Cell::new(0) };
+    /// Bytes promoted by cycles that did NOT trace, since the last cycle that
+    /// did (or the last full collection). This is the quantity the untraced
+    /// budget bounds: every one of these bytes is *assumed* live.
+    static UNTRACED_PROMOTED_BYTES: Cell<usize> = const { Cell::new(0) };
+    /// Live-subject counters for the untraced path (#7888). A benchmark that
+    /// never entered it proves nothing about it.
+    static UNTRACED_PROMOTION_CYCLES: Cell<u64> = const { Cell::new(0) };
+    static UNTRACED_PROMOTED_OBJECTS: Cell<u64> = const { Cell::new(0) };
+    /// Old-gen occupancy when the last real measurement landed — the base the
+    /// untraced budget's relative half is taken against.
+    static OLD_GEN_AT_LAST_MEASUREMENT: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Record that `bytes` of young capacity became old-gen, so the next
@@ -143,8 +202,10 @@ pub(super) fn should_promote_young_in_place() -> bool {
     if !promote_in_place_enabled() {
         return false;
     }
-    // Both of these exist to make objects move. Leave them a copier to drive.
-    if gc_force_evacuate_enabled() || gc_zeal_enabled() {
+    // Forced evacuation exists to make objects move — and it is what every
+    // stress mode implies (a resolved schedule seed included), so this one
+    // predicate covers them all. Leave them a copier to drive.
+    if gc_force_evacuate_enabled() {
         return false;
     }
     if PROMOTED_DEAD_BYTES.with(Cell::get) >= PROMOTED_DEAD_BUDGET_BYTES {
@@ -155,10 +216,101 @@ pub(super) fn should_promote_young_in_place() -> bool {
         .is_some_and(|permille| permille >= PROMOTE_SURVIVAL_THRESHOLD_PERMILLE)
 }
 
+/// How many untraced-promoted bytes may accumulate before a cycle has to
+/// measure again.
+///
+/// `max(floor, old-gen as it stood at the last MEASUREMENT)`: an untraced run
+/// may not more than double the old generation it started from. The relative
+/// half lets a program with a large genuinely-live old heap keep running free
+/// cycles — its exposure is proportional to memory it already holds — and the
+/// absolute floor keeps the rule from re-measuring constantly while old-gen is
+/// still small.
+///
+/// It has to be the size at the last measurement, not the size now: the
+/// untraced bytes ARE old-gen bytes, so comparing against the current figure
+/// compares a quantity with itself and the relative half can never fire.
+fn untraced_promotion_budget_bytes() -> usize {
+    UNTRACED_PROMOTION_FLOOR_BYTES.max(OLD_GEN_AT_LAST_MEASUREMENT.with(Cell::get))
+}
+
+/// Should this promoting cycle also skip the trace?
+///
+/// Caller has already established that the cycle promotes the WHOLE young
+/// generation in place ([`should_promote_young_in_place`] plus a non-empty
+/// retag), which is what makes the trace's remaining products enumerable —
+/// see `gc::copying`'s `untraced` binding for the enumeration and the
+/// gates that go with it. This half answers only the policy question.
+pub(super) fn should_promote_young_untraced() -> bool {
+    // In test builds this path is opt-in per thread, for the same reason
+    // `should_promote_young_in_place` is: the unit suite drives
+    // `gc_collect_minor` directly and asserts what a TRACING cycle does with
+    // its marks (identity, liveness, weak tombstoning). Silently rerouting
+    // those to a path that produces no marks would leave the traced path
+    // untested wherever this one is admissible. The tests that are ABOUT this
+    // path opt in and assert the live-subject counters.
+    #[cfg(test)]
+    if !TEST_UNTRACED_OPT_IN.with(Cell::get) {
+        return false;
+    }
+    if UNTRACED_PROMOTED_BYTES.with(Cell::get) >= untraced_promotion_budget_bytes() {
+        return false;
+    }
+    LAST_YOUNG_SURVIVAL_PERMILLE
+        .with(Cell::get)
+        .is_some_and(|permille| permille >= UNTRACED_PROMOTION_SURVIVAL_PERMILLE)
+}
+
+/// Charge an untraced promotion against the budgets and count the subject.
+///
+/// Two charges, against two different bounds:
+///
+/// * `UNTRACED_PROMOTED_BYTES` bounds how STALE the estimator may get before a
+///   cycle has to measure again.
+/// * `PROMOTED_DEAD_BYTES` — the footprint cap the traced path already feeds
+///   from an exact measurement — is charged the dead bytes the last measurement
+///   IMPLIES. Without this an untraced run would disarm that cap entirely
+///   (charging zero is not "no garbage", it is "no answer"), and a workload
+///   sitting just inside the survival threshold could park garbage indefinitely
+///   with each individual cycle looking fine. With it, the two paths share one
+///   footprint bound; they differ only in whether the dead figure is measured
+///   or extrapolated, and the untraced budget is what bounds the extrapolation.
+pub(super) fn note_untraced_promotion(promoted_bytes: usize, promoted_objects: usize) {
+    let dead_permille =
+        1000u64.saturating_sub(LAST_YOUNG_SURVIVAL_PERMILLE.with(Cell::get).unwrap_or(0));
+    let implied_dead = (promoted_bytes as u64)
+        .saturating_mul(dead_permille)
+        .checked_div(1000)
+        .unwrap_or(0) as usize;
+    PROMOTED_DEAD_BYTES.with(|c| c.set(c.get().saturating_add(implied_dead)));
+    UNTRACED_PROMOTED_BYTES.with(|c| c.set(c.get().saturating_add(promoted_bytes)));
+    UNTRACED_PROMOTION_CYCLES.with(|c| c.set(c.get().saturating_add(1)));
+    UNTRACED_PROMOTED_OBJECTS.with(|c| c.set(c.get().saturating_add(promoted_objects as u64)));
+}
+
+/// Cycles that promoted without tracing, and the objects they promoted.
+pub fn untraced_promotion_cycles() -> u64 {
+    UNTRACED_PROMOTION_CYCLES.with(Cell::get)
+}
+
+pub fn untraced_promoted_objects() -> u64 {
+    UNTRACED_PROMOTED_OBJECTS.with(Cell::get)
+}
+
+pub(crate) fn untraced_promoted_bytes_since_measurement() -> usize {
+    UNTRACED_PROMOTED_BYTES.with(Cell::get)
+}
+
 /// Record the young-survival ratio a copying minor just measured. Called on
-/// EVERY copying minor, promoting or evacuating — that is what keeps the
-/// predictor from going stale under repeated promotion.
+/// EVERY copying minor that TRACES, promoting or evacuating — that is what
+/// keeps the predictor from going stale under repeated promotion. An untraced
+/// promotion deliberately does NOT call this: it measured nothing, and
+/// recording its assumption as a measurement would turn the feedback loop into
+/// a mirror.
 pub(super) fn note_young_survival(young_bytes: usize, live_bytes: usize) {
+    // A real measurement landed, so the untraced run it ends is settled and the
+    // next run's budget is taken against the heap this one leaves behind.
+    UNTRACED_PROMOTED_BYTES.with(|c| c.set(0));
+    OLD_GEN_AT_LAST_MEASUREMENT.with(|c| c.set(crate::arena::old_gen_in_use_bytes()));
     if young_bytes == 0 {
         return;
     }
@@ -184,9 +336,13 @@ pub(super) fn note_in_place_promotion(
 }
 
 /// A full collection reclaimed old-gen, so the retained-garbage budget starts
-/// over.
+/// over — and with it the untraced budget, whose whole subject (assumed-live
+/// promoted bytes that were never checked) has just been checked by a full
+/// trace and either kept or freed.
 pub(super) fn note_full_collection_reclaimed_old_gen() {
     PROMOTED_DEAD_BYTES.with(|c| c.set(0));
+    UNTRACED_PROMOTED_BYTES.with(|c| c.set(0));
+    OLD_GEN_AT_LAST_MEASUREMENT.with(|c| c.set(crate::arena::old_gen_in_use_bytes()));
 }
 
 /// How many cycles promoted in place, and how many objects they promoted.
@@ -213,6 +369,7 @@ pub(crate) fn promoted_dead_bytes_since_full() -> usize {
 #[cfg(test)]
 thread_local! {
     static TEST_OPT_IN: Cell<bool> = const { Cell::new(false) };
+    static TEST_UNTRACED_OPT_IN: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Opt this thread's copying minors into the in-place promotion path, and
@@ -222,6 +379,9 @@ pub(super) struct InPlacePromotionTestGuard {
     previous_opt_in: bool,
     previous_survival: Option<u64>,
     previous_dead: usize,
+    previous_untraced: usize,
+    previous_untraced_opt_in: bool,
+    previous_old_gen_base: usize,
 }
 
 #[cfg(test)]
@@ -231,9 +391,22 @@ impl InPlacePromotionTestGuard {
             previous_opt_in: TEST_OPT_IN.replace(true),
             previous_survival: LAST_YOUNG_SURVIVAL_PERMILLE.get(),
             previous_dead: PROMOTED_DEAD_BYTES.get(),
+            previous_untraced: UNTRACED_PROMOTED_BYTES.get(),
+            previous_untraced_opt_in: TEST_UNTRACED_OPT_IN.get(),
+            previous_old_gen_base: OLD_GEN_AT_LAST_MEASUREMENT.get(),
         };
+        OLD_GEN_AT_LAST_MEASUREMENT.with(|c| c.set(0));
         LAST_YOUNG_SURVIVAL_PERMILLE.with(|c| c.set(Some(survival_permille)));
         PROMOTED_DEAD_BYTES.with(|c| c.set(0));
+        guard
+    }
+
+    /// Opt into the UNTRACED promotion path as well (#7888): fresh budget, and
+    /// a survival ratio in the fully-live regime.
+    pub(super) fn untraced() -> Self {
+        let guard = Self::enabled(1000);
+        UNTRACED_PROMOTED_BYTES.with(|c| c.set(0));
+        TEST_UNTRACED_OPT_IN.with(|c| c.set(true));
         guard
     }
 }
@@ -244,6 +417,9 @@ impl Drop for InPlacePromotionTestGuard {
         TEST_OPT_IN.with(|c| c.set(self.previous_opt_in));
         LAST_YOUNG_SURVIVAL_PERMILLE.with(|c| c.set(self.previous_survival));
         PROMOTED_DEAD_BYTES.with(|c| c.set(self.previous_dead));
+        UNTRACED_PROMOTED_BYTES.with(|c| c.set(self.previous_untraced));
+        TEST_UNTRACED_OPT_IN.with(|c| c.set(self.previous_untraced_opt_in));
+        OLD_GEN_AT_LAST_MEASUREMENT.with(|c| c.set(self.previous_old_gen_base));
     }
 }
 
@@ -264,4 +440,9 @@ pub(super) fn seed_young_survival_for_tests(permille: u64) {
 #[cfg(test)]
 pub(super) fn seed_promoted_dead_bytes_for_tests(bytes: usize) {
     PROMOTED_DEAD_BYTES.with(|c| c.set(bytes));
+}
+
+#[cfg(test)]
+pub(super) fn seed_untraced_promoted_bytes_for_tests(bytes: usize) {
+    UNTRACED_PROMOTED_BYTES.with(|c| c.set(bytes));
 }
