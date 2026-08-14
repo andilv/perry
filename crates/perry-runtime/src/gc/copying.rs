@@ -710,7 +710,7 @@ impl CopyingNurseryCollector {
         // refuses to move would silently stay in from-space across a copying
         // minor. `pointer_bearing_large_object_threshold_is_movable` pins that.
         if total < GC_HEADER_SIZE || total > MAX_YOUNG_MOVE_BYTES {
-            if std::env::var_os("PERRY_GC_DIAG").is_some() {
+            if crate::gc::gc_diag_enabled() {
                 eprintln!(
                     "[gc-move-guard] refusing wild young move user={:#x} obj_type={} size={}",
                     old_user as usize,
@@ -932,7 +932,7 @@ fn untraced_promotion_instrument_veto() -> Option<&'static str> {
     if super::fromspace_scan::fromspace_scan_enabled() {
         return Some("fromspace_scan");
     }
-    if std::env::var_os("PERRY_GC_VERIFY_MARK").is_some() {
+    if crate::gc::gc_verify_mark_enabled() {
         return Some("verify_mark");
     }
     if super::barrier::incremental_mark_in_progress_on_this_thread() {
@@ -1033,8 +1033,11 @@ pub(super) fn scan_remembered_dirty_slots_copying(
 }
 
 /// The young-pin latch was clear, the preflight was skipped on that proof, and
-/// the copier then met a pinned young object anyway — so the latch is
-/// incomplete and a pin site exists that does not go through `gc::pin_object`.
+/// the copier then met bytes that describe a pinned young object anyway.
+/// This is the instant relocation would become unsafe, but it does not by
+/// itself identify the violated invariant. In #7990 the header was internally
+/// impossible (`GC_TYPE_MAP | GC_FLAG_INTERNED`), and the fault disappeared
+/// when comparison operands were rooted; the pin latch itself was complete.
 ///
 /// There is no recovery: leaving the object in from-space strands the
 /// referring slot on memory `copying_reset_from_spaces_and_flip` is about to
@@ -1043,17 +1046,19 @@ pub(super) fn scan_remembered_dirty_slots_copying(
 #[cold]
 #[inline(never)]
 unsafe fn pinned_young_move_under_skipped_preflight(header: *mut GcHeader) -> ! {
+    // #7990: the report is built in `gc/pin.rs` from the header's own flags,
+    // because those flags are the only evidence that distinguishes an
+    // incomplete pin latch from a dangling pointer into recycled memory — and
+    // this message used to assert the former as fact while `gc_pin_sites.py`,
+    // the tool it told the reader to run, answered OK.
     eprintln!(
-        "[gc-pin-latch] FATAL: copying minor is about to relocate a PINNED young \
-         object on a preflight-skipped cycle. header={:#x} obj_type={} size={} \
-         flags={:#04x}\n\
-         The young-pin latch (gc/pin.rs) is incomplete: some site sets \
-         GC_FLAG_PINNED without going through gc::pin_object. Find it with \
-         `python3 scripts/gc_pin_sites.py` and route it through pin_object (#7645).",
-        header as usize,
-        (*header).obj_type,
-        (*header).size,
-        (*header).gc_flags,
+        "{}",
+        super::pin::pinned_young_move_report(
+            header as usize,
+            (*header).obj_type,
+            (*header).size,
+            (*header).gc_flags,
+        )
     );
     std::process::abort()
 }
@@ -1326,7 +1331,7 @@ pub(super) fn run_copied_minor_attempt(
         trace.root_sources.native_stack_fallback.scanned =
             matches!(decision, ConservativeStackScanDecision::Scan);
     }
-    if std::env::var_os("PERRY_GC_DIAG").is_some() {
+    if crate::gc::gc_diag_enabled() {
         let reason = match eligibility.fallback_reason {
             CopiedMinorFallbackReason::None => "none",
             CopiedMinorFallbackReason::NotAttempted => "not_attempted",
@@ -1690,7 +1695,7 @@ pub(super) fn run_copied_minor_attempt(
     // young objects, check that no MARKED (survived) object references an
     // UNMARKED (about-to-be-freed) child — i.e. a live parent whose child is
     // being swept. Non-fatal; logs parent/child obj_types.
-    if std::env::var_os("PERRY_GC_VERIFY_MARK").is_some() {
+    if crate::gc::gc_verify_mark_enabled() {
         super::verify::verify_marked_heap_report_nonfatal("copying-minor");
     }
 
@@ -1923,7 +1928,7 @@ pub(super) fn run_copied_minor_attempt(
         collector.stats.copied_bytes,
         collector.stats.survivor_live_bytes,
     );
-    if std::env::var_os("PERRY_GC_DIAG").is_some() {
+    if crate::gc::gc_diag_enabled() {
         eprintln!(
             "[gc-copy-minor] ran in_place={} untraced={} untraced_cycles={} untraced_objects={} in_place_blocks={} in_place_dead_bytes={} sparse_blocks={} survival_permille={} copied_objects={} copied_bytes={} promoted_objects={} promoted_bytes={} freed_bytes={} tenuring_survivals={} eden_live_bytes={} trigger={:?} declared_safepoint={}",
             collector.stats.in_place_promotion,

@@ -78,7 +78,7 @@ mod root_words;
 use root_words::*;
 mod layout;
 mod layout_slot_visit;
-pub(crate) use layout_slot_visit::*;
+use layout_slot_visit::*;
 /// #7510: the per-object slot-layout side tables and the emptiness flag that
 /// keeps them off the allocation, store, death and trace paths. Split out of
 /// `layout.rs` so it stays under the repo's 2000-line-per-file cap.
@@ -100,7 +100,7 @@ mod barrier;
 pub use barrier::*;
 /// #7630: the runtime slot-store helpers, split from `barrier.rs` (2000-line cap).
 mod barrier_store;
-pub use barrier_store::*;
+pub(crate) use barrier_store::*;
 mod dirty_page_cache;
 // #7187 Phase B: `crate::arena`'s page-metadata module invalidates the
 // barrier's "already dirty" page cache when it un-stamps or discards a page.
@@ -140,6 +140,7 @@ use sticky_remembered::*;
 pub(crate) use copying::CopyingPointerSet;
 // The hard ceiling every birth-generation threshold in `gc::types` must stay
 // under; asserted by `arena::tests::pointer_bearing_large_object_threshold_is_movable`.
+#[cfg(test)]
 pub(crate) use copying::MAX_YOUNG_MOVE_BYTES;
 mod dead_owner;
 mod old_free;
@@ -378,10 +379,7 @@ pub fn gen_gc_enabled() -> bool {
         if !write_barriers_enabled() {
             return false;
         }
-        !matches!(
-            std::env::var("PERRY_GEN_GC").as_deref(),
-            Ok("0") | Ok("off") | Ok("false")
-        )
+        env_default_on_enabled("PERRY_GEN_GC")
     })
 }
 
@@ -437,11 +435,7 @@ fn gc_force_evacuate_enabled() -> bool {
     // the mode — without this it would be a knob whose name promises relocation
     // stress and whose effect is sweep pressure. Unconditional, per #7611's
     // deletion note above.
-    schedule::gc_schedule_enabled()
-        || matches!(
-            std::env::var("PERRY_GC_FORCE_EVACUATE").as_deref(),
-            Ok("1") | Ok("on") | Ok("true")
-        )
+    schedule::gc_schedule_enabled() || env_flag_enabled("PERRY_GC_FORCE_EVACUATE")
 }
 
 fn gc_verify_evacuation_enabled() -> bool {
@@ -450,10 +444,7 @@ fn gc_verify_evacuation_enabled() -> bool {
     {
         return forced;
     }
-    matches!(
-        std::env::var("PERRY_GC_VERIFY_EVACUATION").as_deref(),
-        Ok("1") | Ok("on") | Ok("true")
-    )
+    env_flag_enabled("PERRY_GC_VERIFY_EVACUATION")
 }
 
 /// Per-thread test overrides for the two collector knobs the unit suite needs
@@ -522,6 +513,8 @@ pub(super) mod knob_overrides {
     }
 }
 
+#[cfg(test)]
+thread_local! {
 /// `PERRY_GC_SCAVENGE` — **ON by default since #7056**, kill switch
 /// `PERRY_GC_SCAVENGE=0`/`off`/`false`. It is a PACING knob: it routes
 /// nursery-churn triggers to the direct minor in `gc_check_trigger` instead of
@@ -577,8 +570,6 @@ pub(super) mod knob_overrides {
 /// for the reason above. It is recorded rather than quietly deleted because
 /// this whole PR exists because a stale half of a doc comment kept carrying a
 /// soundness argument after it stopped being true.
-#[cfg(test)]
-thread_local! {
     /// Test-only override, consulted BEFORE the process-wide OnceLock so a
     /// single test can pin a pacing mode even though the process default is on.
     /// Same discipline as `GC_MOVING_LOOP_POLLS_TEST_OVERRIDE`.
@@ -819,6 +810,9 @@ pub fn gc_init() {
         MutableRootScannerSource::RuntimeMutableScanner,
     );
     reg_scanner!(crate::promise::scan_native_async_completion_roots_mut);
+    // Runtime path-module exports and cached initialization errors live in a
+    // provider-owned Rust registry, so moving GC must mark and rewrite them.
+    reg_scanner!(crate::module_require::scan_module_path_roots_mut);
     reg_budgeted_scanner!(
         promise_mutable_root_scanner,
         crate::promise::scan_promise_roots_mut_step,
@@ -1271,17 +1265,59 @@ fn emit_schedule_liveness_verdict() {
     }
 }
 
-/// #5093: parse a boolean-ish env var by value (not mere presence): true for
-/// `1`/`true`/`on`/`yes` (case-insensitive), false for unset / `0`/`false`/`off`
-/// / `no` / empty / anything else.
-fn env_flag_enabled(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(v) => matches!(
+/// #5093 semantics as a **pure** function of the raw value, so both directions
+/// can be pinned by a test without touching the process environment (the live
+/// readers cache in a `OnceLock`; a test that called `set_var` would be at the
+/// mercy of which test ran first, and `set_var` is process-wide — see the
+/// `knob_overrides` note above for what that cost us once already).
+///
+/// True for `1`/`true`/`on`/`yes` (case-insensitive, surrounding whitespace
+/// ignored). False for unset, `0`/`false`/`off`/`no`, the empty string, **and
+/// anything unrecognised** — a typo must not silently arm an instrument.
+///
+/// #7991: this is the single definition of "boolean-ish GC knob". Every GC knob
+/// that is a boolean must route through it. `scripts/check_gc_env_knobs.py`
+/// enforces that by rejecting presence-only reads (`var_os(..).is_some()`) of
+/// GC-family names in production code.
+pub(crate) fn env_flag_from_value(raw: Option<&str>) -> bool {
+    match raw {
+        Some(v) => matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "on" | "yes"
         ),
-        Err(_) => false,
+        None => false,
     }
+}
+
+/// #5093: parse a boolean-ish env var by value (not mere presence).
+/// See [`env_flag_from_value`] for the exact contract.
+pub(crate) fn env_flag_enabled(name: &str) -> bool {
+    env_flag_from_value(std::env::var(name).ok().as_deref())
+}
+
+/// The mirror of [`env_flag_from_value`] for a **default-ON kill switch**:
+/// the feature is ON for unset, for the empty string, and for anything
+/// unrecognised; OFF only for an explicit `0`/`off`/`false`/`no`
+/// (case-insensitive, surrounding whitespace ignored).
+///
+/// This is deliberately **not** `!env_flag_from_value(..)`. Both helpers fail
+/// toward their knob's documented default, which is the opposite direction in
+/// each case: a typo must neither arm an instrument that is off by default nor
+/// disable a collector feature that ships on.
+pub(crate) fn env_default_on_from_value(raw: Option<&str>) -> bool {
+    match raw {
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        None => true,
+    }
+}
+
+/// Read a default-ON kill switch from the environment.
+/// See [`env_default_on_from_value`] for the exact contract.
+pub(crate) fn env_default_on_enabled(name: &str) -> bool {
+    env_default_on_from_value(std::env::var(name).ok().as_deref())
 }
 
 /// FFI: get GC stats
@@ -1382,3 +1418,8 @@ mod tests;
 /// on a parallel test thread can wipe its entries mid-test.
 #[cfg(test)]
 pub(crate) use tests::support::copying_nursery_isolation_lock as global_side_table_test_lock;
+#[cfg(test)]
+pub(crate) use tests::support::{
+    register_runtime_handle_root_scanner_for_tests, CopyingNurseryTestGuard,
+    GcTriggerThresholdTestGuard,
+};

@@ -745,6 +745,7 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default()
     );
+    let module_path_literal = format!("{:?}", source_path.to_string_lossy());
     let cjs_preamble = format!(
         r#"    // #3527: `module`/`exports` are reassignable `var`s (mirroring Node, where
     // they are wrapper-function parameters), so CJS bodies that do
@@ -756,6 +757,10 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
     // real module ref the same way), so named/default-export resolution stays
     // correct regardless of what the body does to its `module` local.
     const __cjs_module = {{ exports: {{}} }};
+    // Publish the initial object before user code. The runtime exposes it only
+    // to same-thread recursive loads; concurrent first callers wait for the
+    // final registration at the bottom of this wrapper.
+    __perry_register_path_module_partial({module_path_literal}, __cjs_module.exports);
     var module = __cjs_module;
     var exports = __cjs_module.exports;
     function __perry_cjs_require_error(kind, code, message) {{
@@ -824,7 +829,7 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
         // registered, fall through to the `.json` read / MODULE_NOT_FOUND throw.
         {{
             const __perry_path_mod = __perry_require_path_module(specifier);
-            if (__perry_path_mod !== undefined) return __perry_path_mod;
+            if (__perry_path_mod !== undefined || __perry_has_path_module(specifier)) return __perry_path_mod;
         }}
         // Runtime `require(absolutePath)` of a `.json` file (Next.js loads
         // manifests this way: `require(this.middlewareManifestPath)`). Node's
@@ -867,12 +872,10 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
 
     // Wall 54: self-register this compiled module's exports under its absolute
     // source path so a runtime `require(absolutePath.js)` (turbopack/Next.js
-    // page+chunk loading) resolves to it. `{:?}` debug-quotes to a valid JS
-    // string literal.
-    let path_register = format!(
-        "__perry_register_path_module({:?}, __cjs_module.exports);",
-        source_path.to_string_lossy()
-    );
+    // page+chunk loading) resolves to it. Reuse the exact literal used for the
+    // partial publication above so both registry operations have one key.
+    let path_register =
+        format!("__perry_register_path_module({module_path_literal}, __cjs_module.exports);");
     let wrapped = if let Some(flat_class) = &flat_default_class {
         // Issue #4933 — flat emission. Drop the IIFE and run the CommonJS body
         // at ESM module scope: `module.exports = {flat_class}` then resolves to
@@ -942,8 +945,10 @@ const _cjs = (function() {{
 }
 
 fn target_node_platform(target: Option<&str>) -> Option<&'static str> {
+    if super::super::is_windows_target(target) {
+        return Some("win32");
+    }
     match target {
-        Some("windows") | Some("windows-winui") => Some("win32"),
         Some("linux") | Some("linux-x86_64") | Some("linux-arm64") | Some("linux-aarch64")
         // musl shares node's `process.platform === "linux"` (#4826).
         | Some("linux-musl") | Some("linux-x86_64-musl") | Some("linux-aarch64-musl") => {

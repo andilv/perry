@@ -126,6 +126,15 @@ pub(super) const ALIAS_NOT_SINGLE_LET: ShapeDenial = ShapeDenial {
     issue: None,
 };
 
+pub(super) const RETURN_METHOD_RECEIVER_UNPROVEN: ShapeDenial = ShapeDenial {
+    rule: RULE1,
+    reason: "initialized by a fresh-returning method call, but the receiver's \
+             exact shape or contained dispatch proof did not survive the full \
+             region analysis.",
+    tier: Tier::Fixable,
+    issue: Some("#7170 R2"),
+};
+
 /// #7112: `find_new_candidates` excludes cell-backed locals before the
 /// containment walk, so without an entry they look indistinguishable from
 /// values the analysis never considered.
@@ -428,8 +437,8 @@ pub(super) fn deny_local(
 ///
 /// #7170 R0 changed two things here and nothing else:
 ///
-/// 1. The denial is [`UNBOUND_ALLOC_SERVED_RETURN`] when the site is in return
-///    position of a function that already carries a return-shape fact, so the
+/// 1. The denial is [`UNBOUND_ALLOC_SERVED_RETURN`] when the site is a proven
+///    source of a function that already carries a return-shape fact, so the
 ///    served population leaves the rule-1 bucket instead of inflating it.
 /// 2. The syntactic position and the site's walk ordinal are recorded as
 ///    first-class fields, which is what lets `Entry::dedup_key` tell two
@@ -440,7 +449,7 @@ pub(super) fn deny_alloc_site(site: &NewSite) {
     if !opt_report::enabled() || suppressed() {
         return;
     }
-    let served = site.is_return_position && opt_report::region_is_return_shape_producer();
+    let served = site.is_return_shape_source && opt_report::region_is_return_shape_producer();
     let d = if served {
         UNBOUND_ALLOC_SERVED_RETURN
     } else {
@@ -543,22 +552,25 @@ fn walk_lets(stmts: &[Stmt], depth: u32, f: &mut impl FnMut(u32, &str, u32)) {
 // about exactly one of these strings meaning two different things.
 //
 // None of these strings is load-bearing: servedness is decided by
-// [`NewSite::is_return_position`], set at the one site that knows it. A label
+// [`NewSite::is_return_shape_source`], set at the one site that knows it. A label
 // here can be renamed without silently disabling a classification.
 
 /// The allocation IS the function's return value: `return new C(...)`.
 const RETURN: &str = "return";
 /// The allocation sits *inside* a returned expression but is not the returned
-/// value — a conditional arm, a `&&` operand, an awaited operand, a member
-/// access base.
+/// value — a conditional arm, a logical operand, an awaited operand, a member
+/// access base. #7170 R2 consumes conditional and logical *result* allocations
+/// as return-shape sources, but they remain in this syntactic bucket rather
+/// than being mislabeled as direct returns.
 ///
 /// Split out in review of #7176. `RETURN` was set once, at
 /// `Stmt::Return(Some(e))`, and `scan_expr` propagates its context unchanged
 /// through the fallback arm, so `return cond ? new C() : new D()` filed both
 /// arms as return positions. That over-counted the `return` bucket — 323 of
 /// which was published on #7170 as R1's ceiling — and would have handed
-/// `Tier::Served` to operands the return-shape fact does not cover the moment
-/// the producer side widened.
+/// `Tier::Served` to unrelated operands when the producer side widened. The
+/// separate `is_return_shape_source` bit now distinguishes R2's result arms
+/// from conditions and every other operand in this same bucket.
 const RETURNED_OPERAND: &str = "returned expression operand";
 /// A genuine `new C(arg)` argument — the developer wrote a constructor call.
 const CTOR_ARG: &str = "constructor argument";
@@ -597,15 +609,17 @@ pub(super) struct NewSite {
     /// Index of this site in the region's walk. A de-duplication discriminant;
     /// see [`crate::opt_report::Entry::alloc_ordinal`].
     pub ordinal: u32,
-    /// This allocation **is** the expression of a `Stmt::Return` — the value the
-    /// function hands back — rather than something nested inside it.
+    /// This allocation is one of the fresh values a return-shape fact proves:
+    /// either the direct expression of a `Stmt::Return`, or a possible result
+    /// allocation of a returned conditional / logical expression (#7170 R2).
+    /// An allocation in a condition, a constructor argument, or a consumed
+    /// short-circuit operand is not a source.
     ///
-    /// The only input to the served-return classification, and set in exactly
-    /// one place ([`scan_return`]) together with the `context` label, so a
-    /// sabotage cannot kill one without the other. Deriving servedness from the
-    /// label string instead would make a cosmetic rename of a report bucket
-    /// silently disable it.
-    pub is_return_position: bool,
+    /// Set only by [`scan_return`] and its result-arm walker. Deriving
+    /// servedness from the context label instead would be wrong: conditional
+    /// arms remain `returned expression operand` positions even when their
+    /// allocations are inputs to the producer fact.
+    pub is_return_shape_source: bool,
     /// Byte offset of the `new` expression in its module's source. `Expr::New`
     /// is the one HIR node that already carries a source position (#5253,
     /// captured for constructor TypeErrors), so allocation sites — which have
@@ -742,15 +756,27 @@ fn scan_stmts(
 
 /// Scan the expression of a `Stmt::Return`.
 ///
-/// **The direct expression of a `return` is the function's return value;
-/// anything nested inside it is an operand.** `return cond ? new C() : new D()`
-/// returns the *conditional*, not either allocation, and #7107's return-shape
-/// fact says nothing about them.
+/// The direct expression of a `return` is the function's return value. #7170
+/// R2 additionally proves possible result allocations of conditional and
+/// short-circuiting logical expressions. Conditions and every non-result
+/// nested expression remain ordinary operands.
 ///
-/// This is the only place `RETURN` and [`NewSite::is_return_position`] are set,
-/// and they are set together, so no sabotage can leave the label and the
-/// classification disagreeing.
+/// This is the only entry into the served-source classification.
 fn scan_return(e: &Expr, depth: u32, out: &mut Vec<NewSite>) {
+    let sources = super::ptr_shape_returns::possible_return_shape_new_sources(e);
+    scan_return_result(e, depth, true, &sources, out);
+}
+
+/// Scan a returned expression while preserving which nested allocations can
+/// actually become its result. `direct` controls only the position label; the
+/// source bit comes from the producer proof's own outcome analysis.
+fn scan_return_result(
+    e: &Expr,
+    depth: u32,
+    direct: bool,
+    sources: &[&Expr],
+    out: &mut Vec<NewSite>,
+) {
     match e {
         Expr::New {
             class_name,
@@ -758,11 +784,32 @@ fn scan_return(e: &Expr, depth: u32, out: &mut Vec<NewSite>) {
             byte_offset,
             ..
         } => {
-            push_new_site(out, class_name, RETURN, depth, *byte_offset, true);
+            let is_source = sources.iter().any(|source| std::ptr::eq(*source, e));
+            push_new_site(
+                out,
+                class_name,
+                if direct { RETURN } else { RETURNED_OPERAND },
+                depth,
+                *byte_offset,
+                is_source,
+            );
             let arg_ctx = arg_context(class_name);
             for a in args {
                 scan_expr(a, depth, arg_ctx, out);
             }
+        }
+        Expr::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            scan_expr(condition, depth, RETURNED_OPERAND, out);
+            scan_return_result(then_expr, depth, false, sources, out);
+            scan_return_result(else_expr, depth, false, sources, out);
+        }
+        Expr::Logical { left, right, .. } => {
+            scan_return_result(left, depth, false, sources, out);
+            scan_return_result(right, depth, false, sources, out);
         }
         _ => scan_expr(e, depth, RETURNED_OPERAND, out),
     }
@@ -774,7 +821,7 @@ fn push_new_site(
     context: &'static str,
     depth: u32,
     byte_offset: u32,
-    is_return_position: bool,
+    is_return_shape_source: bool,
 ) {
     out.push(NewSite {
         display: display_class(class_name),
@@ -782,7 +829,7 @@ fn push_new_site(
         loop_depth: depth,
         ordinal: out.len() as u32,
         byte_offset,
-        is_return_position,
+        is_return_shape_source,
     });
 }
 

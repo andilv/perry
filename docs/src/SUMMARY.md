@@ -15,6 +15,7 @@
 
 - [Supported Features](language/supported-features.md)
 - [Type System](language/type-system.md)
+- [Native Layout Values](language/native-values.md)
 - [Decorators](language/decorators.md)
 - [Limitations](language/limitations.md)
 
@@ -180,6 +181,7 @@
 - [Garbage Collector](internals/garbage-collector.md)
 - [Explicit Memory Control](internals/explicit-memory.md)
 - [The GC rooting invariant (codegen)](internals/gc-rooting-invariant.md)
+- [Local binding type evidence](internals/local-binding-type-evidence.md)
 - [Incremental GC step bounds](internals/gc-step-bounds.md)
 - [RFC: rooting by construction](internals/rfc-rooting-by-construction.md)
 

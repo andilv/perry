@@ -371,9 +371,12 @@ pub(super) fn compile_method(
     let flat_const_ids: std::collections::HashSet<u32> =
         cross_module.flat_const_arrays.keys().copied().collect();
     // `--opt-report` (#6952) attribution scope; no-op when off.
-    let _opt_report_scope = crate::opt_report::enter_region(
+    let _opt_report_scope = crate::opt_report::enter_method_region(
         &format!("{}.{}", class.name, method.name),
-        crate::opt_report::RegionKind::Method,
+        cross_module
+            .module_dispatch
+            .return_shape_method_class(&class.name, &method.name, method.id)
+            .is_some(),
     );
     let native_facts = crate::collectors::collect_native_region_fact_graph(
         &method.body,
@@ -424,6 +427,8 @@ pub(super) fn compile_method(
         native_facts: &native_facts,
         locals,
         local_types,
+        proven_local_types: std::collections::HashMap::new(),
+        module_global_proven_types: &cross_module.module_global_proven_types,
         reassigned_locals: crate::collectors::reassigned_locals(&method.body),
         const_string_locals: std::collections::HashMap::new(),
         const_number_locals: std::collections::HashMap::new(),
@@ -513,6 +518,7 @@ pub(super) fn compile_method(
         shadow_slot_clears_after_stmt,
         arena_state_slot: None,
         class_keys_slots: HashMap::new(),
+        class_shape_slots: HashMap::new(),
         cached_lengths: HashMap::new(),
         bounded_index_pairs: Vec::new(),
         packed_f64_loop_facts: Vec::new(),
@@ -595,12 +601,11 @@ pub(super) fn compile_method(
         typed_i1_closures: &cross_module.typed_i1_closures,
         typed_i1_closure_param_reps: &cross_module.typed_i1_closure_param_reps,
         typed_string_closures: &cross_module.typed_string_closures,
-        typed_string_closure_capture_counts: &cross_module.typed_string_closure_capture_counts,
+        typed_closure_capture_reps: &cross_module.typed_closure_capture_reps,
         was_unrolled: method.was_unrolled,
         ic_site_counter: ic_base,
         ic_globals: Vec::new(),
         typed_parse_rodata: Vec::new(),
-        typed_parse_counter: 0,
         buffer_data_slots: HashMap::new(),
         buffer_view_slots: HashMap::new(),
         native_arena_owner_aliases: HashMap::new(),
@@ -1484,6 +1489,8 @@ pub(super) fn compile_static_method(
         native_facts: &native_facts,
         locals,
         local_types,
+        proven_local_types: std::collections::HashMap::new(),
+        module_global_proven_types: &cross_module.module_global_proven_types,
         reassigned_locals: crate::collectors::reassigned_locals(&f.body),
         const_string_locals: std::collections::HashMap::new(),
         const_number_locals: std::collections::HashMap::new(),
@@ -1577,6 +1584,7 @@ pub(super) fn compile_static_method(
         shadow_slot_clears_after_stmt,
         arena_state_slot: None,
         class_keys_slots: HashMap::new(),
+        class_shape_slots: HashMap::new(),
         cached_lengths: HashMap::new(),
         bounded_index_pairs: Vec::new(),
         packed_f64_loop_facts: Vec::new(),
@@ -1659,12 +1667,11 @@ pub(super) fn compile_static_method(
         typed_i1_closures: &cross_module.typed_i1_closures,
         typed_i1_closure_param_reps: &cross_module.typed_i1_closure_param_reps,
         typed_string_closures: &cross_module.typed_string_closures,
-        typed_string_closure_capture_counts: &cross_module.typed_string_closure_capture_counts,
+        typed_closure_capture_reps: &cross_module.typed_closure_capture_reps,
         was_unrolled: f.was_unrolled,
         ic_site_counter: ic_base,
         ic_globals: Vec::new(),
         typed_parse_rodata: Vec::new(),
-        typed_parse_counter: 0,
         buffer_data_slots: HashMap::new(),
         buffer_view_slots: HashMap::new(),
         native_arena_owner_aliases: HashMap::new(),

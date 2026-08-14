@@ -34,7 +34,9 @@ mod subclass_tests;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use self::alloc::{array_length_range_error, js_array_alloc_pointer_elements};
+pub(crate) use self::alloc::{
+    array_length_range_error, js_array_alloc_pointer_elements, js_array_alloc_with_length_exact,
+};
 pub use self::alloc::{
     js_array_alloc, js_array_alloc_literal, js_array_alloc_with_length,
     js_array_alloc_with_length_longlived, js_array_constructor_single, js_array_create,
@@ -145,7 +147,7 @@ pub(crate) use self::prototype_addr::{
 };
 #[cfg(test)]
 pub(crate) use self::prototype_addr::{
-    test_memoized_prototype_addr, test_prototype_addr_cache_wiring,
+    test_memoized_prototype_addr, test_prototype_addr_cache_wiring, test_prototype_addr_cell_count,
     test_rewrite_prototype_addr_slot,
 };
 pub(crate) use self::sort::object_prototype_has_index_prop;

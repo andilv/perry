@@ -21,6 +21,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
+use std::time::Instant;
 
 use crate::OutputFormat;
 
@@ -29,6 +31,184 @@ use crate::OutputFormat;
 /// the wild are a handful of levels deep at most; the cap is a belt-and-braces
 /// stop so a pathological (or cyclic) re-export graph can never spin forever.
 const MAX_REEXPORT_HOPS: usize = 16;
+
+/// Keep outer module parallelism and each module's inner LLVM workers inside a
+/// single conservative CPU/memory budget. Large generated modules retain a
+/// substantial HIR/LLVM graph while their units compile, so letting Rayon's
+/// host-sized global pool start one such graph per logical CPU can exhaust RAM.
+fn default_module_codegen_jobs(
+    total_modules: usize,
+    logical_cpus: usize,
+    llvm_unit_jobs: usize,
+) -> usize {
+    let worker_budget = logical_cpus.max(1).min(4);
+    (worker_budget / llvm_unit_jobs.max(1))
+        .max(1)
+        .min(3)
+        .min(total_modules.max(1))
+}
+
+fn configured_module_codegen_jobs(total_modules: usize) -> (usize, usize) {
+    let llvm_unit_jobs = std::env::var("PERRY_CODEGEN_UNIT_JOBS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(2);
+    let logical_cpus = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    let default_jobs = default_module_codegen_jobs(total_modules, logical_cpus, llvm_unit_jobs);
+    let module_jobs = std::env::var("PERRY_MODULE_JOBS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(default_jobs)
+        .min(total_modules.max(1));
+    (module_jobs, llvm_unit_jobs)
+}
+
+// OpenCode's 0.5--1.0 MiB generated chunks routinely lower to 20--45 MiB of
+// LLVM input even with fewer than 1,000 HIR callables. Treat that observed
+// range as memory-heavy too: ordinary modules still use outer parallelism,
+// while one generated chunk at a time gets the full inner-unit budget.
+const EXCLUSIVE_MODULE_CALLABLES: usize = 500;
+const EXCLUSIVE_MODULE_SOURCE_BYTES: u64 = 512 * 1024;
+
+fn module_codegen_callable_count(module: &perry_hir::Module) -> usize {
+    let class_callables: usize = module
+        .classes
+        .iter()
+        .map(|class| {
+            usize::from(class.constructor.is_some())
+                + class.methods.len()
+                + class.static_methods.len()
+                + class.computed_members.len()
+                + class.getters.len()
+                + class.setters.len()
+        })
+        .sum();
+    module.functions.len() + class_callables
+}
+
+fn module_codegen_is_exclusive(path: &Path, module: &perry_hir::Module) -> bool {
+    module_codegen_callable_count(module) >= EXCLUSIVE_MODULE_CALLABLES
+        || fs::metadata(path)
+            .map(|metadata| metadata.len() >= EXCLUSIVE_MODULE_SOURCE_BYTES)
+            .unwrap_or(false)
+}
+
+struct ModuleCodegenLimiter {
+    available: Mutex<usize>,
+    ready: Condvar,
+    capacity: usize,
+}
+
+struct ModuleCodegenPermit<'a> {
+    limiter: &'a ModuleCodegenLimiter,
+    weight: usize,
+}
+
+impl ModuleCodegenLimiter {
+    fn new(capacity: usize) -> Self {
+        Self {
+            available: Mutex::new(capacity.max(1)),
+            ready: Condvar::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    fn acquire(&self, exclusive: bool) -> ModuleCodegenPermit<'_> {
+        let weight = if exclusive { self.capacity } else { 1 };
+        let mut available = self.available.lock().expect("module limiter poisoned");
+        while *available < weight {
+            available = self.ready.wait(available).expect("module limiter poisoned");
+        }
+        *available -= weight;
+        ModuleCodegenPermit {
+            limiter: self,
+            weight,
+        }
+    }
+}
+
+impl Drop for ModuleCodegenPermit<'_> {
+    fn drop(&mut self) {
+        let mut available = self
+            .limiter
+            .available
+            .lock()
+            .expect("module limiter poisoned");
+        *available += self.weight;
+        self.limiter.ready.notify_all();
+    }
+}
+
+struct ModuleCodegenCompletion<'a> {
+    completed: &'a AtomicUsize,
+    total: usize,
+    started: Instant,
+    enabled: bool,
+}
+
+impl Drop for ModuleCodegenCompletion<'_> {
+    fn drop(&mut self) {
+        let done = self.completed.fetch_add(1, Ordering::Relaxed) + 1;
+        if !self.enabled || self.total == 0 {
+            return;
+        }
+        let report_step = (self.total / 20).max(1);
+        if done != self.total && done % report_step != 0 {
+            return;
+        }
+        let elapsed = self.started.elapsed().as_secs_f64();
+        let eta = if done < self.total {
+            elapsed * self.total.saturating_sub(done) as f64 / done as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[perry] codegen: modules finished {done}/{} ({:.0}%; {:.1} min elapsed; ETA ~{:.1} min)",
+            self.total,
+            done as f64 * 100.0 / self.total as f64,
+            elapsed / 60.0,
+            eta / 60.0
+        );
+    }
+}
+
+#[cfg(test)]
+mod module_codegen_job_tests {
+    use super::{default_module_codegen_jobs, ModuleCodegenLimiter};
+
+    #[test]
+    fn coordinates_outer_and_inner_parallelism() {
+        assert_eq!(default_module_codegen_jobs(308, 12, 2), 2);
+        assert_eq!(default_module_codegen_jobs(308, 12, 4), 1);
+        assert_eq!(default_module_codegen_jobs(308, 2, 1), 2);
+    }
+
+    #[test]
+    fn never_starts_more_jobs_than_modules() {
+        assert_eq!(default_module_codegen_jobs(1, 64, 1), 1);
+        assert_eq!(default_module_codegen_jobs(2, 64, 1), 2);
+        assert_eq!(default_module_codegen_jobs(0, 64, 1), 1);
+    }
+
+    #[test]
+    fn oversized_module_reserves_the_entire_outer_pool() {
+        let limiter = ModuleCodegenLimiter::new(2);
+        {
+            let _ordinary = limiter.acquire(false);
+            assert_eq!(*limiter.available.lock().unwrap(), 1);
+        }
+        assert_eq!(*limiter.available.lock().unwrap(), 2);
+        {
+            let _oversized = limiter.acquire(true);
+            assert_eq!(*limiter.available.lock().unwrap(), 0);
+        }
+        assert_eq!(*limiter.available.lock().unwrap(), 2);
+    }
+}
 
 /// Builds the complete codegen view of a foreign HIR class.
 ///
@@ -99,6 +279,7 @@ fn imported_class_from_hir(
             .map(|field| field.ty.clone())
             .collect(),
         source_class_id: Some(class.id),
+        return_shape_imports: Vec::new(),
     }
 }
 
@@ -117,6 +298,20 @@ pub fn run_with_parse_cache(
     // ever sees the concrete `linux-musl` triple family.
     let mut args = args;
     args.target = apply_libc_to_target(args.target.take(), args.libc.as_deref())?;
+
+    // Long native builds must never look hung. The codegen crate owns the
+    // detailed phase/unit reporter; enable it for human-readable CLI output
+    // and keep JSON output machine-clean.
+    if std::env::var_os("PERRY_CODEGEN_PROGRESS").is_none() {
+        std::env::set_var(
+            "PERRY_CODEGEN_PROGRESS",
+            if matches!(format, OutputFormat::Text) {
+                "1"
+            } else {
+                "0"
+            },
+        );
+    }
 
     // #835 + #846: clear the codegen-side FFI provenance set up-front
     // so any leftover entries from a prior `perry dev` rebuild (or a
@@ -800,6 +995,15 @@ pub fn run_with_parse_cache(
     // Build a map of all exported functions with their return types from all modules
     let mut exported_func_return_types: BTreeMap<(String, String), perry_hir::types::Type> =
         BTreeMap::new();
+    // #7170 R2: final-HIR return-shape facts for directly exported native
+    // functions. Values are content-addressed anonymous-record class names;
+    // keys use the declaring path + exported symbol name, exactly like the
+    // function return-type metadata beside it. Import resolution later walks
+    // aliases/re-exports to this origin key before installing a consumer fact.
+    //
+    // Harvest all modules before rayon starts codegen so the result is
+    // independent of module compile order.
+    let mut exported_return_shapes: BTreeMap<(String, String), &perry_hir::Class> = BTreeMap::new();
     // Set of exported functions that were declared `async` in their source module.
     // We track this separately because users routinely write `async function f() { ... }`
     // without an explicit `Promise<T>` annotation, in which case `func.return_type` is the
@@ -807,6 +1011,15 @@ pub fn run_with_parse_cache(
     let mut exported_async_funcs: BTreeSet<(String, String)> = BTreeSet::new();
     for (path, hir_module) in &ctx.native_modules {
         let path_str = path.to_string_lossy().to_string();
+        for (export_name, class_name) in perry_codegen::module_exported_return_shapes(hir_module) {
+            if let Some(class) = hir_module
+                .classes
+                .iter()
+                .find(|class| class.name == class_name)
+            {
+                exported_return_shapes.insert((path_str.clone(), export_name), class);
+            }
+        }
         for func in &hir_module.functions {
             if func.is_exported {
                 exported_func_param_counts
@@ -2166,6 +2379,29 @@ pub fn run_with_parse_cache(
 
     let total_codegen_modules = ctx.native_modules.len();
     let codegen_modules_started = AtomicUsize::new(0);
+    let codegen_modules_completed = AtomicUsize::new(0);
+    let codegen_started = Instant::now();
+    let codegen_progress_enabled = matches!(format, OutputFormat::Text)
+        && std::env::var("PERRY_CODEGEN_PROGRESS").as_deref() != Ok("0");
+    let (module_jobs, llvm_unit_jobs) = configured_module_codegen_jobs(total_codegen_modules);
+    let exclusive_modules = ctx
+        .native_modules
+        .iter()
+        .filter(|(path, module)| module_codegen_is_exclusive(path, module))
+        .count();
+    if matches!(format, OutputFormat::Text) && total_codegen_modules > 1 {
+        eprintln!(
+            "[perry] codegen: module parallelism: {module_jobs} module jobs x \
+             {llvm_unit_jobs} LLVM unit workers (override with PERRY_MODULE_JOBS / \
+             PERRY_CODEGEN_UNIT_JOBS)"
+        );
+        if module_jobs > 1 && exclusive_modules > 0 {
+            eprintln!(
+                "[perry] codegen: {exclusive_modules} oversized module(s) will run exclusively \
+                 to cap peak memory"
+            );
+        }
+    }
     // Where this compile's objects go — see `compile/object_staging.rs`.
     //
     // #7167: only a compile that is going to *link* gets a temp staging
@@ -2196,10 +2432,22 @@ pub fn run_with_parse_cache(
             no_link_destination.dir().to_path_buf()
         }
     };
-    let compile_results: Vec<Result<NativeObjectArtifact, String>> = ctx
-        .native_modules
-        .par_iter()
-        .map(|(path, hir_module)| {
+    let module_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(module_jobs)
+        .thread_name(|index| format!("perry-module-{index}"))
+        .build()
+        .map_err(|error| anyhow!("failed to create module codegen pool: {error}"))?;
+    let module_limiter = ModuleCodegenLimiter::new(module_jobs);
+    let compile_results: Vec<Result<NativeObjectArtifact, String>> = module_pool.install(|| {
+        ctx.native_modules.par_iter().map(|(path, hir_module)| {
+            let _permit =
+                module_limiter.acquire(module_codegen_is_exclusive(path, hir_module));
+            let _completion = ModuleCodegenCompletion {
+                completed: &codegen_modules_completed,
+                total: total_codegen_modules,
+                started: codegen_started,
+                enabled: codegen_progress_enabled,
+            };
             // Compile this module to LLVM IR (or .ll text in bitcode-link mode)
             // and return the object bytes for the linker to consume.
             let codegen_index = codegen_modules_started.fetch_add(1, Ordering::Relaxed) + 1;
@@ -3542,6 +3790,45 @@ pub fn run_with_parse_cache(
                         imported_return_types.insert(local_name.clone(), return_type.clone());
                     }
 
+                    // #7170 R2: cross-module return-shape provenance. Resolve
+                    // the same exact origin path/name the call-symbol plumbing
+                    // above uses, then install both halves atomically:
+                    //
+                    //  * LOCAL ExternFuncRef name -> returned shape, and
+                    //  * the source class's field metadata in imported_classes.
+                    //
+                    // The producer pre-pass exports anonymous record shapes
+                    // only. Their names content-address the complete field
+                    // shape, so a same-named local class is the same layout;
+                    // named user classes remain fail-closed in this increment.
+                    let return_shape_origin_name = resolved_origin_name
+                        .as_ref()
+                        .unwrap_or(&exported_name)
+                        .clone();
+                    let return_shape_key = (origin_path.clone(), return_shape_origin_name);
+                    if let Some(class) = exported_return_shapes.get(&return_shape_key).copied() {
+                        let imported_index = match imported_classes
+                            .iter()
+                            .position(|imported| imported.name == class.name)
+                        {
+                            Some(index) => index,
+                            None => {
+                                let class_prefix =
+                                    compute_module_prefix(&origin_path, &ctx.project_root);
+                                imported_classes.push(imported_class_from_hir(
+                                    class,
+                                    class_prefix,
+                                    None,
+                                ));
+                                imported_classes.len() - 1
+                            }
+                        };
+                        let imported = &mut imported_classes[imported_index];
+                        if !imported.return_shape_imports.contains(&local_name) {
+                            imported.return_shape_imports.push(local_name.clone());
+                        }
+                    }
+
                     // Imported async functions
                     if exported_async_funcs.contains(&key) {
                         imported_async_set.insert(local_name.clone());
@@ -4026,6 +4313,22 @@ pub fn run_with_parse_cache(
             }
             if references_interface {
                 for (src_pathbuf, src_hir) in &ctx.native_modules {
+                    // #8036: this augmentation supplies FOREIGN implementors
+                    // to a consumer's polymorphic dispatch tower. Feeding the
+                    // module its own exported classes back through
+                    // `imported_classes` creates a second, imported-constructor
+                    // identity for each local class. `lower_new` then treats a
+                    // local class as cross-module and calls its standalone
+                    // constructor metadata instead of the local implicit-super
+                    // path. That is observably wrong for native-backed derived
+                    // classes such as Next's ReadonlyURLSearchParams: the local
+                    // path installs the URLSearchParams backing, while the
+                    // accidental self-import path loses it. Local classes are
+                    // already present in codegen's class table, so they must
+                    // never be added by this foreign-class fallback.
+                    if src_pathbuf == path {
+                        continue;
+                    }
                     let src_path = src_pathbuf.to_string_lossy().to_string();
                     for class in &src_hir.classes {
                         if !class.is_exported {
@@ -4533,7 +4836,8 @@ pub fn run_with_parse_cache(
                 stored_cache_path: false,
             })
         })
-        .collect();
+        .collect()
+    });
 
     // Tier 4.4 (v0.5.336): partition compile results, then write object
     // files in parallel via rayon. The OS handles concurrent writes to
@@ -4936,9 +5240,7 @@ pub fn run_with_parse_cache(
             .or_else(|| find_runtime_library(target.as_deref()).ok());
         let stdlib_lib_path = stdlib_lib_resolved.clone();
         // Check if stdlib will be linked - if so, it provides perry_runtime symbols (no stubs needed)
-        let target_is_windows =
-            matches!(target.as_deref(), Some("windows") | Some("windows-winui"))
-                || (cfg!(target_os = "windows") && target.is_none());
+        let target_is_windows = is_windows_target(target.as_deref());
         let will_link_stdlib = (ctx.needs_stdlib || target_is_windows) && stdlib_lib_path.is_some();
         // Issue #76 — when the wasm host is
         // being linked, scan its archive so the `perry_wasm_host_*` symbols
@@ -4980,8 +5282,7 @@ pub fn run_with_parse_cache(
         );
         let is_linux = matches!(target.as_deref(), Some(t) if t.starts_with("linux"))
             || (!cfg!(target_os = "macos") && !cfg!(target_os = "windows") && target.is_none());
-        let is_windows = matches!(target.as_deref(), Some("windows") | Some("windows-winui"))
-            || (cfg!(target_os = "windows") && target.is_none());
+        let is_windows = is_windows_target(target.as_deref());
         // Symbol prefix depends on object format:
         // Mach-O targets (macOS, iOS, watchOS, tvOS): nm shows `_` prefix
         // COFF (Windows targets): no prefix
@@ -5293,9 +5594,7 @@ pub fn run_with_parse_cache(
         // `-o app.appx` is respected verbatim). Non-Windows targets keep the
         // bare name — Unix executables are conventionally extension-less.
         Some(p) => {
-            let is_windows_output =
-                matches!(target.as_deref(), Some("windows") | Some("windows-winui"))
-                    || (target.is_none() && cfg!(target_os = "windows"));
+            let is_windows_output = is_windows_target(target.as_deref());
             if is_windows_output && p.extension().is_none() {
                 p.with_extension(windows_default_output_extension(is_dylib, is_staticlib))
             } else {
@@ -5522,8 +5821,7 @@ pub fn run_with_parse_cache(
     );
     let is_linux = matches!(target.as_deref(), Some(t) if t.starts_with("linux"))
         || (target.is_none() && cfg!(target_os = "linux"));
-    let _is_windows = matches!(target.as_deref(), Some("windows") | Some("windows-winui"))
-        || (target.is_none() && cfg!(target_os = "windows"));
+    let _is_windows = is_windows_target(target.as_deref());
     // is_watchos / is_tvos are defined below (near the per-platform link step).
     // The is_cross_* bindings used to live here, but they're now derived
     // inside `link::build_and_run_link` which is the only consumer.
@@ -5535,13 +5833,11 @@ pub fn run_with_parse_cache(
     // emits `perry_module_init` instead of `main` (see is_dylib branch in
     // codegen/entry.rs, which now also covers `staticlib`).
     if is_staticlib {
-        let is_windows_target =
-            matches!(target.as_deref(), Some("windows") | Some("windows-winui"))
-                || (target.is_none() && cfg!(target_os = "windows"));
+        let windows_target = is_windows_target(target.as_deref());
         // Best-effort: drop a stale archive first so `ar` doesn't append to a
         // previous build's contents.
         let _ = fs::remove_file(&exe_path);
-        let mut cmd = if is_windows_target {
+        let mut cmd = if windows_target {
             // Archiver precedence (2026-07 audit): MSVC `lib.exe` when a
             // Visual Studio install (or a vcvars prompt) provides one, else
             // LLVM's `llvm-lib` — a drop-in lib.exe replacement that ships
@@ -5697,8 +5993,7 @@ pub fn run_with_parse_cache(
         // #6222: the link below runs the HOST toolchain. Reject a target it cannot
         // honour rather than emitting a host-arch dylib from a cross-compiled object.
         verify_dylib_target_linkable(target.as_deref())?;
-        let is_dylib_windows = matches!(target.as_deref(), Some("windows") | Some("windows-winui"))
-            || (target.is_none() && cfg!(target_os = "windows"));
+        let is_dylib_windows = is_windows_target(target.as_deref());
         let has_plugin_deactivate = ctx
             .native_modules
             .values()
@@ -5739,7 +6034,7 @@ pub fn run_with_parse_cache(
             // See also the cross-linker note in `select_linker_command`.
             let Some(linker) = find_lld_link()
                 .or_else(|| find_llvm_tool("lld-link"))
-                .or_else(find_msvc_link_exe)
+                .or_else(|| find_msvc_link_exe(target.as_deref()))
             else {
                 return Err(anyhow!(
                     "Building a Windows plugin .dll requires a COFF linker and none was \
@@ -5753,10 +6048,10 @@ pub fn run_with_parse_cache(
             };
             let mut c = Command::new(linker);
             // Both linkers need the CRT + SDK lib dirs for /defaultlib:libcmt.
-            // Mirror `select_linker_command`: leave a user-provided LIB alone,
-            // otherwise resolve it (xwin sysroot first, then vswhere).
-            if std::env::var("LIB").is_err() {
-                if let Some(lib_paths) = find_msvc_lib_paths() {
+            // Mirror `select_linker_command`: a host-architecture LIB is valid
+            // only for a native Windows target.
+            if std::env::var("LIB").is_err() || !is_native_windows_target(target.as_deref()) {
+                if let Some(lib_paths) = find_msvc_lib_paths(target.as_deref()) {
                     c.env("LIB", lib_paths);
                 }
             }
@@ -5973,6 +6268,35 @@ pub fn run_with_parse_cache(
     } else {
         None
     };
+
+    // #7629 — refuse a link whose wrapper archives bundle a different tokio
+    // compilation than the stdlib archive. Two tokios means two
+    // `tokio::runtime::context::CONTEXT` thread-locals, and the wrapper reads
+    // the one perry-stdlib's runtime never entered: the binary links cleanly
+    // and SIGABRTs at its first socket with "there is no reactor running".
+    // The #507 rebuild already prevents that by construction on the
+    // auto-optimize path; this catches every path that bypasses it.
+    {
+        let report = super::shared_tokio::verify_shared_tokio(
+            stdlib_lib.as_deref(),
+            &optimized_libs.well_known_libs,
+        );
+        if !report.mismatched.is_empty() {
+            let stdlib_path = stdlib_lib.clone().unwrap_or_default();
+            return Err(anyhow!(
+                "{}",
+                super::shared_tokio::mismatch_error_message(&report, &stdlib_path)
+            ));
+        }
+        if verbose > 0 && report.compared_anything() {
+            for checked in &report.checked {
+                eprintln!(
+                    "  shared-tokio: {} bundles {} (matches stdlib)",
+                    checked.name, checked.tokio_id
+                );
+            }
+        }
+    }
 
     // Build & run the per-platform link command. Tier 2.1 final extraction
     // (v0.5.342) — see crates/perry/src/commands/compile/link.rs.
@@ -6391,7 +6715,9 @@ fn apple_sdk_sysroot(sdk: &str) -> Result<PathBuf> {
 fn verify_dylib_target_linkable(target: Option<&str>) -> Result<()> {
     let Some(t) = target else { return Ok(()) };
     let host_ok = match t {
-        "windows" | "windows-winui" => true,
+        "windows" | "windows-winui" | "windows-x86_64" | "windows-aarch64" | "windows-arm64" => {
+            true
+        }
         t if t.starts_with("linux") => cfg!(target_os = "linux"),
         t if apple_dylib_cross_target(t).is_some() => cfg!(target_os = "macos"),
         _ => false,

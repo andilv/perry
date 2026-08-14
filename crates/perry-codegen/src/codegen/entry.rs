@@ -461,18 +461,14 @@ pub(super) fn compile_module_entry(
         // `.next/server/**` module path now (before `main` borrows `llmod`); the
         // registration calls go in the block below. `(string_const_name,
         // byte_len, sanitized_prefix)`.
-        let nextjs_path_inits: Vec<(String, usize, String)> = if is_dylib {
-            Vec::new()
-        } else {
-            cross_module
-                .nextjs_path_init_modules
-                .iter()
-                .map(|(path, prefix)| {
-                    let (cn, len) = llmod.add_string_constant(path);
-                    (cn, len, prefix.clone())
-                })
-                .collect()
-        };
+        let nextjs_path_inits: Vec<(String, usize, String)> = cross_module
+            .nextjs_path_init_modules
+            .iter()
+            .map(|(path, prefix)| {
+                let (cn, len) = llmod.add_string_constant(path);
+                (cn, len, prefix.clone())
+            })
+            .collect();
         let main = if is_dylib {
             llmod.define_function("perry_module_init", VOID, vec![])
         } else {
@@ -733,6 +729,8 @@ pub(super) fn compile_module_entry(
             native_facts: &main_native_facts,
             locals: HashMap::new(),
             local_types: init_local_types,
+            proven_local_types: HashMap::new(),
+            module_global_proven_types: &cross_module.module_global_proven_types,
             reassigned_locals: crate::collectors::reassigned_locals(&hir.init),
             const_string_locals: HashMap::new(),
             const_number_locals: HashMap::new(),
@@ -820,6 +818,7 @@ pub(super) fn compile_module_entry(
             shadow_slot_clears_after_stmt: main_shadow_slot_clears_after_stmt,
             arena_state_slot: None,
             class_keys_slots: HashMap::new(),
+            class_shape_slots: HashMap::new(),
             cached_lengths: HashMap::new(),
             bounded_index_pairs: Vec::new(),
             packed_f64_loop_facts: Vec::new(),
@@ -911,12 +910,11 @@ pub(super) fn compile_module_entry(
             typed_i1_closures: &cross_module.typed_i1_closures,
             typed_i1_closure_param_reps: &cross_module.typed_i1_closure_param_reps,
             typed_string_closures: &cross_module.typed_string_closures,
-            typed_string_closure_capture_counts: &cross_module.typed_string_closure_capture_counts,
+            typed_closure_capture_reps: &cross_module.typed_closure_capture_reps,
             was_unrolled: hir.init_was_unrolled,
             ic_site_counter: ic_base,
             ic_globals: Vec::new(),
             typed_parse_rodata: Vec::new(),
-            typed_parse_counter: 0,
             buffer_data_slots: HashMap::new(),
             buffer_view_slots: HashMap::new(),
             native_arena_owner_aliases: HashMap::new(),
@@ -1274,7 +1272,18 @@ pub(super) fn compile_module_entry(
                     }
                     blk.call_void(&format!("{}__init", dep_prefix), &[]);
                 }
-                blk.call_void(&init_body_name, &[]);
+                // Run each module body behind a native exception boundary.
+                // A CommonJS wrapper publishes partial exports at the top of
+                // this body; if an exception escapes before final publication,
+                // the runtime caches that exact failure and wakes path-module
+                // waiters before rethrowing. Keeping the boundary here avoids
+                // adding a JavaScript `try` block that would change top-level
+                // `let`/`const`/`class` scope in flat CJS emission.
+                let init_body_addr = format!("ptrtoint (ptr @{} to i64)", init_body_name);
+                blk.call_void(
+                    "js_run_module_init_catching",
+                    &[(I64, init_body_addr.as_str())],
+                );
                 blk.ret_void();
             }
         }
@@ -1403,6 +1412,8 @@ pub(super) fn compile_module_entry(
             native_facts: &init_native_facts,
             locals: HashMap::new(),
             local_types: HashMap::new(),
+            proven_local_types: HashMap::new(),
+            module_global_proven_types: &cross_module.module_global_proven_types,
             reassigned_locals: crate::collectors::reassigned_locals(&hir.init),
             const_string_locals: HashMap::new(),
             const_number_locals: HashMap::new(),
@@ -1490,6 +1501,7 @@ pub(super) fn compile_module_entry(
             shadow_slot_clears_after_stmt: init_shadow_slot_clears_after_stmt,
             arena_state_slot: None,
             class_keys_slots: HashMap::new(),
+            class_shape_slots: HashMap::new(),
             cached_lengths: HashMap::new(),
             bounded_index_pairs: Vec::new(),
             packed_f64_loop_facts: Vec::new(),
@@ -1581,12 +1593,11 @@ pub(super) fn compile_module_entry(
             typed_i1_closures: &cross_module.typed_i1_closures,
             typed_i1_closure_param_reps: &cross_module.typed_i1_closure_param_reps,
             typed_string_closures: &cross_module.typed_string_closures,
-            typed_string_closure_capture_counts: &cross_module.typed_string_closure_capture_counts,
+            typed_closure_capture_reps: &cross_module.typed_closure_capture_reps,
             was_unrolled: hir.init_was_unrolled,
             ic_site_counter: ic_base,
             ic_globals: Vec::new(),
             typed_parse_rodata: Vec::new(),
-            typed_parse_counter: 0,
             buffer_data_slots: HashMap::new(),
             buffer_view_slots: HashMap::new(),
             native_arena_owner_aliases: HashMap::new(),

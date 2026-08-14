@@ -116,6 +116,9 @@ jobs:
             benchmarks/honest_bench/harness/run_http_bench.sh \
             tests/test_benchmark_peer_fallback.sh
 
+      - name: Validate Windows LLVM runtime npm staging
+        run: ./tests/test_stage_npm_windows_llvm.sh
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -156,6 +159,17 @@ jobs:
       - name: File size limit
         if: ${{ !cancelled() }}
         run: ./scripts/check_file_size.sh
+
+      # #7846: erased TypeScript annotations and initializer-refined local
+      # types are hints, not runtime proofs. Every codegen read must choose the
+      # whole-region write-invalidating accessor or carry an inventoried
+      # runtime/representation justification. Count-exact entries make both a
+      # new consumer and a stale exemption fail.
+      - name: Local binding type-proof audit
+        if: ${{ !cancelled() }}
+        run: |
+          python3 scripts/local_binding_type_audit.py --self-test
+          python3 scripts/local_binding_type_audit.py
 
       # Well-known binding provenance pins: every third-party binding in
       # well_known_bindings.toml must carry an [bindings.<name>.upstream]
@@ -248,6 +262,21 @@ jobs:
         run: |
           python3 scripts/check_gc_env_knobs.py --self-test
           python3 scripts/check_gc_env_knobs.py
+
+      # #7982. The in-process LLVM reader's unit gate builds three tracked `.ll`
+      # corpora and asserts they RAN — which proves the tests ran, not that they
+      # test today's IR. All three froze on 2026-08-03 and carried zero
+      # `addrspace(1)` while RS4GC made it the shape of every GC root, so the
+      # unit gate stayed green through three `main` failures of the end-to-end
+      # arm. This asserts every IR form the reader carries a dedicated branch
+      # for is present in the corpora: a form that disappears fails here, and
+      # the fix is either a refresh (scripts/refresh_llvm_inprocess_corpora.sh)
+      # or deleting the now-untested branch.
+      - name: llvm-inprocess corpus currency
+        if: ${{ !cancelled() }}
+        run: |
+          python3 scripts/check_llvm_corpus_currency.py --self-test
+          python3 scripts/check_llvm_corpus_currency.py
 
       # #7877, second round. The knob audit above covers env-var names; it says
       # nothing about the paths and numbers the same pages state. Both drifted:
@@ -402,6 +431,7 @@ jobs:
       - name: GC matrix liveness gate
         if: ${{ !cancelled() }}
         run: |
+          ./scripts/gc_repsel_matrix.sh --self-test-liveness-parser
           python3 scripts/gc_matrix_liveness_check.py --self-test
           python3 scripts/gc_matrix_liveness_check.py --check-registry
 
@@ -495,7 +525,7 @@ jobs:
       - uses: ./.github/actions/setup-llvm22
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       # Same tarball'd-disk-cache pattern as api-docs-drift (see the comment
       # there for why SCCACHE_GHA_ENABLED is off).
@@ -565,7 +595,7 @@ jobs:
       - uses: ./.github/actions/setup-llvm22
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Cache sccache objects
         uses: actions/cache@v6
@@ -633,7 +663,7 @@ jobs:
       - uses: ./.github/actions/setup-llvm22
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       # Persist the sccache disk cache across runs. The github.job +
       # github.run_id key makes every run (including PRs) save its own fresh
@@ -744,7 +774,7 @@ jobs:
       - uses: ./.github/actions/setup-llvm22
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       # Persist the sccache disk cache across runs. The github.job +
       # github.run_id key makes every run (including PRs) save its own fresh
@@ -1017,7 +1047,7 @@ jobs:
 
       - name: Install sccache
         if: steps.scope.outputs.suites != ''
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Cache sccache objects
         if: steps.scope.outputs.suites != ''
@@ -1248,6 +1278,51 @@ jobs:
             exit 1
           }
 
+  # Native Windows ARM64 coverage for #4482. The x64 Windows gate above cannot
+  # execute an ARM binary, so keep a focused native job that proves the
+  # compiler, runtime ABI, final linker, and advertised target all agree.
+  windows-arm64-build:
+    runs-on: windows-11-arm
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-llvm22
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "${{ runner.os }}-${{ runner.arch }}-perry"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build ARM64 compiler and static libraries (perry-dev)
+        run: cargo build --profile perry-dev -p perry -p perry-runtime-static -p perry-stdlib-static
+
+      - name: Run ARM64 setjmp ABI tests
+        run: 'cargo test --profile perry-dev --lib -p perry-runtime ffi::setjmp::tests:: -- --test-threads=1'
+
+      - name: Compile and run a Perry ARM64 executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Keep this a runtime-only smoke. The full runtime+stdlib COFF archive
+          # composition has its own gate; this job's contract is the ARM ABI,
+          # target selection, SDK discovery, final PE link, and execution.
+          New-Item -ItemType Directory -Force 'target/windows-arm64-smoke-libs' | Out-Null
+          Copy-Item 'target/perry-dev/perry_runtime.lib' 'target/windows-arm64-smoke-libs/'
+          $env:PERRY_RUNTIME_DIR = (Resolve-Path 'target/windows-arm64-smoke-libs').Path
+          target/perry-dev/perry.exe compile tests/release/link_smoke/fixture.ts `
+            --target windows-aarch64 `
+            --no-auto-optimize `
+            -o target/windows-arm64-smoke.exe
+          $output = target/windows-arm64-smoke.exe
+          if ($output.Trim() -ne 'ok') {
+            throw "unexpected ARM64 smoke output: '$output'"
+          }
+
   # ---------------------------------------------------------------------------
   # GC write-barrier stress (optional / non-blocking)
   #
@@ -1432,7 +1507,7 @@ jobs:
       - uses: ./.github/actions/setup-llvm22
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       # Persist the sccache disk cache across runs. The github.job +
       # github.run_id key makes every run (including PRs) save its own fresh
@@ -1609,7 +1684,7 @@ jobs:
       - uses: ./.github/actions/setup-llvm22
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Cache sccache objects
         uses: actions/cache@v6
@@ -1766,7 +1841,7 @@ jobs:
       - uses: ./.github/actions/setup-llvm22
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Cache sccache objects
         uses: actions/cache@v6

@@ -119,25 +119,41 @@
 #                 objects copied, and the whole step passes. The collector was
 #                 never the problem.
 #
-#   ubuntu-24.04-arm  REAL DEFECT, filed as #7984. `PERRY_STACKMAP_WALKER=verify`
-#                 caught the fast fp-chain walker and the unwinder resolving the
-#                 same root to addresses 96 bytes apart. This arm is red because
-#                 it found the bug it was built to find; it must STAY red until
-#                 #7984 is fixed. Do not skip it.
+#   ubuntu-24.04-arm  REAL DEFECT, filed as #7984 and FIXED (#7997).
+#                 `PERRY_STACKMAP_WALKER=verify` caught the fast fp-chain
+#                 walker and the unwinder resolving the same root 96 bytes
+#                 apart, and the fast walker — the one that runs when `verify`
+#                 is off — was the wrong one. Two blind spots in
+#                 `fp_to_sp_offset`, both only reachable with SVE on, which is
+#                 what `-mcpu=native` turns on for a Neoverse-class core and
+#                 nothing on macOS or x86-64 ever does: a callee-save store
+#                 ended the prologue's stack-adjustment run, and
+#                 `addvl sp, sp, #-N` was not decoded at all. The 96 was never
+#                 a constant — it is that frame's missed tail, and it scales
+#                 with the vector length (208 at VL = 64 B).
 #
-#   windows-latest    REAL DEFECT, filed as #7985 (`perry.exe` cannot link
-#                 against the official LLVM 22 release: /MT-vs-/MD CRT mismatch,
-#                 bundled rpmalloc redefining malloc, and inkwell referencing
-#                 target backends the release does not build). A SECOND,
-#                 separate failure in the same arm — Git-bash `tar` reading
-#                 `D:\a\_temp` as a remote host — was a workflow bug and is
-#                 fixed here with `--force-local`.
+#                 This arm should now be GREEN. If it goes red again, read the
+#                 report `verify` prints before assuming a regression: it names
+#                 the frame, the base register, both resolved bases and the
+#                 prologue words, which is enough to say which walker is wrong
+#                 without a second run.
 #
-# So: after #7970 the macOS and ubuntu-latest arms should pass and the other two
-# should remain red on their filed defects. This workflow is therefore NOT a
-# promotion candidate yet — promoting it while #7984/#7985 are open would block
-# every PR. Promote only once all four arms are green, and per CLAUDE.md, run it
-# green once BEFORE adding it to branch protection.
+#   windows-latest    FIXES LANDED; GREEN RUN PENDING. #8017 stopped linking the official archive's
+#                 incompatible /MT + rpmalloc static objects, restricted
+#                 inkwell to Perry's x86/AArch64 targets, and linked the
+#                 archive's LLVM-C.dll instead. #7985's release follow-up
+#                 keeps that DLL beside perry.exe in the Windows zip/npm
+#                 package. A SECOND, separate failure in the same arm —
+#                 Git-bash `tar` reading `D:\a\_temp` as a remote host — was
+#                 fixed by #8028, which normalizes shell paths with `cygpath`
+#                 and exports native Windows paths for Perry. `--force-local`
+#                 was ineffective with the runner's bsdtar.
+#
+# So: all known defects now have fixes in the intended combined state, but the
+# windows-latest arm remains unproven until a complete run measures it. Per
+# CLAUDE.md this becomes a promotion candidate only AFTER one complete green
+# run demonstrates all four arms; do not add it to branch protection based on
+# a comment.
 name: gc-native-roots
 on:
   # Must run where it can actually gate something. Branch-scoped triggers were
@@ -250,7 +266,7 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version-file: .node-version
       - uses: dtolnay/rust-toolchain@stable
@@ -262,6 +278,42 @@ jobs:
         run: |
           export RUSTFLAGS="-C force-frame-pointers=yes -C force-unwind-tables=yes"
           cargo build --profile perry-dev -p perry -p perry-runtime-static -p perry-stdlib-static
+
+      # The two aarch64 walkers, over a frame this repository wrote, on the host
+      # that has to walk it.
+      #
+      # Until this step, NOTHING `cargo test` runs ever called `fp_chain::visit`
+      # or `unwind::visit` — their only exercise anywhere was `verify` mode in
+      # the step further down, inside a workflow that has never had a successful
+      # run on any branch (#7970). The unit tests cover the decoder and the
+      # matcher; the step that turns a `(register, offset)` pair into a stack
+      # address had none, which is why #7984 could only ever be found by
+      # compiling TypeScript and collecting.
+      #
+      # This asks the same question in seconds and without a compiler: given a
+      # frame whose layout is known — the aarch64-ELF one, where LLVM puts the
+      # `x29,x30` pair below the other callee-saves, and the Mach-O one, where
+      # it sits at the top — do both walkers land on the word the record names?
+      # It runs BEFORE the probe matrix so a walker defect is reported as a
+      # walker defect rather than as an oracle diff twenty minutes later.
+      - name: Walker agreement (aarch64 hosts)
+        if: ${{ !cancelled() && matrix.arch == 'aarch64' && runner.os != 'Windows' }}
+        run: |
+          set -euo pipefail
+          export RUSTFLAGS="-C force-frame-pointers=yes -C force-unwind-tables=yes"
+          cargo test --profile perry-dev -p perry-runtime --lib gc::roots::stack_maps \
+            -- --test-threads=1 | tee /tmp/walker-agreement.log
+          # `--lib <filter>` is a substring match, so a rename makes it select
+          # nothing and `cargo test` still exits 0 having run zero tests — a
+          # gate that cannot fail. Require each test by name, including the
+          # sabotage arm that proves the sentinel check discriminates.
+          for name in both_walkers_resolve_an_sp_root_in_an_elf_shaped_frame \
+                      both_walkers_resolve_an_sp_root_in_a_darwin_shaped_frame \
+                      a_wrong_frame_offset_is_caught; do
+            grep -q "walker_agreement::$name ... ok" /tmp/walker-agreement.log \
+              || { echo "::error::$name did not run — the filter matched nothing"; exit 1; }
+          done
+
       - name: Probe matrix, RS4GC mode, forced evacuation
         if: ${{ !cancelled() }}
         run: |
@@ -286,25 +338,27 @@ jobs:
             # archive — one directory, so opt and clang cannot skew.
             exe=".exe"
             llvm_ver=22.1.3
-            llvm_root="$RUNNER_TEMP/clang+llvm-$llvm_ver-x86_64-pc-windows-msvc"
+            # Git Bash exposes RUNNER_TEMP as a native `D:\...` path. Convert
+            # it before any Unix tool sees it: the runner's bsdtar still treats
+            # `D:` as a remote host even when passed GNU tar's --force-local.
+            runner_temp_posix="$(cygpath -u "$RUNNER_TEMP")"
+            llvm_root="$runner_temp_posix/clang+llvm-$llvm_ver-x86_64-pc-windows-msvc"
             if [ ! -x "$llvm_root/bin/opt.exe" ]; then
-              curl -sSL --retry 3 -o "$RUNNER_TEMP/llvm.tar.xz" \
+              curl -sSL --retry 3 -o "$runner_temp_posix/llvm.tar.xz" \
                 "https://github.com/llvm/llvm-project/releases/download/llvmorg-$llvm_ver/clang+llvm-$llvm_ver-x86_64-pc-windows-msvc.tar.xz"
-              # --force-local: this step runs under Git-bash, where $RUNNER_TEMP
-              # is a WINDOWS path (`D:\a\_temp`). GNU tar reads `D:` as a remote
-              # `host:path` and tries to rsh to a host named `D`, which is the
-              # 2026-08-11 failure verbatim:
+              # The old --force-local workaround was ineffective because the
+              # Windows runner supplies bsdtar, not GNU tar. Passing the
+              # cygpath-normalized archive and destination avoids the remote
+              # `host:path` grammar entirely. The previous failure was:
               #     tar (child): Cannot connect to D: resolve failed
               #     xz: (stdin): File format not recognized
               #     tar: Error is not recoverable: exiting now      (exit 2)
-              # `-C` is not parsed for a remote spec, so only the ARCHIVE path
-              # needs the flag. Verify the extraction rather than trusting it:
-              # a half-extracted tree would otherwise surface as the much more
-              # confusing "no matched opt+clang pair" error below.
-              tar --force-local -xJf "$RUNNER_TEMP/llvm.tar.xz" -C "$RUNNER_TEMP"
+              # Verify extraction rather than trusting it: a half-extracted
+              # tree otherwise becomes a misleading tool-pair error below.
+              tar -xJf "$runner_temp_posix/llvm.tar.xz" -C "$runner_temp_posix"
               if [ ! -x "$llvm_root/bin/opt.exe" ]; then
-                echo "::error::extracted $RUNNER_TEMP/llvm.tar.xz but $llvm_root/bin/opt.exe is still missing — the archive layout changed, or the download was truncated"
-                ls -la "$RUNNER_TEMP" | head -20
+                echo "::error::extracted $runner_temp_posix/llvm.tar.xz but $llvm_root/bin/opt.exe is still missing — the archive layout changed, or the download was truncated"
+                ls -la "$runner_temp_posix" | head -20
                 exit 1
               fi
             fi
@@ -322,11 +376,20 @@ jobs:
             echo "::error::no matched opt+clang pair under $llvm_bin — RS4GC cannot run, and silently skipping it is exactly the gate that cannot fail"
             exit 1
           fi
-          export PERRY_LLVM_OPT="$llvm_bin/opt$exe"
-          export PERRY_LLVM_CLANG="$llvm_bin/clang$exe"
+          llvm_opt="$llvm_bin/opt$exe"
+          llvm_clang="$llvm_bin/clang$exe"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # Shell tools need the POSIX path above, while native perry.exe
+            # reads these environment values directly as Windows PathBufs.
+            export PERRY_LLVM_OPT="$(cygpath -w "$llvm_opt")"
+            export PERRY_LLVM_CLANG="$(cygpath -w "$llvm_clang")"
+          else
+            export PERRY_LLVM_OPT="$llvm_opt"
+            export PERRY_LLVM_CLANG="$llvm_clang"
+          fi
           echo "RS4GC toolchain: $llvm_bin"
-          "$PERRY_LLVM_OPT" --version | head -2
-          "$PERRY_LLVM_CLANG" --version | head -2
+          "$llvm_opt" --version | head -2
+          "$llvm_clang" --version | head -2
 
           pass=0
           total=0
@@ -515,7 +578,7 @@ jobs:
                 "/tmp/rs4gc-$name" > "/tmp/walker-$name-$mode.out" \
                                   2> "/tmp/walker-$name-$mode.err" \
                 || { echo "::error::$name crashed under PERRY_STACKMAP_WALKER=$mode"; \
-                     tail -20 "/tmp/walker-$name-$mode.err"; exit 1; }
+                     tail -120 "/tmp/walker-$name-$mode.err"; exit 1; }
               diff "/tmp/rs4gc-$name.oracle" "/tmp/walker-$name-$mode.out" \
                 || { echo "::error::$name diverged from the pinned oracle under PERRY_STACKMAP_WALKER=$mode"; exit 1; }
               checked=$((checked+1))
