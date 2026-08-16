@@ -473,7 +473,10 @@ fn emit_uncaught_backtrace() {
     if !on {
         return;
     }
-    #[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(
+        unix,
+        any(target_os = "macos", all(target_os = "linux", not(target_env = "musl")))
+    ))]
     {
         const MAX_FRAMES: usize = 96;
         let mut frames = [std::ptr::null_mut::<libc::c_void>(); MAX_FRAMES];
