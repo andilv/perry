@@ -38,22 +38,24 @@ pub(crate) fn get_field_by_name_object_tail(
                             (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
                         let key_len = (*key).byte_len as usize;
                         let key_bytes = std::slice::from_raw_parts(key_ptr, key_len);
-                        if is_timer_handle_method_key(key_bytes)
-                            && crate::timer::is_known_timer_id(raw as i64)
-                        {
-                            let this_f64 = f64::from_bits(
-                                crate::value::js_nanbox_pointer(raw as i64).to_bits(),
-                            );
-                            let result =
-                                super::super::js_class_method_bind(this_f64, key_ptr, key_len);
-                            return JSValue::from_bits(result.to_bits());
+                        if let Some(method) = timer_handle_method_name_static(key_bytes) {
+                            if crate::timer::is_known_timer_id(raw as i64) {
+                                let this_f64 = f64::from_bits(
+                                    crate::value::js_nanbox_pointer(raw as i64).to_bits(),
+                                );
+                                // #8133: the `'static` literal, NOT `key_ptr` —
+                                // that is the interior of a movable heap string
+                                // this read does not own.
+                                let result = super::super::js_class_method_bind(
+                                    this_f64,
+                                    method.as_ptr(),
+                                    method.len(),
+                                );
+                                return JSValue::from_bits(result.to_bits());
+                            }
                         }
-                        if let Some(v) = crate::text::text_handle_property(
-                            raw as usize,
-                            key_bytes,
-                            key_ptr,
-                            key_len,
-                        ) {
+                        if let Some(v) = crate::text::text_handle_property(raw as usize, key_bytes)
+                        {
                             return v;
                         }
                     }
@@ -113,17 +115,20 @@ pub(crate) fn get_field_by_name_object_tail(
                 let key_ptr = (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
                 let key_len = (*key).byte_len as usize;
                 let key_bytes = std::slice::from_raw_parts(key_ptr, key_len);
-                if is_timer_handle_method_key(key_bytes)
-                    && crate::timer::is_known_timer_id(obj as i64)
-                {
-                    let this_f64 =
-                        f64::from_bits(crate::value::js_nanbox_pointer(obj as i64).to_bits());
-                    let result = super::super::js_class_method_bind(this_f64, key_ptr, key_len);
-                    return JSValue::from_bits(result.to_bits());
+                if let Some(method) = timer_handle_method_name_static(key_bytes) {
+                    if crate::timer::is_known_timer_id(obj as i64) {
+                        let this_f64 =
+                            f64::from_bits(crate::value::js_nanbox_pointer(obj as i64).to_bits());
+                        // #8133: see the sibling arm above.
+                        let result = super::super::js_class_method_bind(
+                            this_f64,
+                            method.as_ptr(),
+                            method.len(),
+                        );
+                        return JSValue::from_bits(result.to_bits());
+                    }
                 }
-                if let Some(v) =
-                    crate::text::text_handle_property(obj as usize, key_bytes, key_ptr, key_len)
-                {
+                if let Some(v) = crate::text::text_handle_property(obj as usize, key_bytes) {
                     return v;
                 }
             }
@@ -251,7 +256,15 @@ pub(crate) fn get_field_by_name_object_tail(
                 if let Some(value) = crypto_key_property_value(obj as usize, key_bytes) {
                     return value;
                 }
-                if key_bytes == b"length" || key_bytes == b"byteLength" {
+                // #8149: `length` is a `%TypedArray%` slot. An `ArrayBuffer` /
+                // `SharedArrayBuffer` / `DataView` has only `byteLength`, so
+                // node answers `undefined` for `dv.length` / `ab.length`. Asked
+                // ABOVE the shared arm, which answers the byte count for both
+                // spellings.
+                if key_bytes == b"byteLength"
+                    || (key_bytes == b"length"
+                        && !crate::buffer::is_non_indexed_buffer_view(obj as usize))
+                {
                     let b = obj as *const crate::buffer::BufferHeader;
                     return JSValue::number(crate::buffer::js_buffer_length(b) as f64);
                 }
@@ -1034,14 +1047,11 @@ pub(crate) fn get_field_by_name_object_tail(
                 gc_type == crate::gc::GC_TYPE_MAP,
             );
         }
-        // RegExp: RegExpHeader is allocated via GC_TYPE_OBJECT but tracked
-        // in REGEX_POINTERS. Detect and route `.source`, `.flags`,
+        // RegExp has a dedicated GC kind. Route `.source`, `.flags`,
         // `.lastIndex`, `.global`, `.ignoreCase`, `.multiline`, `.sticky`,
-        // `.unicode`, `.dotAll` to the regex header fields. Must run
-        // before the generic object-field path so the keys_array lookup
-        // doesn't try to read the regex header bytes as ObjectHeader.
-        if gc_type == crate::gc::GC_TYPE_OBJECT && crate::regex::is_regex_pointer(obj as *const u8)
-        {
+        // `.unicode`, `.dotAll` to the regex header fields. The kind check keeps
+        // its native payload out of the generic ObjectHeader field path.
+        if gc_type == crate::gc::GC_TYPE_REGEXP {
             if !key.is_null() {
                 let key_ptr = (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
                 let key_len = (*key).byte_len as usize;
@@ -1139,10 +1149,7 @@ pub(crate) fn get_field_by_name_object_tail(
             return JSValue::undefined();
         }
         if gc_type != crate::gc::GC_TYPE_OBJECT {
-            let object_type = (*obj).object_type;
-            if object_type != crate::error::OBJECT_TYPE_REGULAR {
-                return JSValue::undefined();
-            }
+            return JSValue::undefined();
         }
         if super::super::is_arguments_object(obj) {
             if let Some(value) = super::super::arguments_object_get_field(obj, key) {
@@ -1287,7 +1294,7 @@ pub(crate) fn get_field_by_name_object_tail(
             let key_bytes = std::slice::from_raw_parts(key_ptr, key_len);
             // #4949 `.prototype` / #6497 `.name` on heap class-expression
             // values — see `class_object_props`.
-            if (*obj).object_type == crate::error::OBJECT_TYPE_CLASS && (*obj).class_id != 0 {
+            if super::super::is_class_object_ptr(obj as *const u8) && (*obj).class_id != 0 {
                 if key_bytes == b"prototype" {
                     return super::class_object_props::class_object_prototype_value(obj);
                 }

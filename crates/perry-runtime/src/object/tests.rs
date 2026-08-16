@@ -1534,7 +1534,7 @@ fn array_receiver_is_never_read_as_a_class_id() {
 #[test]
 fn constructor_ref_method_value_resolves_static_over_instance_method() {
     // Unique id so the process-global registries don't collide with other tests.
-    const CLASS_ID: u32 = 0x7689;
+    const LEX_METHOD_TEST_CLASS_ID: u32 = 0x7689;
     const NAME: &[u8] = b"lex";
 
     extern "C" fn static_lex_7689() -> f64 {
@@ -1546,7 +1546,7 @@ fn constructor_ref_method_value_resolves_static_over_instance_method() {
 
     unsafe {
         super::class_registry::js_register_class_method(
-            CLASS_ID as i64,
+            LEX_METHOD_TEST_CLASS_ID as i64,
             NAME.as_ptr(),
             NAME.len() as i64,
             instance_lex_7689 as *const () as usize as i64,
@@ -1555,7 +1555,7 @@ fn constructor_ref_method_value_resolves_static_over_instance_method() {
             0,
         );
         super::class_registry::js_register_class_static_method(
-            CLASS_ID as i64,
+            LEX_METHOD_TEST_CLASS_ID as i64,
             NAME.as_ptr(),
             NAME.len() as i64,
             static_lex_7689 as *const () as usize as i64,
@@ -1564,7 +1564,7 @@ fn constructor_ref_method_value_resolves_static_over_instance_method() {
         );
     }
 
-    let class_ref = super::native_module::class_constructor_ref_value(CLASS_ID);
+    let class_ref = super::native_module::class_constructor_ref_value(LEX_METHOD_TEST_CLASS_ID);
     let bound = super::native_module::js_class_method_bind(class_ref, NAME.as_ptr(), NAME.len());
     let result = unsafe { crate::closure::js_native_call_value(bound, std::ptr::null(), 0) };
     assert_eq!(
@@ -1575,7 +1575,7 @@ fn constructor_ref_method_value_resolves_static_over_instance_method() {
 
     // The guard must not over-narrow: the PROTOTYPE ref names the instance
     // method, and an extracted `C.prototype.lex` must keep resolving it.
-    let proto_ref = super::native_module::class_prototype_ref_value(CLASS_ID);
+    let proto_ref = super::native_module::class_prototype_ref_value(LEX_METHOD_TEST_CLASS_ID);
     let bound_proto =
         super::native_module::js_class_method_bind(proto_ref, NAME.as_ptr(), NAME.len());
     let result_proto =
@@ -1584,5 +1584,57 @@ fn constructor_ref_method_value_resolves_static_over_instance_method() {
         result_proto, 7.0,
         "a method value extracted off the PROTOTYPE ref must still dispatch \
          the instance `lex`"
+    );
+}
+
+/// #8117: a `Buffer` / `DataView` receiver must not reach the ordinary
+/// `ObjectHeader` walk in `obj_value_has_own_key`.
+///
+/// A buffer is a `BufferHeader` — no `class_id`, no `keys_array`. With no arm
+/// of its own it fell through to the ordinary arm, which read
+/// `(*obj).keys_array` out of the bytes that follow a buffer header and handed
+/// that to `js_array_length`, whose lazy-array probe dereferences `addr - 8`.
+///
+/// The two platforms fail differently, which is why this test asserts the
+/// ANSWER rather than merely "did not crash":
+///
+/// * Linux: the payload bytes clear the old `< 0x10000` magnitude floor and the
+///   dereference is a SIGSEGV. `b.readUInt8 = fn` reached through the dynamic
+///   `[[Set]]` (`js_put_value_set_dyn_ic_miss` -> `proxy::ordinary_set_with_
+///   receiver` -> `proxy::own_set_descriptor`) crashed 10/10.
+/// * macOS: the heap floor is high enough that the garbage usually reads as
+///   null, so it silently answered "no own key" for a property the buffer
+///   really owns.
+///
+/// The first assertion below fails on BOTH.
+#[test]
+fn buffer_own_key_comes_from_the_expando_table_not_the_object_walk() {
+    let addr = crate::buffer::buffer_alloc(8) as usize;
+    crate::buffer::buffer_set_own_prop(addr, "myFlag", 42.0);
+    let receiver = crate::value::js_nanbox_pointer(addr as i64);
+
+    let present = crate::string::js_string_from_bytes(b"myFlag".as_ptr(), 6);
+    let present_key = crate::value::js_nanbox_string(present as i64);
+    assert!(
+        obj_value_has_own_key(receiver, present_key),
+        "a buffer's own expando property must be reported as an own key"
+    );
+
+    // A `Buffer.prototype` method is INHERITED, not own. That is what lets
+    // `buf.readUInt8 = fn` install a shadowing own property instead of
+    // being treated as the redefinition of an existing one.
+    let inherited = crate::string::js_string_from_bytes(b"readUInt8".as_ptr(), 9);
+    let inherited_key = crate::value::js_nanbox_string(inherited as i64);
+    assert!(
+        !obj_value_has_own_key(receiver, inherited_key),
+        "a Buffer.prototype method is inherited, not an own key"
+    );
+
+    // And a key the buffer has never seen.
+    let absent = crate::string::js_string_from_bytes(b"nope".as_ptr(), 4);
+    let absent_key = crate::value::js_nanbox_string(absent as i64);
+    assert!(
+        !obj_value_has_own_key(receiver, absent_key),
+        "an unknown key is not an own key"
     );
 }

@@ -116,6 +116,17 @@ use barrier_arming::*;
 /// eligibility preflight is skipped on. Every write of the bit goes through
 /// `pin::pin_object`; `scripts/gc_pin_sites.py` enforces that in `lint`.
 mod pin;
+
+/// #7803 diagnostics: expose the pin-latch's header-coherence verdict to
+/// runtime-side producer traps (e.g. `object::this_binding::this_set_check`)
+/// so every instrument grades headers with the same rules.
+pub(crate) fn header_incoherence_for_diagnostics(
+    obj_type: u8,
+    size: u32,
+    flags: u8,
+) -> Option<String> {
+    pin::header_incoherence(obj_type, size, flags)
+}
 #[cfg(test)]
 pub(crate) use pin::test_reset_young_pin_latch;
 pub use pin::{
@@ -129,15 +140,19 @@ mod prefetch;
 
 mod copying;
 mod copying_first_cycle;
+mod copying_pointer_set;
 /// Per-scanner root attribution for the copied-minor root scan (#7915).
 mod scanner_profile;
 mod sticky_remembered;
 use copying::*;
 use copying_first_cycle::*;
+// Named rather than glob-imported: a glob does not propagate through the
+// transitive re-exports the gc submodules reach these through.
+use copying_pointer_set::{plausible_gc_header, CopyingPointer, CopyingPointerKind};
 use sticky_remembered::*;
 // The copied-minor pointer classifier is consumed by the weak-holder registry
 // pass in `crate::weakref` (#6182), which lives outside the gc module.
-pub(crate) use copying::CopyingPointerSet;
+pub(crate) use copying_pointer_set::CopyingPointerSet;
 // The hard ceiling every birth-generation threshold in `gc::types` must stay
 // under; asserted by `arena::tests::pointer_bearing_large_object_threshold_is_movable`.
 #[cfg(test)]
@@ -830,9 +845,9 @@ pub fn gc_init() {
     // reflect-metadata store were invisible to GC — values swept/moved under
     // live references, owner keys stale after evacuation.
     reg_scanner!(crate::object::descriptor_state::scan_descriptor_roots_mut);
-    // #6759 Phase C3a: shape records follow their keys array across
-    // evacuation (metadata-rewrite rekey only; the records hold no heap
-    // references and mark nothing).
+    // #8067: the descriptor table is weak. Live-object layout scans trace its
+    // ordered-keys slot; this scanner only follows existing forwarding records
+    // for descriptors and the pointer-keyed slot accelerator after evacuation.
     reg_scanner!(crate::object::shapes::scan_shape_table_rekey_mut);
     reg_scanner!(crate::proxy::scan_proxy_roots_mut);
     // Object/string-valued `err.<prop> = v` user props live as raw bits in

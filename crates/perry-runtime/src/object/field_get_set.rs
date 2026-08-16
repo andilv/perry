@@ -257,7 +257,7 @@ pub(crate) use accessors::scan_accessor_receiver_override_root_mut;
 mod buffer_own_prop;
 mod class_object_props;
 mod crypto_key;
-mod enumeration;
+pub(crate) mod enumeration;
 mod field_ops;
 mod get_field_by_name;
 #[cfg(test)]
@@ -330,15 +330,14 @@ pub(crate) use has_property::{
     wide_key_index_note_hit, WIDE_KEY_INDEX_MIN_KEYS,
 };
 pub use has_property::{js_in_operator, js_object_has_property};
-pub(crate) use ic_miss::pic_epoch_bump;
 pub(crate) use ic_miss::{
-    is_array_method_value_name, is_primitive_proto_method, is_timer_handle_method_key,
-    set_method_value_name,
+    is_array_method_value_name, is_primitive_proto_method, set_method_value_name,
+    timer_handle_method_name_static,
 };
 pub use ic_miss::{
     js_object_get_field_by_name_f64, js_object_get_field_by_property_id_f64,
     js_object_get_field_ic_miss, js_object_set_field_by_property_id, js_private_brand_check,
-    js_private_guard, PicCache, PERRY_IC_EPOCH, PIC_CACHE_WORDS,
+    js_private_guard, PicCache, PIC_CACHE_WORDS,
 };
 
 #[cfg(test)]

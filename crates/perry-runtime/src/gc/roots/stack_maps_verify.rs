@@ -54,10 +54,9 @@ pub(super) fn visit(
     let mut slow: Vec<ResolvedRoot> = Vec::new();
     let mut stats = unwind::visit(index, &mut |root: ResolvedRoot| {
         slow.push(root);
-        visit(MutableRootSlot {
-            kind: super::MutableRootSlotKind::NativeStack,
-            ptr: root.address as *mut u64,
-        });
+        // Same provenance publication as the non-verify walks, so a latch
+        // fired under PERRY_STACKMAP_WALKER=verify names its frame too.
+        root.visit_with_context(visit);
     });
 
     if !addresses_agree(&fast, &slow) {
@@ -176,6 +175,7 @@ fn describe(out: &mut String, index: &StackMapIndex, root: &ResolvedRoot) {
 /// of the very data under suspicion. This is the same set the walker's
 /// `match_records` containment check consults, so a dump gated on it reads
 /// only what the walk already read.
+#[cfg(any(target_arch = "aarch64", test))]
 fn map_vouches_for(index: &StackMapIndex, function_address: usize) -> bool {
     index
         .function_starts
@@ -240,7 +240,7 @@ mod tests {
     /// An index that vouches for NO function address, so the report never
     /// dereferences the synthetic addresses above.
     fn empty_index() -> StackMapIndex {
-        super::super::index_records(Vec::new(), Vec::new())
+        super::super::index_records(Vec::new(), Vec::new(), Vec::new())
     }
 
     #[test]

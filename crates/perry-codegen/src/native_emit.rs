@@ -305,6 +305,10 @@ pub fn compile_module_units_native(
         Ok("1" | "all")
     ) || std::env::var("PERRY_CODEGEN_UNIT_TIMINGS").is_ok();
     let unit_total = parts.len();
+    // Root lowering was selected while the module was produced. Preserve that
+    // exact backend choice across the worker boundary instead of re-reading
+    // fresh thread-local defaults in each LLVM thread (#8070).
+    let native_roots = crate::codegen::helpers::native_stack_roots_enabled();
     if show_progress {
         eprintln!(
             "[perry] codegen: {module_prefix}: freezing {unit_total} codegen units for worker threads"
@@ -331,10 +335,15 @@ pub fn compile_module_units_native(
             unit.estimated_bytes,
             unit.function_count,
             unit.max_function_bytes,
+            native_roots,
         );
-        let unit_bytes =
-            crate::inprocess::optimize_and_emit_module(&module, &effective_target, &args)
-                .map_err(|e| anyhow!("unit {i}: {e:#}"))?;
+        let unit_bytes = crate::inprocess::optimize_and_emit_module(
+            &module,
+            &effective_target,
+            &args,
+            native_roots,
+        )
+        .map_err(|e| anyhow!("unit {i}: {e:#}"))?;
         let obj = crate::linker::finish_native_emission(unit_bytes, &effective_target, &args)
             .map_err(|e| anyhow!("unit {i}: {e:#}"))?;
         log::debug!(
@@ -383,8 +392,16 @@ pub fn compile_module_units_native(
         std::sync::mpsc::sync_channel::<(usize, Result<FrozenUnit>)>(jobs.max(1));
     let receiver = std::sync::Mutex::new(receiver);
     std::thread::scope(|scope| {
-        for _ in 0..jobs {
-            scope.spawn(|| loop {
+        for worker_index in 0..jobs {
+            // LLVM recursion depth scales with function size, and a post-RS4GC
+            // relocation-fan-out function reaches millions of instructions
+            // (#8082) — Rust's default 2 MiB worker stack SIGBUSes on the
+            // guard page mid-pass with no crash report. Reserve a deep stack;
+            // it is address space, not resident memory, until touched.
+            std::thread::Builder::new()
+                .name(format!("perry-llvm-unit-{worker_index}"))
+                .stack_size(64 * 1024 * 1024)
+                .spawn_scoped(scope, || loop {
                 let received = receiver
                     .lock()
                     .expect("native freeze queue poisoned")
@@ -407,7 +424,8 @@ pub fn compile_module_units_native(
                     );
                 }
                 *slots[i].lock().expect("native codegen-unit slot poisoned") = Some(out);
-            });
+                })
+                .expect("spawn LLVM unit worker");
         }
         let freeze_started = std::time::Instant::now();
         let report_step = (unit_total / 20).max(1);
@@ -508,7 +526,7 @@ pub fn compile_module_units_diff(
 /// The plan argv for a natively-built module. Same decision code as the text
 /// path (`build_clang_compile_plan`), with the byte-size input taken from the
 /// render-free size estimate the codegen-unit balancer already uses.
-fn plan_for(llmod: &LlModule, target: Option<&str>) -> (String, Vec<String>) {
+fn plan_for(llmod: &LlModule, target: Option<&str>, native_roots: bool) -> (String, Vec<String>) {
     let funcs = llmod.deduped_function_refs();
     let est_bytes: usize = funcs.iter().map(|f| f.estimated_ir_bytes()).sum();
     let max_fn_bytes = funcs
@@ -516,7 +534,7 @@ fn plan_for(llmod: &LlModule, target: Option<&str>) -> (String, Vec<String>) {
         .map(|f| f.estimated_ir_bytes())
         .max()
         .unwrap_or(0);
-    crate::linker::native_plan_args(target, est_bytes, funcs.len(), max_fn_bytes)
+    crate::linker::native_plan_args(target, est_bytes, funcs.len(), max_fn_bytes, native_roots)
 }
 
 pub fn compile_module_native(
@@ -527,13 +545,19 @@ pub fn compile_module_native(
     let context = Context::create();
     let module = build_native_module(&context, llmod)?;
     debug_dump(&module, module_prefix);
-    let (effective_target, args) = plan_for(llmod, target);
+    let native_roots = crate::codegen::helpers::native_stack_roots_enabled();
+    let (effective_target, args) = plan_for(llmod, target, native_roots);
     // #7982: under the statepoint backends the plan asks for `-S`, so this
     // returns assembler TEXT. It must go through the compact-map rewrite and
     // the assembler before it can be called an object — the textual path has
     // always done this, the native path silently did not, and the link died
     // with `ld: unknown file type`.
-    let bytes = crate::inprocess::optimize_and_emit_module(&module, &effective_target, &args)?;
+    let bytes = crate::inprocess::optimize_and_emit_module(
+        &module,
+        &effective_target,
+        &args,
+        native_roots,
+    )?;
     crate::linker::finish_native_emission(bytes, &effective_target, &args)
 }
 
@@ -576,33 +600,147 @@ fn debug_dump(module: &Module<'_>, module_prefix: &str) {
 mod tests {
     use super::*;
     use crate::module::LlModule;
-    use crate::types::{I32, I64, PTR, VOID};
+    use crate::types::{I1, I32, I64, PTR, VOID};
 
     fn precise_root_fixture(extra_plain_function: bool) -> LlModule {
-        let mut module = LlModule::new(crate::codegen::default_target_triple());
+        precise_root_fixture_for(
+            &crate::codegen::default_target_triple(),
+            extra_plain_function,
+        )
+    }
+
+    fn precise_root_fixture_for(triple: &str, extra_plain_function: bool) -> LlModule {
+        let mut module = LlModule::new(triple);
+        module.declare_function_with_ret_attrs("js_shadow_frame_enter", PTR, &[I32], "nonnull");
+        module.declare_function("js_shadow_frame_pop", VOID, &[I64]);
         module.declare_function("js_shadow_slot_bind", VOID, &[I32, PTR]);
         module.declare_function("js_map_alloc", I64, &[I32]);
+        module.declare_function("may_collect", I64, &[]);
 
         let function = module.define_function("native_root_diff_fixture", I64, vec![]);
         function.enable_shadow_frame(0);
-        let root_index = function
-            .reserve_shadow_slot()
-            .expect("native root fixture reserves one precise-root slot");
-        let root = function.alloca_entry(I64);
-        function.entry_allocas_push_store(I64, "0", &root);
-        function.entry_setup_call_void(
-            "js_shadow_slot_bind",
-            &[(I32, &root_index.to_string()), (PTR, &root)],
-        );
+        let mut constant_roots = Vec::new();
+        let mut dynamic_roots = Vec::new();
+        for roots in [&mut constant_roots, &mut dynamic_roots] {
+            for _ in 0..8 {
+                let root_index = function
+                    .reserve_shadow_slot()
+                    .expect("native root fixture reserves a precise-root slot");
+                let root = function.alloca_entry(I64);
+                function.entry_allocas_push_store(I64, "0", &root);
+                function.entry_setup_call_void(
+                    "js_shadow_slot_bind",
+                    &[(I32, &root_index.to_string()), (PTR, &root)],
+                );
+                roots.push(root);
+            }
+        }
         let entry = function.create_block("entry");
-        let value = entry.call(I64, "js_map_alloc", &[(I32, "0")]);
-        entry.store(I64, &value, &root);
-        entry.ret(I64, &value);
+        // The C-API builder folds this select while whole-module textual IR
+        // retains it until SCCP. Both shapes must converge BEFORE
+        // RS4GC decides which SSA roots cross the safepoint (#8065).
+        for root in &constant_roots {
+            let constant = entry.select(
+                I1,
+                "false",
+                I64,
+                "9222246136947933188",
+                "9222246136947933185",
+            );
+            entry.store(I64, &constant, root);
+        }
+        for root in &dynamic_roots {
+            let dynamic = entry.call(I64, "js_map_alloc", &[(I32, "0")]);
+            entry.store(I64, &dynamic, root);
+        }
+        let _safepoint = entry.call(I64, "may_collect", &[]);
+        // Both values stay live across may_collect. The dynamic one is the
+        // positive witness: pre-RS4GC canonicalization must not erase it.
+        let mut observed = entry.load(I64, &dynamic_roots[0]);
+        for root in constant_roots.iter().chain(dynamic_roots.iter().skip(1)) {
+            let value = entry.load(I64, root);
+            observed = entry.xor(I64, &observed, &value);
+        }
+        entry.ret(I64, &observed);
         if extra_plain_function {
             let plain = module.define_function("native_root_diff_plain", VOID, vec![]);
             plain.create_block("entry").ret_void();
         }
         module
+    }
+
+    fn assert_dynamic_root_survives_rs4gc(module: &LlModule, label: &str) {
+        let target = crate::codegen::default_target_triple();
+        let text_ir = module.to_ir();
+        let context = Context::create();
+        let native_ir = build_native_module(&context, module)
+            .expect("native root witness constructs")
+            .print_to_string()
+            .to_string();
+        for (arm, ir) in [("text", text_ir), ("native", native_ir)] {
+            let rewritten = crate::inprocess::statepoint_rewritten_ir(
+                &ir,
+                &target,
+                &format!("{label}_{arm}_root_witness"),
+            )
+            .unwrap_or_else(|e| panic!("{arm} root witness must run RS4GC: {e:#}"));
+            assert!(
+                rewritten.contains("\"gc-live\"(ptr addrspace(1)"),
+                "{arm} arm lost the positive dynamic root before RS4GC:\n{rewritten}"
+            );
+            assert!(
+                rewritten.contains("gc.relocate"),
+                "{arm} arm did not relocate the live dynamic root:\n{rewritten}"
+            );
+        }
+    }
+
+    fn compact_gc_map_section_name() -> &'static [u8] {
+        if cfg!(target_os = "macos") {
+            b"__perry_gcmap"
+        } else if cfg!(target_os = "windows") {
+            b".pgcmap"
+        } else {
+            b".perry_gcmap"
+        }
+    }
+
+    fn object_contains(object: &[u8], needle: &[u8]) -> bool {
+        object.windows(needle.len()).any(|window| window == needle)
+    }
+
+    fn assert_compact_gc_map(object: &[u8], label: &str) {
+        let section_name = compact_gc_map_section_name();
+        assert!(
+            object_contains(object, section_name),
+            "{label} object has no compact GC-map section"
+        );
+        assert!(
+            object_contains(object, b"PGCM"),
+            "{label} compact GC-map section has no map payload"
+        );
+    }
+
+    fn assert_no_compact_gc_map(object: &[u8], label: &str) {
+        assert!(
+            !object_contains(object, compact_gc_map_section_name()),
+            "{label} shadow-stack object unexpectedly has a compact GC-map section"
+        );
+        assert!(
+            !object_contains(object, b"PGCM"),
+            "{label} shadow-stack object unexpectedly has a compact GC-map payload"
+        );
+    }
+
+    fn compile_text_units_on_producer(units: &[String]) -> Vec<u8> {
+        let objects = units
+            .iter()
+            .map(|unit| {
+                crate::linker::compile_ll_to_object(unit, None)
+                    .expect("trusted text unit emits an object")
+            })
+            .collect::<Vec<_>>();
+        crate::linker::merge_unit_objects(&objects).expect("trusted text units partial-link")
     }
 
     #[test]
@@ -619,6 +757,7 @@ mod tests {
             !text_ir.contains("call void @js_shadow_slot_bind"),
             "native-root lowering must consume the shadow-stack bind:\n{text_ir}"
         );
+        assert_dynamic_root_survives_rs4gc(&module, "direct");
 
         let text = crate::linker::compile_ll_to_object(&text_ir, None)
             .expect("trusted text arm emits an object");
@@ -635,10 +774,16 @@ mod tests {
     fn split_native_construction_lowers_precise_roots_before_rs4gc() {
         let _native = crate::codegen::helpers::NativeRootsPin::native();
         let text_module = precise_root_fixture(true);
+        assert_dynamic_root_survives_rs4gc(&text_module, "split");
         let units = text_module.render_codegen_units(2);
         assert_eq!(units.len(), 2, "fixture must exercise two real units");
-        let text = crate::linker::compile_units_to_object(&units, None)
-            .expect("trusted text units emit and partial-link");
+        // Compile the trusted units sequentially on this pinned producer
+        // thread. Going through compile_units_to_object here made the control
+        // machine-dependent: on a high-core host it spawned workers too, both
+        // arms lost the same thread-local decision, and byte equality passed
+        // while BOTH objects omitted the map (#8070).
+        let text = compile_text_units_on_producer(&units);
+        assert_compact_gc_map(&text, "trusted text");
 
         let mut native_module = precise_root_fixture(true);
         let native = compile_module_units_native(
@@ -648,10 +793,76 @@ mod tests {
             "split_native_root_diff_fixture",
         )
         .expect("direct native units emit and partial-link");
+        assert_compact_gc_map(&native, "split native");
         assert_eq!(
             native, text,
             "split native units must freeze finalized precise-root IR, not \
              pre-lowered shadow-slot calls"
+        );
+    }
+
+    /// #8087: the same construction-path comparison, pinned to an **ELF**
+    /// target rather than the host's.
+    ///
+    /// The three sibling tests above ran only against the host triple, so on a
+    /// macOS developer machine they exercised Mach-O exclusively — and Mach-O
+    /// records no `STT_FILE` symbol. That is precisely why a module-name
+    /// difference that made all of them fail on the Linux runner was invisible
+    /// locally for two days. Naming the object format explicitly keeps this
+    /// check honest on every host.
+    #[test]
+    fn native_and_text_arms_agree_on_an_elf_target() {
+        const ELF_TRIPLE: &str = "x86_64-unknown-linux-gnu";
+        let _native = crate::codegen::helpers::NativeRootsPin::native();
+        let module = precise_root_fixture_for(ELF_TRIPLE, false);
+
+        let text = crate::linker::compile_ll_to_object(&module.to_ir(), Some(ELF_TRIPLE))
+            .expect("trusted text arm emits an ELF object");
+        let native = compile_module_native(&module, Some(ELF_TRIPLE), "native_root_elf_fixture")
+            .expect("direct native arm emits an ELF object");
+
+        assert_eq!(
+            &text[..4],
+            b"\x7fELF",
+            "fixture must actually produce ELF, or this test proves nothing"
+        );
+        assert_eq!(
+            native, text,
+            "native and text construction must emit byte-identical ELF objects; \
+             a difference here is a recorded-name or lowering divergence (#8087)"
+        );
+    }
+
+    #[test]
+    fn split_native_construction_propagates_shadow_backend_to_workers() {
+        let _shadow = crate::codegen::helpers::NativeRootsPin::shadow();
+        let text_module = precise_root_fixture(true);
+        let text_ir = text_module.to_ir();
+        assert!(
+            text_ir.contains("call void @js_shadow_slot_bind"),
+            "negative control must demonstrably use the shadow-stack lowering:\n{text_ir}"
+        );
+        assert!(
+            !text_ir.contains("alloca ptr addrspace(1)"),
+            "negative control must not contain native-stack root allocas:\n{text_ir}"
+        );
+        let units = text_module.render_codegen_units(2);
+        assert_eq!(units.len(), 2, "fixture must exercise two real units");
+        let text = compile_text_units_on_producer(&units);
+        assert_no_compact_gc_map(&text, "trusted text");
+
+        let mut native_module = precise_root_fixture(true);
+        let native = compile_module_units_native(
+            &mut native_module,
+            2,
+            None,
+            "split_shadow_root_diff_fixture",
+        )
+        .expect("direct shadow-stack native units emit and partial-link");
+        assert_no_compact_gc_map(&native, "split native");
+        assert_eq!(
+            native, text,
+            "split native workers must preserve the producer's shadow-stack backend decision"
         );
     }
 
@@ -704,15 +915,20 @@ pub fn compile_module_diff(
     let text = llmod.to_ir();
     let ctx_text = Context::create();
     let m_text = crate::inprocess::parse_ir_text(&ctx_text, &text, "perry_native_module")?;
-    let (effective_target, args) = plan_for(llmod, target);
+    let native_roots = crate::codegen::helpers::native_stack_roots_enabled();
+    let (effective_target, args) = plan_for(llmod, target, native_roots);
 
     let ctx_native = Context::create();
     let native = build_native_module(&ctx_native, llmod);
     match native {
         Err(e) => {
             eprintln!("perry: [ir-diff] native construction FAILED (text arm still used): {e:#}");
-            let bytes =
-                crate::inprocess::optimize_and_emit_module(&m_text, &effective_target, &args)?;
+            let bytes = crate::inprocess::optimize_and_emit_module(
+                &m_text,
+                &effective_target,
+                &args,
+                native_roots,
+            )?;
             crate::linker::finish_native_emission(bytes, &effective_target, &args)
         }
         Ok(m_native) => {
@@ -728,10 +944,18 @@ pub fn compile_module_diff(
             } else {
                 (String::new(), String::new())
             };
-            let bytes_native =
-                crate::inprocess::optimize_and_emit_module(&m_native, &effective_target, &args)?;
-            let bytes_text =
-                crate::inprocess::optimize_and_emit_module(&m_text, &effective_target, &args)?;
+            let bytes_native = crate::inprocess::optimize_and_emit_module(
+                &m_native,
+                &effective_target,
+                &args,
+                native_roots,
+            )?;
+            let bytes_text = crate::inprocess::optimize_and_emit_module(
+                &m_text,
+                &effective_target,
+                &args,
+                native_roots,
+            )?;
             if bytes_text == bytes_native {
                 eprintln!(
                     "perry: [ir-diff] OK — native and text arms emit byte-identical objects \
