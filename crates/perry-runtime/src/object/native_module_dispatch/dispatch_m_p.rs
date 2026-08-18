@@ -44,8 +44,10 @@ pub(crate) unsafe fn nm_dispatch_module(ctx: &NmCtx, module_name: &str, method_n
         ("module", "flushCompileCache") => crate::process::js_module_flush_compile_cache(),
         ("module", "getCompileCacheDir") => crate::process::js_module_get_compile_cache_dir(),
         ("module", "getSourceMapsSupport") => crate::process::js_module_get_source_maps_support(),
+        ("module", "findSourceMap") => crate::process::js_module_find_source_map(arg(0)),
         ("module", "isBuiltin") => crate::process::js_module_is_builtin(arg(0)),
-        ("module", "Module") => crate::process::js_module_module_new(arg(0)),
+        ("module", "Module") => crate::process::js_module_module_new(arg(0), arg(1)),
+        ("module", "SourceMap") => crate::process::js_module_source_map_new(arg(0), arg(1)),
         ("module", "_findPath") => crate::process::js_module_find_path(arg(0), arg(1), arg(2)),
         ("module", "_initPaths") => crate::process::js_module_init_paths(),
         ("module", "_load") => crate::process::js_module_load(arg(0), arg(1), arg(2)),
@@ -59,12 +61,14 @@ pub(crate) unsafe fn nm_dispatch_module(ctx: &NmCtx, module_name: &str, method_n
         }
         ("module", "register") => crate::process::js_module_register(arg(0), arg(1), arg(2)),
         ("module", "registerHooks") => crate::process::js_module_register_hooks(arg(0)),
+        ("module", "runMain") => crate::object::js_module_run_main(),
         ("module", "setSourceMapsSupport") => {
             crate::process::js_module_set_source_maps_support(arg(0), arg(1))
         }
         ("module", "stripTypeScriptTypes") => {
             crate::process::js_module_strip_typescript_types(arg(0), arg(1))
         }
+        ("module", "syncBuiltinESMExports") => crate::object::js_module_sync_builtin_esm_exports(),
         _ => f64::from_bits(JSValue::undefined().bits()),
     }
 }
@@ -595,24 +599,26 @@ pub(crate) unsafe fn nm_dispatch_perf(ctx: &NmCtx, module_name: &str, method_nam
         // ── PerformanceObserverEntryList (the callback `list` arg) ──
         ("perf_observer_list", "getEntries") => crate::perf_hooks::current_list_get_entries(),
         ("perf_observer_list", "getEntriesByType") => {
+            crate::perf_hooks::validate_perf_list_filter_arg(arg(0), "type", args_len == 0);
             crate::perf_hooks::current_list_get_by_type(arg(0))
         }
         ("perf_observer_list", "getEntriesByName") => {
+            crate::perf_hooks::validate_perf_list_filter_arg(arg(0), "name", args_len == 0);
             crate::perf_hooks::current_list_get_by_name(arg(0))
         }
 
-        // ── Histogram instance methods (#1336) ──
-        // Every method is a no-op on the stub — `enable`/`disable`/`reset`
-        // don't sample anything, `record`/`recordDelta`/`add` discard input.
-        // `percentile(p)` returns 0 (no samples => no rank).
-        ("perf_histogram", "enable")
-        | ("perf_histogram", "disable")
-        | ("perf_histogram", "reset")
-        | ("perf_histogram", "record")
-        | ("perf_histogram", "recordDelta")
-        | ("perf_histogram", "add") => crate::perf_hooks::js_perf_histogram_noop(),
-        ("perf_histogram", "percentile") | ("perf_histogram", "percentileBigInt") => {
-            crate::perf_hooks::js_perf_histogram_percentile(arg(0))
+        // ── Histogram instance methods ──
+        // `record`/`recordDelta`/`add`/`reset`/`percentile*`/`toJSON`, plus the
+        // ELD `enable`/`disable` lifecycle, all re-derive the instance from the
+        // receiver (`perf_histogram::histogram_method`).
+        ("perf_histogram", _) => {
+            let args: &[f64] = if args_ptr.is_null() || args_len == 0 {
+                &[]
+            } else {
+                std::slice::from_raw_parts(args_ptr, args_len)
+            };
+            crate::perf_histogram::histogram_method(obj, method_name, args)
+                .unwrap_or_else(|| f64::from_bits(JSValue::undefined().bits()))
         }
 
         // ── timers module ──

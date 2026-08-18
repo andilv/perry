@@ -5,11 +5,13 @@ JavaScript number semantics, and normal objects and arrays remain managed
 values. At boundaries where byte width and C-compatible layout are part of
 correctness, `perry/native` provides an explicit, opt-in contract.
 
-```typescript
+```typescript,no-test
 import {
-  type u32,
-  type u64,
-  type f32,
+  u8,
+  i32,
+  u32,
+  u64,
+  f32,
   type pod,
   type PodView,
   NativeArena,
@@ -18,11 +20,22 @@ import {
   offsetof,
 } from "perry/native";
 
+const opcode = u8(inputOpcode);
+const flags = u32(inputFlags);
+const sequence = u64(inputSequence);
+const gain = f32(inputGain);
+
 type PacketHeader = pod<{
   flags: u32;
   sequence: u64;
   gain: f32;
 }>;
+
+const header: PacketHeader = {
+  flags: u32(inputFlags),
+  sequence: u64(inputSequence),
+  gain: f32(inputGain),
+};
 
 const byteLength = sizeof<PacketHeader>();
 const alignment = alignof<PacketHeader>();
@@ -42,6 +55,7 @@ ABI verifier already supports:
 
 | Type | Native representation |
 |---|---|
+| `u8`, `byte` | unsigned 8-bit integer (`byte` is a type alias) |
 | `i32` | signed 32-bit integer |
 | `i64` | signed 64-bit integer |
 | `u32` | unsigned 32-bit integer |
@@ -54,12 +68,33 @@ These names replace the internal-looking `PerryI32`, `PerryU64`,
 `PerryF32`, and related spellings in new application code. The old names
 remain available as compatibility aliases.
 
-The scalar aliases currently establish representation inside a `pod` layout
-and at supported native ABI boundaries. They do not change the semantics of
-standalone TypeScript arithmetic. Checked scalar conversion functions,
-additional widths (`i8`, `i16`, `u8`, `u16`, and `isize`), and guaranteed
-native lanes across general-purpose collections are later parts of the native
-value profile.
+Each scalar name is both a type and a checked conversion function. Integer
+conversions accept only finite integral values in range; unsigned conversions
+also reject negative values. Because standalone results remain
+JavaScript-compatible numbers, `i64`, `u64`, and `usize` reject values outside
+the safe-integer range rather than returning an imprecise number. `f32` makes
+binary32 rounding explicit and rejects values that are non-finite before or
+after rounding; `f64` validates that its input is finite. A non-number throws a
+`TypeError`; an unrepresentable number throws a `RangeError`.
+
+```typescript,no-test
+import { u8, i32, u32, u64, f32 } from "perry/native";
+
+const opcode = u8(dynamicOpcode);
+const offset = i32(dynamicOffset);
+const count = u32(dynamicCount);
+const sequence = u64(dynamicSequence);
+const ratio = f32(computation);
+```
+
+The scalar aliases establish representation inside a `pod` layout and at
+supported native ABI boundaries. A matching checked conversion may initialize
+a POD field from a dynamic value without forcing the whole record back to an
+ordinary object; the conversion guard runs before the value enters the native
+record. They do not change the semantics of
+standalone TypeScript arithmetic. Additional widths (`i8`, `i16`, `u16`, and
+`isize`) and guaranteed native lanes across general-purpose
+collections are later parts of the native value profile.
 
 ## POD records
 

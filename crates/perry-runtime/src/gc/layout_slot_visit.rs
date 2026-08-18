@@ -15,73 +15,62 @@ pub(super) unsafe fn visit_gc_layout_slot_descriptors(
     visit: &mut dyn FnMut(GcMutableSlotDescriptor),
 ) {
     let mut child_slots = gc_child_slots(header);
-    // Capture the authoritative descriptor facts. `gc_child_slots` has already
-    // copied the descriptor's keys edge into the compatibility header scratch
-    // slot; a copying visit can rewrite that slot, after which the descriptor
-    // table is updated below.
-    let object_shape_facts = if (*header).obj_type == GC_TYPE_OBJECT {
-        let obj = (header as *mut u8).add(GC_HEADER_SIZE) as *mut crate::object::ObjectHeader;
-        let descriptor = crate::object::shapes::object_shape_descriptor(obj);
-        let old_keys = descriptor
-            .map(|facts| facts.keys as usize as *mut crate::array::ArrayHeader)
-            .unwrap_or((*obj).keys_array);
-        let live_inline_slot_count = descriptor
-            .map(|facts| facts.live_inline_slot_count)
-            .unwrap_or((*obj).field_count);
-        if old_keys.is_null() {
-            Some((obj, 0, 0, live_inline_slot_count))
-        } else if crate::value::addr_class::try_read_tracked_gc_header(old_keys as usize)
-            .is_some_and(|keys_header| (*keys_header.as_ptr()).obj_type == GC_TYPE_ARRAY)
-        {
-            // A forwarded tracked array still carries GC_TYPE_ARRAY in
-            // its from-space header. The length helper follows that stub,
-            // so a sibling whose shared keys edge was already rewritten
-            // can still validate against the descriptor's new pointer.
-            Some((
-                obj,
-                old_keys as u64,
-                descriptor
-                    .map(|facts| facts.logical_key_count)
-                    .unwrap_or_else(|| {
-                        crate::array::keys_array_len_capped_to_capacity(old_keys) as u32
-                    }),
-                live_inline_slot_count,
-            ))
-        } else {
-            // Do not dereference corrupt/unmapped header words merely because
-            // their sibling word happens to look like a ShapeId. The
-            // authoritative header edge below is still enumerated; only
-            // redundant descriptor synchronization is skipped.
-            None
+    // #8213: drained async box cells are weak registry entries during a full
+    // trace. A closure proven live by the mark set is their owner, so enumerate
+    // the malloc-side JSValue payload as an external child slot. Requiring a
+    // marked/pinned closure prevents generic descriptor walks over dead old
+    // objects from accidentally resurrecting the cycle this edge is meant to
+    // break.
+    if (*header).obj_type == GC_TYPE_CLOSURE
+        && (*header).gc_flags & (GC_FLAG_MARKED | GC_FLAG_PINNED) != 0
+        && full_trace_active()
+    {
+        let closure = (header as *mut u8).add(GC_HEADER_SIZE) as usize;
+        crate::closure::visit_closure_box_payload_slots_mut(closure, |slot| {
+            visit(fixed_slot(slot));
+        });
+    }
+    // #8112: the authoritative ordered-keys edge, taken from the descriptor
+    // `gc_child_slots` already resolved for this receiver. It is the boxed
+    // record's OWN `keys` word, so the collector marks through it and rewrites
+    // it in place — the descriptor is the root and the rewritable location.
+    //
+    // Never enumerate the HashMap BUCKET as a GC slot: dirty-page work may
+    // retain enumerated slot addresses across budgeted resumptions, during
+    // which descriptor insertion can reallocate the table. Boxing the record
+    // is what answers that — the bucket moves, the record does not.
+    //
+    // Liveness is an ephemeron relation with two halves. A YOUNG carrier is
+    // traced, so emitting the edge here marks the keys array exactly while
+    // that receiver lives. An OLD carrier is not traced by a minor at all —
+    // and because the record is SHARED, one sibling's rewrite creates an
+    // old→young edge for a parent the minor never visits, which no per-parent
+    // remembered-set page can describe. That half is the `old_carrier` gate
+    // armed below and rooted by `shapes::scan_shape_table_rekey_mut`.
+    // `PERRY_GC_VERIFY_EVACUATION` is what established the second half is
+    // needed: without it the verifier aborts on a `slot_page_ever_dirty=false`
+    // old→young edge through this word.
+    let shape_keys_edge = if (*header).obj_type == GC_TYPE_OBJECT {
+        // A receiver the minor will not enumerate for itself arms the table's
+        // ephemeron gate. The test is "not in the nursery", not "in old-gen":
+        // a `gc_malloc`'d large object and an immortal bootstrap resident are
+        // both outside the young generation and both invisible to a minor, and
+        // over-arming the gate only costs one extra rooted record until the
+        // next full trace recomputes it. A to-space survivor IS nursery, so a
+        // young carrier still relies on the edge emitted just below.
+        let user_ptr = (header as *mut u8).add(GC_HEADER_SIZE);
+        if !crate::arena::pointer_in_nursery(user_ptr as usize) {
+            crate::object::shapes::note_old_generation_carrier(child_slots.object_shape);
         }
+        crate::object::gc_shape_keys_edge_slot(child_slots.object_shape)
     } else {
         None
     };
     if let Some(slot) = child_slots.take_prefix_child_slot() {
         visit(fixed_slot(slot).with_layout(HeapChildSlotReadKind::Prefix));
     }
-    // #8067: the header keys slot above is the sole strong edge. Once its
-    // visitor callback has run, mirror an immediate rewrite into the weak
-    // descriptor. Never enumerate the HashMap bucket as a GC slot: dirty-page
-    // work may retain enumerated slot addresses across budgeted resumptions,
-    // during which descriptor insertion can reallocate the table. A deferred
-    // visitor leaves old==new here; the metadata forwarding pass repairs it
-    // after copying. RegExp uses its dedicated GC slot kind and never enters
-    // the ObjectHeader branch above.
-    if let Some((obj, old_keys, logical_key_count, live_inline_slot_count)) = object_shape_facts {
-        let new_keys = (*obj).keys_array as u64;
-        // Mark, verify, and deferred dirty scans leave the header edge
-        // unchanged. Only a copying rewrite needs to borrow and update the
-        // weak descriptor table.
-        if new_keys != old_keys {
-            crate::object::shapes::synchronize_live_object_shape_descriptor_after_header_visit(
-                obj,
-                old_keys,
-                new_keys,
-                logical_key_count,
-                live_inline_slot_count,
-            );
-        }
+    if let Some(slot) = shape_keys_edge {
+        visit(fixed_slot(slot).with_layout(HeapChildSlotReadKind::Prefix));
     }
     if let Some(slot) = child_slots.take_meta_child_slot() {
         visit(fixed_slot(slot).with_layout(HeapChildSlotReadKind::Prefix));
@@ -101,7 +90,7 @@ pub(super) unsafe fn visit_gc_layout_slot_descriptors(
             if raw_numeric_object_slots != 0 {
                 record_layout_raw_numeric_object_field_range_skipped(raw_numeric_object_slots);
             }
-            visit(GcMutableSlotDescriptor::PointerFreeRange);
+            visit(GcMutableSlotDescriptor::PointerFreeRange(range));
         }
         HeapPayloadSlotScan::AllPointers {
             raw_numeric_object_slots,
@@ -224,6 +213,28 @@ pub(super) unsafe fn visit_gc_rewrite_slot_descriptors(
             // entries reachable only through a >cap map would be swept
             // while live and never rewritten after a move.
             if size > capacity || size > 16_000_000 || (*map).entries.is_null() {
+                return;
+            }
+            // Defensive tripwire (# fabricated-Map): if a fabricated Map
+            // header ever slips past `plausible_gc_header`, the `entries`
+            // field would be a NaN-boxed JSValue (top bits 0x7FFD…) or some
+            // other non-pointer word read from the original object's
+            // payload. Reject it rather than dereference a derived slot
+            // range from a garbage base. This is a backstop; the primary
+            // fix is the fixed-layout size check in `plausible_gc_header`.
+            // Use the shared heap-address classifier so the bound is
+            // platform-correct (a fixed `>> 47` cutoff would false-reject
+            // genuine entries on aarch64 Linux, where user space reaches
+            // bit 48) and so low / handle-band garbage is rejected too,
+            // not only the NaN-box signature.
+            let entries_addr = (*map).entries as usize;
+            if !crate::value::addr_class::is_plausible_heap_addr(entries_addr) {
+                if crate::gc::gc_diag_enabled() {
+                    eprintln!(
+                        "[gc-tripwire] Map entries is not a plausible heap address: {:#x} (fabricated Map?)",
+                        entries_addr
+                    );
+                }
                 return;
             }
             visit(GcMutableSlotDescriptor::Range {

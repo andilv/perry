@@ -146,13 +146,13 @@ pub extern "C" fn js_object_get_field_by_name(
                     if class_id != 0
                         && class_id != super::super::native_module::NATIVE_MODULE_CLASS_ID
                     {
-                        let keys = (*o).keys_array;
+                        let keys = crate::object::object_keys_array(o);
                         if !keys.is_null()
                             && ((keys as u64) >> 48) == 0
                             && crate::value::addr_class::is_above_handle_band(keys as usize)
                         {
                             let alloc_limit = std::cmp::max(
-                                (*o).field_count,
+                                crate::object::object_live_slot_count(o),
                                 crate::object::INLINE_SLOT_FLOOR as u32,
                             ) as usize;
                             if let Some(idx) = super::super::prop_plan::read_plan_lookup(
@@ -822,6 +822,11 @@ pub extern "C" fn js_object_get_field_by_name(
                         primitive_builtin_prototype_property(b"Number", key, f64::from_bits(bits))
                     {
                         return v;
+                    }
+                    if let Some(bound) =
+                        bind_primitive_proto_method_static(f64::from_bits(bits), key_bytes)
+                    {
+                        return bound;
                     }
                 }
             }
@@ -1562,9 +1567,8 @@ pub extern "C" fn js_object_get_field_by_name(
                 if let Some(v) = primitive_builtin_prototype_property(b"Number", key, f) {
                     return v;
                 }
-                if is_primitive_proto_method(name_bytes) {
-                    let result = super::super::js_class_method_bind(f, name_ptr, name_len);
-                    return JSValue::from_bits(result.to_bits());
+                if let Some(bound) = bind_primitive_proto_method_static(f, name_bytes) {
+                    return bound;
                 }
             }
             return JSValue::undefined();

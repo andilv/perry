@@ -179,6 +179,7 @@ mod artifacts;
 mod boxed_locals;
 mod closure;
 mod closure_collect;
+mod ctor_arity;
 #[cfg(test)]
 mod emission_order_tests;
 mod entry;
@@ -201,6 +202,8 @@ mod opts;
 mod ordinary_param_guard_tests;
 mod param_guard;
 mod spec_abi;
+#[cfg(test)]
+mod spec_preserve_none_tests;
 mod spec_return_proof;
 #[cfg(test)]
 mod spec_self_recursion_tests;
@@ -990,6 +993,13 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             I32,
             "0",
         );
+        // #8122: the inline-`new` header image, composed at module init
+        // (`string_pool.rs`) for the classes `class_header_images` admits.
+        llmod.add_internal_global(
+            &crate::typed_shape::header_image_global_name_from_keys_global(&global_name),
+            "<2 x i64>",
+            "zeroinitializer",
+        );
 
         // Build the packed-keys string. Format: each field name
         // followed by `\0`. Parent classes contribute their fields
@@ -1172,6 +1182,13 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             &crate::typed_shape::shape_id_global_name_from_keys_global(&global_name),
             I32,
             "0",
+        );
+        // #8122: the inline-`new` header image, composed at module init
+        // (`string_pool.rs`) for the classes `class_header_images` admits.
+        llmod.add_internal_global(
+            &crate::typed_shape::header_image_global_name_from_keys_global(&global_name),
+            "<2 x i64>",
+            "zeroinitializer",
         );
         class_keys_globals_map.insert(c.name.clone(), global_name.clone());
         let mut packed_keys = String::new();
@@ -1376,12 +1393,21 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
     // already had `func_signatures.has_rest`.
     let mut method_has_rest: std::collections::HashMap<(String, String), bool> =
         std::collections::HashMap::new();
+    let mut method_has_synthetic_arguments: std::collections::HashMap<(String, String), bool> =
+        std::collections::HashMap::new();
     for cls in &hir.classes {
         for m in &cls.methods {
-            method_param_counts.insert((cls.name.clone(), m.name.clone()), m.params.len());
+            let key = (cls.name.clone(), m.name.clone());
+            method_param_counts.insert(key.clone(), m.params.len());
             let has_rest = m.params.iter().any(|p| p.is_rest);
             if has_rest {
-                method_has_rest.insert((cls.name.clone(), m.name.clone()), true);
+                method_has_rest.insert(key.clone(), true);
+            }
+            if m.params
+                .last()
+                .is_some_and(|param| param.arguments_object.is_some())
+            {
+                method_has_synthetic_arguments.insert(key, true);
             }
         }
         // Issue #894: track static methods too. Effect's `static pipe()` /
@@ -1397,7 +1423,14 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             method_param_counts.insert((cls.name.clone(), key.clone()), sm.params.len());
             let has_rest = sm.params.iter().any(|p| p.is_rest);
             if has_rest {
-                method_has_rest.insert((cls.name.clone(), key), true);
+                method_has_rest.insert((cls.name.clone(), key.clone()), true);
+            }
+            if sm
+                .params
+                .last()
+                .is_some_and(|param| param.arguments_object.is_some())
+            {
+                method_has_synthetic_arguments.insert((cls.name.clone(), key), true);
             }
         }
     }
@@ -1421,6 +1454,18 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
                 method_has_rest.insert((ic.name.clone(), mname.clone()), true);
                 if effective_name != ic.name {
                     method_has_rest.insert((effective_name.clone(), mname.clone()), true);
+                }
+            }
+            if ic
+                .method_has_synthetic_arguments
+                .get(i)
+                .copied()
+                .unwrap_or(false)
+            {
+                method_has_synthetic_arguments.insert((ic.name.clone(), mname.clone()), true);
+                if effective_name != ic.name {
+                    method_has_synthetic_arguments
+                        .insert((effective_name.clone(), mname.clone()), true);
                 }
             }
         }
@@ -1793,6 +1838,74 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         }
     }
 
+    // #8122: the inline-`new` header-image table. For every class with a keys
+    // global (local or imported stub), derive the packed GcHeader word the
+    // inline allocator will store — with `target_layout::inline_alloc_gc_packed`,
+    // the SAME function the allocation site uses — from the same module-level
+    // maps the site consults through its `FnCtx`. Module init composes
+    // `[gc_packed | class_id | ShapeId << 32]` into the class's image global;
+    // the site loads that instead of composing per site (or per call in a
+    // recursive allocator, where the per-function compose measured +0.6% on
+    // `tree`).
+    //
+    // Module init writes one image per KEYS global (aliases share one), so the
+    // init table is keyed by keys global and the site table is DERIVED from it:
+    // a class only gets a site entry if module init will actually compose its
+    // image. A site entry with no init store would hand every instance a
+    // zeroed header, so that direction of the dependency is load-bearing.
+    let class_header_image_inits: std::collections::HashMap<String, (u32, u64)> = {
+        let mut inits: std::collections::HashMap<String, (u32, u64)> =
+            std::collections::HashMap::new();
+        for (class_name, keys_global) in &class_keys_globals_map {
+            let Some(&field_count) = class_field_counts_map.get(class_name) else {
+                continue;
+            };
+            let Some(&class_id) = class_ids.get(class_name) else {
+                continue;
+            };
+            let typed_intact =
+                crate::lower_call::typed_shape_init::layout_pointer_free_at_allocation_in(
+                    &class_table,
+                    &class_keys_globals_map,
+                    &class_init_chains_map,
+                    class_name,
+                    field_count,
+                );
+            let gc_packed =
+                crate::target_layout::inline_alloc_gc_packed(&triple, field_count, typed_intact);
+            match inits.get(keys_global) {
+                // Two names (an alias) sharing one keys global must agree on
+                // the word module init writes; if they do not, neither may use
+                // the image — drop the keys global from the table.
+                Some(&(existing_id, existing_gc)) => {
+                    if existing_id != class_id || existing_gc != gc_packed {
+                        inits.insert(keys_global.clone(), (u32::MAX, 0));
+                    }
+                }
+                None => {
+                    inits.insert(keys_global.clone(), (class_id, gc_packed));
+                }
+            }
+        }
+        inits.retain(|_, (class_id, _)| *class_id != u32::MAX);
+        inits
+    };
+    let class_header_images_map: std::collections::HashMap<String, (String, u64, u32)> =
+        class_keys_globals_map
+            .iter()
+            .filter_map(|(class_name, keys_global)| {
+                let &(class_id, gc_packed) = class_header_image_inits.get(keys_global)?;
+                Some((
+                    class_name.clone(),
+                    (
+                        crate::typed_shape::header_image_global_name_from_keys_global(keys_global),
+                        gc_packed,
+                        class_id,
+                    ),
+                ))
+            })
+            .collect();
+
     let mut cross_module = CrossModuleCtx {
         namespace_imports: opts.namespace_imports.iter().cloned().collect(),
         namespace_member_nested: opts.namespace_member_nested.iter().cloned().collect(),
@@ -1818,9 +1931,11 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         func_returns_class: func_returns_class_map,
         method_param_counts,
         method_has_rest,
+        method_has_synthetic_arguments,
         class_keys_globals: class_keys_globals_map,
         class_field_counts: class_field_counts_map,
         class_init_chains: class_init_chains_map,
+        class_header_images: class_header_images_map,
         imported_class_ctors: opts
             .imported_classes
             .iter()
@@ -1874,6 +1989,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         target_triple: triple.clone(),
         app_metadata: opts.app_metadata.clone(),
         module_dispatch: module_dispatch_facts,
+        array_callback_shapes: std::collections::HashMap::new(),
         // Inline-hot-small pre-pass (#6850 follow-up): FuncIds with an in-loop
         // call site AND few total call sites, so small hot callees can earn
         // `inlinehint` while the call-site cap bounds duplication.
@@ -2222,6 +2338,29 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         closure_arrow_functions,
     } = closure_collect::collect_module_closures(hir);
 
+    // #8103: closure bodies are emitted before their enclosing regions. Prove
+    // inline array-callback element shapes module-wide now, while both sides
+    // of the boundary are available, then inject the vetted parameter facts
+    // when each closure is compiled.
+    let mut array_callback_shapes = crate::collectors::collect_array_callback_shapes(
+        hir,
+        &closures,
+        &module_boxed_vars,
+        &module_globals,
+        &module_receiver_types,
+        &class_table,
+        &cross_module.module_dispatch,
+    );
+    // Async/generator transforms clear the flags on the closure expression,
+    // but preserve the original identity in these module sets. Their callback
+    // parameters outlive the synchronous array HOF invocation and therefore
+    // cannot inherit its region-local containment fact.
+    array_callback_shapes.retain(|func_id, _| {
+        !cross_module.async_step_closures.contains(func_id)
+            && !cross_module.local_generator_funcs.contains(func_id)
+    });
+    cross_module.array_callback_shapes = array_callback_shapes;
+
     cross_module.typed_f64_closures.clear();
     cross_module.typed_i32_closures.clear();
     cross_module.typed_i1_closures.clear();
@@ -2502,6 +2641,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
                 f.id,
                 &module_prefix,
                 &f.params,
+                &f.body,
                 &demoted,
                 &guard_blocked,
                 &cross_module.type_aliases,
@@ -2605,12 +2745,49 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
                 continue;
             };
             for guard in plan.guards.iter().flatten() {
+                // (#8079) Scalar descriptors are decided inline by a
+                // typed-abi leaf guard; no rodata blob is referenced.
+                if param_guard::scalar_descriptor_rep(&guard.descriptor).is_some() {
+                    continue;
+                }
                 llmod.add_named_string_constant(
                     &guard.descriptor_name,
                     guard.descriptor.len() + 1,
                     &param_guard::descriptor_llvm_literal(&guard.descriptor),
                 );
             }
+        }
+
+        // #8175: recursion-participating specialized clones take LLVM's
+        // `preserve_none` convention. Registered HERE — after the plan is
+        // final and before any function body compiles — so every dispatch
+        // tier (static, guarded/range-checked, the public trampoline's fast
+        // arm, and the clone's own self-recursion) stamps the call-site
+        // convention through the one `LlBlock::call` choke point, and the
+        // clone's define/declare render it from the same registry. Spec
+        // entries are `internal` and direct-call-only by construction
+        // (`spec_abi_symbol_reachability`), so the convention cannot escape
+        // the module. Gated to recursion because the boundary cost is real:
+        // a normal-CC caller saves ~20 CSRs once per entry, which amortizes
+        // under a recursive tree and pessimizes a cheap non-recursive callee
+        // in a hot loop.
+        if spec_abi::spec_preserve_none_enabled()
+            && spec_abi::preserve_none_target_ok(&triple)
+            && !cross_module.spec_abi_functions.is_empty()
+        {
+            let recursive = crate::collectors::collect_recursion_participants(hir);
+            let mut preserve_none: Vec<String> = hir
+                .functions
+                .iter()
+                .filter(|f| recursive.contains(&f.id))
+                .filter_map(|f| {
+                    let plan = cross_module.spec_abi_functions.get(&f.id)?;
+                    let public = func_names.get(&f.id)?;
+                    Some(spec_function_name(public, &plan.reps))
+                })
+                .collect();
+            preserve_none.sort_unstable();
+            llmod.set_preserve_none_fns(preserve_none);
         }
     }
 
@@ -2894,6 +3071,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         closure_arrow_functions: &closure_arrow_functions,
         closures: &closures,
         class_keys_init_data: &class_keys_init_data,
+        class_header_image_inits: &class_header_image_inits,
         imported_class_stubs: &imported_class_stubs,
         cross_module: &cross_module,
     })?;

@@ -17,7 +17,7 @@
 //! codegen rewrites known Proxy locals to ProxyGet/ProxySet/etc. variants at
 //! HIR lowering time, which route through the entry points here.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use crate::closure::{js_closure_call0, js_closure_call1, js_closure_call2, js_closure_call3};
@@ -63,9 +63,10 @@ pub use reflect::{
 ///
 /// Revocation detaches: `js_proxy_revoke` stores 0 bits into `target` and
 /// `handler` (spec: [[ProxyTarget]]/[[ProxyHandler]] become null) so the
-/// wrapped graphs can die — `scan_proxy_roots_mut` otherwise strongly roots
-/// them for the life of the registry slot (2026-07-09 GC audit). No valid
-/// proxy target/handler is ever the all-zero-bits number `0.0` (both must be
+/// wrapped graphs can die. Minor collections strongly scan live entries;
+/// full collections instead discover proxy handles through traced slots and
+/// prune entries whose handles were not observed. No valid proxy
+/// target/handler is ever the all-zero-bits number `0.0` (both must be
 /// objects), so 0 bits is an unambiguous detached sentinel. Every trap path
 /// checks `revoked` before touching `target`/`handler`.
 #[repr(C)]
@@ -96,6 +97,14 @@ thread_local! {
     /// a scanner that rewrites `target_bits` during GC fixup (similar to the
     /// 9 existing scanners in gc.rs).
     static REFLECT_METADATA: RefCell<HashMap<MetadataKey, f64>> = RefCell::new(HashMap::new());
+    /// Live proxy ids observed by the current full GC trace. `None` outside a
+    /// full trace; minors continue to root every registry entry strongly.
+    static PROXY_FULL_TRACE_LIVE: RefCell<Option<Vec<bool>>> = const { RefCell::new(None) };
+    /// Hot reject-path gate: collector funnels test this before decoding a
+    /// proxy-band payload, so ordinary marking pays one TLS boolean branch.
+    static PROXY_FULL_TRACE_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    /// Monotone liveness counter for diagnostics and non-vacuous tests.
+    static PROXY_GC_RECLAIMED_TOTAL: Cell<u64> = const { Cell::new(0) };
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -121,6 +130,76 @@ const POINTER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 /// `value::addr_class` (`PROXY_ID_BAND_START`).
 const PROXY_TAG_BASE: u64 = crate::value::addr_class::PROXY_ID_BAND_START as u64;
 
+/// Number of ids the revocable-Proxy band can encode: `HANDLE_BAND_MAX -
+/// PROXY_ID_BAND_START`, i.e. **65,536**, of which id 0 is reserved so a
+/// handle is never the bare band base.
+///
+/// This is a hard ceiling, not a soft one. `encode_proxy_id` maps id `n` to
+/// `PROXY_TAG_BASE + n`, so the first id at or above this length encodes to
+/// `HANDLE_BAND_MAX` — a payload that `addr_class::is_proxy_id_band` rejects
+/// and `addr_class::is_above_handle_band` **accepts as a dereferenceable heap
+/// address**. Minting one is therefore a memory-safety bug rather than a lost
+/// proxy: the 65,536th `new Proxy(...)` in a thread used to hand back a value
+/// that the very next property read dereferenced, SIGSEGV (#8213).
+///
+/// Every other handle band already refuses to allocate past its end
+/// (`common/handle.rs`, `fetch/mod.rs` both panic). The Proxy band was the
+/// one without a guard — and the only one whose ids are minted straight from
+/// user code with no matching free/close call, so it is also the only one a
+/// long-running program reaches by simply staying up (#8213 measured ~4
+/// proxies per HTTP request on a warm Next.js App Route, i.e. this ceiling
+/// lands after roughly 16k requests).
+const PROXY_ID_BAND_LEN: u64 = (crate::value::addr_class::HANDLE_BAND_MAX
+    - crate::value::addr_class::PROXY_ID_BAND_START) as u64;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only shrink of [`PROXY_ID_BAND_LEN`] so the exhaustion boundary
+    /// can be walked without allocating 65k objects. Thread-local, and the
+    /// test harness gives every test its own thread, so it cannot leak into
+    /// another test. Never set outside `cfg(test)`.
+    static PROXY_ID_BAND_LEN_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[inline]
+fn proxy_id_band_len() -> u64 {
+    #[cfg(test)]
+    {
+        if let Some(len) = PROXY_ID_BAND_LEN_OVERRIDE.with(|c| c.get()) {
+            return len;
+        }
+    }
+    PROXY_ID_BAND_LEN
+}
+
+/// Reserve the id a registry of `len` entries would hand out next, or `None`
+/// when that id would fall outside the band.
+///
+/// Split out from [`js_proxy_new`] because the refusal is the testable half:
+/// the throw itself ends the process when no `try` is open, so the boundary
+/// is asserted here instead.
+fn reserve_proxy_id(len: usize) -> Option<u64> {
+    let id = len as u64;
+    (id < proxy_id_band_len()).then_some(id)
+}
+
+/// The band is full. Throw a catchable `RangeError` rather than mint an
+/// out-of-band id — same trade as `error::throw_allocation_failed` (#5067):
+/// a program that can catch it keeps running, and one that cannot gets a
+/// named error instead of a segfault.
+#[cold]
+fn throw_proxy_band_exhausted() -> ! {
+    let msg = format!(
+        "Too many proxies: this thread's Proxy registry is full ({} entries); \
+         Perry never reclaims a Proxy registry slot",
+        PROXY_ID_BAND_LEN - 1
+    );
+    let handle = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
+    let err = crate::error::js_rangeerror_new(handle);
+    crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64))
+}
+
 fn encode_proxy_id(id: u64) -> i64 {
     (PROXY_TAG_BASE + id) as i64
 }
@@ -128,6 +207,15 @@ fn encode_proxy_id(id: u64) -> i64 {
 fn decode_proxy_id(raw: i64) -> Option<u64> {
     let raw = raw as u64;
     if raw < PROXY_TAG_BASE {
+        return None;
+    }
+    // Reject payloads at or past the band end so this decoder and
+    // `addr_class::is_proxy_id_band` agree about what a proxy id is. They used
+    // to disagree above the band: `lookup` accepted anything below 4 GiB while
+    // every addr-class consumer read the same payload as a heap address
+    // (#8213). `reserve_proxy_id` makes such an id unmintable; this keeps the
+    // two classifications from drifting apart again.
+    if raw >= crate::value::addr_class::HANDLE_BAND_MAX as u64 {
         return None;
     }
     let id = raw - PROXY_TAG_BASE;
@@ -154,15 +242,143 @@ fn lookup(proxy_boxed: f64) -> Option<u64> {
         return None;
     }
     let id = decode_proxy_id(lower48 as i64)?;
-    // Only a real entry in the registry counts as a proxy.
-    PROXIES.with(|p| {
+    // A collected slot remains a tombstone. Treating it as a non-proxy would
+    // hand the small id-band payload to generic object code, which may
+    // dereference it; fail loudly if the collector ever under-approximates.
+    let status = PROXIES.with(|p| {
         let v = p.borrow();
-        if (id as usize) < v.len() && v[id as usize].is_some() {
-            Some(id)
-        } else {
-            None
+        match v.get(id as usize) {
+            Some(Some(_)) => 1,
+            Some(None) => 2,
+            None => 0,
         }
-    })
+    });
+    match status {
+        1 => Some(id),
+        2 => collected_return(),
+        _ => None,
+    }
+}
+
+/// Keep a proxy id visible to any full collection that starts while a native
+/// proxy operation is running. The returned scope owns the slot; the handle
+/// itself need not be retained because slots live until the scope is dropped.
+fn pin_proxy_for_native_call(proxy_boxed: f64) -> crate::gc::RuntimeHandleScope {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let _ = scope.root_nanbox_f64(proxy_boxed);
+    scope
+}
+
+/// Arm proxy-id observation for a full trace. The registry becomes weak for
+/// the mark phase until [`gc_finish_full_trace`] prunes unobserved entries.
+pub(crate) fn gc_begin_full_trace() {
+    let (len, has_live_entries) = PROXIES.with(|p| {
+        let proxies = p.borrow();
+        (proxies.len(), proxies.iter().any(Option::is_some))
+    });
+    PROXY_FULL_TRACE_LIVE.with(|live| {
+        assert!(live.borrow().is_none(), "proxy full trace already active");
+        *live.borrow_mut() = Some(vec![false; len]);
+    });
+    PROXY_FULL_TRACE_ACTIVE.with(|active| active.set(has_live_entries));
+}
+
+#[inline(always)]
+pub(crate) fn gc_full_trace_active() -> bool {
+    PROXY_FULL_TRACE_ACTIVE.with(Cell::get)
+}
+
+/// Observe one bits value from a collector-owned tracing funnel. Returns true
+/// when it names an existing proxy slot (live or a collected tombstone).
+/// First observation marks the live entry's target/handler immediately; this
+/// closes the cycle without making the whole registry a strong root.
+pub(crate) fn gc_observe_traced_value(bits: u64, valid_ptrs: &crate::gc::ValidPointerSet) -> bool {
+    if !gc_full_trace_active() || (bits & !POINTER_MASK) != POINTER_TAG {
+        return false;
+    }
+    let payload = (bits & POINTER_MASK) as usize;
+    if !crate::value::addr_class::is_proxy_id_band(payload) {
+        return false;
+    }
+    let Some(id) = decode_proxy_id(payload as i64) else {
+        return false;
+    };
+    let entry = PROXIES.with(|proxies| {
+        let proxies = proxies.borrow();
+        proxies.get(id as usize).map(|slot| {
+            slot.as_ref()
+                .map(|entry| (entry.target.to_bits(), entry.handler.to_bits()))
+        })
+    });
+    let Some(entry) = entry else {
+        return false;
+    };
+    let first_observation = PROXY_FULL_TRACE_LIVE.with(|live| {
+        let mut live = live.borrow_mut();
+        let live = live.as_mut().expect("proxy observation outside full trace");
+        if id as usize >= live.len() {
+            live.resize(id as usize + 1, false);
+        }
+        let first = !live[id as usize];
+        live[id as usize] = true;
+        first
+    });
+    if first_observation {
+        if let Some((target, handler)) = entry {
+            crate::gc::try_mark_value_or_raw(target, valid_ptrs);
+            crate::gc::try_mark_value_or_raw(handler, valid_ptrs);
+        }
+    }
+    true
+}
+
+/// End a full proxy trace and tombstone every registry entry whose handle was
+/// not observed. Returns the number reclaimed in this pass.
+pub(crate) fn gc_finish_full_trace() -> usize {
+    PROXY_FULL_TRACE_ACTIVE.with(|active| active.set(false));
+    let live = PROXY_FULL_TRACE_LIVE.with(|state| {
+        state
+            .borrow_mut()
+            .take()
+            .expect("proxy full trace was not active")
+    });
+    let (reclaimed, remaining, slots) = PROXIES.with(|proxies| {
+        let mut proxies = proxies.borrow_mut();
+        let mut reclaimed = 0usize;
+        for (id, slot) in proxies.iter_mut().enumerate().skip(1) {
+            if slot.is_some() && !live.get(id).copied().unwrap_or(false) {
+                slot.take();
+                reclaimed += 1;
+            }
+        }
+        let remaining = proxies.iter().flatten().count();
+        (reclaimed, remaining, proxies.len().saturating_sub(1))
+    });
+    let total = PROXY_GC_RECLAIMED_TOTAL.with(|counter| {
+        let total = counter.get().saturating_add(reclaimed as u64);
+        counter.set(total);
+        total
+    });
+    if crate::gc::gc_diag_enabled() {
+        eprintln!(
+            "[gc-proxy-registry] live={remaining} tombstones={} slots={slots} reclaimed={reclaimed} reclaimed_total={total}",
+            slots.saturating_sub(remaining),
+        );
+    }
+    reclaimed
+}
+
+/// Cancel observation when an in-progress GC cycle is dropped.
+pub(crate) fn gc_abort_full_trace() {
+    // A parked budgeted cycle can be dropped by the GC cycle TLS destructor.
+    // Darwin does not guarantee an order between independent TLS destructors,
+    // so the proxy trace cells may already be unavailable during thread exit.
+    // There is no trace left to observe once that thread is gone; ordinary
+    // cycle cancellation still takes the same cleanup path.
+    let _ = PROXY_FULL_TRACE_ACTIVE.try_with(|active| active.set(false));
+    let _ = PROXY_FULL_TRACE_LIVE.try_with(|live| {
+        live.borrow_mut().take();
+    });
 }
 
 /// Allocate a new proxy. Returns the NaN-boxed POINTER_TAG value holding the
@@ -232,15 +448,30 @@ pub extern "C" fn js_proxy_new(target: f64, handler: f64) -> f64 {
         throw_proxy_non_object();
     }
     let callable = target_callable_at_creation(target);
+    // Reserve BEFORE taking the mutable borrow: `throw_proxy_band_exhausted`
+    // allocates a JS error, which can collect, and `scan_proxy_roots_mut`
+    // borrows `PROXIES` mutably — throwing under an open borrow would panic
+    // the collector (and a caught throw would leave the registry borrowed for
+    // the life of the thread).
+    let Some(reserved) = reserve_proxy_id(PROXIES.with(|p| p.borrow().len())) else {
+        throw_proxy_band_exhausted();
+    };
     PROXIES.with(|p| {
         let mut v = p.borrow_mut();
         let id = v.len() as u64;
+        debug_assert_eq!(id, reserved, "nothing may allocate a proxy id in between");
         v.push(Some(Box::new(ProxyEntry {
             target,
             handler,
             revoked: false,
             callable,
         })));
+        // A proxy born during a sliced full trace was absent from the begin
+        // snapshot. Arm observation before its handle can be published into a
+        // root/heap slot; the incremental write barrier will record it.
+        if PROXY_FULL_TRACE_LIVE.with(|live| live.borrow().is_some()) {
+            PROXY_FULL_TRACE_ACTIVE.with(|active| active.set(true));
+        }
         let encoded = encode_proxy_id(id) as u64;
         f64::from_bits(POINTER_TAG | (encoded & POINTER_MASK))
     })
@@ -377,6 +608,13 @@ fn handler_trap(handler: f64, trap_name: &str) -> f64 {
 /// Raise a "proxy revoked" TypeError via `js_throw`. Does not return.
 fn revoked_return() -> f64 {
     revoked_return_with_message("Cannot perform operation on a proxy that has been revoked")
+}
+
+fn collected_return() -> ! {
+    let _ = revoked_return_with_message(
+        "Cannot perform operation on a proxy that has been garbage collected",
+    );
+    unreachable!("js_throw returned from collected proxy TypeError")
 }
 
 fn revoked_return_with_message(msg: &str) -> f64 {
@@ -531,6 +769,18 @@ fn create_list_from_array_like(value: f64) -> Vec<f64> {
     let is_pointer = top16 == 0x7FFD || (top16 == 0 && bits > 0x10000);
     if is_pointer {
         let ptr = (bits & POINTER_MASK) as usize;
+        // `arguments` is an ordinary ObjectHeader backed by the arguments
+        // registry, not a GC_TYPE_ARRAY. Reading it through the generic object
+        // field path below loses its indexed bindings, so
+        // `Reflect.apply(target, thisArg, arguments)` constructed an empty
+        // argument list. Next 16's ProxyTracer forwards startActiveSpan with
+        // exactly that shape; its callback was consequently never invoked and
+        // the production App Route request remained pending (#8036).
+        if let Some(values) = unsafe {
+            crate::object::arguments_object_to_vec(ptr as *const crate::object::ObjectHeader)
+        } {
+            return values;
+        }
         // #7531: `value` is `argumentsList` from `Reflect.apply(target,
         // thisArg, argumentsList)` / `Reflect.construct` -- caller-supplied,
         // so it can be a fetch/zlib/proxy/common-registry handle id under
@@ -621,6 +871,7 @@ fn call_with_this_and_args(f: f64, this_arg: f64, args: &[f64]) -> f64 {
 /// otherwise fetch the field from the target directly via the generic path.
 #[no_mangle]
 pub extern "C" fn js_proxy_get(proxy_boxed: f64, key: f64) -> f64 {
+    let _proxy_pin = pin_proxy_for_native_call(proxy_boxed);
     let id = match lookup(proxy_boxed) {
         Some(id) => id,
         None => return f64::from_bits(TAG_UNDEFINED),
@@ -1513,7 +1764,7 @@ fn ordinary_set_with_receiver(target: f64, key: f64, value: f64, receiver: f64) 
                             let interned = crate::object::interned_key_ptr(key_ptr);
                             // #6595: a per-evaluation CLASS OBJECT (what a
                             // capture-carrying class materializes as,
-                            // `object_type == OBJECT_TYPE_CLASS`) shares its
+                            // `ShapeObjectKind::Class`) shares its
                             // template cid with its instances, and its own-data
                             // writes must reach the #6530
                             // `mirror_class_object_static_write` hook in
@@ -1530,8 +1781,17 @@ fn ordinary_set_with_receiver(target: f64, key: f64, value: f64, receiver: f64) 
                                     addr,
                                 )
                                 && class_id != crate::object::NATIVE_MODULE_CLASS_ID
-                                && (*(addr as *const crate::ObjectHeader)).object_type
-                                    == crate::error::OBJECT_TYPE_REGULAR
+                                // #8113: this asks for ORDINARY specifically —
+                                // it must stay FALSE for a class object or
+                                // #6595 reopens. `object_is_regular` is exactly
+                                // `descriptor.object_kind == Ordinary` since
+                                // #8086, so it is the same predicate the
+                                // deleted `object_type == OBJECT_TYPE_REGULAR`
+                                // word expressed, not the weaker
+                                // "is an ObjectHeader" test.
+                                && crate::object::object_is_regular(
+                                    addr as *const crate::ObjectHeader,
+                                )
                                 && interned != 0;
                             let verdict = if plan_eligible
                                 && crate::object::prop_plan::store_plan_check(class_id, interned)
@@ -1949,6 +2209,48 @@ static KEEP_REFLECT_OWN_KEYS: extern "C" fn(f64) -> f64 = js_reflect_own_keys;
 #[used]
 static KEEP_REFLECT_APPLY: extern "C" fn(f64, f64, f64) -> f64 = js_reflect_apply;
 
+/// #8194: death pruning for `REFLECT_METADATA`.
+///
+/// The key carries the decorator target's NaN-boxed bits, and
+/// `rewrite_metadata_target_bits` **rekeys** them when the target moves.
+/// Entries were removed only by `Reflect.deleteMetadata`, so a target that
+/// simply became unreachable left its address in the key — the #8040 shape,
+/// because the next rewrite pass reads whatever the arena put there.
+///
+/// Non-`POINTER_TAG` keys (class refs, primitives) and handle-band ids are
+/// left alone: they are not heap addresses, and the `gc::dead_owner` probes
+/// decline to attribute them anyway.
+pub(crate) fn prune_dead_reflect_metadata_targets(is_dead_owner: &dyn Fn(usize) -> bool) {
+    REFLECT_METADATA.with(|store| {
+        store.borrow_mut().retain(|key, _| {
+            if (key.target_bits & !POINTER_MASK) != POINTER_TAG {
+                return true;
+            }
+            let addr = (key.target_bits & POINTER_MASK) as usize;
+            addr == 0 || !is_dead_owner(addr)
+        });
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn test_reflect_metadata_len() -> usize {
+    REFLECT_METADATA.with(|store| store.borrow().len())
+}
+
+#[cfg(test)]
+pub(crate) fn test_seed_reflect_metadata(target_bits: u64, key: &str) {
+    REFLECT_METADATA.with(|store| {
+        store.borrow_mut().insert(
+            MetadataKey {
+                target_bits,
+                key: key.to_string(),
+                property_key: None,
+            },
+            f64::from_bits(TAG_UNDEFINED),
+        );
+    });
+}
+
 /// Rewrite a `REFLECT_METADATA` key's POINTER-tagged target bits during the
 /// GC metadata-rewrite phase; non-pointer targets (class refs, primitives)
 /// pass through untouched.
@@ -1970,19 +2272,24 @@ fn rewrite_metadata_target_bits(
     }
 }
 
-/// GC scanner for the proxy registry + reflect-metadata store (2026-07-02
-/// audit P0; ported from the stranded be73b4f8d). A proxy's target/handler
-/// are commonly reachable ONLY through `PROXIES` — without visiting them a
-/// minor GC collects (or moves) them and every subsequent trap derefs freed
-/// or stale memory. `REFLECT_METADATA`'s own doc admits its keys go stale on
-/// a target move; rekey them during the metadata-rewrite phase.
+/// GC scanner for the proxy registry + reflect-metadata store. A minor trace
+/// must visit every live entry because it does not scan the whole heap. A full
+/// mark trace skips those strong edges and observes proxy handles from roots
+/// and heap slots instead; rewrite/verify phases still visit surviving entry
+/// slots. `REFLECT_METADATA`'s keys are rekeyed during metadata rewrite.
 pub(crate) fn scan_proxy_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
-    PROXIES.with(|proxies| {
-        for entry in proxies.borrow_mut().iter_mut().flatten() {
-            visitor.visit_nanbox_f64_slot(&mut entry.target);
-            visitor.visit_nanbox_f64_slot(&mut entry.handler);
-        }
-    });
+    // A full mark trace discovers liveness from proxy-band handles instead of
+    // making the registry itself a root. Minors cannot make that inference
+    // because they do not scan the whole heap, and rewrite/verify phases must
+    // still update the live entries after evacuation.
+    if !(gc_full_trace_active() && visitor.is_mark_phase()) {
+        PROXIES.with(|proxies| {
+            for entry in proxies.borrow_mut().iter_mut().flatten() {
+                visitor.visit_nanbox_f64_slot(&mut entry.target);
+                visitor.visit_nanbox_f64_slot(&mut entry.handler);
+            }
+        });
+    }
 
     REFLECT_METADATA.with(|store| {
         let mut store = store.borrow_mut();
@@ -2005,12 +2312,199 @@ pub(crate) fn scan_proxy_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'
 }
 
 #[cfg(test)]
+pub(crate) fn test_proxy_slot_is_live(proxy_boxed: f64) -> bool {
+    let bits = proxy_boxed.to_bits();
+    let Some(id) = decode_proxy_id((bits & POINTER_MASK) as i64) else {
+        return false;
+    };
+    PROXIES.with(|proxies| {
+        proxies
+            .borrow()
+            .get(id as usize)
+            .is_some_and(Option::is_some)
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn test_proxy_gc_reclaimed_total() -> u64 {
+    PROXY_GC_RECLAIMED_TOTAL.with(Cell::get)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     fn obj_value() -> f64 {
         let obj = crate::object::js_object_alloc(0, 0);
         f64::from_bits(POINTER_TAG | ((obj as u64) & POINTER_MASK))
+    }
+
+    /// #8213: an id past the end of the revocable-Proxy band does not merely
+    /// fail to round-trip — it encodes to a payload every addr-class consumer
+    /// reads as a **dereferenceable heap address**, so the value the 65,536th
+    /// `new Proxy(...)` handed back was segfaulted by the next property read.
+    ///
+    /// The vacuity guard matters here: if the band is ever moved or resized,
+    /// `PROXY_ID_BAND_LEN` moves with it and the loop below would still pass
+    /// while testing a different range, so pin the width too.
+    #[test]
+    fn every_reservable_proxy_id_encodes_inside_the_band() {
+        use crate::value::addr_class;
+
+        assert_eq!(
+            PROXY_ID_BAND_LEN, 0x10000,
+            "the revocable-Proxy band is [0xF0000, 0x100000): 65,536 ids"
+        );
+
+        for len in 0..PROXY_ID_BAND_LEN as usize {
+            let id = reserve_proxy_id(len).expect("inside the band");
+            assert_eq!(id, len as u64);
+            assert!(
+                addr_class::is_proxy_id_band(encode_proxy_id(id) as usize),
+                "id {id} must encode inside the proxy band"
+            );
+        }
+
+        // The first refused id, and why refusing it is a memory-safety fix
+        // rather than a tidiness one.
+        assert_eq!(reserve_proxy_id(PROXY_ID_BAND_LEN as usize), None);
+        let out_of_band = encode_proxy_id(PROXY_ID_BAND_LEN) as usize;
+        assert!(!addr_class::is_proxy_id_band(out_of_band));
+        assert!(
+            addr_class::is_above_handle_band(out_of_band),
+            "an out-of-band proxy id is classified as a heap address to be \
+             dereferenced — that is the SIGSEGV this guard prevents"
+        );
+    }
+
+    /// The decoder and `addr_class::is_proxy_id_band` must agree about what a
+    /// proxy id is. Before #8213 they did not: `lookup` accepted any payload
+    /// below 4 GiB, so an out-of-band id was simultaneously "a live proxy"
+    /// (here) and "a heap pointer" (everywhere else).
+    #[test]
+    fn decode_proxy_id_rejects_payloads_outside_the_band() {
+        use crate::value::addr_class;
+
+        assert_eq!(
+            decode_proxy_id(PROXY_TAG_BASE as i64),
+            None,
+            "id 0 reserved"
+        );
+        assert_eq!(
+            decode_proxy_id((PROXY_TAG_BASE - 1) as i64),
+            None,
+            "below band"
+        );
+        assert_eq!(
+            decode_proxy_id((addr_class::HANDLE_BAND_MAX - 1) as i64),
+            Some(PROXY_ID_BAND_LEN - 1),
+            "the last in-band payload still decodes"
+        );
+        assert_eq!(
+            decode_proxy_id(addr_class::HANDLE_BAND_MAX as i64),
+            None,
+            "the first payload past the band is not a proxy id"
+        );
+        assert_eq!(decode_proxy_id(0x1_0000_0000_i64), None);
+    }
+
+    /// End of the live path: `js_proxy_new` stops handing out ids at the band
+    /// edge. The refusal itself is asserted through `reserve_proxy_id` because
+    /// the throw `js_proxy_new` performs exits the process when no `try` is
+    /// open (`exception::js_throw`), which a unit test cannot survive.
+    #[test]
+    fn js_proxy_new_never_mints_past_the_band_edge() {
+        use crate::value::addr_class;
+
+        // Shrink the band so the edge is reachable without 65k allocations.
+        // Index 0 is reserved, so a length of 6 leaves 5 usable ids.
+        PROXY_ID_BAND_LEN_OVERRIDE.with(|c| c.set(Some(6)));
+
+        let mut minted = Vec::new();
+        for _ in 0..5 {
+            let proxy = js_proxy_new(obj_value(), obj_value());
+            let payload = (proxy.to_bits() & POINTER_MASK) as usize;
+            assert!(
+                addr_class::is_proxy_id_band(payload),
+                "{payload:#x} escaped the proxy band"
+            );
+            assert_eq!(js_proxy_is_proxy(proxy), 1);
+            minted.push(proxy);
+        }
+
+        let full = PROXIES.with(|p| p.borrow().len());
+        assert_eq!(full, 6, "registry is at the (shrunk) band edge");
+        assert_eq!(
+            reserve_proxy_id(full),
+            None,
+            "the next new Proxy(...) must be refused, not minted out of band"
+        );
+
+        // Everything minted before the edge still works.
+        for proxy in minted {
+            assert_eq!(js_proxy_is_proxy(proxy), 1);
+            assert_eq!(js_proxy_is_revoked(proxy), 0);
+        }
+    }
+
+    /// The live witness for #8213: what a program that runs off the end of the
+    /// band actually gets. It cannot be observed in-process — `js_throw` with
+    /// no open `try` prints the uncaught error and `process::exit(1)`s — so the
+    /// child re-runs this test against a shrunk band and the parent asserts on
+    /// its exit status and output. `Some(1)` versus a signal death is exactly
+    /// the difference this fix makes: before, the 65,536th `new Proxy(...)`
+    /// returned a payload the next property read dereferenced (SIGSEGV, no
+    /// status code at all).
+    ///
+    /// It also covers the two things a unit test on `reserve_proxy_id` cannot:
+    /// that the registry borrow is released before the throw (an open borrow
+    /// would panic the moment the error allocation reaches the GC's proxy
+    /// scanner), and that the error is allocatable at all with a full registry.
+    #[test]
+    fn exhausting_the_band_reports_a_range_error_instead_of_segfaulting() {
+        // Harness plumbing, deliberately not a `PERRY_GC_*` name (that family
+        // is audited by `scripts/check_gc_env_knobs.py`).
+        const CHILD_ENV: &str = "PERRY_TEST_PROXY_BAND_EXHAUSTION_CHILD";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            // Index 0 is reserved, so a length of 4 leaves 3 usable ids and the
+            // 4th call is the one past the edge.
+            PROXY_ID_BAND_LEN_OVERRIDE.with(|c| c.set(Some(4)));
+            for _ in 0..8 {
+                js_proxy_new(obj_value(), obj_value());
+            }
+            unreachable!("js_proxy_new must not mint an id past the band edge");
+        }
+
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current test binary"),
+        )
+        .arg("proxy::tests::exhausting_the_band_reports_a_range_error_instead_of_segfaulting")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(CHILD_ENV, "1")
+        .output()
+        .expect("launch the band-exhaustion witness");
+
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "exhaustion must exit(1) after an uncaught RangeError, not die on a \
+             signal and not run past the edge; output was:\n{combined}"
+        );
+        assert!(
+            combined.contains("RangeError"),
+            "the uncaught error must be a RangeError; output was:\n{combined}"
+        );
+        assert!(
+            combined.contains("Too many proxies"),
+            "the message must name the exhausted registry; output was:\n{combined}"
+        );
     }
 
     /// 2026-07-09 GC audit (wave 2 batch A): revocation must DETACH — null the
@@ -2109,6 +2603,27 @@ mod tests {
             padded[3],
             keys.len() as u32,
             count,
+        )
+    }
+
+    fn object_array_numeric_write_range_guard(
+        array: f64,
+        keys: &[f64],
+        start: u32,
+        end: u32,
+    ) -> u64 {
+        assert!((1..=4).contains(&keys.len()));
+        let mut padded = [0.0; 4];
+        padded[..keys.len()].copy_from_slice(keys);
+        put_value::js_object_array_numeric_write_range_guard(
+            array,
+            padded[0],
+            padded[1],
+            padded[2],
+            padded[3],
+            keys.len() as u32,
+            start,
+            end,
         )
     }
 
@@ -2263,6 +2778,35 @@ mod tests {
             object_array_numeric_write_guard(boxed_object(mixed.cast()), &[c, d], 2),
             0,
             "content-equal but distinct shape keys arrays must not share raw slots"
+        );
+
+        let ranged_values = [
+            boxed_object(other),
+            boxed_object(first),
+            boxed_object(second),
+        ];
+        let ranged =
+            crate::array::js_array_from_f64(ranged_values.as_ptr(), ranged_values.len() as u32);
+        let ranged_box = boxed_object(ranged.cast());
+        assert_eq!(
+            object_array_numeric_write_range_guard(ranged_box, &[c, d], 1, 3),
+            (4u64 << 16) | 3,
+            "a non-zero range must ignore an ineligible receiver before its source start"
+        );
+        assert_eq!(
+            object_array_numeric_write_guard(ranged_box, &[c, d], 3),
+            0,
+            "the legacy prefix ABI must continue proving from element zero"
+        );
+        assert_eq!(
+            object_array_numeric_write_range_guard(ranged_box, &[c, d], 3, 3),
+            0,
+            "an empty receiver range must reject"
+        );
+        assert_eq!(
+            object_array_numeric_write_range_guard(ranged_box, &[c, d], 1, 4),
+            0,
+            "a receiver range may not outrun the array"
         );
 
         unsafe {
@@ -2536,6 +3080,24 @@ mod tests {
                 "{addr:#x} must not be misread as a live Array"
             );
         }
+    }
+
+    #[test]
+    fn create_list_from_array_like_unpacks_arguments_objects() {
+        let raw = crate::array::js_array_alloc(3);
+        let raw = crate::array::js_array_push_f64(raw, 11.0);
+        let raw = crate::array::js_array_push_f64(raw, 22.0);
+        let raw = crate::array::js_array_push_f64(raw, 33.0);
+        let raw_args = crate::value::js_nanbox_pointer(raw as i64);
+        let undefined = f64::from_bits(TAG_UNDEFINED);
+        let arguments = crate::object::js_arguments_object_alloc(raw_args, undefined, 0);
+        let boxed_arguments = crate::value::js_nanbox_pointer(arguments as i64);
+
+        assert_eq!(
+            create_list_from_array_like(boxed_arguments),
+            vec![11.0, 22.0, 33.0],
+            "Reflect.apply must preserve every entry from a real arguments object"
+        );
     }
 
     /// #7531: `raw_ptr_from_value` feeds `array_ptr_from_value`, which derefs

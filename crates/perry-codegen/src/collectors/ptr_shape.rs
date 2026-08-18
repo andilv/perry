@@ -358,6 +358,14 @@ pub(crate) fn collect_shape_proven_ptr_locals(
         candidates.insert(id, class_name);
         element_seeded.insert(id);
     }
+    // #8103: a direct inline array callback's element parameter is the same
+    // provenance route as a licensed indexed read. Unlike every other seed it
+    // is a parameter binding, so the use walk expects zero `Let` sites.
+    let mut callback_seeded: HashSet<u32> = HashSet::new();
+    for (id, class_name) in element_facts.callback_param_seeds() {
+        candidates.insert(id, class_name.to_owned());
+        callback_seeded.insert(id);
+    }
     if candidates.is_empty() {
         return HashMap::new();
     }
@@ -487,7 +495,8 @@ pub(crate) fn collect_shape_proven_ptr_locals(
             );
             continue;
         }
-        if let_counts.get(id).copied().unwrap_or(0) != 1 {
+        let expected_let_count = if callback_seeded.contains(id) { 0 } else { 1 };
+        if let_counts.get(id).copied().unwrap_or(0) != expected_let_count {
             deny(id, class_name, report::MULTIPLE_LET);
             continue;
         }
@@ -1093,7 +1102,8 @@ impl<'a> UseWalk<'a> {
             | Stmt::LabeledBreak(_)
             | Stmt::LabeledContinue(_)
             | Stmt::PreallocateBoxes(_)
-            | Stmt::PreallocateTdzBoxes(_) => {}
+            | Stmt::PreallocateTdzBoxes(_)
+            | Stmt::ReleaseBoxes(_) => {}
         }
     }
 
@@ -1638,7 +1648,8 @@ impl<'a, 'b> ThisFlowAnalysis<'a, 'b> {
             | Stmt::LabeledBreak(_)
             | Stmt::LabeledContinue(_)
             | Stmt::PreallocateBoxes(_)
-            | Stmt::PreallocateTdzBoxes(_) => true,
+            | Stmt::PreallocateTdzBoxes(_)
+            | Stmt::ReleaseBoxes(_) => true,
         }
     }
 
@@ -1934,7 +1945,13 @@ pub(in crate::collectors) use numeric::collect_numeric_by_construction_locals as
 /// Conservative "cannot be a BigInt" for the spec Number-path argument.
 fn expr_provably_not_bigint(e: &Expr, not_bigint_locals: &HashSet<u32>) -> bool {
     match e {
-        Expr::Number(_) | Expr::Integer(_) | Expr::String(_) | Expr::Bool(_) => true,
+        Expr::Number(_)
+        | Expr::Integer(_)
+        | Expr::String(_)
+        | Expr::Bool(_)
+        | Expr::PodLayoutSizeOf { .. }
+        | Expr::PodLayoutAlignOf { .. }
+        | Expr::PodLayoutOffsetOf { .. } => true,
         Expr::LocalGet(id) => not_bigint_locals.contains(id),
         Expr::Unary { op, operand } => match op {
             perry_hir::UnaryOp::Pos => true, // `+x` throws for BigInt

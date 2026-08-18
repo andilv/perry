@@ -360,8 +360,8 @@ pub(crate) fn try_lower_sloppy_class_field_store(
         ctx.current_block = fast_idx;
         {
             // arm64_32 watchOS: the fields region starts at `size_of::<ObjectHeader>()`
-            // past the user pointer (24 on 64-bit, 20 on ILP32) — same derivation as
-            // the strict arm and the runtime setter.
+            // past the user pointer (16 on LP64 and ILP32 since #8047) —
+            // same derivation as the strict arm and the runtime setter.
             let header_skip =
                 crate::target_layout::object_header_size_bytes(ctx.target_triple).to_string();
             let blk = ctx.block();
@@ -515,6 +515,7 @@ fn try_lower_sloppy_class_field_boxed_store(
                 &field_addr,
                 barrier_needed,
                 class_field_store_layout_note_is_conforming(ctx, class_name, field_index),
+                "class_field_set",
             );
             ctx.block().br(&merge_label);
         }
@@ -1230,6 +1231,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                                                 &class_name,
                                                 field_index,
                                             ),
+                                            "class_field_set",
                                         );
                                     }
                                     let (semantic, rep) = if requires_raw_f64 {
@@ -1440,10 +1442,9 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                                     class_field_store_needs_string_addref(ctx, value);
                                 let raw_stored_value = {
                                     // arm64_32 watchOS: the object fields region begins at
-                                    // `size_of::<ObjectHeader>()` past the user pointer — 24 on
-                                    // 64-bit, 20 on ILP32 (the trailing `keys_array` pointer is
-                                    // 4 bytes there). A hardcoded 24 writes every class field 4
-                                    // bytes off on a 32-bit watch; the paired inline read
+                                    // `size_of::<ObjectHeader>()` past the user pointer — 16 on
+                                    // both LP64 and ILP32 since #8047. A hardcoded offset writes
+                                    // class fields to the wrong word when the header changes; the paired inline read
                                     // (`property_get`) and the runtime setter must agree, so
                                     // derive it from the target triple (no-op on 64-bit; see
                                     // `target_layout`).
@@ -1512,6 +1513,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                                                 &class_name,
                                                 field_index,
                                             ),
+                                            "class_field_set",
                                         );
                                         None
                                     };

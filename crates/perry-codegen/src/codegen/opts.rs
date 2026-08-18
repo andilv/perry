@@ -519,6 +519,11 @@ pub struct ImportedClass {
     /// fix for the freestanding-function path. Empty Vec means "fall through
     /// to the old behavior (no rest)".
     pub method_has_rest: Vec<bool>,
+    /// Parallel to `method_names`. `true` identifies the rest-shaped trailing
+    /// slot that Perry synthesized for a source method which reads
+    /// `arguments`. Unlike a user `...rest` slot, this slot receives every
+    /// actual argument while the named parameters remain positional.
+    pub method_has_synthetic_arguments: Vec<bool>,
     /// Static field names defined on this class. Used to declare the foreign
     /// `@perry_static_<src>__<class>__<field>` global with external linkage
     /// so cross-module `[Parent.Symbol.X] = …` reads/writes resolve to the
@@ -697,6 +702,11 @@ pub(crate) struct CrossModuleCtx {
     /// rest-bundling in `lower_call.rs`'s static / dynamic dispatch
     /// arms. Closes #484. Sparse map (only `true` entries stored).
     pub method_has_rest: std::collections::HashMap<(String, String), bool>,
+    /// Per-`(class, method)` synthesized-`arguments` flag. This is a subset of
+    /// `method_has_rest`, but the call-site packing semantics differ: the
+    /// synthetic slot receives all actual arguments rather than only the
+    /// values after the visible parameters.
+    pub method_has_synthetic_arguments: std::collections::HashMap<(String, String), bool>,
     /// Per-class `keys_array` global variable names. Each entry maps
     /// `class_name → @perry_class_keys_<modprefix>__<sanitized_class>`.
     /// Built once in `compile_module` (one entry per class — local
@@ -720,6 +730,16 @@ pub(crate) struct CrossModuleCtx {
     /// describes — not a colliding same-named cross-module parent's fields.
     pub class_init_chains:
         std::collections::HashMap<String, Vec<(String, Vec<perry_hir::ClassField>)>>,
+    /// #8122: per-class inline-`new` header image — `class_name → (image
+    /// global name, packed GcHeader word, class id)`. The global is a `<2 x i64>` holding
+    /// `[gc_packed | class_id | ShapeId << 32]`, composed once at module init
+    /// right after the ShapeId mint (`string_pool.rs`); the inline allocator
+    /// loads it and stores an instance's 16-byte header prefix in one vector
+    /// store. The packed word is recorded so the allocation site can
+    /// cross-check the table against its own derivation before using it —
+    /// both come from `target_layout::inline_alloc_gc_packed`, but a header
+    /// word is not something to trust by argument.
+    pub class_header_images: std::collections::HashMap<String, (String, u64, u32)>,
     /// Imported class constructor function names. Maps class_name →
     /// full constructor symbol (e.g. "Editor" → "hone_editor_...__Editor_constructor").
     /// Populated from `opts.imported_classes`.
@@ -765,6 +785,13 @@ pub(crate) struct CrossModuleCtx {
     /// the mutation usually lives in a *different* function (or a constructor,
     /// or a field initializer) than the `new`, so a per-function walk misses it.
     pub module_dispatch: crate::collectors::ModuleDispatchFacts,
+    /// #8103: inline array-callback element parameters whose enclosing region
+    /// proved an exact, stable element shape. Closures compile independently,
+    /// so this module pre-pass carries the fact across that boundary.
+    pub array_callback_shapes: std::collections::HashMap<
+        u32,
+        std::collections::HashMap<u32, crate::collectors::PtrShapeLocal>,
+    >,
     /// Functions with a 3-param clamp pattern: fid → true. Call sites
     /// emit `@llvm.smax.i32` + `@llvm.smin.i32` instead of a function call.
     pub clamp3_functions: std::collections::HashSet<u32>,

@@ -28,6 +28,15 @@ use inkwell::{AddressSpace, FloatPredicate, IntPredicate};
 
 mod eh;
 mod types;
+mod vector;
+
+/// LLVM's numeric id for the `preserve_none` calling convention
+/// (`llvm::CallingConv::PreserveNone`, llvm/IR/CallingConv.h — 21 in the
+/// pinned LLVM 22 line). Must name the same convention as the textual token
+/// `crate::inst::PRESERVE_NONE_CC`; a define/call-site pair that disagrees
+/// is UB, so both the function value and every call/invoke site set this
+/// explicitly when the token is present.
+pub(crate) const LLVM_CC_PRESERVE_NONE: u32 = 21;
 
 use types::{basic_type, constant, fn_type_of, indirect_fn_type, strip_label, ty_and_val};
 #[cfg(test)]
@@ -174,6 +183,9 @@ struct ParsedHeader {
     /// build a module that verifies, runs, and has no precise roots. The
     /// native path must reproduce it or it is not building the same program.
     gc_strategy: Option<String>,
+    /// `preserve_nonecc` between linkage and return type (#8175). Applied as
+    /// the function's calling convention; every call site carries it too.
+    preserve_none: bool,
 }
 
 fn parse_header(header: &str) -> Result<ParsedHeader> {
@@ -203,6 +215,11 @@ fn parse_header(header: &str) -> Result<ParsedHeader> {
             }
             _ => {}
         }
+    }
+    let mut preserve_none = false;
+    if toks.peek() == Some(&crate::inst::PRESERVE_NONE_CC) {
+        preserve_none = true;
+        toks.next();
     }
     let ret_tok = toks
         .next()
@@ -276,6 +293,7 @@ fn parse_header(header: &str) -> Result<ParsedHeader> {
         attr_str,
         personality,
         gc_strategy,
+        preserve_none,
     })
 }
 
@@ -300,6 +318,9 @@ impl<'ctx, 'm> FnReader<'ctx, 'm> {
         };
         if let Some(l) = h.linkage {
             func.set_linkage(l);
+        }
+        if h.preserve_none {
+            func.set_call_conventions(LLVM_CC_PRESERVE_NONE);
         }
         Ok(func)
     }
@@ -529,6 +550,15 @@ impl<'ctx, 'm> FnReader<'ctx, 'm> {
                     .build_select(cond.into_int_value(), a, bv, dst.trim_start_matches('%'))
                     .map_err(be)?
             }
+            // Vector forms (#8228). These MUST be dispatched by name: the
+            // fallthrough below is the binary-op arm, which sees a
+            // three-operand `insertelement` as a malformed `add` and reports
+            // "bad binary op `insertelement` operands" — the failure that
+            // blocked every multi-unit module once #8204 started emitting the
+            // header-image compose.
+            "insertelement" => self.insert_element(dst, rest)?,
+            "extractelement" => self.extract_element(dst, rest)?,
+            "shufflevector" => self.shuffle_vector(dst, rest)?,
             _ => self.binary_or_cast(dst, op, rest)?,
         };
         self.def(dst, v)?;
@@ -763,6 +793,12 @@ impl<'ctx, 'm> FnReader<'ctx, 'm> {
             return self.call_asm(asm_rest).map(|_| None);
         }
 
+        // #8175: explicit calling-convention token before the return type.
+        let (rest, preserve_none) = match rest.strip_prefix(crate::inst::PRESERVE_NONE_CC) {
+            Some(tail) => (tail.trim_start(), true),
+            None => (rest, false),
+        };
+
         // Return type is the first top-level token; everything from the
         // callee marker on is `CALLEE(ARGS)[ #attrs]`.
         let callee_pos = rest
@@ -821,6 +857,9 @@ impl<'ctx, 'm> FnReader<'ctx, 'm> {
             .builder
             .build_indirect_call(fn_ty, callee_ptr, &args, name)
             .map_err(be)?;
+        if preserve_none {
+            site.set_call_convention(LLVM_CC_PRESERVE_NONE);
+        }
         match trailing_attr {
             "" => {}
             // `"gc-leaf-function"` (#7982): RS4GC reads it to decide the call
@@ -1018,6 +1057,14 @@ impl<'ctx, 'm> FnReader<'ctx, 'm> {
         let a = self.val(ty, atok)?;
         let b2 = self.val(ty, parts[1].trim())?;
         let nm = name;
+        if let (BasicValueEnum::VectorValue(av), BasicValueEnum::VectorValue(bv)) = (a, b2) {
+            // `expr/channel.rs` emits `mul`/`add` over `<4 x i32>`. The scalar
+            // arms below reach their operands through `into_int_value()`,
+            // which panics on a vector instead of erroring, so split first.
+            let out = self.vector_binary(op_base, nm, av, bv)?;
+            apply_flags(out.as_instruction_value(), &flag_tokens);
+            return Ok(out);
+        }
         let out: BasicValueEnum = match op_base {
             "add" => self
                 .builder
@@ -1476,6 +1523,7 @@ impl<'ctx, 'm> FnReader<'ctx, 'm> {
                 ret,
                 callee,
                 args,
+                cconv,
             } => {
                 let mut argv: Vec<BasicMetadataValueEnum> = Vec::with_capacity(args.len());
                 let mut argtys: Vec<inkwell::types::BasicMetadataTypeEnum> =
@@ -1504,6 +1552,15 @@ impl<'ctx, 'm> FnReader<'ctx, 'm> {
                             .unwrap_or(""),
                     )
                     .map_err(be)?;
+                match cconv {
+                    None => {}
+                    Some(cc) if *cc == crate::inst::PRESERVE_NONE_CC => {
+                        site.set_call_convention(LLVM_CC_PRESERVE_NONE);
+                    }
+                    // Closed dialect: an unknown token is a construction bug,
+                    // not something to normalize away silently.
+                    Some(cc) => bail!("unknown calling-convention token `{cc}`"),
+                }
                 if let Some(d) = dst {
                     match site.try_as_basic_value() {
                         inkwell::values::ValueKind::Basic(v) => self.def(d, v)?,

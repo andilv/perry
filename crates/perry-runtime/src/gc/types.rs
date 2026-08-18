@@ -772,6 +772,7 @@ pub(crate) fn gc_type_after_payload_move(obj_type: u8, old_user: usize, new_user
         }
         GcMoveHookKind::ClosureDynamicProps => {
             crate::closure::closure_dynamic_props_owner_moved(old_user, new_user);
+            crate::closure::closure_box_captures_owner_moved(old_user, new_user);
         }
         GcMoveHookKind::MapSideTables => {
             crate::map::map_header_moved_for_gc(old_user, new_user);
@@ -1091,7 +1092,9 @@ pub const OBJ_FLAG_HAS_DESCRIPTORS: u16 = 0x800;
 /// Heap class-expression value (`class C {}`), as distinct from an ordinary
 /// instance carrying the same `GC_TYPE_OBJECT` allocation tag. This is the
 /// authoritative replacement for `ObjectHeader::object_type ==
-/// OBJECT_TYPE_CLASS`; the legacy payload word remains an ABI mirror until
+/// OBJECT_TYPE_CLASS`; #8113 deleted that legacy payload word — the note below
+/// is history, kept because it explains why the kind lives in the descriptor
+/// rather than in
 /// #8047 removes it. Bit 13 is preserved by survival-age and layout-state
 /// updates and is otherwise unused for `GC_TYPE_OBJECT`.
 // #2145: this object is a per-kind `<TypedArrayCtor>.prototype` whose

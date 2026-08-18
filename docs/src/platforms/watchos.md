@@ -103,12 +103,15 @@ them into a fat binary — see [Publishing to the App Store](watchos-app-store.m
 > **Hardcoded struct-field offsets are the other arm64_32 trap.** A heap header
 > whose layout includes a pointer shifts on arm64_32 — e.g. `ClosureHeader`'s
 > `type_tag` sits at +12 after an 8-byte `func_ptr` on 64-bit but at +8 after a
-> 4-byte one on ILP32, and `ObjectHeader`'s field region starts at +24 on 64-bit
-> but +20 on ILP32 (the trailing `keys_array` pointer is 4 bytes). NEVER hardcode
+> 4-byte one on ILP32, while `ObjectHeader`'s field region starts at +16 on
+> both layouts (#8047 removes the derived `keys_array` word and ILP32 retains
+> explicit alignment padding). Those numbers were +32/+24 before #8113 and
+> +24/+16 before #8047; that is exactly why they must be
+> derived, not written down. NEVER hardcode
 > such an offset: in `perry-runtime` use `std::mem::offset_of!` / `size_of`
 > (these track the target); in `perry-codegen` (which runs on the host but emits
 > for the target) derive it from the target triple via `crate::target_layout`.
-> Hardcoded `12` (closure magic) and `24` (`ObjectHeader` size) were the original
+> Hardcoded `12` (closure magic) and a hardcoded `ObjectHeader` size were the original
 > arm64_32 startup-crash root causes — a real getter failed its `CLOSURE_MAGIC`
 > probe, was judged non-callable, and the resulting `TypeError` value-coercion
 > dereferenced the closure as an object.

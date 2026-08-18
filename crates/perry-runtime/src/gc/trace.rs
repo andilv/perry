@@ -545,13 +545,18 @@ pub(super) fn take_mark_seeds() -> Vec<*mut GcHeader> {
 
 #[inline]
 pub(super) fn clear_mark_seeds() {
-    MARK_SEEDS.with(|cell| unsafe {
+    // An unfinished budgeted cycle is owned by another TLS value. During
+    // thread teardown its Drop may run after MARK_SEEDS has already been
+    // destroyed; at that point there is no surviving mutator that could
+    // consume these seeds. `try_with` keeps normal cleanup identical while
+    // making the teardown path order-independent.
+    let _ = MARK_SEEDS.try_with(|cell| unsafe {
         (*cell.get()).clear();
     });
 }
 
 #[inline]
-pub(super) fn try_mark_value(value_bits: u64, valid_ptrs: &ValidPointerSet) -> bool {
+pub(crate) fn try_mark_value(value_bits: u64, valid_ptrs: &ValidPointerSet) -> bool {
     let tag = value_bits & TAG_MASK;
     // Hot-path tag rejection. POINTER_TAG / STRING_TAG / BIGINT_TAG are
     // the only NaN-tags that wrap a heap pointer; everything else
@@ -564,6 +569,12 @@ pub(super) fn try_mark_value(value_bits: u64, valid_ptrs: &ValidPointerSet) -> b
     }
     let ptr_val = (value_bits & POINTER_MASK) as usize;
     if ptr_val == 0 {
+        return false;
+    }
+
+    if crate::proxy::gc_full_trace_active()
+        && crate::proxy::gc_observe_traced_value(value_bits, valid_ptrs)
+    {
         return false;
     }
 
@@ -630,6 +641,11 @@ pub(super) unsafe fn mark_field_into_worklist(
     valid_ptrs: &ValidPointerSet,
     worklist: &mut Vec<*mut GcHeader>,
 ) -> bool {
+    if crate::proxy::gc_full_trace_active()
+        && crate::proxy::gc_observe_traced_value(val_bits, valid_ptrs)
+    {
+        return false;
+    }
     let tag = val_bits & TAG_MASK;
     let ptr_val: usize = if tag == POINTER_TAG || tag == STRING_TAG || tag == BIGINT_TAG {
         let p = (val_bits & POINTER_MASK) as usize;
@@ -997,15 +1013,25 @@ pub(super) unsafe fn trace_heap_rewrite_slots(
     valid_ptrs: &ValidPointerSet,
     worklist: &mut Vec<*mut GcHeader>,
 ) {
-    visit_gc_rewrite_slots(header, |slot| unsafe {
-        if crate::weakref::is_weak_target_trace_slot(header, slot.slot) {
+    visit_gc_rewrite_slot_descriptors(header, |descriptor| unsafe {
+        if let GcMutableSlotDescriptor::PointerFreeRange(range) = descriptor {
+            if crate::proxy::gc_full_trace_active() {
+                for i in 0..range.slot_count() {
+                    crate::proxy::gc_observe_traced_value(*range.slot(i), valid_ptrs);
+                }
+            }
             return;
         }
-        slot.record_layout_read();
-        if slot.layout_kind.is_some() {
-            record_trace_slot_read();
-        }
-        mark_field_into_worklist(*slot.slot, valid_ptrs, worklist);
+        descriptor.visit_slots(&mut |slot| {
+            if crate::weakref::is_weak_target_trace_slot(header, slot.slot) {
+                return;
+            }
+            slot.record_layout_read();
+            if slot.layout_kind.is_some() {
+                record_trace_slot_read();
+            }
+            mark_field_into_worklist(*slot.slot, valid_ptrs, worklist);
+        });
     });
 }
 

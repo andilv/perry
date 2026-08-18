@@ -552,7 +552,6 @@ impl Promise {
 /// result to `next`. Saves one Promise allocation per `await` of a
 /// primitive value, which is the steady-state pattern for the async-to-
 /// generator transform.
-#[derive(Clone)]
 pub(crate) enum Task {
     Promise(*mut Promise, f64, bool, AsyncContextSnapshot),
     PromiseAll(
@@ -576,8 +575,17 @@ pub(crate) enum Task {
     /// is a wrapper that calls `step(value, is_error)` — but skips the
     /// then_v_arrow alloc + dispatch by carrying `step_closure` and
     /// the `is_error` flag directly. Saves one closure allocation
-    /// per await on the steady-state primitive-await path.
-    AsyncStep(ClosurePtr, f64, *mut Promise, bool, AsyncContextSnapshot),
+    /// per await on the steady-state primitive-await path. The final field is
+    /// an owning reference to malloc-side activation metadata, not a GC root;
+    /// dispatch must release it exactly once (including `longjmp` recovery).
+    AsyncStep(
+        ClosurePtr,
+        f64,
+        *mut Promise,
+        bool,
+        AsyncContextSnapshot,
+        *mut crate::r#box::AsyncBoxActivation,
+    ),
 }
 
 // Global task queue for pending promise callbacks. Must be FIFO per
@@ -625,7 +633,15 @@ pub(crate) static TASK_QUEUE: RefCell<std::collections::VecDeque<Task>>
     /// activation, not a NESTED one whose own `next` shouldn't be
     /// collapsed onto its parent's).
     pub(crate) static INLINE_TRAP: std::cell::Cell<InlineTrap>
-        = const { std::cell::Cell::new(InlineTrap { trap_next: std::ptr::null_mut(), current_step: 0 }) };
+        = const { std::cell::Cell::new(InlineTrap { trap_next: std::ptr::null_mut(), current_step: 0, box_activation: std::ptr::null_mut() }) };
+
+    /// Explicitly-owned running activation references. This is a stack rather
+    /// than a single slot because microtask drains are re-entrant. The normal
+    /// tail pops one entry; a `longjmp` trap drains only entries pushed since
+    /// that runner's entry depth, compensating for destructors/tails skipped by
+    /// the non-local jump without touching an enclosing activation.
+    pub(crate) static ASYNC_BOX_EXECUTION_REFS: std::cell::RefCell<Vec<*mut crate::r#box::AsyncBoxActivation>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 
     /// Defensive re-entry guard for the async step driver (issue #712).
     ///
@@ -648,13 +664,21 @@ pub(crate) static TASK_QUEUE: RefCell<std::collections::VecDeque<Task>>
     /// the step dispatch. This bounds the worst-case loop at
     /// `ASYNC_STEP_REENTRY_BOUND` iterations instead of unbounded.
     pub(crate) static ASYNC_STEP_GUARD: std::cell::Cell<AsyncStepGuard>
-        = const { std::cell::Cell::new(AsyncStepGuard { last_closure: 0, consecutive_error_count: 0 }) };
+        = const { std::cell::Cell::new(AsyncStepGuard { consecutive_error_count: 0 }) };
 }
 
 /// Defensive guard state for the async step driver. See `ASYNC_STEP_GUARD`.
+///
+/// #8193: this used to carry a `last_closure: usize` — the address of the
+/// closure that took the last erroring step. The same-closure check that read
+/// it was deleted when #712/#921/#922 showed a runaway loop ALTERNATES between
+/// two closures, so the field became write-only. It was not inert, though: it
+/// was a raw heap address that `scan_promise_roots_mut` REKEYED without
+/// marking, and nothing pruned it when the closure died — the #8040 shape (see
+/// `gc::dead_owner`). The fix for state nobody reads is to delete it, not to
+/// maintain it correctly.
 #[derive(Copy, Clone)]
 pub(crate) struct AsyncStepGuard {
-    pub last_closure: usize,
     pub consecutive_error_count: u32,
 }
 
@@ -1117,6 +1141,10 @@ pub(crate) fn restore_all_microtask_contexts() {
 pub(crate) struct InlineTrap {
     pub trap_next: *mut Promise,
     pub current_step: usize,
+    /// Stable malloc-side reachability token for the currently executing
+    /// plain-async activation. Unlike `current_step`, this address is not in
+    /// the moving GC heap.
+    pub box_activation: *mut crate::r#box::AsyncBoxActivation,
 }
 
 impl InlineTrap {
@@ -1125,8 +1153,41 @@ impl InlineTrap {
         InlineTrap {
             trap_next: std::ptr::null_mut(),
             current_step: 0,
+            box_activation: std::ptr::null_mut(),
         }
     }
+}
+
+#[inline]
+pub(crate) fn current_async_box_activation() -> *mut crate::r#box::AsyncBoxActivation {
+    INLINE_TRAP.with(|trap| trap.get().box_activation)
+}
+
+#[inline]
+pub(crate) fn push_async_box_execution_ref(activation: *mut crate::r#box::AsyncBoxActivation) {
+    ASYNC_BOX_EXECUTION_REFS.with(|refs| refs.borrow_mut().push(activation));
+}
+
+#[inline]
+pub(crate) fn pop_async_box_execution_ref(expected: *mut crate::r#box::AsyncBoxActivation) {
+    ASYNC_BOX_EXECUTION_REFS.with(|refs| {
+        let actual = refs.borrow_mut().pop().unwrap_or(std::ptr::null_mut());
+        debug_assert_eq!(actual, expected);
+    });
+}
+
+pub(crate) fn async_box_execution_ref_depth() -> usize {
+    ASYNC_BOX_EXECUTION_REFS.with(|refs| refs.borrow().len())
+}
+
+pub(crate) fn unwind_async_box_execution_refs(depth: usize) {
+    ASYNC_BOX_EXECUTION_REFS.with(|refs| {
+        let mut refs = refs.borrow_mut();
+        debug_assert!(depth <= refs.len());
+        for activation in refs.drain(depth..) {
+            crate::r#box::release_async_box_activation(activation);
+        }
+    });
 }
 
 /// Returns 1 iff the current thread's microtask queue has at least one

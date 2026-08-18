@@ -38,7 +38,7 @@ pub(crate) use numeric::{
 pub(crate) use pod::{
     add_operands_have_pod_materialization_hazard,
     expr_may_return_boxed_value_from_raw_f64_fallback, expression_has_numeric_length,
-    is_fixed_width_buffer_numeric_read, is_numeric_typed_array_class,
+    is_fixed_width_buffer_numeric_read, is_numeric_typed_array_class, is_typed_array_expr,
     numeric_proof_is_declared_only, pod_record_field_is_numeric,
     scalar_replaced_array_element_is_raw_f64, scalar_replaced_field_is_raw_f64,
     scalar_replaced_field_raw_f64_store_state,
@@ -51,6 +51,8 @@ pub(crate) use predicates::{
 // `super::*`) can keep calling `tuple_index_literal` directly.
 #[cfg(test)]
 pub(crate) use predicates::tuple_index_literal;
+#[cfg(test)]
+pub(crate) use refine::is_imported_native_constructor_class;
 pub(crate) use refine::{
     compute_auto_captures, declared_array_property_claim, is_crypto_digest_chain,
     is_global_constructor_expr, is_process_namespace_version_property, proven_type_from_init,

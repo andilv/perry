@@ -14,6 +14,61 @@ static I32_BOX_SET_NULL_COUNT: AtomicU64 = AtomicU64::new(0);
 static BOOL_BOX_GET_NULL_COUNT: AtomicU64 = AtomicU64::new(0);
 static BOOL_BOX_SET_NULL_COUNT: AtomicU64 = AtomicU64::new(0);
 
+// #7933 follow-up (async-state RSS accumulation) — release/reuse telemetry.
+// `allocs` counts every `js_*box_alloc*` call, `pool_reuses` the subset served
+// from the free pool instead of `std::alloc`, `releases` the cells parked by
+// `js_*box_release`. `allocs - pool_reuses` is the number of cells ever
+// malloc'd — the process-lifetime malloc residue the regression test gates on.
+static BOX_ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
+static BOX_POOL_REUSE_COUNT: AtomicU64 = AtomicU64::new(0);
+static BOX_RELEASE_COUNT: AtomicU64 = AtomicU64::new(0);
+// Diagnostic-only (#8208 tuning): how often the quarantine actually drains,
+// and how many cells that published. A pool whose high-water mark is 41x one
+// batch's working set is a flush-frequency question, not a pool-size question.
+static BOX_FLUSH_COUNT: AtomicU64 = AtomicU64::new(0);
+static BOX_FLUSH_PUBLISHED: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of the release/reuse counters: `(allocs, pool_reuses, releases)`.
+/// Sums all three box kinds.
+pub fn box_release_stats() -> (u64, u64, u64) {
+    (
+        BOX_ALLOC_COUNT.load(Ordering::Relaxed),
+        BOX_POOL_REUSE_COUNT.load(Ordering::Relaxed),
+        BOX_RELEASE_COUNT.load(Ordering::Relaxed),
+    )
+}
+
+/// `PERRY_GC_DIAG=1`: one line at process exit with the box release/reuse
+/// counters and the surviving registry populations. `resident = allocs -
+/// pool_reuses` is the number of cells that cost a real `std::alloc`
+/// allocation over the process lifetime — the quantity that grew linearly
+/// with completed async activations before the #7933 follow-up. Emitted from
+/// the same exit funnel as the other GC diagnostics
+/// (`js_gc_release_current_thread_collection_side_allocations`).
+pub fn report_box_stats_at_exit() {
+    if !crate::gc::gc_diag_enabled() {
+        return;
+    }
+    static EMITTED: AtomicU64 = AtomicU64::new(0);
+    if EMITTED.swap(1, Ordering::SeqCst) != 0 {
+        return;
+    }
+    let (allocs, reuses, releases) = box_release_stats();
+    let (reg, i32_reg, bool_reg) = (
+        BOX_REGISTRY.with(|r| r.borrow().len()),
+        I32_BOX_REGISTRY.with(|r| r.borrow().len()),
+        BOOL_BOX_REGISTRY.with(|r| r.borrow().len()),
+    );
+    eprintln!(
+        "[box-stats] allocs={allocs} pool_reuses={reuses} releases={releases} \
+         resident_cells={} registry_len={reg} i32_registry_len={i32_reg} \
+         bool_registry_len={bool_reg} flushes={} published={}",
+        allocs.saturating_sub(reuses),
+        BOX_FLUSH_COUNT.load(Ordering::Relaxed),
+        BOX_FLUSH_PUBLISHED.load(Ordering::Relaxed),
+    );
+}
+
 /// A box is simply a heap-allocated JSValue bit slot.
 #[repr(C)]
 pub struct Box {
@@ -86,12 +141,16 @@ crate::perry_thread_local! {
     ///
     /// ## Why caching only positives is sound
     ///
-    /// The registries are **monotonic**: `js_box_alloc*` inserts and nothing
-    /// ever removes (boxes are never freed — see `is_registered_box_ptr`). So
-    /// "address A was in the registry" is a fact that can never later become
-    /// false, and an address can never be recycled into a non-box allocation.
-    /// A cache hit is therefore exactly as authoritative as the probe it
-    /// replaces.
+    /// Box-cell memory is **never returned to the allocator**: an address
+    /// minted by `js_*box_alloc*` is a box cell for the life of the thread —
+    /// live in the registry, or (since the #7933 follow-up) parked in the
+    /// release quarantine/free pool, but never recycled into a non-box
+    /// allocation. `js_*box_release` removes a cell from the registry AND
+    /// evicts it from this cache (`box_ptr_cache_evict`), so a cache hit
+    /// still implies "currently registered": the only writer that removes a
+    /// registry entry clears the matching cache slot in the same call, on
+    /// the same thread. A hit is therefore exactly as authoritative as the
+    /// probe it replaces.
     ///
     /// A **negative** cache would NOT be sound — an address that is not a box
     /// today can be minted as one tomorrow — so a miss always falls through to
@@ -107,6 +166,458 @@ crate::perry_thread_local! {
         const { [const { std::cell::Cell::new(0) }; BOX_PTR_CACHE_SLOTS] };
     static BOOL_BOX_PTR_CACHE: [std::cell::Cell<usize>; BOX_PTR_CACHE_SLOTS] =
         const { [const { std::cell::Cell::new(0) }; BOX_PTR_CACHE_SLOTS] };
+}
+
+crate::perry_thread_local! {
+    /// #7933 follow-up: reusable cells for each box kind, plus the fallback
+    /// quarantine used by release calls made outside a tracked activation.
+    ///
+    /// `js_*box_release` names every cell in a completed plain-async frame.
+    /// The async pump retains the activation token for queued/running steps.
+    /// When those drain, each uncaptured cell clears and publishes while a
+    /// closure-captured cell remains pending until its own capture count is
+    /// zero. `js_*box_alloc*` pops the matching free list before touching
+    /// `std::alloc`.
+    ///
+    /// ## Why the per-activation boundary is sound
+    ///
+    /// Before the activation reference count reaches zero, every terminal cell
+    /// remains registered and unchanged because a queued/running resume can
+    /// still observe the frame. At zero, the frame splits into independent
+    /// cells: GC closure capture indexes follow moves and keep only the exact
+    /// captured cells live until authoritative death pruning drops their final
+    /// counts. Clearing and reuse therefore happen at each exact reachability
+    /// boundary instead of one captured cell retaining the whole frame.
+    ///
+    /// Memory safety is unconditional either way: cells only ever move
+    /// between the registry, the quarantine and the pool — they are never
+    /// handed back to the allocator — so every address ever minted by
+    /// `js_*box_alloc*` stays a valid box cell for the life of the thread.
+    /// That preserves the two properties the never-free design bought:
+    /// perry#4898's rejection of foreign pointers (an address is either a
+    /// live registered cell or an inert parked one) and #7906's positive
+    /// pointer cache ("was a box" can never become "is another object").
+    ///
+    /// NOT a GC root: published cells are cleared before parking, and the
+    /// addresses themselves are `std::alloc` memory, not GC-heap pointers.
+    /// The root-holder census intentionally does not classify bare core-crate
+    /// integer tables of this shape; its documented rule-B limit applies.
+    /// Head of the per-kind INTRUSIVE free list; 0 is the empty list.
+    ///
+    /// A free cell's own 8 bytes hold the address of the next free cell, so
+    /// the reuse pool costs **zero** bytes of side table. That is not a
+    /// micro-optimisation: a `Vec<usize>` pool is one 8-byte slot per cell on
+    /// top of the cell, and the pool's high-water mark is ~330 cells per unit
+    /// of PEAK CONCURRENCY (measured: `resident_cells / SIZE` is 329-334
+    /// across a 16x sweep), held for the life of the thread. At SIZE=200 that
+    /// side table was ~1 MB and made small async workloads a net RSS
+    /// REGRESSION; threading the list through the cells removes it entirely.
+    ///
+    /// Overwriting the cell is why this list holds only cells that are past
+    /// their activation's reachability boundary. Pending cells retain their
+    /// real value while a closure can observe it; both the activation step
+    /// boundary and that cell's capture count must be clear before its bytes
+    /// become an intrusive link.
+    static BOX_FREE_HEAD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static I32_BOX_FREE_HEAD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BOOL_BOX_FREE_HEAD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BOX_RELEASE_QUARANTINE: std::cell::RefCell<Vec<usize>> =
+        std::cell::RefCell::new(Vec::new());
+    static I32_BOX_RELEASE_QUARANTINE: std::cell::RefCell<Vec<usize>> =
+        std::cell::RefCell::new(Vec::new());
+    static BOOL_BOX_RELEASE_QUARANTINE: std::cell::RefCell<Vec<usize>> =
+        std::cell::RefCell::new(Vec::new());
+
+    /// Stable non-GC activation tokens. Tokens are recycled rather than freed;
+    /// a pending-await thunk captures the token pointer plus its generation and
+    /// can therefore reject a stale capture without a per-activation HashMap.
+    /// The control block contains no GC pointers and does not move when the
+    /// collector relocates the activation's step closure or result Promise.
+    static NEXT_ASYNC_BOX_ACTIVATION_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+    static ASYNC_BOX_ACTIVATION_FREE_HEAD: std::cell::Cell<*mut AsyncBoxActivation> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
+    /// Tagged cell addresses released by tracked activations. An activation's
+    /// entries are one contiguous range because `ReleaseBoxes` contains only
+    /// adjacent, non-reentrant runtime calls. Published ranges become zeroed
+    /// holes and trailing holes are popped, so capacity is bounded by delayed
+    /// activations plus one releasing frame rather than process history.
+    static ASYNC_RELEASED_CELLS: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Cells already named by a terminal `ReleaseBoxes`. They remain live and
+    /// registered while an escaped closure can still read them. The value is
+    /// the cell-kind tag plus `ASYNC_RELEASE_DRAINED` once queued/running step
+    /// owners are gone; at that point a zero capture count publishes the cell.
+    static ASYNC_PENDING_RELEASES: std::cell::RefCell<crate::fast_hash::PtrHashMap<usize, usize>> =
+        std::cell::RefCell::new(crate::fast_hash::new_ptr_hash_map());
+}
+
+/// Malloc-side reachability token for one lowered plain-async activation.
+///
+/// `refs` counts the lifecycle owner plus queued/running async-step owners.
+/// At zero, unobserved terminal cells publish immediately; a closure-captured
+/// cell detaches from the activation and publishes independently when its own
+/// capture count reaches zero.
+pub(crate) struct AsyncBoxActivation {
+    id: u64,
+    refs: std::cell::Cell<usize>,
+    lifecycle_owned: std::cell::Cell<bool>,
+    release_start: std::cell::Cell<usize>,
+    release_end: std::cell::Cell<usize>,
+    next_free: std::cell::Cell<*mut AsyncBoxActivation>,
+}
+
+const NO_RELEASE_RANGE: usize = usize::MAX;
+const ASYNC_RELEASE_JS: usize = 1;
+const ASYNC_RELEASE_I32: usize = 2;
+const ASYNC_RELEASE_BOOL: usize = 3;
+const ASYNC_RELEASE_TAG_MASK: usize = 0b11;
+const ASYNC_RELEASE_DRAINED: usize = 0b100;
+
+/// Create the stable token for a plain-async activation. The activation
+/// lifecycle owns the initial reference until a terminal release (or
+/// `js_async_step_done`) marks the activation complete.
+pub(crate) fn new_async_box_activation() -> *mut AsyncBoxActivation {
+    let id = NEXT_ASYNC_BOX_ACTIVATION_ID.with(|next| {
+        let id = next.get();
+        // IDs are stored losslessly in a closure's f64 capture. Reaching 2^53
+        // activations in one thread is not realistic; wrapping to 1 keeps 0 as
+        // the permanent "not a tracked plain-async activation" sentinel.
+        let following = if id >= (1u64 << 53) - 1 { 1 } else { id + 1 };
+        next.set(following);
+        id
+    });
+    let ptr = ASYNC_BOX_ACTIVATION_FREE_HEAD.with(|head| {
+        let ptr = head.get();
+        if ptr.is_null() {
+            std::boxed::Box::into_raw(std::boxed::Box::new(AsyncBoxActivation {
+                id,
+                refs: std::cell::Cell::new(1),
+                lifecycle_owned: std::cell::Cell::new(true),
+                release_start: std::cell::Cell::new(NO_RELEASE_RANGE),
+                release_end: std::cell::Cell::new(NO_RELEASE_RANGE),
+                next_free: std::cell::Cell::new(std::ptr::null_mut()),
+            }))
+        } else {
+            unsafe {
+                head.set((*ptr).next_free.get());
+                (*ptr).id = id;
+                (*ptr).refs.set(1);
+                (*ptr).lifecycle_owned.set(true);
+                (*ptr).release_start.set(NO_RELEASE_RANGE);
+                (*ptr).release_end.set(NO_RELEASE_RANGE);
+                (*ptr).next_free.set(std::ptr::null_mut());
+            }
+            ptr
+        }
+    });
+    ptr
+}
+
+#[inline]
+pub(crate) fn async_box_activation_id(ptr: *mut AsyncBoxActivation) -> u64 {
+    if ptr.is_null() {
+        0
+    } else {
+        unsafe { (*ptr).id }
+    }
+}
+
+/// Validate the stable token pointer + generation captured by a pending-await
+/// thunk. Token storage is never freed, so reading it is safe even after the
+/// token was recycled; the generation and lifecycle bit reject that stale
+/// capture without a HashMap lookup on every async activation.
+pub(crate) fn find_async_box_activation(
+    ptr: *mut AsyncBoxActivation,
+    id: u64,
+) -> *mut AsyncBoxActivation {
+    if ptr.is_null() || id == 0 {
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        if (*ptr).id == id && (*ptr).lifecycle_owned.get() && (*ptr).refs.get() > 0 {
+            ptr
+        } else {
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[inline]
+pub(crate) fn retain_async_box_activation(ptr: *mut AsyncBoxActivation) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        let old = (*ptr).refs.get();
+        debug_assert!(old > 0);
+        (*ptr).refs.set(
+            old.checked_add(1)
+                .expect("async activation refcount overflow"),
+        );
+    }
+}
+
+/// Resolve a raw closure-capture word to a currently registered box address.
+pub(crate) fn registered_box_capture_addr(addr: usize) -> Option<usize> {
+    if !is_plausible_box_ptr(addr as *mut Box) {
+        return None;
+    }
+    let ptr = addr as *mut Box;
+    let is_live_box = is_registered_box_ptr(ptr)
+        || is_registered_i32_box_ptr(ptr.cast::<I32Box>())
+        || is_registered_bool_box_ptr(ptr.cast::<BoolBox>());
+    is_live_box.then_some(addr)
+}
+
+#[inline]
+pub(crate) fn release_async_box_activation(ptr: *mut AsyncBoxActivation) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        let old = (*ptr).refs.get();
+        debug_assert!(old > 0);
+        let new = old - 1;
+        (*ptr).refs.set(new);
+        if new == 0 {
+            debug_assert!(!(*ptr).lifecycle_owned.get());
+            publish_async_activation_cells(ptr);
+            ASYNC_BOX_ACTIVATION_FREE_HEAD.with(|head| {
+                (*ptr).next_free.set(head.get());
+                head.set(ptr);
+            });
+        }
+    }
+}
+
+fn park_async_activation_cell(activation: *mut AsyncBoxActivation, addr: usize, tag: usize) {
+    debug_assert!(!activation.is_null());
+    debug_assert_eq!(addr & ASYNC_RELEASE_TAG_MASK, 0);
+    debug_assert!((ASYNC_RELEASE_JS..=ASYNC_RELEASE_BOOL).contains(&tag));
+    ASYNC_RELEASED_CELLS.with(|cells| {
+        let mut cells = cells.borrow_mut();
+        unsafe {
+            let start = (*activation).release_start.get();
+            if start == NO_RELEASE_RANGE {
+                (*activation).release_start.set(cells.len());
+            } else {
+                debug_assert_eq!(
+                    (*activation).release_end.get(),
+                    cells.len(),
+                    "ReleaseBoxes calls for one activation must be contiguous"
+                );
+            }
+            cells.push(addr | tag);
+            (*activation).release_end.set(cells.len());
+        }
+    });
+}
+
+fn push_free_cell(addr: usize, head: &'static crate::tls_hot::HotKey<std::cell::Cell<usize>>) {
+    head.with(|head| {
+        let next = head.get();
+        debug_assert_eq!(addr % ALIGN_OF_BOX_CELL, 0);
+        unsafe { (addr as *mut usize).write(next) };
+        head.set(addr);
+    });
+}
+
+fn publish_box_cell(addr: usize, tag: usize) {
+    match tag {
+        ASYNC_RELEASE_JS => {
+            BOX_REGISTRY.with(|r| {
+                r.borrow_mut().remove(&addr);
+            });
+            box_ptr_cache_evict(&BOX_PTR_CACHE, addr);
+            unsafe { (*(addr as *mut Box)).value = crate::value::TAG_UNDEFINED };
+            push_free_cell(addr, &BOX_FREE_HEAD);
+        }
+        ASYNC_RELEASE_I32 => {
+            I32_BOX_REGISTRY.with(|r| {
+                r.borrow_mut().remove(&addr);
+            });
+            box_ptr_cache_evict(&I32_BOX_PTR_CACHE, addr);
+            unsafe { (*(addr as *mut I32Box)).value = -1 };
+            push_free_cell(addr, &I32_BOX_FREE_HEAD);
+        }
+        ASYNC_RELEASE_BOOL => {
+            BOOL_BOX_REGISTRY.with(|r| {
+                r.borrow_mut().remove(&addr);
+            });
+            box_ptr_cache_evict(&BOOL_BOX_PTR_CACHE, addr);
+            unsafe { (*(addr as *mut BoolBox)).value = true };
+            push_free_cell(addr, &BOOL_BOX_FREE_HEAD);
+        }
+        _ => unreachable!("invalid async released-cell tag"),
+    }
+    ASYNC_PENDING_RELEASES.with(|pending| {
+        pending.borrow_mut().remove(&addr);
+    });
+    BOX_FLUSH_PUBLISHED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn box_capture_count_reached_zero(addr: usize) {
+    let pending = ASYNC_PENDING_RELEASES
+        .with(|releases| releases.borrow().get(&addr).copied())
+        .unwrap_or(0);
+    if pending & ASYNC_RELEASE_DRAINED != 0 {
+        publish_box_cell(addr, pending & ASYNC_RELEASE_TAG_MASK);
+    }
+}
+
+/// Expose a drained, closure-owned JS box's payload to the closure tracer.
+/// The exact-capture table may also contain i32/bool box addresses; requiring
+/// the pending JS tag is the authoritative type discriminator before the
+/// pointer is dereferenced as [`Box`].
+pub(crate) fn visit_pending_captured_js_box_payload_slot(
+    addr: usize,
+    visit: &mut dyn FnMut(*mut u64),
+) {
+    let is_pending_js = ASYNC_PENDING_RELEASES.with(|pending| {
+        pending
+            .borrow()
+            .get(&addr)
+            .is_some_and(|tag| *tag == (ASYNC_RELEASE_JS | ASYNC_RELEASE_DRAINED))
+    });
+    if is_pending_js && BOX_REGISTRY.with(|registry| registry.borrow().contains(&addr)) {
+        let ptr = addr as *mut Box;
+        unsafe { visit(&raw mut (*ptr).value) };
+    }
+}
+
+fn begin_pending_release(addr: usize, tag: usize) -> bool {
+    ASYNC_PENDING_RELEASES.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        if pending.contains_key(&addr) {
+            false
+        } else {
+            pending.insert(addr, tag);
+            true
+        }
+    })
+}
+
+fn publish_async_activation_cells(activation: *mut AsyncBoxActivation) {
+    let (start, end) = unsafe {
+        (
+            (*activation).release_start.get(),
+            (*activation).release_end.get(),
+        )
+    };
+    if start == NO_RELEASE_RANGE {
+        return;
+    }
+    ASYNC_RELEASED_CELLS.with(|cells| {
+        let mut cells = cells.borrow_mut();
+        debug_assert!(start <= end && end <= cells.len());
+        for tagged in &mut cells[start..end] {
+            let value = *tagged;
+            if value == 0 {
+                continue;
+            }
+            let addr = value & !ASYNC_RELEASE_TAG_MASK;
+            let tag = value & ASYNC_RELEASE_TAG_MASK;
+            if crate::closure::box_capture_count(addr) == 0 {
+                publish_box_cell(addr, tag);
+            } else {
+                ASYNC_PENDING_RELEASES.with(|pending| {
+                    let previous = pending
+                        .borrow_mut()
+                        .insert(addr, tag | ASYNC_RELEASE_DRAINED);
+                    debug_assert_eq!(previous, Some(tag));
+                });
+            }
+            *tagged = 0;
+        }
+        while cells.last() == Some(&0) {
+            cells.pop();
+        }
+    });
+}
+
+/// Drop the activation lifecycle's owner at terminal state. Queued or running
+/// steps keep their own references; the cells publish only when the last of
+/// those references is released. `replace(false)` makes duplicate terminal
+/// releases idempotent without a per-activation registry lookup.
+pub(crate) fn finish_async_box_activation(ptr: *mut AsyncBoxActivation) {
+    if ptr.is_null() {
+        return;
+    }
+    if unsafe { (*ptr).lifecycle_owned.replace(false) } {
+        release_async_box_activation(ptr);
+    }
+}
+
+fn publish_released_cells(
+    cells: &mut Vec<usize>,
+    head: &'static crate::tls_hot::HotKey<std::cell::Cell<usize>>,
+) {
+    if cells.is_empty() {
+        return;
+    }
+    BOX_FLUSH_PUBLISHED.fetch_add(cells.len() as u64, Ordering::Relaxed);
+    head.with(|h| {
+        let mut next = h.get();
+        for addr in cells.drain(..) {
+            debug_assert_eq!(addr % ALIGN_OF_BOX_CELL, 0);
+            unsafe { (addr as *mut usize).write(next) };
+            next = addr;
+        }
+        h.set(next);
+    });
+}
+
+/// Drain the release quarantines into the free pools. Called at the
+/// outermost microtask-pump exit once TASK_QUEUE is empty (see the
+/// QUARANTINE doc above for why that boundary), and by tests.
+pub fn flush_released_boxes() {
+    BOX_FLUSH_COUNT.fetch_add(1, Ordering::Relaxed);
+    for (q, head) in [
+        (&BOX_RELEASE_QUARANTINE, &BOX_FREE_HEAD),
+        (&I32_BOX_RELEASE_QUARANTINE, &I32_BOX_FREE_HEAD),
+        (&BOOL_BOX_RELEASE_QUARANTINE, &BOOL_BOX_FREE_HEAD),
+    ] {
+        q.with(|q| {
+            let mut q = q.borrow_mut();
+            if q.is_empty() {
+                return;
+            }
+            publish_released_cells(&mut q, head);
+            // Deliberately NOT shrunk. The quarantine is refilled to roughly
+            // the same size every interval, so handing the buffer back here
+            // just makes the next interval re-grow it: measured, shrinking to
+            // 1 KiB each flush cost +5.3 MB peak RSS at BATCHES=1200 in
+            // allocator churn, which is the opposite of the point.
+        });
+    }
+}
+
+/// Every box cell is exactly one pointer wide, which is what lets the free
+/// list live inside the cells. Asserted rather than assumed: a field added to
+/// any box struct would silently make the link write out of bounds.
+const ALIGN_OF_BOX_CELL: usize = std::mem::align_of::<Box>();
+const _: () = {
+    assert!(std::mem::size_of::<Box>() == std::mem::size_of::<usize>());
+    assert!(std::mem::size_of::<I32Box>() == std::mem::size_of::<usize>());
+    assert!(std::mem::size_of::<BoolBox>() == std::mem::size_of::<usize>());
+    assert!(std::mem::align_of::<Box>() >= std::mem::align_of::<usize>());
+    assert!(std::mem::align_of::<I32Box>() >= std::mem::align_of::<usize>());
+    assert!(std::mem::align_of::<BoolBox>() >= std::mem::align_of::<usize>());
+};
+
+/// Pop a cell from an intrusive free list, or 0 when it is empty.
+#[inline(always)]
+fn pop_free_cell(head: &'static crate::tls_hot::HotKey<std::cell::Cell<usize>>) -> usize {
+    head.with(|h| {
+        let addr = h.get();
+        if addr != 0 {
+            // SAFETY: `addr` was minted by `js_*box_alloc*`, is cell-sized and
+            // cell-aligned, and its memory is never returned to the allocator,
+            // so the link written at publish time is still there.
+            h.set(unsafe { (addr as *const usize).read() });
+        }
+        addr
+    })
 }
 
 /// Boxes are 8-byte allocations, so bits 0..3 of an address carry no
@@ -126,9 +637,43 @@ fn box_ptr_cache_record(cache: &'static BoxPtrCache, addr: usize) {
     cache.with(|slots| slots[box_ptr_cache_index(addr)].set(addr));
 }
 
+/// Evict `addr` from its direct-mapped cache slot if it currently occupies
+/// it. Called on publication so a parked cell is invisible to the positive cache
+/// too — the parked-cell inertness argument in the QUARANTINE doc relies on
+/// every `js_box_get`/`js_box_set` on a parked address falling through to
+/// the registry probe and missing.
+#[inline(always)]
+fn box_ptr_cache_evict(cache: &'static BoxPtrCache, addr: usize) {
+    cache.with(|slots| {
+        let slot = &slots[box_ptr_cache_index(addr)];
+        if slot.get() == addr {
+            slot.set(0);
+        }
+    });
+}
+
 /// Allocate a new box with an initial JSValue bit pattern.
 #[no_mangle]
 pub extern "C" fn js_box_alloc_bits(initial_bits: i64) -> *mut Box {
+    BOX_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+    // #7933 follow-up: serve from the free pool first. A pooled address was
+    // minted by this function, cleared and de-registered at release, and is
+    // provably unreferenced (see the QUARANTINE doc) — re-registering it
+    // with a fresh value is indistinguishable from a fresh allocation.
+    let pooled = pop_free_cell(&BOX_FREE_HEAD);
+    if pooled != 0 {
+        let addr = pooled;
+        BOX_POOL_REUSE_COUNT.fetch_add(1, Ordering::Relaxed);
+        let ptr = addr as *mut Box;
+        unsafe {
+            (*ptr).value = initial_bits as u64;
+        }
+        BOX_REGISTRY.with(|r| {
+            r.borrow_mut().insert(addr);
+        });
+        box_ptr_cache_record(&BOX_PTR_CACHE, addr);
+        return ptr;
+    }
     unsafe {
         let layout = Layout::new::<Box>();
         let ptr = alloc(layout) as *mut Box;
@@ -158,6 +703,21 @@ pub extern "C" fn js_box_alloc(initial_value: f64) -> *mut Box {
 
 #[no_mangle]
 pub extern "C" fn js_i32_box_alloc(initial_value: i32) -> *mut I32Box {
+    BOX_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+    let pooled = pop_free_cell(&I32_BOX_FREE_HEAD);
+    if pooled != 0 {
+        let addr = pooled;
+        BOX_POOL_REUSE_COUNT.fetch_add(1, Ordering::Relaxed);
+        let ptr = addr as *mut I32Box;
+        unsafe {
+            (*ptr).value = initial_value;
+        }
+        I32_BOX_REGISTRY.with(|r| {
+            r.borrow_mut().insert(addr);
+        });
+        box_ptr_cache_record(&I32_BOX_PTR_CACHE, addr);
+        return ptr;
+    }
     unsafe {
         let layout = Layout::new::<I32Box>();
         let ptr = alloc(layout) as *mut I32Box;
@@ -178,6 +738,21 @@ pub extern "C" fn js_i32_box_alloc(initial_value: i32) -> *mut I32Box {
 
 #[no_mangle]
 pub extern "C" fn js_bool_box_alloc(initial_value: i32) -> *mut BoolBox {
+    BOX_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+    let pooled = pop_free_cell(&BOOL_BOX_FREE_HEAD);
+    if pooled != 0 {
+        let addr = pooled;
+        BOX_POOL_REUSE_COUNT.fetch_add(1, Ordering::Relaxed);
+        let ptr = addr as *mut BoolBox;
+        unsafe {
+            (*ptr).value = initial_value != 0;
+        }
+        BOOL_BOX_REGISTRY.with(|r| {
+            r.borrow_mut().insert(addr);
+        });
+        box_ptr_cache_record(&BOOL_BOX_PTR_CACHE, addr);
+        return ptr;
+    }
     unsafe {
         let layout = Layout::new::<BoolBox>();
         let ptr = alloc(layout) as *mut BoolBox;
@@ -196,6 +771,137 @@ pub extern "C" fn js_bool_box_alloc(initial_value: i32) -> *mut BoolBox {
     }
 }
 
+/// #7933 follow-up: release one JSValue box cell at a plain-async
+/// activation's terminal state.
+///
+/// Emitted by codegen for every cell in a completed plain-async frame. It
+/// records the cell in the activation's pending terminal release range.
+/// Clearing, de-registration and reuse wait for both async-step references and
+/// GC closures capturing the cell to disappear (see the pool doc above).
+///
+/// Idempotent and foreign-pointer-safe by the same gate: a pointer that is
+/// not currently registered — already released, never a box, or a
+/// perry#4898-style bogus address — is left untouched. The terminal arms of
+/// the step machine can re-run on a stray duplicate resume, so double
+/// release MUST be a total no-op (a second park of the same address would
+/// alias two future activations onto one cell).
+#[no_mangle]
+pub extern "C" fn js_box_release(ptr: *mut Box) {
+    let addr = ptr as usize;
+    if !is_plausible_box_ptr(ptr) {
+        return;
+    }
+    let activation = crate::promise::current_async_box_activation();
+    if !activation.is_null() {
+        if !BOX_REGISTRY.with(|r| r.borrow().contains(&addr)) {
+            return;
+        }
+        if !begin_pending_release(addr, ASYNC_RELEASE_JS) {
+            return;
+        }
+        park_async_activation_cell(activation, addr, ASYNC_RELEASE_JS);
+        finish_async_box_activation(activation);
+        BOX_RELEASE_COUNT.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let was_registered = BOX_REGISTRY.with(|r| r.borrow_mut().remove(&addr));
+    if !was_registered {
+        return;
+    }
+    box_ptr_cache_evict(&BOX_PTR_CACHE, addr);
+    unsafe {
+        // Cleared BEFORE parking: a parked cell must read as `undefined`
+        // through any stale path, and must retain nothing for the GC (the
+        // root scanner only walks the registry, which no longer has it).
+        (*ptr).value = crate::value::TAG_UNDEFINED;
+    }
+    BOX_RELEASE_QUARANTINE.with(|q| q.borrow_mut().push(addr));
+    BOX_RELEASE_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `js_box_release` for the compiler-private i32 control cells
+/// (`__gen_state` / `__gen_pending_type`). Same contract as
+/// `js_box_release`, with one twist: generated async-step code reads these
+/// cells with RAW inline loads (`load_async_i32_control_cell`), never
+/// through the registry-checked getter — so the PARKED VALUE is what a stray
+/// duplicate resume would observe. Park `-1`: the linearizer numbers states
+/// from 0, so `-1` matches no dispatch case and no catch-route condition,
+/// and the dispatch loop's default arm returns the done iter-result.
+/// (Unreachable in practice anyway: the parked `__gen_done = true` below
+/// short-circuits a stray resume before any state read.)
+#[no_mangle]
+pub extern "C" fn js_i32_box_release(ptr: *mut I32Box) {
+    let addr = ptr as usize;
+    if !is_plausible_box_ptr(ptr.cast::<Box>()) {
+        return;
+    }
+    let activation = crate::promise::current_async_box_activation();
+    if !activation.is_null() {
+        if !I32_BOX_REGISTRY.with(|r| r.borrow().contains(&addr)) {
+            return;
+        }
+        if !begin_pending_release(addr, ASYNC_RELEASE_I32) {
+            return;
+        }
+        park_async_activation_cell(activation, addr, ASYNC_RELEASE_I32);
+        finish_async_box_activation(activation);
+        BOX_RELEASE_COUNT.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let was_registered = I32_BOX_REGISTRY.with(|r| r.borrow_mut().remove(&addr));
+    if !was_registered {
+        return;
+    }
+    box_ptr_cache_evict(&I32_BOX_PTR_CACHE, addr);
+    unsafe {
+        (*ptr).value = -1;
+    }
+    I32_BOX_RELEASE_QUARANTINE.with(|q| q.borrow_mut().push(addr));
+    BOX_RELEASE_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `js_box_release` for the compiler-private i1 control cells
+/// (`__gen_done` / `__gen_executing`). Same contract. Like the i32 cells,
+/// generated code reads these with RAW inline loads, so the parked value is
+/// what a stray duplicate resume observes. Park `true`: a stray resume's
+/// first control read is `if (__gen_done) return {done: true}` — parked
+/// `true` takes byte-for-byte the pre-release terminal short-circuit
+/// (`__gen_done` really was `true` when the activation completed).
+/// `__gen_executing` also parks `true`, which is fine: the executing guard
+/// belongs to the user-callable generator `.next()` wrappers, and
+/// generators never release (only `was_plain_async` activations do, and
+/// their fused step body never reads `__gen_executing`).
+#[no_mangle]
+pub extern "C" fn js_bool_box_release(ptr: *mut BoolBox) {
+    let addr = ptr as usize;
+    if !is_plausible_box_ptr(ptr.cast::<Box>()) {
+        return;
+    }
+    let activation = crate::promise::current_async_box_activation();
+    if !activation.is_null() {
+        if !BOOL_BOX_REGISTRY.with(|r| r.borrow().contains(&addr)) {
+            return;
+        }
+        if !begin_pending_release(addr, ASYNC_RELEASE_BOOL) {
+            return;
+        }
+        park_async_activation_cell(activation, addr, ASYNC_RELEASE_BOOL);
+        finish_async_box_activation(activation);
+        BOX_RELEASE_COUNT.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let was_registered = BOOL_BOX_REGISTRY.with(|r| r.borrow_mut().remove(&addr));
+    if !was_registered {
+        return;
+    }
+    box_ptr_cache_evict(&BOOL_BOX_PTR_CACHE, addr);
+    unsafe {
+        (*ptr).value = true;
+    }
+    BOOL_BOX_RELEASE_QUARANTINE.with(|q| q.borrow_mut().push(addr));
+    BOX_RELEASE_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
 /// GC root scanner: walk every registered box and `mark` the JSValue bit
 /// value inside. Heap pointers stored inside boxes (e.g. the generator
 /// state machine's iter object held in a mutable-capture box) must be
@@ -210,22 +916,39 @@ pub fn scan_box_roots(mark: &mut dyn FnMut(f64)) {
 }
 
 pub fn scan_box_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
-    BOX_REGISTRY.with(|r| {
-        let r = r.borrow();
-        for &addr in r.iter() {
-            let ptr = addr as *mut Box;
-            // Defensive: the registry should only contain valid live
-            // pointers, but if a stale entry slipped through we'd
-            // segfault on the deref. The tight bounds check on the
-            // address (alloc gives 8-aligned pointers in user space)
-            // matches `is_plausible_box_ptr` to keep this a no-op for
-            // any pathological entry.
-            if addr >= 0x1000 && (addr as u64) < 0x0001_0000_0000_0000 && addr % 8 == 0 {
-                unsafe {
-                    visitor.visit_nanbox_u64_raw_slot(&raw mut (*ptr).value);
+    let full_trace = crate::gc::full_trace_active();
+    ASYNC_PENDING_RELEASES.with(|pending| {
+        let pending = pending.borrow();
+        BOX_REGISTRY.with(|r| {
+            let r = r.borrow();
+            for &addr in r.iter() {
+                // A drained box is retained only by exact closure-capture
+                // metadata. During a full trace its payload is reached from
+                // each live closure instead. Rooting it here as well would
+                // make `box -> closure -> same box` an uncollectable native
+                // cycle. Minors retain the old strong-root rule because they
+                // cannot adjudicate old-closure liveness.
+                if full_trace
+                    && pending
+                        .get(&addr)
+                        .is_some_and(|tag| *tag == (ASYNC_RELEASE_JS | ASYNC_RELEASE_DRAINED))
+                {
+                    continue;
+                }
+                let ptr = addr as *mut Box;
+                // Defensive: the registry should only contain valid live
+                // pointers, but if a stale entry slipped through we'd
+                // segfault on the deref. The tight bounds check on the
+                // address (alloc gives 8-aligned pointers in user space)
+                // matches `is_plausible_box_ptr` to keep this a no-op for
+                // any pathological entry.
+                if addr >= 0x1000 && (addr as u64) < 0x0001_0000_0000_0000 && addr % 8 == 0 {
+                    unsafe {
+                        visitor.visit_nanbox_u64_raw_slot(&raw mut (*ptr).value);
+                    }
                 }
             }
-        }
+        });
     });
 }
 
@@ -490,12 +1213,15 @@ fn is_plausible_box_ptr(ptr: *mut Box) -> bool {
 }
 
 /// Authoritative box-pointer check: the address must have been minted by
-/// `js_box_alloc` (and thus recorded in `BOX_REGISTRY`). Boxes are never
-/// freed — the registry is monotonic per thread — so membership has no
-/// false negatives for a real live box and no stale-reuse hazard: an
-/// address that isn't in the registry is provably not a box, regardless of
-/// how plausible its bit-pattern looks. This is what stops a stray
-/// read-only/garbage pointer (perry#4898) from being dereferenced as a box.
+/// `js_box_alloc` and be currently registered. Box-cell memory is never
+/// returned to the allocator — a cell is live-registered or parked in the
+/// release pool (#7933 follow-up), never recycled into a non-box
+/// allocation — so membership has no false negatives for a live box and no
+/// stale-reuse hazard: an address that isn't in the registry is either not
+/// a box at all or a released (inert, `undefined`-reading) cell, and
+/// treating both as "not a box" is exactly right. This is what stops a
+/// stray read-only/garbage pointer (perry#4898) from being dereferenced as
+/// a box, and what makes a parked cell's reads/writes inert.
 #[inline]
 fn is_registered_box_ptr(ptr: *mut Box) -> bool {
     if !is_plausible_box_ptr(ptr) {
@@ -521,7 +1247,7 @@ fn is_registered_box_ptr(ptr: *mut Box) -> bool {
 /// mutable capture — stores the raw box pointer in its capture slot rather
 /// than a NaN-boxed value (see the codegen closure lowering in
 /// `perry-codegen/src/expr/closure.rs`). That pointer addresses a box in the
-/// *current thread's* thread-local, never-freed `BOX_REGISTRY`, so it is
+/// *current thread's* thread-local `BOX_REGISTRY`, so it is
 /// meaningless on any other thread. The `perry/thread` serializer uses this to
 /// unwrap such a slot to the value the box actually holds before deep-copying
 /// it across the boundary (#6520 — without it the worker read the captured
@@ -535,7 +1261,8 @@ pub fn box_slot_contents_bits(slot_bits: u64) -> Option<u64> {
     let ptr = slot_bits as usize as *mut Box;
     if is_registered_box_ptr(ptr) {
         // Safety: the address is in BOX_REGISTRY, so it was minted by
-        // `js_box_alloc` and points at a live (never-freed) `Box`.
+        // `js_box_alloc` and points at a live `Box` (cell memory is never
+        // returned to the allocator; see the release-pool doc).
         Some(unsafe { (*ptr).value })
     } else {
         None
@@ -577,6 +1304,18 @@ fn is_registered_bool_box_ptr(ptr: *mut BoolBox) -> bool {
 #[cfg(feature = "keepalive-anchors")]
 #[used]
 static KEEP_JS_BOX_ALLOC_BITS: extern "C" fn(i64) -> *mut Box = js_box_alloc_bits;
+
+#[cfg(feature = "keepalive-anchors")]
+#[used]
+static KEEP_JS_BOX_RELEASE: extern "C" fn(*mut Box) = js_box_release;
+
+#[cfg(feature = "keepalive-anchors")]
+#[used]
+static KEEP_JS_I32_BOX_RELEASE: extern "C" fn(*mut I32Box) = js_i32_box_release;
+
+#[cfg(feature = "keepalive-anchors")]
+#[used]
+static KEEP_JS_BOOL_BOX_RELEASE: extern "C" fn(*mut BoolBox) = js_bool_box_release;
 #[cfg(feature = "keepalive-anchors")]
 #[used]
 static KEEP_JS_BOX_GET_BITS: extern "C" fn(*mut Box) -> i64 = js_box_get_bits;
@@ -613,13 +1352,25 @@ static KEEP_JS_BOOL_BOX_SET: extern "C" fn(*mut BoolBox, i32) = js_bool_box_set;
 
 #[cfg(test)]
 pub(crate) fn test_clear_box_registry() {
+    crate::closure::test_clear_closure_box_capture_indexes();
     BOX_REGISTRY.with(|r| r.borrow_mut().clear());
     I32_BOX_REGISTRY.with(|r| r.borrow_mut().clear());
     BOOL_BOX_REGISTRY.with(|r| r.borrow_mut().clear());
-    // Clearing the registry is the ONE operation that breaks the monotonicity
-    // the positive cache rests on, and it exists only for tests. Drop the
-    // caches with it, or a later test would see a stale "yes" for an address
-    // this call just un-registered.
+    BOX_FREE_HEAD.with(|h| h.set(0));
+    I32_BOX_FREE_HEAD.with(|h| h.set(0));
+    BOOL_BOX_FREE_HEAD.with(|h| h.set(0));
+    BOX_RELEASE_QUARANTINE.with(|q| q.borrow_mut().clear());
+    I32_BOX_RELEASE_QUARANTINE.with(|q| q.borrow_mut().clear());
+    BOOL_BOX_RELEASE_QUARANTINE.with(|q| q.borrow_mut().clear());
+    ASYNC_RELEASED_CELLS.with(|cells| cells.borrow_mut().clear());
+    ASYNC_PENDING_RELEASES.with(|pending| pending.borrow_mut().clear());
+    // Registry membership is not monotonic any more (#8208: `js_*box_release`
+    // de-registers a completed activation's cells), so the positive cache is
+    // kept coherent by an eviction on every un-registration rather than by
+    // never un-registering. This wholesale clear is the bulk case — it exists
+    // only for tests — and it must drop the caches for the same reason a single
+    // release evicts one slot: otherwise a later test would see a stale "yes"
+    // for an address this call just un-registered.
     for cache in [&BOX_PTR_CACHE, &I32_BOX_PTR_CACHE, &BOOL_BOX_PTR_CACHE] {
         cache.with(|slots| {
             for slot in slots {
@@ -860,3 +1611,7 @@ mod tests {
         assert_eq!(box_slot_contents_bits(0), None);
     }
 }
+
+#[cfg(test)]
+#[path = "box/release_tests.rs"]
+mod release_tests;

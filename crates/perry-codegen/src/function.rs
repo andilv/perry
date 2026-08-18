@@ -4,6 +4,8 @@
 //! by all its blocks (see `block.rs`), an ordered list of blocks, and emits
 //! itself as an LLVM `define` when serialized.
 
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::block::{FpFlags, LlBlock, RegCounter};
@@ -538,6 +540,64 @@ impl LlFunction {
         slot
     }
 
+    /// Compose the 16-byte object-header prefix the inline `new` path stores
+    /// per allocation — `[GcHeader packed word | class_id | ShapeId << 32]` —
+    /// ONCE per function, as a `<2 x i64>` SSA value, and return its register.
+    ///
+    /// # Why a vector, and why once per function (#8122)
+    ///
+    /// The header prefix is two adjacent 8-byte words. Before #8113 BOTH were
+    /// compile-time constants (`gc_packed` and `object_type | class_id << 32`),
+    /// so LLVM merged them into a single 16-byte constant-pool store
+    /// (`ldr q0, [pool]; str q0, [obj]` on AArch64). #8113 deleted
+    /// `object_type` and moved the ShapeId — a MODULE-INIT value loaded from a
+    /// global — into the second word, so the pair is no longer a constant and
+    /// LLVM stores it as two scalars: the 40-bit `gc_packed` immediate is then
+    /// rematerialised (`mov` + two `movk`) at every allocation and the second
+    /// word is shifted/or-ed per allocation. Measured: +4.5 instructions per
+    /// `new` on `push_cls`/`churn_alloc` (+5.5% total), with the IR
+    /// byte-identical modulo offsets and one store FEWER — a backend
+    /// store-merging artefact, invisible at the IR level.
+    ///
+    /// Building the pair here, after the init prelude (the ShapeId global is
+    /// populated by `__perry_init_strings_*`), yields one live `q` register
+    /// (or one stack reload) and one `str q` per allocation — the shape LLVM
+    /// produced for the pre-#8113 constant pair, now independent of whether
+    /// the words happen to be constants.
+    ///
+    /// `shape_slot` is the i32 entry alloca returned by `entry_init_load_global`
+    /// for the class's ShapeId global; the lines emitted here are appended to
+    /// the SAME region, so they run after its load+store.
+    pub fn entry_init_object_header_image(
+        &mut self,
+        shape_slot: &str,
+        gc_packed: u64,
+        class_id: u32,
+    ) -> String {
+        let shape_i32 = format!("%r{}", self.reg_counter.next());
+        let shape_i64 = format!("%r{}", self.reg_counter.next());
+        let shape_shifted = format!("%r{}", self.reg_counter.next());
+        let header_word = format!("%r{}", self.reg_counter.next());
+        let image = format!("%r{}", self.reg_counter.next());
+        let lines = [
+            format!("  {} = load i32, ptr {}", shape_i32, shape_slot),
+            format!("  {} = zext i32 {} to i64", shape_i64, shape_i32),
+            format!("  {} = shl i64 {}, 32", shape_shifted, shape_i64),
+            format!("  {} = or i64 {}, {}", header_word, shape_shifted, class_id),
+            format!(
+                "  {} = insertelement <2 x i64> <i64 {}, i64 0>, i64 {}, i32 1",
+                image, gc_packed, header_word
+            ),
+        ];
+        let region = if self.entry_init_boundary.is_some() {
+            &mut self.entry_post_init_setup
+        } else {
+            &mut self.entry_allocas
+        };
+        region.extend(lines);
+        image
+    }
+
     /// Emit a one-time function-entry load of a module global into a
     /// stack slot, returning the slot pointer. Used by the inline
     /// bump allocator to cache class-static values like the per-class
@@ -653,6 +713,21 @@ impl LlFunction {
         self.blocks.len()
     }
 
+    /// #8175: install the module's `preserve_nonecc` symbol registry on this
+    /// function's counter, so its call sites stamp the call-site convention
+    /// and its own define/declare rendering can consult the same set. Called
+    /// by `LlModule::define_function` for every function.
+    pub(crate) fn set_preserve_none_fns(&self, fns: Rc<RefCell<HashSet<String>>>) {
+        self.reg_counter.set_preserve_none_fns(fns);
+    }
+
+    /// Whether this function's define header (and every declare of it) must
+    /// carry the `preserve_nonecc` calling convention (#8175). Render-time
+    /// lookup against the module registry, so define order never matters.
+    pub(crate) fn is_preserve_none(&self) -> bool {
+        self.reg_counter.callee_preserve_none(&self.name)
+    }
+
     /// Whether final rendering must lower shadow-slot bindings into native
     /// `addrspace(1)` roots before RS4GC runs.
     ///
@@ -719,6 +794,17 @@ impl LlFunction {
             format!("{} ", self.linkage)
         };
 
+        // #8175: the calling convention survives `force_external` on purpose —
+        // codegen-unit promotion changes VISIBILITY, never the ABI. A unit
+        // that calls a promoted `preserve_nonecc` clone still calls it with
+        // the clone's convention (declare + call site both carry the token),
+        // so splitting is carried, not refused.
+        let cconv: String = if self.is_preserve_none() {
+            format!("{} ", crate::inst::PRESERVE_NONE_CC)
+        } else {
+            String::new()
+        };
+
         let attrs = if self.force_inline {
             " alwaysinline"
         } else if self.no_inline {
@@ -754,8 +840,9 @@ impl LlFunction {
             None => String::new(),
         };
         format!(
-            "define {}{} @{}({}){}{}{}{} {{",
+            "define {}{}{} @{}({}){}{}{}{} {{",
             linkage,
+            cconv,
             self.return_type,
             self.name,
             param_str,

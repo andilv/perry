@@ -209,7 +209,7 @@ unsafe fn object_field_name(
 ) -> Option<String> {
     let keys_bits = crate::object::shapes::object_shape_descriptor(obj)
         .map(|descriptor| descriptor.keys)
-        .unwrap_or((*obj).keys_array as u64);
+        .unwrap_or(crate::object::object_keys_array(obj) as u64);
     let keys_addr = decode_slot_target(keys_bits);
     if keys_addr < GC_HEADER_SIZE + 0x1000 {
         return None;
@@ -311,7 +311,8 @@ pub fn gc_build_v8_heap_snapshot_json() -> String {
             let fc = unsafe {
                 crate::object::shapes::object_shape_descriptor(obj)
                     .map(|descriptor| descriptor.live_inline_slot_count as usize)
-                    .unwrap_or((*obj).field_count as usize)
+                    // #8113: 0, not a second (eager) descriptor probe.
+                    .unwrap_or(0)
             };
             if fc <= 10_000 {
                 (

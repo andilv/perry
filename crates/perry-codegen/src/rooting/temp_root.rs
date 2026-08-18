@@ -360,6 +360,25 @@ pub(crate) fn expr_is_inert_primitive(ctx: &FnCtx<'_>, expr: &Expr) -> bool {
         // does allocate.)
         Expr::String(_) => true,
         Expr::LocalGet(id) => local_is_inert_primitive(ctx, *id),
+        // A bounds- and lifetime-proven byte read is a native load, not a
+        // helper call.  This matters inside a store RHS: classifying
+        // `buf[i]` as collecting made `buf[i] = (buf[i] + 1) & 255` discard
+        // the enclosing store's cached-view proof even though the RHS lowers
+        // to a load and integer arithmetic only.
+        Expr::Uint8ArrayGet { array, index } => crate::expr::can_lower_buffer_access_without_calls(
+            ctx,
+            array,
+            index,
+            crate::expr::BufferAccessSpec::uint8array_get(),
+        ),
+        Expr::BufferIndexGet { buffer, index } => {
+            crate::expr::can_lower_buffer_access_without_calls(
+                ctx,
+                buffer,
+                index,
+                crate::expr::BufferAccessSpec::buffer_index_get(),
+            )
+        }
         // `++` / `--` on an inert local runs ToNumeric over a value that is
         // already a non-pointer primitive, then a numeric add and a store: no
         // user code, no allocation. (`x++` on a BigInt DOES allocate a fresh
@@ -411,13 +430,16 @@ pub(crate) fn expr_is_inert_primitive(ctx: &FnCtx<'_>, expr: &Expr) -> bool {
 ///    a genuine local and not for a global, so a global is never inert.
 ///
 /// A declaration is deliberately absent from this judgment. The type arm uses
-/// only runtime-derived initializer evidence; `integer_locals` is the separate
-/// whole-write structural proof for literal-seeded recurrences. A lying scalar
-/// annotation therefore retains its root and cannot make coercion look inert.
+/// only runtime-derived evidence; `integer_locals` and
+/// `number_by_construction_locals` are the separate whole-write structural
+/// proofs for integer recurrences and general Number-valued accumulators. A
+/// lying scalar annotation therefore retains its root and cannot make coercion
+/// look inert.
 pub(in crate::rooting) fn local_is_inert_primitive(ctx: &FnCtx<'_>, id: u32) -> bool {
     !ctx.shadow_slot_map.contains_key(&id)
         && !ctx.module_globals.contains_key(&id)
         && (ctx.integer_locals.contains(&id)
+            || ctx.number_by_construction_locals.contains(&id)
             || matches!(
                 ctx.stable_local_type_proof(&id),
                 Some(

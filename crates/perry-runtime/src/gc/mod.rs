@@ -58,6 +58,8 @@ mod hot_tls;
 pub(crate) use hot_tls::*;
 mod roots;
 pub use roots::*;
+mod full_trace;
+pub(crate) use full_trace::*;
 #[cfg(test)]
 /// Rewrite runtime-handle roots only; this deliberately does not rewrite the
 /// installed `INLINE_TRAP`, whose scanner is exercised separately.
@@ -79,6 +81,11 @@ use root_words::*;
 mod layout;
 mod layout_slot_visit;
 use layout_slot_visit::*;
+/// #8112: the one question the remembered set asks about the shape table's
+/// shared keys word. Its own file because both `barrier/mod.rs` (1995 lines)
+/// and `cycle.rs` (1991) are at the 2000-line cap.
+mod shape_keys_edge;
+use shape_keys_edge::slot_is_shared_shape_keys_word;
 /// #7510: the per-object slot-layout side tables and the emptiness flag that
 /// keeps them off the allocation, store, death and trace paths. Split out of
 /// `layout.rs` so it stays under the repo's 2000-line-per-file cap.
@@ -116,17 +123,6 @@ use barrier_arming::*;
 /// eligibility preflight is skipped on. Every write of the bit goes through
 /// `pin::pin_object`; `scripts/gc_pin_sites.py` enforces that in `lint`.
 mod pin;
-
-/// #7803 diagnostics: expose the pin-latch's header-coherence verdict to
-/// runtime-side producer traps (e.g. `object::this_binding::this_set_check`)
-/// so every instrument grades headers with the same rules.
-pub(crate) fn header_incoherence_for_diagnostics(
-    obj_type: u8,
-    size: u32,
-    flags: u8,
-) -> Option<String> {
-    pin::header_incoherence(obj_type, size, flags)
-}
 #[cfg(test)]
 pub(crate) use pin::test_reset_young_pin_latch;
 pub use pin::{
@@ -141,6 +137,8 @@ mod prefetch;
 mod copying;
 mod copying_first_cycle;
 mod copying_pointer_set;
+/// #8174: shared validation for the TARGET of a forwarding pointer.
+mod forwarding;
 /// Per-scanner root attribution for the copied-minor root scan (#7915).
 mod scanner_profile;
 mod sticky_remembered;
@@ -149,6 +147,7 @@ use copying_first_cycle::*;
 // Named rather than glob-imported: a glob does not propagate through the
 // transitive re-exports the gc submodules reach these through.
 use copying_pointer_set::{plausible_gc_header, CopyingPointer, CopyingPointerKind};
+use forwarding::*;
 use sticky_remembered::*;
 // The copied-minor pointer classifier is consumed by the weak-holder registry
 // pass in `crate::weakref` (#6182), which lives outside the gc module.
@@ -175,6 +174,9 @@ mod verify;
 /// the rewrite pass own root enumeration. Debug-only
 /// (`PERRY_GC_FROMSPACE_SCAN=1`).
 mod fromspace_scan;
+/// #8220 diagnostic: native-stack scan for stale from-space pointers after a
+/// copying minor. Debug-only (`PERRY_GC_SCAN_NATIVE_STACK=1`).
+mod native_stack_scan;
 /// #7742: the measured policy behind whole-block in-place promotion. The
 /// mechanism is `arena/promote.rs`; this decides when to use it.
 mod promote_in_place;
@@ -887,6 +889,7 @@ pub fn gc_init() {
     reg_scanner!(crate::map::scan_map_iterator_array_roots_mut);
     reg_scanner!(crate::set::scan_set_iterator_array_roots_mut);
     reg_scanner!(crate::perf_hooks::scan_perf_entries_roots_mut);
+    reg_scanner!(crate::perf_histogram::scan_histogram_roots_mut);
     reg_scanner!(crate::v8::scan_v8_promise_hook_roots_mut);
     reg_scanner!(crate::typed_feedback::scan_typed_feedback_roots_mut);
     reg_scanner!(crate::typedarray_props::scan_typed_array_own_props_roots_mut);
@@ -954,6 +957,11 @@ pub fn gc_init() {
     reg_scanner!(crate::iter_result::scan_iter_result_keys_roots_mut);
     reg_scanner!(small_int_cache_mutable_root_scanner);
     reg_scanner!(crate::builtins::scan_console_log_singleton_roots_mut);
+    reg_scanner!(crate::builtins::scan_structured_clone_memo_roots_mut);
+    // #8282/#8294: process EventEmitter listener closures live as raw
+    // `*const ClosureHeader` in a TLS map. The scanner existed but was never
+    // called, so the table stayed invisible to the collector.
+    crate::os::os_process_emitter::register_process_emitter_root_scanner();
     reg_scanner!(crate::builtins::scan_boxed_primitive_payload_roots_mut);
     reg_scanner!(crate::weakref::scan_pending_finalization_jobs_roots_mut);
     // #6182: keep the weak-holder registry's stored holder ADDRESSES current
@@ -1016,6 +1024,11 @@ pub fn gc_init() {
     reg_scanner!(crate::process::scan_process_env_cache_roots_mut);
     reg_scanner!(crate::process::scan_permission_cache_roots_mut);
     reg_scanner!(crate::process::scan_report_cache_roots_mut);
+    // #8220: process EventEmitter listener closures are held as raw
+    // `*const ClosureHeader` in a TLS `HashMap` — invisible to the precise
+    // root map. Without this scanner a copying minor that evacuates a
+    // listener closure leaves the raw pointer stale.
+    reg_scanner!(crate::os::process_emitter_root_scanner);
     // #7231: the raw `Error` constructor address behind
     // `Error.prepareStackTrace`. The closure is reachable through `globalThis`
     // so it is not swept, but this duplicate lives outside the object graph
@@ -1143,6 +1156,7 @@ pub extern "C" fn js_gc_release_current_thread_collection_side_allocations() {
     // safepoints the schedule actually saw. Inert (one cached-`Option` load) and
     // once-only when the mode is off.
     schedule::report_exit_summary();
+    crate::r#box::report_box_stats_at_exit();
     emit_incremental_liveness_diag();
     emit_schedule_liveness_verdict();
 }

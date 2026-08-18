@@ -12,7 +12,7 @@ use super::*;
 pub struct InlineArenaState {
     pub data: *mut u8, // offset  0  — current block's data pointer
     pub offset: usize, // offset  8  — bump pointer (mutated inline)
-    pub size: usize,   // offset 16  — current block's size
+    pub size: usize,   // offset 16 — current block's size
 }
 
 /// Get the per-thread inline arena state pointer. Called once per JS

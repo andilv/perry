@@ -69,6 +69,7 @@ pub use classes::*;
 mod handle_ids;
 pub(crate) use handle_ids::{next_id, next_id_or_throw};
 mod dispatch;
+mod dispatch_custody;
 // #2154 — raw-consumer bridge so perry-ext-http can drive an HTTP exchange
 // over a socket produced by `agent.createConnection` (split out for the gate).
 mod raw_bridge;
@@ -239,6 +240,28 @@ fn scan_net_roots(visitor: &mut GcRootVisitor<'_>) {
             }
         }
     }
+    // `once_flags()` keys membership by the closure's ADDRESS BITS. The
+    // canonical copy in `listeners()` above keeps the closure alive and is
+    // rewritten when the copying GC moves it — but a `HashSet<i64>` element
+    // cannot be rewritten in place, so without this rebuild the set still
+    // holds the OLD address after evacuation: the once-membership test in
+    // `lifecycle.rs` then misses, the listener is never auto-removed, and a
+    // "once" callback fires on every subsequent event. Drain, forward each
+    // element through the visitor, and reinsert under the new identity.
+    if let Ok(mut once) = statics::once_flags().lock() {
+        for per_handle in once.values_mut() {
+            for set in per_handle.values_mut() {
+                let old: Vec<i64> = set.drain().collect();
+                for mut cb in old {
+                    visitor.visit_i64_slot(&mut cb);
+                    set.insert(cb);
+                }
+            }
+        }
+    }
+    // #8259 — the pump's in-flight dispatch frames (snapshotted callbacks +
+    // parked payloads), which the table walks above cannot see.
+    dispatch_custody::scan(visitor);
 }
 
 pub(crate) struct SocketState {
@@ -1438,21 +1461,30 @@ pub unsafe extern "C" fn js_ext_net_drain_pending() -> i32 {
         match ev {
             PendingNetEvent::Connect(id, local_server) => {
                 server_state::finish_local_connect(local_server);
-                for cb in listeners_for(id, "connect") {
+                // #8259: park the snapshot so callback N stays rooted (and is
+                // rewritten on evacuation) while callback N-1 runs user JS.
+                let frame = dispatch_custody::DispatchFrame::park(listeners_for(id, "connect"));
+                for i in 0..frame.len() {
+                    let cb = frame.cb(i);
                     if cb != 0 {
                         let _ = JsClosure::from_raw(cb as *const RawClosureHeader).call0();
                     }
                 }
+                drop(frame);
                 lifecycle::drain_once_listeners(id, "connect");
                 // TLS sockets additionally fire 'secureConnect' once the
                 // handshake completes — the direct-TLS connect path only
                 // signals Connect after the handshake, so this is the right
                 // tick. Plain sockets simply have no listeners here. #4971.
-                for cb in listeners_for(id, "secureConnect") {
+                let frame =
+                    dispatch_custody::DispatchFrame::park(listeners_for(id, "secureConnect"));
+                for i in 0..frame.len() {
+                    let cb = frame.cb(i);
                     if cb != 0 {
                         let _ = JsClosure::from_raw(cb as *const RawClosureHeader).call0();
                     }
                 }
+                drop(frame);
                 lifecycle::drain_once_listeners(id, "secureConnect");
             }
             PendingNetEvent::Data(id, bytes) => {
@@ -1461,6 +1493,11 @@ pub unsafe extern "C" fn js_ext_net_drain_pending() -> i32 {
                     server_state::buffer_pending_server_data(id, bytes);
                     continue;
                 }
+                // #8259: park BEFORE the payload allocation below — it can
+                // collect, and the evacuating arms then move the closures a
+                // bare snapshot would still point at. The payload is parked
+                // too: callback 1's JS can move it before callback 2 runs.
+                let mut frame = dispatch_custody::DispatchFrame::park(cbs);
                 // #4973: `socket.setEncoding(enc)` switches 'data' delivery
                 // from Buffers to decoded strings (Node readable-stream
                 // semantics). 'hex'/'base64' render their text forms; the
@@ -1484,12 +1521,15 @@ pub unsafe extern "C" fn js_ext_net_drain_pending() -> i32 {
                     // POINTER_TAG over the buffer pointer.
                     f64::from_bits(0x7FFD_0000_0000_0000 | (buf as u64 & 0x0000_FFFF_FFFF_FFFF))
                 };
-                for cb in cbs {
+                frame.set_payload(payload_f64.to_bits());
+                for i in 0..frame.len() {
+                    let cb = frame.cb(i);
                     if cb != 0 {
-                        let _ =
-                            JsClosure::from_raw(cb as *const RawClosureHeader).call1(payload_f64);
+                        let _ = JsClosure::from_raw(cb as *const RawClosureHeader)
+                            .call1(f64::from_bits(frame.payload_bits()));
                     }
                 }
+                drop(frame);
                 lifecycle::drain_once_listeners(id, "data");
             }
             PendingNetEvent::Error(id, msg) => {
@@ -1497,15 +1537,21 @@ pub unsafe extern "C" fn js_ext_net_drain_pending() -> i32 {
                 if cbs.is_empty() {
                     continue;
                 }
+                // #8259: park before the allocating build_error_object.
+                let mut frame = dispatch_custody::DispatchFrame::park(cbs);
                 // Issue #770 — emit an Error-shaped object `{message: msg}`
                 // so user code can read `err.message`. Pre-fix this was a
                 // raw NaN-boxed string and `err.message` was `undefined`.
                 let err_f64 = build_error_object(&msg);
-                for cb in cbs {
+                frame.set_payload(err_f64.to_bits());
+                for i in 0..frame.len() {
+                    let cb = frame.cb(i);
                     if cb != 0 {
-                        let _ = JsClosure::from_raw(cb as *const RawClosureHeader).call1(err_f64);
+                        let _ = JsClosure::from_raw(cb as *const RawClosureHeader)
+                            .call1(f64::from_bits(frame.payload_bits()));
                     }
                 }
+                drop(frame);
                 lifecycle::drain_once_listeners(id, "error");
             }
             PendingNetEvent::End(id) => {
@@ -1514,20 +1560,26 @@ pub unsafe extern "C" fn js_ext_net_drain_pending() -> i32 {
                 // right after `End` in `run_socket_task`) does the actual
                 // listener-map / socket-map teardown, so don't remove
                 // anything here.
-                for cb in listeners_for(id, "end") {
+                let frame = dispatch_custody::DispatchFrame::park(listeners_for(id, "end"));
+                for i in 0..frame.len() {
+                    let cb = frame.cb(i);
                     if cb != 0 {
                         let _ = JsClosure::from_raw(cb as *const RawClosureHeader).call0();
                     }
                 }
+                drop(frame);
                 lifecycle::drain_once_listeners(id, "end");
             }
             PendingNetEvent::Close(id) => {
                 let had_error = f64::from_bits(JsValue::from_bool(false).bits());
-                for cb in listeners_for(id, "close") {
+                let frame = dispatch_custody::DispatchFrame::park(listeners_for(id, "close"));
+                for i in 0..frame.len() {
+                    let cb = frame.cb(i);
                     if cb != 0 {
                         let _ = JsClosure::from_raw(cb as *const RawClosureHeader).call1(had_error);
                     }
                 }
+                drop(frame);
                 statics::listeners().lock().unwrap().remove(&id);
                 statics::sockets().lock().unwrap().remove(&id);
                 statics::once_flags().lock().unwrap().remove(&id);
@@ -1566,11 +1618,16 @@ pub unsafe extern "C" fn js_ext_net_drain_pending() -> i32 {
                 let sock_f64 = f64::from_bits(
                     0x7FFD_0000_0000_0000 | (socket_id as u64 & 0x0000_FFFF_FFFF_FFFF),
                 );
-                for cb in cbs {
+                // #8259: sock_f64 is a handle id (not a heap address), so
+                // only the callbacks need custody.
+                let frame = dispatch_custody::DispatchFrame::park(cbs);
+                for i in 0..frame.len() {
+                    let cb = frame.cb(i);
                     if cb != 0 {
                         let _ = JsClosure::from_raw(cb as *const RawClosureHeader).call1(sock_f64);
                     }
                 }
+                drop(frame);
                 lifecycle::drain_once_listeners(server_id, "connection");
                 server_state::release_pending_server_data(socket_id);
             }
@@ -1590,11 +1647,17 @@ pub unsafe extern "C" fn js_ext_net_drain_pending() -> i32 {
                         Vec::new()
                     }
                 };
-                for cb in cbs {
+                // #8259: these were REMOVED from the table above (one-shot),
+                // so this frame is their ONLY root during dispatch — without
+                // it a collection here can free, not just move, them.
+                let frame = dispatch_custody::DispatchFrame::park(cbs);
+                for i in 0..frame.len() {
+                    let cb = frame.cb(i);
                     if cb != 0 {
                         let _ = JsClosure::from_raw(cb as *const RawClosureHeader).call0();
                     }
                 }
+                drop(frame);
             }
             PendingNetEvent::ServerClose(server_id) => {
                 // Drain close listeners (one-shot, like Node).
@@ -1606,11 +1669,16 @@ pub unsafe extern "C" fn js_ext_net_drain_pending() -> i32 {
                         Vec::new()
                     }
                 };
-                for cb in cbs {
+                // #8259: removed from the table above — custody is the only
+                // root; see the ServerListening arm.
+                let frame = dispatch_custody::DispatchFrame::park(cbs);
+                for i in 0..frame.len() {
+                    let cb = frame.cb(i);
                     if cb != 0 {
                         let _ = JsClosure::from_raw(cb as *const RawClosureHeader).call0();
                     }
                 }
+                drop(frame);
                 // Tear down the server entry so the keepalive gate
                 // (`js_ext_net_has_active_handles`) lets the runtime
                 // exit cleanly after the user's close() resolves.
@@ -1629,12 +1697,18 @@ pub unsafe extern "C" fn js_ext_net_drain_pending() -> i32 {
                     eprintln!("[perry-ext-net] server {} error: {}", server_id, msg);
                     continue;
                 }
+                // #8259: park before the allocating build_error_object.
+                let mut frame = dispatch_custody::DispatchFrame::park(cbs);
                 let err_f64 = build_error_object(&msg);
-                for cb in cbs {
+                frame.set_payload(err_f64.to_bits());
+                for i in 0..frame.len() {
+                    let cb = frame.cb(i);
                     if cb != 0 {
-                        let _ = JsClosure::from_raw(cb as *const RawClosureHeader).call1(err_f64);
+                        let _ = JsClosure::from_raw(cb as *const RawClosureHeader)
+                            .call1(f64::from_bits(frame.payload_bits()));
                     }
                 }
+                drop(frame);
                 lifecycle::drain_once_listeners(server_id, "error");
             }
             PendingNetEvent::ServerDrop(server_id, info) => {
@@ -1643,12 +1717,18 @@ pub unsafe extern "C" fn js_ext_net_drain_pending() -> i32 {
                     lifecycle::drain_once_listeners(server_id, "drop");
                     continue;
                 }
+                // #8259: park before the allocating build_drop_object.
+                let mut frame = dispatch_custody::DispatchFrame::park(cbs);
                 let info = server_state::build_drop_object(&info);
-                for cb in cbs {
+                frame.set_payload(info.to_bits());
+                for i in 0..frame.len() {
+                    let cb = frame.cb(i);
                     if cb != 0 {
-                        let _ = JsClosure::from_raw(cb as *const RawClosureHeader).call1(info);
+                        let _ = JsClosure::from_raw(cb as *const RawClosureHeader)
+                            .call1(f64::from_bits(frame.payload_bits()));
                     }
                 }
+                drop(frame);
                 lifecycle::drain_once_listeners(server_id, "drop");
             }
         }

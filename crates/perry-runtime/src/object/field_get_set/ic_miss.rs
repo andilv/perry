@@ -94,16 +94,28 @@ pub extern "C" fn js_object_get_field_by_name_boxed(
 /// dispatchable through `js_native_call_method` (every name here has a
 /// corresponding dispatch arm). `constructor` is excluded: it is a property
 /// holding the `Number` function, not a bound method.
-pub(crate) fn is_primitive_proto_method(key: &[u8]) -> bool {
-    matches!(
-        key,
-        b"toString"
-            | b"valueOf"
-            | b"hasOwnProperty"
-            | b"isPrototypeOf"
-            | b"propertyIsEnumerable"
-            | b"toLocaleString"
-    )
+pub(crate) fn primitive_proto_method_name_static(key: &[u8]) -> Option<&'static [u8]> {
+    match key {
+        b"toString" => Some(b"toString"),
+        b"valueOf" => Some(b"valueOf"),
+        b"hasOwnProperty" => Some(b"hasOwnProperty"),
+        b"isPrototypeOf" => Some(b"isPrototypeOf"),
+        b"propertyIsEnumerable" => Some(b"propertyIsEnumerable"),
+        b"toLocaleString" => Some(b"toLocaleString"),
+        _ => None,
+    }
+}
+
+/// Bind a primitive receiver's inherited method without allowing the closure
+/// to retain the caller's key storage. Both finite-number guards route through
+/// this helper so the pointer-lifetime rule has a single implementation.
+pub(crate) unsafe fn bind_primitive_proto_method_static(
+    receiver: f64,
+    key: &[u8],
+) -> Option<JSValue> {
+    let method = primitive_proto_method_name_static(key)?;
+    let result = super::super::js_class_method_bind(receiver, method.as_ptr(), method.len());
+    Some(JSValue::from_bits(result.to_bits()))
 }
 
 /// Static-name lowering traffics in immutable AOT descriptors instead of
@@ -620,10 +632,11 @@ pub extern "C" fn js_object_get_field_ic_miss(
     let can_cache = !crate::state::state().descriptors.accessors_in_use.get();
     unsafe {
         // Issue #72: validate this really is a GC_TYPE_OBJECT before reading
-        // (*obj).keys_array — otherwise an Array/String/Buffer/etc. receiver
-        // (whose `object_type` byte at offset 0 happens to be 1, matching
-        // OBJECT_TYPE_REGULAR for a length-1 array) would be treated as
-        // cacheable and seed the per-site PIC with garbage from element[1].
+        // crate::object::object_keys_array(obj) — otherwise an Array/String/Buffer/etc. receiver
+        // (whose word at offset 0 collides with a real `class_id` — since
+        // #8113 that is an array's `length`, so ANY length-N array impersonates
+        // class N) would be treated as cacheable and seed the per-site PIC with
+        // garbage from element[1].
         // The codegen guard funnels non-OBJECT receivers here too, so this
         // belt-and-braces check keeps the cache from being primed with
         // values that would survive into the inline hot path.
@@ -635,13 +648,32 @@ pub extern "C" fn js_object_get_field_ic_miss(
                 (*gc_header).obj_type == crate::gc::GC_TYPE_OBJECT
             };
         let has_own_descriptors = is_object && super::super::object_has_descriptors(obj as usize);
-        let is_regular = is_object && crate::object::object_is_regular(obj);
+        // #8122: ONE shape-table probe. `object_is_regular` is `GC_TYPE_OBJECT
+        // && !FORWARDED && descriptor.object_kind == Ordinary`; the kind test
+        // was already `GC_TYPE_OBJECT` above, so read the descriptor once and
+        // take the kind, the keys edge, the key count and the live bound from
+        // it — this path used to probe three times (regularity, the
+        // descriptor, then `object_shape_id` for the PIC token).
+        let shape = if is_object {
+            let gc_header =
+                (obj as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
+            if (*gc_header).gc_flags & crate::gc::GC_FLAG_FORWARDED == 0 {
+                crate::object::shapes::object_shape_descriptor(obj)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let is_regular = shape.is_some_and(|shape| {
+            shape.object_kind == crate::object::shapes::ShapeObjectKind::Ordinary
+        });
         // Gate-neutral builtin accessors deliberately leave the process-wide
         // accessor latch clear. Their owner bit must still block this PIC:
         // its generated hit path is a raw slot load and would otherwise turn
         // `Set.prototype.size` into `undefined` instead of invoking the getter.
         if can_cache && is_regular && !has_own_descriptors {
-            let Some(shape) = crate::object::shapes::object_shape_descriptor(obj) else {
+            let Some(shape) = shape else {
                 let value = js_object_get_field_by_name(obj, key);
                 return f64::from_bits(value.bits());
             };
@@ -678,7 +710,9 @@ pub extern "C" fn js_object_get_field_ic_miss(
                     //
                     // The runtime and emitted hit path share one identity:
                     // the authoritative, never-reused ShapeId token.
-                    let stamp = crate::object::shapes::object_shape_id(obj);
+                    // The descriptor resolved above, so the header stamp IS the
+                    // shape id — no second probe.
+                    let stamp = crate::object::shapes::object_shape_stamp(obj);
                     let token = (stamp as u64 | crate::object::shapes::PIC_ID_TOKEN_BIT) as i64;
                     pic_prime_get(cache, token, i as i64);
                     let field_ptr = (obj as *const u8)
@@ -1266,7 +1300,7 @@ mod c3c_pic_tests {
             let obj = crate::object::js_object_alloc(0x6080, 8);
             let key = crate::string::js_string_from_bytes(b"pic6080_x".as_ptr(), 9);
             crate::object::js_object_set_field_by_name(obj, key, 7.0);
-            let keys = (*obj).keys_array;
+            let keys = crate::object::object_keys_array(obj);
             assert!(!keys.is_null(), "test premise: field append built keys");
             assert_eq!((*obj).class_id, 0x6080, "test premise: a class instance");
 

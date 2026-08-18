@@ -1,7 +1,7 @@
 use super::*;
 use crate::gc::{
     GcHeader, GC_FLAG_MARKED, GC_FLAG_TENURED, GC_HEADER_SIZE, GC_TYPE_ARRAY, GC_TYPE_BUFFER,
-    GC_TYPE_STRING, GC_TYPE_TYPED_ARRAY, LARGE_OBJECT_THRESHOLD_BYTES,
+    GC_TYPE_MAP, GC_TYPE_STRING, GC_TYPE_TYPED_ARRAY, LARGE_OBJECT_THRESHOLD_BYTES,
 };
 
 fn general_block_index_for(addr: usize) -> Option<usize> {
@@ -103,6 +103,42 @@ fn reset_single_reclaimable_nursery_block(
     block_has_live[current] = true;
     let stats = arena_reset_empty_blocks(&block_has_live);
     (candidate, base, size, before_offset, stats)
+}
+
+#[test]
+fn object_start_bitmap_stamps_only_maps_and_clears_on_reset() {
+    run_with_fresh_arenas(|| {
+        let unstamped_array = arena_alloc_gc(64, 8, GC_TYPE_ARRAY) as usize;
+        let (_, array_base, array_bitmap) = classify_heap_space_in_range(unstamped_array)
+            .expect("allocation must be in an arena range");
+        assert!(
+            !arena_header_is_object_start(
+                unstamped_array - GC_HEADER_SIZE,
+                array_base,
+                array_bitmap,
+            ),
+            "ordinary arena allocations must not pay to stamp exact starts"
+        );
+
+        let user = arena_alloc_gc(16, 8, GC_TYPE_MAP) as usize;
+        let header = user - GC_HEADER_SIZE;
+        let (_, range_base, bitmap) =
+            classify_heap_space_in_range(user).expect("allocation must be in an arena range");
+
+        assert!(arena_header_is_object_start(header, range_base, bitmap));
+        assert!(
+            !arena_header_is_object_start(header + 8, range_base, bitmap),
+            "an aligned payload word must not be recorded as an object start"
+        );
+
+        arena_reset_all_blocks_to_zero();
+        let (_, reset_base, reset_bitmap) =
+            classify_heap_space_in_range(user).expect("reset retains the arena block registration");
+        assert!(
+            !arena_header_is_object_start(header, reset_base, reset_bitmap),
+            "reset must clear stale object boundaries before block reuse"
+        );
+    });
 }
 
 #[test]

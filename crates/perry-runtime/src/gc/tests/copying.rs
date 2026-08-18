@@ -1,6 +1,7 @@
 mod adaptive_tenuring;
 mod all_pointer_elements_7469;
 mod deferred_finalize_7635;
+mod fabricated_map_rejection;
 mod latch;
 mod pointer_publish_7154;
 mod promise_side_tables;
@@ -602,7 +603,7 @@ fn test_copying_minor_preserves_dynamic_object_values_after_numeric_first_growth
     assert_copied_minor_trace(&trace, true, CopiedMinorFallbackReason::None, false);
     assert_ne!(obj_after as usize, obj as usize);
     unsafe {
-        let keys = (*obj_after).keys_array;
+        let keys = crate::object::object_keys_array(obj_after);
         assert!(!keys.is_null());
         assert_eq!(crate::array::js_array_length(keys), 3);
         let key0 = crate::array::js_array_get(keys, 0);

@@ -645,6 +645,35 @@ thread_local! {
 
 pub(crate) const CONSOLE_INSTANCE_CLASS_ID: u32 = 0xFFFF_0083;
 
+/// #8190: death pruning for `CONSOLE_INSTANCES`.
+///
+/// The table is keyed by the raw heap address of a `new console.Console(...)`
+/// instance object, and `scan_console_log_singleton_roots_mut` **rekeys** that
+/// address when the object moves. A rekeyed table's dead key is not merely a
+/// leak — the arena recycles the address and the next rewrite pass reads the
+/// recycled bytes as a `GcHeader`. See `gc::dead_owner`'s module doc.
+pub(crate) fn prune_dead_console_instance_owners(is_dead_owner: &dyn Fn(usize) -> bool) {
+    CONSOLE_INSTANCES.with(|instances| {
+        instances
+            .borrow_mut()
+            .retain(|&owner, _| !is_dead_owner(owner));
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn test_console_instance_count() -> usize {
+    CONSOLE_INSTANCES.with(|instances| instances.borrow().len())
+}
+
+#[cfg(test)]
+pub(crate) fn test_seed_console_instance(owner: usize) {
+    CONSOLE_INSTANCES.with(|instances| {
+        instances
+            .borrow_mut()
+            .insert(owner, ConsoleInstanceState::default());
+    });
+}
+
 pub(crate) fn is_console_instance_method_name(method_name: &str) -> bool {
     matches!(
         method_name,
@@ -679,6 +708,7 @@ pub(crate) fn is_console_instance_value(value: f64) -> bool {
     unsafe { (*obj).class_id == CONSOLE_INSTANCE_CLASS_ID }
 }
 
+#[derive(Default)]
 struct ConsoleInstanceState {
     stdout: f64,
     stderr: f64,
@@ -1443,7 +1473,7 @@ pub(crate) unsafe fn decode_dir_depth_option(options_value: f64) -> Option<usize
         return None;
     }
     let obj_ptr = ptr as *const crate::object::ObjectHeader;
-    let keys_array = (*obj_ptr).keys_array;
+    let keys_array = crate::object::object_keys_array(obj_ptr);
     if keys_array.is_null() {
         return None;
     }
@@ -1519,7 +1549,7 @@ pub(crate) unsafe fn decode_dir_bool_option(options_value: f64, option_name: &st
         return None;
     }
     let obj_ptr = ptr as *const crate::object::ObjectHeader;
-    let keys_array = (*obj_ptr).keys_array;
+    let keys_array = crate::object::object_keys_array(obj_ptr);
     if keys_array.is_null() {
         return None;
     }

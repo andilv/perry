@@ -152,6 +152,13 @@ pub(super) unsafe fn dispatch_handle(
             if let Some(r) = dispatch_typed_array_method(ta, method_name, args_ptr, args_len) {
                 return Some(r);
             }
+            if typed_array_lacks_array_method(method_name) {
+                return Some(dispatch_absent_typed_array_array_method(
+                    ta,
+                    method_name,
+                    arg_handles,
+                ));
+            }
         }
 
         // Builtin-prototype borrowing is lowered to a direct receiver call
@@ -891,7 +898,7 @@ pub(super) unsafe fn dispatch_handle(
             }
 
             // Scan object fields for a callable property (closure stored via IndexSet)
-            let keys = (*obj).keys_array;
+            let keys = crate::object::object_keys_array(obj);
             if !keys.is_null() {
                 let keys_ptr = keys as usize;
                 if (keys_ptr as u64) >> 48 == 0 && keys_ptr >= 0x10000 {

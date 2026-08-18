@@ -23,6 +23,18 @@ pub(super) fn try_rewrite_nanboxed_value(bits: u64, valid_ptrs: &ValidPointerSet
     Some(tag | (new_user as u64 & POINTER_MASK))
 }
 
+/// #8174: refuses a forwarding target that is not a heap object start, in
+/// lockstep with [`CopyingNurseryCollector::rewrite_raw_addr`](super::copying).
+///
+/// The lockstep is the point. This function is what the VERIFY pass runs
+/// (`RuntimeRootVisitMode::Verify`), and it panics whenever it can rewrite a
+/// slot the rewrite pass left alone. Tightening only the rewrite pass would
+/// therefore have turned a silently-corrupt rewrite into a `PERRY_GC_VERIFY_
+/// EVACUATION` abort blaming an innocent scanner — the two walkers must reach
+/// the same verdict or the verifier is measuring the difference between them
+/// instead of the heap. Its own gate (`valid_ptrs`, a live census) is strictly
+/// stronger than the copier's heap-region test, so this only changes the case
+/// where a genuinely LIVE forwarded object's target word is corrupt.
 pub(super) fn try_rewrite_raw_addr(ptr_addr: usize, valid_ptrs: &ValidPointerSet) -> Option<usize> {
     if ptr_addr == 0 {
         return None;
@@ -41,6 +53,9 @@ pub(super) fn try_rewrite_raw_addr(ptr_addr: usize, valid_ptrs: &ValidPointerSet
             let next = forwarding_address(header) as usize;
             if next == 0 || next == current {
                 return rewrote.then_some(current);
+            }
+            if !accept_forwarding_target(next) {
+                return None;
             }
             current = next;
             rewrote = true;
@@ -544,6 +559,13 @@ pub(super) unsafe fn verify_old_young_parent_slots_covered(
     stats.checked_old_objects = stats.checked_old_objects.saturating_add(1);
     visit_gc_rewrite_slots(header, |slot| unsafe {
         if crate::weakref::is_weak_target_trace_slot(header, slot.slot) {
+            return;
+        }
+        // #8112: the shape table's shared keys word is not a slot this parent
+        // owns, so per-parent coverage is the wrong question to ask of it.
+        // `gc/shape_keys_edge.rs` says why; the table's `old_carrier` root is
+        // what covers it instead.
+        if slot_is_shared_shape_keys_word(header, slot.slot) {
             return;
         }
         slot.record_layout_read();

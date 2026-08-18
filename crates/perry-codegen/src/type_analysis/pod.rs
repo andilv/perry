@@ -10,7 +10,7 @@ use perry_hir::Expr;
 use crate::expr::FnCtx;
 use crate::type_analysis_class_fields::{class_field_declared_type, declared_field_type};
 
-pub(crate) fn is_numeric_typed_array_class(name: &str) -> bool {
+pub(crate) fn is_typed_array_class(name: &str) -> bool {
     matches!(
         name,
         "Int8Array"
@@ -23,7 +23,22 @@ pub(crate) fn is_numeric_typed_array_class(name: &str) -> bool {
             | "Float16Array"
             | "Float32Array"
             | "Float64Array"
+            | "BigInt64Array"
+            | "BigUint64Array"
     )
+}
+
+pub(crate) fn is_numeric_typed_array_class(name: &str) -> bool {
+    is_typed_array_class(name) && !matches!(name, "BigInt64Array" | "BigUint64Array")
+}
+
+pub(crate) fn is_typed_array_expr(ctx: &FnCtx<'_>, object: &Expr) -> bool {
+    matches!(
+        static_type_of(ctx, object),
+        Some(HirType::Named(name)) if is_typed_array_class(&name)
+    ) || receiver_class_name(ctx, object)
+        .as_deref()
+        .is_some_and(is_typed_array_class)
 }
 
 pub(crate) fn expression_has_numeric_length(ctx: &FnCtx<'_>, object: &Expr) -> bool {
@@ -538,6 +553,23 @@ pub(crate) fn numeric_proof_is_declared_only(ctx: &FnCtx<'_>, expr: &Expr) -> bo
             }
             if let Expr::LocalGet(arr_id) = object.as_ref() {
                 if crate::expr::masked_window_fact_for_index(ctx, *arr_id, index).is_some() {
+                    return false;
+                }
+                if ctx.native_facts.num_array_local(*arr_id).is_some() {
+                    return false;
+                }
+                // #8225: a live BufferViewSlot is compiler-owned runtime
+                // evidence for a typed-array/buffer representation. Its
+                // element load cannot produce a string: the checked slow arm
+                // is at worst `undefined` (coerced separately when needed),
+                // while a proven native-owned access is a raw numeric load.
+                // Do not discard that stronger fact and reclassify the read
+                // from its erasable source annotation.
+                if ctx
+                    .buffer_view_slots
+                    .get(arr_id)
+                    .is_some_and(|view| view.elem.is_number_valued())
+                {
                     return false;
                 }
             }

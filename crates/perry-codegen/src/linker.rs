@@ -16,6 +16,12 @@ use std::sync::OnceLock;
 
 use anyhow::{anyhow, bail, Context, Result};
 
+#[path = "linker_temp.rs"]
+mod linker_temp;
+use linker_temp::{
+    reap_stale_llvm_scratch_once, FailedScratch, FailureRetention, PROCESS_FAILURE_RETENTION,
+};
+
 /// Cached result of the pre-flight clang probe — evaluated once per process.
 /// `Some(default_triple)` if the probe succeeded, `None` if it failed.
 static CLANG_PROBE: OnceLock<Option<String>> = OnceLock::new();
@@ -350,6 +356,47 @@ fn ll_size_opt_max_fn_bytes() -> usize {
         .unwrap_or(DEFAULT_LL_SIZE_OPT_MAX_FN_BYTES)
 }
 
+/// For an oversized unit, the size of its **widest single function** above
+/// which we drop the whole unit to `-O0`.
+///
+/// This is the per-function counterpart of the average cap above, and it is the
+/// arm that can actually see the `#4880` shape. An average cannot: a bundle is
+/// hundreds of ordinary functions plus one generated monolith, and the ordinary
+/// ones dilute the monolith out of the mean. `next@16.3.0`'s bundled
+/// `jsonwebtoken` is exactly that — 468 functions averaging 28 KB with one at
+/// 3.5 MB — so its average sits nine times UNDER the average cap while one
+/// body is a monolith (#8132).
+///
+/// **The default is deliberately unchanged at 6 MiB, and lowering it is a
+/// measured bad trade.** The arm previously borrowed `ll_o0_threshold_bytes()`,
+/// which is a *whole-unit* constant answering a different question; it now has
+/// its own name and its own override so the two stop moving together. What it
+/// is NOT is a retune, because the corpus does not support one. Over the 52
+/// oversized codegen units Perry produces from `next@16.3.0`'s 17 largest
+/// `dist/compiled/**` bundles, the widest function runs from 751 KB to 11.1 MB
+/// *continuously* (deciles 0.73/1.3/1.6/1.9/2.1/2.2/2.7/3.4/3.8/5.4 MB) — there
+/// is no empty band between "ordinary bundle" and "monolith", because in real
+/// webpack output every oversized unit is monolith-bearing. (Their averages run
+/// 19-67 KB/fn, so all 52 clear the average cap and this arm is the only one
+/// that ever fires.) A cap low enough to catch #8132's two units (3.5 MB and
+/// 1.5 MB) is ≤ 1.5 MB, which reclassifies 44 of 52; 1 MiB reclassifies 50 of
+/// 52. Measured on that same bundle, reclassifying costs **+95% `__text`
+/// (2.80 MB → 5.45 MB) to buy −62% clang CPU (43.8 s → 16.5 s)**. Whether that
+/// trade is worth making is a product call; `PERRY_LL_O0_MAX_FN_BYTES` makes it
+/// one env var instead of a rebuild, and the default declines to make it on
+/// everybody's behalf.
+///
+/// `0` disables this arm entirely (leaving only the average cap);
+/// `PERRY_LL_SIZE_OPT` still overrides both.
+const DEFAULT_LL_O0_MAX_FN_BYTES: usize = 6 * 1024 * 1024;
+
+fn ll_o0_max_fn_bytes() -> usize {
+    std::env::var("PERRY_LL_O0_MAX_FN_BYTES")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_LL_O0_MAX_FN_BYTES)
+}
+
 /// Decide the clang opt flag for an oversized unit: `-Os` when the unit is many
 /// ordinary functions (size-optimize, big `__text` win), `-O0` when it is a
 /// pathological few-giant-function monolith (`#4880`). `ll_fn_count` is the
@@ -368,7 +415,8 @@ fn oversized_opt_flag(
     // hundreds of small functions dilute one pathological generated function's
     // average: that sent a 20+ MiB body through -Os in the Claude bundle and
     // spent minutes in LLVM where the same body finishes in seconds at -O0.
-    if max_fn_bytes.is_some_and(|bytes| bytes > ll_o0_threshold_bytes()) {
+    let max_fn_cap = ll_o0_max_fn_bytes();
+    if max_fn_cap > 0 && max_fn_bytes.is_some_and(|bytes| bytes > max_fn_cap) {
         return "-O0";
     }
     let avg_fn_bytes = ll_byte_size / ll_fn_count.max(1);
@@ -414,15 +462,25 @@ fn build_clang_compile_plan(
     let o0_threshold = ll_o0_threshold_bytes();
     let opt_flag = if o0_threshold > 0 && ll_byte_size > o0_threshold {
         let flag = oversized_opt_flag(ll_byte_size, ll_fn_count, max_fn_bytes);
+        // `widest` is the quantity the -O0 arm actually decides on, so print
+        // it: an average alone cannot explain why a unit was routed, and a
+        // corpus sweep needs the per-unit distribution to retune the cap.
+        // `?` when the caller could not supply it (the textual clang path,
+        // which has no per-function sizes).
         eprintln!(
             "perry: module IR is {:.1} MB (> {:.1} MB), {} functions \
-             (~{:.0} KB/fn); compiling at {} instead of -O3 so LLVM's -O1+ \
-             pipeline doesn't blow up on oversized functions (#4880). Override \
-             with PERRY_LL_O0_THRESHOLD_BYTES / PERRY_LL_SIZE_OPT.",
+             (~{:.0} KB/fn avg, widest {}); compiling at {} instead of -O3 so \
+             LLVM's -O1+ pipeline doesn't blow up on oversized functions \
+             (#4880). Override with PERRY_LL_O0_THRESHOLD_BYTES / \
+             PERRY_LL_O0_MAX_FN_BYTES / PERRY_LL_SIZE_OPT.",
             ll_byte_size as f64 / (1024.0 * 1024.0),
             o0_threshold as f64 / (1024.0 * 1024.0),
             ll_fn_count,
             (ll_byte_size as f64 / ll_fn_count.max(1) as f64) / 1024.0,
+            match max_fn_bytes {
+                Some(bytes) => format!("{:.0} KB", bytes as f64 / 1024.0),
+                None => "?".to_string(),
+            },
             flag,
         );
         flag
@@ -638,14 +696,17 @@ fn compile_ll_to_object_with_native_roots(
     target_triple: Option<&str>,
     native_roots: bool,
 ) -> Result<Vec<u8>> {
+    let tmp_dir = env::temp_dir();
+    reap_stale_llvm_scratch_once(&tmp_dir);
     let rs4gc_ll = maybe_rs4gc_preprocess(ll_text, native_roots)?;
     let ll_text: &str = rs4gc_ll.as_deref().unwrap_or(ll_text);
-    compile_ll_to_object_in(
-        &env::temp_dir(),
+    compile_ll_to_object_in_with_retention(
+        &tmp_dir,
         ll_text,
         target_triple,
         TempFilePolicy::from_env(),
         native_roots,
+        &PROCESS_FAILURE_RETENTION,
     )
 }
 
@@ -661,9 +722,8 @@ fn compile_ll_to_object_with_native_roots(
 ///
 /// * **success**: the object is read into memory, and the per-call directory
 ///   goes with it — a compile leaves nothing behind (#7144).
-/// * **failure** (clang non-zero, or the object cannot be read): everything is
-///   left on disk. The error message names the `.ll`, and a failed compile is
-///   exactly when someone wants to look at the IR that produced it.
+/// * **failure** (clang non-zero, or the object cannot be read): the first
+///   failure's IR is retained for diagnosis; later failures are removed (#8249).
 /// * **`PERRY_LLVM_KEEP_IR`**: everything is kept and its location printed,
 ///   plus the compile plan as JSON.
 /// * **`PERRY_DEBUG_SYMBOLS`**: no effect on any of the above. It was believed
@@ -797,8 +857,15 @@ fn compile_ll_inprocess_in(
     target_triple: Option<&str>,
     policy: TempFilePolicy,
     native_roots: bool,
+    failure_retention: &FailureRetention,
 ) -> Result<Vec<u8>> {
     let (paths, _pid, _nonce) = llvm_temp_paths(tmp_dir, ll_text);
+    let failed_scratch = FailedScratch::new(
+        &paths.scratch_dir,
+        &paths.ll_path,
+        policy.keep,
+        failure_retention,
+    );
     // Same decision inputs as the clang path — opt level (#4880 fallback
     // included), CPU tuning, inlinehint threshold — via the same plan
     // constructor, so the backends cannot drift on a decision independently.
@@ -840,41 +907,35 @@ fn compile_ll_inprocess_in(
         &module_name,
         native_roots,
     ) {
-        // The statepoint backends ask for `-S`, because #7314's compact-map
-        // rewriter rewrites `.llvm_stackmaps` at ASSEMBLY time — that is where
-        // LLVM prints function addresses as symbol names, so one text parser
-        // replaces Mach-O and ELF relocation parsing plus a second link pass.
-        //
-        // So what came back is assembly, not an object. Write it where the
-        // clang path would have, run the same rewrite-and-assemble step, and
-        // return the resulting object. Skipping this wrote assembly text into a
-        // `.o` and the link died with `ld: unknown file type`.
+        // Statepoint plans ask for `-S`: #7314's compact-map rewriter operates
+        // on assembly. Rewrite and assemble those bytes before returning them.
         Ok(bytes) if plan.asm_path.is_some() => {
             let asm_path = plan.asm_path.as_ref().expect("checked");
             if let Some(parent) = asm_path.parent() {
                 fs::create_dir_all(parent).ok();
             }
             fs::write(asm_path, &bytes)
-                .with_context(|| format!("Failed to write {}", asm_path.display()))?;
-            // `plan.clang` is the literal `(in-process)` placeholder here, so
-            // resolve a real assembler. Using the system clang for this step is
-            // sound: the version skew that motivated the in-process backend was
-            // an *IR* parse failure (`unterminated attribute group`), and by
-            // this point the IR is gone — what is being assembled is text this
-            // LLVM just printed, which any contemporary assembler accepts.
-            let assembler = find_clang().context(
-                "the statepoint compact-map rewrite needs an assembler to turn \
+                .with_context(|| format!("Failed to write {}", asm_path.display()))
+                .map_err(|error| failed_scratch.finish_with_ir(error, ll_text))?;
+            // The in-process version-skew problem concerns IR parsing; any
+            // contemporary system clang can assemble the emitted text.
+            let assembler = find_clang()
+                .context(
+                    "the statepoint compact-map rewrite needs an assembler to turn \
                  the emitted assembly into an object, and no clang was found",
-            )?;
+                )
+                .map_err(|error| failed_scratch.finish_with_ir(error, ll_text))?;
             crate::gc_map::compact_and_assemble(
                 &assembler,
                 &plan.effective_target,
                 asm_path,
                 &plan.obj_path,
                 &plan.clang_args,
-            )?;
+            )
+            .map_err(|error| failed_scratch.finish_with_ir(error, ll_text))?;
             let obj = fs::read(&plan.obj_path)
-                .with_context(|| format!("Failed to read assembled {}", plan.obj_path.display()))?;
+                .with_context(|| format!("Failed to read assembled {}", plan.obj_path.display()))
+                .map_err(|error| failed_scratch.finish_with_ir(error, ll_text))?;
             if policy.keep {
                 // This arm retains the object too — `compact_and_assemble`
                 // wrote it to `plan.obj_path` and the scratch dir survives
@@ -886,13 +947,8 @@ fn compile_ll_inprocess_in(
                 // workloads fail on exactly this, never reaching their subject).
                 eprintln!("[perry-codegen] kept object: {}", plan.obj_path.display());
             } else {
-                // `remove_dir_all`, not the two names we know about — the same
-                // reason the clang path gives. This arm is the only in-process
-                // one that CREATES the scratch dir (writing the assembly), so
-                // unlinking just the files left an empty husk per compile: a
-                // leak counted in compiles rather than in distinct IR, which is
-                // what turned the temp-hygiene gate red once this backend
-                // became the default and the clang cleanup stopped running.
+                // Remove the whole private directory so assembler side-files
+                // and the directory itself cannot leak (#8072).
                 let _ = fs::remove_dir_all(&paths.scratch_dir);
             }
             Ok(obj)
@@ -917,20 +973,15 @@ fn compile_ll_inprocess_in(
             Ok(bytes)
         }
         Err(e) => {
-            // Same contract as a failed clang compile: the IR that produced
-            // the failure is left on disk and named in the error.
-            let _ = fs::create_dir_all(&paths.scratch_dir);
-            let _ = fs::write(&paths.ll_path, ll_text);
-            Err(anyhow!(
+            let error = anyhow!(
                 "in-process LLVM compile failed (PERRY_LLVM_INPROCESS).\n\
                  requested -target: {}\n\
-                 LLVM IR left at: {}\n\
                  \n\
                  {}",
                 plan.effective_target,
-                paths.ll_path.display(),
                 e
-            ))
+            );
+            Err(failed_scratch.finish_with_ir(error, ll_text))
         }
     }
 }
@@ -942,6 +993,7 @@ fn compile_ll_inprocess_in(
     _target_triple: Option<&str>,
     _policy: TempFilePolicy,
     _native_roots: bool,
+    _failure_retention: &FailureRetention,
 ) -> Result<Vec<u8>> {
     // Fail loudly rather than silently falling back: an A/B arm that asked
     // for the in-process backend must never be served the text path.
@@ -954,15 +1006,23 @@ fn compile_ll_inprocess_in(
     )
 }
 
-fn compile_ll_to_object_in(
+fn compile_ll_to_object_in_with_retention(
     tmp_dir: &Path,
     ll_text: &str,
     target_triple: Option<&str>,
     policy: TempFilePolicy,
     native_roots: bool,
+    failure_retention: &FailureRetention,
 ) -> Result<Vec<u8>> {
     if inprocess_requested() {
-        return compile_ll_inprocess_in(tmp_dir, ll_text, target_triple, policy, native_roots);
+        return compile_ll_inprocess_in(
+            tmp_dir,
+            ll_text,
+            target_triple,
+            policy,
+            native_roots,
+            failure_retention,
+        );
     }
     // Validate the toolchain before creating the potentially large `.ll`
     // scratch file. Unsupported clang releases should fail without leaving
@@ -1002,6 +1062,7 @@ fn compile_ll_to_object_in(
     fs::create_dir_all(&scratch_dir)
         .with_context(|| format!("Failed to create temp dir at {}", scratch_dir.display()))?;
     write_ll_atomically(&ll_path, ll_text, write_pid, write_nonce)?;
+    let failed_scratch = FailedScratch::new(&scratch_dir, &ll_path, policy.keep, failure_retention);
 
     let plan = build_clang_compile_plan(
         clang.clone(),
@@ -1045,9 +1106,9 @@ fn compile_ll_to_object_in(
     // disables tuning entirely. See `cpu_tuning_arg_for` (#6125).
 
     log::debug!("perry-codegen: {:?}", cmd);
-    let output = cmd
-        .output()
-        .with_context(|| format!("Failed to invoke {}", clang.display()))?;
+    let output = cmd.output().map_err(|error| {
+        failed_scratch.finish(anyhow!("Failed to invoke {}: {error}", clang.display()))
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1063,12 +1124,11 @@ fn compile_ll_to_object_in(
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|| "(unable to query --version)".to_string());
         let hint = build_clang_failure_hint(&stderr, &clang_version, &plan.effective_target);
-        return Err(anyhow!(
+        let error = anyhow!(
             "clang -c failed (status={}).\n\
              clang:           {}\n\
              clang --version: {}\n\
              requested -target: {}\n\
-             LLVM IR left at: {}\n\
              \n\
              stderr:\n{}\n\
              {}",
@@ -1076,10 +1136,10 @@ fn compile_ll_to_object_in(
             plan.clang.display(),
             clang_version.lines().next().unwrap_or("?"),
             plan.effective_target,
-            plan.ll_path.display(),
             stderr,
             hint
-        ));
+        );
+        return Err(failed_scratch.finish(error));
     }
 
     if let Some(asm_path) = &plan.asm_path {
@@ -1089,11 +1149,13 @@ fn compile_ll_to_object_in(
             asm_path,
             &obj_path,
             &plan.clang_args,
-        )?;
+        )
+        .map_err(|error| failed_scratch.finish(error))?;
     }
 
     let bytes = fs::read(&obj_path)
-        .with_context(|| format!("Failed to read clang output at {}", obj_path.display()))?;
+        .with_context(|| format!("Failed to read clang output at {}", obj_path.display()))
+        .map_err(|error| failed_scratch.finish(error))?;
 
     // Clean up on success.
     //

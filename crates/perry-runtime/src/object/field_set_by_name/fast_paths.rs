@@ -59,7 +59,7 @@ pub(crate) unsafe fn try_existing_own_data_overwrite(
         return false;
     }
 
-    let keys = (*obj).keys_array;
+    let keys = crate::object::object_keys_array(obj);
     let keys_addr = keys as usize;
     if keys.is_null() || (keys_addr as u64) >> 48 != 0 {
         return false;
@@ -99,10 +99,11 @@ pub(crate) unsafe fn try_existing_own_data_overwrite(
         vbits
     };
     super::mark_object_dynamic_shape_unknown(obj);
-    let alloc_limit =
-        std::cmp::max((*obj).field_count, crate::object::INLINE_SLOT_FLOOR as u32) as usize;
+    // #8113: one bound probe, reused. It is a shape-table lookup now.
+    let live_slots = crate::object::object_live_slot_count(obj);
+    let alloc_limit = std::cmp::max(live_slots, crate::object::INLINE_SLOT_FLOOR as u32) as usize;
     if (idx as usize) < alloc_limit {
-        if idx >= (*obj).field_count {
+        if idx >= live_slots {
             set_object_live_slot_count(obj, idx + 1);
         }
         store_object_field_slot(obj, idx as usize, vbits);
@@ -239,7 +240,7 @@ pub extern "C" fn js_object_set_field_by_name_transition_fast(
         obj = obj_handle.get_raw_mut_ptr::<ObjectHeader>();
         let value = value_handle.get_nanbox_f64();
 
-        let keys = (*obj).keys_array;
+        let keys = crate::object::object_keys_array(obj);
         let prev_keys = keys as usize;
         if !keys.is_null() {
             let keys_ptr = keys as usize;
@@ -258,8 +259,10 @@ pub extern "C" fn js_object_set_field_by_name_transition_fast(
         set_object_keys_array(obj, next_keys as *mut ArrayHeader);
         super::mark_object_dynamic_shape_unknown(obj);
 
+        // #8113: one bound probe, reused.
+        let live_slots = crate::object::object_live_slot_count(obj);
         let alloc_limit =
-            std::cmp::max((*obj).field_count, crate::object::INLINE_SLOT_FLOOR as u32) as usize;
+            std::cmp::max(live_slots, crate::object::INLINE_SLOT_FLOOR as u32) as usize;
         let slot_usize = slot_idx as usize;
         let vbits = value.to_bits();
         let vbits = if (vbits >> 48) == 0x7FFD && (vbits & 0x0000_FFFF_FFFF_FFFF) == 0 {
@@ -269,7 +272,7 @@ pub extern "C" fn js_object_set_field_by_name_transition_fast(
         };
 
         if slot_usize < alloc_limit {
-            if slot_idx >= (*obj).field_count {
+            if slot_idx >= live_slots {
                 set_object_live_slot_count(obj, slot_idx + 1);
             }
             store_object_field_slot(obj, slot_usize, vbits);

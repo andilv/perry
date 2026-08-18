@@ -1,7 +1,8 @@
 // Auto-generated from Perry's API manifest (#465). Do not edit by hand.
 // Source: perry-api-manifest::API_MANIFEST
-// Coverage: 2010 entries across 123 modules
+// Coverage: 2024 entries across 123 modules
 
+type PerryU8 = number & { readonly __perryU8?: never };
 type PerryU32 = number & { readonly __perryU32?: never };
 type PerryU64 = number & { readonly __perryU64?: never };
 type PerryUSize = number & { readonly __perryUSize?: never };
@@ -323,9 +324,9 @@ declare module "bun:ffi" {
   export function ptr(...args: any[]): any;
   /** stdlib @perryStub stage ≥2 — not yet implemented, throws at runtime (#6562) */
   export function read(...args: any[]): any;
-  /** stdlib @perryStub stage 2 — not yet implemented, throws at runtime (#6562) */
+  /** stdlib */
   export function toArrayBuffer(...args: any[]): any;
-  /** stdlib @perryStub stage 2 — not yet implemented, throws at runtime (#6562) */
+  /** stdlib */
   export function toBuffer(...args: any[]): any;
   /** stdlib @perryStub stage ≥2 — not yet implemented, throws at runtime (#6562) */
   export function viewSource(...args: any[]): any;
@@ -2417,9 +2418,14 @@ declare module "perf_hooks" {
   /** stdlib */
   export const constants: any;
   /** stdlib */
+  const _default: any;
+  export default _default;
+  /** stdlib */
   export const performance: any;
   /** stdlib */
   export function createHistogram(...args: any[]): any;
+  /** stdlib */
+  export function eventLoopUtilization(...args: any[]): any;
   /** stdlib */
   export function monitorEventLoopDelay(...args: any[]): any;
   /** stdlib */
@@ -2669,10 +2675,26 @@ declare module "perry/native" {
   export const NativeArena: any;
   /** intrinsic */
   export function alignof(): number;
+  /** stdlib */
+  export function f32(value: number): number;
+  /** stdlib */
+  export function f64(value: number): number;
+  /** stdlib */
+  export function i32(value: number): number;
+  /** stdlib */
+  export function i64(value: number): number;
   /** intrinsic */
   export function offsetof(field: string): number;
   /** intrinsic */
   export function sizeof(): number;
+  /** stdlib */
+  export function u32(value: number): number;
+  /** stdlib */
+  export function u64(value: number): number;
+  /** stdlib */
+  export function u8(value: number): number;
+  /** stdlib */
+  export function usize(value: number): number;
 }
 
 declare module "perry/plugin" {
@@ -2985,6 +3007,8 @@ declare module "perry/ui" {
   /** stdlib */
   export function WebView(...args: any[]): any;
   /** stdlib */
+  export function WheelPicker(...args: any[]): any;
+  /** stdlib */
   export function Window(...args: any[]): any;
   /** stdlib */
   export function ZStack(...args: any[]): any;
@@ -3154,6 +3178,12 @@ declare module "perry/ui" {
   export function webviewLoadUrl(...args: any[]): any;
   /** stdlib */
   export function webviewReload(...args: any[]): any;
+  /** stdlib */
+  export function wheelPickerAddItem(...args: any[]): any;
+  /** stdlib */
+  export function wheelPickerGetSelected(...args: any[]): any;
+  /** stdlib */
+  export function wheelPickerSetSelected(...args: any[]): any;
 }
 
 declare module "perry/updater" {
@@ -4249,7 +4279,7 @@ declare module "vm" {
   /** stdlib */
   export function compileFunction(...args: any[]): any;
   /** stdlib */
-  export function createContext(p0: any): any;
+  export function createContext(contextObject?: any, options?: any): any;
   /** stdlib */
   export function createScript(...args: any[]): any;
   /** stdlib */

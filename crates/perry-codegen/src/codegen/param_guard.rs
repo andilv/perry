@@ -325,7 +325,186 @@ impl<'a> GuardGraphBuilder<'a> {
     }
 }
 
-const MAGIC: u32 = 0x3154_4750; // `PGT1`, little-endian.
+const MAGIC: u32 = 0x3254_4750; // `PGT2`, little-endian.
+
+/// Set on a container node's op byte to tell `js_param_type_guard` that a
+/// visit to that node must be recorded in the traversal's visited set
+/// (`OP_TRACK_VISIT` in `perry-runtime`'s `param_type_guard`).
+///
+/// The validator kept the set unconditionally, which cost a linear scan of up
+/// to 64 entries — and past that a `HashSet` insert — for every container it
+/// touched. On the shapes that actually pay for guards that is per ARRAY
+/// ELEMENT: validating `p: { toks: Token[], pos: number }` on every `peek(p)`
+/// recorded one entry per token, none of which can ever be consulted. The set
+/// only earns its keep on a node that can be entered twice, and the compiler
+/// owns the graph, so it decides that here instead (#8202).
+const OP_TRACK_VISIT: u8 = 0x80;
+
+fn node_children(node: &GuardNode) -> Vec<u32> {
+    match node {
+        GuardNode::Array(elem) | GuardNode::Set(elem) | GuardNode::RecursiveRef(elem) => {
+            vec![*elem]
+        }
+        GuardNode::Tuple(elems) | GuardNode::Union(elems) => elems.clone(),
+        GuardNode::Object { fields, .. } => fields.iter().map(|field| field.ty).collect(),
+        GuardNode::Map { key, value } => vec![*key, *value],
+        _ => Vec::new(),
+    }
+}
+
+/// Only these ops consult the visited set at all; tagging anything else would
+/// change bytes the validator never reads.
+fn is_container(node: &GuardNode) -> bool {
+    matches!(
+        node,
+        GuardNode::Array(_)
+            | GuardNode::Tuple(_)
+            | GuardNode::Object { .. }
+            | GuardNode::Map { .. }
+            | GuardNode::Set(_)
+    )
+}
+
+/// Every node that lies on a directed cycle: its strongly-connected component
+/// has more than one member, or it points at itself. Iterative Tarjan, so a
+/// 4096-node descriptor cannot blow the compiler's stack.
+fn cycle_members(children: &[Vec<u32>]) -> Vec<bool> {
+    let count = children.len();
+    let mut index = vec![u32::MAX; count];
+    let mut low = vec![0u32; count];
+    let mut on_stack = vec![false; count];
+    let mut component: Vec<u32> = Vec::new();
+    let mut cycle = vec![false; count];
+    let mut next_index = 0u32;
+    // (node, next unvisited child slot)
+    let mut work: Vec<(u32, usize)> = Vec::new();
+
+    for root in 0..count {
+        if index[root] != u32::MAX {
+            continue;
+        }
+        index[root] = next_index;
+        low[root] = next_index;
+        next_index += 1;
+        component.push(root as u32);
+        on_stack[root] = true;
+        work.push((root as u32, 0));
+
+        while let Some((node, cursor)) = work.pop() {
+            let node_index = node as usize;
+            if let Some(child) = children[node_index].get(cursor).copied() {
+                work.push((node, cursor + 1));
+                let child_index = child as usize;
+                if child_index >= count {
+                    continue;
+                }
+                if child == node {
+                    cycle[node_index] = true;
+                } else if index[child_index] == u32::MAX {
+                    index[child_index] = next_index;
+                    low[child_index] = next_index;
+                    next_index += 1;
+                    component.push(child);
+                    on_stack[child_index] = true;
+                    work.push((child, 0));
+                } else if on_stack[child_index] {
+                    low[node_index] = low[node_index].min(index[child_index]);
+                }
+                continue;
+            }
+            if low[node_index] == index[node_index] {
+                let mut members: Vec<u32> = Vec::new();
+                while let Some(top) = component.pop() {
+                    on_stack[top as usize] = false;
+                    members.push(top);
+                    if top == node {
+                        break;
+                    }
+                }
+                if members.len() > 1 {
+                    for member in members {
+                        cycle[member as usize] = true;
+                    }
+                }
+            }
+            if let Some((parent, _)) = work.last().copied() {
+                let parent_index = parent as usize;
+                low[parent_index] = low[parent_index].min(low[node_index]);
+            }
+        }
+    }
+    cycle
+}
+
+/// One bit per node: does a visit to it have to go in the visited set?
+///
+/// Two facts make the set load-bearing, and both are properties of this
+/// immutable graph rather than of the value being validated:
+///
+/// * **termination** — a value cycle (`env.parent === env`) can only walk
+///   forever through a node that reaches itself, so every node on a descriptor
+///   cycle is recorded;
+/// * **no re-walk blowup** — a node the traversal can enter twice with the same
+///   address memoizes, which keeps total work linear in (address, node) pairs.
+///   `entries` answers that by propagating a saturating "how many ways in"
+///   count from the root, resetting at each node already known to memoize.
+///
+/// Everything else — the tree-shaped descriptors that dominate real guarded
+/// parameters — records nothing, because a second visit could never be
+/// consulted anyway.
+fn visit_tracking_bits(nodes: &[GuardNode], root: u32) -> Vec<bool> {
+    let count = nodes.len();
+    let children: Vec<Vec<u32>> = nodes.iter().map(node_children).collect();
+    let mut parents: Vec<Vec<u32>> = vec![Vec::new(); count];
+    for (id, edges) in children.iter().enumerate() {
+        for child in edges {
+            if let Some(slot) = parents.get_mut(*child as usize) {
+                slot.push(id as u32);
+            }
+        }
+    }
+
+    // Only a CONTAINER on a cycle actually memoizes — the validator consults
+    // the set nowhere else — so only those cut the propagation below. A union
+    // or recursive-reference cycle carrying no container is bounded by the
+    // validator's depth cap instead, exactly as it is today.
+    let cycles = cycle_members(&children);
+    let mut track: Vec<bool> = nodes
+        .iter()
+        .enumerate()
+        .map(|(id, node)| is_container(node) && cycles[id])
+        .collect();
+    // Saturating at 2: "can be entered more than once" is the whole question.
+    let mut entries = vec![0u8; count];
+    if let Some(slot) = entries.get_mut(root as usize) {
+        *slot = 1;
+    }
+    let mut work: Vec<u32> = (0..count as u32).collect();
+    while let Some(node) = work.pop() {
+        let node_index = node as usize;
+        let mut value = u8::from(node == root);
+        for parent in &parents[node_index] {
+            let parent_index = *parent as usize;
+            // A node that already memoizes hands its subtree exactly one entry,
+            // however many ways the walk reached the node itself.
+            let out = if track[parent_index] {
+                1
+            } else {
+                entries[parent_index]
+            };
+            value = value.saturating_add(out).min(2);
+        }
+        if value > entries[node_index] {
+            entries[node_index] = value;
+            work.extend_from_slice(&children[node_index]);
+        }
+    }
+
+    for (id, node) in nodes.iter().enumerate() {
+        track[id] = is_container(node) && (track[id] || entries[id] >= 2);
+    }
+    track
+}
 
 fn put_u16(out: &mut Vec<u8>, value: u16) {
     out.extend_from_slice(&value.to_le_bytes());
@@ -398,13 +577,50 @@ fn encode_node(node: &GuardNode) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn descriptor_for_type(
+/// Whether validation has a value-independent upper bound. Arrays, maps and
+/// sets walk a runtime-sized collection; a descriptor cycle can walk a
+/// runtime-sized object graph. Everything else visits a fixed graph of fields
+/// and union arms whose size the compiler owns.
+fn descriptor_walk_is_bounded(nodes: &[GuardNode], root: u32) -> bool {
+    let children: Vec<Vec<u32>> = nodes.iter().map(node_children).collect();
+    let cycle = cycle_members(&children);
+    let mut seen = vec![false; nodes.len()];
+    let mut work = vec![root];
+    while let Some(node) = work.pop() {
+        let Ok(index) = usize::try_from(node) else {
+            return false;
+        };
+        let (Some(entry), Some(children), Some(on_cycle), Some(visited)) = (
+            nodes.get(index),
+            children.get(index),
+            cycle.get(index),
+            seen.get_mut(index),
+        ) else {
+            return false;
+        };
+        if std::mem::replace(visited, true) {
+            continue;
+        }
+        if *on_cycle
+            || matches!(
+                entry,
+                GuardNode::Array(_) | GuardNode::Map { .. } | GuardNode::Set(_)
+            )
+        {
+            return false;
+        }
+        work.extend(children);
+    }
+    true
+}
+
+fn descriptor_for_type_with_walk_bound(
     ty: &Type,
     type_aliases: &HashMap<String, Type>,
     interfaces: &HashMap<String, perry_hir::Interface>,
     classes: &HashMap<String, &perry_hir::Class>,
     class_ids: &HashMap<String, u32>,
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, bool)> {
     let mut builder = GuardGraphBuilder {
         nodes: Vec::new(),
         named: HashMap::new(),
@@ -415,11 +631,22 @@ fn descriptor_for_type(
         class_ids,
     };
     let root = builder.build_type(ty, false)?;
-    let bodies = builder
+    let walk_is_bounded = descriptor_walk_is_bounded(&builder.nodes, root);
+    let mut bodies = builder
         .nodes
         .iter()
         .map(encode_node)
         .collect::<Option<Vec<_>>>()?;
+    for (body, tracked) in bodies
+        .iter_mut()
+        .zip(visit_tracking_bits(&builder.nodes, root))
+    {
+        if tracked {
+            if let Some(op) = body.first_mut() {
+                *op |= OP_TRACK_VISIT;
+            }
+        }
+    }
     let node_count: u32 = bodies.len().try_into().ok()?;
     let header_len = 12usize.checked_add((bodies.len() + 1).checked_mul(4)?)?;
     let mut offset: u32 = header_len.try_into().ok()?;
@@ -435,13 +662,69 @@ fn descriptor_for_type(
     for body in bodies {
         out.extend_from_slice(&body);
     }
-    Some(out)
+    Some((out, walk_is_bounded))
+}
+
+#[cfg(test)]
+fn descriptor_for_type(
+    ty: &Type,
+    type_aliases: &HashMap<String, Type>,
+    interfaces: &HashMap<String, perry_hir::Interface>,
+    classes: &HashMap<String, &perry_hir::Class>,
+    class_ids: &HashMap<String, u32>,
+) -> Option<Vec<u8>> {
+    descriptor_for_type_with_walk_bound(ty, type_aliases, interfaces, classes, class_ids)
+        .map(|(descriptor, _)| descriptor)
+}
+
+/// A loop makes the body's own work potentially unbounded, so a collection or
+/// recursive graph walk can still be amortizable. With no loop, validating an
+/// unbounded input to enter a bounded body cannot win as the input grows.
+/// Nested closure bodies are not part of the enclosing function's work.
+fn body_contains_loop(stmts: &[perry_hir::Stmt]) -> bool {
+    use perry_hir::Stmt;
+    stmts.iter().any(|stmt| match stmt {
+        Stmt::While { .. } | Stmt::DoWhile { .. } | Stmt::For { .. } => true,
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            body_contains_loop(then_branch)
+                || else_branch.as_deref().is_some_and(body_contains_loop)
+        }
+        Stmt::Try {
+            body,
+            catch,
+            finally,
+        } => {
+            body_contains_loop(body)
+                || catch
+                    .as_ref()
+                    .is_some_and(|catch| body_contains_loop(&catch.body))
+                || finally.as_deref().is_some_and(body_contains_loop)
+        }
+        Stmt::Switch { cases, .. } => cases.iter().any(|case| body_contains_loop(&case.body)),
+        Stmt::Labeled { body, .. } => body_contains_loop(std::slice::from_ref(body.as_ref())),
+        Stmt::Expr(_)
+        | Stmt::Throw(_)
+        | Stmt::Return(_)
+        | Stmt::Let { .. }
+        | Stmt::Break
+        | Stmt::Continue
+        | Stmt::LabeledBreak(_)
+        | Stmt::LabeledContinue(_)
+        | Stmt::PreallocateBoxes(_)
+        | Stmt::PreallocateTdzBoxes(_)
+        | Stmt::ReleaseBoxes(_) => false,
+    })
 }
 
 pub(crate) fn declaration_guards(
     function_id: u32,
     module_prefix: &str,
     params: &[perry_hir::Param],
+    body: &[perry_hir::Stmt],
     demoted_params: &[bool],
     // (#8094) Guard-only ineligibility, kept SEPARATE from `demoted_params`
     // because that mask also drives raw representation selection: a reference
@@ -453,6 +736,7 @@ pub(crate) fn declaration_guards(
     classes: &HashMap<String, &perry_hir::Class>,
     class_ids: &HashMap<String, u32>,
 ) -> Vec<Option<SpecParamGuard>> {
+    let body_can_amortize_unbounded_walk = body_contains_loop(body);
     params
         .iter()
         .zip(demoted_params.iter())
@@ -462,19 +746,31 @@ pub(crate) fn declaration_guards(
             if *demoted || *blocked || matches!(param.ty, Type::Any | Type::Unknown | Type::Never) {
                 return None;
             }
+            let (descriptor, walk_is_bounded) = descriptor_for_type_with_walk_bound(
+                &param.ty,
+                type_aliases,
+                interfaces,
+                classes,
+                class_ids,
+            )?;
+            // #8202: `peek(p: Parser)` walked every token to enter an O(1)
+            // body, while `asNum(v: Value)` admitted a recursive 123-node
+            // graph to read one discriminant and one field. The validator was
+            // 9.8-12% of those programs and the clone it licensed was worth
+            // only 0.1-0.2%. Do not emit a guard whose work grows with the
+            // input when the guarded body itself is statically bounded. A
+            // loop leaves the decision unchanged: array reducers and similar
+            // consumers can amortize validation over their own traversal.
+            if !walk_is_bounded && !body_can_amortize_unbounded_walk {
+                return None;
+            }
             Some(SpecParamGuard {
                 proof: param.ty.clone(),
                 descriptor_name: format!(
                     "perry_param_guard_{}_{}_{}",
                     module_prefix, function_id, index
                 ),
-                descriptor: descriptor_for_type(
-                    &param.ty,
-                    type_aliases,
-                    interfaces,
-                    classes,
-                    class_ids,
-                )?,
+                descriptor,
             })
         })
         .collect()
@@ -555,6 +851,51 @@ pub(crate) fn body_contains_await(stmts: &[perry_hir::Stmt]) -> bool {
     })
 }
 
+/// A single-node scalar descriptor whose predicate an existing typed-abi
+/// leaf guard already decides exactly. Before #8201, a single-node
+/// `js_param_type_guard` call cost ~450 instructions and measured as 16-34%
+/// of ALL retired instructions on the
+/// tree/tree_wide/interp/iso_miss corpus rows, because every unproven call
+/// routes through the public wrapper. The descriptor parse is only a small
+/// part of that cost, and LLVM already elides the inline visited array's
+/// initialization; the win here comes from avoiding the interpretive call:
+///
+/// * `OP_NUMBER` (1) = `js_typed_f64_arg_guard` = `is_number || is_int32`
+/// * `OP_INT32` (2) — the validator literally calls `js_typed_i32_arg_guard`
+/// * `OP_BOOLEAN` (3) = `js_typed_i1_arg_guard` = `TAG_TRUE | TAG_FALSE`
+/// * `OP_STRING` (4) = `js_typed_string_arg_guard` = `is_any_string`
+///
+/// The predicate equivalence is what makes this sound: routing (clone vs
+/// generic fallback) is bit-for-bit the decision the validator would have
+/// made. Anything structural — unions, objects, arrays, literals — keeps
+/// the descriptor call. Layout checked exhaustively so a future format
+/// change fails back to the validator instead of misreading bytes.
+pub(crate) fn scalar_descriptor_rep(descriptor: &[u8]) -> Option<super::typed_abi::TypedParamRep> {
+    use super::typed_abi::TypedParamRep;
+    let word = |at: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(
+            descriptor.get(at..at + 4)?.try_into().ok()?,
+        ))
+    };
+    // magic | root | node_count | offsets (node_count+1) | bodies
+    if descriptor.len() != 21
+        || word(0)? != MAGIC
+        || word(4)? != 0
+        || word(8)? != 1
+        || word(12)? != 20
+        || word(16)? != 21
+    {
+        return None;
+    }
+    match descriptor[20] & !OP_TRACK_VISIT {
+        1 => Some(TypedParamRep::F64),
+        2 => Some(TypedParamRep::I32),
+        3 => Some(TypedParamRep::I1),
+        4 => Some(TypedParamRep::StringRef),
+        _ => None,
+    }
+}
+
 /// LLVM `c"..."` encoding for a binary descriptor plus its sentinel byte.
 pub(crate) fn descriptor_llvm_literal(bytes: &[u8]) -> String {
     let mut out = String::from("c\"");
@@ -573,6 +914,230 @@ pub(crate) fn descriptor_llvm_literal(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (#8079) The four ops the leaf guards decide classify; everything
+    /// structural, literal, truncated, or foreign stays with the validator.
+    /// Built through the real encoder so a layout change flips this red
+    /// instead of silently misclassifying.
+    #[test]
+    fn scalar_descriptor_rep_classifies_exactly_the_leaf_guard_ops() {
+        use super::super::typed_abi::TypedParamRep;
+        let build = |ty: &Type| {
+            descriptor_for_type(
+                ty,
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            scalar_descriptor_rep(&build(&Type::Number)),
+            Some(TypedParamRep::F64)
+        );
+        assert_eq!(
+            scalar_descriptor_rep(&build(&Type::Int32)),
+            Some(TypedParamRep::I32)
+        );
+        assert_eq!(
+            scalar_descriptor_rep(&build(&Type::Boolean)),
+            Some(TypedParamRep::I1)
+        );
+        assert_eq!(
+            scalar_descriptor_rep(&build(&Type::String)),
+            Some(TypedParamRep::StringRef)
+        );
+        assert_eq!(
+            scalar_descriptor_rep(&build(&Type::Array(Box::new(Type::Number)))),
+            None
+        );
+        assert_eq!(scalar_descriptor_rep(&build(&Type::Null)), None);
+        assert_eq!(scalar_descriptor_rep(&build(&Type::Number)[..20]), None);
+        assert_eq!(scalar_descriptor_rep(b"PGT1"), None);
+    }
+
+    fn declaration_guard_for(
+        ty: Type,
+        body: &[perry_hir::Stmt],
+        aliases: &HashMap<String, Type>,
+    ) -> Option<SpecParamGuard> {
+        let params = [perry_hir::Param {
+            id: 1,
+            name: "value".to_string(),
+            ty,
+            default: None,
+            decorators: Vec::new(),
+            is_rest: false,
+            arguments_object: None,
+        }];
+        declaration_guards(
+            1,
+            "walk_bound_test",
+            &params,
+            body,
+            &[false],
+            &[false],
+            aliases,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .into_iter()
+        .next()
+        .flatten()
+    }
+
+    /// #8202: a runtime-sized validation walk cannot amortize against a body
+    /// with statically bounded work. Keep bounded structural objects and the
+    /// existing loop-consumer case, but decline arrays and recursive graphs
+    /// for constant-work helpers such as `peek` and `asNum`.
+    #[test]
+    fn constant_work_bodies_decline_unbounded_descriptor_walks() {
+        let flat = object_alias("Flat", &[("value", Type::Number)]);
+        let flat_aliases = HashMap::from([flat]);
+        assert!(
+            declaration_guard_for(Type::Named("Flat".to_string()), &[], &flat_aliases).is_some(),
+            "a fixed field walk remains eligible"
+        );
+
+        let array = Type::Array(Box::new(Type::Number));
+        assert!(declaration_guard_for(array.clone(), &[], &HashMap::new()).is_none());
+
+        let loop_body = [perry_hir::Stmt::While {
+            condition: perry_hir::Expr::Bool(false),
+            body: Vec::new(),
+        }];
+        assert!(
+            declaration_guard_for(array, &loop_body, &HashMap::new()).is_some(),
+            "a loop consumer keeps the existing structural specialization"
+        );
+
+        let recursive_aliases = HashMap::from([object_alias(
+            "Link",
+            &[(
+                "next",
+                Type::Union(vec![Type::Named("Link".to_string()), Type::Null]),
+            )],
+        )]);
+        assert!(
+            declaration_guard_for(Type::Named("Link".to_string()), &[], &recursive_aliases)
+                .is_none(),
+            "a recursive value walk is runtime-sized too"
+        );
+    }
+
+    fn object_alias(name: &str, fields: &[(&str, Type)]) -> (String, Type) {
+        let mut properties = HashMap::new();
+        for (field, ty) in fields {
+            properties.insert(
+                (*field).to_string(),
+                perry_hir::types::PropertyInfo {
+                    ty: ty.clone(),
+                    optional: false,
+                    readonly: false,
+                },
+            );
+        }
+        (
+            name.to_string(),
+            Type::Object(perry_hir::types::ObjectType {
+                name: Some(name.to_string()),
+                properties,
+                property_order: Some(fields.iter().map(|(f, _)| (*f).to_string()).collect()),
+                index_signature: None,
+            }),
+        )
+    }
+
+    fn tracked_ops(descriptor: &[u8]) -> Vec<u8> {
+        let word = |at: usize| u32::from_le_bytes(descriptor[at..at + 4].try_into().unwrap());
+        let node_count = word(8) as usize;
+        (0..node_count)
+            .map(|id| descriptor[word(12 + id * 4) as usize])
+            .filter(|op| op & OP_TRACK_VISIT != 0)
+            .map(|op| op & !OP_TRACK_VISIT)
+            .collect()
+    }
+
+    /// (#8202) The shape that pays for guards in practice — `peek(p: Parser)`,
+    /// whose `toks: Token[]` walk touches every element on every call — is a
+    /// tree, so no visit is worth recording. Nothing may carry the bit.
+    #[test]
+    fn a_tree_shaped_descriptor_records_no_visits() {
+        let aliases = HashMap::from([
+            object_alias("Token", &[("kind", Type::String), ("text", Type::String)]),
+            object_alias(
+                "Parser",
+                &[
+                    (
+                        "toks",
+                        Type::Array(Box::new(Type::Named("Token".to_string()))),
+                    ),
+                    ("pos", Type::Number),
+                ],
+            ),
+        ]);
+        let descriptor = descriptor_for_type(
+            &Type::Named("Parser".to_string()),
+            &aliases,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(tracked_ops(&descriptor), Vec::<u8>::new());
+    }
+
+    /// A value cycle can only walk forever through a node that reaches itself,
+    /// so the container on the cycle MUST carry the bit — the validator's only
+    /// termination argument for `env.parent === env` rests on it.
+    #[test]
+    fn a_container_on_a_cycle_records_its_visits() {
+        let aliases = HashMap::from([object_alias(
+            "Env",
+            &[(
+                "parent",
+                Type::Union(vec![Type::Named("Env".to_string()), Type::Null]),
+            )],
+        )]);
+        let descriptor = descriptor_for_type(
+            &Type::Named("Env".to_string()),
+            &aliases,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(tracked_ops(&descriptor), vec![11]);
+    }
+
+    /// A node two fields share can be entered twice with the SAME address, so
+    /// it memoizes; dropping that would make a deep shared graph re-walk
+    /// exponentially. Its own children stay untracked — the memo at the
+    /// convergence point already holds their entry count at one.
+    #[test]
+    fn a_shared_container_records_its_visits() {
+        let aliases = HashMap::from([
+            object_alias("Leaf", &[("v", Type::Number)]),
+            object_alias(
+                "Pair",
+                &[
+                    ("a", Type::Named("Leaf".to_string())),
+                    ("b", Type::Named("Leaf".to_string())),
+                ],
+            ),
+        ]);
+        let descriptor = descriptor_for_type(
+            &Type::Named("Pair".to_string()),
+            &aliases,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(tracked_ops(&descriptor), vec![11]);
+    }
 
     #[test]
     fn recursive_alias_serializes_as_a_finite_graph() {

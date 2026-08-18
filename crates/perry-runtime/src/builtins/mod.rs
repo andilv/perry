@@ -74,9 +74,11 @@ pub use console::{
 };
 
 pub(crate) use console::{
-    is_console_instance_method_name, is_console_instance_value,
+    is_console_instance_method_name, is_console_instance_value, prune_dead_console_instance_owners,
     try_console_instance_method_dispatch, CONSOLE_INSTANCE_CLASS_ID,
 };
+#[cfg(test)]
+pub(crate) use console::{test_console_instance_count, test_seed_console_instance};
 
 pub use formatting::{
     function_name_for_ptr, function_source_for_func_ptr, function_source_for_ptr, js_array_print,
@@ -90,8 +92,13 @@ pub use formatting::{
 pub(crate) use formatting::{
     boxed_primitive_json_value, boxed_primitive_payload, boxed_primitive_to_string_tag,
     format_finite_number_js, format_jsvalue, is_negative_zero, jsvalue_string_content,
-    InspectCompactGuard, InspectCustomInspectGuard, InspectDepthLimitGuard, InspectGettersGuard,
-    InspectShowHiddenGuard, InspectSortedGuard, INT_EXACT_FASTPATH_LIMIT,
+    prune_dead_boxed_primitive_payload_owners, InspectCompactGuard, InspectCustomInspectGuard,
+    InspectDepthLimitGuard, InspectGettersGuard, InspectShowHiddenGuard, InspectSortedGuard,
+    INT_EXACT_FASTPATH_LIMIT,
+};
+#[cfg(test)]
+pub(crate) use formatting::{
+    test_boxed_primitive_payload_count, test_seed_boxed_primitive_payload,
 };
 
 pub use globals::{
@@ -102,6 +109,7 @@ pub use globals::{
     scan_queued_microtask_roots_mut,
 };
 
+pub(crate) use globals::scan_structured_clone_memo_roots_mut;
 pub(crate) use globals::{drain_queued_microtasks_count, queued_microtasks_pending};
 
 /// #6943: inertness predicate for the `js_string_coerce`-as-property-key

@@ -122,8 +122,7 @@ pub(super) unsafe fn dispatch_primitive(
             if let Some(result) = crate::value::function_to_string_method_result(object) {
                 return Some(result);
             }
-            let func_ptr = (*(raw_addr as *const crate::closure::ClosureHeader)).func_ptr as usize;
-            let s = crate::builtins::function_source_for_func_ptr(func_ptr);
+            let s = crate::node_vm::function_source_for_closure(raw_addr);
             let str_ptr = crate::string::js_string_from_bytes(s.as_ptr(), s.len() as u32);
             return Some(f64::from_bits(JSValue::string_ptr(str_ptr).bits()));
         }
@@ -821,6 +820,13 @@ pub(super) unsafe fn dispatch_primitive(
                 let ta = addr as *mut crate::typedarray::TypedArrayHeader;
                 if let Some(r) = dispatch_typed_array_method(ta, method_name, args_ptr, args_len) {
                     return Some(r);
+                }
+                if typed_array_lacks_array_method(method_name) {
+                    return Some(dispatch_absent_typed_array_array_method(
+                        ta,
+                        method_name,
+                        arg_handles,
+                    ));
                 }
             }
         }

@@ -138,7 +138,7 @@ pub extern "C" fn js_object_set_field_by_name(
                         && !super::prototype_chain::object_has_prototype_override(raw)
                         && super::prop_plan::store_plan_check(class_id, key as usize)
                     {
-                        let keys = (*o).keys_array;
+                        let keys = crate::object::object_keys_array(o);
                         let keys_ok = keys.is_null()
                             || (((keys as u64) >> 48) == 0
                                 && crate::value::addr_class::is_above_handle_band(keys as usize));
@@ -160,8 +160,10 @@ pub extern "C" fn js_object_set_field_by_name(
                                 };
                                 set_object_keys_array(o, next_keys as *mut ArrayHeader);
                                 super::mark_object_dynamic_shape_unknown(o);
+                                // #8113: one bound probe, reused.
+                                let live_slots = crate::object::object_live_slot_count(o);
                                 let alloc_limit = std::cmp::max(
-                                    (*o).field_count,
+                                    live_slots,
                                     crate::object::INLINE_SLOT_FLOOR as u32,
                                 ) as usize;
                                 if (slot_idx as usize) < alloc_limit {
@@ -169,7 +171,7 @@ pub extern "C" fn js_object_set_field_by_name(
                                         .add(std::mem::size_of::<ObjectHeader>())
                                         as *mut JSValue;
                                     let slot = fields_ptr.add(slot_idx as usize);
-                                    if slot_idx >= (*o).field_count {
+                                    if slot_idx >= live_slots {
                                         set_object_live_slot_count(o, slot_idx + 1);
                                     }
                                     crate::gc::runtime_store_jsvalue_slot(

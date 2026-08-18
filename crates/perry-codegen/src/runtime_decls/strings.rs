@@ -197,6 +197,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
         &[PTR, I32, PTR],
     );
     module.declare_function("js_closure_set_capture_bits", VOID, &[I64, I32, I64]);
+    module.declare_function("js_closure_set_box_capture_ptr", VOID, &[I64, I32, I64]);
     module.declare_function("js_closure_get_capture_bits", I64, &[I64, I32]);
     module.declare_function("js_closure_set_capture_f64", VOID, &[I64, I32, DOUBLE]);
     module.declare_function("js_closure_get_capture_f64", DOUBLE, &[I64, I32]);
@@ -934,7 +935,13 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_process_source_maps_enabled", DOUBLE, &[]);
     module.declare_function("js_process_set_source_maps_enabled", DOUBLE, &[DOUBLE]);
     module.declare_function("js_module_is_builtin", DOUBLE, &[DOUBLE]);
-    module.declare_function("js_module_find_package_json", DOUBLE, &[DOUBLE, DOUBLE]);
+    module.declare_function(
+        "js_module_find_package_json",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, DOUBLE],
+    );
+    module.declare_function("js_module_find_source_map", DOUBLE, &[DOUBLE]);
+    module.declare_function("js_module_source_map_new", DOUBLE, &[DOUBLE, DOUBLE]);
     module.declare_function("js_module_register", DOUBLE, &[DOUBLE, DOUBLE, DOUBLE]);
     module.declare_function("js_module_register_hooks", DOUBLE, &[DOUBLE]);
     module.declare_function("js_process_next_tick", VOID, &[I64, I64]);
@@ -987,6 +994,9 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_i32_box_alloc", I64, &[I32]);
     module.declare_function("js_i32_box_get", I32, &[I64]);
     module.declare_function("js_i32_box_set", VOID, &[I64, I32]);
+    module.declare_function("js_box_release", VOID, &[I64]);
+    module.declare_function("js_i32_box_release", VOID, &[I64]);
+    module.declare_function("js_bool_box_release", VOID, &[I64]);
     module.declare_function("js_bool_box_alloc", I64, &[I32]);
     module.declare_function("js_bool_box_get", I32, &[I64]);
     module.declare_function("js_bool_box_set", VOID, &[I64, I32]);

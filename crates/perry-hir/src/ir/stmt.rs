@@ -73,6 +73,19 @@ pub enum Stmt {
     /// ReferenceError; the `Stmt::Let` (or `let x;` with no init) overwrites
     /// the sentinel with the real value / `undefined`, ending the dead zone.
     PreallocateTdzBoxes(Vec<LocalId>),
+    /// Hand the heap box cells behind a set of boxed LocalIds to the async
+    /// activation lifetime tracker (#7933 / #8213). A cell no closure captures
+    /// is cleared, de-registered, and parked when the activation's queued and
+    /// running steps drain. A closure-captured cell remains live until the GC
+    /// proves the final capturing closure dead.
+    ///
+    /// Semantics are a *reclamation hint*: dropping this statement is always
+    /// correct (the cells just stay live, as before #7933). Carrying it
+    /// through a pass that renumbers LocalIds WITHOUT remapping these ids is
+    /// NOT correct — the release would then free a live local's cell — so any
+    /// id-substitution pass must either remap the list like a `LocalSet`
+    /// target or drop the statement.
+    ReleaseBoxes(Vec<LocalId>),
 }
 
 /// A case in a switch statement

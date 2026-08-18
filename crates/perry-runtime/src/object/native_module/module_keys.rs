@@ -1550,6 +1550,39 @@ const SEA_DEFAULT_KEYS: &[&[u8]] = &[
     b"getAssetKeys",
 ];
 
+const MODULE_NAMESPACE_KEYS: &[&[u8]] = &[
+    b"Module",
+    b"SourceMap",
+    b"_cache",
+    b"_extensions",
+    b"_findPath",
+    b"_initPaths",
+    b"_load",
+    b"_nodeModulePaths",
+    b"_pathCache",
+    b"_preloadModules",
+    b"_resolveFilename",
+    b"_resolveLookupPaths",
+    b"builtinModules",
+    b"constants",
+    b"createRequire",
+    b"default",
+    b"enableCompileCache",
+    b"findPackageJSON",
+    b"findSourceMap",
+    b"flushCompileCache",
+    b"getCompileCacheDir",
+    b"getSourceMapsSupport",
+    b"globalPaths",
+    b"isBuiltin",
+    b"register",
+    b"registerHooks",
+    b"runMain",
+    b"setSourceMapsSupport",
+    b"stripTypeScriptTypes",
+    b"syncBuiltinESMExports",
+];
+
 pub(crate) fn native_module_enumerable_keys(module_name: &str) -> Option<&'static [&'static [u8]]> {
     let module_name = normalize_native_module_alias(module_name);
     match module_name {
@@ -1612,6 +1645,7 @@ pub(crate) fn native_module_enumerable_keys(module_name: &str) -> Option<&'stati
         ]),
         "sea" => Some(SEA_NAMESPACE_KEYS),
         "sea.default" => Some(SEA_DEFAULT_KEYS),
+        "module" => Some(MODULE_NAMESPACE_KEYS),
         "domain" => Some(&[b"_stack", b"Domain", b"createDomain", b"create", b"active"]),
         // #3677: zlib.constants enumerates the full Z_*/BROTLI_*/ZSTD_* table.
         "zlib.constants" => Some(ZLIB_CONSTANTS_KEYS),
@@ -1780,6 +1814,21 @@ pub(crate) fn native_module_enumerable_keys(module_name: &str) -> Option<&'stati
             b"createHistogram",
             b"performance",
             b"constants",
+            b"default",
+        ]),
+        "perf_hooks.constants" => Some(&[
+            b"NODE_PERFORMANCE_GC_MAJOR",
+            b"NODE_PERFORMANCE_GC_MINOR",
+            b"NODE_PERFORMANCE_GC_MINOR_MARK_SWEEP",
+            b"NODE_PERFORMANCE_GC_INCREMENTAL",
+            b"NODE_PERFORMANCE_GC_WEAKCB",
+            b"NODE_PERFORMANCE_GC_FLAGS_NO",
+            b"NODE_PERFORMANCE_GC_FLAGS_CONSTRUCT_RETAINED",
+            b"NODE_PERFORMANCE_GC_FLAGS_FORCED",
+            b"NODE_PERFORMANCE_GC_FLAGS_SYNCHRONOUS_PHANTOM_PROCESSING",
+            b"NODE_PERFORMANCE_GC_FLAGS_ALL_AVAILABLE_GARBAGE",
+            b"NODE_PERFORMANCE_GC_FLAGS_ALL_EXTERNAL_MEMORY",
+            b"NODE_PERFORMANCE_GC_FLAGS_SCHEDULE_IDLE",
         ]),
         // The util/types namespace object is tagged `util.types` internally
         // (see the `callable_module_name` remap below); accept both spellings.

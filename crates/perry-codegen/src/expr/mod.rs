@@ -36,6 +36,8 @@ mod buffer_access;
 mod buffer_views;
 mod channel;
 #[cfg(test)]
+mod class_method_arguments_object_tests;
+#[cfg(test)]
 mod conforming_layout_note_tests;
 mod helpers;
 mod i32_fast_path;
@@ -58,7 +60,8 @@ mod write_barrier;
 pub(crate) use crate::native_value::{materialize_js_value, materialize_js_value_without_record};
 pub(crate) use array_literal::lower_array_literal;
 pub(crate) use buffer_access::{
-    access_facts_for_spec, can_lower_integer_typed_array_store_value, emit_buffer_access_pointer,
+    access_facts_for_spec, can_lower_buffer_access_without_calls,
+    can_lower_integer_typed_array_store_value, emit_buffer_access_pointer,
     lower_buffer_access_proof, lower_buffer_load, lower_buffer_store, lower_typed_array_load,
     lower_typed_array_store, BufferAccessSpec,
 };
@@ -136,7 +139,11 @@ pub(crate) use write_barrier::{
 // and the `lower_expr` dispatch table moved into siblings to keep this file
 // under 2000 lines. Inherent methods (`record_value`) need no re-export.
 #[cfg(test)]
+mod array_callback_shape_tests;
+#[cfg(test)]
 mod array_push_guard_tests;
+#[cfg(test)]
+mod barrier_stem_census_tests;
 #[cfg(test)]
 mod class_field_barrier_tests;
 mod dispatch;
@@ -146,6 +153,8 @@ mod record_value;
 mod repsel_gates;
 mod scalar_slot_root;
 pub(crate) mod shadow_inline;
+#[cfg(test)]
+mod write_pic_barrier_tests;
 // `pub(crate)` since #7615 slice 8: `rooting/temp_root.rs` binds a pooled
 // temp alloca through the same shadow-slot emission every named local uses,
 // and it now lives outside `crate::expr`.
@@ -206,6 +215,16 @@ pub(crate) struct InlineCtorReturn {
 }
 
 /// Per-function codegen context. Held briefly during lowering, never stored.
+/// #8122: where an inline-`new` site gets its `<2 x i64>` header image from.
+#[derive(Clone, Debug)]
+pub enum HeaderImageSource {
+    /// An entry alloca holding the module-init image global's value; each
+    /// site emits its own `load <2 x i64>` from it.
+    EntrySlot(String),
+    /// An SSA value composed in the entry region (dominates every site).
+    EntryValue(String),
+}
+
 pub(crate) struct FnCtx<'a> {
     /// Function being built (blocks, params, registers).
     pub func: &'a mut LlFunction,
@@ -472,6 +491,9 @@ pub(crate) struct FnCtx<'a> {
     /// `ctx.classes` chain (which mis-picks same-named cross-module parents).
     pub class_init_chains:
         &'a std::collections::HashMap<String, Vec<(String, Vec<perry_hir::ClassField>)>>,
+    /// #8122: per-class inline-`new` header-image globals, see
+    /// `CrossModuleCtx::class_header_images`.
+    pub class_header_image_globals: &'a std::collections::HashMap<String, (String, u64, u32)>,
     /// Imported class constructor metadata, keyed by effective imported class name.
     pub imported_class_ctors: &'a std::collections::HashMap<String, crate::codegen::ImportedCtor>,
     /// Per-function param signature: `(declared_param_count,
@@ -635,6 +657,10 @@ pub(crate) struct FnCtx<'a> {
     /// of undefined". Same shape as `func_signatures`'s `has_rest`
     /// bit but for class-method dispatch.
     pub method_has_rest: &'a std::collections::HashMap<(String, String), bool>,
+    /// Subset of `method_has_rest` whose trailing rest-shaped slot is the
+    /// compiler-synthesized `arguments` binding and therefore receives every
+    /// actual argument.
+    pub method_has_synthetic_arguments: &'a std::collections::HashMap<(String, String), bool>,
     /// FFI manifest: `name -> (params, return)` from `package.json`
     /// `nativeLibrary.functions`. Descriptors use the shared native-library
     /// ABI vocabulary. `lower_call` consults
@@ -827,6 +853,14 @@ pub(crate) struct FnCtx<'a> {
     /// [`Self::class_keys_slots`]. Shape ids are scalar metadata rather than GC
     /// pointers, so these entry-hoisted copies need no shadow-slot binding.
     pub class_shape_slots: std::collections::HashMap<String, String>,
+    /// #8122: per-class `<2 x i64>` object-header prefix image, keyed by class
+    /// name + the packed GcHeader word it was built with. Read by the inline
+    /// `new` path so every allocation stores the prefix with ONE vector store
+    /// instead of rematerialising the packed constant per site. Either an
+    /// entry-hoisted stack slot holding the module-level image global (loaded
+    /// per site — a value loaded at one site does not dominate another) or,
+    /// as the fallback, an SSA value composed in the entry region.
+    pub class_header_images: std::collections::HashMap<(String, u64), HeaderImageSource>,
 
     /// Per-arr-local cached `arr.length` slots — populated by
     /// `lower_for` when it spots the well-known shape

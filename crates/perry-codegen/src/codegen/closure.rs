@@ -803,7 +803,7 @@ pub(super) fn compile_closure(
             .return_shape_class(func_id)
             .is_some(),
     );
-    let native_facts = crate::collectors::collect_native_region_fact_graph(
+    let mut native_facts = crate::collectors::collect_native_region_fact_graph(
         body,
         &[],
         &flat_const_ids,
@@ -817,6 +817,12 @@ pub(super) fn compile_closure(
         &cross_module.compile_time_constants,
         &cross_module.module_dispatch,
     );
+    if let Some(callback_shapes) = cross_module.array_callback_shapes.get(&func_id) {
+        native_facts
+            .shape_stability
+            .shape_proven_ptr_locals
+            .extend(callback_shapes.clone());
+    }
 
     // Representation-selection context gates (see codegen/function.rs).
     // Async-step closures (CPS-rewritten `async` closures — the rewrite clears
@@ -950,6 +956,7 @@ pub(super) fn compile_closure(
         class_keys_globals: &cross_module.class_keys_globals,
         class_field_counts: &cross_module.class_field_counts,
         class_init_chains: &cross_module.class_init_chains,
+        class_header_image_globals: &cross_module.class_header_images,
         imported_class_ctors: &cross_module.imported_class_ctors,
         func_signatures,
         func_synthetic_arguments,
@@ -981,6 +988,7 @@ pub(super) fn compile_closure(
         imported_func_synthetic_arguments: &cross_module.imported_func_synthetic_arguments,
         method_param_counts: &cross_module.method_param_counts,
         method_has_rest: &cross_module.method_has_rest,
+        method_has_synthetic_arguments: &cross_module.method_has_synthetic_arguments,
         imported_func_return_types: &cross_module.imported_func_return_types,
         ffi_signatures: &cross_module.ffi_signatures,
         ffi_aliases: &cross_module.ffi_aliases,
@@ -1005,6 +1013,7 @@ pub(super) fn compile_closure(
         arena_state_slot: None,
         class_keys_slots: HashMap::new(),
         class_shape_slots: HashMap::new(),
+        class_header_images: HashMap::new(),
         cached_lengths: HashMap::new(),
         bounded_index_pairs: Vec::new(),
         packed_f64_loop_facts: Vec::new(),

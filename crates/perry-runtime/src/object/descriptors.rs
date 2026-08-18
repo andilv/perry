@@ -64,7 +64,7 @@ unsafe fn boxed_string_own_property_names(obj_value: f64, str_value: f64) -> f64
 
     let obj = extract_obj_ptr(obj_value);
     if !obj.is_null() {
-        let keys = (*obj).keys_array;
+        let keys = crate::object::object_keys_array(obj);
         if !keys.is_null() {
             let len = crate::array::js_array_length(keys) as usize;
             let order = ecma_own_key_order(keys);
@@ -538,6 +538,7 @@ pub extern "C" fn js_object_get_own_property_descriptor(obj_value: f64, key_valu
                     // `Object.defineProperty`) overrides those defaults.
                     let registered = super::get_property_attrs(ptr, name);
                     let writable_default = registered.map(|a| a.writable());
+                    let enumerable_default = registered.map(|a| a.enumerable());
                     let configurable_default = registered.map(|a| a.configurable()).unwrap_or(true);
                     if let Some(acc) = super::get_accessor_descriptor(ptr, name) {
                         let attrs =
@@ -583,7 +584,7 @@ pub extern "C" fn js_object_get_own_property_descriptor(obj_value: f64, key_valu
                             Some((
                                 arity as f64,
                                 writable_default.unwrap_or(false),
-                                false,
+                                enumerable_default.unwrap_or(false),
                                 configurable_default,
                             ))
                         }
@@ -597,7 +598,7 @@ pub extern "C" fn js_object_get_own_property_descriptor(obj_value: f64, key_valu
                                 Some((
                                     dynv,
                                     writable_default.unwrap_or(false),
-                                    false,
+                                    enumerable_default.unwrap_or(false),
                                     configurable_default,
                                 ))
                             } else {
@@ -610,12 +611,18 @@ pub extern "C" fn js_object_get_own_property_descriptor(obj_value: f64, key_valu
                                     fname.as_ptr(),
                                     fname.len() as u32,
                                 );
-                                Some((crate::js_nanbox_string(s as i64), false, false, true))
+                                Some((
+                                    crate::js_nanbox_string(s as i64),
+                                    writable_default.unwrap_or(false),
+                                    enumerable_default.unwrap_or(false),
+                                    configurable_default,
+                                ))
                             }
                         }
                         _ => {
-                            let dynv = crate::closure::closure_get_dynamic_prop(ptr, name);
-                            if dynv.to_bits() != crate::value::TAG_UNDEFINED {
+                            if crate::closure::closure_has_own_dynamic_prop(ptr, name) {
+                                let dynv = crate::closure::closure_get_own_dynamic_prop(ptr, name)
+                                    .unwrap_or_else(|| f64::from_bits(crate::value::TAG_UNDEFINED));
                                 let attrs = registered
                                     .unwrap_or(super::PropertyAttrs::new(true, true, true));
                                 Some((
@@ -632,6 +639,7 @@ pub extern "C" fn js_object_get_own_property_descriptor(obj_value: f64, key_valu
                     let Some((value, writable, enumerable, configurable)) = resolved else {
                         return f64::from_bits(crate::value::TAG_UNDEFINED);
                     };
+                    let value_handle = scope.root_nanbox_f64(value);
                     let packed = b"value\0writable\0enumerable\0configurable";
                     let desc = js_object_alloc_with_shape(
                         0x0D_E5_C0,
@@ -642,7 +650,7 @@ pub extern "C" fn js_object_get_own_property_descriptor(obj_value: f64, key_valu
                     let header_size = std::mem::size_of::<ObjectHeader>();
                     let fields = (desc as *mut u8).add(header_size) as *mut f64;
                     // GC_STORE_AUDIT(INIT): descriptor object is freshly allocated; layout is rebuilt before publication.
-                    *fields = value;
+                    *fields = value_handle.get_nanbox_f64();
                     *fields.add(1) = f64::from_bits(if writable { TAG_TRUE } else { TAG_FALSE });
                     *fields.add(2) = f64::from_bits(if enumerable { TAG_TRUE } else { TAG_FALSE });
                     *fields.add(3) =
@@ -1385,7 +1393,7 @@ pub extern "C" fn js_object_get_own_property_names(obj_value: f64) -> f64 {
                 return f64::from_bits((empty as u64) | 0x7FFD_0000_0000_0000);
             }
         }
-        let keys = (*obj).keys_array;
+        let keys = crate::object::object_keys_array(obj);
         if keys.is_null() {
             let empty = crate::array::js_array_alloc(0);
             return f64::from_bits((empty as u64) | 0x7FFD_0000_0000_0000);
@@ -1714,6 +1722,15 @@ pub(crate) unsafe fn nm_get_own_descriptor(
             _ => {}
         }
     }
+    if module_name == "vm.constants" {
+        let value = js_object_get_field_by_name(obj, key_str);
+        return Some(build_data_descriptor(
+            f64::from_bits(value.bits()),
+            false,
+            true,
+            false,
+        ));
+    }
     let value = js_object_get_field_by_name(obj, key_str);
     if matches!(
         module_name.as_str(),
@@ -1724,10 +1741,18 @@ pub(crate) unsafe fn nm_get_own_descriptor(
             .unwrap_or_else(|| f64::from_bits(crate::value::TAG_UNDEFINED));
         return Some(build_data_descriptor(value, false, true, false));
     }
+    if module_name == "module" {
+        return Some(build_data_descriptor(
+            f64::from_bits(value.bits()),
+            true,
+            true,
+            false,
+        ));
+    }
     Some(build_data_descriptor(
         f64::from_bits(value.bits()),
         true,
         true,
-        true,
+        module_name != "vm",
     ))
 }

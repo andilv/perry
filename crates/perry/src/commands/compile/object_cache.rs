@@ -591,6 +591,14 @@ fn compute_object_cache_key_with_env(
                     .collect::<Vec<_>>()
                     .join(","),
             );
+            buf.push_str(":method_synthetic_arguments=");
+            buf.push_str(
+                &c.method_has_synthetic_arguments
+                    .iter()
+                    .map(|b| if *b { "1" } else { "0" })
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
             buf.push_str(":static_fields=");
             buf.push_str(&c.static_field_names.join(","));
             buf.push_str(":static_methods=");
@@ -917,6 +925,10 @@ fn compute_object_cache_key_with_env(
             .unwrap_or(""),
     );
     h.field(
+        "env_ll_o0_max_fn_bytes",
+        env_var("PERRY_LL_O0_MAX_FN_BYTES").as_deref().unwrap_or(""),
+    );
+    h.field(
         "env_entry_symbol",
         env_var("PERRY_ENTRY_SYMBOL").as_deref().unwrap_or(""),
     );
@@ -1045,6 +1057,14 @@ fn compute_object_cache_key_with_env(
         env_var("PERRY_SPECIALIZED_ABI_MAX")
             .as_deref()
             .unwrap_or(""),
+    );
+    // #8175 — `preserve_nonecc` on recursion-participating specialized
+    // clones: `=0`/`off`/`false` keeps the default C convention, which
+    // changes the emitted IR / .o bytes; the knob exists precisely for
+    // single-binary A/B arms, so it must never let those arms share objects.
+    h.field(
+        "env_spec_preserve_none",
+        env_var("PERRY_SPEC_PRESERVE_NONE").as_deref().unwrap_or(""),
     );
     // Representation-selection Phase 3b — shape-proven Ptr<Shape> locals:
     // `=0`/`off`/`false` reverts proven object locals from bare fixed-offset
