@@ -483,7 +483,10 @@ fn emit_uncaught_backtrace() {
     }
     #[cfg(all(
         unix,
-        any(target_os = "macos", all(target_os = "linux", not(target_env = "musl")))
+        any(
+            target_os = "macos",
+            all(target_os = "linux", not(target_env = "musl"))
+        )
     ))]
     {
         const MAX_FRAMES: usize = 96;
