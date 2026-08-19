@@ -480,7 +480,7 @@ fn lower_put_value_static_write_ic(
 
     let site_id = ctx.ic_site_counter;
     ctx.ic_site_counter += 1;
-    let cache_name = format!("perry_ic_{}", site_id);
+    let cache_name = super::inline_cache_global_name(ctx, site_id);
     ctx.pending_declares
         .push((format!("__ic_decl_{}", site_id), DOUBLE, vec![]));
     ctx.ic_globals.push(cache_name.clone());
@@ -488,7 +488,7 @@ fn lower_put_value_static_write_ic(
     // Keep the first four ways inline. Shapes 5–8 use a separate cache in a
     // compact outlined helper, avoiding four more copies of the generated
     // receiver guards while preventing the fourth inline way from thrashing.
-    let tail_cache_name = format!("perry_ic_{}_poly_tail", site_id);
+    let tail_cache_name = format!("{}_poly_tail", cache_name);
     ctx.ic_globals.push(tail_cache_name.clone());
     let tail_cache_ref = format!("@{}", tail_cache_name);
 
@@ -884,7 +884,7 @@ fn lower_put_value_dyn_ic_inline(
 ) -> Result<String> {
     let site_id = ctx.ic_site_counter;
     ctx.ic_site_counter += 1;
-    let cache_name = format!("perry_ic_{}", site_id);
+    let cache_name = super::inline_cache_global_name(ctx, site_id);
     ctx.ic_globals.push(cache_name.clone());
     let cache_ref = format!("@{}", cache_name);
 
@@ -1081,10 +1081,16 @@ fn lower_put_value_dyn_ic_inline(
     Ok(result)
 }
 
-fn static_write_key(ctx: &FnCtx<'_>, key: &Expr) -> Option<String> {
+pub(crate) fn static_string_write_key(ctx: &FnCtx<'_>, key: &Expr) -> Option<String> {
     match key {
         Expr::String(property) => Some(property.clone()),
         Expr::LocalGet(id) => ctx.const_string_locals.get(id).cloned(),
+        _ => None,
+    }
+}
+
+pub(crate) fn static_write_key(ctx: &FnCtx<'_>, key: &Expr) -> Option<String> {
+    static_string_write_key(ctx, key).or_else(|| match key {
         // #6812 (w13): `o[7] = v` — a constant integer key is the canonical
         // numeric-string property key ("7"; i64 formatting is canonical for
         // every integer, including negatives). Real arrays never take the IC
@@ -1093,7 +1099,7 @@ fn static_write_key(ctx: &FnCtx<'_>, key: &Expr) -> Option<String> {
         // generic write, which performs the element store.
         Expr::Integer(n) => Some(n.to_string()),
         _ => None,
-    }
+    })
 }
 
 fn put_value_rhs_is_safepoint_free(ctx: &FnCtx<'_>, expr: &Expr) -> bool {
@@ -1647,7 +1653,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     let t = g.reread(ctx, recv_slot)?;
                     let site_id = ctx.ic_site_counter;
                     ctx.ic_site_counter += 1;
-                    let cache_name = format!("perry_ic_{}", site_id);
+                    let cache_name = super::inline_cache_global_name(ctx, site_id);
                     ctx.ic_globals.push(cache_name.clone());
                     let cache_ref = format!("@{}", cache_name);
                     Ok(ctx.block().call(

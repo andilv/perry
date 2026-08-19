@@ -24,7 +24,7 @@ use crate::native_value::{
 };
 use crate::strings::StringPool;
 use crate::type_analysis::{is_bigint_expr, is_bool_expr, is_numeric_expr};
-use crate::types::{DOUBLE, F32, I1, I32, I64, I8};
+use crate::types::{DOUBLE, F32, I1, I16, I32, I64, I8};
 
 // Issue #1098: expr.rs split into expr/ submodules. These are pure
 // mechanical moves of self-contained helper clusters out of this file;
@@ -1827,6 +1827,45 @@ pub(crate) fn class_field_loop_fact_lookup<'f>(
     })
 }
 
+/// Build a linker-unique inline-cache global name.
+///
+/// `ic_site_counter` is only module-wide. LLVM codegen-unit splitting can
+/// promote a private global for cross-unit use, so the source-module prefix is
+/// also required to keep separately compiled modules from defining the same
+/// `perry_ic_N` symbol at the final application link.
+pub(crate) fn inline_cache_global_name(ctx: &FnCtx<'_>, site_id: u32) -> String {
+    inline_cache_global_name_for_prefix(ctx.strings.module_prefix(), site_id)
+}
+
+fn inline_cache_global_name_for_prefix(module_prefix: &str, site_id: u32) -> String {
+    if module_prefix.is_empty() {
+        format!("perry_ic_{site_id}")
+    } else {
+        format!("perry_ic_{module_prefix}__{site_id}")
+    }
+}
+
+#[cfg(test)]
+mod inline_cache_name_tests {
+    use super::inline_cache_global_name_for_prefix;
+
+    #[test]
+    fn cache_symbols_are_unique_across_source_modules() {
+        assert_eq!(
+            inline_cache_global_name_for_prefix("packages_a_ts", 7),
+            "perry_ic_packages_a_ts__7"
+        );
+        assert_eq!(
+            inline_cache_global_name_for_prefix("packages_b_ts", 7),
+            "perry_ic_packages_b_ts__7"
+        );
+        assert_ne!(
+            inline_cache_global_name_for_prefix("packages_a_ts", 7),
+            inline_cache_global_name_for_prefix("packages_b_ts", 7)
+        );
+    }
+}
+
 impl<'a> FnCtx<'a> {
     /// Return runtime-derived initializer evidence only when no write anywhere
     /// in this region can have invalidated it.
@@ -2781,15 +2820,27 @@ fn native_number_to_f64(ctx: &mut FnCtx<'_>, lowered: &LoweredValue) -> Option<S
     match &lowered.rep {
         NativeRep::F64 => Some(lowered.value.clone()),
         NativeRep::F32 => Some(ctx.block().fpext(F32, &lowered.value, DOUBLE)),
+        NativeRep::I8 => {
+            let widened = ctx.block().sext(I8, &lowered.value, I32);
+            Some(ctx.block().sitofp(I32, &widened, DOUBLE))
+        }
+        NativeRep::I16 => {
+            let widened = ctx.block().sext(I16, &lowered.value, I32);
+            Some(ctx.block().sitofp(I32, &widened, DOUBLE))
+        }
         NativeRep::I32 => Some(ctx.block().sitofp(I32, &lowered.value, DOUBLE)),
         NativeRep::U8 => {
             let widened = ctx.block().zext(I8, &lowered.value, I32);
             Some(ctx.block().uitofp(I32, &widened, DOUBLE))
         }
+        NativeRep::U16 => {
+            let widened = ctx.block().zext(I16, &lowered.value, I32);
+            Some(ctx.block().uitofp(I32, &widened, DOUBLE))
+        }
         NativeRep::U32 | NativeRep::BufferLen => {
             Some(ctx.block().uitofp(I32, &lowered.value, DOUBLE))
         }
-        NativeRep::I64 => Some(ctx.block().sitofp(I64, &lowered.value, DOUBLE)),
+        NativeRep::I64 | NativeRep::ISize => Some(ctx.block().sitofp(I64, &lowered.value, DOUBLE)),
         NativeRep::U64 | NativeRep::USize | NativeRep::HandleId => {
             Some(ctx.block().uitofp(I64, &lowered.value, DOUBLE))
         }
@@ -2856,9 +2907,21 @@ fn lower_bitwise_operand_i32(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<Option<
     };
     let value = match lowered.rep {
         NativeRep::I32 | NativeRep::U32 | NativeRep::BufferLen => lowered.value,
+        NativeRep::I8 => {
+            let raw = lowered.value;
+            ctx.block().sext(I8, &raw, I32)
+        }
+        NativeRep::I16 => {
+            let raw = lowered.value;
+            ctx.block().sext(I16, &raw, I32)
+        }
         NativeRep::U8 => {
             let raw = lowered.value;
             ctx.block().zext(I8, &raw, I32)
+        }
+        NativeRep::U16 => {
+            let raw = lowered.value;
+            ctx.block().zext(I16, &raw, I32)
         }
         NativeRep::I1 => {
             let raw = lowered.value;

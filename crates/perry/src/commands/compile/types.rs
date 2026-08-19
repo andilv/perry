@@ -614,6 +614,12 @@ pub struct CompilationContext {
     pub package_aliases: HashMap<String, String>,
     /// Packages to compile natively instead of routing to V8 (from perry.compilePackages)
     pub compile_packages: HashSet<String>,
+    /// Node native-addon packages omitted from wildcard/automatic whole-package
+    /// AOT routing. A statically imported pure JS/TS subpath may still be
+    /// promoted file-by-file; reaching an actual `.node` binary remains a hard
+    /// error, while exact `compilePackages` opt-ins keep the package-level
+    /// diagnostic.
+    pub auto_skipped_node_addon_packages: HashSet<String>,
     /// JavaScript package entry files reached through a statically resolved
     /// import edge. Perry has no runtime JavaScript engine, so these exact
     /// graph members must re-enter the native AOT collector even when their
@@ -628,6 +634,11 @@ pub struct CompilationContext {
     #[allow(dead_code)]
     // #5731 embed-assets context contract; pub field populated on the embed path, not read here
     pub embedded_assets: Vec<(String, PathBuf)>,
+    /// Canonical paths whose import attributes explicitly requested Bun's
+    /// `{ type: "file" }` loader. Kept separate from `embedded_assets` because
+    /// automatic wasm imports also register bytes there but must still lower
+    /// their executable adapter on a later metadata pass.
+    pub file_loader_asset_paths: HashSet<PathBuf>,
     /// #1681 (Phase 3 of #1677): true when this is the build-time capture
     /// stage (the `current_exe` subprocess), so `precompile(EXPR)` sites
     /// emit their build-time value instead of substituting. Re-installed on
@@ -738,9 +749,10 @@ pub struct CompilationContext {
     /// URL parsing is otherwise hand-rolled, so a program with no URL API links
     /// none of the host-canonicalization/IDNA machinery.
     pub uses_url: bool,
-    /// Whether any TS module calls `String.prototype.normalize`. Gates
-    /// `perry-runtime/string-normalize` (`unicode-normalization`, ~113 KB of
-    /// NFC/NFD/NFKC/NFKD tables).
+    /// Whether any TS module calls `String.prototype.normalize` or
+    /// `String.prototype.localeCompare`. Gates `perry-runtime/string-normalize`
+    /// (`unicode-normalization`, ~113 KB of NFC/NFD/NFKC/NFKD tables); locale
+    /// comparison needs NFC to honor canonical equivalence.
     pub uses_string_normalize: bool,
     /// Whether any TS module constructs an `Intl.Segmenter`. Gates
     /// `perry-runtime/intl-segmenter` (`unicode-segmentation`, ~73 KB of UAX #29
@@ -1110,8 +1122,10 @@ impl CompilationContext {
             native_libraries: Vec::new(),
             package_aliases: HashMap::new(),
             compile_packages: HashSet::new(),
+            auto_skipped_node_addon_packages: HashSet::new(),
             aot_discovered_modules: HashSet::new(),
             embedded_assets: Vec::new(),
+            file_loader_asset_paths: HashSet::new(),
             precompile_capture: false,
             precompile_results: HashMap::new(),
             fast_math: false,

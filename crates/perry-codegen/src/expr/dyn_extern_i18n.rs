@@ -63,8 +63,8 @@ pub(crate) fn namespace_value_for_prefix(ctx: &mut FnCtx<'_>, prefix: &str) -> S
 /// returns the target **namespace value directly** (no Promise wrap) and uses the
 /// ambient createRequire-backed require (`js_module_ambient_require_apply`) as the
 /// unresolved / no-match fallthrough instead of a rejected promise — so builtins
-/// keep resolving by string and unknown packages throw the descriptive
-/// `ERR_PERRY_UNSUPPORTED_CREATE_REQUIRE`. `paths` is populated by the same
+/// keep resolving by string and unknown packages throw Node-compatible
+/// `MODULE_NOT_FOUND`. `paths` is populated by the same
 /// `collect_modules` resolver as `import()`.
 fn lower_dynamic_require(ctx: &mut FnCtx<'_>, paths: &[String], arg: &Expr) -> Result<String> {
     // Empty `paths` → genuinely runtime-computed specifier (didn't const-fold).
@@ -763,14 +763,10 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         // an imported function appears as a STANDALONE value — `if
         // (this.ffi.setCursors)` truthiness check, `someFn === otherFn`
         // equality comparison, or being passed as a callback — we route
-        // to the static `__perry_extern_closure_<src>__<name>` global
-        // emitted by `compile_module` for every imported function (see the
-        // wrapper-emit block right after the user-function `__perry_wrap_*`
-        // loop). The global is a `ClosureHeader` with `func_ptr` pointing
-        // at a thin `__perry_wrap_extern_<src>__<name>` thunk and
-        // `type_tag = CLOSURE_MAGIC`, so the runtime's `js_closure_callN`
-        // sees a valid closure and dispatches correctly. We just take the
-        // address and NaN-box it as POINTER.
+        // to the source module's canonical `__perry_wrap_perry_fn_*` symbol
+        // and ask `js_closure_alloc_singleton` for its shared ClosureHeader.
+        // This preserves reference identity across consumers without emitting
+        // a second consumer-local wrapper for every imported binding.
         //
         // For namespaces / built-ins that aren't in `import_function_prefixes`
         // (e.g. setTimeout / clearTimeout / Math / Date), we still don't

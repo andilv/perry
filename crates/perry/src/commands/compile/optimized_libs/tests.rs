@@ -1053,6 +1053,60 @@ fn retain_workspace_declared_features_keeps_all_without_manifests() {
     assert_eq!(cross_features.len(), 2);
 }
 
+/// Regression: the auto-optimize rebuild must always include
+/// `perry-runtime/keepalive-anchors` in the cross-feature set. #6917 gated
+/// the `#[used]` keepalive anchors behind the feature and only enabled it for
+/// the bitcode-LTO path, under the assumption that the classic link path
+/// "keeps every reachable runtime symbol via real undefined references from
+/// the program's objects." That assumption is wrong: `#[no_mangle] pub extern
+/// "C" fn` symbols that are only called from codegen (not from within the
+/// perry-runtime crate) are dead-code-eliminated during staticlib archive
+/// creation when no `#[used]` anchor pins them. The resulting
+/// `libperry_runtime.a` is missing core symbols (`js_box_release`,
+/// `js_bool_box_release`, `js_closure_set_box_capture_ptr`,
+/// `js_link_path_module_parent`) and programs whose codegen emits calls to
+/// them fail to link with "Undefined symbols for architecture arm64."
+#[test]
+fn auto_optimize_always_includes_keepalive_anchors() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let empty_features: std::collections::BTreeSet<&'static str> =
+        std::collections::BTreeSet::new();
+    let ctx = CompilationContext::new(dir.path().to_path_buf());
+    let cross = auto_optimized_cross_features(&ctx, &empty_features, &[]);
+    assert!(
+        cross.iter().any(|f| f == "perry-runtime/keepalive-anchors"),
+        "auto_optimized_cross_features must always include \
+         perry-runtime/keepalive-anchors so codegen-only #[no_mangle] symbols \
+         survive into the staticlib archive, got {cross:?}"
+    );
+}
+
+/// The `keepalive-anchors` feature must NOT be conditional on
+/// `PERRY_LLVM_BITCODE_LINK` — the classic link path needs it too.
+#[test]
+fn auto_optimize_keepalive_anchors_not_bitcode_only() {
+    let _guard = env_lock();
+    let old_bitcode = std::env::var_os("PERRY_LLVM_BITCODE_LINK");
+    std::env::remove_var("PERRY_LLVM_BITCODE_LINK");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let empty_features: std::collections::BTreeSet<&'static str> =
+        std::collections::BTreeSet::new();
+    let ctx = CompilationContext::new(dir.path().to_path_buf());
+    let cross = auto_optimized_cross_features(&ctx, &empty_features, &[]);
+
+    set_env_var(
+        "PERRY_LLVM_BITCODE_LINK",
+        old_bitcode.as_deref().and_then(|v| v.to_str()),
+    );
+
+    assert!(
+        cross.iter().any(|f| f == "perry-runtime/keepalive-anchors"),
+        "keepalive-anchors must be present even without PERRY_LLVM_BITCODE_LINK, \
+         got {cross:?}"
+    );
+}
+
 /// The well-known flip drops `compression-brotli`/`compression-zstd` from the
 /// stdlib rebuild on a stated premise: "The ext crate carries all codecs, so
 /// nothing is lost by dropping them here."
@@ -1096,11 +1150,9 @@ fn ext_zlib_covers_every_stdlib_symbol_the_flip_strips() {
         "js_zlib_process_pending",
         // Genuine one-shot gaps. Same shape as the #8005 pair; they have not
         // broken a link only because no gap test links them on this path yet.
-        "js_zlib_crc32",
         "js_zlib_deflate_raw",
         "js_zlib_inflate_raw",
         "js_zlib_unzip",
-        "js_zlib_unzip_sync",
     ];
 
     fn exported_zlib_symbols(dir: &Path) -> std::collections::BTreeSet<String> {
@@ -1180,5 +1232,75 @@ fn ext_zlib_covers_every_stdlib_symbol_the_flip_strips() {
         "these KNOWN_EXT_GAPS entries no longer describe reality — the symbol \
          left perry-stdlib or gained an ext implementation: {stale:?}. Delete \
          them; a list that outlives its entries stops being a ratchet."
+    );
+}
+
+/// Regression: a program that references `WebAssembly.*` must get the
+/// `perry-runtime/wasm-host` cross feature so the runtime archive carries
+/// `js_webassembly_*` symbol definitions. Without it the link fails with
+/// `_js_webassembly_module_new` undefined (issue #76).
+#[test]
+fn wasm_usage_enables_wasm_host_cross_feature() {
+    let workspace_root = find_perry_workspace_root().expect("workspace root");
+    let mut ctx = CompilationContext::new(workspace_root);
+    ctx.needs_wasm_runtime = true;
+
+    let features = compute_required_features(
+        &ctx.native_module_imports,
+        ctx.uses_fetch,
+        ctx.uses_crypto_builtins,
+    );
+    let cross = auto_optimized_cross_features(&ctx, &features, &[]);
+    assert!(
+        cross.iter().any(|f| f == "perry-runtime/wasm-host"),
+        "needs_wasm_runtime=true must add perry-runtime/wasm-host to the \
+         cross-feature set so the runtime archive defines js_webassembly_* \
+         symbols; got: {cross:?}"
+    );
+}
+
+/// Regression: a program that does NOT reference `WebAssembly.*` must NOT
+/// get the `perry-runtime/wasm-host` cross feature — non-wasm programs
+/// don't pay for wasmi (the feature is deliberately kept out of `default`).
+#[test]
+fn non_wasm_usage_does_not_enable_wasm_host_cross_feature() {
+    let workspace_root = find_perry_workspace_root().expect("workspace root");
+    let ctx = CompilationContext::new(workspace_root);
+
+    let features = compute_required_features(
+        &ctx.native_module_imports,
+        ctx.uses_fetch,
+        ctx.uses_crypto_builtins,
+    );
+    let cross = auto_optimized_cross_features(&ctx, &features, &[]);
+    assert!(
+        !cross.iter().any(|f| f == "perry-runtime/wasm-host"),
+        "needs_wasm_runtime=false must NOT add perry-runtime/wasm-host — \
+         non-wasm programs must not link the wasmi host; got: {cross:?}"
+    );
+}
+
+/// Regression: the auto-optimize cache key must differ between a wasm-using
+/// program and a non-wasm program so cargo doesn't serve a cached non-wasm
+/// runtime archive (missing `js_webassembly_*`) to a wasm program, or vice
+/// versa (an archive carrying unresolved `perry_wasm_host_*` refs).
+#[test]
+fn wasm_usage_changes_auto_optimize_cache_key() {
+    let workspace_root = find_perry_workspace_root().expect("workspace root");
+    let ctx_no_wasm = CompilationContext::new(workspace_root.clone());
+    let mut ctx_wasm = CompilationContext::new(workspace_root);
+    ctx_wasm.needs_wasm_runtime = true;
+
+    let features = compute_required_features(
+        &ctx_no_wasm.native_module_imports,
+        ctx_no_wasm.uses_fetch,
+        ctx_no_wasm.uses_crypto_builtins,
+    );
+    let feature_arg = features_to_cargo_arg(&features);
+    let key_no_wasm = auto_optimized_cache_key(&feature_arg, true, false, None, &ctx_no_wasm);
+    let key_wasm = auto_optimized_cache_key(&feature_arg, true, false, None, &ctx_wasm);
+    assert_ne!(
+        key_no_wasm, key_wasm,
+        "wasm usage must change the cache key so the target dirs don't collide"
     );
 }
