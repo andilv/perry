@@ -866,7 +866,10 @@ extern "C" fn fromspace_fault_handler(
 
 #[cfg(all(
     unix,
-    any(target_os = "macos", all(target_os = "linux", not(target_env = "musl")))
+    any(
+        target_os = "macos",
+        all(target_os = "linux", not(target_env = "musl"))
+    )
 ))]
 fn emit_native_backtrace() {
     const MAX_FRAMES: usize = 64;
@@ -885,7 +888,10 @@ fn emit_native_backtrace() {
 
 #[cfg(all(
     unix,
-    not(any(target_os = "macos", all(target_os = "linux", not(target_env = "musl"))))
+    not(any(
+        target_os = "macos",
+        all(target_os = "linux", not(target_env = "musl"))
+    ))
 ))]
 fn emit_native_backtrace() {}
 
