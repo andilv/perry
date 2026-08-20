@@ -1,4 +1,3 @@
-use super::super::*;
 use super::*;
 
 pub(crate) fn global_this_rest_array_values(rest: f64) -> Vec<f64> {
@@ -366,7 +365,7 @@ pub(crate) extern "C" fn object_prototype_to_locale_string_thunk(
     _closure: *const crate::closure::ClosureHeader,
 ) -> f64 {
     let this_value = f64::from_bits(IMPLICIT_THIS.with(|c| c.get()));
-    unsafe { super::super::js_object_default_to_locale_string(this_value) }
+    unsafe { super::super::js_object_prototype_to_locale_string(this_value) }
 }
 
 /// Spec `CreateListFromArrayLike`'s implementation-defined cap on the

@@ -830,6 +830,16 @@ fn compute_object_cache_key_with_env(
         env_var("PERRY_SHADOW_STACK").as_deref().unwrap_or(""),
     );
     h.field("env_rs4gc", env_var("PERRY_RS4GC").as_deref().unwrap_or(""));
+    h.field(
+        "env_ll_size_opt",
+        env_var("PERRY_LL_SIZE_OPT").as_deref().unwrap_or(""),
+    );
+    h.field(
+        "env_ll_preopt_optnone_instrs",
+        env_var("PERRY_LL_PREOPT_OPTNONE_INSTRS")
+            .as_deref()
+            .unwrap_or(""),
+    );
     // Explicit-safepoint contract: flips audited AllocNoReentry helpers
     // between statepoint and plain call. Two arms sharing a cached object
     // would make the contract's metadata reduction unmeasurable.
@@ -907,26 +917,6 @@ fn compute_object_cache_key_with_env(
         env_var("PERRY_STRING_INIT_CHUNK_SIZE")
             .as_deref()
             .unwrap_or(""),
-    );
-    h.field(
-        "env_ll_o0_threshold_bytes",
-        env_var("PERRY_LL_O0_THRESHOLD_BYTES")
-            .as_deref()
-            .unwrap_or(""),
-    );
-    h.field(
-        "env_ll_size_opt",
-        env_var("PERRY_LL_SIZE_OPT").as_deref().unwrap_or(""),
-    );
-    h.field(
-        "env_ll_size_opt_max_fn_bytes",
-        env_var("PERRY_LL_SIZE_OPT_MAX_FN_BYTES")
-            .as_deref()
-            .unwrap_or(""),
-    );
-    h.field(
-        "env_ll_o0_max_fn_bytes",
-        env_var("PERRY_LL_O0_MAX_FN_BYTES").as_deref().unwrap_or(""),
     );
     h.field(
         "env_entry_symbol",

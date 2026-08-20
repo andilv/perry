@@ -363,7 +363,8 @@ fn emit_public_spec_function_trampoline(
                 crate::collectors::SpecParamRep::F64 => {
                     Some(emit_typed_arg_guard(blk, TypedParamRep::F64, arg))
                 }
-                crate::collectors::SpecParamRep::Boxed => None,
+                crate::collectors::SpecParamRep::Boxed
+                | crate::collectors::SpecParamRep::NumberArray => None,
                 // Guarded plans never carry TaPtr: its raw pointer contract is
                 // admitted only by construction at a direct call site.
                 crate::collectors::SpecParamRep::TaPtr { .. } => Some("false".to_string()),
@@ -428,7 +429,8 @@ fn emit_public_spec_function_trampoline(
         let blk = wf.block_mut(fast_idx).unwrap();
         for (arg, rep) in arg_names.iter().zip(plan.reps.iter()) {
             match rep {
-                crate::collectors::SpecParamRep::Boxed => {
+                crate::collectors::SpecParamRep::Boxed
+                | crate::collectors::SpecParamRep::NumberArray => {
                     raw_args.push((DOUBLE, arg.clone()));
                 }
                 crate::collectors::SpecParamRep::I32 => {
@@ -714,7 +716,16 @@ pub(super) fn compile_function(
     // plan selection demoted any reassigned/closure-referenced param to
     // `Boxed` — a stamped param provably holds this rep for the whole body.
     if let Some(plan) = spec_entry {
-        for (p, rep) in f.params.iter().zip(plan.reps.iter()) {
+        for ((p, rep), guard) in f
+            .params
+            .iter()
+            .zip(plan.reps.iter())
+            .zip(plan.guards.iter())
+        {
+            if let Some(guard) = guard {
+                local_types.insert(p.id, guard.proof.clone());
+                continue;
+            }
             match rep {
                 crate::collectors::SpecParamRep::I32 => {
                     local_types.insert(p.id, perry_hir::types::Type::Int32);
@@ -724,7 +735,9 @@ pub(super) fn compile_function(
                         local_types.insert(p.id, perry_hir::types::Type::Named(class.to_string()));
                     }
                 }
-                crate::collectors::SpecParamRep::Boxed | crate::collectors::SpecParamRep::F64 => {}
+                crate::collectors::SpecParamRep::Boxed
+                | crate::collectors::SpecParamRep::NumberArray
+                | crate::collectors::SpecParamRep::F64 => {}
             }
         }
     }
@@ -798,13 +811,27 @@ pub(super) fn compile_function(
                                 spec_ta_kind_class_name(*kind)?.to_string(),
                             )
                         }
-                        (None, crate::collectors::SpecParamRep::Boxed) => return None,
+                        (
+                            None,
+                            crate::collectors::SpecParamRep::Boxed
+                            | crate::collectors::SpecParamRep::NumberArray,
+                        ) => return None,
                     };
                     Some((param.id, proof))
                 })
                 .collect()
         })
         .unwrap_or_default();
+    let spec_numeric_params: HashSet<u32> = spec_param_proofs
+        .iter()
+        .filter_map(|(id, ty)| {
+            matches!(
+                ty,
+                perry_hir::types::Type::Number | perry_hir::types::Type::Int32
+            )
+            .then_some(*id)
+        })
+        .collect();
     // `--opt-report` (#6952): attribute every representation decision the
     // collectors below make to this function. No-op when the report is off.
     //
@@ -834,6 +861,7 @@ pub(super) fn compile_function(
         &cross_module.module_dispatch,
         &spec_ta_lens,
         &spec_i32_params,
+        &spec_numeric_params,
     );
 
     if let Some(plan) = spec_entry {

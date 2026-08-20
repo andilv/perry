@@ -22,6 +22,11 @@ fn throw_frozen_array_mutation() -> ! {
 #[inline]
 pub(crate) fn array_length_is_non_writable(arr: *const ArrayHeader) -> bool {
     let flags = array_object_flags(arr);
+    array_length_is_non_writable_with_flags(arr, flags)
+}
+
+#[inline]
+fn array_length_is_non_writable_with_flags(arr: *const ArrayHeader, flags: u16) -> bool {
     flags & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0
         && crate::object::get_property_attrs(arr as usize, "length")
             .map(|a| !a.writable())
@@ -76,6 +81,13 @@ pub(crate) fn guard_writable_length(arr: *const ArrayHeader) {
     }
 }
 
+#[inline]
+fn guard_writable_length_with_flags(arr: *const ArrayHeader, flags: u16) {
+    if array_length_is_non_writable_with_flags(arr, flags) {
+        throw_non_writable_length();
+    }
+}
+
 /// Guard called from the static `push_single`/`push` codegen path so that
 /// frozen + non-writable-`length` checks fire even for `arr.push()` with no
 /// arguments.  ECMA-262 §23.1.3.21 always performs `Set(O,"length",…,true)`.
@@ -85,10 +97,13 @@ pub extern "C" fn js_array_push_guard(arr: *mut ArrayHeader) {
     if arr.is_null() {
         return;
     }
-    if array_is_frozen(arr) {
+    // SAFETY: `clean_arr_ptr_mut` just proved this exact pointer is the live,
+    // non-forwarded array head; no allocation occurs before the flag read.
+    let flags = unsafe { array_object_flags_resolved(arr) };
+    if flags & crate::gc::OBJ_FLAG_FROZEN != 0 {
         throw_frozen_array_mutation();
     }
-    guard_writable_length(arr);
+    guard_writable_length_with_flags(arr, flags);
 }
 
 #[no_mangle]
@@ -625,11 +640,17 @@ pub extern "C" fn js_array_push_f64(arr: *mut ArrayHeader, value: f64) -> *mut A
         return js_array_alloc(0);
     }
     let arr = cleaned;
-    if array_is_frozen(arr) {
+    // One resolved header word answers every policy/layout question below.
+    // Re-entering the public helpers here used to run `clean_arr_ptr` (and its
+    // allocator-ownership proof) once for each individual bit test.
+    // SAFETY: `clean_arr_ptr_mut` just returned this live head and no
+    // allocation or safepoint intervenes before the read.
+    let flags = unsafe { array_object_flags_resolved(arr) };
+    if flags & crate::gc::OBJ_FLAG_FROZEN != 0 {
         throw_frozen_array_mutation();
     }
-    guard_writable_length(arr);
-    if array_is_sealed_or_no_extend(arr) {
+    guard_writable_length_with_flags(arr, flags);
+    if flags & (crate::gc::OBJ_FLAG_SEALED | crate::gc::OBJ_FLAG_NO_EXTEND) != 0 {
         return arr;
     }
     unsafe {
@@ -640,7 +661,7 @@ pub extern "C" fn js_array_push_f64(arr: *mut ArrayHeader, value: f64) -> *mut A
             return js_array_push_f64_grow(arr, length, value);
         }
 
-        let value = canonicalize_array_numeric_store_value(arr, value);
+        let value = canonicalize_array_numeric_store_value_from_flags(flags, value);
         let value_bits = value.to_bits();
         let elements_ptr = (arr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut f64;
         // GC_STORE_AUDIT(BARRIERED): push slot is immediately recorded via note_array_slot.
@@ -919,13 +940,17 @@ pub extern "C" fn js_array_set_length(arr: *mut ArrayHeader, new_length: f64) {
             return;
         }
         if n < cur {
-            // Truncate: clear elements at indices [n..cur) to TAG_HOLE so
-            // any code that resurrects the slot via `arr[i]` reads `undefined`,
-            // not stale data. The capacity stays unchanged — JS doesn't
-            // require Perry to release the underlying buffer here, and growing
-            // back via `push` would just re-overwrite these slots anyway.
-            for i in n..cur {
-                note_array_slot(arr, i as usize, crate::value::TAG_HOLE);
+            // ArraySetLength deletes indices from high to low. This must clear
+            // descriptor-backed indices as well as dense slots: an accessor at
+            // index 0 cannot remain observable after its getter truncates the
+            // array to zero. If a non-configurable index blocks deletion, keep
+            // that index and restore length to index + 1 per §10.4.2.4.
+            for i in (n..cur).rev() {
+                if js_array_delete(arr, i) == 0 {
+                    (*arr).length = i + 1;
+                    refresh_array_numeric_layout(arr);
+                    return;
+                }
             }
             (*arr).length = n;
             refresh_array_numeric_layout(arr);
@@ -978,7 +1003,13 @@ pub extern "C" fn js_array_delete(arr: *mut ArrayHeader, index: u32) -> i32 {
                 return 0;
             }
         }
-        note_array_slot(arr, index as usize, crate::value::TAG_HOLE);
+        if index < (*arr).capacity {
+            note_array_slot(arr, index as usize, crate::value::TAG_HOLE);
+        }
+        // Sparse indices live in the named-property side table rather than the
+        // dense allocation. Always clear that representation too: a later
+        // growth can make a formerly sparse index fall below capacity.
+        array_named_property_delete_by_name(arr, &key);
         crate::object::clear_property_attrs(arr as usize, &key);
         crate::object::clear_accessor_descriptor(arr as usize, &key);
         1

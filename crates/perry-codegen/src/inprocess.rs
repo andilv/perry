@@ -6,9 +6,9 @@
 //! the flag's cache-key participation live in `linker.rs` /
 //! `perry/src/commands/compile/{build_cache,object_cache}.rs`.
 //!
-//! Decision parity by construction: this module does not re-derive opt levels
+//! Decision parity by construction: this module does not re-derive optimization
 //! or CPU tuning. It interprets the *same* argv `build_clang_compile_plan`
-//! produces for clang (`-O3`/`-Os`/`-O0`, `-mcpu=native`, `-mllvm
+//! produces for clang (`-O3`/explicit `-Os`, `-mcpu=native`, `-mllvm
 //! -inlinehint-threshold=N`, `-target <triple>`), so the two backends cannot
 //! drift on a decision without drifting on the plan — which the plan's own
 //! tests pin.
@@ -328,64 +328,83 @@ pub(crate) fn optimize_and_emit_module(
     )
 }
 
-/// Instruction-count cap above which a single post-RS4GC function is stamped
-/// `optnone`+`noinline` rather than entering the `-O1+` pipeline.
+/// Optional pre-optimization escape hatch for unusually large generated
+/// functions.
 ///
-/// Calibrated on the #8036 Next 16.3.0 production bundle: the largest
-/// known-fine post-rewrite function is ~413k lines (its `-Os` unit finished
-/// in ~40s), the pathological one is ~2.1M (its unit ran >65 CPU-minutes
-/// without finishing). 512k sits between them, biased low because the false
-/// positive costs only code size in one already-degenerate function while the
-/// false negative costs an unbounded compile. Tunable via
-/// `PERRY_LL_RS4GC_OPTNONE_INSTRS`; `0` disables the demotion.
-const DEFAULT_RS4GC_OPTNONE_INSTRS: usize = 512 * 1024;
+/// Dense generated bundles often contain one parser/table initializer that is
+/// large enough to make the `-O1+` middle-end super-linear, alongside hundreds
+/// of ordinary functions that benefit substantially from `-Os`. Routing the
+/// whole codegen unit to `-O0` keeps compilation bounded but also bloats every
+/// ordinary sibling. When this cap is non-zero, only functions above it are
+/// stamped `optnone`+`noinline` before the module pipeline runs. This makes
+/// `PERRY_LL_SIZE_OPT=1` a practical hybrid mode instead of an all-or-nothing
+/// gamble on the largest function in each unit.
+///
+/// Disabled by default while the threshold is calibrated across the bundle
+/// corpus. `PERRY_LL_PREOPT_OPTNONE_INSTRS=N` enables it; `0` disables it.
+const DEFAULT_PREOPT_OPTNONE_INSTRS: usize = 0;
 
-fn rs4gc_optnone_instr_cap() -> usize {
-    std::env::var("PERRY_LL_RS4GC_OPTNONE_INSTRS")
+fn preopt_optnone_instr_cap() -> usize {
+    std::env::var("PERRY_LL_PREOPT_OPTNONE_INSTRS")
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
-        .unwrap_or(DEFAULT_RS4GC_OPTNONE_INSTRS)
+        .unwrap_or(DEFAULT_PREOPT_OPTNONE_INSTRS)
 }
 
-/// Stamp `optnone`+`noinline` on every function whose post-RS4GC body exceeds
-/// `cap` instructions, so the optimization pipeline skips exactly the
-/// relocation-fan-out monsters and still optimizes their siblings. `optnone`
-/// only gates the middle-end: the function keeps its `gc "statepoint-example"`
-/// lowering, so the compact stack map it emits is unchanged in kind.
-fn demote_relocation_bloated_functions(module: &inkwell::module::Module<'_>, cap: usize) {
+fn stamp_function_optnone(function: inkwell::values::FunctionValue<'_>) {
+    let context = function.get_type().get_context();
+    let optnone_kind = Attribute::get_named_enum_kind_id("optnone");
+    let noinline_kind = Attribute::get_named_enum_kind_id("noinline");
+    // `alwaysinline` and `noinline` are verifier-incompatible. Generated
+    // functions do not normally carry it, but the opt-in must remain safe for
+    // imported/generated IR that does.
+    function.remove_enum_attribute(
+        AttributeLoc::Function,
+        Attribute::get_named_enum_kind_id("alwaysinline"),
+    );
+    function.remove_enum_attribute(
+        AttributeLoc::Function,
+        Attribute::get_named_enum_kind_id("inlinehint"),
+    );
+    function.add_attribute(
+        AttributeLoc::Function,
+        context.create_enum_attribute(optnone_kind, 0),
+    );
+    function.add_attribute(
+        AttributeLoc::Function,
+        context.create_enum_attribute(noinline_kind, 0),
+    );
+}
+
+fn function_instruction_count(function: inkwell::values::FunctionValue<'_>, cap: usize) -> usize {
+    let mut instrs = 0usize;
+    'body: for bb in function.get_basic_blocks() {
+        let mut inst = bb.get_first_instruction();
+        while let Some(i) = inst {
+            instrs += 1;
+            if instrs > cap {
+                break 'body;
+            }
+            inst = i.get_next_instruction();
+        }
+    }
+    instrs
+}
+
+/// Demote large functions before the ordinary optimization pipeline while
+/// leaving every smaller sibling eligible for the unit's requested opt level.
+fn demote_preoptimization_bloated_functions(module: &inkwell::module::Module<'_>, cap: usize) {
     if cap == 0 {
         return;
     }
-    let context = module.get_context();
-    let optnone_kind = Attribute::get_named_enum_kind_id("optnone");
-    let noinline_kind = Attribute::get_named_enum_kind_id("noinline");
     let mut function = module.get_first_function();
     while let Some(f) = function {
-        let mut instrs = 0usize;
-        'body: for bb in f.get_basic_blocks() {
-            let mut inst = bb.get_first_instruction();
-            while let Some(i) = inst {
-                instrs += 1;
-                if instrs > cap {
-                    break 'body;
-                }
-                inst = i.get_next_instruction();
-            }
-        }
-        if instrs > cap {
-            f.add_attribute(
-                AttributeLoc::Function,
-                context.create_enum_attribute(optnone_kind, 0),
-            );
-            f.add_attribute(
-                AttributeLoc::Function,
-                context.create_enum_attribute(noinline_kind, 0),
-            );
+        if function_instruction_count(f, cap) > cap {
+            stamp_function_optnone(f);
             eprintln!(
-                "perry: rewrite-statepoints-for-gc grew `{}` past {} \
-                 instructions; compiling it unoptimized (optnone) so the \
-                 -O1+ pipeline doesn't go super-linear on relocation fan-out \
-                 (#8082). Override with PERRY_LL_RS4GC_OPTNONE_INSTRS.",
+                "perry: `{}` exceeds {} pre-optimization instructions; compiling only this \
+                 function unoptimized (optnone) while its siblings keep the module's size \
+                 optimization. Override with PERRY_LL_PREOPT_OPTNONE_INSTRS.",
                 f.get_name().to_string_lossy(),
                 cap,
             );
@@ -454,6 +473,12 @@ fn optimize_and_emit(
     module.set_triple(&triple);
     module.set_data_layout(&tm.get_target_data().get_data_layout());
 
+    // Opt-in hybrid size optimization for generated bundles: protect only the
+    // pathological bodies before entering the requested module pipeline.
+    if opt != '0' {
+        demote_preoptimization_bloated_functions(module, preopt_optnone_instr_cap());
+    }
+
     // RS4GC must run BEFORE the optimization pipeline, and — critically — in
     // this process, against this LLVM.
     //
@@ -493,17 +518,6 @@ fn optimize_and_emit(
                 e.to_string()
             )
         })?;
-        // The #4880 opt-tier decision (`native_plan_args`) was made from
-        // PRE-rewrite sizes, but RS4GC's relocation fan-out is quadratic-ish
-        // in (live gc values x statepoints): one 51k-line minified-bundle
-        // closure grew 40x to 2.1M instructions, and a single `-Os` function
-        // pass then ran for over an hour on it (#8082). Re-check here, where
-        // the grown sizes exist, and opt out just the exploded functions.
-        // The external text path needs no twin: it re-parses the REWRITTEN
-        // text, so its plan already sees post-RS4GC sizes.
-        if opt != '0' {
-            demote_relocation_bloated_functions(module, rs4gc_optnone_instr_cap());
-        }
     }
 
     let pipeline = match opt {
@@ -594,11 +608,10 @@ mod tests {
     }
 
     #[test]
-    fn relocation_bloated_function_is_demoted_to_optnone_and_its_sibling_is_not() {
+    fn preoptimization_bloated_function_is_demoted_without_demoting_its_sibling() {
         global_init(&[]);
         let context = Context::create();
-        // `big` carries 6 instructions, `small` 2; a cap of 4 separates them.
-        let ir = "define i64 @big(i64 %a) gc \"statepoint-example\" {\n\
+        let ir = "define i64 @big(i64 %a) {\n\
                   entry:\n\
                   \x20 %x1 = add i64 %a, 1\n\
                   \x20 %x2 = add i64 %x1, 1\n\
@@ -607,34 +620,32 @@ mod tests {
                   \x20 %x5 = add i64 %x4, 1\n\
                   \x20 ret i64 %x5\n\
                   }\n\
-                  define i64 @small(i64 %a) gc \"statepoint-example\" {\n\
+                  define i64 @small(i64 %a) {\n\
                   entry:\n\
                   \x20 %x1 = add i64 %a, 1\n\
                   \x20 ret i64 %x1\n\
                   }\n";
-        let module = parse_ir_text(&context, ir, "optnone_demotion").expect("fixture parses");
-        demote_relocation_bloated_functions(&module, 4);
+        let module =
+            parse_ir_text(&context, ir, "preopt_optnone_demotion").expect("fixture parses");
+        demote_preoptimization_bloated_functions(&module, 4);
 
         let optnone_kind = Attribute::get_named_enum_kind_id("optnone");
-        let noinline_kind = Attribute::get_named_enum_kind_id("noinline");
         let big = module.get_function("big").expect("big exists");
         let small = module.get_function("small").expect("small exists");
         assert!(
             big.get_enum_attribute(AttributeLoc::Function, optnone_kind)
                 .is_some(),
-            "a function past the cap must be stamped optnone"
-        );
-        assert!(
-            big.get_enum_attribute(AttributeLoc::Function, noinline_kind)
-                .is_some(),
-            "optnone requires noinline or the verifier rejects the function"
+            "a function past the pre-optimization cap must be stamped optnone"
         );
         assert!(
             small
                 .get_enum_attribute(AttributeLoc::Function, optnone_kind)
                 .is_none(),
-            "a sibling under the cap must keep the ordinary pipeline"
+            "an ordinary sibling must keep the module optimization pipeline"
         );
+        module
+            .verify()
+            .expect("optnone+noinline must remain verifier-valid");
     }
 
     fn constant_fold_order_fixture(folded: bool) -> String {

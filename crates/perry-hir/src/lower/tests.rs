@@ -990,3 +990,153 @@ fn method_local_shadowing_the_class_name_still_wins_in_new() {
         "a method-scope local named after the class must still win for `new`: {body}"
     );
 }
+/// #8447: the ambient-typing idiom `declare function require(name: string): any`
+/// names the global require intrinsic — it must NOT be registered as an
+/// external FFI function. That registration made every require-shadowing guard
+/// (`require_is_shadowed_by_local`, `try_require_literal`) treat the global as
+/// shadowed since #8343, so `require("node:fs")` lowered to a call to a
+/// `require` symbol no archive defines, and every consumer failed at link
+/// (`Undefined symbols: "_require"`).
+#[test]
+fn test_ambient_require_declare_does_not_shadow_the_intrinsic() {
+    let source = r#"
+        declare function require(name: string): any;
+        function probe(): string {
+            const fs = require("node:fs");
+            return typeof fs.constants.O_RDONLY;
+        }
+        console.log(probe());
+    "#;
+    let module = perry_parser::parse_typescript(source, "t.ts").expect("source parses");
+    let hir = super::lower_module(&module, "t", "t.ts").expect("source lowers");
+    let dump = format!("{hir:?}");
+    assert!(
+        !dump.contains("ExternFuncRef { name: \"require\""),
+        "an ambient `declare function require` must not lower calls to an \
+         extern `require` symbol — nothing defines it, so linking fails: {dump}"
+    );
+    assert!(
+        dump.contains("\"fs\""),
+        "the require(\"node:fs\") call must resolve to the fs native module: {dump}"
+    );
+}
+
+/// The counterpart (#8343's intent, unchanged): a `function require(...)` WITH
+/// a body — e.g. the CJS wrap's synthetic require — is a real user binding and
+/// must keep shadowing the intrinsic, so the call stays a plain user-function
+/// call instead of a native-module namespace binding.
+#[test]
+fn test_user_require_function_with_body_still_shadows_the_intrinsic() {
+    let source = r#"
+        function require(name: string): string { return "shadowed:" + name; }
+        const fs = require("node:fs");
+        console.log(fs);
+    "#;
+    let module = perry_parser::parse_typescript(source, "t.ts").expect("source parses");
+    let hir = super::lower_module(&module, "t", "t.ts").expect("source lowers");
+    let dump = format!("{hir:?}");
+    assert!(
+        !dump.contains("NativeModuleRef(\"fs\")"),
+        "a user `function require` with a body shadows the intrinsic — the \
+         call must not be rewritten into a native-module namespace: {dump}"
+    );
+}
+
+/// #8465: `const require = createRequire(import.meta.url)` binds the REAL
+/// module-scoped require — `const net = require("net")` must still take the
+/// static native-namespace fast path (as it did before #8343's shadow guard),
+/// not flow to the runtime createRequire surface, where `net.connect` reached
+/// as a bound value dispatches through a null-by-default function pointer and
+/// silently returns undefined.
+#[test]
+fn test_create_require_local_keeps_the_native_namespace_fast_path() {
+    let source = r#"
+        import { createRequire } from "node:module";
+        const require = createRequire(import.meta.url);
+        const net = require("net");
+        console.log(typeof net.connect);
+    "#;
+    let module = perry_parser::parse_typescript(source, "t.ts").expect("source parses");
+    let hir = super::lower_module(&module, "t", "t.ts").expect("source lowers");
+    let dump = format!("{hir:?}");
+    assert!(
+        dump.contains("NativeModuleRef(\"net\")"),
+        "require(\"net\") under a createRequire-backed local must fold to the \
+         static native namespace: {dump}"
+    );
+    assert!(
+        !dump.contains("name: \"net\""),
+        "the namespace binding must not leave a runtime `net` local behind: {dump}"
+    );
+}
+
+/// The #8465 counterpart, complementary to
+/// `test_user_require_function_with_body_still_shadows_the_intrinsic` above:
+/// that one pins that a real `function require` body suppresses the fold; this
+/// one additionally pins that the bound name survives as a runtime local, which
+/// is what the CJS wrap's synthetic require depends on.
+#[test]
+fn test_function_require_with_body_still_shadows_the_namespace_fast_path() {
+    let source = r#"
+        function require(name: string): any { return { connect: 1 }; }
+        const net = require("net");
+        console.log(typeof net.connect);
+    "#;
+    let module = perry_parser::parse_typescript(source, "t.ts").expect("source parses");
+    let hir = super::lower_module(&module, "t", "t.ts").expect("source lowers");
+    let dump = format!("{hir:?}");
+    assert!(
+        !dump.contains("NativeModuleRef(\"net\")"),
+        "a real `function require` body must keep shadowing: {dump}"
+    );
+    assert!(
+        dump.contains("name: \"net\""),
+        "the `net` binding must stay a runtime local under a shadowing require: {dump}"
+    );
+}
+
+/// #8470: the plain, non-reactive documented form
+/// `widget.animateOpacity(target, dur)` must lower to the perry/ui animation
+/// call. The reactive desugar bailed when no argument read `State.value`, so
+/// the call fell onto the generic instance-method path and was rejected as an
+/// unknown method — making a declared API usable only by accident, when an
+/// argument happened to be reactive.
+#[test]
+fn test_non_reactive_widget_animate_lowers_to_the_ui_call() {
+    let source = r#"
+        import { App, Text, VStack } from "perry/ui"
+        const fading = Text("Fading text")
+        fading.animateOpacity(1.0, 0.3)
+        App({ title: "t", width: 400, height: 300, body: VStack(16, [fading]) })
+    "#;
+    let module = perry_parser::parse_typescript(source, "t.ts").expect("source parses");
+    let hir = super::lower_module(&module, "t", "t.ts").expect("source lowers");
+    let dump = format!("{hir:?}");
+    assert!(
+        dump.contains("widgetAnimateOpacity"),
+        "a literal-argument animateOpacity must still reach the perry/ui \
+         animation call: {dump}"
+    );
+}
+
+/// The guard on that arm: this desugar keys on the METHOD NAME, so a user
+/// class with its own `animateOpacity` must not be rewritten into a widget
+/// call just because the name matches.
+#[test]
+fn test_user_class_animate_method_is_not_hijacked_as_a_widget_call() {
+    let source = r#"
+        class Fader {
+            animateOpacity(target: number, dur: number): number { return target + dur; }
+        }
+        const f = new Fader();
+        console.log(f.animateOpacity(1.0, 0.3));
+    "#;
+    let module = perry_parser::parse_typescript(source, "t.ts").expect("source parses");
+    let hir = super::lower_module(&module, "t", "t.ts").expect("source lowers");
+    let dump = format!("{hir:?}");
+    assert!(
+        !dump.contains("widgetAnimateOpacity"),
+        "a user class method that merely shares the name must stay an ordinary \
+         method call: {dump}"
+    );
+}

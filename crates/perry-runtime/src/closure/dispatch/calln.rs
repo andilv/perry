@@ -35,6 +35,17 @@ pub extern "C" fn js_closure_call0(closure: *const ClosureHeader) -> f64 {
 
 /// Call a closure with 1 argument, returning f64
 #[no_mangle]
+// The one-argument value-call path can run arbitrary generated code and must
+// let a JS exception unwind to the generated caller's catch landing pad.
+// #8479: NOT `C-unwind`. The runtime is built `panic=abort` and JS throws
+// travel as a raw Itanium `_Unwind_Exception` that must step THROUGH these
+// frames untouched (see `crate::eh` and the panic=abort rationale in the
+// workspace Cargo.toml). Marking a frame `extern "C-unwind"` in a
+// panic=abort crate does not enable that — it makes rustc wrap the call in
+// an abort-on-unwind landing pad, which is exactly the RFC-2945 guard a JS
+// throw trips ("panic in a function that cannot unwind"). #8416 introduced
+// the first two such guards here; #8464 added ~40 more and measurably
+// regressed main (+20 gap crashes, gc-stress) before being reverted.
 pub extern "C" fn js_closure_call1(closure: *const ClosureHeader, arg0: f64) -> f64 {
     let func_ptr = get_valid_func_ptr(closure);
     if func_ptr.is_null() {
@@ -61,11 +72,7 @@ pub extern "C" fn js_closure_call1(closure: *const ClosureHeader, arg0: f64) -> 
 #[no_mangle]
 // A dynamically-dispatched closure can throw into a generated caller's catch
 // landing pad; this bridge is on Next's loadManifest/readFileSync path.
-pub extern "C-unwind" fn js_closure_call2(
-    closure: *const ClosureHeader,
-    arg0: f64,
-    arg1: f64,
-) -> f64 {
+pub extern "C" fn js_closure_call2(closure: *const ClosureHeader, arg0: f64, arg1: f64) -> f64 {
     let func_ptr = get_valid_func_ptr(closure);
     if func_ptr.is_null() {
         return dispatch_proxy_callee_or_throw(closure, &[arg0, arg1]);

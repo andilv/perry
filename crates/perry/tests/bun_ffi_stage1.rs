@@ -1,3 +1,13 @@
+// #8479: `tier1_every_ffi_type_against_test_dylib` aborts on Linux with
+// "panic in a function that cannot unwind" at the use-after-close throw
+// (`lib.close()` then calling a symbol). The frame carrying the nounwind
+// guard is STILL UNIDENTIFIED: converting the closure dispatch family
+// (#8464) did not fix it and measurably regressed main, and converting
+// `bun_ffi::dlopen`'s thunks (#8480) did not fix it either. macOS does not
+// reproduce it at all, so the Linux `e2e-scoped` run of this suite is the
+// only verdict that counts — naming this file in a runtime diff is what
+// opts the suite into that job, and a candidate fix must not be merged
+// before that job has reported green.
 //! bun:ffi stages 1-2 (#6562) — e2e: compile TS that dlopens real C-ABI
 //! dylibs and drive them through the typed call stubs.
 //!
@@ -41,6 +51,12 @@ fn compile_and_run(dir: &Path, entry: &Path, envs: &[(&str, &str)]) -> (bool, St
         String::from_utf8_lossy(&compile.stderr)
     );
     let mut run = Command::new(&output);
+    // #8479 diagnostic: the use-after-close abort reproduces only on Linux
+    // and the panic message alone does not name the frame carrying the
+    // nounwind guard — two candidate fixes (#8464, #8480) both left it
+    // aborting. Ask the child for a backtrace so CI names the frame instead
+    // of us guessing a third time.
+    run.env("RUST_BACKTRACE", "full");
     for (k, v) in envs {
         run.env(k, v);
     }
@@ -316,6 +332,15 @@ console.log("closed-throws:", closedError.includes("close()"));
 console.log("TIER1-DONE");
 "#;
 
+/// #8479: this test is the canary for the JS-throw transport. Its
+/// use-after-close case throws from inside an FFI symbol stub, so the throw
+/// must cross the runtime's dispatch frames. The runtime is `panic=abort`
+/// and that throw is a raw Itanium unwind that has to pass THROUGH those
+/// frames — so any `extern "C-unwind"` on a pass-through frame installs an
+/// RFC-2945 abort guard and turns this into "panic in a function that cannot
+/// unwind" (Linux only; macOS never reproduces it). Keep this file in the
+/// diff of any change to that path so `e2e-scoped` actually runs the suite:
+/// the job SKIPS silently and reports green when nothing in scope changed.
 #[test]
 fn tier1_every_ffi_type_against_test_dylib() {
     let dir = tempfile::tempdir().expect("tempdir");

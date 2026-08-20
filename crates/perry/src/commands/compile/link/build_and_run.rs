@@ -330,8 +330,12 @@ pub(crate) fn build_and_run_link(
     let skip_runtime = (is_android || is_watchos || is_visionos)
         && (ctx.needs_ui || is_watchos)
         && find_ui_library(target).is_some();
-    let mut well_known_libs: Vec<PathBuf> = if prefer_well_known_before_stdlib {
-        well_known_libs
+    let mut source_well_known_libs = well_known_libs.to_vec();
+    let mut seen_well_known = std::collections::HashSet::new();
+    source_well_known_libs.retain(|path| seen_well_known.insert(path.clone()));
+    let prepare_well_known = || {
+        let cacheable = std::cell::Cell::new(true);
+        let paths = source_well_known_libs
             .iter()
             .map(|wk| {
                 // Wrappers precede stdlib here, so a wrapper's bundled
@@ -346,6 +350,7 @@ pub(crate) fn build_and_run_link(
                 let wk = match stdlib_lib {
                     Some(stdlib) => strip_bundled_runtime_from_well_known_lib(wk, stdlib)
                         .unwrap_or_else(|e| {
+                            cacheable.set(false);
                             eprintln!(
                                 "[strip-dedup] bundled-runtime drop skipped for {} (non-fatal): {e}",
                                 wk.display()
@@ -375,6 +380,7 @@ pub(crate) fn build_and_run_link(
                 let wk = match stdlib_lib {
                     Some(stdlib) => strip_bundled_shared_deps_from_well_known_lib(&wk, stdlib)
                         .unwrap_or_else(|e| {
+                            cacheable.set(false);
                             eprintln!(
                                 "[strip-dedup] shared-deps drop skipped for {} (non-fatal): {e}",
                                 wk.display()
@@ -383,17 +389,34 @@ pub(crate) fn build_and_run_link(
                         }),
                     None => wk.clone(),
                 };
-                strip_duplicate_objects_from_well_known_lib(&wk).unwrap_or(wk)
+                strip_duplicate_objects_from_well_known_lib(&wk).unwrap_or_else(|_| {
+                    cacheable.set(false);
+                    wk
+                })
             })
-            .collect()
-    } else {
-        well_known_libs.to_vec()
+            .collect();
+        (paths, cacheable.get())
     };
+    let well_known_libs: Vec<PathBuf> =
+        if prefer_well_known_before_stdlib && !source_well_known_libs.is_empty() {
+            prepare_well_known_archives(
+                PreparedArchiveInputs {
+                    cache_dir: &ctx.cache_dir,
+                    target,
+                    target_triple: rust_target_triple(target),
+                    compiled_features,
+                    runtime_lib,
+                    stdlib_lib: stdlib_lib.as_deref(),
+                    well_known_libs: &source_well_known_libs,
+                },
+                prepare_well_known,
+            )
+        } else {
+            source_well_known_libs
+        };
     // Multiple specifiers can route to the same native archive (`http` and
-    // `https` both select perry_ext_http). Repeating it adds no symbols and on
-    // COFF can make lld-link choose a different duplicate COMDAT provider.
-    let mut seen_well_known = std::collections::HashSet::new();
-    well_known_libs.retain(|path| seen_well_known.insert(path.clone()));
+    // `https` both select perry_ext_http). They were de-duplicated before the
+    // archive-preparation pass so the expensive transform also runs once.
     if !skip_runtime {
         if ctx.needs_stdlib || is_windows {
             // On Windows/MSVC, always try to link stdlib because codegen unconditionally
@@ -981,7 +1004,30 @@ pub(crate) fn build_and_run_link(
             let ui_lib = if is_android || is_visionos {
                 ui_lib
             } else {
-                let trimmed = match strip_duplicate_objects_from_lib(&ui_lib) {
+                // #8455: the trim's evidence set must equal the archives that
+                // will actually be on this link line. stdlib joins it when
+                // `ctx.needs_stdlib || is_windows` (the arm above), and on
+                // Linux unconditionally (appended after the UI lib below). A
+                // pure-UI ld64 program links neither — counting stdlib's
+                // symbols anyway dropped the UI lib's bundled-std members that
+                // the thin-LTO runtime archive does not export (e.g.
+                // `<Stdout as Write>::flush` from `PerryTestExitTarget::
+                // test_exit`), failing every UI doc-test at link.
+                let stdlib_on_link_line: Option<PathBuf> = if is_linux {
+                    stdlib_lib.clone().or_else(|| find_stdlib_library(target))
+                } else if ctx.needs_stdlib || is_windows {
+                    stdlib_lib.clone()
+                } else {
+                    None
+                };
+                let stdlib_evidence = match stdlib_on_link_line {
+                    Some(ref path) => StdlibEvidence::Linked(path.as_path()),
+                    None => StdlibEvidence::NotLinked,
+                };
+                let trimmed = match strip_duplicate_objects_from_lib_with_evidence(
+                    &ui_lib,
+                    stdlib_evidence,
+                ) {
                     Ok(trimmed) => trimmed,
                     Err(e) => {
                         eprintln!("[strip-dedup] skipped for UI lib (non-fatal): {e}");
@@ -1001,8 +1047,13 @@ pub(crate) fn build_and_run_link(
                 if is_linux || is_windows {
                     trimmed
                 } else {
+                    // #8455: same evidence rule for the localize pass — only
+                    // rebind UI globals to archives actually on the link line.
+                    // Localizing against an unlinked stdlib turns the UI lib's
+                    // own definition local while the external reference stays
+                    // unresolved.
                     let mut linked_refs: Vec<&Path> = vec![runtime_lib];
-                    if let Some(ref s) = stdlib_lib {
+                    if let Some(ref s) = stdlib_on_link_line {
                         linked_refs.push(s.as_path());
                     }
                     match dedup_ui_lib_against_linked_libs(&trimmed, &linked_refs) {
@@ -1196,7 +1247,7 @@ pub(crate) fn build_and_run_link(
             || (ctx.needs_stdlib && find_geisterhand_stdlib(target).is_none())
             || (ctx.needs_ui && find_geisterhand_ui(target).is_none());
         if gh_missing {
-            build_geisterhand_libs(target, format)?;
+            build_geisterhand_libs(target, format, verbose)?;
         }
 
         if let Some(gh_lib) = find_geisterhand_library(target) {
@@ -1416,7 +1467,8 @@ pub(crate) fn build_and_run_link(
                         }
                     }
 
-                    let cargo_status = cargo_cmd.status()?;
+                    let cargo_status =
+                        super::super::tool_output::run_internal_tool(&mut cargo_cmd, verbose)?;
                     if !cargo_status.success() {
                         return Err(anyhow!(
                             "Failed to build native library crate for {}: {}",
@@ -1732,7 +1784,8 @@ pub(crate) fn build_and_run_link(
                         .and_then(|s| s.to_str())
                         .unwrap_or("swift_src");
                     let obj_out = swift_obj_dir.join(format!("{}.o", stem));
-                    let status = Command::new(&swiftc)
+                    let mut swift_cmd = Command::new(&swiftc);
+                    swift_cmd
                         .arg("-target")
                         .arg(swift_triple)
                         .arg("-sdk")
@@ -1742,8 +1795,9 @@ pub(crate) fn build_and_run_link(
                         .arg("-O")
                         .arg("-o")
                         .arg(&obj_out)
-                        .arg(swift_src)
-                        .status()?;
+                        .arg(swift_src);
+                    let status =
+                        super::super::tool_output::run_internal_tool(&mut swift_cmd, verbose)?;
                     if !status.success() {
                         return Err(anyhow!(
                             "Failed to compile Swift source: {}",
@@ -1905,7 +1959,7 @@ pub(crate) fn build_and_run_link(
             .collect();
         eprintln!("[link] invoking: {} {}", program, rendered.join(" "));
     }
-    let status_result = cmd.status();
+    let status_result = super::super::tool_output::run_internal_tool(&mut cmd, verbose);
     if verbose > 0 {
         match &status_result {
             Ok(status) => eprintln!("[link] linker exited: {status}"),

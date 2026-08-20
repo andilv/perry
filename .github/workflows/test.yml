@@ -334,6 +334,16 @@ jobs:
           python3 scripts/addr_class_inventory.py --self-test
           python3 scripts/addr_class_inventory.py
 
+      # String payloads live directly after StringHeader in the moving GC heap.
+      # Keep new consumers on the owned-copy or rooted-reread APIs instead of
+      # adding more layout arithmetic and caller-chosen `&'static str` helpers.
+      # Existing sites are tracked per crate and may only decrease.
+      - name: String payload-access inventory
+        if: ${{ !cancelled() }}
+        run: |
+          python3 scripts/string_payload_access_inventory.py --self-test
+          python3 scripts/string_payload_access_inventory.py
+
       # Two reserved class ids sharing a value is silent and destructive: every
       # dispatch tower matches them in a fixed order, so the later arm becomes
       # unreachable and its whole method surface dies (#7576 killed the entire
@@ -704,7 +714,12 @@ jobs:
     needs: plan
     if: fromJSON(needs.plan.outputs.plan).jobs.check
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # 90 (was 60): full-tier runs share the free-plan runner pool with the
+    # coalesced main sweeps; in dispatch run 32298711372 sibling jobs pushed
+    # this past its cap and the cancellation alone failed full-suite-gate
+    # (the gate treats cancelled == failed). The cap is a hang backstop, not
+    # a perf budget — margin costs nothing on healthy runs.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
 
@@ -783,7 +798,9 @@ jobs:
     needs: plan
     if: fromJSON(needs.plan.outputs.plan).jobs.warnings
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # 90 (was 60): same contention margin as `check` — cancelled at exactly
+    # 60:26 in full-tier run 32298711372 while doing useful work.
+    timeout-minutes: 90
     env:
       RUSTFLAGS: -D warnings
       RUSTC_WRAPPER: sccache
@@ -1019,8 +1036,25 @@ jobs:
             # (e.g. functional_batch2_regressions) link the prebuilt archive
             # directly and fail with "Could not find libperry_runtime.a" if the
             # cached staticlib was invalidated. Build them explicitly.
+            # #8479: build these with `--release`. The `panic` strategy is a
+            # PROFILE-level setting, and only `release`/`dist`/`perry-dev` set
+            # `panic = "abort"` — a bare `cargo build` produces a DEBUG,
+            # `panic = "unwind"` runtime. Under `panic = "unwind"` rustc plants
+            # an RFC-2945 abort guard in every `extern "C"` helper, which a JS
+            # throw crossing that helper trips ("panic in a function that
+            # cannot unwind"). So the child binaries were linking a runtime
+            # whose unwind semantics are the OPPOSITE of what Perry ships, and
+            # the two throw-transport canaries could not both pass: #8416
+            # papered over it with `extern "C-unwind"` (correct for the debug
+            # runtime, WRONG for the shipped one), #8464 generalised that and
+            # cost +20 gap crashes, and #8480 added more. Verified: against a
+            # `panic = "abort"` runtime, with those conversions removed, BOTH
+            # `tier1_every_ffi_type_against_test_dylib` and
+            # `function_apply_with_runtime_args_defers_to_a_located_aot_error`
+            # pass.
             if printf '%s\n' "$scope" | grep -qE '^(perry|perry-stdlib)$'; then
-              cargo build -p perry-runtime -p perry-stdlib -p perry-runtime-static -p perry-stdlib-static
+              cargo build --release -p perry-runtime -p perry-stdlib -p perry-runtime-static -p perry-stdlib-static
+              export PERRY_RUNTIME_DIR="$PWD/target/release"
             fi
             find target/debug/deps -maxdepth 1 -type f -perm -111 ! -name '*.so' -delete
             # Large perry / perry-stdlib integration-test binaries: serialize
@@ -1257,9 +1291,15 @@ jobs:
           # libperry_{runtime,stdlib}.a don't exist unless built explicitly —
           # and the suites that compile with PERRY_NO_AUTO_OPTIMIZE=1 link them
           # directly ("Could not find libperry_runtime.a" otherwise).
+          # #8479: `--release` so the child links a `panic = "abort"` runtime,
+          # matching what Perry ships. A bare `cargo build` yields a DEBUG,
+          # `panic = "unwind"` runtime whose `extern "C"` helpers carry
+          # RFC-2945 abort guards that a JS throw trips — the opposite of the
+          # shipped semantics. See the longer note in `cargo-test`.
           if printf '%s\n' "$SUITES" | grep -qE '^(perry|perry-stdlib) '; then
-            cargo build -p perry-runtime -p perry-stdlib \
+            cargo build --release -p perry-runtime -p perry-stdlib \
               -p perry-runtime-static -p perry-stdlib-static
+            export PERRY_RUNTIME_DIR="$PWD/target/release"
           fi
 
           status=0
@@ -2197,7 +2237,12 @@ jobs:
     # heavy shard) while still bounding a genuine hang. Durable fix — raising
     # the shard count 8->12 so no single slice approaches the cap — tracked as
     # a follow-up on #6456.
-    timeout-minutes: 75
+    # 110 (was 75): in full-tier run 32298711372 the auto-optimize shards ran
+    # ~70 min when they finished at all, and shards 2/4/5 were cancelled at
+    # exactly 75:00 under runner contention — each cancellation fails
+    # full-suite-gate on its own. Margin over the observed worst case until
+    # the #6456 reshard lands.
+    timeout-minutes: 110
     steps:
       - uses: actions/checkout@v7
 
@@ -3110,6 +3155,14 @@ jobs:
     # the same 20-slot pool.
     needs: [plan, check]
     if: fromJSON(needs.plan.outputs.plan).jobs.doc_tests
+    # #8468: an explicit cap. Without one this job inherited GitHub's 360-min
+    # default, so when the Windows leg stalled in the LLVM download it burned
+    # six hours before being cancelled — having run ZERO doc-tests — and a
+    # cancelled job fails `full-suite-gate`, blocking the release. Measured
+    # healthy runs: macOS 34 min end-to-end. 120 leaves generous headroom for
+    # the slower Windows host while bounding a hang to a fifth of what it cost
+    # (run 32298711372).
+    timeout-minutes: 120
     # Blocking host runs and the portable cross-compile subset gate the job.
     # Known platform-tail failures remain advisory at their individual steps.
     strategy:
@@ -3128,7 +3181,15 @@ jobs:
             # Proper fix: hoist well-known-binding lookup out of
             # build_optimized_libs into link.rs so it runs even when
             # auto-optimize is skipped. Tracked separately.
-            cmd_exclude_gallery: "./scripts/run_doc_tests.sh --verbose --skip-xcompile --filter-exclude ui/gallery.ts --filter-exclude stdlib/http/snippets.ts"
+            # #8475: the three fastify-importing snippets cannot run under the
+            # harness's PERRY_NO_AUTO_OPTIMIZE=1 speed flag — `perry compile`
+            # hard-errors on `import 'fastify'` there, because the prebuilt
+            # stdlib is not built with `external-fastify-pump` and the request
+            # loop would hang. Excluded on the same terms as the HTTP aggregate
+            # above until the harness can run this class in a second,
+            # auto-optimizing pass. COVERAGE GAP, tracked in #8475 — not a
+            # statement that these snippets work.
+            cmd_exclude_gallery: "./scripts/run_doc_tests.sh --verbose --skip-xcompile --filter-exclude ui/gallery.ts --filter-exclude stdlib/http/snippets.ts --filter-exclude getting-started/npm_packages.ts --filter-exclude stdlib/http/fastify_json.ts --filter-exclude stdlib/overview/snippets.ts"
             cmd_gallery: "./scripts/run_doc_tests.sh --verbose --skip-xcompile --filter ui/gallery.ts"
             # Repeat `--xcompile-only-target=…` per target rather than a
             # single comma-delimited value because PowerShell splits even
@@ -3171,7 +3232,9 @@ jobs:
             shell: pwsh
             # The well-known HTTP aggregate remains excluded on every host
             # while its no-auto ext-archive routing issue is tracked.
-            cmd_exclude_gallery: "./scripts/run_doc_tests.ps1 --verbose --skip-xcompile --filter-exclude ui/gallery.ts --filter-exclude stdlib/http/snippets.ts"
+            # #8475: same fastify / PERRY_NO_AUTO_OPTIMIZE exclusion as the
+            # macOS entry above. COVERAGE GAP, tracked there.
+            cmd_exclude_gallery: "./scripts/run_doc_tests.ps1 --verbose --skip-xcompile --filter-exclude ui/gallery.ts --filter-exclude stdlib/http/snippets.ts --filter-exclude getting-started/npm_packages.ts --filter-exclude stdlib/http/fastify_json.ts --filter-exclude stdlib/overview/snippets.ts"
             cmd_gallery: "./scripts/run_doc_tests.ps1 --verbose --skip-xcompile --filter ui/gallery.ts"
             cmd_xcompile_blocking: "./scripts/run_doc_tests.ps1 --verbose --xcompile-only --xcompile-only-target=web --xcompile-only-target=wasm"
             cmd_xcompile_advisory: "./scripts/run_doc_tests.ps1 --verbose --xcompile-only"

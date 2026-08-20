@@ -15,16 +15,126 @@
 use anyhow::{anyhow, Result};
 use perry_hir::Expr;
 
-use crate::expr::{lower_expr, nanbox_string_inline, unbox_str_handle, FnCtx};
+use crate::expr::{
+    current_closure_ptr_value, emit_root_nanbox_store_on_block, emit_write_barrier, lower_expr,
+    nanbox_string_inline, unbox_str_handle, FnCtx,
+};
 use crate::type_analysis::is_string_expr;
 use crate::types::{DOUBLE, I32, I64};
 
 use crate::rooting::{operand_may_collect, with_operands_rooted, with_rooted_group, Repr};
 
+/// Storage used by a source-level binding that can own an appendable string.
+///
+/// Heap cells and module roots are variable storage, not aliases of the value
+/// they contain. Keeping that distinction here lets them retain the unique
+/// string bit until an ordinary `LocalGet` extracts the value (#8432).
+enum StringAppendTarget {
+    LocalSlot(String),
+    BoxedLocal(String),
+    Captured { index: u32, boxed: bool },
+    ModuleGlobal(String),
+}
+
+impl StringAppendTarget {
+    fn for_local(ctx: &FnCtx<'_>, local_id: u32) -> Option<Self> {
+        if let Some(&index) = ctx.closure_captures.get(&local_id) {
+            return Some(Self::Captured {
+                index,
+                boxed: ctx.boxed_vars.contains(&local_id),
+            });
+        }
+        if ctx.boxed_vars.contains(&local_id) && !ctx.module_globals.contains_key(&local_id) {
+            return ctx.locals.get(&local_id).cloned().map(Self::BoxedLocal);
+        }
+        if let Some(slot) = ctx.locals.get(&local_id).cloned() {
+            return Some(Self::LocalSlot(slot));
+        }
+        ctx.module_globals
+            .get(&local_id)
+            .map(|name| Self::ModuleGlobal(format!("@{name}")))
+    }
+
+    fn load(&self, ctx: &mut FnCtx<'_>) -> Result<String> {
+        match self {
+            Self::LocalSlot(slot) | Self::ModuleGlobal(slot) => Ok(ctx.block().load(DOUBLE, slot)),
+            Self::BoxedLocal(box_slot) => {
+                let blk = ctx.block();
+                let box_ptr = blk.load(I64, box_slot);
+                let bits = blk.call(I64, "js_box_get_bits", &[(I64, &box_ptr)]);
+                Ok(blk.bitcast_i64_to_double(&bits))
+            }
+            Self::Captured { index, boxed } => {
+                let closure_ptr =
+                    current_closure_ptr_value(ctx, "captured string self-append load")?;
+                let index = index.to_string();
+                let bits = ctx.block().call(
+                    I64,
+                    "js_closure_get_capture_bits",
+                    &[(I64, &closure_ptr), (I32, &index)],
+                );
+                if *boxed {
+                    let value_bits = ctx.block().call(I64, "js_box_get_bits", &[(I64, &bits)]);
+                    Ok(ctx.block().bitcast_i64_to_double(&value_bits))
+                } else {
+                    Ok(ctx.block().bitcast_i64_to_double(&bits))
+                }
+            }
+        }
+    }
+
+    fn store(&self, ctx: &mut FnCtx<'_>, value: &str) -> Result<()> {
+        match self {
+            Self::LocalSlot(slot) => ctx.block().store(DOUBLE, value, slot),
+            Self::ModuleGlobal(slot) => emit_root_nanbox_store_on_block(ctx.block(), value, slot),
+            Self::BoxedLocal(box_slot) => {
+                let blk = ctx.block();
+                let box_ptr = blk.load(I64, box_slot);
+                let value_bits = blk.bitcast_double_to_i64(value);
+                blk.call_void("js_box_set_bits", &[(I64, &box_ptr), (I64, &value_bits)]);
+                emit_write_barrier(ctx, &box_ptr, &value_bits);
+            }
+            Self::Captured { index, boxed } => {
+                // The rhs and append helper can collect. Re-read the current
+                // closure root here rather than retaining its movable pointer
+                // from the load above (#7055).
+                let closure_ptr =
+                    current_closure_ptr_value(ctx, "captured string self-append store")?;
+                let index = index.to_string();
+                if *boxed {
+                    let box_ptr = ctx.block().call(
+                        I64,
+                        "js_closure_get_capture_bits",
+                        &[(I64, &closure_ptr), (I32, &index)],
+                    );
+                    let value_bits = ctx.block().bitcast_double_to_i64(value);
+                    ctx.block()
+                        .call_void("js_box_set_bits", &[(I64, &box_ptr), (I64, &value_bits)]);
+                    emit_write_barrier(ctx, &box_ptr, &value_bits);
+                } else {
+                    let value_bits = ctx.block().bitcast_double_to_i64(value);
+                    ctx.block().call_void(
+                        "js_closure_set_capture_bits",
+                        &[(I64, &closure_ptr), (I32, &index), (I64, &value_bits)],
+                    );
+                    emit_write_barrier(ctx, &closure_ptr, &value_bits);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether `local_id` has storage that can be read-modify-written by the
+/// amortized string append lowering.
+pub(crate) fn can_lower_string_self_append(ctx: &FnCtx<'_>, local_id: u32) -> bool {
+    StringAppendTarget::for_local(ctx, local_id).is_some()
+}
+
 /// Lower the `str = str + rhs` self-append pattern. Uses the in-place
 /// `js_string_append` runtime function (refcount=1 → mutate in place,
-/// otherwise allocate). The returned pointer is stored back to the local
-/// slot — `js_string_append` may realloc when growing past capacity.
+/// otherwise allocate). The returned pointer is stored back to the binding's
+/// slot/cell/root — `js_string_append` may realloc when growing past capacity.
 ///
 /// This is the load-bearing optimization for the canonical `let str = "";
 /// for (...) str = str + "a"` string-build pattern.
@@ -33,17 +143,14 @@ pub(crate) fn lower_string_self_append(
     local_id: u32,
     rhs: &Expr,
 ) -> Result<String> {
-    let slot = ctx
-        .locals
-        .get(&local_id)
-        .ok_or_else(|| anyhow!("string self-append: local {} not in scope", local_id))?
-        .clone();
+    let target = StringAppendTarget::for_local(ctx, local_id)
+        .ok_or_else(|| anyhow!("string self-append: local {} not in scope", local_id))?;
 
     // A declared string type is permission to select this lowering, not proof
     // that the slot contains a string. Use the same inline tag dispatch for
     // canonical and ordinary boxed locals: this keeps the true-string append
     // arm direct and makes the annotation-lie arm choose the real JS `+`.
-    lower_tag_dispatched_str_self_append(ctx, rhs, &slot)
+    lower_tag_dispatched_str_self_append(ctx, rhs, &target)
 }
 
 /// Repsel Phase 3a: is this expression PROVEN to lower to a heap-tagged
@@ -148,7 +255,7 @@ pub(crate) fn str_operand_handle_tag_dispatched(
 fn lower_tag_dispatched_str_self_append(
     ctx: &mut FnCtx<'_>,
     rhs: &Expr,
-    slot: &str,
+    target: &StringAppendTarget,
 ) -> Result<String> {
     use crate::nanbox::{
         POINTER_MASK_I64, POINTER_TAG_TOP16_I64 as TAG_POINTER,
@@ -161,7 +268,7 @@ fn lower_tag_dispatched_str_self_append(
         // ToString call. A pointer rhs needs Add's default-hint ToPrimitive, so
         // it joins the dynamic arm; primitive rhs values keep the old direct
         // coercion + in-place append sequence.
-        let lhs_box = ctx.block().load(DOUBLE, slot);
+        let lhs_box = target.load(ctx)?;
         let protect_lhs = operand_may_collect(ctx, rhs);
         return with_rooted_group(ctx, 0, |ctx, group| {
             let lhs_root = group.adopt_emitted(ctx, Repr::Boxed, &lhs_box, protect_lhs);
@@ -198,13 +305,15 @@ fn lower_tag_dispatched_str_self_append(
             let lhs_after_coercion = if protect_lhs {
                 group.reread_emitted(ctx, lhs_root)
             } else {
-                ctx.block().load(DOUBLE, slot)
+                target.load(ctx)?
             };
             let bits_d_after = ctx.block().bitcast_double_to_i64(&lhs_after_coercion);
             let h_d = ctx.block().and(I64, &bits_d_after, POINTER_MASK_I64);
-            let h_new = ctx
-                .block()
-                .call(I64, "js_string_append", &[(I64, &h_d), (I64, &r_handle)]);
+            let h_new = ctx.block().call(
+                I64,
+                "js_string_append_known_heap",
+                &[(I64, &h_d), (I64, &r_handle)],
+            );
             let box_append = nanbox_string_inline(ctx.block(), &h_new);
             let append_pred = ctx.block().label.clone();
             ctx.block().br(&merge_label);
@@ -223,7 +332,7 @@ fn lower_tag_dispatched_str_self_append(
                 DOUBLE,
                 &[(&box_append, &append_pred), (&box_dynamic, &dynamic_pred)],
             );
-            ctx.block().store(DOUBLE, &new_box, slot);
+            target.store(ctx, &new_box)?;
             Ok(new_box)
         });
     }
@@ -242,7 +351,7 @@ fn lower_tag_dispatched_str_self_append(
     //   dest heap, rhs lie   → dynamic `+`                  (cold)
     //   dest other           → js_string_concat_box          (SSO-aware and
     //                          total: lies delegate to dynamic `+`)
-    let lhs_box = ctx.block().load(DOUBLE, slot);
+    let lhs_box = target.load(ctx)?;
     let protect_lhs = operand_may_collect(ctx, rhs);
     with_rooted_group(ctx, 0, |ctx, group| {
         let lhs_root = group.adopt_emitted(ctx, Repr::Boxed, &lhs_box, protect_lhs);
@@ -279,9 +388,11 @@ fn lower_tag_dispatched_str_self_append(
         ctx.current_block = heap_idx;
         let h_d = ctx.block().and(I64, &bits_d, POINTER_MASK_I64);
         let h_r = ctx.block().and(I64, &bits_r, POINTER_MASK_I64);
-        let h_new = ctx
-            .block()
-            .call(I64, "js_string_append", &[(I64, &h_d), (I64, &h_r)]);
+        let h_new = ctx.block().call(
+            I64,
+            "js_string_append_known_heap",
+            &[(I64, &h_d), (I64, &h_r)],
+        );
         let box_heap = nanbox_string_inline(ctx.block(), &h_new);
         let heap_pred = ctx.block().label.clone();
         ctx.block().br(&merge_label);
@@ -295,13 +406,13 @@ fn lower_tag_dispatched_str_self_append(
         let lhs_after_materialize = if protect_lhs {
             group.reread_emitted(ctx, lhs_root)
         } else {
-            ctx.block().load(DOUBLE, slot)
+            target.load(ctx)?
         };
         let bits_d_after = ctx.block().bitcast_double_to_i64(&lhs_after_materialize);
         let h_d_after = ctx.block().and(I64, &bits_d_after, POINTER_MASK_I64);
         let h_sso = ctx.block().call(
             I64,
-            "js_string_append",
+            "js_string_append_known_heap",
             &[(I64, &h_d_after), (I64, &r_handle)],
         );
         let box_sso = nanbox_string_inline(ctx.block(), &h_sso);
@@ -336,7 +447,7 @@ fn lower_tag_dispatched_str_self_append(
                 (&box_other, &dother_pred),
             ],
         );
-        ctx.block().store(DOUBLE, &new_box, slot);
+        target.store(ctx, &new_box)?;
         Ok(new_box)
     })
 }
@@ -519,7 +630,7 @@ pub(crate) fn lower_string_concat(
 /// Cap the per-call part count for the n-way fold. Must match the
 /// runtime's `MAX_PARTS` in `js_string_concat_chain`. 32 covers every
 /// realistic CSV / log-line / template chain in user code.
-const CONCAT_CHAIN_MAX_PARTS: usize = 32;
+pub(crate) const CONCAT_CHAIN_MAX_PARTS: usize = 32;
 
 /// Try to flatten a left-spine of `Binary { Add }` nodes where every Add
 /// has at least one statically-string operand. Returns the parts in
@@ -606,24 +717,38 @@ pub(crate) fn lower_string_concat_chain(ctx: &mut FnCtx<'_>, parts: &[&Expr]) ->
     // one allocating interpolation was enough to sweep the parts already
     // lowered. Parts that nothing allocating follows emit no rooting calls.
     with_operands_rooted(ctx, parts, |ctx, lowered| {
-        let n = lowered.len();
-        // Hoist the buffer to the function entry block. Issue #167.
-        let buf_reg = ctx.func.alloca_entry_array(DOUBLE, CONCAT_CHAIN_MAX_PARTS);
-        let blk = ctx.block();
-        for (i, val) in lowered.iter().enumerate() {
-            let slot = blk.gep(DOUBLE, &buf_reg, &[(I64, &format!("{}", i))]);
-            blk.store(DOUBLE, val, &slot);
-        }
-        // Pass the array's base pointer as i64 (codegen ABI uses i64 for
-        // raw pointer args matching the existing `js_string_concat` shape).
-        let base_i64 = blk.next_reg();
-        blk.emit_raw(format!("{} = ptrtoint ptr {} to i64", base_i64, buf_reg));
-
-        let result_handle = blk.call(
-            I64,
-            "js_string_concat_chain",
-            &[(I64, &base_i64), (I32, &format!("{}", n))],
-        );
-        Ok(nanbox_string_inline(blk, &result_handle))
+        Ok(emit_string_concat_chain(ctx, lowered))
     })
+}
+
+/// Emit the shared stack-buffer + runtime-call core for values that have
+/// already been lowered, coerced where required, and re-read from their roots.
+///
+/// `String.prototype.concat` needs this lower-level entry point because its
+/// arguments are evaluated first and then `ToString`-coerced left-to-right.
+/// Each coercion needs a fresh root re-read of the raw value, which is more
+/// than `with_operands_rooted`'s single re-read point can provide.
+pub(crate) fn emit_string_concat_chain(ctx: &mut FnCtx<'_>, parts: &[String]) -> String {
+    debug_assert!(parts.len() >= 2);
+    debug_assert!(parts.len() <= CONCAT_CHAIN_MAX_PARTS);
+
+    let n = parts.len();
+    // Hoist the buffer to the function entry block. Issue #167.
+    let buf_reg = ctx.func.alloca_entry_array(DOUBLE, CONCAT_CHAIN_MAX_PARTS);
+    let blk = ctx.block();
+    for (i, val) in parts.iter().enumerate() {
+        let slot = blk.gep(DOUBLE, &buf_reg, &[(I64, &format!("{}", i))]);
+        blk.store(DOUBLE, val, &slot);
+    }
+    // Pass the array's base pointer as i64 (codegen ABI uses i64 for
+    // raw pointer args matching the existing `js_string_concat` shape).
+    let base_i64 = blk.next_reg();
+    blk.emit_raw(format!("{} = ptrtoint ptr {} to i64", base_i64, buf_reg));
+
+    let result_handle = blk.call(
+        I64,
+        "js_string_concat_chain",
+        &[(I64, &base_i64), (I32, &format!("{}", n))],
+    );
+    nanbox_string_inline(blk, &result_handle)
 }
