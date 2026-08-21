@@ -160,10 +160,12 @@ try {
 
 ## worker_threads
 
-Partially recognized at HIR-lowering time (`parentPort` / `Worker` shapes)
-but full dispatch is incomplete. For data-parallel work today, prefer
-`parallelMap` / `parallelFilter` / `spawn` from `perry/thread`
-(see [Threading](../threading/overview.md)).
+Perry compiles statically resolvable worker entry files as separate native
+module entry functions. Both the Node `worker_threads` API and the Web/Bun
+global `Worker` shape use the same in-process worker runtime; worker source is
+never passed to a runtime JavaScript engine. For closure-oriented data-parallel
+work, `parallelMap` / `parallelFilter` / `spawn` from `perry/thread` remain the
+simpler interface (see [Threading](../threading/overview.md)).
 
 ```text
 import { Worker, parentPort, workerData } from "worker_threads";
@@ -181,6 +183,23 @@ if (parentPort) {
     console.log(msg.result); // 42
   });
 }
+```
+
+Web Worker module URLs are discovered relative to the importing source file:
+
+```typescript,no-test
+// main.ts
+const worker = new Worker(new URL("./worker.ts", import.meta.url), {
+  type: "module",
+});
+worker.onmessage = (event) => console.log(event.data);
+worker.postMessage({ value: 21 });
+
+// worker.ts
+onmessage = (event) => {
+  postMessage({ result: event.data.value * 2 });
+  close();
+};
 ```
 
 ## commander (CLI Parsing)
@@ -245,6 +264,31 @@ term.resize(120, 40);   // TIOCSWINSZ → child sees SIGWINCH
 term.kill("SIGTERM");   // no argument = SIGHUP
 sub.dispose();          // unsubscribe onData
 ```
+
+## @parcel/watcher
+
+Perry provides the low-level `@parcel/watcher` binding object and all eight
+published platform-package names through one `notify`-backed native facade.
+The pure-JavaScript `@parcel/watcher/wrapper` continues to compile normally;
+its target-dependent platform `require` is folded to the native facade at
+compile time. The behavior was checked against `@parcel/watcher` 2.5.1.
+
+Subscriptions use FSEvents on macOS, inotify on Linux,
+ReadDirectoryChangesW on Windows, and notify's native backend on other
+supported systems. An unknown or unavailable requested backend falls back to
+the platform default. Events are delivered on Perry's main thread in
+coalesced batches: create followed by update remains one `create`, create
+followed by delete disappears, and rename is `delete` for the old path plus
+`create` for the new path. Backend overflow/rescan notifications trigger a
+fresh tree snapshot and emit its diff.
+
+`ignorePaths` are absolute path prefixes. `ignoreGlobs` are the regex sources
+produced by the package's JS wrapper and match root-relative paths, including
+dot-files. `unsubscribe` matches directory, callback identity, and normalized
+options; it stops the native watcher and drains queued events before its
+promise resolves, so no callback fires afterward. Live subscriptions keep the
+event loop active. `writeSnapshot` and `getEventsSince` use the same snapshot
+diff semantics as overflow recovery.
 
 ## External native bindings
 

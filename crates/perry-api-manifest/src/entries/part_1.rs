@@ -203,10 +203,10 @@ pub(crate) const API_MANIFEST_PART_1: &[ApiEntry] = &[
     method("better-sqlite3", "pluck", true, None),
     method("better-sqlite3", "columns", true, None),
     method("better-sqlite3", "transaction", true, None),
-    // bun:ffi (#6562) — stage-1/2 surface. `FFIType` and `suffix` are
+    // bun:ffi (#6562). `FFIType` and `suffix` are
     // constants; symbol-table call stubs live on the object `dlopen`
     // returns, so the module surface itself is small. The later-stage
-    // exports (JSCallback / linkSymbols / CFunction / viewSource / read) are
+    // exports (linkSymbols / CFunction / viewSource / read) are
     // declared and throw a descriptive
     // ERR_NOT_IMPLEMENTED at runtime.
     method("bun:ffi", "dlopen", false, None),
@@ -216,12 +216,11 @@ pub(crate) const API_MANIFEST_PART_1: &[ApiEntry] = &[
     property("bun:ffi", "suffix"),
     method("bun:ffi", "toArrayBuffer", false, None),
     method("bun:ffi", "toBuffer", false, None),
-    // Stage ≥3 surface: declared so feature-probes get a clear error rather
+    method("bun:ffi", "JSCallback", false, None),
+    // Remaining surface: declared so feature-probes get a clear error rather
     // than `undefined is not a function`, but NOT implemented yet — each
     // throws at runtime. Marked `.stub_note` so the generated `.d.ts` /
     // `reference.md` say so instead of reading as usable APIs (#6562).
-    method("bun:ffi", "JSCallback", false, None)
-        .stub_note("stage 3 — not yet implemented, throws at runtime (#6562)"),
     method("bun:ffi", "CFunction", false, None)
         .stub_note("stage 3 — not yet implemented, throws at runtime (#6562)"),
     method("bun:ffi", "linkSymbols", false, None)
@@ -230,6 +229,26 @@ pub(crate) const API_MANIFEST_PART_1: &[ApiEntry] = &[
         .stub_note("stage ≥2 — not yet implemented, throws at runtime (#6562)"),
     method("bun:ffi", "read", false, None)
         .stub_note("stage ≥2 — not yet implemented, throws at runtime (#6562)"),
+    // bun:sqlite (#8510) shares node:sqlite's rusqlite handles while keeping
+    // Bun's public constructor and statement vocabulary.
+    class("bun:sqlite", "Database"),
+    class("bun:sqlite", "Statement"),
+    method("bun:sqlite", "Database", false, None),
+    method("bun:sqlite", "query", true, Some("Database")),
+    method("bun:sqlite", "prepare", true, Some("Database")),
+    method("bun:sqlite", "run", true, Some("Database")),
+    method("bun:sqlite", "close", true, Some("Database")),
+    method("bun:sqlite", "serialize", true, Some("Database")),
+    method("bun:sqlite", "loadExtension", true, Some("Database")),
+    method("bun:sqlite", "transaction", true, Some("Database")),
+    property("bun:sqlite", "filename"),
+    property("bun:sqlite", "inTransaction"),
+    method("bun:sqlite", "run", true, Some("Statement")),
+    method("bun:sqlite", "get", true, Some("Statement")),
+    method("bun:sqlite", "all", true, Some("Statement")),
+    method("bun:sqlite", "values", true, Some("Statement")),
+    method("bun:sqlite", "safeIntegers", true, Some("Statement")),
+    method("bun:sqlite", "finalize", true, Some("Statement")),
     class("sqlite", "DatabaseSync"),
     class("sqlite", "Session"),
     class("sqlite", "SQLTagStore"),

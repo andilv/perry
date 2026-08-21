@@ -7,11 +7,12 @@ use crate::common::{for_each_handle_mut_of, Handle};
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::sync::{Mutex, Once, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 mod backup;
 mod better;
 mod bind;
+mod bun;
 mod connection;
 mod dispatch;
 mod node_db;
@@ -24,6 +25,7 @@ mod options;
 // keep resolving and sibling modules reach one another via `use super::*`.
 pub(crate) use backup::*;
 pub(crate) use bind::*;
+pub(crate) use bun::*;
 pub(crate) use connection::*;
 pub(crate) use dispatch::*;
 pub(crate) use node_db::*;
@@ -44,6 +46,8 @@ pub struct NodeSqliteDbHandle {
     pub conn: Mutex<Option<Connection>>,
     pub path: String,
     pub read_only: bool,
+    pub read_write: bool,
+    pub create: bool,
     pub enable_foreign_keys: bool,
     pub enable_dqs: bool,
     pub timeout_ms: i32,
@@ -178,6 +182,8 @@ pub(crate) struct NodeSqliteAggregateState {
 pub(crate) struct NodeSqliteOptions {
     open: bool,
     read_only: bool,
+    read_write: bool,
+    create: bool,
     enable_foreign_keys: bool,
     enable_dqs: bool,
     timeout_ms: i32,
@@ -195,6 +201,8 @@ impl Default for NodeSqliteOptions {
         Self {
             open: true,
             read_only: false,
+            read_write: true,
+            create: true,
             enable_foreign_keys: true,
             enable_dqs: false,
             timeout_ms: 0,
@@ -215,10 +223,14 @@ pub(crate) const TAG_NULL_BITS: u64 = 0x7FFC_0000_0000_0002;
 pub(crate) const JS_SAFE_INTEGER_MAX: i64 = 9_007_199_254_740_991;
 pub(crate) const JS_SAFE_INTEGER_MIN: i64 = -9_007_199_254_740_991;
 
-pub(crate) static NODE_SQLITE_GC_SCANNER: Once = Once::new();
 pub(crate) static NODE_SQLITE_CUSTOM_FUNCTIONS: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
 pub(crate) static NODE_SQLITE_CUSTOM_AGGREGATES: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
 pub(crate) static NODE_SQLITE_ACTIVE_AGGREGATES: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+
+thread_local! {
+    // The mutable-root scanner registry is thread-local, so this latch must be too.
+    static NODE_SQLITE_GC_SCANNER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 pub(crate) fn node_sqlite_custom_functions() -> &'static Mutex<HashSet<usize>> {
     NODE_SQLITE_CUSTOM_FUNCTIONS.get_or_init(|| Mutex::new(HashSet::new()))
@@ -233,11 +245,15 @@ pub(crate) fn node_sqlite_active_aggregates() -> &'static Mutex<HashSet<usize>> 
 }
 
 pub(crate) fn ensure_node_sqlite_gc_scanner_registered() {
-    NODE_SQLITE_GC_SCANNER.call_once(|| {
+    NODE_SQLITE_GC_SCANNER.with(|registered| {
+        if registered.get() {
+            return;
+        }
         perry_runtime::gc::gc_register_mutable_root_scanner_named(
             "stdlib:node_sqlite",
             scan_node_sqlite_roots_mut,
         );
+        registered.set(true);
     });
 }
 

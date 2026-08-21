@@ -73,6 +73,20 @@ pub(super) fn lower_new(ctx: &mut LoweringContext, new_expr: &ast::NewExpr) -> R
     }
 
     if let ast::Expr::Ident(callee_ident) = callee_expr {
+        // Keep Bun's `Database` distinct from better-sqlite3's same-named
+        // constructor while still allocating the shared native SQLite handle.
+        if matches!(
+            ctx.lookup_native_module(callee_ident.sym.as_ref()),
+            Some(("bun:sqlite", Some("Database")))
+        ) {
+            return Ok(Expr::New {
+                class_name: "BunSqliteDatabase".to_string(),
+                args: lower_optional_args(ctx, new_expr.args.as_deref())?,
+                type_args: Vec::new(),
+                byte_offset: new_byte_offset,
+                cap_args_appended: 0,
+            });
+        }
         let module_constructor = ctx
             .lookup_native_module(callee_ident.sym.as_ref())
             .map(|(module_name, method)| {
@@ -568,6 +582,21 @@ pub(super) fn lower_new(ctx: &mut LoweringContext, new_expr: &ast::NewExpr) -> R
             }
 
             if let Some((module_name, method_name)) = ctx.lookup_native_module(&class_name) {
+                // #6562: Bun exposes JSCallback as a constructor, but Perry's
+                // native-module export returns the already-built
+                // `{ ptr, threadsafe, close }` object. Route the named import
+                // through the module call directly so `new JSCallback(...)`
+                // observes that explicit object return instead of generic
+                // `Expr::New` manufacturing and retaining a blank instance.
+                if module_name == "bun:ffi" && method_name == Some("JSCallback") {
+                    return Ok(Expr::NativeMethodCall {
+                        module: "bun:ffi".to_string(),
+                        class_name: None,
+                        object: None,
+                        method: "JSCallback".to_string(),
+                        args: lower_optional_args(ctx, new_expr.args.as_deref())?,
+                    });
+                }
                 if module_name == "module"
                     && matches!(method_name, Some("Module") | Some("SourceMap"))
                 {
@@ -608,15 +637,22 @@ pub(super) fn lower_new(ctx: &mut LoweringContext, new_expr: &ast::NewExpr) -> R
                 }
             }
 
-            if class_name == "Worker"
-                && ctx
+            if class_name == "Worker" {
+                let imported_worker = ctx
                     .lookup_native_module("Worker")
                     .map(|(module_name, export_name)| {
                         is_worker_threads_module_name(module_name) && export_name == Some("Worker")
                     })
-                    .unwrap_or(false)
-            {
-                return lower_worker_new(ctx, new_expr);
+                    .unwrap_or(false);
+                // Bun and browsers expose Worker as a global constructor. The
+                // AOT representation is the same dedicated WorkerNew node used
+                // by node:worker_threads: collect_modules discovers and
+                // compiles its entry, and codegen passes the entry function to
+                // the in-process worker runtime. Preserve ordinary lexical
+                // shadowing (`class Worker {}` / a parameter named Worker).
+                if imported_worker || !shadowed_by_user_binding {
+                    return lower_worker_new(ctx, new_expr);
+                }
             }
 
             // #1677 `new Function(...)` handling, when `Function` is not
