@@ -8,6 +8,14 @@
 use super::*;
 
 pub(crate) const API_MANIFEST_PART_2: &[ApiEntry] = &[
+    // #8511: deliberately narrow TypeScript runtime compatibility. These are
+    // the only value exports audited in OpenCode Code Mode; strict manifest
+    // gating makes every other TypeScript compiler API fail explicitly.
+    method("typescript", "transpileModule", false, None),
+    method("typescript", "flattenDiagnosticMessageText", false, None),
+    property("typescript", "ScriptTarget"),
+    property("typescript", "ModuleKind"),
+    property("typescript", "DiagnosticCategory"),
     method_sig(
         "@parcel/watcher",
         "subscribe",
@@ -1224,6 +1232,10 @@ pub(crate) const API_MANIFEST_PART_2: &[ApiEntry] = &[
     method("worker_threads", "once", true, Some("Worker")),
     method("worker_threads", "off", true, Some("Worker")),
     method("worker_threads", "terminate", true, Some("Worker")),
+    // #8527 — global Web Worker AOT compile added the dispatch row
+    // (NativeModSig in native_table/extras.rs) without a manifest
+    // counterpart; this closes that drift.
+    method("worker_threads", "reload", true, Some("Worker")),
     // #4917 — real: `ref()`/`unref()` flip `WorkerRecord.refed`, which
     // `js_worker_threads_has_pending` checks to keep the event loop alive
     // (a live refed worker holds the process; `unref()` releases it).

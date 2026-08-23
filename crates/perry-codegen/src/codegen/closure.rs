@@ -612,6 +612,12 @@ pub(super) fn compile_closure(
         // which spans the body.
         let capture_root_slots =
             u32::from(captures_this || enclosing_class.is_some()) + u32::from(captures_new_target);
+        crate::codegen::helpers::maybe_spill_roots_to_shadow_frame(
+            lf,
+            &llvm_name,
+            m.len() + capture_root_slots as usize,
+            body,
+        );
         lf.enable_shadow_frame(m.len() as u32 + capture_root_slots);
         m
     } else {
@@ -971,6 +977,8 @@ pub(super) fn compile_closure(
         closure_rest_params,
         local_closure_func_ids: HashMap::new(),
         local_closure_param_counts: HashMap::new(),
+        resolved_arrow_callback_targets: HashMap::new(),
+        local_func_ref_ids: HashMap::new(),
         option_object_locals: HashMap::new(),
         object_literal_locals: HashSet::new(),
         namespace_imports: &cross_module.namespace_imports,
@@ -1087,6 +1095,7 @@ pub(super) fn compile_closure(
         typed_i1_function_param_reps: &cross_module.typed_i1_function_param_reps,
         typed_f64_methods: &cross_module.typed_f64_methods,
         pshape_methods: &cross_module.pshape_methods,
+        nonnegative_index_methods: &cross_module.nonnegative_index_methods,
         pshape_tower_routable: &cross_module.pshape_tower_routable,
         proven_this: None,
         typed_i32_methods: &cross_module.typed_i32_methods,

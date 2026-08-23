@@ -357,6 +357,132 @@ pub(crate) fn inline_hot_small_max_call_sites() -> u32 {
     })
 }
 
+/// #8583: statepoint relocation estimate above which a function keeps its GC
+/// roots in a shadow frame instead of native statepoints.
+///
+/// `rewrite-statepoints-for-gc` adds one relocation per GC value live across
+/// each safepoint, so the optimizer's post-rewrite cost scales with
+/// `live_roots × safepoints`. Past a point that fan-out makes the `-Os`/`-O3`
+/// middle-end super-linear and the compile does not finish (the Claude Code
+/// bundle's 68 MB entry body measured 795 root slots × ~106k safepoints ≈ 8.4e7
+/// and grew 439k → 6.5M instructions under RS4GC; without RS4GC the same unit
+/// optimized at `-Os` in ~5s). Real functions sit orders of magnitude below
+/// this: hundreds of call sites times tens of slots is ~1e4–1e5.
+///
+/// The default (#8620) is measured, not guessed. Synthetic entry functions with
+/// a controlled `slots × safepoints` estimate were compiled at `-Os` with
+/// spilling OFF (pure RS4GC fan-out) and the `@main` codegen unit timed:
+///
+/// | estimate | fan-out finish |
+/// |---------:|---------------:|
+/// |     8.0M |         ~325 s |
+/// |    16.0M |         ~235 s |
+/// |    32.0M |  ~511 s (8.5m) |
+/// |    40.0M |  did not finish in 20 min |
+/// |    48.0M |  did not finish in 20 min |
+///
+/// The fan-out cliff sits between 32M and 40M, so the default is the largest
+/// estimate whose fan-out still finished in bounded time. Below it fan-out is
+/// the cheaper lowering — spilling a moderate function costs more than the
+/// fan-out it avoids (an ~8M function spilled in 303 s vs 180 s fanned out,
+/// #8620) — and above it fan-out risks not finishing and the shadow frame wins.
+/// The former 4M default fired on ~8M functions that fan out fine in minutes.
+/// The post-RS4GC instruction-budget assertion (#8586, inprocess.rs) backstops
+/// any function this estimate misses: it fails loudly rather than hanging, so
+/// raising the threshold is safe.
+///
+/// `PERRY_ROOT_SPILL_RELOCATIONS=<n>` overrides it; `0` disables spilling
+/// (every function stays on native statepoints, the pre-#8583 behavior).
+const DEFAULT_ROOT_SPILL_RELOCATIONS: usize = 32_000_000;
+
+fn root_spill_relocation_threshold() -> usize {
+    std::env::var("PERRY_ROOT_SPILL_RELOCATIONS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_ROOT_SPILL_RELOCATIONS)
+}
+
+/// The relocation estimate for a function with `slot_count` GC-root slots and
+/// a body containing `safepoint_sites` call-like expressions. Saturating so a
+/// pathological product cannot wrap.
+pub(crate) fn root_relocation_estimate(slot_count: usize, safepoint_sites: usize) -> usize {
+    slot_count.saturating_mul(safepoint_sites)
+}
+
+#[cfg(test)]
+mod root_spill_default_tests {
+    use super::{root_relocation_estimate, DEFAULT_ROOT_SPILL_RELOCATIONS};
+
+    /// #8620: the default is pinned to the measured RS4GC fan-out cliff — the
+    /// largest estimate whose fan-out finished in bounded time (32M finished in
+    /// ~8.5 min; 40M/48M did not finish in 20 min). Change it only with fresh
+    /// measurement.
+    #[test]
+    fn default_sits_at_the_measured_fan_out_cliff() {
+        assert_eq!(DEFAULT_ROOT_SPILL_RELOCATIONS, 32_000_000);
+    }
+
+    /// The moderate case the old 4M default wrongly spilled (#8620): ~8M
+    /// relocations (4000 root slots × ~2001 safepoints) fans out in minutes, so
+    /// under the new default it stays on native statepoints.
+    #[test]
+    fn moderate_fan_out_stays_on_statepoints() {
+        let est = root_relocation_estimate(4000, 2001);
+        assert_eq!(est, 8_004_000);
+        assert!(
+            est <= DEFAULT_ROOT_SPILL_RELOCATIONS,
+            "moderate estimate {est} must not exceed the default (would spill)",
+        );
+    }
+
+    /// The genuinely-catastrophic case (Claude Code `cli.js` `@main`,
+    /// ~795 slots × ~106k safepoints ≈ 8.4e7, never finishes at `-Os`) must
+    /// still spill under the new default.
+    #[test]
+    fn catastrophic_fan_out_still_spills() {
+        let est = root_relocation_estimate(795, 106_000);
+        assert!(
+            est > DEFAULT_ROOT_SPILL_RELOCATIONS,
+            "catastrophic estimate {est} must exceed the default (should spill)",
+        );
+    }
+}
+
+/// Decide whether `func` should spill its roots to the shadow frame, and if so
+/// mark it (BEFORE its `enable_*_shadow_frame` call) and report it. Only
+/// meaningful under native stack-map roots — the shadow frame is already the
+/// lowering otherwise. Reporting is at default verbosity because #8421 requires
+/// that a change to how a function is compiled is never silent; the message
+/// states that the optimization level is unchanged.
+pub(super) fn maybe_spill_roots_to_shadow_frame(
+    func: &mut crate::function::LlFunction,
+    fn_name: &str,
+    slot_count: usize,
+    body: &[perry_hir::Stmt],
+) {
+    if !native_stack_roots_enabled() {
+        return;
+    }
+    let threshold = root_spill_relocation_threshold();
+    if threshold == 0 {
+        return;
+    }
+    let sites = crate::collectors::count_safepoint_sites(body);
+    let estimate = root_relocation_estimate(slot_count, sites);
+    if estimate <= threshold {
+        return;
+    }
+    func.request_shadow_frame_spill();
+    eprintln!(
+        "perry: `{fn_name}` keeps its {slot_count} GC roots in a shadow frame instead of \
+         statepoints: an estimated {estimate} relocations ({slot_count} roots × {sites} \
+         safepoints) would make rewrite-statepoints-for-gc fan-out super-linear in the \
+         optimizer (> {threshold}). The function is still compiled at the requested \
+         optimization level; only its GC-root representation changes, and its roots stay \
+         precise (#8583). Override with PERRY_ROOT_SPILL_RELOCATIONS."
+    );
+}
+
 pub(super) fn enable_module_init_shadow_frame(
     func: &mut crate::function::LlFunction,
     stmts: &[perry_hir::Stmt],
@@ -368,6 +494,10 @@ pub(super) fn enable_module_init_shadow_frame(
 
     let shadow_slot_map =
         crate::collectors::collect_pointer_typed_locals(&[], stmts, flat_const_ids);
+    // #8583: the module-entry body is the minified-bundle IIFE — the function
+    // that fans out catastrophically under RS4GC. Decide its root lowering
+    // before the frame is built.
+    maybe_spill_roots_to_shadow_frame(func, "main", shadow_slot_map.len(), stmts);
     func.enable_post_init_shadow_frame(shadow_slot_map.len() as u32);
     let shadow_slot_clears_after_stmt =
         crate::collectors::collect_shadow_slot_clear_points(stmts, &shadow_slot_map);

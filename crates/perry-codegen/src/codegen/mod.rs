@@ -183,8 +183,13 @@ mod ctor_arity;
 #[cfg(test)]
 mod emission_order_tests;
 mod entry;
+pub mod entry_outline;
 mod func_registry;
 mod function;
+#[cfg(test)]
+mod hoisted_callback_method_tests;
+#[cfg(test)]
+mod index_method_clone_tests;
 // `pub(crate)` so `crate::linker` can read the inline-hot-small policy
 // (`inline_hot_small_enabled` / `inline_hot_small_hint_threshold`).
 #[cfg(test)]
@@ -217,6 +222,7 @@ mod typed_abi_opt_report;
 mod unknown_func_tests;
 
 pub(crate) use closure::emit_typed_capture_guard;
+pub(crate) use function::arena_threaded_function_body_name;
 pub use helpers::resolve_target_triple;
 pub(crate) use helpers::{
     decide_codegen_units, decide_full_outline_ic, default_target_triple, full_outline_ic_enabled,
@@ -230,12 +236,13 @@ pub(crate) use param_guard::scalar_descriptor_rep;
 pub(crate) use spec_abi::{spec_abi_enabled, spec_function_name, SpecDispatch, SpecFnPlan};
 pub(crate) use typed_abi::{
     emit_typed_arg_guard, emit_typed_arg_to_raw, generic_closure_body_name,
-    generic_function_body_name, generic_method_body_name, typed_arg_is_guard_candidate,
-    typed_f64_closure_name, typed_f64_function_name, typed_f64_method_name,
-    typed_f64_receiver_method_info, typed_f64_receiver_method_name, typed_i1_closure_name,
-    typed_i1_function_name, typed_i1_method_name, typed_i32_closure_name, typed_i32_function_name,
-    typed_i32_method_name, typed_param_reps_match_args, typed_string_closure_name,
-    typed_string_function_name, typed_string_method_name, TypedParamRep, TypedReceiverMethodInfo,
+    generic_function_body_name, generic_method_body_name, nonnegative_index_method_name,
+    typed_arg_is_guard_candidate, typed_f64_closure_name, typed_f64_function_name,
+    typed_f64_method_name, typed_f64_receiver_method_info, typed_f64_receiver_method_name,
+    typed_i1_closure_name, typed_i1_function_name, typed_i1_method_name, typed_i32_closure_name,
+    typed_i32_function_name, typed_i32_method_name, typed_param_reps_match_args,
+    typed_string_closure_name, typed_string_function_name, typed_string_method_name, TypedParamRep,
+    TypedReceiverMethodInfo,
 };
 
 use artifacts::{emit_module_artifacts, ModuleArtifactsCtx};
@@ -345,6 +352,9 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
     // afresh for every module — including the `false` case, to clear any prior
     // module's decision on this thread.
     set_full_outline_ic(decide_full_outline_ic(module_callable_count(hir)));
+    // #8595: report the module-entry outlining analysis when asked. Pure
+    // diagnostic — no transform yet (see codegen/entry_outline.rs).
+    entry_outline::report_entry_outlining(hir);
     // FEAT_JSCVT decision is per-target (apple-arm64 only) — same
     // set-per-module discipline as the outline gate above.
     helpers::set_jscvt_for_target(&triple);
@@ -586,12 +596,17 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         let imported_getters: Vec<perry_hir::Function> = ic
             .getter_names
             .iter()
-            .map(|prop| perry_hir::Function {
+            .enumerate()
+            .map(|(index, prop)| perry_hir::Function {
                 id: 0,
                 name: format!("get_{}", prop),
                 type_params: Vec::new(),
                 params: Vec::new(),
-                return_type: perry_hir::types::Type::Any,
+                return_type: ic
+                    .getter_return_types
+                    .get(index)
+                    .cloned()
+                    .unwrap_or(perry_hir::types::Type::Any),
                 body: Vec::new(),
                 is_async: false,
                 is_generator: false,
@@ -670,12 +685,17 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             methods: ic
                 .method_names
                 .iter()
-                .map(|m| perry_hir::Function {
+                .enumerate()
+                .map(|(index, m)| perry_hir::Function {
                     id: 0,
                     name: m.clone(),
                     type_params: Vec::new(),
                     params: Vec::new(),
-                    return_type: perry_hir::types::Type::Any,
+                    return_type: ic
+                        .method_return_types
+                        .get(index)
+                        .cloned()
+                        .unwrap_or(perry_hir::types::Type::Any),
                     body: Vec::new(),
                     is_async: false,
                     is_generator: false,
@@ -702,7 +722,93 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             static_accessor_names: Vec::new(),
             static_accessor_fn_ids: Vec::new(),
             static_fields: Vec::new(),
-            static_methods: Vec::new(),
+            static_methods: ic
+                .static_method_names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    // The body/default expressions remain in the producer,
+                    // but imported static dispatch still needs the declared
+                    // width and trailing rest/`arguments` shape to forward
+                    // arguments with the producer's ABI. Synthetic params are
+                    // sufficient because no imported stub body is compiled.
+                    let declared = ic
+                        .static_method_param_counts
+                        .get(index)
+                        .copied()
+                        .unwrap_or(0);
+                    let has_rest = ic
+                        .static_method_has_rest
+                        .get(index)
+                        .copied()
+                        .unwrap_or(false);
+                    let has_user_rest = ic
+                        .static_method_has_user_rest
+                        .get(index)
+                        .copied()
+                        .unwrap_or(false);
+                    let last_is_synthetic_arguments = ic
+                        .static_method_has_synthetic_arguments
+                        .get(index)
+                        .copied()
+                        .unwrap_or(false);
+                    let params = (0..declared)
+                        .map(|param_index| {
+                            let is_last = param_index + 1 == declared;
+                            let is_user_rest = has_user_rest
+                                && if last_is_synthetic_arguments {
+                                    param_index + 2 == declared
+                                } else {
+                                    is_last
+                                };
+                            let is_synthetic_rest = is_last
+                                && last_is_synthetic_arguments
+                                && has_rest
+                                && !has_user_rest;
+                            let is_legacy_rest = is_last
+                                && !last_is_synthetic_arguments
+                                && has_rest
+                                && !has_user_rest;
+                            perry_hir::Param {
+                                id: param_index as perry_hir::types::LocalId,
+                                name: format!("arg{param_index}"),
+                                ty: perry_hir::types::Type::Any,
+                                default: None,
+                                decorators: Vec::new(),
+                                is_rest: is_user_rest || is_synthetic_rest || is_legacy_rest,
+                                arguments_object: (is_last && last_is_synthetic_arguments).then(
+                                    || perry_hir::ArgumentsObjectMeta {
+                                        strict: true,
+                                        simple_parameters: false,
+                                        mapped_parameter_ids: Vec::new(),
+                                        restricted_callee: true,
+                                    },
+                                ),
+                            }
+                        })
+                        .collect();
+                    perry_hir::Function {
+                        id: 0,
+                        name: name.clone(),
+                        type_params: Vec::new(),
+                        params,
+                        return_type: ic
+                            .static_method_return_types
+                            .get(index)
+                            .cloned()
+                            .unwrap_or(perry_hir::types::Type::Any),
+                        body: Vec::new(),
+                        is_async: false,
+                        is_generator: false,
+                        is_strict: true,
+                        was_plain_async: false,
+                        was_unrolled: false,
+                        is_exported: false,
+                        captures: Vec::new(),
+                        decorators: Vec::new(),
+                    }
+                })
+                .collect(),
             computed_members: Vec::new(),
             decorators: Vec::new(),
             is_exported: false,
@@ -1471,6 +1577,33 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
                 }
             }
         }
+        for (i, method_name) in ic.static_method_names.iter().enumerate() {
+            let registry_name = static_method_registry_key(method_name);
+            let count = ic.static_method_param_counts.get(i).copied().unwrap_or(0);
+            method_param_counts.insert((ic.name.clone(), registry_name.clone()), count);
+            if effective_name != ic.name {
+                method_param_counts.insert((effective_name.clone(), registry_name.clone()), count);
+            }
+            if ic.static_method_has_rest.get(i).copied().unwrap_or(false) {
+                method_has_rest.insert((ic.name.clone(), registry_name.clone()), true);
+                if effective_name != ic.name {
+                    method_has_rest.insert((effective_name.clone(), registry_name.clone()), true);
+                }
+            }
+            if ic
+                .static_method_has_synthetic_arguments
+                .get(i)
+                .copied()
+                .unwrap_or(false)
+            {
+                method_has_synthetic_arguments
+                    .insert((ic.name.clone(), registry_name.clone()), true);
+                if effective_name != ic.name {
+                    method_has_synthetic_arguments
+                        .insert((effective_name.clone(), registry_name), true);
+                }
+            }
+        }
     }
 
     // Refs #915 (gap 3 / #321 follow-up): tag functions whose body
@@ -1607,6 +1740,16 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
     let mut typed_string_methods = std::collections::HashSet::new();
     let mut typed_i1_method_param_reps = std::collections::HashMap::new();
     let mut typed_f64_receiver_methods = std::collections::HashMap::new();
+    let nonnegative_index_methods: std::collections::HashMap<(String, String), Vec<u32>> = hir
+        .classes
+        .iter()
+        .flat_map(|class| {
+            class.methods.iter().filter_map(move |method| {
+                let params = typed_abi::nonnegative_index_method_params(method);
+                (!params.is_empty()).then(|| ((class.name.clone(), method.name.clone()), params))
+            })
+        })
+        .collect();
     progress.checkpoint("cross-module and typed-ABI analysis");
 
     // Module-wide dispatch/barrier facts. Hoisted above the typed-clone
@@ -1855,6 +1998,10 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
     // a class only gets a site entry if module init will actually compose its
     // image. A site entry with no init store would hand every instance a
     // zeroed header, so that direction of the dependency is load-bearing.
+    let imported_stub_names: std::collections::HashSet<&str> = imported_class_stubs
+        .iter()
+        .map(|class| class.name.as_str())
+        .collect();
     let class_header_image_inits: std::collections::HashMap<String, (u32, u64)> = {
         let mut inits: std::collections::HashMap<String, (u32, u64)> =
             std::collections::HashMap::new();
@@ -1865,13 +2012,24 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             let Some(&class_id) = class_ids.get(class_name) else {
                 continue;
             };
-            let typed_layout = crate::lower_call::typed_shape_init::layout_at_allocation_in(
-                &class_table,
-                &class_keys_globals_map,
-                &class_init_chains_map,
-                class_name,
-                field_count,
-            );
+            // An imported stub has no defining constructor body, so this
+            // module cannot prove that its layout is declarable before that
+            // constructor runs. More importantly, minting a typed ShapeId
+            // here while the producer minted an ordinary one gives the same
+            // runtime class two exact identities across modules. Keep the
+            // consumer on the canonical structural identity and validate the
+            // typed layout after the producer's constructor returns.
+            let typed_layout = if imported_stub_names.contains(class_name.as_str()) {
+                crate::target_layout::InlineTypedLayout::None
+            } else {
+                crate::lower_call::typed_shape_init::layout_at_allocation_in(
+                    &class_table,
+                    &class_keys_globals_map,
+                    &class_init_chains_map,
+                    class_name,
+                    field_count,
+                )
+            };
             let gc_packed =
                 crate::target_layout::inline_alloc_gc_packed(&triple, field_count, typed_layout);
             match inits.get(keys_global) {
@@ -2002,6 +2160,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         // no call-site cap (the cap prices `inlinehint`'s duplication, which
         // the inline bump allocator does not incur), plus direct recursion.
         alloc_hot_functions: crate::collectors::collect_alloc_hot_functions(hir),
+        arena_threaded_functions: crate::collectors::collect_self_recursive_allocators(hir),
         clamp3_functions: hir
             .functions
             .iter()
@@ -2042,6 +2201,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         typed_string_methods,
         typed_i1_method_param_reps,
         typed_f64_receiver_methods,
+        nonnegative_index_methods,
         pshape_methods,
         pshape_tower_routable,
         typed_f64_closures: std::collections::HashSet::new(),

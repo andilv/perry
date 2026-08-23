@@ -24,7 +24,7 @@ use crate::native_value::{
 };
 use crate::strings::StringPool;
 use crate::type_analysis::{is_bigint_expr, is_bool_expr, is_numeric_expr};
-use crate::types::{DOUBLE, F32, I1, I16, I32, I64, I8};
+use crate::types::{DOUBLE, F32, I1, I16, I32, I64, I8, PTR};
 
 // Issue #1098: expr.rs split into expr/ submodules. These are pure
 // mechanical moves of self-contained helper clusters out of this file;
@@ -567,6 +567,15 @@ pub(crate) struct FnCtx<'a> {
     /// `local_closure_func_ids` for guarded direct closure calls: direct
     /// calls only fire when the static arity exactly matches the call site.
     pub local_closure_param_counts: std::collections::HashMap<u32, usize>,
+    /// Nullable code pointers resolved once from immutable method callback
+    /// parameters, indexed by callback local (including exact const aliases)
+    /// and call arity.
+    pub resolved_arrow_callback_targets: std::collections::HashMap<(u32, usize), String>,
+    /// Immutable local aliases of same-module function declarations.
+    /// Calling one is semantically the same as calling its `FuncRef` directly;
+    /// retain the runtime function object in the local for identity/property
+    /// observations, but bypass closure dispatch at call sites.
+    pub local_func_ref_ids: std::collections::HashMap<u32, u32>,
     /// LocalId → compile-time options object fields for immutable locals
     /// initialized from object literals / anonymous-shape literals. This lets
     /// native constructor lowering read `const init = {...}; new Request(url,
@@ -826,13 +835,9 @@ pub(crate) struct FnCtx<'a> {
     /// the trust into a four-instruction runtime tag test instead.
     pub declared_only_numeric_locals: std::collections::HashSet<u32>,
 
-    /// Cached pointer to this function's `InlineArenaState` slot —
-    /// allocated lazily on the first `new ClassName()` site that uses
-    /// the inline bump-allocator path. The slot lives in the function
-    /// entry block (via `LlFunction::entry_init_call_ptr`) and holds
-    /// the result of a one-time `js_inline_arena_state()` call. Each
-    /// subsequent `new` in the function loads from this slot instead
-    /// of paying a TLS access per allocation.
+    /// Cached pointer to this function's `InlineArenaState` slot. Ordinary
+    /// functions populate it with the runtime accessor; arena-threaded
+    /// recursive bodies seed it from their hidden pointer parameter.
     ///
     /// `None` until the first `new` lowers; thereafter `Some(slot_name)`
     /// (e.g. `"%r3"`).
@@ -1033,6 +1038,12 @@ pub(crate) struct FnCtx<'a> {
     /// declarations only), which is what rules out a subclass `this`.
     pub pshape_methods:
         &'a std::collections::HashMap<(String, String), crate::collectors::PtrShapeLocal>,
+
+    /// Module-local methods whose nonnegative-index clone was actually
+    /// emitted. Call lowering gates on this registry rather than re-running
+    /// eligibility over `classes`, which also contains imported structural
+    /// stubs.
+    pub nonnegative_index_methods: &'a std::collections::HashMap<(String, String), Vec<u32>>,
 
     /// #7142: the subset of [`Self::pshape_methods`] the class-id dispatch
     /// tower may route to. A profitability filter only — see
@@ -1849,6 +1860,22 @@ fn inline_cache_global_name_for_prefix(module_prefix: &str, site_id: u32) -> Str
     }
 }
 
+/// #8591: return this invocation's cached inline-arena state.
+///
+/// Recursive allocator bodies may seed the cache from a hidden parameter;
+/// every other function lazily emits the ordinary entry accessor when its
+/// first inline allocation site is lowered.
+pub(crate) fn load_inline_arena_state(ctx: &mut FnCtx<'_>) -> String {
+    let arena_state_slot = if let Some(slot) = ctx.arena_state_slot.clone() {
+        slot
+    } else {
+        let slot = ctx.func.entry_init_call_ptr("js_inline_arena_state");
+        ctx.arena_state_slot = Some(slot.clone());
+        slot
+    };
+    ctx.block().load(PTR, &arena_state_slot)
+}
+
 #[cfg(test)]
 mod inline_cache_name_tests {
     use super::inline_cache_global_name_for_prefix;
@@ -2121,9 +2148,13 @@ mod index_get;
 #[cfg(test)]
 mod index_get_claim_tests;
 mod masked_window;
+#[cfg(test)]
+mod null_default_numeric_add_tests;
 mod ptr_numarray_access;
 mod ta_param_f64_read;
-pub(crate) use index_get::packed_f64_loop_index_parts;
+pub(crate) use index_get::{
+    numeric_index_has_integer_array_index_proof, packed_f64_loop_index_parts,
+};
 pub(crate) use masked_window::masked_window_fact_for_index;
 /// Rooting coverage for the computed-store arms the TS corpora cannot reach
 /// (#7637, #7638, #7639) — see the module header for why they cannot.
@@ -2871,8 +2902,35 @@ fn lower_bitwise_operand_i32(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<Option<
         }
     }
 
-    let Some(lowered) = lower_numeric_operand_value(ctx, expr)? else {
-        return Ok(None);
+    // Region proofs cover bounds-checked typed-array reads such as
+    // `P[++i]`.  `lower_expr_value` intentionally does not expose every such
+    // read, but the native-i32 lowering has the exact checked access path we
+    // need for a bitwise operand.
+    if can_lower_expr_as_i32_in_current_region(ctx, expr) {
+        return Ok(Some(
+            lower_expr_native(ctx, expr, ExpectedNativeRep::I32)?.value,
+        ));
+    }
+
+    let lowered = match lower_numeric_operand_value(ctx, expr)? {
+        Some(lowered) => lowered,
+        // Mutable numeric accumulators do not have a stable plain-f64 slot
+        // proof for `lower_expr_value`, even when the whole-region write proof
+        // establishes that every value is a Number.  Materialize only this
+        // non-recursive leaf and apply the bitwise operator's required
+        // ToInt32 conversion; nested bitwise expressions continue through the
+        // native structural path above.
+        None if matches!(expr, Expr::LocalGet(id)
+                if ctx.number_by_construction_locals.contains(id)) =>
+        {
+            let value = lower_expr(ctx, expr)?;
+            return Ok(Some(if is_known_finite(ctx, expr) {
+                ctx.block().toint32_fast(&value)
+            } else {
+                ctx.block().toint32_wrap(&value)
+            }));
+        }
+        None => return Ok(None),
     };
     let value = match lowered.rep {
         NativeRep::I32 | NativeRep::U32 | NativeRep::BufferLen => lowered.value,

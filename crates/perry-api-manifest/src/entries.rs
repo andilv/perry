@@ -48,7 +48,6 @@ pub const NATIVE_MODULES: &[&str] = &[
     "dotenv/config",  // dotenv's auto-load-on-import subpath
     "jsonwebtoken",   // JWT sign/verify
     "nanoid",         // compact URL-safe ID generation
-    "slugify",        // string → URL slug
     "validator",      // string validators/sanitizers
     "ethers",         // Ethereum library (utils/wallet/ABI)
     "mongodb",        // MongoDB driver
@@ -199,6 +198,9 @@ pub const NATIVE_MODULES: &[&str] = &[
     "@parcel/watcher-linux-arm64-musl",
     "@parcel/watcher-win32-x64",
     "@parcel/watcher-win32-arm64",
+    // #8511: the runtime `transpileModule` subset used by OpenCode Code Mode.
+    // The upstream compiler is deliberately not compiled into the app.
+    "typescript",
 ];
 
 /// Node built-in submodules that Perry routes through the

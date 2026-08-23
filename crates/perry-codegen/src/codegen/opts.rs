@@ -510,6 +510,10 @@ pub struct ImportedClass {
     pub has_instance_fields: bool,
     /// Method names defined on this class.
     pub method_names: Vec<String>,
+    /// Declared return types parallel to `method_names`. Imported class stubs
+    /// retain these so a call such as `factory.make().run()` can recover the
+    /// returned receiver class without value-importing that class directly.
+    pub method_return_types: Vec<perry_hir::types::Type>,
     /// Per-method explicit param counts, parallel to `method_names`. Issue #235:
     /// codegen uses this to declare cross-module method symbols with the
     /// correct arity (was hardcoded "6 as safe upper bound", which made the
@@ -544,11 +548,29 @@ pub struct ImportedClass {
     /// missing method and fall through to `0.0` — turning every
     /// `await Foo.connect(...)` into a no-op that resolves with the number 0.
     pub static_method_names: Vec<String>,
+    /// Declared return types parallel to `static_method_names`.
+    pub static_method_return_types: Vec<perry_hir::types::Type>,
+    /// Declared parameter counts parallel to `static_method_names`. Imported
+    /// static-call lowering uses these counts to pad omitted arguments with
+    /// `undefined`, allowing the producer's default-parameter prologue to run.
+    pub static_method_param_counts: Vec<usize>,
+    /// Whether each static method has a rest-shaped HIR parameter. A hidden
+    /// `arguments` slot can follow a user-declared rest parameter.
+    pub static_method_has_rest: Vec<bool>,
+    /// Whether each static method has a user-declared rest parameter. This is
+    /// distinct from the hidden `arguments` slot: a method can have both and
+    /// then needs two trailing arrays at the cross-module call site.
+    pub static_method_has_user_rest: Vec<bool>,
+    /// Whether each static method's final HIR parameter is Perry's hidden
+    /// `arguments` binding rather than a user-declared rest parameter.
+    pub static_method_has_synthetic_arguments: Vec<bool>,
     /// Getter property names. Without these, cross-module `obj.prop` for a
     /// getter property silently falls through to `undefined` because the
     /// dispatch site at `expr.rs::PropertyGet` looks up `(class, "__get_prop")`
     /// in `method_names`, which previously had no cross-module entry.
     pub getter_names: Vec<String>,
+    /// Declared return types parallel to `getter_names`.
+    pub getter_return_types: Vec<perry_hir::types::Type>,
     /// Setter property names. Symmetric to `getter_names` for `obj.prop = v`.
     pub setter_names: Vec<String>,
     /// Parent class name, if any.
@@ -882,6 +904,12 @@ pub(crate) struct CrossModuleCtx {
     /// calling the clone.
     pub typed_f64_receiver_methods:
         std::collections::HashMap<(String, String), super::typed_abi::TypedReceiverMethodInfo>,
+    /// Module-local methods with an emitted nonnegative-index clone, mapped to
+    /// the parameter ids whose call-site proofs license that clone. Keeping an
+    /// explicit emitted-body registry prevents imported structural stubs from
+    /// manufacturing calls to clone symbols their defining module never
+    /// exported.
+    pub nonnegative_index_methods: std::collections::HashMap<(String, String), Vec<u32>>,
     /// Representation-selection Phase 5a: `(class, method)` pairs that have a
     /// generated `internal` proven-`this` clone
     /// (`collectors/proven_this.rs`). Keys are OWN declarations of
@@ -1036,4 +1064,8 @@ pub(crate) struct CrossModuleCtx {
     /// `inlinehint`, whose cost scales with call sites, and the two must not
     /// share an admission rule. See the collector's doc comment.
     pub alloc_hot_functions: std::collections::HashSet<u32>,
+    /// #8591: directly self-recursive functions with at least one `new` site.
+    /// Their internal body carries an `InlineArenaState` pointer through self
+    /// calls so recursive activations do not repeat the runtime accessor.
+    pub arena_threaded_functions: std::collections::HashSet<u32>,
 }

@@ -29,6 +29,12 @@
 # Migration order tracks #466 Phase 5 (smallest first). Each entry
 # is gated on the bundled crate actually existing in the workspace
 # — wrappers that haven't been ported yet have no entry.
+#
+# This file describes current resolver behavior, not permission to keep a
+# package-specific Rust rewrite indefinitely. Before adding or removing a
+# bundled crate, update its `migration` in `workspace-architecture.json`; CI
+# requires every ext crate and package mapping to have an explicit decision
+# (#5716).
 
 [bindings.dotenv]
 crate = "perry-ext-dotenv"
@@ -84,21 +90,6 @@ sha256 = "e062c57ed120ea135478f305da04802bf69eab23fbc0ca2bae6989b6855390c4"
 repo = "https://github.com/uuidjs/uuid"
 ref = "70177807e9229dfacde2038dc1e722f1828f358a"
 ported-at = "14.0.1"
-date = "2026-07-30"
-[bindings.slugify]
-crate = "perry-ext-slugify"
-lib = "perry_ext_slugify"
-tracking = "#466"
-# Partial: `remove`, `locale`, the complete char map, and `slugify.extend`
-# are not implemented by this wrapper.
-compat = "partial"
-
-[bindings.slugify.upstream]
-version = "1.6.9"
-sha256 = "19ab247286f687aa8803b3615eab0779f517904ec96298e5005ff4de77ff9948"
-repo = "https://github.com/simov/slugify"
-ref = "78c6ee658d61d81a3a33bc1f558b50013be9ccf6"
-ported-at = "1.6.9"
 date = "2026-07-30"
 [bindings.bcrypt]
 crate = "perry-ext-bcrypt"
@@ -717,3 +708,19 @@ crate = "perry-ext-parcel-watcher"
 lib = "perry_ext_parcel_watcher"
 tracking = "#8513"
 alias-of = "@parcel/watcher"
+# `typescript` — only the runtime transpilation API audited for OpenCode Code
+# Mode. Perry uses SWC to erase TS/TSX syntax and emit JavaScript; it does not
+# compile or embed Microsoft's complete type checker/compiler bundle.
+[bindings.typescript]
+crate = "perry-ext-typescript"
+lib = "perry_ext_typescript"
+tracking = "#8511"
+compat = "partial"
+
+[bindings.typescript.upstream]
+version = "5.8.2"
+sha256 = "ef938a45323df5775664ea5d55e8bc0ab2027a40db1ff857bb957fe7bbaa4434"
+repo = "https://github.com/microsoft/TypeScript"
+ref = "beb69e4cdd61b1a0fd9ae21ae58bd4bd409d7217"
+ported-at = "5.8.2"
+date = "2026-08-21"

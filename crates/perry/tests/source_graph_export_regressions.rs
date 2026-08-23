@@ -6,6 +6,25 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Once;
 
+const GC_ENV_OVERRIDES: &[&str] = &[
+    "PERRY_GEN_GC",
+    "PERRY_GC_SCAVENGE",
+    "PERRY_GC_SCAVENGE_NURSERY_MB",
+    "PERRY_GC_MOVING_SAFEPOINT",
+    "PERRY_GC_MOVING_LOOP_POLLS",
+    "PERRY_GC_FORCE_EVACUATE",
+    "PERRY_CONSERVATIVE_STACK_SCAN",
+    "PERRY_WRITE_BARRIERS",
+    "PERRY_GC_INCREMENTAL",
+    "PERRY_GC_HEAP_LIMIT",
+];
+
+fn remove_gc_env_overrides(command: &mut Command) {
+    for key in GC_ENV_OVERRIDES {
+        command.env_remove(key);
+    }
+}
+
 fn perry_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_perry"))
 }
@@ -56,6 +75,9 @@ fn ensure_runtime_archive() {
 }
 
 fn runtime_dir() -> PathBuf {
+    if let Some(runtime_dir) = std::env::var_os("PERRY_RUNTIME_DIR") {
+        return PathBuf::from(runtime_dir);
+    }
     ensure_runtime_archive();
     target_debug_dir()
 }
@@ -95,6 +117,304 @@ fn compile_and_run(dir: &Path, entry: &str) -> String {
         String::from_utf8_lossy(&run.stderr)
     );
     String::from_utf8_lossy(&run.stdout).into_owned()
+}
+
+fn compile_and_run_with_llvm_trace(dir: &Path, entry: &str) -> (String, String) {
+    let output = dir.join("main_bin");
+    let compile = Command::new(perry_bin())
+        .current_dir(dir)
+        .arg("compile")
+        .arg(entry)
+        .arg("--no-cache")
+        .arg("--trace")
+        .arg("llvm")
+        .arg("-o")
+        .arg(&output)
+        .env("PERRY_NO_AUTO_OPTIMIZE", "1")
+        .env("PERRY_RUNTIME_DIR", runtime_dir())
+        .output()
+        .expect("run perry compile");
+    assert!(
+        compile.status.success(),
+        "perry compile failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&output)
+        .current_dir(dir)
+        .output()
+        .expect("run compiled binary");
+    assert!(
+        run.status.success(),
+        "compiled binary failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let trace_dir = dir.join(".perry-trace/llvm");
+    let entry_stem = entry.replace(['/', '.', '-'], "_");
+    let entry_ir_path = std::fs::read_dir(&trace_dir)
+        .expect("read LLVM trace directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&entry_stem) && name.ends_with(".ll"))
+        })
+        .unwrap_or_else(|| panic!("missing LLVM trace for {entry} in {}", trace_dir.display()));
+    let entry_ir = std::fs::read_to_string(entry_ir_path).expect("read entry LLVM trace");
+
+    (String::from_utf8_lossy(&run.stdout).into_owned(), entry_ir)
+}
+
+fn compile_and_run_with_all_llvm_trace(dir: &Path, entry: &str) -> (String, String) {
+    let output = dir.join("main_bin");
+    let compile = Command::new(perry_bin())
+        .current_dir(dir)
+        .arg("compile")
+        .arg(entry)
+        .arg("--no-cache")
+        .arg("--trace")
+        .arg("llvm")
+        .arg("-o")
+        .arg(&output)
+        .env("PERRY_NO_AUTO_OPTIMIZE", "1")
+        .env("PERRY_RUNTIME_DIR", runtime_dir())
+        .output()
+        .expect("run perry compile");
+    assert!(
+        compile.status.success(),
+        "perry compile failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&output)
+        .current_dir(dir)
+        .output()
+        .expect("run compiled binary");
+    assert!(
+        run.status.success(),
+        "compiled binary failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let trace_dir = dir.join(".perry-trace/llvm");
+    let mut trace_paths: Vec<PathBuf> = std::fs::read_dir(&trace_dir)
+        .expect("read LLVM trace directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("ll"))
+        .collect();
+    trace_paths.sort();
+    let mut all_ir = String::new();
+    for path in trace_paths {
+        all_ir.push_str(&std::fs::read_to_string(path).expect("read LLVM trace"));
+        all_ir.push('\n');
+    }
+    (String::from_utf8_lossy(&run.stdout).into_owned(), all_ir)
+}
+
+fn llvm_function_body_containing(
+    ir: &str,
+    definition_contains: &str,
+    body_contains: &str,
+) -> String {
+    let lines: Vec<&str> = ir.lines().collect();
+    for start in 0..lines.len() {
+        if !lines[start].starts_with("define") || !lines[start].contains(definition_contains) {
+            continue;
+        }
+        let body = lines[start..]
+            .iter()
+            .copied()
+            .take_while(|line| *line != "}")
+            .collect::<Vec<_>>()
+            .join("\n");
+        if body.contains(body_contains) {
+            return body;
+        }
+    }
+    panic!(
+        "no definition containing {definition_contains:?} whose body contains \
+         {body_contains:?}:\n{ir}"
+    );
+}
+
+#[test]
+fn cross_module_arrow_callback_dispatch_is_resolved_once_and_fails_closed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(
+        dir.path(),
+        "sink.ts",
+        "export class Sink {\n\
+           run(callback: (a: number, b: number, c: number) => number) {\n\
+             let sum = 0;\n\
+             for (let i = 0; i < 32; i++) sum += callback(i, i + 1, i + 2);\n\
+             return sum;\n\
+           }\n\
+           ordinary(callback: (a: number, b: number, c: number) => number) {\n\
+             return callback(1, 2, 3);\n\
+           }\n\
+         }\n",
+    );
+    write(
+        dir.path(),
+        "forwarder.ts",
+        "import { Sink } from './sink';\n\
+         export class Forwarder {\n\
+           sink = new Sink();\n\
+           run(callback: (a: number, b: number, c: number) => number) {\n\
+             return this.sink.run(callback);\n\
+           }\n\
+           ordinary(callback: (a: number, b: number, c: number) => number) {\n\
+             return this.sink.ordinary(callback);\n\
+           }\n\
+         }\n",
+    );
+    write(
+        dir.path(),
+        "main.ts",
+        "import { Forwarder } from './forwarder';\n\
+         const iterator = new Forwarder();\n\
+         const total = iterator.run((a, b, c) => {\n\
+           const churn = new Array(8192);\n\
+           churn[0] = { value: a };\n\
+           return a + b + c;\n\
+         });\n\
+         function ordinary(a: number, b: number, c: number) {\n\
+           return this === undefined ? 42 : -1;\n\
+         }\n\
+         console.log(total);\n\
+         console.log(iterator.ordinary(ordinary));\n",
+    );
+
+    let (stdout, all_ir) = compile_and_run_with_all_llvm_trace(dir.path(), "main.ts");
+    assert_eq!(stdout, "1584\n42\n");
+
+    let sink_run = llvm_function_body_containing(
+        &all_ir,
+        "@perry_method_sink_ts__Sink__run",
+        "@js_closure_resolve_arrow_direct_call(",
+    );
+    assert_eq!(
+        sink_run
+            .matches("@js_closure_resolve_arrow_direct_call(")
+            .count(),
+        1,
+        "the callback target must be resolved once at method entry:\n{sink_run}"
+    );
+    assert!(
+        sink_run
+            .lines()
+            .any(|line| line.contains(" = call double %") && line.contains("i64 ")),
+        "the admitted arrow arm must call the resolved target:\n{sink_run}"
+    );
+    assert!(
+        sink_run.contains("@js_closure_call3("),
+        "the public method must retain full fallback dispatch:\n{sink_run}"
+    );
+    assert!(
+        !all_ir.contains("$callback_"),
+        "entry hoisting must not clone callback method bodies"
+    );
+
+    let mut forced_command = Command::new(dir.path().join("main_bin"));
+    forced_command.current_dir(dir.path());
+    remove_gc_env_overrides(&mut forced_command);
+    let forced = forced_command
+        .env("PERRY_GC_SCAVENGE", "1")
+        .env("PERRY_GC_SCAVENGE_NURSERY_MB", "1")
+        .env("PERRY_GC_FORCE_EVACUATE", "1")
+        .env("PERRY_GC_VERIFY_EVACUATION", "1")
+        .env("PERRY_GC_INCREMENTAL", "0")
+        .output()
+        .expect("run compiled binary with forced evacuation");
+    assert!(
+        forced.status.success(),
+        "forced-evacuation run failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&forced.stdout),
+        String::from_utf8_lossy(&forced.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&forced.stdout), "1584\n42\n");
+}
+
+#[test]
+fn imported_class_return_types_pull_in_transitive_dispatch_metadata() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(
+        dir.path(),
+        "returned.ts",
+        "export class Returned {\n\
+           value: number;\n\
+           constructor(value = 0) { this.value = value; }\n\
+           methodPing() { return 41; }\n\
+           getterPing() { return 42; }\n\
+           staticPing() { return 43; }\n\
+           valuePing() { return this.value; }\n\
+         }\n\
+         export function makeReturned(value = 0) { return new Returned(value); }\n",
+    );
+    write(
+        dir.path(),
+        "factory.ts",
+        "import { makeReturned } from './returned';\n\
+         import type { Returned as Result } from './returned';\n\
+         class Hidden { pong() { return 44; } }\n\
+         export class Factory {\n\
+           make(): Result { return makeReturned(); }\n\
+           get result(): Result { return makeReturned(); }\n\
+           static create(): Result { return makeReturned(); }\n\
+           static defaulted(value = 45): Result {\n\
+             return makeReturned(value);\n\
+           }\n\
+           static rested(head: number, ...tail: number[]): Result {\n\
+             return makeReturned(head + tail.length);\n\
+           }\n\
+           static argumentsBacked(head: number): Result {\n\
+             return makeReturned(head + arguments.length);\n\
+           }\n\
+           static restAndArguments(head: number, ...tail: number[]): Result {\n\
+             return makeReturned(head + tail.length + arguments.length);\n\
+           }\n\
+           hidden(): Hidden { return new Hidden(); }\n\
+         }\n",
+    );
+    write(
+        dir.path(),
+        "main.ts",
+        "import { Factory } from './factory';\n\
+         const overridden = new Factory().make();\n\
+         (overridden as any).methodPing = () => 99;\n\
+         console.log(\n\
+           overridden.methodPing(),\n\
+           new Factory().result.getterPing(),\n\
+           Factory.create().staticPing(),\n\
+           new Factory().hidden().pong(),\n\
+           Factory.defaulted().valuePing(),\n\
+           Factory.rested(45, 1, 2).valuePing(),\n\
+           Factory.argumentsBacked(45, 1, 2).valuePing(),\n\
+           Factory.restAndArguments(40, 1, 2).valuePing(),\n\
+         );\n",
+    );
+
+    let (stdout, entry_ir) = compile_and_run_with_llvm_trace(dir.path(), "main.ts");
+    assert_eq!(stdout, "99 42 43 44 45 47 48 45\n");
+    for symbol in [
+        "perry_method_returned_ts__Returned__methodPing",
+        "perry_method_returned_ts__Returned__getterPing",
+        "perry_method_returned_ts__Returned__staticPing",
+        "perry_method_returned_ts__Returned__valuePing",
+        "perry_method_factory_ts__Hidden__pong",
+    ] {
+        assert!(
+            entry_ir.contains(&format!("call double @{symbol}(")),
+            "the consumer did not route the returned instance directly through {symbol}:\n{entry_ir}"
+        );
+    }
 }
 
 #[test]

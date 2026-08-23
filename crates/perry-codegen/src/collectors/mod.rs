@@ -18,6 +18,7 @@ mod escape_check;
 mod escape_news;
 mod escape_objects;
 mod hir_facts;
+mod hoisted_callback_calls;
 mod hot_callees;
 mod i32_locals;
 mod index_uses;
@@ -42,6 +43,7 @@ mod ptr_shape_report;
 mod ptr_shape_returns;
 mod refs;
 mod repsel_benefit;
+mod safepoint_sites;
 mod scalar_method_dispatch;
 mod scalar_methods;
 mod shadow_slots;
@@ -65,13 +67,16 @@ pub(crate) use hir_facts::{
     collect_native_region_fact_graph, collect_native_region_fact_graph_with_spec_params,
     NativeRegionFactGraph,
 };
+pub(crate) use hoisted_callback_calls::collect_hoisted_callback_calls;
 pub(crate) use hot_callees::{
     collect_alloc_hot_functions, collect_hot_loop_callees, collect_recursion_participants,
+    collect_self_recursive_allocators,
 };
 pub(crate) use i32_locals::{
     collect_integer_let_ids, collect_localset_ids_in_stmts, is_strictly_i32_bounded_expr,
     is_ushr_zero,
 };
+pub(crate) use index_uses::collect_index_used_locals;
 pub(crate) use int_valued_i64_locals::ceil_log2_abs;
 pub(crate) use integer_locals::{
     collect_flat_row_aliases, is_int32_producing_expr, static_index_window,
@@ -82,7 +87,8 @@ pub(crate) use number_by_construction::collect_number_by_construction_locals;
 pub(crate) use param_ranges::{collect_param_int_ranges, ParamIntRanges};
 pub(crate) use pointer_locals::collect_pointer_typed_locals;
 pub(crate) use proven_this::{
-    method_proven_this, prune_unregistered_clones, pshape_method_name,
+    method_proven_this, prune_unregistered_clones, pshape_method_name, ptr_array_cache_fields,
+    ptr_array_cache_method_name, ptr_array_cached_method,
     tower_route_profitable as pshape_tower_route_profitable,
 };
 pub(crate) use ptr_numarray::{NumArrayDensity, NumArrayLocal};
@@ -92,6 +98,7 @@ pub(crate) use ptr_shape_returns::collect_exported_return_shapes;
 pub(crate) use refs::{
     collect_let_ids, collect_ref_ids_in_expr, collect_ref_ids_in_stmts, is_clamp_call,
 };
+pub(crate) use safepoint_sites::count_safepoint_sites;
 pub(crate) use scalar_method_dispatch::{
     collect_module_dispatch_facts, mark_unstable_scalar_method_receivers, ModuleDispatchFacts,
 };

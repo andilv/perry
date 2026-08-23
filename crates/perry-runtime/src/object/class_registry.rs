@@ -51,6 +51,8 @@ mod state;
 mod vm_brand;
 
 // ── state.rs ────────────────────────────────────────────────────────────────
+#[cfg(test)]
+pub(crate) use state::class_decl_prototype_object_root_store;
 pub(crate) use state::{
     class_decl_prototype_object, class_decl_prototype_value,
     class_decl_prototype_value_for_instance_class, class_delete_own_dynamic_prop,
@@ -103,7 +105,8 @@ pub(crate) use prototype_methods::CLASS_PROTOTYPE_FAST_GUARDS_INVALIDATED;
 // ── prototype_methods.rs ────────────────────────────────────────────────────
 pub(crate) use prototype_methods::{
     class_prototype_fast_guards_invalidated, class_prototype_method_root_store,
-    mirror_prototype_method_on_object, synthetic_class_id_for_function,
+    invalidate_class_prototype_fast_guards, mirror_prototype_method_on_object,
+    synthetic_class_id_for_function,
 };
 pub use prototype_methods::{
     js_class_register_static_field, js_get_function_prototype_method,

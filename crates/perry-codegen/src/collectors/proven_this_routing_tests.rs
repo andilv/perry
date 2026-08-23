@@ -102,6 +102,18 @@ fn field(name: &str, ty: Type) -> ClassField {
     }
 }
 
+fn array_field(name: &str) -> ClassField {
+    ClassField {
+        name: name.to_string(),
+        key_expr: None,
+        ty: Type::Array(Box::new(Type::Number)),
+        init: Some(Expr::Array(Vec::new())),
+        is_private: false,
+        is_readonly: false,
+        decorators: Vec::new(),
+    }
+}
+
 fn param(id: u32, name: &str, ty: Type) -> Param {
     Param {
         id,
@@ -400,6 +412,129 @@ fn ptr_shape_local_module() -> Module {
     m
 }
 
+/// A small Registry-shaped class for #8607. Repeated `this.keys` /
+/// `this.vals` reads in the loop are the shape whose guarded array accesses
+/// become ordinary local-array accesses in the contained-receiver clone.
+fn array_registry_class() -> Class {
+    let scan = func(
+        110,
+        "scan",
+        Vec::new(),
+        Type::Number,
+        vec![
+            Stmt::Let {
+                id: 111,
+                name: "sum".to_string(),
+                ty: Type::Number,
+                mutable: true,
+                init: Some(Expr::Number(0.0)),
+            },
+            Stmt::For {
+                init: Some(Box::new(Stmt::Let {
+                    id: 112,
+                    name: "i".to_string(),
+                    ty: Type::Number,
+                    mutable: true,
+                    init: Some(Expr::Number(0.0)),
+                })),
+                condition: Some(Expr::Compare {
+                    op: perry_hir::CompareOp::Lt,
+                    left: Box::new(Expr::LocalGet(112)),
+                    right: Box::new(Expr::PropertyGet {
+                        object: Box::new(this_get("keys")),
+                        property: "length".to_string(),
+                        byte_offset: 0,
+                    }),
+                }),
+                update: Some(Expr::Update {
+                    id: 112,
+                    op: perry_hir::UpdateOp::Increment,
+                    prefix: false,
+                }),
+                body: vec![Stmt::Expr(Expr::LocalSet(
+                    111,
+                    Box::new(Expr::Binary {
+                        op: BinaryOp::Add,
+                        left: Box::new(Expr::LocalGet(111)),
+                        right: Box::new(Expr::IndexGet {
+                            object: Box::new(this_get("vals")),
+                            index: Box::new(Expr::LocalGet(112)),
+                        }),
+                    }),
+                ))],
+            },
+            Stmt::Return(Some(Expr::LocalGet(111))),
+        ],
+    );
+    class(
+        109,
+        "ArrayRegistry",
+        vec![array_field("keys"), array_field("vals")],
+        vec![scan],
+    )
+}
+
+fn ptr_array_cache_module() -> Module {
+    let mut m = Module::new("ptr_array_cache.ts");
+    m.classes = vec![array_registry_class()];
+    m.functions = vec![
+        // Phase 3b: provenance + containment. This is the ONLY caller allowed
+        // to select `$ptr_arrays`.
+        func(
+            120,
+            "contained",
+            Vec::new(),
+            Type::Number,
+            vec![
+                Stmt::Let {
+                    id: 121,
+                    name: "result".to_string(),
+                    ty: Type::Number,
+                    mutable: true,
+                    init: Some(Expr::Number(0.0)),
+                },
+                Stmt::Let {
+                    id: 122,
+                    name: "registry".to_string(),
+                    ty: Type::Named("ArrayRegistry".to_string()),
+                    mutable: false,
+                    init: Some(Expr::New {
+                        class_name: "ArrayRegistry".to_string(),
+                        args: Vec::new(),
+                        type_args: Vec::new(),
+                        byte_offset: 0,
+                        cap_args_appended: 0,
+                    }),
+                },
+                Stmt::Expr(Expr::LocalSet(
+                    121,
+                    Box::new(call(Expr::LocalGet(122), "scan", Vec::new())),
+                )),
+                Stmt::Return(Some(Expr::LocalGet(121))),
+            ],
+        ),
+        // A typed parameter is aliased by construction. Exact-shape guards
+        // may route it to `$pshape`, but never to the cached-value clone.
+        func(
+            123,
+            "aliased",
+            vec![param(
+                124,
+                "registry",
+                Type::Named("ArrayRegistry".to_string()),
+            )],
+            Type::Number,
+            vec![Stmt::Return(Some(call(
+                Expr::LocalGet(124),
+                "scan",
+                Vec::new(),
+            )))],
+        ),
+    ];
+    m.init_kind = ModuleInitKind::Eager;
+    m
+}
+
 /// A module whose `probe(c: Counter)` calls both methods on a statically-typed
 /// parameter. A typed parameter is not a Phase 3b shape-proven local (no
 /// provenance, no containment), so both calls go through the *guarded* site:
@@ -542,7 +677,10 @@ fn guarded_pshape_call_site_is_preceded_by_a_shape_id_guard() {
         });
         let prefix = &probe[..call_pos];
         let guarded = prefix.contains("call i32 @js_typed_feedback_method_direct_call_guard(")
-            || prefix.contains("call i32 @js_method_direct_shape_guard(");
+            || prefix.contains("call i32 @js_method_direct_shape_guard(")
+            || prefix.contains(
+                "load atomic i8, ptr @PERRY_CLASS_PROTOTYPE_FAST_GUARDS_INVALIDATED acquire",
+            );
         assert!(
             guarded,
             "{target}: no ShapeId guard call precedes it in `probe` — a \
@@ -551,6 +689,60 @@ fn guarded_pshape_call_site_is_preceded_by_a_shape_id_guard() {
              unguarded:\n{probe}"
         );
     }
+}
+
+/// The single-pair shape-only arm is small enough to inline at the call site.
+/// Pin the complete safety gate: acquire the prototype-mutation latch, accept
+/// both the boxed-pointer and internal raw-pointer ABIs, reject addresses
+/// outside the target heap range before dereference, reject own descriptors,
+/// then compare the exact class/ShapeId pair. The out-of-line guard must be
+/// absent from this caller.
+#[test]
+fn single_arm_method_shape_guard_is_inlined_with_the_runtime_contract() {
+    let ir = emit(&guarded_site_module(), false);
+    let probe = function_body(&ir, "__probe(");
+    assert!(
+        probe.contains(
+            "load atomic i8, ptr @PERRY_CLASS_PROTOTYPE_FAST_GUARDS_INVALIDATED acquire, align 1",
+        ),
+        "the inline guard must acquire the runtime's release-published sticky latch:\n{probe}"
+    );
+    assert!(
+        !probe.contains("call i32 @js_method_direct_shape_guard("),
+        "a monomorphic shape-only site must not retain the out-of-line guard call:\n{probe}"
+    );
+    assert!(
+        probe.contains("icmp eq i64")
+            && probe.contains(", 32765")
+            && probe.contains(", 0"),
+        "the dereference gate must accept the 0x7FFD boxed pointer tag and the internal raw-pointer form:\n{probe}"
+    );
+    let target = crate::codegen::default_target_triple();
+    let heap_floor = crate::target_layout::heap_addr_lower_bound_inclusive(&target);
+    let heap_ceiling = crate::target_layout::heap_addr_upper_bound_exclusive(&target);
+    assert!(
+        probe.contains("icmp uge i64")
+            && probe.contains(&format!(", {heap_floor}"))
+            && probe.contains("icmp ult i64")
+            && probe.contains(&format!(", {heap_ceiling}")),
+        "the dereference gate must reject candidates outside the target heap range:\n{probe}"
+    );
+    assert!(
+        probe.contains("method_direct.inline_deref")
+            && probe.contains("getelementptr i8, ptr")
+            && probe.contains("i64 -8")
+            && probe.contains("i64 -7")
+            && probe.contains("i64 -6")
+            && probe.contains("and i16")
+            && probe.contains(", 2048")
+            && probe.contains("icmp ne i32")
+            && probe.contains("i64 4")
+            && probe.contains("add i32")
+            && probe.contains(", -2147483648")
+            && probe.contains("icmp ult i32")
+            && probe.contains(", 1073741824"),
+        "the header block must check the GC type, forwarding flag, own-descriptor bit, nonzero class id, ShapeId domain, and live ShapeId:\n{probe}"
+    );
 }
 
 /// Regression (#7128), Phase 3b guard-free site: a shape-proven LOCAL whose
@@ -582,6 +774,73 @@ fn ptr_shape_local_typed_fallback_routes_to_proven_this_clone() {
         calls.iter().any(|c| c == norm2),
         "a shape-proven local's method call must route to the proven-`this` \
          clone from the guard-free site too. defined={defs:?} called={calls:?}"
+    );
+}
+
+/// #8607: array-field value caching requires the Phase 3b containment proof,
+/// not merely an exact shape. Pin both sides so widening a `$pshape` route to
+/// this clone cannot silently make an aliased callback-induced slot rebind
+/// stale.
+#[test]
+fn array_field_cache_clone_routes_only_from_contained_receivers() {
+    let ir = emit(&ptr_array_cache_module(), false);
+    let cached = ir
+        .lines()
+        .find(|line| line.starts_with("define") && line.contains("__scan$ptr_arrays("))
+        .and_then(|line| {
+            let at = line.find('@')?;
+            let paren = line[at..].find('(')?;
+            Some(line[at + 1..at + paren].to_string())
+        })
+        .unwrap_or_else(|| panic!("no contained-receiver array-cache clone emitted:\n{ir}"));
+
+    let contained = function_body(&ir, "__contained(");
+    assert!(
+        contained.contains(&format!("call double @{cached}(")),
+        "the contained receiver must call its array-cache clone:\n{contained}"
+    );
+    let aliased = function_body(&ir, "__aliased(");
+    assert!(
+        !aliased.contains("$ptr_arrays"),
+        "an aliased receiver must never reach a cached-field-value clone:\n{aliased}"
+    );
+    assert!(
+        aliased.contains("$pshape"),
+        "the existing exact-shape clone should remain available to the aliased route:\n{aliased}"
+    );
+}
+
+#[test]
+fn array_field_cache_declines_direct_and_super_slot_rebinding() {
+    let class = array_registry_class();
+    let scan = &class.methods[0];
+    assert_eq!(
+        crate::collectors::ptr_array_cache_fields(&class, scan).len(),
+        2,
+        "the control Registry method should cache both array fields"
+    );
+
+    let mut direct = scan.clone();
+    direct.body.push(Stmt::Expr(Expr::PropertySet {
+        object: Box::new(Expr::This),
+        property: "keys".to_string(),
+        value: Box::new(Expr::Array(Vec::new())),
+    }));
+    assert!(
+        crate::collectors::ptr_array_cache_fields(&class, &direct).is_empty(),
+        "a direct slot replacement would make an entry snapshot stale"
+    );
+
+    let mut through_super = scan.clone();
+    through_super.body.push(Stmt::Expr(Expr::SuperPropertySet {
+        parent_class_id: 1,
+        parent_class_name: Some("Parent".to_string()),
+        key: Box::new(Expr::String("keys".to_string())),
+        value: Box::new(Expr::Array(Vec::new())),
+    }));
+    assert!(
+        crate::collectors::ptr_array_cache_fields(&class, &through_super).is_empty(),
+        "a super property set still writes with receiver=this"
     );
 }
 

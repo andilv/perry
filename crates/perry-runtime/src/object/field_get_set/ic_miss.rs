@@ -623,13 +623,6 @@ pub extern "C" fn js_object_get_field_ic_miss(
     if (obj as usize) < 0x10000 {
         return f64::from_bits(crate::value::TAG_UNDEFINED);
     }
-    // When accessors are active anywhere in the program, skip the cache
-    // entirely: the PIC fast path does a direct field load that bypasses
-    // getter dispatch, so any object that uses defineProperty / get / set
-    // would silently return the raw slot value instead of calling the
-    // getter. The slow path through js_object_get_field_by_name handles
-    // accessors correctly.
-    let can_cache = !crate::state::state().descriptors.accessors_in_use.get();
     unsafe {
         // Issue #72: validate this really is a GC_TYPE_OBJECT before reading
         // crate::object::object_keys_array(obj) — otherwise an Array/String/Buffer/etc. receiver
@@ -668,11 +661,16 @@ pub extern "C" fn js_object_get_field_ic_miss(
         let is_regular = shape.is_some_and(|shape| {
             shape.object_kind == crate::object::shapes::ShapeObjectKind::Ordinary
         });
-        // Gate-neutral builtin accessors deliberately leave the process-wide
-        // accessor latch clear. Their owner bit must still block this PIC:
-        // its generated hit path is a raw slot load and would otherwise turn
-        // `Set.prototype.size` into `undefined` instead of invoking the getter.
-        if can_cache && is_regular && !has_own_descriptors {
+        // Descriptor-bearing receivers must not prime this PIC: its generated
+        // hit path is a raw slot load and would bypass their getter / property
+        // semantics. This per-object bit replaces the old process-wide
+        // `accessors_in_use` gate. `note_descriptor_target` sets the bit and
+        // transitions the receiver's ShapeId before an installed descriptor is
+        // observable, while unrelated accessors cannot affect an own data
+        // property on this receiver. The emitted hit path independently checks
+        // the same bit, so both cache population and cache use fail closed.
+        // Gate-neutral builtin accessors set the owner bit as well.
+        if is_regular && !has_own_descriptors {
             let Some(shape) = shape else {
                 let value = js_object_get_field_by_name(obj, key);
                 return f64::from_bits(value.bits());
@@ -869,9 +867,92 @@ mod sso_tests_1781 {
     }
 }
 
+/// Stamp an instance constructed through a `ClassExprFresh` value with the
+/// identity of that particular class evaluation. The brand lives in the
+/// object's traced metadata record so it neither shifts user field slots nor
+/// changes the instance's ShapeId / own-key enumeration.
+pub(crate) unsafe fn stamp_private_evaluation_brand(obj: *mut ObjectHeader, class_value: f64) {
+    if obj.is_null() || !super::super::class_registry::is_class_object_value(class_value) {
+        return;
+    }
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let obj_handle = scope.root_raw_mut_ptr(obj);
+    let class_handle = scope.root_nanbox_f64(class_value);
+    let (meta, _) =
+        obj_handle.across_mut::<ObjectHeader, _>(|| crate::object::object_meta_ensure(obj));
+    let brand = class_handle.get_nanbox_f64().to_bits();
+    (*meta).private_evaluation_brand = brand;
+    crate::gc::runtime_write_barrier_slot(
+        meta as usize,
+        &(*meta).private_evaluation_brand as *const u64 as usize,
+        brand,
+    );
+}
+
+/// Return the per-evaluation brand carried by `value`, provided it belongs to
+/// `declaring_class_id`'s compile-time template. A fresh class object is its
+/// own static brand; instances carry that object in the hidden slot above.
+fn private_evaluation_brand(value: f64, declaring_class_id: u32) -> Option<u64> {
+    if declaring_class_id == 0 {
+        return None;
+    }
+    if super::super::class_registry::is_class_object_value(value) {
+        let object = JSValue::from_bits(value.to_bits()).as_pointer::<ObjectHeader>();
+        if !object.is_null() && js_object_get_class_id(object) == declaring_class_id {
+            return Some(value.to_bits());
+        }
+    }
+    let value = JSValue::from_bits(value.to_bits());
+    if !value.is_pointer() {
+        return None;
+    }
+    let object = value.as_pointer::<ObjectHeader>();
+    let brand = unsafe {
+        if object.is_null() || !crate::object::object_is_shaped(object) || (*object).meta.is_null()
+        {
+            return None;
+        }
+        f64::from_bits((*(*object).meta).private_evaluation_brand)
+    };
+    if !super::super::class_registry::is_class_object_value(brand) {
+        return None;
+    }
+    let object = JSValue::from_bits(brand.to_bits()).as_pointer::<ObjectHeader>();
+    (!object.is_null() && js_object_get_class_id(object) == declaring_class_id)
+        .then_some(brand.to_bits())
+}
+
+/// If the lexical class evaluation can be recovered from `brand_owner`,
+/// compare `obj` against that exact evaluation. `None` asks callers to retain
+/// the existing template-class check for ordinary (single-evaluation) classes.
+fn private_evaluation_brand_matches(
+    obj: f64,
+    brand_owner: f64,
+    declaring_class_id: u32,
+) -> Option<bool> {
+    // A static method/accessor closes over the PrivateEnvironment of its class
+    // evaluation. Its visible `this` may be replaced by call/apply, so dispatch
+    // records the lexical owner separately from ambient IMPLICIT_THIS.
+    let brand_owner = if super::super::class_registry::is_class_object_value(brand_owner) {
+        let captured_owner = super::super::static_private_owner_current().unwrap_or(brand_owner);
+        if super::super::class_registry::is_class_object_value(captured_owner)
+            && private_evaluation_brand(captured_owner, declaring_class_id).is_some()
+        {
+            captured_owner
+        } else {
+            brand_owner
+        }
+    } else {
+        brand_owner
+    };
+    let expected = private_evaluation_brand(brand_owner, declaring_class_id)?;
+    Some(private_evaluation_brand(obj, declaring_class_id) == Some(expected))
+}
+
 #[no_mangle]
 pub extern "C" fn js_private_brand_check(
     obj: f64,
+    brand_owner: f64,
     declaring_class_id: u32,
     field_name_ptr: *const u8,
     field_name_len: u32,
@@ -882,32 +963,9 @@ pub extern "C" fn js_private_brand_check(
         return false_value;
     }
 
-    let value = JSValue::from_bits(obj.to_bits());
-    if !value.is_pointer() {
-        return false_value;
-    }
-    let obj_ptr = value.as_pointer::<ObjectHeader>();
-    if obj_ptr.is_null() {
-        return false_value;
-    }
-
-    let obj_class_id = js_object_get_class_id(obj_ptr);
-    if obj_class_id == 0 {
-        return false_value;
-    }
-
-    let mut cur = obj_class_id;
-    let mut has_declaring_brand = false;
-    for _ in 0..32 {
-        if cur == declaring_class_id {
-            has_declaring_brand = true;
-            break;
-        }
-        match super::super::class_registry::get_parent_class_id(cur) {
-            Some(parent) if parent != 0 && parent != cur => cur = parent,
-            _ => break,
-        }
-    }
+    let has_declaring_brand =
+        private_evaluation_brand_matches(obj, brand_owner, declaring_class_id)
+            .unwrap_or_else(|| unsafe { private_object_has_brand(obj, declaring_class_id) });
     if !has_declaring_brand {
         return false_value;
     }
@@ -984,6 +1042,7 @@ unsafe fn private_object_has_brand(obj: f64, declaring_class_id: u32) -> bool {
 #[no_mangle]
 pub extern "C" fn js_private_guard(
     obj: f64,
+    brand_owner: f64,
     declaring_class_id: u32,
     _field_name_ptr: *const u8,
     _field_name_len: u32,
@@ -995,13 +1054,17 @@ pub extern "C" fn js_private_guard(
     }
     let is_static = op >= 2;
     let read_write = op & 1; // 0=read, 1=write
-    let has_brand = if is_static {
-        // Static private brand: the receiver must be exactly the declaring
-        // class constructor (identity), not an instance or a subclass.
-        super::super::class_ref_id(obj) == Some(declaring_class_id)
-    } else {
-        unsafe { private_object_has_brand(obj, declaring_class_id) }
-    };
+    let has_brand = private_evaluation_brand_matches(obj, brand_owner, declaring_class_id)
+        .unwrap_or_else(|| {
+            if is_static {
+                // Static private brand: the receiver must be exactly the
+                // declaring class constructor (identity), not an instance or
+                // a subclass.
+                super::super::class_ref_id(obj) == Some(declaring_class_id)
+            } else {
+                unsafe { private_object_has_brand(obj, declaring_class_id) }
+            }
+        });
     if !has_brand {
         throw_private_type_error(
             "Cannot access private member from an object whose class did not declare it",
@@ -1019,6 +1082,45 @@ pub extern "C" fn js_private_guard(
         throw_private_type_error("Invalid private member operation for its kind");
     }
     obj
+}
+
+#[cfg(test)]
+mod private_evaluation_brand_tests {
+    use super::*;
+
+    #[test]
+    fn stamping_a_fresh_brand_preserves_instance_shape_and_slots() {
+        unsafe {
+            const CID: u32 = 62_441;
+            let class = crate::object::js_object_alloc(CID, 0);
+            crate::object::class_registry::js_object_mark_class(class as i64);
+            let class_value = crate::value::js_nanbox_pointer(class as i64);
+            assert!(crate::object::class_registry::is_class_object_value(
+                class_value
+            ));
+
+            let instance = crate::object::js_object_alloc(CID, 2);
+            let shape_before = crate::object::shapes::object_shape_id(instance);
+            let keys_before = crate::object::object_keys_array(instance);
+            let slots_before = crate::object::object_live_slot_count(instance);
+
+            stamp_private_evaluation_brand(instance, class_value);
+
+            assert_eq!(
+                crate::object::shapes::object_shape_id(instance),
+                shape_before
+            );
+            assert_eq!(crate::object::object_keys_array(instance), keys_before);
+            assert_eq!(
+                crate::object::object_live_slot_count(instance),
+                slots_before
+            );
+            assert_eq!(
+                private_evaluation_brand(crate::value::js_nanbox_pointer(instance as i64), CID),
+                Some(class_value.to_bits())
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1291,6 +1393,87 @@ mod poly_pic_tests {
 
 #[cfg(test)]
 mod c3c_pic_tests {
+    /// Installing an accessor on one object must not permanently disable every
+    /// property-read PIC in the process. Descriptor ownership is recorded on
+    /// the owning object's GC header, so a different descriptor-free object's
+    /// own data field remains safe to cache.
+    #[test]
+    fn unrelated_accessor_does_not_poison_plain_receiver_pic() {
+        let _lock = crate::gc::global_side_table_test_lock();
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let unrelated = crate::object::js_object_alloc(0, 1);
+        let unrelated = scope.root_raw_mut_ptr(unrelated);
+        crate::object::set_accessor_descriptor(
+            unrelated.with_mut_ptr(|o: *mut crate::object::ObjectHeader| o as usize),
+            "pic_unrelated_accessor".to_string(),
+            crate::object::AccessorDescriptor::default(),
+        );
+        assert!(
+            crate::state::state().descriptors.accessors_in_use.get(),
+            "test premise: the process-wide accessor latch is active"
+        );
+
+        let obj = crate::object::js_object_alloc(0, 8);
+        let obj = scope.root_raw_mut_ptr(obj);
+        let key_bytes = b"pic_plain_data";
+        let key = crate::string::js_string_from_bytes(key_bytes.as_ptr(), key_bytes.len() as u32);
+        let key = scope.root_string_ptr(key);
+        obj.with_mut_ptr(|o| {
+            key.with_const_ptr(|k| crate::object::js_object_set_field_by_name(o, k, 42.0))
+        });
+
+        let mut cache = [0i64; super::PIC_CACHE_WORDS];
+        assert_eq!(
+            obj.with_mut_ptr(
+                |o| key.with_const_ptr(|k| super::js_object_get_field_ic_miss(o, k, &mut cache))
+            ),
+            42.0
+        );
+        assert_ne!(
+            cache[0], 0,
+            "an accessor owned by an unrelated object must not prevent this \
+             descriptor-free receiver from priming its read PIC"
+        );
+        assert_eq!(cache[1], 0, "the first own data field lives in slot 0");
+    }
+
+    /// The receiver-local half of the proof: an accessor-bearing object must
+    /// keep taking descriptor-aware lookup and must never seed a raw-slot hit.
+    #[test]
+    fn accessor_bearing_receiver_does_not_prime_plain_data_pic() {
+        let _lock = crate::gc::global_side_table_test_lock();
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let obj = crate::object::js_object_alloc(0, 8);
+        let obj = scope.root_raw_mut_ptr(obj);
+        let key_bytes = b"pic_guarded_data";
+        let key = crate::string::js_string_from_bytes(key_bytes.as_ptr(), key_bytes.len() as u32);
+        let key = scope.root_string_ptr(key);
+        obj.with_mut_ptr(|o| {
+            key.with_const_ptr(|k| crate::object::js_object_set_field_by_name(o, k, 17.0))
+        });
+        crate::object::set_accessor_descriptor(
+            obj.with_mut_ptr(|o: *mut crate::object::ObjectHeader| o as usize),
+            "pic_guarded_data".to_string(),
+            crate::object::AccessorDescriptor::default(),
+        );
+
+        let mut cache = [0i64; super::PIC_CACHE_WORDS];
+        let via_pic = obj.with_mut_ptr(|o| {
+            key.with_const_ptr(|k| super::js_object_get_field_ic_miss(o, k, &mut cache))
+        });
+        let via_ladder = obj
+            .with_mut_ptr(|o| key.with_const_ptr(|k| super::js_object_get_field_by_name_f64(o, k)));
+        assert_eq!(
+            via_pic.to_bits(),
+            via_ladder.to_bits(),
+            "the miss path must preserve this receiver's accessor semantics"
+        );
+        assert_eq!(
+            cache[0], 0,
+            "an accessor-bearing receiver must not prime a raw-slot PIC"
+        );
+    }
+
     /// A class instance primes the same authoritative ShapeId token that the
     /// emitted guard reads from the receiver.
     #[test]

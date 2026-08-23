@@ -13,7 +13,6 @@ members = [
     "crates/perry-ext-dotenv",
     "crates/perry-ext-nanoid",
     "crates/perry-ext-uuid",
-    "crates/perry-ext-slugify",
     "crates/perry-ext-bcrypt",
     "crates/perry-ext-argon2",
     "crates/perry-ext-jsonwebtoken",
@@ -49,6 +48,7 @@ members = [
     "crates/perry-ext-ads",
     "crates/perry-ext-node-forge",
     "crates/perry-ext-parcel-watcher",
+    "crates/perry-ext-typescript",
     "crates/perry-wasm-host",
     "crates/perry-container-compose",
     "crates/perry-container-e2e",
@@ -316,7 +316,7 @@ codegen-units = 16
 codegen-units = 16
 
 [workspace.package]
-version = "0.5.1516"
+version = "0.5.1519"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/PerryTS/perry"
@@ -344,6 +344,10 @@ not_unsafe_ptr_arg_deref = "allow"
 swc_ecma_parser = "32.0"
 swc_ecma_ast = "19.0"
 swc_common = "18.0"
+swc_ecma_codegen = "21.0"
+swc_ecma_transforms_base = "32.0"
+swc_ecma_transforms_react = "35.0"
+swc_ecma_transforms_typescript = "35.0"
 
 # Runtime dependencies
 # bdwgc for garbage collection (Boehm GC)
@@ -455,7 +459,6 @@ perry-ffi = { path = "crates/perry-ffi", version = "0.5.1011" }
 perry-ext-dotenv = { path = "crates/perry-ext-dotenv" }
 perry-ext-nanoid = { path = "crates/perry-ext-nanoid" }
 perry-ext-uuid = { path = "crates/perry-ext-uuid" }
-perry-ext-slugify = { path = "crates/perry-ext-slugify" }
 perry-ext-bcrypt = { path = "crates/perry-ext-bcrypt" }
 perry-ext-argon2 = { path = "crates/perry-ext-argon2" }
 perry-ext-jsonwebtoken = { path = "crates/perry-ext-jsonwebtoken" }
@@ -491,6 +494,7 @@ perry-ext-pdf = { path = "crates/perry-ext-pdf" }
 perry-ext-ads = { path = "crates/perry-ext-ads" }
 perry-ext-node-forge = { path = "crates/perry-ext-node-forge" }
 perry-ext-parcel-watcher = { path = "crates/perry-ext-parcel-watcher" }
+perry-ext-typescript = { path = "crates/perry-ext-typescript" }
 perry-stdlib = { path = "crates/perry-stdlib" }
 perry-diagnostics = { path = "crates/perry-diagnostics" }
 perry-ui-model = { path = "crates/perry-ui-model" }

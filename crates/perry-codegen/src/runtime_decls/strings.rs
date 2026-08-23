@@ -235,8 +235,10 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     );
     module.declare_function("js_closure_call0", DOUBLE, &[I64]);
     module.declare_function("js_closure_call1", DOUBLE, &[I64, DOUBLE]);
+    module.declare_function("js_closure_call1_receiverless", DOUBLE, &[I64, DOUBLE]);
     module.declare_function("js_closure_call2", DOUBLE, &[I64, DOUBLE, DOUBLE]);
     module.declare_function("js_closure_call3", DOUBLE, &[I64, DOUBLE, DOUBLE, DOUBLE]);
+    module.declare_function("js_closure_resolve_arrow_direct_call", PTR, &[I64, I32]);
     module.declare_function(
         "js_closure_call4",
         DOUBLE,
@@ -412,11 +414,15 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_map_from_iterable", I64, &[DOUBLE]);
     module.declare_function("js_object_has_property", DOUBLE, &[DOUBLE, DOUBLE]);
     module.declare_function("js_in_operator", DOUBLE, &[DOUBLE, DOUBLE]);
-    module.declare_function("js_private_brand_check", DOUBLE, &[DOUBLE, I32, PTR, I32]);
+    module.declare_function(
+        "js_private_brand_check",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, I32, PTR, I32],
+    );
     module.declare_function(
         "js_private_guard",
         DOUBLE,
-        &[DOUBLE, I32, PTR, I32, I32, I32],
+        &[DOUBLE, DOUBLE, I32, PTR, I32, I32, I32],
     );
     module.declare_function("js_fs_to_unix_timestamp", DOUBLE, &[DOUBLE]);
     module.declare_function("js_fs_write_file_sync", I32, &[DOUBLE, DOUBLE]);
@@ -1050,11 +1056,11 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
         I32,
         &[I32, I64, I32, PTR, I32, PTR, I32],
     );
-    // Inline bump-allocator state accessor + slow path. The codegen
-    // calls `js_inline_arena_state` once per JS function entry, caches
-    // the returned pointer in a stack slot, and reads/writes the
-    // bump-pointer state directly via fixed GEPs (data=0, offset=8,
-    // size=16). When the bump check fails, it calls
+    // Inline bump-allocator state accessor + slow path. Ordinary allocation
+    // kernels cache `js_inline_arena_state` at function entry. Self-recursive
+    // allocators resolve it in a public wrapper and forward it as a hidden body
+    // parameter. Both forms then read/write the bump-pointer state via fixed
+    // GEPs (data=0, offset=8, size=16). When the bump check fails, codegen calls
     // `js_inline_arena_slow_alloc` which syncs back to the underlying
     // arena, allocates a new block, and returns the new pointer.
     //

@@ -30,6 +30,37 @@ use super::typed_abi::{
     typed_string_function_name, TypedFunctionTrampolineKind, TypedParamRep,
 };
 
+/// Internal body name for a self-recursive allocator whose arena-state pointer
+/// is threaded through recursive calls (#8591).
+pub(crate) fn arena_threaded_function_body_name(public_name: &str) -> String {
+    format!("{public_name}.__arena")
+}
+
+fn emit_public_arena_threaded_wrapper(
+    llmod: &mut LlModule,
+    f: &Function,
+    public_name: &str,
+    body_name: &str,
+) {
+    let params: Vec<(LlvmType, String)> = f
+        .params
+        .iter()
+        .map(|p| (DOUBLE, format!("%arg{}", p.id)))
+        .collect();
+    let mut call_args: Vec<(LlvmType, String)> = params.clone();
+    let wrapper = llmod.define_function(public_name, DOUBLE, params);
+    wrapper.force_inline = true;
+    let entry = wrapper.create_block("entry");
+    let arena_state = entry.call(PTR, "js_inline_arena_state", &[]);
+    call_args.push((PTR, arena_state));
+    let call_args: Vec<(LlvmType, &str)> = call_args
+        .iter()
+        .map(|(ty, value)| (*ty, value.as_str()))
+        .collect();
+    let value = entry.call(DOUBLE, body_name, &call_args);
+    entry.ret(DOUBLE, &value);
+}
+
 /// Compile the internal typed-f64 clone for a conservatively eligible user
 /// function. `compile_function` emits both the public JSValue trampoline and
 /// the internal generic fallback body; guarded direct FuncRef sites can still
@@ -502,7 +533,16 @@ pub(super) fn compile_function(
     } else {
         None
     };
-    let llvm_name = if let Some(plan) = spec_entry {
+    let arena_threaded = typed_public_trampoline.is_none()
+        && guarded_public_plan.is_none()
+        && spec_entry.is_none()
+        && !f.is_async
+        && !f.is_generator
+        && !f.was_plain_async
+        && cross_module.arena_threaded_functions.contains(&f.id);
+    let llvm_name = if arena_threaded {
+        arena_threaded_function_body_name(&public_llvm_name)
+    } else if let Some(plan) = spec_entry {
         // Spec entries are an ADDITIONAL internal symbol next to the ordinary
         // public body — never combined with the typed_abi trampoline scheme
         // (mutual exclusion is enforced at plan selection).
@@ -520,7 +560,7 @@ pub(super) fn compile_function(
     // alloca slots keyed by the same HIR LocalId. Specialized entries
     // (representation-selection Phase 2) instead type each parameter register
     // by its rep — raw i32, raw f64, or raw typed-array header pointer (i64).
-    let params: Vec<(LlvmType, String)> = match spec_entry {
+    let mut params: Vec<(LlvmType, String)> = match spec_entry {
         Some(plan) => f
             .params
             .iter()
@@ -533,11 +573,18 @@ pub(super) fn compile_function(
             .map(|p| (DOUBLE, format!("%arg{}", p.id)))
             .collect(),
     };
+    if arena_threaded {
+        params.push((PTR, "%perry_arena_state".to_string()));
+    }
 
     let ic_base = llmod.ic_counter;
     let buffer_alias_base = llmod.buffer_alias_counter;
     let lf = llmod.define_function(&llvm_name, DOUBLE, params);
-    if typed_public_trampoline.is_some() || guarded_public_plan.is_some() || spec_entry.is_some() {
+    if typed_public_trampoline.is_some()
+        || guarded_public_plan.is_some()
+        || spec_entry.is_some()
+        || arena_threaded
+    {
         lf.linkage = "internal".to_string();
     }
 
@@ -554,6 +601,12 @@ pub(super) fn compile_function(
             cross_module.flat_const_arrays.keys().copied().collect();
         let m =
             crate::collectors::collect_pointer_typed_locals(&f.params, &f.body, &flat_const_ids);
+        crate::codegen::helpers::maybe_spill_roots_to_shadow_frame(
+            lf,
+            &llvm_name,
+            m.len(),
+            &f.body,
+        );
         lf.enable_shadow_frame(m.len() as u32);
         m
     } else {
@@ -829,6 +882,17 @@ pub(super) fn compile_function(
             .then_some(*id)
         })
         .collect();
+    let spec_number_array_params: HashSet<u32> = spec_param_proofs
+        .iter()
+        .filter_map(|(id, ty)| {
+            matches!(ty, perry_hir::types::Type::Array(element)
+                if matches!(element.as_ref(), perry_hir::types::Type::Number | perry_hir::types::Type::Int32))
+            .then_some(*id)
+        })
+        .collect();
+    // Unlike source annotations, these proofs are backed by the public
+    // wrapper's `js_param_type_guard`.  The guarded-array seed collector may
+    // therefore trust that an element is Number-or-undefined in this clone.
     // `--opt-report` (#6952): attribute every representation decision the
     // collectors below make to this function. No-op when the report is off.
     //
@@ -859,6 +923,7 @@ pub(super) fn compile_function(
         &spec_ta_lens,
         &spec_i32_params,
         &spec_numeric_params,
+        &spec_number_array_params,
     );
 
     // A Number-by-construction local cannot ever hold a GC pointer, so it
@@ -934,6 +999,14 @@ pub(super) fn compile_function(
         std::collections::HashSet::new()
     };
 
+    let arena_state_slot = if arena_threaded {
+        let slot = lf.alloca_entry(PTR);
+        lf.entry_allocas_push_store(PTR, "%perry_arena_state", &slot);
+        Some(slot)
+    } else {
+        None
+    };
+
     let mut ctx = FnCtx {
         func: lf,
         module_slug: crate::expr::native_region_slug(strings.module_prefix()),
@@ -997,6 +1070,8 @@ pub(super) fn compile_function(
         closure_rest_params,
         local_closure_func_ids: HashMap::new(),
         local_closure_param_counts: HashMap::new(),
+        resolved_arrow_callback_targets: HashMap::new(),
+        local_func_ref_ids: HashMap::new(),
         option_object_locals: HashMap::new(),
         object_literal_locals: HashSet::new(),
         namespace_imports: &cross_module.namespace_imports,
@@ -1034,7 +1109,7 @@ pub(super) fn compile_function(
         shadow_slot_clears_after_stmt,
         shadow_slots_bound: bound_param_slots,
         temp_roots: crate::rooting::TempRootPool::default(),
-        arena_state_slot: None,
+        arena_state_slot,
         class_keys_slots: HashMap::new(),
         class_shape_slots: HashMap::new(),
         class_header_images: HashMap::new(),
@@ -1116,6 +1191,7 @@ pub(super) fn compile_function(
         typed_i1_function_param_reps: &cross_module.typed_i1_function_param_reps,
         typed_f64_methods: &cross_module.typed_f64_methods,
         pshape_methods: &cross_module.pshape_methods,
+        nonnegative_index_methods: &cross_module.nonnegative_index_methods,
         pshape_tower_routable: &cross_module.pshape_tower_routable,
         proven_this: None,
         typed_i32_methods: &cross_module.typed_i32_methods,
@@ -1344,6 +1420,8 @@ pub(super) fn compile_function(
         emit_public_typed_function_trampoline(llmod, f, &public_llvm_name, &llvm_name, kind);
     } else if let Some(plan) = guarded_public_plan.as_ref() {
         emit_public_spec_function_trampoline(llmod, f, &public_llvm_name, &llvm_name, plan);
+    } else if arena_threaded {
+        emit_public_arena_threaded_wrapper(llmod, f, &public_llvm_name, &llvm_name);
     }
     Ok(())
 }

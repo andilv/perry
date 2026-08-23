@@ -386,6 +386,24 @@ fn collect_module_one(
         &ctx.compile_packages,
         canonical.parent().unwrap_or_else(|| Path::new(".")),
     );
+
+    // #8547: a builtin reached through `require("http")` never appears in the
+    // ESM import walk below, so `needs_stdlib` stayed false, the link came out
+    // runtime-only, `perry-stdlib`'s dispatch init never ran, and every
+    // stdlib-backed export returned `undefined` (`http.createServer` was the
+    // reported case; the bug is not http-specific). The lowered body cannot
+    // answer this — the CJS shim resolves the name through a generated runtime
+    // switch that contains EVERY builtin — so recover it from the literal call
+    // sites, which is what `extract_require_specifiers` already finds for CJS
+    // wrapping. Dynamic `require(someVar)` stays undetectable and unchanged.
+    for spec in super::cjs_wrap::extract_require_specifiers(&source) {
+        if !perry_hir::requires_stdlib(&spec) {
+            continue;
+        }
+        ctx.needs_stdlib = true;
+        let normalized = spec.strip_prefix("node:").unwrap_or(&spec).to_string();
+        ctx.native_module_imports.insert(normalized);
+    }
     if was_cjs_wrapped && ctx.debug_symbols {
         if let Some(prefix_lines) = cjs_wrap_body_prefix_lines {
             let lines_after_transform = source.bytes().filter(|&b| b == b'\n').count();
@@ -1921,6 +1939,22 @@ fn collect_module_finish(
             ..Default::default()
         });
         transform_async_to_generator(&mut hir_module);
+        // #8595: outline an oversized module-entry body into per-chunk
+        // functions so no single function carries the whole init (which is
+        // pathological for RS4GC relocation fan-out, ISel, and regalloc alike).
+        // Self-gating and fail-safe: a no-op unless PERRY_OUTLINE_ENTRY is set,
+        // and it declines (leaving the body unchanged) unless the whole body is
+        // provably safe to relocate. See perry-codegen `codegen::entry_outline`.
+        match perry_codegen::codegen::entry_outline::outline_entry_module(&mut hir_module) {
+            perry_codegen::codegen::entry_outline::OutlineOutcome::Outlined { chunks } => {
+                log::debug!(
+                    "perry: outlined entry body of '{}' into {} chunk functions",
+                    hir_module.name,
+                    chunks
+                );
+            }
+            perry_codegen::codegen::entry_outline::OutlineOutcome::Skipped(_) => {}
+        }
         progress.record(ProgressSnapshot {
             stage: "transform-generators",
             module_path: Some(&canonical),

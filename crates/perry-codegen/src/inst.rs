@@ -36,6 +36,7 @@ pub enum LoadFlavor {
     Aligned(u32),
     Volatile,
     AtomicMonotonic(u32),
+    AtomicAcquire(u32),
     AtomicSeqCst(u32),
     /// `!invariant.load !0` tagged (issue #52).
     Invariant,
@@ -123,8 +124,8 @@ pub enum LlInst {
         /// header — a mismatch is UB, not a verifier error (#8175).
         cconv: Option<&'static str>,
     },
-    /// Pre-opaque-pointer indirect call, rendered `(T1, T2)*` exactly as the
-    /// text emitter always has.
+    /// Opaque-pointer indirect call. The callee operand itself is a `ptr`;
+    /// argument types remain explicit at the call site.
     CallIndirect {
         dst: String,
         ret: LlvmType,
@@ -219,6 +220,12 @@ impl LlInst {
                         "  {dst} = load atomic {ty}, ptr {ptr} monotonic, align {n}"
                     );
                 }
+                LoadFlavor::AtomicAcquire(n) => {
+                    let _ = write!(
+                        out,
+                        "  {dst} = load atomic {ty}, ptr {ptr} acquire, align {n}"
+                    );
+                }
                 LoadFlavor::AtomicSeqCst(n) => {
                     let _ = write!(
                         out,
@@ -292,14 +299,7 @@ impl LlInst {
                 fptr,
                 args,
             } => {
-                let _ = write!(out, "  {dst} = call {ret} (");
-                for (i, (t, _)) in args.iter().enumerate() {
-                    if i > 0 {
-                        out.push_str(", ");
-                    }
-                    out.push_str(t);
-                }
-                let _ = write!(out, ")* {fptr}(");
+                let _ = write!(out, "  {dst} = call {ret} {fptr}(");
                 push_args(out, args);
                 out.push(')');
             }
