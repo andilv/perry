@@ -6,12 +6,10 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use perry_hir::Module as HirModule;
 
-use crate::module::LlModule;
-use crate::strings::StringPool;
 use crate::types::{LlvmType, DOUBLE, I64, VOID};
 
+use super::artifact_context::{ModuleArtifactsCtx, OptsView};
 use super::closure::{
     compile_closure, compile_typed_f64_closure, compile_typed_i1_closure,
     compile_typed_i32_closure, compile_typed_string_closure,
@@ -21,82 +19,16 @@ use super::entry::compile_module_entry;
 use super::helpers::{
     function_body_returns_generator_object, sanitize, scoped_fn_name, unknown_func_wrapper_name,
 };
+use super::indexed_method_artifacts::{compile_indexed_method_clones, IndexedMethodArtifactsCtx};
 use super::method::{
     compile_method, compile_static_method, compile_typed_f64_method,
     compile_typed_f64_receiver_method, compile_typed_i1_method, compile_typed_i32_method,
     compile_typed_string_method,
 };
 use super::native_namespace_exports::emit_native_namespace_reexport_getters;
-use super::opts::CrossModuleCtx;
 use super::spec_function_length;
-use super::typed_abi::TypedFunctionTrampolineKind;
-
-/// Read-only view of the `CompileOptions` fields that the artifact
-/// emission step references via `opts.X`. Bundled into a struct so the
-/// moved block (originally written against `let opts = …;` of type
-/// `CompileOptions`) can keep its `opts.X` syntax without holding a
-/// `&CompileOptions` borrow — that borrow is unavailable at the call
-/// site, because `compile_module`'s prelude moves several `opts`
-/// fields into `CrossModuleCtx` before invoking this function.
-struct OptsView<'a> {
-    import_function_prefixes: &'a std::collections::HashMap<String, String>,
-    imported_classes: &'a [super::opts::ImportedClass],
-    is_entry_module: bool,
-    non_entry_module_prefixes: &'a [String],
-    output_type: &'a str,
-}
 use super::string_pool::emit_string_pool;
-
-/// All the data computed by the prelude of `compile_module` that the
-/// tail half (this file) needs. Bundled so the call from
-/// `compile_module` stays a single line; field names mirror the
-/// in-prelude local names so the moved block reads unchanged once
-/// destructured.
-pub(super) struct ModuleArtifactsCtx<'a> {
-    pub progress: &'a super::CompileProgress,
-    pub llmod: &'a mut LlModule,
-    pub target_triple: &'a str,
-    pub strings: &'a mut StringPool,
-    pub hir: &'a HirModule,
-    pub import_function_prefixes: &'a std::collections::HashMap<String, String>,
-    pub imported_classes: &'a [super::opts::ImportedClass],
-    pub is_entry_module: bool,
-    pub non_entry_module_prefixes: &'a [String],
-    pub output_type: &'a str,
-    pub module_prefix: &'a String,
-    pub class_table: &'a HashMap<String, &'a perry_hir::Class>,
-    pub class_ids: &'a HashMap<String, u32>,
-    pub enum_table: &'a HashMap<(String, String), perry_hir::EnumValue>,
-    pub module_globals: &'a HashMap<u32, String>,
-    pub module_global_types: &'a HashMap<u32, perry_hir::types::Type>,
-    pub static_field_globals: &'a HashMap<(String, String), String>,
-    pub method_names: &'a HashMap<(String, String), String>,
-    pub func_names: &'a HashMap<u32, String>,
-    pub func_signatures: &'a HashMap<u32, (usize, bool, bool, bool)>,
-    pub func_synthetic_arguments: &'a std::collections::HashSet<u32>,
-    pub module_boxed_vars: &'a std::collections::HashSet<u32>,
-    /// Typed-ABI capture-representation oracle: module-wide `Stmt::Let` types
-    /// MINUS boxed ids (#5869). Only the typed closure clones read this.
-    pub module_local_types: &'a HashMap<u32, perry_hir::types::Type>,
-    /// #6369: receiver-type oracle for closure bodies — the same module-wide
-    /// `Stmt::Let` types with no representation filtering, mirroring the
-    /// `module_global_types` seed that `compile_function` / `compile_method`
-    /// already use. Feeds `FnCtx.local_types` only.
-    pub module_receiver_types: &'a HashMap<u32, perry_hir::types::Type>,
-    pub closure_rest_params: &'a HashMap<u32, usize>,
-    pub closure_synthetic_arguments: &'a std::collections::HashSet<u32>,
-    pub closure_rest_and_arguments: &'a std::collections::HashSet<u32>,
-    pub closure_arities: &'a HashMap<u32, u32>,
-    pub closure_lengths: &'a HashMap<u32, u32>,
-    pub closure_arrow_functions: &'a std::collections::HashSet<u32>,
-    pub closures: &'a [(perry_hir::types::FuncId, perry_hir::Expr)],
-    pub class_keys_init_data: &'a [(String, String, u32, Vec<u64>, Vec<u64>)],
-    /// #8122: keys global → (class id, packed GcHeader word) for the classes
-    /// whose inline-`new` header image module init must compose.
-    pub class_header_image_inits: &'a std::collections::HashMap<String, (u32, u64)>,
-    pub imported_class_stubs: &'a [perry_hir::Class],
-    pub cross_module: &'a CrossModuleCtx,
-}
+use super::typed_abi::TypedFunctionTrampolineKind;
 
 /// Emit the artifact tail: bodies, wrappers, namespace globals, entry
 /// function, string pool. Mirrors the in-prelude execution order of
@@ -138,6 +70,7 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
         closure_arities,
         closure_lengths,
         closure_arrow_functions,
+        trusted_box_closures,
         closures,
         class_keys_init_data,
         class_header_image_inits,
@@ -225,8 +158,35 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
             &module_reassigned_locals,
             closure_rest_params,
             cross_module,
+            false,
         )
         .with_context(|| format!("lowering closure func_id={}", func_id))?;
+        if trusted_box_closures.contains_key(func_id) {
+            compile_closure(
+                llmod,
+                *func_id,
+                closure_expr,
+                func_names,
+                strings,
+                class_table,
+                method_names,
+                module_globals,
+                opts.import_function_prefixes,
+                enum_table,
+                static_field_globals,
+                class_ids,
+                func_signatures,
+                func_synthetic_arguments,
+                module_prefix,
+                module_boxed_vars,
+                module_receiver_types,
+                &module_reassigned_locals,
+                closure_rest_params,
+                cross_module,
+                true,
+            )
+            .with_context(|| format!("lowering trusted-box closure func_id={}", func_id))?;
+        }
         let done = closure_index + 1;
         if done == closures.len() || done % closure_progress_step == 0 {
             progress.items("closure bodies", done, closures.len(), closure_started);
@@ -339,37 +299,29 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
                 .nonnegative_index_methods
                 .get(&(class.name.clone(), method.name.clone()))
             {
-                compile_method(
-                    llmod,
-                    class,
-                    method,
-                    func_names,
-                    strings,
-                    class_table,
-                    method_names,
-                    module_globals,
-                    module_global_types,
-                    opts.import_function_prefixes,
-                    enum_table,
-                    static_field_globals,
-                    class_ids,
-                    func_signatures,
-                    func_synthetic_arguments,
-                    module_boxed_vars,
-                    closure_rest_params,
-                    cross_module,
-                    None,
-                    false,
-                    None,
-                    Some(nonnegative_index_params),
-                    false,
-                )
-                .with_context(|| {
-                    format!(
-                        "lowering nonnegative-index method clone '{}::{}'",
-                        class.name, method.name
-                    )
-                })?;
+                compile_indexed_method_clones(
+                    IndexedMethodArtifactsCtx {
+                        llmod,
+                        class,
+                        method,
+                        func_names,
+                        strings,
+                        classes: class_table,
+                        methods: method_names,
+                        module_globals,
+                        module_global_types,
+                        import_function_prefixes: opts.import_function_prefixes,
+                        enums: enum_table,
+                        static_field_globals,
+                        class_ids,
+                        func_signatures,
+                        func_synthetic_arguments,
+                        module_boxed_vars,
+                        closure_rest_params,
+                        cross_module,
+                    },
+                    nonnegative_index_params,
+                )?;
             }
             compile_method(
                 llmod,
@@ -397,8 +349,48 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
                 None,
                 None,
                 false,
+                false,
+                false,
             )
             .with_context(|| format!("lowering method '{}::{}'", class.name, method.name))?;
+            if cross_module
+                .guarded_undefined_method_params
+                .contains_key(&(class.name.clone(), method.name.clone()))
+            {
+                compile_method(
+                    llmod,
+                    class,
+                    method,
+                    func_names,
+                    strings,
+                    class_table,
+                    method_names,
+                    module_globals,
+                    module_global_types,
+                    opts.import_function_prefixes,
+                    enum_table,
+                    static_field_globals,
+                    class_ids,
+                    func_signatures,
+                    func_synthetic_arguments,
+                    module_boxed_vars,
+                    closure_rest_params,
+                    cross_module,
+                    None,
+                    false,
+                    None,
+                    None,
+                    false,
+                    false,
+                    true,
+                )
+                .with_context(|| {
+                    format!(
+                        "lowering exact-undefined clone of method '{}::{}'",
+                        class.name, method.name
+                    )
+                })?;
+            }
             // Representation-selection Phase 5a: the additive `internal`
             // proven-`this` clone. Same HIR, same ABI, same shadow-bound
             // tagged-at-rest receiver slot — only `this.field` lowering
@@ -434,6 +426,8 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
                     Some(fact.clone()),
                     None,
                     false,
+                    false,
+                    false,
                 )
                 .with_context(|| {
                     format!(
@@ -441,6 +435,44 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
                         class.name, method.name
                     )
                 })?;
+                if cross_module
+                    .guarded_undefined_method_params
+                    .contains_key(&(class.name.clone(), method.name.clone()))
+                {
+                    compile_method(
+                        llmod,
+                        class,
+                        method,
+                        func_names,
+                        strings,
+                        class_table,
+                        method_names,
+                        module_globals,
+                        module_global_types,
+                        opts.import_function_prefixes,
+                        enum_table,
+                        static_field_globals,
+                        class_ids,
+                        func_signatures,
+                        func_synthetic_arguments,
+                        module_boxed_vars,
+                        closure_rest_params,
+                        cross_module,
+                        None,
+                        false,
+                        Some(fact.clone()),
+                        None,
+                        false,
+                        false,
+                        true,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "lowering proven-`this` exact-undefined clone of method '{}::{}'",
+                            class.name, method.name
+                        )
+                    })?;
+                }
 
                 // #8607: a second, stricter clone for the Phase 3b
                 // provenance+containment route. Its synthetic immutable
@@ -474,7 +506,9 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
                         false,
                         Some(fact.clone()),
                         None,
+                        false,
                         true,
+                        false,
                     )
                     .with_context(|| {
                         format!(
@@ -513,6 +547,8 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
                 false,
                 None,
                 None,
+                false,
+                false,
                 false,
             )
             .with_context(|| {
@@ -581,6 +617,8 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
                 None,
                 None,
                 false,
+                false,
+                false,
             )
             .with_context(|| format!("lowering getter '{}::{}'", class.name, prop))?;
         }
@@ -635,6 +673,8 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
                 false,
                 None,
                 None,
+                false,
+                false,
                 false,
             )
             .with_context(|| format!("lowering setter '{}::{}'", class.name, prop))?;
@@ -732,6 +772,8 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
                 false,
                 None,
                 None,
+                false,
+                false,
                 false,
             )
             .with_context(|| format!("lowering constructor for '{}'", class.name))?;
@@ -1801,7 +1843,7 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
     // name (`const bar = function namedBar(){}` ⇒ `"namedBar"`).
     let mut named_inline_closure_ids: std::collections::HashSet<perry_hir::types::FuncId> =
         std::collections::HashSet::new();
-    for stmt in &hir.init {
+    for stmt in super::entry_outline::logical_entry_stmts(hir) {
         if let perry_hir::Stmt::Let { name, init, .. } = stmt {
             if name.is_empty() || name.starts_with('_') {
                 continue;
@@ -1934,6 +1976,7 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
         closure_arities,
         closure_lengths,
         closure_arrow_functions,
+        trusted_box_closures,
         &user_fn_wrapper_rest,
         closure_synthetic_arguments,
         &user_fn_wrapper_synthetic_arguments,

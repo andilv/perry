@@ -10,7 +10,7 @@ use crate::expr::FnCtx;
 use crate::module::LlModule;
 use crate::stmt;
 use crate::strings::StringPool;
-use crate::types::{LlvmType, DOUBLE, I1, I32, I64, PTR};
+use crate::types::{LlvmType, DOUBLE, I1, I32, I64, I8, PTR};
 
 use super::opts::CrossModuleCtx;
 use super::typed_abi::{
@@ -499,6 +499,7 @@ pub(super) fn compile_closure(
     module_reassigned_locals: &HashSet<u32>,
     closure_rest_params: &HashMap<u32, usize>,
     cross_module: &CrossModuleCtx,
+    trusted_box_captures: bool,
 ) -> Result<()> {
     // Destructure the closure expression. We trust that the caller
     // passes only `Expr::Closure` here (from `collect_closures_*`).
@@ -562,10 +563,15 @@ pub(super) fn compile_closure(
     } else {
         None
     };
-    let llvm_name = if typed_public_trampoline.is_some() {
+    let ordinary_body_name = if typed_public_trampoline.is_some() {
         generic_closure_body_name(&public_llvm_name)
     } else {
         public_llvm_name.clone()
+    };
+    let llvm_name = if trusted_box_captures {
+        format!("{ordinary_body_name}$trusted_boxes")
+    } else {
+        ordinary_body_name
     };
 
     // Param list: i64 this_closure, then each param as double.
@@ -584,7 +590,7 @@ pub(super) fn compile_closure(
     // indirect-call admission is computed correctly but never reaches
     // `new_site_is_in_loop` while the closure body is emitted.
     lf.alloc_hot = cross_module.alloc_hot_functions.contains(&func_id);
-    if typed_public_trampoline.is_some() {
+    if typed_public_trampoline.is_some() || trusted_box_captures {
         lf.linkage = "internal".to_string();
     }
 
@@ -680,26 +686,12 @@ pub(super) fn compile_closure(
     // creation sites disagree on capture indices and a globalized
     // block-scoped let captured by a closure ends up with a
     // value-instead-of-box-pointer in its capture slot.
-    let mut auto_captures: Vec<u32> = captures
-        .iter()
-        .copied()
-        .filter(|id| !module_globals.contains_key(id))
-        .collect();
-    {
-        let param_ids: std::collections::HashSet<u32> = params.iter().map(|p| p.id).collect();
-        let already: std::collections::HashSet<u32> = auto_captures.iter().copied().collect();
-        let mut sorted: Vec<u32> = closure_referenced_ids.iter().copied().collect();
-        sorted.sort();
-        for id in sorted {
-            if !param_ids.contains(&id)
-                && !closure_declared_ids.contains(&id)
-                && !already.contains(&id)
-                && !module_globals.contains_key(&id)
-            {
-                auto_captures.push(id);
-            }
-        }
-    }
+    let auto_captures = crate::type_analysis::compute_auto_captures_with_globals(
+        params,
+        body,
+        captures,
+        module_globals,
+    );
     let closure_captures: HashMap<u32, u32> = auto_captures
         .iter()
         .enumerate()
@@ -758,6 +750,23 @@ pub(super) fn compile_closure(
             );
             let v = blk.bitcast_i64_to_double(&bits);
             blk.store(DOUBLE, &v, &slot);
+        } else if let Some(class_id) = enclosing_class
+            .as_ref()
+            .and_then(|class_name| class_ids.get(class_name))
+            .copied()
+            .filter(|class_id| *class_id != 0)
+        {
+            // Static field initialization substitutes lexical `this` with the
+            // class constructor and then drops the ordinary this-capture slot.
+            // `super.x` encodes its receiver implicitly, though, so there is no
+            // Expr::This node for that substitution to rewrite. Seed the
+            // closure's synthetic this slot with the enclosing ClassRef rather
+            // than the old 0.0 sentinel so arrows in static fields retain the
+            // class constructor as their SuperProperty receiver.
+            let class_ref = crate::nanbox::double_literal(f64::from_bits(
+                crate::nanbox::INT32_TAG | class_id as u64,
+            ));
+            blk.store(DOUBLE, &class_ref, &slot);
         } else {
             blk.store(DOUBLE, "0.0", &slot);
         }
@@ -907,6 +916,41 @@ pub(super) fn compile_closure(
         })
     };
 
+    // The private exact-arrow clone is entered only after the runtime has
+    // verified the public closure identity and its compiler-installed raw-box
+    // capture mask. Capture slots never change. Load each box pointer once,
+    // before user code or a safepoint can relocate the closure, and retain the
+    // non-moving box pointer for the invocation. This removes the repeated
+    // checked closure-capture helper from hot callback bodies without caching
+    // the mutable VALUE stored inside the box.
+    let trusted_box_capture_ptrs = if trusted_box_captures {
+        let mut trusted = HashMap::new();
+        let mut boxed_captures: Vec<_> = closure_captures
+            .iter()
+            .filter(|(id, _)| closure_boxed_vars.contains(id))
+            .map(|(id, index)| (*id, *index))
+            .collect();
+        boxed_captures.sort_unstable_by_key(|(_, index)| *index);
+        if !boxed_captures.is_empty() {
+            let header_size =
+                crate::target_layout::closure_header_size_bytes(&cross_module.target_triple)
+                    .to_string();
+            let blk = lf.block_mut(0).expect("closure body has an entry block");
+            let closure_ptr = blk.inttoptr(I64, "%this_closure");
+            let captures_base = blk.gep(I8, &closure_ptr, &[(I64, &header_size)]);
+            for (id, index) in boxed_captures {
+                let index = index.to_string();
+                let capture_slot = blk.gep(I64, &captures_base, &[(I64, &index)]);
+                let bits = blk.load(I64, &capture_slot);
+                let ptr = blk.inttoptr(I64, &bits);
+                trusted.insert(id, crate::expr::TrustedBoxCapturePtr { bits, ptr });
+            }
+        }
+        trusted
+    } else {
+        HashMap::new()
+    };
+
     let mut ctx = FnCtx {
         func: lf,
         module_slug: crate::expr::native_region_slug(strings.module_prefix()),
@@ -934,6 +978,18 @@ pub(super) fn compile_closure(
         this_stack,
         new_target_stack,
         class_stack,
+        super_called_stack: Vec::new(),
+        shared_super_scope_active: false,
+        lexical_this_uses_derived_binding: captures_this
+            && enclosing_class
+                .as_ref()
+                .and_then(|name| classes.get(name).copied())
+                .is_some_and(|class| {
+                    class.extends.is_some()
+                        || class.extends_name.is_some()
+                        || class.native_extends.is_some()
+                        || class.extends_expr.is_some()
+                }),
         inline_ctor_return: Vec::new(),
         methods,
         module_globals,
@@ -978,6 +1034,8 @@ pub(super) fn compile_closure(
         local_closure_func_ids: HashMap::new(),
         local_closure_param_counts: HashMap::new(),
         resolved_arrow_callback_targets: HashMap::new(),
+        trusted_box_captures,
+        trusted_box_capture_ptrs,
         local_func_ref_ids: HashMap::new(),
         option_object_locals: HashMap::new(),
         object_literal_locals: HashSet::new(),
@@ -1023,6 +1081,7 @@ pub(super) fn compile_closure(
         class_shape_slots: HashMap::new(),
         class_header_images: HashMap::new(),
         cached_lengths: HashMap::new(),
+        array_length_snapshots: HashMap::new(),
         bounded_index_pairs: Vec::new(),
         packed_f64_loop_facts: Vec::new(),
         masked_window_array_facts: Vec::new(),
@@ -1096,6 +1155,9 @@ pub(super) fn compile_closure(
         typed_f64_methods: &cross_module.typed_f64_methods,
         pshape_methods: &cross_module.pshape_methods,
         nonnegative_index_methods: &cross_module.nonnegative_index_methods,
+        trusted_array_param_handles: HashMap::new(),
+        versioned_indexed_loop_facts: Vec::new(),
+        stable_packed_loop_facts: Vec::new(),
         pshape_tower_routable: &cross_module.pshape_tower_routable,
         proven_this: None,
         typed_i32_methods: &cross_module.typed_i32_methods,
@@ -1181,21 +1243,23 @@ pub(super) fn compile_closure(
     for raw in &typed_parse_rodata {
         llmod.add_raw_global(raw.clone());
     }
-    if let Some(kind) = typed_public_trampoline {
-        let capture_reps = cross_module
-            .typed_closure_capture_reps
-            .get(&func_id)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        emit_public_typed_closure_trampoline(
-            llmod,
-            func_id,
-            closure_expr,
-            module_prefix,
-            &llvm_name,
-            kind,
-            capture_reps,
-        )?;
+    if !trusted_box_captures {
+        if let Some(kind) = typed_public_trampoline {
+            let capture_reps = cross_module
+                .typed_closure_capture_reps
+                .get(&func_id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            emit_public_typed_closure_trampoline(
+                llmod,
+                func_id,
+                closure_expr,
+                module_prefix,
+                &llvm_name,
+                kind,
+                capture_reps,
+            )?;
+        }
     }
     Ok(())
 }

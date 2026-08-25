@@ -1154,29 +1154,9 @@ detail = "checksum function raw numeric field write canonicalizes and performs a
 allow_materialization_reasons = ["runtime_api", "return_abi"]
 
 [[workloads.raw_numeric_object_fields.native_rep_checks.require_records]]
-name = "raw_scalar_ctor_field_store_raw_f64"
+name = "raw_scalar_field_store_raw_f64"
 source_function = "rawNumericObjectFieldsChecksum"
-expr_kind = "ScalarThisFieldSet"
-consumer = "scalar_object_field_store.raw_f64"
-native_rep_name = "f64"
-access_mode = "none"
-consumed_fact_kind = "representation"
-consumed_fact_state = "consumed"
-
-[[workloads.raw_numeric_object_fields.native_rep_checks.require_records]]
-name = "raw_scalar_field_load_raw_f64"
-source_function = "rawNumericObjectFieldsChecksum"
-expr_kind = "ScalarObjectFieldGet"
-consumer = "scalar_object_field_load.raw_f64"
-native_rep_name = "f64"
-access_mode = "none"
-consumed_fact_kind = "representation"
-consumed_fact_state = "consumed"
-
-[[workloads.raw_numeric_object_fields.native_rep_checks.require_records]]
-name = "raw_scalar_ctor_field_store_raw_f64"
-source_function = "rawNumericObjectFieldsChecksum"
-expr_kind = "ScalarThisFieldSet"
+expr_kind = "ScalarObjectFieldSet"
 consumer = "scalar_object_field_store.raw_f64"
 native_rep_name = "f64"
 access_mode = "none"
@@ -1349,17 +1329,29 @@ function_contains = "scalarReplacementChecksum"
 regex_none = ["@js_object_get_field", "@js_object_set_field", "@js_array_get", "@js_array_set"]
 detail = "scalar-replaced literals do not use runtime property or array access helpers"
 
+[[workloads.scalar_replacement_literals.ir_checks]]
+name = "known_aggregate_call_no_object_or_array_heap_alloc"
+function_contains = "scalarAggregateCallChecksum"
+regex_none = ["@js_object_alloc", "@js_object_alloc_with_shape", "@js_array_alloc"]
+detail = "known fixed-aggregate consumers scalar-replace descriptor objects and carrier arrays"
+
+[[workloads.scalar_replacement_literals.ir_checks]]
+name = "known_aggregate_call_no_property_or_array_runtime_access"
+function_contains = "scalarAggregateCallChecksum"
+regex_none = ["@js_object_get_field", "@js_object_set_field", "@js_array_get", "@js_array_set"]
+detail = "known fixed-aggregate consumers read scalar fields without runtime aggregate helpers"
+
 [[workloads.scalar_replacement_literals.stdout_checks]]
 name = "scalar_replacement_checksum"
-equals = "17\n"
+equals = "17\n3000000\n"
 detail = "scalar-replacement fixture stdout checksum"
 
 [workloads.scalar_replacement_literals.native_rep_checks]
-function_contains = "scalarReplacementChecksum"
 allow_materialization_reasons = ["runtime_api"]
 
 [[workloads.scalar_replacement_literals.native_rep_checks.require_records]]
 name = "scalar_object_literal_store"
+source_function = "scalarReplacementChecksum"
 expr_kind = "ScalarObjectLiteralInit"
 consumer = "scalar_object_field_store"
 native_rep_name = "js_value"
@@ -1367,6 +1359,7 @@ access_mode = "none"
 
 [[workloads.scalar_replacement_literals.native_rep_checks.require_records]]
 name = "scalar_object_field_get"
+source_function = "scalarReplacementChecksum"
 expr_kind = "ScalarObjectFieldGet"
 consumer = "scalar_object_field_load"
 native_rep_name = "js_value"
@@ -1374,6 +1367,7 @@ access_mode = "none"
 
 [[workloads.scalar_replacement_literals.native_rep_checks.require_records]]
 name = "scalar_object_field_set"
+source_function = "scalarReplacementChecksum"
 expr_kind = "ScalarObjectFieldSet"
 consumer = "scalar_object_field_store"
 native_rep_name = "js_value"
@@ -1381,6 +1375,7 @@ access_mode = "none"
 
 [[workloads.scalar_replacement_literals.native_rep_checks.require_records]]
 name = "scalar_array_literal_store"
+source_function = "scalarReplacementChecksum"
 expr_kind = "ScalarArrayLiteralInit"
 consumer = "scalar_array_element_store"
 native_rep_name = "js_value"
@@ -1388,10 +1383,21 @@ access_mode = "none"
 
 [[workloads.scalar_replacement_literals.native_rep_checks.require_records]]
 name = "scalar_array_index_get"
+source_function = "scalarReplacementChecksum"
 expr_kind = "ScalarArrayIndexGet"
 consumer = "scalar_array_element_load"
 native_rep_name = "js_value"
 access_mode = "none"
+
+[[workloads.scalar_replacement_literals.native_rep_checks.require_records]]
+name = "known_aggregate_call_scalar_fields"
+source_function = "scalarAggregateCallChecksum"
+expr_kind = "ScalarAggregateFieldInit"
+consumer = "scalar_object_field_store"
+native_rep_name = "js_value"
+access_mode = "none"
+notes_contains = "carrier_array=elided"
+min = 4
 
 [workloads.width_aware_buffer_kernels]
 source = "benchmarks/compiler_output/fixtures/width_aware_buffer_kernels.ts"
@@ -2036,3 +2042,95 @@ allow_materialization_reasons = [
   "unknown_bounds",
   "dynamic_escape",
 ]
+
+[workloads.for_in_stable_keys]
+source = "benchmarks/compiler_output/fixtures/for_in_stable_keys.ts"
+kind = "for_in_stable_keys"
+allow_dynamic_property_runtime = true
+allow_hot_loop_conversions = true
+allowed_hot_loop_runtime_calls = [
+  "js_array_get",
+  "js_array_length",
+  "js_dyn_index_get",
+  "js_dynamic_string_or_number_add",
+  "js_for_in_keys_stable_value",
+  "js_gc_loop_safepoint",
+  "js_in_operator",
+  "js_value_typeof",
+]
+
+[workloads.for_in_stable_keys.vectorization]
+min_vectorized_loops = 0
+scalar_baseline = "allowed: dynamic for-in semantics require guarded runtime enumeration"
+allowed_missed_reason_kinds = [
+  "call_instruction",
+  "control_flow",
+  "generic_not_vectorized",
+  "not_beneficial",
+  "uncountable_loop",
+  "unknown_trip_count",
+  "unsupported_instruction",
+  "unsupported_reduction",
+]
+
+[workloads.for_in_stable_keys.runtime_budgets]
+
+[[workloads.for_in_stable_keys.stdout_checks]]
+name = "for_in_stable_keys_checksum"
+equals = "for_in_stable_keys:200000\n"
+detail = "the stable registry fixture retains exact for-in semantics"
+
+[[workloads.for_in_stable_keys.ir_checks]]
+name = "stable_registry_uses_guarded_for_in_helper"
+section = "llvm_before"
+function_contains = "sumRegistry"
+contains = "call i64 @js_for_in_keys_stable_value"
+detail = "the registry loop enters the guarded stable-key helper"
+
+[[workloads.for_in_stable_keys.ir_checks]]
+name = "stable_registry_avoids_generic_enumeration_helpers"
+section = "llvm_before"
+function_contains = "sumRegistry"
+regex_none = [
+  "call i64 @js_for_in_keys_value",
+  "call i64 @js_object_keys",
+  "call i64 @js_object_get_own_property_names",
+]
+detail = "the stable arm does not directly allocate or rebuild generic key lists"
+
+[workloads.issue_8693_imported_this]
+source = "test-files/fixtures/issue_8693_imported_this/main.js"
+kind = "imported_class_method_specialization"
+allow_hot_loop_conversions = true
+allow_dynamic_property_runtime = true
+
+[workloads.issue_8693_imported_this.vectorization]
+min_vectorized_loops = 0
+scalar_baseline = "allowed: this fixture gates cross-module method dispatch, not loop vectorization"
+allowed_missed_reason_kinds = [
+  "call_instruction",
+  "control_flow",
+  "generic_not_vectorized",
+  "not_beneficial",
+  "uncountable_loop",
+  "unknown_trip_count",
+  "unsupported_instruction",
+  "unsupported_reduction",
+]
+
+[workloads.issue_8693_imported_this.runtime_budgets]
+
+[workloads.issue_8693_imported_this.native_rep_checks]
+allow_materialization_reasons = ["runtime_api"]
+
+[[workloads.issue_8693_imported_this.native_rep_checks.require_records]]
+name = "imported_registry_proven_this_selection"
+consumer = "proven_this_method_direct_call"
+notes_contains = "receiver_provenance=imported_class_metadata"
+min = 2
+
+[[workloads.issue_8693_imported_this.native_rep_checks.require_records]]
+name = "imported_registry_generic_fallback_retained"
+consumer = "proven_this_method_direct_call"
+notes_contains = "generic_dispatch_fallback=js_native_call_method_by_id"
+min = 2

@@ -1,6 +1,6 @@
 // Auto-generated from Perry's API manifest (#465). Do not edit by hand.
 // Source: perry-api-manifest::API_MANIFEST
-// Coverage: 2051 entries across 133 modules
+// Coverage: 2065 entries across 135 modules
 
 type PerryI8 = number & { readonly __perryI8?: never };
 type PerryI16 = number & { readonly __perryI16?: never };
@@ -370,8 +370,10 @@ declare module "bun:ffi" {
   /** stdlib */
   export const FFIType: any;
   /** stdlib */
+  export const read: any;
+  /** stdlib */
   export const suffix: any;
-  /** stdlib @perryStub stage 3 — not yet implemented, throws at runtime (#6562) */
+  /** stdlib */
   export function CFunction(...args: any[]): any;
   /** stdlib */
   export function CString(...args: any[]): any;
@@ -379,17 +381,15 @@ declare module "bun:ffi" {
   export function JSCallback(...args: any[]): any;
   /** stdlib */
   export function dlopen(...args: any[]): any;
-  /** stdlib @perryStub stage ≥2 — not yet implemented, throws at runtime (#6562) */
+  /** stdlib */
   export function linkSymbols(...args: any[]): any;
   /** stdlib */
   export function ptr(...args: any[]): any;
-  /** stdlib @perryStub stage ≥2 — not yet implemented, throws at runtime (#6562) */
-  export function read(...args: any[]): any;
   /** stdlib */
   export function toArrayBuffer(...args: any[]): any;
   /** stdlib */
   export function toBuffer(...args: any[]): any;
-  /** stdlib @perryStub stage ≥2 — not yet implemented, throws at runtime (#6562) */
+  /** stdlib */
   export function viewSource(...args: any[]): any;
 }
 
@@ -1585,6 +1585,21 @@ declare module "fetch" {
   export default function (...args: any[]): any;
 }
 
+declare module "ffi" {
+  /** stdlib */
+  export const suffix: any;
+  /** stdlib */
+  export function dlopen(...args: any[]): any;
+  /** stdlib */
+  export function getRawPointer(...args: any[]): any;
+  /** stdlib */
+  export function toArrayBuffer(...args: any[]): any;
+  /** stdlib */
+  export function toBuffer(...args: any[]): any;
+  /** stdlib */
+  export function toString(...args: any[]): any;
+}
+
 declare module "fs" {
   /** stdlib */
   export class Dir { [key: string]: any; }
@@ -2709,6 +2724,23 @@ declare module "perry/i18n" {
   export function ShortDate(...args: any[]): any;
   /** stdlib */
   export function t(...args: any[]): any;
+}
+
+declare module "perry/ios" {
+  /** stdlib */
+  export function createLanguageModelSession(...args: any[]): any;
+  /** stdlib */
+  export function destroyLanguageModelSession(...args: any[]): any;
+  /** stdlib */
+  export function foundationModelAvailability(...args: any[]): any;
+  /** stdlib */
+  export function getLayoutEnvironment(...args: any[]): any;
+  /** stdlib */
+  export function offLayoutChange(...args: any[]): any;
+  /** stdlib */
+  export function onLayoutChange(...args: any[]): any;
+  /** stdlib */
+  export function respond(...args: any[]): any;
 }
 
 declare module "perry/media" {
@@ -4018,6 +4050,8 @@ declare module "tls" {
   export function createServer(options: any, secureConnectionListener: any): any;
   /** stdlib */
   export function getCACertificates(type: any): any;
+  /** stdlib */
+  export function getCertificateCompressionAlgorithms(...args: any[]): any;
   /** stdlib */
   export function getCiphers(...args: any[]): any;
   /** stdlib */

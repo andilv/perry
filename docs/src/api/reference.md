@@ -2,7 +2,7 @@
 
 This page is auto-generated from Perry's compile-time API manifest (`perry-api-manifest::API_MANIFEST`). It is the source of truth for what `perry compile` accepts; references to symbols not listed here produce `R005 UnimplementedApi` (issue #463). Stubs (#464) are flagged ⚠ — they link cleanly but no-op at runtime on the chosen target.
 
-Total: 2988 entries across 135 modules.
+Total: 3015 entries across 137 modules.
 
 ## Modules
 
@@ -52,6 +52,7 @@ Total: 2988 entries across 135 modules.
 - [`exponential-backoff`](#exponential-backoff)
 - [`fastify`](#fastify)
 - [`fetch`](#fetch)
+- [`ffi`](#ffi)
 - [`fs`](#fs)
 - [`fs/promises`](#fspromises)
 - [`http`](#http)
@@ -91,6 +92,7 @@ Total: 2988 entries across 135 modules.
 - [`perry/container-compose`](#perrycontainer-compose)
 - [`perry/gc`](#perrygc)
 - [`perry/i18n`](#perryi18n)
+- [`perry/ios`](#perryios)
 - [`perry/media`](#perrymedia)
 - [`perry/native`](#perrynative)
 - [`perry/plugin`](#perryplugin)
@@ -436,20 +438,20 @@ Total: 2988 entries across 135 modules.
 
 ### Methods
 
-- `CFunction` — module ⚠ **stub** — stage 3 — not yet implemented, throws at runtime (#6562)
+- `CFunction` — module
 - `CString` — module
 - `JSCallback` — module
 - `dlopen` — module
-- `linkSymbols` — module ⚠ **stub** — stage ≥2 — not yet implemented, throws at runtime (#6562)
+- `linkSymbols` — module
 - `ptr` — module
-- `read` — module ⚠ **stub** — stage ≥2 — not yet implemented, throws at runtime (#6562)
 - `toArrayBuffer` — module
 - `toBuffer` — module
-- `viewSource` — module ⚠ **stub** — stage ≥2 — not yet implemented, throws at runtime (#6562)
+- `viewSource` — module
 
 ### Properties
 
 - `FFIType`
+- `read`
 - `suffix`
 
 ## `bun:sqlite`
@@ -1425,6 +1427,20 @@ Total: 2988 entries across 135 modules.
 
 - `default` — module
 
+## `ffi`
+
+### Methods
+
+- `dlopen` — module
+- `getRawPointer` — module
+- `toArrayBuffer` — module
+- `toBuffer` — module
+- `toString` — module
+
+### Properties
+
+- `suffix`
+
 ## `fs`
 
 ### Classes
@@ -1609,6 +1625,7 @@ Total: 2988 entries across 135 modules.
 - `__get_aborted` — instance *(class: `ClientRequest`)*
 - `__get_aborted` — instance *(class: `IncomingMessage`)*
 - `__get_complete` — instance *(class: `IncomingMessage`)*
+- `__get_connection` — instance *(class: `IncomingMessage`)*
 - `__get_connection` — instance *(class: `ClientRequest`)*
 - `__get_createConnection` — instance *(class: `Agent`)*
 - `__get_createSocket` — instance *(class: `Agent`)*
@@ -1641,9 +1658,11 @@ Total: 2988 entries across 135 modules.
 - `__get_path` — instance *(class: `ClientRequest`)*
 - `__get_protocol` — instance *(class: `Agent`)*
 - `__get_protocol` — instance *(class: `ClientRequest`)*
+- `__get_req` — instance *(class: `IncomingMessage`)*
 - `__get_requestTimeout` — instance *(class: `HttpServer`)*
 - `__get_requests` — instance *(class: `Agent`)*
 - `__get_reusedSocket` — instance *(class: `ClientRequest`)*
+- `__get_socket` — instance *(class: `IncomingMessage`)*
 - `__get_socket` — instance *(class: `ClientRequest`)*
 - `__get_sockets` — instance *(class: `Agent`)*
 - `__get_statusCode` — instance *(class: `IncomingMessage`)*
@@ -1687,6 +1706,7 @@ Total: 2988 entries across 135 modules.
 - `close` — instance *(class: `HttpServer`)*
 - `closeAllConnections` — instance *(class: `HttpServer`)*
 - `closeIdleConnections` — instance *(class: `HttpServer`)*
+- `connection` — instance *(class: `IncomingMessage`)*
 - `cork` — instance *(class: `ClientRequest`)*
 - `cork` — instance *(class: `ServerResponse`)*
 - `createServer` — module
@@ -1738,6 +1758,7 @@ Total: 2988 entries across 135 modules.
 - `ref` — instance *(class: `HttpServer`)*
 - `removeHeader` — instance *(class: `ClientRequest`)*
 - `removeHeader` — instance *(class: `ServerResponse`)*
+- `req` — instance *(class: `IncomingMessage`)*
 - `request` — module
 - `requestTimeout` — instance *(class: `HttpServer`)*
 - `requests` — instance *(class: `Agent`)*
@@ -1756,6 +1777,7 @@ Total: 2988 entries across 135 modules.
 - `setTimeout` — instance *(class: `IncomingMessage`)*
 - `setTimeout` — instance *(class: `ClientRequest`)*
 - `setTimeout` — instance *(class: `ServerResponse`)*
+- `socket` — instance *(class: `IncomingMessage`)*
 - `sockets` — instance *(class: `Agent`)*
 - `statusCode` — instance *(class: `IncomingMessage`)*
 - `statusMessage` — instance *(class: `IncomingMessage`)*
@@ -2215,10 +2237,16 @@ Total: 2988 entries across 135 modules.
 - `getConnections` — instance *(class: `Server`)*
 - `getDefaultAutoSelectFamily` — module
 - `getDefaultAutoSelectFamilyAttemptTimeout` — module
+- `getEphemeralKeyInfo` — instance *(class: `Socket`)*
+- `getFinished` — instance *(class: `Socket`)*
 - `getPeerCertificate` — instance *(class: `Socket`)*
+- `getPeerFinished` — instance *(class: `Socket`)*
+- `getPeerX509Certificate` — instance *(class: `Socket`)*
 - `getProtocol` — instance *(class: `Socket`)*
 - `getSession` — instance *(class: `Socket`)*
+- `getSharedSigalgs` — instance *(class: `Socket`)*
 - `getTypeOfService` — instance *(class: `Socket`)*
+- `getX509Certificate` — instance *(class: `Socket`)*
 - `isBlockList` — module *(class: `BlockList`)*
 - `isIP` — module
 - `isIPv4` — module
@@ -2262,6 +2290,7 @@ Total: 2988 entries across 135 modules.
 - `setDefaultEncoding` — instance *(class: `Socket`)*
 - `setEncoding` — instance *(class: `Socket`)*
 - `setKeepAlive` — instance *(class: `Socket`)*
+- `setKeyCert` — instance *(class: `Socket`)*
 - `setMaxSendFragment` — instance *(class: `Socket`)*
 - `setNoDelay` — instance *(class: `Socket`)*
 - `setTimeout` — instance *(class: `Socket`)*
@@ -2603,6 +2632,18 @@ Total: 2988 entries across 135 modules.
 - `Raw` — module
 - `ShortDate` — module
 - `t` — module
+
+## `perry/ios`
+
+### Methods
+
+- `createLanguageModelSession` — module
+- `destroyLanguageModelSession` — module
+- `foundationModelAvailability` — module
+- `getLayoutEnvironment` — module
+- `offLayoutChange` — module
+- `onLayoutChange` — module
+- `respond` — module
 
 ## `perry/media`
 
@@ -3633,6 +3674,7 @@ Total: 2988 entries across 135 modules.
 - `createServer` — module
 - `eventNames` — instance *(class: `Server`)*
 - `getCACertificates` — module
+- `getCertificateCompressionAlgorithms` — module
 - `getCiphers` — module
 - `getTicketKeys` — instance *(class: `Server`)*
 - `listen` — instance *(class: `Server`)*

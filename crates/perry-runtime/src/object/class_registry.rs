@@ -21,19 +21,21 @@ pub use super::class_handles::{
     event_emitter_handle_probe, event_emitter_on, event_emitter_set_domain,
     fetch_handle_kind_probe, handle_method_dispatch, handle_own_property_names_dispatch,
     handle_property_dispatch, handle_property_set_dispatch, handle_prototype_dispatch,
-    js_register_event_emitter_async_resource_handle_probe, js_register_event_emitter_get_domain,
-    js_register_event_emitter_handle_probe, js_register_event_emitter_on,
-    js_register_event_emitter_set_domain, js_register_fetch_handle_kind_probe,
-    js_register_handle_method_dispatch, js_register_handle_own_property_names_dispatch,
-    js_register_handle_property_dispatch, js_register_handle_property_set_dispatch,
-    js_register_handle_prototype_dispatch, js_register_net_socket_handle_probe,
+    http_agent_handle_probe, js_register_event_emitter_async_resource_handle_probe,
+    js_register_event_emitter_get_domain, js_register_event_emitter_handle_probe,
+    js_register_event_emitter_on, js_register_event_emitter_set_domain,
+    js_register_fetch_handle_kind_probe, js_register_handle_method_dispatch,
+    js_register_handle_own_property_names_dispatch, js_register_handle_property_dispatch,
+    js_register_handle_property_set_dispatch, js_register_handle_prototype_dispatch,
+    js_register_http_agent_handle_probe, js_register_net_socket_handle_probe,
     js_register_stream_expando_set, js_register_stream_handle_kind_probe,
-    js_register_stream_handle_probe, net_socket_handle_probe, stream_expando_set,
-    stream_handle_kind_probe, stream_handle_probe, EventEmitterAsyncResourceHandleProbeFn,
-    EventEmitterGetDomainFn, EventEmitterHandleProbeFn, EventEmitterOnFn, EventEmitterSetDomainFn,
-    FetchHandleKindProbeFn, HandleMethodDispatchFn, HandleOwnPropertyNamesDispatchFn,
-    HandlePropertyDispatchFn, HandlePropertySetDispatchFn, HandlePrototypeDispatchFn,
-    NetSocketHandleProbeFn, StreamHandleKindProbeFn, StreamHandleProbeFn,
+    js_register_stream_handle_probe, js_register_tls_handle_kind_probe, net_socket_handle_probe,
+    stream_expando_set, stream_handle_kind_probe, stream_handle_probe, tls_handle_kind_probe,
+    EventEmitterAsyncResourceHandleProbeFn, EventEmitterGetDomainFn, EventEmitterHandleProbeFn,
+    EventEmitterOnFn, EventEmitterSetDomainFn, FetchHandleKindProbeFn, HandleMethodDispatchFn,
+    HandleOwnPropertyNamesDispatchFn, HandlePropertyDispatchFn, HandlePropertySetDispatchFn,
+    HandlePrototypeDispatchFn, HttpAgentHandleProbeFn, NetSocketHandleProbeFn,
+    StreamHandleKindProbeFn, StreamHandleProbeFn, TlsHandleKindProbeFn,
 };
 use super::*;
 
@@ -42,6 +44,7 @@ mod class_meta;
 mod construct;
 pub(crate) use construct::scan_current_new_target_root_mut;
 mod dispatch;
+mod function_prototype;
 mod gc_roots;
 pub(crate) mod parent_static;
 mod prototype_methods;
@@ -54,7 +57,7 @@ mod vm_brand;
 #[cfg(test)]
 pub(crate) use state::class_decl_prototype_object_root_store;
 pub(crate) use state::{
-    class_decl_prototype_object, class_decl_prototype_value,
+    class_decl_prototype_method_names, class_decl_prototype_object, class_decl_prototype_value,
     class_decl_prototype_value_for_instance_class, class_delete_own_dynamic_prop,
     class_dynamic_prop_root_store, class_has_own_dynamic_prop, class_id_for_decl_prototype_object,
     class_is_key_deleted, class_mark_key_deleted, class_object_value_for_cid,
@@ -62,9 +65,9 @@ pub(crate) use state::{
     class_parent_closure, class_parent_closure_root_store, class_prototype_method_is_enumerable,
     class_prototype_method_set_enumerable, class_prototype_method_value_cache_root_store,
     class_prototype_object_root_store, class_static_defined_attrs, class_static_set_defined_attrs,
-    global_object_prototype_bits, is_bound_native_method_closure_value,
-    is_non_constructable_builtin_function_value, parent_closure_in_chain,
-    throw_non_constructable_builtin_function,
+    class_unmark_key_deleted, global_object_prototype_bits,
+    is_bound_native_constructor_closure_value, is_non_constructable_builtin_function_value,
+    parent_closure_in_chain, throw_non_constructable_builtin_function,
 };
 pub use state::{
     ClassVTable, VTableMethodEntry, CLASS_DECL_PROTOTYPE_OBJECTS, CLASS_DYNAMIC_PARENT_VALUE,
@@ -88,10 +91,11 @@ pub(crate) use class_meta::test_text_encoding_stream_new_with_constructor;
 #[cfg(feature = "global-text")]
 pub(crate) use class_meta::text_decoder_bool_option;
 pub use class_meta::{
-    class_name_for_id, is_anon_shape_class_id, js_compression_stream_new,
+    class_length_for_id, class_name_for_id, is_anon_shape_class_id, js_compression_stream_new,
     js_decompression_stream_new, js_register_anon_shape_class_id, js_register_class_id,
-    js_register_class_name, js_text_decoder_stream_new, js_text_encoder_stream_new,
-    js_text_encoding_stream_new, ANON_SHAPE_CLASS_IDS, CLASS_NAMES,
+    js_register_class_length, js_register_class_name, js_text_decoder_stream_new,
+    js_text_encoder_stream_new, js_text_encoding_stream_new, ANON_SHAPE_CLASS_IDS, CLASS_LENGTHS,
+    CLASS_NAMES,
 };
 pub(crate) use class_meta::{
     identify_global_builtin_constructor, report_dispatch_miss,
@@ -100,12 +104,16 @@ pub(crate) use class_meta::{
     CLASS_ID_TEXT_ENCODER_STREAM,
 };
 #[cfg(test)]
-pub(crate) use prototype_methods::CLASS_PROTOTYPE_FAST_GUARDS_INVALIDATED;
+pub(crate) use prototype_methods::{
+    class_prototype_fast_guards_invalidated, CLASS_PROTOTYPE_FAST_GUARDS_INVALIDATED,
+    CLASS_PROTOTYPE_FAST_GUARDS_INVALIDATED_BY_METHOD,
+};
 
 // ── prototype_methods.rs ────────────────────────────────────────────────────
 pub(crate) use prototype_methods::{
-    class_prototype_fast_guards_invalidated, class_prototype_method_root_store,
-    invalidate_class_prototype_fast_guards, mirror_prototype_method_on_object,
+    class_prototype_fast_guard_invalidated_for_method, class_prototype_method_guard_slot,
+    class_prototype_method_root_remove, class_prototype_method_root_store,
+    invalidate_class_prototype_fast_guards_for_method, mirror_prototype_method_on_object,
     synthetic_class_id_for_function,
 };
 pub use prototype_methods::{
@@ -115,15 +123,18 @@ pub use prototype_methods::{
 
 // ── construct.rs / vm_brand.rs ──────────────────────────────────────────────
 pub(crate) use construct::{
-    extends_target_must_throw, function_would_have_own_prototype, is_callable_function_value,
-    js_value_is_constructor, lookup_prototype_method, nm_ctor_child_process, nm_ctor_cluster,
+    extends_target_must_throw, is_callable_function_value, js_value_is_constructor,
+    lookup_own_prototype_method, lookup_prototype_method, nm_ctor_child_process, nm_ctor_cluster,
     nm_ctor_fs, nm_ctor_readline, nm_ctor_repl, nm_ctor_stream, nm_ctor_tls, nm_ctor_tty,
-    nm_ctor_vm, nm_ctor_wasi, ordinary_function_prototype_value_for_read, promise_parent_in_chain,
+    nm_ctor_vm, nm_ctor_wasi, promise_parent_in_chain,
 };
 pub use construct::{
-    js_ctor_return_override, js_function_prototype_value_for_read, js_new_function_construct,
-    js_new_function_construct_apply, js_new_function_construct_with_new_target,
-    js_new_target_value,
+    js_ctor_return_override, js_new_function_construct, js_new_function_construct_apply,
+    js_new_function_construct_with_new_target, js_new_target_value,
+};
+pub use function_prototype::js_function_prototype_value_for_read;
+pub(crate) use function_prototype::{
+    function_would_have_own_prototype, ordinary_function_prototype_value_for_read,
 };
 pub(crate) use vm_brand::brand_vm_script_instance;
 
@@ -135,10 +146,11 @@ pub(crate) use gc_roots::{
 pub use gc_roots::{scan_class_side_table_roots, scan_class_side_table_roots_mut};
 #[cfg(test)]
 pub(crate) use gc_roots::{
-    test_class_dynamic_prop_root_bits, test_class_parent_closure_root_addr,
-    test_class_prototype_method_root_bits, test_class_prototype_method_value_root_bits,
-    test_class_prototype_object_root_addr, test_clear_class_side_table_roots,
-    test_function_class_id_key_count, test_function_class_id_key_for_class,
+    test_class_decl_prototype_object_root_addr, test_class_dynamic_prop_root_bits,
+    test_class_parent_closure_root_addr, test_class_prototype_method_root_bits,
+    test_class_prototype_method_value_root_bits, test_class_prototype_object_root_addr,
+    test_clear_class_side_table_roots, test_function_class_id_key_count,
+    test_function_class_id_key_for_class, test_seed_class_decl_prototype_object_root,
     test_seed_class_dynamic_prop_root, test_seed_class_prototype_method_root,
     test_seed_class_prototype_method_value_root, test_seed_class_prototype_object_root,
     test_seed_function_class_id_key,
@@ -159,19 +171,24 @@ pub use registration::{
 #[cfg(test)]
 pub(crate) use dispatch::test_bump_vtable_generation;
 pub(crate) use dispatch::{
-    call_vtable_method, fetch_parent_kind_in_chain, obj_dispatch_ic_insert, obj_dispatch_ic_lookup,
-    vtable_generation, vtable_ic_insert, vtable_ic_lookup, VTABLE_GEN,
+    call_vtable_method, call_vtable_method_with_private_brand, fetch_parent_kind_in_chain,
+    obj_dispatch_ic_insert, obj_dispatch_ic_lookup, vtable_generation, vtable_ic_insert,
+    vtable_ic_lookup, VTABLE_GEN,
 };
 
 // ── parent_static.rs ────────────────────────────────────────────────────────
 pub(crate) use parent_static::{
-    call_registered_static_method, call_static_method, class_chain_has_instance_accessor,
-    class_has_instance_getter, class_has_own_static_method, class_has_symbol_member_in_chain,
-    class_instance_setter_apply, class_method_bind_length, class_object_own_field_bytes,
-    class_object_pinned_parent, class_own_symbol_member_keys, class_static_accessor_getter_value,
-    class_static_accessor_setter_apply, class_symbol_getter_value, class_symbol_setter_apply,
-    get_parent_class_id, lookup_class_symbol_method_in_chain, lookup_static_method_in_chain,
-    register_class,
+    call_private_static_method_for_owner, call_registered_static_method, call_static_method,
+    class_chain_has_instance_accessor, class_dynamic_static_accessor_descriptor,
+    class_dynamic_static_accessor_getter_value, class_has_instance_getter,
+    class_has_own_static_method, class_has_symbol_member_in_chain, class_instance_setter_apply,
+    class_method_bind_length, class_object_own_field_bytes, class_object_pinned_parent,
+    class_own_symbol_accessor_ptrs, class_own_symbol_member_keys, class_own_symbol_method,
+    class_private_instance_getter_value, class_private_instance_setter_apply,
+    class_static_accessor_getter_value, class_static_accessor_setter_apply,
+    class_symbol_getter_value, class_symbol_setter_apply, get_parent_class_id,
+    lookup_class_symbol_method_in_chain, lookup_static_method_in_chain, register_class,
+    register_class_dynamic_static_accessor,
 };
 pub use parent_static::{
     is_class_object_ptr, is_class_object_value, is_registered_class_prototype_object,

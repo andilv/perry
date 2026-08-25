@@ -1376,7 +1376,9 @@ pub fn build_inline_arg_bindings(
             // local (`function f(a){a++}; f(x)` mutated x — S13.2.1_A6),
             // and substituting a literal would produce `5++`.
             let force_let = mutated_params.contains(&param.id);
-            if is_trivial_expr(arg) && !trivial_in_closure && !force_let {
+            let preserve_value_boundary = inline_arg_needs_value_boundary(param, arg);
+            if is_trivial_expr(arg) && !trivial_in_closure && !force_let && !preserve_value_boundary
+            {
                 param_map.insert(param.id, arg.clone());
             } else {
                 let fresh = *next_local_id;
@@ -1411,6 +1413,15 @@ pub fn build_inline_arg_bindings(
     Some((setup, param_map))
 }
 
+fn inline_arg_needs_value_boundary(param: &Param, arg: &Expr) -> bool {
+    // A source local passed to a non-primitive parameter must retain the
+    // parameter-binding boundary. In particular, standalone POD records have
+    // value semantics there: codegen materializes a managed copy for `any`
+    // and copies exact POD layouts. Direct substitution would let later POD
+    // recognition target the caller's native local from inside the callee.
+    matches!(arg, Expr::LocalGet(_)) && !param.ty.is_primitive()
+}
+
 /// Try to inline a simple function or method call.
 /// Handles two patterns:
 /// 1. Single `Return(expr)` body — classic expression-level inline
@@ -1429,6 +1440,12 @@ pub fn try_inline_simple_call(
         // Check for regular function call
         if let Expr::FuncRef(func_id) = callee.as_ref() {
             if let Some(func) = func_candidates.get(func_id) {
+                // Loop-bearing candidates are admitted only for the dedicated
+                // fixed-aggregate path in `try_inline_call`. Expression-level
+                // inlining has nowhere to place their control flow.
+                if !has_simple_control_flow(&func.body) {
+                    return None;
+                }
                 // Pattern 1: single Return(expr)
                 if func.body.len() == 1 {
                     if let Stmt::Return(Some(return_expr)) = &func.body[0] {
@@ -1702,6 +1719,156 @@ pub fn try_inline_simple_call(
     None
 }
 
+const MAX_SCALAR_AGGREGATE_CALL_LEN: usize = 8;
+
+pub(crate) fn scalar_aggregate_call_len(
+    func: &Function,
+    args: &[Expr],
+) -> Option<(LocalId, usize)> {
+    let param_id = scalar_aggregate_loop_param(func)?;
+    let param_index = func.params.iter().position(|param| param.id == param_id)?;
+    let Expr::Array(elements) = args.get(param_index)? else {
+        return None;
+    };
+    if elements.is_empty()
+        || elements.len() > MAX_SCALAR_AGGREGATE_CALL_LEN
+        || elements.iter().any(|element| match element {
+            Expr::Object(properties) => {
+                properties.is_empty() || properties.iter().any(|(key, _)| key == "__proto__")
+            }
+            // Closed-shape object literals have already been rewritten by HIR
+            // lowering to constructor calls whose positional arguments are the
+            // property values. The replacement pass resolves their field names
+            // from the synthesized class before removing either allocation.
+            Expr::New {
+                class_name,
+                args,
+                cap_args_appended,
+                ..
+            } => {
+                !class_name.starts_with("__AnonShape_")
+                    || args.is_empty()
+                    || args.len() > 16
+                    || *cap_args_appended != 0
+            }
+            _ => true,
+        })
+    {
+        return None;
+    }
+    Some((param_id, elements.len()))
+}
+
+/// Replace the loop-bound read on the original parameter before local-id
+/// substitution. The actual argument remains bound to a normal local until
+/// the post-unroll scalar-replacement pass proves every element use; only the
+/// fresh literal's immutable length is folded here.
+fn fold_scalar_aggregate_param_length(stmts: &mut [Stmt], param_id: LocalId, len: usize) {
+    fn fold_expr(expr: &mut Expr, param_id: LocalId, len: usize) {
+        if matches!(
+            expr,
+            Expr::PropertyGet { object, property, .. }
+                if property == "length"
+                    && matches!(object.as_ref(), Expr::LocalGet(id) if *id == param_id)
+        ) {
+            *expr = Expr::Integer(len as i64);
+            return;
+        }
+        perry_hir::walker::walk_expr_children_mut(expr, &mut |child| {
+            fold_expr(child, param_id, len)
+        });
+    }
+
+    for stmt in stmts {
+        match stmt {
+            Stmt::Let { init, .. } => {
+                if let Some(init) = init {
+                    fold_expr(init, param_id, len);
+                }
+            }
+            Stmt::Expr(expr) | Stmt::Throw(expr) => fold_expr(expr, param_id, len),
+            Stmt::Return(value) => {
+                if let Some(value) = value {
+                    fold_expr(value, param_id, len);
+                }
+            }
+            Stmt::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                fold_expr(condition, param_id, len);
+                fold_scalar_aggregate_param_length(then_branch, param_id, len);
+                if let Some(else_branch) = else_branch {
+                    fold_scalar_aggregate_param_length(else_branch, param_id, len);
+                }
+            }
+            Stmt::While { condition, body } | Stmt::DoWhile { body, condition } => {
+                fold_expr(condition, param_id, len);
+                fold_scalar_aggregate_param_length(body, param_id, len);
+            }
+            Stmt::For {
+                init,
+                condition,
+                update,
+                body,
+            } => {
+                if let Some(init) = init {
+                    fold_scalar_aggregate_param_length(
+                        std::slice::from_mut(init.as_mut()),
+                        param_id,
+                        len,
+                    );
+                }
+                if let Some(condition) = condition {
+                    fold_expr(condition, param_id, len);
+                }
+                if let Some(update) = update {
+                    fold_expr(update, param_id, len);
+                }
+                fold_scalar_aggregate_param_length(body, param_id, len);
+            }
+            Stmt::Try {
+                body,
+                catch,
+                finally,
+            } => {
+                fold_scalar_aggregate_param_length(body, param_id, len);
+                if let Some(catch) = catch {
+                    fold_scalar_aggregate_param_length(&mut catch.body, param_id, len);
+                }
+                if let Some(finally) = finally {
+                    fold_scalar_aggregate_param_length(finally, param_id, len);
+                }
+            }
+            Stmt::Switch {
+                discriminant,
+                cases,
+            } => {
+                fold_expr(discriminant, param_id, len);
+                for case in cases {
+                    if let Some(test) = &mut case.test {
+                        fold_expr(test, param_id, len);
+                    }
+                    fold_scalar_aggregate_param_length(&mut case.body, param_id, len);
+                }
+            }
+            Stmt::Labeled { body, .. } => fold_scalar_aggregate_param_length(
+                std::slice::from_mut(body.as_mut()),
+                param_id,
+                len,
+            ),
+            Stmt::Break
+            | Stmt::Continue
+            | Stmt::LabeledBreak(_)
+            | Stmt::LabeledContinue(_)
+            | Stmt::PreallocateBoxes(_)
+            | Stmt::PreallocateTdzBoxes(_)
+            | Stmt::ReleaseBoxes(_) => {}
+        }
+    }
+}
+
 /// Try to inline a call that may have multiple statements
 pub fn try_inline_call(
     expr: &Expr,
@@ -1717,6 +1884,11 @@ pub fn try_inline_call(
         // Handle regular function calls
         if let Expr::FuncRef(func_id) = callee.as_ref() {
             if let Some(func) = func_candidates.get(func_id) {
+                let scalar_aggregate = if has_simple_control_flow(&func.body) {
+                    None
+                } else {
+                    Some(scalar_aggregate_call_len(func, args)?)
+                };
                 // Extra actual args are evaluated before a JS call even when
                 // the callee declares fewer params. The current inliner maps
                 // params with zip(), so it cannot preserve those trailing
@@ -1750,7 +1922,12 @@ pub fn try_inline_call(
                     // Body-written params get a copy — see
                     // build_inline_arg_bindings (S13.2.1_A6).
                     let force_let = mutated.contains(&param.id);
-                    if is_trivial_expr(arg) && !trivial_in_closure && !force_let {
+                    let preserve_value_boundary = inline_arg_needs_value_boundary(param, arg);
+                    if is_trivial_expr(arg)
+                        && !trivial_in_closure
+                        && !force_let
+                        && !preserve_value_boundary
+                    {
                         param_map.insert(param.id, arg.clone());
                     } else {
                         let local_id = *next_local_id;
@@ -1786,6 +1963,10 @@ pub fn try_inline_call(
                 }
 
                 let mut inlined_body = func.body.clone();
+
+                if let Some((param_id, len)) = scalar_aggregate {
+                    fold_scalar_aggregate_param_length(&mut inlined_body, param_id, len);
+                }
 
                 // Collect all LocalIds from Let statements in the body and remap them
                 let body_local_ids = collect_body_local_ids(&inlined_body);
@@ -1882,7 +2063,8 @@ pub fn try_inline_call(
                         let trivial_in_closure = is_trivial_expr(arg)
                             && !matches!(arg, Expr::LocalGet(_))
                             && closure_capt.contains(&param.id);
-                        if is_trivial_expr(arg) && !trivial_in_closure {
+                        let preserve_value_boundary = inline_arg_needs_value_boundary(param, arg);
+                        if is_trivial_expr(arg) && !trivial_in_closure && !preserve_value_boundary {
                             param_map.insert(param.id, arg.clone());
                         } else {
                             let local_id = *next_local_id;

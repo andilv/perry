@@ -920,6 +920,11 @@ pub fn gc_init() {
     // under concurrent load) must rewrite the cell, or the body's next
     // `this`-derived dispatch derefs a relocated receiver → SIGSEGV.
     reg_scanner!(crate::object::scan_implicit_this_roots_mut);
+    // Fresh class evaluations are lexical environments, not merely template
+    // class ids. Method dispatch keeps the active evaluation here so private
+    // accesses remain exact across `.call`/`.apply`; root and rewrite those
+    // class objects while a moving collection runs inside the method body.
+    reg_scanner!(crate::object::scan_private_lexical_brand_roots_mut);
     // Connected inspector sessions are retained only by the inspector's
     // thread-local registry while they receive protocol notifications.
     reg_scanner!(crate::node_inspector::scan_inspector_roots_mut);
@@ -977,6 +982,8 @@ pub fn gc_init() {
     // (nothing else holds them — they live for the program's lifetime
     // via codegen `getter` calls, not via a user-visible JSValue root).
     reg_scanner!(crate::node_submodules::scan_node_submodule_singleton_roots_mut,);
+    #[cfg(feature = "mod-node-test")]
+    reg_scanner!(crate::node_submodules::test::runner::scan_node_test_runner_roots_mut,);
     // Box-capture root scanner (mutable closure captures, esp. the
     // generator state-machine's `__iter` and `__step` boxes that hold
     // the iter object + step closure across awaits).

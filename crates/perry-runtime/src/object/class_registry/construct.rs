@@ -158,7 +158,7 @@ pub(crate) unsafe fn nm_ctor_tls(
             args_ptr, args_len, 0,
         )));
     }
-    None
+    crate::tls::construct_registered_tls_class(method, args_ptr, args_len)
 }
 
 pub(crate) unsafe fn nm_ctor_wasi(
@@ -313,6 +313,13 @@ pub unsafe extern "C" fn js_new_function_construct(
         super::super::object_ops::throw_object_type_error(b"is not a constructor");
     }
     if let Some((module, method)) = bound_native_callable_module_and_method(func_value) {
+        // Native constructors and ordinary exports share the bound-method
+        // trampoline. Consult the export metadata before falling through to
+        // generic closure construction; some lower-case JavaScript wrappers
+        // are constructors while native functions such as path methods are not.
+        if !super::super::native_module::is_native_module_constructor_export(&module, &method) {
+            super::super::object_ops::throw_object_type_error(b"is not a constructor");
+        }
         if module == "perf_hooks" {
             if let Some(result) =
                 crate::perf_hooks::construct_perf_hooks_class(&method, args_ptr, args_len)
@@ -473,7 +480,8 @@ pub unsafe extern "C" fn js_new_function_construct(
                 if args.len() == 1 {
                     return crate::date::js_date_new_from_value(args[0]);
                 }
-                let mut vals = [f64::from_bits(crate::value::TAG_UNDEFINED); 7];
+                let undefined = f64::from_bits(crate::value::TAG_UNDEFINED);
+                let mut vals = [undefined, undefined, 1.0, 0.0, 0.0, 0.0, 0.0];
                 for (i, slot) in vals.iter_mut().enumerate() {
                     if i < args.len() {
                         *slot = args[i];
@@ -482,6 +490,27 @@ pub unsafe extern "C" fn js_new_function_construct(
                 return crate::date::js_date_new_local_components(
                     vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6],
                 );
+            }
+            "Boolean" => {
+                let value = args
+                    .first()
+                    .copied()
+                    .unwrap_or_else(|| f64::from_bits(crate::value::TAG_UNDEFINED));
+                return crate::builtins::js_boxed_boolean_new(value);
+            }
+            "Number" => {
+                let value = args
+                    .first()
+                    .copied()
+                    .unwrap_or_else(|| f64::from_bits(crate::value::TAG_UNDEFINED));
+                return crate::builtins::js_boxed_number_new(value);
+            }
+            "String" => {
+                let value = args
+                    .first()
+                    .copied()
+                    .unwrap_or_else(|| f64::from_bits(crate::value::TAG_UNDEFINED));
+                return crate::builtins::js_boxed_string_new(value, (!args.is_empty()) as i32);
             }
             "Array" => {
                 if args.len() == 1 {
@@ -915,6 +944,9 @@ pub unsafe extern "C" fn js_new_function_construct(
             // address. Reproduced by `new C()` where `C = mk()` is a class
             // EXPRESSION value.
             let inst_handle = scope.root_raw_mut_ptr(inst);
+            inst_handle.with_mut_ptr::<ObjectHeader, _>(|inst| {
+                link_class_object_instance_prototype(class_handle.get_nanbox_f64(), inst)
+            });
             // Every evaluation gets a distinct brand despite sharing its
             // class id. Stamp it before replay, where private access may occur.
             inst_handle.with_mut_ptr::<ObjectHeader, _>(|inst| {
@@ -937,20 +969,31 @@ pub unsafe extern "C" fn js_new_function_construct(
                     args_len,
                 );
             });
-            let inst: *mut ObjectHeader = inst_handle.get_raw_mut_ptr();
             // `class X extends Request/Response {}` constructed via the dynamic
             // (class-expression value) path: the replayed ctor's `super()`
             // can't statically route an aliased parent, so attach the native
             // fetch handle here when the registered parent is a fetch builtin
             // and the instance didn't already get one. Refs `@hono/node-server`.
             if let Some(kind) = fetch_parent_kind_in_chain(class_cid) {
-                if super::super::field_get_set::fetch_subclass_handle_id(inst as usize).is_none() {
-                    super::super::attach_fetch_handle_for_construction(
-                        inst, kind, args_ptr, args_len,
-                    );
+                let has_handle = inst_handle.with_mut_ptr::<ObjectHeader, _>(|inst| {
+                    super::super::field_get_set::fetch_subclass_handle_id(inst as usize).is_some()
+                });
+                if !has_handle {
+                    inst_handle.with_mut_ptr::<ObjectHeader, _>(|inst| {
+                        super::super::attach_fetch_handle_for_construction(
+                            inst, kind, args_ptr, args_len,
+                        )
+                    });
                 }
             }
-            // Re-read: `attach_fetch_handle_for_construction` allocates.
+            // Class-expression values can also extend Promise and reach this
+            // dynamic construct path. The synthesized default constructor does
+            // not call construct-only builtins as plain functions; attach the
+            // Promise backing here, matching the ClassRef path below. An
+            // explicit `super(executor)` has already installed it, so avoid
+            // invoking the executor twice.
+            ensure_promise_subclass_backing(&inst_handle, class_cid, args_ptr, args_len);
+            // Re-read: the fetch attachment and Promise executor both allocate.
             return crate::value::js_nanbox_pointer(
                 inst_handle.get_raw_mut_ptr::<ObjectHeader>() as i64
             );
@@ -971,6 +1014,9 @@ pub unsafe extern "C" fn js_new_function_construct(
             "Arrow function is not a constructor",
             "ERR_INVALID_ARG_TYPE",
         );
+    }
+    if extends_target_must_throw(func_value) {
+        super::super::object_ops::throw_object_type_error(b"is not a constructor");
     }
     let cid = synthetic_class_id_for_function(func_value);
     // Allocate the instance with the synthetic class id (or 0 if the
@@ -1108,7 +1154,10 @@ pub unsafe extern "C" fn js_new_function_construct(
         }
         return inst_handle.get_nanbox_f64();
     }
-    nan_boxed
+    // Ordinary objects, symbols and every other non-callable heap value do not
+    // have [[Construct]]. The historical placeholder return made `new
+    // Reflect()`, `new Error.prototype()` and `new sym()` silently succeed.
+    super::super::object_ops::throw_object_type_error(b"is not a constructor")
 }
 
 /// `new <callee>(...spread)` — spread-bearing construction. Codegen builds a
@@ -1187,6 +1236,10 @@ pub(crate) fn js_value_is_constructor(value: f64) -> bool {
     if is_non_constructable_builtin_function_value(value) {
         return false;
     }
+    let ptr = JSValue::from_bits(value.to_bits()).as_pointer::<crate::closure::ClosureHeader>();
+    if crate::closure::closure_is_bound_method(ptr) {
+        return is_bound_native_constructor_closure_value(value);
+    }
     true
 }
 
@@ -1220,6 +1273,15 @@ pub(crate) fn extends_target_must_throw(value: f64) -> bool {
     if is_callable_function_value(value) {
         if is_arrow_function_value(value) || is_non_constructable_builtin_function_value(value) {
             return true;
+        }
+        // Native-module constructor exports use the same BOUND_METHOD
+        // trampoline as ordinary method reads. Their module/method captures
+        // are the distinguishing [[Construct]] metadata: rejecting the raw
+        // trampoline here breaks dynamic aliases such as
+        // `const Console = console.Console; new Console(...)` and native base
+        // construction reached through an indirect user-class chain.
+        if is_bound_native_constructor_closure_value(value) {
+            return false;
         }
         let ptr = jv.as_pointer::<crate::closure::ClosureHeader>();
         if !ptr.is_null() && is_valid_obj_ptr(ptr as *const u8) {
@@ -1366,33 +1428,9 @@ fn new_target_class_id(new_target: f64) -> Option<u32> {
     constructor_class_ref_id(new_target).or_else(|| class_object_class_id(new_target))
 }
 
-/// True when class `cid` (or an ancestor) `extends Promise` — its registered
-/// dynamic-parent value resolves to the intrinsic `Promise` constructor. Used to
-/// run `js_promise_subclass_init` on the dynamic (runtime) `new Subclass(exec)`
-/// path, where codegen's `super()` Promise branch never emitted the init (e.g.
-/// `NewPromiseCapability(Subclass)` inside a combinator, which calls the runtime
-/// `js_new_function_construct` directly rather than a compiled `new`).
-pub(crate) fn promise_parent_in_chain(class_id: u32) -> bool {
-    let mut cid = class_id;
-    let mut depth = 0u32;
-    while depth < 32 && cid != 0 {
-        let parent_val = js_get_dynamic_parent_value(cid);
-        if matches!(
-            identify_global_builtin_constructor(parent_val),
-            Some("Promise")
-        ) {
-            return true;
-        }
-        match get_parent_class_id(cid) {
-            Some(p) if p != 0 && p != cid => {
-                cid = p;
-                depth += 1;
-            }
-            _ => break,
-        }
-    }
-    false
-}
+include!("construct/class_return.rs");
+include!("construct/class_object.rs");
+include!("construct/promise_subclass.rs");
 
 unsafe fn construct_registered_class_ref(
     target_cid: u32,
@@ -1468,22 +1506,8 @@ unsafe fn construct_registered_class_ref(
             super::super::attach_fetch_handle_for_construction(inst, kind, args_ptr, args_len);
         }
     }
-    // ClassRef `new` of a Promise subclass — run the Promise constructor against
-    // a hidden backing cell (only when the compiled ctor's `super()` didn't
-    // already attach one). `NewPromiseCapability(Subclass)` reaches here.
-    if promise_parent_in_chain(target_cid) {
-        // Re-read: `attach_fetch_handle_for_construction` above allocates.
-        let inst_val =
-            crate::value::js_nanbox_pointer(inst_handle.get_raw_mut_ptr::<ObjectHeader>() as i64);
-        if crate::promise::subclass_backing_promise(inst_val).is_none() {
-            let executor = if args_len >= 1 && !args_ptr.is_null() {
-                *args_ptr
-            } else {
-                f64::from_bits(crate::value::TAG_UNDEFINED)
-            };
-            crate::promise::js_promise_subclass_init(inst_val, executor);
-        }
-    }
+    // `NewPromiseCapability(Subclass)` reaches this dynamic ClassRef path.
+    ensure_promise_subclass_backing(&inst_handle, target_cid, args_ptr, args_len);
     // Re-read once more: the executor `js_promise_subclass_init` runs is user
     // code, so the last two blocks are both collection points.
     crate::value::js_nanbox_pointer(inst_handle.get_raw_mut_ptr::<ObjectHeader>() as i64)
@@ -1494,6 +1518,13 @@ unsafe fn construct_registered_class_ref(
 /// is an object (so a typed-array view should adopt it as its `[[Prototype]]`),
 /// or `None` when it is a primitive (so the default per-kind prototype applies).
 fn new_target_custom_object_prototype(new_target: f64) -> Option<u64> {
+    if let Some(class_id) = constructor_class_ref_id(new_target) {
+        let declared = super::class_decl_prototype_value(class_id);
+        if unsafe { super::super::value_is_object_like(declared) } {
+            return Some(declared.to_bits());
+        }
+        return Some(super::super::class_prototype_ref_value(class_id).to_bits());
+    }
     let bits = new_target.to_bits();
     if (bits >> 48) != 0x7FFD {
         return None;
@@ -1589,6 +1620,16 @@ pub unsafe extern "C" fn js_new_function_construct_with_new_target(
     // `Object.getPrototypeOf` and `.constructor` resolve through it (test262
     // `ctors*/use-custom-proto-if-object` / `use-default-proto-if-…`).
     if let Some(ta_name) = identify_global_builtin_constructor(func_value) {
+        // Symbol and BigInt are callable conversion functions but have no
+        // [[Construct]] slot. A distinct newTarget (the subclass case) must
+        // not turn either into a generic constructable closure.
+        if matches!(ta_name, "Symbol" | "BigInt") {
+            return if ta_name == "Symbol" {
+                crate::error::js_throw_symbol_constructor_type_error()
+            } else {
+                crate::error::js_throw_bigint_constructor_type_error()
+            };
+        }
         // `Reflect.construct(Date, args, newTarget)` (#5989) — Next.js 16's
         // cacheComponents Date extension constructs through exactly this
         // shape: its installed wrapper runs
@@ -1599,13 +1640,20 @@ pub unsafe extern "C" fn js_new_function_construct_with_new_target(
         // `GetPrototypeFromConstructor(newTarget)` like the typed-array arm
         // below so `instanceof newTarget` and subclass prototypes hold.
         if ta_name == "Date" {
-            let proto_bits = new_target_custom_object_prototype(nt);
-            let result = js_new_function_construct(func_value, args_ptr, args_len);
-            if let Some(proto_bits) = proto_bits {
+            let scope = crate::gc::RuntimeHandleScope::new();
+            let nt = scope.root_nanbox_f64(nt);
+            let func = scope.root_nanbox_f64(func_value);
+            let proto = new_target_custom_object_prototype(nt.get_nanbox_f64())
+                .map(|bits| scope.root_heap_word_u64(bits));
+            let result = js_new_function_construct(func.get_nanbox_f64(), args_ptr, args_len);
+            if let Some(proto) = proto {
                 let jv = crate::value::JSValue::from_bits(result.to_bits());
                 if jv.is_pointer() {
                     let addr = (jv.bits() & crate::value::POINTER_MASK) as usize;
-                    super::super::prototype_chain::object_set_static_prototype(addr, proto_bits);
+                    super::super::prototype_chain::object_set_static_prototype(
+                        addr,
+                        proto.get_heap_word_u64(),
+                    );
                 }
             }
             return result;
@@ -1625,16 +1673,56 @@ pub unsafe extern "C" fn js_new_function_construct_with_new_target(
                 | "BigInt64Array"
                 | "BigUint64Array"
         ) {
-            // Read `newTarget.prototype` (GetPrototypeFromConstructor) BEFORE
-            // building the view: Node evaluates the proto access as part of
-            // AllocateTypedArray, so a throwing `prototype` getter must surface
-            // here even when later steps would also throw (test262
-            // `throw-type-error-before-custom-proto-access` agreement).
-            let proto_bits = new_target_custom_object_prototype(nt);
+            // Validate and initialize the typed-array contents before reading
+            // a custom newTarget prototype. In particular, invalid Symbol
+            // element conversion must throw TypeError without observing a
+            // poisoned `newTarget.prototype` getter.
+            let scope = crate::gc::RuntimeHandleScope::new();
+            let nt_h = scope.root_nanbox_f64(nt);
             let result = js_new_function_construct(func_value, args_ptr, args_len);
+            let result_h = scope.root_heap_word_u64(result.to_bits());
+            let proto_bits = new_target_custom_object_prototype(nt_h.get_nanbox_f64());
+            let result = f64::from_bits(result_h.get_heap_word_u64());
             if let Some(addr) = crate::typedarray_props::typed_array_addr_from_value(result) {
                 if let Some(proto_bits) = proto_bits {
                     super::super::prototype_chain::object_set_static_prototype(addr, proto_bits);
+                }
+            }
+            return result;
+        }
+        if matches!(
+            ta_name,
+            "ArrayBuffer"
+                | "SharedArrayBuffer"
+                | "DataView"
+                | "Boolean"
+                | "Number"
+                | "String"
+                | "RegExp"
+                | "Function"
+        ) {
+            let scope = crate::gc::RuntimeHandleScope::new();
+            let nt = scope.root_nanbox_f64(nt);
+            let func = scope.root_nanbox_f64(func_value);
+            let proto = new_target_custom_object_prototype(nt.get_nanbox_f64())
+                .map(|bits| scope.root_heap_word_u64(bits));
+            let result = js_new_function_construct(func.get_nanbox_f64(), args_ptr, args_len);
+            if let Some(proto) = proto {
+                let bits = result.to_bits();
+                let addr = if (bits >> 48) == 0x7FFD {
+                    (bits & crate::value::POINTER_MASK) as usize
+                } else if (bits >> 48) == 0 && crate::buffer::is_registered_buffer(bits as usize) {
+                    // ArrayBuffer and SharedArrayBuffer are represented by a
+                    // raw BufferHeader pointer rather than a NaN-boxed object.
+                    bits as usize
+                } else {
+                    0
+                };
+                if addr != 0 {
+                    super::super::prototype_chain::object_set_static_prototype(
+                        addr,
+                        proto.get_heap_word_u64(),
+                    );
                 }
             }
             return result;
@@ -1721,80 +1809,6 @@ pub unsafe extern "C" fn js_new_function_construct_with_new_target(
     inst_handle.get_nanbox_f64()
 }
 
-fn constructor_return_overrides_this(value: f64) -> bool {
-    use crate::value::JSValue;
-    let jv = JSValue::from_bits(value.to_bits());
-    if !jv.is_pointer() {
-        return false;
-    }
-    if is_callable_function_value(value) {
-        return true;
-    }
-    let raw = jv.as_pointer::<u8>();
-    if raw.is_null() {
-        return false;
-    }
-    if super::super::is_arguments_object(raw as *const ObjectHeader) {
-        return true;
-    }
-    unsafe {
-        let arr = crate::array::clean_arr_ptr(raw as *const crate::array::ArrayHeader);
-        if !arr.is_null() {
-            return true;
-        }
-        if !is_valid_obj_ptr(raw as *const u8) {
-            return false;
-        }
-        let gc_header =
-            (raw as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-        matches!(
-            (*gc_header).obj_type,
-            // Per spec, a constructor returning ANY Object overrides the
-            // implicit `this`. Promises are objects — a user constructor like
-            // `function P(exec){ return new Promise(...) }` (the
-            // `NewPromiseCapability` shape exercised by the Promise-combinator
-            // test262 cases) must yield that Promise, not the empty default.
-            // GC_TYPE_TEMPORAL: `new Temporal.Duration(...)` (and every other
-            // Temporal constructor) is dispatched through this generic path —
-            // the constructor thunk allocates a Temporal cell and returns it, so
-            // that cell must override the empty default `this` (#4687).
-            crate::gc::GC_TYPE_OBJECT
-                | crate::gc::GC_TYPE_ERROR
-                | crate::gc::GC_TYPE_PROMISE
-                | crate::gc::GC_TYPE_TEMPORAL
-        )
-    }
-}
-
-/// Apply ECMAScript constructor return-override semantics for an inlined
-/// constructor body's explicit `return <value>`. Given the implicit `this`
-/// and the returned value:
-///   - returned value is an Object  → it becomes the construction result;
-///   - returned value is `undefined` → result is `this`;
-///   - returned value is any other primitive → for a derived constructor
-///     (`class X extends Y`) this is a TypeError; for a base constructor the
-///     primitive is ignored and the result is `this`.
-/// `is_derived` is 1 for a class with an `extends` clause, 0 otherwise.
-/// Refs class/subclass/derived-class-return-override-*.
-#[no_mangle]
-pub extern "C" fn js_ctor_return_override(this_val: f64, return_val: f64, is_derived: i32) -> f64 {
-    use crate::value::JSValue;
-    if constructor_return_overrides_this(return_val) {
-        return return_val;
-    }
-    let jv = JSValue::from_bits(return_val.to_bits());
-    if jv.is_undefined() {
-        return this_val;
-    }
-    if is_derived != 0 {
-        crate::collection_iter::throw_type_error(
-            "Derived constructors may only return object or undefined",
-        );
-    }
-    // Base constructor: a returned primitive is ignored.
-    this_val
-}
-
 /// Verify that a JSValue is a NaN-boxed pointer to a registered
 /// closure header. `js_native_call_value` itself doesn't validate the
 /// pointer shape — it dereferences whatever lower-48 bits it gets — so
@@ -1823,7 +1837,7 @@ pub(crate) fn is_callable_function_value(value: f64) -> bool {
     unsafe { (*ptr).type_tag == crate::closure::CLOSURE_MAGIC }
 }
 
-fn is_arrow_function_value(value: f64) -> bool {
+pub(super) fn is_arrow_function_value(value: f64) -> bool {
     use crate::value::JSValue;
     let jv = JSValue::from_bits(value.to_bits());
     if !jv.is_pointer() {
@@ -1844,137 +1858,21 @@ fn is_arrow_function_value(value: f64) -> bool {
     crate::closure::closure_is_arrow(ptr)
 }
 
-/// Predicate-only sibling of `ordinary_function_prototype_value_for_read`:
-/// would this function have an own `.prototype` slot? Crucially does NOT
-/// materialize the prototype object — `fn.hasOwnProperty('prototype')` must
-/// not lock the slot's attributes before a later
-/// `Object.defineProperty(fn, "prototype", …)` (TypedArrayConstructors
-/// custom-proto tests).
-pub(crate) fn function_would_have_own_prototype(func_value: f64) -> bool {
-    if !is_callable_function_value(func_value) || is_arrow_function_value(func_value) {
-        return false;
-    }
-    if super::super::native_module::builtin_closure_is_non_constructable_value(func_value) {
-        return false;
-    }
-    synthetic_class_id_for_function(func_value) != 0
-}
-
-pub(crate) fn ordinary_function_prototype_value_for_read(func_value: f64) -> Option<f64> {
-    if !is_callable_function_value(func_value) || is_arrow_function_value(func_value) {
-        return None;
-    }
-    // Bound-method / bound-function values (class method/getter/setter reads via
-    // `C.prototype.m`, instance method reads, `fn.bind(...)`) are non-constructors
-    // and have NO `prototype` own property (`C.prototype.m.prototype === undefined`,
-    // `'prototype' in C.prototype.m === false`). (Test262 definition method/accessor
-    // prop-desc.)
-    //
-    // #4973 / #3527 / #5268 exception: bound NATIVE-MODULE *class* exports
-    // (`http.Server`, `fs.ReadStream`, `events.EventEmitter`, …) are
-    // constructors in Node, and the util.inherits / `Object.create(Ctor.
-    // prototype)` / `Object.setPrototypeOf(x, Ctor.prototype)` subclass
-    // pattern reads their `.prototype` as a setPrototypeOf / Object.create
-    // operand. Returning None here made that read `undefined`, and
-    // `Object.create(undefined)` / `Object.setPrototypeOf(x, undefined)` then
-    // threw "Object prototype may only be an Object or null" — the blocker hit
-    // at Express init (`express/lib/request.js`:
-    // `Object.create(http.IncomingMessage.prototype)`), graceful-fs's
-    // `ReadStream.prototype = Object.create(fs$ReadStream.prototype)`, and
-    // pino's `Object.setPrototypeOf(prototype, EventEmitter.prototype)`.
-    //
-    // A bound-native export is a constructor class when its method name uses
-    // Node's constructor-cased convention (a leading uppercase ASCII letter,
-    // e.g. `ReadStream`/`EventEmitter`/`Server`) AND it isn't explicitly
-    // marked non-constructable (built-in prototype methods like
-    // `String.prototype.charAt` carry that flag). Such exports are cached
-    // singleton closures (NATIVE_CALLABLE_EXPORTS), so the synthetic-class
-    // path below gives them a stable `.prototype` object. Non-constructor
-    // bound methods (`fs.readFile`, `path.join`, …) keep `prototype ===
-    // undefined`, matching Node's built-in non-constructor functions.
-    {
-        let jv = crate::value::JSValue::from_bits(func_value.to_bits());
-        if jv.is_pointer() {
-            let cptr = jv.as_pointer::<crate::closure::ClosureHeader>();
-            if !cptr.is_null()
-                && is_valid_obj_ptr(cptr as *const u8)
-                && crate::closure::closure_is_bound_method(cptr)
-            {
-                if super::super::native_module::builtin_closure_is_non_constructable_value(
-                    func_value,
-                ) {
-                    return None;
-                }
-                let is_native_class_export = unsafe {
-                    super::super::native_module::bound_native_callable_module_and_method(func_value)
-                }
-                .map(|(_module, method)| {
-                    method
-                        .as_bytes()
-                        .first()
-                        .is_some_and(|b| b.is_ascii_uppercase())
-                })
-                .unwrap_or(false);
-                if !is_native_class_export {
-                    return None;
-                }
-            }
-        }
-    }
-    // Built-in methods (`String.prototype.charAt`, `Array.prototype.map`, …) are
-    // not constructors and have NO `prototype` own property — `String.prototype.
-    // charAt.prototype === undefined` (ECMA-262: built-in non-constructor
-    // functions don't get the auto-created `.prototype`). Don't lazily synthesize
-    // one for them.
-    if super::super::native_module::builtin_closure_is_non_constructable_value(func_value) {
-        return None;
-    }
-    let cid = synthetic_class_id_for_function(func_value);
-    if cid == 0 {
-        return None;
-    }
-    let proto = ensure_function_prototype_object(func_value, cid);
-    if proto.is_null() {
-        return None;
-    }
-    Some(crate::value::js_nanbox_pointer(proto as i64))
-}
-
-#[no_mangle]
-pub extern "C" fn js_function_prototype_value_for_read(func_value: f64) -> f64 {
-    let undef = f64::from_bits(crate::value::TAG_UNDEFINED);
-    let jv = crate::value::JSValue::from_bits(func_value.to_bits());
-    if !jv.is_pointer() {
-        return undef;
-    }
-    let ptr = jv.as_pointer() as *const crate::closure::ClosureHeader;
-    if ptr.is_null() || !is_valid_obj_ptr(ptr as *const u8) {
-        return undef;
-    }
-    unsafe {
-        if (*ptr).type_tag != crate::closure::CLOSURE_MAGIC {
-            return undef;
-        }
-    }
-
-    let closure_addr = ptr as usize;
-    if crate::closure::closure_is_key_deleted(closure_addr, "prototype") {
-        return undef;
-    }
-    let dynamic = crate::closure::closure_get_dynamic_prop(closure_addr, "prototype");
-    if dynamic.to_bits() != crate::value::TAG_UNDEFINED {
-        return dynamic;
-    }
-    if let Some(proto) = generator_function_prototype_of(closure_addr) {
-        return proto;
-    }
-    ordinary_function_prototype_value_for_read(func_value).unwrap_or(undef)
-}
-
 /// Lookup helper: returns the registered prototype-method value for
 /// `(class_id, name)`, or None if no assignment matched. Walks the
 /// parent-class chain so methods registered on a base class are found
 /// via subclass instances.
+pub(crate) fn lookup_own_prototype_method(class_id: u32, name: &str) -> Option<f64> {
+    if class_is_key_deleted(class_id, name) {
+        return None;
+    }
+    CLASS_PROTOTYPE_METHODS.with(|table| {
+        let guard = table.read().ok()?;
+        let bits = guard.as_ref()?.get(&class_id)?.get(name)?;
+        Some(f64::from_bits(*bits))
+    })
+}
+
 pub(crate) fn lookup_prototype_method(class_id: u32, name: &str) -> Option<f64> {
     CLASS_PROTOTYPE_METHODS.with(|table| {
         let guard = table.read().ok()?;
@@ -1982,9 +1880,11 @@ pub(crate) fn lookup_prototype_method(class_id: u32, name: &str) -> Option<f64> 
         let mut cid = class_id;
         let mut depth = 0usize;
         while depth < 32 {
-            if let Some(per_class) = map.get(&cid) {
-                if let Some(&bits) = per_class.get(name) {
-                    return Some(f64::from_bits(bits));
+            if !class_is_key_deleted(cid, name) {
+                if let Some(per_class) = map.get(&cid) {
+                    if let Some(&bits) = per_class.get(name) {
+                        return Some(f64::from_bits(bits));
+                    }
                 }
             }
             match crate::object::class_generic_origin(cid).or_else(|| get_parent_class_id(cid)) {

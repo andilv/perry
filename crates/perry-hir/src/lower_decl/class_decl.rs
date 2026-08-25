@@ -40,6 +40,9 @@ fn is_genuine_node_stream_parent(ctx: &LoweringContext, name: &str) -> bool {
     matches!(ctx.lookup_native_module(name), Some(("stream", _)))
 }
 
+mod class_heritage;
+use class_heritage::*;
+
 use super::*;
 
 fn generic_computed_member_key<'a>(
@@ -129,6 +132,7 @@ fn lower_generic_computed_class_member(
     ctx: &mut LoweringContext,
     method: &ast::ClassMethod,
     computed: &ast::ComputedPropName,
+    source_order: usize,
 ) -> Result<ClassComputedMember> {
     let key_expr = lower_expr(ctx, &computed.expr)?;
     let function_name = computed_member_name(method.kind, computed);
@@ -157,6 +161,7 @@ fn lower_generic_computed_class_member(
         function,
         is_static: method.is_static,
         kind,
+        source_order,
     })
 }
 
@@ -176,6 +181,7 @@ fn lower_noncomputed_class_member_registration(
     ctx: &mut LoweringContext,
     method: &ast::ClassMethod,
     prop_name: &str,
+    source_order: usize,
 ) -> Result<ClassComputedMember> {
     let function_name = noncomputed_member_registration_name(method.kind, method);
     let (kind, function) = match method.kind {
@@ -203,6 +209,7 @@ fn lower_noncomputed_class_member_registration(
         function,
         is_static: method.is_static,
         kind,
+        source_order,
     })
 }
 
@@ -310,6 +317,16 @@ pub fn lower_class_decl(
             id
         }
     };
+    if let Some(ast::Expr::Ident(parent)) = class_decl.class.super_class.as_deref() {
+        if let Some(crate::lower::fn_ctor_env::FnCtorShape::DynCtor(kind)) =
+            ctx.fn_ctor_env.entries.get(parent.sym.as_ref()).cloned()
+        {
+            if let Some(forward_args) = dynamic_function_forwarding_mode(&class_decl.class) {
+                ctx.dynamic_function_subclasses
+                    .insert(name.clone(), (kind, forward_args));
+            }
+        }
+    }
 
     // Set current class for arrow function `this` capture tracking
     let old_class = ctx.current_class.take();
@@ -368,7 +385,20 @@ pub fn lower_class_decl(
     let (extends, extends_name, native_extends, extends_expr) = if let Some(ref super_class) =
         class_decl.class.super_class
     {
-        if let ast::Expr::Ident(ident) = super_class.as_ref() {
+        if ctx
+            .current_class_inner_name
+            .as_deref()
+            .is_some_and(|inner| is_class_self_heritage(super_class, inner))
+        {
+            (
+                None,
+                None,
+                None,
+                Some(Box::new(crate::lower::throw_reference_error_expr(
+                    "js_throw_reference_error_this_before_super",
+                ))),
+            )
+        } else if let ast::Expr::Ident(ident) = super_class.as_ref() {
             let parent_name = ident.sym.to_string();
             // First check if it's a native module class
             let native_parent = match parent_name.as_str() {
@@ -450,7 +480,7 @@ pub fn lower_class_decl(
                 // type-facts) to an UNRELATED same-named class, corrupting the
                 // subclass. Matches the fully-dynamic `class X extends
                 // <runtimeValue>` shape (`extends`+`extends_name` both None).
-                match lower_expr(ctx, super_class) {
+                match lower_class_heritage_expr(ctx, super_class) {
                     Ok(expr) => (None, None, None, Some(Box::new(expr))),
                     Err(_) => (None, None, None, None),
                 }
@@ -486,7 +516,7 @@ pub fn lower_class_decl(
                     // textual parent name (super-call codegen, etc.)
                     // but extends_expr takes precedence on the
                     // method-dispatch path.
-                    match lower_expr(ctx, super_class) {
+                    match lower_class_heritage_expr(ctx, super_class) {
                         Ok(expr) => (None, Some(parent_name), None, Some(Box::new(expr))),
                         Err(_) => (None, Some(parent_name), None, None),
                     }
@@ -537,7 +567,7 @@ pub fn lower_class_decl(
                 // guard in `extract_top_level_class_decls` keeps this class
                 // inside the IIFE so the require alias is assigned before the
                 // registration runs.
-                match lower_expr(ctx, super_class) {
+                match lower_class_heritage_expr(ctx, super_class) {
                     Ok(expr) => (None, Some(parent_name), None, Some(Box::new(expr))),
                     Err(_) => (None, Some(parent_name), None, None),
                 }
@@ -562,7 +592,7 @@ pub fn lower_class_decl(
                 // is handled by the `parent_name == name` arm above. (Refs #488
                 // drizzle-sqlite for the original cross-module link.)
                 let resolved = ctx.lookup_class(&parent_name);
-                match lower_expr(ctx, super_class) {
+                match lower_class_heritage_expr(ctx, super_class) {
                     Ok(expr) => (resolved, Some(parent_name), None, Some(Box::new(expr))),
                     Err(_) => (resolved, Some(parent_name), None, None),
                 }
@@ -581,7 +611,7 @@ pub fn lower_class_decl(
             // the rest of the program still compiles (the
             // method-dispatch catch-all in object.rs surfaces the
             // missing-method case clearly enough).
-            match lower_expr(ctx, super_class) {
+            match lower_class_heritage_expr(ctx, super_class) {
                 Ok(expr) => (None, None, None, Some(Box::new(expr))),
                 Err(_) => (None, None, None, None),
             }
@@ -727,7 +757,7 @@ pub fn lower_class_decl(
     let mut seen_generic_computed_member = false;
 
     // Second pass: actually lower the class members
-    for member in &class_decl.class.body {
+    for (member_index, member) in class_decl.class.body.iter().enumerate() {
         match member {
             ast::ClassMember::Constructor(ctor) => {
                 constructor = Some(lower_constructor(ctx, &name, ctor)?);
@@ -738,8 +768,12 @@ pub fn lower_class_decl(
                     continue;
                 }
                 if let Some(computed) = generic_computed_member_key(ctx, method) {
-                    computed_members
-                        .push(lower_generic_computed_class_member(ctx, method, computed)?);
+                    computed_members.push(lower_generic_computed_class_member(
+                        ctx,
+                        method,
+                        computed,
+                        member_index,
+                    )?);
                     seen_generic_computed_member = true;
                     continue;
                 }
@@ -802,7 +836,10 @@ pub fn lower_class_decl(
                         })?;
                         if seen_generic_computed_member && can_source_order_register {
                             computed_members.push(lower_noncomputed_class_member_registration(
-                                ctx, method, &prop_name,
+                                ctx,
+                                method,
+                                &prop_name,
+                                member_index,
                             )?);
                         }
                         if method.is_static {
@@ -818,7 +855,10 @@ pub fn lower_class_decl(
                         })?;
                         if seen_generic_computed_member && can_source_order_register {
                             computed_members.push(lower_noncomputed_class_member_registration(
-                                ctx, method, &prop_name,
+                                ctx,
+                                method,
+                                &prop_name,
+                                member_index,
                             )?);
                         }
                         if method.is_static {
@@ -852,7 +892,10 @@ pub fn lower_class_decl(
                         }
                         if seen_generic_computed_member && can_source_order_register {
                             computed_members.push(lower_noncomputed_class_member_registration(
-                                ctx, method, &prop_name,
+                                ctx,
+                                method,
+                                &prop_name,
+                                member_index,
                             )?);
                         }
                         if method.is_static {
@@ -1335,9 +1378,9 @@ pub fn lower_class_from_ast(
     let old_inner_name = ctx.current_class_inner_name.take();
     // A class-expression caller stashes the source ident here; fall back
     // to the (possibly synthetic) registration name when absent.
-    ctx.current_class_inner_name = ctx
-        .pending_class_inner_name
-        .take()
+    let explicit_inner_name = ctx.pending_class_inner_name.take();
+    ctx.current_class_inner_name = explicit_inner_name
+        .clone()
         .or_else(|| Some(name.to_string()));
     let old_is_derived = ctx.current_class_is_derived;
     ctx.current_class_is_derived = class.super_class.is_some();
@@ -1376,7 +1419,19 @@ pub fn lower_class_from_ast(
     let (extends, extends_name, native_extends, extends_expr) = if let Some(ref super_class) =
         class.super_class
     {
-        if let ast::Expr::Ident(ident) = super_class.as_ref() {
+        if explicit_inner_name
+            .as_deref()
+            .is_some_and(|inner| is_class_self_heritage(super_class, inner))
+        {
+            (
+                None,
+                None,
+                None,
+                Some(Box::new(crate::lower::throw_reference_error_expr(
+                    "js_throw_reference_error_this_before_super",
+                ))),
+            )
+        } else if let ast::Expr::Ident(ident) = super_class.as_ref() {
             let parent_name = ident.sym.to_string();
             let native_parent = match parent_name.as_str() {
                 "EventEmitter" => Some(("events".to_string(), "EventEmitter".to_string())),
@@ -1460,7 +1515,7 @@ pub fn lower_class_from_ast(
                 // method / vtable / type-facts), corrupting the subclass. The
                 // dynamic `extends_expr` path registers the correct parent edge at
                 // runtime via `RegisterClassParentDynamic` + `function_class_id`.
-                match lower_expr(ctx, super_class) {
+                match lower_class_heritage_expr(ctx, super_class) {
                     Ok(expr) => (None, None, None, Some(Box::new(expr))),
                     Err(_) => (None, None, None, None),
                 }
@@ -1477,7 +1532,7 @@ pub fn lower_class_from_ast(
                     // falls through to extends_expr capture so a
                     // function-with-prototype value can be resolved at
                     // runtime via `function_class_id`.
-                    match lower_expr(ctx, super_class) {
+                    match lower_class_heritage_expr(ctx, super_class) {
                         Ok(expr) => (None, Some(parent_name), None, Some(Box::new(expr))),
                         Err(_) => (None, Some(parent_name), None, None),
                     }
@@ -1505,7 +1560,7 @@ pub fn lower_class_from_ast(
                 // matching `.default` arm in `lower_class_decl` above: route
                 // through `extends_expr` so `super()` re-evaluates the alias
                 // at construction time and the parent edge is registered.
-                match lower_expr(ctx, super_class) {
+                match lower_class_heritage_expr(ctx, super_class) {
                     Ok(expr) => (None, Some(parent_name), None, Some(Box::new(expr))),
                     Err(_) => (None, Some(parent_name), None, None),
                 }
@@ -1516,7 +1571,7 @@ pub fn lower_class_from_ast(
                 // Keep in lockstep with the matching arm in `lower_class_decl`
                 // (wall 48: NodeNextRequest extends _index.BaseNextRequest).
                 let resolved = ctx.lookup_class(&parent_name);
-                match lower_expr(ctx, super_class) {
+                match lower_class_heritage_expr(ctx, super_class) {
                     Ok(expr) => (resolved, Some(parent_name), None, Some(Box::new(expr))),
                     Err(_) => (resolved, Some(parent_name), None, None),
                 }
@@ -1527,7 +1582,7 @@ pub fn lower_class_from_ast(
             // expression so codegen can evaluate it at the class
             // declaration site and call
             // `js_register_class_parent_dynamic` at runtime.
-            match lower_expr(ctx, super_class) {
+            match lower_class_heritage_expr(ctx, super_class) {
                 Ok(expr) => (None, None, None, Some(Box::new(expr))),
                 Err(_) => (None, None, None, None),
             }
@@ -1578,7 +1633,7 @@ pub fn lower_class_from_ast(
     let mut computed_members = Vec::new();
     let mut seen_generic_computed_member = false;
 
-    for member in &class.body {
+    for (member_index, member) in class.body.iter().enumerate() {
         match member {
             ast::ClassMember::Constructor(ctor) => {
                 constructor = Some(lower_constructor(ctx, name, ctor)?);
@@ -1589,8 +1644,12 @@ pub fn lower_class_from_ast(
                     continue;
                 }
                 if let Some(computed) = generic_computed_member_key(ctx, method) {
-                    computed_members
-                        .push(lower_generic_computed_class_member(ctx, method, computed)?);
+                    computed_members.push(lower_generic_computed_class_member(
+                        ctx,
+                        method,
+                        computed,
+                        member_index,
+                    )?);
                     seen_generic_computed_member = true;
                     continue;
                 }
@@ -1645,7 +1704,10 @@ pub fn lower_class_from_ast(
                         })?;
                         if seen_generic_computed_member && can_source_order_register {
                             computed_members.push(lower_noncomputed_class_member_registration(
-                                ctx, method, &prop_name,
+                                ctx,
+                                method,
+                                &prop_name,
+                                member_index,
                             )?);
                         }
                         if method.is_static {
@@ -1660,7 +1722,10 @@ pub fn lower_class_from_ast(
                         })?;
                         if seen_generic_computed_member && can_source_order_register {
                             computed_members.push(lower_noncomputed_class_member_registration(
-                                ctx, method, &prop_name,
+                                ctx,
+                                method,
+                                &prop_name,
+                                member_index,
                             )?);
                         }
                         if method.is_static {
@@ -1683,7 +1748,10 @@ pub fn lower_class_from_ast(
                         }
                         if seen_generic_computed_member && can_source_order_register {
                             computed_members.push(lower_noncomputed_class_member_registration(
-                                ctx, method, &prop_name,
+                                ctx,
+                                method,
+                                &prop_name,
+                                member_index,
                             )?);
                         }
                         if method.is_static {

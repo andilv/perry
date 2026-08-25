@@ -437,7 +437,17 @@ pub(crate) fn lower_ident_assignment(
             strict: ctx.current_strict,
         });
     }
-    if let Some(id) = ctx.lookup_local(&name) {
+    let targets_class_inner = ctx.current_class_inner_name.as_deref() == Some(name.as_str())
+        && !ctx
+            .local_decl_scope_depth(&name)
+            .zip(ctx.current_class_scope_depth)
+            .is_some_and(|(local_depth, class_depth)| local_depth > class_depth);
+    if targets_class_inner {
+        Ok(Expr::Sequence(vec![
+            *value,
+            throw_type_error_const_assignment(&name),
+        ]))
+    } else if let Some(id) = ctx.lookup_local(&name) {
         if ctx.is_local_immutable(id) {
             // `const c = 1; c = 9` (and every wrapped spelling of the same
             // target) evaluates the RHS for side effects, then throws
@@ -447,19 +457,38 @@ pub(crate) fn lower_ident_assignment(
                 throw_type_error_const_assignment(&name),
             ]));
         }
-        Ok(Expr::LocalSet(id, value))
-    } else if ctx.current_class_inner_name.as_deref() == Some(name.as_str()) {
-        // Assigning to the class own-name binding from inside the class
-        // body targets the immutable inner `const` binding -> TypeError
-        // (test262 language/statements/class/name-binding/const). Evaluate
-        // the RHS for side effects first, then throw. A local/param that
-        // shadows the name was already handled by the `lookup_local` arm
-        // above, so this only fires for the genuine class binding.
-        Ok(Expr::Sequence(vec![
-            *value,
-            throw_type_error_const_assignment(&name),
-        ]))
-    } else if ctx.lookup_class(&name).is_some() || ctx.lookup_func(&name).is_some() {
+        let local_set = Expr::LocalSet(id, value);
+        let mirrors_script_var = super::lower_expr::global_script_this_enabled()
+            && ctx.script_var_decl_names.contains(&name)
+            && ctx.local_decl_scope_depth(&name) == Some(0);
+        if mirrors_script_var {
+            let global_this = Box::new(Expr::GlobalThisExpr);
+            Ok(Expr::Sequence(vec![
+                local_set,
+                Expr::PutValueSet {
+                    target: global_this.clone(),
+                    key: Box::new(Expr::String(name)),
+                    value: Box::new(Expr::LocalGet(id)),
+                    receiver: global_this,
+                    strict: ctx.current_strict,
+                },
+            ]))
+        } else {
+            Ok(local_set)
+        }
+    } else if ctx.lookup_class(&name).is_some() || ctx.forward_class_shadows_local(&name) {
+        let class_name = ctx.resolve_class_name(&name);
+        Ok(Expr::Call {
+            callee: Box::new(Expr::ExternFuncRef {
+                name: "js_class_lexical_binding_set".to_string(),
+                param_types: vec![crate::types::Type::Any, crate::types::Type::Any],
+                return_type: crate::types::Type::Any,
+            }),
+            args: vec![Expr::ClassRef(class_name), *value],
+            type_args: Vec::new(),
+            byte_offset: 0,
+        })
+    } else if ctx.lookup_func(&name).is_some() {
         // v0.5.757: don't shadow a class/function binding with an
         // implicit local for `<Name> = X` patterns. Drizzle's
         // sql.js uses `((sql2) => { ... })(sql || (sql = {}))`
@@ -471,6 +500,12 @@ pub(crate) fn lower_ident_assignment(
         Ok(*value)
     } else {
         if ctx.current_strict {
+            if matches!(name.as_str(), "undefined" | "NaN" | "Infinity") {
+                return Ok(Expr::Sequence(vec![
+                    *value,
+                    throw_type_error_const_assignment(&name),
+                ]));
+            }
             // #5989: strict-mode assignment to an existing global
             // builtin is a property write, not a ReferenceError. See
             // `strict_global_assign_existing_or_throw` for the full
@@ -516,33 +551,52 @@ fn lower_assignment_target(
         }
         ast::AssignTarget::Simple(ast::SimpleAssignTarget::Member(member)) => {
             // Proxy set: `proxy.foo = v` / `proxy[k] = v`
-            if let ast::Expr::Ident(obj_ident) = member.obj.as_ref() {
-                let obj_name = obj_ident.sym.to_string();
-                if ctx.is_proxy_local(&obj_name) {
-                    let proxy = Box::new(if let Some(id) = ctx.lookup_local(&obj_name) {
-                        Expr::LocalGet(id)
-                    } else {
-                        lower_expr(ctx, &member.obj)?
-                    });
-                    let key = Box::new(match &member.prop {
-                        ast::MemberProp::Ident(i) => Expr::String(i.sym.to_string()),
-                        ast::MemberProp::Computed(c) => lower_expr(ctx, &c.expr)?,
-                        ast::MemberProp::PrivateName(p) => {
-                            Expr::String(format!("#{}", p.name.as_str()))
-                        }
-                    });
-                    return Ok(Expr::PutValueSet {
-                        target: proxy.clone(),
-                        key,
-                        value,
-                        receiver: proxy,
-                        strict: ctx.current_strict,
-                    });
+            if !matches!(member.prop, ast::MemberProp::PrivateName(_)) {
+                if let ast::Expr::Ident(obj_ident) = member.obj.as_ref() {
+                    let obj_name = obj_ident.sym.to_string();
+                    if ctx.is_proxy_local(&obj_name) {
+                        let proxy = Box::new(if let Some(id) = ctx.lookup_local(&obj_name) {
+                            Expr::LocalGet(id)
+                        } else {
+                            lower_expr(ctx, &member.obj)?
+                        });
+                        let key = Box::new(match &member.prop {
+                            ast::MemberProp::Ident(i) => Expr::String(i.sym.to_string()),
+                            ast::MemberProp::Computed(c) => lower_expr(ctx, &c.expr)?,
+                            ast::MemberProp::PrivateName(_) => unreachable!("guarded above"),
+                        });
+                        return Ok(Expr::PutValueSet {
+                            target: proxy.clone(),
+                            key,
+                            value,
+                            receiver: proxy,
+                            strict: ctx.current_strict,
+                        });
+                    }
                 }
             }
             // Check if this is a static field assignment (e.g., Counter.count = 5)
             if let ast::Expr::Ident(obj_ident) = member.obj.as_ref() {
                 let obj_name = obj_ident.sym.to_string();
+                // Dynamic GeneratorFunction/AsyncGeneratorFunction results
+                // use a compact non-closure runtime representation, but still
+                // inherit Function.prototype's poisoned caller/arguments
+                // accessors. The local's inferred brand is authoritative here.
+                if let ast::MemberProp::Ident(prop_ident) = &member.prop {
+                    let is_dynamic_generator = matches!(
+                        ctx.lookup_local_type(&obj_name),
+                        Some(Type::Named(name))
+                            if matches!(name.as_str(), "GeneratorFunction" | "AsyncGeneratorFunction")
+                    );
+                    if is_dynamic_generator
+                        && matches!(prop_ident.sym.as_ref(), "caller" | "arguments")
+                    {
+                        return Ok(Expr::Sequence(vec![
+                            *value,
+                            throw_restricted_function_property_assignment(),
+                        ]));
+                    }
+                }
                 // `f.caller = v` / `f.arguments = v` on a declared function —
                 // the poisoned setter-less accessor on Function.prototype
                 // throws (strict semantics; Perry-compiled code is strict).
@@ -1138,13 +1192,14 @@ fn lower_assignment_target(
                     // Private field assignment: this.#field = value. Guard the
                     // receiver so a write to a wrong receiver — or to a
                     // getter-only accessor / a private method — throws.
-                    let property = format!("#{}", private.name);
+                    let private_name = format!("#{}", private.name);
                     let object = super::expr_member::wrap_private_guard(
                         ctx,
                         object,
-                        &property,
+                        &private_name,
                         super::expr_member::PRIV_OP_WRITE,
                     );
+                    let property = super::expr_member::private_storage_property(ctx, &private_name);
                     Ok(wrap_assign_object_prelude(
                         prelude.take(),
                         Expr::PropertySet {
@@ -1157,15 +1212,6 @@ fn lower_assignment_target(
             }
         }
         ast::AssignTarget::Simple(ast::SimpleAssignTarget::SuperProp(super_prop)) => {
-            if ctx.current_class_member_is_static {
-                let mut exprs = Vec::new();
-                if let ast::SuperProp::Computed(computed) = &super_prop.prop {
-                    exprs.push(lower_expr(ctx, &computed.expr)?);
-                }
-                exprs.push(*value);
-                exprs.push(throw_type_error_const_assignment(""));
-                return Ok(Expr::Sequence(exprs));
-            }
             let key = match &super_prop.prop {
                 ast::SuperProp::Ident(ident) => Box::new(Expr::String(ident.sym.to_string())),
                 ast::SuperProp::Computed(computed) => Box::new(lower_expr(ctx, &computed.expr)?),

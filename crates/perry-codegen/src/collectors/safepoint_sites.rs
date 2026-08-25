@@ -56,6 +56,35 @@ fn is_safepoint(e: &Expr) -> bool {
             | Expr::Await(_)
             | Expr::Yield { .. }
             | Expr::AsyncFirstCall { .. }
+            // #8583 (unit-4 / `__33499`): object and array literals allocate via
+            // a runtime call (`js_array_from_values`, `js_object_*`) that can
+            // collect, so RS4GC inserts a statepoint at each. A minified data
+            // table is a single giant array-of-arrays — `__33499` lowered to
+            // 11,104 `js_array_from_values` calls, none of which is an `Expr::Call`,
+            // so the pre-fix count saw almost no safepoints, the function was not
+            // spilled, and RS4GC then fanned out for >3 h. Counting these keeps
+            // the estimate an over-approximation biased toward spilling (the safe
+            // direction; a hoisted/constant literal that emits no call only costs
+            // a cheap shadow frame).
+            | Expr::Object(_)
+            | Expr::ObjectSpread { .. }
+            | Expr::ObjectAssign { .. }
+            | Expr::Array(_)
+            | Expr::ArraySpread(_)
+            // #8583 (`__AnonShape_*_constructor`): a property/index STORE lowers
+            // to an allocating, collecting runtime call (`js_class_field_set_ic`
+            // / `js_set_property` / the array-set helpers) that RS4GC gives a
+            // statepoint. A closed-shape object literal compiles to a constructor
+            // that is one long run of `this.field = v` stores (`PropertySet`);
+            // with none counted the estimate was ~0, the constructor was not
+            // spilled, and RS4GC grew it 34k -> 2.28M instructions, overrunning
+            // the #8586 budget. Count the stores (not the reads:
+            // `PropertyGet`/`IndexGet` frequently inline to a shape-cached load
+            // with no call, and counting them would over-spill read-heavy hot
+            // loops). `PropertyUpdate` (`x.f++`) is a read-modify-write store.
+            | Expr::PropertySet { .. }
+            | Expr::PropertyUpdate { .. }
+            | Expr::IndexSet { .. }
     )
 }
 
@@ -215,5 +244,71 @@ mod tests {
         // f(g(), h()) is three calls.
         let nested = call(vec![call(vec![]), call(vec![])]);
         assert_eq!(count_safepoint_sites(&[Stmt::Expr(nested)]), 3);
+    }
+
+    #[test]
+    fn array_and_object_literals_are_safepoints() {
+        // #8583: allocating literals lower to a collecting runtime call
+        // (`js_array_from_values` / `js_object_*`) and must count. A minified
+        // data table is a giant array-of-arrays with no `Expr::Call` at all —
+        // the pre-fix count saw zero safepoints and the function was not spilled.
+        let inner = |a, b| Expr::Array(vec![Expr::Number(a as f64), Expr::Number(b as f64)]);
+        // [[..],[..],[..]] — one outer Array + three inner Arrays = 4 safepoints.
+        let table = Expr::Array(vec![inner(1, 2), inner(3, 4), inner(5, 6)]);
+        assert_eq!(count_safepoint_sites(&[Stmt::Expr(table)]), 4);
+
+        // An object literal is also an allocating safepoint.
+        let obj = Expr::Object(vec![("k".to_string(), Expr::Number(1.0))]);
+        assert_eq!(count_safepoint_sites(&[Stmt::Expr(obj)]), 1);
+    }
+
+    #[test]
+    fn nested_array_literals_recurse() {
+        // Deeply nested constant arrays count every allocating level — the
+        // `__33499` shape (11,104 `js_array_from_values` from one literal).
+        let leaf = || Expr::Array(vec![Expr::Number(0.0)]);
+        let rows: Vec<Expr> = (0..10).map(|_| leaf()).collect();
+        // 1 outer + 10 inner = 11.
+        assert_eq!(count_safepoint_sites(&[Stmt::Expr(Expr::Array(rows))]), 11);
+    }
+
+    #[test]
+    fn property_and_index_stores_are_safepoints() {
+        // #8583: `this.field = v` / `arr[i] = v` lower to a collecting runtime
+        // call and must count. A closed-shape object literal is a constructor of
+        // many `PropertySet` stores (the `__AnonShape_*_constructor` shape) — the
+        // pre-fix count saw none, so the constructor never spilled and RS4GC
+        // overran the #8586 budget.
+        let this = || Expr::LocalGet(0);
+        let set = |p: &str| Expr::PropertySet {
+            object: Box::new(this()),
+            property: p.to_string(),
+            value: Box::new(Expr::Number(1.0)),
+        };
+        // Three field stores in the constructor body.
+        let body = vec![
+            Stmt::Expr(set("a")),
+            Stmt::Expr(set("b")),
+            Stmt::Expr(set("c")),
+        ];
+        assert_eq!(count_safepoint_sites(&body), 3);
+
+        // An index store counts too; the value sub-expression still recurses
+        // (a call in the value is its own safepoint).
+        let idx_set = Expr::IndexSet {
+            object: Box::new(this()),
+            index: Box::new(Expr::Number(0.0)),
+            value: Box::new(call(vec![])),
+        };
+        // 1 for the IndexSet + 1 for the call in `value`.
+        assert_eq!(count_safepoint_sites(&[Stmt::Expr(idx_set)]), 2);
+
+        // A read (`PropertyGet`) is deliberately NOT a safepoint (it inlines).
+        let get = Expr::PropertyGet {
+            object: Box::new(this()),
+            property: "x".to_string(),
+            byte_offset: 0,
+        };
+        assert_eq!(count_safepoint_sites(&[Stmt::Expr(get)]), 0);
     }
 }

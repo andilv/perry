@@ -679,49 +679,7 @@ pub(crate) fn build_and_run_link(
     }
 
     if is_watchos {
-        // watchOS frameworks (swiftc auto-links Swift stdlib on the non-game-loop path)
-        let is_watchos_game_loop = compiled_features.iter().any(|f| f == "watchos-game-loop");
-        let is_watchos_swift_app = compiled_features.iter().any(|f| f == "watchos-swift-app");
-        if !is_watchos_game_loop {
-            cmd.arg("-framework").arg("SwiftUI");
-        }
-        cmd.arg("-framework")
-            .arg("WatchKit")
-            .arg("-framework")
-            .arg("Foundation")
-            .arg("-framework")
-            .arg("CoreFoundation")
-            .arg("-framework")
-            .arg("Security")
-            .arg("-framework")
-            .arg("UserNotifications") // UNUserNotificationCenter (perry/system notificationSend/Schedule/OnTap)
-            // AVFAudio: AVAudioEngine / AVAudioSession / AVAudioApplication for
-            // microphone capture + the record-permission API (perry/system
-            // audioStart, getLevel, recording). Without this the audio classes
-            // aren't registered in the objc runtime, so `AnyClass::get` returns
-            // nil and audio silently no-ops on device — e.g. a watchOS dB meter
-            // shows no levels and never prompts for mic permission. (The iOS
-            // branch already links these; watchOS was missing them.)
-            .arg("-framework")
-            .arg("AVFAudio")
-            .arg("-framework")
-            .arg("AVFoundation")
-            .arg("-lSystem")
-            .arg("-lresolv");
-        if is_watchos_game_loop {
-            // QuartzCore for CAMetalLayer-backed rendering (Metal.framework is NOT
-            // in the watchOS SDK — the native lib must dlopen it or supply its own
-            // path to the device's Metal dylib). -lobjc for the dynamic
-            // WKApplicationDelegate class registered from watchos_game_loop.rs.
-            cmd.arg("-framework").arg("QuartzCore").arg("-lobjc");
-        }
-        if is_watchos_swift_app {
-            // SceneKit for SceneView-backed 3D rendering from the native lib's
-            // `@main struct App: App`. The lib may additionally use Canvas (2D,
-            // already covered by SwiftUI) or SpriteKit (opt-in via the
-            // manifest's `frameworks` list).
-            cmd.arg("-framework").arg("SceneKit");
-        }
+        watchos_frameworks::append_watchos_frameworks(&mut cmd, compiled_features);
     } else if is_ios {
         // iOS frameworks
         cmd.arg("-framework")
@@ -766,6 +724,12 @@ pub(crate) fn build_and_run_link(
             .arg("-lresolv")
             .arg("-lobjc")
             .arg("-lSystem");
+        if ctx.native_module_imports.contains("perry/ios") {
+            // FoundationModels is Swift-only. The bridge object is compiled
+            // in platform_cmd; weak-link so the app's iOS 17 deployment
+            // target still launches and reports `unsupported` before iOS 26.
+            cmd.arg("-weak_framework").arg("FoundationModels");
+        }
     } else if is_visionos {
         cmd.arg("-framework")
             .arg("SwiftUI")
@@ -1007,6 +971,11 @@ pub(crate) fn build_and_run_link(
             find_ui_library(target)
         };
         if let Some(ui_lib) = ui_lib_option {
+            let winui_import_library = if matches!(target, Some("windows-winui")) {
+                Some(winui_assets::winui_bootstrap_import_library(&ui_lib)?)
+            } else {
+                None
+            };
             // The UI staticlib bundles perry_runtime + Rust std. When perry-stdlib
             // is also linked (which bundles the same), duplicate symbols cause
             // crashes (conflicting static state initialization). Strip fully
@@ -1084,6 +1053,9 @@ pub(crate) fn build_and_run_link(
                 // undefined when the lib is scanned. /WHOLEARCHIVE forces all
                 // objects from the archive to be included unconditionally.
                 cmd.arg(format!("/WHOLEARCHIVE:{}", ui_lib.display()));
+                if let Some(import_library) = winui_import_library {
+                    cmd.arg(import_library);
+                }
             } else {
                 cmd.arg(&ui_lib);
             }
@@ -1926,6 +1898,7 @@ pub(crate) fn build_and_run_link(
         if let Some(path) = embedded_info_plist_path {
             let _ = fs::remove_file(path);
         }
+        winui_assets::deploy_winui_runtime_assets(target, ctx.needs_ui, exe_path)?;
         return Ok(link_cache_status);
     }
 
@@ -1990,6 +1963,8 @@ pub(crate) fn build_and_run_link(
     if !status.success() {
         return Err(anyhow!("Linking failed"));
     }
+
+    winui_assets::deploy_winui_runtime_assets(target, ctx.needs_ui, exe_path)?;
 
     Ok(link_cache_status)
 }

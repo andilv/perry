@@ -225,6 +225,31 @@ pub(super) fn lower_new(ctx: &mut LoweringContext, new_expr: &ast::NewExpr) -> R
     // Try to extract class name from callee
     match callee_expr {
         ast::Expr::Ident(ident) => {
+            let source_class_name = ident.sym.as_str();
+            // Hidden dynamic-function constructors reached through
+            // `<function literal>.constructor` are pre-classified by
+            // `fn_ctor_env`. Their call form already const-folds; construction
+            // must use the same kind-aware path (`new GeneratorFunction()`,
+            // `new AsyncFunction(...)`, and async generators) instead of the
+            // generic object-construction fallback.
+            if ctx.local_decl_scope_depth(ident.sym.as_ref()) == Some(0) {
+                if let Some(super::fn_ctor_env::FnCtorShape::DynCtor(kind)) =
+                    ctx.fn_ctor_env.entries.get(ident.sym.as_str()).cloned()
+                {
+                    let args = new_expr.args.as_deref().unwrap_or(&[]);
+                    if let Some(folded) =
+                        super::const_fold_fn::try_const_fold_function_construct_kind(
+                            ctx,
+                            args,
+                            crate::eval_classifier::EvalSurface::NewFunction,
+                            new_expr.span,
+                            kind,
+                        )?
+                    {
+                        return Ok(folded);
+                    }
+                }
+            }
             // The inner name of the class currently being lowered is a lexical
             // binding that wins over same-named OUTER locals. A nearer method
             // parameter/local still shadows it: `class C { static make(C) {
@@ -249,7 +274,7 @@ pub(super) fn lower_new(ctx: &mut LoweringContext, new_expr: &ast::NewExpr) -> R
             let mut class_name = if is_current_class_self {
                 ctx.current_class.clone().unwrap()
             } else {
-                ctx.resolve_class_name(ident.sym.as_str())
+                ctx.resolve_class_name(source_class_name)
             };
             // Snapshot the callee identifier's local/param binding at the TOP
             // of the ident arm, before any argument lowering or native-module
@@ -341,7 +366,7 @@ pub(super) fn lower_new(ctx: &mut LoweringContext, new_expr: &ast::NewExpr) -> R
                     || callee_local_at_entry.is_some()
                     || ctx.lookup_func(&class_name).is_some()
                     || ctx.lookup_imported_func(&class_name).is_some()
-                    || ctx.forward_class_names.contains(class_name.as_str()));
+                    || ctx.forward_class_names.contains(source_class_name));
             if matches!(
                 ctx.lookup_native_module(&class_name),
                 Some(("url", Some("Url")))
@@ -588,12 +613,15 @@ pub(super) fn lower_new(ctx: &mut LoweringContext, new_expr: &ast::NewExpr) -> R
                 // through the module call directly so `new JSCallback(...)`
                 // observes that explicit object return instead of generic
                 // `Expr::New` manufacturing and retaining a blank instance.
-                if module_name == "bun:ffi" && method_name == Some("JSCallback") {
+                if module_name == "bun:ffi"
+                    && matches!(method_name, Some("JSCallback") | Some("CFunction"))
+                {
+                    let method = method_name.unwrap_or("JSCallback").to_string();
                     return Ok(Expr::NativeMethodCall {
                         module: "bun:ffi".to_string(),
                         class_name: None,
                         object: None,
-                        method: "JSCallback".to_string(),
+                        method,
                         args: lower_optional_args(ctx, new_expr.args.as_deref())?,
                     });
                 }
@@ -652,6 +680,32 @@ pub(super) fn lower_new(ctx: &mut LoweringContext, new_expr: &ast::NewExpr) -> R
                 // shadowing (`class Worker {}` / a parameter named Worker).
                 if imported_worker || !shadowed_by_user_binding {
                     return lower_worker_new(ctx, new_expr);
+                }
+            }
+
+            // `var GeneratorFunction = Object.getPrototypeOf(function*() {})
+            // .constructor; class G extends GeneratorFunction {}`. Perry is
+            // ahead-of-time compiled, so a constant construction site can use
+            // the same kind-aware fold as a direct dynamic-function-constructor
+            // call. The trivial explicit constructor supplies no arguments;
+            // the implicit constructor forwards the new-site arguments.
+            if let Some((kind, forward_args)) =
+                ctx.dynamic_function_subclasses.get(&class_name).copied()
+            {
+                let empty_args: &[ast::ExprOrSpread] = &[];
+                let args_slice = if forward_args {
+                    new_expr.args.as_deref().unwrap_or(empty_args)
+                } else {
+                    empty_args
+                };
+                if let Some(folded) = super::const_fold_fn::try_const_fold_function_construct_kind(
+                    ctx,
+                    args_slice,
+                    crate::eval_classifier::EvalSurface::NewFunction,
+                    new_expr.span,
+                    kind,
+                )? {
+                    return Ok(folded);
                 }
             }
 
@@ -888,8 +942,25 @@ pub(super) fn lower_new(ctx: &mut LoweringContext, new_expr: &ast::NewExpr) -> R
                     }
                 }
             }
-            if matches!(class_name.as_str(), "Symbol" | "BigInt" | "Math" | "JSON")
-                && !shadowed_by_user_binding
+            if matches!(
+                class_name.as_str(),
+                "Symbol"
+                    | "BigInt"
+                    | "Math"
+                    | "JSON"
+                    | "Atomics"
+                    | "Reflect"
+                    | "global"
+                    | "decodeURI"
+                    | "decodeURIComponent"
+                    | "encodeURI"
+                    | "encodeURIComponent"
+                    | "eval"
+                    | "isFinite"
+                    | "isNaN"
+                    | "parseFloat"
+                    | "parseInt"
+            ) && !shadowed_by_user_binding
             {
                 let args = new_expr
                     .args
@@ -1433,6 +1504,32 @@ pub(super) fn lower_new(ctx: &mut LoweringContext, new_expr: &ast::NewExpr) -> R
                 // via `js_new_function_construct` — see
                 // `perry-codegen/src/lower_call/new.rs`.
             }
+            // A named native-module export whose public name is not a class
+            // name still has a real runtime function value. Route `new` over
+            // that value through the dynamic constructor check instead of the
+            // static `Expr::New { class_name }` fallback, which would merely
+            // allocate an empty placeholder. This is where Node distinguishes
+            // constructable JavaScript wrappers (`repl.start`, `events.init`)
+            // from native non-constructors (`path.toNamespacedPath`). The
+            // runtime's explicit export metadata makes that decision. Keep
+            // capitalized class exports on the specialized paths below.
+            if let Some((module, Some(export))) = ctx.lookup_native_module(&class_name) {
+                if export
+                    .chars()
+                    .next()
+                    .is_some_and(|first| !first.is_uppercase())
+                {
+                    return Ok(Expr::NewDynamic {
+                        callee: Box::new(Expr::PropertyGet {
+                            byte_offset: 0,
+                            object: Box::new(Expr::NativeModuleRef(module.to_string())),
+                            property: export.to_string(),
+                        }),
+                        args,
+                        byte_offset: new_byte_offset,
+                    });
+                }
+            }
             // #wall: an ALIASED named import of a native built-in class
             // (`import { BlockList as Wj4 } from "net"; new Wj4()`) must
             // construct exactly like the un-aliased form. The bare-ident
@@ -1468,6 +1565,42 @@ pub(super) fn lower_new(ctx: &mut LoweringContext, new_expr: &ast::NewExpr) -> R
                         class_name = export.to_string();
                     }
                 }
+            }
+            // An identifier that resolves to no lexical, function, class,
+            // import, native-module, or global-constructor binding fails while
+            // evaluating the constructor reference.  That is a ReferenceError
+            // (`new Missing()`), distinct from the TypeError produced when a
+            // present binding's value is non-constructable.
+            //
+            // Consult the native-module registry under BOTH the (possibly
+            // rewritten) `class_name` AND the original `source_class_name`.
+            // The alias-rewrite block just above replaces `class_name` with a
+            // native class's EXPORT name (`Wj4` → `BlockList`) so the
+            // construction path below matches the un-aliased form, but the
+            // registry is keyed on the LOCAL import name (`Wj4`), so
+            // `lookup_native_module(&class_name)` misses under the export name.
+            // Checking `source_class_name` recognizes the aliased native import
+            // as resolved; without it, an aliased `import { BlockList as Wj4 }`
+            // / `{ AsyncLocalStorage as J_z }` / `{ PassThrough as Lrz }` (none
+            // of which are reified global builtins) fell through to this throw
+            // at module init even though the binding is perfectly resolvable.
+            if ctx.lookup_class(&class_name).is_none()
+                && ctx.resolve_class_alias(&class_name).is_none()
+                && ctx.lookup_local(&class_name).is_none()
+                && ctx.lookup_func(&class_name).is_none()
+                && ctx.lookup_imported_func(&class_name).is_none()
+                && ctx.lookup_native_module(&class_name).is_none()
+                && ctx.lookup_native_module(source_class_name).is_none()
+                && !ctx.forward_class_names.contains(source_class_name)
+                && !is_reified_global_builtin_constructor(&class_name)
+            {
+                return Ok(Expr::NewDynamic {
+                    callee: Box::new(super::throw_reference_error_expr(
+                        "js_throw_reference_error_unresolved_get",
+                    )),
+                    args,
+                    byte_offset: new_byte_offset,
+                });
             }
             // Issue #212: classes nested in a function may capture
             // enclosing-scope locals. `lower_class_decl` extended the

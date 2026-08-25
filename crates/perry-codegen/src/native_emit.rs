@@ -34,7 +34,7 @@
 //! the remaining per-LINE formatting; the `instructions=` counter logged per
 //! module is that migration's ratchet.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context as _, Result};
 use inkwell::context::Context;
 use inkwell::module::Module;
 
@@ -89,7 +89,9 @@ fn build_native_module<'ctx>(context: &'ctx Context, llmod: &LlModule) -> Result
         skeleton.push_str(&format!("declare {} @{}({})\n", f.return_type, f.name, tys));
     }
     let module = crate::inprocess::parse_ir_text(context, &skeleton, "perry_native_module")?;
-    let (typed_insts, raw_insts) = stream_functions(context, &module, &funcs, false)?;
+    let gc_leaf_callees = crate::gc_call_effects::transitive_leaf_functions(&funcs);
+    let (typed_insts, raw_insts) =
+        stream_functions(context, &module, &funcs, false, &gc_leaf_callees)?;
     log::debug!(
         "perry-codegen: native construction built {} functions, {} typed + {} raw instructions \
          (ratchet: raw -> 0), skeleton {} bytes",
@@ -108,6 +110,7 @@ fn stream_functions<'ctx>(
     module: &Module<'ctx>,
     funcs: &[&crate::function::LlFunction],
     force_external: bool,
+    gc_leaf_callees: &std::collections::HashSet<String>,
 ) -> Result<(usize, usize)> {
     let mut typed_insts = 0usize;
     let mut raw_insts = 0usize;
@@ -123,7 +126,7 @@ fn stream_functions<'ctx>(
             // This remains native construction: only one finalized function
             // is materialized and fed through the closed dialect line reader,
             // never parsed as module-scale IR.
-            let fn_text = f.to_ir();
+            let fn_text = f.to_ir_with_gc_leaf_callees(gc_leaf_callees);
             for line in fn_text.lines().skip(1) {
                 stream.line(line).map_err(|e| {
                     anyhow!(
@@ -166,11 +169,63 @@ struct FrozenUnit {
     function_count: usize,
 }
 
+/// Apply a typed post-RS4GC budget request to the lowering-owned functions
+/// that produced a module/unit. The request is expected to make progress for
+/// every named function; otherwise retrying would either preserve the refusal
+/// or loop forever, so fail with the original names and counts instead.
+pub(crate) fn apply_budget_spill_retry<'a>(
+    funcs: impl IntoIterator<Item = &'a mut crate::function::LlFunction>,
+    violations: &[crate::inprocess::Rs4gcBudgetViolation],
+) -> Result<()> {
+    let mut changed = std::collections::HashSet::new();
+    for function in funcs {
+        let Some(violation) = violations
+            .iter()
+            .find(|violation| function.name == violation.name)
+        else {
+            continue;
+        };
+        if function.request_shadow_frame_spill() {
+            changed.insert(violation.name.clone());
+            eprintln!(
+                "perry: `{}` exceeded the post-RS4GC instruction budget ({} -> {} \
+                     instructions; cap {}); retrying it with precise GC roots in a shadow \
+                     frame at the requested optimization level (#8679)",
+                violation.name,
+                violation
+                    .pre_instructions
+                    .map_or_else(|| "unknown".to_string(), |n| n.to_string()),
+                violation.post_instructions,
+                violation.cap,
+            );
+        }
+    }
+    let missing: Vec<&str> = violations
+        .iter()
+        .filter(|violation| !changed.contains(&violation.name))
+        .map(|violation| violation.name.as_str())
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "post-RS4GC budget requested a shadow-frame retry for {}, but those \
+             functions were not available for a new lowering (or were already retried)",
+            missing.join(", ")
+        ))
+    }
+}
+
 fn freeze_unit(
-    part: crate::module::OwnedCodegenUnitPart,
+    part: &crate::module::OwnedCodegenUnitPart,
     external_declarations: &[(String, String)],
 ) -> Result<FrozenUnit> {
-    let crate::module::OwnedCodegenUnitPart { pre, post, funcs } = part;
+    let crate::module::OwnedCodegenUnitPart {
+        pre,
+        post,
+        funcs,
+        gc_leaf_callees,
+    } = part;
     let mut skeleton = format!("{pre}{post}");
     // Text units minimize declarations with a rendered-reference scan. Typed
     // instructions can name helpers without passing through that textual scan
@@ -201,11 +256,14 @@ fn freeze_unit(
             // no inkwell builders. Let LLVM's in-process assembly parser build
             // only these exceptional functions; all ordinary bodies remain on
             // the typed C-API path and never become text.
-            skeleton.push_str(&crate::module::render_fn_external(&f));
+            skeleton.push_str(&crate::module::render_fn_external_with_gc_leaf_callees(
+                &f,
+                &gc_leaf_callees,
+            ));
             skeleton.push('\n');
             continue;
         }
-        skeleton.push_str(&crate::module::declare_line_for(&f));
+        skeleton.push_str(&crate::module::declare_line_for(f));
         skeleton.push('\n');
         let mut items = Vec::new();
         if f.stack_map_requested() {
@@ -213,7 +271,7 @@ fn freeze_unit(
             // owned lines so worker threads still receive an immutable payload
             // and the module-scale text graph is never retained.
             items.extend(
-                f.to_ir()
+                f.to_ir_with_gc_leaf_callees(&gc_leaf_callees)
                     .lines()
                     .skip(1)
                     .filter(|line| *line != "}")
@@ -233,7 +291,7 @@ fn freeze_unit(
         }
         functions.push(FrozenFunction {
             name: f.name.clone(),
-            header: synth_define_header(&f, true),
+            header: synth_define_header(f, true),
             items,
         });
     }
@@ -255,18 +313,64 @@ fn stream_frozen_functions<'ctx>(
             .map_err(|e| anyhow!("native IR construction failed in @{}: {e:#}", f.name))?;
         for item in &f.items {
             use crate::function::FinalItem as FI;
-            match item {
-                FrozenItem::Label(s) => stream.item(&FI::Label(s))?,
-                FrozenItem::Blank => stream.item(&FI::Blank)?,
-                FrozenItem::Text(s) => stream.item(&FI::Text(s))?,
-                FrozenItem::Inst(i) => stream.item(&FI::Inst(i))?,
-            }
+            let res = match item {
+                FrozenItem::Label(s) => stream.item(&FI::Label(s)),
+                FrozenItem::Blank => stream.item(&FI::Blank),
+                FrozenItem::Text(s) => stream.item(&FI::Text(s)),
+                FrozenItem::Inst(i) => stream.item(&FI::Inst(i)),
+            };
+            res.map_err(|e| dump_dialect_failure(f, e))?;
         }
-        let (t, r) = stream.finish()?;
+        let (t, r) = stream.finish().map_err(|e| dump_dialect_failure(f, e))?;
         typed += t;
         raw += r;
     }
     Ok((typed, raw))
+}
+
+/// Diagnostic for a dialect construction failure (e.g. "register %rN was used
+/// but never defined"): name the offending function and, when
+/// `PERRY_DIALECT_DUMP=<dir>` is set, write the function's full constructed IR
+/// text (typed insts rendered via `render_into`) to `<dir>/<name>.ll` so the
+/// malformed use site is visible. The failing unit never parses, so the normal
+/// `PERRY_SAVE_LL` post-parse dump cannot capture it.
+fn dump_dialect_failure(f: &FrozenFunction, e: anyhow::Error) -> anyhow::Error {
+    if let Ok(dir) = std::env::var("PERRY_DIALECT_DUMP") {
+        let _ = std::fs::create_dir_all(&dir);
+        let mut buf = String::new();
+        buf.push_str(&f.header);
+        buf.push('\n');
+        for item in &f.items {
+            match item {
+                FrozenItem::Label(s) => {
+                    buf.push_str(s);
+                    buf.push('\n');
+                }
+                FrozenItem::Blank => buf.push('\n'),
+                FrozenItem::Text(s) => {
+                    buf.push_str(s);
+                    buf.push('\n');
+                }
+                FrozenItem::Inst(i) => {
+                    i.render_into(&mut buf);
+                    buf.push('\n');
+                }
+            }
+        }
+        let safe: String = f
+            .name
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let _ = std::fs::write(format!("{dir}/{safe}.ll"), &buf);
+    }
+    anyhow!("native IR construction failed in @{}: {e:#}", f.name)
 }
 
 /// Native construction for a module large enough to split into codegen
@@ -316,7 +420,15 @@ pub fn compile_module_units_native(
         .collect();
     let target_triple = llmod.target_triple.clone();
     let owned_module = std::mem::replace(llmod, LlModule::new(target_triple));
-    let parts = owned_module.into_codegen_unit_parts(n);
+    // Keep at most a bounded window of lowering-owned units alive after they
+    // are frozen. A post-RS4GC budget miss needs that source graph exactly
+    // once so the named functions can switch root lowering and be frozen
+    // again; successful units are still dropped immediately (#8679).
+    let mut parts: Vec<Option<crate::module::OwnedCodegenUnitPart>> = owned_module
+        .into_codegen_unit_parts(n)
+        .into_iter()
+        .map(Some)
+        .collect();
     let unit_timings = std::env::var("PERRY_CODEGEN_UNIT_TIMINGS").is_ok();
     let show_progress = matches!(
         std::env::var("PERRY_CODEGEN_PROGRESS").as_deref(),
@@ -339,25 +451,34 @@ pub fn compile_module_units_native(
     // `LlModule::skeleton_ir`; cross-unit declarations with their actual
     // signatures already live in each part's filtered `pre`.
     let llvm_started = std::time::Instant::now();
+    #[cfg(test)]
+    let test_budget = crate::inprocess::test_rs4gc_budget_cap();
     let compile_one = |i: usize, unit: &FrozenUnit| -> Result<Vec<u8>> {
         let started = std::time::Instant::now();
         let context = Context::create();
         let module =
             crate::inprocess::parse_ir_text(&context, &unit.skeleton, "perry_native_module")
-                .map_err(|e| anyhow!("unit {i} skeleton: {e:#}"))?;
+                .with_context(|| format!("unit {i} skeleton"))?;
         let (t, r) = stream_frozen_functions(&context, &module, &unit.functions)
-            .map_err(|e| anyhow!("unit {i}: {e:#}"))?;
+            .with_context(|| format!("unit {i}"))?;
         debug_dump(&module, &format!("{module_prefix}.unit{i}"));
         let (effective_target, args) = crate::linker::native_plan_args(target, native_roots);
         let mut stats = crate::inprocess::UnitCodegenStats::default();
-        let unit_bytes = crate::inprocess::optimize_and_emit_module_with_stats(
-            &module,
-            &effective_target,
-            &args,
-            native_roots,
-            unit_timings.then_some(&mut stats),
-        )
-        .map_err(|e| anyhow!("unit {i}: {e:#}"))?;
+        let stats_out = unit_timings.then_some(&mut stats);
+        let optimize = || {
+            crate::inprocess::optimize_and_emit_module_with_stats(
+                &module,
+                &effective_target,
+                &args,
+                native_roots,
+                stats_out,
+            )
+        };
+        #[cfg(test)]
+        let optimized = crate::inprocess::with_inherited_test_rs4gc_budget(test_budget, optimize);
+        #[cfg(not(test))]
+        let optimized = optimize();
+        let unit_bytes = optimized.with_context(|| format!("unit {i}"))?;
         if unit_timings {
             let widest = |w: &Option<(String, usize)>| {
                 w.as_ref()
@@ -383,7 +504,7 @@ pub fn compile_module_units_native(
             );
         }
         let obj = crate::linker::finish_native_emission(unit_bytes, &effective_target, &args)
-            .map_err(|e| anyhow!("unit {i}: {e:#}"))?;
+            .with_context(|| format!("unit {i}"))?;
         log::debug!(
             "perry-codegen: native unit {i}: {} fns, {t} typed + {r} raw insts, {:.3}s",
             unit.function_count,
@@ -401,6 +522,7 @@ pub fn compile_module_units_native(
     if show_progress {
         let estimated_mib: f64 = parts
             .iter()
+            .flatten()
             .map(|part| {
                 (part.pre.len()
                     + part.post.len()
@@ -416,21 +538,23 @@ pub fn compile_module_units_native(
             "[perry] codegen: {module_prefix}: freeze/LLVM pipeline started: {unit_total} units, {jobs} workers, ~{estimated_mib:.1} MiB estimated IR"
         );
     }
-    let completed = std::sync::atomic::AtomicUsize::new(0);
     let frozen = std::sync::atomic::AtomicUsize::new(0);
-    let slots: Vec<std::sync::Mutex<Option<Result<Vec<u8>>>>> = (0..parts.len())
-        .map(|_| std::sync::Mutex::new(None))
-        .collect();
-    // The producer alone touches lowering-owned LlFunction/Rc state. Each
-    // completed owned payload immediately enters a bounded queue, letting LLVM
-    // consume it while the producer freezes later units. Previously all units
-    // were frozen into a Vec first: full Claude waited ~5 minutes before LLVM
-    // started and retained both graphs at peak RSS.
+    let mut slots: Vec<Option<Result<Vec<u8>>>> = (0..parts.len()).map(|_| None).collect();
+    // The producer alone touches lowering-owned LlFunction/Rc state. Workers
+    // return their result through a second channel; on a typed budget request
+    // the producer can mutate that still-local graph, freeze it again, and
+    // resubmit it. The in-flight window stays bounded so this retry ability
+    // does not restore the old whole-bundle retention peak.
     let (sender, receiver) =
         std::sync::mpsc::sync_channel::<(usize, Result<FrozenUnit>)>(jobs.max(1));
+    let (result_sender, result_receiver) =
+        std::sync::mpsc::channel::<(usize, std::time::Duration, Result<Vec<u8>>)>();
     let receiver = std::sync::Mutex::new(receiver);
     std::thread::scope(|scope| {
         for worker_index in 0..jobs {
+            let result_sender = result_sender.clone();
+            let receiver = &receiver;
+            let compile_one = &compile_one;
             // LLVM recursion depth scales with function size, and a post-RS4GC
             // relocation-fan-out function reaches millions of instructions
             // (#8082) — Rust's default 2 MiB worker stack SIGBUSes on the
@@ -439,40 +563,29 @@ pub fn compile_module_units_native(
             std::thread::Builder::new()
                 .name(format!("perry-llvm-unit-{worker_index}"))
                 .stack_size(64 * 1024 * 1024)
-                .spawn_scoped(scope, || loop {
-                let received = receiver
-                    .lock()
-                    .expect("native freeze queue poisoned")
-                    .recv();
-                let Ok((i, frozen_unit)) = received else { break };
-                let unit_started = std::time::Instant::now();
-                let out = frozen_unit.and_then(|unit| compile_one(i, &unit));
-                let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                if show_progress {
-                    let elapsed = llvm_started.elapsed().as_secs_f64();
-                    let eta = if done < unit_total {
-                        elapsed / done as f64 * (unit_total - done) as f64
-                    } else {
-                        0.0
+                .spawn_scoped(scope, move || loop {
+                    let received = receiver
+                        .lock()
+                        .expect("native freeze queue poisoned")
+                        .recv();
+                    let Ok((i, frozen_unit)) = received else {
+                        break;
                     };
-                    eprintln!(
-                        "[perry] codegen: {module_prefix}: LLVM unit {}/{} finished ({:.1}s; {} complete; elapsed {:.1} min; ETA ~{:.1} min)",
-                        i + 1, unit_total, unit_started.elapsed().as_secs_f64(), done,
-                        elapsed / 60.0, eta / 60.0
-                    );
-                }
-                *slots[i].lock().expect("native codegen-unit slot poisoned") = Some(out);
+                    let unit_started = std::time::Instant::now();
+                    let out = frozen_unit.and_then(|unit| compile_one(i, &unit));
+                    if result_sender
+                        .send((i, unit_started.elapsed(), out))
+                        .is_err()
+                    {
+                        break;
+                    }
                 })
                 .expect("spawn LLVM unit worker");
         }
+        drop(result_sender);
         let freeze_started = std::time::Instant::now();
         let report_step = (unit_total / 20).max(1);
-        // Consume each part as soon as its owned worker payload has been
-        // produced. Keeping `parts` alive through the scoped worker join held
-        // every unit's large pre/post strings until all LLVM work completed;
-        // dropping that multi-gigabyte graph afterwards added a several-minute
-        // single-threaded destructor tail on the full Claude Code bundle.
-        for (i, part) in parts.into_iter().enumerate() {
+        let enqueue = |i: usize, part: &crate::module::OwnedCodegenUnitPart, retry: bool| -> bool {
             if unit_timings {
                 // Name the widest body before LLVM ever sees it: the one
                 // irreducible function in a bundle is the one that sets the
@@ -480,7 +593,8 @@ pub fn compile_module_units_native(
                 // not say which (#8583).
                 if let Some(widest) = part.funcs.iter().max_by_key(|f| f.estimated_ir_bytes()) {
                     eprintln!(
-                        "[perry] codegen: {module_prefix}: unit {}/{unit_total}: {} fns, ~{:.1} MiB estimated IR, widest {} (~{:.1} MiB)",
+                        "[perry] codegen: {module_prefix}: {}unit {}/{unit_total}: {} fns, ~{:.1} MiB estimated IR, widest {} (~{:.1} MiB)",
+                        if retry { "retry " } else { "" },
                         i + 1,
                         part.funcs.len(),
                         part.funcs.iter().map(|f| f.estimated_ir_bytes()).sum::<usize>() as f64 / 1_048_576.0,
@@ -491,7 +605,10 @@ pub fn compile_module_units_native(
             }
             let unit = freeze_unit(part, &external_declarations);
             if sender.send((i, unit)).is_err() {
-                break;
+                return false;
+            }
+            if retry {
+                return true;
             }
             let done = frozen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if show_progress && (done == unit_total || done % report_step == 0) {
@@ -504,18 +621,102 @@ pub fn compile_module_units_native(
                     eta
                 );
             }
+            true
+        };
+
+        // One source unit per worker. Retrying requires retaining that source
+        // until LLVM answers, but there is no reason to retain a second queued
+        // source per worker too; freezing the next unit after one completes is
+        // only a small producer step and keeps the extra peak tightly bounded.
+        let max_in_flight = jobs.clamp(1, unit_total);
+        let mut next = 0usize;
+        let mut in_flight = 0usize;
+        while next < max_in_flight {
+            let part = parts[next]
+                .as_ref()
+                .expect("an undispatched native unit still owns its lowering graph");
+            if !enqueue(next, part, false) {
+                break;
+            }
+            next += 1;
+            in_flight += 1;
+        }
+
+        let mut done = 0usize;
+        while done < unit_total && in_flight != 0 {
+            let Ok((i, attempt_elapsed, out)) = result_receiver.recv() else {
+                break;
+            };
+            if let Err(error) = &out {
+                if let Some(violations) = crate::inprocess::rs4gc_budget_retry(error) {
+                    let retry = parts[i]
+                        .as_mut()
+                        .expect("a retryable native unit keeps its lowering graph");
+                    match apply_budget_spill_retry(retry.funcs.iter_mut(), &violations) {
+                        Ok(()) if enqueue(i, retry, true) => continue,
+                        Ok(()) => {
+                            slots[i] = Some(Err(anyhow!(
+                                "native codegen retry queue closed for unit {}/{}",
+                                i + 1,
+                                unit_total
+                            )));
+                        }
+                        Err(retry_error) => {
+                            slots[i] = Some(Err(retry_error.context(format!(
+                                "native codegen unit {}/{} could not honor its RS4GC budget retry: \
+                                 {error:#}",
+                                i + 1,
+                                unit_total
+                            ))));
+                        }
+                    }
+                } else {
+                    slots[i] = Some(out);
+                }
+            } else {
+                slots[i] = Some(out);
+            }
+
+            // A final result no longer needs its Rc/RefCell lowering graph.
+            // Drop it now, not after every unit and LLVM worker has finished.
+            parts[i].take();
+            done += 1;
+            in_flight -= 1;
+            if show_progress {
+                let elapsed = llvm_started.elapsed().as_secs_f64();
+                let eta = if done < unit_total {
+                    elapsed / done as f64 * (unit_total - done) as f64
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "[perry] codegen: {module_prefix}: LLVM unit {}/{} finished ({:.1}s; {} complete; elapsed {:.1} min; ETA ~{:.1} min)",
+                    i + 1,
+                    unit_total,
+                    attempt_elapsed.as_secs_f64(),
+                    done,
+                    elapsed / 60.0,
+                    eta / 60.0
+                );
+            }
+
+            if next < unit_total {
+                let part = parts[next]
+                    .as_ref()
+                    .expect("an undispatched native unit still owns its lowering graph");
+                if enqueue(next, part, false) {
+                    next += 1;
+                    in_flight += 1;
+                }
+            }
         }
         drop(sender);
     });
     let mut objs = Vec::with_capacity(unit_total);
     for (i, slot) in slots.into_iter().enumerate() {
         objs.push(
-            slot.into_inner()
-                .expect("native codegen-unit slot poisoned")
-                .expect("every native codegen unit is compiled")
-                .map_err(|e| {
-                    anyhow!("native codegen unit {}/{} failed: {e:#}", i + 1, unit_total)
-                })?,
+            slot.expect("every native codegen unit is compiled")
+                .with_context(|| format!("native codegen unit {}/{} failed", i + 1, unit_total))?,
         );
     }
     let merge_started = std::time::Instant::now();
@@ -551,8 +752,18 @@ pub fn compile_module_units_diff(
     target: Option<&str>,
     module_prefix: &str,
 ) -> Result<Vec<u8>> {
-    let units = llmod.render_codegen_units(n);
-    let bytes_text = crate::linker::compile_units_to_object(&units, target)?;
+    let (bytes_text, text_unit_count) = loop {
+        let units = llmod.render_codegen_units(n);
+        match crate::linker::compile_units_to_object(&units, target) {
+            Ok(bytes) => break (bytes, units.len()),
+            Err(error) => {
+                let Some(violations) = crate::inprocess::rs4gc_budget_retry(&error) else {
+                    return Err(error);
+                };
+                apply_budget_spill_retry(llmod.functions_mut(), &violations)?;
+            }
+        }
+    };
     match compile_module_units_native(llmod, n, target, module_prefix) {
         Err(e) => {
             eprintln!("perry: [ir-diff] native unit construction FAILED (text arm used): {e:#}");
@@ -561,9 +772,9 @@ pub fn compile_module_units_diff(
             if bytes_text == bytes_native {
                 eprintln!(
                     "perry: [ir-diff] OK — native and text unit arms emit byte-identical merged \
-                     objects ({} bytes, {} units)",
+                    objects ({} bytes, {} units)",
                     bytes_text.len(),
-                    units.len()
+                    text_unit_count
                 );
             } else {
                 eprintln!(
@@ -584,27 +795,36 @@ fn plan_for(target: Option<&str>, native_roots: bool) -> (String, Vec<String>) {
 }
 
 pub fn compile_module_native(
-    llmod: &LlModule,
+    llmod: &mut LlModule,
     target: Option<&str>,
     module_prefix: &str,
 ) -> Result<Vec<u8>> {
-    let context = Context::create();
-    let module = build_native_module(&context, llmod)?;
-    debug_dump(&module, module_prefix);
     let native_roots = crate::codegen::helpers::native_stack_roots_enabled();
     let (effective_target, args) = plan_for(target, native_roots);
-    // #7982: under the statepoint backends the plan asks for `-S`, so this
-    // returns assembler TEXT. It must go through the compact-map rewrite and
-    // the assembler before it can be called an object — the textual path has
-    // always done this, the native path silently did not, and the link died
-    // with `ld: unknown file type`.
-    let bytes = crate::inprocess::optimize_and_emit_module(
-        &module,
-        &effective_target,
-        &args,
-        native_roots,
-    )?;
-    crate::linker::finish_native_emission(bytes, &effective_target, &args)
+    loop {
+        let context = Context::create();
+        let module = build_native_module(&context, llmod)?;
+        debug_dump(&module, module_prefix);
+        // #7982: under the statepoint backends the plan asks for `-S`, so this
+        // returns assembler TEXT. It must go through the compact-map rewrite
+        // and the assembler before it can be called an object.
+        match crate::inprocess::optimize_and_emit_module(
+            &module,
+            &effective_target,
+            &args,
+            native_roots,
+        ) {
+            Ok(bytes) => {
+                return crate::linker::finish_native_emission(bytes, &effective_target, &args);
+            }
+            Err(error) => {
+                let Some(violations) = crate::inprocess::rs4gc_budget_retry(&error) else {
+                    return Err(error);
+                };
+                apply_budget_spill_retry(llmod.functions_mut(), &violations)?;
+            }
+        }
+    }
 }
 
 /// The debug view under native construction: `PERRY_SAVE_LL=<dir>` (which
@@ -836,6 +1056,80 @@ mod tests {
         );
     }
 
+    /// #8596: whole-module generated-callee effects must reach both emission
+    /// transports. The text path spells the string attribute inline; LLVM's
+    /// C API prints it through an attribute group. RS4GC is the final arbiter:
+    /// both forms must leave `pure_generated` direct and wrap `may_collect`.
+    #[test]
+    fn transitive_generated_leaf_calls_match_text_and_native_construction() {
+        let _native = crate::codegen::helpers::NativeRootsPin::native();
+        let mut module = LlModule::new(crate::codegen::default_target_triple());
+        module.declare_function("js_shadow_slot_bind", VOID, &[I32, PTR]);
+        module.declare_function("may_collect", VOID, &[]);
+
+        let pure = module.define_function("pure_generated", VOID, vec![]);
+        pure.create_block("entry").ret_void();
+
+        let caller = module.define_function("rooted_leaf_caller", VOID, vec![]);
+        caller.enable_shadow_frame(0);
+        let slot = caller.reserve_shadow_slot().expect("reserve native root");
+        let root = caller.alloca_entry(I64);
+        caller.entry_allocas_push_store(I64, "0", &root);
+        caller.entry_setup_call_void(
+            "js_shadow_slot_bind",
+            &[(I32, &slot.to_string()), (PTR, &root)],
+        );
+        let entry = caller.create_block("entry");
+        entry.call_void("pure_generated", &[]);
+        entry.call_void("may_collect", &[]);
+        entry.ret_void();
+
+        let text_ir = module.to_ir();
+        let context = Context::create();
+        let native_ir = build_native_module(&context, &module)
+            .expect("native transitive-leaf witness constructs")
+            .print_to_string()
+            .to_string();
+        assert!(
+            text_ir.contains("call void @pure_generated() \"gc-leaf-function\""),
+            "text path lost transitive leaf marker:\n{text_ir}"
+        );
+        assert!(
+            native_ir.contains("\"gc-leaf-function\""),
+            "native path lost transitive leaf marker:\n{native_ir}"
+        );
+        let units = module.render_codegen_units(2);
+        assert_eq!(units.len(), 2, "fixture must split into two real units");
+        assert!(
+            units
+                .iter()
+                .any(|unit| unit.contains("call void @pure_generated() \"gc-leaf-function\"")),
+            "split text units lost the whole-module leaf closure:\n{}",
+            units.join("\n--- unit ---\n")
+        );
+
+        let target = crate::codegen::default_target_triple();
+        for (arm, ir) in [("text", text_ir), ("native", native_ir)] {
+            let rewritten = crate::inprocess::statepoint_rewritten_ir(
+                &ir,
+                &target,
+                &format!("transitive_leaf_{arm}"),
+            )
+            .unwrap_or_else(|e| panic!("{arm} transitive-leaf witness failed RS4GC: {e:#}"));
+            assert!(
+                rewritten.contains("call void @pure_generated()"),
+                "{arm} path statepointed a proven leaf call:\n{rewritten}"
+            );
+            assert!(
+                rewritten.lines().any(|line| {
+                    line.contains("@llvm.experimental.gc.statepoint")
+                        && line.contains("@may_collect")
+                }),
+                "{arm} path failed to statepoint the collecting control:\n{rewritten}"
+            );
+        }
+    }
+
     fn compact_gc_map_section_name() -> &'static [u8] {
         if cfg!(target_os = "macos") {
             b"__perry_gcmap"
@@ -887,7 +1181,7 @@ mod tests {
     #[test]
     fn native_construction_lowers_precise_roots_before_rs4gc() {
         let _native = crate::codegen::helpers::NativeRootsPin::native();
-        let module = precise_root_fixture(false);
+        let mut module = precise_root_fixture(false);
 
         let text_ir = module.to_ir();
         assert!(
@@ -902,13 +1196,77 @@ mod tests {
 
         let text = crate::linker::compile_ll_to_object(&text_ir, None)
             .expect("trusted text arm emits an object");
-        let native = compile_module_native(&module, None, "native_root_diff_fixture")
+        let native = compile_module_native(&mut module, None, "native_root_diff_fixture")
             .expect("direct native arm emits an object");
         assert_eq!(
             native, text,
             "a mapped function must be byte-identical after both arms run RS4GC; \
              a behavior-only check is vacuous until a collection"
         );
+    }
+
+    /// #8679: a real backend budget miss must come back through the native
+    /// constructor, mutate the lowering-owned function, rebuild the module,
+    /// and finish emission. The one-instruction cap guarantees that the first
+    /// RS4GC arm trips without constructing a million-instruction fixture;
+    /// the successful result and retained shadow IR prove this is a retry,
+    /// not the former hard refusal or a disabled budget.
+    #[test]
+    fn post_rs4gc_budget_retries_with_a_shadow_frame() {
+        let _native = crate::codegen::helpers::NativeRootsPin::native();
+        let mut module = precise_root_fixture(false);
+        let before = module
+            .deduped_function_refs()
+            .into_iter()
+            .find(|function| function.name == "native_root_diff_fixture")
+            .expect("fixture function exists before the retry")
+            .to_ir();
+        assert!(before.contains("gc \"statepoint-example\""), "{before}");
+        assert!(!before.contains("@js_shadow_frame_enter"), "{before}");
+
+        let object = crate::inprocess::with_test_rs4gc_budget(1, || {
+            compile_module_native(&mut module, None, "rs4gc_budget_retry_fixture")
+        })
+        .expect("a post-RS4GC budget miss must spill and retry successfully");
+        assert!(!object.is_empty());
+
+        let retried = module
+            .deduped_function_refs()
+            .into_iter()
+            .find(|function| function.name == "native_root_diff_fixture")
+            .expect("fixture function survives the retry");
+        assert!(retried.spills_roots_to_shadow_frame());
+        let after = retried.to_ir();
+        assert!(!after.contains("gc \"statepoint-example\""), "{after}");
+        assert!(after.contains("@js_shadow_frame_enter"), "{after}");
+        assert!(after.contains("@js_shadow_slot_bind"), "{after}");
+        assert!(after.contains("@js_shadow_frame_pop"), "{after}");
+    }
+
+    /// The reported Claude bundle takes the split-unit worker path. Its retry
+    /// source must stay on the producer thread (the `LlFunction` graph is not
+    /// `Send`) while LLVM reports the typed violation from a worker. A compact
+    /// map would prove the worker silently missed the test cap and kept the
+    /// statepoint lowering; no map proves the successful object came from the
+    /// resubmitted shadow-frame unit.
+    #[test]
+    fn split_unit_budget_retry_returns_a_shadow_rooted_object() {
+        let _native = crate::codegen::helpers::NativeRootsPin::native();
+        let mut module = precise_root_fixture(true);
+        let before = module.render_codegen_units(2);
+        assert!(
+            before
+                .iter()
+                .any(|unit| unit.contains("gc \"statepoint-example\"")),
+            "fixture must initially send a mapped function through RS4GC"
+        );
+
+        let object = crate::inprocess::with_test_rs4gc_budget(1, || {
+            compile_module_units_native(&mut module, 2, None, "rs4gc_split_budget_retry_fixture")
+        })
+        .expect("a worker budget miss must be re-lowered and resubmitted");
+        assert!(!object.is_empty());
+        assert_no_compact_gc_map(&object, "budget-retried split native");
     }
 
     #[test]
@@ -955,12 +1313,13 @@ mod tests {
     fn native_and_text_arms_agree_on_an_elf_target() {
         const ELF_TRIPLE: &str = "x86_64-unknown-linux-gnu";
         let _native = crate::codegen::helpers::NativeRootsPin::native();
-        let module = precise_root_fixture_for(ELF_TRIPLE, false);
+        let mut module = precise_root_fixture_for(ELF_TRIPLE, false);
 
         let text = crate::linker::compile_ll_to_object(&module.to_ir(), Some(ELF_TRIPLE))
             .expect("trusted text arm emits an ELF object");
-        let native = compile_module_native(&module, Some(ELF_TRIPLE), "native_root_elf_fixture")
-            .expect("direct native arm emits an ELF object");
+        let native =
+            compile_module_native(&mut module, Some(ELF_TRIPLE), "native_root_elf_fixture")
+                .expect("direct native arm emits an ELF object");
 
         assert_eq!(
             &text[..4],
@@ -1049,6 +1408,24 @@ mod tests {
 /// Returns the text arm's object (the trusted reference) so a diff run is
 /// safe for real builds while surfacing every divergence.
 pub fn compile_module_diff(
+    llmod: &mut LlModule,
+    target: Option<&str>,
+    module_prefix: &str,
+) -> Result<Vec<u8>> {
+    loop {
+        match compile_module_diff_once(llmod, target, module_prefix) {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) => {
+                let Some(violations) = crate::inprocess::rs4gc_budget_retry(&error) else {
+                    return Err(error);
+                };
+                apply_budget_spill_retry(llmod.functions_mut(), &violations)?;
+            }
+        }
+    }
+}
+
+fn compile_module_diff_once(
     llmod: &LlModule,
     target: Option<&str>,
     module_prefix: &str,

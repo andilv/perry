@@ -510,6 +510,16 @@ pub struct ImportedClass {
     pub has_instance_fields: bool,
     /// Method names defined on this class.
     pub method_names: Vec<String>,
+    /// Own methods for which the defining module emitted an externally
+    /// callable, guarded proven-`this` clone. Consumers may reference only
+    /// names in this producer-authored capability set; absence is fail-closed
+    /// and keeps the public method body on the direct arm.
+    pub proven_this_method_names: Vec<String>,
+    /// Subset of `proven_this_method_names` for which the producer also proved
+    /// that the extra exact-keys check paid by a class-id dispatch-tower arm is
+    /// profitable. This keeps adapter-field calls fail-closed without asking
+    /// an importer that cannot see the method body to repeat the decision.
+    pub proven_this_tower_method_names: Vec<String>,
     /// Declared return types parallel to `method_names`. Imported class stubs
     /// retain these so a call such as `factory.make().run()` can recover the
     /// returned receiver class without value-importing that class directly.
@@ -910,13 +920,17 @@ pub(crate) struct CrossModuleCtx {
     /// manufacturing calls to clone symbols their defining module never
     /// exported.
     pub nonnegative_index_methods: std::collections::HashMap<(String, String), Vec<u32>>,
+    /// Instance methods with one emitted exact-`undefined` parameter clone,
+    /// mapped to the guarded formal index. The public symbol keeps the stable
+    /// JSValue ABI and performs the bit-exact guard before entering the clone;
+    /// every other runtime value falls through to the ordinary body.
+    pub guarded_undefined_method_params: std::collections::HashMap<(String, String), usize>,
     /// Representation-selection Phase 5a: `(class, method)` pairs that have a
-    /// generated `internal` proven-`this` clone
-    /// (`collectors/proven_this.rs`). Keys are OWN declarations of
-    /// module-local classes only, which is precisely the condition the two
-    /// routing sites rely on: a hit means the receiver's proven exact class is
-    /// the class the clone was compiled for, so `this` cannot be a subclass
-    /// instance with a different chain.
+    /// generated proven-`this` clone (`collectors/proven_this.rs`). Local keys
+    /// come from body analysis; imported keys come from an explicit capability
+    /// published by the defining module. Both represent OWN declarations, so a
+    /// hit means the receiver's proven exact class is the class the clone was
+    /// compiled for and `this` cannot have a different subclass chain.
     pub pshape_methods:
         std::collections::HashMap<(String, String), crate::collectors::PtrShapeLocal>,
     /// #7142: the subset of [`Self::pshape_methods`] whose clone the class-id

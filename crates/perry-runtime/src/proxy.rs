@@ -521,6 +521,34 @@ pub extern "C" fn js_proxy_is_proxy(value: f64) -> i32 {
     }
 }
 
+/// Resolve the backing object used by Perry's private-element storage without
+/// invoking any Proxy trap.  Private names use the object's internal
+/// [[PrivateElements]] list in ECMAScript; they are deliberately not ordinary
+/// `[[Get]]`/`[[Set]]` operations.  Perry's Proxy is a stable registry handle,
+/// so its private storage lives on the backing target and all private-element
+/// entry points consistently resolve through this helper.
+pub(crate) fn private_element_receiver(mut value: f64) -> f64 {
+    for _ in 0..32 {
+        let Some(id) = lookup(value) else {
+            return value;
+        };
+        let (target, revoked) = PROXIES.with(|p| {
+            p.borrow()
+                .get(id as usize)
+                .and_then(|entry| entry.as_ref())
+                .map(|entry| (entry.target, entry.revoked))
+                .unwrap_or((f64::from_bits(TAG_UNDEFINED), false))
+        });
+        if revoked {
+            revoked_return_with_message(
+                "Cannot access a private element on a proxy that has been revoked",
+            );
+        }
+        value = target;
+    }
+    value
+}
+
 /// `IsArray`'s Proxy branch (ECMA-262 §7.2.2). If `value` is a live Proxy,
 /// returns `Some(target)` so the caller can recurse on the target; if the Proxy
 /// has been revoked, throws a `TypeError` (does not return). Returns `None` for
@@ -728,6 +756,20 @@ fn reflect_value_is_object(value: f64) -> bool {
         return true;
     }
     let bits = value.to_bits();
+    // BufferHeader-backed values are objects even when they are not GC heap
+    // allocations. In particular, SharedArrayBuffer uses a process-global,
+    // never-moved backing from `alloc_zeroed`; depending on the surrounding
+    // allocation history its address can fail the generic heap-address test
+    // below. Consult the authoritative registries before that heuristic so
+    // receiver-aware Set reaches CreateDataProperty and records named
+    // expandos such as an own `constructor`.
+    let raw = extract_pointer(bits) as usize;
+    if raw != 0
+        && (crate::buffer::is_registered_buffer(raw)
+            || crate::typedarray::lookup_typed_array_kind(raw).is_some())
+    {
+        return true;
+    }
     let top16 = bits >> 48;
     if top16 == (POINTER_TAG >> 48) {
         let lower48 = bits & POINTER_MASK;
@@ -968,6 +1010,36 @@ pub extern "C" fn js_proxy_get(proxy_boxed: f64, key: f64) -> f64 {
     target_get(target, key)
 }
 
+/// Resolve the ultimate target when a Proxy wraps a class constructor. Used
+/// by method-call dispatch to bind a static method's visible `this` to the
+/// Proxy receiver while retaining the target class as its lexical owner.
+pub(crate) fn proxy_target_class_id(mut value: f64) -> Option<u32> {
+    let mut depth = 0usize;
+    while let Some(id) = lookup(value) {
+        value = PROXIES.with(|proxies| {
+            proxies
+                .borrow()
+                .get(id as usize)
+                .and_then(|entry| entry.as_ref())
+                .map(|entry| entry.target)
+                .unwrap_or(f64::from_bits(TAG_UNDEFINED))
+        });
+        depth += 1;
+        if depth >= 32 {
+            return None;
+        }
+    }
+    if let Some(class_id) = crate::object::class_ref_id(value) {
+        return Some(class_id);
+    }
+    if crate::object::is_class_object_value(value) {
+        let raw = extract_pointer(value.to_bits()) as *const crate::ObjectHeader;
+        let class_id = crate::object::js_object_get_class_id(raw);
+        return (class_id != 0).then_some(class_id);
+    }
+    None
+}
+
 /// Extract a raw heap pointer (48-bit) from either a NaN-boxed value
 /// (POINTER_TAG / STRING_TAG) or a raw i64/f64-reinterpreted pointer
 /// (module-level globals store Arrays/Objects as raw I64s, not NaN-boxed).
@@ -1024,10 +1096,23 @@ fn target_get_property_key(target: f64, property_key: f64) -> f64 {
     if unsafe { crate::symbol::js_is_symbol(property_key) } != 0 {
         return unsafe { crate::symbol::js_object_get_symbol_property(target, property_key) };
     }
-    let obj_ptr = extract_pointer(target.to_bits()) as *const crate::ObjectHeader;
     let key_ptr =
         crate::value::js_get_string_pointer_unified(property_key) as *const crate::StringHeader;
-    if obj_ptr.is_null() || key_ptr.is_null() {
+    if key_ptr.is_null() {
+        return f64::from_bits(TAG_UNDEFINED);
+    }
+    // Class constructors use Perry's INT32-tagged ClassRef representation,
+    // not a heap pointer. Preserve those bits exactly as the ordinary dynamic
+    // class-property path does; pointer extraction would turn the target into
+    // null and make `new Proxy(C, {}).staticMethod` read as `undefined`.
+    if crate::object::class_ref_id(target).is_some() {
+        return crate::object::js_object_get_field_by_name_f64(
+            target.to_bits() as *const crate::ObjectHeader,
+            key_ptr,
+        );
+    }
+    let obj_ptr = extract_pointer(target.to_bits()) as *const crate::ObjectHeader;
+    if obj_ptr.is_null() {
         return f64::from_bits(TAG_UNDEFINED);
     }
     crate::object::js_object_get_field_by_name_f64(obj_ptr, key_ptr)
@@ -1088,6 +1173,19 @@ fn target_set(target: f64, key: f64, value: f64) {
     // already-heap `STRING_TAG` value, which `js_string_coerce` hands straight
     // back without touching the allocator.
     let key_ptr = crate::builtins::js_string_coerce(property_key) as *const crate::StringHeader;
+    let target_addr = extract_pointer(target.to_bits()) as usize;
+    if let Some(class_id) = crate::object::class_id_for_decl_prototype_object(target_addr) {
+        // Imported `C.prototype.m = value` materializes the declaration's
+        // prototype object before PutValue reaches this shared write tail.
+        // Keep the runtime method registry authoritative so instance dispatch
+        // observes the replacement and direct guards retire.
+        if let Some(name) = key_to_rust_string(property_key) {
+            crate::object::class_prototype_method_set_enumerable(class_id, &name, true);
+            crate::object::class_prototype_method_root_store(class_id, name, value.to_bits());
+            crate::typed_feedback::invalidate_method_change(class_id);
+        }
+        return;
+    }
     if crate::object::class_ref_id(target).is_some() {
         // Preserve the INT32-tagged class-ref bits so class dynamic props
         // land in CLASS_DYNAMIC_PROPS instead of being pointer-extracted to 0.
@@ -1100,7 +1198,7 @@ fn target_set(target: f64, key: f64, value: f64) {
         }
         return;
     }
-    let obj_addr = extract_pointer(target.to_bits()) as usize;
+    let obj_addr = target_addr;
     if crate::closure::is_closure_ptr(obj_addr) {
         if let Some(name) = key_to_rust_string(property_key) {
             crate::closure::closure_set_dynamic_prop(obj_addr, &name, value);
@@ -1483,6 +1581,63 @@ fn call_setter_with_receiver(setter_bits: u64, receiver: f64, value: f64) -> boo
     true
 }
 
+/// Ordinary named-property Set for the BufferHeader-backed objects that are
+/// not integer-indexed exotics (ArrayBuffer, SharedArrayBuffer, DataView).
+///
+/// These values have no ObjectHeader/GcHeader. The generic Set tail eventually
+/// asks whether the receiver is a GC heap object before CreateDataProperty;
+/// a process-global SharedArrayBuffer can therefore be rejected even though
+/// the buffer registries authoritatively classify it as an Object. Walk the
+/// descriptors normally, but materialize the final own data property in the
+/// buffer expando table instead of the ObjectHeader store.
+fn set_nonindexed_buffer_named_self(target: f64, key: f64, value: f64) -> Option<bool> {
+    if unsafe { crate::symbol::js_is_symbol(key) } != 0 {
+        return None;
+    }
+    let raw = raw_ptr_from_value(target)?;
+    if !crate::buffer::is_non_indexed_buffer_view(raw) {
+        return None;
+    }
+    let name = key_to_rust_string(key)?;
+
+    // Existing own accessor/data descriptors take the same precedence as in
+    // OrdinarySetWithOwnDescriptor. Buffer expandos live in side tables, so
+    // inspect those tables without treating the BufferHeader as ObjectHeader.
+    if let Some(accessor) = crate::object::get_accessor_descriptor(raw, &name) {
+        return Some(call_setter_with_receiver(accessor.set, target, value));
+    }
+    if crate::buffer::buffer_has_own_prop(raw, &name) {
+        if crate::object::get_property_attrs(raw, &name).is_some_and(|attrs| !attrs.writable()) {
+            return Some(false);
+        }
+        crate::buffer::buffer_set_own_prop(raw, &name, value);
+        return Some(true);
+    }
+
+    // A descriptor on the prototype can reject the write or invoke a setter.
+    // A writable inherited data descriptor (including the standard
+    // `.constructor`) creates an own property on the original receiver.
+    let mut current = prototype_of_for_set(target);
+    for _ in 0..64 {
+        let Some(proto) = current else {
+            break;
+        };
+        if let Some(desc) = own_set_descriptor(proto, key) {
+            match desc {
+                OwnSetDescriptor::Data { writable: false } => return Some(false),
+                OwnSetDescriptor::Data { writable: true } => break,
+                OwnSetDescriptor::Accessor { setter_bits } => {
+                    return Some(call_setter_with_receiver(setter_bits, target, value));
+                }
+            }
+        }
+        current = prototype_of_for_set(proto);
+    }
+
+    crate::buffer::buffer_set_own_prop(raw, &name, value);
+    Some(true)
+}
+
 /// #5129: build a fresh data property descriptor
 /// `{ value, writable: true, enumerable: true, configurable: true }`
 /// (the CreateDataProperty shape) for defining a property on a Proxy receiver
@@ -1509,6 +1664,24 @@ unsafe fn build_create_data_descriptor(value: f64) -> f64 {
         POINTER_TAG
             | ((desc_handle.get_raw_mut_ptr::<crate::ObjectHeader>() as u64) & POINTER_MASK),
     )
+}
+
+/// Define a writable, enumerable, configurable own data property using the
+/// receiver's `[[DefineOwnProperty]]`. This is the operation used by public
+/// class fields: it bypasses inherited setters on ordinary objects and still
+/// drives a Proxy's `defineProperty` trap.
+pub(crate) fn create_data_property(receiver: f64, key: f64, value: f64) -> bool {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let receiver = scope.root_nanbox_f64(receiver);
+    let key = scope.root_nanbox_f64(key);
+    let value = scope.root_nanbox_f64(value);
+    let descriptor = unsafe { build_create_data_descriptor(value.get_nanbox_f64()) };
+    let descriptor = scope.root_nanbox_f64(descriptor);
+    crate::value::js_is_truthy(js_reflect_define_property(
+        receiver.get_nanbox_f64(),
+        key.get_nanbox_f64(),
+        descriptor.get_nanbox_f64(),
+    )) != 0
 }
 
 /// #5129: build a `{ value }`-only property descriptor — the `valueDesc` of
@@ -2088,6 +2261,40 @@ pub extern "C" fn js_super_put_value_set(
     strict: i32,
 ) -> f64 {
     let receiver = normalize_accessor_receiver(receiver);
+    // Static-context super uses the parent CONSTRUCTOR as the lookup target,
+    // while retaining the child constructor as Receiver. A statically-known
+    // class parent is represented by a ClassRef; a function-valued parent is
+    // the value captured at class-definition time. The previous instance-only
+    // path looked at `Parent.prototype` and made valid static writes fail.
+    if let Some(child_id) = crate::object::class_ref_id(receiver) {
+        let target = if parent_class_id != 0 {
+            f64::from_bits(crate::value::INT32_TAG | parent_class_id as u64)
+        } else {
+            crate::object::js_get_dynamic_parent_value(child_id)
+        };
+        let tv = crate::value::JSValue::from_bits(target.to_bits());
+        if !tv.is_undefined() && !tv.is_null() {
+            return js_put_value_set(target, key, value, receiver, strict);
+        }
+        // A base class's constructor inherits from Function.prototype. Perry
+        // does not materialize that object for this path; when lookup misses,
+        // OrdinarySet creates the own property on Receiver.
+        return js_put_value_set(receiver, key, value, receiver, strict);
+    }
+    if parent_class_id == 0 && crate::object::is_class_object_value(receiver) {
+        let obj = crate::value::JSValue::from_bits(receiver.to_bits())
+            .as_pointer::<crate::ObjectHeader>();
+        let child_id = if obj.is_null() {
+            0
+        } else {
+            crate::object::js_object_get_class_id(obj)
+        };
+        let dynamic_parent = crate::object::js_get_dynamic_parent_value(child_id);
+        if crate::value::JSValue::from_bits(dynamic_parent.to_bits()).is_undefined() {
+            return js_put_value_set(receiver, key, value, receiver, strict);
+        }
+        return js_put_value_set(dynamic_parent, key, value, receiver, strict);
+    }
     let receiver_parent_class_id = receiver_super_parent_class_id(receiver);
     if let Some(ok) =
         class_super_accessor_set(parent_class_id, key, value, receiver).or_else(|| {
@@ -2883,9 +3090,10 @@ mod tests {
             "perry-codegen emits 0x200 for this bit"
         );
         // It ADMITS a receiver, so it must not appear in the mask that REJECTS
-        // one (`WRITE_PIC_BLOCKING_FLAGS = 0x1907`) — a collision would make
+        // one (`WRITE_PIC_BLOCKING_FLAGS = 0x1987`) — a collision would make
         // every marked object permanently ineligible.
-        assert_eq!(crate::gc::OBJ_FLAG_PLAIN_ORDINARY & 0x1907, 0);
+        assert_eq!(crate::gc::OBJ_FLAG_PLAIN_ORDINARY & 0x1987, 0);
+        assert_ne!(crate::gc::OBJ_FLAG_PACKED_NUMERIC_PROOF & 0x1987, 0);
         // Bit 9 is shared with the array-only arguments-object flag, disjoint
         // by `obj_type`; and it must not collide with any object-meaningful
         // flag or with the survival-age / layout-state fields the GC owns.

@@ -5,7 +5,60 @@
 
 use super::*;
 
+/// Remember an immutable `const n = receiver.length` association for guarded
+/// counted-loop admission. The property read itself keeps ordinary semantics;
+/// only a later runtime proof is allowed to consume this association.
+pub(super) fn record_array_length_snapshot(ctx: &mut FnCtx<'_>, id: u32, init: &perry_hir::Expr) {
+    if ctx.reassigned_locals.contains(&id) {
+        return;
+    }
+    if let perry_hir::Expr::PropertyGet {
+        object, property, ..
+    } = init
+    {
+        if property == "length" {
+            if let perry_hir::Expr::LocalGet(array_id) = object.as_ref() {
+                ctx.array_length_snapshots.insert(id, *array_id);
+            }
+        }
+    }
+}
+
 use crate::native_value::BufferAccessMode;
+
+/// #8691: the aggregate scalar-replacement transform erases the carrier array
+/// and object literals before codegen, leaving one synthetic local per field.
+/// Preserve lowering evidence for those eliminated allocations so the result
+/// remains visible to `--explain-lowering`.
+pub(super) fn record_scalar_aggregate_field(ctx: &mut FnCtx<'_>, id: u32, name: &str, value: &str) {
+    if !name.starts_with("__perry_scalar_aggregate_") {
+        return;
+    }
+    let lowered = crate::native_value::LoweredValue {
+        semantic: crate::native_value::SemanticKind::JsValue,
+        rep: crate::native_value::NativeRep::JsValue,
+        llvm_ty: DOUBLE,
+        value: value.to_string(),
+    };
+    ctx.record_lowered_value_with_access_mode(
+        "ScalarAggregateFieldInit",
+        Some(id),
+        "scalar_object_field_store",
+        &lowered,
+        None,
+        None,
+        None,
+        None,
+        false,
+        false,
+        vec![
+            format!("local={name}"),
+            "carrier_array=elided".to_string(),
+            "carrier_object=elided".to_string(),
+            "write_barrier=0".to_string(),
+        ],
+    );
+}
 
 pub(super) fn pod_view_count_source(ctx: &FnCtx<'_>, expr: &perry_hir::Expr) -> String {
     match expr {

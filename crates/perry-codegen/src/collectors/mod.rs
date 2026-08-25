@@ -59,7 +59,7 @@ pub use clamp_detect::{detect_clamp3, detect_clamp_u8, returns_i32_identity_arg,
 // transitively expose through `pub(crate) use crate::collectors::*`.
 pub(crate) use byte_read_key::{collect_numeric_typed_locals, uint8array_get_reads_a_byte};
 pub(crate) use class_accessors::{is_class_getter, is_class_setter};
-pub(crate) use closures::collect_closures_in_stmts;
+pub(crate) use closures::{collect_closures_in_expr, collect_closures_in_stmts};
 pub(crate) use escape_arrays::{const_index, MAX_SCALAR_OBJECT_FIELDS};
 pub(crate) use escape_check::{check_escapes_in_stmts, find_new_candidates};
 pub(crate) use escape_news::MAX_SCALAR_ARRAY_LEN;
@@ -82,11 +82,12 @@ pub(crate) use integer_locals::{
     collect_flat_row_aliases, is_int32_producing_expr, static_index_window,
 };
 pub(crate) use local_refs::{expr_contains_local_get, mark_all_candidate_refs_in_expr};
-pub(crate) use mutation::{body_contains_call, has_any_mutation};
+pub(crate) use mutation::{body_contains_call, body_contains_closure, has_any_mutation};
 pub(crate) use number_by_construction::collect_number_by_construction_locals;
 pub(crate) use param_ranges::{collect_param_int_ranges, ParamIntRanges};
 pub(crate) use pointer_locals::collect_pointer_typed_locals;
 pub(crate) use proven_this::{
+    exportable_method_capabilities as exportable_proven_this_method_capabilities,
     method_proven_this, prune_unregistered_clones, pshape_method_name, ptr_array_cache_fields,
     ptr_array_cache_method_name, ptr_array_cached_method,
     tower_route_profitable as pshape_tower_route_profitable,

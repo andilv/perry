@@ -36,6 +36,9 @@ use super::global_eval_hoist::{
 use super::lower_expr::lower_expr;
 use super::LoweringContext;
 
+mod param_early_error;
+use param_early_error::fn_ctor_kind_param_early_error;
+
 /// Lower an expression that throws a `SyntaxError` when the enclosing call
 /// site is evaluated — a throwing IIFE in value position. Used when a folded
 /// `new Function(...)` / `Function(...)` body is not syntactically valid JS,
@@ -311,37 +314,6 @@ pub(crate) fn try_const_fold_function_construct_kind(
         None => (String::new(), String::new()),
     };
 
-    // CSP capability-probe handling (`PERRY_EVAL_CSP`). A trivial no-op
-    // `new Function("")` / `Function("")` is the canonical runtime-codegen
-    // feature-test (`try { new Function(""), true } catch { false }`). perry is
-    // ahead-of-time compiled and cannot generate code from a runtime string, so
-    // under CSP mode this probe must report "unavailable" — throw at
-    // *construction* (not when called), exactly as a CSP `unsafe-eval`-blocked
-    // environment does — so probing callers (e.g. zod 4's validator JIT) take
-    // their non-codegen interpreter fallback. Only the trivial empty-body no-op
-    // is refused; real literal bodies (`return 42`, the `return this` globalThis
-    // polyfill) still fold, preserving spec behavior by default.
-    //
-    // The probe passes AT LEAST ONE string argument (`new Function("")`). A
-    // ZERO-argument `new Function()` is not a codegen request at all — it
-    // constructs the empty function `anonymous() {}` — so it must NEVER throw,
-    // even under the default CSP mode (#5835 Intl-ctor test regressed here:
-    // `new Function()` used purely as a constructable-with-settable-prototype
-    // scaffold for `Reflect.construct` began throwing). Gate the refusal on
-    // there actually being an argument.
-    if !consts.is_empty()
-        && body_src.trim().is_empty()
-        && crate::eval_classifier::eval_csp_probe_unavailable()
-    {
-        return synth_throwing_iife(
-            ctx,
-            "throw new TypeError(\"Function: runtime dynamic code generation is \
-             unavailable in this ahead-of-time compiled binary\");",
-            span,
-        )
-        .map(Some);
-    }
-
     // Assemble the exact source text the spec's CreateDynamicFunction
     // prescribes: newlines around the body and *before the closing paren*
     // so a `//` comment in the params or body can't swallow a delimiter.
@@ -374,8 +346,47 @@ pub(crate) fn try_const_fold_function_construct_kind(
     // prologue makes duplicate or `eval`/`arguments` parameter names a
     // SyntaxError, and a private name (`o.#f`) outside any class body is a
     // SyntaxError regardless of mode (AllPrivateIdentifiersValid).
-    if fn_ctor_strict_param_early_error(fn_expr) || fn_body_has_stray_private_name(fn_expr) {
+    if fn_ctor_kind_param_early_error(fn_expr, kind)
+        || fn_ctor_strict_param_early_error(fn_expr)
+        || fn_body_has_stray_private_name(fn_expr)
+    {
         return synth_function_syntax_error(ctx, surface, span).map(Some);
+    }
+
+    // CSP capability-probe handling (`PERRY_EVAL_CSP`). A trivial no-op
+    // `new Function("")` / `Function("")` is the canonical runtime-codegen
+    // feature-test (`try { new Function(""), true } catch { false }`). perry is
+    // ahead-of-time compiled and cannot generate code from a runtime string, so
+    // under CSP mode this probe must report "unavailable" — throw at
+    // *construction* (not when called), exactly as a CSP `unsafe-eval`-blocked
+    // environment does — so probing callers (e.g. zod 4's validator JIT) take
+    // their non-codegen interpreter fallback. Only the trivial empty-body no-op
+    // is refused; real literal bodies (`return 42`, the `return this` globalThis
+    // polyfill) still fold, preserving spec behavior by default.
+    //
+    // Parameter/body syntax and CreateDynamicFunction early errors take
+    // precedence over this Perry-specific capability signal. In particular,
+    // `GeneratorFunction("x = yield", "")` must throw SyntaxError rather than
+    // being mistaken for a valid empty-body capability probe.
+    //
+    // The probe passes AT LEAST ONE string argument (`new Function("")`). A
+    // ZERO-argument `new Function()` is not a codegen request at all — it
+    // constructs the empty function `anonymous() {}` — so it must NEVER throw,
+    // even under the default CSP mode (#5835 Intl-ctor test regressed here:
+    // `new Function()` used purely as a constructable-with-settable-prototype
+    // scaffold for `Reflect.construct` began throwing). Gate the refusal on
+    // there actually being an argument.
+    if !consts.is_empty()
+        && body_src.trim().is_empty()
+        && crate::eval_classifier::eval_csp_probe_unavailable()
+    {
+        return synth_throwing_iife(
+            ctx,
+            "throw new TypeError(\"Function: runtime dynamic code generation is \
+             unavailable in this ahead-of-time compiled binary\");",
+            span,
+        )
+        .map(Some);
     }
 
     let outer_strict = ctx.current_strict;
@@ -600,7 +611,9 @@ fn resolve_fn_ctor_arg(
                 FnCtorShape::ObjToString(body) => eval_tostring(&mut ctx.fn_ctor_env, &body),
                 // A dynamic-function ctor VALUE used as a ToString-able arg
                 // isn't a constant string.
-                FnCtorShape::DynCtor(_) | FnCtorShape::FnLiteral(_) => None,
+                FnCtorShape::DynCtor(_)
+                | FnCtorShape::FnLiteral(_)
+                | FnCtorShape::IndirectEvalFactory { .. } => None,
             };
         }
         // A constant EXPRESSION over env entries — `Function(p + "," + p,
@@ -1301,6 +1314,9 @@ pub(crate) fn try_eval_function_call_fold(
     ctx: &mut LoweringContext,
     call: &ast::CallExpr,
 ) -> Result<Option<Expr>> {
+    if let Some(expr) = try_indirect_eval_factory_call(ctx, call)? {
+        return Ok(Some(expr));
+    }
     if let Some(expr) = try_indirect_eval_globalthis(ctx, call) {
         return Ok(Some(expr));
     }
@@ -1347,7 +1363,7 @@ pub(crate) fn try_eval_function_call_fold(
     }
     // `var AsyncFunction = (async function(){}).constructor; AsyncFunction(...)`
     // — a single-assignment module var recorded as a dynamic-function ctor.
-    if ctx.scope_depth == 0 {
+    if ctx.local_decl_scope_depth(id.sym.as_str()) == Some(0) {
         if let Some(super::fn_ctor_env::FnCtorShape::DynCtor(kind)) =
             ctx.fn_ctor_env.entries.get(id.sym.as_str()).cloned()
         {
@@ -1361,6 +1377,68 @@ pub(crate) fn try_eval_function_call_fold(
         }
     }
     Ok(None)
+}
+
+fn try_indirect_eval_factory_call(
+    ctx: &mut LoweringContext,
+    call: &ast::CallExpr,
+) -> Result<Option<Expr>> {
+    if call.args.len() != 1 || call.args[0].spread.is_some() {
+        return Ok(None);
+    }
+    let ast::Callee::Expr(callee) = &call.callee else {
+        return Ok(None);
+    };
+    let ast::Expr::Ident(factory) = callee.as_ref() else {
+        return Ok(None);
+    };
+    let ast::Expr::Ident(eval_arg) = call.args[0].expr.as_ref() else {
+        return Ok(None);
+    };
+    if eval_arg.sym.as_ref() != "eval"
+        || ctx.lookup_local("eval").is_some()
+        || ctx.lookup_func("eval").is_some()
+        || ctx.lookup_imported_func("eval").is_some()
+    {
+        return Ok(None);
+    }
+    let Some(super::fn_ctor_env::FnCtorShape::IndirectEvalFactory {
+        source_name,
+        construct,
+    }) = ctx.fn_ctor_env.entries.get(factory.sym.as_str()).cloned()
+    else {
+        return Ok(None);
+    };
+    let Some(super::fn_ctor_env::FnCtorShape::Str(source)) =
+        ctx.fn_ctor_env.entries.get(&source_name).cloned()
+    else {
+        return Ok(None);
+    };
+    let module = match perry_parser::parse_typescript(&source, "<indirect eval body>.cjs") {
+        Ok(module) => module,
+        Err(_) => return Ok(None),
+    };
+    let [ast::ModuleItem::Stmt(ast::Stmt::Expr(statement))] = module.body.as_slice() else {
+        return Ok(None);
+    };
+
+    // The evaluated class lives in eval's own execution context, not at the
+    // surrounding module top.  Raising the synthetic scope depth selects the
+    // ClassExprFresh lowering used for function/factory evaluations, so a
+    // repeated call site creates a distinct private brand each time.
+    ctx.scope_depth += 1;
+    let lowered = super::lower_expr(ctx, &statement.expr);
+    ctx.scope_depth -= 1;
+    let lowered = lowered?;
+    if construct {
+        Ok(Some(Expr::NewDynamic {
+            callee: Box::new(lowered),
+            args: Vec::new(),
+            byte_offset: 0,
+        }))
+    } else {
+        Ok(Some(lowered))
+    }
 }
 
 /// Fold `Function.call(thisArg, ...ctorArgs)` / `Function.apply(thisArg,
@@ -1652,6 +1730,16 @@ fn try_const_fold_eval(
     // plain assignment. (test262 language/eval-code/direct/strictness-override)
     let eval_strict = ctx.current_strict || crate::lower_decl::body_has_use_strict(&body_stmts);
 
+    // SWC initially lexes the standalone eval body as a sloppy Script. That is
+    // necessary for legal sloppy-only syntax, but it means the lexer defers the
+    // strict-mode errors for legacy numeric literals (`01`, `08`, ...). Re-lex
+    // strict eval source with an explicit directive and surface those deferred
+    // diagnostics at the eval call. Modern `0o` literals remain valid, and the
+    // parser keeps comment/string contents out of the diagnostic stream.
+    if eval_strict && strict_eval_has_legacy_numeric_literal(&body_src) {
+        return synth_function_syntax_error(ctx, EvalSurface::Eval, span).map(Some);
+    }
+
     // Annex B.3.3.3: a *sloppy global* direct eval routes the `var`/`function`
     // declarations of its body into the global variable environment, so they
     // survive after the eval returns. Rewrite them to global assignments before
@@ -1687,6 +1775,32 @@ fn try_const_fold_eval(
     }
 
     build_eval_completion_iife(ctx, body_stmts, eval_strict, span)
+}
+
+fn strict_eval_has_legacy_numeric_literal(source: &str) -> bool {
+    const LEGACY_NUMERIC_DIAGNOSTICS: [&str; 2] = [
+        "Legacy decimal escape is not permitted in strict mode",
+        "Legacy octal escape is not permitted in strict mode",
+    ];
+
+    let strict_source = format!("\"use strict\";\n{source}");
+    let mut cache = perry_diagnostics::SourceCache::new();
+    match perry_parser::parse_typescript_with_cache(
+        &strict_source,
+        "<strict eval numeric probe>.cjs",
+        &mut cache,
+    ) {
+        Ok(parsed) => parsed
+            .diagnostics
+            .iter()
+            .any(|diagnostic| LEGACY_NUMERIC_DIAGNOSTICS.contains(&diagnostic.message.as_str())),
+        Err(error) => {
+            let message = format!("{error:#}");
+            LEGACY_NUMERIC_DIAGNOSTICS
+                .iter()
+                .any(|diagnostic| message.contains(diagnostic))
+        }
+    }
 }
 
 /// Is the current eval call site at module top level in global-script mode,
@@ -1775,7 +1889,7 @@ fn build_eval_completion_iife(
 
 #[cfg(test)]
 mod foldable_tests {
-    use super::eval_body_iife_foldable;
+    use super::{eval_body_iife_foldable, strict_eval_has_legacy_numeric_literal};
     use swc_ecma_ast as ast;
 
     fn parse(src: &str) -> Vec<ast::Stmt> {
@@ -1788,6 +1902,28 @@ mod foldable_tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn strict_eval_rejects_legacy_numeric_literals_only_in_code() {
+        for source in ["value = 01;", "value = 08;", "value = 000;"] {
+            assert!(
+                strict_eval_has_legacy_numeric_literal(source),
+                "expected strict early error for {source:?}"
+            );
+        }
+
+        for source in [
+            "value = 0o1; value = 0x1; value = 1;",
+            "value = '01';",
+            "// 01\nvalue = 1;",
+            "/* 08 */ value = 1;",
+        ] {
+            assert!(
+                !strict_eval_has_legacy_numeric_literal(source),
+                "unexpected strict early error for {source:?}"
+            );
+        }
     }
 
     #[test]

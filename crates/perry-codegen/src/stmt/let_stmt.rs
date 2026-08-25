@@ -1,13 +1,11 @@
-//! `Stmt::Let` lowering — large arm extracted from the dispatcher.
-
-use super::*;
-
 use super::let_buffer_views::{math_min_length_buffer_ids, register_noalias_buffer_view};
 use super::let_stmt_facts::{
     buffer_local_alias_source, collect_scalar_class_data, native_i32_alias_source,
-    note_ptr_shape_scalar_replaced, pod_view_count_source, record_pod_rejection,
+    note_ptr_shape_scalar_replaced, pod_view_count_source, record_array_length_snapshot,
+    record_pod_rejection, record_scalar_aggregate_field,
 };
 use super::unused_expr::lower_unused_expr;
+use super::*;
 use crate::expr::{
     box_i1_for_compat_shadow, emit_root_nanbox_store_on_block,
     expr_produces_non_pointer_bits_by_construction, lower_expr_value,
@@ -19,13 +17,8 @@ use crate::native_value::{
 use crate::type_analysis::is_string_expr;
 use crate::types::{DOUBLE, I1, I32, I64, I8, PTR};
 
-/// #5271: does `init` provably evaluate to a plain object literal? Two
-/// shapes reach codegen: a data-only literal stays `Expr::Object`, while a
-/// literal carrying methods/getters lowers to an immediately-invoked
-/// object-building closure whose sole param is named `__perry_obj_iife`
-/// and whose single argument is the seed `Object(..)`. Recognizing both
-/// lets `o.trim()` / `internals.trim(v, s)` resolve to the receiver's own
-/// member rather than `String.prototype.trim`.
+/// #5271: recognize both data-only object literals and method/getter IIFEs so
+/// own members win over built-in prototype methods during lowering.
 fn is_object_literal_init(init: &perry_hir::Expr) -> bool {
     use perry_hir::Expr;
     match init {
@@ -128,6 +121,7 @@ pub(crate) fn lower_let(
     }
     if let Some(init_expr) = init {
         crate::expr::record_local_value_alias_for_write(ctx, id, init_expr);
+        record_array_length_snapshot(ctx, id, init_expr);
         ctx.guarded_discriminant_aliases.remove(&id);
         if !mutable && !ctx.reassigned_locals.contains(&id) {
             if let perry_hir::Expr::PropertyGet {
@@ -148,6 +142,7 @@ pub(crate) fn lower_let(
         }
     } else {
         ctx.local_value_aliases.remove(&id);
+        ctx.array_length_snapshots.remove(&id);
         ctx.guarded_discriminant_aliases.remove(&id);
     }
     crate::expr::record_int_facts_for_let(ctx, id, init, mutable);
@@ -442,6 +437,25 @@ pub(crate) fn lower_let(
     }
 
     if let Some(init_expr) = init {
+        let copied = match init_expr {
+            perry_hir::Expr::LocalGet(source_id) if !ctx.boxed_vars.contains(&id) => {
+                crate::expr::copy_pod_local(ctx, id, *source_id, &refined_ty)?
+            }
+            _ => None,
+        };
+        if let Some(copied) = copied {
+            ctx.local_types.insert(id, refined_ty.clone());
+            ctx.locals.insert(id, copied.materialized_slot.clone());
+            ctx.pod_records.insert(id, copied);
+            if ctx.module_globals.contains_key(&id) {
+                let _ = crate::expr::materialize_pod_local(
+                    ctx,
+                    id,
+                    MaterializationReason::PodMaterialization,
+                )?;
+            }
+            return Ok(());
+        }
         match crate::native_value::layout_decision_for_type(ctx, &refined_ty) {
             PodLayoutDecision::Layout(_)
                 if ctx.boxed_vars.contains(&id) && !ctx.module_globals.contains_key(&id) =>
@@ -453,12 +467,11 @@ pub(crate) fn lower_let(
                 );
             }
             PodLayoutDecision::Layout(layout) => {
-                match crate::native_value::collect_pod_init_fields(ctx, init_expr).and_then(
-                    |fields| {
+                match crate::native_value::collect_pod_init_fields(ctx, init_expr, &layout)
+                    .and_then(|fields| {
                         crate::native_value::validate_exact_init(&layout, &fields)?;
                         Ok(fields)
-                    },
-                ) {
+                    }) {
                     Ok(init_fields) => {
                         let data_slot = ctx
                             .func
@@ -534,9 +547,8 @@ pub(crate) fn lower_let(
         }
     }
 
-    // Keep a non-escaping uppercase result virtual when every consumer is a
-    // fused string operation. Store the original boxed receiver now so later
-    // writes to its source local cannot change the captured value.
+    // Keep non-escaping uppercase results virtual for fused consumers while
+    // snapshotting the receiver against later source-local writes.
     if let Some(perry_hir::Expr::Call { callee, args, .. }) = init {
         if ctx.fusible_uppercase_locals.contains(&id)
             && args.is_empty()
@@ -1901,6 +1913,7 @@ pub(crate) fn lower_let(
                     }
                 }
             }
+            record_scalar_aggregate_field(ctx, id, name, &v);
             v
         } else {
             String::new() // unused below; cleanup blocks check used_i32_init
@@ -1936,10 +1949,10 @@ pub(crate) fn lower_let(
                 // sentinel on x86-64 — so it is NOT portable. `int_valued_ta`
                 // locals (and any other i32-shadow local with a non-known-finite
                 // init) are only ever observed through ToInt32, so seeding with
-                // the exact ToInt32 keeps every arm identical. Known-finite
-                // inits keep the cheaper `fptosi→i64→trunc` (bit-identical for
-                // finite values), so existing i32-shadow locals are unchanged.
-                let v_i32 = if crate::expr::is_known_finite(ctx, init_expr) {
+                // the exact ToInt32 keeps every arm identical. Proven-i32-range
+                // inits keep the cheaper `fptosi→i64→trunc`, so existing
+                // i32-shadow locals are unchanged.
+                let v_i32 = if crate::expr::is_known_i32_range(ctx, init_expr) {
                     let v_i64 = ctx.block().fptosi(DOUBLE, &v, crate::types::I64);
                     ctx.block().trunc(crate::types::I64, &v_i64, I32)
                 } else {

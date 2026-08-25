@@ -40,6 +40,8 @@ mod grammar;
 #[cfg(feature = "regex-engine")]
 mod match_all;
 #[cfg(feature = "regex-engine")]
+mod repeat_matcher;
+#[cfg(feature = "regex-engine")]
 mod replace_expand;
 mod replace_fn;
 #[cfg(feature = "regex-engine")]
@@ -224,6 +226,7 @@ pub(crate) fn test_alloc_nursery_regexp_for_move(source: &str, flags: &str) -> *
         (*ptr).last_index = crate::value::JSValue::number(0.0).bits();
         (*ptr).magic = REGEXP_MAGIC;
         (*ptr).fancy_ptr = std::ptr::null();
+        (*ptr).repeat_matcher_ptr = std::ptr::null();
 
         REGEX_EVER_REGISTERED.arm();
         REGEX_POINTERS.with(|table| {
@@ -277,7 +280,7 @@ pub(crate) fn regex_header_has_magic(re: *const RegExpHeader) -> bool {
 ///   * `flags_ptr`   — the flags `StringHeader`,
 ///   * `last_index`  — a writable JSValue (`re.lastIndex = …`) that may be a
 ///     NaN-boxed heap pointer.
-/// `regex_ptr`/`fancy_ptr` point to OFF-heap leaked Rust allocations and the
+/// The compiled matcher pointers point to OFF-heap leaked Rust allocations and the
 /// bool/`magic` fields are never heap refs, so they must NOT be scanned.
 ///
 /// `pattern_ptr` and `flags_ptr` are consecutive equal-width fields, so under
@@ -301,6 +304,11 @@ crate::perry_thread_local! {
     static REGEX_CACHE: RefCell<HashMap<(String, String), Arc<Regex>>> = RefCell::new(HashMap::new());
     /// Fancy-regex fallback cache for patterns with lookbehind/lookahead.
     static FANCY_CACHE: RefCell<HashMap<(String, String), Arc<fancy_regex::Regex>>> = RefCell::new(HashMap::new());
+
+    /// ECMAScript backtracking matchers for quantified capture groups. These
+    /// are the patterns where `regex`/`fancy-regex` cannot reproduce
+    /// `RepeatMatcher` capture reset and nullable-iteration semantics (#5897).
+    static REPEAT_MATCHER_CACHE: RefCell<HashMap<(String, String), Arc<repeat_matcher::RepeatMatcherRegex>>> = RefCell::new(HashMap::new());
 }
 
 /// Compiled-program size budget handed to both regex engines.
@@ -343,13 +351,13 @@ pub(crate) fn build_fancy_regex(pattern: &str) -> Result<fancy_regex::Regex, fan
         .build()
 }
 
-/// Entry cap for `REGEX_CACHE`/`FANCY_CACHE` (2026-07-09 GC audit: one entry
+/// Entry cap for the compiled-regex caches (2026-07-09 GC audit: one entry
 /// per distinct `(pattern, flags)` ever compiled, no cap of any kind, entries
 /// up to [`REGEX_SIZE_LIMIT`] — `new RegExp(userInput)` was an attacker-driven
 /// OOM). When an insert would exceed the cap the whole map is cleared — the
 /// `PARSE_KEY_CACHE` precedent: cheap, no LRU bookkeeping, recompilation is
 /// the fallback. Live `RegExpHeader`s are unaffected: each header OWNS a
-/// leaked `Arc` reference to its compiled program(s) (`regex_ptr`/`fancy_ptr`),
+/// leaked `Arc` reference to its compiled program(s),
 /// so dropping the cache's references cannot free a program still in use.
 #[cfg(feature = "regex-engine")]
 const REGEX_CACHE_MAX_ENTRIES: usize = 512;
@@ -387,6 +395,16 @@ fn compile_and_cache_regex_checked(pattern: &str, flags: &str) -> bool {
     });
     if already {
         return true;
+    }
+    if let Some(repeat_matcher) = repeat_matcher::compile(pattern, flags) {
+        REPEAT_MATCHER_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            evict_regex_cache_if_full(&mut cache);
+            cache.insert(
+                (pattern.to_string(), flags.to_string()),
+                Arc::new(repeat_matcher),
+            );
+        });
     }
     // Translate JS regex to Rust-compatible pattern
     let translated = js_regex_to_rust(pattern);
@@ -524,6 +542,10 @@ pub struct RegExpHeader {
     /// Header-resident twin of the `FANCY_CACHE` thread-local so the fancy
     /// fallback survives the duplicate-runtime split described above.
     pub fancy_ptr: *const (),
+    /// Header-owned `Arc<RepeatMatcherRegex>` for quantified capture groups,
+    /// or null for the ordinary linear/fancy paths. Like `fancy_ptr`, this
+    /// survives cache eviction and duplicate statically-linked runtime copies.
+    pub repeat_matcher_ptr: *const (),
 }
 
 /// Self-identifying sentinel stamped into every `RegExpHeader.magic` by
@@ -614,11 +636,16 @@ pub fn is_registered_regex(addr: usize) -> bool {
 
 /// Internal helper: Get string data from StringHeader
 pub(crate) fn string_as_str<'a>(s: *const StringHeader) -> &'a str {
+    unsafe { std::str::from_utf8_unchecked(string_as_bytes(s)) }
+}
+
+/// Internal helper: get the byte payload without assuming it is Unicode
+/// scalar UTF-8. JavaScript strings containing lone surrogates use WTF-8.
+pub(crate) fn string_as_bytes<'a>(s: *const StringHeader) -> &'a [u8] {
     unsafe {
         let len = (*s).byte_len as usize;
         let data = (s as *const u8).add(std::mem::size_of::<StringHeader>());
-        let bytes = std::slice::from_raw_parts(data, len);
-        std::str::from_utf8_unchecked(bytes)
+        std::slice::from_raw_parts(data, len)
     }
 }
 
@@ -961,6 +988,15 @@ pub extern "C" fn js_regexp_new(
                 None => std::ptr::null(),
             }
         });
+        (*ptr).repeat_matcher_ptr = REPEAT_MATCHER_CACHE.with(|cache| {
+            match cache
+                .borrow()
+                .get(&(owned_pattern.clone(), flags_str.to_string()))
+            {
+                Some(arc) => Arc::into_raw(arc.clone()) as *const (),
+                None => std::ptr::null(),
+            }
+        });
 
         // Record the pointer so that js_string_split can detect
         // `s.split(regex)` without a dedicated runtime decl.
@@ -1131,6 +1167,14 @@ pub extern "C" fn js_regexp_test(re: *const RegExpHeader, s: *const StringHeader
             return if arr.is_null() { 0 } else { 1 };
         }
 
+        if let Some(repeat_matcher) = lookup_repeat_matcher(re) {
+            return if repeat_matcher.regex.find(str_data).is_some() {
+                1
+            } else {
+                0
+            };
+        }
+
         if let Some(fre) = lookup_fancy_regex(re) {
             return match fre.is_match(str_data) {
                 Ok(true) => 1,
@@ -1169,6 +1213,31 @@ pub(crate) fn lookup_fancy_regex(re: *const RegExpHeader) -> Option<Arc<fancy_re
         let flags_str = string_as_str((*re).flags_ptr);
         FANCY_CACHE.with(|fc| {
             fc.borrow()
+                .get(&(pat.to_string(), flags_str.to_string()))
+                .cloned()
+        })
+    }
+}
+
+/// Look up the ECMAScript-native matcher used when quantified capture groups
+/// make `RepeatMatcher`'s capture-reset semantics observable.
+#[cfg(feature = "regex-engine")]
+fn lookup_repeat_matcher(
+    re: *const RegExpHeader,
+) -> Option<Arc<repeat_matcher::RepeatMatcherRegex>> {
+    unsafe {
+        if regex_header_has_magic(re) && !(*re).repeat_matcher_ptr.is_null() {
+            let raw = (*re).repeat_matcher_ptr as *const repeat_matcher::RepeatMatcherRegex;
+            let arc = Arc::from_raw(raw);
+            let cloned = arc.clone();
+            std::mem::forget(arc);
+            return Some(cloned);
+        }
+        let pat = string_as_str((*re).pattern_ptr);
+        let flags_str = string_as_str((*re).flags_ptr);
+        REPEAT_MATCHER_CACHE.with(|cache| {
+            cache
+                .borrow()
                 .get(&(pat.to_string(), flags_str.to_string()))
                 .cloned()
         })
@@ -1333,19 +1402,44 @@ pub extern "C" fn js_string_replace_regex(
         return js_string_from_str("");
     }
 
-    let str_data = string_as_str(s);
-    let repl_str = if is_valid_ptr(replacement) {
-        string_as_str(replacement)
-    } else {
-        "undefined"
-    };
-
     if !is_valid_regex_ptr(re) {
         // If regex is null, return original string
         return copy_replace_source(s);
     }
 
     unsafe {
+        // The Rust string engines require scalar-value UTF-8, while Perry
+        // stores lone JavaScript surrogates as WTF-8. Match those subjects as
+        // UTF-16 code units with the ECMAScript engine and rebuild the result
+        // through the WTF-8-aware string builder.
+        if (*s).flags & crate::string::STRING_FLAG_HAS_LONE_SURROGATES != 0 {
+            let replacement_bytes = if is_valid_ptr(replacement) {
+                string_as_bytes(replacement)
+            } else {
+                b"undefined"
+            };
+            if let Some(result) = repeat_matcher::replace_wtf8_subject(
+                re,
+                string_as_bytes(s),
+                replacement_bytes,
+                (*re).global,
+            ) {
+                return finish_replace_bytes(&result);
+            }
+        }
+
+        let str_data = string_as_str(s);
+        let repl_str = if is_valid_ptr(replacement) {
+            string_as_str(replacement)
+        } else {
+            "undefined"
+        };
+
+        if let Some(repeat_matcher) = lookup_repeat_matcher(re) {
+            let result = repeat_matcher.replace(str_data, repl_str, (*re).global);
+            return finish_replace_bytes(result.as_bytes());
+        }
+
         // Pattern the `regex` crate couldn't compile (lookbehind/backreferences)
         // → drive the replacement through fancy-regex. Otherwise the never-match
         // placeholder in `regex_ptr` would leave the input unchanged.
@@ -1450,7 +1544,9 @@ pub extern "C" fn js_string_split_regex_n(
     unsafe {
         // Each element is either a substring (`Some`) or `undefined` (`None`,
         // for an unmatched capture group spliced into the result).
-        let parts: Vec<Option<String>> = if let Some(fre) = lookup_fancy_regex(re) {
+        let parts: Vec<Option<String>> = if let Some(repeat_matcher) = lookup_repeat_matcher(re) {
+            repeat_matcher.split(&str_data, limit)
+        } else if let Some(fre) = lookup_fancy_regex(re) {
             // Fancy-regex fallback (lookbehind/backreferences): `fancy_regex` has
             // no `split`, so walk non-overlapping matches and slice between them.
             // (Captured-group splicing is not reproduced for this engine.)
@@ -1507,6 +1603,14 @@ pub extern "C" fn js_string_search_regex(s: *const StringHeader, re: *const RegE
     let str_data = string_as_str(s);
 
     unsafe {
+        if let Some(repeat_matcher) = lookup_repeat_matcher(re) {
+            return repeat_matcher
+                .regex
+                .find(str_data)
+                .map(|matched| byte_index_to_utf16_index(str_data, matched.start()) as i32)
+                .unwrap_or(-1);
+        }
+
         // Fancy-regex fallback (lookbehind/backreferences): the never-match
         // placeholder in `regex_ptr` would always report -1 otherwise.
         if let Some(fre) = lookup_fancy_regex(re) {

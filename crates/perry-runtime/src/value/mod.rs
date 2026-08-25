@@ -105,9 +105,9 @@ pub use nanbox::{
 // ----- Dynamic arithmetic dispatch (BigInt vs float) -----
 pub use dynamic_arith::{
     js_dynamic_add, js_dynamic_bitand, js_dynamic_bitor, js_dynamic_bitxor, js_dynamic_div,
-    js_dynamic_mod, js_dynamic_mul, js_dynamic_neg, js_dynamic_pow, js_dynamic_shl, js_dynamic_shr,
-    js_dynamic_string_or_number_add, js_dynamic_sub, js_dynamic_ushr, js_numeric_step,
-    js_to_numeric,
+    js_dynamic_mod, js_dynamic_mul, js_dynamic_neg, js_dynamic_pos, js_dynamic_pow, js_dynamic_shl,
+    js_dynamic_shr, js_dynamic_string_or_number_add, js_dynamic_sub, js_dynamic_ushr,
+    js_numeric_step, js_to_numeric,
 };
 
 // ----- Dynamic index get/set + bare-NaN check -----
@@ -115,7 +115,8 @@ pub use dyn_index::{js_dyn_index_get, js_dyn_index_set, js_is_undefined_or_bare_
 
 // ----- to-string conversion helpers -----
 pub(crate) use to_string::{
-    coerce_validate_radix, function_to_primitive_for_add, function_to_string_method_result,
+    array_prototype_to_string, call_array_prototype_to_string_method, coerce_validate_radix,
+    function_to_primitive_for_add, function_to_string_method_result,
     ordinary_to_primitive_for_toprimitive, ordinary_to_primitive_number_for_add,
     to_primitive_number, OrdinaryToPrimitiveOutcome,
 };

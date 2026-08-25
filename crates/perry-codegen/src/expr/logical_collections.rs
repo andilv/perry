@@ -649,12 +649,13 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         }
 
         // -------- for (key in obj) enumeration keys -> string[] --------
-        // Like ObjectKeys but nullish-safe (no throw) and walks the prototype
-        // chain for inherited enumerable keys. Backs the for-in desugar.
+        // The guarded runtime entry reuses a stable one-key shape's immutable
+        // key array without allocation, then falls back to the complete
+        // nullish/prototype-aware enumerator for every other receiver.
         Expr::ForInKeys(obj) => {
             let obj_box = lower_expr(ctx, obj)?;
             let blk = ctx.block();
-            let arr_handle = blk.call(I64, "js_for_in_keys_value", &[(DOUBLE, &obj_box)]);
+            let arr_handle = blk.call(I64, "js_for_in_keys_stable_value", &[(DOUBLE, &obj_box)]);
             Ok(nanbox_pointer_inline(blk, &arr_handle))
         }
 
@@ -880,14 +881,21 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         }
         Expr::PrivateBrandCheck {
             class_name,
+            class_id: declaring_class_id,
             field_name,
+            kind,
+            is_static,
             object,
         } => {
             let obj = lower_expr(ctx, object)?;
             // The rooting window between these two operands is empty:
             // lowering `this` only reads the current binding and cannot GC.
             let brand_owner = lower_expr(ctx, &Expr::This)?;
-            let class_id = ctx.class_ids.get(class_name).copied().unwrap_or(0);
+            let class_id = if *declaring_class_id != 0 {
+                *declaring_class_id
+            } else {
+                ctx.class_ids.get(class_name).copied().unwrap_or(0)
+            };
             let key_label = emit_string_literal_global(ctx, field_name);
             Ok(ctx.block().call(
                 DOUBLE,
@@ -898,6 +906,8 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     (I32, &class_id.to_string()),
                     (PTR, &key_label),
                     (I32, &field_name.len().to_string()),
+                    (I32, &kind.to_string()),
+                    (I32, if *is_static { "1" } else { "0" }),
                 ],
             ))
         }

@@ -38,7 +38,9 @@ pub(crate) use native_dispatch::{
     is_native_dispatch_member, is_net_server_method_name, is_net_socket_method_name,
     is_stream_api_member, is_url_pattern_data_property, is_worker_instance_value_property,
 };
-pub(crate) use private_guard::{wrap_private_guard, PRIV_OP_READ, PRIV_OP_WRITE};
+pub(crate) use private_guard::{
+    private_storage_property, wrap_private_guard, PRIV_OP_READ, PRIV_OP_WRITE,
+};
 pub(crate) use process_literals::{process_allowed_node_flags_literal, process_features_literal};
 pub(crate) use process_props::{
     is_ws_ready_state_receiver, lower_process_named_property, process_metadata_native_property,
@@ -1032,8 +1034,16 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
     // body-local colliding `class X` registers under `class_renames`, and
     // the raw name would bind the FIRST same-named registrant's statics.
     if let ast::Expr::Ident(obj_ident) = member.obj.as_ref() {
-        let obj_name = ctx.resolve_class_name(obj_ident.sym.as_ref());
-        if ctx.lookup_class(&obj_name).is_some() {
+        let source_name = obj_ident.sym.as_ref();
+        // A fresh nested class declaration binds its evaluated heap class
+        // object to a real local. That local's own statics are per evaluation,
+        // so reading through the shared template's `StaticFieldGet` loses both
+        // its value and its property-presence semantics. This mirrors the
+        // static-call guard in `expr_call/static_and_instance.rs`.
+        let local_shadows_class = ctx.lookup_local(source_name).is_some()
+            && !ctx.inferred_class_bindings.contains(source_name);
+        let obj_name = ctx.resolve_class_name(source_name);
+        if !local_shadows_class && ctx.lookup_class(&obj_name).is_some() {
             if let ast::MemberProp::Ident(prop_ident) = &member.prop {
                 let field_name = prop_ident.sym.to_string();
                 if ctx.has_static_field(&obj_name, &field_name) {
@@ -1089,25 +1099,25 @@ fn lower_member_inner(ctx: &mut LoweringContext, member: &ast::MemberExpr) -> Re
             e
         }
         let inner = unwrap_member_obj(member.obj.as_ref());
-        if let ast::Expr::Ident(obj_ident) = inner {
-            let obj_name = obj_ident.sym.to_string();
-            if ctx.is_proxy_local(&obj_name) {
-                let proxy_expr = if let Some(id) = ctx.lookup_local(&obj_name) {
-                    Expr::LocalGet(id)
-                } else {
-                    lower_expr(ctx, &member.obj)?
-                };
-                let key_expr = match &member.prop {
-                    ast::MemberProp::Ident(i) => Expr::String(i.sym.to_string()),
-                    ast::MemberProp::Computed(c) => lower_expr(ctx, &c.expr)?,
-                    ast::MemberProp::PrivateName(pn) => {
-                        Expr::String(format!("#{}", pn.name.as_str()))
-                    }
-                };
-                return Ok(Expr::ProxyGet {
-                    proxy: Box::new(proxy_expr),
-                    key: Box::new(key_expr),
-                });
+        if !matches!(member.prop, ast::MemberProp::PrivateName(_)) {
+            if let ast::Expr::Ident(obj_ident) = inner {
+                let obj_name = obj_ident.sym.to_string();
+                if ctx.is_proxy_local(&obj_name) {
+                    let proxy_expr = if let Some(id) = ctx.lookup_local(&obj_name) {
+                        Expr::LocalGet(id)
+                    } else {
+                        lower_expr(ctx, &member.obj)?
+                    };
+                    let key_expr = match &member.prop {
+                        ast::MemberProp::Ident(i) => Expr::String(i.sym.to_string()),
+                        ast::MemberProp::Computed(c) => lower_expr(ctx, &c.expr)?,
+                        ast::MemberProp::PrivateName(_) => unreachable!("guarded above"),
+                    };
+                    return Ok(Expr::ProxyGet {
+                        proxy: Box::new(proxy_expr),
+                        key: Box::new(key_expr),
+                    });
+                }
             }
         }
     }

@@ -1277,7 +1277,7 @@ fn representation_lowering_helpers_have_lto_keepalive_anchors() {
         (
             guards,
             "static G4",
-            "static G4: unsafe extern \"C\" fn(f64, u32, u32) -> i32",
+            "static G4: unsafe extern \"C\" fn(f64, u32, u32, u32) -> i32",
             "js_method_direct_shape_guard",
         ),
         (
@@ -1583,6 +1583,51 @@ fn typed_feedback_class_field_set_guard_fails_for_frozen_object() {
     assert_eq!(site.fallback_calls, 0);
 }
 
+/// #8690: a packed Array-subclass numeric proof is authoritative even for
+/// pointer-free values. The class-field set guard must miss while the bit is
+/// active so the runtime setter can retire it for SSO and boolean overwrites.
+#[test]
+fn typed_feedback_class_field_set_guard_retires_packed_numeric_proof_for_tagged_values() {
+    let _guard = typed_feedback_test_lock();
+    reset_typed_feedback_for_tests();
+    register(8_690, TypedFeedbackSiteKind::PropertySet, "obj.x=");
+
+    let class_id = 0x7EED_8690;
+    let (obj, _, key, receiver) = class_instance(class_id, b"x");
+    let expected_shape_id = shape_id(obj);
+    crate::object::js_object_set_field(obj, 0, crate::JSValue::number(1.0));
+    let header =
+        unsafe { (obj as *mut u8).sub(crate::gc::GC_HEADER_SIZE) as *mut crate::gc::GcHeader };
+    let short = crate::value::JSValue::try_short_string(b"s").expect("inline SSO");
+
+    for (name, value_bits) in [("SSO", short.bits()), ("boolean", crate::value::TAG_TRUE)] {
+        unsafe {
+            (*header)._reserved |= crate::gc::OBJ_FLAG_PACKED_NUMERIC_PROOF;
+        }
+        let value = f64::from_bits(value_bits);
+        assert_eq!(
+            js_typed_feedback_class_field_set_guard(
+                8_690,
+                receiver,
+                class_id,
+                expected_shape_id,
+                key,
+                0,
+                value,
+                0,
+            ),
+            0,
+            "{name} must not bypass packed numeric proof invalidation"
+        );
+        crate::object::js_object_set_field(obj, 0, crate::JSValue::from_bits(value_bits));
+        assert_eq!(
+            unsafe { (*header)._reserved } & crate::gc::OBJ_FLAG_PACKED_NUMERIC_PROOF,
+            0,
+            "the runtime setter must retire proof authority for {name}"
+        );
+    }
+}
+
 #[test]
 fn typed_feedback_class_field_set_guard_falls_back_for_class_setter() {
     let _guard = typed_feedback_test_lock();
@@ -1618,6 +1663,43 @@ fn typed_feedback_class_field_set_guard_falls_back_for_class_setter() {
     js_typed_feedback_record_fallback_call(32);
     crate::object::js_object_set_field_by_name(obj, key, 7.0);
 
+    // OrdinarySet step 1: `O.[[GetOwnProperty]](P)` comes FIRST. This receiver
+    // has an own data property `x`, so the write lands in its own slot and the
+    // prototype accessor is never consulted. Node 26.5.1, verbatim:
+    //
+    //   class A { x = 1; set x(v) { log("setter") } get x() { return 99 } }
+    //   const a = new A(); Object.assign(a, { x: 7 });   // no "setter"
+    //   a.x                                              // 7
+    //
+    // `Object.assign` funnels straight into `js_object_set_field_by_name`
+    // (object/alloc.rs::object_assign_set_string_key), so this is the exact
+    // production path, not a synthetic one. Before the own-key check in
+    // `set_field_by_name_object_tail` this test asserted the opposite --
+    // setter fired, own slot untouched -- which diverged from Node.
+    assert_eq!(
+        CLASS_FIELD_SETTER_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        crate::object::js_object_get_field(obj, 0).bits(),
+        7.0f64.to_bits()
+    );
+
+    // ...and the fallback still DISPATCHES the setter when the receiver has no
+    // own property of that name -- the #486 (hono `set res(_res)`) shape the
+    // vtable walk exists for. Same class-setter registration, a receiver whose
+    // shape does not carry `x`.
+    let bare_class_id = 0x7EED_0033;
+    let (bare, _, _, _) = class_instance(bare_class_id, b"other");
+    unsafe {
+        crate::object::js_register_class_setter(
+            bare_class_id as i64,
+            b"x".as_ptr(),
+            1,
+            test_class_field_setter as *const () as usize as i64,
+        );
+    }
+    crate::object::js_object_set_field_by_name(bare, key, 7.0);
     assert_eq!(
         CLASS_FIELD_SETTER_CALLS.load(std::sync::atomic::Ordering::SeqCst),
         1
@@ -1625,10 +1707,6 @@ fn typed_feedback_class_field_set_guard_falls_back_for_class_setter() {
     assert_eq!(
         CLASS_FIELD_SETTER_VALUE_BITS.load(std::sync::atomic::Ordering::SeqCst),
         7.0f64.to_bits()
-    );
-    assert_eq!(
-        crate::object::js_object_get_field(obj, 0).bits(),
-        1.0f64.to_bits()
     );
 
     let site = &typed_feedback_snapshot().sites[0];
@@ -1948,10 +2026,17 @@ fn method_direct_shape_guard_requires_the_exact_compiler_pair() {
     let class_id = 0x7EED_1061;
     let (obj, _, _, receiver) = class_instance(class_id, b"x");
     let expected_shape_id = shape_id(obj);
+    let method_name = "direct_shape_target_1061";
+    let method_slot = crate::object::class_prototype_method_guard_slot(method_name);
 
     assert_eq!(
         unsafe {
-            super::guards::js_method_direct_shape_guard(receiver, class_id, expected_shape_id)
+            super::guards::js_method_direct_shape_guard(
+                receiver,
+                class_id,
+                expected_shape_id,
+                method_slot,
+            )
         },
         1
     );
@@ -1961,6 +2046,7 @@ fn method_direct_shape_guard_requires_the_exact_compiler_pair() {
                 receiver,
                 class_id.wrapping_add(1),
                 expected_shape_id,
+                method_slot,
             )
         },
         0
@@ -1978,7 +2064,12 @@ fn method_direct_shape_guard_requires_the_exact_compiler_pair() {
     );
     assert_eq!(
         unsafe {
-            super::guards::js_method_direct_shape_guard(receiver, class_id, expected_shape_id)
+            super::guards::js_method_direct_shape_guard(
+                receiver,
+                class_id,
+                expected_shape_id,
+                method_slot,
+            )
         },
         1
     );
@@ -1990,7 +2081,12 @@ fn method_direct_shape_guard_requires_the_exact_compiler_pair() {
         let original_reserved = (*gc)._reserved;
         (*gc)._reserved |= crate::gc::OBJ_FLAG_HAS_DESCRIPTORS;
         assert_eq!(
-            super::guards::js_method_direct_shape_guard(receiver, class_id, expected_shape_id),
+            super::guards::js_method_direct_shape_guard(
+                receiver,
+                class_id,
+                expected_shape_id,
+                method_slot,
+            ),
             0
         );
         (*gc)._reserved = original_reserved;
@@ -2004,13 +2100,54 @@ fn method_direct_shape_guard_requires_the_exact_compiler_pair() {
     }
     assert_eq!(
         unsafe {
-            super::guards::js_method_direct_shape_guard(receiver, class_id, expected_shape_id)
+            super::guards::js_method_direct_shape_guard(
+                receiver,
+                class_id,
+                expected_shape_id,
+                method_slot,
+            )
         },
         0
     );
     unsafe {
         (*obj).parent_class_id = expected_shape_id;
     }
+
+    crate::object::class_prototype_method_root_store(
+        class_id.wrapping_add(10),
+        "direct_shape_unrelated_1061".to_string(),
+        crate::value::TAG_UNDEFINED,
+    );
+    assert_eq!(
+        unsafe {
+            super::guards::js_method_direct_shape_guard(
+                receiver,
+                class_id,
+                expected_shape_id,
+                method_slot,
+            )
+        },
+        1,
+        "a different method name must not poison this direct guard",
+    );
+
+    crate::object::class_prototype_method_root_store(
+        class_id.wrapping_add(11),
+        method_name.to_string(),
+        crate::value::TAG_UNDEFINED,
+    );
+    assert_eq!(
+        unsafe {
+            super::guards::js_method_direct_shape_guard(
+                receiver,
+                class_id,
+                expected_shape_id,
+                method_slot,
+            )
+        },
+        0,
+        "the same method name must retire guards across the class hierarchy",
+    );
 }
 
 #[test]

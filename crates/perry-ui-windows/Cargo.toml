@@ -80,6 +80,10 @@ windows = { version = "0.62", features = [
     # SystemMediaTransportControls / DisplayUpdater / MusicDisplayProperties
     # (#367 — volume HUD media tile, headphone media keys, Edge Now Playing).
     "Media",
+    # PdfView (#6613) — decode native PDF pages to an in-memory PNG via
+    # Windows.Data.Pdf, then paint them in the Win32 widget with GDI+.
+    "Data_Pdf",
+    "Storage",
     "Storage_Streams",
     # WinHTTP — URL-fetched images on Windows (Image(url, alt) +
     # ImageGallery URLs). Mirrors the macOS NSURL/NSData path: native
@@ -109,4 +113,9 @@ windows-xaml = { package = "windows", version = "0.35", features = [
 ] }
 
 [features]
+default = ["ffi-exports"]
+# Keep the C ABI in the default Win32 staticlib, while allowing the WinUI
+# backend to reuse the implementation modules and provide its own dispatching
+# exports without duplicate `perry_ui_*` symbols in the final archive.
+ffi-exports = []
 geisterhand = []

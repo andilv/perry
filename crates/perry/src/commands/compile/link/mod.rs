@@ -51,7 +51,9 @@ mod linux_ui_libs;
 mod native_features;
 mod pkg_config;
 mod platform_cmd;
+mod watchos_frameworks;
 mod windows_link;
+mod winui_assets;
 
 use archive_cache::{prepare_well_known_archives, PreparedArchiveInputs};
 pub(super) use build_and_run::build_and_run_link;

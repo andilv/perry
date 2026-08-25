@@ -17,6 +17,15 @@ pub enum WithSetFallback {
     SloppyImplicit(LocalId),
 }
 
+/// One source-ordered static initialization step on a per-evaluation class
+/// object. Computed names have already been evaluated before these steps run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ClassFreshStaticInit {
+    Named(u32),
+    Computed(u32),
+    Block(u32),
+}
+
 /// Expression
 #[derive(Debug, Clone)]
 pub enum Expr {
@@ -272,7 +281,13 @@ pub enum Expr {
     /// so ordinary public string keys cannot satisfy private-field syntax.
     PrivateBrandCheck {
         class_name: String,
+        /// Declaring class identity; 0 only when lexical resolution failed.
+        class_id: u32,
         field_name: String,
+        /// Private member kind, using [`PrivKind`](crate::lower::PrivKind)'s
+        /// wire values: 0=field, 1=method, 2=getter, 3=setter, 4=get+set.
+        kind: u8,
+        is_static: bool,
         object: Box<Expr>,
     },
 
@@ -533,8 +548,10 @@ pub enum Expr {
     /// `new` / `instanceof` keep dispatching through the existing class_id
     /// machinery — and writes the per-evaluation static fields as the
     /// object's OWN properties (`named_statics` via
-    /// `js_object_set_field_by_name`, `symbol_statics` via
-    /// `js_object_set_symbol_property`). The class value is the object
+    /// `js_object_set_field_by_name`, `computed_statics` via the generic
+    /// PropertyKey setter). Computed field keys are resolved first into hidden
+    /// own slots so instance construction and computed static initialization
+    /// reuse the same PropertyKey. The class value is the object
     /// POINTER, so `make(a) !== make(b)` (distinct heap allocations) and
     /// each carries its own `static ast`. Because it is a normal traced
     /// heap object it is collectible — no leak. The static-field
@@ -543,7 +560,13 @@ pub enum Expr {
     ClassExprFresh {
         template: String,
         named_statics: Vec<(String, Expr)>,
-        symbol_statics: Vec<(Expr, Expr)>,
+        computed_keys: Vec<(String, Expr)>,
+        /// (hidden resolved-key slot name, initializer)
+        computed_statics: Vec<(String, Expr)>,
+        /// Static fields and blocks in ClassBody source order. Indices address
+        /// `named_statics`, `computed_statics`, or the template's static-block
+        /// function list respectively.
+        static_init_order: Vec<ClassFreshStaticInit>,
         /// #1787: the captured outer-scope values this class expression
         /// closes over, in the synthesized constructor's capture-param
         /// order (see `synthesize_class_captures`). Each entry is a

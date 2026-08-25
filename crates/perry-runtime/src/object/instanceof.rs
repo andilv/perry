@@ -211,46 +211,34 @@ pub extern "C" fn js_instanceof_dynamic(value: f64, type_ref: f64) -> f64 {
         }
         return f64::from_bits(TAG_FALSE);
     }
-    // Spec step (InstanceofOperator): consult the RHS's OWN `@@hasInstance`
-    // first. zod 4 builds `ZodType` as a plain FUNCTION and installs its brand
-    // check via `Object.defineProperty(ZodTypeFn, Symbol.hasInstance, { value })`,
-    // so the function RHS would otherwise fall through to the prototype-walk tail
-    // and return false. Read OWN only (`has_own` ⇒ `get` returns the own value,
-    // never the inherited Function.prototype default thunk → no recursion). Also
-    // catches a dynamic class-ref RHS (own @@hasInstance lives in CLASS_STATIC_SYMBOLS).
+    // Spec step (InstanceofOperator): an OWN user-defined `@@hasInstance`
+    // overrides even native constructor brand checks. The native generic hook
+    // lives on Function.prototype, so the own-property gate distinguishes an
+    // explicit override from that inherited default without recursion.
     {
         let hi_sym = crate::symbol::well_known_symbol("hasInstance");
         if !hi_sym.is_null() {
             let hi_f64 = f64::from_bits(crate::value::JSValue::pointer(hi_sym as *const u8).bits());
             if unsafe { crate::symbol::js_object_has_own_symbol(type_ref, hi_f64) } {
                 let cb = unsafe { crate::symbol::js_object_get_symbol_property(type_ref, hi_f64) };
-                // A present-but-non-callable own `@@hasInstance` throws; only a
-                // `null`/`undefined` value falls through to the default below.
-                if let HasInstanceOutcome::Result(r) = dispatch_own_has_instance(cb, value) {
-                    return r;
+                if let HasInstanceOutcome::Result(result) = dispatch_own_has_instance(cb, value) {
+                    return result;
                 }
             }
         }
     }
-    // Spec step (InstanceofOperator): consult the RHS's OWN `@@hasInstance`
-    // first. zod 4 builds `ZodType` as a plain FUNCTION and installs its brand
-    // check via `Object.defineProperty(ZodTypeFn, Symbol.hasInstance, { value })`,
-    // so the function RHS would otherwise fall through to the prototype-walk tail
-    // and return false. Read OWN only (`has_own` ⇒ `get` returns the own value,
-    // never the inherited Function.prototype default thunk → no recursion). Also
-    // catches a dynamic class-ref RHS (own @@hasInstance lives in CLASS_STATIC_SYMBOLS).
-    {
-        let hi_sym = crate::symbol::well_known_symbol("hasInstance");
-        if !hi_sym.is_null() {
-            let hi_f64 = f64::from_bits(crate::value::JSValue::pointer(hi_sym as *const u8).bits());
-            if unsafe { crate::symbol::js_object_has_own_symbol(type_ref, hi_f64) } {
-                let cb = unsafe { crate::symbol::js_object_get_symbol_property(type_ref, hi_f64) };
-                // A present-but-non-callable own `@@hasInstance` throws; only a
-                // `null`/`undefined` value falls through to the default below.
-                if let HasInstanceOutcome::Result(r) = dispatch_own_has_instance(cb, value) {
-                    return r;
-                }
-            }
+    // Native http(s).Agent handles have no heap prototype chain. After any own
+    // override above has had first refusal, retain their native brand check.
+    if let Some((module, method)) = unsafe { bound_native_callable_module_and_method(type_ref) } {
+        if matches!(module.as_str(), "http" | "https") && method == "Agent" {
+            let matched = small_native_handle_id(value)
+                .zip(crate::object::http_agent_handle_probe())
+                .is_some_and(|(handle, probe)| unsafe { probe(handle) });
+            return f64::from_bits(if matched {
+                crate::value::TAG_TRUE
+            } else {
+                TAG_FALSE
+            });
         }
     }
     let bits = type_ref.to_bits();
@@ -373,6 +361,19 @@ pub extern "C" fn js_instanceof_dynamic(value: f64, type_ref: f64) -> f64 {
         {
             return f64::from_bits(crate::value::TAG_TRUE);
         }
+        if module == "tls" && matches!(method.as_str(), "Server" | "TLSSocket") {
+            let want = if method == "Server" { 1 } else { 2 };
+            if let (Some(handle), Some(probe)) = (
+                small_native_handle_id(value),
+                crate::object::tls_handle_kind_probe(),
+            ) {
+                return f64::from_bits(if unsafe { probe(handle) } == want {
+                    crate::value::TAG_TRUE
+                } else {
+                    TAG_FALSE
+                });
+            }
+        }
         if module == "wasi" && method == "WASI" && crate::wasi::is_wasi_instance(value) {
             return f64::from_bits(crate::value::TAG_TRUE);
         }
@@ -389,11 +390,14 @@ pub extern "C" fn js_instanceof_dynamic(value: f64, type_ref: f64) -> f64 {
         // #2689: `net.Stream` is an alias for `net.Socket`; both should match
         // a live socket handle via the runtime probe.
         if module == "net" && matches!(method.as_str(), "Socket" | "Stream") {
-            if let (Some(handle), Some(probe)) = (
-                small_native_handle_id(value),
-                crate::object::net_socket_handle_probe(),
-            ) {
-                if unsafe { probe(handle) } {
+            if let Some(handle) = small_native_handle_id(value) {
+                let net_socket = crate::object::net_socket_handle_probe()
+                    .map(|probe| unsafe { probe(handle) })
+                    .unwrap_or(false);
+                let tls_socket = crate::object::tls_handle_kind_probe()
+                    .map(|probe| unsafe { probe(handle) == 2 })
+                    .unwrap_or(false);
+                if net_socket || tls_socket {
                     return f64::from_bits(crate::value::TAG_TRUE);
                 }
             }
@@ -533,6 +537,7 @@ pub(crate) fn global_builtin_constructor_class_id(name: &str) -> u32 {
         "WeakSet" => 0xFFFF002D,
         "RegExp" => 0xFFFF0021,
         "ArrayBuffer" => 0xFFFF0025,
+        "SharedArrayBuffer" => 0xFFFF002E,
         "DataView" => 0xFFFF002B,
         "Array" => 0xFFFF0024,
         "Object" => 0xFFFF0050,
@@ -786,6 +791,7 @@ crate::perry_thread_local! {
 fn rhs_is_object_value(value: f64) -> bool {
     let bits = value.to_bits();
     let jsval = crate::JSValue::from_bits(bits);
+
     if jsval.is_null()
         || jsval.is_undefined()
         || jsval.is_bool()
@@ -1135,11 +1141,14 @@ pub extern "C" fn js_instanceof(value: f64, class_id: u32) -> f64 {
         };
     }
     if class_id == CLASS_ID_NET_SOCKET {
-        return if let (Some(handle), Some(probe)) = (
-            small_native_handle_id(value),
-            crate::object::net_socket_handle_probe(),
-        ) {
-            if unsafe { probe(handle) } {
+        return if let Some(handle) = small_native_handle_id(value) {
+            let net_socket = crate::object::net_socket_handle_probe()
+                .map(|probe| unsafe { probe(handle) })
+                .unwrap_or(false);
+            let tls_socket = crate::object::tls_handle_kind_probe()
+                .map(|probe| unsafe { probe(handle) == 2 })
+                .unwrap_or(false);
+            if net_socket || tls_socket {
                 true_val
             } else {
                 false_val
@@ -1216,6 +1225,22 @@ pub extern "C" fn js_instanceof(value: f64, class_id: u32) -> f64 {
     let bits = value.to_bits();
     let jsval = crate::JSValue::from_bits(bits);
 
+    // Native/exotic subclass instances (typed arrays, ArrayBuffers, boxed
+    // primitives, Dates, …) do not carry a Perry `ObjectHeader.class_id`.
+    // Their constructor records the distinct newTarget prototype in the
+    // prototype side table instead. Honor that chain for user class ids.
+    if is_class_id_registered(class_id) {
+        let addr = value_addr(value);
+        if addr != 0 && super::prototype_chain::object_static_prototype(addr).is_some() {
+            let constructor = super::class_constructor_ref_value(class_id);
+            return if ordinary_has_instance_prototype_walk(value, constructor) {
+                true_val
+            } else {
+                false_val
+            };
+        }
+    }
+
     // Special handling for Uint8Array/Buffer (class_id 0xFFFF0004)
     // Perry buffers are raw BufferHeader pointers bitcast to f64 (not NaN-boxed),
     // so the normal POINTER_TAG check doesn't work for them.
@@ -1240,7 +1265,8 @@ pub extern "C" fn js_instanceof(value: f64, class_id: u32) -> f64 {
     // marked in a side registry. They can arrive either NaN-boxed or as raw
     // buffer pointers, matching the Buffer/Uint8Array path above.
     const CLASS_ID_ARRAY_BUFFER: u32 = 0xFFFF0025;
-    if class_id == CLASS_ID_ARRAY_BUFFER {
+    const CLASS_ID_SHARED_ARRAY_BUFFER: u32 = 0xFFFF002E;
+    if class_id == CLASS_ID_ARRAY_BUFFER || class_id == CLASS_ID_SHARED_ARRAY_BUFFER {
         let addr = if jsval.is_pointer() {
             (bits & 0x0000_FFFF_FFFF_FFFF) as usize
         } else {
@@ -1251,10 +1277,12 @@ pub extern "C" fn js_instanceof(value: f64, class_id: u32) -> f64 {
                 0
             }
         };
-        if addr != 0
-            && crate::buffer::is_registered_buffer(addr)
-            && crate::buffer::is_array_buffer(addr)
-        {
+        let matches_brand = if class_id == CLASS_ID_SHARED_ARRAY_BUFFER {
+            crate::buffer::is_shared_array_buffer(addr)
+        } else {
+            crate::buffer::is_array_buffer(addr)
+        };
+        if addr != 0 && crate::buffer::is_registered_buffer(addr) && matches_brand {
             return true_val;
         }
         return false_val;

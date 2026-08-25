@@ -11,22 +11,11 @@ pub(crate) fn is_non_constructable_builtin_function_value(value: f64) -> bool {
     super::super::native_module::builtin_closure_is_non_constructable_value(value)
 }
 
-/// True when `value` is a bound native-module method/export closure
-/// (`BOUND_METHOD_FUNC_PTR` trampoline — what a `require('stream').Writable`
-/// property read produces). These represent real Node classes/functions and
-/// must be accepted as `extends` targets.
-pub(crate) fn is_bound_native_method_closure_value(value: f64) -> bool {
-    // Gate on the native-module metadata, not the raw BOUND_METHOD_FUNC_PTR
-    // trampoline: reified `Function.prototype.{bind,call,apply}` values
-    // (`reify_function_method_value`) share that trampoline but are NOT native
-    // constructors, so matching the sentinel alone would let `class X extends
-    // obj.method {}` skip the spec-required TypeError and silently stay
-    // parentless. A real native-module export carries a non-empty module name.
-    unsafe {
-        super::super::native_module::bound_native_callable_module_and_method(value)
-            .map(|(module, _)| !module.is_empty())
-            .unwrap_or(false)
-    }
+/// True when `value` is a bound native-module *constructor* export. Native
+/// constructors and ordinary module functions share `BOUND_METHOD_FUNC_PTR`,
+/// so the export's explicit constructor metadata must make the distinction.
+pub(crate) fn is_bound_native_constructor_closure_value(value: f64) -> bool {
+    super::super::native_module::bound_native_callable_is_constructor_value(value)
 }
 
 pub(crate) fn throw_non_constructable_builtin_function() -> ! {
@@ -52,6 +41,14 @@ pub(crate) fn class_is_key_deleted(class_id: u32, key: &str) -> bool {
             .map(|keys| keys.contains(key))
             .unwrap_or(false)
     })
+}
+
+pub(crate) fn class_unmark_key_deleted(class_id: u32, key: &str) {
+    CLASS_DELETED_KEYS.with(|m| {
+        if let Some(keys) = m.borrow_mut().get_mut(&class_id) {
+            keys.remove(key);
+        }
+    });
 }
 
 /// Record `C.<name> = value` in the class-ref side table that dynamic reads
@@ -136,7 +133,7 @@ pub(crate) fn class_own_enumerable_field_names(class_id: u32) -> Vec<String> {
             .map(|props| {
                 props
                     .keys()
-                    .filter(|k| !k.starts_with('#'))
+                    .filter(|k| !crate::object::is_internal_runtime_key(k))
                     // #7190: a key installed by `Object.defineProperty` without
                     // `enumerable: true` shares this table with static fields
                     // but is NOT enumerable.
@@ -576,17 +573,17 @@ pub(crate) fn class_decl_prototype_object(class_id: u32) -> *mut ObjectHeader {
     })
 }
 
-fn class_decl_prototype_method_names(class_id: u32) -> Vec<String> {
+pub(crate) fn class_decl_prototype_method_names(class_id: u32) -> Vec<String> {
     let mut names = Vec::new();
     if let Ok(registry) = CLASS_VTABLE_REGISTRY.read() {
         if let Some(vtable) = registry.as_ref().and_then(|reg| reg.get(&class_id)) {
-            names.extend(
-                vtable
-                    .methods
-                    .keys()
-                    .filter(|name| *name != "constructor")
-                    .cloned(),
-            );
+            // The real class constructor is stored in `Class::constructor`,
+            // not in the instance-method vtable. An entry named
+            // `"constructor"` here is therefore an ordinary method, most
+            // notably `class C { ["constructor"]() {} }`. It must replace the
+            // implicit `C.prototype.constructor` data property when the
+            // reflective prototype object is materialized.
+            names.extend(vtable.methods.keys().cloned());
         }
     }
     names.sort();
@@ -594,15 +591,56 @@ fn class_decl_prototype_method_names(class_id: u32) -> Vec<String> {
     names
 }
 
-fn install_class_decl_prototype_method_fields(proto: *mut ObjectHeader, class_id: u32) {
-    let proto_value = crate::value::js_nanbox_pointer(proto as i64);
-    for name in class_decl_prototype_method_names(class_id) {
-        let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
-        let leaked: &'static [u8] = name.as_bytes().to_vec().leak();
-        let method = js_class_method_bind(proto_value, leaked.as_ptr(), leaked.len());
-        js_object_set_field_by_name(proto, key, method);
-        set_builtin_property_attrs(proto as usize, name, PropertyAttrs::new(true, false, true));
+pub(super) fn install_class_decl_prototype_method_field(
+    proto: *mut ObjectHeader,
+    class_id: u32,
+    name: &str,
+) {
+    if proto.is_null() {
+        return;
     }
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let proto_handle = scope.root_raw_mut_ptr(proto);
+    // Do not bind by reading the prototype object here. Its implicit
+    // `constructor` data property would shadow a computed method with that
+    // name and make the installation write the class constructor straight
+    // back. The canonical vtable value is the property value we need.
+    let method_handle =
+        scope.root_nanbox_f64(class_prototype_method_value_for_name(class_id, name));
+    let key_handle = scope.root_string_ptr(crate::string::js_string_from_bytes(
+        name.as_ptr(),
+        name.len() as u32,
+    ));
+    let method = method_handle.get_nanbox_f64();
+    proto_handle.with_mut_ptr::<ObjectHeader, _>(|proto| {
+        key_handle.with_const_ptr::<crate::StringHeader, _>(|key| {
+            js_object_set_field_by_name(proto, key, method)
+        })
+    });
+    proto_handle.with_mut_ptr::<ObjectHeader, _>(|proto| {
+        set_builtin_property_attrs(
+            proto as usize,
+            name.to_string(),
+            PropertyAttrs::new(true, false, true),
+        )
+    });
+}
+
+fn install_class_decl_prototype_method_fields(proto: *mut ObjectHeader, class_id: u32) {
+    for name in class_decl_prototype_method_names(class_id) {
+        install_class_decl_prototype_method_field(proto, class_id, &name);
+    }
+}
+
+fn class_parent_prototype_bits(value: f64) -> Option<u64> {
+    let bits = value.to_bits();
+    if bits == crate::value::TAG_NULL {
+        return Some(bits);
+    }
+    if !unsafe { super::super::object_ops::value_is_object_like(value) } {
+        return None;
+    }
+    (unsafe { crate::symbol::js_is_symbol(value) } == 0).then_some(bits)
 }
 
 pub(crate) fn class_decl_prototype_value(class_id: u32) -> f64 {
@@ -629,18 +667,9 @@ pub(crate) fn class_decl_prototype_value(class_id: u32) -> f64 {
         return f64::from_bits(crate::value::TAG_UNDEFINED);
     }
     // #7769 follow-up: materializing a declared class's prototype object is
-    // not prototype SURGERY, and it used to invalidate the fast guards as if
-    // it were.
-    //
-    // `invalidate_class_prototype_fast_guards()` trips a process-global,
-    // MONOTONIC latch. It disables every `js_method_direct_shape_guard` /
-    // `js_typed_feedback_method_direct_call_guard` in the program, retires
-    // every outstanding element-shape record (`invalidate_all_element_shapes`)
-    // and bumps `VTABLE_GEN`, retiring the `vtable_ic` / `obj_dispatch_ic`
-    // dispatch caches. It exists for the one event that can change which
-    // member `recv.m()` resolves to: a WRITE to a prototype
-    // (`Class.prototype.m = fn`), which is what the two call sites in
-    // `prototype_methods.rs` cover.
+    // not prototype surgery. A real keyed prototype write invalidates only
+    // the matching method-name guard slot, retires element-shape records, and
+    // bumps `VTABLE_GEN` so generic dispatch observes the replacement.
     //
     // Reaching this line changes none of that. The object being created is
     // fresh and unobserved; the writes immediately below install
@@ -692,18 +721,67 @@ pub(crate) fn class_decl_prototype_value(class_id: u32) -> f64 {
         unsafe { mirror_prototype_method_on_object(proto, &name, value_bits, enumerable) };
     }
 
-    let parent_proto_bits = get_parent_class_id(class_id)
-        .filter(|parent_id| *parent_id != 0 && *parent_id != class_id)
-        .and_then(|parent_id| {
-            let parent_proto = class_decl_prototype_value(parent_id);
-            let parent_bits = parent_proto.to_bits();
-            ((parent_bits >> 48) == 0x7FFD).then_some(parent_bits)
-        })
-        .or_else(global_object_prototype_bits);
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let dynamic_parent = scope.root_nanbox_f64(js_get_dynamic_parent_value(class_id));
+    let null_heritage = dynamic_parent.get_nanbox_f64().to_bits() == crate::value::TAG_NULL;
+    let parent_proto_bits = if null_heritage {
+        // A class extending null creates a prototype object whose
+        // [[Prototype]] is null, not Object.prototype.  Record TAG_NULL
+        // explicitly so "no custom link" is not mistaken for the ordinary
+        // Object.prototype default.
+        Some(crate::value::TAG_NULL)
+    } else {
+        let registered_parent_proto = get_parent_class_id(class_id)
+            .filter(|parent_id| *parent_id != 0 && *parent_id != class_id)
+            .and_then(|parent_id| {
+                let parent_proto = class_decl_prototype_value(parent_id);
+                let parent_bits = parent_proto.to_bits();
+                ((parent_bits >> 48) == 0x7FFD).then_some(parent_bits)
+            });
+        if registered_parent_proto.is_some() {
+            registered_parent_proto
+        } else {
+            // A runtime function-valued superclass (including Intl service
+            // constructors) has no class-id edge. Link the declared prototype
+            // to the parent's own `.prototype` exactly once, while this fresh
+            // class prototype is initialized. Construction must never rewrite
+            // this edge after user code mutates it.
+            let parent = JSValue::from_bits(dynamic_parent.get_nanbox_f64().to_bits());
+            if parent.is_pointer() {
+                let parent_addr = parent.as_pointer::<u8>() as usize;
+                if crate::closure::is_closure_ptr(parent_addr) {
+                    // Use the same observable `.prototype` read as ordinary
+                    // property access. Plain functions and bound native-module
+                    // constructor exports materialize this object lazily, while
+                    // explicit, deleted, and generator prototypes must retain
+                    // their own semantics.
+                    let parent_proto =
+                        super::function_prototype::js_function_prototype_value_for_read(
+                            dynamic_parent.get_nanbox_f64(),
+                        );
+                    if let Some(bits) = class_parent_prototype_bits(parent_proto) {
+                        Some(bits)
+                    } else {
+                        super::super::object_ops::throw_object_type_error(
+                            b"Class extends value does not have valid prototype property",
+                        );
+                    }
+                } else {
+                    global_object_prototype_bits()
+                }
+            } else {
+                global_object_prototype_bits()
+            }
+        }
+    };
     if let Some(bits) = parent_proto_bits {
-        super::super::prototype_chain::object_set_static_prototype(proto as usize, bits);
+        let proto = class_decl_prototype_object(class_id);
+        if !proto.is_null() {
+            super::super::prototype_chain::object_set_static_prototype(proto as usize, bits);
+        }
     }
 
+    let proto = class_decl_prototype_object(class_id);
     crate::value::js_nanbox_pointer(proto as i64)
 }
 
@@ -852,5 +930,91 @@ mod class_dynamic_prop_store_tests {
         // is non-empty for the whole process), still updates the value.
         class_dynamic_prop_root_store(cid, "k", 3.0);
         assert_eq!(stored(cid, "k"), Some(3.0));
+    }
+}
+
+#[cfg(test)]
+mod class_parent_prototype_tests {
+    use super::*;
+
+    #[test]
+    fn only_object_and_null_parent_prototypes_are_valid() {
+        let object_ptr = crate::object::js_object_alloc(0, 0);
+        assert!(!object_ptr.is_null());
+        let object = crate::value::js_nanbox_pointer(object_ptr as i64);
+        assert_eq!(class_parent_prototype_bits(object), Some(object.to_bits()));
+        assert_eq!(
+            class_parent_prototype_bits(f64::from_bits(crate::value::POINTER_TAG | 0x1234)),
+            None
+        );
+        assert_eq!(
+            class_parent_prototype_bits(f64::from_bits(crate::value::TAG_NULL)),
+            Some(crate::value::TAG_NULL)
+        );
+        assert_eq!(
+            class_parent_prototype_bits(f64::from_bits(crate::value::TAG_UNDEFINED)),
+            None
+        );
+        assert_eq!(class_parent_prototype_bits(1.0), None);
+    }
+
+    /// #8760: a `class X extends <bound native EventEmitter export>` registered
+    /// through the dynamic-parent path (`import { EventEmitter as EE } from
+    /// "events"; class X extends EE {}` — cli.js 2.1.112's exact shape) must
+    /// link its declared prototype to EventEmitter's real, lazily-materialized
+    /// prototype instead of throwing "Class extends value does not have valid
+    /// prototype property". The raw `prototype` dynamic slot on the bound export
+    /// closure is still `undefined` here, so the resolution must fall through to
+    /// the same lazy materialization an ordinary `EE.prototype` read uses.
+    #[test]
+    fn native_constructor_export_parent_links_declared_prototype() {
+        const ISSUE_8760_CLASS_ID: u32 = 0x7d01_8760;
+        const CLASS_NAME: &[u8] = b"Issue8760Subclass";
+
+        // The bound `events.EventEmitter` export — a BOUND_METHOD closure whose
+        // `.prototype` object is materialized on demand, not at mint time.
+        let ee_ctor = crate::object::bound_native_callable_export_value("events", "EventEmitter");
+
+        // Precondition: the raw dynamic `prototype` slot is undefined — the exact
+        // condition that made the dynamic-parent registration throw before the fix.
+        let ee_addr = (ee_ctor.to_bits() & crate::value::POINTER_MASK) as usize;
+        assert_eq!(
+            crate::closure::closure_get_dynamic_prop(ee_addr, "prototype").to_bits(),
+            crate::value::TAG_UNDEFINED,
+            "precondition: the bound export's raw prototype slot must be undefined"
+        );
+
+        unsafe {
+            js_register_class_name(
+                ISSUE_8760_CLASS_ID,
+                CLASS_NAME.as_ptr(),
+                CLASS_NAME.len() as u32,
+            );
+        }
+        js_register_class_parent_dynamic(ISSUE_8760_CLASS_ID, ee_ctor);
+
+        // Must not throw, and must materialize a real prototype object.
+        let decl_proto = class_decl_prototype_value(ISSUE_8760_CLASS_ID);
+        assert_eq!(
+            decl_proto.to_bits() & crate::value::TAG_MASK,
+            crate::value::POINTER_TAG,
+            "the subclass prototype must materialize (no TypeError) for a native constructor parent"
+        );
+
+        // Its [[Prototype]] must be EventEmitter's canonical prototype — the same
+        // object an ordinary `EE.prototype` read resolves to — so `instanceof`
+        // and inherited `emit`/`on` work through the chain.
+        let ee_proto = super::function_prototype::ordinary_function_prototype_value_for_read(
+            crate::object::bound_native_callable_export_value("events", "EventEmitter"),
+        )
+        .expect("EventEmitter export must expose a prototype object");
+        let decl_proto_addr = (decl_proto.to_bits() & crate::value::POINTER_MASK) as usize;
+        let linked = super::super::prototype_chain::object_static_prototype(decl_proto_addr)
+            .expect("the subclass prototype must have a linked [[Prototype]]");
+        assert_eq!(
+            linked & crate::value::POINTER_MASK,
+            ee_proto.to_bits() & crate::value::POINTER_MASK,
+            "the subclass prototype must inherit from EventEmitter.prototype"
+        );
     }
 }

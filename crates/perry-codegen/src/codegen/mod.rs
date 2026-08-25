@@ -175,6 +175,7 @@ impl Drop for CompileProgress {
 }
 
 pub(crate) mod arguments;
+mod artifact_context;
 mod artifacts;
 mod boxed_locals;
 mod closure;
@@ -190,15 +191,19 @@ mod function;
 mod hoisted_callback_method_tests;
 #[cfg(test)]
 mod index_method_clone_tests;
+mod indexed_method_artifacts;
 // `pub(crate)` so `crate::linker` can read the inline-hot-small policy
 // (`inline_hot_small_enabled` / `inline_hot_small_hint_threshold`).
 #[cfg(test)]
 mod clone_suffix_tests;
 #[cfg(test)]
 mod declared_string_add_tests;
+#[cfg(test)]
+mod guarded_undefined_method_tests;
 pub(crate) mod helpers;
 mod method;
 mod method_registry;
+mod method_trampolines;
 mod module_globals_emit;
 mod native_namespace_exports;
 #[cfg(test)]
@@ -213,9 +218,12 @@ mod spec_preserve_none_tests;
 mod spec_return_proof;
 #[cfg(test)]
 mod spec_self_recursion_tests;
+pub(crate) mod static_fields;
 mod string_pool;
 #[cfg(test)]
 mod testing_feature_gate_tests;
+#[cfg(test)]
+mod trusted_box_callback_tests;
 mod typed_abi;
 mod typed_abi_opt_report;
 #[cfg(test)]
@@ -236,7 +244,8 @@ pub(crate) use param_guard::scalar_descriptor_rep;
 pub(crate) use spec_abi::{spec_abi_enabled, spec_function_name, SpecDispatch, SpecFnPlan};
 pub(crate) use typed_abi::{
     emit_typed_arg_guard, emit_typed_arg_to_raw, generic_closure_body_name,
-    generic_function_body_name, generic_method_body_name, nonnegative_index_method_name,
+    generic_function_body_name, generic_method_body_name, nonnegative_index_fast_array_method_name,
+    nonnegative_index_fast_array_params, nonnegative_index_method_name,
     typed_arg_is_guard_candidate, typed_f64_closure_name, typed_f64_function_name,
     typed_f64_method_name, typed_f64_receiver_method_info, typed_f64_receiver_method_name,
     typed_i1_closure_name, typed_i1_function_name, typed_i1_method_name, typed_i32_closure_name,
@@ -245,7 +254,8 @@ pub(crate) use typed_abi::{
     TypedReceiverMethodInfo,
 };
 
-use artifacts::{emit_module_artifacts, ModuleArtifactsCtx};
+use artifact_context::ModuleArtifactsCtx;
+use artifacts::emit_module_artifacts;
 use function::{
     compile_function, compile_typed_f64_function, compile_typed_i1_function,
     compile_typed_i32_function, compile_typed_string_function,
@@ -1406,6 +1416,12 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         } // macOS / darwin default
     };
     progress.checkpoint("symbol tables and initial declarations");
+    // #8595: after entry outlining, declaration-bearing statements live in
+    // compiler-owned chunk functions. Analyses that model the module's source
+    // environment use the reconstructed stream, not the compact call-only
+    // `hir.init`, so immutable initializer facts and TDZ/prealloc metadata are
+    // unchanged by the structural transform.
+    let logical_entry_stmts = entry_outline::logical_entry_stmts(hir);
 
     // Pre-scan hir.init for compile-time constant variables. These are
     // `declare const __platform__: number` / `declare const __plugins__: number`
@@ -1413,7 +1429,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
     // uses these to constant-fold platform checks in `lower_if`, eliminating
     // dead branches that reference extern FFI functions absent on the target.
     let mut compile_time_constants: HashMap<u32, f64> = HashMap::new();
-    for s in &hir.init {
+    for s in logical_entry_stmts.iter().copied() {
         if let perry_hir::Stmt::Let {
             id,
             name,
@@ -1442,14 +1458,14 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
     // ReferenceError on pre-declaration reads instead of folding to a value.
     {
         let mut prealloc_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        for s in &hir.init {
+        for s in logical_entry_stmts.iter().copied() {
             if let perry_hir::Stmt::PreallocateBoxes(ids)
             | perry_hir::Stmt::PreallocateTdzBoxes(ids) = s
             {
                 prealloc_ids.extend(ids.iter().copied());
             }
         }
-        for s in &hir.init {
+        for s in logical_entry_stmts.iter().copied() {
             if let perry_hir::Stmt::Let {
                 id,
                 mutable: false,
@@ -1750,6 +1766,26 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             })
         })
         .collect();
+    // One bounded full-body version per eligible method. The erased optional
+    // annotation only nominates a candidate; the public wrapper emitted in
+    // `codegen/method.rs` guards the actual argument bits before the clone can
+    // consume a `Type::Void` proof. Keep the module-wide cap explicit so a
+    // source file with many optional loop filters cannot grow without bound.
+    let mut guarded_undefined_method_candidates: Vec<_> = hir
+        .classes
+        .iter()
+        .flat_map(|class| {
+            class.methods.iter().filter_map(move |method| {
+                param_guard::guarded_undefined_method_candidate(method).map(|candidate| {
+                    (
+                        candidate.body_nodes,
+                        (class.name.clone(), method.name.clone()),
+                        candidate.param_index,
+                    )
+                })
+            })
+        })
+        .collect();
     progress.checkpoint("cross-module and typed-ABI analysis");
 
     // Module-wide dispatch/barrier facts. Hoisted above the typed-clone
@@ -1799,17 +1835,6 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
                 receiver_class_table,
                 &module_dispatch_facts,
             ) {
-                // #7142: the tower routing site emits its own inline shape
-                // re-check, so it only takes the clone where the clone deletes
-                // strictly more guarded field sites than that check costs. The
-                // other two sites are guard-dominated and route unconditionally.
-                if crate::collectors::pshape_tower_route_profitable(
-                    class,
-                    method,
-                    receiver_class_table,
-                ) {
-                    pshape_tower_routable.insert((class.name.clone(), method.name.clone()));
-                }
                 pshape_methods.insert((class.name.clone(), method.name.clone()), fact);
             }
             match typed_abi::typed_f64_method_rejection_reason(method) {
@@ -1924,6 +1949,78 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             }
         }
     }
+    // #7142: the tower routing site emits its own inline shape re-check, so it
+    // only takes a clone where that clone deletes strictly more guarded work
+    // than the check costs. Price these routes after all local clone facts are
+    // known so nested `this.other()` calls can count an inherited clone too.
+    let local_pshape_methods: std::collections::HashSet<(String, String)> =
+        pshape_methods.keys().cloned().collect();
+    for class in &hir.classes {
+        for method in &class.methods {
+            let key = (class.name.clone(), method.name.clone());
+            if local_pshape_methods.contains(&key)
+                && crate::collectors::pshape_tower_route_profitable(
+                    class,
+                    method,
+                    receiver_class_table,
+                    &local_pshape_methods,
+                )
+            {
+                pshape_tower_routable.insert(key);
+            }
+        }
+    }
+    // Imported classes publish only clone names the defining module proved and
+    // emitted. Installing those capabilities in the same registries lets both
+    // the ordinary exact-class/shape guarded arm and profitable adapter-field
+    // dispatch towers retain the receiver proof across ESM and npm boundaries.
+    // The tower subset is producer-authored because only the defining module
+    // can see enough of the body to price its additional keys-token check.
+    for imported in &opts.imported_classes {
+        let effective_name = imported
+            .local_alias
+            .as_deref()
+            .unwrap_or(&imported.name)
+            .to_string();
+        if hir.classes.iter().any(|class| class.name == effective_name) {
+            continue;
+        }
+        for method in &imported.proven_this_method_names {
+            if !imported.method_names.contains(method) {
+                continue;
+            }
+            pshape_methods.insert(
+                (effective_name.clone(), method.clone()),
+                crate::collectors::PtrShapeLocal {
+                    class_name: effective_name.clone(),
+                    numeric_fields: std::collections::HashSet::new(),
+                    report_name: crate::opt_report::enabled()
+                        .then(|| format!("imported:{}", imported.source_prefix)),
+                },
+            );
+            if imported.proven_this_tower_method_names.contains(method) {
+                pshape_tower_routable.insert((effective_name.clone(), method.clone()));
+            }
+        }
+    }
+    // Keep this first implementation non-combinatorial. Existing typed/raw
+    // method clone families have their own public trampolines and calling
+    // conventions; composing those proofs is separate work. The optional
+    // undefined version retains the ordinary boxed ABI throughout.
+    guarded_undefined_method_candidates.retain(|(_, key, _)| {
+        !typed_f64_methods.contains(key)
+            && !typed_i32_methods.contains(key)
+            && !typed_i1_methods.contains(key)
+            && !typed_string_methods.contains(key)
+            && !typed_f64_receiver_methods.contains_key(key)
+            && !nonnegative_index_methods.contains_key(key)
+    });
+    guarded_undefined_method_candidates.sort_unstable_by(|left, right| left.cmp(right));
+    let guarded_undefined_method_params = guarded_undefined_method_candidates
+        .into_iter()
+        .take(16)
+        .map(|(_, key, param_index)| (key, param_index))
+        .collect();
     let mut compiler_private_async_i32_control_locals = std::collections::HashSet::new();
     let mut compiler_private_async_i1_control_locals = std::collections::HashSet::new();
     crate::boxed_vars::collect_compiler_private_async_control_locals_in_stmts(
@@ -2202,6 +2299,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         typed_i1_method_param_reps,
         typed_f64_receiver_methods,
         nonnegative_index_methods,
+        guarded_undefined_method_params,
         pshape_methods,
         pshape_tower_routable,
         typed_f64_closures: std::collections::HashSet::new(),
@@ -2224,7 +2322,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             // in the module (LocalSet/Update/IndexSet/mutating methods).
             let mut map: std::collections::HashMap<u32, crate::expr::FlatConstInfo> =
                 std::collections::HashMap::new();
-            for s in &hir.init {
+            for s in logical_entry_stmts.iter().copied() {
                 if let perry_hir::Stmt::Let {
                     id,
                     init: Some(init),
@@ -2491,6 +2589,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
     // `closure_collect::collect_module_closures`.
     let closure_collect::ModuleClosures {
         closures,
+        direct_call_closures,
         closure_rest_params,
         closure_synthetic_arguments,
         closure_rest_and_arguments,
@@ -2659,6 +2758,28 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             ),
         }
     }
+
+    // Trusted bodies deliberately use the ordinary closure ABI. Keep them
+    // disjoint from all typed-clone families so registration can always name
+    // the public body directly and so one closure never accumulates two
+    // independent cloning policies.
+    let trusted_box_exclusions: std::collections::HashSet<u32> = cross_module
+        .async_step_closures
+        .union(&cross_module.local_generator_funcs)
+        .chain(cross_module.funcs_reading_dynamic_this.iter())
+        .chain(cross_module.typed_f64_closures.iter())
+        .chain(cross_module.typed_i32_closures.iter())
+        .chain(cross_module.typed_i1_closures.iter())
+        .chain(cross_module.typed_string_closures.iter())
+        .copied()
+        .collect();
+    let trusted_box_closures = closure_collect::select_trusted_box_closures(
+        &closures,
+        &direct_call_closures,
+        &module_boxed_vars,
+        &module_globals,
+        &trusted_box_exclusions,
+    );
 
     // ---- Representation-selection Phase 2: specialized-ABI plan selection.
     // Runs AFTER the typed_abi clone sets so mutual exclusion is decidable;
@@ -3256,6 +3377,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         closure_arities: &closure_arities,
         closure_lengths: &closure_lengths,
         closure_arrow_functions: &closure_arrow_functions,
+        trusted_box_closures: &trusted_box_closures,
         closures: &closures,
         class_keys_init_data: &class_keys_init_data,
         class_header_image_inits: &class_header_image_inits,
@@ -3327,28 +3449,30 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             progress.phase(3, "object ready; releasing generated IR");
             return result;
         }
-        let units = llmod.render_codegen_units(n_units);
-        log::debug!(
-            "perry-codegen: split '{}' into {} codegen units",
-            hir.name,
-            units.len()
-        );
-        // #7154: dump the units. The comment above used to claim `PERRY_SAVE_LL`
-        // took the single-text path — it never did; this `return` fires before
-        // the `PERRY_SAVE_LL` write below. So `--trace llvm` silently emitted
-        // NOTHING for any module past `MIN_CALLABLES_TO_SPLIT`, i.e. exactly the
-        // largest modules, which is where a static IR audit
-        // (`scripts/gc_root_dominance_check.py`) most needs to look — a corpus
-        // that quietly omits its biggest members makes a clean verdict
-        // meaningless. One file per unit, not one concatenation: the units are
-        // already materialized here, so this adds no peak.
-        if let Ok(save_dir) = std::env::var("PERRY_SAVE_LL") {
-            for (i, unit) in units.iter().enumerate() {
-                let filename = format!("{}/{}.unit{}.ll", save_dir, module_prefix, i);
-                let _ = std::fs::write(&filename, unit);
+        loop {
+            let units = llmod.render_codegen_units(n_units);
+            log::debug!(
+                "perry-codegen: split '{}' into {} codegen units",
+                hir.name,
+                units.len()
+            );
+            // #7154: dump the units. The comment above used to claim
+            // `PERRY_SAVE_LL` took the single-text path — it never did; this
+            // return fires before the write below. One file per unit, not one
+            // concatenation: the units are already materialized here, so this
+            // adds no peak.
+            if let Ok(save_dir) = std::env::var("PERRY_SAVE_LL") {
+                for (i, unit) in units.iter().enumerate() {
+                    let filename = format!("{}/{}.unit{}.ll", save_dir, module_prefix, i);
+                    let _ = std::fs::write(&filename, unit);
+                }
+            }
+            match crate::linker::compile_units_to_object(&units, opts.target.as_deref()) {
+                Ok(object) => return Ok(object),
+                Err(error) if apply_rs4gc_budget_retry(&mut llmod, &error)? => continue,
+                Err(error) => return Err(error),
             }
         }
-        return crate::linker::compile_units_to_object(&units, opts.target.as_deref());
     }
 
     // exp/llvm-inprocess Phase 2: `PERRY_LLVM_INPROCESS=native` constructs
@@ -3356,27 +3480,58 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
     // textual); `=diff` builds both arms and diffs them. Unit-split and
     // emit_ir_only paths above stay textual (they fall into the in-process
     // *transport* under these values, so no clang subprocess either way).
-    if let Some(result) = try_native_construction(&llmod, opts.target.as_deref(), &module_prefix) {
+    if let Some(result) =
+        try_native_construction(&mut llmod, opts.target.as_deref(), &module_prefix)
+    {
         return result;
     }
 
-    let ll_text = llmod.to_ir();
-    log::debug!(
-        "perry-codegen: emitted {} bytes of LLVM IR for '{}' ({} interned strings)",
-        ll_text.len(),
-        hir.name,
-        strings.len()
-    );
-    // Save .ll files when PERRY_SAVE_LL=<dir> is set
-    if let Ok(save_dir) = std::env::var("PERRY_SAVE_LL") {
-        let filename = format!("{}/{}.ll", save_dir, module_prefix);
-        let _ = std::fs::write(&filename, &ll_text);
+    loop {
+        let ll_text = llmod.to_ir();
+        log::debug!(
+            "perry-codegen: emitted {} bytes of LLVM IR for '{}' ({} interned strings)",
+            ll_text.len(),
+            hir.name,
+            strings.len()
+        );
+        // Save .ll files when PERRY_SAVE_LL=<dir> is set
+        if let Ok(save_dir) = std::env::var("PERRY_SAVE_LL") {
+            let filename = format!("{}/{}.ll", save_dir, module_prefix);
+            let _ = std::fs::write(&filename, &ll_text);
+        }
+        if opts.emit_ir_only {
+            return Ok(ll_text.into_bytes());
+        }
+        match crate::linker::compile_ll_to_object(&ll_text, opts.target.as_deref()) {
+            Ok(object) => return Ok(object),
+            Err(error) if apply_rs4gc_budget_retry(&mut llmod, &error)? => continue,
+            Err(error) => return Err(error),
+        }
     }
-    if opts.emit_ir_only {
-        Ok(ll_text.into_bytes())
-    } else {
-        crate::linker::compile_ll_to_object(&ll_text, opts.target.as_deref())
-    }
+}
+
+/// Consume the typed post-RS4GC budget signal on text-transport paths. The
+/// native constructors have the same loop closer to their LLVM modules; text
+/// compilation returns through `linker`, so its retry belongs at the last
+/// point where the lowering-owned `LlModule` is still available.
+#[cfg(feature = "llvm-inprocess")]
+fn apply_rs4gc_budget_retry(
+    llmod: &mut crate::module::LlModule,
+    error: &anyhow::Error,
+) -> Result<bool> {
+    let Some(violations) = crate::inprocess::rs4gc_budget_retry(error) else {
+        return Ok(false);
+    };
+    crate::native_emit::apply_budget_spill_retry(llmod.functions_mut(), &violations)?;
+    Ok(true)
+}
+
+#[cfg(not(feature = "llvm-inprocess"))]
+fn apply_rs4gc_budget_retry(
+    _llmod: &mut crate::module::LlModule,
+    _error: &anyhow::Error,
+) -> Result<bool> {
+    Ok(false)
 }
 
 /// exp/llvm-inprocess: unit-split twin of [`try_native_construction`].
@@ -3418,7 +3573,7 @@ fn try_native_units(
 /// in-process mode is requested, so the flag can never silently no-op.
 #[cfg(feature = "llvm-inprocess")]
 fn try_native_construction(
-    llmod: &crate::module::LlModule,
+    llmod: &mut crate::module::LlModule,
     target: Option<&str>,
     module_prefix: &str,
 ) -> Option<Result<Vec<u8>>> {
@@ -3445,7 +3600,7 @@ fn try_native_construction(
 
 #[cfg(not(feature = "llvm-inprocess"))]
 fn try_native_construction(
-    _llmod: &crate::module::LlModule,
+    _llmod: &mut crate::module::LlModule,
     _target: Option<&str>,
     _module_prefix: &str,
 ) -> Option<Result<Vec<u8>>> {

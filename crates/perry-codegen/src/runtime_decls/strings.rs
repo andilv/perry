@@ -47,6 +47,10 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // second arg is the count. Returns a raw string handle.
     // (`crates/perry-runtime/src/string.rs::js_string_concat_chain`)
     module.declare_function("js_string_concat_chain", I64, &[I64, I32]);
+    // Self-append variant of the N-way chain. The first part is the binding's
+    // current owner value; the runtime may extend it in place when unique and
+    // otherwise writes the complete result in one allocation.
+    module.declare_function("js_string_append_chain", I64, &[I64, I32]);
 
     // In-place append for the `x = x + y` pattern. When `x` has
     // refcount=1 (unique owner), the runtime mutates in-place and
@@ -218,6 +222,11 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_register_closure_arity", VOID, &[PTR, I32]);
     module.declare_function("js_register_closure_length", VOID, &[PTR, I32]);
     module.declare_function("js_register_closure_arrow_function", VOID, &[PTR]);
+    module.declare_function(
+        "js_register_closure_trusted_direct",
+        VOID,
+        &[PTR, PTR, I32, I64],
+    );
     module.declare_function("js_register_closure_strict_function", VOID, &[PTR]);
     module.declare_function("js_register_closure_async_function", VOID, &[PTR]);
     module.declare_function("js_register_closure_generator_function", VOID, &[PTR]);
@@ -392,6 +401,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_object_keys", I64, &[I64]);
     module.declare_function("js_object_keys_value", I64, &[DOUBLE]);
     module.declare_function("js_for_in_keys_value", I64, &[DOUBLE]);
+    module.declare_function("js_for_in_keys_stable_value", I64, &[DOUBLE]);
     module.declare_function("js_is_finite", DOUBLE, &[DOUBLE]);
     module.declare_function("js_is_undefined_or_bare_nan", I32, &[DOUBLE]);
     module.declare_function("js_math_min_array", DOUBLE, &[I64]);
@@ -417,12 +427,24 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function(
         "js_private_brand_check",
         DOUBLE,
-        &[DOUBLE, DOUBLE, I32, PTR, I32],
+        &[DOUBLE, DOUBLE, I32, PTR, I32, I32, I32],
     );
     module.declare_function(
         "js_private_guard",
         DOUBLE,
         &[DOUBLE, DOUBLE, I32, PTR, I32, I32, I32],
+    );
+    module.declare_function("js_private_brand_add", DOUBLE, &[DOUBLE, I32]);
+    module.declare_function(
+        "js_private_field_add",
+        DOUBLE,
+        &[DOUBLE, I32, DOUBLE, DOUBLE],
+    );
+    module.declare_function("js_class_field_add", DOUBLE, &[DOUBLE, DOUBLE, DOUBLE]);
+    module.declare_function(
+        "js_class_computed_field_key",
+        DOUBLE,
+        &[DOUBLE, I32, PTR, I64],
     );
     module.declare_function("js_fs_to_unix_timestamp", DOUBLE, &[DOUBLE]);
     module.declare_function("js_fs_write_file_sync", I32, &[DOUBLE, DOUBLE]);
@@ -669,6 +691,18 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // based on the receiver's NaN-box tag at runtime. Used by IndexGet's
     // fallback path when codegen can't statically prove the receiver type.
     module.declare_function("js_dyn_index_get", DOUBLE, &[DOUBLE, DOUBLE]);
+    // #8655: guarded packed-array / dense Array-subclass read before the
+    // fully generic dynamic dispatcher. Used by unknown-receiver loop reads.
+    module.declare_function(
+        "js_packed_arraylike_index_get",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, PTR],
+    );
+    module.declare_function(
+        "js_packed_arraylike_loop_guard",
+        I32,
+        &[DOUBLE, DOUBLE, I32, PTR],
+    );
     // Issue #957: tag-aware dynamic index write. Used by `Expr::IndexUpdate`
     // codegen to write back the incremented value without rebuilding the
     // IndexSet dispatch tree. Routes to `js_array_set_index_or_string` for
@@ -995,6 +1029,8 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_box_alloc_bits", I64, &[I64]);
     module.declare_function("js_box_get_bits", I64, &[I64]);
     module.declare_function("js_box_set_bits", VOID, &[I64, I64]);
+    module.declare_function("js_box_get_bits_trusted", I64, &[I64]);
+    module.declare_function("js_box_set_bits_trusted_no_barrier", VOID, &[I64, I64]);
     module.declare_function("js_box_alloc", I64, &[DOUBLE]);
     module.declare_function("js_box_get", DOUBLE, &[I64]);
     module.declare_function("js_box_set", VOID, &[I64, DOUBLE]);
@@ -1284,11 +1320,13 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_instanceof_noncallable_rhs", DOUBLE, &[]);
     module.declare_function("js_register_class_extends_error", VOID, &[I32]);
     module.declare_function("js_register_class_extends_data_view", VOID, &[I32]);
+    module.declare_function("js_register_class_extends_typed_array", VOID, &[I32]);
     module.declare_function("js_register_class_id", VOID, &[I32]);
     // #1021 NestJS: surface Perry class names to V8 so `metatype.name`
     // is non-empty. Codegen emits one call per registered class id at
     // program init, mirroring `js_register_class_id`.
     module.declare_function("js_register_class_name", VOID, &[I32, PTR, I32]);
+    module.declare_function("js_register_class_length", VOID, &[I32, I32]);
     // Anon-shape class registration so `.constructor` reads on object
     // literals (`{ x: 1 }`) return the global `Object` constructor
     // instead of the synthetic class ref. Refs #968 / date-fns

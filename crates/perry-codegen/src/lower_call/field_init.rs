@@ -11,7 +11,7 @@ use perry_hir::{Expr, Stmt};
 
 use crate::expr::{lower_expr, FnCtx};
 use crate::nanbox::{double_literal, POINTER_MASK_I64};
-use crate::types::{DOUBLE, I32, I64};
+use crate::types::{DOUBLE, I32, I64, PTR};
 
 /// The field name a constructor-prologue statement assigns from a plain
 /// parameter, or `None` if the statement is not of that shape.
@@ -463,6 +463,22 @@ pub(crate) enum FieldInitMode {
     AfterRoot,
 }
 
+/// Whether a named public field initializer can populate the allocation's
+/// predeclared own slot through the ordinary by-name store.
+///
+/// A fresh ordinary instance already owns every named field in its class-key
+/// layout, so overwriting that slot has the same DefineField semantics as
+/// CreateDataProperty: an inherited setter cannot intercept an existing own
+/// data property. The exception is a constructor chain that can replace
+/// `this` (the replacement may be a Proxy), or a name whose chain contains an
+/// accessor/redeclaration and therefore has no stable global field index.
+/// Those cases must keep `js_class_field_add` and its full
+/// `[[DefineOwnProperty]]` behavior.
+fn can_store_predeclared_public_field(ctx: &FnCtx<'_>, class_name: &str, property: &str) -> bool {
+    !crate::lower_call::ctor_chain_can_replace_this(ctx.classes, class_name)
+        && crate::type_analysis::class_field_global_index(ctx, class_name, property).is_some()
+}
+
 pub(crate) fn apply_field_initializers_recursive(
     ctx: &mut FnCtx<'_>,
     class_name: &str,
@@ -638,8 +654,8 @@ pub(crate) fn apply_field_initializers_recursive(
                     .map(ctor_prologue_param_assigned_fields)
                     .unwrap_or_default()
             });
-        let mut init_pairs: Vec<(String, Expr)> = Vec::new();
-        let mut init_pairs_computed: Vec<(Expr, Expr)> = Vec::new();
+        let mut init_pairs: Vec<(String, Expr, bool)> = Vec::new();
+        let mut init_pairs_computed: Vec<(String, Expr)> = Vec::new();
         for field in &class_fields {
             // Wall 46: synthesized capture fields (`__perry_cap_*`) are populated
             // EXCLUSIVELY by the constructor's capture-param assignments — for a
@@ -673,18 +689,104 @@ pub(crate) fn apply_field_initializers_recursive(
                 None => Expr::Undefined,
             };
             match &field.key_expr {
-                Some(key) => init_pairs_computed.push((key.clone(), init)),
-                None => init_pairs.push((field.name.clone(), init)),
+                Some(_) => init_pairs_computed.push((field.name.clone(), init)),
+                None => init_pairs.push((field.name.clone(), init, field.is_private)),
             }
         }
-        if init_pairs.is_empty() && init_pairs_computed.is_empty() {
+        let (class_has_private_elements, class_has_private_brand) = ctx
+            .classes
+            .get(&class_name_in_chain)
+            .copied()
+            .map(|class| {
+                (
+                    class.has_private_instance_elements(),
+                    class.has_private_instance_brand(),
+                )
+            })
+            .unwrap_or((false, false));
+        if init_pairs.is_empty() && init_pairs_computed.is_empty() && !class_has_private_elements {
             continue;
         }
 
         // Temporarily swap class_stack so `this.field` in the init
         // resolves against the correct class.
         ctx.class_stack.push(class_name_in_chain.clone());
-        for (prop, init_expr) in init_pairs {
+        // Private methods/accessors are installed before fields and share a
+        // single per-class brand. Private fields are added individually below
+        // so their initializer ordering and duplicate check remain observable.
+        if class_has_private_brand {
+            let this_val = ctx
+                .this_stack
+                .last()
+                .cloned()
+                .map(|slot| ctx.block().load(DOUBLE, &slot))
+                .unwrap_or_else(|| double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)));
+            let class_id = ctx
+                .class_ids
+                .get(&class_name_in_chain)
+                .copied()
+                .unwrap_or(0)
+                .to_string();
+            ctx.block().call(
+                DOUBLE,
+                "js_private_brand_add",
+                &[(DOUBLE, &this_val), (I32, &class_id)],
+            );
+        }
+        for (prop, init_expr, is_private) in init_pairs {
+            // A scalar-replaced `new C()` has no heap receiver. Its fields are
+            // represented by the allocas in `ctx.scalar_replaced`, and the
+            // dummy `this_stack` slot exists only so ordinary constructor
+            // assignments can reach the scalar PropertySet fast path. DefineField
+            // lowering bypasses PropertySet, so route public named initializers
+            // to those allocas directly as well. Otherwise `js_class_field_add`
+            // receives the uninitialized dummy `this` value.
+            if !is_private {
+                if let Some(target_id) = ctx.scalar_ctor_target.last().copied() {
+                    let slot = ctx
+                        .scalar_replaced
+                        .get(&target_id)
+                        .and_then(|fields| fields.get(&prop))
+                        .cloned();
+                    let value = lower_expr(ctx, &init_expr)?;
+                    if let Some(slot) = slot {
+                        ctx.block().store(DOUBLE, &value, &slot);
+                        crate::expr::root_scalar_replaced_slot(ctx, &slot, &init_expr);
+                    }
+                    continue;
+                }
+            }
+            if is_private {
+                let value = lower_expr(ctx, &init_expr)?;
+                let this_val = ctx
+                    .this_stack
+                    .last()
+                    .cloned()
+                    .map(|slot| ctx.block().load(DOUBLE, &slot))
+                    .unwrap_or_else(|| {
+                        double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED))
+                    });
+                let key_idx = ctx.strings.intern(&prop);
+                let key_global = format!("@{}", ctx.strings.entry(key_idx).handle_global);
+                let key = ctx.block().load(DOUBLE, &key_global);
+                let class_id = ctx
+                    .class_ids
+                    .get(&class_name_in_chain)
+                    .copied()
+                    .unwrap_or(0)
+                    .to_string();
+                ctx.block().call(
+                    DOUBLE,
+                    "js_private_field_add",
+                    &[
+                        (DOUBLE, &this_val),
+                        (I32, &class_id),
+                        (DOUBLE, &key),
+                        (DOUBLE, &value),
+                    ],
+                );
+                continue;
+            }
             // Issue #263: arrow-function class fields like
             // `arrowField = () => this.value` need their reserved `this`
             // capture slot patched with the constructor's `this` AFTER
@@ -738,42 +840,125 @@ pub(crate) fn apply_field_initializers_recursive(
                 let key_handle_global = format!("@{}", ctx.strings.entry(key_idx).handle_global);
                 let blk = ctx.block();
                 let key_box = blk.load(DOUBLE, &key_handle_global);
-                let key_bits = blk.bitcast_double_to_i64(&key_box);
-                let key_raw = blk.and(I64, &key_bits, POINTER_MASK_I64);
-                let this_bits = blk.bitcast_double_to_i64(&this_val);
-                let this_raw = blk.and(I64, &this_bits, POINTER_MASK_I64);
-                blk.call_void(
-                    "js_object_set_field_by_name",
-                    &[(I64, &this_raw), (I64, &key_raw), (DOUBLE, &closure_val)],
-                );
+                if can_store_predeclared_public_field(ctx, &class_name_in_chain, &prop) {
+                    // The field is already an own key in the freshly allocated
+                    // exact class shape. Store by name so the runtime fills the
+                    // existing slot without `mark_object_dynamic_shape_unknown`.
+                    // This matters for the exact-shape guards emitted inside a
+                    // hot captures-`this` arrow: full DefineOwnProperty used to
+                    // change the receiver's shape before the arrow was ever
+                    // called, making every guard miss (#8693 / perform-ecs).
+                    let blk = ctx.block();
+                    let this_bits = blk.bitcast_double_to_i64(&this_val);
+                    let this_raw = blk.and(I64, &this_bits, POINTER_MASK_I64);
+                    let key_bits = blk.bitcast_double_to_i64(&key_box);
+                    let key_raw = blk.and(I64, &key_bits, POINTER_MASK_I64);
+                    blk.call_void(
+                        "js_object_set_field_by_name",
+                        &[(I64, &this_raw), (I64, &key_raw), (DOUBLE, &closure_val)],
+                    );
+                } else {
+                    ctx.block().call(
+                        DOUBLE,
+                        "js_class_field_add",
+                        &[
+                            (DOUBLE, &this_val),
+                            (DOUBLE, &key_box),
+                            (DOUBLE, &closure_val),
+                        ],
+                    );
+                }
                 continue;
             }
 
-            // Non-closure (or non-this-capturing closure) initializer:
-            // build a PropertySet { this, prop, init_expr } and lower
-            // through the existing path.
-            let set_expr = Expr::PropertySet {
-                object: Box::new(Expr::This),
-                property: prop,
-                value: Box::new(init_expr),
-            };
-            let _ = lower_expr(ctx, &set_expr)?;
+            // DefineField uses CreateDataProperty semantics: an inherited
+            // setter must not run, while a Proxy receiver must observe its
+            // `defineProperty` trap. `js_class_field_add` provides both, but it
+            // is a full [[DefineOwnProperty]] behind a handle scope — per field,
+            // per construction. #8648: `shapes.ts` pays it ~2M times (7 classes
+            // x ~2-3 fields x 120k constructions) and measured 3.14x.
+            //
+            // The two semantics coincide when neither difference can arise:
+            //
+            //   * no accessor anywhere on the chain -- `class_field_global_index`
+            //     already answers exactly this, returning `None` the moment an
+            //     accessor (or a re-declaration) appears on the chain
+            //     (`class_field_inline_guard`, #5654); and
+            //   * the receiver is provably the freshly allocated ordinary
+            //     instance -- no constructor on the chain hands back a
+            //     replacement `this` via `js_ctor_return_override`, which is the
+            //     only way a Proxy can become the field-initializer receiver.
+            //
+            // Both hold for an ordinary class, so lower through the optimized
+            // `PropertySet` path (inline shape precheck -> direct slot store)
+            // exactly as this did before #8630. Anything else keeps the full
+            // DefineField call.
+            if can_store_predeclared_public_field(ctx, &class_name_in_chain, &prop) {
+                let set_expr = Expr::PropertySet {
+                    object: Box::new(Expr::This),
+                    property: prop,
+                    value: Box::new(init_expr),
+                };
+                let _ = lower_expr(ctx, &set_expr)?;
+                continue;
+            }
+            let value = lower_expr(ctx, &init_expr)?;
+            let this_val = ctx
+                .this_stack
+                .last()
+                .cloned()
+                .map(|slot| ctx.block().load(DOUBLE, &slot))
+                .unwrap_or_else(|| double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)));
+            let key_idx = ctx.strings.intern(&prop);
+            let key_global = format!("@{}", ctx.strings.entry(key_idx).handle_global);
+            let key = ctx.block().load(DOUBLE, &key_global);
+            ctx.block().call(
+                DOUBLE,
+                "js_class_field_add",
+                &[(DOUBLE, &this_val), (DOUBLE, &key), (DOUBLE, &value)],
+            );
         }
 
-        // Computed-key fields: `[Parent.Symbol.X] = init` lowers to
-        // `this[Parent.Symbol.X] = init`. The key expression is evaluated
-        // at construction time per ES spec — `Object.defineProperty(this, k, …)`
-        // semantics through the IndexSet path. arrow-with-this-capture is
+        // Computed-key fields reuse the PropertyKey resolved once during
+        // ClassDefinitionEvaluation. DefineField uses CreateDataProperty
+        // semantics (including Proxy [[DefineOwnProperty]]), not assignment.
+        // arrow-with-this-capture is
         // unusual on a computed-key field; if it ever surfaces in real code
         // we extend this branch the same way the string-keyed loop above
         // does.
-        for (key_expr, init_expr) in init_pairs_computed {
-            let set_expr = Expr::IndexSet {
-                object: Box::new(Expr::This),
-                index: Box::new(key_expr),
-                value: Box::new(init_expr),
-            };
-            let _ = lower_expr(ctx, &set_expr)?;
+        for (key_slot, init_expr) in init_pairs_computed {
+            let value = lower_expr(ctx, &init_expr)?;
+            let this_val = ctx
+                .this_stack
+                .last()
+                .cloned()
+                .map(|slot| ctx.block().load(DOUBLE, &slot))
+                .unwrap_or_else(|| double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)));
+            let class_id = ctx
+                .class_ids
+                .get(&class_name_in_chain)
+                .copied()
+                .unwrap_or(0)
+                .to_string();
+            let key_idx = ctx.strings.intern(&key_slot);
+            let entry = ctx.strings.entry(key_idx);
+            let key_bytes = format!("@{}", entry.bytes_global);
+            let key_len = entry.byte_len.to_string();
+            let key = ctx.block().call(
+                DOUBLE,
+                "js_class_computed_field_key",
+                &[
+                    (DOUBLE, &this_val),
+                    (I32, &class_id),
+                    (PTR, &key_bytes),
+                    (I64, &key_len),
+                ],
+            );
+            ctx.block().call(
+                DOUBLE,
+                "js_class_field_add",
+                &[(DOUBLE, &this_val), (DOUBLE, &key), (DOUBLE, &value)],
+            );
         }
         ctx.class_stack.pop();
     }

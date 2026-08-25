@@ -58,6 +58,7 @@ pub const NATIVE_MODULES: &[&str] = &[
     // #6562: Bun FFI (C-ABI). The `bun:` prefix is part of the specifier
     // (unlike `node:`, which is stripped) — `import { dlopen } from "bun:ffi"`.
     "bun:ffi",
+    "ffi",        // node:ffi (the node: prefix is normalized away)
     "bun:sqlite", // Bun facade over Perry's native SQLite engine
     "node-cron",  // cron-style scheduler (npm node-cron; aliases `cron`)
     "nodemailer", // SMTP email sending
@@ -132,6 +133,7 @@ pub const NATIVE_MODULES: &[&str] = &[
     "perry/tui",      // terminal-UI framework
     "perry/yoga",     // Yoga flexbox layout
     "perry/ui",       // native UI (AppKit/UIKit/Win32/GTK4/…)
+    "perry/ios",      // iOS-only UIKit/Foundation Models APIs
     "perry/system",   // OS integration (keychain, notifications, …)
     "perry/plugin",   // compile-time plugin surface
     "perry/widget",   // home-screen widgets (WidgetKit/Glance)
@@ -242,6 +244,7 @@ pub const RUNTIME_ONLY_MODULES: &[&str] = &[
     "buffer",
     // #6562: bun:ffi is implemented entirely in perry-runtime.
     "bun:ffi",
+    "ffi",
     "assert",
     "assert/strict",
     "test",
@@ -265,6 +268,7 @@ pub const RUNTIME_ONLY_MODULES: &[&str] = &[
     // (registry + fs interception); no perry-stdlib surface needed.
     "perry",
     "perry/ui",
+    "perry/ios",
     "perry/system",
     "perry/widget",
     "perry/i18n",

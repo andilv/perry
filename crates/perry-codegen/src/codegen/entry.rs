@@ -122,7 +122,7 @@ fn emit_plugin_abi_shim(llmod: &mut LlModule, hir: &HirModule, module_prefix: &s
 /// (function(){ ... })()`), which is where the wrapped entry's top-level
 /// statements live. Assignments nested in conditionals or inner functions are
 /// deliberately skipped — those run conditionally/lazily, exactly as in Node.
-fn collect_entry_env_literals(init: &[perry_hir::Stmt]) -> Vec<(String, String)> {
+fn collect_entry_env_literals(hir: &HirModule) -> Vec<(String, String)> {
     use perry_hir::{Expr, Stmt};
 
     fn record(expr: &Expr, out: &mut Vec<(String, String)>) {
@@ -176,7 +176,9 @@ fn collect_entry_env_literals(init: &[perry_hir::Stmt]) -> Vec<(String, String)>
     }
 
     let mut out = Vec::new();
-    scan(init, &mut out, 0);
+    for stmt in super::entry_outline::logical_entry_stmts(hir) {
+        scan(std::slice::from_ref(stmt), &mut out, 0);
+    }
     out
 }
 
@@ -620,7 +622,7 @@ pub(super) fn compile_module_entry(
             // `collect_entry_env_literals`. The "NODE_ENV"/"production" string
             // handles are interned here and populated by the strings-init call
             // above (the entry body also references them, so they share slots).
-            for (name, value) in collect_entry_env_literals(&hir.init) {
+            for (name, value) in collect_entry_env_literals(hir) {
                 let name_idx = strings.intern(&name);
                 let value_idx = strings.intern(&value);
                 let name_global = format!("@{}", strings.entry(name_idx).handle_global);
@@ -783,6 +785,9 @@ pub(super) fn compile_module_entry(
             pending_labels: Vec::new(),
             classes,
             this_stack: Vec::new(),
+            super_called_stack: Vec::new(),
+            shared_super_scope_active: false,
+            lexical_this_uses_derived_binding: false,
             inline_ctor_return: Vec::new(),
             new_target_stack: Vec::new(),
             class_stack: Vec::new(),
@@ -822,6 +827,8 @@ pub(super) fn compile_module_entry(
             local_closure_func_ids: HashMap::new(),
             local_closure_param_counts: HashMap::new(),
             resolved_arrow_callback_targets: HashMap::new(),
+            trusted_box_captures: false,
+            trusted_box_capture_ptrs: HashMap::new(),
             local_func_ref_ids: HashMap::new(),
             option_object_locals: HashMap::new(),
             object_literal_locals: HashSet::new(),
@@ -865,6 +872,7 @@ pub(super) fn compile_module_entry(
             class_shape_slots: HashMap::new(),
             class_header_images: HashMap::new(),
             cached_lengths: HashMap::new(),
+            array_length_snapshots: HashMap::new(),
             bounded_index_pairs: Vec::new(),
             packed_f64_loop_facts: Vec::new(),
             masked_window_array_facts: Vec::new(),
@@ -947,6 +955,9 @@ pub(super) fn compile_module_entry(
             typed_f64_methods: &cross_module.typed_f64_methods,
             pshape_methods: &cross_module.pshape_methods,
             nonnegative_index_methods: &cross_module.nonnegative_index_methods,
+            trusted_array_param_handles: HashMap::new(),
+            versioned_indexed_loop_facts: Vec::new(),
+            stable_packed_loop_facts: Vec::new(),
             pshape_tower_routable: &cross_module.pshape_tower_routable,
             proven_this: None,
             typed_i32_methods: &cross_module.typed_i32_methods,
@@ -1159,6 +1170,9 @@ pub(super) fn compile_module_entry(
                     "0".to_string()
                 };
                 let has_stdlib = ctx.block().call(I32, "js_stdlib_has_active_handles", &[]);
+                let has_ffi_callbacks =
+                    ctx.block()
+                        .call(I32, "js_bun_ffi_has_active_threadsafe_callbacks", &[]);
                 // #591: TASK_QUEUE may carry a pending `.then` continuation
                 // that was queued by `js_run_stdlib_pump`'s resolution path
                 // in the SAME body iteration that already drained the inflight
@@ -1168,6 +1182,7 @@ pub(super) fn compile_module_entry(
                 let has_microtasks = ctx.block().call(I32, "js_microtasks_pending", &[]);
                 let any1 = ctx.block().or(I32, &has_timers, &has_callbacks);
                 let any2 = ctx.block().or(I32, &has_intervals, &has_stdlib);
+                let any2 = ctx.block().or(I32, &any2, &has_ffi_callbacks);
                 let any3 = ctx.block().or(I32, &any1, &any2);
                 let any4 = ctx.block().or(I32, &any3, &has_cron);
                 let any = ctx.block().or(I32, &any4, &has_microtasks);
@@ -1473,6 +1488,9 @@ pub(super) fn compile_module_entry(
             pending_labels: Vec::new(),
             classes,
             this_stack: Vec::new(),
+            super_called_stack: Vec::new(),
+            shared_super_scope_active: false,
+            lexical_this_uses_derived_binding: false,
             inline_ctor_return: Vec::new(),
             new_target_stack: Vec::new(),
             class_stack: Vec::new(),
@@ -1512,6 +1530,8 @@ pub(super) fn compile_module_entry(
             local_closure_func_ids: HashMap::new(),
             local_closure_param_counts: HashMap::new(),
             resolved_arrow_callback_targets: HashMap::new(),
+            trusted_box_captures: false,
+            trusted_box_capture_ptrs: HashMap::new(),
             local_func_ref_ids: HashMap::new(),
             option_object_locals: HashMap::new(),
             object_literal_locals: HashSet::new(),
@@ -1555,6 +1575,7 @@ pub(super) fn compile_module_entry(
             class_shape_slots: HashMap::new(),
             class_header_images: HashMap::new(),
             cached_lengths: HashMap::new(),
+            array_length_snapshots: HashMap::new(),
             bounded_index_pairs: Vec::new(),
             packed_f64_loop_facts: Vec::new(),
             masked_window_array_facts: Vec::new(),
@@ -1637,6 +1658,9 @@ pub(super) fn compile_module_entry(
             typed_f64_methods: &cross_module.typed_f64_methods,
             pshape_methods: &cross_module.pshape_methods,
             nonnegative_index_methods: &cross_module.nonnegative_index_methods,
+            trusted_array_param_handles: HashMap::new(),
+            versioned_indexed_loop_facts: Vec::new(),
+            stable_packed_loop_facts: Vec::new(),
             pshape_tower_routable: &cross_module.pshape_tower_routable,
             proven_this: None,
             typed_i32_methods: &cross_module.typed_i32_methods,

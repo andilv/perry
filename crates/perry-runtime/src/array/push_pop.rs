@@ -1,6 +1,5 @@
 //! push / pop / shift / unshift / set_length / delete + grow primitive.
 use super::*;
-use crate::arena::arena_alloc_gc;
 use std::ptr;
 
 /// `pop`/`shift`/`push`/`unshift` on a frozen array perform a `Set`/`Delete`
@@ -133,8 +132,38 @@ pub extern "C" fn js_array_grow(arr: *mut ArrayHeader, min_capacity: u32) -> *mu
         let old_size = array_byte_size(old_capacity as usize);
         let new_size = array_byte_size(new_capacity as usize);
 
-        // Allocate new from arena and copy old data.
-        let new_ptr = arena_alloc_gc(new_size, 8, crate::gc::GC_TYPE_ARRAY) as *mut ArrayHeader;
+        // A growth stub outlives the array operation: aliases can keep its
+        // address and `clean_arr_ptr` follows it on a later access. Therefore
+        // a non-moving source must not forward into the copying nursery. A
+        // minor does not trace a retained `GC_FLAG_FORWARDED` stub as a normal
+        // array object, so its payload forwarding word is outside ordinary
+        // layout and remembered-set scanning. It would neither move nor retain
+        // a young target; resetting from-space would leave the permanent old
+        // stub pointing at recycled bytes.
+        //
+        // For a young source, use the nursery only when the already-open block
+        // can satisfy the grow without collecting. If that allocation would
+        // collect, the source may be promoted while its handle is reloaded;
+        // birth the target old instead so the post-collection source cannot
+        // acquire the same old->young forwarding edge.
+        let old_header =
+            (arr as *mut u8).sub(crate::gc::GC_HEADER_SIZE) as *mut crate::gc::GcHeader;
+        let source_requires_old_target = (*old_header).gc_flags & crate::gc::GC_FLAG_TENURED != 0
+            || !matches!(
+                crate::arena::classify_heap_generation(arr as usize),
+                crate::arena::HeapGeneration::Nursery
+            );
+        let new_ptr = if source_requires_old_target {
+            crate::arena::arena_alloc_gc_old_born_tenured(new_size, 8, crate::gc::GC_TYPE_ARRAY)
+        } else {
+            let young =
+                crate::arena::arena_alloc_gc_no_collect(new_size, 8, crate::gc::GC_TYPE_ARRAY);
+            if young.is_null() {
+                crate::arena::arena_alloc_gc_old_born_tenured(new_size, 8, crate::gc::GC_TYPE_ARRAY)
+            } else {
+                young
+            }
+        } as *mut ArrayHeader;
         let arr = arr_handle.get_raw_mut_ptr::<ArrayHeader>();
         // GC_STORE_AUDIT(BARRIERED): array growth copy transfers layout and replays write barriers below.
         ptr::copy_nonoverlapping(arr as *const u8, new_ptr as *mut u8, old_size);
@@ -945,7 +974,36 @@ pub extern "C" fn js_array_set_length(arr: *mut ArrayHeader, new_length: f64) {
             // index 0 cannot remain observable after its getter truncates the
             // array to zero. If a non-configurable index blocks deletion, keep
             // that index and restore length to index + 1 per §10.4.2.4.
-            for i in (n..cur).rev() {
+            //
+            // A large logical extension does not allocate its holes (see the
+            // growth branch below), so do not walk those holes when the length
+            // is restored. Far materialized indices live in the named-property
+            // table. Delete them first, in the same descending order required
+            // by ArraySetLength, then visit the allocated dense prefix.
+            let capacity = (*arr).capacity;
+            if cur > capacity {
+                let mut sparse_indices: Vec<u32> = array_named_property_names(arr, false)
+                    .into_iter()
+                    .filter_map(|name| {
+                        let index = name.parse::<u32>().ok()?;
+                        (index != u32::MAX
+                            && index >= n.max(capacity)
+                            && index < cur
+                            && index.to_string() == name)
+                            .then_some(index)
+                    })
+                    .collect();
+                sparse_indices.sort_unstable_by(|a, b| b.cmp(a));
+                sparse_indices.dedup();
+                for i in sparse_indices {
+                    if js_array_delete(arr, i) == 0 {
+                        (*arr).length = i + 1;
+                        refresh_array_numeric_layout(arr);
+                        return;
+                    }
+                }
+            }
+            for i in (n..cur.min(capacity)).rev() {
                 if js_array_delete(arr, i) == 0 {
                     (*arr).length = i + 1;
                     refresh_array_numeric_layout(arr);
@@ -955,6 +1013,15 @@ pub extern "C" fn js_array_set_length(arr: *mut ArrayHeader, new_length: f64) {
             (*arr).length = n;
             refresh_array_numeric_layout(arr);
         } else if n > cur {
+            // Growing `length` creates holes conceptually; it must not allocate
+            // a dense backing store proportional to the requested length.
+            // Test262's descriptor probe writes 2^32-1 here. Keep large sparse
+            // extensions logical and let later indexed writes choose storage.
+            if n > (*arr).capacity && n > 1_000_000 {
+                (*arr).length = n;
+                refresh_array_numeric_layout(arr);
+                return;
+            }
             // Extend: pad with TAG_HOLE. Past-capacity extensions go
             // through `js_array_grow` which installs a forwarding pointer at
             // the OLD location (issue #233 mechanism), so the caller's stale

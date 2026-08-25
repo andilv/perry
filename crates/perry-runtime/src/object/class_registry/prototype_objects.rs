@@ -38,35 +38,51 @@ pub(crate) fn ensure_function_prototype_object(
         return existing;
     }
 
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let func_handle = scope.root_nanbox_f64(func_value);
     let proto = js_object_alloc(0, 0);
     if proto.is_null() {
         return proto;
     }
+    let proto_handle = scope.root_raw_mut_ptr(proto);
 
-    let constructor_key =
-        crate::string::js_string_from_bytes(b"constructor".as_ptr(), "constructor".len() as u32);
-    js_object_set_field_by_name(proto, constructor_key, func_value);
-    set_builtin_property_attrs(
-        proto as usize,
-        "constructor".to_string(),
-        PropertyAttrs::new(true, false, true),
-    );
+    let constructor_key = scope.root_string_ptr(crate::string::js_string_from_bytes(
+        b"constructor".as_ptr(),
+        "constructor".len() as u32,
+    ));
+    proto_handle.with_mut_ptr::<ObjectHeader, _>(|proto| {
+        constructor_key.with_const_ptr::<crate::StringHeader, _>(|key| {
+            js_object_set_field_by_name(proto, key, func_handle.get_nanbox_f64())
+        })
+    });
+    proto_handle.with_mut_ptr::<ObjectHeader, _>(|proto| {
+        set_builtin_property_attrs(
+            proto as usize,
+            "constructor".to_string(),
+            PropertyAttrs::new(true, false, true),
+        )
+    });
 
     if let Some(object_proto_bits) = global_object_prototype_bits() {
-        super::super::prototype_chain::object_set_static_prototype(
-            proto as usize,
-            object_proto_bits,
-        );
+        let object_proto = scope.root_nanbox_u64(object_proto_bits);
+        proto_handle.with_mut_ptr::<ObjectHeader, _>(|proto| {
+            super::super::prototype_chain::object_set_static_prototype(
+                proto as usize,
+                object_proto.get_nanbox_u64(),
+            )
+        });
     }
 
-    class_prototype_object_root_store(class_id, proto);
+    proto_handle.with_mut_ptr::<ObjectHeader, _>(|proto| {
+        class_prototype_object_root_store(class_id, proto)
+    });
 
     // #5024: methods registered before the prototype object materialized
     // (`F.prototype.m = v` typically runs long before any reflective
     // `F.prototype` read) live only in CLASS_PROTOTYPE_METHODS. Backfill
     // them as ordinary own properties so enumeration sees them; later
     // registrations write through via class_prototype_method_root_store.
-    let registered: Vec<(String, u64)> = {
+    let registered_bits: Vec<(String, u64)> = {
         CLASS_PROTOTYPE_METHODS.with(|table| {
             let guard = table.read().unwrap();
             guard
@@ -76,9 +92,17 @@ pub(crate) fn ensure_function_prototype_object(
                 .unwrap_or_default()
         })
     };
-    for (name, value_bits) in registered {
+    // The copied side-table values are no longer themselves scanner roots.
+    // Root the whole snapshot before the first mirrored property can allocate.
+    let registered: Vec<_> = registered_bits
+        .into_iter()
+        .map(|(name, value_bits)| (name, scope.root_nanbox_u64(value_bits)))
+        .collect();
+    for (name, value) in registered {
         let enumerable = class_prototype_method_is_enumerable(class_id, &name);
-        unsafe { mirror_prototype_method_on_object(proto, &name, value_bits, enumerable) };
+        proto_handle.with_mut_ptr::<ObjectHeader, _>(|proto| unsafe {
+            mirror_prototype_method_on_object(proto, &name, value.get_nanbox_u64(), enumerable)
+        });
     }
 
     // #5477: the bound `events.EventEmitter` / `EventEmitterAsyncResource` export's
@@ -95,17 +119,21 @@ pub(crate) fn ensure_function_prototype_object(
     // (which arms), so binaries without module imports link neither the
     // probe nor the EventEmitter prototype machinery.
     if let Some(ops) = super::super::nm_namespace_ops() {
-        unsafe { (ops.ee_prototype_install)(func_value, proto) };
+        proto_handle.with_mut_ptr::<ObjectHeader, _>(|proto| unsafe {
+            (ops.ee_prototype_install)(func_handle.get_nanbox_f64(), proto)
+        });
     }
 
-    let func_bits = func_value.to_bits();
+    let func_bits = func_handle.get_nanbox_u64();
     if (func_bits >> 48) == 0x7FFD {
         let func_ptr = (func_bits & crate::value::POINTER_MASK) as usize;
         if func_ptr != 0 {
             crate::closure::closure_set_dynamic_prop(
                 func_ptr,
                 "prototype",
-                crate::value::js_nanbox_pointer(proto as i64),
+                proto_handle.with_mut_ptr::<ObjectHeader, _>(|proto| {
+                    crate::value::js_nanbox_pointer(proto as i64)
+                }),
             );
             set_builtin_property_attrs(
                 func_ptr,
@@ -115,7 +143,7 @@ pub(crate) fn ensure_function_prototype_object(
         }
     }
 
-    proto
+    proto_handle.with_mut_ptr::<ObjectHeader, _>(|proto| proto)
 }
 
 per_test_global! {
@@ -396,6 +424,47 @@ unsafe fn resolve_proto_chain_field_inner(
                 unsafe { super::super::field_get_set::own_data_field_by_name(decl_proto, key) }
             {
                 if !value.is_undefined() {
+                    // Declared methods are mirrored onto the template's shared
+                    // reflective prototype. For a ClassExprFresh instance,
+                    // substitute the method closure owned by this particular
+                    // class evaluation; otherwise separate factory calls share
+                    // a lexical private brand and cross-calls incorrectly pass.
+                    if let Some(receiver) = receiver {
+                        let key_ptr = crate::string::string_data(key);
+                        let key_len = (*key).byte_len as usize;
+                        if let Ok(name) =
+                            std::str::from_utf8(std::slice::from_raw_parts(key_ptr, key_len))
+                        {
+                            let name = name.to_string();
+                            let scope = crate::gc::RuntimeHandleScope::new();
+                            let value = scope.root_nanbox_u64(value.bits());
+                            let receiver = scope.root_heap_word_u64(receiver.to_bits());
+                            if super::super::native_module::class_has_own_method(cid, &name)
+                                && value.get_nanbox_u64()
+                                    == super::super::native_module::class_prototype_method_value_for_name(
+                                        cid, &name,
+                                    )
+                                    .to_bits()
+                            {
+                                let receiver = f64::from_bits(receiver.get_heap_word_u64());
+                                if let Some(brand) =
+                                    super::super::private_evaluation_brand_value(receiver)
+                                {
+                                    let brand_obj = crate::value::JSValue::from_bits(brand.to_bits())
+                                        .as_pointer::<ObjectHeader>();
+                                    if !brand_obj.is_null()
+                                        && js_object_get_class_id(brand_obj) == cid
+                                    {
+                                        let method = super::super::native_module::class_evaluation_method_value_for_name(
+                                            cid, &name, brand,
+                                        );
+                                        return Some(JSValue::from_bits(method.to_bits()));
+                                    }
+                                }
+                            }
+                            return Some(JSValue::from_bits(value.get_nanbox_u64()));
+                        }
+                    }
                     return Some(value);
                 }
             }
@@ -536,8 +605,13 @@ pub(crate) unsafe fn nm_ee_prototype_install(
     func_value: f64,
     proto: *mut crate::object::ObjectHeader,
 ) {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let func_value = scope.root_nanbox_f64(func_value);
+    let proto = scope.root_raw_mut_ptr(proto);
     if let Some((module, method)) =
-        super::super::native_module::bound_native_callable_module_and_method(func_value)
+        super::super::native_module::bound_native_callable_module_and_method(
+            func_value.get_nanbox_f64(),
+        )
     {
         if module.trim_start_matches("node:") == "events"
             && matches!(
@@ -545,7 +619,9 @@ pub(crate) unsafe fn nm_ee_prototype_install(
                 "EventEmitter" | "EventEmitterAsyncResource"
             )
         {
-            crate::node_stream::install_event_emitter_prototype_methods(proto);
+            proto.with_mut_ptr::<crate::object::ObjectHeader, _>(|proto| {
+                crate::node_stream::install_event_emitter_prototype_methods(proto)
+            });
         }
     }
 }

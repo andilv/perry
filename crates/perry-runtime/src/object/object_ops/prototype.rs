@@ -87,6 +87,20 @@ pub extern "C" fn js_object_create(proto_value: f64) -> f64 {
         return f64::from_bits((obj as u64) | POINTER_TAG);
     }
 
+    // Integer-indexed exotic objects are valid prototypes even though their
+    // TypedArrayHeader cannot be modeled as an ObjectHeader-backed synthetic
+    // class prototype.  Preserve the exact object identity in the ordinary
+    // per-instance prototype side table so its [[Set]] intercepts canonical
+    // numeric keys on descendants.
+    if crate::typedarray_props::typed_array_addr_from_value(proto_value).is_some() {
+        let obj = js_object_alloc(0, 0);
+        crate::object::prototype_chain::object_set_static_prototype(
+            obj as usize,
+            proto_value.to_bits(),
+        );
+        return f64::from_bits((obj as u64) | POINTER_TAG);
+    }
+
     let mut class_id: u32 = 0;
     let proto_bits = proto_value.to_bits();
     if (proto_bits & 0xFFFF_0000_0000_0000) == POINTER_TAG {
@@ -285,6 +299,15 @@ pub extern "C" fn js_object_get_prototype_of(obj_value: f64) -> f64 {
         None
     };
     let buffer_backed_prototype = |addr: usize| -> Option<f64> {
+        // A native ArrayBuffer/SharedArrayBuffer constructed with a distinct
+        // newTarget (subclassing / Reflect.construct) records that custom
+        // [[Prototype]] in the same side table as typed arrays. Honor it before
+        // falling back to the intrinsic buffer prototype.
+        if let Some(proto_bits) = super::super::prototype_chain::object_static_prototype(addr) {
+            if proto_bits != crate::value::TAG_NULL {
+                return Some(f64::from_bits(proto_bits));
+            }
+        }
         let name = if crate::buffer::is_array_buffer(addr) {
             "ArrayBuffer"
         } else if crate::buffer::is_shared_array_buffer(addr) {
@@ -338,6 +361,17 @@ pub extern "C" fn js_object_get_prototype_of(obj_value: f64) -> f64 {
     };
     if top16 == 0x7FFE {
         let class_id = (bits & 0xFFFF_FFFF) as u32;
+        if super::super::class_prototype_ref_id(obj_value).is_none() {
+            // A class whose heritage is a runtime function value has no Perry
+            // parent class id. Its constructor's [[Prototype]] is that exact
+            // function object (not Function.prototype), as observed by
+            // Object.getPrototypeOf(D) and static `super` lookup.
+            let dynamic_parent = super::super::js_get_dynamic_parent_value(class_id);
+            let parent_value = crate::value::JSValue::from_bits(dynamic_parent.to_bits());
+            if !parent_value.is_undefined() && !parent_value.is_null() {
+                return dynamic_parent;
+            }
+        }
         if let Some(parent_id) = get_parent_class_id(class_id) {
             // #8343 followup: `NATIVE_MODULE_CLASS_ID` (0xFFFFFFFE) is a
             // sentinel, not a real class. A prior `Object.create(proto)` whose

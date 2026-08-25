@@ -23,6 +23,11 @@ pub unsafe extern "C" fn js_register_class_id(class_id: u32) {
 /// from `v8::Function::builder(...)` would collide every module under the
 /// same token. (#1021.)
 pub static CLASS_NAMES: RwLock<Option<HashMap<u32, String>>> = RwLock::new(None);
+/// Maps `class_id → ECMAScript constructor length` (formal parameters before
+/// the first default/rest parameter). Class refs are integer immediates rather
+/// than heap Function objects, so their own `length` property is reified from
+/// this table alongside `CLASS_NAMES`.
+pub static CLASS_LENGTHS: RwLock<Option<HashMap<u32, u32>>> = RwLock::new(None);
 
 /// Register the user-visible name of a class so the V8 bridge can label
 /// the V8-side wrapper for nice `metatype.name` reads. Idempotent.
@@ -55,6 +60,22 @@ pub unsafe extern "C" fn js_register_class_name(class_id: u32, name_ptr: *const 
 pub fn class_name_for_id(class_id: u32) -> Option<String> {
     let guard = CLASS_NAMES.read().ok()?;
     guard.as_ref()?.get(&class_id).cloned()
+}
+
+#[no_mangle]
+pub extern "C" fn js_register_class_length(class_id: u32, length: u32) {
+    if class_id == 0 {
+        return;
+    }
+    let mut guard = CLASS_LENGTHS.write().unwrap();
+    if guard.is_none() {
+        *guard = Some(HashMap::new());
+    }
+    guard.as_mut().unwrap().insert(class_id, length);
+}
+
+pub fn class_length_for_id(class_id: u32) -> Option<u32> {
+    CLASS_LENGTHS.read().ok()?.as_ref()?.get(&class_id).copied()
 }
 
 /// Whether dynamic-dispatch miss diagnostics are enabled (`PERRY_DISPATCH_DIAG`,
@@ -165,6 +186,19 @@ pub(crate) fn identify_global_builtin_constructor(func_value: f64) -> Option<&'s
         let is_global_builtin_func = func_ptr
             == global_this_builtin_noop_thunk as *const u8 as usize
             || func_ptr == typed_array_constructor_call_thunk as *const u8 as usize
+            // ArrayBuffer / SharedArrayBuffer / DataView carry the shared
+            // construct-only call thunk (populate.rs). When one is captured into
+            // a variable and constructed — `const D = DataView; new D(buf)`,
+            // `Reflect.construct(DataView, …)`, `class X extends DataView` — the
+            // dynamic-`new` path lands here and must recognize the thunk so the
+            // singleton walk recovers the name and construct.rs's
+            // "ArrayBuffer"/"SharedArrayBuffer"/"DataView" arms build it, instead
+            // of falling through to invoke the bare-call thunk (which throws
+            // "Constructor requires 'new'"). Minified bundles capture these
+            // globals into locals pervasively (the Claude Code cli.js bundle
+            // fails at module init without this). Regression from the thunk swap
+            // in 06e1ab349 — before it these carried the recognized noop thunk.
+            || func_ptr == construct_only_builtin_call_thunk as *const u8 as usize
             // #4102: `Array`/`Object`/`Date` constructor *values* carry their own
             // coercion thunks (not the shared noop thunk), so the dynamic
             // `instanceof` / reflective `@@hasInstance` path could not recover

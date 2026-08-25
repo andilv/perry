@@ -202,6 +202,7 @@ mod class_object_props;
 mod crypto_key;
 pub(crate) mod enumeration;
 mod field_ops;
+mod for_in_stable;
 mod get_field_by_name;
 #[cfg(test)]
 mod get_field_by_name_probe_tests;
@@ -248,6 +249,7 @@ pub(crate) use accessors::{
     ordinary_object_prototype_property_value, own_data_field_by_name,
     primitive_builtin_prototype_property, primitive_object_prototype_accessor, string_index_value,
 };
+pub(crate) use class_object_props::class_object_prototype_value;
 pub(crate) use crypto_key::{
     crypto_key_property_value, CLASS_ID_BOXED_BIGINT, CLASS_ID_BOXED_BOOLEAN,
     CLASS_ID_BOXED_NUMBER, CLASS_ID_BOXED_STRING, CLASS_ID_BOXED_SYMBOL,
@@ -265,6 +267,7 @@ pub use field_ops::{
     js_object_set_field_by_index, js_object_set_field_f64, js_object_set_keys, js_object_to_value,
     js_value_to_object,
 };
+pub use for_in_stable::js_for_in_keys_stable_value;
 pub use get_field_by_name::js_object_get_field_by_name;
 pub(crate) use get_field_by_name_tail::get_field_by_name_object_tail;
 pub(super) use has_property::native_module_own_field_by_key;
@@ -276,13 +279,18 @@ pub use has_property::{js_in_operator, js_object_has_property};
 #[cfg(test)]
 pub(crate) use ic_miss::primitive_proto_method_name_static;
 pub(crate) use ic_miss::{
-    bind_primitive_proto_method_static, is_array_method_value_name, set_method_value_name,
-    stamp_private_evaluation_brand, timer_handle_method_name_static,
+    bind_primitive_proto_method_static, is_array_method_value_name, private_evaluation_brand_value,
+    private_lexical_brand_pop, private_lexical_brand_push, private_lexical_brand_stack_restore,
+    private_lexical_brand_stack_savepoint, private_member_access_hints_restore,
+    private_member_access_hints_savepoint, private_member_call_by_name, private_member_get_by_name,
+    private_member_set_by_name, scan_private_lexical_brand_roots_mut, set_method_value_name,
+    stamp_private_evaluation_brand, take_private_method_call_hint, take_private_method_owner_hint,
+    timer_handle_method_name_static,
 };
 pub use ic_miss::{
-    js_object_get_field_by_name_f64, js_object_get_field_by_property_id_f64,
-    js_object_get_field_ic_miss, js_object_set_field_by_property_id, js_private_brand_check,
-    js_private_guard, PicCache, PIC_CACHE_WORDS,
+    js_class_field_add, js_object_get_field_by_name_f64, js_object_get_field_by_property_id_f64,
+    js_object_get_field_ic_miss, js_object_set_field_by_property_id, js_private_brand_add,
+    js_private_brand_check, js_private_field_add, js_private_guard, PicCache, PIC_CACHE_WORDS,
 };
 
 #[cfg(test)]

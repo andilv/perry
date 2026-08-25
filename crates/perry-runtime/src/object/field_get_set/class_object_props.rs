@@ -5,18 +5,130 @@
 
 use super::*;
 
+const CLASS_EVALUATION_PROTOTYPE_KEY: &[u8] = b"#<perry:class-evaluation-prototype>";
+
+/// Materialize the distinct prototype object created by one evaluation of a
+/// heap class expression/declaration. Template class ids still own dispatch,
+/// but observable method identity and private-name closures belong to the
+/// evaluation, not to that shared template.
+unsafe fn class_evaluation_prototype_value(obj: *const ObjectHeader) -> f64 {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let class = scope.root_raw_mut_ptr(obj as *mut ObjectHeader);
+    let hidden_key = crate::string::js_string_from_bytes(
+        CLASS_EVALUATION_PROTOTYPE_KEY.as_ptr(),
+        CLASS_EVALUATION_PROTOTYPE_KEY.len() as u32,
+    );
+    let hidden_key = scope.root_string_ptr(hidden_key);
+    let existing = class.with_mut_ptr::<ObjectHeader, _>(|class| {
+        hidden_key
+            .with_const_ptr::<crate::StringHeader, _>(|key| own_data_field_by_name(class, key))
+    });
+    if let Some(existing) = existing.filter(|value| !value.is_undefined()) {
+        return f64::from_bits(existing.bits());
+    }
+
+    let class_id = class.with_mut_ptr::<ObjectHeader, _>(|class| (*class).class_id);
+    let proto = scope.root_raw_mut_ptr(js_object_alloc(class_id, 0));
+
+    let constructor_key = crate::string::js_string_from_bytes(b"constructor".as_ptr(), 11);
+    let constructor_key = scope.root_string_ptr(constructor_key);
+    let class_value = class
+        .with_mut_ptr::<ObjectHeader, _>(|class| crate::value::js_nanbox_pointer(class as i64));
+    proto.with_mut_ptr::<ObjectHeader, _>(|proto| {
+        constructor_key.with_const_ptr::<crate::StringHeader, _>(|key| {
+            js_object_set_field_by_name(proto, key, class_value)
+        });
+        set_builtin_property_attrs(
+            proto as usize,
+            "constructor".to_string(),
+            PropertyAttrs::new(true, false, true),
+        );
+    });
+
+    for name in super::super::class_registry::class_decl_prototype_method_names(class_id) {
+        let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+        let key = scope.root_string_ptr(key);
+        let class_value = class
+            .with_mut_ptr::<ObjectHeader, _>(|class| crate::value::js_nanbox_pointer(class as i64));
+        let method = super::super::native_module::class_evaluation_method_value_for_name(
+            class_id,
+            &name,
+            class_value,
+        );
+        proto.with_mut_ptr::<ObjectHeader, _>(|proto| {
+            key.with_const_ptr::<crate::StringHeader, _>(|key| {
+                js_object_set_field_by_name(proto, key, method)
+            });
+            set_builtin_property_attrs(proto as usize, name, PropertyAttrs::new(true, false, true));
+        });
+    }
+
+    // Each evaluation owns a distinct prototype object, and that object's
+    // [[Prototype]] follows this evaluation's pinned heritage edge rather than
+    // the template-id (last-wins) parent table.
+    let pinned_parent = class.with_const_ptr::<ObjectHeader, _>(|class| {
+        super::super::class_registry::class_object_pinned_parent(class)
+    });
+    let parent_proto = match pinned_parent {
+        Some(parent) if parent.to_bits() == crate::value::TAG_NULL => Some(crate::value::TAG_NULL),
+        Some(parent) => {
+            let parent = scope.root_nanbox_f64(parent);
+            let parent_value = parent.get_nanbox_f64();
+            if super::super::class_registry::is_class_object_value(parent_value) {
+                let parent_obj =
+                    JSValue::from_bits(parent_value.to_bits()).as_pointer::<ObjectHeader>();
+                (!parent_obj.is_null())
+                    .then(|| class_evaluation_prototype_value(parent_obj).to_bits())
+            } else if let Some(parent_id) = super::super::class_ref_id(parent_value) {
+                Some(super::super::class_registry::class_decl_prototype_value(parent_id).to_bits())
+            } else {
+                let parent_js = JSValue::from_bits(parent_value.to_bits());
+                if parent_js.is_pointer()
+                    && crate::closure::is_closure_ptr(parent_js.as_pointer::<u8>() as usize)
+                {
+                    let value = crate::closure::closure_get_dynamic_prop(
+                        parent_js.as_pointer::<u8>() as usize,
+                        "prototype",
+                    );
+                    let value_js = JSValue::from_bits(value.to_bits());
+                    if value.to_bits() == crate::value::TAG_NULL {
+                        Some(crate::value::TAG_NULL)
+                    } else {
+                        value_js.is_pointer().then_some(value.to_bits())
+                    }
+                } else {
+                    None
+                }
+            }
+        }
+        None => super::super::class_registry::global_object_prototype_bits(),
+    };
+    if let Some(parent_proto) = parent_proto {
+        let parent_proto = scope.root_heap_word_u64(parent_proto);
+        proto.with_mut_ptr::<ObjectHeader, _>(|proto| {
+            super::super::prototype_chain::object_set_static_prototype(
+                proto as usize,
+                parent_proto.get_heap_word_u64(),
+            )
+        });
+    }
+
+    let proto_value = proto
+        .with_mut_ptr::<ObjectHeader, _>(|proto| crate::value::js_nanbox_pointer(proto as i64));
+    class.with_mut_ptr::<ObjectHeader, _>(|class| {
+        hidden_key.with_const_ptr::<crate::StringHeader, _>(|key| {
+            js_object_set_field_by_name(class, key, proto_value)
+        })
+    });
+    proto.with_mut_ptr::<ObjectHeader, _>(|proto| crate::value::js_nanbox_pointer(proto as i64))
+}
+
 /// #4949: heap class-expression values (`ClassExprFresh`) are real
 /// OBJECT_TYPE_CLASS objects, not INT32 class refs. Their `.prototype`
 /// read must still expose the live declared-class prototype object so
 /// tsc/tslib decorator code can inspect and mutate method descriptors.
-pub(super) unsafe fn class_object_prototype_value(obj: *const ObjectHeader) -> JSValue {
-    let class_id = (*obj).class_id;
-    let value = super::super::class_registry::class_decl_prototype_value(class_id);
-    if value.to_bits() == crate::value::TAG_UNDEFINED {
-        let value = super::super::class_prototype_ref_value(class_id);
-        return JSValue::from_bits(value.to_bits());
-    }
-    JSValue::from_bits(value.to_bits())
+pub(crate) unsafe fn class_object_prototype_value(obj: *const ObjectHeader) -> JSValue {
+    JSValue::from_bits(class_evaluation_prototype_value(obj).to_bits())
 }
 
 /// Resolve `.name` for an `OBJECT_TYPE_CLASS` heap object. An explicit

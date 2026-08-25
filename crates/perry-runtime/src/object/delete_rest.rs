@@ -97,6 +97,22 @@ pub extern "C" fn js_object_delete_field(
                 key,
             );
         }
+        // ArrayBuffer / SharedArrayBuffer / DataView are registered
+        // BufferHeaders with ordinary named expandos.  They must not fall
+        // through to the ObjectHeader keys-array walk.
+        if crate::buffer::is_registered_buffer(obj as usize) {
+            if let Some(name) = super::has_own_helpers::str_from_string_header(key) {
+                if let Some(attrs) = get_property_attrs(obj as usize, name) {
+                    if !attrs.configurable() {
+                        return 0;
+                    }
+                }
+                crate::buffer::buffer_delete_own_prop(obj as usize, name);
+                super::clear_accessor_descriptor(obj as usize, name);
+                super::clear_property_attrs(obj as usize, name);
+            }
+            return 1;
+        }
         if let Some(result) = super::arguments_object_before_delete(obj, key) {
             return result;
         }
@@ -115,6 +131,12 @@ pub extern "C" fn js_object_delete_field(
                     return 0;
                 }
                 super::exotic_expando::value_remove(kind, obj as usize, name);
+                if kind == ExoticKind::Error {
+                    crate::error::js_error_delete_builtin_own_property(
+                        obj as *mut crate::error::ErrorHeader,
+                        name,
+                    );
+                }
                 super::clear_accessor_descriptor(obj as usize, name);
                 super::clear_property_attrs(obj as usize, name);
             }
@@ -215,6 +237,12 @@ pub extern "C" fn js_object_delete_field(
                         return 0;
                     }
                 }
+                // Deleting an accessor from a class/Object prototype changes
+                // method resolution for this key just like installing it.
+                super::descriptor_state::disable_inline_guards_for_descriptor_target(
+                    obj as usize,
+                    name,
+                );
                 super::clear_accessor_descriptor(obj as usize, name);
                 super::clear_property_attrs(obj as usize, name);
                 // defineProperty may ALSO have planted a keys_array
@@ -242,9 +270,12 @@ pub extern "C" fn js_object_delete_field(
             if let Some(name) = super::has_own_helpers::str_from_string_header(key) {
                 if name != "constructor"
                     && (super::class_registry::class_own_accessor_ptrs(cid, name).is_some()
-                        || super::native_module::class_has_own_method(cid, name))
+                        || super::native_module::class_has_own_method(cid, name)
+                        || super::class_registry::lookup_own_prototype_method(cid, name).is_some())
                 {
                     super::class_registry::class_mark_key_deleted(cid, name);
+                    super::class_registry::invalidate_class_prototype_fast_guards_for_method(name);
+                    crate::typed_feedback::invalidate_method_change(cid);
                     // Accessors have no keys_array entry, so the scan below is a
                     // vacuous success for them; methods DO, so fall through to
                     // remove it. Either way, don't early-return.
@@ -286,6 +317,12 @@ pub extern "C" fn js_object_delete_field(
                     return 0;
                 }
             }
+            // A configurable data method on a class/Object prototype is about
+            // to disappear. Retire only this name's direct-method guards.
+            super::descriptor_state::disable_inline_guards_for_descriptor_target(
+                obj as usize,
+                name,
+            );
         }
 
         // Proper delete: shift remaining keys + values down by one, then
@@ -401,6 +438,20 @@ fn delete_receiver_is_pointer(obj_value: f64) -> bool {
     crate::value::JSValue::from_bits(obj_value.to_bits()).is_pointer()
 }
 
+fn delete_class_prototype_key(class_id: u32, name: &str) -> i32 {
+    let has_own = name == "constructor"
+        || super::native_module::class_has_own_method(class_id, name)
+        || super::class_registry::class_own_accessor_ptrs(class_id, name).is_some()
+        || super::class_registry::lookup_own_prototype_method(class_id, name).is_some();
+    if !has_own {
+        return 1;
+    }
+    super::class_registry::class_mark_key_deleted(class_id, name);
+    super::class_registry::invalidate_class_prototype_fast_guards_for_method(name);
+    crate::typed_feedback::invalidate_method_change(class_id);
+    1
+}
+
 /// `delete prim.field` (static key): once RequireObjectCoercible has rejected
 /// null/undefined, a primitive receiver (number/boolean/…) has no deletable own
 /// property, so `delete` is a no-op that evaluates to `true` (spec ToObject of a
@@ -412,6 +463,16 @@ pub extern "C" fn js_object_delete_field_value(
     obj_value: f64,
     key: *const crate::StringHeader,
 ) -> i32 {
+    if let Some(class_id) = super::class_prototype_ref_id(obj_value) {
+        if key.is_null() {
+            return 1;
+        }
+        return unsafe {
+            super::has_own_helpers::str_from_string_header(key)
+                .map(|name| delete_class_prototype_key(class_id, name))
+                .unwrap_or(1)
+        };
+    }
     // A class reference (`delete C.m` for a `static m()`) is INT32-tagged, so
     // `is_pointer` is false and the guard below would no-op it. But a static
     // member delete must still unregister the method/field. `js_object_delete_field`
@@ -434,6 +495,13 @@ pub extern "C" fn js_object_delete_field_value(
 /// `js_object_delete_field_value`, delegating real objects to the dynamic path.
 #[no_mangle]
 pub extern "C" fn js_object_delete_dynamic_value(obj_value: f64, key: f64) -> i32 {
+    if let Some(class_id) = super::class_prototype_ref_id(obj_value) {
+        return unsafe {
+            super::native_module::metadata_key_to_string(key)
+                .map(|name| delete_class_prototype_key(class_id, &name))
+                .unwrap_or(1)
+        };
+    }
     // Class-ref receiver (`delete C["m"]`): see `js_object_delete_field_value`.
     if let Some(class_id) = super::native_module::class_ref_id(obj_value) {
         return js_object_delete_dynamic(class_id as usize as *mut ObjectHeader, key);

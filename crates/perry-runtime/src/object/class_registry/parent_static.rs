@@ -1,5 +1,5 @@
 use super::*;
-use crate::JSValue;
+use crate::{object::object_ops::throw_object_type_error, JSValue};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
@@ -90,6 +90,14 @@ pub extern "C" fn js_register_class_parent_dynamic(class_id: u32, mut parent_val
     // and Event-shaped dispatch gates. Builtins without a class id keep the
     // parentless baseline (no throw — they ARE constructors).
     if let Some(name) = identify_global_builtin_constructor(parent_value) {
+        // `%Proxy%` is constructable but intentionally has no usable
+        // `prototype` property, so it fails ClassDefinitionEvaluation's
+        // prototype-object-or-null check.
+        if name == "Proxy" {
+            super::super::object_ops::throw_object_type_error(
+                b"Class extends value has invalid prototype property",
+            );
+        }
         let parent_cid = super::super::instanceof::global_builtin_constructor_class_id(name);
         if parent_cid != 0 && parent_cid != class_id {
             register_class(class_id, parent_cid);
@@ -101,7 +109,7 @@ pub extern "C" fn js_register_class_parent_dynamic(class_id: u32, mut parent_val
         match name {
             "Request" => super::super::register_fetch_parent_kind(class_id, 1),
             "Response" => super::super::register_fetch_parent_kind(class_id, 2),
-            _ => {}
+            _ => super::super::data_view_registry::register_builtin_view_parent(class_id, name),
         }
         return;
     }
@@ -114,6 +122,9 @@ pub extern "C" fn js_register_class_parent_dynamic(class_id: u32, mut parent_val
     if let Some((module, method)) = unsafe {
         super::super::native_module::bound_native_callable_module_and_method(parent_value)
     } {
+        if !super::super::native_module::is_native_module_constructor_export(&module, &method) {
+            throw_object_type_error(b"Class extends value is not a constructor");
+        }
         if super::super::native_module::normalize_native_module_alias(&module) == "wasi"
             && method == "WASI"
         {
@@ -121,16 +132,11 @@ pub extern "C" fn js_register_class_parent_dynamic(class_id: u32, mut parent_val
         }
         return;
     }
-    if is_bound_native_method_closure_value(parent_value) {
-        return;
-    }
     // Spec: a non-`null` superclass that is not a constructor throws a TypeError
     // at class-definition time (before any `.prototype` access). (Test262
     // subclass/superclass-* and definition/invalid-extends.)
     if extends_target_must_throw(parent_value) {
-        super::super::object_ops::throw_object_type_error(
-            b"Class extends value is not a constructor",
-        );
+        throw_object_type_error(b"Class extends value is not a constructor");
     }
 
     // #5893 (ClassDefinitionEvaluation): once the superclass is confirmed a
@@ -643,7 +649,7 @@ pub unsafe extern "C" fn js_register_class_computed_method(
                 setters: HashMap::new(),
             });
         vtable.methods.insert(
-            name,
+            name.clone(),
             VTableMethodEntry {
                 func_ptr: func_ptr as usize,
                 param_count: param_count as u32,
@@ -654,6 +660,10 @@ pub unsafe extern "C" fn js_register_class_computed_method(
                 has_rest: has_rest != 0,
             },
         );
+        // Backfill when reflection already materialized `C.prototype`.
+        drop(registry);
+        let proto = class_decl_prototype_object(class_id);
+        super::state::install_class_decl_prototype_method_field(proto, class_id, &name);
     }
     VTABLE_GEN.fetch_add(1, Ordering::Release);
 }
@@ -810,6 +820,8 @@ pub(crate) fn lookup_class_symbol_method_in_chain(
         None
     })
 }
+
+include!("parent_static/private_and_dynamic.rs");
 
 /// Presence-only check (`[[HasProperty]]`, never `[[Get]]`) for a Symbol-keyed
 /// METHOD or ACCESSOR declared on `class_id` or any ancestor. These computed
@@ -988,12 +1000,17 @@ pub(crate) unsafe fn class_static_accessor_getter_value(
     name: &str,
     receiver: f64,
 ) -> Option<f64> {
-    let guard = CLASS_STATIC_ACCESSORS.read().ok()?;
-    let map = guard.as_ref()?;
+    let guard = CLASS_STATIC_ACCESSORS.read().ok();
+    let map = guard.as_ref().and_then(|guard| guard.as_ref());
     let mut cid = class_id;
     let mut depth = 0usize;
     while cid != 0 && depth < 32 {
-        if let Some(accessors) = map.get(&cid) {
+        // A descriptor installed by `defineProperty` replaces an existing
+        // class-body accessor at the same inheritance level.
+        if let Some(result) = class_dynamic_static_accessor_getter_value(cid, name, receiver) {
+            return Some(result);
+        }
+        if let Some(accessors) = map.and_then(|map| map.get(&cid)) {
             if let Some(&(getter, _)) = accessors.get(name) {
                 if getter == 0 {
                     return Some(f64::from_bits(crate::value::TAG_UNDEFINED));
@@ -1028,17 +1045,17 @@ pub(crate) unsafe fn class_static_accessor_setter_apply(
     receiver: f64,
     value: f64,
 ) -> bool {
-    let guard = match CLASS_STATIC_ACCESSORS.read() {
-        Ok(g) => g,
-        Err(_) => return false,
-    };
-    let Some(map) = guard.as_ref() else {
-        return false;
-    };
+    let guard = CLASS_STATIC_ACCESSORS.read().ok();
+    let map = guard.as_ref().and_then(|guard| guard.as_ref());
     let mut cid = class_id;
     let mut depth = 0usize;
     while cid != 0 && depth < 32 {
-        if let Some(accessors) = map.get(&cid) {
+        if let Some(applied) =
+            class_dynamic_static_accessor_setter_apply(cid, name, receiver, value)
+        {
+            return applied;
+        }
+        if let Some(accessors) = map.and_then(|map| map.get(&cid)) {
             if let Some(&(_, setter)) = accessors.get(name) {
                 if setter != 0 {
                     // Mirror the getter path: the compiled static-accessor
@@ -1448,10 +1465,17 @@ pub unsafe extern "C" fn js_class_static_method_call(
     if name_ptr.is_null() || name_len == 0 {
         return receiver;
     }
-    let name = match std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len)) {
+    let storage_name = match std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len)) {
         Ok(s) => s,
         Err(_) => return receiver,
     };
+    let private_name = if storage_name.starts_with("#<perry:private-member:") {
+        super::super::field_get_set::take_private_method_call_hint(storage_name)
+            .and_then(|(_, is_static, name)| is_static.then(|| name.to_string()))
+    } else {
+        None
+    };
+    let name = private_name.as_deref().unwrap_or(storage_name);
     // Resolve the receiver's class_id: INT32 ClassRef payload, or the
     // class_id stamped on a POINTER class object's ObjectHeader.
     let bits = receiver.to_bits();
@@ -1638,16 +1662,25 @@ pub unsafe extern "C" fn js_class_static_method_call(
         }
     }
     // True miss: no static method and no callable static field resolved on the
-    // class chain. We hand back the receiver (load-bearing for effect's
-    // `.pipe()`-during-init chains, #687) — but that silent class-ref is exactly
-    // what surfaces downstream as a stray `1`. Surface it at the call site.
+    // class chain. Keep the two compatibility no-ops introduced for Effect's
+    // schema initialization (#687), but otherwise follow JavaScript semantics:
+    // calling an absent member throws instead of silently returning the class.
+    // In particular, this is observable when code deliberately probes a class
+    // with an unknown method inside `assert.throws`.
     report_dispatch_miss(
         "static-member-call",
         receiver,
         name,
-        "the receiver (class ref)",
+        if matches!(name, "pipe" | "annotations") {
+            "the receiver (compatibility no-op)"
+        } else {
+            "TypeError"
+        },
     );
-    receiver
+    if matches!(name, "pipe" | "annotations") {
+        return receiver;
+    }
+    crate::error::js_throw_type_error_not_a_function(std::ptr::null(), 0, name.as_ptr(), name.len())
 }
 
 // `get_parent_class_id` now lives in `object::class_meta_registry` next to the

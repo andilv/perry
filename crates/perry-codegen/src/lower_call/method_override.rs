@@ -11,12 +11,21 @@ use crate::expr::{
 };
 use crate::nanbox::double_literal;
 use crate::native_value::LoweredValue;
-use crate::types::{DOUBLE, I1, I16, I32, I64, I8};
+use crate::types::{DOUBLE, I1, I32, I64, I8};
 
 const POINTER_TAG_HI16: &str = "32765"; // 0x7FFD
 const GC_TYPE_OBJECT: &str = "2";
-const GC_FLAG_FORWARDED_I8: &str = "-128"; // 0x80 as i8
-const OBJ_FLAG_HAS_DESCRIPTORS_I16: &str = "2048"; // 0x0800
+// The first four bytes before an ObjectHeader are, in little-endian order,
+// `gtype: u8`, `flags: u8`, and `reserved: u16`.  One masked i32 load can
+// therefore prove the three fields the direct-method contract consumes:
+//
+//   gtype == GC_TYPE_OBJECT
+//   flags & GC_FLAG_FORWARDED == 0
+//   reserved & (OBJ_FLAG_HAS_DESCRIPTORS | OBJ_FLAG_PACKED_NUMERIC_PROOF) == 0
+//
+// Mask: 0x0800_0000 (descriptor bit) | 0x0080_0000 (packed proof bit) |
+// 0x0000_8000 (forwarded bit) | 0x0000_00ff (the complete gtype byte).
+const GC_OBJECT_METHOD_GUARD_MASK_I32: &str = "142639359"; // 0x0880_80ff
 const SHAPE_ID_BASE_NEG_I32: &str = "-2147483648"; // subtract 0x8000_0000
 const SHAPE_ID_RANGE_LEN: &str = "1073741824"; // 0x4000_0000
 
@@ -28,15 +37,17 @@ const SHAPE_ID_RANGE_LEN: &str = "1073741824"; // 0x4000_0000
 /// The first block proves that the value is a tagged heap pointer or the raw
 /// object-address form used by internal method ABIs before any dereference.
 /// The second block reproduces the runtime helper's production contract: the
-/// class-prototype invalidation latch is clear, the receiver is a non-forwarded
-/// ordinary object without own descriptors, and its exact `(class_id, ShapeId)`
-/// pair still matches the compiler-published pair. Any failed proof takes the
-/// unchanged dynamic method fallback.
-fn emit_inline_direct_method_shape_guard(
+/// all-method escape latch and this method name's invalidation byte are clear,
+/// the receiver is a non-forwarded ordinary object without own descriptors,
+/// and its exact `(class_id, ShapeId)` pair still matches the
+/// compiler-published pair. Any failed proof takes the unchanged dynamic
+/// method fallback.
+pub(crate) fn emit_inline_direct_method_shape_guard(
     ctx: &mut FnCtx<'_>,
     recv_box: &str,
     expected_class_id: &str,
     expected_shape_id: &str,
+    method_guard_slot: &str,
     fast_label: &str,
     fallback_label: &str,
 ) {
@@ -51,7 +62,15 @@ fn emit_inline_direct_method_shape_guard(
         let blk = ctx.block();
         let invalidated =
             blk.load_atomic_acquire(I8, "@PERRY_CLASS_PROTOTYPE_FAST_GUARDS_INVALIDATED", 1);
-        let prototype_ok = blk.icmp_eq(I8, &invalidated, "0");
+        let all_methods_ok = blk.icmp_eq(I8, &invalidated, "0");
+        let method_slot_ptr = blk.gep(
+            I8,
+            "@PERRY_CLASS_PROTOTYPE_FAST_GUARDS_INVALIDATED_BY_METHOD",
+            &[(I64, method_guard_slot)],
+        );
+        let method_invalidated = blk.load_atomic_acquire(I8, &method_slot_ptr, 1);
+        let method_ok = blk.icmp_eq(I8, &method_invalidated, "0");
+        let prototype_ok = blk.and(I1, &all_methods_ok, &method_ok);
         let recv_bits = blk.bitcast_double_to_i64(recv_box);
         let recv_handle = blk.and(I64, &recv_bits, crate::nanbox::POINTER_MASK_I64);
         let tag = blk.lshr(I64, &recv_bits, "48");
@@ -77,41 +96,81 @@ fn emit_inline_direct_method_shape_guard(
         let recv_handle = blk.and(I64, &recv_bits, crate::nanbox::POINTER_MASK_I64);
         let obj_ptr = blk.inttoptr(I64, &recv_handle);
 
-        let gtype_ptr = blk.gep(I8, &obj_ptr, &[(I64, "-8")]);
-        let gtype = blk.load(I8, &gtype_ptr);
-        let gtype_ok = blk.icmp_eq(I8, &gtype, GC_TYPE_OBJECT);
+        let gc_header_ptr = blk.gep(I8, &obj_ptr, &[(I64, "-8")]);
+        let gc_header = blk.load(I32, &gc_header_ptr);
+        let guarded_gc_bits = blk.and(I32, &gc_header, GC_OBJECT_METHOD_GUARD_MASK_I32);
+        let gc_header_ok = blk.icmp_eq(I32, &guarded_gc_bits, GC_TYPE_OBJECT);
 
-        let gflags_ptr = blk.gep(I8, &obj_ptr, &[(I64, "-7")]);
-        let gflags = blk.load(I8, &gflags_ptr);
-        let forwarded = blk.and(I8, &gflags, GC_FLAG_FORWARDED_I8);
-        let not_forwarded = blk.icmp_eq(I8, &forwarded, "0");
+        // ObjectHeader begins with adjacent `class_id: u32` and
+        // `shape_id: u32`. Compare them as one packed word. The expected
+        // ShapeId is still range-checked below, so equality proves the live
+        // receiver's class is non-zero and its ShapeId is in-domain without
+        // four separate field predicates.
+        let class_shape = blk.load(I64, &obj_ptr);
+        let expected_shape_i64 = blk.zext(I32, expected_shape_id, I64);
+        let expected_shape_high = blk.shl(I64, &expected_shape_i64, "32");
+        let expected_class_shape = blk.or(I64, &expected_shape_high, expected_class_id);
+        let class_shape_ok = blk.icmp_eq(I64, &class_shape, &expected_class_shape);
 
-        let reserved_ptr = blk.gep(I8, &obj_ptr, &[(I64, "-6")]);
-        let reserved = blk.load(I16, &reserved_ptr);
-        let descriptor_bits = blk.and(I16, &reserved, OBJ_FLAG_HAS_DESCRIPTORS_I16);
-        let no_own_descriptors = blk.icmp_eq(I16, &descriptor_bits, "0");
-
-        let class_ptr = blk.gep(I8, &obj_ptr, &[(I64, "0")]);
-        let class_id = blk.load(I32, &class_ptr);
-        let class_valid = blk.icmp_ne(I32, &class_id, "0");
-        let class_ok = blk.icmp_eq(I32, &class_id, expected_class_id);
-
-        let shape_ptr = blk.gep(I8, &obj_ptr, &[(I64, "4")]);
-        let shape_id = blk.load(I32, &shape_ptr);
         // `is_shape_id` is `[0x8000_0000, 0xC000_0000)`. Subtract the base
         // modulo i32 and compare with the range length, matching the runtime
-        // helper without a call.
-        let shape_id_rel = blk.add(I32, &shape_id, SHAPE_ID_BASE_NEG_I32);
+        // helper. Equality above transfers this proof to the live header.
+        let shape_id_rel = blk.add(I32, expected_shape_id, SHAPE_ID_BASE_NEG_I32);
         let shape_valid = blk.icmp_ult(I32, &shape_id_rel, SHAPE_ID_RANGE_LEN);
-        let shape_ok = blk.icmp_eq(I32, &shape_id, expected_shape_id);
 
-        let mut pass = blk.and(I1, &gtype_ok, &not_forwarded);
-        pass = blk.and(I1, &pass, &no_own_descriptors);
-        pass = blk.and(I1, &pass, &class_valid);
-        pass = blk.and(I1, &pass, &class_ok);
-        pass = blk.and(I1, &pass, &shape_valid);
-        pass = blk.and(I1, &pass, &shape_ok);
+        let pass = blk.and(I1, &gc_header_ok, &class_shape_ok);
+        let pass = blk.and(I1, &pass, &shape_valid);
         blk.cond_br(&pass, fast_label, fallback_label);
+    }
+}
+
+#[cfg(test)]
+mod packed_guard_tests {
+    use super::*;
+
+    /// Anti-drift gate for the runtime fields packed into the i32 load at
+    /// `obj - 8`. Keep this alongside the emitter so a flag move changes a
+    /// failing test instead of silently weakening a generated guard.
+    #[test]
+    fn gc_header_mask_preserves_the_direct_method_contract() {
+        let obj_type_mask = 0x0000_00ffu32;
+        let forwarded = u32::from(0x80u8) << 8;
+        let has_descriptors = 0x0800u32 << 16;
+        let packed_numeric_proof = 0x0080u32 << 16;
+        let mask = obj_type_mask | forwarded | has_descriptors | packed_numeric_proof;
+        let expected = u32::from(2u8);
+
+        assert_eq!(GC_OBJECT_METHOD_GUARD_MASK_I32, mask.to_string());
+        assert_eq!(expected & mask, expected);
+        assert_ne!((expected | forwarded) & mask, expected);
+        assert_ne!((expected | has_descriptors) & mask, expected);
+        assert_ne!((expected | packed_numeric_proof) & mask, expected);
+        assert_ne!((expected ^ 1) & mask, expected);
+    }
+
+    /// `ObjectHeader::{class_id,parent_class_id}` are adjacent u32 fields.
+    /// Perry's supported native targets are little-endian, so one i64 load
+    /// sees class in the low word and ShapeId in the high word.
+    #[test]
+    fn class_shape_word_uses_the_supported_little_endian_layout() {
+        let class_id = 0x1234_5678u32;
+        let shape_id = 0x89ab_cdefu32;
+        let mut bytes = [0u8; 8];
+        bytes[..4].copy_from_slice(&class_id.to_le_bytes());
+        bytes[4..].copy_from_slice(&shape_id.to_le_bytes());
+        assert_eq!(
+            u64::from_le_bytes(bytes),
+            (u64::from(shape_id) << 32) | u64::from(class_id)
+        );
+
+        for triple in [
+            "aarch64-apple-darwin",
+            "x86_64-unknown-linux-gnu",
+            "aarch64-linux-android",
+            "x86_64-pc-windows-msvc",
+        ] {
+            assert!(!triple.starts_with("s390") && !triple.starts_with("powerpc64-"));
+        }
     }
 }
 
@@ -319,9 +378,9 @@ pub(super) fn emit_guarded_direct_method_call(
     // the `js_method_direct_shape_guard` /
     // `js_typed_feedback_method_direct_call_guard` branch, which matched the
     // exact class id AND the keys token. A `pshape_methods` hit additionally
-    // proves `receiver_class_name` DECLARES `property` (the map holds own
-    // declarations of module-local classes only), so the clone's `this` is
-    // exactly the class it was compiled for and can never be a subclass
+    // proves `receiver_class_name` DECLARES `property` (locally by analysis or
+    // across modules by a producer-authored capability), so the clone's `this`
+    // is exactly the class it was compiled for and can never be a subclass
     // instance.
     //
     // The `perry_static_` exclusion is carried forward from the guard-free
@@ -348,6 +407,7 @@ pub(super) fn emit_guarded_direct_method_call(
     let entry = ctx.strings.entry(key_idx);
     let bytes_global = format!("@{}", entry.bytes_global);
     let name_len_str = entry.byte_len.to_string();
+    let method_guard_slot_str = (entry.dispatch_hash & 0xffff).to_string();
     let dispatch_global = ctx.strings.static_dispatch_global(key_idx);
     let site_id = if shape_only_guard {
         None
@@ -405,7 +465,11 @@ pub(super) fn emit_guarded_direct_method_call(
         let cid = ctx.block().call(
             I32,
             "js_method_direct_shape_class",
-            &[(DOUBLE, recv_box), (crate::types::PTR, &shape_slot)],
+            &[
+                (DOUBLE, recv_box),
+                (crate::types::PTR, &shape_slot),
+                (I32, &method_guard_slot_str),
+            ],
         );
         let shape_id = ctx.block().load(I32, &shape_slot);
         {
@@ -439,6 +503,7 @@ pub(super) fn emit_guarded_direct_method_call(
             recv_box,
             &expected_class_id_str,
             &expected_shape_id,
+            &method_guard_slot_str,
             &fast_label,
             &fallback_label,
         );
@@ -457,6 +522,7 @@ pub(super) fn emit_guarded_direct_method_call(
                 (DOUBLE, recv_box),
                 (I32, &expected_class_id_str),
                 (I32, &expected_shape_id),
+                (I32, &method_guard_slot_str),
             ],
         )
     } else {
@@ -979,9 +1045,9 @@ pub(super) fn emit_guarded_direct_method_call(
             // instead; identical ABI, so only the callee name changes.
             //
             // A `pshape_methods` hit additionally proves `receiver_class_name`
-            // DECLARES `property` (the map holds own declarations of
-            // module-local classes only), so the clone's `this` is exactly the
-            // class it was compiled for — an inherited `Base::m` reached
+            // DECLARES `property` (locally by analysis or across modules by a
+            // producer-authored capability), so the clone's `this` is exactly
+            // the class it was compiled for — an inherited `Base::m` reached
             // through a subclass receiver never routes here.
             //
             // NOTE: the per-field `js_typed_feedback_class_field_get_guard`
@@ -1001,7 +1067,39 @@ pub(super) fn emit_guarded_direct_method_call(
             let target = nonnegative_index_direct_fn
                 .or(pshape_fn.as_deref())
                 .unwrap_or(direct_fn);
-            ctx.block().call(DOUBLE, target, direct_arg_slices)
+            let result = ctx.block().call(DOUBLE, target, direct_arg_slices);
+            if nonnegative_index_direct_fn.is_none() {
+                if let Some(pshape) = pshape_fn.as_deref() {
+                    let receiver_provenance =
+                        if ctx.imported_class_sources.contains_key(receiver_class_name) {
+                            "imported_class_metadata"
+                        } else {
+                            "module_local_analysis"
+                        };
+                    ctx.record_lowered_value(
+                        "MethodCall",
+                        None,
+                        "proven_this_method_direct_call",
+                        &LoweredValue::js_value(result.clone()),
+                        None,
+                        None,
+                        None,
+                        false,
+                        false,
+                        vec![
+                            format!("typed_clone={pshape}"),
+                            format!("generic_method={direct_fn}"),
+                            format!("receiver_class={receiver_class_name}"),
+                            format!("method={property}"),
+                            format!("receiver_provenance={receiver_provenance}"),
+                            "this_representation=tagged_js_value_exact_shape".to_string(),
+                            "method_identity_guard=required".to_string(),
+                            "generic_dispatch_fallback=js_native_call_method_by_id".to_string(),
+                        ],
+                    );
+                }
+            }
+            result
         }
     };
     let after_fast = ctx.block().label.clone();

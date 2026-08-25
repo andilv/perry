@@ -71,6 +71,12 @@ mod handle_ids;
 pub(crate) use handle_ids::{next_id, next_id_or_throw};
 mod dispatch;
 mod dispatch_custody;
+mod ipc;
+mod socket_emit;
+pub use socket_emit::{
+    js_ext_net_register_http_agent_socket_event_hook, js_ext_net_set_http_agent_phase,
+    js_ext_net_socket_emit, js_ext_net_socket_emit_abort_error,
+};
 // #2154 — raw-consumer bridge so perry-ext-http can drive an HTTP exchange
 // over a socket produced by `agent.createConnection` (split out for the gate).
 mod raw_bridge;
@@ -84,10 +90,19 @@ pub use adopt::{adopt_upgraded_tcp_stream, ensure_adopted_socket_dispatch};
 mod option_setters;
 pub use option_setters::{
     js_net_server_noop_self, js_net_socket_get_type_of_service, js_net_socket_noop_self,
-    js_net_socket_set_encoding, js_net_socket_set_no_delay, js_net_socket_set_timeout,
-    js_net_socket_set_type_of_service,
+    js_net_socket_ref, js_net_socket_set_encoding, js_net_socket_set_no_delay,
+    js_net_socket_set_timeout, js_net_socket_set_type_of_service, js_net_socket_unref,
 };
 use option_setters::{js_net_validate_connect_port, js_net_validate_listen_port};
+mod socket_facade;
+pub(crate) use socket_facade::TlsSocketMetadata;
+pub use socket_facade::{
+    js_ext_net_has_active_handles, js_ext_net_is_socket_handle, js_ext_net_set_tls_metadata,
+    js_ext_net_socket_has_ref, js_ext_net_socket_peer_certificate_json, js_ext_net_socket_set_ref,
+    js_ext_net_socket_tls_authorized, js_ext_net_socket_tls_encrypted,
+    js_ext_net_socket_tls_servername, js_ext_net_socket_tls_session,
+    js_ext_net_socket_tls_session_reused,
+};
 
 #[cfg(test)]
 mod nodelay_tests;
@@ -103,10 +118,11 @@ pub use server_state::*;
 mod jsvalue;
 pub(crate) use jsvalue::{
     build_error_object, get_object_bool_field, get_object_number_field, get_object_string_field,
-    is_nanboxed_pointer, jsvalue_to_socket_bytes, string_from_header_i64, unbox_pointer,
+    get_object_value_field, is_nanboxed_pointer, jsvalue_to_socket_bytes, string_from_header_i64,
+    unbox_pointer,
 };
 
-use crate::tls::do_tls_handshake;
+use crate::tls::{do_tls_handshake, record_tls_handshake, TlsClientConfigData};
 
 // ─── Transport enum (plain or TLS, swappable at runtime) ─────────────────────
 //
@@ -159,6 +175,17 @@ pub(crate) mod statics {
         P.get_or_init(|| Mutex::new(Vec::new()))
     }
 
+    /// HTTP Agent-owned socket handles are transport facades over the HTTP
+    /// client's private connection pool. `true` means assigned to a request;
+    /// `false` means parked in `agent.freeSockets`. Keeping this tiny bit of
+    /// metadata here lets the ordinary net.Socket EventEmitter surface expose
+    /// Node's internal listener counts without leaking HTTP internals into the
+    /// generic handle dispatcher.
+    pub fn http_agent_phases() -> &'static Mutex<HashMap<i64, bool>> {
+        static H: OnceLock<Mutex<HashMap<i64, bool>>> = OnceLock::new();
+        H.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
     /// Server registry — `net.createServer(...)` returns a handle here.
     /// Separate from the socket map: server handles host an accept-loop
     /// shutdown channel and a bound port; sockets host a per-connection
@@ -178,6 +205,12 @@ pub(crate) mod statics {
         static E: OnceLock<Mutex<HashMap<i64, String>>> = OnceLock::new();
         E.get_or_init(|| Mutex::new(HashMap::new()))
     }
+
+    /// Per-socket EventEmitter warning thresholds set through `events.*`.
+    pub fn max_listeners() -> &'static Mutex<HashMap<i64, f64>> {
+        static M: OnceLock<Mutex<HashMap<i64, f64>>> = OnceLock::new();
+        M.get_or_init(|| Mutex::new(HashMap::new()))
+    }
 }
 
 /// Backing state for an `net.Server` handle (`net.createServer(...)`).
@@ -194,6 +227,9 @@ pub(crate) struct ServerState {
     pub shutdown_tx: Option<oneshot::Sender<()>>,
     pub bound_port: u16,
     pub bound_host: String,
+    /// Named-pipe / Unix-domain-socket path for an IPC listener. TCP servers
+    /// leave this unset and use `bound_host` + `bound_port`.
+    pub bound_path: Option<String>,
     pub listening: bool,
     pub active_connections: usize,
     pub pending_connections: usize,
@@ -273,6 +309,8 @@ pub(crate) struct SocketState {
     /// can move it into the spawned task at connect time.
     pub(crate) pending_rx: Option<mpsc::UnboundedReceiver<SocketCommand>>,
     pub(crate) is_open: bool,
+    /// Whether pending socket I/O keeps the process event loop alive.
+    pub(crate) refed: bool,
     /// Issue #2131 — the kernel-assigned local address, populated after
     /// `TcpStream::connect`/`accept`. Drives `socket.address()` so the
     /// "undefined.address" cluster reports the actual bound port/family.
@@ -293,6 +331,7 @@ pub(crate) struct SocketState {
     pub(crate) type_of_service: u8,
     pub(crate) server_id: Option<i64>,
     pub(crate) server_connection_active: bool,
+    pub(crate) tls: TlsSocketMetadata,
 }
 
 #[cfg(test)]
@@ -304,6 +343,7 @@ impl SocketState {
             cmd_tx,
             pending_rx: None,
             is_open: true,
+            refed: true,
             local_addr: None,
             raw: None,
             destroyed: false,
@@ -313,6 +353,7 @@ impl SocketState {
             type_of_service: 0,
             server_id: None,
             server_connection_active: false,
+            tls: TlsSocketMetadata::default(),
         }
     }
 }
@@ -337,6 +378,7 @@ pub(crate) enum SocketCommand {
     UpgradeTls {
         servername: String,
         verify: bool,
+        config: TlsClientConfigData,
         reply: oneshot::Sender<Result<(), String>>,
     },
 }
@@ -346,6 +388,7 @@ enum PendingNetEvent {
     /// `.1` identifies a same-process server target and whether its admission
     /// is expected to hit `dropMaxConnection`; external connects use `None`.
     Connect(i64, Option<(i64, bool)>),
+    SecureConnect(i64),
     /// One chunk of read data. Carried as a refcounted `Bytes` — a zero-copy
     /// view sliced out of the socket task's reused read buffer (`split_to`) —
     /// so the path from the receive buffer to the main-thread drain handler
@@ -359,6 +402,7 @@ enum PendingNetEvent {
     End(i64),
     Close(i64),
     Error(i64, String),
+    AbortError(i64),
     /// Issue #1123 followup — accept-loop on a `net.Server` produced
     /// a new client socket. Fires the server's `'connection'`
     /// listeners with the new socket handle.
@@ -449,7 +493,7 @@ where
 
 /// `net.createConnection(...)` / `net.connect(...)` — returns a handle
 /// immediately; connection happens in the background and emits
-/// `'connect'` or `'error'`. Supports both Node overloads:
+/// `'connect'` or `'error'`. Supports Node's TCP and IPC overloads:
 ///
 /// - Positional: `net.connect(port, host, cb?)`. `arg1_f64` is the
 ///   port as a regular f64 number, `arg2_f64` carries the host as a
@@ -459,6 +503,7 @@ where
 ///   `port`; `arg2_f64` is the optional `connectListener`. In this
 ///   form `arg3_f64` is unused (the dispatch table pads it with
 ///   `undefined`). Issue #770.
+/// - IPC: `net.connect(path, cb?)` or `net.connect({ path }, cb?)`.
 ///
 /// The `connectListener` (whichever slot it ends up in) is
 /// auto-registered as a `'connect'` listener on the new socket
@@ -487,27 +532,21 @@ pub unsafe extern "C" fn js_ext_net_socket_connect(
 
 #[no_mangle]
 pub unsafe extern "C" fn js_net_socket_connect(arg1_f64: f64, arg2_f64: f64, arg3_f64: f64) -> i64 {
-    /// Register `cb_f64` as a `'connect'` listener on `handle` if it
-    /// carries a real closure pointer. No-op otherwise.
-    fn register_connect_cb(handle: i64, cb_f64: f64) {
-        if handle == 0 || !is_nanboxed_pointer(cb_f64) {
-            return;
-        }
-        let cb_ptr = unsafe { unbox_pointer(cb_f64) } as i64;
-        if cb_ptr == 0 {
-            return;
-        }
-        let mut listeners = statics::listeners().lock().unwrap();
-        listeners
-            .entry(handle)
-            .or_default()
-            .entry("connect".to_string())
-            .or_default()
-            .push(cb_ptr);
+    // Path overload: `net.connect(path[, cb])`.
+    if let Some(path) = ipc::string_value(arg1_f64) {
+        let handle = ipc::spawn_socket(path);
+        ipc::register_connect_cb(handle, arg2_f64);
+        return handle;
     }
 
     if is_nanboxed_pointer(arg1_f64) {
-        // Options-object overload: extract host/port from the object.
+        // Options-object overload. A `path` selects local IPC before the TCP
+        // host/port fields are considered, matching Node's normalization.
+        if let Some(path) = get_object_string_field(arg1_f64, "path") {
+            let handle = ipc::spawn_socket(path);
+            ipc::register_connect_cb(handle, arg2_f64);
+            return handle;
+        }
         let host = match get_object_string_field(arg1_f64, "host")
             .or_else(|| get_object_string_field(arg1_f64, "hostname"))
         {
@@ -524,7 +563,7 @@ pub unsafe extern "C" fn js_net_socket_connect(arg1_f64: f64, arg2_f64: f64, arg
         };
         let handle = spawn_socket_task(host, port, /* direct_tls: */ None);
         // connectListener lives in arg2 for the options form.
-        register_connect_cb(handle, arg2_f64);
+        ipc::register_connect_cb(handle, arg2_f64);
         return handle;
     }
     // Positional overload: arg1 is the port number, arg2 is the host
@@ -548,7 +587,7 @@ pub unsafe extern "C" fn js_net_socket_connect(arg1_f64: f64, arg2_f64: f64, arg
     js_net_validate_connect_port(arg1_f64);
     let port = arg1_f64 as u16;
     let handle = spawn_socket_task(host, port, /* direct_tls: */ None);
-    register_connect_cb(handle, listener_f64);
+    ipc::register_connect_cb(handle, listener_f64);
     handle
 }
 
@@ -570,6 +609,7 @@ pub unsafe extern "C" fn js_net_socket_alloc() -> i64 {
             cmd_tx: tx,
             pending_rx: Some(rx),
             is_open: false,
+            refed: true,
             local_addr: None,
             raw: None,
             destroyed: false,
@@ -579,6 +619,7 @@ pub unsafe extern "C" fn js_net_socket_alloc() -> i64 {
             type_of_service: 0,
             server_id: None,
             server_connection_active: false,
+            tls: TlsSocketMetadata::default(),
         },
     );
     statics::listeners()
@@ -614,6 +655,7 @@ pub unsafe extern "C" fn js_net_create_server(
             shutdown_tx: None,
             bound_port: 0,
             bound_host: String::new(),
+            bound_path: None,
             listening: false,
             active_connections: 0,
             pending_connections: 0,
@@ -637,9 +679,9 @@ pub unsafe extern "C" fn js_net_create_server(
 
 // ─── FFI: net.Server.listen / .close / .address / .on ────────────────────────
 
-/// `server.listen(port, callback?)` — bind a tokio `TcpListener` on
-/// `0.0.0.0:port` and spawn an accept loop on the shared multi-thread
-/// runtime. The `callback` (a NaN-boxed closure pointer in the codegen's
+/// `server.listen(port | path, callback?)` — bind TCP, a Windows named pipe,
+/// or a Unix-domain socket and spawn an accept loop on the shared runtime.
+/// The `callback` (a NaN-boxed closure pointer in the codegen's
 /// NA_PTR slot, raw i64 here after unboxing in lower_call.rs) is
 /// registered as a one-shot `'listening'` listener; when the bind
 /// resolves, the accept-loop task pushes a `ServerListening` event so
@@ -662,13 +704,25 @@ pub unsafe extern "C" fn js_net_server_listen(handle: i64, port: f64, arg2: f64,
         0 => js_net_callback_ptr(arg2),
         cb => cb,
     };
-    // #2013: a numeric `port` must be an integer in [0, 65536); Node throws
-    // RangeError [ERR_SOCKET_BAD_PORT] otherwise. (A string is a pipe path and
-    // is left alone.)
-    js_net_validate_listen_port(port);
-    let port_u16 = port as u16;
-    let host = string_from_header_i64(js_get_string_pointer_unified(arg2))
-        .unwrap_or_else(|| "0.0.0.0".to_string());
+    let path = ipc::string_value(port)
+        .or_else(|| is_nanboxed_pointer(port).then(|| get_object_string_field(port, "path"))?);
+    let (port_u16, host) = if path.is_some() {
+        (0, String::new())
+    } else if is_nanboxed_pointer(port) {
+        let option_port = get_object_number_field(port, "port").unwrap_or(0.0);
+        js_net_validate_listen_port(option_port);
+        let option_host = get_object_string_field(port, "host")
+            .filter(|host| !host.is_empty())
+            .unwrap_or_else(|| "0.0.0.0".to_string());
+        (option_port as u16, option_host)
+    } else {
+        // #2013: a numeric `port` must be an integer in [0, 65536); Node throws
+        // RangeError [ERR_SOCKET_BAD_PORT] otherwise.
+        js_net_validate_listen_port(port);
+        let host = string_from_header_i64(js_get_string_pointer_unified(arg2))
+            .unwrap_or_else(|| "0.0.0.0".to_string());
+        (port as u16, host)
+    };
 
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
 
@@ -686,6 +740,7 @@ pub unsafe extern "C" fn js_net_server_listen(handle: i64, port: f64, arg2: f64,
         s.shutdown_tx = Some(shutdown_tx);
         s.bound_port = port_u16;
         s.bound_host = host.clone();
+        s.bound_path = path.clone();
         s.listening = true;
     }
 
@@ -705,6 +760,11 @@ pub unsafe extern "C" fn js_net_server_listen(handle: i64, port: f64, arg2: f64,
 
     let host_for_spawn = host.clone();
     let server_id = handle;
+
+    if let Some(path) = path {
+        ipc::spawn_listener(server_id, path, shutdown_rx);
+        return;
+    }
 
     // Run the accept loop cooperatively on Perry's shared multi-thread runtime
     // via `spawn_async` — no throwaway current-thread runtime, no blocking-pool
@@ -768,34 +828,6 @@ pub unsafe extern "C" fn js_net_server_listen(handle: i64, port: f64, arg2: f64,
                                 push_event(PendingNetEvent::ServerDrop(server_id, info));
                                 continue;
                             }
-                            // Allocate a fresh Socket handle that
-                            // shares the existing socket machinery
-                            // (run_socket_task, command channel,
-                            // 'data'/'end'/'close'/'error' pump
-                            // dispatch). The accept side doesn't
-                            // need a tokio TcpStream::connect — we
-                            // already have the stream — so we
-                            // bypass `spawn_socket_task` (which
-                            // calls TcpStream::connect inside) and
-                            // call `run_socket_task` directly with
-                            // the accepted stream.
-                            let socket_id = next_id();
-                            // #6441: on a background thread there is no JS frame
-                            // to unwind to, so exhaustion can't throw here.
-                            // Drop the accepted stream — closing the connection,
-                            // the EMFILE-style degradation Node applies when it
-                            // can't accept — rather than register a phantom
-                            // socket under the `0` sentinel. Refuse quietly: once
-                            // the band is exhausted every accept fails, so an
-                            // 'error' event per connection would flood a hot
-                            // loop; the synchronous client-facing entry points
-                            // still surface a throwable EMFILE.
-                            if socket_id == perry_ffi::INVALID_HANDLE {
-                                server_state::cancel_pending_connection(server_id);
-                                drop(stream);
-                                continue;
-                            }
-                            let (tx, rx) = mpsc::unbounded_channel::<SocketCommand>();
                             // Node sets TCP_NODELAY on every accepted socket by
                             // default (Nagle off). Match that so small writes
                             // aren't delayed waiting to coalesce; a later
@@ -807,62 +839,11 @@ pub unsafe extern "C" fn js_net_server_listen(handle: i64, port: f64, arg2: f64,
                             // bound port/family instead of returning
                             // undefined.
                             let accepted_local = stream.local_addr().ok();
-                            statics::sockets().lock().unwrap().insert(
-                                socket_id,
-                                SocketState {
-                                    cmd_tx: tx,
-                                    pending_rx: None,
-                                    is_open: true,
-                                    local_addr: accepted_local,
-                                    raw: None,
-                                    destroyed: false,
-                                    bytes_read: 0,
-                                    bytes_written: 0,
-                                    timeout: None,
-                                    type_of_service: 0,
-                                    server_id: Some(server_id),
-                                    server_connection_active: false,
-                                },
+                            ipc::register_accepted_transport(
+                                server_id,
+                                Transport::Plain(stream),
+                                accepted_local,
                             );
-                            statics::listeners()
-                                .lock()
-                                .unwrap()
-                                .insert(socket_id, HashMap::new());
-
-                            // Surface the new socket to the user's
-                            // `'connection'` listener on the main
-                            // thread *before* spawning the read
-                            // loop — the listener typically registers
-                            // its own `.on('data', ...)` handlers
-                            // and we want those in place before
-                            // bytes start arriving. The accepted
-                            // stream's read loop spawns next.
-                            push_event(PendingNetEvent::ServerConnection(
-                                server_id, socket_id, false,
-                            ));
-
-                            // Spawn the per-socket read/write loop on
-                            // the same shared runtime as this accept
-                            // loop. A direct `tokio::spawn` (not
-                            // `spawn_socket_runner`, which routes
-                            // through the `perry_ffi::spawn_async` FFI
-                            // shim) is correct here because we're
-                            // already inside a task on the shared
-                            // runtime — `tokio::spawn` lands on it
-                            // directly, skipping the round-trip back
-                            // out through C. The shim only matters at
-                            // the FFI entry points that cross into
-                            // Rust-from-C, where no ambient runtime
-                            // task exists yet.
-                            tokio::spawn(async move {
-                                let mut rx = rx;
-                                run_socket_task(
-                                    socket_id,
-                                    Transport::Plain(stream),
-                                    &mut rx,
-                                )
-                                .await;
-                            });
                         }
                         Err(e) => {
                             push_event(PendingNetEvent::ServerError(
@@ -938,6 +919,12 @@ pub unsafe extern "C" fn js_net_server_address(handle: i64) -> *mut StringHeader
     let json = match statics::servers().lock() {
         Ok(g) => match g.get(&handle) {
             Some(s) if s.listening => {
+                if let Some(path) = &s.bound_path {
+                    return alloc_string(
+                        &serde_json::to_string(path).unwrap_or_else(|_| "null".to_string()),
+                    )
+                    .as_raw();
+                }
                 let family = if s.bound_host.contains(':') {
                     "IPv6"
                 } else {
@@ -979,8 +966,8 @@ pub unsafe extern "C" fn js_net_server_on(handle: i64, event_ptr: i64, cb: i64) 
 
 // ─── FFI: socket.connect(port, host) (instance method on existing handle) ─────
 
-/// `socket.connect(port, host)` — initiates a TCP connection on a socket
-/// previously allocated by `new net.Socket()`. Pulls its receiver out of
+/// `socket.connect(port, host)` / `socket.connect(path)` — initiates a TCP or
+/// IPC connection on a socket previously allocated by `new net.Socket()`. Pulls its receiver out of
 /// the `SocketState::pending_rx` slot rather than allocating a fresh
 /// channel, so any listener already registered (`sock.on('data', cb)`)
 /// sees the same handle id once the connect completes.
@@ -989,21 +976,63 @@ pub unsafe extern "C" fn js_net_server_on(handle: i64, event_ptr: i64, cb: i64) 
 ///
 /// See `js_net_socket_connect`.
 #[no_mangle]
-pub unsafe extern "C" fn js_net_socket_method_connect(handle: i64, port: f64, host_ptr: i64) {
-    // #2013: validate the port first (RangeError [ERR_SOCKET_BAD_PORT]),
-    // before any host handling, matching Node's `Socket.prototype.connect`.
-    js_net_validate_connect_port(port);
-    let host = match string_from_header_i64(host_ptr) {
-        Some(h) => h,
-        None => {
-            push_event(PendingNetEvent::Error(
-                handle,
-                "socket.connect: invalid host string".to_string(),
-            ));
+pub unsafe extern "C" fn js_ext_net_socket_method_connect(
+    handle: i64,
+    arg1: f64,
+    arg2: f64,
+    arg3: f64,
+) {
+    js_net_socket_method_connect(handle, arg1, arg2, arg3);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn js_net_socket_method_connect(
+    handle: i64,
+    arg1: f64,
+    arg2: f64,
+    arg3: f64,
+) {
+    if let Some(path) = ipc::string_value(arg1) {
+        ipc::register_connect_cb(handle, arg2);
+        ipc::connect_existing(handle, path);
+        return;
+    }
+
+    let (host, port, callback) = if is_nanboxed_pointer(arg1) {
+        if let Some(path) = get_object_string_field(arg1, "path") {
+            ipc::register_connect_cb(handle, arg2);
+            ipc::connect_existing(handle, path);
             return;
         }
+        let port = match get_object_number_field(arg1, "port") {
+            Some(port) => port,
+            None => {
+                push_event(PendingNetEvent::Error(
+                    handle,
+                    "socket.connect: options.port or options.path is required".to_string(),
+                ));
+                return;
+            }
+        };
+        let host = get_object_string_field(arg1, "host")
+            .or_else(|| get_object_string_field(arg1, "hostname"))
+            .filter(|host| !host.is_empty())
+            .unwrap_or_else(|| "localhost".to_string());
+        (host, port, arg2)
+    } else {
+        let host = ipc::string_value(arg2);
+        let callback = if host.is_some() { arg3 } else { arg2 };
+        (
+            host.unwrap_or_else(|| "127.0.0.1".to_string()),
+            arg1,
+            callback,
+        )
     };
+    // #2013: validate before truncating, matching Node's synchronous
+    // ERR_SOCKET_BAD_PORT behavior for positional and options overloads.
+    js_net_validate_connect_port(port);
     let port = port as u16;
+    ipc::register_connect_cb(handle, callback);
 
     let rx = {
         let mut guard = statics::sockets().lock().unwrap();
@@ -1062,8 +1091,23 @@ pub unsafe extern "C" fn js_net_socket_method_connect(handle: i64, port: f64, ho
 pub(crate) fn spawn_socket_task(
     host: String,
     port: u16,
-    direct_tls: Option<(String, bool)>,
+    direct_tls: Option<(String, bool, TlsClientConfigData)>,
 ) -> i64 {
+    spawn_socket_task_initialized(host, port, direct_tls, |_| {})
+}
+
+/// Allocate a socket and run `initialize` after its registries exist but before
+/// the async connect task can complete. TLS uses this boundary to publish its
+/// runtime metadata without racing a fast loopback handshake.
+pub(crate) fn spawn_socket_task_initialized<F>(
+    host: String,
+    port: u16,
+    direct_tls: Option<(String, bool, TlsClientConfigData)>,
+    initialize: F,
+) -> i64
+where
+    F: FnOnce(i64),
+{
     ensure_gc_scanner_registered();
     dispatch::ensure_runtime_dispatch_registered();
     let id = next_id_or_throw();
@@ -1079,6 +1123,7 @@ pub(crate) fn spawn_socket_task(
             cmd_tx: tx,
             pending_rx: None,
             is_open: false,
+            refed: true,
             local_addr: None,
             raw: None,
             destroyed: false,
@@ -1088,12 +1133,14 @@ pub(crate) fn spawn_socket_task(
             type_of_service: 0,
             server_id: None,
             server_connection_active: false,
+            tls: TlsSocketMetadata::default(),
         },
     );
     statics::listeners()
         .lock()
         .unwrap()
         .insert(id, HashMap::new());
+    initialize(id);
 
     spawn_socket_runner(move || {
         Box::pin(async move {
@@ -1119,9 +1166,12 @@ pub(crate) fn spawn_socket_task(
             let local = tcp.local_addr().ok();
 
             let transport = match direct_tls {
-                Some((servername, verify)) => {
-                    match do_tls_handshake(tcp, &servername, verify).await {
-                        Ok(tls) => Transport::Tls(Box::new(tls)),
+                Some((servername, verify, config)) => {
+                    match do_tls_handshake(tcp, &servername, verify, Some(&config)).await {
+                        Ok(tls) => {
+                            record_tls_handshake(id, &tls, &servername, verify, Some(&config));
+                            Transport::Tls(Box::new(tls))
+                        }
                         Err(e) => {
                             server_state::cancel_local_connect(local_server);
                             push_event(PendingNetEvent::Error(id, e));
@@ -1199,6 +1249,11 @@ pub(crate) async fn run_socket_task(
                         // #2154 raw mode: signal EOF on the buffer, suppress
                         // JS events. Else (#1852) fire 'end' then 'close' per
                         // Node's default `allowHalfOpen: false` teardown order.
+                        // Complete the writable half before dropping the
+                        // transport. For TLS this sends close_notify; without
+                        // it the peer observes an unclean EOF and emits only
+                        // 'close', skipping its 'end' event.
+                        let _ = t.shutdown().await;
                         if !raw_bridge::mark_terminal(id, None) {
                             push_event(PendingNetEvent::End(id));
                             push_event(PendingNetEvent::Close(id));
@@ -1274,14 +1329,22 @@ pub(crate) async fn run_socket_task(
                         mark_closed(id);
                         break;
                     }
-                    Some(SocketCommand::UpgradeTls { servername, verify, reply }) => {
+                    Some(SocketCommand::UpgradeTls { servername, verify, config, reply }) => {
                         let old = transport.take();
                         match old {
                             Some(Transport::Plain(tcp)) => {
-                                match do_tls_handshake(tcp, &servername, verify).await {
+                                match do_tls_handshake(tcp, &servername, verify, Some(&config)).await {
                                     Ok(tls) => {
+                                        record_tls_handshake(
+                                            id,
+                                            &tls,
+                                            &servername,
+                                            verify,
+                                            Some(&config),
+                                        );
                                         transport = Some(Transport::Tls(Box::new(tls)));
                                         let _ = reply.send(Ok(()));
+                                        push_event(PendingNetEvent::SecureConnect(id));
                                     }
                                     Err(e) => {
                                         let _ = reply.send(Err(e.clone()));
@@ -1295,6 +1358,12 @@ pub(crate) async fn run_socket_task(
                             Some(already_tls @ Transport::Tls(_)) => {
                                 transport = Some(already_tls);
                                 let _ = reply.send(Err("socket is already TLS".to_string()));
+                            }
+                            Some(ipc @ Transport::Ipc(_)) => {
+                                transport = Some(ipc);
+                                let _ = reply.send(Err(
+                                    "TLS upgrade is unsupported for IPC sockets".to_string(),
+                                ));
                             }
                             None => {
                                 let _ = reply.send(Err("socket closed".to_string()));
@@ -1328,9 +1397,14 @@ pub unsafe extern "C" fn js_net_socket_on(handle: i64, event_ptr: i64, cb: i64) 
         Some(e) => e,
         None => return,
     };
-    let mut listeners = statics::listeners().lock().unwrap();
-    let entry = listeners.entry(handle).or_default();
-    entry.entry(event).or_default().push(cb);
+    {
+        let mut listeners = statics::listeners().lock().unwrap();
+        let entry = listeners.entry(handle).or_default();
+        entry.entry(event.clone()).or_default().push(cb);
+    }
+    if event == "close" {
+        tls::fire_pending_tls_abort(handle);
+    }
 }
 
 // ─── FFI: socket.upgradeToTLS(servername, verify) -> Promise ─────────────────
@@ -1379,6 +1453,7 @@ pub unsafe extern "C" fn js_net_socket_upgrade_tls(
         .send(SocketCommand::UpgradeTls {
             servername,
             verify: verify_bool,
+            config: TlsClientConfigData::default(),
             reply: reply_tx,
         })
         .is_err()
@@ -1428,6 +1503,52 @@ pub unsafe extern "C" fn js_net_process_pending() -> i32 {
     js_ext_net_drain_pending()
 }
 
+fn socket_receiver(handle: i64) -> f64 {
+    f64::from_bits(0x7FFD_0000_0000_0000 | (handle as u64 & 0x0000_FFFF_FFFF_FFFF))
+}
+
+unsafe fn emit_socket_no_arg(handle: i64, event: &str) {
+    extern "C" {
+        fn js_implicit_this_set(value: f64) -> f64;
+    }
+    let frame = dispatch_custody::DispatchFrame::park(listeners_for(handle, event));
+    let previous_this = js_implicit_this_set(socket_receiver(handle));
+    for index in 0..frame.len() {
+        let callback = frame.cb(index);
+        if callback != 0 {
+            let _ = JsClosure::from_raw(callback as *const RawClosureHeader).call0();
+        }
+    }
+    js_implicit_this_set(previous_this);
+    drop(frame);
+    lifecycle::drain_once_listeners(handle, event);
+}
+
+unsafe fn emit_tls_secure_connect(handle: i64) {
+    extern "C" {
+        fn js_tls_client_check_identity_from_metadata(handle: i64) -> f64;
+    }
+    let identity_error = js_tls_client_check_identity_from_metadata(handle);
+    if !JsValue::from_bits(identity_error.to_bits()).is_undefined() {
+        let mut frame = dispatch_custody::DispatchFrame::park(listeners_for(handle, "error"));
+        frame.set_payload(identity_error.to_bits());
+        for index in 0..frame.len() {
+            let callback = frame.cb(index);
+            if callback != 0 {
+                let _ = JsClosure::from_raw(callback as *const RawClosureHeader)
+                    .call1(f64::from_bits(frame.payload_bits()));
+            }
+        }
+        drop(frame);
+        lifecycle::drain_once_listeners(handle, "error");
+        if let Some(socket) = statics::sockets().lock().unwrap().get(&handle) {
+            let _ = socket.cmd_tx.send(SocketCommand::Destroy);
+        }
+        return;
+    }
+    emit_socket_no_arg(handle, "secureConnect");
+}
+
 /// Drain ext-net's own pending-event queue.
 ///
 /// This carries a DISTINCT `#[no_mangle]` symbol (`js_ext_net_drain_pending`),
@@ -1464,30 +1585,19 @@ pub unsafe extern "C" fn js_ext_net_drain_pending() -> i32 {
                 server_state::finish_local_connect(local_server);
                 // #8259: park the snapshot so callback N stays rooted (and is
                 // rewritten on evacuation) while callback N-1 runs user JS.
-                let frame = dispatch_custody::DispatchFrame::park(listeners_for(id, "connect"));
-                for i in 0..frame.len() {
-                    let cb = frame.cb(i);
-                    if cb != 0 {
-                        let _ = JsClosure::from_raw(cb as *const RawClosureHeader).call0();
-                    }
-                }
-                drop(frame);
-                lifecycle::drain_once_listeners(id, "connect");
+                emit_socket_no_arg(id, "connect");
                 // TLS sockets additionally fire 'secureConnect' once the
                 // handshake completes — the direct-TLS connect path only
                 // signals Connect after the handshake, so this is the right
                 // tick. Plain sockets simply have no listeners here. #4971.
-                let frame =
-                    dispatch_custody::DispatchFrame::park(listeners_for(id, "secureConnect"));
-                for i in 0..frame.len() {
-                    let cb = frame.cb(i);
-                    if cb != 0 {
-                        let _ = JsClosure::from_raw(cb as *const RawClosureHeader).call0();
-                    }
+                extern "C" {
+                    fn js_tls_client_is_connected(handle: i64) -> i32;
                 }
-                drop(frame);
-                lifecycle::drain_once_listeners(id, "secureConnect");
+                if js_tls_client_is_connected(id) != 0 {
+                    emit_tls_secure_connect(id);
+                }
             }
+            PendingNetEvent::SecureConnect(id) => emit_tls_secure_connect(id),
             PendingNetEvent::Data(id, bytes) => {
                 let cbs = listeners_for(id, "data");
                 if cbs.is_empty() {
@@ -1555,6 +1665,26 @@ pub unsafe extern "C" fn js_ext_net_drain_pending() -> i32 {
                 drop(frame);
                 lifecycle::drain_once_listeners(id, "error");
             }
+            PendingNetEvent::AbortError(id) => {
+                let cbs = listeners_for(id, "error");
+                if cbs.is_empty() {
+                    continue;
+                }
+                let mut frame = dispatch_custody::DispatchFrame::park(cbs);
+                extern "C" {
+                    fn js_abort_error_value() -> f64;
+                }
+                frame.set_payload(js_abort_error_value().to_bits());
+                for i in 0..frame.len() {
+                    let cb = frame.cb(i);
+                    if cb != 0 {
+                        let _ = JsClosure::from_raw(cb as *const RawClosureHeader)
+                            .call1(f64::from_bits(frame.payload_bits()));
+                    }
+                }
+                drop(frame);
+                lifecycle::drain_once_listeners(id, "error");
+            }
             PendingNetEvent::End(id) => {
                 // Issue #1852 — readable side ended (peer FIN). Fire the
                 // `'end'` listeners; the trailing `Close` event (pushed
@@ -1572,6 +1702,10 @@ pub unsafe extern "C" fn js_ext_net_drain_pending() -> i32 {
                 lifecycle::drain_once_listeners(id, "end");
             }
             PendingNetEvent::Close(id) => {
+                extern "C" {
+                    fn js_tls_client_record_closed(handle: i64);
+                }
+                js_tls_client_record_closed(id);
                 let had_error = f64::from_bits(JsValue::from_bool(false).bits());
                 let frame = dispatch_custody::DispatchFrame::park(listeners_for(id, "close"));
                 for i in 0..frame.len() {
@@ -1585,6 +1719,8 @@ pub unsafe extern "C" fn js_ext_net_drain_pending() -> i32 {
                 statics::sockets().lock().unwrap().remove(&id);
                 statics::once_flags().lock().unwrap().remove(&id);
                 statics::encodings().lock().unwrap().remove(&id);
+                statics::http_agent_phases().lock().unwrap().remove(&id);
+                statics::max_listeners().lock().unwrap().remove(&id);
                 server_state::discard_pending_server_data(id);
             }
             // Issue #1123 followup — server-side events. The
@@ -1838,16 +1974,6 @@ pub unsafe extern "C" fn js_ext_net_socket_remove_all_listeners(
     js_net_socket_remove_all_listeners(handle, event_ptr)
 }
 
-#[no_mangle]
-pub extern "C" fn js_ext_net_is_socket_handle(handle: i64) -> i32 {
-    let owned = is_net_socket_handle(handle);
-    if owned {
-        1
-    } else {
-        0
-    }
-}
-
 /// `extern "C"` form of `is_net_server_handle` for method-value/property
 /// dispatch on `net.Server` handles.
 #[no_mangle]
@@ -1857,12 +1983,6 @@ pub extern "C" fn js_ext_net_is_server_handle(handle: i64) -> i32 {
     } else {
         0
     }
-}
-
-/// Auxiliary liveness hook registered with the runtime for mixed stdlib links.
-#[no_mangle]
-pub extern "C" fn js_ext_net_has_active_handles() -> i32 {
-    server_state::has_active_handles() as i32
 }
 
 #[cfg(test)]

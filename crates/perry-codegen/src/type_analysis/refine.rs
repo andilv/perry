@@ -233,6 +233,11 @@ pub(crate) fn proven_type_from_init(ctx: &FnCtx<'_>, init: &Expr) -> Option<HirT
         Expr::String(_) | Expr::WtfString(_) | Expr::I18nString { .. } | Expr::TypeOf(_) => {
             Some(HirType::String)
         }
+        // `Symbol()` identities are system-allocated and never relocated;
+        // `Symbol.for()` identities are process-lifetime `Box` allocations.
+        // Recording the constructor provenance (rather than trusting a
+        // `symbol` annotation) lets strict equality use raw identity safely.
+        Expr::SymbolNew(_) | Expr::SymbolFor(_) => Some(HirType::Symbol),
         Expr::Array(_) | Expr::ArraySpread(_) => Some(HirType::Array(Box::new(HirType::Any))),
         Expr::MapNew | Expr::MapNewFromArray(_) => Some(HirType::Generic {
             base: "Map".to_string(),
@@ -913,6 +918,18 @@ pub(crate) fn compute_auto_captures(
     body: &[perry_hir::Stmt],
     explicit: &[u32],
 ) -> Vec<u32> {
+    compute_auto_captures_with_globals(params, body, explicit, ctx.module_globals)
+}
+
+/// Context-free half of [`compute_auto_captures`]. Closure body emission and
+/// module-level layout registration use this directly so every capture index
+/// comes from the same ordering implementation as the creation site.
+pub(crate) fn compute_auto_captures_with_globals(
+    params: &[perry_hir::Param],
+    body: &[perry_hir::Stmt],
+    explicit: &[u32],
+    module_globals: &std::collections::HashMap<u32, String>,
+) -> Vec<u32> {
     // Exclude module globals from the explicit captures list. perry-hir
     // sometimes lists block-scoped top-level lets (those whose
     // `inside_block_scope > 0`) in `Closure.captures` — the HIR-side
@@ -928,7 +945,7 @@ pub(crate) fn compute_auto_captures(
     let mut out: Vec<u32> = explicit
         .iter()
         .copied()
-        .filter(|id| !ctx.module_globals.contains_key(id))
+        .filter(|id| !module_globals.contains_key(id))
         .collect();
     let mut referenced: std::collections::HashSet<u32> = std::collections::HashSet::new();
     crate::collectors::collect_ref_ids_in_stmts(body, &mut referenced);
@@ -943,7 +960,7 @@ pub(crate) fn compute_auto_captures(
         if !param_ids.contains(&id)
             && !inner_lets.contains(&id)
             && !already.contains(&id)
-            && !ctx.module_globals.contains_key(&id)
+            && !module_globals.contains_key(&id)
         {
             out.push(id);
         }

@@ -89,14 +89,14 @@ mod-node-test = []
 # degrade gracefully when off (auto-optimize leaves this off unless the program
 # uses a heap-snapshot / `process.report` API, which the compiler detects).
 diagnostics = []
-# The user's regular-expression engine (`regex` + `fancy-regex`, ~1.2 MB of
-# DFA/NFA machinery). A program that never evaluates a regex literal, `RegExp`,
+# The user's regular-expression engines (`regex`, `fancy-regex`, and `regress`).
+# A program that never evaluates a regex literal, `RegExp`,
 # a regex-coercing string method, or a glob API can't produce a RegExp at
 # runtime, so the compiler leaves this off and the engine is never linked. The
 # RegExp object's identity/display layer (header, `is_regex_pointer`, `toString`)
 # stays always compiled, so console-formatting / value-to-string paths keep
 # working with no engine present.
-regex-engine = ["dep:regex", "dep:fancy-regex"]
+regex-engine = ["dep:regex", "dep:fancy-regex", "dep:regress"]
 # The TC39 `Temporal.*` API (`temporal_rs` + its transitive tz/calendar deps:
 # jiff-tzdb, icu_calendar, timezone_provider, calendrical_calculations —
 # ~580 KB). Independent of JS `Date` (which has its own `date.rs` impl), so a
@@ -179,16 +179,13 @@ global-webfetch = []
 # detection would make `process.send` undefined, so err toward enabling).
 proc-ipc = []
 # `Intl.getCanonicalLocales` / `*.supportedLocalesOf` BCP-47 (UTS #35) language-tag
-# canonicalization via `icu_locale_core` (the data-free structural parser — case
-# normalization, variant ordering, extension well-formedness, UTS35 rejection of
-# extlang/grandfathered/duplicate-singleton tags). No CLDR data is pulled (that
-# would need `icu_locale` + `icu_locale_data`), so deep alias replacement
-# (grandfathered→preferred, complex subtag replacement) is out of scope. Only
-# `intl.rs` uses it; a program that never canonicalizes a locale links none of
-# it (the compiler enables it on `Intl.getCanonicalLocales`/`supportedLocalesOf`
-# usage). Already pulled transitively by `temporal`, so default/shipped builds
-# carry no extra weight. A hand-rolled structural fallback covers the off case.
-intl-locale = ["dep:icu_locale_core"]
+# canonicalization via ICU4X's structural parser plus compiled CLDR aliases and
+# likely-subtag data. Only Intl locale operations use it; a program that never
+# canonicalizes or expands a locale links none of it. The same data is already
+# pulled transitively by `intl-datetime` in default builds, so the shipped full
+# runtime carries no duplicate tables. A hand-rolled fallback covers the off
+# case for size-optimized builds.
+intl-locale = ["dep:icu_locale", "dep:icu_locale_core"]
 # CLDR-accurate Intl.DateTimeFormat / toLocaleString date-time patterns.
 intl-datetime = ["dep:icu_datetime", "dep:icu_time", "dep:icu_calendar", "dep:icu_locale_core"]
 # `full` only opt-ins the small Node-API helpers (os.hostname / os.homedir).
@@ -261,6 +258,7 @@ libc.workspace = true
 gimli = { version = "0.34", default-features = false, features = ["read"] }
 rand = "0.10"
 regex = { workspace = true, optional = true }
+regress = { workspace = true, features = ["utf16"], optional = true }
 # Taffy — flexbox / grid layout engine for the perry/tui module
 # (#358 Phase 3). Same crate Bevy and Dioxus use; pure Rust, no FFI.
 taffy = { version = "0.13", default-features = false, features = ["std", "flexbox", "taffy_tree"] }
@@ -291,14 +289,20 @@ temporal_rs = { version = "0.2.3", default-features = false, features = ["std", 
 
 serde.workspace = true
 serde_json.workspace = true
+# TLS client identity callbacks run from the external net archive, before the
+# stdlib TLS module is necessarily linked. Keep the legacy peer-certificate
+# object builder in the runtime so that callback path has no stdlib symbol
+# dependency (the DER parser is dead-stripped from programs that never use it).
+x509-cert = { version = "0.3", default-features = false }
 unicode-normalization = { version = "0.1", optional = true }
 # #4877: extended grapheme-cluster / word / sentence segmentation backing
 # Intl.Segmenter (the grapheme path is what string-width@7+/wrap-ansi@9+ use,
 # so it gates ink). Pure-Rust UAX #29 implementation, already in our lock graph.
 unicode-segmentation = { version = "1", optional = true }
-# #5298: BCP-47 (UTS #35) structural locale-tag canonicalization for
-# `Intl.getCanonicalLocales` / `*.supportedLocalesOf`. The data-free structural
-# parser only (no CLDR alias tables); already in our lock graph via temporal_rs.
+# #5298/#5896: BCP-47 (UTS #35) structural locale-tag canonicalization, CLDR
+# aliases, and likely-subtag expansion for the Intl locale APIs. Both crates and
+# their compiled data are already in the default lock graph via icu_datetime.
+icu_locale = { version = "2", optional = true }
 icu_locale_core = { version = "2", optional = true }
 # CLDR date/time formatting for Intl.DateTimeFormat / Date.prototype.toLocale*
 # (icu4x 2.x, matching the icu_calendar/icu_locale_core already in the graph).

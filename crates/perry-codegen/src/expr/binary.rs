@@ -25,7 +25,7 @@ use crate::types::{DOUBLE, I1, I128, I32, I64};
 
 use crate::rooting::with_operands_rooted;
 
-use super::{is_known_finite, lower_expr, FnCtx};
+use super::{is_known_i32_range, lower_expr, FnCtx};
 
 /// `helper(left, right)` with each operand rooted across the other's lowering
 /// and the group released on every path out (#6951).
@@ -303,6 +303,24 @@ fn add_tree_leaves<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
     }
 }
 
+/// Whether a fully-dynamic `+` tree is worth one shared numeric guard.
+///
+/// A three-or-more-leaf tree is the common accumulator shape
+/// `sum += row.x + row.y`: lowering each node independently otherwise pays
+/// the dynamic add helper twice even when every runtime value is a number. At
+/// two leaves the guard merely moves the helper behind a branch; starting at
+/// three it can replace two or more helper calls with one shared tag check.
+///
+/// Do not require a static numeric hint here. The important accumulator case
+/// is often a captured local plus fields read from interface-shaped objects,
+/// so every leaf is `Any` to codegen. The guard itself is the runtime proof;
+/// its cold arm preserves the original tree and exact dynamic `+` semantics.
+fn dynamic_add_tree_benefits_shared_guard(expr: &Expr) -> bool {
+    let mut leaves = Vec::new();
+    add_tree_leaves(expr, &mut leaves);
+    leaves.len() >= 3
+}
+
 /// Rebuild the `+` tree over already-lowered leaf values, node for node, so the
 /// original associativity survives. `fast` picks the inline `fadd`; otherwise
 /// every node goes through the spec-`+` helper.
@@ -358,6 +376,14 @@ fn chain_fold_is_sound(ctx: &FnCtx<'_>, parts: &[&Expr]) -> bool {
 }
 
 fn lower_arithmetic_operand(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<(String, bool)> {
+    // A stable-packed numeric clone has a stronger fact than the generic
+    // untyped-local typed-array probe below: its preheader scanned the exact
+    // range, and its emitted-IR gate proved that no call can invalidate that
+    // proof. Preserve the clone's private direct load and report that no
+    // residual ToNumber coercion is needed.
+    if crate::stmt::stable_packed_loop::has_numeric_index_fact(ctx, expr) {
+        return Ok((lower_expr(ctx, expr)?, true));
+    }
     // #5497 Lever E: a representation-first Boolean local/literal is already
     // an i1. JavaScript arithmetic applies ToNumber, which is exactly an
     // unsigned i1 -> f64 conversion; boxing and calling js_number_coerce only
@@ -889,9 +915,12 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         || crate::type_analysis::expr_produces_canonical_raw_f64(ctx, left))
                     && (right_bool
                         || crate::type_analysis::expr_produces_canonical_raw_f64(ctx, right));
-                if !(both_numeric || boolean_numeric_add)
-                    || add_operands_have_pod_materialization_hazard(ctx, left, right)
-                {
+                let materialization_hazard =
+                    add_operands_have_pod_materialization_hazard(ctx, left, right);
+                if !(both_numeric || boolean_numeric_add) || materialization_hazard {
+                    if dynamic_add_tree_benefits_shared_guard(expr) && !materialization_hazard {
+                        return lower_guarded_numeric_add(ctx, expr);
+                    }
                     return lower_rooted_dynamic_binary(
                         ctx,
                         "js_dynamic_string_or_number_add",
@@ -1080,7 +1109,8 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 // entirely — just fptosi + sitofp (identity for in-range
                 // values, LLVM eliminates via instcombine).
                 BinaryOp::BitOr
-                    if matches!(right.as_ref(), Expr::Integer(0)) && is_known_finite(ctx, left) =>
+                    if matches!(right.as_ref(), Expr::Integer(0))
+                        && is_known_i32_range(ctx, left) =>
                 {
                     let blk = ctx.block();
                     let li = blk.toint32_fast(&l);
@@ -1091,8 +1121,8 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 | BinaryOp::BitXor
                 | BinaryOp::Shl
                 | BinaryOp::Shr => {
-                    let l_safe = is_known_finite(ctx, left);
-                    let r_safe = is_known_finite(ctx, right);
+                    let l_safe = is_known_i32_range(ctx, left);
+                    let r_safe = is_known_i32_range(ctx, right);
                     let blk = ctx.block();
                     let li = if l_safe {
                         blk.toint32_fast(&l)
@@ -1115,15 +1145,16 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     blk.sitofp(I32, &v, DOUBLE)
                 }
                 BinaryOp::UShr
-                    if matches!(right.as_ref(), Expr::Integer(0)) && is_known_finite(ctx, left) =>
+                    if matches!(right.as_ref(), Expr::Integer(0))
+                        && is_known_i32_range(ctx, left) =>
                 {
                     let blk = ctx.block();
                     let li = blk.toint32_fast(&l);
                     blk.uitofp(I32, &li, DOUBLE)
                 }
                 BinaryOp::UShr => {
-                    let l_safe = is_known_finite(ctx, left);
-                    let r_safe = is_known_finite(ctx, right);
+                    let l_safe = is_known_i32_range(ctx, left);
+                    let r_safe = is_known_i32_range(ctx, right);
                     let blk = ctx.block();
                     let li = if l_safe {
                         blk.toint32_fast(&l)

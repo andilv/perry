@@ -177,6 +177,12 @@ pub extern "C" fn js_object_get_index_polymorphic(obj_handle: i64, idx: f64) -> 
     if raw < 0x1000 {
         return f64::from_bits(crate::value::TAG_UNDEFINED);
     }
+    // Symbols share GC_TYPE_STRING storage for tracing, but they are primitive
+    // values, not String exotic objects. A numeric property access boxes the
+    // Symbol transiently and therefore observes no indexed property.
+    if crate::symbol::is_registered_symbol(raw as usize) {
+        return f64::from_bits(crate::value::TAG_UNDEFINED);
+    }
     // #5525 fast path: cached typed-array kind lookup + inline load, ahead of
     // the thread-local `typed_array_get_numeric_index` registry dispatch.
     // `typed_array_fast_index_get` returns `Some(value)` for an in-bounds read
@@ -202,7 +208,7 @@ pub extern "C" fn js_object_get_index_polymorphic(obj_handle: i64, idx: f64) -> 
         && crate::buffer::is_non_indexed_buffer_view(raw as usize)
     {
         if let Some(key) = crate::buffer::canonical_index_key(idx) {
-            return crate::buffer::buffer_get_own_prop(raw as usize, &key)
+            return crate::buffer::buffer_read_own_prop(raw as usize, &key)
                 .unwrap_or_else(|| f64::from_bits(crate::value::TAG_UNDEFINED));
         }
     }
@@ -217,7 +223,7 @@ pub extern "C" fn js_object_get_index_polymorphic(obj_handle: i64, idx: f64) -> 
             // pass wrote into a zero-length Buffer (RangeError
             // [ERR_OUT_OF_RANGE] at the MySQL handshake).
             if let Some(name) = buffer_key_name(idx) {
-                if let Some(v) = crate::buffer::buffer_get_own_prop(raw as usize, &name) {
+                if let Some(v) = crate::buffer::buffer_read_own_prop(raw as usize, &name) {
                     return v;
                 }
                 // The bound closure keeps the name POINTER and re-reads it at
@@ -285,7 +291,16 @@ pub extern "C" fn js_object_get_index_polymorphic(obj_handle: i64, idx: f64) -> 
             return unsafe { rooted_property_key_get(raw, idx) };
         }
     }
-    if gc_type == crate::gc::GC_TYPE_OBJECT || gc_type == crate::gc::GC_TYPE_CLOSURE {
+    if gc_type == crate::gc::GC_TYPE_OBJECT {
+        if let Some(index) = numeric_key_u32_index(idx) {
+            let receiver = f64::from_bits(crate::value::POINTER_TAG | raw);
+            if let Some(value) = crate::array::array_subclass_fast_index_get(receiver, index) {
+                return value;
+            }
+        }
+        return unsafe { rooted_property_key_get(raw, idx) };
+    }
+    if gc_type == crate::gc::GC_TYPE_CLOSURE {
         return unsafe { rooted_property_key_get(raw, idx) };
     }
     if crate::set::is_registered_set(raw as usize) || crate::map::is_registered_map(raw as usize) {
@@ -305,7 +320,7 @@ pub extern "C" fn js_object_get_index_polymorphic(obj_handle: i64, idx: f64) -> 
 /// Polymorphic numeric-key set: `obj[idx] = value` where `idx` is a number
 /// and the receiver type isn't statically known. Dispatches by GC type:
 ///
-/// - `GC_TYPE_ARRAY` / buffer / typed-array → `js_array_set_f64_extend`,
+/// - `GC_TYPE_ARRAY` / buffer / typed-array → `js_array_set_f64_extend_strict`,
 ///   which preserves the array fast-path (forwarding chain follow + grow).
 /// - `GC_TYPE_OBJECT` / `GC_TYPE_CLOSURE`   → stringify `idx` and delegate
 ///   to `js_object_set_field_by_name`. JS treats `obj[0] = v` as `obj["0"] = v`,
@@ -451,10 +466,10 @@ pub extern "C" fn js_object_set_index_polymorphic(obj_handle: i64, idx: f64, val
 
     if gc_type == crate::gc::GC_TYPE_ARRAY {
         if let Some(index) = numeric_key_u32_index(idx) {
-            // Includes lazy/forwarded — js_array_set_f64_extend's clean_arr_ptr_mut
+            // Includes lazy/forwarded — js_array_set_f64_extend_strict's clean_arr_ptr_mut
             // walks the forwarding chain and routes buffers/typed-arrays through
             // their per-kind setter.
-            crate::array::js_array_set_f64_extend(
+            crate::array::js_array_set_f64_extend_strict(
                 raw as *mut crate::array::ArrayHeader,
                 index,
                 value,
@@ -469,6 +484,11 @@ pub extern "C" fn js_object_set_index_polymorphic(obj_handle: i64, idx: f64, val
         // Stringify the index and route through the object field setter,
         // which handles shape transitions, frozen/sealed/extensible checks,
         // overflow into out-of-line storage, and accessor descriptors.
+        // Keep the receiver/key alive because the setter can allocate and the
+        // Array-subclass post-step below must observe their evacuated values.
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let recv_h = scope.root_nanbox_f64(boxed);
+        let key_h = scope.root_nanbox_f64(idx);
         unsafe { rooted_property_key_set(raw, idx, value) };
         // #7574: a `class X extends Array` instance IS an Array in JavaScript,
         // so `sub[3] = v` runs the Array-exotic `[[DefineOwnProperty]]` and
@@ -478,13 +498,10 @@ pub extern "C" fn js_object_set_index_polymorphic(obj_handle: i64, idx: f64, val
         // then made the next `sub.push(v)` append at index 0 and overwrite it.
         // Ordinary objects and object literals never reach the chain walk: the
         // `class_id == 0` test short-circuits first.
-        let class_id = crate::object::js_object_get_class_id(raw as *const ObjectHeader);
-        if class_id != 0 && crate::array::is_array_subclass_class_id(class_id) {
-            if let Some(index) = numeric_key_u32_index(idx) {
-                let recv = f64::from_bits(crate::value::POINTER_TAG | raw);
-                crate::array::maintain_array_exotic_length(recv, index);
-            }
-        }
+        crate::array::note_array_subclass_index_write(
+            recv_h.get_nanbox_f64(),
+            key_h.get_nanbox_f64(),
+        );
         return;
     }
     // Buffer / typed-array were handled above. Map / Set are collection
@@ -492,7 +509,11 @@ pub extern "C" fn js_object_set_index_polymorphic(obj_handle: i64, idx: f64, val
     // writes are no-ops instead of truncating fractional keys into element
     // offsets.
     if let Some(index) = numeric_key_u32_index(idx) {
-        crate::array::js_array_set_f64_extend(raw as *mut crate::array::ArrayHeader, index, value);
+        crate::array::js_array_set_f64_extend_strict(
+            raw as *mut crate::array::ArrayHeader,
+            index,
+            value,
+        );
     }
 }
 

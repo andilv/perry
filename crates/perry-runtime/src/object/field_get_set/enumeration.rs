@@ -956,7 +956,7 @@ pub(crate) fn registered_buffer_own_keys(addr: usize) -> Option<Vec<String>> {
 /// The value each key of [`registered_buffer_own_keys`] names: the byte for an
 /// in-bounds index of a byte-indexed buffer, else the stored own property.
 pub(crate) fn registered_buffer_own_value(addr: usize, key: &str) -> f64 {
-    if let Some(v) = crate::buffer::buffer_get_own_prop(addr, key) {
+    if let Some(v) = crate::buffer::buffer_read_own_prop(addr, key) {
         return v;
     }
     if crate::buffer::is_byte_indexed_buffer(addr) {
@@ -973,30 +973,69 @@ pub(crate) fn registered_buffer_own_value(addr: usize, key: &str) -> f64 {
 /// Build the `Object.keys` / `.values` / `.entries` answer for a registered
 /// buffer from [`registered_buffer_own_keys`].
 fn registered_buffer_enum(addr: usize, what: MapSetEnum) -> Option<*mut ArrayHeader> {
-    let keys = registered_buffer_own_keys(addr)?;
-    let mut out = crate::array::js_array_alloc(keys.len().max(1) as u32);
+    if addr == 0 || !crate::buffer::is_registered_buffer(addr) {
+        return None;
+    }
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let receiver = scope.root_raw_mut_ptr(addr as *mut crate::buffer::BufferHeader);
+    let keys = receiver.with_mut_ptr::<crate::buffer::BufferHeader, _>(|receiver| {
+        registered_buffer_own_keys(receiver as usize)
+    })?;
+    let out = scope.root_raw_mut_ptr(crate::array::js_array_alloc(keys.len().max(1) as u32));
     for key in keys {
         let key_str = || crate::string::js_string_from_bytes(key.as_ptr(), key.len() as u32);
         match what {
             MapSetEnum::Keys => {
-                out = crate::array::js_array_push(out, JSValue::string_ptr(key_str()));
+                let key = scope.root_string_ptr(key_str());
+                let next = out.with_mut_ptr::<ArrayHeader, _>(|out| {
+                    key.with_mut_ptr::<crate::StringHeader, _>(|key| {
+                        crate::array::js_array_push(out, JSValue::string_ptr(key))
+                    })
+                });
+                out.set_raw_mut_ptr(next);
             }
             MapSetEnum::Values => {
-                out = crate::array::js_array_push_f64(out, registered_buffer_own_value(addr, &key));
+                let value =
+                    scope.root_nanbox_f64(receiver.with_mut_ptr::<crate::buffer::BufferHeader, _>(
+                        |receiver| registered_buffer_own_value(receiver as usize, &key),
+                    ));
+                let next = out.with_mut_ptr::<ArrayHeader, _>(|out| {
+                    crate::array::js_array_push_f64(out, value.get_nanbox_f64())
+                });
+                out.set_raw_mut_ptr(next);
             }
             MapSetEnum::Entries => {
-                let pair = crate::array::js_array_alloc(2);
-                let pair = crate::array::js_array_push(pair, JSValue::string_ptr(key_str()));
-                let pair =
-                    crate::array::js_array_push_f64(pair, registered_buffer_own_value(addr, &key));
-                out = crate::array::js_array_push(
-                    out,
-                    JSValue::from_bits(JSValue::pointer(pair as *const u8).bits()),
-                );
+                let pair = scope.root_raw_mut_ptr(crate::array::js_array_alloc(2));
+                let key_value = scope.root_string_ptr(key_str());
+                let next = pair.with_mut_ptr::<ArrayHeader, _>(|pair| {
+                    key_value.with_mut_ptr::<crate::StringHeader, _>(|key| {
+                        crate::array::js_array_push(pair, JSValue::string_ptr(key))
+                    })
+                });
+                pair.set_raw_mut_ptr(next);
+                let value =
+                    scope.root_nanbox_f64(receiver.with_mut_ptr::<crate::buffer::BufferHeader, _>(
+                        |receiver| registered_buffer_own_value(receiver as usize, &key),
+                    ));
+                let next = pair.with_mut_ptr::<ArrayHeader, _>(|pair| {
+                    crate::array::js_array_push_f64(pair, value.get_nanbox_f64())
+                });
+                pair.set_raw_mut_ptr(next);
+                let pair_value =
+                    scope.root_nanbox_f64(pair.with_mut_ptr::<ArrayHeader, _>(|pair| {
+                        crate::value::js_nanbox_pointer(pair as i64)
+                    }));
+                let next = out.with_mut_ptr::<ArrayHeader, _>(|out| {
+                    crate::array::js_array_push(
+                        out,
+                        JSValue::from_bits(pair_value.get_nanbox_u64()),
+                    )
+                });
+                out.set_raw_mut_ptr(next);
             }
         }
     }
-    Some(out)
+    Some(out.with_mut_ptr::<ArrayHeader, _>(|out| out))
 }
 
 /// Get the keys of an object as an array of strings.
@@ -1269,7 +1308,7 @@ pub extern "C" fn js_object_keys(obj: *const ObjectHeader) -> *mut ArrayHeader {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            if (hide_private && (key_str.starts_with('#') || is_internal_runtime_key(key_str)))
+            if (hide_private && is_internal_runtime_key(key_str))
                 || (hide_wasi_state && key_str.starts_with("__wasi"))
             {
                 continue;
@@ -1289,10 +1328,8 @@ pub extern "C" fn js_object_keys(obj: *const ObjectHeader) -> *mut ArrayHeader {
 }
 
 /// Get the values of an object as an array
-/// True when `obj` is a class instance (`class_id != 0`) and `key_val` names a
-/// private element (`#x`). Private elements physically live in the instance
-/// keys_array but are never enumerable/reflectable properties. Plain object
-/// literals keep `class_id == 0`, so `{"#fff": 1}` stays visible.
+/// True when `key_val` names compiler/runtime-only private storage on a class
+/// instance. Public String keys such as `"#x"` remain visible.
 pub(crate) unsafe fn instance_private_key_hidden(
     obj: *const ObjectHeader,
     key_val: crate::JSValue,
@@ -1302,7 +1339,7 @@ pub(crate) unsafe fn instance_private_key_hidden(
     }
     let mut buf = [0u8; crate::value::SHORT_STRING_MAX_LEN];
     crate::string::js_string_key_bytes(key_val, &mut buf)
-        .map(|b| b.first() == Some(&b'#') || is_internal_runtime_key_bytes(b))
+        .map(is_internal_runtime_key_bytes)
         .unwrap_or(false)
 }
 
@@ -1328,7 +1365,18 @@ pub(crate) unsafe fn instance_private_key_hidden(
 pub(crate) fn is_internal_runtime_key_bytes(b: &[u8]) -> bool {
     b == crate::object::map_set_subclass::BACKING_KEY
         || b == crate::weakref::WEAK_ENTRIES_KEY
+        || b == crate::object::parent_static::CLASS_OBJECT_PARENT_KEY.as_bytes()
+        || b == b"__perry_ctor_caps"
         || b.starts_with(crate::node_stream::NATIVE_BASE_SUPER_PREFIX)
+        || b.starts_with(b"__perry_computed_field_key_")
+        || b == b"#<perry:class-evaluation-prototype>"
+        || b == b"#<perry:private-class-lexical-binding>"
+        || b.starts_with(b"#<perry:private-brand:")
+        || b.starts_with(b"#<perry:private-member:")
+        || b.starts_with(b"#<perry:private-field:")
+        || b.starts_with(b"#<perry:private-value:")
+        || b.starts_with(b"#<perry:class-evaluation-method:")
+        || b.starts_with(b"#<perry:static-private-method:")
 }
 
 /// `&str` form of [`is_internal_runtime_key_bytes`].

@@ -41,10 +41,10 @@ pub(super) use super::{
     find_outer_writes_stmt, find_thread_hazard_in_body, get_raw_string_ptr,
     hazardous_module_global_ids, lower_fetch_native_method, lower_native_module_dispatch,
     lower_notification_schedule, lower_perry_ui_table_call, native_module_lookup,
-    perry_audio_table_lookup, perry_i18n_table_lookup, perry_media_table_lookup,
-    perry_plugin_instance_method_lookup, perry_plugin_table_lookup, perry_system_table_lookup,
-    perry_ui_instance_method_lookup, perry_ui_table_lookup, perry_updater_table_lookup,
-    ThreadClosureHazard,
+    perry_audio_table_lookup, perry_i18n_table_lookup, perry_ios_table_lookup,
+    perry_media_table_lookup, perry_plugin_instance_method_lookup, perry_plugin_table_lookup,
+    perry_system_table_lookup, perry_ui_instance_method_lookup, perry_ui_table_lookup,
+    perry_updater_table_lookup, ThreadClosureHazard,
 };
 
 mod box_style;
@@ -369,6 +369,60 @@ pub(crate) fn lower_native_method_call(
     // runtime's method dispatcher so per-instance streams, indentation, and
     // counters are used instead of the process-global console helpers.
     if module == "console" && class_name == Some("Console") {
+        if let Some(recv) = object {
+            let recv_box = lower_expr(ctx, recv)?;
+            let mut lowered_args: Vec<String> = Vec::with_capacity(args.len());
+            for arg in args {
+                lowered_args.push(lower_expr(ctx, arg)?);
+            }
+
+            let (args_ptr, args_len) = if lowered_args.is_empty() {
+                ("null".to_string(), "0".to_string())
+            } else {
+                let n = lowered_args.len();
+                let buf = ctx.func.alloca_entry_array(DOUBLE, n);
+                {
+                    let blk = ctx.block();
+                    for (i, value) in lowered_args.iter().enumerate() {
+                        let slot = blk.gep(DOUBLE, &buf, &[(I64, &i.to_string())]);
+                        blk.store(DOUBLE, value, &slot);
+                    }
+                }
+                (buf, n.to_string())
+            };
+
+            let method_idx = ctx.strings.intern(method);
+            let entry = ctx.strings.entry(method_idx);
+            let bytes_global = format!("@{}", entry.bytes_global);
+            let name_len = entry.byte_len.to_string();
+            return Ok(ctx.block().call(
+                DOUBLE,
+                "js_native_call_method",
+                &[
+                    (DOUBLE, &recv_box),
+                    (PTR, &bytes_global),
+                    (I64, &name_len),
+                    (PTR, &args_ptr),
+                    (I64, &args_len),
+                ],
+            ));
+        }
+    }
+
+    // `X509Certificate` instances are compact native handles.  Their method
+    // calls normally miss the static native table and used to fall through to
+    // `js_native_call_method_nullsafe`.  That entry point also serves native
+    // *property reads*, so its zero-argument path asks the handle-property
+    // dispatcher first.  For `cert.toLegacyObject()` this returned the bound
+    // method closure instead of invoking it; valid-host identity checks then
+    // appeared to pass only because a closure is not a certificate object.
+    //
+    // Bare method-value reads (`const f = cert.toLegacyObject`) remain ordinary
+    // `PropertyGet`s in HIR (`is_native_dispatch_member` deliberately excludes
+    // crypto), so an actual `NativeMethodCall` for this exact class is
+    // unambiguously a call.  Route it through the non-property dispatcher just
+    // like the Console instance arm above.
+    if module == "crypto" && class_name == Some("X509Certificate") {
         if let Some(recv) = object {
             let recv_box = lower_expr(ctx, recv)?;
             let mut lowered_args: Vec<String> = Vec::with_capacity(args.len());

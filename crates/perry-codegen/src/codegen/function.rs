@@ -580,6 +580,11 @@ pub(super) fn compile_function(
     let ic_base = llmod.ic_counter;
     let buffer_alias_base = llmod.buffer_alias_counter;
     let lf = llmod.define_function(&llvm_name, DOUBLE, params);
+    let entry_outline_chunk = super::entry_outline::is_entry_chunk(f);
+    // #8595: these functions exist specifically to bound backend work. Letting
+    // the ordinary or pre-statepoint inliner fold them back into module init
+    // would recreate the single giant function before RS4GC/ISel/regalloc.
+    lf.no_inline = entry_outline_chunk;
     if typed_public_trampoline.is_some()
         || guarded_public_plan.is_some()
         || spec_entry.is_some()
@@ -620,7 +625,8 @@ pub(super) fn compile_function(
     // rewritten wrapper into its caller breaks GC-root coverage of the
     // step closure's iter capture, hanging async chains (issue #447).
     let specialized_entry = spec_entry.is_some();
-    if !specialized_entry
+    if !entry_outline_chunk
+        && !specialized_entry
         && f.body.len() <= 8
         && !f.is_async
         && !f.is_generator
@@ -647,7 +653,8 @@ pub(super) fn compile_function(
     // as `hot_loop_callee` (before the entry block exists and before any
     // expression is lowered), for the same reason.
     lf.alloc_hot = cross_module.alloc_hot_functions.contains(&f.id);
-    if !specialized_entry
+    if !entry_outline_chunk
+        && !specialized_entry
         && !lf.force_inline
         && inline_hot_small_enabled()
         && (INLINE_HOT_SMALL_MIN..=inline_hot_small_size_cap()).contains(&f.body.len())
@@ -1032,6 +1039,9 @@ pub(super) fn compile_function(
         pending_labels: Vec::new(),
         classes,
         this_stack: Vec::new(),
+        super_called_stack: Vec::new(),
+        shared_super_scope_active: false,
+        lexical_this_uses_derived_binding: false,
         inline_ctor_return: Vec::new(),
         new_target_stack: Vec::new(),
         class_stack: Vec::new(),
@@ -1071,6 +1081,8 @@ pub(super) fn compile_function(
         local_closure_func_ids: HashMap::new(),
         local_closure_param_counts: HashMap::new(),
         resolved_arrow_callback_targets: HashMap::new(),
+        trusted_box_captures: false,
+        trusted_box_capture_ptrs: HashMap::new(),
         local_func_ref_ids: HashMap::new(),
         option_object_locals: HashMap::new(),
         object_literal_locals: HashSet::new(),
@@ -1114,6 +1126,7 @@ pub(super) fn compile_function(
         class_shape_slots: HashMap::new(),
         class_header_images: HashMap::new(),
         cached_lengths: HashMap::new(),
+        array_length_snapshots: HashMap::new(),
         bounded_index_pairs: Vec::new(),
         packed_f64_loop_facts: Vec::new(),
         masked_window_array_facts: Vec::new(),
@@ -1192,6 +1205,9 @@ pub(super) fn compile_function(
         typed_f64_methods: &cross_module.typed_f64_methods,
         pshape_methods: &cross_module.pshape_methods,
         nonnegative_index_methods: &cross_module.nonnegative_index_methods,
+        trusted_array_param_handles: HashMap::new(),
+        versioned_indexed_loop_facts: Vec::new(),
+        stable_packed_loop_facts: Vec::new(),
         pshape_tower_routable: &cross_module.pshape_tower_routable,
         proven_this: None,
         typed_i32_methods: &cross_module.typed_i32_methods,

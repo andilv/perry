@@ -10,9 +10,9 @@ use perry_hir::{BinaryOp, Expr, UpdateOp};
 
 use crate::lower_string_concat::{
     can_lower_string_self_append, flatten_string_add_chain, lower_string_self_append,
+    lower_string_self_append_chain,
 };
 use crate::nanbox::double_literal;
-use crate::native_value::MaterializationReason;
 use crate::type_analysis::{is_map_expr, is_set_expr, receiver_class_name};
 use crate::types::{DOUBLE, I32, I64};
 
@@ -20,8 +20,38 @@ use super::{
     can_lower_expr_as_i32_in_current_region, emit_root_nanbox_store_on_block,
     emit_shadow_slot_clear, emit_shadow_slot_update_for_expr, emit_write_barrier,
     is_global_this_builtin_function_name, lower_expr, lower_expr_as_i32,
-    lower_pod_local_reassignment, materialize_pod_local, nanbox_string_inline, FnCtx,
+    lower_pod_local_reassignment, materialize_pod_value_copy, nanbox_string_inline, FnCtx,
+    TrustedBoxCapturePtr,
 };
+
+/// Load the current value from a compiler-proven raw box capture.
+///
+/// The exact-arrow resolver has already validated `capture.ptr`, so the hot
+/// path is a direct cell load. Preserve lexical TDZ behavior with a cold call
+/// to the existing trusted accessor only for the reserved sentinel; that
+/// helper owns both ReferenceError construction and Perry's internal TDZ
+/// suppression window semantics.
+fn load_trusted_box_capture_bits(ctx: &mut FnCtx<'_>, capture: &TrustedBoxCapturePtr) -> String {
+    let bits = ctx.block().load(I64, &capture.ptr);
+    let is_tdz = ctx.block().icmp_eq(I64, &bits, crate::nanbox::TAG_TDZ_I64);
+    let slow_idx = ctx.new_block("trusted_box.tdz");
+    let merge_idx = ctx.new_block("trusted_box.read");
+    let slow_label = ctx.block_label(slow_idx);
+    let merge_label = ctx.block_label(merge_idx);
+    let fast_label = ctx.block().label.clone();
+    ctx.block().cond_br(&is_tdz, &slow_label, &merge_label);
+
+    ctx.current_block = slow_idx;
+    let slow_bits = ctx
+        .block()
+        .call(I64, "js_box_get_bits_trusted", &[(I64, &capture.bits)]);
+    let slow_end = ctx.block().label.clone();
+    ctx.block().br(&merge_label);
+
+    ctx.current_block = merge_idx;
+    ctx.block()
+        .phi(I64, &[(&bits, &fast_label), (&slow_bits, &slow_end)])
+}
 
 /// A box, closure cell, or module root is the storage for the source binding,
 /// not an alias of the string it currently owns. An ordinary read extracts a
@@ -408,27 +438,40 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         // module-scope `let`s (the ones in `hir.init` at top level).
         Expr::LocalGet(id) => {
             if ctx.pod_records.contains_key(id) {
-                return materialize_pod_local(ctx, *id, MaterializationReason::PodMaterialization);
+                return materialize_pod_value_copy(ctx, *id);
             }
             // Captured by closure (from outer scope):
             if let Some(&capture_idx) = ctx.closure_captures.get(id) {
-                let closure_ptr = super::current_closure_ptr_value(ctx, "captured local")?;
                 let idx_str = capture_idx.to_string();
                 // If the captured id is a boxed var, the capture slot holds a
                 // raw box pointer. Read the capture, extract the box pointer,
                 // and deref via js_box_get_bits.
                 if ctx.boxed_vars.contains(id) {
+                    if let Some(capture) = ctx.trusted_box_capture_ptrs.get(id).cloned() {
+                        let bits = load_trusted_box_capture_bits(ctx, &capture);
+                        let value = ctx.block().bitcast_i64_to_double(&bits);
+                        demote_extracted_string_binding(ctx, *id, &value);
+                        return Ok(value);
+                    }
+                    let closure_ptr =
+                        super::current_closure_ptr_value(ctx, "captured boxed local")?;
+                    let getter = if ctx.trusted_box_captures {
+                        "js_box_get_bits_trusted"
+                    } else {
+                        "js_box_get_bits"
+                    };
                     let blk = ctx.block();
                     let box_ptr = blk.call(
                         I64,
                         "js_closure_get_capture_bits",
                         &[(I64, &closure_ptr), (I32, &idx_str)],
                     );
-                    let bits = blk.call(I64, "js_box_get_bits", &[(I64, &box_ptr)]);
+                    let bits = blk.call(I64, getter, &[(I64, &box_ptr)]);
                     let value = blk.bitcast_i64_to_double(&bits);
                     demote_extracted_string_binding(ctx, *id, &value);
                     return Ok(value);
                 }
+                let closure_ptr = super::current_closure_ptr_value(ctx, "captured local")?;
                 let bits = ctx.block().call(
                     I64,
                     "js_closure_get_capture_bits",
@@ -575,15 +618,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         None
                     };
                     if let Some(parts) = accumulator_parts {
-                        let mut suffix = parts[1].clone();
-                        for part in &parts[2..] {
-                            suffix = Expr::Binary {
-                                op: BinaryOp::Add,
-                                left: Box::new(suffix),
-                                right: Box::new((*part).clone()),
-                            };
-                        }
-                        let v = lower_string_self_append(ctx, *id, &suffix)?;
+                        let v = lower_string_self_append_chain(ctx, *id, &parts[1..])?;
                         emit_shadow_slot_update_for_expr(ctx, *id, &v, value);
                         super::record_native_arena_owner_assignment(ctx, *id, value.as_ref());
                         return Ok(v);
@@ -600,11 +635,60 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // via one sitofp per write so non-int readers (e.g. `acc / K`)
             // still see the current value.
             if let Some(i32_slot) = ctx.i32_counter_slots.get(id).cloned() {
+                let structurally_i32 = can_lower_expr_as_i32_in_current_region(ctx, value);
+                // Within a stable-packed numeric clone, when `x` is a
+                // canonical raw Number, `x | 0` may feed the canonical i32
+                // slot directly: materializing a double here only to convert
+                // it back would duplicate the spec ToInt32. Keep BOTH gates
+                // explicit. Declared Number types are erased, so a local can
+                // still hold a String or BigInt at runtime; and other loop
+                // clones own narrower indexed-load contracts that their
+                // existing assignment lowering must continue to see.
+                //
+                // The canonical gate is a claim about the VALUE the ordinary
+                // lowering of `x` produces, NOT a licence to re-evaluate `x`'s
+                // operands natively — see the lowering below.
+                let explicit_numeric_toint32 = matches!(
+                    value.as_ref(),
+                    Expr::Binary {
+                        op: BinaryOp::BitOr,
+                        left,
+                        right,
+                        ..
+                    } if matches!(right.as_ref(), Expr::Integer(0))
+                        && crate::type_analysis::expr_produces_canonical_raw_f64(ctx, left)
+                ) && !ctx.stable_packed_loop_facts.is_empty();
                 if !ctx.closure_captures.contains_key(id)
                     && !(ctx.boxed_vars.contains(id) && !ctx.module_globals.contains_key(id))
-                    && can_lower_expr_as_i32_in_current_region(ctx, value)
+                    && (structurally_i32 || explicit_numeric_toint32)
                 {
-                    let v_i32 = lower_expr_as_i32(ctx, value)?;
+                    let v_i32 = if structurally_i32 {
+                        lower_expr_as_i32(ctx, value)?
+                    } else {
+                        // `expr_produces_canonical_raw_f64` vouches for the
+                        // RESULT of `x | 0`; it says nothing about `x`'s
+                        // OPERANDS. Lowering the tree as native i32 would let
+                        // `lower_expr_native_i32`'s i32-chain arm `fptosi`
+                        // every operand it cannot lower natively — turning
+                        // `h ^ recv.charCodeAt(i)` on an unproven receiver into
+                        // an inline `xor i32` over whatever that method
+                        // returned, so a BigInt silently yields garbage instead
+                        // of the spec's TypeError (the #7773 family: only a
+                        // live guard is a proof, an inferred type is not).
+                        //
+                        // Lower through `lower_expr` instead. `expr/binary.rs`
+                        // applies `is_provably_not_bigint` PER OPERAND, so a
+                        // proven tree still gets the inline `xor i32`/`or i32`
+                        // and an unproven one keeps the BigInt-aware
+                        // `js_dynamic_bit*` helper. The trailing conversion is
+                        // free: `x | 0` always lowers to `sitofp i32`, so
+                        // instcombine folds `trunc(fptosi(sitofp(v)))` back to
+                        // `v` — and that `sitofp` is exactly why `toint32_fast`
+                        // (whose contract is a known-finite input) is the right
+                        // conversion here.
+                        let d = lower_expr(ctx, value)?;
+                        ctx.block().toint32_fast(&d)
+                    };
                     let unsigned_i32 = ctx.unsigned_i32_locals.contains(id);
                     let blk = ctx.block();
                     blk.store(I32, &v_i32, &i32_slot);
@@ -651,24 +735,38 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // Closure captures first (write through the runtime), then
             // locals, then module globals.
             if let Some(&capture_idx) = ctx.closure_captures.get(id) {
-                let closure_ptr = super::current_closure_ptr_value(ctx, "captured local set")?;
                 let idx_str = capture_idx.to_string();
                 // Boxed captured var: read the box pointer from the
                 // capture slot, then js_box_set_bits to update the shared
                 // cell. Do NOT overwrite the capture slot — it holds
                 // the box pointer, not the value.
                 if ctx.boxed_vars.contains(id) {
-                    let blk = ctx.block();
-                    let box_ptr = blk.call(
-                        I64,
-                        "js_closure_get_capture_bits",
-                        &[(I64, &closure_ptr), (I32, &idx_str)],
-                    );
-                    let v_bits = blk.bitcast_double_to_i64(&v);
-                    blk.call_void("js_box_set_bits", &[(I64, &box_ptr), (I64, &v_bits)]);
-                    // Gen-GC Phase C2: barrier — box is the parent.
-                    emit_write_barrier(ctx, &box_ptr, &v_bits);
+                    if let Some(capture) = ctx.trusted_box_capture_ptrs.get(id).cloned() {
+                        let v_bits = ctx.block().bitcast_double_to_i64(&v);
+                        ctx.block().store(I64, &v_bits, &capture.ptr);
+                        // Gen-GC Phase C2: barrier — box is the parent.
+                        emit_write_barrier(ctx, &capture.bits, &v_bits);
+                    } else {
+                        let closure_ptr =
+                            super::current_closure_ptr_value(ctx, "captured boxed local set")?;
+                        let setter = if ctx.trusted_box_captures {
+                            "js_box_set_bits_trusted_no_barrier"
+                        } else {
+                            "js_box_set_bits"
+                        };
+                        let blk = ctx.block();
+                        let box_ptr = blk.call(
+                            I64,
+                            "js_closure_get_capture_bits",
+                            &[(I64, &closure_ptr), (I32, &idx_str)],
+                        );
+                        let v_bits = blk.bitcast_double_to_i64(&v);
+                        blk.call_void(setter, &[(I64, &box_ptr), (I64, &v_bits)]);
+                        // Gen-GC Phase C2: barrier — box is the parent.
+                        emit_write_barrier(ctx, &box_ptr, &v_bits);
+                    }
                 } else {
+                    let closure_ptr = super::current_closure_ptr_value(ctx, "captured local set")?;
                     let v_bits = ctx.block().bitcast_double_to_i64(&v);
                     ctx.block().call_void(
                         "js_closure_set_capture_bits",
@@ -779,7 +877,6 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             };
             // Closure capture path: runtime get + add/sub + runtime set.
             if let Some(&capture_idx) = ctx.closure_captures.get(id) {
-                let closure_ptr = super::current_closure_ptr_value(ctx, "captured local update")?;
                 let idx_str = capture_idx.to_string();
                 // Boxed captured var: deref box bits, modify, store back.
                 //
@@ -804,23 +901,48 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 // activation therefore cannot become reusable inside the
                 // nested user frame `coerce_old`/`step_new` may enter.
                 if ctx.boxed_vars.contains(id) {
+                    if let Some(capture) = ctx.trusted_box_capture_ptrs.get(id).cloned() {
+                        let old_bits = load_trusted_box_capture_bits(ctx, &capture);
+                        let old = ctx.block().bitcast_i64_to_double(&old_bits);
+                        let old = coerce_old(ctx.block(), &old);
+                        let new = step_new(ctx.block(), &old);
+                        let new_bits = ctx.block().bitcast_double_to_i64(&new);
+                        ctx.block().store(I64, &new_bits, &capture.ptr);
+                        // Gen-GC Phase C2: `++`/`--` on a BigInt yields a heap
+                        // pointer via js_numeric_step — barrier the box parent.
+                        emit_write_barrier(ctx, &capture.bits, &new_bits);
+                        return Ok(if *prefix { new } else { old });
+                    }
+                    let closure_ptr =
+                        super::current_closure_ptr_value(ctx, "captured boxed local update")?;
+                    let getter = if ctx.trusted_box_captures {
+                        "js_box_get_bits_trusted"
+                    } else {
+                        "js_box_get_bits"
+                    };
+                    let setter = if ctx.trusted_box_captures {
+                        "js_box_set_bits_trusted_no_barrier"
+                    } else {
+                        "js_box_set_bits"
+                    };
                     let blk = ctx.block();
                     let box_ptr = blk.call(
                         I64,
                         "js_closure_get_capture_bits",
                         &[(I64, &closure_ptr), (I32, &idx_str)],
                     );
-                    let old_bits = blk.call(I64, "js_box_get_bits", &[(I64, &box_ptr)]);
+                    let old_bits = blk.call(I64, getter, &[(I64, &box_ptr)]);
                     let old = blk.bitcast_i64_to_double(&old_bits);
                     let old = coerce_old(blk, &old);
                     let new = step_new(blk, &old);
                     let new_bits = blk.bitcast_double_to_i64(&new);
-                    blk.call_void("js_box_set_bits", &[(I64, &box_ptr), (I64, &new_bits)]);
+                    blk.call_void(setter, &[(I64, &box_ptr), (I64, &new_bits)]);
                     // Gen-GC Phase C2: `++`/`--` on a BigInt yields a heap
                     // pointer via js_numeric_step — barrier the box parent.
                     emit_write_barrier(ctx, &box_ptr, &new_bits);
                     return Ok(if *prefix { new } else { old });
                 }
+                let closure_ptr = super::current_closure_ptr_value(ctx, "captured local update")?;
                 let old_bits = ctx.block().call(
                     I64,
                     "js_closure_get_capture_bits",

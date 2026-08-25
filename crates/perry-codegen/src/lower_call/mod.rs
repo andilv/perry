@@ -47,6 +47,10 @@ mod console_rooting_tests;
 #[cfg(test)]
 mod ctor_prologue_store_tests;
 mod ctor_prologue_stores;
+/// #8648: what a standalone `<Class>_constructor` symbol RETURNS — see the
+/// module header for why this can only be asserted on IR.
+#[cfg(test)]
+mod ctor_return_publish_tests;
 mod dataview_intrinsic;
 mod early_branches;
 mod event_target;
@@ -62,14 +66,18 @@ pub(crate) use func_ref::{
 };
 mod jsx;
 mod method_override;
+pub(crate) use method_override::emit_inline_direct_method_shape_guard;
 mod namespace_call;
 mod native;
 mod native_module_dispatch;
+#[cfg(test)]
+mod native_module_rooting_tests;
 mod native_table;
 mod new;
 pub(crate) mod new_alloc;
 mod new_ctor_args;
 mod new_helpers;
+pub(crate) use new_helpers::emit_ctor_return_override;
 mod omitted_native_params;
 mod options;
 /// `pub(crate)` so `type_analysis` can reuse the exact receiver/method
@@ -116,9 +124,9 @@ use ui_styling::apply_inline_style;
 // table-lookup family and `lower_perry_ui_table_call` unchanged.
 pub(super) use ui_tables::{
     lower_perry_ui_table_call, perry_audio_table_lookup, perry_background_table_lookup,
-    perry_i18n_table_lookup, perry_media_table_lookup, perry_plugin_instance_method_lookup,
-    perry_plugin_table_lookup, perry_system_table_lookup, perry_ui_instance_method_lookup,
-    perry_ui_table_lookup, perry_updater_table_lookup,
+    perry_i18n_table_lookup, perry_ios_table_lookup, perry_media_table_lookup,
+    perry_plugin_instance_method_lookup, perry_plugin_table_lookup, perry_system_table_lookup,
+    perry_ui_instance_method_lookup, perry_ui_table_lookup, perry_updater_table_lookup,
 };
 // Same for `native_module_dispatch.rs` — `native.rs` consumes both
 // `native_module_lookup` and `lower_native_module_dispatch` via
@@ -150,7 +158,7 @@ pub(crate) use new_ctor_args::{
 // super-must-be-called.
 pub(crate) use new_helpers::{
     ctor_body_calls_super, ctor_body_closure_calls_super, ctor_body_has_value_return,
-    ctor_body_uses_this,
+    ctor_body_uses_this, ctor_chain_can_replace_this,
 };
 // #6325 / #6326: the class-chain walk to a native base whose surface perry
 // stamps onto the instance, plus its init emitter. Shared by the implicit

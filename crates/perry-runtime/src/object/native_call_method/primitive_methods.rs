@@ -59,6 +59,24 @@ pub(super) unsafe fn dispatch_primitive(
                 args.as_ptr(),
                 args.len(),
             ));
+        } else if class_id != 0
+            && matches!(
+                method_name,
+                "bind" | "call" | "apply" | "isPrototypeOf" | "toString"
+            )
+            && crate::object::class_registry::class_own_static_field_value(class_id, method_name)
+                .is_none()
+        {
+            // These are inherited Function/Object prototype operations, not
+            // static data members. Let `dispatch_common` handle them. Looking
+            // them up as a class property here reifies a bound method whose
+            // dispatch re-enters this same arm indefinitely (`C.call(...)`
+            // exhausted the native stack instead of throwing TypeError).
+            return match method_name {
+                "bind" => Some(crate::closure::js_function_bind(object, args_ptr, args_len)),
+                "call" | "apply" => super::proto_dispatch::throw_fn_proto_not_callable(method_name),
+                _ => None,
+            };
         } else if class_id != 0 && !method_name_ptr.is_null() && method_name_len > 0 {
             // #5437: `C.viaFn()` where `viaFn` is a static DATA property holding a
             // callable (`C.viaFn = fn` / `static viaFn = fn`), NOT a registered
@@ -128,16 +146,10 @@ pub(super) unsafe fn dispatch_primitive(
             let str_ptr = crate::string::js_string_from_bytes(s.as_ptr(), s.len() as u32);
             return Some(f64::from_bits(JSValue::string_ptr(str_ptr).bits()));
         }
-        let raw = crate::value::js_nanbox_get_pointer(object) as *const u8;
-        if !raw.is_null() && crate::object::is_valid_obj_ptr(raw) {
-            unsafe {
-                let gc = raw.sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-                if (*gc).obj_type == crate::gc::GC_TYPE_ERROR {
-                    let s = crate::error::js_error_to_string(raw as *mut crate::error::ErrorHeader);
-                    return Some(f64::from_bits(JSValue::string_ptr(s).bits()));
-                }
-            }
-        }
+        // Error instances continue through ordinary method lookup. Their
+        // prototype's `toString` is replaceable, so hard-wiring the native
+        // formatter here would ignore `Error.prototype.toString =
+        // Object.prototype.toString`.
     }
 
     // Primitive-wrapper prototypes (`Number.prototype`, `Boolean.prototype`,
@@ -195,7 +207,7 @@ pub(super) unsafe fn dispatch_primitive(
                     (own.to_bits() & crate::value::POINTER_MASK) as usize,
                 )
             {
-                return None;
+                return super::call_primitive_closure_value(object, own_jsv, args_ptr, args_len);
             }
         }
         match method_name {

@@ -126,6 +126,12 @@ pub(super) fn emit_string_pool(
     closure_lengths: &HashMap<u32, u32>,
     // Closure body func_ids that came from arrow function syntax.
     closure_arrow_functions: &std::collections::HashSet<u32>,
+    // Small direct arrow callbacks with an internal body that trusts their
+    // compiler-installed box-capture slots after exact-target resolution.
+    trusted_box_closures: &std::collections::HashMap<
+        u32,
+        super::closure_collect::TrustedBoxClosure,
+    >,
     // Issue #653: wrappers (`__perry_wrap_<name>`) for top-level user functions
     // that declare a rest param. Each entry is `(wrapper_symbol, fixed_arity)`
     // — the runtime side-table is keyed on the wrapper's func_ptr, NOT the
@@ -1055,6 +1061,41 @@ pub(super) fn emit_string_pool(
             ],
         );
     }
+    // Class refs are immediate values, not heap Function objects. Register
+    // each constructor's visible arity so the field-get path can reify the
+    // Function-compatible own `length` property.
+    let mut class_lengths: Vec<(u32, u32)> = classes
+        .iter()
+        .filter(|(class_name, class)| *class_name == &class.name && class.id != 0)
+        .filter_map(|(class_name, class)| {
+            let cid = class_ids.get(class_name).copied()?;
+            let length = class
+                .constructor
+                .as_ref()
+                .map(|ctor| {
+                    ctor.params
+                        .iter()
+                        .take_while(|p| {
+                            !p.is_rest && p.default.is_none() && !p.name.starts_with("__perry_cap_")
+                        })
+                        .count() as u32
+                })
+                .unwrap_or(0);
+            Some((cid, length))
+        })
+        .collect();
+    class_lengths.sort_unstable_by_key(|(cid, _)| *cid);
+    class_lengths.dedup_by_key(|(cid, _)| *cid);
+    for (cid, length) in class_lengths {
+        chunker.roll_if_full();
+        chunker.current_block().call_void(
+            "js_register_class_length",
+            &[
+                (crate::types::I32, &cid.to_string()),
+                (crate::types::I32, &length.to_string()),
+            ],
+        );
+    }
 
     // Refs #486 (hono logger middleware): also register every class
     // getter in the runtime VTABLE_REGISTRY. Without this, cross-module
@@ -1327,6 +1368,28 @@ pub(super) fn emit_string_pool(
         let closure_sym = format!("perry_closure_{}__{}", module_prefix, fid);
         let func_ref = format!("@{}", closure_sym);
         blk.call_void("js_register_closure_arrow_function", &[(PTR, &func_ref)]);
+    }
+
+    let mut sorted_trusted: Vec<(u32, super::closure_collect::TrustedBoxClosure)> =
+        trusted_box_closures
+            .iter()
+            .map(|(func_id, plan)| (*func_id, *plan))
+            .collect();
+    sorted_trusted.sort_unstable_by_key(|(func_id, _)| *func_id);
+    for (fid, plan) in sorted_trusted {
+        chunker.roll_if_full();
+        let blk = chunker.current_block();
+        let public_ref = format!("@perry_closure_{}__{}", module_prefix, fid);
+        let trusted_ref = format!("{}$trusted_boxes", public_ref);
+        blk.call_void(
+            "js_register_closure_trusted_direct",
+            &[
+                (PTR, &public_ref),
+                (PTR, &trusted_ref),
+                (I32, &plan.capture_count.to_string()),
+                (I64, &plan.boxed_capture_mask.to_string()),
+            ],
+        );
     }
 
     // Issue #653: register `__perry_wrap_<name>` wrappers for top-level user

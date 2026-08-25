@@ -41,8 +41,9 @@ const BUILD_CACHE_ENV_VARS: &[&str] = &[
     "PERRY_RS4GC",
     // `-Os` vs `-O3` for every native module.
     "PERRY_LL_SIZE_OPT",
-    // The post-RS4GC per-function instruction budget (#8583): a unit that one
-    // setting refuses must not be served from a build another accepted.
+    // The post-RS4GC per-function instruction budget (#8583/#8679): a function
+    // one setting re-lowers must not be served from a build another kept on
+    // statepoints.
     "PERRY_LL_RS4GC_MAX_INSTRS",
     // #8583: the relocation estimate above which a function spills its GC roots
     // to a shadow frame. It changes which functions carry statepoints, so it
@@ -98,6 +99,10 @@ const BUILD_CACHE_ENV_VARS: &[&str] = &[
     "PERRY_LLVM_LIB",
     "PERRY_LLVM_OPT",
     "PERRY_OUTLINE_METHOD_DISPATCH",
+    // Entry-function outlining changes the emitted function graph; the chunk
+    // size changes the split points, so both belong in the cache key.
+    "PERRY_OUTLINE_ENTRY",
+    "PERRY_OUTLINE_ENTRY_CHUNK_STMTS",
     "PERRY_PTR_NUMARRAY_LOCALS",
     "PERRY_PTR_SHAPE_LOCALS",
     "PERRY_PTR_SHAPE_THIS",
@@ -107,10 +112,17 @@ const BUILD_CACHE_ENV_VARS: &[&str] = &[
     "PERRY_STATIC_STRING_LOWERING",
     "PERRY_STRING_INIT_CHUNK_SIZE",
     "PERRY_TA_PARAM_F64_READ",
+    // #8692: disables guarded direct Uint32Array read-modify-write lowering;
+    // toggling it changes the generated CFG and helper calls.
+    "PERRY_TYPED_ARRAY_RMW",
     "PERRY_WATCHOS_ARM64_32",
     // #8105 — number-by-construction locals (see the collector of the same
     // name); `=0` empties the fact and changes every affected function's IR.
     "PERRY_NUMBER_BY_CONSTRUCTION",
+    // #8583 follow-up gate: `=0/off/false` reverts every large constant array
+    // literal from the const-descriptor path to procedural construction —
+    // different emitted IR for the same source.
+    "PERRY_CONST_ARRAY_DESCRIPTOR",
 ];
 
 /// #7183: codegen env vars that deliberately do NOT key the build cache.
@@ -141,6 +153,12 @@ const BUILD_CACHE_ENV_EXCLUSIONS: &[&str] = &[
     // Human-facing telemetry only; never changes IR or object bytes.
     "PERRY_CODEGEN_PROGRESS",
     "PERRY_CODEGEN_UNIT_TIMINGS",
+    // Entry outlining report output is observational only.
+    "PERRY_OUTLINE_ENTRY_REPORT",
+    // Only read on an already-fatal dialect-construction failure (a unit that
+    // never parses); it writes a diagnostic IR dump to `<dir>/<name>.ll` for
+    // triage and cannot affect the bytes of any build that actually succeeds.
+    "PERRY_DIALECT_DUMP",
 ];
 
 #[cfg(test)]
@@ -716,6 +734,9 @@ fn eligibility(args: &CompileArgs, project_root: &Path) -> Result<(), String> {
     // so the report would be empty. Same reasoning as explain-lowering above.
     if args.opt_report.is_some() || std::env::var("PERRY_OPT_REPORT").is_ok() {
         return Err("opt-report".to_string());
+    }
+    if std::env::var("PERRY_OUTLINE_ENTRY_REPORT").is_ok() {
+        return Err("outline-entry-report".to_string());
     }
     if args.verify_native_regions || args.emit_attest || args.emit_sandbox {
         return Err("sidecar-or-verify".to_string());

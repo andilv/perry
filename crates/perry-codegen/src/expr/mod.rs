@@ -87,7 +87,7 @@ pub(crate) use helpers::{
 };
 pub(crate) use i32_fast_path::{
     can_lower_expr_as_i32, can_lower_expr_as_i32_in_current_region,
-    imul_operand_i32_lowerable_in_current_region, is_known_finite, lower_expr_as_i32,
+    imul_operand_i32_lowerable_in_current_region, is_known_i32_range, lower_expr_as_i32,
     lower_expr_native, lower_imul_operand_i32, lower_packed_u32_loop_index_get,
     try_flat_const_2d_int, try_lower_flat_const_index_get,
 };
@@ -99,8 +99,9 @@ pub(crate) use nanbox_inline::{
 pub(crate) use native_record::{array_kind_fact, effect_fact, raw_f64_layout_fact};
 pub(crate) use object_literal::lower_object_literal;
 pub(crate) use pod_record::{
-    lower_and_store_initial_pod_field, lower_pod_local_reassignment, materialize_pod_local,
-    try_lower_pod_field_get, try_lower_pod_field_set,
+    copy_pod_local, lower_and_store_initial_pod_field, lower_pod_local_reassignment,
+    materialize_pod_local, materialize_pod_value_copy, try_lower_pod_field_get,
+    try_lower_pod_field_set,
 };
 pub(crate) use proven_view_access::{
     index_is_exact_i32_shape, local_is_proven_int_store_view,
@@ -354,6 +355,16 @@ pub(crate) struct FnCtx<'a> {
     /// Stack of `this` slot pointers — set when lowering inside a class
     /// constructor body. `Expr::This` loads from the top entry.
     pub this_stack: Vec<String>,
+    /// Per-inlined-constructor flag slots used by `super()`. A successful
+    /// super-constructor return binds derived `this` exactly once; a second
+    /// successful call must throw before instance elements run again.
+    pub super_called_stack: Vec<String>,
+    /// The outermost standalone derived-constructor binding was also exposed
+    /// to nested arrow functions through the runtime binding stack.
+    pub shared_super_scope_active: bool,
+    /// This separately-emitted closure captures lexical `this` from a derived
+    /// constructor and must consult that constructor's shared TDZ cell.
+    pub lexical_this_uses_derived_binding: bool,
     /// Stack of lexical `new.target` slot pointers. Arrow closures that
     /// reference `new.target` capture the enclosing value here.
     pub new_target_stack: Vec<String>,
@@ -571,6 +582,18 @@ pub(crate) struct FnCtx<'a> {
     /// parameters, indexed by callback local (including exact const aliases)
     /// and call arity.
     pub resolved_arrow_callback_targets: std::collections::HashMap<(u32, usize), String>,
+    /// This is an internal clone of a compiler-proven direct arrow body. Its
+    /// boxed capture slots were installed through
+    /// `js_closure_set_box_capture_ptr`, so captured-box accesses may use the
+    /// raw helpers. Public and dynamically dispatched closure bodies keep the
+    /// defensive runtime registry validation.
+    pub trusted_box_captures: bool,
+    /// Raw box capture pointers loaded once in the entry block of a
+    /// compiler-private exact-arrow clone. The capture slots are immutable,
+    /// and a live exact capture edge keeps each box cell alive and non-moving
+    /// for the invocation, so these SSA values remain valid across safepoints
+    /// even though the closure object itself may relocate.
+    pub trusted_box_capture_ptrs: std::collections::HashMap<u32, TrustedBoxCapturePtr>,
     /// Immutable local aliases of same-module function declarations.
     /// Calling one is semantically the same as calling its `FuncRef` directly;
     /// retain the runtime function object in the local for identity/property
@@ -881,6 +904,12 @@ pub(crate) struct FnCtx<'a> {
     /// call that LLVM can't prove won't modify the length).
     pub cached_lengths: std::collections::HashMap<u32, String>,
 
+    /// Immutable locals initialized from an exact `receiver.length` read,
+    /// keyed by the snapshot local. The read itself retains ordinary property
+    /// semantics; a later counted-loop guard may use the association only
+    /// after proving the receiver is a packed Array/Array-subclass.
+    pub array_length_snapshots: std::collections::HashMap<u32, u32>,
+
     /// `(counter_local_id, array_local_id)` pairs that are guaranteed
     /// inbounds inside the current loop nest — populated by
     /// `lower_for` when it detects the same `for (...; i < arr.length;
@@ -1044,6 +1073,22 @@ pub(crate) struct FnCtx<'a> {
     /// eligibility over `classes`, which also contains imported structural
     /// stubs.
     pub nonnegative_index_methods: &'a std::collections::HashMap<(String, String), Vec<u32>>,
+
+    /// Raw live array handles supplied only to a fallback-free indexed-method
+    /// clone. The caller's versioned-loop admission proves the complete index
+    /// range and revalidates every handle before entering each fast iteration.
+    /// Public and ordinary `$idx_u31` bodies always leave this map empty.
+    pub trusted_array_param_handles: std::collections::HashMap<u32, String>,
+
+    /// Active fallback-free loop versions. The newest fact belongs to the
+    /// innermost fast loop. Its scalar fingerprints are revalidated at each
+    /// iteration entry before these live array handles may be consumed.
+    pub versioned_indexed_loop_facts: Vec<VersionedIndexedLoopFact>,
+
+    /// Scoped direct Array/Array-subclass iteration facts. The preheader
+    /// descriptor contains scalar layout data only; `live_receiver_handle`
+    /// is refreshed by the iteration-entry check before direct loads.
+    pub stable_packed_loop_facts: Vec<StablePackedLoopFact>,
 
     /// #7142: the subset of [`Self::pshape_methods`] the class-id dispatch
     /// tower may route to. A profitability filter only — see
@@ -1468,6 +1513,14 @@ pub(crate) struct FnCtx<'a> {
     pub buffer_alias_base: u32,
 }
 
+#[derive(Clone)]
+pub(crate) struct TrustedBoxCapturePtr {
+    /// Integer form used as the write-barrier parent.
+    pub bits: String,
+    /// Opaque LLVM pointer used by direct box-cell loads and stores.
+    pub ptr: String,
+}
+
 /// (Issue #50) Info about a flat-folded const 2D int array.
 #[derive(Debug, Clone)]
 pub struct FlatConstInfo {
@@ -1505,6 +1558,67 @@ pub(crate) struct BoundedIndexPair {
     pub index_local_id: u32,
     pub array_local_id: u32,
     pub scope_id: u32,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct VersionedIndexedArrayFact {
+    pub local_id: u32,
+    pub local_slot: String,
+    pub expected_fingerprint: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct VersionedIndexedMethodFact {
+    pub class_name: String,
+    pub method_name: String,
+    pub this_slot: String,
+    pub expected_class_id: String,
+    pub expected_shape_id: String,
+    pub method_guard_slot: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct VersionedIndexedLoopFact {
+    pub counter_local_id: u32,
+    pub falsy_local_id: Option<u32>,
+    pub side_exit_label: String,
+    pub arrays: Vec<VersionedIndexedArrayFact>,
+    pub method: VersionedIndexedMethodFact,
+    /// Populated by the iteration-entry revalidation block. These SSA handles
+    /// dominate the complete fast body and are never retained across the loop
+    /// callback/back edge.
+    pub live_array_handles: std::collections::HashMap<u32, String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StablePackedNumericAccess {
+    /// Whether the admitted receiver is a plain Array rather than an
+    /// Array-subclass object.
+    pub is_plain: String,
+    /// Address immediately before element zero for a plain Array.
+    pub plain_base: String,
+    /// Number of admitted Array-subclass elements stored inline.
+    pub object_inline_count: String,
+    /// Address immediately before element zero in inline object storage.
+    pub object_inline_base: String,
+    /// Address immediately before element zero in spill object storage.
+    pub object_spill_base: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StablePackedLoopFact {
+    pub counter_local_id: u32,
+    pub array_local_id: u32,
+    pub side_exit_label: String,
+    pub descriptor: String,
+    pub live_receiver_handle: Option<String>,
+    /// Admission scanned the complete indexed range and proved every value is
+    /// an untagged IEEE Number. This is requested only when the indexed value
+    /// appears below a numeric operator in the cloned body.
+    pub numeric_elements: bool,
+    /// Preheader-derived numeric storage bases. Admission proved the complete
+    /// range is raw f64 and the call-free clone keeps these addresses stable.
+    pub numeric_access: Option<StablePackedNumericAccess>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2142,6 +2256,8 @@ mod compare;
 mod compare_tests;
 mod conditional;
 mod dyn_extern_i18n;
+#[cfg(test)]
+mod dynamic_add_tree_tests;
 mod env_clones;
 mod fs_await;
 mod index_get;
@@ -2165,6 +2281,7 @@ mod index_set_guarded;
 mod index_set_typed_array;
 mod instance_misc1;
 mod member_update;
+mod typed_array_rmw;
 pub(crate) use instance_misc1::builtin_parent_reserved_class_id;
 pub(crate) mod class_field_inline_guard;
 pub(crate) mod element_shape_guard;
@@ -2183,7 +2300,7 @@ mod static_field_meta;
 mod static_method;
 mod string_regex_proc;
 mod super_method;
-mod this_super_call;
+pub(crate) mod this_super_call;
 pub(crate) use this_super_call::is_other_builtin_constructor_name;
 mod unary;
 mod url_main;
@@ -2840,10 +2957,16 @@ fn native_number_to_f64(ctx: &mut FnCtx<'_>, lowered: &LoweredValue) -> Option<S
         NativeRep::U32 | NativeRep::BufferLen => {
             Some(ctx.block().uitofp(I32, &lowered.value, DOUBLE))
         }
-        NativeRep::I64 | NativeRep::ISize => Some(ctx.block().sitofp(I64, &lowered.value, DOUBLE)),
-        NativeRep::U64 | NativeRep::USize | NativeRep::HandleId => {
-            Some(ctx.block().uitofp(I64, &lowered.value, DOUBLE))
-        }
+        NativeRep::I64 | NativeRep::ISize => Some(ctx.block().call(
+            DOUBLE,
+            "js_native_abi_materialize_i64",
+            &[(I64, &lowered.value)],
+        )),
+        NativeRep::U64 | NativeRep::USize | NativeRep::HandleId => Some(ctx.block().call(
+            DOUBLE,
+            "js_native_abi_materialize_u64",
+            &[(I64, &lowered.value)],
+        )),
         _ => None,
     }
 }
@@ -2903,10 +3026,17 @@ fn lower_bitwise_operand_i32(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<Option<
     }
 
     // Region proofs cover bounds-checked typed-array reads such as
-    // `P[++i]`.  `lower_expr_value` intentionally does not expose every such
+    // `P[++i]`. `lower_expr_value` intentionally does not expose every such
     // read, but the native-i32 lowering has the exact checked access path we
     // need for a bitwise operand.
-    if can_lower_expr_as_i32_in_current_region(ctx, expr) {
+    //
+    // A bare local without an actual i32 slot is different: membership in
+    // `integer_locals` proves integer-valued writes, not an i32-range value.
+    // Sending such a local through `lower_expr_native_i32` falls back to a
+    // bare `fptosi f64 -> i32`. After `c *= 1103515245; c += 12345`, that is
+    // poison rather than ECMAScript ToInt32. Let the F64 arm below apply its
+    // program-point range proof and otherwise use `toint32_wrap`.
+    if !matches!(expr, Expr::LocalGet(_)) && can_lower_expr_as_i32_in_current_region(ctx, expr) {
         return Ok(Some(
             lower_expr_native(ctx, expr, ExpectedNativeRep::I32)?.value,
         ));
@@ -2924,7 +3054,7 @@ fn lower_bitwise_operand_i32(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<Option<
                 if ctx.number_by_construction_locals.contains(id)) =>
         {
             let value = lower_expr(ctx, expr)?;
-            return Ok(Some(if is_known_finite(ctx, expr) {
+            return Ok(Some(if is_known_i32_range(ctx, expr) {
                 ctx.block().toint32_fast(&value)
             } else {
                 ctx.block().toint32_wrap(&value)
@@ -2955,7 +3085,7 @@ fn lower_bitwise_operand_i32(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<Option<
             ctx.block().zext(I1, &raw, I32)
         }
         NativeRep::F64 => {
-            if is_known_finite(ctx, expr) {
+            if is_known_i32_range(ctx, expr) {
                 ctx.block().toint32_fast(&lowered.value)
             } else {
                 ctx.block().toint32_wrap(&lowered.value)

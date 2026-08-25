@@ -1060,6 +1060,23 @@ pub unsafe extern "C-unwind" fn js_native_call_method_nullsafe(
             }
         }
     }
+    // Native handle properties use this same member-read fallback when the
+    // static receiver class is wider than the runtime value.  Ask the handle
+    // property dispatcher before interpreting the member as a method.  This
+    // is what makes data properties such as `TLSSocket.authorized` and
+    // `alpnProtocol` observable, and also recovers bound method values such as
+    // `setKeyCert` when they are read before being called.
+    if args_len == 0 && !method_name_ptr.is_null() && v.is_pointer() {
+        let handle = crate::value::js_nanbox_get_pointer(object);
+        if crate::value::addr_class::is_handle_band(handle as usize) {
+            if let Some(dispatch) = crate::object::handle_property_dispatch() {
+                let value = dispatch(handle, method_name_ptr as *const u8, method_name_len);
+                if value.to_bits() != crate::value::TAG_UNDEFINED {
+                    return value;
+                }
+            }
+        }
+    }
     js_native_call_method(object, method_name_ptr, method_name_len, args_ptr, args_len)
 }
 
@@ -1074,24 +1091,45 @@ pub unsafe extern "C-unwind" fn js_native_call_method(
     args_ptr: *const f64,
     args_len: usize,
 ) -> f64 {
+    if !method_name_ptr.is_null() && method_name_len > 0 {
+        let method_name_bytes =
+            std::slice::from_raw_parts(method_name_ptr as *const u8, method_name_len);
+        if method_name_bytes.starts_with(b"#<perry:private-member:") {
+            if let Ok(storage_name) = std::str::from_utf8(method_name_bytes) {
+                if let Some(result) = super::field_get_set::private_member_call_by_name(
+                    object,
+                    storage_name,
+                    args_ptr,
+                    args_len,
+                ) {
+                    return result;
+                }
+            }
+        }
+    }
     // PerformanceObserverEntryList is a native namespace receiver, and typed
     // feedback can dispatch its methods before the generic prototype/native-
     // module tower below. Validate the WebIDL-required filter argument at this
     // common entry so direct calls and extracted prototype calls agree.
-    if method_name_len == 16
-        && !method_name_ptr.is_null()
-        && crate::perf_hooks::is_perf_observer_list_value(object)
-    {
+    if method_name_len == 16 && !method_name_ptr.is_null() {
         let name = std::slice::from_raw_parts(method_name_ptr as *const u8, method_name_len);
-        let arg0 = if args_len > 0 && !args_ptr.is_null() {
-            *args_ptr
-        } else {
-            f64::from_bits(crate::value::TAG_UNDEFINED)
-        };
-        if name == b"getEntriesByName" {
-            crate::perf_hooks::validate_perf_list_filter_arg(arg0, "name", args_len == 0);
-        } else if name == b"getEntriesByType" {
-            crate::perf_hooks::validate_perf_list_filter_arg(arg0, "type", args_len == 0);
+        // Compare the method before probing the receiver. Pointer-tagged
+        // native handles share this call bridge with heap objects, and an
+        // unrelated 16-byte method (for example TLSSocket#getSharedSigalgs)
+        // must not be dereferenced as a PerformanceObserverEntryList.
+        if matches!(name, b"getEntriesByName" | b"getEntriesByType")
+            && crate::perf_hooks::is_perf_observer_list_value(object)
+        {
+            let arg0 = if args_len > 0 && !args_ptr.is_null() {
+                *args_ptr
+            } else {
+                f64::from_bits(crate::value::TAG_UNDEFINED)
+            };
+            if name == b"getEntriesByName" {
+                crate::perf_hooks::validate_perf_list_filter_arg(arg0, "name", args_len == 0);
+            } else {
+                crate::perf_hooks::validate_perf_list_filter_arg(arg0, "type", args_len == 0);
+            }
         }
     }
     // #7769: the tower's own previously-computed answer for this
@@ -1643,11 +1681,22 @@ pub unsafe extern "C-unwind" fn js_native_call_method(
         let prev_this_h = prev_this_scope.root_nanbox_u64(
             IMPLICIT_THIS.with(|c| c.replace(object_handle.get_nanbox_f64().to_bits())),
         );
+        let proxy_class_id = crate::proxy::proxy_target_class_id(object_handle.get_nanbox_f64());
+        let is_static_class_method = proxy_class_id.is_some_and(|class_id| {
+            crate::object::class_registry::lookup_static_method_in_chain(class_id, method_name)
+                .is_some()
+        });
+        if is_static_class_method {
+            crate::object::static_this_arm(object_handle.get_nanbox_f64());
+        }
         let result = crate::closure::js_native_call_value(
             method_handle.get_nanbox_f64(),
             args.as_ptr(),
             args.len(),
         );
+        if is_static_class_method {
+            crate::object::static_this_disarm();
+        }
         IMPLICIT_THIS.with(|c| c.set(prev_this_h.get_nanbox_u64()));
         return result;
     }
@@ -2010,7 +2059,11 @@ pub unsafe extern "C-unwind" fn js_native_call_method(
 
         // Vtable lookup: check if this class has a registered method in the vtable
         let class_id = (*obj).class_id;
-        if class_id != 0 {
+        if class_id != 0
+            && (!class_prototype_fast_guard_invalidated_for_method(
+                class_prototype_method_guard_slot(method_name),
+            ) || !class_is_key_deleted(class_id, method_name))
+        {
             if let Ok(registry) = CLASS_VTABLE_REGISTRY.read() {
                 if let Some(ref reg) = *registry {
                     if let Some(vtable) = reg.get(&class_id) {
@@ -2133,7 +2186,15 @@ pub unsafe extern "C-unwind" fn js_native_call_method(
                             }
                         }
                     }
-                    return object();
+                    if matches!(method_name, "pipe" | "annotations") {
+                        return object();
+                    }
+                    crate::error::js_throw_type_error_not_a_function(
+                        std::ptr::null(),
+                        0,
+                        method_name.as_ptr(),
+                        method_name.len(),
+                    );
                 }
             }
         }
