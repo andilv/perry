@@ -56,6 +56,8 @@ const RESOLVER_RESOLVE_METHODS: &[&str] = &[
     "reverse",
 ];
 const RESOLVER_SERVERS_FIELD: &str = "__dns_servers";
+const RESOLVER_TIMEOUT_FIELD: &str = "__dns_timeout";
+const RESOLVER_TRIES_FIELD: &str = "__dns_tries";
 
 #[derive(Clone, Copy)]
 pub(crate) enum RecordKind {
@@ -985,12 +987,10 @@ fn lookup_all_result(addresses: &[ResolvedAddress]) -> f64 {
     array_value_from_values(&values)
 }
 
-fn queue_callback(callback_value: f64, args: &[f64]) {
+fn queue_callback(callback_value: f64, args: &[f64], provider_type: &'static str) {
     let callback = closure_ptr_from_value(callback_value)
         .unwrap_or_else(|| throw_error_value(invalid_callback_error(callback_value)));
-    unsafe {
-        crate::builtins::js_queue_next_tick_args(callback as i64, args.as_ptr(), args.len() as i32);
-    }
+    crate::timer::schedule_native_callback(callback as i64, args, provider_type);
 }
 
 fn lookup_value(hostname: &str, options: LookupOptions) -> Result<f64, f64> {
@@ -1153,16 +1153,12 @@ fn promise_reverse_args(args: i64) -> String {
 
 fn call_success_callback(callback: f64, value: f64) {
     let args = [null_value(), value];
-    unsafe {
-        crate::closure::js_native_call_value(callback, args.as_ptr(), args.len());
-    }
+    queue_callback(callback, &args, "QUERYWRAP");
 }
 
 fn call_error_callback(callback: f64, error: f64) {
     let args = [error];
-    unsafe {
-        crate::closure::js_native_call_value(callback, args.as_ptr(), args.len());
-    }
+    queue_callback(callback, &args, "QUERYWRAP");
 }
 
 fn dns_callback_resolve(args: i64, default_kind: Option<RecordKind>) -> f64 {
@@ -1250,19 +1246,74 @@ fn method_value(name: &str) -> f64 {
     js_nanbox_pointer(closure as i64)
 }
 
-fn resolver_object(initial_servers: Vec<String>) -> *mut ObjectHeader {
-    let method_count = RESOLVER_CONTROL_METHODS.len() + RESOLVER_RESOLVE_METHODS.len() + 1;
-    let obj = js_object_alloc(0, method_count as u32);
-    js_object_set_field_by_name(
-        obj,
-        key(RESOLVER_SERVERS_FIELD),
-        servers_array_value(&initial_servers),
-    );
+fn resolver_object(initial_servers: Vec<String>, options: f64) -> *mut ObjectHeader {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let options = scope.root_nanbox_f64(options);
+    let timeout_key = scope.root_string_ptr(key("timeout"));
+    let timeout = resolver_object_from_value(options.get_nanbox_f64())
+        .map(|object| {
+            timeout_key.with_mut_ptr::<crate::StringHeader, _>(|key| {
+                crate::object::js_object_get_field_by_name_f64(object, key)
+            })
+        })
+        .unwrap_or_else(undefined_value);
+    let timeout = scope.root_nanbox_f64(timeout);
+    let tries_key = scope.root_string_ptr(key("tries"));
+    let tries = resolver_object_from_value(options.get_nanbox_f64())
+        .map(|object| {
+            tries_key.with_mut_ptr::<crate::StringHeader, _>(|key| {
+                crate::object::js_object_get_field_by_name_f64(object, key)
+            })
+        })
+        .unwrap_or_else(undefined_value);
+    let tries = scope.root_nanbox_f64(tries);
+    let method_count = RESOLVER_CONTROL_METHODS.len() + RESOLVER_RESOLVE_METHODS.len() + 3;
+    let obj = scope.root_raw_mut_ptr(js_object_alloc(0, method_count as u32));
+    let servers = scope.root_nanbox_f64(servers_array_value(&initial_servers));
+    let servers_key = scope.root_string_ptr(key(RESOLVER_SERVERS_FIELD));
+    obj.with_mut_ptr::<ObjectHeader, _>(|object| {
+        servers_key.with_mut_ptr::<crate::StringHeader, _>(|key| {
+            js_object_set_field_by_name(object, key, servers.get_nanbox_f64());
+        });
+    });
+    let timeout_key = scope.root_string_ptr(key(RESOLVER_TIMEOUT_FIELD));
+    obj.with_mut_ptr::<ObjectHeader, _>(|object| {
+        timeout_key.with_mut_ptr::<crate::StringHeader, _>(|key| {
+            js_object_set_field_by_name(object, key, timeout.get_nanbox_f64());
+        });
+    });
+    let tries_key = scope.root_string_ptr(key(RESOLVER_TRIES_FIELD));
+    obj.with_mut_ptr::<ObjectHeader, _>(|object| {
+        tries_key.with_mut_ptr::<crate::StringHeader, _>(|key| {
+            js_object_set_field_by_name(object, key, tries.get_nanbox_f64());
+        });
+    });
     for method in RESOLVER_CONTROL_METHODS {
-        js_object_set_field_by_name(obj, key(method), method_value(method));
+        let value = scope.root_nanbox_f64(method_value(method));
+        let field_key = scope.root_string_ptr(key(method));
+        obj.with_mut_ptr::<ObjectHeader, _>(|object| {
+            field_key.with_mut_ptr::<crate::StringHeader, _>(|field_key| {
+                js_object_set_field_by_name(object, field_key, value.get_nanbox_f64());
+            });
+        });
     }
     for method in RESOLVER_RESOLVE_METHODS {
-        js_object_set_field_by_name(obj, key(method), method_value(method));
+        let value = scope.root_nanbox_f64(method_value(method));
+        let field_key = scope.root_string_ptr(key(method));
+        obj.with_mut_ptr::<ObjectHeader, _>(|object| {
+            field_key.with_mut_ptr::<crate::StringHeader, _>(|field_key| {
+                js_object_set_field_by_name(object, field_key, value.get_nanbox_f64());
+            });
+        });
     }
-    obj
+    let (_, obj_ptr) = obj.across_mut::<ObjectHeader, _>(|| {
+        obj.with_mut_ptr::<ObjectHeader, _>(|obj_ptr| {
+            let _ = crate::async_hooks::init_resource(
+                "DNSCHANNEL",
+                js_nanbox_pointer(obj_ptr as i64),
+                true,
+            );
+        });
+    });
+    obj_ptr
 }

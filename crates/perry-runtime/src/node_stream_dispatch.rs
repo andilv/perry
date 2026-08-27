@@ -257,6 +257,259 @@ pub(crate) fn install_event_emitter_prototype_methods(proto: *mut ObjectHeader) 
     }
 }
 
+enum EventEmitterAsyncResourceBacking {
+    ExternalEmitter(i64),
+    RuntimeResource(i64),
+}
+
+fn event_emitter_async_resource_backing(receiver: f64) -> Option<EventEmitterAsyncResourceBacking> {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let receiver = scope.root_nanbox_f64(receiver);
+    let bits = receiver.get_nanbox_f64().to_bits();
+    if bits >> 48 == 0x7FFD {
+        let handle = (bits & crate::value::POINTER_MASK) as i64;
+        if crate::object::event_emitter_async_resource_handle_probe()
+            .is_some_and(|probe| unsafe { probe(handle) })
+        {
+            return Some(EventEmitterAsyncResourceBacking::ExternalEmitter(handle));
+        }
+        let raw = handle as usize;
+        if crate::value::addr_class::is_plausible_heap_addr(raw) {
+            let key = scope.root_string_ptr(hidden_key(EVENT_EMITTER_ASYNC_RESOURCE_KEY));
+            let raw = (receiver.get_nanbox_f64().to_bits() & crate::value::POINTER_MASK) as usize;
+            let value = key.with_const_ptr::<crate::StringHeader, _>(|key| {
+                js_object_get_field_by_name_f64(raw as *const ObjectHeader, key)
+            });
+            if value.to_bits() >> 48 == 0x7FFD {
+                let resource = (value.to_bits() & crate::value::POINTER_MASK) as i64;
+                if crate::async_hooks::is_async_resource_handle(resource) {
+                    return Some(EventEmitterAsyncResourceBacking::RuntimeResource(resource));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn require_event_emitter_async_resource_receiver(
+    closure: *const ClosureHeader,
+) -> EventEmitterAsyncResourceBacking {
+    if let Some(backing) = event_emitter_async_resource_backing(this_value(closure)) {
+        return backing;
+    }
+    crate::node_submodules::diagnostics::throw_type_error_no_code(
+        b"Cannot read private member from an object whose class did not declare it",
+    )
+}
+
+extern "C" fn ns_ee_async_resource_emit_rest(
+    closure: *const ClosureHeader,
+    event: f64,
+    rest: f64,
+) -> f64 {
+    let backing = require_event_emitter_async_resource_receiver(closure);
+    let runtime_async_id = match backing {
+        EventEmitterAsyncResourceBacking::RuntimeResource(resource) => {
+            crate::async_hooks::js_async_resource_async_id(resource) as u64
+        }
+        EventEmitterAsyncResourceBacking::ExternalEmitter(_) => 0,
+    };
+    if runtime_async_id != 0 {
+        crate::async_hooks::js_async_hooks_provider_enter(runtime_async_id);
+    }
+    let result = ns_emit_rest(closure, event, rest);
+    if runtime_async_id != 0 {
+        crate::async_hooks::js_async_hooks_provider_leave(runtime_async_id);
+    }
+    result
+}
+
+extern "C" fn ns_ee_async_resource_destroy(closure: *const ClosureHeader) -> f64 {
+    match require_event_emitter_async_resource_receiver(closure) {
+        EventEmitterAsyncResourceBacking::ExternalEmitter(handle) => {
+            crate::object::event_emitter_async_resource_dispatch()
+                .map(|dispatch| unsafe { dispatch(handle, 3) })
+                .unwrap_or_else(|| f64::from_bits(crate::value::TAG_UNDEFINED))
+        }
+        EventEmitterAsyncResourceBacking::RuntimeResource(resource) => {
+            crate::async_hooks::js_async_resource_emit_destroy(resource) as f64
+        }
+    }
+}
+
+extern "C" fn ns_ee_async_resource_getter(closure: *const ClosureHeader) -> f64 {
+    let operation = crate::closure::js_closure_get_capture_ptr(closure, 1) as u32;
+    match require_event_emitter_async_resource_receiver(closure) {
+        EventEmitterAsyncResourceBacking::ExternalEmitter(handle) => {
+            crate::object::event_emitter_async_resource_dispatch()
+                .map(|dispatch| unsafe { dispatch(handle, operation) })
+                .unwrap_or_else(|| f64::from_bits(crate::value::TAG_UNDEFINED))
+        }
+        EventEmitterAsyncResourceBacking::RuntimeResource(resource) => match operation {
+            0 => crate::async_hooks::js_async_resource_async_id(resource),
+            1 => crate::async_hooks::js_async_resource_trigger_async_id(resource),
+            2 => f64::from_bits(crate::value::js_nanbox_pointer(resource).to_bits()),
+            _ => f64::from_bits(crate::value::TAG_UNDEFINED),
+        },
+    }
+}
+
+/// Complete the `EventEmitterAsyncResource.prototype` surface. Its inherited
+/// EventEmitter methods remain available, while `emit` and the resource
+/// accessors enforce Node's private-brand receiver validation.
+pub(crate) unsafe fn install_event_emitter_async_resource_prototype(proto: *mut ObjectHeader) {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let proto = scope.root_raw_mut_ptr(proto);
+    crate::closure::js_register_closure_rest(ns_ee_async_resource_emit_rest as *const u8, 1);
+    crate::closure::js_register_closure_arity(ns_ee_async_resource_destroy as *const u8, 0);
+    crate::closure::js_register_closure_arity(ns_ee_async_resource_getter as *const u8, 0);
+
+    let install_method = |name: &str, function: *const u8| {
+        let closure = js_closure_alloc(function, 1);
+        crate::closure::js_closure_set_capture_ptr(closure, 0, crate::value::TAG_UNDEFINED as i64);
+        let closure = scope.root_raw_mut_ptr(closure);
+        let key = scope.root_string_ptr(hidden_key(name.as_bytes()));
+        proto.with_mut_ptr::<ObjectHeader, _>(|proto| {
+            key.with_const_ptr::<crate::StringHeader, _>(|key| {
+                closure.with_const_ptr::<ClosureHeader, _>(|closure| {
+                    js_object_set_field_by_name(
+                        proto,
+                        key,
+                        f64::from_bits(JSValue::pointer(closure as *const u8).bits()),
+                    );
+                });
+            });
+        });
+        proto.with_mut_ptr::<ObjectHeader, _>(|proto| {
+            crate::object::set_builtin_property_attrs(
+                proto as usize,
+                name.to_string(),
+                crate::object::PropertyAttrs::new(true, false, true),
+            );
+        });
+    };
+    install_method("emit", ns_ee_async_resource_emit_rest as *const u8);
+    install_method("emitDestroy", ns_ee_async_resource_destroy as *const u8);
+
+    for (name, operation) in [
+        ("asyncId", 0_i64),
+        ("triggerAsyncId", 1),
+        ("asyncResource", 2),
+    ] {
+        let closure = js_closure_alloc(ns_ee_async_resource_getter as *const u8, 2);
+        crate::closure::js_closure_set_capture_ptr(closure, 0, crate::value::TAG_UNDEFINED as i64);
+        crate::closure::js_closure_set_capture_ptr(closure, 1, operation);
+        let closure = scope.root_raw_mut_ptr(closure);
+        let key = scope.root_string_ptr(hidden_key(name.as_bytes()));
+        proto.with_mut_ptr::<ObjectHeader, _>(|proto| {
+            key.with_const_ptr::<crate::StringHeader, _>(|key| {
+                js_object_set_field_by_name(
+                    proto,
+                    key,
+                    f64::from_bits(crate::value::TAG_UNDEFINED),
+                );
+            });
+        });
+        proto.with_mut_ptr::<ObjectHeader, _>(|proto| {
+            closure.with_const_ptr::<ClosureHeader, _>(|closure| {
+                crate::object::set_builtin_accessor_descriptor(
+                    proto as usize,
+                    name.to_string(),
+                    crate::object::AccessorDescriptor {
+                        get: JSValue::pointer(closure as *const u8).bits(),
+                        set: 0,
+                    },
+                    crate::object::PropertyAttrs::new(true, false, true),
+                );
+            });
+        });
+    }
+}
+
+pub(crate) unsafe fn install_event_emitter_async_resource_instance_methods(
+    obj: *mut ObjectHeader,
+    this_value: f64,
+) {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let obj = scope.root_raw_mut_ptr(obj);
+    let this_value = scope.root_nanbox_f64(this_value);
+    crate::closure::js_register_closure_rest(ns_ee_async_resource_emit_rest as *const u8, 1);
+    crate::closure::js_register_closure_arity(ns_ee_async_resource_destroy as *const u8, 0);
+    crate::closure::js_register_closure_arity(ns_ee_async_resource_getter as *const u8, 0);
+    for (name, function) in [
+        ("emit", ns_ee_async_resource_emit_rest as *const u8),
+        ("emitDestroy", ns_ee_async_resource_destroy as *const u8),
+    ] {
+        let closure = js_closure_alloc(function, 1);
+        crate::closure::js_closure_set_capture_ptr(
+            closure,
+            0,
+            this_value.get_nanbox_f64().to_bits() as i64,
+        );
+        let closure = scope.root_raw_mut_ptr(closure);
+        let key = scope.root_string_ptr(hidden_key(name.as_bytes()));
+        obj.with_mut_ptr::<ObjectHeader, _>(|obj| {
+            key.with_const_ptr::<crate::StringHeader, _>(|key| {
+                closure.with_const_ptr::<ClosureHeader, _>(|closure| {
+                    js_object_set_field_by_name(
+                        obj,
+                        key,
+                        f64::from_bits(JSValue::pointer(closure as *const u8).bits()),
+                    );
+                });
+            });
+        });
+    }
+
+    // Source-compiled subclasses are plain runtime objects rather than
+    // external emitter handles. Bind the resource accessors directly to the
+    // instance just like emit/emitDestroy; relying only on the native parent
+    // prototype leaves dynamic loop/property reads as `undefined`.
+    for (name, operation) in [
+        ("asyncId", 0_i64),
+        ("triggerAsyncId", 1),
+        ("asyncResource", 2),
+    ] {
+        let closure = js_closure_alloc(ns_ee_async_resource_getter as *const u8, 2);
+        crate::closure::js_closure_set_capture_ptr(
+            closure,
+            0,
+            this_value.get_nanbox_f64().to_bits() as i64,
+        );
+        crate::closure::js_closure_set_capture_ptr(closure, 1, operation);
+        let closure = scope.root_raw_mut_ptr(closure);
+        let key = scope.root_string_ptr(hidden_key(name.as_bytes()));
+        obj.with_mut_ptr::<ObjectHeader, _>(|obj| {
+            key.with_const_ptr::<crate::StringHeader, _>(|key| {
+                js_object_set_field_by_name(obj, key, f64::from_bits(crate::value::TAG_UNDEFINED));
+            });
+        });
+        obj.with_mut_ptr::<ObjectHeader, _>(|obj| {
+            closure.with_const_ptr::<ClosureHeader, _>(|closure| {
+                crate::object::set_builtin_accessor_descriptor(
+                    obj as usize,
+                    name.to_string(),
+                    crate::object::AccessorDescriptor {
+                        get: JSValue::pointer(closure as *const u8).bits(),
+                        set: 0,
+                    },
+                    crate::object::PropertyAttrs::new(true, false, true),
+                );
+            });
+        });
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn js_event_emitter_async_resource_subclass_backing(receiver: i64) -> i64 {
+    let receiver =
+        f64::from_bits(crate::value::POINTER_TAG | (receiver as u64 & crate::value::POINTER_MASK));
+    match event_emitter_async_resource_backing(receiver) {
+        Some(EventEmitterAsyncResourceBacking::RuntimeResource(resource)) => resource,
+        _ => 0,
+    }
+}
+
 pub(super) fn register_stub_arities() {
     let register = |func: *const u8, arity: u32| {
         crate::closure::js_register_closure_arity(func, arity);

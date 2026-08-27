@@ -30,8 +30,10 @@ mod loop_bounded_i32;
 mod mutation;
 mod not_bigint_locals;
 mod number_by_construction;
+mod object_literal_exports;
 mod param_ranges;
 mod pointer_locals;
+mod proven_args;
 mod proven_this;
 #[cfg(test)]
 mod proven_this_routing_tests;
@@ -84,8 +86,12 @@ pub(crate) use integer_locals::{
 pub(crate) use local_refs::{expr_contains_local_get, mark_all_candidate_refs_in_expr};
 pub(crate) use mutation::{body_contains_call, body_contains_closure, has_any_mutation};
 pub(crate) use number_by_construction::collect_number_by_construction_locals;
+pub(crate) use object_literal_exports::exported_object_literal_capabilities;
 pub(crate) use param_ranges::{collect_param_int_ranges, ParamIntRanges};
 pub(crate) use pointer_locals::collect_pointer_typed_locals;
+pub(crate) use proven_args::{
+    method_proven_shape_args, pshape_args_method_name, ProvenShapeArgPlan,
+};
 pub(crate) use proven_this::{
     exportable_method_capabilities as exportable_proven_this_method_capabilities,
     method_proven_this, prune_unregistered_clones, pshape_method_name, ptr_array_cache_fields,
@@ -101,7 +107,8 @@ pub(crate) use refs::{
 };
 pub(crate) use safepoint_sites::count_safepoint_sites;
 pub(crate) use scalar_method_dispatch::{
-    collect_module_dispatch_facts, mark_unstable_scalar_method_receivers, ModuleDispatchFacts,
+    collect_module_dispatch_facts, for_each_expr_in_stmts, mark_unstable_scalar_method_receivers,
+    ModuleDispatchFacts,
 };
 pub(crate) use scalar_methods::simple_scalar_method_summary;
 pub(crate) use shadow_slots::{

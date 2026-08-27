@@ -67,6 +67,71 @@ mod c3c_tests {
         );
     }
 
+    /// A module-init ShapeId is already a complete proof of the immutable
+    /// keys edge and live inline bound. The allocation fast path must be able
+    /// to install that proof directly on a newborn without publishing the
+    /// same facts through the reverse shape index again.
+    #[test]
+    fn preinstalled_shape_fast_path_stamps_matching_newborn() {
+        let _lock = crate::gc::global_side_table_test_lock();
+        const CID: u32 = 0x0C3C_7903;
+        let packed = b"direct_a\0direct_b";
+        let keys =
+            crate::object::js_build_class_keys_array(CID, 2, packed.as_ptr(), packed.len() as u32);
+        let shape_id = js_object_shape_id_for_keys(keys as usize as u64, 2);
+        let payload = std::mem::size_of::<crate::object::ObjectHeader>()
+            + crate::object::INLINE_SLOT_FLOOR * std::mem::size_of::<crate::value::JSValue>();
+        let obj = crate::arena::arena_alloc_gc(payload, 8, crate::gc::GC_TYPE_OBJECT)
+            as *mut crate::object::ObjectHeader;
+
+        unsafe {
+            (*obj).class_id = CID;
+            (*obj).parent_class_id = 0;
+            (*obj).meta = std::ptr::null_mut();
+            let fields = (obj as *mut u8).add(std::mem::size_of::<crate::object::ObjectHeader>())
+                as *mut crate::value::JSValue;
+            // GC_STORE_AUDIT(INIT): freshly allocated inline slots, filled with a
+            // non-pointer immediate before the object is reachable from anything.
+            for index in 0..crate::object::INLINE_SLOT_FLOOR {
+                std::ptr::write(fields.add(index), crate::value::JSValue::undefined());
+            }
+            crate::gc::layout_init_pointer_free(obj as *mut u8);
+
+            assert!(try_birth_stamp_preinstalled_shape(obj, shape_id, keys, 2));
+            assert_eq!((*obj).parent_class_id, shape_id);
+            assert_eq!(crate::object::object_keys_array(obj), keys);
+            debug_assert_object_shape_parity(obj);
+        }
+    }
+
+    /// Learned/hidden inline capacity can legitimately exceed the public key
+    /// count. A module-init id for the narrow shape must fail closed, and the
+    /// existing allocator fallback must publish and retain the exact wider
+    /// descriptor rather than stamping the supplied id anyway.
+    #[test]
+    fn preinstalled_shape_live_bound_mismatch_uses_exact_fallback() {
+        let _lock = crate::gc::global_side_table_test_lock();
+        const CID: u32 = 0x0C3C_7904;
+        let packed = b"wide_a\0wide_b";
+        let keys =
+            crate::object::js_build_class_keys_array(CID, 2, packed.as_ptr(), packed.len() as u32);
+        let narrow_id = js_object_shape_id_for_keys(keys as usize as u64, 2);
+
+        let obj =
+            crate::object::js_object_alloc_class_inline_keys_stamped(CID, 0, 3, keys, narrow_id);
+        let actual_id = unsafe { (*obj).parent_class_id };
+        assert_ne!(
+            actual_id, narrow_id,
+            "a narrow module ShapeId must not describe a wider allocation"
+        );
+        let descriptor = shape_descriptor_by_id(actual_id)
+            .expect("the widened fallback must publish an exact descriptor");
+        assert_eq!(descriptor.keys, keys as u64);
+        assert_eq!(descriptor.logical_key_count, 2);
+        assert_eq!(descriptor.live_inline_slot_count, 3);
+        unsafe { debug_assert_object_shape_parity(obj) };
+    }
+
     /// #6759 C3c stamp invariant on a REAL object through the real
     /// write/read paths: a read resolution stamps a shape id into the
     /// plain object's `parent_class_id`; after further appends any surviving
@@ -474,25 +539,48 @@ mod descriptor_tests_8067 {
             "the lifted descriptor must name the boxed record's own keys word"
         );
         assert_eq!(unsafe { *slot }, keys as u64);
+        assert_eq!(
+            shape_descriptor_by_id(id).unwrap().indexed_keys,
+            keys as u64,
+            "newly minted descriptor must record its indexed keys address"
+        );
 
         // Writing THROUGH the slot is what an evacuating visitor does. The
         // table must observe it with no write-back callback of any kind.
         let moved_keys = keys as u64 + 0x3000;
         unsafe { *slot = moved_keys };
         assert_eq!(shape_descriptor_by_id(id).unwrap().keys, moved_keys);
+        assert_eq!(
+            shape_descriptor_by_id(id).unwrap().indexed_keys,
+            keys as u64,
+            "an object-edge rewrite must retain the old indexed address until metadata repair"
+        );
 
-        // The keys-address reverse index is repaired by the metadata pass, not
-        // by the store; force it the way `scan_shape_table_rekey_mut` does.
+        // The keys-address reverse index is repaired incrementally by the
+        // metadata pass, not by the store; force the same one-id repair here.
         {
             let mut inner = crate::state::state().shapes.inner.borrow_mut();
-            rebuild_descriptor_reverse_indices(&mut inner);
+            sync_descriptor_reverse_indices(&mut inner, id);
         }
+        assert_eq!(shape_descriptor_by_id(id).unwrap().indexed_keys, moved_keys);
+        assert_eq!(
+            shape_descriptor_ensure(moved_keys as *const ArrayHeader, 3, 2),
+            Ok(id),
+            "incremental repair must publish the moved facts under the original id"
+        );
+        let old_address_id = shape_descriptor_ensure(keys as *const ArrayHeader, 3, 2)
+            .expect("shape range unexpectedly exhausted");
+        assert_ne!(
+            old_address_id, id,
+            "incremental repair must remove the stale old-address facts entry"
+        );
         test_drop_shape_descriptors(moved_keys as usize);
         assert_eq!(
             shape_descriptor_by_id(id),
             None,
             "descriptor rekey did not update the keys-address index"
         );
+        test_drop_shape_descriptors(keys);
     }
 
     #[test]

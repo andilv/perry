@@ -132,6 +132,12 @@
       "why": "Monotonic counter of live async-resource handles. Holds no address at all; the resource objects live in RESOURCES, which scan_async_hooks_roots_mut visits."
     },
     {
+      "file": "crates/perry-runtime/src/async_hooks.rs",
+      "name": "TEST_FORCE_RESOLVE_GC",
+      "verdict": "test_only",
+      "why": "#[cfg(test)] AtomicUsize one-shot flag that asks resolve_async_resource_handle to force a collection; stores only 0 or 1 and is absent from shipped binaries."
+    },
+    {
       "file": "crates/perry-runtime/src/child_process/reactor.rs",
       "name": "CP_NEXT_LIVE_ID",
       "verdict": "not_a_gc_pointer",
@@ -156,6 +162,12 @@
       "why": "Cache miss counter (telemetry). Holds no address."
     },
     {
+      "file": "crates/perry-runtime/src/closure/registry.rs",
+      "name": "CLOSURE_VERSIONED_LOOP_REGISTRY",
+      "verdict": "not_a_gc_pointer",
+      "why": "Maps a closure body `func_ptr` (a code pointer, never moved) to TrustedDirectTarget{func_ptr:*const u8, capture_count:u32, boxed_capture_mask:u64}. Both key and value are code pointers and plain integers; no field can hold a heap pointer, so the table cannot hold a GC root. Same shape as its sibling CLOSURE_ARROW_FUNCTION_REGISTRY in the same thread_local block."
+    },
+    {
       "file": "crates/perry-runtime/src/fs/filehandle.rs",
       "name": "NEXT_READ_LINES_ID",
       "verdict": "not_a_gc_pointer",
@@ -172,6 +184,18 @@
       "name": "TCP_SOCKETS",
       "verdict": "not_a_gc_pointer",
       "why": "Keyed by handle id; TcpStreamWrapper is Rust-owned (tokio stream + SocketAddr), no JS values."
+    },
+    {
+      "file": "crates/perry-runtime/src/node_api_host/loader.rs",
+      "name": "LEGACY_CAPTURE",
+      "verdict": "not_a_gc_pointer",
+      "why": "Temporary legacy-addon registration state: a canonical Rust PathBuf, a pointer to the addon's static napi_module descriptor in the loaded native library, and counters/flags. It never stores a Perry GC-heap address."
+    },
+    {
+      "file": "crates/perry-runtime/src/node_api_host/metadata.rs",
+      "name": "PENDING_FINALIZERS",
+      "verdict": "not_a_gc_pointer",
+      "why": "Queue entries contain a native addon function pointer plus the addon's opaque data and hint pointers. Node-API defines those as embedder-owned native pointers; no field is a Perry GC-heap address."
     },
     {
       "file": "crates/perry-runtime/src/node_submodules/blob.rs",
@@ -252,6 +276,12 @@
       "name": "TEST_BOUND_METHOD_MOVE",
       "verdict": "test_only",
       "why": "#[cfg(test)] diagnostic trace for the bound-method moving-GC regression: records the (before, after) addresses a test-forced minor produced so the test can assert the relocation happened. The addresses are compared as integers, never dereferenced, and the cell is dead in a shipped binary."
+    },
+    {
+      "file": "crates/perry-runtime/src/os/signal.rs",
+      "name": "SIGNAL_ASYNC_IDS",
+      "verdict": "not_a_gc_pointer",
+      "why": "Maps owned Rust signal-name strings to async_hooks async IDs. Async IDs are scalar u64 identifiers, not JS heap addresses; the AsyncResource objects themselves live in async_hooks RESOURCES, whose registered scanner visits them."
     },
     {
       "file": "crates/perry-runtime/src/perf_hooks.rs",
@@ -336,6 +366,12 @@
       "name": "DECODER_REGISTRY",
       "verdict": "not_a_gc_pointer",
       "why": "Keyed by decoder handle id; DecoderState is Rust-owned (encoding enum, label, flags), no JS values."
+    },
+    {
+      "file": "crates/perry-runtime/src/timer.rs",
+      "name": "TIMER_HANDLE_KINDS",
+      "verdict": "not_a_gc_pointer",
+      "why": "Maps scalar timer handle IDs to the CallbackTimerKind enum so clearTimeout/clearInterval can destroy the matching async_hooks resource. Neither the i64 keys nor the enum values contain a JS heap address."
     },
     {
       "file": "crates/perry-runtime/src/thread.rs",
@@ -438,9 +474,21 @@
     },
     {
       "file": "crates/perry-stdlib/src/worker_threads.rs",
+      "name": "CURRENT_WORKER_ID",
+      "verdict": "not_a_gc_pointer",
+      "why": "Thread-local scalar ID of the currently executing in-process Worker. It is an index into the Rust-owned WORKERS registry, not a JS heap address."
+    },
+    {
+      "file": "crates/perry-stdlib/src/worker_threads.rs",
       "name": "NEXT_PORT_ID",
       "verdict": "not_a_gc_pointer",
       "why": "Monotonic MessagePort id counter."
+    },
+    {
+      "file": "crates/perry-stdlib/src/worker_threads.rs",
+      "name": "NEXT_WORKER_ID",
+      "verdict": "not_a_gc_pointer",
+      "why": "Monotonic u64 counter used to allocate in-process Worker registry IDs. It contains no address."
     },
     {
       "file": "crates/perry-stdlib/src/ws.rs",
@@ -1952,10 +2000,6 @@
     {
       "file": "crates/perry-runtime/src/gc/schedule.rs",
       "name": "SCHEDULE_NEXT_CANDIDATE_BYTES"
-    },
-    {
-      "file": "crates/perry-runtime/src/map.rs",
-      "name": "MAP_INDEX"
     },
     {
       "file": "crates/perry-runtime/src/map.rs",

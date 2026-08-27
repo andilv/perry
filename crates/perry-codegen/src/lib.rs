@@ -71,8 +71,10 @@ pub(crate) mod typed_shape;
 pub mod types;
 
 pub use codegen::{
-    compile_module, resolve_target_triple, AppMetadata, CompileOptions, FpContractMode,
-    ImportedClass, NamespaceEntry, NamespaceEntryKind,
+    compile_module, resolve_target_triple, short_spread_method_capabilities, AppMetadata,
+    CompileOptions, ExportedObjectLiteralCapability, FpContractMode, ImportedClass,
+    ImportedObjectLiteral, ImportedObjectLiteralMethod, NamespaceEntry, NamespaceEntryKind,
+    ObjectLiteralMethodCandidate, ShortSpreadMethodCandidate,
 };
 pub use collectors::CjsPreambleCensus;
 
@@ -87,6 +89,14 @@ pub fn exported_proven_this_method_capabilities(
     std::collections::HashMap<String, Vec<String>>,
 ) {
     collectors::exportable_proven_this_method_capabilities(hir)
+}
+
+/// Return immutable exported object-literal capabilities for the compile
+/// driver to resolve through ESM aliases and re-exports.
+pub fn exported_object_literal_method_capabilities(
+    hir: &perry_hir::Module,
+) -> std::collections::HashMap<String, ExportedObjectLiteralCapability> {
+    collectors::exported_object_literal_capabilities(hir)
 }
 
 /// The shadow-stack field offsets generated code bakes into its inline root

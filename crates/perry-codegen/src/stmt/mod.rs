@@ -21,6 +21,7 @@ mod element_shape_loop;
 mod element_shape_loop_tests;
 mod if_stmt;
 mod let_buffer_views;
+mod let_object_facts;
 mod let_stmt;
 mod let_stmt_facts;
 mod loops;
@@ -28,6 +29,7 @@ mod masked_window_region;
 #[cfg(test)]
 mod prealloc_module_global_tests;
 pub(crate) mod stable_packed_loop;
+mod stable_packed_typed_array;
 mod switch_stmt;
 mod try_stmt;
 mod unused_expr;

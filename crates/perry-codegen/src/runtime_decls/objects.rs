@@ -231,6 +231,12 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
         I32,
         &[I64, DOUBLE, PTR, I32, I32],
     );
+    module.declare_function("js_closure_exact_func_guard", I64, &[DOUBLE, PTR]);
+    module.declare_function(
+        "js_object_own_method_cache_miss",
+        I64,
+        &[DOUBLE, I32, I32, PTR, I64, PTR, PTR],
+    );
     module.declare_function(
         "js_typed_feedback_object_set_unboxed_f64_field",
         VOID,
@@ -401,6 +407,11 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
         &[I64, DOUBLE, I32, I32],
     );
     module.declare_function("js_typed_array_masked_window_data_ptr", I64, &[DOUBLE]);
+    module.declare_function(
+        "js_packed_ecs_u32_loop_guard",
+        I64,
+        &[DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, I32, PTR],
+    );
     module.declare_function(
         "js_typed_feedback_packed_u32_array_loop_guard",
         I32,

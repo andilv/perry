@@ -38,6 +38,11 @@ fn minimal_auto_workspace(dir: &Path) {
         &dir.join("crates/perry-stdlib/src/lib.rs"),
         b"pub fn stdlib() {}\n",
     );
+    write_file(&dir.join("crates/perry-hir/Cargo.toml"), b"[package]\n");
+    write_file(
+        &dir.join("crates/perry-hir/src/lib.rs"),
+        b"pub fn hir() {}\n",
+    );
 }
 
 #[test]
@@ -344,6 +349,30 @@ fn source_fingerprint_tracks_runtime_and_stdlib_content_not_mtimes() {
     assert_ne!(
         fp_rt, fp_std,
         "a perry-stdlib source edit must rotate the fingerprint"
+    );
+
+    write_file(
+        &dir.path().join("crates/perry-hir/tests/e2e.rs"),
+        b"#[test] fn e2e_only() {}\n",
+    );
+    assert_eq!(
+        fp_std,
+        auto_optimized_source_fingerprint(dir.path(), &[]),
+        "test-only targets do not land in the optimized runtime archive"
+    );
+
+    // Compiler/runtime contract inputs participate in perry-runtime's build
+    // id even when the runtime archive does not depend on them through Cargo.
+    // Reusing the old archive after a lowering edit therefore fails the build
+    // id check unless the auto-opt stamp rotates too.
+    write_file(
+        &dir.path().join("crates/perry-hir/src/lib.rs"),
+        b"pub fn hir_changed() {}\n",
+    );
+    assert_ne!(
+        fp_std,
+        auto_optimized_source_fingerprint(dir.path(), &[]),
+        "a compiler/runtime contract edit must rotate the fingerprint"
     );
 }
 
@@ -1096,6 +1125,26 @@ fn auto_optimize_always_includes_keepalive_anchors() {
         "auto_optimized_cross_features must always include \
          perry-runtime/keepalive-anchors so codegen-only #[no_mangle] symbols \
          survive into the staticlib archive, got {cross:?}"
+    );
+}
+
+#[test]
+fn data_url_dynamic_import_enables_dyn_eval_and_changes_cache_key() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let empty_features = std::collections::BTreeSet::new();
+    let without = CompilationContext::new(dir.path().to_path_buf());
+    let mut with_data_url = CompilationContext::new(dir.path().to_path_buf());
+    with_data_url.uses_data_url_dynamic_import = true;
+
+    let cross = auto_optimized_cross_features(&with_data_url, &empty_features, &[]);
+    assert!(
+        cross.iter().any(|f| f == "perry-runtime/dyn-eval"),
+        "data URL modules require the dyn-eval runtime, got {cross:?}"
+    );
+    assert_ne!(
+        auto_optimized_cache_key("", true, false, None, &with_data_url),
+        auto_optimized_cache_key("", true, false, None, &without),
+        "a runtime without dyn-eval must not be reused for data URL imports"
     );
 }
 

@@ -1,4 +1,5 @@
 use super::let_buffer_views::{math_min_length_buffer_ids, register_noalias_buffer_view};
+use super::let_object_facts::{is_object_literal_init, record_imported_object_alias};
 use super::let_stmt_facts::{
     buffer_local_alias_source, collect_scalar_class_data, native_i32_alias_source,
     note_ptr_shape_scalar_replaced, pod_view_count_source, record_array_length_snapshot,
@@ -12,28 +13,11 @@ use crate::expr::{
     lower_expr_with_expected_type, unbox_str_handle,
 };
 use crate::native_value::{
-    LoweredValue, MaterializationReason, NativeRep, PodLayoutDecision, PodLocal, SemanticKind,
+    ExpectedNativeRep, LoweredValue, MaterializationReason, NativeRep, PodLayoutDecision, PodLocal,
+    SemanticKind,
 };
 use crate::type_analysis::is_string_expr;
 use crate::types::{DOUBLE, I1, I32, I64, I8, PTR};
-
-/// #5271: recognize both data-only object literals and method/getter IIFEs so
-/// own members win over built-in prototype methods during lowering.
-fn is_object_literal_init(init: &perry_hir::Expr) -> bool {
-    use perry_hir::Expr;
-    match init {
-        Expr::Object(_) => true,
-        Expr::Call { callee, args, .. } => {
-            matches!(args.first(), Some(Expr::Object(_)))
-                && matches!(
-                    callee.as_ref(),
-                    Expr::Closure { params, .. }
-                        if params.first().is_some_and(|p| p.name == "__perry_obj_iife")
-                )
-        }
-        _ => false,
-    }
-}
 
 fn is_global_this_value(expr: &perry_hir::Expr) -> bool {
     matches!(expr, perry_hir::Expr::GlobalGet(_))
@@ -91,6 +75,7 @@ pub(crate) fn lower_let(
             ctx.local_func_ref_ids.insert(id, *func_id);
         }
     }
+    record_imported_object_alias(ctx, id, init, mutable);
     // Record immutable literal metadata before the module-global and boxed
     // storage paths return. The loop/PIC matchers reason from the HIR local id,
     // so the storage representation does not change the const proof.
@@ -120,6 +105,7 @@ pub(crate) fn lower_let(
         }
     }
     if let Some(init_expr) = init {
+        super::stable_packed_loop::record_derived_local(ctx, id, init_expr, mutable);
         crate::expr::record_local_value_alias_for_write(ctx, id, init_expr);
         record_array_length_snapshot(ctx, id, init_expr);
         ctx.guarded_discriminant_aliases.remove(&id);
@@ -1711,7 +1697,15 @@ pub(crate) fn lower_let(
             false
         };
         let v = if !used_i32_init {
-            let native_init = if matches!(
+            let derived_u32 =
+                crate::stmt::stable_packed_loop::u32_view_derived_local_slot(ctx, id).is_some();
+            let native_init = if derived_u32 {
+                Some(crate::expr::lower_expr_native(
+                    ctx,
+                    init_expr,
+                    ExpectedNativeRep::U32,
+                )?)
+            } else if matches!(
                 refined_ty,
                 perry_hir::types::Type::Number | perry_hir::types::Type::Int32
             ) || (matches!(refined_ty, perry_hir::types::Type::Boolean)
@@ -1754,6 +1748,11 @@ pub(crate) fn lower_let(
                     );
                     v
                 } else if matches!(lowered.rep, NativeRep::U32 | NativeRep::BufferLen) {
+                    if let Some(native_slot) =
+                        crate::stmt::stable_packed_loop::u32_view_derived_local_slot(ctx, id)
+                    {
+                        ctx.block().store(I32, &lowered.value, &native_slot);
+                    }
                     let v = ctx.block().uitofp(I32, &lowered.value, DOUBLE);
                     ctx.block().store(DOUBLE, &v, &slot);
                     ctx.record_lowered_value(

@@ -349,6 +349,23 @@ fn put_value_static_property_fast_path(
     let Expr::String(property) = key else {
         return None;
     };
+    // Source-level `arr.length = value` lowers to `PutValueSet`, while the
+    // Array-exotic length implementation lives in `PropertySet::lower`.
+    // Preserve that statically proven receiver contract here just as
+    // `put_value_index_fast_path` below does for Array index writes. The two
+    // receiver trees represent the one source evaluation, so use the shared
+    // structural identity check and let `PropertySet::lower` evaluate it once.
+    //
+    // Only strict writes may take this route: the existing Array length arm
+    // calls `js_array_set_length_strict`, whereas a rejected sloppy PutValue
+    // must remain a silent no-op through the generic strict-aware runtime.
+    if strict
+        && property == "length"
+        && same_put_value_receiver_expr(target, receiver)
+        && is_array_expr(ctx, target)
+    {
+        return Some(property.clone());
+    }
     // #6542: this fast path lowers to `js_object_set_field_by_name`, which has
     // no `strict` parameter and throws unconditionally when the field is
     // non-writable (frozen/sealed object, `writable: false` descriptor). That
@@ -1260,7 +1277,15 @@ fn is_numeric_string_key(key: &str) -> bool {
 }
 
 fn put_value_index_fast_path(ctx: &FnCtx<'_>, target: &Expr, key: &Expr, receiver: &Expr) -> bool {
-    if !same_side_effect_free_receiver(target, receiver) {
+    // `PutValueSet` stores the assignment base in both `target` and `receiver`;
+    // those two HIR trees describe one source evaluation, not two evaluations
+    // that may be coalesced only when pure. Use the same structural-identity
+    // check as the generic same-receiver PutValue lowering below so expressions
+    // such as `this.getData()[index] = value` can retain the statically known
+    // Array type. `IndexSet::lower` evaluates that base once. A genuinely
+    // distinct receiver (including a call with different arguments) still
+    // fails closed to the explicit-receiver runtime path.
+    if !same_put_value_receiver_expr(target, receiver) {
         return false;
     }
     if is_array_expr(ctx, target) {
@@ -1578,6 +1603,10 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     // path returns the assigned value to ITS caller, which may
                     // well consume it. Never the discarded form.
                     false,
+                    // Preserve the reference's own strictness. Module init is
+                    // a synthetic non-strict function even though module code
+                    // carries strict PutValue references.
+                    *strict,
                 );
             }
             if let Some(result) =

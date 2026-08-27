@@ -57,6 +57,8 @@ fn ir_opts(is_entry: bool) -> CompileOptions {
         namespace_imports: Vec::new(),
         namespace_member_nested: Vec::new(),
         imported_classes: Vec::new(),
+        short_spread_method_candidates: std::sync::Arc::default(),
+        object_literal_method_candidates: std::sync::Arc::default(),
         imported_enums: Vec::new(),
         imported_async_funcs: std::collections::HashSet::new(),
         type_aliases: std::collections::HashMap::new(),
@@ -225,11 +227,12 @@ fn pshape_call_targets(ir: &str) -> Vec<String> {
 
 fn pshape_definitions(ir: &str) -> Vec<String> {
     ir.lines()
-        .filter(|l| l.starts_with("define") && l.contains("$pshape"))
+        .filter(|l| l.starts_with("define"))
         .filter_map(|l| {
             let at = l.find('@')?;
             let paren = l[at..].find('(')?;
-            Some(l[at + 1..at + paren].to_string())
+            let name = &l[at + 1..at + paren];
+            name.ends_with("$pshape").then(|| name.to_string())
         })
         .collect()
 }

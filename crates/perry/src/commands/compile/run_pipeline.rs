@@ -339,6 +339,61 @@ fn imported_class_from_hir(
             .collect(),
         source_class_id: Some(class.id),
         return_shape_imports: Vec::new(),
+        object_literal: None,
+    }
+}
+
+fn imported_object_literal_from_capability(
+    capability: &perry_codegen::ExportedObjectLiteralCapability,
+    source_prefix: String,
+    source_export_name: String,
+    local_binding: String,
+) -> perry_codegen::ImportedClass {
+    // Keep the anonymous shape distinct from user-visible class/import names
+    // in the consumer while retaining the producer's class name for external
+    // keys/constructor symbol formation.
+    let receiver_class_name = format!(
+        "__ImportedObject_{}_{}_{}",
+        source_prefix, capability.global_id, local_binding
+    );
+    perry_codegen::ImportedClass {
+        name: capability.class_name.clone(),
+        local_alias: Some(receiver_class_name.clone()),
+        source_prefix: source_prefix.clone(),
+        constructor_param_count: capability.field_names.len(),
+        has_own_constructor: true,
+        constructor_has_rest: false,
+        has_instance_fields: !capability.field_names.is_empty(),
+        method_names: Vec::new(),
+        proven_this_method_names: Vec::new(),
+        proven_this_tower_method_names: Vec::new(),
+        method_return_types: Vec::new(),
+        method_param_counts: Vec::new(),
+        method_has_rest: Vec::new(),
+        method_has_synthetic_arguments: Vec::new(),
+        static_field_names: Vec::new(),
+        static_method_names: Vec::new(),
+        static_method_return_types: Vec::new(),
+        static_method_param_counts: Vec::new(),
+        static_method_has_rest: Vec::new(),
+        static_method_has_user_rest: Vec::new(),
+        static_method_has_synthetic_arguments: Vec::new(),
+        getter_names: Vec::new(),
+        getter_return_types: Vec::new(),
+        setter_names: Vec::new(),
+        parent_name: None,
+        field_names: capability.field_names.clone(),
+        field_types: vec![perry_hir::types::Type::Any; capability.field_names.len()],
+        source_class_id: Some(capability.class_id),
+        return_shape_imports: Vec::new(),
+        object_literal: Some(perry_codegen::ImportedObjectLiteral {
+            local_binding,
+            source_export_name,
+            source_prefix,
+            receiver_class_name,
+            source_global_id: capability.global_id,
+            methods: capability.methods.clone(),
+        }),
     }
 }
 
@@ -926,6 +981,22 @@ pub fn run_with_parse_cache(
                 class_proven_this_tower_methods
                     .insert(class as *const perry_hir::Class as usize, methods.clone());
             }
+        }
+    }
+
+    // Immutable object-literal method capabilities are keyed exactly like the
+    // other producer facts below. Import resolution later follows barrels to
+    // this defining path/name before installing a consumer-local binding.
+    let mut exported_object_literals: BTreeMap<
+        (String, String),
+        perry_codegen::ExportedObjectLiteralCapability,
+    > = BTreeMap::new();
+    for (path, hir_module) in &ctx.native_modules {
+        let path_str = path.to_string_lossy().to_string();
+        for (export_name, capability) in
+            perry_codegen::exported_object_literal_method_capabilities(hir_module)
+        {
+            exported_object_literals.insert((path_str.clone(), export_name), capability);
         }
     }
 
@@ -2650,6 +2721,75 @@ pub fn run_with_parse_cache(
             )
         })
         .collect();
+    // #8772: harvest producer-authored concrete method capabilities across
+    // the final whole-program HIR before parallel codegen. This is a reverse
+    // flow as well as an import flow: a generic library can own
+    // `value.reset(...args)` while an adapter that imports that library owns
+    // every concrete `reset` implementation. Arc keeps the whole-program map
+    // shared rather than cloning it once per module job.
+    let mut short_spread_method_candidates: std::collections::HashMap<
+        String,
+        Vec<perry_codegen::ShortSpreadMethodCandidate>,
+    > = std::collections::HashMap::new();
+    for hir_module in ctx.native_modules.values() {
+        for candidate in perry_codegen::short_spread_method_capabilities(hir_module) {
+            short_spread_method_candidates
+                .entry(candidate.method_name.clone())
+                .or_default()
+                .push(candidate);
+        }
+    }
+    for candidates in short_spread_method_candidates.values_mut() {
+        candidates.sort_unstable_by(|a, b| {
+            a.class_id
+                .cmp(&b.class_id)
+                .then_with(|| a.target.cmp(&b.target))
+        });
+        candidates.dedup_by(|a, b| a.class_id == b.class_id && a.target == b.target);
+    }
+    let short_spread_method_candidates = std::sync::Arc::new(short_spread_method_candidates);
+    // #8775: a generic library module can receive an exported adapter object
+    // through a parameter without importing its defining module. Publish the
+    // producer's exact immutable object/method facts to every codegen job so a
+    // dynamic property call can select it with runtime identity + shape + live
+    // closure guards. This is the object-literal analogue of the reverse-flow
+    // short-spread registry above.
+    let mut object_literal_method_candidates: std::collections::HashMap<
+        String,
+        Vec<perry_codegen::ObjectLiteralMethodCandidate>,
+    > = std::collections::HashMap::new();
+    for ((source_path, source_export_name), capability) in &exported_object_literals {
+        let source_prefix = compute_module_prefix(source_path, &ctx.project_root);
+        for method in &capability.methods {
+            object_literal_method_candidates
+                .entry(method.name.clone())
+                .or_default()
+                .push(perry_codegen::ObjectLiteralMethodCandidate {
+                    class_id: capability.class_id,
+                    source_prefix: source_prefix.clone(),
+                    source_export_name: source_export_name.clone(),
+                    source_global_id: capability.global_id,
+                    shape_id_global: capability.shape_id_global.clone(),
+                    method: method.clone(),
+                });
+        }
+    }
+    for candidates in object_literal_method_candidates.values_mut() {
+        candidates.sort_unstable_by(|a, b| {
+            a.source_prefix
+                .cmp(&b.source_prefix)
+                .then_with(|| a.source_global_id.cmp(&b.source_global_id))
+                .then_with(|| a.method.field_index.cmp(&b.method.field_index))
+                .then_with(|| a.method.func_id.cmp(&b.method.func_id))
+        });
+        candidates.dedup_by(|a, b| {
+            a.source_prefix == b.source_prefix
+                && a.source_global_id == b.source_global_id
+                && a.method.field_index == b.method.field_index
+                && a.method.func_id == b.method.func_id
+        });
+    }
+    let object_literal_method_candidates = std::sync::Arc::new(object_literal_method_candidates);
     let module_pool = rayon::ThreadPoolBuilder::new()
         .num_threads(module_jobs)
         .thread_name(|index| format!("perry-module-{index}"))
@@ -3024,34 +3164,6 @@ pub fn run_with_parse_cache(
                 if import.module_kind != perry_hir::ModuleKind::NativeCompiled {
                     continue;
                 }
-                // Issue #684: skip WHOLE-DECL type-only imports
-                // (`import type * as X`, `import type { Foo }`). They
-                // contribute zero runtime state — neither the namespace
-                // binding nor the named members ever appear in a
-                // value-position expression after type erasure. Pre-fix
-                // the loop below treated them like value imports and
-                // registered every export of the source module into
-                // `import_function_prefixes` / `namespace_member_prefixes`,
-                // which collided with later named-import registrations:
-                //   effect's `ParseResult.ts` has both
-                //     `import { TaggedError } from "./Data.js"`
-                //     `import type * as Schema from "./Schema.js"`
-                //   Schema.ts also exports `TaggedError`, so the type-only
-                //   loop iteration registered `TaggedError → Schema_ts`
-                //   into `import_function_prefixes`. If Schema.ts was
-                //   processed AFTER Data.ts (HashMap iteration order is
-                //   unstable), the Schema entry won — and top-level
-                //   `class ParseError extends TaggedError("ParseError")`
-                //   dispatched into Schema.ts's `TaggedError` instead of
-                //   Data.ts's. Worse, Schema.ts is type-only so it isn't
-                //   in `module_init_deps` either, meaning its backing
-                //   global was still 0.0 — `js_closure_call1(0.0, ...)`
-                //   threw `TypeError: value is not a function` during
-                //   `ParseResult.ts__init`. Closes #684 (companion to
-                //   #680's `module_init_deps` filter at L3234).
-                if import.type_only {
-                    continue;
-                }
                 let resolved_path = match &import.resolved_path {
                     Some(p) => p,
                     None => continue,
@@ -3066,6 +3178,63 @@ pub fn run_with_parse_cache(
                     Some(m) => sanitize_name(&m.name),
                     None => continue,
                 };
+                // A whole-declaration `import type` contributes no runtime
+                // binding or init edge (#684), but a named class annotation
+                // may still carry useful producer-authored field metadata.
+                // Attach only that exact class when its defining module is
+                // already present in the value-reachable graph. Do not touch
+                // function/namespace maps, imported vars, native libraries,
+                // or module-init dependencies: those were the collision and
+                // phantom-load hazards #684 removed.
+                if import.type_only {
+                    for spec in &import.specifiers {
+                        let perry_hir::ImportSpecifier::Named { imported, local } = spec else {
+                            continue;
+                        };
+                        let key = (resolved_path_str.clone(), imported.clone());
+                        let Some(class) = exported_classes.get(&key) else {
+                            continue;
+                        };
+                        let origin_path = all_module_exports
+                            .get(&resolved_path_str)
+                            .and_then(|exports| exports.get(imported))
+                            .cloned()
+                            .unwrap_or_else(|| resolved_path_str.clone());
+                        let effective_prefix = if origin_path != resolved_path_str {
+                            compute_module_prefix(&origin_path, &ctx.project_root)
+                        } else {
+                            source_prefix.clone()
+                        };
+                        let class_prefix = canonical_class_source_prefix(
+                            class,
+                            &class_canonical_path,
+                            &ctx.project_root,
+                            &effective_prefix,
+                        );
+                        let local_alias = (local != &class.name).then(|| local.clone());
+                        let duplicate = imported_classes.iter().any(|existing| {
+                            existing.name == class.name
+                                && existing.local_alias.as_ref() == local_alias.as_ref()
+                                && existing.source_prefix == class_prefix
+                        });
+                        if !duplicate {
+                            imported_classes.push(imported_class_from_hir(
+                                class,
+                                class_prefix,
+                                local_alias,
+                                proven_this_methods_for_import(
+                                    class,
+                                    &class_proven_this_methods,
+                                ),
+                                proven_this_methods_for_import(
+                                    class,
+                                    &class_proven_this_tower_methods,
+                                ),
+                            ));
+                        }
+                    }
+                    continue;
+                }
                 // PerryTS/storekit#1: when the import source is a package that
                 // declares `perry.nativeLibrary` (e.g. `@perryts/storekit`),
                 // its `.ts` source is a wrapper holding ambient `export
@@ -4067,6 +4236,20 @@ pub fn run_with_parse_cache(
                         if local_name != exported_name {
                             imported_vars.insert(local_name.clone());
                         }
+
+                        let origin_export_name = resolved_origin_name
+                            .clone()
+                            .unwrap_or_else(|| exported_name.clone());
+                        if let Some(capability) = exported_object_literals
+                            .get(&(origin_path.clone(), origin_export_name.clone()))
+                        {
+                            imported_classes.push(imported_object_literal_from_capability(
+                                capability,
+                                effective_prefix.clone(),
+                                origin_export_name,
+                                local_name.clone(),
+                            ));
+                        }
                     }
 
                     // Imported classes
@@ -4790,6 +4973,12 @@ pub fn run_with_parse_cache(
                 namespace_imports,
                 namespace_member_nested: namespace_member_nested.into_iter().collect(),
                 imported_classes,
+                short_spread_method_candidates: std::sync::Arc::clone(
+                    &short_spread_method_candidates,
+                ),
+                object_literal_method_candidates: std::sync::Arc::clone(
+                    &object_literal_method_candidates,
+                ),
                 imported_enums,
                 imported_async_funcs: imported_async_set,
                 type_aliases: type_alias_map,
@@ -6125,6 +6314,13 @@ pub fn run_with_parse_cache(
     // emits `perry_module_init` instead of `main` (see is_dylib branch in
     // codegen/entry.rs, which now also covers `staticlib`).
     if is_staticlib {
+        let runtime_lib_for_manifest = optimized_libs
+            .runtime
+            .clone()
+            .or_else(|| find_runtime_library(target.as_deref()).ok());
+        if let Some(runtime) = &runtime_lib_for_manifest {
+            ensure_runtime_library_compatible(runtime)?;
+        }
         let windows_target = is_windows_target(target.as_deref());
         // Best-effort: drop a stale archive first so `ar` doesn't append to a
         // previous build's contents.
@@ -6198,10 +6394,6 @@ pub fn run_with_parse_cache(
                 "path": abs.display().to_string(),
             }));
         };
-        let runtime_lib_for_manifest = optimized_libs
-            .runtime
-            .clone()
-            .or_else(|| find_runtime_library(target.as_deref()).ok());
         if let Some(p) = &runtime_lib_for_manifest {
             push_archive(&mut link_archives, "runtime", p);
         }
@@ -6511,6 +6703,12 @@ pub fn run_with_parse_cache(
     } else {
         find_runtime_library(target.as_deref())?
     };
+    // #8752: discovery only proves that an archive exists. A runtime copied
+    // from an older compiler build can be found successfully and then fail at
+    // the final link with undefined symbols for newly emitted entrypoints.
+    // Read its embedded build stamp now so the error names the stale archive
+    // and both builds before invoking the platform linker.
+    ensure_runtime_library_compatible(&runtime_lib)?;
     // #1383 — under --enable-geisterhand, prefer the geisterhand-built stdlib
     // over the auto-optimized one. `build_geisterhand_libs` (already run above
     // when selecting `runtime_lib`) compiles perry-stdlib into target/geisterhand
@@ -6609,6 +6807,15 @@ pub fn run_with_parse_cache(
         args.debug_symbols,
         verbose,
     )?;
+
+    // Approved Node-API payloads are a relocatable authenticated sibling of
+    // the executable. Run this even on a link-cache hit so a changed payload
+    // refreshes distribution bytes without needlessly relinking the host.
+    if let Some(sidecar) = stage_native_addon_sidecar(&ctx, &exe_path, target.as_deref())? {
+        if matches!(format, OutputFormat::Text) {
+            println!("Wrote Node-API sidecar: {}", sidecar.display());
+        }
+    }
 
     // HarmonyOS: emit the ArkTS EntryAbility + Index page next to the .so,
     // then bundle everything into a .hap. The ArkTS shim's import name is

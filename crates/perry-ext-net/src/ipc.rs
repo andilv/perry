@@ -32,6 +32,9 @@ fn allocate_socket() -> (i64, mpsc::UnboundedReceiver<SocketCommand>) {
     statics::sockets().lock().unwrap().insert(
         id,
         SocketState {
+            tcp_async_id: 0,
+            connect_async_id: 0,
+            shutdown_async_id: 0,
             cmd_tx: tx,
             pending_rx: None,
             is_open: false,
@@ -41,6 +44,7 @@ fn allocate_socket() -> (i64, mpsc::UnboundedReceiver<SocketCommand>) {
             destroyed: false,
             bytes_read: 0,
             bytes_written: 0,
+            bytes_queued: 0,
             timeout: None,
             type_of_service: 0,
             server_id: None,
@@ -99,6 +103,9 @@ pub(crate) fn register_accepted_transport(
     statics::sockets().lock().unwrap().insert(
         socket_id,
         SocketState {
+            tcp_async_id: 0,
+            connect_async_id: 0,
+            shutdown_async_id: 0,
             cmd_tx: tx,
             pending_rx: None,
             is_open: true,
@@ -108,6 +115,7 @@ pub(crate) fn register_accepted_transport(
             destroyed: false,
             bytes_read: 0,
             bytes_written: 0,
+            bytes_queued: 0,
             timeout: None,
             type_of_service: 0,
             server_id: Some(server_id),

@@ -652,6 +652,34 @@ fn symbol_keys_keep_creation_order_across_accessor_redefine() {
     }
 }
 
+#[test]
+fn undefined_symbol_value_still_counts_as_an_own_property() {
+    let _global = crate::gc::global_side_table_test_lock();
+    crate::symbol::test_clear_symbol_side_table_roots();
+    unsafe {
+        let obj = js_object_alloc(0, 0);
+        assert!(!obj.is_null());
+        let obj_value = crate::value::js_nanbox_pointer(obj as i64);
+        let symbol = crate::symbol::js_symbol_new_empty();
+        crate::symbol::js_object_set_symbol_property(
+            obj_value,
+            symbol,
+            f64::from_bits(crate::value::TAG_UNDEFINED),
+        );
+
+        assert!(crate::symbol::has_own_symbol_property(obj_value, symbol));
+        assert!(super::reflect_support::obj_value_has_own_key(
+            obj_value, symbol
+        ));
+        crate::proxy::js_put_value_set(obj_value, symbol, 42.0, obj_value, 1);
+        assert_eq!(
+            crate::symbol::js_object_get_symbol_property(obj_value, symbol).to_bits(),
+            42.0f64.to_bits(),
+            "OrdinarySet must overwrite an own Symbol property whose old value is undefined"
+        );
+    }
+}
+
 /// #7916 / #8047: the per-object footprint accounting this issue is about,
 /// pinned as an executable fact rather than a comment.
 ///
@@ -919,7 +947,7 @@ fn transition_cache_lookup_rejects_mutated_edge_target() {
     let keys = crate::array::js_array_push(keys, JSValue::string_ptr(key));
     let keys = crate::array::js_array_push(keys, JSValue::string_ptr(key));
 
-    transition_cache_insert(0, key, keys as usize, 0);
+    transition_cache_insert(0, key, keys as usize, 0, 0);
 
     assert!(
         transition_cache_lookup(0, key).is_none(),
@@ -930,9 +958,10 @@ fn transition_cache_lookup_rejects_mutated_edge_target() {
     with_transition_cache(|t| unsafe {
         // GC_STORE_AUDIT(ROOT): test cleanup writes non-pointer sentinels into scanned TRANSITION_CACHE_GLOBAL roots.
         (*t)[slot] = TransitionEntry {
-            prev_keys: 0,
             key_ptr: 0,
             next_keys: 0,
+            prev_shape_id: 0,
+            target_shape_id: 0,
             slot_idx: 0,
             target_len: 0,
         };
@@ -940,14 +969,63 @@ fn transition_cache_lookup_rejects_mutated_edge_target() {
 }
 
 #[test]
+fn transition_cache_requires_exact_predecessor_shape_id() {
+    let key = crate::string::js_string_from_bytes(b"shape-key".as_ptr(), 9);
+    let keys = crate::array::js_array_alloc(4);
+    let keys = crate::array::js_array_push(keys, JSValue::string_ptr(key));
+    const PREDECESSOR: u32 = 101;
+    const OTHER_PREDECESSOR: u32 = 102;
+    const TARGET: u32 = 201;
+
+    transition_cache_insert(PREDECESSOR, key, keys as usize, 0, TARGET);
+    assert!(
+        transition_cache_lookup(OTHER_PREDECESSOR, key).is_none(),
+        "equal keys edges with different semantic ShapeIds must not alias"
+    );
+    assert_eq!(
+        transition_cache_lookup(PREDECESSOR, key),
+        Some((keys as usize, 0, TARGET))
+    );
+
+    let slot = transition_cache_slot(PREDECESSOR, key as usize);
+    with_transition_cache(|table| unsafe {
+        (*table)[slot] = TransitionEntry {
+            key_ptr: 0,
+            next_keys: 0,
+            prev_shape_id: 0,
+            target_shape_id: 0,
+            slot_idx: 0,
+            target_len: 0,
+        };
+    });
+}
+
+#[test]
+fn transition_cache_prunes_a_descriptorless_target_shape() {
+    let _lock = crate::gc::global_side_table_test_lock();
+    let next_keys = crate::array::js_array_alloc(0);
+    let predecessor = crate::object::shapes::shape_id_for_keys_ensure(std::ptr::null(), 0);
+    let target = crate::object::shapes::shape_descriptor_ensure(next_keys, 0, 0)
+        .expect("shape range unexpectedly exhausted");
+    let occupancy_before = test_transition_cache_occupancy();
+    transition_cache_insert(predecessor, std::ptr::null(), next_keys as usize, 0, target);
+    assert_eq!(test_transition_cache_occupancy(), occupancy_before + 1);
+
+    crate::object::shapes::test_drop_shape_descriptors(next_keys as usize);
+    assert!(crate::object::shapes::shape_descriptor_by_id(target).is_none());
+    prune_dead_transition_cache_entries(&|_| false);
+    assert_eq!(
+        test_transition_cache_occupancy(),
+        occupancy_before,
+        "a descriptorless target must release its rooted transition edge"
+    );
+}
+
+#[test]
 fn transition_cache_lookup_rejects_slot_key_mismatch() {
-    // #6006: `prev_keys` / `key_ptr` are raw addresses that GC does not
-    // relocate. When GC frees a keys_array and recycles its address into an
-    // unrelated array, a stale entry can pointer-match a *different* shape —
-    // one where `next_keys[slot_idx]` is a DIFFERENT key. Adopting that edge
-    // would store the value at the wrong slot (keys_array looks right but the
-    // read returns undefined). The content check must reject such an edge so
-    // the caller falls back to the correct slow path.
+    // The target bytes remain independently validated even though predecessor
+    // identity now uses a stable ShapeId. Adopting a mismatched target would
+    // store the value at the wrong slot.
     let want = crate::string::js_string_from_bytes(b"alpha".as_ptr(), 5);
     let other = crate::string::js_string_from_bytes(b"beta".as_ptr(), 4);
 
@@ -958,7 +1036,7 @@ fn transition_cache_lookup_rejects_slot_key_mismatch() {
     // Insert an edge keyed on (prev=0, `alpha`) but targeting the `beta` shape,
     // mirroring a recycled-address false match (target_len is set because the
     // length matches slot_idx+1, so only the content check can catch it).
-    transition_cache_insert(0, want, keys as usize, 0);
+    transition_cache_insert(0, want, keys as usize, 0, 0);
 
     assert!(
         transition_cache_lookup(0, want).is_none(),
@@ -968,7 +1046,7 @@ fn transition_cache_lookup_rejects_slot_key_mismatch() {
     // Sanity: an edge whose target slot DOES hold the key still hits.
     let good_keys = crate::array::js_array_alloc(4);
     let good_keys = crate::array::js_array_push(good_keys, JSValue::string_ptr(want));
-    transition_cache_insert(0, want, good_keys as usize, 0);
+    transition_cache_insert(0, want, good_keys as usize, 0, 0);
     assert!(
         transition_cache_lookup(0, want).is_some(),
         "a genuine edge (target slot holds the key) must still hit (#6006)"
@@ -978,9 +1056,10 @@ fn transition_cache_lookup_rejects_slot_key_mismatch() {
     with_transition_cache(|t| unsafe {
         // GC_STORE_AUDIT(ROOT): test cleanup writes non-pointer sentinels into scanned TRANSITION_CACHE_GLOBAL roots.
         (*t)[slot] = TransitionEntry {
-            prev_keys: 0,
             key_ptr: 0,
             next_keys: 0,
+            prev_shape_id: 0,
+            target_shape_id: 0,
             slot_idx: 0,
             target_len: 0,
         };
@@ -1001,7 +1080,7 @@ fn transition_cache_lookup_rejects_grown_shared_target() {
     // A 1-key target with spare capacity, cached as a slot-0 edge (target_len=1).
     let keys = crate::array::js_array_alloc(4);
     let keys = crate::array::js_array_push(keys, JSValue::string_ptr(key));
-    transition_cache_insert(0, key, keys as usize, 0);
+    transition_cache_insert(0, key, keys as usize, 0, 0);
     assert!(
         transition_cache_lookup(0, key).is_some(),
         "sanity: a genuine 1-key edge hits before the target grows (#6006)"
@@ -1025,9 +1104,10 @@ fn transition_cache_lookup_rejects_grown_shared_target() {
     with_transition_cache(|t| unsafe {
         // GC_STORE_AUDIT(ROOT): test cleanup writes non-pointer sentinels into scanned TRANSITION_CACHE_GLOBAL roots.
         (*t)[slot] = TransitionEntry {
-            prev_keys: 0,
             key_ptr: 0,
             next_keys: 0,
+            prev_shape_id: 0,
+            target_shape_id: 0,
             slot_idx: 0,
             target_len: 0,
         };
@@ -1350,13 +1430,11 @@ fn class_capture_value_or_rejects_tag_stripped_fallback() {
 /// Reading `.size` on a `Map` *by name* — the shape a minified bundle produces
 /// when the receiver's `Map` type is erased to `any` (`map.size` dispatched
 /// through `js_object_get_field_by_name`) — reaches the `.size` fast path,
-/// which calls `own_key_present(map, "size")`. A `MapHeader` is 16 bytes
-/// (`size`/`capacity`/`entries`) with no `keys_array` field at offset 16, so
-/// `crate::object::object_keys_array(obj)` used to read 8 bytes past the header into the adjacent
-/// allocation; that stray word cleared the keys-pointer alignment/range guard
-/// and then SIGBUS'd on the `[keys-8]` GC-type-tag load. `own_key_present` now
-/// answers `false` for a non-`GC_TYPE_OBJECT` receiver, so the read falls
-/// through to the `Map.size` tail instead of dereferencing garbage.
+/// which calls `own_key_present(map, "size")`. A `MapHeader` is not an
+/// `ObjectHeader` and has no `keys_array` field; treating it as one used to
+/// read unrelated bytes and then SIGBUS on the derived GC-type-tag load.
+/// `own_key_present` now answers `false` for a non-`GC_TYPE_OBJECT` receiver,
+/// so the read falls through to the `Map.size` tail.
 #[test]
 fn map_size_by_name_does_not_oob_read_keys_array() {
     unsafe {
@@ -1366,8 +1444,8 @@ fn map_size_by_name_does_not_oob_read_keys_array() {
         let empty = crate::map::js_map_alloc(4);
         assert!(!empty.is_null());
         // The precise frame that faulted: a Map is not an object, so it has no
-        // own string key. This must answer false without dereferencing
-        // `[obj+16]` past the 16-byte MapHeader.
+        // own string key. This must answer false without interpreting Map
+        // metadata as an ObjectHeader field.
         assert!(!own_key_present(empty as *mut ObjectHeader, size_key));
         let v0 = crate::object::js_object_get_field_by_name(empty as *const ObjectHeader, size_key);
         assert!(v0.is_number(), "empty Map .size must be a number");

@@ -8,7 +8,7 @@
 #![cfg(test)]
 
 use super::*;
-use crate::ir::{EnumValue, Stmt};
+use crate::ir::{EnumValue, Expr, Stmt};
 use crate::types::{Type, TypeParam};
 
 fn make_ctx() -> LoweringContext {
@@ -23,6 +23,32 @@ fn test_lower_define_and_lookup_local() {
     assert_eq!(ctx.lookup_local("y"), None);
     // Verify the type is stored correctly
     assert_eq!(ctx.lookup_local_type("x"), Some(&Type::Number));
+}
+
+#[test]
+fn array_inference_is_revoked_after_plain_object_assignment() {
+    let source = r#"
+        var value = [1];
+        value.unshift(0);
+        value = { 0: 1 };
+        value.unshift(0);
+    "#;
+    let module =
+        perry_parser::parse_typescript(source, "array-reassign.js").expect("source parses");
+    let hir =
+        super::lower_module(&module, "array-reassign", "array-reassign.js").expect("source lowers");
+    let value_type = hir.init.iter().find_map(|stmt| match stmt {
+        Stmt::Let { name, ty, .. } if name == "value" => Some(ty),
+        _ => None,
+    });
+    assert_eq!(value_type, Some(&Type::Any));
+
+    let dump = format!("{hir:?}");
+    assert_eq!(
+        dump.matches("ArrayUnshift").count(),
+        1,
+        "only the call before the object reassignment may stay specialized: {dump}"
+    );
 }
 
 #[test]
@@ -84,6 +110,123 @@ function build(paramBox: unknown) {
             starts.contains(&expected),
             "missing declaration span for {name} at {expected}: {starts:?}"
         );
+    }
+}
+
+#[test]
+fn static_method_literals_skip_the_builder_iife_but_home_objects_fail_closed() {
+    let source = r#"
+const outer = 4;
+const fast = {
+  plain: 1,
+  captured(x: number) { return outer + x; },
+  dynamicThis(x: number) { return this.plain + x; },
+};
+const withSuper = { read() { return super.value; } };
+const key = "computed";
+const computed = { [key]() { return 1; } };
+"#;
+    let module = perry_parser::parse_typescript(source, "method-object.ts").expect("source parses");
+    let hir =
+        super::lower_module(&module, "method-object", "method-object.ts").expect("source lowers");
+
+    let local_init = |name: &str| {
+        hir.init
+            .iter()
+            .find_map(|stmt| match stmt {
+                Stmt::Let {
+                    name: local_name,
+                    init: Some(init),
+                    ..
+                } if local_name == name => Some(init),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing init for {name}"))
+    };
+
+    let Expr::Object(props) = local_init("fast") else {
+        panic!(
+            "static method literal should be a direct object: {:#?}",
+            hir.init
+        );
+    };
+    assert_eq!(
+        props
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        ["plain", "captured", "dynamicThis"]
+    );
+    assert!(matches!(
+        &props[2].1,
+        Expr::Closure {
+            captures_this: true,
+            ..
+        }
+    ));
+
+    for name in ["withSuper", "computed"] {
+        assert!(
+            matches!(
+                local_init(name),
+                Expr::Call { callee, .. }
+                    if matches!(
+                        callee.as_ref(),
+                        Expr::Closure { params, .. }
+                            if params.first().is_some_and(|param| param.name == "__perry_obj_iife")
+                    )
+            ),
+            "{name} must retain the source-ordered home-object IIFE"
+        );
+    }
+}
+
+#[test]
+fn exported_static_method_literals_keep_a_stable_shape_seed() {
+    let source = r#"
+export const named = {
+  value: 1,
+  read() { return this.value; },
+};
+export default {
+  value: 2,
+  read() { return this.value; },
+};
+"#;
+    let module =
+        perry_parser::parse_typescript(source, "exported-method-object.ts").expect("source parses");
+    let hir = super::lower_module(
+        &module,
+        "exported-method-object",
+        "exported-method-object.ts",
+    )
+    .expect("source lowers");
+
+    for name in ["named", "default"] {
+        let init = hir
+            .init
+            .iter()
+            .find_map(|stmt| match stmt {
+                Stmt::Let {
+                    name: local_name,
+                    init: Some(init),
+                    ..
+                } if local_name == name => Some(init),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing init for {name}"));
+        let Expr::Call { callee, args, .. } = init else {
+            panic!("exported method object must retain its seeded IIFE: {init:#?}");
+        };
+        assert!(matches!(
+            callee.as_ref(),
+            Expr::Closure { params, .. }
+                if params.first().is_some_and(|param| param.name == "__perry_obj_iife")
+        ));
+        assert!(matches!(
+            args.as_slice(),
+            [Expr::New { class_name, .. }] if class_name.starts_with("__AnonShape_")
+        ));
     }
 }
 

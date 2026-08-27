@@ -472,6 +472,16 @@ pub(super) unsafe fn dispatch_common(
             ) {
                 return Some(result);
             }
+            // A direct primitive-wrapper call resolves through
+            // Number/Boolean/BigInt.prototype and returns the primitive's
+            // internal value. The explicit Object.prototype.valueOf.call(x)
+            // form uses object_prototype_value_of_thunk instead, where ToObject
+            // intentionally produces a wrapper.
+            let object = object_handle.get_nanbox_f64();
+            let jsval = JSValue::from_bits(object.to_bits());
+            if !jsval.is_pointer() {
+                return Some(object);
+            }
             return Some(js_object_default_value_of(object));
         }
 
@@ -849,7 +859,7 @@ pub(super) unsafe fn dispatch_common(
             if !args_ptr.is_null() {
                 for i in 0..args_len {
                     let val = *args_ptr.add(i);
-                    arr = crate::array::js_array_push_f64(arr, val);
+                    arr = crate::array::js_array_push_f64_spec(arr, val);
                 }
             }
             return Some(crate::array::js_array_length(arr) as f64);

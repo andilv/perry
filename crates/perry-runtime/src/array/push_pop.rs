@@ -191,6 +191,12 @@ pub extern "C" fn js_array_grow(arr: *mut ArrayHeader, min_capacity: u32) -> *mu
             (new_ptr as *mut u8).sub(crate::gc::GC_HEADER_SIZE) as *mut crate::gc::GcHeader;
         (*new_header)._reserved = (*old_header)._reserved;
         crate::gc::layout_transfer(arr as *mut u8, new_ptr as *mut u8);
+        // `js_array_grow` is an allocation replacement outside the collector,
+        // so GC's normal side-table rekey phase does not run. Preserve every
+        // accessor/property descriptor already owned by the old array before
+        // turning it into a forwarding stub (reduceRight getter-order cases
+        // commonly install index 1, then grow again while installing index 2).
+        crate::object::transfer_descriptor_owner(arr as usize, new_ptr as usize);
         // #7742-adjacent: the copy above is verbatim at offset 0, so the old
         // store's dirty-page coverage can be TRANSLATED to the new address
         // instead of re-derived from 3 M slot values. Falls back to the full
@@ -701,6 +707,75 @@ pub extern "C" fn js_array_push_f64(arr: *mut ArrayHeader, value: f64) -> *mut A
     }
 }
 
+/// User-observable `Array.prototype.push` for a statically known Array.
+///
+/// Most runtime callers use [`js_array_push_f64`] as an internal
+/// CreateDataProperty-style append while building a fresh result array. Those
+/// writes must ignore inherited indexed setters. JavaScript `push`, however,
+/// performs `Set` and therefore needs the descriptor-aware path whenever the
+/// receiver or its prototype chain is exotic.
+#[no_mangle]
+pub extern "C" fn js_array_push_f64_spec(arr: *mut ArrayHeader, value: f64) -> *mut ArrayHeader {
+    if array_ptr_as_proxy(arr).is_some() {
+        return js_array_push_f64(arr, value);
+    }
+    let cleaned = clean_arr_ptr_mut(arr);
+    if cleaned.is_null() {
+        return js_array_push_f64(arr, value);
+    }
+    if crate::array::array_iteration_is_exotic(cleaned) {
+        crate::string::js_string_addref_if_heap_string(value);
+        return push_array_spec_path(cleaned, value);
+    }
+    js_array_push_f64(cleaned, value)
+}
+
+/// The observable Set/Set-length path for push when indexed descriptors,
+/// sparse storage, or prototype indices make the dense append inequivalent.
+fn push_array_spec_path(arr: *mut ArrayHeader, value: f64) -> *mut ArrayHeader {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let arr_handle = scope.root_raw_mut_ptr(arr);
+    let value_handle = scope.root_nanbox_f64(value);
+    let length = unsafe { (*arr_handle.get_raw_mut_ptr::<ArrayHeader>()).length };
+
+    if length == u32::MAX {
+        // 2^32-1 is a named property, not an Array index. The element Set is
+        // observable before the final ArraySetLength rejects 2^32.
+        let key_text = length.to_string();
+        let key = crate::string::js_string_from_bytes(key_text.as_ptr(), key_text.len() as u32);
+        unsafe {
+            array_named_property_set(
+                arr_handle.get_raw_mut_ptr::<ArrayHeader>(),
+                key,
+                value_handle.get_nanbox_f64(),
+            );
+        }
+        crate::array::array_length_range_error();
+    }
+
+    let next = crate::array::array_spec_set(
+        arr_handle.get_raw_mut_ptr::<ArrayHeader>(),
+        length,
+        value_handle.get_nanbox_f64(),
+    );
+    let next = clean_arr_ptr_mut(next);
+    if !next.is_null() {
+        arr_handle.set_raw_mut_ptr(next);
+    }
+    unsafe {
+        let current = clean_arr_ptr_mut(arr_handle.get_raw_mut_ptr::<ArrayHeader>());
+        arr_handle.set_raw_mut_ptr(current);
+        // An inherited setter above can change either integrity condition.
+        if array_is_frozen(current) {
+            throw_frozen_array_mutation();
+        }
+        guard_writable_length(current);
+        (*current).length = length + 1;
+        rebuild_array_layout(current);
+        current
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn js_array_push_hole(arr: *mut ArrayHeader) -> *mut ArrayHeader {
     js_array_push_f64(arr, f64::from_bits(crate::value::TAG_HOLE))
@@ -720,6 +795,9 @@ pub extern "C" fn js_array_numeric_push_f64_unboxed(
     }
     guard_writable_length(arr);
     unsafe {
+        if crate::array::array_iteration_is_exotic(arr) {
+            return js_array_push_f64_spec(arr, value);
+        }
         if array_numeric_raw_f64_push_inbounds(arr, value) {
             return arr;
         }
@@ -981,6 +1059,28 @@ pub extern "C" fn js_array_set_length(arr: *mut ArrayHeader, new_length: f64) {
             // table. Delete them first, in the same descending order required
             // by ArraySetLength, then visit the allocated dense prefix.
             let capacity = (*arr).capacity;
+            // With no indexed descriptors and no side-table properties, every
+            // own index in the truncated suffix is an ordinary dense slot.
+            // ArraySetLength has no observable per-index operation in this
+            // case, so clear the suffix in one runtime region and rebuild the
+            // live-prefix GC layout once. This preserves the holes required if
+            // the array grows again without paying String construction and
+            // three descriptor/expando probes for every removed element.
+            if flags & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS == 0
+                && cur <= capacity
+                && !array_has_named_properties(arr)
+            {
+                let elements = (arr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut u64;
+                for i in n..cur {
+                    // GC_STORE_AUDIT(BARRIERED): the suffix becomes unreachable
+                    // when length is published below; rebuild_array_layout then
+                    // rebuilds the complete live-prefix layout/barrier state.
+                    ptr::write(elements.add(i as usize), crate::value::TAG_HOLE);
+                }
+                (*arr).length = n;
+                rebuild_array_layout(arr);
+                return;
+            }
             if cur > capacity {
                 let mut sparse_indices: Vec<u32> = array_named_property_names(arr, false)
                     .into_iter()
@@ -1110,8 +1210,19 @@ pub extern "C" fn js_array_shift_f64(arr: *mut ArrayHeader) -> f64 {
             return TAG_UNDEFINED_F64;
         }
 
+        // A raw memmove is only equivalent to Shift when every observable
+        // indexed operation is an ordinary dense-array access. Indexed
+        // descriptors and prototype properties require the specified live
+        // HasProperty/Get/Set/Delete order; their accessors can also freeze the
+        // receiver or make `length` non-writable before the final length Set.
+        if crate::array::array_iteration_is_exotic(arr) {
+            return shift_array_spec_path(arr);
+        }
+
+        // `TAG_HOLE` is an internal storage sentinel. Even on the dense path,
+        // Get(O, "0") must expose it as `undefined`.
+        let value = crate::array::js_array_get_f64(arr, 0);
         let elements_ptr = (arr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut f64;
-        let value = *elements_ptr;
 
         // Shift all elements down
         // GC_STORE_AUDIT(BARRIERED): shift memmove is followed by layout/barrier rebuild.
@@ -1119,6 +1230,82 @@ pub extern "C" fn js_array_shift_f64(arr: *mut ArrayHeader) -> f64 {
         (*arr).length = length - 1;
         rebuild_array_layout(arr);
         value
+    }
+}
+
+/// ECMA-262 Array.prototype.shift for a real array whose indexed operations
+/// are observable. The loop keeps the original length while consulting live
+/// presence and values, and roots both the receiver and carried values across
+/// accessors which may allocate or move either one.
+unsafe fn shift_array_spec_path(arr: *mut ArrayHeader) -> f64 {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let arr_handle = scope.root_raw_mut_ptr(arr);
+    let first_handle = scope.root_nanbox_f64(f64::from_bits(crate::value::TAG_UNDEFINED));
+    let from_value_handle = scope.root_nanbox_f64(f64::from_bits(crate::value::TAG_UNDEFINED));
+    let len = (*arr).length;
+
+    let (first, _) = arr_handle.across_mut::<ArrayHeader, _>(|| {
+        arr_handle.with_mut_ptr(|current| crate::array::array_spec_get(current, 0))
+    });
+    first_handle.set_nanbox_f64(first);
+
+    for from in 1..len {
+        let from_present = arr_handle.with_mut_ptr::<ArrayHeader, _>(|current| {
+            crate::array::array_spec_has_index(current, from)
+        });
+        let to = from - 1;
+        if from_present {
+            let (value, _) = arr_handle.across_mut::<ArrayHeader, _>(|| {
+                arr_handle.with_mut_ptr(|current| crate::array::array_spec_get(current, from))
+            });
+            from_value_handle.set_nanbox_f64(value);
+            shift_array_spec_set(&arr_handle, to, &from_value_handle);
+        } else {
+            shift_array_spec_delete(&arr_handle, to);
+        }
+    }
+
+    shift_array_spec_delete(&arr_handle, len - 1);
+
+    // Set(O, "length", len - 1, true) occurs after every indexed operation.
+    // Re-read the receiver state because any getter/setter above may have
+    // frozen it or replaced `length` with a non-writable descriptor.
+    arr_handle.with_mut_ptr::<ArrayHeader, _>(|current| {
+        let current = clean_arr_ptr_mut(current);
+        if array_is_frozen(current) {
+            throw_frozen_array_mutation();
+        }
+        guard_writable_length(current);
+        (*current).length = len - 1;
+        rebuild_array_layout(current);
+    });
+    first_handle.get_nanbox_f64()
+}
+
+fn shift_array_spec_set(
+    arr_handle: &crate::gc::RuntimeHandle<'_>,
+    index: u32,
+    value_handle: &crate::gc::RuntimeHandle<'_>,
+) {
+    let (next, post_gc) = arr_handle.across_mut::<ArrayHeader, _>(|| {
+        let value = value_handle.get_nanbox_f64();
+        arr_handle.with_mut_ptr(|current| crate::array::array_spec_set(current, index, value))
+    });
+    let next = clean_arr_ptr_mut(next);
+    let current = if next.is_null() {
+        clean_arr_ptr_mut(post_gc)
+    } else {
+        next
+    };
+    arr_handle.set_raw_mut_ptr(current);
+}
+
+fn shift_array_spec_delete(arr_handle: &crate::gc::RuntimeHandle<'_>, index: u32) {
+    let (deleted, _) = arr_handle.across_mut::<ArrayHeader, _>(|| {
+        arr_handle.with_mut_ptr(|current| crate::array::js_array_delete(current, index))
+    });
+    if deleted == 0 {
+        throw_cannot_delete_array_index(index);
     }
 }
 
@@ -1134,6 +1321,9 @@ pub extern "C" fn js_array_unshift_f64(arr: *mut ArrayHeader, value: f64) -> *mu
     let arr = clean_arr_ptr_mut(arr);
     if arr.is_null() {
         return js_array_alloc(0);
+    }
+    if crate::array::array_iteration_is_exotic(arr) {
+        return unshift_array_spec_path(arr, &[value]);
     }
     if array_is_frozen(arr) {
         throw_frozen_array_mutation();
@@ -1195,6 +1385,16 @@ pub extern "C" fn js_array_unshift_variadic(
     // a frozen array and a non-writable `length` throw before the no-op early
     // return. Frozen check must come first because freeze doesn't record "length"
     // attrs, so `guard_writable_length` alone wouldn't catch it.
+    if count != 0 && crate::array::array_iteration_is_exotic(arr) {
+        let values = unsafe {
+            if items.is_null() {
+                &[][..]
+            } else {
+                std::slice::from_raw_parts(items, count as usize)
+            }
+        };
+        return unshift_array_spec_path(arr, values);
+    }
     if array_is_frozen(arr) {
         throw_frozen_array_mutation();
     }
@@ -1241,6 +1441,54 @@ pub extern "C" fn js_array_unshift_variadic(
         (*arr).length = length + n as u32;
         rebuild_array_layout(arr);
         arr
+    }
+}
+
+fn unshift_array_spec_path(arr: *mut ArrayHeader, items: &[f64]) -> *mut ArrayHeader {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let arr_handle = scope.root_raw_mut_ptr(arr);
+    let item_handles: Vec<_> = items
+        .iter()
+        .map(|value| scope.root_nanbox_f64(*value))
+        .collect();
+    let length = unsafe { (*arr_handle.get_raw_mut_ptr::<ArrayHeader>()).length };
+    let count = u32::try_from(item_handles.len()).unwrap_or_else(|_| {
+        crate::array::array_length_range_error();
+    });
+    let new_length = length.checked_add(count).unwrap_or_else(|| {
+        crate::array::array_length_range_error();
+    });
+
+    let mut k = length;
+    while k > 0 {
+        let from = k - 1;
+        let to = from + count;
+        if crate::array::array_spec_has_index(arr_handle.get_raw_mut_ptr::<ArrayHeader>(), from) {
+            let iteration_scope = crate::gc::RuntimeHandleScope::new();
+            let value =
+                crate::array::array_spec_get(arr_handle.get_raw_mut_ptr::<ArrayHeader>(), from);
+            let value_handle = iteration_scope.root_nanbox_f64(value);
+            shift_array_spec_set(&arr_handle, to, &value_handle);
+        } else {
+            shift_array_spec_delete(&arr_handle, to);
+        }
+        k -= 1;
+    }
+    for (index, value) in item_handles.iter().enumerate() {
+        shift_array_spec_set(&arr_handle, index as u32, value);
+    }
+
+    unsafe {
+        let current = clean_arr_ptr_mut(arr_handle.get_raw_mut_ptr::<ArrayHeader>());
+        arr_handle.set_raw_mut_ptr(current);
+        // Getters/setters in the indexed moves may have changed this state.
+        if array_is_frozen(current) {
+            throw_frozen_array_mutation();
+        }
+        guard_writable_length(current);
+        (*current).length = new_length;
+        rebuild_array_layout(current);
+        current
     }
 }
 

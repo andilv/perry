@@ -220,6 +220,7 @@ const FFI_REGISTRY: &[(&str, OwnerKind)] = &[
     ("js_https_request",                            OwnerKind::WellKnown("http")),
     ("js_https_get",                                OwnerKind::WellKnown("http")),
     ("js_http_on",                                  OwnerKind::WellKnown("http")),
+    ("js_http_once",                                OwnerKind::WellKnown("http")),
     ("js_http_set_header",                          OwnerKind::WellKnown("http")),
     ("js_http_set_timeout",                         OwnerKind::WellKnown("http")),
     ("js_http_set_timeout_full",                    OwnerKind::WellKnown("http")),
@@ -300,6 +301,7 @@ const FFI_REGISTRY: &[(&str, OwnerKind)] = &[
     ("js_node_http_server_ref",                     OwnerKind::WellKnown("http")),
     ("js_node_http_server_unref",                   OwnerKind::WellKnown("http")),
     ("js_node_http_im_on",                          OwnerKind::WellKnown("http")),
+    ("js_node_http_im_once",                        OwnerKind::WellKnown("http")),
     ("js_node_http_im_pause",                       OwnerKind::WellKnown("http")),
     ("js_node_http_im_resume",                      OwnerKind::WellKnown("http")),
     ("js_node_http_im_pause_self",                  OwnerKind::WellKnown("http")),
@@ -391,6 +393,8 @@ const FFI_REGISTRY: &[(&str, OwnerKind)] = &[
     // import flip might not fire. Tagging here so the linker pulls
     // libperry_ext_net.a in regardless.
     ("js_net_create_server",                        OwnerKind::WellKnown("net")),
+    ("js_ext_net_create_server",                    OwnerKind::WellKnown("net")),
+    ("js_ext_net_socket_connect",                   OwnerKind::WellKnown("net")),
     ("js_net_server_listen",                        OwnerKind::WellKnown("net")),
     ("js_net_server_close",                         OwnerKind::WellKnown("net")),
     ("js_net_server_address",                       OwnerKind::WellKnown("net")),
@@ -439,6 +443,9 @@ const FFI_REGISTRY: &[(&str, OwnerKind)] = &[
     // program that doesn't otherwise import socket-side surface.
     ("js_net_socket_address",                       OwnerKind::WellKnown("net")),
     ("js_net_socket_once",                          OwnerKind::WellKnown("net")),
+    ("js_ext_net_socket_once",                      OwnerKind::WellKnown("net")),
+    ("js_ext_net_socket_on",                        OwnerKind::WellKnown("net")),
+    ("js_ext_tls_connect",                          OwnerKind::WellKnown("net")),
     ("js_net_socket_remove_listener",               OwnerKind::WellKnown("net")),
     ("js_net_socket_remove_all_listeners",          OwnerKind::WellKnown("net")),
     ("js_net_socket_listener_count",                OwnerKind::WellKnown("net")),
@@ -539,11 +546,17 @@ const FFI_REGISTRY: &[(&str, OwnerKind)] = &[
     // `external-events-construct` feature (see optimized_libs.rs), which the
     // default-import dynamic-`new` path relies on (#4995).
     //
-    // Only the core surface defined by perry-ext-events is listed; the
-    // `js_event_emitter_async_resource_*` helpers live in perry-stdlib and
-    // are out of scope here (`EventEmitterAsyncResource` is node:events-only).
+    // EventEmitterAsyncResource lives alongside the external EventEmitter so
+    // optimized node:events builds retain one coherent handle registry.
     ("js_event_emitter_new",                        OwnerKind::WellKnown("events")),
     ("js_event_emitter_new_with_options",           OwnerKind::WellKnown("events")),
+    ("js_event_emitter_async_resource_new",         OwnerKind::WellKnown("events")),
+    ("js_event_emitter_async_resource_call",        OwnerKind::WellKnown("events")),
+    ("js_event_emitter_async_resource_subclass_init", OwnerKind::WellKnown("events")),
+    ("js_event_emitter_async_resource_async_id",    OwnerKind::WellKnown("events")),
+    ("js_event_emitter_async_resource_trigger_async_id", OwnerKind::WellKnown("events")),
+    ("js_event_emitter_async_resource_async_resource", OwnerKind::WellKnown("events")),
+    ("js_event_emitter_async_resource_emit_destroy", OwnerKind::WellKnown("events")),
     ("js_event_emitter_on",                         OwnerKind::WellKnown("events")),
     ("js_event_emitter_once",                       OwnerKind::WellKnown("events")),
     ("js_event_emitter_prepend_listener",           OwnerKind::WellKnown("events")),
@@ -559,6 +572,8 @@ const FFI_REGISTRY: &[(&str, OwnerKind)] = &[
     ("js_event_emitter_set_max_listeners",          OwnerKind::WellKnown("events")),
     ("js_event_emitter_get_max_listeners",          OwnerKind::WellKnown("events")),
     ("js_event_emitter_domain_value",               OwnerKind::WellKnown("events")),
+    ("js_ext_net_socket_write3",                    OwnerKind::WellKnown("net")),
+    ("js_ext_net_socket_end3",                      OwnerKind::WellKnown("net")),
 
     // ── mysql2 (perry-ext-mysql2) ────────────────────────────────────
     // Normally `import "mysql2"` flips the `[bindings.mysql2]` well-known
@@ -628,6 +643,7 @@ const EXT_PREFIX_REGISTRY: &[(&str, &str)] = &[
     ("js_node_forge_", "node-forge"),
     // Native runtime TypeScript transpilation subset (#8511).
     ("js_typescript_", "typescript"),
+    ("js_qs_",         "qs"),
 ];
 
 /// Process-wide collector of provider keys observed during codegen.
@@ -1115,6 +1131,8 @@ mod tests {
             "js_event_emitter_set_max_listeners",
             "js_event_emitter_get_max_listeners",
             "js_event_emitter_domain_value",
+            "js_event_emitter_async_resource_call",
+            "js_event_emitter_async_resource_subclass_init",
         ] {
             assert_symbol_routes_to(symbol, OwnerKind::WellKnown("events"));
         }
@@ -1161,6 +1179,8 @@ mod tests {
             ("js_node_forge_create_certificate", "node-forge"),
             ("js_parcel_watcher_subscribe", "@parcel/watcher"),
             ("js_parcel_watcher_get_events_since", "@parcel/watcher"),
+            ("js_qs_stringify", "qs"),
+            ("js_qs_parse", "qs"),
         ] {
             assert_symbol_routes_to(symbol, OwnerKind::WellKnown(binding));
         }

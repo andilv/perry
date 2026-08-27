@@ -26,6 +26,9 @@ use super::method::{
     compile_typed_string_method,
 };
 use super::native_namespace_exports::emit_native_namespace_reexport_getters;
+use super::ordinary_method_artifacts::{
+    compile_ordinary_method_artifacts, OrdinaryMethodArtifactsCtx,
+};
 use super::spec_function_length;
 use super::string_pool::emit_string_pool;
 use super::typed_abi::TypedFunctionTrampolineKind;
@@ -71,6 +74,7 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
         closure_lengths,
         closure_arrow_functions,
         trusted_box_closures,
+        versioned_loop_callbacks,
         closures,
         class_keys_init_data,
         class_header_image_inits,
@@ -159,6 +163,7 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
             closure_rest_params,
             cross_module,
             false,
+            false,
         )
         .with_context(|| format!("lowering closure func_id={}", func_id))?;
         if trusted_box_closures.contains_key(func_id) {
@@ -184,8 +189,36 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
                 closure_rest_params,
                 cross_module,
                 true,
+                false,
             )
             .with_context(|| format!("lowering trusted-box closure func_id={}", func_id))?;
+        }
+        if versioned_loop_callbacks.contains(func_id) {
+            compile_closure(
+                llmod,
+                *func_id,
+                closure_expr,
+                func_names,
+                strings,
+                class_table,
+                method_names,
+                module_globals,
+                opts.import_function_prefixes,
+                enum_table,
+                static_field_globals,
+                class_ids,
+                func_signatures,
+                func_synthetic_arguments,
+                module_prefix,
+                module_boxed_vars,
+                module_receiver_types,
+                &module_reassigned_locals,
+                closure_rest_params,
+                cross_module,
+                true,
+                true,
+            )
+            .with_context(|| format!("lowering versioned-loop closure func_id={}", func_id))?;
         }
         let done = closure_index + 1;
         if done == closures.len() || done % closure_progress_step == 0 {
@@ -323,201 +356,29 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
                     nonnegative_index_params,
                 )?;
             }
-            compile_method(
-                llmod,
-                class,
-                method,
-                func_names,
-                strings,
-                class_table,
-                method_names,
-                module_globals,
-                module_global_types,
-                opts.import_function_prefixes,
-                enum_table,
-                static_field_globals,
-                class_ids,
-                func_signatures,
-                func_synthetic_arguments,
-                module_boxed_vars,
-                closure_rest_params,
-                cross_module,
+            compile_ordinary_method_artifacts(
+                OrdinaryMethodArtifactsCtx {
+                    llmod,
+                    class,
+                    method,
+                    func_names,
+                    strings,
+                    classes: class_table,
+                    methods: method_names,
+                    module_globals,
+                    module_global_types,
+                    import_function_prefixes: opts.import_function_prefixes,
+                    enums: enum_table,
+                    static_field_globals,
+                    class_ids,
+                    func_signatures,
+                    func_synthetic_arguments,
+                    module_boxed_vars,
+                    closure_rest_params,
+                    cross_module,
+                },
                 typed_public_trampoline,
-                cross_module
-                    .typed_f64_receiver_methods
-                    .contains_key(&(class.name.clone(), method.name.clone())),
-                None,
-                None,
-                false,
-                false,
-                false,
-            )
-            .with_context(|| format!("lowering method '{}::{}'", class.name, method.name))?;
-            if cross_module
-                .guarded_undefined_method_params
-                .contains_key(&(class.name.clone(), method.name.clone()))
-            {
-                compile_method(
-                    llmod,
-                    class,
-                    method,
-                    func_names,
-                    strings,
-                    class_table,
-                    method_names,
-                    module_globals,
-                    module_global_types,
-                    opts.import_function_prefixes,
-                    enum_table,
-                    static_field_globals,
-                    class_ids,
-                    func_signatures,
-                    func_synthetic_arguments,
-                    module_boxed_vars,
-                    closure_rest_params,
-                    cross_module,
-                    None,
-                    false,
-                    None,
-                    None,
-                    false,
-                    false,
-                    true,
-                )
-                .with_context(|| {
-                    format!(
-                        "lowering exact-undefined clone of method '{}::{}'",
-                        class.name, method.name
-                    )
-                })?;
-            }
-            // Representation-selection Phase 5a: the additive `internal`
-            // proven-`this` clone. Same HIR, same ABI, same shadow-bound
-            // tagged-at-rest receiver slot — only `this.field` lowering
-            // differs (bare fixed-offset access instead of the per-access
-            // guard diamond). Reached ONLY from the two call sites that
-            // already prove the receiver's exact shape; never registered into
-            // a runtime vtable.
-            if let Some(fact) = cross_module
-                .pshape_methods
-                .get(&(class.name.clone(), method.name.clone()))
-            {
-                compile_method(
-                    llmod,
-                    class,
-                    method,
-                    func_names,
-                    strings,
-                    class_table,
-                    method_names,
-                    module_globals,
-                    module_global_types,
-                    opts.import_function_prefixes,
-                    enum_table,
-                    static_field_globals,
-                    class_ids,
-                    func_signatures,
-                    func_synthetic_arguments,
-                    module_boxed_vars,
-                    closure_rest_params,
-                    cross_module,
-                    None,
-                    false,
-                    Some(fact.clone()),
-                    None,
-                    false,
-                    false,
-                    false,
-                )
-                .with_context(|| {
-                    format!(
-                        "lowering proven-`this` clone of method '{}::{}'",
-                        class.name, method.name
-                    )
-                })?;
-                if cross_module
-                    .guarded_undefined_method_params
-                    .contains_key(&(class.name.clone(), method.name.clone()))
-                {
-                    compile_method(
-                        llmod,
-                        class,
-                        method,
-                        func_names,
-                        strings,
-                        class_table,
-                        method_names,
-                        module_globals,
-                        module_global_types,
-                        opts.import_function_prefixes,
-                        enum_table,
-                        static_field_globals,
-                        class_ids,
-                        func_signatures,
-                        func_synthetic_arguments,
-                        module_boxed_vars,
-                        closure_rest_params,
-                        cross_module,
-                        None,
-                        false,
-                        Some(fact.clone()),
-                        None,
-                        false,
-                        false,
-                        true,
-                    )
-                    .with_context(|| {
-                        format!(
-                            "lowering proven-`this` exact-undefined clone of method '{}::{}'",
-                            class.name, method.name
-                        )
-                    })?;
-                }
-
-                // #8607: a second, stricter clone for the Phase 3b
-                // provenance+containment route. Its synthetic immutable
-                // aliases keep stable array-valued fields in local slots, so
-                // existing local-array loop optimizations can see through
-                // repeated `this.field` uses. It is never selected by the
-                // guarded or dispatch-tower `$pshape` routes.
-                if let Some(cached_method) =
-                    crate::collectors::ptr_array_cached_method(class, method)
-                {
-                    compile_method(
-                        llmod,
-                        class,
-                        &cached_method,
-                        func_names,
-                        strings,
-                        class_table,
-                        method_names,
-                        module_globals,
-                        module_global_types,
-                        opts.import_function_prefixes,
-                        enum_table,
-                        static_field_globals,
-                        class_ids,
-                        func_signatures,
-                        func_synthetic_arguments,
-                        module_boxed_vars,
-                        closure_rest_params,
-                        cross_module,
-                        None,
-                        false,
-                        Some(fact.clone()),
-                        None,
-                        false,
-                        true,
-                        false,
-                    )
-                    .with_context(|| {
-                        format!(
-                            "lowering contained-receiver array-cache clone of method '{}::{}'",
-                            class.name, method.name
-                        )
-                    })?;
-                }
-            }
+            )?;
         }
         for member in class
             .computed_members
@@ -547,6 +408,7 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
                 false,
                 None,
                 None,
+                false,
                 false,
                 false,
                 false,
@@ -619,6 +481,7 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
                 false,
                 false,
                 false,
+                false,
             )
             .with_context(|| format!("lowering getter '{}::{}'", class.name, prop))?;
         }
@@ -673,6 +536,7 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
                 false,
                 None,
                 None,
+                false,
                 false,
                 false,
                 false,
@@ -772,6 +636,7 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
                 false,
                 None,
                 None,
+                false,
                 false,
                 false,
                 false,
@@ -1977,6 +1842,7 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
         closure_lengths,
         closure_arrow_functions,
         trusted_box_closures,
+        versioned_loop_callbacks,
         &user_fn_wrapper_rest,
         closure_synthetic_arguments,
         &user_fn_wrapper_synthetic_arguments,

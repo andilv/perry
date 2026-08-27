@@ -183,37 +183,6 @@ pub struct PtrShapeLocal {
     pub report_name: Option<String>,
 }
 
-/// Whether an expression node is a §5.2 shape barrier for the module-wide
-/// first-increment kill rule. Targets are NOT inspected — any occurrence
-/// disables all `Ptr<Shape>` promotion in the module.
-pub(crate) fn expr_is_shape_barrier(expr: &Expr) -> bool {
-    match expr {
-        Expr::ObjectDefineProperty(..)
-        | Expr::ObjectDefineProperties(..)
-        | Expr::ReflectDefineProperty { .. }
-        | Expr::ObjectSetPrototypeOf(..)
-        | Expr::ReflectSetPrototypeOf { .. }
-        | Expr::ReflectSet { .. }
-        | Expr::ReflectDelete { .. }
-        | Expr::ReflectPreventExtensions(..)
-        | Expr::Delete(..)
-        | Expr::ProxyNew { .. } => true,
-        // `__proto__` writes mutate the prototype chain of an arbitrary
-        // object. (Reads and `<Class>.prototype` naming are handled by the
-        // dispatch-stability facts; only writes are shape barriers.)
-        Expr::PropertySet { property, .. } | Expr::PropertyUpdate { property, .. } => {
-            property == "__proto__"
-        }
-        Expr::PutValueSet { key, .. } => {
-            matches!(key.as_ref(), Expr::String(k) if k == "__proto__")
-        }
-        Expr::IndexSet { index, .. } => {
-            matches!(index.as_ref(), Expr::String(k) if k == "__proto__")
-        }
-        _ => false,
-    }
-}
-
 /// Compile-time visibility: one stderr line per shape-proven local, plus a
 /// process-wide running count. Only under `PERRY_REPSEL_DEBUG=1`.
 ///
@@ -287,36 +256,21 @@ fn report_early_bail(
     }
 }
 
-/// Entry point: collect the shape-proven pointer locals of one lowered region.
-///
-/// `not_bigint_locals` feeds the numeric-field proof (a `Sub`/`Div`/bitwise
-/// over provably-non-BigInt operands is a Number by spec).
-pub(crate) fn collect_shape_proven_ptr_locals(
-    stmts: &[Stmt],
-    boxed_vars: &HashSet<u32>,
-    module_globals: &HashMap<u32, String>,
-    classes: &HashMap<String, &Class>,
-    module_dispatch: &ModuleDispatchFacts,
-    not_bigint_locals: &HashSet<u32>,
-    element_facts: &ElementShapeFacts,
-) -> HashMap<u32, PtrShapeLocal> {
-    collect_shape_proven_ptr_locals_and_element_fields(
-        stmts,
-        boxed_vars,
-        module_globals,
-        classes,
-        module_dispatch,
-        not_bigint_locals,
-        element_facts,
-        &HashSet::new(),
-    )
-    .0
+#[path = "ptr_shape_entry.rs"]
+mod entry;
+pub(crate) use entry::{
+    collect_guarded_argument_route_locals, collect_shape_proven_ptr_locals,
+    collect_shape_proven_ptr_locals_and_element_fields, expr_is_shape_barrier,
+};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CollectionPurpose {
+    UnguardedRepresentation,
+    GuardedArgumentRoute,
 }
 
-/// Collect pointer-local facts plus the group-wide numeric layouts of proven
-/// element arrays. The latter includes arrays read only as `A[i].field`, which
-/// have no element local to carry a [`PtrShapeLocal`] of their own.
-pub(crate) fn collect_shape_proven_ptr_locals_and_element_fields(
+#[allow(clippy::too_many_arguments)]
+fn collect_shape_proven_ptr_locals_impl(
     stmts: &[Stmt],
     boxed_vars: &HashSet<u32>,
     module_globals: &HashMap<u32, String>,
@@ -325,6 +279,7 @@ pub(crate) fn collect_shape_proven_ptr_locals_and_element_fields(
     not_bigint_locals: &HashSet<u32>,
     element_facts: &ElementShapeFacts,
     numeric_param_seeds: &HashSet<u32>,
+    purpose: CollectionPurpose,
 ) -> (HashMap<u32, PtrShapeLocal>, HashMap<u32, HashSet<String>>) {
     // #7152: Perry's own `cjs_wrap` preamble, recognised once for this region.
     // One scan of the top-level statement list on anything else, then a
@@ -332,7 +287,9 @@ pub(crate) fn collect_shape_proven_ptr_locals_and_element_fields(
     let preamble = super::cjs_scaffolding::preamble_in_region(stmts);
     let bail = if !ptr_shape_locals_enabled() {
         Some(report::GATE_DISABLED)
-    } else if module_dispatch.has_shape_barrier_sites() {
+    } else if purpose == CollectionPurpose::UnguardedRepresentation
+        && module_dispatch.has_shape_barrier_sites()
+    {
         Some(report::MODULE_BARRIER)
     } else {
         None
@@ -445,6 +402,7 @@ pub(crate) fn collect_shape_proven_ptr_locals_and_element_fields(
         candidates: &candidates,
         roots: &roots,
         classes,
+        module_dispatch,
         disqualified: HashSet::new(),
         let_counts: HashMap::new(),
         field_stores: HashMap::new(),
@@ -458,6 +416,7 @@ pub(crate) fn collect_shape_proven_ptr_locals_and_element_fields(
         element_seeded: &element_seeded,
         element_facts,
         in_closure: false,
+        purpose,
     };
     walk.walk_stmts(stmts);
     let UseWalk {
@@ -841,6 +800,7 @@ struct UseWalk<'a> {
     /// Tracked member id (candidate or const alias) -> root candidate id.
     roots: &'a HashMap<u32, u32>,
     classes: &'a HashMap<String, &'a Class>,
+    module_dispatch: &'a ModuleDispatchFacts,
     disqualified: HashSet<u32>,
     let_counts: HashMap<u32, u32>,
     /// root candidate -> (field name, store value) for in-function stores.
@@ -879,6 +839,9 @@ struct UseWalk<'a> {
     /// doc, rule 2) does NOT apply — only the enclosing function's own
     /// returns are terminators for this local's lifetime.
     in_closure: bool,
+    /// Whether this walk is proving the broad guard-free representation or
+    /// only a fresh-object route protected by an exact argument guard.
+    purpose: CollectionPurpose,
 }
 
 impl<'a> UseWalk<'a> {
@@ -1214,13 +1177,60 @@ impl<'a> UseWalk<'a> {
                                     .or_default()
                                     .push(args.as_slice());
                             }
-                            for a in args {
-                                // Position-aware: `o.m(o.field)` is safe,
-                                // `o.m(o)` escapes via the LocalGet arm.
+                            for (param_index, a) in args.iter().enumerate() {
+                                // An audited exact-class argument clone may
+                                // preserve this position only when the tracked
+                                // argument is distinct from the receiver and
+                                // every other source argument.
+                                if resolvable
+                                    && super::proven_args::route_preserves_argument_containment(
+                                        self.module_dispatch,
+                                        self.candidates,
+                                        self.roots,
+                                        Some(root),
+                                        Some(class_name),
+                                        property,
+                                        param_index,
+                                        a,
+                                        args,
+                                    )
+                                {
+                                    continue;
+                                }
                                 self.with_ctx(report::ESC_CALL_ARGUMENT, |w| w.walk_expr(a));
                             }
                             return;
                         }
+                    }
+
+                    // In the route-only proof, method lowering may establish
+                    // the receiver class after this analysis (notably for
+                    // `this.m(fresh)`). Preserve the fresh argument only when
+                    // all emitted clones with this method name and position
+                    // agree on its class AND preserve containment. The fact is
+                    // invisible to ordinary field/method lowering and is
+                    // consumed only beside the live class+ShapeId guard.
+                    if self.purpose == CollectionPurpose::GuardedArgumentRoute
+                        && matches!(object.as_ref(), Expr::This | Expr::LocalGet(_))
+                    {
+                        self.walk_expr(object);
+                        for (param_index, arg) in args.iter().enumerate() {
+                            if super::proven_args::route_preserves_argument_containment(
+                                self.module_dispatch,
+                                self.candidates,
+                                self.roots,
+                                None,
+                                None,
+                                property,
+                                param_index,
+                                arg,
+                                args,
+                            ) {
+                                continue;
+                            }
+                            self.with_ctx(report::ESC_CALL_ARGUMENT, |walk| walk.walk_expr(arg));
+                        }
+                        return;
                     }
                 }
                 self.walk_expr(callee);

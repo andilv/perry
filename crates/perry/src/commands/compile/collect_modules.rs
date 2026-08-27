@@ -57,7 +57,7 @@ use import_helpers::{
 };
 use json_module::synthesize_json_module;
 pub(super) use native_addon::package_has_unsupported_node_addon;
-use native_addon::{refuse_compile_package_native_addon, refuse_node_addon_binary};
+use native_addon::{collect_or_refuse_node_addon, refuse_compile_package_native_addon};
 use parse_error::annotate_parse_error;
 use static_require_transform::transform_static_literal_requires;
 pub(super) use walk::collect_modules;
@@ -99,6 +99,16 @@ fn collect_module_one(
     parse_cache: Option<&mut ParseCache>,
 ) -> Result<ModuleDiscovery> {
     let mut pending = Vec::new();
+
+    // A `.node` member is a sidecar native module, never UTF-8 source. Record
+    // an approved entry and stop this discovery frame before any JS/TS parser
+    // or source reader sees its bytes.
+    if collect_or_refuse_node_addon(ctx, &canonical)? {
+        return Ok(ModuleDiscovery {
+            finish: None,
+            children: pending,
+        });
+    }
 
     // Check if this file should be handled by JS runtime instead of native compilation
     // This includes: JS files, declaration files (.d.ts), JSON files, or any file in node_modules when JS runtime is enabled
@@ -191,7 +201,6 @@ fn collect_module_one(
             });
         }
 
-        refuse_node_addon_binary(&canonical)?;
         let source = fs::read_to_string(&canonical)
             .map_err(|e| anyhow!("Failed to read {}: {}", canonical.display(), e))?;
         progress.record(ProgressSnapshot {
@@ -299,10 +308,19 @@ fn collect_module_one(
         synthesize_wasm_module(&bytes, &virtual_path).source
     } else {
         // It's a TypeScript (or synthetic JSON/text) file to compile natively.
-        refuse_node_addon_binary(&canonical)?;
         fs::read_to_string(&canonical)
             .map_err(|e| anyhow!("Failed to read {}: {}", canonical.display(), e))?
     };
+    // CJS wrapping consumes literal `require()` sites and replaces them with
+    // generated loader calls. Queue native targets before that rewrite so the
+    // graph still authenticates and packages the selected `.node` binary.
+    for specifier in super::cjs_wrap::extract_require_specifiers(&raw_source) {
+        if let Some(target) = super::resolve::resolve_relative_import_path(&specifier, &canonical) {
+            if target.extension().and_then(|extension| extension.to_str()) == Some("node") {
+                pending.push(target);
+            }
+        }
+    }
     // JSON module import: turn the data file into a native ESM module whose
     // default export is the parsed value.
     let raw_source = if imported_file_asset.is_some() || is_wasm {
@@ -738,6 +756,9 @@ fn collect_module_one(
                         return;
                     }
                     for p in &set {
+                        if p.starts_with("data:text/javascript,") {
+                            ctx.uses_data_url_dynamic_import = true;
+                        }
                         if !new_dyn_imports.contains(p) {
                             new_dyn_imports.push(p.clone());
                         }
@@ -1008,18 +1029,40 @@ fn collect_module_one(
 
     // Process imports and update their resolved paths and module kinds
     for import in &mut hir_module.imports {
-        // Skip type-only imports — they were recorded for class-metadata flow
-        // (see lower.rs's #446 comment: a per-specifier `import { type Foo }`
-        // is preserved so Foo's class info reaches `imported_classes` for
-        // method dispatch) but they MUST NOT be loaded as runtime modules.
-        // Without this skip, `import type { StandardSchemaV1 } from
-        // "@standard-schema/spec"` (Effect's only `@standard-schema` use,
-        // a type-only reference) queued the package's V8 fallback. The
-        // spec ships an empty `src_exports = {}` at runtime, so any
-        // `something._tag` from the import binding then threw
-        // `TypeError: Cannot read properties of undefined (reading '_tag')`
-        // during Effect's module init. Refs #321, #684.
+        // Resolve TypeScript type-only imports for metadata, but never queue
+        // their target as a runtime module. The final graph may already
+        // contain the target through a value import elsewhere; retaining its
+        // canonical path here then lets run_pipeline attach that existing
+        // class's field/method metadata to this consumer. This is compile-time
+        // bookkeeping only: no init edge, binding, package capability, or V8
+        // fallback is created. In particular, the `@standard-schema/spec`
+        // case from #684 remains erased at runtime.
         if import.type_only {
+            if let Some(alias) = ctx.package_aliases.get(import.source.as_str()).cloned() {
+                import.source = alias;
+                import.is_native = perry_hir::is_native_module(&import.source);
+            }
+            if !import.is_native {
+                if let Some(resolved) = cached_resolve_import_with_lexical_base(
+                    &import.source,
+                    entry_path,
+                    &canonical,
+                    ctx,
+                ) {
+                    let resolved_path = resolved.canonical_path;
+                    let kind = if resolved.kind == ModuleKind::Interpreted
+                        && !is_in_perry_native_package(&resolved_path)
+                        && !is_declaration_file(&resolved_path)
+                        && aot_promotion_is_authorized(&resolved_path, ctx)
+                    {
+                        ModuleKind::NativeCompiled
+                    } else {
+                        resolved.kind
+                    };
+                    import.resolved_path = Some(resolved_path.to_string_lossy().to_string());
+                    import.module_kind = kind;
+                }
+            }
             continue;
         }
         let uses_file_loader = file_loader_sources.contains(&import.source);

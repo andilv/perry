@@ -35,7 +35,11 @@ pub extern "C" fn js_dns_lookup(args: i64) -> f64 {
         Ok(values) => values,
         Err(error) => vec![error],
     };
-    queue_callback(callback_handle.get_nanbox_f64(), &callback_args);
+    queue_callback(
+        callback_handle.get_nanbox_f64(),
+        &callback_args,
+        "GETADDRINFOREQWRAP",
+    );
     undefined_value()
 }
 
@@ -62,7 +66,7 @@ pub extern "C" fn js_dns_lookup_service(args: i64) -> f64 {
         Ok((hostname, service)) => vec![null_value(), str_value(&hostname), str_value(&service)],
         Err(error) => vec![error],
     };
-    queue_callback(callback_value, &callback_args);
+    queue_callback(callback_value, &callback_args, "GETNAMEINFOREQWRAP");
     undefined_value()
 }
 
@@ -253,13 +257,13 @@ pub extern "C" fn js_dns_get_default_result_order(_args: i64) -> f64 {
 }
 
 #[no_mangle]
-pub extern "C" fn js_dns_resolver_new(_args: i64) -> f64 {
-    boxed_pointer(resolver_object(stored_servers()) as *const u8)
+pub extern "C" fn js_dns_resolver_new(args: i64) -> f64 {
+    boxed_pointer(resolver_object(stored_servers(), first_arg(args)) as *const u8)
 }
 
 #[no_mangle]
-pub extern "C" fn js_dns_promises_resolver_new(_args: i64) -> f64 {
-    boxed_pointer(resolver_object(stored_promise_servers()) as *const u8)
+pub extern "C" fn js_dns_promises_resolver_new(args: i64) -> f64 {
+    boxed_pointer(resolver_object(stored_promise_servers(), first_arg(args)) as *const u8)
 }
 
 #[no_mangle]

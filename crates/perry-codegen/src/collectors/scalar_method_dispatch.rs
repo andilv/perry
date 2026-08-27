@@ -99,6 +99,11 @@ pub struct ModuleDispatchFacts {
     /// Populated by the compile driver from a whole-program pre-pass over
     /// final HIR, after this module's own barrier/producer facts are collected.
     imported_return_shapes: HashMap<String, String>,
+    /// #8774: exact-shape argument clones installed after clone eligibility is
+    /// known. The containment walk consults this table only for a statically
+    /// resolved method call whose tracked argument class exactly matches the
+    /// clone's guarded parameter.
+    argument_shape_routes: HashMap<(String, String, usize), ArgumentShapeRoute>,
     /// Representation-selection Phase 3b, #7170 R1: `LocalId` -> `FuncId` for
     /// every local that provably names one closure literal, module-wide.
     ///
@@ -115,6 +120,12 @@ pub struct ModuleDispatchFacts {
     closure_bindings: HashMap<u32, u32>,
 }
 
+#[derive(Debug, Clone)]
+struct ArgumentShapeRoute {
+    class_name: String,
+    preserves_containment: bool,
+}
+
 impl Default for ModuleDispatchFacts {
     /// Fail safe: a fact set that was never populated must not license the
     /// scalar-method summary (nor any `Ptr<Shape>` promotion).
@@ -128,6 +139,7 @@ impl Default for ModuleDispatchFacts {
             return_shape_functions: HashMap::new(),
             return_shape_methods: HashMap::new(),
             imported_return_shapes: HashMap::new(),
+            argument_shape_routes: HashMap::new(),
             closure_bindings: HashMap::new(),
         }
     }
@@ -234,6 +246,75 @@ impl ModuleDispatchFacts {
         self.imported_return_shapes = shapes;
     }
 
+    /// Install the guarded argument-clone capabilities emitted by this
+    /// module. Clone admission depends on typed-ABI family selection performed
+    /// by codegen, while ordinary region facts are collected later during
+    /// artifact emission.
+    pub(crate) fn install_argument_shape_routes(
+        &mut self,
+        routes: impl IntoIterator<Item = ((String, String), Vec<(usize, String, bool)>)>,
+    ) {
+        self.argument_shape_routes.clear();
+        for ((owner, method), args) in routes {
+            for (index, class_name, preserves_containment) in args {
+                self.argument_shape_routes.insert(
+                    (owner.clone(), method.clone(), index),
+                    ArgumentShapeRoute {
+                        class_name,
+                        preserves_containment,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Expected exact argument class and post-call containment contract for one
+    /// emitted `$pshape_args` route.
+    pub(crate) fn argument_shape_route(
+        &self,
+        owner_class: &str,
+        method_name: &str,
+        param_index: usize,
+    ) -> Option<(&str, bool)> {
+        self.argument_shape_routes
+            .get(&(
+                owner_class.to_string(),
+                method_name.to_string(),
+                param_index,
+            ))
+            .map(|route| (route.class_name.as_str(), route.preserves_containment))
+    }
+
+    /// Expected argument class when every emitted clone for this method name
+    /// and position agrees.  This is used only by the guarded-route
+    /// containment query for a receiver such as `this`, whose concrete class
+    /// is selected later by method lowering.  A missing or conflicting route
+    /// stands down.
+    pub(crate) fn unique_argument_shape_class(
+        &self,
+        method_name: &str,
+        param_index: usize,
+    ) -> Option<(&str, bool)> {
+        let mut matches = self
+            .argument_shape_routes
+            .iter()
+            .filter(|((_, method, index), _)| method == method_name && *index == param_index)
+            .map(|(_, route)| (route.class_name.as_str(), route.preserves_containment));
+        let first = matches.next()?;
+        let mut all_preserve = first.1;
+        for route in matches {
+            if route.0 != first.0 {
+                return None;
+            }
+            all_preserve &= route.1;
+        }
+        Some((first.0, all_preserve))
+    }
+
+    pub(crate) fn has_argument_shape_routes(&self) -> bool {
+        !self.argument_shape_routes.is_empty()
+    }
+
     /// Representation-selection Phase 3b, #7170 R1: the `FuncId` that
     /// `LocalGet(local_id)` in callee position provably names, or `None`.
     ///
@@ -257,6 +338,7 @@ pub fn collect_module_dispatch_facts(hir: &Module) -> ModuleDispatchFacts {
         return_shape_functions: HashMap::new(),
         return_shape_methods: HashMap::new(),
         imported_return_shapes: HashMap::new(),
+        argument_shape_routes: HashMap::new(),
         // #7170 R1. Purely structural — no barrier flag feeds it, and it is
         // read only through `closure_binding_func`, whose every consumer treats
         // `None` as "take no seed". Computed here rather than lazily so the one
@@ -519,7 +601,7 @@ pub(super) fn for_each_expr(expr: &Expr, f: &mut dyn FnMut(&Expr)) {
     }
 }
 
-pub(super) fn for_each_expr_in_stmts(stmts: &[Stmt], f: &mut dyn FnMut(&Expr)) {
+pub(crate) fn for_each_expr_in_stmts(stmts: &[Stmt], f: &mut dyn FnMut(&Expr)) {
     for stmt in stmts {
         for_each_expr_in_stmt(stmt, f);
     }
@@ -730,6 +812,7 @@ mod tests {
             return_shape_functions: HashMap::new(),
             return_shape_methods: HashMap::new(),
             imported_return_shapes: HashMap::new(),
+            argument_shape_routes: HashMap::new(),
             closure_bindings: HashMap::new(),
         }
     }

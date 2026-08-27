@@ -15,7 +15,8 @@ use crate::types::{DOUBLE, I1, I32, I64};
 // Reach the override-emit helpers (`pub(super)` of `lower_call`) by their
 // canonical crate-relative path.
 use crate::lower_call::method_override::{
-    emit_guarded_direct_method_call, emit_own_method_override_check, SubclassDispatchArm,
+    emit_guarded_direct_method_call, emit_own_method_override_check, emit_pshape_argument_dispatch,
+    SubclassDispatchArm,
 };
 
 /// Cap on the number of extra `(class id, keys token)` arms a shape-guarded
@@ -1376,7 +1377,20 @@ pub(crate) fn try_lower_instance_method_call(
                             &fallback_fn,
                             params,
                         );
-                        return Ok(Some(ctx.block().call(DOUBLE, &target, &fast_args)));
+                        let value = if matches!(
+                            fact.guard_mode,
+                            crate::expr::VersionedIndexedGuardMode::CallbackDeopt { .. }
+                        ) {
+                            // Admission proved every private handle argument
+                            // is a live in-bounds array. The checked-reader
+                            // clone's only collecting arms are therefore
+                            // unreachable in this loop version; a callback
+                            // cold arm side-exits before the next use.
+                            ctx.block().call_gc_leaf(DOUBLE, &target, &fast_args)
+                        } else {
+                            ctx.block().call(DOUBLE, &target, &fast_args)
+                        };
+                        return Ok(Some(value));
                     }
                 }
                 let typed_receiver_direct = match (
@@ -1457,6 +1471,21 @@ pub(crate) fn try_lower_instance_method_call(
                         .or(ptr_array_cache_target.as_deref())
                         .or(pshape_target.as_deref())
                         .unwrap_or(fallback_fn.as_str());
+                    // #8774: containment proves the receiver here, while the
+                    // dedicated argument guards prove every selected callee
+                    // parameter.  A miss calls the same receiver-safe generic
+                    // target this block used before argument specialization.
+                    if let Some(argument_specialized) = emit_pshape_argument_dispatch(
+                        ctx,
+                        &class_name,
+                        property,
+                        &fallback_fn,
+                        generic_target,
+                        &arg_slices,
+                        args,
+                    ) {
+                        return Ok(Some(argument_specialized));
+                    }
                     // Prefer the typed-receiver clone (bare gep+load field
                     // access inside the body) when one exists: the receiver
                     // is proven, so only the ARGUMENT value classes need
@@ -1536,6 +1565,7 @@ pub(crate) fn try_lower_instance_method_call(
                     property,
                     &fallback_fn,
                     &arg_slices,
+                    args,
                     &fallback_user_args,
                     nonnegative_index_direct_name.as_deref(),
                     typed_direct,

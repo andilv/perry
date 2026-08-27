@@ -56,6 +56,7 @@ pub(super) fn compile_method(
     fast_array_handle_clone: bool,
     ptr_array_cache_clone: bool,
     guarded_undefined_clone: bool,
+    pshape_arg_clone: bool,
 ) -> Result<()> {
     let public_llvm_name = methods
         .get(&(class.name.clone(), method.name.clone()))
@@ -72,9 +73,16 @@ pub(super) fn compile_method(
     // lowerer. It never replaces the public symbol and never participates in
     // the typed-trampoline / generic-body split — those are emitted by the
     // primary (`proven_this: None`) invocation for this same method.
-    let is_pshape_clone = proven_this.is_some();
+    let is_pshape_clone = proven_this.is_some() && !pshape_arg_clone;
     let is_index_clone = nonnegative_index_params.is_some();
-    let guarded_undefined_param = (!is_index_clone && !ptr_array_cache_clone)
+    let pshape_arg_plan = pshape_arg_clone
+        .then(|| {
+            cross_module
+                .pshape_arg_methods
+                .get(&(class.name.clone(), method.name.clone()))
+        })
+        .flatten();
+    let guarded_undefined_param = (!is_index_clone && !ptr_array_cache_clone && !pshape_arg_clone)
         .then(|| {
             cross_module
                 .guarded_undefined_method_params
@@ -97,7 +105,14 @@ pub(super) fn compile_method(
     debug_assert!(!guarded_undefined_clone || guarded_undefined_param.is_some());
     debug_assert!(!guarded_undefined_clone || !is_index_clone);
     debug_assert!(!guarded_undefined_clone || !ptr_array_cache_clone);
-    let family_name = if ptr_array_cache_clone {
+    debug_assert!(!pshape_arg_clone || pshape_arg_plan.is_some());
+    debug_assert!(!pshape_arg_clone || !is_index_clone);
+    debug_assert!(!pshape_arg_clone || !ptr_array_cache_clone);
+    debug_assert!(!pshape_arg_clone || typed_public_trampoline.is_none());
+    debug_assert!(!pshape_arg_clone || !force_generic_body);
+    let family_name = if pshape_arg_clone {
+        crate::collectors::pshape_args_method_name(&public_llvm_name)
+    } else if ptr_array_cache_clone {
         crate::collectors::ptr_array_cache_method_name(&public_llvm_name)
     } else if is_pshape_clone {
         crate::collectors::pshape_method_name(&public_llvm_name)
@@ -118,7 +133,7 @@ pub(super) fn compile_method(
         )
     } else if guarded_undefined_param.is_some() {
         generic_method_body_name(&family_name)
-    } else if ptr_array_cache_clone || is_pshape_clone {
+    } else if ptr_array_cache_clone || is_pshape_clone || pshape_arg_clone {
         family_name.clone()
     } else if typed_public_trampoline.is_some() || force_generic_body {
         generic_method_body_name(&public_llvm_name)
@@ -151,10 +166,11 @@ pub(super) fn compile_method(
         || typed_public_trampoline.is_some()
         || force_generic_body
         || guarded_undefined_param.is_some()
+        || pshape_arg_clone
     {
         lf.linkage = "internal".to_string();
     }
-    super::helpers::apply_pshape_inline_policy(lf, method, is_pshape_clone);
+    super::helpers::apply_pshape_inline_policy(lf, method, is_pshape_clone || pshape_arg_clone);
     if is_index_clone {
         lf.pre_statepoint_inline = true;
     }
@@ -309,6 +325,19 @@ pub(super) fn compile_method(
     if let Some(index) = guarded_undefined_param.filter(|_| guarded_undefined_clone) {
         guarded_param_proofs.insert(method.params[index].id, perry_hir::types::Type::Void);
     }
+    if let Some(plan) = pshape_arg_plan {
+        // Unlike a source annotation, this overlay is backed by the exact
+        // class+shape guard that exclusively routes into `$pshape_args`.
+        // Supplying it to property dispatch lets an unannotated (`Any`) JS
+        // parameter resolve the declared field before the Ptr<Shape> overlay
+        // removes that field access's ordinary IC diamond.
+        guarded_param_proofs.extend(plan.args.iter().map(|arg| {
+            (
+                arg.param_id,
+                perry_hir::types::Type::Named(arg.fact.class_name.clone()),
+            )
+        }));
+    }
     let mut reassigned_locals = crate::collectors::reassigned_locals(&method.body);
     if let Some(index) = guarded_undefined_param.filter(|_| guarded_undefined_clone) {
         // Candidate discovery already rejected every user-authored write and
@@ -387,7 +416,9 @@ pub(super) fn compile_method(
         local_closure_func_ids: HashMap::new(),
         local_closure_param_counts: HashMap::new(),
         resolved_arrow_callback_targets: HashMap::new(),
+        resolved_versioned_loop_callback_targets: HashMap::new(),
         trusted_box_captures: false,
+        versioned_loop_deopt_context: None,
         trusted_box_capture_ptrs: HashMap::new(),
         local_func_ref_ids: HashMap::new(),
         option_object_locals: HashMap::new(),
@@ -469,7 +500,11 @@ pub(super) fn compile_method(
         local_class_field_aliases: HashMap::new(),
         local_id_to_name: HashMap::new(),
         local_value_aliases: HashMap::new(),
+        local_imported_object_aliases: HashMap::new(),
         imported_vars: &cross_module.imported_vars,
+        imported_object_literals: &cross_module.imported_object_literals,
+        short_spread_method_candidates: &cross_module.short_spread_method_candidates,
+        object_literal_method_candidates: &cross_module.object_literal_method_candidates,
         compile_time_constants: native_facts.compile_time_constants(),
         target_triple: &cross_module.target_triple,
         app_metadata: &cross_module.app_metadata,
@@ -507,6 +542,7 @@ pub(super) fn compile_method(
         typed_i1_function_param_reps: &cross_module.typed_i1_function_param_reps,
         typed_f64_methods: &cross_module.typed_f64_methods,
         pshape_methods: &cross_module.pshape_methods,
+        pshape_arg_methods: &cross_module.pshape_arg_methods,
         nonnegative_index_methods: &cross_module.nonnegative_index_methods,
         trusted_array_param_handles: fast_array_param_ids
             .iter()
@@ -517,6 +553,14 @@ pub(super) fn compile_method(
         stable_packed_loop_facts: Vec::new(),
         pshape_tower_routable: &cross_module.pshape_tower_routable,
         proven_this,
+        proven_shape_params: pshape_arg_plan
+            .map(|plan| {
+                plan.args
+                    .iter()
+                    .map(|arg| (arg.param_id, arg.fact.clone()))
+                    .collect()
+            })
+            .unwrap_or_default(),
         typed_i32_methods: &cross_module.typed_i32_methods,
         typed_i1_methods: &cross_module.typed_i1_methods,
         typed_string_methods: &cross_module.typed_string_methods,
@@ -563,6 +607,7 @@ pub(super) fn compile_method(
         .map(|call| (call.source_param, call.arity))
         .collect();
     let mut resolved_callback_ptrs = HashMap::new();
+    let mut resolved_versioned_callback_ptrs = HashMap::new();
     for (source_param, arity) in callback_keys {
         let Some(source_slot) = ctx.locals.get(&source_param).cloned() else {
             continue;
@@ -575,6 +620,12 @@ pub(super) fn compile_method(
             &[(I64, &source_handle), (I32, &arity.to_string())],
         );
         resolved_callback_ptrs.insert((source_param, arity), fn_ptr);
+        let versioned_fn_ptr = ctx.block().call(
+            PTR,
+            "js_closure_resolve_versioned_loop_direct_call",
+            &[(I64, &source_handle), (I32, &arity.to_string())],
+        );
+        resolved_versioned_callback_ptrs.insert((source_param, arity), versioned_fn_ptr);
     }
     for call in hoisted_callback_calls {
         let Some(fn_ptr) = resolved_callback_ptrs
@@ -585,11 +636,19 @@ pub(super) fn compile_method(
         };
         ctx.resolved_arrow_callback_targets
             .insert((call.callee_local, call.arity), fn_ptr);
+        if let Some(versioned_fn_ptr) = resolved_versioned_callback_ptrs
+            .get(&(call.source_param, call.arity))
+            .cloned()
+        {
+            ctx.resolved_versioned_loop_callback_targets
+                .insert((call.callee_local, call.arity), versioned_fn_ptr);
+        }
     }
 
     super::arguments::materialize_arguments_object(
         &mut ctx,
         &method.params,
+        Some(&method.body),
         super::arguments::ArgumentsCallee::Undefined,
     );
 
@@ -1650,7 +1709,9 @@ pub(super) fn compile_static_method(
         local_closure_func_ids: HashMap::new(),
         local_closure_param_counts: HashMap::new(),
         resolved_arrow_callback_targets: HashMap::new(),
+        resolved_versioned_loop_callback_targets: HashMap::new(),
         trusted_box_captures: false,
+        versioned_loop_deopt_context: None,
         trusted_box_capture_ptrs: HashMap::new(),
         local_func_ref_ids: HashMap::new(),
         option_object_locals: HashMap::new(),
@@ -1732,7 +1793,11 @@ pub(super) fn compile_static_method(
         local_class_field_aliases: HashMap::new(),
         local_id_to_name: HashMap::new(),
         local_value_aliases: HashMap::new(),
+        local_imported_object_aliases: HashMap::new(),
         imported_vars: &cross_module.imported_vars,
+        imported_object_literals: &cross_module.imported_object_literals,
+        short_spread_method_candidates: &cross_module.short_spread_method_candidates,
+        object_literal_method_candidates: &cross_module.object_literal_method_candidates,
         compile_time_constants: native_facts.compile_time_constants(),
         target_triple: &cross_module.target_triple,
         app_metadata: &cross_module.app_metadata,
@@ -1770,12 +1835,14 @@ pub(super) fn compile_static_method(
         typed_i1_function_param_reps: &cross_module.typed_i1_function_param_reps,
         typed_f64_methods: &cross_module.typed_f64_methods,
         pshape_methods: &cross_module.pshape_methods,
+        pshape_arg_methods: &cross_module.pshape_arg_methods,
         nonnegative_index_methods: &cross_module.nonnegative_index_methods,
         trusted_array_param_handles: HashMap::new(),
         versioned_indexed_loop_facts: Vec::new(),
         stable_packed_loop_facts: Vec::new(),
         pshape_tower_routable: &cross_module.pshape_tower_routable,
         proven_this: None,
+        proven_shape_params: std::collections::HashMap::new(),
         typed_i32_methods: &cross_module.typed_i32_methods,
         typed_i1_methods: &cross_module.typed_i1_methods,
         typed_string_methods: &cross_module.typed_string_methods,
@@ -1812,6 +1879,7 @@ pub(super) fn compile_static_method(
     super::arguments::materialize_arguments_object(
         &mut ctx,
         &f.params,
+        Some(&f.body),
         super::arguments::ArgumentsCallee::Undefined,
     );
     if f.is_async {

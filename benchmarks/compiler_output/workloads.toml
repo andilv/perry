@@ -1570,16 +1570,27 @@ min_vectorized_loops = 0
 scalar_baseline = "allowed: native-owned typed view fixture gates proof records and fallback reasons"
 allowed_missed_reason_kinds = [
   "call_instruction",
-  # #8489: three loops here now miss vectorization for `control_flow` on the
-  # Linux/release configuration this gate runs in (not reproducible on a
-  # macOS perry-dev build). It is pre-existing — it fails identically on the
-  # pre-merge baseline 3627657c7 and still fails after #8484 — so it is NOT
-  # the `extern "C-unwind"` unwind edges. This workload requires no
-  # vectorization (`min_vectorized_loops = 0`, explicit scalar baseline), so
-  # the list is a change detector rather than a performance floor, and the
+  # #8489: three loops here miss vectorization for `control_flow`. ATTRIBUTED
+  # to 40e2ce86d (#8457, "make -Os the default native optimization level"),
+  # and it is legitimate rather than a codegen regression: perry's emitted IR
+  # is byte-identical across that commit (same sha256 at 526e0b502,
+  # f14a9e262 and 40e2ce86d). Only the clang args changed, -O3 -> -Os, and
+  # the harness's remark pass reuses the compile's own args. At -Os LLVM
+  # declines the SimplifyCFG speculation and if-conversion that at -O3
+  # flattened these branches into selects before the vectorizer ran, so the
+  # loops genuinely carry control flow it cannot if-convert — and vectorizing
+  # them would grow code size, which is exactly what -Os asks it not to do.
+  # This workload requires no vectorization (`min_vectorized_loops = 0`,
+  # explicit scalar baseline), so this list is a change detector, and the
   # sibling `native_abi_packet_control` / `native_pod_layout_constants`
-  # workloads already accept this reason. Widened to unblock the release
-  # gate; #8489 stays open to attribute the codegen change that caused it.
+  # workloads already accept the same reason.
+  #
+  # Earlier notes here said Linux-only, release-config, and caused by the
+  # string-codegen work. All three were wrong: the gate builds with
+  # `cargo build -p perry` (a DEBUG build, test.yml:1809), it reproduces on
+  # macOS with that profile, and control_flow=3 predates #8448/#8450/#8453/
+  # #8454. 40e2ce86d is an ancestor of the 3627657c7 baseline, which is why
+  # that baseline looked "pre-existing".
   "control_flow",
   "generic_not_vectorized",
   "not_beneficial",
@@ -2134,3 +2145,62 @@ name = "imported_registry_generic_fallback_retained"
 consumer = "proven_this_method_direct_call"
 notes_contains = "generic_dispatch_fallback=js_native_call_method_by_id"
 min = 2
+
+[workloads.issue_8775_imported_object]
+source = "test-files/fixtures/issue_8775_imported_object/main.js"
+kind = "imported_object_literal_method_specialization"
+allow_hot_loop_conversions = true
+allow_dynamic_property_runtime = true
+
+[workloads.issue_8775_imported_object.vectorization]
+min_vectorized_loops = 0
+scalar_baseline = "allowed: this fixture gates cross-module own-method dispatch"
+allowed_missed_reason_kinds = [
+  "call_instruction",
+  "control_flow",
+  "generic_not_vectorized",
+  "not_beneficial",
+  "uncountable_loop",
+  "unknown_trip_count",
+  "unsupported_instruction",
+  "unsupported_reduction",
+]
+
+[workloads.issue_8775_imported_object.runtime_budgets]
+
+[[workloads.issue_8775_imported_object.stdout_checks]]
+name = "imported_object_checksum"
+equals = "{\"checksum\":400000,\"remaining\":0}\n"
+detail = "stable imported object methods preserve the Node checksum"
+
+[[workloads.issue_8775_imported_object.ir_checks]]
+name = "direct_producer_closure_calls"
+section = "llvm_before"
+contains_all = [
+  "call double @perry_closure_adapter_js__6",
+  "call double @perry_closure_adapter_js__7",
+  "call double @perry_closure_adapter_js__8",
+  "call double @perry_closure_adapter_js__9",
+]
+detail = "stable arms directly call producer closure bodies"
+
+[[workloads.issue_8775_imported_object.ir_checks]]
+name = "generic_method_fallback_retained"
+section = "llvm_before"
+contains = "call double @js_native_call_method_by_id"
+detail = "guard failures retain the universal method dispatcher"
+
+[workloads.issue_8775_imported_object.native_rep_checks]
+allow_materialization_reasons = ["runtime_api"]
+
+[[workloads.issue_8775_imported_object.native_rep_checks.require_records]]
+name = "imported_object_direct_selection"
+consumer = "imported_object_literal_method_direct_call"
+notes_contains = "receiver_provenance=imported_object_literal_metadata"
+min = 5
+
+[[workloads.issue_8775_imported_object.native_rep_checks.require_records]]
+name = "imported_object_generic_fallback_retained"
+consumer = "imported_object_literal_method_direct_call"
+notes_contains = "generic_dispatch_fallback=js_native_call_method_by_id"
+min = 5

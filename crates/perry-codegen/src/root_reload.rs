@@ -216,6 +216,8 @@ const NON_COLLECTING: &[&str] = &[
     "js_nanbox_get_pointer",
     // inline-cache guards: pure reads
     "js_typed_feedback_closure_direct_call_guard",
+    "js_closure_exact_func_guard",
+    "js_object_own_method_cache_miss",
     // verified non-allocating bookkeeping stores/reads
     "js_closure_set_capture_bits",
     "js_closure_set_box_capture_ptr",
@@ -926,13 +928,17 @@ fn facts_of(inst: &LlInst, slots: &HashSet<String>) -> Facts {
             use_op(&mut uses, b);
         }
         LlInst::Call {
-            dst, callee, args, ..
+            dst,
+            callee,
+            args,
+            gc_leaf,
+            ..
         } => {
             result = dst.as_deref().and_then(reg);
             for (_, v) in args {
                 use_op(&mut uses, v);
             }
-            collecting = is_collecting(callee);
+            collecting = !gc_leaf && is_collecting(callee);
             // #7725: the two capture-bits halves. GET extends a derivation like a transparent
             // bit op (see CAPTURE_GET_CALLEE); SET's side effect on the capture slot has to
             // invalidate that derivation the way a store does, via the shared `stores_to`
@@ -949,14 +955,18 @@ fn facts_of(inst: &LlInst, slots: &HashSet<String>) -> Facts {
             }
         }
         LlInst::CallIndirect {
-            dst, fptr, args, ..
+            dst,
+            fptr,
+            args,
+            gc_leaf,
+            ..
         } => {
             result = reg(dst);
             use_op(&mut uses, fptr);
             for (_, v) in args {
                 use_op(&mut uses, v);
             }
-            collecting = true;
+            collecting = !gc_leaf;
         }
         LlInst::AsmBarrier => {}
         LlInst::Br { label } => succs.push(label.clone()),

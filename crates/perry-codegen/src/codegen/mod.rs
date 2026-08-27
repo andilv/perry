@@ -174,32 +174,35 @@ impl Drop for CompileProgress {
     }
 }
 
+#[cfg(test)]
+mod argument_shape_clone_tests;
 pub(crate) mod arguments;
 mod artifact_context;
 mod artifacts;
 mod boxed_locals;
+#[cfg(test)]
+mod clone_suffix_tests;
 mod closure;
 mod closure_collect;
 mod ctor_arity;
 #[cfg(test)]
+mod declared_string_add_tests;
+#[cfg(test)]
 mod emission_order_tests;
 mod entry;
 pub mod entry_outline;
-mod func_registry;
+pub(crate) mod func_registry;
 mod function;
+#[cfg(test)]
+mod guarded_undefined_method_tests;
 #[cfg(test)]
 mod hoisted_callback_method_tests;
 #[cfg(test)]
 mod index_method_clone_tests;
 mod indexed_method_artifacts;
+mod ordinary_method_artifacts;
 // `pub(crate)` so `crate::linker` can read the inline-hot-small policy
 // (`inline_hot_small_enabled` / `inline_hot_small_hint_threshold`).
-#[cfg(test)]
-mod clone_suffix_tests;
-#[cfg(test)]
-mod declared_string_add_tests;
-#[cfg(test)]
-mod guarded_undefined_method_tests;
 pub(crate) mod helpers;
 mod method;
 mod method_registry;
@@ -237,7 +240,9 @@ pub(crate) use helpers::{
     module_callable_count, set_full_outline_ic, write_barriers_enabled,
 };
 pub use opts::{
-    AppMetadata, CompileOptions, FpContractMode, ImportedClass, NamespaceEntry, NamespaceEntryKind,
+    AppMetadata, CompileOptions, ExportedObjectLiteralCapability, FpContractMode, ImportedClass,
+    ImportedObjectLiteral, ImportedObjectLiteralMethod, NamespaceEntry, NamespaceEntryKind,
+    ObjectLiteralMethodCandidate, ShortSpreadMethodCandidate,
 };
 pub(crate) use opts::{CrossModuleCtx, ImportedCtor};
 pub(crate) use param_guard::scalar_descriptor_rep;
@@ -262,7 +267,7 @@ use function::{
 };
 use helpers::{
     collect_return_class, emit_buffer_alias_metadata, function_body_returns_generator_object,
-    sanitize,
+    sanitize, scoped_method_name,
 };
 
 // Collector and boxing-analysis walkers live in dedicated modules. The
@@ -339,6 +344,39 @@ fn record_typed_clone_rejection(
 
 pub(crate) fn static_method_registry_key(method_name: &str) -> String {
     format!("__perry_static__{}", method_name)
+}
+
+/// Harvest concrete method capabilities before modules enter parallel
+/// codegen. This deliberately includes non-exported classes: a generic
+/// library can receive their instances through a callback or registration API
+/// without importing their type (perform-ecs is the motivating case).
+pub fn short_spread_method_capabilities(hir: &HirModule) -> Vec<ShortSpreadMethodCandidate> {
+    let source_prefix = sanitize(&hir.name);
+    let mut used_keys_globals = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for class in &hir.classes {
+        let keys_global =
+            helpers::unique_class_keys_global(&source_prefix, &class.name, &mut used_keys_globals);
+        let shape_id_global =
+            crate::typed_shape::shape_id_global_name_from_keys_global(&keys_global);
+        for method in &class.methods {
+            // Rest-shaped methods need a different direct ABI. This includes
+            // the compiler's hidden `arguments` parameter, which is also
+            // marked as rest. Both stay on the generic apply path.
+            if method.params.iter().any(|param| param.is_rest) {
+                continue;
+            }
+            out.push(ShortSpreadMethodCandidate {
+                class_id: class.id,
+                method_name: method.name.clone(),
+                source_prefix: source_prefix.clone(),
+                target: scoped_method_name(&source_prefix, &class.name, &method.name),
+                shape_id_global: shape_id_global.clone(),
+                declared_count: method.params.len(),
+            });
+        }
+    }
+    out
 }
 
 /// Compile a Perry HIR module to an object file via LLVM IR.
@@ -1086,27 +1124,18 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
     // `new ClassName()` site still resolves to the right global.
     let mut used_class_keys_globals: std::collections::HashSet<String> =
         std::collections::HashSet::new();
-    fn unique_global(base: String, used: &mut std::collections::HashSet<String>) -> String {
-        if used.insert(base.clone()) {
-            return base;
-        }
-        let mut n = 1u32;
-        loop {
-            let candidate = format!("{base}_{n}");
-            if used.insert(candidate.clone()) {
-                return candidate;
-            }
-            n += 1;
-        }
-    }
-
     for c in &hir.classes {
-        let global_name = unique_global(
-            format!("perry_class_keys_{}__{}", module_prefix, sanitize(&c.name)),
+        let global_name = helpers::unique_class_keys_global(
+            &module_prefix,
+            &c.name,
             &mut used_class_keys_globals,
         );
         llmod.add_internal_global(&global_name, I64, "0");
-        llmod.add_internal_global(
+        // #8772: the immutable class ShapeId is a producer-authored
+        // whole-program capability. Generic callers in other modules load it
+        // to guard reverse-discovered direct method arms. The keys array stays
+        // private; only the opaque process-unique identity is exported.
+        llmod.add_global(
             &crate::typed_shape::shape_id_global_name_from_keys_global(&global_name),
             I32,
             "0",
@@ -1291,8 +1320,9 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         if class_keys_globals_map.contains_key(&c.name) {
             continue;
         }
-        let global_name = unique_global(
-            format!("perry_class_keys_{}__{}", module_prefix, sanitize(&c.name)),
+        let global_name = helpers::unique_class_keys_global(
+            &module_prefix,
+            &c.name,
             &mut used_class_keys_globals,
         );
         llmod.add_internal_global(&global_name, I64, "0");
@@ -2016,11 +2046,68 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             && !nonnegative_index_methods.contains_key(key)
     });
     guarded_undefined_method_candidates.sort_unstable_by(|left, right| left.cmp(right));
-    let guarded_undefined_method_params = guarded_undefined_method_candidates
-        .into_iter()
-        .take(16)
-        .map(|(_, key, param_index)| (key, param_index))
-        .collect();
+    let guarded_undefined_method_params: std::collections::HashMap<(String, String), usize> =
+        guarded_undefined_method_candidates
+            .into_iter()
+            .take(16)
+            .map(|(_, key, param_index)| (key, param_index))
+            .collect();
+    // #8774: one non-combinatorial tagged-ABI clone per local method. Source
+    // annotations or a unique unannotated field signature only nominate a
+    // class; every routed call emits an exact runtime class+shape guard. Keep
+    // this disjoint from typed/index/undefined clone families, whose
+    // trampolines have separate routing conventions.
+    // Argument layouts may come from an imported class stub. The clone itself
+    // is still emitted only for a method body owned by this module; imported
+    // field metadata, class id and class-keys/ShapeId globals provide the same
+    // exact runtime guard and offsets as local metadata. This is required by
+    // perform-ecs: `ECS.addComponentsToEntity` is local to ECS.ts while its
+    // `Entity` parameter is declared in Entity.ts.
+    let visible_class_names: std::collections::HashSet<&str> =
+        receiver_class_table.keys().map(String::as_str).collect();
+    let mut pshape_arg_methods = std::collections::HashMap::new();
+    for class in &hir.classes {
+        for method in &class.methods {
+            let key = (class.name.clone(), method.name.clone());
+            if typed_f64_methods.contains(&key)
+                || typed_i32_methods.contains(&key)
+                || typed_i1_methods.contains(&key)
+                || typed_string_methods.contains(&key)
+                || typed_f64_receiver_methods.contains_key(&key)
+                || nonnegative_index_methods.contains_key(&key)
+                || guarded_undefined_method_params.contains_key(&key)
+            {
+                continue;
+            }
+            let Some(plan) = crate::collectors::method_proven_shape_args(
+                method,
+                receiver_class_table,
+                &visible_class_names,
+            ) else {
+                continue;
+            };
+            if !plan.args.is_empty() {
+                pshape_arg_methods.insert(key, plan);
+            }
+        }
+    }
+    module_dispatch_facts.install_argument_shape_routes(pshape_arg_methods.iter().map(
+        |(key, plan)| {
+            (
+                key.clone(),
+                plan.args
+                    .iter()
+                    .map(|arg| {
+                        (
+                            arg.param_index,
+                            arg.fact.class_name.clone(),
+                            arg.preserves_containment,
+                        )
+                    })
+                    .collect(),
+            )
+        },
+    ));
     let mut compiler_private_async_i32_control_locals = std::collections::HashSet::new();
     let mut compiler_private_async_i1_control_locals = std::collections::HashSet::new();
     crate::boxed_vars::collect_compiler_private_async_control_locals_in_stmts(
@@ -2162,12 +2249,70 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             })
             .collect();
 
+    let imported_object_literals: std::collections::HashMap<String, ImportedObjectLiteral> = opts
+        .imported_classes
+        .iter()
+        .filter_map(|imported| {
+            imported
+                .object_literal
+                .as_ref()
+                .map(|object| (object.local_binding.clone(), object.clone()))
+        })
+        .collect();
+    let mut imported_object_producers: std::collections::BTreeSet<(String, u32)> =
+        imported_object_literals
+            .values()
+            .map(|object| (object.source_prefix.clone(), object.source_global_id))
+            .collect();
+    for (source_prefix, source_global_id) in &imported_object_producers {
+        llmod.add_external_global(
+            &format!("perry_global_{source_prefix}__{source_global_id}"),
+            DOUBLE,
+        );
+    }
+
+    for candidate in opts.object_literal_method_candidates.values().flatten() {
+        if candidate.source_prefix != module_prefix
+            && imported_object_producers
+                .insert((candidate.source_prefix.clone(), candidate.source_global_id))
+        {
+            llmod.add_external_global(
+                &format!(
+                    "perry_global_{}__{}",
+                    candidate.source_prefix, candidate.source_global_id
+                ),
+                DOUBLE,
+            );
+        }
+    }
+
+    // #8772: declare the opaque ShapeId slots published by concrete classes
+    // in other modules. Local candidates already have a defining global in
+    // this module and must not be redeclared as external.
+    let mut declared_short_spread_shapes = std::collections::HashSet::new();
+    for candidate in opts.short_spread_method_candidates.values().flatten() {
+        if candidate.source_prefix != module_prefix
+            && declared_short_spread_shapes.insert(candidate.shape_id_global.clone())
+        {
+            llmod.add_external_global(&candidate.shape_id_global, I32);
+        }
+    }
+    for candidate in opts.object_literal_method_candidates.values().flatten() {
+        if candidate.source_prefix != module_prefix
+            && declared_short_spread_shapes.insert(candidate.shape_id_global.clone())
+        {
+            llmod.add_external_global(&candidate.shape_id_global, I32);
+        }
+    }
+
     let mut cross_module = CrossModuleCtx {
         namespace_imports: opts.namespace_imports.iter().cloned().collect(),
         namespace_member_nested: opts.namespace_member_nested.iter().cloned().collect(),
         namespace_member_prefixes: opts.namespace_member_prefixes,
         namespace_member_origin_names: opts.namespace_member_origin_names,
         imported_async_funcs: opts.imported_async_funcs,
+        short_spread_method_candidates: Arc::clone(&opts.short_spread_method_candidates),
+        object_literal_method_candidates: Arc::clone(&opts.object_literal_method_candidates),
         local_async_funcs,
         local_generator_funcs,
         async_step_closures: hir.async_step_closures.iter().copied().collect(),
@@ -2238,6 +2383,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             }
         }),
         imported_vars: opts.imported_vars,
+        imported_object_literals,
         needs_stdlib: opts.needs_stdlib,
         needs_geisterhand: opts.needs_geisterhand,
         geisterhand_port: opts.geisterhand_port,
@@ -2301,6 +2447,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         nonnegative_index_methods,
         guarded_undefined_method_params,
         pshape_methods,
+        pshape_arg_methods,
         pshape_tower_routable,
         typed_f64_closures: std::collections::HashSet::new(),
         typed_i32_closures: std::collections::HashSet::new(),
@@ -2779,6 +2926,12 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         &module_boxed_vars,
         &module_globals,
         &trusted_box_exclusions,
+    );
+    let versioned_loop_callbacks = closure_collect::select_versioned_loop_callbacks(
+        &closures,
+        &trusted_box_closures,
+        &module_boxed_vars,
+        &module_globals,
     );
 
     // ---- Representation-selection Phase 2: specialized-ABI plan selection.
@@ -3378,6 +3531,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         closure_lengths: &closure_lengths,
         closure_arrow_functions: &closure_arrow_functions,
         trusted_box_closures: &trusted_box_closures,
+        versioned_loop_callbacks: &versioned_loop_callbacks,
         closures: &closures,
         class_keys_init_data: &class_keys_init_data,
         class_header_image_inits: &class_header_image_inits,

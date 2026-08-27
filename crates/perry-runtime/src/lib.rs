@@ -51,6 +51,8 @@ pub mod atomics_futex;
 pub mod bigint;
 pub mod r#box;
 pub mod buffer;
+mod build_stamp;
+pub use build_stamp::{PERRY_RUNTIME_BUILD_ID, PERRY_RUNTIME_BUILD_STAMP};
 pub mod builtins;
 pub mod bun_compat;
 pub mod bun_ffi;
@@ -101,6 +103,8 @@ pub mod native_handle;
 pub mod native_value_profile;
 pub mod navigator;
 pub mod net_validate;
+#[cfg(feature = "node-api-host")]
+pub mod node_api_host;
 mod param_type_guard;
 // #6468: the `node:http2` constant tables are only reachable through the
 // `http2` native-module namespace, so a program that never imports `node:http2`
@@ -307,8 +311,8 @@ pub use object::{
 };
 pub use promise::{js_is_promise, js_promise_run_microtasks, js_promise_state, js_promise_value};
 pub use promise::{
-    js_promise_mark_internally_handled, js_promise_new, js_promise_reject, js_promise_rejected,
-    js_promise_resolve, js_promise_resolved,
+    js_promise_mark_internally_handled, js_promise_new, js_promise_new_cross_thread,
+    js_promise_reject, js_promise_rejected, js_promise_resolve, js_promise_resolved,
 };
 pub use string::js_string_from_bytes;
 pub use value::{
@@ -484,6 +488,8 @@ pub(crate) mod stdlib_pump {
     #[no_mangle]
     pub extern "C" fn js_run_stdlib_pump() {
         crate::promise::js_native_async_process_pending();
+        #[cfg(feature = "node-api-host")]
+        crate::node_api_host::process_pending();
         crate::os::js_process_signal_drain();
         // Drain the tty resize-pending flag (#347 Phase 3). Lives in
         // perry-runtime, not stdlib, so it runs even when stdlib isn't
@@ -529,6 +535,10 @@ pub(crate) mod stdlib_pump {
     /// async ops, etc.). Returns 0 if perry-stdlib is not linked.
     #[no_mangle]
     pub extern "C" fn js_stdlib_has_active_handles() -> i32 {
+        #[cfg(feature = "node-api-host")]
+        if crate::node_api_host::has_active_work() {
+            return 1;
+        }
         if crate::promise::js_native_async_has_active() != 0 {
             return 1;
         }

@@ -58,6 +58,8 @@ fn ir_opts() -> CompileOptions {
         namespace_imports: Vec::new(),
         namespace_member_nested: Vec::new(),
         imported_classes: Vec::new(),
+        short_spread_method_candidates: std::sync::Arc::default(),
+        object_literal_method_candidates: std::sync::Arc::default(),
         imported_enums: Vec::new(),
         imported_async_funcs: std::collections::HashSet::new(),
         type_aliases: std::collections::HashMap::new(),
@@ -445,7 +447,7 @@ fn a_metadata_selected_add_keeps_the_runtime_number_guard() {
     assert!(
         generic.contains("call i32 @js_typed_feedback_numeric_array_push_guard")
             && generic.contains("call i64 @js_array_numeric_push_f64_unboxed")
-            && generic.contains("call i64 @js_array_push_f64"),
+            && generic.contains("call i64 @js_array_push_f64_spec"),
         "a declared-number addition must validate the live value and retain the generic push fallback:\n{generic}"
     );
     assert!(

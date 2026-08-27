@@ -104,8 +104,9 @@ pub(crate) use pod_record::{
     try_lower_pod_field_set,
 };
 pub(crate) use proven_view_access::{
-    index_is_exact_i32_shape, local_is_proven_int_store_view,
+    index_is_exact_i32_shape, is_proven_u32_view_read, local_is_proven_int_store_view,
     try_lower_proven_view_checked_f64_load, try_lower_proven_view_checked_store,
+    try_lower_proven_view_checked_u32_load,
 };
 pub(crate) use range_facts::{
     bounds_for_buffer_access_width, effective_alias_state_for_access,
@@ -132,7 +133,8 @@ pub(crate) use write_barrier::{
     emit_root_heap_word_store_on_block, emit_root_nanbox_store_on_block, emit_write_barrier,
     emit_write_barrier_slot_generation_tested, emit_write_barrier_slot_on_block,
     emit_write_barrier_slot_value_and_generation_tested, lower_array_super_init,
-    lower_event_emitter_subclass_init, lower_node_stream_super_init, lower_stream_super_init,
+    lower_event_emitter_async_resource_subclass_init, lower_event_emitter_subclass_init,
+    lower_node_stream_super_init, lower_stream_super_init,
 };
 
 // Issue #1098 phase 3: the `FnCtx` definition stays in this trunk, but its
@@ -160,9 +162,16 @@ mod write_pic_barrier_tests;
 // temp alloca through the same shadow-slot emission every named local uses,
 // and it now lives outside `crate::expr`.
 #[cfg(test)]
+mod call_return_array_index_tests;
+#[cfg(test)]
 mod call_spread_rooting_tests;
+mod call_spread_short;
+#[cfg(test)]
+mod call_spread_short_tests;
 #[cfg(test)]
 mod issue7628_rooting_tests;
+#[cfg(test)]
+mod readonly_collection_tests;
 pub(crate) mod shadow_slot;
 #[cfg(test)]
 mod slice7_rooting_tests;
@@ -582,12 +591,19 @@ pub(crate) struct FnCtx<'a> {
     /// parameters, indexed by callback local (including exact const aliases)
     /// and call arity.
     pub resolved_arrow_callback_targets: std::collections::HashMap<(u32, usize), String>,
+    /// Nullable compiler-private callback targets whose guarded cold arms
+    /// poison a versioned loop before they can run user code.
+    pub resolved_versioned_loop_callback_targets: std::collections::HashMap<(u32, usize), String>,
     /// This is an internal clone of a compiler-proven direct arrow body. Its
     /// boxed capture slots were installed through
     /// `js_closure_set_box_capture_ptr`, so captured-box accesses may use the
     /// raw helpers. Public and dynamically dispatched closure bodies keep the
     /// defensive runtime registry validation.
     pub trusted_box_captures: bool,
+    /// Stack context supplied only to a compiler-private versioned-loop
+    /// callback clone. Its cold arms record the exact resume index and poison
+    /// the caller's private counter before executing observable fallback code.
+    pub versioned_loop_deopt_context: Option<String>,
     /// Raw box capture pointers loaded once in the entry block of a
     /// compiler-private exact-arrow clone. The capture slots are immutable,
     /// and a live exact capture edge keeps each box cell alive and non-moving
@@ -693,6 +709,14 @@ pub(crate) struct FnCtx<'a> {
     /// compiler-synthesized `arguments` binding and therefore receives every
     /// actual argument.
     pub method_has_synthetic_arguments: &'a std::collections::HashMap<(String, String), bool>,
+    /// Whole-program reverse capabilities for guarded short-spread method
+    /// calls. See `CompileOptions::short_spread_method_candidates`.
+    pub short_spread_method_candidates:
+        &'a std::collections::HashMap<String, Vec<crate::ShortSpreadMethodCandidate>>,
+    /// Whole-program exported object-literal candidates for dynamic receiver
+    /// calls. See `CompileOptions::object_literal_method_candidates`.
+    pub object_literal_method_candidates:
+        &'a std::collections::HashMap<String, Vec<crate::ObjectLiteralMethodCandidate>>,
     /// FFI manifest: `name -> (params, return)` from `package.json`
     /// `nativeLibrary.functions`. Descriptors use the shared native-library
     /// ABI vocabulary. `lower_call` consults
@@ -1061,12 +1085,21 @@ pub(crate) struct FnCtx<'a> {
     /// keeps today's guarded lowering because its receiver is unproven.
     pub proven_this: Option<crate::collectors::PtrShapeLocal>,
 
+    /// #8774: parameter-local exact-shape proofs installed only in a guarded
+    /// `$pshape_args` method clone.  Like `proven_this`, each value remains a
+    /// tagged JSValue in its ordinary shadow-bound slot; field lowering reloads
+    /// that slot before deriving a raw pointer.
+    pub proven_shape_params: std::collections::HashMap<u32, crate::collectors::PtrShapeLocal>,
+
     /// Phase 5a: `(class, method)` pairs with an emitted proven-`this` clone.
     /// The two proven call sites consult this before routing; a hit also
     /// proves the receiver's exact class DECLARES the method (own
     /// declarations only), which is what rules out a subclass `this`.
     pub pshape_methods:
         &'a std::collections::HashMap<(String, String), crate::collectors::PtrShapeLocal>,
+    /// #8774: module-local guarded exact-shape parameter clone plans.
+    pub pshape_arg_methods:
+        &'a std::collections::HashMap<(String, String), crate::collectors::ProvenShapeArgPlan>,
 
     /// Module-local methods whose nonnegative-index clone was actually
     /// emitted. Call lowering gates on this registry rather than re-running
@@ -1256,10 +1289,17 @@ pub(crate) struct FnCtx<'a> {
     /// receiver calls.
     pub local_value_aliases: std::collections::HashMap<u32, u32>,
 
+    /// Immutable local aliases of producer-proven imported object literals.
+    /// The value is the original consumer import binding used to look up the
+    /// cross-module capability.
+    pub local_imported_object_aliases: std::collections::HashMap<u32, String>,
+
     /// Names of imports that are exported variables (not functions).
     /// When an ExternFuncRef with one of these names appears as a value,
     /// the codegen calls the getter instead of wrapping as a closure.
     pub imported_vars: &'a std::collections::HashSet<String>,
+    pub imported_object_literals:
+        &'a std::collections::HashMap<String, crate::codegen::ImportedObjectLiteral>,
 
     /// Compile-time constant values for specific module globals. When a
     /// global is a known compile-time constant (e.g., `__platform__`),
@@ -1578,12 +1618,24 @@ pub(crate) struct VersionedIndexedMethodFact {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) enum VersionedIndexedGuardMode {
+    Fingerprints,
+    CallbackDeopt {
+        callback_local_id: u32,
+        callback_arity: usize,
+        target: String,
+        context: String,
+    },
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct VersionedIndexedLoopFact {
     pub counter_local_id: u32,
     pub falsy_local_id: Option<u32>,
     pub side_exit_label: String,
     pub arrays: Vec<VersionedIndexedArrayFact>,
     pub method: VersionedIndexedMethodFact,
+    pub guard_mode: VersionedIndexedGuardMode,
     /// Populated by the iteration-entry revalidation block. These SSA handles
     /// dominate the complete fast body and are never retained across the loop
     /// callback/back edge.
@@ -1592,6 +1644,10 @@ pub(crate) struct VersionedIndexedLoopFact {
 
 #[derive(Clone, Debug)]
 pub(crate) struct StablePackedNumericAccess {
+    /// One preheader-derived element-zero base for a mode-2 Array-subclass
+    /// prefix proven wholly inline or wholly spilled. When present, indexed
+    /// reads need no per-element storage-kind selection.
+    pub contiguous_base: Option<String>,
     /// Whether the admitted receiver is a plain Array rather than an
     /// Array-subclass object.
     pub is_plain: String,
@@ -1606,19 +1662,90 @@ pub(crate) struct StablePackedNumericAccess {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct StablePackedReadCache {
+    /// The cache is keyed by the scalar loop counter rather than assumed to
+    /// expire on the back edge. This remains correct through `continue` edges
+    /// and lets LLVM promote all three slots without relying on block layout.
+    pub valid_slot: String,
+    pub counter_slot: String,
+    /// A boxed JS value. It is not a GC root: any call that could move a
+    /// pointer dirties the associated proof before entering the callee, and a
+    /// dirty cache is never loaded.
+    pub value_slot: String,
+    /// Canonical unsigned entity index paired with `value_slot`. Present only
+    /// when admission proved every element is an exact `u32`; consumers can
+    /// then reuse the native index without repeating ToUint32 conversion.
+    pub u32_slot: Option<String>,
+    /// Compile-time source-order state. The first lowered occurrence only
+    /// populates the slots; later occurrences emit a runtime hit/miss test.
+    pub has_producer: bool,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct StablePackedLoopFact {
     pub counter_local_id: u32,
     pub array_local_id: u32,
     pub side_exit_label: String,
     pub descriptor: String,
+    /// Boxed bound passed to the runtime guard (`-1` requests live length).
+    pub bound: String,
+    /// Live-length versions must observe growth as well as shrink. The
+    /// iteration guard compares its refreshed bound with this admitted value
+    /// and side-exits when they differ.
+    pub admitted_bound: String,
+    pub live_length_bound: bool,
+    /// Captured receivers cannot keep a raw address across calls in the loop
+    /// body. They reload the closure slot and revalidate before the first
+    /// indexed effect of every iteration.
+    pub revalidate_each_iteration: bool,
+    /// A nested receiver derived from an outer guarded read may have pure
+    /// compiler temporaries before its first indexed use. Revalidate at that
+    /// use, after those temporaries, so none of their runtime loads can leave a
+    /// stale raw address.
+    pub revalidate_before_indexed_read: bool,
+    /// Path-sensitive validity bit for a nested-derived raw receiver. Calls
+    /// set it before entering the callee; a successful exact revalidation
+    /// clears it. LLVM promotes the compiler-private alloca to SSA, so the
+    /// clean hot arm is one branch and no runtime call.
+    pub revalidation_dirty_slot: Option<String>,
+    /// Non-root cache paired with `revalidation_dirty_slot`. It is read only
+    /// on the clean arm; a call dirties the proof before a moving collection,
+    /// and successful revalidation refreshes this word before clearing it.
+    pub revalidation_live_raw_slot: Option<String>,
+    /// One exact `array[counter]` result shared by repeated occurrences in the
+    /// same source iteration. A hit additionally requires a clean revalidation
+    /// proof, so observable calls force an exact reread at the next occurrence.
+    pub repeated_read_cache: Option<StablePackedReadCache>,
     pub live_receiver_handle: Option<String>,
     /// Admission scanned the complete indexed range and proved every value is
     /// an untagged IEEE Number. This is requested only when the indexed value
     /// appears below a numeric operator in the cloned body.
     pub numeric_elements: bool,
+    /// The current guarded typed-array clone uses `array[counter]` as an
+    /// element key. Its first source occurrence validates and canonicalizes
+    /// the value to `u32`; repeated occurrences reuse those native bits.
+    pub u32_index_elements: bool,
+    /// Minimum immutable length of every pairwise-distinct admitted component
+    /// column. The entity guard checks its canonical index against this once,
+    /// allowing every component access in the iteration to be unchecked.
+    pub u32_component_bound: Option<String>,
+    /// Equal-length component admission makes an out-of-range entity a
+    /// no-effect iteration: every typed-array read is `undefined` and every
+    /// store is ignored. Branch directly to this loop's update rather than
+    /// restarting the generic clone and replaying earlier effects.
+    pub u32_out_of_bounds_label: Option<String>,
     /// Preheader-derived numeric storage bases. Admission proved the complete
     /// range is raw f64 and the call-free clone keeps these addresses stable.
     pub numeric_access: Option<StablePackedNumericAccess>,
+    /// Immutable locals initialized from this loop's guarded direct indexed
+    /// read. They may seed a nested candidate only while this fast-loop fact
+    /// is active.
+    pub derived_locals: std::collections::HashSet<u32>,
+    /// Immutable locals initialized from a proven Uint32Array view read in
+    /// this clone. Their ordinary JS slot still stores the exact Number, while
+    /// native stores may consume it with ToUint32 semantics without falling
+    /// back to the dynamic typed-array setter.
+    pub u32_view_derived_locals: std::collections::HashMap<u32, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1966,6 +2093,42 @@ pub(crate) fn inline_cache_global_name(ctx: &FnCtx<'_>, site_id: u32) -> String 
     inline_cache_global_name_for_prefix(ctx.strings.module_prefix(), site_id)
 }
 
+/// Record a cold-arm bailout for a compiler-private versioned-loop callback.
+/// The stack context is `[counter_slot_ptr, original_bound, resume_index]` as
+/// three i64 words. The first cold arm stores `counter + 1` and poisons the
+/// private i32 counter to `bound - 1`; the caller's ordinary update advances
+/// it to `bound`, so the existing loop condition exits without a hot-path
+/// check. Later cold arms in the same callback are idempotent.
+pub(crate) fn emit_versioned_loop_callback_deopt(ctx: &mut FnCtx<'_>) {
+    let Some(context) = ctx.versioned_loop_deopt_context.clone() else {
+        return;
+    };
+    let resume_ptr = ctx.block().gep(I64, &context, &[(I64, "2")]);
+    let resume = ctx.block().load(I64, &resume_ptr);
+    let unmarked = ctx.block().icmp_eq(I64, &resume, "-1");
+    let mark_idx = ctx.new_block("versioned_callback.deopt.mark");
+    let continue_idx = ctx.new_block("versioned_callback.deopt.continue");
+    let mark_label = ctx.block_label(mark_idx);
+    let continue_label = ctx.block_label(continue_idx);
+    ctx.block().cond_br(&unmarked, &mark_label, &continue_label);
+
+    ctx.current_block = mark_idx;
+    let counter_slot_ptr = ctx.block().gep(I64, &context, &[(I64, "0")]);
+    let counter_slot_bits = ctx.block().load(I64, &counter_slot_ptr);
+    let counter_slot = ctx.block().inttoptr(I64, &counter_slot_bits);
+    let counter = ctx.block().load(I32, &counter_slot);
+    let next = ctx.block().add(I32, &counter, "1");
+    let next_i64 = ctx.block().zext(I32, &next, I64);
+    ctx.block().store(I64, &next_i64, &resume_ptr);
+    let bound_ptr = ctx.block().gep(I64, &context, &[(I64, "1")]);
+    let bound_i64 = ctx.block().load(I64, &bound_ptr);
+    let bound = ctx.block().trunc(I64, &bound_i64, I32);
+    let poison = ctx.block().sub(I32, &bound, "1");
+    ctx.block().store(I32, &poison, &counter_slot);
+    ctx.block().br(&continue_label);
+    ctx.current_block = continue_idx;
+}
+
 fn inline_cache_global_name_for_prefix(module_prefix: &str, site_id: u32) -> String {
     if module_prefix.is_empty() {
         format!("perry_ic_{site_id}")
@@ -2089,8 +2252,65 @@ impl<'a> FnCtx<'a> {
             return None;
         }
         match e {
-            perry_hir::Expr::LocalGet(id) => self.native_facts.shape_proven_ptr_local(*id),
+            perry_hir::Expr::LocalGet(id) => self.ptr_shape_local_fact(*id),
             perry_hir::Expr::This => self.proven_this.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Shared exact-shape lookup for a local, with clone-parameter overlays
+    /// taking precedence over ordinary native facts.
+    fn ptr_shape_local_fact(&self, id: u32) -> Option<&crate::collectors::PtrShapeLocal> {
+        self.proven_shape_params
+            .get(&id)
+            .or_else(|| self.native_facts.shape_proven_ptr_local(id))
+    }
+
+    /// Caller-side containment proof used to admit an argument-shape clone
+    /// route, paired with whether that route must still emit its runtime
+    /// class+ShapeId guard.
+    ///
+    /// This deliberately ignores the raw-pointer representation context gate:
+    /// the caller keeps a tagged value, the route rechecks its live class and
+    /// shape, and the clone binds its own tagged shadow slot. Only the proof
+    /// that no external alias can reshape the argument is consumed here.
+    ///
+    /// The guard may be elided in exactly one case: the caller already holds
+    /// the BROAD `Ptr<Shape>` representation fact, which by construction was
+    /// proven in a barrier-free module (rule 5) with full containment (rules
+    /// 1-4). There the caller is itself licensed to read this object's
+    /// declared fields at fixed offsets without a guard, so the clone's reads
+    /// add no exposure and the guard is tautological.
+    ///
+    /// The route-only fact is weaker — it is collected with rule 5's
+    /// module-wide barrier kill BYPASSED — so it must never license guard-free
+    /// field access, and its route keeps the guard plus the generic fallback.
+    pub(crate) fn ptr_shape_argument_route_fact(
+        &self,
+        e: &perry_hir::Expr,
+    ) -> Option<(&crate::collectors::PtrShapeLocal, bool)> {
+        match e {
+            // Ordinary native facts are containment proofs. A selected clone
+            // parameter inherits the class fact from its caller's guard, but
+            // forwarded clone parameters retain an explicit guard/fallback at
+            // the next route because their fact originates at a dynamic
+            // caller boundary.
+            perry_hir::Expr::LocalGet(id) => self
+                .proven_shape_params
+                .get(id)
+                .map(|fact| (fact, true))
+                .or_else(|| {
+                    self.native_facts
+                        .shape_proven_ptr_local(*id)
+                        .map(|fact| (fact, false))
+                })
+                .or_else(|| {
+                    self.native_facts
+                        .guarded_argument_route_local(*id)
+                        .map(|fact| (fact, true))
+                }),
+            // `proven_this` may come from a runtime receiver guard rather than
+            // containment, so it cannot justify an argument clone route.
             _ => None,
         }
     }
@@ -2103,7 +2323,7 @@ impl<'a> FnCtx<'a> {
         e: &perry_hir::Expr,
     ) -> Option<&crate::collectors::PtrShapeLocal> {
         match e {
-            perry_hir::Expr::LocalGet(id) => self.native_facts.shape_proven_ptr_local(*id),
+            perry_hir::Expr::LocalGet(id) => self.ptr_shape_local_fact(*id),
             perry_hir::Expr::This => self.proven_this.as_ref(),
             _ => None,
         }
@@ -2278,6 +2498,7 @@ pub(crate) use masked_window::masked_window_fact_for_index;
 mod computed_store_rooting_tests;
 mod index_set;
 mod index_set_guarded;
+mod index_set_packed_loop;
 mod index_set_typed_array;
 mod instance_misc1;
 mod member_update;
@@ -3465,6 +3686,26 @@ pub(crate) fn lower_expr_value(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<Optio
                 "LocalGet",
                 Some(*id),
                 "ordinary_expr_value.local_i1",
+                &lowered,
+                None,
+                None,
+                None,
+                false,
+                false,
+                Vec::new(),
+            );
+            Ok(Some(lowered))
+        }
+        Expr::LocalGet(id)
+            if crate::stmt::stable_packed_loop::u32_view_derived_local_slot(ctx, *id).is_some() =>
+        {
+            let slot = crate::stmt::stable_packed_loop::u32_view_derived_local_slot(ctx, *id)
+                .expect("guarded derived-u32 slot");
+            let lowered = LoweredValue::u32(ctx.block().load(I32, &slot));
+            ctx.record_lowered_value(
+                "LocalGet",
+                Some(*id),
+                "stable_packed_u32_view_derived_local",
                 &lowered,
                 None,
                 None,

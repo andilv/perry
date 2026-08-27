@@ -22,6 +22,10 @@
 
 use perry_ffi::{alloc_string, nanbox_string_bits, ArrayHeader, JsValue, StringHeader};
 use std::collections::HashSet;
+use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use tokio::io::AsyncWriteExt;
 
 use crate::statics;
 use crate::string_from_header_i64;
@@ -52,6 +56,47 @@ fn nanbox_bool(b: bool) -> f64 {
 
 fn nanbox_undefined() -> f64 {
     f64::from_bits(TAG_UNDEFINED_BITS)
+}
+
+/// Main-thread custody for write/end callbacks awaiting socket-task I/O.
+pub(crate) fn socket_completions() -> &'static Mutex<std::collections::HashMap<u64, (i64, i64)>> {
+    static COMPLETIONS: OnceLock<Mutex<std::collections::HashMap<u64, (i64, i64)>>> =
+        OnceLock::new();
+    COMPLETIONS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+pub(crate) unsafe fn dispatch_socket_completion(completion: u64, error: Option<String>) {
+    let callback = (completion != 0)
+        .then(|| socket_completions().lock().unwrap().remove(&completion))
+        .flatten()
+        .map(|(_, callback)| callback)
+        .unwrap_or(0);
+    if callback == 0 {
+        return;
+    }
+    let mut frame = crate::dispatch_custody::DispatchFrame::park(vec![callback]);
+    if let Some(message) = error {
+        frame.set_payload(crate::build_error_object(&message).to_bits());
+        let _ = perry_ffi::JsClosure::from_raw(frame.cb(0) as *const perry_ffi::RawClosureHeader)
+            .call1(f64::from_bits(frame.payload_bits()));
+    } else {
+        let _ = perry_ffi::JsClosure::from_raw(frame.cb(0) as *const perry_ffi::RawClosureHeader)
+            .call0();
+    }
+}
+
+pub(crate) fn drop_socket_completions(socket_id: i64) {
+    let completions = socket_completions()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|(completion, (owner, _))| (*owner == socket_id).then_some(*completion))
+        .collect::<Vec<_>>();
+    for completion in completions {
+        unsafe {
+            dispatch_socket_completion(completion, Some("Socket is closed".to_string()));
+        }
+    }
 }
 
 /// NaN-box a freshly allocated runtime string as an `f64` JS value.
@@ -131,14 +176,16 @@ pub unsafe extern "C" fn js_net_socket_get_bytes_read(handle: i64) -> f64 {
     with_socket(handle, 0u64, |s| s.bytes_read) as f64
 }
 
-/// `socket.bytesWritten` — total bytes queued for the socket.
+/// `socket.bytesWritten` — bytes dispatched to the transport or still queued.
 ///
 /// # Safety
 ///
 /// See [`js_net_socket_get_pending`].
 #[no_mangle]
 pub unsafe extern "C" fn js_net_socket_get_bytes_written(handle: i64) -> f64 {
-    with_socket(handle, 0u64, |s| s.bytes_written) as f64
+    with_socket(handle, 0u64, |s| {
+        s.bytes_written.saturating_add(s.bytes_queued)
+    }) as f64
 }
 
 /// `socket.timeout` — the value set via `setTimeout(ms)`, or `undefined`.
@@ -295,11 +342,64 @@ pub unsafe extern "C" fn js_ext_net_socket_write(handle: i64, chunk_bits: i64) {
         Some(b) => b,
         None => return,
     };
+    enqueue_socket_write(handle, bytes, 0);
+}
+
+fn enqueue_socket_write(handle: i64, bytes: Vec<u8>, completion: u64) {
     let mut sockets = statics::sockets().lock().unwrap();
-    if let Some(s) = sockets.get_mut(&handle) {
-        s.bytes_written = s.bytes_written.saturating_add(bytes.len() as u64);
-        let _ = s.cmd_tx.send(crate::SocketCommand::Write(bytes));
+    let failure = if let Some(s) = sockets.get_mut(&handle) {
+        let byte_len = bytes.len() as u64;
+        if s.cmd_tx
+            .send(crate::SocketCommand::Write(bytes, completion))
+            .is_err()
+        {
+            Some("Socket write failed")
+        } else {
+            s.bytes_queued = s.bytes_queued.saturating_add(byte_len);
+            None
+        }
+    } else {
+        Some("Socket is closed")
+    };
+    drop(sockets);
+    if completion != 0 {
+        if let Some(message) = failure {
+            unsafe {
+                dispatch_socket_completion(completion, Some(message.to_string()));
+            }
+        }
     }
+}
+
+fn record_socket_write_progress(handle: i64, written: usize) {
+    if written == 0 {
+        return;
+    }
+    if let Some(socket) = statics::sockets().lock().unwrap().get_mut(&handle) {
+        let written = written as u64;
+        socket.bytes_queued = socket.bytes_queued.saturating_sub(written);
+        socket.bytes_written = socket.bytes_written.saturating_add(written);
+    }
+}
+
+pub(crate) async fn write_socket_bytes(
+    transport: &mut crate::Transport,
+    handle: i64,
+    bytes: &[u8],
+) -> io::Result<()> {
+    let mut written = 0;
+    while written < bytes.len() {
+        let count = transport.write(&bytes[written..]).await?;
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write socket bytes",
+            ));
+        }
+        written += count;
+        record_socket_write_progress(handle, count);
+    }
+    Ok(())
 }
 
 /// `socket.write(chunk)` under the name the static NATIVE_MODULE_TABLE path
@@ -313,6 +413,58 @@ pub unsafe extern "C" fn js_ext_net_socket_write(handle: i64, chunk_bits: i64) {
 #[no_mangle]
 pub unsafe extern "C" fn js_net_socket_write(handle: i64, chunk_bits: i64) {
     js_ext_net_socket_write(handle, chunk_bits);
+}
+
+unsafe fn socket_completion(values: [f64; 3]) -> i64 {
+    extern "C" {
+        fn js_value_is_closure(value_bits: i64) -> i32;
+    }
+    values
+        .into_iter()
+        .find(|value| js_value_is_closure(value.to_bits() as i64) != 0)
+        .map(|callback| {
+            const POINTER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+            (callback.to_bits() & POINTER_MASK) as i64
+        })
+        .unwrap_or(0)
+}
+
+fn register_socket_completion(handle: i64, callback: i64) -> u64 {
+    static NEXT_COMPLETION: AtomicU64 = AtomicU64::new(1);
+    if callback == 0 {
+        return 0;
+    }
+    let token = NEXT_COMPLETION.fetch_add(1, Ordering::Relaxed);
+    socket_completions()
+        .lock()
+        .unwrap()
+        .insert(token, (handle, callback));
+    token
+}
+
+/// Full Node overload for `socket.write(chunk[, encoding][, callback])`.
+#[no_mangle]
+pub unsafe extern "C" fn js_ext_net_socket_write3(
+    handle: i64,
+    chunk: f64,
+    encoding_or_callback: f64,
+    callback: f64,
+) {
+    let roots = perry_ffi::TransientRootScope::enter();
+    let callback = roots.root_nanbox(callback);
+    let encoding_or_callback = roots.root_nanbox(encoding_or_callback);
+    let completion = socket_completion([chunk, encoding_or_callback.get(), callback.get()]);
+    let completion = register_socket_completion(handle, completion);
+    let Some(bytes) = crate::jsvalue_to_socket_bytes(chunk) else {
+        if completion != 0 {
+            dispatch_socket_completion(
+                completion,
+                Some("Invalid data passed to socket.write".to_string()),
+            );
+        }
+        return;
+    };
+    enqueue_socket_write(handle, bytes, completion);
 }
 
 /// `socket.end([data])` — optionally write a final chunk, then half-close the
@@ -330,15 +482,31 @@ pub unsafe extern "C" fn js_net_socket_write(handle: i64, chunk_bits: i64) {
 /// must reference live runtime allocations.
 #[no_mangle]
 pub unsafe extern "C" fn js_ext_net_socket_end(handle: i64, chunk_bits: i64) {
+    // Decode the GC-managed input before provider init can run user hooks and
+    // move it. Only owned bytes survive across that callback boundary.
+    let final_bytes = crate::jsvalue_to_socket_bytes(f64::from_bits(chunk_bits as u64));
+    let trigger = statics::sockets().lock().ok().and_then(|sockets| {
+        sockets
+            .get(&handle)
+            .and_then(|socket| (socket.shutdown_async_id == 0).then_some(socket.tcp_async_id))
+    });
+    if let Some(trigger) = trigger {
+        let async_id = crate::init_provider_with_trigger(b"SHUTDOWNWRAP", trigger);
+        if let Some(socket) = statics::sockets().lock().unwrap().get_mut(&handle) {
+            socket.shutdown_async_id = async_id;
+        }
+    }
     let mut sockets = statics::sockets().lock().unwrap();
     if let Some(s) = sockets.get_mut(&handle) {
-        if let Some(bytes) = crate::jsvalue_to_socket_bytes(f64::from_bits(chunk_bits as u64)) {
+        if let Some(bytes) = final_bytes {
             if !bytes.is_empty() {
-                s.bytes_written = s.bytes_written.saturating_add(bytes.len() as u64);
-                let _ = s.cmd_tx.send(crate::SocketCommand::Write(bytes));
+                let byte_len = bytes.len() as u64;
+                if s.cmd_tx.send(crate::SocketCommand::Write(bytes, 0)).is_ok() {
+                    s.bytes_queued = s.bytes_queued.saturating_add(byte_len);
+                }
             }
         }
-        let _ = s.cmd_tx.send(crate::SocketCommand::End);
+        let _ = s.cmd_tx.send(crate::SocketCommand::End(0));
     }
 }
 
@@ -351,6 +519,61 @@ pub unsafe extern "C" fn js_ext_net_socket_end(handle: i64, chunk_bits: i64) {
 #[no_mangle]
 pub unsafe extern "C" fn js_net_socket_end(handle: i64, chunk_bits: i64) {
     js_ext_net_socket_end(handle, chunk_bits);
+}
+
+/// Full Node overload for `socket.end([data][, encoding][, callback])`.
+#[no_mangle]
+pub unsafe extern "C" fn js_ext_net_socket_end3(
+    handle: i64,
+    chunk_or_callback: f64,
+    encoding_or_callback: f64,
+    callback: f64,
+) {
+    let roots = perry_ffi::TransientRootScope::enter();
+    let chunk_or_callback = roots.root_nanbox(chunk_or_callback);
+    let encoding_or_callback = roots.root_nanbox(encoding_or_callback);
+    let callback = roots.root_nanbox(callback);
+    let completion = socket_completion([
+        chunk_or_callback.get(),
+        encoding_or_callback.get(),
+        callback.get(),
+    ]);
+    let completion = register_socket_completion(handle, completion);
+    let final_bytes = crate::jsvalue_to_socket_bytes(chunk_or_callback.get());
+    let trigger = statics::sockets().lock().ok().and_then(|sockets| {
+        sockets
+            .get(&handle)
+            .and_then(|socket| (socket.shutdown_async_id == 0).then_some(socket.tcp_async_id))
+    });
+    if let Some(trigger) = trigger {
+        let async_id = crate::init_provider_with_trigger(b"SHUTDOWNWRAP", trigger);
+        if let Some(socket) = statics::sockets().lock().unwrap().get_mut(&handle) {
+            socket.shutdown_async_id = async_id;
+        }
+    }
+    let mut sockets = statics::sockets().lock().unwrap();
+    if let Some(socket) = sockets.get_mut(&handle) {
+        if let Some(bytes) = final_bytes.filter(|bytes| !bytes.is_empty()) {
+            let byte_len = bytes.len() as u64;
+            if socket
+                .cmd_tx
+                .send(crate::SocketCommand::Write(bytes, 0))
+                .is_ok()
+            {
+                socket.bytes_queued = socket.bytes_queued.saturating_add(byte_len);
+            }
+        }
+        if socket
+            .cmd_tx
+            .send(crate::SocketCommand::End(completion))
+            .is_err()
+            && completion != 0
+        {
+            socket_completions().lock().unwrap().remove(&completion);
+        }
+    } else if completion != 0 {
+        socket_completions().lock().unwrap().remove(&completion);
+    }
 }
 
 /// `socket.destroy()` — hard close. Flags the handle destroyed (so
@@ -443,6 +666,7 @@ fn register_listener_with_flag(handle: i64, event: String, cb: i64, once: bool) 
     if cb == 0 {
         return;
     }
+    let releases_pending_data = event == "data";
     {
         let mut listeners = statics::listeners().lock().unwrap();
         listeners
@@ -460,6 +684,9 @@ fn register_listener_with_flag(handle: i64, event: String, cb: i64, once: bool) 
             .entry(event)
             .or_default()
             .insert(cb);
+    }
+    if releases_pending_data {
+        crate::server_state::release_pending_server_data(handle);
     }
 }
 
@@ -1014,5 +1241,40 @@ mod tests {
         assert!(!json.contains("\"orphan\""));
 
         reset_handle(handle);
+    }
+
+    #[test]
+    fn rejected_write_does_not_increase_bytes_written() {
+        let handle = -91_238;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        statics::sockets()
+            .lock()
+            .unwrap()
+            .insert(handle, crate::SocketState::for_test(tx));
+
+        enqueue_socket_write(handle, vec![1, 2, 3], 0);
+        assert_eq!(unsafe { js_net_socket_get_bytes_written(handle) }, 0.0);
+
+        statics::sockets().lock().unwrap().remove(&handle);
+    }
+
+    #[test]
+    fn bytes_written_includes_queue_then_keeps_only_dispatched_progress_on_close() {
+        let handle = -91_239;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        statics::sockets()
+            .lock()
+            .unwrap()
+            .insert(handle, crate::SocketState::for_test(tx));
+
+        enqueue_socket_write(handle, vec![1, 2, 3, 4], 0);
+        assert_eq!(unsafe { js_net_socket_get_bytes_written(handle) }, 4.0);
+        record_socket_write_progress(handle, 2);
+        assert_eq!(unsafe { js_net_socket_get_bytes_written(handle) }, 4.0);
+        crate::server_state::mark_socket_closed(handle);
+        assert_eq!(unsafe { js_net_socket_get_bytes_written(handle) }, 2.0);
+
+        statics::sockets().lock().unwrap().remove(&handle);
     }
 }

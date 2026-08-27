@@ -6165,6 +6165,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "perry-ext-qs"
+version = "0.5.1519"
+dependencies = [
+ "perry-ffi",
+ "perry-runtime",
+ "serde_json",
+]
+
+[[package]]
 name = "perry-ext-ratelimit"
 version = "0.5.1519"
 dependencies = [
@@ -6180,6 +6189,7 @@ dependencies = [
  "image",
  "kamadak-exif",
  "perry-ffi",
+ "perry-runtime",
 ]
 
 [[package]]
@@ -6307,6 +6317,7 @@ dependencies = [
  "encoding_rs",
  "fancy-regex",
  "gimli",
+ "hex",
  "hickory-proto",
  "hostname",
  "icu_calendar",
@@ -6331,6 +6342,7 @@ dependencies = [
  "ryu",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "socket2",
  "taffy",
  "temporal_rs",

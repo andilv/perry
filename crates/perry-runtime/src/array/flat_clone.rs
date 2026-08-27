@@ -53,6 +53,8 @@ unsafe fn receiver_gc_type(ptr: *const ArrayHeader) -> u8 {
 ///  - `array_proto_iterator_modified`: user code replaced or deleted
 ///    `Array.prototype[Symbol.iterator]`, so the builtin walk is no longer what
 ///    a spread must run.
+///  - `object_static_prototype`: `Object.setPrototypeOf(array, custom)` can
+///    replace the inherited iterator without touching Array.prototype.
 ///  - `has_own_symbol_property`: the instance carries its OWN `[Symbol.iterator]`,
 ///    which shadows the prototype's. Existence is probed WITHOUT invoking an
 ///    accessor, so falling through to the slow path calls a user getter exactly
@@ -86,15 +88,68 @@ pub(crate) fn dense_spread_source(value: f64) -> Option<*const ArrayHeader> {
     if crate::array::array_proto_iterator_modified() {
         return None;
     }
-    let iter_sym = crate::symbol::well_known_symbol("iterator");
-    if iter_sym.is_null() {
+    if crate::object::prototype_chain::object_static_prototype(arr as usize).is_some() {
         return None;
     }
-    let sym_value = f64::from_bits(crate::value::JSValue::pointer(iter_sym as *const u8).bits());
-    if unsafe { crate::symbol::has_own_symbol_property(value, sym_value) } {
-        return None;
+    // Do not materialize Symbol.iterator from a guard. If it is not cached,
+    // user code cannot have installed it as an own key; if it is cached, the
+    // side-table existence probe below is non-allocating and never invokes an
+    // accessor. This keeps dense_spread_source usable in call-site guards that
+    // hold evaluated operands in SSA registers.
+    let iter_sym = crate::symbol::well_known_symbol_if_cached("iterator");
+    if !iter_sym.is_null() {
+        let sym_value =
+            f64::from_bits(crate::value::JSValue::pointer(iter_sym as *const u8).bits());
+        if unsafe { crate::symbol::has_own_symbol_property(value, sym_value) } {
+            return None;
+        }
     }
     Some(arr)
+}
+
+/// Copy a short, exact packed-array spread tail into caller-owned storage.
+///
+/// Returns the element count (`0..=4`) on success and `-1` when spread must use
+/// the generic iterator path. In addition to [`dense_spread_source`]'s exact
+/// ordinary-array proof, this rejects holes: the general dense-copy path may
+/// normalize a hole to `undefined`, while a direct-call arm promises that each
+/// value came from a present packed slot.
+///
+/// This helper is deliberately non-allocating. Generated code evaluates and
+/// roots `receiver`, fixed arguments, and the spread expression before calling
+/// it, then uses the copied values only when the returned arity is nonnegative.
+#[no_mangle]
+pub unsafe extern "C" fn js_short_packed_spread_values(value: f64, out: *mut f64) -> i32 {
+    // Call/new spread lowering has historically routed nullish sources through
+    // `js_array_like_to_array`, where they contribute no arguments. Preserve
+    // that established Perry behaviour in the guarded path as well: otherwise
+    // taking the optimization would turn an accepted call into a TypeError in
+    // the fallback materializer. This also matches old TypeScript's emitted
+    // `[fixed].concat(optionalArgs)` shape used by perform-ecs@0.7.8.
+    if matches!(
+        value.to_bits(),
+        crate::value::TAG_UNDEFINED | crate::value::TAG_NULL
+    ) {
+        return 0;
+    }
+    let Some(arr) = dense_spread_source(value) else {
+        return -1;
+    };
+    let len = (*arr).length as usize;
+    if len > 4 || (len != 0 && out.is_null()) {
+        return -1;
+    }
+    let elements = (arr as *const u8).add(std::mem::size_of::<ArrayHeader>()) as *const u64;
+    for index in 0..len {
+        let bits = std::ptr::read(elements.add(index));
+        if bits == crate::value::TAG_HOLE {
+            return -1;
+        }
+        // GC_STORE_AUDIT(STACK): caller-owned generated stack storage; the
+        // rooted spread operand keeps copied heap values live during the guard.
+        std::ptr::write(out.add(index), f64::from_bits(bits));
+    }
+    len as i32
 }
 
 /// Element-copy an array [`dense_spread_source`] has already proven ordinary.
@@ -225,11 +280,29 @@ pub extern "C" fn js_array_flat_depth(arr: *const ArrayHeader, depth: f64) -> *m
     } else {
         depth as u32
     };
-    unsafe {
-        let mut result = js_array_alloc(0);
-        result = js_array_flat_into(result, arr, levels);
-        result
-    }
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let arr_handle = scope.root_raw_mut_ptr(arr as *mut ArrayHeader);
+    let result = js_array_alloc(0);
+    unsafe { js_array_flat_into(result, arr_handle.get_raw_mut_ptr::<ArrayHeader>(), levels) }
+}
+
+/// Generic `Array.prototype.flat.call(receiver, depth?)` entry. The receiver is
+/// first converted with ToObject/LengthOfArrayLike while preserving holes, then
+/// flattened as an Array. `undefined` (whether omitted or explicitly supplied)
+/// selects the specification default depth of one.
+#[no_mangle]
+pub extern "C" fn js_arraylike_flat(receiver: f64, depth: f64) -> f64 {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let receiver_handle = scope.root_nanbox_f64(receiver);
+    let source = js_array_from_arraylike_holey_value(receiver_handle.get_nanbox_f64());
+    let source_handle = scope.root_raw_mut_ptr(source);
+    let depth = if depth.to_bits() == crate::value::TAG_UNDEFINED {
+        1.0
+    } else {
+        crate::builtins::js_number_coerce(depth)
+    };
+    let result = js_array_flat_depth(source_handle.get_raw_mut_ptr::<ArrayHeader>(), depth);
+    f64::from_bits(crate::value::JSValue::pointer(result as *const u8).bits())
 }
 
 /// Recursive worker for `js_array_flat_depth`. Returns the (possibly
@@ -240,24 +313,35 @@ unsafe fn js_array_flat_into(
     src: *const ArrayHeader,
     depth_left: u32,
 ) -> *mut ArrayHeader {
-    let len = (*src).length as usize;
-    let elements = (src as *const u8).add(std::mem::size_of::<ArrayHeader>()) as *const f64;
+    // A push into `result` can allocate and move `src`; keep the source rooted
+    // and derive its live address for every observable indexed operation.
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let src_handle = scope.root_raw_mut_ptr(src as *mut ArrayHeader);
+    let len = (*src_handle.get_raw_mut_ptr::<ArrayHeader>()).length as usize;
+    let exotic = crate::array::array_iteration_is_exotic(src);
     for i in 0..len {
-        let element = *elements.add(i);
-        // Per ECMAScript FlattenIntoArray, holes are absent (HasProperty is
-        // false) and are skipped, not copied as `null`/`undefined`.
-        if element.to_bits() == crate::value::TAG_HOLE {
-            continue;
-        }
+        let live_src = src_handle.get_raw_mut_ptr::<ArrayHeader>();
+        let element = if exotic {
+            if !crate::array::array_spec_has_index(live_src, i as u32) {
+                continue;
+            }
+            crate::array::array_spec_get(live_src, i as u32)
+        } else {
+            let elements =
+                (live_src as *const u8).add(std::mem::size_of::<ArrayHeader>()) as *const f64;
+            let element = *elements.add(i);
+            // Per FlattenIntoArray, holes are absent and skipped.
+            if element.to_bits() == crate::value::TAG_HOLE {
+                continue;
+            }
+            element
+        };
         let mut pushed = false;
         if depth_left > 0 {
             let sub_arr = flattenable_array_ptr(element);
             if !sub_arr.is_null() {
-                let sub_len = (*sub_arr).length as usize;
-                if sub_len <= 1_000_000 {
-                    result = js_array_flat_into(result, sub_arr, depth_left - 1);
-                    pushed = true;
-                }
+                result = js_array_flat_into(result, sub_arr, depth_left - 1);
+                pushed = true;
             }
         }
         if !pushed {

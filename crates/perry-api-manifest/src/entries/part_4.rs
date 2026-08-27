@@ -838,6 +838,7 @@ pub(crate) const API_MANIFEST_PART_4: &[ApiEntry] = &[
     method("http", "ref", true, Some("HttpServer")),
     method("http", "unref", true, Some("HttpServer")),
     method("http", "on", true, Some("IncomingMessage")),
+    method("http", "once", true, Some("IncomingMessage")),
     method("http", "addListener", true, Some("IncomingMessage")),
     method("http", "pause", true, Some("IncomingMessage")),
     method("http", "resume", true, Some("IncomingMessage")),
@@ -856,6 +857,7 @@ pub(crate) const API_MANIFEST_PART_4: &[ApiEntry] = &[
     // method, so the manifest-consistency drift guard requires a row
     // here even though the test collapses class_filter variants.
     method("http", "setTimeout", true, Some("ClientRequest")),
+    method("http", "once", true, Some("ClientRequest")),
     method("http", "listenerCount", true, Some("ClientRequest")),
     method("http", "setHeader", true, Some("ClientRequest")),
     method("http", "getHeader", true, Some("ClientRequest")),
@@ -1112,4 +1114,23 @@ pub(crate) const API_MANIFEST_PART_4: &[ApiEntry] = &[
     property("bun", "stdin"),
     property("bun", "stdout"),
     property("bun", "stderr"),
+    // --- qs (issue #8751) ---
+    // Native nested query-string codec. This keeps Stripe's request encoder
+    // off qs' legacy get-intrinsic/ES-shims dependency chain.
+    method_sig(
+        "qs",
+        "stringify",
+        false,
+        None,
+        &[p_any("value"), p_any("options")],
+        TypeSpec::String,
+    ),
+    method_sig(
+        "qs",
+        "parse",
+        false,
+        None,
+        &[p_str("input"), p_any("options")],
+        TypeSpec::Any,
+    ),
 ];

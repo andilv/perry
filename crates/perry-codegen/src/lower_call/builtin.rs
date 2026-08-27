@@ -133,6 +133,47 @@ pub(super) fn lower_builtin_new<'a>(
         }
     }
     match class_name {
+        "Resolver"
+            if import_src.is_some_and(|source| {
+                matches!(
+                    source.strip_prefix("node:").unwrap_or(source),
+                    "dns" | "dns/promises"
+                )
+            }) =>
+        {
+            // `new Resolver()` is a constructor expression, so it bypasses
+            // the native-module call table used by `dns.Resolver()`. Route it
+            // to the same runtime constructor and preserve evaluation of any
+            // superfluous arguments.
+            let options_idx = adopt_optional_arg(ctx, args, 0, group)?;
+            for arg in args.iter().skip(1) {
+                let _ = lower_expr(ctx, arg)?;
+            }
+            let options = match options_idx {
+                Some(index) => group.reread(ctx, index)?,
+                None => double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)),
+            };
+            let options = group.adopt_emitted(ctx, crate::rooting::Repr::Boxed, &options, true);
+            let runtime = if import_src.is_some_and(|source| {
+                source.strip_prefix("node:").unwrap_or(source) == "dns/promises"
+            }) {
+                "js_dns_promises_resolver_new"
+            } else {
+                "js_dns_resolver_new"
+            };
+            ctx.pending_declares
+                .push((runtime.to_string(), DOUBLE, vec![I64]));
+            let zero = "0".to_string();
+            let args_array = group.begin_array(ctx, &zero);
+            let options = group.reread_emitted(ctx, options);
+            group.push_array(ctx, args_array, &options);
+            let args_array = group.read_array(ctx, args_array);
+            Ok(Some(ctx.block().call(
+                DOUBLE,
+                runtime,
+                &[(I64, &args_array)],
+            )))
+        }
         "Utf8Stream"
             if import_src
                 .map(|source| source.strip_prefix("node:").unwrap_or(source) == "fs")

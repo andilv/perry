@@ -641,6 +641,13 @@ pub struct CompilationContext {
     pub cache_dir: PathBuf,
     /// External native libraries discovered from package dependencies
     pub native_libraries: Vec<NativeLibraryManifest>,
+    /// Exact host-owned package names permitted to execute prebuilt Node-API
+    /// addons. Unlike the older compile/native-library policy lists this set
+    /// deliberately has no wildcard syntax.
+    pub native_addon_packages: BTreeSet<String>,
+    /// Approved `.node` entries reached by the compile graph, keyed by their
+    /// relocatable package-relative logical id.
+    pub native_addons: BTreeMap<String, NativeAddonModule>,
     /// Package aliases: maps npm package name → replacement package name (from perry.packageAliases)
     pub package_aliases: HashMap<String, String>,
     /// Packages to compile natively instead of routing to V8 (from perry.compilePackages)
@@ -739,6 +746,10 @@ pub struct CompilationContext {
     /// (e.g. "mysql2", "fastify", "ws"). Used by `--minimal-stdlib` to
     /// compute the smallest perry-stdlib feature set that satisfies them.
     pub native_module_imports: BTreeSet<String>,
+    /// Whether a dynamic import can resolve to a JavaScript `data:` URL.
+    /// The runtime evaluates these modules through the dyn-eval interpreter,
+    /// so auto-optimized archives must retain that otherwise optional feature.
+    pub uses_data_url_dynamic_import: bool,
     /// Whether any TS module calls global `fetch()` (which routes to
     /// reqwest in perry-stdlib's http-client feature).
     pub uses_fetch: bool,
@@ -1159,6 +1170,8 @@ impl CompilationContext {
             cache_dir: super::object_cache::resolve_cache_dir(&project_root, None),
             project_root,
             native_libraries: Vec::new(),
+            native_addon_packages: BTreeSet::new(),
+            native_addons: BTreeMap::new(),
             package_aliases: HashMap::new(),
             compile_packages: HashSet::new(),
             auto_skipped_node_addon_packages: HashSet::new(),
@@ -1182,6 +1195,7 @@ impl CompilationContext {
             needs_geisterhand: false,
             geisterhand_port: 7676,
             native_module_imports: BTreeSet::new(),
+            uses_data_url_dynamic_import: false,
             uses_fetch: false,
             uses_crypto_builtins: false,
             uses_zlib_brotli: false,
@@ -1249,6 +1263,20 @@ impl CompilationContext {
             debug_symbols: false,
         }
     }
+}
+
+/// A prebuilt Node-API binary selected by the ordinary module resolver.
+/// `source_path` and `package_dir` are compile-time inputs only; generated
+/// code and sidecar manifests use `logical_id` and `entry_relative` so build
+/// machine paths never enter an artifact or cache key.
+#[derive(Debug, Clone)]
+pub struct NativeAddonModule {
+    pub logical_id: String,
+    pub package: String,
+    pub version: String,
+    pub source_path: PathBuf,
+    pub package_dir: PathBuf,
+    pub entry_relative: PathBuf,
 }
 
 /// External native library manifest parsed from package.json `perry.nativeLibrary` field

@@ -127,14 +127,22 @@ pub extern "C" fn js_worker_threads_process_pending() -> i32 {
                 processed += 1;
             }
             WorkerEvent::Exit(worker_id, code) => {
-                let terminate_promise =
+                let (terminate_promise, async_resources) =
                     if let Some(worker) = WORKERS.lock().unwrap().get_mut(&worker_id) {
                         worker.alive = false;
-                        worker.terminate_promise.take()
+                        (
+                            worker.terminate_promise.take(),
+                            Some(worker.async_resources),
+                        )
                     } else {
-                        None
+                        (None, None)
                     };
                 dispatch_worker_event(worker_id, "exit", Some(code as f64));
+                if let Some(async_resources) = async_resources {
+                    for resource in async_resources {
+                        perry_runtime::async_hooks::destroy(resource.async_id);
+                    }
+                }
                 if let Some(promise) = terminate_promise {
                     super::async_shim::queue_promise_resolution(
                         promise,
@@ -205,7 +213,11 @@ pub extern "C" fn js_worker_threads_has_pending() -> i32 {
 fn dispatch_worker_event(worker_id: u64, event: &str, arg: Option<f64>) {
     // Collect (callback, web_event) pairs, then invoke OUTSIDE the WORKERS lock —
     // a listener may re-enter postMessage / terminate, which needs the lock again.
-    let (object_bits, callbacks): (u64, Vec<(u64, bool)>) = {
+    let (object_bits, callbacks, async_resources): (
+        u64,
+        Vec<(u64, bool)>,
+        [perry_runtime::async_hooks::AsyncResourceIds; 3],
+    ) = {
         let mut workers = WORKERS.lock().unwrap();
         let Some(worker) = workers.get_mut(&worker_id) else {
             return;
@@ -222,7 +234,7 @@ fn dispatch_worker_event(worker_id: u64, event: &str, arg: Option<f64>) {
                 callbacks
             })
             .unwrap_or_default();
-        (worker.object_bits, callbacks)
+        (worker.object_bits, callbacks, worker.async_resources)
     };
 
     // Web-style `addEventListener` listeners receive a `MessageEvent` wrapper
@@ -244,49 +256,58 @@ fn dispatch_worker_event(worker_id: u64, event: &str, arg: Option<f64>) {
         })
         .collect::<Vec<_>>();
     let arg_handle = arg.map(|a| scope.root_nanbox_f64(a));
-    let property_name = match event {
-        "message" => Some("onmessage"),
-        "error" => Some("onerror"),
-        "messageerror" => Some("onmessageerror"),
-        _ => None,
+    let resource = match event {
+        "online" => async_resources[1],
+        "message" | "messageerror" => async_resources[2],
+        _ => async_resources[0],
     };
-    let property_handler = property_name
-        .and_then(|name| object_event_handler(object_h.get_nanbox_f64().to_bits(), name))
-        .map(|bits| scope.root_nanbox_f64(f64::from_bits(bits)));
-    let needs_event = property_handler.is_some() || callbacks.iter().any(|(_, web)| *web);
-    let event_handle = if needs_event {
-        let data = (event == "message")
-            .then(|| arg_handle.as_ref().map(|h| h.get_nanbox_f64()))
-            .flatten();
-        let ev = event_object(event, object_h.get_nanbox_f64().to_bits(), data);
-        Some(scope.root_nanbox_f64(ev))
-    } else {
-        None
-    };
-
-    if let (Some(callback_h), Some(event_h)) = (property_handler, event_handle.as_ref()) {
-        call_callback1(
-            callback_h.get_nanbox_f64().to_bits(),
-            object_h.get_nanbox_f64().to_bits(),
-            event_h.get_nanbox_f64(),
-        );
-    }
-
-    for (callback_h, web_event) in callbacks {
-        let closure_ptr = perry_runtime::value::js_nanbox_get_pointer(callback_h.get_nanbox_f64());
-        if closure_ptr == 0 {
-            continue;
-        }
-        let closure = closure_ptr as *const ClosureHeader;
-        let call_arg = if web_event {
-            event_handle.as_ref().map(|h| h.get_nanbox_f64())
-        } else {
-            arg_handle.as_ref().map(|h| h.get_nanbox_f64())
+    perry_runtime::async_hooks::run_resource_scope_catching(resource, || {
+        let property_name = match event {
+            "message" => Some("onmessage"),
+            "error" => Some("onerror"),
+            "messageerror" => Some("onmessageerror"),
+            _ => None,
         };
-        if let Some(arg) = call_arg {
-            perry_runtime::closure::js_closure_call1(closure, arg);
+        let property_handler = property_name
+            .and_then(|name| object_event_handler(object_h.get_nanbox_f64().to_bits(), name))
+            .map(|bits| scope.root_nanbox_f64(f64::from_bits(bits)));
+        let needs_event = property_handler.is_some() || callbacks.iter().any(|(_, web)| *web);
+        let event_handle = if needs_event {
+            let data = (event == "message")
+                .then(|| arg_handle.as_ref().map(|h| h.get_nanbox_f64()))
+                .flatten();
+            let ev = event_object(event, object_h.get_nanbox_f64().to_bits(), data);
+            Some(scope.root_nanbox_f64(ev))
         } else {
-            perry_runtime::closure::js_closure_call0(closure);
+            None
+        };
+
+        if let (Some(callback_h), Some(event_h)) = (property_handler, event_handle.as_ref()) {
+            call_callback1(
+                callback_h.get_nanbox_f64().to_bits(),
+                object_h.get_nanbox_f64().to_bits(),
+                event_h.get_nanbox_f64(),
+            );
         }
-    }
+
+        for (callback_h, web_event) in callbacks {
+            let closure_ptr =
+                perry_runtime::value::js_nanbox_get_pointer(callback_h.get_nanbox_f64());
+            if closure_ptr == 0 {
+                continue;
+            }
+            let closure = closure_ptr as *const ClosureHeader;
+            let call_arg = if web_event {
+                event_handle.as_ref().map(|h| h.get_nanbox_f64())
+            } else {
+                arg_handle.as_ref().map(|h| h.get_nanbox_f64())
+            };
+            if let Some(arg) = call_arg {
+                perry_runtime::closure::js_closure_call1(closure, arg);
+            } else {
+                perry_runtime::closure::js_closure_call0(closure);
+            }
+        }
+        js_undefined()
+    });
 }

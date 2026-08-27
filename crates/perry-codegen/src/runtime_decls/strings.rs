@@ -227,6 +227,16 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
         VOID,
         &[PTR, PTR, I32, I64],
     );
+    module.declare_function(
+        "js_register_closure_versioned_loop_direct",
+        VOID,
+        &[PTR, PTR, I32, I64],
+    );
+    module.declare_function(
+        "js_closure_resolve_versioned_loop_direct_call",
+        PTR,
+        &[I64, I32],
+    );
     module.declare_function("js_register_closure_strict_function", VOID, &[PTR]);
     module.declare_function("js_register_closure_async_function", VOID, &[PTR]);
     module.declare_function("js_register_closure_generator_function", VOID, &[PTR]);
@@ -390,6 +400,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_map_set_string_string", I64, &[I64, I64, I64]);
     module.declare_function("js_map_set_number_key", I64, &[I64, DOUBLE, DOUBLE]);
     module.declare_function("js_map_get", DOUBLE, &[I64, DOUBLE]);
+    module.declare_function("js_declared_map_get", DOUBLE, &[DOUBLE, DOUBLE]);
     module.declare_function("js_map_get_string_key", DOUBLE, &[I64, I64]);
     module.declare_function("js_map_get_number_key", DOUBLE, &[I64, DOUBLE]);
     module.declare_function("js_map_has", I32, &[I64, DOUBLE]);
@@ -624,6 +635,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_set_add_f32", I64, &[I64, F32]);
     module.declare_function("js_set_add_bool", I64, &[I64, I32]);
     module.declare_function("js_set_has", I32, &[I64, DOUBLE]);
+    module.declare_function("js_readonly_set_has", DOUBLE, &[DOUBLE, DOUBLE]);
     module.declare_function("js_set_has_string", I32, &[I64, I64]);
     module.declare_function("js_set_has_number", I32, &[I64, DOUBLE]);
     module.declare_function("js_set_has_i32", I32, &[I64, I32]);
@@ -703,11 +715,32 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
         I32,
         &[DOUBLE, DOUBLE, I32, PTR],
     );
+    // #8773: same complete packed-loop admission, returning the validated
+    // live receiver address. Captured bindings may hold an array-growth
+    // forwarding stub and cannot be rewritten like a compiler-private local.
+    module.declare_function(
+        "js_packed_arraylike_loop_guard_live",
+        I64,
+        &[DOUBLE, DOUBLE, I32, PTR],
+    );
+    // #8773: O(1) revalidation against descriptor words published by the
+    // complete guard. Used before later observable indexed effects without
+    // repeating dense-layout discovery or descriptor publication.
+    module.declare_function(
+        "js_packed_arraylike_loop_revalidate_live",
+        I64,
+        &[DOUBLE, DOUBLE, I32, PTR],
+    );
     // Issue #957: tag-aware dynamic index write. Used by `Expr::IndexUpdate`
     // codegen to write back the incremented value without rebuilding the
     // IndexSet dispatch tree. Routes to `js_array_set_index_or_string` for
     // arrays and `js_object_set_field_by_name` for plain objects.
     module.declare_function("js_dyn_index_set", DOUBLE, &[DOUBLE, DOUBLE, DOUBLE]);
+    module.declare_function(
+        "js_dyn_index_set_strict",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, DOUBLE, I32],
+    );
     module.declare_function("js_string_to_char_array", I64, &[I64]);
     module.declare_function("js_string_repeat", I64, &[I64, DOUBLE]);
     module.declare_function("js_string_replace_string", I64, &[I64, I64, I64]);

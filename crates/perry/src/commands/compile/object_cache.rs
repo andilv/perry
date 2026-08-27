@@ -569,6 +569,7 @@ fn compute_object_cache_key_with_env(
             a.name
                 .cmp(&b.name)
                 .then(a.source_prefix.cmp(&b.source_prefix))
+                .then(a.local_alias.cmp(&b.local_alias))
         });
         let mut buf = String::new();
         for c in v {
@@ -693,9 +694,105 @@ fn compute_object_cache_key_with_env(
             let mut return_shape_imports = c.return_shape_imports.clone();
             return_shape_imports.sort();
             buf.push_str(&return_shape_imports.join(","));
+            buf.push_str(":object_literal=");
+            if let Some(object) = &c.object_literal {
+                buf.push_str(&format!(
+                    "{}@{}:{}:{}:{}:",
+                    object.local_binding,
+                    object.source_prefix,
+                    object.source_export_name,
+                    object.receiver_class_name,
+                    object.source_global_id,
+                ));
+                let mut methods = object.methods.clone();
+                methods.sort_by(|left, right| left.name.cmp(&right.name));
+                for method in methods {
+                    buf.push_str(&format!(
+                        "{}={}/{}/{}/{};",
+                        method.name,
+                        method.func_id,
+                        method.target,
+                        method.param_count,
+                        method.field_index
+                    ));
+                }
+            }
             buf.push('|');
         }
         h.field("imported_classes", &buf);
+    }
+
+    // #8772: these producer capabilities are harvested from OTHER modules and
+    // can change the guarded direct-call arms without changing this module's
+    // own HIR. Keep ordering independent of HashMap/rayon traversal order.
+    {
+        let mut candidates: Vec<&perry_codegen::ShortSpreadMethodCandidate> = opts
+            .short_spread_method_candidates
+            .values()
+            .flatten()
+            .collect();
+        candidates.sort_by(|a, b| {
+            a.method_name
+                .cmp(&b.method_name)
+                .then(a.class_id.cmp(&b.class_id))
+                .then(a.target.cmp(&b.target))
+        });
+        let value = candidates
+            .into_iter()
+            .map(|candidate| {
+                format!(
+                    "{}:{}@{}:{}:{}:{}",
+                    candidate.method_name,
+                    candidate.class_id,
+                    candidate.source_prefix,
+                    candidate.target,
+                    candidate.shape_id_global,
+                    candidate.declared_count,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        h.field("short_spread_method_candidates", &value);
+    }
+
+    // #8775 reverse-flow object candidates likewise affect modules that do
+    // not import the producer and therefore are not covered by the imported
+    // class/object fingerprint above.
+    {
+        let mut candidates: Vec<&perry_codegen::ObjectLiteralMethodCandidate> = opts
+            .object_literal_method_candidates
+            .values()
+            .flatten()
+            .collect();
+        candidates.sort_by(|a, b| {
+            a.method
+                .name
+                .cmp(&b.method.name)
+                .then(a.method.param_count.cmp(&b.method.param_count))
+                .then(a.source_prefix.cmp(&b.source_prefix))
+                .then(a.source_global_id.cmp(&b.source_global_id))
+                .then(a.method.func_id.cmp(&b.method.func_id))
+        });
+        let value = candidates
+            .into_iter()
+            .map(|candidate| {
+                format!(
+                    "{}/{}:{}@{}#{}:{}:{}:{}:{}:{}",
+                    candidate.method.name,
+                    candidate.method.param_count,
+                    candidate.class_id,
+                    candidate.source_prefix,
+                    candidate.source_global_id,
+                    candidate.source_export_name,
+                    candidate.shape_id_global,
+                    candidate.method.func_id,
+                    candidate.method.target,
+                    candidate.method.field_index,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        h.field("object_literal_method_candidates", &value);
     }
 
     // Imported enums — sort by local name, serialize every member.

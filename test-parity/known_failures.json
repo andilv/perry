@@ -37,6 +37,15 @@
       "linux"
     ]
   },
+  "test_class_field_layout": {
+    "issue": "8841",
+    "added": "2026-08-25",
+    "category": "bug-open",
+    "reason": "Reproduces 5/5 on pre-#8835 r13 and in r14 Full CI: both runtimes exit 0 but their class-field layout output differs. Tracked in #8841.",
+    "platforms": [
+      "linux"
+    ]
+  },
   "test_date_fns_format": {
     "issue": "8271",
     "added": "2026-08-17",
@@ -98,15 +107,6 @@
     "reason": "RE-TRIAGE: tracking issue #3680 is CLOSED but this still fails (audited 2026-08-07, #7582) — needs a new issue. node:v8 Serializer / Deserializer classes still absent from the surface."
   },
   "test_guarded_raw_numeric_arrays": {
-    "issue": "8271",
-    "added": "2026-08-17",
-    "category": "untriaged",
-    "reason": "First complete parity run since 2026-07-04 (suite dark behind tag-gating + continue-on-error; #8187/#8244). Needs bisect over the six-week window. 2026-08-17 parity-debt audit (#8271).",
-    "platforms": [
-      "linux"
-    ]
-  },
-  "test_harness_class_mixins": {
     "issue": "8271",
     "added": "2026-08-17",
     "category": "untriaged",
@@ -237,6 +237,15 @@
     "added": "2026-08-17",
     "category": "untriaged",
     "reason": "First complete parity run since 2026-07-04 (suite dark behind tag-gating + continue-on-error; #8187/#8244). Needs bisect over the six-week window. 2026-08-17 parity-debt audit (#8271).",
+    "platforms": [
+      "linux"
+    ]
+  },
+  "test_issue_3199_3200_tls_server_tlssocket": {
+    "issue": "8841",
+    "added": "2026-08-25",
+    "category": "bug-open",
+    "reason": "Reproduces 5/5 on both pre-#8835 r13 and r14: Perry exits 1 after the initial TLS server-address line while Node completes with exit 0. Tracked in #8841.",
     "platforms": [
       "linux"
     ]
@@ -421,6 +430,15 @@
       "linux"
     ]
   },
+  "test_issue_4975_http_agent_keep_alive_connection_options": {
+    "issue": "8841",
+    "added": "2026-08-26",
+    "category": "bug-open",
+    "reason": "Release run 32935157745: Node exits 0, while Perry prints the expected keepAlive and keepAliveInitialDelay values but does not terminate before the 10s harness deadline. Track the Agent/socket lifecycle gap after server.close(); remove this entry with the fix tracked in #8841.",
+    "platforms": [
+      "linux"
+    ]
+  },
   "test_issue_4977_gc_toplevel_locals": {
     "issue": "8271",
     "added": "2026-08-17",
@@ -471,15 +489,6 @@
     "added": "2026-08-17",
     "category": "ci-env",
     "reason": "Compile fails on the Linux CI host (libperry_ui_gtk4.a family — same class as #8224 item 3). 2026-08-17 parity-debt audit (#8271).",
-    "platforms": [
-      "linux"
-    ]
-  },
-  "test_issue_562_stream_subclass": {
-    "issue": "8271",
-    "added": "2026-08-17",
-    "category": "untriaged",
-    "reason": "First complete parity run since 2026-07-04 (suite dark behind tag-gating + continue-on-error; #8187/#8244). Needs bisect over the six-week window. 2026-08-17 parity-debt audit (#8271).",
     "platforms": [
       "linux"
     ]
@@ -628,15 +637,6 @@
       "linux"
     ]
   },
-  "test_issue_806_curried_mixin_outer_capture": {
-    "issue": "8271",
-    "added": "2026-08-17",
-    "category": "untriaged",
-    "reason": "First complete parity run since 2026-07-04 (suite dark behind tag-gating + continue-on-error; #8187/#8244). Needs bisect over the six-week window. 2026-08-17 parity-debt audit (#8271).",
-    "platforms": [
-      "linux"
-    ]
-  },
   "test_issue_859_native_promise_pin": {
     "issue": "8271",
     "added": "2026-08-17",
@@ -741,6 +741,15 @@
     "added": "2026-08-17",
     "category": "untriaged",
     "reason": "First complete parity run since 2026-07-04 (suite dark behind tag-gating + continue-on-error; #8187/#8244). Needs bisect over the six-week window. 2026-08-17 parity-debt audit (#8271).",
+    "platforms": [
+      "linux"
+    ]
+  },
+  "test_parcel_watcher_facade": {
+    "issue": "8841",
+    "added": "2026-08-26",
+    "category": "ci-env",
+    "reason": "Release run 32922022811: the Linux Node oracle exits in package_json_reader while Perry's native watcher sees events but times out waiting for the nested create event. Track the CI-dependent facade mismatch without weakening the dedicated Parcel watcher integration tests.",
     "platforms": [
       "linux"
     ]
@@ -865,12 +874,6 @@
       "linux"
     ]
   },
-  "test_parity_stream": {
-    "issue": "793",
-    "added": "2026-05-15",
-    "category": "module-inventory",
-    "reason": "Tracking issue #793 (roadmap umbrella) is CLOSED — this needs a live surface tracker (audited 2026-08-07, #7582). Node.js module inventory — `node:stream` surface not fully implemented. Tracker for surface coverage; flips to PASS as each API lands. Not a regression."
-  },
   "test_parity_stream_web": {
     "issue": "793",
     "added": "2026-05-15",
@@ -954,6 +957,15 @@
     "added": "2026-08-17",
     "category": "untriaged",
     "reason": "First complete parity run since 2026-07-04 (suite dark behind tag-gating + continue-on-error; #8187/#8244). Needs bisect over the six-week window. 2026-08-17 parity-debt audit (#8271).",
+    "platforms": [
+      "linux"
+    ]
+  },
+  "test_stress_promises": {
+    "issue": "8841",
+    "added": "2026-08-25",
+    "category": "bug-open",
+    "reason": "Reproduces 5/5 on both pre-#8835 r13 and r14: Perry dies with SIGSEGV (exit 139) after six output lines while Node exits 0. Tracked in #8841.",
     "platforms": [
       "linux"
     ]

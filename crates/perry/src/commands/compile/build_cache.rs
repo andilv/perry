@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use super::{BuildCacheStats, CompilationContext, CompileArgs, CompileResult, LinkCacheStats};
 
-const BUILD_CACHE_MANIFEST_VERSION: u32 = 1;
+const BUILD_CACHE_MANIFEST_VERSION: u32 = 2;
 
 const BUILD_CACHE_ENV_VARS: &[&str] = &[
     "PATH",
@@ -49,6 +49,8 @@ const BUILD_CACHE_ENV_VARS: &[&str] = &[
     // to a shadow frame. It changes which functions carry statepoints, so it
     // changes the generated code and must be a cache input.
     "PERRY_ROOT_SPILL_RELOCATIONS",
+    // #8583: selects the descriptor-backed lowering for large constant arrays.
+    // The two paths emit different IR and therefore require distinct cache keys.
     "PERRY_GC_SAFEPOINT_ONLY",
     "PERRY_INLINE_SHADOW_SLOT",
     "PERRY_DISABLE_BUFFER_FAST_PATH",
@@ -139,6 +141,7 @@ const BUILD_CACHE_ENV_EXCLUSIONS: &[&str] = &[
     "PERRY_LLVM_DIFF_DIR",
     "PERRY_REPSEL_DEBUG",
     "PERRY_STATEPOINT_REPORT",
+    // Writes malformed dialect IR for diagnostics without changing emitted code.
     // `opt_report`'s own module doc states the contract this exclusion rests
     // on: "Observational only. Nothing in this module is read by codegen …
     // the returned fact sets are bit-identical with the report on and off,
@@ -251,6 +254,7 @@ mod tests {
             native_modules: 0,
             js_modules: 0,
             output: file_fingerprint(&output).expect("fingerprint output"),
+            sidecar_outputs: Vec::new(),
         };
         std::fs::write(
             &manifest_path,
@@ -395,6 +399,7 @@ struct BuildCacheManifest {
     native_modules: usize,
     js_modules: usize,
     output: FileFingerprint,
+    sidecar_outputs: Vec<FileFingerprint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -508,6 +513,9 @@ impl BuildCacheProbe {
         }
         if file_fingerprint(&self.output_path).ok() != Some(manifest.output.clone()) {
             return miss("output");
+        }
+        if verify_files(&manifest.sidecar_outputs).is_err() {
+            return miss("native-addon-sidecar");
         }
         BuildCacheStats {
             hit: true,
@@ -641,9 +649,12 @@ impl BuildCacheProbe {
         object_fingerprints: &[String],
         runtime_inputs: &[PathBuf],
     ) -> Result<BuildCacheManifest, String> {
-        let sources = ctx
-            .native_modules
-            .keys()
+        let mut source_paths = ctx.native_modules.keys().cloned().collect::<BTreeSet<_>>();
+        for addon in ctx.native_addons.values() {
+            source_paths.extend(super::native_addon_sidecar::addon_payload_files(addon));
+        }
+        let sources = source_paths
+            .iter()
             .map(|path| file_fingerprint(path.as_path()))
             .collect::<std::io::Result<Vec<_>>>()
             .map_err(|_| "source-fingerprint".to_string())?;
@@ -658,6 +669,19 @@ impl BuildCacheProbe {
             .map(|path| file_fingerprint(path.as_path()))
             .collect::<std::io::Result<Vec<_>>>()
             .map_err(|_| "runtime-fingerprint".to_string())?;
+        let sidecar_outputs = if ctx.native_addons.is_empty() {
+            Vec::new()
+        } else {
+            let root = super::native_addon_sidecar::sidecar_root(output_path)
+                .map_err(|_| "sidecar-output".to_string())?;
+            walkdir::WalkDir::new(root)
+                .into_iter()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.path().is_file())
+                .map(|entry| file_fingerprint(entry.path()))
+                .collect::<std::io::Result<Vec<_>>>()
+                .map_err(|_| "sidecar-output".to_string())?
+        };
         Ok(BuildCacheManifest {
             version: BUILD_CACHE_MANIFEST_VERSION,
             perry_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -675,6 +699,7 @@ impl BuildCacheProbe {
             native_modules: ctx.native_modules.len(),
             js_modules: ctx.js_modules.len(),
             output: file_fingerprint(output_path).map_err(|_| "output-fingerprint".to_string())?,
+            sidecar_outputs,
         })
     }
 }
