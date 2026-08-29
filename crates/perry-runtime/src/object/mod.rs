@@ -67,6 +67,7 @@ mod buffer_dispatch;
 mod class_constructors;
 mod class_gc_roots;
 mod class_handles;
+pub mod class_image;
 mod class_registry;
 pub(crate) use class_registry::scan_current_new_target_root_mut;
 mod collection_proto_thunks;
@@ -74,7 +75,7 @@ mod data_view_registry;
 mod dataview_proto_thunks;
 mod date_proto_thunks;
 mod delete_rest;
-mod descriptors;
+pub(crate) mod descriptors;
 mod disposable_proto_thunks;
 pub(crate) mod exotic_expando;
 pub(crate) mod field_get_set;
@@ -246,11 +247,11 @@ pub(crate) use descriptor_state::{
     class_instance_set_may_intercept, clear_accessor_descriptor, clear_property_attrs,
     constructor_accessor_ever_installed, descriptors_in_use, disable_class_field_inline_guard,
     get_accessor_descriptor, get_property_attrs, json_object_getter_value, mark_all_keys,
-    object_has_descriptors, object_proto_may_intercept_key, owner_may_have_descriptor_entries,
-    plain_data_write_may_intercept, prune_dead_descriptor_owner_entries,
-    reflect_getter_closure_bits, set_accessor_descriptor, set_builtin_accessor_descriptor,
-    set_builtin_property_attrs, set_property_attrs, transfer_descriptor_owner, AccessorDescriptor,
-    DescriptorTables, PropertyAttrs,
+    object_has_descriptors, object_proto_may_intercept_key, owner_has_property_descriptors,
+    owner_may_have_descriptor_entries, plain_data_write_may_intercept,
+    prune_dead_descriptor_owner_entries, reflect_getter_closure_bits, set_accessor_descriptor,
+    set_builtin_accessor_descriptor, set_builtin_property_attrs, set_property_attrs,
+    transfer_descriptor_owner, AccessorDescriptor, DescriptorTables, PropertyAttrs,
 };
 pub(crate) use field_get_set::FieldLookupCaches;
 pub(crate) use field_get_set::{
@@ -443,6 +444,12 @@ pub(crate) struct ObjectHotTables {
     /// and keys_array == null.
     pub(crate) shape_inline_cache:
         std::cell::UnsafeCell<[ShapeCacheEntry; SHAPE_INLINE_CACHE_SIZE]>,
+    /// Pointer-free direct cache for immutable ShapeId object-kind facts.
+    /// ShapeIds are monotone and never reused; descriptor retirement clears a
+    /// matching entry. Keeping this beside the other per-agent shape tables
+    /// avoids borrowing the descriptor HashMap on repeated regular-object
+    /// checks (notably homogeneous Array element stores).
+    pub(crate) shape_kind_cache: std::cell::UnsafeCell<Box<[u64]>>,
     /// Overflow map for shape_ids that collide in the inline cache. Values
     /// are `(keys_array, runtime_shape_id)` — see [`ShapeCacheEntry`].
     pub(crate) shape_cache_overflow: RefCell<HashMap<u32, (*mut ArrayHeader, u32)>>,
@@ -452,6 +459,18 @@ pub(crate) struct ObjectHotTables {
     /// TLS layout when this lived in a `thread_local!`, and keeping it
     /// boxed inside the heap-allocated `RuntimeState` preserves that.
     pub(crate) transition_cache: std::cell::UnsafeCell<Box<[TransitionEntry]>>,
+    /// Bidirectional index over learned sequential numeric property appends.
+    /// Array-subclass `push`/`pop` uses it to restore an exact historical
+    /// ShapeId without cloning or compacting the ordered-keys array.
+    pub(crate) array_tail_forward:
+        std::cell::UnsafeCell<Box<[array_tail_transition::ArrayTailTransitionEntry]>>,
+    pub(crate) array_tail_reverse:
+        std::cell::UnsafeCell<Box<[array_tail_transition::ArrayTailTransitionEntry]>>,
+    /// Exact-ShapeId -> authoritative forward/reverse table indices. This is
+    /// an accelerator only: collisions and stale indices revalidate the full
+    /// entry and fall back to the complete open-addressed tables.
+    pub(crate) array_tail_direct:
+        std::cell::UnsafeCell<Box<[array_tail_transition::ArrayTailDirectIndex]>>,
 }
 
 impl ObjectHotTables {
@@ -465,6 +484,9 @@ impl ObjectHotTables {
                     runtime_shape_id: 0,
                     keys_array: std::ptr::null_mut(),
                 }; SHAPE_INLINE_CACHE_SIZE],
+            ),
+            shape_kind_cache: std::cell::UnsafeCell::new(
+                vec![0; shapes::SHAPE_KIND_CACHE_SIZE].into_boxed_slice(),
             ),
             shape_cache_overflow: RefCell::new(HashMap::new()),
             transition_cache: std::cell::UnsafeCell::new(
@@ -481,6 +503,27 @@ impl ObjectHotTables {
                 ]
                 .into_boxed_slice(),
             ),
+            array_tail_forward: std::cell::UnsafeCell::new(
+                vec![
+                    array_tail_transition::ArrayTailTransitionEntry::EMPTY;
+                    array_tail_transition::ARRAY_TAIL_TRANSITION_CACHE_SIZE
+                ]
+                .into_boxed_slice(),
+            ),
+            array_tail_reverse: std::cell::UnsafeCell::new(
+                vec![
+                    array_tail_transition::ArrayTailTransitionEntry::EMPTY;
+                    array_tail_transition::ARRAY_TAIL_TRANSITION_CACHE_SIZE
+                ]
+                .into_boxed_slice(),
+            ),
+            array_tail_direct: std::cell::UnsafeCell::new(
+                vec![
+                    array_tail_transition::ArrayTailDirectIndex::EMPTY;
+                    array_tail_transition::ARRAY_TAIL_TRANSITION_CACHE_SIZE
+                ]
+                .into_boxed_slice(),
+            ),
         }
     }
 }
@@ -490,84 +533,17 @@ impl ObjectHotTables {
 /// faster than the hash overhead (memory access, cache footprint).
 const KEYS_INDEX_THRESHOLD: u32 = 32;
 
-/// Raw dense-slot view of a (validated) keys array: resolve a grow-forward
-/// pointer ONCE, then hand back the backing slots for direct indexing. The
-/// generic `js_array_get` element getter re-runs the whole per-element
-/// gauntlet — forward-resolution, lazy/Map/Set receiver probes (each a TLS +
-/// registry HashMap hit), descriptor gates — on EVERY slot, which made the
-/// keys_array scan loops (`own_key_present`, the sidecar/wide-index builds)
-/// pay ~µs per element. Callers have already validated `keys` is a
-/// `GC_TYPE_ARRAY`; keys arrays are dense (no holes), and a slot that is not
-/// a string simply fails the key match. (#6748 grind)
-#[inline]
-pub(crate) unsafe fn keys_array_dense_slots(
-    keys: *const crate::array::ArrayHeader,
-) -> (*const f64, usize) {
-    let arr = crate::array::clean_arr_ptr(keys);
-    if arr.is_null() {
-        return (std::ptr::null(), 0);
-    }
-    let len = (*arr).length.min((*arr).capacity) as usize;
-    (
-        (arr as *const u8).add(std::mem::size_of::<crate::array::ArrayHeader>()) as *const f64,
-        len,
-    )
-}
+#[path = "keys_lookup.rs"]
+mod keys_lookup;
+pub(crate) mod read_stub;
+pub(crate) use keys_lookup::*;
 
-/// FNV-1a hash of the bytes behind a string header. Same hash function
-/// as `key_content_hash_impl` so callers can mix paths.
-#[inline(always)]
-fn key_bytes_hash(name_ptr: *const u8, name_len: usize) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    unsafe {
-        for i in 0..name_len {
-            h ^= *name_ptr.add(i) as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-    }
-    h
-}
-
-/// Locate `key` in `obj`'s keys array via the shape record (#6759 C1:
-/// keyed on keys_array identity — shared across same-shape objects —
-/// replacing the per-object sidecar). Returns `Some(slot)` on a
-/// content-validated hit, `None` on miss (caller falls through to
-/// append/grow or the linear scan).
-#[inline]
-unsafe fn keys_index_lookup(
-    _obj: *const ObjectHeader,
-    keys: *const crate::array::ArrayHeader,
-    key_bytes: &[u8],
-    key_hash: u64,
-) -> Option<u32> {
-    let key_count = crate::array::js_array_length(keys);
-    if key_count < KEYS_INDEX_THRESHOLD {
-        return None;
-    }
-    shapes::shape_slot_lookup(keys, key_bytes, key_hash, key_count, true)
-}
-
-/// Record a new (key_hash → slot) entry on the POST-append keys array's
-/// shape after a key was appended. Caller passes `crate::object::object_keys_array(obj)`
-/// (the definitive post-append array — a clone or grow-realloc lands
-/// under its new identity, or nowhere if no shape entry exists yet) and
-/// ensures `new_count` equals the new keys_array length.
-#[inline]
-fn keys_index_insert(
-    keys: *const crate::array::ArrayHeader,
-    new_count: u32,
-    key_hash: u64,
-    slot: u32,
-) {
-    if new_count < KEYS_INDEX_THRESHOLD {
-        return;
-    }
-    shapes::shape_note_append(keys, new_count, key_hash, slot);
-}
-
+pub(crate) mod array_tail_transition;
 mod call_method_depth;
+mod meta_accessors;
 use call_method_depth::CallMethodDepthGuard;
 pub(crate) use call_method_depth::{call_method_depth_restore, call_method_depth_savepoint};
+pub(crate) use meta_accessors::*;
 
 /// Fast direct-mapped inline cache for class shape keys arrays.
 /// Indexed by `shape_id mod CACHE_SIZE`. Each slot stores
@@ -788,7 +764,7 @@ pub(crate) unsafe fn interned_key_ptr(key: *const crate::StringHeader) -> usize 
 fn key_content_hash_impl(key: *const crate::StringHeader) -> u64 {
     unsafe {
         let len = (*key).byte_len as usize;
-        let data = (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
+        let data = keys_lookup::string_header_payload(key);
         let mut h: u64 = 0xcbf29ce484222325;
         for i in 0..len {
             h ^= *data.add(i) as u64;
@@ -907,6 +883,7 @@ unsafe fn transition_cache_stamp_shape_shared(next_keys: usize) -> bool {
 }
 
 fn transition_cache_insert(
+    array_tail_owner: *const ObjectHeader,
     prev_shape_id: u32,
     interned_key: *const crate::StringHeader,
     next_keys: usize,
@@ -940,6 +917,16 @@ fn transition_cache_insert(
         entry.slot_idx = slot_idx;
         entry.target_len = target_len;
     });
+    if !array_tail_owner.is_null() {
+        array_tail_transition::record_numeric_tail_transition(
+            array_tail_owner,
+            prev_shape_id,
+            target_shape_id,
+            interned_key,
+            next_keys,
+            slot_idx,
+        );
+    }
     // Small dynamic shapes are stabilized eagerly because otherwise
     // the original builder can grow the cached target in place and
     // force future lookups to reject it. Large one-off dictionaries
@@ -967,7 +954,26 @@ pub fn scan_transition_cache_roots_mut(visitor: &mut crate::gc::RuntimeRootVisit
             if entry.next_keys != 0 {
                 let mut invalidate = false;
                 invalidate |= visitor.visit_metadata_usize_slot(&mut entry.key_ptr);
-                visitor.visit_usize_slot(&mut entry.next_keys);
+                // #6759 phase 3: `next_keys` is WEAK, not a strong root.
+                //
+                // `visit_usize_slot` MARKS. With 16384 slots this cache was
+                // therefore keeping up to 16384 keys arrays — and, through
+                // them, their shape descriptors — alive whether or not any live
+                // object still had that shape. That is a direct contributor to
+                // the shape table growing without bound between full
+                // collections (measured: 786k descriptors on a workload holding
+                // under 400 live objects).
+                //
+                // A transition entry is a pure cache: it answers "adding key k
+                // to shape S yields shape T". If nothing has shape T any more,
+                // the answer is worthless, so pinning T's keys array to keep it
+                // answerable is backwards. `key_ptr` was already weak for the
+                // same reason; this makes the pair consistent.
+                //
+                // Rewrite-only keeps a surviving target's address correct;
+                // `prune_dead_transition_cache_entries` drops the entry when the
+                // target did not survive.
+                visitor.visit_metadata_usize_slot(&mut entry.next_keys);
                 if invalidate {
                     *entry = TransitionEntry {
                         key_ptr: 0,
@@ -981,6 +987,7 @@ pub fn scan_transition_cache_roots_mut(visitor: &mut crate::gc::RuntimeRootVisit
             }
         }
     });
+    array_tail_transition::scan_roots_mut(visitor);
 }
 
 /// #8192: death pruning for the transition cache.
@@ -1008,6 +1015,10 @@ pub(crate) fn prune_dead_transition_cache_entries(is_dead_owner: &dyn Fn(usize) 
                 continue;
             }
             let dead = (entry.key_ptr != 0 && is_dead_owner(entry.key_ptr))
+                // #6759 phase 3: `next_keys` stopped being a strong root, so a
+                // dead target is now possible and must be reaped here — this is
+                // the half that makes weakening it safe.
+                || is_dead_owner(entry.next_keys)
                 || shapes::shape_descriptor_by_id(entry.prev_shape_id).is_none()
                 || (entry.target_shape_id != 0
                     && shapes::shape_descriptor_by_id(entry.target_shape_id).is_none());
@@ -1023,6 +1034,7 @@ pub(crate) fn prune_dead_transition_cache_entries(is_dead_owner: &dyn Fn(usize) 
             }
         }
     });
+    array_tail_transition::prune_invalid_entries();
 }
 
 #[cfg(test)]
@@ -1552,6 +1564,63 @@ pub struct ObjectMeta {
     /// property: private branding must not consume a user field slot, alter
     /// the ShapeId/key order, or become visible to enumeration.
     pub private_evaluation_brand: u64,
+    /// Exact class-declared named-prefix identity for an Array-subclass
+    /// receiver. Numeric tail mutations change the ordinary ShapeId on every
+    /// push/pop even though the named slots before that tail remain fixed.
+    /// Property-read PICs may use this nonzero scalar as a second identity
+    /// only after `array_subclass_named_prefix_token` has proved the current
+    /// keys against the class's registered allocation keys. Generic shape or
+    /// semantic transitions clear it; the exact learned numeric-tail
+    /// transition is the only publisher that deliberately preserves it.
+    pub array_subclass_named_prefix_token: u64,
+    /// Native pointer to this receiver's per-thread [`ObjectHotTables`].
+    /// Array-subclass tail transitions are agent-local: their ShapeIds and
+    /// rooted key arrays belong to the same thread that owns the object. Once
+    /// a transition is learned, caching that stable heap allocation here lets
+    /// every later push/pop reach the full historical shape lattice without a
+    /// Darwin TLS/TSD lookup first.
+    ///
+    /// This is NOT a managed-heap edge and the ObjectMeta slot visitors must
+    /// deliberately ignore it. Perry workers deep-copy values into independent
+    /// arenas rather than sharing ObjectHeaders, so an object cannot carry the
+    /// pointer into another agent. The RuntimeState allocation outlives every
+    /// object in that thread.
+    pub array_tail_object_hot: u64,
+    /// Move-stable, receiver-local cache of the Array-subclass dense layout.
+    /// `array_subclass_dense_key` is `(class_id << 32) | ShapeId`; the two
+    /// payload words use the same packing as `array::subclass`'s global
+    /// collision cache. They contain scalar slot indices only, never managed
+    /// pointers. A generic semantic/structural mutation publishes a new
+    /// ShapeId before it becomes observable, so a stale payload misses by key
+    /// without a pointer-side-table invalidation walk. Exact learned numeric
+    /// tail transitions update these words directly.
+    pub array_subclass_dense_key: u64,
+    pub array_subclass_dense_slots: u64,
+    pub array_subclass_dense_bounds: u64,
+    /// #6759 phase 1: named own properties for a cell that has no
+    /// `keys_array`/inline-slot layout of its own — a NaN-boxed pointer to an
+    /// ordinary object used as the property bag, or 0 when the owner has none.
+    ///
+    /// An `ErrorHeader` (and every other exotic cell) cannot store named
+    /// properties inline, which is why they lived in `ERROR_USER_PROPS`, keyed
+    /// by the owner's ADDRESS and needing four GC hooks of their own —
+    /// rekey-on-evacuation, finalize, dead-sweep and a root scanner — plus the
+    /// long-standing bug that a recycled address inherited the previous
+    /// tenant's properties.
+    ///
+    /// Hanging the bag off the metadata record instead makes it an ordinary
+    /// child edge: it moves with its owner, dies with its owner, and needs no
+    /// address bookkeeping at all.
+    pub expando: u64,
+    /// Elements backing store of a `class X extends Array` instance: a
+    /// `GC_TYPE_ARRAY` (`*mut ArrayHeader` bits, 0 = none) holding the
+    /// instance's indexed elements and `length`, exactly as a plain Array
+    /// does — so `push`/`pop`/`obj[i]` are element operations instead of
+    /// property-shape transitions (`array/subclass_elements.rs`). A traced
+    /// child edge exactly like `spill`: lives and moves with this record.
+    /// Installed by `js_array_subclass_init` under
+    /// `array_subclass_elements_enabled()`; never present otherwise.
+    pub elements: u64,
 }
 
 pub(crate) const OBJECT_META_FLAG_PROTO_OVERRIDE: u64 = 1;
@@ -1572,8 +1641,8 @@ pub(crate) unsafe fn object_is_regular(obj: *const ObjectHeader) -> bool {
     };
     header.obj_type == crate::gc::GC_TYPE_OBJECT
         && header.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
-        && shapes::object_shape_descriptor(obj)
-            .is_some_and(|shape| shape.object_kind == shapes::ShapeObjectKind::Ordinary)
+        && shapes::shape_object_kind_by_id((*obj).parent_class_id)
+            == Some(shapes::ShapeObjectKind::Ordinary)
 }
 
 #[inline]
@@ -1593,64 +1662,84 @@ pub(crate) unsafe fn object_is_shaped(obj: *const ObjectHeader) -> bool {
 // ObjectMeta record and buffer elements one word past the ArrayHeader. Keep
 // codegen and these structs in lock-step.
 const _: () = assert!(std::mem::offset_of!(ObjectMeta, spill) == 32);
+const _: () = assert!(std::mem::offset_of!(ObjectMeta, array_subclass_named_prefix_token) == 48);
+const _: () = assert!(std::mem::offset_of!(ObjectMeta, array_tail_object_hot) == 56);
+// The Array-subclass elements store: codegen's inline `elem.*` tiers load
+// `ObjectHeader.meta` then this word (perry-codegen `expr/index_get` and
+// `property_get/composed_ics.rs`). Keep in lock-step.
+const _: () = assert!(std::mem::offset_of!(ObjectMeta, elements) == 96);
+const _: () = assert!(std::mem::offset_of!(ObjectHeader, meta) == 8);
 const _: () = assert!(std::mem::size_of::<crate::array::ArrayHeader>() == 8);
 
 /// Fetch-or-allocate the per-object meta record. Caller must have already
 /// established that `obj` is a live `GC_TYPE_OBJECT` allocation
 /// (see `prototype_chain::meta_capable_object`).
-pub(crate) unsafe fn object_meta_ensure(obj: *mut ObjectHeader) -> *mut ObjectMeta {
-    if !(*obj).meta.is_null() {
-        return (*obj).meta;
+/// The metadata edge of ANY cell that has one, addressed uniformly.
+///
+/// #6759 phase 1 (header unification). Cell types declare their fields
+/// independently — there is no shared header prefix — so "does this cell own an
+/// `ObjectMeta`?" had no single answer and every caller had to know it was
+/// holding an `ObjectHeader` before it could ask. That is why per-object state
+/// for the exotic types accumulated in side tables keyed by address instead:
+/// there was nowhere on the cell to put it.
+///
+/// This is the one path the migration needs. It returns `None` for a cell type
+/// that has no metadata edge yet, so callers degrade to their existing side
+/// table rather than mis-reading another layout's bytes as a pointer.
+///
+/// Every exotic cell type now answers this: Object, Error, Map, Set, RegExp,
+/// Promise and Date. Anything else (Temporal, the typed-array views) returns
+/// `None` and keeps its existing storage.
+pub(crate) unsafe fn cell_meta_slot(user_ptr: usize) -> Option<*mut *mut ObjectMeta> {
+    // Canonical validated read rather than an open-coded magnitude test:
+    // `try_read_gc_header` applies `is_plausible_heap_addr` AND rejects
+    // small-buffer slab addresses, which are heap-plausible but carry no
+    // GcHeader — reading one classifies the previous slab entry's bytes as a
+    // type tag.
+    let Some(gc_hdr) = crate::value::addr_class::try_read_gc_header(user_ptr) else {
+        return None;
+    };
+    match gc_hdr.obj_type {
+        crate::gc::GC_TYPE_OBJECT => {
+            Some(&mut (*(user_ptr as *mut ObjectHeader)).meta as *mut *mut ObjectMeta)
+        }
+        crate::gc::GC_TYPE_ERROR => {
+            Some(&mut (*(user_ptr as *mut crate::error::ErrorHeader)).meta as *mut *mut ObjectMeta)
+        }
+        crate::gc::GC_TYPE_MAP => {
+            Some(&mut (*(user_ptr as *mut crate::map::MapHeader)).meta as *mut *mut ObjectMeta)
+        }
+        crate::gc::GC_TYPE_SET => {
+            Some(&mut (*(user_ptr as *mut crate::set::SetHeader)).meta as *mut *mut ObjectMeta)
+        }
+        crate::gc::GC_TYPE_REGEXP => {
+            Some(&mut (*(user_ptr as *mut crate::regex::RegExpHeader)).meta as *mut *mut ObjectMeta)
+        }
+        crate::gc::GC_TYPE_PROMISE => {
+            Some(&mut (*(user_ptr as *mut crate::promise::Promise)).meta as *mut *mut ObjectMeta)
+        }
+        crate::gc::GC_TYPE_DATE_CELL => {
+            Some(&mut (*(user_ptr as *mut crate::date::DateCell)).meta as *mut *mut ObjectMeta)
+        }
+        // Anything still without a metadata edge answers absence rather than
+        // mis-reading its own layout as a pointer.
+        _ => None,
     }
-    // Root the owner across the allocation: `arena_alloc_gc` can trigger a
-    // copied-minor that MOVES `obj`, and the header store below must land
-    // in the live copy, not the stale from-space one. Reload through the
-    // handle after the allocation. (The fresh `meta` record itself cannot
-    // move before the store — no allocation happens in between.)
-    let scope = crate::gc::RuntimeHandleScope::new();
-    let obj_handle = scope.root_raw_mut_ptr(obj);
-    let meta = arena_alloc_gc(
-        std::mem::size_of::<ObjectMeta>(),
-        8,
-        crate::gc::GC_TYPE_OBJECT_META,
-    ) as *mut ObjectMeta;
-    let obj = obj_handle.get_raw_mut_ptr::<ObjectHeader>();
-    if !(*obj).meta.is_null() {
-        // A GC-triggered re-entrant path installed one meanwhile; keep it
-        // (the fresh record above is unreferenced and dies with the cycle).
-        return (*obj).meta;
-    }
-    (*meta).prototype = 0;
-    (*meta).attr_key_bits = 0;
-    (*meta).accessor_key_bits = 0;
-    (*meta).flags = 0;
-    (*meta).spill = 0;
-    (*meta).private_evaluation_brand = 0;
-    // GC_STORE_AUDIT(BARRIERED): meta-record edge is a header-slot store
-    // followed by an object-slot barrier, mirroring `set_object_keys_array`.
-    (*obj).meta = meta;
-    crate::gc::runtime_write_barrier_slot(
-        obj as usize,
-        &(*obj).meta as *const _ as usize,
-        meta as u64,
-    );
-    meta
 }
 
-/// GC slot accessor for the `meta` header edge (#6759 Phase B): a raw-pointer
-/// child slot. The GC type table calls this
-/// only for `GC_TYPE_OBJECT`; RegExp uses its dedicated slot descriptor.
-pub(crate) unsafe fn gc_object_meta_slot(user_ptr: usize) -> Option<*mut u64> {
-    if user_ptr == 0 {
-        return None;
-    }
-    let obj = user_ptr as *mut ObjectHeader;
-    if (*obj).meta.is_null() {
-        return None;
-    }
-    Some(&mut (*obj).meta as *mut _ as *mut u64)
+/// Does `user_ptr` name a cell that can own an `ObjectMeta`? (Exercised by
+/// the error-cell tests; production code asks `cell_meta_slot` directly.)
+#[cfg(test)]
+pub(crate) unsafe fn cell_has_meta_edge(user_ptr: usize) -> bool {
+    cell_meta_slot(user_ptr).is_some()
 }
 
+/// Materialise the metadata record for ANY cell that has a metadata edge,
+/// allocating one on first use. `None` for a cell type not yet unified.
+///
+/// The allocation can trigger a collection that MOVES the owner, so the slot
+/// is re-resolved from the rooted address afterwards rather than reusing the
+/// pointer taken before the allocation.
 #[inline]
 unsafe fn set_object_keys_array(obj: *mut ObjectHeader, keys_array: *mut ArrayHeader) {
     let live = object_live_slot_count(obj);
@@ -1779,3 +1868,63 @@ pub(super) unsafe fn mark_object_dynamic_shape_unknown(obj: *mut ObjectHeader) {
 
 #[cfg(test)]
 mod tests;
+
+/// The named-property bag for a cell that has no inline slot layout of its own,
+/// creating it on first write.
+///
+/// #6759 phase 1. An `ErrorHeader` (and the other exotic cells) cannot hold
+/// named properties inline, so they lived in tables keyed by the owner's
+/// ADDRESS — `ERROR_USER_PROPS` and friends — which cost four GC hooks
+/// (rekey-on-evacuation, finalize, dead-sweep, root scanner) and carried a
+/// standing hazard: a recycled address inherits the previous tenant's
+/// properties.
+///
+/// The bag is an ordinary object hanging off `ObjectMeta.expando`, so it is an
+/// ordinary child edge — it moves with its owner, dies with its owner, and
+/// keeps ECMA-262 insertion order for free because that is what an object's
+/// `keys_array` already does.
+pub(crate) unsafe fn cell_expando_ensure(user_ptr: usize) -> Option<*mut ObjectHeader> {
+    let meta = object_meta_ensure_for_cell(user_ptr)?;
+    if (*meta).expando != 0 {
+        return Some(
+            crate::value::JSValue::from_bits((*meta).expando).as_pointer::<ObjectHeader>()
+                as *mut ObjectHeader,
+        );
+    }
+    // `js_object_alloc` allocates and can move the owner, so re-resolve the
+    // meta record from the rooted address afterwards.
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let owner = scope.root_raw_mut_ptr(user_ptr as *mut u8);
+    let bag = js_object_alloc(0, 0);
+    let user_ptr = owner.get_raw_mut_ptr::<u8>() as usize;
+    let meta = object_meta_ensure_for_cell(user_ptr)?;
+    if (*meta).expando != 0 {
+        return Some(
+            crate::value::JSValue::from_bits((*meta).expando).as_pointer::<ObjectHeader>()
+                as *mut ObjectHeader,
+        );
+    }
+    let boxed = crate::value::js_nanbox_pointer(bag as i64).to_bits();
+    // GC_STORE_AUDIT(BARRIERED): metadata-record slot store + object barrier.
+    (*meta).expando = boxed;
+    crate::gc::runtime_write_barrier_slot(
+        meta as usize,
+        &(*meta).expando as *const _ as usize,
+        boxed,
+    );
+    Some(bag)
+}
+
+/// The existing bag, or `None` when the owner never took one. Never allocates,
+/// so it is safe on read paths.
+pub(crate) unsafe fn cell_expando_get(user_ptr: usize) -> Option<*mut ObjectHeader> {
+    let slot = cell_meta_slot(user_ptr)?;
+    let meta = *slot;
+    if meta.is_null() || (*meta).expando == 0 {
+        return None;
+    }
+    Some(
+        crate::value::JSValue::from_bits((*meta).expando).as_pointer::<ObjectHeader>()
+            as *mut ObjectHeader,
+    )
+}

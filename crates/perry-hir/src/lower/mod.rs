@@ -42,7 +42,9 @@ mod expr_call;
 pub(crate) mod expr_function;
 pub(crate) use expr_function::capture_function_source;
 mod expr_member;
-pub(crate) use expr_member::{private_storage_property, wrap_private_guard, PRIV_OP_WRITE};
+pub(crate) use expr_member::{
+    private_storage_property, wrap_private_guard, PRIV_OP_READ, PRIV_OP_WRITE,
+};
 mod expr_misc;
 mod expr_new;
 mod expr_new_builtins;
@@ -116,8 +118,8 @@ pub use lower_module_fn::{
 mod lower_expr;
 pub(crate) use lower_expr::{
     lower_expr, lower_expr_assignment, strict_global_assign_existing_or_throw,
-    throw_reference_error_expr, try_desugar_reactive_text, with_implicit_unset_let,
-    with_set_fallback_for_ident,
+    throw_reference_error_expr, try_desugar_reactive_text, unresolved_global_get_expr,
+    with_implicit_unset_let, with_set_fallback_for_ident,
 };
 
 // Re-export extracted module functions

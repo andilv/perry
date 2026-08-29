@@ -309,6 +309,17 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
         &[DOUBLE, DOUBLE],
     );
     module.declare_function("js_object_get_symbol_property", DOUBLE, &[DOUBLE, DOUBLE]);
+    module.declare_function(
+        "js_object_get_symbol_property_ic_miss",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, PTR],
+    );
+    module.declare_function(
+        "js_object_get_symbol_then_field_ic_miss",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, PTR, I64, PTR, PTR],
+    );
+    module.add_external_global("PERRY_SYMBOL_PROPERTY_IC_EPOCH", I64);
     module.declare_function("js_object_create", DOUBLE, &[DOUBLE]);
     // #2816: Object.create(proto[, propertiesObject]) — validates the
     // prototype and applies the optional descriptor bag.
@@ -667,6 +678,7 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     module.declare_function("js_array_find_last", DOUBLE, &[I64, I64]);
     module.declare_function("js_array_find_last_index", I32, &[I64, I64]);
     module.declare_function("js_array_some", DOUBLE, &[I64, I64]);
+    module.declare_function("js_array_some_captureless", DOUBLE, &[I64, PTR]);
     module.declare_function("js_array_every", DOUBLE, &[I64, I64]);
 
     // Phase E: async/await runtime support.
@@ -937,6 +949,9 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     // Normalize a Request/Response subclass object (for example NextResponse)
     // to its native Fetch registry handle; bare handles pass through.
     module.declare_function("js_fetch_unwrap_handle", DOUBLE, &[DOUBLE]);
+    // Response BodyInit metadata is reset before argument evaluation so a
+    // throwing init expression cannot leak it into a later construction.
+    module.declare_function("js_response_body_init_reset", DOUBLE, &[]);
     // js_response_body_init_ptr(body_value_f64) -> string_ptr (i64): drains a
     // ReadableStream body to bytes, else falls back to string coercion.
     module.declare_function("js_response_body_init_ptr", I64, &[DOUBLE]);

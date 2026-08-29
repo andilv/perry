@@ -94,7 +94,7 @@ pub(super) const VERIFIED_BARRIER_STEMS: &[(&str, StemKind)] = &[
     ("put.pic", StemKind::PointerTestedStore),
 ];
 
-const BARRIER_CALL: &str = "call void @js_write_barrier_slot(";
+const BARRIER_CALL: &str = "call void @js_write_barrier_slot";
 const INCREMENTAL_GLOBAL: &str = "@PERRY_INCREMENTAL_MARK_BARRIER_ACTIVE_COUNT";
 
 // ---------------------------------------------------------------------------
@@ -473,6 +473,7 @@ fn apush_ir() -> String {
             Stmt::Expr(Expr::ArrayPush {
                 array_id: ARR_ID,
                 value: Box::new(Expr::Object(vec![("v".to_string(), Expr::Number(1.0))])),
+                field_writeback: None,
             }),
             Stmt::Return(Some(Expr::LocalGet(ARR_ID))),
         ],

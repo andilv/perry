@@ -336,9 +336,11 @@ struct NumericIndex {
 #[inline]
 fn dense_integer_key(key: NumericKey) -> Option<u32> {
     let value = f64::from_bits(key.0);
-    if !value.is_finite() || value < 0.0 || value > u32::MAX as f64 {
-        return None;
-    }
+    // `as u32` saturates (NaN → 0, negatives → 0, > u32::MAX and +inf →
+    // u32::MAX), so the round trip alone decides every case the three range
+    // tests used to pre-screen: a value that is not a finite integer in
+    // 0..=u32::MAX never converts back to itself. One conversion pair instead
+    // of three compares and a conversion pair, on every dense Map lookup.
     let integer = value as u32;
     (integer as f64 == value).then_some(integer)
 }
@@ -358,6 +360,9 @@ impl NumericIndex {
             if integer >= dense.base {
                 let offset = integer as usize - dense.base as usize;
                 if offset < dense.slots.len() {
+                    // Authoritative for its span: a key inside the range was
+                    // either copied here when the table was (re)built or
+                    // inserted directly, so a miss is a definitive miss.
                     let entry = dense.slots[offset];
                     return (entry != DENSE_NUMERIC_EMPTY).then_some(entry);
                 }
@@ -373,6 +378,23 @@ impl NumericIndex {
 
     fn insert(&mut self, key: NumericKey, entry_index: u32) {
         let integer = dense_integer_key(key);
+        // An integer inside the range table's span lives only there: the hash
+        // insert would be pure overhead on the sequential-id workloads the
+        // table exists for (`entityCommands.set(entityId, …)` per command).
+        // `rebuild_dense` carries these dense-only keys into a widened span
+        // and `remove` clears them here, so the hash index never needs them.
+        if let (Some(integer), Some(dense)) = (integer, self.dense.as_mut()) {
+            if integer >= dense.base {
+                let offset = integer as usize - dense.base as usize;
+                if offset < dense.slots.len() {
+                    if dense.slots[offset] == DENSE_NUMERIC_EMPTY {
+                        self.dense_key_count += 1;
+                    }
+                    dense.slots[offset] = entry_index;
+                    return;
+                }
+            }
+        }
         let is_new = self.hashed.insert(key, entry_index).is_none();
         if is_new && integer.is_some() {
             self.dense_key_count += 1;
@@ -381,14 +403,7 @@ impl NumericIndex {
         let Some(integer) = integer else {
             return;
         };
-        if let Some(dense) = self.dense.as_mut() {
-            if integer >= dense.base {
-                let offset = integer as usize - dense.base as usize;
-                if offset < dense.slots.len() {
-                    dense.slots[offset] = entry_index;
-                    return;
-                }
-            }
+        if self.dense.is_some() {
             self.maybe_expand_dense(integer);
         } else {
             self.maybe_initialize_dense();
@@ -396,26 +411,37 @@ impl NumericIndex {
     }
 
     fn remove(&mut self, key: &NumericKey) -> Option<u32> {
-        let removed = self.hashed.remove(key);
-        if removed.is_some() {
-            if let Some(integer) = dense_integer_key(*key) {
-                self.dense_key_count = self.dense_key_count.saturating_sub(1);
-                if let Some(dense) = self.dense.as_mut() {
-                    if integer >= dense.base {
-                        let offset = integer as usize - dense.base as usize;
-                        if offset < dense.slots.len() {
-                            dense.slots[offset] = DENSE_NUMERIC_EMPTY;
-                        }
+        let integer = dense_integer_key(*key);
+        let mut removed = self.hashed.remove(key);
+        if let (Some(integer), Some(dense)) = (integer, self.dense.as_mut()) {
+            if integer >= dense.base {
+                let offset = integer as usize - dense.base as usize;
+                if offset < dense.slots.len() {
+                    let entry = dense.slots[offset];
+                    if entry != DENSE_NUMERIC_EMPTY {
+                        dense.slots[offset] = DENSE_NUMERIC_EMPTY;
+                        // A key copied into the span at rebuild time is still
+                        // in the hash index too; count it once either way.
+                        removed = removed.or(Some(entry));
                     }
                 }
             }
+        }
+        if removed.is_some() && integer.is_some() {
+            self.dense_key_count = self.dense_key_count.saturating_sub(1);
         }
         removed
     }
 
     fn clear(&mut self) {
         self.hashed.clear();
-        self.dense = None;
+        // Keep the allocated span: `Map.clear()` followed by the same id
+        // population (a per-frame grouping map) would otherwise rebuild the
+        // table from scratch every cycle. The slots are reset, and the span
+        // still only widens through `maybe_expand_dense`'s density budget.
+        if let Some(dense) = self.dense.as_mut() {
+            dense.slots.fill(DENSE_NUMERIC_EMPTY);
+        }
         self.dense_key_count = 0;
     }
 
@@ -504,8 +530,40 @@ impl NumericIndex {
                 }
             }
         }
+        // Keys inserted straight into the previous span are not in the hash
+        // index; the new span always covers the old one, and the range table
+        // is authoritative, so its entries win over any stale hash copy.
+        if let Some(old) = self.dense.take() {
+            for (offset, &entry_index) in old.slots.iter().enumerate() {
+                if entry_index == DENSE_NUMERIC_EMPTY {
+                    continue;
+                }
+                let integer = old.base as u64 + offset as u64;
+                if integer >= base as u64 {
+                    let new_offset = (integer - base as u64) as usize;
+                    if new_offset < slots.len() {
+                        slots[new_offset] = entry_index;
+                        continue;
+                    }
+                }
+                // Outside the new span (cannot happen by construction, but a
+                // key must never be silently dropped): keep it in the hash.
+                self.hashed
+                    .insert(NumericKey((integer as f64).to_bits()), entry_index);
+            }
+        }
         self.dense = Some(DenseNumericIndex { base, slots });
     }
+}
+
+/// `true` for an ordinary IEEE double that is neither NaN nor `±0`. Every
+/// NaN-box tag shares the quiet-NaN prefix, so one mask separates a plain
+/// number from every tagged value; the zero test removes the one pair of
+/// distinct bit patterns (`+0`/`-0`) that SameValueZero identifies.
+#[inline]
+pub(crate) fn is_plain_nonzero_number_bits(bits: u64) -> bool {
+    const QNAN_PREFIX: u64 = 0x7FF8_0000_0000_0000;
+    (bits & QNAN_PREFIX) != QNAN_PREFIX && (bits & !(1u64 << 63)) != 0
 }
 
 /// `true` if `bits` is a non-pointer JSValue (number, bool, undefined,
@@ -1038,6 +1096,15 @@ pub struct MapHeader {
     pub entries: *mut f64,
     /// Direct pointer to the stable numeric-key index owned by MAP_REGISTRY.
     numeric_index: *mut NumericIndex,
+    /// #6759 phase 1 (header unification): per-object metadata record, or
+    /// null — the same `ObjectMeta` cell an `ObjectHeader` hangs off its own
+    /// `meta` field. Appended LAST so every preceding field keeps its offset.
+    ///
+    /// Traced and rewritten by the `GcRewriteDescriptorKind::Map` arm, which
+    /// `trace_heap_rewrite_slots` drives, so listing it there makes the edge
+    /// marked as well as rewritten (#6812: an edge visited only on the rewrite
+    /// path is invisible to marking).
+    pub meta: *mut crate::object::ObjectMeta,
 }
 
 /// Each map entry is 16 bytes (key + value, both as f64/JSValue)
@@ -1270,6 +1337,10 @@ pub extern "C" fn js_map_alloc(capacity: u32) -> *mut MapHeader {
         // GC_STORE_AUDIT(INIT): map entries buffer is external storage; element stores are barriered separately.
         (*ptr).entries = entries;
         (*ptr).numeric_index = std::ptr::null_mut();
+        // #6759 phase 1: the arena allocator reuses free-list memory without
+        // zeroing, so this MUST be initialised explicitly — an uninitialised
+        // meta edge is a garbage pointer the collector would follow.
+        (*ptr).meta = std::ptr::null_mut();
 
         // Register in map registry for runtime type detection
         register_map(ptr, entries, cap as usize);
@@ -1335,13 +1406,82 @@ pub extern "C" fn js_map_find_key_index(map_boxed: f64, key: f64) -> f64 {
 #[used]
 static KEEP_MAP_FIND_KEY_INDEX: extern "C" fn(f64, f64) -> f64 = js_map_find_key_index;
 
+/// The two lookups every hot `Map` does, with nothing else in the frame.
+///
+/// `find_key_index` grew the string-hash, pointer-index and generic-compare
+/// paths into one body, and the register pressure of those cold paths costs
+/// every lookup the full prologue/epilogue (eight callee-saved GPRs and four
+/// FP registers on arm64 — the profile put a third of the function's self
+/// time there). The lane here answers the two shapes the numeric side-table
+/// exists for — a plain (untagged, non-NaN, non-zero) number key against a
+/// small map's entries by bit identity, or against the dense integer range
+/// table — and returns `None` for everything else so [`find_key_index_cold`]
+/// decides it. A dense-range miss is definitive for its span (every insert,
+/// delete, clear and GC rewrite keeps the table exact), exactly as in the cold
+/// path; a key outside the span goes to the hashed index there.
+#[inline(always)]
+unsafe fn find_key_index_hot(map: *const MapHeader, key: f64) -> Option<i32> {
+    let size = (*map).size;
+    let key_bits = key.to_bits();
+    if !is_plain_nonzero_number_bits(key_bits) {
+        return None;
+    }
+    if size <= SIDE_TABLE_THRESHOLD {
+        let entries = entries_ptr(map);
+        for i in 0..size {
+            if ptr::read(entries.add((i as usize) * 2)).to_bits() == key_bits {
+                return Some(i as i32);
+            }
+        }
+        return Some(-1);
+    }
+    let index = (*map).numeric_index.as_ref()?;
+    let dense = index.dense.as_ref()?;
+    let integer = dense_integer_key(NumericKey(key_bits))?;
+    let offset = integer.checked_sub(dense.base)? as usize;
+    if offset >= dense.slots.len() {
+        return None;
+    }
+    let entry = *dense.slots.get_unchecked(offset);
+    if entry == DENSE_NUMERIC_EMPTY || entry >= size {
+        return Some(-1);
+    }
+    Some(entry as i32)
+}
+
+#[inline(always)]
 pub(crate) unsafe fn find_key_index(map: *const MapHeader, key: f64) -> i32 {
+    if let Some(index) = find_key_index_hot(map, key) {
+        return index;
+    }
+    find_key_index_cold(map, key)
+}
+
+/// Every lookup shape [`find_key_index_hot`] declines: tagged, zero and NaN
+/// keys, string content hashing, the pointer-identity index, the hashed
+/// numeric index, and the generic linear compare. Out of line on purpose —
+/// see the hot lane.
+#[inline(never)]
+unsafe fn find_key_index_cold(map: *const MapHeader, key: f64) -> i32 {
     let size = (*map).size;
     let key_bits = key.to_bits();
 
     // Small maps: linear scan beats side-table dispatch.
     if size <= SIDE_TABLE_THRESHOLD {
         let entries = entries_ptr(map);
+        // A plain (untagged, non-NaN), non-zero number is SameValueZero-equal
+        // to an entry key exactly when the bits match: no tagged value can
+        // equal a number, and only `±0` / NaN break bit identity, so those
+        // (and every non-number) keep the general comparison below.
+        if is_plain_nonzero_number_bits(key_bits) {
+            for i in 0..size {
+                let entry_bits = ptr::read(entries.add((i as usize) * 2)).to_bits();
+                if entry_bits == key_bits {
+                    return i as i32;
+                }
+            }
+            return -1;
+        }
         for i in 0..size {
             let entry_key = ptr::read(entries.add((i as usize) * 2));
             if jsvalue_eq(entry_key, key) {
@@ -1819,6 +1959,11 @@ pub extern "C" fn js_map_set_string_string(
     map_set_string_returning_receiver(map, key, boxed_heap_string_key(value))
 }
 
+/// Above this many entries `js_map_clear` resets the string/pointer
+/// side-tables unconditionally rather than reading every key to see whether
+/// it has to.
+const SIDE_TABLE_CLEAR_SCAN_MAX: u32 = 16;
+
 /// Get a value from the map by key
 /// Returns the value, or TAG_UNDEFINED if not found
 #[no_mangle]
@@ -1838,11 +1983,67 @@ fn map_get_resolved(map: *const MapHeader, key: f64) -> f64 {
 
         if idx >= 0 {
             let entries = entries_ptr(map);
-            return ptr::read(entries.add((idx as usize) * 2 + 1));
+            let value_slot = entries.add((idx as usize) * 2 + 1);
+            let value = ptr::read(value_slot);
+            return heal_forwarded_array_value(map, value_slot, value);
         }
 
         f64::from_bits(TAG_UNDEFINED)
     }
+}
+
+/// Rewrite a Map value that still names an Array growth stub to the live head.
+///
+/// `js_array_grow` preserves JavaScript identity by leaving a forwarding stub
+/// at the old address, and codegen writes the grown head back only into the
+/// binding it pushed through. A container that handed out the array — the
+/// `componentData.get(type).push(v)` shape — keeps the stub, so every later
+/// `get` returns it and every element access re-runs the tracked forwarding
+/// resolver. That was the single largest runtime leaf on the ECS command
+/// path. The stub and its target are both arrays the resolver validates, so
+/// substituting the live head is unobservable (`===` already resolves
+/// forwarding); the slot store goes through the ordinary external-slot
+/// barrier. Non-pointers, non-arrays, and anything the cheap generation
+/// classifier cannot place are returned untouched.
+#[inline]
+unsafe fn heal_forwarded_array_value(
+    map: *const MapHeader,
+    value_slot: *const f64,
+    value: f64,
+) -> f64 {
+    let bits = value.to_bits();
+    if bits & crate::value::TAG_MASK != crate::value::POINTER_TAG {
+        return value;
+    }
+    let raw = (bits & crate::value::POINTER_MASK) as usize;
+    if raw < crate::gc::GC_HEADER_SIZE
+        || raw % std::mem::align_of::<crate::gc::GcHeader>() != 0
+        || !crate::value::addr_class::is_plausible_heap_addr(raw)
+    {
+        return value;
+    }
+    // A POINTER_TAG value in a Map entry was stored by the runtime and is kept
+    // alive by the entry itself, so its header can be read after the band
+    // check, exactly as codegen's inline array guards read it. Only the
+    // forwarding bit is decided here; the full resolver validates the target.
+    let header = (raw - crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
+    if (*header).obj_type != crate::gc::GC_TYPE_ARRAY
+        || (*header).gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
+    {
+        return value;
+    }
+    let live = crate::array::clean_arr_ptr(raw as *const crate::array::ArrayHeader);
+    if live.is_null() || live as usize == raw {
+        return value;
+    }
+    let live_value = crate::value::js_nanbox_pointer(live as i64);
+    // GC_STORE_AUDIT(EXTERNAL_BARRIERED): map value slot uses the shared external-slot helper.
+    crate::gc::runtime_store_external_jsvalue_slot(
+        map as usize,
+        value_slot as usize,
+        live_value.to_bits(),
+    );
+    live_value
 }
 
 /// Fast `Map.get`/`ReadonlyMap.get` for a declared structural receiver.
@@ -2200,6 +2401,28 @@ pub extern "C" fn js_map_clear(map: *mut MapHeader) {
     if map.is_null() {
         return;
     }
+    // Every index this function resets mirrors the entries exactly (insert,
+    // delete, clear and the GC rewrites keep them in step), so an already-empty
+    // map has nothing to reset: the per-entity `adds.clear(); removes.clear()`
+    // of a change set is this case half the time.
+    let size = unsafe { (*map).size };
+    if size == 0 {
+        return;
+    }
+    // The string and pointer side-tables hold an entry only for a string or
+    // pointer key the map holds. A small map whose keys are all plain numbers
+    // (or bits-stable primitives) owes them nothing, and reading its keys is
+    // cheaper than the two thread-local resolutions plus two hash probes
+    // that find two empty tables — the per-frame grouping maps of an ECS
+    // are this shape, ten thousand clears a frame.
+    let side_tables_may_hold_this_map = size > SIDE_TABLE_CLEAR_SCAN_MAX
+        || unsafe {
+            let entries = entries_ptr(map);
+            (0..size as usize).any(|i| {
+                let key_bits = ptr::read(entries.add(i * 2)).to_bits();
+                !is_safe_numeric_key(key_bits)
+            })
+        };
     unsafe {
         (*map).size = 0;
     }
@@ -2207,6 +2430,9 @@ pub extern "C" fn js_map_clear(map: *mut MapHeader) {
         if let Some(index) = (*map).numeric_index.as_mut() {
             index.clear();
         }
+    }
+    if !side_tables_may_hold_this_map {
+        return;
     }
     MAP_STRING_INDEX.with(|idx| {
         let mut idx = idx.borrow_mut();
@@ -2940,6 +3166,129 @@ mod tests {
     }
 
     #[test]
+    fn clear_resets_every_index_whatever_the_key_kinds() {
+        // Numeric-only map: cleared without touching the side-tables; the
+        // numeric index is reset (a re-added key is found, a removed one not).
+        let map = js_map_alloc(4);
+        for key in 1..=3 {
+            js_map_set(map, key as f64, (key * 10) as f64);
+        }
+        js_map_clear(map);
+        assert_eq!(js_map_size(map), 0);
+        assert_eq!(js_map_has(map, 2.0), 0);
+        js_map_set(map, 2.0, 5.0);
+        assert_eq!(js_map_get(map, 2.0), 5.0);
+        assert_eq!(js_map_has(map, 1.0), 0);
+        // Clearing an empty map is a no-op that leaves it usable.
+        js_map_clear(map);
+        js_map_clear(map);
+        js_map_set(map, 7.0, 8.0);
+        assert_eq!(js_map_get(map, 7.0), 8.0);
+        assert_eq!(js_map_size(map), 1);
+
+        // String-keyed map: the content-hashed side-table must be reset too —
+        // a stale index entry would make the re-added key's lookup land on a
+        // wrong entry slot.
+        let strings = js_map_alloc(4);
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let key_a = js_string_from_bytes(b"alpha".as_ptr(), 5);
+        let key_b = js_string_from_bytes(b"beta".as_ptr(), 4);
+        let _ra = scope.root_raw_mut_ptr(key_a);
+        let _rb = scope.root_raw_mut_ptr(key_b);
+        js_map_set_string_i32(strings, key_a, 1);
+        js_map_set_string_i32(strings, key_b, 2);
+        js_map_set(strings, 9.0, 3.0);
+        js_map_clear(strings);
+        assert_eq!(js_map_size(strings), 0);
+        assert_eq!(js_map_has_string_key(strings, key_a), 0);
+        js_map_set_string_i32(strings, key_b, 22);
+        js_map_set_string_i32(strings, key_a, 11);
+        assert_eq!(
+            js_map_get_string_key(strings, key_a).to_bits(),
+            crate::value::JSValue::int32(11).bits()
+        );
+        assert_eq!(
+            js_map_get_string_key(strings, key_b).to_bits(),
+            crate::value::JSValue::int32(22).bits()
+        );
+        assert_eq!(js_map_has(strings, 9.0), 0);
+
+        // A map past the scan bound still resets everything.
+        let big = js_map_alloc(4);
+        for key in 0..40 {
+            js_map_set(big, key as f64, key as f64);
+        }
+        js_map_set_string_i32(big, key_a, 5);
+        js_map_clear(big);
+        assert_eq!(js_map_size(big), 0);
+        assert_eq!(js_map_has(big, 12.0), 0);
+        assert_eq!(js_map_has_string_key(big, key_a), 0);
+        js_map_set_string_i32(big, key_a, 6);
+        assert_eq!(
+            js_map_get_string_key(big, key_a).to_bits(),
+            crate::value::JSValue::int32(6).bits()
+        );
+    }
+
+    #[test]
+    fn hot_lookup_lane_agrees_with_the_cold_path_on_every_key_shape() {
+        let map = js_map_alloc(4);
+        // Small map: bit-identity scan, hit and definitive miss.
+        for key in 1..=4 {
+            js_map_set(map, key as f64, (key * 10) as f64);
+        }
+        for key in 1..=4 {
+            assert_eq!(js_map_get(map, key as f64), (key * 10) as f64);
+            assert_eq!(js_map_has(map, key as f64), 1);
+        }
+        assert_eq!(js_map_has(map, 5.0), 0);
+        assert_eq!(js_map_has(map, 2.5), 0);
+        // Zero, -0 and NaN keys are the cold path's (SameValueZero).
+        js_map_set(map, 0.0, 1.0);
+        assert_eq!(js_map_get(map, -0.0), 1.0);
+        js_map_set(map, f64::NAN, 2.0);
+        assert_eq!(js_map_get(map, f64::from_bits(0x7FF8_0000_0000_0001)), 2.0);
+
+        // A tagged key (a boolean) never takes the numeric lane.
+        let boxed_true = f64::from_bits(crate::value::TAG_TRUE);
+        js_map_set(map, boxed_true, 5.0);
+        assert_eq!(js_map_get(map, boxed_true), 5.0);
+        assert_eq!(js_map_has(map, boxed_true), 1);
+        for key in 1..=4 {
+            assert_eq!(js_map_get(map, key as f64), (key * 10) as f64);
+        }
+
+        // Dense span (a fresh map, so the run is dense enough to build the
+        // range table): hit, definitive in-span miss, out-of-span keys through
+        // the hashed index; negative / fractional / huge keys never touch the
+        // range table.
+        let dense = js_map_alloc(4);
+        for key in 1_024..1_040 {
+            js_map_set(dense, key as f64, (key * 10) as f64);
+        }
+        let (base, len) = test_map_dense_numeric_index_range(dense)
+            .expect("a dense run should activate the numeric range index");
+        js_map_set(dense, 1_000_000.0, 77.0);
+        js_map_set(dense, -3.0, 88.0);
+        js_map_set(dense, 4.5, 99.0);
+        js_map_set(dense, u32::MAX as f64 + 1.0, 66.0);
+        for key in 1_024..1_040 {
+            assert_eq!(js_map_get(dense, key as f64), (key * 10) as f64);
+            assert_eq!(js_map_has(dense, key as f64), 1);
+        }
+        assert_eq!(js_map_has(dense, 1_023.0), 0);
+        assert_eq!(js_map_has(dense, 1_040.0), 0);
+        assert_eq!(js_map_has(dense, (base as f64) + (len as f64) + 5.0), 0);
+        assert_eq!(js_map_has(dense, 1_031.5), 0);
+        assert_eq!(js_map_get(dense, 1_000_000.0), 77.0);
+        assert_eq!(js_map_get(dense, -3.0), 88.0);
+        assert_eq!(js_map_get(dense, 4.5), 99.0);
+        assert_eq!(js_map_get(dense, u32::MAX as f64 + 1.0), 66.0);
+        assert_eq!(js_map_has(dense, 0.0), 0);
+        assert_eq!(js_map_has(dense, f64::NAN), 0);
+    }
+
+    #[test]
     fn numeric_index_adapts_to_dense_high_range_without_widening_for_sparse_keys() {
         let map = js_map_alloc(4);
 
@@ -2973,8 +3322,18 @@ mod tests {
         );
 
         js_map_clear(map);
-        assert_eq!(test_map_dense_numeric_index_range(map), None);
+        // The span survives `clear()` (a per-frame grouping map repopulates
+        // the same ids), but every slot is reset: nothing is found and the
+        // next population starts from zero density.
+        assert_eq!(test_map_dense_numeric_index_range(map), Some((base, len)));
         assert_eq!(js_map_size(map), 0);
+        for key in 1_024..1_040 {
+            assert_eq!(js_map_has(map, key as f64), 0);
+        }
+        js_map_set(map, 1_030.0, 5.0);
+        assert_eq!(js_map_get(map, 1_030.0), 5.0);
+        assert_eq!(js_map_has(map, 1_031.0), 0);
+        assert_eq!(js_map_size(map), 1);
     }
 
     #[test]
@@ -3093,5 +3452,39 @@ mod tests {
             js_map_entry_key_at(map, 27).to_bits(),
             pointer_keys[1].to_bits()
         );
+    }
+
+    /// A Map value that names an Array growth stub is healed to the live head
+    /// on `get`, and the entry itself is rewritten so later reads are direct.
+    #[test]
+    fn map_get_heals_a_forwarded_array_value() {
+        unsafe {
+            let map = js_map_alloc(4);
+            let mut arr = crate::array::js_array_alloc(2);
+            let stub_value = crate::value::js_nanbox_pointer(arr as i64);
+            js_map_set(map, 7.0, stub_value);
+            // Grow past the initial capacity so the original head becomes a
+            // forwarding stub.
+            for i in 0..64 {
+                arr = crate::array::js_array_push_f64(arr, i as f64);
+            }
+            assert_ne!(
+                arr as usize,
+                stub_value.to_bits() as usize & 0xFFFF_FFFF_FFFF
+            );
+            let got = js_map_get(map, 7.0);
+            assert_eq!(
+                got.to_bits() & 0x0000_FFFF_FFFF_FFFF,
+                arr as u64,
+                "get must answer the live head"
+            );
+            let entries = entries_ptr(map);
+            assert_eq!(
+                ptr::read(entries.add(1)).to_bits(),
+                got.to_bits(),
+                "the entry slot is rewritten to the live head"
+            );
+            assert_eq!(crate::array::js_array_get_f64(arr, 63), 63.0);
+        }
     }
 }

@@ -1,8 +1,15 @@
 //! Indexing — length / element get / element set / hybrid string-or-index dispatch.
-use super::header::{array_numeric_layout, NumericArrayLayout};
+use super::indexing_support::*;
 use super::*;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::Ordering;
+
+#[path = "indexing_keyed.rs"]
+mod keyed;
+pub use keyed::{
+    js_array_get_index_or_string, js_array_set_index_or_string,
+    js_array_set_index_or_string_strict, js_array_set_string_key,
+};
 
 const MAX_DENSE_ARRAY_GROW_LENGTH: u32 = 1_000_000;
 
@@ -16,130 +23,25 @@ const MAX_DENSE_ARRAY_GROW_LENGTH: u32 = 1_000_000;
 /// benchmark for 6 hours (Regression Check, v0.5.1129–v0.5.1150).
 const DENSE_ARRAY_GAP_LIMIT: u32 = 1024;
 
-/// A strict-mode element write (`arr[i] = v`) to a **frozen** array's existing
-/// index is `[[Set]]` on a non-writable data property with `Throw = true`
-/// (ECMA-262 §10.4.2.4 → OrdinarySetWithOwnDescriptor step 2.b.i), so it must
-/// throw a **TypeError** rather than silently no-op. Perry compiles everything
-/// strict, so the codegen `arr[i] = v` fast paths — which call these
-/// `js_array_set_f64*` helpers directly — carry the strict-`Set` contract.
-/// Matches V8's message. (test262 built-ins/Array element-write-on-frozen.)
-#[cold]
-fn throw_frozen_array_index_write(index: u32) -> ! {
-    crate::collection_iter::throw_type_error(&format!(
-        "Cannot assign to read only property '{index}' of object '[object Array]'"
-    ));
-}
-
-/// A strict-mode write that would *add* a new index to a non-extensible
-/// (frozen / sealed / preventExtensions'd) array — `arr[i] = v` with
-/// `i >= length` — is `CreateDataProperty` on a non-extensible object with
-/// `Throw = true`, so it must throw a **TypeError**. Matches V8's message.
-#[cold]
-fn throw_array_not_extensible_add(index: u32) -> ! {
-    crate::collection_iter::throw_type_error(&format!(
-        "Cannot add property {index}, object is not extensible"
-    ));
-}
-
-/// Sticky flag: someone installed an indexed property on `Array.prototype`.
-/// An out-of-bounds element read on an ordinary array must fall through to
-/// `Array.prototype[index]` (ECMA-262 OrdinaryGet -> prototype chain), but in
-/// real code nobody adds numeric indices there, so the hot OOB path stays a
-/// single relaxed atomic load until the (rare) write flips this. The address
-/// it is compared against lives in [`super::prototype_addr`], which also owns
-/// the GC hazard that address carries (#6981).
-static ARRAY_PROTO_HAS_INDEX: AtomicBool = AtomicBool::new(false);
-
-/// Same idea for `Object.prototype`: a numeric index installed there
-/// (`Object.prototype[2] = 2`, or a defineProperty accessor) shows through
-/// array HOLES and OOB reads (chain: arr -> Array.prototype ->
-/// Object.prototype; test262 concat/S15.4.4.4_A3_T3). Flipped by the object
-/// index-write/defineProperty hooks; consulted by the typed-feedback guards
-/// and the hole/OOB read fallbacks.
-static OBJECT_PROTO_HAS_INDEX: AtomicBool = AtomicBool::new(false);
-
-/// Sticky summary of the process-wide conditions that invalidate codegen's
-/// inline plain-array index guard. The generated guard loads this byte
-/// directly; keeping the three rare prototype conditions behind one exported
-/// byte avoids an out-of-line runtime call on every array read.
-#[no_mangle]
-pub static PERRY_ARRAY_INDEX_FAST_PATH_INVALIDATED: AtomicU8 = AtomicU8::new(0);
-
 #[inline]
 pub(crate) fn invalidate_array_index_fast_path() {
     PERRY_ARRAY_INDEX_FAST_PATH_INVALIDATED.store(1, Ordering::Relaxed);
 }
 
-/// Test-only companion to
-/// `prototype_chain::test_swap_array_static_proto_recorded`: swap the summary
-/// byte generated code reads, returning the previous value. Only for a test
-/// that knowingly set it and is putting the process back as it found it.
 #[cfg(test)]
-pub(crate) fn test_swap_array_index_fast_path_invalidated(value: u8) -> u8 {
-    PERRY_ARRAY_INDEX_FAST_PATH_INVALIDATED.swap(value, Ordering::Relaxed)
+thread_local! {
+    static STRICT_DENSE_POINTER_OVERWRITE_HITS: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
 }
 
-/// Record (if `obj` is the canonical `Object.prototype`) that it now carries
-/// an indexed property. Called from the object index-write / numeric
-/// defineProperty paths; cheap (relaxed loads + compare).
-#[inline]
-pub(crate) fn note_object_prototype_index_write(obj: usize) {
-    if !OBJECT_PROTO_HAS_INDEX.load(Ordering::Relaxed) && obj != 0 && obj == object_prototype_addr()
-    {
-        OBJECT_PROTO_HAS_INDEX.store(true, Ordering::Relaxed);
-        invalidate_array_index_fast_path();
-    }
+#[cfg(test)]
+pub(crate) fn test_strict_dense_pointer_overwrite_hits() -> u64 {
+    STRICT_DENSE_POINTER_OVERWRITE_HITS.with(std::cell::Cell::get)
 }
 
 pub(crate) fn object_prototype_has_index_flag() -> bool {
     OBJECT_PROTO_HAS_INDEX.load(Ordering::Relaxed)
-}
-
-/// Sticky flag: user code replaced or deleted `Array.prototype[Symbol.iterator]`.
-/// `js_get_iterator`'s array short-circuit assumes the builtin values iterator;
-/// once this flips, GetIterator on an array must consult the (patched) method
-/// per spec — or throw TypeError when it was deleted. Same single-relaxed-load
-/// hot-path shape as `ARRAY_PROTO_HAS_INDEX` above.
-static ARRAY_PROTO_ITERATOR_MODIFIED: AtomicBool = AtomicBool::new(false);
-
-/// The same fact as [`ARRAY_PROTO_ITERATOR_MODIFIED`], exported so GENERATED
-/// code can read it (#7760 item 1).
-///
-/// `for…of` over a statically-proven array desugars to an index loop
-/// (`__i < __arr.length` / `__arr[__i]`) in HIR lowering, which never consults
-/// the iteration protocol — so a patched `Array.prototype[Symbol.iterator]` was
-/// ignored there even after the spread paths were fixed (#7542). The loop now
-/// branches on this flag ONCE at entry, which is also what the spec wants:
-/// `for…of` performs GetIterator exactly once, so a patch landing mid-loop must
-/// not change the iterator already in hand.
-///
-/// A separate `u8` global rather than exposing the `AtomicBool`: codegen emits
-/// a plain volatile `i8` load, the same shape as
-/// `PERRY_ARRAY_INDEX_FAST_PATH_INVALIDATED`, so the fast arm pays one load and
-/// a predictable branch per LOOP — not per iteration — and the index loop
-/// itself is emitted byte-identically to before.
-#[no_mangle]
-pub static PERRY_ARRAY_PROTO_ITERATOR_PATCHED: AtomicU8 = AtomicU8::new(0);
-
-/// Record (if `obj` is `Array.prototype` and `sym_key` is the well-known
-/// `Symbol.iterator`) that the array iteration protocol has been tampered
-/// with. Called from the symbol-property set/delete paths.
-pub(crate) fn note_array_proto_iterator_write(obj: usize, sym_key: usize) {
-    if ARRAY_PROTO_ITERATOR_MODIFIED.load(Ordering::Relaxed) || obj == 0 || sym_key == 0 {
-        return;
-    }
-    if obj == array_prototype_addr()
-        && sym_key == crate::symbol::well_known_symbol("iterator") as usize
-    {
-        ARRAY_PROTO_ITERATOR_MODIFIED.store(true, Ordering::Relaxed);
-        // Publish to generated code. Release so a loop that observes the `1`
-        // also observes the prototype write that preceded it.
-        PERRY_ARRAY_PROTO_ITERATOR_PATCHED.store(1, Ordering::Release);
-    }
-}
-
-pub(crate) fn array_proto_iterator_modified() -> bool {
-    ARRAY_PROTO_ITERATOR_MODIFIED.load(Ordering::Relaxed)
 }
 
 /// Record (if `arr` is `Array.prototype`) that the prototype now carries an
@@ -226,7 +128,31 @@ pub(crate) fn array_iteration_is_exotic(arr: *const ArrayHeader) -> bool {
     if arr.is_null() {
         return false;
     }
-    if array_object_flags(arr) & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0 {
+    if crate::buffer::is_registered_buffer(arr as usize)
+        || crate::typedarray::lookup_typed_array_kind(arr as usize).is_some()
+    {
+        return true;
+    }
+    // SAFETY: the clean above resolved this exact live head, and the flag read
+    // precedes every operation that could allocate or safepoint. The
+    // compatible header-less receivers exited above.
+    let flags = unsafe { array_object_flags_resolved(arr) };
+    unsafe { array_iteration_is_exotic_resolved(arr, flags) }
+}
+
+/// [`array_iteration_is_exotic`] for a caller that already resolved the live
+/// plain-array head, excluded Buffer/TypedArray receivers, and owns the header
+/// word: the policy tests without a second receiver resolution and registry
+/// probe (the iteration helpers call this once per invocation).
+///
+/// # Safety
+///
+/// `arr` and `flags` must satisfy [`array_object_flags_resolved`]'s contract.
+pub(crate) unsafe fn array_iteration_is_exotic_resolved(
+    arr: *const ArrayHeader,
+    flags: u16,
+) -> bool {
+    if flags & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0 {
         return true;
     }
     if ARRAY_PROTO_HAS_INDEX.load(Ordering::Relaxed) {
@@ -510,110 +436,6 @@ fn array_get_property_by_key(arr: *const ArrayHeader, key: *const crate::StringH
     f64::from_bits(value.bits())
 }
 
-#[no_mangle]
-/// Reported length of an object's keys/property array, capped at its physical
-/// capacity.
-///
-/// Object property walks (the wide-key field-get index and `Object.assign`'s
-/// source enumeration) size their work by the keys array's length. A dense
-/// keys array's logical length can never exceed its capacity, so for a
-/// well-formed array this is a no-op. But when a keys array is malformed and
-/// `js_array_length` reports a bogus, oversized value (observed: a pointer-
-/// sized length ~= the keys pointer's own low bits, far beyond the real key
-/// count), an unclamped `for i in 0..len` / `HashMap::with_capacity(len)` turns
-/// a single missing-property read or `Object.assign` into a multi-GB / minutes-
-/// long spin. Capping to capacity bounds that work to physically-present slots.
-///
-/// FOR DENSE KEYS/PROPERTY ARRAYS ONLY — general JS arrays may have
-/// `length > capacity` (sparse), where this cap would be incorrect.
-pub(crate) unsafe fn keys_array_len_capped_to_capacity(arr: *const ArrayHeader) -> usize {
-    // #7765: a well-formed dense keys array answers from its own two words.
-    // `js_array_length` re-derives the same number through a proxy probe, a
-    // second header read for its lazy/object arms, and a `clean_arr_ptr`
-    // forwarding walk — once per property read on the field-get funnel.
-    // `length <= capacity` is exactly the well-formed case; the sparse and
-    // corrupted shapes this cap exists for fall through unchanged.
-    if let Some(header) = crate::value::addr_class::try_read_gc_header(arr as usize) {
-        if header.obj_type == crate::gc::GC_TYPE_ARRAY
-            && header.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
-            && (*arr).length <= (*arr).capacity
-        {
-            return (*arr).length as usize;
-        }
-    }
-    // A forwarding stub overwrites the old payload's `(length, capacity)`
-    // words with the target address. Resolve once, then read BOTH facts from
-    // the live header; mixing a resolved length with the stale from-space
-    // capacity can truncate an otherwise exact shape count.
-    let live = clean_arr_ptr(arr);
-    if live.is_null() {
-        return js_array_length(arr) as usize;
-    }
-    let raw = js_array_length(live) as usize;
-    raw.min((*live).capacity as usize)
-}
-
-/// Read slot `index` of a dense internal keys/property array.
-///
-/// The object field-get funnel has already proved `keys` is a live
-/// `GC_TYPE_ARRAY` — it reads the `GcHeader` and returns `undefined` otherwise
-/// — and has capped `index` below the array's own capacity (see
-/// [`keys_array_len_capped_to_capacity`]). Those are precisely the two facts
-/// [`js_array_get_f64`] re-establishes from scratch on every call: a
-/// `clean_arr_ptr` forwarding walk, a lazy-header probe, the exotic-receiver
-/// classifications and a descriptor-flag read — per key examined, per property
-/// read. On `gc-handoff/apps/asyncpipe_big.ts` that one funnel was 78% of all
-/// `js_array_get_f64` samples.
-///
-/// Falls back to the general getter for anything it cannot serve on those
-/// terms — a forwarded array (which `clean_arr_ptr` would relocate), one
-/// carrying index descriptors, an out-of-range index, or a hole (which reads
-/// through the prototype chain) — so no general semantics move. Keys arrays
-/// are dense and descriptor-free, so the fallback is the cold arm.
-#[inline]
-pub(crate) unsafe fn keys_array_slot(
-    keys: *const ArrayHeader,
-    index: u32,
-) -> crate::value::JSValue {
-    if let Some(header) = crate::value::addr_class::try_read_gc_header(keys as usize) {
-        if header.obj_type == crate::gc::GC_TYPE_ARRAY
-            && header.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
-            && header._reserved & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS == 0
-            && index < (*keys).length
-            && index < (*keys).capacity
-        {
-            let elements =
-                (keys as *const u8).add(std::mem::size_of::<ArrayHeader>()) as *const f64;
-            let raw = std::ptr::read(elements.add(index as usize));
-            if raw.to_bits() != crate::value::TAG_HOLE {
-                return crate::value::JSValue::from_bits(raw.to_bits());
-            }
-        }
-    }
-    #[cfg(test)]
-    KEYS_ARRAY_SLOT_FALLBACKS.with(|c| c.set(c.get().wrapping_add(1)));
-    crate::array::js_array_get(keys, index)
-}
-
-#[cfg(test)]
-thread_local! {
-/// Times [`keys_array_slot`] could NOT serve a slot from the dense words and
-/// had to delegate. Asserted in both directions by
-/// `array::collection_tag_tests` — zero for the dense keys arrays the fast path
-/// exists for, non-zero for every shape it must refuse — so a fast path that
-/// silently stopped applying, or one that started swallowing a shape it should
-/// have delegated, both go red.
-///
-/// Per THREAD — `cargo test` runs every case on its own thread in one process,
-/// so a process-global counter would be moved by whatever else is running.
-    static KEYS_ARRAY_SLOT_FALLBACKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn test_keys_array_slot_fallbacks() -> u64 {
-    KEYS_ARRAY_SLOT_FALLBACKS.with(|c| c.get())
-}
-
 /// Auto-opt dead-strip anchor: codegen emits a bare `js_array_length` symbol in
 /// native-region wrappers (`__perry_wrap_*`) and elsewhere, so it must be a
 /// `#[no_mangle]` C export AND survive dead-stripping even when no Rust caller
@@ -624,6 +446,47 @@ static KEEP_ARRAY_LENGTH: extern "C" fn(*const ArrayHeader) -> u32 = js_array_le
 
 #[no_mangle]
 pub extern "C" fn js_array_length(arr: *const ArrayHeader) -> u32 {
+    // Fast lane: a live plain array on an arena page. Every dynamic `.length`
+    // read and every native push lowering (which re-reads the length for the
+    // result) lands here; the proxy, Set/Map, object and subclass arms below
+    // all begin with probes this receiver cannot satisfy. A proxy id sits in
+    // the handle band and a Set/Map/object header has another type, so the
+    // lane's own checks exclude them.
+    {
+        let bits = arr as u64;
+        let top16 = bits >> 48;
+        let raw = if top16 >= 0x7FF8 {
+            if top16 == (crate::value::POINTER_TAG >> 48) {
+                (bits & crate::value::POINTER_MASK) as usize
+            } else {
+                0
+            }
+        } else {
+            bits as usize
+        };
+        if raw >= crate::gc::GC_HEADER_SIZE
+            && raw % std::mem::align_of::<crate::gc::GcHeader>() == 0
+            && crate::value::addr_class::is_plausible_heap_addr(raw)
+            && !matches!(
+                crate::arena::classify_heap_generation(raw),
+                crate::arena::HeapGeneration::Unknown
+            )
+        {
+            // SAFETY: owned arena page, header-aligned; the header word
+            // precedes every arena block.
+            let header = (raw - crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
+            let (obj_type, gc_flags) = unsafe { ((*header).obj_type, (*header).gc_flags) };
+            if obj_type == crate::gc::GC_TYPE_ARRAY
+                && gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
+                && gc_flags & crate::gc::GC_FLAG_ARENA != 0
+            {
+                let hdr = unsafe { &*(raw as *const ArrayHeader) };
+                if hdr.length <= hdr.capacity {
+                    return hdr.length;
+                }
+            }
+        }
+    }
     // #5135: a Proxy typed (statically) as an array (immer drafts) reaches here
     // with the masked proxy id. Read `length` through the proxy `get` trap
     // rather than deref-ing the id as an `ArrayHeader`.
@@ -694,6 +557,14 @@ pub extern "C" fn js_array_length(arr: *const ArrayHeader) -> u32 {
                 && ((*gc_header).obj_type == crate::gc::GC_TYPE_OBJECT
                     || (*gc_header).obj_type == crate::gc::GC_TYPE_CLOSURE)
             {
+                if let Some(v) = crate::array::subclass::array_subclass_fast_length_raw(raw_ptr) {
+                    let n = crate::builtins::js_number_coerce(v);
+                    return if n.is_nan() || n <= 0.0 {
+                        0
+                    } else {
+                        n.min(u32::MAX as f64) as u32
+                    };
+                }
                 let key = crate::string::js_string_from_bytes(b"length".as_ptr(), 6);
                 let v = crate::object::js_object_get_field_by_name_f64(
                     raw_ptr as *const crate::object::ObjectHeader,
@@ -753,6 +624,9 @@ pub extern "C" fn js_array_get_f64_unchecked(arr: *const ArrayHeader, index: u32
     let cleaned = clean_arr_ptr(arr);
     if cleaned.is_null() {
         // #7574: array-like OBJECT receiver — see `js_array_get_f64`.
+        if let Some(value) = crate::array::subclass::array_subclass_fast_index_get_raw(arr, index) {
+            return value;
+        }
         if crate::array::subclass::array_object_receiver(arr).is_some() {
             return js_array_get_f64(arr, index);
         }
@@ -761,7 +635,10 @@ pub extern "C" fn js_array_get_f64_unchecked(arr: *const ArrayHeader, index: u32
     let arr = cleaned;
     // Index accessors / custom attrs installed via `Object.defineProperty`
     // need the descriptor-aware getter.
-    if array_object_flags(arr) & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0 {
+    // SAFETY: `clean_arr_ptr` returned this live head and no safepoint has
+    // intervened.
+    let flags = unsafe { array_object_flags_resolved(arr) };
+    if flags & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0 {
         return js_array_get_f64(arr, index);
     }
     const TAG_UNDEFINED_F64: f64 = f64::from_bits(0x7FFC_0000_0000_0001u64);
@@ -802,9 +679,12 @@ pub extern "C" fn js_array_numeric_get_f64_unboxed(arr: *mut ArrayHeader, index:
     // proved this receiver is a non-forwarded plain Array with raw numeric
     // layout, so keep the helper leaf-small: avoid re-running the expensive
     // rebuild/descriptor path on every indexed read in numeric loops.
+    // SAFETY: the clean above resolved this exact live head and no safepoint
+    // has intervened.
+    let flags = unsafe { array_object_flags_resolved(arr) };
     unsafe {
-        if array_numeric_layout(arr) == Some(NumericArrayLayout::RawF64)
-            && array_object_flags(arr) & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS == 0
+        if flags & crate::gc::GC_ARRAY_RAW_F64_LAYOUT != 0
+            && flags & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS == 0
             && index < (*arr).length
         {
             let elements_ptr =
@@ -911,11 +791,42 @@ pub extern "C" fn js_array_get_f64(arr: *const ArrayHeader, index: u32) -> f64 {
         }
     }
 
+    // A %TypedArray% receiver reaching the generic element read (an untyped
+    // `mask[i]` on a `Uint32Array` field) used to pay `clean_arr_ptr`'s
+    // tracked-allocation resolver — a guaranteed miss for a typed array —
+    // before the registry probe below could route it. The managed header tag
+    // already read above selects the typed authority first; the registry
+    // remains the liveness/layout proof, exactly as for Map/Set.
+    if receiver_tag.0 == crate::gc::GC_TYPE_TYPED_ARRAY
+        && crate::typedarray::lookup_typed_array_kind(raw_ptr as usize).is_some()
+    {
+        return crate::typedarray::js_typed_array_get(
+            raw_ptr as *const crate::typedarray::TypedArrayHeader,
+            index as i32,
+        );
+    }
+
+    // An ordinary-object receiver (the object-backed `class X extends Array`
+    // instance — the wolf-ecs `Archetype` behind `packed[sparse[x]]`) can
+    // never be an `ArrayHeader`, so `clean_arr_ptr`'s tracked-allocation
+    // resolver is a guaranteed miss for it. Ask the exact dense-subclass
+    // proof first; it re-validates the object header itself. Every rejected
+    // case (holes, descriptors, prototype overrides, spilled/unknown layouts)
+    // still reaches the complete resolver and spec-generic `Get` below.
+    if receiver_tag.0 == crate::gc::GC_TYPE_OBJECT {
+        if let Some(value) = crate::array::subclass::array_subclass_fast_index_get_raw(arr, index) {
+            return value;
+        }
+    }
+
     let cleaned = clean_arr_ptr(arr);
     if cleaned.is_null() {
         // #7574: `a[i]` on a `class X extends Array` instance held in a
         // `T[]`-annotated binding. Read the object's indexed property through
         // the spec-generic `Get`, not the `ObjectHeader` words.
+        if let Some(value) = crate::array::subclass::array_subclass_fast_index_get_raw(arr, index) {
+            return value;
+        }
         if let Some(recv) = crate::array::subclass::array_object_receiver(arr) {
             return crate::array::subclass::array_object_index_get(recv, index);
         }
@@ -1015,11 +926,14 @@ pub extern "C" fn js_array_set_f64_unchecked(arr: *mut ArrayHeader, index: u32, 
     if arr.is_null() {
         return;
     }
-    if array_is_frozen(arr) {
+    // SAFETY: the clean above resolved this exact live head and no safepoint
+    // has intervened.
+    let flags = unsafe { array_object_flags_resolved(arr) };
+    if flags & crate::gc::OBJ_FLAG_FROZEN != 0 {
         return;
     }
     // Index accessors / non-writable attrs need the descriptor-aware setter.
-    if array_object_flags(arr) & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0 {
+    if flags & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0 {
         js_array_set_f64_extend(arr, index, value);
         return;
     }
@@ -1032,12 +946,9 @@ pub extern "C" fn js_array_set_f64_unchecked(arr: *mut ArrayHeader, index: u32, 
             array_sparse_index_property_set(arr, index, value);
             return;
         }
-        let value = canonicalize_array_numeric_store_value(arr, value);
-        let value_bits = value.to_bits();
-        let elements_ptr = (arr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut f64;
-        // GC_STORE_AUDIT(BARRIERED): unchecked array set is immediately recorded via note_array_slot.
-        ptr::write(elements_ptr.add(index as usize), value);
-        note_array_slot(arr, index as usize, value_bits);
+        // GC_STORE_AUDIT(BARRIERED): the resolved store performs the layout
+        // note and write barrier as part of the slot write.
+        store_array_slot_resolved(arr, index as usize, value, flags);
     }
 }
 
@@ -1052,7 +963,9 @@ pub extern "C" fn js_array_numeric_set_f64_unboxed(
         return 0;
     }
 
-    let flags = array_object_flags(arr);
+    // SAFETY: the clean above resolved this exact live head and no safepoint
+    // has intervened.
+    let flags = unsafe { array_object_flags_resolved(arr) };
     if flags & (crate::gc::OBJ_FLAG_FROZEN | crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS) != 0 {
         return 0;
     }
@@ -1063,7 +976,7 @@ pub extern "C" fn js_array_numeric_set_f64_unboxed(
     // the whole layout on every iteration. Preserve the helper fallback for
     // direct runtime calls and arrays that have not been converted yet.
     unsafe {
-        if index < (*arr).length && array_numeric_layout(arr) == Some(NumericArrayLayout::RawF64) {
+        if index < (*arr).length && flags & crate::gc::GC_ARRAY_RAW_F64_LAYOUT != 0 {
             let Some(number) = value_bits_to_number(value.to_bits()) else {
                 clear_array_numeric_layout(arr);
                 return 0;
@@ -1124,7 +1037,10 @@ pub extern "C" fn js_array_set_f64(arr: *mut ArrayHeader, index: u32, value: f64
         );
         return;
     }
-    if array_is_frozen(arr) {
+    // SAFETY: the clean above resolved this exact plain-array head; the
+    // Buffer/TypedArray exits precede this direct header read.
+    let flags = unsafe { array_object_flags_resolved(arr) };
+    if flags & crate::gc::OBJ_FLAG_FROZEN != 0 {
         return;
     }
     unsafe {
@@ -1136,12 +1052,9 @@ pub extern "C" fn js_array_set_f64(arr: *mut ArrayHeader, index: u32, value: f64
             array_sparse_index_property_set(arr, index, value);
             return;
         }
-        let value = canonicalize_array_numeric_store_value(arr, value);
-        let value_bits = value.to_bits();
-        let elements_ptr = (arr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut f64;
-        // GC_STORE_AUDIT(BARRIERED): array set is immediately recorded via note_array_slot.
-        ptr::write(elements_ptr.add(index as usize), value);
-        note_array_slot(arr, index as usize, value_bits);
+        // GC_STORE_AUDIT(BARRIERED): the resolved store performs the layout
+        // note and write barrier as part of the slot write.
+        store_array_slot_resolved(arr, index as usize, value, flags);
     }
 }
 
@@ -1174,7 +1087,17 @@ pub(crate) fn array_strict_index_write_guard(arr: *mut ArrayHeader, index: u32) 
     {
         return;
     }
-    let flags = array_object_flags(clean);
+    // SAFETY: `clean_arr_ptr_mut` returned this live plain-array head and the
+    // registry exits above exclude the compatible header-less receivers.
+    let flags = unsafe { array_object_flags_resolved(clean) };
+    array_strict_index_write_guard_resolved(clean, index, flags);
+}
+
+/// Strict element-write policy check for a live plain array whose header word
+/// the caller already owns. This contains no Perry allocation or safepoint, so
+/// the same resolved pointer and flags remain valid for the following store.
+#[inline]
+fn array_strict_index_write_guard_resolved(clean: *mut ArrayHeader, index: u32, flags: u16) {
     let length = unsafe { (*clean).length };
 
     // A descriptor-bearing array is rare, so keep all key construction and
@@ -1228,14 +1151,451 @@ pub(crate) fn array_strict_index_write_guard(arr: *mut ArrayHeader, index: u32) 
     }
 }
 
+/// Fast lane for the dominant element-store shape: a plain number written
+/// into an in-bounds slot of a live, unrestricted array whose GC layout is
+/// either pointer-free or tag-scanned.
+///
+/// The general path resolves the receiver through the tracked-header
+/// classifier, probes two registries, roots both operands in a handle scope,
+/// canonicalizes the value, and then funnels the slot write through the
+/// layout note and the write barrier. For this shape every one of those steps
+/// is provably a no-op, so it is answered here with a handful of header
+/// tests: the receiver is validated the same way `clean_arr_ptr` starts
+/// (tag strip, address band) and is then required to sit on a page the arena
+/// owns (`classify_heap_generation`, the cached lookup the write barrier
+/// itself relies on) before its header is read. Everything else — forwarded
+/// stubs, descriptors, frozen/sealed/non-extensible arrays, side-mask or typed
+/// or element-shape layouts, typed arrays and buffers, out-of-range indices,
+/// tagged or NaN values, `Array.prototype` — returns `false` untouched and
+/// takes the general path exactly as before.
+///
+/// A plain double needs no numeric canonicalization (it is already the raw
+/// `f64` the raw-f64 layout stores), cannot be a heap pointer (no barrier, no
+/// pointer-mask update), and keeps a pointer-free or tag-scanned layout valid.
+#[inline]
+unsafe fn try_strict_dense_number_store(
+    arr: *mut ArrayHeader,
+    index: u32,
+    value: f64,
+) -> Option<*mut ArrayHeader> {
+    const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+    let value_bits = value.to_bits();
+    // A plain double or an INT32 box (`value_bits_to_number` already refuses
+    // the class-reference values that share that tag). NaN keeps the general
+    // path so its canonical encoding stays in one place.
+    let Some(number) = super::header::value_bits_to_number(value_bits) else {
+        return None;
+    };
+    if number.is_nan() {
+        return None;
+    }
+    let bits = arr as u64;
+    let top16 = bits >> 48;
+    let raw = if top16 >= 0x7FF8 {
+        if top16 == 0x7FFC || bits & PAYLOAD_MASK == 0 {
+            return None;
+        }
+        (bits & PAYLOAD_MASK) as usize
+    } else {
+        bits as usize
+    };
+    if raw < crate::gc::GC_HEADER_SIZE
+        || raw % std::mem::align_of::<crate::gc::GcHeader>() != 0
+        || !crate::value::addr_class::is_plausible_heap_addr(raw)
+    {
+        return None;
+    }
+    if matches!(
+        crate::arena::classify_heap_generation(raw),
+        crate::arena::HeapGeneration::Unknown
+    ) {
+        return None;
+    }
+    let mut raw = raw;
+    let mut header = (raw - crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
+    if (*header).obj_type != crate::gc::GC_TYPE_ARRAY {
+        return None;
+    }
+    if (*header).gc_flags & crate::gc::GC_FLAG_FORWARDED != 0 {
+        // An alias that kept a growth stub (the resolver path-compresses
+        // longer chains to one edge): follow it once, re-proving the target
+        // exactly like the stub. Anything else stays on the full resolver.
+        let target = crate::gc::forwarding_address(header) as usize;
+        if target < crate::gc::GC_HEADER_SIZE
+            || target % std::mem::align_of::<crate::gc::GcHeader>() != 0
+            || !crate::value::addr_class::is_plausible_heap_addr(target)
+            || matches!(
+                crate::arena::classify_heap_generation(target),
+                crate::arena::HeapGeneration::Unknown
+            )
+        {
+            return None;
+        }
+        let target_header = (target - crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
+        if (*target_header).obj_type != crate::gc::GC_TYPE_ARRAY
+            || (*target_header).gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
+        {
+            return None;
+        }
+        raw = target;
+        header = target_header;
+    }
+    let flags = (*header)._reserved;
+    // Array header bits only: for `GC_TYPE_ARRAY` the 0x1000 bit is
+    // `GC_ARRAY_RAW_F64_HOLES`, not the object typed-layout flag.
+    const REJECT: u16 = crate::gc::OBJ_FLAG_FROZEN
+        | crate::gc::OBJ_FLAG_SEALED
+        | crate::gc::OBJ_FLAG_NO_EXTEND
+        | crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS
+        | crate::gc::GC_ARRAY_ELEMENT_SHAPE
+        | crate::gc::GC_LAYOUT_ALL_POINTERS;
+    if flags & REJECT != 0 {
+        return None;
+    }
+    let layout = flags & crate::gc::GC_LAYOUT_STATE_MASK;
+    if layout != crate::gc::GC_LAYOUT_POINTER_FREE && layout != 0 {
+        return None;
+    }
+    let arr = raw as *mut ArrayHeader;
+    if index >= (*arr).length || index >= (*arr).capacity {
+        return None;
+    }
+    // No registry probes: a `GC_TYPE_ARRAY` header is never a Buffer
+    // (`GC_TYPE_BUFFER`), a %TypedArray% (`GC_TYPE_TYPED_ARRAY`) or a native
+    // view (`GC_TYPE_NATIVE_TYPED_VIEW`) — every registration carries its own
+    // object type — so the obj_type test above already answered both. Only
+    // `Array.prototype` itself still needs the address compare: an index
+    // write there must flip `ARRAY_PROTO_HAS_INDEX` on the slow path.
+    if raw == array_prototype_addr() {
+        return None;
+    }
+    // The raw-f64 layouts store the canonical double (what the general path's
+    // canonicalization and `note_array_numeric_index_write` produce); every
+    // other layout keeps the value's own encoding.
+    let store_bits =
+        if flags & (crate::gc::GC_ARRAY_RAW_F64_LAYOUT | crate::gc::GC_ARRAY_RAW_F64_HOLES) != 0 {
+            number.to_bits()
+        } else {
+            value_bits
+        };
+    // GC_STORE_AUDIT(POINTER_FREE): a number never holds a heap pointer, and
+    // the receiver's layout was proved pointer-free or tag-scanned above.
+    ptr::write(
+        super::header::array_elements_ptr(arr).add(index as usize),
+        store_bits,
+    );
+    Some(arr)
+}
+
+/// Exercised by the unit tests: `true` when the fast lane answered the store.
+#[cfg(test)]
+pub(crate) fn test_strict_dense_number_store(
+    arr: *mut ArrayHeader,
+    index: u32,
+    value: f64,
+) -> bool {
+    unsafe { try_strict_dense_number_store(arr, index, value) }.is_some()
+}
+
+/// The strict store's third exact lane: an in-range overwrite of a slot that
+/// holds a heap pointer with another heap pointer — `column[index] = record`
+/// on an ECS archetype's component column, once per command.
+///
+/// Both number lanes decline a pointer value at their first test, and the
+/// store then paid the whole tower: the registry-probing head resolver, a
+/// second flag resolution, the descriptor guard, the string add-ref probe,
+/// a handle scope, the prototype note and the extend path's own descriptor
+/// checks, to reach the same one-slot write. The admission here is the
+/// plain-number lane's receiver discipline (the same decode, magnitude,
+/// alignment, plausibility and generation classification before the header
+/// is read), the same integrity / descriptor / element-shape / raw-f64
+/// rejections, plus what a pointer overwrite specifically needs: the head's
+/// layout is not pointer-free and the old slot already holds a pointer (its
+/// per-slot mask bit is therefore set, or the array is tag-scanned), so the
+/// store changes no layout claim. The write itself is
+/// [`store_array_slot_resolved`] — the exact layout note and write barrier
+/// the general path performs — so what is skipped is bookkeeping the proven
+/// shape cannot need, never a barrier. A store onto `Array.prototype` keeps
+/// the general path (it must flip `ARRAY_PROTO_HAS_INDEX`).
+///
+/// # Safety
+/// `arr` is decoded and validated before any dereference, exactly as in
+/// [`try_strict_dense_number_store`].
+unsafe fn try_strict_dense_pointer_overwrite(
+    arr: *mut ArrayHeader,
+    index: u32,
+    value: f64,
+) -> Option<*mut ArrayHeader> {
+    const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+    let value_bits = value.to_bits();
+    if value_bits & crate::value::TAG_MASK != crate::value::POINTER_TAG {
+        return None;
+    }
+    let bits = arr as u64;
+    let top16 = bits >> 48;
+    let raw = if top16 >= 0x7FF8 {
+        if top16 == 0x7FFC || bits & PAYLOAD_MASK == 0 {
+            return None;
+        }
+        (bits & PAYLOAD_MASK) as usize
+    } else {
+        bits as usize
+    };
+    if raw < crate::gc::GC_HEADER_SIZE
+        || raw % std::mem::align_of::<crate::gc::GcHeader>() != 0
+        || !crate::value::addr_class::is_plausible_heap_addr(raw)
+    {
+        return None;
+    }
+    if matches!(
+        crate::arena::classify_heap_generation(raw),
+        crate::arena::HeapGeneration::Unknown
+    ) {
+        return None;
+    }
+    let header = (raw - crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
+    if (*header).obj_type != crate::gc::GC_TYPE_ARRAY
+        || (*header).gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
+    {
+        return None;
+    }
+    let flags = (*header)._reserved;
+    const REJECT: u16 = crate::gc::OBJ_FLAG_FROZEN
+        | crate::gc::OBJ_FLAG_SEALED
+        | crate::gc::OBJ_FLAG_NO_EXTEND
+        | crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS
+        | crate::gc::GC_ARRAY_ELEMENT_SHAPE
+        | crate::gc::GC_ARRAY_RAW_F64_LAYOUT
+        | crate::gc::GC_ARRAY_RAW_F64_HOLES;
+    if flags & REJECT != 0 {
+        return None;
+    }
+    if flags & crate::gc::GC_LAYOUT_STATE_MASK == crate::gc::GC_LAYOUT_POINTER_FREE {
+        return None;
+    }
+    let arr = raw as *mut ArrayHeader;
+    if index >= (*arr).length || index >= (*arr).capacity {
+        return None;
+    }
+    let old_bits = ptr::read(super::header::array_elements_ptr(arr).add(index as usize));
+    if old_bits & crate::value::TAG_MASK != crate::value::POINTER_TAG {
+        return None;
+    }
+    if raw == array_prototype_addr() {
+        return None;
+    }
+    // GC_STORE_AUDIT(BARRIERED): the resolved store performs the layout note
+    // and write barrier as part of the slot write.
+    super::header_gc_slots::store_array_slot_resolved(arr, index as usize, value, flags);
+    Some(arr)
+}
+
+/// Exercised by the unit tests: `true` when the pointer-overwrite lane
+/// answered the store.
+#[cfg(test)]
+pub(crate) fn test_strict_dense_pointer_overwrite(
+    arr: *mut ArrayHeader,
+    index: u32,
+    value: f64,
+) -> bool {
+    unsafe { try_strict_dense_pointer_overwrite(arr, index, value) }.is_some()
+}
+
 #[no_mangle]
 pub extern "C" fn js_array_set_f64_extend_strict(
     arr: *mut ArrayHeader,
     index: u32,
     value: f64,
 ) -> *mut ArrayHeader {
-    array_strict_index_write_guard(arr, index);
-    js_array_set_f64_extend(arr, index, value)
+    // Two exact fast lanes, each storing only what the general path below
+    // would store and declining every shape it cannot prove. The plain-number
+    // lane (#8885) resolves the head itself, so a hit returns that head; the
+    // dense-index lane (#8876) covers the remaining in-range existing-slot
+    // stores. The #8885/#8876 composition on `main` had kept only the second,
+    // leaving the first unreachable outside its unit tests.
+    // SAFETY: the lane validates the receiver before every dereference.
+    if let Some(resolved) = unsafe { try_strict_dense_number_store(arr, index, value) } {
+        return resolved;
+    }
+    // SAFETY: as above — the lane validates the receiver before every dereference.
+    if let Some(resolved) = unsafe { try_strict_dense_pointer_overwrite(arr, index, value) } {
+        return resolved;
+    }
+    if let Some(resolved) = try_strict_dense_index_set(arr, index, value) {
+        return resolved;
+    }
+    let clean = clean_arr_ptr_mut(arr);
+    if clean.is_null()
+        || crate::buffer::is_registered_buffer(clean as usize)
+        || crate::typedarray::lookup_typed_array_kind(clean as usize).is_some()
+    {
+        // Preserve the existing polymorphic/subclass behavior on receivers
+        // that are not live plain arrays. These are cold and cannot use the
+        // resolved-header contract below.
+        array_strict_index_write_guard(arr, index);
+        return js_array_set_f64_extend(arr, index, value);
+    }
+
+    // SAFETY: the clean above resolved this exact live plain-array head. The
+    // guard performs no Perry allocation/safepoint, so the proof remains live
+    // for the store core.
+    let flags = unsafe { array_object_flags_resolved(clean) };
+    array_strict_index_write_guard_resolved(clean, index, flags);
+    crate::string::js_string_addref_if_heap_string(value);
+    unsafe { js_array_set_f64_extend_resolved(clean, index, value, flags) }
+}
+
+/// Complete a strict existing-slot assignment without redispatching
+/// the receiver through the guard, extending setter, layout classifier, and
+/// write barrier independently.
+///
+/// This is deliberately narrower than the ordinary dense-array setter:
+///
+/// - a plain Array must have an existing own dense slot (not a hole); a dense
+///   raw-f64 Number-to-Number overwrite takes the metadata-free sub-path;
+/// - an object-backed Array subclass must prove the exact dense shape and a
+///   writable existing numeric slot through its own guarded fast path; and
+/// - frozen arrays, descriptors, growth, holes, and forwarding failures
+///   decline to the unchanged strict implementation.
+///
+/// General values retain the ordinary numeric-layout note, element-shape note,
+/// slot-layout update, and write barrier, but reuse the receiver flags already
+/// read here instead of reclassifying the Array in each layer.
+#[inline]
+pub(crate) fn try_strict_dense_index_set(
+    arr: *mut ArrayHeader,
+    index: u32,
+    value: f64,
+) -> Option<*mut ArrayHeader> {
+    let value_bits = value.to_bits();
+    let number = value_bits_to_number(value_bits);
+    // Complete the overwhelmingly common Number-to-Number ordinary-Array
+    // overwrites from the live header and slot themselves. The generated
+    // guarded store already uses this exact magnitude/header discipline; this
+    // tier is for dynamic-key sites that reach the feedback helper instead
+    // (notably both sparse-set number moves and ECS archetype pointer moves).
+    //
+    // Both values are constructively classified as Numbers, so the store
+    // cannot add or remove a GC edge, change the per-slot pointer mask, demote
+    // a unique string, or require a write barrier.  Requiring an existing own
+    // non-hole slot plus the same frozen/descriptor/prototype guards as the
+    // resolved path preserves every observable assignment case.  Forwarding,
+    // growth, sparse holes, accessors and non-number values retain the complete
+    // implementation below.
+    if number.is_some() {
+        if let Some(header) = unsafe { crate::value::addr_class::try_read_gc_header(arr as usize) }
+        {
+            if header.obj_type == crate::gc::GC_TYPE_ARRAY
+                && header.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
+                && header._reserved
+                    & (crate::gc::OBJ_FLAG_FROZEN | crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS)
+                    == 0
+                && super::PERRY_ARRAY_INDEX_FAST_PATH_INVALIDATED.load(Ordering::Relaxed) == 0
+            {
+                unsafe {
+                    let length = (*arr).length;
+                    let capacity = (*arr).capacity;
+                    if index < length && length <= capacity && length <= 100_000_000 {
+                        let elements = (arr as *mut u8)
+                            .add(std::mem::size_of::<ArrayHeader>())
+                            .cast::<f64>();
+                        let slot = elements.add(index as usize);
+                        let old = ptr::read(slot);
+                        let old_bits = old.to_bits();
+                        if let Some(new_number) = number.filter(|_| {
+                            old_bits != crate::value::TAG_HOLE
+                                && value_bits_to_number(old_bits).is_some()
+                        }) {
+                            // GC_STORE_AUDIT(POINTER_FREE): old and new were
+                            // constructively decoded as ECMAScript Numbers.
+                            ptr::write(slot, new_number);
+                            return Some(arr);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Object-backed Array subclasses are rejected by `clean_arr_ptr_mut`.
+    // Ask their exact shape/descriptor proof first so a hit performs only its
+    // one validated-object resolution rather than two failed Array cleans.
+    if let Some(number) = number {
+        if crate::array::subclass::array_subclass_fast_index_set_raw(arr, index, number) {
+            return Some(arr);
+        }
+    }
+
+    let resolved = clean_arr_ptr_mut(arr);
+    if resolved.is_null() {
+        return None;
+    }
+    let flags = unsafe { array_object_flags_resolved(resolved) };
+    if flags & (crate::gc::OBJ_FLAG_FROZEN | crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS) != 0 {
+        return None;
+    }
+    if super::PERRY_ARRAY_INDEX_FAST_PATH_INVALIDATED.load(Ordering::Relaxed) != 0 {
+        return None;
+    }
+    unsafe {
+        if index >= (*resolved).length || index >= (*resolved).capacity {
+            return None;
+        }
+        let elements = (resolved as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut f64;
+        if flags & crate::gc::GC_ARRAY_RAW_F64_LAYOUT != 0 {
+            if let Some(number) = number {
+                // GC_STORE_AUDIT(POINTER_FREE): `GC_ARRAY_RAW_F64_LAYOUT`
+                // proves the retired value is a Number, and
+                // `value_bits_to_number` constructively produced its
+                // replacement above.
+                ptr::write(elements.add(index as usize), number);
+                return Some(resolved);
+            }
+        }
+
+        // An in-range hole is not an existing own property: a prototype
+        // accessor may intercept it and sealed/non-extensible Arrays may
+        // reject creating it. The unchanged strict fallback owns that case.
+        let slot = elements.add(index as usize);
+        let old_bits = ptr::read(slot).to_bits();
+        if old_bits == crate::value::TAG_HOLE {
+            return None;
+        }
+
+        let pointer_tag = crate::value::POINTER_TAG;
+        let pointer_mask = crate::value::POINTER_MASK;
+        let raw_numeric_flags =
+            crate::gc::GC_ARRAY_RAW_F64_LAYOUT | crate::gc::GC_ARRAY_RAW_F64_HOLES;
+        if flags & raw_numeric_flags == 0
+            && value_bits & crate::value::TAG_MASK == pointer_tag
+            && value_bits & pointer_mask != 0
+            && old_bits & crate::value::TAG_MASK == pointer_tag
+            && old_bits & pointer_mask != 0
+        {
+            #[cfg(test)]
+            STRICT_DENSE_POINTER_OVERWRITE_HITS.with(|hits| hits.set(hits.get().wrapping_add(1)));
+            // GC_STORE_AUDIT(BARRIERED): old and new are constructively
+            // pointer-bearing, so the slot mask is unchanged. Maintain the
+            // independent element proof and the mandatory generational/SATB
+            // edge.
+            ptr::write(slot, value);
+            crate::array::element_shape::note_element_store_resolved_flags(
+                resolved,
+                index as usize,
+                value_bits,
+                flags,
+            );
+            crate::gc::runtime_write_barrier_slot(resolved as usize, slot as usize, value_bits);
+            return Some(resolved);
+        }
+
+        // A heap string assigned into an existing slot becomes shared before
+        // the store, exactly as in `js_array_set_f64_extend`. This call does
+        // not allocate or safepoint, so the resolved receiver remains live.
+        crate::string::js_string_addref_if_heap_string(value);
+        crate::array::note_array_slot_resolved_flags(resolved, index as usize, value, flags);
+    }
+    Some(resolved)
 }
 
 /// Set an element in an array by index, extending the array if needed
@@ -1256,6 +1616,9 @@ pub extern "C" fn js_array_set_f64_extend(
         // `ObjectHeader.keys_array` / `.meta`. Run the object `[[Set]]` plus
         // the Array-exotic `length` maintenance, and return the ORIGINAL
         // receiver so the caller's realloc write-back keeps the binding.
+        if crate::array::subclass::array_subclass_fast_index_set_raw(arr, index, value) {
+            return arr;
+        }
         if let Some(recv) = crate::array::subclass::array_object_receiver(arr) {
             crate::array::subclass::array_object_index_set(recv, index, value);
             return arr;
@@ -1263,10 +1626,6 @@ pub extern "C" fn js_array_set_f64_extend(
         return js_array_alloc(0);
     }
     let arr = cleaned;
-    // If this write targets `Array.prototype`, mark the prototype as carrying an
-    // indexed property so out-of-bounds element reads on ordinary arrays consult
-    // it (ECMA-262 OrdinaryGet → prototype chain). Cheap no-op otherwise.
-    note_array_index_write(arr as usize);
     // Check if this is actually a buffer (Uint8Array) — write individual bytes
     if crate::buffer::is_registered_buffer(arr as usize) {
         crate::buffer::js_buffer_set(
@@ -1285,7 +1644,29 @@ pub extern "C" fn js_array_set_f64_extend(
         );
         return arr;
     }
-    let flags = array_object_flags(arr);
+    // SAFETY: the clean above resolved this live plain-array head, and the
+    // compatible Buffer/TypedArray receivers have exited.
+    let flags = unsafe { array_object_flags_resolved(arr) };
+    unsafe { js_array_set_f64_extend_resolved(arr, index, value, flags) }
+}
+
+/// Plain-array body of [`js_array_set_f64_extend`], entered after one shared
+/// ownership/forwarding proof. `flags` is the header word for `arr`.
+///
+/// # Safety
+///
+/// `arr` and `flags` must satisfy [`array_object_flags_resolved`]'s contract.
+#[inline]
+unsafe fn js_array_set_f64_extend_resolved(
+    arr: *mut ArrayHeader,
+    index: u32,
+    value: f64,
+    flags: u16,
+) -> *mut ArrayHeader {
+    // If this write targets `Array.prototype`, mark the prototype as carrying an
+    // indexed property so out-of-bounds element reads on ordinary arrays consult
+    // it (ECMA-262 OrdinaryGet → prototype chain). Cheap no-op otherwise.
+    note_array_index_write(arr as usize);
     let is_frozen = flags & crate::gc::OBJ_FLAG_FROZEN != 0;
     let blocks_extension =
         flags & (crate::gc::OBJ_FLAG_SEALED | crate::gc::OBJ_FLAG_NO_EXTEND) != 0;
@@ -1341,12 +1722,9 @@ pub extern "C" fn js_array_set_f64_extend(
                 array_sparse_index_property_set(arr, index, value);
                 return arr;
             }
-            let value = canonicalize_array_numeric_store_value(arr, value);
-            let value_bits = value.to_bits();
-            let elements_ptr = (arr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut f64;
-            // GC_STORE_AUDIT(BARRIERED): in-bounds extending set is immediately recorded via note_array_slot.
-            ptr::write(elements_ptr.add(index as usize), value);
-            note_array_slot(arr, index as usize, value_bits);
+            // GC_STORE_AUDIT(BARRIERED): the resolved store performs the
+            // layout note and write barrier as part of the slot write.
+            store_array_slot_resolved(arr, index as usize, value, flags);
             return arr;
         }
 
@@ -1387,18 +1765,18 @@ pub extern "C" fn js_array_set_f64_extend(
         // afterwards: record it (dense drops to holes) instead of demoting
         // to the permanent O(n) verify walk.
         let had_raw_layout = crate::array::header::array_has_raw_f64_layout_or_holes(arr);
-        let elements_ptr = (arr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut f64;
         for i in length..index {
             // GC_STORE_AUDIT(BARRIERED): sparse gap sentinel is layout-noted + barriered by the hole-aware note.
             crate::array::header::note_array_hole_fill_slot(arr, i as usize);
         }
 
         // Set the value
-        let value = canonicalize_array_numeric_store_value(arr, value);
-        let value_bits = value.to_bits();
-        // GC_STORE_AUDIT(BARRIERED): extending set value is immediately recorded via note_array_slot.
-        ptr::write(elements_ptr.add(index as usize), value);
-        note_array_slot(arr, index as usize, value_bits);
+        // `js_array_grow` may have replaced the backing allocation, so refresh
+        // the header word from the returned live head before canonicalizing.
+        let store_flags = array_object_flags_resolved(arr);
+        // GC_STORE_AUDIT(BARRIERED): the resolved store performs the layout
+        // note and write barrier as part of the slot write.
+        let value_bits = store_array_slot_resolved(arr, index as usize, value, store_flags);
         (*arr).length = new_length;
         if had_raw_layout
             && index > length
@@ -1408,504 +1786,6 @@ pub extern "C" fn js_array_set_f64_extend(
         }
 
         arr
-    }
-}
-
-/// Try to perform `arr[i] = arr[i] + delta` over a dense numeric window.
-///
-/// This is intentionally transactional: the first pass validates the actual
-/// runtime receiver and every source slot, and only then does the second pass
-/// mutate. Returning `-1` means "run the ordinary JS loop"; no slot has been
-/// changed in that case. A non-negative return is the counter value the source
-/// loop would have on exit.
-fn array_numeric_range_add_impl(receiver: f64, start: f64, end: Option<f64>, delta: f64) -> i64 {
-    let receiver_value = crate::value::JSValue::from_bits(receiver.to_bits());
-    if !receiver_value.is_pointer() {
-        return -1;
-    }
-    let raw = receiver_value.as_pointer::<ArrayHeader>() as usize;
-    let Some(header) = (unsafe { crate::value::addr_class::try_read_gc_header(raw) }) else {
-        return -1;
-    };
-    if header.obj_type != crate::gc::GC_TYPE_ARRAY {
-        return -1;
-    }
-    let arr = clean_arr_ptr_mut(raw as *mut ArrayHeader);
-    if arr.is_null() {
-        return -1;
-    }
-
-    let Some(start_number) = value_bits_to_number(start.to_bits()) else {
-        return -1;
-    };
-    if !start_number.is_finite()
-        || start_number.fract() != 0.0
-        || !(0.0..=i32::MAX as f64).contains(&start_number)
-    {
-        return -1;
-    }
-    let start = start_number as u32;
-
-    let end = match end {
-        Some(end) => {
-            let Some(end_number) = value_bits_to_number(end.to_bits()) else {
-                return -1;
-            };
-            if !end_number.is_finite()
-                || end_number.fract() != 0.0
-                || !(0.0..=i32::MAX as f64).contains(&end_number)
-            {
-                return -1;
-            }
-            end_number as u32
-        }
-        None => unsafe { (*arr).length },
-    };
-    let flags = array_object_flags(arr);
-    if flags & (crate::gc::OBJ_FLAG_FROZEN | crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS) != 0 {
-        return -1;
-    }
-
-    unsafe {
-        if end > (*arr).length || end > (*arr).capacity {
-            return -1;
-        }
-        if start >= end {
-            return i64::from(start);
-        }
-        let elements = (arr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut u64;
-        for index in start..end {
-            if value_bits_to_number(ptr::read(elements.add(index as usize))).is_none() {
-                return -1;
-            }
-        }
-        for index in start..end {
-            let slot = elements.add(index as usize);
-            let number = value_bits_to_number(ptr::read(slot))
-                .expect("numeric range was validated before mutation");
-            // GC_STORE_AUDIT(POINTER_FREE): both operands were proven numeric,
-            // so the replacement is an unboxed IEEE-754 value.
-            ptr::write(slot, (number + delta).to_bits());
-        }
-    }
-    i64::from(end)
-}
-
-#[no_mangle]
-pub extern "C" fn js_array_numeric_range_add(
-    receiver: f64,
-    start: f64,
-    end: f64,
-    delta: f64,
-) -> i64 {
-    array_numeric_range_add_impl(receiver, start, Some(end), delta)
-}
-
-#[no_mangle]
-pub extern "C" fn js_array_numeric_range_add_len(receiver: f64, start: f64, delta: f64) -> i64 {
-    array_numeric_range_add_impl(receiver, start, None, delta)
-}
-
-#[cfg(feature = "keepalive-anchors")]
-#[used]
-static KEEP_ARRAY_NUMERIC_RANGE_ADD: extern "C" fn(f64, f64, f64, f64) -> i64 =
-    js_array_numeric_range_add;
-#[cfg(feature = "keepalive-anchors")]
-#[used]
-static KEEP_ARRAY_NUMERIC_RANGE_ADD_LEN: extern "C" fn(f64, f64, f64) -> i64 =
-    js_array_numeric_range_add_len;
-
-/// `arr[stringKey] = value` — handles the JS spec rule that numeric-string
-/// keys on arrays are coerced to integer indices. Pre-fix the codegen's
-/// IndexSet array fast-path applied `fptosi(double, i32)` directly to the
-/// NaN-boxed string value, producing garbage indices that all collapsed
-/// onto slot 0 (every iteration overwrote the previous).
-///
-/// Spec: an "array index" is a string whose canonical numeric form is a
-/// non-negative integer < 2^32-1. Such writes update the array's element
-/// storage; non-numeric string keys fall through to the object-property
-/// path on the array's expando map (rare).
-///
-/// Issue #637 followup: this helper is also called from the polymorphic
-/// IndexSet dispatch when the receiver type isn't statically known —
-/// the runtime detects the receiver's gc_type byte and routes to the
-/// per-kind setter. For Object/Closure receivers, fall through to
-/// `js_object_set_field_by_name`. For Array receivers, parse the key
-/// as integer and route to `js_array_set_f64_extend`.
-#[no_mangle]
-pub extern "C" fn js_array_set_string_key(
-    arr: *mut ArrayHeader,
-    key: *const crate::StringHeader,
-    value: f64,
-) -> *mut ArrayHeader {
-    if arr.is_null() || key.is_null() {
-        return arr;
-    }
-    // A class-ref value (INT32 tag 0x7FFE) reaching this polymorphic setter
-    // (`C[name] = v` where `C` is a runtime class-ref value) is not an array —
-    // its high bits are set, so the `is_array` GC-header probe below would
-    // dereference unmapped memory. Route to the by-name object setter, which
-    // detects the class-ref tag and stores into the static-field tables.
-    if (arr as u64) >> 48 == 0x7FFE {
-        crate::object::js_object_set_field_by_name(
-            arr as *mut crate::object::ObjectHeader,
-            key,
-            value,
-        );
-        return arr;
-    }
-    // Issue #637: also called from polymorphic IndexSet — detect the
-    // receiver's gc_type and route accordingly. For Object/Closure
-    // (non-array) receivers, just call the object setter directly so
-    // the standard expando-property path runs.
-    let is_array = unsafe {
-        if (arr as usize) >= crate::gc::GC_HEADER_SIZE + 0x1000 {
-            let gc_header =
-                (arr as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-            (*gc_header).obj_type == crate::gc::GC_TYPE_ARRAY
-        } else {
-            false
-        }
-    };
-    if !is_array {
-        crate::object::js_object_set_field_by_name(
-            arr as *mut crate::object::ObjectHeader,
-            key,
-            value,
-        );
-        return arr;
-    }
-    // Read the key as a Rust &str via the standard StringHeader layout.
-    let key_str = unsafe {
-        let len = (*key).byte_len as usize;
-        if len == 0 {
-            return arr;
-        }
-        let data = (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
-        let bytes = std::slice::from_raw_parts(data, len);
-        match std::str::from_utf8(bytes) {
-            Ok(s) => s,
-            Err(_) => return arr,
-        }
-    };
-    // `length` is a real own property of every array — a polymorphic /
-    // computed string-key write (`arr["length"] = n`, or an `Object.assign`
-    // copying a source's own `length` onto an array target) must resize the
-    // array (truncate / extend + holes), NOT land as an inert expando. The
-    // dedicated `arr.length = n` codegen path already routes to
-    // `js_array_set_length`; this covers the by-string-key entry points.
-    // (test262 Object/assign/target-Array: `Object.assign([7,8,9], {1:2,
-    // length:2})` truncates the target to `[1,2]`.)
-    if key_str == "length" {
-        js_array_set_length(arr, value);
-        return arr;
-    }
-    // Try parse as a non-negative integer in array-index range.
-    if let Ok(idx) = key_str.parse::<u32>() {
-        // Reject leading zeros / signs that would round-trip differently
-        // (e.g. "01" -> 1, but the canonical form is "1"; per spec only
-        // "1" is a valid array index, "01" is a generic property).
-        let canonical = idx.to_string();
-        if canonical == key_str && idx < u32::MAX {
-            return js_array_set_f64_extend(arr, idx, value);
-        }
-    }
-    if array_is_frozen(arr) {
-        return arr;
-    }
-    let existing = unsafe { array_named_property_get(arr, key).is_some() };
-    if !existing && array_is_sealed_or_no_extend(arr) {
-        return arr;
-    }
-    // Named accessor installed via `Object.defineProperty(arr, "prop",
-    // {get,set})`: dispatch the setter instead of the expando store.
-    if array_object_flags(arr) & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0 {
-        if let Some(acc) = crate::object::get_accessor_descriptor(arr as usize, key_str) {
-            if acc.set != 0 {
-                unsafe {
-                    crate::object::invoke_accessor_setter(
-                        acc.set,
-                        crate::value::js_nanbox_pointer(arr as i64),
-                        value,
-                    );
-                }
-            }
-            return arr;
-        }
-    }
-    if let Some(attrs) = crate::object::get_property_attrs(arr as usize, key_str) {
-        if !attrs.writable() {
-            return arr;
-        }
-    }
-    // Non-numeric string key — fall through to object-property set on the
-    // array's expando map. Arrays with named properties are rare but spec-
-    // legal.
-    unsafe {
-        array_named_property_set(arr, key, value);
-    }
-    arr
-}
-
-/// `arr[idx]` where `idx` may be a number or property-key value. This mirrors
-/// `js_array_set_index_or_string` for read paths that cannot safely narrow the
-/// key through i32 codegen.
-#[no_mangle]
-pub extern "C" fn js_array_get_index_or_string(arr: *const ArrayHeader, idx: f64) -> f64 {
-    if arr.is_null() {
-        return f64::from_bits(crate::value::TAG_UNDEFINED);
-    }
-    let bits = idx.to_bits();
-    let top16 = bits >> 48;
-    if top16 == 0x7FFF {
-        let key = (bits & 0x0000_FFFF_FFFF_FFFF) as *const crate::StringHeader;
-        return array_get_property_by_key(arr, key);
-    }
-    if top16 == 0x7FF9 {
-        let key = crate::value::js_get_string_pointer_unified(idx) as *const crate::StringHeader;
-        return array_get_property_by_key(arr, key);
-    }
-
-    let numeric = if (bits & crate::value::TAG_MASK) == crate::value::INT32_TAG {
-        Some(crate::value::JSValue::from_bits(bits).as_int32() as f64)
-    } else if !(0x7FF8..=0x7FFF).contains(&top16) {
-        Some(idx)
-    } else {
-        None
-    };
-    if let Some(n) = numeric {
-        if n.is_finite() && n.trunc() == n && n >= 0.0 && n < u32::MAX as f64 {
-            return js_array_get_f64(arr, n as u32);
-        }
-        if n.is_finite() && n.trunc() == n {
-            let key = if n == 0.0 {
-                "0".to_string()
-            } else {
-                format!("{:.0}", n)
-            };
-            // #6935: `js_string_from_bytes` ALLOCATES, so it can trigger a GC
-            // that evacuates the receiver; `arr` is a bare Rust local.
-            let scope = crate::gc::RuntimeHandleScope::new();
-            let arr_handle = scope.root_raw_const_ptr(arr);
-            // Allocating key build + receiver re-read as one combinator (#7341).
-            let (key_ptr, arr_now) = arr_handle.across_const::<ArrayHeader, _>(|| {
-                crate::string::js_string_from_bytes(key.as_ptr(), key.len() as u32)
-            });
-            return array_get_property_by_key(arr_now, key_ptr);
-        }
-    }
-
-    if unsafe { crate::symbol::js_is_symbol(idx) } != 0 {
-        // Symbol-keyed read on an array: `arr[sym] = v` stores into the
-        // symbol side table keyed by the header address (write arm in
-        // `js_array_set_index_or_string`), so read it back through the
-        // standard symbol getter — which also serves an accessor installed
-        // via `defineProperty(arr, sym, {get})`. This used to hard-return
-        // `undefined`, making every stored symbol property unreadable
-        // (test262 getOwnPropertySymbols/order-after-define-property,
-        // Array-receiver half).
-        return unsafe {
-            crate::symbol::js_object_get_symbol_property(
-                crate::value::js_nanbox_pointer(arr as i64),
-                idx,
-            )
-        };
-    }
-    // #6935: read-side sibling of `js_array_set_index_or_string` below —
-    // `js_jsvalue_to_string` on an object key (`a[new Number(1)]`,
-    // `a[{toString(){...}}]`) runs user JS, allocates and can evacuate `arr`.
-    let scope = crate::gc::RuntimeHandleScope::new();
-    let arr_handle = scope.root_raw_const_ptr(arr);
-    let key = crate::value::js_jsvalue_to_string(idx);
-    if key.is_null() {
-        return f64::from_bits(crate::value::TAG_UNDEFINED);
-    }
-    array_get_property_by_key(
-        arr_handle.get_raw_const_ptr::<ArrayHeader>(),
-        key as *const crate::StringHeader,
-    )
-}
-
-/// `arr[idx] = value` where idx may be a NaN-boxed string (numeric-string
-/// key) OR a number. Dispatches at runtime: string tags → parse and route
-/// to `js_array_set_string_key`; otherwise treat as numeric and route to
-/// `js_array_set_f64_extend`. Issue #637 followup: the array fast-path's
-/// `fptosi(idx_double, i32)` collapsed every NaN-boxed string to slot 0
-/// (NaN→i32 = 0 on most platforms), so `forEach((k) => arr[k] = ...)`
-/// over `["0","1","2"]` overwrote slot 0 three times. Codegen routes
-/// the array fast-path here when the index expression isn't statically
-/// numeric.
-#[no_mangle]
-pub extern "C" fn js_array_set_index_or_string(
-    arr: *mut ArrayHeader,
-    idx: f64,
-    value: f64,
-) -> *mut ArrayHeader {
-    if arr.is_null() {
-        return arr;
-    }
-    let bits = idx.to_bits();
-    let top16 = bits >> 48;
-    // STRING_TAG (0x7FFF) heap pointer — dispatch through the string-key
-    // helper which parses the numeric value and routes appropriately.
-    // SHORT_STRING_TAG (0x7FF9) is the SSO variant; same path via
-    // `js_get_string_pointer_unified` — handled inside `js_string_*` helpers.
-    if top16 == 0x7FFF {
-        let ptr = (bits & 0x0000_FFFF_FFFF_FFFF) as *const crate::StringHeader;
-        return js_array_set_string_key(arr, ptr, value);
-    }
-    if top16 == 0x7FF9 {
-        // SHORT_STRING_TAG (SSO). Materialize as a real StringHeader
-        // via `js_get_string_pointer_unified` so `js_array_set_string_key`
-        // can read the bytes through the standard layout.
-        let str_ptr =
-            crate::value::js_get_string_pointer_unified(idx) as *const crate::StringHeader;
-        return js_array_set_string_key(arr, str_ptr, value);
-    }
-    // Treat numeric keys according to the array-index boundary. Only
-    // integers in 0..2^32-2 extend element storage; 2^32-1 and larger are
-    // ordinary string properties.
-    let numeric = if (bits & crate::value::TAG_MASK) == crate::value::INT32_TAG {
-        Some(crate::value::JSValue::from_bits(bits).as_int32() as f64)
-    } else if !(0x7FF8..=0x7FFF).contains(&top16) {
-        Some(idx)
-    } else {
-        None
-    };
-    if let Some(n) = numeric {
-        if n.is_finite() && n.trunc() == n && n >= 0.0 && n < u32::MAX as f64 {
-            return js_array_set_f64_extend(arr, n as u32, value);
-        }
-        // Any other finite/non-finite number that is NOT a canonical array
-        // index (2^32-1 and above, negatives, and non-integer floats such as
-        // `a[1.5]`) becomes an ordinary string property. Route through
-        // `js_jsvalue_to_string` so the key is the spec ToString of the
-        // number ("4294967295", "-1", "1.5", "NaN") rather than a truncated
-        // integer — `js_array_set_string_key` then stores it on the expando
-        // map without touching `length` or any element slot. (Issue #4543.)
-        // #6935: `js_jsvalue_to_string` allocates the stringified key, so it can
-        // GC and evacuate both the receiver and the value being stored.
-        let scope = crate::gc::RuntimeHandleScope::new();
-        let arr_handle = scope.root_raw_mut_ptr(arr);
-        let value_handle = scope.root_nanbox_f64(value);
-        let key = crate::value::js_jsvalue_to_string(idx);
-        if !key.is_null() {
-            return js_array_set_string_key(
-                arr_handle.get_raw_mut_ptr::<ArrayHeader>(),
-                key as *const crate::StringHeader,
-                value_handle.get_nanbox_f64(),
-            );
-        }
-        return arr_handle.get_raw_mut_ptr::<ArrayHeader>();
-    }
-    // Symbol-keyed write: store through the symbol side table (keyed by the
-    // header address), exactly like a plain-object receiver. This arm used to
-    // be missing — a symbol key fell past the string fallback below (guarded
-    // `js_is_symbol == 0`) to the final bare return, so the write was
-    // silently DROPPED and `arr[sym]` / `getOwnPropertySymbols(arr)` saw
-    // nothing (test262 getOwnPropertySymbols/order-after-define-property,
-    // Array-receiver half).
-    if unsafe { crate::symbol::js_is_symbol(idx) } != 0 {
-        // The store can run a user setter (symbol accessor installed on the
-        // array), which can GC and evacuate the receiver.
-        let scope = crate::gc::RuntimeHandleScope::new();
-        let arr_handle = scope.root_raw_mut_ptr(arr);
-        unsafe {
-            crate::symbol::js_object_set_symbol_property(
-                crate::value::js_nanbox_pointer(arr as i64),
-                idx,
-                value,
-            );
-        }
-        return arr_handle.get_raw_mut_ptr::<ArrayHeader>();
-    }
-    // Fallback for a NON-numeric key: a primitive (`a[null]`, `a[undefined]`,
-    // `a[true]`, `a[10n]`) or a boxed object (`a[new Number(1)]`). Per
-    // ToPropertyKey these become string property keys (or, for `10n`, the
-    // canonical index "10"); `js_array_set_string_key` routes accordingly.
-    // Arrays previously DROPPED these writes (plain objects handled them).
-    // Restricted to `numeric.is_none()`: numeric keys (including non-integer
-    // finite floats) are handled above. Symbols are handled by the arm above.
-    //
-    // #6935: this is the boxed-object arm the doc comment above names, so
-    // `js_jsvalue_to_string` here runs a USER `toString` / `valueOf` — allocate
-    // → GC → evacuation. Pre-fix `arr` and `value` were both raw Rust locals
-    // across it, so a stale receiver dropped the write and a stale `value`
-    // stored a dangling pointer inside a live array.
-    if numeric.is_none() && unsafe { crate::symbol::js_is_symbol(idx) } == 0 {
-        let scope = crate::gc::RuntimeHandleScope::new();
-        let arr_handle = scope.root_raw_mut_ptr(arr);
-        let value_handle = scope.root_nanbox_f64(value);
-        let key = crate::value::js_jsvalue_to_string(idx);
-        if !key.is_null() {
-            return js_array_set_string_key(
-                arr_handle.get_raw_mut_ptr::<ArrayHeader>(),
-                key as *const crate::StringHeader,
-                value_handle.get_nanbox_f64(),
-            );
-        }
-        return arr_handle.get_raw_mut_ptr::<ArrayHeader>();
-    }
-    arr
-}
-
-/// Strict-mode `arr[key] = v` (dynamic index-or-string key) — `Set` with
-/// `Throw = true`. For a canonical numeric index this enforces the frozen /
-/// non-extensible guard (throwing a TypeError) before delegating; non-index
-/// keys fall through to the ordinary path unchanged. This is the assignment
-/// entry point behind `js_typed_feedback_array_set_index_or_string`; the plain
-/// `js_array_set_index_or_string` keeps its silent contract for any internal
-/// caller. test262 built-ins/Array element-write-on-frozen (string/dynamic key).
-#[no_mangle]
-pub extern "C" fn js_array_set_index_or_string_strict(
-    arr: *mut ArrayHeader,
-    idx: f64,
-    value: f64,
-) -> *mut ArrayHeader {
-    if !arr.is_null() {
-        // Resolve the canonical array-index interpretation of the key (mirrors
-        // the numeric branch of `js_array_set_index_or_string`), and guard it.
-        // A string key that spells an index (`"0"`) also targets the element
-        // store, so ToString it and re-parse.
-        let index = canonical_index_of_set_key(idx);
-        if let Some(i) = index {
-            array_strict_index_write_guard(arr, i);
-        }
-    }
-    js_array_set_index_or_string(arr, idx, value)
-}
-
-/// The canonical array index (`0..2^32-1`) a dynamic `arr[key] = v` key targets,
-/// or `None` for a non-index key. Numbers use the array-index boundary; string
-/// keys are parsed via their ToString so `arr["3"]` on a frozen array throws
-/// like `arr[3]`.
-fn canonical_index_of_set_key(idx: f64) -> Option<u32> {
-    let bits = idx.to_bits();
-    let top16 = bits >> 48;
-    // Heap string / SSO key: parse the string as a canonical index.
-    if top16 == 0x7FFF || top16 == 0x7FF9 {
-        let s = crate::value::js_get_string_pointer_unified(idx) as *const crate::StringHeader;
-        if s.is_null() {
-            return None;
-        }
-        let len = unsafe { (*s).byte_len as usize };
-        let data = unsafe { (s as *const u8).add(std::mem::size_of::<crate::StringHeader>()) };
-        let bytes = unsafe { std::slice::from_raw_parts(data, len) };
-        let name = std::str::from_utf8(bytes).ok()?;
-        return crate::object::canonical_array_index(name);
-    }
-    // Numeric key.
-    let n = if (bits & crate::value::TAG_MASK) == crate::value::INT32_TAG {
-        crate::value::JSValue::from_bits(bits).as_int32() as f64
-    } else if !(0x7FF8..=0x7FFF).contains(&top16) {
-        idx
-    } else {
-        return None;
-    };
-    if n.is_finite() && n.trunc() == n && n >= 0.0 && n < u32::MAX as f64 {
-        Some(n as u32)
-    } else {
-        None
     }
 }
 

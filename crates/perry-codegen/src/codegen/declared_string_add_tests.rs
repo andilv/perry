@@ -192,9 +192,10 @@ fn a_string_literal_operand_keeps_the_fused_concat() {
         add(Expr::String("item_".to_string()), Expr::LocalGet(1)),
     );
     assert!(
-        ir.contains("call i64 @js_string_concat_value("),
-        "a proven string must keep the fused single-allocation concat — the \
-         guard is for claims, not for proofs:\n{ir}"
+        ir.contains("call double @js_string_concat_value_box("),
+        "a proven string must keep the fused concat (the `_box` twin, which \
+         returns SSO for short results) — the guard is for claims, not for \
+         proofs:\n{ir}"
     );
     assert!(
         !ir.contains("call double @js_string_add_value("),
@@ -214,7 +215,7 @@ fn a_coerced_operand_keeps_the_fused_concat() {
         ),
     );
     assert!(
-        ir.contains("call i64 @js_string_concat_value(")
+        ir.contains("call double @js_string_concat_value_box(")
             && !ir.contains("call double @js_string_add_value("),
         "`String(x)` constructs a string; it is not an annotation:\n{ir}"
     );
@@ -627,6 +628,20 @@ fn assigning_one_local_to_another_demotes_a_possible_string_alias() {
     assert!(
         ir.contains("call void @js_string_addref_if_heap_string("),
         "assignment aliases need the same demote as declaration aliases:\n{ir}"
+    );
+    // The helper's tag test is hoisted into IR: the call sits behind an
+    // inline `STRING_TAG` compare, so a numeric copy never leaves the
+    // function. Pin the compare AND the call — the demote must still reach
+    // the runtime for a real heap string.
+    let tag_at = ir
+        .find("icmp ne i64 %")
+        .expect("inline STRING_TAG compare before the demote call");
+    let call_at = ir
+        .find("call void @js_string_addref_if_heap_string(")
+        .expect("demote call");
+    assert!(
+        ir.contains(", 9223090561878065152") && tag_at < call_at,
+        "the demote call must be guarded by an inline 0x7FFF_0000_0000_0000 tag compare:\n{ir}"
     );
 }
 

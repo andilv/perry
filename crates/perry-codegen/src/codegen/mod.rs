@@ -194,6 +194,8 @@ pub mod entry_outline;
 pub(crate) mod func_registry;
 mod function;
 #[cfg(test)]
+mod guarded_falsy_default_method_tests;
+#[cfg(test)]
 mod guarded_undefined_method_tests;
 #[cfg(test)]
 mod hoisted_callback_method_tests;
@@ -248,8 +250,9 @@ pub(crate) use opts::{CrossModuleCtx, ImportedCtor};
 pub(crate) use param_guard::scalar_descriptor_rep;
 pub(crate) use spec_abi::{spec_abi_enabled, spec_function_name, SpecDispatch, SpecFnPlan};
 pub(crate) use typed_abi::{
-    emit_typed_arg_guard, emit_typed_arg_to_raw, generic_closure_body_name,
-    generic_function_body_name, generic_method_body_name, nonnegative_index_fast_array_method_name,
+    emit_typed_arg_guard, emit_typed_arg_to_raw, emit_typed_f64_guard,
+    emit_typed_f64_to_raw_guarded, generic_closure_body_name, generic_function_body_name,
+    generic_method_body_name, nonnegative_index_fast_array_method_name,
     nonnegative_index_fast_array_params, nonnegative_index_method_name,
     typed_arg_is_guard_candidate, typed_f64_closure_name, typed_f64_function_name,
     typed_f64_method_name, typed_f64_receiver_method_info, typed_f64_receiver_method_name,
@@ -423,10 +426,6 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
     let _opt_report_module_scope = crate::opt_report::enter_module(hir);
 
     let mut llmod = LlModule::new_with_fp_flags(&triple, fp_flags);
-    // Null guard global: a zeroed i32 used as a safe dereference target
-    // when a NaN-unboxed pointer is null/invalid. Prevents segfaults from
-    // uninitialized locals or unhandled expressions producing 0.0/TAG_UNDEFINED.
-    llmod.add_internal_global("perry_null_guard_zero", crate::types::I32, "0");
     runtime_decls::declare_phase1(&mut llmod);
 
     // Derive a per-module symbol prefix from the HIR module name:
@@ -440,6 +439,18 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
     // `main` is the only globally-named symbol — non-entry modules emit
     // `<prefix>__init` instead.
     let module_prefix = sanitize(&hir.name);
+    // Anonymous rodata constants (`add_string_constant`) carry the prefix
+    // too: codegen-unit splitting promotes them to link-visible symbols,
+    // and their per-module counter would otherwise collide across modules
+    // at the final link (GNU ld: `multiple definition of .str.N`).
+    llmod.set_symbol_prefix(&module_prefix);
+    // Null guard global: a zeroed i32 used as a safe dereference target
+    // when a NaN-unboxed pointer is null/invalid. Prevents segfaults from
+    // uninitialized locals or unhandled expressions producing 0.0/TAG_UNDEFINED.
+    // Defined AFTER the prefix is installed so its name is module-unique
+    // (`perry_null_guard_zero_<prefix>`) — split units export it strong on
+    // ELF/COFF, exactly like the string constants above.
+    llmod.add_internal_global(&llmod.null_guard_global(), crate::types::I32, "0");
 
     // Imports are no longer a hard error — Phase F.1 supports multi-
     // module compilation. Cross-module function CALLS via ExternFuncRef
@@ -1153,15 +1164,17 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         // first (walking from deepest ancestor down) so the slot
         // order matches `class_field_global_index`'s assumption.
         let mut packed_keys = String::new();
-        // Skip computed-key fields (`[Symbol.for("k")] = …`): their key is an
-        // expression evaluated at runtime, not a stable string, so they don't
-        // get an inline slot. Including their synthetic `__computed_field_*`
-        // names in the packed keys would surface them as enumerable own
-        // properties via Object.keys() and inflate the inline-slot count.
-        // Their values are stored via `apply_field_initializers_recursive`'s
-        // IndexSet path → js_object_set_field / js_object_set_symbol_property.
+        // Skip computed-key fields (`[Symbol.for("k")] = …`) and private
+        // fields. Computed keys are evaluated at construction time; private
+        // fields live in class-id-qualified runtime storage installed by
+        // `js_private_field_add`. Neither is a public inline shape key.
+        // Including either synthetic/source spelling in packed keys leaks it
+        // through reflection and inflates/misaligns the inline-slot layout.
         let count_keyable = |fields: &[perry_hir::ClassField]| -> u32 {
-            fields.iter().filter(|f| f.key_expr.is_none()).count() as u32
+            fields
+                .iter()
+                .filter(|f| f.key_expr.is_none() && !f.is_private)
+                .count() as u32
         };
         let mut total_field_count = count_keyable(&c.fields);
         // (parent_name, resolved_fields) captured during the chain walk so we
@@ -1240,7 +1253,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         // (which would risk re-picking the wrong same-named stub).
         for (_parent_name, parent_fields) in parent_chain.iter().rev() {
             for f in parent_fields {
-                if f.key_expr.is_some() {
+                if f.key_expr.is_some() || f.is_private {
                     continue;
                 }
                 packed_keys.push_str(&f.name);
@@ -1248,7 +1261,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             }
         }
         for f in &c.fields {
-            if f.key_expr.is_some() {
+            if f.key_expr.is_some() || f.is_private {
                 continue;
             }
             packed_keys.push_str(&f.name);
@@ -1340,7 +1353,13 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         );
         class_keys_globals_map.insert(c.name.clone(), global_name.clone());
         let mut packed_keys = String::new();
-        let mut total_field_count = c.fields.len() as u32;
+        let keyable_count = |fields: &[perry_hir::ClassField]| -> u32 {
+            fields
+                .iter()
+                .filter(|f| f.key_expr.is_none() && !f.is_private)
+                .count() as u32
+        };
+        let mut total_field_count = keyable_count(&c.fields);
         // Issue #485: imported subclass stubs also need their parent's
         // fields prepended to the packed-keys, so allocations on this
         // importing side reserve enough inline slots for parent +
@@ -1368,12 +1387,12 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
                 resolve_parent(&parent_name, child_prefix.as_deref())
             {
                 parent_chain.push((parent_name.clone(), parent_fields.clone()));
-                total_field_count += parent_fields.len() as u32;
+                total_field_count += keyable_count(&parent_fields);
                 p = parent_extends;
                 child_prefix = Some(parent_prefix);
             } else if let Some(parent) = hir.classes.iter().find(|cls| cls.name == parent_name) {
                 parent_chain.push((parent_name.clone(), parent.fields.clone()));
-                total_field_count += parent.fields.len() as u32;
+                total_field_count += keyable_count(&parent.fields);
                 p = parent.extends_name.clone();
                 child_prefix = Some(module_prefix.clone());
             } else {
@@ -1382,11 +1401,17 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         }
         for (_parent_name, parent_fields) in parent_chain.iter().rev() {
             for f in parent_fields {
+                if f.key_expr.is_some() || f.is_private {
+                    continue;
+                }
                 packed_keys.push_str(&f.name);
                 packed_keys.push('\0');
             }
         }
         for f in &c.fields {
+            if f.key_expr.is_some() || f.is_private {
+                continue;
+            }
             packed_keys.push_str(&f.name);
             packed_keys.push('\0');
         }
@@ -1549,6 +1574,8 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         std::collections::HashMap::new();
     let mut method_has_synthetic_arguments: std::collections::HashMap<(String, String), bool> =
         std::collections::HashMap::new();
+    let mut method_arguments_length_only: std::collections::HashMap<(String, String), bool> =
+        std::collections::HashMap::new();
     for cls in &hir.classes {
         for m in &cls.methods {
             let key = (cls.name.clone(), m.name.clone());
@@ -1561,7 +1588,10 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
                 .last()
                 .is_some_and(|param| param.arguments_object.is_some())
             {
-                method_has_synthetic_arguments.insert(key, true);
+                method_has_synthetic_arguments.insert(key.clone(), true);
+            }
+            if arguments::method_supports_arguments_length_direct_abi(m) {
+                method_arguments_length_only.insert(key, true);
             }
         }
         // Issue #894: track static methods too. Effect's `static pipe()` /
@@ -1619,6 +1649,18 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
                 method_has_synthetic_arguments.insert((ic.name.clone(), mname.clone()), true);
                 if effective_name != ic.name {
                     method_has_synthetic_arguments
+                        .insert((effective_name.clone(), mname.clone()), true);
+                }
+            }
+            if ic
+                .method_arguments_length_only
+                .get(i)
+                .copied()
+                .unwrap_or(false)
+            {
+                method_arguments_length_only.insert((ic.name.clone(), mname.clone()), true);
+                if effective_name != ic.name {
+                    method_arguments_length_only
                         .insert((effective_name.clone(), mname.clone()), true);
                 }
             }
@@ -1790,7 +1832,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         .classes
         .iter()
         .flat_map(|class| {
-            class.methods.iter().filter_map(move |method| {
+            class.methods.iter().filter_map(|method| {
                 let params = typed_abi::nonnegative_index_method_params(method);
                 (!params.is_empty()).then(|| ((class.name.clone(), method.name.clone()), params))
             })
@@ -1813,6 +1855,20 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
                         candidate.param_index,
                     )
                 })
+            })
+        })
+        .collect();
+    let mut guarded_falsy_field_default_candidates: Vec<_> = hir
+        .classes
+        .iter()
+        .flat_map(|class| {
+            class.methods.iter().filter_map(|method| {
+                let key = (class.name.clone(), method.name.clone());
+                if !nonnegative_index_methods.contains_key(&key) {
+                    return None;
+                }
+                param_guard::guarded_falsy_field_default_method_candidate(class, method)
+                    .map(|candidate| (candidate.body_nodes, key, candidate))
             })
         })
         .collect();
@@ -1865,7 +1921,13 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
                 receiver_class_table,
                 &module_dispatch_facts,
             ) {
-                pshape_methods.insert((class.name.clone(), method.name.clone()), fact);
+                let key = (class.name.clone(), method.name.clone());
+                // Indexed methods compose this receiver proof with their
+                // exact nonnegative-i32 argument proof. Their published
+                // The published proven-receiver entry guards the live
+                // argument once, then selects its combined integer clone or
+                // its receiver-safe generic body.
+                pshape_methods.insert(key, fact);
             }
             match typed_abi::typed_f64_method_rejection_reason(method) {
                 None => {
@@ -2052,6 +2114,14 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             .take(16)
             .map(|(_, key, param_index)| (key, param_index))
             .collect();
+    guarded_falsy_field_default_candidates
+        .sort_unstable_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let guarded_falsy_field_default_methods: std::collections::HashMap<_, _> =
+        guarded_falsy_field_default_candidates
+            .into_iter()
+            .take(16)
+            .map(|(_, key, candidate)| (key, candidate))
+            .collect();
     // #8774: one non-combinatorial tagged-ABI clone per local method. Source
     // annotations or a unique unannotated field signature only nominate a
     // class; every routed call emits an exact runtime class+shape guard. Keep
@@ -2076,6 +2146,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
                 || typed_f64_receiver_methods.contains_key(&key)
                 || nonnegative_index_methods.contains_key(&key)
                 || guarded_undefined_method_params.contains_key(&key)
+                || guarded_falsy_field_default_methods.contains_key(&key)
             {
                 continue;
             }
@@ -2333,6 +2404,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         method_param_counts,
         method_has_rest,
         method_has_synthetic_arguments,
+        method_arguments_length_only,
         class_keys_globals: class_keys_globals_map,
         class_field_counts: class_field_counts_map,
         class_init_chains: class_init_chains_map,
@@ -2446,6 +2518,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         typed_f64_receiver_methods,
         nonnegative_index_methods,
         guarded_undefined_method_params,
+        guarded_falsy_field_default_methods,
         pshape_methods,
         pshape_arg_methods,
         pshape_tower_routable,

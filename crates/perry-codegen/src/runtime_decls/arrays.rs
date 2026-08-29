@@ -42,6 +42,7 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
     // blob_len). Returns the nanboxed JS value (a fresh, mutable array).
     module.declare_function("js_value_from_const_descriptor", DOUBLE, &[PTR, I32]);
     module.declare_function("js_array_push_f64", I64, &[I64, DOUBLE]);
+    module.declare_function("js_array_push_u31_with_length", I64, &[I64, I32, PTR]);
     module.declare_function("js_array_push_f64_spec", I64, &[I64, DOUBLE]);
     module.declare_function("js_array_push_guard", VOID, &[I64]);
     module.declare_function("js_array_push_hole", I64, &[I64]);
@@ -107,6 +108,7 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
     // it preserves `undefined` and non-numeric property values and throws for
     // nullish receivers.
     module.declare_function("js_value_length_property_f64", DOUBLE, &[DOUBLE]);
+    module.declare_function("js_value_length_property_ic_f64", DOUBLE, &[DOUBLE, PTR]);
 
     // Shadow stack for precise root tracking (gen-GC Phase A per
     // docs/generational-gc-plan.md). Declared now so codegen can
@@ -171,6 +173,14 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
     //   js_gc_init_typed_shape_layout(obj: u64, slot_count: u32, raw_f64_mask_words: *const u64, raw_f64_mask_word_count: u32, pointer_mask_words: *const u64, pointer_mask_word_count: u32)
     module.declare_function("js_write_barrier", VOID, &[I64, I64]);
     module.declare_function("js_write_barrier_slot", VOID, &[I64, I64, I64]);
+    // perry-runtime: `array::indexing_support::js_array_live_head` — resolves a
+    // forwarded array head a generated loop re-read from its root.
+    module.declare_function("js_array_live_head", I64, &[I64]);
+    module.declare_function(
+        "js_write_barrier_slot_validated_parent",
+        VOID,
+        &[I64, I64, I64],
+    );
     module.declare_function("js_write_barrier_root_nanbox", VOID, &[I64]);
     module.declare_function("js_write_barrier_root_heap_word", VOID, &[I64]);
     module.declare_function("js_gc_note_slot_layout", VOID, &[I64, I32, I64]);

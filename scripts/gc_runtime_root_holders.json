@@ -231,13 +231,6 @@
       "why": "Visited from the sibling module, so the same-file rule misses it. The `events: [i64; 5]` are DIAG_CHANNELS ids, not addresses."
     },
     {
-      "file": "crates/perry-runtime/src/node_submodules/diagnostics.rs",
-      "name": "ERROR_USER_PROPS",
-      "verdict": "covered_elsewhere",
-      "scanner": "node_submodules::diagnostics_gc::scan_error_user_props_roots_mut (diagnostics_gc.rs:46/72/134)",
-      "why": "The whole GC half of diagnostics lives in diagnostics_gc.rs, including the ErrorHeader-address rekey."
-    },
-    {
       "file": "crates/perry-runtime/src/node_submodules/diagnostics_tail.rs",
       "name": "DIAG_STORE_SCOPES",
       "verdict": "not_a_gc_pointer",
@@ -312,10 +305,28 @@
     },
     {
       "file": "crates/perry-runtime/src/promise/microtasks.rs",
+      "name": "ASYNC_BOX_EXECUTION_REF_BASES",
+      "verdict": "not_a_gc_pointer",
+      "why": "Vec<u32> of checked length snapshots from ASYNC_BOX_EXECUTION_REFS. Every entry comes only from Vec::len() and is used only as a later Vec drain boundary; no address or JS value can enter this vector, and entries are never dereferenced or decoded."
+    },
+    {
+      "file": "crates/perry-runtime/src/promise/microtasks.rs",
       "name": "CURRENT_MICROTASK_VALUE",
       "verdict": "covered_elsewhere",
       "scanner": "promise::scan_promise_roots_mut (promise/scanners.rs:66, visit_cell_f64_slot) plus its budgeted step twin scan_current_microtask_value_step (scanners.rs:420); registered via reg_budgeted_scanner! at gc/mod.rs:833-838",
       "why": "Declared in promise/microtasks.rs, scanned from promise/scanners.rs. The scanners.rs:786/913 sites are the mutator-side save/clear the scanner exists to protect, not the coverage mechanism."
+    },
+    {
+      "file": "crates/perry-runtime/src/proxy/put_value.rs",
+      "name": "WRITE_STUB",
+      "verdict": "not_a_gc_pointer",
+      "why": "Megamorphic dynamic-write stub cache: 4096 ways of (shape_token, key_bits, slot) plain u64s. The token is a shape id and the slot an index; key_bits are content-derived by construction, because stub_key_bits admits only SSO immediates (and short ASCII heap strings folded to the SSO bits of their content) and rejects every key that would otherwise be stored under a pointer. No way holds a heap address, so nothing here keeps an object alive, and a stale entry is rejected by dyn_ic_try_store's per-hit shape-token/flags/slot-bound revalidation."
+    },
+    {
+      "file": "crates/perry-runtime/src/object/read_stub.rs",
+      "name": "READ_STUB",
+      "verdict": "not_a_gc_pointer",
+      "why": "Megamorphic property-read stub cache, the read twin of WRITE_STUB: 2-way ways of (shape_token, key_bits, slot) plain u64s. The token is a shape id and the slot an index; key_bits are content-derived by construction, because read_stub_key_bits returns short_ascii_sso_bits(key) \u2014 the key's characters packed inline \u2014 and yields None for any key that would otherwise be stored under a pointer. No way holds a heap address, so nothing here keeps an object alive, and a stale entry cannot hit: receiver_shape_token returns None for a receiver with no live shape, and the token identifies the exact key set and order, so a shape change yields a different token."
     },
     {
       "file": "crates/perry-runtime/src/pty/mod.rs",
@@ -1803,10 +1814,6 @@
     },
     {
       "file": "crates/perry-runtime/src/box.rs",
-      "name": "BOOL_BOX_PTR_CACHE"
-    },
-    {
-      "file": "crates/perry-runtime/src/box.rs",
       "name": "BOOL_BOX_REGISTRY"
     },
     {
@@ -1819,10 +1826,6 @@
     },
     {
       "file": "crates/perry-runtime/src/box.rs",
-      "name": "BOX_PTR_CACHE"
-    },
-    {
-      "file": "crates/perry-runtime/src/box.rs",
       "name": "BOX_REGISTRY"
     },
     {
@@ -1832,10 +1835,6 @@
     {
       "file": "crates/perry-runtime/src/box.rs",
       "name": "I32_BOX_FREE_HEAD"
-    },
-    {
-      "file": "crates/perry-runtime/src/box.rs",
-      "name": "I32_BOX_PTR_CACHE"
     },
     {
       "file": "crates/perry-runtime/src/box.rs",

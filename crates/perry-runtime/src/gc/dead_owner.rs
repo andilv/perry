@@ -211,6 +211,9 @@ pub(super) fn prune_dead_owner_side_tables_post_trace(full_trace: bool) {
         // ever add notes, so without this the table's root set would grow
         // monotonically and no keys array would ever be reclaimed again.
         crate::object::shapes::rotate_old_carrier_epoch_after_full_trace();
+        // The same rule for the array-tail transition caches: their carrier
+        // bits are exact only when rebuilt from live occupancy.
+        crate::object::array_tail_transition::recompute_cache_carriers_after_full_trace();
     }
     let probe = PostTraceProbe::new(full_trace);
     fan_out(
@@ -290,6 +293,15 @@ pub(super) const DEAD_KEY_PRUNES: &[DeadKeyPrune] = &[
         table: "ARRAY_NAMED_PROPS",
         owner: DeadKeyOwner::Any,
         prune: crate::array::prune_dead_array_named_property_owners,
+    },
+    // Re-keyed by the per-object move hook (`transfer_per_object_slot_mask` /
+    // `transfer_per_object_descriptor`), not by a metadata visitor. Dropping
+    // dead keys here is what lets `PERRY_YOUNG_LAYOUT_RECORDS` reach zero, so
+    // the inline allocator stops probing for a previous tenant's record.
+    DeadKeyPrune {
+        table: "LAYOUT_SLOT_MASKS + TYPED_LAYOUTS",
+        owner: DeadKeyOwner::Any,
+        prune: crate::gc::layout_tables::prune_dead_per_object_layout_owners,
     },
     // Re-keyed by the per-object move hook, not by a metadata visitor.
     DeadKeyPrune {

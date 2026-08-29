@@ -32,6 +32,11 @@ use crate::types::{DOUBLE, F32, I1, I16, I32, I64, I8, PTR};
 // remain here. `pub(crate) use` keeps the public surface stable so
 // existing `crate::expr::X` paths resolve unchanged.
 mod array_literal;
+mod bitset_test;
+pub(crate) mod hot_tls;
+#[cfg(test)]
+mod map_entry_at_tests;
+pub(crate) use bitset_test::is_u32_bitset_test;
 mod buffer_access;
 mod buffer_views;
 mod channel;
@@ -80,10 +85,11 @@ pub(crate) use helpers::{
     array_store_needs_layout_note, array_store_needs_write_barrier, buffer_alias_metadata_suffix,
     class_field_store_layout_note_is_conforming, class_field_store_needs_layout_note,
     class_field_store_needs_string_addref, emit_all_pointer_array_declaration,
-    expr_has_numeric_pointer_free_array_layout, expr_produces_fresh_heap_allocation,
-    expr_produces_non_pointer_bits_by_construction, is_global_this_builtin_function_name,
-    is_global_this_builtin_name, lower_expr_with_expected_type, lower_js_args_array,
-    store_needs_string_addref, unbox_str_handle, unbox_to_i64,
+    emit_string_addref_if_heap_string, expr_has_numeric_pointer_free_array_layout,
+    expr_produces_fresh_heap_allocation, expr_produces_non_pointer_bits_by_construction,
+    is_global_this_builtin_function_name, is_global_this_builtin_name,
+    lower_expr_with_expected_type, lower_js_args_array, store_needs_string_addref,
+    unbox_str_handle, unbox_to_i64,
 };
 pub(crate) use i32_fast_path::{
     can_lower_expr_as_i32, can_lower_expr_as_i32_in_current_region,
@@ -224,6 +230,20 @@ pub(crate) struct InlineCtorReturn {
     pub is_derived: bool,
 }
 
+/// One statement-region-owned property IC shared by equivalent reads.
+///
+/// The owner emits a speculative, side-effect-free cache probe before the
+/// original statements, then leaves the original generic property reads in
+/// place as the semantic fallback. Those reads must prime the *same* cache or
+/// the speculative probe would remain cold forever. Sharing is safe only for
+/// the exact `(base local, static property name)` pair recorded here.
+#[derive(Clone)]
+pub(crate) struct PropertyGetIcOverride {
+    pub base_local_id: u32,
+    pub property: String,
+    pub cache_name: String,
+}
+
 /// Per-function codegen context. Held briefly during lowering, never stored.
 /// #8122: where an inline-`new` site gets its `<2 x i64>` header image from.
 #[derive(Clone, Debug)]
@@ -315,6 +335,18 @@ pub(crate) struct FnCtx<'a> {
     /// reading the field, because they consult it *after* lowering their
     /// operands, by which point the field has been taken again.
     pub discard_this_expr: bool,
+    /// A condition consumer is lowering a call and can consume an `i1`
+    /// truthiness result directly. Guarded user-method dispatch uses this to
+    /// keep the statically-resolved arm's constructively-Boolean result native
+    /// while applying full `js_is_truthy` semantics to the dynamic override
+    /// arm. The ordinary JSValue result remains available for every other use.
+    pub truthy_call_result_requested: bool,
+    /// `(canonical boxed result, native truthiness)` published by the
+    /// outermost call lowering that honored `truthy_call_result_requested`.
+    /// The consumer compares the boxed SSA name with the expression result,
+    /// so a nested argument/receiver call can never be mistaken for the call
+    /// whose truthiness was requested.
+    pub pending_truthy_call_result: Option<(String, String)>,
     /// HIR FuncId → LLVM function name. Resolved at the top of
     /// `compile_module` so `FuncRef(id)` calls know what to emit.
     pub func_names: &'a std::collections::HashMap<u32, String>,
@@ -709,6 +741,8 @@ pub(crate) struct FnCtx<'a> {
     /// compiler-synthesized `arguments` binding and therefore receives every
     /// actual argument.
     pub method_has_synthetic_arguments: &'a std::collections::HashMap<(String, String), bool>,
+    /// Methods whose producer emitted a scalar `arguments.length` direct ABI.
+    pub method_arguments_length_only: &'a std::collections::HashMap<(String, String), bool>,
     /// Whole-program reverse capabilities for guarded short-spread method
     /// calls. See `CompileOptions::short_spread_method_candidates`.
     pub short_spread_method_candidates:
@@ -889,6 +923,9 @@ pub(crate) struct FnCtx<'a> {
     /// `None` until the first `new` lowers; thereafter `Some(slot_name)`
     /// (e.g. `"%r3"`).
     pub arena_state_slot: Option<String>,
+    /// `arena_state_slot` is a lazily-resolved null-initialized slot minted by
+    /// `load_inline_arena_state` (as opposed to a seeded hidden parameter).
+    pub arena_state_lazy: bool,
 
     /// Per-class cached `keys_array` global slots. The
     /// `@perry_class_keys_<class>` global is set once at module init,
@@ -1457,6 +1494,11 @@ pub(crate) struct FnCtx<'a> {
     /// the function is emitted, the caller emits `@<name> = private
     /// global [2 x i64] zeroinitializer` for each entry.
     pub ic_globals: Vec<String>,
+
+    /// Region-scoped cache selected by a guarded statement fusion. Generic
+    /// property reads matching the exact base local and key reuse it instead
+    /// of allocating independent per-expression caches.
+    pub property_get_ic_override: Option<PropertyGetIcOverride>,
 
     /// Issue #179 typed-parse: raw rodata globals emitted by
     /// `JsonParseTyped` codegen. Each entry is the full LLVM IR line
@@ -2143,14 +2185,81 @@ fn inline_cache_global_name_for_prefix(module_prefix: &str, site_id: u32) -> Str
 /// every other function lazily emits the ordinary entry accessor when its
 /// first inline allocation site is lowered.
 pub(crate) fn load_inline_arena_state(ctx: &mut FnCtx<'_>) -> String {
+    // The state is resolved on the first allocation that actually executes,
+    // not in the entry block: a function whose hot path never allocates
+    // (`exists`, the typed guard arms of `set`) used to pay the thread-local
+    // accessor on every call for an allocation on a cold branch. The slot is
+    // an entry alloca so the resolved pointer is shared by every later site,
+    // including sites inside loops; a seeded slot (#8591's hidden parameter)
+    // is simply never null.
     let arena_state_slot = if let Some(slot) = ctx.arena_state_slot.clone() {
         slot
     } else {
-        let slot = ctx.func.entry_init_call_ptr("js_inline_arena_state");
+        let slot = ctx.func.alloca_entry_null_ptr();
         ctx.arena_state_slot = Some(slot.clone());
+        ctx.arena_state_lazy = true;
         slot
     };
-    ctx.block().load(PTR, &arena_state_slot)
+    if !ctx.arena_state_lazy {
+        // Seeded by the recursive-allocator entry: never null.
+        return ctx.block().load(PTR, &arena_state_slot);
+    }
+    let cached = ctx.block().load(PTR, &arena_state_slot);
+    let is_null = ctx.block().icmp_eq(PTR, &cached, "null");
+    let init_idx = ctx.new_block("arena_state.init");
+    let done_idx = ctx.new_block("arena_state.ready");
+    let init_label = ctx.block_label(init_idx);
+    let done_label = ctx.block_label(done_idx);
+    let cached_pred = ctx.block().label.clone();
+    ctx.block().cond_br(&is_null, &init_label, &done_label);
+
+    ctx.current_block = init_idx;
+    let (fresh, init_pred) = if hot_tls::inline_hot_tls_enabled(ctx) {
+        // Apple aarch64: the runtime accessor is one hot-cache lookup, a
+        // field load and a lazy-init test — do those here and keep the call
+        // for the misses (no key, unpublished cache, uninitialised state).
+        let lookup = hot_tls::emit_hot_tls_lookup(ctx, "arena_state");
+        let ready_idx = ctx.new_block("arena_state.hot_tls.ready");
+        let resolved_idx = ctx.new_block("arena_state.hot_tls.resolved");
+        let ready_label = ctx.block_label(ready_idx);
+        let resolved_label = ctx.block_label(resolved_idx);
+        let slow_label = ctx.block_label(lookup.slow_idx);
+        let state_ptr =
+            hot_tls::hot_tls_field(ctx, &lookup.hot, hot_tls::HOT_TLS_INLINE_STATE_OFFSET);
+        let state = {
+            let blk = ctx.block();
+            let state = blk.load(PTR, &state_ptr);
+            let data = blk.load(PTR, &state);
+            let initialised = blk.icmp_ne(PTR, &data, "null");
+            blk.cond_br(&initialised, &ready_label, &slow_label);
+            state
+        };
+        ctx.current_block = ready_idx;
+        ctx.block().store(PTR, &state, &arena_state_slot);
+        let ready_pred = ctx.block().label.clone();
+        ctx.block().br(&resolved_label);
+
+        ctx.current_block = lookup.slow_idx;
+        let called = ctx.block().call(PTR, "js_inline_arena_state", &[]);
+        ctx.block().store(PTR, &called, &arena_state_slot);
+        let slow_pred = ctx.block().label.clone();
+        ctx.block().br(&resolved_label);
+
+        ctx.current_block = resolved_idx;
+        let resolved = ctx
+            .block()
+            .phi(PTR, &[(&state, &ready_pred), (&called, &slow_pred)]);
+        (resolved, ctx.block().label.clone())
+    } else {
+        let fresh = ctx.block().call(PTR, "js_inline_arena_state", &[]);
+        ctx.block().store(PTR, &fresh, &arena_state_slot);
+        (fresh, ctx.block().label.clone())
+    };
+    ctx.block().br(&done_label);
+
+    ctx.current_block = done_idx;
+    ctx.block()
+        .phi(PTR, &[(&cached, &cached_pred), (&fresh, &init_pred)])
 }
 
 #[cfg(test)]
@@ -2461,6 +2570,7 @@ impl<'a> FnCtx<'a> {
 // per-chunk sibling modules. The dispatch in `lower_expr` below routes each
 // variant to its module's `lower(ctx, expr)` helper.
 mod array_methods;
+pub(crate) mod array_pop;
 mod array_push;
 mod arrays_finds;
 mod bigint_set;
@@ -2486,8 +2596,11 @@ mod index_get_claim_tests;
 mod masked_window;
 #[cfg(test)]
 mod null_default_numeric_add_tests;
+
 mod ptr_numarray_access;
 mod ta_param_f64_read;
+#[cfg(test)]
+mod unary_bitnot_tests;
 pub(crate) use index_get::{
     numeric_index_has_integer_array_index_proof, packed_f64_loop_index_parts,
 };
@@ -2976,16 +3089,8 @@ pub(crate) fn lower_i32_control_store_value(ctx: &mut FnCtx<'_>, value: &Expr) -
 }
 
 pub(crate) fn lower_i1_control_store_value(ctx: &mut FnCtx<'_>, value: &Expr) -> Result<String> {
-    if let Some(lowered) = lower_expr_value(ctx, value)? {
-        if matches!(lowered.rep, NativeRep::I1) {
-            return Ok(lowered.value);
-        }
-        let boxed = materialize_js_value(ctx, lowered, MaterializationReason::RuntimeApi);
-        let truthy = crate::lower_conditional::lower_truthy(ctx, &boxed, value);
-        return Ok(truthy);
-    }
-    let boxed = lower_expr(ctx, value)?;
-    Ok(crate::lower_conditional::lower_truthy(ctx, &boxed, value))
+    let (_boxed, truthy) = crate::lower_conditional::lower_expr_with_truthy(ctx, value)?;
+    Ok(truthy)
 }
 
 fn lower_async_i32_control_const_compare(

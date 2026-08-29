@@ -27,8 +27,25 @@ pub extern "C" fn js_object_get_field_by_name(
     obj: *const ObjectHeader,
     key: *const crate::StringHeader,
 ) -> JSValue {
-    if let Some(value) = super::private_member_get_by_name(obj, key) {
-        return JSValue::from_bits(value.to_bits());
+    // Guard hoisted to the call site: an ordinary key is rejected on a length
+    // compare and one byte here, so the overwhelmingly common property read
+    // makes no call into the private-member path at all.
+    if !super::cannot_be_private_member_name(key) {
+        if let Some(value) = super::private_member_get_by_name(obj, key) {
+            return JSValue::from_bits(value.to_bits());
+        }
+    }
+    // An elements-backed Array-subclass instance answers its indices and
+    // `length` from its store; an absent index falls through to the ordinary
+    // lookup, which reaches the prototype chain (the shape has no index keys).
+    if let Some((_, elements)) = unsafe { crate::array::subclass_elements::backed(obj as usize) } {
+        if let Some(elements_key) = unsafe { crate::array::subclass_elements::key_of_header(key) } {
+            if let Some(value) =
+                unsafe { crate::array::subclass_elements::get_by_key(elements, elements_key) }
+            {
+                return JSValue::from_bits(value.to_bits());
+            }
+        }
     }
     // #7341: the `.size` arm below calls two helpers that allocate, and every
     // arm AFTER it dereferences `obj` again. Shadow the parameter so that arm
@@ -94,6 +111,55 @@ pub extern "C" fn js_object_get_field_by_name(
             }
         }
     }
+    // Megamorphic read stub. Primed below once the lane has proved this
+    // receiver ordinary, so a hit only has to re-prove the properties that can
+    // change: heap-object type, not forwarded, no blocking flags, a real class
+    // id, and the receiver's CURRENT shape token. The token pins the exact key
+    // set and order, so a match means the cached slot still names this key; a
+    // stale entry misses rather than resolving to the wrong property.
+    //
+    // Sits after the process.env and Proxy arms above, which have their own
+    // semantics and must keep them, and before the lane's guard chain plus the
+    // read-plan probe — which is what a hit is here to skip. The plan's epoch
+    // is bumped by the collector at loop-poll cadence, so on a steady read loop
+    // it is repeatedly cold and falls through to a shape-index hash lookup.
+    unsafe {
+        if let Some(key_bits) = super::super::read_stub::read_stub_key_bits(key) {
+            let addr = obj as usize;
+            if let Some(gc) = crate::value::addr_class::try_read_gc_header(addr) {
+                const STUB_BLOCKING: u16 =
+                    crate::gc::OBJ_FLAG_HAS_DESCRIPTORS | crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO;
+                if gc.obj_type == crate::gc::GC_TYPE_OBJECT
+                    && gc.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
+                    && gc._reserved & STUB_BLOCKING == 0
+                {
+                    let o = addr as *const ObjectHeader;
+                    let class_id = (*o).class_id;
+                    if class_id != 0
+                        && class_id != super::super::native_module::NATIVE_MODULE_CLASS_ID
+                    {
+                        if let Some(token) = super::super::read_stub::receiver_shape_token(o) {
+                            if let Some(slot) =
+                                super::super::read_stub::read_stub_probe(token, key_bits)
+                            {
+                                let live = crate::object::object_live_slot_count(o);
+                                let limit =
+                                    std::cmp::max(live, crate::object::INLINE_SLOT_FLOOR as u32);
+                                if slot < limit {
+                                    return super::accessors::js_object_get_field(o, slot);
+                                }
+                                if let Some(bits) = super::super::overflow_get(addr, slot as usize)
+                                {
+                                    return JSValue::from_bits(bits);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // FAST LANE (store-plan-cache follow-up): resolve an OWN data field on a
     // provably-plain arena class instance with no rooting scope, no
     // exotic-registry probes, and no key hashing. Every gate proves a property
@@ -162,6 +228,7 @@ pub extern "C" fn js_object_get_field_by_name(
                                 keys as usize,
                                 key as usize,
                             ) {
+                                prime_read_stub(o, key, idx);
                                 return if (idx as usize) < alloc_limit {
                                     super::accessors::js_object_get_field(o, idx)
                                 } else {
@@ -177,23 +244,40 @@ pub extern "C" fn js_object_get_field_by_name(
                                 let key_count =
                                     crate::array::keys_array_len_capped_to_capacity(keys);
                                 if key_count <= 4096 {
-                                    for i in 0..key_count {
-                                        let kv = crate::array::keys_array_slot(keys, i as u32);
-                                        if crate::string::js_string_key_matches(kv, key) {
-                                            super::super::prop_plan::read_plan_record(
-                                                keys as usize,
-                                                key as usize,
-                                                i as u32,
-                                            );
-                                            return if i < alloc_limit {
-                                                super::accessors::js_object_get_field(o, i as u32)
-                                            } else {
-                                                match super::super::overflow_get(raw, i) {
-                                                    Some(b) => JSValue::from_bits(b),
-                                                    None => JSValue::undefined(),
-                                                }
-                                            };
-                                        }
+                                    // #8936/#8950's shared resolver: the shape's
+                                    // hash index answers in O(1), with the raw
+                                    // dense-slot scan as its own fallback. The
+                                    // open-coded `keys_array_slot` +
+                                    // `js_string_key_matches` walk this replaces
+                                    // was the read-plan cache's MISS path, so it
+                                    // ran in full — up to `key_count` string
+                                    // compares — every time the epoch-guarded
+                                    // plan was flushed (each GC, and every
+                                    // descriptor / prototype / delete mutation).
+                                    // On a 500-key receiver that put
+                                    // `js_string_key_matches` at 9.6% self time
+                                    // in a computed-key read loop, second only to
+                                    // this function itself.
+                                    if let Some(i) = crate::object::keys_find_slot_by_key_ptr(
+                                        keys,
+                                        key_count as u32,
+                                        key,
+                                    ) {
+                                        let i = i as usize;
+                                        prime_read_stub(o, key, i as u32);
+                                        super::super::prop_plan::read_plan_record(
+                                            keys as usize,
+                                            key as usize,
+                                            i as u32,
+                                        );
+                                        return if i < alloc_limit {
+                                            super::accessors::js_object_get_field(o, i as u32)
+                                        } else {
+                                            match super::super::overflow_get(raw, i) {
+                                                Some(b) => JSValue::from_bits(b),
+                                                None => JSValue::undefined(),
+                                            }
+                                        };
                                     }
                                 }
                             }
@@ -1662,6 +1746,22 @@ mod null_key_guard_5972 {
                 crate::value::TAG_UNDEFINED,
                 "null key should miss → undefined"
             );
+        }
+    }
+}
+
+/// Record `(shape token, key content) -> slot` for the megamorphic read stub.
+///
+/// Only called from inside the fast lane, i.e. once the receiver has already
+/// been proved an ordinary shaped heap object with a resolvable own slot, so
+/// the stub never learns an entry for a receiver whose reads have other
+/// semantics. Keys that cannot be represented as content bits are skipped by
+/// `read_stub_key_bits`.
+#[inline]
+fn prime_read_stub(obj: *const ObjectHeader, key: *const crate::StringHeader, slot: u32) {
+    if let Some(key_bits) = super::super::read_stub::read_stub_key_bits(key) {
+        if let Some(token) = unsafe { super::super::read_stub::receiver_shape_token(obj) } {
+            super::super::read_stub::read_stub_insert(token, key_bits, slot);
         }
     }
 }

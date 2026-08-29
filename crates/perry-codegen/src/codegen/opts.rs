@@ -562,6 +562,12 @@ pub struct ImportedClass {
     /// `arguments`. Unlike a user `...rest` slot, this slot receives every
     /// actual argument while the named parameters remain positional.
     pub method_has_synthetic_arguments: Vec<bool>,
+    /// Parallel to `method_names`. `true` is a producer-authored capability:
+    /// the method has no user rest parameter and observes its synthesized
+    /// `arguments` binding only through exact `.length` reads. Importers may
+    /// call the additive `$arguments_length` ABI with a scalar count instead
+    /// of allocating and filling an argument bundle.
+    pub method_arguments_length_only: Vec<bool>,
     /// Static field names defined on this class. Used to declare the foreign
     /// `@perry_static_<src>__<class>__<field>` global with external linkage
     /// so cross-module `[Parent.Symbol.X] = …` reads/writes resolve to the
@@ -839,6 +845,9 @@ pub(crate) struct CrossModuleCtx {
     /// synthetic slot receives all actual arguments rather than only the
     /// values after the visible parameters.
     pub method_has_synthetic_arguments: std::collections::HashMap<(String, String), bool>,
+    /// Producer-proved scalar-count direct-call capability for synthetic
+    /// `arguments` methods. Sparse map (only `true` entries stored).
+    pub method_arguments_length_only: std::collections::HashMap<(String, String), bool>,
     /// Per-class `keys_array` global variable names. Each entry maps
     /// `class_name → @perry_class_keys_<modprefix>__<sanitized_class>`.
     /// Built once in `compile_module` (one entry per class — local
@@ -1019,6 +1028,14 @@ pub(crate) struct CrossModuleCtx {
     /// JSValue ABI and performs the bit-exact guard before entering the clone;
     /// every other runtime value falls through to the ordinary body.
     pub guarded_undefined_method_params: std::collections::HashMap<(String, String), usize>,
+    /// Indexed methods with one private omitted-argument/false-field clone.
+    /// The public index wrapper proves exact `undefined`, receiver class and
+    /// ShapeId, ordinary packed layout, and the live field's canonical-false
+    /// bits before skipping the default prologue and its falsy branch.
+    pub guarded_falsy_field_default_methods: std::collections::HashMap<
+        (String, String),
+        super::param_guard::GuardedFalsyFieldDefaultMethodCandidate,
+    >,
     /// Representation-selection Phase 5a: `(class, method)` pairs that have a
     /// generated proven-`this` clone (`collectors/proven_this.rs`). Local keys
     /// come from body analysis; imported keys come from an explicit capability

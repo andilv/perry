@@ -81,6 +81,7 @@ pub(crate) fn classify_direct_callee(name: &str) -> GcCallEffect {
         // `gc/barrier.rs`: remembered-set / incremental-marking maintenance.
         | "js_write_barrier"
         | "js_write_barrier_slot"
+        | "js_write_barrier_slot_validated_parent"
         | "js_write_barrier_root_heap_word"
         | "js_write_barrier_root_nanbox"
         // `gc/roots.rs`: registers one module-level global as a root. Audited
@@ -156,6 +157,9 @@ pub(crate) fn classify_direct_callee(name: &str) -> GcCallEffect {
         // side-table remove `layout_init_pointer_free` already does on every
         // allocation. No Perry allocation, no re-entry into generated code.
         | "js_array_declare_all_pointer_elements"
+        // `clean_arr_ptr` on a raw head: reads headers and the forwarding
+        // registry, allocates nothing, never re-enters generated code.
+        | "js_array_live_head"
         // TLS dynamic-call context only. #8596 adds the `_get` reader — a bare
         // `IMPLICIT_THIS.with(|c| f64::from_bits(c.get()))` (`object/this_binding.rs`),
         // the exact shape of the already-admitted `_set` and `js_new_target_get`.
@@ -230,6 +234,7 @@ pub(crate) fn classify_direct_callee(name: &str) -> GcCallEffect {
         | "js_object_alloc_class_inline_keys"
         | "js_object_alloc_class_inline_keys_stamped"
         | "js_array_push_f64"
+        | "js_array_push_u31_with_length"
         | "js_array_length"
         | "js_array_slice_values"
         // Second audit round (2026-08-01): ctor-return semantics check
@@ -846,6 +851,7 @@ mod tests {
         for name in [
             "js_closure_alloc_singleton",
             "js_array_push_f64",
+            "js_array_push_u31_with_length",
             "js_ctor_return_override",
             "js_array_indexOf_jsvalue",
             "js_validate_array_comparator",
@@ -862,6 +868,7 @@ mod tests {
         for name in [
             "js_value_length_f64",
             "js_value_length_property_f64",
+            "js_value_length_property_ic_f64",
             "js_array_get_f64",
         ] {
             assert_eq!(

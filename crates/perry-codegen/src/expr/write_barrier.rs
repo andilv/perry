@@ -57,10 +57,10 @@ pub(crate) fn emit_write_barrier(ctx: &mut FnCtx<'_>, parent_bits: &str, child_b
     // touches the incremental-mark latch, the parent decode or the remembered
     // set — so for every numeric store this call does nothing but cost a call.
     //
-    // An array element store pays it unconditionally today: `this.vals[i] = v`
-    // in `gc-handoff/apps/pipeline.ts`'s `Registry` emits
-    // `js_typed_feedback_array_set_f64_extend` immediately followed by a bare
-    // `js_write_barrier`, on a `number[]`.
+    // Runtime array setters now own a precise destination-slot barrier and do
+    // not use this opaque compatibility wrapper. Other opaque property-store
+    // helpers still reach it when their internal destination is unavailable to
+    // generated code.
     //
     // `emit_may_carry_heap_pointer_check` is a deliberate SUPERSET of the
     // runtime predicate (its doc records why the direction is load-bearing,
@@ -221,7 +221,16 @@ pub(crate) fn emit_write_barrier_slot_generation_tested(
     ctx.current_block = barrier_idx;
     {
         let blk = ctx.block();
-        emit_write_barrier_slot_on_block(blk, parent_bits, slot_addr, child_bits);
+        // The gate above just dereferenced `parent_handle`'s header, so the
+        // runtime need not re-validate or re-classify it: the validated-parent
+        // entry takes the raw handle and goes straight to the decoded barrier.
+        // `parent_bits` is deliberately unused on this arm — it is the same
+        // object, boxed or raw, and the raw handle is what the gate proved.
+        let _ = parent_bits;
+        blk.call_void(
+            "js_write_barrier_slot_validated_parent",
+            &[(I64, parent_handle), (I64, slot_addr), (I64, child_bits)],
+        );
         blk.br(&done_label);
     }
     ctx.current_block = done_idx;
@@ -305,7 +314,16 @@ pub(crate) fn emit_write_barrier_slot_value_and_generation_tested(
     ctx.current_block = barrier_idx;
     {
         let blk = ctx.block();
-        emit_write_barrier_slot_on_block(blk, parent_bits, slot_addr, child_bits);
+        // The gate above just dereferenced `parent_handle`'s header, so the
+        // runtime need not re-validate or re-classify it: the validated-parent
+        // entry takes the raw handle and goes straight to the decoded barrier.
+        // `parent_bits` is deliberately unused on this arm — it is the same
+        // object, boxed or raw, and the raw handle is what the gate proved.
+        let _ = parent_bits;
+        blk.call_void(
+            "js_write_barrier_slot_validated_parent",
+            &[(I64, parent_handle), (I64, slot_addr), (I64, child_bits)],
+        );
         blk.br(&done_label);
     }
     ctx.current_block = done_idx;
@@ -347,9 +365,10 @@ pub(crate) fn emit_layout_note_slot_on_block(
     );
 }
 
-/// Scalar-aware layout note: passes the slot's previous value (`old_bits`) so
+/// Value-aware layout note: passes the slot's previous value (`old_bits`) so
 /// the runtime can skip the thread-local layout hashmap when the store does not
-/// change the slot's pointer-ness (scalar-over-scalar). See
+/// change the slot's pointer-ness (scalar-over-scalar or pointer-over-pointer).
+/// Array element-shape bookkeeping still runs for the latter. See
 /// `js_gc_note_slot_layout_aware`.
 pub(crate) fn emit_layout_note_slot_aware_on_block(
     blk: &mut LlBlock,
@@ -487,10 +506,12 @@ pub(crate) fn emit_jsvalue_slot_store_with_value_bits_on_block(
 /// As [`emit_jsvalue_slot_store_on_block`], but for an **in-place element
 /// overwrite** of a slot that already holds a valid value: routes the layout
 /// note through `js_gc_note_slot_layout_aware`, which loads the previous slot
-/// value and skips the thread-local layout hashmap when neither old nor new is
-/// a heap pointer. Use only where the slot is guaranteed initialized (array
-/// `arr[i] = …` overwrites), not for fresh-slot appends/literals or object
-/// field writes (which are POINTER_FREE-dominated and only pay the extra load).
+/// value and skips the thread-local layout hashmap when old and new have the
+/// same heap-pointer classification. Array element-shape bookkeeping still
+/// runs for pointer-over-pointer. Use only where the slot is guaranteed
+/// initialized (array `arr[i] = …` overwrites), not for fresh-slot
+/// appends/literals or object field writes (which are POINTER_FREE-dominated
+/// and only pay the extra load).
 /// This is the dominant per-write cost on downgraded `any[]` numeric loops
 /// (#5094) and gives ~9× on `bench_numeric_array_downgrade` without regressing
 /// `bench_object_property`.
@@ -519,6 +540,37 @@ pub(crate) fn emit_jsvalue_slot_store_scalar_aware_on_block(
         true,
         None,
     )
+}
+
+/// The scalar-aware slot store with its layout note DEFERRED to the caller:
+/// loads the slot's previous value, writes the new one through the shared
+/// (audited) store, runs the string-addref demote, and returns
+/// `(value_bits, old_bits)` so the caller can decide inline whether the
+/// runtime note would act at all before calling it. The caller owns both the
+/// note and the barrier; nothing else about the store changes.
+pub(crate) fn emit_jsvalue_slot_store_deferred_layout_note_on_block(
+    blk: &mut LlBlock,
+    slot_ptr: &str,
+    value_double: &str,
+) -> (String, String) {
+    let old_double = blk.load(DOUBLE, slot_ptr);
+    let old_bits = blk.bitcast_double_to_i64(&old_double);
+    let value_bits = emit_jsvalue_slot_store_on_block_inner(
+        blk,
+        slot_ptr,
+        value_double,
+        "",
+        "",
+        true,
+        false,
+        "",
+        "",
+        false,
+        false,
+        None,
+    )
+    .unwrap_or_else(|| blk.bitcast_double_to_i64(value_double));
+    (value_bits, old_bits)
 }
 
 /// #7511 — emit the `i1` predicate "these NaN-boxed bits MAY carry a heap
@@ -569,6 +621,36 @@ pub(crate) fn emit_may_carry_heap_pointer_check(blk: &mut LlBlock, value_bits: &
     let tagged = blk.or(I1, &is_pointer_tag, &is_string_tag);
     let tagged = blk.or(I1, &tagged, &is_bigint_tag);
     blk.or(I1, &tagged, &is_raw_addr)
+}
+
+/// The EXACT codegen mirror of `perry-runtime::gc::layout::layout_pointer_bearing_bits`
+/// (not the superset above): a `POINTER_TAG` / `STRING_TAG` / `BIGINT_TAG`
+/// value bears a pointer iff its 48-bit payload is non-zero; every other
+/// NaN-boxed tag never does; a bare value bears one iff it lies in
+/// `[0x1000, POINTER_MASK]` and is 8-byte aligned. `bits <= POINTER_MASK`
+/// already implies an all-zero top word, which is the runtime's
+/// `tag >= 0x7FF8…` rejection. Used where a store's GC layout note is skipped
+/// only when the runtime itself would return without acting, so the answer
+/// must match the runtime on every input.
+pub(crate) fn emit_layout_pointer_bearing_check(blk: &mut LlBlock, value_bits: &str) -> String {
+    use crate::nanbox::{
+        BIGINT_TAG_TOP16_I64, POINTER_MASK_I64, POINTER_TAG_TOP16_I64, STRING_TAG_TOP16_I64,
+    };
+    let top16 = blk.lshr(I64, value_bits, "48");
+    let is_pointer_tag = blk.icmp_eq(I64, &top16, POINTER_TAG_TOP16_I64);
+    let is_string_tag = blk.icmp_eq(I64, &top16, STRING_TAG_TOP16_I64);
+    let is_bigint_tag = blk.icmp_eq(I64, &top16, BIGINT_TAG_TOP16_I64);
+    let tagged = blk.or(I1, &is_pointer_tag, &is_string_tag);
+    let tagged = blk.or(I1, &tagged, &is_bigint_tag);
+    let payload = blk.and(I64, value_bits, POINTER_MASK_I64);
+    let payload_nonzero = blk.icmp_ne(I64, &payload, "0");
+    let above_floor = blk.icmp_uge(I64, value_bits, "4096");
+    let within_mask = blk.icmp_ule(I64, value_bits, POINTER_MASK_I64);
+    let low_bits = blk.and(I64, value_bits, "7");
+    let aligned = blk.icmp_eq(I64, &low_bits, "0");
+    let bare = blk.and(I1, &above_floor, &within_mask);
+    let bare = blk.and(I1, &bare, &aligned);
+    blk.select(I1, &tagged, I1, &payload_nonzero, &bare)
 }
 
 /// #7511 — a class-field JSValue slot store whose three GC-bookkeeping calls
@@ -820,9 +902,10 @@ fn emit_jsvalue_slot_store_on_block_inner(
         .unwrap_or_else(|| blk.bitcast_double_to_i64(value_double));
     if layout_note_needed {
         match old_bits.as_deref() {
-            // Scalar-over-scalar stores leave the GC slot layout unchanged — the
-            // aware note skips the thread-local layout hashmap when neither the
-            // new nor the old value is a heap pointer (#5094).
+            // Same-classification overwrites leave the GC slot mask unchanged.
+            // The aware note skips the general layout pipeline; its runtime
+            // pointer-over-pointer arm still maintains Array element-shape
+            // metadata (#5094).
             Some(old) => emit_layout_note_slot_aware_on_block(
                 blk,
                 layout_parent_bits,

@@ -14,15 +14,23 @@ use crate::types::{LlvmType, DOUBLE, I1, I32, I64, PTR};
 
 use super::helpers::{node_stream_parent_kind, scoped_static_method_name};
 use super::method_trampolines::{
-    emit_guarded_undefined, emit_public_generic, emit_public_typed, guarded_undefined_name,
+    emit_guarded_nonnegative_index, emit_guarded_undefined, emit_public_generic, emit_public_typed,
+    guarded_falsy_field_default_name, guarded_undefined_name,
 };
 use super::opts::CrossModuleCtx;
+
+#[path = "method_typed.rs"]
+mod typed;
 use super::typed_abi::{
     generic_method_body_name, lower_typed_f64_body, lower_typed_f64_receiver_body,
     lower_typed_i1_body, lower_typed_i32_body, lower_typed_string_body, typed_f64_method_name,
     typed_f64_receiver_method_name, typed_i1_method_name, typed_i32_method_name,
     typed_param_reps_for_params, typed_string_method_name, TypedFunctionTrampolineKind,
     TypedReceiverMethodInfo,
+};
+pub(super) use typed::{
+    compile_typed_f64_method, compile_typed_f64_receiver_method, compile_typed_i1_method,
+    compile_typed_i32_method, compile_typed_string_method,
 };
 
 /// Compile a class instance method as a top-level LLVM function with the
@@ -68,6 +76,13 @@ pub(super) fn compile_method(
                 method.name
             )
         })?;
+    let arguments_length_clone = method.params.last().is_some_and(|param| {
+        matches!(
+            &param.ty,
+            perry_hir::types::Type::Named(name)
+                if name == super::arguments::SYNTHETIC_ARGUMENTS_LENGTH_TYPE
+        )
+    });
     // Representation-selection Phase 5a: the proven-`this` clone is a SECOND,
     // additive body compiled from the same HIR through the same statement
     // lowerer. It never replaces the public symbol and never participates in
@@ -75,6 +90,11 @@ pub(super) fn compile_method(
     // primary (`proven_this: None`) invocation for this same method.
     let is_pshape_clone = proven_this.is_some() && !pshape_arg_clone;
     let is_index_clone = nonnegative_index_params.is_some();
+    let guarded_index_family = !is_index_clone
+        && force_generic_body
+        && cross_module
+            .nonnegative_index_methods
+            .contains_key(&(class.name.clone(), method.name.clone()));
     let pshape_arg_plan = pshape_arg_clone
         .then(|| {
             cross_module
@@ -82,14 +102,21 @@ pub(super) fn compile_method(
                 .get(&(class.name.clone(), method.name.clone()))
         })
         .flatten();
-    let guarded_undefined_param = (!is_index_clone && !ptr_array_cache_clone && !pshape_arg_clone)
-        .then(|| {
-            cross_module
-                .guarded_undefined_method_params
-                .get(&(class.name.clone(), method.name.clone()))
-                .copied()
-        })
-        .flatten();
+    let guarded_undefined_param =
+        (!arguments_length_clone && !is_index_clone && !ptr_array_cache_clone && !pshape_arg_clone)
+            .then(|| {
+                cross_module
+                    .guarded_undefined_method_params
+                    .get(&(class.name.clone(), method.name.clone()))
+                    .copied()
+            })
+            .flatten();
+    let guarded_falsy_field_default = cross_module
+        .guarded_falsy_field_default_methods
+        .get(&(class.name.clone(), method.name.clone()))
+        .copied();
+    let guarded_clone_param = guarded_undefined_param
+        .or_else(|| guarded_falsy_field_default.map(|candidate| candidate.param_index));
     let fast_array_param_ids = if fast_array_handle_clone {
         crate::codegen::typed_abi::nonnegative_index_fast_array_params(
             method,
@@ -98,19 +125,23 @@ pub(super) fn compile_method(
     } else {
         Vec::new()
     };
-    debug_assert!(!(is_pshape_clone && is_index_clone));
     debug_assert!(!fast_array_handle_clone || is_index_clone);
+    debug_assert!(!fast_array_handle_clone || !is_pshape_clone);
     debug_assert!(!fast_array_handle_clone || !fast_array_param_ids.is_empty());
     debug_assert!(!ptr_array_cache_clone || is_pshape_clone);
-    debug_assert!(!guarded_undefined_clone || guarded_undefined_param.is_some());
-    debug_assert!(!guarded_undefined_clone || !is_index_clone);
+    debug_assert!(!guarded_undefined_clone || guarded_clone_param.is_some());
+    debug_assert!(
+        !guarded_undefined_clone || !is_index_clone || guarded_falsy_field_default.is_some()
+    );
     debug_assert!(!guarded_undefined_clone || !ptr_array_cache_clone);
     debug_assert!(!pshape_arg_clone || pshape_arg_plan.is_some());
     debug_assert!(!pshape_arg_clone || !is_index_clone);
     debug_assert!(!pshape_arg_clone || !ptr_array_cache_clone);
     debug_assert!(!pshape_arg_clone || typed_public_trampoline.is_none());
     debug_assert!(!pshape_arg_clone || !force_generic_body);
-    let family_name = if pshape_arg_clone {
+    let family_name = if arguments_length_clone {
+        super::arguments::arguments_length_method_name(&public_llvm_name)
+    } else if pshape_arg_clone {
         crate::collectors::pshape_args_method_name(&public_llvm_name)
     } else if ptr_array_cache_clone {
         crate::collectors::ptr_array_cache_method_name(&public_llvm_name)
@@ -119,19 +150,31 @@ pub(super) fn compile_method(
     } else {
         public_llvm_name.clone()
     };
-    let llvm_name = if fast_array_handle_clone {
+    let llvm_name = if arguments_length_clone {
+        family_name.clone()
+    } else if fast_array_handle_clone {
         crate::codegen::nonnegative_index_fast_array_method_name(
             &public_llvm_name,
             nonnegative_index_params.expect("fast-array clone has index parameters"),
         )
     } else if let Some(params) = nonnegative_index_params {
-        crate::codegen::nonnegative_index_method_name(&public_llvm_name, params)
+        let index_name = crate::codegen::nonnegative_index_method_name(&family_name, params);
+        if guarded_undefined_clone && guarded_falsy_field_default.is_some() {
+            guarded_falsy_field_default_name(
+                &index_name,
+                guarded_clone_param.expect("falsy-default clone parameter"),
+            )
+        } else {
+            index_name
+        }
     } else if guarded_undefined_clone {
         guarded_undefined_name(
             &family_name,
             guarded_undefined_param.expect("undefined clone parameter"),
         )
     } else if guarded_undefined_param.is_some() {
+        generic_method_body_name(&family_name)
+    } else if guarded_index_family {
         generic_method_body_name(&family_name)
     } else if ptr_array_cache_clone || is_pshape_clone || pshape_arg_clone {
         family_name.clone()
@@ -154,6 +197,7 @@ pub(super) fn compile_method(
 
     let ic_base = llmod.ic_counter;
     let buffer_alias_base = llmod.buffer_alias_counter;
+    let lowered_function_index = llmod.function_count();
     let lf = llmod.define_function(&llvm_name, DOUBLE, params);
     // Plain `$pshape` clones are producer-published capabilities and need
     // external linkage for guarded calls from importing modules. The stricter
@@ -166,6 +210,7 @@ pub(super) fn compile_method(
         || typed_public_trampoline.is_some()
         || force_generic_body
         || guarded_undefined_param.is_some()
+        || (guarded_undefined_clone && guarded_falsy_field_default.is_some())
         || pshape_arg_clone
     {
         lf.linkage = "internal".to_string();
@@ -174,6 +219,30 @@ pub(super) fn compile_method(
     if is_index_clone {
         lf.pre_statepoint_inline = true;
     }
+    // #8872: methods participate in the same allocation-hot analysis as
+    // functions and closures.  This must be set before the entry block exists
+    // because `lower_call/new_alloc.rs` consults it while lowering each `new`
+    // site.  Previously `collect_alloc_hot_functions` could discover a method
+    // FuncId, but method codegen silently discarded the result, leaving tiny
+    // cross-module allocation kernels on the outlined runtime allocator.
+    lf.alloc_hot = cross_module.alloc_hot_functions.contains(&method.id);
+
+    // A false-field-default clone is entered only after its public wrapper
+    // proved the omitted argument, exact receiver layout, and live false slot.
+    // Remove exactly the corresponding synthetic default prologue; all other
+    // parameter defaults retain their source order and effects.
+    let specialized_body = guarded_falsy_field_default
+        .filter(|_| guarded_undefined_clone)
+        .map(|candidate| {
+            method
+                .body
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != candidate.prologue_stmt_index)
+                .map(|(_, stmt)| stmt.clone())
+                .collect::<Vec<_>>()
+        });
+    let method_body = specialized_body.as_deref().unwrap_or(&method.body);
 
     // gh #6206 / #6081: methods were compiled WITHOUT a shadow frame — same
     // exact-roots liveness hole as closures (see compile_closure). One extra
@@ -184,14 +253,14 @@ pub(super) fn compile_method(
             cross_module.flat_const_arrays.keys().copied().collect();
         let m = crate::collectors::collect_pointer_typed_locals(
             &method.params,
-            &method.body,
+            method_body,
             &flat_const_ids,
         );
         crate::codegen::helpers::maybe_spill_roots_to_shadow_frame(
             lf,
             &llvm_name,
             m.len() + 1,
-            &method.body,
+            method_body,
         );
         lf.enable_shadow_frame(m.len() as u32 + 1);
         m
@@ -200,7 +269,7 @@ pub(super) fn compile_method(
     };
     let this_shadow_slot_idx = shadow_slot_map.len() as u32;
     let shadow_slot_clears_after_stmt =
-        crate::collectors::collect_shadow_slot_clear_points(&method.body, &shadow_slot_map);
+        crate::collectors::collect_shadow_slot_clear_points(method_body, &shadow_slot_map);
 
     let _ = lf.create_block("entry");
 
@@ -237,11 +306,13 @@ pub(super) fn compile_method(
             }
             map.insert(p.id, slot);
             if index_param_ids.contains(&p.id) {
-                // The clone is reachable only from a call site that proved
-                // this argument is in [0, i32::MAX]. The ordinary boxed ABI
-                // materializes such loop indices as plain doubles, so one
-                // entry conversion supplies the canonical raw index slot.
-                let raw_i32 = blk.fptosi(DOUBLE, &arg_name, I32);
+                // A statically proven route normally passes a plain double;
+                // the guarded stable public entry may also pass Perry's
+                // canonical INT32 NaN-box. Both entries prove the exact same
+                // signed-i32 value class before reaching this body, so use the
+                // shared already-guarded conversion rather than `fptosi`
+                // (which cannot consume a tagged INT32 value).
+                let raw_i32 = super::typed_abi::emit_typed_i32_raw_assuming_guarded(blk, &arg_name);
                 let i32_slot = blk.alloca(I32);
                 blk.store(I32, &raw_i32, &i32_slot);
                 index_i32_param_slots.insert(p.id, i32_slot);
@@ -257,7 +328,7 @@ pub(super) fn compile_method(
     for p in &method.params {
         local_types.insert(p.id, p.ty.clone());
     }
-    if let Some(index) = guarded_undefined_param.filter(|_| guarded_undefined_clone) {
+    if let Some(index) = guarded_clone_param.filter(|_| guarded_undefined_clone) {
         local_types.insert(method.params[index].id, perry_hir::types::Type::Void);
     }
 
@@ -278,7 +349,7 @@ pub(super) fn compile_method(
             .is_some(),
     );
     let native_facts = crate::collectors::collect_native_region_fact_graph(
-        &method.body,
+        method_body,
         &[],
         &flat_const_ids,
         &clamp_fn_ids,
@@ -311,18 +382,18 @@ pub(super) fn compile_method(
     let repsel_context_denial = repsel_flags.canonical_denial;
     let report_denial = repsel_flags.report_denial();
     let repsel_closure_refs = if repsel_allows || repsel_str_allows || report_denial {
-        crate::expr::collect_closure_referenced_locals(&method.body)
+        crate::expr::collect_closure_referenced_locals(method_body)
     } else {
         std::collections::HashSet::new()
     };
     let repsel_str_ineligible = if repsel_str_allows || report_denial {
-        crate::expr::collect_canonical_str_ineligible_locals(&method.body)
+        crate::expr::collect_canonical_str_ineligible_locals(method_body)
     } else {
         std::collections::HashSet::new()
     };
 
     let mut guarded_param_proofs = index_param_proofs;
-    if let Some(index) = guarded_undefined_param.filter(|_| guarded_undefined_clone) {
+    if let Some(index) = guarded_clone_param.filter(|_| guarded_undefined_clone) {
         guarded_param_proofs.insert(method.params[index].id, perry_hir::types::Type::Void);
     }
     if let Some(plan) = pshape_arg_plan {
@@ -338,8 +409,8 @@ pub(super) fn compile_method(
             )
         }));
     }
-    let mut reassigned_locals = crate::collectors::reassigned_locals(&method.body);
-    if let Some(index) = guarded_undefined_param.filter(|_| guarded_undefined_clone) {
+    let mut reassigned_locals = crate::collectors::reassigned_locals(method_body);
+    if let Some(index) = guarded_clone_param.filter(|_| guarded_undefined_clone) {
         // Candidate discovery already rejected every user-authored write and
         // closure capture.  The remaining assignment is TypeScript's lowered
         // optional-parameter prologue (`undefined = undefined`), which cannot
@@ -367,6 +438,8 @@ pub(super) fn compile_method(
         current_block: 0,
         discard_expr_value: false,
         discard_this_expr: false,
+        truthy_call_result_requested: false,
+        pending_truthy_call_result: None,
         func_names,
         strings,
         loop_targets: Vec::new(),
@@ -439,6 +512,7 @@ pub(super) fn compile_method(
         method_param_counts: &cross_module.method_param_counts,
         method_has_rest: &cross_module.method_has_rest,
         method_has_synthetic_arguments: &cross_module.method_has_synthetic_arguments,
+        method_arguments_length_only: &cross_module.method_arguments_length_only,
         imported_func_return_types: &cross_module.imported_func_return_types,
         ffi_signatures: &cross_module.ffi_signatures,
         ffi_aliases: &cross_module.ffi_aliases,
@@ -461,6 +535,7 @@ pub(super) fn compile_method(
         declared_only_numeric_locals: std::collections::HashSet::new(),
         shadow_slot_clears_after_stmt,
         arena_state_slot: None,
+        arena_state_lazy: false,
         class_keys_slots: HashMap::new(),
         class_shape_slots: HashMap::new(),
         class_header_images: HashMap::new(),
@@ -574,6 +649,7 @@ pub(super) fn compile_method(
         was_unrolled: method.was_unrolled,
         ic_site_counter: ic_base,
         ic_globals: Vec::new(),
+        property_get_ic_override: None,
         typed_parse_rodata: Vec::new(),
         buffer_data_slots: HashMap::new(),
         buffer_view_slots: HashMap::new(),
@@ -648,7 +724,7 @@ pub(super) fn compile_method(
     super::arguments::materialize_arguments_object(
         &mut ctx,
         &method.params,
-        Some(&method.body),
+        Some(method_body),
         super::arguments::ArgumentsCallee::Undefined,
     );
 
@@ -675,7 +751,7 @@ pub(super) fn compile_method(
             // thread-local round trip per construction for a cell no one
             // reads. Measured: 1.89x on a two-class `new B(x, y)` loop,
             // 3.14x on `shapes.ts`.
-            if crate::collectors::body_contains_closure(&method.body) {
+            if crate::collectors::body_contains_closure(method_body) {
                 crate::expr::this_super_call::push_shared_super_called_slot(&mut ctx);
                 ctx.shared_super_scope_active = true;
             } else {
@@ -809,7 +885,7 @@ pub(super) fn compile_method(
                             (ctor.symbol, ctor.param_count)
                         } else {
                             // No callable ctor symbol — bail.
-                            stmt::lower_stmts(&mut ctx, &method.body).with_context(|| {
+                            stmt::lower_stmts(&mut ctx, method_body).with_context(|| {
                                 format!("lowering body of method '{}::{}'", class.name, method.name)
                             })?;
                             // Fall through to the default ret at end.
@@ -1127,14 +1203,14 @@ pub(super) fn compile_method(
             .call(DOUBLE, "js_throw_reference_error_this_before_super", &[]);
         ctx.block().unreachable();
     } else if method.is_async {
-        stmt::lower_async_rejecting_stmts(&mut ctx, &method.body).with_context(|| {
+        stmt::lower_async_rejecting_stmts(&mut ctx, method_body).with_context(|| {
             format!(
                 "lowering async body of method '{}::{}'",
                 class.name, method.name
             )
         })?;
     } else {
-        stmt::lower_stmts(&mut ctx, &method.body).with_context(|| {
+        stmt::lower_stmts(&mut ctx, method_body).with_context(|| {
             format!("lowering body of method '{}::{}'", class.name, method.name)
         })?;
     }
@@ -1199,6 +1275,24 @@ pub(super) fn compile_method(
     let buffer_alias_used = ctx.buffer_data_slots.len() as u32;
     let native_rep_records = std::mem::take(&mut ctx.native_rep_records);
     drop(ctx);
+
+    // Under native roots, ordinary `force_inline` is intentionally only an
+    // LLVM hint: running the inliner after statepoint rewriting duplicates
+    // relocation scaffolding.  Exact-receiver leaves are different.  Once the
+    // body has actually been lowered, admit only compact bodies to the early
+    // inliner so direct method chains can flatten without guessing from HIR
+    // statement count.  Indexed clones are already admitted above and
+    // pshape-argument clones do not carry an exact receiver proof.
+    if is_pshape_clone && !is_index_clone && !method.is_async && !method.is_generator {
+        let lowered = llmod
+            .function_mut(lowered_function_index)
+            .expect("just-lowered method function");
+        if super::helpers::guarded_specialization_fits_preinline_budget(
+            lowered.estimated_ir_bytes(),
+        ) {
+            lowered.pre_statepoint_inline = true;
+        }
+    }
     llmod.ic_counter = ic_end;
     llmod.buffer_alias_counter += buffer_alias_used;
     llmod.native_rep_records.extend(native_rep_records);
@@ -1221,239 +1315,51 @@ pub(super) fn compile_method(
     // twice.
     if let Some(param_index) = guarded_undefined_param.filter(|_| !guarded_undefined_clone) {
         emit_guarded_undefined(llmod, method, &family_name, &llvm_name, param_index);
-    } else if !is_pshape_clone && !is_index_clone && !guarded_undefined_clone {
+    } else if !arguments_length_clone
+        && !is_index_clone
+        && !guarded_undefined_clone
+        && !pshape_arg_clone
+        && !ptr_array_cache_clone
+    {
         if let Some(kind) = typed_public_trampoline {
             emit_public_typed(llmod, method, &public_llvm_name, &llvm_name, kind);
         } else if force_generic_body {
-            emit_public_generic(llmod, method, &public_llvm_name, &llvm_name);
+            if let Some(params) = cross_module
+                .nonnegative_index_methods
+                .get(&(class.name.clone(), method.name.clone()))
+            {
+                let wrapper_name = if is_pshape_clone {
+                    &family_name
+                } else {
+                    &public_llvm_name
+                };
+                let expected_class_id = *class_ids
+                    .get(&class.name)
+                    .expect("method class has a runtime class id");
+                let keys_global = cross_module
+                    .class_keys_globals
+                    .get(&class.name)
+                    .expect("method class has a canonical keys global");
+                let expected_shape_global =
+                    crate::typed_shape::shape_id_global_name_from_keys_global(keys_global);
+                let falsy_default = (!is_pshape_clone)
+                    .then_some(guarded_falsy_field_default.as_ref())
+                    .flatten();
+                emit_guarded_nonnegative_index(
+                    llmod,
+                    method,
+                    wrapper_name,
+                    &llvm_name,
+                    params,
+                    expected_class_id,
+                    &expected_shape_global,
+                    falsy_default,
+                );
+            } else {
+                emit_public_generic(llmod, method, &public_llvm_name, &llvm_name);
+            }
         }
     }
-    Ok(())
-}
-
-/// Compile the internal typed-f64 clone for a conservatively eligible instance
-/// method. The public/generic method body keeps the usual
-/// `double(this, args...) -> double` ABI and remains the only symbol registered
-/// in runtime vtables.
-pub(super) fn compile_typed_f64_method(
-    llmod: &mut LlModule,
-    class: &perry_hir::Class,
-    method: &Function,
-    methods: &HashMap<(String, String), String>,
-) -> Result<()> {
-    let generic_name = methods
-        .get(&(class.name.clone(), method.name.clone()))
-        .cloned()
-        .ok_or_else(|| {
-            anyhow!(
-                "method '{}::{}' missing from registry",
-                class.name,
-                method.name
-            )
-        })?;
-    let llvm_name = typed_f64_method_name(&generic_name);
-    let param_reps = typed_param_reps_for_params(&method.params).ok_or_else(|| {
-        anyhow!(
-            "typed-f64 method '{}::{}' has unsupported parameter",
-            class.name,
-            method.name
-        )
-    })?;
-    let params: Vec<(LlvmType, String)> = method
-        .params
-        .iter()
-        .zip(param_reps.iter())
-        .map(|(p, rep)| (rep.llvm_ty(), format!("%arg{}", p.id)))
-        .collect();
-    let lf = llmod.define_function(&llvm_name, DOUBLE, params);
-    lf.linkage = "internal".to_string();
-    lf.force_inline = true;
-    let _ = lf.create_block("entry");
-
-    let value = {
-        let blk = lf.block_mut(0).unwrap();
-        lower_typed_f64_body(blk, &method.params, &method.body)?
-    };
-    lf.block_mut(0).unwrap().ret(DOUBLE, &value);
-    Ok(())
-}
-
-/// Compile the internal typed-f64 receiver clone for an exact own instance
-/// method. The clone takes a raw receiver handle (`i64`) plus raw numeric
-/// method arguments; callers must compose the method-direct guard with raw-f64
-/// class-field guards for every receiver field before entering it.
-pub(super) fn compile_typed_f64_receiver_method(
-    llmod: &mut LlModule,
-    class: &perry_hir::Class,
-    method: &Function,
-    methods: &HashMap<(String, String), String>,
-    receiver: &TypedReceiverMethodInfo,
-    header_skip: u64,
-) -> Result<()> {
-    let generic_name = methods
-        .get(&(class.name.clone(), method.name.clone()))
-        .cloned()
-        .ok_or_else(|| {
-            anyhow!(
-                "method '{}::{}' missing from registry",
-                class.name,
-                method.name
-            )
-        })?;
-    let llvm_name = typed_f64_receiver_method_name(&generic_name);
-    let mut params: Vec<(LlvmType, String)> = Vec::with_capacity(method.params.len() + 1);
-    params.push((I64, "%this_obj".to_string()));
-    for p in &method.params {
-        params.push((DOUBLE, format!("%arg{}", p.id)));
-    }
-    let lf = llmod.define_function(&llvm_name, DOUBLE, params);
-    lf.linkage = "internal".to_string();
-    lf.force_inline = true;
-    let _ = lf.create_block("entry");
-
-    let value = {
-        let blk = lf.block_mut(0).unwrap();
-        lower_typed_f64_receiver_body(blk, &method.params, &method.body, receiver, header_skip)?
-    };
-    lf.block_mut(0).unwrap().ret(DOUBLE, &value);
-    Ok(())
-}
-
-/// Compile the internal typed-i1 clone for a conservatively eligible instance
-/// method. Runtime vtables still register only the generic method symbol; this
-/// clone is only called from guarded exact own-method sites.
-pub(super) fn compile_typed_i1_method(
-    llmod: &mut LlModule,
-    class: &perry_hir::Class,
-    method: &Function,
-    methods: &HashMap<(String, String), String>,
-) -> Result<()> {
-    let generic_name = methods
-        .get(&(class.name.clone(), method.name.clone()))
-        .cloned()
-        .ok_or_else(|| {
-            anyhow!(
-                "method '{}::{}' missing from registry",
-                class.name,
-                method.name
-            )
-        })?;
-    let llvm_name = typed_i1_method_name(&generic_name);
-    let param_reps = typed_param_reps_for_params(&method.params).ok_or_else(|| {
-        anyhow!(
-            "typed-i1 method '{}::{}' has unsupported parameter",
-            class.name,
-            method.name
-        )
-    })?;
-    let params: Vec<(LlvmType, String)> = method
-        .params
-        .iter()
-        .zip(param_reps.iter())
-        .map(|(p, rep)| (rep.llvm_ty(), format!("%arg{}", p.id)))
-        .collect();
-    let lf = llmod.define_function(&llvm_name, I1, params);
-    lf.linkage = "internal".to_string();
-    lf.force_inline = true;
-    let _ = lf.create_block("entry");
-
-    let value = {
-        let blk = lf.block_mut(0).unwrap();
-        lower_typed_i1_body(blk, &method.params, &method.body)?
-    };
-    lf.block_mut(0).unwrap().ret(I1, &value);
-    Ok(())
-}
-
-/// Compile the internal typed-i32 clone for a conservatively eligible instance
-/// method. The public method symbol remains a JSValue trampoline registered in
-/// the vtable; this clone is reached only after exact method and Int32 guards.
-pub(super) fn compile_typed_i32_method(
-    llmod: &mut LlModule,
-    class: &perry_hir::Class,
-    method: &Function,
-    methods: &HashMap<(String, String), String>,
-) -> Result<()> {
-    let generic_name = methods
-        .get(&(class.name.clone(), method.name.clone()))
-        .cloned()
-        .ok_or_else(|| {
-            anyhow!(
-                "method '{}::{}' missing from registry",
-                class.name,
-                method.name
-            )
-        })?;
-    let llvm_name = typed_i32_method_name(&generic_name);
-    let param_reps = typed_param_reps_for_params(&method.params).ok_or_else(|| {
-        anyhow!(
-            "typed-i32 method '{}::{}' has unsupported parameter",
-            class.name,
-            method.name
-        )
-    })?;
-    let params: Vec<(LlvmType, String)> = method
-        .params
-        .iter()
-        .zip(param_reps.iter())
-        .map(|(p, rep)| (rep.llvm_ty(), format!("%arg{}", p.id)))
-        .collect();
-    let lf = llmod.define_function(&llvm_name, I32, params);
-    lf.linkage = "internal".to_string();
-    lf.force_inline = true;
-    let _ = lf.create_block("entry");
-
-    let value = {
-        let blk = lf.block_mut(0).unwrap();
-        lower_typed_i32_body(blk, &method.params, &method.body)?
-    };
-    lf.block_mut(0).unwrap().ret(I32, &value);
-    Ok(())
-}
-
-/// Compile the internal typed-string clone for a conservatively eligible
-/// instance method. The clone passes raw `StringHeader*` handles as i64; the
-/// public method symbol remains a JSValue trampoline registered in vtables.
-pub(super) fn compile_typed_string_method(
-    llmod: &mut LlModule,
-    class: &perry_hir::Class,
-    method: &Function,
-    methods: &HashMap<(String, String), String>,
-) -> Result<()> {
-    let generic_name = methods
-        .get(&(class.name.clone(), method.name.clone()))
-        .cloned()
-        .ok_or_else(|| {
-            anyhow!(
-                "method '{}::{}' missing from registry",
-                class.name,
-                method.name
-            )
-        })?;
-    let llvm_name = typed_string_method_name(&generic_name);
-    let param_reps = typed_param_reps_for_params(&method.params).ok_or_else(|| {
-        anyhow!(
-            "typed-string method '{}::{}' has unsupported parameter",
-            class.name,
-            method.name
-        )
-    })?;
-    let params: Vec<(LlvmType, String)> = method
-        .params
-        .iter()
-        .zip(param_reps.iter())
-        .map(|(p, rep)| (rep.llvm_ty(), format!("%arg{}", p.id)))
-        .collect();
-    let lf = llmod.define_function(&llvm_name, I64, params);
-    lf.linkage = "internal".to_string();
-    lf.force_inline = true;
-    let _ = lf.create_block("entry");
-
-    let value = {
-        let blk = lf.block_mut(0).unwrap();
-        lower_typed_string_body(blk, &method.params, &method.body)?
-    };
-    lf.block_mut(0).unwrap().ret(I64, &value);
     Ok(())
 }
 
@@ -1656,6 +1562,8 @@ pub(super) fn compile_static_method(
         current_block: 0,
         discard_expr_value: false,
         discard_this_expr: false,
+        truthy_call_result_requested: false,
+        pending_truthy_call_result: None,
         func_names,
         strings,
         loop_targets: Vec::new(),
@@ -1732,6 +1640,7 @@ pub(super) fn compile_static_method(
         method_param_counts: &cross_module.method_param_counts,
         method_has_rest: &cross_module.method_has_rest,
         method_has_synthetic_arguments: &cross_module.method_has_synthetic_arguments,
+        method_arguments_length_only: &cross_module.method_arguments_length_only,
         imported_func_return_types: &cross_module.imported_func_return_types,
         ffi_signatures: &cross_module.ffi_signatures,
         ffi_aliases: &cross_module.ffi_aliases,
@@ -1754,6 +1663,7 @@ pub(super) fn compile_static_method(
         declared_only_numeric_locals: std::collections::HashSet::new(),
         shadow_slot_clears_after_stmt,
         arena_state_slot: None,
+        arena_state_lazy: false,
         class_keys_slots: HashMap::new(),
         class_shape_slots: HashMap::new(),
         class_header_images: HashMap::new(),
@@ -1856,6 +1766,7 @@ pub(super) fn compile_static_method(
         was_unrolled: f.was_unrolled,
         ic_site_counter: ic_base,
         ic_globals: Vec::new(),
+        property_get_ic_override: None,
         typed_parse_rodata: Vec::new(),
         buffer_data_slots: HashMap::new(),
         buffer_view_slots: HashMap::new(),

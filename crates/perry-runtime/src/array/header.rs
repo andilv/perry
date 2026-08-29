@@ -336,6 +336,7 @@ fn merge_array_named_props(
     owner: usize,
     owner_props: Vec<ArrayNamedProperty>,
 ) {
+    note_array_named_props_ever();
     let entry = props.entry(owner).or_default();
     for prop in owner_props {
         if let Some(existing) = entry.iter_mut().find(|existing| existing.name == prop.name) {
@@ -396,6 +397,20 @@ unsafe fn string_header_as_str<'a>(key: *const crate::StringHeader) -> Option<&'
     std::str::from_utf8(bytes).ok()
 }
 
+/// Has ANY array on this process ever taken a named (non-index) property?
+///
+/// `array_has_named_properties` is on the `length` shrink path of every
+/// `pooled.length = 0` an object pool performs; without the latch each of
+/// those paid a thread-local hash probe to learn that the table has always
+/// been empty. Monotone (never cleared), so a false answer is always safe.
+static ARRAY_NAMED_PROPS_EVER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+fn note_array_named_props_ever() {
+    ARRAY_NAMED_PROPS_EVER.store(true, std::sync::atomic::Ordering::Release);
+}
+
 pub(crate) unsafe fn array_named_property_set(
     arr: *mut ArrayHeader,
     key: *const crate::StringHeader,
@@ -409,6 +424,7 @@ pub(crate) unsafe fn array_named_property_set(
         return;
     };
     let owner = arr as usize;
+    note_array_named_props_ever();
     ARRAY_NAMED_PROPS.with(|m| {
         let mut map = m.borrow_mut();
         let props = map.entry(owner).or_default();
@@ -477,16 +493,12 @@ pub(crate) unsafe fn array_named_property_get_by_name(
     })
 }
 
-/// Whether this Array owns any side-table properties.
-///
-/// Numeric properties normally live in dense element storage, but a far
-/// sparse index can enter this table and later fall below a grown capacity.
-/// Bulk element operations use this predicate to decline a dense-only path
-/// instead of leaving that second representation observable.
+/// Does this (already resolved) array head carry named properties in the
+/// side table? Answered by the monotone latch first: until some array has
+/// taken a named property, the table has always been empty.
 #[inline]
-pub(crate) unsafe fn array_has_named_properties(arr: *const ArrayHeader) -> bool {
-    let arr = clean_arr_ptr(arr);
-    if arr.is_null() {
+pub(crate) unsafe fn array_has_named_properties_resolved(arr: *const ArrayHeader) -> bool {
+    if !ARRAY_NAMED_PROPS_EVER.load(std::sync::atomic::Ordering::Acquire) {
         return false;
     }
     ARRAY_NAMED_PROPS.with(|m| {
@@ -637,6 +649,41 @@ pub(crate) fn clean_arr_ptr(arr: *const ArrayHeader) -> *const ArrayHeader {
     // header reads below require allocator ownership as well.
     if !crate::value::addr_class::is_plausible_heap_addr(cleaned as usize) {
         return std::ptr::null();
+    }
+    // Fast lane for the overwhelmingly common receiver: a live plain array on
+    // a page the arena owns. The tracked-header classifier below re-derives
+    // page ownership, type-table membership, size and storage consistency on
+    // every call, and every runtime array entry point (push, pop, length,
+    // some, length assignment, …) funnels through here — it was the largest
+    // runtime leaf on the ECS command path. The cached generation classifier
+    // is the same page-ownership answer the write barrier relies on; with an
+    // in-band, aligned address on an owned page, the header's type, forwarding
+    // and arena bits settle the ordinary case. Forwarded stubs, lazy arrays,
+    // malloc-backed objects, registered buffers/typed arrays and any
+    // inconsistent header keep the full resolver.
+    {
+        let addr = cleaned as usize;
+        if addr >= crate::gc::GC_HEADER_SIZE
+            && addr % std::mem::align_of::<crate::gc::GcHeader>() == 0
+            && !matches!(
+                crate::arena::classify_heap_generation(addr),
+                crate::arena::HeapGeneration::Unknown
+            )
+        {
+            // SAFETY: the address is on an arena page this process owns and
+            // is header-aligned; the header word precedes every arena block.
+            let header = (addr - crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
+            let (obj_type, gc_flags) = unsafe { ((*header).obj_type, (*header).gc_flags) };
+            if obj_type == crate::gc::GC_TYPE_ARRAY
+                && gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
+                && gc_flags & crate::gc::GC_FLAG_ARENA != 0
+            {
+                let hdr = unsafe { &*cleaned };
+                if hdr.length <= hdr.capacity && hdr.length <= 100_000_000 {
+                    return cleaned;
+                }
+            }
+        }
     }
     // Issue #233: follow GC_FLAG_FORWARDED forwarding chains. When
     // an array grows (js_array_grow) we install a forwarding pointer
@@ -903,6 +950,23 @@ pub(crate) fn array_ptr_as_proxy(arr: *const ArrayHeader) -> Option<f64> {
     None
 }
 
+/// May this receiver be a registered typed array, Buffer or native view?
+///
+/// A `GC_TYPE_ARRAY` header never is — every registration carries its own
+/// object type (`GC_TYPE_TYPED_ARRAY`, `GC_TYPE_NATIVE_TYPED_VIEW`,
+/// `GC_TYPE_BUFFER`) — so the iteration helpers need not probe the
+/// thread-local registries for one. Anything else, including a header this
+/// cannot read, may be, and keeps the probes.
+#[inline]
+pub(crate) fn receiver_may_be_registered_exotic(arr: *const ArrayHeader) -> bool {
+    unsafe {
+        match array_gc_header(arr) {
+            Some(header) => (*header).obj_type != crate::gc::GC_TYPE_ARRAY,
+            None => true,
+        }
+    }
+}
+
 /// Normalize an Array.prototype method receiver into a real ArrayHeader.
 ///
 /// `Array.prototype.<method>.call(arrayLike, ...)` lets a *generic array-like
@@ -1077,17 +1141,8 @@ pub(crate) unsafe fn canonicalize_array_numeric_store_bits(
     value_bits
 }
 
-#[inline]
-pub(crate) unsafe fn canonicalize_array_numeric_store_value(
-    arr: *mut ArrayHeader,
-    value: f64,
-) -> f64 {
-    f64::from_bits(canonicalize_array_numeric_store_bits(arr, value.to_bits()))
-}
-
 /// Canonicalize a store using the flag word read from an already-resolved
-/// array. This is the no-second-classification twin of
-/// [`canonicalize_array_numeric_store_value`].
+/// array, avoiding a second ownership/forwarding classification.
 #[inline(always)]
 pub(crate) fn canonicalize_array_numeric_store_value_from_flags(flags: u16, value: f64) -> f64 {
     let raw_layout = crate::gc::GC_ARRAY_RAW_F64_LAYOUT | crate::gc::GC_ARRAY_RAW_F64_HOLES;
@@ -1142,7 +1197,7 @@ pub(super) unsafe fn array_has_raw_f64_layout_flag(arr: *const ArrayHeader) -> b
 }
 
 #[inline]
-unsafe fn set_array_raw_f64_layout_flag(arr: *const ArrayHeader) {
+pub(super) unsafe fn set_array_raw_f64_layout_flag(arr: *const ArrayHeader) {
     if let Some(header) = array_gc_header(arr) {
         (*header)._reserved |= crate::gc::GC_ARRAY_RAW_F64_LAYOUT;
     }
@@ -1639,6 +1694,12 @@ pub(crate) unsafe fn refresh_array_numeric_layout(arr: *mut ArrayHeader) {
     if arr.is_null() {
         return;
     }
+    refresh_array_numeric_layout_resolved(arr);
+}
+
+/// [`refresh_array_numeric_layout`] for a head the caller already resolved.
+#[inline]
+pub(crate) unsafe fn refresh_array_numeric_layout_resolved(arr: *mut ArrayHeader) {
     if array_slots_are_numeric(arr) {
         rebuild_array_numeric_raw_f64(arr);
     } else {
@@ -1672,6 +1733,26 @@ pub extern "C" fn js_array_clear_numeric_layout(arr: *mut ArrayHeader) {
 
 #[no_mangle]
 pub extern "C" fn js_array_note_numeric_write(arr: *mut ArrayHeader, value_bits: u64) {
+    // A Number never downgrades the raw-f64 layout: nothing to clear, so do
+    // not pay the receiver resolver for it.
+    if value_bits_are_numeric(value_bits) {
+        return;
+    }
+    // Exact, non-forwarded ordinary Array whose raw-f64 bits are already
+    // clear: the note is a no-op. Answer from the magnitude-checked live
+    // header probe (the same discipline as the generated guards) instead of
+    // the tracked-allocation resolver. Forwarding stubs and every other brand
+    // keep the complete resolver below.
+    let raw_bits = crate::gc::GC_ARRAY_RAW_F64_LAYOUT | crate::gc::GC_ARRAY_RAW_F64_HOLES;
+    let already_clear = unsafe { crate::value::addr_class::try_read_gc_header(arr as usize) }
+        .is_some_and(|header| {
+            header.obj_type == crate::gc::GC_TYPE_ARRAY
+                && header.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
+                && header._reserved & raw_bits == 0
+        });
+    if already_clear {
+        return;
+    }
     let arr = clean_arr_ptr_mut(arr);
     unsafe {
         note_array_numeric_write(arr, value_bits);

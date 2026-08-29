@@ -34,6 +34,70 @@ pub(crate) unsafe fn note_array_slot(arr: *mut ArrayHeader, index: usize, value_
     crate::gc::runtime_write_barrier_slot(arr as usize, slot, value_bits);
 }
 
+/// [`note_array_slot`] for a live plain Array whose flag word was already
+/// read by the caller's receiver guard. This preserves the exact store,
+/// numeric-layout, element-shape, per-slot-layout, and barrier sequence
+/// without redispatching through `array_numeric_layout` merely to recover the
+/// same raw-f64 bits.
+///
+/// # Safety
+///
+/// `arr` must be a live, forwarding-resolved `GC_TYPE_ARRAY`; `index` must be
+/// inside its allocation, and `flags` must be the current preceding
+/// `GcHeader::_reserved` word with no intervening safepoint.
+#[inline]
+pub(crate) unsafe fn note_array_slot_resolved_flags(
+    arr: *mut ArrayHeader,
+    index: usize,
+    value: f64,
+    flags: u16,
+) {
+    let value = canonicalize_array_numeric_store_value_from_flags(flags, value);
+    let mut value_bits = value.to_bits();
+    let slot_ptr = array_elements_ptr(arr).add(index);
+    let old_bits = std::ptr::read(slot_ptr);
+    // GC_STORE_AUDIT(BARRIERED): resolved-flags helper notes layout and emits the array slot barrier below.
+    std::ptr::write(slot_ptr, value_bits);
+    value_bits = note_array_numeric_index_write(arr, index, value_bits);
+    crate::gc::layout_note_slot_aware(arr as usize, index, value_bits, old_bits);
+    let slot = slot_ptr as usize;
+    crate::gc::runtime_write_barrier_slot(arr as usize, slot, value_bits);
+}
+
+/// Store and record one element on an array whose live head and header flags
+/// the caller has already resolved.
+///
+/// The ordinary [`note_array_slot`] entry point must rediscover the numeric
+/// layout through `clean_arr_ptr`. Hot array writers have already paid that
+/// ownership/forwarding proof and have the same header word in hand for their
+/// frozen/descriptor checks. Reusing it here avoids reclassifying the same
+/// pointer while preserving the numeric-layout note, GC layout note, and write
+/// barrier as one indivisible store protocol.
+///
+/// # Safety
+///
+/// `arr` must be the non-null result of `clean_arr_ptr_mut`, and `flags` must
+/// have been read from that exact live head with no intervening Perry
+/// allocation or safepoint.
+#[inline]
+pub(crate) unsafe fn store_array_slot_resolved(
+    arr: *mut ArrayHeader,
+    index: usize,
+    value: f64,
+    flags: u16,
+) -> u64 {
+    let value = canonicalize_array_numeric_store_value_from_flags(flags, value);
+    let value_bits = value.to_bits();
+    // GC_STORE_AUDIT(BARRIERED): the layout note and runtime_write_barrier_slot
+    // below cover this resolved-head slot write.
+    std::ptr::write(array_elements_ptr(arr).add(index), value_bits);
+    note_array_numeric_index_write(arr, index, value_bits);
+    crate::gc::layout_note_slot(arr as usize, index, value_bits);
+    let slot = array_elements_ptr(arr).add(index) as usize;
+    crate::gc::runtime_write_barrier_slot(arr as usize, slot, value_bits);
+    value_bits
+}
+
 #[inline]
 pub(crate) unsafe fn note_array_slot_layout_only(
     arr: *mut ArrayHeader,
@@ -103,8 +167,47 @@ pub(crate) unsafe fn rebuild_array_layout(arr: *mut ArrayHeader) {
         crate::gc::layout_mark_unknown(arr as *mut u8);
         return;
     }
+    let was_all_pointer = super::header::array_object_flags_resolved(arr)
+        & (crate::gc::GC_LAYOUT_STATE_MASK | crate::gc::GC_LAYOUT_ALL_POINTERS)
+        == (crate::gc::GC_LAYOUT_SIDE_MASK | crate::gc::GC_LAYOUT_ALL_POINTERS);
+    if length == 0 && was_all_pointer {
+        // The branch below re-arms the all-pointer claim, and
+        // `layout_init_all_pointer_slots` already does everything the
+        // zero-slot rebuild would have done first — clears the typed-intact
+        // bit and forgets both per-object record kinds
+        // (`layout_forget_object`) before setting the state — so the rebuild
+        // was a second pass over the same registries for every
+        // `pooled.length = 0`. Skip straight to the re-arm.
+        crate::gc::layout_init_all_pointer_slots(arr as *mut u8);
+        return;
+    }
     crate::gc::layout_rebuild_from_slots(arr as *mut u8, array_elements_ptr(arr), length);
-    refresh_array_numeric_layout(arr);
+    if length == 0 {
+        // `layout_rebuild_from_slots` just left the head POINTER_FREE with its
+        // per-object records dropped and the typed-intact bit cleared, which
+        // is everything `refresh_array_numeric_layout` would redo for zero
+        // slots via `rebuild_array_numeric_raw_f64` -> `layout_init_pointer_free`
+        // (a second header resolution, a second forget probe). There are no
+        // slots for the old-gen barrier replay either.
+        //
+        // An empty array holds BOTH vacuous claims, so keep the one its
+        // history predicts. A pool bucket that held pointers and is emptied
+        // for reuse (`pooled.length = 0`) will take pointers again: leaving
+        // it `SIDE_MASK | ALL_POINTERS` — the state a declared `[]` literal
+        // starts in — lets every push take the inline pointer-layout arm,
+        // where resetting it to POINTER_FREE | RAW_F64 made the first push
+        // of every reuse pay a layout transition (5k per frame on the ECS
+        // command buffer). A non-pointer store into that state still demotes
+        // it to UNKNOWN through `layout_note_slot`, exactly as it does for a
+        // declared literal. Everything else keeps the raw-f64 claim.
+        if was_all_pointer {
+            crate::gc::layout_init_all_pointer_slots(arr as *mut u8);
+        } else {
+            super::header::set_array_raw_f64_layout_flag(arr);
+        }
+        return;
+    }
+    super::header::refresh_array_numeric_layout_resolved(arr);
     if crate::arena::pointer_in_old_gen(arr as usize) {
         let slots = array_elements_ptr(arr);
         for i in 0..length {

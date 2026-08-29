@@ -8,6 +8,12 @@
 // `NativeRootsPin::native()` because their module-wide "no inbounds GEP" proxy
 // collides with the shadow lowering's inline slot addressing (see that file's
 // header).
+// The typed-f64 guard/unbox are inline since `emit_typed_f64_guard`: a
+// public entry proves `is_number || is_int32` with a band test whose
+// SHORT_STRING top-16 bound (`, 32761`) is its signature, and unboxes an
+// INT32 lane with `sitofp i32 %` behind a select. Assertions below pin those
+// markers where they used to pin `call i32 @js_typed_f64_arg_guard(` and
+// `call double @js_typed_f64_arg_to_raw`.
 use perry_codegen::testing::NativeRootsPin;
 use perry_codegen::{compile_module, AppMetadata, CompileOptions};
 use perry_hir::types::{ObjectType, PropertyInfo, Type, TypeParam};
@@ -1173,7 +1179,10 @@ fn assert_only_guarded_generic_splits(ir: &str, case: &str) {
         let entry = function_ir_section(ir, base);
         assert!(
             entry.contains("call i32 @js_param_type_guard(")
-                || entry.contains("_arg_guard(double "),
+                || entry.contains("_arg_guard(double ")
+                // The f64 guard is the inline `is_number || is_int32` band test
+                // (`emit_typed_f64_guard`): its SHORT_STRING top-16 bound.
+                || entry.contains(", 32761"),
             "{case}: `{base}`'s public entry reaches a clone without guarding:\n{entry}"
         );
     }
@@ -3202,8 +3211,8 @@ fn map_number_key_set_get_has_delete_use_guarded_number_key_specialization() {
     let ir = compile_ir_for_module_with_opts(module, empty_opts()).unwrap();
     let probe_ir = body_ir_section(&ir, "perry_fn_map_number_key_specialization_ts__probe");
     assert!(
-        probe_ir.contains("call i32 @js_typed_f64_arg_guard")
-            && probe_ir.contains("call double @js_typed_f64_arg_to_raw"),
+        probe_ir.contains("call i32 @js_typed_f64_arg_guard(")
+            && probe_ir.contains("call double @js_typed_f64_arg_to_raw("),
         "Map<number, V> specialization should guard then unbox the key to raw f64:\n{probe_ir}"
     );
     for helper in [
@@ -3275,8 +3284,8 @@ fn map_number_key_string_value_set_uses_string_ref_until_slot() {
         "perry_fn_map_number_string_value_specialization_ts__probe",
     );
     assert!(
-        probe_ir.contains("call i32 @js_typed_f64_arg_guard")
-            && probe_ir.contains("call double @js_typed_f64_arg_to_raw"),
+        probe_ir.contains("call i32 @js_typed_f64_arg_guard(")
+            && probe_ir.contains("call double @js_typed_f64_arg_to_raw("),
         "Map<number, string>.set should keep the existing guarded numeric-key path:\n{probe_ir}"
     );
     assert!(
@@ -4902,8 +4911,8 @@ fn set_number_add_has_delete_use_guarded_number_specialization() {
     let ir = compile_ir_for_module_with_opts(module, empty_opts()).unwrap();
     let probe_ir = body_ir_section(&ir, "perry_fn_set_number_specialization_ts__probe");
     assert!(
-        probe_ir.contains("call i32 @js_typed_f64_arg_guard")
-            && probe_ir.contains("call double @js_typed_f64_arg_to_raw"),
+        probe_ir.contains("call i32 @js_typed_f64_arg_guard(")
+            && probe_ir.contains("call double @js_typed_f64_arg_to_raw("),
         "Set<number> specialization should guard then unbox the value to raw f64:\n{probe_ir}"
     );
     for helper in [
@@ -6611,6 +6620,7 @@ fn artifact_records_array_push_value_bits_before_slot_store() {
             Stmt::Expr(Expr::ArrayPush {
                 array_id: 1,
                 value: Box::new(local(2)),
+                field_writeback: None,
             }),
             Stmt::Return(Some(int(0))),
         ],
@@ -7588,7 +7598,7 @@ fn compiler_private_async_iter_result_annotated_numeric_payload_stays_generic() 
     // per-call cost. The invariant is unchanged: the raw-f64 clone is only
     // reachable through the entry guard, with the generic body as fallback.
     assert!(
-        entry.contains("call i32 @js_typed_f64_arg_guard(")
+        entry.contains(", 32761")
             && !entry.contains("call i32 @js_param_type_guard(")
             && entry.contains(&format!("@{symbol}$generic(")),
         "the raw-f64 clone must be reachable only through the entry guard, with the generic body as fallback:\n{entry}"
@@ -10591,8 +10601,8 @@ fn typed_f64_function_clone_emits_internal_clone_and_guarded_call() {
         ir.contains(&format!("define internal double @{generic_body}")),
         "{ir}"
     );
-    assert!(ir.contains("call i32 @js_typed_f64_arg_guard"), "{ir}");
-    assert!(ir.contains("call double @js_typed_f64_arg_to_raw"), "{ir}");
+    assert!(ir.contains(", 32761"), "{ir}");
+    assert!(ir.contains("sitofp i32 %"), "{ir}");
     assert!(ir.contains(&format!("call double @{typed}")), "{ir}");
     assert!(
         ir.contains(&format!("call double @{generic_body}(")),
@@ -10616,8 +10626,7 @@ fn typed_f64_public_trampoline_dispatches_before_generic_body() {
         "typed function should keep a separate generic body:\n{ir}"
     );
     assert!(
-        wrapper_ir.contains("call i32 @js_typed_f64_arg_guard")
-            && wrapper_ir.contains("call double @js_typed_f64_arg_to_raw"),
+        wrapper_ir.contains(", 32761") && wrapper_ir.contains("sitofp i32 %"),
         "public wrapper should guard and unbox numeric JSValue args:\n{wrapper_ir}"
     );
     let typed_call = wrapper_ir
@@ -10842,7 +10851,7 @@ fn typed_f64_function_clone_accepts_mixed_raw_signature_and_direct_call() {
         "typed clone body should avoid JSValue traffic on the hot path:\n{typed_ir}"
     );
     assert!(
-        wrapper_ir.contains("call i32 @js_typed_f64_arg_guard")
+        wrapper_ir.contains(", 32761")
             && wrapper_ir.contains("call i32 @js_typed_i32_arg_guard")
             && wrapper_ir.contains("call i32 @js_typed_i1_arg_guard")
             && wrapper_ir.contains(&format!("call double @{typed}(double %"))
@@ -11334,8 +11343,8 @@ fn typed_i1_numeric_predicate_function_uses_f64_params_and_public_wrapper() {
         "numeric predicate body should stay in native f64/i1 SSA:\n{typed_ir}"
     );
     assert!(
-        wrapper_ir.contains("call i32 @js_typed_f64_arg_guard")
-            && wrapper_ir.contains("call double @js_typed_f64_arg_to_raw")
+        wrapper_ir.contains(", 32761")
+            && wrapper_ir.contains("sitofp i32 %")
             && wrapper_ir.contains(&format!("call i1 @{typed}(double ")),
         "public wrapper should guard/unbox f64 args before the i1 clone:\n{wrapper_ir}"
     );
@@ -11344,8 +11353,8 @@ fn typed_i1_numeric_predicate_function_uses_f64_params_and_public_wrapper() {
         "public wrapper should retain a generic JSValue fallback:\n{wrapper_ir}"
     );
     assert!(
-        caller_ir.contains("call i32 @js_typed_f64_arg_guard")
-            && caller_ir.contains("call double @js_typed_f64_arg_to_raw")
+        caller_ir.contains(", 32761")
+            && caller_ir.contains("sitofp i32 %")
             && caller_ir.contains(&format!("call i1 @{typed}(double ")),
         "direct FuncRef lowering should use the mixed-signature typed-i1 clone after f64 guards:\n{caller_ir}"
     );
@@ -12116,15 +12125,15 @@ fn typed_i1_numeric_predicate_method_uses_f64_params_and_guarded_direct_call() {
         "numeric predicate method body should stay in native f64/i1 SSA:\n{typed_ir}"
     );
     assert!(
-        wrapper_ir.contains("call i32 @js_typed_f64_arg_guard")
-            && wrapper_ir.contains("call double @js_typed_f64_arg_to_raw")
+        wrapper_ir.contains(", 32761")
+            && wrapper_ir.contains("sitofp i32 %")
             && wrapper_ir.contains(&format!("call i1 @{typed}(double ")),
         "public method wrapper should guard/unbox f64 args before the i1 clone:\n{wrapper_ir}"
     );
     assert!(
         contains_inline_direct_method_shape_guard(caller_ir)
-            && caller_ir.contains("call i32 @js_typed_f64_arg_guard")
-            && caller_ir.contains("call double @js_typed_f64_arg_to_raw")
+            && caller_ir.contains(", 32761")
+            && caller_ir.contains("sitofp i32 %")
             && caller_ir.contains(&format!("call i1 @{typed}(double ")),
         "exact direct method call should use the mixed-signature typed-i1 clone after f64 guards:\n{caller_ir}"
     );
@@ -12238,8 +12247,8 @@ fn typed_f64_method_clone_emits_internal_clone_and_guarded_direct_call() {
         "generic method ABI body must remain emitted separately:\n{ir}"
     );
     assert!(contains_inline_direct_method_shape_guard(&ir), "{ir}");
-    assert!(ir.contains("call i32 @js_typed_f64_arg_guard"), "{ir}");
-    assert!(ir.contains("call double @js_typed_f64_arg_to_raw"), "{ir}");
+    assert!(ir.contains(", 32761"), "{ir}");
+    assert!(ir.contains("sitofp i32 %"), "{ir}");
     assert!(
         ir.contains(&format!("call double @{typed}(double ")),
         "typed direct call should target the clone:\n{ir}"
@@ -12275,8 +12284,7 @@ fn typed_f64_method_public_trampoline_dispatches_before_generic_body() {
     let wrapper_ir = function_ir_section(&ir, public);
 
     assert!(
-        wrapper_ir.contains("call i32 @js_typed_f64_arg_guard")
-            && wrapper_ir.contains("call double @js_typed_f64_arg_to_raw"),
+        wrapper_ir.contains(", 32761") && wrapper_ir.contains("sitofp i32 %"),
         "public method wrapper should guard and unbox numeric JSValue args:\n{wrapper_ir}"
     );
     let typed_call = wrapper_ir
@@ -12601,8 +12609,7 @@ fn typed_f64_closure_clone_emits_internal_clone_and_guarded_direct_call() {
         "{ir}"
     );
     assert!(
-        wrapper_ir.contains("call i32 @js_typed_f64_arg_guard")
-            && wrapper_ir.contains("call double @js_typed_f64_arg_to_raw"),
+        wrapper_ir.contains(", 32761") && wrapper_ir.contains("sitofp i32 %"),
         "public closure wrapper should guard and unbox numeric JSValue args:\n{wrapper_ir}"
     );
     assert!(
@@ -12669,13 +12676,13 @@ fn typed_f64_closure_clone_accepts_immutable_numeric_capture() {
     );
     assert!(
         wrapper_ir.contains("call i64 @js_closure_get_capture_bits(i64 %this_closure, i32 0)")
-            && wrapper_ir.contains("call i32 @js_typed_f64_arg_guard"),
+            && wrapper_ir.contains(", 32761"),
         "public typed-f64 wrapper must validate capture bits before entering the raw clone:\n{wrapper_ir}"
     );
     assert!(
         caller_ir.contains("closure_direct.typed_f64")
             && caller_ir.contains("call i64 @js_closure_get_capture_bits")
-            && caller_ir.contains("call i32 @js_typed_f64_arg_guard")
+            && caller_ir.contains(", 32761")
             && caller_ir.contains(&format!("call double @{generic_body}(i64 ")),
         "direct typed-f64 calls must guard captures and retain their generic branch:\n{caller_ir}"
     );
@@ -13016,8 +13023,8 @@ fn typed_i1_numeric_predicate_closure_uses_f64_params_and_guarded_direct_call() 
         "numeric-predicate typed closure clone should use f64 params and i1 return:\n{ir}"
     );
     assert!(
-        wrapper_ir.contains("call i32 @js_typed_f64_arg_guard")
-            && wrapper_ir.contains("call double @js_typed_f64_arg_to_raw")
+        wrapper_ir.contains(", 32761")
+            && wrapper_ir.contains("sitofp i32 %")
             && wrapper_ir.contains(&format!("call i1 @{typed}(i64 %this_closure")),
         "public closure wrapper should guard/unbox numeric JSValue args and call the typed clone:\n{wrapper_ir}"
     );
@@ -13027,8 +13034,8 @@ fn typed_i1_numeric_predicate_closure_uses_f64_params_and_guarded_direct_call() 
     );
     assert!(
         ir.contains(&format!("call i1 @{typed}(i64 "))
-            && ir.contains("call i32 @js_typed_f64_arg_guard")
-            && ir.contains("call double @js_typed_f64_arg_to_raw"),
+            && ir.contains(", 32761")
+            && ir.contains("sitofp i32 %"),
         "direct local closure call should guard/unbox numeric args and call the typed clone:\n{ir}"
     );
     assert!(
@@ -13777,8 +13784,8 @@ fn scalar_method_boolean_predicate_guards_public_numeric_arguments() {
         assert!(
             ir.contains("scalar_method_arg_guard.fast")
                 && ir.contains("scalar_method_arg_guard.fallback")
-                && ir.contains("call i32 @js_typed_f64_arg_guard")
-                && ir.contains("call double @js_typed_f64_arg_to_raw"),
+                && ir.contains(", 32761")
+                && ir.contains("sitofp i32 %"),
             "{case} public numeric arg should guard/unbox before scalar inline:\n{ir}"
         );
         assert!(
@@ -13859,8 +13866,8 @@ fn scalar_method_boolean_predicate_guards_public_numeric_argument_expressions() 
     assert!(
         ir.contains("scalar_method_arg_guard.fast")
             && ir.contains("scalar_method_arg_guard.fallback")
-            && ir.matches("call i32 @js_typed_f64_arg_guard").count() >= 2
-            && ir.matches("call double @js_typed_f64_arg_to_raw").count() >= 2
+            && ir.matches(", 32761").count() >= 2
+            && ir.matches("sitofp i32 %").count() >= 2
             && ir.contains("fmul double")
             && ir.contains("fadd double"),
         "public numeric arg expression should guard/unbox locals and rebuild arithmetic as raw f64 before scalar inline:\n{ir}"
@@ -14243,6 +14250,61 @@ fn ir_function_body<'a>(ir: &'a str, marker: &str) -> &'a str {
         .map(|offset| offset + 1)
         .unwrap_or(rest.len());
     &rest[..end]
+}
+
+#[test]
+fn this_method_value_uses_receiver_snapshot_bind() {
+    let mut snapshot = class(8955, "Snapshot", Vec::new());
+    snapshot.methods.push(Function {
+        id: 89550,
+        name: "capture".to_string(),
+        type_params: Vec::new(),
+        params: Vec::new(),
+        return_type: Type::Any,
+        body: vec![Stmt::Return(Some(Expr::PropertyGet {
+            byte_offset: 0,
+            object: Box::new(Expr::This),
+            property: "method".to_string(),
+        }))],
+        is_async: false,
+        is_generator: false,
+        is_strict: false,
+        is_exported: false,
+        captures: Vec::new(),
+        decorators: Vec::new(),
+        was_plain_async: false,
+        was_unrolled: false,
+    });
+    snapshot.methods.push(Function {
+        id: 89551,
+        name: "method".to_string(),
+        type_params: Vec::new(),
+        params: Vec::new(),
+        return_type: Type::Number,
+        body: vec![Stmt::Return(Some(number(1.0)))],
+        is_async: false,
+        is_generator: false,
+        is_strict: false,
+        is_exported: false,
+        captures: Vec::new(),
+        decorators: Vec::new(),
+        was_plain_async: false,
+        was_unrolled: false,
+    });
+    let module = module_with_classes_and_params(
+        "issue_8955_this_method_snapshot.ts",
+        vec![snapshot],
+        Vec::new(),
+        Type::Any,
+        vec![Stmt::Return(Some(Expr::Undefined))],
+    );
+
+    let ir = compile_ir_for_module_with_opts(module, empty_opts()).unwrap();
+    let capture = ir_function_body(&ir, "Snapshot__capture(");
+    assert!(
+        capture.contains("call double @js_class_method_snapshot_bind"),
+        "a this.method value read must capture the receiver instead of using the canonical owner marker:\n{capture}"
+    );
 }
 
 #[test]

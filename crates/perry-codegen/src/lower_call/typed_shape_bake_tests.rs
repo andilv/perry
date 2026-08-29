@@ -51,6 +51,13 @@ const FORGET_CALL: &str = "call void @js_gc_forget_object_layout(";
 const ANY_GLOBAL: &str = "@PERRY_PER_OBJECT_LAYOUTS_ANY";
 const ANY_ATOMIC_LOAD: &str =
     "load atomic i32, ptr @PERRY_PER_OBJECT_LAYOUTS_ANY monotonic, align 4";
+/// The second gate: records keyed by an address this allocator could have
+/// recycled. Read only once the armed count is non-zero, and before the
+/// address sketch — a long-lived masked object on an old page keeps the
+/// armed count non-zero forever while this stays at zero.
+const YOUNG_ATOMIC_LOAD: &str =
+    "load atomic i32, ptr @PERRY_YOUNG_LAYOUT_RECORDS monotonic, align 4";
+const SKETCH_WORD_GEP: &str = "getelementptr i64, ptr @PERRY_LAYOUT_ADDR_FILTER";
 
 /// The packed `GcHeader` word the inline bump writes for a two-`number`-field
 /// class:
@@ -405,6 +412,15 @@ fn a_pointer_free_shape_bakes_its_layout_into_the_header_constant() {
          per-object mask, and `layout_note_slot` would then OR the new \
          object's pointer bits into it:\n{ir}"
     );
+    let any_at = ir.find(ANY_ATOMIC_LOAD).expect("armed-count load");
+    let young_at = ir.find(YOUNG_ATOMIC_LOAD).expect("young-record load");
+    let sketch_at = ir.find(SKETCH_WORD_GEP).expect("address sketch probe");
+    assert!(
+        any_at < young_at && young_at < sketch_at,
+        "the gate must read the armed count, then the young-record count, and \
+         only then hash the address into the sketch — each load is the cheap \
+         proof that skips everything after it:\n{ir}"
+    );
 }
 
 /// `class Link { a: number; b: Link | null }` — one declared type differs;
@@ -482,6 +498,7 @@ fn imported_remote() -> ImportedClass {
         method_param_counts: vec![0],
         method_has_rest: vec![false],
         method_has_synthetic_arguments: vec![false],
+        method_arguments_length_only: vec![false],
         static_field_names: Vec::new(),
         static_method_names: Vec::new(),
         static_method_return_types: Vec::new(),
@@ -567,5 +584,58 @@ fn imported_pointer_layout_does_not_invent_a_consumer_typed_shape_id() {
     assert!(
         !ir.contains(DECLARE_CALL) && ir.contains("call void @js_gc_init_typed_shape_layout("),
         "the imported layout must be validated after its real constructor, not declared before it:\n{ir}"
+    );
+}
+
+#[test]
+fn imported_length_only_arguments_capability_uses_scalar_direct_abi() {
+    let mut module = Module::new("imported_arguments_length_consumer.ts");
+    module.init = vec![
+        Stmt::Let {
+            id: 20,
+            name: "instance".to_string(),
+            ty: Type::Named("Remote".to_string()),
+            mutable: false,
+            init: Some(Expr::New {
+                class_name: "Remote".to_string(),
+                args: vec![Expr::Null],
+                type_args: Vec::new(),
+                byte_offset: 0,
+                cap_args_appended: 0,
+            }),
+        },
+        Stmt::Expr(Expr::Call {
+            callee: Box::new(Expr::PropertyGet {
+                object: Box::new(Expr::LocalGet(20)),
+                property: "read".to_string(),
+                byte_offset: 0,
+            }),
+            args: vec![Expr::Integer(1), Expr::Integer(2)],
+            type_args: Vec::new(),
+            byte_offset: 0,
+        }),
+    ];
+
+    let mut remote = imported_remote();
+    remote.method_param_counts = vec![1];
+    remote.method_has_rest = vec![true];
+    remote.method_has_synthetic_arguments = vec![true];
+    remote.method_arguments_length_only = vec![true];
+    let mut opts = ir_opts();
+    opts.imported_classes.push(remote);
+
+    let ir =
+        String::from_utf8(compile_module(&module, opts).unwrap()).expect("LLVM IR should be UTF-8");
+    assert!(
+        ir.contains("declare double @perry_method_producer_ts__Remote__read$arguments_length")
+            && ir.contains("call double @perry_method_producer_ts__Remote__read$arguments_length",)
+            && ir.contains("double 2.0"),
+        "the consumer should trust the producer capability and pass only the actual count:\n{ir}"
+    );
+    assert!(
+        !ir.contains("call i64 @js_array_alloc")
+            && !ir.contains("call i64 @js_array_push_f64")
+            && !ir.contains("call i64 @js_array_mark_arguments_object"),
+        "the imported direct path should not allocate an argument bundle:\n{ir}"
     );
 }

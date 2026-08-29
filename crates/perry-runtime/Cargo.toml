@@ -49,6 +49,30 @@ keepalive-anchors = []
 # leaves it off and falls back to the system allocator. The #6882 VM-tag
 # retag rides the same gate (it only exists to label mimalloc's mappings).
 alloc-mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
+# DIAGNOSTIC ONLY — never in `default`, never in a shipping build.
+#
+# Builds mimalloc in secure + debug mode to hunt heap corruption that is
+# *allocator-dependent*: the class of bug that crashes ~56% of the time on
+# mimalloc and 0/41 on the system allocator. macOS `free()` ignores the
+# caller-passed size, so a mismatched dealloc layout is silently harmless
+# there while it corrupts mimalloc's metadata — the system-allocator "fix"
+# hides the bug rather than proving its absence.
+#
+#   secure → guard pages after each block, encoded free lists, randomized
+#            placement  ⇒ catches heap *overflow* at the write.
+#   debug  → mi_assert checks on every free ⇒ catches invalid free, double
+#            free, and wrong-size/align dealloc at the *call site*.
+#
+# Both report through mimalloc's own error path, so a hit names the failing
+# operation instead of leaving a SIGSEGV to attribute by hand. Expect a large
+# slowdown; this is an instrument, not a configuration.
+alloc-mimalloc-hardened = [
+    "alloc-mimalloc",
+    "mimalloc/secure",
+    "mimalloc/debug",
+    "libmimalloc-sys/secure",
+    "libmimalloc-sys/debug",
+]
 # Per-module Node-API gate (binary-size): compiles `node:dgram`'s UDP-socket
 # implementation (`crate::dgram` + `crate::dgram_reactor`, ~2.2k LOC, incl. the
 # `js_dgram_*` externs codegen emits direct calls to) + its dispatch arm only
@@ -186,8 +210,9 @@ proc-ipc = []
 # runtime carries no duplicate tables. A hand-rolled fallback covers the off
 # case for size-optimized builds.
 intl-locale = ["dep:icu_locale", "dep:icu_locale_core"]
-# CLDR-accurate Intl.DateTimeFormat / toLocaleString date-time patterns.
-intl-datetime = ["dep:icu_datetime", "dep:icu_time", "dep:icu_calendar", "dep:icu_locale_core"]
+# CLDR-accurate Intl.DateTimeFormat / toLocaleString date-time patterns and a
+# compiled IANA database for explicit named `timeZone` options.
+intl-datetime = ["dep:icu_datetime", "dep:icu_time", "dep:icu_calendar", "dep:icu_locale_core", "dep:timezone_provider"]
 # `full` only opt-ins the small Node-API helpers (os.hostname / os.homedir).
 # `postgres`, `redis`, `whoami` were previously listed here but were either
 # unimported (postgres, whoami) or only used by a now-deleted `redis_client.rs`
@@ -289,6 +314,7 @@ perry-diagnostics = { path = "../perry-diagnostics", optional = true }
 # output binary. Perry supplies its own CF-free host system in `temporal::now`
 # (clock via `SystemTime`, zone via `crate::date::host_time_zone_name`).
 temporal_rs = { version = "0.2.3", default-features = false, features = ["std", "compiled_data"], optional = true }
+timezone_provider = { version = "0.2.6", default-features = false, features = ["tzif"], optional = true }
 
 serde.workspace = true
 serde_json.workspace = true

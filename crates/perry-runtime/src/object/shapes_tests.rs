@@ -11,6 +11,45 @@ mod c3c_tests {
         crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32)
     }
 
+    #[test]
+    fn repeated_class_evaluations_reuse_the_class_shape() {
+        let _lock = crate::gc::global_side_table_test_lock();
+        unsafe {
+            const CID: u32 = 0x5268;
+            let scope = crate::gc::RuntimeHandleScope::new();
+            let first = scope.root_raw_mut_ptr(crate::object::js_object_alloc(CID, 0));
+            let second = scope.root_raw_mut_ptr(crate::object::js_object_alloc(CID, 0));
+
+            let ordinary =
+                first.with_const_ptr::<crate::ObjectHeader, _>(|obj| object_shape_id(obj));
+            assert_eq!(
+                ordinary,
+                second.with_const_ptr::<crate::ObjectHeader, _>(|obj| object_shape_id(obj)),
+                "test premise: equal class evaluations start with one shape"
+            );
+
+            first.with_mut_ptr::<crate::ObjectHeader, _>(|obj| {
+                transition_object_shape_to_class(obj);
+            });
+            second.with_mut_ptr::<crate::ObjectHeader, _>(|obj| {
+                transition_object_shape_to_class(obj);
+            });
+
+            let first_class =
+                first.with_const_ptr::<crate::ObjectHeader, _>(|obj| object_shape_id(obj));
+            let second_class =
+                second.with_const_ptr::<crate::ObjectHeader, _>(|obj| object_shape_id(obj));
+            assert_ne!(
+                ordinary, first_class,
+                "becoming a class must invalidate guards"
+            );
+            assert_eq!(
+                first_class, second_class,
+                "equivalent class evaluations must not mint unbounded descriptors"
+            );
+        }
+    }
+
     /// #6759 C3c: ids come from the dedicated range (disjoint from real and
     /// builtin class ids), are stable per exact descriptor facts, and distinct
     /// across identities.
@@ -496,6 +535,27 @@ mod descriptor_tests_8067 {
     }
 
     #[test]
+    fn object_kind_direct_cache_is_agent_local_and_retires_with_descriptor() {
+        let _lock = crate::gc::global_side_table_test_lock();
+        let keys = 0x8067_0000_0000_1400usize;
+        let id = shape_descriptor_ensure(keys as *const ArrayHeader, 2, 2)
+            .expect("shape range unexpectedly exhausted");
+        assert_eq!(shape_object_kind_by_id(id), Some(ShapeObjectKind::Ordinary));
+        assert_eq!(
+            shape_object_kind_by_id(id),
+            Some(ShapeObjectKind::Ordinary),
+            "the direct-cache hit must preserve the immutable descriptor fact"
+        );
+
+        test_drop_shape_descriptors(keys);
+        assert_eq!(
+            shape_object_kind_by_id(id),
+            None,
+            "retiring the authoritative descriptor must retire its direct-cache entry"
+        );
+    }
+
+    #[test]
     fn process_global_module_shape_id_installs_with_agent_local_keys() {
         let _lock = crate::gc::global_side_table_test_lock();
         let module_keys = 0x8067_0000_0000_1800usize;
@@ -735,5 +795,164 @@ mod descriptor_tests_8067 {
             assert_eq!(transitioned.logical_key_count, 2);
             assert_eq!(transitioned.live_inline_slot_count, 2);
         }
+    }
+}
+
+/// `ids_by_facts` moved from std's SipHash `RandomState` to `FastKeyHasher`.
+///
+/// The hazard that motivated the original "deliberately NOT a `PtrHashMap`"
+/// note is real: `PtrHasher`'s `write_*` methods OVERWRITE the accumulator, so
+/// a five-field `ShapeFacts` would collapse to its last field and every
+/// descriptor sharing that field would collide into one bucket.
+///
+/// `FastKeyHasher` avoids this by implementing only `write` — the derived
+/// `Hash`'s `write_u32`/`write_u64` calls all forward there and FOLD with
+/// FNV-1a. This test pins that property directly: vary ONE field at a time and
+/// require a distinct hash each time. It fails loudly against any hasher that
+/// overwrites instead of folding.
+#[test]
+fn shape_facts_hash_folds_every_field() {
+    use crate::fast_hash::FastKeyHasher;
+    use std::hash::{BuildHasher, Hash, Hasher};
+
+    fn h(f: &ShapeFacts) -> u64 {
+        let mut hasher = FastKeyHasher.build_hasher();
+        f.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    let base = ShapeFacts {
+        keys: 0x1111_2222_3333_4444,
+        logical_key_count: 7,
+        live_inline_slot_count: 3,
+        semantic_generation: 9,
+        object_kind: ShapeObjectKind::Ordinary,
+    };
+
+    let variants = [
+        (
+            "keys",
+            ShapeFacts {
+                keys: 0x5555_6666_7777_8888,
+                ..base
+            },
+        ),
+        (
+            "logical_key_count",
+            ShapeFacts {
+                logical_key_count: 8,
+                ..base
+            },
+        ),
+        (
+            "live_inline_slot_count",
+            ShapeFacts {
+                live_inline_slot_count: 4,
+                ..base
+            },
+        ),
+        (
+            "semantic_generation",
+            ShapeFacts {
+                semantic_generation: 10,
+                ..base
+            },
+        ),
+        (
+            "object_kind",
+            ShapeFacts {
+                object_kind: ShapeObjectKind::Class,
+                ..base
+            },
+        ),
+    ];
+
+    let base_hash = h(&base);
+    for (field, v) in &variants {
+        assert_ne!(
+            h(v),
+            base_hash,
+            "changing `{field}` alone must change the hash — a hasher that \
+             overwrites instead of folding would collapse ShapeFacts to its \
+             last field and collide every descriptor that shares it"
+        );
+    }
+
+    // Same facts must still hash the same, or lookups would miss.
+    assert_eq!(h(&base), h(&base.clone()), "hashing must be deterministic");
+}
+
+/// The shape lookup cache holds a record's ADDRESS, so it must stop matching
+/// the moment that address can change under an id still in use.
+///
+/// A stale way would hand out a pointer to a dropped `Box<ShapeDescriptor>` —
+/// a use-after-free reachable from the hot property path, not a wrong answer.
+/// Removal is the funnel that frees a record, so it bumps the epoch; this pins
+/// that. Deleting the `invalidate_shape_lookup_cache()` call in
+/// `remove_descriptor_and_reverse_indices` fails this test.
+#[test]
+fn shape_lookup_cache_is_invalidated_when_a_record_is_removed() {
+    let _lock = crate::gc::global_side_table_test_lock();
+    unsafe {
+        let obj = crate::object::js_object_alloc(0, 0);
+        let keys = crate::object::object_keys_array(obj);
+        let id = test_shape_id_for_keys(keys as usize)
+            .expect("a fresh object must have a registered shape");
+
+        // Populate the way.
+        assert!(
+            shape_descriptor_by_id(id).is_some(),
+            "the descriptor must resolve before removal"
+        );
+        let epoch_before = crate::state::state().shapes.lookup_epoch.get();
+
+        // Drop it through the funnel that frees the box.
+        {
+            let mut inner = crate::state::state().shapes.inner.borrow_mut();
+            remove_descriptor_and_reverse_indices(&mut inner, id);
+        }
+
+        assert_ne!(
+            crate::state::state().shapes.lookup_epoch.get(),
+            epoch_before,
+            "removing a record must bump the lookup epoch — a way still naming \
+             the freed box would hand out a dangling ShapeDescriptor pointer"
+        );
+        assert!(
+            shape_descriptor_by_id(id).is_none(),
+            "a removed id must not resolve from the cache"
+        );
+    }
+}
+
+/// A fresh-id insert must NOT invalidate the cache: it cannot make any existing
+/// way wrong, and flushing on every shape creation would defeat the cache in
+/// exactly the workloads that build shapes.
+#[test]
+fn fresh_shape_creation_does_not_flush_the_lookup_cache() {
+    let _lock = crate::gc::global_side_table_test_lock();
+    unsafe {
+        let a = crate::object::js_object_alloc(0, 0);
+        let keys_a = crate::object::object_keys_array(a);
+        let id_a = test_shape_id_for_keys(keys_a as usize).expect("shape for a");
+        assert!(shape_descriptor_by_id(id_a).is_some());
+        let epoch = crate::state::state().shapes.lookup_epoch.get();
+
+        // Create more objects — each mints shapes through the fresh-id path.
+        for _ in 0..8 {
+            let o = crate::object::js_object_alloc(0, 0);
+            std::hint::black_box(o);
+        }
+
+        assert_eq!(
+            crate::state::state().shapes.lookup_epoch.get(),
+            epoch,
+            "minting fresh shape ids must not bump the epoch; only removal and \
+             the replacing insert may"
+        );
+        assert!(
+            shape_descriptor_by_id(id_a).is_some(),
+            "the earlier descriptor must still resolve"
+        );
     }
 }

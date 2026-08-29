@@ -1,16 +1,25 @@
-//! Object-deref tail of `js_object_get_field_by_name`: pointer-strip,
-//! handle dispatch, and the full ObjectHeader property walk. Extracted
-//! verbatim from field_get_set.rs (issue #1103 split) so neither half
-//! exceeds the file-size budget. Pure relocation — no logic change.
+//! Object-deref tail of `js_object_get_field_by_name`: pointer stripping,
+//! handle dispatch, and the full ObjectHeader property walk (#1103 split).
 
 use super::*;
 
-/// Tail of `js_object_get_field_by_name` (everything after the leading
-/// primitive/handle/Date receiver guards). Body moved verbatim.
+/// Object-deref tail of `js_object_get_field_by_name`.
 pub(crate) fn get_field_by_name_object_tail(
     obj: *const ObjectHeader,
     key: *const crate::StringHeader,
 ) -> JSValue {
+    // An elements-backed Array-subclass instance answers its indices and
+    // `length` from its store; an absent index falls through to the ordinary
+    // lookup, which reaches the prototype chain (the shape has no index keys).
+    if let Some((_, elements)) = unsafe { crate::array::subclass_elements::backed(obj as usize) } {
+        if let Some(elements_key) = unsafe { crate::array::subclass_elements::key_of_header(key) } {
+            if let Some(value) =
+                unsafe { crate::array::subclass_elements::get_by_key(elements, elements_key) }
+            {
+                return JSValue::from_bits(value.to_bits());
+            }
+        }
+    }
     // Strip NaN-boxing tags if present (defensive: handle POINTER_TAG, UNDEFINED, NULL, etc.)
     let obj = {
         let bits = obj as u64;
@@ -1458,6 +1467,9 @@ pub(crate) fn get_field_by_name_object_tail(
                 {
                     return v;
                 }
+                if let Some(v) = super::accessors::array_subclass_prototype_field(obj, key) {
+                    return v;
+                }
                 if let Some(v) = ordinary_object_prototype_property_value(obj, key) {
                     return v;
                 }
@@ -1658,7 +1670,12 @@ pub(crate) fn get_field_by_name_object_tail(
             return JSValue::undefined();
         }
 
-        for i in 0..key_count {
+        // #8936/#8950's resolver narrows the candidate to one slot via the
+        // shape hash index instead of walking every key; the original match
+        // below still gates the hit, so this cannot widen what is accepted.
+        if let Some(i) = crate::object::keys_find_slot_by_key_ptr(keys, key_count as u32, key)
+            .map(|v| v as usize)
+        {
             let key_val = crate::array::keys_array_slot(keys, i as u32);
             // #1781: accept inline SSO short keys here too — the
             // slow-path lookup is what backs `obj[k]` for ≤5-byte
@@ -1854,6 +1871,9 @@ pub(crate) fn get_field_by_name_object_tail(
             if let Some(v) =
                 super::super::prototype_chain::resolve_inherited_field(obj as usize, key)
             {
+                return v;
+            }
+            if let Some(v) = super::accessors::array_subclass_prototype_field(obj, key) {
                 return v;
             }
             if let Some(v) = ordinary_object_prototype_property_value(obj, key) {

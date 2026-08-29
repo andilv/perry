@@ -13,12 +13,14 @@ mod header;
 mod header_gc_slots;
 mod immutable;
 mod indexing;
+mod indexing_support;
 mod is_array;
 mod iter_methods;
 mod iter_object;
 mod iterator;
 mod join;
 mod jsvalue_api;
+mod numeric_range;
 mod prototype_addr;
 mod push_pop;
 mod reduce_right;
@@ -27,13 +29,20 @@ mod sort;
 mod species;
 mod splice_slice;
 mod subclass;
+pub(crate) mod subclass_elements;
 
 #[cfg(test)]
 mod collection_tag_tests;
 #[cfg(test)]
 mod forwarding_tests;
 #[cfg(test)]
+mod push_pop_tests;
+#[cfg(test)]
 mod spread_dense_tests;
+#[cfg(test)]
+mod strict_store_tests;
+#[cfg(test)]
+mod subclass_elements_tests;
 #[cfg(test)]
 mod subclass_tests;
 #[cfg(test)]
@@ -118,30 +127,32 @@ pub use self::immutable::{
     js_array_to_sorted_default, js_array_to_sorted_with_comparator, js_array_to_spliced,
     js_array_with, js_arraylike_copy_within,
 };
-#[cfg(test)]
-pub(crate) use self::indexing::test_keys_array_slot_fallbacks;
 pub(crate) use self::indexing::{
-    array_has_own_index, array_iteration_is_exotic, array_proto_iterator_modified,
+    array_has_own_index, array_iteration_is_exotic, array_iteration_is_exotic_resolved,
     array_prototype_has_index_flag, array_spec_get, array_spec_has_index, array_spec_set,
-    invalidate_array_index_fast_path, keys_array_len_capped_to_capacity, keys_array_slot,
-    note_array_proto_iterator_write, note_object_prototype_index_write,
-    object_prototype_has_index_flag, PERRY_ARRAY_INDEX_FAST_PATH_INVALIDATED,
 };
 pub use self::indexing::{
     js_array_get_element, js_array_get_element_f64, js_array_get_f64, js_array_get_f64_unchecked,
     js_array_get_index_or_string, js_array_get_length, js_array_length,
-    js_array_numeric_get_f64_unboxed, js_array_numeric_range_add, js_array_numeric_range_add_len,
-    js_array_numeric_set_f64_unboxed, js_array_set_f64, js_array_set_f64_extend,
-    js_array_set_f64_extend_strict, js_array_set_f64_unchecked, js_array_set_index_or_string,
-    js_array_set_index_or_string_strict, js_array_set_string_key,
+    js_array_numeric_get_f64_unboxed, js_array_numeric_set_f64_unboxed, js_array_set_f64,
+    js_array_set_f64_extend, js_array_set_f64_extend_strict, js_array_set_f64_unchecked,
+    js_array_set_index_or_string, js_array_set_index_or_string_strict, js_array_set_string_key,
+};
+#[cfg(test)]
+pub(crate) use self::indexing_support::test_keys_array_slot_fallbacks;
+pub(crate) use self::indexing_support::{
+    array_proto_iterator_modified, invalidate_array_index_fast_path,
+    keys_array_len_capped_to_capacity, keys_array_slot, note_array_proto_iterator_write,
+    note_object_prototype_index_write, object_prototype_has_index_flag,
+    PERRY_ARRAY_INDEX_FAST_PATH_INVALIDATED,
 };
 pub use self::is_array::js_array_is_array;
 pub(crate) use self::iter_methods::throw_reduce_of_empty;
 pub use self::iter_methods::{
     js_array_at, js_array_every, js_array_filter, js_array_find, js_array_findIndex,
     js_array_find_last, js_array_find_last_index, js_array_flatMap, js_array_forEach, js_array_map,
-    js_array_map_discard, js_array_reduce, js_array_some, js_array_to_locale_string,
-    js_validate_array_callback, js_validate_array_map_callback,
+    js_array_map_discard, js_array_reduce, js_array_some, js_array_some_captureless,
+    js_array_to_locale_string, js_validate_array_callback, js_validate_array_map_callback,
 };
 pub use self::iter_object::{
     arguments_values_iter, array_entries_iter, array_keys_iter, array_values_iter,
@@ -154,6 +165,7 @@ pub use self::iterator::{
     js_array_spread_append, js_for_of_to_array, js_get_async_iterator, js_iterator_to_array,
 };
 pub use self::join::{js_array_join, js_array_join_value};
+pub use self::numeric_range::{js_array_numeric_range_add, js_array_numeric_range_add_len};
 pub use self::prototype_addr::scan_prototype_addr_cache_roots_mut;
 pub(crate) use self::prototype_addr::{
     array_prototype_addr, object_prototype_addr, object_prototype_addr_matches,
@@ -170,14 +182,17 @@ pub use self::subclass::{
     array_subclass_dense_snapshot, array_subclass_has_iterator_override, is_array_subclass_instance,
 };
 #[cfg(test)]
-pub(crate) use indexing::test_swap_array_index_fast_path_invalidated;
+pub(crate) use indexing_support::test_swap_array_index_fast_path_invalidated;
 // #7574 — array-like OBJECT receiver resolution for the raw `js_array_*` entry
 // points, plus the Array-exotic `length` maintenance the generic OBJECT index
 // store needs for a `class X extends Array` receiver.
 pub(crate) use self::subclass::{
-    array_object_set_length, array_subclass_fast_index_get, array_subclass_fast_length,
-    clear_packed_subclass_numeric_proof, is_array_subclass_class_id, is_array_subclass_value,
-    note_array_subclass_index_write, note_packed_subclass_spill_store,
+    array_object_set_length, array_subclass_fast_index_get, array_subclass_fast_index_set,
+    array_subclass_fast_length, array_subclass_fast_length_with_ic,
+    array_subclass_named_prefix_token_for_slot, array_subclass_tail_descriptors_are_plain,
+    clear_array_subclass_named_prefix_token, clear_packed_subclass_numeric_proof,
+    is_array_subclass_class_id, is_array_subclass_value, note_array_subclass_index_write,
+    note_packed_subclass_spill_store,
 };
 // Issue #1572 — flatten helpers reused by `node_stream::ns_iter_flat_map`
 // so an `async function*` mapper return is driven through the iterator
@@ -195,8 +210,8 @@ pub(crate) use self::push_pop::guard_writable_length;
 pub use self::push_pop::{
     js_array_delete, js_array_grow, js_array_numeric_push_f64_unboxed, js_array_pop_f64,
     js_array_push_f64, js_array_push_f64_spec, js_array_push_hole, js_array_push_spread_f64,
-    js_array_set_length, js_array_set_length_strict, js_array_shift_f64, js_array_unshift_f64,
-    js_array_unshift_jsvalue, js_array_unshift_variadic,
+    js_array_push_u31_with_length, js_array_set_length, js_array_set_length_strict,
+    js_array_shift_f64, js_array_unshift_f64, js_array_unshift_jsvalue, js_array_unshift_variadic,
 };
 pub use self::reduce_right::js_array_reduce_right;
 pub use self::search::{
@@ -214,20 +229,20 @@ pub(crate) use self::alloc::array_length_from_property_value_or_throw;
 pub(crate) use self::alloc::{js_array_from_arraylike, js_array_from_string_codepoints};
 pub(crate) use self::flat_clone::{dense_spread_copy, dense_spread_source, flattenable_array_ptr};
 pub(crate) use self::header::{
-    array_byte_size, array_has_named_properties, array_is_frozen, array_is_sealed_or_no_extend,
-    array_named_property_delete, array_named_property_delete_by_name, array_named_property_get,
-    array_named_property_get_by_name, array_named_property_has, array_named_property_names,
-    array_named_property_set, array_numeric_raw_f64_get, array_numeric_raw_f64_push_inbounds,
-    array_numeric_raw_f64_set_inbounds, array_object_flags, array_object_flags_from_tag,
-    array_object_flags_resolved, array_ptr_as_proxy, array_receiver_addr, array_receiver_gc_tag,
-    buffer_receiver_as_uint8_typed_array, canonicalize_array_numeric_store_value,
-    canonicalize_array_numeric_store_value_from_flags, clean_arr_ptr, clean_arr_ptr_mut,
-    clear_array_numeric_layout, clear_array_numeric_layout_ptr, gc_element_slot_range,
-    mark_array_layout_unknown, mark_array_raw_f64_holes_fresh, normalize_array_receiver,
-    note_array_slot, note_array_slot_layout_only, rebuild_array_layout, rebuild_array_layout_exact,
+    array_byte_size, array_has_named_properties_resolved, array_is_frozen,
+    array_is_sealed_or_no_extend, array_named_property_delete, array_named_property_delete_by_name,
+    array_named_property_get, array_named_property_get_by_name, array_named_property_has,
+    array_named_property_names, array_named_property_set, array_numeric_raw_f64_get,
+    array_numeric_raw_f64_push_inbounds, array_numeric_raw_f64_set_inbounds, array_object_flags,
+    array_object_flags_from_tag, array_object_flags_resolved, array_ptr_as_proxy,
+    array_receiver_addr, array_receiver_gc_tag, buffer_receiver_as_uint8_typed_array,
+    clean_arr_ptr, clean_arr_ptr_mut, clear_array_numeric_layout, clear_array_numeric_layout_ptr,
+    gc_element_slot_range, mark_array_layout_unknown, mark_array_raw_f64_holes_fresh,
+    normalize_array_receiver, note_array_slot, note_array_slot_layout_only,
+    note_array_slot_resolved_flags, rebuild_array_layout, rebuild_array_layout_exact,
     refresh_array_numeric_layout, replay_array_growth_write_barriers, set_array_numeric_layout,
-    store_array_slot, transfer_array_numeric_layout, typed_array_receiver, value_bits_to_number,
-    NumericArrayLayout, MIN_ARRAY_CAPACITY,
+    store_array_slot, store_array_slot_resolved, transfer_array_numeric_layout,
+    typed_array_receiver, value_bits_to_number, NumericArrayLayout, MIN_ARRAY_CAPACITY,
 };
 
 // Sole caller is the regex-engine-gated `regex::exec_array`, so the helper and

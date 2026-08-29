@@ -916,11 +916,15 @@ fn test_old_page_defrag_target_gate_emits_trace() {
         "forced old-page defrag should report moved old-page bytes"
     );
     assert!(
-        trace.sweep.reusable_bytes > 0 || trace.sweep.returned_bytes > 0,
-        "forced old-page defrag should make the emptied source block reusable or returned"
+        trace.sweep.reusable_bytes > 0
+            || trace.sweep.pooled_bytes > 0
+            || trace.sweep.returned_bytes > 0,
+        "forced old-page defrag should make the emptied source block reusable, pooled, or returned"
     );
     assert!(
-        trace.old_pages.reusable_bytes > 0 || trace.old_pages.returned_bytes > 0,
+        trace.old_pages.reusable_bytes > 0
+            || trace.old_pages.pooled_bytes > 0
+            || trace.old_pages.returned_bytes > 0,
         "old-page telemetry should expose targeted source-block reclaim"
     );
     assert_eq!(
@@ -1477,7 +1481,7 @@ fn test_minor_sweep_keeps_unmarked_old_object_layout_mask() {
 
     // A live old-gen object with one pointer slot, plus the slot-layout mask
     // the collector reads to find that pointer.
-    let old_obj = crate::arena::arena_alloc_gc_old(4 * 8, 8, GC_TYPE_OBJECT) as usize;
+    let old_obj = crate::arena::arena_alloc_gc_old(8 * 8, 8, GC_TYPE_OBJECT) as usize;
     unsafe {
         std::ptr::write_bytes(old_obj as *mut u8, 0, 4 * 8);
         // A freshly allocated payload starts pointer-free; the first pointer
@@ -1487,7 +1491,7 @@ fn test_minor_sweep_keeps_unmarked_old_object_layout_mask() {
     let child = crate::arena::arena_alloc_gc_old(16, 8, GC_TYPE_STRING) as usize;
     layout_note_slot(old_obj, 0, string_bits(child));
     assert_eq!(
-        test_layout_pointer_slot_count(old_obj, 4),
+        test_layout_pointer_slot_count(old_obj, 8),
         Some(1),
         "precondition: the old object starts with a one-pointer slot mask"
     );
@@ -1498,7 +1502,7 @@ fn test_minor_sweep_keeps_unmarked_old_object_layout_mask() {
     let _ = sweep.finish_unbounded();
 
     assert_eq!(
-        test_layout_pointer_slot_count(old_obj, 4),
+        test_layout_pointer_slot_count(old_obj, 8),
         Some(1),
         "#6892: minor sweep wiped the slot-layout mask of a live old-gen object"
     );
@@ -1519,7 +1523,7 @@ fn test_full_sweep_still_finalizes_unmarked_old_object() {
     clear_mark_seeds();
     crate::arena::old_pages_begin_gc_cycle();
 
-    let old_obj = crate::arena::arena_alloc_gc_old(4 * 8, 8, GC_TYPE_OBJECT) as usize;
+    let old_obj = crate::arena::arena_alloc_gc_old(8 * 8, 8, GC_TYPE_OBJECT) as usize;
     unsafe {
         std::ptr::write_bytes(old_obj as *mut u8, 0, 4 * 8);
         // A freshly allocated payload starts pointer-free; the first pointer
@@ -1528,14 +1532,14 @@ fn test_full_sweep_still_finalizes_unmarked_old_object() {
     }
     let child = crate::arena::arena_alloc_gc_old(16, 8, GC_TYPE_STRING) as usize;
     layout_note_slot(old_obj, 0, string_bits(child));
-    assert_eq!(test_layout_pointer_slot_count(old_obj, 4), Some(1));
+    assert_eq!(test_layout_pointer_slot_count(old_obj, 8), Some(1));
 
     // Full trace (`minor_sweep = false`): unmarked is provably dead.
     let mut sweep = IncrementalSweepState::new(false, true, None, false, false);
     let _ = sweep.finish_unbounded();
 
     assert_eq!(
-        test_layout_pointer_slot_count(old_obj, 4),
+        test_layout_pointer_slot_count(old_obj, 8),
         None,
         "a full sweep must still finalize genuinely dead old-gen objects"
     );

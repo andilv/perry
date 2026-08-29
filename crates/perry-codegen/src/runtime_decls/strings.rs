@@ -32,6 +32,10 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // `js_value_concat_string(value_f64, suffix_handle) -> handle`
     module.declare_function("js_string_concat_value", I64, &[I64, DOUBLE]);
     module.declare_function("js_value_concat_string", I64, &[DOUBLE, I64]);
+    // NaN-box-returning twin: SSO immediate for ≤5-ASCII-byte results, so
+    // `"k" + i` computed keys get content-stable bits (dyn-IC/stub hits)
+    // and skip the per-iteration allocation entirely.
+    module.declare_function("js_string_concat_value_box", DOUBLE, &[I64, DOUBLE]);
 
     // #7837: the same two fused concats, but with the STRING side passed
     // NaN-boxed instead of pre-unboxed, so the helper can tell a real string
@@ -162,6 +166,9 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_text_encoder_encode_into_llvm", I64, &[DOUBLE, DOUBLE]);
     // typeof: returns a string handle ("number"/"string"/"boolean"/"undefined"/"object"/"function")
     module.declare_function("js_value_typeof", I64, &[DOUBLE]);
+    // Integer classifier used by `typeof value === "literal"`, with the same
+    // exceptional-representation semantics and no cached-string round trip.
+    module.declare_function("js_value_typeof_tag", I32, &[DOUBLE]);
     module.declare_function("js_string_starts_with", I32, &[I64, I64]);
     module.declare_function("js_string_ends_with", I32, &[I64, I64]);
     module.declare_function("js_string_search_value_to_string", I64, &[DOUBLE, I32]);

@@ -6,11 +6,16 @@
 use anyhow::Result;
 use perry_hir::{Expr, LogicalOp};
 
-use crate::expr::{lower_expr, FnCtx};
+use crate::expr::{lower_expr, lower_expr_value, FnCtx};
+use crate::native_value::{materialize_js_value, MaterializationReason, NativeRep};
 use crate::type_analysis::{
     expr_may_return_boxed_value_from_raw_f64_fallback, is_bool_expr, is_numeric_expr,
 };
-use crate::types::{DOUBLE, I32, I64};
+use crate::types::{DOUBLE, I1, I32, I64};
+
+/// #8885: the quiet-NaN prefix mask, as the i64 literal codegen emits.
+/// Defined locally to keep this lowering independent of `expr::compare`.
+const QNAN_PREFIX_I64: &str = "9221120237041090560";
 
 /// Convert a lowered condition value to an `i1` for `cond_br`.
 ///
@@ -67,8 +72,98 @@ pub(crate) fn lower_truthy(ctx: &mut FnCtx<'_>, cond_val: &str, cond_expr: &Expr
         let bits = blk.bitcast_double_to_i64(cond_val);
         return blk.icmp_eq(I64, &bits, crate::nanbox::TAG_TRUE_I64);
     }
+    // Dynamic value: decide the bit-decidable shapes inline and keep the
+    // runtime predicate for the rest. A plain (non-NaN, untagged) double is
+    // truthy iff it is non-zero; `true`/`false`/`undefined`/`null` are single
+    // bit patterns. Strings (empty is falsy), BigInt (`0n` is falsy), pointers,
+    // handles, int32 boxes, and NaN take `js_is_truthy` exactly as before.
+    let bits = ctx.block().bitcast_double_to_i64(cond_val);
+    let masked = ctx.block().and(I64, &bits, QNAN_PREFIX_I64);
+    let plain = ctx.block().icmp_ne(I64, &masked, QNAN_PREFIX_I64);
+
+    let num_idx = ctx.new_block("truthy.num");
+    let tag_idx = ctx.new_block("truthy.tag");
+    let slow_idx = ctx.new_block("truthy.slow");
+    let merge_idx = ctx.new_block("truthy.merge");
+    let num_l = ctx.block_label(num_idx);
+    let tag_l = ctx.block_label(tag_idx);
+    let slow_l = ctx.block_label(slow_idx);
+    let merge_l = ctx.block_label(merge_idx);
+    ctx.block().cond_br(&plain, &num_l, &tag_l);
+
+    ctx.current_block = num_idx;
+    let num_res = ctx.block().fcmp("one", cond_val, "0.0");
+    let num_pred = ctx.block().label.clone();
+    ctx.block().br(&merge_l);
+
+    ctx.current_block = tag_idx;
+    let is_true = ctx.block().icmp_eq(I64, &bits, crate::nanbox::TAG_TRUE_I64);
+    let is_false = ctx
+        .block()
+        .icmp_eq(I64, &bits, crate::nanbox::TAG_FALSE_I64);
+    let is_undef = ctx
+        .block()
+        .icmp_eq(I64, &bits, crate::nanbox::TAG_UNDEFINED_I64);
+    let is_null = ctx.block().icmp_eq(I64, &bits, crate::nanbox::TAG_NULL_I64);
+    let falsy_a = ctx.block().or(I1, &is_false, &is_undef);
+    let falsy = ctx.block().or(I1, &falsy_a, &is_null);
+    let decided = ctx.block().or(I1, &is_true, &falsy);
+    let tag_pred = ctx.block().label.clone();
+    ctx.block().cond_br(&decided, &merge_l, &slow_l);
+
+    ctx.current_block = slow_idx;
     let i32_truthy = ctx.block().call(I32, "js_is_truthy", &[(DOUBLE, cond_val)]);
-    ctx.block().icmp_ne(I32, &i32_truthy, "0")
+    let slow_res = ctx.block().icmp_ne(I32, &i32_truthy, "0");
+    let slow_pred = ctx.block().label.clone();
+    ctx.block().br(&merge_l);
+
+    ctx.current_block = merge_idx;
+    ctx.block().phi(
+        I1,
+        &[
+            (&num_res, &num_pred),
+            (&is_true, &tag_pred),
+            (&slow_res, &slow_pred),
+        ],
+    )
+}
+
+/// Lower one expression once and return both its ordinary boxed value and its
+/// JavaScript truthiness as native `i1`.
+///
+/// Guarded direct user-method calls may publish a use-sensitive truthiness
+/// result: the proven method arm tests a constructively-Boolean return inline,
+/// while the dynamic override arm still uses the total runtime predicate.  The
+/// boxed SSA-name equality below makes publication compositional — a call in
+/// the receiver or an argument cannot impersonate the outer expression.
+pub(crate) fn lower_expr_with_truthy(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<(String, String)> {
+    if let Some(lowered) = lower_expr_value(ctx, expr)? {
+        if matches!(lowered.rep, NativeRep::I1) {
+            let truthy = lowered.value.clone();
+            let boxed = materialize_js_value(ctx, lowered, MaterializationReason::RuntimeApi);
+            return Ok((boxed, truthy));
+        }
+        let boxed = materialize_js_value(ctx, lowered, MaterializationReason::RuntimeApi);
+        let truthy = lower_truthy(ctx, &boxed, expr);
+        return Ok((boxed, truthy));
+    }
+
+    let saved_request = ctx.truthy_call_result_requested;
+    let saved_pending = ctx.pending_truthy_call_result.take();
+    ctx.truthy_call_result_requested = true;
+    let lowered = lower_expr(ctx, expr);
+    let published = ctx.pending_truthy_call_result.take();
+    ctx.truthy_call_result_requested = saved_request;
+    ctx.pending_truthy_call_result = saved_pending;
+    let boxed = lowered?;
+
+    if let Some((published_boxed, truthy)) = published {
+        if published_boxed == boxed {
+            return Ok((boxed, truthy));
+        }
+    }
+    let truthy = lower_truthy(ctx, &boxed, expr);
+    Ok((boxed, truthy))
 }
 
 /// Lower `cond ? then_expr : else_expr` to a 4-block CFG with a phi at
@@ -85,8 +180,7 @@ pub(crate) fn lower_conditional(
     let saved_guarded_proof = branch_proofs
         .as_ref()
         .and_then(|(id, _, _)| ctx.snapshot_guarded_proof(id));
-    let cond = lower_expr(ctx, condition)?;
-    let cond_bool = lower_truthy(ctx, &cond, condition);
+    let (_cond, cond_bool) = lower_expr_with_truthy(ctx, condition)?;
 
     let then_idx = ctx.new_block("ternary.then");
     let else_idx = ctx.new_block("ternary.else");
@@ -206,13 +300,10 @@ pub(crate) fn lower_logical(
     }
 
     // Lower left in the current block.
-    let l = lower_expr(ctx, left)?;
+    let (l, l_bool) = lower_expr_with_truthy(ctx, left)?;
     // Capture the post-left block — left's lowering may have created new
     // blocks via nested control flow.
     let l_block_label = ctx.block().label.clone();
-    // Truthiness test: fast fcmp for numeric, js_is_truthy for NaN-boxed.
-    let l_bool = lower_truthy(ctx, &l, left);
-
     let then_idx = ctx.new_block("logical.then");
     let merge_idx = ctx.new_block("logical.merge");
     let then_label = ctx.block_label(then_idx);
@@ -230,9 +321,17 @@ pub(crate) fn lower_logical(
         LogicalOp::Coalesce => unreachable!("guarded above"),
     }
 
-    // The "then" block evaluates the right side.
+    // The "then" block evaluates the right side. When an enclosing condition
+    // requested native truthiness, preserve the right operand's truthiness as
+    // well as its actual JavaScript value; `&&` / `||` return an operand, so
+    // replacing the value itself with a Boolean would be observably wrong.
     ctx.current_block = then_idx;
-    let r = lower_expr(ctx, right)?;
+    let (r, r_bool) = if ctx.truthy_call_result_requested {
+        let (value, truthy) = lower_expr_with_truthy(ctx, right)?;
+        (value, Some(truthy))
+    } else {
+        (lower_expr(ctx, right)?, None)
+    };
     let r_block_label = ctx.block().label.clone();
     if !ctx.block().is_terminated() {
         ctx.block().br(&merge_label);
@@ -240,7 +339,23 @@ pub(crate) fn lower_logical(
 
     // Merge block: phi between l (short-circuit path) and r (normal path).
     ctx.current_block = merge_idx;
-    Ok(ctx
+    let result = ctx
         .block()
-        .phi(DOUBLE, &[(&l, &l_block_label), (&r, &r_block_label)]))
+        .phi(DOUBLE, &[(&l, &l_block_label), (&r, &r_block_label)]);
+    if let Some(r_bool) = r_bool {
+        let short_circuit_truthy = match op {
+            LogicalOp::And => "false",
+            LogicalOp::Or => "true",
+            LogicalOp::Coalesce => unreachable!("guarded above"),
+        };
+        let truthy = ctx.block().phi(
+            crate::types::I1,
+            &[
+                (short_circuit_truthy, &l_block_label),
+                (&r_bool, &r_block_label),
+            ],
+        );
+        ctx.pending_truthy_call_result = Some((result.clone(), truthy));
+    }
+    Ok(result)
 }

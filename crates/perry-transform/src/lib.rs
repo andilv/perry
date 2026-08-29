@@ -9,11 +9,14 @@
 mod aggregate_scalar;
 pub mod async_to_generator;
 pub mod closure;
+mod closure_local_inline;
 pub mod deforest;
+mod field_push_local_bind;
 pub mod finally_inline;
 pub mod generator;
 pub mod i18n;
 pub mod inline;
+pub mod module_const_fold;
 pub mod prop_cse;
 mod source_spans;
 pub mod state_desugar;
@@ -26,8 +29,9 @@ pub use finally_inline::inline_finally_into_returns;
 pub use generator::transform_generators;
 pub use i18n::{apply_i18n, I18nDiagnostic, I18nStringTable};
 pub use inline::{
-    gather_cross_module_anon_classes, gather_cross_module_methods,
-    gather_cross_module_methods_with_extern_imports, inline_functions, MethodCandidate,
+    gather_cross_module_anon_classes, gather_cross_module_functions, gather_cross_module_methods,
+    gather_cross_module_methods_with_extern_imports, inline_functions, FunctionCandidate,
+    MethodCandidate, RequiredExternImport,
 };
 pub use unroll::unroll_static_loops;
 
@@ -49,5 +53,7 @@ pub use unroll::unroll_static_loops;
 pub fn post_inline_cleanups(module: &mut perry_hir::Module) {
     unroll_static_loops(module);
     aggregate_scalar::run(module);
+    closure_local_inline::run(module);
+    field_push_local_bind::run(module);
     prop_cse::run(module);
 }

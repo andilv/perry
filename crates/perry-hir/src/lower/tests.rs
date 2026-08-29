@@ -1187,6 +1187,50 @@ fn fresh_class_declaration_collision_keeps_lexical_binding() {
     }));
 }
 
+/// A fresh class's end-of-body capture refresh must preserve the whole
+/// one-element shared-mutable cell, matching the initial `ClassExprFresh`
+/// snapshot. Refreshing with `cell[0]` stores the scalar value, while lifted
+/// members still read the constructor capture as `capture[0]`.
+#[test]
+fn fresh_class_refresh_keeps_shared_capture_cell_handle() {
+    let source = r#"
+        const exported = (() => {
+            let dep;
+            dep = { default: "ok" };
+            const holder = {};
+            holder.default = class {
+                read() { return dep.default; }
+            };
+            return holder.default;
+        })();
+    "#;
+    let module = perry_parser::parse_typescript(source, "t.ts").expect("source parses");
+    let hir = super::lower_module(&module, "t", "t.ts").expect("source lowers");
+    let compact: String = format!("{:#?}", hir.init)
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+
+    let mut remainder = compact.as_str();
+    let mut refreshes = 0usize;
+    while let Some(offset) = remainder.find("RefreshClassExprCaptures{") {
+        remainder = &remainder[offset + "RefreshClassExprCaptures{".len()..];
+        let captures = remainder
+            .find("captures:[")
+            .map(|index| &remainder[index + "captures:[".len()..])
+            .expect("refresh includes a captures vector");
+        assert!(
+            captures.starts_with("LocalGet("),
+            "fresh-class refresh must carry the shared cell handle, not an indexed value: {captures}"
+        );
+        refreshes += 1;
+    }
+    assert!(
+        refreshes > 0,
+        "fixture must emit at least one fresh-class refresh"
+    );
+}
+
 /// Companion (the case the depth rule must NOT break): a module-scope `class e`
 /// and a factory-local `let e` holding a different constructor. JS says the
 /// nearer local wins, so `new e()` inside the factory must still construct the
@@ -1523,5 +1567,178 @@ fn typescript_transpile_subset_lowers_to_native_dispatch_and_enums() {
     assert!(
         dump.contains("method: \"flattenDiagnosticMessageText\""),
         "diagnostic flattening must use TypeScript native dispatch: {dump}"
+    );
+}
+
+/// #8882: a module-level class constructing a sibling class that is declared
+/// inside a function body lowered LATER. This is the shape the CJS wrap
+/// produces for Next's `server/lib/lru-cache.js`: `LRUCache` is hoisted out of
+/// the module IIFE while `SentinelNode` (whose doc comment closes on the
+/// `class` line, so the textual hoister never sees it) stays inside the
+/// `__perry_cjs_factory` closure. JS binds the constructor reference when the
+/// `new` executes; the #8643 guard instead lowered it to an unconditional,
+/// nameless `ReferenceError` that killed the application at init.
+#[test]
+fn hoisted_class_constructs_sibling_declared_inside_a_later_closure() {
+    let source = r#"
+        class LRUCache {
+            constructor() {
+                this.head = new SentinelNode();
+                this.tail = new SentinelNode();
+            }
+        }
+        const _cjs = (function () {
+            class SentinelNode {
+                constructor() {
+                    this.prev = null;
+                    this.next = null;
+                }
+            }
+            return { SentinelNode };
+        })();
+    "#;
+    let module = perry_parser::parse_typescript(source, "lru-cache.js").expect("source parses");
+    let hir = super::lower_module(&module, "lru-cache", "lru-cache.js").expect("source lowers");
+    let lru_cache = hir
+        .classes
+        .iter()
+        .find(|class| class.name == "LRUCache")
+        .expect("LRUCache class is lowered");
+    let debug = format!("{lru_cache:?}");
+
+    assert!(
+        !debug.contains("js_throw_reference_error_unresolved_get")
+            && !debug.contains("js_global_get_or_throw_unresolved"),
+        "a sibling class declared later in the module must not lower to a \
+         compile-time ReferenceError:\n{debug}"
+    );
+    assert_eq!(
+        debug.matches(r#"New { class_name: "SentinelNode""#).count(),
+        2,
+        "both `new SentinelNode()` sites must stay late-bound by-name constructs:\n{debug}"
+    );
+}
+
+/// #8882 / #8730: a constructor name that resolves to nothing in the module
+/// is read off `globalThis` when the `new` executes — exactly like a bare
+/// identifier read — so a runtime-created global constructs and a true miss
+/// throws `ReferenceError: <name> is not defined` WITH the identifier. The
+/// `typeof`-guarded browser-API shape is the one Next's `app-page` runtime
+/// carries; it previously lowered to the nameless throw even though the guard
+/// makes the branch dead on a server.
+#[test]
+fn unresolved_new_names_the_identifier_and_defers_to_a_runtime_global_lookup() {
+    let source = r#"
+        function observe(cb: any): any {
+            return typeof IntersectionObserver === "function"
+                ? new IntersectionObserver(cb)
+                : null;
+        }
+    "#;
+    let module = perry_parser::parse_typescript(source, "t.ts").expect("source parses");
+    let hir = super::lower_module(&module, "t", "t.ts").expect("source lowers");
+    let observe = hir
+        .functions
+        .iter()
+        .find(|function| function.name == "observe")
+        .expect("observe is lowered");
+    let debug = format!("{observe:?}");
+
+    assert!(
+        !debug.contains("js_throw_reference_error_unresolved_get"),
+        "the nameless ReferenceError helper must not be emitted for `new <unknown>()`:\n{debug}"
+    );
+    assert!(
+        debug.contains(
+            r#"NewDynamic { callee: Call { callee: ExternFuncRef { name: "js_global_get_or_throw_unresolved", param_types: [Any], return_type: Any }, args: [String("IntersectionObserver")]"#
+        ),
+        "an unresolved constructor must be a runtime globalThis lookup carrying its name:\n{debug}"
+    );
+}
+
+/// A derived class with captured outers whose `super()` is not its own
+/// statement — the minifier's `super(a), this.x = b, …` comma sequence, as in
+/// Next's `AppRouteRouteModule` — must stash the `this.__perry_cap_*` fields
+/// AFTER the call, not at constructor entry. #8630's derived-`this` TDZ turns
+/// an entry stash into `ReferenceError: Must call super constructor …` at
+/// every construction (the Coop Next.js fixture died at module init).
+#[test]
+fn derived_ctor_capture_stash_follows_super_inside_comma_sequence() {
+    let source = r#"
+        const exported = (() => {
+            const shared = { tag: "outer" };
+            class Base {
+                constructor(opts) { this.definition = opts.definition; }
+            }
+            class Derived extends Base {
+                constructor({ definition: r, name: n }) {
+                    super({ definition: r }), this.name = n, this.tag = shared.tag;
+                }
+            }
+            return Derived;
+        })();
+    "#;
+    assert_capture_stash_follows_super(source, "Derived");
+}
+
+/// Same requirement for a `super()` nested deeper than a leading comma operand
+/// — p-queue's `if (super(), this.a = 0, …)` shape.
+#[test]
+fn derived_ctor_capture_stash_follows_super_inside_if_test() {
+    let source = r#"
+        const exported = (() => {
+            const shared = { tag: "outer" };
+            class Base {
+                constructor() { this.base = 1; }
+            }
+            class Derived extends Base {
+                constructor(e) {
+                    var q;
+                    if (super(), this.count = 0, this.tag = shared.tag, !e) { q = 1; }
+                    this.q = q;
+                }
+            }
+            return Derived;
+        })();
+    "#;
+    assert_capture_stash_follows_super(source, "Derived");
+}
+
+fn assert_capture_stash_follows_super(source: &str, class_name: &str) {
+    let module = perry_parser::parse_typescript(source, "t.ts").expect("source parses");
+    let hir = super::lower_module(&module, "t", "t.ts").expect("source lowers");
+    let class = hir
+        .classes
+        .iter()
+        .find(|c| c.name == class_name)
+        .unwrap_or_else(|| panic!("fixture declares class {class_name}"));
+    let ctor = class
+        .constructor
+        .as_ref()
+        .expect("the derived class keeps its user-written constructor");
+    let mut super_at = None;
+    let mut first_stash_at = None;
+    for (index, stmt) in ctor.body.iter().enumerate() {
+        let compact: String = format!("{stmt:?}")
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        if super_at.is_none() && compact.contains("SuperCall(") {
+            super_at = Some(index);
+        }
+        if first_stash_at.is_none()
+            && compact.contains("PropertySet{object:This,property:\"__perry_cap_")
+        {
+            first_stash_at = Some(index);
+        }
+    }
+    // Anti-vacuity: the fixture must actually capture (`shared`) and call
+    // `super()`, or the ordering below is not being tested.
+    let super_at = super_at.expect("fixture constructor calls super()");
+    let first_stash_at = first_stash_at.expect("fixture class captures an outer local");
+    assert!(
+        first_stash_at > super_at,
+        "capture stash (stmt {first_stash_at}) must follow super() (stmt {super_at}): {:#?}",
+        ctor.body
     );
 }

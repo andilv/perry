@@ -10,8 +10,10 @@ pub extern "C" fn js_object_get_field_by_name_f64(
     obj: *const ObjectHeader,
     key: *const crate::StringHeader,
 ) -> f64 {
-    if let Some(value) = private_member_get_by_name(obj, key) {
-        return value;
+    if !cannot_be_private_member_name(key) {
+        if let Some(value) = private_member_get_by_name(obj, key) {
+            return value;
+        }
     }
     if (obj as usize) > 0 && (obj as usize) < 0x10000 && !key.is_null() {
         if let Some(name) = unsafe { super::super::has_own_helpers::str_from_string_header(key) } {
@@ -232,7 +234,7 @@ pub const PIC_CACHE_WORDS: usize = 12;
 /// |---|---|
 /// | 0 | `tok0` — most-recently-used ShapeId token |
 /// | 1 | `slot0` — its resolved field slot |
-/// | 2 | reserved non-identity scratch |
+/// | 2 | optional Array-subclass class-declared named-prefix token |
 /// | 3,4 / 5,6 / 7,8 / 9,10 | `(tok, slot)` ways |
 /// | 11 | round-robin victim index for the ways |
 pub type PicCache = [i64; PIC_CACHE_WORDS];
@@ -514,6 +516,22 @@ pub extern "C" fn js_object_get_field_ic_miss(
         // slot without repeating generic object dispatch. Both arms retain
         // their established helpers, making this a dispatch short-circuit
         // rather than a second implementation of either representation.
+        // An elements-backed Array-subclass instance answers its indices and
+        // `length` from its store; an absent index falls through to the ordinary
+        // lookup, which reaches the prototype chain (the shape has no index keys).
+        if let Some((_, elements)) =
+            unsafe { crate::array::subclass_elements::backed(obj as usize) }
+        {
+            if let Some(elements_key) =
+                unsafe { crate::array::subclass_elements::key_of_header(key) }
+            {
+                if let Some(value) =
+                    unsafe { crate::array::subclass_elements::get_by_key(elements, elements_key) }
+                {
+                    return value;
+                }
+            }
+        }
         if unsafe { key_bytes_are(key, b"length") } {
             match unsafe { gc_type_of(obj) } {
                 Some(crate::gc::GC_TYPE_ARRAY) => {
@@ -698,16 +716,14 @@ pub extern "C" fn js_object_get_field_ic_miss(
         let is_regular = shape.is_some_and(|shape| {
             shape.object_kind == crate::object::shapes::ShapeObjectKind::Ordinary
         });
-        // Descriptor-bearing receivers must not prime this PIC: its generated
-        // hit path is a raw slot load and would bypass their getter / property
-        // semantics. This per-object bit replaces the old process-wide
-        // `accessors_in_use` gate. `note_descriptor_target` sets the bit and
-        // transitions the receiver's ShapeId before an installed descriptor is
-        // observable, while unrelated accessors cannot affect an own data
-        // property on this receiver. The emitted hit path independently checks
-        // the same bit, so both cache population and cache use fail closed.
-        // Gate-neutral builtin accessors set the owner bit as well.
-        if is_regular && !has_own_descriptors {
+        // Descriptor-bearing receivers ordinarily must not prime a raw-load
+        // PIC. One narrow exception is an object-backed Array subclass whose
+        // complete class-declared prefix has been proved data-only: its
+        // unrelated `length` descriptor must not make `arch.sset` / `mask` /
+        // `change` permanently generic. The proof below is class-wide but
+        // owner-authorized, and every descriptor/structural transition clears
+        // the owner's token before publication.
+        if is_regular {
             let Some(shape) = shape else {
                 let value = js_object_get_field_by_name(obj, key);
                 return f64::from_bits(value.bits());
@@ -749,6 +765,22 @@ pub extern "C" fn js_object_get_field_ic_miss(
                     // shape id — no second probe.
                     let stamp = crate::object::shapes::object_shape_stamp(obj);
                     let token = (stamp as u64 | crate::object::shapes::PIC_ID_TOKEN_BIT) as i64;
+                    // Word 2 carries an optional class-declared named-prefix
+                    // identity for object-backed Array subclasses. Their
+                    // numeric tail changes ShapeId on every push/pop while
+                    // declared fields keep the same slots. The proof builder
+                    // is gated by an existing ObjectMeta pointer so ordinary
+                    // objects retain the old miss cost; it validates the
+                    // complete prefix before publishing a nonzero token.
+                    let named_prefix_token = if !(*obj).meta.is_null() {
+                        crate::array::array_subclass_named_prefix_token_for_slot(obj, i) as i64
+                    } else {
+                        0
+                    };
+                    if has_own_descriptors && named_prefix_token == 0 {
+                        break;
+                    }
+                    (*cache)[2] = named_prefix_token;
                     pic_prime_get(cache, token, i as i64);
                     let field_ptr = (obj as *const u8)
                         .add(std::mem::size_of::<ObjectHeader>() + i * 8)

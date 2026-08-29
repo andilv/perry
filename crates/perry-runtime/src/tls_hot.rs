@@ -153,11 +153,60 @@ pub(crate) struct HotTls {
     pub(crate) learned_inline_fields: *mut u8,
     // gc/roots/temp_roots.rs
     pub(crate) temp_roots: *mut u8,
+    // ------------------------------------------------------------------
+    // Inline hot VALUES. A named pointer field and a generic slot both cost
+    // TSD base → `HotTls` → slot pointer → value; a value that lives here is
+    // one dependent load shorter (TSD base → `HotTls` → value), and on the
+    // hottest probes — the write barrier's dirty-page cache on every
+    // remembered store, the prototype rows on every indexed array write, the
+    // box-pointer caches on every boxed-local read — that load was the
+    // measurable part. Only small `Copy` values with a `const` initial state
+    // belong here; anything needing `Drop` stays a slot.
+    // ------------------------------------------------------------------
+    /// `object::this_binding` — the implicit `this` of the current
+    /// dynamically-dispatched method call, NaN-boxed (`TAG_UNDEFINED` when
+    /// none). FIRST inline value on purpose: generated code on Apple
+    /// aarch64 reads and writes it at the fixed byte offset
+    /// [`HOT_TLS_IMPLICIT_THIS_OFFSET`] (see `hot_tls_layout_is_what_codegen_assumes`).
+    pub(crate) implicit_this: Cell<u64>,
+    /// `gc::dirty_page_cache` — the one-entry dirty-page cache
+    /// (`usize::MAX` = nothing cached).
+    pub(crate) last_dirty_old_page: Cell<usize>,
+    /// `gc::barrier::mark_dirty_external_slot_page` — the last `(page, header)`
+    /// pair recorded in `EXTERNAL_DIRTY_SLOT_PAGES` (`usize::MAX` = none).
+    /// Same invariant discipline as the inline-slot cache: valid exactly while
+    /// the pair is still recorded, cleared wherever a pair is removed.
+    pub(crate) last_external_dirty_page: Cell<usize>,
+    pub(crate) last_external_dirty_header: Cell<usize>,
+    /// `array::prototype_addr` — this thread's memoized intrinsic prototype
+    /// addresses, `usize::MAX` = not yet computed. Rewritten by the
+    /// collector's root scan like the slot it replaced.
+    pub(crate) prototype_addrs: [Cell<usize>; INLINE_PROTOTYPE_ADDR_ROWS],
+    /// `box` — direct-mapped positive caches over the three box registries.
+    pub(crate) box_ptr_cache: [Cell<usize>; INLINE_BOX_PTR_CACHE_SLOTS],
+    pub(crate) i32_box_ptr_cache: [Cell<usize>; INLINE_BOX_PTR_CACHE_SLOTS],
+    pub(crate) bool_box_ptr_cache: [Cell<usize>; INLINE_BOX_PTR_CACHE_SLOTS],
     /// Generic slots, one per [`crate::perry_thread_local`] declaration that
     /// this thread has resolved at least once. Last, so the named fields above
     /// keep their small fixed offsets.
     slots: [Cell<*mut u8>; HOT_SLOT_CAPACITY],
 }
+
+/// Byte offsets generated code hard-codes into its inline hot-cache access
+/// (`perry-codegen/src/expr/hot_tls.rs`, Apple aarch64 only). Pinned here
+/// with `offset_of!` so a field reorder fails to compile instead of silently
+/// reading the wrong cell.
+pub const HOT_TLS_INLINE_STATE_OFFSET: usize = 8;
+pub const HOT_TLS_IMPLICIT_THIS_OFFSET: usize = 128;
+const _: () = assert!(std::mem::offset_of!(HotTls, inline_state) == HOT_TLS_INLINE_STATE_OFFSET);
+const _: () = assert!(std::mem::offset_of!(HotTls, implicit_this) == HOT_TLS_IMPLICIT_THIS_OFFSET);
+const _: () = assert!(std::mem::offset_of!(crate::arena::InlineArenaState, data) == 0);
+
+/// Rows of [`HotTls::prototype_addrs`]; `array::prototype_addr` sizes its
+/// builtin-name table from this.
+pub(crate) const INLINE_PROTOTYPE_ADDR_ROWS: usize = 2;
+/// Slots of each [`HotTls`] box-pointer cache; `box` indexes with this.
+pub(crate) const INLINE_BOX_PTR_CACHE_SLOTS: usize = 8;
 
 impl HotTls {
     /// Read a claimed slot. `idx` must have passed the `< HOT_SLOT_CAPACITY`
@@ -195,6 +244,14 @@ impl HotTls {
         shape_install_memo: std::ptr::null_mut(),
         learned_inline_fields: std::ptr::null_mut(),
         temp_roots: std::ptr::null_mut(),
+        implicit_this: Cell::new(crate::value::TAG_UNDEFINED),
+        last_dirty_old_page: Cell::new(usize::MAX),
+        last_external_dirty_page: Cell::new(usize::MAX),
+        last_external_dirty_header: Cell::new(usize::MAX),
+        prototype_addrs: [const { Cell::new(usize::MAX) }; INLINE_PROTOTYPE_ADDR_ROWS],
+        box_ptr_cache: [const { Cell::new(0) }; INLINE_BOX_PTR_CACHE_SLOTS],
+        i32_box_ptr_cache: [const { Cell::new(0) }; INLINE_BOX_PTR_CACHE_SLOTS],
+        bool_box_ptr_cache: [const { Cell::new(0) }; INLINE_BOX_PTR_CACHE_SLOTS],
         slots: [const { Cell::new(std::ptr::null_mut()) }; HOT_SLOT_CAPACITY],
     };
 }
@@ -272,7 +329,16 @@ pub(crate) mod darwin_tsd {
     /// created yet, or [`publish`]'s self-check rejected it.
     pub(super) const NO_KEY: usize = usize::MAX;
 
-    pub(super) static KEY: AtomicUsize = AtomicUsize::new(NO_KEY);
+    /// The pthread key under which each thread publishes its `HotTls`
+    /// address. Exported by name because generated code on this platform
+    /// performs the same lookup inline (`perry-codegen/src/expr/hot_tls.rs`):
+    /// load this key, `mrs tpidrro_el0`, index the TSD array, and read the
+    /// cache — falling back to the runtime accessor when the key is
+    /// [`NO_KEY`] or the slot is still null. The value is only ever written
+    /// by [`ensure_key`] / [`disable`], exactly as before.
+    #[no_mangle]
+    pub static PERRY_HOT_TSD_KEY: AtomicUsize = AtomicUsize::new(NO_KEY);
+    pub(super) use PERRY_HOT_TSD_KEY as KEY;
 
     /// Latched by [`disable`] so no later thread retries a path this process
     /// has already proven wrong.
@@ -288,6 +354,26 @@ pub(crate) mod darwin_tsd {
     /// # Safety
     /// `slot` must be a key returned by `pthread_key_create`, so that the index
     /// lands inside the thread's TSD array.
+    /// This thread's TSD base — the per-thread constant [`get`] indexes from,
+    /// exposed so a hot reader can *identify* the calling thread with one
+    /// `mrs` and no memory access at all (the write barrier's dirty-page
+    /// cache mirrors its value under the writing thread's base). Same asm and
+    /// the same NOT-`pure` discipline as [`get`]: the value must be re-read
+    /// wherever execution can resume on another thread.
+    #[inline(always)]
+    pub(crate) fn base() -> usize {
+        let base: usize;
+        // SAFETY: reads a user-readable system register; no memory touched.
+        unsafe {
+            core::arch::asm!(
+                "mrs {b}, tpidrro_el0",
+                b = out(reg) base,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+        base & !0b111
+    }
+
     #[inline(always)]
     pub(super) unsafe fn get(slot: usize) -> *mut u8 {
         let base: usize;

@@ -1043,6 +1043,27 @@ fn registered_buffer_enum(addr: usize, what: MapSetEnum) -> Option<*mut ArrayHea
 /// Otherwise (the common case), this returns the stored keys array directly.
 #[no_mangle]
 pub extern "C" fn js_object_keys(obj: *const ObjectHeader) -> *mut ArrayHeader {
+    // An elements-backed Array-subclass instance: its present indices come
+    // first (ascending, as strings), then the shape's own enumerable keys.
+    // `length` is non-enumerable and not in the shape, so it never appears.
+    if unsafe { crate::array::subclass_elements::backed(obj as usize) }.is_some() {
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let obj_h = scope.root_raw_const_ptr(obj);
+        let (shape_keys, obj) = obj_h.across_const::<ObjectHeader, _>(|| js_object_keys_shape(obj));
+        if let Some((_, elements)) =
+            unsafe { crate::array::subclass_elements::backed(obj as usize) }
+        {
+            return unsafe {
+                crate::array::subclass_elements::prepend_index_keys(elements, shape_keys, false)
+            };
+        }
+        return shape_keys;
+    }
+    js_object_keys_shape(obj)
+}
+
+/// [`js_object_keys`] over the shape alone.
+fn js_object_keys_shape(obj: *const ObjectHeader) -> *mut ArrayHeader {
     // #8149: a registered BUFFER receiver — node `Buffer`, `Uint8Array`,
     // `ArrayBuffer`, `SharedArrayBuffer` or `DataView`. Asked FIRST, above the
     // `is_valid_obj_ptr` guard: a `BufferHeader` is not an `ObjectHeader`, and
@@ -1177,12 +1198,10 @@ pub extern "C" fn js_object_keys(obj: *const ObjectHeader) -> *mut ArrayHeader {
                 // actually has descriptor entries, so the common all-default
                 // array stays on the fast path.
                 let owner = stripped as usize;
-                let has_idx_descriptors = crate::state::state()
-                    .descriptors
-                    .property_descriptors
-                    .borrow()
-                    .keys()
-                    .any(|(ptr, _)| *ptr == owner);
+                // O(1) via the owner index. This used to walk every descriptor
+                // in the program on every `Object.keys(array)` — profiling
+                // `claude -p` put this scan at the top of self-time by 4×.
+                let has_idx_descriptors = super::super::owner_has_property_descriptors(owner);
                 let result = crate::array::js_array_alloc(length);
                 for i in 0..length {
                     if std::ptr::read(elements.add(i as usize)) == crate::value::TAG_HOLE {
@@ -1253,16 +1272,11 @@ pub extern "C" fn js_object_keys(obj: *const ObjectHeader) -> *mut ArrayHeader {
         // fresh array; the fast path now mirrors it, just without the
         // per-key descriptor check.
         // #6759 Phase C2: the owner's meta summary answers "no descriptor
-        // entries at all" in two loads; the O(table-size) owner scan runs
-        // only for owners that may actually hold entries (or can't carry a
-        // meta record — the conservative arm).
-        let has_descriptors = super::super::owner_may_have_descriptor_entries(obj as usize, false)
-            && crate::state::state()
-                .descriptors
-                .property_descriptors
-                .borrow()
-                .keys()
-                .any(|(ptr, _)| *ptr == obj as usize);
+        // entries at all" in two loads (still the first check, inside
+        // `owner_has_property_descriptors`); what used to follow it was an
+        // O(table-size) owner scan for every owner that *might* hold entries,
+        // now an O(1) owner-index lookup.
+        let has_descriptors = super::super::owner_has_property_descriptors(obj as usize);
         let len = crate::array::js_array_length(keys) as usize;
         // #2438: enumerate in ECMA-262 OrdinaryOwnPropertyKeys order —
         // array-index keys first (ascending numeric), then string keys in
@@ -1354,6 +1368,12 @@ pub(crate) unsafe fn instance_private_key_hidden(
 /// prefix test would wrongly hide legitimate user properties whose name happens
 /// to begin with `__perry_` (e.g. `this.__perry_user = 1`).
 ///
+/// `#<perry:private-member:…>` is deliberately NOT in this list. It is a
+/// transient compiler routing key for private method/accessor operations; the
+/// runtime consumes it only when a matching private-access hint is pending and
+/// never installs it as private object storage. Without a hint, that spelling
+/// is ordinary user data and must remain visible to reflection.
+///
 /// The one prefix family is `__perry_native_super__<method>` (#6316): the native
 /// base method a subclass override displaced. Its key set is parameterized by
 /// method name, so an exact allowlist cannot enumerate it. The prefix is a
@@ -1372,7 +1392,6 @@ pub(crate) fn is_internal_runtime_key_bytes(b: &[u8]) -> bool {
         || b == b"#<perry:class-evaluation-prototype>"
         || b == b"#<perry:private-class-lexical-binding>"
         || b.starts_with(b"#<perry:private-brand:")
-        || b.starts_with(b"#<perry:private-member:")
         || b.starts_with(b"#<perry:private-field:")
         || b.starts_with(b"#<perry:private-value:")
         || b.starts_with(b"#<perry:class-evaluation-method:")
@@ -1412,6 +1431,27 @@ pub(crate) unsafe fn descriptor_marks_non_enumerable(
 /// Returns an array of the object's field values
 #[no_mangle]
 pub extern "C" fn js_object_values(obj: *const ObjectHeader) -> *mut ArrayHeader {
+    // An elements-backed Array-subclass instance: its present elements come
+    // first (ascending), then the shape's own enumerable properties.
+    if unsafe { crate::array::subclass_elements::backed(obj as usize) }.is_some() {
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let obj_h = scope.root_raw_const_ptr(obj);
+        let (shape_part, obj) =
+            obj_h.across_const::<ObjectHeader, _>(|| js_object_values_shape(obj));
+        if let Some((_, elements)) =
+            unsafe { crate::array::subclass_elements::backed(obj as usize) }
+        {
+            return unsafe {
+                crate::array::subclass_elements::prepend_index_values(elements, shape_part)
+            };
+        }
+        return shape_part;
+    }
+    js_object_values_shape(obj)
+}
+
+/// [`js_object_values`] over the shape alone.
+fn js_object_values_shape(obj: *const ObjectHeader) -> *mut ArrayHeader {
     // #8149: a registered BUFFER receiver — node `Buffer`, `Uint8Array`,
     // `ArrayBuffer`, `SharedArrayBuffer` or `DataView`. Asked FIRST, above the
     // `is_valid_obj_ptr` guard: a `BufferHeader` is not an `ObjectHeader`, and
@@ -1575,6 +1615,27 @@ pub extern "C" fn js_object_values(obj: *const ObjectHeader) -> *mut ArrayHeader
 /// Returns an array where each element is a 2-element array [key, value]
 #[no_mangle]
 pub extern "C" fn js_object_entries(obj: *const ObjectHeader) -> *mut ArrayHeader {
+    // An elements-backed Array-subclass instance: its present elements come
+    // first (ascending), then the shape's own enumerable properties.
+    if unsafe { crate::array::subclass_elements::backed(obj as usize) }.is_some() {
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let obj_h = scope.root_raw_const_ptr(obj);
+        let (shape_part, obj) =
+            obj_h.across_const::<ObjectHeader, _>(|| js_object_entries_shape(obj));
+        if let Some((_, elements)) =
+            unsafe { crate::array::subclass_elements::backed(obj as usize) }
+        {
+            return unsafe {
+                crate::array::subclass_elements::prepend_index_entries(elements, shape_part)
+            };
+        }
+        return shape_part;
+    }
+    js_object_entries_shape(obj)
+}
+
+/// [`js_object_entries`] over the shape alone.
+fn js_object_entries_shape(obj: *const ObjectHeader) -> *mut ArrayHeader {
     // #8149: a registered BUFFER receiver — node `Buffer`, `Uint8Array`,
     // `ArrayBuffer`, `SharedArrayBuffer` or `DataView`. Asked FIRST, above the
     // `is_valid_obj_ptr` guard: a `BufferHeader` is not an `ObjectHeader`, and

@@ -189,3 +189,18 @@ pub(crate) fn bound_native_callable_is_constructor_value(value: f64) -> bool {
     unsafe { bound_native_callable_module_and_method(value) }
         .is_some_and(|(module, property)| is_native_module_constructor_export(&module, &property))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::is_native_module_constructor_export;
+
+    #[test]
+    fn fs_read_file_and_stream_classes_expose_prototypes() {
+        assert!(is_native_module_constructor_export("fs", "readFile"));
+        assert!(is_native_module_constructor_export("fs", "ReadStream"));
+        assert!(is_native_module_constructor_export(
+            "node:fs",
+            "WriteStream"
+        ));
+    }
+}

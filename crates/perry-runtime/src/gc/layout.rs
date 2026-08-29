@@ -877,6 +877,33 @@ pub(crate) fn layout_note_slot(parent_user: usize, slot_index: usize, value_bits
             layout_mark_unknown(parent_user as *mut u8);
             return;
         }
+        // An empty array's first pointer append is also a complete proof of
+        // the all-pointer invariant: before the caller bumps `length` the
+        // live prefix is empty, and immediately afterwards its sole element
+        // is the pointer we just classified. Publish that stronger state
+        // instead of minting a one-bit side mask (or falling back to UNKNOWN),
+        // so later pointer appends can consume the same O(1) header proof as
+        // arrays declared all-pointer by codegen.
+        //
+        // This is deliberately restricted to `length == 0`. A POINTER_FREE
+        // array with an existing numeric prefix may also receive a pointer at
+        // its append position, but that prefix does not satisfy the claim.
+        // Clear both raw-f64 flags before publishing ALL_POINTERS: the two
+        // representations are mutually exclusive, and generated append code
+        // uses their absence as part of its admission test.
+        if pointer
+            && (*header).obj_type == GC_TYPE_ARRAY
+            && (*header)._reserved & GC_LAYOUT_STATE_MASK == GC_LAYOUT_POINTER_FREE
+        {
+            let arr = parent_user as *const crate::array::ArrayHeader;
+            if (*arr).length == 0
+                && layout_all_pointer_array_append(header, parent_user, slot_index)
+            {
+                crate::array::clear_array_numeric_layout_ptr(parent_user);
+                layout_init_all_pointer_slots(parent_user as *mut u8);
+                return;
+            }
+        }
         if !pointer && (*header)._reserved & GC_LAYOUT_STATE_MASK == GC_LAYOUT_POINTER_FREE {
             return;
         }
@@ -950,6 +977,65 @@ pub(crate) fn layout_note_slot(parent_user: usize, slot_index: usize, value_bits
     }
 }
 
+/// Existing-slot layout note with the value that was overwritten.
+///
+/// The GC slot mask records one bit of information: whether a slot can carry a
+/// heap edge. Replacing one pointer-bearing value with another cannot change
+/// that bit. Arrays still have a second, independent invariant to maintain —
+/// their homogeneous element-shape record — so the pointer-over-pointer path
+/// runs that hook after validating/chasing the owner header and then stops
+/// before the typed-layout and per-slot-mask machinery. Object-backed packed
+/// numeric proofs are retired for the same reason as in [`layout_note_slot`].
+///
+/// Scalar-over-scalar keeps the historical fast return. A change in either
+/// direction uses the complete note so pointer masks and typed descriptors are
+/// updated exactly as before.
+#[inline]
+pub(crate) fn layout_note_slot_aware(
+    parent_user: usize,
+    slot_index: usize,
+    value_bits: u64,
+    old_bits: u64,
+) {
+    let value_is_pointer = layout_pointer_bearing_bits(value_bits);
+    let old_is_pointer = layout_pointer_bearing_bits(old_bits);
+    if !value_is_pointer && !old_is_pointer {
+        return;
+    }
+    if value_is_pointer && old_is_pointer {
+        if slot_index > 16_000_000 {
+            return;
+        }
+        unsafe {
+            let Some(header) = layout_header_for_user(parent_user) else {
+                return;
+            };
+            if (*header).gc_flags & GC_FLAG_FORWARDED != 0 {
+                let new_user = forwarding_address(header) as usize;
+                if new_user != 0 && new_user != parent_user {
+                    layout_note_slot_aware(new_user, slot_index, value_bits, old_bits);
+                }
+                return;
+            }
+            if (*header).obj_type == GC_TYPE_ARRAY {
+                crate::array::note_element_store(
+                    parent_user as *mut crate::array::ArrayHeader,
+                    slot_index,
+                    value_bits,
+                );
+            } else if (*header).obj_type == GC_TYPE_OBJECT
+                && (*header)._reserved & OBJ_FLAG_PACKED_NUMERIC_PROOF != 0
+            {
+                crate::array::clear_packed_subclass_numeric_proof(
+                    parent_user as *mut crate::object::ObjectHeader,
+                );
+            }
+        }
+        return;
+    }
+    layout_note_slot(parent_user, slot_index, value_bits);
+}
+
 /// True when `slot_index` of `parent_user` is a **raw-f64-masked slot of an
 /// intact typed-shape descriptor** — i.e. exactly the case where
 /// [`layout_note_slot`] would call `layout_set_typed_unknown` (permanently
@@ -1001,14 +1087,13 @@ pub extern "C" fn js_gc_note_slot_layout(parent: u64, slot_index: u32, value_bit
     layout_note_slot(parent_user, slot_index as usize, value_bits);
 }
 
-/// Scalar-aware variant of [`js_gc_note_slot_layout`]: `old_bits` is the value
-/// previously held in the slot. When **neither** the new value nor the old
-/// value is a heap pointer, the slot's pointer-ness is unchanged, so the
-/// per-slot GC layout mask needs no update — the `SIDE_MASK`/typed path's
-/// thread-local hashmap touch is skipped. The mask invariant ("bit set ⟺ slot
-/// holds a pointer") is preserved because the full path still runs whenever a
-/// pointer is involved on either side (`new` is a pointer → set; `old` was a
-/// pointer → clear), which is exactly when the mask must change. This is the
+/// Value-aware variant of [`js_gc_note_slot_layout`]: `old_bits` is the value
+/// previously held in the slot. When old and new have the same heap-pointer
+/// classification, the per-slot GC layout mask needs no update. The
+/// pointer-over-pointer path still maintains Array element-shape metadata;
+/// classification changes retain the full typed-layout and mask pipeline.
+/// The mask invariant ("bit set ⟺ slot holds a pointer") is therefore
+/// preserved while avoiding the thread-local hashmap on stable overwrites. This is the
 /// dominant per-write cost on heterogeneous `any[]` numeric write loops
 /// (stubbing `layout_note_slot` makes `bench_numeric_array_downgrade` 11×
 /// faster). `layout_pointer_bearing_bits` is the same predicate the layout
@@ -1021,11 +1106,8 @@ pub extern "C" fn js_gc_note_slot_layout_aware(
     value_bits: u64,
     old_bits: u64,
 ) {
-    if !layout_pointer_bearing_bits(value_bits) && !layout_pointer_bearing_bits(old_bits) {
-        return;
-    }
     let parent_user = strip_nanbox_user_ptr(parent);
-    layout_note_slot(parent_user, slot_index as usize, value_bits);
+    layout_note_slot_aware(parent_user, slot_index as usize, value_bits, old_bits);
 }
 
 pub(super) unsafe fn layout_rebuild_from_slots_with_policy(
@@ -1355,6 +1437,9 @@ pub(crate) struct HeapChildSlotIterator {
     /// #6812: second prefix — the object's `meta` header edge. Kept
     /// separate from `prefix_slot` so payload indices stay mask-aligned.
     pub(super) meta_slot: Option<*mut u64>,
+    /// A second explicit meta edge — the Array-subclass `elements` store at
+    /// the end of the `ObjectMeta` record — read exactly like `meta_slot`.
+    pub(super) meta_slot2: Option<*mut u64>,
     pub(super) payload: HeapSlotRange,
     pub(super) selection: HeapPayloadSlotSelection,
     /// #8122: the receiver's `ShapeDescriptor`, resolved ONCE by
@@ -1370,6 +1455,7 @@ impl HeapChildSlotIterator {
         Self {
             prefix_slot: None,
             meta_slot: None,
+            meta_slot2: None,
             payload: HeapSlotRange::new(std::ptr::null_mut(), 0),
             selection: HeapPayloadSlotSelection::Empty,
             object_shape: None,
@@ -1385,6 +1471,7 @@ impl HeapChildSlotIterator {
         Self {
             prefix_slot,
             meta_slot: None,
+            meta_slot2: None,
             payload,
             selection,
             object_shape: None,
@@ -1405,6 +1492,7 @@ impl HeapChildSlotIterator {
         Self {
             prefix_slot,
             meta_slot: None,
+            meta_slot2: None,
             payload,
             selection,
             object_shape,
@@ -1416,8 +1504,17 @@ impl HeapChildSlotIterator {
         self
     }
 
+    pub(super) fn with_meta_slot2(mut self, slot: Option<*mut u64>) -> Self {
+        self.meta_slot2 = slot;
+        self
+    }
+
     pub(super) fn take_meta_child_slot(&mut self) -> Option<*mut u64> {
         self.meta_slot.take()
+    }
+
+    pub(super) fn take_meta_child_slot2(&mut self) -> Option<*mut u64> {
+        self.meta_slot2.take()
     }
 
     pub(super) fn take_prefix_child_slot(&mut self) -> Option<*mut u64> {
@@ -1465,6 +1562,9 @@ impl Iterator for HeapChildSlotIterator {
             return Some(HeapChildSlot::Child(slot, HeapChildSlotReadKind::Prefix));
         }
         if let Some(slot) = self.meta_slot.take() {
+            return Some(HeapChildSlot::Child(slot, HeapChildSlotReadKind::Prefix));
+        }
+        if let Some(slot) = self.meta_slot2.take() {
             return Some(HeapChildSlot::Child(slot, HeapChildSlotReadKind::Prefix));
         }
         match &mut self.selection {
@@ -1649,6 +1749,10 @@ pub(super) unsafe fn gc_child_slots(header: *mut GcHeader) -> HeapChildSlotItera
                 Some(last_index_slot),
                 HeapSlotRange::new(pattern_slot, slot_count),
             )
+            // #6759 phase 1: the metadata edge. RegExp reaches marking through
+            // THIS iterator (its rewrite arm delegates here), so the edge has
+            // to be enumerated at this point, not in the rewrite match.
+            .with_meta_slot(crate::object::cell_meta_slot(user_ptr as usize).map(|s| s as *mut u64))
         }
         GcLayoutSlotKind::ObjectMeta => {
             // Prototype and the private-evaluation brand are explicit prefix
@@ -1660,7 +1764,13 @@ pub(super) unsafe fn gc_child_slots(header: *mut GcHeader) -> HeapChildSlotItera
             let proto_slot = Some(&mut (*meta).prototype as *mut u64);
             let brand_slot = Some(&mut (*meta).private_evaluation_brand as *mut u64);
             let range = HeapSlotRange::new(&mut (*meta).spill as *mut u64, 1);
-            HeapChildSlotIterator::new(header, proto_slot, range).with_meta_slot(brand_slot)
+            // The Array-subclass elements store is a raw-pointer child edge
+            // (0 = none) exactly like `spill`; it sits at the end of the
+            // record, so it is enumerated as a second explicit meta edge.
+            let elements_slot = Some(&mut (*meta).elements as *mut u64);
+            HeapChildSlotIterator::new(header, proto_slot, range)
+                .with_meta_slot(brand_slot)
+                .with_meta_slot2(elements_slot)
         }
         GcLayoutSlotKind::ClosureCaptures => {
             let closure = user_ptr as *mut crate::closure::ClosureHeader;

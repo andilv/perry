@@ -615,6 +615,14 @@ fn compute_object_cache_key_with_env(
                     .collect::<Vec<_>>()
                     .join(","),
             );
+            buf.push_str(":method_arguments_length_only=");
+            buf.push_str(
+                &c.method_arguments_length_only
+                    .iter()
+                    .map(|b| if *b { "1" } else { "0" })
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
             buf.push_str(":static_fields=");
             buf.push_str(&c.static_field_names.join(","));
             buf.push_str(":static_methods=");
@@ -1007,6 +1015,14 @@ fn compute_object_cache_key_with_env(
     h.field(
         "env_ll_rs4gc_max_instrs",
         env_var("PERRY_LL_RS4GC_MAX_INSTRS")
+            .as_deref()
+            .unwrap_or(""),
+    );
+    // #8883: the TailCallElim alloca-walk budget stamps `disable-tail-calls`
+    // on the functions it trips on, which changes their object code.
+    h.field(
+        "env_ll_tre_max_alloca_walk",
+        env_var("PERRY_LL_TRE_MAX_ALLOCA_WALK")
             .as_deref()
             .unwrap_or(""),
     );

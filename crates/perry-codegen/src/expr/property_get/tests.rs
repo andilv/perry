@@ -103,6 +103,29 @@ fn emit(debug: bool, source: Option<&str>) -> String {
         .expect("LLVM IR should be UTF-8")
 }
 
+fn emit_guarded_length_read() -> String {
+    let mut module = Module::new("guarded_length_read.ts");
+    module.init = vec![
+        Stmt::Let {
+            id: 11,
+            name: "values".to_string(),
+            ty: perry_hir::types::Type::Array(Box::new(perry_hir::types::Type::Any)),
+            mutable: false,
+            // An uninitialized erased annotation can still hold any runtime
+            // value once control reaches this site. It also prevents scalar
+            // replacement from folding the length to a literal.
+            init: None,
+        },
+        Stmt::Return(Some(Expr::PropertyGet {
+            object: Box::new(Expr::LocalGet(11)),
+            property: "length".to_string(),
+            byte_offset: 0,
+        })),
+    ];
+    String::from_utf8(compile_module(&module, ir_opts(false, None)).unwrap())
+        .expect("LLVM IR should be UTF-8")
+}
+
 #[test]
 fn property_read_emits_call_location_under_debug_symbols() {
     let ir = emit(true, Some(SRC));
@@ -125,9 +148,9 @@ fn no_call_location_without_debug_symbols() {
     );
 }
 
-/// #8067: property-read PIC identity is the authoritative ShapeId only. The
-/// former keys-pointer epoch word is reserved scratch and must not participate
-/// in the emitted hit predicate.
+/// #8067: the primary property-read PIC identity is the authoritative ShapeId
+/// only. Word 2 may carry the independent Array-subclass named-prefix proof,
+/// but it is consulted only after this exact ShapeId predicate fails.
 #[test]
 fn generic_property_get_hit_path_is_shape_id_only() {
     let ir = emit(false, None);
@@ -140,12 +163,30 @@ fn generic_property_get_hit_path_is_shape_id_only() {
         "hit path must form a discriminated ShapeId token:\n{ir}"
     );
     assert!(
-        !ir.contains("@PERRY_IC_EPOCH")
-            && !ir.lines().any(|line| {
-                line.contains("getelementptr i64, ptr @perry_ic_")
-                    && line.trim_end().ends_with(", i64 2")
-            }),
+        !ir.contains("@PERRY_IC_EPOCH"),
         "the removed pointer-token epoch must not appear in emitted IR:\n{ir}"
+    );
+}
+
+#[test]
+fn guarded_length_read_emits_array_subclass_scalar_ic() {
+    let ir = emit_guarded_length_read();
+    for block in [
+        "plen.ic.header",
+        "plen.ic.identity",
+        "plen.ic.family_token",
+        "plen.ic.inline",
+        "plen.ic.spill_load",
+    ] {
+        assert!(ir.contains(block), "missing {block} from length IC:\n{ir}");
+    }
+    assert!(
+        ir.contains("call double @js_value_length_property_ic_f64"),
+        "the cold arm must prime the scalar cache while retaining property semantics:\n{ir}"
+    );
+    assert!(
+        ir.contains("getelementptr i64") && ir.contains("i64 6\n"),
+        "the family hit must validate ObjectMeta's named-prefix token:\n{ir}"
     );
 }
 
@@ -185,7 +226,9 @@ fn fs_parent_promises_property_installs_before_resolution() {
 /// itself so the runtime's copy cannot drift.
 #[test]
 fn pic_cache_layout_matches_runtime() {
-    use crate::expr::property_get::generic_dispatch::{PIC_CACHE_WORDS, PIC_WAYS, PIC_WAY_BASE};
+    use crate::expr::property_get::generic_dispatch::{
+        PIC_CACHE_WORDS, PIC_NAMED_PREFIX_TOKEN, PIC_WAYS, PIC_WAY_BASE,
+    };
     assert_eq!(
         PIC_CACHE_WORDS, 12,
         "perry-runtime's PIC_CACHE_WORDS is 12; update both sides together"
@@ -195,12 +238,53 @@ fn pic_cache_layout_matches_runtime() {
         PIC_CACHE_WORDS,
         "the ways must fill the emitted global exactly"
     );
+    assert_eq!(
+        PIC_NAMED_PREFIX_TOKEN, 2,
+        "runtime PicCache word 2 carries the Array-subclass named-prefix token"
+    );
     let ir = emit(false, None);
     assert!(
         ir.contains(&format!(
             "= private global [{PIC_CACHE_WORDS} x i64] zeroinitializer"
         )),
         "every @perry_ic_N must be emitted at the width the runtime writes:\n{ir}"
+    );
+}
+
+/// Object-backed Array subclasses mint one ShapeId per numeric tail length.
+/// A named-field site on such a receiver must try the independently proved
+/// class prefix before falling into the bounded shape ways / runtime miss.
+#[test]
+fn generic_property_get_emits_array_subclass_named_prefix_guard() {
+    use crate::expr::property_get::generic_dispatch::PIC_NAMED_PREFIX_TOKEN;
+
+    let ir = emit(false, None);
+    let guard = ir
+        .find("\npic.prefix.guard")
+        .unwrap_or_else(|| panic!("expected a named-prefix guard block:\n{ir}"));
+    let token = ir
+        .find("\npic.prefix.token")
+        .unwrap_or_else(|| panic!("expected a named-prefix token block:\n{ir}"));
+    let hit = ir
+        .find("\npic.prefix.hit")
+        .unwrap_or_else(|| panic!("expected a named-prefix hit block:\n{ir}"));
+    let miss = ir
+        .find("\npic.miss")
+        .unwrap_or_else(|| panic!("expected the ordinary PIC miss block:\n{ir}"));
+    assert!(
+        guard < token && token < hit && hit < miss,
+        "prefix guard must precede the ordinary miss path:\n{ir}"
+    );
+
+    let guard_body = &ir[guard..token];
+    assert!(
+        guard_body.contains(&format!("i64 {PIC_NAMED_PREFIX_TOKEN}\n")),
+        "the cheap first gate must read cache word 2 before touching ObjectMeta:\n{guard_body}"
+    );
+    let token_body = &ir[token..hit];
+    assert!(
+        token_body.contains("getelementptr i64") && token_body.contains("i64 6\n"),
+        "ObjectMeta word 6 must carry the runtime-paired prefix token:\n{token_body}"
     );
 }
 
@@ -733,5 +817,69 @@ fn generic_non_length_read_keeps_the_whole_tower() {
     assert!(
         ir[sso..].contains("js_object_get_field_by_name_f64"),
         "a non-`length` SSO read must still call the by-name helper:\n{ir}"
+    );
+}
+
+/// A dynamically typed `.size` read must recognize native Map/Set receivers
+/// by their live GC kinds before entering the object-only PIC. This covers
+/// nested structural reads such as `this.ctx.hooks.size` without trusting an
+/// erased TypeScript annotation as a native-layout proof.
+#[test]
+fn generic_size_read_serves_native_collections_inline() {
+    let ir = emit_read("size");
+    let collection = ir
+        .find("\npget.collection_size")
+        .unwrap_or_else(|| panic!("expected a native collection size block:\n{ir}"));
+    let collection_body = &ir[collection..];
+    let collection_end = collection_body[1..]
+        .find("\n\n")
+        .map(|i| i + 1)
+        .unwrap_or(collection_body.len());
+    let collection_body = &collection_body[..collection_end];
+
+    assert!(
+        ir.contains("icmp eq i8") && ir.contains(", 8") && ir.contains(", 12"),
+        "the collection arm must be guarded by GC_TYPE_MAP and GC_TYPE_SET:\n{ir}"
+    );
+    assert!(
+        collection_body.contains("load i32") && collection_body.contains("uitofp i32"),
+        "the branded collection arm must load the shared leading size field inline:\n\
+         {collection_body}"
+    );
+    assert!(
+        ir.contains("@perry_ic_") && ir.contains("js_object_get_field_ic_miss"),
+        "non-collection receivers must retain the generic property tower:\n{ir}"
+    );
+}
+
+#[test]
+fn generic_non_size_read_has_no_collection_layout_load() {
+    let ir = emit_read("other");
+    assert!(
+        !ir.contains("pget.collection_size") && !ir.contains("pic.recv_object_check"),
+        "only `.size` may grow the native collection fast path:\n{ir}"
+    );
+}
+
+/// The object-backed `.length` tier probes the elements-backed subclass store
+/// first: meta word → `ObjectMeta.elements` (word 12) → the inner Array's
+/// `length` word — and only then the shape/family IC.
+#[test]
+fn the_length_tier_probes_the_elements_store_before_the_shape_ic() {
+    let ir = emit_guarded_length_read();
+    assert!(
+        ir.contains("plen.elem.meta") && ir.contains("plen.elem.length"),
+        "the elements probe must exist:\n{ir}"
+    );
+    let store = super::super::class_field_barrier_tests::block_body(&ir, "plen.elem.store.")
+        .expect("the elements-store probe block exists");
+    assert!(
+        store.contains("getelementptr i64, ptr %") && store.contains(", i64 12"),
+        "the probe must load ObjectMeta.elements at word 12:\n{store}"
+    );
+    // A miss of the probe keeps the shape IC.
+    assert!(
+        store.contains("plen.ic.shape"),
+        "a missing store must fall through to the shape IC:\n{store}"
     );
 }

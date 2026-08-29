@@ -115,12 +115,15 @@ pub(crate) unsafe fn own_data_field_by_name(
         crate::object::object_live_slot_count(obj),
         crate::object::INLINE_SLOT_FLOOR as u32,
     ) as usize;
-    for i in 0..key_count {
-        let key_val = crate::array::js_array_get(keys, i as u32);
-        // #1781: accept inline SSO short keys — `is_string()` is
-        // STRING_TAG-only, so the pre-fix shape silently skipped any
-        // ≤5-byte key stored as a `SHORT_STRING_TAG` value.
-        if crate::string::js_string_key_matches(key_val, key) {
+    // #6759: shape-index + raw dense-slot scan, replacing the per-element
+    // `js_array_get` + `js_string_key_matches` walk. This is the READ path's
+    // copy of the scan that #8936 killed on the [[Set]]/delete side — an
+    // isolated overwrite-loop profile still showed `js_array_get_f64` at 23.5%
+    // self time, and the caller graph attributed it here. The shared helper
+    // preserves #1781's SSO-key acceptance (its byte resolver is SSO-aware).
+    if let Some(islot) = crate::object::keys_find_slot_by_key_ptr(keys, key_count as u32, key) {
+        let i = islot as usize;
+        {
             if i < alloc_limit {
                 return Some(js_object_get_field(obj, i as u32));
             }
@@ -596,6 +599,29 @@ pub(crate) unsafe fn string_index_value(
     }
 }
 
+/// Resolve an inherited `Array.prototype` property for an Array-subclass
+/// instance after its own fields and class-declared methods have missed.
+/// An explicit per-instance prototype replaces the ordinary class chain and
+/// therefore suppresses this implicit fallback.
+pub(crate) unsafe fn array_subclass_prototype_field(
+    obj: *const ObjectHeader,
+    key: *const crate::StringHeader,
+) -> Option<JSValue> {
+    if obj.is_null()
+        || key.is_null()
+        || super::super::prototype_chain::object_static_prototype(obj as usize).is_some()
+        || !crate::array::is_array_subclass_class_id((*obj).class_id)
+    {
+        return None;
+    }
+    let key_ptr = crate::object::string_header_payload(key);
+    let key_len = (*key).byte_len as usize;
+    let name = std::str::from_utf8(std::slice::from_raw_parts(key_ptr, key_len)).ok()?;
+    // `array_prototype_property_value` copies `name` before its first
+    // allocation and roots the receiver across the prototype lookup.
+    array_prototype_property_value(name, obj as usize)
+}
+
 pub(crate) unsafe fn array_prototype_property_value(
     name: &str,
     receiver_addr: usize,
@@ -622,6 +648,8 @@ pub(crate) unsafe fn array_prototype_property_value(
     let name_copy = super::HeapKeyBytes::copy_of(name.as_bytes());
     let name: &str = std::str::from_utf8_unchecked(name_copy.as_bytes());
 
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let receiver_h = scope.root_nanbox_f64(crate::value::js_nanbox_pointer(receiver_addr as i64));
     let ctor = super::super::js_get_global_this_builtin_value(b"Array".as_ptr(), 5);
     let ctor_value = JSValue::from_bits(ctor.to_bits());
     if !ctor_value.is_pointer() {
@@ -633,15 +661,11 @@ pub(crate) unsafe fn array_prototype_property_value(
     if !proto_value.is_pointer() {
         return None;
     }
-    // #7498: `js_string_from_bytes` ALLOCATES, so `Array.prototype` and the
-    // receiver cannot be carried across it as bare `usize`s — and the key it
-    // produces is itself a fresh heap string this function then hands to two
-    // more calls that can collect (`js_object_get_field_by_name` runs getters;
-    // `default_object_prototype_property_value` interns another key). Root all
-    // three and read each back at its point of use.
-    let scope = crate::gc::RuntimeHandleScope::new();
+    // #7498: the receiver is rooted before the allocating global lookup above;
+    // `Array.prototype` and the fresh key are rooted before the calls below,
+    // which can collect (`js_object_get_field_by_name` runs getters and
+    // `default_object_prototype_property_value` interns another key).
     let proto_h = scope.root_nanbox_f64(proto);
-    let receiver_h = scope.root_nanbox_f64(crate::value::js_nanbox_pointer(receiver_addr as i64));
     let key_h = scope.root_nanbox_f64(crate::value::nanbox_string_key(
         crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32),
     ));

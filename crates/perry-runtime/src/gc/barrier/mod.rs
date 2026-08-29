@@ -990,13 +990,21 @@ fn incremental_mark_barrier_value_with_valid_ptrs(
     true
 }
 
+#[inline(always)]
 pub(super) fn incremental_mark_barrier_value(value_bits: u64) -> bool {
     // #7469: the overwhelmingly common case is "no cycle anywhere", and
     // proving it must not cost a thread-local resolution — this runs on every
-    // heap-pointer store in compiled code.
+    // heap-pointer store in compiled code. Inlined into every entry point so
+    // that proof is one static load and a branch there, not a call.
     if incremental_mark_barrier_globally_idle() {
         return false;
     }
+    incremental_mark_barrier_value_active(value_bits)
+}
+
+/// [`incremental_mark_barrier_value`] once a cycle is known to be active.
+#[inline(never)]
+fn incremental_mark_barrier_value_active(value_bits: u64) -> bool {
     let ptr = hot_incremental_mark_valid_ptrs().get();
     if ptr.is_null() {
         return false;
@@ -1122,97 +1130,6 @@ pub extern "C" fn js_write_barrier(parent: u64, child: u64) {
     js_write_barrier_slot(parent, 0, child);
 }
 
-/// Gen-GC Phase C1: slot-aware write barrier. Called by
-/// codegen-emitted store sites unless `PERRY_WRITE_BARRIERS=0`/
-/// `off`/`false` disabled barrier emission at compile time.
-///
-/// Decode the parent + child as raw addresses. If parent's
-/// GcHeader sits in the old-gen arena AND child's NaN-boxed
-/// pointer (any of POINTER / STRING / BIGINT / SHORT_STRING)
-/// resolves to a heap address inside the nursery, dirty the page
-/// containing the written slot. A zero slot address falls back to
-/// dirtying every occupied page in the parent object.
-///
-/// Hot-path constraints: this fires on EVERY heap store in
-/// compiled code by default. Must be cheap:
-/// generation checks use arena page side metadata rather than
-/// scanning every arena block.
-#[no_mangle]
-pub extern "C" fn js_write_barrier_slot(parent: u64, slot_addr: u64, child: u64) {
-    write_barrier_slot_inner(parent, slot_addr as usize, child, false);
-}
-
-pub(super) fn write_barrier_slot_inner(
-    parent: u64,
-    slot_addr: usize,
-    child: u64,
-    external_slot: bool,
-) {
-    // Decode child first: primitive stores are the overwhelmingly common
-    // case (every numeric array/field store) and need NEITHER the
-    // incremental-mark probe (nothing to mark) NOR the remembered set (no
-    // old→young edge) — so they must not pay the incremental barrier's
-    // unconditional thread-local access, which dominated tight numeric store
-    // loops (#6011: `ema[i] = <f64>` spent more time in this preamble than
-    // in the store itself).
-    let Some(child_addr) = barrier_child_prologue(child) else {
-        return;
-    };
-    if !barrier_remembering_active() {
-        return;
-    }
-    // Decode the parent — must be a NaN-boxed heap pointer.
-    let parent_addr = decode_heap_addr(parent);
-    if parent_addr == 0 {
-        bump_write_barrier_trace_counter(BarrierTraceCounter::NonPointerParentSkips);
-        return;
-    }
-    write_barrier_decoded_parent(parent_addr, slot_addr, child_addr, external_slot);
-}
-
-/// The never-skippable half of the barrier: decode the stored child and shade
-/// it for any in-progress incremental cycle. Returns the child's heap address,
-/// or `None` when the store published no heap pointer at all (every numeric
-/// array/field store — the #6011 fast path, which must stay the cheapest exit).
-#[inline]
-fn barrier_child_prologue(child: u64) -> Option<usize> {
-    let child_addr = decode_heap_addr(child);
-    bump_write_barrier_trace_counter(BarrierTraceCounter::Calls);
-    if child_addr == 0 {
-        bump_write_barrier_trace_counter(BarrierTraceCounter::NonPointerChildSkips);
-        return None;
-    }
-    incremental_mark_barrier_value(child);
-    Some(child_addr)
-}
-
-/// #7187: should this barrier call do remembered-set work at all?
-///
-/// Placed **after** [`barrier_child_prologue`] and **before** the parent
-/// decode, in every entry point. Both halves of that placement are
-/// load-bearing:
-///
-///   * After the prologue, so the #6011 fast path (any number stored into any
-///     slot — the overwhelmingly common store) pays literally nothing new, and
-///     so SATB/insertion shading for an in-progress incremental cycle is never
-///     skipped. An incremental cycle implies a collection has run implies
-///     armed, so this could not bite today; writing the order down keeps a
-///     later refactor from hoisting the check above the shading.
-///   * Before the parent decode, so the unarmed window also skips
-///     `decode_heap_addr`'s raw-pointer arm — itself a
-///     `classify_heap_generation` on the bare-`u64` entry point.
-///
-/// Cost once armed: one relaxed load of a `static` (`adrp`/`ldr`) plus a
-/// perfectly-predicted, permanently-taken branch.
-#[inline]
-fn barrier_remembering_active() -> bool {
-    if barrier_remembering_armed() {
-        return true;
-    }
-    bump_write_barrier_trace_counter(BarrierTraceCounter::UnarmedSkips);
-    false
-}
-
 /// [`write_barrier_slot_inner`] for a caller that already holds the parent as
 /// a plain GC user pointer — see [`write_barrier_decoded_parent`] for why the
 /// `u64` round-trip is worth avoiding (#7187).
@@ -1301,7 +1218,7 @@ pub(super) fn barrier_parent_addr_is_dereferenceable(parent_addr: usize) -> bool
 /// here, because the Rust callers derive `parent_addr` from a live
 /// `*mut ArrayHeader` / `*mut ObjectHeader` / … rather than from JS value
 /// bits.
-#[inline]
+#[inline(never)]
 pub(super) fn write_barrier_decoded_parent(
     parent_addr: usize,
     slot_addr: usize,
@@ -1311,6 +1228,20 @@ pub(super) fn write_barrier_decoded_parent(
     // Old → young check. Runtime-owned malloc GC objects are outside
     // the nursery and must be treated as old when the caller uses the
     // external-slot path for fields or side buffers.
+    // An inline slot whose page is the one the dirty-page cache names has
+    // nothing left to owe the remembered set: the cache's invariant
+    // (`dirty_page_cache`) is "cached ⟹ recorded in DIRTY_OLD_PAGES AND
+    // stamped dirty in the page metadata", and that is exactly what
+    // `remember_old_to_young_inline_slot` would establish for this slot. The
+    // SATB shading already ran in the caller's prologue. Answering here skips
+    // both page-generation classifications — the parent's and the child's —
+    // which is the whole cost of the barrier on the second and third push into
+    // the same bucket, or on every push into a large array whose tail sits on
+    // one page.
+    if !external_slot && inline_slot_store_on_cached_dirty_page(parent_addr, slot_addr) {
+        bump_write_barrier_trace_counter(BarrierTraceCounter::DirtyPageCacheHits);
+        return;
+    }
     if !barrier_parent_needs_remembering(parent_addr, external_slot) {
         bump_write_barrier_trace_counter(BarrierTraceCounter::ParentNotOldSkips);
         return;
@@ -1325,7 +1256,7 @@ pub(super) fn write_barrier_decoded_parent(
     let inserted = if external_slot {
         remember_old_to_young_external_slot(parent_addr, slot_addr)
     } else {
-        remember_old_to_young_slot(parent_addr, slot_addr)
+        remember_old_to_young_inline_slot(parent_addr, slot_addr)
     };
     if inserted {
         bump_write_barrier_trace_counter(BarrierTraceCounter::NewInserts);
@@ -1606,7 +1537,7 @@ pub(super) fn malloc_gc_parent_addr(parent_addr: usize) -> bool {
 /// Accepts POINTER_TAG / STRING_TAG / BIGINT_TAG / SHORT_STRING_TAG;
 /// SHORT_STRING values return 0 because they're inline data, not
 /// heap pointers.
-#[inline]
+#[inline(always)]
 pub(super) fn decode_heap_addr(bits: u64) -> usize {
     let tag = bits & TAG_MASK;
     if tag == POINTER_TAG || tag == STRING_TAG || tag == BIGINT_TAG {
@@ -1618,25 +1549,32 @@ pub(super) fn decode_heap_addr(bits: u64) -> usize {
         // high bits and is rejected here without paying the page-map
         // classification, which dominated tight numeric store loops. Only
         // the (rare) subnormal doubles whose bits look address-shaped fall
-        // through to the authoritative arena lookup.
+        // through to the authoritative arena lookup — out of line, so the
+        // tag test above inlines into every barrier entry as a leaf.
         let addr = bits as usize;
         if (bits >> 48) != 0 || addr < 0x10000 || addr & 0x7 != 0 {
             return 0;
         }
-        if matches!(
-            crate::arena::classify_heap_generation(addr),
-            crate::arena::HeapGeneration::Unknown
-        ) {
-            0
-        } else {
-            addr
-        }
+        decode_raw_pointer_candidate(addr)
     } else {
         // SHORT_STRING_TAG (0x7FF9), INT32_TAG (0x7FFE),
         // primitive (0x7FFC), JS_HANDLE (0x7FFB) — none are
         // young-gen pointers.
         0
     }
+}
+
+/// [`remember_old_to_young_slot`] for a slot INSIDE the parent's own block.
+/// `barrier_parent_needs_remembering` has just classified the parent as Old,
+/// and an inline slot lies in the same allocation, so its page is on the same
+/// registered Old range: the slot's own classification would answer the
+/// same thing and was one of three page lookups per old→young store.
+#[inline]
+pub(super) fn remember_old_to_young_inline_slot(parent_addr: usize, slot_addr: usize) -> bool {
+    if slot_addr != 0 && slot_addr >= parent_addr {
+        return mark_dirty_old_page(crate::arena::generation_page_for_addr(slot_addr));
+    }
+    remember_old_to_young_slot(parent_addr, slot_addr)
 }
 
 pub(super) fn remember_old_to_young_slot(parent_addr: usize, slot_addr: usize) -> bool {
@@ -1765,7 +1703,24 @@ pub(super) fn ever_dirty_old_page(page: usize) -> bool {
 
 pub(super) fn mark_dirty_external_slot_page(header_addr: usize, page: usize) -> bool {
     bump_write_barrier_trace_counter(BarrierTraceCounter::DirtyPageMarkAttempts);
-    EXTERNAL_DIRTY_SLOT_PAGES.with(|s| {
+    // One-entry cache over the (page → headers) table, the external-slot
+    // twin of `dirty_page_cache`: a `Map`'s entries buffer is an external
+    // slot span, so `map.set(k, v)` on one map stores into the same page
+    // under the same header again and again, and each store paid the
+    // thread-local table probe plus a linear scan of that page's header list
+    // (which grows with every map whose buffer shares the page). The pair is
+    // recorded only after the table holds it and cleared wherever the table
+    // drops a pair (`clear_one_external_dirty_slot_header`), so a hit means
+    // exactly what the probe would have found.
+    {
+        let hot = crate::tls_hot::hot();
+        if hot.last_external_dirty_page.get() == page
+            && hot.last_external_dirty_header.get() == header_addr
+        {
+            return false;
+        }
+    }
+    let header_was_new = EXTERNAL_DIRTY_SLOT_PAGES.with(|s| {
         let mut pages = s.borrow_mut();
         let page_was_new = !pages.contains_key(&page);
         let headers = pages.entry(page).or_insert_with(Vec::new);
@@ -1779,7 +1734,19 @@ pub(super) fn mark_dirty_external_slot_page(header_addr: usize, page: usize) -> 
             bump_write_barrier_trace_counter(BarrierTraceCounter::NewDirtyPages);
         }
         header_was_new
-    })
+    });
+    let hot = crate::tls_hot::hot();
+    hot.last_external_dirty_page.set(page);
+    hot.last_external_dirty_header.set(header_addr);
+    header_was_new
+}
+
+/// Drop the external-slot pair cache. Called from every path that removes a
+/// pair from `EXTERNAL_DIRTY_SLOT_PAGES` — see `mark_dirty_external_slot_page`.
+pub(super) fn invalidate_external_dirty_slot_cache() {
+    let hot = crate::tls_hot::hot();
+    hot.last_external_dirty_page.set(usize::MAX);
+    hot.last_external_dirty_header.set(usize::MAX);
 }
 
 #[inline]
@@ -1989,6 +1956,7 @@ pub(super) fn remembered_dirty_page_count() -> usize {
     })
 }
 
+mod leaf;
 /// Gen-GC Phase C: read the current remembered set size — used
 /// by tests and `PERRY_GC_DIAG=1` output to confirm barrier
 /// activity. Returns 0 in Phase C1 since no codegen-emitted
@@ -1997,4 +1965,7 @@ pub(super) fn remembered_dirty_page_count() -> usize {
 // module purely for the 2000-line file-size gate; same module tree, same
 // visibility semantics (the statics they read are pub(super)/pub(crate)).
 mod maintenance;
+pub(super) use leaf::{decode_raw_pointer_candidate, inline_slot_store_on_cached_dirty_page};
+
+pub(super) use super::barrier_store::{barrier_child_prologue, barrier_remembering_active};
 pub use maintenance::*;

@@ -947,7 +947,7 @@ fn transition_cache_lookup_rejects_mutated_edge_target() {
     let keys = crate::array::js_array_push(keys, JSValue::string_ptr(key));
     let keys = crate::array::js_array_push(keys, JSValue::string_ptr(key));
 
-    transition_cache_insert(0, key, keys as usize, 0, 0);
+    transition_cache_insert(std::ptr::null(), 0, key, keys as usize, 0, 0);
 
     assert!(
         transition_cache_lookup(0, key).is_none(),
@@ -977,7 +977,7 @@ fn transition_cache_requires_exact_predecessor_shape_id() {
     const OTHER_PREDECESSOR: u32 = 102;
     const TARGET: u32 = 201;
 
-    transition_cache_insert(PREDECESSOR, key, keys as usize, 0, TARGET);
+    transition_cache_insert(std::ptr::null(), PREDECESSOR, key, keys as usize, 0, TARGET);
     assert!(
         transition_cache_lookup(OTHER_PREDECESSOR, key).is_none(),
         "equal keys edges with different semantic ShapeIds must not alias"
@@ -1008,7 +1008,14 @@ fn transition_cache_prunes_a_descriptorless_target_shape() {
     let target = crate::object::shapes::shape_descriptor_ensure(next_keys, 0, 0)
         .expect("shape range unexpectedly exhausted");
     let occupancy_before = test_transition_cache_occupancy();
-    transition_cache_insert(predecessor, std::ptr::null(), next_keys as usize, 0, target);
+    transition_cache_insert(
+        std::ptr::null(),
+        predecessor,
+        std::ptr::null(),
+        next_keys as usize,
+        0,
+        target,
+    );
     assert_eq!(test_transition_cache_occupancy(), occupancy_before + 1);
 
     crate::object::shapes::test_drop_shape_descriptors(next_keys as usize);
@@ -1036,7 +1043,7 @@ fn transition_cache_lookup_rejects_slot_key_mismatch() {
     // Insert an edge keyed on (prev=0, `alpha`) but targeting the `beta` shape,
     // mirroring a recycled-address false match (target_len is set because the
     // length matches slot_idx+1, so only the content check can catch it).
-    transition_cache_insert(0, want, keys as usize, 0, 0);
+    transition_cache_insert(std::ptr::null(), 0, want, keys as usize, 0, 0);
 
     assert!(
         transition_cache_lookup(0, want).is_none(),
@@ -1046,7 +1053,7 @@ fn transition_cache_lookup_rejects_slot_key_mismatch() {
     // Sanity: an edge whose target slot DOES hold the key still hits.
     let good_keys = crate::array::js_array_alloc(4);
     let good_keys = crate::array::js_array_push(good_keys, JSValue::string_ptr(want));
-    transition_cache_insert(0, want, good_keys as usize, 0, 0);
+    transition_cache_insert(std::ptr::null(), 0, want, good_keys as usize, 0, 0);
     assert!(
         transition_cache_lookup(0, want).is_some(),
         "a genuine edge (target slot holds the key) must still hit (#6006)"
@@ -1080,7 +1087,7 @@ fn transition_cache_lookup_rejects_grown_shared_target() {
     // A 1-key target with spare capacity, cached as a slot-0 edge (target_len=1).
     let keys = crate::array::js_array_alloc(4);
     let keys = crate::array::js_array_push(keys, JSValue::string_ptr(key));
-    transition_cache_insert(0, key, keys as usize, 0, 0);
+    transition_cache_insert(std::ptr::null(), 0, key, keys as usize, 0, 0);
     assert!(
         transition_cache_lookup(0, key).is_some(),
         "sanity: a genuine 1-key edge hits before the target grows (#6006)"
@@ -1668,6 +1675,74 @@ fn array_receiver_is_never_read_as_a_class_id() {
         super::native_module::class_id_from_method_receiver(obj_value),
         Some(impersonated),
         "a real class instance must still resolve to its class id"
+    );
+}
+
+/// #8955: Perry intentionally snapshots the receiver for a `this.method`
+/// value read. Replacing the own property after capture must not make the
+/// saved value re-resolve by name, while an override present before the read
+/// must still win.
+#[test]
+fn this_method_snapshot_survives_own_property_replacement() {
+    // Named distinctly from the real `CLASS_ID` mirror in
+    // `class_registry/state.rs`: `class_id_collisions.py` matches on the
+    // NAME, so a test-local `CLASS_ID` with a different value reads to that
+    // gate as cross-crate mirror drift.
+    const SNAPSHOT_CLASS_ID: u32 = 0x8955;
+    const NAME: &[u8] = b"snapshot";
+
+    extern "C" fn return_receiver(this: f64) -> f64 {
+        this
+    }
+
+    unsafe {
+        super::class_registry::js_register_class_method(
+            SNAPSHOT_CLASS_ID as i64,
+            NAME.as_ptr(),
+            NAME.len() as i64,
+            return_receiver as *const () as usize as i64,
+            0,
+            0,
+            0,
+        );
+    }
+
+    let obj = js_object_alloc(SNAPSHOT_CLASS_ID, 0);
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let receiver = scope.root_nanbox_f64(crate::value::js_nanbox_pointer(obj as i64));
+    let captured = scope.root_nanbox_f64(super::native_module::js_class_method_snapshot_bind(
+        receiver.get_nanbox_f64(),
+        NAME.as_ptr(),
+        NAME.len(),
+    ));
+
+    let key = scope.root_string_ptr(crate::string::js_string_from_bytes(
+        NAME.as_ptr(),
+        NAME.len() as u32,
+    ));
+    let live_obj = JSValue::from_bits(receiver.get_nanbox_f64().to_bits())
+        .as_pointer::<ObjectHeader>() as *mut ObjectHeader;
+    key.with_const_ptr::<crate::StringHeader, _>(|key| {
+        js_object_set_field_by_name(live_obj, key, 99.0)
+    });
+
+    let result = unsafe {
+        crate::closure::js_native_call_value(captured.get_nanbox_f64(), std::ptr::null(), 0)
+    };
+    assert_eq!(
+        result.to_bits(),
+        receiver.get_nanbox_f64().to_bits(),
+        "the captured method must keep dispatching through the vtable with its read-time receiver"
+    );
+
+    let after_override = super::native_module::js_class_method_snapshot_bind(
+        receiver.get_nanbox_f64(),
+        NAME.as_ptr(),
+        NAME.len(),
+    );
+    assert_eq!(
+        after_override, 99.0,
+        "an own override that exists before the read must still shadow the prototype method"
     );
 }
 

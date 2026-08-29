@@ -1,6 +1,7 @@
 //! push / pop / shift / unshift / set_length / delete + grow primitive.
 use super::*;
 use std::ptr;
+use std::sync::atomic::Ordering;
 
 /// `pop`/`shift`/`push`/`unshift` on a frozen array perform a `Set`/`Delete`
 /// with `Throw = true` internally (ECMA-262 §23.1.3.*), so a non-writable
@@ -78,6 +79,17 @@ pub(crate) fn guard_writable_length(arr: *const ArrayHeader) {
     if array_length_is_non_writable(arr) {
         throw_non_writable_length();
     }
+}
+
+/// The `_reserved` flags of `arr`'s header when that header is a plain
+/// `GC_TYPE_ARRAY`, read without re-classifying an already-resolved head.
+/// `None` for anything else `clean_arr_ptr` can hand back unchanged (a typed
+/// array, a Buffer), which keeps the registry-probing generic helpers in
+/// charge of those.
+#[inline]
+unsafe fn resolved_plain_array_flags(arr: *const ArrayHeader) -> Option<u16> {
+    let gc_header = super::header::array_gc_header(arr)?;
+    ((*gc_header).obj_type == crate::gc::GC_TYPE_ARRAY).then(|| (*gc_header)._reserved)
 }
 
 #[inline]
@@ -658,6 +670,15 @@ pub extern "C" fn js_array_push_f64(arr: *mut ArrayHeader, value: f64) -> *mut A
         }
         return arr;
     }
+    // An object-backed Array subclass carries `GC_TYPE_OBJECT`, so the tracked
+    // resolver below is a guaranteed miss for it. Ask the dense subclass append
+    // first, off the header tag the guarded element tiers already read; every
+    // rejected case (no dense proof, integrity flags, tail not learned) keeps
+    // the complete route below. wolf-ecs `packed.push(id)` on an `Archetype`
+    // paid the resolver twice per push once #8897 routed field pushes here.
+    if object_backed_push_fast(arr, value) {
+        return arr;
+    }
     let cleaned = clean_arr_ptr_mut(arr);
     if cleaned.is_null() {
         // #7574: a `class X extends Array` instance (or any array-like object)
@@ -668,13 +689,35 @@ pub extern "C" fn js_array_push_f64(arr: *mut ArrayHeader, value: f64) -> *mut A
         // receiver so codegen's realloc write-back leaves the binding pointing
         // at the instance (returning a fresh empty array here is what made the
         // push look silently dropped).
+        if crate::array::subclass::array_subclass_fast_push_one_raw(arr, value).is_some() {
+            return arr;
+        }
         if let Some(recv) = crate::array::subclass::array_object_receiver(arr) {
             crate::array::subclass::array_object_method(recv, "push", &[value]);
             return arr;
         }
         return js_array_alloc(0);
     }
-    let arr = cleaned;
+    unsafe { js_array_push_f64_resolved(cleaned, value) }
+}
+
+/// The dense object-backed Array-subclass append, dispatched off the receiver's
+/// `GC_TYPE_OBJECT` header tag before any allocator/registry resolution. The
+/// caller has already demoted a uniquely-owned heap string in `value`.
+#[inline]
+fn object_backed_push_fast(arr: *mut ArrayHeader, value: f64) -> bool {
+    if crate::array::array_receiver_gc_tag(arr).0 != crate::gc::GC_TYPE_OBJECT {
+        return false;
+    }
+    crate::array::subclass::array_subclass_fast_push_one_raw(arr, value).is_some()
+}
+
+/// Push into a live, forwarding-resolved plain Array. The caller owns all
+/// receiver-brand and Proxy handling; keeping this core separate lets the
+/// guarded u31 entry reuse the resolved header instead of classifying it a
+/// second time through `js_array_push_f64`.
+#[inline]
+unsafe fn js_array_push_f64_resolved(arr: *mut ArrayHeader, value: f64) -> *mut ArrayHeader {
     // One resolved header word answers every policy/layout question below.
     // Re-entering the public helpers here used to run `clean_arr_ptr` (and its
     // allocator-ownership proof) once for each individual bit test.
@@ -688,24 +731,114 @@ pub extern "C" fn js_array_push_f64(arr: *mut ArrayHeader, value: f64) -> *mut A
     if flags & (crate::gc::OBJ_FLAG_SEALED | crate::gc::OBJ_FLAG_NO_EXTEND) != 0 {
         return arr;
     }
-    unsafe {
-        let length = (*arr).length;
-        let capacity = (*arr).capacity;
+    let length = (*arr).length;
+    let capacity = (*arr).capacity;
 
-        if length >= capacity {
-            return js_array_push_f64_grow(arr, length, value);
-        }
-
-        let value = canonicalize_array_numeric_store_value_from_flags(flags, value);
-        let value_bits = value.to_bits();
-        let elements_ptr = (arr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut f64;
-        // GC_STORE_AUDIT(BARRIERED): push slot is immediately recorded via note_array_slot.
-        ptr::write(elements_ptr.add(length as usize), value);
-        note_array_slot(arr, length as usize, value_bits);
-        (*arr).length = length + 1;
-        arr
+    if length >= capacity {
+        return js_array_push_f64_grow(arr, length, value);
     }
+
+    // GC_STORE_AUDIT(BARRIERED): the resolved store performs the layout
+    // note and write barrier as part of the slot write.
+    store_array_slot_resolved(arr, length as usize, value, flags);
+    (*arr).length = length + 1;
+    arr
 }
+
+/// Single-element push for a value constructively proved by generated code to
+/// be a nonnegative signed-i32 Number. Besides avoiding value classification,
+/// this entry returns the semantic push result through `new_length`, so the
+/// caller does not immediately redispatch `js_array_length` on the receiver.
+///
+/// Every unproved receiver state either retains the complete resolved
+/// algorithm (Array-subclass integrity flags, first-seen tail transitions,
+/// growth) or — for the receivers whose push can run user code (indexed
+/// descriptors / prototype indices, Proxy traps, foreign families) — returns
+/// null so the generated caller performs the complete public push itself.
+/// That is what keeps this symbol allocate-but-never-reenter.
+#[no_mangle]
+pub extern "C" fn js_array_push_u31_with_length(
+    arr: *mut ArrayHeader,
+    value: u32,
+    new_length: *mut u32,
+) -> *mut ArrayHeader {
+    let number = f64::from(value);
+
+    // Generated callers hand this entry a freshly decoded JS receiver.  The
+    // ordinary-array and object-backed Array-subclass headers are therefore
+    // safe to classify with the same magnitude-checked live-header probe used
+    // by the generated Array element tiers.  Doing that before the complete
+    // forwarding/allocator-ownership resolver matters for the ECS kernels:
+    // every plain `SparseSet.packed.push(id)` used to pay a tracked-allocation
+    // lookup, and every Array-subclass push paid that lookup only to learn that
+    // it was not an `ArrayHeader` before repeating the header read in the
+    // subclass path.
+    //
+    // Only a non-forwarded, sane ordinary Array is consumed here.  Forwarding
+    // stubs, lazy/external receivers and every other brand retain
+    // `clean_arr_ptr_mut` below; the resolved helper retains the complete
+    // frozen/sealed/descriptor/grow and GC-bookkeeping behavior.
+    //
+    // `push` is an observable `Set`: an Array carrying indexed descriptors, a
+    // sparse tail, or an indexed property on `Array.prototype` /
+    // `Object.prototype` must take the descriptor-aware `js_array_push_f64_spec`
+    // route exactly as the statically typed push lowering does. The direct arm
+    // reads those conditions from the header word it already holds plus the
+    // sticky prototype-invalidation byte the generated guards use; the
+    // resolved arm asks the complete predicate.
+    let direct_plain = unsafe { crate::value::addr_class::try_read_gc_header(arr as usize) }
+        .filter(|header| {
+            header.obj_type == crate::gc::GC_TYPE_ARRAY
+                && header.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
+                && header._reserved & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS == 0
+                && super::PERRY_ARRAY_INDEX_FAST_PATH_INVALIDATED.load(Ordering::Relaxed) == 0
+        })
+        .and_then(|_| unsafe {
+            let length = (*arr).length;
+            let capacity = (*arr).capacity;
+            (length <= capacity && length <= 100_000_000).then_some(arr)
+        });
+    if let Some(cleaned) = direct_plain {
+        let pushed = unsafe { js_array_push_f64_resolved(cleaned, number) };
+        if !new_length.is_null() {
+            unsafe { *new_length = (*pushed).length };
+        }
+        return pushed;
+    }
+
+    if let Some(length) = crate::array::subclass::array_subclass_fast_push_u31_raw(arr, value) {
+        if !new_length.is_null() {
+            unsafe { *new_length = length as u32 };
+        }
+        return arr;
+    }
+
+    let cleaned = clean_arr_ptr_mut(arr);
+    if cleaned.is_null() || crate::array::array_iteration_is_exotic(cleaned) {
+        // Not handled here. An exotic receiver (indexed descriptors, an indexed
+        // prototype property, a registered buffer / typed-array view) needs the
+        // observable `Set`, and a receiver the resolver does not own (a Proxy,
+        // a foreign family) needs the complete public push — both can run user
+        // code through accessors or traps. This entry is classified
+        // allocate-but-never-reenter in `gc_call_effects`, so it must never
+        // reach those paths; the generated caller takes its complete guarded
+        // push (`js_array_push_guard` + `js_array_push_f64`) on a null result.
+        return std::ptr::null_mut();
+    }
+    let pushed = unsafe { js_array_push_f64_resolved(cleaned, number) };
+    if !new_length.is_null() {
+        unsafe { *new_length = (*pushed).length };
+    }
+    pushed
+}
+
+#[cfg(feature = "keepalive-anchors")]
+#[used]
+static KEEP_JS_ARRAY_PUSH_U31_WITH_LENGTH: extern "C" fn(
+    *mut ArrayHeader,
+    u32,
+    *mut u32,
+) -> *mut ArrayHeader = js_array_push_u31_with_length;
 
 /// User-observable `Array.prototype.push` for a statically known Array.
 ///
@@ -718,6 +851,16 @@ pub extern "C" fn js_array_push_f64(arr: *mut ArrayHeader, value: f64) -> *mut A
 pub extern "C" fn js_array_push_f64_spec(arr: *mut ArrayHeader, value: f64) -> *mut ArrayHeader {
     if array_ptr_as_proxy(arr).is_some() {
         return js_array_push_f64(arr, value);
+    }
+    // Object-backed Array subclass: the dense append needs neither the tracked
+    // resolver nor the exotic probe (both are classification misses for an
+    // OBJECT header); the string demote precedes the store as in
+    // `js_array_push_f64`.
+    if crate::array::array_receiver_gc_tag(arr).0 == crate::gc::GC_TYPE_OBJECT {
+        crate::string::js_string_addref_if_heap_string(value);
+        if crate::array::subclass::array_subclass_fast_push_one_raw(arr, value).is_some() {
+            return arr;
+        }
     }
     let cleaned = clean_arr_ptr_mut(arr);
     if cleaned.is_null() {
@@ -825,13 +968,12 @@ unsafe fn js_array_push_f64_grow(
     let value_handle = scope.root_nanbox_f64(value);
 
     let arr = js_array_grow(arr_handle.get_raw_mut_ptr::<ArrayHeader>(), length + 1);
-    let value = canonicalize_array_numeric_store_value(arr, value_handle.get_nanbox_f64());
-    let value_bits = value.to_bits();
-
-    let elements_ptr = (arr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut f64;
-    // GC_STORE_AUDIT(BARRIERED): grown push slot is immediately recorded via note_array_slot.
-    ptr::write(elements_ptr.add(length as usize), value);
-    note_array_slot(arr, length as usize, value_bits);
+    // SAFETY: `js_array_grow` returns the resolved live array head and no
+    // safepoint intervenes before the flag read/store.
+    let flags = array_object_flags_resolved(arr);
+    // GC_STORE_AUDIT(BARRIERED): the resolved store performs the layout note
+    // and write barrier as part of the slot write.
+    store_array_slot_resolved(arr, length as usize, value_handle.get_nanbox_f64(), flags);
     (*arr).length = length + 1;
     arr
 }
@@ -909,9 +1051,64 @@ pub extern "C" fn js_array_push_spread_f64(
 #[no_mangle]
 pub extern "C" fn js_array_pop_f64(arr: *mut ArrayHeader) -> f64 {
     const TAG_UNDEFINED_F64: f64 = f64::from_bits(0x7FFC_0000_0000_0001u64);
+    // The common plain-Array case can be completed from one live header read.
+    // `clean_arr_ptr_mut` is intentionally much stronger: it proves allocator
+    // ownership, follows forwarding chains, recognizes lazy/external storage,
+    // and validates several foreign receiver families.  That proof is needed
+    // by the generic public entry but redundant after the guards below have
+    // established the exact non-forwarded Array layout.
+    //
+    // A dense own final slot makes Get/Delete/Set(length) unobservable.  Any
+    // integrity/descriptor flag, indexed-prototype invalidation, hole,
+    // forwarding stub, empty receiver, or malformed bound declines to the
+    // unchanged algorithms below.  Leaving the retired physical word intact
+    // matches the existing dense branch later in this function; the logical
+    // length is the GC trace bound and a later push overwrites the word before
+    // publishing the larger length.
+    if let Some(header) = unsafe { crate::value::addr_class::try_read_gc_header(arr as usize) } {
+        let guarded_flags = crate::gc::OBJ_FLAG_FROZEN
+            | crate::gc::OBJ_FLAG_SEALED
+            | crate::gc::OBJ_FLAG_NO_EXTEND
+            | crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS;
+        if header.obj_type == crate::gc::GC_TYPE_ARRAY
+            && header.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
+            && header._reserved & guarded_flags == 0
+            && super::PERRY_ARRAY_INDEX_FAST_PATH_INVALIDATED.load(Ordering::Relaxed) == 0
+        {
+            unsafe {
+                let length = (*arr).length;
+                let capacity = (*arr).capacity;
+                // An empty plain array: `Set(O, "length", 0)` is a no-op on a
+                // writable length (`OBJ_FLAG_ARRAY_DESCRIPTORS` is where a
+                // non-writable one is recorded, and it is excluded above), and
+                // there is no index to Get or Delete — the answer is
+                // `undefined`. Without this arm the drained pool's
+                // `pool.pop() ?? []` ran the whole generic tower (subclass and
+                // plain-object probes, a tracked classification, the flag
+                // resolution) to reach the same `length == 0` return.
+                if length == 0 {
+                    return TAG_UNDEFINED_F64;
+                }
+                if length <= capacity && length <= 100_000_000 {
+                    let new_length = length - 1;
+                    let elements = (arr as *mut u8)
+                        .add(std::mem::size_of::<ArrayHeader>())
+                        .cast::<f64>();
+                    let value = ptr::read(elements.add(new_length as usize));
+                    if value.to_bits() != crate::value::TAG_HOLE {
+                        (*arr).length = new_length;
+                        return value;
+                    }
+                }
+            }
+        }
+    }
     // Borrowed array-like receiver (`obj.pop = Array.prototype.pop; obj.pop()`):
     // the thunk hands this dense helper the plain object pointer. Run the
     // spec-generic engine instead of reading the object as an `ArrayHeader`.
+    if let Some(value) = crate::array::subclass::array_subclass_fast_pop_raw(arr) {
+        return value;
+    }
     if let Some(recv) = crate::array::plain_object_value(arr) {
         return crate::array::generic_object_pop(recv);
     }
@@ -919,10 +1116,25 @@ pub extern "C" fn js_array_pop_f64(arr: *mut ArrayHeader) -> f64 {
     if arr.is_null() {
         return TAG_UNDEFINED_F64;
     }
-    if array_is_frozen(arr) {
-        throw_frozen_array_mutation();
+    // Resolve the header flags ONCE. `array_is_frozen`, `guard_writable_length`
+    // and `array_iteration_is_exotic` each re-ran `clean_arr_ptr` on the head
+    // this function had just resolved — three classifications per pop on an
+    // object pool's `pool.pop()`.
+    let plain_flags = unsafe { resolved_plain_array_flags(arr) };
+    match plain_flags {
+        Some(flags) => {
+            if flags & crate::gc::OBJ_FLAG_FROZEN != 0 {
+                throw_frozen_array_mutation();
+            }
+            guard_writable_length_with_flags(arr, flags);
+        }
+        None => {
+            if array_is_frozen(arr) {
+                throw_frozen_array_mutation();
+            }
+            guard_writable_length(arr);
+        }
     }
-    guard_writable_length(arr);
     unsafe {
         let length = (*arr).length;
         if length == 0 {
@@ -930,7 +1142,11 @@ pub extern "C" fn js_array_pop_f64(arr: *mut ArrayHeader) -> f64 {
         }
 
         let new_length = length - 1;
-        if !crate::array::array_iteration_is_exotic(arr) {
+        let exotic = match plain_flags {
+            Some(flags) => crate::array::array_iteration_is_exotic_resolved(arr, flags),
+            None => crate::array::array_iteration_is_exotic(arr),
+        };
+        if !exotic {
             let elements_ptr = (arr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut f64;
             let value = *elements_ptr.add(new_length as usize);
             (*arr).length = new_length;
@@ -995,8 +1211,62 @@ pub extern "C" fn js_array_pop_f64(arr: *mut ArrayHeader) -> f64 {
 /// non-throwing `[[DefineOwnProperty]]`/no-Throw contract. Only the assignment
 /// codegen paths (`field_set_by_name` / `property_set` / proxy `PutValue`) route
 /// here. test262 built-ins/Array length-write-on-frozen.
+/// `arr.length = 0` on a plain dense array, decided from one header read.
+///
+/// Both `length =` entries resolve the receiver through `clean_arr_ptr_mut`
+/// (allocator ownership, forwarding, the Buffer / typed-array registries),
+/// coerce the new length, resolve the flags a second time and probe the
+/// named-property table before reaching the plain-shrink branch — for an
+/// object pool's `pooled.length = 0` that tower was the whole cost, five
+/// thousand times a frame. Exactly the header facts the pop fast path proves
+/// are enough here: a `GC_TYPE_ARRAY` head that is not forwarded, none of the
+/// integrity / descriptor flags (a non-writable `length` is recorded under
+/// `OBJ_FLAG_ARRAY_DESCRIPTORS`, so neither entry has anything to throw), a
+/// dense `length <= capacity`, and no named properties. The work is the
+/// plain-shrink branch's, unchanged: holes over the retired prefix, the
+/// length, one layout rebuild. Anything else declines to the full entry.
+#[inline(always)]
+fn try_truncate_plain_array_to_zero(arr: *mut ArrayHeader) -> bool {
+    let Some(header) = (unsafe { crate::value::addr_class::try_read_gc_header(arr as usize) })
+    else {
+        return false;
+    };
+    let guarded_flags = crate::gc::OBJ_FLAG_FROZEN
+        | crate::gc::OBJ_FLAG_SEALED
+        | crate::gc::OBJ_FLAG_NO_EXTEND
+        | crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS;
+    if header.obj_type != crate::gc::GC_TYPE_ARRAY
+        || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
+        || header._reserved & guarded_flags != 0
+    {
+        return false;
+    }
+    unsafe {
+        let cur = (*arr).length;
+        if cur > (*arr).capacity || array_has_named_properties_resolved(arr) {
+            return false;
+        }
+        if cur == 0 {
+            return true;
+        }
+        let elements = (arr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut u64;
+        for i in 0..cur {
+            // GC_STORE_AUDIT(BARRIERED): the suffix becomes unreachable when
+            // length is published below; rebuild_array_layout then rebuilds
+            // the complete live-prefix layout/barrier state.
+            ptr::write(elements.add(i as usize), crate::value::TAG_HOLE);
+        }
+        (*arr).length = 0;
+        rebuild_array_layout(arr);
+    }
+    true
+}
+
 #[no_mangle]
 pub extern "C" fn js_array_set_length_strict(arr: *mut ArrayHeader, new_length: f64) {
+    if new_length.to_bits() == 0 && try_truncate_plain_array_to_zero(arr) {
+        return;
+    }
     let cleaned = clean_arr_ptr_mut(arr);
     if cleaned.is_null() {
         // #7574: `a.length = n` on a `class X extends Array` instance reached
@@ -1019,16 +1289,23 @@ pub extern "C" fn js_array_set_length_strict(arr: *mut ArrayHeader, new_length: 
 
 #[no_mangle]
 pub extern "C" fn js_array_set_length(arr: *mut ArrayHeader, new_length: f64) {
+    if new_length.to_bits() == 0 && try_truncate_plain_array_to_zero(arr) {
+        return;
+    }
     let arr = clean_arr_ptr_mut(arr);
     if arr.is_null() {
         return;
     }
     let n = array_length_from_property_value_or_throw(new_length);
-    let scope = crate::gc::RuntimeHandleScope::new();
-    let _arr_handle = scope.root_raw_mut_ptr(arr);
     unsafe {
         let cur = (*arr).length;
-        let flags = array_object_flags(arr);
+        // The head was resolved a line ago; read its flags directly when the
+        // header really is an array (the common case) instead of classifying
+        // it a second time through `array_object_flags`.
+        let flags = match resolved_plain_array_flags(arr) {
+            Some(flags) => flags,
+            None => array_object_flags(arr),
+        };
         if flags & crate::gc::OBJ_FLAG_FROZEN != 0 {
             return;
         }
@@ -1068,8 +1345,13 @@ pub extern "C" fn js_array_set_length(arr: *mut ArrayHeader, new_length: f64) {
             // three descriptor/expando probes for every removed element.
             if flags & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS == 0
                 && cur <= capacity
-                && !array_has_named_properties(arr)
+                && !array_has_named_properties_resolved(arr)
             {
+                // Plain shrink: nothing below can run user code or allocate
+                // on the GC heap (hole stores, a length write, a layout
+                // rebuild from the surviving slots), so the head needs no
+                // handle scope. `pooled.length = 0` in an object pool is this
+                // branch every time.
                 let elements = (arr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut u64;
                 for i in n..cur {
                     // GC_STORE_AUDIT(BARRIERED): the suffix becomes unreachable
@@ -1081,6 +1363,8 @@ pub extern "C" fn js_array_set_length(arr: *mut ArrayHeader, new_length: f64) {
                 rebuild_array_layout(arr);
                 return;
             }
+            let scope = crate::gc::RuntimeHandleScope::new();
+            let _arr_handle = scope.root_raw_mut_ptr(arr);
             if cur > capacity {
                 let mut sparse_indices: Vec<u32> = array_named_property_names(arr, false)
                     .into_iter()
@@ -1113,6 +1397,8 @@ pub extern "C" fn js_array_set_length(arr: *mut ArrayHeader, new_length: f64) {
             (*arr).length = n;
             refresh_array_numeric_layout(arr);
         } else if n > cur {
+            let scope = crate::gc::RuntimeHandleScope::new();
+            let _arr_handle = scope.root_raw_mut_ptr(arr);
             // Growing `length` creates holes conceptually; it must not allocate
             // a dense backing store proportional to the requested length.
             // Test262's descriptor probe writes 2^32-1 here. Keep large sparse

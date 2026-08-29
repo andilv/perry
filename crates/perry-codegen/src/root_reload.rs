@@ -201,6 +201,7 @@ const NON_COLLECTING: &[&str] = &[
     "js_write_barrier",
     "js_write_barrier_root_nanbox",
     "js_write_barrier_slot",
+    "js_write_barrier_slot_validated_parent",
     "js_gc_register_global_root",
     // pure value predicates / bit twiddling.
     //
@@ -233,6 +234,7 @@ const NON_COLLECTING: &[&str] = &[
     "js_tdz_suppress_end",
     "js_array_note_numeric_write",
     "js_array_declare_all_pointer_elements",
+    "js_array_live_head",
     "js_array_length",
     "js_object_mark_class",
     "js_class_object_pin_parent",

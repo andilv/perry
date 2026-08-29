@@ -290,17 +290,14 @@ pub extern "C" fn js_object_delete_field(
 
         // Search through the keys array for a match
         let key_count = crate::array::js_array_length(keys) as usize;
-        let mut found_idx: Option<usize> = None;
-        for i in 0..key_count {
-            let key_val = crate::array::js_array_get(keys, i as u32);
-            // #1781: SSO-aware match — pre-fix `delete obj.id` on an
-            // object whose `id` lived as an inline SSO key reported
-            // success vacuously without actually deleting anything.
-            if crate::string::js_string_key_matches(key_val, key) {
-                found_idx = Some(i);
-                break;
-            }
-        }
+        // #6759: shape-index + dense-slot scan (SSO-aware via the shared
+        // helper, preserving #1781). The old per-element `js_array_get` walk
+        // made every `delete` O(keys) full-accessor calls — measured as the
+        // dominant residue (16.0 M of 90.8 M accessor calls) after the
+        // [[Set]]/[[Get]] walks were fixed.
+        let found_idx: Option<usize> =
+            crate::object::keys_find_slot_by_key_ptr(keys, key_count as u32, key)
+                .map(|i| i as usize);
 
         let i = match found_idx {
             Some(i) => i,
@@ -517,6 +514,11 @@ pub extern "C" fn js_object_delete_dynamic_value(obj_value: f64, key: f64) -> i3
 /// Returns 1 if successful, 0 otherwise
 #[no_mangle]
 pub extern "C" fn js_object_delete_dynamic(obj: *mut ObjectHeader, key: f64) -> i32 {
+    if let Some((_, elements)) = unsafe { crate::array::subclass_elements::backed(obj as usize) } {
+        if let Some(elements_key) = crate::array::subclass_elements::key_of_value(key) {
+            return unsafe { crate::array::subclass_elements::delete_key(elements, elements_key) };
+        }
+    }
     // Proxy receiver (small registered id) — route through the proxy
     // `deleteProperty` trap before any key coercion that would deref the fake
     // pointer. Handles symbol keys too (the string path also funnels into

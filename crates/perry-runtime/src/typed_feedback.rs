@@ -954,6 +954,17 @@ pub extern "C" fn js_typed_feedback_object_get_field_by_name_f64(
     obj: *const ObjectHeader,
     key: *const crate::StringHeader,
 ) -> f64 {
+    // #5094's gate, which the property wrappers never got. Typed-feedback
+    // recording is OFF by default, and `guard_observe` / `record_fallback_call`
+    // both early-return in that mode — but the caller has already built the
+    // whole `Observation` to hand them, hashing the key and resolving the
+    // receiver's shape. On an isolated property-read loop that dead work was
+    // 10% of self time. Take the underlying op directly, exactly as the array
+    // index wrappers already do.
+    if !typed_feedback_enabled() {
+        return crate::object::js_object_get_field_by_name_f64(obj, key);
+    }
+
     let object_addr = normalize_raw_object_addr(obj as u64);
     let (shape_addr, class_id, gc_type) = object_shape(object_addr);
     let observation = Observation {
@@ -985,6 +996,17 @@ pub extern "C" fn js_typed_feedback_object_set_field_by_name(
     key: *const crate::StringHeader,
     value: f64,
 ) {
+    // #5094's gate, which the property wrappers never got. Typed-feedback
+    // recording is OFF by default, and `guard_observe` / `record_fallback_call`
+    // both early-return in that mode — but the caller has already built the
+    // whole `Observation` to hand them, hashing the key and resolving the
+    // receiver's shape. On an isolated property-read loop that dead work was
+    // 10% of self time. Take the underlying op directly, exactly as the array
+    // index wrappers already do.
+    if !typed_feedback_enabled() {
+        crate::object::js_object_set_field_by_name(obj, key, value);
+        return;
+    }
     let object_addr = normalize_raw_object_addr(obj as u64);
     let (shape_addr, class_id, gc_type) = object_shape(object_addr);
     let observation = Observation {
@@ -2082,6 +2104,20 @@ pub extern "C" fn js_typed_feedback_array_index_get_fallback_boxed(
         return f64::from_bits(TAG_UNDEFINED);
     }
 
+    // #8876: an object-backed `class X extends Array` instance carries
+    // `GC_TYPE_OBJECT`, so the guarded element tier rejects it and every
+    // canonical index on such a receiver lands here. Answer the proven dense
+    // subclass read first — the registry probes below cannot classify it, and
+    // the `GC_TYPE_OBJECT` arm stringifies the index into a by-name lookup
+    // (wolf-ecs `packed[sparse[x]]` on an `Archetype` paid `from_utf8` +
+    // string allocation per read). A receiver without a dense proof keeps the
+    // established path.
+    if let Some(index) = finite_nonnegative_u32_index(index) {
+        if let Some(value) = crate::array::array_subclass_fast_index_get(receiver, index) {
+            return value;
+        }
+    }
+
     if crate::typedarray::lookup_typed_array_kind(raw_addr).is_some() {
         return crate::typedarray::js_typed_array_index_get_dynamic(
             raw_addr as *const crate::typedarray::TypedArrayHeader,
@@ -2540,6 +2576,13 @@ pub extern "C" fn js_typed_feedback_array_set_index_or_string(
     idx: f64,
     value: f64,
 ) -> *mut ArrayHeader {
+    // #5094 for the assignment site: with recording off (the default) every
+    // helper below early-returns, but the index conversion and two
+    // out-of-line calls to reach those returns were 1.5% of an ECS frame on
+    // `column[index] = record`. One flag test, then the store.
+    if !typed_feedback_enabled() {
+        return crate::array::js_array_set_index_or_string_strict(arr, idx, value);
+    }
     let index = finite_nonnegative_u32_index(idx).unwrap_or(u32::MAX);
     observe_array(site_id, arr, index);
     if index == u32::MAX {
@@ -2560,6 +2603,17 @@ pub extern "C" fn js_typed_feedback_object_set_index_polymorphic(
     idx: f64,
     value: f64,
 ) {
+    // #5094's gate, which the property wrappers never got. Typed-feedback
+    // recording is OFF by default, and `guard_observe` / `record_fallback_call`
+    // both early-return in that mode — but the caller has already built the
+    // whole `Observation` to hand them, hashing the key and resolving the
+    // receiver's shape. On an isolated property-read loop that dead work was
+    // 10% of self time. Take the underlying op directly, exactly as the array
+    // index wrappers already do.
+    if !typed_feedback_enabled() {
+        crate::object::js_object_set_index_polymorphic(obj_handle, idx, value);
+        return;
+    }
     let index = finite_nonnegative_u32_index(idx).unwrap_or(u32::MAX);
     observe_array(site_id, obj_handle as *const ArrayHeader, index);
     record_guard_fail(site_id);

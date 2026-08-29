@@ -586,6 +586,15 @@ impl LlFunction {
     /// user code in the entry block, dominating every reachable use.
     /// The slot pointer is returned for the caller to load from at
     /// each subsequent allocation site.
+    /// An entry-block `ptr` slot initialized to `null`, for a value that is
+    /// resolved lazily at its first use (see `load_inline_arena_state`).
+    pub fn alloca_entry_null_ptr(&mut self) -> String {
+        let slot = self.alloca_entry(crate::types::PTR);
+        self.entry_allocas
+            .push(format!("  store ptr null, ptr {}", slot));
+        slot
+    }
+
     pub fn entry_init_call_ptr(&mut self, func_name: &str) -> String {
         let slot = self.alloca_entry(crate::types::PTR);
         let result_reg = format!("%r{}", self.reg_counter.next());
@@ -775,6 +784,12 @@ impl LlFunction {
     /// by `LlModule::define_function` for every function.
     pub(crate) fn set_preserve_none_fns(&self, fns: Rc<RefCell<HashSet<String>>>) {
         self.reg_counter.set_preserve_none_fns(fns);
+    }
+
+    /// Point this function's null-guard loads at the module's (possibly
+    /// module-prefixed) null-guard global. See `RegCounter::null_guard_symbol`.
+    pub(crate) fn set_null_guard_global(&self, global: &str) {
+        self.reg_counter.set_null_guard_global(global);
     }
 
     /// Whether this function's define header (and every declare of it) must

@@ -67,6 +67,45 @@ fn configured_module_codegen_jobs(total_modules: usize) -> (usize, usize) {
     (module_jobs, llvm_unit_jobs)
 }
 
+/// Whether `name` is metadata for an erased TypeScript declaration rather
+/// than a JavaScript binding in `module`.
+///
+/// Interfaces and type aliases remain in `Module::exports` so cross-module
+/// type resolution can follow re-export chains. Runtime namespace builders
+/// must filter them back out, while preserving declaration-merged names that
+/// also have a value binding.
+fn is_type_only_export_binding(module: &perry_hir::Module, name: &str) -> bool {
+    let has_type_declaration = module
+        .interfaces
+        .iter()
+        .any(|interface| interface.name == name)
+        || module.type_aliases.iter().any(|alias| alias.name == name);
+    if !has_type_declaration {
+        return false;
+    }
+
+    let has_runtime_value = module
+        .functions
+        .iter()
+        .any(|function| function.name == name)
+        || module
+            .exported_functions
+            .iter()
+            .any(|(exported, _)| exported == name)
+        || module
+            .exported_objects
+            .iter()
+            .any(|exported| exported == name)
+        || module.classes.iter().any(|class| class.name == name)
+        || module
+            .enums
+            .iter()
+            .any(|enumeration| enumeration.name == name)
+        || module.globals.iter().any(|global| global.name == name);
+
+    !has_runtime_value
+}
+
 // OpenCode's 0.5--1.0 MiB generated chunks routinely lower to 20--45 MiB of
 // LLVM input even with fewer than 1,000 HIR callables. Treat that observed
 // range as memory-heavy too: ordinary modules still use outer parallelism,
@@ -271,6 +310,11 @@ fn imported_class_from_hir(
                     .is_some_and(|param| param.arguments_object.is_some())
             })
             .collect(),
+        method_arguments_length_only: class
+            .methods
+            .iter()
+            .map(perry_codegen::method_supports_arguments_length_direct_abi)
+            .collect(),
         static_field_names: class
             .static_fields
             .iter()
@@ -371,6 +415,7 @@ fn imported_object_literal_from_capability(
         method_param_counts: Vec::new(),
         method_has_rest: Vec::new(),
         method_has_synthetic_arguments: Vec::new(),
+        method_arguments_length_only: Vec::new(),
         static_field_names: Vec::new(),
         static_method_names: Vec::new(),
         static_method_return_types: Vec::new(),
@@ -918,6 +963,17 @@ pub fn run_with_parse_cache(
 
     let i18n_table = apply_i18n_pass(&mut ctx, i18n_config.as_ref(), &i18n_translations, format);
 
+    // Module-level const literals fold into their reads only now, after the
+    // whole transform phase: every cross-module harvest has been taken from
+    // the unfolded bodies, so no inlining decision moves, while the typed-ABI
+    // clone rules and the lowering see the literal (a one-line predicate
+    // comparing against an `export const` earns its typed clone). This runs
+    // before the HIR trace and before the object-cache fingerprint, so both
+    // describe exactly what codegen consumes.
+    for hir_module in ctx.native_modules.values_mut() {
+        perry_transform::module_const_fold::run(hir_module);
+    }
+
     if trace_hir {
         dump_hir_for_debug(&ctx, args.focus.as_deref());
     }
@@ -1101,6 +1157,223 @@ pub fn run_with_parse_cache(
         for (path, imported_enums_for_module) in &module_enums {
             if let Some(hir_module) = ctx.native_modules.get_mut(path) {
                 perry_hir::fix_imported_enums(hir_module, imported_enums_for_module);
+            }
+        }
+    }
+
+    // Resolve imported and generic type-alias references in every module's
+    // type positions (`perry_hir::type_alias_resolve`). Per-module lowering
+    // only settles a non-generic, same-module alias; `import type { EntityId }
+    // from "../entity"` and `EntityId<T>` stayed `Named`/`Generic` and erased
+    // the branded-primitive shape they spell. Exported aliases are keyed by
+    // (defining path, exported name) and followed through barrels exactly like
+    // the enum fix-up above, so a local binding resolves only to the alias its
+    // import actually names. Alias bodies are closed against their own
+    // module's scope before any consumer is rewritten.
+    {
+        let mut exported_aliases: BTreeMap<(String, String), perry_hir::AliasDef> = BTreeMap::new();
+        for (path, hir_module) in &ctx.native_modules {
+            let path_str = path.to_string_lossy().to_string();
+            for alias in &hir_module.type_aliases {
+                if alias.is_exported {
+                    exported_aliases.insert(
+                        (path_str.clone(), alias.name.clone()),
+                        perry_hir::AliasDef {
+                            params: alias.type_params.clone(),
+                            ty: alias.ty.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        loop {
+            let mut new_entries: Vec<((String, String), perry_hir::AliasDef)> = Vec::new();
+            for (path, hir_module) in &ctx.native_modules {
+                let path_str = path.to_string_lossy().to_string();
+                for export in &hir_module.exports {
+                    let re_export = match export {
+                        perry_hir::Export::ExportAll { source } => Some((source.as_str(), None)),
+                        perry_hir::Export::ReExport {
+                            source,
+                            imported,
+                            exported,
+                        } => Some((
+                            source.as_str(),
+                            Some((imported.as_str(), exported.as_str())),
+                        )),
+                        _ => None,
+                    };
+                    let Some((source, names)) = re_export else {
+                        continue;
+                    };
+                    let Some((resolved_source, _)) = resolve_import(
+                        source,
+                        path,
+                        &ctx.project_root,
+                        &ctx.compile_packages,
+                        &ctx.compile_package_dirs,
+                    ) else {
+                        continue;
+                    };
+                    let source_path_str = resolved_source.to_string_lossy().to_string();
+                    for ((src_path, alias_name), def) in &exported_aliases {
+                        if src_path != &source_path_str {
+                            continue;
+                        }
+                        let (propagate, exported_name) = match names {
+                            Some((imported, exported)) => {
+                                (alias_name == imported, exported.to_string())
+                            }
+                            None => (true, alias_name.clone()),
+                        };
+                        if propagate {
+                            let key = (path_str.clone(), exported_name);
+                            if !exported_aliases.contains_key(&key)
+                                && !new_entries.iter().any(|(k, _)| k == &key)
+                            {
+                                new_entries.push((key, def.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+            if new_entries.is_empty() {
+                break;
+            }
+            for (key, def) in new_entries {
+                exported_aliases.insert(key, def);
+            }
+        }
+
+        // Per-module scope tables: own declarations plus imported bindings.
+        let mut tables: BTreeMap<PathBuf, perry_hir::AliasTable> = BTreeMap::new();
+        for (path, hir_module) in &ctx.native_modules {
+            let mut table = perry_hir::AliasTable::new();
+            for alias in &hir_module.type_aliases {
+                table.insert(
+                    alias.name.clone(),
+                    perry_hir::AliasDef {
+                        params: alias.type_params.clone(),
+                        ty: alias.ty.clone(),
+                    },
+                );
+            }
+            for import in &hir_module.imports {
+                if import.module_kind != perry_hir::ModuleKind::NativeCompiled {
+                    continue;
+                }
+                let Some(resolved_path) = &import.resolved_path else {
+                    continue;
+                };
+                for spec in &import.specifiers {
+                    let (local_name, exported_name) = match spec {
+                        perry_hir::ImportSpecifier::Named { imported, local } => {
+                            (local.clone(), imported.clone())
+                        }
+                        perry_hir::ImportSpecifier::Default { local } => {
+                            (local.clone(), local.clone())
+                        }
+                        perry_hir::ImportSpecifier::Namespace { .. } => continue,
+                    };
+                    if let Some(def) = exported_aliases.get(&(resolved_path.clone(), exported_name))
+                    {
+                        table.entry(local_name).or_insert_with(|| def.clone());
+                    }
+                }
+            }
+            if !table.is_empty() {
+                tables.insert(path.clone(), table);
+            }
+        }
+
+        // Close alias bodies in their defining scope (`ComponentId<T>` spells
+        // `EntityId<T, "component">`, which spells `number`), then refresh the
+        // imported copies. Chains are short; the bound only guards a cycle.
+        for _ in 0..8 {
+            let mut changed = false;
+            let mut closed: BTreeMap<(String, String), perry_hir::AliasDef> = BTreeMap::new();
+            for (path, hir_module) in &ctx.native_modules {
+                let Some(table) = tables.get(path) else {
+                    continue;
+                };
+                let path_str = path.to_string_lossy().to_string();
+                for alias in &hir_module.type_aliases {
+                    let Some(def) = table.get(&alias.name) else {
+                        continue;
+                    };
+                    let resolved = perry_hir::type_alias_resolve::resolve_type(&def.ty, table);
+                    if resolved != def.ty {
+                        changed = true;
+                    }
+                    closed.insert(
+                        (path_str.clone(), alias.name.clone()),
+                        perry_hir::AliasDef {
+                            params: def.params.clone(),
+                            ty: resolved,
+                        },
+                    );
+                }
+            }
+            if !changed {
+                break;
+            }
+            for (key, def) in &closed {
+                if let Some(existing) = exported_aliases.get_mut(key) {
+                    *existing = def.clone();
+                }
+            }
+            // Re-exported copies share the defining alias's body.
+            let mut by_body: Vec<((String, String), perry_hir::AliasDef)> = Vec::new();
+            for (key, def) in &exported_aliases {
+                for (ckey, cdef) in &closed {
+                    if ckey != key && def.params == cdef.params && def.ty == cdef.ty {
+                        by_body.push((key.clone(), cdef.clone()));
+                    }
+                }
+            }
+            for (key, def) in by_body {
+                exported_aliases.insert(key, def);
+            }
+            for (path, hir_module) in &ctx.native_modules {
+                let Some(table) = tables.get_mut(path) else {
+                    continue;
+                };
+                let path_str = path.to_string_lossy().to_string();
+                for alias in &hir_module.type_aliases {
+                    if let Some(def) = closed.get(&(path_str.clone(), alias.name.clone())) {
+                        table.insert(alias.name.clone(), def.clone());
+                    }
+                }
+                for import in &hir_module.imports {
+                    if import.module_kind != perry_hir::ModuleKind::NativeCompiled {
+                        continue;
+                    }
+                    let Some(resolved_path) = &import.resolved_path else {
+                        continue;
+                    };
+                    for spec in &import.specifiers {
+                        let (local_name, exported_name) = match spec {
+                            perry_hir::ImportSpecifier::Named { imported, local } => {
+                                (local.clone(), imported.clone())
+                            }
+                            perry_hir::ImportSpecifier::Default { local } => {
+                                (local.clone(), local.clone())
+                            }
+                            perry_hir::ImportSpecifier::Namespace { .. } => continue,
+                        };
+                        if let Some(def) =
+                            exported_aliases.get(&(resolved_path.clone(), exported_name))
+                        {
+                            table.insert(local_name, def.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        for (path, table) in &tables {
+            if let Some(hir_module) = ctx.native_modules.get_mut(path) {
+                perry_hir::resolve_type_aliases_in_module(hir_module, table);
             }
         }
     }
@@ -1392,25 +1665,40 @@ pub fn run_with_parse_cache(
     for (path, hir_module) in &ctx.native_modules {
         let path_str = path.to_string_lossy().to_string();
         let exports = all_module_exports.entry(path_str.clone()).or_default();
+        // `is_exported` and `exported_objects` also mark PRIVATE backing names
+        // that need cross-module symbols. For `function _null() {}; export {
+        // _null as null }`, `_null` is link-visible but is not a public module
+        // export. Derive the namespace surface from the consumer-visible side
+        // of `Export::Named` so an alias does not publish both names (#8904).
+        let public_named_exports: std::collections::HashSet<&str> = hir_module
+            .exports
+            .iter()
+            .filter_map(|export| match export {
+                perry_hir::Export::Named { exported, .. } => Some(exported.as_str()),
+                _ => None,
+            })
+            .collect();
         // Exported functions
         for func in &hir_module.functions {
-            if func.is_exported {
+            if func.is_exported && public_named_exports.contains(func.name.as_str()) {
                 exports.insert(func.name.clone(), path_str.clone());
             }
         }
         // Exported objects (export const x = { ... })
         for obj_name in &hir_module.exported_objects {
-            exports.insert(obj_name.clone(), path_str.clone());
+            if public_named_exports.contains(obj_name.as_str()) {
+                exports.insert(obj_name.clone(), path_str.clone());
+            }
         }
         // Exported classes
         for class in &hir_module.classes {
-            if class.is_exported {
+            if class.is_exported && public_named_exports.contains(class.name.as_str()) {
                 exports.insert(class.name.clone(), path_str.clone());
             }
         }
         // Exported enums
         for en in &hir_module.enums {
-            if en.is_exported {
+            if en.is_exported && public_named_exports.contains(en.name.as_str()) {
                 exports.insert(en.name.clone(), path_str.clone());
             }
         }
@@ -1422,40 +1710,10 @@ pub fn run_with_parse_cache(
         // resolves to a bogus closure value that breaks consumers enumerating
         // the namespace (drizzle's `drizzle(pool, { schema })`, where the schema
         // module also `export type Customer = …` alongside the real tables).
-        // A name that is ALSO a value export (declaration merging, a class)
-        // stays — only names that are exclusively types are dropped.
-        let value_export_names: std::collections::HashSet<&str> = hir_module
-            .functions
-            .iter()
-            .filter(|f| f.is_exported)
-            .map(|f| f.name.as_str())
-            .chain(hir_module.exported_objects.iter().map(|s| s.as_str()))
-            .chain(
-                hir_module
-                    .classes
-                    .iter()
-                    .filter(|c| c.is_exported)
-                    .map(|c| c.name.as_str()),
-            )
-            .chain(
-                hir_module
-                    .enums
-                    .iter()
-                    .filter(|e| e.is_exported)
-                    .map(|e| e.name.as_str()),
-            )
-            .collect();
-        let type_only_export_names: std::collections::HashSet<String> = hir_module
-            .type_aliases
-            .iter()
-            .map(|t| t.name.clone())
-            .chain(hir_module.interfaces.iter().map(|i| i.name.clone()))
-            .filter(|n| !value_export_names.contains(n.as_str()))
-            .collect();
         // Named exports (export { foo, bar as baz })
         for export in &hir_module.exports {
             if let perry_hir::Export::Named { local, exported } = export {
-                if type_only_export_names.contains(exported) {
+                if is_type_only_export_binding(hir_module, local) {
                     continue;
                 }
                 exports.insert(exported.clone(), path_str.clone());
@@ -2426,6 +2684,18 @@ pub fn run_with_parse_cache(
         for fe in flat {
             // Locate source module's HIR (where the binding lives).
             let source_mod = module_name_to_module.get(&fe.source_module);
+            // `flatten_exports` intentionally retains interfaces and aliases
+            // so the type resolver can follow their barrel chains. A dynamic
+            // import or nested namespace re-export is a JavaScript object,
+            // though, and must not expose those erased declarations as own
+            // enumerable properties with `undefined` values (#8904).
+            if fe.nested_namespace_of.is_none()
+                && source_mod
+                    .map(|module| is_type_only_export_binding(module, &fe.source_local))
+                    .unwrap_or(false)
+            {
+                continue;
+            }
             let source_prefix = source_mod
                 .map(|m| sanitize_module_name(&m.name))
                 .unwrap_or_else(|| sanitize_module_name(&fe.source_module));
@@ -6607,7 +6877,14 @@ pub fn run_with_parse_cache(
             // everything in the plugin itself.
             cmd.arg("/defaultlib:libcmt");
         } else {
-            cmd.arg("-o").arg(&exe_path);
+            // Linux also needs the system libraries the executable link has
+            // always carried (`-lm -lpthread -ldl`): LLVM lowers the math
+            // intrinsics in generated closures to libm calls, and glibc's
+            // `floor`/`log10` live in libm.so, so a real-app ELF dylib link
+            // failed with `undefined reference to 'floor'` (#8942). They go
+            // AFTER the objects — GNU ld only resolves what precedes a `-l`.
+            // macOS gets libm through the implicit `-lSystem`.
+            link::push_unix_dylib_output(&mut cmd, is_linux, &exe_path);
         }
 
         let status = tool_output::run_internal_tool(&mut cmd, verbose)?;
