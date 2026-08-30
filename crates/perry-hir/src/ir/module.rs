@@ -54,22 +54,24 @@ pub struct Module {
     /// add dynamic-property-helper calls to module init for pure programs. Set
     /// at lowering from the installed module source.
     pub references_global_this: bool,
-    /// #5848: names of Annex B block-nested top-level `function`
-    /// declarations (`{ function f(){} }`, `if (c) function f(){}`,
-    /// `switch (x) { case 1: function f(){} }`, directly in sloppy global
-    /// code) that need an early `undefined`-valued, non-configurable global
-    /// property — GlobalDeclarationInstantiation's `CreateGlobalVarBinding`
-    /// (B.3.3.2 step 5.b.i) runs before any top-level statement executes, so
-    /// the property must already exist (as `undefined`) ahead of the block
-    /// that later assigns the real function. Excludes names already covered
-    /// by a same-named bare top-level function declaration (already
-    /// reflected with its real value via `script_global_functions`). Codegen
-    /// emits these unconditionally for a non-ESM entry program (not gated on
-    /// `references_global_this`: the pattern is rare enough that the extra
-    /// reflection call is not a meaningful per-program cost).
+    /// Script-level `var` bindings and Annex B block-nested top-level function
+    /// declarations that need an early `undefined`-valued, non-configurable
+    /// global property. GlobalDeclarationInstantiation's
+    /// `CreateGlobalVarBinding` runs before any top-level statement executes;
+    /// later value mirrors must update this property without creating it with
+    /// the ordinary assignment attributes. Excludes names covered by a
+    /// same-named bare top-level function declaration, whose entry value is
+    /// emitted separately through `script_global_functions`.
     pub annexb_global_undefined_names: Vec<String>,
     /// Top-level statements to execute
     pub init: Vec<Stmt>,
+    /// Lexical bindings from multi-declarator classic `for` heads.
+    ///
+    /// HIR has one `For::init` statement slot, so these declarations are
+    /// emitted immediately before the loop. Codegen still needs to recognize
+    /// them as per-iteration bindings when deciding whether a closure capture
+    /// is a snapshot or a shared box.
+    pub classic_for_lexical_bindings: std::collections::HashSet<crate::types::LocalId>,
     /// Exported native module instances: (export_name, module_name, class_name)
     /// This tracks variables like `export const pool = new Pool(...)` from pg
     pub exported_native_instances: Vec<(String, String, String)>,
@@ -188,6 +190,7 @@ impl Module {
             references_global_this: false,
             annexb_global_undefined_names: Vec::new(),
             init: Vec::new(),
+            classic_for_lexical_bindings: std::collections::HashSet::new(),
             exported_native_instances: Vec::new(),
             exported_func_return_native_instances: Vec::new(),
             exported_objects: Vec::new(),

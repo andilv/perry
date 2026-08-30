@@ -123,6 +123,7 @@ fn module_with_classes_and_params(
             was_unrolled: false,
         }],
         init: Vec::new(),
+        classic_for_lexical_bindings: std::collections::HashSet::new(),
         exported_native_instances: Vec::new(),
         exported_func_return_native_instances: Vec::new(),
         exported_objects: Vec::new(),
@@ -2445,19 +2446,37 @@ fn packed_f64_loop_store_update_versions_with_side_exit() {
         ir.contains("for.packed_f64_fast") && ir.contains("for.packed_f64_slow"),
         "safe store-update loop should emit fast and slow clones:\n{ir}"
     );
+    // The fast clone's store is the inline range store: a nanbox tag check on
+    // the RHS value plus a raw `store double` — NO per-store runtime call. The
+    // per-iteration `js_typed_feedback_numeric_array_index_set_guard` (and the
+    // `js_array_numeric_value_to_raw_f64` canonicalization call) it used to
+    // keep made the "fast" clone slower than the plain per-store diamond
+    // (9.1 vs 3.3 ns/store); every check the guard performed is proven by the
+    // loop-entry guard + the loop bound (`i < arr.length`, offset-0 index).
+    let fast_start = ir
+        .find("for.packed_f64_fast")
+        .expect("expected packed-f64 fast clone");
+    let fast_end = ir
+        .find("for.packed_f64_slow")
+        .expect("expected packed-f64 slow clone");
+    let fast_clone = &ir[fast_start..fast_end];
     assert!(
-        ir.contains("call i32 @js_typed_feedback_numeric_array_index_set_guard"),
-        "fast store should keep a runtime numeric/layout store guard:\n{ir}"
+        !fast_clone.contains("call i32 @js_typed_feedback_numeric_array_index_set_guard"),
+        "packed fast clone must not keep a per-store runtime guard call:\n{fast_clone}\n\n{ir}"
     );
     assert!(
-        ir.contains("call double @js_array_numeric_value_to_raw_f64"),
-        "fast store should canonicalize numeric values before raw f64 storage:\n{ir}"
+        !fast_clone.contains("call double @js_array_numeric_value_to_raw_f64"),
+        "packed fast clone must not canonicalize per store — boxed values side-exit:\n{fast_clone}\n\n{ir}"
+    );
+    assert!(
+        fast_clone.contains("packed_f64_range_store.fast"),
+        "packed fast clone should store through the inline range-store block:\n{fast_clone}\n\n{ir}"
     );
 
     let fallback_start = ir
-        .find("\npacked_f64_loop_store.fallback.")
+        .find("\npacked_f64_range_store.side_exit.")
         .map(|pos| pos + 1)
-        .expect("expected packed-f64 store fallback block");
+        .expect("expected packed-f64 store side-exit block");
     let fallback_tail = &ir[fallback_start..];
     let fallback_end = fallback_tail
         .find("\n\n")
@@ -2466,7 +2485,7 @@ fn packed_f64_loop_store_update_versions_with_side_exit() {
     let fallback_block = &ir[fallback_start..fallback_end];
     assert!(
         fallback_block.contains("br label %packed_f64.loop.slow.preheader."),
-        "packed store guard failure must side-exit to the slow clone preheader:\n{fallback_block}\n\n{ir}"
+        "packed store value-check failure must side-exit to the slow clone preheader:\n{fallback_block}\n\n{ir}"
     );
     assert!(
         !fallback_block.contains("js_typed_feedback_array_index_set_fallback_boxed"),
@@ -2512,8 +2531,8 @@ fn packed_f64_loop_store_update_versions_with_side_exit() {
     );
     assert!(
         records.iter().any(|record| {
-            record["expr_kind"] == "PackedF64LoopStore"
-                && record["consumer"] == "packed_f64_loop_store"
+            record["expr_kind"] == "PackedF64RangeLoopStore"
+                && record["consumer"] == "packed_f64_range_loop_store"
                 && record["access_mode"] == "checked_native"
                 && record["notes"].as_array().is_some_and(|notes| {
                     notes
@@ -2522,12 +2541,12 @@ fn packed_f64_loop_store_update_versions_with_side_exit() {
                 })
                 && record_has_raw_f64_layout_fact(record, "consumed_facts", "consumed")
         }),
-        "expected checked packed raw-f64 loop store record:\n{artifact:#}"
+        "expected checked packed raw-f64 range-store record:\n{artifact:#}"
     );
     assert!(
         records.iter().any(|record| {
-            record["expr_kind"] == "PackedF64LoopStore"
-                && record["consumer"] == "packed_f64_loop_store_side_exit"
+            record["expr_kind"] == "PackedF64RangeLoopStore"
+                && record["consumer"] == "packed_f64_range_loop_store_side_exit"
                 && record["access_mode"] == "dynamic_fallback"
                 && record["materialization_reason"] == "runtime_api"
                 && record["fallback_reason"] == "runtime_api"
@@ -2537,9 +2556,212 @@ fn packed_f64_loop_store_update_versions_with_side_exit() {
                         .any(|note| note == "store_guard_failure=side_exit_slow_restart")
                 })
                 && record_has_raw_f64_layout_fact(record, "rejected_facts", "rejected")
-                && record_has_raw_f64_layout_fact(record, "rejected_facts", "invalidated")
         }),
         "expected packed store side-exit fallback evidence:\n{artifact:#}"
+    );
+}
+
+#[test]
+fn masked_window_dense_store_inlines_raw_store_without_calls() {
+    // `for (let i = 0; i < 64; i++) a[i & 7] = i` — a masked static-window
+    // store whose RHS is the canonical-i32 counter. The dense range loop must
+    // admit it: ONE f64 dense guard at entry (never the i32 tier — a store
+    // could break its all-slots-i32 loading proof), and a fast clone whose
+    // store is a bare in-window `store double` with NO per-store runtime
+    // call, no value check, no barrier.
+    let bitand = |left: Expr, right: Expr| Expr::Binary {
+        op: BinaryOp::BitAnd,
+        left: Box::new(left),
+        right: Box::new(right),
+    };
+    let module = module_with_classes_and_params(
+        "masked_window_dense_store.ts",
+        Vec::new(),
+        Vec::new(),
+        Type::Number,
+        vec![
+            number_array_let(1, "values", vec![1, 2, 3, 4, 5, 6, 7, 8]),
+            for_loop(
+                4,
+                int(64),
+                vec![array_set(1, bitand(local(4), int(7)), local(4))],
+            ),
+            Stmt::Return(Some(index_get(1, int(0)))),
+        ],
+    );
+
+    let ir = compile_ir_for_module_with_opts(module.clone(), empty_opts()).unwrap();
+    assert!(
+        ir.contains("call i32 @js_typed_feedback_packed_f64_range_loop_guard_dense"),
+        "masked store loop should get the f64 dense range guard:\n{ir}"
+    );
+    assert!(
+        !ir.contains("call i32 @js_typed_feedback_packed_f64_range_loop_guard_dense_i32"),
+        "a store-admitting dense loop must skip the i32 guard tier:\n{ir}"
+    );
+    // Line-anchored: label REFERENCES (`br label %for.packed_f64_range_fast...`)
+    // appear mid-line long before the block definitions, which start at
+    // column 0.
+    let fast_start = ir
+        .find("\nfor.packed_f64_range_fast")
+        .map(|pos| pos + 1)
+        .expect("expected dense fast clone");
+    let fast_region_end = ir[fast_start..]
+        .find("\nfor.packed_f64_range_slow")
+        .map(|off| fast_start + off)
+        .unwrap_or(ir.len());
+    let fast_clone = &ir[fast_start..fast_region_end];
+    for forbidden in [
+        "js_typed_feedback_numeric_array_index_set_guard",
+        "js_typed_feedback_array_set_f64_extend",
+        "js_array_numeric_value_to_raw_f64",
+        "js_dyn_index_set_strict",
+        "js_write_barrier",
+    ] {
+        assert!(
+            !fast_clone.contains(forbidden),
+            "dense fast clone must not call {forbidden}:\n{fast_clone}\n\n{ir}"
+        );
+    }
+    assert!(
+        fast_clone.contains("store double"),
+        "dense fast clone should store raw doubles inline:\n{fast_clone}\n\n{ir}"
+    );
+
+    let artifact = compile_artifact_json_for_module(module);
+    let records = artifact["records"].as_array().unwrap();
+    assert!(
+        records.iter().any(|record| {
+            record["expr_kind"] == "MaskedWindowStore"
+                && record["consumer"] == "packed_f64_masked_window_store"
+                && record["access_mode"] == "checked_native"
+                && record_has_raw_f64_layout_fact(record, "consumed_facts", "consumed")
+        }),
+        "expected a checked masked-window store record:\n{artifact:#}"
+    );
+}
+
+#[test]
+fn masked_window_dense_store_admits_float_arithmetic_rhs() {
+    // `a[i & 7] = a[(i + 1) & 7] + 0.5` — arithmetic over admitted operands
+    // (an in-window masked load and a literal). The fast clone must stay
+    // call-free: the RHS lowers to a raw in-window load plus a bare `fadd`,
+    // and the store stays the inline range store. This pins the predicate's
+    // central claim — that admitted arithmetic never routes through a
+    // boxed-result helper.
+    let bitand = |left: Expr, right: Expr| Expr::Binary {
+        op: BinaryOp::BitAnd,
+        left: Box::new(left),
+        right: Box::new(right),
+    };
+    let module = module_with_classes_and_params(
+        "masked_window_dense_store_arith.ts",
+        Vec::new(),
+        Vec::new(),
+        Type::Number,
+        vec![
+            number_array_let(1, "values", vec![1, 2, 3, 4, 5, 6, 7, 8]),
+            for_loop(
+                4,
+                int(64),
+                vec![array_set(
+                    1,
+                    bitand(local(4), int(7)),
+                    add(
+                        index_get(1, bitand(add(local(4), int(1)), int(7))),
+                        number(0.5),
+                    ),
+                )],
+            ),
+            Stmt::Return(Some(index_get(1, int(0)))),
+        ],
+    );
+
+    let ir = compile_ir_for_module_with_opts(module.clone(), empty_opts()).unwrap();
+    assert!(
+        ir.contains("call i32 @js_typed_feedback_packed_f64_range_loop_guard_dense"),
+        "arith masked store loop should get the f64 dense range guard:\n{ir}"
+    );
+    let fast_start = ir
+        .find("\nfor.packed_f64_range_fast")
+        .map(|pos| pos + 1)
+        .expect("expected dense fast clone");
+    let fast_region_end = ir[fast_start..]
+        .find("\nfor.packed_f64_range_slow")
+        .map(|off| fast_start + off)
+        .unwrap_or(ir.len());
+    let fast_clone = &ir[fast_start..fast_region_end];
+    for forbidden in [
+        "js_typed_feedback_numeric_array_index_set_guard",
+        "js_typed_feedback_array_set_f64_extend",
+        "js_add",
+        "js_dyn_index_set_strict",
+    ] {
+        assert!(
+            !fast_clone.contains(forbidden),
+            "arith dense fast clone must not call {forbidden}:\n{fast_clone}\n\n{ir}"
+        );
+    }
+    assert!(
+        fast_clone.contains("fadd double") && fast_clone.contains("store double"),
+        "arith dense fast clone should be a raw load + fadd + raw store:\n{fast_clone}\n\n{ir}"
+    );
+
+    let artifact = compile_artifact_json_for_module(module);
+    let records = artifact["records"].as_array().unwrap();
+    assert!(
+        records.iter().any(|record| {
+            record["expr_kind"] == "MaskedWindowStore"
+                && record["consumer"] == "packed_f64_masked_window_store"
+                && record["access_mode"] == "checked_native"
+        }),
+        "expected a checked masked-window store record for the arith RHS:\n{artifact:#}"
+    );
+}
+
+#[test]
+fn masked_window_dense_store_rejects_unproven_rhs() {
+    // Same loop, but the RHS is a plain number PARAMETER — numeric by type
+    // yet potentially INT32-boxed at runtime, and dense mode has no side
+    // exits to catch that. The matcher must refuse the store (no
+    // masked-store record, no dense store admission); the store keeps a
+    // guarded/generic lowering instead.
+    let bitand = |left: Expr, right: Expr| Expr::Binary {
+        op: BinaryOp::BitAnd,
+        left: Box::new(left),
+        right: Box::new(right),
+    };
+    let module = module_with_classes_and_params(
+        "masked_window_dense_store_reject.ts",
+        Vec::new(),
+        vec![Param {
+            id: 9,
+            name: "v".to_string(),
+            ty: Type::Number,
+            default: None,
+            decorators: Vec::new(),
+            is_rest: false,
+            arguments_object: None,
+        }],
+        Type::Number,
+        vec![
+            number_array_let(1, "values", vec![1, 2, 3, 4, 5, 6, 7, 8]),
+            for_loop(
+                4,
+                int(64),
+                vec![array_set(1, bitand(local(4), int(7)), local(9))],
+            ),
+            Stmt::Return(Some(index_get(1, int(0)))),
+        ],
+    );
+
+    let artifact = compile_artifact_json_for_module(module);
+    let records = artifact["records"].as_array().unwrap();
+    assert!(
+        !records
+            .iter()
+            .any(|record| record["expr_kind"] == "MaskedWindowStore"),
+        "an unproven RHS must not reach the masked-window raw store:\n{artifact:#}"
     );
 }
 
@@ -2965,15 +3187,28 @@ fn packed_f64_loop_unary_math_store_versions_with_side_exit() {
         !fast_body.contains("js_math_to_number"),
         "packed fast body must not route Math.abs(arr[i]) through JSValue ToNumber:\n{fast_body}\n\n{ir}"
     );
+    // The fast clone stores through the inline range store (see the
+    // store-update twin above): no per-store guard call remains in it.
+    let fast_start = ir
+        .find("for.packed_f64_fast")
+        .expect("expected packed-f64 fast clone");
+    let fast_end = ir
+        .find("for.packed_f64_slow")
+        .expect("expected packed-f64 slow clone");
+    let fast_clone = &ir[fast_start..fast_end];
     assert!(
-        ir.contains("call i32 @js_typed_feedback_numeric_array_index_set_guard"),
-        "fast unary math store should keep a runtime numeric/layout store guard:\n{ir}"
+        !fast_clone.contains("call i32 @js_typed_feedback_numeric_array_index_set_guard"),
+        "unary math packed fast clone must not keep a per-store runtime guard call:\n{fast_clone}\n\n{ir}"
+    );
+    assert!(
+        fast_clone.contains("packed_f64_range_store.fast"),
+        "unary math packed fast clone should store through the inline range-store block:\n{fast_clone}\n\n{ir}"
     );
 
     let fallback_start = ir
-        .find("\npacked_f64_loop_store.fallback.")
+        .find("\npacked_f64_range_store.side_exit.")
         .map(|pos| pos + 1)
-        .expect("expected packed-f64 store fallback block");
+        .expect("expected packed-f64 store side-exit block");
     let fallback_tail = &ir[fallback_start..];
     let fallback_end = fallback_tail
         .find("\n\n")
@@ -3009,8 +3244,8 @@ fn packed_f64_loop_unary_math_store_versions_with_side_exit() {
     );
     assert!(
         records.iter().any(|record| {
-            record["expr_kind"] == "PackedF64LoopStore"
-                && record["consumer"] == "packed_f64_loop_store"
+            record["expr_kind"] == "PackedF64RangeLoopStore"
+                && record["consumer"] == "packed_f64_range_loop_store"
                 && record["access_mode"] == "checked_native"
                 && record["notes"].as_array().is_some_and(|notes| {
                     notes
@@ -3022,17 +3257,16 @@ fn packed_f64_loop_unary_math_store_versions_with_side_exit() {
                 })
                 && record_has_raw_f64_layout_fact(record, "consumed_facts", "consumed")
         }),
-        "expected checked packed raw-f64 loop store record for unary math RHS:\n{artifact:#}"
+        "expected checked packed raw-f64 range-store record for unary math RHS:\n{artifact:#}"
     );
     assert!(
         records.iter().any(|record| {
-            record["expr_kind"] == "PackedF64LoopStore"
-                && record["consumer"] == "packed_f64_loop_store_side_exit"
+            record["expr_kind"] == "PackedF64RangeLoopStore"
+                && record["consumer"] == "packed_f64_range_loop_store_side_exit"
                 && record["access_mode"] == "dynamic_fallback"
                 && record["materialization_reason"] == "runtime_api"
                 && record["fallback_reason"] == "runtime_api"
                 && record_has_raw_f64_layout_fact(record, "rejected_facts", "rejected")
-                && record_has_raw_f64_layout_fact(record, "rejected_facts", "invalidated")
         }),
         "expected unary math packed store side-exit fallback evidence:\n{artifact:#}"
     );
@@ -3080,7 +3314,12 @@ fn packed_f64_loop_rejects_coercive_unary_math_store_rhs() {
         !records.iter().any(|record| {
             matches!(
                 record["expr_kind"].as_str(),
-                Some("PackedF64LoopGuard" | "PackedF64LoopStore" | "PackedF64LoopLoad")
+                Some(
+                    "PackedF64LoopGuard"
+                        | "PackedF64LoopStore"
+                        | "PackedF64RangeLoopStore"
+                        | "PackedF64LoopLoad"
+                )
             )
         }),
         "coercive unary math store loop should not record packed-f64 loop facts:\n{artifact:#}"
@@ -6514,7 +6753,12 @@ fn packed_f64_loop_rejects_nonnumeric_store_then_later_read() {
         !records.iter().any(|record| {
             matches!(
                 record["expr_kind"].as_str(),
-                Some("PackedF64LoopGuard" | "PackedF64LoopStore" | "PackedF64LoopLoad")
+                Some(
+                    "PackedF64LoopGuard"
+                        | "PackedF64LoopStore"
+                        | "PackedF64RangeLoopStore"
+                        | "PackedF64LoopLoad"
+                )
             )
         }),
         "nonnumeric store/read loop should not record packed-f64 loop facts:\n{artifact:#}"
@@ -6582,7 +6826,12 @@ fn packed_f64_loop_rejects_store_then_read_invalidation_shape() {
         !records.iter().any(|record| {
             matches!(
                 record["expr_kind"].as_str(),
-                Some("PackedF64LoopGuard" | "PackedF64LoopStore" | "PackedF64LoopLoad")
+                Some(
+                    "PackedF64LoopGuard"
+                        | "PackedF64LoopStore"
+                        | "PackedF64RangeLoopStore"
+                        | "PackedF64LoopLoad"
+                )
             )
         }),
         "store-bearing loop should not record packed-f64 loop facts:\n{artifact:#}"
@@ -7887,6 +8136,7 @@ fn typed_f64_clone_test_module(use_any_param: bool) -> Module {
             },
         ],
         init: Vec::new(),
+        classic_for_lexical_bindings: std::collections::HashSet::new(),
         exported_native_instances: Vec::new(),
         exported_func_return_native_instances: Vec::new(),
         exported_objects: Vec::new(),
@@ -8062,6 +8312,7 @@ fn typed_i1_clone_test_module_named(name: &str) -> Module {
             },
         ],
         init: Vec::new(),
+        classic_for_lexical_bindings: std::collections::HashSet::new(),
         exported_native_instances: Vec::new(),
         exported_func_return_native_instances: Vec::new(),
         exported_objects: Vec::new(),
@@ -8155,6 +8406,7 @@ fn typed_string_clone_test_module(case: &str) -> Module {
             },
         ],
         init: Vec::new(),
+        classic_for_lexical_bindings: std::collections::HashSet::new(),
         exported_native_instances: Vec::new(),
         exported_func_return_native_instances: Vec::new(),
         exported_objects: Vec::new(),
@@ -8270,6 +8522,7 @@ fn typed_i1_numeric_predicate_module() -> Module {
             },
         ],
         init: Vec::new(),
+        classic_for_lexical_bindings: std::collections::HashSet::new(),
         exported_native_instances: Vec::new(),
         exported_func_return_native_instances: Vec::new(),
         exported_objects: Vec::new(),
@@ -8348,6 +8601,7 @@ fn typed_i1_i32_predicate_module() -> Module {
             },
         ],
         init: Vec::new(),
+        classic_for_lexical_bindings: std::collections::HashSet::new(),
         exported_native_instances: Vec::new(),
         exported_func_return_native_instances: Vec::new(),
         exported_objects: Vec::new(),
@@ -8475,6 +8729,7 @@ fn typed_i32_return_module(case: &str) -> Module {
             },
         ],
         init: Vec::new(),
+        classic_for_lexical_bindings: std::collections::HashSet::new(),
         exported_native_instances: Vec::new(),
         exported_func_return_native_instances: Vec::new(),
         exported_objects: Vec::new(),

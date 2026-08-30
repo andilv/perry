@@ -367,9 +367,97 @@ pub(super) fn apply_pshape_inline_policy(
 /// such as mutation-heavy ECS transitions by nearly an order of magnitude.
 pub(super) const GUARDED_SPECIALIZATION_PREINLINE_MAX_IR_BYTES: usize = 16 * 1024;
 
+/// Raised ceiling for a body that is **small at the source level**.
+///
+/// The constant above deliberately judges lowered IR rather than statement
+/// count, because one source statement can lower to a large property/index
+/// dispatch lattice. That is the right *admission* test and the wrong *bound*:
+/// it also rejects the leaf methods that consist of a single such statement,
+/// which are exactly the ones worth flattening into their callers. wolf-ecs is
+/// the case in point — `SparseSet.add`, `ECS._hasComponent` and
+/// `ECS._archChange` are one statement each and lower to tens of KiB of guard
+/// lattice, so every call from `addComponent` stayed a native call boundary.
+///
+/// Statement count is a sound bound on how much *source* a caller can absorb,
+/// and it is what keeps this away from #8583's failure mode: the giant bundled
+/// IIFEs whose `rewrite-statepoints-for-gc` fan-out made `-Os` never finish are
+/// thousands of statements, so they can never reach this arm however their IR
+/// measures. Overridable via `PERRY_GUARDED_PREINLINE_MAX_IR_BYTES` (the raised
+/// ceiling) for A/B without a rebuild.
+pub(super) fn guarded_specialization_source_small_max_ir_bytes() -> usize {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("PERRY_GUARDED_PREINLINE_MAX_IR_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(64 * 1024)
+    })
+}
+
+/// Statement ceiling for the raised budget. Shares
+/// [`inline_hot_small_size_cap`]'s value: the same "this is a leaf, not a
+/// subsystem" judgement, measured the same way.
+#[inline]
+pub(super) fn guarded_specialization_source_small(statements: usize) -> bool {
+    statements <= inline_hot_small_size_cap()
+}
+
 #[inline]
 pub(super) fn guarded_specialization_fits_preinline_budget(ir_bytes: usize) -> bool {
     ir_bytes <= GUARDED_SPECIALIZATION_PREINLINE_MAX_IR_BYTES
+}
+
+/// [`guarded_specialization_fits_preinline_budget`] plus the source-small arm.
+#[inline]
+pub(super) fn guarded_specialization_admits_preinline(ir_bytes: usize, statements: usize) -> bool {
+    guarded_specialization_fits_preinline_budget(ir_bytes)
+        || (guarded_specialization_source_small(statements)
+            && ir_bytes <= guarded_specialization_source_small_max_ir_bytes())
+}
+
+#[cfg(test)]
+mod guarded_preinline_admission_tests {
+    use super::*;
+
+    /// Written against the functions' own values rather than literals, so a
+    /// retuned default cannot silently turn these into vacuous assertions.
+    #[test]
+    fn source_small_arm_admits_a_large_lattice_but_a_statement_bound_still_bounds_it() {
+        let raised = guarded_specialization_source_small_max_ir_bytes();
+        let cap = inline_hot_small_size_cap();
+        assert!(
+            raised > GUARDED_SPECIALIZATION_PREINLINE_MAX_IR_BYTES,
+            "the new arm only means something if its ceiling is higher than the original's",
+        );
+
+        // The case this change exists for: one-statement leaves whose guard
+        // lattice lowers well past the original 16 KiB ceiling.
+        let past_original = GUARDED_SPECIALIZATION_PREINLINE_MAX_IR_BYTES + 1;
+        assert!(!guarded_specialization_fits_preinline_budget(past_original));
+        assert!(guarded_specialization_admits_preinline(past_original, 1));
+        assert!(guarded_specialization_admits_preinline(raised, cap));
+
+        // #8583's protection, and the reason the statement count is a BOUND
+        // rather than an admission test: the giant bundled IIFEs are thousands
+        // of statements, so no IR size may let them through this arm.
+        assert!(!guarded_specialization_admits_preinline(raised, cap + 1));
+        assert!(!guarded_specialization_admits_preinline(
+            past_original,
+            5_000
+        ));
+
+        // The raised ceiling is still a ceiling.
+        assert!(!guarded_specialization_admits_preinline(raised + 1, 1));
+
+        // The original arm is unchanged: within 16 KiB, statement count is
+        // irrelevant, exactly as before this change.
+        assert!(guarded_specialization_admits_preinline(
+            GUARDED_SPECIALIZATION_PREINLINE_MAX_IR_BYTES,
+            5_000,
+        ));
+        assert!(guarded_specialization_admits_preinline(0, usize::MAX));
+    }
 }
 
 /// Maximum total (module-wide) direct call sites a function may have and still
@@ -1602,5 +1690,125 @@ mod native_roots_target_tests {
             rs4gc_env_override().is_none() || rs4gc_env_override().is_some(),
             "override is a tri-state"
         );
+    }
+}
+
+/// `PERRY_CALLEE_BINDING_RESOLUTION` gate (default on): resolve loop-called
+/// immutable callee bindings once at body entry. `=0`/`off`/`false` restores
+/// per-call `js_closure_callN` dispatch for A/B bisection.
+pub(super) fn callee_binding_resolution_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        !matches!(
+            std::env::var("PERRY_CALLEE_BINDING_RESOLUTION").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        )
+    })
+}
+
+/// Populate `resolved_arrow_callback_targets` for loop-called immutable callee
+/// bindings — the generalization of `codegen/method.rs`'s callback-parameter
+/// resolution to plain function and closure bodies, and to captured bindings
+/// and module globals.
+///
+/// Every read here is RAW and cannot throw: a parameter or plain local is a
+/// slot load; a captured binding is a capture-slot load (plus a
+/// `js_box_get_bits` cell read for a boxed capture — the untrusted entry,
+/// which returns the TDZ sentinel rather than throwing); a module global is a
+/// global load. A sentinel or non-closure value simply resolves to null and
+/// every call keeps its full-dispatcher fallback, so a body that runs before a
+/// captured binding initializes behaves exactly as before. The binding being
+/// unassigned module-wide (the collector's admission) is what makes the
+/// entry-resolved identity stand for every later call.
+///
+/// The `Function` type-hint check mirrors the guarded direct-dispatch arm in
+/// `lower_call/early_branches.rs` — the ONLY consumer of the map — so a
+/// resolution is never emitted for a binding whose call sites cannot use it.
+pub(super) fn emit_callee_binding_resolutions(
+    ctx: &mut crate::expr::FnCtx<'_>,
+    body: &[perry_hir::Stmt],
+    param_ids: &std::collections::HashSet<u32>,
+    // `None` = the caller has no module-wide reassignment oracle; only
+    // parameters (whose writes are all in this body) are admitted then.
+    module_reassigned: Option<&std::collections::HashSet<u32>>,
+    this_closure_available: bool,
+) {
+    use crate::types::{DOUBLE, I32, I64, PTR};
+    if !callee_binding_resolution_enabled() {
+        return;
+    }
+    let empty = std::collections::HashSet::new();
+    let (capture_ids, module_global_ids) = if module_reassigned.is_some() {
+        (
+            ctx.closure_captures.keys().copied().collect(),
+            ctx.module_globals.keys().copied().collect(),
+        )
+    } else {
+        (empty.clone(), empty.clone())
+    };
+    let candidates = crate::collectors::collect_loop_called_callee_bindings(
+        body,
+        param_ids,
+        &capture_ids,
+        &module_global_ids,
+        module_reassigned.unwrap_or(&empty),
+    );
+    for (id, arity) in candidates {
+        if ctx
+            .resolved_arrow_callback_targets
+            .contains_key(&(id, arity))
+        {
+            continue;
+        }
+        // A statically-known callee takes the known-func_id guarded direct
+        // path — a static, inlinable call — which beats the entry-resolved
+        // indirect call this map would install.
+        if ctx.local_closure_func_ids.contains_key(&id) {
+            continue;
+        }
+        if !matches!(
+            ctx.local_type_hint(&id),
+            Some(perry_hir::types::Type::Function(function))
+                if !function.is_async && !function.is_generator
+        ) {
+            continue;
+        }
+        let value_box = if let Some(&capture_idx) = ctx.closure_captures.get(&id) {
+            if !this_closure_available {
+                continue;
+            }
+            let offset = crate::target_layout::closure_header_size_bytes(ctx.target_triple)
+                + 8 * u64::from(capture_idx);
+            let blk = ctx.block();
+            let slot_addr = blk.add(I64, "%this_closure", &offset.to_string());
+            let slot_ptr = blk.inttoptr(I64, &slot_addr);
+            let bits = blk.load(I64, &slot_ptr);
+            if ctx.boxed_vars.contains(&id) {
+                let blk = ctx.block();
+                let cell_bits = blk.call(I64, "js_box_get_bits", &[(I64, &bits)]);
+                ctx.block().bitcast_i64_to_double(&cell_bits)
+            } else {
+                ctx.block().bitcast_i64_to_double(&bits)
+            }
+        } else if let Some(global_name) = ctx.module_globals.get(&id).cloned() {
+            let g_ref = format!("@{global_name}");
+            ctx.block().load(DOUBLE, &g_ref)
+        } else if let Some(slot) = ctx.locals.get(&id).cloned() {
+            if ctx.boxed_vars.contains(&id) {
+                continue;
+            }
+            ctx.block().load(DOUBLE, &slot)
+        } else {
+            continue;
+        };
+        let handle = crate::expr::unbox_to_i64(ctx.block(), &value_box);
+        let fn_ptr = ctx.block().call(
+            PTR,
+            "js_closure_resolve_arrow_direct_call",
+            &[(I64, &handle), (I32, &arity.to_string())],
+        );
+        ctx.resolved_arrow_callback_targets
+            .insert((id, arity), fn_ptr);
     }
 }

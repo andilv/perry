@@ -250,7 +250,7 @@ pub(crate) use accessors::{
     accessor_receiver_override_begin, accessor_receiver_override_end,
     array_prototype_property_value, builtin_reflection_accessor_read, class_getter_this,
     invoke_accessor_getter, invoke_accessor_setter, is_typed_array_prototype,
-    ordinary_object_prototype_property_value, own_data_field_by_name,
+    object_field_at_with_live, ordinary_object_prototype_property_value, own_data_field_by_name,
     primitive_builtin_prototype_property, primitive_object_prototype_accessor, string_index_value,
 };
 pub(crate) use class_object_props::class_object_prototype_value;
@@ -284,7 +284,8 @@ pub use has_property::{js_in_operator, js_object_has_property};
 #[cfg(test)]
 pub(crate) use ic_miss::primitive_proto_method_name_static;
 pub(crate) use ic_miss::{
-    bind_primitive_proto_method_static, cannot_be_private_member_name, is_array_method_value_name,
+    bind_primitive_proto_method_static, cannot_be_private_member_name,
+    current_private_lexical_brand_value, is_array_method_value_name,
     private_evaluation_brand_value, private_lexical_brand_pop, private_lexical_brand_push,
     private_lexical_brand_stack_restore, private_lexical_brand_stack_savepoint,
     private_member_access_hints_restore, private_member_access_hints_savepoint,

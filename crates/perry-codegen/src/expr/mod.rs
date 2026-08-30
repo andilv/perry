@@ -210,7 +210,7 @@ pub(crate) use shadow_slot::{
     current_closure_ptr_value, emit_persistent_shadow_root_barrier,
     emit_shadow_slot_bind_for_local, emit_shadow_slot_clear, emit_shadow_slot_update_for_expr,
     enable_persistent_shadow_slot_for_array_alias, expr_is_known_non_pointer_shadow_value,
-    try_current_closure_ptr_value,
+    root_inlined_ctor_pointer_locals, try_current_closure_ptr_value,
 };
 
 /// One in-flight inline-constructor return target. See
@@ -615,6 +615,10 @@ pub(crate) struct FnCtx<'a> {
     /// Used by the closure call site in `lower_call` to look up the
     /// callee's rest param info from `closure_rest_params`.
     pub local_closure_func_ids: std::collections::HashMap<u32, u32>,
+    /// Bindings whose closure identity holds with `FuncRef` strength (#7170
+    /// R1's single-binding fact: one `Let`, never written anywhere, never
+    /// rebound). A call through one of these needs NO runtime identity guard.
+    pub guard_free_closure_bindings: std::collections::HashSet<u32>,
     /// LocalId → closure declared parameter count. Paired with
     /// `local_closure_func_ids` for guarded direct closure calls: direct
     /// calls only fire when the static arity exactly matches the call site.
@@ -1046,6 +1050,17 @@ pub(crate) struct FnCtx<'a> {
     /// on hot array-walking loops like `for (let i = 0; i < arr.length;
     /// i++) arr[i] = expr`.
     pub i32_counter_slots: std::collections::HashMap<u32, String>,
+    /// Unboxed reduce-accumulator redirect, active only while a packed fast
+    /// clone is being lowered: local id -> plain (addrspace-0) F64 alloca.
+    /// The clone's preheader tag-tested the local as a Number and moved its
+    /// value here; every in-clone read/write of the local goes through this
+    /// alloca (mem2reg promotes it to a register — the GC-root slot's
+    /// store-to-load-forward chain was the reduce rows' latency floor), and
+    /// every clone exit (fall-through and side-exit trampoline) writes the
+    /// value back to the real slot. A genuine double's bits ARE its nanbox,
+    /// so no conversion exists on either edge; the stale number left in the
+    /// root slot during the clone is harmless to a GC scan.
+    pub numeric_accumulator_f64_slots: std::collections::HashMap<u32, String>,
 
     /// Representation-selection Phase 1 (RFC `docs/representation-selection-
     /// rfc.md`): LocalId → selected slot representation. Absent = `Boxed`
@@ -1727,6 +1742,15 @@ pub(crate) struct StablePackedReadCache {
 pub(crate) struct StablePackedLoopFact {
     pub counter_local_id: u32,
     pub array_local_id: u32,
+    /// Plain locals the fast preheader proved to hold a Number (one tag test
+    /// per admitted accumulator) and whose every write inside the loop body is
+    /// numeric-preserving with all leaves provable numeric in-loop, so the
+    /// value stays a Number by induction for the whole fast clone.
+    /// `is_numeric_expr` consults this for `LocalGet`, exactly like the
+    /// element-shape clone's `numeric_accumulator` — it is what lets
+    /// `s += arr[i]` lower to a native `fadd` instead of
+    /// `js_dynamic_string_or_number_add` on every iteration.
+    pub numeric_accumulators: Vec<u32>,
     pub side_exit_label: String,
     pub descriptor: String,
     /// Boxed bound passed to the runtime guard (`-1` requests live length).
@@ -1903,6 +1927,15 @@ pub(crate) struct PackedF64LoopFact {
     /// RHS is numeric bits (side-exiting otherwise) and skip the per-iteration
     /// store guard — the range guard already proved bounds and mutability.
     pub allow_holes: bool,
+    /// Plain locals the packed fast preheader proved to hold a Number (one
+    /// tag test per admitted accumulator) whose every in-body write is
+    /// numeric-preserving — the packed twin of
+    /// `StablePackedLoopFact::numeric_accumulators`. `is_numeric_expr`
+    /// consults this for `LocalGet`, which is what lets `s += arr[i]` inside
+    /// the fast clone lower to a native `fadd` instead of
+    /// `js_dynamic_string_or_number_add` on every iteration. Scope-safe by
+    /// construction: the fact is pushed around the fast-clone lowering only.
+    pub numeric_accumulators: Vec<u32>,
     /// True when a *range* guard (hole-tolerant or dense) validated the whole
     /// constant-offset index window `[start + min_offset, bound + max_offset)`
     /// at loop entry — `arr[i ± c]` loads may use non-zero offsets even
@@ -1955,6 +1988,15 @@ pub(crate) struct MaskedWindowArrayFact {
     pub values_i32: bool,
     /// Storage layout the guard proved — selects the inline load shape.
     pub elem: MaskedWindowElem,
+    /// True only in a dense fast-loop scope whose matcher admitted masked
+    /// STORES (plain-f64 tier, `values_i32 == false`): the body walk proved
+    /// every store's RHS produces a genuine (unboxed) double by construction,
+    /// so an in-window raw `store double` needs no value check, no side
+    /// exit, no barrier, and cannot break the window's dense raw-f64 claim.
+    /// The i32 tier and the TA tiers never set this — a store could break
+    /// the i32 tier's all-slots-i32 materialization proof, and the TA tiers'
+    /// hoisted data pointers serve reads only.
+    pub allows_stores: bool,
 }
 
 /// #5093: one fact per (receiver, versioned loop). See
@@ -2593,7 +2635,7 @@ mod fs_await;
 mod index_get;
 #[cfg(test)]
 mod index_get_claim_tests;
-mod masked_window;
+pub(crate) mod masked_window;
 #[cfg(test)]
 mod null_default_numeric_add_tests;
 
@@ -4038,4 +4080,19 @@ pub(crate) fn lower_expr_value(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<Optio
         }
         _ => Ok(None),
     }
+}
+
+/// `PERRY_BOX_CAPTURE_ENTRY_CELLS` gate (default on): resolve a read-only
+/// boxed capture's cell pointer once at closure entry instead of calling
+/// `js_box_get_bits` per read. `=0`/`off`/`false` restores the per-read calls
+/// for A/B bisection.
+pub(crate) fn box_capture_entry_cells_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        !matches!(
+            std::env::var("PERRY_BOX_CAPTURE_ENTRY_CELLS").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        )
+    })
 }

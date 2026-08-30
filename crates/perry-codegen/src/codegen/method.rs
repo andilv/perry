@@ -487,6 +487,7 @@ pub(super) fn compile_method(
             .compiler_private_async_i1_control_locals,
         closure_rest_params,
         local_closure_func_ids: HashMap::new(),
+        guard_free_closure_bindings: std::collections::HashSet::new(),
         local_closure_param_counts: HashMap::new(),
         resolved_arrow_callback_targets: HashMap::new(),
         resolved_versioned_loop_callback_targets: HashMap::new(),
@@ -549,6 +550,7 @@ pub(super) fn compile_method(
         class_field_loop_facts: Vec::new(),
         element_shape_loop_facts: Vec::new(),
         i32_counter_slots: index_i32_param_slots,
+        numeric_accumulator_f64_slots: HashMap::new(),
         local_slot_reps: HashMap::new(),
         repsel_context_allows_canonical_i32: repsel_allows,
         // #7109 split the FIELD out of `repsel_context_allows_canonical_i32`;
@@ -736,6 +738,12 @@ pub(super) fn compile_method(
     // as uninitialized register values (read as NaN-boxed undefined).
     let is_constructor_method = method.name == format!("{}_constructor", class.name);
     if is_constructor_method {
+        // #9043: a default-derived chain can reach a dynamic parent through a
+        // constructor-free static ancestor (`Leaf -> Mid -> <captured Base>`).
+        // Keep the owner of that dynamic edge so this standalone Leaf symbol
+        // dispatches through Mid's registered parent, just like direct `new`.
+        let dynamic_parent_owner =
+            crate::lower_call::default_ctor_dynamic_parent_owner(&ctx, class);
         if class.extends.is_some()
             || class.extends_name.is_some()
             || class.native_extends.is_some()
@@ -768,21 +776,35 @@ pub(super) fn compile_method(
         // no `extends_name`) now emits a synthesized dynamic super below —
         // stage its self fields AFTER that call (tail SelfOnly), like any
         // other heritage class, instead of applying them twice.
-        let no_ctor_dynamic_parent = class.constructor.is_none()
-            && class.extends_name.is_none()
-            && class.extends_expr.is_some();
-        let init_mode = if class.extends_name.is_some() || no_ctor_dynamic_parent {
-            crate::lower_call::FieldInitMode::AncestorsOnly
-        } else {
-            crate::lower_call::FieldInitMode::All
-        };
-        crate::lower_call::apply_field_initializers_recursive(&mut ctx, &class.name, init_mode)
-            .with_context(|| {
-                format!(
-                    "applying field initializers for '{}' constructor",
-                    class.name
-                )
-            })?;
+        // The runtime parent constructor initializes everything above its
+        // dynamic edge. Classes from that edge's owner through this leaf are
+        // derived and must wait until the synthesized super call below.
+        if dynamic_parent_owner.is_none() {
+            let init_mode = if class.extends_name.is_some() {
+                crate::lower_call::FieldInitMode::AncestorsOnly
+            } else if class.extends_expr.is_some() {
+                // Dynamic parent (`class X extends someExpr`) with an OWN
+                // ctor: the body's `super()` lowering stages the self fields
+                // after the parent returns (spec order). Staging `All` here
+                // ran every initializer TWICE — silent double side effects
+                // for public fields, and a thrown "initialize twice" for
+                // private ones (pi's startup died on the mixin pattern).
+                // The static ancestor chain of a purely dynamic parent is
+                // empty, so AncestorsOnly stages nothing, which is correct:
+                // everything above the edge belongs to the runtime parent
+                // constructor.
+                crate::lower_call::FieldInitMode::AncestorsOnly
+            } else {
+                crate::lower_call::FieldInitMode::All
+            };
+            crate::lower_call::apply_field_initializers_recursive(&mut ctx, &class.name, init_mode)
+                .with_context(|| {
+                    format!(
+                        "applying field initializers for '{}' constructor",
+                        class.name
+                    )
+                })?;
+        }
         // Refs #420: when a class has no own constructor but extends a parent
         // that DOES have a body, JS spec requires a default ctor that calls
         // `super(...args)` — implicit forward. perry's standalone ctor for
@@ -819,6 +841,9 @@ pub(super) fn compile_method(
                 if has_local_body || has_imported_ctor {
                     break;
                 }
+                if pc.extends_expr.is_some() {
+                    break;
+                }
                 effective_parent = pc.extends_name.as_deref();
             }
             // Wall 51: a class with a DYNAMIC parent (`extends_expr`, e.g.
@@ -830,7 +855,7 @@ pub(super) fn compile_method(
             // the static call would target the wrong/empty symbol, so the parent
             // ctor never ran and inherited fields stayed undefined. Skip the
             // inline path for dynamic-parent classes.
-            if let Some(pname) = effective_parent.filter(|_| class.extends_expr.is_none()) {
+            if let Some(pname) = effective_parent.filter(|_| dynamic_parent_owner.is_none()) {
                 let pname_owned = pname.to_string();
                 let node_stream_kind = if pname_owned == "Readable" {
                     node_stream_parent_kind(ctx.classes, class)
@@ -1052,17 +1077,27 @@ pub(super) fn compile_method(
             // .pathname` threw. Forward this synthesized ctor's params to the
             // runtime dynamic-parent super dispatcher, mirroring the explicit
             // `Expr::SuperCall` dynamic-parent path in `expr/this_super_call.rs`.
-            let parent_is_uncallable_builtin = class
-                .extends_name
+            let parent_is_uncallable_builtin = dynamic_parent_owner
                 .as_deref()
+                .and_then(|owner| ctx.classes.get(owner).copied())
+                .and_then(|owner| owner.extends_name.as_deref())
                 .map(crate::expr::is_other_builtin_constructor_name)
                 .unwrap_or(false)
-                && class.extends_name.as_deref() != Some("SharedArrayBuffer");
+                && dynamic_parent_owner
+                    .as_deref()
+                    .and_then(|owner| ctx.classes.get(owner).copied())
+                    .and_then(|owner| owner.extends_name.as_deref())
+                    != Some("SharedArrayBuffer");
             if builtin_parent_runtime.is_none()
-                && class.extends_expr.is_some()
+                && dynamic_parent_owner.is_some()
                 && !parent_is_uncallable_builtin
             {
-                if let Some(cid) = ctx.class_ids.get(&class.name).copied().filter(|c| *c != 0) {
+                if let Some(cid) = dynamic_parent_owner
+                    .as_deref()
+                    .and_then(|owner| ctx.class_ids.get(owner))
+                    .copied()
+                    .filter(|c| *c != 0)
+                {
                     let undef_lit =
                         crate::nanbox::double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
                     let mut lowered_args: Vec<String> = Vec::with_capacity(method.params.len());
@@ -1137,10 +1172,13 @@ pub(super) fn compile_method(
             // run, so they can read state set by the parent body (e.g. drizzle's
             // PgText.enumValues = this.config.enumValues — this.config is set
             // in Column body via super-chain). Refs #420.
+            let post_init_mode = dynamic_parent_owner
+                .map(crate::lower_call::FieldInitMode::FromInclusive)
+                .unwrap_or(crate::lower_call::FieldInitMode::SelfOnly);
             crate::lower_call::apply_field_initializers_recursive(
                 &mut ctx,
                 &class.name,
-                crate::lower_call::FieldInitMode::SelfOnly,
+                post_init_mode,
             )
             .with_context(|| {
                 format!(
@@ -1287,8 +1325,9 @@ pub(super) fn compile_method(
         let lowered = llmod
             .function_mut(lowered_function_index)
             .expect("just-lowered method function");
-        if super::helpers::guarded_specialization_fits_preinline_budget(
+        if super::helpers::guarded_specialization_admits_preinline(
             lowered.estimated_ir_bytes(),
+            method.body.len(),
         ) {
             lowered.pre_statepoint_inline = true;
         }
@@ -1615,6 +1654,7 @@ pub(super) fn compile_static_method(
             .compiler_private_async_i1_control_locals,
         closure_rest_params,
         local_closure_func_ids: HashMap::new(),
+        guard_free_closure_bindings: std::collections::HashSet::new(),
         local_closure_param_counts: HashMap::new(),
         resolved_arrow_callback_targets: HashMap::new(),
         resolved_versioned_loop_callback_targets: HashMap::new(),
@@ -1677,6 +1717,7 @@ pub(super) fn compile_static_method(
         class_field_loop_facts: Vec::new(),
         element_shape_loop_facts: Vec::new(),
         i32_counter_slots: HashMap::new(),
+        numeric_accumulator_f64_slots: HashMap::new(),
         local_slot_reps: HashMap::new(),
         repsel_context_allows_canonical_i32: repsel_allows,
         // #7109 split the FIELD out of `repsel_context_allows_canonical_i32`;

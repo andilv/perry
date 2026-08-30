@@ -1081,6 +1081,7 @@ pub(super) fn compile_function(
             .compiler_private_async_i1_control_locals,
         closure_rest_params,
         local_closure_func_ids: HashMap::new(),
+        guard_free_closure_bindings: std::collections::HashSet::new(),
         local_closure_param_counts: HashMap::new(),
         resolved_arrow_callback_targets: HashMap::new(),
         resolved_versioned_loop_callback_targets: HashMap::new(),
@@ -1147,6 +1148,7 @@ pub(super) fn compile_function(
             .map(|id| (*id, crate::expr::SlotRep::I32))
             .collect(),
         i32_counter_slots: spec_i32_param_slots,
+        numeric_accumulator_f64_slots: HashMap::new(),
         repsel_context_allows_canonical_i32: repsel_allows,
         // #7109 split the FIELD out of `repsel_context_allows_canonical_i32`;
         // #7128 split the VALUE, which is what the knob actually reads. Until
@@ -1395,6 +1397,15 @@ pub(super) fn compile_function(
                 },
             );
         }
+    }
+
+    // #9060 follow-up: resolve loop-called immutable callee bindings once at
+    // entry (parameters only here — the plain-function path has no module-wide
+    // reassignment oracle in scope for captures/globals). Skipped for async
+    // bodies: their entry SSA values do not survive the CPS rewrite.
+    if !f.is_async {
+        let param_ids: std::collections::HashSet<u32> = f.params.iter().map(|p| p.id).collect();
+        super::helpers::emit_callee_binding_resolutions(&mut ctx, &f.body, &param_ids, None, false);
     }
 
     if f.is_async {

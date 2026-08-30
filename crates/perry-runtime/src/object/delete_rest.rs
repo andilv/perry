@@ -332,31 +332,163 @@ pub extern "C" fn js_object_delete_field(
         let alloc_limit = std::cmp::max(field_count as usize, crate::object::INLINE_SLOT_FLOOR);
         let new_count = key_count - 1;
 
-        // CRITICAL: clone the keys_array before mutating it. The same
-        // keys_array is shared across all objects that built the same
-        // shape via `transition_cache_lookup`-hit fast paths. Without
-        // cloning, mutating its length / contents to remove the deleted
-        // key would corrupt every other object that picks up this
-        // shape — they'd silently lose entries they never deleted.
-        let keys_cloned = crate::array::js_array_alloc(new_count.max(1) as u32 + 4);
-        let src_elements =
-            (keys as *const u8).add(std::mem::size_of::<crate::ArrayHeader>()) as *const f64;
-        let dst_elements =
-            (keys_cloned as *mut u8).add(std::mem::size_of::<crate::ArrayHeader>()) as *mut f64;
-        // Copy keys [0..i) ++ [i+1..N) into [0..new_count).
-        for j in 0..i {
-            // GC_STORE_AUDIT(INIT): cloned keys array is unpublished; layout is rebuilt before publication.
-            *dst_elements.add(j) = *src_elements.add(j);
+        // The clone below exists because one keys_array is shared by every
+        // object that built this shape through a `transition_cache_lookup`
+        // hit: mutating it in place would silently drop entries from siblings
+        // that never deleted anything.
+        //
+        // Sharing is TRACKED. The caches stamp `GC_FLAG_SHAPE_SHARED` when
+        // they publish an array (`transition_cache_insert`), and both the
+        // ordinary `[[Set]]` growth path and `object_ops::keys_array` already
+        // treat that bit as authoritative for exactly this decision. An array
+        // without it has a single owner, so it can be compacted in place —
+        // removing the last per-delete allocation on this path (a ~500-element
+        // clone, 200k of them on `bench_populated_delete.ts`) and keeping the
+        // array's ADDRESS, so the key index only needs its slots shifted.
+        let keys_gc_header =
+            (keys as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
+        let keys_owned = (*keys_gc_header).gc_flags & crate::gc::GC_FLAG_SHAPE_SHARED == 0;
+        // O(1) tombstone delete (flag-gated, #9020's Map pattern applied to
+        // objects). An OWNED keys array can take a hole marker in place of
+        // the deleted key: survivors keep their slots, so nothing shifts, no
+        // layout rebuilds, and the live inline-slot bound is untouched. The
+        // shape publish mints a fresh semantic generation, which is what
+        // retires every cached (token, key) pair for this receiver — a
+        // deleted key must stop hitting even though the array address and
+        // every surviving slot are byte-identical, or a stale IC hit would
+        // return the cleared slot instead of walking the prototype chain.
+        // The read-plan epoch was already bumped at this function's entry.
+        //
+        // Tombstones are squeezed out when they reach half the slots (the
+        // Map threshold), which amortizes compaction to O(1) per delete and
+        // bounds the array at 2x its live size.
+        if keys_owned && object_tombstone_deletes_enabled() {
+            let holes = super::shapes::object_shape_hole_count(obj);
+            let threshold_hit = key_count >= 16 && (holes + 1) * 2 > key_count as u32;
+            if !threshold_hit {
+                let successor = super::shapes::publish_object_shape_holes(obj, holes + 1);
+                if successor != 0 {
+                    let elements = (keys as *mut u8).add(std::mem::size_of::<crate::ArrayHeader>())
+                        as *mut f64;
+                    // Barriered stores, exactly the Map delete's idiom: the
+                    // hole overwrites a key POINTER and the clear overwrites
+                    // the value, so SATB marking must shade both children.
+                    crate::gc::runtime_store_external_jsvalue_slot(
+                        keys as usize,
+                        elements.add(i) as usize,
+                        crate::value::TAG_HOLE,
+                    );
+                    if i < alloc_limit {
+                        let fields_ptr =
+                            (obj as *mut u8).add(std::mem::size_of::<ObjectHeader>()) as *mut u64;
+                        crate::gc::runtime_store_jsvalue_slot(
+                            obj as usize,
+                            fields_ptr.add(i) as usize,
+                            i,
+                            crate::value::TAG_UNDEFINED,
+                        );
+                    } else {
+                        overflow_set(obj as usize, i, crate::value::TAG_UNDEFINED);
+                    }
+                    return 1;
+                }
+                // Unstamped/unshaped receiver: fall through to the
+                // compacting delete below, which needs no shape stamp.
+            } else {
+                // Threshold: squeeze every hole plus this key in one pass,
+                // then continue through the ordinary compaction bookkeeping
+                // is unnecessary — the squeeze does its own.
+                squeeze_holes_and_delete(
+                    obj,
+                    keys,
+                    i,
+                    key_count,
+                    alloc_limit,
+                    field_count,
+                    crate::object::reserved_slot_floor_for_class_id((*obj).class_id) as usize,
+                );
+                return 1;
+            }
         }
-        for j in i..new_count {
-            // GC_STORE_AUDIT(INIT): cloned keys array is unpublished; layout is rebuilt before publication.
-            *dst_elements.add(j) = *src_elements.add(j + 1);
-        }
-        (*keys_cloned).length = new_count as u32;
-        super::rebuild_array_layout_from_slots(keys_cloned);
-        // `set_object_keys_array` publishes the cloned edge while preserving
-        // the predecessor's semantic generation and object kind.
-        set_object_keys_array(obj, keys_cloned);
+        let index_migrated = if keys_owned {
+            let elements =
+                (keys as *mut u8).add(std::mem::size_of::<crate::ArrayHeader>()) as *mut f64;
+            // Overlapping ranges inside ONE allocation: `copy` (memmove).
+            //
+            // Unlike the clone arm below, this destination is the LIVE,
+            // PUBLISHED array, so that arm's "unpublished, so no barrier" does
+            // not carry over. No new referent is introduced -- every value
+            // moved was already in this array one slot higher.
+            // Same shape as `Array.prototype.splice`'s tail memmove
+            // (`array/splice_slice.rs`), and safe for the same reason.
+            if new_count > i {
+                // GC_STORE_AUDIT(BARRIERED): `rebuild_array_layout_from_slots`
+                // runs just below and, for an old-gen array, re-runs
+                // `runtime_write_barrier_slot` over every slot; `length` is set
+                // first so it covers exactly the compacted range.
+                std::ptr::copy(elements.add(i + 1), elements.add(i), new_count - i);
+            }
+            (*keys).length = new_count as u32;
+            super::rebuild_array_layout_from_slots(keys);
+            // Re-publish the shape for the SAME array at its new key count.
+            // Without this the object keeps a stamped ShapeId whose descriptor
+            // still claims the pre-delete count, which the shape-facts audit
+            // catches as "published ShapeId disagrees with authoritative
+            // ObjectHeader facts". `publish_object_shape_from` versions a
+            // same-pointer change internally, and `keys_changed` is false here
+            // so the typed layout is preserved rather than marked unknown.
+            set_object_keys_array(obj, keys as *mut crate::ArrayHeader);
+            super::shapes::shape_index_shift_in_place(keys as usize, i as u32, key_count as u32)
+        } else {
+            let keys_cloned = crate::array::js_array_alloc(new_count.max(1) as u32 + 4);
+            let src_elements =
+                (keys as *const u8).add(std::mem::size_of::<crate::ArrayHeader>()) as *const f64;
+            let dst_elements =
+                (keys_cloned as *mut u8).add(std::mem::size_of::<crate::ArrayHeader>()) as *mut f64;
+            // Copy keys [0..i) ++ [i+1..N) into [0..new_count) as two contiguous
+            // runs. These were scalar element loops, which is O(resident keys) of
+            // load/store pairs on a path that already allocates and rebuilds a
+            // layout per delete — and `delete obj[k]` on a populated object is
+            // perry's worst object-model gap against node (~200x on
+            // `bench_populated_delete.ts`).
+            //
+            // GC_STORE_AUDIT(INIT): the destination is a freshly allocated, still
+            // UNPUBLISHED keys array whose layout is rebuilt before it is
+            // published — which is why the per-element writes carried no barrier
+            // either. Source and destination are distinct allocations, so the
+            // copies cannot overlap.
+            if i > 0 {
+                std::ptr::copy_nonoverlapping(src_elements, dst_elements, i);
+            }
+            if new_count > i {
+                // GC_STORE_AUDIT(INIT): same unpublished destination as the run
+                // above — freshly allocated keys array, layout rebuilt before
+                // `set_object_keys_array` publishes it, distinct allocations.
+                std::ptr::copy_nonoverlapping(
+                    src_elements.add(i + 1),
+                    dst_elements.add(i),
+                    new_count - i,
+                );
+            }
+            (*keys_cloned).length = new_count as u32;
+            super::rebuild_array_layout_from_slots(keys_cloned);
+            // Carry the key index onto the clone by shifting slots, instead of
+            // letting the new address miss `indices` and re-hash every surviving
+            // property name. On a 500-key object that rebuild ran on EVERY delete.
+            // A wrong index can only cause a miss — `shape_slot_lookup` validates
+            // the stored key against the requested bytes before returning a slot.
+            let index_migrated = super::shapes::shape_index_migrate_after_delete(
+                keys as usize,
+                keys_cloned as usize,
+                i as u32,
+                key_count as u32,
+                !keys_owned,
+            );
+            // `set_object_keys_array` publishes the cloned edge while preserving
+            // the predecessor's semantic generation and object kind.
+            set_object_keys_array(obj, keys_cloned);
+            index_migrated
+        };
 
         // 1) Shift values down: for slot j in i..new_count, copy slot j+1
         //    into slot j. Inline reads/writes for j < alloc_limit;
@@ -367,7 +499,18 @@ pub extern "C" fn js_object_delete_field(
             // written under. Reading by NAME here would invoke a getter and store its
             // result as a data property, silently collapsing accessors (Next's module
             // exports are `Object.defineProperty(..., {get})`).
-            let next = js_object_get_field(obj, (j + 1) as u32);
+            // `js_object_get_field` resolves the live-slot bound itself, and
+            // that bound is a shape-table probe — so shifting N values paid N
+            // descriptor lookups per delete. This loop already holds the same
+            // bound in `field_count`, and nothing in it changes the receiver's
+            // shape, so pass it in. `object_field_at_with_live` exists for
+            // exactly this (#8122) and is otherwise the identical body,
+            // including the inline-vs-overflow split.
+            let next = crate::object::field_get_set::object_field_at_with_live(
+                obj,
+                (j + 1) as u32,
+                field_count,
+            );
             // Inline write if target slot < alloc_limit, else overflow.
             if j < alloc_limit {
                 let fields_ptr =
@@ -420,7 +563,13 @@ pub extern "C" fn js_object_delete_field(
         //    not eagerly deleted because a sibling may still name one; exact
         //    new facts are published below and weak post-trace pruning retires
         //    dead historical descriptors.
-        crate::object::shapes::shape_drop(crate::object::object_keys_array(obj));
+        // ...unless the migration above already shifted it to match the
+        // compacted array, in which case it is CURRENT, not stale, and
+        // dropping it would throw away the rebuild this is meant to avoid —
+        // the next lookup would re-hash every surviving key name.
+        if !index_migrated {
+            crate::object::shapes::shape_drop(crate::object::object_keys_array(obj));
+        }
         1
     }
 }
@@ -997,4 +1146,126 @@ mod sso_tests_1781 {
             );
         }
     }
+}
+
+/// Gate for O(1) tombstone deletes (`PERRY_OBJECT_TOMBSTONES=1`). Default OFF
+/// while the walker audit and differentials bake; the sibling Map tombstones
+/// (#9020) shipped default-on after the same sequence.
+fn object_tombstone_deletes_enabled() -> bool {
+    // Test override first: the OnceLock latches at the FIRST delete anywhere
+    // in the test process, which is long before a tombstone test's own
+    // `set_var` — so tests opt in through this cell instead of the env.
+    #[cfg(test)]
+    if let Some(forced) = TOMBSTONE_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        // Default ON (#9029 shipped the mechanism flag-gated; the walker
+        // audit and churn-bound tests are the default-on prerequisites).
+        // `PERRY_OBJECT_TOMBSTONES=0` is the kill switch, mirroring the
+        // moving-scavenge rollout's `PERRY_GC_MOVING_LOOP_POLLS=0` pattern.
+        !matches!(
+            std::env::var("PERRY_OBJECT_TOMBSTONES").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        )
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static TOMBSTONE_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the tombstone-delete flag for the CURRENT THREAD's asserts,
+/// bypassing the env-latched OnceLock. Pass `None` to restore env behavior;
+/// callers must do so before returning (tests share threads).
+#[cfg(test)]
+pub(crate) fn test_set_tombstone_deletes(forced: Option<bool>) {
+    TOMBSTONE_TEST_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// Threshold compaction for a tombstoned keys array: squeeze every hole AND
+/// the key at `delete_slot` out in one overlap-safe pass, values moved to
+/// match, then republish layout, live bound and shape. The cost equals what
+/// ONE pre-tombstone delete paid, amortized over the deletes that created
+/// the holes — `compact_map_entries`' argument, applied to objects.
+///
+/// # Safety
+/// `obj` live and owned `keys` as its current keys array; `delete_slot <
+/// key_count`; caller already bumped the read-plan epoch.
+unsafe fn squeeze_holes_and_delete(
+    obj: *mut ObjectHeader,
+    keys: *const crate::ArrayHeader,
+    delete_slot: usize,
+    key_count: usize,
+    alloc_limit: usize,
+    field_count: u32,
+    // #9019: a reserved-layout receiver's leading `floor` slots are
+    // STRUCTURAL tombstones guarding its raw internal fields — squeezing
+    // them would slide user keys back under the floor and re-open the
+    // field-0 alias. They are exempt from compaction; only churn holes at
+    // or past the floor are squeezed. (`delete_slot` is always >= floor
+    // there: the reserved slots hold no key a delete could match.)
+    reserved_floor: usize,
+) {
+    let keys = keys as *mut crate::ArrayHeader;
+    let elements = (keys as *mut u8).add(std::mem::size_of::<crate::ArrayHeader>()) as *mut f64;
+    let fields_ptr = (obj as *mut u8).add(std::mem::size_of::<ObjectHeader>()) as *mut u64;
+    let floor = reserved_floor.min(key_count);
+    let mut out = floor;
+    for s in floor..key_count {
+        let kv = std::ptr::read(elements.add(s));
+        if s == delete_slot || kv.to_bits() == crate::value::TAG_HOLE {
+            continue;
+        }
+        if out != s {
+            // Keys move DOWN within one buffer (out < s always) — same
+            // overlap argument as `compact_map_entries`.
+            // GC_STORE_AUDIT(EXTERNAL_BARRIERED): the dirty-span barrier after
+            // this loop covers every surviving key slot written here, exactly
+            // as compact_map_entries' squeeze is audited.
+            std::ptr::write(elements.add(out), kv);
+            // Value follows its key. Read through the index path against the
+            // PRE-squeeze bound (the same boundary it was written under),
+            // then store through the barriered inline/overflow split.
+            let v =
+                crate::object::field_get_set::object_field_at_with_live(obj, s as u32, field_count);
+            if out < alloc_limit {
+                crate::gc::runtime_store_jsvalue_slot(
+                    obj as usize,
+                    fields_ptr.add(out) as usize,
+                    out,
+                    v.bits(),
+                );
+            } else {
+                overflow_set(obj as usize, out, v.bits());
+            }
+        }
+        out += 1;
+    }
+    (*keys).length = out as u32;
+    if out > 0 {
+        // GC_STORE_AUDIT(EXTERNAL_BARRIERED): dirty-span barrier over the
+        // compacted key slots, mirroring compact_map_entries.
+        crate::gc::runtime_write_barrier_external_slot_span(keys as usize, elements as usize, out);
+    }
+    super::rebuild_array_layout_from_slots(keys);
+    // Publish the squeezed shape BEFORE touching the live-slot bound: the
+    // squeeze changed the keys array's length in place, and
+    // `set_object_live_slot_count`'s unchanged-bound early return asserts
+    // parity against the STAMPED descriptor — which still carries the
+    // pre-squeeze logical_key_count until the publish below runs. At scale
+    // the floored bound is usually unchanged, so that assert fired mid-
+    // transition (#9108, reserved_floor at-scale test SIGABRT).
+    //
+    // Slots moved: the per-array key index and any stale descriptors for the
+    // pre-squeeze states are wrong now. Drop the index (rebuilt on demand)
+    // and publish the squeezed shape at exactly the surviving hole count —
+    // zero for an ordinary receiver, the structural reserved floor (#9019)
+    // for an iterator-family one.
+    crate::object::shapes::shape_drop(keys);
+    super::shapes::publish_object_shape_holes(obj, floor as u32);
+    set_object_live_slot_count(obj, std::cmp::min(out, alloc_limit) as u32);
 }

@@ -709,6 +709,13 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // `js_string_char_at` / `js_array_get_f64` / `js_object_get_field_by_name_f64`
     // based on the receiver's NaN-box tag at runtime. Used by IndexGet's
     // fallback path when codegen can't statically prove the receiver type.
+    // By-value computed read: key arrives NaN-boxed so an SSO key can be
+    // answered from the read stub without being materialised to the heap.
+    module.declare_function(
+        "js_typed_feedback_object_get_field_by_value_f64",
+        DOUBLE,
+        &[I64, I64, DOUBLE],
+    );
     module.declare_function("js_dyn_index_get", DOUBLE, &[DOUBLE, DOUBLE]);
     // #8655: guarded packed-array / dense Array-subclass read before the
     // fully generic dynamic dispatcher. Used by unknown-receiver loop reads.
@@ -1327,6 +1334,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // and a type-preserving step by 1n/1.0. Keeps `let i = 10n; i++` a BigInt.
     module.declare_function("js_to_numeric", DOUBLE, &[DOUBLE]);
     module.declare_function("js_numeric_step", DOUBLE, &[DOUBLE, I32]);
+    module.declare_function("js_box_capture_cell_ptr", I64, &[I64]);
     // Refs #486: dispatch path for `+` when neither operand has a static
     // type (string|number|bigint). Per JS spec, string concat takes
     // priority; otherwise BigInt or numeric add. Hono's
@@ -1542,6 +1550,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_with_implicit_read", DOUBLE, &[DOUBLE, DOUBLE]);
     // Iterator-protocol result validation (for-of lazy loop).
     module.declare_function("js_iterator_result_validate", DOUBLE, &[DOUBLE]);
+    module.declare_function("js_for_of_next", DOUBLE, &[DOUBLE]);
     module.declare_function("js_global_get_or_throw_unresolved", DOUBLE, &[DOUBLE]);
     // Ambient `require` for compiled external / compilePackages modules (#5373):
     // bind a bare `require` to a createRequire-backed closure instead of throwing

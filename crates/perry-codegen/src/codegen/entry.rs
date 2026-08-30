@@ -231,25 +231,17 @@ fn emit_script_global_function_decls(ctx: &mut FnCtx<'_>, hir: &HirModule) {
     }
 }
 
-/// #5848: emit the global-object reflection of a Script's Annex B
-/// block-nested top-level `function` declarations (`{ function f(){} }` /
-/// `if (c) function f(){}` / `switch (x) { case 1: function f(){} }`
-/// directly in sloppy global code) — `globalThis[name] = undefined`, as a
-/// non-configurable own property.
+/// Emit the early global-object bindings for Script-level `var`s and Annex B
+/// block-nested top-level function declarations —
+/// `globalThis[name] = undefined`, as a non-configurable own property.
 ///
 /// GlobalDeclarationInstantiation's `CreateGlobalVarBinding` (B.3.3.2 step
 /// 5.b.i) runs for these names before any top-level statement executes, so
 /// the property must already be observable — with value `undefined` — ahead
-/// of the block that later assigns the real function (test262 `annexB/
-/// language/global-code/*-global-init.js`). The block's own execution still
-/// writes the real function into the module-level local slot
-/// (`annexb_block_fn_var_ids`) as today; this only seeds the *object*
-/// property so pre-block `Object.getOwnPropertyDescriptor`/`hasOwnProperty`
-/// checks see it — a one-time snapshot, not a live-synced mirror, matching
-/// `emit_script_global_function_decls`'s existing precedent. Unlike that
-/// function, not gated on `hir.references_global_this`: this Annex B pattern
-/// is rare enough that the extra reflection call is not a meaningful
-/// per-program cost, and the spec creates the property unconditionally.
+/// of the statement that later assigns the real value. The HIR reflection
+/// pass keeps subsequent writes synchronized; this prelude establishes the
+/// descriptor it must preserve (test262 `language/eval-code/*/
+/// var-env-var-init-global-exstng` and Annex B global-init cases).
 fn emit_annexb_global_undefined_decls(ctx: &mut FnCtx<'_>, hir: &HirModule) {
     if hir.annexb_global_undefined_names.is_empty() {
         return;
@@ -827,6 +819,7 @@ pub(super) fn compile_module_entry(
                 .compiler_private_async_i1_control_locals,
             closure_rest_params,
             local_closure_func_ids: HashMap::new(),
+            guard_free_closure_bindings: std::collections::HashSet::new(),
             local_closure_param_counts: HashMap::new(),
             resolved_arrow_callback_targets: HashMap::new(),
             resolved_versioned_loop_callback_targets: HashMap::new(),
@@ -887,6 +880,7 @@ pub(super) fn compile_module_entry(
             class_field_loop_facts: Vec::new(),
             element_shape_loop_facts: Vec::new(),
             i32_counter_slots: HashMap::new(),
+            numeric_accumulator_f64_slots: HashMap::new(),
             local_slot_reps: HashMap::new(),
             // #7109: this entry body selects canonical i32/u32/Str on the same
             // per-value rules as a function body. Phase 1 (#6903) excluded it
@@ -1543,6 +1537,7 @@ pub(super) fn compile_module_entry(
                 .compiler_private_async_i1_control_locals,
             closure_rest_params,
             local_closure_func_ids: HashMap::new(),
+            guard_free_closure_bindings: std::collections::HashSet::new(),
             local_closure_param_counts: HashMap::new(),
             resolved_arrow_callback_targets: HashMap::new(),
             resolved_versioned_loop_callback_targets: HashMap::new(),
@@ -1603,6 +1598,7 @@ pub(super) fn compile_module_entry(
             class_field_loop_facts: Vec::new(),
             element_shape_loop_facts: Vec::new(),
             i32_counter_slots: HashMap::new(),
+            numeric_accumulator_f64_slots: HashMap::new(),
             local_slot_reps: HashMap::new(),
             // #7109: this entry body selects canonical i32/u32/Str on the same
             // per-value rules as a function body. Phase 1 (#6903) excluded it

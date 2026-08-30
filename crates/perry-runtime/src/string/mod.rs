@@ -171,6 +171,7 @@ pub use html::{
 };
 pub use intern::{js_string_intern, scan_intern_table_roots, scan_intern_table_roots_mut};
 pub use io::{js_string_error, js_string_print, js_string_warn};
+pub(crate) use iter_object::dispatch_string_iterator_method_builtin;
 pub use iter_object::{
     dispatch_string_iterator_method, string_values_iter, STRING_ITERATOR_CLASS_ID,
 };
@@ -191,6 +192,8 @@ pub use slice_ops::{
     js_string_trim_start,
 };
 pub use split::{js_string_split, js_string_split_n};
+
+pub(crate) use intern::intern_lookup_bytes;
 
 #[cfg(test)]
 pub(crate) use intern::{

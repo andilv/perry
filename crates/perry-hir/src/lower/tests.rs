@@ -52,6 +52,25 @@ fn array_inference_is_revoked_after_plain_object_assignment() {
 }
 
 #[test]
+fn array_iterator_helper_chain_is_not_lowered_as_array_map() {
+    let source = "const helper = [1, 2].values().map((x) => x * 2);";
+    let module =
+        perry_parser::parse_typescript(source, "iterator-helper-map.ts").expect("source parses");
+    let hir = super::lower_module(&module, "iterator-helper-map", "iterator-helper-map.ts")
+        .expect("source lowers");
+    let dump = format!("{hir:#?}");
+
+    assert!(
+        dump.contains("ArrayValues"),
+        "the Array iterator producer must remain in the lowered chain: {dump}"
+    );
+    assert!(
+        !dump.contains("ArrayMap"),
+        "an iterator's `.map()` must use dynamic helper dispatch, not Array.prototype.map: {dump}"
+    );
+}
+
+#[test]
 fn local_declaration_span_survives_ast_to_hir_lowering() {
     let source = "function build() {\n  const boxed = makeValue();\n  return boxed;\n}\n";
     let module = perry_parser::parse_typescript(source, "span.ts").expect("source parses");
@@ -1049,6 +1068,37 @@ fn nested_class_shadowing_outer_var_constructs_the_class_not_the_local() {
     assert!(
         body.contains("class_name: \"A\""),
         "`new A()` inside A's own method must construct class A: {body}"
+    );
+}
+
+/// Self-construction is lowered before a named class expression's capture
+/// union is known. The post-body pass appends the lexical self cell, and must
+/// also mark it as a capture argument so constructor binding does not discard
+/// it as an ordinary user argument.
+#[test]
+fn named_class_expr_self_new_records_appended_capture_provenance() {
+    let source = r#"
+        const make = () => class c {
+            static create(): any { return new c(); }
+            constructor() { if (c === null) throw new Error("unreachable"); }
+        };
+    "#;
+    let module = perry_parser::parse_typescript(source, "t.ts").expect("source parses");
+    let hir = super::lower_module(&module, "t", "t.ts").expect("source lowers");
+    let create = hir
+        .classes
+        .iter()
+        .find(|class| class.name.starts_with("c__class_expr_"))
+        .expect("named class expression is lowered")
+        .static_methods
+        .iter()
+        .find(|method| method.name == "create")
+        .expect("static create method is lowered");
+    let body = format!("{:#?}", create.body);
+
+    assert!(
+        body.contains("cap_args_appended: 1"),
+        "the appended lexical-self cell must be identified as a capture arg: {body}"
     );
 }
 

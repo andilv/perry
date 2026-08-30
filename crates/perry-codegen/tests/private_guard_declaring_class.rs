@@ -87,6 +87,7 @@ fn module_with(classes: Vec<Class>, body: Vec<Stmt>) -> Module {
             was_unrolled: false,
         }],
         init: Vec::new(),
+        classic_for_lexical_bindings: std::collections::HashSet::new(),
         exported_native_instances: Vec::new(),
         exported_func_return_native_instances: Vec::new(),
         exported_objects: Vec::new(),
@@ -123,6 +124,10 @@ fn private_guard_uses_declaring_class_id_not_name_collided_id() {
         field_name: "#v".to_string(),
         kind: 0, // field
         op: 0,   // instance read
+        // Not a named class expression's self-binding: this guard's receiver
+        // is a plain expression, so the declaring class id stays the brand
+        // owner — which is exactly what this test pins.
+        receiver_is_brand_owner: false,
         object: Box::new(Expr::Integer(0)),
     };
     let ir = String::from_utf8(

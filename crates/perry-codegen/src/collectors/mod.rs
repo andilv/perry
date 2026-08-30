@@ -49,7 +49,7 @@ mod safepoint_sites;
 mod scalar_method_dispatch;
 mod scalar_methods;
 mod shadow_slots;
-mod spec_abi_sites;
+pub(crate) mod spec_abi_sites;
 mod this_as_value;
 mod uppercase_strings;
 
@@ -69,7 +69,9 @@ pub(crate) use hir_facts::{
     collect_native_region_fact_graph, collect_native_region_fact_graph_with_spec_params,
     NativeRegionFactGraph,
 };
-pub(crate) use hoisted_callback_calls::collect_hoisted_callback_calls;
+pub(crate) use hoisted_callback_calls::{
+    collect_hoisted_callback_calls, collect_loop_called_callee_bindings,
+};
 pub(crate) use hot_callees::{
     collect_alloc_hot_functions, collect_hot_loop_callees, collect_recursion_participants,
     collect_self_recursive_allocators,

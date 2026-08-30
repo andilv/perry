@@ -1,5 +1,6 @@
 //! Shared `%IteratorPrototype%`-style prototype singletons for the built-in
-//! iterator objects (Array / Map / Set / String iterators).
+//! iterator objects (Array / Map / Set / String / RegExp-string / Iterator
+//! Helper iterators).
 //!
 //! test262's `verifyProperty` suite (built-ins/{Array,Map,Set,String}
 //! IteratorPrototype) requires that:
@@ -47,6 +48,7 @@ crate::perry_thread_local! {
     static SET_ITERATOR_PROTOTYPE_PTR_SLOT: AtomicI64 = const { AtomicI64::new(0) };
     static STRING_ITERATOR_PROTOTYPE_PTR_SLOT: AtomicI64 = const { AtomicI64::new(0) };
     static REGEXP_STRING_ITERATOR_PROTOTYPE_PTR_SLOT: AtomicI64 = const { AtomicI64::new(0) };
+    static ITERATOR_HELPER_PROTOTYPE_PTR_SLOT: AtomicI64 = const { AtomicI64::new(0) };
 }
 
 pub(crate) static ITERATOR_PROTOTYPE_PTR: super::RealmAtomicI64 =
@@ -61,6 +63,24 @@ pub(crate) static STRING_ITERATOR_PROTOTYPE_PTR: super::RealmAtomicI64 =
     super::RealmAtomicI64::new(&STRING_ITERATOR_PROTOTYPE_PTR_SLOT);
 pub(crate) static REGEXP_STRING_ITERATOR_PROTOTYPE_PTR: super::RealmAtomicI64 =
     super::RealmAtomicI64::new(&REGEXP_STRING_ITERATOR_PROTOTYPE_PTR_SLOT);
+pub(crate) static ITERATOR_HELPER_PROTOTYPE_PTR: super::RealmAtomicI64 =
+    super::RealmAtomicI64::new(&ITERATOR_HELPER_PROTOTYPE_PTR_SLOT);
+
+/// Resolve and validate the implicit-`this` object shared by the family
+/// prototype thunks. Keeping the raw-address probe here gives both the generic
+/// family dispatcher and the helper-specific brand check one audited path.
+unsafe fn implicit_this_iterator_object() -> Option<*mut ObjectHeader> {
+    let this = super::js_implicit_this_get();
+    let jv = JSValue::from_bits(this.to_bits());
+    if !jv.is_pointer() {
+        return None;
+    }
+    let obj = jv.as_pointer::<ObjectHeader>() as *mut ObjectHeader;
+    if obj.is_null() || !super::is_valid_obj_ptr(obj as *const u8) {
+        return None;
+    }
+    Some(obj)
+}
 
 /// Dispatch `method` on the implicit-`this` iterator instance, routing by class
 /// id to the matching existing iterator dispatcher. Shared by the per-family
@@ -69,32 +89,31 @@ pub(crate) static REGEXP_STRING_ITERATOR_PROTOTYPE_PTR: super::RealmAtomicI64 =
 /// throw when `this` is not a recognized iterator (test262 `this-not-object` /
 /// `does-not-have-...-internal-slots` brand checks).
 unsafe fn dispatch_on_implicit_this(method: &str) -> f64 {
-    let this = super::js_implicit_this_get();
-    let jv = JSValue::from_bits(this.to_bits());
-    if !jv.is_pointer() {
+    let Some(obj) = implicit_this_iterator_object() else {
         return brand_type_error(method);
-    }
-    let obj = jv.as_pointer::<ObjectHeader>() as *mut ObjectHeader;
-    if obj.is_null() || !super::is_valid_obj_ptr(obj as *const u8) {
-        return brand_type_error(method);
-    }
+    };
     let class_id = (*obj).class_id;
+    // The `_builtin` variants skip the own-`next` override probe (#9019):
+    // these thunks ARE the canonical prototype `next` functions, so invoking
+    // one directly (`proto.next.call(it)`, or a `.bind(it)` taken before a
+    // patch landed) must run the builtin algorithm — probing here would send
+    // a patch that delegates to its bound original into infinite recursion.
     match class_id {
         crate::array::ARRAY_ITERATOR_CLASS_ID => {
-            crate::array::dispatch_array_iterator_method(obj, method)
+            crate::array::dispatch_array_iterator_method_builtin(obj, method)
         }
         crate::collection_iter_object::MAP_ITERATOR_CLASS_ID => {
-            crate::collection_iter_object::dispatch_map_iterator_method(obj, method)
+            crate::collection_iter_object::dispatch_map_iterator_method_builtin(obj, method)
         }
         crate::collection_iter_object::SET_ITERATOR_CLASS_ID => {
-            crate::collection_iter_object::dispatch_set_iterator_method(obj, method)
+            crate::collection_iter_object::dispatch_set_iterator_method_builtin(obj, method)
         }
         crate::string::STRING_ITERATOR_CLASS_ID => {
-            crate::string::dispatch_string_iterator_method(obj, method)
+            crate::string::dispatch_string_iterator_method_builtin(obj, method)
         }
         #[cfg(feature = "regex-engine")]
         crate::regex::REGEXP_STRING_ITERATOR_CLASS_ID => {
-            crate::regex::dispatch_regexp_string_iterator_method(obj, method)
+            crate::regex::dispatch_regexp_string_iterator_method_builtin(obj, method)
         }
         _ => brand_type_error(method),
     }
@@ -136,6 +155,24 @@ extern "C" fn regexp_string_iterator_next_thunk(
     _arg: f64,
 ) -> f64 {
     unsafe { dispatch_on_implicit_this("next") }
+}
+
+/// `%Iterator Helper Prototype%.next` has a helper-specific brand check. Use
+/// the intrinsic algorithm directly rather than the general method dispatcher:
+/// a saved/bound canonical method must not re-enter a later `next` override.
+extern "C" fn iterator_helper_next_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    _arg: f64,
+) -> f64 {
+    unsafe {
+        let Some(obj) = implicit_this_iterator_object() else {
+            return brand_type_error("next");
+        };
+        if (*obj).class_id != crate::iterator_helpers::ITERATOR_HELPER_CLASS_ID {
+            return brand_type_error("next");
+        }
+        crate::iterator_helpers::iterator_helper_next_builtin(obj)
+    }
 }
 
 /// `%IteratorPrototype%[Symbol.iterator]()` returns `this` (the iterator).
@@ -194,6 +231,8 @@ fn build_iterator_prototypes() {
         "RegExp String Iterator",
         shared,
     );
+    let iterator_helper_proto =
+        build_family_proto(iterator_helper_next_thunk, "Iterator Helper", shared);
 
     ITERATOR_PROTOTYPE_PTR.store(shared as i64, Ordering::Release);
     ARRAY_ITERATOR_PROTOTYPE_PTR.store(array_proto as i64, Ordering::Release);
@@ -201,6 +240,7 @@ fn build_iterator_prototypes() {
     SET_ITERATOR_PROTOTYPE_PTR.store(set_proto as i64, Ordering::Release);
     STRING_ITERATOR_PROTOTYPE_PTR.store(string_proto as i64, Ordering::Release);
     REGEXP_STRING_ITERATOR_PROTOTYPE_PTR.store(regexp_string_proto as i64, Ordering::Release);
+    ITERATOR_HELPER_PROTOTYPE_PTR.store(iterator_helper_proto as i64, Ordering::Release);
 }
 
 /// Install `[Symbol.iterator]` on the shared parent as a real method whose
@@ -263,7 +303,41 @@ fn build_family_proto(
     proto
 }
 
+/// Whether any iterator-prototype tower has been materialized on this thread.
+#[cfg(test)]
+pub(crate) fn iterator_prototypes_materialized() -> bool {
+    ITERATOR_PROTOTYPE_PTR.load(Ordering::Acquire) != 0
+}
+
+#[cfg(test)]
+mod override_probe_premise_tests {
+    use super::*;
+
+    /// The fast path in `call_overridden_iterator_next` returns `None` on a
+    /// null tower, treating that as PROOF that no override exists. That is only
+    /// sound if every route to the prototype object materializes the tower —
+    /// this pins the route user code takes, `Object.getPrototypeOf(iter)`,
+    /// which lands in `iterator_prototype_for_class_id`.
+    ///
+    /// Deliberately one-directional: `perry-runtime`'s suite shares process
+    /// globals, so asserting the tower starts null would make this depend on
+    /// test order. The implication is what the fast path actually relies on.
+    #[test]
+    fn reaching_an_iterator_prototype_materializes_the_tower() {
+        assert!(
+            iterator_prototype_for_class_id(crate::array::ARRAY_ITERATOR_CLASS_ID).is_some(),
+            "array iterator must have a prototype to reach",
+        );
+        assert!(
+            iterator_prototypes_materialized(),
+            "reaching a prototype must materialize the tower, or a null tower \
+             would no longer prove the absence of an override",
+        );
+    }
+}
+
 /// Lazily build the prototypes (idempotent). Cheap after the first call.
+
 pub(crate) fn ensure_iterator_prototypes() {
     if ITERATOR_PROTOTYPE_PTR.load(Ordering::Acquire) == 0 {
         build_iterator_prototypes();
@@ -280,6 +354,7 @@ pub(crate) fn iterator_prototype_for_class_id(class_id: u32) -> Option<f64> {
         crate::collection_iter_object::SET_ITERATOR_CLASS_ID => &SET_ITERATOR_PROTOTYPE_PTR,
         crate::string::STRING_ITERATOR_CLASS_ID => &STRING_ITERATOR_PROTOTYPE_PTR,
         crate::regex::REGEXP_STRING_ITERATOR_CLASS_ID => &REGEXP_STRING_ITERATOR_PROTOTYPE_PTR,
+        crate::iterator_helpers::ITERATOR_HELPER_CLASS_ID => &ITERATOR_HELPER_PROTOTYPE_PTR,
         _ => return None,
     };
     let ptr = slot.load(Ordering::Acquire);
@@ -305,6 +380,7 @@ pub(crate) fn attach_iterator_prototype(obj_ptr: *mut ObjectHeader, class_id: u3
         crate::collection_iter_object::SET_ITERATOR_CLASS_ID => &SET_ITERATOR_PROTOTYPE_PTR,
         crate::string::STRING_ITERATOR_CLASS_ID => &STRING_ITERATOR_PROTOTYPE_PTR,
         crate::regex::REGEXP_STRING_ITERATOR_CLASS_ID => &REGEXP_STRING_ITERATOR_PROTOTYPE_PTR,
+        crate::iterator_helpers::ITERATOR_HELPER_CLASS_ID => &ITERATOR_HELPER_PROTOTYPE_PTR,
         _ => return,
     };
     let proto_ptr = slot.load(Ordering::Acquire);
@@ -323,7 +399,63 @@ pub(crate) unsafe fn call_overridden_iterator_next(
     let scope = crate::gc::RuntimeHandleScope::new();
     let iter = scope.root_nanbox_f64(crate::value::js_nanbox_pointer(iter_obj as i64));
     let previous = scope.root_nanbox_f64(super::js_implicit_this_get());
-    ensure_iterator_prototypes();
+    // #9019: an OWN `next` (`it.next = fn`, stored past the reserved floor
+    // by `object/reserved_floor.rs`) shadows the prototype thunk and exists
+    // independently of the tower, so probe it BEFORE the tower-null
+    // early-out — the assignment alone materializes nothing. For every
+    // unpatched iterator the probe is one descriptor lookup ending at a
+    // null keys edge. A PRESENT own value that is not a closure throws,
+    // matching IteratorNext's GetV+Call — it must never fall through to the
+    // builtin advance, which would ignore the patch the user installed.
+    let own = super::js_object_get_own_field_or_undef(iter.get_nanbox_f64(), b"next".as_ptr(), 4);
+    // `it.next = undefined` is PRESENT but non-callable (GetV yields the
+    // stored undefined, Call throws), which the value read alone cannot
+    // distinguish from absence. The bytes-based keys scan allocates nothing,
+    // and an unpatched iterator's keys edge is null, so the hot path pays
+    // one null check.
+    let own_present = own.to_bits() != crate::value::TAG_UNDEFINED || {
+        let obj = crate::value::js_nanbox_get_pointer(iter.get_nanbox_f64()) as *const ObjectHeader;
+        let keys = super::object_keys_array(obj);
+        !keys.is_null()
+            && super::keys_find_slot_by_bytes(
+                keys,
+                crate::array::js_array_length(keys) as u32,
+                b"next",
+            )
+            .is_some()
+    };
+    if own_present {
+        if !JSValue::from_bits(own.to_bits()).is_pointer() {
+            crate::closure::throw_not_callable();
+        }
+        let own_raw = crate::value::js_nanbox_get_pointer(own);
+        // `is_closure_ptr` self-validates the address (handle band + heap
+        // floor + magic probe), so a null or mis-boxed value throws rather
+        // than faulting.
+        if !crate::closure::is_closure_ptr(own_raw as usize) {
+            crate::closure::throw_not_callable();
+        }
+        let method = scope.root_nanbox_f64(own);
+        super::js_implicit_this_set(iter.get_nanbox_f64());
+        let result = crate::exception::js_call_catching(|| {
+            crate::closure::js_native_call_value(method.get_nanbox_f64(), std::ptr::null(), 0)
+        });
+        super::js_implicit_this_set(previous.get_nanbox_f64());
+        return match result {
+            Ok(value) => Some(value),
+            Err(error) => crate::exception::js_throw(error),
+        };
+    }
+    // An override can only be installed through the prototype OBJECT, and the
+    // only way user code obtains that object is `Object.getPrototypeOf(iter)`
+    // (or a direct prototype write), both of which materialize the tower. A
+    // null tower therefore PROVES no override exists — and building the tower
+    // here, as this probe used to, made every builtin `.next()` allocate a
+    // "next" key string and run a by-name prototype lookup just to learn
+    // nothing was patched.
+    if ITERATOR_PROTOTYPE_PTR.load(Ordering::Acquire) == 0 {
+        return None;
+    }
     let (slot, canonical): (&crate::object::RealmAtomicI64, *const u8) = match class_id {
         crate::array::ARRAY_ITERATOR_CLASS_ID => (
             &ARRAY_ITERATOR_PROTOTYPE_PTR,
