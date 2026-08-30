@@ -27,7 +27,7 @@ use crate::gc::telemetry::RootSourcesTraceStats;
 // the Itanium/pthread declarations, which do not exist there.
 #[cfg(not(target_os = "windows"))]
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock, RwLockReadGuard};
 
 /// Magic and version of the compact map the compiler emits
@@ -205,6 +205,46 @@ impl StackMapIndexStore {
 }
 
 static STACK_MAPS: StackMapIndexStore = StackMapIndexStore::new();
+
+/// Set by [`initialize`], read by the root scan.
+///
+/// The scan resolves native frame roots through the stack-map index, and an
+/// index that was never built is INDISTINGUISHABLE downstream from an image
+/// with no native roots: both are empty. The consequences are not the same.
+/// With statepoints as the only root mechanism, scanning against an unbuilt
+/// index means the collector finds no roots, frees live objects, and corrupts
+/// the heap with no diagnostic — the same failure `build_stack_map_index`
+/// already refuses to degrade into, asserted here at the consuming end.
+///
+/// It cannot fire today: `js_gc_init` builds the index eagerly, before any
+/// mutator code runs. It is here so that it CAN fire if the build is ever made
+/// lazy and a path into the scan is missed — turning a silent, delayed heap
+/// corruption into a loud abort on the first test that reaches it. Landing it
+/// while the build is still eager is deliberate: it proves the check is placed
+/// on the path it claims to guard, before anything depends on it.
+static STACK_MAPS_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// Whether [`initialize`] has run. Exposed so a future lazy build can assert
+/// the same property at whatever point it chooses to construct the index.
+pub(in crate::gc) fn stack_maps_initialized() -> bool {
+    STACK_MAPS_INITIALIZED.load(Ordering::Acquire)
+}
+
+/// Does any loaded image carry a gc-map section — i.e. are there native frame
+/// roots for the scan to miss?
+///
+/// This inspects the loader's image list; it does not decode anything, and the
+/// answer is cached because it cannot change for a process once its images are
+/// loaded. An inspection error answers `true`, so an unreadable loader makes
+/// the assert stricter rather than weaker.
+fn image_has_stack_map_sections() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        loaded_stack_map_sections()
+            .map(|sections| !sections.is_empty())
+            .unwrap_or(true)
+    })
+}
 
 // #7803 creation-cycle verifier (diagnostic, `PERRY_GC_NATIVE_SLOT_VERIFY=1`).
 //
@@ -609,8 +649,55 @@ pub(in crate::gc) fn record_native_stack_walk_source(
     }
 }
 
+/// Mark the stack-map index as owed, without building it.
+///
+/// Decoding the gc-map section is the single largest cost in process startup
+/// for a big image — 17.4MB, 72,713 functions, 2.15M records and a 117MB index
+/// for claude-code — and a run that never collects never reads any of it.
+/// `cc --version` is exactly that run.
+///
+/// The build is therefore deferred to [`ensure_built`], which every path that
+/// can reach a root scan calls while allocation is still legal. Missing one of
+/// those paths would mean scanning against an unbuilt index, which is
+/// indistinguishable from "this image has no native roots" and frees live
+/// objects silently — so the assert at the top of `visit_stack_map_root_slots`
+/// (#9182) exists to turn that into a loud abort instead. It landed first, on
+/// purpose.
+///
+/// Re-arms on every call: a newly loaded image calls `js_gc_init` again, and
+/// the next collection must decode its section too.
 pub(in crate::gc) fn initialize() {
+    STACK_MAPS_INITIALIZED.store(false, Ordering::Release);
+    if !lazy_stack_maps_enabled() {
+        ensure_built();
+    }
+}
+
+/// `PERRY_LAZY_STACK_MAPS=0` restores the eager decode at `js_gc_init`, for
+/// A/B measurement of what the deferral is worth.
+fn lazy_stack_maps_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        !matches!(
+            std::env::var("PERRY_LAZY_STACK_MAPS").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        )
+    })
+}
+
+/// Build the stack-map index if it is owed. Safe to call redundantly.
+///
+/// MUST be called before any path that can reach [`visit_stack_map_root_slots`],
+/// and while allocation is still legal — the parser allocates its index once,
+/// and root scans must stay allocation-free while the collector owns the heap.
+pub(in crate::gc) fn ensure_built() {
+    if STACK_MAPS_INITIALIZED.load(Ordering::Acquire) {
+        return;
+    }
     STACK_MAPS.rebuild();
+    // Publish AFTER the rebuild: a reader that observes the flag must be able
+    // to observe the index it promises.
+    STACK_MAPS_INITIALIZED.store(true, Ordering::Release);
 }
 
 /// Whether this image carries any native stack-map records — i.e. whether
@@ -1123,6 +1210,22 @@ impl StackMapIndex {
 pub(super) fn visit_stack_map_root_slots(
     visit: &mut impl FnMut(MutableRootSlot),
 ) -> NativeStackWalkStats {
+    // The invariant is not "initialize ran" but "an empty index means this
+    // image genuinely has no native roots". Stating it that way keeps the
+    // check live in EVERY configuration: perry-runtime's unit tests reach the
+    // scan without `js_gc_init`, and they pass because their harness carries
+    // no gc-map section — the right reason — rather than by being exempted
+    // from the check. Exempting them by build config would leave no check in
+    // precisely the configuration where the index is legitimately unbuilt,
+    // which is a hole the moment a test binary does carry statepoint frames.
+    assert!(
+        stack_maps_initialized() || !image_has_stack_map_sections(),
+        "perry: the native root scan ran before the stack-map index was built. \
+         An unbuilt index is indistinguishable from an image with no native \
+         roots, so the collector would find no roots on this frame and free \
+         live objects silently. This means a path into the root scan does not \
+         pass through the point that builds the index."
+    );
     let published = stack_maps();
     let index = &published.index;
     if index.records.is_empty() {

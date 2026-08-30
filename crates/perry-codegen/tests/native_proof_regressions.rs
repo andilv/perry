@@ -1568,9 +1568,13 @@ fn pod_field_read_after_dynamic_materialization_uses_dynamic_numeric_sub() {
         ir.contains("call double @js_dynamic_sub"),
         "materialized POD field reads must use coercing dynamic arithmetic:\n{ir}"
     );
+    // The `fsub` may appear, but only downstream of a runtime tag test: since
+    // the guarded-arithmetic change, `-` emits a diamond whose cold arm is the
+    // `js_dynamic_sub` asserted above. What must never happen — boxed bits
+    // reaching raw arithmetic on a static claim alone — is what is asserted.
     assert!(
-        !ir.contains("fsub double"),
-        "materialized POD field reads must not feed boxed JSValue bits into raw arithmetic:\n{ir}"
+        !ir.contains("fsub double") || ir.contains("guarded_arith.numeric"),
+        "materialized POD field reads must not feed boxed JSValue bits into UNGUARDED raw arithmetic:\n{ir}"
     );
 }
 
@@ -12648,14 +12652,28 @@ fn typed_f64_receiver_method_clone_raw_loads_after_composed_guards() {
     let method_guard = caller_ir
         .find("call i32 @js_typed_feedback_method_direct_call_guard")
         .unwrap_or_else(|| panic!("caller should use the full method-direct guard:\n{caller_ir}"));
+    // The method-direct PROOF that dominates the fast arm is the inline
+    // shape probe (its first block loads the prototype-override latch) —
+    // the runtime guard is that probe's miss edge and is emitted after the
+    // fast arm in text order. Either form is the same proof; take whichever
+    // comes first so the ordering assertion below is about the proof, not
+    // about which emission shape carried it.
+    let inline_probe = caller_ir.find("@PERRY_CLASS_PROTOTYPE_FAST_GUARDS_INVALIDATED");
+    let method_proof = inline_probe.map_or(method_guard, |p| p.min(method_guard));
     let field_guard = caller_ir
         .find("call i32 @js_typed_feedback_class_field_get_guard")
         .unwrap_or_else(|| panic!("caller should guard raw-f64 receiver fields:\n{caller_ir}"));
+    // Same for the raw-f64 FIELD proof: one inline class-field precheck
+    // (the field-GET sites' form, first mentioned by its `deref` block in the
+    // branch that enters it) dominates the typed call, and the per-field
+    // runtime guard is that precheck's miss edge.
+    let inline_field_precheck = caller_ir.find("class_field_inline.deref");
+    let field_proof = inline_field_precheck.map_or(field_guard, |p| p.min(field_guard));
     let typed_call = caller_ir
         .find(&format!("call double @{typed}(i64 "))
         .unwrap_or_else(|| panic!("caller should call the receiver clone:\n{caller_ir}"));
     assert!(
-        method_guard < field_guard && field_guard < typed_call,
+        method_proof < field_proof && field_proof < typed_call,
         "receiver clone must run only after method-direct and raw-f64 field guards:\n{caller_ir}"
     );
     // #7506: this used to assert the guard-failure edge calls `$generic` BY
@@ -12744,9 +12762,13 @@ fn typed_f64_receiver_method_clone_raw_loads_after_composed_guards() {
              keep the possibly boxed `+` result on semantically dynamic multiplication:\n\
              {pshape_ir}"
         );
+        // Annotation-only operands still must not reach raw multiplication on
+        // the strength of the annotation. They may reach it after a runtime
+        // tag test, which is the same standard `+` has held since #9159 and
+        // which `*` now shares: the diamond's cold arm keeps `js_dynamic_mul`.
         assert!(
-            !pshape_ir.contains(" fmul "),
-            "annotation-only operands must not reach raw f64 multiplication in `$pshape`:\n{pshape_ir}"
+            !pshape_ir.contains(" fmul ") || pshape_ir.contains("guarded_arith.numeric"),
+            "annotation-only operands must not reach UNGUARDED raw f64 multiplication in `$pshape`:\n{pshape_ir}"
         );
     }
     assert!(
@@ -12854,9 +12876,7 @@ fn typed_f64_closure_clone_emits_internal_clone_and_guarded_direct_call() {
         "typed closure should expose a public wrapper and keep an internal generic body:\n{ir}"
     );
     assert!(
-        ir.contains(&format!(
-            "call i64 @js_closure_alloc_singleton(ptr @{public}"
-        )),
+        ir.contains(&format!("call i64 @js_closure_alloc(ptr @{public}")),
         "closure allocation must keep storing the public wrapper pointer:\n{ir}"
     );
     assert!(
@@ -12985,9 +13005,7 @@ fn typed_i32_closure_clone_emits_internal_clone_and_guarded_direct_call() {
         "typed-i32 closure should expose a public wrapper and keep an internal generic body:\n{ir}"
     );
     assert!(
-        ir.contains(&format!(
-            "call i64 @js_closure_alloc_singleton(ptr @{public}"
-        )),
+        ir.contains(&format!("call i64 @js_closure_alloc(ptr @{public}")),
         "closure allocation must keep storing the public wrapper pointer:\n{ir}"
     );
     assert!(
@@ -13184,9 +13202,7 @@ fn typed_i1_closure_clone_emits_internal_clone_and_guarded_direct_call() {
         "typed closure should expose a public wrapper and keep an internal generic body:\n{ir}"
     );
     assert!(
-        ir.contains(&format!(
-            "call i64 @js_closure_alloc_singleton(ptr @{public}"
-        )),
+        ir.contains(&format!("call i64 @js_closure_alloc(ptr @{public}")),
         "closure allocation must keep storing the public wrapper pointer:\n{ir}"
     );
     assert!(
@@ -13437,9 +13453,7 @@ fn typed_string_closure_clone_emits_internal_clone_and_guarded_direct_call() {
         "typed string closure should expose a public wrapper and keep an internal generic body:\n{ir}"
     );
     assert!(
-        ir.contains(&format!(
-            "call i64 @js_closure_alloc_singleton(ptr @{public}"
-        )),
+        ir.contains(&format!("call i64 @js_closure_alloc(ptr @{public}")),
         "closure allocation must keep storing the public wrapper pointer:\n{ir}"
     );
     assert!(
@@ -15270,8 +15284,8 @@ fn nested_same_shape_object_writes_version_one_through_four_fields() {
         rejected
             .matches("call double @js_put_value_set_ic_miss")
             .count(),
-        20,
-        "the bounded rejection must preserve all four cache miss entries for all five semantic write sites:\n{rejected}"
+        25,
+        "the bounded rejection must preserve all five fallback entries for all five semantic write sites:\n{rejected}"
     );
 
     let mut nonfinite_body = loop_body(1);
@@ -15599,3 +15613,49 @@ mod integer_modulo;
 
 #[path = "native_proof_regressions/math_mul_fastpath.rs"]
 mod math_mul_fastpath;
+
+// `sum = sum + arr[i] + arr[j]` in a nested counted loop (suite
+// `10_nested_loops`): the inner clone reads `arr` at its own counter AND at the
+// outer loop's. The foreign read used to fall to the typed-feedback tier — a
+// registered guard CALL plus a boxed fallback per element — while the sibling
+// read beside it was a raw slot load. It now takes the same raw load behind one
+// inline bounds check, exiting to the clone's existing side exit when it fails.
+#[test]
+fn packed_clone_reads_a_foreign_counter_without_the_feedback_call() {
+    let add = |left: Expr, right: Expr| Expr::Binary {
+        op: BinaryOp::Add,
+        left: Box::new(left),
+        right: Box::new(right),
+    };
+    let body = vec![
+        number_array_let(1, "arr", vec![1, 2, 3, 4, 5, 6, 7, 8]),
+        Stmt::Let {
+            id: 2,
+            name: "sum".to_string(),
+            ty: Type::Number,
+            mutable: true,
+            init: Some(Expr::Number(0.0)),
+        },
+        for_loop(
+            3,
+            length(1),
+            vec![for_loop(
+                4,
+                length(1),
+                vec![Stmt::Expr(Expr::LocalSet(
+                    2,
+                    Box::new(add(
+                        add(local(2), index_get(1, local(3))),
+                        index_get(1, local(4)),
+                    )),
+                ))],
+            )],
+        ),
+        Stmt::Return(Some(local(2))),
+    ];
+    let ir = compile_ir("packed_clone_foreign_read.ts", body);
+    assert!(
+        ir.contains("packed_f64_loop.foreign.inbounds"),
+        "the foreign-counter read should take the bounds-checked clone load:\n{ir}"
+    );
+}

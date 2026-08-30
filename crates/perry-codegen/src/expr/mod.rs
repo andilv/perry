@@ -134,6 +134,7 @@ pub(crate) use v8_interop::{
 pub(crate) use write_barrier::{
     emit_array_numeric_write_note_on_block, emit_jsvalue_slot_store_on_block,
     emit_jsvalue_slot_store_pointer_tested, emit_jsvalue_slot_store_scalar_aware_on_block,
+    emit_jsvalue_slot_store_scalar_aware_with_flags_on_block,
     emit_jsvalue_slot_store_with_flags_on_block, emit_jsvalue_slot_store_with_value_bits_on_block,
     emit_layout_note_slot_on_block, emit_may_carry_heap_pointer_check,
     emit_root_heap_word_store_on_block, emit_root_nanbox_store_on_block, emit_write_barrier,
@@ -998,6 +999,11 @@ pub(crate) struct FnCtx<'a> {
     /// `i` in bounds.
     pub packed_f64_loop_facts: Vec<PackedF64LoopFact>,
     pub masked_window_array_facts: Vec<MaskedWindowArrayFact>,
+    /// Scoped facts established by the string-array masked-window loop
+    /// versioner. The entry guard proves every slot in the window is an
+    /// in-bounds SSO-or-heap string, so reads may bypass ordinary array
+    /// dispatch and string `.length` needs no dynamic miss arm.
+    pub string_window_array_facts: Vec<StringWindowArrayFact>,
     /// #6750 follow-up: locals currently flow-refined to Number inside a
     /// masked-window region fast copy — their shadow slots were cleared at
     /// the refinement point and per-statement shadow updates are suppressed
@@ -1061,6 +1067,49 @@ pub(crate) struct FnCtx<'a> {
     /// so no conversion exists on either edge; the stale number left in the
     /// root slot during the clone is harmless to a GC scan.
     pub numeric_accumulator_f64_slots: std::collections::HashMap<u32, String>,
+    /// Poll-scoped receiver cache, active only while a packed fast clone is
+    /// being lowered: array local id -> frame-rooted F64 alloca holding the
+    /// receiver BOX. Every in-clone `LocalGet` of the receiver reads this
+    /// alloca instead of the source binding's root, so native-root mem2reg
+    /// promotes it and LLVM hoists the handle mask + element base math out of
+    /// the loop — the per-access root re-derive was 3-5 instructions on every
+    /// packed load and store. The cache is itself rewritten by evacuation and
+    /// refreshes from the source root on the ARMED arm of every loop poll
+    /// (`emit_armed_gc_loop_safepoint`), which is the only place a call-free
+    /// clone can collect; entries in `packed_receiver_refresh` drive that
+    /// reload for EVERY active scope, which keeps nested clones' outer caches
+    /// fresh when an inner loop's poll fires. Rooting the cache is required
+    /// even with that reload: it makes liveness across the poll explicit and
+    /// keeps the shadow and native precise-root lowerings structurally sound.
+    pub packed_receiver_box_slots: std::collections::HashMap<u32, String>,
+    /// (alloca, source ref, source-is-module-global) reload recipes for the
+    /// poll-arm refresh of `packed_receiver_box_slots`.
+    pub packed_receiver_refresh: Vec<(String, String)>,
+    /// Masked-handle twin of `packed_receiver_box_slots`: array id -> i64
+    /// alloca holding `box & POINTER_MASK`. The hot packed lanes' address
+    /// math consults it via `packed_receiver_handle_i64`, removing the
+    /// per-element mask that LLVM cannot PRE across the poll's refresh phi.
+    pub packed_receiver_handle_slots: std::collections::HashMap<u32, String>,
+    /// When set, `emit_armed_gc_loop_safepoint` gates its VOLATILE armed
+    /// load on `(counter & 63) == 0`, so the poll's serialization cost (and
+    /// the receiver-cache re-derive it forces on every element) is paid once
+    /// per 64 iterations instead of per iteration. Sound because the clone
+    /// body is call-free — the poll is its only collection point, and a
+    /// 64-iteration drain delay on a sub-nanosecond loop body is far inside
+    /// the poll contract's tolerance. Holds the counter's i32 slot; set and
+    /// cleared by the packed fast-clone lowering.
+    pub poll_stride_counter_slot: Option<String>,
+    /// Update-only INTEGER accumulators (`c++` count loops) inside a packed
+    /// fast clone: while a local id is in this set, `Expr::Update` touches
+    /// ONLY its parallel i32 slot (a promotable alloca — the loop-carried
+    /// value becomes a 1-cycle integer add instead of the double slot's
+    /// load→fadd→store chain, which cost the count loops ~5 cycles/element
+    /// of pure latency). The double slot goes stale for the clone's duration
+    /// and is re-synced (`sitofp` + store) at every clone exit. Admission
+    /// (packed preheader): writes are Update-only, the local is an
+    /// integer-local with an i32 slot, and an entry range test proves
+    /// |value| < 2^30 so `bound <= 16M` iterations cannot wrap the i32.
+    pub deferred_integer_update_accumulators: std::collections::HashSet<u32>,
 
     /// Representation-selection Phase 1 (RFC `docs/representation-selection-
     /// rfc.md`): LocalId → selected slot representation. Absent = `Boxed`
@@ -1965,6 +2014,25 @@ pub(crate) enum MaskedWindowElem {
     TaF64 { data_ptr: String },
 }
 
+/// The pointer-masked receiver handle for a packed-lane access: the cached
+/// pre-masked value when the clone hoisted it, else the inline
+/// bitcast-and-mask. One i64 load vs two ALU ops — the win is that the load
+/// is loop-invariant to LLVM while the mask of a poll-refreshed phi is not.
+pub(crate) fn packed_receiver_handle_i64(
+    ctx: &mut FnCtx<'_>,
+    arr_id: Option<u32>,
+    arr_box: &str,
+) -> String {
+    if let Some(id) = arr_id {
+        if let Some(slot) = ctx.packed_receiver_handle_slots.get(&id).cloned() {
+            return ctx.block().load(crate::types::I64, &slot);
+        }
+    }
+    let blk = ctx.block();
+    let bits = blk.bitcast_double_to_i64(arr_box);
+    blk.and(crate::types::I64, &bits, crate::nanbox::POINTER_MASK_I64)
+}
+
 /// Read-only masked-index window fact for the dense packed-f64 range loop:
 /// the entry guard (`js_typed_feedback_packed_f64_range_loop_guard_dense`
 /// for the plain tiers, `js_typed_feedback_masked_window_ta_kind` for the
@@ -1997,6 +2065,20 @@ pub(crate) struct MaskedWindowArrayFact {
     /// the i32 tier's all-slots-i32 materialization proof, and the TA tiers'
     /// hoisted data pointers serve reads only.
     pub allows_stores: bool,
+}
+
+/// Read-only masked-index window over a plain array of boxed strings.
+///
+/// The fast-loop preheader validates the receiver shape, bounds, and every
+/// slot's string tag. Its body is call/store-free apart from the accumulator
+/// update, so the proof remains true until the scoped clone exits.
+#[derive(Debug, Clone)]
+pub(crate) struct StringWindowArrayFact {
+    pub array_local_id: u32,
+    pub scope_id: u32,
+    pub min_idx: i64,
+    pub max_idx_exclusive: i64,
+    pub numeric_accumulator: u32,
 }
 
 /// #5093: one fact per (receiver, versioned loop). See
@@ -2638,6 +2720,8 @@ mod index_get_claim_tests;
 pub(crate) mod masked_window;
 #[cfg(test)]
 mod null_default_numeric_add_tests;
+mod string_length;
+pub(crate) mod string_window;
 
 mod ptr_numarray_access;
 mod ta_param_f64_read;

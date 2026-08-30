@@ -57,6 +57,31 @@ const BUILD_CACHE_ENV_VARS: &[&str] = &[
     // off, the map is empty and every binding takes the entry-resolved
     // indirect path, so the two settings emit different call sequences.
     "PERRY_CALL_DEVIRT",
+    // #9124: gates deciding the monomorphic method case with the inline
+    // shape probe instead of the typed-feedback runtime guard — the two
+    // settings emit different call sequences, so a cached object from one
+    // must not serve the other.
+    "PERRY_METHOD_INLINE_PROBE",
+    // #9149: gates hoisting a loop-invariant property-array receiver out of
+    // counted for-loops — on and off emit different loop bodies, so a cached
+    // object from one must not serve the other.
+    "PERRY_LOOP_PROPERTY_HOIST",
+    // #9154: gates keeping the packed fast path across break/continue/return —
+    // on and off emit different loop exits, so a cached object from one must
+    // not serve the other.
+    "PERRY_PACKED_LOOP_ABRUPT",
+    // #9159: gates admitting the guarded fadd for two-leaf dynamic `+` — on
+    // and off emit different add sequences, so a cached object from one must
+    // not serve the other.
+    "PERRY_DYNAMIC_ADD_PAIR_GUARD",
+    // #9166: gates the guarded inline path for `-`, `*` and `/` — on and off
+    // emit different arithmetic sequences, so a cached object from one must
+    // not serve the other.
+    "PERRY_GUARDED_ARITH",
+    // #9122: gates the shape-cache path for object literals whose methods
+    // capture `this` — on and off emit different literal-birth sequences,
+    // so a cached object from one must not serve the other.
+    "PERRY_OBJECT_LITERAL_SHAPE_METHODS",
     // #9060: gates whether a reduce accumulator earns the stable-packed fast
     // clone's numeric proof — with it on, `s += arr[i]` lowers to an inline
     // fadd instead of `js_dynamic_string_or_number_add`, so the two settings
@@ -181,6 +206,11 @@ const BUILD_CACHE_ENV_EXCLUSIONS: &[&str] = &[
     // Human-facing telemetry only; never changes IR or object bytes.
     "PERRY_CODEGEN_PROGRESS",
     "PERRY_CODEGEN_UNIT_TIMINGS",
+    // `packed_loop_reject` prints the admission chain's declining condition and
+    // returns `None` either way — the rejection is what the caller already got
+    // without the flag, so the emitted code is identical. An input, rather than
+    // an exclusion, would make every trace run miss the cache for nothing.
+    "PERRY_PACKED_LOOP_TRACE",
     // Entry outlining report output is observational only.
     "PERRY_OUTLINE_ENTRY_REPORT",
     // Only read on an already-fatal dialect-construction failure (a unit that

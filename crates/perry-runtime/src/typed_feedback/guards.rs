@@ -106,6 +106,11 @@ fn method_direct_call_contract(
         );
     };
     let name_hash = hash_bytes(method_bytes);
+    let method_guard_slot = crate::object::class_prototype_method_guard_slot(method_name);
+    if crate::object::class_prototype_fast_guard_invalidated_for_method(method_guard_slot) {
+        return (shape_addr, class_id, gc_type, name_hash, false);
+    }
+
     if object_addr == 0
         || expected_class_id == 0
         || !crate::object::shapes::is_shape_id(expected_shape_id)
@@ -119,6 +124,7 @@ fn method_direct_call_contract(
     unsafe {
         if (*gc_header).obj_type != crate::gc::GC_TYPE_OBJECT
             || (*gc_header).gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
+            || (*gc_header)._reserved & crate::gc::OBJ_FLAG_STABLE_TOMBSTONES != 0
         {
             return (shape_addr, class_id, gc_type, name_hash, false);
         }
@@ -282,7 +288,9 @@ fn class_field_get_contract(
         if (*gc_header).obj_type != crate::gc::GC_TYPE_OBJECT {
             return (0, 0, gc_type, false);
         }
-        if (*gc_header).gc_flags & crate::gc::GC_FLAG_FORWARDED != 0 {
+        if (*gc_header).gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
+            || (*gc_header)._reserved & crate::gc::OBJ_FLAG_STABLE_TOMBSTONES != 0
+        {
             return (0, 0, gc_type, false);
         }
 
@@ -335,6 +343,7 @@ fn class_field_fast_contract(
     unsafe {
         if (*gc_header).obj_type != crate::gc::GC_TYPE_OBJECT
             || (*gc_header).gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
+            || (*gc_header)._reserved & crate::gc::OBJ_FLAG_STABLE_TOMBSTONES != 0
         {
             return false;
         }
@@ -551,7 +560,9 @@ fn class_field_set_contract(
             return (0, 0, gc_type, false);
         }
         if (*gc_header)._reserved
-            & (crate::gc::OBJ_FLAG_FROZEN | crate::gc::OBJ_FLAG_PACKED_NUMERIC_PROOF)
+            & (crate::gc::OBJ_FLAG_FROZEN
+                | crate::gc::OBJ_FLAG_PACKED_NUMERIC_PROOF
+                | crate::gc::OBJ_FLAG_STABLE_TOMBSTONES)
             != 0
         {
             let obj = object_addr as *mut ObjectHeader;
@@ -1065,7 +1076,9 @@ pub unsafe extern "C" fn js_method_direct_shape_class(
     if (*gc_header).obj_type != crate::gc::GC_TYPE_OBJECT
         || (*gc_header).gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
         || (*gc_header)._reserved
-            & (crate::gc::OBJ_FLAG_HAS_DESCRIPTORS | crate::gc::OBJ_FLAG_PACKED_NUMERIC_PROOF)
+            & (crate::gc::OBJ_FLAG_HAS_DESCRIPTORS
+                | crate::gc::OBJ_FLAG_STABLE_TOMBSTONES
+                | crate::gc::OBJ_FLAG_PACKED_NUMERIC_PROOF)
             != 0
         || crate::object::class_prototype_fast_guard_invalidated_for_method(method_guard_slot)
     {
@@ -1244,7 +1257,9 @@ pub unsafe extern "C" fn js_object_own_method_cache_miss(
     if (*gc_header).obj_type != crate::gc::GC_TYPE_OBJECT
         || (*gc_header).gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
         || (*gc_header)._reserved
-            & (crate::gc::OBJ_FLAG_HAS_DESCRIPTORS | crate::gc::OBJ_FLAG_PACKED_NUMERIC_PROOF)
+            & (crate::gc::OBJ_FLAG_HAS_DESCRIPTORS
+                | crate::gc::OBJ_FLAG_STABLE_TOMBSTONES
+                | crate::gc::OBJ_FLAG_PACKED_NUMERIC_PROOF)
             != 0
     {
         return 0;

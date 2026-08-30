@@ -1137,6 +1137,7 @@ pub(super) fn compile_function(
         bounded_index_pairs: Vec::new(),
         packed_f64_loop_facts: Vec::new(),
         masked_window_array_facts: Vec::new(),
+        string_window_array_facts: Vec::new(),
         masked_region_scalar_locals: std::collections::HashSet::new(),
         suppressed_cleared_shadow_slots: std::collections::HashSet::new(),
         class_field_loop_facts: Vec::new(),
@@ -1149,6 +1150,11 @@ pub(super) fn compile_function(
             .collect(),
         i32_counter_slots: spec_i32_param_slots,
         numeric_accumulator_f64_slots: HashMap::new(),
+        packed_receiver_box_slots: HashMap::new(),
+        packed_receiver_refresh: Vec::new(),
+        packed_receiver_handle_slots: HashMap::new(),
+        poll_stride_counter_slot: None,
+        deferred_integer_update_accumulators: HashSet::new(),
         repsel_context_allows_canonical_i32: repsel_allows,
         // #7109 split the FIELD out of `repsel_context_allows_canonical_i32`;
         // #7128 split the VALUE, which is what the knob actually reads. Until

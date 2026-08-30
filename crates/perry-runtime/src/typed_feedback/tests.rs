@@ -1174,6 +1174,12 @@ fn typed_feedback_array_loop_helpers_have_lto_keepalive_anchors() {
         "static KEEP_JS_TYPED_FEEDBACK_PACKED_F64_RANGE_LOOP_GUARD: extern \"C\" fn(",
         "js_typed_feedback_packed_f64_range_loop_guard",
     );
+    assert_lto_keepalive_anchor(
+        typed_feedback,
+        "KEEP_JS_STRING_ARRAY_RANGE_LOOP_GUARD",
+        "static KEEP_JS_STRING_ARRAY_RANGE_LOOP_GUARD: extern \"C\" fn(f64, i32, i32) -> i32",
+        "js_string_array_range_loop_guard",
+    );
 }
 
 #[test]
@@ -2249,6 +2255,46 @@ fn typed_feedback_method_direct_guard_fails_for_own_method_replacement() {
     assert_eq!(site.guard_passes, 0);
     assert_eq!(site.guard_failures, 1);
     assert_eq!(site.fallback_calls, 1);
+}
+
+#[test]
+fn typed_feedback_method_direct_guard_fails_after_method_invalidation() {
+    let _guard = typed_feedback_test_lock();
+    reset_typed_feedback_for_tests();
+    register(
+        9123,
+        TypedFeedbackSiteKind::MethodCall,
+        "obj.deleted_9123()",
+    );
+
+    let class_id = 0x7EED_9123;
+    let method_name = b"deleted_9123";
+    let (obj, _, _, receiver) = class_instance(class_id, b"x");
+    let expected_shape_id = shape_id(obj);
+    unsafe { register_test_method(class_id, method_name) };
+
+    let guard = || unsafe {
+        js_typed_feedback_method_direct_call_guard(
+            9123,
+            receiver,
+            class_id,
+            expected_shape_id,
+            method_name.as_ptr() as *const i8,
+            method_name.len(),
+            test_direct_method_ptr(),
+        )
+    };
+    assert_eq!(guard(), 1);
+
+    // A delete has no replacement value for the contract to discover. The
+    // sticky per-name latch is the authoritative evidence that the declared
+    // vtable method may no longer be callable.
+    crate::object::invalidate_class_prototype_fast_guards_for_method("deleted_9123");
+    assert_eq!(guard(), 0);
+
+    let site = &typed_feedback_snapshot().sites[0];
+    assert_eq!(site.guard_passes, 1);
+    assert_eq!(site.guard_failures, 1);
 }
 
 #[test]

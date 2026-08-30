@@ -266,13 +266,12 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // ran webhook_endpoints' method) — the `replace is not a function`
             // symptom.
             //
-            // To preserve the hot-path optimizations while restoring identity,
-            // arrow functions are singleton-eligible because they have no own
-            // `.prototype` and are not constructable. Compiler-synthesized
-            // non-arrow async callbacks whose captures are all boxes are also
-            // safe: they are never constructors and their cache key includes
-            // the box addresses. Other non-arrow closures are treated as
-            // potential constructors and always get a fresh instance.
+            // The Stripe fix restricted the caches to arrows (no own
+            // `.prototype`, not constructable) plus non-arrow all-boxed
+            // captures. pi's boot showed that is still not enough: identity
+            // itself is observable (`===`, expandos, setPrototypeOf), not
+            // just `.prototype`, so ANY user literal is off-limits — see the
+            // identity gate below.
             let mut write_ids = std::collections::HashSet::new();
             crate::boxed_vars::collect_write_ids_in_stmts(body, &mut write_ids);
             let writes_unboxed_capture = auto_captures
@@ -284,8 +283,29 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 && auto_captures
                     .iter()
                     .all(|cap_id| ctx.boxed_vars.contains(cap_id));
-            let singleton_identity_safe = *is_arrow || captures_all_boxed;
-            let no_capture_singleton = *is_arrow && total_caps == 0;
+            // IDENTITY GATE (pi boot blocker): a closure literal evaluation
+            // must produce a FRESH function object every time it runs
+            // (ECMA-262 OrdinaryFunctionCreate). Sharing one ClosureHeader
+            // across evaluations is observable through `===`, expando
+            // properties, WeakMap/WeakSet keys, addEventListener identity
+            // de-duplication — and through `Object.setPrototypeOf(a, b)`,
+            // which for a conflated pair (a IS b) becomes a SELF-set and
+            // throws "TypeError: Cyclic __proto__ value". pi's esbuild
+            // bundle wires `setPrototypeOf(wrapped, original)` where both
+            // came from the same arrow literal with bit-identical captures,
+            // so its boot died on exactly that throw.
+            //
+            // The singleton caches therefore only serve closures the
+            // COMPILER synthesized: the async-activation step closures
+            // recognized by `is_plain_async_step_body` (their terminal
+            // `ReleaseBoxes` arms cannot appear in user code, and their
+            // identity never escapes the runtime's promise machinery).
+            // Those are the closures the caches were built for — re-created
+            // per resume with the same per-activation box captures. User
+            // arrows and function expressions always mint fresh objects.
+            let is_plain_async_step = is_plain_async_step_body(body);
+            let singleton_identity_safe = is_plain_async_step && (*is_arrow || captures_all_boxed);
+            let no_capture_singleton = is_plain_async_step && *is_arrow && total_caps == 0;
             let captured_singleton =
                 singleton_identity_safe && !no_capture_singleton && !writes_unboxed_capture;
 
@@ -320,6 +340,16 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 None
             };
 
+            // Bulk-init admission: a fresh closure whose captures are all plain
+            // bits. Box-cell captures keep the per-slot setter path — their
+            // `set_closure_box_capture` bookkeeping has no bulk twin.
+            let bulk_fresh_init = !no_capture_singleton
+                && !captured_singleton
+                && total_caps > 0
+                && !captured_value_bits.is_empty()
+                && auto_captures
+                    .iter()
+                    .all(|cap_id| is_plain_async_step || !ctx.boxed_vars.contains(cap_id));
             let closure_handle = if no_capture_singleton {
                 let blk = ctx.block();
                 blk.call(I64, "js_closure_alloc_singleton", &[(PTR, &func_ref)])
@@ -354,6 +384,32 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     "js_closure_alloc_with_captures_singleton",
                     &[(PTR, &func_ref), (I32, &cap_count), (PTR, &buf)],
                 )
+            } else if bulk_fresh_init {
+                // Fresh (identity-carrying) closure with plain-bits captures:
+                // ONE runtime call does allocation + slots + layout instead of
+                // `js_closure_alloc` plus a `js_closure_set_capture_bits` per
+                // capture (each re-resolving the header, forwarding, kind
+                // dispatch and the barrier's page classification). The reserved
+                // `this` / `new.target` slots are pre-filled with the pointer-free
+                // sentinel the per-slot path relied on `js_closure_alloc` writing;
+                // the post-create patch below fills them exactly as before.
+                let buf = ctx.func.alloca_entry_array(I64, total_caps);
+                {
+                    let blk = ctx.block();
+                    for i in 0..total_caps {
+                        let slot = blk.gep(I64, &buf, &[(I64, &format!("{}", i))]);
+                        match captured_value_bits.get(i) {
+                            Some(v_bits) => blk.store(I64, v_bits, &slot),
+                            None => blk.store(I64, crate::nanbox::TAG_UNDEFINED_I64, &slot),
+                        }
+                    }
+                }
+                let blk = ctx.block();
+                blk.call(
+                    I64,
+                    "js_closure_alloc_init",
+                    &[(PTR, &func_ref), (I32, &cap_count), (PTR, &buf)],
+                )
             } else {
                 let blk = ctx.block();
                 blk.call(
@@ -383,7 +439,6 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // frame as escaped would delay every terminal cell until a full
             // GC. User closures nested inside it still take the dedicated
             // setter and therefore preserve #8213's escaped-cell lifetime.
-            let is_plain_async_step = is_plain_async_step_body(body);
             let boxed_capture_slots = auto_captures
                 .iter()
                 .map(|cap_id| ctx.boxed_vars.contains(cap_id))
@@ -391,6 +446,10 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             let blk = ctx.block();
             for (idx, val_bits) in captured_value_bits.iter().enumerate() {
                 let track_box_capture = boxed_capture_slots[idx] && !is_plain_async_step;
+                if bulk_fresh_init {
+                    // Every slot was written by `js_closure_alloc_init`.
+                    continue;
+                }
                 if !captured_singleton || track_box_capture {
                     let idx_str = idx.to_string();
                     let setter = if track_box_capture {

@@ -83,10 +83,13 @@ pub(crate) use gc_roots::{
     test_symbol_property_root_bits, test_symbol_property_roots,
 };
 
+use crate::fast_hash::{
+    new_ptr_hash_map, new_ptr_hash_set, FastKeyHashMap, PtrHashMap, PtrHashSet,
+};
 use crate::string::StringHeader;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 // NaN-boxing tags (must match value.rs)
@@ -142,7 +145,7 @@ static SYMBOL_REGISTRY: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None)
 // detect symbol pointers safely without reading the (possibly nonexistent)
 // GcHeader byte.
 per_test_global! {
-    static SYMBOL_POINTERS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+    static SYMBOL_POINTERS: Mutex<Option<PtrHashSet<usize>>> = Mutex::new(None);
 }
 
 /// Process-lifetime descriptions for registered (`Symbol.for`) and well-known
@@ -154,7 +157,7 @@ per_test_global! {
 /// materialize a fresh StringHeader in the *caller's* arena on demand, which
 /// is the only thread-safe contract: the symbol identity is global, but
 /// every StringHeader belongs to exactly one thread's arena.
-static REGISTERED_SYMBOL_DESCRIPTIONS: Mutex<Option<HashMap<usize, std::sync::Arc<str>>>> =
+static REGISTERED_SYMBOL_DESCRIPTIONS: Mutex<Option<PtrHashMap<usize, std::sync::Arc<str>>>> =
     Mutex::new(None);
 
 pub(crate) fn registered_symbol_description(sym_ptr: usize) -> Option<std::sync::Arc<str>> {
@@ -209,8 +212,8 @@ crate::perry_thread_local! {
     /// not recoverable from the payload. That is the pre-existing WTF-8 gap
     /// CLAUDE.md already lists, not a new one, and it is strictly better than
     /// dropping the description.
-    static FRESH_SYMBOL_DESCRIPTIONS: RefCell<HashMap<u64, std::sync::Arc<[u8]>>> =
-        RefCell::new(HashMap::new());
+    static FRESH_SYMBOL_DESCRIPTIONS: RefCell<PtrHashMap<u64, std::sync::Arc<[u8]>>> =
+        RefCell::new(new_ptr_hash_map());
 }
 
 #[cfg(test)]
@@ -282,7 +285,7 @@ pub(crate) fn test_fresh_symbol_description_count() -> usize {
 pub(crate) fn record_registered_symbol_description(sym_ptr: usize, description: &str) {
     let mut guard = REGISTERED_SYMBOL_DESCRIPTIONS.lock().unwrap();
     if guard.is_none() {
-        *guard = Some(HashMap::new());
+        *guard = Some(new_ptr_hash_map());
     }
     guard
         .as_mut()
@@ -445,15 +448,103 @@ pub(crate) fn test_disable_symbol_magic_screen(disabled: bool) -> bool {
     TEST_DISABLE_SYMBOL_MAGIC_SCREEN.with(|c| c.replace(disabled))
 }
 
+/// Smallest and largest pointer ever registered as a Symbol, as a conservative
+/// filter in front of the process-global registry mutex.
+///
+/// `SYMBOL_EVER_REGISTERED` answers "has any symbol EVER been registered?",
+/// which stops discriminating the moment a program creates its first symbol —
+/// and every program that touches a well-known symbol creates one. After that
+/// `is_registered_symbol_slow` took the global mutex on EVERY probe, including
+/// the overwhelming majority asking about pointers that are not symbols at all.
+///
+/// The range only ever widens, and registration extends it before taking the
+/// lock — the same ordering, and for the same reason, as the latch arm above
+/// it: a pointer outside the range cannot be in the set, so rejecting is sound,
+/// while accepting merely falls through to the lookup that was already there.
+/// Death pruning removes entries without narrowing the range, which is
+/// harmless: those pointers reach the lookup, which correctly says no.
+static SYMBOL_ADDR_MIN: AtomicUsize = AtomicUsize::new(usize::MAX);
+static SYMBOL_ADDR_MAX: AtomicUsize = AtomicUsize::new(0);
+
+/// Widen the address range to admit `ptr`.
+///
+/// EVERY path that puts a pointer into `SYMBOL_POINTERS` must call this
+/// first, not just the registration one. `is_registered_symbol_slow` rejects
+/// an out-of-range pointer WITHOUT consulting the set, so a member outside
+/// the range is a live symbol the probe reports as "not a symbol".
+///
+/// That is not a theoretical second inserter: `SYMBOL_POINTERS` is a GC root
+/// registry, and `rewrite_symbol_pointer_metadata_if_forwarded` re-keys an
+/// entry to the symbol's new address every time the collector moves it. A
+/// symbol evacuated out of the range established by its own allocation would
+/// otherwise stop answering to `typeof`, symbol-keyed property lookup and
+/// `Symbol.iterator` dispatch — while still being perfectly alive.
+pub(crate) fn widen_symbol_addr_range(ptr: usize) {
+    SYMBOL_ADDR_MIN.fetch_min(ptr, Ordering::Release);
+    SYMBOL_ADDR_MAX.fetch_max(ptr, Ordering::Release);
+}
+
+/// The ONLY way to put a pointer into `SYMBOL_POINTERS`. Widening and
+/// inserting are one operation on purpose: there are three insert sites (the
+/// registration, and two forwarding rewrites — a per-slot one and the bulk
+/// one the copying minor actually drives), and a range filter is only sound
+/// while every one of them widens.
+pub(crate) fn insert_symbol_pointer_in_set(set: &mut PtrHashSet<usize>, ptr: usize) {
+    widen_symbol_addr_range(ptr);
+    set.insert(ptr);
+}
+
+/// Save/restore the range filter's bounds around a test that needs to observe
+/// a NARROW range. The bounds are process-global and only ever widen in
+/// production, so a test that resets them must put back at least what it
+/// found — otherwise a later test in the same binary gets a range too narrow
+/// for symbols registered before it ran, and fails for no reason of its own.
+#[cfg(test)]
+pub(crate) struct SymbolAddrRangeGuard(usize, usize);
+
+#[cfg(test)]
+impl SymbolAddrRangeGuard {
+    /// Reset to the empty range, so only what the test registers is admitted.
+    pub(crate) fn reset() -> Self {
+        let g = SymbolAddrRangeGuard(
+            SYMBOL_ADDR_MIN.load(Ordering::Acquire),
+            SYMBOL_ADDR_MAX.load(Ordering::Acquire),
+        );
+        SYMBOL_ADDR_MIN.store(usize::MAX, Ordering::Release);
+        SYMBOL_ADDR_MAX.store(0, Ordering::Release);
+        g
+    }
+}
+
+#[cfg(test)]
+impl Drop for SymbolAddrRangeGuard {
+    fn drop(&mut self) {
+        // Union of what we saved and what the test widened to, so neither the
+        // pre-existing members nor the test's own survive outside the range.
+        SYMBOL_ADDR_MIN.fetch_min(self.0, Ordering::Release);
+        SYMBOL_ADDR_MAX.fetch_max(self.1, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_symbol_addr_range() -> (usize, usize) {
+    (
+        SYMBOL_ADDR_MIN.load(Ordering::Acquire),
+        SYMBOL_ADDR_MAX.load(Ordering::Acquire),
+    )
+}
+
 pub(crate) fn register_symbol_pointer(ptr: usize) {
     // Arm before taking the lock, so the entry is never reachable while the
     // latch still reads idle.
     SYMBOL_EVER_REGISTERED.arm();
+    // Widen before the insert, for the same reason.
+    widen_symbol_addr_range(ptr);
     let mut guard = crate::gc::lock_gc_root_registry(&SYMBOL_POINTERS);
     if guard.is_none() {
-        *guard = Some(HashSet::new());
+        *guard = Some(new_ptr_hash_set());
     }
-    guard.as_mut().unwrap().insert(ptr);
+    insert_symbol_pointer_in_set(guard.as_mut().unwrap(), ptr);
 }
 
 #[cfg(test)]
@@ -524,9 +615,28 @@ pub fn is_registered_symbol(ptr: usize) -> bool {
     is_registered_symbol_slow(ptr)
 }
 
+/// `PERRY_SYMBOL_RANGE_FILTER=0` restores the unconditional mutex acquisition.
+fn symbol_range_filter_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        !matches!(
+            std::env::var("PERRY_SYMBOL_RANGE_FILTER").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        )
+    })
+}
+
 #[inline(never)]
 fn is_registered_symbol_slow(ptr: usize) -> bool {
     if ptr < 0x10000 {
+        return false;
+    }
+    // Outside the registered range ⟹ not a symbol, without the global mutex.
+    if symbol_range_filter_enabled()
+        && (ptr < SYMBOL_ADDR_MIN.load(Ordering::Acquire)
+            || ptr > SYMBOL_ADDR_MAX.load(Ordering::Acquire))
+    {
         return false;
     }
     let guard = SYMBOL_POINTERS.lock().unwrap();
@@ -550,15 +660,17 @@ pub(crate) fn is_global_registered_symbol(ptr: usize) -> bool {
 // rewritten when owners move; symbol keys and NaN-boxed values are GC roots.
 // Storage stays intentionally linear because per-object symbol keys are rare.
 per_test_global! {
-    static SYMBOL_PROPERTIES: Mutex<Option<HashMap<usize, Vec<(usize, u64)>>>> = Mutex::new(None);
+    static SYMBOL_PROPERTIES: Mutex<Option<PtrHashMap<usize, Vec<(usize, u64)>>>> =
+        Mutex::new(None);
 }
 
 // Descriptor attributes for symbol-keyed properties installed through
 // Object.defineProperty. Direct symbol assignment uses the normal data-property
 // defaults, so absence here means writable/enumerable/configurable are all true.
 per_test_global! {
-    static SYMBOL_PROPERTY_ATTRS: Mutex<Option<HashMap<(usize, usize), crate::object::PropertyAttrs>>> =
-        Mutex::new(None);
+    static SYMBOL_PROPERTY_ATTRS: Mutex<
+        Option<FastKeyHashMap<(usize, usize), crate::object::PropertyAttrs>>,
+    > = Mutex::new(None);
 }
 
 /// Death pruning for the symbol-keyed property side tables (2026-07-09 GC
@@ -835,7 +947,7 @@ pub(crate) fn store_object_symbol_property_root(
     {
         let mut guard = crate::gc::lock_gc_root_registry(&SYMBOL_PROPERTIES);
         if guard.is_none() {
-            *guard = Some(HashMap::new());
+            *guard = Some(new_ptr_hash_map());
         }
         let map = guard.as_mut().unwrap();
         let entries = map.entry(obj_key).or_default();

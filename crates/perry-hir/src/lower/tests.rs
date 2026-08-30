@@ -163,23 +163,44 @@ const computed = { [key]() { return 1; } };
             .unwrap_or_else(|| panic!("missing init for {name}"))
     };
 
-    let Expr::Object(props) = local_init("fast") else {
+    // A static-key, super-free method literal is a closed-shape RECORD: it
+    // lowers to the anonymous-shape class allocation (fixed-slot reads, no
+    // builder IIFE), with each method carried as a dynamic-`this` closure
+    // argument — the function-expression spelling's semantics — so no
+    // post-construction `this` patch exists to get wrong.
+    let Expr::New {
+        class_name, args, ..
+    } = local_init("fast")
+    else {
         panic!(
-            "static method literal should be a direct object: {:#?}",
+            "static method literal should be a closed-shape record allocation: {:#?}",
             hir.init
         );
     };
-    assert_eq!(
-        props
-            .iter()
-            .map(|(key, _)| key.as_str())
-            .collect::<Vec<_>>(),
-        ["plain", "captured", "dynamicThis"]
+    assert!(
+        class_name.starts_with("__AnonShape_"),
+        "record class expected, got {class_name}"
     );
+    let record = hir
+        .classes
+        .iter()
+        .find(|class| &class.name == class_name)
+        .unwrap_or_else(|| panic!("record class {class_name} must be synthesized"));
+    assert_eq!(
+        record
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        ["plain", "captured", "dynamicThis"],
+        "field order must follow source order"
+    );
+    assert_eq!(args.len(), 3);
     assert!(matches!(
-        &props[2].1,
+        &args[2],
         Expr::Closure {
-            captures_this: true,
+            captures_this: false,
+            enclosing_class: None,
             ..
         }
     ));
@@ -1102,6 +1123,41 @@ fn named_class_expr_self_new_records_appended_capture_provenance() {
     );
 }
 
+/// A private update wraps its receiver twice: once for the read and once for
+/// the write. Both guards must preserve the named class expression's lexical
+/// self binding, including when that binding is captured by a nested arrow.
+#[test]
+fn named_class_expr_static_private_update_in_arrow_keeps_lexical_brand_owner() {
+    let source = r#"
+        const make = () => class c {
+            static #v = 0;
+            static f() { return (() => { c.#v++; return c.#v; })(); }
+        };
+    "#;
+    let module = perry_parser::parse_typescript(source, "t.ts").expect("source parses");
+    let hir = super::lower_module(&module, "t", "t.ts").expect("source lowers");
+    let method = hir
+        .classes
+        .iter()
+        .find(|class| class.name.starts_with("c__class_expr_"))
+        .expect("named class expression is lowered")
+        .static_methods
+        .iter()
+        .find(|method| method.name == "f")
+        .expect("static f method is lowered");
+    let body = format!("{:#?}", method.body);
+
+    assert_eq!(
+        body.matches("receiver_is_brand_owner: true").count(),
+        3,
+        "the update's read/write guards and the following read must identify the lexical class owner: {body}"
+    );
+    assert!(
+        !body.contains("receiver_is_brand_owner: false"),
+        "both guards around the private update must retain the lexical class owner: {body}"
+    );
+}
+
 /// A sibling class declaration is already a known lexical binding while an
 /// earlier class method is lowered, even though its registry entry is emitted
 /// later. The unresolved-constructor guard must preserve that forward binding.
@@ -1790,5 +1846,38 @@ fn assert_capture_stash_follows_super(source: &str, class_name: &str) {
         first_stash_at > super_at,
         "capture stash (stmt {first_stash_at}) must follow super() (stmt {super_at}): {:#?}",
         ctor.body
+    );
+}
+
+/// `const masks = opts?.masks ?? null` must not be declared `Null`. The
+/// AST-level `??` rule used to answer the right operand's type whenever the
+/// left inferred `Any` — and an optional chain always does — so the binding
+/// was typed `Null`, which downstream read as "holds no pointer".
+#[test]
+fn nullish_coalescing_over_an_optional_chain_is_not_typed_by_its_right_operand() {
+    let source = r#"
+        function add(opts: { masks: number[] } | null) {
+            const masks = opts?.masks ?? null;
+            return masks;
+        }
+    "#;
+    let module = perry_parser::parse_typescript(source, "coalesce.ts").expect("source parses");
+    let hir = super::lower_module(&module, "coalesce", "coalesce.ts").expect("source lowers");
+    let add = hir
+        .functions
+        .iter()
+        .find(|f| f.name == "add")
+        .expect("`add` lowers");
+    let masks_ty = add
+        .body
+        .iter()
+        .find_map(|stmt| match stmt {
+            Stmt::Let { name, ty, .. } if name == "masks" => Some(ty),
+            _ => None,
+        })
+        .expect("`masks` lowers to a Let");
+    assert!(
+        !matches!(masks_ty, Type::Null | Type::Void),
+        "`opts?.masks ?? null` is an array on the non-null path; got {masks_ty:?}"
     );
 }

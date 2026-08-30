@@ -7,8 +7,22 @@
 
 use super::*;
 
-static CLASS_KEYS_BY_ID: std::sync::RwLock<Option<std::collections::HashMap<u32, (usize, u32)>>> =
-    std::sync::RwLock::new(None);
+/// class_id -> (keys array address, field count).
+///
+/// `PtrHasher`, not SipHash: the key is a codegen-minted class id (a small
+/// sequential counter, see `perry-hir::lower::context`), never external input,
+/// so hash-flooding resistance buys nothing — the same rationale as the
+/// pointer-keyed registries in `fast_hash`. `js_build_class_keys_array` calls
+/// `remember_class_keys_array` on EVERY invocation, including the shape-cache
+/// hit path, so this probe is per-object-construction rather than
+/// per-registration; a `claude-code --help` profile put SipHash under
+/// `remember_class_keys_array` at 0.175% of samples.
+///
+/// Iteration-order safe: the map is only ever `insert`ed and `get`ed (the two
+/// sites below). Nothing iterates it, so the hasher cannot reorder anything.
+static CLASS_KEYS_BY_ID: std::sync::RwLock<
+    Option<crate::fast_hash::PtrHashMap<u32, (usize, u32)>>,
+> = std::sync::RwLock::new(None);
 
 fn remember_class_keys_array(class_id: u32, field_count: u32, keys_array: *mut ArrayHeader) {
     if class_id == 0 || keys_array.is_null() {
@@ -17,7 +31,7 @@ fn remember_class_keys_array(class_id: u32, field_count: u32, keys_array: *mut A
     {
         let mut guard = CLASS_KEYS_BY_ID.write().unwrap();
         if guard.is_none() {
-            *guard = Some(std::collections::HashMap::new());
+            *guard = Some(crate::fast_hash::new_ptr_hash_map());
         }
         guard
             .as_mut()
@@ -799,14 +813,32 @@ pub extern "C" fn js_object_alloc_with_shape(
 
     unsafe {
         let obj_ptr = obj_handle.get_raw_mut_ptr::<ObjectHeader>();
-        set_object_keys_array_with_live(obj_ptr, keys_arr, field_count);
-        // #6804: birth-stamp the runtime ShapeId (see `ShapeCacheEntry`) —
-        // newborn literals carry their stable identity immediately, so
-        // typed_feedback tokens and the id-keyed FIELD_CACHE never see a
-        // pre-stamp window for shape-cached objects.
-        // #8113: `field_count` is the LOGICAL live-slot bound; the extra
-        // physical slots above it stay available for dynamic growth.
-        crate::object::shapes::birth_stamp_object_shape(obj_ptr, runtime_shape_id, field_count);
+        // A shape-cache HIT hands back the canonical keys array paired with
+        // its already-minted ShapeId, so stamp the newborn straight from that
+        // immutable descriptor — the same `try_birth_stamp_preinstalled_shape`
+        // the compiled-class allocator uses — instead of re-canonicalizing
+        // the identical facts on every birth. The publish-then-stamp path
+        // below (`publish_object_shape_from` hashing `ShapeFacts`, plus three
+        // descriptor lookups in `birth_stamp_object_shape`) was the bulk of a
+        // 257 ns `{ a, b, m() {} }` literal; a miss (first birth of the shape,
+        // worker-local id not yet installed, bound mismatch) keeps it.
+        let stamped_from_cache = runtime_shape_id != 0
+            && crate::object::shapes::try_birth_stamp_preinstalled_shape(
+                obj_ptr,
+                runtime_shape_id,
+                keys_arr,
+                field_count,
+            );
+        if !stamped_from_cache {
+            set_object_keys_array_with_live(obj_ptr, keys_arr, field_count);
+            // #6804: birth-stamp the runtime ShapeId (see `ShapeCacheEntry`) —
+            // newborn literals carry their stable identity immediately, so
+            // typed_feedback tokens and the id-keyed FIELD_CACHE never see a
+            // pre-stamp window for shape-cached objects.
+            // #8113: `field_count` is the LOGICAL live-slot bound; the extra
+            // physical slots above it stay available for dynamic growth.
+            crate::object::shapes::birth_stamp_object_shape(obj_ptr, runtime_shape_id, field_count);
+        }
     }
 
     obj_handle.get_raw_mut_ptr::<ObjectHeader>()

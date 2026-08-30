@@ -244,6 +244,92 @@ fn lower_guarded_numeric_add(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String>
     })
 }
 
+/// The `+`-shaped guard for the arithmetic operators that cannot concatenate.
+///
+/// `-`, `*` and `/` apply ToNumeric to both operands, so unlike `+` there is
+/// no string case to preserve — the whole reason `lower_guarded_numeric_add`
+/// has to rebuild its tree. That makes the guard strictly simpler: test both
+/// operands, do the operation inline when they are numbers, and hand the
+/// original operands to the same dynamic helper otherwise.
+///
+/// BigInt is handled by the test rather than by a separate check: a BigInt is
+/// not a Number, so `5n - 3n` and `1n - 1` both take the cold arm and keep
+/// the helper's exact semantics (a BigInt result and a TypeError
+/// respectively).
+fn lower_guarded_numeric_arith(
+    ctx: &mut FnCtx<'_>,
+    op: BinaryOp,
+    left: &Expr,
+    right: &Expr,
+    fname: &str,
+) -> Result<String> {
+    let leaves = [left, right];
+    let needs_test: Vec<bool> = leaves
+        .iter()
+        .map(|leaf| !crate::type_analysis::expr_produces_canonical_raw_f64(ctx, leaf))
+        .collect();
+
+    with_operands_rooted(ctx, &leaves, |ctx, values| {
+        let mut cond: Option<String> = None;
+        for (value, is_tested) in values.iter().zip(needs_test.iter()) {
+            if !is_tested {
+                continue;
+            }
+            let is_num = crate::stmt::emit_js_value_is_number(ctx, value);
+            cond = Some(match cond {
+                Some(prev) => ctx.block().and(I1, &prev, &is_num),
+                None => is_num,
+            });
+        }
+        let native = |ctx: &mut FnCtx<'_>, l: &str, r: &str| match op {
+            BinaryOp::Sub => ctx.block().fsub(l, r),
+            BinaryOp::Mul => ctx.block().fmul(l, r),
+            _ => ctx.block().fdiv(l, r),
+        };
+        // Every leaf already vouched for: no diamond to emit.
+        let Some(all_num) = cond else {
+            let (l, r) = (values[0].clone(), values[1].clone());
+            return Ok(native(ctx, &l, &r));
+        };
+
+        let fast_idx = ctx.new_block("guarded_arith.numeric");
+        let slow_idx = ctx.new_block("guarded_arith.dynamic");
+        let merge_idx = ctx.new_block("guarded_arith.merge");
+        let fast_label = ctx.block_label(fast_idx);
+        let slow_label = ctx.block_label(slow_idx);
+        let merge_label = ctx.block_label(merge_idx);
+        ctx.block().cond_br(&all_num, &fast_label, &slow_label);
+
+        ctx.current_block = fast_idx;
+        let (l, r) = (values[0].clone(), values[1].clone());
+        let fast_val = native(ctx, &l, &r);
+        let fast_end = ctx.block().label.clone();
+        ctx.block().br(&merge_label);
+
+        ctx.current_block = slow_idx;
+        crate::expr::emit_versioned_loop_callback_deopt(ctx);
+        let slow_val =
+            ctx.block()
+                .call(DOUBLE, fname, &[(DOUBLE, &values[0]), (DOUBLE, &values[1])]);
+        let slow_end = ctx.block().label.clone();
+        ctx.block().br(&merge_label);
+
+        ctx.current_block = merge_idx;
+        Ok(ctx
+            .block()
+            .phi(DOUBLE, &[(&fast_val, &fast_end), (&slow_val, &slow_end)]))
+    })
+}
+
+/// `PERRY_GUARDED_ARITH=0` restores the unconditional dynamic helper for
+/// `-`, `*` and `/`.
+fn guarded_arith_enabled() -> bool {
+    !matches!(
+        std::env::var("PERRY_GUARDED_ARITH").as_deref(),
+        Ok("0") | Ok("off") | Ok("false")
+    )
+}
+
 /// Recognize `(value === null ? 0 : value) + 1` and its operand-reversed form.
 ///
 /// Generic user-class methods currently surface as `Any` at their call sites,
@@ -313,18 +399,36 @@ fn add_tree_leaves<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
 ///
 /// A three-or-more-leaf tree is the common accumulator shape
 /// `sum += row.x + row.y`: lowering each node independently otherwise pays
-/// the dynamic add helper twice even when every runtime value is a number. At
-/// two leaves the guard merely moves the helper behind a branch; starting at
-/// three it can replace two or more helper calls with one shared tag check.
+/// the dynamic add helper twice even when every runtime value is a number,
+/// and one shared tag check replaces both.
+///
+/// Two leaves qualify as well, which the original threshold excluded on the
+/// grounds that the guard "merely moves the helper behind a branch". It does
+/// more than that. On the hot arm the helper call is replaced by an inline
+/// `fadd`, and the operands stop going through `lower_rooted_dynamic_binary`,
+/// which roots them — so a plain `s += v` accumulator was paying a call plus
+/// a write barrier per add and keeping its accumulator in a shadow-frame slot
+/// instead of a register. Measured on `s += v` with both operands numbers at
+/// runtime but neither statically proven: 3.44 -> 0.43 ns/op against node's
+/// 0.35. The cold arm still rebuilds the original tree, so a leaf that turns
+/// out to be a string concatenates exactly as before.
 ///
 /// Do not require a static numeric hint here. The important accumulator case
 /// is often a captured local plus fields read from interface-shaped objects,
 /// so every leaf is `Any` to codegen. The guard itself is the runtime proof;
 /// its cold arm preserves the original tree and exact dynamic `+` semantics.
 fn dynamic_add_tree_benefits_shared_guard(expr: &Expr) -> bool {
+    if matches!(
+        std::env::var("PERRY_DYNAMIC_ADD_PAIR_GUARD").as_deref(),
+        Ok("0") | Ok("off") | Ok("false")
+    ) {
+        let mut leaves = Vec::new();
+        add_tree_leaves(expr, &mut leaves);
+        return leaves.len() >= 3;
+    }
     let mut leaves = Vec::new();
     add_tree_leaves(expr, &mut leaves);
-    leaves.len() >= 3
+    leaves.len() >= 2
 }
 
 /// Rebuild the `+` tree over already-lowered leaf values, node for node, so the
@@ -401,6 +505,44 @@ fn lower_arithmetic_operand(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<(String,
     // not an unconditional raw f64. In arithmetic context the OOB `undefined`
     // must become canonical NaN. Sink that conversion into the OOB/cold arms
     // so the in-bounds hot path remains a guard plus native load.
+    // The HIR spells the same read `Uint8ArrayGet` when it already knows the
+    // receiver is a `Uint8Array`/`Buffer`. Its value is a byte or (OOB)
+    // `undefined`; in number context that `undefined` must become canonical
+    // NaN BEFORE any `fadd`/`fmul` — IEEE arithmetic propagates the NaN-box
+    // payload, so a raw `fadd acc, <undefined box>` would leave `acc` reading
+    // as `undefined` (caught by the OOB differential: `a += px[17]` printed
+    // `undefined`). Prefer the guarded inline load (NaN sunk into the OOB
+    // arm, in-bounds path untouched); when it declines, canonicalize the
+    // generic read inline with one compare + select — never a call — which
+    // is exact because the only non-double this node can yield is the
+    // `undefined` box.
+    if let Expr::Uint8ArrayGet { index, .. } = expr {
+        if is_numeric_expr(ctx, index) {
+            // Deliberately NOT routed through
+            // `ta_param_f64_read::try_lower_ta_f64_read_for_number_context`:
+            // its checked load reads the length at `handle + 0` and the
+            // elements at `handle + 16`, which is the typed-array object
+            // layout. Perry's `new Uint8Array(n)` is buffer-backed (length at
+            // `data - 8`), so that load treats every index as out of bounds and
+            // silently yields `undefined` — measured as `checksum:0` on
+            // benchmarks/suite/bench_int_arithmetic.ts. `f64_kind_from_class`
+            // still maps "Uint8Array"/"Uint8ClampedArray" to a kind, so the
+            // same hazard waits for any future caller that hands it one of
+            // those receivers.
+            //
+            // `lower_expr` picks the correct tier for this node (the inline
+            // buffer-view load when the receiver is a tracked view, else
+            // `js_uint8array_index_get_value`); the only value it can return
+            // that is not a double is the `undefined` box, so one compare +
+            // select canonicalizes it exactly, with no call.
+            let raw = lower_expr(ctx, expr)?;
+            let blk = ctx.block();
+            let bits = blk.bitcast_double_to_i64(&raw);
+            let is_undef = blk.icmp_eq(I64, &bits, crate::nanbox::TAG_UNDEFINED_I64);
+            let canonical = blk.select(I1, &is_undef, DOUBLE, "0x7FF8000000000000", &raw);
+            return Ok((canonical, true));
+        }
+    }
     if let Expr::IndexGet { object, index } = expr {
         if let Some(value) =
             super::ta_param_f64_read::try_lower_ta_f64_read_for_number_context(ctx, object, index)?
@@ -1027,6 +1169,18 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         // operands, so a pointer-bearing left operand must
                         // survive the right operand's evaluation.
                         let fname = bigint_dynamic_helper(*op);
+                        // `-`, `*` and `/` take the same guarded diamond `+`
+                        // got in #9159. The bail above is reached whenever an
+                        // operand MIGHT be a BigInt, which for an unproven
+                        // operand is always — so `s -= v` paid a call per
+                        // operation while `s += v` did not. The guard needs no
+                        // proof: a BigInt is not a Number, so it fails the test
+                        // and the cold arm runs this same helper.
+                        if guarded_arith_enabled()
+                            && matches!(op, BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div)
+                        {
+                            return lower_guarded_numeric_arith(ctx, *op, left, right, fname);
+                        }
                         return lower_rooted_dynamic_binary(ctx, fname, left, right);
                     }
                 }

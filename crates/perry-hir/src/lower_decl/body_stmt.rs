@@ -32,6 +32,47 @@ use detect::{
 
 use for_await::lower_runtime_for_await_iterator_body;
 
+// Keep the property-hoist pass and its large `Stmt`/`Expr` return place out of
+// recursive `lower_body_stmt` frames. At the unoptimized test profile, adding
+// those temporaries to the monolithic lowering function exhausted Rust's
+// default 2 MiB test-thread stack while compiling an unrelated dependency
+// graph (#9194). The call boundary is intentional, including in optimized
+// compiler builds.
+#[inline(never)]
+fn finish_for_with_property_array_hoist(
+    ctx: &mut LoweringContext,
+    init: Option<Box<Stmt>>,
+    condition: Option<Expr>,
+    update: Option<Expr>,
+    body: Vec<Stmt>,
+) -> Vec<Stmt> {
+    if let Some((hoist, new_condition, new_body)) = condition.as_ref().and_then(|cond| {
+        crate::lower::property_array_hoist::hoist_loop_invariant_property_array(
+            ctx,
+            cond,
+            update.as_ref(),
+            &body,
+        )
+    }) {
+        return vec![
+            hoist,
+            Stmt::For {
+                init,
+                condition: Some(new_condition),
+                update,
+                body: new_body,
+            },
+        ];
+    }
+
+    vec![Stmt::For {
+        init,
+        condition,
+        update,
+        body,
+    }]
+}
+
 pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Vec<Stmt>> {
     let mut result = Vec::new();
 
@@ -732,13 +773,22 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                             // head into the loop-scoped prelude in source order,
                             // registering each binding before the next
                             // initializer is lowered.
-                            let has_multiple_decls = var_decl.decls.len() > 1;
-                            for decl in
-                                var_decl
-                                    .decls
-                                    .iter()
-                                    .skip(if has_multiple_decls { 0 } else { 1 })
-                            {
+                            //
+                            // #9106 carve-out: when hoisting the tail around a
+                            // literal-initialized first declarator is provably
+                            // unobservable, keep that declarator in `For::init`
+                            // — the versioned counted-loop matchers key their
+                            // counter on it (`for (let i = 0, len = arr.length;
+                            // i < len; i++)`).
+                            let first_decl_keeps_init_slot = var_decl.decls.len() == 1
+                                || crate::lower_decl::for_head_first_decl_keeps_init_slot(
+                                    &var_decl.decls,
+                                );
+                            for decl in var_decl.decls.iter().skip(if first_decl_keeps_init_slot {
+                                1
+                            } else {
+                                0
+                            }) {
                                 if let Some(init_ast) = decl.init.as_ref() {
                                     result.extend(predeclare_implicit_assignment_targets(
                                         ctx, init_ast,
@@ -788,7 +838,7 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                                     init: init_expr,
                                 });
                             }
-                            if has_multiple_decls {
+                            if !first_decl_keeps_init_slot {
                                 None
                             } else if let Some(decl) = var_decl.decls.first() {
                                 if let Some(init_ast) = decl.init.as_ref() {
@@ -864,13 +914,17 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                 .map(|e| lower_expr(ctx, e))
                 .transpose()?;
             let body = lower_body_stmt(ctx, &for_stmt.body)?;
+            // `for (i = 0; i < holder.arr.length; i++) … holder.arr[i] …`
+            // repeats a by-name property lookup every iteration AND keeps the
+            // loop out of the packed-array machinery entirely, since that
+            // matcher wants a bare local. Hoisting the receiver read is worth
+            // 20.58 ns/iteration versus 0.50 hand-hoisted (node: 0.54). The
+            // pass refuses unless the read is provably side-effect free and
+            // the loop cannot rebind or write it — see the module docs.
+            let lowered_for =
+                finish_for_with_property_array_hoist(ctx, init, condition, update, body);
             ctx.pop_block_scope(for_scope_mark);
-            result.push(Stmt::For {
-                init,
-                condition,
-                update,
-                body,
-            });
+            result.extend(lowered_for);
         }
         ast::Stmt::Try(try_stmt) => {
             // try body is its own lexical scope

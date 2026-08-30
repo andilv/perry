@@ -248,8 +248,9 @@ pub(crate) use descriptor_state::{
     accessor_descriptor_keys_for_obj, class_field_inline_guard_enabled,
     class_instance_set_may_intercept, clear_accessor_descriptor, clear_property_attrs,
     constructor_accessor_ever_installed, descriptors_in_use, disable_class_field_inline_guard,
-    get_accessor_descriptor, get_property_attrs, json_object_getter_value, mark_all_keys,
-    object_has_descriptors, object_proto_may_intercept_key, owner_has_property_descriptors,
+    get_accessor_descriptor, get_property_attrs, install_fresh_accessor_property,
+    json_object_getter_value, mark_all_keys, object_has_descriptors,
+    object_proto_may_intercept_key, owner_has_property_descriptors,
     owner_may_have_descriptor_entries, plain_data_write_may_intercept,
     prune_dead_descriptor_owner_entries, reflect_getter_closure_bits, set_accessor_descriptor,
     set_builtin_accessor_descriptor, set_builtin_property_attrs, set_property_attrs,
@@ -454,7 +455,25 @@ pub(crate) struct ObjectHotTables {
     pub(crate) shape_kind_cache: std::cell::UnsafeCell<Box<[u64]>>,
     /// Overflow map for shape_ids that collide in the inline cache. Values
     /// are `(keys_array, runtime_shape_id)` — see [`ShapeCacheEntry`].
-    pub(crate) shape_cache_overflow: RefCell<HashMap<u32, (*mut ArrayHeader, u32)>>,
+    ///
+    /// `PtrHasher`, not SipHash. The inline cache above is 256 entries,
+    /// direct-mapped on `shape_id & 255`, and `shape_id` steps by
+    /// `10007 mod 256 == 23` per class id — so any image with more than 256
+    /// live shapes collides constantly and `shape_cache_get_with_id` falls
+    /// through to this map. Every `shape_cache_insert` writes it too. The key
+    /// is a runtime-minted shape id (`class_id * 10007 + field_count * 100003
+    /// + 1_000_000`), never external input.
+    ///
+    /// A `u32` key's SipHash is small enough that LLVM inlines it into the
+    /// caller, so this cost does NOT appear under a `RandomState` frame in a
+    /// sampled profile — it is charged to `js_build_class_keys_array` and
+    /// friends. Every sibling field of this struct is already either a fast
+    /// hash table or an `UnsafeCell` array; this one was the exception.
+    ///
+    /// Iteration-order safe: the only iteration is `scan_shape_cache_roots_mut`
+    /// (`.values_mut()`, GC root marking — commutative). Nothing else iterates.
+    pub(crate) shape_cache_overflow:
+        RefCell<crate::fast_hash::PtrHashMap<u32, (*mut ArrayHeader, u32)>>,
     /// Per-thread shape-transition cache for the dynamic-key write path;
     /// see the doc block above `with_transition_cache`. HEAP-allocated
     /// (`Box`) — oversized inline storage overflowed the arm64_32 ILP32
@@ -490,7 +509,7 @@ impl ObjectHotTables {
             shape_kind_cache: std::cell::UnsafeCell::new(
                 vec![0; shapes::SHAPE_KIND_CACHE_SIZE].into_boxed_slice(),
             ),
-            shape_cache_overflow: RefCell::new(HashMap::new()),
+            shape_cache_overflow: RefCell::new(crate::fast_hash::new_ptr_hash_map()),
             transition_cache: std::cell::UnsafeCell::new(
                 vec![
                     TransitionEntry {
@@ -1869,6 +1888,10 @@ pub(super) unsafe fn mark_object_dynamic_shape_unknown(obj: *mut ObjectHeader) {
     crate::gc::layout_mark_unknown(obj as *mut u8);
 }
 
+/// #9180: the receiver `[[Set]]` own-key probe, split out to keep `tests.rs`
+/// under the 2000-line cap.
+#[cfg(test)]
+mod own_key_probe_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
