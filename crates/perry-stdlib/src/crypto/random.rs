@@ -434,13 +434,14 @@ pub unsafe extern "C" fn js_crypto_native_dispatch(
             js_crypto_pbkdf2_async_alg(bytes_ptr(0), bytes_ptr(1), arg(2), arg(3), digest, callback)
         }
         "scrypt" => {
+            let options = if args_len >= 5 { arg(3) } else { undefined };
             let callback = if args_len >= 5 { arg(4) } else { arg(3) };
-            js_crypto_scrypt_async(bytes_ptr(0), bytes_ptr(1), arg(2), callback)
+            js_crypto_scrypt_async(bytes_ptr(0), bytes_ptr(1), arg(2), options, callback)
         }
         "scryptSync" => {
-            let options_ptr = if args_len >= 4 { bytes_ptr(3) } else { 0 };
+            let options = if args_len >= 4 { arg(3) } else { undefined };
             pointer_value(
-                js_crypto_scrypt_bytes(bytes_ptr(0), bytes_ptr(1), arg(2), options_ptr) as *mut u8,
+                js_crypto_scrypt_bytes(bytes_ptr(0), bytes_ptr(1), arg(2), options) as *mut u8,
             )
         }
         // Node callback forms are randomInt(max, callback) and
@@ -734,17 +735,7 @@ mod tests {
     }
 
     fn catch_runtime_throw(f: impl FnOnce()) -> bool {
-        let env = perry_runtime::exception::js_try_push();
-        let jumped = unsafe { perry_runtime::ffi::setjmp::setjmp(env as *mut c_int) };
-        if jumped == 0 {
-            f();
-            perry_runtime::exception::js_try_end();
-            false
-        } else {
-            perry_runtime::exception::js_try_end();
-            perry_runtime::exception::js_clear_exception();
-            true
-        }
+        perry_runtime::exception::catch_js_throw(f).is_err()
     }
 
     #[test]

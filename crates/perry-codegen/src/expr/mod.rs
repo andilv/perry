@@ -134,10 +134,10 @@ pub(crate) use v8_interop::{
 pub(crate) use write_barrier::{
     emit_array_numeric_write_note_on_block, emit_jsvalue_slot_store_on_block,
     emit_jsvalue_slot_store_pointer_tested, emit_jsvalue_slot_store_scalar_aware_on_block,
-    emit_jsvalue_slot_store_scalar_aware_with_flags_on_block,
     emit_jsvalue_slot_store_with_flags_on_block, emit_jsvalue_slot_store_with_value_bits_on_block,
     emit_layout_note_slot_on_block, emit_may_carry_heap_pointer_check,
-    emit_root_heap_word_store_on_block, emit_root_nanbox_store_on_block, emit_write_barrier,
+    emit_root_heap_word_store_on_block, emit_root_nanbox_store_on_block,
+    emit_scalar_aware_store_gated_on_pointerness, emit_write_barrier,
     emit_write_barrier_slot_generation_tested, emit_write_barrier_slot_on_block,
     emit_write_barrier_slot_value_and_generation_tested, lower_array_super_init,
     lower_event_emitter_async_resource_subclass_init, lower_event_emitter_subclass_init,
@@ -1992,6 +1992,16 @@ pub(crate) struct PackedF64LoopFact {
     /// is the dense range loop: the window is additionally hole-free, so
     /// loads carry no hole check at all).
     pub window_validated: bool,
+    /// #9253: reads on this receiver may use an AFFINE index — an
+    /// integer-producing expression over the loop counter and loop-invariant
+    /// integer locals (`a[i * size + k]`). The entry guard proved the receiver
+    /// only, so every such read pays an inline `icmp ult idx, len` against the
+    /// live length and takes `store_side_exit_label` when it fails.
+    ///
+    /// The matcher admits the loop only when EVERY tracked access qualifies,
+    /// so a lowering that finds this flag set may trust that the index shape in
+    /// front of it was the one admitted.
+    pub affine_indices: bool,
 }
 
 /// Element storage a masked-window fact's entry guard proved (#6750
@@ -2054,6 +2064,12 @@ pub(crate) struct MaskedWindowArrayFact {
     /// element type is exactly i32 (Int32Array tier), so loads may
     /// materialize elements as native `i32`.
     pub values_i32: bool,
+    /// Accumulator locals admitted by the entry tag check for THIS clone:
+    /// every in-clone write is numeric-preserving (verified by the
+    /// accumulator walk), so `is_numeric_expr` may treat them as Numbers
+    /// while the fact is live. Mirrors `StringWindowArrayFact`'s
+    /// `numeric_accumulator` (#9160) and `PackedF64LoopFact`'s vec.
+    pub numeric_accumulators: Vec<u32>,
     /// Storage layout the guard proved — selects the inline load shape.
     pub elem: MaskedWindowElem,
     /// True only in a dense fast-loop scope whose matcher admitted masked
@@ -2726,9 +2742,11 @@ pub(crate) mod string_window;
 mod ptr_numarray_access;
 mod ta_param_f64_read;
 #[cfg(test)]
+mod unary_bigint_tests;
+#[cfg(test)]
 mod unary_bitnot_tests;
 pub(crate) use index_get::{
-    numeric_index_has_integer_array_index_proof, packed_f64_loop_index_parts,
+    affine_index_fits_i64, numeric_index_has_integer_array_index_proof, packed_f64_loop_index_parts,
 };
 pub(crate) use masked_window::masked_window_fact_for_index;
 /// Rooting coverage for the computed-store arms the TS corpora cannot reach

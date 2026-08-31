@@ -463,12 +463,98 @@ fn escaped_hyphen_in_class_stays_literal() {
 }
 
 #[test]
+fn ecmascript_word_escapes_and_boundaries_use_the_spec_word_set() {
+    fn matches(pattern: &str, flags: &str, subject: &str) -> bool {
+        let re = js_regexp_new(make_string(pattern), make_string(flags));
+        js_regexp_test(re, make_string(subject)) != 0
+    }
+
+    // Neither `u` nor `i` alone widens the ASCII set. Rust's native `\w`
+    // admits all of these, which was the silent wrong-answer bug.
+    for flags in ["", "i", "u"] {
+        for subject in ["é", "Ω", "漢", "K", "ſ"] {
+            assert!(
+                !matches(r"^\w$", flags, subject),
+                "/^\\w$/{flags} {subject}"
+            );
+            assert!(matches(r"^\W$", flags, subject), "/^\\W$/{flags} {subject}");
+            assert!(
+                !matches(r"^[\w]$", flags, subject),
+                "/^[\\w]$/{flags} {subject}"
+            );
+            assert!(
+                matches(r"^[\W]$", flags, subject),
+                "/^[\\W]$/{flags} {subject}"
+            );
+        }
+    }
+
+    // `i`+`u` adds exactly the two non-ASCII simple folds into ASCII.
+    for subject in ["K", "ſ"] {
+        assert!(matches(r"^\w$", "iu", subject));
+        assert!(!matches(r"^\W$", "iu", subject));
+        assert!(matches(r"^[\w]$", "iu", subject));
+        assert!(!matches(r"^[\W]$", "iu", subject));
+        assert!(matches(r"^\b.\b$", "iu", subject));
+        assert!(!matches(r"^\B.\B$", "iu", subject));
+    }
+    for subject in ["é", "Ω", "漢"] {
+        assert!(!matches(r"^\w$", "iu", subject));
+        assert!(matches(r"^\W$", "iu", subject));
+        assert!(!matches(r"^\b.\b$", "iu", subject));
+        assert!(matches(r"^\B.\B$", "iu", subject));
+    }
+
+    // Mixed classes under non-Unicode `i` need separate exact-word and
+    // normally-folded arms; the outer Rust `(?i)` must not fold the word arm.
+    assert!(!matches(r"^[a\w]+$", "i", "Ω"));
+    assert!(matches(r"^[^a\w]+$", "i", "Ω"));
+    assert!(matches(r"^[a\W]+$", "i", "Ω"));
+    assert!(!matches(r"^[^a\W]+$", "i", "Ω"));
+    assert!(matches(r"^[^a\W]+$", "i", "cfx"));
+    assert!(!matches(r"^[^a\W]+$", "i", "café"));
+
+    // Boundary word-ness is the same predicate as `\w`.
+    assert!(!matches(r"^\bΩ\b$", "", "Ω"));
+    assert!(matches(r"^\BΩ\B$", "", "Ω"));
+    assert!(matches(r"x\bΩ", "", "xΩ"));
+    assert!(!matches(r"x\BΩ", "", "xΩ"));
+}
+
+#[test]
+fn ecmascript_dot_excludes_all_line_terminators_without_dotall() {
+    fn matches(pattern: &str, flags: &str, subject: &str) -> bool {
+        let re = js_regexp_new(make_string(pattern), make_string(flags));
+        js_regexp_test(re, make_string(subject)) != 0
+    }
+
+    for flags in ["", "i", "u", "m", "g"] {
+        for terminator in ["\n", "\r", "\u{2028}", "\u{2029}"] {
+            assert!(
+                !matches(r"^.$", flags, terminator),
+                "/^.$/{flags} matched {terminator:?}"
+            );
+        }
+    }
+    for terminator in ["\n", "\r", "\u{2028}", "\u{2029}"] {
+        assert!(matches(r"^.$", "s", terminator));
+        assert!(matches(r"^.$", "isu", terminator));
+    }
+    assert!(matches(r"^.$", "", "\t"));
+    assert!(!matches(r".{2}", "g", "\t\r\n"));
+    assert!(matches(r".{2}", "gs", "\t\r\n"));
+}
+
+#[test]
 fn annexb_legacy_decimal_escapes() {
     // #5594: a `\<n>` with no matching capture group is an Annex B.1.4
     // legacy octal escape, not a backreference — `\1` → `\x01`, never the
     // bare `\1` the `regex`/`fancy-regex` crates reject.
     assert_eq!(js_regex_to_rust(r"\1"), r"\x{01}");
-    assert_eq!(js_regex_to_rust(r"\b(\w+) \2\b"), r"\b(\w+) \x{02}\b");
+    assert_eq!(
+        js_regex_to_rust(r"\b(\w+) \2\b"),
+        r"(?-iu:\b)((?-i:[A-Za-z0-9_])+) \x{02}(?-iu:\b)"
+    );
     // Multi-digit octal: `\12` = 0o12 = 0x0A, `\14` = 0o14 = 0x0C.
     assert_eq!(js_regex_to_rust(r"[\12-\14]"), r"[\x{0A}-\x{0C}]");
     // Inside a class a decimal escape is always octal, never a backref —
@@ -1068,5 +1154,118 @@ fn validated_pattern_set_is_capped() {
     assert!(
         len <= REGEX_CACHE_MAX_ENTRIES,
         "VALIDATED_PATTERNS must stay capped at {REGEX_CACHE_MAX_ENTRIES} entries, got {len}"
+    );
+}
+
+/// The `[\s\S]` → `(?s:.)` rewrite must not move a single match result.
+///
+/// The rewrite exists purely to dodge a 1.1-million-iteration case fold in
+/// `regex_syntax` (see `grammar::push_any_char`), so the only thing that may
+/// change is how long construction takes. Everything a program can observe —
+/// what matches, what a capture group holds, which group number it is, and
+/// that the NEGATED forms still match nothing — is pinned here, because a
+/// silently widened character class produces no error anywhere: only a wrong
+/// answer, on inputs a syntax test never looks at.
+#[test]
+fn any_char_rewrite_preserves_match_behaviour() {
+    // Matches every code point, newlines included, with and without `i`.
+    for pattern in ["[\\s\\S]", "[^]", "[\\d\\D]", "[\\w\\W]", "[\\S\\s]"] {
+        for flags in ["", "i", "u", "iu", "m"] {
+            let re = js_regexp_new(make_string(pattern), make_string(flags));
+            for subject in ["a", "\n", " ", "\u{1F600}", "Ω", "\r"] {
+                assert!(
+                    js_regexp_test(re, make_string(subject)) != 0,
+                    "/{pattern}/{flags} must match {subject:?}"
+                );
+            }
+        }
+    }
+
+    // The negated forms are the exact opposite and must still match NOTHING.
+    for pattern in ["[^\\s\\S]", "[^\\w\\W]", "[]"] {
+        let re = js_regexp_new(make_string(pattern), make_string("i"));
+        for subject in ["a", "\n", "Ω"] {
+            assert!(
+                js_regexp_test(re, make_string(subject)) == 0,
+                "/{pattern}/i must not match {subject:?}"
+            );
+        }
+    }
+
+    // A class that is NOT a complementary pair keeps its narrow meaning.
+    let narrow = js_regexp_new(make_string("[\\d\\s]"), make_string("i"));
+    assert!(js_regexp_test(narrow, make_string("7")) != 0);
+    assert!(js_regexp_test(narrow, make_string("a")) == 0);
+
+    // The rewrite emits a NON-capturing group, so group numbering is
+    // unchanged: `$1` is still `b`, not the any-char.
+    let re = js_regexp_new(make_string("a[\\s\\S](b)"), make_string(""));
+    let m = js_regexp_exec(re, make_string("a\nb"));
+    assert!(!m.is_null(), "a[\\s\\S](b) must match \"a\\nb\"");
+
+    // Quantifiers still bind to the any-char, lazily and greedily.
+    let lazy = js_regexp_new(make_string("<x>([\\s\\S]*?)</x>"), make_string("i"));
+    assert!(js_regexp_test(lazy, make_string("<x>one\ntwo</x>")) != 0);
+    let greedy = js_regexp_new(make_string("^[\\s\\S]{3}$"), make_string(""));
+    assert!(js_regexp_test(greedy, make_string("a\nb")) != 0);
+    assert!(js_regexp_test(greedy, make_string("a\nbc")) == 0);
+
+    // `.source` still reports what the author wrote, not the translation.
+    let re = js_regexp_new(make_string("[\\s\\S]+"), make_string("gi"));
+    assert_eq!(
+        string_payload(js_regexp_get_source(re)),
+        b"[\\s\\S]+".to_vec()
+    );
+}
+
+/// #9305 fallout: the translator spells ECMAScript's ASCII `\b`/`\B` as
+/// `(?-iu:\b)`, which fancy-regex's parser rejects (`NonUnicodeUnsupported`).
+/// Any lookaround/backreference pattern containing a word boundary therefore
+/// raised a bogus SyntaxError — cli.js's `marked` html-block regex among
+/// them, whose throw-in-a-microtask the setjmp miscompile then turned into
+/// a segfault. `build_fancy_regex` now rewrites the marker into one-char
+/// lookarounds.
+#[test]
+fn fancy_engine_accepts_ascii_word_boundary_markers() {
+    // Lookahead + \b: std engine refuses (lookaround), fancy must accept.
+    let translated = js_regex_to_rust(r"(?!foo\b)\w+");
+    let fancy = crate::regex::build_fancy_regex(&translated).expect("fancy build");
+    assert_eq!(
+        fancy.find("foobar").unwrap().map(|m| m.as_str()),
+        Some("foobar")
+    );
+    assert!(fancy.find("foo bar").unwrap().map(|m| m.as_str()) != Some("foo"));
+
+    // \B variant.
+    let translated = js_regex_to_rust(r"(?=x)x\Ba");
+    let fancy = crate::regex::build_fancy_regex(&translated).expect("fancy \\B build");
+    assert!(fancy.is_match("xa").unwrap());
+
+    // Boundary semantics stay ASCII on the fancy engine: é is NOT a word
+    // char, so /(?=.)\bé/ must treat the position before é as a boundary
+    // only when the preceding char is a word char... spec: \b before é
+    // (non-word) requires previous to be word.
+    let translated = js_regex_to_rust(r"(?=.)a\b\u00e9");
+    let fancy = crate::regex::build_fancy_regex(&translated).expect("fancy ascii build");
+    assert!(fancy.is_match("a\u{e9}").unwrap());
+
+    // The real-world shape: marked's html-block regex from cli_2.1.112.js.
+    let marked = concat!(
+        r"^ *(?:<!--(?:-?>|[\s\S]*?(?:-->|$)) *(?:\n|\s*$)",
+        r"|<((?!(?:a|em|strong|small|s|cite|q|dfn|abbr|data|time|code|var|samp|kbd",
+        r"|sub|sup|i|b|u|mark|ruby|rt|rp|bdi|bdo|span|br|wbr|ins|del|img)\b)",
+        r"\w+(?!:|[^\w\s@]*@)\b)[\s\S]+?</\1> *(?:\n{2,}|\s*$)",
+        r"|<(?!(?:a|em|strong|small|s|cite|q|dfn|abbr|data|time|code|var|samp|kbd",
+        r"|sub|sup|i|b|u|mark|ruby|rt|rp|bdi|bdo|span|br|wbr|ins|del|img)\b)",
+        r"\w+(?!:|[^\w\s@]*@)\b(?:\x22[^\x22]*\x22|'[^']*'|\s[^'\x22/>\s]*)*?/?> *(?:\n{2,}|\s*$))",
+    );
+    let translated = js_regex_to_rust(marked);
+    let fancy = crate::regex::build_fancy_regex(&translated).expect("marked html regex build");
+    assert_eq!(
+        fancy
+            .find("<div>\nhello\n</div>\n\n")
+            .unwrap()
+            .map(|m| m.as_str()),
+        Some("<div>\nhello\n</div>\n\n")
     );
 }

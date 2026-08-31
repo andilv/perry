@@ -197,6 +197,9 @@ pub(crate) fn is_fetch_subclass_body_method(name: &[u8]) -> bool {
 // ── Topical sub-modules (issue #1103: keep every file < 2000 lines) ──
 mod accessors;
 pub(crate) use accessors::scan_accessor_receiver_override_root_mut;
+/// #9192 array prototype/constructor slots, split out of
+/// `get_field_by_name_tail.rs` for the 2000-line cap.
+mod array_retargeted_proto;
 mod buffer_own_prop;
 mod class_object_props;
 mod crypto_key;
@@ -215,6 +218,10 @@ mod ic_miss;
 mod ic_miss_array_length_tests;
 mod map_set_receiver;
 mod probe_dispatch;
+/// #9131: per-instance `[[Prototype]]` override lookup, split out of
+/// `get_field_by_name_tail.rs` for the 2000-line cap.
+mod prototype_override;
+#[allow(dead_code)] // #9244: field-get short-circuits removed; kept for the method path.
 
 /// Size of the direct-mapped `(keys_ptr, key_hash, field_index)` inline
 /// cache backing `js_object_get_field_by_name`'s slow tail.
@@ -277,8 +284,8 @@ pub(crate) use get_field_by_name_async::async_resource_property;
 pub(crate) use get_field_by_name_tail::get_field_by_name_object_tail;
 pub(super) use has_property::native_module_own_field_by_key;
 pub(crate) use has_property::{
-    closure_dynamic_prop_by_key, reified_function_method_name, wide_key_index_lookup,
-    wide_key_index_note_hit, WIDE_KEY_INDEX_MIN_KEYS,
+    closure_dynamic_prop_by_key, prototype_value_has_property, reified_function_method_name,
+    wide_key_index_lookup, wide_key_index_note_hit, WIDE_KEY_INDEX_MIN_KEYS,
 };
 pub use has_property::{js_in_operator, js_object_has_property};
 #[cfg(test)]

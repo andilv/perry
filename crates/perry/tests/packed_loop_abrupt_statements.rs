@@ -145,11 +145,16 @@ fn break_in_a_loop_whose_array_grows() {
 }
 
 #[test]
-fn a_throw_that_does_not_construct_takes_the_fast_path_correctly() {
-    // A `throw` whose value is already built is admitted: its block ends in
-    // `unreachable`, so control never returns to the loop and nothing reads
-    // what the clone cached. A throw that CONSTRUCTS its value is not, because
-    // the construction is emitted in blocks preceding the terminating one.
+fn a_throw_that_does_not_construct_is_still_correct() {
+    // This shape was admitted to the fast path by #9185 on the reasoning that
+    // the throw block ends in `unreachable`, so "control never returns to the
+    // loop and nothing reads what the clone cached". The second half of that
+    // is false — an unwind lands in a `catch`, which can read anything the
+    // loop wrote — and the loop is no longer admitted. See
+    // `a_loop_carried_local_survives_a_taken_throw` below for the case that
+    // proves it, and note what these assertions do NOT check: `throwPre`
+    // reads the thrown value and `k`, `throwValue` throws `s` itself. Both
+    // observe the clone's live value, never the frame slot left behind.
     let out = compile_and_run(&format!(
         "{PRELUDE}
         const PRE = new Error(\"boom\");
@@ -175,9 +180,7 @@ fn a_throw_that_does_not_construct_takes_the_fast_path_correctly() {
 
 #[test]
 fn throw_inside_the_loop_is_still_correct() {
-    // A throw that CONSTRUCTS its value is not admitted (the construction is a
-    // call in a block that does not end in `unreachable`), but it must keep
-    // working on the generic path.
+    // A throw that CONSTRUCTS its value must keep working on the generic path.
     let out = compile_and_run(&format!(
         "{PRELUDE}
         function throwAt(k: number): string {{
@@ -191,4 +194,103 @@ fn throw_inside_the_loop_is_still_correct() {
         "
     ));
     assert_eq!(out, "hit15 none2016");
+}
+
+/// #9185 admitted `throw` to the packed fast path and this is the case that
+/// showed it was a silent wrong answer; #9210 fixed it properly, so the loops
+/// below are on the fast path again AND correct.
+///
+/// `break` and `continue` leave the clone through normal CFG edges, which
+/// flush the loop-carried locals back to their frame slots. An unwind edge
+/// reaches no such block, so the `catch` below read `s` from a slot the loop
+/// never updated and got its pre-loop `0` instead of `780`. The fix emits the
+/// writeback at the throw site; this test is that writeback's only guard.
+///
+/// Every assertion here reads a loop-carried local AFTER the abrupt exit,
+/// which is precisely what #9185's own tests did not do. The `break` and
+/// `continue` rows are not padding: they are what established that the defect
+/// was specific to the unwind edge rather than to abrupt exits in general.
+#[test]
+fn a_loop_carried_local_survives_a_taken_throw() {
+    let out = compile_and_run(&format!(
+        "{PRELUDE}
+        const PRE = new Error(\"boom\");
+        function viaBreak(): string {{
+            let s = 0;
+            for (let i = 0; i < arr.length; i++) {{ if (arr[i] === 40) break; s += arr[i]; }}
+            return \"break \" + s;
+        }}
+        function viaContinue(): string {{
+            let s = 0;
+            for (let i = 0; i < arr.length; i++) {{ if (arr[i] % 2 === 0) continue; s += arr[i]; }}
+            return \"continue \" + s;
+        }}
+        function throwThenRead(): string {{
+            let s = 0;
+            try {{
+                for (let i = 0; i < arr.length; i++) {{ if (arr[i] === 40) throw PRE; s += arr[i]; }}
+            }} catch (e) {{ return \"throwBefore \" + s; }}
+            return \"none \" + s;
+        }}
+        function accumulateThenThrow(): string {{
+            let s = 0;
+            try {{
+                for (let i = 0; i < arr.length; i++) {{ s += arr[i]; if (arr[i] === 40) throw PRE; }}
+            }} catch (e) {{ return \"throwAfter \" + s; }}
+            return \"none \" + s;
+        }}
+        function throwThenReadViaClosure(): string {{
+            let s = 0;
+            const get = () => s;
+            try {{
+                for (let i = 0; i < arr.length; i++) {{ if (arr[i] === 40) throw PRE; s += arr[i]; }}
+            }} catch (e) {{ return \"closure \" + get(); }}
+            return \"none \" + get();
+        }}
+        console.log(
+            viaBreak() + \" | \" + viaContinue() + \" | \" + throwThenRead() + \" | \"
+            + accumulateThenThrow() + \" | \" + throwThenReadViaClosure()
+        );
+        "
+    ));
+    assert_eq!(
+        out,
+        "break 780 | continue 1024 | throwBefore 780 | throwAfter 820 | closure 780"
+    );
+}
+
+/// Both accumulator representations must survive the throw, not just the
+/// float one.
+///
+/// A `+=` accumulator lives in a `DOUBLE` alloca, but a `c++` counter is
+/// promoted to a separate i32 slot and only converted back with `sitofp`.
+/// Those are two distinct writeback paths in the clone, and the flush at the
+/// throw site has to cover both — a fix that walked only the float table
+/// would leave `c` reading `0` here while `s` looked correct.
+#[test]
+fn both_accumulator_kinds_survive_a_taken_throw() {
+    let out = compile_and_run(&format!(
+        "{PRELUDE}
+        const PRE = new Error(\"boom\");
+        function bothAccumulators(): string {{
+            let c = 0; let s = 0;
+            try {{
+                for (let i = 0; i < arr.length; i++) {{
+                    if (arr[i] === 40) throw PRE;
+                    c++; s += arr[i];
+                }}
+            }} catch (e) {{ return \"c=\" + c + \" s=\" + s; }}
+            return \"none c=\" + c + \" s=\" + s;
+        }}
+        function counterOnly(): string {{
+            let c = 0;
+            try {{
+                for (let i = 0; i < arr.length; i++) {{ if (arr[i] === 17) throw PRE; c++; }}
+            }} catch (e) {{ return \"c=\" + c; }}
+            return \"none c=\" + c;
+        }}
+        console.log(bothAccumulators() + \" | \" + counterOnly());
+        "
+    ));
+    assert_eq!(out, "c=40 s=780 | c=17");
 }

@@ -42,8 +42,11 @@ use super::{
 
 mod foreign_counter;
 mod guarded_array;
-pub(crate) use foreign_counter::packed_f64_loop_index_parts;
-use foreign_counter::{foreign_packed_loop_read, packed_f64_loop_fact_for_index};
+pub(crate) use foreign_counter::{affine_index_fits_i64, packed_f64_loop_index_parts};
+use foreign_counter::{
+    affine_packed_loop_read, emit_affine_index_i64, foreign_packed_loop_read,
+    packed_f64_loop_offset_read,
+};
 mod inline_dyn_typed_array;
 
 use guarded_array::{
@@ -222,7 +225,11 @@ fn numeric_index_has_loop_array_index_proof(ctx: &FnCtx<'_>, object: &Expr, inde
     if !ctx.i32_counter_slots.contains_key(&idx_id) {
         return false;
     }
-    if packed_f64_loop_fact_for_index(ctx, *arr_id, index).is_some() {
+    // #9259: an offset index is still an integer array index even when the
+    // loop bound does not prove it in range, so it must not fall through to
+    // the runtime-key helper -- that call is what the clone's call-free scan
+    // rejects. In-range-ness is settled by the inline bounds check instead.
+    if packed_f64_loop_offset_read(ctx, *arr_id, index).is_some() {
         return true;
     }
     offset == 0
@@ -749,14 +756,19 @@ pub(crate) fn lower_numeric_index_get_for_number_context(
     }
 
     if let Expr::LocalGet(arr_id) = object.as_ref() {
-        if let Some((fact, idx_id, offset)) =
-            packed_f64_loop_fact_for_index(ctx, *arr_id, index.as_ref())
+        if let Some((fact, idx_id, offset, needs_bounds_check)) =
+            packed_f64_loop_offset_read(ctx, *arr_id, index.as_ref())
         {
             if let Some(i32_slot) = ctx.i32_counter_slots.get(&idx_id).cloned() {
                 let arr_box = lower_expr(ctx, object)?;
                 let idx_i32 = load_packed_loop_index_i32(ctx, &i32_slot, offset);
                 return Ok(Some(lower_packed_f64_loop_index_get(
-                    ctx, *arr_id, &arr_box, &idx_i32, &fact, false,
+                    ctx,
+                    *arr_id,
+                    &arr_box,
+                    &idx_i32,
+                    &fact,
+                    needs_bounds_check,
                 )));
             }
         }
@@ -765,6 +777,31 @@ pub(crate) fn lower_numeric_index_get_for_number_context(
         // `is_packed_f64_loop_foreign_read_index` for read-only bodies. The
         // guard already proved this receiver's packed layout, so the element
         // load is the clone's raw slot load behind one inline bounds check.
+
+        // #9253: `a[i * size + k]` against a receiver-only affine fact. The
+        // entry guard proved the receiver once in the preheader; the index is
+        // materialised in i64 and range-clamped, then the shared bounds-checked
+        // element load does one `icmp ult idx, len` and takes the fact's side
+        // exit. That leaves per iteration only the compare and the raw load,
+        // instead of re-deriving tag/handle/header/flags/16M-sanity per access.
+        if let Some(fact) = affine_packed_loop_read(ctx, *arr_id, index.as_ref()) {
+            let arr_box = lower_expr(ctx, object)?;
+            if let Some(idx64) = emit_affine_index_i64(ctx, index.as_ref(), fact.index_local_id) {
+                // Unsigned: a negative index reads as a huge unsigned value and
+                // takes the side exit, so no static non-negativity proof is
+                // needed. The i32 ceiling keeps the truncation below exact.
+                let fits = ctx.block().icmp_ult(I64, &idx64, "2147483647");
+                let cont_idx = ctx.new_block("packed_f64_affine.index_fits");
+                let cont_label = ctx.block_label(cont_idx);
+                ctx.block()
+                    .cond_br(&fits, &cont_label, &fact.store_side_exit_label);
+                ctx.current_block = cont_idx;
+                let idx_i32 = ctx.block().trunc(I64, &idx64, I32);
+                return Ok(Some(lower_packed_f64_loop_index_get(
+                    ctx, *arr_id, &arr_box, &idx_i32, &fact, true,
+                )));
+            }
+        }
         if let Some((fact, idx_id)) = foreign_packed_loop_read(ctx, *arr_id, index.as_ref()) {
             if let Some(i32_slot) = ctx.i32_counter_slots.get(&idx_id).cloned() {
                 let arr_box = lower_expr(ctx, object)?;
@@ -1006,103 +1043,6 @@ fn lower_bounded_array_index_get(
     Ok(ctx.block().phi(
         DOUBLE,
         &[(&fast_val, &fast_end_label), (&lazy_val, &lazy_end_label)],
-    ))
-}
-
-// #6132: retired — inline-read a value as a plain ArrayHeader, which is unsafe
-// for off-heap typed arrays (garbage reads). Callers now use the typed-feedback
-// guarded path. Kept temporarily behind allow(dead_code); slated for deletion.
-#[allow(dead_code)]
-fn lower_legacy_array_index_get(
-    ctx: &mut FnCtx<'_>,
-    arr_box: &str,
-    idx_i32: &str,
-) -> Result<String> {
-    let blk = ctx.block();
-    let arr_bits = blk.bitcast_double_to_i64(arr_box);
-    let arr_handle = blk.and(I64, &arr_bits, POINTER_MASK_I64);
-
-    // Lazy/forwarded arrays need the runtime helper because their payload is
-    // not the ordinary ArrayHeader element layout. Plain arrays stay fully
-    // inline, including the bounds check and HOLE -> undefined translation.
-    let gc_type_addr = blk.sub(I64, &arr_handle, "8");
-    let gc_type_ptr = blk.inttoptr(I64, &gc_type_addr);
-    let gc_type = blk.load(I8, &gc_type_ptr);
-    let is_lazy = blk.icmp_eq(I8, &gc_type, "9"); // GC_TYPE_LAZY_ARRAY
-    let gc_flags_addr = blk.sub(I64, &arr_handle, "7");
-    let gc_flags_ptr = blk.inttoptr(I64, &gc_flags_addr);
-    let gc_flags = blk.load(I8, &gc_flags_ptr);
-    let fwd_bits = blk.and(I8, &gc_flags, "128"); // GC_FLAG_FORWARDED
-    let is_fwd = blk.icmp_ne(I8, &fwd_bits, "0");
-    let needs_slow = blk.or(I1, &is_lazy, &is_fwd);
-    // Index accessors / custom attribute descriptors (`Object.defineProperty
-    // (arr, i, { get })`) divert element reads through the descriptor tables —
-    // the raw slot load below would bypass them (test262 sort/precise-*).
-    // GcHeader._reserved (u16 at -6) carries OBJ_FLAG_ARRAY_DESCRIPTORS=0x400.
-    let obj_flags_addr = blk.sub(I64, &arr_handle, "6");
-    let obj_flags_ptr = blk.inttoptr(I64, &obj_flags_addr);
-    let obj_flags = blk.load(I16, &obj_flags_ptr);
-    let desc_bits = blk.and(I16, &obj_flags, "1024");
-    let has_desc = blk.icmp_ne(I16, &desc_bits, "0");
-    let needs_slow = blk.or(I1, &needs_slow, &has_desc);
-
-    let lazy_idx = ctx.new_block("arr.lazy");
-    let fast_idx = ctx.new_block("arr.fast");
-    let merge_idx = ctx.new_block("arr.merge");
-    let lazy_label = ctx.block_label(lazy_idx);
-    let fast_label = ctx.block_label(fast_idx);
-    let merge_label = ctx.block_label(merge_idx);
-    ctx.block().cond_br(&needs_slow, &lazy_label, &fast_label);
-
-    ctx.current_block = lazy_idx;
-    let lazy_blk = ctx.block();
-    let lazy_val = lazy_blk.call(
-        DOUBLE,
-        "js_array_get_f64",
-        &[(I64, &arr_handle), (I32, idx_i32)],
-    );
-    let lazy_end_label = lazy_blk.label.clone();
-    lazy_blk.br(&merge_label);
-
-    ctx.current_block = fast_idx;
-    let fast_blk = ctx.block();
-    let len_i32 = fast_blk.safe_load_i32_from_ptr(&arr_handle);
-    let in_bounds = fast_blk.icmp_ult(I32, idx_i32, &len_i32);
-    let ok_idx = ctx.new_block("arr.ok");
-    let oob_idx = ctx.new_block("arr.oob");
-    let ok_label = ctx.block_label(ok_idx);
-    let oob_label = ctx.block_label(oob_idx);
-    ctx.block().cond_br(&in_bounds, &ok_label, &oob_label);
-
-    ctx.current_block = ok_idx;
-    let blk = ctx.block();
-    let idx_i64 = blk.zext(I32, idx_i32, I64);
-    let byte_offset = blk.shl(I64, &idx_i64, "3");
-    let with_header = blk.add(I64, &byte_offset, "8");
-    let element_addr = blk.add(I64, &arr_handle, &with_header);
-    let element_ptr = blk.inttoptr(I64, &element_addr);
-    let raw = blk.load(DOUBLE, &element_ptr);
-    let raw_bits = blk.bitcast_double_to_i64(&raw);
-    let is_hole = blk.icmp_eq(I64, &raw_bits, crate::nanbox::TAG_HOLE_I64);
-    let undef_d = blk.bitcast_i64_to_double(crate::nanbox::TAG_UNDEFINED_I64);
-    let val = blk.select(I1, &is_hole, DOUBLE, &undef_d, &raw);
-    let ok_end_label = ctx.block().label.clone();
-    ctx.block().br(&merge_label);
-
-    ctx.current_block = oob_idx;
-    let undef_bits = crate::nanbox::i64_literal(crate::nanbox::TAG_UNDEFINED);
-    let undef_val = ctx.block().bitcast_i64_to_double(&undef_bits);
-    let oob_end_label = ctx.block().label.clone();
-    ctx.block().br(&merge_label);
-
-    ctx.current_block = merge_idx;
-    Ok(ctx.block().phi(
-        DOUBLE,
-        &[
-            (&val, &ok_end_label),
-            (&undef_val, &oob_end_label),
-            (&lazy_val, &lazy_end_label),
-        ],
     ))
 }
 
@@ -1631,14 +1571,19 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 // The loop already proved `i < arr.length` and the
                 // body provably can't change `arr.length`.
                 if let Expr::LocalGet(arr_id) = object.as_ref() {
-                    if let Some((fact, idx_id, offset)) =
-                        packed_f64_loop_fact_for_index(ctx, *arr_id, index.as_ref())
+                    if let Some((fact, idx_id, offset, needs_bounds_check)) =
+                        packed_f64_loop_offset_read(ctx, *arr_id, index.as_ref())
                     {
                         if let Some(i32_slot) = ctx.i32_counter_slots.get(&idx_id).cloned() {
                             let arr_box = lower_expr(ctx, object)?;
                             let idx_i32 = load_packed_loop_index_i32(ctx, &i32_slot, offset);
                             return Ok(lower_packed_f64_loop_index_get(
-                                ctx, *arr_id, &arr_box, &idx_i32, &fact, false,
+                                ctx,
+                                *arr_id,
+                                &arr_box,
+                                &idx_i32,
+                                &fact,
+                                needs_bounds_check,
                             ));
                         }
                     }

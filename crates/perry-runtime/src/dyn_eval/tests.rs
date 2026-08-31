@@ -47,19 +47,7 @@ fn truthy(v: f64) -> bool {
 /// Run `f` under a Rust-side landing pad; `Err(exception)` when it throws.
 /// Same setjmp idiom as the interpreter's own try/catch.
 fn catch_throw(f: impl FnOnce() -> f64) -> Result<f64, f64> {
-    use crate::ffi::setjmp::setjmp;
-    let trap = crate::exception::js_try_push();
-    let jumped = unsafe { setjmp(trap as *mut std::os::raw::c_int) };
-    if jumped == 0 {
-        let v = f();
-        crate::exception::js_try_end();
-        Ok(v)
-    } else {
-        crate::exception::js_try_end();
-        let exc = crate::exception::js_get_exception();
-        crate::exception::js_clear_exception();
-        Err(exc)
-    }
+    crate::exception::catch_js_throw(f)
 }
 
 fn error_message(exc: f64) -> String {
@@ -995,16 +983,12 @@ fn script_literals_use_fresh_populated_realm_prototypes() {
     let outer_object_prototype = crate::object::builtin_prototype_value("Object");
     let scope = crate::gc::RuntimeHandleScope::new();
     let intrinsics = scope.root_raw_mut_ptr(crate::object::js_object_alloc(0, 0));
-    crate::object::populate_global_this_builtins(
-        intrinsics
-            .across_mut::<crate::object::ObjectHeader, _>(|| ())
-            .1,
-    );
-    let intrinsics = crate::value::js_nanbox_pointer(
-        intrinsics
-            .across_mut::<crate::object::ObjectHeader, _>(|| ())
-            .1 as i64,
-    );
+    intrinsics.with_mut_ptr::<crate::object::ObjectHeader, _>(|intrinsics| {
+        crate::object::populate_global_this_builtins(intrinsics)
+    });
+    let intrinsics = intrinsics.with_mut_ptr::<crate::object::ObjectHeader, _>(|intrinsics| {
+        crate::value::js_nanbox_pointer(intrinsics as i64)
+    });
     let realm_object_prototype = bridge::intrinsic_prototype(intrinsics, "Object");
     assert_ne!(
         realm_object_prototype.to_bits(),

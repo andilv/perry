@@ -42,8 +42,9 @@ rustflags = ["-C", "force-unwind-tables=yes"]
 # system libs (-lz3 -lxml2 -lffi ...) that a musl binary cannot satisfy at
 # runtime — a musl+glibc mixed process segfaults at startup. Musl targets
 # must therefore be built WITHOUT the llvm-inprocess feature (see the musl
-# feature handling in .github/workflows/manual-build.yml and
-# release-packages.yml), keeping the binary pure static musl.
+# feature handling in .github/workflows/manual-build.yml), keeping the
+# binary pure static musl. (The release pipeline's musl legs are exempt: they
+# build inside Alpine with a musl-built LLVM, so llvm-inprocess stays ON.)
 [target.aarch64-unknown-linux-musl]
 rustflags = ["-L", "native=/usr/lib/aarch64-linux-musl"]
 

@@ -598,6 +598,11 @@ crate::perry_thread_local! {
     /// this side-table keyed by class_id.
     pub(crate) static CLASS_DYNAMIC_PROPS: std::cell::RefCell<std::collections::HashMap<u32, std::collections::HashMap<String, f64>>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Property-creation order for `CLASS_DYNAMIC_PROPS`. The value table is a
+    /// HashMap for hot lookup, while [[OwnPropertyKeys]] needs first-insertion
+    /// order (with delete + re-add moving a key to the end).
+    pub(crate) static CLASS_DYNAMIC_PROP_ORDER: std::cell::RefCell<std::collections::HashMap<u32, Vec<String>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
     /// #7190: `(writable, enumerable)` for static own keys installed by
     /// `Object.defineProperty(C, k, desc)`. They live in `CLASS_DYNAMIC_PROPS`
     /// next to `static x = …` fields, which are writable AND enumerable by
@@ -1819,16 +1824,12 @@ unsafe fn set_object_keys_array_with_live(
     // #8067/#8113: every visible ShapeId resolves to the exact rooted
     // ordered-keys/live-slot descriptor. Same-pointer appends are versioned
     // inside the helper.
-    let successor_shape_id =
-        shapes::publish_object_shape_from(obj, predecessor, keys_array, live_inline_slot_count);
-    // An old receiver is invisible to an ordinary minor root walk. Arm the
-    // shared descriptor edge at publication time so its keys array is copied
-    // during the same first minor, rather than relying on a later pass over a
-    // stale from-space address. Exact object-start validation deliberately
-    // rejects that stale address once the nursery block is reset (#8256).
-    if !crate::arena::pointer_in_nursery(obj as usize) {
-        shapes::note_old_generation_carrier(shapes::shape_descriptor_by_id(successor_shape_id));
-    }
+    // An old receiver is invisible to an ordinary minor root walk (#8256).
+    // #9200: the arming that used to live here moved into the stamp funnel
+    // (`shapes::stamp_object_shape_id_with_carrier_note`), which
+    // `publish_object_shape_from` and every other post-birth publish now
+    // route through — this call site no longer needs to remember the note.
+    shapes::publish_object_shape_from(obj, predecessor, keys_array, live_inline_slot_count);
 }
 
 #[inline]

@@ -889,6 +889,10 @@ pub(crate) fn get_field_by_name_object_tail(
                 if key_bytes == b"length" {
                     return JSValue::number(crate::array::js_array_length(arr) as f64);
                 }
+                // #9192; see `array_retargeted_proto::array_proto_slot`.
+                if key_bytes == b"__proto__" {
+                    return super::array_retargeted_proto::array_proto_slot(obj);
+                }
                 // date-fns / drizzle / lodash duck-typing path:
                 // `arr.constructor === Array`, `new arr.constructor(...)`,
                 // etc. expect a non-undefined function-typed value that
@@ -905,6 +909,10 @@ pub(crate) fn get_field_by_name_object_tail(
                     }
                     if let Some(v) = crate::array::array_named_property_get(arr, key) {
                         return JSValue::from_bits(v.to_bits());
+                    }
+                    // #9192; see `array_retargeted_proto::array_constructor_slot`.
+                    if let Some(v) = super::array_retargeted_proto::array_constructor_slot(obj) {
+                        return v;
                     }
                     let v = js_get_global_this_builtin_value(b"Array".as_ptr(), 5);
                     return JSValue::from_bits(v.to_bits());
@@ -1341,6 +1349,12 @@ pub(crate) fn get_field_by_name_object_tail(
         let keys = crate::object::object_keys_array(obj);
 
         if keys.is_null() {
+            // #9131; see `prototype_override::inherited_field_if_overridden`.
+            // A miss returns None so the synthesized arms below stay reachable
+            // (#9244).
+            if let Some(v) = super::prototype_override::inherited_field_if_overridden(obj, key) {
+                return v;
+            }
             // #809: an object with no own keys (e.g. an `Object.create(proto)`
             // result, or a `Function.prototype = obj` instance) still has to
             // resolve inherited props/methods. Pre-fix this returned undefined
@@ -1709,6 +1723,11 @@ pub(crate) fn get_field_by_name_object_tail(
                     };
                 }
             }
+        }
+
+        // Shaped-receiver own-key miss; same rule as the keyless arm above.
+        if let Some(v) = super::prototype_override::inherited_field_if_overridden(obj, key) {
+            return v;
         }
 
         // Key not found in the keys_array — fall back to the class

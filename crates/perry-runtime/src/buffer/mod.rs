@@ -63,7 +63,11 @@ pub(crate) use header::{
     finalize_collected_dead_buffer, is_foreign_backed_buffer,
 };
 #[cfg(test)]
-pub(crate) use header::{test_data_view_registry_len, test_shared_array_buffer_registry_len};
+pub(crate) use header::{
+    test_buffer_addr_window_bounds, test_buffer_registry_probe_count, test_data_view_registry_len,
+    test_shared_array_buffer_registry_len, test_uint8array_addr_window_bounds,
+    test_uint8array_registry_probe_count,
+};
 
 // ---- Re-exports: ArrayBuffer detach / transfer (ES2024) ----
 // `detach_array_buffer` dereferences the raw address it is given, so it stays
@@ -83,7 +87,9 @@ pub use own_props::{
 // `ArrayBuffer` / `SharedArrayBuffer` / `DataView` share `BufferHeader` and the
 // buffer registry with `Buffer` / `Uint8Array` but have NO integer-indexed own
 // properties. See `exotic_view`.
-pub use exotic_view::{canonical_index_key, is_byte_indexed_buffer, is_non_indexed_buffer_view};
+pub use exotic_view::{
+    canonical_index_key, is_byte_indexed_buffer, is_node_buffer, is_non_indexed_buffer_view,
+};
 
 // ---- Re-exports: Buffer.from / alloc / concat (FFI) ----
 pub use from::{
@@ -99,8 +105,8 @@ pub use from::{
 // ---- Re-exports: predicates / byteLength (FFI) ----
 pub use query::{
     js_buffer_byte_length, js_buffer_byte_length_value, js_buffer_is_ascii, js_buffer_is_buffer,
-    js_buffer_is_encoding, js_buffer_is_utf8, js_native_buffer_byte_len, js_native_buffer_data_ptr,
-    js_value_buffer_or_typedarray_data,
+    js_buffer_is_encoding, js_buffer_is_node_buffer, js_buffer_is_utf8, js_native_buffer_byte_len,
+    js_native_buffer_data_ptr, js_value_buffer_or_typedarray_data,
 };
 
 // ---- Re-exports: toString / print / length / to-array ----

@@ -9,8 +9,7 @@ use perry_hir::{Expr, UnaryOp};
 
 use crate::lower_conditional::lower_expr_with_truthy;
 use crate::type_analysis::{
-    expr_may_return_boxed_value_from_raw_f64_fallback, is_bigint_expr, is_numeric_expr,
-    is_provably_not_bigint,
+    expr_may_return_boxed_value_from_raw_f64_fallback, is_numeric_expr, is_provably_not_bigint,
 };
 use crate::types::{DOUBLE, I32, I64};
 
@@ -19,16 +18,23 @@ use super::{is_known_i32_range, lower_expr, FnCtx};
 pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
     match expr {
         Expr::Unary { op, operand } => {
-            let numeric = is_numeric_expr(ctx, operand)
+            let statically_numeric = is_numeric_expr(ctx, operand);
+            let numeric = statically_numeric
                 && !expr_may_return_boxed_value_from_raw_f64_fallback(ctx, operand);
             let native_bitnot =
                 matches!(op, UnaryOp::BitNot) && numeric && is_provably_not_bigint(ctx, operand);
             let bitnot_known_i32 = native_bitnot && is_known_i32_range(ctx, operand);
-            // `-<bigint>` must stay a BigInt (`typeof -1n === "bigint"`).
-            // `fneg` on a NaN-boxed BigInt flips the NaN payload's sign bit
-            // and produces a garbage number, so route negation through the
-            // runtime dynamic helper when the operand is statically bigint.
-            let is_big = matches!(op, UnaryOp::Neg) && is_bigint_expr(ctx, operand);
+            // Unary minus performs ToNumeric, not ToNumber: a possible BigInt
+            // operand must use the dynamic helper so `-1n` remains a BigInt.
+            // A statically numeric expression is already proven to yield a
+            // Number (even if a boxed cold fallback still needs coercion), and
+            // a separately proven non-BigInt value can use `js_number_coerce`.
+            // Everything else may be a BigInt at runtime — notably an indexed
+            // read from a plain array — and routing it through ToNumber would
+            // silently round large BigInts before `fneg` (#9142).
+            let _dynamic_neg = matches!(op, UnaryOp::Neg)
+                && !statically_numeric
+                && !is_provably_not_bigint(ctx, operand);
             let (v, precomputed_truthy) = if matches!(op, UnaryOp::Not) {
                 let (boxed, truthy) = lower_expr_with_truthy(ctx, operand)?;
                 (boxed, Some(truthy))
@@ -38,13 +44,18 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             let blk = ctx.block();
             match op {
                 UnaryOp::Neg => {
-                    if is_big {
-                        Ok(blk.call(DOUBLE, "js_dynamic_neg", &[(DOUBLE, &v)]))
-                    } else if numeric {
+                    if numeric {
                         Ok(blk.fneg(&v))
                     } else {
-                        let coerced = blk.call(DOUBLE, "js_number_coerce", &[(DOUBLE, &v)]);
-                        Ok(blk.fneg(&coerced))
+                        // Mirrors `Pos` below: anything not statically numeric
+                        // goes through the dynamic helper, which performs a real
+                        // ToNumeric. The old `js_number_coerce` + `fneg` fallback
+                        // answered NaN when the operand's `valueOf` THREW, so
+                        // `-{ valueOf() { throw … } }` silently produced NaN
+                        // where every other operator (`+x`, `~x`, `x * 2`)
+                        // propagated. `js_dynamic_neg` also keeps a BigInt a
+                        // BigInt, which is why `dynamic_neg` folded in here.
+                        Ok(blk.call(DOUBLE, "js_dynamic_neg", &[(DOUBLE, &v)]))
                     }
                 }
                 UnaryOp::Pos => {

@@ -358,12 +358,64 @@ jobs:
           echo "All gate workflows passed — proceeding to build/publish."
 
   # ---------------------------------------------------------------------------
+  # Warm the x86_64-apple-darwin dependency cache before `build` runs.
+  #
+  # The macOS x86_64 leg must run on an Intel runner: the bare `macos-15` label
+  # is the Arm64 image, whose arm64-only LLVM cannot link an x86_64 binary.
+  # Intel runners are materially slower -- the arm64 leg takes ~3h40m WITH a
+  # warm cache -- and a cold `dist` build there ran to GitHub's hard 6h job
+  # ceiling and was cancelled. A cancelled job SKIPS its post-steps, so
+  # `rust-cache` saved nothing, leaving that leg unable to warm its own cache:
+  # it cannot finish without a cache and cannot cache without finishing.
+  #
+  # This job breaks the loop. `rust-cache` caches THIRD-PARTY dependencies only
+  # (it deliberately evicts workspace-crate fingerprints -- see #4856 in the
+  # build job), and those are the bulk of a cold build. Compiling them here
+  # under a timeout safely inside the ceiling, with `cache-on-failure`, saves
+  # the cache even if this job does not finish, so `build` starts from
+  # compiled dependencies.
+  #
+  # `continue-on-error` is deliberate: this is an optimization, never a gate.
+  # If it fails or times out, `build` runs exactly as it would have.
+  prime-macos-x86_64-cache:
+    needs: [preflight]
+    runs-on: macos-15-intel
+    timeout-minutes: 330
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install Rust toolchain
+        run: rustup toolchain install nightly-2026-08-20 --profile minimal --target x86_64-apple-darwin
+      - uses: ./.github/actions/setup-llvm22
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          # MUST match the build job's key for this target, or this warms a
+          # cache nothing reads.
+          shared-key: "release-x86_64-apple-darwin"
+          cache-on-failure: true
+          workspaces: |
+            . -> target
+      - name: Compile dependencies for x86_64-apple-darwin
+        run: cargo build --profile dist --target x86_64-apple-darwin -p perry
+
+  # ---------------------------------------------------------------------------
   # Build release binaries for all platforms
   # ---------------------------------------------------------------------------
   build:
     # preflight is only in `needs` for its outputs (the update-manifest signing
     # steps bake the release tag into the signed URL); await-tests is the gate.
-    needs: [preflight, await-tests]
+    needs: [preflight, await-tests, prime-macos-x86_64-cache]
+    # `prime-macos-x86_64-cache` is a cache warmer, never a gate, so its result
+    # must not decide whether the release builds. `continue-on-error` keeps a
+    # failure there from failing the RUN, but this is the repository's first
+    # JOB-level use of it and GitHub's `needs` semantics for that case are not
+    # worth a silently skipped release to find out. State the gate explicitly:
+    # await-tests decides, preflight must have produced its outputs, and the
+    # warmer's outcome is deliberately unexamined.
+    if: >-
+      ${{ !cancelled()
+      && needs.preflight.result == 'success'
+      && needs.await-tests.result == 'success' }}
     strategy:
       # Don't let one platform's build failure cancel the others (mirrors
       # build-cross). A broken cross-host target should not strand the
@@ -375,7 +427,14 @@ jobs:
             target: aarch64-apple-darwin
             artifact: perry-macos-aarch64
             old_glibc_image: ""
-          - os: macos-15
+          # macos-15-intel, NOT macos-15: the bare label is the Arm64 image
+          # (see actions/runner-images). Building x86_64-apple-darwin there
+          # links brew's arm64-only LLVM, so every LLVM symbol is undefined at
+          # link once the in-process backend became default — the artifact
+          # shipped in v0.5.1220 and has been failing since. LLVM publishes no
+          # x86_64 macOS binary, so a native Intel runner is the only source of
+          # an x86_64 libLLVM.
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             artifact: perry-macos-x86_64
             old_glibc_image: ""
@@ -390,13 +449,21 @@ jobs:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             artifact: perry-linux-x86_64-musl
-            musl: true
             old_glibc_image: ""
+            # musl needs a musl-BUILT LLVM: perry links libLLVM in-process, and
+            # apt.llvm.org ships only glibc builds, so the static link died with
+            # `ld-linux-*.so.2: DSO missing from command line`. Alpine packages
+            # LLVM 22.1.8 for both arches; nothing is built from source.
+            musl_image: alpine:edge
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             artifact: perry-linux-aarch64-musl
-            musl: true
             old_glibc_image: ""
+            # musl needs a musl-BUILT LLVM: perry links libLLVM in-process, and
+            # apt.llvm.org ships only glibc builds, so the static link died with
+            # `ld-linux-*.so.2: DSO missing from command line`. Alpine packages
+            # LLVM 22.1.8 for both arches; nothing is built from source.
+            musl_image: alpine:edge
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: perry-windows-x86_64
@@ -428,7 +495,7 @@ jobs:
       # Its host-side GTK4 build does not depend on perry-codegen, so avoid
       # installing a second LLVM copy on the noble runner for these two legs.
       - uses: ./.github/actions/setup-llvm22
-        if: matrix.old_glibc_image == ''
+        if: matrix.old_glibc_image == '' && matrix.musl_image == ''
 
       # Cache cargo registry + target/ per (matrix.target, Cargo.lock).
       # First run on a target is still a cold build, but every subsequent
@@ -503,7 +570,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libunwind-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libwebkitgtk-6.0-dev libshumate-dev
 
       - name: Install musl tools (Linux musl)
-        if: endsWith(matrix.target, '-musl')
+        if: endsWith(matrix.target, '-musl') && matrix.musl_image == ''
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Build perry
@@ -511,33 +578,11 @@ jobs:
         # the next step. (Perry is V8-free — the former perry-jsruntime
         # crate, which downloaded a prebuilt V8 that 404'd on musl, was
         # removed.)
-        if: matrix.old_glibc_image == ''
-        run: |
-          FEATURES=""
-          if [ "${{ matrix.musl }}" = "true" ]; then
-            # Musl legs cannot statically link the glibc-built in-process LLVM
-            # (#7353): versioned glibc refs (__isoc23_*@@GLIBC_2.38) and the
-            # -lz3/-lxml2/-lffi system libs neither link into musl, and a forced
-            # link yields a musl+glibc mixed process that segfaults at startup.
-            # Pure-static variant (no llvm-inprocess feature): perry shells out
-            # to the LLVM tools (opt/llc) at compile time. Matching per-target
-            # rustflags live in .cargo/config.toml (musl libc.a order + fortify).
-            FEATURES="--no-default-features --features full-cli"
-          fi
-          cargo build --profile dist --target ${{ matrix.target }} $FEATURES -p perry
-
-      - name: Verify musl binary is fully static
-        if: matrix.musl == true
-        run: |
-          BIN="target/${{ matrix.target }}/dist/perry"
-          file "$BIN" | grep -q static || { echo "::error::$BIN is not statically linked"; exit 1; }
-          if readelf -l "$BIN" | grep -q INTERP; then
-            echo "::error::$BIN has a dynamic interpreter — musl artifact regressed to glibc-hybrid"
-            exit 1
-          fi
+        if: matrix.old_glibc_image == '' && matrix.musl_image == ''
+        run: cargo build --profile dist --target ${{ matrix.target }} -p perry
 
       - name: Build runtime libraries
-        if: matrix.old_glibc_image == ''
+        if: matrix.old_glibc_image == '' && matrix.musl_image == ''
         run: |
           cargo build --profile dist --target ${{ matrix.target }} -p perry-runtime -p perry-runtime-static
           cargo build --profile dist --target ${{ matrix.target }} -p perry-stdlib -p perry-stdlib-static
@@ -550,7 +595,7 @@ jobs:
         # See optimized_libs.rs (find_runtime_abort_library selection).
         # Separate CARGO_TARGET_DIR so the profile override doesn't
         # invalidate the main build's incremental cache.
-        if: runner.os != 'Windows' && matrix.old_glibc_image == ''
+        if: runner.os != 'Windows' && matrix.old_glibc_image == '' && matrix.musl_image == ''
         run: |
           CARGO_TARGET_DIR=target-abort CARGO_PROFILE_DIST_PANIC=abort \
             cargo build --profile dist --target ${{ matrix.target }} -p perry-runtime -p perry-runtime-static
@@ -575,7 +620,7 @@ jobs:
         # a crate requires a recorded retain/migration decision. Best-effort
         # per crate: a wrapper that can't build on this host must not fail the
         # whole release — packaging below ships whatever was produced.
-        if: runner.os != 'Windows' && matrix.old_glibc_image == ''
+        if: runner.os != 'Windows' && matrix.old_glibc_image == '' && matrix.musl_image == ''
         run: |
           set -euo pipefail
           governed_ext_packages=$(./scripts/release_ext_packages.sh)
@@ -633,6 +678,46 @@ jobs:
             [ -f "$archive" ] && cp "$archive" "$dst/"
           done
 
+      # musl needs a musl-BUILT LLVM (see the matrix comment). Alpine is the
+      # only source of a packaged LLVM 22 for musl, so the compiler, runtime and
+      # stdlib are built inside it. Unlike the glibc-2.31 container, the host's
+      # ~/.cargo and ~/.rustup are NOT mounted: those are glibc binaries and
+      # cannot execute in a musl sysroot. The image installs its own rustup with
+      # the pinned nightly, whose musl host toolchain rustup does publish.
+      - name: Build Linux musl core artifacts in a musl sysroot
+        if: matrix.musl_image != ''
+        env:
+          MUSL_IMAGE: ${{ matrix.musl_image }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          docker build \
+            --build-arg "ALPINE_IMAGE=$MUSL_IMAGE" \
+            --build-arg "RUST_TOOLCHAIN=nightly-2026-08-20" \
+            --tag perry-musl-llvm22 \
+            --file scripts/linux-musl-llvm22.Dockerfile \
+            .
+          docker run --rm \
+            --env HOME=/tmp/perry-home \
+            --env CARGO_TARGET_DIR=/work/target-musl \
+            --env PERRY_ABORT_TARGET_DIR=/work/target-musl-abort \
+            --env PERRY_CLI_UPDATE_PUBLIC_KEYS \
+            --volume "$GITHUB_WORKSPACE:/work" \
+            --workdir /work \
+            perry-musl-llvm22 \
+            sh scripts/build_linux_musl.sh "$TARGET"
+
+          # Same boundary as the old-sysroot leg: only the artifacts packaging
+          # consumes cross back into target/.
+          src="target-musl/$TARGET/dist"
+          dst="target/$TARGET/dist"
+          mkdir -p "$dst"
+          for artifact in perry libperry_runtime.a libperry_runtime_abort.a libperry_stdlib.a; do
+            test -s "$src/$artifact"
+            sudo cp "$src/$artifact" "$dst/$artifact"
+          done
+          sudo chown -R "$(id -u):$(id -g)" "$dst"
+
       - name: Build UI library (macOS)
         if: runner.os == 'macOS'
         run: cargo build --profile dist --target ${{ matrix.target }} -p perry-ui-macos
@@ -678,12 +763,19 @@ jobs:
       # GitHub-hosted Windows runners pre-install the Android NDK at
       # `%ANDROID_NDK_HOME%`; we point cargo at its `aarch64-linux-android-*`
       # clang as the cross-linker.
+      # X64 only: the step below resolves the NDK toolchain under
+      # `prebuilt/windows-x86_64`, and the NDK ships no Windows-arm64 host
+      # toolchain, so `windows-11-arm` cannot run it. It also has no NDK
+      # installed, which is how this surfaced — the leg failed with
+      # "ANDROID_NDK_HOME not set" and blocked `create-release`, which requires
+      # every matrix leg to succeed. The same library is already produced by
+      # the `aarch64-linux-android` build-cross leg on Linux.
       - name: Install aarch64-linux-android Rust target (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && runner.arch == 'X64'
         shell: pwsh
         run: rustup target add aarch64-linux-android
       - name: Build Android cross-compile libraries (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && runner.arch == 'X64'
         shell: pwsh
         env:
           # API level 24 matches every other Android leg we cross-build for
@@ -912,16 +1004,27 @@ jobs:
           # `<install-dir>/<triple>/release/<libname>.a` so we mirror that
           # layout inside the zip — the `aarch64-linux-android/release/`
           # subdir lives alongside `perry.exe`.
-          $androidLibDir = "staging/aarch64-linux-android/release"
-          New-Item -ItemType Directory -Force -Path $androidLibDir | Out-Null
-          $androidLibs = @("libperry_runtime.a", "libperry_stdlib.a", "libperry_ui_android.a")
-          foreach ($lib in $androidLibs) {
-            $src = "target/aarch64-linux-android/dist/$lib"
-            if (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
-              Write-Error "Required Android library missing from ${{ matrix.artifact }}: $src"
-              exit 1
+          # Only the x86_64 Windows runner builds these: the NDK ships no
+          # Windows-arm64 host toolchain (the step resolves its compiler under
+          # `prebuilt/windows-x86_64`) and the ARM runner has no NDK at all.
+          # Requiring them unconditionally made the ARM leg fail in packaging
+          # once the build step was correctly skipped. `perry-windows-aarch64`
+          # has never shipped -- v0.5.1220 carries only `perry-windows-x86_64`
+          # -- so this does not remove anything users have; it makes the leg
+          # internally consistent. Android cross-compilation from a Windows
+          # ARM host needs an NDK that supports that host.
+          if ($env:RUNNER_ARCH -eq "X64") {
+            $androidLibDir = "staging/aarch64-linux-android/release"
+            New-Item -ItemType Directory -Force -Path $androidLibDir | Out-Null
+            $androidLibs = @("libperry_runtime.a", "libperry_stdlib.a", "libperry_ui_android.a")
+            foreach ($lib in $androidLibs) {
+              $src = "target/aarch64-linux-android/dist/$lib"
+              if (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
+                Write-Error "Required Android library missing from ${{ matrix.artifact }}: $src"
+                exit 1
+              }
+              Copy-Item $src $androidLibDir
             }
-            Copy-Item $src $androidLibDir
           }
           Compress-Archive -Path staging/* -DestinationPath "${{ matrix.artifact }}.zip"
 

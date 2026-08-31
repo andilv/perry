@@ -158,10 +158,12 @@ native-cli = []
 # system libs), which a musl binary cannot resolve — the link dies on
 # `undefined reference to '__isoc23_strtoull@@GLIBC_2.38'`, and even a forced
 # link produces a musl+glibc mixed process that segfaults at startup. The
-# musl legs of manual-build.yml / release-packages.yml therefore build
-# `--no-default-features --features full-cli` (the in-process backend is not
-# in full-cli) — the shipped musl binary is pure static musl and shells out
-# to the LLVM tools (opt/llc) at compile time, like pre-#7353 builds.
+# musl legs of manual-build.yml therefore build `--no-default-features
+# --features full-cli` (the in-process backend is not in full-cli) — the
+# shipped musl binary is pure static musl and shells out to the LLVM tools
+# (opt/llc) at compile time, like pre-#7353 builds. (The release pipeline's
+# musl legs are exempt: they build inside Alpine with a musl-built LLVM, so
+# llvm-inprocess stays ON there.)
 llvm-inprocess = ["perry-codegen/llvm-inprocess"]
 
 # Codegen backends for non-native targets. Each enables one backend crate;

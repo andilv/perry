@@ -20,7 +20,9 @@ pub(super) use runtime_handles::{
     new_runtime_handle_root_scan_state, scan_runtime_handle_roots_mut,
     scan_runtime_handle_roots_mut_step,
 };
-pub(crate) use runtime_handles::{runtime_handle_stack_restore, runtime_handle_stack_savepoint};
+pub(crate) use runtime_handles::{
+    runtime_handle_stack_hot_addr, runtime_handle_stack_restore, runtime_handle_stack_savepoint,
+};
 pub use runtime_handles::{RuntimeHandle, RuntimeHandleScope};
 pub use scanner_shims::{
     async_context_mutable_root_scanner, async_context_root_scanner,
@@ -108,7 +110,6 @@ crate::perry_thread_local! {
     pub(super) static FFI_MUTABLE_ROOT_SCANNERS: RefCell<Vec<PerryFfiMutableRootScanner>> = RefCell::new(Vec::new());
     pub(super) static FFI_NAMED_MUTABLE_ROOT_SCANNERS: RefCell<Vec<(PerryFfiNamedMutableRootScanner, usize)>> = RefCell::new(Vec::new());
     pub(super) static GLOBAL_ROOTS: RefCell<Vec<*mut u64>> = const { RefCell::new(Vec::new()) };
-    pub(super) static RUNTIME_HANDLE_STACK: RefCell<Vec<RuntimeHandleSlot>> = const { RefCell::new(Vec::new()) };
     pub(super) static GC_ROOT_LOCK_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -444,6 +445,14 @@ pub(super) fn mark_stack_roots_unchecked(
     #[repr(C, align(16))]
     struct JmpBufWords([u64; 32]);
     let mut jmp_buf = JmpBufWords([0u64; 32]); // oversized for safety
+                                               // The ONE remaining raw `setjmp` call in Rust code, and the one place
+                                               // it is sound (#9305): this buffer is never a `longjmp` target — the
+                                               // call is a register-spilling trick (setjmp dumps the callee-saved
+                                               // registers into the buffer for the conservative scan below) and
+                                               // returns exactly once, so LLVM's single-return assumption holds.
+                                               // Every jmp_buf that CAN be longjmp'd to is armed through the C
+                                               // trampoline `exception::arm_trap_and_run` instead — never add a raw
+                                               // `setjmp` whose buffer reaches `js_throw`.
     unsafe {
         crate::ffi::setjmp::setjmp(jmp_buf.0.as_mut_ptr() as *mut std::os::raw::c_int);
     }

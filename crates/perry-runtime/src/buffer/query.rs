@@ -67,11 +67,9 @@ pub unsafe extern "C" fn js_value_buffer_or_typedarray_data(
 static KEEP_JS_VALUE_BUFFER_OR_TYPEDARRAY_DATA: unsafe extern "C" fn(f64, *mut u32) -> *const u8 =
     js_value_buffer_or_typedarray_data;
 
-/// Check if an object is a Buffer (using the buffer registry)
-#[no_mangle]
-pub extern "C" fn js_buffer_is_buffer(ptr: i64) -> i32 {
+fn buffer_addr_from_raw(ptr: i64) -> Option<usize> {
     if ptr == 0 || (ptr as u64) < 0x1000 {
-        return 0;
+        return None;
     }
     // Strip NaN-boxing tags if present
     let addr = if ((ptr as u64) >> 48) != 0 {
@@ -79,10 +77,43 @@ pub extern "C" fn js_buffer_is_buffer(ptr: i64) -> i32 {
     } else {
         ptr as u64
     };
-    if is_registered_buffer(addr as usize) {
-        1
-    } else {
-        0
+    Some(addr as usize)
+}
+
+/// Check whether a value uses Perry's shared BufferHeader storage.
+///
+/// Native consumers intentionally accept Buffer-backed Uint8Arrays and other
+/// byte views, so this remains broader than the JavaScript Buffer brand check.
+#[no_mangle]
+pub extern "C" fn js_buffer_is_buffer(ptr: i64) -> i32 {
+    buffer_addr_from_raw(ptr).is_some_and(is_registered_buffer) as i32
+}
+
+/// Check if an object has the Node `Buffer` brand.
+///
+/// Perry intentionally backs both `Buffer` and constructor-created
+/// `Uint8Array` values with `BufferHeader` and registers both addresses in
+/// `BUFFER_REGISTRY`. Keep [`js_buffer_is_buffer`] as the broader storage
+/// predicate used by native APIs that accept either representation, and use
+/// this discriminator for the public `Buffer.isBuffer()` identity check.
+#[no_mangle]
+pub extern "C" fn js_buffer_is_node_buffer(ptr: i64) -> i32 {
+    buffer_addr_from_raw(ptr).is_some_and(is_node_buffer) as i32
+}
+
+#[cfg(test)]
+mod buffer_brand_tests {
+    use super::*;
+
+    #[test]
+    fn node_buffer_brand_excludes_constructor_uint8arrays() {
+        let buffer = buffer_alloc(4);
+        let uint8array = js_uint8array_alloc(4);
+
+        assert_eq!(js_buffer_is_buffer(buffer as i64), 1);
+        assert_eq!(js_buffer_is_node_buffer(buffer as i64), 1);
+        assert_eq!(js_buffer_is_buffer(uint8array as i64), 1);
+        assert_eq!(js_buffer_is_node_buffer(uint8array as i64), 0);
     }
 }
 

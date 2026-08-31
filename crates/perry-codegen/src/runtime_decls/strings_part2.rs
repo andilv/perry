@@ -236,12 +236,12 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     module.declare_function(
         "js_register_class_computed_method",
         VOID,
-        &[I64, DOUBLE, I64, I64, I64, I64],
+        &[I64, DOUBLE, I64, I64, I64, I64, I64],
     );
     module.declare_function(
         "js_register_class_computed_accessor",
         VOID,
-        &[I64, DOUBLE, I64, I64, I64],
+        &[I64, DOUBLE, I64, I64, I64, I64],
     );
     // v0.5.747: register a string-named static field on a class so reads
     // via the runtime dynamic-dispatch path (when the class ref is in an
@@ -500,11 +500,11 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
         DOUBLE,
         &[I64, I64, I64, I64, DOUBLE, DOUBLE],
     );
-    module.declare_function("js_crypto_scrypt_bytes", I64, &[I64, I64, DOUBLE, I64]);
+    module.declare_function("js_crypto_scrypt_bytes", I64, &[I64, I64, DOUBLE, DOUBLE]);
     module.declare_function(
         "js_crypto_scrypt_async",
         DOUBLE,
-        &[I64, I64, DOUBLE, DOUBLE],
+        &[I64, I64, DOUBLE, DOUBLE, DOUBLE],
     );
     module.declare_function("js_crypto_sign_rsa_sha256", I64, &[I64, I64, DOUBLE]);
     module.declare_function("js_crypto_sign_async", DOUBLE, &[I64, I64, DOUBLE, DOUBLE]);

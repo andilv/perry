@@ -553,6 +553,7 @@ pub unsafe extern "C" fn js_register_class_computed_method(
     param_count: i64,
     is_static: i64,
     has_rest: i64,
+    definition_order: i64,
 ) {
     if class_id == 0 || func_ptr == 0 {
         return;
@@ -565,6 +566,12 @@ pub unsafe extern "C" fn js_register_class_computed_method(
             return;
         }
         crate::symbol::note_symbol_key_installed(sym_key);
+        super::registration::record_class_symbol_member_order(
+            class_id,
+            sym_key,
+            is_static != 0,
+            definition_order as u32,
+        );
         CLASS_SYMBOL_METHODS.with(|table| {
             let mut guard = table.write().unwrap();
             if guard.is_none() {
@@ -606,6 +613,10 @@ pub unsafe extern "C" fn js_register_class_computed_method(
                 } else {
                     None
                 }
+            })
+            .or_else(|| {
+                (sym_key == crate::symbol::inspect_custom_symbol_ptr())
+                    .then_some("__perry_inspect_custom__")
             });
             if let Some(method_name) = alias {
                 let mut registry = CLASS_VTABLE_REGISTRY.write().unwrap();
@@ -639,6 +650,12 @@ pub unsafe extern "C" fn js_register_class_computed_method(
         Some(name) => name,
         None => return,
     };
+    super::registration::record_class_string_member_order(
+        class_id,
+        name.clone(),
+        is_static != 0,
+        definition_order as u32,
+    );
     if is_static != 0 && name == "prototype" {
         throw_object_type_error(b"Classes may not have a static property named 'prototype'");
     }
@@ -694,6 +711,7 @@ pub unsafe extern "C" fn js_register_class_computed_accessor(
     getter_ptr: i64,
     setter_ptr: i64,
     is_static: i64,
+    definition_order: i64,
 ) {
     if class_id == 0 || (getter_ptr == 0 && setter_ptr == 0) {
         return;
@@ -706,6 +724,12 @@ pub unsafe extern "C" fn js_register_class_computed_accessor(
             return;
         }
         crate::symbol::note_symbol_key_installed(sym_key);
+        super::registration::record_class_symbol_member_order(
+            class_id,
+            sym_key,
+            is_static != 0,
+            definition_order as u32,
+        );
         CLASS_SYMBOL_ACCESSORS.with(|table| {
             let mut guard = table.write().unwrap();
             if guard.is_none() {
@@ -727,6 +751,12 @@ pub unsafe extern "C" fn js_register_class_computed_accessor(
         return;
     }
     if let Some(name) = property_key_string(property_key) {
+        super::registration::record_class_string_member_order(
+            class_id,
+            name.clone(),
+            is_static != 0,
+            definition_order as u32,
+        );
         if is_static != 0 && name == "prototype" {
             throw_object_type_error(b"Classes may not have a static property named 'prototype'");
         }
@@ -917,10 +947,18 @@ pub(crate) fn class_own_symbol_member_keys(class_id: u32, is_static: bool) -> Ve
     });
     keys.sort_by_key(|sym_key| unsafe {
         let ptr = *sym_key as *const crate::symbol::SymbolHeader;
-        if ptr.is_null() {
-            u64::MAX
+        let symbol_id = if ptr.is_null() { u64::MAX } else { (*ptr).id };
+        let definition_order = CLASS_SYMBOL_MEMBER_ORDERS.with(|orders| {
+            orders.read().ok().and_then(|guard| {
+                guard
+                    .as_ref()
+                    .and_then(|map| map.get(&(class_id, symbol_id, is_static)).copied())
+            })
+        });
+        if let Some(order) = definition_order {
+            (0u8, order, symbol_id)
         } else {
-            (*ptr).id
+            (1u8, u32::MAX, symbol_id)
         }
     });
     keys
@@ -1583,6 +1621,39 @@ pub unsafe extern "C" fn js_class_static_method_call(
     {
         return result;
     }
+    // `Object.setPrototypeOf(Ctor, obj)` put a plain object on the
+    // CONSTRUCTOR's prototype chain, so `Ctor.method(...)` resolves through it
+    // (Effect's `Schema.Opaque`). Walk the registered parent chain the same way
+    // the static FIELD lookup above does, reading each level's recorded
+    // constructor prototype, and invoke the first callable found with `this`
+    // bound to the original receiver.
+    {
+        let mut cid = class_id;
+        let mut depth = 0u32;
+        while cid != 0 && depth < 32 {
+            let static_proto = super::class_static_prototype(cid);
+            if !static_proto.is_null() {
+                let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+                let member = super::super::field_get_set::js_object_get_field_by_name(
+                    static_proto as *const ObjectHeader,
+                    key,
+                );
+                let member = f64::from_bits(member.bits());
+                let mv = crate::value::JSValue::from_bits(member.to_bits());
+                if !mv.is_undefined() && !mv.is_null() {
+                    let prev_this = crate::object::js_implicit_this_set(receiver);
+                    let result = crate::closure::js_native_call_value(member, args_ptr, args_len);
+                    crate::object::js_implicit_this_set(prev_this);
+                    return result;
+                }
+            }
+            match get_parent_class_id(cid) {
+                Some(parent) if parent != 0 && parent != cid => cid = parent,
+                _ => break,
+            }
+            depth += 1;
+        }
+    }
     // `class X extends Promise` — inherited builtin static (`X.all(...)`,
     // `X.resolve(...)`, …). Dispatch the spec static with `this` = the subclass
     // receiver so `NewPromiseCapability(X)` constructs the subclass. Resolves the
@@ -1743,6 +1814,44 @@ pub fn is_registered_class_prototype_object(ptr: usize) -> bool {
     if crate::value::addr_class::is_handle_band(ptr) {
         return false;
     }
+    // An address no registration ever admitted cannot be in the map, so reject
+    // it here — inline, and in particular before the `map.values().any(…)`
+    // linear scan below, which is what this probe actually costs (#9225).
+    // 99.05% of the calls on `claude-code --help` end here.
+    if !crate::object::class_registry::CLASS_PROTOTYPE_ADDR_FILTER.may_contain(ptr) {
+        // Machine-check the writer set rather than enumerate it. The filter is
+        // sound only if EVERY route that stores an address into
+        // `CLASS_PROTOTYPE_OBJECTS` admits it first — the insert, both GC root
+        // scanners, the per-slot GC step and the test seeds — and a route added
+        // without admitting would not crash: it would silently report a live
+        // prototype as "not a prototype". In a debug build every rejection is
+        // therefore re-derived from the map itself, which turns that into a
+        // panic in the first test that exercises the route. Compiled out
+        // entirely in release.
+        #[cfg(debug_assertions)]
+        {
+            // `try_read`, not `read`, for the reason the symbol twin gives:
+            // the rejection path never took this lock before, so a blocking
+            // audit could hang on a caller the audited code would not have.
+            let present = CLASS_PROTOTYPE_OBJECTS.with(|table| {
+                table.try_read().is_ok_and(|guard| {
+                    guard
+                        .as_ref()
+                        .is_some_and(|map| map.values().any(|&p| p == ptr))
+                })
+            });
+            assert!(
+                !present,
+                "CLASS_PROTOTYPE_ADDR_FILTER rejected {ptr:#x}, but it IS a \
+                 registered class prototype. Some route stored it into \
+                 CLASS_PROTOTYPE_OBJECTS without calling \
+                 `note_class_prototype_object_registered` first."
+            );
+        }
+        return false;
+    }
+    #[cfg(test)]
+    TEST_CLASS_PROTOTYPE_SCANS.with(|c| c.set(c.get().wrapping_add(1)));
     CLASS_PROTOTYPE_OBJECTS.with(|table| {
         if let Ok(guard) = table.read() {
             if let Some(map) = guard.as_ref() {
@@ -1751,6 +1860,20 @@ pub fn is_registered_class_prototype_object(ptr: usize) -> bool {
         }
         false
     })
+}
+
+#[cfg(test)]
+thread_local! {
+/// Test-only count of `is_registered_class_prototype_object` calls that got
+/// past `CLASS_PROTOTYPE_ADDR_FILTER` and reached the linear scan. The filter
+/// is a fast path, and a fast path nobody can prove ran is not a fast path
+/// (same contract as `buffer::header::TEST_BUFFER_REGISTRY_PROBES`).
+    static TEST_CLASS_PROTOTYPE_SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn test_class_prototype_scan_count() -> u64 {
+    TEST_CLASS_PROTOTYPE_SCANS.with(|c| c.get())
 }
 
 /// Walk the prototype chain of `class_id` and return the id of the class that
@@ -1783,177 +1906,5 @@ pub fn method_owner_class_id(class_id: u32, name: &str) -> Option<u32> {
 mod unstamped_tests;
 
 #[cfg(test)]
-mod shape_authority_tests_8067 {
-    fn key<'scope>(
-        scope: &'scope crate::gc::RuntimeHandleScope,
-        name: &str,
-    ) -> crate::gc::RuntimeHandle<'scope> {
-        scope.root_string_ptr(crate::string::js_string_from_bytes(
-            name.as_ptr(),
-            name.len() as u32,
-        ))
-    }
-
-    #[test]
-    fn mark_class_rejects_non_heap_addresses() {
-        // Representative ids from the native-handle and proxy bands. The
-        // extern entry point must validate before reading a preceding header.
-        super::js_object_mark_class(0x40000);
-        super::js_object_mark_class(1);
-    }
-
-    #[test]
-    fn class_kind_survives_static_field_installation_and_deletion() {
-        let _lock = crate::gc::global_side_table_test_lock();
-        unsafe {
-            const CID: u32 = 0x8067;
-            let scope = crate::gc::RuntimeHandleScope::new();
-            let obj_handle = scope.root_raw_mut_ptr(crate::object::js_object_alloc(CID, 8));
-            let before = obj_handle.with_mut_ptr::<crate::ObjectHeader, _>(|obj| {
-                let before = crate::object::shapes::object_shape_id(obj);
-                assert!(crate::object::object_is_regular(obj));
-                before
-            });
-
-            let ((), obj) = obj_handle.across_mut::<crate::ObjectHeader, _>(|| {
-                obj_handle.with_mut_ptr::<crate::ObjectHeader, _>(|obj| {
-                    super::js_object_mark_class(obj as i64)
-                })
-            });
-            let after = crate::object::shapes::object_shape_id(obj);
-            assert_ne!(before, after, "becoming a class object is semantic");
-            assert_eq!(
-                crate::object::shapes::object_shape_descriptor(obj)
-                    .expect("class descriptor")
-                    .object_kind,
-                crate::object::shapes::ShapeObjectKind::Class
-            );
-
-            // #8113 removed the `object_type` compatibility mirror this used to
-            // sabotage. Classification is driven by the ShapeId descriptor
-            // transition above and by nothing else, so assert that directly.
-            assert!(super::is_class_object_ptr(obj.cast()));
-            assert!(!crate::object::object_is_regular(obj));
-
-            // Numeric layout installation historically set/cleared bits in
-            // GcHeader::_reserved, where the old class marker collided with
-            // GC_LAYOUT_ALL_POINTERS. Shape kind must be unaffected.
-            let numeric_key = key(&scope, "numericStatic");
-            let ((), obj) = obj_handle.across_mut::<crate::ObjectHeader, _>(|| {
-                obj_handle.with_mut_ptr::<crate::ObjectHeader, _>(|obj| {
-                    numeric_key.with_const_ptr::<crate::StringHeader, _>(|key| {
-                        crate::object::js_object_set_field_by_name(obj, key, 42.0)
-                    })
-                })
-            });
-            assert!(
-                super::is_class_object_ptr(obj.cast()),
-                "numeric static write changed class descriptor: {:?}",
-                crate::object::shapes::object_shape_descriptor(obj)
-            );
-            assert!(!crate::object::object_is_regular(obj));
-
-            // Repeat with a pointer-bearing static value, which drives the
-            // opposite GC layout state and used to erase the aliased bit.
-            let pointer_key = key(&scope, "pointerStatic");
-            let payload = key(&scope, "rootedStaticValue");
-            let ((), obj) = obj_handle.across_mut::<crate::ObjectHeader, _>(|| {
-                obj_handle.with_mut_ptr::<crate::ObjectHeader, _>(|obj| {
-                    pointer_key.with_const_ptr::<crate::StringHeader, _>(|key| {
-                        payload.with_mut_ptr::<crate::StringHeader, _>(|payload| {
-                            let value =
-                                f64::from_bits(crate::value::JSValue::string_ptr(payload).bits());
-                            crate::object::js_object_set_field_by_name(obj, key, value)
-                        })
-                    })
-                })
-            });
-            assert!(super::is_class_object_ptr(obj.cast()));
-            assert!(!crate::object::object_is_regular(obj));
-            assert_eq!(
-                crate::object::shapes::object_shape_descriptor(obj)
-                    .expect("post-write class descriptor")
-                    .object_kind,
-                crate::object::shapes::ShapeObjectKind::Class,
-                "class kind must never share storage with GC layout flags"
-            );
-
-            // The pointer-bearing write above leaves a typed/side-mask layout.
-            // Growing the keys array from that state invalidates typed
-            // feedback. The invalidation asks for the receiver's shape, so a
-            // keys transition must keep the old class stamp visible until the
-            // invalidation finishes and must prefer its saved predecessor over
-            // any defensive self-heal in the temporary cleared-stamp window.
-            let after_pointer_key = key(&scope, "afterPointerStatic");
-            let ((), obj) = obj_handle.across_mut::<crate::ObjectHeader, _>(|| {
-                obj_handle.with_mut_ptr::<crate::ObjectHeader, _>(|obj| {
-                    after_pointer_key.with_const_ptr::<crate::StringHeader, _>(|key| {
-                        crate::object::js_object_set_field_by_name(obj, key, 7.0)
-                    })
-                })
-            });
-            assert!(
-                super::is_class_object_ptr(obj.cast()),
-                "typed-layout invalidation erased class descriptor lineage: {:?}",
-                crate::object::shapes::object_shape_descriptor(obj)
-            );
-            assert_eq!(
-                crate::object::shapes::object_shape_descriptor(obj)
-                    .expect("post-invalidation class descriptor")
-                    .object_kind,
-                crate::object::shapes::ShapeObjectKind::Class
-            );
-
-            // Deletion installs a cloned keys array, which clears the current
-            // stamp. The replacement descriptor must inherit class kind from
-            // the predecessor captured before that clear.
-            let (deleted, obj) = obj_handle.across_mut::<crate::ObjectHeader, _>(|| {
-                obj_handle.with_mut_ptr::<crate::ObjectHeader, _>(|obj| {
-                    numeric_key.with_const_ptr::<crate::StringHeader, _>(|key| {
-                        crate::object::js_object_delete_field(obj, key)
-                    })
-                })
-            });
-            assert_eq!(deleted, 1);
-            assert!(
-                super::is_class_object_ptr(obj.cast()),
-                "deleting a static field erased class descriptor lineage: {:?}",
-                crate::object::shapes::object_shape_descriptor(obj)
-            );
-            assert_eq!(
-                crate::object::shapes::object_shape_descriptor(obj)
-                    .expect("post-delete class descriptor")
-                    .object_kind,
-                crate::object::shapes::ShapeObjectKind::Class
-            );
-
-            let class_value = crate::value::js_nanbox_pointer(obj as i64);
-            let class_value_handle = scope.root_nanbox_f64(class_value);
-            let typeof_ptr = crate::builtins::js_value_typeof(class_value);
-            assert_eq!(crate::regex::string_as_str(typeof_ptr), "function");
-
-            let instance = crate::object::js_new_function_construct(
-                class_value_handle.get_nanbox_f64(),
-                std::ptr::null(),
-                0,
-            );
-            let instance_handle = scope.root_nanbox_f64(instance);
-            let instance_value = crate::value::JSValue::from_bits(instance.to_bits());
-            assert!(
-                instance_value.is_pointer(),
-                "construction must return an object"
-            );
-            let instance_ptr = instance_value.as_pointer::<crate::ObjectHeader>();
-            assert_eq!((*instance_ptr).class_id, CID);
-            assert_eq!(
-                crate::object::js_instanceof_dynamic(
-                    instance_handle.get_nanbox_f64(),
-                    class_value_handle.get_nanbox_f64(),
-                )
-                .to_bits(),
-                crate::value::TAG_TRUE,
-                "instanceof must still recognize the class after static writes"
-            );
-        }
-    }
-}
+#[path = "parent_static/shape_authority_tests_8067.rs"]
+mod shape_authority_tests_8067;

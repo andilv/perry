@@ -20,6 +20,9 @@ enum ClassSideTableRootSlot {
     DeclPrototypeObject {
         class_id: u32,
     },
+    StaticPrototype {
+        class_id: u32,
+    },
     ParentClosure {
         class_id: u32,
     },
@@ -111,12 +114,24 @@ pub fn scan_class_side_table_roots_mut(visitor: &mut crate::gc::RuntimeRootVisit
             if let Some(map) = guard.as_mut() {
                 for proto_addr in map.values_mut() {
                     visitor.visit_usize_slot(proto_addr);
+                    // See the twin in `class_gc_roots::scan_class_inheritance_roots_mut`.
+                    super::note_class_prototype_object_registered(*proto_addr);
                 }
             }
         }
     });
 
     CLASS_DECL_PROTOTYPE_OBJECTS.with(|table| {
+        if let Ok(mut guard) = table.write() {
+            if let Some(map) = guard.as_mut() {
+                map.visit_root_slots(|proto_addr| {
+                    visitor.visit_usize_slot(proto_addr);
+                });
+            }
+        }
+    });
+
+    CLASS_STATIC_PROTOTYPES.with(|table| {
         if let Ok(mut guard) = table.write() {
             if let Some(map) = guard.as_mut() {
                 for proto_addr in map.values_mut() {
@@ -264,8 +279,18 @@ fn class_side_table_root_snapshot() -> Vec<ClassSideTableRootSlot> {
     CLASS_DECL_PROTOTYPE_OBJECTS.with(|table| {
         if let Ok(guard) = table.read() {
             if let Some(map) = guard.as_ref() {
-                for &class_id in map.keys() {
+                for class_id in map.class_ids() {
                     slots.push(ClassSideTableRootSlot::DeclPrototypeObject { class_id });
+                }
+            }
+        }
+    });
+
+    CLASS_STATIC_PROTOTYPES.with(|table| {
+        if let Ok(guard) = table.read() {
+            if let Some(map) = guard.as_ref() {
+                for &class_id in map.keys() {
+                    slots.push(ClassSideTableRootSlot::StaticPrototype { class_id });
                 }
             }
         }
@@ -390,12 +415,26 @@ fn scan_class_side_table_root_slot(
                 if let Ok(mut guard) = table.write() {
                     if let Some(proto_addr) = guard.as_mut().and_then(|map| map.get_mut(class_id)) {
                         visitor.visit_usize_slot(proto_addr);
+                        // The per-slot GC step moves one prototype at a time;
+                        // it carries the same obligation as the bulk scanner.
+                        super::note_class_prototype_object_registered(*proto_addr);
                     }
                 }
             });
         }
         ClassSideTableRootSlot::DeclPrototypeObject { class_id } => {
             CLASS_DECL_PROTOTYPE_OBJECTS.with(|table| {
+                if let Ok(mut guard) = table.write() {
+                    if let Some(map) = guard.as_mut() {
+                        map.visit_root_slot_for(*class_id, |proto_addr| {
+                            visitor.visit_usize_slot(proto_addr);
+                        });
+                    }
+                }
+            });
+        }
+        ClassSideTableRootSlot::StaticPrototype { class_id } => {
+            CLASS_STATIC_PROTOTYPES.with(|table| {
                 if let Ok(mut guard) = table.write() {
                     if let Some(proto_addr) = guard.as_mut().and_then(|map| map.get_mut(class_id)) {
                         visitor.visit_usize_slot(proto_addr);
@@ -614,6 +653,7 @@ pub(crate) fn test_clear_class_side_table_roots() {
     // and `use crate::object::*`; name the canonical definition explicitly.
     use super::state::CLASS_DELETED_KEYS;
     CLASS_DYNAMIC_PROPS.with(|m| m.borrow_mut().clear());
+    crate::object::CLASS_DYNAMIC_PROP_ORDER.with(|order| order.borrow_mut().clear());
     CLASS_DELETED_KEYS.with(|m| m.borrow_mut().clear());
     CLASS_PROTOTYPE_METHOD_VALUES.with(|cache| cache.borrow_mut().clear());
     CLASS_PROTOTYPE_METHODS.with(|table| {
@@ -641,6 +681,11 @@ pub(crate) fn test_clear_class_side_table_roots() {
             *guard = None;
         }
     });
+    CLASS_STATIC_PROTOTYPES.with(|table| {
+        if let Ok(mut guard) = table.write() {
+            *guard = None;
+        }
+    });
     CLASS_PARENT_CLOSURES.with(|table| {
         if let Ok(mut guard) = table.write() {
             *guard = None;
@@ -652,6 +697,11 @@ pub(crate) fn test_clear_class_side_table_roots() {
         }
     });
     CLASS_SYMBOL_ACCESSORS.with(|table| {
+        if let Ok(mut guard) = table.write() {
+            *guard = None;
+        }
+    });
+    CLASS_SYMBOL_MEMBER_ORDERS.with(|table| {
         if let Ok(mut guard) = table.write() {
             *guard = None;
         }
@@ -749,7 +799,7 @@ pub(crate) fn test_class_decl_prototype_object_root_addr(class_id: u32) -> usize
         table
             .read()
             .ok()
-            .and_then(|guard| guard.as_ref().and_then(|map| map.get(&class_id).copied()))
+            .and_then(|guard| guard.as_ref().and_then(|map| map.get(class_id)))
             .unwrap_or(0)
     })
 }

@@ -480,10 +480,256 @@ fn lower_numeric_range_add_loop(
             &[(DOUBLE, &arr_box), (DOUBLE, &start_box), (DOUBLE, &delta)],
         ),
     };
+    // Result contract (see `array_numeric_range_add_impl`):
+    //   ret >= 0          -- whole window done; ret is the counter on exit.
+    //   ret == -1         -- receiver-level decline; nothing mutated.
+    //   ret <= -2         -- slots [start, k) mutated, k = -ret - 2; the
+    //                        ordinary loop RESUMES at k (the element at k is
+    //                        not a plain number, so its `+` may concatenate or
+    //                        dispatch valueOf -- generic code handles it).
     let succeeded = ctx.block().icmp_sge(I64, &result, "0");
     let success_idx = ctx.new_block("numeric.range_add.success");
     let fallback_idx = ctx.new_block("numeric.range_add.fallback");
     let merge_idx = ctx.new_block("numeric.range_add.merge");
+    let success_label = ctx.block_label(success_idx);
+    let fallback_label = ctx.block_label(fallback_idx);
+    let merge_label = ctx.block_label(merge_idx);
+    ctx.block()
+        .cond_br(&succeeded, &success_label, &fallback_label);
+
+    ctx.current_block = success_idx;
+    let final_counter = ctx.block().sitofp(I64, &result, DOUBLE);
+    if let Some(slot) = ctx.locals.get(&matched.counter_id).cloned() {
+        ctx.block().store(DOUBLE, &final_counter, &slot);
+    }
+    if let Some(slot) = ctx.i32_counter_slots.get(&matched.counter_id).cloned() {
+        let final_i32 = ctx.block().trunc(I64, &result, I32);
+        ctx.block().store(I32, &final_i32, &slot);
+    }
+    ctx.block().br(&merge_label);
+
+    ctx.current_block = fallback_idx;
+    {
+        // ret <= -2: seed the counter with the resume index before entering
+        // the ordinary loop. ret == -1 keeps the counter untouched (it still
+        // holds the loop's start value).
+        let is_partial = ctx.block().icmp_slt(I64, &result, "-1");
+        let neg = ctx.block().sub(I64, "-2", &result);
+        let cur_i32 = if let Some(slot) = ctx.i32_counter_slots.get(&matched.counter_id).cloned() {
+            let cur = ctx.block().load(I32, &slot);
+            let resume = ctx.block().trunc(I64, &neg, I32);
+            let seeded = ctx
+                .block()
+                .select(crate::types::I1, &is_partial, I32, &resume, &cur);
+            ctx.block().store(I32, &seeded, &slot);
+            Some(seeded)
+        } else {
+            None
+        };
+        if let Some(slot) = ctx.locals.get(&matched.counter_id).cloned() {
+            let cur = ctx.block().load(DOUBLE, &slot);
+            let resume_d = if let Some(seeded) = &cur_i32 {
+                ctx.block().sitofp(I32, seeded, DOUBLE)
+            } else {
+                let d = ctx.block().sitofp(I64, &neg, DOUBLE);
+                let cur2 = cur.clone();
+                ctx.block()
+                    .select(crate::types::I1, &is_partial, DOUBLE, &d, &cur2)
+            };
+            ctx.block().store(DOUBLE, &resume_d, &slot);
+        }
+    }
+    lower_for_after_init(
+        ctx,
+        init,
+        condition,
+        update,
+        body,
+        "for.numeric_range_add_fallback",
+    )?;
+    if !ctx.block().is_terminated() {
+        ctx.block().br(&merge_label);
+    }
+    ctx.current_block = merge_idx;
+    Ok(true)
+}
+
+struct StridedTaggedFill {
+    counter_id: u32,
+    array_id: u32,
+    bound: perry_hir::Expr,
+    step: perry_hir::Expr,
+    /// NaN-box bits of the stored constant, as an i64 literal string.
+    value_bits: String,
+}
+
+/// Match `for (...; j < B; j = j + S) arr[j] = C;` where `C` is a boolean,
+/// `null`, or `undefined` literal, `B`/`S` are integer literals or
+/// loop-invariant plain locals, and nothing in the body writes any
+/// participant. The kernel (`js_array_fill_range_strided_tagged`) validates
+/// the actual receiver at run time — plain dense boxed array, no integrity
+/// flags, no raw-f64 layout, no active incremental mark — and declines to
+/// the ordinary loop otherwise with nothing stored.
+///
+/// Numbers are deliberately not matched: a numeric constant fill targets a
+/// raw-f64-layout array in practice, and the kernel declines those (tag bits
+/// stored into unboxed-double storage would be read back as doubles), so the
+/// call would be a per-loop toll with no fast path behind it.
+fn match_strided_tagged_fill_loop(
+    ctx: &FnCtx<'_>,
+    condition: Option<&perry_hir::Expr>,
+    update: Option<&perry_hir::Expr>,
+    body: &[Stmt],
+) -> Option<StridedTaggedFill> {
+    use perry_hir::{BinaryOp, CompareOp, Expr};
+    if !ctx.pending_labels.is_empty() {
+        return None;
+    }
+
+    let Some(Expr::Compare {
+        op: CompareOp::Lt,
+        left,
+        right,
+    }) = condition
+    else {
+        return None;
+    };
+    let Expr::LocalGet(counter_id) = left.as_ref() else {
+        return None;
+    };
+    let counter_id = *counter_id;
+    if ctx.boxed_vars.contains(&counter_id) || ctx.closure_captures.contains_key(&counter_id) {
+        return None;
+    }
+
+    // An operand the kernel can take as an f64 argument: an i32-range integer
+    // literal, or a plain loop-invariant local the body never writes.
+    let invariant_operand = |e: &Expr| -> Option<Expr> {
+        match e {
+            Expr::Integer(v) if i32::try_from(*v).is_ok() => Some(e.clone()),
+            Expr::LocalGet(id)
+                if *id != counter_id
+                    && !ctx.boxed_vars.contains(id)
+                    && !ctx.closure_captures.contains_key(id)
+                    && !stmts_mutate_local(body, *id) =>
+            {
+                Some(e.clone())
+            }
+            _ => None,
+        }
+    };
+    let bound = invariant_operand(right)?;
+
+    // Update: `j = j + S` (either operand order).
+    let step = match update? {
+        Expr::LocalSet(id, value) if *id == counter_id => match value.as_ref() {
+            Expr::Binary {
+                op: BinaryOp::Add,
+                left,
+                right,
+            } => match (left.as_ref(), right.as_ref()) {
+                (Expr::LocalGet(l), other) if *l == counter_id => invariant_operand(other)?,
+                (other, Expr::LocalGet(r)) if *r == counter_id => invariant_operand(other)?,
+                _ => return None,
+            },
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if let Expr::Integer(v) = &step {
+        if *v <= 0 {
+            return None;
+        }
+    }
+
+    // Body: exactly one store of a non-pointer constant at the counter.
+    let [Stmt::Expr(store)] = body else {
+        return None;
+    };
+    let (object, index, value) = match store {
+        Expr::IndexSet {
+            object,
+            index,
+            value,
+        } => (object.as_ref(), index.as_ref(), value.as_ref()),
+        Expr::PutValueSet {
+            target,
+            key,
+            value,
+            receiver,
+            ..
+        } if matches!(
+            (target.as_ref(), receiver.as_ref()),
+            (Expr::LocalGet(a), Expr::LocalGet(b)) if a == b
+        ) =>
+        {
+            (target.as_ref(), key.as_ref(), value.as_ref())
+        }
+        _ => return None,
+    };
+    let Expr::LocalGet(array_id) = object else {
+        return None;
+    };
+    let array_id = *array_id;
+    if array_id == counter_id
+        || ctx.boxed_vars.contains(&array_id)
+        || ctx.closure_captures.contains_key(&array_id)
+        || stmts_mutate_local(body, array_id)
+    {
+        return None;
+    }
+    if !matches!(index, Expr::LocalGet(id) if *id == counter_id) {
+        return None;
+    }
+    let value_bits = match value {
+        Expr::Bool(true) => crate::nanbox::TAG_TRUE_I64.to_string(),
+        Expr::Bool(false) => crate::nanbox::TAG_FALSE_I64.to_string(),
+        Expr::Null => crate::nanbox::TAG_NULL_I64.to_string(),
+        Expr::Undefined => crate::nanbox::TAG_UNDEFINED_I64.to_string(),
+        _ => return None,
+    };
+
+    Some(StridedTaggedFill {
+        counter_id,
+        array_id,
+        bound,
+        step,
+        value_bits,
+    })
+}
+
+/// Mirror of `lower_numeric_range_add_loop`'s two-outcome contract, without
+/// the partial arm: a fill stores one constant everywhere, so the kernel
+/// either completes the window (`>= 0`, the counter's exit value) or declines
+/// with nothing stored (`-1`) and the ordinary loop runs from the counter's
+/// current (start) value.
+fn lower_strided_tagged_fill_loop(
+    ctx: &mut FnCtx<'_>,
+    matched: StridedTaggedFill,
+    init: Option<&Stmt>,
+    condition: Option<&perry_hir::Expr>,
+    update: Option<&perry_hir::Expr>,
+    body: &[Stmt],
+) -> Result<bool> {
+    let arr_box = lower_expr(ctx, &perry_hir::Expr::LocalGet(matched.array_id))?;
+    let start_box = lower_expr(ctx, &perry_hir::Expr::LocalGet(matched.counter_id))?;
+    let end_box = lower_expr(ctx, &matched.bound)?;
+    let step_box = lower_expr(ctx, &matched.step)?;
+    let result = ctx.block().call(
+        I64,
+        "js_array_fill_range_strided_tagged",
+        &[
+            (DOUBLE, &arr_box),
+            (DOUBLE, &start_box),
+            (DOUBLE, &end_box),
+            (DOUBLE, &step_box),
+            (I64, &matched.value_bits),
+        ],
+    );
+    let succeeded = ctx.block().icmp_sge(I64, &result, "0");
+    let success_idx = ctx.new_block("strided_fill.success");
+    let fallback_idx = ctx.new_block("strided_fill.fallback");
+    let merge_idx = ctx.new_block("strided_fill.merge");
     let success_label = ctx.block_label(success_idx);
     let fallback_label = ctx.block_label(fallback_idx);
     let merge_label = ctx.block_label(merge_idx);
@@ -508,7 +754,7 @@ fn lower_numeric_range_add_loop(
         condition,
         update,
         body,
-        "for.numeric_range_add_fallback",
+        "for.strided_fill_fallback",
     )?;
     if !ctx.block().is_terminated() {
         ctx.block().br(&merge_label);
@@ -535,17 +781,17 @@ fn emit_range_loop_accumulator_admission(
     slow_pre_label: &str,
     block_prefix: &str,
 ) -> PackedAccumulatorScope {
-    let mut counter_arrays = matched
-        .arrays
-        .iter()
-        .filter(|access| access.counter.is_some())
-        .map(|access| access.array_id);
-    let Some(array_id) = counter_arrays.next() else {
-        return PackedAccumulatorScope::empty();
+    // One array may carry the accumulator proof: with several, no single
+    // admitted leaf spans them all. Counter-bearing arrays keep priority;
+    // a masked-only array (dense mode) now qualifies too, because the dense
+    // entry guard validates its whole window hole-free, making every
+    // in-window read a Number the accumulator walk may lean on.
+    let mut single = matched.arrays.iter().filter(|a| a.counter.is_some());
+    let (array_id, masked_reads_validated) = match (single.next(), single.next()) {
+        (Some(access), None) => (access.array_id, access.stat.is_some()),
+        (None, _) if matched.arrays.len() == 1 => (matched.arrays[0].array_id, true),
+        _ => return PackedAccumulatorScope::empty(),
     };
-    if counter_arrays.next().is_some() {
-        return PackedAccumulatorScope::empty();
-    }
     emit_packed_numeric_accumulator_admission(
         ctx,
         body,
@@ -553,6 +799,11 @@ fn emit_range_loop_accumulator_admission(
         matched.counter_id,
         slow_pre_label,
         block_prefix,
+        // The range tier publishes `window_validated: true` and its loads are
+        // hole-checked, so an `a[i +/- c]` read is lowered inline and yields a
+        // Number. See `accumulator_rhs_is_numeric`.
+        true,
+        masked_reads_validated,
     )
 }
 
@@ -796,6 +1047,68 @@ impl PackedAccumulatorScope {
     }
 }
 
+/// Write the fast clone's promoted accumulators back to their real slots
+/// WITHOUT ending the redirect scope.
+///
+/// `PackedAccumulatorScope::finish` covers the fall-through exit and the
+/// side-exit trampolines cover a mid-iteration deopt, but both are blocks the
+/// clone BRANCHES to, and `break`/`continue` reach them the same way. An
+/// unwind edge reaches neither: under invoke-EH `js_throw` leaves for the
+/// landing pad from inside the call itself, so a `catch` observes whatever is
+/// in the real slot at that moment. Emitting the stores at the throw site is
+/// the only point that works, which is what #9185 was missing.
+///
+/// Unlike `finish` this does NOT unregister the redirects: lowering continues
+/// inside the clone afterwards, and later statements must keep reading the
+/// promoted values.
+pub(crate) fn flush_packed_accumulator_locals(ctx: &mut FnCtx<'_>) {
+    if ctx.numeric_accumulator_f64_slots.is_empty()
+        && ctx.deferred_integer_update_accumulators.is_empty()
+    {
+        return;
+    }
+    if ctx.block().is_terminated() {
+        return;
+    }
+
+    // The side tables are hash-keyed, so collect and sort before emitting —
+    // IR order must not depend on hash iteration order.
+    let mut unboxed: Vec<(u32, String, String)> = ctx
+        .numeric_accumulator_f64_slots
+        .iter()
+        .filter_map(|(id, alloca)| {
+            ctx.locals
+                .get(id)
+                .map(|real_slot| (*id, alloca.clone(), real_slot.clone()))
+        })
+        .collect();
+    unboxed.sort_by_key(|(id, _, _)| *id);
+    for (_, alloca, real_slot) in &unboxed {
+        // Same argument as `finish`: a genuine double's bits are its nanbox,
+        // numbers carry no heap edge so no barrier, and leaving the shadow
+        // state conservative only ever costs an extra root scan.
+        let value = ctx.block().load(DOUBLE, alloca);
+        ctx.block().store(DOUBLE, &value, real_slot);
+    }
+
+    let mut deferred: Vec<(u32, String, String)> = ctx
+        .deferred_integer_update_accumulators
+        .iter()
+        .filter_map(|id| {
+            let i32_slot = ctx.i32_counter_slots.get(id)?;
+            let dbl_slot = ctx.locals.get(id)?;
+            Some((*id, i32_slot.clone(), dbl_slot.clone()))
+        })
+        .collect();
+    deferred.sort_by_key(|(id, _, _)| *id);
+    for (_, i32_slot, dbl_slot) in &deferred {
+        let blk = ctx.block();
+        let value = blk.load(I32, i32_slot);
+        let as_double = blk.sitofp(I32, &value, DOUBLE);
+        blk.store(DOUBLE, &as_double, dbl_slot);
+    }
+}
+
 fn emit_packed_numeric_accumulator_admission(
     ctx: &mut FnCtx<'_>,
     body: &[Stmt],
@@ -803,9 +1116,16 @@ fn emit_packed_numeric_accumulator_admission(
     counter_id: u32,
     slow_pre_label: &str,
     block_prefix: &str,
+    offset_reads_inlined: bool,
+    masked_reads_validated: bool,
 ) -> PackedAccumulatorScope {
     let accumulators = super::stable_packed_accumulator::collect_numeric_accumulators(
-        ctx, body, array_id, counter_id,
+        ctx,
+        body,
+        array_id,
+        counter_id,
+        offset_reads_inlined,
+        masked_reads_validated,
     );
     // Integer (`c++`) accumulators admit independently of the float set —
     // a pure count loop has no float accumulator at all.
@@ -986,6 +1306,14 @@ fn lower_packed_f64_versioned_for(
         matched.counter_id,
         &slow_pre_label,
         loop_label,
+        // This tier publishes `window_validated: false`, so
+        // `packed_f64_loop_fact_for_index` declines a non-zero offset and the
+        // read takes the generic path — which can produce `undefined`. #9259
+        // is the work that would make an offset read inline here.
+        false,
+        // No masked windows either: this tier's guard proves the receiver and
+        // the length bound, not a hole-free window.
+        false,
     );
     acc_scope.hoist_receivers(ctx, &[matched.array_id]);
     ctx.packed_f64_loop_facts.push(PackedF64LoopFact {
@@ -997,6 +1325,7 @@ fn lower_packed_f64_versioned_for(
         array_kind: matched.array_kind,
         allow_holes: false,
         window_validated: false,
+        affine_indices: false,
         numeric_accumulators: acc_scope.accumulators.clone(),
     });
     // The guard just proved a live, non-forwarded plain array, and the
@@ -1073,6 +1402,13 @@ pub(super) struct PackedF64RangeArrayAccess {
     /// (`arr[e & K]`, `arr[K1 + (e >>> k & K2)]`, … — see
     /// `collectors::static_index_window`). Dense mode only.
     pub(super) stat: Option<(i64, i64)>,
+    /// #9253: at least one access used an AFFINE index — an integer-producing
+    /// expression over the counter and loop-invariant integer locals, such as
+    /// `a[i * size + k]`. Such an index has no compile-time window, so the
+    /// entry guard proves only the receiver (shape / raw-f64 packedness /
+    /// integrity) and each read pays an inline `icmp ult idx, len` with a side
+    /// exit. Classic mode only: dense mode's loads carry no side exit.
+    pub(super) affine: bool,
     pub(super) written: bool,
 }
 
@@ -1108,6 +1444,22 @@ struct PackedF64RangeLoop {
 /// potential side exit (hole-checked loads / the store's numeric-RHS check),
 /// so a side exit into the slow loop re-executes the current iteration
 /// without duplicating effects.
+/// Diagnostic twin of [`packed_loop_reject`] for the #6011 range matcher.
+///
+/// Same reasoning: the admission decision is a chain of independent
+/// conditions, and when a loop unexpectedly stays on the generic path there is
+/// no way to tell WHICH one declined it by reading the code. #9204 gave the
+/// versioned matcher this treatment after three attempts on #9151 each guessed
+/// a different gate; the range matcher had no equivalent, so #9248 guessed too
+/// — and widened a predicate that was never the thing rejecting the loop.
+fn range_loop_reject(reason: &'static str) -> Option<PackedF64RangeLoop> {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if *ON.get_or_init(|| std::env::var("PERRY_PACKED_LOOP_TRACE").as_deref() == Ok("1")) {
+        eprintln!("[range-loop] rejected: {reason}");
+    }
+    None
+}
 fn match_packed_f64_range_loop(
     ctx: &FnCtx<'_>,
     init: Option<&Stmt>,
@@ -1117,7 +1469,7 @@ fn match_packed_f64_range_loop(
 ) -> Option<PackedF64RangeLoop> {
     use perry_hir::{CompareOp, Expr, UpdateOp};
     if !ctx.pending_labels.is_empty() {
-        return None;
+        return range_loop_reject("pending_labels");
     }
     let (counter_id, start) = match init? {
         Stmt::Let {
@@ -1128,21 +1480,21 @@ fn match_packed_f64_range_loop(
             let start = match init_expr {
                 Expr::Integer(n) => *n,
                 Expr::Number(n) if n.is_finite() && n.fract() == 0.0 => *n as i64,
-                _ => return None,
+                _ => return range_loop_reject("init_not_integer_literal"),
             };
             (*id, start)
         }
-        _ => return None,
+        _ => return range_loop_reject("init_not_a_let"),
     };
     if !(0..=i64::from(i32::MAX)).contains(&start) {
-        return None;
+        return range_loop_reject("start_out_of_i32_range");
     }
     let (op, left, right) = match condition? {
         Expr::Compare { op, left, right } => (*op, left.as_ref(), right.as_ref()),
-        _ => return None,
+        _ => return range_loop_reject("condition_not_compare"),
     };
     if !matches!(op, CompareOp::Lt) || !matches!(left, Expr::LocalGet(id) if *id == counter_id) {
-        return None;
+        return range_loop_reject("compare_not_lt_on_counter");
     }
     let bound = match right {
         // Cap constants at i32::MAX - 64 so `bound + max_offset` cannot
@@ -1159,7 +1511,7 @@ fn match_packed_f64_range_loop(
             // mutate the global mid-loop, and direct writes to `bound_id` in
             // cond/update/body are rejected by the invariance walker.
             if ctx.boxed_vars.contains(bound_id) {
-                return None;
+                return range_loop_reject("bound_local_boxed");
             }
             // Repsel Phase 1: canonical-i32 bounds read through `LocalGet`
             // (materialized from the i32 slot) — accessible storage.
@@ -1167,14 +1519,14 @@ fn match_packed_f64_range_loop(
                 && !ctx.local_slot_reps.contains_key(bound_id)
                 && !ctx.module_globals.contains_key(bound_id)
             {
-                return None;
+                return range_loop_reject("bound_local_not_addressable");
             }
             if !local_bound_is_loop_invariant(condition?, update, body, *bound_id) {
-                return None;
+                return range_loop_reject("bound_not_loop_invariant");
             }
             PackedF64RangeLoopBound::Local(*bound_id)
         }
-        _ => return None,
+        _ => return range_loop_reject("bound_shape_unsupported"),
     };
     if !matches!(
         update?,
@@ -1184,7 +1536,7 @@ fn match_packed_f64_range_loop(
             ..
         } if *id == counter_id
     ) {
-        return None;
+        return range_loop_reject("update_not_counter_increment");
     }
     // Repsel Phase 1: canonical-i32 counters qualify — they already own the
     // shared i32 slot the versioned copies read, and the `Update`/`LocalGet`
@@ -1195,7 +1547,7 @@ fn match_packed_f64_range_loop(
         || !loop_counter_bounds_are_safe(ctx, counter_id, update, body)
         || !loop_counter_entry_i32_range_is_safe(init, counter_id)
     {
-        return None;
+        return range_loop_reject("counter_not_integer");
     }
 
     let bound_local = match bound {
@@ -1204,8 +1556,31 @@ fn match_packed_f64_range_loop(
     };
     let mut accesses: std::collections::BTreeMap<u32, PackedF64RangeArrayAccess> =
         std::collections::BTreeMap::new();
-    let dense = if packed_f64_range_loop_body_collect(body, counter_id, bound_local, &mut accesses)
-    {
+    // #9253: a leaf of an affine index (`a[i * size + k]`) is admissible when
+    // it is an integer-valued local that the loop body never writes. The
+    // counter is handled by the recogniser itself. Invariance is required
+    // because the fast clone recomputes the index in i64 from the leaves'
+    // slots: a leaf written mid-body would make the recomputation and the
+    // source expression disagree.
+    let affine_leaf_ok = |id: u32| -> bool {
+        // The lowering materialises each leaf from its shared i32 shadow, so
+        // require that shadow HERE. Matcher and lowering must admit exactly
+        // the same shapes: admitting one the lowering declines emits a helper
+        // call, and the clone's call-free scan then discards the whole clone
+        // (the #9259 cascade).
+        ctx.integer_locals.contains(&id)
+            && ctx.i32_counter_slots.contains_key(&id)
+            && !stmts_mutate_local(body, id)
+            && !ctx.boxed_vars.contains(&id)
+            && !ctx.closure_captures.contains_key(&id)
+    };
+    let dense = if packed_f64_range_loop_body_collect(
+        body,
+        counter_id,
+        bound_local,
+        &mut accesses,
+        Some(&affine_leaf_ok),
+    ) {
         false
     } else {
         // The classic shape (one statement, counter-offset indices, stores
@@ -1213,20 +1588,40 @@ fn match_packed_f64_range_loop(
         // read-only DENSE mode: several scalar statements, masked
         // statically-windowed indices, no stores, no side exits.
         accesses.clear();
+        let mut pending_accumulators = std::collections::BTreeSet::new();
         if !packed_f64_range_loop_dense_body_collect(
             ctx,
             body,
             counter_id,
             bound_local,
             &mut accesses,
+            &mut pending_accumulators,
         ) {
-            return None;
+            return range_loop_reject("body_not_admissible");
+        }
+        if !pending_accumulators.is_empty() {
+            // The peel above assumed each pending local numeric; that holds
+            // only if the lowering will actually admit it (entry tag check +
+            // numeric-preserving writes). Verify with the SAME collector and
+            // the SAME array selection `emit_range_loop_accumulator_admission`
+            // uses -- if the two disagree, the clone would contain a dynamic
+            // `+` (a collecting call) under facts that forbid one.
+            if accesses.len() != 1 {
+                return range_loop_reject("accumulator_needs_single_array");
+            }
+            let array_id = *accesses.keys().next().expect("len checked");
+            let admitted = super::stable_packed_accumulator::collect_numeric_accumulators(
+                ctx, body, array_id, counter_id, true, true,
+            );
+            if !pending_accumulators.iter().all(|id| admitted.contains(id)) {
+                return range_loop_reject("accumulator_not_provable");
+            }
         }
         true
     };
     if accesses.is_empty() {
         // No tracked array access — nothing for the versioned loop to win.
-        return None;
+        return range_loop_reject("no_tracked_array_access");
     }
     for access in accesses.values() {
         let arr_id = access.array_id;
@@ -1265,15 +1660,15 @@ fn match_packed_f64_range_loop(
                 if !packed_loop_array_binding_storage_is_addressable(ctx, arr_id)
                     || ctx.scalar_replaced_arrays.contains_key(&arr_id)
                 {
-                    return None;
+                    return range_loop_reject("dense_written_not_addressable");
                 }
             } else if !packed_loop_array_binding_is_eligible(ctx, arr_id) {
-                return None;
+                return range_loop_reject("written_binding_not_eligible");
             }
         } else if !packed_loop_array_binding_storage_is_addressable(ctx, arr_id)
             || ctx.scalar_replaced_arrays.contains_key(&arr_id)
         {
-            return None;
+            return range_loop_reject("read_binding_not_addressable");
         }
         // The guard takes i32 window endpoints; make sure `start + offset`
         // still fits (bound-side overflow is prevented by the constant cap /
@@ -1284,17 +1679,32 @@ fn match_packed_f64_range_loop(
             if !(i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&min_idx)
                 || !(i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&max_base)
             {
-                return None;
+                return range_loop_reject("counter_window_out_of_i32");
             }
         }
         if let Some((lo, hi)) = access.stat {
             // `hi + 1` must fit the guard's i32 `max_idx_exclusive` argument.
             if lo < 0 || hi >= i64::from(i32::MAX) {
-                return None;
+                return range_loop_reject("static_window_out_of_i32");
             }
         }
-        if access.counter.is_none() && access.stat.is_none() {
-            return None;
+        if access.counter.is_none() && access.stat.is_none() && !access.affine {
+            return range_loop_reject("access_has_no_window");
+        }
+        // #9253: an affine index has no compile-time window by construction,
+        // so its entry guard proves the RECEIVER only and each read pays an
+        // inline bounds check with a side exit. Dense mode's loads have no
+        // side exit, so the two are mutually exclusive; the matcher only ever
+        // sets `affine` on the classic path, and this makes that explicit
+        // rather than implicit in which caller passed the leaf predicate.
+        if access.affine && dense {
+            return range_loop_reject("affine_index_in_dense_mode");
+        }
+        if access.affine && access.written {
+            // A store through an affine index would need the side exit to be
+            // replay-safe, which the classic mode only guarantees for a single
+            // statement whose one side effect happens last. Reads only.
+            return range_loop_reject("affine_index_store");
         }
         if access.written {
             // Dense written arrays need only the declared number[]-ness: the
@@ -1308,14 +1718,14 @@ fn match_packed_f64_range_loop(
             // here; a wrong hint is one failed guard -> slow loop. Classic
             // (side-exiting, hole-tolerant) written arrays keep the full set.
             if !local_allows_packed_f64_loop_store(ctx, arr_id) {
-                return None;
+                return range_loop_reject("store_local_not_allowed");
             }
             if !dense
                 && !ctx
                     .native_facts
                     .packed_f64_eligible_for_guarded_store(arr_id)
             {
-                return None;
+                return range_loop_reject("store_not_fact_eligible");
             }
         } else if !local_is_number_array(ctx, arr_id)
             && !(dense && local_is_untyped_candidate(ctx, arr_id))
@@ -1327,7 +1737,7 @@ fn match_packed_f64_range_loop(
             // slow loop, never correctness. Known non-array static types stay
             // excluded so ordinary object/string index loops don't grow dead
             // guard chains.
-            return None;
+            return range_loop_reject("array_static_type_excluded");
         }
     }
     Some(PackedF64RangeLoop {
@@ -1337,6 +1747,89 @@ fn match_packed_f64_range_loop(
         arrays: accesses.into_values().collect(),
         dense,
     })
+}
+
+/// #9253: is `index` an integer-producing expression over the loop counter and
+/// loop-invariant integer locals — `k`, `i * size + k`, `k * size + j`?
+///
+/// This is a KIND proof, not a range proof. It deliberately does not try to
+/// bound the value: `size` is typically a parameter with no callsite summary,
+/// so `int_range_expr` answers `None` and any static window is unobtainable.
+/// The read instead pays an unsigned `icmp ult idx, len` against the live
+/// length, which rejects a negative index as a huge unsigned one and takes the
+/// side exit — so non-negativity is not needed as a static fact either.
+///
+/// What IS needed is that the value materialises without wrapping, which the
+/// lowering guarantees by computing the index in i64 from operands that are
+/// each a proven i32 (`emit_object_array_write_index_i64` is the existing
+/// precedent for the same arithmetic).
+///
+/// Leaves: the counter, any local proven integer-valued, and integer literals.
+/// A non-counter local must additionally be loop-invariant — checked by the
+/// caller, which has the loop body — because a leaf written inside the body
+/// would make the index and the emitted i64 recomputation disagree.
+/// Does `expr` read `id` anywhere? Used to keep the affine index arm to
+/// counter-dependent indices; a wholly loop-invariant index belongs to a tier
+/// that can prove a compile-time window for it.
+fn expr_mentions_local(expr: &perry_hir::Expr, id: u32) -> bool {
+    use perry_hir::Expr;
+    if matches!(expr, Expr::LocalGet(found) if *found == id) {
+        return true;
+    }
+    let mut found = false;
+    perry_hir::walker::walk_expr_children(expr, &mut |child| {
+        if !found {
+            found = expr_mentions_local(child, id);
+        }
+    });
+    found
+}
+
+fn packed_f64_range_loop_index_is_affine_with(
+    index: &perry_hir::Expr,
+    counter_id: u32,
+    leaf_ok: &dyn Fn(u32) -> bool,
+) -> bool {
+    use perry_hir::{BinaryOp, Expr};
+    match index {
+        Expr::Integer(v) => i32::try_from(*v).is_ok(),
+        Expr::Number(n) => {
+            n.fract() == 0.0 && *n >= f64::from(i32::MIN) && *n <= f64::from(i32::MAX)
+        }
+        Expr::LocalGet(id) => *id == counter_id || leaf_ok(*id),
+        // Only the operators whose i64 recomputation is exact. `Div`/`Mod`/
+        // shifts are excluded: they are not wrong here so much as unproven,
+        // and admitting a shape the lowering then declines would emit a helper
+        // call and cost the whole clone (the #9259 cascade).
+        Expr::Binary {
+            op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul,
+            left,
+            right,
+        } => {
+            packed_f64_range_loop_index_is_affine_with(left, counter_id, leaf_ok)
+                && packed_f64_range_loop_index_is_affine_with(right, counter_id, leaf_ok)
+        }
+        _ => false,
+    }
+}
+
+/// Record an affine (window-less) access. Unlike the counter/static recorders
+/// this widens nothing: there is no window to merge, and the entry guard will
+/// prove the receiver rather than a range.
+fn record_packed_f64_range_affine_access(
+    accesses: &mut std::collections::BTreeMap<u32, PackedF64RangeArrayAccess>,
+    array_id: u32,
+) {
+    let entry = accesses
+        .entry(array_id)
+        .or_insert(PackedF64RangeArrayAccess {
+            array_id,
+            counter: None,
+            stat: None,
+            affine: false,
+            written: false,
+        });
+    entry.affine = true;
 }
 
 fn record_packed_f64_range_access(
@@ -1351,6 +1844,7 @@ fn record_packed_f64_range_access(
             array_id,
             counter: None,
             stat: None,
+            affine: false,
             written,
         });
     entry.counter = Some(match entry.counter {
@@ -1387,6 +1881,7 @@ pub(super) fn record_packed_f64_range_static_access(
             array_id,
             counter: None,
             stat: None,
+            affine: false,
             written: false,
         });
     entry.stat = Some(match entry.stat {
@@ -1432,6 +1927,7 @@ fn packed_f64_range_loop_body_collect(
     counter_id: u32,
     bound_local: Option<u32>,
     accesses: &mut std::collections::BTreeMap<u32, PackedF64RangeArrayAccess>,
+    affine_leaf_ok: Option<&dyn Fn(u32) -> bool>,
 ) -> bool {
     use perry_hir::Expr;
     let [Stmt::Expr(expr)] = body else {
@@ -1465,10 +1961,22 @@ fn packed_f64_range_loop_body_collect(
         Expr::LocalSet(id, value) => {
             *id != counter_id
                 && Some(*id) != bound_local
-                && packed_f64_range_loop_pure_expr_collect(value, counter_id, false, accesses)
+                && packed_f64_range_loop_pure_expr_collect(
+                    value,
+                    counter_id,
+                    false,
+                    accesses,
+                    affine_leaf_ok,
+                )
                 && !accesses.contains_key(id)
         }
-        _ => packed_f64_range_loop_pure_expr_collect(expr, counter_id, false, accesses),
+        _ => packed_f64_range_loop_pure_expr_collect(
+            expr,
+            counter_id,
+            false,
+            accesses,
+            affine_leaf_ok,
+        ),
     }
 }
 
@@ -1524,7 +2032,7 @@ fn packed_f64_range_loop_store_collect(
     let Some(offset) = packed_f64_range_loop_index_offset(index, counter_id) else {
         return false;
     };
-    if !packed_f64_range_loop_pure_expr_collect(value, counter_id, false, accesses) {
+    if !packed_f64_range_loop_pure_expr_collect(value, counter_id, false, accesses, None) {
         return false;
     }
     record_packed_f64_range_access(accesses, *arr_id, offset, true);
@@ -1545,9 +2053,40 @@ fn packed_f64_range_loop_dense_body_collect(
     counter_id: u32,
     bound_local: Option<u32>,
     accesses: &mut std::collections::BTreeMap<u32, PackedF64RangeArrayAccess>,
+    pending_accumulators: &mut std::collections::BTreeSet<u32>,
+) -> bool {
+    let mut written: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    packed_f64_range_loop_dense_stmts_collect(
+        ctx,
+        body,
+        counter_id,
+        bound_local,
+        accesses,
+        &mut written,
+        pending_accumulators,
+    )
+        // Written arrays are allowed (masked stores above); a scalar `let`/set
+        // shadowing a tracked array id still rejects.
+        && !accesses.is_empty()
+        && accesses.keys().all(|arr_id| !written.contains(arr_id))
+}
+
+/// The statement walk behind [`packed_f64_range_loop_dense_body_collect`],
+/// split out so a conditional's branches can recurse into it.
+///
+/// `written` is threaded rather than rebuilt per branch: a scalar assigned
+/// inside an `if` still shadows a tracked array id for the caller's
+/// disjointness check, and rebuilding it per branch would lose that.
+fn packed_f64_range_loop_dense_stmts_collect(
+    ctx: &FnCtx<'_>,
+    body: &[Stmt],
+    counter_id: u32,
+    bound_local: Option<u32>,
+    accesses: &mut std::collections::BTreeMap<u32, PackedF64RangeArrayAccess>,
+    written: &mut std::collections::HashSet<u32>,
+    pending_accumulators: &mut std::collections::BTreeSet<u32>,
 ) -> bool {
     use perry_hir::Expr;
-    let mut written: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for stmt in body {
         match stmt {
             Stmt::Let {
@@ -1556,7 +2095,9 @@ fn packed_f64_range_loop_dense_body_collect(
                 ..
             } => {
                 if !masked_window_expression_is_non_collecting(ctx, init)
-                    || !packed_f64_range_loop_pure_expr_collect(init, counter_id, true, accesses)
+                    || !packed_f64_range_loop_pure_expr_collect(
+                        init, counter_id, true, accesses, None,
+                    )
                 {
                     return false;
                 }
@@ -1569,8 +2110,20 @@ fn packed_f64_range_loop_dense_body_collect(
                 if *id == counter_id || Some(*id) == bound_local {
                     return false;
                 }
-                if !masked_window_expression_is_non_collecting(ctx, value)
-                    || !packed_f64_range_loop_pure_expr_collect(value, counter_id, true, accesses)
+                // First try the plain proof; a self-accumulating write whose
+                // only unprovable leaf is the target itself retries with the
+                // target treated as numeric and records it as PENDING. The
+                // caller then verifies every pending id against
+                // `collect_numeric_accumulators` -- the same walk the lowering
+                // runs -- and rejects the whole dense match otherwise, so the
+                // clone never contains a write this assumption cannot cover.
+                if masked_window_expression_proof(ctx, value, None).is_none() {
+                    if masked_window_expression_proof(ctx, value, Some(*id)).is_none() {
+                        return false;
+                    }
+                    pending_accumulators.insert(*id);
+                }
+                if !packed_f64_range_loop_pure_expr_collect(value, counter_id, true, accesses, None)
                 {
                     return false;
                 }
@@ -1600,10 +2153,10 @@ fn packed_f64_range_loop_dense_body_collect(
                         || !masked_window_expression_is_non_collecting(ctx, value)
                         || !dense_masked_store_rhs_is_admissible(ctx, value, counter_id, accesses)
                         || !packed_f64_range_loop_pure_expr_collect(
-                            index, counter_id, true, accesses,
+                            index, counter_id, true, accesses, None,
                         )
                         || !packed_f64_range_loop_pure_expr_collect(
-                            value, counter_id, true, accesses,
+                            value, counter_id, true, accesses, None,
                         )
                     {
                         return false;
@@ -1618,17 +2171,79 @@ fn packed_f64_range_loop_dense_body_collect(
                     continue;
                 }
                 if !masked_window_expression_is_non_collecting(ctx, expr)
-                    || !packed_f64_range_loop_pure_expr_collect(expr, counter_id, true, accesses)
+                    || !packed_f64_range_loop_pure_expr_collect(
+                        expr, counter_id, true, accesses, None,
+                    )
                 {
                     return false;
                 }
             }
+            // #9275: a conditional whose branches are themselves admitted
+            // scalar statements. The versioned tier already accepts this shape
+            // (`expr_is_packed_f64_loop_safe` recurses through `Expr::Compare`,
+            // and integer `c++` accumulators admit independently), so
+            // `for (k = 1; k < N; k++) if (a[k] > a[k-1]) c++` got a packed
+            // clone when its bound was written `arr.length` and none when it
+            // was written as a literal — 4ms against 31ms for identical work.
+            //
+            // Dense mode is where this belongs, and its own safety argument
+            // carries over unchanged: the fast loop's loads have no side
+            // exits, so an iteration runs entirely in the fast copy or
+            // entirely in the slow one, and a branch cannot leave a
+            // half-applied iteration behind. The classic mode above cannot
+            // take this — it permits a hole-read side exit that re-executes
+            // the iteration, which is why it insists on a single statement
+            // whose one side effect happens last.
+            //
+            // Reads from BOTH branches are recorded, so the entry guard
+            // validates the union of the windows rather than the taken path's.
+            // That is the conservative direction: a window only reachable on
+            // the untaken branch can make the guard decline a loop it would
+            // have run correctly, costing the clone and never correctness.
+            Stmt::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                if !masked_window_expression_is_non_collecting(ctx, condition)
+                    || !packed_f64_range_loop_pure_expr_collect(
+                        condition, counter_id, true, accesses, None,
+                    )
+                {
+                    return false;
+                }
+                if !packed_f64_range_loop_dense_stmts_collect(
+                    ctx,
+                    then_branch,
+                    counter_id,
+                    bound_local,
+                    accesses,
+                    written,
+                    pending_accumulators,
+                ) {
+                    return false;
+                }
+                if let Some(else_branch) = else_branch {
+                    if !packed_f64_range_loop_dense_stmts_collect(
+                        ctx,
+                        else_branch,
+                        counter_id,
+                        bound_local,
+                        accesses,
+                        written,
+                        pending_accumulators,
+                    ) {
+                        return false;
+                    }
+                }
+            }
+            // `break` / `continue` stay rejected here: dense mode's guarantee
+            // is that the whole iteration runs in one copy, and an early exit
+            // out of a branch is a shape this walk has not reasoned about.
             _ => return false,
         }
     }
-    // Written arrays are allowed (masked stores above); a scalar `let`/set
-    // shadowing a tracked array id still rejects.
-    !accesses.is_empty() && accesses.keys().all(|arr_id| !written.contains(arr_id))
+    true
 }
 
 /// Match-time twin of `masked_window::masked_store_rhs_is_genuine_f64`: at
@@ -1687,7 +2302,7 @@ pub(super) fn masked_window_expression_is_non_collecting(
     ctx: &FnCtx<'_>,
     expr: &perry_hir::Expr,
 ) -> bool {
-    masked_window_expression_proof(ctx, expr).is_some()
+    masked_window_expression_proof(ctx, expr, None).is_some()
 }
 
 /// Facts about a value whose evaluation has also been proved non-collecting.
@@ -1706,6 +2321,7 @@ struct MaskedWindowExpressionProof {
 fn masked_window_expression_proof(
     ctx: &FnCtx<'_>,
     expr: &perry_hir::Expr,
+    accumulator: Option<u32>,
 ) -> Option<MaskedWindowExpressionProof> {
     use perry_hir::{BinaryOp, CompareOp, Expr, UnaryOp};
     let proof = |inert, numeric| MaskedWindowExpressionProof { inert, numeric };
@@ -1718,12 +2334,22 @@ fn masked_window_expression_proof(
             if !matches!(object.as_ref(), Expr::LocalGet(_)) {
                 return None;
             }
-            masked_window_expression_proof(ctx, index)?;
+            masked_window_expression_proof(ctx, index, accumulator)?;
             Some(proof(true, true))
         }
         Expr::Number(_) | Expr::Integer(_) => Some(proof(true, true)),
         Expr::Bool(_) | Expr::Null | Expr::Undefined => Some(proof(true, false)),
-        Expr::LocalGet(_) => {
+        Expr::LocalGet(id) => {
+            // A pending accumulator is numeric BY CONTRACT, not by static
+            // proof: the clone's entry emits a genuine-double tag check on it
+            // and branches to the slow copy otherwise, and the caller verifies
+            // (with the same collector the lowering runs) that every in-clone
+            // write keeps it numeric. Static analysis cannot see this because
+            // the accumulator's own writes read the guarded array, whose
+            // element proof only exists once the guard has run.
+            if accumulator == Some(*id) {
+                return Some(proof(true, true));
+            }
             let inert = crate::rooting::expr_is_inert_primitive(ctx, expr);
             Some(proof(
                 inert,
@@ -1737,8 +2363,8 @@ fn masked_window_expression_proof(
             crate::rooting::expr_is_inert_primitive(ctx, expr).then(|| proof(true, true))
         }
         Expr::Binary { op, left, right } => {
-            let left = masked_window_expression_proof(ctx, left)?;
-            let right = masked_window_expression_proof(ctx, right)?;
+            let left = masked_window_expression_proof(ctx, left, accumulator)?;
+            let right = masked_window_expression_proof(ctx, right, accumulator)?;
             if matches!(op, BinaryOp::Add) {
                 if !left.numeric || !right.numeric {
                     return None;
@@ -1749,23 +2375,23 @@ fn masked_window_expression_proof(
             Some(proof(true, true))
         }
         Expr::Compare { op, left, right } => {
-            let left = masked_window_expression_proof(ctx, left)?;
-            let right = masked_window_expression_proof(ctx, right)?;
+            let left = masked_window_expression_proof(ctx, left, accumulator)?;
+            let right = masked_window_expression_proof(ctx, right, accumulator)?;
             if !matches!(op, CompareOp::Eq | CompareOp::Ne) && (!left.inert || !right.inert) {
                 return None;
             }
             Some(proof(true, false))
         }
         Expr::Unary { op, operand } => {
-            let operand = masked_window_expression_proof(ctx, operand)?;
+            let operand = masked_window_expression_proof(ctx, operand, accumulator)?;
             if !matches!(op, UnaryOp::Not) && !operand.inert {
                 return None;
             }
             Some(proof(true, !matches!(op, UnaryOp::Not)))
         }
         Expr::Logical { left, right, .. } => {
-            let left = masked_window_expression_proof(ctx, left)?;
-            let right = masked_window_expression_proof(ctx, right)?;
+            let left = masked_window_expression_proof(ctx, left, accumulator)?;
+            let right = masked_window_expression_proof(ctx, right, accumulator)?;
             Some(proof(
                 left.inert && right.inert,
                 left.numeric && right.numeric,
@@ -1776,25 +2402,25 @@ fn masked_window_expression_proof(
             then_expr,
             else_expr,
         } => {
-            masked_window_expression_proof(ctx, condition)?;
-            let then_expr = masked_window_expression_proof(ctx, then_expr)?;
-            let else_expr = masked_window_expression_proof(ctx, else_expr)?;
+            masked_window_expression_proof(ctx, condition, accumulator)?;
+            let then_expr = masked_window_expression_proof(ctx, then_expr, accumulator)?;
+            let else_expr = masked_window_expression_proof(ctx, else_expr, accumulator)?;
             Some(proof(
                 then_expr.inert && else_expr.inert,
                 then_expr.numeric && else_expr.numeric,
             ))
         }
         Expr::Void(value) | Expr::TypeOf(value) | Expr::BooleanCoerce(value) => {
-            masked_window_expression_proof(ctx, value)?;
+            masked_window_expression_proof(ctx, value, accumulator)?;
             Some(proof(true, false))
         }
         Expr::NumberCoerce(value) => {
-            let value = masked_window_expression_proof(ctx, value)?;
+            let value = masked_window_expression_proof(ctx, value, accumulator)?;
             value.inert.then(|| proof(true, true))
         }
         Expr::MathImul(left, right) | Expr::MathPow(left, right) => {
             for value in [left.as_ref(), right.as_ref()] {
-                if !masked_window_expression_proof(ctx, value)?.inert {
+                if !masked_window_expression_proof(ctx, value, accumulator)?.inert {
                     return None;
                 }
             }
@@ -1802,7 +2428,7 @@ fn masked_window_expression_proof(
         }
         Expr::MathMin(values) | Expr::MathMax(values) => {
             for value in values {
-                if !masked_window_expression_proof(ctx, value)?.inert {
+                if !masked_window_expression_proof(ctx, value, accumulator)?.inert {
                     return None;
                 }
             }
@@ -1816,7 +2442,7 @@ fn masked_window_expression_proof(
         | Expr::MathTrunc(value)
         | Expr::MathSign(value)
         | Expr::MathF16round(value) => {
-            let value = masked_window_expression_proof(ctx, value)?;
+            let value = masked_window_expression_proof(ctx, value, accumulator)?;
             if !value.inert {
                 return None;
             }
@@ -1836,6 +2462,7 @@ pub(super) fn packed_f64_range_loop_pure_expr_collect(
     counter_id: u32,
     allow_static: bool,
     accesses: &mut std::collections::BTreeMap<u32, PackedF64RangeArrayAccess>,
+    affine_leaf_ok: Option<&dyn Fn(u32) -> bool>,
 ) -> bool {
     use perry_hir::Expr;
     match expr {
@@ -1847,6 +2474,27 @@ pub(super) fn packed_f64_range_loop_pure_expr_collect(
                 record_packed_f64_range_access(accesses, *arr_id, offset, false);
                 return true;
             }
+            // #9253: an affine integer index (`a[i * size + k]`). Classic mode
+            // only — the caller passes `None` for dense, whose loads carry no
+            // side exit and so cannot take a per-read bounds check.
+            if let Some(leaf_ok) = affine_leaf_ok {
+                // The index must actually involve the counter. A constant or
+                // wholly loop-invariant index (`a[0]`, `a[1]`) is affine by the
+                // grammar but has a compile-time window, and the DENSE tier's
+                // masked/static-window path serves it better — admitting it
+                // here makes the classic walker succeed and silently steals the
+                // loop from that tier, which is a regression, not a win.
+                if packed_f64_range_loop_index_is_affine_with(index, counter_id, leaf_ok)
+                    && expr_mentions_local(index, counter_id)
+                    // #9294 follow-up: the i64 materialization is wrap-free
+                    // only when the tree's worst case fits i63. Shared with
+                    // the lowering so the two cannot disagree.
+                    && crate::expr::affine_index_fits_i64(index)
+                {
+                    record_packed_f64_range_affine_access(accesses, *arr_id);
+                    return true;
+                }
+            }
             if !allow_static {
                 return false;
             }
@@ -1857,7 +2505,13 @@ pub(super) fn packed_f64_range_loop_pure_expr_collect(
                 return false;
             }
             // The index may nest further tracked reads — walk it too.
-            if !packed_f64_range_loop_pure_expr_collect(index, counter_id, allow_static, accesses) {
+            if !packed_f64_range_loop_pure_expr_collect(
+                index,
+                counter_id,
+                allow_static,
+                accesses,
+                affine_leaf_ok,
+            ) {
                 return false;
             }
             record_packed_f64_range_static_access(accesses, *arr_id, lo, hi);
@@ -1872,51 +2526,68 @@ pub(super) fn packed_f64_range_loop_pure_expr_collect(
         Expr::Binary { left, right, .. }
         | Expr::Compare { left, right, .. }
         | Expr::Logical { left, right, .. } => {
-            packed_f64_range_loop_pure_expr_collect(left, counter_id, allow_static, accesses)
-                && packed_f64_range_loop_pure_expr_collect(
-                    right,
-                    counter_id,
-                    allow_static,
-                    accesses,
-                )
+            packed_f64_range_loop_pure_expr_collect(
+                left,
+                counter_id,
+                allow_static,
+                accesses,
+                affine_leaf_ok,
+            ) && packed_f64_range_loop_pure_expr_collect(
+                right,
+                counter_id,
+                allow_static,
+                accesses,
+                affine_leaf_ok,
+            )
         }
         Expr::Unary { operand, .. }
         | Expr::Void(operand)
         | Expr::TypeOf(operand)
         | Expr::NumberCoerce(operand)
-        | Expr::BooleanCoerce(operand) => {
-            packed_f64_range_loop_pure_expr_collect(operand, counter_id, allow_static, accesses)
-        }
+        | Expr::BooleanCoerce(operand) => packed_f64_range_loop_pure_expr_collect(
+            operand,
+            counter_id,
+            allow_static,
+            accesses,
+            affine_leaf_ok,
+        ),
         Expr::Conditional {
             condition,
             then_expr,
             else_expr,
         } => {
-            packed_f64_range_loop_pure_expr_collect(condition, counter_id, allow_static, accesses)
-                && packed_f64_range_loop_pure_expr_collect(
-                    then_expr,
-                    counter_id,
-                    allow_static,
-                    accesses,
-                )
-                && packed_f64_range_loop_pure_expr_collect(
-                    else_expr,
-                    counter_id,
-                    allow_static,
-                    accesses,
-                )
+            packed_f64_range_loop_pure_expr_collect(
+                condition,
+                counter_id,
+                allow_static,
+                accesses,
+                affine_leaf_ok,
+            ) && packed_f64_range_loop_pure_expr_collect(
+                then_expr,
+                counter_id,
+                allow_static,
+                accesses,
+                affine_leaf_ok,
+            ) && packed_f64_range_loop_pure_expr_collect(
+                else_expr,
+                counter_id,
+                allow_static,
+                accesses,
+                affine_leaf_ok,
+            )
         }
         Expr::MathImul(left, right) | Expr::MathPow(left, right) => {
-            packed_f64_range_loop_pure_expr_collect(left, counter_id, allow_static, accesses)
+            packed_f64_range_loop_pure_expr_collect(left, counter_id, allow_static, accesses, None)
                 && packed_f64_range_loop_pure_expr_collect(
                     right,
                     counter_id,
                     allow_static,
                     accesses,
+                    affine_leaf_ok,
                 )
         }
         Expr::MathMin(values) | Expr::MathMax(values) => values.iter().all(|expr| {
-            packed_f64_range_loop_pure_expr_collect(expr, counter_id, allow_static, accesses)
+            packed_f64_range_loop_pure_expr_collect(expr, counter_id, allow_static, accesses, None)
         }),
         Expr::MathAbs(value)
         | Expr::MathSqrt(value)
@@ -1926,7 +2597,7 @@ pub(super) fn packed_f64_range_loop_pure_expr_collect(
         | Expr::MathTrunc(value)
         | Expr::MathSign(value)
         | Expr::MathF16round(value) => {
-            packed_f64_range_loop_pure_expr_collect(value, counter_id, allow_static, accesses)
+            packed_f64_range_loop_pure_expr_collect(value, counter_id, allow_static, accesses, None)
         }
         _ => false,
     }
@@ -1957,6 +2628,32 @@ fn emit_packed_f64_range_guards(
             "array[packed_f64_range_loop]",
             TypedFeedbackContract::packed_f64_array_loop(),
         );
+        // #9253: an affine access has no window to validate. The 2-arg
+        // receiver guard proves exactly what is hoistable — plain-array shape,
+        // raw-f64 packedness, integrity/frozen state, the 16M length and
+        // capacity sanity bounds — once in the preheader, which is the whole
+        // point: those are the per-iteration instructions this issue is about.
+        // The index itself is validated per read by `icmp ult idx, len`.
+        if access.affine {
+            let guard_i32 = ctx.block().call(
+                I32,
+                "js_typed_feedback_packed_f64_array_loop_guard",
+                &[(I64, &feedback_site_id), (DOUBLE, &arr_box)],
+            );
+            let guard_ok = ctx.block().icmp_ne(I32, &guard_i32, "0");
+            all_guards_ok = Some(match all_guards_ok {
+                None => guard_ok,
+                Some(prev) => ctx.block().and(I1, &prev, &guard_ok),
+            });
+            record_packed_f64_loop_guard_artifacts(
+                ctx,
+                access.array_id,
+                &arr_box,
+                guard_id,
+                PackedNumericLoopKind::F64,
+            );
+            continue;
+        }
         let (min_idx, max_idx): (String, String) = match (access.counter, access.stat) {
             (Some((min_off, max_off)), None) => (
                 (matched.start + i64::from(min_off)).to_string(),
@@ -2033,6 +2730,24 @@ fn push_packed_f64_range_facts(
                 // hole-tolerant.
                 allow_holes: !matched.dense,
                 window_validated: true,
+                affine_indices: false,
+                numeric_accumulators: numeric_accumulators.to_vec(),
+            });
+        }
+        // #9253: an affine access publishes a receiver-only fact. No window
+        // was validated, so reads bounds-check per access; holes are excluded
+        // because the receiver guard proves fully-packed raw f64.
+        if access.affine {
+            ctx.packed_f64_loop_facts.push(PackedF64LoopFact {
+                index_local_id: matched.counter_id,
+                array_local_id: access.array_id,
+                scope_id,
+                guard_id: guard_id.to_string(),
+                store_side_exit_label: slow_pre_label.to_string(),
+                array_kind: PackedNumericLoopKind::F64,
+                allow_holes: false,
+                window_validated: false,
+                affine_indices: true,
                 numeric_accumulators: numeric_accumulators.to_vec(),
             });
         }
@@ -2047,6 +2762,7 @@ fn push_packed_f64_range_facts(
                     values_i32,
                     elem: crate::expr::MaskedWindowElem::PlainF64,
                     allows_stores: allow_masked_stores,
+                    numeric_accumulators: numeric_accumulators.to_vec(),
                 });
         }
     }
@@ -2149,6 +2865,7 @@ fn lower_masked_window_ta_tier(
                 values_i32,
                 elem,
                 allows_stores: false,
+                numeric_accumulators: Vec::new(),
             });
     }
     lower_for_after_init_with_i32_bound(
@@ -4788,9 +5505,18 @@ fn match_packed_f64_versioned_loop(
     }
     let ordinary_hoist =
         condition.and_then(|cond| classify_for_length_hoist(ctx, cond, update, body));
-    let hoist = ordinary_hoist.or_else(|| {
-        condition.and_then(|cond| classify_for_length_hoist_impl(ctx, cond, update, body, true))
-    })?;
+    let hoist = ordinary_hoist
+        .or_else(|| {
+            condition.and_then(|cond| classify_for_length_hoist_impl(ctx, cond, update, body, true))
+        })
+        .or_else(|| {
+            // #9253 flagged this as the one SILENT gate in the matcher: a loop
+            // whose bound is not `arr.length` exits here before any of the named
+            // rejects below can fire, which made every literal- or param-bounded
+            // loop invisible to the trace.
+            let _ = packed_loop_reject("no_length_hoist");
+            None
+        })?;
     if !matches!(hoist.op, perry_hir::CompareOp::Lt) || hoist.lhs_addend != 0 {
         return packed_loop_reject("compare_op_not_lt");
     }
@@ -5063,9 +5789,48 @@ fn stmt_is_packed_f64_loop_safe(
                     .as_ref()
                     .is_none_or(|expr| expr_is_packed_f64_loop_safe(ctx, expr, arr_id, counter_id))
         }
-        // `throw` stays out: the thrown value is typically constructed
-        // (`throw new Error(…)`), which is a call in the loop body.
-        Stmt::Throw(_) => packed_loop_abrupt_enabled(),
+        // `throw` stays out. Admitting it (#9185) was a silent wrong answer:
+        // `break`/`continue`/`return` leave the clone through normal CFG edges
+        // that flush the loop-carried locals back to their frame slots, but an
+        // unwind edge does not, so anything reading such a local AFTER the
+        // throw saw its stale pre-loop value:
+        //
+        //     let s = 0;
+        //     try { for (let i = 0; i < arr.length; i++) {
+        //             if (arr[i] === 40) throw PRE; s += arr[i]; } }
+        //     catch (e) { return s; }   // gave 0, node gives 780
+        //
+        // #9185's tests missed it because none of them read a loop-carried
+        // local after unwinding — they read the thrown value (which IS the
+        // clone's live value, and was correct) or an untouched variable. A
+        // closure-captured accumulator was also correct, being boxed rather
+        // than register-promoted, which is what kept the bug this narrow.
+        //
+        // Admitted again now that `flush_packed_accumulator_locals` emits the
+        // writeback AT the throw site (#9210). The operand is checked the same
+        // way `Stmt::Return` checks its value; #9185 admitted any throw at all
+        // and leaned on `stmt_array_length_effect` to reject the constructing
+        // ones, which is a weaker guarantee than stating the requirement here.
+        // The thrown operand is deliberately NOT required to be
+        // `expr_is_packed_f64_loop_safe`. That predicate asks "can the clone
+        // keep running after this", and after a throw it cannot: control
+        // leaves the loop for a landing pad and never returns, so no later
+        // iteration can observe a value the operand disturbed.
+        //
+        // What the operand still must not do is change `arr.length` before the
+        // hoisted bound is used, and that IS checked — `stmt_preserves_array_length`
+        // walks `Stmt::Throw(e)` into `e`, so `throw arr.pop()` is rejected
+        // there. Keeping the two questions in their own predicates is what lets
+        // a constructed operand (`new Error(…)`, `"bad " + i`) stay on the fast
+        // path; requiring loop-safety here costs 8.4x for no correctness gain.
+        //
+        // The accumulator writeback this needs is emitted at the throw site by
+        // `flush_packed_accumulator_locals`; without it this admission is the
+        // #9185 wrong answer.
+        Stmt::Throw(value) => {
+            packed_loop_abrupt_enabled()
+                && throw_operand_cannot_unwind(ctx, value, arr_id, counter_id)
+        }
         Stmt::LabeledBreak(_)
         | Stmt::LabeledContinue(_)
         | Stmt::While { .. }
@@ -5202,6 +5967,99 @@ fn local_is_int32_value(ctx: &FnCtx<'_>, local_id: u32) -> bool {
         )
 }
 
+/// Can evaluating `expr` as a thrown operand UNWIND before the throw itself?
+///
+/// This is the guard on `flush_packed_accumulator_locals`. That flush is
+/// emitted at the throw site, after the operand is lowered — so an operand that
+/// unwinds on its own leaves the loop-carried accumulators stale, reproducing
+/// #9185 one level deeper. `expr_is_packed_f64_loop_safe` is NOT sufficient
+/// here: it accepts a bare `Expr::Binary` over locals, and `+` on an object
+/// dispatches to a user `valueOf`/`toString` that can throw.
+///
+/// Throwing a value coerces nothing, so a bare local is fine. Anything that
+/// COERCES — arithmetic, concatenation, an Error message being stringified —
+/// must be provably free of user dispatch.
+fn throw_operand_cannot_unwind(
+    ctx: &FnCtx<'_>,
+    expr: &perry_hir::Expr,
+    arr_id: u32,
+    counter_id: u32,
+) -> bool {
+    use perry_hir::Expr;
+    match expr {
+        // Thrown as-is: no conversion, so no user code, whatever it holds.
+        Expr::LocalGet(_)
+        | Expr::String(_)
+        | Expr::Number(_)
+        | Expr::Integer(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::Undefined => true,
+        Expr::ErrorNew(message) => message
+            .as_ref()
+            .is_none_or(|m| expr_is_coercion_free_primitive(ctx, m, arr_id, counter_id)),
+        Expr::TypeErrorNew(message)
+        | Expr::RangeErrorNew(message)
+        | Expr::ReferenceErrorNew(message)
+        | Expr::SyntaxErrorNew(message) => {
+            expr_is_coercion_free_primitive(ctx, message, arr_id, counter_id)
+        }
+        Expr::Binary { left, right, .. } | Expr::Compare { left, right, .. } => {
+            expr_is_coercion_free_primitive(ctx, left, arr_id, counter_id)
+                && expr_is_coercion_free_primitive(ctx, right, arr_id, counter_id)
+        }
+        Expr::Unary { operand, .. } => {
+            expr_is_coercion_free_primitive(ctx, operand, arr_id, counter_id)
+        }
+        _ => false,
+    }
+}
+
+/// Can `expr` be stringified WITHOUT running user code?
+///
+/// Deliberately syntactic and much narrower than `expr_is_packed_f64_loop_safe`:
+/// that predicate accepts a bare `Expr::LocalGet`, which is right for a value
+/// that is merely thrown (throwing coerces nothing) but wrong for one that is
+/// about to be stringified by an Error constructor, since the local may hold an
+/// object with a user `toString`.
+///
+/// Admitted: literals, the loop counter, a read of the packed array being
+/// iterated (both are numbers by the loop's own guards), and arithmetic or
+/// concatenation over those. Anything else — including any other local — is
+/// rejected, because proving it is not an object is not this predicate's job.
+fn expr_is_coercion_free_primitive(
+    ctx: &FnCtx<'_>,
+    expr: &perry_hir::Expr,
+    arr_id: u32,
+    counter_id: u32,
+) -> bool {
+    use perry_hir::Expr;
+    match expr {
+        Expr::String(_)
+        | Expr::Number(_)
+        | Expr::Integer(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::Undefined => true,
+        // The counter is the loop's own i32 induction variable.
+        Expr::LocalGet(id) => *id == counter_id,
+        // An element of the packed f64 array is a genuine double: the versioned
+        // loop only entered the fast clone after proving that layout.
+        Expr::IndexGet { object, index } => {
+            matches!(object.as_ref(), Expr::LocalGet(id) if *id == arr_id)
+                && expr_is_coercion_free_primitive(ctx, index, arr_id, counter_id)
+        }
+        Expr::Binary { left, right, .. } | Expr::Compare { left, right, .. } => {
+            expr_is_coercion_free_primitive(ctx, left, arr_id, counter_id)
+                && expr_is_coercion_free_primitive(ctx, right, arr_id, counter_id)
+        }
+        Expr::Unary { operand, .. } | Expr::NumberCoerce(operand) => {
+            expr_is_coercion_free_primitive(ctx, operand, arr_id, counter_id)
+        }
+        _ => false,
+    }
+}
+
 fn expr_is_packed_f64_loop_safe(
     ctx: &FnCtx<'_>,
     expr: &perry_hir::Expr,
@@ -5322,18 +6180,36 @@ fn is_packed_f64_loop_foreign_read_index(
     if is_packed_f64_loop_index(object, index, arr_id, counter_id) {
         return true;
     }
-    let (perry_hir::Expr::LocalGet(object_id), perry_hir::Expr::LocalGet(index_id)) =
-        (object, index)
-    else {
+    let perry_hir::Expr::LocalGet(object_id) = object else {
         return false;
     };
-    *object_id == arr_id
-        && *index_id != counter_id
-        && *index_id != arr_id
-        && ctx.integer_locals.contains(index_id)
-        && ctx.i32_counter_slots.contains_key(index_id)
-        && !ctx.boxed_vars.contains(index_id)
-        && !ctx.closure_captures.contains_key(index_id)
+    if *object_id != arr_id {
+        return false;
+    }
+    // #9259: parse `j` and `j ± c` with the SAME parser the read lowering uses
+    // (`packed_f64_loop_offset_read`). If the two disagree, the matcher admits
+    // a shape the lowering declines, that read emits a helper call, and the
+    // clone's call-free scan then discards the whole clone — which is exactly
+    // the 9x this issue is about, arriving by a different route.
+    let Some((index_id, offset)) = crate::expr::packed_f64_loop_index_parts(index) else {
+        return false;
+    };
+    // The lowering loads the index from this slot; without it there is no i32
+    // to bounds-check.
+    if index_id == arr_id || !ctx.i32_counter_slots.contains_key(&index_id) {
+        return false;
+    }
+    if index_id == counter_id {
+        // The loop's OWN counter at a constant offset (`a[k - 1]`, the EMA
+        // shape). The bound proves `k` in range, not `k ± c`, so this takes
+        // the identical treatment a foreign counter gets below: one inline
+        // `icmp ult` against the live length and the fact's existing side
+        // exit. Offset 0 was already accepted above.
+        return offset != 0;
+    }
+    ctx.integer_locals.contains(&index_id)
+        && !ctx.boxed_vars.contains(&index_id)
+        && !ctx.closure_captures.contains_key(&index_id)
 }
 
 fn is_packed_f64_loop_index(
@@ -5622,6 +6498,18 @@ pub(crate) fn lower_for(
 
     if let Some(matched) = match_numeric_range_add_loop(ctx, init, condition, update, body) {
         if lower_numeric_range_add_loop(ctx, matched, init, condition, update, body)? {
+            return Ok(());
+        }
+    }
+
+    // The sieve idiom: `for (j = <anything>; j < B; j += S) arr[j] = <const>`.
+    // One bulk-kernel call replaces a per-element inline guard chain over a
+    // receiver that cannot change mid-loop. Init shape is irrelevant — it was
+    // lowered above, so the counter local already holds the start value and
+    // the kernel reads it from there (the same trick `numeric_range_add`
+    // uses for `j = i * i`).
+    if let Some(matched) = match_strided_tagged_fill_loop(ctx, condition, update, body) {
+        if lower_strided_tagged_fill_loop(ctx, matched, init, condition, update, body)? {
             return Ok(());
         }
     }
@@ -8118,6 +9006,28 @@ pub(crate) fn expr_preserves_array_length(
                 && walk(object)
                 && args.iter().all(&walk)
         }
+        // The Error-family construction nodes allocate an error object and
+        // store their own message; none of them can reach an unrelated local
+        // array, so they preserve `arr.length`. Together with the `Stmt::Throw`
+        // admission above this is what keeps `if (bad) throw new Error(…)` —
+        // the #9151 shape — on the packed fast path.
+        //
+        // Identity is not in question at this layer: HIR emits these nodes only
+        // for the INTRINSIC constructor (`lower_new` gates them on
+        // `!shadowed_by_user_binding`). A user `class Error { … }`, or any other
+        // shadowing binding, lowers to `Expr::New`/`NewDynamic` instead and is
+        // still rejected by the fallback below — checking the NAME here would be
+        // a wrong-answer bug rather than a missed optimisation. The message and
+        // options operands are arbitrary expressions and are still walked.
+        Expr::ErrorNew(message) => message.as_ref().is_none_or(|m| walk(m)),
+        Expr::TypeErrorNew(message)
+        | Expr::RangeErrorNew(message)
+        | Expr::ReferenceErrorNew(message)
+        | Expr::SyntaxErrorNew(message) => walk(message),
+        Expr::ErrorNewWithCause { message, cause } => walk(message) && walk(cause),
+        Expr::ErrorNewWithOptions {
+            message, options, ..
+        } => walk(message) && walk(options),
         Expr::NativeMethodCall { .. } | Expr::CallSpread { .. } => false,
         Expr::Closure { .. } => false,
         Expr::Binary { left, right, .. }

@@ -709,6 +709,42 @@ pub(crate) unsafe fn note_cache_carrier(descriptor: Option<ShapeDescriptor>) {
     (*record).cache_carrier = true;
 }
 
+/// The post-birth publication point for a ShapeId into a receiver's header
+/// word: stamp, then register the carrier duty the stamp just created.
+///
+/// #9200: a receiver a MINOR WILL NOT ENUMERATE (old-gen, `gc_malloc`'d
+/// large, immortal bootstrap) can be stamped with a descriptor whose keys
+/// array is nursery-young. The receiver is invisible to the next minor, so
+/// the descriptor's record is the ONLY path that can keep that keys array
+/// alive — and an unarmed record is walked metadata-only by
+/// `scan_shape_table_rekey_mut`. The keys array is then swept while live,
+/// `prune_dead_shape_keys` drops the descriptor as dead, and the receiver
+/// comes back shapeless: `Object.keys()` empty, every fixed-slot read
+/// `undefined`. The tombstone-delete publish hit exactly this: it minted a
+/// fresh unarmed descriptor for an already-promoted receiver and then
+/// retired the armed predecessor in its keys-address sweep.
+///
+/// Arming here — in the same breath as the header store — makes the
+/// old-carrier gate hold BY CONSTRUCTION for every publish routed through
+/// this funnel, instead of relying on each publish site to remember the
+/// note. The nursery test mirrors `visit_gc_layout_slot_descriptors`'
+/// carrier note: "not in the nursery", never "in old-gen".
+///
+/// Over-approximation is the designed cost model: the gate is sticky within
+/// an epoch and recomputed by every full trace, so arming a receiver that
+/// dies young roots one record for at most one full collection — exactly
+/// the generational contract (#8112).
+#[inline]
+pub(crate) unsafe fn stamp_object_shape_id_with_carrier_note(
+    obj: *mut crate::object::ObjectHeader,
+    id: u32,
+) {
+    (*obj).parent_class_id = id;
+    if !crate::arena::pointer_in_nursery(obj as usize) {
+        note_old_generation_carrier(shape_descriptor_by_id(id));
+    }
+}
+
 /// Clear every `cache_carrier` bit ahead of the post-full-trace recompute.
 pub(crate) fn clear_all_cache_carriers() {
     let mut inner = crate::state::state().shapes.inner.borrow_mut();
@@ -921,9 +957,14 @@ unsafe fn install_cached_object_shape_version_impl(
     // Match `set_object_keys_array_with_live`: representation feedback must be
     // invalidated while the predecessor stamp is still authoritative.
     super::mark_object_dynamic_shape_unknown(obj);
-    (*obj).parent_class_id = target_shape_id;
-    if !target_is_cache_carried && !crate::arena::pointer_in_nursery(obj as usize) {
-        note_old_generation_carrier(shape_descriptor_by_id(target_shape_id));
+    if target_is_cache_carried {
+        // `cache_carrier` already roots the target descriptor for the
+        // cache's lifetime — strictly stronger than the epoch-scoped
+        // old-carrier note, so this stamp deliberately skips the funnel's
+        // descriptor probe (see the function doc above).
+        (*obj).parent_class_id = target_shape_id;
+    } else {
+        stamp_object_shape_id_with_carrier_note(obj, target_shape_id);
     }
 
     #[cfg(debug_assertions)]
@@ -976,7 +1017,7 @@ pub(crate) unsafe fn stamp_object_shape(
         crate::array::clear_array_subclass_named_prefix_token(obj);
         let id = shape_descriptor_ensure(keys, key_count, live_inline_slot_count)
             .unwrap_or_else(|error| shape_descriptor_error_abort(error));
-        (*obj).parent_class_id = id;
+        stamp_object_shape_id_with_carrier_note(obj, id);
         debug_assert_object_shape_parity(obj);
         return id;
     };
@@ -997,7 +1038,7 @@ pub(crate) unsafe fn stamp_object_shape(
         // an actual structural identity change.
         crate::array::clear_array_subclass_named_prefix_token(obj);
     }
-    (*obj).parent_class_id = id;
+    stamp_object_shape_id_with_carrier_note(obj, id);
     debug_assert_object_shape_parity(obj);
     id
 }
@@ -1044,7 +1085,7 @@ pub(crate) unsafe fn birth_stamp_object_shape(
                 live_inline_slot_count,
             );
     if supplied_id_is_local {
-        (*obj).parent_class_id = runtime_shape_id;
+        stamp_object_shape_id_with_carrier_note(obj, runtime_shape_id);
         debug_assert_object_shape_parity(obj);
     } else {
         // `current` was just published from the newborn's explicit keys edge
@@ -1064,12 +1105,12 @@ pub(crate) unsafe fn birth_stamp_object_shape(
 /// Stamp a newborn compiled-class allocation from the ShapeId installed at
 /// module initialization, without re-canonicalizing the same shape facts.
 ///
-/// A hit proves the immutable ordered-keys edge and live inline-slot bound
-/// directly from the agent-local descriptor. Canonical class keys never mutate
-/// in place: structural growth forks a new keys array and mints a new ShapeId,
-/// so exact `(ShapeId, keys pointer)` identity also carries the descriptor's
-/// logical key count. Missing worker-local ids and learned-width mismatches
-/// return `false` for the existing mint-and-validate path to handle.
+/// A hit proves the immutable ordered-keys edge, logical key count, and live
+/// inline-slot bound directly from the agent-local descriptor. The id and keys
+/// pointer arrive through separate module globals, so every structural fact is
+/// checked before the single stamp store. Missing worker-local ids, key-count
+/// drift, and learned-width mismatches return `false` for the existing
+/// mint-and-validate path to handle.
 ///
 /// # Safety
 ///
@@ -1090,7 +1131,13 @@ pub(crate) unsafe fn try_birth_stamp_preinstalled_shape(
     let Some(descriptor) = shape_descriptor_by_id(runtime_shape_id) else {
         return false;
     };
+    let logical_key_count = if keys.is_null() {
+        0
+    } else {
+        crate::array::keys_array_len_capped_to_capacity(keys) as u32
+    };
     if descriptor.keys != keys as u64
+        || descriptor.logical_key_count != logical_key_count
         || descriptor.live_inline_slot_count != live_inline_slot_count
         || descriptor.semantic_generation != 0
         || descriptor.object_kind != ShapeObjectKind::Ordinary
@@ -1284,7 +1331,7 @@ pub(crate) unsafe fn publish_object_shape_from(
         object_kind,
         hole_count,
     ));
-    (*obj).parent_class_id = id;
+    stamp_object_shape_id_with_carrier_note(obj, id);
     debug_assert_object_shape_parity_for_keys(obj, keys);
     id
 }
@@ -1317,7 +1364,7 @@ pub(crate) unsafe fn transition_object_shape_semantics(
         generation,
         current.object_kind,
     ));
-    (*obj).parent_class_id = id;
+    stamp_object_shape_id_with_carrier_note(obj, id);
     debug_assert_object_shape_parity(obj);
     id
 }
@@ -1366,7 +1413,7 @@ pub(crate) unsafe fn transition_object_shape_to_class(
         current.semantic_generation,
         ShapeObjectKind::Class,
     ));
-    (*obj).parent_class_id = id;
+    stamp_object_shape_id_with_carrier_note(obj, id);
     debug_assert_object_shape_parity(obj);
     id
 }

@@ -46,6 +46,7 @@ mod builtin_alias_construct;
 mod class_meta;
 mod construct;
 pub(crate) use construct::scan_current_new_target_root_mut;
+pub mod decl_prototype_table;
 mod dispatch;
 mod function_prototype;
 mod gc_roots;
@@ -64,19 +65,23 @@ pub(crate) use state::{
     class_decl_prototype_value_for_instance_class, class_delete_own_dynamic_prop,
     class_dynamic_prop_root_store, class_has_own_dynamic_prop, class_id_for_decl_prototype_object,
     class_is_key_deleted, class_mark_key_deleted, class_object_value_for_cid,
-    class_object_value_root_store, class_own_enumerable_field_names, class_own_static_field_value,
-    class_parent_closure, class_parent_closure_root_store, class_prototype_method_is_enumerable,
+    class_object_value_root_store, class_own_dynamic_prop_names, class_own_enumerable_field_names,
+    class_own_static_field_value, class_own_string_member_names, class_parent_closure,
+    class_parent_closure_root_store, class_prototype_method_is_enumerable,
     class_prototype_method_set_enumerable, class_prototype_method_value_cache_root_store,
-    class_prototype_object_root_store, class_static_defined_attrs, class_static_set_defined_attrs,
-    class_unmark_key_deleted, global_object_prototype_bits,
-    is_bound_native_constructor_closure_value, is_non_constructable_builtin_function_value,
-    parent_closure_in_chain, throw_non_constructable_builtin_function,
+    class_prototype_object_root_store, class_static_defined_attrs, class_static_prototype,
+    class_static_prototype_is_nulled, class_static_prototype_root_clear,
+    class_static_prototype_root_store, class_static_set_defined_attrs, class_unmark_key_deleted,
+    global_object_prototype_bits, is_bound_native_constructor_closure_value,
+    is_non_constructable_builtin_function_value, note_class_prototype_object_registered,
+    parent_closure_in_chain, throw_non_constructable_builtin_function, CLASS_PROTOTYPE_ADDR_FILTER,
 };
 pub use state::{
     ClassVTable, VTableMethodEntry, CLASS_DECL_PROTOTYPE_OBJECTS, CLASS_DYNAMIC_PARENT_VALUE,
     CLASS_METHOD_BIND_LENGTHS, CLASS_OBJECT_VALUES, CLASS_PARENT_CLOSURES,
     CLASS_PROTOTYPE_METHOD_NONENUM, CLASS_PROTOTYPE_OBJECTS, CLASS_STATIC_ACCESSORS,
-    CLASS_STATIC_METHODS, CLASS_STATIC_METHOD_BIND_LENGTHS, CLASS_SYMBOL_ACCESSORS,
+    CLASS_STATIC_METHODS, CLASS_STATIC_METHOD_BIND_LENGTHS, CLASS_STATIC_PROTOTYPES,
+    CLASS_STRING_MEMBER_ORDERS, CLASS_SYMBOL_ACCESSORS, CLASS_SYMBOL_MEMBER_ORDERS,
     CLASS_SYMBOL_METHODS, CLASS_VTABLE_REGISTRY, FUNCTION_CLASS_IDS, REGISTERED_CLASS_IDS,
 };
 
@@ -94,11 +99,11 @@ pub(crate) use class_meta::test_text_encoding_stream_new_with_constructor;
 #[cfg(feature = "global-text")]
 pub(crate) use class_meta::text_decoder_bool_option;
 pub use class_meta::{
-    class_length_for_id, class_name_for_id, is_anon_shape_class_id, js_compression_stream_new,
-    js_decompression_stream_new, js_register_anon_shape_class_id, js_register_class_id,
-    js_register_class_length, js_register_class_name, js_text_decoder_stream_new,
-    js_text_encoder_stream_new, js_text_encoding_stream_new, ANON_SHAPE_CLASS_IDS, CLASS_LENGTHS,
-    CLASS_NAMES,
+    class_length_for_id, class_name_for_id, declared_class_outranks_anon_shape,
+    is_anon_shape_class_id, js_compression_stream_new, js_decompression_stream_new,
+    js_register_anon_shape_class_id, js_register_class_id, js_register_class_length,
+    js_register_class_name, js_text_decoder_stream_new, js_text_encoder_stream_new,
+    js_text_encoding_stream_new, ANON_SHAPE_CLASS_IDS, CLASS_LENGTHS, CLASS_NAMES,
 };
 pub(crate) use class_meta::{
     identify_global_builtin_constructor, report_dispatch_miss,
@@ -116,8 +121,8 @@ pub(crate) use prototype_methods::{
 pub(crate) use prototype_methods::{
     class_prototype_fast_guard_invalidated_for_method, class_prototype_method_guard_slot,
     class_prototype_method_root_remove, class_prototype_method_root_store,
-    invalidate_class_prototype_fast_guards_for_method, mirror_prototype_method_on_object,
-    synthetic_class_id_for_function,
+    invalidate_class_prototype_fast_guards, invalidate_class_prototype_fast_guards_for_method,
+    mirror_prototype_method_on_object, synthetic_class_id_for_function,
 };
 pub use prototype_methods::{
     js_class_register_static_field, js_get_function_prototype_method,
@@ -162,12 +167,13 @@ pub(crate) use gc_roots::{
 // ── registration.rs ─────────────────────────────────────────────────────────
 pub(crate) use registration::{
     class_accessor_function_value, class_own_accessor_ptrs, class_own_static_accessor_ptrs,
+    invalidate_class_string_member_order,
 };
 pub use registration::{
     is_class_id_registered, js_register_class_getter, js_register_class_method,
     js_register_class_method_bind_length, js_register_class_setter,
     js_register_class_static_getter, js_register_class_static_method_bind_length,
-    js_register_class_static_setter,
+    js_register_class_static_setter, js_register_class_string_member_order,
 };
 
 // ── dispatch.rs ─────────────────────────────────────────────────────────────
@@ -180,18 +186,20 @@ pub(crate) use dispatch::{
 };
 
 // ── parent_static.rs ────────────────────────────────────────────────────────
+#[cfg(test)]
+pub(crate) use parent_static::test_class_prototype_scan_count;
 pub(crate) use parent_static::{
     call_private_static_method_for_owner, call_registered_static_method, call_static_method,
     class_chain_has_instance_accessor, class_dynamic_static_accessor_descriptor,
     class_dynamic_static_accessor_getter_value, class_has_instance_getter,
-    class_has_own_static_method, class_has_symbol_member_in_chain, class_instance_setter_apply,
-    class_method_bind_length, class_object_own_field_bytes, class_object_pinned_parent,
-    class_own_symbol_accessor_ptrs, class_own_symbol_member_keys, class_own_symbol_method,
-    class_private_instance_getter_value, class_private_instance_setter_apply,
-    class_static_accessor_getter_value, class_static_accessor_setter_apply,
-    class_symbol_getter_value, class_symbol_setter_apply, get_parent_class_id,
-    lookup_class_symbol_method_in_chain, lookup_static_method_in_chain, register_class,
-    register_class_dynamic_static_accessor,
+    class_has_own_static_method, class_has_own_symbol_member, class_has_symbol_member_in_chain,
+    class_instance_setter_apply, class_method_bind_length, class_object_own_field_bytes,
+    class_object_pinned_parent, class_own_symbol_accessor_ptrs, class_own_symbol_member_keys,
+    class_own_symbol_method, class_private_instance_getter_value,
+    class_private_instance_setter_apply, class_static_accessor_getter_value,
+    class_static_accessor_setter_apply, class_symbol_getter_value, class_symbol_setter_apply,
+    get_parent_class_id, lookup_class_symbol_method_in_chain, lookup_static_method_in_chain,
+    register_class, register_class_dynamic_static_accessor,
 };
 pub use parent_static::{
     is_class_object_ptr, is_class_object_value, is_registered_class_prototype_object,

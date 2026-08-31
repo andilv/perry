@@ -1,5 +1,8 @@
+use super::decl_prototype_table::DeclPrototypeTable;
 use super::*;
-use crate::object::class_image::{ImageTable, StaticAccessorTable, StaticMethodTable};
+use crate::object::class_image::{
+    ImageTable, StaticAccessorTable, StaticMethodTable, StringMemberOrderTable,
+};
 use std::collections::HashMap;
 use std::sync::RwLock;
 
@@ -99,10 +102,21 @@ pub(crate) fn class_dynamic_prop_root_store(class_id: u32, name: &str, value: f6
         });
     }
     CLASS_DYNAMIC_PROPS.with(|m| {
-        m.borrow_mut()
+        let created = m
+            .borrow_mut()
             .entry(class_id)
             .or_default()
-            .insert(name.to_string(), value);
+            .insert(name.to_string(), value)
+            .is_none();
+        if created {
+            crate::object::CLASS_DYNAMIC_PROP_ORDER.with(|order| {
+                order
+                    .borrow_mut()
+                    .entry(class_id)
+                    .or_default()
+                    .push(name.to_string());
+            });
+        }
     });
     crate::gc::runtime_write_barrier_root_nanbox(value.to_bits());
 }
@@ -128,22 +142,37 @@ pub(crate) fn class_own_static_field_value(class_id: u32, name: &str) -> Option<
 /// here too (never reflectable). Returned unsorted; the caller applies ECMA
 /// ordering. (test262 class/elements static-field-declaration & friends.)
 pub(crate) fn class_own_enumerable_field_names(class_id: u32) -> Vec<String> {
-    CLASS_DYNAMIC_PROPS.with(|m| {
-        m.borrow()
-            .get(&class_id)
-            .map(|props| {
-                props
-                    .keys()
-                    .filter(|k| !crate::object::is_internal_runtime_key(k))
-                    // #7190: a key installed by `Object.defineProperty` without
-                    // `enumerable: true` shares this table with static fields
-                    // but is NOT enumerable.
-                    .filter(|k| !class_static_key_is_non_enumerable(class_id, k))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
-    })
+    class_own_dynamic_prop_names(class_id)
+        .into_iter()
+        // #7190: a key installed by `Object.defineProperty` without
+        // `enumerable: true` shares this table with static fields but is NOT
+        // enumerable.
+        .filter(|key| !class_static_key_is_non_enumerable(class_id, key))
+        .collect()
+}
+
+pub(crate) fn class_own_dynamic_prop_names(class_id: u32) -> Vec<String> {
+    let mut names = crate::object::CLASS_DYNAMIC_PROP_ORDER
+        .with(|order| order.borrow().get(&class_id).cloned().unwrap_or_default());
+    CLASS_DYNAMIC_PROPS.with(|props| {
+        let props = props.borrow();
+        let Some(props) = props.get(&class_id) else {
+            names.clear();
+            return;
+        };
+        names.retain(|name| props.contains_key(name));
+        // Registries populated by older/native paths may predate the order
+        // side table. Keep those visible with a deterministic fallback.
+        let mut missing: Vec<String> = props
+            .keys()
+            .filter(|name| !names.contains(name))
+            .cloned()
+            .collect();
+        missing.sort();
+        names.extend(missing);
+    });
+    names.retain(|key| !crate::object::is_internal_runtime_key(key));
+    names
 }
 
 /// #7190: record a `defineProperty`-installed static key's attributes. Called
@@ -193,6 +222,11 @@ pub(crate) fn class_delete_own_dynamic_prop(class_id: u32, name: &str) {
     CLASS_DYNAMIC_PROPS.with(|m| {
         if let Some(props) = m.borrow_mut().get_mut(&class_id) {
             props.remove(name);
+        }
+    });
+    crate::object::CLASS_DYNAMIC_PROP_ORDER.with(|order| {
+        if let Some(names) = order.borrow_mut().get_mut(&class_id) {
+            names.retain(|existing| existing != name);
         }
     });
 }
@@ -259,6 +293,12 @@ pub static CLASS_STATIC_METHODS: ImageTable<RwLock<Option<StaticMethodTable>>> =
 pub static CLASS_STATIC_ACCESSORS: ImageTable<RwLock<Option<StaticAccessorTable>>> =
     ImageTable::new(|image| &image.static_accessors);
 
+/// Source order for public class methods/accessors. Dispatch data lives in
+/// separate hash maps by member kind; keeping this metadata alongside the
+/// image lets [[OwnPropertyKeys]] reconstruct the single ClassBody order.
+pub static CLASS_STRING_MEMBER_ORDERS: ImageTable<RwLock<Option<StringMemberOrderTable>>> =
+    ImageTable::new(|image| &image.string_member_orders);
+
 /// Spec `Function.prototype.length` per (class_id, method/accessor name) — the
 /// count of formal parameters before the first one with a default or a rest.
 /// The vtable only records the *total* param count (needed for call dispatch),
@@ -282,6 +322,12 @@ crate::perry_thread_local! {
         RwLock::new(None);
 
     pub static CLASS_SYMBOL_ACCESSORS: RwLock<Option<HashMap<(u32, usize, bool), (usize, usize)>>> =
+        RwLock::new(None);
+
+    /// Source order for Symbol-keyed class methods/accessors. Symbol member
+    /// registries are thread-local because their keys are heap addresses, so
+    /// their ordering metadata follows the same ownership model.
+    pub static CLASS_SYMBOL_MEMBER_ORDERS: RwLock<Option<HashMap<(u32, u64, bool), u32>>> =
         RwLock::new(None);
 }
 
@@ -319,6 +365,88 @@ crate::perry_thread_local! {
     pub static CLASS_PROTOTYPE_OBJECTS: RwLock<Option<HashMap<u32, usize>>> = RwLock::new(None);
 }
 
+/// Monotone address filter over the values of [`CLASS_PROTOTYPE_OBJECTS`].
+///
+/// `is_registered_class_prototype_object` answers "is this heap object some
+/// class's registered prototype?" with `map.values().any(…)` — a LINEAR SCAN,
+/// #9225 — and the caller that asks it is
+/// `descriptor_state::disable_inline_guards_for_descriptor_target`, which runs
+/// on every `Object.defineProperty`. esbuild's `__export(exports, { … })` makes
+/// that thousands of calls per bundle: on `claude-code --help` the probe is
+/// called 26,290 times, answers `true` **122** times, and costs **0.46%** of
+/// the run — roughly 1,200 instructions per call, which is the scan.
+///
+/// A monotone `[lo, hi]` window cannot help here: prototypes are ordinary
+/// GC-heap objects interleaved with everything else, and replaying the real
+/// argument stream against the window the registrations build rejects only
+/// 54.0%. The same replay against this filter rejects **99.05%** (26,041 of
+/// 26,290; 122 genuine `true` answers preserved, 127 false positives), and it
+/// rejects them before the thread-local resolution, the `RwLock` and the scan.
+///
+/// Rejecting is sound because every route that puts an address into the map
+/// admits it here first — see [`note_class_prototype_object_registered`] — and
+/// removals never clear bits, which only makes the filter weaker, never wrong.
+/// The completeness of that writer set is machine-checked rather than
+/// enumerated: see the probe.
+///
+/// This does not close #9225. A false positive still pays the scan, so the
+/// table's O(n) slope survives at ~1% of its strength; the O(1) inverse index
+/// #9225 asks for is still the right structural fix, and this filter sits in
+/// front of it either way.
+pub(crate) static CLASS_PROTOTYPE_ADDR_FILTER: crate::registry_latch::RegistryAddrFilter =
+    crate::registry_latch::RegistryAddrFilter::new();
+
+/// Admit `addr` into [`CLASS_PROTOTYPE_ADDR_FILTER`].
+///
+/// EVERY route that stores an address into [`CLASS_PROTOTYPE_OBJECTS`] must
+/// call this **before** the address becomes findable — the insert below, the
+/// two GC root scanners and the per-slot GC step (all of which rewrite stored
+/// addresses through `visit_usize_slot`), and the test seeds. A route that
+/// forgets does not crash: the probe reports a live prototype as "not a
+/// prototype", so `getOwnPropertyDescriptor(C.prototype, …)` and the
+/// descriptor-guard disable silently change behaviour. The debug-build audit in
+/// the probe exists to turn that into a test failure.
+///
+/// The GC scanners admit AFTER the visitor rewrites the slot, which is still
+/// "before it is findable": they hold the table's write guard across both, so
+/// no reader can observe the new address until the guard drops.
+#[inline]
+pub(crate) fn note_class_prototype_object_registered(addr: usize) {
+    CLASS_PROTOTYPE_ADDR_FILTER.admit(addr);
+}
+
+crate::perry_thread_local! {
+    /// The CONSTRUCTOR's `[[Prototype]]`, set by `Object.setPrototypeOf(Ctor, obj)`
+    /// on a declared class (perry represents those as INT32 ClassRefs, not heap
+    /// Function objects, so they have no closure prototype slot to write).
+    ///
+    /// Deliberately its own table. `CLASS_PROTOTYPE_OBJECTS` means "the object
+    /// INSTANCES of this class inherit from", and the method-dispatch and
+    /// field-read walks read it for exactly that purpose — parking a
+    /// constructor-side link there makes `new Ctor()` inherit the constructor's
+    /// statics and makes prototype-method mirroring write into the user's
+    /// object. Only the static-side lookups consult this table:
+    /// `js_object_get_field_by_name`'s ClassRef arm, the generic `in` presence
+    /// walk, static method dispatch, and `Object.getPrototypeOf`.
+    ///
+    /// Effect's `Schema.Opaque` is the motivating shape (`Schema.ts:1887`,
+    /// `:5874`): `class Opaque {}; Object.setPrototypeOf(Opaque, schema)`, then
+    /// `class Partial extends Opaque {}` reads `Partial.ast` through the chain.
+    ///
+    /// Stored as `usize` for the same Send + Sync reason as the tables above.
+    pub static CLASS_STATIC_PROTOTYPES: RwLock<Option<HashMap<u32, usize>>> = RwLock::new(None);
+}
+
+crate::perry_thread_local! {
+    /// Class ids whose constructor `[[Prototype]]` was explicitly set to `null`
+    /// (`Object.setPrototypeOf(Ctor, null)`). Absence from CLASS_STATIC_PROTOTYPES
+    /// alone cannot express this: "never linked" must still report the default
+    /// `Function.prototype`, while an explicit null must report `null`. Holds
+    /// class ids only, so the collector has nothing to trace here.
+    pub static CLASS_STATIC_PROTOTYPE_NULLED: RwLock<Option<std::collections::HashSet<u32>>> =
+        RwLock::new(None);
+}
+
 crate::perry_thread_local! {
     /// Lazily materialized `Class.prototype` objects for declared ES classes.
     /// These are separate from `CLASS_PROTOTYPE_OBJECTS`: that older table is
@@ -326,7 +454,7 @@ crate::perry_thread_local! {
     /// inheritance shortcuts. Declared class prototypes need stable heap identity
     /// for `typeof C.prototype`, `Object.getPrototypeOf(new C())`, and
     /// `C.prototype.isPrototypeOf(instance)` without perturbing those paths.
-    pub static CLASS_DECL_PROTOTYPE_OBJECTS: RwLock<Option<HashMap<u32, usize>>> = RwLock::new(None);
+    pub static CLASS_DECL_PROTOTYPE_OBJECTS: RwLock<Option<DeclPrototypeTable>> = RwLock::new(None);
 }
 
 crate::perry_thread_local! {
@@ -459,6 +587,9 @@ pub(crate) fn class_prototype_object_root_store(class_id: u32, proto_ptr: *mut O
     if class_id == 0 || proto_ptr.is_null() {
         return;
     }
+    // Admit before the insert, so the address is never in the map while the
+    // filter still rejects it. See `note_class_prototype_object_registered`.
+    note_class_prototype_object_registered(proto_ptr as usize);
     CLASS_PROTOTYPE_OBJECTS.with(|table| {
         let mut guard = table.write().unwrap();
         if guard.is_none() {
@@ -469,16 +600,88 @@ pub(crate) fn class_prototype_object_root_store(class_id: u32, proto_ptr: *mut O
     crate::gc::runtime_write_barrier_root_raw_ptr(proto_ptr);
 }
 
+pub(crate) fn class_static_prototype_root_store(class_id: u32, proto_ptr: *mut ObjectHeader) {
+    if class_id == 0 || proto_ptr.is_null() {
+        return;
+    }
+    CLASS_STATIC_PROTOTYPES.with(|table| {
+        let mut guard = table.write().unwrap();
+        if guard.is_none() {
+            *guard = Some(HashMap::new());
+        }
+        guard.as_mut().unwrap().insert(class_id, proto_ptr as usize);
+    });
+    CLASS_STATIC_PROTOTYPE_NULLED.with(|table| {
+        if let Ok(mut guard) = table.write() {
+            if let Some(set) = guard.as_mut() {
+                set.remove(&class_id);
+            }
+        }
+    });
+    crate::gc::runtime_write_barrier_root_raw_ptr(proto_ptr);
+}
+
+pub(crate) fn class_static_prototype_root_clear(class_id: u32) {
+    if class_id == 0 {
+        return;
+    }
+    CLASS_STATIC_PROTOTYPES.with(|table| {
+        if let Ok(mut guard) = table.write() {
+            if let Some(map) = guard.as_mut() {
+                map.remove(&class_id);
+            }
+        }
+    });
+    CLASS_STATIC_PROTOTYPE_NULLED.with(|table| {
+        let mut guard = table.write().unwrap();
+        if guard.is_none() {
+            *guard = Some(std::collections::HashSet::new());
+        }
+        guard.as_mut().unwrap().insert(class_id);
+    });
+}
+
+/// True when `Object.setPrototypeOf(Ctor, null)` explicitly severed the
+/// constructor's prototype chain, as opposed to never having linked one.
+pub(crate) fn class_static_prototype_is_nulled(class_id: u32) -> bool {
+    if class_id == 0 {
+        return false;
+    }
+    let class_id = crate::object::class_generic_origin(class_id).unwrap_or(class_id);
+    CLASS_STATIC_PROTOTYPE_NULLED.with(|table| {
+        table
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|set| set.contains(&class_id)))
+            .unwrap_or(false)
+    })
+}
+
+/// The constructor-side `[[Prototype]]` recorded for `class_id`, or null.
+pub(crate) fn class_static_prototype(class_id: u32) -> *mut ObjectHeader {
+    if class_id == 0 {
+        return std::ptr::null_mut();
+    }
+    let class_id = crate::object::class_generic_origin(class_id).unwrap_or(class_id);
+    CLASS_STATIC_PROTOTYPES.with(|table| {
+        if let Ok(read) = table.read() {
+            if let Some(map) = read.as_ref() {
+                return map.get(&class_id).copied().unwrap_or(0) as *mut ObjectHeader;
+            }
+        }
+        std::ptr::null_mut()
+    })
+}
+
 pub(crate) fn class_decl_prototype_object_root_store(class_id: u32, proto_ptr: *mut ObjectHeader) {
     if class_id == 0 || proto_ptr.is_null() {
         return;
     }
     CLASS_DECL_PROTOTYPE_OBJECTS.with(|table| {
         let mut guard = table.write().unwrap();
-        if guard.is_none() {
-            *guard = Some(HashMap::new());
-        }
-        guard.as_mut().unwrap().insert(class_id, proto_ptr as usize);
+        guard
+            .get_or_insert_with(DeclPrototypeTable::default)
+            .insert(class_id, proto_ptr as usize);
     });
     crate::gc::runtime_write_barrier_root_raw_ptr(proto_ptr);
 }
@@ -531,22 +734,23 @@ pub(crate) fn parent_closure_in_chain(class_id: u32) -> Option<usize> {
 
 /// Reverse lookup: which declared class's `.prototype` is this heap object?
 /// Used by `Object.getOwnPropertyDescriptor(C.prototype, name)` to surface
-/// vtable accessors as own properties of the prototype object. Linear scan —
-/// the table is small (one entry per materialized declared-class prototype)
-/// and this only runs on the reflection slow path.
+/// vtable accessors as own properties of the prototype object, and by
+/// `descriptor_state::disable_inline_guards_for_descriptor_target` on every
+/// `Object.defineProperty`.
+///
+/// #9180: this was a linear scan over every materialized declared-class
+/// prototype, on the strength of a "the table is small and this is a cold
+/// reflection path" comment that a bundled application falsifies twice over
+/// — it was 3.10% of `cc --help`. Callers ask about arbitrary objects, so the
+/// common case is a MISS, and a miss walked the whole table.
+/// [`DeclPrototypeTable`] carries the inverse of the map next to it and keeps
+/// the two in step by construction; see that module for why the invalidation
+/// is structural rather than enumerated.
 pub(crate) fn class_id_for_decl_prototype_object(ptr: usize) -> Option<u32> {
     if ptr == 0 {
         return None;
     }
-    CLASS_DECL_PROTOTYPE_OBJECTS.with(|table| {
-        table
-            .read()
-            .ok()?
-            .as_ref()?
-            .iter()
-            .find(|(_, &p)| p == ptr)
-            .map(|(k, _)| *k)
-    })
+    CLASS_DECL_PROTOTYPE_OBJECTS.with(|table| table.read().ok()?.as_ref()?.class_id_for(ptr))
 }
 
 /// #7757: a monomorphized specialization (`Gen$num`) must present the GENERIC's
@@ -572,7 +776,7 @@ pub(crate) fn class_decl_prototype_object(class_id: u32) -> *mut ObjectHeader {
     CLASS_DECL_PROTOTYPE_OBJECTS.with(|table| {
         if let Ok(read) = table.read() {
             if let Some(map) = read.as_ref() {
-                return map.get(&class_id).copied().unwrap_or(0) as *mut ObjectHeader;
+                return map.get(class_id).unwrap_or(0) as *mut ObjectHeader;
             }
         }
         std::ptr::null_mut()
@@ -592,8 +796,72 @@ pub(crate) fn class_decl_prototype_method_names(class_id: u32) -> Vec<String> {
             names.extend(vtable.methods.keys().cloned());
         }
     }
+    order_class_string_member_names(class_id, false, &mut names);
+    names
+}
+
+fn internal_symbol_dispatch_alias(name: &str) -> bool {
+    matches!(
+        name,
+        "@@iterator"
+            | "@@asyncIterator"
+            | "@@toPrimitive"
+            | "__perry_dispose__"
+            | "__perry_async_dispose__"
+            | "__perry_inspect_custom__"
+    )
+}
+
+fn order_class_string_member_names(class_id: u32, is_static: bool, names: &mut Vec<String>) {
     names.sort();
     names.dedup();
+    let orders = CLASS_STRING_MEMBER_ORDERS.read().ok();
+    let order_for = |name: &str| {
+        orders
+            .as_ref()
+            .and_then(|guard| guard.as_ref())
+            .and_then(|map| map.get(&(class_id, is_static, name.to_string())).copied())
+    };
+    // Synthetic names exist solely to keep Perry's string-based dispatch fast.
+    // A source method literally named "@@iterator" has an order registration
+    // and remains visible; an alias created for a Symbol method does not.
+    names.retain(|name| {
+        let order = order_for(name);
+        order != Some(u32::MAX) && (order.is_some() || !internal_symbol_dispatch_alias(name))
+    });
+    names.sort_by(|left, right| match (order_for(left), order_for(right)) {
+        (Some(a), Some(b)) => a.cmp(&b).then_with(|| left.cmp(right)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => left.cmp(right),
+    });
+}
+
+/// Own string-keyed methods and accessors in ClassBody definition order.
+/// The dispatch registries intentionally remain hash maps; reflection is the
+/// only consumer that needs their cross-kind ordering.
+pub(crate) fn class_own_string_member_names(class_id: u32, is_static: bool) -> Vec<String> {
+    let mut names = Vec::new();
+    if is_static {
+        if let Ok(methods) = CLASS_STATIC_METHODS.read() {
+            if let Some(map) = methods.as_ref().and_then(|all| all.get(&class_id)) {
+                names.extend(map.keys().cloned());
+            }
+        }
+        if let Ok(accessors) = CLASS_STATIC_ACCESSORS.read() {
+            if let Some(map) = accessors.as_ref().and_then(|all| all.get(&class_id)) {
+                names.extend(map.keys().cloned());
+            }
+        }
+    } else if let Ok(registry) = CLASS_VTABLE_REGISTRY.read() {
+        if let Some(vtable) = registry.as_ref().and_then(|all| all.get(&class_id)) {
+            names.extend(vtable.methods.keys().cloned());
+            names.extend(vtable.getters.keys().cloned());
+            names.extend(vtable.setters.keys().cloned());
+        }
+    }
+    names.retain(|name| !name.starts_with('#'));
+    order_class_string_member_names(class_id, is_static, &mut names);
     names
 }
 

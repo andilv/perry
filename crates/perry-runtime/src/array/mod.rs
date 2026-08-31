@@ -13,6 +13,14 @@ mod header;
 mod header_gc_slots;
 mod immutable;
 mod indexing;
+/// Keys-array length-cap bounds tests, split out of `indexing.rs` for the
+/// 2000-line cap.
+#[cfg(test)]
+mod keys_len_cap_tests;
+/// Test-only strict-dense store helpers, split out of `indexing.rs` for the
+/// 2000-line cap.
+#[cfg(test)]
+mod strict_dense_test_helpers;
 #[cfg(test)]
 pub(crate) use indexing::test_element_accessor_calls;
 mod indexing_support;
@@ -130,8 +138,9 @@ pub use self::immutable::{
     js_array_with, js_arraylike_copy_within,
 };
 pub(crate) use self::indexing::{
-    array_has_own_index, array_iteration_is_exotic, array_iteration_is_exotic_resolved,
-    array_prototype_has_index_flag, array_spec_get, array_spec_has_index, array_spec_set,
+    array_custom_prototype, array_has_own_index, array_iteration_is_exotic,
+    array_iteration_is_exotic_resolved, array_prototype_has_index_flag, array_spec_get,
+    array_spec_has_index, array_spec_set,
 };
 pub use self::indexing::{
     js_array_get_element, js_array_get_element_f64, js_array_get_f64, js_array_get_f64_unchecked,
@@ -168,7 +177,9 @@ pub use self::iterator::{
     js_array_spread_append, js_for_of_to_array, js_get_async_iterator, js_iterator_to_array,
 };
 pub use self::join::{js_array_join, js_array_join_value};
-pub use self::numeric_range::{js_array_numeric_range_add, js_array_numeric_range_add_len};
+pub use self::numeric_range::{
+    js_array_fill_range_strided_tagged, js_array_numeric_range_add, js_array_numeric_range_add_len,
+};
 pub use self::prototype_addr::scan_prototype_addr_cache_roots_mut;
 pub(crate) use self::prototype_addr::{
     array_prototype_addr, object_prototype_addr, object_prototype_addr_matches,
