@@ -729,8 +729,11 @@ fn int32_producing_deps(
             deps.insert(*id);
             true
         }
+        // Only `| 0` is a signed-i32-producing ToInt32. `>>> 0` yields the
+        // UNSIGNED [0, 2^32) range (u32), which cannot round-trip through a
+        // signed i32 slot — see the seeders' `is_ushr_zero` exclusion.
         Expr::Binary { op, right, .. }
-            if matches!(op, BinaryOp::BitOr | BinaryOp::UShr)
+            if matches!(op, BinaryOp::BitOr)
                 && matches!(right.as_ref(), Expr::Integer(0)) =>
         {
             true
@@ -754,6 +757,8 @@ fn int32_producing_deps(
                 false
             }
         }
+        // The remaining bitwise ops are all signed-i32-producing (ToInt32 on
+        // their operands). `UShr`/`>>>` is the sole unsigned-result op.
         Expr::Binary { op, .. } => matches!(
             op,
             BinaryOp::BitAnd
@@ -761,7 +766,6 @@ fn int32_producing_deps(
                 | BinaryOp::BitXor
                 | BinaryOp::Shl
                 | BinaryOp::Shr
-                | BinaryOp::UShr
         ),
         Expr::LocalGet(id) if candidates.contains(id) => {
             deps.insert(*id);
@@ -1050,8 +1054,11 @@ pub fn is_int32_producing_expr(
         // `let x = 3000000000` that the syntactic seed now rejects.
         Expr::Integer(n) => super::i32_locals::integer_literal_fits_i32(*n),
         Expr::Update { .. } => true,
+        // Only `| 0` is a signed-i32-producing ToInt32. `>>> 0` yields the
+        // UNSIGNED [0, 2^32) range (u32), which cannot round-trip through a
+        // signed i32 slot — see the seeders' `is_ushr_zero` exclusion.
         Expr::Binary { op, right, .. }
-            if matches!(op, BinaryOp::BitOr | BinaryOp::UShr)
+            if matches!(op, BinaryOp::BitOr)
                 && matches!(right.as_ref(), Expr::Integer(0)) =>
         {
             true
@@ -1082,6 +1089,8 @@ pub fn is_int32_producing_expr(
                 false
             }
         }
+        // The remaining bitwise ops are all signed-i32-producing (ToInt32 on
+        // their operands). `UShr`/`>>>` is the sole unsigned-result op.
         Expr::Binary { op, .. } => matches!(
             op,
             BinaryOp::BitAnd
@@ -1089,7 +1098,6 @@ pub fn is_int32_producing_expr(
                 | BinaryOp::BitXor
                 | BinaryOp::Shl
                 | BinaryOp::Shr
-                | BinaryOp::UShr
         ),
         Expr::LocalGet(id) => known_int_locals.contains(id),
         Expr::MathImul(_, _) => true, // Math.imul always returns i32
