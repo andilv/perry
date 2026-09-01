@@ -931,6 +931,10 @@ pub(super) fn compile_function(
         &spec_i32_params,
         &spec_numeric_params,
         &spec_number_array_params,
+        // #9363: module-scope bindings whose CONSTRUCTION (not annotation)
+        // proves a numeric typed-array/Uint8Array kind, so `g[i]` off one is
+        // Number-or-`undefined` exactly as a body-local `const` view is.
+        &cross_module.module_global_proven_types,
     );
 
     // A Number-by-construction local cannot ever hold a GC pointer, so it
@@ -1047,6 +1051,7 @@ pub(super) fn compile_function(
         inline_ctor_return: Vec::new(),
         new_target_stack: Vec::new(),
         class_stack: Vec::new(),
+        in_static_member: false,
         methods,
         module_globals,
         import_function_prefixes,
@@ -1150,9 +1155,8 @@ pub(super) fn compile_function(
             .collect(),
         i32_counter_slots: spec_i32_param_slots,
         numeric_accumulator_f64_slots: HashMap::new(),
-        packed_receiver_box_slots: HashMap::new(),
-        packed_receiver_refresh: Vec::new(),
-        packed_receiver_handle_slots: HashMap::new(),
+        transition_cache_base_slot: None,
+        receiver_descriptors: Default::default(),
         poll_stride_counter_slot: None,
         deferred_integer_update_accumulators: HashSet::new(),
         repsel_context_allows_canonical_i32: repsel_allows,

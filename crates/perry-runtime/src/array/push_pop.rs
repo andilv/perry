@@ -203,6 +203,10 @@ pub extern "C" fn js_array_grow(arr: *mut ArrayHeader, min_capacity: u32) -> *mu
             (new_ptr as *mut u8).sub(crate::gc::GC_HEADER_SIZE) as *mut crate::gc::GcHeader;
         (*new_header)._reserved = (*old_header)._reserved;
         crate::gc::layout_transfer(arr as *mut u8, new_ptr as *mut u8);
+        // Array expandos and sparse numeric indices live in an address-keyed
+        // side table. Growth is not a collector move, so rekey it explicitly
+        // before the old address becomes a forwarding stub (#9371).
+        transfer_array_named_property_owner(arr as usize, new_ptr as usize);
         // `js_array_grow` is an allocation replacement outside the collector,
         // so GC's normal side-table rekey phase does not run. Preserve every
         // accessor/property descriptor already owned by the old array before
@@ -896,10 +900,13 @@ fn push_array_spec_path(arr: *mut ArrayHeader, value: f64) -> *mut ArrayHeader {
         crate::array::array_length_range_error();
     }
 
+    // `Array.prototype.push` step 4.d specifies `Set(O, …, true)` — the
+    // mutator's own Throw, independent of the caller's strictness (#9394).
     let next = crate::array::array_spec_set(
         arr_handle.get_raw_mut_ptr::<ArrayHeader>(),
         length,
         value_handle.get_nanbox_f64(),
+        true,
     );
     let next = clean_arr_ptr_mut(next);
     if !next.is_null() {
@@ -1575,7 +1582,9 @@ fn shift_array_spec_set(
 ) {
     let (next, post_gc) = arr_handle.across_mut::<ArrayHeader, _>(|| {
         let value = value_handle.get_nanbox_f64();
-        arr_handle.with_mut_ptr(|current| crate::array::array_spec_set(current, index, value))
+        // The mutators specify `Set(O, …, true)` regardless of the calling
+        // code's strictness (#9394).
+        arr_handle.with_mut_ptr(|current| crate::array::array_spec_set(current, index, value, true))
     });
     let next = clean_arr_ptr_mut(next);
     let current = if next.is_null() {

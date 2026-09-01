@@ -807,6 +807,7 @@ pub(super) fn compile_module_entry(
             inline_ctor_return: Vec::new(),
             new_target_stack: Vec::new(),
             class_stack: Vec::new(),
+            in_static_member: false,
             methods,
             module_globals,
             import_function_prefixes,
@@ -904,9 +905,8 @@ pub(super) fn compile_module_entry(
             element_shape_loop_facts: Vec::new(),
             i32_counter_slots: HashMap::new(),
             numeric_accumulator_f64_slots: HashMap::new(),
-            packed_receiver_box_slots: HashMap::new(),
-            packed_receiver_refresh: Vec::new(),
-            packed_receiver_handle_slots: HashMap::new(),
+            transition_cache_base_slot: None,
+            receiver_descriptors: Default::default(),
             poll_stride_counter_slot: None,
             deferred_integer_update_accumulators: HashSet::new(),
             local_slot_reps: HashMap::new(),
@@ -1046,7 +1046,31 @@ pub(super) fn compile_module_entry(
         // first microtask drain finishes promise/queueMicrotask jobs before
         // the nextTick queue, matching Node's job-within-checkpoint ordering
         // for ESM evaluation (#788). CJS-style entries keep ticks-first.
-        if !hir.imports.is_empty() || !hir.exports.is_empty() || hir.has_top_level_await {
+        //
+        // #9412: "has imports or exports" is not the same question for a
+        // CommonJS entry, because `cjs_wrap` gives every CommonJS file BOTH —
+        // a synthetic `import { createRequire as __perry_cjs_create_require }
+        // from 'node:module'` and an `export default _cjs`. So any entry
+        // containing a bare `require(` answered "ESM" here and ran its
+        // `process.nextTick` callbacks AFTER the promise queue, where Node
+        // runs a CommonJS program's ticks first. Measured against Node 26:
+        // an entry as `.cjs` prints ["tick","promise","await"], the same file
+        // as `.mjs` prints ["promise","await","tick"] — the deferral is right,
+        // it was just being applied to the wrong module kind. Every real
+        // bundle requires a builtin and every minimal fixture doesn't, so the
+        // ordering was correct in exactly the programs a test suite contains.
+        //
+        // Only this checkpoint is re-gated. `is_esm_entry` below keeps its
+        // original meaning for GlobalDeclarationInstantiation: a CommonJS
+        // module's top-level `function` declarations live inside the module
+        // wrapper and are NOT global-object properties either, so "not a
+        // Script" is the right answer there for a wrapped entry too — and
+        // that predicate is mirrored in `perry-hir`'s `lower_module_fn`,
+        // which runs before the wrap flag is knowable here.
+        let cjs_wrapped_entry = crate::collectors::is_cjs_wrapped_module(hir);
+        if (!hir.imports.is_empty() || !hir.exports.is_empty() || hir.has_top_level_await)
+            && !cjs_wrapped_entry
+        {
             ctx.block().call_void("js_mark_entry_module_esm", &[]);
         }
         // Initialize static class fields with their declared init
@@ -1248,20 +1272,37 @@ pub(super) fn compile_module_entry(
                 // we ret. Mirrors Node's "event loop drained → one
                 // beforeExit pass" semantics.
                 //
-                // We still pass `0` to the `beforeExit` emit (the #2135 test
-                // surface only pins the firing + default code); the *process*
-                // status, by contrast, now consults `process.exitCode` at the
-                // `ret` below (#6666). Explicit `process.exit(N)` bypasses this
-                // whole block via libc::_exit.
+                // `beforeExit` is emitted with the PENDING `process.exitCode`
+                // rather than a literal `0`: Node passes the code the process
+                // is about to leave with, so `process.exitCode = 5` makes a
+                // `beforeExit` listener see `5` (#9403). The *process* status
+                // likewise consults `process.exitCode` at the `ret` below
+                // (#6666).
+                //
+                // #9403: then run Node's exit sequence — emit `exit` with that
+                // same code. This is the natural-drain arm; `process.exit(N)`
+                // and the fatal uncaught-exception / unhandled-rejection paths
+                // run the identical sequence from the runtime, and the emit is
+                // one-shot so no path can double-fire it. Async work an `exit`
+                // listener schedules must not run, and does not: nothing below
+                // ticks the timer queues again.
                 ctx.current_block = exit_idx;
-                let zero_code = "0x0".to_string();
                 ctx.block()
-                    .call_void("js_process_emit_before_exit", &[(DOUBLE, &zero_code)]);
+                    .call_void("js_process_emit_before_exit_pending", &[]);
                 let _ = ctx
                     .block()
                     .call(I32, "js_promise_run_microtasks_event_loop", &[]);
+                ctx.block().call_void("js_process_run_exit_sequence", &[]);
                 ctx.block()
                     .call_void("js_process_run_finalization_exit", &[]);
+                // The one piece of async work Node DOES honour here: V8 runs a
+                // microtask checkpoint once `emit("exit")` returns to the top
+                // level, so a `.then` queued by an `exit` listener runs (after
+                // every listener) on this path — and only on this path, since
+                // `process.exit()` leaves without one. Promise jobs only: the
+                // nextTick queue and the timer queues stay dark, exactly as in
+                // Node.
+                let _ = ctx.block().call(I32, "js_promise_run_promise_jobs", &[]);
                 ctx.block().call_void("js_trace_events_flush_output", &[]);
                 // After the event loop drains, surface any still-unhandled
                 // promise rejection (Node exits non-zero; this matches the
@@ -1519,6 +1560,7 @@ pub(super) fn compile_module_entry(
             inline_ctor_return: Vec::new(),
             new_target_stack: Vec::new(),
             class_stack: Vec::new(),
+            in_static_member: false,
             methods,
             module_globals,
             import_function_prefixes,
@@ -1616,9 +1658,8 @@ pub(super) fn compile_module_entry(
             element_shape_loop_facts: Vec::new(),
             i32_counter_slots: HashMap::new(),
             numeric_accumulator_f64_slots: HashMap::new(),
-            packed_receiver_box_slots: HashMap::new(),
-            packed_receiver_refresh: Vec::new(),
-            packed_receiver_handle_slots: HashMap::new(),
+            transition_cache_base_slot: None,
+            receiver_descriptors: Default::default(),
             poll_stride_counter_slot: None,
             deferred_integer_update_accumulators: HashSet::new(),
             local_slot_reps: HashMap::new(),

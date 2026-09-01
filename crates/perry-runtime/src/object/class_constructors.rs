@@ -1051,7 +1051,15 @@ unsafe fn default_error_init_for_implicit_chain(
     args_ptr: *const f64,
     args_len: usize,
 ) {
-    if !crate::object::extends_builtin_error(class_cid) || args_ptr.is_null() || args_len == 0 {
+    if !crate::object::extends_builtin_error(class_cid) {
+        return;
+    }
+    // #9410: the dynamic replay path is a construction site like any other,
+    // so the instance gets its own lazily-formatted `stack` here — before the
+    // message guard below, which returns early for `new X()` with no argument
+    // and would otherwise leave exactly those instances trace-less.
+    crate::error::js_error_subclass_capture_stack(crate::value::js_nanbox_pointer(inst as i64));
+    if args_ptr.is_null() || args_len == 0 {
         return;
     }
     let msg = *args_ptr;
@@ -1113,6 +1121,11 @@ pub unsafe extern "C" fn js_error_subclass_default_init(
         let key = crate::string::js_string_from_bytes(b"name".as_ptr(), b"name".len() as u32);
         crate::object::js_object_set_field_by_name(inst, key, name_boxed);
     }
+    // #9410: `stack`. The synthesized standalone ctor stamps `message` and
+    // `name` but installed nothing for `stack`, so `new X("m").stack` was
+    // `undefined` for every `class X extends Error {}` with no own
+    // constructor. Last, so the getter's head sees the `name` just written.
+    crate::error::js_error_subclass_capture_stack(this_val);
 }
 
 /// Keepalive: generated code is the only caller (#6469).
@@ -1308,6 +1321,14 @@ pub(crate) unsafe fn replay_class_object_constructor(
         };
         final_args.push(v);
     }
+    // #9364: name the evaluation this constructor belongs to for the duration
+    // of the replay, so a `super()` in its body resolves THIS class object's
+    // pinned heritage rather than the template's last-wins stash. `capture_owner`
+    // is the class object that owns `ctor_ptr` — the same object whose captured
+    // environment fills the trailing cap params — so it is also the object whose
+    // heritage that constructor's `super()` means. The guard pops on unwind.
+    let _active_evaluation =
+        super::class_registry::push_active_class_evaluation(capture_owner_handle.get_nanbox_f64());
     inst_handle.with_mut_ptr::<ObjectHeader, _>(|inst| {
         let _ = call_vtable_method(
             ctor_ptr,

@@ -961,3 +961,338 @@ mod concat_chain_no_collect {
         }
     }
 }
+
+/// The short-concat memo: `"prefix" + smallint` results are content-addressed,
+/// so two evaluations producing the same bytes share one string object.
+///
+/// This asserts OBJECT IDENTITY, not equality. Equality would pass whether or
+/// not the memo fires, which would make it a test that cannot fail — the whole
+/// point is proving the allocation was skipped.
+#[test]
+fn concat_memo_returns_one_object_for_equal_results() {
+    let _lock = crate::gc::global_side_table_test_lock();
+    crate::string::concat::test_clear_concat_memo();
+
+    crate::string::concat::test_reset_memo_governor();
+    let prefix = crate::string::js_string_from_bytes(b"field_".as_ptr(), 6);
+    // #9391's doorkeeper admits a result on its SECOND sighting, so the third
+    // evaluation is the first that can share. That ordering is the point: a
+    // result seen once never costs a rooted entry.
+    let _first = crate::string::js_string_concat_value(prefix, 7.0);
+    let second = crate::string::js_string_concat_value(prefix, 7.0);
+    // A DIFFERENT prefix object with the same bytes must still reach the entry:
+    // the memo is keyed on result content, not on operand identity.
+    let other_prefix = crate::string::js_string_from_bytes(b"field_".as_ptr(), 6);
+    assert_ne!(prefix as usize, other_prefix as usize);
+    let third = crate::string::js_string_concat_value(other_prefix, 7.0);
+
+    assert_eq!(
+        second as usize, third as usize,
+        "once admitted, equal concat results must share one memoized string"
+    );
+    let first = third;
+    unsafe {
+        assert_eq!((*first).byte_len, 7);
+        // Shared, so the in-place `+=` append can never mutate it under a
+        // second holder — the property that makes sharing sound at all.
+        assert_eq!((*first).refcount, 0);
+        let bytes = std::slice::from_raw_parts(crate::string::string_data(first), 7);
+        assert_eq!(bytes, b"field_7");
+    }
+}
+
+/// Distinct results must not alias, including across the memo's hash: a
+/// collision has to degrade to a miss, never to a wrong string.
+#[test]
+fn concat_memo_never_aliases_distinct_results() {
+    let _lock = crate::gc::global_side_table_test_lock();
+    crate::string::concat::test_clear_concat_memo();
+
+    let prefix = crate::string::js_string_from_bytes(b"field_".as_ptr(), 6);
+    let mut seen: Vec<(usize, String)> = Vec::new();
+    for n in 0..40u32 {
+        let s = crate::string::js_string_concat_value(prefix, n as f64);
+        let text = unsafe {
+            let b =
+                std::slice::from_raw_parts(crate::string::string_data(s), (*s).byte_len as usize);
+            String::from_utf8_lossy(b).into_owned()
+        };
+        assert_eq!(text, format!("field_{n}"));
+        for (other_ptr, other_text) in &seen {
+            if *other_text != text {
+                assert_ne!(
+                    *other_ptr, s as usize,
+                    "distinct results {other_text} and {text} must not share an object"
+                );
+            }
+        }
+        seen.push((s as usize, text));
+    }
+}
+
+/// A non-ASCII prefix is excluded: its `utf16_len` differs from `byte_len`, so
+/// a memoized result would carry the wrong `.length`.
+#[test]
+fn concat_memo_declines_non_ascii_prefixes() {
+    let _lock = crate::gc::global_side_table_test_lock();
+    crate::string::concat::test_clear_concat_memo();
+
+    let prefix = crate::string::js_string_from_bytes("é_".as_bytes().as_ptr(), 3);
+    let a = crate::string::js_string_concat_value(prefix, 1.0);
+    let b = crate::string::js_string_concat_value(prefix, 1.0);
+    assert_ne!(
+        a as usize, b as usize,
+        "a non-ASCII prefix must not be memoized"
+    );
+    unsafe {
+        // "é_1" is 4 bytes but 3 UTF-16 units; the memo path would have
+        // asserted byte_len == utf16_len.
+        assert_eq!((*a).byte_len, 4);
+        assert_eq!((*a).utf16_len, 3);
+    }
+}
+
+/// #9391: the memo must stop PROBING when it stops paying.
+///
+/// `bench_gc_pressure` builds half a million distinct `"item_" + i` strings.
+/// Before the governor the memo probed every one of them for six hits, and the
+/// probe alone — buffer assembly plus hashing — cost the row 21 ms against
+/// 12 ms with the memo compiled out.
+///
+/// This asserts the governor's DECISION, not a wall-clock number: a timing
+/// test here would be noise-sensitive and would not say why it failed.
+#[test]
+fn concat_memo_governor_disables_itself_when_nothing_hits() {
+    crate::string::concat::test_reset_memo_governor();
+    assert!(
+        crate::string::concat::test_memo_enabled(),
+        "governor starts enabled"
+    );
+
+    // One full window of candidates, none of which hit.
+    let window = crate::string::concat::test_memo_window();
+    for _ in 0..window {
+        crate::string::concat::test_memo_should_probe();
+    }
+    assert!(
+        !crate::string::concat::test_memo_enabled(),
+        "a window with no hits must turn the probe off"
+    );
+}
+
+/// The other half: a workload that DOES hit keeps the memo on, so the governor
+/// cannot silently disable the case the memo exists for
+/// (`bench_object_property`, which hits 211,960 times out of 212,000).
+#[test]
+fn concat_memo_governor_stays_on_when_hits_are_frequent() {
+    crate::string::concat::test_reset_memo_governor();
+    let window = crate::string::concat::test_memo_window();
+    for _ in 0..window {
+        crate::string::concat::test_memo_should_probe();
+        crate::string::concat::test_memo_note_hit();
+    }
+    assert!(
+        crate::string::concat::test_memo_enabled(),
+        "a window that hits every time must keep the probe on"
+    );
+}
+
+/// And it recovers: a backoff always expires into a probation window, so a
+/// program whose first phase misses and whose second phase hits is picked up
+/// rather than left permanently disabled.
+#[test]
+fn concat_memo_governor_recovers_after_backoff() {
+    crate::string::concat::test_reset_memo_governor();
+    let window = crate::string::concat::test_memo_window();
+    for _ in 0..window {
+        crate::string::concat::test_memo_should_probe();
+    }
+    assert!(!crate::string::concat::test_memo_enabled());
+
+    // Serving the backoff out must eventually re-enable. The exact number of
+    // windows is a tuning detail; that it terminates is the contract.
+    let mut windows = 0;
+    while !crate::string::concat::test_memo_enabled() && windows < 8 {
+        for _ in 0..window {
+            crate::string::concat::test_memo_should_probe();
+        }
+        windows += 1;
+    }
+    assert!(
+        crate::string::concat::test_memo_enabled(),
+        "backoff must expire into a probation window, got stuck for {windows} windows"
+    );
+}
+
+/// #9409: `split("")` cuts at UTF-16 CODE UNIT boundaries, so an astral
+/// character yields TWO parts — a high and a low surrogate, each stored as
+/// WTF-8 and flagged, exactly as `charAt` already returns them.
+mod split_empty_delimiter_code_units {
+    use super::*;
+
+    fn parts(source: &str, limit: i32) -> Vec<Vec<u8>> {
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let s = scope.root_string_ptr(js_string_from_bytes(source.as_ptr(), source.len() as u32));
+        let empty = scope.root_string_ptr(js_string_from_bytes(b"".as_ptr(), 0));
+        let arr = s.with_const_ptr::<StringHeader, _>(|s| {
+            empty.with_const_ptr::<StringHeader, _>(|e| {
+                crate::string::js_string_split_n(s, e, limit)
+            })
+        });
+        // `split` stores NaN-boxed string pointers with STRING_TAG; the mask is
+        // how the existing split tests read one back.
+        const POINTER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+        unsafe {
+            (0..crate::array::js_array_length(arr) as usize)
+                .map(|i| {
+                    let part = (crate::array::js_array_get_f64(arr, i as u32).to_bits()
+                        & POINTER_MASK) as *const StringHeader;
+                    std::slice::from_raw_parts(
+                        crate::string::string_data(part),
+                        (*part).byte_len as usize,
+                    )
+                    .to_vec()
+                })
+                .collect()
+        }
+    }
+
+    fn flags_of(source: &str, index: usize) -> u32 {
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let s = scope.root_string_ptr(js_string_from_bytes(source.as_ptr(), source.len() as u32));
+        let empty = scope.root_string_ptr(js_string_from_bytes(b"".as_ptr(), 0));
+        let arr = s.with_const_ptr::<StringHeader, _>(|s| {
+            empty.with_const_ptr::<StringHeader, _>(|e| crate::string::js_string_split_n(s, e, -1))
+        });
+        const POINTER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+        unsafe {
+            let part = (crate::array::js_array_get_f64(arr, index as u32).to_bits() & POINTER_MASK)
+                as *const StringHeader;
+            (*part).flags as u32
+        }
+    }
+
+    #[test]
+    fn an_astral_character_splits_into_its_two_surrogate_halves() {
+        assert_eq!(
+            parts("😀", -1),
+            [vec![0xED, 0xA0, 0xBD], vec![0xED, 0xB8, 0x80]]
+        );
+        assert_eq!(
+            parts("a😀b", -1),
+            [
+                b"a".to_vec(),
+                vec![0xED, 0xA0, 0xBD],
+                vec![0xED, 0xB8, 0x80],
+                b"b".to_vec()
+            ]
+        );
+    }
+
+    /// Each half must carry `HAS_LONE_SURROGATES`, or `isWellFormed()` and
+    /// `JSON.stringify` would treat a broken half as valid text.
+    #[test]
+    fn each_half_is_flagged_as_a_lone_surrogate() {
+        assert_ne!(flags_of("😀", 0) & STRING_FLAG_HAS_LONE_SURROGATES, 0);
+        assert_ne!(flags_of("😀", 1) & STRING_FLAG_HAS_LONE_SURROGATES, 0);
+        // A BMP part is untouched by the change and stays unflagged.
+        assert_eq!(flags_of("é", 0) & STRING_FLAG_HAS_LONE_SURROGATES, 0);
+    }
+
+    /// `limit` counts code units, so it can stop between the halves of one
+    /// character — `"😀".split("", 1)` is a one-element array holding the lone
+    /// high surrogate.
+    #[test]
+    fn limit_counts_code_units_and_may_cut_a_pair() {
+        assert_eq!(parts("😀", 1), [vec![0xED, 0xA0, 0xBD]]);
+        assert_eq!(
+            parts("😀", 2),
+            [vec![0xED, 0xA0, 0xBD], vec![0xED, 0xB8, 0x80]]
+        );
+        assert_eq!(parts("a😀b", 2), [b"a".to_vec(), vec![0xED, 0xA0, 0xBD]]);
+        assert_eq!(parts("😀", 0).len(), 0);
+    }
+
+    /// BMP text, lone surrogates already in the payload, and the empty string
+    /// keep their pre-#9409 answers: the change is confined to 4-byte
+    /// sequences.
+    #[test]
+    fn non_astral_payloads_are_unchanged() {
+        assert_eq!(
+            parts("abc", -1),
+            [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]
+        );
+        assert_eq!(
+            parts("é漢", -1),
+            ["é".as_bytes().to_vec(), "漢".as_bytes().to_vec()]
+        );
+        assert_eq!(parts("", -1).len(), 0);
+    }
+
+    fn scalar_part(source: &str, index: i32) -> Vec<u8> {
+        const POINTER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let s = scope.root_string_ptr(js_string_from_bytes(source.as_ptr(), source.len() as u32));
+        let empty = scope.root_string_ptr(js_string_from_bytes(b"".as_ptr(), 0));
+        let value = s.with_const_ptr::<StringHeader, _>(|s| {
+            empty.with_const_ptr::<StringHeader, _>(|e| {
+                crate::string::split::js_string_split_part_value(s, e, index)
+            })
+        });
+        let part = (value.to_bits() & POINTER_MASK) as *const StringHeader;
+        unsafe {
+            std::slice::from_raw_parts(crate::string::string_data(part), (*part).byte_len as usize)
+                .to_vec()
+        }
+    }
+
+    fn scalar_part_len(source: &str, index: i32) -> f64 {
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let s = scope.root_string_ptr(js_string_from_bytes(source.as_ptr(), source.len() as u32));
+        let empty = scope.root_string_ptr(js_string_from_bytes(b"".as_ptr(), 0));
+        s.with_const_ptr::<StringHeader, _>(|s| {
+            empty.with_const_ptr::<StringHeader, _>(|e| {
+                crate::string::split::js_string_split_part_utf16_length(s, e, index)
+            })
+        })
+    }
+
+    /// The two scalar-replacement fast paths answer `split("")[k]` and
+    /// `split("")[k].length` WITHOUT building the array, so they need the same
+    /// code-unit indexing or a scalar-replaced read would disagree with the
+    /// array form of the identical expression.
+    #[test]
+    fn the_scalar_fast_paths_index_the_same_code_units() {
+        assert_eq!(scalar_part("a\u{1F600}b", 0), b"a".to_vec());
+        assert_eq!(scalar_part("a\u{1F600}b", 1), vec![0xED, 0xA0, 0xBD]);
+        assert_eq!(scalar_part("a\u{1F600}b", 2), vec![0xED, 0xB8, 0x80]);
+        assert_eq!(scalar_part("a\u{1F600}b", 3), b"b".to_vec());
+        for index in 0..4 {
+            assert_eq!(scalar_part_len("a\u{1F600}b", index), 1.0, "index {index}");
+            assert_eq!(
+                scalar_part("a\u{1F600}b", index),
+                parts("a\u{1F600}b", -1)[index as usize],
+                "index {index} must match the array form"
+            );
+        }
+        assert_eq!(scalar_part_len("a\u{1F600}b", 4), 0.0);
+    }
+
+    /// A malformed payload (a `Buffer`/FFI slice cut mid-sequence) reports 0
+    /// UTF-16 units for its stray lead byte. It still has to come back as its
+    /// own part, or split/join would silently drop bytes — the #6085 guarantee.
+    #[test]
+    fn a_malformed_lead_byte_is_still_its_own_part() {
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let bytes = [0x80u8, b'|', 0xF0];
+        let s = scope.root_string_ptr(js_string_from_wtf8_bytes(
+            bytes.as_ptr(),
+            bytes.len() as u32,
+        ));
+        let empty = scope.root_string_ptr(js_string_from_bytes(b"".as_ptr(), 0));
+        let arr = s.with_const_ptr::<StringHeader, _>(|s| {
+            empty.with_const_ptr::<StringHeader, _>(|e| crate::string::js_string_split_n(s, e, -1))
+        });
+        assert_eq!(crate::array::js_array_length(arr), 3);
+    }
+}

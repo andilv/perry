@@ -105,7 +105,7 @@ mod append;
 mod base64_codec;
 mod char_ops;
 mod compare;
-mod concat;
+pub(crate) mod concat;
 mod format;
 mod html;
 mod intern;
@@ -142,6 +142,10 @@ pub use char_ops::{
     js_string_from_code_point, js_string_from_code_point_array, js_string_index_get,
     js_string_index_get_boxed, js_string_index_to_i32, js_string_to_char_array,
 };
+// The one-UTF-16-code-unit string builder `charAt` uses. `split("")` needs the
+// same constructor: both cut a string at code-unit boundaries, so both have to
+// be able to produce a lone surrogate (#9409).
+pub(crate) use char_ops::string_from_code_unit;
 pub use compare::{
     js_string_compare, js_string_ends_with, js_string_ends_with_at, js_string_equals,
     js_string_is_well_formed, js_string_locale_compare, js_string_locale_compare_opts,
@@ -157,6 +161,7 @@ pub(crate) use compare::{
 pub use concat::{
     js_string_add_value, js_string_append_chain, js_string_concat, js_string_concat_box,
     js_string_concat_chain, js_string_concat_value, js_value_add_string, js_value_concat_string,
+    scan_concat_memo_roots, scan_concat_memo_roots_mut,
 };
 pub(crate) use format::fix_exponent_format;
 pub(crate) use format::js_format_f64;

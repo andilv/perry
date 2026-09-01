@@ -134,6 +134,12 @@ pub(crate) fn lower_index_set_fast(
     // `expr_produces_canonical_raw_f64` — the slot store may skip the
     // `js_array_numeric_value_to_raw_f64` canonicalization call entirely.
     value_is_canonical_raw_f64: bool,
+    // #9394: the assignment's own `Throw` flag (ES2024 §6.2.5.7). The guard
+    // declines exactly the receivers whose element write can be REJECTED
+    // (frozen, sealed, descriptor-bearing, prototype-sensitive), so this is
+    // the flag the fallback continuation needs to decide between a TypeError
+    // and a silent no-op.
+    assignment_strict: bool,
     feedback_site_id: &str,
 ) -> Result<()> {
     // #8583-followup: if evaluating an operand diverged — a throwing
@@ -294,9 +300,13 @@ pub(crate) fn lower_index_set_fast(
             let hdr_capacity = blk.load(I32, &cap_ptr);
             let index_nonnegative = blk.icmp_slt(I32, &idx_i32, "0");
             let index_nonnegative = blk.icmp_eq(I1, &index_nonnegative, "false");
-            let length_sane = blk.icmp_ule(I32, &hdr_length, "16000000");
             let capacity_sane = blk.icmp_ule(I32, &hdr_capacity, "16000000");
             let length_within_capacity = blk.icmp_ule(I32, &hdr_length, &hdr_capacity);
+            let index_within_capacity = blk.icmp_ult(I32, &idx_i32, &hdr_capacity);
+            // #9371: `new Array(largeLength)` intentionally has length above
+            // capacity. A store into its allocated prefix is still safe; only
+            // the boundary write needs the runtime to grow that prefix.
+            let storage_safe = blk.or(I1, &length_within_capacity, &index_within_capacity);
 
             let mut guard_ok = blk.and(I1, &is_array, &not_forwarded);
             guard_ok = blk.and(I1, &guard_ok, &integrity_clean);
@@ -312,9 +322,8 @@ pub(crate) fn lower_index_set_fast(
             }
             guard_ok = blk.and(I1, &guard_ok, &default_prototype_chain);
             guard_ok = blk.and(I1, &guard_ok, &index_nonnegative);
-            guard_ok = blk.and(I1, &guard_ok, &length_sane);
             guard_ok = blk.and(I1, &guard_ok, &capacity_sane);
-            guard_ok = blk.and(I1, &guard_ok, &length_within_capacity);
+            guard_ok = blk.and(I1, &guard_ok, &storage_safe);
             // #9237: kept exactly where it is load-bearing. The comment below
             // is about the RAW store — a `number[]` slot can genuinely receive a
             // non-number at runtime, and writing its NaN-boxed tag verbatim as a
@@ -389,6 +398,7 @@ pub(crate) fn lower_index_set_fast(
 
     ctx.current_block = guard_fallback_idx;
     {
+        let strict_flag = if assignment_strict { "1" } else { "0" };
         let fallback_box = ctx.block().call(
             DOUBLE,
             "js_typed_feedback_array_index_set_fallback_boxed",
@@ -397,6 +407,7 @@ pub(crate) fn lower_index_set_fast(
                 (DOUBLE, arr_box),
                 (DOUBLE, idx_double),
                 (DOUBLE, val_double),
+                (I32, strict_flag),
             ],
         );
         ctx.block().store(DOUBLE, &fallback_box, &slot);
@@ -754,11 +765,14 @@ pub(crate) fn lower_index_set_fast(
             "js_typed_feedback_record_fallback_call",
             &[(I64, feedback_site_id)],
         );
-        // Strict `arr[i] = v`: a frozen array's element is non-writable and a
-        // non-extensible array rejects a new index, so route to the throwing
-        // variant. (The inline fast/medium paths above are only reached for
-        // arrays with a proven dense-numeric layout, which excludes frozen /
-        // sealed / non-extensible arrays — those always fall to this call.)
+        // Growth for a receiver the guard already ACCEPTED. That guard
+        // (`plain_array_index_set_guard`) declines frozen, sealed and
+        // non-extensible arrays, descriptor-bearing arrays, and every
+        // prototype-sensitive shape — all of which take the `fallback` edge
+        // above instead — so no store reaching here can be rejected and the
+        // entry's `Throw` argument is unobservable. The strict entry is kept
+        // because it is the one that carries the fused key/policy/store
+        // path (#9394 left this arm alone deliberately).
         let new_handle = blk.call(
             I64,
             "js_array_set_f64_extend_strict",
