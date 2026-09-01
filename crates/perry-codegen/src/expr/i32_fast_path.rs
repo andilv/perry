@@ -1435,7 +1435,14 @@ fn lower_expr_native_i32(ctx: &mut FnCtx<'_>, e: &Expr) -> Result<LoweredValue> 
                 ctx.block().load(I32, &slot)
             } else {
                 let d = lower_expr(ctx, e)?;
-                ctx.block().fptosi(DOUBLE, &d, I32)
+                // #7232: a bare `fptosi f64 -> i32` on a local whose value can
+                // exceed i32::MAX (e.g. a `>>> 0` reassignment) is poison.
+                // Guard it exactly like the F64 arm above.
+                if is_known_i32_range(ctx, e) {
+                    ctx.block().toint32_fast(&d)
+                } else {
+                    ctx.block().toint32(&d)
+                }
             }
         }
         // Math.imul(a, b) → single `mul i32` instruction.
@@ -1533,8 +1540,14 @@ fn lower_expr_native_i32(ctx: &mut FnCtx<'_>, e: &Expr) -> Result<LoweredValue> 
                 // Non-clamp integer-returning helpers still route through the
                 // typed lowering decision. The callee is marked alwaysinline
                 // elsewhere, so optimized IR can still collapse this ABI bridge.
+                // Guarded like the F64 arm: a helper returning a value in
+                // [2^31, 2^32) would poison a bare fptosi.
                 let d = lower_expr(ctx, e)?;
-                ctx.block().fptosi(DOUBLE, &d, I32)
+                if is_known_i32_range(ctx, e) {
+                    ctx.block().toint32_fast(&d)
+                } else {
+                    ctx.block().toint32(&d)
+                }
             }
         }
         Expr::Uint8ArrayGet { array, index } => {
@@ -1546,9 +1559,21 @@ fn lower_expr_native_i32(ctx: &mut FnCtx<'_>, e: &Expr) -> Result<LoweredValue> 
             i32_from_indexed_get_lowered(ctx, lowered)
         }
         // Fallback for other expressions.
+        //
+        // A bare `fptosi f64 -> i32` here is LLVM poison for values outside
+        // [i32::MIN, i32::MAX] — in particular for the UNSIGNED [2^31, 2^32)
+        // range, which JS `>>>`/bitwise chains routinely produce (an array
+        // element holding a `>>> 0` result, e.g. SHA-256 state words, would
+        // collapse to 0x80000000). Mirror the guarded F64 arm above: use
+        // `toint32_fast` only when the i32-RANGE proof holds, otherwise the
+        // exact `toint32` (NaN/±Inf -> 0, i64-truncate, wrap mod 2^32).
         _ => {
             let d = lower_expr(ctx, e)?;
-            ctx.block().fptosi(DOUBLE, &d, I32)
+            if is_known_i32_range(ctx, e) {
+                ctx.block().toint32_fast(&d)
+            } else {
+                ctx.block().toint32(&d)
+            }
         }
     };
     let lowered = i32_lowered(value);
