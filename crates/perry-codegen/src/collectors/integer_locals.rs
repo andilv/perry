@@ -733,8 +733,7 @@ fn int32_producing_deps(
         // UNSIGNED [0, 2^32) range (u32), which cannot round-trip through a
         // signed i32 slot — see the seeders' `is_ushr_zero` exclusion.
         Expr::Binary { op, right, .. }
-            if matches!(op, BinaryOp::BitOr)
-                && matches!(right.as_ref(), Expr::Integer(0)) =>
+            if matches!(op, BinaryOp::BitOr) && matches!(right.as_ref(), Expr::Integer(0)) =>
         {
             true
         }
@@ -761,11 +760,7 @@ fn int32_producing_deps(
         // their operands). `UShr`/`>>>` is the sole unsigned-result op.
         Expr::Binary { op, .. } => matches!(
             op,
-            BinaryOp::BitAnd
-                | BinaryOp::BitOr
-                | BinaryOp::BitXor
-                | BinaryOp::Shl
-                | BinaryOp::Shr
+            BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::Shl | BinaryOp::Shr
         ),
         Expr::LocalGet(id) if candidates.contains(id) => {
             deps.insert(*id);
@@ -1058,8 +1053,7 @@ pub fn is_int32_producing_expr(
         // UNSIGNED [0, 2^32) range (u32), which cannot round-trip through a
         // signed i32 slot — see the seeders' `is_ushr_zero` exclusion.
         Expr::Binary { op, right, .. }
-            if matches!(op, BinaryOp::BitOr)
-                && matches!(right.as_ref(), Expr::Integer(0)) =>
+            if matches!(op, BinaryOp::BitOr) && matches!(right.as_ref(), Expr::Integer(0)) =>
         {
             true
         }
@@ -1093,11 +1087,7 @@ pub fn is_int32_producing_expr(
         // their operands). `UShr`/`>>>` is the sole unsigned-result op.
         Expr::Binary { op, .. } => matches!(
             op,
-            BinaryOp::BitAnd
-                | BinaryOp::BitOr
-                | BinaryOp::BitXor
-                | BinaryOp::Shl
-                | BinaryOp::Shr
+            BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::Shl | BinaryOp::Shr
         ),
         Expr::LocalGet(id) => known_int_locals.contains(id),
         Expr::MathImul(_, _) => true, // Math.imul always returns i32
