@@ -183,6 +183,8 @@ pub(crate) unsafe fn ordinary_to_primitive_for_toprimitive(
     } else {
         [b"valueOf", b"toString"]
     };
+    // #9445: the displaced receiver is rooted ONCE here, not once per callback.
+    let prev_this = scope.root_nanbox_f64(crate::object::js_implicit_this_get());
     for name in order {
         let recv = value_handle.get_nanbox_f64();
         let key_ptr = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
@@ -197,13 +199,13 @@ pub(crate) unsafe fn ordinary_to_primitive_for_toprimitive(
         }
         let method_handle = scope.root_nanbox_f64(method);
         let recv = value_handle.get_nanbox_f64();
-        let prev_this = crate::object::js_implicit_this_set(recv);
+        crate::object::js_implicit_this_set(recv);
         let result = crate::closure::js_native_call_value(
             method_handle.get_nanbox_f64(),
             std::ptr::null(),
             0,
         );
-        crate::object::js_implicit_this_set(prev_this);
+        crate::object::js_implicit_this_set(prev_this.get_nanbox_f64());
         if is_primitive_value(result) {
             return result;
         }
@@ -456,9 +458,10 @@ pub(crate) unsafe fn call_own_method(method: f64, receiver: f64) -> Option<f64> 
     // different value into its reserved `this` slot (an inherited or bound
     // method), exactly as the method-dispatch tower does (#1982).
     let bound = crate::closure::clone_closure_rebind_this(bits, receiver);
-    let prev_this = crate::object::js_implicit_this_set(receiver);
+    let this_scope = crate::gc::RuntimeHandleScope::new(); // #9445
+    let prev_this = this_scope.root_nanbox_f64(crate::object::js_implicit_this_set(receiver));
     let ret = crate::closure::js_native_call_value(f64::from_bits(bound), std::ptr::null(), 0);
-    crate::object::js_implicit_this_set(prev_this);
+    crate::object::js_implicit_this_set(prev_this.get_nanbox_f64());
     Some(ret)
 }
 
@@ -833,9 +836,9 @@ unsafe fn call_method_for_primitive(
     // receiver, so rebinding is a correct no-op. Mirrors #1982.
     let recv = value_handle.get_nanbox_f64();
     let bound = crate::closure::clone_closure_rebind_this(method_bits, recv);
-    let prev_this = crate::object::js_implicit_this_set(recv);
+    let prev_this = scope.root_nanbox_f64(crate::object::js_implicit_this_set(recv));
     let ret = crate::closure::js_native_call_value(f64::from_bits(bound), std::ptr::null(), 0);
-    crate::object::js_implicit_this_set(prev_this);
+    crate::object::js_implicit_this_set(prev_this.get_nanbox_f64());
     let ret_jsv = JSValue::from_bits(ret.to_bits());
     let is_primitive = ret_jsv.is_any_string()
         || ret_jsv.is_number()
@@ -888,9 +891,9 @@ unsafe fn call_function_method(
 
     let method_handle = scope.root_nanbox_f64(method);
     let bound = crate::closure::clone_closure_rebind_this(method_handle.get_nanbox_u64(), recv);
-    let prev_this = crate::object::js_implicit_this_set(recv);
+    let prev_this = scope.root_nanbox_f64(crate::object::js_implicit_this_set(recv));
     let ret = crate::closure::js_native_call_value(f64::from_bits(bound), std::ptr::null(), 0);
-    crate::object::js_implicit_this_set(prev_this);
+    crate::object::js_implicit_this_set(prev_this.get_nanbox_f64());
 
     FunctionMethodOutcome::Value(ret)
 }
@@ -1029,7 +1032,12 @@ pub extern "C" fn js_jsvalue_to_string(value: f64) -> *mut crate::string::String
         // a correctness-preserving compatibility shim for the many
         // call sites that currently expect a heap pointer.
         crate::string::js_string_materialize_to_heap(value)
-    } else if jsval.is_undefined() {
+    } else if jsval.is_undefined() || jsval.bits() == crate::value::TAG_HOLE {
+        // #9462: an empty-slot sentinel that reached a string coercion. Its
+        // bits are a NaN, so the numeric tail below rendered it "NaN"; node
+        // prints "undefined" for `String(a[i])` on an empty slot. Template
+        // interpolation and `x.toString()` both funnel through here, so this
+        // one arm covers all three spellings.
         crate::string::js_string_from_bytes(b"undefined".as_ptr(), 9)
     } else if jsval.is_null() {
         crate::string::js_string_from_bytes(b"null".as_ptr(), 4)
@@ -1041,9 +1049,11 @@ pub extern "C" fn js_jsvalue_to_string(value: f64) -> *mut crate::string::String
         }
     } else if jsval.is_int32() {
         // A registered class id shares the INT32 encoding (`Expr::ClassRef`)
-        // — `String(C)` / `"" + C` must produce function source, not the
-        // numeric id. Perry keeps no class source, so the NativeFunction
-        // form with the class name.
+        // — `String(C)` / `"" + C` must produce the class's source text, not
+        // the numeric id. #9413 gave codegen a class-source side table
+        // (`js_register_class_source`), so this is the real source when the
+        // class came from user code and the NativeFunction placeholder only
+        // for classes perry synthesized.
         let n = jsval.as_int32();
         let cid = (value.to_bits() & 0xFFFF_FFFF) as u32;
         if crate::object::is_class_id_registered(cid) {
@@ -1051,8 +1061,7 @@ pub extern "C" fn js_jsvalue_to_string(value: f64) -> *mut crate::string::String
                 let primitive = unsafe { class_ref_to_primitive(value, 2) };
                 return js_jsvalue_to_string(primitive);
             }
-            let name = crate::object::class_name_for_id(cid).unwrap_or_default();
-            let s = format!("function {name}() {{ [native code] }}");
+            let s = crate::object::class_ref_to_string(cid);
             return crate::string::js_string_from_bytes(s.as_ptr(), s.len() as u32);
         }
         let s = n.to_string();

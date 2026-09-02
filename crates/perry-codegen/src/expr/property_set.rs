@@ -42,8 +42,8 @@ use super::{
     class_field_store_layout_note_is_conforming, class_field_store_needs_layout_note,
     class_field_store_needs_string_addref, emit_jsvalue_slot_store_pointer_tested,
     emit_typed_feedback_register_site, expr_produces_non_pointer_bits_by_construction, lower_expr,
-    lower_expr_native, raw_f64_layout_fact, try_lower_pod_field_set, unbox_to_i64, FnCtx,
-    TypedFeedbackContract, TypedFeedbackKind,
+    lower_expr_native, raw_f64_layout_fact, try_lower_pod_field_set,
+    typed_feedback_emission_enabled, unbox_to_i64, FnCtx, TypedFeedbackContract, TypedFeedbackKind,
 };
 
 /// Metadata-only class candidate for the runtime-guarded plain-field store.
@@ -146,418 +146,23 @@ pub(crate) fn class_has_computed_runtime_members(ctx: &FnCtx<'_>, class_name: &s
 /// `js_object_set_field_by_name` — by-name dispatch, a `RuntimeHandleScope`,
 /// and a per-object side-table touch, for a store whose slot index is a
 /// compile-time constant. On `deeplist.ts` that one store was the benchmark.
-pub(crate) fn try_lower_sloppy_class_field_store(
-    ctx: &mut FnCtx<'_>,
-    object: &Expr,
-    property: &str,
-    value: &Expr,
-) -> Result<Option<String>> {
-    // Oversized modules full-outline the whole IC diamond into one call
-    // (#5334 lever B); that outlined runtime has no sloppy variant, so leave
-    // those modules on the unchanged path.
-    if crate::codegen::full_outline_ic_enabled() {
-        return Ok(None);
-    }
-    let Some(class_name) = receiver_class_name(ctx, object)
-        .or_else(|| guarded_declared_class_store_candidate(ctx, object))
-    else {
-        return Ok(None);
-    };
-    if class_has_computed_runtime_members(ctx, &class_name) {
-        return Ok(None);
-    }
-    // A compiled setter owns the name; never store into the slot behind it.
-    // (`class_field_global_index` also rejects accessors anywhere in the
-    // chain — this is the same check the strict arm makes first, kept so the
-    // two arms agree on which shapes are eligible.)
-    if ctx
-        .methods
-        .contains_key(&(class_name.clone(), format!("__set_{}", property)))
-    {
-        return Ok(None);
-    }
-    let Some(field_index) =
-        crate::type_analysis::class_field_global_index(ctx, &class_name, property)
-    else {
-        return Ok(None);
-    };
-    let (Some(&expected_class_id), Some(keys_global_name)) = (
-        ctx.class_ids.get(&class_name),
-        ctx.class_keys_globals.get(&class_name).cloned(),
-    ) else {
-        return Ok(None);
-    };
-    let requires_raw_f64 =
-        crate::type_analysis::class_field_declared_type(ctx, &class_name, property)
-            .as_ref()
-            .is_some_and(crate::typed_shape::type_is_raw_f64_candidate);
-    if !requires_raw_f64 {
-        return try_lower_sloppy_class_field_boxed_store(
-            ctx,
-            object,
-            property,
-            value,
-            field_index,
-            expected_class_id,
-            &keys_global_name,
-            &class_name,
-        );
-    }
-
-    // Operand order mirrors the strict class-field arm below verbatim: the
-    // assignment reference is evaluated before the RHS.
-    //
-    // #7640 section C: this used to claim the receiver's relocation across an
-    // allocating RHS was "handled by the same statepoint re-read that arm
-    // relies on". That mechanism doesn't exist — RS4GC only relocates a value
-    // that is still `ptr addrspace(1)`-typed and live across the safepoint,
-    // and `recv_box` crosses it as a plain `double` (a `bitcast`/`ptrtoint`
-    // chain, dead before the call, per `function/precise_roots.rs`). The
-    // repair is deliberately split by receiver shape:
-    //
-    //  * `object` a bare `Expr::LocalGet`/`Expr::This` — its value IS a load
-    //    out of a shadow slot, and `root_reload.rs` (#7280) re-materialises
-    //    that load (plus any pure `bitcast`/`ptrtoint`/`and`/… derived from
-    //    it) below any collection point it doesn't dominate. Unconditional
-    //    on RS4GC — it runs before either root lowering sees the IR, so it
-    //    protects shadow (`PERRY_RS4GC=0`) and native (`=1`, default)
-    //    identically. Verified: `scripts/gc_root_dominance_check.py
-    //    --stale-registers`/`--statepoints`, both lowerings, on
-    //    `test-files/test_gap_gc_class_field_receiver_rooting.ts`'s
-    //    `setRawF64`/`setBoxed`/`setViaSetter` — zero hazards.
-    //  * `object` anything else — e.g. `this.target.x = allocPoint(n).x`,
-    //    where the receiver is itself a class-field READ — cannot use that
-    //    repair: the receiver
-    //    is a `phi` over two field-get paths, not a direct shadow-slot load,
-    //    so `root_reload` has no root to re-derive from, and
-    //    `--stale-registers`' pattern match only anchors on a direct
-    //    `load double, ptr <root>` source. Confirmed by hand on this exact
-    //    shape (`Holder.setOnThis` in the test above): the field-get result
-    //    register is reused, unreloaded, after `allocPoint`'s call in the
-    //    emitted IR. `with_class_store_operands` closes exactly this residual
-    //    with an explicit operand group, while routing bare locals / `this`
-    //    through the unchanged direct path. Its own collection predicate keeps
-    //    a compound receiver with an inert RHS byte-identical too.
-    with_class_store_operands(ctx, object, value, |ctx, recv_box, val_double| {
-        // #7287: inside the fast clone of a #5093 class-field versioned loop, this
-        // store is covered by the preheader's hoisted shape check — emit the same
-        // inline plain-finite check + bare slot store the STRICT arm emits (see
-        // `lower`'s class-field arm), instead of the per-access diamond.
-        //
-        // Sound in sloppy mode for the same reason #7423 made the fast arm
-        // mode-independent: the preheader proved not-frozen, no per-receiver
-        // descriptors, matching class id and keys token, and an intact typed
-        // layout, and the loop's body is call-free so none of that can change while
-        // the clone runs. A store that reaches the raw slot could not have been
-        // *rejected* in either mode, so there is no sloppy/strict divergence to
-        // preserve. Everything else — a non-finite or NaN-boxed value — side-exits
-        // to the slow clone BEFORE storing, and the slow clone re-executes the whole
-        // iteration through this unchanged sloppy lowering.
-        if let Expr::LocalGet(recv_id) = object {
-            if let Some((fact, _)) = crate::expr::class_field_loop_fact_lookup(
-                &ctx.class_field_loop_facts,
-                *recv_id,
-                &class_name,
-                property,
-            )
-            .filter(|(_, loop_idx)| *loop_idx == field_index)
-            {
-                let obj_ptr = fact.obj_ptr.clone();
-                let side_exit_label = fact.side_exit_label.clone();
-                let store_idx = ctx.new_block("class_field_loop_store.sloppy_fast");
-                let store_label = ctx.block_label(store_idx);
-                {
-                    let blk = ctx.block();
-                    let val_bits = blk.bitcast_double_to_i64(&val_double);
-                    let finite =
-                        crate::expr::class_field_inline_guard::emit_plain_finite_number_check(
-                            blk, &val_bits,
-                        );
-                    blk.cond_br(&finite, &store_label, &side_exit_label);
-                }
-                ctx.current_block = store_idx;
-                {
-                    let header_skip =
-                        crate::target_layout::object_header_size_bytes(ctx.target_triple)
-                            .to_string();
-                    let blk = ctx.block();
-                    let fields_base = blk.gep(I8, &obj_ptr, &[(I64, &header_skip)]);
-                    let field_ptr =
-                        blk.gep(DOUBLE, &fields_base, &[(I64, &field_index.to_string())]);
-                    // No `js_array_numeric_value_to_raw_f64` canonicalization is
-                    // needed: INT32-boxed and NaN values — the only inputs it
-                    // rewrites — cannot pass the finite check above.
-                    //
-                    // GC_STORE_AUDIT(POINTER_FREE): the finite check proved
-                    // `val_double` is a genuine unboxed double, never a heap
-                    // pointer — no edge, no write barrier.
-                    blk.store(DOUBLE, &val_double, &field_ptr);
-                }
-                return Ok(Some(val_double));
-            }
-        }
-
-        let key_idx = ctx.strings.intern(property);
-        let key_handle_global = format!("@{}", ctx.strings.entry(key_idx).handle_global);
-        let field_idx_str = field_index.to_string();
-        let expected_class_id_str = expected_class_id.to_string();
-        let expected_shape_id =
-            crate::typed_shape::load_class_shape_id(ctx, &class_name, &keys_global_name);
-
-        let (obj_bits, obj_handle, key_box, val_bits) = {
-            let blk = ctx.block();
-            let obj_bits = blk.bitcast_double_to_i64(&recv_box);
-            let obj_handle = blk.and(I64, &obj_bits, POINTER_MASK_I64);
-            let key_box = blk.load(DOUBLE, &key_handle_global);
-            let val_bits = blk.bitcast_double_to_i64(&val_double);
-            (obj_bits, obj_handle, key_box, val_bits)
-        };
-
-        let fast_idx = ctx.new_block("class_field_sloppy_set.fast");
-        let merge_idx = ctx.new_block("class_field_sloppy_set.merge");
-        let fast_label = ctx.block_label(fast_idx);
-        let merge_label = ctx.block_label(merge_idx);
-
-        // Emits the shape/flags/value precheck and branches to `fast_label` on a
-        // hit; leaves `ctx.current_block` on the freshly created miss block.
-        let subclass_arms = crate::expr::class_field_inline_guard::class_field_subclass_arms(
-            ctx,
-            &class_name,
-            property,
-            field_index,
-            true,
-        );
-        let _miss_label = crate::expr::class_field_inline_guard::emit_class_field_inline_precheck(
-            ctx,
-            &obj_bits,
-            &obj_handle,
-            &expected_class_id_str,
-            &expected_shape_id,
-            true,
-            Some(&val_bits),
-            &fast_label,
-            &subclass_arms,
-        );
-
-        // Miss: the strict-aware runtime with `strict = 0`, so a rejected write
-        // stays a silent no-op exactly as sloppy `PutValue` requires.
-        {
-            let blk = ctx.block();
-            let _ = blk.call(
-                DOUBLE,
-                "js_put_value_set",
-                &[
-                    (DOUBLE, &recv_box),
-                    (DOUBLE, &key_box),
-                    (DOUBLE, &val_double),
-                    (DOUBLE, &recv_box),
-                    (I32, "0"),
-                ],
-            );
-            blk.br(&merge_label);
-        }
-
-        ctx.current_block = fast_idx;
-        {
-            // arm64_32 watchOS: the fields region starts at `size_of::<ObjectHeader>()`
-            // past the user pointer (16 on LP64 and ILP32 since #8047) —
-            // same derivation as the strict arm and the runtime setter.
-            let header_skip =
-                crate::target_layout::object_header_size_bytes(ctx.target_triple).to_string();
-            let blk = ctx.block();
-            let obj_ptr = blk.inttoptr(I64, &obj_handle);
-            let fields_base = blk.gep(I8, &obj_ptr, &[(I64, &header_skip)]);
-            let field_ptr = blk.gep(DOUBLE, &fields_base, &[(I64, &field_idx_str)]);
-            // GC_STORE_AUDIT(POINTER_FREE): a guarded raw-f64 class slot holds
-            // numbers only, and the precheck rejected every value that is not a
-            // plain finite double, so no write barrier and no layout note are due.
-            let numeric_value = canonicalize_raw_f64_numeric_store_value(blk, &val_double);
-            blk.store(DOUBLE, &numeric_value, &field_ptr);
-            blk.br(&merge_label);
-        }
-
-        ctx.current_block = merge_idx;
-        Ok(Some(val_double))
-    })
-}
-
-/// The boxed-slot half of [`try_lower_sloppy_class_field_store`] — P1 (#5094).
-///
-/// Same shape as the raw-f64 half: the #5093 inline precheck decides, a hit
-/// stores straight into the packed slot, a miss goes to `js_put_value_set(...,
-/// strict = 0)` so a rejected sloppy write stays a silent no-op.
-///
-/// # Why the precheck alone licenses a guard-free boxed store
-///
-/// `emit_class_field_inline_precheck` is a strict subset of the runtime's
-/// `class_field_fast_contract`: on a hit, the guard call would have answered
-/// "fast" too. For a SET it additionally proves the receiver is not frozen and
-/// carries no per-object descriptors, and the process-global latch it reads
-/// first is flipped by any prototype-level descriptor or accessor install. Add
-/// the `__set_<property>` refusal the caller already made, and every way a
-/// `[[Set]]` could be *rejected* or *diverted* is excluded — which is the only
-/// thing sloppy and strict `PutValue` disagree about. The value plays no part:
-/// unlike the raw-f64 arm, a boxed slot accepts any `JSValue`, so this arm
-/// passes `require_raw_f64 = false` and the plain-finite test is not emitted.
-///
-/// # GC obligations
-///
-/// All three are discharged by [`emit_jsvalue_slot_store_pointer_tested`], with
-/// the same value-side predicates the strict guarded arm computes — the write
-/// barrier (`expr_produces_non_pointer_bits_by_construction`), the layout note
-/// (`class_field_store_needs_layout_note`) and the string demote
-/// (`class_field_store_needs_string_addref`). Whatever survives those static
-/// proofs is decided by ONE live test of the stored bits (#7511), so a genuine
-/// pointer store still reaches the remembered set. Nothing here is keyed on
-/// strictness, so this arm's GC behaviour is byte-identical to the strict one.
-#[allow(clippy::too_many_arguments)]
-fn try_lower_sloppy_class_field_boxed_store(
-    ctx: &mut FnCtx<'_>,
-    object: &Expr,
-    property: &str,
-    value: &Expr,
-    field_index: u32,
-    expected_class_id: u32,
-    keys_global_name: &str,
-    class_name: &str,
-) -> Result<Option<String>> {
-    // The direct local/`this` path keeps the existing root-reload repair; the
-    // compound path gets the explicit operand root the #7640 note above says it
-    // lacked.
-    with_class_store_operands(ctx, object, value, |ctx, recv_box, val_double| {
-        // Computed before the block builder is borrowed below.
-        let barrier_needed = !expr_produces_non_pointer_bits_by_construction(ctx, value);
-        let layout_note_needed = class_field_store_needs_layout_note(ctx, value);
-        let string_addref_needed = class_field_store_needs_string_addref(ctx, value);
-
-        let key_idx = ctx.strings.intern(property);
-        let key_handle_global = format!("@{}", ctx.strings.entry(key_idx).handle_global);
-        let field_idx_str = field_index.to_string();
-        let expected_class_id_str = expected_class_id.to_string();
-        let expected_shape_id =
-            crate::typed_shape::load_class_shape_id(ctx, class_name, keys_global_name);
-
-        let (obj_bits, obj_handle, key_box, val_bits) = {
-            let blk = ctx.block();
-            let obj_bits = blk.bitcast_double_to_i64(&recv_box);
-            let obj_handle = blk.and(I64, &obj_bits, POINTER_MASK_I64);
-            let key_box = blk.load(DOUBLE, &key_handle_global);
-            let val_bits = blk.bitcast_double_to_i64(&val_double);
-            (obj_bits, obj_handle, key_box, val_bits)
-        };
-
-        let fast_idx = ctx.new_block("class_field_sloppy_set.boxed_fast");
-        let merge_idx = ctx.new_block("class_field_sloppy_set.boxed_merge");
-        let fast_label = ctx.block_label(fast_idx);
-        let merge_label = ctx.block_label(merge_idx);
-
-        // `set_value_bits` is `Some` so the not-frozen check is emitted;
-        // `require_raw_f64` is false, so the plain-finite value check is not.
-        let subclass_arms = crate::expr::class_field_inline_guard::class_field_subclass_arms(
-            ctx,
-            class_name,
-            property,
-            field_index,
-            false,
-        );
-        let _miss_label = crate::expr::class_field_inline_guard::emit_class_field_inline_precheck(
-            ctx,
-            &obj_bits,
-            &obj_handle,
-            &expected_class_id_str,
-            &expected_shape_id,
-            false,
-            Some(&val_bits),
-            &fast_label,
-            &subclass_arms,
-        );
-
-        {
-            let blk = ctx.block();
-            let _ = blk.call(
-                DOUBLE,
-                "js_put_value_set",
-                &[
-                    (DOUBLE, &recv_box),
-                    (DOUBLE, &key_box),
-                    (DOUBLE, &val_double),
-                    (DOUBLE, &recv_box),
-                    (I32, "0"),
-                ],
-            );
-            blk.br(&merge_label);
-        }
-
-        ctx.current_block = fast_idx;
-        {
-            // arm64_32 watchOS: the fields region starts at
-            // `size_of::<ObjectHeader>()` past the user pointer — same derivation
-            // as every sibling arm and the runtime setter.
-            let header_skip =
-                crate::target_layout::object_header_size_bytes(ctx.target_triple).to_string();
-            let (field_ptr, field_addr) = {
-                let blk = ctx.block();
-                let obj_ptr = blk.inttoptr(I64, &obj_handle);
-                let fields_base = blk.gep(I8, &obj_ptr, &[(I64, &header_skip)]);
-                let field_ptr = blk.gep(DOUBLE, &fields_base, &[(I64, &field_idx_str)]);
-                let field_addr = blk.ptrtoint(&field_ptr, I64);
-                (field_ptr, field_addr)
-            };
-            emit_jsvalue_slot_store_pointer_tested(
-                ctx,
-                &field_ptr,
-                &val_double,
-                &obj_handle,
-                &field_idx_str,
-                string_addref_needed,
-                layout_note_needed,
-                &obj_bits,
-                &field_addr,
-                barrier_needed,
-                class_field_store_layout_note_is_conforming(ctx, class_name, field_index),
-                "class_field_set",
-            );
-            ctx.block().br(&merge_label);
-        }
-
-        ctx.current_block = merge_idx;
-        let stored = LoweredValue {
-            semantic: SemanticKind::JsValue,
-            rep: NativeRep::JsValue,
-            llvm_ty: DOUBLE,
-            value: val_double.clone(),
-        };
-        ctx.record_lowered_value_with_access_mode(
-            "ClassFieldSet",
-            None,
-            "class_field_set.sloppy_boxed_store",
-            &stored,
-            Some(BoundsState::Guarded {
-                guard_id: "class_field_inline_precheck".to_string(),
-            }),
-            None,
-            Some(BufferAccessMode::CheckedNative),
-            None,
-            false,
-            false,
-            vec![
-                format!("field={}", property),
-                format!("field_index={}", field_idx_str),
-                "receiver_proof=inline_precheck_exact_class".to_string(),
-                "field_layout_raw_f64=false".to_string(),
-                "store_guard_failure=js_put_value_set_sloppy".to_string(),
-            ],
-        );
-        Ok(Some(val_double))
-    })
-}
+mod sloppy_class_field;
+pub(crate) use sloppy_class_field::try_lower_sloppy_class_field_store;
 
 fn lower_runtime_property_set_by_name(
     ctx: &mut FnCtx<'_>,
     object: &Expr,
     property: &str,
     value: &Expr,
+    // #9459: `js_object_set_field_by_property_id` resolves the dispatch id and
+    // hands the key to `js_object_set_field_by_name`, which has no `strict`
+    // parameter and rejects by throwing. Correct for a strict `PutValue`, wrong
+    // for sloppy.
+    assignment_strict: bool,
 ) -> Result<String> {
+    if !assignment_strict {
+        return lower_put_value_property_set_by_name(ctx, object, property, value, false);
+    }
     // #7154: root the receiver across the value's evaluation, which allocates.
     // The group re-reads it as part of emitting the store, so no register of
     // the receiver exists across the window.
@@ -574,6 +179,135 @@ fn lower_runtime_property_set_by_name(
         );
         Ok(val_double.clone())
     })
+}
+
+/// #9459 / #9495: the terminal by-name store for `Expr::PropertySet`, in BOTH
+/// modes.
+///
+/// `Set(O, P, V, Throw)` -- ordinary `[[Set]]` WITH the receiver. When the
+/// receiver has no own property, ES2024 SS10.1.9.2 (`OrdinarySetWithOwnDescriptor`)
+/// walks to the parent and lets the PARENT's descriptor decide: an inherited
+/// non-writable data property or getter-only accessor rejects, an inherited
+/// setter runs with the original receiver, and only a writable data property
+/// (or the end of the chain) creates a new own property on the receiver. The
+/// rejection is thrown iff `Throw` (SS6.2.5.7 `PutValue`,
+/// `Throw = IsStrictReference`). That is exactly
+/// `js_put_value_set(target, key, value, receiver, strict)`, the entry `o.x = v`
+/// has always used through `Expr::PutValueSet`; routing every `PropertySet`
+/// spelling here -- `o.x += 1`, `for (o.x of it)`, `[o.x] = arr` -- makes them
+/// agree with it instead of diverging by lane.
+///
+/// #9459 brought the SLOPPY half here: its old tail rejected by throwing. #9495
+/// brings the STRICT half: its old tail,
+/// `js_typed_feedback_object_set_field_by_name_fast` ->
+/// `js_object_set_field_by_name`, was an OWN-property store with no prototype
+/// walk, so a strict `o.x += 1` against an inherited setter never ran the setter,
+/// an inherited non-writable / getter-only property never threw, and an own
+/// property materialised where the spec creates none.
+///
+/// The typed-feedback `PropertySet` site moves with the store
+/// (`emit_typed_feedback_property_set_observation`): it describes the store,
+/// not the store's strictness, so both modes register it.
+///
+/// `target` and `receiver` are the same expression, evaluated ONCE -- the
+/// property reference's base is one evaluation, and `with_operands_rooted_across`
+/// hands the single lowered box to both operand slots.
+///
+/// Rooting is the #7154 window: the receiver is live across `value`'s
+/// lowering, which is arbitrary user code and can drive an evacuating minor.
+fn lower_put_value_property_set_by_name(
+    ctx: &mut FnCtx<'_>,
+    object: &Expr,
+    property: &str,
+    value: &Expr,
+    assignment_strict: bool,
+) -> Result<String> {
+    rooting::with_operands_rooted_across(
+        ctx,
+        &[object],
+        &[value],
+        |ctx| {
+            lower_value_for_dynamic_property_set(
+                ctx,
+                value,
+                "property_set.dynamic_value_bits",
+                "dynamic_property_set_helper_edge",
+            )
+        },
+        |ctx, vals, (val_double, _val_bits)| {
+            let obj_box = vals[0].clone();
+            let key_idx = ctx.strings.intern(property);
+            let key_handle_global = format!("@{}", ctx.strings.entry(key_idx).handle_global);
+            let obj_bits = ctx.block().bitcast_double_to_i64(&obj_box);
+            // `undefined.x = 1` is a TypeError in BOTH modes: `GetValue` on the
+            // base runs before `PutValue` ever consults `Throw`.
+            emit_nullish_write_guard(ctx, &obj_bits, property, "pset");
+            let key_box = ctx.block().load(DOUBLE, &key_handle_global);
+            emit_typed_feedback_property_set_observation(ctx, property, &obj_bits, |ctx| {
+                // The key is an interned heap string, so its `StringHeader*` is
+                // a mask, never an allocation.
+                let key_bits = ctx.block().bitcast_double_to_i64(&key_box);
+                ctx.block().and(I64, &key_bits, POINTER_MASK_I64)
+            });
+            let strict_flag = if assignment_strict { "1" } else { "0" };
+            let _ = ctx.block().call(
+                DOUBLE,
+                "js_put_value_set",
+                &[
+                    (DOUBLE, &obj_box),
+                    (DOUBLE, &key_box),
+                    (DOUBLE, &val_double),
+                    (DOUBLE, &obj_box),
+                    (I32, strict_flag),
+                ],
+            );
+            Ok(val_double)
+        },
+    )
+}
+
+/// #9495: the typed-feedback `PropertySet` observation for a by-name store
+/// whose tail is `js_put_value_set`.
+///
+/// The old strict tail folded the observation into a DISPATCHING wrapper
+/// (`js_typed_feedback_object_set_field_by_name_fast`), emitted in every build
+/// because it also chose between the shape-transition fast path and the
+/// by-name setter. The receiver-aware `[[Set]]` makes that choice inside
+/// `js_put_value_set`, so nothing is left for a wrapper to decide and the
+/// observation stands alone -- a pure-recording helper, compile-gated on
+/// `PERRY_TYPED_FEEDBACK` / `_TRACE` like every other one since #7480 step 4. A
+/// default build emits the bare `js_put_value_set` call and nothing else.
+///
+/// The site is always REGISTERED (a no-op call-free counter bump in a default
+/// build) so that `ic_site_counter` -- and with it every later inline-cache
+/// global name in the function -- is numbered exactly as it was when the
+/// dispatching wrapper stood here.
+///
+/// `key_raw` derives the bare `StringHeader*` the observer hashes, and is only
+/// run in an emitting build. It runs BEFORE the observe call and after nothing
+/// else, so a derivation that can allocate (an SSO key materialising onto the
+/// heap -- #7640 section D) precedes no raw receiver handle: `obj_bits` is the
+/// NaN-boxed receiver the rooting group re-read.
+pub(super) fn emit_typed_feedback_property_set_observation(
+    ctx: &mut FnCtx<'_>,
+    operation: &str,
+    obj_bits: &str,
+    key_raw: impl FnOnce(&mut FnCtx<'_>) -> String,
+) {
+    let site_id = emit_typed_feedback_register_site(
+        ctx,
+        TypedFeedbackKind::PropertySet,
+        operation,
+        TypedFeedbackContract::put_value_set(),
+    );
+    if !typed_feedback_emission_enabled() {
+        return;
+    }
+    let key_raw = key_raw(ctx);
+    ctx.block().call_void(
+        "js_typed_feedback_observe_property_set",
+        &[(I64, &site_id), (I64, obj_bits), (I64, &key_raw)],
+    );
 }
 
 fn lower_value_for_dynamic_property_set(
@@ -638,7 +372,23 @@ pub(crate) fn emit_nullish_write_guard(
     ctx.current_block = ok_idx;
 }
 
-pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
+/// Lower an `Expr::PropertySet`.
+///
+/// `assignment_strict` is the assignment's own `Throw` flag (ES2024 SS6.2.5.7
+/// `PutValue` calls `Set(O, P, V, Throw)` with `Throw = IsStrictReference`).
+/// #9459: the HIR node carries no strictness, so it comes from the caller --
+/// `ctx.is_strict_fn` for the ordinary dispatch (`expr/dispatch.rs`, the same
+/// source `Expr::IndexSet` uses since #9426), and `PutValueSet::strict` for the
+/// two routes that synthesize a `PropertySet` from a `PutValue`
+/// (`expr/proxy_reflect.rs`). A rejected SLOPPY `[[Set]]` is a silent no-op, so
+/// every arm below whose runtime entry rejects by THROWING is strict-only; the
+/// sloppy twin of each is the strictness-aware `js_put_value_set(..., 0)` that
+/// the surrounding `PutValueSet` lowering already uses for `o.x = v`.
+///
+/// #9495: the generic by-name tail is that same receiver-aware `[[Set]]` in BOTH
+/// modes (`lower_put_value_property_set_by_name`). The strict tail used to be an
+/// own-property store that skipped the prototype walk; see the helper.
+pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr, assignment_strict: bool) -> Result<String> {
     match expr {
         Expr::PropertySet {
             object,
@@ -672,7 +422,20 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // (route to js_array_set_length when the target is registered as
             // an array). Deliberately out of scope here; the static-typed
             // case covers the issue's repro.
-            if property == "length" && crate::type_analysis::is_array_expr(ctx, object) {
+            //
+            // #9459: strict only. `js_array_set_length_strict` is named for the
+            // `Throw` flag it hard-codes -- `Set(O, "length", n, true)`. A SLOPPY
+            // `arr.length` write that `OrdinarySet` rejects (frozen array, or an
+            // explicit `writable: false` on `length`) must be a silent no-op, so
+            // sloppy falls through to the generic `js_put_value_set(..., 0)` tail
+            // below. That is already where sloppy `arr.length = 0` goes today --
+            // `put_value_static_property_fast_path` refuses this arm for sloppy
+            // references (`expr/proxy_reflect.rs`), and #9422's fixture pins the
+            // result -- so the two spellings agree rather than diverging by lane.
+            if assignment_strict
+                && property == "length"
+                && crate::type_analysis::is_array_expr(ctx, object)
+            {
                 // #7637: this arm had NO store-operand guard, while every other
                 // `PropertySet` arm in this file has had one since #7154. It is
                 // the same window: `arr.length = f()` lowers the receiver first
@@ -804,6 +567,66 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     return Ok(val_double);
                 }
             }
+            // #9460: the local IS scalar-replaced, but this property has no
+            // field slot -- so there is nothing to store into, and nothing that
+            // could ever read it back.
+            //
+            // `stmt/let_stmt.rs`'s scalar-replacement arm creates slots for a
+            // synthetic `__AnonShape_*` class (an object literal) only for the
+            // fields in `non_escaping_new_used_fields`, which by design tracks
+            // READS: "writes still need their RHS evaluated for JS side effects,
+            // but the scalar slot/store can be elided when the field is never
+            // observed" (`collectors/escape_news.rs`). It then registers
+            // `ctx.locals[id]` as a DUMMY entry-block alloca that is never
+            // initialized, because the binding has stopped being an object at
+            // all, and overwrites `local_types[id]` with the synthetic class.
+            //
+            // Without this arm a slotless store fell through to the class-field /
+            // `Ptr<Shape>` lowerings below, which load that dummy slot as an
+            // `ObjectHeader*` and store through `null + <header size>` --
+            // SIGSEGV on `const o: any = {x:1}; o.x = 7;` with no later read of
+            // `o.x`, in BOTH modes. The read side has had the matching guard
+            // since the synthetic-shape work (`expr/property_get.rs`, whose
+            // comment names the same hazard: "the generic runtime helper that
+            // crashes on the dummy slot"); the write side never got it, which is
+            // why adding a `console.log(o.x)` made the crash disappear -- the
+            // read is what creates the slot.
+            //
+            // Discarding the store is what the contract above promises and is
+            // unobservable: the receiver is a non-escaping fresh literal, so no
+            // alias exists, and a read of a slotless field already answers
+            // `undefined` on the read side. The RHS is still lowered, so its side
+            // effects happen -- same shape as the `this` arm just below, which
+            // has always evaluated the value and dropped the store when the
+            // inlined constructor's target field has no slot.
+            if let Expr::LocalGet(id) = object.as_ref() {
+                if ctx.scalar_replaced.contains_key(id) {
+                    let val_double = lower_expr(ctx, value)?;
+                    let lowered = LoweredValue {
+                        semantic: SemanticKind::JsValue,
+                        rep: NativeRep::JsValue,
+                        llvm_ty: DOUBLE,
+                        value: val_double.clone(),
+                    };
+                    ctx.record_lowered_value_with_access_mode(
+                        "ScalarObjectFieldSetElided",
+                        Some(*id),
+                        "scalar_object_field_store.unobserved",
+                        &lowered,
+                        None,
+                        None,
+                        None,
+                        None,
+                        false,
+                        false,
+                        vec![
+                            format!("field={}", property),
+                            "reason=field_never_read_no_scalar_slot".to_string(),
+                        ],
+                    );
+                    return Ok(val_double);
+                }
+            }
             // Handle `this` during scalar-replaced constructor inlining:
             if let Expr::This = object.as_ref() {
                 if let Some(target_id) = ctx.scalar_ctor_target.last().copied() {
@@ -906,7 +729,13 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 if class_has_computed_runtime_members(ctx, &class_name)
                     && !ctx.is_static_class_this(object)
                 {
-                    return lower_runtime_property_set_by_name(ctx, object, property, value);
+                    return lower_runtime_property_set_by_name(
+                        ctx,
+                        object,
+                        property,
+                        value,
+                        assignment_strict,
+                    );
                 }
                 let setter_key = (class_name.clone(), format!("__set_{}", property));
                 // STATIC accessors compile under the static (no-`this`)
@@ -920,7 +749,11 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     if let Some(fn_name) = ctx.methods.get(&setter_key).cloned() {
                         if proven_class_name.is_none() {
                             return lower_runtime_property_set_by_name(
-                                ctx, object, property, value,
+                                ctx,
+                                object,
+                                property,
+                                value,
+                                assignment_strict,
                             );
                         }
                         return with_class_store_operands(
@@ -937,6 +770,37 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                             },
                         );
                     }
+                }
+                // #9459: SLOPPY code stops here. Every class-field arm below
+                // terminates in `js_class_field_set_ic` /
+                // `js_class_field_set_fallback`, whose miss path is
+                // `js_object_set_field_by_name` -- no `strict` parameter, rejects
+                // by throwing. That is the same reason
+                // `put_value_static_property_fast_path` bars sloppy references
+                // from this route for `PutValueSet` (#6542), and the recovery is
+                // the same one #7288/#5094 built for that lowering: the #5093
+                // inline precheck declines every receiver whose store could be
+                // REJECTED (frozen, descriptor-bearing, wrong class or keys token,
+                // accessor in the chain), so its fast arm is mode-independent and
+                // only its miss needed a sloppy-correct tail. A decline lands on
+                // the same `js_put_value_set(..., 0)` the generic sloppy tail uses,
+                // so the two are one behaviour with two speeds.
+                //
+                // The setter-dispatch arm above is deliberately AHEAD of this: a
+                // compiled `__set_<property>` accessor runs in both modes, and a
+                // setter that throws does so because of its own body, not because
+                // of the assignment's `Throw` flag.
+                if !assignment_strict {
+                    if matches!(object.as_ref(), Expr::LocalGet(_) | Expr::This) {
+                        if let Some(result) =
+                            try_lower_sloppy_class_field_store(ctx, object, property, value)?
+                        {
+                            return Ok(result);
+                        }
+                    }
+                    return lower_put_value_property_set_by_name(
+                        ctx, object, property, value, false,
+                    );
                 }
                 // Fast path: known class instance + plain instance field.
                 // The runtime guard checks the receiver's class/shape and
@@ -1659,72 +1523,21 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     }
                 }
             }
-            // #7154: the value expression can collect, and an evacuating minor
-            // inside it relocates the receiver out from under `obj_box` --
-            // `obj.k = f()` then writes `k` into abandoned from-space memory
-            // and the field never appears on the object the program keeps.
-            //
-            // `across` rather than the plain form because the value is lowered
-            // by `lower_value_for_dynamic_property_set` (an
-            // `ExpectedNativeRep::JsValueBits` lowering plus a recorded
-            // materialisation), which the operand list cannot produce.
-            rooting::with_operands_rooted_across(
+            // #9459 / #9495 / #9525: the generic by-name tail is the
+            // receiver-aware `[[Set]]` with the assignment's own `Throw` flag,
+            // in BOTH modes. This includes `caller` / `arguments`: their
+            // inherited poisoned accessor rejects a plain non-strict
+            // function store with `false`, and only PutValue can decide from
+            // `Throw` whether that rejection stays silent or becomes a
+            // TypeError. The by-name setter below has no `Throw` parameter and
+            // therefore remains only for strict-only specialised paths.
+            return lower_put_value_property_set_by_name(
                 ctx,
-                &[object.as_ref()],
-                &[value.as_ref()],
-                |ctx| {
-                    lower_value_for_dynamic_property_set(
-                        ctx,
-                        value,
-                        "property_set.dynamic_value_bits",
-                        "dynamic_property_set_helper_edge",
-                    )
-                },
-                |ctx, vals, (val_double, _val_bits)| {
-                    let obj_box = &vals[0];
-                    // Intern the field name in the StringPool (same one the
-                    // matching getter uses, so they share the global string).
-                    let key_idx = ctx.strings.intern(property);
-                    let key_handle_global =
-                        format!("@{}", ctx.strings.entry(key_idx).handle_global);
-                    let obj_bits = ctx.block().bitcast_double_to_i64(obj_box);
-                    emit_nullish_write_guard(ctx, &obj_bits, property, "pset");
-                    // Issue #618-followup: pass the FULL bits (including NaN-box
-                    // tag) so the runtime can detect INT32-tagged class refs
-                    // (`SQL.Aliased = Aliased` IIFE-static-property pattern from
-                    // drizzle-orm). Pre-fix the AND-with-POINTER_MASK_I64 stripped
-                    // the 0x7FFE tag, leaving the runtime with a small integer
-                    // (the class id) — which fell into the small-handle dispatch
-                    // path and silently dropped the assignment. The runtime now
-                    // checks for top16 == 0x7FFE and routes to CLASS_DYNAMIC_PROPS.
-                    let key_box = ctx.block().load(DOUBLE, &key_handle_global);
-                    let key_bits = ctx.block().bitcast_double_to_i64(&key_box);
-                    let key_raw = ctx.block().and(I64, &key_bits, POINTER_MASK_I64);
-                    if matches!(property.as_str(), "caller" | "arguments") {
-                        ctx.block().call_void(
-                            "js_object_set_field_by_name",
-                            &[(I64, &obj_bits), (I64, &key_raw), (DOUBLE, &val_double)],
-                        );
-                        return Ok(val_double);
-                    }
-                    let site_id = emit_typed_feedback_register_site(
-                        ctx,
-                        TypedFeedbackKind::PropertySet,
-                        property,
-                        TypedFeedbackContract::object_set_by_name(),
-                    );
-                    ctx.block().call_void(
-                        "js_typed_feedback_object_set_field_by_name_fast",
-                        &[
-                            (I64, &site_id),
-                            (I64, &obj_bits),
-                            (I64, &key_raw),
-                            (DOUBLE, &val_double),
-                        ],
-                    );
-                    Ok(val_double)
-                },
-            )
+                object,
+                property,
+                value,
+                assignment_strict,
+            );
         }
 
         // `obj.field` — generic object field read. We get the key string

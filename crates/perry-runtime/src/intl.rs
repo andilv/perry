@@ -91,7 +91,7 @@ pub(crate) use number_format::{
     number_format_bound_to_parts_thunk, number_format_format_getter_thunk,
     number_format_range_thunk, number_format_range_to_parts_thunk,
     number_format_resolved_options_thunk, number_format_to_parts_thunk, number_parts_from_resolved,
-    parts_to_js_array, this_intl_object,
+    number_to_locale_string, parts_to_js_array, this_intl_object,
 };
 pub(crate) use number_format_options::configure_number_format;
 pub(crate) use segmenter::{
@@ -737,19 +737,6 @@ fn rest_arg(rest: f64, index: u32) -> f64 {
     }
 }
 
-fn group_integer_digits(digits: &str, separator: char) -> String {
-    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
-    let len = digits.len();
-    for (i, ch) in digits.chars().enumerate() {
-        let from_end = len - i;
-        grouped.push(ch);
-        if from_end > 1 && from_end % 3 == 1 {
-            grouped.push(separator);
-        }
-    }
-    grouped
-}
-
 fn format_number_parts(
     value: f64,
     locale: &str,
@@ -793,7 +780,9 @@ fn format_number_parts(
     if negative {
         out.push('-');
     }
-    out.push_str(&group_integer_digits(int_part, group_sep));
+    out.push_str(&number_format::group_integer_digits_for_locale(
+        int_part, group_sep, locale,
+    ));
     if !frac_part.is_empty() {
         out.push(decimal_sep);
         out.push_str(frac_part);

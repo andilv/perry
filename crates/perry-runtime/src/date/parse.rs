@@ -16,13 +16,21 @@ use super::{make_utc_ms, time_clip, timestamp_to_local_components};
 /// accepts:
 ///   - ISO 8601: "YYYY", "YYYY-MM", "YYYY-MM-DD", with optional
 ///     "THH:MM[:SS[.sss]]" and an optional "Z" / "+HH:MM" / "-HH:MM" offset.
-///     Date-only forms are UTC; date-time forms without an offset are also
-///     treated as UTC (matching V8's ISO handling).
+///     ECMA-262 §21.4.3.2 splits the default zone on whether a TIME is
+///     present: a date-ONLY form with no offset is UTC, a date-TIME form
+///     with no offset is LOCAL wall-clock time. An explicit designator wins
+///     in both. (#9449: this comment previously claimed date-time forms
+///     were "also treated as UTC (matching V8's ISO handling)" and the code
+///     did that — wrong against both node and the spec, and the reason the
+///     behaviour looked deliberate.)
 ///   - "YYYY-MM-DD HH:MM:SS" (space separator, MySQL form).
 ///   - RFC-1123 / IETF: "Thu, 01 Jan 1970 00:00:00 GMT",
 ///     "01 Jan 1970 00:00:00 GMT" (with optional weekday and optional
 ///     trailing GMT/UTC/+offset).
 ///   - Month-name forms: "March 7, 2020", "Jan 15 2024".
+///   - #9414: the numeric slash forms node also accepts — "2026/09/01",
+///     "2026/9/1", "09/01/2026", with an optional trailing clock and zone.
+///     These are LOCAL time, not UTC (see `parse_slash_date`).
 pub(super) fn parse_date_string(s: &str) -> f64 {
     let s = s.trim();
     if s.is_empty() {
@@ -36,6 +44,9 @@ pub(super) fn parse_date_string(s: &str) -> f64 {
         return time_clip(ts);
     }
     if let Some(ts) = parse_rfc_or_named(s) {
+        return time_clip(ts);
+    }
+    if let Some(ts) = parse_slash_date(s) {
         return time_clip(ts);
     }
     f64::NAN
@@ -71,7 +82,226 @@ fn parse_tz_offset(rest: &str) -> Option<i64> {
     };
     let h: i64 = hh.parse().ok()?;
     let m: i64 = mm.parse().ok()?;
+    if h > 23 || m > 59 {
+        return None;
+    }
     Some(sign * (h * 60 + m))
+}
+
+/// V8's fixed legacy timezone-name table. These abbreviations deliberately do
+/// not consult the host timezone database: `EST` always means UTC-05:00, even
+/// for a date on which a particular location observes daylight time.
+fn named_tz_offset(token: &str) -> Option<i64> {
+    let lower = token.to_ascii_lowercase();
+    let fixed = match lower.as_str() {
+        "ut" | "utc" | "gmt" | "z" => Some(0),
+        "edt" => Some(-4 * 60),
+        "est" | "cdt" => Some(-5 * 60),
+        "cst" | "mdt" => Some(-6 * 60),
+        "mst" | "pdt" => Some(-7 * 60),
+        "pst" => Some(-8 * 60),
+        _ => None,
+    };
+    if fixed.is_some() {
+        return fixed;
+    }
+
+    // A GMT-family word may carry an attached numeric offset. V8 accepts the
+    // same spelling after a date-only form and after a clock.
+    for prefix in ["utc", "gmt", "ut", "z"] {
+        if lower.starts_with(prefix) && lower.len() > prefix.len() {
+            let rest = &token[prefix.len()..];
+            if rest.starts_with('+') || rest.starts_with('-') {
+                return parse_tz_offset(rest).filter(|offset| *offset != i64::MAX);
+            }
+        }
+    }
+    None
+}
+
+#[derive(Clone, Copy)]
+struct ParsedClock {
+    hour: i64,
+    minute: i64,
+    second: i64,
+    millis: i64,
+    attached_tz: Option<i64>,
+}
+
+fn parse_clock_digits(input: &str, index: &mut usize, min: usize, max: usize) -> Option<i64> {
+    let start = *index;
+    while *index < input.len() && *index - start < max && input.as_bytes()[*index].is_ascii_digit()
+    {
+        *index += 1;
+    }
+    if *index - start < min {
+        return None;
+    }
+    input[start..*index].parse().ok()
+}
+
+/// Parse a complete clock token and return any numeric/Z designator attached
+/// directly to it. In the ISO `T` spelling hour/minute/second fields are two
+/// digits; the whitespace-separated legacy spelling also accepts one digit.
+/// Alphabetic words are intentionally not accepted as an attached suffix —
+/// `10:30 GMT` is valid while `10:30GMT` is not.
+fn parse_clock_token(token: &str, strict_iso: bool) -> Option<ParsedClock> {
+    let mut index = 0usize;
+    let field_min = if strict_iso { 2 } else { 1 };
+    let hour = parse_clock_digits(token, &mut index, field_min, 2)?;
+    if token.as_bytes().get(index) != Some(&b':') {
+        return None;
+    }
+    index += 1;
+    let minute = parse_clock_digits(token, &mut index, field_min, 2)?;
+    let mut second = 0i64;
+    let mut millis = 0i64;
+
+    if token.as_bytes().get(index) == Some(&b':') {
+        index += 1;
+        // The legacy grammar accepts a trailing colon as an omitted seconds
+        // field (`10:30:`); ISO requires the two digits.
+        if index < token.len() && token.as_bytes()[index].is_ascii_digit() {
+            second = parse_clock_digits(token, &mut index, field_min, 2)?;
+        } else if strict_iso || index != token.len() {
+            return None;
+        }
+        if token.as_bytes().get(index) == Some(&b'.') {
+            index += 1;
+            let fraction_start = index;
+            while index < token.len() && token.as_bytes()[index].is_ascii_digit() {
+                index += 1;
+            }
+            if fraction_start == index {
+                return None;
+            }
+            millis = normalize_millis(&token[fraction_start..index]);
+        }
+    }
+
+    if minute > 59 || second > 59 {
+        return None;
+    }
+    if hour > 24 || (hour == 24 && (minute != 0 || second != 0 || millis != 0)) {
+        return None;
+    }
+
+    let attached_tz = if index == token.len() {
+        None
+    } else {
+        let rest = &token[index..];
+        if rest.eq_ignore_ascii_case("z") || rest.starts_with('+') || rest.starts_with('-') {
+            Some(parse_tz_offset(rest).filter(|offset| *offset != i64::MAX)?)
+        } else {
+            return None;
+        }
+    };
+    Some(ParsedClock {
+        hour,
+        minute,
+        second,
+        millis,
+        attached_tz,
+    })
+}
+
+/// Parse the implementation-defined tail after an ISO-shaped date when it is
+/// not the strict `T` clock. Tokens are order-independent like V8's legacy
+/// DateParser: a clock, AM/PM and a named/numeric zone may be combined, with a
+/// later zone token winning. Parenthesized comments are explicitly consumed;
+/// every other word must be recognized or the whole parse fails.
+fn parse_legacy_iso_tail(tail: &str) -> Option<(Option<ParsedClock>, Option<i64>)> {
+    let mut clock: Option<ParsedClock> = None;
+    let mut meridiem: Option<bool> = None; // true => PM
+    let mut tz_minutes_east: Option<i64> = None;
+    let mut in_comment = false;
+
+    for token in tail.split_whitespace() {
+        if in_comment {
+            if token.ends_with(')') {
+                in_comment = false;
+            }
+            continue;
+        }
+        if token.starts_with('(') {
+            if token.ends_with(')') {
+                continue;
+            }
+            if token.contains(')') {
+                return None;
+            }
+            in_comment = true;
+            continue;
+        }
+        if token.contains(['(', ')']) {
+            return None;
+        }
+
+        let lower = token.to_ascii_lowercase();
+        if lower == "am" || lower == "pm" {
+            meridiem = Some(lower == "pm");
+            continue;
+        }
+        if let Some(offset) = named_tz_offset(token) {
+            tz_minutes_east = Some(offset);
+            continue;
+        }
+        if (token.starts_with('+') || token.starts_with('-')) && clock.is_some() {
+            let offset = parse_tz_offset(token)?;
+            if offset == i64::MAX {
+                return None;
+            }
+            tz_minutes_east = Some(offset);
+            continue;
+        }
+        if let Some(parsed) = parse_clock_token(token, false) {
+            if clock.is_some() {
+                return None;
+            }
+            if let Some(offset) = parsed.attached_tz {
+                tz_minutes_east = Some(offset);
+            }
+            clock = Some(parsed);
+            continue;
+        }
+        return None;
+    }
+    if in_comment {
+        return None;
+    }
+
+    if let Some(is_pm) = meridiem {
+        let parsed = clock.as_mut()?;
+        // V8 accepts 00:xx AM as midnight, but rejects an hour above 12 when a
+        // meridiem is present.
+        if parsed.hour > 12 {
+            return None;
+        }
+        parsed.hour = if is_pm {
+            if parsed.hour == 12 {
+                12
+            } else {
+                parsed.hour + 12
+            }
+        } else if parsed.hour == 12 {
+            0
+        } else {
+            parsed.hour
+        };
+    }
+    Some((clock, tz_minutes_east))
+}
+
+/// Reinterpret an instant that was composed with `make_utc_ms` from
+/// wall-clock components as LOCAL time: subtract the host's UTC offset in
+/// effect at that instant. Shared by every grammar here that yields
+/// wall-clock components with no zone designator — the ISO date-TIME form
+/// (#9449), the RFC / month-name form and the numeric slash form (#9414).
+/// Mirrors the conversion in `js_date_new_local_components`.
+fn local_wall_clock_to_utc(base: f64) -> f64 {
+    let secs = (base as i64).div_euclid(1000);
+    let (_, _, _, _, _, _, tz_offset) = timestamp_to_local_components(secs);
+    base - (tz_offset * 1000) as f64
 }
 
 /// ISO 8601 / MySQL branch. Returns `Some(ms)` on success.
@@ -108,98 +338,74 @@ fn parse_iso8601(s: &str) -> Option<f64> {
     let mut second: i64 = 0;
     let mut millis: i64 = 0;
 
-    // Year only ("YYYY" / "±YYYYYY").
-    if s.len() == year_end {
-        return Some(make_utc_ms(
-            year,
-            month1 as i64 - 1,
-            day,
-            hour,
-            minute,
-            second,
-            millis,
-        ));
-    }
-    // Require a '-' for month.
-    if b.get(year_end) != Some(&b'-') {
-        return None;
-    }
-    if b.len() < year_end + 3 {
-        return None;
-    }
-    month1 = s[year_end + 1..year_end + 3].parse().ok()?;
-    if !(1..=12).contains(&month1) {
-        return None;
-    }
-    let mut idx = year_end + 3;
-    let mut has_day = false;
+    let mut idx = year_end;
     if b.get(idx) == Some(&b'-') {
         if b.len() < idx + 3 {
             return None;
         }
-        day = s[idx + 1..idx + 3].parse().ok()?;
-        if !(1..=31).contains(&day) {
+        month1 = s[idx + 1..idx + 3].parse().ok()?;
+        if !(1..=12).contains(&month1) {
             return None;
         }
         idx += 3;
-        has_day = true;
+        if b.get(idx) == Some(&b'-') {
+            if b.len() < idx + 3 {
+                return None;
+            }
+            day = s[idx + 1..idx + 3].parse().ok()?;
+            if !(1..=31).contains(&day) {
+                return None;
+            }
+            idx += 3;
+        }
     }
 
-    // Time part (after 'T' or ' ').
-    let mut tz_minutes_east: Option<i64> = None; // None => "no offset present"
+    // #9509: parsing the tail is explicit and exhaustive. A strict `T` clock
+    // may carry only its attached numeric/Z designator. The legacy tail used
+    // by whitespace-separated clocks and date-only zone words is tokenized;
+    // every token must be recognized.
+    let mut tz_minutes_east: Option<i64> = None;
+    let mut has_time = false;
     if idx < s.len() {
-        let sep = b[idx];
-        if sep != b'T' && sep != b' ' {
-            return None;
-        }
-        // Month-only "YYYY-MM" cannot carry a time component.
-        if !has_day {
-            return None;
-        }
-        let time_str = &s[idx + 1..];
-        // Split off a trailing zone designator. Scan for the first of
-        // 'Z', '+', '-' after the HH:MM[:SS[.sss]] body.
-        let zone_pos = time_str
-            .char_indices()
-            .find(|(i, c)| *i > 0 && (*c == 'Z' || *c == '+' || *c == '-'))
-            .map(|(i, _)| i);
-        let (clock, zone) = match zone_pos {
-            Some(p) => (&time_str[..p], &time_str[p..]),
-            None => (time_str, ""),
-        };
-        let cb = clock.as_bytes();
-        if clock.len() < 5 || cb[2] != b':' {
-            return None;
-        }
-        hour = clock[0..2].parse().ok()?;
-        minute = clock[3..5].parse().ok()?;
-        if clock.len() >= 8 && cb[5] == b':' {
-            second = clock[6..8].parse().ok()?;
-            if clock.len() > 9 && cb[8] == b'.' {
-                let frac = &clock[9..];
-                let frac_digits: String = frac.chars().take_while(|c| c.is_ascii_digit()).collect();
-                if !frac_digits.is_empty() {
-                    millis = normalize_millis(&frac_digits);
-                }
+        if b[idx] == b'T' {
+            let parsed = parse_clock_token(&s[idx + 1..], true)?;
+            hour = parsed.hour;
+            minute = parsed.minute;
+            second = parsed.second;
+            millis = parsed.millis;
+            tz_minutes_east = parsed.attached_tz;
+            has_time = true;
+        } else {
+            let tail = &s[idx..];
+            // A clock or token that follows the numeric date must either be
+            // whitespace-separated or be a directly-attached zone word.
+            if !tail.as_bytes()[0].is_ascii_whitespace()
+                && !tail.as_bytes()[0].is_ascii_alphabetic()
+            {
+                return None;
             }
-        }
-        if !zone.is_empty() {
-            match parse_tz_offset(zone) {
-                Some(v) if v == i64::MAX => {}
-                Some(v) => tz_minutes_east = Some(v),
-                None => return None,
+            let (parsed_clock, parsed_tz) = parse_legacy_iso_tail(tail)?;
+            if let Some(parsed) = parsed_clock {
+                hour = parsed.hour;
+                minute = parsed.minute;
+                second = parsed.second;
+                millis = parsed.millis;
+                has_time = true;
             }
+            tz_minutes_east = parsed_tz;
         }
     }
     let base = make_utc_ms(year, month1 as i64 - 1, day, hour, minute, second, millis);
-    // Apply zone offset: a clock with offset +HH:MM is `offset` ahead of UTC,
-    // so UTC = clock - offset.
-    let adjusted = if let Some(off) = tz_minutes_east {
-        base - (off * 60_000) as f64
-    } else {
-        base
+    let adjusted = match tz_minutes_east {
+        // An explicit `Z` / `±HH:MM` always wins: a clock with offset +HH:MM
+        // is `offset` ahead of UTC, so UTC = clock - offset.
+        Some(off) => base - (off * 60_000) as f64,
+        // #9449: no designator and a TIME present => local wall clock.
+        None if has_time => local_wall_clock_to_utc(base),
+        // No designator and no time (a date-only form) => UTC, per the spec's
+        // deliberate asymmetry. This half was already right; it must stay.
+        None => base,
     };
-    let _ = idx;
     Some(adjusted)
 }
 
@@ -335,12 +541,216 @@ fn parse_rfc_or_named(s: &str) -> Option<f64> {
     let base = make_utc_ms(y, m as i64 - 1, d, hour, minute, second, 0);
     match tz_minutes_east {
         Some(off) => Some(base - (off * 60_000) as f64),
-        None => {
-            // Local-time interpretation: subtract local tz offset at that
-            // instant (mirrors js_date_new_local_components).
-            let secs = (base as i64).div_euclid(1000);
-            let (_, _, _, _, _, _, tz_offset) = timestamp_to_local_components(secs);
-            Some(base - (tz_offset * 1000) as f64)
+        // Local-time interpretation (see `local_wall_clock_to_utc`).
+        None => Some(local_wall_clock_to_utc(base)),
+    }
+}
+
+/// Node/V8 accept a purely numeric, slash-separated date — `"2026/09/01"`,
+/// `"2026/9/1"`, `"09/01/2026"` — as the ECMA-262 §21.4.3.2
+/// "implementation-defined format". The spec deliberately says nothing about
+/// it, so this branch reproduces V8's `DateParser::DayComposer::Write`
+/// measured against `node --experimental-strip-types`, not a reading of the
+/// standard:
+///
+///   * Up to three numeric components are collected in source order and
+///     padded with `1`. If the FIRST one is not a valid day-of-month
+///     (`1..=31`) the triple is Y/M/D, otherwise it is M/D/Y — which is what
+///     makes `"2026/09/01"` year-first and `"09/01/2026"` US month-first
+///     without any lookahead.
+///   * A year in `0..=49` maps to `2000..=2049`, one in `50..=99` to
+///     `1950..=1999` (so `"09/01/26"` is 2026 and `"99/1/1"` is 1999).
+///   * The month must be `1..=12` and the day `1..=31`, but a day past the
+///     end of its month ROLLS OVER rather than failing: node's
+///     `new Date("2026/02/30")` is 2 March 2026. `"2026/13/01"` and
+///     `"2026/09/00"` are Invalid Date.
+///   * With no zone designator the components are LOCAL wall-clock time —
+///     unlike the ISO branch above, which is UTC. This is the difference
+///     that makes `new Date("2026/09/01").getHours() === 0` everywhere.
+///
+/// Only reached when the input actually contains a `/`, so the ISO,
+/// RFC-1123 and month-name grammars above keep their existing behaviour
+/// untouched.
+fn parse_slash_date(s: &str) -> Option<f64> {
+    if !s.contains('/') {
+        return None;
+    }
+    // `/` and `,` are both separators here ("2026/09/01,10:30" parses), so
+    // flatten them to spaces and work token-by-token like the RFC branch.
+    let normalized = s.replace([',', '/'], " ");
+
+    let mut comps: Vec<i64> = Vec::new();
+    let mut named_month: Option<i64> = None;
+    let mut hour: i64 = 0;
+    let mut minute: i64 = 0;
+    let mut second: i64 = 0;
+    let mut millis: i64 = 0;
+    let mut saw_time = false;
+    let mut pm: Option<bool> = None;
+    let mut tz_minutes_east: Option<i64> = None;
+
+    for tok in normalized.split_whitespace() {
+        let low = tok.to_ascii_lowercase();
+        // Parenthesized trailing comment — `"2026/09/01 (comment)"` is valid.
+        if tok.starts_with('(') {
+            continue;
         }
+        // Weekday name (never a month name, never a number).
+        if ["sun", "mon", "tue", "wed", "thu", "fri", "sat"]
+            .iter()
+            .any(|w| low.starts_with(w))
+            && month_from_name(tok).is_none()
+        {
+            continue;
+        }
+        if let Some(m) = month_from_name(tok) {
+            if named_month.is_some() {
+                return None;
+            }
+            named_month = Some(m as i64);
+            continue;
+        }
+        if tok.contains(':') {
+            if saw_time {
+                return None;
+            }
+            let parts: Vec<&str> = tok.split(':').collect();
+            if parts.len() < 2 || parts.len() > 3 {
+                return None;
+            }
+            hour = parts[0].parse().ok()?;
+            minute = parts[1].parse().ok()?;
+            if let Some(sec_tok) = parts.get(2) {
+                let (whole, frac) = match sec_tok.split_once('.') {
+                    Some((w, f)) => (w, Some(f)),
+                    None => (*sec_tok, None),
+                };
+                second = whole.parse().ok()?;
+                if let Some(frac) = frac {
+                    if frac.is_empty() || !frac.bytes().all(|c| c.is_ascii_digit()) {
+                        return None;
+                    }
+                    millis = normalize_millis(frac);
+                }
+            }
+            saw_time = true;
+            continue;
+        }
+        if low == "am" || low == "a.m." {
+            pm = Some(false);
+            continue;
+        }
+        if low == "pm" || low == "p.m." {
+            pm = Some(true);
+            continue;
+        }
+        if low == "gmt" || low == "utc" || low == "ut" || low == "z" {
+            tz_minutes_east = Some(0);
+            continue;
+        }
+        if low.starts_with("gmt") || low.starts_with("utc") {
+            let off = parse_tz_offset(&tok[3..])?;
+            if off != i64::MAX {
+                tz_minutes_east = Some(off);
+            }
+            continue;
+        }
+        // A bare `+HHMM` / `-HH:MM` is a zone designator only AFTER a clock
+        // has been read; before one, V8 treats the sign as a separator and the
+        // digits as another date component, which is why node's
+        // `new Date("2026/09/01 +0500")` is Invalid Date (a fourth component)
+        // while `new Date("2026/09/01 10:30 +0500")` is not.
+        if saw_time && (tok.starts_with('+') || tok.starts_with('-')) && tok.len() >= 3 {
+            let off = parse_tz_offset(tok)?;
+            if off != i64::MAX {
+                tz_minutes_east = Some(off);
+            }
+            continue;
+        }
+        // Numeric date component. A leading sign is a separator, not part of
+        // the number (`new Date("-2026/09/01")` is the same instant as
+        // `new Date("2026/09/01")` in node).
+        let digits = tok.trim_start_matches(['+', '-']);
+        if !digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit()) {
+            if comps.len() == 3 {
+                return None;
+            }
+            comps.push(digits.parse().ok()?);
+            continue;
+        }
+        // Anything else (a stray word, a named zone abbreviation) is not part
+        // of this grammar.
+        return None;
+    }
+
+    if comps.is_empty() {
+        return None;
+    }
+    // Day and month default to 1 (V8 `DayComposer::Write`).
+    while comps.len() < 3 {
+        comps.push(1);
+    }
+    let is_day = |x: i64| (1..=31).contains(&x);
+    let (mut year, month, day) = match named_month {
+        None => {
+            if is_day(comps[0]) {
+                // M/D/Y
+                (comps[2], comps[0], comps[1])
+            } else {
+                // Y/M/D
+                (comps[0], comps[1], comps[2])
+            }
+        }
+        Some(m) => {
+            if is_day(comps[0]) {
+                (comps[1], m, comps[0])
+            } else {
+                (comps[0], m, comps[1])
+            }
+        }
+    };
+    if (0..=49).contains(&year) {
+        year += 2000;
+    } else if (50..=99).contains(&year) {
+        year += 1900;
+    }
+    if !(1..=12).contains(&month) || !is_day(day) {
+        return None;
+    }
+
+    // Clock validation (V8 `TimeComposer::Write`): 24:00:00.000 is the only
+    // hour-24 form accepted, and `am`/`pm` require a 12-hour clock.
+    match pm {
+        Some(is_pm) => {
+            if !(1..=12).contains(&hour) {
+                return None;
+            }
+            hour = if is_pm {
+                if hour == 12 {
+                    12
+                } else {
+                    hour + 12
+                }
+            } else if hour == 12 {
+                0
+            } else {
+                hour
+            };
+        }
+        None => {
+            if hour > 24 || (hour == 24 && (minute != 0 || second != 0 || millis != 0)) {
+                return None;
+            }
+        }
+    }
+    if minute > 59 || second > 59 {
+        return None;
+    }
+
+    let base = make_utc_ms(year, month - 1, day, hour, minute, second, millis);
+    match tz_minutes_east {
+        Some(off) => Some(base - (off * 60_000) as f64),
+        // No designator: the components are LOCAL wall-clock time.
+        None => Some(local_wall_clock_to_utc(base)),
     }
 }

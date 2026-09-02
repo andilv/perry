@@ -913,7 +913,47 @@ pub(crate) fn lower_stmt(
                                                                     .clone()
                                                                     .unwrap_or_default(),
                                                             );
+                                                            // Issue #9079: `const Mixed2 =
+                                                            // mixin(Mixed)` — a mixin applied to a
+                                                            // previous mixin's RESULT. That base is
+                                                            // a lexical VALUE binding, so
+                                                            // `lower_class_from_ast` captures it as
+                                                            // `extends_expr` (a dynamic parent)
+                                                            // instead of a static class link. This
+                                                            // arm bound the synthesized class
+                                                            // WITHOUT the decl-time
+                                                            // `RegisterClassParentDynamic` its
+                                                            // sibling `const X = class {…}` path
+                                                            // above emits, so the class id got a
+                                                            // `js_get_dynamic_parent_value` in its
+                                                            // constructor and no registration to
+                                                            // answer it: `js_fetch_or_value_super`
+                                                            // fell back to the most-derived
+                                                            // receiver, re-selected the same class,
+                                                            // and recursed until the stack
+                                                            // overflowed — a SIGSEGV, not a wrong
+                                                            // value. Emit it here too, in source
+                                                            // order before the value binding, and
+                                                            // clone the extends expression before
+                                                            // `push_class_dedup` moves the class
+                                                            // out. A single-level `mixin(Root)`
+                                                            // extends a real class, keeps
+                                                            // `extends_expr` None, and is unchanged.
+                                                            let parent_register = lowered_class
+                                                                .extends_expr
+                                                                .clone()
+                                                                .map(|parent_expr| {
+                                                                    Stmt::Expr(
+                                                                        Expr::RegisterClassParentDynamic {
+                                                                            class_name: bind_name.clone(),
+                                                                            parent_expr,
+                                                                        },
+                                                                    )
+                                                                });
                                                             push_class_dedup(module, lowered_class);
+                                                            if let Some(reg) = parent_register {
+                                                                module.init.push(reg);
+                                                            }
                                                             ctx.class_expr_aliases.insert(
                                                                 bind_name.clone(),
                                                                 bind_name.clone(),
@@ -1822,9 +1862,19 @@ pub(crate) fn lower_stmt(
             // Case statement-lists share the switch's block scope without
             // being a `BlockStmt`, so they don't pass through
             // `lower_block_stmt` — re-bind their pre-registered
-            // forward-captured lets here (all cases up front: one scope).
+            // forward-captured lets here (all cases up front: one scope), and
+            // (#9466) disambiguate the `class` declarations they hold for the
+            // same reason. Every case shares ONE lexical scope, so they take
+            // one shared scope key: a second case re-declaring the name is a
+            // redeclaration, not a shadow.
+            let mut saved_class_renames = Vec::new();
             for case in &switch_stmt.cases {
                 rebind_nested_forward_scope_lets(ctx, &case.cons);
+                saved_class_renames.extend(enter_class_rename_scope(
+                    ctx,
+                    switch_stmt.span.lo.0,
+                    &case.cons,
+                ));
             }
 
             for case in &switch_stmt.cases {
@@ -1838,6 +1888,7 @@ pub(crate) fn lower_stmt(
                 cases.push(SwitchCase { test, body });
             }
 
+            exit_class_rename_scope(ctx, saved_class_renames);
             ctx.pop_block_scope(switch_scope_mark);
 
             module.init.push(Stmt::Switch {

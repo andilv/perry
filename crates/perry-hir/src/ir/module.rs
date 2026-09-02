@@ -16,6 +16,15 @@ pub struct LocalSourceSpan {
     pub end: u32,
 }
 
+/// Retained source text plus the function-kind bit needed by runtime
+/// reflection. The latter distinguishes ordinary non-strict functions from
+/// methods and other callable forms that share the same closure layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionSourceMetadata {
+    pub text: String,
+    pub is_non_strict_ordinary: bool,
+}
+
 /// A complete HIR module (corresponds to one TypeScript file)
 #[derive(Debug, Clone)]
 pub struct Module {
@@ -63,6 +72,27 @@ pub struct Module {
     /// same-named bare top-level function declaration, whose entry value is
     /// emitted separately through `script_global_functions`.
     pub annexb_global_undefined_names: Vec<String>,
+    /// #9423: true iff this module's top-level code is STRICT.
+    ///
+    /// An ES module is strict with no directive prologue (ES2024 SS11.2.2), and a
+    /// Script is strict when it opens with a `"use strict"` directive. Lowering
+    /// already computes exactly this as `LoweringContext::module_strict` and
+    /// feeds it to `current_strict`, so every HIR node that carries its own
+    /// `strict` flag (`PutValueSet`, `PropertyUpdate`, `IndexUpdate`) is right.
+    ///
+    /// This field exists because CODEGEN cannot see that. Module init is lowered
+    /// as a synthetic function, and codegen's `FnCtx::is_strict_fn` was hardcoded
+    /// `false` for it -- so the lanes that read the CONTEXT's strictness rather
+    /// than a flag on the node (`Expr::IndexSet` via `expr/dispatch.rs`,
+    /// `delete`) saw sloppy at module top level: a rejected
+    /// `for (frozenArray[0] of ...)` silently no-opped. Both entry sites and
+    /// every outlined chunk now read this field.
+    ///
+    /// Module top-level `this` is NOT governed by this flag: that is
+    /// `Expr::ModuleTopThis`, a module-goal decision made in `lower_expr`'s
+    /// `This` arm (switched only by `PERRY_GLOBAL_SCRIPT_THIS`), which never
+    /// consults strictness -- it still diverges from node (#9423 notes it).
+    pub init_is_strict: bool,
     /// Top-level statements to execute
     pub init: Vec<Stmt>,
     /// Lexical bindings from multi-declarator classic `for` heads.
@@ -144,7 +174,20 @@ pub struct Module {
     /// by codegen to emit `js_register_function_source` so `fn.toString()`
     /// (and `Function.prototype.toString.call(fn)`) reconstruct the source
     /// instead of returning the generic `"[object Object]"`.
-    pub closure_source_text: std::collections::HashMap<crate::types::FuncId, String>,
+    pub closure_source_text:
+        std::collections::HashMap<crate::types::FuncId, FunctionSourceMetadata>,
+    /// #9413: original source text for each user class, keyed by ClassId.
+    /// Populated at lowering by slicing the module source against the class's
+    /// AST span (SWC anchors `Class::span` at the `class` keyword and ends it
+    /// at the closing brace, so the slice is exactly what
+    /// `Function.prototype.toString` must return). Consumed by codegen to emit
+    /// `js_register_class_source`, so `String(C)` / `C.toString()` /
+    /// `` `${C}` `` reconstruct the class source instead of the
+    /// `function C() { [native code] }` placeholder a class ref used to get —
+    /// classes are the one callable kind whose source perry retained nowhere,
+    /// even though the sibling `closure_source_text` had done it for every
+    /// function since #4101.
+    pub class_source_text: std::collections::HashMap<crate::ClassId, String>,
     /// #3664: func_ids of `async function*` declarations and `async function*(){}`
     /// expressions. The generator transform clears `is_async`/`is_generator`
     /// before codegen, erasing the async-vs-sync distinction (both lower to a
@@ -189,6 +232,7 @@ impl Module {
             script_global_functions: Vec::new(),
             references_global_this: false,
             annexb_global_undefined_names: Vec::new(),
+            init_is_strict: false,
             init: Vec::new(),
             classic_for_lexical_bindings: std::collections::HashSet::new(),
             exported_native_instances: Vec::new(),
@@ -206,6 +250,7 @@ impl Module {
             closure_display_names: std::collections::HashMap::new(),
             class_display_names: std::collections::HashMap::new(),
             closure_source_text: std::collections::HashMap::new(),
+            class_source_text: std::collections::HashMap::new(),
             async_generator_funcs: std::collections::HashSet::new(),
             local_source_spans: std::collections::HashMap::new(),
             gen_param_prologue_len: std::collections::HashMap::new(),

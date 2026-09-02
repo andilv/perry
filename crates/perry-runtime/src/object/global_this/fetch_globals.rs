@@ -449,13 +449,17 @@ pub(crate) unsafe fn temporal_subclass_super(
     // to the parent ctor for the duration of the call (the cell it returns is
     // re-homed onto the subclass `this`; the exact new.target identity is not
     // observable to these native ctors beyond being defined). Restore after.
-    let prev_this = crate::object::js_implicit_this_set(this_box);
+    // #9445: root the displaced receiver and `this_box` (consumed again below)
+    // across the parent constructor call.
+    let this_scope = crate::gc::RuntimeHandleScope::new();
+    let this_h = this_scope.root_nanbox_f64(this_box);
+    let prev_this = this_scope.root_nanbox_f64(crate::object::js_implicit_this_set(this_box));
     let prev_nt = crate::object::js_new_target_set(parent_val);
     let cell = crate::closure::js_native_call_value(parent_val, args_ptr, args_len);
     crate::object::js_new_target_set(prev_nt);
-    crate::object::js_implicit_this_set(prev_this);
+    crate::object::js_implicit_this_set(prev_this.get_nanbox_f64());
     if crate::temporal::is_temporal_value(cell) {
-        attach_temporal_cell_to_this(this_box, cell);
+        attach_temporal_cell_to_this(this_h.get_nanbox_f64(), cell);
     }
     true
 }
@@ -720,7 +724,7 @@ pub unsafe extern "C" fn js_fetch_or_value_super(
     // value routes through the dynamic-parent registry): the parent value is
     // the global Error-family constructor. The ordinary value-super dispatch
     // below invokes it as a plain call, which builds a FRESH error cell and
-    // drops it — `this` never receives `message`/`name`, so every subclass
+    // drops it — `this` never receives `message`, so every subclass
     // instance constructed through this path printed "An error has occurred".
     // Apply the spec default Error-init directly on `this`, mirroring the
     // static-`new` arm (#573, `lower_call/new.rs`) and the standalone-ctor arm
@@ -736,28 +740,28 @@ pub unsafe extern "C" fn js_fetch_or_value_super(
             let stash = crate::object::class_registry::js_get_dynamic_parent_value(cid);
             super::super::class_registry::identify_global_builtin_constructor(stash)
         });
-        if let Some(kind) = err_parent.filter(|k| {
-            matches!(
-                *k,
-                "Error"
-                    | "TypeError"
-                    | "RangeError"
-                    | "ReferenceError"
-                    | "SyntaxError"
-                    | "URIError"
-                    | "EvalError"
-                    | "AggregateError"
-            )
-        }) {
+        if err_parent
+            .filter(|k| {
+                matches!(
+                    *k,
+                    "Error"
+                        | "TypeError"
+                        | "RangeError"
+                        | "ReferenceError"
+                        | "SyntaxError"
+                        | "URIError"
+                        | "EvalError"
+                        | "AggregateError"
+                )
+            })
+            .is_some()
+        {
             let msg = if !args_ptr.is_null() && args_len >= 1 {
                 *args_ptr
             } else {
                 undef
             };
-            let name_str = crate::string::js_string_from_bytes(kind.as_ptr(), kind.len() as u32);
-            crate::object::class_constructors::js_error_subclass_default_init(
-                this_box, msg, name_str,
-            );
+            crate::object::class_constructors::js_error_subclass_default_init(this_box, msg);
             return undef;
         }
     }
@@ -959,9 +963,10 @@ pub unsafe extern "C" fn js_fetch_or_value_super(
                     }
                 }
             }
-            let prev = crate::object::js_implicit_this_set(this_box);
+            let this_scope = crate::gc::RuntimeHandleScope::new(); // #9445
+            let prev = this_scope.root_nanbox_f64(crate::object::js_implicit_this_set(this_box));
             let r = crate::closure::js_native_call_value(callee, args_ptr, args_len);
-            crate::object::js_implicit_this_set(prev);
+            crate::object::js_implicit_this_set(prev.get_nanbox_f64());
             r
         }
     }

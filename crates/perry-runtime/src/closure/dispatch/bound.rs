@@ -3,6 +3,57 @@
 
 use super::*;
 
+/// Resolve a bound class-method value to the raw method body whose source was
+/// registered by codegen. Ordinary instance methods carry an owner prototype
+/// ref plus their string name; statics carry a constructor ref; symbol-keyed
+/// methods carry the already-resolved function pointer directly.
+///
+/// Returns `None` for the many non-class users of the BOUND_METHOD sentinel
+/// (native module methods, `Function.prototype.call` reifications, and so on),
+/// which correctly retain synthesized native source text.
+pub(crate) unsafe fn bound_method_source_func_ptr(closure: *const ClosureHeader) -> Option<usize> {
+    if closure.is_null()
+        || (*closure).func_ptr != BOUND_METHOD_FUNC_PTR
+        || crate::closure::real_capture_count((*closure).capture_count) < 3
+    {
+        return None;
+    }
+
+    let method_name_ptr = js_closure_get_capture_ptr(closure, 1) as *const u8;
+    if method_name_ptr == crate::object::SYMBOL_BOUND_METHOD_NAME.as_ptr() {
+        if crate::closure::real_capture_count((*closure).capture_count) < 5 {
+            return None;
+        }
+        return (js_closure_get_capture_ptr(closure, 3) as usize != 0)
+            .then(|| js_closure_get_capture_ptr(closure, 3) as usize);
+    }
+
+    let method_name_len = js_closure_get_capture_ptr(closure, 2) as usize;
+    if method_name_ptr.is_null() || method_name_len == 0 {
+        return None;
+    }
+    let name =
+        std::str::from_utf8(std::slice::from_raw_parts(method_name_ptr, method_name_len)).ok()?;
+    let receiver = js_closure_get_capture_f64(closure, 0);
+
+    if let Some(class_id) = crate::object::class_prototype_ref_id(receiver) {
+        return crate::object::lookup_class_method_in_chain(class_id, name)
+            .map(|(func_ptr, ..)| func_ptr);
+    }
+
+    let static_class_id = crate::object::class_ref_id(receiver).or_else(|| {
+        crate::object::is_class_object_value(receiver).then(|| {
+            let obj = crate::value::JSValue::from_bits(receiver.to_bits())
+                .as_pointer::<crate::object::ObjectHeader>();
+            crate::object::js_object_get_class_id(obj)
+        })
+    });
+    static_class_id
+        .filter(|class_id| *class_id != 0)
+        .and_then(|class_id| crate::object::lookup_static_method_in_chain(class_id, name))
+        .map(|(func_ptr, ..)| func_ptr)
+}
+
 /// Dispatch a bound method call with the given arguments.
 /// Extracts the namespace object and method name from the closure captures,
 /// then calls js_native_call_method with the packed arguments.
@@ -214,7 +265,8 @@ unsafe fn dispatch_symbol_bound_method(
         // the direct-call path. The one-shot static-`this` override (armed by
         // the Function.prototype call/apply arms for a static bound-method
         // value) still wins in the static-method prologue.
-        let prev_this = crate::object::js_implicit_this_set(receiver);
+        let this_scope = crate::gc::RuntimeHandleScope::new(); // #9445
+        let prev_this = this_scope.root_nanbox_f64(crate::object::js_implicit_this_set(receiver));
         crate::object::static_private_owner_push(receiver);
         let result = crate::object::call_registered_static_method(
             func_ptr,
@@ -224,7 +276,7 @@ unsafe fn dispatch_symbol_bound_method(
             has_rest,
         );
         crate::object::static_private_owner_pop();
-        crate::object::js_implicit_this_set(prev_this);
+        crate::object::js_implicit_this_set(prev_this.get_nanbox_f64());
         result
     } else {
         // Computed symbol methods never synthesize an `arguments` object but
@@ -267,14 +319,15 @@ pub unsafe fn dispatch_bound_function(closure: *const ClosureHeader, args: &[f64
     // slot, not IMPLICIT_THIS — rebind it to the bound receiver so the bound
     // `this` is honored (arrows/non-captures_this targets are returned as-is).
     let target = rebind_explicit_this(target, bound_this);
-    let prev_this = crate::object::js_implicit_this_set(bound_this);
+    let this_scope = crate::gc::RuntimeHandleScope::new(); // #9445
+    let prev_this = this_scope.root_nanbox_f64(crate::object::js_implicit_this_set(bound_this));
     let (call_ptr, call_len) = if combined.is_empty() {
         (std::ptr::null::<f64>(), 0usize)
     } else {
         (combined.as_ptr(), combined.len())
     };
     let result = js_native_call_value(target, call_ptr, call_len);
-    crate::object::js_implicit_this_set(prev_this);
+    crate::object::js_implicit_this_set(prev_this.get_nanbox_f64());
     result
 }
 

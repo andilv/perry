@@ -639,6 +639,7 @@ fn alloc_malloc_kind_test_object(obj_type: u8) -> *mut u8 {
                 std::ptr::write(
                     ptr as *mut crate::promise::Promise,
                     crate::promise::Promise {
+                        native_pinned: 0,
                         state: crate::promise::PromiseState::Pending,
                         value: 0.0,
                         reason: 0.0,
@@ -672,6 +673,7 @@ fn alloc_malloc_kind_test_object(obj_type: u8) -> *mut u8 {
                         cause: 0.0,
                         errors: std::ptr::null_mut(),
                         meta: std::ptr::null_mut(),
+                        frames: std::ptr::null_mut(),
                     },
                 );
             }

@@ -1157,6 +1157,18 @@ pub extern "C" fn js_array_pop_f64(arr: *mut ArrayHeader) -> f64 {
             let elements_ptr = (arr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut f64;
             let value = *elements_ptr.add(new_length as usize);
             (*arr).length = new_length;
+            // #9462: the popped slot can be a HOLE — `[1, ,].pop()`,
+            // `new Array(3).pop()`, `delete a[a.length - 1]` then pop. The
+            // dense fast path above explicitly DECLINES on `TAG_HOLE` and
+            // lands here, where the raw slot was returned untranslated; the
+            // sentinel's bits are a NaN, so `typeof v` was "number",
+            // `String(v)` was "NaN" and `v !== undefined` — the same shape as
+            // #536's bare-NaN empty pop, which this exact function was already
+            // fixed for once. The element READ arm of `js_array_get_f64`
+            // translates the sentinel; so must the element REMOVE arm.
+            if value.to_bits() == crate::value::TAG_HOLE {
+                return TAG_UNDEFINED_F64;
+            }
             return value;
         }
 
@@ -1271,10 +1283,36 @@ fn try_truncate_plain_array_to_zero(arr: *mut ArrayHeader) -> bool {
 
 #[no_mangle]
 pub extern "C" fn js_array_set_length_strict(arr: *mut ArrayHeader, new_length: f64) {
+    // #9422: a rejected STRICT `Set(O, "length", n, true)` must throw, and this
+    // entry recognised only ONE of the two ways `length` can be non-writable.
+    // `Object.freeze` sets `OBJ_FLAG_FROZEN`, which it tested; an explicit
+    // `Object.defineProperty(arr, "length", { writable: false })` records the
+    // attribute in the descriptor side table WITHOUT freezing the array, and
+    // that shape fell through to the sloppy body, whose own non-writable arm is
+    // a silent `return` (see `js_array_set_length` below, where the comment
+    // says the strict throw "is handled by the caller's PutValue" -- this IS
+    // that caller). Node throws for every `arr.length = n` on a non-writable
+    // `length`, including a same-value write: OrdinarySet consults the own
+    // descriptor and returns false before it ever looks at `n`.
+    //
+    // `array_length_is_non_writable` is not new. It is the predicate
+    // `push`/`pop`/`shift`/`unshift` have guarded with since test262
+    // Array.prototype.push/set-length-*-non-writable -- those mutators perform
+    // the same `Set(O, "length", ..., true)`. This is the one such site that
+    // was not using it.
+    //
+    // It runs BEFORE the zero-truncate fast path on purpose: a write the spec
+    // rejects must not reach a shortcut that stores.
+    let cleaned = clean_arr_ptr_mut(arr);
+    if !cleaned.is_null()
+        && (array_object_flags(cleaned) & crate::gc::OBJ_FLAG_FROZEN != 0
+            || array_length_is_non_writable(cleaned))
+    {
+        throw_non_writable_length();
+    }
     if new_length.to_bits() == 0 && try_truncate_plain_array_to_zero(arr) {
         return;
     }
-    let cleaned = clean_arr_ptr_mut(arr);
     if cleaned.is_null() {
         // #7574: `a.length = n` on a `class X extends Array` instance reached
         // here through the `is_array_expr`-keyed `property_set` lowering and
@@ -1287,11 +1325,7 @@ pub extern "C" fn js_array_set_length_strict(arr: *mut ArrayHeader, new_length: 
         }
         return;
     }
-    let arr = cleaned;
-    if array_object_flags(arr) & crate::gc::OBJ_FLAG_FROZEN != 0 {
-        throw_non_writable_length();
-    }
-    js_array_set_length(arr, new_length);
+    js_array_set_length(cleaned, new_length);
 }
 
 #[no_mangle]

@@ -41,15 +41,40 @@ fn workspace_root() -> PathBuf {
         .expect("canonicalize workspace root")
 }
 
+/// Perry ships a `panic=abort` runtime. A debug `panic=unwind` archive plants
+/// abort-on-unwind guards in `extern "C"` helpers, so the raw JS exceptions in
+/// this fixture cannot reach their generated catch landing pads on Linux.
+/// Relative Cargo target overrides are rooted at the nested build's workspace.
+fn target_runtime_dir() -> PathBuf {
+    let target = match std::env::var_os("CARGO_TARGET_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        Some(path) if path.is_absolute() => path,
+        Some(path) => workspace_root().join(path),
+        None => workspace_root().join("target"),
+    };
+    if cfg!(windows) {
+        target.join("x86_64-pc-windows-msvc").join("release")
+    } else {
+        target.join("release")
+    }
+}
+
 fn runtime_dir() -> PathBuf {
     static BUILD_RUNTIME: Once = Once::new();
     BUILD_RUNTIME.call_once(|| {
         let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
         let mut command = Command::new(cargo);
-        command.current_dir(workspace_root()).arg("build");
+        command
+            .current_dir(workspace_root())
+            .arg("build")
+            // `panic` is profile-level; this must match `target_runtime_dir()`
+            // and the runtime Perry actually ships.
+            .arg("--release");
         remove_gc_env_overrides(&mut command);
-        if !cfg!(debug_assertions) {
-            command.arg("--release");
+        if cfg!(windows) {
+            command.arg("--target").arg("x86_64-pc-windows-msvc");
         }
         let build = command
             .args(["-p", "perry-runtime-static"])
@@ -63,10 +88,7 @@ fn runtime_dir() -> PathBuf {
         );
     });
 
-    perry_bin()
-        .parent()
-        .expect("Perry binary directory")
-        .to_path_buf()
+    target_runtime_dir()
 }
 
 fn run_fixture(binary: &Path, force_evacuation: bool) -> Output {

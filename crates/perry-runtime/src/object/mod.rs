@@ -236,8 +236,9 @@ pub use with_env::*;
 // named re-exports keep existing `crate::object::X` / bare-name call sites in
 // the object submodules resolving unchanged.
 pub(crate) use class_meta_registry::{
-    class_generic_origin, extends_builtin_error, fetch_parent_kind, lookup_has_instance_hook,
-    lookup_to_string_tag_hook, register_fetch_parent_kind, CLASS_REGISTRY,
+    builtin_error_prototype_name, class_generic_origin, extends_builtin_error, fetch_parent_kind,
+    lookup_has_instance_hook, lookup_to_string_tag_hook, register_fetch_parent_kind,
+    CLASS_REGISTRY,
 };
 pub use class_meta_registry::{
     js_register_class_extends_error, js_register_class_generic_origin,
@@ -1870,6 +1871,8 @@ pub(super) unsafe fn mark_object_dynamic_shape_unknown(obj: *mut ObjectHeader) {
 /// under the 2000-line cap.
 #[cfg(test)]
 mod own_key_probe_tests;
+#[cfg(test)]
+mod restricted_function_store_tests;
 #[cfg(test)]
 mod test_root_accessors;
 #[cfg(test)]

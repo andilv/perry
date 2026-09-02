@@ -102,11 +102,10 @@ pub struct ErrorHeader {
     /// `ObjectHeader` hangs off its own `meta` field.
     ///
     /// #6759 phase 1 (header unification). An `ErrorHeader` is not an
-    /// `ObjectHeader`, so before this field the only place to put anything
-    /// per-error was a side table keyed by the error's ADDRESS — and errors
-    /// accumulated seven of them, each needing its own GC rekey-on-evacuation,
-    /// finalize, dead-sweep and root-scanner hook. Giving the cell a metadata
-    /// edge is what lets those payloads move onto the object itself.
+    /// `ObjectHeader`, so before this field user-assigned properties lived in
+    /// an address-keyed side table. Giving the cell a metadata edge lets those
+    /// properties live on the object itself. Node's built-in diagnostic fields
+    /// remain in one owner-keyed record managed by the Error GC hook.
     ///
     /// Appended LAST on purpose: every preceding field keeps its offset, so
     /// codegen and the `errors`-at-+48 assumption in this file's tests are
@@ -120,6 +119,21 @@ pub struct ErrorHeader {
     /// there separately (#6812: a meta edge enumerated only on the rewrite
     /// path is invisible to marking).
     pub meta: *mut crate::object::ObjectMeta,
+    /// #9486: the native return addresses captured when this error was
+    /// constructed, ASCII-encoded by `stack_frames::encode_pcs`, optionally
+    /// followed by `\n` and the #5247 recorded call-site line. Null when the
+    /// platform has no frame-pointer chain to walk, or once `stack` has been
+    /// materialised.
+    ///
+    /// A `StringHeader` rather than a bespoke cell so it needs no new
+    /// `GC_TYPE_*`, no new rewrite-descriptor arm and no finalizer: it is
+    /// traced by the one added `visit(...)` line in the
+    /// `GcRewriteDescriptorKind::Error` arm of `gc/layout_slot_visit.rs`,
+    /// exactly like `stack` beside it.
+    ///
+    /// Appended LAST, for the reason `meta` documents above: every preceding
+    /// field keeps its offset.
+    pub frames: *mut StringHeader,
 }
 
 thread_local! {
@@ -178,15 +192,24 @@ static KEEP_JS_SET_CALL_LOCATION: unsafe extern "C" fn(*const u8, usize, u32) =
 /// #5247: render the current call-location frame, or `<anonymous>` when no
 /// location was recorded (default builds, or a synthesized/offset-less site).
 fn current_stack_frame() -> String {
+    recorded_stack_frame().unwrap_or_else(|| "    at <anonymous>".to_string())
+}
+
+/// The #5247 call-site frame line, or `None` when no location was recorded.
+///
+/// The `Option` is what lets #9486 capture this WITHOUT paying for a string in
+/// a default build: `current_stack_frame`'s unconditional `"<anonymous>"`
+/// allocation happened on every `new Error`, and the recorded case only exists
+/// under `--debug-symbols`.
+fn recorded_stack_frame() -> Option<String> {
     if let Some((file, line, column)) = RUNTIME_SOURCE_LOCATION.with(|slot| slot.borrow().clone()) {
-        return format!("    at {file}:{line}:{column}");
+        return Some(format!("    at {file}:{line}:{column}"));
     }
-    CURRENT_CALL_LOCATION.with(|c| match c.get() {
-        Some((file_ptr, file_len, line)) => {
+    CURRENT_CALL_LOCATION.with(|c| {
+        c.get().map(|(file_ptr, file_len, line)| {
             let bytes = unsafe { std::slice::from_raw_parts(file_ptr as *const u8, file_len) };
             format!("    at {}:{}", String::from_utf8_lossy(bytes), line)
-        }
-        None => "    at <anonymous>".to_string(),
+        })
     })
 }
 
@@ -210,7 +233,6 @@ unsafe fn alloc_error(
     message: *mut StringHeader,
     has_message: bool,
 ) -> *mut ErrorHeader {
-    let scope = crate::gc::RuntimeHandleScope::new();
     // #321 frontier issue #69 (sibling to #2230's `dyn_index_get` guard):
     // codegen lowers `new Error(value)` by handing the value straight to
     // `js_error_new_with_message` even when `value` is not a string pointer
@@ -226,27 +248,43 @@ unsafe fn alloc_error(
     // predicate guards `dyn_index_get/set` (#2230), `js_object_keys`, the
     // by-name field setters, and several typed-feedback probes — this
     // brings the error-allocation path under the same umbrella.
-    let message_ptr = if message.is_null() || !crate::object::is_valid_obj_ptr(message as *const u8)
-    {
-        js_string_from_bytes(b"".as_ptr(), 0)
+    let message_is_valid =
+        !message.is_null() && crate::object::is_valid_obj_ptr(message as *const u8);
+    // #9530: Node diagnostics are registered immediately before construction
+    // because no ErrorHeader exists yet. Take that transient message-keyed
+    // record before the first allocation below can move the message; once the
+    // Error exists, the record is installed under its owner address and follows
+    // the existing ErrorSideTables move/finalize hook.
+    let diagnostics = if message_is_valid {
+        crate::node_submodules::take_pending_error_diagnostics(message)
     } else {
+        None
+    };
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let message_ptr = if message_is_valid {
         message
+    } else {
+        js_string_from_bytes(b"".as_ptr(), 0)
     };
     let message_handle = scope.root_string_ptr(message_ptr);
 
     let error_name = js_string_from_bytes(name_bytes.as_ptr(), name_bytes.len() as u32);
     let error_name_handle = scope.root_string_ptr(error_name);
 
-    let message_ptr = message_handle.get_raw_const_ptr::<StringHeader>() as *mut StringHeader;
-    let msg_str = {
-        let len = (*message_ptr).byte_len as usize;
-        let data = (message_ptr as *const u8).add(std::mem::size_of::<StringHeader>());
-        let bytes = std::slice::from_raw_parts(data, len);
-        std::str::from_utf8(bytes).unwrap_or("")
+    // #9486: `.stack` is NOT built here. The frames are captured — a
+    // frame-pointer chain walk, no allocation, no symbolication — and the
+    // string is formatted on first read (`js_error_get_stack`), the same
+    // capture-then-format-on-read split #9432 gave Error subclasses. Building
+    // it eagerly meant every `new Error` paid for a UTF-8 decode of its own
+    // message and two `String` allocations to produce a line almost no
+    // program ever looks at; paying for a SYMBOLICATED one would have been far
+    // worse.
+    let payload = capture_frames_payload();
+    let frames_handle = if payload.is_empty() {
+        None
+    } else {
+        Some(scope.root_string_ptr(js_string_from_bytes(payload.as_ptr(), payload.len() as u32)))
     };
-    let name_str = std::str::from_utf8(name_bytes).unwrap_or("Error");
-    let stack = make_stack(name_str, msg_str);
-    let stack_handle = scope.root_string_ptr(stack);
 
     let raw = crate::arena::arena_alloc_gc(
         std::mem::size_of::<ErrorHeader>(),
@@ -266,12 +304,19 @@ unsafe fn alloc_error(
     };
     (*ptr).message = message_handle.get_raw_const_ptr::<StringHeader>() as *mut StringHeader;
     (*ptr).name = error_name_handle.get_raw_const_ptr::<StringHeader>() as *mut StringHeader;
-    (*ptr).stack = stack_handle.get_raw_const_ptr::<StringHeader>() as *mut StringHeader;
+    // Null until `js_error_get_stack` materialises it (#9486).
+    (*ptr).stack = std::ptr::null_mut();
     (*ptr).cause = f64::from_bits(TAG_UNDEFINED);
     (*ptr).errors = std::ptr::null_mut();
     // No metadata record until something needs one; the GC treats a null meta
     // edge as absent.
     (*ptr).meta = std::ptr::null_mut();
+    (*ptr).frames = match &frames_handle {
+        Some(handle) => handle.get_raw_const_ptr::<StringHeader>() as *mut StringHeader,
+        None => std::ptr::null_mut(),
+    };
+
+    crate::node_submodules::install_error_diagnostics(ptr, diagnostics);
 
     ptr
 }
@@ -370,9 +415,9 @@ pub extern "C" fn js_referenceerror_new(message: *mut StringHeader) -> *mut Erro
 
 thread_local! {
     /// Interned `&'static str` for each distinct Node `ERR_*` code passed
-    /// across the FFI boundary, so it can be stored in the
-    /// message→code side table read by the `.code` getter. Bounded: each
-    /// distinct code string leaks at most once per thread.
+    /// across the FFI boundary, so it can be stored in the diagnostic record
+    /// read by the `.code` getter. Bounded: each distinct code string leaks at
+    /// most once per thread.
     static INTERNED_ERROR_CODES: std::cell::RefCell<std::collections::HashMap<String, &'static str>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
@@ -391,7 +436,7 @@ fn intern_error_code(code: &str) -> &'static str {
 /// Generic "build a JS Error subclass carrying a Node `.code`" FFI entry
 /// point for out-of-crate callers that have no direct access to
 /// `perry-runtime`'s Rust API. Building + registering in this single extern
-/// symbol guarantees the message→code registration and the later `.code` read
+/// symbol guarantees the diagnostic registration and the later `.code` read
 /// resolve through the same runtime copy, avoiding the staticlib thread-local
 /// divergence that split registration/read paths hit.
 ///
@@ -880,14 +925,24 @@ pub(crate) unsafe fn js_error_builtin_own_property_is_enumerable(
     }
 }
 
-/// Get the stack property of an Error
+/// Get the stack property of an Error.
+///
+/// #9486: this is where `.stack` is BUILT. `alloc_error` stores only the
+/// captured return addresses, so the first read of an error's `.stack`
+/// formats the head from the error's current `name`/`message` (what V8 does —
+/// a subclass constructor assigns `this.name` after `super()` returns) and
+/// resolves the captured frames to names, then memoises the result into the
+/// `stack` field. Every later read returns that string.
+///
+/// This is the single choke point: nothing else may read `(*error).stack`
+/// directly, because before this runs it is null.
 #[no_mangle]
 pub extern "C" fn js_error_get_stack(error: *mut ErrorHeader) -> *mut StringHeader {
     unsafe {
         if error.is_null() {
             return js_string_from_bytes(b"".as_ptr(), 0);
         }
-        (*error).stack
+        materialize_error_stack(error)
     }
 }
 
@@ -1861,6 +1916,12 @@ static KEEP_AGGREGATEERROR_NEW_FULL: extern "C" fn(
 #[cfg(feature = "keepalive-anchors")]
 #[used]
 static KEEP_ERROR_IS_ERROR: extern "C" fn(f64) -> f64 = js_error_is_error;
+
+#[path = "error_stack_frames.rs"]
+mod stack_frames;
+pub(crate) use stack_frames::{
+    capture_frames_payload, frames_payload_to_lines, materialize_error_stack,
+};
 
 #[path = "error_subclass_stack.rs"]
 mod subclass_stack;

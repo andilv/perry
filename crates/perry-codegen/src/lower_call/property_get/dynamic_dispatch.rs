@@ -7,13 +7,16 @@ use super::*;
 use anyhow::Result;
 use perry_hir::Expr;
 
-use crate::expr::{lower_expr, nanbox_pointer_inline, unbox_to_i64, FnCtx};
+use crate::expr::{nanbox_pointer_inline, unbox_to_i64, FnCtx};
 use crate::nanbox::double_literal;
 use crate::type_analysis::receiver_class_name;
 use crate::types::{DOUBLE, I1, I32, I64};
 
+#[path = "dispatch_receiver_class.rs"]
+mod dispatch_receiver_class;
 #[path = "dynamic_dispatch_tower.rs"]
 mod tower;
+use dispatch_receiver_class::*;
 use tower::{emit_tower_pshape_call, tower_pshape_route};
 
 // Reach the override-emit helpers (`pub(super)` of `lower_call`) by their
@@ -28,62 +31,6 @@ use crate::lower_call::method_override::{
 /// long inline compare chain — more instruction cache than the single tower
 /// call it replaces — so past this width the site keeps the single-arm guard.
 const MAX_SUBCLASS_DISPATCH_ARMS: usize = 8;
-
-/// Can an exact canonical shape prove that `property` is not an own field?
-///
-/// A post-construction assignment such as `this.run = f` mints a successor
-/// ShapeId, so an exact canonical-shape match excludes that override. A
-/// declared field is different: it is already part of the canonical shape and
-/// may intentionally shadow a prototype method (#620). Computed fields and
-/// incomplete/dynamic parent chains are similarly unknowable here and retain
-/// the runtime own-property probe.
-fn canonical_shape_excludes_own_property(
-    ctx: &FnCtx<'_>,
-    class_name: &str,
-    property: &str,
-) -> bool {
-    let mut current = Some(class_name.to_string());
-    let mut seen = std::collections::HashSet::new();
-    while let Some(name) = current {
-        if !seen.insert(name.clone()) {
-            return false;
-        }
-        let Some(class) = ctx.classes.get(&name) else {
-            return false;
-        };
-        if class
-            .fields
-            .iter()
-            .any(|field| field.key_expr.is_some() || field.name == property)
-        {
-            return false;
-        }
-        if class.extends_expr.is_some() || class.native_extends.is_some() {
-            return false;
-        }
-        current = class.extends_name.clone().or_else(|| {
-            class.extends.and_then(|parent_id| {
-                ctx.classes
-                    .iter()
-                    .find_map(|(name, candidate)| (candidate.id == parent_id).then(|| name.clone()))
-            })
-        });
-    }
-    true
-}
-
-/// A declared class may select the direct-method guard, but never prove the
-/// direct call. The guard validates the live class id, keys token, own
-/// override, and resolved method pointer; every miss uses dynamic dispatch.
-fn guarded_declared_receiver_class_candidate(ctx: &FnCtx<'_>, object: &Expr) -> Option<String> {
-    let Expr::LocalGet(id) = object else {
-        return None;
-    };
-    let perry_hir::types::Type::Named(name) = ctx.local_type_hint(id)? else {
-        return None;
-    };
-    ctx.classes.contains_key(name).then(|| name.clone())
-}
 
 /// #7142: the proven-`this` clone a class-id dispatch-tower case may route to,
 /// plus the keys token the routed path must re-check inline.
@@ -331,7 +278,48 @@ pub(crate) fn try_lower_instance_method_call(
             }
         }
         if !implementors.is_empty() {
-            let recv_box = lower_expr(ctx, object)?;
+            // #9417: the receiver is lowered FIRST — JS evaluation order requires
+            // the MemberExpression to be evaluated before the arguments — and
+            // consumed LAST, after every argument expression. Each of those is
+            // arbitrary user code that can drive an evacuating young-gen minor,
+            // and a bare SSA register is not a GC root
+            // (`docs/src/internals/gc-rooting-invariant.md`, case 3), so from the
+            // first collection onward the receiver names from-space.
+            //
+            // Nothing faults there. `js_object_get_own_field_or_undef` fails its
+            // `obj_type == GC_TYPE_OBJECT` check on the recycled cell and answers
+            // TAG_UNDEFINED, the own-override probe misses, and the by-name
+            // dispatch runs on a retired address — so the failure surfaces as a
+            // wrong answer several steps downstream. That is #9417's `reading
+            // 'def'` in the Claude Code bundle: zod's `K4.extend(q, {…})` with the
+            // object literal in argument position.
+            //
+            // `early_branches.rs`'s COMPUTED-key dispatch (`obj[k](…)`) got this
+            // in #7210 (3); the named-property tower here did not. Same fix, same
+            // combinator: one `RootedGroup` over [receiver, ...args], re-read
+            // below the group. `root_reload` then re-derives every later use that
+            // a collection point can reach, so the re-read is needed once here
+            // rather than at each of the tower's ~dozen consumers.
+            //
+            // #9480: state the window per operand. The receiver spans every
+            // argument; argument i spans only arguments i+1..N. The own-field
+            // and class-id probes below are certified GC leaves. Only work
+            // emitted after all source arguments (rest/`arguments` bundles or
+            // debug call-location bookkeeping) extends every window.
+            let collapse_dynamic = crate::codegen::full_outline_ic_enabled()
+                && method_dispatch_collapse_enabled()
+                && implementors
+                    .iter()
+                    .all(|(_, f)| !f.starts_with("perry_static_"));
+            let post_args_may_collect = ctx.strings.call_location_for(call_byte_offset).is_some()
+                || (!collapse_dynamic
+                    && impl_meta
+                        .iter()
+                        .any(|&(has_rest, has_synthetic, _, _)| has_rest || has_synthetic));
+            let mut roots = crate::rooting::open_rooted_group(1 + args.len());
+            let recv_collects =
+                post_args_may_collect || crate::rooting::any_operand_may_collect(ctx, args.iter());
+            let recv_idx = roots.lower(ctx, object, recv_collects)?;
             // #1758 / epic #1785: the raw user args (no `this`, no issue-#235
             // padding, no rest-bundling) drive every concrete callee below. A
             // `perry_static_*` implementor (a class-object value reaching this
@@ -341,9 +329,16 @@ pub(crate) fn try_lower_instance_method_call(
             // static arity/rest semantics; the instance-style `fname(recv,
             // args…)` direct call would pass recv as arg0 and never set
             // IMPLICIT_THIS (the #1787 broken-tower bug).
+            let mut arg_idxs: Vec<usize> = Vec::with_capacity(args.len());
+            for (index, a) in args.iter().enumerate() {
+                let collects = post_args_may_collect
+                    || crate::rooting::any_operand_may_collect(ctx, args[index + 1..].iter());
+                arg_idxs.push(roots.lower(ctx, a, collects)?);
+            }
+            let recv_box = roots.reread(ctx, recv_idx)?;
             let mut static_user_args: Vec<String> = Vec::with_capacity(args.len());
-            for a in args {
-                static_user_args.push(lower_expr(ctx, a)?);
+            for &idx in &arg_idxs {
+                static_user_args.push(roots.reread(ctx, idx)?);
             }
             // #5391 path 4: oversized modules full-outline the class-id switch
             // tower. The tower emits one icmp + case block per class implementing
@@ -355,12 +350,7 @@ pub(crate) fn try_lower_instance_method_call(
             // a `perry_static_*` class-object-static method, which needs
             // `js_class_static_method_call` and is NOT reproduced by the by-name
             // dispatcher. Mirrors the GET/SET/array-literal full-outline paths.
-            if crate::codegen::full_outline_ic_enabled()
-                && method_dispatch_collapse_enabled()
-                && implementors
-                    .iter()
-                    .all(|(_, f)| !f.starts_with("perry_static_"))
-            {
+            if collapse_dynamic {
                 let v = emit_collapsed_instance_dispatch(
                     ctx,
                     &recv_box,
@@ -369,6 +359,9 @@ pub(crate) fn try_lower_instance_method_call(
                     call_byte_offset,
                     /* with_override_probe */ true,
                 )?;
+                // Released below the call that reads the group, in the merge the
+                // collapse helper leaves current (`open_rooted_group`'s contract).
+                roots.release(ctx);
                 return Ok(Some(v));
             }
             // #5437: each implementor of `property` has its OWN declared arity
@@ -779,13 +772,18 @@ pub(crate) fn try_lower_instance_method_call(
 
             // Outer merge: phi over override and dispatch values.
             ctx.current_block = probe_outer_merge_idx;
-            return Ok(Some(ctx.block().phi(
+            let v_probe_phi = ctx.block().phi(
                 DOUBLE,
                 &[
                     (v_override_probe.as_str(), after_override_probe.as_str()),
                     (v_dispatch_phi.as_str(), after_dispatch_phi.as_str()),
                 ],
-            )));
+            );
+            // The release has to post-dominate BOTH arms of the override probe
+            // and every case block of the tower, which is why this group is
+            // `open_rooted_group` and the release sits in the outer merge.
+            roots.release(ctx);
+            return Ok(Some(v_probe_phi));
         }
     }
 
@@ -880,20 +878,9 @@ pub(crate) fn try_lower_instance_method_call(
                 }
             }
 
-            let recv_box = lower_expr(ctx, object)?;
-            let mut fallback_user_args: Vec<String> = Vec::with_capacity(args.len());
-            for a in args {
-                fallback_user_args.push(lower_expr(ctx, a)?);
-            }
-            // #5391 path 4 (virtual tower): eligibility to collapse the
-            // per-overriding-subclass class-id switch to a single by-name
-            // dispatch (see the two return sites below). Requires overrides
-            // (the empty case is the compact override-check path) and no
-            // `perry_static_*` implementor (those need
-            // `js_class_static_method_call`). Computed up front so the
-            // rest-bearing case can return BEFORE the rest-array bundling below,
-            // which would otherwise materialize a dead js_array for the collapsed
-            // path (the by-name dispatch takes the raw, un-bundled args).
+            // Metadata needed to state #9480's post-argument window before
+            // lowering the receiver. Computing it emits no program IR, so JS
+            // evaluation order remains receiver-then-arguments.
             let can_collapse_virtual = crate::codegen::full_outline_ic_enabled()
                 && method_dispatch_collapse_enabled()
                 && !overrides.is_empty()
@@ -912,14 +899,86 @@ pub(crate) fn try_lower_instance_method_call(
                 Some(&true)
             );
             // `fallback_key.0` is the class the parent-chain walk resolved
-            // `property` to — the defining class, so #8162's user-rest bit is
-            // read off the body the fallback call reaches.
+            // `property` to: the defining class that owns #8162's user-rest
+            // bit and the arguments-length-only specialization metadata.
             let fallback_has_user_rest =
                 crate::codegen::arguments::method_has_user_rest(ctx, &fallback_key.0, property);
             let fallback_arguments_length_only = matches!(
                 ctx.method_arguments_length_only.get(&fallback_key),
                 Some(&true)
             );
+            let collapses_before_bundling = (fallback_has_rest
+                || override_meta.iter().any(|meta| meta.0))
+                && can_collapse_virtual;
+            // Even an `arguments.length`-only clone needs a real Arguments
+            // bundle on a guard miss / own-override route, so keep that
+            // fallback allocation in the window. The early collapse above is
+            // the only path that proves no direct bundle will be emitted.
+            let fallback_bundle_may_collect = fallback_has_rest || fallback_has_synthetic_arguments;
+            let any_bundle_may_collect = !collapses_before_bundling
+                && (fallback_bundle_may_collect
+                    || override_meta.iter().any(|meta| meta.0 || meta.1));
+            // Specialized direct paths can place typed-feedback/argument
+            // guards between the final source argument and its consuming
+            // method call. Those guards are outside #9480's two-helper audit,
+            // so retain the conservative window for those uncommon paths.
+            let typed_method_key = (class_name.clone(), property.to_string());
+            let has_specialized_guard = ctx.typed_f64_methods.contains(&typed_method_key)
+                || ctx.typed_i32_methods.contains(&typed_method_key)
+                || ctx.typed_i1_methods.contains(&typed_method_key)
+                || ctx.typed_string_methods.contains(&typed_method_key)
+                || ctx
+                    .classes
+                    .get(&class_name)
+                    .and_then(|class| {
+                        let class = *class;
+                        class
+                            .methods
+                            .iter()
+                            .find(|method| method.name == property)
+                            .and_then(|method| {
+                                crate::codegen::typed_f64_receiver_method_info(
+                                    class,
+                                    method,
+                                    ctx.classes,
+                                )
+                            })
+                    })
+                    .is_some();
+            let post_args_may_collect = any_bundle_may_collect
+                || has_specialized_guard
+                || (can_collapse_virtual
+                    && ctx.strings.call_location_for(call_byte_offset).is_some());
+
+            // #9417, same defect as the dynamic-dispatch site above and for the
+            // same reason: the receiver is lowered first (JS evaluation order)
+            // and consumed by the override probe, the guarded direct calls and
+            // every arm of the class-id tower — all of it below the lowering of
+            // the argument expressions, any of which can drive an evacuating
+            // young-gen minor. `build_direct_method_args` additionally allocates
+            // a rest array between the re-read and the call.
+            //
+            // One `RootedGroup` over [receiver, ...args], re-read below the
+            // group. #9480 protects each operand only when a later argument or
+            // an audited post-argument step can collect; `root_reload`
+            // re-derives rooted values after any remaining collection point.
+            // Rest/synthetic bundles, debug bookkeeping, and specialized
+            // guards retain the conservative post-argument window.
+            let mut roots = crate::rooting::open_rooted_group(1 + args.len());
+            let recv_collects =
+                post_args_may_collect || crate::rooting::any_operand_may_collect(ctx, args.iter());
+            let recv_idx = roots.lower(ctx, object, recv_collects)?;
+            let mut arg_idxs: Vec<usize> = Vec::with_capacity(args.len());
+            for (index, a) in args.iter().enumerate() {
+                let collects = post_args_may_collect
+                    || crate::rooting::any_operand_may_collect(ctx, args[index + 1..].iter());
+                arg_idxs.push(roots.lower(ctx, a, collects)?);
+            }
+            let recv_box = roots.reread(ctx, recv_idx)?;
+            let mut fallback_user_args: Vec<String> = Vec::with_capacity(args.len());
+            for &idx in &arg_idxs {
+                fallback_user_args.push(roots.reread(ctx, idx)?);
+            }
             // Keep the maximum declared arity only for selecting safe
             // shape-guarded/typed fast-path arms below. Direct calls no longer
             // share an ABI vector: the fallback and each virtual override are
@@ -970,14 +1029,16 @@ pub(crate) fn try_lower_instance_method_call(
             if (fallback_has_rest || override_meta.iter().any(|meta| meta.0))
                 && can_collapse_virtual
             {
-                return Ok(Some(emit_collapsed_instance_dispatch(
+                let collapsed = emit_collapsed_instance_dispatch(
                     ctx,
                     &recv_box,
                     property,
                     &fallback_user_args,
                     call_byte_offset,
                     /* with_override_probe */ false,
-                )?));
+                )?;
+                roots.release(ctx);
+                return Ok(Some(collapsed));
             }
             let undefined_lit = double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
             let direct_args = build_direct_method_args(
@@ -1308,6 +1369,7 @@ pub(crate) fn try_lower_instance_method_call(
                         } else {
                             ctx.block().call(DOUBLE, &target, &fast_args)
                         };
+                        roots.release(ctx);
                         return Ok(Some(value));
                     }
                 }
@@ -1357,7 +1419,9 @@ pub(crate) fn try_lower_instance_method_call(
                     if fallback_arguments_length_only {
                         let target =
                             crate::codegen::arguments::arguments_length_method_name(&fallback_fn);
-                        return Ok(Some(ctx.block().call(DOUBLE, &target, &arg_slices)));
+                        let value = ctx.block().call(DOUBLE, &target, &arg_slices);
+                        roots.release(ctx);
+                        return Ok(Some(value));
                     }
                     // Representation-selection Phase 5a: the proven-`this`
                     // clone, when one was emitted. Hoisted above the
@@ -1421,6 +1485,7 @@ pub(crate) fn try_lower_instance_method_call(
                             &fallback_fn,
                             &argument_specialized,
                         );
+                        roots.release(ctx);
                         return Ok(Some(argument_specialized));
                     }
                     // Prefer the typed-receiver clone (bare gep+load field
@@ -1489,6 +1554,7 @@ pub(crate) fn try_lower_instance_method_call(
                             &fallback_fn,
                             &merged,
                         );
+                        roots.release(ctx);
                         return Ok(Some(merged));
                     }
                     // Representation-selection Phase 5a: route to the
@@ -1503,6 +1569,7 @@ pub(crate) fn try_lower_instance_method_call(
                         &fallback_fn,
                         &direct,
                     );
+                    roots.release(ctx);
                     return Ok(Some(direct));
                 }
                 let arguments_length_direct_fn = fallback_arguments_length_only
@@ -1550,6 +1617,7 @@ pub(crate) fn try_lower_instance_method_call(
                     shape_only_guard,
                     &subclass_arms,
                 ) {
+                    roots.release(ctx);
                     return Ok(Some(guarded));
                 }
             }
@@ -1591,7 +1659,7 @@ pub(crate) fn try_lower_instance_method_call(
                 // array as one positional argument and break a native override
                 // such as `super.emit(event, ...args)` forwarding to
                 // EventEmitter (#620 / rest-spread-to-native-override).
-                return Ok(Some(emit_own_method_override_check(
+                let checked = emit_own_method_override_check(
                     ctx,
                     &recv_box,
                     property,
@@ -1599,7 +1667,9 @@ pub(crate) fn try_lower_instance_method_call(
                     &arg_slices,
                     &recv_box,
                     &fallback_user_args,
-                )));
+                );
+                roots.release(ctx);
+                return Ok(Some(checked));
             }
 
             // #5391 path 4 (virtual tower): collapse the per-overriding-subclass
@@ -1611,14 +1681,16 @@ pub(crate) fn try_lower_instance_method_call(
             // behavior-identical. The rest-bearing case already collapsed above
             // (before the rest bundling); this handles the non-rest case.
             if can_collapse_virtual {
-                return Ok(Some(emit_collapsed_instance_dispatch(
+                let collapsed = emit_collapsed_instance_dispatch(
                     ctx,
                     &recv_box,
                     property,
                     &fallback_user_args,
                     call_byte_offset,
                     /* with_override_probe */ false,
-                )?));
+                )?;
+                roots.release(ctx);
+                return Ok(Some(collapsed));
             }
 
             // Step 4: virtual dispatch via class_id switch.
@@ -1739,7 +1811,12 @@ pub(crate) fn try_lower_instance_method_call(
                 .iter()
                 .map(|(v, l)| (v.as_str(), l.as_str()))
                 .collect();
-            return Ok(Some(ctx.block().phi(DOUBLE, &phi_args)));
+            let v_tower = ctx.block().phi(DOUBLE, &phi_args);
+            // The release post-dominates every case block and the default arm,
+            // which is why the group is `open_rooted_group`: releasing inside an
+            // arm would cut slots a sibling arm still reads.
+            roots.release(ctx);
+            return Ok(Some(v_tower));
         }
     }
     Ok(None)

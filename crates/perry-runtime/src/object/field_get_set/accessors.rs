@@ -316,45 +316,7 @@ pub(crate) unsafe fn ordinary_object_prototype_property_value(
                 scope.root_nanbox_f64(crate::value::js_nanbox_pointer(obj as usize as i64));
             let key_h = scope.root_nanbox_f64(crate::value::nanbox_string_key(key));
             let _guard = object_prototype_lookup_guard()?;
-            let mut current = class_id;
-            let mut prototype_name = "Error";
-            for _ in 0..32 {
-                match current {
-                    crate::error::CLASS_ID_TYPE_ERROR => {
-                        prototype_name = "TypeError";
-                        break;
-                    }
-                    crate::error::CLASS_ID_RANGE_ERROR => {
-                        prototype_name = "RangeError";
-                        break;
-                    }
-                    crate::error::CLASS_ID_REFERENCE_ERROR => {
-                        prototype_name = "ReferenceError";
-                        break;
-                    }
-                    crate::error::CLASS_ID_SYNTAX_ERROR => {
-                        prototype_name = "SyntaxError";
-                        break;
-                    }
-                    crate::error::CLASS_ID_EVAL_ERROR => {
-                        prototype_name = "EvalError";
-                        break;
-                    }
-                    crate::error::CLASS_ID_URI_ERROR => {
-                        prototype_name = "URIError";
-                        break;
-                    }
-                    crate::error::CLASS_ID_AGGREGATE_ERROR => {
-                        prototype_name = "AggregateError";
-                        break;
-                    }
-                    crate::error::CLASS_ID_ERROR => break,
-                    _ => match super::super::get_parent_class_id(current) {
-                        Some(parent) if parent != 0 && parent != current => current = parent,
-                        _ => break,
-                    },
-                }
-            }
+            let prototype_name = super::super::builtin_error_prototype_name(class_id);
             let prototype = super::super::builtin_prototype_value(prototype_name);
             let prototype_value = JSValue::from_bits(prototype.to_bits());
             if prototype_value.is_pointer() {
@@ -476,15 +438,43 @@ pub(crate) unsafe fn invoke_accessor_getter(get_bits: u64, receiver: f64) -> JSV
     // OrdinaryCallBindThis: a primitive receiver (accessor inherited from
     // Number.prototype / Object.prototype etc.) is boxed ONCE up front for a
     // sloppy getter; a strict getter observes the raw primitive.
-    let eff_receiver = crate::closure::coerce_call_this(f64::from_bits(get_bits), eff_receiver);
-    let call_bits = crate::closure::clone_closure_rebind_this(get_bits, eff_receiver);
-    let closure = (call_bits & crate::value::POINTER_MASK) as *const crate::closure::ClosureHeader;
-    if closure.is_null() {
+    //
+    // #9417: every value below is GC-managed and lives across an allocation.
+    // `coerce_call_this` boxes a primitive receiver, `clone_closure_rebind_this`
+    // allocates a fresh `ClosureHeader`, and `js_closure_call0` runs USER CODE —
+    // any of the three can drive an evacuating young-gen minor. A bare Rust
+    // local is exactly the slot the collector cannot see or rewrite (#7249,
+    // #7498), and the receiver here is not merely read afterwards: it is
+    // PUBLISHED into the GC-rooted `IMPLICIT_THIS` cell, and `prev` is written
+    // back into that same cell after the getter body has had a full turn to
+    // allocate. Either store installs a pre-collection address as some frame's
+    // `this`, after which every ordinary property read off it answers
+    // `undefined` (`js_object_get_own_field_or_undef` fails its
+    // `obj_type == GC_TYPE_OBJECT` check on the retired cell and returns
+    // TAG_UNDEFINED rather than faulting) — the silent-wrong-answer shape
+    // claude-code reported as `Cannot read properties of undefined (reading
+    // 'def')` on its unauthenticated path.
+    //
+    // Root all four and re-read each at its point of use.
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let get_h = scope.root_nanbox_u64(get_bits);
+    let recv_h = scope.root_nanbox_f64(eff_receiver);
+    let coerced = crate::closure::coerce_call_this(
+        f64::from_bits(get_h.get_nanbox_u64()),
+        recv_h.get_nanbox_f64(),
+    );
+    let recv_h = scope.root_nanbox_f64(coerced);
+    let call_bits =
+        crate::closure::clone_closure_rebind_this(get_h.get_nanbox_u64(), recv_h.get_nanbox_f64());
+    let call_h = scope.root_nanbox_u64(call_bits);
+    if (call_h.get_nanbox_u64() & crate::value::POINTER_MASK) == 0 {
         return JSValue::undefined();
     }
-    let prev = super::super::js_implicit_this_set(eff_receiver);
+    let prev_h = scope.root_nanbox_f64(super::super::js_implicit_this_set(recv_h.get_nanbox_f64()));
+    let closure = (call_h.get_nanbox_u64() & crate::value::POINTER_MASK)
+        as *const crate::closure::ClosureHeader;
     let result_f64 = crate::closure::js_closure_call0(closure);
-    super::super::js_implicit_this_set(prev);
+    super::super::js_implicit_this_set(prev_h.get_nanbox_f64());
     JSValue::from_bits(result_f64.to_bits())
 }
 
@@ -496,15 +486,29 @@ pub(crate) unsafe fn invoke_accessor_setter(set_bits: u64, receiver: f64, value:
         return;
     }
     // Strict/sloppy receiver coercion — see invoke_accessor_getter.
-    let receiver = crate::closure::coerce_call_this(f64::from_bits(set_bits), receiver);
-    let call_bits = crate::closure::clone_closure_rebind_this(set_bits, receiver);
-    let closure = (call_bits & crate::value::POINTER_MASK) as *const crate::closure::ClosureHeader;
-    if closure.is_null() {
+    // #9417: same rooting contract as `invoke_accessor_getter` — plus `value`,
+    // which is a bare local across the closure-clone allocation and is then
+    // handed to user code as the assigned value.
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let set_h = scope.root_nanbox_u64(set_bits);
+    let recv_h = scope.root_nanbox_f64(receiver);
+    let value_h = scope.root_nanbox_f64(value);
+    let coerced = crate::closure::coerce_call_this(
+        f64::from_bits(set_h.get_nanbox_u64()),
+        recv_h.get_nanbox_f64(),
+    );
+    let recv_h = scope.root_nanbox_f64(coerced);
+    let call_bits =
+        crate::closure::clone_closure_rebind_this(set_h.get_nanbox_u64(), recv_h.get_nanbox_f64());
+    let call_h = scope.root_nanbox_u64(call_bits);
+    if (call_h.get_nanbox_u64() & crate::value::POINTER_MASK) == 0 {
         return;
     }
-    let prev = super::super::js_implicit_this_set(receiver);
-    let _ = crate::closure::js_closure_call1(closure, value);
-    super::super::js_implicit_this_set(prev);
+    let prev_h = scope.root_nanbox_f64(super::super::js_implicit_this_set(recv_h.get_nanbox_f64()));
+    let closure = (call_h.get_nanbox_u64() & crate::value::POINTER_MASK)
+        as *const crate::closure::ClosureHeader;
+    let _ = crate::closure::js_closure_call1(closure, value_h.get_nanbox_f64());
+    super::super::js_implicit_this_set(prev_h.get_nanbox_f64());
 }
 
 /// Invoke an accessor owned by a descriptor-marked object before its empty

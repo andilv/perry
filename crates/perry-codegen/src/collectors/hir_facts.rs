@@ -64,6 +64,19 @@ pub(crate) struct RepresentationFacts {
     /// — it never widens the parallel-shadow `needs_i32_slot` gate. See
     /// `collectors/loop_bounded_i32.rs`.
     pub loop_bounded_i32_locals: HashSet<u32>,
+    /// #9363: accumulators whose `acc = acc + <byte read>` chain provably
+    /// stays below 2^53, so the update's `fadd` may carry `reassoc` and the
+    /// reduction can be split into parallel partial sums. Same trip-count
+    /// proof as `loop_bounded_i32_locals`, weaker conclusion — it changes no
+    /// storage decision, only an FMF flag. See `collectors/loop_bounded_i32.rs`.
+    pub reassociable_f64_accumulators: HashSet<u32>,
+    /// The intervals and integer constants behind `loop_bounded_i32_locals`,
+    /// for a consumer that needs the numbers rather than the verdict:
+    /// `concat_site_cache.rs` gives a `"literal" + value` site a per-site
+    /// table only when the value is proven small. Runs independently of the
+    /// canonical-i32 gate for the same reason as
+    /// `reassociable_f64_accumulators`: it is not a storage decision.
+    pub loop_induction: super::loop_bounded_i32::LoopInductionFacts,
     /// Locals whose canonical-i32 promotion is PROVABLE but not PROFITABLE
     /// (#7128): written after declaration, no i32-consuming read anywhere in
     /// the body, and at least one double-consuming read inside a loop — so the
@@ -222,6 +235,14 @@ impl TypeFacts {
 
     pub(crate) fn loop_bounded_i32_locals(&self) -> &HashSet<u32> {
         &self.representation.loop_bounded_i32_locals
+    }
+
+    pub(crate) fn reassociable_f64_accumulators(&self) -> &HashSet<u32> {
+        &self.representation.reassociable_f64_accumulators
+    }
+
+    pub(crate) fn loop_induction(&self) -> &super::loop_bounded_i32::LoopInductionFacts {
+        &self.representation.loop_induction
     }
 
     pub(crate) fn unprofitable_canonical_i32_locals(&self) -> &HashSet<u32> {
@@ -541,6 +562,16 @@ pub(crate) fn collect_type_facts(
     } else {
         HashSet::new()
     };
+    // #9363: the reassociation admission runs independently of the canonical
+    // i32 gate — it is not a storage decision, so `PERRY_CANONICAL_I32_LOCALS=0`
+    // must not silently disable it.
+    let reassociable_f64_accumulators =
+        super::loop_bounded_i32::collect_reassociable_f64_accumulators(
+            stmts,
+            compile_time_constants,
+        );
+    let loop_induction =
+        super::loop_bounded_i32::collect_loop_induction_facts(stmts, compile_time_constants);
     // #7123: this set now includes accumulators whose integer-ness and full
     // range were proved together (for example `sum += i % 1000`). The older
     // integer provenance collector deliberately does not accept bare `%`, so
@@ -716,6 +747,8 @@ pub(crate) fn collect_type_facts(
             not_bigint_locals,
             int_valued_ta_locals,
             loop_bounded_i32_locals,
+            reassociable_f64_accumulators,
+            loop_induction,
             unprofitable_canonical_i32_locals,
             number_by_construction_locals,
         },
@@ -777,6 +810,7 @@ pub(crate) fn collect_native_region_fact_graph(
     classes: &HashMap<String, &perry_hir::Class>,
     compile_time_constants: &HashMap<u32, f64>,
     module_dispatch: &super::ModuleDispatchFacts,
+    module_global_proven_types: &HashMap<u32, perry_hir::types::Type>,
 ) -> NativeRegionFactGraph {
     collect_native_region_fact_graph_with_spec_params(
         stmts,
@@ -794,7 +828,7 @@ pub(crate) fn collect_native_region_fact_graph(
         &HashSet::new(),
         &HashSet::new(),
         &HashSet::new(),
-        &HashMap::new(),
+        module_global_proven_types,
     )
 }
 
@@ -2195,6 +2229,7 @@ mod tests {
             &HashMap::new(),
             &constants,
             &crate::collectors::ModuleDispatchFacts::default(),
+            &HashMap::new(),
         );
 
         assert!(graph.known_noalias_buffer_locals().contains(&1));
@@ -2286,6 +2321,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &crate::collectors::ModuleDispatchFacts::default(),
+            &HashMap::new(),
         );
 
         assert!(graph.integer_locals().contains(&1));

@@ -105,10 +105,11 @@ struct GuardedLevel {
     extreme: i64,
 }
 
+/// A closed integer interval a local is proven never to leave.
 #[derive(Clone, Copy, Debug)]
-struct IntInterval {
-    lo: i64,
-    hi: i64,
+pub(crate) struct IntInterval {
+    pub(crate) lo: i64,
+    pub(crate) hi: i64,
 }
 
 /// Analysis state, accumulated over one whole function body.
@@ -199,8 +200,102 @@ pub fn collect_loop_bounded_i32_locals(
         stmts,
         &st,
         &induction_intervals,
+        AccumulatorMode::I32Storage,
     ));
     out
+}
+
+/// #9363: accumulators whose `acc = acc + <byte read>` chain provably stays
+/// below 2^53, so the update's `fadd` may carry `reassoc`.
+///
+/// Same proof, same trip-count machinery, weaker conclusion — see
+/// [`AccumulatorMode`]. Consumed only by the emitter that adds the flag; it
+/// changes no storage decision, so a wrong `true` cannot produce a wrapped or
+/// mistyped value, only a differently-grouped sum (which the bound proves is
+/// bit-identical anyway).
+pub fn collect_reassociable_f64_accumulators(
+    stmts: &[Stmt],
+    compile_time_constants: &HashMap<u32, f64>,
+) -> HashSet<u32> {
+    let st = analysed_state(stmts, compile_time_constants);
+    let induction_intervals = induction_intervals(&st);
+    collect_bounded_accumulator_locals(
+        stmts,
+        &st,
+        &induction_intervals,
+        AccumulatorMode::ReassocF64,
+    )
+}
+
+/// What the induction proof knows about integer values, for a consumer that
+/// needs the numbers rather than the i32 verdict: `concat_site_cache.rs`
+/// gives a `"literal" + value` site a per-site table only when the value is
+/// proven small, because the table's inline gate is pure cost on a value
+/// that sweeps past it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LoopInductionFacts {
+    /// Every admissible counter's closed interval, both endpoints in i32.
+    pub(crate) intervals: HashMap<u32, IntInterval>,
+    /// Locals that are integer constants: module-level compile-time
+    /// constants plus this body's never-written `const`/`let` bindings with
+    /// an integer-literal initialiser — the same set the loop guard `v < B`
+    /// accepts as `B`.
+    pub(crate) integer_constants: HashMap<u32, i64>,
+}
+
+pub fn collect_loop_induction_facts(
+    stmts: &[Stmt],
+    compile_time_constants: &HashMap<u32, f64>,
+) -> LoopInductionFacts {
+    let st = analysed_state(stmts, compile_time_constants);
+    let intervals = induction_intervals(&st);
+    let mut integer_constants = st.module_consts.clone();
+    integer_constants.extend(st.const_ints.iter().map(|(&id, &v)| (id, v)));
+    LoopInductionFacts {
+        intervals,
+        integer_constants,
+    }
+}
+
+/// Run the whole-function walk once; both interval consumers start here.
+fn analysed_state(stmts: &[Stmt], compile_time_constants: &HashMap<u32, f64>) -> State {
+    let mut st = State::default();
+    st.module_consts = compile_time_constants
+        .iter()
+        .filter_map(|(&id, &v)| {
+            (v.is_finite() && v.fract() == 0.0 && v.abs() <= i32::MAX as f64)
+                .then_some((id, v as i64))
+        })
+        .collect();
+    collect_declarations(stmts, &mut st);
+    collect_const_ints(stmts, &mut st);
+    let empty: HashMap<u32, GuardedLevel> = HashMap::new();
+    walk_stmts(stmts, &empty, &mut st);
+    st
+}
+
+/// Every admissible local's closed interval, both endpoints inside i32.
+fn induction_intervals(st: &State) -> HashMap<u32, IntInterval> {
+    st.bounds
+        .iter()
+        .filter_map(|(&id, bound)| {
+            if st.disqualified.contains(&id) || st.bad_decl.contains(&id) {
+                return None;
+            }
+            let init = *st.declared_init.get(&id)?;
+            let interval = match bound.dir {
+                Dir::Inc => IntInterval {
+                    lo: init,
+                    hi: bound.extreme,
+                },
+                Dir::Dec => IntInterval {
+                    lo: bound.extreme,
+                    hi: init,
+                },
+            };
+            (fits_i32(interval.lo) && fits_i32(interval.hi)).then_some((id, interval))
+        })
+        .collect()
 }
 
 fn fits_i32(n: i64) -> bool {
@@ -934,6 +1029,46 @@ impl ExecutionBound {
     }
 }
 
+/// Which admission the accumulator pass is computing.
+///
+/// Both share one proof — `|acc| <= |A0| + sum(T * M)` over the trip-count
+/// machinery above — and differ only in what magnitudes count as bounded and
+/// how large the result may be.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AccumulatorMode {
+    /// #7123: admit to canonical i32 STORAGE. Every addend must be an
+    /// integer-valued expression, because the slot cannot hold anything else.
+    I32Storage,
+    /// #9363: admit only to `fadd reassoc` on the accumulator update — the
+    /// value stays an f64 in the same slot it always used.
+    ///
+    /// This is a strictly weaker claim, so it admits strictly more:
+    ///
+    ///  * a byte read (`buf[i]`) counts with magnitude 255. It is NOT
+    ///    integer-valued in general — an out-of-range read is `undefined`,
+    ///    i.e. NaN in arithmetic — which is exactly why `I32Storage` must
+    ///    refuse it: an i32 slot cannot represent NaN. Reassociation does not
+    ///    care: NaN propagates through every grouping alike, so a chain
+    ///    containing one is NaN under any association, and a chain without one
+    ///    is a sum of exact integers.
+    ///  * the limit is 2^53 rather than `i32::MAX`, because the claim is only
+    ///    that every partial sum is exactly representable as an f64 (where
+    ///    addition is associative), not that it fits an integer register.
+    ReassocF64,
+}
+
+impl AccumulatorMode {
+    fn limit(self) -> u128 {
+        match self {
+            // Below 2^53 every integer is exactly representable, so f64
+            // addition is exact and therefore associative: any grouping of the
+            // same addends yields bit-identical results.
+            Self::ReassocF64 => 1u128 << 53,
+            Self::I32Storage => i32::MAX as u128,
+        }
+    }
+}
+
 #[derive(Default)]
 struct AccumulatorState {
     /// Sum of the worst-case magnitude contribution from every syntactic write
@@ -948,6 +1083,7 @@ fn collect_bounded_accumulator_locals(
     stmts: &[Stmt],
     induction: &State,
     induction_intervals: &HashMap<u32, IntInterval>,
+    mode: AccumulatorMode,
 ) -> HashSet<u32> {
     let mut accumulators = AccumulatorState::default();
     walk_accumulator_stmts(
@@ -955,6 +1091,7 @@ fn collect_bounded_accumulator_locals(
         ExecutionBound::function_body(),
         induction,
         induction_intervals,
+        mode,
         &mut accumulators,
     );
 
@@ -968,7 +1105,7 @@ fn collect_bounded_accumulator_locals(
             let init = *induction.declared_init.get(&id)?;
             let contribution = *accumulators.contribution.get(&id)?;
             let worst_magnitude = u128::from(init.unsigned_abs()).saturating_add(contribution);
-            (worst_magnitude <= i32::MAX as u128).then_some(id)
+            (worst_magnitude <= mode.limit()).then_some(id)
         })
         .collect()
 }
@@ -1031,6 +1168,7 @@ fn accumulator_step_magnitude(
     value: &Expr,
     st: &State,
     induction_intervals: &HashMap<u32, IntInterval>,
+    mode: AccumulatorMode,
 ) -> Option<u128> {
     let Expr::Binary {
         op: BinaryOp::Add,
@@ -1048,14 +1186,26 @@ fn accumulator_step_magnitude(
     } else {
         return None;
     };
-    step_magnitude_bound(step, st, induction_intervals)
+    step_magnitude_bound(step, st, induction_intervals, mode)
 }
 
 fn step_magnitude_bound(
     e: &Expr,
     st: &State,
     induction_intervals: &HashMap<u32, IntInterval>,
+    mode: AccumulatorMode,
 ) -> Option<u128> {
+    // A `Uint8Array` / `Buffer` element is a byte, so its magnitude is at most
+    // 255 — the tightest bound any addend in this analysis has. It is admitted
+    // ONLY under `ReassocF64`: an out-of-range read is `undefined`, hence NaN
+    // in arithmetic, which is not an integer value and must never reach an i32
+    // slot. Reassociation tolerates it because NaN propagates identically
+    // through every grouping. See `AccumulatorMode`.
+    if mode == AccumulatorMode::ReassocF64
+        && matches!(e, Expr::Uint8ArrayGet { .. } | Expr::BufferIndexGet { .. })
+    {
+        return Some(255);
+    }
     if let Some(value) = integer_literal(e) {
         return Some(u128::from(value.unsigned_abs()));
     }
@@ -1109,10 +1259,12 @@ fn record_accumulator_write(
     execution: ExecutionBound,
     induction: &State,
     induction_intervals: &HashMap<u32, IntInterval>,
+    mode: AccumulatorMode,
     accumulators: &mut AccumulatorState,
 ) {
-    let magnitude = value
-        .and_then(|value| accumulator_step_magnitude(id, value, induction, induction_intervals));
+    let magnitude = value.and_then(|value| {
+        accumulator_step_magnitude(id, value, induction, induction_intervals, mode)
+    });
     let Some((executions, magnitude)) = execution.executions.zip(magnitude) else {
         accumulators.disqualified.insert(id);
         return;
@@ -1135,6 +1287,7 @@ fn walk_accumulator_stmts(
     execution: ExecutionBound,
     induction: &State,
     induction_intervals: &HashMap<u32, IntInterval>,
+    mode: AccumulatorMode,
     accumulators: &mut AccumulatorState,
 ) {
     for stmt in stmts {
@@ -1146,6 +1299,7 @@ fn walk_accumulator_stmts(
                         execution,
                         induction,
                         induction_intervals,
+                        mode,
                         accumulators,
                     );
                 }
@@ -1155,6 +1309,7 @@ fn walk_accumulator_stmts(
                 execution,
                 induction,
                 induction_intervals,
+                mode,
                 accumulators,
             ),
             Stmt::Return(value) => {
@@ -1164,6 +1319,7 @@ fn walk_accumulator_stmts(
                         execution,
                         induction,
                         induction_intervals,
+                        mode,
                         accumulators,
                     );
                 }
@@ -1178,6 +1334,7 @@ fn walk_accumulator_stmts(
                     execution,
                     induction,
                     induction_intervals,
+                    mode,
                     accumulators,
                 );
                 walk_accumulator_stmts(
@@ -1185,6 +1342,7 @@ fn walk_accumulator_stmts(
                     execution,
                     induction,
                     induction_intervals,
+                    mode,
                     accumulators,
                 );
                 if let Some(else_branch) = else_branch {
@@ -1193,6 +1351,7 @@ fn walk_accumulator_stmts(
                         execution,
                         induction,
                         induction_intervals,
+                        mode,
                         accumulators,
                     );
                 }
@@ -1208,9 +1367,17 @@ fn walk_accumulator_stmts(
                     unknown,
                     induction,
                     induction_intervals,
+                    mode,
                     accumulators,
                 );
-                walk_accumulator_stmts(body, unknown, induction, induction_intervals, accumulators);
+                walk_accumulator_stmts(
+                    body,
+                    unknown,
+                    induction,
+                    induction_intervals,
+                    mode,
+                    accumulators,
+                );
             }
             Stmt::For {
                 init,
@@ -1224,6 +1391,7 @@ fn walk_accumulator_stmts(
                         execution,
                         induction,
                         induction_intervals,
+                        mode,
                         accumulators,
                     );
                 }
@@ -1242,6 +1410,7 @@ fn walk_accumulator_stmts(
                         execution.nested_loop(None),
                         induction,
                         induction_intervals,
+                        mode,
                         accumulators,
                     );
                 }
@@ -1251,6 +1420,7 @@ fn walk_accumulator_stmts(
                         loop_execution,
                         induction,
                         induction_intervals,
+                        mode,
                         accumulators,
                     );
                 }
@@ -1259,6 +1429,7 @@ fn walk_accumulator_stmts(
                     loop_execution,
                     induction,
                     induction_intervals,
+                    mode,
                     accumulators,
                 );
             }
@@ -1272,6 +1443,7 @@ fn walk_accumulator_stmts(
                     execution,
                     induction,
                     induction_intervals,
+                    mode,
                     accumulators,
                 );
                 if let Some(catch) = catch {
@@ -1280,6 +1452,7 @@ fn walk_accumulator_stmts(
                         execution,
                         induction,
                         induction_intervals,
+                        mode,
                         accumulators,
                     );
                 }
@@ -1289,6 +1462,7 @@ fn walk_accumulator_stmts(
                         execution,
                         induction,
                         induction_intervals,
+                        mode,
                         accumulators,
                     );
                 }
@@ -1302,6 +1476,7 @@ fn walk_accumulator_stmts(
                     execution,
                     induction,
                     induction_intervals,
+                    mode,
                     accumulators,
                 );
                 for case in cases {
@@ -1311,6 +1486,7 @@ fn walk_accumulator_stmts(
                             execution,
                             induction,
                             induction_intervals,
+                            mode,
                             accumulators,
                         );
                     }
@@ -1319,6 +1495,7 @@ fn walk_accumulator_stmts(
                         execution,
                         induction,
                         induction_intervals,
+                        mode,
                         accumulators,
                     );
                 }
@@ -1328,6 +1505,7 @@ fn walk_accumulator_stmts(
                 execution,
                 induction,
                 induction_intervals,
+                mode,
                 accumulators,
             ),
             _ => {}
@@ -1340,6 +1518,7 @@ fn walk_accumulator_expr(
     execution: ExecutionBound,
     induction: &State,
     induction_intervals: &HashMap<u32, IntInterval>,
+    mode: AccumulatorMode,
     accumulators: &mut AccumulatorState,
 ) {
     match expr {
@@ -1350,6 +1529,7 @@ fn walk_accumulator_expr(
                 execution,
                 induction,
                 induction_intervals,
+                mode,
                 accumulators,
             );
             walk_accumulator_expr(
@@ -1357,6 +1537,7 @@ fn walk_accumulator_expr(
                 execution,
                 induction,
                 induction_intervals,
+                mode,
                 accumulators,
             );
         }
@@ -1366,6 +1547,7 @@ fn walk_accumulator_expr(
             execution,
             induction,
             induction_intervals,
+            mode,
             accumulators,
         ),
         Expr::Closure { body, .. } => {
@@ -1377,7 +1559,14 @@ fn walk_accumulator_expr(
             accumulators.disqualified.extend(written);
             let unknown = execution.nested_loop(None);
             perry_hir::walker::walk_expr_children(expr, &mut |child| {
-                walk_accumulator_expr(child, unknown, induction, induction_intervals, accumulators)
+                walk_accumulator_expr(
+                    child,
+                    unknown,
+                    induction,
+                    induction_intervals,
+                    mode,
+                    accumulators,
+                )
             });
         }
         _ => {
@@ -1390,6 +1579,7 @@ fn walk_accumulator_expr(
                     execution,
                     induction,
                     induction_intervals,
+                    mode,
                     accumulators,
                 )
             });

@@ -71,6 +71,7 @@ fn empty_module() -> Module {
         script_global_functions: Vec::new(),
         references_global_this: false,
         annexb_global_undefined_names: Vec::new(),
+        init_is_strict: false,
         init: Vec::new(),
         classic_for_lexical_bindings: std::collections::HashSet::new(),
         exported_native_instances: Vec::new(),
@@ -88,6 +89,7 @@ fn empty_module() -> Module {
         closure_display_names: std::collections::HashMap::new(),
         class_display_names: std::collections::HashMap::new(),
         closure_source_text: std::collections::HashMap::new(),
+        class_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
@@ -278,6 +280,85 @@ fn event_loop_microtask_pump_is_the_single_timer_phase_owner() {
             "{redundant_call} duplicates the timer phases already owned by the event-loop checkpoint\n{ir}"
         );
     }
+}
+
+/// #9441: the body's park must be guarded by a re-check of the SAME liveness
+/// question the header asks, so the iteration that consumed the last event
+/// source does not sleep on an answer already known.
+///
+/// This is the mechanism assertion. On unfixed `origin/main` the body ended in
+/// an unconditional `call void @js_wait_for_event()` and the ~1 s idle tail was
+/// visible only on a stopwatch; here it is structural.
+#[test]
+fn event_loop_body_rechecks_liveness_before_parking() {
+    let ir = emitted_ir("executable");
+
+    let body_start = ir
+        .find("\nevent_loop.body.")
+        .map(|offset| offset + 1)
+        .unwrap_or_else(|| panic!("missing event-loop body block in emitted IR:\n{ir}"));
+    let body_len = ir[body_start..]
+        .find("\nevent_loop.")
+        .expect("the body block should be followed by another event_loop block");
+    let body_block = &ir[body_start..body_start + body_len];
+    assert!(
+        !body_block.contains("js_wait_for_event"),
+        "the body must hand off to the liveness re-check, not park unconditionally\n{body_block}"
+    );
+    assert!(
+        body_block.contains("br label %event_loop.body_check"),
+        "the body must branch to the post-body liveness re-check\n{body_block}"
+    );
+
+    let check_start = ir
+        .find("\nevent_loop.body_check.")
+        .map(|offset| offset + 1)
+        .unwrap_or_else(|| panic!("missing event_loop.body_check block:\n{ir}"));
+    let check_len = ir[check_start..]
+        .find("\nevent_loop.")
+        .expect("body_check should be followed by another event_loop block");
+    let check_block = &ir[check_start..check_start + check_len];
+
+    // Every arm the header consults must be re-asked here, or a source the
+    // re-check cannot see would make the loop spin instead of park.
+    for arm in [
+        "js_timer_has_pending",
+        "js_callback_timer_has_pending",
+        "js_interval_timer_has_pending",
+        "js_stdlib_has_active_handles",
+        "js_bun_ffi_has_active_threadsafe_callbacks",
+        "js_microtasks_pending",
+    ] {
+        assert!(
+            check_block.contains(arm),
+            "the post-body re-check must consult {arm} exactly as the header does\n{check_block}"
+        );
+    }
+    assert!(
+        check_block.contains("br i1 ") && check_block.contains("%event_loop.body_wait"),
+        "the re-check must branch to the park only when something is still live\n{check_block}"
+    );
+    assert!(
+        check_block.contains("%event_loop.header"),
+        "the re-check must skip the park and go straight back to the header when \
+         nothing is live\n{check_block}"
+    );
+
+    // The park itself still exists — the fix removes the park on a DEAD loop,
+    // not the park on a live one, and deleting it would spin every waiting
+    // program at 100 % CPU.
+    let wait_start = ir
+        .find("\nevent_loop.body_wait.")
+        .map(|offset| offset + 1)
+        .unwrap_or_else(|| panic!("missing event_loop.body_wait block:\n{ir}"));
+    let wait_len = ir[wait_start..]
+        .find("\nevent_loop.")
+        .expect("body_wait should be followed by another event_loop block");
+    let wait_block = &ir[wait_start..wait_start + wait_len];
+    assert!(
+        wait_block.contains("call void @js_wait_for_event()"),
+        "a loop with live work must still park\n{wait_block}"
+    );
 }
 
 #[test]

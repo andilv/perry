@@ -904,6 +904,10 @@ pub fn lower_module_full(
         ctx.seed_imported_class_accessors(seed);
     }
     let mut module = Module::new(name);
+    // #9423: hand codegen the strictness lowering just computed. Set here, next
+    // to `ctx.module_strict`, rather than at the end of lowering, so a later
+    // early return cannot ship a module that claims to be sloppy.
+    module.init_is_strict = ctx.module_strict;
     if should_enable_react_automatic_jsx(name, ast_module) {
         enable_react_automatic_jsx(&mut module, &mut ctx);
     }
@@ -1488,6 +1492,10 @@ pub fn lower_module_full(
         // #4101: flush captured function source text for `fn.toString()`.
         for (id, src) in ctx.closure_source_text.drain() {
             module.closure_source_text.insert(id, src);
+        }
+        // #9413: same, for classes — `String(C)` must produce class source.
+        for (id, src) in ctx.class_source_text.drain() {
+            module.class_source_text.insert(id, src);
         }
         // Flush any pending classes created during expression lowering
         // (e.g., class expressions in `new (class extends Command { ... })()`)

@@ -199,6 +199,25 @@ fn module(name: &str, params: Vec<Param>, return_type: Type, body: Vec<Stmt>) ->
     module_with_classes(name, Vec::new(), params, return_type, body)
 }
 
+/// #9459: the same module with `probe` (and module init) STRICT.
+///
+/// `module_with_classes` hard-codes `is_strict: false`, which used to be
+/// invisible: `Expr::PropertySet` carried no strictness and every store took one
+/// lowering. It now takes the assignment's own `Throw` flag from
+/// `FnCtx::is_strict_fn`, and only the STRICT store tail carries the
+/// typed-feedback `PropertySet` site -- the sloppy tail is
+/// `js_put_value_set(..., 0)`, so a rejected sloppy `[[Set]]` stays a silent
+/// no-op. A test whose subject is that site has to ask for the lane it lives on,
+/// the same expectation move #9458 made when `Module::init_is_strict` landed.
+fn strict_module(name: &str, params: Vec<Param>, return_type: Type, body: Vec<Stmt>) -> Module {
+    let mut module = module_with_classes(name, Vec::new(), params, return_type, body);
+    module.init_is_strict = true;
+    for function in &mut module.functions {
+        function.is_strict = true;
+    }
+    module
+}
+
 fn module_with_classes(
     name: &str,
     classes: Vec<Class>,
@@ -231,6 +250,7 @@ fn module_with_classes(
             was_plain_async: false,
             was_unrolled: false,
         }],
+        init_is_strict: false,
         init: Vec::new(),
         classic_for_lexical_bindings: std::collections::HashSet::new(),
         exported_native_instances: Vec::new(),
@@ -251,6 +271,7 @@ fn module_with_classes(
         closure_display_names: std::collections::HashMap::new(),
         class_display_names: std::collections::HashMap::new(),
         closure_source_text: std::collections::HashMap::new(),
+        class_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
@@ -341,7 +362,12 @@ fn typed_feedback_instruments_property_and_method_boundaries() {
     // later tests in this binary never observe the changed environment.
     let _lock = env_lock();
     let _env = EnvVarGuard::set("PERRY_TYPED_FEEDBACK", Some("1"));
-    let ir = ir_for(module(
+    // #9459: STRICT -- see `strict_module`. #9495: the strict and sloppy tails
+    // are now ONE tail (`js_put_value_set` with the assignment's own `Throw`
+    // flag), so the `object_set_by_name_guard` site asserted here is registered
+    // in both modes; the sloppy twin below asserts the flag, not a different
+    // lane.
+    let ir = ir_for(strict_module(
         "typed_feedback_property.ts",
         vec![param(1, "obj", Type::Any)],
         Type::Any,
@@ -374,14 +400,117 @@ fn typed_feedback_instruments_property_and_method_boundaries() {
     assert!(ir.contains("object_set_by_name_guard"));
     assert!(ir.contains("object_get_by_name_guard"));
     assert!(ir.contains("method_call_guard"));
-    assert!(ir.contains("js_typed_feedback_object_set_field_by_name_fast"));
-    assert!(ir.contains("js_object_set_field_by_name"));
+    // #9495: the strict by-name store is the receiver-aware `[[Set]]`
+    // (`js_put_value_set(..., 1)`), observed by the pure-recording
+    // `js_typed_feedback_observe_property_set` in an emitting build -- not the
+    // own-property `js_typed_feedback_object_set_field_by_name_fast` ->
+    // `js_object_set_field_by_name` dispatcher, which skipped the prototype
+    // walk. Match CALLS: every runtime entry is `declare`d in every module.
+    assert!(
+        ir.contains("call void @js_typed_feedback_observe_property_set("),
+        "an emitting build observes the strict by-name store:\n{ir}"
+    );
+    assert_eq!(
+        put_value_set_strict_flags(&ir),
+        vec!["1"],
+        "the strict store reaches `js_put_value_set` with Throw = 1:\n{ir}"
+    );
+    assert!(
+        !ir.contains("call void @js_typed_feedback_object_set_field_by_name_fast("),
+        "the own-property store dispatcher must not be CALLED on a strict \
+         by-name store -- it skips the prototype walk (#9495):\n{ir}"
+    );
     assert!(ir.contains("js_object_get_field_by_name_f64"));
     assert!(ir.contains("call double @js_typed_feedback_native_call_method"));
     assert!(ir.contains("call void @js_typed_feedback_record_guard_pass"));
     assert!(ir.contains("call void @js_typed_feedback_record_guard_fail"));
     assert!(ir.contains("call void @js_typed_feedback_record_fallback_call"));
     assert!(ir.contains("call void @js_typed_feedback_observe_property_get"));
+}
+
+/// The `i32` `Throw` flag of every `js_put_value_set` CALL in `ir`, in emission
+/// order. Matches the call, never the `declare` line, and reads the flag off
+/// the call's last operand so a test can pin WHICH mode reached the entry.
+fn put_value_set_strict_flags(ir: &str) -> Vec<&str> {
+    ir.lines()
+        .filter(|line| line.contains("call double @js_put_value_set("))
+        .map(|line| {
+            let args = line.rsplit_once(')').map(|(head, _)| head).unwrap_or(line);
+            args.rsplit_once("i32 ")
+                .map(|(_, flag)| flag.trim())
+                .expect("js_put_value_set call ends in its i32 Throw flag")
+        })
+        .collect()
+}
+
+/// #9459: the sloppy twin of the boundaries test above.
+///
+/// A sloppy `o.x = v` must not reach `js_object_set_field_by_name` -- it has no
+/// `strict` parameter and rejects a non-writable slot by throwing, where sloppy
+/// `PutValue` discards the rejection. It goes to `js_put_value_set(..., 0)`.
+///
+/// #9495: the strict tail is the same entry with `1`, so the two modes are now
+/// distinguished by the flag alone; the typed-feedback `PropertySet` site is
+/// registered in both (it describes the store, not its strictness), and the
+/// old own-property dispatcher is called in neither.
+///
+/// The GET boundary is asserted too, and is deliberately unchanged: strictness
+/// is a property of `PutValue`, not of `GetValue`. That assertion is also what
+/// keeps this test from passing on an empty program.
+#[test]
+fn sloppy_property_set_uses_strictness_aware_put_value() {
+    let _lock = env_lock();
+    let _env = EnvVarGuard::set("PERRY_TYPED_FEEDBACK", Some("1"));
+    let ir = ir_for(module(
+        "typed_feedback_property_sloppy.ts",
+        vec![param(1, "obj", Type::Any)],
+        Type::Any,
+        vec![
+            Stmt::Expr(Expr::PropertySet {
+                object: Box::new(Expr::LocalGet(1)),
+                property: "x".to_string(),
+                value: Box::new(Expr::Number(1.0)),
+            }),
+            Stmt::Return(Some(Expr::PropertyGet {
+                byte_offset: 0,
+                object: Box::new(Expr::LocalGet(1)),
+                property: "x".to_string(),
+            })),
+        ],
+    ));
+
+    // Match the CALL, not the symbol: every runtime entry is `declare`d in
+    // every module, so `contains("js_put_value_set")` would pass on a module
+    // that never stores and `contains("...set_field_by_name_fast")` would fail
+    // on one that never does either.
+    assert_eq!(
+        put_value_set_strict_flags(&ir),
+        vec!["0"],
+        "a sloppy property store should reach the strictness-aware [[Set]] with \
+         Throw = 0:\n{ir}"
+    );
+    assert!(
+        !ir.contains("call void @js_typed_feedback_object_set_field_by_name_fast("),
+        "the own-property store dispatcher must not be CALLED on a sloppy \
+         store -- its underlying setter throws on a rejected write:\n{ir}"
+    );
+    assert!(
+        ir.contains("object_set_by_name_guard")
+            && ir.contains("call void @js_typed_feedback_observe_property_set("),
+        "the typed-feedback SET site is registered and observed on the sloppy \
+         tail too -- it is one tail since #9495:\n{ir}"
+    );
+    // ANTI-VACUITY: the reads are untouched by strictness and must still be
+    // instrumented, so the negatives above are about the store lane and not
+    // about an empty module.
+    assert!(
+        ir.contains("object_get_by_name_guard"),
+        "the property READ boundary is strictness-independent and must remain:\n{ir}"
+    );
+    assert!(
+        ir.contains("js_object_get_field_by_name_f64"),
+        "the property read itself must still be lowered:\n{ir}"
+    );
 }
 
 /// The negative twin of the test above, and the whole of #7480 step 4's second
@@ -459,9 +588,29 @@ fn a_default_build_emits_no_typed_feedback_recording_calls() {
     // And the helpers that DECIDE something, rather than merely counting, are
     // not gated: this is the line between the two, asserted rather than
     // described.
+    //
+    // #9495: this used to name `js_typed_feedback_object_set_field_by_name_fast`
+    // on the `obj.x = 1` store. That dispatcher chose between the shape-
+    // transition fast path and the by-name setter; the store is now the
+    // receiver-aware `js_put_value_set`, which makes that choice itself, so no
+    // wrapper stands on the store and its observation is a gated recording
+    // helper like the rest (asserted absent above). The line is now drawn on
+    // the two dispatchers this same fixture still emits -- the property GET
+    // (the set dispatcher's twin) and the method call -- and as CALLS, since
+    // the old symbol match was satisfied by the `declare` line alone.
     assert!(
-        ir.contains("js_typed_feedback_object_set_field_by_name_fast"),
-        "dispatching feedback wrappers must still be emitted in a default build"
+        ir.contains("call double @js_typed_feedback_object_get_field_by_name_f64("),
+        "dispatching feedback wrappers must still be emitted in a default build \
+         (property get):\n{ir}"
+    );
+    assert!(
+        ir.contains("call double @js_typed_feedback_native_call_method"),
+        "dispatching feedback wrappers must still be emitted in a default build \
+         (method call):\n{ir}"
+    );
+    assert!(
+        ir.contains("call double @js_put_value_set("),
+        "the by-name store itself must still be lowered in a default build:\n{ir}"
     );
 }
 

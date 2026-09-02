@@ -91,8 +91,8 @@ use super::index_get::numeric_index_has_integer_array_index_proof;
 /// other shape — a subclass instance, a plain object, an out-of-range or
 /// negative index, an unpublished handle — takes the runtime helper exactly
 /// as before, so the two paths are equivalent by construction.
-/// Byte offset of `MapHeader::used`, which the tombstoned-delete lane loads to
-/// check `used == size` (no holes) before admitting a raw entry read.
+/// Byte offset of `MapHeader::used`, the raw extent the inline entry read is
+/// bounded by (the for-of cursor only ever yields a live raw index below it).
 ///
 /// `perry-codegen` does not depend on `perry-runtime`, so nothing binds this
 /// literal to the struct it describes. The runtime pins the offset with an
@@ -156,20 +156,19 @@ fn lower_map_entry_at_inline(
         let gc_flags = blk.load(I8, &flags_ptr);
         let forwarded = blk.and(I8, &gc_flags, GC_FLAG_FORWARDED);
         let live = blk.icmp_eq(I8, &forwarded, "0");
-        let size_ptr = blk.inttoptr(I64, &m_handle);
-        let size = blk.load(I32, &size_ptr);
-        // Tombstoned deletes leave `used > size`; a raw entry read is only
-        // dense-correct with no holes present, so a holey map falls back to
-        // the runtime helper — which compacts, after which this admission
-        // holds again (the lane self-heals).
+        // The index is a LIVE raw index by construction: it comes from
+        // `js_map_cursor_next`, and the for-of desugars in perry-hir are the
+        // only producers of these reads. So the read is bounded by the raw
+        // extent `used`, not the live `size`, and holes need no admission
+        // check — the cursor already stepped over them. (This lane used to
+        // require `used == size` and fall back to a runtime helper that
+        // compacted the whole map on every holey read.)
         let used_addr = blk.add(I64, &m_handle, MAP_HEADER_USED_OFFSET);
         let used_ptr = blk.inttoptr(I64, &used_addr);
         let used = blk.load(I32, &used_ptr);
-        let dense = blk.icmp_eq(I32, &used, &size);
-        let in_range = blk.icmp_ult(I32, &i_i32, &size);
+        let in_range = blk.icmp_ult(I32, &i_i32, &used);
         let a = blk.and(I1, &is_map, &live);
-        let b = blk.and(I1, &a, &dense);
-        let admitted = blk.and(I1, &b, &in_range);
+        let admitted = blk.and(I1, &a, &in_range);
         blk.cond_br(&admitted, &fast_label, &slow_label);
     }
     ctx.current_block = fast_idx;
@@ -595,8 +594,14 @@ pub(crate) fn lower(
         // calling `js_map_entries` (which materializes N+1 small Arrays).
         Expr::MapEntryKeyAt { map, idx } | Expr::MapEntryValueAt { map, idx } => {
             let (runtime_fn, value_slot) = match expr {
-                Expr::MapEntryKeyAt { .. } => ("js_map_entry_key_at", false),
-                Expr::MapEntryValueAt { .. } => ("js_map_entry_value_at", true),
+                // The RAW twins: these nodes are produced only by the for-of
+                // desugars, whose cursor yields live raw indices, so the
+                // fallback must read raw slots bounded by `used` and never
+                // compact. (`js_map_entry_key_at` without `_raw` is the
+                // live-index accessor the array-like `map[i]` read uses,
+                // which compacts — #9504.)
+                Expr::MapEntryKeyAt { .. } => ("js_map_entry_key_raw_at", false),
+                Expr::MapEntryValueAt { .. } => ("js_map_entry_value_raw_at", true),
                 _ => unreachable!(),
             };
             rooting::with_operands_rooted(ctx, &[map, idx], |ctx, vals| {
@@ -619,7 +624,7 @@ pub(crate) fn lower(
                 let i_i32 = blk.fptosi(DOUBLE, &i_dbl, I32);
                 Ok(blk.call(
                     DOUBLE,
-                    "js_set_value_at",
+                    "js_set_value_raw_at",
                     &[(I64, &s_handle), (I32, &i_i32)],
                 ))
             })
@@ -945,6 +950,14 @@ pub(crate) fn lower(
             {
                 let reason = buffer_access_materialization_reason(ctx, array);
                 return Ok(materialize_js_value(ctx, value, reason));
+            }
+            // #9342: untracked-but-class-proven receiver (module-global /
+            // param `Uint8Array`) — guarded inline byte read via the
+            // buffer-lane admission cache; guard misses defer to the priming
+            // memory-safe helper.
+            if let Some(value) = super::u8_buffer_read::try_lower_u8_buffer_read(ctx, array, index)?
+            {
+                return Ok(value);
             }
             if !numeric_index_has_integer_array_index_proof(ctx, index) {
                 return rooting::with_operands_rooted(ctx, &[array, index], |ctx, vals| {

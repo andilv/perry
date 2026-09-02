@@ -518,11 +518,13 @@ fn emit_listener0(object_value: f64, callback: f64) {
     if cb.is_null() {
         return;
     }
-    let prev_this = crate::object::js_implicit_this_set(object_handle.get_nanbox_f64());
+    let prev_this = scope.root_nanbox_f64(crate::object::js_implicit_this_set(
+        object_handle.get_nanbox_f64(),
+    ));
     with_watcher_uncaught_trap(|| {
         crate::closure::js_closure_call0(cb);
     });
-    crate::object::js_implicit_this_set(prev_this);
+    crate::object::js_implicit_this_set(prev_this.get_nanbox_f64());
 }
 
 fn emit_fs_watch_event(
@@ -546,16 +548,18 @@ fn emit_fs_watch_event(
     let refreshed_callbacks =
         crate::gc::RuntimeHandleScope::refreshed_nanbox_f64_slice(&callback_handles);
     let refreshed_args = crate::gc::RuntimeHandleScope::refreshed_nanbox_f64_slice(&arg_handles);
+    // #9445: the displaced receiver is rooted ONCE here, not once per callback.
+    let prev_this = scope.root_nanbox_f64(crate::object::js_implicit_this_get());
     for callback in refreshed_callbacks {
         let cb = extract_closure_ptr(callback);
         if cb.is_null() {
             continue;
         }
-        let prev_this = crate::object::js_implicit_this_set(object_handle.get_nanbox_f64());
+        crate::object::js_implicit_this_set(object_handle.get_nanbox_f64());
         with_watcher_uncaught_trap(|| {
             crate::closure::js_closure_call2(cb, refreshed_args[0], refreshed_args[1]);
         });
-        crate::object::js_implicit_this_set(prev_this);
+        crate::object::js_implicit_this_set(prev_this.get_nanbox_f64());
     }
 }
 
@@ -581,16 +585,18 @@ fn emit_watch_file_change(
     let refreshed_callbacks =
         crate::gc::RuntimeHandleScope::refreshed_nanbox_f64_slice(&callback_handles);
     let refreshed_args = crate::gc::RuntimeHandleScope::refreshed_nanbox_f64_slice(&arg_handles);
+    // #9445: the displaced receiver is rooted ONCE here, not once per callback.
+    let prev_this = scope.root_nanbox_f64(crate::object::js_implicit_this_get());
     for callback in refreshed_callbacks {
         let cb = extract_closure_ptr(callback);
         if cb.is_null() {
             continue;
         }
-        let prev_this = crate::object::js_implicit_this_set(object_handle.get_nanbox_f64());
+        crate::object::js_implicit_this_set(object_handle.get_nanbox_f64());
         with_watcher_uncaught_trap(|| {
             crate::closure::js_closure_call2(cb, refreshed_args[0], refreshed_args[1]);
         });
-        crate::object::js_implicit_this_set(prev_this);
+        crate::object::js_implicit_this_set(prev_this.get_nanbox_f64());
     }
 }
 

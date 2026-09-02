@@ -361,6 +361,8 @@ pub(super) fn compile_method(
         classes,
         &cross_module.compile_time_constants,
         &cross_module.module_dispatch,
+        // #9363: a method body reads the same module-scope views.
+        &cross_module.module_global_proven_types,
     );
     let mut index_clone_integer_locals = native_facts.integer_locals().clone();
     index_clone_integer_locals.extend(index_param_ids.iter().copied());
@@ -976,17 +978,10 @@ pub(super) fn compile_method(
                                 .cloned()
                                 .map(|slot| ctx.block().load(DOUBLE, &slot))
                                 .unwrap_or_else(|| undef_lit.clone());
-                            let kind_idx = ctx.strings.intern(&pname_owned);
-                            let kind_handle_global =
-                                format!("@{}", ctx.strings.entry(kind_idx).handle_global);
                             let blk = ctx.block();
-                            let kind_box = blk.load(DOUBLE, &kind_handle_global);
-                            let kind_bits = blk.bitcast_double_to_i64(&kind_box);
-                            let kind_raw =
-                                blk.and(I64, &kind_bits, crate::nanbox::POINTER_MASK_I64);
                             blk.call_void(
                                 "js_error_subclass_default_init",
-                                &[(DOUBLE, &this_box), (DOUBLE, &msg_box), (I64, &kind_raw)],
+                                &[(DOUBLE, &this_box), (DOUBLE, &msg_box)],
                             );
                         }
                         ("".to_string(), 0)
@@ -1565,6 +1560,8 @@ pub(super) fn compile_static_method(
         classes,
         &cross_module.compile_time_constants,
         &cross_module.module_dispatch,
+        // #9363: a method body reads the same module-scope views.
+        &cross_module.module_global_proven_types,
     );
 
     // Representation-selection context gates (see codegen/function.rs).

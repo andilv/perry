@@ -144,20 +144,22 @@ pub(crate) use console::{
 pub(crate) use console::{test_console_instance_count, test_seed_console_instance};
 
 pub use formatting::{
-    function_name_for_ptr, function_source_for_func_ptr, function_source_for_ptr, js_array_print,
-    js_boxed_bigint_new, js_boxed_boolean_new, js_boxed_number_new, js_boxed_string_new,
-    js_boxed_symbol_new, js_register_function_name, js_register_function_source, js_util_format,
-    js_util_format_with_options, js_util_inspect, js_util_is_deep_strict_equal,
-    js_util_is_deep_strict_equal_skip_prototype, js_util_strip_vt_control_characters,
-    register_function_name_if_absent, scan_boxed_primitive_payload_roots_mut,
+    function_is_non_strict_ordinary_for_ptr, function_name_for_ptr, function_name_registry_entries,
+    function_name_registry_len, function_source_for_func_ptr, function_source_for_ptr,
+    js_array_print, js_boxed_bigint_new, js_boxed_boolean_new, js_boxed_number_new,
+    js_boxed_string_new, js_boxed_symbol_new, js_register_function_name,
+    js_register_function_source, js_util_format, js_util_format_with_options, js_util_inspect,
+    js_util_is_deep_strict_equal, js_util_is_deep_strict_equal_skip_prototype,
+    js_util_strip_vt_control_characters, register_function_name_if_absent,
+    scan_boxed_primitive_payload_roots_mut,
 };
 
 pub(crate) use formatting::{
     boxed_primitive_json_value, boxed_primitive_payload, boxed_primitive_to_string_tag,
-    format_finite_number_js, format_jsvalue, is_negative_zero, jsvalue_string_content,
-    prune_dead_boxed_primitive_payload_owners, InspectCompactGuard, InspectCustomInspectGuard,
-    InspectDepthLimitGuard, InspectGettersGuard, InspectShowHiddenGuard, InspectSortedGuard,
-    INT_EXACT_FASTPATH_LIMIT,
+    format_finite_number_js, format_jsvalue, int32_or_class_repr, is_array_hole, is_negative_zero,
+    jsvalue_string_content, prune_dead_boxed_primitive_payload_owners, InspectCompactGuard,
+    InspectCustomInspectGuard, InspectDepthLimitGuard, InspectGettersGuard, InspectShowHiddenGuard,
+    InspectSortedGuard, INT_EXACT_FASTPATH_LIMIT,
 };
 #[cfg(test)]
 pub(crate) use formatting::{

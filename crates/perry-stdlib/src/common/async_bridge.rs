@@ -69,34 +69,40 @@ unsafe fn unpin_promise_after_native_resolution(promise_ptr: usize) {
     perry_runtime::gc::unpin_object(header);
 }
 
-/// Allocate a fresh Promise and pin it for cross-thread resolution.
-/// Convenience wrapper for direct callers of [`queue_promise_resolution`]
-/// / [`queue_deferred_resolution`] (fetch, zlib, bcrypt, ioredis, ws,
-/// etc.) — modules that bypass `spawn_for_promise[_deferred]` because
-/// their own future setup is custom. Equivalent to
-/// `js_promise_new()` followed by [`pin_promise_for_native_resolution`].
+/// Release the native async completion token a promise minted through
+/// `perry_ffi_promise_new` still owns (#9356).
+///
+/// `perry_ffi_promise_new` allocates through `js_native_async_completion_new`,
+/// which registers a token keyed by the promise address so the token API can
+/// settle it later. perry-ffi's `JsPromise::resolve_with` / `reject_with` and
+/// the legacy `resolve_*` shims do not go through the token API — they queue
+/// straight into the stdlib pump and settle the promise here — so nothing ever
+/// removed the token. Every native call (each mysql2 query, every bcrypt hash,
+/// …) leaked one registry entry: the settled promise stayed rooted and was
+/// rewritten on every minor collection, and `js_native_async_has_active`
+/// reported work forever. Dropping the token here mirrors the cleanup
+/// `js_native_async_process_pending` performs for token-API settlements; it
+/// is a no-op for promises that never had a token.
+fn release_native_async_token(promise: *mut perry_runtime::Promise) {
+    perry_runtime::promise::js_native_async_drop_promise_token(promise);
+}
+
+/// Allocate a fresh Promise for cross-thread resolution. Convenience wrapper
+/// for direct callers of [`queue_promise_resolution`] /
+/// [`queue_deferred_resolution`] — modules that bypass
+/// `spawn_for_promise[_deferred]` because their own future setup is custom.
+///
+/// #9552: the pin is taken by `js_promise_new_cross_thread` itself and
+/// released when the promise settles, so this is now exactly that
+/// constructor. Callers that reach for the bare constructor get the same
+/// guarantee; this name survives for the modules that spell the intent.
 ///
 /// # Safety
-/// Same as `js_promise_new()`; the pinning has no preconditions of
-/// its own. The matching unpin runs automatically in
-/// `js_stdlib_process_pending`.
+/// Same as `js_promise_new()`.
 #[inline]
 pub unsafe fn js_promise_new_for_native_resolution() -> *mut perry_runtime::Promise {
     ensure_gc_scanner_registered();
-    // #8770: allocate in MALLOC space (non-moving), not the nursery arena. A
-    // native-resolution promise is handed to a tokio worker as a raw `usize` and,
-    // until its resolution is queued into PENDING_RESOLUTIONS (which the root
-    // scanner visits), it is reachable only through that worker-thread capture —
-    // invisible to the main-thread copying minor. A nursery resident in that
-    // window is wiped by the from-space flip REGARDLESS of its PIN flag (the flip
-    // resets eden/survivor blocks wholesale; only root-reachable pins force the
-    // fallback — see `js_promise_new_cross_thread`). Then `js_stdlib_process_
-    // pending` unpins/resolves through the stale pointer and faults on the
-    // reclaimed header. Malloc space is non-moving and both sweep paths honor
-    // GC_FLAG_PINNED, so the pin actually protects it there.
-    let p = perry_runtime::js_promise_new_cross_thread();
-    pin_promise_for_native_resolution(p as usize);
-    p
+    perry_runtime::js_promise_new_cross_thread()
 }
 
 /// Count of in-flight `perry_ffi_spawn_blocking[_with_reactor]` tasks
@@ -532,18 +538,19 @@ pub extern "C" fn js_stdlib_process_pending() -> i32 {
     for resolution in simple_resolutions {
         let scope = perry_runtime::gc::RuntimeHandleScope::new();
         let promise_ptr_usize = resolution.promise_ptr;
-        let promise_handle =
-            scope.root_raw_mut_ptr(promise_ptr_usize as *mut perry_runtime::Promise);
+        // #9552: the address spent its in-flight window as a bare usize in a
+        // worker future; verify it still names a promise before touching it.
+        let promise_handle = scope.root_raw_mut_ptr(
+            perry_runtime::promise::native_promise_from_raw(promise_ptr_usize, "stdlib pump"),
+        );
         let result_handle = scope.root_nanbox_u64(resolution.result_bits);
         // Issue #859: unpin BEFORE resolve so the just-settled promise
         // can be reclaimed by the next GC. Resolve doesn't trigger GC
         // mid-call, so ordering here is purely about leaving a clean
         // GC state after the loop.
-        unsafe {
-            unpin_promise_after_native_resolution(
-                promise_handle.get_raw_mut_ptr::<perry_runtime::Promise>() as usize,
-            )
-        };
+        let promise_ptr = promise_handle.get_raw_mut_ptr::<perry_runtime::Promise>();
+        unsafe { unpin_promise_after_native_resolution(promise_ptr as usize) };
+        release_native_async_token(promise_ptr);
         if resolution.is_success {
             perry_runtime::js_promise_resolve(
                 promise_handle.get_raw_mut_ptr(),
@@ -568,8 +575,11 @@ pub extern "C" fn js_stdlib_process_pending() -> i32 {
     for resolution in deferred_resolutions {
         let scope = perry_runtime::gc::RuntimeHandleScope::new();
         let promise_ptr_usize = resolution.promise_ptr;
-        let promise_handle =
-            scope.root_raw_mut_ptr(promise_ptr_usize as *mut perry_runtime::Promise);
+        // #9552: the address spent its in-flight window as a bare usize in a
+        // worker future; verify it still names a promise before touching it.
+        let promise_handle = scope.root_raw_mut_ptr(
+            perry_runtime::promise::native_promise_from_raw(promise_ptr_usize, "stdlib pump"),
+        );
         // Run the converter on the main thread to create JSValues safely
         let result_bits = (resolution.converter)();
         let result_handle = scope.root_nanbox_u64(result_bits);
@@ -578,11 +588,9 @@ pub extern "C" fn js_stdlib_process_pending() -> i32 {
         // and may itself have allocated (creating the result string,
         // etc.), but the promise stayed pinned across that work — so
         // even if the converter triggered GC, the promise survived.
-        unsafe {
-            unpin_promise_after_native_resolution(
-                promise_handle.get_raw_mut_ptr::<perry_runtime::Promise>() as usize,
-            )
-        };
+        let promise_ptr = promise_handle.get_raw_mut_ptr::<perry_runtime::Promise>();
+        unsafe { unpin_promise_after_native_resolution(promise_ptr as usize) };
+        release_native_async_token(promise_ptr);
         if resolution.is_success {
             perry_runtime::js_promise_resolve(
                 promise_handle.get_raw_mut_ptr(),
@@ -1039,6 +1047,44 @@ where
     });
 }
 
+/// Spawn an async operation whose success and error values both need to be
+/// materialized on the main thread.
+///
+/// Database adapters use this variant to reject with a real JavaScript Error
+/// (including driver-specific fields such as `code` and `errno`) instead of a
+/// bare string. As with [`spawn_for_promise_deferred`], neither converter runs
+/// on the async executor, where allocating Perry heap values would be unsafe.
+///
+/// # Safety
+/// `promise_ptr` must point to a live Perry Promise.
+pub unsafe fn spawn_for_promise_deferred_with_error<T, E, F, C, R>(
+    promise_ptr: *mut u8,
+    future: F,
+    converter: C,
+    reject_converter: R,
+) where
+    T: Send + 'static,
+    E: Send + 'static,
+    F: Future<Output = Result<T, E>> + Send + 'static,
+    C: FnOnce(T) -> u64 + Send + 'static,
+    R: FnOnce(E) -> u64 + Send + 'static,
+{
+    ensure_pump_registered();
+    ensure_gc_scanner_registered();
+    let ptr = promise_ptr as usize;
+    pin_promise_for_native_resolution(ptr);
+
+    EXT_BLOCKING_TASKS_INFLIGHT.fetch_add(1, Ordering::AcqRel);
+    RUNTIME.spawn(async move {
+        match future.await {
+            Ok(data) => queue_deferred_resolution(ptr, true, move || converter(data)),
+            Err(error) => queue_deferred_resolution(ptr, false, move || reject_converter(error)),
+        }
+        EXT_BLOCKING_TASKS_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
+        perry_runtime::event_pump::js_notify_main_thread();
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1046,6 +1092,28 @@ mod tests {
     fn clear_pending() {
         PENDING_RESOLUTIONS.lock().unwrap().clear();
         PENDING_DEFERRED.lock().unwrap().clear();
+    }
+
+    #[test]
+    fn stdlib_pump_releases_the_native_async_token_of_a_deferred_resolution() {
+        clear_pending();
+        // perry-ffi's `JsPromise::new()` mints the promise through this shim,
+        // which registers a native async token keyed by the promise address.
+        let promise = crate::perry_ffi_async::perry_ffi_promise_new();
+        assert!(!promise.is_null());
+        assert!(perry_runtime::promise::native_async_promise_has_token(
+            promise
+        ));
+        // `JsPromise::resolve_with` settles through the deferred queue, never
+        // through the token API — the pump must drop the token itself or it
+        // leaks one registry entry per native call (#9356).
+        queue_deferred_resolution(promise as usize, true, || 7.0f64.to_bits());
+        assert!(js_stdlib_process_pending() >= 1);
+        assert_eq!(perry_runtime::promise::js_promise_state(promise), 1);
+        assert_eq!(perry_runtime::promise::js_promise_value(promise), 7.0);
+        assert!(!perry_runtime::promise::native_async_promise_has_token(
+            promise
+        ));
     }
 
     #[test]

@@ -1415,6 +1415,75 @@ fn fresh_class_refresh_keeps_shared_capture_cell_handle() {
     );
 }
 
+/// A mutable lexical classic-for binding captured by a class uses the shared
+/// one-element cell representation.  The backedge must copy its current value
+/// into a fresh cell before the update, matching CreatePerIterationEnvironment:
+/// instances from completed iterations retain their own capture cell, while a
+/// `var` head continues to share one binding for the whole loop.
+#[test]
+fn classic_for_class_capture_freshens_lexical_cell_before_update() {
+    let source = r#"
+        const lexical = [];
+        for (let i = 0; i < 3; i++) {
+            class Lexical { value() { return i; } }
+            lexical.push(new Lexical());
+        }
+
+        const shared = [];
+        for (var i = 0; i < 3; i++) {
+            class Shared { value() { return i; } }
+            shared.push(new Shared());
+        }
+    "#;
+    let module = perry_parser::parse_typescript(source, "t.ts").expect("source parses");
+    let hir = super::lower_module(&module, "t", "t.ts").expect("source lowers");
+    let loops: Vec<_> = hir
+        .init
+        .iter()
+        .filter_map(|stmt| match stmt {
+            crate::Stmt::For { init, update, .. } => Some((init, update)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(loops.len(), 2, "fixture lowers to lexical and var loops");
+
+    let lexical_id = match loops[0].0.as_deref() {
+        Some(crate::Stmt::Let {
+            id,
+            init: Some(crate::Expr::Array(items)),
+            ..
+        }) if items.len() == 1 => *id,
+        other => panic!("lexical head must lower to one shared capture cell: {other:#?}"),
+    };
+    assert!(matches!(
+        loops[0].1,
+        Some(crate::Expr::Sequence(items))
+            if matches!(
+                items.as_slice(),
+                [
+                    crate::Expr::LocalSet(set_id, fresh),
+                    crate::Expr::IndexUpdate { object, .. },
+                ] if *set_id == lexical_id
+                    && matches!(
+                        fresh.as_ref(),
+                        crate::Expr::Array(values)
+                            if matches!(
+                                values.as_slice(),
+                                [crate::Expr::IndexGet { object, .. }]
+                                    if matches!(object.as_ref(), crate::Expr::LocalGet(id) if *id == lexical_id)
+                            )
+                    )
+                    && matches!(object.as_ref(), crate::Expr::LocalGet(id) if *id == lexical_id)
+            )
+    ));
+
+    assert!(
+        loops[1].0.is_none(),
+        "var head is hoisted outside For::init"
+    );
+    assert!(matches!(loops[1].1, Some(crate::Expr::IndexUpdate { .. })));
+}
+
 /// Companion (the case the depth rule must NOT break): a module-scope `class e`
 /// and a factory-local `let e` holding a different constructor. JS says the
 /// nearer local wins, so `new e()` inside the factory must still construct the
@@ -1874,92 +1943,8 @@ fn unresolved_new_names_the_identifier_and_defers_to_a_runtime_global_lookup() {
     );
 }
 
-/// A derived class with captured outers whose `super()` is not its own
-/// statement — the minifier's `super(a), this.x = b, …` comma sequence, as in
-/// Next's `AppRouteRouteModule` — must stash the `this.__perry_cap_*` fields
-/// AFTER the call, not at constructor entry. #8630's derived-`this` TDZ turns
-/// an entry stash into `ReferenceError: Must call super constructor …` at
-/// every construction (the Coop Next.js fixture died at module init).
-#[test]
-fn derived_ctor_capture_stash_follows_super_inside_comma_sequence() {
-    let source = r#"
-        const exported = (() => {
-            const shared = { tag: "outer" };
-            class Base {
-                constructor(opts) { this.definition = opts.definition; }
-            }
-            class Derived extends Base {
-                constructor({ definition: r, name: n }) {
-                    super({ definition: r }), this.name = n, this.tag = shared.tag;
-                }
-            }
-            return Derived;
-        })();
-    "#;
-    assert_capture_stash_follows_super(source, "Derived");
-}
-
-/// Same requirement for a `super()` nested deeper than a leading comma operand
-/// — p-queue's `if (super(), this.a = 0, …)` shape.
-#[test]
-fn derived_ctor_capture_stash_follows_super_inside_if_test() {
-    let source = r#"
-        const exported = (() => {
-            const shared = { tag: "outer" };
-            class Base {
-                constructor() { this.base = 1; }
-            }
-            class Derived extends Base {
-                constructor(e) {
-                    var q;
-                    if (super(), this.count = 0, this.tag = shared.tag, !e) { q = 1; }
-                    this.q = q;
-                }
-            }
-            return Derived;
-        })();
-    "#;
-    assert_capture_stash_follows_super(source, "Derived");
-}
-
-fn assert_capture_stash_follows_super(source: &str, class_name: &str) {
-    let module = perry_parser::parse_typescript(source, "t.ts").expect("source parses");
-    let hir = super::lower_module(&module, "t", "t.ts").expect("source lowers");
-    let class = hir
-        .classes
-        .iter()
-        .find(|c| c.name == class_name)
-        .unwrap_or_else(|| panic!("fixture declares class {class_name}"));
-    let ctor = class
-        .constructor
-        .as_ref()
-        .expect("the derived class keeps its user-written constructor");
-    let mut super_at = None;
-    let mut first_stash_at = None;
-    for (index, stmt) in ctor.body.iter().enumerate() {
-        let compact: String = format!("{stmt:?}")
-            .chars()
-            .filter(|ch| !ch.is_whitespace())
-            .collect();
-        if super_at.is_none() && compact.contains("SuperCall(") {
-            super_at = Some(index);
-        }
-        if first_stash_at.is_none()
-            && compact.contains("PropertySet{object:This,property:\"__perry_cap_")
-        {
-            first_stash_at = Some(index);
-        }
-    }
-    // Anti-vacuity: the fixture must actually capture (`shared`) and call
-    // `super()`, or the ordering below is not being tested.
-    let super_at = super_at.expect("fixture constructor calls super()");
-    let first_stash_at = first_stash_at.expect("fixture class captures an outer local");
-    assert!(
-        first_stash_at > super_at,
-        "capture stash (stmt {first_stash_at}) must follow super() (stmt {super_at}): {:#?}",
-        ctor.body
-    );
-}
+mod capture_stash;
+mod mixin_parent_chain;
 
 /// `const masks = opts?.masks ?? null` must not be declared `Null`. The
 /// AST-level `??` rule used to answer the right operand's type whenever the

@@ -63,6 +63,7 @@ pub(super) unsafe fn alloc_old_test_promise() -> *mut crate::promise::Promise {
     std::ptr::write(
         ptr,
         crate::promise::Promise {
+            native_pinned: 0,
             state: crate::promise::PromiseState::Pending,
             value: 0.0,
             reason: 0.0,
@@ -95,6 +96,7 @@ pub(super) unsafe fn alloc_old_test_error() -> *mut crate::error::ErrorHeader {
             cause: f64::from_bits(crate::value::TAG_UNDEFINED),
             errors: std::ptr::null_mut(),
             meta: std::ptr::null_mut(),
+            frames: std::ptr::null_mut(),
         },
     );
     ptr
@@ -783,6 +785,7 @@ pub(super) fn allocate_dead_malloc_churn_headers(per_type: usize) -> Vec<usize> 
             std::ptr::write(
                 ptr,
                 crate::promise::Promise {
+                    native_pinned: 0,
                     state: crate::promise::PromiseState::Pending,
                     value: 0.0,
                     reason: 0.0,

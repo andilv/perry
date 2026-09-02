@@ -670,10 +670,11 @@ pub(super) fn call_listener_args(stream: f64, listener: f64, args: &[f64]) -> f6
     if !is_callable_value(listener) {
         return f64::from_bits(super::TAG_UNDEFINED);
     }
-    let prev = crate::object::js_implicit_this_set(stream);
+    let this_scope = crate::gc::RuntimeHandleScope::new(); // #9445
+    let prev = this_scope.root_nanbox_f64(crate::object::js_implicit_this_set(stream));
     let result =
         unsafe { crate::closure::js_native_call_value(listener, args.as_ptr(), args.len()) };
-    crate::object::js_implicit_this_set(prev);
+    crate::object::js_implicit_this_set(prev.get_nanbox_f64());
     result
 }
 
@@ -731,6 +732,14 @@ pub(super) fn emit_stream_event_from_array(
         args.push(crate::array::js_array_get_f64(args_arr, i));
     }
     emit_stream_event(stream, event, &args)
+}
+
+/// #9493: whether `stream` has a listener for `event` in THIS registry. The
+/// fs-stream bridge asks before forwarding an `'error'` its own registry has
+/// already delivered, so the unhandled-error throw below fires only when
+/// neither registry had a listener.
+pub(super) fn has_stream_listeners(stream: f64, event: f64) -> bool {
+    event_identity_bytes(event).is_some() && !listener_snapshot(stream, event).is_empty()
 }
 
 pub(super) fn emit_stream_event(stream: f64, event: f64, args: &[f64]) -> f64 {

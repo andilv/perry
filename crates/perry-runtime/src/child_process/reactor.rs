@@ -49,6 +49,176 @@ type CpReader = Box<dyn Read + Send>;
 type CpWriter = Box<dyn Write + Send>;
 type CpWaiter = Box<dyn FnOnce() -> (Option<i32>, Option<i32>) + Send>;
 
+/// Node's default `writableHighWaterMark` for a child's stdin socket.
+pub(super) const CP_STDIN_HIGH_WATER_MARK: usize = 64 * 1024;
+
+/// #9493: the writable side of a live child's stdin.
+///
+/// `stdin.write()` used to `write_all` inline: it parked the main thread on a
+/// full pipe until the child read (an LSP that stops reading hangs the
+/// program), always returned `true`, never emitted `'drain'`, and committed
+/// every byte before a `process.exit()` in the same tick. Node — libuv's
+/// `uv_try_write` — commits what the pipe accepts right now, queues the
+/// remainder for the loop, and judges the return value against the queued
+/// length. This is that shape: the synchronous try-write is on the main
+/// thread (bytes below pipe capacity land exactly as they did, including at
+/// `process.exit()`), the remainder goes to a drain thread, and completion
+/// (callbacks, `'drain'`, the deferred close for `end()`) is reported back
+/// through the event queue like every other child event.
+struct CpStdin {
+    /// Owns the pipe end; dropping it is the EOF the child sees.
+    writer: CpWriter,
+    /// Raw descriptor the drain thread dups. Unix only.
+    #[cfg(unix)]
+    fd: i32,
+    /// Bytes handed to the drain thread and not yet reported written —
+    /// `writableLength`.
+    queued: usize,
+    /// A `write()` returned `false` and no `'drain'` has fired since.
+    need_drain: bool,
+    /// `end()` ran while bytes were queued: close once they are written.
+    end_pending: bool,
+    /// Write/end callbacks that fire, in order, once the queue drains
+    /// (NaN-boxed closures; rooted by `cp_reactor_scan_roots_mut`).
+    callbacks: Vec<u64>,
+    /// Sender to the lazily-started drain thread.
+    #[cfg(unix)]
+    tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+}
+
+impl CpStdin {
+    #[cfg(unix)]
+    fn new(writer: CpWriter, fd: i32) -> Self {
+        // `O_NONBLOCK` is a property of this open file description alone —
+        // the child's read end is a separate description — so the try-write
+        // reports `WouldBlock` instead of parking the main thread.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags >= 0 {
+                let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+        }
+        Self {
+            writer,
+            fd,
+            queued: 0,
+            need_drain: false,
+            end_pending: false,
+            callbacks: Vec::new(),
+            tx: None,
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn new(writer: CpWriter) -> Self {
+        Self {
+            writer,
+            queued: 0,
+            need_drain: false,
+            end_pending: false,
+            callbacks: Vec::new(),
+        }
+    }
+
+    /// libuv's `uv__try_write`: write until the pipe would block. Returns how
+    /// many bytes were committed. A broken pipe counts the whole chunk as
+    /// consumed — `SIGPIPE` is ignored process-wide (#9402), the reader is
+    /// gone, and there is nobody left to deliver to.
+    fn try_write(&mut self, bytes: &[u8]) -> usize {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            match self.writer.write(&bytes[offset..]) {
+                Ok(0) => break,
+                Ok(n) => offset += n,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return bytes.len(),
+            }
+        }
+        offset
+    }
+
+    #[cfg(unix)]
+    fn enqueue(&mut self, handle: u64, bytes: Vec<u8>) {
+        if self.tx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            cp_spawn_stdin_drain(handle, self.fd, rx);
+            self.tx = Some(tx);
+        }
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(bytes);
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn enqueue(&mut self, handle: u64, bytes: Vec<u8>) {
+        // Blocking pipe handles: a short `write` only means an error, so the
+        // remainder is written inline as before and reported at once.
+        let _ = self.writer.write_all(&bytes);
+        cp_push_event(CpEvent::StdinWritten {
+            handle,
+            len: bytes.len(),
+            broken: false,
+        });
+    }
+}
+
+/// Drain thread for the bytes the pipe would not take synchronously. It
+/// owns a `dup` of the descriptor, so the registry's writer can be dropped
+/// (`end()`, child close, teardown) without pulling the fd out from under
+/// an in-flight write; the dup closes when the channel ends, which is what
+/// finally delivers EOF after an `end()` on a backed-up pipe.
+#[cfg(unix)]
+fn cp_spawn_stdin_drain(handle: u64, fd: i32, rx: std::sync::mpsc::Receiver<Vec<u8>>) {
+    let dup = unsafe { libc::dup(fd) };
+    std::thread::spawn(move || {
+        let mut broken = dup < 0;
+        for chunk in rx {
+            let mut offset = 0;
+            while !broken && offset < chunk.len() {
+                let n = unsafe {
+                    libc::write(
+                        dup,
+                        chunk[offset..].as_ptr() as *const libc::c_void,
+                        chunk.len() - offset,
+                    )
+                };
+                if n >= 0 {
+                    offset += n as usize;
+                    continue;
+                }
+                match std::io::Error::last_os_error().raw_os_error() {
+                    Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => {
+                        let mut pfd = libc::pollfd {
+                            fd: dup,
+                            events: libc::POLLOUT,
+                            revents: 0,
+                        };
+                        unsafe {
+                            libc::poll(&mut pfd, 1, -1);
+                        }
+                    }
+                    Some(code) if code == libc::EINTR => {}
+                    _ => broken = true,
+                }
+            }
+            cp_push_event(CpEvent::StdinWritten {
+                handle,
+                len: chunk.len(),
+                broken,
+            });
+            if broken {
+                break;
+            }
+        }
+        if dup >= 0 {
+            unsafe {
+                libc::close(dup);
+            }
+        }
+    });
+}
+
 /// Monotonic registry key for live children.
 static CP_NEXT_LIVE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -88,6 +258,15 @@ enum CpEvent {
     Timeout { handle: u64, signal: i32 },
     /// `AbortSignal` attached through `options.signal` fired.
     Abort { handle: u64 },
+    /// #9493: the stdin drain thread wrote `len` queued bytes (`len == 0` is
+    /// the main thread asking for a `'drain'` after an over-the-mark write
+    /// the pipe took whole). `broken` — the pipe is gone (EPIPE): the queue
+    /// is abandoned and stdin closed.
+    StdinWritten {
+        handle: u64,
+        len: usize,
+        broken: bool,
+    },
 }
 
 static CP_EVENT_QUEUE: Mutex<Vec<CpEvent>> = Mutex::new(Vec::new());
@@ -103,7 +282,7 @@ struct LiveChild {
     pipe_ids: [crate::async_hooks::AsyncResourceIds; 3],
     pipe_bits: [u64; 3],
     pid: i32,
-    stdin: Option<CpWriter>,
+    stdin: Option<CpStdin>,
     stdout_open: bool,
     stderr_open: bool,
     /// Hold stdout EOF until stderr EOF when both pipes exist. Node drains
@@ -390,7 +569,18 @@ pub(super) fn cp_register_live_child(
 
     let stdout_pipe = child.stdout.take().map(|pipe| Box::new(pipe) as CpReader);
     let stderr_pipe = child.stderr.take().map(|pipe| Box::new(pipe) as CpReader);
-    let stdin_pipe = child.stdin.take().map(|pipe| Box::new(pipe) as CpWriter);
+    let stdin_pipe = child.stdin.take().map(|pipe| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = pipe.as_raw_fd();
+            CpStdin::new(Box::new(pipe) as CpWriter, fd)
+        }
+        #[cfg(not(unix))]
+        {
+            CpStdin::new(Box::new(pipe) as CpWriter)
+        }
+    });
     let waiter: CpWaiter = Box::new(move || match child.wait() {
         Ok(status) => {
             #[cfg(unix)]
@@ -470,7 +660,7 @@ pub(super) fn cp_register_windows_live_child(
         stdin_obj,
         extra_pipes,
         pid,
-        stdin.map(|pipe| Box::new(pipe) as CpWriter),
+        stdin.map(|pipe| CpStdin::new(Box::new(pipe) as CpWriter)),
         stdout.map(|pipe| Box::new(pipe) as CpReader),
         stderr.map(|pipe| Box::new(pipe) as CpReader),
         waiter,
@@ -490,7 +680,7 @@ fn cp_register_live_child_parts(
     stdin_obj: f64,
     extra_pipes: Vec<(usize, f64, std::fs::File)>,
     pid: u32,
-    stdin_pipe: Option<CpWriter>,
+    stdin_pipe: Option<CpStdin>,
     stdout_pipe: Option<CpReader>,
     stderr_pipe: Option<CpReader>,
     waiter: CpWaiter,
@@ -851,6 +1041,8 @@ pub extern "C" fn js_child_process_spawn_streams(
             cp_read_arg_strings(args_ptr),
         )
     };
+    validate::cp_validate_no_null_bytes("file", &cmd_str);
+    unsafe { validate::cp_validate_raw_args(args_ptr) };
 
     // `opts_ptr` arrives as a raw (unboxed) heap pointer; re-box it so the
     // options helpers can read `cwd`/`env`/`shell`. Small values mean
@@ -1520,6 +1712,11 @@ fn cp_reactor_pump_inner() {
                     cp_emit(cp, "error", &[cp_abort_error(None)]);
                 }
             }
+            CpEvent::StdinWritten {
+                handle,
+                len,
+                broken,
+            } => cp_stdin_written(handle, len, broken),
         }
     }
 
@@ -1613,17 +1810,6 @@ struct CpCloseItem {
     pipe_ids: [crate::async_hooks::AsyncResourceIds; 3],
 }
 
-#[inline]
-fn cp_stdio_stream(cp: f64, fd: usize) -> f64 {
-    match fd {
-        1 => cp_get_field(cp, b"stdout"),
-        2 => cp_get_field(cp, b"stderr"),
-        _ => cp_array_ptr(cp_get_field(cp, b"stdio"))
-            .map(|stdio| crate::array::js_array_get_f64(stdio, fd as u32))
-            .unwrap_or_else(cp_undefined),
-    }
-}
-
 fn cp_lookup_cp_bits(handle: u64) -> Option<u64> {
     cp_live_lock()
         .as_ref()
@@ -1653,244 +1839,107 @@ pub(super) fn cp_async_scope_for_target(
 // Live `stdin.write()` / `kill()` — called from the mod.rs method bodies.
 // ============================================================================
 
-/// Write `bytes` to a live child's stdin. Returns whether the write succeeded.
-pub(super) fn cp_live_stdin_write(handle: u64, bytes: &[u8]) -> bool {
+/// What `stdin.write()` hands back to the method body (#9493).
+pub(super) struct CpStdinWriteOutcome {
+    /// Node's return value: the queued length, chunk included, was below the
+    /// high-water mark.
+    pub(super) below_high_water_mark: bool,
+    /// Bytes still queued behind the pipe afterwards — `writableLength`.
+    pub(super) writable_length: usize,
+    /// The completion callback was taken over by the drain: it fires, in
+    /// order, once the queue empties. Otherwise the caller defers it as before.
+    pub(super) callback_queued: bool,
+}
+
+/// Write `bytes` to a live child's stdin — libuv's try-write (#9493). Returns
+/// `None` when there is no live child, no open stdin, or `end()` already ran;
+/// the caller then keeps its pre-existing completion path.
+pub(super) fn cp_live_stdin_write(
+    handle: u64,
+    bytes: &[u8],
+    callback_bits: Option<u64>,
+) -> Option<CpStdinWriteOutcome> {
     let mut guard = cp_live_lock();
-    if let Some(map) = guard.as_mut() {
+    let lc = guard.as_mut()?.get_mut(&handle)?;
+    let stdin = lc.stdin.as_mut()?;
+    if stdin.end_pending {
+        return None;
+    }
+    // Node counts the chunk into `writableLength` BEFORE dispatching it and
+    // judges the return value against that: a chunk at or above the mark
+    // returns `false` even when the pipe took all of it, and `'drain'` then
+    // follows on the next turn.
+    let length_with_chunk = stdin.queued.saturating_add(bytes.len());
+    let below_high_water_mark = length_with_chunk < CP_STDIN_HIGH_WATER_MARK;
+    let mut offset = 0;
+    if stdin.queued == 0 {
+        offset = stdin.try_write(bytes);
+    }
+    let remainder = &bytes[offset..];
+    if !remainder.is_empty() {
+        stdin.queued = stdin.queued.saturating_add(remainder.len());
+        stdin.enqueue(handle, remainder.to_vec());
+    }
+    let mut callback_queued = false;
+    if !below_high_water_mark {
+        stdin.need_drain = true;
+    }
+    if !remainder.is_empty() || !below_high_water_mark {
+        if let Some(bits) = callback_bits {
+            stdin.callbacks.push(bits);
+        }
+        callback_queued = true;
+        if remainder.is_empty() {
+            // Written whole but over the mark: the callback and `'drain'` land
+            // on the next turn, through the pump like a drained queue would.
+            cp_push_event(CpEvent::StdinWritten {
+                handle,
+                len: 0,
+                broken: false,
+            });
+        }
+    }
+    Some(CpStdinWriteOutcome {
+        below_high_water_mark,
+        writable_length: stdin.queued,
+        callback_queued,
+    })
+}
+
+/// Close a live child's stdin (`stdin.end()`). Returns `true` when the pipe
+/// closed now (the child sees EOF); `false` when bytes are still queued, in
+/// which case the close — and a callback queued through
+/// `cp_live_stdin_queue_callback` — happens once the drain thread reports
+/// them written (#9493). No-op if already closed / unknown.
+pub(super) fn cp_live_stdin_close(handle: u64) -> bool {
+    if let Some(map) = cp_live_lock().as_mut() {
         if let Some(lc) = map.get_mut(&handle) {
             if let Some(stdin) = lc.stdin.as_mut() {
-                return stdin.write_all(bytes).is_ok();
+                if stdin.queued > 0 {
+                    stdin.end_pending = true;
+                    return false;
+                }
+            }
+            lc.stdin = None;
+        }
+    }
+    true
+}
+
+/// Queue a completion callback behind the stdin bytes still in flight.
+/// Returns `false` (nothing queued) when the queue is already empty.
+pub(super) fn cp_live_stdin_queue_callback(handle: u64, callback_bits: u64) -> bool {
+    if let Some(map) = cp_live_lock().as_mut() {
+        if let Some(lc) = map.get_mut(&handle) {
+            if let Some(stdin) = lc.stdin.as_mut() {
+                if stdin.queued > 0 {
+                    stdin.callbacks.push(callback_bits);
+                    return true;
+                }
             }
         }
     }
     false
-}
-
-/// Close a live child's stdin (`stdin.end()`), dropping the pipe so the child
-/// sees EOF. No-op if already closed / unknown.
-pub(super) fn cp_live_stdin_close(handle: u64) {
-    if let Some(map) = cp_live_lock().as_mut() {
-        if let Some(lc) = map.get_mut(&handle) {
-            lc.stdin = None;
-        }
-    }
-}
-
-/// Duplicate `child`'s process handle before the `Child` moves to the waiter
-/// thread, so the kill paths can act on the process object itself rather than
-/// the recyclable pid (see `cp_win_kill`). The registry entry owns the
-/// duplicate; `LiveChild::drop` closes it. Returns `0` when duplication fails
-/// — kills on that child then report undelivered rather than falling back to
-/// a racy pid-based kill.
-#[cfg(windows)]
-fn cp_win_dup_proc_handle(child: &Child) -> isize {
-    use std::os::windows::io::AsRawHandle;
-    cp_win_dup_raw_proc_handle(child.as_raw_handle())
-}
-
-#[cfg(windows)]
-fn cp_win_dup_raw_proc_handle(raw: std::os::windows::io::RawHandle) -> isize {
-    use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let mut dup: HANDLE = std::ptr::null_mut();
-    let ok = unsafe {
-        DuplicateHandle(
-            GetCurrentProcess(),
-            raw as HANDLE,
-            GetCurrentProcess(),
-            &mut dup,
-            0,
-            0,
-            DUPLICATE_SAME_ACCESS,
-        )
-    };
-    if ok != 0 {
-        dup as isize
-    } else {
-        0
-    }
-}
-
-/// Terminate (or probe) a live child on Windows through the process handle
-/// duplicated at spawn time — the structural analogue of the unix arm's
-/// `libc::kill(pid, sig)`, and the same strategy as libuv's
-/// `uv_process_kill`. Acting on the held handle (never the pid) closes the
-/// pid-reuse race: the waiter thread may already have reaped the `Child` —
-/// freeing the pid for OS reuse — before its `Exited` event reaches the pump,
-/// but the duplicate keeps naming the original process object forever, so a
-/// recycled pid can never be terminated by mistake.
-///
-/// * `signum == 0` — the POSIX existence probe: no side effect, just "is the
-///   process still alive?" (`GetExitCodeProcess` still reporting
-///   `STILL_ACTIVE`).
-/// * any other signal — degrades to `TerminateProcess(handle, 1)`, exactly
-///   like Node on Windows (there are no POSIX signals to deliver). On an
-///   already-exited process `TerminateProcess` fails, so the kill correctly
-///   reports undelivered.
-///
-/// Returns whether the operation succeeded (the `libc::kill(..) == 0`
-/// analogue). The terminated child is reaped by the waiter thread as usual —
-/// `Child::wait()` returns once the process dies — so the existing
-/// Eof → Exited → exit/close pipeline completes naturally.
-#[cfg(windows)]
-fn cp_win_kill(proc_handle: isize, signum: i32) -> bool {
-    use windows_sys::Win32::Foundation::{HANDLE, STILL_ACTIVE};
-    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, TerminateProcess};
-    if proc_handle == 0 {
-        return false; // spawn-time DuplicateHandle failed — nothing to act on
-    }
-    let handle = proc_handle as HANDLE;
-    if signum == 0 {
-        let mut code: u32 = 0;
-        return unsafe { GetExitCodeProcess(handle, &mut code) } != 0
-            && code == STILL_ACTIVE as u32;
-    }
-    unsafe { TerminateProcess(handle, 1) != 0 }
-}
-
-/// Record a successful Windows termination so the waiter's eventual `Exited`
-/// event reports Node's `(code: null, signal: <requested>)` shape instead of
-/// the synthetic `TerminateProcess` exit code — see
-/// `LiveChild::win_kill_signal`.
-#[cfg(windows)]
-fn cp_note_win_kill(handle: u64, signum: i32) {
-    if signum == 0 {
-        return; // sig-0 probe — nothing was terminated
-    }
-    if let Some(map) = cp_live_lock().as_mut() {
-        if let Some(lc) = map.get_mut(&handle) {
-            lc.win_kill_signal = Some(signum);
-        }
-    }
-}
-
-/// What the platform kill primitive acts on: the pid for unix `libc::kill`,
-/// the spawn-time duplicated process handle on Windows (immune to pid reuse —
-/// see `cp_win_kill`).
-#[cfg(not(windows))]
-#[inline]
-fn cp_kill_target(lc: &LiveChild) -> i32 {
-    lc.pid
-}
-#[cfg(windows)]
-#[inline]
-fn cp_kill_target(lc: &LiveChild) -> isize {
-    lc.win_proc_handle
-}
-
-fn cp_live_kill_signum(handle: u64, signum: i32) -> Option<u64> {
-    let (target, cp_bits) = {
-        let guard = cp_live_lock();
-        match guard.as_ref().and_then(|map| map.get(&handle)) {
-            // Skip if already reaped — the pid may have been recycled by the OS.
-            Some(lc) if lc.exited.is_none() => (cp_kill_target(lc), lc.cp_bits),
-            _ => return None,
-        }
-    };
-    #[cfg(unix)]
-    {
-        if unsafe { libc::kill(target, signum) == 0 } {
-            Some(cp_bits)
-        } else {
-            None
-        }
-    }
-    #[cfg(windows)]
-    {
-        if cp_win_kill(target, signum) {
-            cp_note_win_kill(handle, signum);
-            Some(cp_bits)
-        } else {
-            None
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (target, signum, cp_bits);
-        None
-    }
-}
-
-/// Signal a live child. `signal` is the JS `kill([signal])` argument (a signal
-/// name string, a number, or — for the no-arg / default case — undefined or the
-/// `0.0` arg-padding, both treated as `SIGTERM`). Returns whether the signal
-/// was delivered.
-pub(super) fn cp_live_kill(handle: u64, signal: f64) -> bool {
-    cp_live_kill_signum(handle, cp_signal_from_value(signal)).is_some()
-}
-
-fn cp_live_kill_signal(handle: u64, signum: i32) -> bool {
-    let target = {
-        let guard = cp_live_lock();
-        match guard.as_ref().and_then(|map| map.get(&handle)) {
-            // Skip if already reaped — the pid may have been recycled by the OS.
-            Some(lc) if lc.exited.is_none() => cp_kill_target(lc),
-            _ => return false,
-        }
-    };
-    #[cfg(unix)]
-    {
-        unsafe { libc::kill(target, signum) == 0 }
-    }
-    #[cfg(windows)]
-    {
-        if cp_win_kill(target, signum) {
-            cp_note_win_kill(handle, signum);
-            true
-        } else {
-            false
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (target, signum);
-        false
-    }
-}
-
-/// Map a JS `kill` signal argument to a Unix signal number. Default / no-arg
-/// (`undefined` or the `0.0` padding) → `SIGTERM`.
-#[cfg(unix)]
-fn cp_parse_signal(signal: f64) -> i32 {
-    const SIGTERM: i32 = libc::SIGTERM;
-    if JSValue::from_bits(signal.to_bits()).is_undefined() {
-        return SIGTERM;
-    }
-    // Numeric forms BEFORE the string lookup: the unified string accessor
-    // coerces numbers to "9"-style strings, which are not signal names; an
-    // int32 can also arrive NaN-boxed, which `is_finite()` alone misses.
-    let js = JSValue::from_bits(signal.to_bits());
-    if js.is_int32() {
-        let n = js.as_int32();
-        return if n == 0 { SIGTERM } else { n };
-    }
-    if signal.is_finite() {
-        let n = signal as i32;
-        // 0 is the "no-arg" padding sentinel — treat as the default SIGTERM.
-        return if n == 0 { SIGTERM } else { n };
-    }
-    if let Some(name) = cp_value_to_string(signal) {
-        return cp_signal_number(&name).unwrap_or(SIGTERM);
-    }
-    SIGTERM
-}
-
-/// Inverse of `super::cp_signal_name` for the common signals.
-#[cfg(unix)]
-fn cp_signal_number(name: &str) -> Option<i32> {
-    Some(match name {
-        "SIGHUP" => libc::SIGHUP,
-        "SIGINT" => libc::SIGINT,
-        "SIGQUIT" => libc::SIGQUIT,
-        "SIGABRT" => libc::SIGABRT,
-        "SIGKILL" => libc::SIGKILL,
-        "SIGTERM" => libc::SIGTERM,
-        "SIGUSR1" => libc::SIGUSR1,
-        "SIGUSR2" => libc::SIGUSR2,
-        "SIGSTOP" => libc::SIGSTOP,
-        "SIGCONT" => libc::SIGCONT,
-        _ => return None,
-    })
 }
 
 // ============================================================================
@@ -1924,10 +1973,20 @@ pub(crate) fn cp_reactor_scan_roots_mut(visitor: &mut crate::gc::RuntimeRootVisi
             if let Some(exec) = lc.exec.as_mut() {
                 visitor.visit_nanbox_u64_slot(&mut exec.cb_bits);
             }
+            // #9493: stdin write/end callbacks waiting on the drain thread.
+            if let Some(stdin) = lc.stdin.as_mut() {
+                for callback in &mut stdin.callbacks {
+                    visitor.visit_nanbox_u64_slot(callback);
+                }
+            }
         }
     }
 }
 
+mod kill;
+mod stdin_drain;
 #[cfg(all(test, windows))]
 #[path = "reactor/windows_kill_tests.rs"]
 mod windows_kill_tests;
+pub(crate) use kill::*;
+use stdin_drain::*;

@@ -136,6 +136,7 @@ fn module_with_recursive_constructor_return() -> Module {
         script_global_functions: Vec::new(),
         references_global_this: false,
         annexb_global_undefined_names: Vec::new(),
+        init_is_strict: false,
         init: vec![Stmt::Expr(Expr::New {
             class_name: "RecursiveCtor".to_string(),
             args: vec![Expr::Bool(true), Expr::Undefined],
@@ -159,6 +160,7 @@ fn module_with_recursive_constructor_return() -> Module {
         closure_display_names: std::collections::HashMap::new(),
         class_display_names: std::collections::HashMap::new(),
         closure_source_text: std::collections::HashMap::new(),
+        class_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),

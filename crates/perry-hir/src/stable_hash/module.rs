@@ -22,6 +22,7 @@ impl SH for Module {
             script_global_functions,
             references_global_this,
             annexb_global_undefined_names,
+            init_is_strict,
             init,
             classic_for_lexical_bindings,
             exported_native_instances,
@@ -39,6 +40,7 @@ impl SH for Module {
             closure_display_names,
             class_display_names,
             closure_source_text,
+            class_source_text,
             async_generator_funcs,
             // Observational source metadata does not affect emitted code and
             // therefore must not invalidate the object cache.
@@ -60,6 +62,12 @@ impl SH for Module {
         script_global_functions.hash(h);
         references_global_this.hash(h);
         annexb_global_undefined_names.hash(h);
+        // #9423: module strictness reaches CODEGEN (`FnCtx::is_strict_fn` for
+        // module init and for every outlined entry chunk), so two compiles of
+        // byte-identical statements emit different code depending on it. It has
+        // to be part of the object-cache key or a cached sloppy object would be
+        // reused for a strict module.
+        init_is_strict.hash(h);
         init.hash(h);
         let mut classic_for_ids: Vec<u32> = classic_for_lexical_bindings.iter().copied().collect();
         classic_for_ids.sort_unstable();
@@ -103,10 +111,20 @@ impl SH for Module {
         }
         // #4101: function source text participates in codegen (drives the
         // js_register_function_source calls), so include it in the hash.
-        let mut source_pairs: Vec<(u32, &String)> =
+        let mut source_pairs: Vec<(u32, &FunctionSourceMetadata)> =
             closure_source_text.iter().map(|(k, v)| (*k, v)).collect();
         source_pairs.sort_unstable_by_key(|(k, _)| *k);
-        for (id, src) in source_pairs {
+        for (id, metadata) in source_pairs {
+            id.hash(h);
+            metadata.text.hash(h);
+            metadata.is_non_strict_ordinary.hash(h);
+        }
+        // #9413: class source text drives the js_register_class_source calls,
+        // so it participates in the stable hash for the same reason.
+        let mut class_source_pairs: Vec<(u32, &String)> =
+            class_source_text.iter().map(|(k, v)| (*k, v)).collect();
+        class_source_pairs.sort_unstable_by_key(|(k, _)| *k);
+        for (id, src) in class_source_pairs {
             id.hash(h);
             src.hash(h);
         }

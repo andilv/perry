@@ -611,7 +611,9 @@ fn emit_enabled_trace_warning() {
     let process = scope.root_nanbox_f64(process);
     let callback = scope.root_nanbox_f64(callback);
     let warning = scope.root_nanbox_f64(warning);
-    let previous = crate::object::js_implicit_this_set(process.get_nanbox_f64());
+    let previous = scope.root_nanbox_f64(crate::object::js_implicit_this_set(
+        process.get_nanbox_f64(),
+    ));
     unsafe {
         crate::closure::js_native_call_value(
             callback.get_nanbox_f64(),
@@ -619,7 +621,7 @@ fn emit_enabled_trace_warning() {
             1,
         );
     }
-    crate::object::js_implicit_this_set(previous);
+    crate::object::js_implicit_this_set(previous.get_nanbox_f64());
 }
 
 #[cfg(test)]

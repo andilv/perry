@@ -110,6 +110,7 @@ fn base_module(name: &str, body: Vec<Stmt>, interfaces: Vec<Interface>) -> Modul
             was_plain_async: false,
             was_unrolled: false,
         }],
+        init_is_strict: false,
         init: Vec::new(),
         classic_for_lexical_bindings: std::collections::HashSet::new(),
         exported_native_instances: Vec::new(),
@@ -130,6 +131,7 @@ fn base_module(name: &str, body: Vec<Stmt>, interfaces: Vec<Interface>) -> Modul
         closure_display_names: std::collections::HashMap::new(),
         class_display_names: std::collections::HashMap::new(),
         closure_source_text: std::collections::HashMap::new(),
+        class_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
@@ -302,13 +304,18 @@ fn scalar_object_literal_keeps_initializers_read_by_update() {
 
 fn assert_typed_feedback_setter_after(ir: &str, start_pos: usize, context: &str) {
     let after_start = &ir[start_pos..];
+    // #9459 / #9495: the dynamic by-name store is the receiver-aware `[[Set]]`
+    // (`js_put_value_set`) in both modes -- not the own-property
+    // `js_typed_feedback_object_set_field_by_name` wrapper, which had no
+    // `strict` parameter and no prototype walk. Match the CALL: every runtime
+    // entry is `declare`d in every module.
     assert!(
-        after_start.contains("call void @js_typed_feedback_object_set_field_by_name"),
-        "{context} should use the typed-feedback setter wrapper"
+        after_start.contains("call double @js_put_value_set("),
+        "{context} should reach the receiver-aware runtime setter"
     );
     assert!(
-        ir.contains("js_object_set_field_by_name"),
-        "{context} should keep the safe runtime setter as the typed-feedback fallback"
+        !after_start.contains("call void @js_typed_feedback_object_set_field_by_name"),
+        "{context} must not take the own-property setter wrapper (#9495)"
     );
 }
 
@@ -969,7 +976,7 @@ fn typed_object_literal_stable_path_installs_pointer_mask_descriptor() {
 #[test]
 fn typed_object_literal_pointer_free_descriptor_precedes_dynamic_mutation() {
     let row_ty = object_type(&[("count", Type::Number)]);
-    let module = base_module(
+    let mut module = base_module(
         "typed_shape_mutation.ts",
         vec![
             Stmt::Let {
@@ -988,6 +995,10 @@ fn typed_object_literal_pointer_free_descriptor_precedes_dynamic_mutation() {
         ],
         Vec::new(),
     );
+    // #9459 made SLOPPY PropertySet route through `js_put_value_set` (silent
+    // rejection), bypassing the typed-feedback wrapper this test pins. Real TS
+    // modules are ESM and therefore strict — pin the strict path explicitly.
+    module.functions[0].is_strict = true;
 
     let ir = ir_for(module);
     let descriptor_pos = ir

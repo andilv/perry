@@ -142,7 +142,7 @@ fn emptying_a_set_stays_consistent_and_compacts() {
 }
 
 #[test]
-fn raw_indexed_access_self_heals_by_compacting() {
+fn raw_indexed_reads_never_compact_and_the_cursor_steps_over_holes() {
     let set = js_set_alloc(8);
     for v in [1.0f64, 2.0, 3.0] {
         js_set_add(set, v);
@@ -151,10 +151,120 @@ fn raw_indexed_access_self_heals_by_compacting() {
     unsafe {
         assert_ne!((*set).used, (*set).size, "a hole is present");
     }
-    assert_eq!(js_set_value_at(set, 1), 3.0, "extern read compacts first");
+    // The RAW twin the for-of walker uses is a plain bounded read: raw index
+    // 2 is still the THIRD value, the hole at 1 stays, the layout is untouched
+    // (the walker's reads used to compact the whole set once per observed
+    // hole).
+    assert_eq!(js_set_value_raw_at(set, 2), 3.0);
+    assert_eq!(
+        js_set_value_raw_at(set, 1).to_bits(),
+        SET_HOLE_VALUE_BITS,
+        "the raw twin exposes the hole — only the cursor ever reads it"
+    );
     unsafe {
-        assert_eq!((*set).used, (*set).size, "access healed the layout");
+        assert_ne!(
+            (*set).used,
+            (*set).size,
+            "the raw read left the layout alone"
+        );
+        assert_eq!(
+            crate::set::set_compaction_epoch(set),
+            0,
+            "no squeeze happened"
+        );
+        assert_eq!(crate::set::set_cursor_next_raw(set, 0, 0), Some(0));
+        assert_eq!(
+            crate::set::set_cursor_next_raw(set, 1, 0),
+            Some(2),
+            "hole at 1 skipped"
+        );
+        assert_eq!(
+            crate::set::set_cursor_next_raw(set, 3, 0),
+            None,
+            "extent exhausted"
+        );
     }
+    // The LIVE-index accessor (#9462 / #9504 — the array-like `set[i]` read)
+    // squeezes first: live index 1 IS the third value, never a hole, and the
+    // squeeze is recorded so a cursor past the hole rebases exactly.
+    assert_eq!(
+        js_set_value_at(set, 1),
+        3.0,
+        "live index 1 is the third value"
+    );
+    assert_eq!(
+        js_set_value_at(set, 2).to_bits(),
+        crate::value::TAG_UNDEFINED,
+        "past the live size is undefined, not a hole"
+    );
+    unsafe {
+        assert_eq!(
+            (*set).used,
+            (*set).size,
+            "the live accessor squeezed the hole"
+        );
+        assert_eq!(crate::set::set_compaction_epoch(set), 1, "…and recorded it");
+        assert_eq!(crate::set::set_cursor_next_raw(set, 2, 0), Some(1));
+        assert_eq!(js_set_value_raw_at(set, 1), 3.0);
+    }
+}
+
+#[test]
+fn cursor_rebases_exactly_across_a_multi_hole_compaction() {
+    // 40 values; a walk at cursor 21 while the body deletes v0..v20: holes
+    // outnumber the 19 live values, one compaction squeezes all 21 below the
+    // cursor. The rebase moves the cursor down by exactly that count.
+    let set = js_set_alloc(64);
+    for i in 0..40 {
+        js_set_add(set, i as f64);
+    }
+    let epoch0 = crate::set::set_compaction_epoch(set);
+    for i in 0..=20 {
+        assert_eq!(js_set_delete(set, i as f64), 1);
+    }
+    unsafe {
+        assert_eq!((*set).used, (*set).size, "the delete path compacted");
+    }
+    assert_ne!(crate::set::set_compaction_epoch(set), epoch0);
+    assert_eq!(
+        unsafe { crate::set::set_cursor_next_raw(set, 21, epoch0) },
+        Some(0)
+    );
+    assert_eq!(js_set_value_at(set, 0), 21.0, "the true next value");
+    let epoch1 = crate::set::set_compaction_epoch(set);
+    assert_eq!(
+        unsafe { crate::set::set_cursor_next_raw(set, 3, epoch1) },
+        Some(3)
+    );
+}
+
+#[test]
+fn cursor_rebases_through_successive_squeezes_and_clear() {
+    let set = js_set_alloc(64);
+    for i in 0..40 {
+        js_set_add(set, i as f64);
+    }
+    let epoch0 = crate::set::set_compaction_epoch(set);
+    for i in 0..=31 {
+        assert_eq!(js_set_delete(set, i as f64), 1);
+    }
+    unsafe {
+        assert_eq!((*set).used, (*set).size);
+        assert_eq!((*set).size, 8);
+    }
+    assert_eq!(
+        unsafe { crate::set::set_cursor_next_raw(set, 21, epoch0) },
+        Some(0)
+    );
+    assert_eq!(js_set_value_at(set, 0), 32.0);
+    let epoch1 = crate::set::set_compaction_epoch(set);
+    js_set_clear(set);
+    js_set_add(set, 100.0);
+    assert_eq!(
+        unsafe { crate::set::set_cursor_next_raw(set, 5, epoch1) },
+        Some(0)
+    );
+    assert_eq!(js_set_value_at(set, 0), 100.0);
 }
 
 #[test]
@@ -226,4 +336,121 @@ fn clear_resets_the_extent_and_walkers_compact() {
         1,
         "the hole must not defeat the subset walk"
     );
+}
+
+#[test]
+fn cursor_stays_exact_across_forty_squeezes_in_one_body() {
+    // See the Map twin: a set at full capacity squeezes once per delete+re-add
+    // pair on the grow path; the removed-index budget keeps every record.
+    let set = js_set_alloc(64);
+    for i in 0..64 {
+        js_set_add(set, i as f64);
+    }
+    unsafe {
+        assert_eq!((*set).used, (*set).capacity, "premise: at capacity");
+    }
+    let epoch0 = crate::set::set_compaction_epoch(set);
+    for i in 0..40 {
+        assert_eq!(js_set_delete(set, i as f64), 1);
+        js_set_add(set, i as f64);
+    }
+    let squeezes = crate::set::set_compaction_epoch(set).wrapping_sub(epoch0);
+    assert!(
+        squeezes >= 33,
+        "premise: {squeezes} squeezes happened, need > 32"
+    );
+    assert_eq!(
+        unsafe { crate::set::set_cursor_next_raw(set, 10, epoch0) },
+        Some(0)
+    );
+    assert_eq!(js_set_value_raw_at(set, 0), 40.0);
+    let mut order = Vec::new();
+    let mut idx = 0u32;
+    let epoch_now = crate::set::set_compaction_epoch(set);
+    while let Some(i) = unsafe { crate::set::set_cursor_next_raw(set, idx, epoch_now) } {
+        order.push(js_set_value_raw_at(set, i));
+        idx = i + 1;
+    }
+    let expected: Vec<f64> = (40..64).chain(0..40).map(|k| k as f64).collect();
+    assert_eq!(order, expected);
+}
+
+#[test]
+fn clear_truncates_the_squeeze_history() {
+    let set = js_set_alloc(64);
+    for i in 0..64 {
+        js_set_add(set, i as f64);
+    }
+    let epoch0 = crate::set::set_compaction_epoch(set);
+    for i in 0..40 {
+        js_set_delete(set, i as f64);
+        js_set_add(set, i as f64);
+    }
+    js_set_clear(set);
+    js_set_add(set, 7.0);
+    assert_eq!(
+        unsafe { crate::set::set_cursor_next_raw(set, 10, epoch0) },
+        Some(0)
+    );
+    assert_eq!(js_set_value_raw_at(set, 0), 7.0);
+}
+
+extern "C" fn delete_earlier_then_live_read(
+    _closure: *const crate::closure::ClosureHeader,
+    value: f64,
+    _value_again: f64,
+    collection: f64,
+) -> f64 {
+    FOREACH_DELETE_VISITS.with(|visits| visits.borrow_mut().push(value.to_bits()));
+    if value == 5.0 {
+        let set = crate::value::js_nanbox_get_pointer(collection) as *mut SetHeader;
+        js_set_delete(set, 1.0);
+        js_set_delete(set, 2.0);
+        assert_eq!(js_set_value_at(set, 0), 0.0, "live index 0 is value 0");
+        assert_eq!(
+            js_set_value_at(set, 1),
+            3.0,
+            "live index 1 skips the two holes"
+        );
+        unsafe {
+            assert_ne!(
+                (*set).used,
+                (*set).size,
+                "the walk's raw layout was left alone"
+            );
+        }
+    }
+    f64::from_bits(crate::value::TAG_UNDEFINED)
+}
+
+#[test]
+fn a_live_index_read_inside_foreach_defers_the_squeeze_and_skips_nothing() {
+    let expected = (0..20).map(|value| value as f64).collect::<Vec<_>>();
+    let set = js_set_alloc(32);
+    for &value in &expected {
+        js_set_add(set, value);
+    }
+    js_set_foreach(
+        set,
+        foreach_callback(delete_earlier_then_live_read as *const u8),
+        f64::from_bits(crate::value::TAG_UNDEFINED),
+    );
+    assert_eq!(
+        take_foreach_delete_visits(),
+        expected,
+        "every element visited exactly once"
+    );
+    assert_eq!(js_set_size(set), 18);
+    unsafe {
+        assert_eq!(
+            (*set).used,
+            (*set).size,
+            "the outermost walk's completion squeezed"
+        );
+    }
+    js_set_delete(set, 3.0);
+    assert_eq!(js_set_value_at(set, 1), 4.0);
+    unsafe {
+        assert_eq!((*set).used, (*set).size);
+    }
 }

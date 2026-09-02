@@ -76,6 +76,8 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     // reads 0 whenever every live typed array uses inline storage (so the
     // inline `header + 16 + idx*elem_size` load matches the runtime `data_ptr`).
     module.add_external_global("PERRY_TA_KIND_CACHE", "[64 x i64]");
+    // #9342: Uint8Array inline-read admission cache (buffer/header.rs).
+    module.add_external_global("PERRY_U8_INLINE_CACHE", "[64 x i64]");
     module.add_external_global("PERRY_TA_VIEW_GUARD", I64);
     module.declare_function("js_object_alloc", I64, &[I32, I32]);
     // #3149: `Object(value)` plain-call coercion. Takes & returns a NaN-boxed
@@ -118,13 +120,10 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
         VOID,
         &[I64, I64, DOUBLE],
     );
-    // #6469: spec default Error-init for the synthesized standalone ctor of a
-    // no-own-ctor `class X extends Error {}` (this, message, name-string ptr).
-    module.declare_function(
-        "js_error_subclass_default_init",
-        VOID,
-        &[DOUBLE, DOUBLE, I64],
-    );
+    // #6469/#9440: spec default Error-init for the synthesized standalone ctor
+    // of a no-own-ctor `class X extends Error {}` (this, message). `name`
+    // remains inherited from the terminating Error-family prototype.
+    module.declare_function("js_error_subclass_default_init", VOID, &[DOUBLE, DOUBLE]);
     module.declare_function(
         "js_object_set_field_by_name_nonconfigurable",
         VOID,

@@ -112,6 +112,10 @@ pub(super) fn emit_string_pool(
     // #5592: user-visible `.name` overrides keyed by ClassId, for classes
     // whose HIR registration key was uniquified away from their JS name.
     class_display_names: &HashMap<u32, String>,
+    // #9413: retained class SOURCE text keyed by ClassId, so `String(C)` /
+    // `C.toString()` return the class source instead of a synthesized
+    // `function C() { [native code] }`.
+    class_source_text: &HashMap<u32, String>,
     // Wall 51: per-class standalone-constructor arity, accounting for the
     // synthesized `super(...args)` forwarding ctor a no-own-ctor class with
     // heritage inherits (its arity comes from the nearest ancestor ctor, which
@@ -193,7 +197,7 @@ pub(super) fn emit_string_pool(
     // original source we retained. Each entry produces one
     // `js_register_function_source` call in `__perry_init_strings_<prefix>`
     // so `fn.toString()` can reconstruct the source.
-    user_fn_source: &[(String, String)],
+    user_fn_source: &[(String, String, bool)],
 ) {
     for entry in strings.iter() {
         // .rodata bytes — `[N+1 x i8]` because we include the null terminator.
@@ -253,24 +257,45 @@ pub(super) fn emit_string_pool(
     // Each entry becomes one `js_register_function_name(<sym>, <str>,
     // <len>)` call inside the init function. See #1202.
     let mut user_fn_name_constants: Vec<(String, String, usize)> = Vec::new();
+    // Deduplicated by CONTENT (#9486): the same display name is now registered
+    // against several symbols — a top-level function's wrapper and its body,
+    // a class method and its `__perry_wrap_*` twin — and `add_string_constant`
+    // mints a fresh `@.str.N` per call, so without this every extra
+    // registration also cost a duplicate copy of the name in rodata.
+    // Deterministic: the map only reuses a global the loop already minted in
+    // its (already sorted) input order, so emission order is unchanged (#7622).
+    let mut name_constant_cache: std::collections::HashMap<&str, (String, usize)> =
+        std::collections::HashMap::new();
     for (wrapper_sym, display_name) in user_fn_display_names {
         if wrapper_sym.is_empty() || display_name.is_empty() {
             continue;
         }
-        let (const_name, byte_len) = llmod.add_string_constant(display_name);
+        let (const_name, byte_len) = match name_constant_cache.get(display_name.as_str()) {
+            Some(hit) => hit.clone(),
+            None => {
+                let minted = llmod.add_string_constant(display_name);
+                name_constant_cache.insert(display_name.as_str(), minted.clone());
+                minted
+            }
+        };
         user_fn_name_constants.push((wrapper_sym.clone(), const_name, byte_len));
     }
 
     // #4101: pre-allocate string constants for function-source registration,
     // mirroring the name constants above (same borrow ordering: mint the
     // rodata globals BEFORE `init_fn` claims `&mut llmod`).
-    let mut user_fn_source_constants: Vec<(String, String, usize)> = Vec::new();
-    for (wrapper_sym, source_text) in user_fn_source {
+    let mut user_fn_source_constants: Vec<(String, String, usize, bool)> = Vec::new();
+    for (wrapper_sym, source_text, is_non_strict_ordinary) in user_fn_source {
         if wrapper_sym.is_empty() || source_text.is_empty() {
             continue;
         }
         let (const_name, byte_len) = llmod.add_string_constant(source_text);
-        user_fn_source_constants.push((wrapper_sym.clone(), const_name, byte_len));
+        user_fn_source_constants.push((
+            wrapper_sym.clone(),
+            const_name,
+            byte_len,
+            *is_non_strict_ordinary,
+        ));
     }
 
     // Pre-allocate string constants for class-name registration. We need
@@ -302,6 +327,31 @@ pub(super) fn emit_string_pool(
         for (cid, name) in named {
             let (const_name, byte_len) = llmod.add_string_constant(&name);
             named_class_name_constants.push((cid, const_name, byte_len));
+        }
+    }
+
+    // #9413: the same pre-allocation for retained class source text — also
+    // before `init_fn` borrows `llmod`.
+    let mut class_source_constants: Vec<(u32, String, usize)> = Vec::new();
+    {
+        let mut sources: Vec<(u32, &String)> = Vec::new();
+        for (class_name, class) in classes.iter() {
+            if *class_name != class.name || class_name.starts_with("__AnonShape_") {
+                continue;
+            }
+            let cid = match class_ids.get(class_name).copied() {
+                Some(c) if c != 0 => c,
+                _ => continue,
+            };
+            if let Some(src) = class_source_text.get(&cid) {
+                sources.push((cid, src));
+            }
+        }
+        sources.sort_by_key(|entry| entry.0);
+        sources.dedup_by_key(|(cid, _)| *cid);
+        for (cid, src) in sources {
+            let (const_name, byte_len) = llmod.add_string_constant(src);
+            class_source_constants.push((cid, const_name, byte_len));
         }
     }
 
@@ -414,7 +464,8 @@ pub(super) fn emit_string_pool(
     // #4101: register each function's retained source text against the same
     // wrapper/closure address `js_closure_alloc_singleton` stamps into the
     // ClosureHeader, so `fn.toString()` resolves the source by func_ptr.
-    for (wrapper_sym, source_const, source_len) in &user_fn_source_constants {
+    for (wrapper_sym, source_const, source_len, is_non_strict_ordinary) in &user_fn_source_constants
+    {
         chunker.roll_if_full();
         let blk = chunker.current_block();
         let wrapper_ref = format!("@{}", wrapper_sym);
@@ -422,7 +473,12 @@ pub(super) fn emit_string_pool(
         let len_str = source_len.to_string();
         blk.call_void(
             "js_register_function_source",
-            &[(PTR, &wrapper_ref), (PTR, &source_ref), (I32, &len_str)],
+            &[
+                (PTR, &wrapper_ref),
+                (PTR, &source_ref),
+                (I32, &len_str),
+                (I32, if *is_non_strict_ordinary { "1" } else { "0" }),
+            ],
         );
     }
 
@@ -1098,6 +1154,23 @@ pub(super) fn emit_string_pool(
         let const_ref = format!("@{}", const_name);
         blk.call_void(
             "js_register_class_name",
+            &[
+                (crate::types::I32, &cid.to_string()),
+                (crate::types::PTR, &const_ref),
+                (crate::types::I32, &byte_len.to_string()),
+            ],
+        );
+    }
+    // #9413: mirror each class's retained source text into the runtime so
+    // `Function.prototype.toString` on a class REF (an INT32 immediate, not a
+    // ClosureHeader) answers with the class source. Same shape as the
+    // `js_register_function_source` loop above.
+    for (cid, const_name, byte_len) in &class_source_constants {
+        chunker.roll_if_full();
+        let blk = chunker.current_block();
+        let const_ref = format!("@{}", const_name);
+        blk.call_void(
+            "js_register_class_source",
             &[
                 (crate::types::I32, &cid.to_string()),
                 (crate::types::PTR, &const_ref),

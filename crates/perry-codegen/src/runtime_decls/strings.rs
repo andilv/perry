@@ -31,6 +31,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // `js_string_concat_value(prefix_handle, value_f64) -> handle`
     // `js_value_concat_string(value_f64, suffix_handle) -> handle`
     module.declare_function("js_string_concat_value", I64, &[I64, DOUBLE]);
+    module.declare_function("js_string_concat_site_value", DOUBLE, &[I64, I64, DOUBLE]);
     module.declare_function("js_value_concat_string", I64, &[DOUBLE, I64]);
     // NaN-box-returning twin: SSO immediate for ≤5-ASCII-byte results, so
     // `"k" + i` computed keys get content-stable bits (dyn-IC/stub hits)
@@ -1234,10 +1235,22 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // would do. (Map ptr, entry idx) → key / value.
     module.declare_function("js_map_entry_key_at", DOUBLE, &[I64, I32]);
     module.declare_function("js_map_entry_value_at", DOUBLE, &[I64, I32]);
+    // RAW twins for the for-of walkers: bounded by the raw extent, never
+    // compact (the un-suffixed accessors above are live-index and compact).
+    module.declare_function("js_map_entry_key_raw_at", DOUBLE, &[I64, I32]);
+    module.declare_function("js_map_entry_value_raw_at", DOUBLE, &[I64, I32]);
+    module.declare_function("js_set_value_raw_at", DOUBLE, &[I64, I32]);
     // #6075: current index of a key/value (or -1) for the delete-safe for-of
     // fast path. Takes the NaN-boxed collection + key; strips internally.
     module.declare_function("js_map_find_key_index", DOUBLE, &[DOUBLE, DOUBLE]);
     module.declare_function("js_set_find_value_index", DOUBLE, &[DOUBLE, DOUBLE]);
+    // The delete-safe for-of cursor: (NaN-boxed collection, cursor, epoch) →
+    // next live raw index or -1, and the collection's compaction epoch the
+    // loop stores after each step. See perry-hir `map_set_delete_safe_for_of`.
+    module.declare_function("js_map_cursor_next", DOUBLE, &[DOUBLE, DOUBLE, DOUBLE]);
+    module.declare_function("js_map_compaction_epoch", DOUBLE, &[DOUBLE]);
+    module.declare_function("js_set_cursor_next", DOUBLE, &[DOUBLE, DOUBLE, DOUBLE]);
+    module.declare_function("js_set_compaction_epoch", DOUBLE, &[DOUBLE]);
     // Map/Set forEach: (collection_ptr, callback_nanboxed_f64, thisArg_f64) -> void (#2830)
     module.declare_function("js_map_foreach", VOID, &[I64, DOUBLE, DOUBLE]);
     module.declare_function("js_set_foreach", VOID, &[I64, DOUBLE, DOUBLE]);
@@ -1377,6 +1390,8 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // is non-empty. Codegen emits one call per registered class id at
     // program init, mirroring `js_register_class_id`.
     module.declare_function("js_register_class_name", VOID, &[I32, PTR, I32]);
+    // #9413: the class-source sibling of `js_register_function_source`.
+    module.declare_function("js_register_class_source", VOID, &[I32, PTR, I32]);
     module.declare_function("js_register_class_length", VOID, &[I32, I32]);
     // Anon-shape class registration so `.constructor` reads on object
     // literals (`{ x: 1 }`) return the global `Object` constructor

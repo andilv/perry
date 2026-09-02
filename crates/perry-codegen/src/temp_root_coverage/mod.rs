@@ -45,9 +45,11 @@ use perry_hir::{Expr, Module, ModuleInitKind, Stmt};
 
 mod builtin_ctor;
 mod call_callee;
+mod dispatch_receiver;
 mod operands;
+mod set_receiver;
 
-fn entry_opts() -> CompileOptions {
+pub(crate) fn entry_opts() -> CompileOptions {
     CompileOptions {
         target: None,
         is_entry_module: true,
@@ -117,6 +119,7 @@ fn module_with_init(name: &str, init: Vec<Stmt>) -> Module {
         script_global_functions: Vec::new(),
         references_global_this: false,
         annexb_global_undefined_names: Vec::new(),
+        init_is_strict: false,
         init,
         classic_for_lexical_bindings: std::collections::HashSet::new(),
         exported_native_instances: Vec::new(),
@@ -134,6 +137,7 @@ fn module_with_init(name: &str, init: Vec<Stmt>) -> Module {
         closure_display_names: std::collections::HashMap::new(),
         class_display_names: std::collections::HashMap::new(),
         closure_source_text: std::collections::HashMap::new(),
+        class_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),

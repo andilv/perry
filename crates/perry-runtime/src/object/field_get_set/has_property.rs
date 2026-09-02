@@ -415,7 +415,10 @@ pub extern "C" fn js_object_has_property(obj: f64, key: f64) -> f64 {
             // getter is never invoked (`in` is [[HasProperty]], not [[Get]]).
             // Inherited `Function.prototype` methods (`"call" in C`) and
             // inherited static *data* fields are not covered — the latter mirror
-            // the get-by-name gap for the same shape.
+            // the get-by-name gap for the same shape. `constructor` is the one
+            // `Function.prototype` member that IS covered: #9467 made the
+            // class-ref read answer `C.constructor === Function` (inherited,
+            // never own), and `in` must agree with `[[Get]]` on that key.
             if key_val.is_any_string() {
                 let mut sso = [0u8; crate::value::SHORT_STRING_MAX_LEN];
                 if let Some(name) = unsafe { crate::string::js_string_key_bytes(key_val, &mut sso) }
@@ -430,7 +433,7 @@ pub extern "C" fn js_object_has_property(obj: f64, key: f64) -> f64 {
                                 name,
                             )
                         };
-                    let present = matches!(name, "prototype" | "name" | "length")
+                    let present = matches!(name, "prototype" | "name" | "length" | "constructor")
                         || (!super::super::class_registry::class_is_key_deleted(class_id, name)
                             && (super::super::class_registry::class_has_own_dynamic_prop(
                                 class_id, name,
@@ -726,6 +729,24 @@ pub extern "C" fn js_object_has_property(obj: f64, key: f64) -> f64 {
                         crate::typedarray_props::typed_array_prototype_chain_has(
                             obj_addr as usize,
                             name,
+                        )
+                    } {
+                        return nanbox_true;
+                    }
+                    // A Uint8Array is represented by a registered buffer, but
+                    // ordinary properties written through the typed-array
+                    // [[Set]] path live in TYPED_ARRAY_OWN_PROPS.  The
+                    // lookup_typed_array_kind arm above can never see this
+                    // receiver, and the legacy buffer table below is a
+                    // different store.  Ask the buffer-aware typed-array own
+                    // property helper as well, matching Object.keys,
+                    // hasOwnProperty, and getOwnPropertyDescriptor.
+                    let key_str = crate::value::js_get_string_pointer_unified(key)
+                        as *const crate::StringHeader;
+                    if unsafe {
+                        crate::typedarray_props::typed_array_has_own_property(
+                            obj_addr as *const crate::typedarray::TypedArrayHeader,
+                            key_str,
                         )
                     } {
                         return nanbox_true;
