@@ -279,17 +279,56 @@ fn eager_fn_metadata_validation() -> bool {
 /// function's name and source text; the check moves here, where it runs only
 /// for metadata something actually reads. Invalid bytes yield `None`, which is
 /// what the caller saw before when registration rejected them up front.
-fn decode_registered(slot: Option<&std::sync::Arc<[u8]>>) -> Option<String> {
+fn decode_registered(slot: Option<&[u8]>) -> Option<String> {
     let bytes = slot?;
     std::str::from_utf8(bytes).ok().map(str::to_owned)
 }
 
-fn function_name_registry(
+/// #9612: codegen's names and sources are `private unnamed_addr constant`
+/// globals in the program image — read-only, file-backed, already resident at
+/// zero private cost. Copying them into `Arc<[u8]>` at module init made a
+/// second, DIRTY copy of the whole set: measured 5.1 MB of names and 23.8 MB
+/// of source text on the compiled claude-code TUI, for data the binary was
+/// already carrying. Both registries now borrow the image.
+///
+/// Names have a second source that the image cannot supply:
+/// `register_function_name_if_absent` INFERS a name at runtime (a symbol's
+/// description, `get <key>`), and those bytes must be owned. They live in
+/// their own small map rather than widening the main one — an enum value
+/// would add 8 bytes to every one of the ~60 000 image entries to carry the
+/// handful of owned ones, which measured as a NET LOSS on the first attempt
+/// (+0.31 MB) even though it removed 1.8 MB of copies.
+fn function_name_overrides(
 ) -> &'static std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<[u8]>>> {
     use std::sync::OnceLock;
-    static REGISTRY: OnceLock<
+    static OVERRIDES: OnceLock<
         std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<[u8]>>>,
     > = OnceLock::new();
+    OVERRIDES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The registered name for `func_ptr`: the image name when it decodes, else a
+/// runtime-inferred override. Mirrors what the single map used to do, where an
+/// undecodable registration counted as absent — `register_function_name_
+/// if_absent` writes an override in exactly that case, so a reader that
+/// stopped at the image map would lose the name it just recovered.
+fn registered_name_string(func_ptr: usize) -> Option<String> {
+    if let Ok(map) = function_name_registry().lock() {
+        if let Some(name) = decode_registered(map.get(&func_ptr).copied()) {
+            return Some(name);
+        }
+    }
+    function_name_overrides()
+        .lock()
+        .ok()
+        .and_then(|map| decode_registered(map.get(&func_ptr).map(|b| &**b)))
+}
+
+fn function_name_registry(
+) -> &'static std::sync::Mutex<std::collections::HashMap<usize, &'static [u8]>> {
+    use std::sync::OnceLock;
+    static REGISTRY: OnceLock<std::sync::Mutex<std::collections::HashMap<usize, &'static [u8]>>> =
+        OnceLock::new();
     REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -329,11 +368,7 @@ fn format_function_for_console(closure_ptr: *const crate::closure::ClosureHeader
         if func_ptr.is_null() {
             None
         } else {
-            function_name_registry()
-                .lock()
-                .ok()
-                .and_then(|map| decode_registered(map.get(&(func_ptr as usize))))
-                .filter(|n| !n.is_empty())
+            registered_name_string(func_ptr as usize).filter(|n| !n.is_empty())
         }
     };
     let label = match registry_name.or_else(|| {
@@ -377,7 +412,7 @@ fn format_function_for_console(closure_ptr: *const crate::closure::ClosureHeader
 /// # Safety
 ///
 /// `name_ptr..name_ptr+name_len` must point at a valid UTF-8 byte slice
-/// that outlives the call (we copy it). `func_ptr` may be anything; we
+/// that is valid for the REST OF THE PROCESS (#9612: the registry borrows it; codegen emits a `private unnamed_addr constant`). `func_ptr` may be anything; we
 /// only use it as a map key.
 #[no_mangle]
 pub unsafe extern "C" fn js_register_function_name(
@@ -398,7 +433,13 @@ pub unsafe extern "C" fn js_register_function_name(
         return;
     }
     if let Ok(mut map) = function_name_registry().lock() {
-        map.insert(func_ptr as usize, std::sync::Arc::from(bytes));
+        // SAFETY (#9612): the caller's contract is that `name_ptr` addresses a
+        // constant in the program image, which outlives the process. Codegen
+        // emits exactly that (`@.str.N = private unnamed_addr constant`), and
+        // the tests pass `b"..."` literals, which are `'static` too.
+        let image: &'static [u8] =
+            unsafe { std::slice::from_raw_parts(name_ptr, name_len as usize) };
+        map.insert(func_ptr as usize, image);
     }
 }
 
@@ -414,7 +455,7 @@ pub fn register_function_name_if_absent(func_ptr: usize, name: &str) {
     if func_ptr == 0 || name.is_empty() {
         return;
     }
-    if let Ok(mut map) = function_name_registry().lock() {
+    if let Ok(map) = function_name_registry().lock() {
         // "Absent" now means "absent OR stored bytes that do not decode" —
         // registration no longer rejects invalid UTF-8, so an undecodable
         // entry occupies the slot where nothing used to, and a plain
@@ -424,8 +465,15 @@ pub fn register_function_name_if_absent(func_ptr: usize, name: &str) {
         let usable = map
             .get(&func_ptr)
             .is_some_and(|bytes| std::str::from_utf8(bytes).is_ok());
+        // Release the image lock before taking the override lock: the two are
+        // always acquired in this order, never the reverse.
+        drop(map);
         if !usable {
-            map.insert(func_ptr, std::sync::Arc::from(name.as_bytes()));
+            if let Ok(mut overrides) = function_name_overrides().lock() {
+                overrides
+                    .entry(func_ptr)
+                    .or_insert_with(|| std::sync::Arc::from(name.as_bytes()));
+            }
         }
     }
 }
@@ -446,10 +494,23 @@ pub fn function_name_registry_len() -> Option<usize> {
 /// per frame) happens outside it, so a `.stack` read never blocks a
 /// concurrent registration for longer than the snapshot itself.
 pub fn function_name_registry_entries() -> Option<Vec<(usize, std::sync::Arc<[u8]>)>> {
-    function_name_registry()
-        .lock()
-        .ok()
-        .map(|map| map.iter().map(|(k, v)| (*k, v.clone())).collect())
+    // The `Arc` in the return type is the resolver's, not the registry's: an
+    // image name is borrowed, so materializing one costs a copy of the NAME
+    // (tens of bytes), paid per `.stack` snapshot rather than per process.
+    function_name_registry().lock().ok().map(|map| {
+        let mut out: Vec<(usize, std::sync::Arc<[u8]>)> = map
+            .iter()
+            .map(|(k, v)| (*k, std::sync::Arc::from(*v)))
+            .collect();
+        if let Ok(overrides) = function_name_overrides().lock() {
+            for (k, v) in overrides.iter() {
+                if !map.contains_key(k) {
+                    out.push((*k, v.clone()));
+                }
+            }
+        }
+        out
+    })
 }
 
 /// Look up the codegen-registered JS name for a function pointer.
@@ -464,11 +525,7 @@ pub fn function_name_for_ptr(func_ptr: usize) -> Option<String> {
     if func_ptr == 0 {
         return None;
     }
-    function_name_registry()
-        .lock()
-        .ok()
-        .and_then(|map| decode_registered(map.get(&func_ptr)))
-        .filter(|n| !n.is_empty())
+    registered_name_string(func_ptr).filter(|n| !n.is_empty())
 }
 
 /// #4101 / #9525: sidecar registry mapping each user function's compiled
@@ -478,7 +535,10 @@ pub fn function_name_for_ptr(func_ptr: usize) -> Option<String> {
 /// map is fully populated. Mirrors the function-name registry's single-writer,
 /// last-write-wins semantics.
 struct RegisteredFunctionSource {
-    bytes: std::sync::Arc<[u8]>,
+    /// #9612: borrowed from the program image, never copied. Only codegen's
+    /// module init and unit tests with `b"..."` literals register sources, and
+    /// both are `'static`; there is no runtime-inferred source text.
+    bytes: &'static [u8],
     is_non_strict_ordinary: bool,
 }
 
@@ -499,9 +559,14 @@ fn function_source_registry(
 ///
 /// # Safety
 ///
-/// `src_ptr..src_ptr+src_len` must point at a valid UTF-8 byte slice that
-/// outlives the call (we copy it). `func_ptr` is used only as a map key. The
-/// flag is treated as a boolean (`0` is false; every other value is true).
+/// `src_ptr..src_ptr+src_len` must point at a valid UTF-8 byte slice that is
+/// valid for the REST OF THE PROCESS — #9612 stopped copying it, so the
+/// registry borrows these bytes for the program's lifetime. Codegen satisfies
+/// this by emitting the text as a `private unnamed_addr constant` global
+/// (`codegen/string_pool.rs`), which is exactly the property that makes the
+/// borrow free: the bytes are already resident, read-only and file-backed.
+/// `func_ptr` is used only as a map key. The flag is treated as a boolean
+/// (`0` is false; every other value is true).
 #[no_mangle]
 pub unsafe extern "C" fn js_register_function_source(
     func_ptr: *const u8,
@@ -520,10 +585,13 @@ pub unsafe extern "C" fn js_register_function_source(
         return;
     }
     if let Ok(mut map) = function_source_registry().lock() {
+        // SAFETY (#9612): as for names above — `src_ptr` must address a
+        // constant in the program image. The doc comment states the contract.
+        let image: &'static [u8] = std::slice::from_raw_parts(src_ptr, src_len as usize);
         map.insert(
             func_ptr as usize,
             RegisteredFunctionSource {
-                bytes: std::sync::Arc::from(bytes),
+                bytes: image,
                 is_non_strict_ordinary: is_non_strict_ordinary != 0,
             },
         );
@@ -550,7 +618,7 @@ pub fn function_source_for_ptr(func_ptr: usize) -> Option<String> {
     function_source_registry()
         .lock()
         .ok()
-        .and_then(|map| decode_registered(map.get(&func_ptr).map(|source| &source.bytes)))
+        .and_then(|map| decode_registered(map.get(&func_ptr).map(|source| source.bytes)))
         .filter(|s| !s.is_empty())
 }
 
@@ -1836,92 +1904,8 @@ fn looks_like_raw_heap_pointer(value: f64) -> bool {
         && addr >= crate::gc::GC_HEADER_SIZE + 0x1000
 }
 
-fn formatted_deep_equal(left: f64, right: f64, skip_prototype: bool) -> bool {
-    let _guard = DeepEqualSkipPrototypeFormatGuard::new(skip_prototype);
-    format_jsvalue_for_json(left, 0) == format_jsvalue_for_json(right, 0)
-}
-
-fn js_util_deep_strict_equal_bool(
-    left: f64,
-    right: f64,
-    depth: usize,
-    skip_prototype: bool,
-) -> bool {
-    if depth > 64 {
-        return formatted_deep_equal(left, right, skip_prototype);
-    }
-    let left_value = crate::value::JSValue::from_bits(left.to_bits());
-    let right_value = crate::value::JSValue::from_bits(right.to_bits());
-    let left_boxed = boxed_primitives::boxed_primitive_payload(left);
-    let right_boxed = boxed_primitives::boxed_primitive_payload(right);
-    if left_boxed.is_some() || right_boxed.is_some() {
-        return match (left_boxed, right_boxed) {
-            (Some((left_class, left_payload)), Some((right_class, right_payload)))
-                if left_class == right_class =>
-            {
-                js_util_deep_strict_equal_bool(
-                    left_payload,
-                    right_payload,
-                    depth + 1,
-                    skip_prototype,
-                )
-            }
-            _ => false,
-        };
-    }
-    if let Some(equal) =
-        collection_equality::deep_strict_collection_equal(left, right, depth, skip_prototype)
-    {
-        return equal;
-    }
-    if let Some(equal) = typed_array_equality::deep_strict_typed_array_equal(left, right) {
-        return equal;
-    }
-    if identity_equality::is_identity_only_deep_equal_value(left)
-        || identity_equality::is_identity_only_deep_equal_value(right)
-    {
-        return left.to_bits() == right.to_bits();
-    }
-    let has_tagged_heap_operand = left_value.is_pointer() || right_value.is_pointer();
-    let has_raw_heap_operand =
-        looks_like_raw_heap_pointer(left) || looks_like_raw_heap_pointer(right);
-    if has_raw_heap_operand {
-        false
-    } else if has_tagged_heap_operand {
-        // #2934: Node's default deepStrictEqual is prototype-sensitive — two
-        // objects with the same own properties but different `[[Prototype]]`
-        // are not equal. Gate before comparing the formatted body.
-        if !skip_prototype && prototype_equality::prototypes_differ(left, right) {
-            return false;
-        }
-        formatted_deep_equal(left, right, skip_prototype)
-    } else {
-        // A class REFERENCE is compared by identity, never by its rendering.
-        // Since #9415 a class ref renders as `[class Name]`, so two DISTINCT
-        // classes that happen to share a name format identically — the
-        // formatted comparison would call them deep-equal, where node (and the
-        // pre-#9415 class-id rendering, by accident) says they are not. The
-        // probe runs only after `js_jsvalue_equals` has already answered "not
-        // equal", so an ordinary integer that collides with a live class id is
-        // unaffected: equal integers were settled one line above, and unequal
-        // ones are unequal either way.
-        crate::value::js_jsvalue_equals(left, right) != 0
-            || (crate::object::class_ref_id(left).is_none()
-                && crate::object::class_ref_id(right).is_none()
-                && formatted_deep_equal(left, right, skip_prototype))
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn js_util_is_deep_strict_equal(left: f64, right: f64) -> f64 {
-    let equal = js_util_deep_strict_equal_bool(left, right, 0, false);
-    f64::from_bits(crate::value::JSValue::bool(equal).bits())
-}
-
-pub fn js_util_is_deep_strict_equal_skip_prototype(left: f64, right: f64) -> f64 {
-    let equal = js_util_deep_strict_equal_bool(left, right, 0, true);
-    f64::from_bits(crate::value::JSValue::bool(equal).bits())
-}
+mod deep_equal;
+pub use deep_equal::*;
 
 /// Print an array in the format [element1, element2, ...]
 #[no_mangle]
@@ -1943,4 +1927,48 @@ pub extern "C" fn js_array_print(arr_ptr: *const crate::array::ArrayHeader) {
         }
         println!("[{}]", parts.join(", "));
     }
+}
+
+/// `PERRY_GC_CENSUS`: entries and estimated bytes of the function-name and
+/// function-source registries (map storage + one `Arc<[u8]>` per entry).
+pub(crate) fn function_registries_census() -> Vec<crate::gc::census::SideTableRow> {
+    use crate::gc::census::hash_table_bytes;
+    let mut rows = Vec::new();
+    if let Ok(map) = function_name_registry().lock() {
+        // #9612: `Image` names cost nothing beyond the map slot (they point
+        // into the binary); only the runtime-inferred `Owned` ones are heap.
+        // #9612: image names cost nothing beyond the map slot (they point
+        // into the binary); only the runtime-inferred overrides are heap.
+        rows.push((
+            "fn.name_registry",
+            map.len(),
+            hash_table_bytes(
+                map.capacity(),
+                std::mem::size_of::<(usize, &'static [u8])>(),
+            ),
+        ));
+    }
+    if let Ok(map) = function_name_overrides().lock() {
+        let payload: usize = map.values().map(|b| b.len() + 16).sum();
+        rows.push((
+            "fn.name_overrides(runtime-inferred)",
+            map.len(),
+            hash_table_bytes(
+                map.capacity(),
+                std::mem::size_of::<(usize, std::sync::Arc<[u8]>)>(),
+            ) + payload,
+        ));
+    }
+    if let Ok(map) = function_source_registry().lock() {
+        // #9612: source bytes are borrowed from the image; only the map is heap.
+        rows.push((
+            "fn.source_registry(toString)",
+            map.len(),
+            hash_table_bytes(
+                map.capacity(),
+                std::mem::size_of::<(usize, RegisteredFunctionSource)>(),
+            ),
+        ));
+    }
+    rows
 }

@@ -77,8 +77,17 @@ pub(super) fn try_module_static_methods(
                         method_ident.sym.as_ref(),
                         "stringWidth"
                             | "hash"
+                            | "deepEquals"
+                            | "stripANSI"
+                            | "wrapAnsi"
+                            | "which"
+                            | "zstdDecompress"
+                            | "zstdDecompressSync"
+                            | "gc"
+                            | "generateHeapSnapshot"
                             | "file"
                             | "write"
+                            | "serve"
                             | "pathToFileURL"
                             | "fileURLToPath"
                     ) {

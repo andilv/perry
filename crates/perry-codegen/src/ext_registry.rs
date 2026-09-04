@@ -105,6 +105,14 @@ pub enum OwnerKind {
 /// grows past a few dozen entries.
 #[rustfmt::skip]
 const FFI_REGISTRY: &[(&str, OwnerKind)] = &[
+    // ── #9604: Bun.SQL ───────────────────────────────────────────────
+    // The rest of the `"bun"` module stays runtime-only. Pull SQLite into
+    // perry-stdlib only when codegen actually emits the SQL constructor.
+    ("js_bun_sql_new",                           OwnerKind::Stdlib { feature: Some("database-sqlite") }),
+
+    // The Bun dispatch bucket can reach listen/connect through extracted
+    // callable exports, so installing it also activates the net provider.
+    ("js_bun_tcp_nm_install",                       OwnerKind::WellKnown("net")),
     // ── #835: Web Streams ────────────────────────────────────────────
     // `perry-stdlib::streams` owns the canonical implementations.
     // `perry-ext-streams` re-implements a subset, but `js_stream_unwrap_handle`
@@ -395,6 +403,8 @@ const FFI_REGISTRY: &[(&str, OwnerKind)] = &[
     ("js_net_create_server",                        OwnerKind::WellKnown("net")),
     ("js_ext_net_create_server",                    OwnerKind::WellKnown("net")),
     ("js_ext_net_socket_connect",                   OwnerKind::WellKnown("net")),
+    ("js_bun_tcp_listen",                           OwnerKind::WellKnown("net")),
+    ("js_bun_tcp_connect",                          OwnerKind::WellKnown("net")),
     ("js_net_server_listen",                        OwnerKind::WellKnown("net")),
     ("js_net_server_close",                         OwnerKind::WellKnown("net")),
     ("js_net_server_address",                       OwnerKind::WellKnown("net")),
@@ -644,6 +654,9 @@ const EXT_PREFIX_REGISTRY: &[(&str, &str)] = &[
     ("js_node_forge_", "node-forge"),
     // Native runtime TypeScript transpilation subset (#8511).
     ("js_typescript_", "typescript"),
+    // Bun runtime transpilation/build subset shares the pinned SWC wrapper.
+    ("js_bun_transpiler_", "typescript"),
+    ("js_bun_build", "typescript"),
     ("js_qs_",         "qs"),
 ];
 
@@ -712,6 +725,26 @@ thread_local! {
 /// ~30 ns per emission, fully amortized by the surrounding format!
 /// strings.
 pub(crate) fn record_ffi_call(symbol: &str) {
+    // #9603: `js_bun_serve` is implemented by perry-ext-http but crosses a
+    // narrow JSON bridge into perry-stdlib's Fetch registries to construct
+    // Request values and consume Response values. It therefore has two
+    // providers, unlike the ordinary one-symbol/one-owner registry rows.
+    if symbol == "js_bun_serve" {
+        if provider_recording_permitted() {
+            let mut guard = USED_PROVIDERS.lock().expect("USED_PROVIDERS poisoned");
+            let providers = guard.get_or_insert_with(HashSet::new);
+            providers.insert(OwnerKind::WellKnown("http"));
+            providers.insert(OwnerKind::Stdlib {
+                feature: Some("web-fetch"),
+            });
+        }
+        MODULE_CAPTURE.with(|cell| {
+            if let Some(set) = cell.borrow_mut().as_mut() {
+                set.insert("js_bun_serve");
+            }
+        });
+        return;
+    }
     for (name, owner) in FFI_REGISTRY {
         if *name == symbol {
             if provider_recording_permitted() {
@@ -960,6 +993,9 @@ mod tests {
         // Stdlib { feature: Some("http-client") } so the auto-optimize
         // stdlib rebuild compiles the `fetch_blob` module in.
         record_ffi_call("js_url_revoke_object_url");
+        // Repro #9604: one stdlib-backed export must not make every `bun`
+        // import pull in SQLite; the emitted constructor is the feature gate.
+        record_ffi_call("js_bun_sql_new");
         // Non-registered FFI: must NOT cause an insert.
         record_ffi_call("js_definitely_not_a_real_ffi_symbol_zzz");
 
@@ -976,6 +1012,13 @@ mod tests {
                 feature: Some("http-client")
             }),
             "expected Stdlib(http-client) in providers (Blob/URL object-URL), got {:?}",
+            got
+        );
+        assert!(
+            got.contains(&OwnerKind::Stdlib {
+                feature: Some("database-sqlite")
+            }),
+            "expected Stdlib(database-sqlite) for Bun.SQL, got {:?}",
             got
         );
         assert!(
@@ -1007,6 +1050,18 @@ mod tests {
             "js_node_http_create_server_with_options",
             OwnerKind::WellKnown("http"),
         );
+    }
+
+    #[test]
+    fn bun_serve_routes_to_http_and_fetch_providers() {
+        let _guard = ProviderTestGuard::new();
+        let _ = take_used_providers();
+        record_ffi_call("js_bun_serve");
+        let got = take_used_providers();
+        assert!(got.contains(&OwnerKind::WellKnown("http")));
+        assert!(got.contains(&OwnerKind::Stdlib {
+            feature: Some("web-fetch")
+        }));
     }
 
     /// #3954 regression: HTTP-suite native-table rows can emit newer

@@ -2,6 +2,17 @@
 #[cfg(test)]
 fn native_callable_export_arity_reference(module: &str, prop: &str) -> Option<u32> {
     match (module, prop) {
+        // Bun global/module surface (#9599).
+        (
+            "bun",
+            "Glob" | "Terminal" | "Transpiler" | "build" | "connect" | "file" | "fileURLToPath"
+            | "gc" | "hash" | "listen" | "pathToFileURL" | "serve" | "stringWidth" | "stripANSI"
+            | "which" | "zstdDecompress" | "zstdDecompressSync",
+        ) => Some(1),
+        ("bun", "deepEquals" | "generateHeapSnapshot" | "spawn" | "write") => Some(2),
+        ("bun", "wrapAnsi") => Some(3),
+        ("bun.ant", "getPeerPid" | "getPeerUid") => Some(1),
+        ("bun.ant", "memoryPressureLevel") => Some(0),
         // bun:ffi (#6562).
         ("bun:ffi", "dlopen") => Some(2),
         ("bun:ffi", "ptr" | "CString" | "CFunction" | "linkSymbols") => Some(1),
@@ -276,6 +287,41 @@ static CALLABLE_EXPORT_ARITY_TABLE: &[(&str, &[(&str, u32)])] = &[
             ("executionAsyncId", 0),
             ("executionAsyncResource", 0),
             ("triggerAsyncId", 0),
+        ],
+    ),
+    (
+        "bun",
+        &[
+            ("Glob", 1),
+            ("Terminal", 1),
+            ("Transpiler", 1),
+            ("build", 1),
+            ("connect", 1),
+            ("deepEquals", 2),
+            ("file", 1),
+            ("fileURLToPath", 1),
+            ("gc", 1),
+            ("generateHeapSnapshot", 2),
+            ("hash", 1),
+            ("listen", 1),
+            ("pathToFileURL", 1),
+            ("serve", 1),
+            ("spawn", 2),
+            ("stringWidth", 1),
+            ("stripANSI", 1),
+            ("which", 1),
+            ("wrapAnsi", 3),
+            ("write", 2),
+            ("zstdDecompress", 1),
+            ("zstdDecompressSync", 1),
+        ],
+    ),
+    (
+        "bun.ant",
+        &[
+            ("getPeerPid", 1),
+            ("getPeerUid", 1),
+            ("memoryPressureLevel", 0),
         ],
     ),
     (

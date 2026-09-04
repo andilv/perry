@@ -13,6 +13,16 @@ use std::path::PathBuf;
 use perry_hir::{Module as HirModule, ModuleKind};
 use serde::{Deserialize, Serialize};
 
+/// JavaScript host compatibility surface exposed to compiled code.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum JavaScriptPlatform {
+    /// Preserve Perry's Node-compatible globals (the historical default).
+    #[default]
+    Node,
+    /// Install a real `globalThis.Bun` namespace backed by Perry's Bun shims.
+    Bun,
+}
+
 /// Result of a successful compilation
 pub struct CompileResult {
     pub output_path: PathBuf,
@@ -112,6 +122,11 @@ pub struct CompileArgs {
     #[arg(long)]
     pub target: Option<String>,
 
+    /// JavaScript host compatibility platform. `node` keeps the historical
+    /// global surface; `bun` installs a stable `globalThis.Bun` namespace.
+    #[arg(long, value_enum, default_value_t)]
+    pub platform: JavaScriptPlatform,
+
     /// C library / linkage for Linux targets: `glibc` (default, dynamic) or
     /// `musl` (fully static). `--libc musl` upgrades a Linux target
     /// (`linux` / `linux-aarch64`, or the native-host default) to its musl
@@ -162,6 +177,13 @@ pub struct CompileArgs {
     /// `perry.embed` (package.json) / `[compile] embed` (perry.toml). Repeatable.
     #[arg(long)]
     pub embed: Vec<String>,
+
+    /// Map Bun standalone-executable virtual paths below `/$bunfs/root/` to
+    /// an extracted filesystem tree. Static module edges resolve through the
+    /// mapping, while referenced files are embedded under their original Bun
+    /// paths so `node:fs` and `Bun.file()` keep working after relocation.
+    #[arg(long, value_name = "DIR")]
+    pub bunfs_root: Option<PathBuf>,
 
     /// Generate a deterministic TypeScript module that maps asset-relative
     /// names to Bun-compatible `{ type: "file" }` imports. The value is
@@ -607,6 +629,9 @@ pub struct CompilationContext {
     /// `WebAssembly.*` usage OR the user passed `--enable-wasm-runtime`).
     /// Issue #76.
     pub needs_wasm_runtime: bool,
+    /// Whether this build exposes Perry's Bun compatibility namespace as the
+    /// real `Bun` / `globalThis.Bun` global. Off by default.
+    pub bun_platform: bool,
     /// Whether perry/ui module is imported (needs UI library linking).
     /// On the harmonyos target this is forced back to false after the
     /// destructive Phase-2 ArkUI harvest (see `harmonyos_index_ets`) — UI
@@ -648,6 +673,12 @@ pub struct CompilationContext {
     /// Approved `.node` entries reached by the compile graph, keyed by their
     /// relocatable package-relative logical id.
     pub native_addons: BTreeMap<String, NativeAddonModule>,
+    /// Exact project-relative `.node` paths authorized by the host manifest,
+    /// keyed by canonical source path. The value is the portable declared path
+    /// used to derive the sidecar logical id; unlike `native_addon_packages`,
+    /// these entries never confer trust on an npm package or a containing
+    /// directory.
+    pub native_addon_paths: BTreeMap<PathBuf, String>,
     /// Package aliases: maps npm package name → replacement package name (from perry.packageAliases)
     pub package_aliases: HashMap<String, String>,
     /// Packages to compile natively instead of routing to V8 (from perry.compilePackages)
@@ -672,6 +703,9 @@ pub struct CompilationContext {
     #[allow(dead_code)]
     // #5731 embed-assets context contract; pub field populated on the embed path, not read here
     pub embedded_assets: Vec<(String, PathBuf)>,
+    /// Canonical extracted root mounted at Bun's `/$bunfs/root/` virtual path.
+    /// Set only by the compile CLI's `--bunfs-root` option.
+    pub bunfs_root: Option<PathBuf>,
     /// Canonical paths whose import attributes explicitly requested Bun's
     /// `{ type: "file" }` loader. Kept separate from `embedded_assets` because
     /// automatic wasm imports also register bytes there but must still lower
@@ -1163,6 +1197,7 @@ impl CompilationContext {
             declaration_sidecars: BTreeMap::new(),
             import_map: BTreeMap::new(),
             needs_wasm_runtime: false,
+            bun_platform: false,
             needs_ui: false,
             harmonyos_index_ets: None,
             needs_plugins: false,
@@ -1173,11 +1208,13 @@ impl CompilationContext {
             native_libraries: Vec::new(),
             native_addon_packages: BTreeSet::new(),
             native_addons: BTreeMap::new(),
+            native_addon_paths: BTreeMap::new(),
             package_aliases: HashMap::new(),
             compile_packages: HashSet::new(),
             auto_skipped_node_addon_packages: HashSet::new(),
             aot_discovered_modules: HashSet::new(),
             embedded_assets: Vec::new(),
+            bunfs_root: None,
             file_loader_asset_paths: HashSet::new(),
             file_loader_asset_names: HashMap::new(),
             generated_asset_modules: BTreeMap::new(),
@@ -1278,6 +1315,10 @@ pub struct NativeAddonModule {
     pub source_path: PathBuf,
     pub package_dir: PathBuf,
     pub entry_relative: PathBuf,
+    /// Package entries ship their complete package-local payload so adjacent
+    /// data/shared libraries remain available. Exact project-path entries ship
+    /// only the explicitly authorized `.node` file.
+    pub ship_package_payload: bool,
 }
 
 /// External native library manifest parsed from package.json `perry.nativeLibrary` field

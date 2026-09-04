@@ -69,6 +69,7 @@ mod class_gc_roots;
 mod class_handles;
 pub mod class_image;
 mod class_registry;
+pub(crate) use class_registry::class_registry_census;
 pub(crate) use class_registry::scan_current_new_target_root_mut;
 mod collection_proto_thunks;
 mod data_view_registry;
@@ -194,6 +195,7 @@ pub(crate) use class_gc_roots::{
 pub use class_registry::*;
 pub(crate) use collection_proto_thunks::{is_builtin_map_set_value, is_builtin_set_add_value};
 pub(crate) use data_view_registry::{extends_builtin_data_view, extends_builtin_typed_array};
+pub(crate) use date_proto_thunks::date_to_json_value;
 pub use delete_rest::*;
 pub use descriptors::*;
 pub use exotic_expando::scan_exotic_expando_roots_mut;
@@ -1942,4 +1944,46 @@ pub(crate) unsafe fn cell_expando_get(user_ptr: usize) -> Option<*mut ObjectHead
         crate::value::JSValue::from_bits((*meta).expando).as_pointer::<ObjectHeader>()
             as *mut ObjectHeader,
     )
+}
+
+/// `PERRY_GC_CENSUS`: per-thread object tables (`RuntimeState`): the fixed
+/// caches, the overflow-field vectors and the descriptor tables.
+pub(crate) fn object_tables_census() -> Vec<crate::gc::census::SideTableRow> {
+    use crate::gc::census::{map_bytes, vec_bytes};
+    let st = crate::state::state();
+    let mut rows: Vec<crate::gc::census::SideTableRow> = Vec::new();
+    {
+        let m = st.object_hot.overflow_fields.borrow();
+        let inner: usize = m.values().map(vec_bytes).sum();
+        rows.push(("object.overflow_fields", m.len(), map_bytes(&m) + inner));
+    }
+    rows.push((
+        "object.transition_cache(fixed)",
+        TRANSITION_CACHE_SIZE,
+        TRANSITION_CACHE_SIZE * std::mem::size_of::<TransitionEntry>(),
+    ));
+    rows.push((
+        "object.shape_inline_cache(fixed)",
+        SHAPE_INLINE_CACHE_SIZE,
+        SHAPE_INLINE_CACHE_SIZE * std::mem::size_of::<ShapeCacheEntry>(),
+    ));
+    {
+        let m = st.descriptors.property_descriptors.borrow();
+        let inner: usize = m.keys().map(|(_, k)| k.capacity()).sum();
+        rows.push((
+            "object.property_descriptors",
+            m.len(),
+            map_bytes(&m) + inner,
+        ));
+    }
+    {
+        let m = st.descriptors.accessor_descriptors.borrow();
+        let inner: usize = m.keys().map(|(_, k)| k.capacity()).sum();
+        rows.push((
+            "object.accessor_descriptors",
+            m.len(),
+            map_bytes(&m) + inner,
+        ));
+    }
+    rows
 }

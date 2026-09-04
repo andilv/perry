@@ -7,9 +7,12 @@
 //! handle family.
 
 use perry_ffi::{
-    ArrayHeader, JsClosure, JsPromise, JsValue, Promise, RawClosureHeader, StringHeader,
+    build_object_shape, js_object_alloc_with_shape, js_object_set_field, ArrayHeader, JsClosure,
+    JsPromise, JsValue, ObjectHeader, Promise, RawClosureHeader, StringHeader,
 };
 use std::sync::Once;
+
+use crate::statics;
 
 const TAG_UNDEFINED: u64 = 0x7FFC_0000_0000_0001;
 const TAG_NULL: u64 = 0x7FFC_0000_0000_0002;
@@ -35,6 +38,9 @@ extern "C" {
     fn js_register_handle_property_set_dispatch_extension(
         f: unsafe extern "C" fn(i64, *const u8, usize, f64) -> i32,
     );
+    fn js_set_native_bun_tcp_dispatch(
+        f: unsafe extern "C" fn(*const u8, usize, *const f64, usize) -> f64,
+    );
 }
 
 extern "C" fn process_pending_aux() -> i32 {
@@ -54,6 +60,7 @@ pub(crate) fn ensure_runtime_dispatch_registered() {
         js_register_handle_method_dispatch_extension(js_ext_net_handle_method_dispatch);
         js_register_handle_property_dispatch_extension(js_ext_net_handle_property_dispatch);
         js_register_handle_property_set_dispatch_extension(js_ext_net_handle_property_set_dispatch);
+        js_set_native_bun_tcp_dispatch(crate::bun_tcp::js_bun_tcp_native_dispatch);
     });
 }
 
@@ -71,6 +78,23 @@ fn nanbox_handle(handle: i64) -> f64 {
 
 fn nanbox_ptr<T>(ptr: *mut T) -> f64 {
     f64::from_bits(POINTER_TAG | (ptr as u64 & POINTER_MASK))
+}
+
+fn socket_private_handle(handle: i64) -> f64 {
+    let fd = statics::sockets()
+        .lock()
+        .ok()
+        .and_then(|sockets| sockets.get(&handle).and_then(|socket| socket.raw_fd))
+        .unwrap_or(-1);
+    let keys = ["fd"];
+    let (packed, shape_id) = build_object_shape(&keys);
+    let object: *mut ObjectHeader =
+        unsafe { js_object_alloc_with_shape(shape_id, 1, packed.as_ptr(), packed.len() as u32) };
+    if object.is_null() {
+        return undefined();
+    }
+    unsafe { js_object_set_field(object, 0, JsValue::from_number(fd as f64)) };
+    nanbox_ptr(object)
 }
 
 fn unbox_to_i64(v: f64) -> i64 {
@@ -475,7 +499,8 @@ pub unsafe extern "C" fn js_ext_net_handle_method_dispatch(
     } else {
         std::slice::from_raw_parts(args_ptr, args_len)
     };
-    let value = socket_method(handle, method, args)
+    let value = crate::bun_tcp::dispatch_method(handle, method, args)
+        .or_else(|| socket_method(handle, method, args))
         .or_else(|| server_method(handle, method, args))
         .or_else(|| block_list_method(handle, method, args));
     if let Some(value) = value {
@@ -496,7 +521,11 @@ pub unsafe extern "C" fn js_ext_net_handle_property_dispatch(
     out: *mut f64,
 ) -> i32 {
     let prop = property_name(property_name_ptr, property_name_len);
-    let value = if matches!(prop, "address" | "family" | "port" | "flowlabel")
+    let value = if let Some(name) = crate::bun_tcp::method_name(handle, prop) {
+        Some(bind_handle_method(handle, name))
+    } else if let Some(value) = crate::bun_tcp::property(handle, prop) {
+        Some(value)
+    } else if matches!(prop, "address" | "family" | "port" | "flowlabel")
         && crate::js_ext_net_is_socket_address_handle(handle) != 0
     {
         Some(match prop {
@@ -509,6 +538,8 @@ pub unsafe extern "C" fn js_ext_net_handle_property_dispatch(
             "port" => crate::js_net_socket_address_get_port(handle),
             _ => crate::js_net_socket_address_get_flowlabel(handle),
         })
+    } else if prop == "_handle" && crate::js_ext_net_is_socket_handle(handle) != 0 {
+        Some(socket_private_handle(handle))
     } else if prop == "parser"
         && crate::js_ext_net_is_socket_handle(handle) != 0
         && crate::statics::http_agent_phases()
@@ -581,6 +612,13 @@ pub unsafe extern "C" fn js_ext_net_handle_property_set_dispatch(
     property_name_len: usize,
     value: f64,
 ) -> i32 {
+    if crate::bun_tcp::set_property(
+        handle,
+        property_name(property_name_ptr, property_name_len),
+        value,
+    ) {
+        return 1;
+    }
     if crate::js_ext_net_is_server_handle(handle) == 0 {
         return 0;
     }

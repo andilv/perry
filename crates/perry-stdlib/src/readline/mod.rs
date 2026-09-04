@@ -32,6 +32,7 @@ use std::io::Read;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use perry_runtime::closure::{
     get_valid_func_ptr, js_closure_alloc, js_closure_call0, js_closure_call1, js_closure_call2,
@@ -122,14 +123,26 @@ static PENDING_DATA: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 /// reader queues one byte per chunk, so `\x1b[A` arrives as three chunks
 /// and `pump::coalesce_escape_sequences` parks an incomplete prefix here.
 static PENDING_ESCAPE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+/// One-shot deadline for the escape prefix above. A wake from another timer or
+/// producer must not make a held ESC look old enough to flush; only this clock
+/// can do that (#9593).
+static PENDING_ESCAPE_DEADLINE: Mutex<Option<Instant>> = Mutex::new(None);
+/// Node's default `readline.escapeCodeTimeout`.
+const ESCAPE_CODE_TIMEOUT: Duration = Duration::from_millis(500);
 /// Whether the one-shot `'readable'` EOF notification has been delivered.
 static READABLE_EOF_NOTIFIED: AtomicBool = AtomicBool::new(false);
 /// `true` when raw mode is enabled — the reader thread checks this
 /// between bytes to decide which queue to push to.
 static RAW_MODE: AtomicBool = AtomicBool::new(false);
-/// Set when stdin returns EOF or `rl.close()` is called. The has-active
-/// check reads this to decide whether to keep the event loop alive.
+/// Set only when stdin returns EOF. Closing a readline interface pauses its
+/// input stream but does not end that stream; `process.stdin.resume()` may
+/// consume more bytes afterwards.
 static EOF_REACHED: AtomicBool = AtomicBool::new(false);
+/// Whether the physical stdin EOF has been dispatched to `end` / `close`
+/// listeners. This is separate from `CLOSE_FIRED`: explicitly closing a
+/// readline interface fires the interface's `close` event without ending
+/// `process.stdin`.
+static STDIN_END_FIRED: AtomicBool = AtomicBool::new(false);
 /// Whether the background reader thread has been spawned. Atomic
 /// (compare_exchange) so we don't accidentally spawn twice if two
 /// init paths race on first call.
@@ -1105,6 +1118,9 @@ fn ensure_reader_started() {
         // chunks (`pump::coalesce_escape_sequences`), and a paste must still
         // fire one `'keypress'` per character.
         let mut raw_chunks: Vec<Vec<u8>> = Vec::new();
+        // #9588: set whenever this read(2) put something the MAIN THREAD has to
+        // dispatch into a shared queue. See the notify below.
+        let mut queued_for_main: bool;
         loop {
             let n = match reader.read(&mut buf) {
                 Ok(0) => break, // EOF
@@ -1114,6 +1130,7 @@ fn ensure_reader_started() {
             if STDIN_DESTROYED.load(Ordering::Acquire) {
                 break;
             }
+            queued_for_main = false;
             // The mode atomics are still consulted PER BYTE, exactly as
             // before: a mode flip from the main thread mid-block must land on
             // the same byte it used to. Only the syscall and the chunk
@@ -1141,6 +1158,7 @@ fn ensure_reader_started() {
                     if let Ok(mut q) = PENDING_LINES.lock() {
                         q.push(line);
                     }
+                    queued_for_main = true;
                 } else {
                     line_buf.push(b);
                 }
@@ -1150,6 +1168,7 @@ fn ensure_reader_started() {
                     q.append(&mut raw_chunks);
                 }
                 raw_chunks.clear();
+                queued_for_main = true;
             }
             // One `'data'` chunk per read(2) — Node's contract. Line splitting
             // is the CONSUMER's job (readline does its own, above); imposing
@@ -1163,6 +1182,29 @@ fn ensure_reader_started() {
                     q.push(std::mem::take(&mut line_buf));
                 }
                 line_buf = Vec::with_capacity(65536);
+                queued_for_main = true;
+            }
+            // #9588 — WAKE THE PUMP. This reader is a cross-thread producer for
+            // queues only the main thread drains (`js_readline_process_pending`,
+            // reached from `js_run_stdlib_pump`), and it used to push and loop
+            // straight back into `read(2)` without telling anyone. The main loop
+            // therefore learned about a keystroke only when it happened to wake
+            // for some *other* reason, so input latency was the whole
+            // `js_wait_for_event` budget: the next timer deadline, or — for a TUI
+            // sitting idle with no timer armed — the full `IDLE_CAP_MS` (1 s)
+            // safety cap. Measured on the claude-code bundle before this line:
+            // 695-963 ms from keypress to the `'data'` handler, against Node's
+            // sub-millisecond. That is the protocol the event pump documents
+            // ("producer: push_to_queue(); js_notify_main_thread()") and the one
+            // perry-runtime's own stdin reader in `os_process_streams` already
+            // follows; readline's reader was the one producer that skipped it.
+            //
+            // Once per read(2), not per byte: a paste arrives as one syscall and
+            // needs exactly one wake, and the flag keeps a read that queued
+            // nothing (a raw-mode byte absorbed with no listener, a partial line
+            // still accumulating) from waking the loop for no work.
+            if queued_for_main {
+                perry_runtime::event_pump::js_notify_main_thread();
             }
         }
         // Flush any trailing bytes not terminated by a newline. In cooked
@@ -1187,6 +1229,10 @@ fn ensure_reader_started() {
             }
         }
         EOF_REACHED.store(true, Ordering::Release);
+        // #9588: EOF is main-thread-visible work too — the `'end'`/`'close'`
+        // dispatch and the liveness flip that lets the loop exit. Without a wake
+        // here a piped program's exit was delayed by up to `IDLE_CAP_MS`.
+        perry_runtime::event_pump::js_notify_main_thread();
     });
 }
 
@@ -1377,6 +1423,12 @@ pub extern "C" fn js_readline_create_interface(opts: f64) -> i64 {
     try_register_pump();
     let handle = create_interface_from_options(opts);
     if !with_interface(handle, |state| state.uses_custom_stream).unwrap_or(false) {
+        // Node's Interface constructor calls input.resume(). This matters for
+        // a second interface created after the first one was closed, since
+        // close() pauses the shared stdin stream.
+        if !STDIN_DESTROYED.load(Ordering::Acquire) && !EOF_REACHED.load(Ordering::Acquire) {
+            STDIN_PAUSED.store(false, Ordering::Release);
+        }
         ensure_reader_started();
     }
     handle
@@ -1492,8 +1544,8 @@ pub extern "C" fn js_readline_on(
     undefined()
 }
 
-/// rl.close() — synchronously fire the close callback (matching Node's
-/// `Interface.close()` semantics) and mark the interface as EOF.
+/// rl.close() — synchronously pause the input and fire the close callback,
+/// matching Node's `Interface.close()` semantics.
 #[no_mangle]
 pub extern "C" fn js_readline_close(_handle: i64) -> f64 {
     match with_interface(_handle, |state| state.uses_custom_stream) {
@@ -1507,7 +1559,10 @@ pub extern "C" fn js_readline_close(_handle: i64) -> f64 {
         None if _handle != STDIN_READLINE_HANDLE => return undefined(),
         _ => {}
     }
-    EOF_REACHED.store(true, Ordering::Release);
+    // Node implements Interface.close() by calling Interface.pause(), which
+    // in turn pauses the input stream. Do not mark stdin as EOF: user code can
+    // explicitly resume the shared stream after the interface is gone.
+    STDIN_PAUSED.store(true, Ordering::Release);
     // Node stops emitting 'line' after close(). Without clearing these, the
     // pump would still deliver a queued late line to the 'line' handler and
     // `has_line_callbacks` would keep the event loop alive.
@@ -1811,12 +1866,16 @@ pub extern "C" fn js_readline_stdin_destroy() -> f64 {
     RAW_MODE.store(false, Ordering::Release);
     STDIN_DATA_FLOWING.store(false, Ordering::Release);
     EOF_REACHED.store(true, Ordering::Release);
+    STDIN_END_FIRED.store(true, Ordering::Release);
     let _ = termios_impl::disable();
     if let Ok(mut q) = PENDING_DATA.lock() {
         q.clear();
     }
     if let Ok(mut p) = PENDING_ESCAPE.lock() {
         p.clear();
+    }
+    if let Ok(mut deadline) = PENDING_ESCAPE_DEADLINE.lock() {
+        *deadline = None;
     }
     if let Ok(mut q) = PENDING_LINES.lock() {
         q.clear();
@@ -1845,6 +1904,7 @@ pub extern "C" fn js_readline_stdin_destroy() -> f64 {
 // ---------------------------------------------------------------------------
 
 mod pump;
+pub(crate) use pump::js_readline_next_wake_ms;
 pub use pump::{js_readline_has_active, js_readline_process_pending};
 
 // ---------------------------------------------------------------------------

@@ -310,6 +310,27 @@ pub(super) struct RememberedSetRootMarkState {
 
 impl RememberedSetRootMarkState {
     pub(super) fn new() -> Self {
+        Self::new_with_marking(true)
+    }
+
+    /// #9629: a FULL trace visits the old generation from the real root set,
+    /// so every young object a LIVE old object points at is reached anyway.
+    /// Marking from the remembered set on top of that adds exactly one thing:
+    /// the young objects reachable only from old objects that are themselves
+    /// DEAD. `DirtyHeaderSlotScan::new` validates that the dirty page's header
+    /// is a plausible pointer (`valid_ptrs`), never that it is live, so a dead
+    /// old owner's slots are marked as roots like any other.
+    ///
+    /// `mark = false` therefore skips the marking for full traces while still
+    /// taking the snapshot, which is NOT optional: `remembered_dirty_snapshot`
+    /// is what lazily arms the write barrier and reconstructs the log from the
+    /// heap (`barrier_arming::arm_and_reconstruct_remembered_set_if_unarmed`).
+    /// Skipping the snapshot as well would leave a thread's old-to-young
+    /// stores unlogged, which fails in the opposite and far worse direction.
+    ///
+    /// A minor keeps marking: it deliberately does not trace the old
+    /// generation, so there old-to-young edges genuinely are roots.
+    pub(super) fn new_with_marking(mark: bool) -> Self {
         let snapshot = remembered_dirty_snapshot();
         let stats = RememberedSetTraceStats {
             entries_scanned: snapshot.dirty_old_pages.len()
@@ -322,7 +343,7 @@ impl RememberedSetRootMarkState {
         let old_page_cursor = (!snapshot.dirty_old_pages.is_empty())
             .then(|| crate::arena::OldArenaPageObjectCursor::new(&snapshot.dirty_old_pages));
 
-        Self {
+        let mut state = Self {
             snapshot,
             stats,
             old_page_cursor,
@@ -331,7 +352,17 @@ impl RememberedSetRootMarkState {
             seen_headers: crate::fast_hash::new_ptr_hash_set(),
             current_header: None,
             finalized: false,
+        };
+        if !mark {
+            // Snapshot taken (barrier armed, log reconstructed); mark nothing.
+            // The reported set size stays truthful — only `newly_marked` is 0.
+            state.old_page_cursor = None;
+            state.external_cursor = state.snapshot.external_dirty_entries.len();
+            state.fallback_cursor = state.snapshot.fallback_headers.len();
+            state.stats.dirty_pages_after = remembered_dirty_page_count();
+            state.finalized = true;
         }
+        state
     }
 
     pub(super) fn step(&mut self, valid_ptrs: &ValidPointerSet, budget: usize) -> bool {
@@ -1845,116 +1876,8 @@ static KEEP_WRITE_BARRIER_ROOT_HEAP_WORD: extern "C" fn(u64) = js_write_barrier_
 #[used]
 static KEEP_WRITE_BARRIER_ROOT_NANBOX: extern "C" fn(u64) = js_write_barrier_root_nanbox;
 
-#[inline]
-pub(crate) fn runtime_store_gc_heap_word_slot(
-    parent_user: usize,
-    slot_addr: usize,
-    value_bits: u64,
-) {
-    unsafe {
-        std::ptr::write(slot_addr as *mut u64, value_bits);
-    }
-    runtime_write_barrier_gc_slot(parent_user, slot_addr, value_bits);
-}
-
-#[inline]
-pub(crate) fn runtime_store_gc_jsvalue_slot(parent_user: usize, slot_addr: usize, value_bits: u64) {
-    runtime_store_gc_heap_word_slot(parent_user, slot_addr, value_bits);
-}
-
-#[inline]
-pub(crate) fn runtime_store_external_heap_word_slot(
-    parent_user: usize,
-    slot_addr: usize,
-    value_bits: u64,
-) {
-    unsafe {
-        std::ptr::write(slot_addr as *mut u64, value_bits);
-    }
-    runtime_write_barrier_external_slot(parent_user, slot_addr, value_bits);
-}
-
-#[inline]
-pub(crate) fn runtime_store_external_jsvalue_slot(
-    parent_user: usize,
-    slot_addr: usize,
-    value_bits: u64,
-) {
-    runtime_store_external_heap_word_slot(parent_user, slot_addr, value_bits);
-}
-
-// #854: GC write-barrier external-slot store-with-layout path
-#[allow(dead_code)]
-#[inline]
-pub(crate) fn runtime_store_external_jsvalue_slot_with_layout(
-    parent_user: usize,
-    slot_addr: usize,
-    slot_index: usize,
-    value_bits: u64,
-) {
-    unsafe {
-        std::ptr::write(slot_addr as *mut u64, value_bits);
-    }
-    layout_note_slot(parent_user, slot_index, value_bits);
-    runtime_write_barrier_external_slot(parent_user, slot_addr, value_bits);
-}
-
-pub(crate) fn runtime_write_barrier_external_slot_span(
-    parent_addr: usize,
-    first_slot_addr: usize,
-    slot_count: usize,
-) {
-    if !write_barriers_enabled() {
-        return;
-    }
-    dirty_external_slot_span(parent_addr, first_slot_addr, slot_count);
-}
-
-pub(super) fn dirty_external_slot_span(
-    parent_addr: usize,
-    first_slot_addr: usize,
-    slot_count: usize,
-) {
-    if parent_addr < GC_HEADER_SIZE || first_slot_addr == 0 || slot_count == 0 {
-        return;
-    }
-    if !barrier_parent_needs_remembering(parent_addr, true) {
-        return;
-    }
-    let Some(bytes) = slot_count.checked_mul(std::mem::size_of::<u64>()) else {
-        return;
-    };
-    let Some(last_byte) = first_slot_addr.checked_add(bytes.saturating_sub(1)) else {
-        return;
-    };
-    bump_write_barrier_trace_counter(BarrierTraceCounter::ConservativeParentSpanMarks);
-    let header_addr = parent_addr - GC_HEADER_SIZE;
-    let first_page = crate::arena::generation_page_for_addr(first_slot_addr);
-    let last_page = crate::arena::generation_page_for_addr(last_byte);
-    for page in first_page..=last_page {
-        mark_dirty_external_slot_page(header_addr, page);
-    }
-}
-
-pub(super) fn remembered_dirty_page_count() -> usize {
-    DIRTY_OLD_PAGES.with(|old| {
-        let old = old.borrow();
-        EXTERNAL_DIRTY_SLOT_PAGES.with(|external| {
-            let external = external.borrow();
-            if external.is_empty() {
-                return old.len();
-            }
-            let mut pages = crate::fast_hash::new_ptr_hash_set();
-            for &page in old.iter() {
-                pages.insert(page);
-            }
-            for &page in external.keys() {
-                pages.insert(page);
-            }
-            pages.len()
-        })
-    })
-}
+mod runtime_stores;
+pub(crate) use runtime_stores::*;
 
 mod leaf;
 /// Gen-GC Phase C: read the current remembered set size — used
@@ -1969,3 +1892,5 @@ pub(super) use leaf::{decode_raw_pointer_candidate, inline_slot_store_on_cached_
 
 pub(super) use super::barrier_store::{barrier_child_prologue, barrier_remembering_active};
 pub use maintenance::*;
+
+pub(crate) mod census_rows;

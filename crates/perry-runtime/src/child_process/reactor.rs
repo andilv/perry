@@ -227,6 +227,11 @@ static CP_NEXT_LIVE_ID: AtomicU64 = AtomicU64::new(1);
 /// any lock, so the hot async loop pays a single relaxed load per tick.
 static CP_LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Live children which currently keep the event loop alive. `unref()` only
+/// changes this count; the total live count above continues to gate pumping
+/// and GC scanning while the runtime is alive for another reason.
+static CP_REFED_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// An event produced by a child's background thread, consumed by the pump.
 enum CpEvent {
     /// A stdout (`stderr == false`) or stderr chunk.
@@ -293,8 +298,12 @@ struct LiveChild {
     spawned: bool,
     /// `Some((code, signal))` once the waiter reported termination.
     exited: Option<(Option<i32>, Option<i32>)>,
-    /// Whether `exit`/`close` have been emitted (terminal state).
+    /// Whether `exit` has been emitted. `close` follows on the next pump.
+    exit_emitted: bool,
+    /// Whether `close` has been emitted (terminal state).
     closed: bool,
+    /// Whether this process currently contributes an active event-loop handle.
+    refed: bool,
     /// #1933: the parent end of the IPC socket for a `fork()`ed child (a clone
     /// for `child.send()` / `child.disconnect()`; the reader thread owns
     /// another clone). `None` for plain `spawn`.
@@ -456,25 +465,6 @@ fn cp_spawn_reader<R: Read + Send + 'static>(handle: u64, mut pipe: R, fd: usize
                 }
             }
         }
-    });
-}
-
-/// Spawn the waiter thread that reaps `child` and reports its exit status.
-fn cp_spawn_waiter(handle: u64, waiter: CpWaiter) {
-    std::thread::spawn(move || {
-        let (code, signal) = waiter();
-        cp_push_event(CpEvent::Exited {
-            handle,
-            code,
-            signal,
-        });
-    });
-}
-
-fn cp_spawn_timeout(handle: u64, timeout: Duration, signal: i32) {
-    std::thread::spawn(move || {
-        std::thread::sleep(timeout);
-        cp_push_event(CpEvent::Timeout { handle, signal });
     });
 }
 
@@ -738,7 +728,9 @@ fn cp_register_live_child_parts(
                 extra_open: extra_pipes.iter().map(|(fd, _, _)| *fd).collect(),
                 spawned: false,
                 exited: None,
+                exit_emitted: false,
                 closed: false,
+                refed: true,
                 ipc_send,
                 ipc_advanced,
                 abort_signal_bits: 0,
@@ -754,6 +746,7 @@ fn cp_register_live_child_parts(
     }
     crate::stdlib_pump::register_runtime_pump(0, cp_reactor_pump_extern);
     CP_LIVE_COUNT.fetch_add(1, Ordering::SeqCst);
+    CP_REFED_COUNT.fetch_add(1, Ordering::SeqCst);
 
     if let Some(o) = stdout_pipe {
         cp_spawn_reader(handle, o, 1);
@@ -764,10 +757,11 @@ fn cp_register_live_child_parts(
     for (fd, _, pipe) in extra_pipes {
         cp_spawn_reader(handle, pipe, fd);
     }
-    cp_spawn_waiter(handle, waiter);
-    if let Some(timeout) = timeout {
-        cp_spawn_timeout(handle, timeout, kill_signal);
-    }
+    cp_spawn_waiter(
+        handle,
+        waiter,
+        timeout.map(|timeout| (timeout, kill_signal)),
+    );
     #[cfg(any(unix, windows))]
     {
         if let Some(sock) = ipc {
@@ -1083,8 +1077,8 @@ pub extern "C" fn js_child_process_spawn_streams(
         ),
         ("emit", cp_cast2(cp_method_emit)),
         ("kill", cp_cast1(cp_method_kill)),
-        ("ref", cp_cast0(cp_method_this0)),
-        ("unref", cp_cast0(cp_method_this0)),
+        ("ref", cp_cast0(cp_method_ref)),
+        ("unref", cp_cast0(cp_method_unref)),
     ];
     let cp_obj = cp_build_object(&cp_methods, CP_SHAPE_ID + cp_methods.len() as u32);
     let cp = cp_box_ptr(cp_obj as *const u8);
@@ -1273,8 +1267,8 @@ pub(super) fn cp_exec_async(
         ),
         ("emit", cp_cast2(cp_method_emit)),
         ("kill", cp_cast1(cp_method_kill)),
-        ("ref", cp_cast0(cp_method_this0)),
-        ("unref", cp_cast0(cp_method_this0)),
+        ("ref", cp_cast0(cp_method_ref)),
+        ("unref", cp_cast0(cp_method_unref)),
     ];
     let cp = cp_box_ptr(cp_build_object(&methods, CP_SHAPE_ID + methods.len() as u32) as *const u8);
     cp_set_field(cp, b"stdout", stdout_obj);
@@ -1343,7 +1337,9 @@ pub(super) fn cp_exec_async(
                         extra_open: Vec::new(),
                         spawned: false,
                         exited: None,
+                        exit_emitted: false,
                         closed: false,
+                        refed: true,
                         ipc_send: None,
                         ipc_advanced: false,
                         abort_signal_bits: 0,
@@ -1359,6 +1355,7 @@ pub(super) fn cp_exec_async(
             }
             crate::stdlib_pump::register_runtime_pump(0, cp_reactor_pump_extern);
             CP_LIVE_COUNT.fetch_add(1, Ordering::SeqCst);
+            CP_REFED_COUNT.fetch_add(1, Ordering::SeqCst);
 
             if let Some(o) = stdout_pipe {
                 cp_spawn_reader(handle, o, 1);
@@ -1379,10 +1376,11 @@ pub(super) fn cp_exec_async(
                 }
                 Err(_) => (Some(-1), None),
             });
-            cp_spawn_waiter(handle, waiter);
-            if let Some(timeout) = timeout {
-                cp_spawn_timeout(handle, timeout, kill_signal);
-            }
+            cp_spawn_waiter(
+                handle,
+                waiter,
+                timeout.map(|timeout| (timeout, kill_signal)),
+            );
             crate::event_pump::js_notify_main_thread();
             cp
         }
@@ -1539,13 +1537,19 @@ fn cp_reactor_pump_inner() {
             None => Vec::new(),
         }
     };
-    for (handle, cp_bits) in to_spawn {
+    for &(handle, cp_bits) in &to_spawn {
         cp_emit(f64::from_bits(cp_bits), "spawn", &[]);
         if let Some(map) = cp_live_lock().as_mut() {
             if let Some(lc) = map.get_mut(&handle) {
                 lc.spawned = true;
             }
         }
+    }
+    // #9535: `spawn` is a complete host-callback turn. Give an await loop or
+    // the outer promise-job runner control before delivering lifecycle events
+    // that a short-lived child may already have queued.
+    if !to_spawn.is_empty() {
+        return;
     }
 
     // --- Phase A: drain queued data/eof/exited events. ---
@@ -1720,11 +1724,12 @@ fn cp_reactor_pump_inner() {
         }
     }
 
-    // --- Phase B: emit `exit`+`close` once a child has exited AND both
-    // streams have hit EOF, so all `data`/`end` have already fired. For an
-    // exec/execFile child (#4912) the terminal step is its buffered callback
-    // instead of `exit`/`close` events. ---
-    let to_close: Vec<CpCloseItem> = {
+    // --- Phase B: emit `exit` once a child has exited AND both streams have
+    // hit EOF, so all `data`/`end` have already fired. `close` is deliberately
+    // left for the next pump: Node delivers it in the close-callback phase,
+    // after check-phase `setImmediate` callbacks. For exec/execFile (#4912),
+    // the buffered callback accompanies `close` on that following pump. ---
+    let to_finish: Vec<CpCloseItem> = {
         let mut guard = cp_live_lock();
         let mut out = Vec::new();
         if let Some(map) = guard.as_mut() {
@@ -1734,54 +1739,60 @@ fn cp_reactor_pump_inner() {
                 }
                 if let Some((code, signal)) = lc.exited {
                     if !lc.stdout_open && !lc.stderr_open && lc.extra_open.is_empty() {
-                        lc.closed = true;
+                        let close = lc.exit_emitted;
+                        lc.exit_emitted = true;
+                        lc.closed = close;
                         out.push(CpCloseItem {
                             handle: *h,
-                            cp_bits: lc.cp_bits,
                             code,
                             signal,
                             pid: lc.pid,
-                            abort_signal_bits: lc.abort_signal_bits,
-                            abort_listener_bits: lc.abort_listener_bits,
-                            exec: lc.exec.take(),
+                            abort_signal_bits: if close { lc.abort_signal_bits } else { 0 },
+                            abort_listener_bits: if close { lc.abort_listener_bits } else { 0 },
+                            exec: if close { lc.exec.take() } else { None },
                             process_ids: lc.process_ids,
                             pipe_ids: lc.pipe_ids,
+                            refed: lc.refed,
+                            close,
                         });
-                        lc.abort_signal_bits = 0;
-                        lc.abort_listener_bits = 0;
+                        if close {
+                            lc.abort_signal_bits = 0;
+                            lc.abort_listener_bits = 0;
+                        }
                     }
                 }
             }
         }
         out
     };
-    for item in to_close {
-        cp_cleanup_abort_listener(item.abort_signal_bits, item.abort_listener_bits);
-        if let Some(exec) = item.exec {
-            let cp = f64::from_bits(item.cp_bits);
+    for item in to_finish {
+        if !item.close {
+            let Some(cp_bits) = cp_lookup_cp_bits(item.handle) else {
+                continue;
+            };
+            let cp = f64::from_bits(cp_bits);
             let code_f = item.code.map(|c| c as f64).unwrap_or(TAG_NULL_F64);
             let signal_f = item
                 .signal
                 .map(|s| cp_box_string(cp_signal_name(s)))
                 .unwrap_or(TAG_NULL_F64);
+            // Node populates exitCode/signalCode before emitting `exit`.
             cp_set_field(cp, b"exitCode", code_f);
             cp_set_field(cp, b"signalCode", signal_f);
             cp_emit(cp, "exit", &[code_f, signal_f]);
+            continue;
+        }
+
+        cp_cleanup_abort_listener(item.abort_signal_bits, item.abort_listener_bits);
+        if let Some(exec) = item.exec {
             crate::async_hooks::enter_resource_scope(item.process_ids);
             cp_exec_fire_close(exec, item.code, item.signal, item.pid);
             crate::async_hooks::leave_resource_scope(item.process_ids.async_id);
-            cp_emit(cp, "close", &[code_f, signal_f]);
-        } else {
-            let cp = f64::from_bits(item.cp_bits);
-            let code_f = item.code.map(|c| c as f64).unwrap_or(TAG_NULL_F64);
-            let signal_f = item
-                .signal
-                .map(|s| cp_box_string(cp_signal_name(s)))
-                .unwrap_or(TAG_NULL_F64);
-            // Node populates exitCode/signalCode before emitting `exit`, then `close`.
-            cp_set_field(cp, b"exitCode", code_f);
-            cp_set_field(cp, b"signalCode", signal_f);
-            cp_emit(cp, "exit", &[code_f, signal_f]);
+        }
+        if let Some(cp_bits) = cp_lookup_cp_bits(item.handle) {
+            let cp = f64::from_bits(cp_bits);
+            let code_f = cp_get_field(cp, b"exitCode");
+            let signal_f = cp_get_field(cp, b"signalCode");
             cp_emit(cp, "close", &[code_f, signal_f]);
         }
         if let Some(map) = cp_live_lock().as_mut() {
@@ -1792,6 +1803,9 @@ fn cp_reactor_pump_inner() {
             crate::async_hooks::destroy(pipe.async_id);
         }
         CP_LIVE_COUNT.fetch_sub(1, Ordering::SeqCst);
+        if item.refed {
+            CP_REFED_COUNT.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -1799,7 +1813,6 @@ fn cp_reactor_pump_inner() {
 /// events (`exec` is `None`) or an exec/execFile callback (`exec` is `Some`).
 struct CpCloseItem {
     handle: u64,
-    cp_bits: u64,
     code: Option<i32>,
     signal: Option<i32>,
     pid: i32,
@@ -1808,6 +1821,8 @@ struct CpCloseItem {
     exec: Option<Box<CpExecPending>>,
     process_ids: crate::async_hooks::AsyncResourceIds,
     pipe_ids: [crate::async_hooks::AsyncResourceIds; 3],
+    refed: bool,
+    close: bool,
 }
 
 fn cp_lookup_cp_bits(handle: u64) -> Option<u64> {
@@ -1942,51 +1957,14 @@ pub(super) fn cp_live_stdin_queue_callback(handle: u64, callback_bits: u64) -> b
     false
 }
 
-// ============================================================================
-// Event-loop integration hooks (wired from lib.rs / gc/mod.rs).
-// ============================================================================
-
-/// Whether any live child is keeping the event loop alive — OR'd into
-/// `js_stdlib_has_active_handles`.
-pub(crate) fn cp_reactor_has_live() -> bool {
-    CP_LIVE_COUNT.load(Ordering::Relaxed) > 0
-}
-
-/// GC mutable-root scanner: keep every live ChildProcess (and its reachable
-/// stdio sub-objects + listener arrays) alive across collections, and rewrite
-/// the stored pointer on evacuation.
-pub(crate) fn cp_reactor_scan_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
-    if CP_LIVE_COUNT.load(Ordering::Relaxed) == 0 {
-        return;
-    }
-    if let Some(map) = cp_live_lock().as_mut() {
-        for lc in map.values_mut() {
-            visitor.visit_nanbox_u64_slot(&mut lc.cp_bits);
-            if lc.abort_signal_bits != 0 {
-                visitor.visit_nanbox_u64_slot(&mut lc.abort_signal_bits);
-            }
-            if lc.abort_listener_bits != 0 {
-                visitor.visit_nanbox_u64_slot(&mut lc.abort_listener_bits);
-            }
-            // #4912: keep the async exec/execFile callback closure alive until
-            // it fires on `close`.
-            if let Some(exec) = lc.exec.as_mut() {
-                visitor.visit_nanbox_u64_slot(&mut exec.cb_bits);
-            }
-            // #9493: stdin write/end callbacks waiting on the drain thread.
-            if let Some(stdin) = lc.stdin.as_mut() {
-                for callback in &mut stdin.callbacks {
-                    visitor.visit_nanbox_u64_slot(callback);
-                }
-            }
-        }
-    }
-}
-
+mod integration;
 mod kill;
 mod stdin_drain;
+mod timeout;
 #[cfg(all(test, windows))]
 #[path = "reactor/windows_kill_tests.rs"]
 mod windows_kill_tests;
+pub(crate) use integration::*;
 pub(crate) use kill::*;
 use stdin_drain::*;
+use timeout::*;

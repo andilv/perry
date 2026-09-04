@@ -20,305 +20,8 @@ use crate::function::LlFunction;
 use crate::native_value::NativeRepRecord;
 use crate::types::LlvmType;
 
-/// Strip a leading LLVM linkage keyword from a global's post-`=` text, if
-/// present. Linkage comes before `unnamed_addr`/`constant`/`global` in the
-/// grammar, so this leaves the rest of the definition intact.
-fn strip_leading_linkage(s: &str) -> &str {
-    for kw in [
-        "private ",
-        "internal ",
-        "linkonce_odr ",
-        "linkonce ",
-        "weak_odr ",
-        "weak ",
-        "common ",
-        "available_externally ",
-    ] {
-        if let Some(rest) = s.strip_prefix(kw) {
-            return rest;
-        }
-    }
-    s
-}
-
-/// Rewrite a module-global definition so it is safe to duplicate across
-/// codegen units (#5391). Local-linkage (`private`/`internal`) and bare
-/// external definitions are promoted to `linkonce_odr`, so the linker keeps a
-/// single copy when the same global is emitted into multiple units. `external`
-/// declarations (no initializer) are returned unchanged — duplicating a
-/// declaration is harmless.
-
-/// Symbol name of a global/string definition line (`@name = ...`).
-fn global_symbol_name(line: &str) -> Option<&str> {
-    let line = line.trim_start();
-    if !line.starts_with('@') {
-        return None;
-    }
-    let end = line.find(" = ")?;
-    Some(&line[..end])
-}
-
-/// Collect every `@symbol` referenced in a chunk of IR text.
-fn collect_symbol_refs(text: &str, out: &mut HashSet<String>) {
-    let b = text.as_bytes();
-    let mut i = 0usize;
-    while i < b.len() {
-        if b[i] == b'@' {
-            let start = i;
-            i += 1;
-            while i < b.len()
-                && (b[i].is_ascii_alphanumeric() || matches!(b[i], b'_' | b'.' | b'$' | b'-'))
-            {
-                i += 1;
-            }
-            if i > start + 1 {
-                out.insert(text[start..i].to_string());
-            }
-        } else {
-            i += 1;
-        }
-    }
-}
-
-fn metadata_definition_id(line: &str) -> Option<u32> {
-    let rest = line.trim_start().strip_prefix('!')?;
-    let (digits, _) = rest.split_once(" =")?;
-    digits.parse().ok()
-}
-
-/// Collect numeric LLVM metadata references (`!123`) from instructions or
-/// metadata definitions. Named metadata does not occur in Perry's alias tail.
-fn collect_metadata_refs(text: &str, out: &mut HashSet<u32>) {
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'!' || i + 1 >= bytes.len() || !bytes[i + 1].is_ascii_digit() {
-            i += 1;
-            continue;
-        }
-        let start = i + 1;
-        i = start;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            i += 1;
-        }
-        if let Ok(id) = text[start..i].parse() {
-            out.insert(id);
-        }
-    }
-}
-
-fn promote_global_for_units(line: &str) -> String {
-    if line.contains(" = external ") {
-        return line.to_string();
-    }
-    match line.split_once(" = ") {
-        Some((lhs, rhs)) => format!(
-            "{} = linkonce_odr {}",
-            lhs,
-            strip_leading_linkage(rhs.trim_start())
-        ),
-        None => line.to_string(),
-    }
-}
-
-/// Give a generated global one non-discardable definition. On every
-/// non-Mach-O target (ELF and COFF — see `replicate_globals`) each global has
-/// a unique owning codegen unit; leaving that sole definition as
-/// `linkonce_odr` lets LLVM discard it when all references in the owner happen
-/// to optimize away, even though other object files still reference it.
-///
-/// The result is a plain STRONG definition with default visibility, so the
-/// symbol's NAME must be unique across the whole program, not just the
-/// module: `.str.N` constants only satisfy that through
-/// [`LlModule::set_symbol_prefix`].
-fn make_unique_owner_global(line: &str) -> String {
-    if line.contains(" = external ") {
-        return line.to_string();
-    }
-    match line.split_once(" = ") {
-        Some((lhs, rhs)) => format!("{} = {}", lhs, strip_leading_linkage(rhs.trim_start())),
-        None => line.to_string(),
-    }
-}
-
-fn external_decl_for_global(line: &str) -> Option<String> {
-    if line.contains(" = external ") {
-        return Some(line.to_string());
-    }
-    let (name, rhs) = line.split_once(" = ")?;
-    let rhs = strip_leading_linkage(rhs.trim_start());
-    let (kind, rest) = if let Some(rest) = rhs.strip_prefix("unnamed_addr constant ") {
-        ("constant", rest)
-    } else if let Some(rest) = rhs.strip_prefix("constant ") {
-        ("constant", rest)
-    } else if let Some(rest) = rhs.strip_prefix("global ") {
-        ("global", rest)
-    } else {
-        return None;
-    };
-    let rest = rest.trim_start();
-    let ty_end = match rest.as_bytes().first().copied() {
-        Some(b'[') | Some(b'{') | Some(b'<') => {
-            let (mut square, mut curly, mut angle) = (0i32, 0i32, 0i32);
-            let mut end = None;
-            for (i, b) in rest.bytes().enumerate() {
-                match b {
-                    b'[' => square += 1,
-                    b']' => square -= 1,
-                    b'{' => curly += 1,
-                    b'}' => curly -= 1,
-                    b'<' => angle += 1,
-                    b'>' => angle -= 1,
-                    _ => {}
-                }
-                if square == 0 && curly == 0 && angle == 0 {
-                    end = Some(i + 1);
-                    break;
-                }
-            }
-            end?
-        }
-        _ => rest.find(char::is_whitespace).unwrap_or(rest.len()),
-    };
-    Some(format!("{name} = external {kind} {}", &rest[..ty_end]))
-}
-
-/// Attribute-group suffix for a runtime-helper `declare` line, keyed by
-/// helper name (#6082 tranche 1).
-///
-/// Without attributes, -O3 must treat every `js_*` call as "may read and
-/// write all memory, may not return" — no CSE/LICM/DCE across any helper
-/// call. The two groups below re-enable those optimizations for a small,
-/// individually audited allowlist:
-///
-/// * `#2` (PURE) = `nounwind willreturn readnone`. Invariant: the
-///   helper's Rust body (transitively) performs NaN-box BIT manipulation
-///   only — no loads, no stores, no allocation, no GC trigger, no
-///   `js_throw`/longjmp, and it is total over arbitrary input bits (no
-///   panic, no UB), so LLVM may CSE/hoist/sink/delete it freely.
-/// * `#3` (READONLY) = `nounwind willreturn readonly`. Invariant: the
-///   helper may READ heap memory (string headers, BigInt limbs) but never
-///   writes, never allocates, never triggers GC, never takes a lock, and
-///   never throws. LLVM may CSE/LICM it across write-free regions and
-///   delete unused calls, but must still order it against any
-///   possibly-writing call — which keeps it correct w.r.t. the moving GC,
-///   because every GC-capable helper stays maximally clobbering.
-///
-/// SYNTAX NOTE: the groups are spelled with the LEGACY `readnone` /
-/// `readonly` function attributes, NOT the modern `memory(none)` /
-/// `memory(read)` — old LLVM asm parsers (e.g. the Apple clang 15 shipped
-/// on macos-14 CI runners, and any user clang predating LLVM's `memory`
-/// attribute) reject the modern spelling with "unterminated attribute
-/// group", which killed every `--backend llvm` compile through that clang
-/// (caught by the simctl iOS smoke gating the v0.5.1265 release). New
-/// parsers still accept the legacy spelling and auto-upgrade it to the
-/// equivalent `memory(...)` form, so semantics are identical everywhere.
-///
-/// SOUNDNESS NOTES (read before adding an entry):
-/// * Deliberately reads-any (`readonly`, i.e. `memory(read)`), NOT an
-///   argmem-scoped form: helper args are f64 NaN-boxes, not LLVM pointer
-///   arguments, so `argmem` would mean "reads no memory at all" and
-///   license CSE/DSE across real heap reads.
-/// * Anything that can allocate or trigger GC gets NO group — the moving
-///   GC's shadow-stack reload discipline depends on those calls staying
-///   maximally clobbering.
-/// * Anything that can reach `js_throw` (raises through the unwinder) gets NO group —
-///   `willreturn` would let DCE delete a throwing call whose result is
-///   unused, silently dropping the exception.
-///
-/// Audited and rejected (do not re-add without a new audit):
-/// `js_nanbox_string` (allocates an empty string for null input),
-/// `js_get_string_pointer_unified` / `js_typed_string_arg_to_raw`
-/// (materialize SSO strings onto the heap = allocation),
-/// `js_typed_f64_arg_to_raw` (routes through `js_number_coerce`, whose
-/// string/object paths read+parse and reach ToPrimitive),
-/// `js_value_length_f64` (Buffer/TypedArray registry lookups take locks —
-/// a lock acquisition writes memory).
-pub(crate) fn helper_decl_attrs(name: &str) -> &'static str {
-    match name {
-        // PURE — each verified: pure bit tests/masking on the f64/i64 args,
-        // total over arbitrary bits, no memory access anywhere in the body.
-        //   js_nanbox_pointer        value/nanbox.rs — tag ladder, 0 → TAG_NULL
-        //   js_nanbox_get_pointer    value/nanbox.rs — mask ladder, no deref
-        //   js_typed_f64_arg_guard   native_abi.rs — tag-band check
-        //   js_typed_i32_arg_guard   native_abi.rs — tag check + finite/fract/range
-        //   js_typed_i1_arg_guard    native_abi.rs — bits == TAG_TRUE|TAG_FALSE
-        //   js_typed_i1_arg_to_raw   native_abi.rs — bits == TAG_TRUE
-        //   js_typed_i32_arg_to_raw  native_abi.rs — bit extract / saturating cast
-        //   js_typed_string_arg_guard native_abi.rs — STRING/SHORT_STRING tag check
-        "js_nanbox_pointer"
-        | "js_nanbox_get_pointer"
-        | "js_typed_f64_arg_guard"
-        | "js_typed_i32_arg_guard"
-        | "js_typed_i1_arg_guard"
-        | "js_typed_i1_arg_to_raw"
-        | "js_typed_i32_arg_to_raw"
-        | "js_typed_string_arg_guard" => " #2",
-        // READONLY — verified: tag ladder plus reads of StringHeader.utf16_len
-        // (via is_valid_string_ptr, a pure magnitude check) and BigInt limbs
-        // (js_bigint_is_zero via clean_bigint_ptr, pure bit cleanup). No
-        // registry/lock access, no allocation, no throw, no writes.
-        "js_is_truthy" => " #3",
-        // NOUNWIND+WILLRETURN only (#4, repsel Phase 4a.0) — each verified
-        // (`typed_feedback.rs` / `array/header.rs`): no `js_throw` (longjmp)
-        // anywhere in the body, every loop bounded by the 16M length/capacity
-        // sanity caps, no allocation, no GC trigger. They are NOT readonly:
-        // the numeric guards' first-touch path REBUILDS unmarked arrays into
-        // raw-f64 layout (slot writes + flag store), feedback mode
-        // (`PERRY_TYPED_FEEDBACK`, a runtime env check) records observations,
-        // and `js_array_numeric_value_to_raw_f64`'s ClassRef probe takes
-        // registry RwLock reads (a lock word write). #6082 trap notes apply:
-        // argmem is unsound for NaN-box args, and `willreturn` is only
-        // admissible because these helpers cannot reach `js_throw` — any
-        // divergence is a Rust panic-abort, which never resumes the program.
-        "js_typed_feedback_plain_array_index_get_guard"
-        | "js_typed_feedback_numeric_array_index_get_guard"
-        | "js_typed_feedback_plain_array_index_set_guard"
-        | "js_typed_feedback_numeric_array_index_set_guard"
-        | "js_typed_feedback_numeric_array_push_guard"
-        | "js_array_numeric_value_to_raw_f64" => " #4",
-        _ => "",
-    }
-}
-
-/// Synthesize an external `declare` line matching a locally-defined function's
-/// signature, so a codegen unit that calls it (but does not define it) resolves
-/// the call at link time.
-pub(crate) fn declare_line_for(f: &LlFunction) -> String {
-    let params = f
-        .params
-        .iter()
-        .map(|(t, _)| t.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    // #8175: a codegen unit that calls a promoted `preserve_nonecc` clone
-    // binds through this declare; the convention must ride along or the
-    // cross-unit ABI silently splits from the defining unit's.
-    let cconv: String = if f.is_preserve_none() {
-        format!("{} ", crate::inst::PRESERVE_NONE_CC)
-    } else {
-        String::new()
-    };
-    format!("declare {}{} @{}({})", cconv, f.return_type, f.name, params)
-}
-
-/// Render a function with external linkage forced, promoting an `internal` /
-/// `private` definition so cross-unit calls can bind to it. Names are
-/// module-prefixed and unique, so promotion never collides.
-pub(crate) fn render_fn_external(f: &LlFunction) -> String {
-    render_fn_external_with_gc_leaf_callees(f, &HashSet::new())
-}
-
-pub(crate) fn render_fn_external_with_gc_leaf_callees(
-    f: &LlFunction,
-    gc_leaf_callees: &HashSet<String>,
-) -> String {
-    let ir = f.to_ir_with_gc_leaf_callees(gc_leaf_callees);
-    if f.linkage == "internal" || f.linkage == "private" {
-        return ir.replacen(&format!("define {} ", f.linkage), "define ", 1);
-    }
-    ir
-}
+mod linkage;
+pub(crate) use linkage::*;
 
 fn push_statepoint_declarations(ir: &mut String) {
     ir.push_str(
@@ -991,10 +694,12 @@ impl LlModule {
     /// the single giant translation unit that makes clang OOM on large bundles.
     ///
     /// The functions are split into `n` contiguous buckets. Every unit carries:
-    ///   * the full string-constant + global set, with local-linkage and bare
-    ///     external DEFINITIONS promoted to `linkonce_odr` (the linker keeps one
-    ///     copy). Globals are a tiny fraction of a large module's IR, so the
-    ///     duplication is cheap; `external` *declarations* are replicated as-is;
+    ///   * the string constants + globals it references, with local-linkage
+    ///     and bare external DEFINITIONS promoted to `linkonce_odr` when more
+    ///     than one unit defines them (the linker keeps one copy) and left in
+    ///     their original linkage otherwise (#9610). Globals are a tiny
+    ///     fraction of a large module's IR, so the duplication is cheap;
+    ///     `external` *declarations* are replicated as-is;
     ///   * the module's external `declare`s plus a synthesized `declare` for
     ///     every locally-defined function the unit does NOT itself define, so
     ///     cross-unit calls resolve at link time (deduped by name, existing
@@ -1048,16 +753,11 @@ impl LlModule {
             bucket_bytes[target] += sizes[i];
         }
 
-        let shared_strings: Vec<String> = self
-            .string_constants
-            .iter()
-            .map(|s| promote_global_for_units(s))
-            .collect();
-        let shared_globals: Vec<String> = self
-            .globals
-            .iter()
-            .map(|g| promote_global_for_units(g))
-            .collect();
+        // Definitions are carried in their ORIGINAL linkage here; the
+        // duplicate-safe promotion below is applied per unit, and only to the
+        // globals that more than one unit actually defines (#9610).
+        let shared_strings: Vec<String> = self.string_constants.clone();
+        let shared_globals: Vec<String> = self.globals.clone();
 
         // name -> declare line. Existing module declarations (runtime, FFI,
         // cross-module) take precedence; every locally-defined function without
@@ -1098,10 +798,11 @@ impl LlModule {
 
         // A global is emitted into every unit that REFERENCES it — normally
         // exactly one, and `linkonce_odr` lets the linker fold the rare
-        // multi-unit case. Definition-in-one-unit + `external` elsewhere was
-        // tried first and is subtly wrong under `-dead_strip`: the sole
-        // definition can be discarded with its unit's atoms while a live
-        // reference survives in another object.
+        // multi-unit case (only that case: see `defining_unit_count` below).
+        // Definition-in-one-unit + `external` elsewhere was tried first and is
+        // subtly wrong under `-dead_strip`: the sole definition can be
+        // discarded with its unit's atoms while a live reference survives in
+        // another object.
         let all_globals: Vec<&String> =
             shared_strings.iter().chain(shared_globals.iter()).collect();
         // Globals reference OTHER globals in their initializers (a string
@@ -1157,6 +858,32 @@ impl LlModule {
             })
             .collect();
         let replicate_globals = self.target_triple.contains("apple");
+        // #9610: how many units end up DEFINING each global. Under the
+        // replicated (Mach-O) policy that is one unit per referencing bucket;
+        // the owner fallback keeps unreferenced globals at one. Only the
+        // globals a link would see twice need `linkonce_odr` to fold, and
+        // linkage is not free: LLVM's Mach-O section picker sends every
+        // weak-for-linker global to the coalesced *data* section, so a
+        // `zeroinitializer` global promoted for no reason leaves
+        // `__DATA,__bss` (zerofill, no file bytes) for file-backed
+        // `__DATA,__data`. Per-site inline caches are `[12 x i64]
+        // zeroinitializer` referenced by exactly one function each — 25.16 MB
+        // of literal zeros in the Claude Code binary's `__data`, 8.2% of the
+        // file, purely from the promotion. Only LOCAL-linkage definitions skip
+        // it (`has_local_linkage`) — that covers every generated cache and
+        // table, and keeps a strong external definition's cross-module
+        // coalescing exactly as it was.
+        let mut defining_unit_count: Vec<usize> = vec![0; all_globals.len()];
+        if replicate_globals {
+            for need in &bucket_needs {
+                for &gi in need {
+                    defining_unit_count[gi] += 1;
+                }
+            }
+        }
+        for count in &mut defining_unit_count {
+            *count = (*count).max(1);
+        }
 
         let unit_posts: Vec<String> = bucket_metadata_refs
             .into_iter()
@@ -1187,7 +914,11 @@ impl LlModule {
                 let owns = global_owners[gi] == bi;
                 if (replicate_globals && referenced) || owns {
                     if replicate_globals {
-                        pre.push_str(def);
+                        if defining_unit_count[gi] > 1 || !has_local_linkage(def) {
+                            pre.push_str(&promote_global_for_units(def));
+                        } else {
+                            pre.push_str(def);
+                        }
                     } else {
                         pre.push_str(&make_unique_owner_global(def));
                     }
@@ -1705,6 +1436,93 @@ mod tests {
             "size balancing should put the small wrapper in the other unit"
         );
         assert!(global_unit.contains("declare double @__perry_wrap_extern_dep__value(i64)"));
+    }
+
+    #[test]
+    fn mach_o_split_promotes_only_globals_two_units_define() {
+        // #9610: `linkonce_odr` is weak-for-linker, and
+        // `TargetLoweringObjectFileMachO::SelectSectionForGlobal` routes every
+        // weak-for-linker global to the coalesced DATA section before it ever
+        // asks whether the initializer is zero. So promoting a
+        // `zeroinitializer` global that only ONE unit defines moves it out of
+        // zerofill `__DATA,__bss` and writes its zeros into the file — 25.16 MB
+        // (8.2%) of the Claude Code binary, all of it per-site inline caches
+        // (`[12 x i64] zeroinitializer`, one per property-access site, each
+        // referenced by exactly one function and so by exactly one unit).
+        // Promote only what a link would otherwise see defined twice; ELF/COFF
+        // are unaffected either way (their BSS choice ignores linkage).
+        let mut m = LlModule::new("arm64-apple-macosx15.0.0");
+        m.declare_function("js_ic_touch", VOID, &[PTR]);
+        m.add_raw_global("@perry_ic_m__0 = private global [12 x i64] zeroinitializer".to_string());
+        m.add_raw_global("@perry_ic_m__1 = private global [12 x i64] zeroinitializer".to_string());
+        m.add_internal_global("perry_class_keys_m__C", I64, "0");
+        m.add_global("perry_class_shape_id_m__C", I32, "0");
+
+        // Two functions, one per unit under a 2-way split. Each touches its
+        // own cache; both touch the class-keys global, which therefore needs
+        // the linker to fold the two copies onto one storage.
+        for (name, ic) in [
+            ("perry_fn_m__f", "@perry_ic_m__0"),
+            ("perry_fn_m__g", "@perry_ic_m__1"),
+        ] {
+            let f = m.define_function(name, DOUBLE, vec![]);
+            let e = f.create_block("entry");
+            e.call_void("js_ic_touch", &[(PTR, ic)]);
+            e.call_void("js_ic_touch", &[(PTR, "@perry_class_keys_m__C")]);
+            if name == "perry_fn_m__f" {
+                e.call_void("js_ic_touch", &[(PTR, "@perry_class_shape_id_m__C")]);
+            }
+            e.ret(DOUBLE, "0.0");
+        }
+
+        let units = m.render_codegen_units(2);
+        assert_eq!(units.len(), 2, "two functions → two units");
+
+        for ic in ["@perry_ic_m__0", "@perry_ic_m__1"] {
+            let defs: Vec<&String> = units
+                .iter()
+                .filter(|u| {
+                    u.contains(&format!("{ic} = private global [12 x i64] zeroinitializer"))
+                })
+                .collect();
+            assert_eq!(
+                defs.len(),
+                1,
+                "{ic} is referenced by one function, so exactly one unit defines \
+                 it — in its original local linkage, which is what keeps it in __bss"
+            );
+            for u in &units {
+                assert!(
+                    !u.contains(&format!("{ic} = linkonce_odr")),
+                    "{ic} must not be promoted: no second definition exists to fold"
+                );
+            }
+        }
+
+        // The genuinely shared global still gets the promotion — two strong
+        // copies of it in one link is a duplicate-symbol error, and two
+        // *local* copies would be two distinct storages for one runtime slot.
+        let shared_defs = units
+            .iter()
+            .filter(|u| u.contains("@perry_class_keys_m__C = linkonce_odr global i64 0"))
+            .count();
+        assert_eq!(
+            shared_defs, 2,
+            "a global both units reference is defined in both, folded by linkage"
+        );
+
+        // A strong EXTERNAL definition keeps the promotion even at one unit:
+        // `linkonce_odr` is what lets ld64 coalesce two modules' same-named
+        // globals rather than report a duplicate symbol, and this change is
+        // about section placement, not about that.
+        let external_defs = units
+            .iter()
+            .filter(|u| u.contains("@perry_class_shape_id_m__C = linkonce_odr global i32 0"))
+            .count();
+        assert_eq!(
+            external_defs, 1,
+            "a link-visible definition stays `linkonce_odr` however few units define it"
+        );
     }
 
     #[test]

@@ -714,6 +714,8 @@ fn zero_alignment_padding_tail(raw: *mut u8, requested_payload_size: usize) {
                 // writes it (a byte LOOP here gets idiom-recognized by LLVM
                 // back into the `bzero` PLT call this branch exists to
                 // avoid — a real cost when the padding is 2 bytes).
+                // GC_STORE_AUDIT(INIT): fresh String tail padding is zeroed
+                // before payload/header publication.
                 raw.add(allocated_payload - 8)
                     .cast::<u64>()
                     .write_unaligned(0);
@@ -1023,4 +1025,13 @@ pub(crate) fn string_as_str<'a>(s: *const StringHeader) -> &'a str {
 #[inline]
 pub(crate) fn is_ascii_string(s: *const StringHeader) -> bool {
     unsafe { (*s).utf16_len == (*s).byte_len }
+}
+
+/// `PERRY_GC_CENSUS`: the fixed-size intern table (slots, bytes). Entries
+/// point into the GC heap; only the table itself is counted.
+pub(crate) fn intern_table_census() -> (usize, usize) {
+    (
+        intern::INTERN_TABLE_SIZE,
+        intern::INTERN_TABLE_SIZE * std::mem::size_of::<intern::InternEntry>(),
+    )
 }

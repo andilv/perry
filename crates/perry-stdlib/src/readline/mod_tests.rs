@@ -11,8 +11,45 @@ fn close_without_callbacks_is_noop() {
     let h = js_readline_create_interface(0.0);
     assert_eq!(h, STDIN_READLINE_HANDLE);
     js_readline_close(h);
+    assert!(STDIN_PAUSED.load(Ordering::Acquire));
+    assert!(!EOF_REACHED.load(Ordering::Acquire));
+    test_inject_line("late");
     assert_eq!(js_readline_process_pending(), 0);
+    assert_eq!(PENDING_LINES.lock().unwrap().len(), 1);
+    assert_eq!(js_readline_has_active(), 0);
     assert_eq!(js_readline_process_pending(), 0);
+}
+
+#[test]
+fn stdin_close_pauses_delivery_until_explicit_resume() {
+    let _g = reset();
+    let h = js_readline_create_interface(0.0);
+    let event = event_name("data");
+    let cb = data_counter_callback();
+    let _ = js_readline_stdin_on(event, cb);
+
+    js_readline_close(h);
+    test_inject_chunk(b"late");
+    assert_eq!(js_readline_process_pending(), 0);
+    assert_eq!(PENDING_DATA.lock().unwrap().len(), 1);
+    assert!(!EOF_REACHED.load(Ordering::Acquire));
+
+    let _ = js_readline_stdin_resume();
+    assert_eq!(js_readline_process_pending(), 1);
+    DATA_COUNT.with(|count| assert_eq!(*count.borrow(), 1));
+}
+
+#[test]
+fn new_stdin_interface_resumes_after_previous_interface_closed() {
+    let _g = reset();
+    let first = js_readline_create_interface(0.0);
+    js_readline_close(first);
+    assert!(STDIN_PAUSED.load(Ordering::Acquire));
+
+    let second = js_readline_create_interface(0.0);
+    assert_eq!(second, STDIN_READLINE_HANDLE);
+    assert!(!STDIN_PAUSED.load(Ordering::Acquire));
+    assert!(!EOF_REACHED.load(Ordering::Acquire));
 }
 
 #[test]
@@ -251,7 +288,7 @@ fn stdin_unref_and_destroy_release_active_state() {
 }
 
 #[test]
-fn split_escape_sequence_reassembles_to_single_keypress() {
+fn complete_escape_sequence_reassembles_to_single_keypress() {
     // The raw-mode reader queues one byte per chunk, so an arrow key
     // arrives as `\x1b`, `[`, `A` in three chunks. The pump must
     // reassemble them into ONE 'up' keypress, not escape + [ + A.
@@ -268,10 +305,28 @@ fn split_escape_sequence_reassembles_to_single_keypress() {
 }
 
 #[test]
-fn bare_escape_flushes_on_next_tick() {
-    // A lone ESC can't be distinguished from the start of a sequence
-    // within one tick — it's held, then flushed as a bare 'escape'
-    // keypress on the next tick if nothing followed.
+fn split_escape_sequence_reassembles_before_timeout() {
+    // ESC can arrive in one read and the rest of an arrow in a later read.
+    // The completing bytes cancel the one-shot instead of observing a tick as
+    // an implicit timeout and tearing the arrow apart.
+    let _g = reset();
+    let event = event_name("keypress");
+    let cb = keypress_recorder_callback();
+    let _ = js_readline_stdin_on(event, cb);
+    test_inject_chunk(b"\x1b");
+    assert_eq!(js_readline_process_pending(), 0);
+    assert!(js_readline_next_wake_ms() > 0.0);
+    test_inject_chunk(b"[");
+    test_inject_chunk(b"C");
+    assert_eq!(js_readline_process_pending(), 1);
+    KEYPRESS_NAMES.with(|names| assert_eq!(*names.borrow(), vec!["right".to_string()]));
+    assert_eq!(js_readline_next_wake_ms(), -1.0);
+}
+
+#[test]
+fn bare_escape_flushes_only_after_escape_code_timeout() {
+    // A lone ESC can't be distinguished from the start of a sequence. Pump
+    // turns before the deadline must leave it held; expiry emits one keypress.
     let _g = reset();
     let event = event_name("keypress");
     let cb = keypress_recorder_callback();
@@ -280,8 +335,13 @@ fn bare_escape_flushes_on_next_tick() {
     assert_eq!(js_readline_process_pending(), 0);
     // The held prefix keeps the loop alive so the flush tick runs.
     assert_eq!(js_readline_has_active(), 1);
+    let remaining = js_readline_next_wake_ms();
+    assert!((1.0..=500.0).contains(&remaining));
+    assert_eq!(js_readline_process_pending(), 0);
+    *PENDING_ESCAPE_DEADLINE.lock().unwrap() = Some(Instant::now() - Duration::from_millis(1));
     assert_eq!(js_readline_process_pending(), 1);
     KEYPRESS_NAMES.with(|names| assert_eq!(*names.borrow(), vec!["escape".to_string()]));
+    assert_eq!(js_readline_next_wake_ms(), -1.0);
 }
 
 #[test]

@@ -775,6 +775,8 @@ fn should_cache_native_module_namespace(module_name: &str) -> bool {
         "assert/strict"
             | "async_hooks"
             | "async_hooks.default"
+            | "bun"
+            | "bun.ant"
             | "constants"
             | "constants.default"
             // #5263: cache the top-level namespace objects whose dynamic
@@ -997,13 +999,30 @@ unsafe fn native_module_property_by_name_impl(
     if module_name == "url" && property_name == "URLPattern" {
         return js_get_global_this_builtin_value(b"URLPattern".as_ptr(), "URLPattern".len());
     }
-    // #6560 — Bun globals shim pack: `Bun.stdin` / `Bun.stdout` / `Bun.stderr`
-    // are object-valued reads (BunFile-like handles built by `bun_compat`).
+    // #6560/#9599 — Bun globals shim pack. The stdio properties are
+    // BunFile-like handles built by `bun_compat`. In Bun platform mode the
+    // compiler installs this namespace on globalThis, so the metadata below is
+    // deliberately Perry-specific rather than pretending to be a Bun runtime.
     if module_name == "bun" {
         match property_name {
+            "ant" => {
+                let submodule = "bun.ant";
+                return js_create_native_module_namespace(submodule.as_ptr(), submodule.len());
+            }
             "stdin" => return crate::bun_compat::js_bun_stdin(),
             "stdout" => return crate::bun_compat::js_bun_stdout(),
             "stderr" => return crate::bun_compat::js_bun_stderr(),
+            "YAML" => return crate::bun_compat::js_bun_yaml(),
+            "TOML" => return crate::bun_compat::js_bun_toml(),
+            "semver" => return crate::bun_compat::js_bun_semver(),
+            "JSONL" => return crate::bun_compat::js_bun_jsonl(),
+            "hash" => {
+                return crate::bun_compat::decorate_bun_hash(bound_native_callable_export_value(
+                    "bun", "hash",
+                ))
+            }
+            "version" => return native_string_value(env!("CARGO_PKG_VERSION")),
+            "isStandaloneExecutable" => return crate::embedded::is_standalone_executable_value(),
             _ => {}
         }
     }
@@ -1191,7 +1210,12 @@ pub extern "C" fn js_native_module_bind_method(
         {
             return bound;
         }
-        return bound_native_callable_export_value(&module_name, property_name);
+        let value = bound_native_callable_export_value(&module_name, property_name);
+        return if module_name == "bun" && property_name == "hash" {
+            crate::bun_compat::decorate_bun_hash(value)
+        } else {
+            value
+        };
     }
 
     // Try V8 JS runtime fallback for unknown properties (e.g., ethers.Contract)
@@ -1836,9 +1860,13 @@ unsafe fn vt_get_own_field(
         if let Some(bound) = instance_bound_perf_method(&module_name, property_name, nb_ptr) {
             return Some(JSValue::from_bits(bound.to_bits()));
         }
-        return Some(JSValue::from_bits(
-            bound_native_callable_export_value(&module_name, property_name).to_bits(),
-        ));
+        let value = bound_native_callable_export_value(&module_name, property_name);
+        let value = if module_name == "bun" && property_name == "hash" {
+            crate::bun_compat::decorate_bun_hash(value)
+        } else {
+            value
+        };
+        return Some(JSValue::from_bits(value.to_bits()));
     }
     // Object-valued exports (e.g. `perf_hooks.performance` / `.constants`) are
     // resolved by the shared per-property dispatch but are not covered by the

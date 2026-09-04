@@ -1100,10 +1100,40 @@ pub(crate) const API_MANIFEST_PART_4: &[ApiEntry] = &[
     // (Zig-std wyhash, BigInt result), and the module-level
     // `pathToFileURL` / `fileURLToPath` aliases of node:url.
     // Implementation: perry-runtime `bun_compat`.
+    class("bun", "Transpiler"),
+    method("bun", "Transpiler", false, None),
+    method("bun", "build", false, None),
+    method("bun", "transformSync", true, Some("Transpiler")),
+    method("bun", "transform", true, Some("Transpiler")),
+    method("bun", "scanImports", true, Some("Transpiler")),
+    method("bun", "scan", true, Some("Transpiler")),
+    method("bun", "SQL", false, None),
+    // Implementation: perry-runtime `bun_compat`; TCP/Unix sockets live in
+    // perry-ext-net.
     method("bun", "stringWidth", false, None),
+    method("bun", "listen", false, None),
+    method("bun", "connect", false, None),
     method("bun", "hash", false, None),
+    method("bun", "deepEquals", false, None),
+    method("bun", "stripANSI", false, None),
+    method("bun", "wrapAnsi", false, None),
+    method("bun", "which", false, None),
+    method("bun", "zstdDecompress", false, None),
+    method("bun", "zstdDecompressSync", false, None),
+    method("bun", "gc", false, None),
+    method("bun", "generateHeapSnapshot", false, None),
     method("bun", "file", false, None),
     method("bun", "write", false, None),
+    method("bun", "spawn", false, None),
+    method("bun", "Terminal", false, None),
+    method_sig(
+        "bun",
+        "serve",
+        false,
+        None,
+        &[p_any("options")],
+        TypeSpec::Any,
+    ),
     method("bun", "pathToFileURL", false, None),
     method("bun", "fileURLToPath", false, None),
     // #8537 — OpenCode compatibility coverage added these dispatch rows
@@ -1114,6 +1144,13 @@ pub(crate) const API_MANIFEST_PART_4: &[ApiEntry] = &[
     property("bun", "stdin"),
     property("bun", "stdout"),
     property("bun", "stderr"),
+    property("bun", "version"),
+    property("bun", "isStandaloneExecutable"),
+    property("bun", "YAML"),
+    property("bun", "TOML"),
+    property("bun", "semver"),
+    property("bun", "JSONL"),
+    property("bun", "ant"),
     // --- qs (issue #8751) ---
     // Native nested query-string codec. This keeps Stripe's request encoder
     // off qs' legacy get-intrinsic/ES-shims dependency chain.

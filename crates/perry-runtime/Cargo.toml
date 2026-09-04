@@ -22,7 +22,7 @@ crate-type = ["rlib"]
 # actually needs (see optimized_libs.rs), so the heavy subsystems below
 # (regex engine, Temporal, URL/IDNA, normalize, segmenter) are *opt-in per
 # app* and absent from binaries that never use them.
-default = ["full", "regex-engine", "temporal", "url-engine", "string-normalize", "intl-segmenter", "intl-namespace", "global-math", "global-json", "global-reflect", "global-atomics", "global-url", "global-text", "global-websocket", "global-webcrypto", "global-webfetch", "proc-ipc", "intl-locale", "intl-datetime", "diagnostics", "mod-dgram", "mod-http2-constants", "mod-node-test", "dyn-eval", "keepalive-anchors", "alloc-mimalloc"]
+default = ["full", "regex-engine", "temporal", "url-engine", "string-normalize", "intl-segmenter", "intl-namespace", "global-math", "global-json", "global-reflect", "global-atomics", "global-url", "global-text", "global-websocket", "global-webcrypto", "global-webfetch", "proc-ipc", "intl-locale", "intl-datetime", "diagnostics", "mod-dgram", "mod-http2-constants", "mod-node-test", "bun-cli-utils", "dyn-eval", "keepalive-anchors", "alloc-mimalloc"]
 # Compile the ~490 `#[used]` keep-alive anchor statics (`KEEP_*`, `keep!`,
 # `K*`/`G*` fn-pointer statics) that pin codegen-facing `#[no_mangle]` entry
 # points so they survive into the staticlib archive. Without these anchors,
@@ -105,6 +105,17 @@ mod-http2-constants = []
 # `process.getBuiltinModule` (whose target is only known at runtime), the same
 # way `mod-http2-constants` does. Pure cfg gate, no extra deps.
 mod-node-test = []
+# Bun's small data/CLI utility pack (#9600): YAML/TOML parsing, node-semver
+# compatible ranges, xxHash64, and zstd decompression. The compiler enables
+# this as a unit whenever the `"bun"` module or the opt-in Bun global is used;
+# unrelated auto-optimized binaries do not compile or link these backends.
+bun-cli-utils = [
+    "dep:node-semver",
+    "dep:toml",
+    "dep:unsafe-libyaml",
+    "dep:xxhash-rust",
+    "dep:zstd",
+]
 # Cold-path diagnostic JSON serializers (~67 KB of code + the `serde_json`
 # pulled only by them, which dead-strips when unreferenced): GC cycle telemetry
 # (`PERRY_GC_DIAG`), typed-feedback trace dump (`PERRY_TYPED_FEEDBACK`), the v8
@@ -310,6 +321,11 @@ lazy_static.workspace = true
 # only on swc + perry-diagnostics — no cycle back into perry-runtime.
 perry-parser = { path = "../perry-parser", optional = true }
 perry-diagnostics = { path = "../perry-diagnostics", optional = true }
+node-semver = { version = "2.2.0", optional = true }
+toml = { workspace = true, optional = true }
+unsafe-libyaml = { version = "0.2.11", optional = true }
+xxhash-rust = { version = "0.8.15", features = ["xxh64"], optional = true }
+zstd = { workspace = true, optional = true }
 
 # TC39 Temporal API (#4686). Pure-Rust date/time engine (the same one V8
 # uses). We write no calendar/duration/timezone math — temporal_rs owns it;
@@ -392,15 +408,21 @@ socket2 = { workspace = true, features = ["all"] }
 # avoid compiling mimalloc's C on that target entirely.
 [target.'cfg(target_pointer_width = "64")'.dependencies]
 mimalloc = { version = "0.1", default-features = false, optional = true }
+# mimalloc's `extended` C API, needed on EVERY 64-bit target (not just Apple)
+# since #9612: the GC's allocator-maintenance step must purge the allocator the
+# process actually uses. `malloc_trim` / `malloc_zone_pressure_relief` address
+# glibc / the macOS malloc zones, and mimalloc is the `#[global_allocator]`
+# here, so those primitives cannot reach the pages a collection just freed.
+# `mi_collect` can. The Apple-only VM-tag retag (#6882) uses the same crate.
+libmimalloc-sys = { version = "0.1", features = ["extended"], optional = true }
 
 # #6882: mimalloc tags its OS mappings with VM tag 100, which macOS tooling
 # (vmmap, Instruments' VM Tracker, `footprint`) decodes as `IOAccelerator` —
 # the entire JS heap renders as GPU-driver memory. `js_gc_init` retags to
 # VM_MEMORY_APPLICATION_SPECIFIC_1 (240) via mi_option_set(mi_option_os_tag),
 # which lives behind libmimalloc-sys's `extended` API. Apple-only: the tag is
-# only consulted by Apple kernels, and mimalloc itself is 64-bit-only (above).
-[target.'cfg(all(target_pointer_width = "64", target_vendor = "apple"))'.dependencies]
-libmimalloc-sys = { version = "0.1", features = ["extended"], optional = true }
+# only consulted by Apple kernels. The dependency itself is declared for every
+# 64-bit target above; this comment records why the *tag* is Apple-only.
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
@@ -449,3 +471,12 @@ sha2 = "0.11"
 # the generated `[u16; 128]` arrays land in the binary. Already vetted in the
 # workspace lock (allsorts / lopdf depend on it).
 encoding_rs = "0.8"
+
+# #9591: OS change notifications behind `fs.watch` / `fsPromises.watch`
+# (inotify / ReadDirectoryChangesW / kqueue), replacing the timer-driven full
+# tree walk. See `fs/dir_glob_watch/watch_backend.rs`. NOT on macOS: notify's
+# FSEvents backend needs `-framework CoreServices` on every link line that
+# retains the watcher (every `fs` importer), which perry keeps off console
+# binaries for launch time; `watch_fsevents.rs` binds FSEvents via dlopen.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+notify.workspace = true

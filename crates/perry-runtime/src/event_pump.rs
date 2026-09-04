@@ -7,7 +7,7 @@
 //! - a cross-thread event source (tokio worker, `std::thread::spawn`)
 //!   calls `js_notify_main_thread` after pushing into a queue that the
 //!   pump drains, or
-//! - the next timer / interval deadline elapses, or
+//! - the next timer, interval, or registered native deadline elapses, or
 //! - a 1-second safety cap elapses (heartbeat).
 //!
 //! Result: cross-thread async-op latency on the event loop drops from
@@ -314,6 +314,25 @@ pub extern "C" fn js_main_thread_notified() -> i32 {
     i32::from(NOTIFIED.load(Ordering::Acquire))
 }
 
+/// Is there JS work the main thread should be running right now — a notify
+/// since the last wait, or a queued microtask? The idle-time reclaim
+/// (`gc/idle_reclaim.rs`) asks this between collector slices so input never
+/// waits behind more than one slice. Does NOT consume the notify; the next
+/// `js_wait_for_event` fast path does.
+pub(crate) fn main_thread_wake_pending() -> bool {
+    NOTIFIED.load(Ordering::Acquire) || unsafe { js_microtasks_pending() } > 0
+}
+
+/// Test-only: forget a notify left behind by an earlier test in the same
+/// process. `NOTIFIED` is process-global (every promise resolution sets it),
+/// and the production path consumes it in `js_wait_for_event`'s fast path
+/// before any park-site work runs; a unit test that drives the park hook
+/// directly needs the same clean slate.
+#[cfg(test)]
+pub(crate) fn clear_main_thread_notified_for_test() {
+    NOTIFIED.store(false, Ordering::Release);
+}
+
 /// Wake the main thread from `js_wait_for_event` (or a future call).
 ///
 /// Safe to call from any thread, including the main thread itself.
@@ -399,7 +418,7 @@ pub(crate) fn js_notify_promise_progress() {
 //   * `perry_poll()`           — drains microtasks + stdlib
 //   * `perry_has_work()`       — true while anything is pending (microtasks,
 //                                timers across all 3 queues, stdlib handles)
-//   * `perry_next_wake_ms()`   — minimum across the 3 timer queues, or -1
+//   * `perry_next_wake_ms()`   — minimum timer/native deadline, or -1
 //
 // Pair with `perry_set_wake_callback` for polling-free integration.
 // ============================================================================
@@ -463,21 +482,30 @@ pub extern "C" fn perry_has_work() -> i32 {
     0
 }
 
-/// Returns the closest pending wake-up across all 3 timer queues, in
-/// milliseconds from now. Returns -1.0 when no timers are scheduled —
-/// the host can then sleep indefinitely (or until an OS event / a wake
-/// callback fires).
+/// Return every source that can put a deadline on the next event-loop park.
+/// The fourth slot is an optional callback rather than a hard stdlib reference,
+/// so runtime-only binaries retain their existing link surface.
+#[inline]
+fn next_wake_sources_ms() -> [f64; 4] {
+    [
+        js_timer_next_deadline(),
+        js_callback_timer_next_deadline(),
+        js_interval_timer_next_deadline(),
+        crate::stdlib_pump::stdlib_next_wake_ms(),
+    ]
+}
+
+/// Returns the closest pending wake-up across all timer queues and registered
+/// stdlib one-shots, in milliseconds from now. Returns -1.0 when no deadline is
+/// scheduled — the host can then sleep indefinitely (or until an OS event / a
+/// wake callback fires).
 ///
 /// NaN is *not* returned — keeps the return shape printable and avoids
 /// surprising hosts that compare with `<`.
 #[no_mangle]
 pub extern "C" fn perry_next_wake_ms() -> f64 {
     let mut best: f64 = -1.0;
-    for d in [
-        js_timer_next_deadline(),
-        js_callback_timer_next_deadline(),
-        js_interval_timer_next_deadline(),
-    ] {
+    for d in next_wake_sources_ms() {
         if d < 0.0 {
             continue;
         }
@@ -507,13 +535,16 @@ pub extern "C" fn js_event_loop_host_driven() -> i32 {
     EVENT_LOOP_HOST_DRIVEN.load(Ordering::Relaxed) as i32
 }
 
-/// Block until the next scheduled timer fires, a notify arrives, or the
-/// 1-second idle cap elapses — whichever is earliest. Returns immediately
-/// if a notify arrived since the last call (the flag is cleared on
-/// return). Replaces the old `js_sleep_ms` in the generated event loop
-/// and `await` busy-wait.
+/// Block until the next scheduled timer/native deadline fires, a notify
+/// arrives, or the 1-second idle cap elapses — whichever is earliest. Returns
+/// immediately if a notify arrived since the last call (the flag is cleared on
+/// return). Replaces the old `js_sleep_ms` in the generated event loop and
+/// `await` busy-wait.
 #[no_mangle]
 pub extern "C" fn js_wait_for_event() {
+    // `PERRY_GC_CENSUS`: one relaxed atomic load; services a pending SIGUSR2
+    // census request on the main thread before parking.
+    crate::gc::census_poll_signal();
     if crate::promise::mt_profile_enabled() {
         PROFILE_WAIT_COUNT.fetch_add(1, Ordering::Relaxed);
     }
@@ -552,11 +583,7 @@ pub extern "C" fn js_wait_for_event() {
     }
 
     let mut budget_ms: u64 = IDLE_CAP_MS;
-    for d in [
-        js_timer_next_deadline(),
-        js_callback_timer_next_deadline(),
-        js_interval_timer_next_deadline(),
-    ] {
+    for d in next_wake_sources_ms() {
         if d >= 0.0 {
             let d_ms = d as u64;
             if d_ms < budget_ms {
@@ -597,6 +624,17 @@ pub extern "C" fn js_wait_for_event() {
         invoke_wait_driver_fast();
         return;
     }
+    // About to park: nothing notified, no microtask queued, no timer due. That
+    // is the runtime's definition of idle, and idle time is the collector's to
+    // use first — finishing a budgeted cycle the pacer left open, or starting
+    // the idle-time old-gen reclaim if one is owed (`gc/idle_reclaim.rs`). The
+    // hook steps in wake-checked slices; when it did work or a wake arrived
+    // the timer budget computed above is stale, so go back around the loop
+    // rather than parking on it. Otherwise park for whatever it left.
+    let budget_ms = match crate::gc::idle_reclaim_park_hook(budget_ms) {
+        crate::gc::ParkVerdict::Resume => return,
+        crate::gc::ParkVerdict::Park(remaining_ms) => remaining_ms,
+    };
     // Unified single-thread async model: when perry-stdlib has installed a
     // wait-driver (i.e. async work exists), drive ONE bounded tick of the
     // current-thread tokio runtime here instead of parking on the condvar. The

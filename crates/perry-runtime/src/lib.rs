@@ -323,9 +323,9 @@ pub use value::{
 pub use value::{
     js_set_handle_array_get, js_set_handle_array_length, js_set_handle_call_method,
     js_set_handle_object_get_property, js_set_handle_to_string, js_set_handle_typeof,
-    js_set_native_async_hooks_construct, js_set_native_crypto_dispatch,
-    js_set_native_domain_dispatch, js_set_native_events_construct, js_set_native_events_dispatch,
-    js_set_native_http_dispatch, js_set_native_module_js_loader,
+    js_set_native_async_hooks_construct, js_set_native_bun_tcp_dispatch,
+    js_set_native_crypto_dispatch, js_set_native_domain_dispatch, js_set_native_events_construct,
+    js_set_native_events_dispatch, js_set_native_http_dispatch, js_set_native_module_js_loader,
     js_set_native_querystring_dispatch, js_set_native_sqlite_dispatch, js_set_native_tls_dispatch,
     js_set_native_webcrypto_dispatch, js_set_native_zlib_dispatch, js_set_new_from_handle_v8,
 };
@@ -367,6 +367,11 @@ pub(crate) mod stdlib_pump {
     use std::sync::Mutex;
 
     static STDLIB_PUMP_FN: AtomicPtr<()> = AtomicPtr::new(null_mut());
+    /// Optional deadline provider for stdlib-owned one-shot work. The callback
+    /// returns milliseconds until its next wake, or -1 when it has no deadline.
+    /// Kept as a function pointer for the same reason as `STDLIB_PUMP_FN`: the
+    /// runtime must not hard-link perry-stdlib into runtime-only binaries.
+    static STDLIB_NEXT_WAKE_FN: AtomicPtr<()> = AtomicPtr::new(null_mut());
 
     // Runtime-internal reactor pumps (child_process, node-pty) register here
     // when their first live handle appears, mirroring `STDLIB_PUMP_FN`. The
@@ -402,6 +407,39 @@ pub(crate) mod stdlib_pump {
                 func();
             }
         }
+    }
+
+    // #9591: the has-active counterpart of `RUNTIME_PUMP_FNS` — armed slots
+    // for runtime-internal subsystems whose live handles must keep the loop
+    // alive, with the same reason for the indirection: a direct call from
+    // `js_stdlib_has_active_handles` into the fs.watch backend would pin the
+    // OS watcher (and its notify dependency) into every binary.
+    const RUNTIME_HAS_ACTIVE_SLOTS: usize = 4;
+    static RUNTIME_HAS_ACTIVE_FNS: [AtomicPtr<()>; RUNTIME_HAS_ACTIVE_SLOTS] = [
+        AtomicPtr::new(null_mut()),
+        AtomicPtr::new(null_mut()),
+        AtomicPtr::new(null_mut()),
+        AtomicPtr::new(null_mut()),
+    ];
+
+    /// Arm runtime has-active slot `slot` with `f` (see `register_runtime_pump`).
+    pub(crate) fn register_runtime_has_active(slot: usize, f: extern "C" fn() -> i32) {
+        if slot >= RUNTIME_HAS_ACTIVE_SLOTS {
+            return;
+        }
+        RUNTIME_HAS_ACTIVE_FNS[slot].store(std::hint::black_box(f as *mut ()), Ordering::Release);
+    }
+
+    fn run_runtime_has_active() -> bool {
+        RUNTIME_HAS_ACTIVE_FNS.iter().any(|slot| {
+            let p = slot.load(Ordering::Acquire);
+            if p.is_null() {
+                return false;
+            }
+            // SAFETY: only `extern "C" fn() -> i32` values are ever stored.
+            let func: extern "C" fn() -> i32 = unsafe { std::mem::transmute(p) };
+            func() != 0
+        })
     }
 
     // #2532 — auxiliary pump / has-active registries.
@@ -482,6 +520,27 @@ pub(crate) mod stdlib_pump {
     #[no_mangle]
     pub extern "C" fn js_register_stdlib_pump(f: extern "C" fn() -> i32) {
         STDLIB_PUMP_FN.store(f as *mut (), Ordering::Release);
+    }
+
+    /// Register the stdlib's nearest-deadline provider. This lets native
+    /// one-shots participate in `js_wait_for_event` without manufacturing a JS
+    /// timer callback or relying on the one-second idle heartbeat.
+    #[no_mangle]
+    pub extern "C" fn js_register_stdlib_next_wake(f: extern "C" fn() -> f64) {
+        STDLIB_NEXT_WAKE_FN.store(f as *mut (), Ordering::Release);
+    }
+
+    /// Milliseconds until the closest registered stdlib deadline, or -1 when
+    /// perry-stdlib is absent or currently owns no timed work.
+    pub(crate) fn stdlib_next_wake_ms() -> f64 {
+        let f = STDLIB_NEXT_WAKE_FN.load(Ordering::Acquire);
+        if f.is_null() {
+            return -1.0;
+        }
+        // SAFETY: `js_register_stdlib_next_wake` only stores callbacks with
+        // this exact ABI and signature.
+        let func: extern "C" fn() -> f64 = unsafe { std::mem::transmute(f) };
+        func()
     }
 
     /// Run the registered stdlib pump if available. Safe to call even if perry-stdlib
@@ -588,6 +647,11 @@ pub(crate) mod stdlib_pump {
         if crate::os::js_process_signal_has_active() != 0 {
             return 1;
         }
+        // #9591: a ref'd `fs.watch` handle / started `fsPromises.watch`
+        // iterator (armed slot, see `register_runtime_has_active`).
+        if run_runtime_has_active() {
+            return 1;
+        }
         // #2532 — a live `perry-ext-*` handle (e.g. a listening HTTP
         // server registered out-of-tree) keeps the loop alive even when
         // perry-stdlib reports none.
@@ -646,6 +710,41 @@ pub(crate) mod stdlib_pump {
                 0,
                 "removing the listener must release the loop again"
             );
+        }
+
+        static HAS_ACTIVE_FLAG: AtomicI32 = AtomicI32::new(0);
+        extern "C" fn flag_has_active() -> i32 {
+            HAS_ACTIVE_FLAG.load(AtomicOrdering::SeqCst)
+        }
+
+        /// #9591: an armed runtime has-active slot keeps the loop alive
+        /// exactly while its callback reports live work — the fs.watch
+        /// backend's liveness reaches the generated event loop through
+        /// this slot, not through a timer.
+        #[test]
+        fn runtime_has_active_slot_gates_the_loop() {
+            crate::os::test_set_stdin_data_listener(None);
+            register_runtime_has_active(RUNTIME_HAS_ACTIVE_SLOTS - 1, flag_has_active);
+            HAS_ACTIVE_FLAG.store(0, AtomicOrdering::SeqCst);
+            assert_eq!(
+                js_stdlib_has_active_handles(),
+                0,
+                "an armed slot reporting 0 must not pin the loop"
+            );
+            HAS_ACTIVE_FLAG.store(1, AtomicOrdering::SeqCst);
+            assert_eq!(
+                js_stdlib_has_active_handles(),
+                1,
+                "an armed slot reporting live work must keep the loop alive"
+            );
+            HAS_ACTIVE_FLAG.store(0, AtomicOrdering::SeqCst);
+            assert_eq!(
+                js_stdlib_has_active_handles(),
+                0,
+                "the loop is released again once the work is gone"
+            );
+            // Out-of-range slots are ignored, never a panic.
+            register_runtime_has_active(RUNTIME_HAS_ACTIVE_SLOTS, flag_has_active);
         }
 
         #[test]

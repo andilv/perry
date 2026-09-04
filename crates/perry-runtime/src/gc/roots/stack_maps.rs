@@ -1996,3 +1996,5 @@ mod decode_tests;
 ))]
 #[path = "stack_maps_walker_agreement.rs"]
 mod walker_agreement;
+
+pub(crate) mod census_rows;

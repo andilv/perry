@@ -1857,6 +1857,33 @@ fn typescript_transpile_subset_lowers_to_native_dispatch_and_enums() {
     );
 }
 
+/// #9602: Bun's runtime compiler surface stays on native calls; neither the
+/// source string nor a plugin object is handed to Perry's JS-module fallback.
+#[test]
+fn bun_transpiler_and_build_lower_to_native_dispatch() {
+    let source = r#"
+        import { Transpiler, build } from "bun";
+        const transpiler = new Transpiler({ loader: "ts" });
+        const output = transpiler.transformSync("const n: number = 1");
+        const imports = transpiler.scanImports("import x from 'pkg'");
+        async function bundle() {
+            return await build({ entrypoints: ["./entry.ts"], target: "bun", format: "esm" });
+        }
+        console.log(output, imports, bundle);
+    "#;
+    let module = perry_parser::parse_typescript(source, "bun-runtime.ts").expect("source parses");
+    let hir = super::lower_module(&module, "bun-runtime", "bun-runtime.ts").expect("source lowers");
+    let dump = format!("{hir:?}");
+    assert!(
+        dump.contains("module: \"bun\"")
+            && dump.contains("class_name: Some(\"Transpiler\")")
+            && dump.contains("method: \"transformSync\"")
+            && dump.contains("method: \"scanImports\"")
+            && dump.contains("method: \"build\""),
+        "Bun runtime compiler APIs must use native dispatch: {dump}"
+    );
+}
+
 /// #8882: a module-level class constructing a sibling class that is declared
 /// inside a function body lowered LATER. This is the shape the CJS wrap
 /// produces for Next's `server/lib/lru-cache.js`: `LRUCache` is hoisted out of
@@ -1946,35 +1973,4 @@ fn unresolved_new_names_the_identifier_and_defers_to_a_runtime_global_lookup() {
 mod capture_stash;
 mod mixin_parent_chain;
 
-/// `const masks = opts?.masks ?? null` must not be declared `Null`. The
-/// AST-level `??` rule used to answer the right operand's type whenever the
-/// left inferred `Any` — and an optional chain always does — so the binding
-/// was typed `Null`, which downstream read as "holds no pointer".
-#[test]
-fn nullish_coalescing_over_an_optional_chain_is_not_typed_by_its_right_operand() {
-    let source = r#"
-        function add(opts: { masks: number[] } | null) {
-            const masks = opts?.masks ?? null;
-            return masks;
-        }
-    "#;
-    let module = perry_parser::parse_typescript(source, "coalesce.ts").expect("source parses");
-    let hir = super::lower_module(&module, "coalesce", "coalesce.ts").expect("source lowers");
-    let add = hir
-        .functions
-        .iter()
-        .find(|f| f.name == "add")
-        .expect("`add` lowers");
-    let masks_ty = add
-        .body
-        .iter()
-        .find_map(|stmt| match stmt {
-            Stmt::Let { name, ty, .. } if name == "masks" => Some(ty),
-            _ => None,
-        })
-        .expect("`masks` lowers to a Let");
-    assert!(
-        !matches!(masks_ty, Type::Null | Type::Void),
-        "`opts?.masks ?? null` is an array on the non-null path; got {masks_ty:?}"
-    );
-}
+mod nullish_over_optional_chain;

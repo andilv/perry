@@ -20,7 +20,13 @@
 //! - `Bun.hash` is Zig-std Wyhash (see `wyhash.rs`) returning a BigInt, so
 //!   `.toString(16)` cache keys match bun-run installs.
 
+mod ant;
+#[cfg(feature = "bun-cli-utils")]
+mod cli_utils;
+#[cfg(not(feature = "bun-cli-utils"))]
+mod cli_utils_stub;
 mod glob;
+mod spawn;
 mod string_width;
 mod width_tables;
 mod wyhash;
@@ -36,7 +42,13 @@ use crate::string::{js_string_from_bytes, StringHeader};
 use crate::value::{js_jsvalue_to_string, JSValue};
 use std::io::{Read, Write};
 
+pub use ant::{js_bun_ant_get_peer_pid, js_bun_ant_get_peer_uid, js_bun_ant_memory_pressure_level};
+#[cfg(feature = "bun-cli-utils")]
+pub use cli_utils::*;
+#[cfg(not(feature = "bun-cli-utils"))]
+pub use cli_utils_stub::*;
 pub use glob::js_bun_glob_new;
+pub use spawn::{js_bun_spawn, js_bun_terminal_new};
 pub use string_width::bun_string_width;
 pub use wyhash::wyhash;
 
@@ -281,6 +293,13 @@ fn mime_type_for_path(path: &str) -> &'static str {
 }
 
 fn read_file_or_reject(path: &str) -> Result<Vec<u8>, f64> {
+    if let Some(bytes) = crate::embedded::lookup(path) {
+        return Ok(bytes.to_vec());
+    }
+    if crate::embedded::is_virtual_path(path) {
+        let error = std::io::Error::new(std::io::ErrorKind::NotFound, "virtual file not found");
+        return Err(unsafe { crate::fs::build_fs_error_value(&error, "open", path) });
+    }
     std::fs::read(path)
         .map_err(|err| unsafe { crate::fs::build_fs_error_value(&err, "open", path) })
 }
@@ -319,11 +338,16 @@ extern "C" fn bun_file_bytes(closure: *const ClosureHeader) -> f64 {
 
 extern "C" fn bun_file_exists(closure: *const ClosureHeader) -> f64 {
     let path = value_to_string(captured(closure));
-    promise_value(bool_value(
+    let exists = if crate::embedded::lookup(&path).is_some() {
+        true
+    } else if crate::embedded::is_virtual_path(&path) {
+        false
+    } else {
         std::fs::metadata(&path)
-            .map(|m| m.is_file())
-            .unwrap_or(false),
-    ))
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false)
+    };
+    promise_value(bool_value(exists))
 }
 
 fn json_parse_promise(bytes: &[u8]) -> f64 {
@@ -368,9 +392,15 @@ pub extern "C" fn js_bun_file(path: f64) -> f64 {
     let obj = js_object_alloc(0, 9);
     set_field(obj, BUN_FILE_PATH_KEY, path_value);
     set_field(obj, b"name", path_value);
-    let size = std::fs::metadata(&path_string)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let size = if let Some(bytes) = crate::embedded::lookup(&path_string) {
+        bytes.len() as u64
+    } else if crate::embedded::is_virtual_path(&path_string) {
+        0
+    } else {
+        std::fs::metadata(&path_string)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+    };
     set_field(obj, b"size", size as f64);
     set_field(
         obj,

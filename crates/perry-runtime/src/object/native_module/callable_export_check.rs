@@ -35,6 +35,38 @@ pub(crate) fn is_native_module_callable_export_reference(module: &str, prop: &st
     if module == "fs" && matches!(prop, "lchmod" | "lchmodSync") {
         return crate::fs::lchmod_is_callable_on_this_platform();
     }
+    if module == "bun"
+        && matches!(
+            prop,
+            "Glob"
+                | "Terminal"
+                | "Transpiler"
+                | "build"
+                | "connect"
+                | "deepEquals"
+                | "file"
+                | "fileURLToPath"
+                | "gc"
+                | "generateHeapSnapshot"
+                | "hash"
+                | "listen"
+                | "pathToFileURL"
+                | "serve"
+                | "spawn"
+                | "stringWidth"
+                | "stripANSI"
+                | "which"
+                | "wrapAnsi"
+                | "write"
+                | "zstdDecompress"
+                | "zstdDecompressSync"
+        )
+    {
+        return true;
+    }
+    if module == "bun.ant" && matches!(prop, "getPeerPid" | "getPeerUid" | "memoryPressureLevel") {
+        return true;
+    }
     // bun:ffi (#6562). `FFIType` and `suffix` are constants, not callables;
     // the not-yet-supported exports are callable so they throw their
     // stage-1 error instead of "undefined is not a function".

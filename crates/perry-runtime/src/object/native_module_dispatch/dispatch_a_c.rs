@@ -272,14 +272,64 @@ pub(crate) unsafe fn nm_dispatch_bun(ctx: &NmCtx, module_name: &str, method_name
         typed_kind
     );
     match (module_name, method_name) {
+        ("bun", "spawn") => crate::bun_compat::js_bun_spawn(arg(0), arg(1)),
+        ("bun", "Terminal") => crate::bun_compat::js_bun_terminal_new(arg(0)),
+        ("bun", "serve") => {
+            let ptr =
+                crate::value::JS_NATIVE_HTTP_DISPATCH.load(std::sync::atomic::Ordering::SeqCst);
+            if ptr.is_null() {
+                f64::from_bits(JSValue::undefined().bits())
+            } else {
+                let dispatch: unsafe extern "C" fn(
+                    *const u8,
+                    usize,
+                    *const u8,
+                    usize,
+                    *const f64,
+                    usize,
+                ) -> f64 = std::mem::transmute(ptr);
+                dispatch(
+                    module_name.as_ptr(),
+                    module_name.len(),
+                    method_name.as_ptr(),
+                    method_name.len(),
+                    args_ptr,
+                    args_len,
+                )
+            }
+        }
+        ("bun", "listen" | "connect") => {
+            let ptr =
+                crate::value::JS_NATIVE_BUN_TCP_DISPATCH.load(std::sync::atomic::Ordering::SeqCst);
+            if ptr.is_null() {
+                f64::from_bits(JSValue::undefined().bits())
+            } else {
+                let dispatch: unsafe extern "C" fn(*const u8, usize, *const f64, usize) -> f64 =
+                    std::mem::transmute(ptr);
+                dispatch(method_name.as_ptr(), method_name.len(), args_ptr, args_len)
+            }
+        }
         ("bun", "stringWidth") => crate::bun_compat::js_bun_string_width(arg(0), arg(1)),
         ("bun", "hash") => crate::bun_compat::js_bun_hash(arg(0), arg(1)),
+        ("bun", "deepEquals") => crate::bun_compat::js_bun_deep_equals(arg(0), arg(1), arg(2)),
+        ("bun", "stripANSI") => crate::bun_compat::js_bun_strip_ansi(arg(0)),
+        ("bun", "wrapAnsi") => crate::bun_compat::js_bun_wrap_ansi(arg(0), arg(1), arg(2)),
+        ("bun", "which") => crate::bun_compat::js_bun_which(arg(0), arg(1)),
+        ("bun", "zstdDecompress") => crate::bun_compat::js_bun_zstd_decompress(arg(0)),
+        ("bun", "zstdDecompressSync") => crate::bun_compat::js_bun_zstd_decompress_sync(arg(0)),
+        ("bun", "gc") => crate::bun_compat::js_bun_gc(arg(0)),
+        ("bun", "generateHeapSnapshot") => {
+            crate::bun_compat::js_bun_generate_heap_snapshot(arg(0), arg(1))
+        }
         ("bun", "file") => crate::bun_compat::js_bun_file(arg(0)),
         ("bun", "write") => crate::bun_compat::js_bun_write(arg(0), arg(1)),
         ("bun", "Glob") => crate::bun_compat::js_bun_glob_new(arg(0)),
         ("bun", "unsupported") => crate::bun_compat::js_bun_unsupported(arg(0)),
         ("bun", "pathToFileURL") => crate::url::js_url_path_to_file_url(arg(0), arg(1)),
         ("bun", "fileURLToPath") => crate::url::js_url_file_url_to_path(arg(0), arg(1)),
+        ("bun.ant", "getPeerUid") => crate::bun_compat::js_bun_ant_get_peer_uid(arg(0)),
+        ("bun.ant", "getPeerPid") => crate::bun_compat::js_bun_ant_get_peer_pid(arg(0)),
+        ("bun.ant", "memoryPressureLevel") => crate::bun_compat::js_bun_ant_memory_pressure_level(),
         _ => f64::from_bits(JSValue::undefined().bits()),
     }
 }

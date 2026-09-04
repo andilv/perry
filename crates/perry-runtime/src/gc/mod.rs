@@ -47,6 +47,17 @@ mod heap_budget;
 pub(crate) use heap_budget::*;
 mod pressure;
 pub use pressure::*;
+mod idle_reclaim;
+pub use idle_reclaim::{
+    idle_reclaim_attempts, idle_reclaim_backoff_shift, idle_reclaim_completions,
+    idle_reclaim_enabled_from_value, idle_reclaim_freed_bytes, idle_reclaim_old_reclaimed_bytes,
+    idle_reclaim_post_purges, idle_reclaim_productive, idle_reclaim_slices,
+    idle_reclaim_start_blocked, idle_reclaim_work_capped, idle_reclaim_yields,
+    IDLE_RECLAIM_MAX_BACKOFF_SHIFT, IDLE_RECLAIM_MAX_WORK_MS_PER_SECOND,
+    IDLE_RECLAIM_MIN_INTERVAL_MS, IDLE_RECLAIM_PRODUCTIVE_MIN_BYTES, IDLE_RECLAIM_PRODUCTIVE_PCT,
+    IDLE_RECLAIM_QUIET_MS, IDLE_RECLAIM_SLICE_US,
+};
+pub(crate) use idle_reclaim::{park_hook as idle_reclaim_park_hook, ParkVerdict};
 mod telemetry;
 pub use telemetry::*;
 mod malloc;
@@ -222,8 +233,11 @@ pub use schedule::{
     schedule_polls_paced,
 };
 pub use verify::*;
+/// Env-gated heap census (`PERRY_GC_CENSUS`); off by default.
+pub(crate) mod census;
 #[cfg(feature = "diagnostics")]
 mod heap_snapshot;
+pub use census::{census_poll_signal, gc_census_enabled};
 #[cfg(feature = "diagnostics")]
 pub use heap_snapshot::gc_build_v8_heap_snapshot_json;
 
@@ -868,6 +882,9 @@ pub fn gc_init() {
         return;
     }
     crate::perf_hooks::init_time_origin();
+    // `PERRY_GC_CENSUS`: remember the main thread and install the SIGUSR2
+    // trigger. No-op (one OnceLock read) when the env var is unset.
+    census::census_on_gc_init();
     reg_budgeted_scanner!(
         scan_runtime_handle_roots_mut,
         scan_runtime_handle_roots_mut_step,
@@ -958,6 +975,16 @@ pub fn gc_init() {
     reg_scanner!(crate::bun_ffi::scan_bun_ffi_roots_mut);
     #[cfg(feature = "node-api-host")]
     reg_scanner!(crate::node_api_host::scan_node_api_roots_mut);
+    // #9611: `WebAssembly.Memory.prototype.buffer` is a foreign-backed wrapper
+    // over the engine's linear memory, and the wasm binding table keys it by
+    // address so an import boundary can re-point it after a `memory.grow`.
+    // Metadata-only: the buffer's real owner is the Memory object.
+    #[cfg(feature = "wasm-host")]
+    reg_scanner!(crate::webassembly::scan_wasm_memory_binding_roots_mut);
+    // The imports object a wasm instance was created with. The host holds only
+    // an opaque token for it, so this table is what a collection rewrites.
+    #[cfg(feature = "wasm-host")]
+    reg_scanner!(crate::webassembly::scan_wasm_import_object_roots_mut);
     reg_budgeted_scanner!(
         crate::object::scan_class_side_table_roots_mut,
         crate::object::scan_class_side_table_roots_mut_step,
@@ -1292,6 +1319,7 @@ fn emit_incremental_liveness_diag() {
         poll_arm::poll_arm_events(),
         poll_arm::poll_armed_count(),
     );
+    idle_reclaim::emit_diag();
     emit_step_bounds_diag();
     emit_gc_time_share_diag();
 }

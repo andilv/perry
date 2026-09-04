@@ -109,7 +109,7 @@ macro_rules! thunk {
 }
 
 pub(crate) mod blob;
-mod consumers;
+pub(crate) mod consumers;
 mod fs_promises;
 mod hono_jsx;
 mod stream_promises;
@@ -128,6 +128,7 @@ use hono_jsx::{
     thunk_hono_render_to_readable_stream, thunk_hono_suspense,
 };
 
+pub(crate) use consumers::{consume_array_buffer, consume_bytes, consume_json, consume_text};
 use consumers::{
     thunk_consumers_arrayBuffer, thunk_consumers_blob, thunk_consumers_buffer,
     thunk_consumers_bytes, thunk_consumers_json, thunk_consumers_text,
