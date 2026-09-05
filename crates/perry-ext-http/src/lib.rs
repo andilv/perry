@@ -109,7 +109,7 @@ use bytes::Bytes;
 use lazy_static::lazy_static;
 use perry_ffi::{
     alloc_string, gc_register_mutable_root_scanner_named, get_handle_mut, iter_handles_of_mut,
-    json_stringify, notify_main_thread, register_handle,
+    json_stringify, notify_main_thread, register_aux_event_pump, register_handle,
     spawn_blocking_with_reactor as spawn_blocking, with_handle_mut, ArrayHeader, GcRootVisitor,
     Handle, JsClosure, JsString, JsValue, ObjectHeader, RawClosureHeader, StringHeader,
 };
@@ -216,15 +216,11 @@ pub(crate) enum PendingHttpEvent {
 /// reqwest task spawned per `http.request`/`http.get`, from dispatch until the
 /// response fully streams or errors).
 ///
-/// `EXT_BLOCKING_TASKS_INFLIGHT` (perry-stdlib's idle-kick / active-handle gate)
+/// `EXT_BLOCKING_TASKS_INFLIGHT` (perry-stdlib's blocking-task gate)
 /// only stays up for the SHORT outer `spawn_blocking` closure that *launches* the
 /// reqwest task and returns; it drops to 0 while the actual fetch is still in
-/// flight. So the runtime's idle-kick never fires during a fetch, and a lost
-/// tokio worker-unpark for the reqwest task (the canonical failure under a
-/// `Promise.all` burst of fetches) is never recovered — the main thread parks
-/// forever with the responses received but undelivered. This counter, exposed via
-/// [`js_ext_http_client_inflight`], lets the idle-kick + active-handle gate honor
-/// a fetch's TRUE lifetime so a stranded reqwest task gets roused.
+/// flight. Registering this counter as a keepalive contributor lets the runtime
+/// gate and fast wait-driver honor the request's true lifetime.
 static CLIENT_REQUESTS_INFLIGHT: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<Handle>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
@@ -256,7 +252,7 @@ impl Drop for ClientInflightGuard {
     }
 }
 
-/// Exposed for perry-stdlib's idle-kick + active-handle gate (#5779 follow-up):
+/// Registered with the runtime's extension keepalive gate (#5779 follow-up):
 /// returns nonzero while any HTTP client fetch is outstanding.
 #[no_mangle]
 pub extern "C" fn js_ext_http_client_inflight() -> i32 {
@@ -318,10 +314,36 @@ pub(crate) fn apply_node_proxy_policy(builder: reqwest::ClientBuilder) -> reqwes
     }
 }
 
-/// A default reqwest client with the Node-conformant proxy policy applied.
+/// Apply the process-wide Node TLS environment after the HTTP proxy/redirect
+/// policy. Explicit per-request TLS options use `TlsOptions::build_client`
+/// instead, but both paths consume the same perry-ffi resolver.
+pub(crate) fn apply_node_client_policy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    let mut builder = apply_node_proxy_policy(builder);
+    let environment = perry_ffi::node_tls_client_environment();
+    if environment.accepts_invalid_certificates() {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    for pem in environment.ca_pems() {
+        match reqwest::Certificate::from_pem_bundle(pem) {
+            Ok(certificates) => {
+                for certificate in certificates {
+                    builder = builder.add_root_certificate(certificate);
+                }
+            }
+            Err(_) => {
+                if let Ok(certificate) = reqwest::Certificate::from_pem(pem) {
+                    builder = builder.add_root_certificate(certificate);
+                }
+            }
+        }
+    }
+    builder
+}
+
+/// A default reqwest client with the Node-conformant client policy applied.
 /// Used as the fallback when a customized builder fails to build.
 pub(crate) fn default_client() -> reqwest::Client {
-    apply_node_proxy_policy(reqwest::Client::builder())
+    apply_node_client_policy(reqwest::Client::builder())
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }
@@ -347,7 +369,7 @@ lazy_static! {
     /// Shared HTTP client — reuses connection pool, DNS cache, TLS
     /// session cache. Without this each request allocs a fresh
     /// reqwest::Client (~250 KB) and the memory never gets reused.
-    pub(crate) static ref HTTP_CLIENT: reqwest::Client = apply_node_proxy_policy(
+    pub(crate) static ref HTTP_CLIENT: reqwest::Client = apply_node_client_policy(
         reqwest::Client::builder()
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .pool_max_idle_per_host(16)
@@ -359,31 +381,32 @@ lazy_static! {
 
 static HTTP_GC_REGISTERED: Once = Once::new();
 
+extern "C" fn client_pump() -> i32 {
+    unsafe { js_http_process_pending() }
+}
+
+extern "C" fn client_has_active() -> i32 {
+    let pending = HTTP_PENDING_EVENTS
+        .lock()
+        .map(|queue| !queue.is_empty())
+        .unwrap_or(false);
+    i32::from(pending || js_ext_http_client_inflight() != 0)
+}
+
 pub(crate) fn ensure_gc_scanner_registered() {
     HTTP_GC_REGISTERED.call_once(|| {
         gc_register_mutable_root_scanner_named("perry-ext-http", scan_http_roots);
-        // #2532 — register the client response/error pump with perry-runtime
-        // directly so `http.request` / `http.get` callbacks fire in an
-        // out-of-tree install (prebuilt full stdlib has the
-        // `external-http-client-pump` arm compiled out). No separate
-        // has-active is needed: the in-flight request is a perry-ffi async
-        // op, which `js_native_async_has_active` already keeps the loop alive
-        // for. Idempotent on the runtime side.
+        // Register both halves directly with perry-runtime. The stdlib bridge
+        // intentionally does not name extension symbols: a client contributes
+        // only after this crate is linked and one of its entry points runs.
+        register_aux_event_pump(client_pump, client_has_active);
         extern "C" {
-            fn js_register_aux_pump(f: extern "C" fn() -> i32);
             fn js_register_http_agent_handle_probe(f: unsafe extern "C" fn(i64) -> bool);
         }
         unsafe extern "C" fn http_agent_probe(handle: i64) -> bool {
             agent::js_ext_http_agent_is_handle(handle) != 0
         }
-        // `js_http_process_pending` is an `unsafe extern "C" fn`; the
-        // registry takes a safe `extern "C" fn`, so route through a thin
-        // safe shim.
-        extern "C" fn client_pump() -> i32 {
-            unsafe { js_http_process_pending() }
-        }
         unsafe {
-            js_register_aux_pump(client_pump);
             js_register_http_agent_handle_probe(http_agent_probe);
         }
     });
@@ -853,7 +876,7 @@ unsafe fn attach_tls_options(handle: Handle, opts_f64: f64) {
         }
     }
     let authorized = tls.reject_unauthorized != Some(false)
-        && !tls_client::node_tls_reject_unauthorized_disabled();
+        && !perry_ffi::node_tls_client_environment().accepts_invalid_certificates();
     let servername = tls.servername.as_ref().or(fallback_servername.as_ref());
     let (servername_ptr, servername_len) = servername
         .map(|value| (value.as_ptr(), value.len()))

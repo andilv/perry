@@ -8,7 +8,7 @@
 //! * **Function-name registration** (`codegen/artifacts.rs`). Every inline
 //!   closure carrying a HIR display name mints a rodata constant through
 //!   `add_string_constant` — whose `@.str.N` counter numbers in first-use order
-//!   — and emits one `js_register_function_name` call into
+//!   — and emits one `js_register_function_name_static` call into
 //!   `__perry_init_strings_*`. Iterating `hir.closure_display_names` permuted
 //!   both. (#7038 fixed the identical defect in the `closure_source_text` loop
 //!   directly below it and left this one standing.)
@@ -166,8 +166,15 @@ fn ir(module: &Module) -> String {
         .expect("LLVM IR should be UTF-8")
 }
 
+fn ir_for_output_type(module: &Module, output_type: &str) -> String {
+    let mut opts = ir_opts();
+    opts.output_type = output_type.to_string();
+    String::from_utf8(compile_module(module, opts).expect("codegen should succeed"))
+        .expect("LLVM IR should be UTF-8")
+}
+
 // ---------------------------------------------------------------------------
-// Shape 1: `js_register_function_name` / `@.str.N`
+// Shape 1: `js_register_function_name_static` / `@.str.N`
 // ---------------------------------------------------------------------------
 
 /// `let _fK = () => {}` for `K` in `0..N`, each carrying a HIR display name.
@@ -207,10 +214,10 @@ fn closure_display_module() -> Module {
     m
 }
 
-/// The `func_id` of every `js_register_function_name` call, in emission order.
+/// The `func_id` of every `js_register_function_name_static` call, in emission order.
 fn registered_closure_ids(ir: &str) -> Vec<u32> {
     ir.lines()
-        .filter(|l| l.contains("call void @js_register_function_name("))
+        .filter(|l| l.contains("call void @js_register_function_name_static("))
         .filter_map(|l| {
             let at = l.find("@perry_closure_")?;
             let rest = &l[at..];
@@ -227,14 +234,14 @@ fn closure_display_names_are_emitted_in_func_id_order() {
     assert_eq!(
         ids.len(),
         N as usize,
-        "expected one js_register_function_name per closure display name; \
+        "expected one js_register_function_name_static per closure display name; \
          the fixture stopped exercising the emission path"
     );
     let mut sorted = ids.clone();
     sorted.sort_unstable();
     assert_eq!(
         ids, sorted,
-        "js_register_function_name calls must be emitted in FuncId order, not \
+        "js_register_function_name_static calls must be emitted in FuncId order, not \
          `hir.closure_display_names` hash order (#7622)"
     );
 }
@@ -247,7 +254,7 @@ fn closure_display_name_emission_is_run_to_run_deterministic() {
     let first = ir(&closure_display_module());
     let second = ir(&closure_display_module());
     assert!(
-        first.contains("call void @js_register_function_name("),
+        first.contains("call void @js_register_function_name_static("),
         "liveness: fixture emitted no function-name registrations"
     );
     assert_eq!(
@@ -438,4 +445,50 @@ fn dispatch_tower_emission_is_run_to_run_deterministic() {
         first, second,
         "two compiles of the same module must emit byte-identical IR (#7622)"
     );
+}
+
+/// #9188 follow-up: the borrowing (`_static`) registration spelling lends the
+/// registry a `@.str.N` constant in THIS image's rodata, and neither registry
+/// has an unregister path. That is sound only while the image stays mapped.
+///
+/// An executable qualifies. A `dylib` does not: perry compiles TypeScript to a
+/// plugin (`codegen/entry.rs` emits its `perry_plugin_abi_version` /
+/// `plugin_activate` shim) and `perry_plugin_unload` ends in `dlclose`, which
+/// unmaps that rodata underneath the borrowed entries — after which the next
+/// `fn.name` / `fn.toString()` / stack frame that resolved one would read
+/// unmapped memory, or, since the registries are address-keyed, whatever image
+/// was later mapped over the same range.
+///
+/// So the spelling must follow the output kind, in BOTH directions: losing the
+/// executable's `_static` silently restores the startup copy this optimisation
+/// removed, and losing the dylib's copy reintroduces the use-after-free.
+#[test]
+fn registration_spelling_follows_output_kind() {
+    let module = closure_display_module();
+
+    let executable = ir_for_output_type(&module, "executable");
+    assert!(
+        executable.contains("call void @js_register_function_name_static("),
+        "an executable outlives its own registry and must keep the borrow"
+    );
+    assert!(
+        !executable.contains("call void @js_register_function_name("),
+        "an executable must not pay the startup copy this optimisation removed"
+    );
+
+    for unloadable in ["dylib", "staticlib"] {
+        let ir = ir_for_output_type(&module, unloadable);
+        assert!(
+            ir.contains("call void @js_register_function_name("),
+            "{unloadable} can be unloaded, so its names must be COPIED into the registry"
+        );
+        assert!(
+            !ir.contains("call void @js_register_function_name_static("),
+            "{unloadable} must not lend rodata that `dlclose` will unmap"
+        );
+        assert!(
+            !ir.contains("call void @js_register_function_source_static("),
+            "{unloadable} must not lend source text that `dlclose` will unmap"
+        );
+    }
 }

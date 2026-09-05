@@ -703,6 +703,9 @@ struct MinorCycleContext {
     malloc_sweep_due: bool,
     evacuation_policy_allowed: bool,
     force_evacuation: bool,
+    /// The idle-time compaction's own collection: exempt from the
+    /// pause-budget gate, since nothing is waiting on it.
+    idle_compaction: bool,
     evacuation_policy_disabled_reason: &'static str,
     old_page_selection: OldPageDefragSelection,
     old_page_source_blocks: crate::arena::OldArenaSourceBlockSelection,
@@ -923,6 +926,7 @@ impl GcCycleState {
                 malloc_sweep_due,
                 evacuation_policy_allowed,
                 force_evacuation,
+                idle_compaction: matches!(trigger_kind, GcTriggerKind::IdleCompact),
                 evacuation_policy_disabled_reason,
                 old_page_selection,
                 old_page_source_blocks,
@@ -1102,6 +1106,7 @@ impl GcCycleState {
                 active_elapsed_us,
                 minor.evacuation_policy_allowed,
                 minor.force_evacuation,
+                minor.idle_compaction,
                 minor.evacuation_policy_disabled_reason,
                 old_to_young_tracking_complete(),
                 minor.old_page_selection.selected_pages,
@@ -1705,7 +1710,10 @@ impl GcCycleState {
                 // per-object finalizers. Minor traces never mark the old
                 // generation, so deadness there is only trusted for
                 // untenured nursery headers.
-                .with_dead_collection_finalize(full_trace),
+                .with_dead_collection_finalize(
+                    full_trace,
+                    full_trace && !self.progress_kind.is_budgeted(),
+                ),
             );
         }
         let done = self
@@ -1951,7 +1959,7 @@ impl GcCycleState {
         // #7865: arena-growth pacing tests a POST-collection occupancy, which
         // is the same kind of quantity as its post-full baseline. Recorded here
         // rather than per-kind because this is the one site both kinds reach.
-        super::policy::note_collection_finished_arena_occupancy();
+        super::policy::note_collection_finished_arena_occupancy(self.minor.is_none());
         if self.minor.is_none() {
             finish_full_old_reclaim_baseline();
         }
@@ -1986,13 +1994,5 @@ impl Drop for GcCycleState {
     }
 }
 
-pub(super) fn restore_minor_in_alloc(prev_in_alloc: u8) {
-    GC_FLAGS.with(|f| {
-        let cur = f.get();
-        if prev_in_alloc != 0 {
-            f.set(cur | GC_FLAG_IN_ALLOC);
-        } else {
-            f.set(cur & !GC_FLAG_IN_ALLOC);
-        }
-    });
-}
+mod alloc_flag;
+pub(super) use alloc_flag::restore_minor_in_alloc;

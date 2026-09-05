@@ -1585,17 +1585,39 @@ pub fn linearize_body(
             // catch-all and was emitted unsplit). `break label` / `continue
             // label` that target this loop from its own body level are first
             // rewritten to plain break/continue, which the loop's own
-            // linearization then maps to its state targets. (Labeled
-            // break/continue from a *nested* loop is left unconverted — the
-            // single-sentinel scheme can't yet distinguish targets; this was
-            // already unsupported before this arm existed, so no regression.)
+            // linearization then maps to its state targets. A labeled
+            // completion that escapes a *nested* loop cannot be rewritten that
+            // way — a plain completion there would bind to the nested loop —
+            // so it is unwound through a carrier local first (#9199), and the
+            // single break/continue sentinel per loop never has to name a
+            // distant target.
             Stmt::Labeled { label, body } if body_contains_yield(std::slice::from_ref(&**body)) => {
                 let mut inner = (**body).clone();
                 match &mut inner {
                     Stmt::For { body, .. }
                     | Stmt::While { body, .. }
                     | Stmt::DoWhile { body, .. } => {
+                        super::break_continue::desugar_labeled_escape_across_nested_loops(
+                            body,
+                            label,
+                            next_local_id,
+                        );
                         rewrite_labeled_bc_in_stmts(body, label, next_local_id);
+                    }
+                    // A statically-typed array `for...of` lowers to a runtime
+                    // `ArrayIterationPatched` guard whose two branches contain
+                    // the iterator-protocol and indexed loops, respectively.
+                    // The source label still targets either generated loop,
+                    // but wrapping the guard means neither loop sees the label
+                    // directly. Rewrite the completions in both loop bodies
+                    // before the guard is split into generator states (#9198).
+                    Stmt::If {
+                        condition: Expr::ArrayIterationPatched,
+                        then_branch,
+                        else_branch: Some(else_branch),
+                    } => {
+                        rewrite_labeled_bc_in_lowered_for_of_arm(then_branch, label, next_local_id);
+                        rewrite_labeled_bc_in_lowered_for_of_arm(else_branch, label, next_local_id);
                     }
                     // A labeled yielding SWITCH: `break label` at case-body
                     // level is the switch's own break — rewrite it to plain
@@ -1603,6 +1625,11 @@ pub fn linearize_body(
                     // into the done-flag (#5868).
                     Stmt::Switch { cases, .. } => {
                         for case in cases.iter_mut() {
+                            super::break_continue::desugar_labeled_escape_across_nested_loops(
+                                &mut case.body,
+                                label,
+                                next_local_id,
+                            );
                             rewrite_labeled_bc_in_stmts(&mut case.body, label, next_local_id);
                         }
                     }
@@ -1663,6 +1690,30 @@ pub fn linearize_body(
             other => {
                 current.push(other.clone());
             }
+        }
+    }
+}
+
+/// Rewrite completions targeting a source label in one branch of the
+/// `ArrayIterationPatched` for-of guard. Each branch consists of setup
+/// statements followed by the generated loop; nested loops in the user's body
+/// remain boundaries inside [`rewrite_labeled_bc_in_stmts`].
+fn rewrite_labeled_bc_in_lowered_for_of_arm(
+    stmts: &mut [Stmt],
+    label: &str,
+    next_local_id: &mut u32,
+) {
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            Stmt::For { body, .. } | Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+                super::break_continue::desugar_labeled_escape_across_nested_loops(
+                    body,
+                    label,
+                    next_local_id,
+                );
+                rewrite_labeled_bc_in_stmts(body, label, next_local_id);
+            }
+            _ => {}
         }
     }
 }

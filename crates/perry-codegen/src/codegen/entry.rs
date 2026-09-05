@@ -968,11 +968,7 @@ pub(super) fn compile_module_entry(
             class_keys_slots: HashMap::new(),
             class_shape_slots: HashMap::new(),
             class_header_images: HashMap::new(),
-            cached_lengths: HashMap::new(),
             array_length_snapshots: HashMap::new(),
-            bounded_index_pairs: Vec::new(),
-            packed_f64_loop_facts: Vec::new(),
-            masked_window_array_facts: Vec::new(),
             string_window_array_facts: Vec::new(),
             masked_region_scalar_locals: std::collections::HashSet::new(),
             suppressed_cleared_shadow_slots: std::collections::HashSet::new(),
@@ -1085,7 +1081,6 @@ pub(super) fn compile_module_entry(
             property_get_ic_override: None,
             typed_parse_rodata: Vec::new(),
             buffer_data_slots: HashMap::new(),
-            buffer_view_slots: HashMap::new(),
             native_arena_owner_aliases: HashMap::new(),
             native_arena_ambiguous_owner_aliases: HashSet::new(),
             disable_buffer_fast_path: cross_module.disable_buffer_fast_path,
@@ -1431,11 +1426,7 @@ pub(super) fn compile_module_entry(
             llmod.declare_function(&name, ret, &params);
         }
         for ic_name in &ic_globals {
-            llmod.add_raw_global(format!(
-                "@{} = private global [{} x i64] zeroinitializer",
-                ic_name,
-                crate::expr::property_get::generic_dispatch::PIC_CACHE_WORDS
-            ));
+            llmod.add_raw_global(crate::expr::inline_cache_global_definition(ic_name));
         }
         for raw in &typed_parse_rodata {
             llmod.add_raw_global(raw.clone());
@@ -1767,11 +1758,7 @@ pub(super) fn compile_module_entry(
             class_keys_slots: HashMap::new(),
             class_shape_slots: HashMap::new(),
             class_header_images: HashMap::new(),
-            cached_lengths: HashMap::new(),
             array_length_snapshots: HashMap::new(),
-            bounded_index_pairs: Vec::new(),
-            packed_f64_loop_facts: Vec::new(),
-            masked_window_array_facts: Vec::new(),
             string_window_array_facts: Vec::new(),
             masked_region_scalar_locals: std::collections::HashSet::new(),
             suppressed_cleared_shadow_slots: std::collections::HashSet::new(),
@@ -1884,7 +1871,6 @@ pub(super) fn compile_module_entry(
             property_get_ic_override: None,
             typed_parse_rodata: Vec::new(),
             buffer_data_slots: HashMap::new(),
-            buffer_view_slots: HashMap::new(),
             native_arena_owner_aliases: HashMap::new(),
             native_arena_ambiguous_owner_aliases: HashSet::new(),
             disable_buffer_fast_path: cross_module.disable_buffer_fast_path,
@@ -1969,11 +1955,7 @@ pub(super) fn compile_module_entry(
         // A dylib's top-level plugin exports live in its entry module, and the
         // three symbols must be defined exactly once per shared library.
         for ic_name in &ic_globals {
-            llmod.add_raw_global(format!(
-                "@{} = private global [{} x i64] zeroinitializer",
-                ic_name,
-                crate::expr::property_get::generic_dispatch::PIC_CACHE_WORDS
-            ));
+            llmod.add_raw_global(crate::expr::inline_cache_global_definition(ic_name));
         }
         for raw in &typed_parse_rodata {
             llmod.add_raw_global(raw.clone());

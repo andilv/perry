@@ -87,6 +87,9 @@ pub(super) struct EvacuationPolicyDecision {
     pub(super) allowed: bool,
     pub(super) considered: bool,
     pub(super) force: bool,
+    /// This collection is the idle-time compaction (`gc/idle_compact.rs`),
+    /// which exempts it from the PAUSE-BUDGET gate below and nothing else.
+    pub(super) idle: bool,
     pub(super) enabled: bool,
     pub(super) reason: &'static str,
     pub(super) snapshot: EvacuationPolicySnapshot,
@@ -98,6 +101,7 @@ impl Default for EvacuationPolicyDecision {
             allowed: true,
             considered: false,
             force: false,
+            idle: false,
             enabled: false,
             reason: "not_evaluated",
             snapshot: EvacuationPolicySnapshot::default(),
@@ -150,6 +154,7 @@ pub(super) fn evacuation_policy_initial_decision(
     pre_evac_pause_us: u64,
     allowed: bool,
     force: bool,
+    idle: bool,
     disabled_reason: &'static str,
     old_to_young_tracking_complete: bool,
     old_page_selected_pages: usize,
@@ -167,7 +172,10 @@ pub(super) fn evacuation_policy_initial_decision(
             force,
             reason: disabled_reason,
             snapshot,
-            ..EvacuationPolicyDecision::default()
+            ..EvacuationPolicyDecision {
+                idle,
+                ..EvacuationPolicyDecision::default()
+            }
         };
     }
     if !old_to_young_tracking_complete {
@@ -176,7 +184,10 @@ pub(super) fn evacuation_policy_initial_decision(
             force,
             reason: "barriers_inactive",
             snapshot,
-            ..EvacuationPolicyDecision::default()
+            ..EvacuationPolicyDecision {
+                idle,
+                ..EvacuationPolicyDecision::default()
+            }
         };
     }
     if force {
@@ -186,7 +197,10 @@ pub(super) fn evacuation_policy_initial_decision(
             force,
             reason: "force_considered",
             snapshot,
-            ..EvacuationPolicyDecision::default()
+            ..EvacuationPolicyDecision {
+                idle,
+                ..EvacuationPolicyDecision::default()
+            }
         };
     }
     if tenured_still_in_nursery_bytes >= MIN_TENURED_NURSERY_BYTES {
@@ -196,7 +210,10 @@ pub(super) fn evacuation_policy_initial_decision(
             force,
             reason: "nursery_pressure",
             snapshot,
-            ..EvacuationPolicyDecision::default()
+            ..EvacuationPolicyDecision {
+                idle,
+                ..EvacuationPolicyDecision::default()
+            }
         };
     }
     if rss_bytes >= gc_rss_pressure_dyn_bytes() {
@@ -206,7 +223,10 @@ pub(super) fn evacuation_policy_initial_decision(
             force,
             reason: "rss_pressure",
             snapshot,
-            ..EvacuationPolicyDecision::default()
+            ..EvacuationPolicyDecision {
+                idle,
+                ..EvacuationPolicyDecision::default()
+            }
         };
     }
     if old_page_selected_pages > 0 {
@@ -216,7 +236,10 @@ pub(super) fn evacuation_policy_initial_decision(
             force,
             reason: "old_page_fragmentation",
             snapshot,
-            ..EvacuationPolicyDecision::default()
+            ..EvacuationPolicyDecision {
+                idle,
+                ..EvacuationPolicyDecision::default()
+            }
         };
     }
     EvacuationPolicyDecision {
@@ -224,7 +247,10 @@ pub(super) fn evacuation_policy_initial_decision(
         force,
         reason: "low_pressure",
         snapshot,
-        ..EvacuationPolicyDecision::default()
+        ..EvacuationPolicyDecision {
+            idle,
+            ..EvacuationPolicyDecision::default()
+        }
     }
 }
 
@@ -399,14 +425,25 @@ pub(super) fn evacuation_policy_final_decision(
         decision.reason = "reclaimable_candidate_ratio_below_threshold";
         return decision;
     }
-    let pause_budget_exceeded = snapshot.previous_pause_us > MAX_PREVIOUS_PAUSE_US
-        || snapshot.pre_evac_pause_us > MAX_PREVIOUS_PAUSE_US;
+    // The pause-budget gate protects a WAITING mutator: a collection that
+    // already spent 20 ms must not also evacuate. The idle compaction has no
+    // waiting mutator by construction — the park hook refuses to start one
+    // with a wake pending — and the pause it is being judged on is the idle
+    // reducer's own full, which is long on purpose. Measured on the #9644
+    // fixture: `releasable_block_bytes=37642240` with the volume gate passed
+    // and `reason=pause_budget_exceeded` off a 149 ms previous pause, i.e.
+    // 37 MB refused because the collection before it did its job.
+    let pause_budget_exceeded = !decision.idle
+        && (snapshot.previous_pause_us > MAX_PREVIOUS_PAUSE_US
+            || snapshot.pre_evac_pause_us > MAX_PREVIOUS_PAUSE_US);
     if pause_budget_exceeded {
         decision.reason = "pause_budget_exceeded";
         return decision;
     }
     decision.enabled = true;
-    decision.reason = if !object_bytes_pass && block_bytes_pass {
+    decision.reason = if decision.idle {
+        "idle_compaction"
+    } else if !object_bytes_pass && block_bytes_pass {
         // Only the granule metric cleared the bar — the new W3 path.
         "releasable_block_bytes"
     } else if snapshot.rss_bytes >= gc_rss_pressure_dyn_bytes() {
@@ -1163,12 +1200,19 @@ impl IncrementalSweepState {
     /// 2026-07-09 audit: buffers and typed arrays joined the same pattern —
     /// their registry/side-table entries are pruned when the owner is
     /// genuinely dead (full traces only; they are all tenured old residents).
-    pub(super) fn with_dead_collection_finalize(mut self, full_trace: bool) -> Self {
+    pub(super) fn with_dead_collection_finalize(
+        mut self,
+        full_trace: bool,
+        synchronous_full_trace: bool,
+    ) -> Self {
         // 2026-07-09 GC audit wave 2: death-prune the object-address-keyed
         // side tables in the same marks-fresh window. Cheap (one flag-check
         // walk over tables the root scanners already walk every cycle), so
         // it runs eagerly here rather than budget-chunked.
-        super::dead_owner::prune_dead_owner_side_tables_post_trace(full_trace);
+        super::dead_owner::prune_dead_owner_side_tables_post_trace(
+            full_trace,
+            synchronous_full_trace,
+        );
         self.dead_maps = crate::map::collect_dead_registered_maps_post_trace(full_trace);
         self.dead_sets = crate::set::collect_dead_registered_sets_post_trace(full_trace);
         self.dead_buffers = crate::buffer::collect_dead_registered_buffers_post_trace(full_trace);
@@ -1605,84 +1649,8 @@ enum ArenaSweepCleanupSubphase {
     Done,
 }
 
-struct ArenaSweepCleanupState {
-    subphase: ArenaSweepCleanupSubphase,
-    general: crate::arena::ArenaResetEmptyBlocksState,
-    survivor: Option<crate::arena::SurvivorArenaReclaimDeadBlocksState>,
-    old: Option<crate::arena::OldArenaReclaimDeadBlocksState>,
-    stats: crate::arena::ArenaResetStats,
-}
-
-impl ArenaSweepCleanupState {
-    fn new(
-        block_has_live: &[bool],
-        block_snapshots: &[crate::arena::ArenaBlockSnapshot],
-        reclaim_dead_old_blocks: bool,
-        targeted_old_blocks: Option<&crate::fast_hash::PtrHashSet<usize>>,
-    ) -> Self {
-        let survivor = reclaim_dead_old_blocks.then(|| {
-            crate::arena::SurvivorArenaReclaimDeadBlocksState::new(block_has_live, block_snapshots)
-        });
-        let old = if reclaim_dead_old_blocks {
-            Some(crate::arena::OldArenaReclaimDeadBlocksState::new_full(
-                block_has_live,
-                block_snapshots,
-            ))
-        } else {
-            targeted_old_blocks.map(|selected| {
-                crate::arena::OldArenaReclaimDeadBlocksState::new_selected(
-                    block_has_live,
-                    block_snapshots,
-                    selected,
-                )
-            })
-        };
-        Self {
-            subphase: ArenaSweepCleanupSubphase::General,
-            general: crate::arena::ArenaResetEmptyBlocksState::new(block_has_live, block_snapshots),
-            survivor,
-            old,
-            stats: crate::arena::ArenaResetStats::default(),
-        }
-    }
-
-    fn step(&mut self, budget: usize) -> bool {
-        match self.subphase {
-            ArenaSweepCleanupSubphase::General => {
-                if self.general.step(budget) {
-                    self.stats = add_reset_stats(self.stats, self.general.stats());
-                    self.subphase = ArenaSweepCleanupSubphase::Survivor;
-                }
-                false
-            }
-            ArenaSweepCleanupSubphase::Survivor => {
-                if let Some(survivor) = self.survivor.as_mut() {
-                    if !survivor.step(budget) {
-                        return false;
-                    }
-                    self.stats = add_reset_stats(self.stats, survivor.stats());
-                }
-                self.subphase = ArenaSweepCleanupSubphase::Old;
-                false
-            }
-            ArenaSweepCleanupSubphase::Old => {
-                if let Some(old) = self.old.as_mut() {
-                    if !old.step(budget) {
-                        return false;
-                    }
-                    self.stats = add_reset_stats(self.stats, old.stats());
-                }
-                self.subphase = ArenaSweepCleanupSubphase::Done;
-                true
-            }
-            ArenaSweepCleanupSubphase::Done => true,
-        }
-    }
-
-    fn stats(&self) -> crate::arena::ArenaResetStats {
-        self.stats
-    }
-}
+mod sweep_cleanup;
+use sweep_cleanup::*;
 
 fn add_reset_stats(
     lhs: crate::arena::ArenaResetStats,
@@ -1884,6 +1852,17 @@ pub(super) fn evacuate_selected_old_pages_collecting(
     // source blocks and evacuate the block all-or-nothing. Dead old objects
     // remain indexed until a full trace proves them dead, so conservatively
     // copying them here preserves the same minor-GC retention contract.
+    // Every hole on a page this pass is evacuating is unusable for the rest
+    // of it, and the block is released at the end. Drop them once, so the
+    // per-allocation exclusion scan in `old_free_take_exact` has nothing to
+    // walk: it is a linear scan of the size bucket, and with the fragmented
+    // pages excluded it used to fail over the whole bucket for every moved
+    // object. See `old_free_filter_pages` for the measurement.
+    let dropped_holes = crate::gc::old_free_filter_pages(excluded_pages);
+    if crate::gc::gc_diag_enabled() && dropped_holes > 0 {
+        eprintln!("[gc-old-page-defrag] dropped_excluded_holes_bytes={dropped_holes}");
+    }
+
     let mut source_headers = Vec::new();
     crate::arena::old_arena_walk_objects_on_pages(excluded_pages, |header_ptr| {
         source_headers.push(header_ptr as *mut GcHeader);

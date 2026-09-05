@@ -47,7 +47,17 @@ mod heap_budget;
 pub(crate) use heap_budget::*;
 mod pressure;
 pub use pressure::*;
+mod arena_right_size;
+pub use arena_right_size::{
+    arena_right_size_episodes, arena_right_size_released_capacity_bytes, arena_right_size_starts,
+};
+mod idle_compact;
 mod idle_reclaim;
+pub use idle_compact::{
+    idle_compact_attempts, idle_compact_backoff_shift, idle_compact_enabled_from_value,
+    idle_compact_pause_us_max, idle_compact_pause_us_total, idle_compact_productive,
+    idle_compact_released_bytes, idle_compact_wake_declined,
+};
 pub use idle_reclaim::{
     idle_reclaim_attempts, idle_reclaim_backoff_shift, idle_reclaim_completions,
     idle_reclaim_enabled_from_value, idle_reclaim_freed_bytes, idle_reclaim_old_reclaimed_bytes,
@@ -257,7 +267,30 @@ pub(super) fn gc_collect_minor_with_trigger(trigger: GcTriggerSnapshot) -> GcCol
     // cannot be deferred any further than this.
     roots::ensure_stack_maps_built();
 
-    gc_collect_minor_with_trigger_inner(trigger, FullEscalation::Allowed)
+    gc_collect_minor_with_trigger_inner(trigger, FullEscalation::Allowed, CopyingFastPath::Allowed)
+}
+
+/// May the copying nursery fast path consume this minor?
+///
+/// `Skipped` exists for one caller: the idle compaction, which needs the
+/// non-copying fallback because that is the only path old-page defrag is
+/// selected on (`gc/idle_compact.rs`). The fast path is not "wrong" there —
+/// on a TUI workload it is eligible every time, which is exactly why a
+/// compaction that let it run would never compact anything.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum CopyingFastPath {
+    Allowed,
+    Skipped,
+}
+
+/// The synchronous moving minor the idle compaction runs: old-page defrag
+/// armed, the copying fast path declined so the selection has a consumer, and
+/// no escalation to a full mark-sweep (which moves nothing, so it would hand
+/// the caller a collection that cannot compact — the #6946 argument).
+pub(super) fn gc_collect_compacting_minor(trigger: GcTriggerSnapshot) -> GcCollectOutcome {
+    roots::ensure_stack_maps_built();
+    let _armed = oldgen_defrag::IdleCompactDefragArm::new();
+    gc_collect_minor_with_trigger_inner(trigger, FullEscalation::Refused, CopyingFastPath::Skipped)
 }
 
 /// May this minor be escalated to a full mark-sweep by the two THROUGHPUT
@@ -289,12 +322,13 @@ pub(super) fn gc_collect_forced_evacuating_minor(trigger: GcTriggerSnapshot) -> 
     // cannot be deferred any further than this.
     roots::ensure_stack_maps_built();
 
-    gc_collect_minor_with_trigger_inner(trigger, FullEscalation::Refused)
+    gc_collect_minor_with_trigger_inner(trigger, FullEscalation::Refused, CopyingFastPath::Allowed)
 }
 
 fn gc_collect_minor_with_trigger_inner(
     trigger: GcTriggerSnapshot,
     escalation: FullEscalation,
+    copying: CopyingFastPath,
 ) -> GcCollectOutcome {
     // PERRY_GC_SAFEPOINT_ONLY: held for the whole collection so every
     // consumer of the scan decision (root scan, copying eligibility,
@@ -373,7 +407,27 @@ fn gc_collect_minor_with_trigger_inner(
     // MARK_SEEDS persists across GC cycles. Clear before any try_mark
     // call so trace sees only this cycle's freshly-marked headers.
     clear_mark_seeds();
-    if let Some(fast_path) = gc_collect_minor_copying_fast_path(&mut trace, start, trigger.kind) {
+    let copying_outcome = match copying {
+        CopyingFastPath::Allowed => {
+            gc_collect_minor_copying_fast_path(&mut trace, start, trigger.kind)
+        }
+        // Run the ordinary eligibility preflight — it carries the one-shot
+        // remembered-set reconstruction every declined cycle depends on — and
+        // then decline, the way any other fallback reason would.
+        CopyingFastPath::Skipped => {
+            let malloc_sweep_due = CopiedMinorEligibility::evaluate(trigger.kind).malloc_sweep_due;
+            gc_collect_minor_copying_fast_path_with_eligibility(
+                &mut trace,
+                start,
+                CopiedMinorEligibility::fallback(
+                    CopiedMinorFallbackReason::IdleCompaction,
+                    malloc_sweep_due,
+                ),
+                trigger.kind,
+            )
+        }
+    };
+    if let Some(fast_path) = copying_outcome {
         let freed_bytes = fast_path.freed_bytes;
         let elapsed_us = start.elapsed().as_micros() as u64;
         GC_STATS.with(|stats| {
@@ -1305,7 +1359,7 @@ fn emit_incremental_liveness_diag() {
          safepoints_blocked(in_alloc={blocked_alloc} unsafe_zone={blocked_unsafe_zone} \
          root_lock={blocked_root_lock}) \
          copying_minors={} loop_polls={} poll_arm_events={} \
-         poll_armed_at_exit={}",
+         poll_armed_at_exit={} forwarded_stub_recoveries={}",
         instruments::incremental_cycle_starts(),
         instruments::incremental_steps(),
         instruments::incremental_completions(),
@@ -1318,8 +1372,11 @@ fn emit_incremental_liveness_diag() {
         instruments::loop_polls_reached(),
         poll_arm::poll_arm_events(),
         poll_arm::poll_armed_count(),
+        trace::forwarded_stub_membership_recoveries(),
     );
     idle_reclaim::emit_diag();
+    idle_compact::emit_diag();
+    arena_right_size::emit_diag();
     emit_step_bounds_diag();
     emit_gc_time_share_diag();
 }

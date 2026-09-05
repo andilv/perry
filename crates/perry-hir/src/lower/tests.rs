@@ -1884,6 +1884,50 @@ fn bun_transpiler_and_build_lower_to_native_dispatch() {
     );
 }
 
+/// #9680: native constructors retain their exported identity when a bundler
+/// minifies the local import name used by a class declaration or expression.
+#[test]
+fn aliased_native_imports_canonicalize_class_heritage() {
+    let source = r#"
+        import { Readable as ut } from "node:stream";
+        import { EventEmitter as jt } from "node:events";
+
+        class ReaddirpStream extends ut {
+            _read() {}
+        }
+        const Watcher = class extends jt {};
+    "#;
+    let module = perry_parser::parse_typescript(source, "watcher.js").expect("source parses");
+    let hir = super::lower_module(&module, "watcher", "watcher.js").expect("source lowers");
+
+    let stream = hir
+        .classes
+        .iter()
+        .find(|class| class.name == "ReaddirpStream")
+        .expect("stream class is lowered");
+    assert_eq!(stream.extends_name.as_deref(), Some("Readable"));
+    assert_eq!(
+        stream.native_extends,
+        Some(("node_stream".to_string(), "Readable".to_string()))
+    );
+    assert!(
+        stream.extends_expr.is_none(),
+        "aliased native heritage must not use replacement-object construction"
+    );
+
+    let watcher = hir
+        .classes
+        .iter()
+        .find(|class| class.name == "Watcher")
+        .expect("inferred-name class expression is lowered");
+    assert_eq!(watcher.extends_name.as_deref(), Some("EventEmitter"));
+    assert_eq!(
+        watcher.native_extends,
+        Some(("events".to_string(), "EventEmitter".to_string()))
+    );
+    assert!(watcher.extends_expr.is_none());
+}
+
 /// #8882: a module-level class constructing a sibling class that is declared
 /// inside a function body lowered LATER. This is the shape the CJS wrap
 /// produces for Next's `server/lib/lru-cache.js`: `LRUCache` is hoisted out of
@@ -1933,42 +1977,7 @@ fn hoisted_class_constructs_sibling_declared_inside_a_later_closure() {
     );
 }
 
-/// #8882 / #8730: a constructor name that resolves to nothing in the module
-/// is read off `globalThis` when the `new` executes — exactly like a bare
-/// identifier read — so a runtime-created global constructs and a true miss
-/// throws `ReferenceError: <name> is not defined` WITH the identifier. The
-/// `typeof`-guarded browser-API shape is the one Next's `app-page` runtime
-/// carries; it previously lowered to the nameless throw even though the guard
-/// makes the branch dead on a server.
-#[test]
-fn unresolved_new_names_the_identifier_and_defers_to_a_runtime_global_lookup() {
-    let source = r#"
-        function observe(cb: any): any {
-            return typeof IntersectionObserver === "function"
-                ? new IntersectionObserver(cb)
-                : null;
-        }
-    "#;
-    let module = perry_parser::parse_typescript(source, "t.ts").expect("source parses");
-    let hir = super::lower_module(&module, "t", "t.ts").expect("source lowers");
-    let observe = hir
-        .functions
-        .iter()
-        .find(|function| function.name == "observe")
-        .expect("observe is lowered");
-    let debug = format!("{observe:?}");
-
-    assert!(
-        !debug.contains("js_throw_reference_error_unresolved_get"),
-        "the nameless ReferenceError helper must not be emitted for `new <unknown>()`:\n{debug}"
-    );
-    assert!(
-        debug.contains(
-            r#"NewDynamic { callee: Call { callee: ExternFuncRef { name: "js_global_get_or_throw_unresolved", param_types: [Any], return_type: Any }, args: [String("IntersectionObserver")]"#
-        ),
-        "an unresolved constructor must be a runtime globalThis lookup carrying its name:\n{debug}"
-    );
-}
+mod unresolved_new_global;
 
 mod capture_stash;
 mod mixin_parent_chain;

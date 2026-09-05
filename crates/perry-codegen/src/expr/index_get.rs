@@ -53,7 +53,8 @@ use foreign_counter::{
 mod inline_dyn_typed_array;
 
 use guarded_array::{
-    lower_guarded_array_index_get, lower_packed_f64_loop_index_get, packed_f64_loop_fact,
+    lower_guarded_array_index_get, lower_packed_f64_loop_index_get,
+    lower_region_validated_array_index_get, packed_f64_loop_fact,
 };
 use inline_dyn_typed_array::lower_inline_dyn_typed_array_get;
 
@@ -71,15 +72,27 @@ pub(crate) fn lower_symbol_property_get_ic(
     ctx.ic_site_counter += 1;
     let cache_name = super::inline_cache_global_name(ctx, site_id);
     ctx.ic_globals.push(cache_name.clone());
-    let cache_ref = format!("@{cache_name}");
 
+    let probe_idx = ctx.new_block("symic.probe");
     let hit_idx = ctx.new_block("symic.hit");
     let miss_idx = ctx.new_block("symic.miss");
     let merge_idx = ctx.new_block("symic.merge");
+    let probe_label = ctx.block_label(probe_idx);
     let hit_label = ctx.block_label(hit_idx);
     let miss_label = ctx.block_label(miss_idx);
     let merge_label = ctx.block_label(merge_idx);
 
+    // #9708: the cache sits behind a pointer slot that the miss handler fills
+    // on the first prime. The probe's three loads go through the pointer, so
+    // an absent cache branches straight to the miss — the edge a fresh
+    // (all-zero) global took anyway, since a zero epoch never matches.
+    let ic_slot = super::emit_inline_cache_slot(ctx, &cache_name);
+    let cache_ref = ic_slot.cache.clone();
+    let cache_slot_ref = ic_slot.slot_ref.clone();
+    ctx.block()
+        .cond_br(&ic_slot.present, &probe_label, &miss_label);
+
+    ctx.current_block = probe_idx;
     let epoch = ctx
         .block()
         .load_atomic_acquire(I64, "@PERRY_SYMBOL_PROPERTY_IC_EPOCH", 8);
@@ -109,7 +122,7 @@ pub(crate) fn lower_symbol_property_get_ic(
     let miss_value = ctx.block().call(
         DOUBLE,
         "js_object_get_symbol_property_ic_miss",
-        &[(DOUBLE, obj_box), (DOUBLE, sym_box), (PTR, &cache_ref)],
+        &[(DOUBLE, obj_box), (DOUBLE, sym_box), (PTR, &cache_slot_ref)],
     );
     let miss_end = ctx.block().label.clone();
     ctx.block().br(&merge_label);
@@ -128,9 +141,9 @@ pub(crate) fn lower_symbol_property_get_ic(
 /// which use the resolved name for FIXED-OFFSET class-layout dispatch that
 /// really would be unsound against a value an `as any` reassignment swapped
 /// in (#6906). Every consumer gated on THIS predicate is different: either a
-/// `ctx.buffer_view_slots`-tracked proof that reassignment already
+/// buffer-view descriptor proof that reassignment already
 /// invalidates on its own (`lower_typed_array_store`, `try_lower_proven_
-/// view_checked_store`/`proven_view_for` — see their own `buffer_view_slots`
+/// view_checked_store`/`proven_view_for` — see their own descriptor
 /// lookups), or a genuinely dynamic runtime call (`js_typed_array_set`,
 /// `js_typed_array_get`, `js_typed_array_index_{get,set}_dynamic`) that
 /// re-validates the object's actual GC kind before touching memory, exactly
@@ -144,11 +157,11 @@ pub(crate) fn lower_symbol_property_get_ic(
 /// object: a type-confused, `unbox`ed-pointer-plus-wrong-offset write,
 /// not merely a missed optimization.
 fn is_width_tracked_typed_array_receiver(ctx: &FnCtx<'_>, object: &Expr) -> bool {
-    if matches!(object, Expr::LocalGet(id) if ctx.buffer_view_slots.contains_key(id)) {
+    if matches!(object, Expr::LocalGet(id) if ctx.receiver_descriptors.contains_buffer_view(id)) {
         return true;
     }
     // This predicate selects only runtime-validated typed-array helpers (or a
-    // `buffer_view_slots` proof that invalidates on assignment), as documented
+    // buffer-view descriptor proof that invalidates on assignment), as documented
     // above. Preserve the declared kind as a hint for that dynamic fallback;
     // the general `static_type_of` deliberately drops reassigned bindings.
     let ty = match object {
@@ -235,11 +248,7 @@ fn numeric_index_has_loop_array_index_proof(ctx: &FnCtx<'_>, object: &Expr, inde
     if packed_f64_loop_offset_read(ctx, *arr_id, index).is_some() {
         return true;
     }
-    offset == 0
-        && ctx
-            .bounded_index_pairs
-            .iter()
-            .any(|fact| fact.array_local_id == *arr_id && fact.index_local_id == idx_id)
+    offset == 0 && ctx.receiver_descriptors.has_bounded_index(*arr_id, idx_id)
 }
 
 fn numeric_index_needs_runtime_key(ctx: &FnCtx<'_>, object: &Expr, index: &Expr) -> bool {
@@ -828,17 +837,14 @@ pub(crate) fn lower_numeric_index_get_for_number_context(
         }
     }
     if let (Expr::LocalGet(arr_id), Expr::LocalGet(idx_id)) = (object.as_ref(), index.as_ref()) {
-        if ctx
-            .bounded_index_pairs
-            .iter()
-            .any(|fact| fact.index_local_id == *idx_id && fact.array_local_id == *arr_id)
-        {
+        if ctx.receiver_descriptors.has_bounded_index(*arr_id, *idx_id) {
             if let Some(i32_slot) = ctx.i32_counter_slots.get(idx_id).cloned() {
                 let repair_slot = receiver_repair_slot(ctx, object);
                 let arr_box = lower_expr(ctx, object)?;
                 let idx_i32 = ctx.block().load(I32, &i32_slot);
-                return lower_guarded_array_index_get(
+                return lower_region_validated_array_index_get(
                     ctx,
+                    *arr_id,
                     &arr_box,
                     &idx_i32,
                     "bidx.num",
@@ -969,6 +975,44 @@ pub(crate) fn lower_unknown_local_index_get_for_number_context(
 }
 
 fn lower_bounded_array_index_get(
+    ctx: &mut FnCtx<'_>,
+    arr_id: u32,
+    arr_box: &str,
+    idx_i32: &str,
+) -> Result<String> {
+    let Some(access) = ctx.receiver_descriptors.array_access(arr_id, false) else {
+        return lower_bounded_array_index_get_checked(ctx, arr_box, idx_i32);
+    };
+
+    let fast_idx = ctx.new_block("bidx.receiver_region.fast");
+    let fallback_idx = ctx.new_block("bidx.receiver_region.fallback");
+    let merge_idx = ctx.new_block("bidx.receiver_region.merge");
+    let fast_label = ctx.block_label(fast_idx);
+    let fallback_label = ctx.block_label(fallback_idx);
+    let merge_label = ctx.block_label(merge_idx);
+    ctx.block()
+        .cond_br(&access.valid_i1, &fast_label, &fallback_label);
+
+    ctx.current_block = fast_idx;
+    let array_handle = ctx.block().load(I64, &access.base_handle_slot);
+    let fast_value =
+        guarded_array::lower_trusted_plain_array_index_get(ctx, &array_handle, idx_i32);
+    let fast_end = ctx.block().label.clone();
+    ctx.block().br(&merge_label);
+
+    ctx.current_block = fallback_idx;
+    let fallback_value = lower_bounded_array_index_get_checked(ctx, arr_box, idx_i32)?;
+    let fallback_end = ctx.block().label.clone();
+    ctx.block().br(&merge_label);
+
+    ctx.current_block = merge_idx;
+    Ok(ctx.block().phi(
+        DOUBLE,
+        &[(&fast_value, &fast_end), (&fallback_value, &fallback_end)],
+    ))
+}
+
+fn lower_bounded_array_index_get_checked(
     ctx: &mut FnCtx<'_>,
     arr_box: &str,
     idx_i32: &str,
@@ -1163,7 +1207,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 if typed_array_index_needs_runtime_key(ctx, object.as_ref(), index.as_ref()) {
                     if runtime_key_may_expose_typed_array_backing_buffer(index) {
                         if let Expr::LocalGet(id) = object.as_ref() {
-                            if ctx.buffer_view_slots.contains_key(id) {
+                            if ctx.receiver_descriptors.contains_buffer_view(id) {
                                 invalidate_buffer_view_pointer(
                                     ctx,
                                     *id,
@@ -1638,16 +1682,15 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 if let (Expr::LocalGet(arr_id), Expr::LocalGet(idx_id)) =
                     (object.as_ref(), index.as_ref())
                 {
-                    if ctx.bounded_index_pairs.iter().any(|fact| {
-                        fact.index_local_id == *idx_id && fact.array_local_id == *arr_id
-                    }) {
+                    if ctx.receiver_descriptors.has_bounded_index(*arr_id, *idx_id) {
                         if let Some(i32_slot) = ctx.i32_counter_slots.get(idx_id).cloned() {
                             let repair_slot = receiver_repair_slot(ctx, object);
                             let arr_box = lower_expr(ctx, object)?;
                             let idx_i32 = ctx.block().load(I32, &i32_slot);
                             if require_numeric_layout {
-                                return lower_guarded_array_index_get(
+                                return lower_region_validated_array_index_get(
                                     ctx,
+                                    *arr_id,
                                     &arr_box,
                                     &idx_i32,
                                     "bidx.num",
@@ -1656,7 +1699,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                                     repair_slot.as_deref(),
                                 );
                             }
-                            return lower_bounded_array_index_get(ctx, &arr_box, &idx_i32);
+                            return lower_bounded_array_index_get(ctx, *arr_id, &arr_box, &idx_i32);
                         }
                     }
                 }

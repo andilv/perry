@@ -3,9 +3,9 @@
 use super::*;
 
 use crate::expr::{
-    array_kind_fact, effect_fact, emit_typed_feedback_register_site, nanbox_pointer_inline,
-    raw_f64_layout_fact, BoundedIndexPair, PackedF64LoopFact, PackedNumericLoopKind,
-    TypedFeedbackContract, TypedFeedbackKind,
+    array_kind_fact, effect_fact, emit_typed_feedback_register_site,
+    expr_has_numeric_pointer_free_array_layout, nanbox_pointer_inline, raw_f64_layout_fact,
+    PackedF64LoopFact, PackedNumericLoopKind, TypedFeedbackContract, TypedFeedbackKind,
 };
 use crate::loop_purity::body_needs_asm_barrier;
 use crate::lower_conditional::lower_truthy;
@@ -76,6 +76,61 @@ struct LengthHoist {
     op: perry_hir::CompareOp,
     lhs_addend: i32,
     buffer_bounds_width_units: Option<u32>,
+}
+
+/// #9254 phase 3: prove the dynamic extent in which an ordinary
+/// `i < arr.length` loop may consume a one-time receiver validation.
+///
+/// Only the exact bounded `arr[i]` operation is replaced by the descriptor's
+/// non-dispatching load. Its children and every surrounding operation retain
+/// the conservative region classification. The outer back-edge poll is added
+/// explicitly because the caller passes the loop body rather than a `Stmt::For`
+/// node; nested-loop polls are discovered by the statement walker itself.
+fn ordinary_counted_array_region_enders(
+    ctx: &FnCtx<'_>,
+    hoist: LengthHoist,
+    update: Option<&perry_hir::Expr>,
+    body: &[Stmt],
+) -> Option<Vec<crate::collectors::RegionEnder>> {
+    use std::cell::Cell;
+
+    if !matches!(hoist.op, perry_hir::CompareOp::Lt)
+        || hoist.lhs_addend != 0
+        || !loop_counter_bounds_are_safe(ctx, hoist.counter_id, update, body)
+    {
+        return None;
+    }
+
+    let saw_bounded_read = Cell::new(false);
+    let is_trusted_operation = |expr: &perry_hir::Expr| {
+        let trusted = matches!(
+            expr,
+            perry_hir::Expr::IndexGet { object, index }
+                if matches!(object.as_ref(), perry_hir::Expr::LocalGet(id) if *id == hoist.arr_id)
+                    && matches!(index.as_ref(), perry_hir::Expr::LocalGet(id) if *id == hoist.counter_id)
+        );
+        if trusted {
+            saw_bounded_read.set(true);
+        }
+        trusted
+    };
+    let is_inert = |expr: &perry_hir::Expr| crate::rooting::expr_is_inert_primitive(ctx, expr);
+    let controls: Vec<&perry_hir::Expr> = update.into_iter().collect();
+    let mut enders = crate::collectors::region_enders_in_stmts_with_trusted_operations(
+        body,
+        &controls,
+        &is_inert,
+        &is_trusted_operation,
+    );
+    if !saw_bounded_read.get()
+        || enders
+            .iter()
+            .any(|ender| !matches!(ender, crate::collectors::RegionEnder::BackEdgePoll))
+    {
+        return None;
+    }
+    enders.push(crate::collectors::RegionEnder::BackEdgePoll);
+    Some(enders)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -826,6 +881,113 @@ struct PackedAccumulatorScope {
     hoisted_receivers: Vec<u32>,
 }
 
+/// Materialize the address half shared by packed clones and phase 3 ordinary
+/// counted loops. The returned box is a precise root, while the handle slot is
+/// refreshed from it after every fired loop poll.
+fn create_poll_refreshed_receiver_cache(
+    ctx: &mut FnCtx<'_>,
+    arr_id: u32,
+) -> Option<(String, String, String)> {
+    let source_ref = if let Some(slot) = ctx.locals.get(&arr_id) {
+        slot.clone()
+    } else {
+        format!("@{}", ctx.module_globals.get(&arr_id)?)
+    };
+    let current = ctx.block().load(DOUBLE, &source_ref);
+    let rooted_box_slot = ctx.func.alloca_entry(DOUBLE);
+    let base_handle_slot = ctx.func.alloca_entry(I64);
+    // `root_entry_alloca` hoists the bind into entry setup, so seed the cache
+    // before that bind can make the collector dereference it. The later store
+    // publishes the live receiver and the bind makes evacuation rewrite this
+    // cache itself.
+    let undefined = crate::nanbox::double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
+    ctx.func
+        .entry_allocas_push_store(DOUBLE, &undefined, &rooted_box_slot);
+    ctx.block().store(DOUBLE, &current, &rooted_box_slot);
+    crate::expr::root_entry_alloca(ctx, &rooted_box_slot);
+    {
+        let blk = ctx.block();
+        let bits = blk.bitcast_double_to_i64(&current);
+        let handle = blk.and(I64, &bits, crate::nanbox::POINTER_MASK_I64);
+        blk.store(I64, &handle, &base_handle_slot);
+    }
+    Some((rooted_box_slot, base_handle_slot, source_ref))
+}
+
+/// Attach a numeric-array validation to an ordinary counted loop. This is
+/// intentionally narrower than the descriptor model: phase 3 targets the
+/// numeric `arr[i]` shape whose guarded header chain dominates matmul-style
+/// kernels. A false one-time guard keeps the established per-read fallback;
+/// a true guard makes every exact bounded read a raw load from the refreshed
+/// handle slot.
+fn materialize_ordinary_counted_array_descriptor(
+    ctx: &mut FnCtx<'_>,
+    hoist: LengthHoist,
+    update: Option<&perry_hir::Expr>,
+    body: &[Stmt],
+) -> bool {
+    if ctx.receiver_descriptors.contains(hoist.arr_id)
+        || !expr_has_numeric_pointer_free_array_layout(
+            ctx,
+            &perry_hir::Expr::LocalGet(hoist.arr_id),
+        )
+    {
+        return false;
+    }
+    let Some(enders) = ordinary_counted_array_region_enders(ctx, hoist, update, body) else {
+        return false;
+    };
+    let Some((rooted_box_slot, base_handle_slot, source_root)) =
+        create_poll_refreshed_receiver_cache(ctx, hoist.arr_id)
+    else {
+        return false;
+    };
+
+    let feedback_site_id = emit_typed_feedback_register_site(
+        ctx,
+        TypedFeedbackKind::ArrayElement,
+        "array[index].receiver_region",
+        TypedFeedbackContract::numeric_array_get_index(),
+    );
+    let receiver = ctx.block().load(DOUBLE, &rooted_box_slot);
+    let guard_i32 = ctx.block().call(
+        I32,
+        "js_typed_feedback_numeric_array_index_get_guard",
+        &[
+            (I64, &feedback_site_id),
+            (DOUBLE, &receiver),
+            // Receiver-only validation: the surrounding strict length bound
+            // supplies the per-use index proof.
+            (I32, "0"),
+            (I32, "0"),
+        ],
+    );
+    let valid_i1 = ctx.block().icmp_ne(I32, &guard_i32, "0");
+
+    // The numeric guard is non-collecting, but it may verify/rewrite boxed
+    // numeric slots into raw-f64 representation. Derive the cached handle
+    // after that operation so the ordering is explicit in the IR contract.
+    {
+        let blk = ctx.block();
+        let fresh = blk.load(DOUBLE, &rooted_box_slot);
+        let bits = blk.bitcast_double_to_i64(&fresh);
+        let handle = blk.and(I64, &bits, crate::nanbox::POINTER_MASK_I64);
+        blk.store(I64, &handle, &base_handle_slot);
+    }
+
+    ctx.receiver_descriptors
+        .materialize_region_validated_array(
+            hoist.arr_id,
+            rooted_box_slot,
+            base_handle_slot,
+            source_root,
+            crate::collectors::ReceiverArrayValidationKind::Numeric,
+            valid_i1,
+            &enders,
+        )
+        .expect("region analysis admitted only poll-refreshable boundaries")
+}
+
 impl PackedAccumulatorScope {
     fn empty() -> Self {
         Self {
@@ -933,40 +1095,15 @@ impl PackedAccumulatorScope {
             if ctx.receiver_descriptors.contains(*arr_id) {
                 continue;
             }
-            let source_ref = if let Some(slot) = ctx.locals.get(arr_id) {
-                slot.clone()
-            } else if let Some(global_name) = ctx.module_globals.get(arr_id) {
-                format!("@{}", global_name)
-            } else {
+            let Some((rooted_box_slot, base_handle_slot, source_ref)) =
+                create_poll_refreshed_receiver_cache(ctx, *arr_id)
+            else {
                 continue;
             };
-            let current = ctx.block().load(DOUBLE, &source_ref);
-            let alloca = ctx.func.alloca_entry(DOUBLE);
-            let handle_alloca = ctx.func.alloca_entry(I64);
-            // `root_entry_alloca` hoists the bind into entry setup, so seed
-            // the cache before that bind can make the collector dereference
-            // it. The later store publishes the live receiver and the bind
-            // makes evacuation rewrite this cache itself. Under native roots
-            // the bind becomes an addrspace(1) value that mem2reg can still
-            // promote, retaining the receiver-cache fast path while making
-            // its liveness across a strided poll explicit to the checker.
-            let undef = crate::nanbox::double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
-            ctx.func.entry_allocas_push_store(DOUBLE, &undef, &alloca);
-            {
-                let blk = ctx.block();
-                blk.store(DOUBLE, &current, &alloca);
-            }
-            crate::expr::root_entry_alloca(ctx, &alloca);
-            {
-                let blk = ctx.block();
-                let bits = blk.bitcast_double_to_i64(&current);
-                let handle = blk.and(I64, &bits, crate::nanbox::POINTER_MASK_I64);
-                blk.store(I64, &handle, &handle_alloca);
-            }
             let installed = ctx.receiver_descriptors.materialize_poll_refreshed_address(
                 *arr_id,
-                alloca,
-                handle_alloca,
+                rooted_box_slot,
+                base_handle_slot,
                 source_ref,
                 // Packed loop admission rejects Stmt::Try. A throw may
                 // leave the clone, but no descriptor is live in the
@@ -1325,18 +1462,19 @@ fn lower_packed_f64_versioned_for(
         false,
     );
     acc_scope.hoist_receivers(ctx, &[matched.array_id]);
-    ctx.packed_f64_loop_facts.push(PackedF64LoopFact {
-        index_local_id: matched.counter_id,
-        array_local_id: matched.array_id,
-        scope_id: packed_scope_id,
-        guard_id: guard_id.to_string(),
-        store_side_exit_label: acc_scope.fact_side_exit(&slow_pre_label),
-        array_kind: matched.array_kind,
-        allow_holes: false,
-        window_validated: false,
-        affine_indices: false,
-        numeric_accumulators: acc_scope.accumulators.clone(),
-    });
+    ctx.receiver_descriptors
+        .materialize_packed_f64_loop(PackedF64LoopFact {
+            index_local_id: matched.counter_id,
+            array_local_id: matched.array_id,
+            scope_id: packed_scope_id,
+            guard_id: guard_id.to_string(),
+            store_side_exit_label: acc_scope.fact_side_exit(&slow_pre_label),
+            array_kind: matched.array_kind,
+            allow_holes: false,
+            window_validated: false,
+            affine_indices: false,
+            numeric_accumulators: acc_scope.accumulators.clone(),
+        });
     // The guard just proved a live, non-forwarded plain array, and the
     // matched body cannot change its length (in-bounds stores only, no
     // calls/closures/awaits) — so hoist the length ONCE as the fast clone's
@@ -1365,8 +1503,8 @@ fn lower_packed_f64_versioned_for(
         Some((matched.counter_id, hoisted_len_i32)),
     )?;
     ctx.poll_stride_counter_slot = saved_stride;
-    ctx.packed_f64_loop_facts
-        .retain(|fact| fact.scope_id != packed_scope_id);
+    ctx.receiver_descriptors
+        .dematerialize_scope(packed_scope_id);
     acc_scope.finish(ctx);
     if !ctx.block().is_terminated() {
         ctx.block().br(&merge_label);
@@ -2840,45 +2978,47 @@ fn push_packed_f64_range_facts(
 ) {
     for access in &matched.arrays {
         if access.counter.is_some() {
-            ctx.packed_f64_loop_facts.push(PackedF64LoopFact {
-                index_local_id: matched.counter_id,
-                array_local_id: access.array_id,
-                scope_id,
-                guard_id: guard_id.to_string(),
-                store_side_exit_label: slow_pre_label.to_string(),
-                array_kind: PackedNumericLoopKind::F64,
-                // Dense mode proved the window hole-free — loads need no
-                // hole check / side exit. Classic range mode stays
-                // hole-tolerant.
-                allow_holes: !matched.dense,
-                window_validated: true,
-                affine_indices: false,
-                numeric_accumulators: numeric_accumulators.to_vec(),
-            });
+            ctx.receiver_descriptors
+                .materialize_packed_f64_loop(PackedF64LoopFact {
+                    index_local_id: matched.counter_id,
+                    array_local_id: access.array_id,
+                    scope_id,
+                    guard_id: guard_id.to_string(),
+                    store_side_exit_label: slow_pre_label.to_string(),
+                    array_kind: PackedNumericLoopKind::F64,
+                    // Dense mode proved the window hole-free — loads need no
+                    // hole check / side exit. Classic range mode stays
+                    // hole-tolerant.
+                    allow_holes: !matched.dense,
+                    window_validated: true,
+                    affine_indices: false,
+                    numeric_accumulators: numeric_accumulators.to_vec(),
+                });
         }
         // #9253: an affine access publishes a receiver-only fact. No window
         // was validated, so reads bounds-check per access; holes are excluded
         // because the receiver guard proves fully-packed raw f64.
         if access.affine {
-            ctx.packed_f64_loop_facts.push(PackedF64LoopFact {
-                index_local_id: matched.counter_id,
-                array_local_id: access.array_id,
-                scope_id,
-                guard_id: guard_id.to_string(),
-                store_side_exit_label: slow_pre_label.to_string(),
-                array_kind: PackedNumericLoopKind::F64,
-                allow_holes: false,
-                // True when the entry guard proved this array's whole affine
-                // window at the loop's endpoints — the reads then skip both
-                // the range clamp and the per-read bounds check.
-                window_validated: affine_window_proven.contains(&access.array_id),
-                affine_indices: true,
-                numeric_accumulators: numeric_accumulators.to_vec(),
-            });
+            ctx.receiver_descriptors
+                .materialize_packed_f64_loop(PackedF64LoopFact {
+                    index_local_id: matched.counter_id,
+                    array_local_id: access.array_id,
+                    scope_id,
+                    guard_id: guard_id.to_string(),
+                    store_side_exit_label: slow_pre_label.to_string(),
+                    array_kind: PackedNumericLoopKind::F64,
+                    allow_holes: false,
+                    // True when the entry guard proved this array's whole affine
+                    // window at the loop's endpoints — the reads then skip both
+                    // the range clamp and the per-read bounds check.
+                    window_validated: affine_window_proven.contains(&access.array_id),
+                    affine_indices: true,
+                    numeric_accumulators: numeric_accumulators.to_vec(),
+                });
         }
         if let Some((lo, hi)) = access.stat {
-            ctx.masked_window_array_facts
-                .push(crate::expr::MaskedWindowArrayFact {
+            ctx.receiver_descriptors.materialize_masked_window_array(
+                crate::expr::MaskedWindowArrayFact {
                     array_local_id: access.array_id,
                     scope_id,
                     guard_id: guard_id.to_string(),
@@ -2888,7 +3028,8 @@ fn push_packed_f64_range_facts(
                     elem: crate::expr::MaskedWindowElem::PlainF64,
                     allows_stores: allow_masked_stores,
                     numeric_accumulators: numeric_accumulators.to_vec(),
-                });
+                },
+            );
         }
     }
 }
@@ -2980,8 +3121,8 @@ fn lower_masked_window_ta_tier(
         let (lo, hi) = access
             .stat
             .expect("TA tiers require static-window accesses");
-        ctx.masked_window_array_facts
-            .push(crate::expr::MaskedWindowArrayFact {
+        ctx.receiver_descriptors.materialize_masked_window_array(
+            crate::expr::MaskedWindowArrayFact {
                 array_local_id: arr_id,
                 scope_id,
                 guard_id: guard_id.to_string(),
@@ -2991,7 +3132,8 @@ fn lower_masked_window_ta_tier(
                 elem,
                 allows_stores: false,
                 numeric_accumulators: Vec::new(),
-            });
+            },
+        );
     }
     lower_for_after_init_with_i32_bound(
         ctx,
@@ -3002,8 +3144,7 @@ fn lower_masked_window_ta_tier(
         loop_label,
         Some((matched.counter_id, bound_i32.to_string())),
     )?;
-    ctx.masked_window_array_facts
-        .retain(|fact| fact.scope_id != scope_id);
+    ctx.receiver_descriptors.dematerialize_scope(scope_id);
     if !ctx.block().is_terminated() {
         ctx.block().br(merge_label);
     }
@@ -3320,10 +3461,7 @@ fn lower_packed_f64_range_versioned_for(
                 Some((matched.counter_id, bound_i32.clone())),
             )?;
             ctx.poll_stride_counter_slot = saved_stride;
-            ctx.packed_f64_loop_facts
-                .retain(|fact| fact.scope_id != scope_i32);
-            ctx.masked_window_array_facts
-                .retain(|fact| fact.scope_id != scope_i32);
+            ctx.receiver_descriptors.dematerialize_scope(scope_i32);
             acc_scope.finish(ctx);
             if !ctx.block().is_terminated() {
                 ctx.block().br(&merge_label);
@@ -3369,10 +3507,7 @@ fn lower_packed_f64_range_versioned_for(
             Some((matched.counter_id, bound_i32.clone())),
         )?;
         ctx.poll_stride_counter_slot = saved_stride;
-        ctx.packed_f64_loop_facts
-            .retain(|fact| fact.scope_id != scope_f64);
-        ctx.masked_window_array_facts
-            .retain(|fact| fact.scope_id != scope_f64);
+        ctx.receiver_descriptors.dematerialize_scope(scope_f64);
         acc_scope.finish(ctx);
         if !ctx.block().is_terminated() {
             ctx.block().br(&merge_label);
@@ -3428,10 +3563,8 @@ fn lower_packed_f64_range_versioned_for(
             Some((matched.counter_id, bound_i32.clone())),
         )?;
         ctx.poll_stride_counter_slot = saved_stride;
-        ctx.packed_f64_loop_facts
-            .retain(|fact| fact.scope_id != packed_scope_id);
-        ctx.masked_window_array_facts
-            .retain(|fact| fact.scope_id != packed_scope_id);
+        ctx.receiver_descriptors
+            .dematerialize_scope(packed_scope_id);
         acc_scope.finish(ctx);
         if !ctx.block().is_terminated() {
             ctx.block().br(&merge_label);
@@ -6770,7 +6903,7 @@ pub(super) fn lower_for_after_init_with_i32_bound(
     });
     let hoisted_buffer_bounds_width = hoist_classification.and_then(|hoist| {
         hoist.buffer_bounds_width_units.filter(|_| {
-            ctx.buffer_view_slots.contains_key(&hoist.arr_id)
+            ctx.receiver_descriptors.contains_buffer_view(hoist.arr_id)
                 && loop_counter_bounds_are_safe(ctx, hoist.counter_id, update, body)
         })
     });
@@ -6811,18 +6944,21 @@ pub(super) fn lower_for_after_init_with_i32_bound(
             )?;
             let slot = ctx.func.alloca_entry(DOUBLE);
             ctx.block().store(DOUBLE, &arr_box_loaded, &slot);
-            ctx.cached_lengths.insert(hoist.arr_id, slot.clone());
+            let installed = ctx
+                .receiver_descriptors
+                .materialize_cached_length(hoist.arr_id, slot.clone());
+            debug_assert!(installed, "loop must own its cached-length descriptor");
             Some(slot)
         };
         // Also tell `lower_index_set_fast` (and similar sites) that
         // `arr[counter_id]` is statically inbounds for this body, so
         // it can skip the runtime length-load + bound check.
         if hoisted_index_bounds_are_safe {
-            ctx.bounded_index_pairs.push(BoundedIndexPair {
-                index_local_id: hoist.counter_id,
-                array_local_id: hoist.arr_id,
-                scope_id: loop_proof_scope_id,
-            });
+            ctx.receiver_descriptors.materialize_bounded_index(
+                hoist.arr_id,
+                hoist.counter_id,
+                loop_proof_scope_id,
+            );
         }
         if let Some(bounds_width_units) = hoisted_buffer_bounds_width {
             ctx.bounded_buffer_index_pairs.push(BoundedBufferIndex {
@@ -6889,6 +7025,19 @@ pub(super) fn lower_for_after_init_with_i32_bound(
     } else {
         None
     };
+
+    // #9254 phase 3: once both the strict loop bound and its i32 storage are
+    // concrete, validate a numeric receiver once for the dynamic extent of
+    // this ordinary loop. Specialized clones keep precedence and own their
+    // existing descriptors; this path is for the generic counted-loop tier.
+    let ordinary_receiver_descriptor_installed =
+        if !in_call_free_clone && hoisted_length_slot.is_some() && i32_length_slot.is_some() {
+            hoist_classification.is_some_and(|hoist| {
+                materialize_ordinary_counted_array_descriptor(ctx, hoist, update, body)
+            })
+        } else {
+            false
+        };
 
     // Issue #168: when the `i < arr.length` peephole didn't fire, also
     // detect the simpler `i < n` shape where `n` is a statically proven
@@ -6979,7 +7128,10 @@ pub(super) fn lower_for_after_init_with_i32_bound(
         if local_bound_index_bounds_are_safe {
             if let Some(buffer_ids) = ctx.min_length_bounds.get(&bound_id).cloned() {
                 for buffer_local_id in buffer_ids {
-                    if ctx.buffer_view_slots.contains_key(&buffer_local_id) {
+                    if ctx
+                        .receiver_descriptors
+                        .contains_buffer_view(buffer_local_id)
+                    {
                         ctx.bounded_buffer_index_pairs.push(BoundedBufferIndex {
                             index_local_id: counter_id,
                             buffer_local_id,
@@ -6993,11 +7145,11 @@ pub(super) fn lower_for_after_init_with_i32_bound(
                 }
             }
             let alloc_bound_ids: Vec<u32> = ctx
-                .buffer_view_slots
-                .iter()
+                .receiver_descriptors
+                .buffer_views()
                 .filter_map(|(buffer_local_id, view)| match &view.length_source {
                     Some(LengthSource::Local { id, addend }) if *id == bound_id && *addend >= 0 => {
-                        Some(*buffer_local_id)
+                        Some(buffer_local_id)
                     }
                     _ => None,
                 })
@@ -7242,6 +7394,12 @@ pub(super) fn lower_for_after_init_with_i32_bound(
 
     ctx.loop_targets.pop();
 
+    if ordinary_receiver_descriptor_installed {
+        let arr_id = hoisted_length_arr_id.expect("installed descriptor has a length receiver");
+        let removed = ctx.receiver_descriptors.dematerialize(arr_id);
+        debug_assert!(removed, "loop owns the receiver descriptor it installed");
+    }
+
     // Pop the hoisted-length entry so nested loops or sibling loops
     // don't see a stale slot. Repsel Phase 1: only when THIS site inserted
     // it — a canonical-i32 counter's slot is its ONLY storage and must
@@ -7252,8 +7410,10 @@ pub(super) fn lower_for_after_init_with_i32_bound(
             ctx.i32_counter_slots.remove(&hoist.counter_id);
         }
     }
-    if let Some(arr_id) = hoisted_length_arr_id {
-        ctx.cached_lengths.remove(&arr_id);
+    if hoisted_length_slot.is_some() {
+        let arr_id = hoisted_length_arr_id.expect("a cached length has a receiver");
+        let removed = ctx.receiver_descriptors.dematerialize_cached_length(arr_id);
+        debug_assert!(removed, "loop must retire its cached-length descriptor");
     }
     let _ = hoisted_length_slot;
     // Pop the i32 counter slot we inserted for the `i < n` number-bound
@@ -7269,8 +7429,8 @@ pub(super) fn lower_for_after_init_with_i32_bound(
     // the counter's existing (Let-site) i32 slot or keeps its own private one
     // out of `ctx.i32_counter_slots` entirely (#6072).
     let _ = dynamic_i32_bound;
-    ctx.bounded_index_pairs
-        .retain(|fact| fact.scope_id != loop_proof_scope_id);
+    ctx.receiver_descriptors
+        .dematerialize_scope(loop_proof_scope_id);
     ctx.bounded_buffer_index_pairs
         .retain(|fact| fact.scope_id != loop_proof_scope_id);
     ctx.guarded_buffer_index_pairs
@@ -7431,7 +7591,7 @@ pub(crate) fn emit_gc_loop_safepoint(
         // be re-derived per element — which is why striding it 1-in-64 (#9316)
         // did not recover the loss and removing it does. Measured on
         // `bench_numeric_array_numeric`: 45 -> 38 ms against node's 38.
-        || !ctx.packed_f64_loop_facts.is_empty()
+        || ctx.receiver_descriptors.has_packed_f64_loop_facts()
         || ctx.versioned_indexed_loop_facts.last().is_some_and(|fact| {
             matches!(
                 fact.guard_mode,
@@ -8138,8 +8298,8 @@ fn min_length_bound_can_use_static_i32(ctx: &crate::expr::FnCtx<'_>, bound_id: u
     };
     !buffer_ids.is_empty()
         && buffer_ids.iter().all(|buffer_id| {
-            ctx.buffer_view_slots
-                .get(buffer_id)
+            ctx.receiver_descriptors
+                .buffer_view(buffer_id)
                 .and_then(|view| view.length_source.as_ref())
                 .is_some_and(|source| length_source_can_use_static_i32(ctx, source))
         })

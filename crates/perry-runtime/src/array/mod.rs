@@ -45,6 +45,8 @@ mod subclass;
 pub(crate) mod subclass_elements;
 
 #[cfg(test)]
+mod callback_rooting_tests;
+#[cfg(test)]
 mod collection_tag_tests;
 #[cfg(test)]
 mod forwarding_tests;
@@ -199,7 +201,8 @@ pub(crate) use self::sort::object_prototype_has_index_prop;
 pub(crate) use self::sort::object_prototype_index_get as sort_object_prototype_index_get;
 pub(crate) use self::sort::object_prototype_index_get_with_receiver as sort_object_prototype_index_get_with_receiver;
 pub use self::subclass::{
-    array_subclass_dense_snapshot, array_subclass_has_iterator_override, is_array_subclass_instance,
+    array_subclass_dense_snapshot, array_subclass_has_iterator_override,
+    is_array_subclass_instance, ArrayLikePicCache, ArrayLikePicCacheSlot, ARRAYLIKE_PIC_WORDS,
 };
 #[cfg(test)]
 pub(crate) use indexing_support::test_swap_array_index_fast_path_invalidated;

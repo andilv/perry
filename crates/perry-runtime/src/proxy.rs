@@ -34,6 +34,7 @@ pub use put_value::{js_proxy_set, js_put_value_set};
 pub(crate) use put_value::{
     js_put_value_set_ic_miss, proxy_set_with_receiver, IC_SLOT_OVERFLOW_BIT,
 };
+pub use put_value::{write_pic_way_entry, WritePicCache, WritePicCacheSlot, WRITE_PIC_WORDS};
 mod json;
 mod metadata;
 mod own_keys;
@@ -1494,7 +1495,7 @@ fn own_set_descriptor(target: f64, key: f64) -> Option<OwnSetDescriptor> {
     // deliberately gated off for typed arrays). Consult that state directly so
     // a non-writable own data property / setter-less accessor rejects the write
     // (test262 TypedArray internals/Set key-is-not-numeric-index).
-    if crate::typedarray::lookup_typed_array_kind(obj_ptr).is_some() {
+    if crate::typedarray_props::is_typed_array_owner(obj_ptr) {
         return match crate::typedarray_props::typed_array_own_set_descriptor(obj_ptr, &key_name) {
             Some(crate::typedarray_props::TypedArrayOwnSetDescriptor::Data { writable }) => {
                 Some(OwnSetDescriptor::Data { writable })
@@ -1857,7 +1858,7 @@ fn ordinary_set_with_receiver(target: f64, key: f64, value: f64, receiver: f64) 
         let addr = extract_pointer(target.to_bits()) as usize;
         // Typed arrays must be excluded before the header probe: small TAs
         // are plain-alloc'd without a GcHeader.
-        if crate::typedarray::lookup_typed_array_kind(addr).is_none()
+        if !crate::typedarray_props::is_typed_array_owner(addr)
             && crate::object::exotic_expando::exotic_expando_kind_of_value(target).is_none()
             && !crate::closure::is_closure_ptr(addr)
         {
@@ -2094,7 +2095,7 @@ fn ordinary_set_with_receiver(target: f64, key: f64, value: f64, receiver: f64) 
         // ordinary data-descriptor flow (create on receiver); an invalid
         // canonical index is a silent no-op `true`.
         let cur_addr = extract_pointer(current.to_bits()) as usize;
-        if crate::typedarray::lookup_typed_array_kind(cur_addr).is_some() {
+        if crate::typedarray_props::is_typed_array_owner(cur_addr) {
             if let Some(name) = property_key_to_rust_string(key) {
                 match crate::typedarray_props::typed_array_canonical_index_validity(cur_addr, &name)
                 {
@@ -2114,7 +2115,7 @@ fn ordinary_set_with_receiver(target: f64, key: f64, value: f64, receiver: f64) 
                         // CreateDataProperty lands in ITS [[DefineOwnProperty]],
                         // which rejects an index that is invalid FOR THE
                         // RECEIVER (`Reflect.set(ta, "0", v, emptyTa)` → false).
-                        if crate::typedarray::lookup_typed_array_kind(recv_addr).is_some() {
+                        if crate::typedarray_props::is_typed_array_owner(recv_addr) {
                             return match crate::typedarray_props::
                                 typed_array_canonical_index_validity(recv_addr, &name)
                             {
@@ -3280,8 +3281,10 @@ mod tests {
         let key_ptr = crate::string::js_string_from_bytes(b"n".as_ptr(), 1);
         let key_ptr = crate::string::js_string_intern(key_ptr, fnv1a(b"n"));
 
-        let mut cache = [0i64; 2];
-        let stored = put_value::js_put_value_set_ic_miss(target, key_ptr, 7.0, 0, &mut cache);
+        let mut cache: put_value::WritePicCache = [0; put_value::WRITE_PIC_WORDS];
+        let mut cache_slot: put_value::WritePicCacheSlot = &mut cache;
+        let stored =
+            put_value::js_put_value_set_ic_miss(target, key_ptr, 7.0, 0, &mut cache_slot, 0);
         assert_eq!(stored, 7.0);
         let expected_token = unsafe {
             crate::object::shapes::PIC_ID_TOKEN_BIT
@@ -3303,13 +3306,15 @@ mod tests {
                 (unmarked as *mut u8).sub(crate::gc::GC_HEADER_SIZE) as *mut crate::gc::GcHeader;
             (*header)._reserved &= !crate::gc::OBJ_FLAG_PLAIN_ORDINARY;
         }
-        let mut cache2 = [0i64; 2];
+        let mut cache2: put_value::WritePicCache = [0; put_value::WRITE_PIC_WORDS];
+        let mut cache2_slot: put_value::WritePicCacheSlot = &mut cache2;
         let stored = put_value::js_put_value_set_ic_miss(
             f64::from_bits(value.bits()),
             key_ptr,
             9.0,
             0,
-            &mut cache2,
+            &mut cache2_slot,
+            0,
         );
         assert_eq!(stored, 9.0, "the write itself still succeeds");
         assert_eq!(
