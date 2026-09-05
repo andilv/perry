@@ -947,7 +947,13 @@ fn yaml_parse(input: f64) -> f64 {
                 let problem = if parser.problem.is_null() {
                     "invalid YAML".to_string()
                 } else {
-                    std::ffi::CStr::from_ptr(parser.problem)
+                    // unsafe-libyaml hardcodes `i8 as c_char` in its private
+                    // libc shim (lib.rs:50), so `parser.problem` is always
+                    // `*const i8`. On targets where C's char is unsigned
+                    // (aarch64/arm/riscv64) `CStr::from_ptr` expects
+                    // `*const u8` — route through `ptr::cast` so the pointee
+                    // is inferred from from_ptr's target-correct `c_char`.
+                    std::ffi::CStr::from_ptr(parser.problem.cast())
                         .to_string_lossy()
                         .into_owned()
                 };
