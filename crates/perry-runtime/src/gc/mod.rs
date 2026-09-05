@@ -163,6 +163,10 @@ mod forwarding;
 /// Per-scanner root attribution for the copied-minor root scan (#7915).
 mod scanner_profile;
 mod sticky_remembered;
+/// #9754: per-side-table young-entry logs (remembered sets for the runtime
+/// side tables), so a minor-scoped root scan visits only the entries that
+/// can hold a pointer a minor acts on.
+pub(crate) mod young_log;
 use copying::*;
 use copying_first_cycle::*;
 // Named rather than glob-imported: a glob does not propagate through the
@@ -247,9 +251,11 @@ pub use verify::*;
 pub(crate) mod census;
 #[cfg(feature = "diagnostics")]
 mod heap_snapshot;
+mod heap_stats;
 pub use census::{census_poll_signal, gc_census_enabled};
 #[cfg(feature = "diagnostics")]
 pub use heap_snapshot::gc_build_v8_heap_snapshot_json;
+pub(crate) use heap_stats::heap_stats;
 
 pub fn gc_collect_minor() -> u64 {
     if defer_gc_request(DeferredGcRequest::DirectMinor) {
@@ -939,6 +945,8 @@ pub fn gc_init() {
     // `PERRY_GC_CENSUS`: remember the main thread and install the SIGUSR2
     // trigger. No-op (one OnceLock read) when the env var is unset.
     census::census_on_gc_init();
+    #[cfg(feature = "alloc-census")]
+    crate::alloc_census::alloc_census_init();
     reg_budgeted_scanner!(
         scan_runtime_handle_roots_mut,
         scan_runtime_handle_roots_mut_step,
@@ -1097,6 +1105,9 @@ pub fn gc_init() {
     // REWRITES: an evacuating collection moves them like any other array, and
     // the thread-local slot is the only place the new address can be recorded.
     reg_scanner!(crate::iter_result::scan_iter_result_keys_roots_mut);
+    // Same shape as the line above: the shared keys arrays behind
+    // `Intl.Segmenter`'s segment records are referenced only by this cache.
+    reg_scanner!(crate::intl::segmenter::scan_segment_record_keys_roots_mut);
     reg_scanner!(small_int_cache_mutable_root_scanner);
     reg_scanner!(concat_memo_mutable_root_scanner);
     reg_scanner!(crate::builtins::scan_console_log_singleton_roots_mut);

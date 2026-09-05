@@ -652,7 +652,9 @@ pub unsafe extern "C-unwind" fn js_native_call_method_value(
     let key_jsval = JSValue::from_bits(key.to_bits());
     let is_symbol_key = crate::symbol::js_is_symbol(key) != 0;
 
-    if is_symbol_key {
+    // Well-known symbol calls must use the current property value below;
+    // direct registry dispatch bypasses own/prototype replacements (#9788).
+    if is_symbol_key && !crate::symbol::is_well_known_symbol(crate::symbol::sym_key_from_f64(key)) {
         let sym_key = crate::symbol::sym_key_from_f64(key);
         if sym_key != 0 {
             let bits = object.to_bits();
@@ -886,7 +888,7 @@ pub unsafe extern "C-unwind" fn js_native_call_method_value(
     // (whose slot is already the receiver), effect's Tag-class symbol *statics*
     // (plain data values), and any closure that doesn't read `this` are all left
     // untouched — keeping the #1758/#36/#321 closure-proto-chain paths intact.
-    let field = if is_symbol_key && crate::symbol::own_symbol_property(object, key).is_none() {
+    let field = if is_symbol_key && !crate::symbol::has_own_symbol_property(object, key) {
         f64::from_bits(crate::closure::clone_closure_rebind_this(
             field.to_bits(),
             object,
@@ -1307,11 +1309,13 @@ pub unsafe extern "C-unwind" fn js_native_call_method(
     // property lookup before any class/native dispatch: that lookup preserves
     // own-property precedence and, for a miss, the per-instance chain is
     // authoritative rather than falling back to the original class vtable.
+    // #9502: an evaluated class's chain has the same precedence because two
+    // instances with the same template id can inherit different parent methods.
     if jsval().is_pointer() {
         let candidate = jsval().as_pointer::<ObjectHeader>() as usize;
         if crate::value::addr_class::is_above_handle_band(candidate)
             && crate::object::is_valid_obj_ptr(candidate as *const u8)
-            && super::prototype_chain::object_has_user_prototype_override(candidate)
+            && super::prototype_chain::object_has_individual_class_prototype(candidate)
         {
             let method_key =
                 crate::string::js_string_from_bytes(method_name.as_ptr(), method_name.len() as u32);

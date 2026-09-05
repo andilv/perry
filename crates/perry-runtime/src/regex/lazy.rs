@@ -163,22 +163,22 @@ pub(super) fn mark_pattern_validated(pattern: &str, flags: &str) {
 /// Prefers the GC-survivable side table (issue #637) and falls back to the
 /// header's own string payloads, which — unlike the thread-local table — are
 /// readable from a second statically-linked copy of the runtime (Wall 18).
-pub(super) fn source_and_flags(re: *const RegExpHeader) -> (String, String) {
+pub(super) fn source_and_flags(re: *const RegExpHeader) -> (Arc<str>, Arc<str>) {
     if let Some(source) =
         REGEX_SOURCE_TABLE.with(|table| table.borrow().get(&(re as usize)).cloned())
     {
         return source;
     }
     unsafe {
-        let pattern = if is_valid_ptr((*re).pattern_ptr) {
-            string_as_str((*re).pattern_ptr).to_string()
+        let pattern: Arc<str> = if is_valid_ptr((*re).pattern_ptr) {
+            Arc::from(string_as_str((*re).pattern_ptr))
         } else {
-            String::new()
+            Arc::from("")
         };
-        let flags = if is_valid_ptr((*re).flags_ptr) {
-            string_as_str((*re).flags_ptr).to_string()
+        let flags: Arc<str> = if is_valid_ptr((*re).flags_ptr) {
+            Arc::from(string_as_str((*re).flags_ptr))
         } else {
-            String::new()
+            Arc::from("")
         };
         (pattern, flags)
     }
@@ -229,20 +229,100 @@ fn build_and_install_programs(re: *const RegExpHeader) {
         return;
     }
     let (pattern, flags) = source_and_flags(re);
-    let arc = get_or_compile_regex(&pattern, &flags);
-    let regex_ptr = Arc::into_raw(arc) as *mut Regex;
-    let fancy_ptr: *const () =
-        FANCY_CACHE.with(
-            |fc| match fc.borrow().get(&(pattern.clone(), flags.clone())) {
-                Some(arc) => Arc::into_raw(arc.clone()) as *const (),
-                None => std::ptr::null(),
-            },
-        );
-    let repeat_matcher_ptr: *const () =
-        REPEAT_MATCHER_CACHE.with(|cache| match cache.borrow().get(&(pattern, flags)) {
-            Some(arc) => Arc::into_raw(arc.clone()) as *const (),
-            None => std::ptr::null(),
+    if crate::hot_diag::regex_on() {
+        let cache_hit = super::REGEX_CACHE.with(|cache| {
+            cache
+                .borrow()
+                .contains_key(&(pattern.to_string(), flags.to_string()))
         });
+        unsafe {
+            let pattern_ptr = (*re).pattern_ptr;
+            crate::hot_diag::regex_with(|d| {
+                d.note_build(pattern_ptr as usize, pattern.as_bytes(), &flags, cache_hit)
+            });
+        }
+    }
+    let std_arc = get_or_compile_regex(&pattern, &flags);
+    let fancy_arc: Option<Arc<fancy_regex::Regex>> = FANCY_CACHE.with(|fc| {
+        fc.borrow()
+            .get(&(pattern.to_string(), flags.to_string()))
+            .cloned()
+    });
+    let repeat_arc: Option<Arc<super::repeat_matcher::RepeatMatcherRegex>> = REPEAT_MATCHER_CACHE
+        .with(|cache| {
+            cache
+                .borrow()
+                .get(&(pattern.to_string(), flags.to_string()))
+                .cloned()
+        });
+    // ── Repair before publishing ──────────────────────────────────────────
+    //
+    // A built header is treated as AUTHORITATIVE — `lookup_fancy_regex` /
+    // `lookup_repeat_matcher` read a null slot beside a non-null `regex_ptr`
+    // as "this pattern has no such program" — and `install_programs` below
+    // memoizes the triple against the pattern text, so whatever is assembled
+    // here becomes the answer for every later construction of the same
+    // literal. It therefore has to be complete, and the probes above cannot
+    // guarantee that on their own: the three caches are capped independently
+    // and each `clear()`s wholesale, while
+    // `compile_and_cache_regex_checked` returns early whenever `REGEX_CACHE`
+    // already holds the pattern — so it never re-runs the fancy or
+    // repeat-matcher build for a pattern whose `REGEX_CACHE` entry survived a
+    // clear of one of the others.
+    //
+    // Both gaps are silent WRONG ANSWERS, not slowdowns: a lookbehind literal
+    // whose fancy program is missing matches nothing at all, and a
+    // quantified-capture literal whose repeat matcher is missing reports the
+    // linear engine's capture assignment instead of ECMA-262's. Re-derive
+    // what is missing. Each check costs nothing when the caches are coherent,
+    // which is the normal case.
+    let mut fancy_arc = fancy_arc;
+    if fancy_arc.is_none() && std_arc.as_str() == super::NEVER_MATCH_PATTERN {
+        // The standard program matches nothing, so this pattern is only
+        // usable through the fancy engine — and it is not there.
+        let flag_prefixed = flag_prefixed_pattern(&pattern, &flags);
+        if let Ok(fre) = super::build_fancy_regex(&flag_prefixed) {
+            let arc = Arc::new(fre);
+            FANCY_CACHE.with(|fc| {
+                let mut fc = fc.borrow_mut();
+                evict_regex_cache_if_full(&mut fc);
+                fc.insert((pattern.to_string(), flags.to_string()), arc.clone());
+            });
+            fancy_arc = Some(arc);
+        }
+    }
+    let mut repeat_arc = repeat_arc;
+    if repeat_arc.is_none() {
+        // `compile` is a byte scan that returns `None` immediately unless a
+        // capture group sits under a quantifier (or inside a negative
+        // lookaround), so this is free for the patterns that do not need it.
+        if let Some(matcher) = super::repeat_matcher::compile(&pattern, &flags) {
+            let arc = Arc::new(matcher);
+            REPEAT_MATCHER_CACHE.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                evict_regex_cache_if_full(&mut cache);
+                cache.insert((pattern.to_string(), flags.to_string()), arc.clone());
+            });
+            repeat_arc = Some(arc);
+        }
+    }
+
+    // Remember the built programs against the pattern text, so the next
+    // construction of the same literal is born built (`js_regexp_new`).
+    super::site_cache::install_programs(
+        &pattern,
+        &flags,
+        super::site_cache::Programs {
+            std: std_arc.clone(),
+            fancy: fancy_arc.clone(),
+            repeat: repeat_arc.clone(),
+        },
+    );
+    let regex_ptr = Arc::into_raw(std_arc) as *mut Regex;
+    let fancy_ptr: *const () =
+        fancy_arc.map_or(std::ptr::null(), |arc| Arc::into_raw(arc) as *const ());
+    let repeat_matcher_ptr: *const () =
+        repeat_arc.map_or(std::ptr::null(), |arc| Arc::into_raw(arc) as *const ());
     unsafe {
         let re = re as *mut RegExpHeader;
         (*re).fancy_ptr = fancy_ptr;

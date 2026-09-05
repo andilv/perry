@@ -1648,3 +1648,185 @@ fn global_replace_substitutes_at_every_empty_match() {
     let out = js_string_replace_regex_named(make_string("a"), named, make_string("[$<n>]"));
     assert_eq!(string_as_str(out), "[a][]");
 }
+
+/// The construction cache (`regex::site_cache`): once a header built from
+/// some `(pattern, flags)` has been executed, the next construction of the
+/// same text is born built — it shares the executed header's program and
+/// never runs the lazy build. Fails on a runtime without the cache (the
+/// second header stays lazy).
+#[test]
+fn site_cache_reconstruction_is_born_built() {
+    let _lock = crate::gc::global_side_table_test_lock();
+    site_cache::test_reset();
+    let re1 = js_regexp_new(make_string("born[0-9]+built"), make_string("g"));
+    assert!(
+        unsafe { (*re1).regex_ptr.is_null() },
+        "construction stays lazy"
+    );
+    assert_eq!(
+        site_cache::test_has_programs("born[0-9]+built", "g"),
+        Some(false),
+        "construction records the validated text without programs"
+    );
+    assert!(js_regexp_test(re1, make_string("xx born42built")) != 0);
+    assert_eq!(
+        site_cache::test_has_programs("born[0-9]+built", "g"),
+        Some(true),
+        "the first execution's build is remembered against the text"
+    );
+    let re2 = js_regexp_new(make_string("born[0-9]+built"), make_string("g"));
+    assert!(
+        !unsafe { (*re2).regex_ptr.is_null() },
+        "the second construction installs the programs eagerly"
+    );
+    assert!(
+        std::ptr::eq(unsafe { (*re1).regex_ptr }, unsafe { (*re2).regex_ptr }),
+        "both headers share one compiled program"
+    );
+    // The owned source copies are shared too (two refcount bumps per header,
+    // not two `String`s).
+    let (p1, p2) = REGEX_SOURCE_TABLE.with(|t| {
+        let t = t.borrow();
+        (
+            t.get(&(re1 as usize)).map(|(p, _)| p.clone()).unwrap(),
+            t.get(&(re2 as usize)).map(|(p, _)| p.clone()).unwrap(),
+        )
+    });
+    assert!(Arc::ptr_eq(&p1, &p2), "source text is shared, not copied");
+    assert_eq!(js_regexp_test(re2, make_string("born7built")), 1);
+    assert_eq!(js_regexp_test(re2, make_string("nothing")), 0);
+    // Different flags are a different entry.
+    let re3 = js_regexp_new(make_string("born[0-9]+built"), make_string("i"));
+    assert!(unsafe { (*re3).regex_ptr.is_null() });
+}
+
+/// `test` on a global/sticky receiver advances `lastIndex` exactly like
+/// `exec` and resets it on failure, through the find-only engine phase (no
+/// exec array). Pinned against node for every branch of that bookkeeping.
+#[test]
+fn global_test_advances_and_resets_last_index() {
+    let _lock = crate::gc::global_side_table_test_lock();
+    let re = js_regexp_new(make_string("a"), make_string("g"));
+    let s = make_string("aXa");
+    assert_eq!(js_regexp_test(re, s), 1);
+    assert_eq!(js_regexp_get_last_index(re), 1.0);
+    assert_eq!(js_regexp_test(re, s), 1);
+    assert_eq!(js_regexp_get_last_index(re), 3.0);
+    assert_eq!(js_regexp_test(re, s), 0);
+    assert_eq!(js_regexp_get_last_index(re), 0.0);
+
+    // `lastIndex > length` is "no match" and resets.
+    js_regexp_set_last_index(re, 10.0);
+    assert_eq!(js_regexp_test(re, s), 0);
+    assert_eq!(js_regexp_get_last_index(re), 0.0);
+
+    // sticky anchors at lastIndex.
+    let sticky = js_regexp_new(make_string("a"), make_string("y"));
+    let t = make_string("ba");
+    assert_eq!(js_regexp_test(sticky, t), 0);
+    assert_eq!(js_regexp_get_last_index(sticky), 0.0);
+    js_regexp_set_last_index(sticky, 1.0);
+    assert_eq!(js_regexp_test(sticky, t), 1);
+    assert_eq!(js_regexp_get_last_index(sticky), 2.0);
+
+    // lastIndex counts UTF-16 code units, not bytes.
+    let astral = js_regexp_new(make_string("b"), make_string("g"));
+    let u = make_string("😀b😀b");
+    assert_eq!(js_regexp_test(astral, u), 1);
+    assert_eq!(js_regexp_get_last_index(astral), 3.0);
+    assert_eq!(js_regexp_test(astral, u), 1);
+    assert_eq!(js_regexp_get_last_index(astral), 6.0);
+    assert_eq!(js_regexp_test(astral, u), 0);
+
+    // The fancy-regex fallback (lookbehind) takes the same path.
+    let fancy = js_regexp_new(make_string("(?<=x)a"), make_string("g"));
+    let f = make_string("xa xa a");
+    assert_eq!(js_regexp_test(fancy, f), 1);
+    assert_eq!(js_regexp_get_last_index(fancy), 2.0);
+    assert_eq!(js_regexp_test(fancy, f), 1);
+    assert_eq!(js_regexp_get_last_index(fancy), 5.0);
+    assert_eq!(js_regexp_test(fancy, f), 0);
+    assert_eq!(js_regexp_get_last_index(fancy), 0.0);
+
+    // The backtracking matcher (quantified capture) likewise.
+    let repeat = js_regexp_new(make_string("(a?b??)*c"), make_string("g"));
+    let r = make_string("abc c");
+    assert_eq!(js_regexp_test(repeat, r), 1);
+    assert_eq!(js_regexp_get_last_index(repeat), 3.0);
+    assert_eq!(js_regexp_test(repeat, r), 1);
+    assert_eq!(js_regexp_get_last_index(repeat), 5.0);
+    assert_eq!(js_regexp_test(repeat, r), 0);
+}
+
+/// A capacity event in one compiled-program cache must not leave a pattern
+/// whose real program lives in ANOTHER of them permanently non-matching.
+///
+/// `compile_and_cache_regex_checked` returns early when `REGEX_CACHE` already
+/// holds the pattern, so it never re-runs the fancy build; for a lookbehind
+/// pattern that `REGEX_CACHE` entry is the never-match placeholder and the
+/// real program is the one in `FANCY_CACHE`. Clear `FANCY_CACHE` on its own —
+/// which is exactly what its independent 512-entry overflow used to do — and
+/// `get_or_compile_regex` hands back a program that matches nothing while
+/// nothing rebuilds the fallback. Since `lookup_fancy_regex` now treats a
+/// built header as authoritative and `site_cache::install_programs` memoizes
+/// the triple against the pattern text, that is not one bad header: every
+/// later construction of the same literal is born with it.
+///
+/// The fix is that `lazy::build_and_install_programs` REPAIRS the header
+/// before publishing it and before memoizing the triple: a standard program
+/// that is the never-match placeholder with no fancy program beside it means
+/// the fancy program is missing, so it is rebuilt. (Clearing the three caches
+/// as a group was built first and dropped: it closes the route into the bad
+/// state but cannot repair a header already in it, so this test still failed.)
+#[test]
+fn a_single_program_cache_clear_cannot_disarm_a_lookbehind_literal() {
+    let _lock = crate::gc::global_side_table_test_lock();
+    let source = "(?<=foo)bar";
+    let scope = crate::gc::RuntimeHandleScope::new();
+    site_cache::test_reset();
+
+    let build = || {
+        let pattern = scope.root_string_ptr(make_string(source));
+        let flags = scope.root_string_ptr(make_string(""));
+        pattern.with_mut_ptr::<StringHeader, _>(|pattern| {
+            flags.with_mut_ptr::<StringHeader, _>(|flags| js_regexp_new(pattern, flags))
+        })
+    };
+    let subject = scope.root_string_ptr(make_string("foobar"));
+
+    let warm = build();
+    assert_eq!(
+        subject.with_const_ptr::<StringHeader, _>(|s| js_regexp_test(warm, s)),
+        1,
+        "a lookbehind pattern must match through the fancy fallback"
+    );
+
+    // The state a `FANCY_CACHE` overflow produces: its programs are gone, the
+    // never-match placeholder for this pattern survives in `REGEX_CACHE`.
+    FANCY_CACHE.with(|fc| fc.borrow_mut().clear());
+    assert!(
+        REGEX_CACHE.with(|c| c
+            .borrow()
+            .contains_key(&(source.to_string(), String::new()))),
+        "the placeholder must survive, or this test exercises nothing"
+    );
+    // A fresh literal site, so the construction cache cannot answer from the
+    // programs the first header built.
+    site_cache::test_reset();
+
+    let cold = build();
+    unsafe {
+        lazy::ensure_regex_compiled(cold);
+        assert!(
+            !(*cold).fancy_ptr.is_null(),
+            "a built header must carry every program its pattern needs — a null \
+             fancy_ptr here is memoized by site_cache::install_programs and makes \
+             the breakage permanent for this literal"
+        );
+    }
+    assert_eq!(
+        subject.with_const_ptr::<StringHeader, _>(|s| js_regexp_test(cold, s)),
+        1,
+        "the literal must still match after an unrelated cache reached capacity"
+    );
+}
