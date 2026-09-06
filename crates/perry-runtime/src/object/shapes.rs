@@ -45,7 +45,7 @@ pub(crate) use shapes_slot_list::{
     object_shape_hole_count, publish_object_shape_holes,
     rekey_stable_tombstone_shape_after_squeeze, retire_owned_shape_history,
     shape_index_migrate_after_delete, shape_index_shift_in_place,
-    try_update_stable_tombstone_shape, try_update_stable_tombstone_shape_cached, SlotList,
+    try_update_stable_tombstone_shape, try_update_stable_tombstone_shape_cached, SlotIndex,
 };
 use shapes_store::{
     IdList, ShapeRecord, ShapeSlab, RECORD_FLAG_CACHE_CARRIER, RECORD_FLAG_CARRIED_SEEN,
@@ -68,7 +68,7 @@ pub(crate) struct ShapeIndex {
     /// `bench_populated_delete.ts` — perry's worst object-model gap against
     /// node — `hash_one::<&usize>` plus `sip::Hasher::write` were **14.7% of
     /// self time**, second only to the lookup that performs them.
-    slots: crate::fast_hash::PtrHashMap<u64, SlotList>,
+    slots: SlotIndex,
 }
 
 /// Immutable facts named by one ShapeId, copied out of the table.
@@ -264,6 +264,15 @@ struct ShapeTableInner {
 
 const SHAPE_YOUNG_LOG_NAME: &str = "shapes.families+indices";
 
+/// Re-export of the id-list operation counters' report, so the collector does
+/// not have to name a private sibling module. One `[gc-idlist]` line per
+/// copying minor under `PERRY_GC_DIAG=1`; `elems_moved` is the falsifier for
+/// the swap-remove change.
+#[inline]
+pub(crate) fn id_list_report() {
+    shapes_store::id_list_report();
+}
+
 impl ShapeTableInner {
     /// Rule 1 of `gc/young_log.rs`: log a keys address BEFORE a family or a
     /// slot index is published under it, when the keys array is not old.
@@ -305,7 +314,14 @@ impl ShapeTableInner {
         let Some(ids) = self.families.get_mut(&keys) else {
             return false;
         };
-        let removed = ids.remove(id);
+        // UNORDERED: a family's readers are set-valued (see `IdList`'s type
+        // doc), and the ordered removal was memmoving the whole tail of a list
+        // measured at up to 514,030 entries, from position ~0.31, 3.7 M times
+        // per 3300-char reply. The dominant caller is the dead-owner prune
+        // (`prune_dead_owner_side_tables_post_trace` ->
+        // `remove_descriptor_indexed_under`); `retire_owned_shape_siblings`
+        // never sees a family longer than 16.
+        let removed = ids.remove_unordered(id);
         if ids.is_empty() {
             self.families.remove(&keys);
         }
@@ -334,7 +350,11 @@ impl ShapeTableInner {
         let Some(ids) = self.by_facts.get_mut(&facts) else {
             return false;
         };
-        let removed = ids.remove(id);
+        // ORDERED, and it must stay ordered: `facts_push_front` is how an
+        // installed process-global id becomes the canonical answer ahead of an
+        // equivalent local one, and this list is read first-wins. Measured at
+        // max length 1 on cc, so the order costs nothing to keep.
+        let removed = ids.remove_ordered(id);
         if ids.is_empty() {
             self.by_facts.remove(&facts);
         }
@@ -1627,12 +1647,7 @@ unsafe fn index_range(shape: &mut ShapeIndex, keys: *const ArrayHeader, key_coun
         let v = crate::JSValue::from_bits((*slots.add(i as usize)).to_bits());
         if let Some(b) = crate::string::js_string_key_bytes(v, &mut sso) {
             let h = super::key_bytes_hash(b.as_ptr(), b.len());
-            match shape.slots.entry(h) {
-                std::collections::hash_map::Entry::Occupied(mut e) => e.get_mut().push(i),
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(SlotList::One(i));
-                }
-            }
+            shape.slots.push(h, i);
         }
     }
     shape.indexed_len = key_count;
@@ -1699,7 +1714,7 @@ pub(crate) unsafe fn shape_slot_lookup_verdict(
             inner.note_young_keys(keys_id as u64);
             inner.indices.entry(keys_id).or_insert(ShapeIndex {
                 indexed_len: 0,
-                slots: crate::fast_hash::new_ptr_hash_map(),
+                slots: SlotIndex::new(),
             })
         }
     };
@@ -1712,12 +1727,9 @@ pub(crate) unsafe fn shape_slot_lookup_verdict(
     } else {
         KeysIndexVerdict::Unindexed
     };
-    let Some(candidates) = shape.slots.get(&key_hash) else {
-        return absent;
-    };
     let mut sso = [0u8; crate::value::SHORT_STRING_MAX_LEN];
     let (slots, slot_len) = super::keys_array_dense_slots(keys);
-    for &i in candidates.iter() {
+    for i in shape.slots.candidates(key_hash) {
         if (i as usize) >= slot_len || i >= key_count {
             continue;
         }
@@ -1746,12 +1758,7 @@ pub(crate) fn shape_note_append(
     if let Some(shape) = inner.indices.get_mut(&(keys as usize)) {
         if shape.indexed_len + 1 == new_count {
             shape.indexed_len = new_count;
-            match shape.slots.entry(key_hash) {
-                std::collections::hash_map::Entry::Occupied(mut e) => e.get_mut().push(slot),
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(SlotList::One(slot));
-                }
-            }
+            shape.slots.push(key_hash, slot);
         }
     }
 }
@@ -1761,12 +1768,7 @@ pub(crate) fn shape_note_append(
 pub(crate) fn shape_note_hit(keys: *const ArrayHeader, key_hash: u64, slot: u32) {
     let mut inner = crate::state::state().shapes.inner.borrow_mut();
     if let Some(shape) = inner.indices.get_mut(&(keys as usize)) {
-        match shape.slots.entry(key_hash) {
-            std::collections::hash_map::Entry::Occupied(mut e) => e.get_mut().push(slot),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(SlotList::One(slot));
-            }
-        }
+        shape.slots.push(key_hash, slot);
     }
 }
 
@@ -2314,17 +2316,13 @@ pub(crate) fn shrink_shape_tables() {
 /// `PERRY_GC_CENSUS`: the by-id slab, the per-shape key indices, the
 /// exact-facts accelerator and the keys-address family index.
 pub(crate) fn shape_table_census() -> Vec<crate::gc::census::SideTableRow> {
-    use crate::gc::census::{hash_table_bytes, map_bytes};
+    use crate::gc::census::map_bytes;
     let table = &crate::state::state().shapes;
     let inner = table.inner.borrow();
     let slab = table.slab();
     let mut rows = Vec::new();
     rows.push(("shapes.descriptors", slab.len(), slab.estimated_bytes()));
-    let index_inner: usize = inner
-        .indices
-        .values()
-        .map(|ix| hash_table_bytes(ix.slots.capacity(), std::mem::size_of::<(u64, SlotList)>()))
-        .sum();
+    let index_inner: usize = inner.indices.values().map(|ix| ix.slots.heap_bytes()).sum();
     rows.push((
         "shapes.indices",
         inner.indices.len(),

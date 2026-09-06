@@ -23,7 +23,7 @@ mod callable_export_check;
 mod callable_export_table;
 pub(crate) mod callable_exports;
 mod perf_instance_bind;
-pub(crate) use perf_instance_bind::instance_bound_perf_method;
+pub(crate) use perf_instance_bind::{instance_bound_perf_method, performance_namespace_method};
 mod constants;
 mod constants_tables;
 mod constructor_exports;
@@ -702,14 +702,6 @@ pub(crate) fn cjs_default_export_value(module_name: &str) -> Option<f64> {
             "dgram".len(),
         )),
         "module" => Some(bound_native_callable_export_value("module", "Module")),
-        // node:perf_hooks has no distinct CJS shape — `module.exports` IS the
-        // namespace, and `default` is listed among its keys. Resolving to the
-        // same tag keeps `hooks.default.performance === hooks.performance`
-        // (the `performance` singleton resolves identically from either).
-        "perf_hooks" => Some(js_create_native_module_namespace(
-            b"perf_hooks".as_ptr(),
-            "perf_hooks".len(),
-        )),
         "process" => Some(js_create_native_module_namespace(
             b"process".as_ptr(),
             "process".len(),
@@ -812,6 +804,7 @@ fn should_cache_native_module_namespace(module_name: &str) -> bool {
             | "path.default"
             | "path.posix.default"
             | "path.win32.default"
+            | "perf_hooks.default"
             | "punycode"
             | "punycode.default"
             | "punycode.ucs2"
@@ -936,12 +929,13 @@ unsafe fn native_module_property_by_name_impl(
     // `typeof performance === "object"`, `performance.timeOrigin` (a
     // constant), `performance.now` (a callable export), and
     // `constants.NODE_PERFORMANCE_GC_*` (constants) all dispatch coherently.
-    if module_name == "perf_hooks" && property_name == "performance" {
+    if matches!(module_name, "perf_hooks" | "perf_hooks.default") && property_name == "performance"
+    {
         // Singleton so `require("perf_hooks").performance` and the global
         // `performance` are the same object (Node identity guarantee, #1327).
         return crate::perf_hooks::performance_namespace();
     }
-    if module_name == "perf_hooks" && property_name == "constants" {
+    if matches!(module_name, "perf_hooks" | "perf_hooks.default") && property_name == "constants" {
         // Its OWN tag. Sharing the `perf_hooks` tag made every read of the
         // constants object resolve against the MODULE's surface, so
         // `Object.keys(constants)` enumerated the export list instead of the
@@ -1192,6 +1186,12 @@ pub extern "C" fn js_native_module_bind_method(
         if let Some(value) = super::global_this::subtle_crypto_method_value(property_name) {
             return value;
         }
+    }
+
+    if let Some(value) =
+        performance_namespace_method(&module_name, property_name, namespace.get_nanbox_f64())
+    {
+        return value;
     }
 
     // Check for known constant properties first
@@ -1832,6 +1832,9 @@ unsafe fn vt_get_own_field(
     }
     if let Some(value) = super::field_get_set::native_module_own_field_by_key(obj, key) {
         return Some(value);
+    }
+    if let Some(value) = performance_namespace_method(&module_name, property_name, nb_ptr) {
+        return Some(JSValue::from_bits(value.to_bits()));
     }
     // #3687: node:cluster default-import EventEmitter methods on the
     // distinct `cluster.default` namespace (see original comment at the

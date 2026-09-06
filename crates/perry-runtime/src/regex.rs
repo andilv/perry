@@ -42,6 +42,17 @@ mod exec_array;
 #[cfg(feature = "regex-engine")]
 mod flags;
 #[cfg(feature = "regex-engine")]
+mod program_key;
+#[cfg(feature = "regex-engine")]
+mod replace_expand_fancy;
+#[cfg(feature = "regex-engine")]
+pub(crate) use program_key::{ProgramKey, NEVER_MATCH_PATTERN};
+#[cfg(feature = "regex-engine")]
+pub use replace_expand_fancy::{
+    js_string_replace_all_regex, js_string_replace_regex, js_string_search_regex,
+    js_string_split_regex, js_string_split_regex_n,
+};
+#[cfg(feature = "regex-engine")]
 mod global_guards;
 #[cfg(feature = "regex-engine")]
 mod global_scan;
@@ -251,6 +262,120 @@ pub(crate) unsafe fn regex_header_finalize_for_gc(re: *mut RegExpHeader) {
     regex_header_clear_dead_for_gc(re as usize);
 }
 
+/// Finalize the RegExp headers that died in from-space during a copied minor.
+///
+/// The copying minor's from-space flip runs no per-object finalize hooks, so
+/// a nursery header that was neither evacuated nor pinned would otherwise keep
+/// its `Arc` programs and its `REGEX_POINTERS` / `REGEX_SOURCE_TABLE` / expando
+/// entries forever. Same shape as `map::finalize_dead_copied_minor_from_space_maps`:
+/// walk the registry after the flip, collect the provably-dead addresses, then
+/// finalize each (the finalizer removes its own registry entries, which is why
+/// the walk and the removal are two passes).
+///
+/// Cost: O(registry) = O(live headers + headers allocated since the last
+/// minor) — the same order as the malloc sweep this replaces, and
+/// proportional to allocation, not to program history.
+pub(crate) fn finalize_dead_copied_minor_from_space_regexps() -> usize {
+    let dead: Vec<usize> = REGEX_POINTERS.with(|table| {
+        table
+            .borrow()
+            .iter()
+            .copied()
+            .filter(|&addr| {
+                crate::gc::owner_is_dead_copied_minor_from_space_of_type(
+                    addr,
+                    crate::gc::GC_TYPE_REGEXP,
+                )
+            })
+            .collect()
+    });
+    let count = dead.len();
+    for addr in dead {
+        unsafe { regex_header_finalize_for_gc(addr as *mut RegExpHeader) };
+    }
+    count
+}
+
+/// Sweep-entry twin of the above for the non-copying cycle kinds (fallback
+/// minor / full mark-sweep): a dead header in the ACTIVE nursery allocation
+/// block is never object-walked by any sweeper, so it is collected from the
+/// registry right after trace instead (#6010, mirroring Map/Set/Buffer).
+/// Deadness: unmarked ∧ not pinned ∧ not forwarded, and for a minor trace also
+/// not tenured and physically in the nursery.
+pub(crate) fn collect_dead_registered_regexps_post_trace(full_trace: bool) -> Vec<usize> {
+    REGEX_POINTERS.with(|table| {
+        table
+            .borrow()
+            .iter()
+            .copied()
+            .filter(|&addr| unsafe { registered_regexp_is_dead_post_trace(addr, full_trace) })
+            .collect()
+    })
+}
+
+/// Finalize one collected-dead RegExp (budget-chunked by the sweep state).
+pub(crate) fn finalize_collected_dead_regexp(addr: usize) {
+    unsafe { regex_header_finalize_for_gc(addr as *mut RegExpHeader) };
+}
+
+unsafe fn registered_regexp_is_dead_post_trace(addr: usize, full_trace: bool) -> bool {
+    let Some(header) = crate::value::addr_class::try_read_gc_header(addr) else {
+        return false;
+    };
+    if header.obj_type != crate::gc::GC_TYPE_REGEXP {
+        return false;
+    }
+    let flags = header.gc_flags;
+    if flags
+        & (crate::gc::GC_FLAG_MARKED | crate::gc::GC_FLAG_PINNED | crate::gc::GC_FLAG_FORWARDED)
+        != 0
+    {
+        return false;
+    }
+    if full_trace {
+        return true;
+    }
+    if flags & crate::gc::GC_FLAG_TENURED != 0 {
+        return false;
+    }
+    matches!(
+        crate::arena::classify_heap_generation(addr),
+        crate::arena::HeapGeneration::Nursery
+    )
+}
+
+/// Test support: construct a RegExp through the PRODUCTION path
+/// (`js_regexp_new`), run one `test()` so the compiled programs are installed
+/// on the header, and hand the header back unrooted.
+#[cfg(all(test, feature = "regex-engine"))]
+pub(crate) fn test_construct_regexp_and_exec_once(pattern: &str, flags: &str) -> *mut RegExpHeader {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let p = scope.root_string_ptr(js_string_from_str(pattern));
+    let f = scope.root_string_ptr(js_string_from_str(flags));
+    let re = p.with_mut_ptr::<StringHeader, _>(|p| {
+        f.with_mut_ptr::<StringHeader, _>(|f| js_regexp_new(p, f))
+    });
+    let subject = scope.root_string_ptr(js_string_from_str("abc"));
+    subject.with_const_ptr::<StringHeader, _>(|s| {
+        let _ = js_regexp_test(re, s);
+    });
+    re
+}
+
+/// Test support: strong count of the standard program a header holds (the
+/// observer clone taken here is released before returning).
+#[cfg(all(test, feature = "regex-engine"))]
+pub(crate) fn test_regexp_std_program_strong_count(re: *const RegExpHeader) -> usize {
+    unsafe {
+        let raw = (*re).regex_ptr as *const Regex;
+        assert!(!raw.is_null(), "program must be installed");
+        let arc = Arc::from_raw(raw);
+        let n = Arc::strong_count(&arc);
+        std::mem::forget(arc);
+        n
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn test_regex_pointer_entry_exists(addr: usize) -> bool {
     REGEX_POINTERS.with(|table| table.borrow().contains(&addr))
@@ -365,14 +490,14 @@ pub(crate) unsafe fn regex_gc_slot_ptrs(re: *mut RegExpHeader) -> (*mut u64, usi
 #[cfg(feature = "regex-engine")]
 crate::perry_thread_local! {
     /// Cache of compiled regex objects, keyed by (pattern, flags).
-    static REGEX_CACHE: RefCell<HashMap<(String, String), Arc<Regex>>> = RefCell::new(HashMap::new());
+    static REGEX_CACHE: RefCell<HashMap<ProgramKey, Arc<Regex>>> = RefCell::new(HashMap::new());
     /// Fancy-regex fallback cache for patterns with lookbehind/lookahead.
-    static FANCY_CACHE: RefCell<HashMap<(String, String), Arc<fancy_regex::Regex>>> = RefCell::new(HashMap::new());
+    static FANCY_CACHE: RefCell<HashMap<ProgramKey, Arc<fancy_regex::Regex>>> = RefCell::new(HashMap::new());
 
     /// ECMAScript backtracking matchers for quantified capture groups. These
     /// are the patterns where `regex`/`fancy-regex` cannot reproduce
     /// `RepeatMatcher` capture reset and nullable-iteration semantics (#5897).
-    static REPEAT_MATCHER_CACHE: RefCell<HashMap<(String, String), Arc<repeat_matcher::RepeatMatcherRegex>>> = RefCell::new(HashMap::new());
+    static REPEAT_MATCHER_CACHE: RefCell<HashMap<ProgramKey, Arc<repeat_matcher::RepeatMatcherRegex>>> = RefCell::new(HashMap::new());
 
     /// `(pattern, flags)` pairs that have already cleared construction-time
     /// validation. Validity is a pure function of the pair, so the answer is
@@ -466,16 +591,6 @@ pub(crate) fn build_fancy_regex(pattern: &str) -> Result<fancy_regex::Regex, fan
         .build()
 }
 
-/// The pattern of the never-match program `compile_and_cache_regex_checked`
-/// installs in `REGEX_CACHE` for a pattern only `fancy-regex` accepts, so a
-/// caller reaching for the standard program does not crash.
-///
-/// Named because `lazy::build_and_install_programs` has to RECOGNISE it: a
-/// header whose standard program is this placeholder is usable only through
-/// its fancy fallback, so the fallback has to exist beside it.
-#[cfg(feature = "regex-engine")]
-pub(crate) const NEVER_MATCH_PATTERN: &str = r"[^\s\S]";
-
 /// Entry cap for the compiled-regex caches (2026-07-09 GC audit: one entry
 /// per distinct `(pattern, flags)` ever compiled, no cap of any kind, entries
 /// up to [`REGEX_SIZE_LIMIT`] — `new RegExp(userInput)` was an attacker-driven
@@ -491,7 +606,7 @@ const REGEX_CACHE_MAX_ENTRIES: usize = 512;
 /// validated-pattern set: make room for one more entry, wiping the map when it
 /// is at capacity.
 #[cfg(feature = "regex-engine")]
-fn evict_regex_cache_if_full<V>(cache: &mut HashMap<(String, String), V>) {
+fn evict_regex_cache_if_full<K, V>(cache: &mut HashMap<K, V>) {
     if cache.len() >= REGEX_CACHE_MAX_ENTRIES {
         cache.clear();
         if crate::hot_diag::regex_on() {
@@ -518,28 +633,65 @@ fn evict_regex_cache_if_full<V>(cache: &mut HashMap<(String, String), V>) {
 /// Returns `false` when BOTH engines reject it — nothing is cached and the
 /// caller decides whether that is a SyntaxError (see `js_regexp_new`'s
 /// bare-pattern fallback for the flag-prefix size edge).
+/// One shared never-match program per thread.
+///
+/// Only used by the `PERRY_REGEX_ENGINE=regress` measurement path, where every
+/// pattern needs a value in `regex_ptr` (the built/not-built flag) but no NFA:
+/// building a fresh one per pattern would be exactly the compile cost the
+/// experiment exists to remove from the measurement.
 #[cfg(feature = "regex-engine")]
-fn compile_and_cache_regex_checked(pattern: &str, flags: &str) -> bool {
+fn shared_never_match_program() -> Arc<Regex> {
+    crate::perry_thread_local! {
+        static NEVER_MATCH: RefCell<Option<Arc<Regex>>> = const { RefCell::new(None) };
+    }
+    NEVER_MATCH.with(|slot| {
+        slot.borrow_mut()
+            .get_or_insert_with(|| Arc::new(Regex::new(NEVER_MATCH_PATTERN).unwrap()))
+            .clone()
+    })
+}
+
+#[cfg(feature = "regex-engine")]
+fn compile_and_cache_regex_checked(pattern: &Arc<str>, flags: &Arc<str>) -> bool {
     let already = REGEX_CACHE.with(|cache| {
         cache
             .borrow()
-            .contains_key(&(pattern.to_string(), flags.to_string()))
+            .contains_key(&(pattern.clone(), flags.clone()))
     });
     if already {
         return true;
     }
-    if let Some(repeat_matcher) = repeat_matcher::compile(pattern, flags) {
+    let regress_covers = if let Some(repeat_matcher) = repeat_matcher::compile(pattern, flags) {
         if crate::hot_diag::regex_on() {
             crate::hot_diag::regex_with(|d| d.compiles_repeat += 1);
         }
         REPEAT_MATCHER_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
             evict_regex_cache_if_full(&mut cache);
+            cache.insert((pattern.clone(), flags.clone()), Arc::new(repeat_matcher));
+        });
+        true
+    } else {
+        false
+    };
+    // `PERRY_REGEX_ENGINE=regress` (measurement only — see
+    // `repeat_matcher::regress_first`): the ECMAScript backtracker is the
+    // primary engine, so stop here. Every exec-family entry point consults the
+    // repeat matcher first, and the shared never-match placeholder gives the
+    // header's `regex_ptr` built-flag a value WITHOUT building an NFA — which
+    // is the whole point of the experiment (the linear engine's program is
+    // ~12.5 KB median against regress's 512 B, measured over 4,463 literals
+    // from seven real bundles).
+    if regress_covers && repeat_matcher::regress_first() {
+        REGEX_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            evict_regex_cache_if_full(&mut cache);
             cache.insert(
-                (pattern.to_string(), flags.to_string()),
-                Arc::new(repeat_matcher),
+                (pattern.clone(), flags.clone()),
+                shared_never_match_program(),
             );
         });
+        return true;
     }
     // Translate JS regex to Rust-compatible pattern, with the inline mode
     // prefix the flags imply. Shared with `lazy::std_engine_syntax_ok` so the
@@ -561,10 +713,7 @@ fn compile_and_cache_regex_checked(pattern: &str, flags: &str) -> bool {
                     }
                     let mut fc = fc.borrow_mut();
                     evict_regex_cache_if_full(&mut fc);
-                    fc.insert(
-                        (pattern.to_string(), flags.to_string()),
-                        std::sync::Arc::new(fre),
-                    );
+                    fc.insert((pattern.clone(), flags.clone()), std::sync::Arc::new(fre));
                     true
                 } else {
                     false
@@ -582,17 +731,17 @@ fn compile_and_cache_regex_checked(pattern: &str, flags: &str) -> bool {
     REGEX_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         evict_regex_cache_if_full(&mut cache);
-        cache.insert((pattern.to_string(), flags.to_string()), Arc::new(regex));
+        cache.insert((pattern.clone(), flags.clone()), Arc::new(regex));
     });
     true
 }
 
 #[cfg(feature = "regex-engine")]
-fn get_or_compile_regex(pattern: &str, flags: &str) -> Arc<Regex> {
+fn get_or_compile_regex(pattern: &Arc<str>, flags: &Arc<str>) -> Arc<Regex> {
     let hit = REGEX_CACHE.with(|cache| {
         cache
             .borrow()
-            .get(&(pattern.to_string(), flags.to_string()))
+            .get(&(pattern.clone(), flags.clone()))
             .cloned()
     });
     if let Some(re) = hit {
@@ -601,14 +750,14 @@ fn get_or_compile_regex(pattern: &str, flags: &str) -> Arc<Regex> {
     let _ = compile_and_cache_regex_checked(pattern, flags);
     REGEX_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if let Some(re) = cache.get(&(pattern.to_string(), flags.to_string())) {
+        if let Some(re) = cache.get(&(pattern.clone(), flags.clone())) {
             return re.clone();
         }
         // Both engines rejected it (validation normally throws before this
         // point) — keep the historical behavior: cache + return never-match.
         let arc = Arc::new(Regex::new(NEVER_MATCH_PATTERN).unwrap());
         evict_regex_cache_if_full(&mut cache);
-        cache.insert((pattern.to_string(), flags.to_string()), arc.clone());
+        cache.insert((pattern.clone(), flags.clone()), arc.clone());
         arc
     })
 }
@@ -811,7 +960,7 @@ pub extern "C" fn js_regexp_new(
 ) -> *mut RegExpHeader {
     // ★ `pattern` is a raw `StringHeader*` in a Rust local, and this function
     // allocates twice below (`js_string_from_str` for the canonical flags, then
-    // `gc_malloc` for the header). Either can drive an evacuating minor that
+    // `arena_alloc_gc` for the header). Either can drive an evacuating minor that
     // relocates the pattern string, after which this argument names retired
     // from-space — and it is then *stored into the header* as `pattern_ptr`,
     // so the damage is permanent rather than transient.
@@ -839,6 +988,32 @@ pub extern "C" fn js_regexp_new(
     // canonical sorted form so `.flags` reflects Node's ordering.
     let canonical_flags = validate_and_canonicalize_flags(raw_flags_str);
     let flags_str = canonical_flags.as_str();
+
+    // ★ Share the caller's flags string when it is ALREADY the canonical text.
+    //
+    // `flags_ptr` used to be a fresh `js_string_from_str` on every
+    // construction. A JS regex literal evaluates to a fresh RegExp object
+    // every time it is reached, so that is one 32-byte GC string per
+    // evaluation: `PERRY_REGEX_DIAG` counts 161,897 constructions per
+    // 400-character claude-code reply, ~5.2 MB of identical one- and two-byte
+    // strings, and ~44 MB on a 3300-character reply.
+    //
+    // JS strings are immutable and have no identity semantics, and a literal's
+    // flags text is written by the author in spec order (`/x/gi`, not
+    // `/x/ig`), so the caller's string usually IS the canonical text and can
+    // simply be shared. Nothing downstream depends on the pointer being fresh:
+    // `flags_ptr`-keyed lookups (`FANCY_CACHE`, `lookup_fancy_regex`) read it
+    // through `string_as_str` and compare CONTENT, and the header keeping a
+    // pointer to it is what keeps it alive.
+    //
+    // This comparison must happen HERE, before the validation block below,
+    // because `raw_flags_str` borrows the caller's GC string and that block
+    // can allocate. The root is taken here for the same reason: the raw
+    // `flags` argument may name from-space after any allocation, exactly as
+    // the ★ note on `pattern_root` says, and this one is stored into the
+    // header too.
+    let shared_flags_root =
+        (is_valid_ptr(flags) && raw_flags_str == flags_str).then(|| scope.root_string_ptr(flags));
 
     let case_insensitive = flags_str.contains('i');
     let global = flags_str.contains('g');
@@ -943,7 +1118,14 @@ pub extern "C" fn js_regexp_new(
             // SyntaxError decision and populates the caches for the fancy
             // fallback.
             if !lazy::std_engine_syntax_ok(pattern_str, flags_str)
-                && !compile_and_cache_regex_checked(pattern_str, flags_str)
+                // Cold: the linear engine's parser refused, so only a BUILD
+                // can tell a fancy-regex pattern from a SyntaxError.
+                // Materialising the `Arc` key happens once per distinct
+                // pattern that needs the fallback, not per object.
+                && !compile_and_cache_regex_checked(
+                    &Arc::from(pattern_str),
+                    &Arc::from(flags_str),
+                )
             {
                 // Preserve the historical edge: validation used to test the
                 // BARE translated pattern (no `(?ims)` prefix). A pattern that
@@ -987,31 +1169,70 @@ pub extern "C" fn js_regexp_new(
     #[allow(unused_variables)]
     let pattern_str: () = ();
 
-    // Allocate the header via gc_malloc so it's tracked by the GC and gets
-    // freed when no longer referenced. Previously this used raw alloc() and
-    // leaked every header, which was a 64-byte-per-call leak on top of the
-    // (now-fixed) regex object leak.
+    // ★ The header is NURSERY-allocated, like an ordinary object.
+    //
+    // It used to be `gc_malloc`'d: raw `alloc()` at first (a 64-byte leak per
+    // construction), then the tracked malloc arm so the sweep could free it.
+    // That arm costs, PER CONSTRUCTION, a mimalloc allocation, a push onto
+    // `MALLOC_STATE.objects`, an insert into the malloc-registry `PtrHashSet`
+    // (which rehashes as it grows), two old→young remembered-set entries for
+    // `pattern_ptr`/`flags_ptr`, and — at death — a malloc-sweep visit, the
+    // finalizer and a free. A JS regex literal constructs a fresh object every
+    // time it is evaluated, so on the claude-code TUI `PERRY_GC_TRACE` counted
+    // **199,873 RegExp headers malloc'd per 400-character reply — 100.0 % of
+    // all malloc allocations** — with the registry swinging 26,690 → 1,689
+    // across one minor: ~94 % of them die young and were paying
+    // old-generation prices to do it.
+    //
+    // `GC_TYPE_REGEXP` has been movable (`GcMoveHookKind::RegExpSideTables`
+    // rekeys `REGEX_POINTERS`, `REGEX_SOURCE_TABLE` and the expando owner
+    // after evacuation; `GcLayoutSlotKind::RegExpFields` traces the two string
+    // edges and `meta`) since the copying collector landed, and
+    // `test_movable_regexp_evacuation_migrates_all_address_owned_state` has
+    // exercised the arena arm all along. What kept production on malloc was
+    // finalization: the copying minor's from-space flip runs no per-object
+    // finalize hooks (`gc::copying`), so a nursery header that dies young
+    // would leak its three `Arc` programs and its registry entries. That is
+    // now handled the way Map/Set/Error handle theirs —
+    // `finalize_dead_copied_minor_from_space_regexps` after a copied minor and
+    // `collect_dead_registered_regexps_post_trace` at sweep entry for the
+    // non-copying cycle kinds — and a tenured header is finalized by the
+    // old-generation sweep's ordinary `gc_type_finalize_unmarked_payload`.
     let header_size = std::mem::size_of::<RegExpHeader>();
-    // Materialize the canonical flags into a fresh StringHeader so that
-    // `flags_ptr`-keyed lookups (FANCY_CACHE, lookup_fancy_regex) and the
-    // GC-survivable source table all agree on the canonical form, and the
-    // header never holds the caller's possibly-temporary input flags.
-    let canonical_flags_ptr = js_string_from_str(flags_str);
-    // ★ #7341: root the canonical flags string too. The `gc_malloc` below is an
-    // allocation and therefore a collection point, exactly as the comment above
-    // `pattern_root` says — but only the PATTERN was rooted and re-read. The
-    // flags string is created here and stored into the header AFTER that
-    // allocation, so an evacuating minor in `gc_malloc` moved it and the header
-    // kept the pre-collection address. `flags_ptr` is then permanently stale in
+    // `flags_ptr` must hold the CANONICAL form, so that `flags_ptr`-keyed
+    // lookups (FANCY_CACHE, lookup_fancy_regex) and the GC-survivable source
+    // table all agree. When the caller's string already is that text it is
+    // shared (rooted above); only a non-canonical spelling (`/x/ig` → `"gi"`,
+    // or a computed `new RegExp(p, f)`) still has to materialize one. The
+    // counter makes the removal provable rather than asserted.
+    let flags_root = match shared_flags_root {
+        Some(root) => root,
+        None => {
+            if crate::hot_diag::regex_on() {
+                crate::hot_diag::regex_with(|d| d.new_flags_allocated += 1);
+            }
+            scope.root_string_ptr(js_string_from_str(flags_str))
+        }
+    };
+    // ★ #7341: root the canonical flags string too. The header allocation below
+    // is an allocation and therefore a collection point, exactly as the comment
+    // above `pattern_root` says — but only the PATTERN was rooted and re-read.
+    // The flags string is created here and stored into the header AFTER that
+    // allocation, so an evacuating minor in the header allocation moved it and
+    // the header kept the pre-collection address. `flags_ptr` is then permanently stale in
     // a live header: `lookup_fancy_regex` reads it through `string_as_str` and
     // faults on retired from-space, which is 5 of the 31 catches in #7341
     // (four different callers, all reaching that one read).
     //
     // The write barrier below already treated this as a real GC edge; what was
     // missing is that the value written had to survive the allocation first.
-    let flags_root = scope.root_string_ptr(canonical_flags_ptr);
+
     unsafe {
-        let raw = crate::gc::gc_malloc(header_size, crate::gc::GC_TYPE_REGEXP);
+        let raw = crate::arena::arena_alloc_gc(
+            header_size,
+            std::mem::align_of::<RegExpHeader>(),
+            crate::gc::GC_TYPE_REGEXP,
+        );
         if raw.is_null() {
             // #5067 — catchable RangeError instead of aborting on OOM.
             crate::error::throw_allocation_failed();
@@ -1036,19 +1257,24 @@ pub extern "C" fn js_regexp_new(
         (*ptr).pattern_ptr = pattern;
         (*ptr).flags_ptr = canonical_flags_ptr;
         // `pattern_ptr` / `flags_ptr` are GC-managed StringHeaders — the GC scans
-        // this 2-slot payload range via the magic-tagged RegExp layout, and
-        // `canonical_flags_ptr` (js_string_from_str above) is a freshly-allocated
-        // YOUNG string. They are stored into this malloc'd (old-generation) header
-        // by raw writes; without a write barrier the old→young edge is never
-        // remembered, so a copying minor GC sweeps the string while the retained
-        // RegExp still points at it. The evacuation verifier reports this as an
-        // uncovered object→string edge, and it crashes for real when the freed
-        // slot is later scanned/read (a heavy regex workload — e.g. ANSI/emoji
-        // parsing in a terminal UI — hits it within seconds). Remember both edges,
-        // mirroring every other native-header pointer store (closure captures,
-        // object prototype slots, array headers). `runtime_write_barrier_gc_slot`
-        // detects the malloc parent and only remembers genuinely-young children,
-        // so an already-old/interned `pattern` is a harmless no-op.
+        // this 2-slot payload range via the magic-tagged RegExp layout.
+        //
+        // The header is young now, so for a young child the barrier records
+        // nothing; it still has to run, because a header born while a budgeted
+        // cycle is marking is allocated black, and because a header that has
+        // been promoted and then reassigned (`RegExp.prototype.compile`) is a
+        // genuine old→young store. Historically the header was malloc'd, i.e.
+        // old, and this store was THE old→young edge a copying minor would
+        // otherwise miss: the evacuation verifier reported it as an uncovered
+        // object→string edge, and it crashed for real when the freed slot was
+        // later scanned/read (a heavy regex workload — e.g. ANSI/emoji parsing
+        // in a terminal UI — hit it within seconds).
+        //
+        // Remember both edges, mirroring every other native-header pointer
+        // store (closure captures, object prototype slots, array headers).
+        // `runtime_write_barrier_gc_slot` classifies the parent and only
+        // remembers genuinely-young children, so an already-old/interned
+        // `pattern` is a harmless no-op.
         let regexp_parent_addr = ptr as usize;
         if !pattern.is_null() {
             crate::gc::runtime_write_barrier_gc_slot(
@@ -1245,6 +1471,48 @@ fn regexp_pattern_is_regexp_like(pattern: f64) -> bool {
     }
 }
 
+/// `regex.test(haystack)` where `haystack` is a **bounded slice whose bounds
+/// ARE the string's ends** — the primitive the `Intl.Segmenter` view mode needs
+/// so a segment can be tested without being materialised.
+///
+/// Passing a sub-slice rather than a start offset is the whole point: `^`
+/// anchors at the slice start, `$` at its end, and a lookbehind cannot see the
+/// preceding grapheme, which is exactly what `test` on the materialised
+/// substring means. A start-offset match would be silently wrong for an
+/// anchored pattern, which is what claude-code's `oR_` is.
+///
+/// Returns `None` — "I decline, materialise and call the normal path" — for a
+/// **global or sticky** regex, because `test` is then stateful: it must consult
+/// and advance `lastIndex`, and that bookkeeping (`regexp_find_advancing`) is
+/// written against a `StringHeader`, not a slice. Answering it from a slice
+/// would either lose the update or invent one.
+// Its body reaches `diag_note_op` and `exec::`, both engine-gated, and its only
+// caller (`js_segments_view_regexp_test`) references it only under this feature.
+#[cfg(feature = "regex-engine")]
+pub(crate) fn regexp_test_str_bounded(re: *const RegExpHeader, hay: &str) -> Option<bool> {
+    if !is_valid_regex_ptr(re) {
+        return None;
+    }
+    unsafe {
+        if (*re).global || (*re).sticky {
+            return None;
+        }
+        if crate::hot_diag::regex_on() {
+            diag_note_op(re, crate::hot_diag::RegexOp::Test);
+        }
+        if let Some(repeat_matcher) = lookup_repeat_matcher(re) {
+            return Some(repeat_matcher.regex.find(hay).is_some());
+        }
+        if let Some(fre) = lookup_fancy_regex(re) {
+            return match fre.is_match(hay) {
+                Ok(v) => Some(v),
+                Err(_) => None,
+            };
+        }
+        Some(lazy::header_std_regex(re).is_match(hay))
+    }
+}
+
 /// Test if a string matches the regex pattern
 /// regex.test(string) -> boolean
 #[cfg(feature = "regex-engine")]
@@ -1278,7 +1546,7 @@ pub extern "C" fn js_regexp_test(re: *const RegExpHeader, s: *const StringHeader
             };
         }
 
-        if let Some(repeat_matcher) = lookup_repeat_matcher(re) {
+        if let Some(repeat_matcher) = lookup_repeat_matcher_for(re, str_data, 0) {
             return if repeat_matcher.regex.find(str_data).is_some() {
                 1
             } else {
@@ -1359,10 +1627,78 @@ pub(crate) fn lookup_fancy_regex(re: *const RegExpHeader) -> Option<Arc<fancy_re
         let flags_str = string_as_str((*re).flags_ptr);
         FANCY_CACHE.with(|fc| {
             fc.borrow()
-                .get(&(pat.to_string(), flags_str.to_string()))
+                .get(&(Arc::from(pat), Arc::from(flags_str)))
                 .cloned()
         })
     }
+}
+
+/// Can the linear program prove there is no match at or after `start`?
+///
+/// # The cliff this closes
+///
+/// `repeat_matcher::capture_layout` takes a pattern OFF the linear engine when
+/// ECMA-262's RepeatMatcher capture semantics are observable — a capture group
+/// directly under a quantifier, or a capture inside a negative lookaround. That
+/// is a correctness requirement (the linear engine keeps the last value of a
+/// capture nested in a quantified group; the spec clears it every iteration),
+/// but it means adding parentheses moves a pattern onto `regress`, a classical
+/// backtracker with no step budget. Measured: `/^(a+)+$/.test("a"*28 + "!")`
+/// costs **16.5 s** while `/^(?:a+)+$/` — the same language, no capture — is
+/// instant, and node does the same test in 4.8 s. **6.3 %** of the 4,463
+/// distinct regex literals across seven real bundles take this route
+/// (claude-code 7.1 %, dayjs 25 %, luxon 29 %).
+///
+/// The two engines accept exactly the same LANGUAGE for a pattern they both
+/// compile; they disagree only about which capture assignment to report. So a
+/// linear "there is no match here" is a real no, reachable in O(n) where the
+/// backtracker's no can cost O(2^n). Ask it first, and the exponential case —
+/// which is always a NON-matching subject, because that is what a ReDoS input
+/// is — never reaches the backtracker.
+///
+/// Returns false (i.e. "cannot rule it out, run the backtracker") whenever the
+/// linear program is not authoritative: not built, or the never-match
+/// placeholder installed for a pattern the `regex` crate could not compile at
+/// all. That is what makes the gate safe for the lookaround shapes, which have
+/// no linear program to consult.
+///
+/// This does NOT bound the worst case; it removes the reachable one. A real
+/// step budget has to be counted by the backtracker — `regress` has none
+/// today, `fancy-regex` ships `backtrack_limit: 1_000_000` — and is pending
+/// upstream.
+#[cfg(feature = "regex-engine")]
+fn linear_rules_out_match(re: *const RegExpHeader, subject: &str, start: usize) -> bool {
+    unsafe {
+        let program = (*re).regex_ptr;
+        if program.is_null() {
+            return false;
+        }
+        let program: &Regex = &*program;
+        if program.as_str() == NEVER_MATCH_PATTERN {
+            // The `regex` crate refused this pattern (lookaround /
+            // backreference); it has no opinion about the subject.
+            return false;
+        }
+        start <= subject.len() && !program.is_match_at(subject, start)
+    }
+}
+
+/// [`lookup_repeat_matcher`] with the linear pre-check applied: `None` also
+/// when the linear program proves no match at or after `start`, so the
+/// backtracker is never entered on a subject that cannot match. Every
+/// `&str`-subject call site uses this; the WTF-8/UTF-16 replace path, which has
+/// no `&str` to hand, uses the bare lookup.
+#[cfg(feature = "regex-engine")]
+fn lookup_repeat_matcher_for(
+    re: *const RegExpHeader,
+    subject: &str,
+    start: usize,
+) -> Option<Arc<repeat_matcher::RepeatMatcherRegex>> {
+    let matcher = lookup_repeat_matcher(re)?;
+    if linear_rules_out_match(re, subject, start) {
+        return None;
+    }
+    Some(matcher)
 }
 
 /// Look up the ECMAScript-native matcher used when quantified capture groups
@@ -1393,7 +1729,7 @@ fn lookup_repeat_matcher(
         REPEAT_MATCHER_CACHE.with(|cache| {
             cache
                 .borrow()
-                .get(&(pat.to_string(), flags_str.to_string()))
+                .get(&(Arc::from(pat), Arc::from(flags_str)))
                 .cloned()
         })
     }
@@ -1410,397 +1746,6 @@ fn lookup_repeat_matcher(
 /// `js_string_replace_regex_fn` pairing already in this file. Used so a pattern
 /// the `regex` crate can't compile (lookbehind/backreferences) still gets full
 /// `$1`/`$<name>`/`$&`/`` $` ``/`$'`/`$$` substitution.
-#[cfg(feature = "regex-engine")]
-fn expand_js_replacement_fancy(
-    repl: &str,
-    caps: &fancy_regex::Captures,
-    subject: &str,
-    has_named_groups: bool,
-) -> String {
-    let m0 = match caps.get(0) {
-        Some(m) => m,
-        None => return String::new(),
-    };
-    let (mstart, mend) = (m0.start(), m0.end());
-    let ngroups = caps.len();
-    let b = repl.as_bytes();
-    let mut out = String::with_capacity(repl.len() + 16);
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] != b'$' {
-            let start = i;
-            while i < b.len() && b[i] != b'$' {
-                i += 1;
-            }
-            out.push_str(&repl[start..i]);
-            continue;
-        }
-        if i + 1 >= b.len() {
-            out.push('$');
-            i += 1;
-            continue;
-        }
-        match b[i + 1] {
-            b'$' => {
-                out.push('$');
-                i += 2;
-            }
-            b'&' => {
-                out.push_str(&subject[mstart..mend]);
-                i += 2;
-            }
-            b'`' => {
-                out.push_str(&subject[..mstart]);
-                i += 2;
-            }
-            b'\'' => {
-                out.push_str(&subject[mend..]);
-                i += 2;
-            }
-            b'0'..=b'9' => {
-                let d1 = (b[i + 1] - b'0') as usize;
-                let (group, consumed) = if i + 2 < b.len() && b[i + 2].is_ascii_digit() {
-                    let two = d1 * 10 + (b[i + 2] - b'0') as usize;
-                    if two >= 1 && two < ngroups {
-                        (Some(two), 2)
-                    } else if d1 >= 1 && d1 < ngroups {
-                        (Some(d1), 1)
-                    } else {
-                        (None, 0)
-                    }
-                } else if d1 >= 1 && d1 < ngroups {
-                    (Some(d1), 1)
-                } else {
-                    (None, 0)
-                };
-                match group {
-                    Some(g) => {
-                        if let Some(m) = caps.get(g) {
-                            out.push_str(m.as_str());
-                        }
-                        i += 1 + consumed;
-                    }
-                    None => {
-                        out.push('$');
-                        i += 1;
-                    }
-                }
-            }
-            b'<' if has_named_groups => {
-                if let Some(rel) = repl[i + 2..].find('>') {
-                    let name = &repl[i + 2..i + 2 + rel];
-                    if let Some(m) = caps.name(name) {
-                        out.push_str(m.as_str());
-                    }
-                    i += 2 + rel + 1;
-                } else {
-                    out.push('$');
-                    i += 1;
-                }
-            }
-            _ => {
-                out.push('$');
-                i += 1;
-            }
-        }
-    }
-    out
-}
-
-/// Fancy-regex fallback for the string-replacement (non-callback) forms of
-/// `String.prototype.replace`/`replaceAll`. Drives a manual non-overlapping
-/// match loop with `fancy_regex` and expands the replacement string via
-/// [`expand_js_replacement_fancy`]. Used when the pattern needs
-/// lookbehind/backreferences the `regex` crate can't compile.
-#[cfg(feature = "regex-engine")]
-unsafe fn replace_regex_str_fancy(
-    str_data: &str,
-    fre: &fancy_regex::Regex,
-    global: bool,
-    repl_str: &str,
-) -> *mut StringHeader {
-    let has_named_groups = fre.capture_names().any(|n| n.is_some());
-    // #9430: the ECMAScript scan for the global form. fancy-regex's own
-    // iterator drops a zero-width match that lands where the previous match
-    // ended, so `"a".replace(/(?<=x)?a*/g, …)`-shaped patterns lost their
-    // trailing (and every interior) empty replacement.
-    let captures_list: Vec<fancy_regex::Captures> = if global {
-        global_scan::fancy_captures(fre, str_data, 0)
-    } else {
-        match fre.captures(str_data) {
-            Ok(Some(caps)) => vec![caps],
-            Ok(None) | Err(_) => Vec::new(),
-        }
-    };
-    let mut result = String::new();
-    let mut last_end = 0usize;
-    for caps in &captures_list {
-        let full_match = caps.get(0).unwrap();
-        result.push_str(&str_data[last_end..full_match.start()]);
-        result.push_str(&expand_js_replacement_fancy(
-            repl_str,
-            caps,
-            str_data,
-            has_named_groups,
-        ));
-        last_end = full_match.end();
-    }
-    result.push_str(&str_data[last_end..]);
-    finish_replace_bytes(result.as_bytes())
-}
-
-/// string.replace(regex, replacement) -> string
-#[cfg(feature = "regex-engine")]
-#[no_mangle]
-pub extern "C" fn js_string_replace_regex(
-    s: *const StringHeader,
-    re: *const RegExpHeader,
-    replacement: *const StringHeader,
-) -> *mut StringHeader {
-    if !is_valid_ptr(s) {
-        return js_string_from_str("");
-    }
-
-    if !is_valid_regex_ptr(re) {
-        // If regex is null, return original string
-        return copy_replace_source(s);
-    }
-    if crate::hot_diag::regex_on() {
-        diag_note_op(re, crate::hot_diag::RegexOp::Replace);
-    }
-
-    unsafe {
-        // The Rust string engines require scalar-value UTF-8, while Perry
-        // stores lone JavaScript surrogates as WTF-8. Match those subjects as
-        // UTF-16 code units with the ECMAScript engine and rebuild the result
-        // through the WTF-8-aware string builder.
-        if (*s).flags & crate::string::STRING_FLAG_HAS_LONE_SURROGATES != 0 {
-            let replacement_bytes = if is_valid_ptr(replacement) {
-                string_as_bytes(replacement)
-            } else {
-                b"undefined"
-            };
-            if let Some(result) = repeat_matcher::replace_wtf8_subject(
-                re,
-                string_as_bytes(s),
-                replacement_bytes,
-                (*re).global,
-            ) {
-                return finish_replace_bytes(&result);
-            }
-        }
-
-        let str_data = string_as_str(s);
-        let repl_str = if is_valid_ptr(replacement) {
-            string_as_str(replacement)
-        } else {
-            "undefined"
-        };
-
-        if let Some(repeat_matcher) = lookup_repeat_matcher(re) {
-            let result = repeat_matcher.replace(str_data, repl_str, (*re).global);
-            return finish_replace_bytes(result.as_bytes());
-        }
-
-        // Pattern the `regex` crate couldn't compile (lookbehind/backreferences)
-        // → drive the replacement through fancy-regex. Otherwise the never-match
-        // placeholder in `regex_ptr` would leave the input unchanged.
-        if let Some(fre) = lookup_fancy_regex(re) {
-            return replace_regex_str_fancy(str_data, &fre, (*re).global, repl_str);
-        }
-
-        let regex = lazy::header_std_regex(re);
-        let global = (*re).global;
-        let has_named_groups = regex.capture_names().any(|n| n.is_some());
-
-        // Route through a JS-aware expander (closure form) so `$&` / `` $` `` /
-        // `$'` — which the regex crate's native `$` syntax doesn't support —
-        // are substituted per match. `$$`, `$n`, and `$<name>` are handled too.
-        // #9430: `Regex::replace_all` runs the crate's own match iterator,
-        // whose empty-match rule is not ECMAScript's. Drive the ECMAScript
-        // scan and splice the replacements here instead; the non-global form
-        // is the same loop over a one-element list.
-        let captures_list: Vec<regex::Captures> = if global {
-            global_scan::std_captures(regex, str_data, 0)
-        } else {
-            regex.captures(str_data).into_iter().collect()
-        };
-        if crate::hot_diag::regex_on() {
-            let n = captures_list.len() as u64;
-            crate::hot_diag::regex_with(|d| d.replace_matches += n);
-        }
-        let mut result = String::with_capacity(str_data.len());
-        let mut last_end = 0usize;
-        for caps in &captures_list {
-            let full = caps.get(0).expect("capture zero is the full match");
-            result.push_str(&str_data[last_end..full.start()]);
-            result.push_str(&expand_js_replacement(
-                repl_str,
-                caps,
-                str_data,
-                has_named_groups,
-            ));
-            last_end = full.end();
-        }
-        result.push_str(&str_data[last_end..]);
-
-        finish_replace_bytes(result.as_bytes())
-    }
-}
-
-/// string.replaceAll(regex, replacement) -> string
-#[cfg(feature = "regex-engine")]
-#[no_mangle]
-pub extern "C" fn js_string_replace_all_regex(
-    s: *const StringHeader,
-    re: *const RegExpHeader,
-    replacement: *const StringHeader,
-) -> *mut StringHeader {
-    if !is_valid_ptr(s) {
-        return js_string_from_str("");
-    }
-
-    if !is_valid_regex_ptr(re) {
-        return copy_replace_source(s);
-    }
-
-    ensure_replace_all_regex_global(re);
-    js_string_replace_regex(s, re, replacement)
-}
-
-/// Split a string by a regex delimiter
-/// string.split(regex) -> string[] (array of NaN-boxed string pointers)
-#[cfg(feature = "regex-engine")]
-#[no_mangle]
-pub extern "C" fn js_string_split_regex(
-    s: *const StringHeader,
-    re: *const RegExpHeader,
-) -> *mut ArrayHeader {
-    js_string_split_regex_n(s, re, -1)
-}
-
-/// string.split(regex, limit) — limit<0 means no limit, limit==0 means empty
-/// (issue #567).
-#[cfg(feature = "regex-engine")]
-#[no_mangle]
-pub extern "C" fn js_string_split_regex_n(
-    s: *const StringHeader,
-    re: *const RegExpHeader,
-    limit: i32,
-) -> *mut ArrayHeader {
-    const STRING_TAG: u64 = 0x7FFF_0000_0000_0000;
-    const POINTER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
-
-    if !is_valid_ptr(s) {
-        return crate::array::js_array_alloc(0);
-    }
-    if limit == 0 {
-        return crate::array::js_array_alloc(0);
-    }
-    let str_data = string_as_str(s).to_owned();
-
-    if !is_valid_regex_ptr(re) {
-        // No regex: return array with the whole string as a single element
-        let arr = crate::array::js_array_alloc(1);
-        let scope = crate::gc::RuntimeHandleScope::new();
-        let arr_handle = scope.root_raw_mut_ptr(arr);
-        // Allocating string + array re-read as one combinator (#7341).
-        let (str_ptr, arr) =
-            arr_handle.across_mut::<ArrayHeader, _>(|| js_string_from_str(&str_data) as u64);
-        unsafe {
-            (*arr).length = 1;
-            let nanboxed = STRING_TAG | (str_ptr & POINTER_MASK);
-            // GC_STORE_AUDIT(BARRIERED): regex split fallback slot uses the shared array slot-store helper.
-            crate::array::store_array_slot(arr, 0, nanboxed);
-        }
-        return arr_handle.get_raw_mut_ptr::<ArrayHeader>();
-    }
-
-    const TAG_UNDEFINED: u64 = 0x7FFC_0000_0000_0001;
-    unsafe {
-        // Each element is either a substring (`Some`) or `undefined` (`None`,
-        // for an unmatched capture group spliced into the result).
-        let parts: Vec<Option<String>> = if let Some(repeat_matcher) = lookup_repeat_matcher(re) {
-            repeat_matcher.split(&str_data, limit)
-        } else if let Some(fre) = lookup_fancy_regex(re) {
-            crate::string::spec_fancy_regex_split(&fre, &str_data, limit)
-        } else {
-            // Standard engine: the JS `RegExp.prototype[Symbol.split]` algorithm
-            // (21.2.5.11). The `regex` crate's own `split` diverges from JS for
-            // zero-width matches (it emits leading/trailing/consecutive empty
-            // strings the spec's `e == p` skip suppresses) and never splices
-            // captured groups, so walk the string the spec's way instead.
-            crate::string::spec_regex_split(lazy::header_std_regex(re), &str_data, limit)
-        };
-
-        let arr = crate::array::js_array_alloc(parts.len() as u32);
-        let scope = crate::gc::RuntimeHandleScope::new();
-        let arr_handle = scope.root_raw_mut_ptr(arr);
-        (*arr_handle.get_raw_mut_ptr::<ArrayHeader>()).length = parts.len() as u32;
-
-        for (i, part) in parts.iter().enumerate() {
-            let nanboxed = match part {
-                Some(text) => {
-                    let str_ptr = js_string_from_str(text) as u64;
-                    STRING_TAG | (str_ptr & POINTER_MASK)
-                }
-                None => TAG_UNDEFINED,
-            };
-            let arr = arr_handle.get_raw_mut_ptr::<ArrayHeader>();
-            // GC_STORE_AUDIT(BARRIERED): regex split result slot uses the shared array slot-store helper.
-            crate::array::store_array_slot(arr, i, nanboxed);
-        }
-        arr_handle.get_raw_mut_ptr::<ArrayHeader>()
-    }
-}
-
-/// Search for a regex match in a string
-/// string.search(regex) -> number (index of first match, -1 if none)
-#[cfg(feature = "regex-engine")]
-#[no_mangle]
-pub extern "C" fn js_string_search_regex(s: *const StringHeader, re: *const RegExpHeader) -> i32 {
-    if !is_valid_ptr(s) || !is_valid_regex_ptr(re) {
-        return -1;
-    }
-    let str_data = string_as_str(s);
-
-    unsafe {
-        if let Some(repeat_matcher) = lookup_repeat_matcher(re) {
-            return repeat_matcher
-                .regex
-                .find(str_data)
-                .map(|matched| byte_index_to_utf16_index(str_data, matched.start()) as i32)
-                .unwrap_or(-1);
-        }
-
-        // Fancy-regex fallback (lookbehind/backreferences): the never-match
-        // placeholder in `regex_ptr` would always report -1 otherwise.
-        if let Some(fre) = lookup_fancy_regex(re) {
-            return match fre.find(str_data) {
-                Ok(Some(m)) => byte_index_to_utf16_index(str_data, m.start()) as i32,
-                _ => -1,
-            };
-        }
-
-        let regex = lazy::header_std_regex(re);
-        match regex.find(str_data) {
-            Some(m) => {
-                // `String.prototype.search` returns a JS string index — UTF-16
-                // code units, matching `.index` / `lastIndex` / `str.length`.
-                byte_index_to_utf16_index(str_data, m.start()) as i32
-            }
-            None => -1,
-        }
-    }
-}
-
-/// Dynamic-receiver dispatch for `regex.test(str)` / `regex.exec(str)` when
-/// codegen couldn't prove the receiver is a RegExp (e.g. hono's RegExpRouter
-/// does `buildWildcardRegExp(k).test(path)`, where the receiver is the result
-/// of a function call). Returns `Some(result)` only when `ptr` is a live regex
-/// AND `method` is `test`/`exec`; `None` otherwise so the generic method
-/// dispatch in `js_native_call_method` continues. The argument is coerced to a
-/// string (`re.test(123)` tests against `"123"`). (#1731)
 #[cfg(feature = "regex-engine")]
 pub(crate) fn dispatch_regex_receiver_method(
     ptr: *const u8,

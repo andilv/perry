@@ -45,6 +45,9 @@ const BUILD_CACHE_ENV_VARS: &[&str] = &[
     "PERRY_RS4GC",
     // `-Os` vs `-O3` for every native module.
     "PERRY_LL_SIZE_OPT",
+    // Explicit application-module LLVM optimization level. This overrides the
+    // normal `PERRY_LL_SIZE_OPT` selection and changes every emitted object.
+    "PERRY_LL_OPT_LEVEL",
     // The post-RS4GC per-function instruction budget (#8583/#8679): a function
     // one setting re-lowers must not be served from a build another kept on
     // statepoints.
@@ -53,6 +56,10 @@ const BUILD_CACHE_ENV_VARS: &[&str] = &[
     // `disable-tail-calls` before the optimizer. It changes the generated
     // code of the functions it trips on, so it is a cache input.
     "PERRY_LL_TRE_MAX_ALLOCA_WALK",
+    // A unit over this post-optimization per-function ceiling uses LLVM's O0
+    // machine pipeline for bounded ISel/regalloc. That changes object bytes,
+    // so both the build and object caches must distinguish its settings.
+    "PERRY_LL_FAST_EMIT_MAX_INSTRS",
     // #9071: gates resolving a loop-called immutable callee binding once at
     // body entry instead of per call — the two settings emit different call
     // sequences, so a cached object from one must not serve the other.
@@ -840,6 +847,24 @@ fn eligibility(args: &CompileArgs, project_root: &Path) -> Result<(), String> {
     }
     if std::env::var("PERRY_OUTLINE_ENTRY_REPORT").is_ok() {
         return Err("outline-entry-report".to_string());
+    }
+    // #9847: same reasoning as `opt-report` above. A cached build reuses the
+    // finished binary and never lowers HIR, so the native-instance report
+    // would print nothing — and nothing is indistinguishable from "no tag was
+    // ever registered", which is the reading this diagnostic exists to make
+    // impossible.
+    if std::env::var("PERRY_NATIVEINST_DIAG").is_ok() {
+        return Err("nativeinst-diag".to_string());
+    }
+
+    // #9843: same reasoning as `opt-report` above, and the reason it is not
+    // optional. A cached build reuses the finished binary and never lowers
+    // HIR, so the segment-view counter would print nothing — and "nothing"
+    // reads exactly like "the tier never fired", which is the phantom-green
+    // this campaign keeps hitting. Excluded from the cache so a zero is a
+    // measured zero.
+    if std::env::var("PERRY_SEGVIEW_DIAG").is_ok() {
+        return Err("segview-diag".to_string());
     }
     if args.verify_native_regions || args.emit_attest || args.emit_sandbox {
         return Err("sidecar-or-verify".to_string());

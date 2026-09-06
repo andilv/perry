@@ -8,6 +8,7 @@ pub(crate) use std::alloc::{alloc, Layout};
 pub(crate) use std::cell::{Cell, RefCell, UnsafeCell};
 pub(crate) use std::collections::hash_map::Entry;
 
+pub(crate) mod alloc_sample;
 mod allocators;
 mod block;
 mod inline;
@@ -33,6 +34,8 @@ mod tests_promoted_runs;
 pub(crate) use allocators::{
     inactive_survivor_index, with_survivor_arena, with_survivor_arena_mut,
 };
+#[cfg(test)]
+pub(crate) use block::old_gen_in_use_bytes_slot_index;
 pub(crate) use block::{
     arena_cell_alloc, arena_cell_try_alloc_current, drain_block_pool_if_requested,
     new_object_start_bitmap, old_gen_in_use_bytes_sub, release_arena_block,
@@ -46,13 +49,14 @@ pub(crate) use block::{
 /// allocation path uses instead of a per-access `_tlv_get_addr`.
 pub(crate) use block::{arena_hot_addr, hot_arena, hot_inline_state, inline_state_hot_addr};
 #[cfg(test)]
+#[cfg(test)]
 pub(crate) use block::{
     block_pool_bytes_for_test, block_pool_explicit_drained_bytes_for_test, block_pool_put,
     force_next_block_alloc_failure, gc_trigger_arena_borrow_depth, gc_trigger_arena_calls,
     reset_gc_trigger_arena_probe,
 };
 pub(crate) use page_meta::{
-    address_span_overlaps_pages, defer_old_object_page_registration,
+    address_span_overlaps_pages, defer_old_object_page_registration, page_class_table_report,
     register_block_space_with_object_starts, register_old_object_pages,
     unregister_block_generation, unregister_old_block_pages, OLD_GEN_RECLAIM_POOLED_BYTES,
     OLD_GEN_RECLAIM_RETURNED_BYTES, OLD_GEN_RECLAIM_REUSABLE_BYTES,

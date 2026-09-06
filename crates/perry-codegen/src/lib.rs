@@ -74,12 +74,19 @@ pub mod types;
 
 pub use codegen::{
     compile_module, namespace_member_class_key, namespace_member_func_key,
-    namespace_member_var_key, resolve_target_triple, short_spread_method_capabilities, AppMetadata,
-    CompileOptions, ExportedObjectLiteralCapability, FpContractMode, ImportedClass,
-    ImportedObjectLiteral, ImportedObjectLiteralMethod, NamespaceEntry, NamespaceEntryKind,
-    ObjectLiteralMethodCandidate, ShortSpreadMethodCandidate,
+    namespace_member_var_key, resolve_target_triple, short_spread_method_capabilities,
+    user_function_symbol, AppMetadata, CompileOptions, ExportedObjectLiteralCapability,
+    FpContractMode, ImportedClass, ImportedObjectLiteral, ImportedObjectLiteralMethod,
+    NamespaceEntry, NamespaceEntryKind, ObjectLiteralMethodCandidate, ShortSpreadMethodCandidate,
 };
 pub use collectors::CjsPreambleCensus;
+// #9843: the segment-view for-of matcher's counter. Exported so the
+// driver can run it at the HIR-trace point — after every transform, on
+// exactly the statements codegen consumes — instead of only inside a
+// codegen run, which a 10 MB bundle does not reach in a usable time.
+pub use collectors::segview::{
+    segview_diag_enabled, segview_lowering_enabled, segview_rewrite_module, SegViewDiag,
+};
 
 /// Return the guarded proven-`this` method-clone capabilities a native module
 /// may safely publish to importing codegen units. The first map contains all

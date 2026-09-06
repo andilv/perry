@@ -345,6 +345,132 @@ fn test_gc_check_trigger_copied_minor_malloc_sweep_rebaselines_trigger() {
     );
 }
 
+/// #9840 on the BUDGETED path — the one cc actually takes. Companion to
+/// `debt_pacer::direct_malloc_minor_also_rebaselines_the_whole_arena_trigger`
+/// (the direct synchronous arm); the moving safepoint
+/// (`gc_safepoint_moving_minor`) is the third caller and shares this same
+/// finisher.
+///
+/// A `MallocCount` minor sweeps the nursery exactly as an `ArenaBytes` minor
+/// does, so the whole-arena trigger must be measured from after it. Leaving it
+/// where the previous arena-kind collection put it is what let six
+/// `MallocCount` minors' promotion walk the arena total across a stale
+/// threshold and fire the arena arm on an 856-byte nursery — see the direct
+/// test's doc comment for the measurement.
+///
+/// Sabotage (delete the `gc_rebaseline_arena_trigger_after_collection` call
+/// from `gc_finish_malloc_trigger_collection`): the first assertion sees the
+/// pre-collection trigger, and the second sees a whole-arena cycle start on
+/// the quiet nursery.
+#[test]
+fn test_budgeted_malloc_minor_rebaselines_the_whole_arena_trigger() {
+    let _legacy_pacing = crate::gc::policy::force_legacy_gc_pacing();
+    let _guard = CopyingNurseryTestGuard::new(1);
+    let trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    let old_in_use = crate::arena::old_gen_in_use_bytes();
+    GC_LAST_OLD_RECLAIM_IN_USE_BYTES.with(|bytes| bytes.set(old_in_use));
+    GC_OLD_RECLAIM_PENDING.with(|pending| pending.set(false));
+
+    let live_malloc = gc_malloc(
+        std::mem::size_of::<crate::closure::ClosureHeader>(),
+        GC_TYPE_CLOSURE,
+    );
+    unsafe {
+        init_test_closure(live_malloc);
+    }
+    js_shadow_slot_set(0, ptr_bits(live_malloc as usize));
+    activate_malloc_registry_for_tests();
+
+    let churn_headers = allocate_dead_malloc_churn_headers(48);
+    assert_eq!(
+        tracked_malloc_headers_matching(&churn_headers),
+        churn_headers.len(),
+        "malloc churn should be tracked before gc_check_trigger"
+    );
+
+    // Arena arm armed but NOT due (1 MB of headroom); malloc pressure due.
+    let arena_total_before = crate::arena::arena_total_bytes();
+    let stale_trigger = arena_total_before + 1024 * 1024;
+    GC_NEXT_TRIGGER_BYTES.with(|trigger| trigger.set(stale_trigger));
+    trigger_guard.make_malloc_sweep_due();
+
+    let collections_before = gc_collection_count();
+    gc_check_trigger();
+
+    let mut step_status = JsGcStepResult::default();
+    assert_eq!(
+        js_gc_step_status(&mut step_status),
+        JS_GC_STEP_STATUS_ACTIVE,
+        "gc_check_trigger should schedule malloc pressure as bounded assist work"
+    );
+    assert_eq!(
+        step_status.trigger_kind,
+        GcTriggerKind::MallocCount.ffi_code(),
+        "the cycle under test must be the MallocCount one"
+    );
+
+    let completed = complete_budgeted_gc_cycle();
+    assert_eq!(completed.status, JS_GC_STEP_STATUS_COMPLETED);
+    assert!(
+        gc_collection_count() > collections_before,
+        "draining the budgeted malloc-pressure cycle should collect"
+    );
+    assert_eq!(
+        tracked_malloc_headers_matching(&churn_headers),
+        0,
+        "the cycle must have swept malloc, or it did not take the arm under test"
+    );
+
+    // (1) The budgeted finisher re-baselined the whole-arena trigger too.
+    let arena_total_after = crate::arena::arena_total_bytes();
+    let next_trigger = GC_NEXT_TRIGGER_BYTES.with(|trigger| trigger.get());
+    assert!(
+        next_trigger >= arena_total_after + gc_trigger_headroom_floor_bytes(),
+        "the budgeted MallocCount finisher must re-baseline the whole-arena \
+         trigger above the set it left behind (next_trigger={next_trigger}, \
+         arena_total_after={arena_total_after}); leaving it at the \
+         pre-collection value ({stale_trigger}) is shape (b)'s stale threshold"
+    );
+
+    // (2) ...so a little old-generation growth cannot re-arm a whole-arena
+    //     cycle on the nursery this collection just emptied.
+    let old_in_use = crate::arena::old_gen_in_use_bytes();
+    GC_LAST_OLD_RECLAIM_IN_USE_BYTES.with(|bytes| bytes.set(old_in_use));
+    GC_OLD_RECLAIM_PENDING.with(|pending| pending.set(false));
+    let mut filler = Vec::new();
+    for _ in 0..32 {
+        filler.push(crate::arena::arena_alloc_gc_old(
+            64 * 1024,
+            8,
+            GC_TYPE_STRING,
+        ));
+    }
+    assert!(
+        crate::arena::arena_total_bytes() > stale_trigger,
+        "the filler must grow the arena total past the PRE-collection trigger, \
+         or the assertion below cannot distinguish the two behaviours"
+    );
+    let old_in_use = crate::arena::old_gen_in_use_bytes();
+    GC_LAST_OLD_RECLAIM_IN_USE_BYTES.with(|bytes| bytes.set(old_in_use));
+    GC_OLD_RECLAIM_PENDING.with(|pending| pending.set(false));
+
+    let collections_before_growth = gc_collection_count();
+    gc_check_trigger();
+    let mut after_growth = JsGcStepResult::default();
+    assert_ne!(
+        js_gc_step_status(&mut after_growth),
+        JS_GC_STEP_STATUS_ACTIVE,
+        "2 MB of old-generation growth after a nursery collection must not open \
+         a whole-arena cycle on the quiet nursery"
+    );
+    assert_eq!(
+        gc_collection_count(),
+        collections_before_growth,
+        "...nor collect"
+    );
+    drop(filler);
+}
+
 #[test]
 fn test_gc_check_trigger_copied_minor_without_malloc_sweep_preserves_malloc_trigger() {
     let _legacy_pacing = crate::gc::policy::force_legacy_gc_pacing();
@@ -890,4 +1016,52 @@ fn test_copied_minor_promotable_census_filtered_walk_matches_unfiltered() {
         "census must count the aged survivor ({survivor_total} bytes), got {actual} — \
          the equivalence assert above must not be vacuously 0 == 0"
     );
+}
+
+/// #9819 follow-up: `js_regexp_new` allocates the header in the NURSERY. A
+/// header that dies young must be finalized by the copied minor — its `Arc`
+/// program released and its registry entries removed — because the from-space
+/// flip runs no per-object finalize hooks. Without
+/// `finalize_dead_copied_minor_from_space_regexps` the dead address stays in
+/// `REGEX_POINTERS` and the program's strong count never comes back down.
+#[test]
+fn nursery_regexp_that_dies_young_is_finalized_by_the_copied_minor() {
+    let _guard = CopyingNurseryTestGuard::new(1);
+    let dead = crate::regex::test_construct_regexp_and_exec_once("b(?:c)+d-die-young", "g");
+    let live = crate::regex::test_construct_regexp_and_exec_once("b(?:c)+d-die-young", "g");
+    let dead_addr = dead as usize;
+    let live_addr = live as usize;
+    // Premise: production construction is nursery-allocated now.
+    assert!(
+        crate::arena::pointer_in_nursery(dead_addr),
+        "the header must be nursery-allocated"
+    );
+    assert!(crate::regex::test_regex_pointer_entry_exists(dead_addr));
+    assert!(crate::regex::test_regex_source_entry_exists(dead_addr));
+    // Both headers share one program through the site cache.
+    let count_before = crate::regex::test_regexp_std_program_strong_count(live);
+    assert!(count_before >= 2);
+
+    // Only `live` is rooted; `dead` is garbage.
+    js_shadow_slot_set(0, ptr_bits(live_addr));
+    let _ = gc_collect_minor();
+
+    let live_new = (js_shadow_slot_get(0) & POINTER_MASK) as usize;
+    assert_ne!(live_new, 0, "the rooted RegExp must survive");
+    assert_ne!(live_new, live_addr, "the rooted RegExp must be evacuated");
+    assert!(crate::regex::regex_header_has_magic(live_new as *const _));
+    assert!(crate::regex::test_regex_pointer_entry_exists(live_new));
+    assert!(crate::regex::test_regex_source_entry_exists(live_new));
+
+    assert!(
+        !crate::regex::test_regex_pointer_entry_exists(dead_addr),
+        "a nursery RegExp that died must be removed from REGEX_POINTERS by the copied minor"
+    );
+    assert!(!crate::regex::test_regex_source_entry_exists(dead_addr));
+    assert_eq!(
+        crate::regex::test_regexp_std_program_strong_count(live_new as *const _),
+        count_before - 1,
+        "the dead header's Arc clone of the shared program must have been dropped"
+    );
+    js_shadow_slot_set(0, 0);
 }

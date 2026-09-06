@@ -905,7 +905,10 @@ fn regex_cache_capped_and_prior_headers_survive_eviction() {
 
     // Flood the cache with distinct patterns — far past the cap.
     for i in 0..(REGEX_CACHE_MAX_ENTRIES * 2 + 10) {
-        let _ = get_or_compile_regex(&format!("cachefill{i}[a-z]+"), "");
+        let _ = get_or_compile_regex(
+            &Arc::from(format!("cachefill{i}[a-z]+").as_str()),
+            &Arc::from(""),
+        );
     }
     let std_len = REGEX_CACHE.with(|c| c.borrow().len());
     assert!(
@@ -915,7 +918,10 @@ fn regex_cache_capped_and_prior_headers_survive_eviction() {
 
     // Flood the fancy cache as well (each pattern rejected by the std engine).
     for i in 0..(REGEX_CACHE_MAX_ENTRIES + 10) {
-        let _ = get_or_compile_regex(&format!("(?<=fill{i})x"), "");
+        let _ = get_or_compile_regex(
+            &Arc::from(format!("(?<=fill{i})x").as_str()),
+            &Arc::from(""),
+        );
     }
     let fancy_len = FANCY_CACHE.with(|c| c.borrow().len());
     assert!(
@@ -925,7 +931,7 @@ fn regex_cache_capped_and_prior_headers_survive_eviction() {
 
     // Quantified captures populate the ECMAScript RepeatMatcher cache.
     for i in 0..(REGEX_CACHE_MAX_ENTRIES + 10) {
-        let _ = get_or_compile_regex(&format!("(repeat{i})*"), "");
+        let _ = get_or_compile_regex(&Arc::from(format!("(repeat{i})*").as_str()), &Arc::from(""));
     }
     let repeat_len = REPEAT_MATCHER_CACHE.with(|c| c.borrow().len());
     assert!(
@@ -1807,7 +1813,7 @@ fn a_single_program_cache_clear_cannot_disarm_a_lookbehind_literal() {
     assert!(
         REGEX_CACHE.with(|c| c
             .borrow()
-            .contains_key(&(source.to_string(), String::new()))),
+            .contains_key(&(std::sync::Arc::from(source), std::sync::Arc::from("")))),
         "the placeholder must survive, or this test exercises nothing"
     );
     // A fresh literal site, so the construction cache cannot answer from the
@@ -1828,5 +1834,117 @@ fn a_single_program_cache_clear_cannot_disarm_a_lookbehind_literal() {
         subject.with_const_ptr::<StringHeader, _>(|s| js_regexp_test(cold, s)),
         1,
         "the literal must still match after an unrelated cache reached capacity"
+    );
+}
+
+/// The backtracking cliff: a capture group under a quantifier takes a pattern
+/// off the linear engine, and the ECMAScript backtracker has no step budget.
+/// `/^(a+)+$/.test("a"*28 + "!")` measured 16.5 s against 4.8 s for node and
+/// 0 ms for the identical-language `/^(?:a+)+$/`.
+///
+/// The linear program proves the answer in O(n) — the two engines accept the
+/// same language and disagree only about capture ASSIGNMENT — so the
+/// backtracker must not be entered for a subject the linear engine has already
+/// ruled out. This test would take minutes without that gate.
+#[test]
+fn quantified_capture_pattern_does_not_backtrack_on_a_non_matching_subject() {
+    let _lock = crate::gc::global_side_table_test_lock();
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let pattern = scope.root_string_ptr(make_string("^(a+)+$"));
+    let flags = scope.root_string_ptr(make_string(""));
+    let re = pattern.with_mut_ptr::<StringHeader, _>(|pattern| {
+        flags.with_mut_ptr::<StringHeader, _>(|flags| js_regexp_new(pattern, flags))
+    });
+    // The pattern really is on the backtracker — that is the premise.
+    assert!(
+        lookup_repeat_matcher(re).is_some(),
+        "a capture under a quantifier must route to the ECMAScript matcher"
+    );
+
+    let hay = format!("{}!", "a".repeat(40));
+    let subject = scope.root_string_ptr(make_string(&hay));
+    let started = std::time::Instant::now();
+    assert_eq!(
+        subject.with_const_ptr::<StringHeader, _>(|s| js_regexp_test(re, s)),
+        0,
+        "no match: the subject ends in '!'"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "a non-matching subject must not be handed to the backtracker \
+         (took {:?} for 40 characters)",
+        started.elapsed()
+    );
+
+    // A subject that DOES match still goes through the backtracker and still
+    // reports the spec's captures.
+    let good = scope.root_string_ptr(make_string("aaaa"));
+    assert_eq!(
+        good.with_const_ptr::<StringHeader, _>(|s| js_regexp_test(re, s)),
+        1
+    );
+}
+
+/// #6759 phase 1 follow-up: a `RegExp` receiver can now answer the
+/// descriptor-summary probe. Before the meta edge was wired for
+/// `GC_TYPE_REGEXP`, `may_have_descriptor_entry` answered the conservative
+/// `true` for every RegExp, so `set_last_index_throwing` built a `String` and
+/// SipHashed `(usize, String)` on every global/sticky `test()`/`exec()`.
+#[test]
+fn a_fresh_regexp_proves_lastindex_absent_without_probing_the_tables() {
+    let _lock = crate::gc::global_side_table_test_lock();
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let pattern = scope.root_string_ptr(make_string("x"));
+    let flags = scope.root_string_ptr(make_string("g"));
+    let re = pattern.with_mut_ptr::<StringHeader, _>(|pattern| {
+        flags.with_mut_ptr::<StringHeader, _>(|flags| js_regexp_new(pattern, flags))
+    });
+    // Premise: this really is the dedicated RegExp cell, not a shaped object
+    // that would have answered through the ordinary `GC_TYPE_OBJECT` path.
+    let gc = unsafe { crate::value::addr_class::try_read_gc_header(re as usize) }
+        .expect("RegExp must be a GC allocation");
+    assert_eq!(gc.obj_type, crate::gc::GC_TYPE_REGEXP);
+
+    assert!(
+        !crate::object::test_may_have_descriptor_entry(re as usize, "lastIndex", false),
+        "a fresh RegExp has no descriptors, so the meta summary must prove \
+         `lastIndex` absent instead of sending the caller to the table"
+    );
+    assert!(
+        crate::object::get_property_attrs(re as usize, "lastIndex").is_none(),
+        "and the answer the fast path skips must be the same one"
+    );
+}
+
+/// The other half, and the one that makes the fast negative safe: an owner
+/// that DOES have a descriptor must still be found. Install and probe share
+/// one predicate, so a probe widened without its install would answer
+/// "proven absent" here and `set_last_index_throwing` would silently stop
+/// throwing (test262 prototype/{exec,test}/y-fail-lastindex-no-write).
+#[test]
+fn a_regexp_with_a_non_writable_lastindex_is_still_found_by_the_probe() {
+    let _lock = crate::gc::global_side_table_test_lock();
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let pattern = scope.root_string_ptr(make_string("x"));
+    let flags = scope.root_string_ptr(make_string("g"));
+    let re = pattern.with_mut_ptr::<StringHeader, _>(|pattern| {
+        flags.with_mut_ptr::<StringHeader, _>(|flags| js_regexp_new(pattern, flags))
+    });
+    let attrs = crate::object::PropertyAttrs::new(false, true, true);
+    crate::object::set_property_attrs(re as usize, "lastIndex".to_string(), attrs);
+
+    assert!(
+        crate::object::test_may_have_descriptor_entry(re as usize, "lastIndex", false),
+        "the install set the key bit, so the probe must send the caller to the table"
+    );
+    let found = crate::object::get_property_attrs(re as usize, "lastIndex")
+        .expect("the descriptor the test installed must be readable back");
+    assert!(!found.writable(), "and it must still read as non-writable");
+
+    // A DIFFERENT key on the same owner stays proven-absent: the summary is
+    // per key, not per owner, so widening it must not blunt it.
+    assert!(
+        !crate::object::test_may_have_descriptor_entry(re as usize, "source", false),
+        "an unrelated key on the same RegExp must still take the fast negative"
     );
 }

@@ -1056,6 +1056,10 @@ fn compute_object_cache_key_with_env(
         "env_ll_size_opt",
         env_var("PERRY_LL_SIZE_OPT").as_deref().unwrap_or(""),
     );
+    h.field(
+        "env_ll_opt_level",
+        env_var("PERRY_LL_OPT_LEVEL").as_deref().unwrap_or(""),
+    );
     // #8583/#8679: the post-RS4GC instruction budget decides whether functions
     // are re-lowered onto shadow frames; two settings must never share an object.
     h.field(
@@ -1069,6 +1073,15 @@ fn compute_object_cache_key_with_env(
     h.field(
         "env_ll_tre_max_alloca_walk",
         env_var("PERRY_LL_TRE_MAX_ALLOCA_WALK")
+            .as_deref()
+            .unwrap_or(""),
+    );
+    // Oversized post-optimization functions can use LLVM's O0 machine
+    // pipeline for bounded ISel/regalloc; the resulting object differs from
+    // normal optimized machine emission.
+    h.field(
+        "env_ll_fast_emit_max_instrs",
+        env_var("PERRY_LL_FAST_EMIT_MAX_INSTRS")
             .as_deref()
             .unwrap_or(""),
     );

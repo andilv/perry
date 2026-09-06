@@ -623,8 +623,7 @@ unsafe fn array_prototype_to_string_override(value: f64) -> ArrayToStringOutcome
     // collector and re-read its address after every allocation.
     let scope = crate::gc::RuntimeHandleScope::new();
     let value_handle = scope.root_nanbox_f64(value);
-    let key_handle =
-        scope.root_string_ptr(crate::string::js_string_from_bytes(b"toString".as_ptr(), 8));
+    let key_handle = scope.root_string_ptr(crate::string::canonical_key(b"toString"));
     let proto = crate::object::builtin_prototype_value("Array");
     let proto_handle = scope.root_nanbox_f64(proto);
     let proto_bits = proto_handle.get_nanbox_f64().to_bits();
@@ -690,8 +689,7 @@ pub(crate) fn call_array_prototype_to_string_method(
     unsafe {
         let scope = crate::gc::RuntimeHandleScope::new();
         let receiver_handle = scope.root_nanbox_f64(value);
-        let key_handle =
-            scope.root_string_ptr(crate::string::js_string_from_bytes(b"toString".as_ptr(), 8));
+        let key_handle = scope.root_string_ptr(crate::string::canonical_key(b"toString"));
         let prototype_handle =
             scope.root_nanbox_f64(crate::object::builtin_prototype_value("Array"));
         let prototype_bits = prototype_handle.get_nanbox_f64().to_bits();
@@ -790,7 +788,7 @@ unsafe fn call_method_for_primitive(
     if obj_ptr.is_null() || (obj_ptr as usize) < 0x10000 {
         return MethodOutcome::Absent;
     }
-    let key = crate::string::js_string_from_bytes(method_name.as_ptr(), method_name.len() as u32);
+    let key = crate::string::canonical_key(method_name);
     let key_handle = scope.root_string_ptr(key);
     // Presence is independent from the value returned by Get. In particular,
     // an inherited accessor may exist yet return undefined/null; that is a
@@ -870,7 +868,7 @@ unsafe fn call_function_method(
         return FunctionMethodOutcome::Absent;
     }
 
-    let key = crate::string::js_string_from_bytes(method_name.as_ptr(), method_name.len() as u32);
+    let key = crate::string::canonical_key(method_name);
     let key_handle = scope.root_string_ptr(key);
     let key_ptr = key_handle.get_raw_const_ptr::<crate::string::StringHeader>();
     let method = function_method_value(closure_ptr, key_ptr, method_name);

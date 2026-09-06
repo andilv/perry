@@ -38,8 +38,8 @@
 //!   engines refuse);
 //! * `.source` / `.flags` / `.global` / `.sticky` / `lastIndex` are header
 //!   and side-table reads that never touched the compiled program;
-//! * identity is untouched — `js_regexp_new` still `gc_malloc`s a fresh
-//!   header per evaluation.
+//! * identity is untouched — `js_regexp_new` still allocates a fresh header
+//!   per evaluation.
 //!
 //! The build itself happens on the first operation that needs a matcher,
 //! through [`ensure_regex_compiled`], and installs exactly the pointers
@@ -233,7 +233,7 @@ fn build_and_install_programs(re: *const RegExpHeader) {
         let cache_hit = super::REGEX_CACHE.with(|cache| {
             cache
                 .borrow()
-                .contains_key(&(pattern.to_string(), flags.to_string()))
+                .contains_key(&(pattern.clone(), flags.clone()))
         });
         unsafe {
             let pattern_ptr = (*re).pattern_ptr;
@@ -243,16 +243,13 @@ fn build_and_install_programs(re: *const RegExpHeader) {
         }
     }
     let std_arc = get_or_compile_regex(&pattern, &flags);
-    let fancy_arc: Option<Arc<fancy_regex::Regex>> = FANCY_CACHE.with(|fc| {
-        fc.borrow()
-            .get(&(pattern.to_string(), flags.to_string()))
-            .cloned()
-    });
+    let fancy_arc: Option<Arc<fancy_regex::Regex>> =
+        FANCY_CACHE.with(|fc| fc.borrow().get(&(pattern.clone(), flags.clone())).cloned());
     let repeat_arc: Option<Arc<super::repeat_matcher::RepeatMatcherRegex>> = REPEAT_MATCHER_CACHE
         .with(|cache| {
             cache
                 .borrow()
-                .get(&(pattern.to_string(), flags.to_string()))
+                .get(&(pattern.clone(), flags.clone()))
                 .cloned()
         });
     // ── Repair before publishing ──────────────────────────────────────────
@@ -286,7 +283,7 @@ fn build_and_install_programs(re: *const RegExpHeader) {
             FANCY_CACHE.with(|fc| {
                 let mut fc = fc.borrow_mut();
                 evict_regex_cache_if_full(&mut fc);
-                fc.insert((pattern.to_string(), flags.to_string()), arc.clone());
+                fc.insert((pattern.clone(), flags.clone()), arc.clone());
             });
             fancy_arc = Some(arc);
         }
@@ -301,7 +298,7 @@ fn build_and_install_programs(re: *const RegExpHeader) {
             REPEAT_MATCHER_CACHE.with(|cache| {
                 let mut cache = cache.borrow_mut();
                 evict_regex_cache_if_full(&mut cache);
-                cache.insert((pattern.to_string(), flags.to_string()), arc.clone());
+                cache.insert((pattern.clone(), flags.clone()), arc.clone());
             });
             repeat_arc = Some(arc);
         }

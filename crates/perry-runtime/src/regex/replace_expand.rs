@@ -3,6 +3,7 @@
 //! `expand_js_replacement` (ECMAScript `$`-pattern expansion) and
 //! `replace_regex_fn_fancy` (the fancy-regex callback-replace fallback).
 
+use super::replace_expand_fancy::replace_regex_str_fancy;
 use super::replace_fn::{copy_replace_source, finish_replace_bytes};
 use super::*;
 
@@ -477,7 +478,7 @@ pub extern "C" fn js_string_replace_regex_named(
     }
 
     unsafe {
-        if let Some(repeat_matcher) = lookup_repeat_matcher(re) {
+        if let Some(repeat_matcher) = lookup_repeat_matcher_for(re, str_data, 0) {
             let result = repeat_matcher.replace(str_data, repl_str, (*re).global);
             return finish_replace_bytes(result.as_bytes());
         }

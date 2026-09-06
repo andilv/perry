@@ -106,6 +106,32 @@ fn is_type_only_export_binding(module: &perry_hir::Module, name: &str) -> bool {
     !has_runtime_value
 }
 
+/// Wrapper symbol used when a dynamic-import namespace materializes a local
+/// function as a JavaScript value. Keep this routed through codegen's own
+/// function mangler: module-name sanitization is intentionally not injective
+/// for `$` and would point `$a` at `_a`'s symbol instead.
+fn namespace_local_function_wrapper_symbol(module_name: &str, function_name: &str) -> String {
+    format!(
+        "__perry_wrap_{}",
+        perry_codegen::user_function_symbol(module_name, function_name)
+    )
+}
+
+#[cfg(test)]
+mod namespace_local_function_symbol_tests {
+    use super::namespace_local_function_wrapper_symbol;
+
+    #[test]
+    fn uses_injective_function_component_for_dynamic_namespace_entries() {
+        let dollar = namespace_local_function_wrapper_symbol("chunk.js", "$a");
+        let underscore = namespace_local_function_wrapper_symbol("chunk.js", "_a");
+
+        assert_eq!(dollar, "__perry_wrap_perry_fn_chunk_js__u__24_a");
+        assert_eq!(underscore, "__perry_wrap_perry_fn_chunk_js___a");
+        assert_ne!(dollar, underscore);
+    }
+}
+
 // OpenCode's 0.5--1.0 MiB generated chunks routinely lower to 20--45 MiB of
 // LLVM input even with fewer than 1,000 HIR callables. Treat that observed
 // range as memory-heavy too: ordinary modules still use outer parallelism,
@@ -996,6 +1022,32 @@ pub fn run_with_parse_cache(
     // describe exactly what codegen consumes.
     for hir_module in ctx.native_modules.values_mut() {
         perry_transform::module_const_fold::run(hir_module);
+    }
+
+    // #9843: the segment-view for-of matcher's hit counter, taken here for
+    // the same reason the HIR trace is taken here — this is the last point
+    // before codegen, so the statements scanned are exactly the statements
+    // codegen consumes. Running it at this point (rather than only inside
+    // `collect_type_facts` on a rayon worker) is what makes "does the tier
+    // fire on the real bundle?" answerable in HIR-lowering time instead of a
+    // full LLVM build. Gated on `PERRY_SEGVIEW_DIAG`; costs nothing otherwise.
+    // #9843: the segment-view lowering. Default OFF (`PERRY_SEGVIEW=1`) because
+    // the runtime's view entry points do not exist yet, so an on-by-default
+    // rewrite would emit calls that fail to link. Runs here, at the same point
+    // as the counter and the HIR trace, so what it rewrites is exactly what
+    // codegen consumes.
+    if perry_codegen::segview_lowering_enabled() {
+        for hir_module in ctx.native_modules.values_mut() {
+            perry_codegen::segview_rewrite_module(hir_module);
+        }
+    }
+
+    if perry_codegen::segview_diag_enabled() {
+        let mut diag = perry_codegen::SegViewDiag::default();
+        for (path, hir_module) in &ctx.native_modules {
+            diag.scan_module(&path.display().to_string(), hir_module);
+        }
+        diag.report();
     }
 
     if trace_hir {
@@ -2766,13 +2818,11 @@ pub fn run_with_parse_cache(
                     .iter()
                     .find(|f| f.name == fe.source_local)
                 {
-                    let scoped = format!(
-                        "perry_fn_{}__{}",
-                        sanitize_module_name(&target_hir.name),
-                        sanitize_module_name(&func.name)
-                    );
                     perry_codegen::NamespaceEntryKind::LocalFunction {
-                        wrap_symbol: format!("__perry_wrap_{}", scoped),
+                        wrap_symbol: namespace_local_function_wrapper_symbol(
+                            &target_hir.name,
+                            &func.name,
+                        ),
                     }
                 } else if let Some(class) = target_hir
                     .classes
@@ -2807,13 +2857,11 @@ pub fn run_with_parse_cache(
                     // ran during init → "Cannot read properties of undefined
                     // (reading 'checks')"). Resolve to the ORIGIN function's
                     // closure singleton instead, matching plain declarations.
-                    let scoped = format!(
-                        "perry_fn_{}__{}",
-                        sanitize_module_name(&target_hir.name),
-                        sanitize_module_name(&func.name)
-                    );
                     perry_codegen::NamespaceEntryKind::LocalFunction {
-                        wrap_symbol: format!("__perry_wrap_{}", scoped),
+                        wrap_symbol: namespace_local_function_wrapper_symbol(
+                            &target_hir.name,
+                            &func.name,
+                        ),
                     }
                 } else {
                     // Best-effort: treat unknown locals as Var sourced

@@ -138,55 +138,11 @@ impl PageGenerationCache {
 // that — an 8.6% regression on the same row (0/7 pairs). Keep the scan short.
 const PAGE_GENERATION_CACHE_WAYS: usize = 4;
 
-/// Small direct-probed cache in front of [`PageGenerationMap`].
-///
-/// Pure accelerator: a miss, a stale way, or a full set all fall through to
-/// the authoritative map, so the only thing correctness depends on is that
-/// every invalidation clears **all** ways — which is why
-/// [`invalidate_generation_cache`] resets the whole set rather than one entry.
-///
-/// Stored behind an `UnsafeCell`, not a `Cell`: `Cell::get` returns a **copy**,
-/// and copying ~200 bytes on every classification cost more than the map lookup
-/// the cache exists to avoid (measured as a ~2% regression on `retain.ts`
-/// before this was switched). Access is single-threaded by construction — the
-/// cache is thread-local and no path holds a reference across a call that could
-/// re-enter classification.
-#[derive(Clone, Copy)]
-struct PageGenerationCacheSet {
-    ways: [PageGenerationCache; PAGE_GENERATION_CACHE_WAYS],
-    /// Round-robin victim for the next insert.
-    next: usize,
-}
+mod page_class;
+pub(crate) use page_class::*;
 
-impl PageGenerationCacheSet {
-    const fn empty() -> Self {
-        Self {
-            ways: [PageGenerationCache::empty(); PAGE_GENERATION_CACHE_WAYS],
-            next: 0,
-        }
-    }
-
-    #[inline(always)]
-    fn lookup(&self, key: usize, addr: usize) -> Option<PageGenerationRange> {
-        for way in self.ways.iter() {
-            if way.valid && way.key == key && way.range.contains(addr) {
-                return Some(way.range);
-            }
-        }
-        None
-    }
-
-    #[inline]
-    fn insert(&mut self, key: usize, range: PageGenerationRange) {
-        let slot = self.next % PAGE_GENERATION_CACHE_WAYS;
-        self.ways[slot] = PageGenerationCache {
-            key,
-            range,
-            valid: true,
-        };
-        self.next = slot.wrapping_add(1);
-    }
-}
+#[cfg(test)]
+mod tests;
 
 /// #7187: this map used to carry a bespoke identity hasher (`write_usize`
 /// stored the key verbatim). `HashMap` is hashbrown, which takes the bucket
@@ -319,13 +275,20 @@ pub(crate) struct OldArenaSourceBlockSelection {
     pub(crate) pages: crate::fast_hash::PtrHashSet<usize>,
 }
 
+// `PAGE_GENERATIONS` and `PAGE_GENERATION_CACHE` stay raw because they are
+// NAMED fields of `HotTls` (`page_generations`, `page_generation_cache`), whose
+// providers below hand `tls_hot::fill` their addresses. A named field is one
+// dependent load cheaper than a claimed slot, which is why the closed set
+// exists; everything else in this file was simply never migrated.
 thread_local! {
     static PAGE_GENERATIONS: RefCell<PageGenerationMap> =
         RefCell::new(crate::fast_hash::new_ptr_hash_map());
 
     static PAGE_GENERATION_CACHE: UnsafeCell<PageGenerationCacheSet> =
         const { UnsafeCell::new(PageGenerationCacheSet::empty()) };
+}
 
+crate::perry_thread_local! {
     static OLD_GEN_PAGE_OBJECTS: RefCell<OldGenPageObjectMap> =
         RefCell::new(crate::fast_hash::new_ptr_hash_map());
 
@@ -411,7 +374,7 @@ pub(crate) fn generation_page_base(page: usize) -> usize {
 fn invalidate_generation_cache() {
     // Every way, not one — a stale way is exactly what this guards against.
     // SAFETY: thread-local, single-threaded.
-    PAGE_GENERATION_CACHE.with(|cache| unsafe { *cache.get() = PageGenerationCacheSet::empty() });
+    PAGE_GENERATION_CACHE.with(|cache| unsafe { (*cache.get()).invalidate() });
 }
 
 fn register_old_block_pages(base: usize, size: usize) {
@@ -1138,7 +1101,7 @@ pub(crate) fn register_old_object_pages(header_addr: usize, total_size: usize) {
 // which fails if a new toucher of either table appears without one.
 // ---------------------------------------------------------------------------
 
-thread_local! {
+crate::perry_thread_local! {
     /// Old-object page registrations not yet folded into `OLD_GEN_PAGE_OBJECTS`.
     /// Entries are `(header_addr, total_size)`; nothing here is dereferenced, so
     /// a deferred entry never keeps an object alive and is not a GC root — and
@@ -1788,108 +1751,6 @@ pub(crate) fn old_page_meta_for_tests(page: usize) -> Option<OldPageMeta> {
     })
 }
 
-#[cfg(test)]
-mod page_generation_hasher_tests {
-    use super::*;
-    use std::collections::HashSet;
-    use std::hash::BuildHasher;
-
-    /// #7187 regression guard for `PageGenerationMap`'s hasher.
-    ///
-    /// `HashMap` is hashbrown: the bucket index comes from the hash's low bits,
-    /// but the SIMD control byte — the filter that decides whether a group
-    /// probe needs a real key comparison — is `hash >> 57`. Generation class
-    /// keys are `addr >> GENERATION_CLASS_SHIFT`, so an identity hasher (which
-    /// this map carried until #7187) produces a value around 2^26 whose top
-    /// seven bits are zero for **every** key in the table. Every occupied slot
-    /// in a probed group then matches, and each match costs a scattered load
-    /// plus a key comparison — on a lookup the write barrier performs several
-    /// times per heap store.
-    ///
-    /// This asserts the property directly rather than asserting "we call
-    /// `PtrHasher`": reinstating any non-mixing hasher collapses the control
-    /// byte to a single value and fails here.
-    #[test]
-    fn control_byte_is_spread_across_generation_class_keys() {
-        let map = PageGenerationMap::default();
-        let build = map.hasher();
-
-        // Realistic 48-bit heap addresses, one per 1 MiB generation bucket —
-        // the exact key population `classify_heap_generation` looks up.
-        let base: usize = 0x0000_7f31_0000_0000;
-        let control_bytes: HashSet<u64> = (0..64)
-            .map(|i| {
-                let addr = base + i * (1usize << GENERATION_CLASS_SHIFT);
-                (build.hash_one(generation_class_key_for_addr(addr)) >> 57) & 0x7f
-            })
-            .collect();
-
-        assert!(
-            control_bytes.len() >= 32,
-            "hashbrown control byte must vary across generation class keys, got {} \
-             distinct values from 64 consecutive buckets (an identity hasher yields 1)",
-            control_bytes.len()
-        );
-    }
-
-    /// The bucket index (low bits) must stay well spread too — mixing that put
-    /// all the entropy in the high bits and left the low bits constant would
-    /// trade a control-byte collision for a far worse bucket collision. This is
-    /// the failure `fast_hash`'s `mix` step exists for.
-    #[test]
-    fn bucket_index_is_spread_across_generation_class_keys() {
-        let map = PageGenerationMap::default();
-        let build = map.hasher();
-
-        let base: usize = 0x0000_7f31_0000_0000;
-        let low_bits: HashSet<u64> = (0..64)
-            .map(|i| {
-                let addr = base + i * (1usize << GENERATION_CLASS_SHIFT);
-                build.hash_one(generation_class_key_for_addr(addr)) & 0x3f
-            })
-            .collect();
-
-        assert!(
-            low_bits.len() >= 32,
-            "bucket index must vary across generation class keys, got {} distinct \
-             values from 64 consecutive buckets",
-            low_bits.len()
-        );
-    }
-
-    /// The map must still answer correctly after the hasher change — a
-    /// point-query round trip over many buckets, which is the only way this map
-    /// is ever used.
-    #[test]
-    fn point_queries_round_trip_across_many_buckets() {
-        let mut map = PageGenerationMap::default();
-        let base: usize = 0x0000_7f31_0000_0000;
-        for i in 0..256usize {
-            let addr = base + i * (1usize << GENERATION_CLASS_SHIFT);
-            map.insert(
-                generation_class_key_for_addr(addr),
-                PageGenerationSlot::Single(PageGenerationRange {
-                    base: addr,
-                    end: addr + (1 << GENERATION_CLASS_SHIFT),
-                    generation: HeapGeneration::Old,
-                    space: HeapSpace::Old,
-                    object_starts: std::ptr::null_mut(),
-                }),
-            );
-        }
-        for i in 0..256usize {
-            let addr = base + i * (1usize << GENERATION_CLASS_SHIFT);
-            let found = map
-                .get(&generation_class_key_for_addr(addr))
-                .and_then(|slot| slot.find(addr + 0x40))
-                .expect("every inserted bucket must be found by point query");
-            assert_eq!(found.generation, HeapGeneration::Old);
-            assert_eq!(found.base, addr);
-        }
-        assert_eq!(map.len(), 256);
-    }
-}
-
 /// `PERRY_GC_CENSUS`: estimated bytes held by the per-page side tables.
 pub(crate) fn page_meta_census() -> Vec<crate::gc::census::SideTableRow> {
     use crate::gc::census::{hash_table_bytes, vec_bytes};
@@ -1934,32 +1795,4 @@ pub(crate) fn page_meta_census() -> Vec<crate::gc::census::SideTableRow> {
         ));
     });
     rows
-}
-
-#[cfg(test)]
-mod block_range_tests {
-    use super::old_arena_block_range_index;
-
-    /// `old_arena_block_range_index` is the whole reason #9772's selection can
-    /// group pages by block, so it gets a test that can fail: gaps between
-    /// blocks must not be attributed to the block below them.
-    #[test]
-    fn block_range_lookup_respects_gaps_and_ends() {
-        // Two 1 MiB blocks with a 1 MiB hole between them.
-        let ranges = vec![
-            (0x1000_0000, 0x1010_0000, 7, 0x10_0000),
-            (0x1020_0000, 0x1030_0000, 9, 0x10_0000),
-        ];
-        assert_eq!(old_arena_block_range_index(&ranges, 0x1000_0000), Some(0));
-        assert_eq!(old_arena_block_range_index(&ranges, 0x100F_FFFF), Some(0));
-        // One past the end of block 0 is the gap, not block 0.
-        assert_eq!(old_arena_block_range_index(&ranges, 0x1010_0000), None);
-        assert_eq!(old_arena_block_range_index(&ranges, 0x1018_0000), None);
-        assert_eq!(old_arena_block_range_index(&ranges, 0x1020_0000), Some(1));
-        assert_eq!(old_arena_block_range_index(&ranges, 0x102F_FFFF), Some(1));
-        // Above every block, and below every block.
-        assert_eq!(old_arena_block_range_index(&ranges, 0x1030_0000), None);
-        assert_eq!(old_arena_block_range_index(&ranges, 0x0FFF_FFFF), None);
-        assert_eq!(old_arena_block_range_index(&[], 0x1000_0000), None);
-    }
 }

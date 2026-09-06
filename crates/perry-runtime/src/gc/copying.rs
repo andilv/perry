@@ -170,6 +170,8 @@ pub(super) struct CopyingNurseryCollector {
     /// skipped. `debug_assert_no_remembering_possible` re-derives the premise at
     /// runtime in debug builds.
     pub(super) skip_remembering: bool,
+    /// `PERRY_GC_DIAG=1`: per-minor survival attribution (gc/survival_diag.rs).
+    pub(super) survival: Option<Box<super::survival_diag::SurvivalDiag>>,
     /// Weak target slots (WeakRef referent / WeakMap-WeakSet entry key /
     /// FinalizationRegistry record target) seen during the copy scan. The
     /// scan must NOT evacuate through them (that would strengthen the weak
@@ -215,6 +217,37 @@ static PREVIOUS_SURVIVOR_ESTIMATE: std::sync::atomic::AtomicUsize =
 /// reserve 100 MB of pointers.
 const SURVIVOR_ESTIMATE_CAP: usize = 1 << 21;
 
+/// Previous minor's dirty-scan covered-set size, for pre-sizing the next one.
+/// Capped for the same reason as the survivor estimate: a one-off huge cycle
+/// must not make every later cycle reserve unboundedly.
+static PREVIOUS_DIRTY_COVERED_ESTIMATE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub(super) fn previous_dirty_covered_estimate() -> usize {
+    PREVIOUS_DIRTY_COVERED_ESTIMATE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// LAST-VALUE. **Do not "just reserve the peak" — that was tried and it cost
+/// 400 MB of settled footprint for no time gain.**
+///
+/// LAST-VALUE, and a high-water mark was tried and REJECTED.
+///
+/// `[gc-dirty-covered]` shows this set is far more volatile than the survivor
+/// count this pattern was copied from: it ramps 1,028 -> ~119,000 over a turn
+/// and swings between adjacent minors, so a last-value estimate under-shoots on
+/// 57 of 96 minors. A high-water mark fixes that on the mechanism — under-shoots
+/// fall to 21 of 97 — and was still rejected: reserving the peak on EVERY minor
+/// cost settled footprint 763 -> 1165 MB and peak RSS 974 -> 1250 MB at 3300
+/// characters, for no measurable time difference (`reserve_rehash` 167 vs 182
+/// leaf samples, inside run-to-run noise). Trading footprint for CPU is
+/// rejected, and here it did not even buy CPU.
+pub(super) fn note_dirty_covered_for_presizing(count: usize) {
+    PREVIOUS_DIRTY_COVERED_ESTIMATE.store(
+        count.min(SURVIVOR_ESTIMATE_CAP),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 pub(super) fn note_survivor_count_for_presizing(count: usize) {
     PREVIOUS_SURVIVOR_ESTIMATE.store(
         count.min(SURVIVOR_ESTIMATE_CAP),
@@ -242,9 +275,19 @@ impl CopyingNurseryCollector {
             live_from_bytes: 0,
             tenuring_survivals,
             skip_remembering: false,
+            survival: crate::gc::gc_diag_enabled()
+                .then(|| Box::new(super::survival_diag::SurvivalDiag::new())),
             weak_slots: Vec::new(),
             memo_addr: 0,
             memo_result: 0,
+        }
+    }
+
+    /// Mirror a `worklist.push` into the survival diag's origin vector.
+    #[inline]
+    fn survival_push(&mut self) {
+        if let Some(d) = self.survival.as_mut() {
+            d.note_worklist_push();
         }
     }
 
@@ -390,6 +433,7 @@ impl CopyingNurseryCollector {
                     if flags & (GC_FLAG_MARKED | GC_FLAG_PINNED) == 0 {
                         (*ptr.header).gc_flags = flags | GC_FLAG_MARKED;
                         self.worklist.push(ptr.header);
+                        self.survival_push();
                         self.marked_headers.push(ptr.header);
                     }
                 }
@@ -432,6 +476,10 @@ impl CopyingNurseryCollector {
             (*header).gc_flags = flags | GC_FLAG_MARKED;
             let total = (*header).size as usize;
             self.worklist.push(header);
+            self.survival_push();
+            if let Some(d) = self.survival.as_mut() {
+                d.record((*header).obj_type, total, true);
+            }
             self.moved_headers.push(header);
             self.stats.promoted_objects += 1;
             self.stats.promoted_bytes += total;
@@ -550,6 +598,10 @@ impl CopyingNurseryCollector {
         gc_type_after_payload_move((*header).obj_type, old_user as usize, new_user as usize);
 
         self.worklist.push(new_header);
+        self.survival_push();
+        if let Some(d) = self.survival.as_mut() {
+            d.record((*new_header).obj_type, total, promote);
+        }
         self.moved_headers.push(new_header);
         self.live_from_bytes += total;
         if promote {
@@ -633,10 +685,16 @@ impl CopyingNurseryCollector {
             }
             let header = self.worklist[i];
             i += 1;
+            if let Some(d) = self.survival.as_mut() {
+                d.begin_drain_entry(i - 1);
+            }
             if (*header).gc_flags & GC_FLAG_FORWARDED != 0 {
                 continue;
             }
             self.scan_object_fields(header);
+        }
+        if let Some(d) = self.survival.as_mut() {
+            d.end_drain();
         }
     }
 
@@ -1356,13 +1414,29 @@ pub(super) fn run_copied_minor_attempt(
     let snapshot = remembered_dirty_snapshot();
     // #9754: objects whose every slot the dirty scan visited in-body — the
     // post-cycle coverage restore skips them (see `scan_dirty_object_slots`).
-    let mut dirty_scan_covered = crate::fast_hash::new_ptr_hash_set();
+    // #9835: this set is rebuilt from EMPTY on every minor and reaches ~1,000
+    // entries (`[gc-restore-coverage] objects_skipped=1026..1116`), so it walked
+    // hashbrown's growth ladder and paid a `RawTable::reserve_rehash` at each
+    // power-of-two boundary — measured 217 leaf samples in `reserve_rehash` on a
+    // 3300-char claude-code reply (1.5 % of the turn), 111 of them under
+    // `PtrHashSet::insert` and the rest under this function and
+    // `restore_surviving_dirty_coverage`.
+    //
+    // Same treatment, and the same justification, as `PREVIOUS_SURVIVOR_ESTIMATE`
+    // above: the count is strongly autocorrelated between adjacent cycles (it is
+    // the same program in the same phase), over-estimating costs only untouched
+    // reserved bytes, and under-estimating falls back to ordinary growth.
+    let mut dirty_scan_covered =
+        crate::fast_hash::new_ptr_hash_set_with_capacity(previous_dirty_covered_estimate());
     if !untraced {
         let _phase = super::pin::CopyingWalkPhaseGuard::enter("remembered_set");
         let remembered_stats = scan_remembered_dirty_slots_copying(
             &snapshot,
             Some(&mut dirty_scan_covered),
             |slot, header, external, stats| unsafe {
+                if let Some(d) = collector.survival.as_mut() {
+                    d.remembered_parent_type = (*header).obj_type;
+                }
                 let before = *slot;
                 collector.visit_slot_with_parent(slot, header, external);
                 if *slot != before {
@@ -1522,7 +1596,7 @@ pub(super) fn run_copied_minor_attempt(
     if gc_verify_evacuation_enabled() {
         let phase_start = trace_phase_start(trace);
         let valid_ptrs = build_valid_pointer_set();
-        verify_evacuated_no_stale_forwarded_refs(&valid_ptrs);
+        verify_evacuated_no_stale_forwarded_refs(EvacuationVerifier::copying_minor(&valid_ptrs));
         trace_phase_record(trace, "evacuation_verify", phase_start);
     }
 
@@ -1616,7 +1690,24 @@ pub(super) fn run_copied_minor_attempt(
     collector.sticky.restore();
     if !collector.skip_remembering {
         restore_surviving_dirty_coverage(&snapshot, &dirty_scan_covered, "copying_minor");
+        // Per minor, not at exit: the rig SIGKILLs cc. Cumulative counters, so
+        // the last line before the kill is the answer.
+        crate::arena::page_class_table_report();
     }
+    // The mechanism, counted rather than assumed: with the pre-size working,
+    // `capacity` is already >= `len` on entry and hashbrown never grows the
+    // table, so `reserve_rehash` disappears from this path. A capacity that
+    // keeps climbing across minors would say the estimate is not tracking.
+    if crate::gc::gc_diag_enabled() {
+        eprintln!(
+            "[gc-dirty-covered] len={} capacity={} presized_to={}",
+            dirty_scan_covered.len(),
+            dirty_scan_covered.capacity(),
+            previous_dirty_covered_estimate(),
+        );
+    }
+    note_dirty_covered_for_presizing(dirty_scan_covered.len());
+    {}
     let malloc_freed_bytes = if malloc_sweep_due {
         let phase_start = trace_phase_start(trace);
         let freed = sweep_malloc_objects();
@@ -1803,6 +1894,12 @@ pub(super) fn run_copied_minor_attempt(
             super::policy::GC_AT_DECLARED_SAFEPOINT.with(std::cell::Cell::get)
         );
     }
+    if let Some(d) = collector.survival.as_ref() {
+        d.report(super::survival_diag::next_minor_seq());
+    }
+    crate::arena::alloc_sample::report("minor");
+    super::diag_sites::report_primitive_dispatch("minor");
+    crate::object::shapes::id_list_report();
     report_forwarding_refusals("copying_minor");
     super::scanner_profile::report_and_reset("copying_minor");
     CopiedMinorAttempt::Done(Some(CopiedMinorFastPathOutcome {
@@ -1815,6 +1912,7 @@ fn finalize_dead_copied_minor_from_space_side_allocations() {
     crate::map::finalize_dead_copied_minor_from_space_maps();
     crate::set::finalize_dead_copied_minor_from_space_sets();
     crate::node_submodules::diagnostics_gc::finalize_dead_copied_minor_from_space_errors();
+    crate::regex::finalize_dead_copied_minor_from_space_regexps();
     // 2026-07-09 GC audit wave 2: the from-space flip runs no per-object
     // finalize hooks, so entries keyed by dead from-space owners in the
     // object-address-keyed side tables are pruned here (headers still intact).

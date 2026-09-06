@@ -103,6 +103,7 @@ mod instanceof;
 mod live_slots;
 mod null_stub;
 mod side_table_roots;
+mod string_wrapper;
 pub(crate) use live_slots::set_object_live_slot_count;
 pub use live_slots::{
     js_object_live_slot_count, object_live_slot_count, perry_object_header_abi_revision,
@@ -162,7 +163,7 @@ mod prototype_helpers;
 mod reflect_support;
 mod reserved_floor;
 pub(crate) use reserved_floor::{ensure_reserved_floor_keys, reserved_slot_floor_for_class_id};
-mod regex_proto_thunks;
+pub(crate) mod regex_proto_thunks;
 // #6812 object-owned overflow storage + the legacy thread-local side table.
 // Split out of this file to stay under the 2000-line CI cap; the sibling
 // `object::*` modules reach these through `use super::*`, so re-export the
@@ -261,6 +262,8 @@ pub use class_meta_registry::{
     js_register_class_extends_error, js_register_class_generic_origin,
     js_register_class_has_instance, js_register_class_to_string_tag,
 };
+#[cfg(test)]
+pub(crate) use descriptor_state::test_may_have_descriptor_entry;
 pub use descriptor_state::PERRY_CLASS_FIELD_INLINE_GUARD_DISABLED;
 pub(crate) use descriptor_state::{
     accessor_descriptor_keys_for_obj, class_field_inline_guard_enabled,
@@ -662,21 +665,6 @@ fn shape_cache_get_with_id(shape_id: u32) -> (*mut ArrayHeader, u32) {
         .unwrap_or((std::ptr::null_mut(), 0))
 }
 
-/// Rule 1 of `gc/young_log.rs` for the shape cache: log `shape_id` BEFORE the
-/// entry naming `keys_array` becomes findable.
-///
-/// Every writer of the cache — the production `shape_cache_insert` and the
-/// `#[cfg(test)]` seed seam — arms through this one function. A seam that
-/// re-implements the predicate is the failure mode this exists to prevent:
-/// the tests then validate an arming rule that is not the one that ships, and
-/// deleting the production arm site stays green.
-#[inline]
-pub(super) fn arm_shape_cache_young(shape_id: u32, keys_array: *mut ArrayHeader) {
-    if crate::gc::young_log::addr_is_minor_relevant(keys_array as usize) {
-        SHAPE_CACHE_YOUNG.with(|log| log.borrow_mut().note(shape_id));
-    }
-}
-
 /// Insert a keys_array into the cache. Updates the inline slot
 /// (evicting any prior entry there) and also writes to the overflow
 /// map so misses on the inline cache still find the value.
@@ -706,9 +694,6 @@ fn shape_cache_insert(shape_id: u32, keys_array: *mut ArrayHeader) {
     };
     let st = crate::state::state();
     let slot = (shape_id as usize) & (SHAPE_INLINE_CACHE_SIZE - 1);
-    // #9754 rule 1: log the id BEFORE the entry is published when the keys
-    // array can matter to a minor.
-    arm_shape_cache_young(shape_id, keys_array);
     unsafe {
         // GC_STORE_AUDIT(ROOT): shape_inline_cache entries are scanned by scan_shape_cache_roots_mut.
         let entry = &mut (*st.object_hot.shape_inline_cache.get())[slot];
@@ -822,14 +807,9 @@ crate::perry_thread_local! {
     /// `scan_transition_cache_roots_mut` visits only these.
     static TRANSITION_CACHE_YOUNG: RefCell<crate::gc::young_log::YoungLog<u32>> =
         const { RefCell::new(crate::gc::young_log::YoungLog::new()) };
-    /// #9754: shape-cache ids (inline slot and overflow key alike) whose keys
-    /// array may still be acted on by a minor.
-    static SHAPE_CACHE_YOUNG: RefCell<crate::gc::young_log::YoungLog<u32>> =
-        const { RefCell::new(crate::gc::young_log::YoungLog::new()) };
 }
 
 const TRANSITION_CACHE_YOUNG_LOG_NAME: &str = "object.transition_cache";
-const SHAPE_CACHE_YOUNG_LOG_NAME: &str = "object.shape_cache";
 
 /// Is a transition-cache entry still something a minor can act on?
 #[inline]
@@ -1334,7 +1314,6 @@ pub(crate) fn test_shape_cache_insert(shape_id: u32, keys_array: *mut ArrayHeade
 pub(crate) fn test_seed_shape_cache_root(shape_id: u32, keys_array: *mut ArrayHeader) {
     let st = crate::state::state();
     let slot = (shape_id as usize) & (SHAPE_INLINE_CACHE_SIZE - 1);
-    arm_shape_cache_young(shape_id, keys_array);
     unsafe {
         // GC_STORE_AUDIT(ROOT): test seed mirrors shape_inline_cache roots scanned by scan_shape_cache_roots_mut.
         let entry = &mut (*st.object_hot.shape_inline_cache.get())[slot];

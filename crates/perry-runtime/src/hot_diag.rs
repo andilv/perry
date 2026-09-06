@@ -105,6 +105,12 @@ pub struct RegexDiag {
     /// Sum of pattern bytes seen by `js_regexp_new` (what a content hash or
     /// copy of the pattern costs per construction).
     pub new_pattern_bytes: u64,
+    /// `js_regexp_new` had to allocate a GC string for the canonical flags
+    /// because the caller's flags string was not already in canonical form.
+    /// The common case — a regex literal, whose flags text the author wrote in
+    /// spec order — shares the caller's immutable string instead, so this
+    /// counter is the per-construction flags allocation that remains.
+    pub new_flags_allocated: u64,
     pub compiles_std: u64,
     pub compiles_fancy: u64,
     pub compiles_repeat: u64,
@@ -125,6 +131,15 @@ pub struct RegexDiag {
     pub replace_calls: u64,
     pub replace_matches: u64,
     pub split_calls: u64,
+    /// `may_have_descriptor_entry` calls whose owner is a `GC_TYPE_REGEXP`
+    /// cell — the `lastIndex` writability question `set_last_index_throwing`
+    /// asks on every global/sticky `test()`/`exec()`.
+    pub desc_regexp_probes: u64,
+    /// Of those, the ones the per-object meta summary proved absent, so no
+    /// `key.to_string()` and no SipHash of `(usize, String)` ran. Before the
+    /// meta edge was wired for RegExp this was 0 by construction: the filter
+    /// answered "maybe" for every one of them.
+    pub desc_regexp_meta_negative: u64,
     per_pattern: HashMap<usize, PatStat>,
 }
 
@@ -238,7 +253,8 @@ impl RegexDiag {
             "[regex-diag] t={secs:.1}s new={} validated_hit={} site_hit={} pattern_bytes={} \
              compiles std={} fancy={} repeat={} cache_clears={} lazy_builds={} lazy_cache_hits={} \
              exec={} exec_matched={} capture_slots={} capture_bytes={} test={} test_global={} \
-             match={} replace={} replace_matches={} split={}",
+             match={} replace={} replace_matches={} split={} flags_alloc={} \
+             desc_regexp_probes={} desc_regexp_meta_negative={}",
             self.new_calls,
             self.new_validated_hit,
             self.new_site_hit,
@@ -259,6 +275,9 @@ impl RegexDiag {
             self.replace_calls,
             self.replace_matches,
             self.split_calls,
+            self.new_flags_allocated,
+            self.desc_regexp_probes,
+            self.desc_regexp_meta_negative,
         );
         // Merge by content (prefix, len, flags): distinct literal sites with
         // the same pattern are one row.
@@ -322,6 +341,154 @@ fn ic_sink() -> &'static Option<Sink> {
         IC_ON.store(sink.is_some(), Ordering::Relaxed);
         sink
     })
+}
+
+// ---------------------------------------------------------------------------
+// Per-object layout tables: occupancy vs the address filter that gates them
+// ---------------------------------------------------------------------------
+
+static LAYOUT_SINK: OnceLock<Option<Sink>> = OnceLock::new();
+static LAYOUT_ON: AtomicBool = AtomicBool::new(false);
+
+fn layout_sink() -> &'static Option<Sink> {
+    LAYOUT_SINK.get_or_init(|| {
+        let sink = sink_from_env("PERRY_LAYOUT_DIAG");
+        LAYOUT_ON.store(sink.is_some(), Ordering::Relaxed);
+        sink
+    })
+}
+
+/// Is the per-object-layout occupancy instrument armed?
+#[inline]
+pub fn layout_on() -> bool {
+    if LAYOUT_SINK.get().is_none() {
+        layout_sink();
+    }
+    LAYOUT_ON.load(Ordering::Relaxed)
+}
+
+/// One collection's view of the per-object layout tables and the 4096-bit
+/// address filter that is supposed to keep evacuation off them.
+///
+/// The question this exists to settle: `layout_addr_filter_may_hold` is
+/// documented for "one or two entries … ~0.05 % false-positive rate", and
+/// `transfer_per_object_descriptor` / `transfer_per_object_slot_mask` return
+/// early only when it says no. If the tables hold far more keys than the
+/// filter has bits, it answers "maybe" for every address, both early returns
+/// stop firing, and every evacuated object pays the full two-map hash path —
+/// while nothing in the system says so out loud.
+///
+/// `keys` is also what a filter rebuild used to cost: one `Vec<usize>` of
+/// every live key per prune, plus a second full walk to recount the young
+/// records.
+#[derive(Default)]
+pub struct LayoutDiag {
+    prunes: u64,
+    typed_len: usize,
+    masks_len: usize,
+    typed_max: usize,
+    masks_max: usize,
+    /// Set bits in the address filter, and its capacity in bits.
+    filter_bits_set: usize,
+    filter_bits_total: usize,
+    filter_bits_set_max: usize,
+    /// Live keys past which a rebuild stops producing a selective filter.
+    useful_keys: usize,
+    /// Prunes that rebuilt the filter from the survivors, and prunes that
+    /// found it already outgrown and skipped the walk.
+    rebuilt: u64,
+    outgrown: u64,
+    /// Keys visited by prunes that DID rebuild — the walk that is still paid.
+    rebuilt_keys: u64,
+}
+
+crate::perry_thread_local! {
+    static LAYOUT_DIAG: RefCell<LayoutDiag> = RefCell::new(LayoutDiag::default());
+}
+
+/// Record one death-prune's occupancy. `rebuilt_filter` says whether this
+/// prune rebuilt the address filter from its survivors, or found the tables
+/// too full for a 4,096-bit sketch to discriminate and saturated it instead.
+pub fn layout_note_prune(
+    typed_len: usize,
+    masks_len: usize,
+    filter_bits_set: usize,
+    filter_bits_total: usize,
+    rebuilt_filter: bool,
+    useful_keys: usize,
+) {
+    LAYOUT_DIAG.with(|d| {
+        let mut d = d.borrow_mut();
+        d.prunes += 1;
+        d.typed_len = typed_len;
+        d.masks_len = masks_len;
+        d.typed_max = d.typed_max.max(typed_len);
+        d.masks_max = d.masks_max.max(masks_len);
+        d.filter_bits_set = filter_bits_set;
+        d.filter_bits_total = filter_bits_total;
+        d.filter_bits_set_max = d.filter_bits_set_max.max(filter_bits_set);
+        d.useful_keys = useful_keys;
+        if rebuilt_filter {
+            d.rebuilt += 1;
+            d.rebuilt_keys += (typed_len + masks_len) as u64;
+        } else {
+            d.outgrown += 1;
+        }
+        let text = d.render();
+        if let Some(sink) = layout_sink() {
+            write_sink(sink, &text);
+        }
+    });
+}
+
+impl LayoutDiag {
+    fn render(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(512);
+        let pct = |n: usize, d: usize| {
+            if d == 0 {
+                0.0
+            } else {
+                100.0 * n as f64 / d as f64
+            }
+        };
+        let keys = self.typed_len + self.masks_len;
+        let _ = writeln!(
+            out,
+            "[layout-diag] prunes={} keys_now={} (typed={} masks={}) keys_max={} \
+             (typed={} masks={})",
+            self.prunes,
+            keys,
+            self.typed_len,
+            self.masks_len,
+            self.typed_max + self.masks_max,
+            self.typed_max,
+            self.masks_max
+        );
+        let _ = writeln!(
+            out,
+            "  filter: {}/{} bits set ({:.1} %), max {}/{} ({:.1} %); selective up to \
+             {} keys, so this table is {}",
+            self.filter_bits_set,
+            self.filter_bits_total,
+            pct(self.filter_bits_set, self.filter_bits_total),
+            self.filter_bits_set_max,
+            self.filter_bits_total,
+            pct(self.filter_bits_set_max, self.filter_bits_total),
+            self.useful_keys,
+            if keys > self.useful_keys {
+                "OUTGROWN it -- every probe answers `may hold`"
+            } else {
+                "within it"
+            }
+        );
+        let _ = writeln!(
+            out,
+            "  filter rebuilds={} over {} keys walked; outgrown-and-skipped={}",
+            self.rebuilt, self.rebuilt_keys, self.outgrown
+        );
+        out
+    }
 }
 
 /// Is the IC-miss instrument armed? One relaxed load once initialised.
@@ -622,5 +789,315 @@ impl IcDiag {
             );
         }
         out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Enumeration and concatenation: EXECUTIONS per site, not bytes
+// ---------------------------------------------------------------------------
+
+static ENUM_SINK: OnceLock<Option<Sink>> = OnceLock::new();
+static ENUM_ON: AtomicBool = AtomicBool::new(false);
+
+fn enum_sink() -> &'static Option<Sink> {
+    ENUM_SINK.get_or_init(|| {
+        let sink = sink_from_env("PERRY_ENUM_DIAG");
+        ENUM_ON.store(sink.is_some(), Ordering::Relaxed);
+        sink
+    })
+}
+
+/// Is the enumeration/concat execution counter armed?
+#[inline]
+pub fn enum_on() -> bool {
+    if ENUM_SINK.get().is_none() {
+        enum_sink();
+    }
+    ENUM_ON.load(Ordering::Relaxed)
+}
+
+/// What actually runs at the two allocation sites the byte-share ranking put
+/// at 7.8 % (`for-in` key arrays) and 6.9 % (string concat).
+///
+/// The campaign's 19:30 correction is the reason this counts executions rather
+/// than bytes: a category's byte share bounds the collection *schedule* it can
+/// move, and nothing else. The cost that a small category can still carry is
+/// whatever runs per allocation — here, for `for-in`, a heap `String` and a
+/// SipHash insert for **every key at every prototype level**, allocated only to
+/// be hashed for shadowing and dropped. Those `String`s are native-heap, so
+/// they are not even in the 7.8 %.
+#[derive(Default)]
+pub struct EnumDiag {
+    started: Option<Instant>,
+    last_dump: Option<Instant>,
+    events: u32,
+    /// Entries to `js_for_in_keys_value`.
+    pub for_in_calls: u64,
+    /// `for-in` calls that took the non-pointer (primitive receiver) path.
+    pub for_in_primitive: u64,
+    /// Prototype levels walked, summed over all calls.
+    pub for_in_levels: u64,
+    /// Key arrays materialised by the walk: one `js_object_keys_value` plus one
+    /// `js_object_get_own_property_names` per level.
+    pub for_in_key_arrays: u64,
+    /// Keys seen at any level — each one costs a `String` and a hash.
+    pub for_in_keys_seen: u64,
+    /// `String` allocations made by `key_string`.
+    pub for_in_key_strings: u64,
+    /// Bytes in those `String`s.
+    pub for_in_key_string_bytes: u64,
+    /// `seen.insert` calls (SipHash of the whole key each time).
+    pub for_in_seen_inserts: u64,
+    /// Of those, inserts that found the name already present — pure waste, the
+    /// name was already shadowed.
+    pub for_in_seen_dupes: u64,
+    /// Keys actually emitted into the result array.
+    pub for_in_keys_emitted: u64,
+    /// Of those, keys emitted at prototype level >= 1 — the only ones for which
+    /// the shadow set is load-bearing. If this is ~0, every `String` and every
+    /// hash spent building that set was spent for nothing.
+    pub for_in_keys_emitted_deep: u64,
+    /// Times the deferred shadow set was actually materialised.
+    pub for_in_shadow_built: u64,
+    /// String concatenations, by entry point.
+    pub concat_calls: u64,
+    pub concat_site_calls: u64,
+    pub concat_chain_calls: u64,
+    /// Bytes produced by concatenation.
+    pub concat_out_bytes: u64,
+}
+
+crate::perry_thread_local! {
+    static ENUM_DIAG: RefCell<EnumDiag> = RefCell::new(EnumDiag::default());
+}
+
+/// Run `f` against this thread's enumeration counters, then maybe dump.
+#[inline]
+pub fn enum_with(f: impl FnOnce(&mut EnumDiag)) {
+    ENUM_DIAG.with(|d| {
+        let mut d = d.borrow_mut();
+        if d.started.is_none() {
+            d.started = Some(Instant::now());
+            d.last_dump = d.started;
+        }
+        f(&mut d);
+        d.events = d.events.wrapping_add(1);
+        if d.events % TICK_EVERY == 0 {
+            let due = d
+                .last_dump
+                .is_some_and(|t| t.elapsed().as_millis() >= DUMP_INTERVAL_MS);
+            if due {
+                d.last_dump = Some(Instant::now());
+                if let Some(sink) = enum_sink() {
+                    write_sink(sink, &d.render());
+                }
+            }
+        }
+    });
+}
+
+impl EnumDiag {
+    fn render(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(1024);
+        let per = |n: u64, d: u64| if d == 0 { 0.0 } else { n as f64 / d as f64 };
+        let _ = writeln!(
+            out,
+            "[enum-diag] for_in calls={} (primitive={}) levels={} ({:.2}/call)",
+            self.for_in_calls,
+            self.for_in_primitive,
+            self.for_in_levels,
+            per(self.for_in_levels, self.for_in_calls)
+        );
+        let _ = writeln!(
+            out,
+            "  key arrays materialised={} ({:.2}/call)   keys seen={} ({:.1}/call)   emitted={} ({:.1}/call)",
+            self.for_in_key_arrays,
+            per(self.for_in_key_arrays, self.for_in_calls),
+            self.for_in_keys_seen,
+            per(self.for_in_keys_seen, self.for_in_calls),
+            self.for_in_keys_emitted,
+            per(self.for_in_keys_emitted, self.for_in_calls)
+        );
+        let _ = writeln!(
+            out,
+            "  PER-KEY WORK: String allocs={} ({:.2} MB) seen.insert={} of which duplicate={} ({:.1} %)",
+            self.for_in_key_strings,
+            self.for_in_key_string_bytes as f64 / (1024.0 * 1024.0),
+            self.for_in_seen_inserts,
+            self.for_in_seen_dupes,
+            100.0 * per(self.for_in_seen_dupes, self.for_in_seen_inserts)
+        );
+        let _ = writeln!(
+            out,
+            "  emitted/String ratio = {:.3}  (1.0 would mean every String earned a key)",
+            per(self.for_in_keys_emitted, self.for_in_key_strings)
+        );
+        let _ = writeln!(
+            out,
+            "  LOAD-BEARING: keys emitted at proto level >=1 = {} ({:.2} % of emitted); shadow set built {} times ({:.2}/call)",
+            self.for_in_keys_emitted_deep,
+            100.0 * per(self.for_in_keys_emitted_deep, self.for_in_keys_emitted),
+            self.for_in_shadow_built,
+            per(self.for_in_shadow_built, self.for_in_calls)
+        );
+        let _ = writeln!(
+            out,
+            "[enum-diag] concat calls={} site={} chain={} out_bytes={:.2} MB ({:.1} B/call)",
+            self.concat_calls,
+            self.concat_site_calls,
+            self.concat_chain_calls,
+            self.concat_out_bytes as f64 / (1024.0 * 1024.0),
+            per(
+                self.concat_out_bytes,
+                self.concat_calls + self.concat_site_calls + self.concat_chain_calls
+            )
+        );
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `is_registered_buffer`: is the min/max window still rejecting?
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicU64, AtomicUsize};
+
+static BUFFER_SINK: OnceLock<Option<Sink>> = OnceLock::new();
+static BUFFER_ON: AtomicBool = AtomicBool::new(false);
+
+fn buffer_sink() -> &'static Option<Sink> {
+    BUFFER_SINK.get_or_init(|| {
+        let sink = sink_from_env("PERRY_BUFFER_DIAG");
+        BUFFER_ON.store(sink.is_some(), Ordering::Relaxed);
+        sink
+    })
+}
+
+/// Is the buffer-probe instrument armed? One relaxed load once initialised.
+#[inline]
+pub fn buffer_on() -> bool {
+    if BUFFER_SINK.get().is_none() {
+        buffer_sink();
+    }
+    BUFFER_ON.load(Ordering::Relaxed)
+}
+
+// Plain relaxed atomics rather than the thread-local `RefCell` the other
+// instruments use: this probe runs millions of times per turn, and a borrow
+// per probe would dominate the thing being measured.
+static BUF_PROBES: AtomicU64 = AtomicU64::new(0);
+static BUF_ADMITS: AtomicU64 = AtomicU64::new(0);
+static BUF_TRUE_POS: AtomicU64 = AtomicU64::new(0);
+static BUF_ADDR_MIN: AtomicUsize = AtomicUsize::new(usize::MAX);
+static BUF_ADDR_MAX: AtomicUsize = AtomicUsize::new(0);
+static BUF_WIN_LO: AtomicUsize = AtomicUsize::new(usize::MAX);
+static BUF_WIN_HI: AtomicUsize = AtomicUsize::new(0);
+static BUF_REGS: AtomicU64 = AtomicU64::new(0);
+static BUF_UNREGS: AtomicU64 = AtomicU64::new(0);
+static BUF_LIVE_MAX: AtomicUsize = AtomicUsize::new(0);
+
+/// One `is_registered_buffer` probe that got past the "ever registered" latch.
+/// `admitted` is what the inline min/max window answered — the whole question,
+/// because only an admitted address pays the out-of-line call.
+#[inline]
+pub fn buffer_note_probe(addr: usize, admitted: bool, window: Option<(usize, usize)>) {
+    let n = BUF_PROBES.fetch_add(1, Ordering::Relaxed);
+    if admitted {
+        BUF_ADMITS.fetch_add(1, Ordering::Relaxed);
+    }
+    BUF_ADDR_MIN.fetch_min(addr, Ordering::Relaxed);
+    BUF_ADDR_MAX.fetch_max(addr, Ordering::Relaxed);
+    if let Some((lo, hi)) = window {
+        BUF_WIN_LO.store(lo, Ordering::Relaxed);
+        BUF_WIN_HI.store(hi, Ordering::Relaxed);
+    }
+    // Dump roughly every million probes; the rig SIGKILLs, so an exit hook
+    // would never fire.
+    if n & 0xF_FFFF == 0 {
+        buffer_dump();
+    }
+}
+
+/// The slow path found a real registered buffer.
+#[inline]
+pub fn buffer_note_true_positive() {
+    BUF_TRUE_POS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One buffer registration, with the registry's size after it. Registrations
+/// are what a Bloom filter would have to hold, and `RegistryAddrFilter` accrues
+/// bits **per admission, not per live entry** — so for a high-churn set the
+/// number that decides whether that structure can work is the CUMULATIVE
+/// count, not the live one. Both are recorded.
+pub fn buffer_note_registration(live_now: usize) {
+    BUF_REGS.fetch_add(1, Ordering::Relaxed);
+    BUF_LIVE_MAX.fetch_max(live_now, Ordering::Relaxed);
+}
+
+/// One buffer leaving the registry.
+pub fn buffer_note_unregistration() {
+    BUF_UNREGS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cold]
+fn buffer_dump() {
+    let probes = BUF_PROBES.load(Ordering::Relaxed);
+    let admits = BUF_ADMITS.load(Ordering::Relaxed);
+    let tp = BUF_TRUE_POS.load(Ordering::Relaxed);
+    let amin = BUF_ADDR_MIN.load(Ordering::Relaxed);
+    let amax = BUF_ADDR_MAX.load(Ordering::Relaxed);
+    let wlo = BUF_WIN_LO.load(Ordering::Relaxed);
+    let whi = BUF_WIN_HI.load(Ordering::Relaxed);
+    let pct = |a: u64, b: u64| {
+        if b == 0 {
+            0.0
+        } else {
+            100.0 * a as f64 / b as f64
+        }
+    };
+    let mb = |n: usize| n as f64 / (1024.0 * 1024.0);
+    let win_span = whi.saturating_sub(wlo);
+    let probe_span = amax.saturating_sub(amin);
+    let mut out = String::with_capacity(768);
+    use std::fmt::Write as _;
+    let _ = writeln!(
+        out,
+        "[buffer-diag] probes={probes} admits={admits} ({:.2} %) rejected={} ({:.2} %) \
+         true_positives={tp} ({:.6} % of admits)",
+        pct(admits, probes),
+        probes - admits,
+        pct(probes - admits, probes),
+        pct(tp, admits)
+    );
+    let _ = writeln!(
+        out,
+        "  window   [{wlo:#x}, {whi:#x}] span {:.1} MB",
+        mb(win_span)
+    );
+    let _ = writeln!(
+        out,
+        "  probed   [{amin:#x}, {amax:#x}] span {:.1} MB  -- window covers {:.1} % of the probed range",
+        mb(probe_span),
+        if probe_span == 0 { 0.0 } else { 100.0 * win_span as f64 / probe_span as f64 }
+    );
+    let regs = BUF_REGS.load(Ordering::Relaxed);
+    let unregs = BUF_UNREGS.load(Ordering::Relaxed);
+    let live_max = BUF_LIVE_MAX.load(Ordering::Relaxed);
+    // A 1,024-bit, 3-hash Bloom filter (`RegistryAddrFilter`) accrues bits per
+    // ADMISSION and never clears them, so `regs` — not `live_max` — is what it
+    // would have to hold. (1 - e^(-3n/1024))^3 at that n:
+    let fp = |n: f64| {
+        let x = 1.0 - (-3.0 * n / 1024.0).exp();
+        100.0 * x * x * x
+    };
+    let _ = writeln!(
+        out,
+        "  registrations={regs} unregistrations={unregs} live_max={live_max}           => a 1024-bit/3-hash Bloom holding all admissions would be {:.1} % false-positive          (and {:.1} % if it could hold only the live set)",
+        fp(regs as f64),
+        fp(live_max as f64)
+    );
+    if let Some(sink) = buffer_sink() {
+        write_sink(sink, &out);
     }
 }
