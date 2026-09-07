@@ -486,7 +486,8 @@ fn test_lower_native_module_registration() {
 fn test_native_module_binding_value_named_import() {
     // #5242: a named builtin import (`import { relative } from 'path'`) used
     // as a value (e.g. an object-literal shorthand `{ relative }`) must resolve
-    // to the callable builtin — `path.relative` — not be dropped to undefined.
+    // to the snapshot-backed builtin export — `path.relative` — not be dropped
+    // to undefined or conflated with the mutable default namespace property.
     let mut ctx = make_ctx();
     ctx.register_native_module(
         "relative".to_string(),
@@ -494,15 +495,20 @@ fn test_native_module_binding_value_named_import() {
         Some("relative".to_string()),
     );
     let value = super::lower_expr::native_module_binding_value(&ctx, "relative");
-    match value {
-        crate::ir::Expr::PropertyGet {
-            object, property, ..
-        } => {
-            assert_eq!(property, "relative");
-            assert!(matches!(*object, crate::ir::Expr::NativeModuleRef(ref m) if m == "path"));
-        }
-        other => panic!("expected PropertyGet(path.relative), got {other:?}"),
-    }
+    assert!(matches!(
+        value,
+        crate::ir::Expr::Call { callee, args, .. }
+            if matches!(
+                callee.as_ref(),
+                crate::ir::Expr::ExternFuncRef { name, .. }
+                    if name == "js_native_module_named_esm_export_value"
+            )
+            && matches!(
+                args.as_slice(),
+                [crate::ir::Expr::String(module), crate::ir::Expr::String(property)]
+                    if module == "path" && property == "relative"
+            )
+    ));
 }
 
 #[test]
@@ -1179,6 +1185,33 @@ fn named_class_expr_static_private_update_in_arrow_keeps_lexical_brand_owner() {
     assert!(
         !body.contains("receiver_is_brand_owner: false"),
         "both guards around the private update must retain the lexical class owner: {body}"
+    );
+}
+
+/// A named class expression whose outer binding has a different name uses a
+/// synthetic registry key. `typeof` must still resolve the source-level inner
+/// name through the class body's lexical binding rather than an optional
+/// global lookup.
+#[test]
+fn typeof_named_class_expr_inner_binding_uses_the_current_class() {
+    let source = r#"
+        var B = class l {
+            static selfType(): string { return typeof l; }
+        };
+    "#;
+    let module = perry_parser::parse_typescript(source, "t.ts").expect("source parses");
+    let hir = super::lower_module(&module, "t", "t.ts").expect("source lowers");
+    let method = hir
+        .classes
+        .iter()
+        .flat_map(|class| &class.static_methods)
+        .find(|method| method.name == "selfType")
+        .expect("static selfType method is lowered");
+    let body = format!("{:#?}", method.body);
+
+    assert!(
+        body.contains("ClassRef") && !body.contains("js_global_get_optional"),
+        "the class's inner name must resolve to its synthetic ClassRef: {body}"
     );
 }
 
@@ -1951,6 +1984,7 @@ mod unresolved_new_global;
 
 mod capture_stash;
 mod mixin_parent_chain;
+mod native_module_sync;
 
 mod nullish_over_optional_chain;
 mod ui_widget_add_child;

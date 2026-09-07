@@ -108,8 +108,8 @@ pub(crate) use live_slots::set_object_live_slot_count;
 pub use live_slots::{
     js_object_live_slot_count, object_live_slot_count, perry_object_header_abi_revision,
 };
+pub(crate) use null_stub::{is_null_stub_address, NullObjectBytes, NULL_OBJECT_BYTES};
 pub use null_stub::{js_unresolved_default_call, js_unresolved_namespace_stub};
-pub(crate) use null_stub::{NullObjectBytes, NULL_OBJECT_BYTES};
 #[cfg(test)]
 pub(crate) use side_table_roots::test_transition_cache_insert;
 pub(crate) use side_table_roots::{
@@ -1295,11 +1295,23 @@ pub fn scan_object_cache_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'
         &iterator_prototypes::STRING_ITERATOR_PROTOTYPE_PTR,
         &iterator_prototypes::REGEXP_STRING_ITERATOR_PROTOTYPE_PTR,
         &iterator_prototypes::ITERATOR_HELPER_PROTOTYPE_PTR,
+        // The realm's `RegExp.prototype`, recorded by `regex_proto_thunks` so
+        // the view mode's canonicality proof is three loads instead of a walk.
+        // A recorded address MUST be scanned: unscanned, it is a stale pointer
+        // the first time the collector moves the prototype.
+        #[cfg(feature = "regex-engine")]
+        &regex_proto_thunks::REGEXP_PROTOTYPE_PTR,
     ] {
         slot.with_slot(|slot| {
             visitor.visit_atomic_i64_slot(slot, Ordering::Acquire, Ordering::Release);
         });
     }
+    // The canonical `test` closure is a NaN-boxed word, not a bare address, so
+    // it is visited as one — the collector rewrites the pointer inside it.
+    #[cfg(feature = "regex-engine")]
+    regex_proto_thunks::REGEXP_PROTOTYPE_TEST_CLOSURE.with_slot(|slot| {
+        visitor.visit_atomic_nanbox_u64_slot(slot, Ordering::Acquire, Ordering::Release);
+    });
 }
 
 /// Drive the PRODUCTION shape-cache writer from a test. Deliberately nothing

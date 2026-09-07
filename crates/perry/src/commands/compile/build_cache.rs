@@ -177,6 +177,9 @@ const BUILD_CACHE_ENV_VARS: &[&str] = &[
     "PERRY_PTR_NUMARRAY_LOCALS",
     "PERRY_PTR_SHAPE_LOCALS",
     "PERRY_PTR_SHAPE_THIS",
+    // #9893: selects the segment-view lowering, which rewrites qualifying
+    // for-of loops to call the `js_segments_view_*` runtime entry points.
+    "PERRY_SEGVIEW",
     "PERRY_SPECIALIZED_ABI",
     "PERRY_SPECIALIZED_ABI_MAX",
     "PERRY_SPEC_PRESERVE_NONE",
@@ -232,6 +235,9 @@ const BUILD_CACHE_ENV_EXCLUSIONS: &[&str] = &[
     "PERRY_PACKED_LOOP_TRACE",
     // Entry outlining report output is observational only.
     "PERRY_OUTLINE_ENTRY_REPORT",
+    // Segment-view diagnostics only scan the final HIR and print counters;
+    // their checks inside the rewrite guard `eprintln!` calls only.
+    "PERRY_SEGVIEW_DIAG",
     // Only read on an already-fatal dialect-construction failure (a unit that
     // never parses); it writes a diagnostic IR dump to `<dir>/<name>.ll` for
     // triage and cannot affect the bytes of any build that actually succeeds.
