@@ -114,6 +114,11 @@ struct ExceptionState {
     /// `call_method_depth_*`). Indexed by try-depth, in lockstep with
     /// `jump_buffers`.
     call_method_depths: Box<[u32]>,
+    /// Re-entrant stdlib-pump depth at handler entry. A callback can throw
+    /// across `js_run_stdlib_pump`, skipping its `PumpDepthGuard`; restore the
+    /// counter so the next top-level pump still runs tick-begin lifecycle
+    /// hooks such as the native-handle quarantine drain.
+    pump_depths: Box<[u32]>,
     /// Active Set/Map `forEach` walks. Their normal epilogues re-enable
     /// backing-store compaction, but a caught throw skips those epilogues.
     set_foreach_depths: Box<[usize]>,
@@ -137,6 +142,11 @@ struct ExceptionState {
     /// evaluating the right-hand side of a guarded private write skips the
     /// normal consumer, so catch entry must discard the orphaned hint.
     private_member_access_hint_depths: Box<[usize]>,
+    /// Active allocation-free regex-factory sites at handler entry. A
+    /// non-literal replacement callee can throw before the wrapper's normal
+    /// pop, so catch entry discards the orphaned identity frame.
+    #[cfg(feature = "regex-engine")]
+    regex_factory_site_depths: Box<[usize]>,
     /// #6559: dyn-eval interpreter state (rooted-stack length + interpreter
     /// call depth, packed) captured when each `try` was pushed. A throw
     /// `longjmp`s past interpreter Rust frames without running their
@@ -161,6 +171,7 @@ impl ExceptionState {
             shadow_savepoints: vec![ShadowSavepoint::EMPTY; MAX_TRY_DEPTH].into_boxed_slice(),
             runtime_handle_savepoints: vec![0usize; MAX_TRY_DEPTH].into_boxed_slice(),
             call_method_depths: vec![0u32; MAX_TRY_DEPTH].into_boxed_slice(),
+            pump_depths: vec![0u32; MAX_TRY_DEPTH].into_boxed_slice(),
             set_foreach_depths: vec![0usize; MAX_TRY_DEPTH].into_boxed_slice(),
             map_foreach_depths: vec![0usize; MAX_TRY_DEPTH].into_boxed_slice(),
             prototype_resolution_depths: vec![0usize; MAX_TRY_DEPTH].into_boxed_slice(),
@@ -168,6 +179,8 @@ impl ExceptionState {
             private_lexical_brand_depths: vec![0usize; MAX_TRY_DEPTH].into_boxed_slice(),
             derived_super_binding_depths: vec![0usize; MAX_TRY_DEPTH].into_boxed_slice(),
             private_member_access_hint_depths: vec![0usize; MAX_TRY_DEPTH].into_boxed_slice(),
+            #[cfg(feature = "regex-engine")]
+            regex_factory_site_depths: vec![0usize; MAX_TRY_DEPTH].into_boxed_slice(),
             #[cfg(feature = "dyn-eval")]
             dyn_eval_savepoints: vec![0u64; MAX_TRY_DEPTH].into_boxed_slice(),
             try_depth: 0,
@@ -232,6 +245,7 @@ fn try_push_with_kind(kind: HandlerKind) -> *mut i32 {
         // this `try` can restore it — `longjmp` skips the `CallMethodDepthGuard`
         // `Drop`s of the method frames it unwinds (#5591).
         (*s).call_method_depths[depth] = crate::object::call_method_depth_savepoint();
+        (*s).pump_depths[depth] = crate::stdlib_pump::pump_depth_savepoint();
         (*s).set_foreach_depths[depth] = crate::set::set_foreach_stack_savepoint();
         (*s).map_foreach_depths[depth] = crate::map::map_foreach_stack_savepoint();
         (*s).prototype_resolution_depths[depth] =
@@ -244,6 +258,11 @@ fn try_push_with_kind(kind: HandlerKind) -> *mut i32 {
             crate::object::derived_super_binding_stack_savepoint();
         (*s).private_member_access_hint_depths[depth] =
             crate::object::private_member_access_hints_savepoint();
+        #[cfg(feature = "regex-engine")]
+        {
+            (*s).regex_factory_site_depths[depth] =
+                crate::regex::site_test::active_factory_stack_savepoint();
+        }
         // #6559: capture the dyn-eval interpreter's rooted-stack length +
         // call depth, so a caught throw restores interpreter state exactly
         // like the shadow stack.
@@ -464,6 +483,7 @@ pub extern "C-unwind" fn js_throw(value: f64) -> ! {
         // otherwise caught throws wrap the counter below zero and wedge every
         // later method call into the depth-guard fallback (#5591).
         crate::object::call_method_depth_restore((*s).call_method_depths[depth]);
+        crate::stdlib_pump::pump_depth_restore((*s).pump_depths[depth]);
         crate::set::set_foreach_stack_restore((*s).set_foreach_depths[depth]);
         crate::map::map_foreach_stack_restore((*s).map_foreach_depths[depth]);
         crate::object::prototype_chain::resolution_stack_restore(
@@ -478,6 +498,10 @@ pub extern "C-unwind" fn js_throw(value: f64) -> ! {
         );
         crate::object::private_member_access_hints_restore(
             (*s).private_member_access_hint_depths[depth],
+        );
+        #[cfg(feature = "regex-engine")]
+        crate::regex::site_test::active_factory_stack_restore(
+            (*s).regex_factory_site_depths[depth],
         );
         // #6559: restore the dyn-eval interpreter's rooted stack + call depth
         // (interpreter Rust frames unwound by this longjmp never run their
@@ -837,6 +861,8 @@ pub(crate) fn test_unwind_innermost_shadow_restore() {
         let depth = (*s).try_depth - 1;
         shadow_stack_restore((*s).shadow_savepoints[depth]);
         runtime_handle_stack_restore((*s).runtime_handle_savepoints[depth]);
+        crate::object::call_method_depth_restore((*s).call_method_depths[depth]);
+        crate::stdlib_pump::pump_depth_restore((*s).pump_depths[depth]);
         crate::set::set_foreach_stack_restore((*s).set_foreach_depths[depth]);
         crate::map::map_foreach_stack_restore((*s).map_foreach_depths[depth]);
         crate::object::prototype_chain::resolution_stack_restore(
@@ -844,6 +870,10 @@ pub(crate) fn test_unwind_innermost_shadow_restore() {
         );
         crate::object::private_member_access_hints_restore(
             (*s).private_member_access_hint_depths[depth],
+        );
+        #[cfg(feature = "regex-engine")]
+        crate::regex::site_test::active_factory_stack_restore(
+            (*s).regex_factory_site_depths[depth],
         );
     });
 }

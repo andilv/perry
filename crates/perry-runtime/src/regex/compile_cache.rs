@@ -86,26 +86,27 @@ pub(crate) fn build_fancy_regex(pattern: &str) -> Result<fancy_regex::Regex, fan
         .build()
 }
 
-/// Entry cap for the compiled-regex caches (2026-07-09 GC audit: one entry
-/// per distinct `(pattern, flags)` ever compiled, no cap of any kind, entries
-/// up to [`REGEX_SIZE_LIMIT`] — `new RegExp(userInput)` was an attacker-driven
-/// OOM). When an insert would exceed the cap the whole map is cleared — the
-/// `PARSE_KEY_CACHE` precedent: cheap, no LRU bookkeeping, recompilation is
-/// the fallback. Live `RegExpHeader`s are unaffected: each header OWNS a raw
-/// `Arc` reference to its compiled program(s), released by its GC finalizer,
-/// so dropping the cache's references cannot free a program still in use.
+/// Entry cap for the content-keyed compiled-regex caches. An insertion at the
+/// cap evicts one entry rather than clearing the entire working set. Literal
+/// programs remain owned by `site_cache` while their literal site is recorded;
+/// only dynamic programs can lose their last cache reference.
 #[cfg(feature = "regex-engine")]
 pub(crate) const REGEX_CACHE_MAX_ENTRIES: usize = 512;
 
-/// Clear-on-overflow guard shared by the compiled-program caches and the
-/// validated-pattern set: make room for one more entry, wiping the map when it
-/// is at capacity.
+/// Make room for one entry without invalidating the other 511 cached answers.
 #[cfg(feature = "regex-engine")]
-pub(crate) fn evict_regex_cache_if_full<K, V>(cache: &mut HashMap<K, V>) {
+pub(crate) fn evict_regex_cache_if_full<K: Clone + Eq + std::hash::Hash, V>(
+    cache: &mut HashMap<K, V>,
+) {
     if cache.len() >= REGEX_CACHE_MAX_ENTRIES {
-        cache.clear();
+        let victim = cache.keys().next().cloned();
+        if let Some(victim) = victim {
+            cache.remove(&victim);
+        }
+        #[cfg(test)]
+        super::tests_cache::note_cache_eviction();
         if crate::hot_diag::regex_on() {
-            crate::hot_diag::regex_with(|d| d.cache_clears += 1);
+            crate::hot_diag::regex_counters(|d| d.cache_evictions += 1);
         }
     }
 }
@@ -131,7 +132,7 @@ pub(crate) fn evict_regex_cache_if_full<K, V>(cache: &mut HashMap<K, V>) {
 /// One shared never-match program per thread.
 ///
 /// Only used by the `PERRY_REGEX_ENGINE=regress` measurement path, where every
-/// pattern needs a value in `regex_ptr` (the built/not-built flag) but no NFA:
+/// pattern needs a value in `programs_ptr` (the built/not-built flag) but no NFA:
 /// building a fresh one per pattern would be exactly the compile cost the
 /// experiment exists to remove from the measurement.
 #[cfg(feature = "regex-engine")]
@@ -173,7 +174,7 @@ pub(crate) fn compile_and_cache_regex_checked(pattern: &Arc<str>, flags: &Arc<st
     // `repeat_matcher::regress_first`): the ECMAScript backtracker is the
     // primary engine, so stop here. Every exec-family entry point consults the
     // repeat matcher first, and the shared never-match placeholder gives the
-    // header's `regex_ptr` built-flag a value WITHOUT building an NFA — which
+    // header's `programs_ptr` built-flag a value WITHOUT building an NFA — which
     // is the whole point of the experiment (the linear engine's program is
     // ~12.5 KB median against regress's 512 B, measured over 4,463 literals
     // from seven real bundles).

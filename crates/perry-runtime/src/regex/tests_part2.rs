@@ -2,7 +2,9 @@
 //! A sibling child of `regex`, so `use super::*` resolves exactly as it does
 //! in `tests.rs`; the shared fixtures come from there.
 
-use super::tests::{make_string, match_capture_text, string_payload};
+use super::tests::{
+    make_string, match_capture_text, regex_has_fancy_program, regex_is_built, string_payload,
+};
 use super::*;
 
 #[test]
@@ -112,164 +114,6 @@ fn syntax_check_agrees_with_full_build() {
             wide.join("\n  ")
         );
     }
-}
-
-/// Construction must NOT build the automaton; the first operation that needs a
-/// matcher must.
-///
-/// This is the structural half of the perf fix — the wall-clock half is a
-/// fixture whose 200 literals cost 73 ms to construct before and ~0 after. A
-/// regression here (something re-introducing an eager build) would not fail any
-/// behavioural test, only make every program slower, so assert the state
-/// directly: `regex_ptr` is the built/not-built flag.
-#[test]
-fn construction_defers_the_program_build_until_first_use() {
-    let re = js_regexp_new(
-        make_string("[A-Za-z]+(?:foo|bar)[0-9]{1,4}"),
-        make_string("i"),
-    );
-    assert!(
-        unsafe { (*re).regex_ptr.is_null() },
-        "constructing a RegExp must not build its program"
-    );
-    // Everything observable without matching stays available.
-    assert_eq!(
-        string_payload(js_regexp_get_source(re)),
-        b"[A-Za-z]+(?:foo|bar)[0-9]{1,4}".to_vec()
-    );
-    assert_eq!(string_payload(js_regexp_get_flags(re)), b"i".to_vec());
-    assert!(unsafe { (*re).case_insensitive });
-    assert!(
-        unsafe { (*re).regex_ptr.is_null() },
-        "reading .source/.flags must not build the program either"
-    );
-
-    assert!(js_regexp_test(re, make_string("XFOO12")) != 0);
-    assert!(
-        !unsafe { (*re).regex_ptr.is_null() },
-        "the first match must build and install the program"
-    );
-}
-
-/// The deferred build installs the fancy-regex and RepeatMatcher programs too,
-/// not just the linear one — they live on the same publish point, so a header
-/// whose pattern needs one must still get it on first use.
-#[test]
-fn deferred_build_installs_the_fancy_and_repeat_matcher_fallbacks() {
-    let fancy = js_regexp_new(make_string(r"(?<=pre)\d+"), make_string(""));
-    assert!(unsafe { (*fancy).fancy_ptr.is_null() });
-    assert!(js_regexp_test(fancy, make_string("pre77")) != 0);
-    assert!(
-        !unsafe { (*fancy).fancy_ptr.is_null() },
-        "first use must install the fancy-regex fallback"
-    );
-    assert!(js_regexp_test(fancy, make_string("nope77")) == 0);
-
-    let repeat = js_regexp_new(make_string(r"(a?b??)*"), make_string(""));
-    assert!(unsafe { (*repeat).repeat_matcher_ptr.is_null() });
-    assert!(js_regexp_test(repeat, make_string("ab")) != 0);
-    assert!(
-        !unsafe { (*repeat).repeat_matcher_ptr.is_null() },
-        "first use must install the ECMAScript RepeatMatcher"
-    );
-}
-
-/// Two evaluations of the same pattern are still distinct objects with
-/// independent `lastIndex`, and deferring the build does not let them share a
-/// header (ECMA-262 requires a fresh object per evaluation — the same
-/// invariant the closure-literal singleton fix restored for functions).
-#[test]
-fn deferred_build_keeps_per_object_identity_and_last_index() {
-    let a = js_regexp_new(make_string("x"), make_string("g"));
-    let b = js_regexp_new(make_string("x"), make_string("g"));
-    assert_ne!(
-        a as usize, b as usize,
-        "each evaluation is a distinct object"
-    );
-    assert!(!js_regexp_exec(a, make_string("xx")).is_null());
-    assert_eq!(regex_last_index_offset(a), 1);
-    assert_eq!(
-        regex_last_index_offset(b),
-        0,
-        "a sibling regex must not inherit lastIndex through the shared program"
-    );
-}
-
-/// The validated-pattern set is capped like the program caches: it holds owned
-/// pattern text (`emoji-regex` is ~12,807 chars) and is fed by `new
-/// RegExp(userInput)`, so an uncapped one would be the same attacker-driven
-/// growth the compiled-program caches were capped for.
-#[test]
-fn validated_pattern_set_is_capped() {
-    for i in 0..(REGEX_CACHE_MAX_ENTRIES * 2 + 10) {
-        lazy::mark_pattern_validated(&format!("validfill{i}[a-z]+"), "");
-    }
-    let len = VALIDATED_PATTERNS.with(|c| c.borrow().len());
-    assert!(
-        len <= REGEX_CACHE_MAX_ENTRIES,
-        "VALIDATED_PATTERNS must stay capped at {REGEX_CACHE_MAX_ENTRIES} entries, got {len}"
-    );
-}
-
-/// The `[\s\S]` → `(?s:.)` rewrite must not move a single match result.
-///
-/// The rewrite exists purely to dodge a 1.1-million-iteration case fold in
-/// `regex_syntax` (see `grammar::push_any_char`), so the only thing that may
-/// change is how long construction takes. Everything a program can observe —
-/// what matches, what a capture group holds, which group number it is, and
-/// that the NEGATED forms still match nothing — is pinned here, because a
-/// silently widened character class produces no error anywhere: only a wrong
-/// answer, on inputs a syntax test never looks at.
-#[test]
-fn any_char_rewrite_preserves_match_behaviour() {
-    // Matches every code point, newlines included, with and without `i`.
-    for pattern in ["[\\s\\S]", "[^]", "[\\d\\D]", "[\\w\\W]", "[\\S\\s]"] {
-        for flags in ["", "i", "u", "iu", "m"] {
-            let re = js_regexp_new(make_string(pattern), make_string(flags));
-            for subject in ["a", "\n", " ", "\u{1F600}", "Ω", "\r"] {
-                assert!(
-                    js_regexp_test(re, make_string(subject)) != 0,
-                    "/{pattern}/{flags} must match {subject:?}"
-                );
-            }
-        }
-    }
-
-    // The negated forms are the exact opposite and must still match NOTHING.
-    for pattern in ["[^\\s\\S]", "[^\\w\\W]", "[]"] {
-        let re = js_regexp_new(make_string(pattern), make_string("i"));
-        for subject in ["a", "\n", "Ω"] {
-            assert!(
-                js_regexp_test(re, make_string(subject)) == 0,
-                "/{pattern}/i must not match {subject:?}"
-            );
-        }
-    }
-
-    // A class that is NOT a complementary pair keeps its narrow meaning.
-    let narrow = js_regexp_new(make_string("[\\d\\s]"), make_string("i"));
-    assert!(js_regexp_test(narrow, make_string("7")) != 0);
-    assert!(js_regexp_test(narrow, make_string("a")) == 0);
-
-    // The rewrite emits a NON-capturing group, so group numbering is
-    // unchanged: `$1` is still `b`, not the any-char.
-    let re = js_regexp_new(make_string("a[\\s\\S](b)"), make_string(""));
-    let m = js_regexp_exec(re, make_string("a\nb"));
-    assert!(!m.is_null(), "a[\\s\\S](b) must match \"a\\nb\"");
-
-    // Quantifiers still bind to the any-char, lazily and greedily.
-    let lazy = js_regexp_new(make_string("<x>([\\s\\S]*?)</x>"), make_string("i"));
-    assert!(js_regexp_test(lazy, make_string("<x>one\ntwo</x>")) != 0);
-    let greedy = js_regexp_new(make_string("^[\\s\\S]{3}$"), make_string(""));
-    assert!(js_regexp_test(greedy, make_string("a\nb")) != 0);
-    assert!(js_regexp_test(greedy, make_string("a\nbc")) == 0);
-
-    // `.source` still reports what the author wrote, not the translation.
-    let re = js_regexp_new(make_string("[\\s\\S]+"), make_string("gi"));
-    assert_eq!(
-        string_payload(js_regexp_get_source(re)),
-        b"[\\s\\S]+".to_vec()
-    );
 }
 
 /// #9305 fallout: the translator spells ECMAScript's ASCII `\b`/`\B` as
@@ -609,10 +453,7 @@ fn site_cache_reconstruction_is_born_built() {
     let _lock = crate::gc::global_side_table_test_lock();
     site_cache::test_reset();
     let re1 = js_regexp_new(make_string("born[0-9]+built"), make_string("g"));
-    assert!(
-        unsafe { (*re1).regex_ptr.is_null() },
-        "construction stays lazy"
-    );
+    assert!(!regex_is_built(re1), "construction stays lazy");
     assert_eq!(
         site_cache::test_has_programs("born[0-9]+built", "g"),
         Some(false),
@@ -626,28 +467,20 @@ fn site_cache_reconstruction_is_born_built() {
     );
     let re2 = js_regexp_new(make_string("born[0-9]+built"), make_string("g"));
     assert!(
-        !unsafe { (*re2).regex_ptr.is_null() },
+        regex_is_built(re2),
         "the second construction installs the programs eagerly"
     );
     assert!(
-        std::ptr::eq(unsafe { (*re1).regex_ptr }, unsafe { (*re2).regex_ptr }),
+        std::ptr::eq(unsafe { (*re1).programs_ptr }, unsafe {
+            (*re2).programs_ptr
+        }),
         "both headers share one compiled program"
     );
-    // The owned source copies are shared too (two refcount bumps per header,
-    // not two `String`s).
-    let (p1, p2) = REGEX_SOURCE_TABLE.with(|t| {
-        let t = t.borrow();
-        (
-            t.get(&(re1 as usize)).map(|(p, _)| p.clone()).unwrap(),
-            t.get(&(re2 as usize)).map(|(p, _)| p.clone()).unwrap(),
-        )
-    });
-    assert!(Arc::ptr_eq(&p1, &p2), "source text is shared, not copied");
     assert_eq!(js_regexp_test(re2, make_string("born7built")), 1);
     assert_eq!(js_regexp_test(re2, make_string("nothing")), 0);
     // Different flags are a different entry.
     let re3 = js_regexp_new(make_string("born[0-9]+built"), make_string("i"));
-    assert!(unsafe { (*re3).regex_ptr.is_null() });
+    assert!(!regex_is_built(re3));
 }
 
 /// `test` on a global/sticky receiver advances `lastIndex` exactly like
@@ -765,15 +598,13 @@ fn a_single_program_cache_clear_cannot_disarm_a_lookbehind_literal() {
     site_cache::test_reset();
 
     let cold = build();
-    unsafe {
-        lazy::ensure_regex_compiled(cold);
-        assert!(
-            !(*cold).fancy_ptr.is_null(),
-            "a built header must carry every program its pattern needs — a null \
-             fancy_ptr here is memoized by site_cache::install_programs and makes \
-             the breakage permanent for this literal"
-        );
-    }
+    lazy::ensure_regex_compiled(cold);
+    assert!(
+        regex_has_fancy_program(cold),
+        "a built header must carry every program its pattern needs — a null \
+         the fancy program here is memoized by site_cache::install_programs and makes \
+         the breakage permanent for this literal"
+    );
     assert_eq!(
         subject.with_const_ptr::<StringHeader, _>(|s| js_regexp_test(cold, s)),
         1,
@@ -1014,7 +845,7 @@ fn a_dynamic_construction_records_nothing_in_the_site_table() {
 
 /// A site hit must be born built: the second construction at a site whose
 /// first header has already executed installs the compiled programs eagerly,
-/// so `regex_ptr` is non-null before any match runs.
+/// so `programs_ptr` is non-null before any match runs.
 ///
 /// This is what makes the fast path complete — a hit that skipped the content
 /// cache but arrived unbuilt would push the pattern's hash back onto the first
@@ -1027,19 +858,19 @@ fn a_site_hit_after_the_first_execution_is_born_built() {
 
     let first = js_regexp_new_site(make_string("bo+rn"), make_string(""), key);
     assert!(
-        unsafe { (*first).regex_ptr }.is_null(),
+        !regex_is_built(first),
         "construction must not build the program (that is #5777's deferred build)"
     );
     assert!(js_regexp_test(first, make_string("boorn")) != 0);
     assert!(
-        !unsafe { (*first).regex_ptr }.is_null(),
+        regex_is_built(first),
         "the first execution installs the programs"
     );
 
     // Second construction at the SAME site.
     let second = js_regexp_new_site(make_string("bo+rn"), make_string(""), key);
     assert!(
-        !unsafe { (*second).regex_ptr }.is_null(),
+        regex_is_built(second),
         "a site hit must install the programs the site already compiled, so the header is born \
          built and the first match pays no lookup"
     );

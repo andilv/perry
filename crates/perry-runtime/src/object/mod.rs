@@ -56,6 +56,11 @@ mod test_root_helpers;
 pub(crate) use test_root_helpers::*;
 
 mod alloc;
+mod json_construction;
+pub(crate) use json_construction::{
+    object_from_inline_json_fields, object_from_json_fields_preinstalled,
+    try_object_from_inline_json_fields,
+};
 mod arguments;
 #[cfg(test)]
 mod arguments_latch_tests;
@@ -1295,23 +1300,13 @@ pub fn scan_object_cache_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'
         &iterator_prototypes::STRING_ITERATOR_PROTOTYPE_PTR,
         &iterator_prototypes::REGEXP_STRING_ITERATOR_PROTOTYPE_PTR,
         &iterator_prototypes::ITERATOR_HELPER_PROTOTYPE_PTR,
-        // The realm's `RegExp.prototype`, recorded by `regex_proto_thunks` so
-        // the view mode's canonicality proof is three loads instead of a walk.
-        // A recorded address MUST be scanned: unscanned, it is a stale pointer
-        // the first time the collector moves the prototype.
-        #[cfg(feature = "regex-engine")]
-        &regex_proto_thunks::REGEXP_PROTOTYPE_PTR,
     ] {
         slot.with_slot(|slot| {
             visitor.visit_atomic_i64_slot(slot, Ordering::Acquire, Ordering::Release);
         });
     }
-    // The canonical `test` closure is a NaN-boxed word, not a bare address, so
-    // it is visited as one — the collector rewrites the pointer inside it.
     #[cfg(feature = "regex-engine")]
-    regex_proto_thunks::REGEXP_PROTOTYPE_TEST_CLOSURE.with_slot(|slot| {
-        visitor.visit_atomic_nanbox_u64_slot(slot, Ordering::Acquire, Ordering::Release);
-    });
+    regex_proto_thunks::scan_canonical_test_site_roots_mut(visitor);
 }
 
 /// Drive the PRODUCTION shape-cache writer from a test. Deliberately nothing
@@ -1428,6 +1423,21 @@ pub(crate) unsafe fn object_keys_array(obj: *const ObjectHeader) -> *mut ArrayHe
     shapes::object_shape_descriptor(obj)
         .map(|descriptor| descriptor.keys as usize as *mut ArrayHeader)
         .unwrap_or(std::ptr::null_mut())
+}
+
+/// Return the two shape facts needed together by callback-free serializers.
+/// Resolving them as one descriptor avoids a second ShapeId slab probe for the
+/// live inline-slot bound after the ordered-keys identity was already checked.
+#[inline]
+pub(crate) unsafe fn object_keys_and_live_slots(
+    obj: *const ObjectHeader,
+) -> Option<(*mut ArrayHeader, u32)> {
+    shapes::object_shape_descriptor(obj).map(|descriptor| {
+        (
+            descriptor.keys as usize as *mut ArrayHeader,
+            descriptor.live_inline_slot_count,
+        )
+    })
 }
 
 /// #6759 Phase B: per-object metadata record, reached from

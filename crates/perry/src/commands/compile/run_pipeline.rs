@@ -783,6 +783,7 @@ pub fn run_with_parse_cache(
         }
         None => None,
     };
+    let bunfs_text_modules = embed::bunfs_text_modules(ctx.bunfs_root.as_deref())?;
     let explain_lowering = if args.explain_lowering {
         Some(lowering_report::ExplainLoweringRun::prepare(
             &ctx.cache_root,
@@ -5649,7 +5650,15 @@ pub fn run_with_parse_cache(
             let compiled = if let Some(session) = &typed_feedback {
                 super::typed_feedback_profile::compile(session, hir_module, opts, path, perry_version)
             } else {
-                perry_codegen::compile_module(hir_module, opts)
+                let unit_cache_dir = cache_key.map(|key| {
+                    ctx.cache_dir
+                        .join("codegen-units-v1")
+                        .join(cache_target_dir)
+                        .join(format!("{key:016x}"))
+                });
+                perry_codegen::unit_cache::with_module_cache(unit_cache_dir, || {
+                    perry_codegen::compile_module(hir_module, opts)
+                })
             };
             let object_code = compiled.map_err(|e| {
                 perry_codegen::ext_registry::take_module_capture();
@@ -6715,9 +6724,11 @@ pub fn run_with_parse_cache(
     // as package.json, perry.toml, and the on-disk caches. Otherwise an entry
     // at `src/main.ts` makes `--embed ./dist/**` silently search `src/dist`.
     if !embedded_assets.is_empty() {
-        if let Some(obj) =
-            embed::generate_embedded_asset_object(&embedded_assets, &object_output_dir)?
-        {
+        if let Some(obj) = embed::generate_embedded_asset_object(
+            &embedded_assets,
+            &object_output_dir,
+            &bunfs_text_modules,
+        )? {
             obj_cleanup_paths.push(obj.clone());
             obj_paths.push(obj);
             obj_fingerprints.push(None);

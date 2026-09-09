@@ -35,7 +35,9 @@ use std::time::{Duration, Instant};
 
 mod types;
 pub use types::*;
+mod json_defer;
 mod policy;
+pub(crate) use json_defer::JsonParseAllocation;
 pub(crate) use policy::gc_runtime_safepoint;
 /// The one writer of `GC_SAFEPOINT_PENDING` — it also keeps the poll's global
 /// arming shadow in step. See `gc/poll_arm.rs`.
@@ -157,6 +159,7 @@ mod prefetch;
 
 mod copying;
 mod copying_first_cycle;
+mod copying_phase;
 mod copying_pointer_set;
 mod diag_sites;
 pub(crate) use diag_sites::primitive_dispatch as diag_primitive_dispatch;
@@ -258,6 +261,7 @@ pub(crate) mod census;
 #[cfg(feature = "diagnostics")]
 mod heap_snapshot;
 mod heap_stats;
+mod regex_census;
 pub use census::{census_poll_signal, gc_census_enabled};
 #[cfg(feature = "diagnostics")]
 pub use heap_snapshot::gc_build_v8_heap_snapshot_json;
@@ -1003,6 +1007,8 @@ pub fn gc_init() {
     reg_scanner!(async_hooks_mutable_root_scanner);
     reg_scanner!(shape_cache_mutable_root_scanner);
     reg_scanner!(crate::regex::scan_last_exec_groups_root_mut);
+    #[cfg(feature = "regex-engine")]
+    reg_scanner!(crate::regex::site_test::scan_roots_mut);
     // #7211: the eight interned `typeof` result strings, and JSON.rawJSON's
     // interned `"rawJSON"` key. Both are thread-local caches of a RAW
     // `StringHeader*` allocated in the nursery and referenced by nothing else,
@@ -1645,6 +1651,18 @@ pub extern "C" fn js_gc_pause_stats(
 pub(crate) unsafe fn mark_shape_shared(user_ptr: *mut u8) {
     let header = layout::header_from_user_ptr(user_ptr);
     (*header).gc_flags |= GC_FLAG_SHAPE_SHARED;
+}
+
+/// Return the header for a user pointer whose GC provenance was already
+/// established by the caller. Keeping the layout cast inside `gc` makes that
+/// proof explicit at hot runtime call sites without repeating address-map
+/// classification during a callback-free operation.
+///
+/// # Safety
+/// `user_ptr` must point at the live payload of a Perry GC allocation.
+#[inline(always)]
+pub(crate) unsafe fn header_from_trusted_user_ptr(user_ptr: *const u8) -> *const GcHeader {
+    layout::header_from_user_ptr(user_ptr)
 }
 
 #[cfg(test)]

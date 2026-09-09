@@ -330,6 +330,29 @@ pub fn object_static_prototype(obj_ptr: usize) -> Option<u64> {
         .and_then(|map| map.get(&obj_ptr).copied())
 }
 
+/// Look up the residual prototype registry for a caller that has already
+/// proved its receiver is not a shaped `GC_TYPE_OBJECT`.
+///
+/// `RegExp` cells meet that precondition. Keeping it explicit lets their hot
+/// view-mode proof read the empty latch FIRST and return without paying
+/// `meta_capable_object`'s buffer/object/header classification. The ordinary
+/// [`object_static_prototype`] remains the entry for unclassified receivers
+/// and still checks object-owned metadata before consulting this registry.
+#[inline]
+// #9917 added this for the recorded canonical-test-site proof, whose only
+// caller is regex-engine gated; without the feature it is dead in a product
+// build. Same gate as the rest of that surface (#9970).
+#[cfg(any(test, feature = "regex-engine"))]
+pub(crate) fn object_static_prototype_known_non_meta(obj_ptr: usize) -> Option<u64> {
+    if !OBJECT_PROTOTYPES_NONEMPTY.load(Ordering::Acquire) {
+        return None;
+    }
+    get_object_prototypes()
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&obj_ptr).copied())
+}
+
 #[inline]
 fn object_has_prototype_flag(obj_ptr: usize, flag: u64) -> bool {
     unsafe {
