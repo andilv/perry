@@ -92,6 +92,7 @@ thread_local! {
 #[cfg_attr(not(test), allow(dead_code))]
 pub enum JsonTapeSafepoint {
     MaterializeObjectRooted,
+    SmallRecordBatchRooted,
     MaterializeArrayRooted,
     LazyArrayRooted,
     LazyGetHeaderRooted,
@@ -144,7 +145,7 @@ fn json_tape_safepoint(_point: JsonTapeSafepoint, _ptr: usize) {}
 pub fn build_tape(bytes: &[u8]) -> Option<Tape> {
     let mut entries: Vec<TapeEntry> = Vec::new();
     let mut stack: Vec<u32> = Vec::new();
-    if build_tape_into(bytes, &mut entries, &mut stack) {
+    if build_tape_into::<false>(bytes, &mut entries, &mut stack, &mut 0) {
         Some(Tape { entries })
     } else {
         None
@@ -154,7 +155,14 @@ pub fn build_tape(bytes: &[u8]) -> Option<Tape> {
 /// Build a tape into caller-provided storage. This is the hot-path
 /// variant used by `JSON.parse` so repeated parse-churn workloads do
 /// not allocate and free a fresh tape vector on every iteration.
-fn build_tape_into(bytes: &[u8], entries: &mut Vec<TapeEntry>, stack: &mut Vec<u32>) -> bool {
+// Keep both specializations outside the common parse entry and its stack frame.
+#[inline(never)]
+fn build_tape_into<const CAPTURE_DEPTH: bool>(
+    bytes: &[u8],
+    entries: &mut Vec<TapeEntry>,
+    stack: &mut Vec<u32>,
+    max_depth: &mut usize,
+) -> bool {
     entries.clear();
     stack.clear();
     // Pre-size: worst case is one tape entry per ~4 bytes of input
@@ -283,6 +291,12 @@ fn build_tape_into(bytes: &[u8], entries: &mut Vec<TapeEntry>, stack: &mut Vec<u
                             link: 0,
                         });
                         stack.push(idx);
+                        if CAPTURE_DEPTH {
+                            *max_depth = (*max_depth).max(stack.len());
+                            if *max_depth > crate::json::MAX_ITERATIVE_NESTING_DEPTH {
+                                return false;
+                            }
+                        }
                         pos += 1;
                         skip_ws(bytes, &mut pos);
                         if pos < bytes.len() && bytes[pos] == b'}' {
@@ -328,6 +342,12 @@ fn build_tape_into(bytes: &[u8], entries: &mut Vec<TapeEntry>, stack: &mut Vec<u
                             link: 0,
                         });
                         stack.push(idx);
+                        if CAPTURE_DEPTH {
+                            *max_depth = (*max_depth).max(stack.len());
+                            if *max_depth > crate::json::MAX_ITERATIVE_NESTING_DEPTH {
+                                return false;
+                            }
+                        }
                         pos += 1;
                         skip_ws(bytes, &mut pos);
                         if pos < bytes.len() && bytes[pos] == b']' {
@@ -515,15 +535,41 @@ pub(crate) unsafe fn with_built_tape_mut_raw<R>(
     len: usize,
     f: impl FnOnce(&mut Vec<TapeEntry>) -> R,
 ) -> Option<R> {
+    with_built_tape_depth_impl::<false, R>(data, len, |entries, _| f(entries))
+}
+
+/// Build a syntax-validated tape and capture the deepest container stack.
+/// Refuse inputs beyond the parse resource budget before materialization.
+/// The caller must retain the legacy depth/error check when this declines.
+///
+/// # Safety
+/// As with `with_built_tape_raw`, no input borrow crosses the callback; `f`
+/// receives only native entries and depth metadata, and must derive its source
+/// pointer again from the root after any collection.
+pub(crate) unsafe fn with_built_tape_depth_raw<R>(
+    data: *const u8,
+    len: usize,
+    f: impl FnOnce(&mut Vec<TapeEntry>, usize) -> R,
+) -> Option<R> {
+    with_built_tape_depth_impl::<true, R>(data, len, f)
+}
+
+unsafe fn with_built_tape_depth_impl<const CAPTURE_DEPTH: bool, R>(
+    data: *const u8,
+    len: usize,
+    f: impl FnOnce(&mut Vec<TapeEntry>, usize) -> R,
+) -> Option<R> {
     TAPE_SCRATCH.with(|cell| {
         let mut scratch = cell.take().unwrap_or_else(TapeScratch::new);
-        let built = build_tape_into(
+        let mut max_depth = 0;
+        let built = build_tape_into::<CAPTURE_DEPTH>(
             std::slice::from_raw_parts(data, len),
             &mut scratch.entries,
             &mut scratch.stack,
+            &mut max_depth,
         );
         let result = if built {
-            Some(f(&mut scratch.entries))
+            Some(f(&mut scratch.entries, max_depth))
         } else {
             None
         };
@@ -564,6 +610,9 @@ enum TapeSource<'a, 'scope> {
         hdr_handle: crate::gc::RuntimeHandle<'scope>,
     },
 }
+
+#[path = "json_tape/record_materialize.rs"]
+mod record_materialize;
 
 impl<'a, 'scope> TapeSource<'a, 'scope> {
     #[inline]
@@ -805,16 +854,12 @@ unsafe fn decode_key_to_interned_string(
                     owned.as_ptr(),
                     owned.len() as u32,
                 );
-                crate::json::PARSE_KEY_CACHE.with(|c| {
-                    c.borrow_mut().insert(owned, p);
-                });
+                crate::json::cache_parse_key(owned, p);
                 return p;
             }
             let p =
                 crate::string::js_string_from_bytes_longlived(slice.as_ptr(), slice.len() as u32);
-            crate::json::PARSE_KEY_CACHE.with(|c| {
-                c.borrow_mut().insert(slice.to_vec(), p);
-            });
+            crate::json::cache_parse_key(slice.to_vec(), p);
             return p;
         }
         Some(ParsedStr::Owned(v)) => v,
@@ -830,9 +875,7 @@ unsafe fn decode_key_to_interned_string(
     }
     let p =
         crate::string::js_string_from_bytes_longlived(key_bytes.as_ptr(), key_bytes.len() as u32);
-    crate::json::PARSE_KEY_CACHE.with(|c| {
-        c.borrow_mut().insert(key_bytes, p);
-    });
+    crate::json::cache_parse_key(key_bytes, p);
     p
 }
 
@@ -846,8 +889,12 @@ unsafe fn materialize_string_value(source: &TapeSource<'_, '_>, offset: usize) -
             // access) can handle both forms — Step 1 + 1.5 of the
             // SSO migration landed those consumer arms in v0.5.214
             // / v0.5.215.
-            if let Some(sso) = JSValue::try_short_string(slice) {
-                return sso;
+            if slice.len() <= crate::value::SHORT_STRING_MAX_LEN
+                && !crate::string::bytes_have_lone_surrogate(slice)
+            {
+                if let Some(sso) = JSValue::try_short_string(slice) {
+                    return sso;
+                }
             }
             let ptr = if source.is_lazy() {
                 let owned = slice.to_vec();
@@ -858,10 +905,14 @@ unsafe fn materialize_string_value(source: &TapeSource<'_, '_>, offset: usize) -
             JSValue::string_ptr(ptr)
         }
         Some(ParsedStr::Owned(vec)) => {
-            if let Some(sso) = JSValue::try_short_string(&vec) {
-                return sso;
+            if vec.len() <= crate::value::SHORT_STRING_MAX_LEN
+                && !crate::string::bytes_have_lone_surrogate(&vec)
+            {
+                if let Some(sso) = JSValue::try_short_string(&vec) {
+                    return sso;
+                }
             }
-            let ptr = crate::string::js_string_from_bytes(vec.as_ptr(), vec.len() as u32);
+            let ptr = crate::string::js_string_from_builder_bytes(&vec);
             JSValue::string_ptr(ptr)
         }
         None => JSValue::null(),
@@ -910,6 +961,9 @@ enum ParsedStr<'a> {
 /// Standalone because the materializer doesn't have a live
 /// `DirectParser` instance. Same semantics as
 /// `DirectParser::parse_string_bytes`.
+// Keep the scalar scan out of its materialization callers even though the
+// canonical escape decoder is now shared and the scanner itself is small.
+#[inline(never)]
 fn parse_string_bytes_static(bytes: &[u8]) -> Option<ParsedStr<'_>> {
     if bytes.is_empty() || bytes[0] != b'"' {
         return None;
@@ -923,76 +977,27 @@ fn parse_string_bytes_static(bytes: &[u8]) -> Option<ParsedStr<'_>> {
         }
         if c == b'\\' {
             // Fall through to slow path from here.
-            return parse_string_bytes_slow(bytes, pos, start);
+            return parse_string_bytes_slow(bytes);
         }
         pos += 1;
     }
     None
 }
 
-fn parse_string_bytes_slow(bytes: &[u8], start_pos: usize, start: usize) -> Option<ParsedStr<'_>> {
-    let mut result: Vec<u8> = Vec::from(&bytes[start..start_pos]);
-    let mut pos = start_pos;
-    loop {
-        if pos >= bytes.len() {
-            return None;
-        }
-        let c = bytes[pos];
-        pos += 1;
-        match c {
-            b'"' => return Some(ParsedStr::Owned(result)),
-            b'\\' => {
-                if pos >= bytes.len() {
-                    return None;
-                }
-                let esc = bytes[pos];
-                pos += 1;
-                match esc {
-                    b'"' => result.push(b'"'),
-                    b'\\' => result.push(b'\\'),
-                    b'/' => result.push(b'/'),
-                    b'n' => result.push(b'\n'),
-                    b'r' => result.push(b'\r'),
-                    b't' => result.push(b'\t'),
-                    b'b' => result.push(0x08),
-                    b'f' => result.push(0x0C),
-                    b'u' => {
-                        if pos + 4 > bytes.len() {
-                            return None;
-                        }
-                        let hex = std::str::from_utf8(&bytes[pos..pos + 4]).ok()?;
-                        let code = u16::from_str_radix(hex, 16).ok()?;
-                        pos += 4;
-                        if (0xD800..=0xDBFF).contains(&code) {
-                            if pos + 6 <= bytes.len()
-                                && bytes[pos] == b'\\'
-                                && bytes[pos + 1] == b'u'
-                            {
-                                let hex2 = std::str::from_utf8(&bytes[pos + 2..pos + 6]).ok()?;
-                                let low = u16::from_str_radix(hex2, 16).ok()?;
-                                pos += 6;
-                                let codepoint = 0x10000
-                                    + ((code as u32 - 0xD800) << 10)
-                                    + (low as u32 - 0xDC00);
-                                if let Some(ch) = char::from_u32(codepoint) {
-                                    let mut buf = [0u8; 4];
-                                    let s = ch.encode_utf8(&mut buf);
-                                    result.extend_from_slice(s.as_bytes());
-                                }
-                            }
-                        } else if let Some(ch) = char::from_u32(code as u32) {
-                            let mut buf = [0u8; 4];
-                            let s = ch.encode_utf8(&mut buf);
-                            result.extend_from_slice(s.as_bytes());
-                        }
-                    }
-                    _ => result.push(esc),
-                }
-            }
-            _ => result.push(c),
-        }
+// Keep the cold escape decoder shared with eager/batched parsing. In
+// particular, lone surrogates must survive every lazy access order.
+#[inline(never)]
+fn parse_string_bytes_slow(bytes: &[u8]) -> Option<ParsedStr<'_>> {
+    let mut parser = crate::json::DirectParser::new(bytes);
+    match parser.parse_string_bytes()? {
+        crate::json::ParsedStr::Borrowed(bytes) => Some(ParsedStr::Borrowed(bytes)),
+        crate::json::ParsedStr::Owned(bytes) => Some(ParsedStr::Owned(bytes)),
     }
 }
+
+#[cfg(test)]
+#[path = "json_tape/string_decode_tests.rs"]
+mod string_decode_tests;
 
 #[cfg(test)]
 #[path = "json_tape_tests.rs"]
@@ -1618,7 +1623,13 @@ pub unsafe fn lazy_get(hdr: *mut LazyArrayHeader, i: u32) -> JSValue {
     (*hdr).walk_tape_pos = idx as u32;
     (*hdr).cumulative_walk_steps = (*hdr).cumulative_walk_steps.saturating_add(step_cost);
 
-    let value = materialize_from_idx_source(&source, &scope, idx);
+    // Amortize the direct producer's shape metadata once consecutive reads
+    // establish a traversal. Isolated reads keep the tape producer, which
+    // avoids creating another parser cache for a glance at a few records.
+    let value = (streak > 1)
+        .then(|| record_materialize::try_small_record(&source, &scope, idx))
+        .flatten()
+        .unwrap_or_else(|| materialize_from_idx_source(&source, &scope, idx));
     let value_handle = scope.root_nanbox_u64(value.bits());
     let hdr = hdr_handle.get_raw_mut_ptr::<LazyArrayHeader>();
     let bitmap = (*hdr).materialized_bitmap;
@@ -1757,7 +1768,7 @@ unsafe fn reparse_materialize(
         let _suppress = crate::gc::GcSuppressScope::new();
         let data = (blob as *const u8).add(std::mem::size_of::<crate::StringHeader>());
         let bytes = std::slice::from_raw_parts(data, blob_len);
-        let mut parser = crate::json::DirectParser::new(bytes);
+        let mut parser = crate::json::DirectParser::new_batched(bytes);
         let parsed = parser.parse_value();
         // Hand the tree to PARSE_ROOTS before the window closes — the
         // handle-scope root below is pushed after it has already closed.

@@ -317,14 +317,15 @@ pub(crate) unsafe fn object_get_to_json(ptr: *const u8) -> Option<f64> {
     Some(result)
 }
 
-/// Check if an array has an own `toJSON` method (an expando property, e.g.
-/// `arr.toJSON = function() {...}`, stored in the array-named-property side
-/// table since an `ArrayHeader` has no `keys_array`) — the array analog of
-/// `object_get_to_json`. Per ECMA-262 §25.5.2.2, `SerializeJSONProperty` step
+/// Check if an array has a callable `toJSON` method. An own expando lives in
+/// the array-named-property side table because `ArrayHeader` has no
+/// `keys_array`; a user-installed `Object.prototype.toJSON` is resolved
+/// through the ordinary Array/Object prototype chain. Per ECMA-262 §25.5.2.2,
+/// `SerializeJSONProperty` step
 /// 2 applies to ANY object, including arrays, BEFORE the `IsArray` check
 /// (step 10) that would otherwise route straight into `SerializeJSONArray`
 /// (test262 JSON/stringify/value-tojson-result,
-/// value-tojson-array-circular). Returns `None` when there's no callable own
+/// value-tojson-array-circular). Returns `None` when there's no callable
 /// `toJSON` (the caller then serializes the array's elements normally).
 #[inline]
 pub(crate) unsafe fn array_get_to_json(arr: *const crate::ArrayHeader) -> Option<f64> {
@@ -332,7 +333,20 @@ pub(crate) unsafe fn array_get_to_json(arr: *const crate::ArrayHeader) -> Option
     if SUPPRESS_NEXT_TO_JSON.with(|c| c.replace(false)) {
         return None;
     }
-    let method = crate::array::array_named_property_get_by_name(arr, "toJSON")?;
+    let method = match crate::array::array_named_property_get_by_name(arr, "toJSON") {
+        Some(method) => method,
+        None => {
+            // Keep the common array path allocation-free. The signature probe
+            // directly detects Object.prototype key changes; only a positive
+            // verdict pays for the full prototype lookup and key allocation.
+            if !super::stringify_tojson_probe::object_proto_may_have_to_json() {
+                return None;
+            }
+            f64::from_bits(
+                crate::object::array_prototype_property_value("toJSON", arr as usize)?.bits(),
+            )
+        }
+    };
     let method_bits = method.to_bits();
     if (method_bits & 0xFFFF_0000_0000_0000) != POINTER_TAG {
         return None;
@@ -1161,28 +1175,29 @@ pub(crate) unsafe fn stringify_object_inner(ptr: *const u8, buf: &mut String, de
     };
     let actual_fields = keys_len;
 
-    // #2438: enumerate own keys in ECMA-262 OrdinaryOwnPropertyKeys order —
-    // array-index keys first (ascending numeric), then string keys in
-    // insertion order. `None` means no array-index keys, so insertion order
-    // already matches spec and the loop walks `0..actual_fields` directly.
-    let key_order = crate::object::ecma_own_key_order(keys_arr);
-
     // Nested one-field leaves and wide inline objects can prove primitive
-    // fields by one raw walk, avoiding the generic closure scan's handle retrievals
-    // and repeated retrievals during emission. No pointer/BigInt field,
-    // descriptor or class can reach the borrowed emit interval.
+    // fields while emitting them in one raw walk, avoiding both the generic
+    // closure scan and the separate ordinary-key ordering scan. An array-index
+    // key or complex value rolls the native buffer back before the general
+    // path computes the required ordering. No pointer/BigInt field, descriptor
+    // or class can reach the borrowed emit interval.
     if (actual_fields == 1 || actual_fields > 32)
         && !has_overflow_fields
         && (*obj).class_id == 0
         && !crate::object::object_has_descriptors(ptr as usize)
-        && super::stringify_primitive_object::fields_are_primitive(obj, actual_fields)
+        && super::stringify_primitive_object::try_emit(obj, keys_arr, buf)
     {
-        super::stringify_primitive_object::emit_validated(obj, keys_arr, key_order.as_deref(), buf);
         if depth > MAX_FAST_DEPTH {
             STRINGIFY_STACK.with(|s| s.borrow_mut().pop());
         }
         return;
     }
+
+    // #2438: enumerate own keys in ECMA-262 OrdinaryOwnPropertyKeys order —
+    // array-index keys first (ascending numeric), then string keys in
+    // insertion order. `None` means no array-index keys, so insertion order
+    // already matches spec and the loop walks `0..actual_fields` directly.
+    let key_order = crate::object::ecma_own_key_order(keys_arr);
 
     // Deferred toJSON + closure checks (issue #67 tightening): scan fields
     // once to detect if any field is actually a closure. For data-only
@@ -1390,6 +1405,13 @@ pub(crate) unsafe fn stringify_object_inner(ptr: *const u8, buf: &mut String, de
             // JSON/stringify/value-string-escape-ascii, where the property
             // name embeds all 32 ASCII control characters).
             write_escaped_string(buf, key_str);
+            buf.push(':');
+        } else if crate::string::js_string_key_bytes(
+            JSValue::from_bits(current_key_bits),
+            &mut key_sso,
+        )
+        .is_some_and(|bytes| super::stringify_scalars::write_wtf8_key(buf, bytes))
+        {
             buf.push(':');
         } else {
             let _ = write!(buf, "\"field{}\":", f);

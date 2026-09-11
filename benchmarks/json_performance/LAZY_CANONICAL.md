@@ -1,0 +1,93 @@
+# Correct source reuse for lazy stringify
+
+Main `eee3881c4` and the tape-depth candidates copy untouched lazy-array source
+without proving canonical string spelling or property enumeration. The original
+[diagnostic](results/lazy-canonical-probe/README.md) demonstrates five inherited
+failures: whitespace, Unicode escapes, slash escapes, duplicate keys and reversed
+integer-like keys. Ordinary direct parsing produces the correct output.
+
+R1 (`96df018b1e436d52aefc0eca8a55fcb5df5e2ee4`) validates compact separators,
+canonical strings, unique keys and numeric-key ordering before source copying.
+Ambiguous cases materialize before ordinary stringify. Admission uses only native
+scratch and introduces no managed intermediate values or collector-policy changes.
+All 297 JSON tests and 126 compiled candidate checks pass; additional main controls
+expose escaped/nested duplicates and index-after-name ordering as inherited bugs.
+[Validation, raw output and moving-GC witnesses](results/lazy-canonical-r1-validation/README.md).
+
+R1 is parked because its [quiet focused replay](results/quiet-lazy-canonical-r1-main-focus-r9/README.md)
+shows 87–101% slower record roundtrips than main and 119–144% slower than tape-depth
+R2. All three sizes have 9/9 slower pairs. The eager heterogeneous stringify concern
+remains +0.427% versus main; that benchmark forces eager parsing and does not use
+this shortcut. R1 has not received full performance matrices or acceptance.
+
+A local stack-location sample places 801 of 1,454 main-thread samples under the
+new proof. The next candidate should combine proof and number normalization,
+validate UTF-8 once, and compare fixed-width separators directly. No resulting
+speedup is claimed yet. Source-string reuse additionally requires shared ownership
+(`StringHeader.refcount == 0`), a complete source span and borrowed normalized output.
+The standard record fixtures contain spellings such as `0.0`, so their normalization
+produces owned output: whole-source reuse would not accelerate those rows.
+
+## R2 combined traversal: still parked
+
+R2 (`c812afd4841e79970d298f7b4ff9b97c9d8888ab`) combines proof and number
+normalization, validates UTF-8 once, compares separators directly and derives
+string ends from adjacent token offsets. It passes 298 JSON tests and all 162
+compiled candidate comparisons, including deep and wide fallback cases.
+[Validation and moving-GC witnesses](results/lazy-canonical-r2-validation/README.md).
+
+Its [quiet focused replay](results/quiet-lazy-canonical-r2-main-focus-r9/README.md)
+reduces the recorded record-roundtrip slowdowns to 28–36% versus main, compared
+with 87–101% in the separate R1 window. It remains 50–65% slower than the current
+PR build and is not accepted. Eager heterogeneous stringify remains +0.434%
+versus main; the 13 KiB roundtrip has a 624 KiB median peak RSS increase.
+
+The fresh local profile points to the scalar quote/backslash tail loop: the
+prominent +1388/+1400 offsets are a byte load and character comparisons, not a
+key-table lookup. The next bounded experiment should apply the existing padded
+word scanner to short lazy-string bodies/tails while preserving the general
+parser scanners. Validate every byte position and guard-page boundary before
+measuring. Native output allocation/copying is a later target; no new output
+ownership, global cache or GC-policy change has been implemented.
+
+## R3 padded short tails: still parked
+
+R3 (`6cb0854eb50837495d7ab67aa7c6c749f544dbf1`) uses packed four-to-seven-byte
+tails only in the lazy canonical-string scan. General parser scanner entry points
+retain their existing specialization. All 298 JSON tests and 162 compiled candidate
+comparisons pass, including guard-page and moving-GC coverage.
+[Validation and exact code](results/lazy-canonical-r3-validation/README.md).
+
+The [qualified focused replay](results/quiet-lazy-canonical-r3-main-focus-r9/README.md)
+keeps record roundtrips 25–34% slower than main and 46–62% slower than the PR build.
+All three sizes have 9/9 slower pairs. Eager heterogeneous stringify is +0.381%
+versus main (8/9 slower pairs). The source remains parked; no full matrix is justified.
+
+A next candidate could retain the plain/escaped string fact already discovered
+while building the native tape, avoiding a second body scan during stringify.
+That requires a complete tape-metadata consumer audit and parse-only, sparse and
+full-scan measurements: moving work into parsing must not hide its cost. No such
+metadata change is included here. Canonicalization and eager stringify performance
+remain separate unresolved issues, and parity with both engines is still incomplete.
+
+## R4 native escape metadata: still parked
+
+R4 (`8a7a29d72dd10d1ab51e3a34108cce9487bd2f3f`) retains the plain-string fact
+in existing native tape leaf metadata. The entry layout and GC policy stay the
+same; unknown metadata preserves the full checked scan. All 304 release JSON
+tests and 162 compiled candidate comparisons pass.
+[Validation and metadata audit](results/lazy-canonical-r4-validation/README.md).
+
+The [qualified eight-case replay](results/quiet-lazy-canonical-r4-main-focus-r9/README.md)
+still measures record roundtrips 15–22% slower than main and 34–47% slower than the
+PR build, with 9/9 slower pairs. The added 1 MiB parse/scan/sparse controls cost
++1.687%/+0.818%/+1.432% versus the PR build. The earlier tape-depth gains keep them
+faster than main, but R4's incremental cost remains unacceptable. Source is parked;
+only evidence is included in PR #10036. No full matrix is justified.
+
+The local profile now exposes the duplicate-key slice loop and string endpoint
+checks in normalization. A bounded next experiment could skip the duplicate
+loop when a native per-object length-bit summary proves no preceding key has that
+length, retaining exact comparison on all collisions. This is a hypothesis only.
+The early tape-entry push also needs reconsideration because parse-only costs
+increased. No new implementation or speed claim exists for either follow-up.

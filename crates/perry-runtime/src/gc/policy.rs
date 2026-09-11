@@ -357,11 +357,19 @@ crate::perry_thread_local! {
     /// chance to fall out of the shadow roots.
     pub(super) static GC_SUPPRESSED_TINY_PARSE_COLLECTION_PENDING: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+
+    /// Tiny final-object births are bounded, so polling the whole arena after
+    /// every one spends more time measuring pressure than allocating. Keep a
+    /// strict call-count bound on that polling delay instead.
+    #[cfg(not(test))]
+    static GC_TINY_PARSE_BOUNDARY_POLL_REMAINING: std::cell::Cell<u8> =
+        const { std::cell::Cell::new(GC_TINY_PARSE_BOUNDARY_POLL_INTERVAL - 1) };
 }
 
 pub(super) const GC_SUPPRESSED_TINY_PARSE_BYTES: usize = 1024 * 1024;
 pub(super) const GC_SUPPRESSED_TINY_PARSE_IN_USE_TRIGGER_BYTES: usize = 48 * 1024 * 1024;
 pub(super) const GC_SUPPRESSED_TINY_PARSE_FULL_GC_IN_USE_TRIGGER_BYTES: usize = 24 * 1024 * 1024;
+pub(super) const GC_TINY_PARSE_BOUNDARY_POLL_INTERVAL: u8 = 64;
 
 pub(super) fn gc_suppressed_parse_is_tiny(parse_growth: usize) -> bool {
     parse_growth <= GC_SUPPRESSED_TINY_PARSE_BYTES
@@ -509,6 +517,27 @@ pub(super) const GC_MALLOC_COUNT_STEP_MIN: usize = 10_000;
 pub(crate) fn gc_schedule_malloc_sweep_after_json_output() {
     let current = malloc_object_count();
     GC_NEXT_MALLOC_TRIGGER.with(|trigger| trigger.set(trigger.get().min(current)));
+}
+
+pub(crate) enum JsonOutputSweep {
+    Pending,
+    CompletedBeforeBoundary,
+    CompletedAtBoundary,
+}
+
+/// Service completed JSON-output debt at a rooted input boundary. Distinguish
+/// an earlier deferred completion so JSON can carry forward output bytes
+/// produced after that request instead of dropping an extra buffer's debt.
+pub(crate) fn gc_service_json_output_sweep() -> JsonOutputSweep {
+    let was_due = malloc_object_count() >= GC_NEXT_MALLOC_TRIGGER.with(Cell::get);
+    gc_check_trigger();
+    if malloc_object_count() >= GC_NEXT_MALLOC_TRIGGER.with(Cell::get) {
+        JsonOutputSweep::Pending
+    } else if was_due {
+        JsonOutputSweep::CompletedAtBoundary
+    } else {
+        JsonOutputSweep::CompletedBeforeBoundary
+    }
 }
 
 crate::perry_thread_local! {
@@ -1512,15 +1541,19 @@ fn gc_bump_malloc_trigger_inner(collect_now: bool) {
 /// mark-sweep needs the collection to happen before the next suppressed parse,
 /// not immediately after the previous one, otherwise the parse result is still
 /// rooted and every churn block looks partially live.
-pub fn gc_collect_pending_suppressed_parse() {
-    let pending = GC_SUPPRESSED_TINY_PARSE_COLLECTION_PENDING.with(|pending| {
-        let was_pending = pending.get();
-        pending.set(false);
-        was_pending
-    });
-    if !pending {
-        return;
+#[inline(always)]
+pub fn gc_collect_pending_suppressed_parse() -> bool {
+    if !GC_SUPPRESSED_TINY_PARSE_COLLECTION_PENDING.with(Cell::get) {
+        return false;
     }
+    gc_collect_pending_suppressed_parse_slow();
+    true
+}
+
+#[cold]
+#[inline(never)]
+fn gc_collect_pending_suppressed_parse_slow() {
+    GC_SUPPRESSED_TINY_PARSE_COLLECTION_PENDING.with(|pending| pending.set(false));
     if GC_FLAGS.with(|f| f.get()) & (GC_FLAG_IN_ALLOC | GC_FLAG_SUPPRESSED) != 0
         || gc_blocked_by_unsafe_zone()
     {
@@ -1568,6 +1601,40 @@ pub fn gc_schedule_parse_boundary_collection_if_pressure() {
         return;
     }
     GC_SUPPRESSED_TINY_PARSE_COLLECTION_PENDING.with(|pending| pending.set(true));
+}
+
+/// Schedule pressure work after a bounded tiny JSON object birth.
+///
+/// The pressure predicate walks arena block state. Empty and bounded-inline
+/// JSON objects are at most a few slots, while its minimum growth headroom is
+/// 16 MiB, so checking every 64 completions keeps the maximum delay to 63
+/// bounded births and removes the heap walk from their steady-state path.
+/// Pending work is still serviced at the start of every parse, before a new
+/// result is born.
+#[inline(always)]
+pub fn gc_schedule_tiny_parse_boundary_collection_if_pressure() {
+    #[cfg(not(test))]
+    {
+        let poll = GC_TINY_PARSE_BOUNDARY_POLL_REMAINING.with(|remaining| {
+            let (next, poll) = tiny_parse_boundary_poll_next(remaining.get());
+            remaining.set(next);
+            poll
+        });
+        if !poll {
+            return;
+        }
+    }
+    // Tests poll immediately so the forced-pressure hook stays deterministic.
+    gc_schedule_parse_boundary_collection_if_pressure();
+}
+
+#[inline(always)]
+pub(super) const fn tiny_parse_boundary_poll_next(remaining: u8) -> (u8, bool) {
+    if remaining == 0 {
+        (GC_TINY_PARSE_BOUNDARY_POLL_INTERVAL - 1, true)
+    } else {
+        (remaining - 1, false)
+    }
 }
 
 /// The allocating parser has proved this construction fits the allowance.
@@ -3072,7 +3139,7 @@ crate::perry_thread_local! {
     static GC_BUDGETED_STEP_ACTIVE: Cell<bool> = const { Cell::new(false) };
 }
 
-pub(super) fn gc_budgeted_cycle_active() -> bool {
+pub(crate) fn gc_budgeted_cycle_active() -> bool {
     GC_BUDGETED_CYCLE_ACTIVE.with(Cell::get)
 }
 

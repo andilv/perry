@@ -20,7 +20,6 @@ perry-stdlib-core = { package = "perry-stdlib", path = "../../../../../../crates
   "rate-limit",
   "validation",
   "bundled-dotenv",
-  "bundled-slugify",
   "bundled-lru-cache",
   "bundled-exponential-backoff",
   "bundled-decimal",
@@ -30,6 +29,9 @@ perry-stdlib-core = { package = "perry-stdlib", path = "../../../../../../crates
   "external-events-construct",
   "external-http-server-pump",
   "external-net-pump",
+  # The external socket wrapper references the stdlib TLS preflight hook even
+  # for a plain HTTP application; retain it without bundling duplicate sockets.
+  "external-net-tls",
   "external-ws-pump",
   "external-zlib-pump",
 ] }
