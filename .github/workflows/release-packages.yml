@@ -213,6 +213,78 @@ jobs:
               exit 0
               ;;
           esac
+          # ---------------------------------------------------------------
+          # Which SHA must carry the green gate?
+          #
+          # Normally the exact candidate. But `test.yml` does not build the
+          # glibc image, read changelog fragments, or run this workflow, so a
+          # candidate that differs from an already-validated ancestor ONLY in
+          # those files is covered by that ancestor's gate. Re-running a ~5h
+          # tier to re-prove untouched code is pure latency, and this campaign
+          # paid it four times over a Dockerfile.
+          #
+          # Fail-closed by construction:
+          #   * the file list comes from GitHub's compare API, computed from
+          #     the commits themselves — not from any dispatch input;
+          #   * ANY path outside the allowlist keeps the exact-SHA requirement;
+          #   * an EMPTY diff is refused too (it should be impossible here, so
+          #     it means the comparison did not do what we think);
+          #   * `.github/workflows/test.yml` is deliberately NOT allowlisted —
+          #     changing the tier's own definition must re-run the tier.
+          GATE_SHA="$SHA"
+          if [ "$MODE" = "cut-release" ]; then
+            gate_green() {
+              local sha="$1" out rid
+              out=$(gh api "/repos/$REPO/actions/workflows/test.yml/runs?head_sha=$sha&per_page=20" 2>/dev/null) || return 1
+              for rid in $(echo "$out" | jq -r '.workflow_runs[]|select(.status=="completed" and .conclusion=="success")|.id' 2>/dev/null); do
+                if gh api "/repos/$REPO/actions/runs/$rid/jobs?per_page=100" \
+                     --jq '.jobs[]|select(.name=="full-suite-gate" and .conclusion=="success")|.name' 2>/dev/null \
+                     | grep -q full-suite-gate; then return 0; fi
+              done
+              return 1
+            }
+            plumbing_only() {
+              # The compare API caps files at 300, even with pagination. At
+              # that boundary completeness is unknown: require the exact SHA.
+              # A rename must also allow its OLD path, or moving code into
+              # changelog.d/ would hide its removal from the tested tree.
+              jq -e --arg base "$2" '
+                def allowed:
+                  type == "string" and
+                  (test("(^/|[\\\\\\r\\n]|(^|/)\\.\\.?(/|$)|//)") | not) and
+                  (test("^changelog[.]d/[^/]+.*$") or
+                   test("^scripts/linux-[^/]+[.]Dockerfile$") or
+                   . == ".github/workflows/release-packages.yml");
+                .status == "ahead" and .behind_by == 0 and
+                .base_commit.sha == $base and .merge_base_commit.sha == $base and
+                (.files | type == "array" and length > 0 and length < 300) and
+                all(.files[];
+                  (.filename | allowed) and
+                  (.status == "added" or .status == "modified" or
+                   .status == "removed" or
+                   (.status == "renamed" and (.previous_filename | allowed))))
+              ' <<< "$1" >/dev/null
+            }
+            if gate_green "$SHA"; then
+              echo "gate: exact SHA $SHA already has a green full-suite-gate."
+            else
+              echo "gate: no green full-tier run on $SHA — checking ancestors."
+              for cand in $(gh api "/repos/$REPO/commits?sha=$SHA&per_page=15" --jq '.[].sha' 2>/dev/null | tail -n +2); do
+                gate_green "$cand" || continue
+                echo "  ancestor $cand has a green full-suite-gate; comparing trees"
+                comparison=$(gh api "/repos/$REPO/compare/$cand...$SHA" 2>/dev/null) || continue
+                if plumbing_only "$comparison" "$cand"; then
+                  echo "    accepted — diff is release-plumbing only:"
+                  jq -r '.files[].filename | "      " + .' <<< "$comparison"
+                  GATE_SHA="$cand"
+                  break
+                fi
+              done
+              [ "$GATE_SHA" = "$SHA" ] && echo "gate: no usable ancestor — requiring a run on $SHA."
+            fi
+          fi
+          echo "gate: validating against $GATE_SHA"
+
           if [ "$MODE" = "cut-release" ]; then
             # Tag-last: no tag push fired the gate workflows, so make sure a
             # run exists on this exact commit — dispatch one if none is there.
@@ -223,17 +295,24 @@ jobs:
             # nightly. The /release skill dispatches cut_release runs on a
             # pinned release/vX.Y.Z branch for exactly that reason.
             for wf_file in "test.yml" "simctl-tests.yml"; do
+              # Only test.yml may reuse the ancestor. Simulator tests still
+              # run on the candidate, which is where dispatch below runs them.
+              WF_SHA="$SHA"
+              if [ "$wf_file" = "test.yml" ]; then
+                WF_SHA="$GATE_SHA"
+                [ "$GATE_SHA" != "$SHA" ] && continue
+              fi
               # test.yml: only a FULL-tier run counts (see the poll below), so
               # look for one of those rather than any run on the SHA -- a
               # push-to-main sweep on the same commit must not suppress the
               # dispatch.
               if [ "$wf_file" = "test.yml" ]; then
                 count=$(gh api \
-                  "/repos/$REPO/actions/workflows/$wf_file/runs?head_sha=$SHA&per_page=20" \
+                  "/repos/$REPO/actions/workflows/$wf_file/runs?head_sha=$WF_SHA&per_page=20" \
                   --jq '[.workflow_runs[] | select(.event == "workflow_dispatch" or .event == "schedule" or .event == "push" and (.head_branch | startswith("v")))] | length')
               else
                 count=$(gh api \
-                  "/repos/$REPO/actions/workflows/$wf_file/runs?head_sha=$SHA&per_page=1" \
+                  "/repos/$REPO/actions/workflows/$wf_file/runs?head_sha=$WF_SHA&per_page=1" \
                   --jq '.total_count')
               fi
               if [ "$count" = "0" ]; then
@@ -245,7 +324,7 @@ jobs:
                   echo "::error::$REF_NAME moved to $tip (this run is on $SHA) — re-dispatch on a branch pinned at the release candidate."
                   exit 1
                 fi
-                echo "No $wf_file run on $SHA yet — dispatching on $REF_NAME."
+                echo "No $wf_file run on $WF_SHA yet — dispatching on $REF_NAME."
                 if [ "$wf_file" = "test.yml" ]; then
                   # The tiered CI workflow: `tier=full` is its dispatch default,
                   # but say so explicitly -- this is the release gate.
@@ -268,6 +347,8 @@ jobs:
           # API error now gets one retry then fails the gate loudly instead
           # of burning the 45-min budget.
           for wf_file in "test.yml" "simctl-tests.yml"; do
+            WF_SHA="$SHA"
+            [ "$wf_file" = "test.yml" ] && WF_SHA="$GATE_SHA"
             echo "::group::Waiting for $wf_file"
             # 120-min budget per workflow.
             # - v0.5.876: 60 → 90 (Tests wall-time grew past 60).
@@ -290,7 +371,7 @@ jobs:
               # Tests run was green, but a tag-triggered Tests run on the
               # same SHA was newer + still running, locking the gate).
               api_out=$(gh api \
-                "/repos/$REPO/actions/workflows/$wf_file/runs?head_sha=$SHA&per_page=20" \
+                "/repos/$REPO/actions/workflows/$wf_file/runs?head_sha=$WF_SHA&per_page=20" \
                 2>&1)
               rc=$?
               set -e
@@ -572,11 +653,27 @@ jobs:
         # (which transitively needs javascriptcoregtk-6.0.pc + webkitgtk-6.0.pc
         # + libsoup-3.0.pc) and libshumate-sys (#517 MapView). Mirrors the
         # apt step in test.yml's doc-tests-gtk4 job.
-        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libunwind-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libwebkitgtk-6.0-dev libshumate-dev
+        run: |
+          # See test.yml: a broken third-party index (Chrome) fails
+          # `apt-get update` for everyone. Drop those sources by CONTENT
+          # (deb822 `.sources` now, not `.list`) and let the install gate.
+          if _bad=$(sudo grep -rlE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/ 2>/dev/null); then
+            printf '%s\n' "$_bad" | sudo xargs -r rm -f
+          fi
+          sudo apt-get update || echo "::warning::apt-get update reported errors; the install below is the real gate"
+          sudo apt-get install -y libgtk-4-dev libunwind-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libwebkitgtk-6.0-dev libshumate-dev
 
       - name: Install musl tools (Linux musl)
         if: endsWith(matrix.target, '-musl') && matrix.musl_image == ''
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        run: |
+          # See test.yml: a broken third-party index (Chrome) fails
+          # `apt-get update` for everyone. Drop those sources by CONTENT
+          # (deb822 `.sources` now, not `.list`) and let the install gate.
+          if _bad=$(sudo grep -rlE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/ 2>/dev/null); then
+            printf '%s\n' "$_bad" | sudo xargs -r rm -f
+          fi
+          sudo apt-get update || echo "::warning::apt-get update reported errors; the install below is the real gate"
+          sudo apt-get install -y musl-tools
 
       - name: Build perry
         # Build only the CLI crate; the runtime libraries are built in
@@ -1507,8 +1604,8 @@ jobs:
             perry-cross-${{ matrix.target }}.tar.gz.sha256
 
   # ---------------------------------------------------------------------------
-  # Tag-last core (cut-release mode only): every build leg is green and all
-  # nine exact npm tarballs are public + registry-verified, so NOW create the
+  # Tag-last core (cut-release mode only): every build leg is green and
+  # every exact npm tarball is public + registry-verified, so NOW create the
   # tag + GitHub Release. Release notes are cut from changelog.d/
   # fragments — same contract as scripts/cut_release_notes.sh, whose
   # --notes-only mode this job calls. The fragment-removal commit stays a
@@ -1539,18 +1636,84 @@ jobs:
           set -euo pipefail
           # Preflight checked this earlier; re-check so a concurrent manual
           # release of the same version fails here instead of clobbering.
-          if gh api "repos/$REPO/git/ref/tags/$TAG" --silent 2>/dev/null; then
-            echo "::error::tag $TAG appeared while the builds ran — aborting."
-            exit 1
+          #
+          # A tag pointing at THIS EXACT candidate is not a conflict, it is our
+          # own previous attempt: `gh release create` creates the tag and then
+          # POSTs the release, so a failure in the POST leaves the tag behind
+          # and the old unconditional abort made the job permanently
+          # unrerunnable. That is exactly what happened in run 34451289395.
+          # Abort only if the tag points somewhere else.
+          # Gate on gh's EXIT STATUS, not its stdout: on a 404 `gh api` prints
+          # the error JSON to STDOUT and exits non-zero, so capturing stdout
+          # with `|| true` yields `{"message":"Not Found",...}` rather than an
+          # empty string. That made the "tag exists at a different SHA" branch
+          # fire on the NORMAL path (tag absent) and aborted v0.5.1520's
+          # create-release with `already exists at {"message":"Not Found"...}`.
+          existing=""
+          # One request, including status headers: only an actual 404 means
+          # absent. Authentication/server failures and malformed data must
+          # not fall through to a release write. Annotated tags fail closed.
+          if tag_response=$(gh api --include "repos/$REPO/git/ref/tags/$TAG" \
+               --jq '.object | select(.type == "commit") | .sha' 2>&1); then
+            existing="${tag_response##*$'\n'}"
+            existing="${existing%$'\r'}"
+            if [[ ! "$existing" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::tag $TAG returned no valid commit SHA — aborting." >&2
+              exit 1
+            fi
+          else
+            http_status="${tag_response%%$'\n'*}"
+            if [[ ! "$http_status" =~ ^HTTP/[0-9.]+\ 404([[:space:]]|$) ]]; then
+              echo "::error::could not determine whether tag $TAG exists — aborting." >&2
+              exit 1
+            fi
           fi
-          ./scripts/cut_release_notes.sh --notes-only > /tmp/release-notes.md
+          reuse_tag=0
+          if [ -n "$existing" ]; then
+            if [ "$existing" != "$SHA" ]; then
+              echo "::error::tag $TAG already exists at $existing, not the candidate $SHA — aborting." >&2
+              exit 1
+            fi
+            echo "tag $TAG already exists at the exact candidate $SHA (previous attempt) — reusing it."
+            reuse_tag=1
+          fi
+
+          ./scripts/cut_release_notes.sh --notes-only > /tmp/release-notes-full.md
+          # GitHub rejects a release body over 125,000 characters with
+          # `HTTP 422: body is too long`. v0.5.1519 carried 1505 changelog.d
+          # fragments -- the first tag since v0.5.1220 on 2026-07-04 -- and
+          # generated 2.8 MB of notes. The POST failed AFTER the tag was
+          # created, which is the worst place for it to fail.
+          LIMIT=120000
+          if [ "$(wc -c < /tmp/release-notes-full.md)" -gt "$LIMIT" ]; then
+            frags=$(find changelog.d -name '*.md' ! -name 'README.md' | wc -l | tr -d ' ')
+            # Cut on a line boundary so the body never ends mid-sentence.
+            head -c "$LIMIT" /tmp/release-notes-full.md | sed '$d' > /tmp/release-notes.md
+            {
+              echo
+              echo '---'
+              echo
+              echo "**These notes are truncated.** This release carries ${frags} changelog"
+              echo "fragments and the full text exceeds GitHub's 125,000-character limit for a"
+              echo "release body. The complete set is in \`changelog.d/\` at [\`$TAG\`](https://github.com/$REPO/tree/$TAG/changelog.d)."
+            } >> /tmp/release-notes.md
+            echo "::notice::release notes truncated from $(wc -c < /tmp/release-notes-full.md) to $(wc -c < /tmp/release-notes.md) bytes (${frags} fragments)"
+          else
+            cp /tmp/release-notes-full.md /tmp/release-notes.md
+          fi
           # Created with GITHUB_TOKEN: GitHub suppresses events triggered by a
           # workflow's own token, so this `release: published` does NOT fire a
           # second release-packages run (publishing continues in THIS run),
           # and the tag emits no `push: tags` event either — the step below
           # dispatches the tag-rider workflows explicitly.
-          gh release create "$TAG" -R "$REPO" \
-            --target "$SHA" --title "$TAG" --notes-file /tmp/release-notes.md
+          if [ "$reuse_tag" -eq 1 ]; then
+            # The tag already exists at this SHA; do not pass --target.
+            gh release create "$TAG" -R "$REPO" \
+              --title "$TAG" --notes-file /tmp/release-notes.md
+          else
+            gh release create "$TAG" -R "$REPO" \
+              --target "$SHA" --title "$TAG" --notes-file /tmp/release-notes.md
+          fi
           echo "Created release $TAG at $SHA"
 
       - name: Dispatch tag-rider workflows (docs, benchmark, container-tests)
@@ -2136,7 +2299,7 @@ jobs:
   #
   # Uses OIDC / Trusted Publishers (no npm login, long-lived NPM_TOKEN, or
   # GitHub Environment). release-packages.yml is the one publisher identity
-  # shared by all nine @perryts/* packages.
+  # shared by every @perryts/* package.
   # ---------------------------------------------------------------------------
   npm-publish:
     # The irreversible leg. Every build must be green in canonical cut-release
@@ -2224,16 +2387,66 @@ jobs:
       - name: Bundle exact npm publication proofs
         run: |
           set -euo pipefail
-          mapfile -t proofs < <(find npm -mindepth 2 -maxdepth 2 -type f -name '*.tgz' | sort)
-          if [ "${#proofs[@]}" -ne 9 ]; then
-            echo "::error::Expected 9 exact npm tarballs; found ${#proofs[@]}." >&2
-            printf '  %s\n' "${proofs[@]}" >&2
+          # The expected set is DERIVED from the manifest the previous step
+          # generates from ALL_PACKAGES (scripts/publish/constants.mts) and
+          # already validates against it. This used to hardcode `9`, which went
+          # silently wrong when the musl legs were dropped pending #9382:
+          # ALL_PACKAGES became 6 platforms + wrapper = 7, stage-npm staged 6,
+          # prepare-ci-packages packed 7 and PASSED its own check -- and then
+          # this step failed the release with "Expected 9; found 7" AFTER a
+          # fully green 14-leg build (run 34438751300). Two expressions of the
+          # same fact, one of which nobody updated.
+          #
+          # Checked BY NAME, not by a count: a count cannot say WHICH package is
+          # missing, and that is the whole question when this fires. The count
+          # equality below still catches a stray EXTRA tarball.
+          # `while read` rather than `mapfile`: mapfile is bash 4+, and keeping
+          # this to bash 3.2 means it can be run and tested on a developer
+          # machine instead of only on a runner. This step failed a release once
+          # already; an untestable version of it is not an improvement.
+          proofs=()
+          while IFS= read -r line; do proofs+=("$line"); done \
+            < <(find npm -mindepth 2 -maxdepth 2 -type f -name '*.tgz' | sort)
+          want=()
+          while IFS= read -r line; do want+=("$line"); done < <(node -e '
+            const m = require("./npm-publish-manifest.json")
+            for (const p of m.packages) {
+              console.log(p.name.replace(/^@/, "").replace(/\//g, "-") + "-" + p.version + ".tgz")
+            }
+          ')
+          if [ "${#want[@]}" -lt 2 ]; then
+            echo "::error::manifest lists ${#want[@]} package(s); refusing to publish a set that small." >&2
             exit 1
           fi
+          missing=""
+          for w in ${want[@]+"${want[@]}"}; do
+            hit=0
+            for p in ${proofs[@]+"${proofs[@]}"}; do
+              if [ "$(basename "$p")" = "$w" ]; then hit=1; break; fi
+            done
+            if [ "$hit" -eq 0 ]; then missing="$missing $w"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::manifest package(s) have no packed tarball:$missing" >&2
+            printf '  on disk: %s\n' ${proofs[@]+"${proofs[@]}"} >&2
+            exit 1
+          fi
+          if [ "${#proofs[@]}" -ne "${#want[@]}" ]; then
+            echo "::error::found ${#proofs[@]} tarball(s) but the manifest lists ${#want[@]}; an unexpected tarball is present." >&2
+            printf '  on disk: %s\n' ${proofs[@]+"${proofs[@]}"} >&2
+            exit 1
+          fi
+          echo "${#want[@]} exact tarballs match the manifest by name."
           tar -cf npm-publish-package-proofs.tar \
             npm-publish-manifest.json socket-scan-receipt.json "${proofs[@]}"
 
       - name: npm publish exact tarballs (OIDC; platforms first, wrapper last)
+        env:
+          # How long to wait for npm publish-time scanning to make the platform
+          # packages visible before giving up. Generous on purpose: a timeout
+          # here is a resumable rerun, while publishing the wrapper too early
+          # is not recoverable (npm versions are immutable).
+          VISIBILITY_WAIT_MIN: "45"
         # No npm login and no NPM_TOKEN. npm exchanges this job's short-lived
         # GitHub OIDC identity because id-token:write is set above. Reruns skip
         # an already-public version only when its immutable registry sha1 is
@@ -2249,10 +2462,44 @@ jobs:
 
           failed=""
           while IFS=$'\t' read -r name version tarball expected_sha; do
-            if [ "$name" = "@perryts/perry" ] && [ -n "$failed" ]; then
-              echo "::error::Not publishing the wrapper because platform publication failed:$failed" >&2
-              failed="$failed $name@$version (blocked by platform failure)"
-              continue
+            if [ "$name" = "@perryts/perry" ]; then
+              if [ -n "$failed" ]; then
+                echo "::error::Not publishing the wrapper because platform publication failed:$failed" >&2
+                failed="$failed $name@$version (blocked by platform failure)"
+                continue
+              fi
+              # npm can report a successful publish that never lands. On
+              # 2026-09-10 it printed "+ @perryts/perry-linux-x64@0.5.1519",
+              # exited 0 and signed provenance, while leaving the version
+              # STAGED: invisible (404, absent from the packument's `time`
+              # map) and un-republishable (E409 on every retry). The guard
+              # above trusted that exit code, so the wrapper shipped as
+              # `latest` with a platform dependency that did not resolve, and
+              # v0.5.1519 could not be completed at all.
+              #
+              # So do not take npm's word for it. Before the wrapper goes out,
+              # confirm every platform package is REALLY in the registry. The
+              # `time` map is the authoritative signal here: `npm view` and the
+              # publish exit status both reported success for a version npm had
+              # no record of.
+              # npm's publish-time scanning can hold a large binary for a
+              # long time -- its own notice says "may take longer than usual"
+              # and gives itself 24 h. So poll ROUND-ROBIN against a single
+              # global deadline rather than giving each package its own short
+              # budget: the packages settle in parallel, so a per-package
+              # timeout would fail the normal slow case while adding nothing
+              # for the broken one.
+              #
+              # Timing out here is SAFE and resumable. The platform packages
+              # are already published; a rerun skips them on matching sha1 and
+              # waits again. What must never happen is the wrapper going out
+              # over a platform that is not really there.
+              echo "=== verifying every platform package is visible before publishing the wrapper ==="
+              if ! node scripts/publish/platform-visibility.mjs npm-publish-manifest.json; then
+                echo "::error::Refusing to publish the wrapper: platform visibility verification failed. Rerun this job to resume." >&2
+                failed="$failed $name@$version (platform visibility failed)"
+                continue
+              fi
             fi
 
             public_sha=$(npm view "$name@$version" dist.shasum 2>/dev/null | tr -d '[:space:]' || true)
@@ -2294,7 +2541,7 @@ jobs:
             exit 1
           fi
 
-      - name: Verify all nine public registry shasums
+      - name: Verify every public registry shasum
         # npm's CDN can lag a successful PUT. Wait briefly, but a different
         # sha1 fails immediately because published versions are immutable.
         run: |
@@ -2319,7 +2566,7 @@ jobs:
               }
             ')
             if [ -z "$waiting" ]; then
-              echo "All nine exact npm tarballs are public and verified. The tag may now be created."
+              echo "Every exact npm tarball is public and verified. The tag may now be created."
               break
             fi
             if [ "$SECONDS" -ge "$deadline" ]; then

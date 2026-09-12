@@ -19,6 +19,8 @@ mod proto_dispatch;
 mod string_methods;
 
 #[cfg(test)]
+mod closure_override_tests;
+#[cfg(test)]
 mod code_point_at_dispatch_tests;
 #[cfg(test)]
 mod dispatch_arg_coercion_tests;
@@ -1716,22 +1718,45 @@ pub unsafe extern "C-unwind" fn js_native_call_method(
         if crate::value::addr_class::is_above_handle_band(raw_addr)
             && crate::closure::is_closure_ptr(raw_addr)
             && !crate::closure::closure_is_key_deleted(raw_addr, method_name)
-            // apply/call/bind/toString on a closure receiver have dedicated
-            // spec-accurate arms below; the dynamic-prop read would resolve
-            // them through the Function.prototype expando fallback to the
-            // GENERIC thunks, which lose arguments-object argArrays
-            // (`G.apply(this, arguments)`).
-            && !matches!(method_name, "apply" | "call" | "bind" | "toString")
         {
-            let dyn_val = crate::closure::closure_get_dynamic_prop(raw_addr, method_name);
-            if dyn_val.to_bits() != crate::value::TAG_UNDEFINED {
+            // #10045: own overrides (including AsyncResource.bind) beat the
+            // Function.prototype fast paths. Keep those fast paths on a miss:
+            // the generic prototype thunks lose arguments-object argArrays
+            // (`G.apply(this, arguments)`). An own undefined/non-callable slot
+            // is not a miss: invoking it must throw instead of using a builtin.
+            let intrinsic_name = matches!(method_name, "apply" | "call" | "bind" | "toString");
+            let own_override = intrinsic_name
+                && (crate::closure::closure_has_own_dynamic_prop(raw_addr, method_name)
+                    || crate::object::get_accessor_descriptor(raw_addr, method_name).is_some());
+            let dyn_val = if !intrinsic_name || own_override {
+                crate::closure::closure_get_dynamic_prop(raw_addr, method_name)
+            } else {
+                f64::from_bits(crate::value::TAG_UNDEFINED)
+            };
+            if dyn_val.to_bits() != crate::value::TAG_UNDEFINED || own_override {
+                let dyn_val = root_scope.root_nanbox_f64(dyn_val);
+                // The permissive value-call bridge returns undefined for
+                // nullish callees. A member invocation must instead reject a
+                // non-callable own value. The prototype-object probe may
+                // allocate, so keep the resolved method in a mutable root.
+                if own_override
+                    && !crate::proxy::proxy_wraps_callable(dyn_val.get_nanbox_f64())
+                    && !crate::object::is_function_prototype_object_value(dyn_val.get_nanbox_f64())
+                {
+                    crate::error::js_throw_type_error_not_a_function(
+                        std::ptr::null(),
+                        0,
+                        method_name.as_ptr(),
+                        method_name.len(),
+                    );
+                }
                 // #6438: same rebind as the GC_TYPE_CLOSURE arm below —
                 // `closure_get_dynamic_prop` may return a method read off the
                 // closure's `Object.setPrototypeOf` proto, whose bound `this`
                 // (an object-literal method binds the literal) would otherwise
                 // win over IMPLICIT_THIS and leave `this` as the PROTO.
                 let bound = crate::closure::clone_closure_rebind_this(
-                    dyn_val.to_bits(),
+                    dyn_val.get_nanbox_u64(),
                     f64::from_bits(object().to_bits()),
                 );
                 // #8495: root the displaced receiver across the call below — the
@@ -1747,11 +1772,19 @@ pub unsafe extern "C-unwind" fn js_native_call_method(
                 // introduced `refreshed_args` and reached ten sites but not
                 // this one.
                 let call_args = refreshed_args();
-                let result = crate::closure::js_native_call_value(
-                    f64::from_bits(bound),
-                    call_args.as_ptr(),
-                    call_args.len(),
-                );
+                let result = if crate::proxy::js_proxy_is_proxy(f64::from_bits(bound)) == 1 {
+                    crate::proxy::call_proxy_value_with_this(
+                        f64::from_bits(bound),
+                        object(),
+                        &call_args,
+                    )
+                } else {
+                    crate::closure::js_native_call_value(
+                        f64::from_bits(bound),
+                        call_args.as_ptr(),
+                        call_args.len(),
+                    )
+                };
                 IMPLICIT_THIS.with(|c| c.set(prev_this_h.get_nanbox_u64()));
                 return result;
             }

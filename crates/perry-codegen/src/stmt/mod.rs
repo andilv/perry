@@ -12,6 +12,9 @@ use crate::native_value::{LoweredValue, MaterializationReason};
 use crate::types::DOUBLE;
 
 #[cfg(test)]
+mod boxed_continuation_tests;
+mod boxed_local_init;
+#[cfg(test)]
 mod boxed_slot_no_root_tests;
 mod cached_field_index_return;
 #[cfg(test)]

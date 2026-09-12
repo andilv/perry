@@ -110,7 +110,9 @@ jobs:
           persist-credentials: false
 
       - name: Self-test the planner
-        run: python3 scripts/ci_plan.py --self-test
+        run: |
+          python3 scripts/ci_plan.py --self-test
+          python3 scripts/ci_pr_files.py --self-test
 
       - name: List changed files (pull_request only)
         if: github.event_name == 'pull_request'
@@ -118,13 +120,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           # An API failure aborts here (set -e), which fails `plan` and with it
           # the gate. It must NOT fall through to an empty list: ci_plan.py
           # treats an empty listing as `core` for the same reason, but a
           # loud failure is better than a silent full run.
-          gh api "repos/$REPOSITORY/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename' > changed-files.txt
+          python3 scripts/ci_pr_files.py "$REPOSITORY" "$PR_NUMBER" \
+            --expected-head "$PR_HEAD_SHA" > changed-files.txt
           echo "Changed files ($(wc -l < changed-files.txt)):"
           sed 's/^/  /' changed-files.txt
 
@@ -213,6 +217,11 @@ jobs:
       - name: Validate Windows LLVM runtime npm staging
         run: ./tests/test_stage_npm_windows_llvm.sh
 
+      - name: Release pipeline failure-path regressions
+        run: |
+          python3 tests/test_release_pipeline.py
+          node --test scripts/publish/platform-visibility.test.mjs
+
       - name: Install Rust toolchain
         run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt --component clippy
       - uses: ./.github/actions/setup-llvm22
@@ -237,6 +246,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           python3 scripts/ci_plan.py --self-test
+          python3 scripts/ci_pr_files.py --self-test
           python3 scripts/ci_cargo_test_shard.py --self-test
           python3 scripts/ci_cargo_test_shard.py --package perry \
             --total-shards "${{ fromJSON(needs.plan.outputs.plan).cargo_test_perry.total }}" \
@@ -1047,8 +1057,11 @@ jobs:
           # test builds accumulated in target/debug.
           CARGO_PROFILE_TEST_DEBUG: "0"
           CARGO_PROFILE_DEV_DEBUG: "0"
-          # For `gh pr view` (PR changed-file list → affected-crate scope).
+          # Complete, expected-head-pinned PR changed-file list for crate scope.
           GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           (
             while sleep 60; do
@@ -1065,8 +1078,8 @@ jobs:
           # workflow_dispatch run the FULL workspace as the safety net. See
           # scripts/ci_test_scope.py for the rules.
           if [ "${{ fromJSON(needs.plan.outputs.plan).cargo_test_scope }}" = "pr" ]; then
-            changed_files="$(gh pr view "${{ github.event.pull_request.number }}" \
-              --json files --jq '.files[].path')"
+            changed_files="$(python3 scripts/ci_pr_files.py "$REPOSITORY" "$PR_NUMBER" \
+              --expected-head "$PR_HEAD_SHA")"
             echo "Changed files in PR:"; printf '%s\n' "$changed_files"
             scope="$(printf '%s\n' "$changed_files" | python3 scripts/ci_test_scope.py)"
           else
@@ -1388,10 +1401,13 @@ jobs:
         id: scope
         env:
           GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           python3 scripts/ci_e2e_scope.py --self-test
-          changed_files="$(gh pr view "${{ github.event.pull_request.number }}" \
-            --json files --jq '.files[].path')"
+          changed_files="$(python3 scripts/ci_pr_files.py "$REPOSITORY" "$PR_NUMBER" \
+            --expected-head "$PR_HEAD_SHA")"
           suites="$(printf '%s\n' "$changed_files" | python3 scripts/ci_e2e_scope.py)"
           # #7708/#8266: selected suites skip held-out tests, while a separate
           # scope-independent step below asserts every held-out test still
@@ -1419,6 +1435,22 @@ jobs:
               echo 'PERRY_EOF'
             } >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Setup pinned Node.js for scoped native oracles
+        if: steps.scope.outputs.rust_work == 'true'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .node-version
+
+      - name: Verify scoped Node oracle before native builds
+        if: steps.scope.outputs.rust_work == 'true'
+        run: |
+          node --input-type=module -e '
+            import assert from "node:assert/strict";
+            import fs from "node:fs";
+            const expected = fs.readFileSync(".node-version", "utf8").trim().replace(/^v/, "");
+            assert.equal(process.versions.node, expected, "Scoped native tests require the pinned Node oracle");
+          '
 
       - name: Install Rust toolchain
         if: steps.scope.outputs.rust_work == 'true'
@@ -1452,6 +1484,12 @@ jobs:
         if: steps.scope.outputs.rust_work == 'true'
         run: rm -rf target/perry-auto-* target/debug/libperry_ext_*.a 2>/dev/null || true
 
+      - name: Install the pinned integration-test Node oracle
+        if: steps.scope.outputs.suites != ''
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .node-version
+
       - name: Run scoped integration suites
         if: steps.scope.outputs.suites != ''
         env:
@@ -1475,10 +1513,10 @@ jobs:
           # RFC-2945 abort guards that a JS throw trips — the opposite of the
           # shipped semantics. See the longer note in `cargo-test`.
           if printf '%s\n' "$SUITES" | grep -qE '^(perry|perry-stdlib) '; then
-            if printf '%s\n' "$SUITES" | grep -qE '^perry (bun_text_modules|import_meta_require_value) '; then
+            if printf '%s\n' "$SUITES" | grep -qE '^perry (bun_text_modules|bun_embedded_compression|import_meta_require_value|minsize_inline_policy|child_output_late_iterator|async_resource_own_bind) '; then
               # Prepare all require providers in one graph, outside the fixture's
               # timeout. A second perry-dev graph inside cargo test exceeded its
-              # ten-minute bound on fresh runners (#9989/#9990).
+              # ten-minute bound on fresh runners (#9989/#9990/#10076).
               cargo build --release -p perry -p perry-runtime -p perry-stdlib \
                 -p perry-runtime-static -p perry-stdlib-static \
                 -p perry-ext-events -p perry-ext-http -p perry-ext-net \
@@ -1804,7 +1842,21 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install clang
         run: |
-          sudo apt-get update
+          # Third-party sources we never install from can fail `apt-get update`,
+          # which exits non-zero if ANY source fails -- a broken Chrome index has
+          # now reddened jobs that only want clang in three separate runs
+          # (34383689667, 34384580491, 34386043331). Two lessons are baked in here:
+          #
+          #   1. Match by CONTENT, not filename. The ubuntu24/20260907.300 image
+          #      moved these to deb822 `.sources` files, so removing
+          #      `google-chrome.list` removed nothing and the job still failed.
+          #   2. Let the INSTALL be the gate. `apt-get update`'s exit status
+          #      aggregates sources we care about with sources we do not; if the
+          #      packages we came for resolve, the update did its job.
+          if _bad=$(sudo grep -rlE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/ 2>/dev/null); then
+            printf '%s\n' "$_bad" | sudo xargs -r rm -f
+          fi
+          sudo apt-get update || echo "::warning::apt-get update reported errors; the install below is the real gate"
           sudo apt-get install -y clang
       - name: Build perry + runtime staticlibs (release)
         env:
@@ -1854,7 +1906,21 @@ jobs:
           save-if: false
       - name: Install clang
         run: |
-          sudo apt-get update
+          # Third-party sources we never install from can fail `apt-get update`,
+          # which exits non-zero if ANY source fails -- a broken Chrome index has
+          # now reddened jobs that only want clang in three separate runs
+          # (34383689667, 34384580491, 34386043331). Two lessons are baked in here:
+          #
+          #   1. Match by CONTENT, not filename. The ubuntu24/20260907.300 image
+          #      moved these to deb822 `.sources` files, so removing
+          #      `google-chrome.list` removed nothing and the job still failed.
+          #   2. Let the INSTALL be the gate. `apt-get update`'s exit status
+          #      aggregates sources we care about with sources we do not; if the
+          #      packages we came for resolve, the update did its job.
+          if _bad=$(sudo grep -rlE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/ 2>/dev/null); then
+            printf '%s\n' "$_bad" | sudo xargs -r rm -f
+          fi
+          sudo apt-get update || echo "::warning::apt-get update reported errors; the install below is the real gate"
           sudo apt-get install -y clang
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
@@ -1936,7 +2002,21 @@ jobs:
           save-if: false
       - name: Install clang
         run: |
-          sudo apt-get update
+          # Third-party sources we never install from can fail `apt-get update`,
+          # which exits non-zero if ANY source fails -- a broken Chrome index has
+          # now reddened jobs that only want clang in three separate runs
+          # (34383689667, 34384580491, 34386043331). Two lessons are baked in here:
+          #
+          #   1. Match by CONTENT, not filename. The ubuntu24/20260907.300 image
+          #      moved these to deb822 `.sources` files, so removing
+          #      `google-chrome.list` removed nothing and the job still failed.
+          #   2. Let the INSTALL be the gate. `apt-get update`'s exit status
+          #      aggregates sources we care about with sources we do not; if the
+          #      packages we came for resolve, the update did its job.
+          if _bad=$(sudo grep -rlE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/ 2>/dev/null); then
+            printf '%s\n' "$_bad" | sudo xargs -r rm -f
+          fi
+          sudo apt-get update || echo "::warning::apt-get update reported errors; the install below is the real gate"
           sudo apt-get install -y clang
       - name: Download shared GC matrix build
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -2032,7 +2112,21 @@ jobs:
 
       - name: Install clang
         run: |
-          sudo apt-get update
+          # Third-party sources we never install from can fail `apt-get update`,
+          # which exits non-zero if ANY source fails -- a broken Chrome index has
+          # now reddened jobs that only want clang in three separate runs
+          # (34383689667, 34384580491, 34386043331). Two lessons are baked in here:
+          #
+          #   1. Match by CONTENT, not filename. The ubuntu24/20260907.300 image
+          #      moved these to deb822 `.sources` files, so removing
+          #      `google-chrome.list` removed nothing and the job still failed.
+          #   2. Let the INSTALL be the gate. `apt-get update`'s exit status
+          #      aggregates sources we care about with sources we do not; if the
+          #      packages we came for resolve, the update did its job.
+          if _bad=$(sudo grep -rlE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/ 2>/dev/null); then
+            printf '%s\n' "$_bad" | sudo xargs -r rm -f
+          fi
+          sudo apt-get update || echo "::warning::apt-get update reported errors; the install below is the real gate"
           sudo apt-get install -y clang
 
       - name: Build compiler
@@ -2412,7 +2506,21 @@ jobs:
 
       - name: Install clang
         run: |
-          sudo apt-get update
+          # Third-party sources we never install from can fail `apt-get update`,
+          # which exits non-zero if ANY source fails -- a broken Chrome index has
+          # now reddened jobs that only want clang in three separate runs
+          # (34383689667, 34384580491, 34386043331). Two lessons are baked in here:
+          #
+          #   1. Match by CONTENT, not filename. The ubuntu24/20260907.300 image
+          #      moved these to deb822 `.sources` files, so removing
+          #      `google-chrome.list` removed nothing and the job still failed.
+          #   2. Let the INSTALL be the gate. `apt-get update`'s exit status
+          #      aggregates sources we care about with sources we do not; if the
+          #      packages we came for resolve, the update did its job.
+          if _bad=$(sudo grep -rlE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/ 2>/dev/null); then
+            printf '%s\n' "$_bad" | sudo xargs -r rm -f
+          fi
+          sudo apt-get update || echo "::warning::apt-get update reported errors; the install below is the real gate"
           sudo apt-get install -y clang
 
       - name: Gate native ABI evidence packet
@@ -3324,7 +3432,21 @@ jobs:
 
       - name: Install mysql client (for fixture health probe)
         run: |
-          sudo apt-get update -qq
+          # Third-party sources we never install from can fail `apt-get update`,
+          # which exits non-zero if ANY source fails -- a broken Chrome index has
+          # now reddened jobs that only want clang in three separate runs
+          # (34383689667, 34384580491, 34386043331). Two lessons are baked in here:
+          #
+          #   1. Match by CONTENT, not filename. The ubuntu24/20260907.300 image
+          #      moved these to deb822 `.sources` files, so removing
+          #      `google-chrome.list` removed nothing and the job still failed.
+          #   2. Let the INSTALL be the gate. `apt-get update`'s exit status
+          #      aggregates sources we care about with sources we do not; if the
+          #      packages we came for resolve, the update did its job.
+          if _bad=$(sudo grep -rlE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/ 2>/dev/null); then
+            printf '%s\n' "$_bad" | sudo xargs -r rm -f
+          fi
+          sudo apt-get update -qq || echo "::warning::apt-get update reported errors; the install below is the real gate"
           sudo apt-get install -y -qq mysql-client
 
       - name: Wait for MySQL service to accept connections
@@ -3609,7 +3731,21 @@ jobs:
       - name: Install GTK4 + GStreamer + Xvfb + PulseAudio headers (Linux)
         if: matrix.os == 'ubuntu-24.04'
         run: |
-          sudo apt-get update
+          # Third-party sources we never install from can fail `apt-get update`,
+          # which exits non-zero if ANY source fails -- a broken Chrome index has
+          # now reddened jobs that only want clang in three separate runs
+          # (34383689667, 34384580491, 34386043331). Two lessons are baked in here:
+          #
+          #   1. Match by CONTENT, not filename. The ubuntu24/20260907.300 image
+          #      moved these to deb822 `.sources` files, so removing
+          #      `google-chrome.list` removed nothing and the job still failed.
+          #   2. Let the INSTALL be the gate. `apt-get update`'s exit status
+          #      aggregates sources we care about with sources we do not; if the
+          #      packages we came for resolve, the update did its job.
+          if _bad=$(sudo grep -rlE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/ 2>/dev/null); then
+            printf '%s\n' "$_bad" | sudo xargs -r rm -f
+          fi
+          sudo apt-get update || echo "::warning::apt-get update reported errors; the install below is the real gate"
           # libgstreamer1.0-dev + libgstreamer-plugins-base1.0-dev added in
           # v0.5.442 for PR #371 (perry/media streaming playback, #351).
           # gstreamer-sys's build script needs `gstreamer-1.0.pc` findable

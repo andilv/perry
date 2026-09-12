@@ -386,6 +386,8 @@ pub(crate) fn lower_let(
     // reuse guard must consider the rep map too, or a redeclaration would
     // re-run the allocation path and leave the local with two slots.
     if ctx.locals.contains_key(&id) || ctx.local_slot_reps.contains_key(&id) {
+        // #10048: materialize a missing continuation cell before its initializer.
+        super::boxed_local_init::ensure_reused_box_is_initialized(ctx, id);
         if let Some(init_expr) = init {
             // The binding's OWN declaration ends its Temporal Dead Zone: the
             // reused-slot write below (plain, unchecked) overwrites any TAG_TDZ
