@@ -55,13 +55,22 @@ build, while still failing loudly (and catchably) if that path runs.
 
 ### Dynamic `import()` with a runtime-computed specifier (#5230)
 
-A dynamic `import(spec)` whose `spec` is only known at runtime (a plugin loader
+For code modules, a dynamic `import(spec)` whose `spec` is only known at runtime (a plugin loader
 building a path from a variable) is subject to the **same defer/notice/strict
 policy** as `eval`. By default it compiles to a rejected `Promise` carrying a
 descriptive `Error` (so `await import(spec)` throws *only if reached*), is
 listed in the shared notice above under the `import(...)` kind, and does **not**
 abort the build. This lets an app with a plugin-loader path compile and run its
 core, with only the plugin-load path throwing if exercised.
+
+If the runtime specifier names a supported Node builtin, Perry resolves its
+native namespace. Otherwise, when it has no compiled target, the rejected
+`Error` retains `code: "ERR_MODULE_NOT_FOUND"` for existing optional-dependency
+handlers. Its message names the requested module, explains that runtime-loaded
+JavaScript is unavailable in the native build, and suggests the application's
+Bun/Node distribution or a statically resolvable import followed by recompilation.
+Deferred sites also retain their source location. Perry does not print a second
+runtime warning: the application's catch/report path owns the diagnostic.
 
 Resolvable specifiers are unaffected and still compile + load: string literals
 (`import("./mod.js")`), ternaries of resolvable arms, template literals over
@@ -77,6 +86,54 @@ async function loadPlugin(name: string) {
   return await import(name + ".js");
 }
 ```
+
+#### Native OpenCode plugins (#10105)
+
+The first native OpenCode deliverable follows **option A** from
+[#10105](https://github.com/PerryTS/perry/issues/10105), tracked in
+[#10107](https://github.com/PerryTS/perry/issues/10107): runtime-installed npm
+plugins, local JS/TS/TSX plugins (including TUI plugins), custom tools, and provider
+SDKs absent from the compiled graph are unavailable. Installing a package after
+compilation does not add its code to the executable. Bundled providers reached
+through static imports remain supported.
+
+Use the Bun distribution when those extensions are required. Including extensions
+in a statically reachable import graph and recompiling is a build-time option;
+there is currently no automatic plugin-pack install/recompile command. A whole
+ESM/CJS module interpreter (option B) and plugin-pack compilation/loading (option C)
+are deferred decisions, not capabilities enabled by the existing dynamic-eval
+interpreter. Runtime data imports such as TOML are a separate feature (#10104).
+
+OpenCode v1.18.30's `PluginLoader.load` catches import rejections, and its caller
+reports a load failure without retrying that stage. The TUI plugin reporter
+includes `error.message`, so it can explain the native limitation and continue
+startup. Perry's regression test covers that minimized loader/report/startup
+contract with `plugin: ["some-npm-plugin"]`, one report, and successful builtin and
+bundled imports afterward. Full OpenTUI rendering remains part of the integration
+acceptance in #10107.
+
+Data files can be loaded at runtime using import attributes (#10104). The
+specifier must be an absolute filesystem path or a `file://` URL, and the
+result has a `default` export:
+
+| Import attribute `type` | Default export |
+|---|---|
+| `"toml"` | Parsed TOML table, using the same parser as `Bun.TOML.parse` |
+| `"json"` | Parsed JSON value |
+| `"text"` | File contents as a string |
+| `"file"` | Filesystem path as a string |
+
+```typescript,no-test
+import { pathToFileURL } from "node:url";
+const { default: config } = await import(pathToFileURL(configPath).href, {
+  with: { type: "toml" },
+});
+```
+
+TOML and JSON parse failures reject with `SyntaxError`. Missing files reject
+with an I/O error. These loaders do not load runtime code modules or resolve
+relative paths, package names, or network URLs. Strict mode still rejects
+runtime-computed specifiers at compile time as described below.
 
 ### Strict mode: refuse at compile time
 

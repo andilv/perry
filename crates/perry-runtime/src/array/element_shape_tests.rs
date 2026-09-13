@@ -108,7 +108,7 @@ fn a_scan_establishes_the_invariant_for_an_array_built_outside_the_funnels() {
     // fresh allocation: nothing establishes the invariant on the way in.
     let arr = js_array_alloc(4);
     unsafe {
-        let elements = (arr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut u64;
+        let elements = crate::array::array_elements_ptr(arr as *const ArrayHeader) as *mut u64;
         for i in 0..4 {
             // GC_STORE_AUDIT(INIT): fresh `js_array_alloc(4)` slots, filled the
             // way an inline array literal's codegen fills them — the point of
@@ -345,8 +345,8 @@ fn a_length_change_behind_the_runtimes_back_fails_the_proof_closed() {
 #[test]
 fn a_bulk_mutator_rebuild_clears_the_invariant() {
     let _serialized = test_serialize();
-    // `shift`/`unshift`/`splice`/`fill`/`copyWithin`/`reverse`/`sort` all
-    // mutate slots with bare writes and then land in `rebuild_array_layout`.
+    // Bulk mutators that land in `rebuild_array_layout` must revoke the proof;
+    // splice/unshift have the same obligation through their dense-move helper.
     let arr = built_from_pushes(CLASS_A, 4);
     assert!(proof(arr).is_some());
     unsafe { crate::array::header::rebuild_array_layout(arr) };

@@ -290,13 +290,31 @@ fn format_function_for_console(closure_ptr: *const crate::closure::ClosureHeader
             registered_name_string(func_ptr as usize).filter(|n| !n.is_empty())
         }
     };
-    let label = match registry_name.or_else(|| {
-        props
-            .iter()
-            .find(|(k, _)| k == "name")
-            .and_then(|(_, v)| jsvalue_string_content(*v))
-            .filter(|n| !n.is_empty())
-    }) {
+    let label = match registry_name
+        .or_else(|| {
+            props
+                .iter()
+                .find(|(k, _)| k == "name")
+                .and_then(|(_, v)| jsvalue_string_content(*v))
+                .filter(|n| !n.is_empty())
+        })
+        .or_else(|| {
+            // #10084: a `Function.prototype.bind` result's `.name` is built
+            // lazily and so may be absent from both the func-ptr registry
+            // (bound closures share the `BOUND_FUNCTION_FUNC_PTR` sentinel,
+            // never registered with a per-instance name) and the `props`
+            // snapshot above (taken before any read materialized it).
+            // Synthesize (and cache) it the same way any other reader of
+            // `.name` would.
+            unsafe {
+                ((*closure_ptr).func_ptr == crate::closure::BOUND_FUNCTION_FUNC_PTR).then(|| {
+                    jsvalue_string_content(crate::closure::bound_function_lazy_name(
+                        closure_ptr as usize,
+                    ))
+                })
+            }
+            .flatten()
+        }) {
         Some(name) => format!("[Function: {name}]"),
         None => "[Function (anonymous)]".to_string(),
     };
@@ -685,9 +703,9 @@ pub(crate) fn format_jsvalue(value: f64, depth: usize) -> String {
                         };
                         return inspect_finish_circular(ptr as usize, empty);
                     }
-                    let data_ptr = (maybe_arr as *const u8)
-                        .add(std::mem::size_of::<crate::array::ArrayHeader>())
-                        as *const f64;
+                    let data_ptr = crate::array::array_elements_ptr(
+                        maybe_arr as *const crate::array::ArrayHeader,
+                    ) as *const f64;
                     // #9415: a hole slot is `TAG_HOLE`, whose bits read back as
                     // a NaN, so element-by-element recursion printed
                     // `new Array(3)` as `[ NaN, NaN, NaN ]`. Runs of holes are
@@ -815,7 +833,7 @@ unsafe fn format_buffer_value(buf_ptr: *const crate::buffer::BufferHeader) -> St
         return "<Buffer >".to_string();
     }
     let len = (*buf_ptr).length as usize;
-    let data = (buf_ptr as *const u8).add(std::mem::size_of::<crate::buffer::BufferHeader>());
+    let data = crate::buffer::buffer_data(buf_ptr as *const crate::buffer::BufferHeader);
     let bytes = std::slice::from_raw_parts(data, len);
 
     // If this buffer was created via `new Uint8Array(...)`, format it Node-style
@@ -1418,9 +1436,9 @@ fn format_jsvalue_for_json(value: f64, depth: usize) -> String {
                         if length > 1_000_000 {
                             return inspect_finish_circular(ptr as usize, "[Array]".to_string());
                         }
-                        let data_ptr = (maybe_arr as *const u8)
-                            .add(std::mem::size_of::<crate::array::ArrayHeader>())
-                            as *const f64;
+                        let data_ptr = crate::array::array_elements_ptr(
+                            maybe_arr as *const crate::array::ArrayHeader,
+                        ) as *const f64;
                         // #9415: the same hole grouping the `format_jsvalue`
                         // array arm does. This is the twin that renders an
                         // array reached as an object FIELD, so without it
@@ -1605,7 +1623,7 @@ pub extern "C" fn js_array_print(arr_ptr: *const crate::array::ArrayHeader) {
 
     unsafe {
         let length = (*arr_ptr).length as usize;
-        let data_ptr = (arr_ptr as *const u8).add(std::mem::size_of::<crate::array::ArrayHeader>())
+        let data_ptr = crate::array::array_elements_ptr(arr_ptr as *const crate::array::ArrayHeader)
             as *const f64;
 
         let mut parts: Vec<String> = Vec::with_capacity(length);

@@ -88,6 +88,10 @@ pub struct CompileArgs {
     #[arg(short, long)]
     pub output: Option<PathBuf>,
 
+    /// Replace an unbound identifier or dotted name with a JS expression (repeatable)
+    #[arg(long, value_name = "NAME=EXPR")]
+    pub define: Vec<String>,
+
     /// Keep intermediate files (for debugging)
     #[arg(long)]
     pub keep_intermediates: bool,
@@ -690,8 +694,12 @@ pub struct CompilationContext {
     pub native_addon_paths: BTreeMap<PathBuf, String>,
     /// Package aliases: maps npm package name → replacement package name (from perry.packageAliases)
     pub package_aliases: HashMap<String, String>,
-    /// Opt-in Solid universal JSX expansion; ordinary JSX remains the default.
-    pub solid_jsx: bool,
+    /// Host override or per-module tsconfig/package selection of universal JSX.
+    pub solid_jsx: super::solid_config::JsxMode,
+    /// The whole graph shares Solid's client instance, including dependency code.
+    pub solid_client: bool,
+    /// A nested JSX package discovered after resolution started needs a new walk.
+    pub solid_client_recollect: bool,
     /// Packages to compile natively instead of routing to V8 (from perry.compilePackages)
     pub compile_packages: HashSet<String>,
     /// Node native-addon packages omitted from wildcard/automatic whole-package
@@ -795,6 +803,8 @@ pub struct CompilationContext {
     /// The runtime evaluates these modules through the dyn-eval interpreter,
     /// so auto-optimized archives must retain that otherwise optional feature.
     pub uses_data_url_dynamic_import: bool,
+    /// Import options can select a runtime TOML loader without a Bun import.
+    pub uses_dynamic_import_options: bool,
     /// Whether any TS module calls global `fetch()` (which routes to
     /// reqwest in perry-stdlib's http-client feature).
     pub uses_fetch: bool,
@@ -1131,6 +1141,9 @@ pub struct CompilationContext {
     /// `NODE_ENV → "production"` default applied to `node_modules` code unless
     /// overridden. Keyed by the full `process.env.<NAME>` string.
     pub define: HashMap<String, DefineValue>,
+    pub expression_defines: BTreeMap<String, String>,
+    pub parsed_defines: perry_parser::defines::Defines,
+    pub resolve_inputs: BTreeSet<PathBuf>,
     /// #5247 (CJS-wrap coordinate skew): for each CommonJS module rewritten by
     /// `cjs_wrap::wrap_commonjs_for_target`, the final wrapped source
     /// text plus the number of newline characters the injected wrapper prefix
@@ -1221,7 +1234,9 @@ impl CompilationContext {
             native_addons: BTreeMap::new(),
             native_addon_paths: BTreeMap::new(),
             package_aliases: HashMap::new(),
-            solid_jsx: false,
+            solid_jsx: Default::default(),
+            solid_client: false,
+            solid_client_recollect: false,
             compile_packages: HashSet::new(),
             auto_skipped_node_addon_packages: HashSet::new(),
             aot_discovered_modules: HashSet::new(),
@@ -1246,6 +1261,7 @@ impl CompilationContext {
             geisterhand_port: 7676,
             native_module_imports: BTreeSet::new(),
             uses_data_url_dynamic_import: false,
+            uses_dynamic_import_options: false,
             uses_fetch: false,
             uses_crypto_builtins: false,
             uses_zlib_brotli: false,
@@ -1309,6 +1325,9 @@ impl CompilationContext {
             deferred_refusals: Vec::new(),
             side_effects_cache: HashMap::new(),
             define: HashMap::new(),
+            expression_defines: BTreeMap::new(),
+            parsed_defines: perry_parser::defines::Defines::default(),
+            resolve_inputs: BTreeSet::new(),
             cjs_wrap_debug_sources: HashMap::new(),
             debug_symbols: false,
         }

@@ -2,7 +2,7 @@
 
 use super::*;
 
-/// Get a slice of a string (byte-based for now)
+/// Get a slice of a string in UTF-16 code units
 /// Returns a new string from start to end (exclusive).
 /// start/end are in UTF-16 code unit indices (JS semantics).
 #[no_mangle]
@@ -33,24 +33,7 @@ pub extern "C" fn js_string_slice(
         return js_string_from_bytes(ptr::null(), 0);
     }
 
-    // ASCII fast path: byte offsets == UTF-16 offsets, skip utf16_len scan.
-    // Copy GC-safely: the destination allocation can move/sweep `s` (#5062).
-    if is_ascii_string(s) {
-        let slice_len = (end - start) as u32;
-        return string_copy_range(s, start as usize, slice_len, slice_len, 0);
-    }
-
-    // Convert UTF-16 offsets to byte offsets
-    let str_data = string_as_str(s);
-    let byte_start = utf16_offset_to_byte_offset(str_data, start as usize);
-    let byte_end = utf16_offset_to_byte_offset(str_data, end as usize);
-    string_copy_range(
-        s,
-        byte_start,
-        (byte_end - byte_start) as u32,
-        (end - start) as u32,
-        0,
-    )
+    super::slice_range::copy_utf16_range(s, start as u32, end as u32)
 }
 
 /// Get a substring (similar to slice but different behavior)
@@ -82,23 +65,7 @@ pub extern "C" fn js_string_substring(
         return js_string_from_bytes(ptr::null(), 0);
     }
 
-    // ASCII fast path: skip utf16_len scan in allocator.
-    // Copy GC-safely: the destination allocation can move/sweep `s` (#5062).
-    if is_ascii_string(s) {
-        let slice_len = (end - start) as u32;
-        return string_copy_range(s, start as usize, slice_len, slice_len, 0);
-    }
-
-    let str_data = string_as_str(s);
-    let byte_start = utf16_offset_to_byte_offset(str_data, start as usize);
-    let byte_end = utf16_offset_to_byte_offset(str_data, end as usize);
-    string_copy_range(
-        s,
-        byte_start,
-        (byte_end - byte_start) as u32,
-        (end - start) as u32,
-        0,
-    )
+    super::slice_range::copy_utf16_range(s, start as u32, end as u32)
 }
 
 /// Legacy `String.prototype.substr(start, length)` (ECMA-262 Annex B.2.3.1).
@@ -159,23 +126,7 @@ pub extern "C" fn js_string_substr(
     let start = start as i32;
     let end = end as i32;
 
-    // ASCII fast path: byte offsets == UTF-16 offsets.
-    // Copy GC-safely: the destination allocation can move/sweep `s` (#5062).
-    if is_ascii_string(s) {
-        let slice_len = (end - start) as u32;
-        return string_copy_range(s, start as usize, slice_len, slice_len, 0);
-    }
-
-    let str_data = string_as_str(s);
-    let byte_start = utf16_offset_to_byte_offset(str_data, start as usize);
-    let byte_end = utf16_offset_to_byte_offset(str_data, end as usize);
-    string_copy_range(
-        s,
-        byte_start,
-        (byte_end - byte_start) as u32,
-        (end - start) as u32,
-        0,
-    )
+    super::slice_range::copy_utf16_range(s, start as u32, end as u32)
 }
 
 // `#[used]` keepalive: `js_string_substr` is reached only from generated `.o`,
@@ -237,7 +188,11 @@ fn js_whitespace_seq_at(bytes: &[u8], i: usize) -> (bool, usize) {
 ///
 /// Trimming behavior on valid input is unchanged; a truncated/invalid tail is
 /// never treated as whitespace, so it survives the trim byte-for-byte.
-fn js_whitespace_trim_range(bytes: &[u8], trim_start: bool, trim_end: bool) -> (usize, usize) {
+pub(super) fn js_whitespace_trim_range(
+    bytes: &[u8],
+    trim_start: bool,
+    trim_end: bool,
+) -> (usize, usize) {
     let mut start = 0usize;
     if trim_start {
         while start < bytes.len() {
@@ -251,23 +206,54 @@ fn js_whitespace_trim_range(bytes: &[u8], trim_start: bool, trim_end: bool) -> (
 
     let mut end = bytes.len();
     if trim_end {
-        // Forward-walk from `start`, remembering the end of the last
-        // non-whitespace sequence. A reverse WTF-8 walk would have to guess
-        // sequence boundaries; this stays O(n) and never reads out of range.
-        let mut i = start;
-        let mut last_non_ws_end = start;
-        while i < bytes.len() {
-            let (is_ws, advance) = js_whitespace_seq_at(bytes, i);
-            let next = (i + advance).min(bytes.len());
-            if !is_ws {
-                last_non_ws_end = next;
-            }
-            i = next;
-        }
-        end = last_non_ws_end;
+        end = js_whitespace_trim_end(bytes, start);
     }
 
     (start, end.max(start))
+}
+
+/// Walk only the trailing edge for valid UTF-8/WTF-8. At most four bytes
+/// identify a candidate sequence. Malformed payloads can have ambiguous
+/// boundaries (a lead can consume an ASCII space or another lead), so use the
+/// historical bounded forward walk for those instead of guessing.
+fn js_whitespace_trim_end(bytes: &[u8], start: usize) -> usize {
+    let mut end = bytes.len();
+    while end > start {
+        let mut candidate = end - 1;
+        while candidate > start && bytes[candidate] & 0xc0 == 0x80 && end - candidate < 4 {
+            candidate -= 1;
+        }
+        // A lead in the preceding three bytes must not nominally extend into
+        // this candidate. Valid text never does; malformed text may, even when
+        // the candidate itself looks like a complete whitespace sequence.
+        for i in candidate.saturating_sub(3).max(start)..candidate {
+            if bytes[i] >= 0xc0 && i + wtf8_step(bytes, i).0 > candidate {
+                return js_whitespace_trim_end_forward(bytes, start);
+            }
+        }
+        let (is_ws, advance) = js_whitespace_seq_at(&bytes[..end], candidate);
+        if candidate + advance != end {
+            return js_whitespace_trim_end_forward(bytes, start);
+        }
+        if !is_ws {
+            break;
+        }
+        end = candidate;
+    }
+    end
+}
+
+fn js_whitespace_trim_end_forward(bytes: &[u8], start: usize) -> usize {
+    let mut i = start;
+    let mut end = start;
+    while i < bytes.len() {
+        let (is_ws, advance) = js_whitespace_seq_at(bytes, i);
+        i = (i + advance).min(bytes.len());
+        if !is_ws {
+            end = i;
+        }
+    }
+    end
 }
 
 /// Shared trim entry point over the raw payload bytes.
@@ -275,16 +261,50 @@ fn trim_impl(s: *const StringHeader, trim_start: bool, trim_end: bool) -> *mut S
     if !is_valid_string_ptr(s) {
         return js_string_from_bytes(ptr::null(), 0);
     }
+    let mode = u8::from(trim_start) | (u8::from(trim_end) << 1);
+    if unsafe { (*s).byte_len } >= trim_cache::MIN_CACHED_BYTES {
+        let cached = trim_cache::lookup(s, mode);
+        if !cached.is_null() {
+            return cached;
+        }
+    }
     let bytes = unsafe { slice::from_raw_parts(string_data(s), (*s).byte_len as usize) };
     let (start, end) = js_whitespace_trim_range(bytes, trim_start, trim_end);
-    let out = &bytes[start..end];
+    if start == end {
+        return js_string_from_bytes(ptr::null(), 0);
+    }
+    if start == 0
+        && end == bytes.len()
+        && !matches!(
+            crate::arena::classify_heap_space(s as usize),
+            crate::arena::HeapSpace::Unknown
+        )
+    {
+        // Returning the receiver creates an alias. Do not leave a unique
+        // append buffer mutable. Foreign storage must still be copied because
+        // a GC root cannot extend the external owner's lifetime.
+        if unsafe { (*s).refcount } != 0 {
+            js_string_addref(s.cast_mut());
+        }
+        return s.cast_mut();
+    }
+    // Count only removed edges. Recounting the retained payload would restore
+    // O(interior length) scanning even after the reverse boundary walk.
+    let removed_units =
+        compute_utf16_len_wtf8(&bytes[..start]) + compute_utf16_len_wtf8(&bytes[end..]);
+    let utf16_len = unsafe { (*s).utf16_len }.saturating_sub(removed_units);
     // Preserve the WTF-8 flag: trimming only removes well-formed whitespace, so
     // any lone surrogate in the source survives into the result.
-    let flags = unsafe { (*s).flags };
-    if flags & STRING_FLAG_HAS_LONE_SURROGATES != 0 {
-        return js_string_from_wtf8_bytes(out.as_ptr(), out.len() as u32);
-    }
-    js_string_from_bytes(out.as_ptr(), out.len() as u32)
+    let flags = unsafe { (*s).flags } & STRING_FLAG_HAS_LONE_SURROGATES;
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let source = scope.root_string_ptr(s);
+    // string_copy_range re-reads its rooted source AFTER allocating. Never
+    // hand the allocator a borrowed pointer into the moving source payload.
+    let result = string_copy_range(s, start, (end - start) as u32, utf16_len, flags);
+    source.with_const_ptr(|source_now: *const StringHeader| {
+        trim_cache::remember(source_now, result, mode)
+    });
+    result
 }
 
 /// Trim whitespace from both ends of a string
@@ -320,6 +340,31 @@ fn case_convert(s: *const StringHeader, upper: bool) -> *mut StringHeader {
         return js_string_from_bytes(ptr::null(), 0);
     }
     let bytes = unsafe { slice::from_raw_parts(string_data(s), (*s).byte_len as usize) };
+
+    // ASCII fast path (#10090): default-locale ASCII case mapping is
+    // context-free and strictly 1-byte-in/1-byte-out, so skip the scalar
+    // wtf8_step decode / per-char to_lowercase()/to_uppercase() iterator
+    // construction / re-encode loop entirely and let `to_ascii_lowercase`/
+    // `to_ascii_uppercase` do a vectorizable byte-table transform instead.
+    //
+    // Must gate on `bytes.is_ascii()` (a real per-byte scan), NOT the
+    // `is_ascii_string(s)` `byte_len == utf16_len` AGGREGATE proxy used
+    // elsewhere for O(1) checks: that aggregate can lie for malformed WTF-8,
+    // where a stray continuation byte (0 UTF-16 units) and a truncated
+    // multi-byte lead (2 units) cancel out to look ASCII while containing
+    // non-ASCII bytes (see `split_parts_get_metadata_from_their_own_bytes`).
+    // A genuinely all-ASCII input can never carry a lone surrogate, so the
+    // result's flags are trivially 0 and its utf16_len == its byte_len.
+    if bytes.is_ascii() {
+        let out = if upper {
+            bytes.to_ascii_uppercase()
+        } else {
+            bytes.to_ascii_lowercase()
+        };
+        let len = out.len() as u32;
+        return js_string_from_bytes_known_utf16(out.as_ptr(), len, len, 0);
+    }
+
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut has_lone_surrogate = false;
     let mut buf = [0u8; 4];

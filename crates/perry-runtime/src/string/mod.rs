@@ -118,13 +118,18 @@ mod locale;
 mod pad;
 mod raw;
 mod slice_ops;
+mod slice_range;
 mod split;
+pub(crate) mod suffix_cursor;
+pub(crate) mod trim_cache;
 mod utf16_count;
-#[cfg(feature = "regex-engine")]
-pub(crate) use split::{spec_fancy_regex_split, spec_regex_split};
 
 #[cfg(test)]
+mod slice_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod trim_tests;
 
 /// #6085 guard-page regression tests: prove no string scanner reads past the
 /// end of an exact-sized payload. Unix-only (needs `mmap` + `mprotect`).
@@ -149,7 +154,11 @@ pub use char_ops::{
 // The one-UTF-16-code-unit string builder `charAt` uses. `split("")` needs the
 // same constructor: both cut a string at code-unit boundaries, so both have to
 // be able to produce a lone surrogate (#9409).
-pub(crate) use char_ops::string_from_code_unit;
+#[cfg(test)]
+pub(crate) use char_ops::test_utf16_index_entries;
+pub(crate) use char_ops::{
+    prune_dead_utf16_indexes, scan_utf16_index_roots_mut, string_from_code_unit,
+};
 pub use compare::{
     js_string_compare, js_string_ends_with, js_string_ends_with_at, js_string_equals,
     js_string_is_well_formed, js_string_locale_compare, js_string_locale_compare_opts,
@@ -197,6 +206,8 @@ pub(crate) use format::js_format_f64;
 pub(crate) fn canonical_key(name: &[u8]) -> *mut StringHeader {
     intern::intern_dispatch_bytes(0, name.as_ptr(), name.len(), 0, false) as *mut StringHeader
 }
+#[cfg(feature = "regex-engine")]
+pub use crate::regex::{js_string_split_js, js_string_split_n};
 pub use format::{
     js_number_to_exponential, js_number_to_fixed, js_number_to_precision, js_number_to_string,
     scan_small_int_cache_roots, scan_small_int_cache_roots_mut,
@@ -228,7 +239,9 @@ pub use slice_ops::{
     js_string_to_lower_case, js_string_to_upper_case, js_string_trim, js_string_trim_end,
     js_string_trim_start,
 };
-pub use split::{js_string_split, js_string_split_n};
+pub use split::js_string_split;
+#[cfg(not(feature = "regex-engine"))]
+pub use split::{js_string_split_js, js_string_split_n};
 
 pub(crate) use intern::intern_lookup_bytes;
 

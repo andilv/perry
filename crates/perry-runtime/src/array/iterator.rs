@@ -1217,7 +1217,18 @@ pub(crate) fn array_from_spread_value(value: f64) -> *mut ArrayHeader {
 
 #[no_mangle]
 pub extern "C" fn js_array_spread_append(dest: *mut ArrayHeader, source: f64) -> *mut ArrayHeader {
-    let arr = array_from_spread_value(source);
+    // Materializing an intercepted iterator can allocate and move the
+    // destination. Keep it rooted across that protocol walk and re-read it
+    // before appending. Ordinary dense arrays need no temporary: the same
+    // guard used by `[...array]` proves their iterator is unobservable.
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let dest_handle = scope.root_raw_mut_ptr(dest);
+    let (arr, dest) = dest_handle.across_mut::<ArrayHeader, _>(|| {
+        match crate::array::dense_spread_source(source) {
+            Some(arr) => arr as *mut ArrayHeader,
+            None => array_from_spread_value(source),
+        }
+    });
     js_array_concat(dest, arr)
 }
 

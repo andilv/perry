@@ -38,9 +38,14 @@ mod prototype_addr;
 mod push_pop;
 mod reduce_right;
 mod search;
+#[cfg(test)]
+mod shift_queue_tests;
 mod sort;
 mod species;
 mod splice_slice;
+mod storage;
+pub use storage::array_elements_ptr;
+pub(crate) use storage::{array_front_offset, array_physical_capacity};
 mod subclass;
 pub(crate) mod subclass_elements;
 
@@ -48,6 +53,8 @@ pub(crate) mod subclass_elements;
 mod callback_rooting_tests;
 #[cfg(test)]
 mod collection_tag_tests;
+#[cfg(test)]
+mod dense_move_tests;
 #[cfg(test)]
 mod forwarding_tests;
 #[cfg(test)]
@@ -162,8 +169,9 @@ pub(crate) use self::indexing_support::test_keys_array_slot_fallbacks;
 pub(crate) use self::indexing_support::{
     array_proto_iterator_modified, invalidate_array_index_fast_path,
     keys_array_len_capped_to_capacity, keys_array_slot, note_array_index_write,
-    note_array_proto_iterator_write, note_object_prototype_index_write,
-    object_prototype_has_index_flag, PERRY_ARRAY_INDEX_FAST_PATH_INVALIDATED,
+    note_array_iteration_not_pristine, note_array_proto_iterator_write,
+    note_object_prototype_index_write, object_prototype_has_index_flag,
+    PERRY_ARRAY_INDEX_FAST_PATH_INVALIDATED,
 };
 pub use self::is_array::js_array_is_array;
 pub(crate) use self::iter_methods::throw_reduce_of_empty;
@@ -246,6 +254,8 @@ pub use self::search::{
 pub use self::sort::{
     js_array_sort_default, js_array_sort_with_comparator, js_validate_array_comparator,
 };
+#[cfg(test)]
+pub(crate) use self::splice_slice::test_collect_after_splice_roots_once;
 pub use self::splice_slice::{
     js_array_slice, js_array_slice_values, js_array_splice, js_array_splice_delete_count,
 };
@@ -261,14 +271,15 @@ pub(crate) use self::header::{
     array_named_property_set, array_numeric_raw_f64_get, array_numeric_raw_f64_push_inbounds,
     array_numeric_raw_f64_set_inbounds, array_object_flags, array_object_flags_from_tag,
     array_object_flags_resolved, array_ptr_as_proxy, array_receiver_addr, array_receiver_gc_tag,
-    buffer_receiver_as_uint8_typed_array, clean_arr_ptr, clean_arr_ptr_mut,
-    clear_array_numeric_layout, clear_array_numeric_layout_ptr, gc_element_slot_range,
-    mark_array_layout_unknown, mark_array_raw_f64_holes_fresh, normalize_array_receiver,
-    note_array_slot, note_array_slot_layout_only, note_array_slot_resolved_flags,
-    rebuild_array_layout, rebuild_array_layout_exact, refresh_array_numeric_layout,
-    replay_array_growth_write_barriers, set_array_numeric_layout, store_array_slot,
-    store_array_slot_resolved, transfer_array_named_property_owner, transfer_array_numeric_layout,
-    typed_array_receiver, value_bits_to_number, NumericArrayLayout, MIN_ARRAY_CAPACITY,
+    buffer_receiver_as_uint8_typed_array, canonicalize_array_numeric_store_value_from_flags,
+    clean_arr_ptr, clean_arr_ptr_mut, clear_array_numeric_layout, clear_array_numeric_layout_ptr,
+    finish_array_dense_move_layout, gc_element_slot_range, mark_array_layout_unknown,
+    mark_array_raw_f64_holes_fresh, normalize_array_receiver, note_array_slot,
+    note_array_slot_layout_only, note_array_slot_resolved_flags, rebuild_array_layout,
+    rebuild_array_layout_exact, refresh_array_numeric_layout, replay_array_growth_write_barriers,
+    set_array_numeric_layout, store_array_slot, store_array_slot_resolved,
+    transfer_array_named_property_owner, transfer_array_numeric_layout, typed_array_receiver,
+    value_bits_to_number, NumericArrayLayout, MIN_ARRAY_CAPACITY,
 };
 
 // Sole caller is the regex-engine-gated `regex::exec_array`, so the helper and

@@ -2,6 +2,16 @@
 use super::*;
 use std::ptr;
 
+#[cfg(test)]
+thread_local! {
+    static SPLICE_COLLECT_AFTER_ROOTING_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn test_collect_after_splice_roots_once() {
+    SPLICE_COLLECT_AFTER_ROOTING_ONCE.with(|armed| armed.set(true));
+}
+
 /// Splice an array - removes elements and optionally inserts new ones
 /// start: starting index (can be negative for from-end)
 /// delete_count: number of elements to delete
@@ -70,17 +80,38 @@ pub extern "C" fn js_array_splice(
             (delete_count as u32).min(len as u32 - start_idx)
         };
 
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let arr_handle = scope.root_raw_mut_ptr(arr);
+        // `items` points at caller-owned raw storage. The storage address is
+        // stable, but an evacuating collection cannot rewrite pointer values
+        // inside it, so root every value before species creation can allocate
+        // or invoke user code.
+        let item_handles = if items.is_null() {
+            Vec::new()
+        } else {
+            scope.root_nanbox_f64_slice(std::slice::from_raw_parts(items, items_count as usize))
+        };
+        #[cfg(test)]
+        SPLICE_COLLECT_AFTER_ROOTING_ONCE.with(|armed| {
+            if armed.replace(false) {
+                crate::gc::gc_collect_minor();
+            }
+        });
+
         // Create array of deleted elements via ArraySpeciesCreate (ECMA-262
         // §23.1.3.31 step 11): reads `O.constructor` / `@@species` and throws
         // on a poisoned getter or non-constructor species before the receiver
         // is mutated.
-        let recv_value = f64::from_bits(crate::value::JSValue::pointer(arr as *const u8).bits());
+        let recv_value = arr_handle.with_mut_ptr::<ArrayHeader, _>(|arr| {
+            f64::from_bits(crate::value::JSValue::pointer(arr as *const u8).bits())
+        });
         let deleted_box =
             crate::array::species::array_species_create(recv_value, actual_delete as usize);
-        let deleted_is_plain = crate::array::species::species_result_is_plain_array(deleted_box);
-        let deleted = crate::value::js_nanbox_get_pointer(deleted_box) as *mut ArrayHeader;
-
-        let elements_ptr = (arr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut f64;
+        let deleted_handle = scope.root_nanbox_f64(deleted_box);
+        let deleted_is_plain =
+            crate::array::species::species_result_is_plain_array(deleted_handle.get_nanbox_f64());
+        let removed_value_handle =
+            scope.root_nanbox_f64(f64::from_bits(crate::value::TAG_UNDEFINED));
 
         // Copy deleted elements to return array. ECMA-262 §23.1.3.31 step
         // 12.b: each removed index goes through HasProperty/Get — a hole
@@ -88,38 +119,62 @@ pub extern "C" fn js_array_splice(
         // property of the deleted array (test262 splice/S15.4.4.12_A4_T3);
         // a genuinely absent index stays a hole.
         let spec_read = |i: usize| -> f64 {
-            let v = *elements_ptr.add(start_idx as usize + i);
+            let v = arr_handle.with_mut_ptr::<ArrayHeader, _>(|arr| {
+                let elements_ptr =
+                    crate::array::array_elements_ptr(arr as *const ArrayHeader) as *const f64;
+                *elements_ptr.add(start_idx as usize + i)
+            });
             if v.to_bits() == crate::value::TAG_HOLE {
                 let idx = start_idx + i as u32;
-                if crate::array::array_spec_has_index(arr, idx) {
-                    return crate::array::array_spec_get(arr, idx);
+                if arr_handle.with_mut_ptr::<ArrayHeader, _>(|arr| {
+                    crate::array::array_spec_has_index(arr, idx)
+                }) {
+                    return arr_handle.with_mut_ptr::<ArrayHeader, _>(|arr| {
+                        crate::array::array_spec_get(arr, idx)
+                    });
                 }
             }
             v
         };
         if deleted_is_plain {
+            let deleted = crate::value::js_nanbox_get_pointer(deleted_handle.get_nanbox_f64())
+                as *mut ArrayHeader;
             (*deleted).length = actual_delete;
-            let deleted_elements =
-                (deleted as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut f64;
             // Hole reads also consult recorded custom prototypes, which are
             // not covered by array_iteration_is_exotic's canonical-proto flags.
-            let src_exotic = crate::array::array_iteration_is_exotic(arr)
+            let src_exotic = arr_handle
+                .with_mut_ptr::<ArrayHeader, _>(|arr| crate::array::array_iteration_is_exotic(arr))
                 || crate::object::prototype_chain::array_static_proto_recorded();
             for i in 0..actual_delete as usize {
                 let value = spec_read(i);
                 if src_exotic {
                     // Publish before the next getter can collect or throw,
                     // leaving the species result reachable with a partial copy.
+                    let deleted =
+                        crate::value::js_nanbox_get_pointer(deleted_handle.get_nanbox_f64())
+                            as *mut ArrayHeader;
                     note_array_slot(deleted, i, value.to_bits());
                 } else {
                     // GC_STORE_AUDIT(BARRIERED): no source callbacks; layout/barrier rebuild follows the copy.
+                    let deleted =
+                        crate::value::js_nanbox_get_pointer(deleted_handle.get_nanbox_f64())
+                            as *mut ArrayHeader;
+                    let deleted_elements =
+                        crate::array::array_elements_ptr(deleted as *const ArrayHeader) as *mut f64;
                     ptr::write(deleted_elements.add(i), value);
                 }
             }
+            let deleted = crate::value::js_nanbox_get_pointer(deleted_handle.get_nanbox_f64())
+                as *mut ArrayHeader;
             rebuild_array_layout(deleted);
         } else {
             for i in 0..actual_delete as usize {
-                crate::array::species::species_result_set(deleted_box, i, spec_read(i));
+                removed_value_handle.set_nanbox_f64(spec_read(i));
+                crate::array::species::species_result_set(
+                    deleted_handle.get_nanbox_f64(),
+                    i,
+                    removed_value_handle.get_nanbox_f64(),
+                );
             }
         }
 
@@ -127,49 +182,70 @@ pub extern "C" fn js_array_splice(
         let new_len = len as u32 - actual_delete + items_count;
 
         // Grow array if needed
-        let arr = if new_len > (*arr).capacity {
-            js_array_grow(arr, new_len)
-        } else {
-            arr
-        };
-        let elements_ptr = (arr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut f64;
-
-        // Shift elements after the splice point
-        let tail_start = start_idx + actual_delete;
-        let tail_len = len as u32 - tail_start;
-
-        if items_count != actual_delete && tail_len > 0 {
-            // Need to shift the tail
-            let src = elements_ptr.add(tail_start as usize);
-            let dst = elements_ptr.add((start_idx + items_count) as usize);
-            // GC_STORE_AUDIT(BARRIERED): splice tail memmove is followed by layout/barrier rebuild.
-            ptr::copy(src, dst, tail_len as usize);
+        let should_grow =
+            arr_handle.with_mut_ptr::<ArrayHeader, _>(|current| new_len > (*current).capacity);
+        if should_grow {
+            let grown = arr_handle
+                .with_mut_ptr::<ArrayHeader, _>(|current| js_array_grow(current, new_len));
+            arr_handle.set_raw_mut_ptr(grown);
         }
+        arr_handle.with_mut_ptr::<ArrayHeader, _>(|arr| {
+            let flags = array_object_flags_resolved(arr);
+            let elements_ptr =
+                crate::array::array_elements_ptr(arr as *const ArrayHeader) as *mut f64;
 
-        // Insert new items
-        if items_count > 0 && !items.is_null() {
-            for i in 0..items_count as usize {
-                let item = *items.add(i);
-                // A uniquely-owned string spliced in now aliases the array slot —
-                // demote it to shared so a later `s += x` doesn't mutate it in
-                // place. No-op for SSO / non-string. (This insert path doesn't
-                // funnel through `note_array_slot`.)
-                crate::string::js_string_addref_if_heap_string(item);
-                // GC_STORE_AUDIT(BARRIERED): splice inserted item writes are followed by layout/barrier rebuild.
-                ptr::write(elements_ptr.add(start_idx as usize + i), item);
+            // Shift elements after the splice point
+            let tail_start = start_idx + actual_delete;
+            let tail_len = len as u32 - tail_start;
+
+            if items_count != actual_delete && tail_len > 0 {
+                // Need to shift the tail
+                let src = elements_ptr.add(tail_start as usize);
+                let dst = elements_ptr.add((start_idx + items_count) as usize);
+                // GC_STORE_AUDIT(BARRIERED): the dense-move finisher translates
+                // survivor dirty pages below.
+                ptr::copy(src, dst, tail_len as usize);
             }
-        }
 
-        // ECMA-262 §23.1.3.31 step 24: Set(O, "length", …, true) — throws on a
-        // non-writable `length` (test262 splice/S15.4.4.12_A6.1_T2/T3).
-        super::push_pop::guard_writable_length(arr);
-        (*arr).length = new_len;
-        rebuild_array_layout(arr);
+            // Insert new items
+            if items_count > 0 && !item_handles.is_empty() {
+                for (i, item_handle) in item_handles.iter().enumerate() {
+                    let item = item_handle.get_nanbox_f64();
+                    // A uniquely-owned string spliced in now aliases the array slot —
+                    // demote it to shared so a later `s += x` doesn't mutate it in
+                    // place. No-op for SSO / non-string. (This insert path doesn't
+                    // funnel through `note_array_slot`.)
+                    crate::string::js_string_addref_if_heap_string(item);
+                    let item = canonicalize_array_numeric_store_value_from_flags(flags, item);
+                    // GC_STORE_AUDIT(BARRIERED): inserted items are covered by the
+                    // dense-move finisher below.
+                    ptr::write(elements_ptr.add(start_idx as usize + i), item);
+                }
+            }
 
-        // Return modified array via out param
-        *out_arr = arr;
+            // ECMA-262 §23.1.3.31 step 24: Set(O, "length", …, true) — throws on a
+            // non-writable `length` (test262 splice/S15.4.4.12_A6.1_T2/T3).
+            super::push_pop::guard_writable_length(arr);
+            (*arr).length = new_len;
+            let moved_count = if items_count != actual_delete {
+                tail_len as usize
+            } else {
+                0
+            };
+            finish_array_dense_move_layout(
+                arr,
+                elements_ptr.add(tail_start as usize).cast(),
+                elements_ptr.add((start_idx + items_count) as usize).cast(),
+                moved_count,
+                elements_ptr.add(start_idx as usize).cast(),
+                items_count as usize,
+            );
 
-        deleted
+            // Return modified array via out param
+            *out_arr = arr;
+        });
+
+        crate::value::js_nanbox_get_pointer(deleted_handle.get_nanbox_f64()) as *mut ArrayHeader
     }
 }
 
@@ -270,12 +346,13 @@ pub extern "C" fn js_array_slice(
         // (has Array.prototype or Object.prototype indexed properties) so
         // inherited indices appear in the result just as [[Get]] would return
         // them (ECMA-262 §23.1.3.25 step 8b "If HasProperty(O, from)…").
-        let src_elements = (arr as *const u8).add(std::mem::size_of::<ArrayHeader>()) as *const f64;
+        let src_elements =
+            crate::array::array_elements_ptr(arr as *const ArrayHeader) as *const f64;
         let src_exotic = crate::array::array_iteration_is_exotic(arr);
         if is_plain {
             (*result).length = slice_len;
             let dst_elements =
-                (result as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut f64;
+                crate::array::array_elements_ptr(result as *const ArrayHeader) as *mut f64;
             for i in 0..slice_len as usize {
                 let src_idx = start_idx as usize + i;
                 let v = if src_exotic {

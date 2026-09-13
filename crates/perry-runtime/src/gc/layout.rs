@@ -445,7 +445,7 @@ pub(super) fn strip_nanbox_user_ptr(bits: u64) -> usize {
 }
 
 #[inline]
-pub(in crate::gc) fn layout_pointer_bearing_bits(bits: u64) -> bool {
+pub(crate) fn layout_pointer_bearing_bits(bits: u64) -> bool {
     let tag = bits & TAG_MASK;
     if tag == POINTER_TAG || tag == STRING_TAG || tag == BIGINT_TAG {
         return bits & POINTER_MASK != 0;
@@ -1836,6 +1836,7 @@ pub(super) unsafe fn gc_child_slots(header: *mut GcHeader) -> HeapChildSlotItera
             // THIS iterator (its rewrite arm delegates here), so the edge has
             // to be enumerated at this point, not in the rewrite match.
             .with_meta_slot(crate::object::cell_meta_slot(user_ptr as usize).map(|s| s as *mut u64))
+            .with_meta_slot2(crate::regex::regex_program_slot(user_ptr))
         }
         GcLayoutSlotKind::ObjectMeta => {
             // Prototype and the private-evaluation brand are explicit prefix

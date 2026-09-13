@@ -466,13 +466,30 @@ pub(super) fn lower_inline_dyn_typed_array_get(
     let elem_bounds_label = ctx.block_label(elem_bounds_idx);
     let elem_load_label = ctx.block_label(elem_load_idx);
     let elem_value_label = ctx.block_label(elem_value_idx);
+    // A `JSON.parse` result is `GC_TYPE_LAZY_ARRAY`, not `GC_TYPE_ARRAY`, so
+    // every one of its indexed reads used to fall straight through to
+    // `arrlike.ic.miss` and re-classify the receiver three more times
+    // (`js_packed_arraylike_index_get` -> `js_array_get_f64` ->
+    // `json_tape::cached_read::lazy_get`). Once a scan or a random-access flip
+    // has installed the ordinary array, that whole chain resolves one word;
+    // serve it here instead, on exactly the proof `lazy_get` already uses.
+    // The blocks are declared here; they are reached from `arrlike.elem.kind`
+    // below, after the ordinary-Array and elements-subclass probes both miss.
+    let lazy_kind_idx = ctx.new_block("arrlike.lazy.kind");
+    let lazy_call_idx = ctx.new_block("arrlike.lazy.call");
+    let lazy_value_idx = ctx.new_block("arrlike.lazy.value");
+    let lazy_kind_label = ctx.block_label(lazy_kind_idx);
+    let lazy_call_label = ctx.block_label(lazy_call_idx);
+    let lazy_value_label = ctx.block_label(lazy_value_idx);
+
     ctx.current_block = object_brand_idx;
     ctx.block()
         .cond_br(&is_array, &object_array_guard_label, &elem_kind_label);
+
     ctx.current_block = elem_kind_idx;
     let elem_is_object = ctx.block().icmp_eq(I8, &gc_type, "2");
     ctx.block()
-        .cond_br(&elem_is_object, &elem_meta_label, &object_miss_label);
+        .cond_br(&elem_is_object, &elem_meta_label, &lazy_kind_label);
     ctx.current_block = elem_meta_idx;
     let elem_meta_addr = ctx.block().add(I64, &object_raw, &meta_offset);
     let elem_meta_slot_ptr = ctx.block().inttoptr(I64, &elem_meta_addr);
@@ -517,7 +534,7 @@ pub(super) fn lower_inline_dyn_typed_array_get(
         .cond_br(&elem_ok, &elem_load_label, &object_miss_label);
     ctx.current_block = elem_load_idx;
     let elem_bytes = ctx.block().shl(I64, &object_idx_i64, "3");
-    let elem_elements_addr = ctx.block().add(I64, &elem_store_i64, "8");
+    let elem_elements_addr = ctx.block().array_elements_addr(&elem_store_i64);
     let elem_addr = ctx.block().add(I64, &elem_elements_addr, &elem_bytes);
     let elem_ptr = ctx.block().inttoptr(I64, &elem_addr);
     let elem_raw = ctx.block().load(DOUBLE, &elem_ptr);
@@ -537,6 +554,50 @@ pub(super) fn lower_inline_dyn_typed_array_get(
     let elem_end_label = ctx.block().label.clone();
     ctx.block().br(&merge_label);
     kind_incoming.push((elem_value, elem_end_label));
+
+    // `GC_TYPE_LAZY_ARRAY` (perry-runtime `gc/types.rs`). This tier hangs off
+    // the Array-subclass probe's miss edge, after the ordinary-Array and
+    // elements-subclass probes have both declined the receiver.
+    ctx.current_block = lazy_kind_idx;
+    let lazy_is_lazy = ctx.block().icmp_eq(I8, &gc_type, "9");
+    ctx.block()
+        .cond_br(&lazy_is_lazy, &lazy_call_label, &object_miss_label);
+
+    // One call into `json_tape::cached_read::js_lazy_array_index_probe`, which
+    // is `lazy_get`'s two non-allocating branches and nothing else. That skips
+    // the dispatcher chain (`js_packed_arraylike_index_get` ->
+    // `js_array_get_f64` -> `lazy_get`) without inlining the whole proof at
+    // every indexed read site: the inline form grew this function ~10% and cost
+    // rows it never executes on up to 5% to code layout alone.
+    //
+    // `TAG_HOLE` means "this read needs the rooted accessor" -- unambiguous,
+    // because a hole is never a value a read yields, and holes already route to
+    // the miss helper. Cold elements, descriptors, out-of-bounds, growth stubs
+    // and a stale length mirror all come back as that. The probe cannot
+    // allocate, run user code or collect, so no extra rooting is required here.
+    ctx.current_block = lazy_call_idx;
+    let lazy_raw_i64 = object_raw.clone();
+    let lazy_probe = ctx.block().call(
+        DOUBLE,
+        "js_lazy_array_index_probe",
+        &[(I64, &lazy_raw_i64), (I64, &object_idx_i64)],
+    );
+    let lazy_probe_bits = ctx.block().bitcast_double_to_i64(&lazy_probe);
+    let lazy_declined = ctx
+        .block()
+        .icmp_eq(I64, &lazy_probe_bits, crate::nanbox::TAG_HOLE_I64);
+    ctx.block()
+        .cond_br(&lazy_declined, &object_miss_label, &lazy_value_label);
+    ctx.current_block = lazy_value_idx;
+    let lazy_value = if coerce_slow_to_number {
+        ctx.block()
+            .call(DOUBLE, "js_number_coerce", &[(DOUBLE, &lazy_probe)])
+    } else {
+        lazy_probe
+    };
+    let lazy_end_label = ctx.block().label.clone();
+    ctx.block().br(&merge_label);
+    kind_incoming.push((lazy_value, lazy_end_label));
 
     // Ordinary Array: the receiver tag and forwarding state were checked in
     // the predecessor.  Reject descriptors or any process-wide prototype
@@ -581,10 +642,11 @@ pub(super) fn lower_inline_dyn_typed_array_get(
     );
 
     ctx.current_block = object_array_load_idx;
-    let array_element_word = ctx.block().add(I64, &object_idx_i64, "1");
+    let array_base = ctx.block().array_elements_addr(&object_raw);
+    let array_base_ptr = ctx.block().inttoptr(I64, &array_base);
     let array_element_ptr =
         ctx.block()
-            .gep_inbounds(I64, &array_ptr, &[(I64, &array_element_word)]);
+            .gep_inbounds(I64, &array_base_ptr, &[(I64, &object_idx_i64)]);
     let array_raw = ctx.block().load(DOUBLE, &array_element_ptr);
     let array_raw_bits = ctx.block().bitcast_double_to_i64(&array_raw);
     let array_is_hole = ctx

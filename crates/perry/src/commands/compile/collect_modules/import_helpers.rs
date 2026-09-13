@@ -94,31 +94,35 @@ pub(super) fn env_defines_for_lowering(
 /// anyway. This keeps the scan cheap and side-effect free.
 pub(super) fn collect_js_module_imports(file_path: &std::path::Path, source: &str) -> Vec<PathBuf> {
     use std::sync::OnceLock;
-    static IMPORT_RE: OnceLock<regex::Regex> = OnceLock::new();
-    static EXPORT_FROM_RE: OnceLock<regex::Regex> = OnceLock::new();
-    static DYNAMIC_IMPORT_RE: OnceLock<regex::Regex> = OnceLock::new();
-    static BARE_IMPORT_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static IMPORT_RE: OnceLock<perry_perex::tooling::Regex> = OnceLock::new();
+    static EXPORT_FROM_RE: OnceLock<perry_perex::tooling::Regex> = OnceLock::new();
+    static DYNAMIC_IMPORT_RE: OnceLock<perry_perex::tooling::Regex> = OnceLock::new();
+    static BARE_IMPORT_RE: OnceLock<perry_perex::tooling::Regex> = OnceLock::new();
 
     // `import ... from "spec"` — matches default/named/namespace forms.
     let import_re = IMPORT_RE.get_or_init(|| {
-        regex::Regex::new(r#"(?m)^\s*import\s+(?:[^'"]+?\s+from\s+)?['"]([^'"]+)['"]"#)
-            .expect("import regex")
+        perry_perex::tooling::Regex::new(
+            r#"(?m)^\s*import\s+(?:[^'"]+?\s+from\s+)?['"]([^'"]+)['"]"#,
+        )
+        .expect("import regex")
     });
     // Bare side-effect import: `import "./foo.js";`
     let bare_re = BARE_IMPORT_RE.get_or_init(|| {
-        regex::Regex::new(r#"(?m)^\s*import\s+['"]([^'"]+)['"]"#).expect("bare import regex")
+        perry_perex::tooling::Regex::new(r#"(?m)^\s*import\s+['"]([^'"]+)['"]"#)
+            .expect("bare import regex")
     });
     // `export ... from "spec"` — covers `export *`, `export * as ns`,
     // `export { a, b }`. Captures the specifier.
     let export_re = EXPORT_FROM_RE.get_or_init(|| {
-        regex::Regex::new(
+        perry_perex::tooling::Regex::new(
             r#"(?m)^\s*export\s+(?:\*(?:\s+as\s+\w+)?|\{[^}]*\})\s+from\s+['"]([^'"]+)['"]"#,
         )
         .expect("export from regex")
     });
     // Dynamic `import("spec")` — string-literal only.
     let dyn_re = DYNAMIC_IMPORT_RE.get_or_init(|| {
-        regex::Regex::new(r#"\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)"#).expect("dynamic import regex")
+        perry_perex::tooling::Regex::new(r#"\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)"#)
+            .expect("dynamic import regex")
     });
 
     let mut specs: Vec<String> = Vec::new();
@@ -145,10 +149,12 @@ pub(super) fn collect_js_module_imports(file_path: &std::path::Path, source: &st
         // so the most common case (top-level package brings in submodules)
         // is covered. Inside a package's `node_modules` tree, all
         // sibling imports are relative-path anyway.
-        if !(super::super::resolve::is_relative_specifier(&spec) || spec.starts_with('/')) {
+        if !(super::super::resolve::is_relative_specifier(&spec)
+            || super::super::resolve::is_absolute_specifier(&spec))
+        {
             continue;
         }
-        let resolved_path = if spec.starts_with('/') {
+        let resolved_path = if super::super::resolve::is_absolute_specifier(&spec) {
             super::super::resolve::resolve_absolute_import_paths(&spec)
         } else {
             super::super::resolve::resolve_relative_import_paths(&spec, file_path)
@@ -214,7 +220,7 @@ fn source_visible_resolved_path(
     importer_path: &Path,
     canonical_path: &Path,
 ) -> PathBuf {
-    let resolved = if import_source.starts_with('/') {
+    let resolved = if super::super::resolve::is_absolute_specifier(import_source) {
         super::super::resolve::resolve_absolute_import_paths(import_source)
     } else if super::super::resolve::is_relative_specifier(import_source) {
         super::super::resolve::resolve_relative_import_paths(import_source, importer_path)

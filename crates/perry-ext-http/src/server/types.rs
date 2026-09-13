@@ -166,9 +166,8 @@ pub unsafe fn parse_listen_args(args_array: i64) -> ListenArgs {
         return out;
     }
     let len = (*arr_ptr).length as usize;
-    let elements = (arr_ptr as *const u8).add(std::mem::size_of::<ArrayHeader>()) as *const u64;
     for i in 0..len {
-        let bits = *elements.add(i);
+        let bits = perry_ffi::js_array_get(arr_ptr, i as u32).bits();
         let v = JsValue::from_bits(bits);
         // The completion callback is the (single) function argument — match it
         // by value type, not position, so it's picked up wherever it floats.
@@ -274,12 +273,7 @@ pub fn jsvalue_to_body_bytes(value: f64) -> Option<Vec<u8>> {
         if is_buffer {
             let buf = raw as *const BufferHeader;
             if !buf.is_null() {
-                unsafe {
-                    let len = (*buf).length as usize;
-                    let data = (buf as *const u8).add(std::mem::size_of::<BufferHeader>());
-                    let slice = std::slice::from_raw_parts(data, len);
-                    return Some(slice.to_vec());
-                }
+                return perry_ffi::read_buffer_bytes(buf).map(<[u8]>::to_vec);
             }
         }
         // Non-buffer pointer — try the string-shaped header (shared

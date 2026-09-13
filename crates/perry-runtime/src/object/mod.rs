@@ -76,7 +76,9 @@ mod class_handles;
 pub mod class_image;
 mod class_registry;
 pub(crate) use class_registry::class_registry_census;
-pub(crate) use class_registry::scan_current_new_target_root_mut;
+#[cfg(feature = "regex-engine")]
+pub(crate) use class_registry::construct_two_rooted;
+pub(crate) use class_registry::{construct_rooted_arguments, scan_current_new_target_root_mut};
 mod collection_proto_thunks;
 mod data_view_registry;
 mod dataview_proto_thunks;
@@ -1825,6 +1827,8 @@ mod tests;
 mod tombstone_tests;
 #[cfg(test)]
 mod transition_ic_tests;
+#[cfg(test)]
+mod wide_object_membership_tests;
 
 /// The named-property bag for a cell that has no inline slot layout of its own,
 /// creating it on first write.

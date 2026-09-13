@@ -104,6 +104,19 @@ fn throw_dataview_oob() -> ! {
     super::numeric::throw_dataview_offset_out_of_bounds()
 }
 
+fn throw_dataview_detached() -> ! {
+    crate::collection_iter::throw_type_error(
+        "Cannot perform DataView access on a detached ArrayBuffer",
+    )
+}
+
+/// Non-allocating `ToIndex` subset used by the numeric setter fast path.
+#[inline(always)]
+fn numeric_byte_offset(value: f64) -> Option<i64> {
+    (value >= 0.0 && value <= 9_007_199_254_740_991.0 && value.trunc() == value)
+        .then_some(value as i64)
+}
+
 #[inline]
 /// `ToIndex(byteOffset)` for `GetViewValue`/`SetViewValue`: ToNumber →
 /// ToIntegerOrInfinity → range-check `[0, 2^53-1]`. A Symbol or object byteOffset
@@ -118,8 +131,8 @@ fn to_byte_offset(value: f64) -> i64 {
     // Fast path (#6386): a non-NaN f64 is by NaN-boxing construction a
     // genuine Number (every tag pattern is a NaN payload), so a valid
     // integral index needs no coercion machinery at all.
-    if value >= 0.0 && value <= 9_007_199_254_740_991.0 && value.trunc() == value {
-        return value as i64;
+    if let Some(offset) = numeric_byte_offset(value) {
+        return offset;
     }
     if crate::value::JSValue::from_bits(value.to_bits()).is_bigint() {
         crate::collection_iter::throw_type_error("Cannot convert a BigInt value to a number");
@@ -140,11 +153,16 @@ fn to_byte_offset(value: f64) -> i64 {
 /// step order). A BigInt accessor takes the `to_bigint_raw_or_throw` path instead.
 #[inline]
 fn to_number(value: f64) -> f64 {
-    // A non-NaN f64 is by NaN-boxing construction already a Number (#6386);
-    // every non-Number value (and boxed int32) carries a NaN tag pattern and
-    // takes the full coercion.
-    if !value.is_nan() {
+    let js_value = crate::value::JSValue::from_bits(value.to_bits());
+    // Includes every IEEE-754 NaN encoding that is not in Perry's tag band.
+    if js_value.is_number() {
         return value;
+    }
+    // DataView SetViewValue uses the abstract ToNumber operation, which rejects
+    // BigInt. `js_number_coerce` also serves explicit Number(), where conversion
+    // from BigInt is allowed, so reject it at this call site.
+    if js_value.is_bigint() {
+        crate::collection_iter::throw_type_error("Cannot convert a BigInt value to a number");
     }
     crate::builtins::js_number_coerce(value)
 }
@@ -152,17 +170,8 @@ fn to_number(value: f64) -> f64 {
 /// Read `width` bytes starting at `offset` from a DataView's backing storage.
 /// Throws `RangeError` (`ERR_OUT_OF_BOUNDS`) when the range escapes the view.
 ///
-/// Resolves through the view registry rather than reading the DataView's own
-/// inline bytes: `js_data_view_new` seeds that storage with a *snapshot* of the
-/// backing taken at construction, and only writes routed through the registry
-/// (`js_buffer_set`, `js_buffer_write`, a sibling DataView's `set*`, …) refresh
-/// it. A typed array aliasing the same `ArrayBuffer` writes its elements
-/// straight into the backing store (`typedarray::data_ptr_mut` — see
-/// `typedarray_view::view_backing_data_ptr`), so nothing refreshes the
-/// snapshot and every `get*` returned pre-write bytes. `read_buffer_byte` has
-/// resolved the backing for `Uint8Array`/`Buffer` views since #1205 for exactly
-/// this reason — which is why a `Uint8Array` writer appeared to work while a
-/// `Uint16Array`/`Uint32Array`/`Float64Array` writer silently did not.
+/// Resolve the shared backing so writes through any sibling typed array or
+/// native data pointer are immediately visible.
 unsafe fn read_bytes<const N: usize>(buf: *const BufferHeader, offset: i64) -> [u8; N] {
     if buf.is_null() || offset < 0 {
         throw_dataview_oob();
@@ -177,24 +186,79 @@ unsafe fn read_bytes<const N: usize>(buf: *const BufferHeader, offset: i64) -> [
     out
 }
 
-/// Write `bytes` at `offset` into a DataView's backing storage, propagating to
-/// any aliased views. Throws `RangeError` when the range escapes the view.
+/// Write `bytes` at `offset` into the shared backing storage.
+/// Throws `RangeError` when the range escapes the view.
 unsafe fn write_bytes(buf: *mut BufferHeader, offset: i64, bytes: &[u8]) {
     if buf.is_null() || offset < 0 {
         throw_dataview_oob();
     }
     let len = (*buf).length as i64;
+    // Detach zeroes every registered view's length before decommitting backing
+    // pages. Keep the common non-empty path table-free; only a zero-length view
+    // needs to distinguish detached TypeError from ordinary RangeError.
+    if len == 0 && super::detach::is_detached_buffer(super::view::backing_of(buf as usize)) {
+        throw_dataview_detached();
+    }
     if offset + (bytes.len() as i64) > len {
         throw_dataview_oob();
     }
-    let base = buffer_data_mut(buf).add(offset as usize);
+    let base = super::view::data_view_data_ptr(buf).add(offset as usize);
     ptr::copy_nonoverlapping(bytes.as_ptr(), base, bytes.len());
-    super::view::propagate_written_range_from_receiver(
-        buf as usize,
-        offset as u32,
-        base,
-        bytes.len() as u32,
-    );
+}
+
+/// Store an already-coerced Number. This path contains no allocation or user
+/// callback; its only call, `write_bytes`, performs bounds checks and a memcpy
+/// through the stable pointer cached by `DataView` construction.
+unsafe fn write_number(
+    buf: *mut BufferHeader,
+    offset: i64,
+    n: f64,
+    kind: DataViewKind,
+    little: bool,
+) {
+    match kind {
+        DataViewKind::BigInt64 | DataViewKind::BigUint64 => unreachable!(),
+        DataViewKind::Int8 | DataViewKind::Uint8 => {
+            // ToUint8 / ToInt8 wrap to the same byte; store identically.
+            let byte = wrap_to_u64(n, 8) as u8;
+            write_bytes(buf, offset, &[byte]);
+        }
+        DataViewKind::Int16 | DataViewKind::Uint16 => {
+            let v = wrap_to_u64(n, 16) as u16;
+            let bytes = if little {
+                v.to_le_bytes()
+            } else {
+                v.to_be_bytes()
+            };
+            write_bytes(buf, offset, &bytes);
+        }
+        DataViewKind::Int32 | DataViewKind::Uint32 => {
+            let v = wrap_to_u64(n, 32) as u32;
+            let bytes = if little {
+                v.to_le_bytes()
+            } else {
+                v.to_be_bytes()
+            };
+            write_bytes(buf, offset, &bytes);
+        }
+        DataViewKind::Float32 => {
+            let v = n as f32;
+            let bytes = if little {
+                v.to_le_bytes()
+            } else {
+                v.to_be_bytes()
+            };
+            write_bytes(buf, offset, &bytes);
+        }
+        DataViewKind::Float64 => {
+            let bytes = if little {
+                n.to_le_bytes()
+            } else {
+                n.to_be_bytes()
+            };
+            write_bytes(buf, offset, &bytes);
+        }
+    }
 }
 
 /// `DataView.prototype.get<Kind>(byteOffset, littleEndian?)`.
@@ -286,6 +350,18 @@ pub fn js_data_view_set(
     kind: DataViewKind,
     little: bool,
 ) -> f64 {
+    // Both inputs are already Numbers and ToIndex is already resolved: no call
+    // below can allocate, invoke JavaScript, collect, or move/reclaim `buf`.
+    // Avoid publishing a transient GC root and use the construction-time data
+    // pointer cache instead of probing VIEW_REGISTRY on every numeric write.
+    if !kind.is_bigint() && crate::value::JSValue::from_bits(value.to_bits()).is_number() {
+        if let Some(offset) = numeric_byte_offset(offset_value) {
+            let buf = unbox_buffer_ptr(buf_f64.to_bits()) as *mut BufferHeader;
+            unsafe { write_number(buf, offset, value, kind, little) };
+            return f64::from_bits(crate::value::TAG_UNDEFINED);
+        }
+    }
+
     let scope = crate::gc::RuntimeHandleScope::new();
     let buf_handle = scope.root_nanbox_f64(buf_f64);
     let offset = to_byte_offset(offset_value);
@@ -305,51 +381,7 @@ pub fn js_data_view_set(
     }
     let n = to_number(value);
     let buf = unbox_buffer_ptr(buf_handle.get_nanbox_f64().to_bits()) as *mut BufferHeader;
-    unsafe {
-        match kind {
-            DataViewKind::BigInt64 | DataViewKind::BigUint64 => unreachable!(),
-            DataViewKind::Int8 | DataViewKind::Uint8 => {
-                // ToUint8 / ToInt8 wrap to the same byte; store identically.
-                let byte = wrap_to_u64(n, 8) as u8;
-                write_bytes(buf, offset, &[byte]);
-            }
-            DataViewKind::Int16 | DataViewKind::Uint16 => {
-                let v = wrap_to_u64(n, 16) as u16;
-                let b = if little {
-                    v.to_le_bytes()
-                } else {
-                    v.to_be_bytes()
-                };
-                write_bytes(buf, offset, &b);
-            }
-            DataViewKind::Int32 | DataViewKind::Uint32 => {
-                let v = wrap_to_u64(n, 32) as u32;
-                let b = if little {
-                    v.to_le_bytes()
-                } else {
-                    v.to_be_bytes()
-                };
-                write_bytes(buf, offset, &b);
-            }
-            DataViewKind::Float32 => {
-                let v = n as f32;
-                let b = if little {
-                    v.to_le_bytes()
-                } else {
-                    v.to_be_bytes()
-                };
-                write_bytes(buf, offset, &b);
-            }
-            DataViewKind::Float64 => {
-                let b = if little {
-                    n.to_le_bytes()
-                } else {
-                    n.to_be_bytes()
-                };
-                write_bytes(buf, offset, &b);
-            }
-        }
-    }
+    unsafe { write_number(buf, offset, n, kind, little) };
     f64::from_bits(crate::value::TAG_UNDEFINED)
 }
 

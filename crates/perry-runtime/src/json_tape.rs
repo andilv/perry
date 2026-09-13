@@ -1139,19 +1139,7 @@ pub struct LazyArrayHeader {
     pub sequential_streak: u32,
 }
 
-// `cached_length` at offset 0 is a CODEGEN contract, not a layout preference:
-// Perry inlines `.length` as a raw u32 load at offset 0 rather than calling
-// `js_array_length`, so an unmaterialized lazy array only reports the right
-// length because this field sits first. Nothing else in the tree enforced
-// that — the guarantee lived in a doc comment — so a field reordered into
-// the front would have produced silently wrong `.length` values with every
-// test still green. Adding a field to this struct is the moment that can
-// happen, so pin it here.
-const _: () = assert!(
-    std::mem::offset_of!(LazyArrayHeader, cached_length) == 0,
-    "LazyArrayHeader::cached_length must stay at offset 0 — codegen inlines \
-     `.length` as a raw u32 load there"
-);
+mod layout;
 
 /// #7478: how long a run of consecutive ascending cold reads has to get
 /// before we stop materializing element-by-element and hand the whole
@@ -1929,9 +1917,9 @@ pub unsafe fn force_materialize_lazy(hdr: *mut LazyArrayHeader) -> *mut crate::a
             };
             let value_handle = elem_scope.root_nanbox_u64(value.bits());
             let arr_ptr = array_from_nanbox_handle(&arr_handle);
-            let elements_ptr = (arr_ptr as *mut u8)
-                .add(std::mem::size_of::<crate::array::ArrayHeader>())
-                as *mut u64;
+            let elements_ptr =
+                crate::array::array_elements_ptr(arr_ptr as *const crate::array::ArrayHeader)
+                    as *mut u64;
             let value_bits = value_handle.get_nanbox_u64();
             // GC_STORE_AUDIT(BARRIERED): note_array_slot below re-stores this slot with the barrier.
             *elements_ptr.add(i) = value_bits;

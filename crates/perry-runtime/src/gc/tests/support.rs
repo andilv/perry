@@ -432,6 +432,8 @@ pub(super) fn reset_copying_nursery_runtime_test_state() {
     crate::object::test_clear_arguments_object_roots();
     crate::symbol::test_clear_symbol_side_table_roots();
     crate::json::test_clear_parse_roots();
+    crate::string::prune_dead_utf16_indexes(&|_| true);
+    crate::string::trim_cache::test_clear_trim_cache();
     crate::set::test_clear_set_roots();
     crate::os::test_clear_process_event_listeners();
     crate::promise::test_clear_promise_scanner_roots();
@@ -922,7 +924,7 @@ pub(super) unsafe fn alloc_old_test_array(
     (*arr).length = length;
     (*arr).capacity = length;
     let elements =
-        (arr as *mut u8).add(std::mem::size_of::<crate::array::ArrayHeader>()) as *mut u64;
+        crate::array::array_elements_ptr(arr as *const crate::array::ArrayHeader) as *mut u64;
     for i in 0..length as usize {
         *elements.add(i) = 0;
     }

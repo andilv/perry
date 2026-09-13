@@ -65,9 +65,8 @@ pub(crate) unsafe fn parse_client_args(args_array: i64) -> ClientArgs {
         return out;
     }
     let len = (*arr_ptr).length as usize;
-    let elements = (arr_ptr as *const u8).add(std::mem::size_of::<ArrayHeader>()) as *const u64;
     for i in 0..len {
-        let bits = *elements.add(i);
+        let bits = perry_ffi::js_array_get(arr_ptr, i as u32).bits();
         // The response callback is the (single) function argument — match
         // it by value type, not position.
         if js_value_is_closure(bits as i64) != 0 {

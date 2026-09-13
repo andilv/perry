@@ -333,15 +333,16 @@ pub(crate) fn test_reset_class_field_inline_guard() {
 /// setup that runs during every program's startup, `Object.freeze` on a config
 /// object, …) no longer disable the #5093 fast path process-wide.
 ///
-/// The prototype-registry probes scan by value (O(#classes)). This comment
-/// used to add "descriptor installs are rare and never on the hot property
-/// path, so the scan cost is acceptable", and that is false for every bundle:
+/// The prototype-registry probe used to scan by value (O(#classes)). This
+/// comment used to add "descriptor installs are rare and never on the hot
+/// property path, so the scan cost is acceptable", and that is false for every bundle:
 /// esbuild's `__export(exports, { … })` makes `Object.defineProperty` a
 /// module-init primitive — claude-code's bundle contains 1,526 of them — so
 /// this function runs 26,290 times on `claude --help` and
 /// `is_registered_class_prototype_object`'s scan alone was 0.46% of the run.
-/// It is now fronted by `CLASS_PROTOTYPE_ADDR_FILTER`, which rejects 99.05% of
-/// those calls before the scan; the O(#classes) slope itself is #9225.
+/// It is now served by the exact inverse prototype-address index, including GC
+/// rekeys, so each negative probe stays O(1) even when a class-heavy graph
+/// saturates the older monotone address filter (#9225, #10106).
 ///
 /// #6759 C5a — per-KEY refinement (the follow-up the paragraph above used to
 /// promise): the inline fast path only ever compiles accesses to DECLARED
@@ -990,6 +991,31 @@ pub(crate) fn set_property_attrs(obj: usize, key: String, attrs: PropertyAttrs) 
         .insert((obj, key), attrs);
 }
 
+/// Install a group of data descriptors without exposing intermediate states.
+/// No JS runs between entries, so one plan invalidation and semantic shape
+/// transition retire all prior observations just as repeated installs would.
+/// The per-key guard, owner index, and GC bookkeeping still run for every key.
+pub(crate) fn set_property_attrs_batch(obj: usize, entries: &[(&str, PropertyAttrs)]) {
+    if entries.is_empty() {
+        return;
+    }
+    super::prop_plan::prop_plan_epoch_bump();
+    note_descriptor_target(obj);
+    let st = state();
+    st.descriptors.property_attrs_in_use.set(true);
+    GLOBAL_DESCRIPTORS_IN_USE.store(true, Ordering::Relaxed);
+    for &(key, attrs) in entries {
+        disable_inline_guards_for_descriptor_target(obj, key);
+        note_meta_descriptor_key(obj, key, false);
+        note_young_descriptor_owner(st, obj, None);
+        owner_index_add(&st.descriptors.attr_keys_by_owner, obj, key);
+        st.descriptors
+            .property_descriptors
+            .borrow_mut()
+            .insert((obj, key.to_string()), attrs);
+    }
+}
+
 /// Remove a customized property descriptor for (obj, key), restoring default
 /// data-property attributes for subsequent writes and reflection.
 pub(crate) fn clear_property_attrs(obj: usize, key: &str) {
@@ -1074,9 +1100,9 @@ pub(crate) fn accessor_descriptor_keys_for_obj(obj: usize) -> Vec<String> {
 /// invoking it. Returns `None` (rather than reading the field) when there is no
 /// accessor at all, so the caller falls back to an ordinary field read.
 pub(crate) fn reflect_getter_closure_bits(value: f64, key: f64) -> Option<u64> {
-    if !state().descriptors.accessors_in_use.get() {
-        return None;
-    }
+    // Builtin accessors live in the descriptor table without arming the
+    // user-accessor fast-path gate. Reflect.get with a distinct receiver must
+    // find them too; get_accessor_descriptor uses each owner's key summary.
     // #6943: `js_string_coerce` allocates for every non-heap-string key and can
     // run a user `toString` / `valueOf` for an object key, so it can trigger a
     // GC that **evacuates**. `value` (the prototype-chain walk's starting

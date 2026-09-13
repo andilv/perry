@@ -607,6 +607,33 @@ fn clone_buffer_header(addr: usize, detach_source: bool) -> f64 {
 
     let src = addr as *mut crate::buffer::BufferHeader;
     let src_len = unsafe { (*src).length };
+    // A constructor-created DataView has a private cached data pointer rather
+    // than inline bytes. Clone its visible window into a fresh ArrayBuffer and
+    // go through the constructor so the clone gets the same representation;
+    // merely marking an inline buffer as a DataView would make the numeric
+    // setter interpret its first bytes as that cache pointer.
+    if crate::buffer::is_data_view(addr) {
+        let backing = crate::buffer::buffer_alloc(src_len);
+        unsafe {
+            (*backing).length = src_len;
+            if src_len > 0 {
+                std::ptr::copy_nonoverlapping(
+                    crate::buffer::buffer_data(src),
+                    crate::buffer::buffer_data_mut(backing),
+                    src_len as usize,
+                );
+            }
+        }
+        crate::buffer::mark_as_array_buffer(backing as usize);
+        let backing_value = crate::value::js_nanbox_pointer(backing as i64);
+        let cloned = crate::buffer::js_data_view_new(backing_value, 0.0, src_len as f64);
+        if detach_source {
+            let cloned_addr = pointer_addr(cloned).unwrap_or(0);
+            record_transfer_clone(addr, cloned_addr);
+        }
+        return cloned;
+    }
+
     let dst = crate::buffer::buffer_alloc(src_len);
     unsafe {
         (*dst).length = src_len;
@@ -624,9 +651,6 @@ fn clone_buffer_header(addr: usize, detach_source: bool) -> f64 {
         crate::buffer::mark_as_array_buffer(dst_addr);
     } else if crate::buffer::is_shared_array_buffer(addr) {
         crate::buffer::mark_as_shared_array_buffer(dst_addr);
-    } else if crate::buffer::is_data_view(addr) {
-        crate::buffer::mark_as_data_view(dst_addr);
-        crate::buffer::set_buffer_ab_alias(dst_addr, crate::buffer::resolve_buffer_ab_alias(addr));
     } else if crate::buffer::is_uint8array_buffer(addr) {
         crate::buffer::mark_as_uint8array(dst_addr);
         crate::buffer::set_buffer_ab_alias(dst_addr, crate::buffer::resolve_buffer_ab_alias(addr));
@@ -837,16 +861,16 @@ fn js_structured_clone_inner(value: f64, depth: usize) -> f64 {
                     for i in 0..len as usize {
                         let new_arr = pointer_addr(structured_clone_memo_value(memo_index)).unwrap()
                             as *mut crate::array::ArrayHeader;
-                        let elements = (new_arr as *mut u8)
-                            .add(std::mem::size_of::<crate::array::ArrayHeader>())
-                            as *mut f64;
+                        let elements = crate::array::array_elements_ptr(
+                            new_arr as *const crate::array::ArrayHeader,
+                        ) as *mut f64;
                         let elem = *elements.add(i);
                         let cloned = js_structured_clone_inner(elem, depth + 1);
                         let new_arr = pointer_addr(structured_clone_memo_value(memo_index)).unwrap()
                             as *mut crate::array::ArrayHeader;
-                        let elements = (new_arr as *mut u8)
-                            .add(std::mem::size_of::<crate::array::ArrayHeader>())
-                            as *mut f64;
+                        let elements = crate::array::array_elements_ptr(
+                            new_arr as *const crate::array::ArrayHeader,
+                        ) as *mut f64;
                         // GC_STORE_AUDIT(BARRIERED): note_array_slot below re-stores this slot with the barrier.
                         *elements.add(i) = cloned;
                         crate::array::note_array_slot(new_arr, i, cloned.to_bits());
@@ -1341,5 +1365,55 @@ mod structured_clone_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn structured_clone_data_view_uses_the_cached_registered_representation() {
+        let backing = crate::buffer::js_array_buffer_new(8);
+        let backing_value = crate::value::js_nanbox_pointer(backing as i64);
+        let source = crate::buffer::js_data_view_new(backing_value, 0.0, 8.0);
+        crate::buffer::js_data_view_set(
+            source,
+            0.0,
+            0x0102_0304u32 as f64,
+            crate::buffer::DataViewKind::Uint32,
+            false,
+        );
+
+        let cloned = js_structured_clone(source);
+        let cloned_addr = pointer_addr(cloned).expect("DataView clone must be a pointer");
+        assert!(crate::buffer::is_data_view(cloned_addr));
+        assert_ne!(
+            crate::buffer::buffer_backing_array_buffer(cloned_addr),
+            backing as usize,
+            "the clone must own an independent ArrayBuffer"
+        );
+
+        crate::buffer::js_data_view_set(
+            cloned,
+            4.0,
+            0x0506_0708u32 as f64,
+            crate::buffer::DataViewKind::Uint32,
+            false,
+        );
+        assert_eq!(
+            crate::buffer::js_data_view_get(
+                cloned,
+                4.0,
+                crate::buffer::DataViewKind::Uint32,
+                false,
+            ),
+            0x0506_0708u32 as f64
+        );
+        assert_eq!(
+            crate::buffer::js_data_view_get(
+                source,
+                4.0,
+                crate::buffer::DataViewKind::Uint32,
+                false,
+            ),
+            0.0,
+            "writing the clone must not change its source"
+        );
     }
 }

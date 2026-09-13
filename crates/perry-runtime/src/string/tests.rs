@@ -23,6 +23,67 @@ fn fnv1a_for_test(bytes: &[u8]) -> u64 {
 }
 
 #[test]
+fn number_to_string_uses_ecmascript_tie_to_even() {
+    let cases = [
+        // The issue's exact tie, its adjacent doubles, and positive counterpart.
+        (0xc0d9_2b80_21ff_ffff, "-25774.00207519531"),
+        (0xc0d9_2b80_2200_0000, "-25774.002075195312"),
+        (0xc0d9_2b80_2200_0001, "-25774.002075195316"),
+        (0x40d9_2b80_2200_0000, "25774.002075195312"),
+        // Further exact ties found by the issue's seeded differential sweep.
+        (0xc03c_d941_0000_0000, "-28.848648071289062"),
+        (0x40d1_4b6e_da00_0000, "17709.732055664062"),
+        (0x40c1_b0ff_d400_0000, "9057.998657226562"),
+    ];
+    for (bits, expected) in cases {
+        assert_eq!(js_format_f64(f64::from_bits(bits)), expected, "{bits:016x}");
+    }
+}
+
+#[test]
+fn number_to_string_preserves_special_values_and_notation_boundaries() {
+    let cases = [
+        (1e21, "1e+21"),
+        (1e-7, "1e-7"),
+        (1e20, "100000000000000000000"),
+        (1e-6, "0.000001"),
+        (f64::MAX, "1.7976931348623157e+308"),
+        (f64::MIN_POSITIVE, "2.2250738585072014e-308"),
+        (f64::from_bits(1), "5e-324"),
+        (f64::EPSILON, "2.220446049250313e-16"),
+        (999_999_999_999_999.0, "999999999999999"),
+        (999_999_999_999_999.9, "999999999999999.9"),
+        (1_000_000_000_000_000.0, "1000000000000000"),
+        (1_000_000_000_000_000.1, "1000000000000000.1"),
+        (-0.0, "0"),
+        (f64::INFINITY, "Infinity"),
+        (f64::NEG_INFINITY, "-Infinity"),
+    ];
+    for (value, expected) in cases {
+        assert_eq!(js_format_f64(value), expected, "{:016x}", value.to_bits());
+    }
+    assert_eq!(js_format_f64(f64::NAN), "NaN");
+}
+
+#[test]
+fn number_to_string_million_seeded_doubles_match_the_ecmascript_formatter() {
+    let mut seed = 0x1234_5678_u32;
+    let mut oracle = ryu_js::Buffer::new();
+    for index in 0..1_000_000 {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        let value = (seed as f64 / 4_294_967_296.0 - 0.5) * 1_000_000.0 / 7.0;
+        assert_eq!(
+            js_format_f64(value),
+            oracle.format_finite(value),
+            "seeded value {index}, bits {:016x}",
+            value.to_bits()
+        );
+    }
+}
+
+#[test]
 fn test_string_create() {
     let data = b"hello";
     let s = js_string_from_bytes(data.as_ptr(), data.len() as u32);
@@ -1392,4 +1453,60 @@ fn header_str_checked_matches_from_utf8_on_every_payload_class() {
 
 fn string_as_bytes_for_test<'a>(s: *const StringHeader) -> &'a [u8] {
     unsafe { slice::from_raw_parts(string_data(s), (*s).byte_len as usize) }
+}
+
+/// ASCII fast path (#10090): `case_convert` must produce byte-identical
+/// results to the pre-fast-path scalar decode loop for pure-ASCII input,
+/// including empty strings, single characters, and input already in the
+/// target case. `utf16_len` must equal `byte_len` and `flags` must be 0 —
+/// an all-ASCII payload can never carry `STRING_FLAG_HAS_LONE_SURROGATES`.
+#[test]
+fn ascii_fast_path_basic_case_conversion() {
+    for input in [
+        "",
+        "a",
+        "A",
+        "aBcD1234EfGh",
+        "already lower",
+        "ALREADY UPPER",
+    ] {
+        let s = js_string_from_bytes(input.as_ptr(), input.len() as u32);
+        let lower = js_string_to_lower_case(s);
+        let upper = js_string_to_upper_case(s);
+        assert_eq!(string_as_str(lower), input.to_ascii_lowercase());
+        assert_eq!(string_as_str(upper), input.to_ascii_uppercase());
+        for out in [lower, upper] {
+            unsafe {
+                assert_eq!((*out).utf16_len, (*out).byte_len);
+                assert_eq!((*out).flags, 0);
+            }
+        }
+    }
+}
+
+/// A lone surrogate after an ASCII prefix must still take the scalar path:
+/// `bytes.is_ascii()` is false (the WTF-8 encoding of a lone surrogate uses
+/// bytes >= 0x80), so the ASCII fast path is not taken, the surrogate bytes
+/// round-trip verbatim, and `STRING_FLAG_HAS_LONE_SURROGATES` survives.
+#[test]
+fn ascii_prefix_with_trailing_lone_surrogate_preserves_flag_and_bytes() {
+    // "ABC" + WTF-8 lone high surrogate U+D800 (ED A0 80).
+    let bytes = [b'A', b'B', b'C', 0xED, 0xA0, 0x80];
+    let s = js_string_from_wtf8_bytes(bytes.as_ptr(), bytes.len() as u32);
+    assert_ne!(unsafe { (*s).flags } & STRING_FLAG_HAS_LONE_SURROGATES, 0);
+    assert!(!string_as_bytes_for_test(s).is_ascii());
+
+    for (out, expect_ascii) in [
+        (js_string_to_lower_case(s), [b'a', b'b', b'c']),
+        (js_string_to_upper_case(s), [b'A', b'B', b'C']),
+    ] {
+        let out_bytes = string_as_bytes_for_test(out);
+        assert_eq!(&out_bytes[..3], &expect_ascii);
+        assert_eq!(&out_bytes[3..], &[0xED, 0xA0, 0x80]);
+        assert_eq!(
+            unsafe { (*out).flags } & STRING_FLAG_HAS_LONE_SURROGATES,
+            STRING_FLAG_HAS_LONE_SURROGATES,
+            "the lone surrogate must keep the result flagged"
+        );
+    }
 }

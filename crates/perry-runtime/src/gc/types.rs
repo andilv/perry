@@ -65,7 +65,10 @@ pub const GC_TYPE_OBJECT_META: u8 = 19;
 /// ObjectHeader consumer to inspect unrelated payload words for a magic value.
 /// A distinct GC kind is the authoritative, header-external discriminator.
 pub const GC_TYPE_REGEXP: u8 = 20;
-pub const GC_TYPE_MAX: u8 = GC_TYPE_REGEXP;
+/// Immutable Perex program words. All operands are integers/relative offsets;
+/// the allocation is a movable leaf reached through its RegExp owner.
+pub const GC_TYPE_REGEX_PROGRAM: u8 = 21;
+pub const GC_TYPE_MAX: u8 = GC_TYPE_REGEX_PROGRAM;
 
 pub(super) const MALLOC_KIND_UNKNOWN_INDEX: usize = 0;
 pub(super) const MALLOC_KIND_BUCKET_COUNT: usize = GC_TYPE_MAX as usize + 1;
@@ -129,6 +132,11 @@ pub fn is_large_object_total_size(total_size: usize) -> bool {
 /// say the payload is traced.
 #[inline]
 pub fn large_object_threshold_for_type(obj_type: u8) -> usize {
+    // Buffers retain their byte-storage policy: their new traced edges live
+    // in side metadata, and buffer_alloc already births every buffer old.
+    if obj_type == GC_TYPE_BUFFER {
+        return LARGE_OBJECT_THRESHOLD_BYTES;
+    }
     match gc_type_info(obj_type) {
         Some(info) if !info.pointer_free => LARGE_POINTER_BEARING_OBJECT_THRESHOLD_BYTES,
         _ => LARGE_OBJECT_THRESHOLD_BYTES,
@@ -164,6 +172,7 @@ pub(crate) enum GcRewriteDescriptorKind {
     Map,
     LazyArray,
     Set,
+    Buffer,
     NativeTypedView,
     NativePodView,
     /// #6759 Phase B: one traced NaN-box slot (`ObjectMeta::prototype`).
@@ -485,12 +494,12 @@ pub(super) static GC_TYPE_INFO_BY_ID: [Option<GcTypeInfo>; MALLOC_KIND_BUCKET_CO
         "buffer",
         GcAllocationPolicy::RawOrLargeOldArena,
         true,
-        GcRewriteDescriptorKind::Leaf,
+        GcRewriteDescriptorKind::Buffer,
         GcLayoutSlotKind::None,
         false,
         GcExternalBytePolicy::InlinePayload,
         GcLargeObjectPolicy::OldArenaWhenOverThreshold,
-        true,
+        false,
         GcMoveHookKind::None,
         GcRewriteHookKind::None,
         GcFinalizeHookKind::None,
@@ -685,6 +694,21 @@ pub(super) static GC_TYPE_INFO_BY_ID: [Option<GcTypeInfo>; MALLOC_KIND_BUCKET_CO
         GcMoveHookKind::RegExpSideTables,
         GcRewriteHookKind::None,
         GcFinalizeHookKind::RegExpSideTables,
+    )),
+    Some(gc_type_info_entry(
+        GC_TYPE_REGEX_PROGRAM,
+        "regex_program",
+        GcAllocationPolicy::Arena,
+        true,
+        GcRewriteDescriptorKind::Leaf,
+        GcLayoutSlotKind::None,
+        true,
+        GcExternalBytePolicy::InlinePayload,
+        GcLargeObjectPolicy::OldArenaWhenOverThreshold,
+        true,
+        GcMoveHookKind::None,
+        GcRewriteHookKind::None,
+        GcFinalizeHookKind::None,
     )),
 ];
 
@@ -929,7 +953,8 @@ pub(crate) fn validate_gc_type_info(info: &GcTypeInfo) -> Result<(), &'static st
                 return Err("closure rewrite descriptor must expose closure capture slots");
             }
         }
-        GcRewriteDescriptorKind::MetaOnly
+        GcRewriteDescriptorKind::Buffer
+        | GcRewriteDescriptorKind::MetaOnly
         | GcRewriteDescriptorKind::Promise
         | GcRewriteDescriptorKind::Error
         | GcRewriteDescriptorKind::Map

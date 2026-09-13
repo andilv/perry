@@ -16,6 +16,30 @@ mod json_shape_template;
 mod json_tape_owned;
 mod native_module_name;
 mod old_defrag_contract;
+#[cfg(feature = "regex-engine")]
+mod perex_construction;
+#[cfg(feature = "regex-engine")]
+mod perex_dispatch;
+#[cfg(feature = "regex-engine")]
+mod perex_execution;
+#[cfg(feature = "regex-engine")]
+mod perex_glob;
+#[cfg(feature = "regex-engine")]
+mod perex_lifecycle;
+#[cfg(feature = "regex-engine")]
+mod perex_match_all;
+#[cfg(feature = "regex-engine")]
+mod perex_match_search;
+#[cfg(feature = "regex-engine")]
+mod perex_ownership;
+#[cfg(feature = "regex-engine")]
+mod perex_public;
+#[cfg(feature = "regex-engine")]
+mod perex_replace;
+#[cfg(feature = "regex-engine")]
+mod perex_split;
+#[cfg(feature = "regex-engine")]
+mod perex_strings;
 mod prototype_addr_cache;
 mod regexp_last_index;
 mod segment_record_keys;
@@ -23,9 +47,27 @@ mod side_table_scanners;
 mod sort_collection;
 mod string_normalize_form;
 mod string_slice;
+mod string_trim;
 mod symbol_description;
 mod thenable_assimilation;
 mod transient_handles;
+mod utf16_index;
+
+/// The address a handle currently holds, as an integer: what a movement
+/// witness compares before and after a collection. Never dereferenced.
+#[cfg(feature = "regex-engine")]
+fn handle_address<T>(handle: &RuntimeHandle<'_>) -> usize {
+    handle.with_const_ptr(|p: *const T| p as usize)
+}
+
+/// A string handle's current pointer, NaN-boxed as a JavaScript value to pass
+/// straight to an entry point that roots its arguments, or to compare.
+#[cfg(feature = "regex-engine")]
+fn handle_string_value(handle: &RuntimeHandle<'_>) -> f64 {
+    handle.with_const_ptr(|p: *const crate::string::StringHeader| {
+        crate::value::js_nanbox_string(p as i64)
+    })
+}
 
 fn assert_panics_with(expected: &str, f: impl FnOnce()) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));

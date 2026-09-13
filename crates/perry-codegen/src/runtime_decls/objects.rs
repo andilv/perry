@@ -58,7 +58,7 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     // byte directly in the inline plain-array index guard.
     module.add_external_global("PERRY_ARRAY_INDEX_FAST_PATH_INVALIDATED", I8);
     // #7760: set when `Array.prototype[Symbol.iterator]` is replaced.
-    module.add_external_global("PERRY_ARRAY_PROTO_ITERATOR_PATCHED", I8);
+    module.add_external_global("PERRY_ARRAY_ITERATION_NOT_PRISTINE", I8);
     // Process-wide count of threads with an active incremental marking
     // barrier. Persistent shadow-slot updates use zero as an authoritative
     // fast skip before calling the TLS-backed root barrier.
@@ -375,6 +375,8 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     // Next.js wall 53: runtime `require(absolutePath.json)` disk fallback.
     module.declare_function("js_require_json_disk", DOUBLE, &[DOUBLE]);
     module.declare_function("js_require_resolve_node_modules", DOUBLE, &[DOUBLE, DOUBLE]);
+    module.declare_function("js_import_meta_resolve", DOUBLE, &[DOUBLE, DOUBLE, DOUBLE]);
+    module.declare_function("js_import_meta_resolve_value", DOUBLE, &[DOUBLE]);
     module.declare_function("js_globalthis_seed_async_local_storage", VOID, &[]);
     // Next.js wall 54: runtime `require(absolutePath.js)` -> AOT-compiled module.
     module.declare_function("js_register_path_module_partial", VOID, &[DOUBLE, DOUBLE]);

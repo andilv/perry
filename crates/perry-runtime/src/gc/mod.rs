@@ -155,7 +155,8 @@ pub use pin::{
 use pin::{note_preflight_skipped, note_preflight_walked, young_pin_latch_armed};
 /// Software prefetch helpers for the collector's pointer-chasing loops
 /// (drain, `clear_marks`, the remembered-set dirty scan).
-mod prefetch;
+// `regex` prefetches its owner-table walks through this too.
+pub(crate) mod prefetch;
 
 mod copying;
 mod copying_first_cycle;
@@ -1102,7 +1103,7 @@ pub fn gc_init() {
     reg_scanner!(crate::child_process::reactor::cp_reactor_scan_roots_mut);
     // #6563: live node-pty IPty objects are likewise reachable only from the
     // pty reactor's registry while their onData/onExit handlers are pending.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     reg_scanner!(crate::pty::reactor::pty_reactor_scan_roots_mut);
     // #4911: a bound node:dgram socket is reachable only from the dgram
     // reactor's registry while its recv thread runs; scan + rewrite it so a GC
@@ -1111,6 +1112,7 @@ pub fn gc_init() {
     reg_scanner!(crate::dgram_reactor::scan_roots_mut);
     reg_scanner!(json_parse_mutable_root_scanner);
     reg_scanner!(intern_table_mutable_root_scanner);
+    reg_scanner!(crate::string::scan_utf16_index_roots_mut);
     // #7564: the per-thread `{ value, done }` / `{ done, value }` keys arrays
     // shared by every iterator result the runtime builds. Nothing else in the
     // heap references them — the result objects that use them are short-lived
@@ -1124,6 +1126,7 @@ pub fn gc_init() {
     reg_scanner!(crate::intl::segmenter::scan_segment_record_keys_roots_mut);
     reg_scanner!(small_int_cache_mutable_root_scanner);
     reg_scanner!(concat_memo_mutable_root_scanner);
+    reg_scanner!(crate::string::trim_cache::scan_trim_cache_roots_mut);
     reg_scanner!(crate::builtins::scan_console_log_singleton_roots_mut);
     reg_scanner!(crate::builtins::scan_structured_clone_memo_roots_mut);
     // #8282/#8294: process EventEmitter listener closures live as raw
