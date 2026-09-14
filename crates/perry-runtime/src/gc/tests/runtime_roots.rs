@@ -19,6 +19,8 @@ mod old_defrag_contract;
 #[cfg(feature = "regex-engine")]
 mod perex_construction;
 #[cfg(feature = "regex-engine")]
+mod perex_cross_call;
+#[cfg(feature = "regex-engine")]
 mod perex_dispatch;
 #[cfg(feature = "regex-engine")]
 mod perex_execution;
@@ -33,13 +35,21 @@ mod perex_match_search;
 #[cfg(feature = "regex-engine")]
 mod perex_ownership;
 #[cfg(feature = "regex-engine")]
+mod perex_position_hint;
+#[cfg(feature = "regex-engine")]
 mod perex_public;
 #[cfg(feature = "regex-engine")]
 mod perex_replace;
 #[cfg(feature = "regex-engine")]
+mod perex_replace_direct;
+#[cfg(feature = "regex-engine")]
+mod perex_reuse;
+#[cfg(feature = "regex-engine")]
 mod perex_split;
 #[cfg(feature = "regex-engine")]
 mod perex_strings;
+#[cfg(feature = "regex-engine")]
+mod perex_work_policy;
 mod prototype_addr_cache;
 mod regexp_last_index;
 mod segment_record_keys;

@@ -8,6 +8,7 @@ use crate::gc::RuntimeHandleScope;
 use crate::string::{StringHeader, STRING_FLAG_HAS_LONE_SURROGATES};
 use perex::binding::{BoundProgram, BoundSubject};
 use perex::executor::ExecError;
+use perex::input::Position;
 use perex::span::{BoundSpan, ReadError, ReadProgress, Span};
 use perex::Budget;
 use std::mem::MaybeUninit;
@@ -127,10 +128,33 @@ pub(crate) fn copy_span(
     quantum: usize,
     poll: &mut impl FnMut() -> Result<(), EngineError>,
 ) -> Result<*mut StringHeader, EngineError> {
-    let mut readers = [
-        BoundSpan::new(subject, span).map_err(|e| read_error(e, |never| match never {}))?,
-        BoundSpan::new(subject, span).map_err(|e| read_error(e, |never| match never {}))?,
-    ];
+    copy_span_near(subject, span, None, budget, max_output_bytes, quantum, poll)
+}
+
+/// `copy_span`, with both reader passes seeking to the span from `near` when
+/// that is closer than either end. Materializing a match's captures from its
+/// search's position seeks back by at most the match length (#10164). `near`
+/// has the same same-binding requirement as `perex_runtime::find_near`.
+pub(crate) fn copy_span_near(
+    subject: &BoundSubject<HeapSubject<'_>>,
+    span: Span,
+    near: Option<Position>,
+    budget: &mut Budget,
+    max_output_bytes: usize,
+    quantum: usize,
+    poll: &mut impl FnMut() -> Result<(), EngineError>,
+) -> Result<*mut StringHeader, EngineError> {
+    let reader = || {
+        match near {
+            Some(near) => BoundSpan::new_near(subject, span, near),
+            None => BoundSpan::new(subject, span),
+        }
+        .map_err(|e| read_error(e, |never| match never {}))
+    };
+    if let Some(output) = copy_ascii_span(subject, span, budget, max_output_bytes, poll)? {
+        return Ok(output);
+    }
+    let mut readers = [reader()?, reader()?];
     copy_units(
         Some(span.len()),
         budget,
@@ -143,6 +167,76 @@ pub(crate) fn copy_span(
                 .map_err(|e| read_error(e, |error| error))
         },
     )
+}
+
+/// The span as one byte copy, when the subject is ASCII: its UTF-16 offsets
+/// are then byte offsets, and its bytes are already the output's encoding.
+/// Decoding and re-encoding it unit by unit, twice, was most of materializing
+/// an `exec` result's captures (#10166). `None` for any other subject.
+fn copy_ascii_span(
+    subject: &BoundSubject<HeapSubject<'_>>,
+    span: Span,
+    budget: &mut Budget,
+    max_output_bytes: usize,
+    poll: &mut impl FnMut() -> Result<(), EngineError>,
+) -> Result<Option<*mut StringHeader>, EngineError> {
+    let Some(length) = subject
+        .with_view(|input| input.ascii_bytes().map(|bytes| bytes.len()))
+        .map_err(EngineError::Subject)?
+    else {
+        return Ok(None);
+    };
+    if span.end() > length {
+        return Err(EngineError::InvalidSpan);
+    }
+    let units = span.len();
+    let limit = max_output_bytes.min(
+        u32::MAX as usize - crate::gc::GC_HEADER_SIZE - std::mem::size_of::<StringHeader>() - 7,
+    );
+    if units > limit || units > crate::string::MAX_STRING_LENGTH {
+        return Err(StorageError::Limit.into());
+    }
+    // The same charge a unit-by-unit read of the span makes.
+    super::perex_runtime::charge(budget, units)?;
+    poll()?;
+    let scope = RuntimeHandleScope::new();
+    let capacity = units as u32;
+    let (output, _) = crate::string::string_storage_alloc(capacity);
+    // The header publishes an empty prefix until the copy below completes. No
+    // GC occurs before the root.
+    unsafe {
+        crate::string::init_string_header(output, 0, 0, capacity, 0, 0);
+    }
+    let output = scope.root_string_ptr(output);
+    output.with_mut_ptr::<StringHeader, _>(|header| {
+        // Reacquire both bases inside one scope that neither allocates nor
+        // collects.
+        subject
+            .with_view(|input| {
+                let bytes = input.ascii_bytes().ok_or(EngineError::InvalidSpan)?;
+                let source = bytes
+                    .get(span.start()..span.end())
+                    .ok_or(EngineError::InvalidSpan)?;
+                let data = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        crate::string::string_data(header) as *mut MaybeUninit<u8>,
+                        capacity as usize,
+                    )
+                };
+                for (slot, &byte) in data.iter_mut().zip(source) {
+                    // GC_STORE_AUDIT(POINTER_FREE): ASCII payload bytes of a string under construction.
+                    slot.write(byte);
+                }
+                unsafe {
+                    crate::string::init_string_header(header, capacity, capacity, capacity, 0, 0);
+                }
+                Ok::<(), EngineError>(())
+            })
+            .map_err(EngineError::Subject)?
+    })?;
+    Ok(Some(
+        output.with_mut_ptr::<StringHeader, _>(|output| output),
+    ))
 }
 
 /// Two reusable original-string cursors for a sequence of final substrings.

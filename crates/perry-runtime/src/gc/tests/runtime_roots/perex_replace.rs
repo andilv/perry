@@ -4,7 +4,7 @@ use crate::regex::{perex_api as api, perex_dispatch as dispatch, perex_replace a
 use crate::value::{
     js_nanbox_get_pointer, js_nanbox_pointer, js_nanbox_string, TAG_NULL, TAG_UNDEFINED,
 };
-fn text<'s>(scope: &'s RuntimeHandleScope, bytes: &[u8]) -> RuntimeHandle<'s> {
+pub(super) fn text<'s>(scope: &'s RuntimeHandleScope, bytes: &[u8]) -> RuntimeHandle<'s> {
     scope.root_nanbox_f64(js_nanbox_string(crate::string::js_string_from_bytes(
         bytes.as_ptr(),
         bytes.len() as u32,
@@ -15,7 +15,11 @@ fn object<'s>(scope: &'s RuntimeHandleScope) -> RuntimeHandle<'s> {
         crate::object::js_object_alloc(0, 8) as i64
     ))
 }
-fn regex<'s>(scope: &'s RuntimeHandleScope, source: &[u8], flags: &[u8]) -> RuntimeHandle<'s> {
+pub(super) fn regex<'s>(
+    scope: &'s RuntimeHandleScope,
+    source: &[u8],
+    flags: &[u8],
+) -> RuntimeHandle<'s> {
     let source = text(scope, source);
     let flags = text(scope, flags);
     scope.root_nanbox_f64(js_nanbox_pointer(crate::regex::js_regexp_construct(
@@ -23,16 +27,20 @@ fn regex<'s>(scope: &'s RuntimeHandleScope, source: &[u8], flags: &[u8]) -> Runt
         flags.get_nanbox_f64(),
     ) as i64))
 }
-fn function<'s>(scope: &'s RuntimeHandleScope, fp: *const u8, arity: u32) -> RuntimeHandle<'s> {
+pub(super) fn function<'s>(
+    scope: &'s RuntimeHandleScope,
+    fp: *const u8,
+    arity: u32,
+) -> RuntimeHandle<'s> {
     crate::closure::js_register_closure_arity(fp, arity);
     scope.root_nanbox_f64(js_nanbox_pointer(
         crate::closure::js_closure_alloc_singleton(fp) as i64,
     ))
 }
-fn get(owner: &RuntimeHandle<'_>, name: &[u8]) -> f64 {
+pub(super) fn get(owner: &RuntimeHandle<'_>, name: &[u8]) -> f64 {
     api::finish(dispatch::get(owner, name))
 }
-fn put(owner: &RuntimeHandle<'_>, name: &[u8], value: f64) {
+pub(super) fn put(owner: &RuntimeHandle<'_>, name: &[u8], value: f64) {
     let scope = RuntimeHandleScope::new();
     let value = scope.root_nanbox_f64(value);
     let key = crate::string::canonical_key(name);
@@ -76,12 +84,12 @@ fn accessor(owner: &RuntimeHandle<'_>, key: f64, getter: f64, setter: f64) {
     );
 }
 
-fn bytes(value: f64) -> Vec<u8> {
+pub(super) fn bytes(value: f64) -> Vec<u8> {
     let mut short = [0; crate::value::SHORT_STRING_MAX_LEN];
     let (data, n) = crate::string::str_bytes_from_jsvalue(value, &mut short).unwrap();
     unsafe { std::slice::from_raw_parts(data, n as usize).to_vec() }
 }
-fn captured<'s>(
+pub(super) fn captured<'s>(
     scope: &'s RuntimeHandleScope,
     fp: *const u8,
     arity: u32,
@@ -491,4 +499,28 @@ fn perex_replace_primitive_search_skips_prototype_hook_and_coerces_receiver() {
             1
         );
     }
+}
+
+#[test]
+fn perex_replace_output_is_not_capped_by_the_scratch_limit() {
+    let _triggers = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    super::perex_public::register_host_roots();
+    let scope = RuntimeHandleScope::new();
+    // Each match after the first appends the preceding "b" and the "x" that
+    // replaces it: two pieces of three list entries each. The scratch limit
+    // divided by eight was the list's former entry cap, so this is one match
+    // past what could be written before.
+    let former_cap = api::SCRATCH_BYTES / 8;
+    let matches = former_cap / 6 + 1;
+    let input = text(&scope, &b"ab".repeat(matches));
+    let search = text(&scope, b"a");
+    let replacement = text(&scope, b"x");
+    let result = crate::regex::js_string_replace_all_js(
+        input.get_nanbox_f64(),
+        search.get_nanbox_f64(),
+        replacement.get_nanbox_f64(),
+    );
+    let output = bytes(result);
+    assert_eq!(output.len(), matches * 2);
+    assert!(output.as_chunks::<2>().0.iter().all(|pair| pair == b"xb"));
 }

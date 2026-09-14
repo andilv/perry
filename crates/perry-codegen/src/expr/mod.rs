@@ -156,6 +156,8 @@ mod array_push_guard_tests;
 mod barrier_stem_census_tests;
 #[cfg(test)]
 mod class_field_barrier_tests;
+#[cfg(test)]
+mod class_field_get_shape_tests;
 mod dispatch;
 #[cfg(test)]
 mod index_set_barrier_tests;
@@ -2096,6 +2098,151 @@ pub(crate) struct ClassFieldLoopFact {
     pub fields: std::collections::BTreeMap<String, u32>,
 }
 
+/// #10123: where the fast clone's element index comes from.
+///
+/// The class-keyed arm admits [`Self::Counter`] only — the preheader's
+/// `length >= bound` check is then exactly "the verified prefix covers every
+/// index the loop reads". The other two arms index somewhere the trip count
+/// says nothing about, so each carries its OWN preheader obligation (see
+/// `expr::element_shape_guard::ElementShapeIndexBound`) and the fast clone
+/// still pays no per-read bounds test.
+///
+/// The counter arm's obligation is also DROPPED for the other two, and that is
+/// not an optimization: leaving it in made the whole shape-keyed arm dead on
+/// its own benchmark, because `for (i = 0; i < 1000000; i++) sum +=
+/// rows[7].id` over a 7,600-element array asks it to prove `length >=
+/// 1000000`. See the `trip_ok` comment in the guard emitter.
+#[derive(Debug, Clone)]
+pub(crate) enum ElementShapeIndex {
+    /// `arr[j]` — the counter, read from its canonical i32 slot.
+    Counter,
+    /// `arr[7]` — a compile-time constant in `0..=i32::MAX`. The preheader
+    /// proved `length > k`.
+    Constant(i64),
+    /// `const d = j % m; … arr[d]` — the shape every sequential-access loop
+    /// over a parsed record array is written in.
+    ///
+    /// `d` is VIRTUAL in the clone exactly like #7771's element binding: its
+    /// `Let` emits an `srem i32` into `slot` (`stmt/let_stmt.rs`) instead of
+    /// the generic `%` lowering, which would be a runtime call and would
+    /// therefore DELETE the clone rather than slow it. The preheader proved
+    /// `1 <= m <= length`, and the counter is non-negative, so
+    /// `srem(counter, m)` is in `[0, length)` with no per-read test.
+    DerivedMod {
+        /// The `const` local the body binds; nothing else may read it.
+        local_id: u32,
+        /// i32 SSA value of the modulus, materialized in the preheader.
+        modulus_i32: String,
+        /// Entry-block i32 alloca the clone writes the derived index to.
+        slot: String,
+    },
+    /// #10185: a LOOP-CARRIED index — `let c = …;` outside the loop,
+    /// `c = (a*c + b) % m;` as the body's first statement, then `arr[c]` (or
+    /// `const index = c; arr[index]`). The benchmark's `random` mode, and the
+    /// shape every pseudo-random walk over a record array is written in.
+    ///
+    /// Unlike [`Self::DerivedMod`]'s `d`, `c` is a real mutable binding that is
+    /// LIVE AFTER THE LOOP, so the clone owes a write-back. It pays it once per
+    /// iteration, at the END of the iteration (`Carried::commit_slot`), which is
+    /// also what makes the residual side exit correct: every exit from the
+    /// middle of an iteration leaves the real slot holding the value it had at
+    /// that iteration's ENTRY, so the slow clone re-runs the update exactly
+    /// once. A write-back at the update site would double-apply the recurrence.
+    Carried(Box<CarriedIndex>),
+}
+
+/// #10185: everything [`ElementShapeIndex::Carried`] needs, boxed to keep the
+/// enum small.
+#[derive(Debug, Clone)]
+pub(crate) struct CarriedIndex {
+    /// The `let` binding the recurrence advances.
+    pub local_id: u32,
+    /// `const index = c` — an optional alias the body may spell the subscript
+    /// through. Also virtual: its `Let` emits nothing.
+    pub alias_id: Option<u32>,
+    /// `c' = (a*c + b) % m`, folded to one affine pair by the matcher. Both
+    /// non-negative, and `|a| * i32::MAX + |b|` proven below 2^53 so the i64
+    /// evaluation agrees with the f64 one JavaScript performs.
+    pub coeff_a: i64,
+    pub coeff_b: i64,
+    /// i32 SSA value of the modulus, materialized in the preheader.
+    pub modulus_i32: String,
+    /// Entry-block i32 alloca holding the live carried value inside the clone.
+    pub slot: String,
+    /// The binding's REAL (NaN-boxed double) slot, written once per iteration
+    /// after every side exit for that iteration has been passed.
+    pub commit_slot: String,
+}
+
+/// #10185: the per-iteration element prefetch.
+///
+/// `rows[index].id + rows[index].name.length + (rows[index].active ? 1 : 0)`
+/// reads ONE element three times. Without this each read repeats the element
+/// load AND the residual header/ShapeId check, which is three branches and
+/// three redundant loads per iteration. The prologue attached to the body's
+/// leading virtual binding does both once and parks the masked element handle
+/// in an entry alloca; every read is then a bare offset load plus the tag test
+/// its own consumer needs.
+///
+/// It is also what makes a MULTI-READ body's side exit correct: every residual
+/// exit now happens in the prologue, before any accumulator store has
+/// committed, so resuming the iteration in the slow clone cannot double-apply
+/// an earlier read.
+#[derive(Debug, Clone)]
+pub(crate) struct ElementPrefetch {
+    /// The virtual binding whose lowering emits the prologue. Exactly one
+    /// statement owns it, so a body with both a carried update and an alias
+    /// emits it once.
+    pub site_local_id: u32,
+    /// Entry-block i64 alloca holding the masked element handle.
+    pub handle_slot: String,
+}
+
+impl ElementShapeIndex {
+    /// Does computing this index read the counter's canonical i32 slot?
+    ///
+    /// `Constant` is a literal, so the clone never touches the counter at all
+    /// except for the trip test — which
+    /// `lower_for_after_init_with_i32_bound` already falls back to a double
+    /// compare for. This is why `for (i = 0; i < n; i++) sum += rows[7].id`
+    /// gets a clone: its counter is neither index-used nor i32-bounded, so
+    /// `stmt/let_stmt.rs` mints no i32 slot for it, and demanding one would
+    /// have declined the benchmark's own `repeat` shape.
+    ///
+    /// The matcher, the fact lookup and the field lowering must all ask this
+    /// same question: a lookup that answered `Some` for a read the lowering
+    /// then declined would hand `is_numeric_expr` a raw-double promise the
+    /// generic path does not keep.
+    pub(crate) fn needs_counter_i32_slot(&self) -> bool {
+        !matches!(
+            self,
+            ElementShapeIndex::Constant(_) | ElementShapeIndex::Carried(_)
+        )
+    }
+
+    /// #10185: the locals whose `Let` / `LocalSet` the fast clone lowers
+    /// VIRTUALLY for this index form. Nothing may read one of them bare inside
+    /// the clone, and their shadow slots must not be cleared there.
+    pub(crate) fn virtual_locals(&self) -> impl Iterator<Item = u32> + '_ {
+        let (a, b) = match self {
+            ElementShapeIndex::DerivedMod { local_id, .. } => (Some(*local_id), None),
+            ElementShapeIndex::Carried(carried) => (Some(carried.local_id), carried.alias_id),
+            _ => (None, None),
+        };
+        a.into_iter().chain(b)
+    }
+}
+
+/// #10123: where one tracked property's value sits inside an element.
+#[derive(Debug, Clone)]
+pub(crate) enum ElementShapeFieldSlot {
+    /// Class-keyed: the compile-time packed field index.
+    Packed(u32),
+    /// Shape-keyed: an i64 SSA value produced once in the preheader by
+    /// `js_shape_ordinary_inline_slot_for_key`, proven non-negative there.
+    Runtime(String),
+}
+
 /// #5093 / repsel #7480: one fact per (array, counter, versioned loop) — the
 /// element-shape clone's licence to read `arr[i].field` with no guard.
 ///
@@ -2111,12 +2258,36 @@ pub(crate) struct ClassFieldLoopFact {
 ///
 /// and the lowering proved the fast clone is call-free, so nothing can revoke
 /// the invariant or move the array while the clone runs.
+///
+/// #10123 added a second, SHAPE-keyed arm. It proves the same thing about a
+/// different identity: the preheader asks
+/// `js_array_ensure_element_shape_ordinary` for the exact ordinary ShapeId
+/// every element carries, which is what a `JSON.parse`'d record array (class
+/// 0, an ordinary birth shape) can prove and a class id is not. The three
+/// facts the clone then reads per element — the slot index, the expected
+/// ShapeId, and that the loaded word really is a Number — all come from that
+/// arm's preheader instead of from a compile-time class.
 #[derive(Debug, Clone)]
 pub(crate) struct ElementShapeLoopFact {
     /// LocalId of the loop-invariant array the preheader guarded.
     pub array_local_id: u32,
-    /// LocalId of the loop counter used as the element index.
+    /// LocalId of the loop counter. It is the element index only when
+    /// [`Self::index`] is [`ElementShapeIndex::Counter`]; it is always the
+    /// local whose canonical i32 slot the clone reads.
     pub index_local_id: u32,
+    /// #10123: how the clone computes the element index.
+    pub index: ElementShapeIndex,
+    /// #10185: the shared per-iteration element deref, when the body has a
+    /// leading virtual binding to hang it off. `None` keeps #10123's per-read
+    /// deref + residual check.
+    pub elem_prefetch: Option<ElementPrefetch>,
+    /// #10123: true when the preheader proved an exact ordinary ShapeId rather
+    /// than a class id. The per-element residual check then drops the
+    /// typed-layout conjunct (a parsed record's layout is
+    /// `GC_LAYOUT_UNKNOWN`/pointer-free, never a typed layout) and adds a
+    /// Number-tag test on the loaded word, because a shape proves which slot
+    /// holds `field` but not what representation the value in it has.
+    pub shape_keyed: bool,
     pub scope_id: u32,
     /// Class the preheader proved every element in the verified prefix has.
     pub class_name: String,
@@ -2134,9 +2305,20 @@ pub(crate) struct ElementShapeLoopFact {
     /// the exact ShapeId, descriptor-free state, and raw-f64 layout for every
     /// field this clone reads. When true, no per-object residual is needed.
     pub statically_layout_proven: bool,
-    /// property name -> packed slot index, every entry a declared raw-f64
-    /// candidate validated by the matcher.
-    pub fields: std::collections::BTreeMap<String, u32>,
+    /// property name -> the slot the clone reads it from. Class-keyed entries
+    /// are compile-time packed indices validated by the matcher as declared
+    /// raw-f64 candidates; shape-keyed ones are the preheader's live query
+    /// results (#10123).
+    pub fields: std::collections::BTreeMap<String, ElementShapeFieldSlot>,
+    /// #10185: true when the fast clone lowers a body the matcher SYNTHESIZED
+    /// (the K-statement accumulator fold, or the carried index's trailing
+    /// write-back) rather than the source body. The function-wide
+    /// shadow-slot-clear map is keyed by statement INDEX, so a rewritten body
+    /// would attribute a clear to the wrong statement; the clone is call-free,
+    /// so no collection can observe a slot inside it and the clears are simply
+    /// suppressed there (`expr::emit_shadow_slot_clear`). The slow clone lowers
+    /// the original body, with its original indices and its original clears.
+    pub synthesized_body: bool,
     /// #7771: the body's `const r = arr[counter]` binding, when the matcher
     /// admitted the element-binding form. Inside the fast clone the `Let`
     /// itself emits nothing (`stmt/let_stmt.rs`) and every `r.field` read
@@ -2183,27 +2365,47 @@ pub(crate) fn element_shape_loop_fact_for_property_get<'f>(
     ctx: &'f FnCtx<'_>,
     object: &perry_hir::Expr,
     property: &str,
-) -> Option<(&'f ElementShapeLoopFact, u32)> {
+) -> Option<(&'f ElementShapeLoopFact, &'f ElementShapeFieldSlot)> {
     use perry_hir::Expr;
     if ctx.element_shape_loop_facts.is_empty() {
         return None;
     }
     match object {
         Expr::IndexGet { object, index } => {
-            let (Expr::LocalGet(array_local_id), Expr::LocalGet(index_local_id)) =
-                (object.as_ref(), index.as_ref())
-            else {
+            let Expr::LocalGet(array_local_id) = object.as_ref() else {
                 return None;
             };
-            if !ctx.i32_counter_slots.contains_key(index_local_id) {
-                return None;
-            }
             ctx.element_shape_loop_facts.iter().rev().find_map(|fact| {
-                if fact.array_local_id != *array_local_id || fact.index_local_id != *index_local_id
+                if fact.array_local_id != *array_local_id
+                    || (fact.index.needs_counter_i32_slot()
+                        && !ctx.i32_counter_slots.contains_key(&fact.index_local_id))
                 {
                     return None;
                 }
-                fact.fields.get(property).map(|idx| (fact, *idx))
+                // #10123: the index SPELLING must be the one the fact's
+                // preheader discharged a bounds obligation for. A fact built
+                // for `arr[7]` says nothing about `arr[j]` in the same body,
+                // and the matcher's one-index-form rule means a body mixing
+                // them was never admitted — this is what keeps that true at
+                // the read.
+                let spelled = match (&fact.index, index.as_ref()) {
+                    (ElementShapeIndex::Counter, Expr::LocalGet(id)) => *id == fact.index_local_id,
+                    (ElementShapeIndex::Constant(k), Expr::Integer(n)) => *n == *k,
+                    (ElementShapeIndex::DerivedMod { local_id, .. }, Expr::LocalGet(id)) => {
+                        *id == *local_id
+                    }
+                    // #10185: `arr[c]` and `const index = c; arr[index]` are
+                    // the same subscript — the alias is virtual, so both
+                    // spellings read the carried slot the preheader bounded.
+                    (ElementShapeIndex::Carried(carried), Expr::LocalGet(id)) => {
+                        *id == carried.local_id || carried.alias_id == Some(*id)
+                    }
+                    _ => false,
+                };
+                if !spelled {
+                    return None;
+                }
+                fact.fields.get(property).map(|slot| (fact, slot))
             })
         }
         // #7771: `r.field` through the clone's element binding. The matcher
@@ -2217,7 +2419,7 @@ pub(crate) fn element_shape_loop_fact_for_property_get<'f>(
             {
                 return None;
             }
-            fact.fields.get(property).map(|idx| (fact, *idx))
+            fact.fields.get(property).map(|slot| (fact, slot))
         }),
         _ => None,
     }
@@ -2817,6 +3019,7 @@ mod typed_array_rmw;
 pub(crate) use instance_misc1::builtin_parent_reserved_class_id;
 pub(crate) mod class_field_inline_guard;
 pub(crate) mod element_shape_guard;
+pub(crate) mod element_shape_reads;
 mod js_runtime;
 mod literals_vars;
 mod logical_collections;

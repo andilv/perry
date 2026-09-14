@@ -772,8 +772,18 @@ impl GcCycleState {
             GcCyclePhase::MarkPropagation => self.step_mark_propagation(budget),
             GcCyclePhase::BlockPersistence => self.step_block_persistence(budget),
             GcCyclePhase::AtomicFinalize => self.step_atomic_finalize(budget),
-            GcCyclePhase::Sweep => self.step_sweep(budget),
-            GcCyclePhase::Reclaim => self.step_reclaim(budget),
+            GcCyclePhase::Sweep => {
+                let _heap_change = crate::gc::heap_generation::HeapChange::begin(
+                    crate::gc::heap_generation::HeapChangeKind::Sweep,
+                );
+                self.step_sweep(budget)
+            }
+            GcCyclePhase::Reclaim => {
+                let _heap_change = crate::gc::heap_generation::HeapChange::begin(
+                    crate::gc::heap_generation::HeapChangeKind::Reclaim,
+                );
+                self.step_reclaim(budget)
+            }
             GcCyclePhase::Complete => {}
         }
         self.active_step_start = None;
@@ -1273,12 +1283,25 @@ impl GcCycleState {
                     return;
                 }
                 let done = {
+                    // #10182: a synchronous full's census knows which blocks
+                    // the trace never reached; the require-marked walk skips
+                    // them. A budgeted cycle has no census (and its mutator
+                    // windows can still shade), so it walks everything.
+                    let budgeted = self.progress_kind.is_budgeted();
+                    let valid_ptrs = self.valid_ptrs.as_ref();
                     let state = self
                         .atomic_finalize
                         .as_mut()
                         .expect("atomic finalize state exists");
                     let rebuild = state.remembered_rebuild.get_or_insert_with(|| {
-                        OldToYoungRememberedRebuildState::new(/* require_marked = */ true)
+                        let skip = if budgeted {
+                            None
+                        } else {
+                            valid_ptrs.and_then(|ptrs| ptrs.block_census.unmarked_blocks())
+                        };
+                        OldToYoungRememberedRebuildState::new_skipping(
+                            /* require_marked = */ true, skip,
+                        )
                     });
                     rebuild.step(budget)
                 };
@@ -1370,6 +1393,9 @@ impl GcCycleState {
         let mut evacuation = EvacuationTraceStats::default();
         let mut evacuation_sticky = StickyRememberedSet::default();
         if minor.evacuation_policy.enabled {
+            let _heap_change = crate::gc::heap_generation::HeapChange::begin(
+                crate::gc::heap_generation::HeapChangeKind::Evacuation,
+            );
             let phase_start = trace_phase_start(&self.trace);
             let mut evacuated_new_headers = Vec::new();
             let mut evacuated_original_headers = Vec::new();
@@ -1378,11 +1404,16 @@ impl GcCycleState {
                 &mut evacuated_new_headers,
                 &mut evacuated_original_headers,
             );
-            let old_page_evacuation = evacuate_selected_old_pages_collecting(
-                &minor.old_page_selection.pages,
-                &mut evacuated_new_headers,
-                &mut evacuated_original_headers,
-            );
+            let old_page_evacuation = {
+                let _compaction = crate::gc::heap_generation::HeapChange::begin(
+                    crate::gc::heap_generation::HeapChangeKind::Compaction,
+                );
+                evacuate_selected_old_pages_collecting(
+                    &minor.old_page_selection.pages,
+                    &mut evacuated_new_headers,
+                    &mut evacuated_original_headers,
+                )
+            };
             evacuation.objects = evacuation
                 .objects
                 .saturating_add(old_page_evacuation.objects);
@@ -1499,6 +1530,16 @@ impl GcCycleState {
                     full_trace && !self.progress_kind.is_budgeted(),
                 ),
             );
+            // #10182: a synchronous full reclaims dead, obligation-free blocks
+            // without walking them. Only its census-built pointer set records
+            // which blocks the trace reached; a budgeted cycle's classifier
+            // set is disarmed and this is a no-op.
+            if full_trace && !self.progress_kind.is_budgeted() {
+                if let Some(valid_ptrs) = self.valid_ptrs.as_ref() {
+                    let sweep = self.sweep_state.take().expect("sweep state was just built");
+                    self.sweep_state = Some(sweep.with_block_skip(&valid_ptrs.block_census));
+                }
+            }
         }
         let done = self
             .sweep_state

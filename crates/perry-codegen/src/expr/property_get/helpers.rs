@@ -359,24 +359,28 @@ pub(crate) fn lower_raw_f64_class_field_get_for_number_context(
     // candidate at the packed slot index carried here. So the lowering needs
     // nothing from the receiver's static type, and asking for it would have
     // made the whole clone dead IR.
-    if let Some((fact, field_index)) =
+    if let Some((fact, field_slot)) =
         crate::expr::element_shape_loop_fact_for_property_get(ctx, object, property)
-            .map(|(fact, idx)| (fact.clone(), idx))
+            .map(|(fact, slot)| (fact.clone(), slot.clone()))
     {
         // Both receiver spellings — `arr[j].field` and #7771's `r.field`
         // through the clone's element binding — resolve to the fact's own
         // array; the report below must not re-derive it from the expression
         // shape, which the binding form does not carry.
         let arr_id = fact.array_local_id;
-        // The counter's canonical i32 slot is what the matcher required;
-        // without it there is nothing to index with.
-        if let Some(slot) = ctx.i32_counter_slots.get(&fact.index_local_id).cloned() {
-            let idx_i32 = ctx.block().load(I32, &slot);
+        // #10123: the index the preheader discharged a bounds obligation for.
+        // Every form is an i32 in `[0, length)` by the time it reaches the GEP,
+        // which is why the fast clone pays no per-read bounds test in any of
+        // them. `None` means the counter's canonical i32 slot the matcher
+        // required is missing, so there is nothing to index with.
+        if let Some(idx_i32) =
+            crate::expr::element_shape_guard::emit_element_shape_index(ctx, &fact)
+        {
             let value = crate::expr::element_shape_guard::emit_element_shape_field_load(
                 ctx,
                 &fact,
                 &idx_i32,
-                field_index,
+                &field_slot,
             );
             let lowered = LoweredValue {
                 semantic: SemanticKind::JsNumber,

@@ -11,6 +11,9 @@ use super::*;
 /// nothing escapes, GC observes that all 700k+ objects from the
 /// previous burst are dead and reclaims the entire arena in O(1).
 pub fn arena_reset_all_blocks_to_zero() {
+    let _heap_change = crate::gc::heap_generation::HeapChange::begin(
+        crate::gc::heap_generation::HeapChangeKind::Sweep,
+    );
     // Only the general arena is reset (issue #179). The longlived arena
     // holds cached data that must not be reclaimed.
     ARENA.with(|arena| unsafe {
@@ -85,6 +88,7 @@ fn poison_region_in_place(arena: &mut Arena) {
 }
 
 fn reset_region_to_zero(arena: &mut Arena) -> (usize, usize) {
+    crate::gc::heap_generation::debug_assert_heap_change_open();
     let mut reset_blocks = 0usize;
     let mut reusable_bytes = 0usize;
     for block in arena.blocks.iter_mut() {
@@ -150,6 +154,15 @@ pub(crate) fn block_in_copying_from_space(
     block_idx < general_n || active_survivor.contains(&block_idx)
 }
 
+/// Global block indices of both survivor arenas (the region between the
+/// general arena and the longlived arena).
+pub(crate) fn survivor_block_index_range() -> std::ops::Range<usize> {
+    let general_n = ARENA.with(|a| unsafe { (*a.get()).blocks.len() });
+    let survivor0_n = SURVIVOR_ARENA_0.with(|a| unsafe { (*a.get()).blocks.len() });
+    let survivor1_n = SURVIVOR_ARENA_1.with(|a| unsafe { (*a.get()).blocks.len() });
+    general_n..general_n + survivor0_n + survivor1_n
+}
+
 pub(crate) fn active_survivor_block_index_range() -> std::ops::Range<usize> {
     let general_n = ARENA.with(|a| unsafe { (*a.get()).blocks.len() });
     let survivor0_n = SURVIVOR_ARENA_0.with(|a| unsafe { (*a.get()).blocks.len() });
@@ -171,6 +184,7 @@ pub(crate) fn active_survivor_block_index_range() -> std::ops::Range<usize> {
 /// has. No other reclaim path (the non-moving minor's `arena_reset_empty_blocks`,
 /// the full mark-sweep, old-gen defrag) is affected by that knob.
 pub(crate) fn copying_reset_from_spaces_and_flip() -> ArenaResetStats {
+    crate::gc::heap_generation::debug_assert_heap_change_open();
     if protect_fromspace_enabled() {
         return copying_quarantine_from_spaces_and_flip();
     }
@@ -261,6 +275,7 @@ pub(crate) fn copying_reset_from_spaces_and_flip() -> ArenaResetStats {
 /// in place and the inline allocator keeps reusing the same ~8MB
 /// arena block forever.
 pub fn arena_reset_empty_blocks(block_has_live: &[bool]) -> ArenaResetStats {
+    crate::gc::heap_generation::debug_assert_heap_change_open();
     let n_live = block_has_live.iter().filter(|&&b| b).count();
     let n_total = block_has_live.len();
     // Issue #179: only reset general-arena blocks. Longlived-arena blocks
@@ -508,6 +523,7 @@ pub fn arena_reset_empty_blocks(block_has_live: &[bool]) -> ArenaResetStats {
 const GENERAL_DEALLOC_DEAD_CYCLES: u32 = 2;
 
 fn filter_free_list_ranges(ranges: &[(usize, usize)]) {
+    crate::gc::heap_generation::debug_assert_heap_change_open();
     if ranges.is_empty() {
         return;
     }
@@ -639,6 +655,7 @@ impl ArenaResetEmptyBlocksState {
     }
 
     fn process_reset_block(&mut self, block_idx: usize) -> Option<(usize, usize, usize)> {
+        crate::gc::heap_generation::debug_assert_heap_change_open();
         let snapshot = self.snapshots.get(block_idx).copied().unwrap_or_default();
         if snapshot.data == 0 {
             return None;
@@ -695,6 +712,7 @@ impl ArenaResetEmptyBlocksState {
         &mut self,
         block_idx: usize,
     ) -> Result<(usize, usize, ArenaBlockRelease), DeallocReject> {
+        crate::gc::heap_generation::debug_assert_heap_change_open();
         let snapshot = self.snapshots.get(block_idx).copied().unwrap_or_default();
         if snapshot.data == 0 {
             return Err(DeallocReject::NoSnapshot);
@@ -882,6 +900,7 @@ impl SurvivorArenaReclaimState {
     }
 
     fn process_block(&mut self, local_idx: usize) {
+        crate::gc::heap_generation::debug_assert_heap_change_open();
         let global_idx = self.block_start + local_idx;
         let snapshot = self.snapshots.get(global_idx).copied().unwrap_or_default();
         if snapshot.data == 0 {
@@ -1184,6 +1203,7 @@ impl OldArenaReclaimDeadBlocksState {
     }
 
     fn process_block(&mut self, local_idx: usize) {
+        crate::gc::heap_generation::debug_assert_heap_change_open();
         let old_block_start = longlived_end();
         let block_idx = old_block_start + local_idx;
         if self
@@ -1298,6 +1318,7 @@ impl OldArenaReclaimDeadBlocksState {
 }
 
 pub(crate) fn old_arena_reclaim_dead_blocks(block_has_live: &[bool]) -> ArenaResetStats {
+    crate::gc::heap_generation::debug_assert_heap_change_open();
     let old_block_start = longlived_end();
     let stats = OLD_ARENA.with(|arena| unsafe {
         let arena = &mut *arena.get();
@@ -1392,6 +1413,7 @@ pub(crate) fn old_arena_reclaim_selected_dead_blocks(
     block_has_live: &[bool],
     selected_old_blocks: &crate::fast_hash::PtrHashSet<usize>,
 ) -> ArenaResetStats {
+    crate::gc::heap_generation::debug_assert_heap_change_open();
     if selected_old_blocks.is_empty() {
         return ArenaResetStats::default();
     }
@@ -1492,6 +1514,7 @@ fn reclaim_dead_survivor_arena_blocks(
     block_start: usize,
     block_has_live: &[bool],
 ) -> ArenaResetStats {
+    crate::gc::heap_generation::debug_assert_heap_change_open();
     with_survivor_arena_mut(arena_idx, |arena| {
         let keep_idx = arena
             .blocks

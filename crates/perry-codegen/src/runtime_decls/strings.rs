@@ -727,7 +727,13 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     );
     module.declare_function("js_dyn_index_get", DOUBLE, &[DOUBLE, DOUBLE]);
     // #8655: guarded packed-array / dense Array-subclass read before the
-    // fully generic dynamic dispatcher. Used by unknown-receiver loop reads.
+    // fully generic dynamic dispatcher. Used by unknown-receiver loop reads,
+    // and (#T2) the single out-of-line exit of the emitted dynamic `obj[i]`
+    // site (`expr/index_get/inline_dyn_typed_array.rs`): it absorbs the
+    // per-kind typed-array ladder's rejected cases, the whole shape-carried
+    // Array-subclass IC tower and the lazy-JSON-array probe, each of which was
+    // an acceleration of a decision this helper already makes — and it is
+    // handed the SAME site cache slot, so the primed words are unchanged.
     module.declare_function(
         "js_packed_arraylike_index_get",
         DOUBLE,
@@ -1153,6 +1159,10 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     );
     module.declare_function("js_build_class_keys_array", I64, &[I32, I32, PTR, I32]);
     module.declare_function("js_object_shape_id_for_keys", I32, &[I64, I32]);
+    // #10123: (shape_id, NaN-boxed key) -> inline slot index, or -1. The
+    // element-shape loop clone's shape-keyed preheader resolves each tracked
+    // property once against the shape the runtime just proved.
+    module.declare_function("js_shape_ordinary_inline_slot_for_key", I32, &[I32, I64]);
     module.declare_function(
         "js_gc_typed_shape_id_for_keys",
         I32,

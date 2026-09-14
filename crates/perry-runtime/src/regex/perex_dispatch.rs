@@ -94,9 +94,17 @@ pub(crate) fn call_one(
     result
 }
 
+#[cfg(test)]
+thread_local! {
+    /// `Get(R, "exec")` lookups `execute` performed on this thread.
+    pub(crate) static EXEC_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// RegExpExec with operation-owned limits. Lookup happens on every iteration;
 /// a callback may replace exec or recompile the receiver before the next one.
 /// Only the known builtin may omit materialization for a boolean test.
+/// `reuse` is consulted only on the builtin path, after the lookup or after
+/// proving the lookup would reach the builtin without running anything.
 pub(crate) fn execute(
     receiver: &RuntimeHandle<'_>,
     input: &RuntimeHandle<'_>,
@@ -104,29 +112,27 @@ pub(crate) fn execute(
     budget: &mut Budget,
     memory: &MemoryBudget,
     poll: &mut impl FnMut() -> Result<(), EngineError>,
+    reuse: Option<&api::Reuse<'_, '_>>,
 ) -> Result<Option<ExecResult>, EngineError> {
     host::charge(budget, 1)?;
     require_object(receiver.get_nanbox_f64())?;
     input.with_mut_ptr::<StringHeader, _>(|input| crate::string::js_string_addref(input));
     let scope = RuntimeHandleScope::new();
-    let method = scope.root_nanbox_f64(get(receiver, b"exec")?);
-    let callable = crate::proxy::proxy_wraps_callable(method.get_nanbox_f64());
-    let builtin =
-        crate::object::regex_proto_thunks::is_builtin_regexp_exec(method.get_nanbox_f64());
-    if callable && !builtin {
-        let argument = scope.root_nanbox_f64(
-            input.with_const_ptr::<StringHeader, _>(|input| js_nanbox_string(input as i64)),
-        );
-        let value = call_one(&method, receiver, &argument)?;
-        if value.to_bits() == TAG_NULL {
-            return Ok(None);
+    // A RegExp whose own properties, prototype and `exec` are the untouched
+    // builtins reaches the builtin exec without running any code, so the Get
+    // is unobservable and is skipped. Through the generic property path it was
+    // about half of every `test` call (#10166). Anything else takes the Get.
+    let receiver_ptr =
+        crate::value::js_nanbox_get_pointer(receiver.get_nanbox_f64()) as *mut RegExpHeader;
+    let known_builtin = super::is_valid_regex_ptr(receiver_ptr)
+        && crate::object::regex_proto_thunks::regexp_view_uses_builtin(receiver.get_nanbox_f64());
+    if !known_builtin {
+        #[cfg(test)]
+        EXEC_LOOKUPS.with(|lookups| lookups.set(lookups.get() + 1));
+        let method = scope.root_nanbox_f64(get(receiver, b"exec")?);
+        if let Some(result) = execute_override(&scope, &method, receiver, input)? {
+            return Ok(result);
         }
-        if !crate::proxy::reflect_value_is_object(value) {
-            return Err(EngineError::Type(
-                "RegExp exec method must return an object or null",
-            ));
-        }
-        return Ok(Some(ExecResult::Override(value)));
     }
     let re = crate::value::js_nanbox_get_pointer(receiver.get_nanbox_f64()) as *mut RegExpHeader;
     if !super::is_valid_regex_ptr(re) {
@@ -137,9 +143,38 @@ pub(crate) fn execute(
     // `execute_with_resources` roots both before it allocates.
     input
         .with_const_ptr::<StringHeader, _>(|input| {
-            api::execute_with_resources(re, input, materialize, budget, memory, poll)
+            api::execute_with_resources(re, input, materialize, budget, memory, poll, reuse)
         })
         .map(|result| result.map(ExecResult::Builtin))
+}
+
+/// The observable half of RegExpExec: call a looked-up `exec` that is not the
+/// builtin, and check what it returns. `Ok(None)` means the builtin runs.
+fn execute_override(
+    scope: &RuntimeHandleScope,
+    method: &RuntimeHandle<'_>,
+    receiver: &RuntimeHandle<'_>,
+    input: &RuntimeHandle<'_>,
+) -> Result<Option<Option<ExecResult>>, EngineError> {
+    let callable = crate::proxy::proxy_wraps_callable(method.get_nanbox_f64());
+    let builtin =
+        crate::object::regex_proto_thunks::is_builtin_regexp_exec(method.get_nanbox_f64());
+    if callable && !builtin {
+        let argument = scope.root_nanbox_f64(
+            input.with_const_ptr::<StringHeader, _>(|input| js_nanbox_string(input as i64)),
+        );
+        let value = call_one(method, receiver, &argument)?;
+        if value.to_bits() == TAG_NULL {
+            return Ok(Some(None));
+        }
+        if !crate::proxy::reflect_value_is_object(value) {
+            return Err(EngineError::Type(
+                "RegExp exec method must return an object or null",
+            ));
+        }
+        return Ok(Some(Some(ExecResult::Override(value))));
+    }
+    Ok(None)
 }
 
 pub(crate) fn to_string(value: &RuntimeHandle<'_>) -> Result<*mut StringHeader, EngineError> {
@@ -318,6 +353,7 @@ pub(crate) fn test_string(receiver: f64, input: *const StringHeader) -> Result<b
         &mut Budget::new(api::WORK),
         &MemoryBudget::new(api::SCRATCH_BYTES),
         &mut host::poll,
+        None,
     )
     .map(|result| result.is_some())
 }
