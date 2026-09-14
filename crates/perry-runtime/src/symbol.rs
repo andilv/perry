@@ -55,6 +55,7 @@ pub use properties::{
 };
 
 // Symbol-keyed property reads.
+pub(crate) use get::has_declared_prototype_symbol_property;
 pub(crate) use get::{has_own_symbol_property, inherited_symbol_property, own_symbol_property};
 pub use get::{
     js_object_get_symbol_property, js_object_get_symbol_property_ic_miss,
@@ -530,7 +531,8 @@ pub(crate) fn insert_symbol_pointer_in_set(set: &mut PtrHashSet<usize>, ptr: usi
 
 /// Width of the symbol filter's bit array, for tests that snapshot it.
 #[cfg(test)]
-pub(crate) const SYMBOL_FILTER_WORDS: usize = crate::registry_latch::RegistryAddrFilter::words();
+pub(crate) const SYMBOL_FILTER_WORDS: usize =
+    crate::registry_latch::RegistryAddrFilter::<16>::words();
 
 /// Save/restore this test's address filter around a fixture that needs to
 /// observe a NEARLY-EMPTY filter. A reset must put back at least what it found,

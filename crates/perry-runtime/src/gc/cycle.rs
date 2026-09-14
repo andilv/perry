@@ -624,9 +624,11 @@ impl GcCycleState {
         let trace = GcCycleTrace::new(GcCollectionKind::Full, trigger);
         let start = Instant::now();
         crate::arena::old_pages_begin_gc_cycle();
-        // The one constructor that sweeps old-gen, so the one that invalidates
-        // a promoted run's bounds. See the fn's doc for why no minor needs it.
-        crate::arena::materialize_all_promoted_page_runs();
+        // #10182: promoted page runs are NOT expanded here any more. The sweep
+        // expands a run only on a page where it is about to invalidate a dead
+        // header (`PendingOldUnregister::defer`), and a block it reclaims whole
+        // drops its runs unexpanded (`unregister_old_block_pages`). A page on
+        // which every object survives keeps its run: nothing reshapes it.
         clear_mark_seeds();
         // Allocate-black for the WHOLE cycle, from the first build slice on:
         // the mark barrier only engages at the END of BuildValidPointerSet
@@ -865,6 +867,12 @@ impl GcCycleState {
             trace_phase_record(&mut self.trace, "build_valid_pointer_set", phase_start);
             return;
         }
+        // The census's frames just returned from the stack region the root
+        // scan's frames are about to occupy, and a conservative stack scan
+        // reads every word below its caller frames, uninitialized slots
+        // included. Zero that dead region so a heap address the census walk
+        // left behind cannot read as a root (#10182).
+        scrub_dead_stack_below();
         let builder = self
             .valid_builder
             .take()
@@ -1294,6 +1302,15 @@ impl GcCycleState {
                         .as_mut()
                         .expect("atomic finalize state exists");
                     let rebuild = state.remembered_rebuild.get_or_insert_with(|| {
+                        // #10182: nothing young is marked and no malloc object
+                        // exists, so the walk could only insert nothing.
+                        if !budgeted
+                            && valid_ptrs.is_some_and(|ptrs| {
+                                full_remembered_rebuild_provably_empty(&ptrs.block_census)
+                            })
+                        {
+                            return OldToYoungRememberedRebuildState::provably_empty();
+                        }
                         let skip = if budgeted {
                             None
                         } else {
@@ -1486,6 +1503,9 @@ impl GcCycleState {
                 // `PERRY_GC_CENSUS` pass 2: marks are final and nothing is
                 // swept yet; only synchronous full cycles are exact.
                 super::census::census_take_if_armed_at_full_sweep_start();
+                // #10241: same point, for a promoted-cohort full's survival
+                // probe (a no-op unless one is armed).
+                super::promoted_cohort::survival::check_minor_view_at_full_sweep_start();
             }
 
             let (do_age_bump, reclaim_dead_old_blocks, targeted_old_blocks, sweep_malloc) =
@@ -1833,6 +1853,20 @@ impl Drop for GcCycleState {
         }
     }
 }
+
+/// Zero `DEAD_STACK_SCRUB_WORDS` words of the stack immediately below the
+/// caller's frame. The region is dead (below the stack pointer of every live
+/// frame), so writing it cannot change program state; it only erases what
+/// frames that already returned left there.
+#[inline(never)]
+pub(super) fn scrub_dead_stack_below() {
+    let mut words = [0u64; DEAD_STACK_SCRUB_WORDS];
+    // Force the zeros to be materialized in this frame.
+    std::hint::black_box(&mut words);
+}
+
+/// 16 KiB: deeper than the census walk's frames.
+const DEAD_STACK_SCRUB_WORDS: usize = 2048;
 
 mod alloc_flag;
 pub(super) use alloc_flag::restore_minor_in_alloc;

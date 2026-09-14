@@ -618,3 +618,41 @@ coercion. Replay does not relax ownership, alias, lifetime or method-identity
 checks. Native-region verification requires a consumed fresh replay fact,
 a matching runtime guard and an explicit fallback/materialization record for
 every claimed profile selection.
+
+## Unused re-export collection
+
+Collection prunes unused `export { name } from`, `export * from`, and namespace
+re-export edges by default when the exporting file and every static dependency
+of the omitted target are proven free of side effects. Perry honors
+`sideEffects: false` and arrays of `*`, `**`, and `?` globs. Without a contract,
+Perry recognizes inert declarations such as literal constants, functions, and
+pure forwarding barrels, including first-party modules. Calls, binding/property
+reads, classes, destructuring, and other unproven initialization retain the module.
+Explicit effectful contracts and unsupported patterns override this inference.
+CommonJS, unresolved dependencies,
+and cyclic static dependency trees conservatively retain the edge. Keeping cycles
+preserves initialization order even when exported variables read each other.
+This pass does not remove direct
+imports used by module code or individual declarations. An `import { x }; export { x }`
+pair is first normalized to a re-export only in barrels whose runtime imports
+are bare imports or named bindings forwarded through local export lists, and
+whose entire static dependency tree is proven free of side effects and cycles.
+Bare imports remain in the graph. Cyclic barrels retain their original imports
+so normalization cannot change their initialization entry point.
+Imports with attributes, nonstandard phases, or package aliases retain their original resolution.
+Namespace and dynamic imports retain the
+complete exported surface, and existing dynamic initialization stays deferred.
+
+Set `PERRY_NO_REEXPORT_PRUNE=1` to disable this collection pass for an A/B build.
+The compile summary reports unique omitted modules in the proven static
+dependency trees, excluding modules retained by another importer.
+
+Set `PERRY_COLLECT_ONLY=1` to stop after collection and write `<cache-dir>/audit.json`
+and `module-graph.json` (paths, eager/deferred initialization, and pruned count)
+without generating objects or linking an executable. This mode bypasses the
+finished-build cache and runs normal collection/preflight checks. For example:
+
+```sh
+PERRY_COLLECT_ONLY=1 perry compile src/index.ts --cache-dir /tmp/graph-after
+PERRY_COLLECT_ONLY=1 PERRY_NO_REEXPORT_PRUNE=1 perry compile src/index.ts --cache-dir /tmp/graph-before
+```

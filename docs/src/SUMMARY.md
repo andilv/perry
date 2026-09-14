@@ -10,6 +10,8 @@
 - [Hello World](getting-started/hello-world.md)
 - [First Native App](getting-started/first-app.md)
 - [Project Configuration](getting-started/project-config.md)
+- [Small-process memory profile](runtime/small-process-memory.md)
+- [Automatic tiny programs](runtime/tiny-programs.md)
 
 # Language
 
@@ -185,6 +187,7 @@
 # Internals
 
 - [Memory Model](internals/memory-model.md)
+- [RegExp program ownership and caching](internals/regexp-program-cache.md)
 - [Garbage Collector](internals/garbage-collector.md)
 - [Explicit Memory Control](internals/explicit-memory.md)
 - [The GC rooting invariant (codegen)](internals/gc-rooting-invariant.md)

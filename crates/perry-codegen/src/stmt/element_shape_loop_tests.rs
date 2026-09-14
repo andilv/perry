@@ -41,6 +41,7 @@ fn ir_opts() -> CompileOptions {
         disable_buffer_fast_path: false,
         namespace_imports: Vec::new(),
         namespace_member_nested: Vec::new(),
+        constructor_param_counts: Default::default(),
         imported_classes: Vec::new(),
         short_spread_method_candidates: std::sync::Arc::default(),
         object_literal_method_candidates: std::sync::Arc::default(),
@@ -423,6 +424,8 @@ fn fast_clone_slice(ir: &str) -> String {
                 || trimmed.starts_with("element_shape.load")
                 || trimmed.starts_with("element_shape.number")
                 || trimmed.starts_with("element_shape.strlen")
+                || trimmed.starts_with("sso.utf16")
+                || trimmed.starts_with("sso.length.done")
                 || trimmed.starts_with("element_shape.bool");
             // Only a repeated CLONE label means the second copy: unrelated
             // functions share ordinary labels (`entry:`), and breaking on one

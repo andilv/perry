@@ -8,7 +8,7 @@ use anyhow::{anyhow, bail, Result};
 use perry_hir::types::Type as HirType;
 use perry_hir::Expr;
 
-use crate::nanbox::{double_literal, POINTER_MASK_I64};
+use crate::nanbox::double_literal;
 use crate::rooting::{with_rooted_accumulator, with_rooted_group, Arg, Repr};
 use crate::types::{DOUBLE, I32, I64, PTR};
 
@@ -16,6 +16,9 @@ use super::{
     emit_string_literal_global, import_origin_suffix, is_global_this_builtin_name, lower_expr,
     nanbox_pointer_inline, nanbox_string_inline, unbox_to_i64, FnCtx, I18nLowerCtx,
 };
+
+#[path = "worker_new.rs"]
+mod worker_new;
 
 /// Build the namespace value for a resolved dynamic-import/require target prefix
 /// on the current block: a native submodule (`__node_submod__<key>`), a native
@@ -436,9 +439,10 @@ fn materialize_compiled_namespace(ctx: &mut FnCtx<'_>, name: &str) -> Result<Opt
     let object = ctx
         .block()
         .call(I64, "js_object_alloc", &[(I32, &zero), (I32, &count)]);
+    let object = nanbox_pointer_inline(ctx.block(), &object);
     with_rooted_accumulator(
         ctx,
-        Repr::Ptr,
+        Repr::Boxed,
         &object,
         true,
         |ctx, accumulator| {
@@ -452,29 +456,53 @@ fn materialize_compiled_namespace(ctx: &mut FnCtx<'_>, name: &str) -> Result<Opt
                     }),
                     property: member.clone(),
                 };
-                let value = lower_expr(ctx, &member_get)?;
+                // #10153: materializing `ns` must not snapshot a variable
+                // export or invoke a CJS getter. Install a closure that reads
+                // the producer's value getter on each subsequent access.
+                let is_live = ctx
+                    .imported_vars
+                    .contains(&crate::namespace_member_var_key(name, member))
+                    && !ctx
+                        .namespace_member_nested
+                        .contains(&(name.to_string(), member.clone()));
+                let value = if is_live {
+                    let wrapper = crate::codegen::namespace_value_getters::symbol(
+                        ctx.strings.module_prefix(),
+                        name,
+                        member,
+                    );
+                    ctx.pending_declares
+                        .push((wrapper.clone(), DOUBLE, vec![I64]));
+                    let handle = ctx.block().call(
+                        I64,
+                        "js_closure_alloc_singleton",
+                        &[(PTR, &format!("@{wrapper}"))],
+                    );
+                    nanbox_pointer_inline(ctx.block(), &handle)
+                } else {
+                    lower_expr(ctx, &member_get)?
+                };
                 let key_index = ctx.strings.intern(member);
                 let key_global = format!("@{}", ctx.strings.entry(key_index).handle_global);
-                let key = {
-                    let block = ctx.block();
-                    let key = block.load(DOUBLE, &key_global);
-                    let key_bits = block.bitcast_double_to_i64(&key);
-                    block.and(I64, &key_bits, POINTER_MASK_I64)
-                };
-                accumulator.call_void(
+                let key = ctx.block().load(DOUBLE, &key_global);
+                accumulator.call(
                     ctx,
-                    "js_object_set_field_by_name",
-                    &[Arg::Plain(I64, &key), Arg::Plain(DOUBLE, &value)],
+                    DOUBLE,
+                    if is_live {
+                        "js_object_define_get_accessor"
+                    } else {
+                        "js_object_set_property_key"
+                    },
+                    &[Arg::Plain(DOUBLE, &key), Arg::Plain(DOUBLE, &value)],
                 );
             }
             Ok(())
         },
         |ctx, object| {
-            let value = nanbox_pointer_inline(ctx.block(), object);
             Ok(Some(ctx.block().call(
                 DOUBLE,
                 "js_finalize_namespace",
-                &[(DOUBLE, &value)],
+                &[(DOUBLE, object)],
             )))
         },
     )
@@ -488,6 +516,9 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             options,
             is_eval: _,
         } => {
+            if paths.len() > 1 {
+                return worker_new::lower_candidates(ctx, paths, filename, options.as_deref());
+            }
             let _ = lower_expr(ctx, filename)?;
             if ctx.block().is_terminated() {
                 return Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)));

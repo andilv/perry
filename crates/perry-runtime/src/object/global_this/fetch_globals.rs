@@ -166,10 +166,17 @@ pub unsafe extern "C" fn js_global_or_console_property_by_name(
 /// sentinels directly (e.g. `globalThis.Array(3)`) returns undefined —
 /// best-effort no-op rather than throwing — and remains a known gap for
 /// non-String call-form constructors after re-binding the global to a local.
+// This function's address identifies builtin constructors across separately
+// linked runtime and stdlib archives. Thin LTO must not replace each copy with
+// a different unrelated undefined-returning thunk. Keep one external symbol
+// and a distinct body, even when changes elsewhere alter LTO partitioning.
+#[no_mangle]
+#[inline(never)]
 pub(crate) extern "C" fn global_this_builtin_noop_thunk(
     _closure: *const crate::closure::ClosureHeader,
     _arg: f64,
 ) -> f64 {
+    std::hint::black_box(global_this_builtin_noop_thunk as *const u8);
     f64::from_bits(crate::value::TAG_UNDEFINED)
 }
 
@@ -761,7 +768,14 @@ pub unsafe extern "C" fn js_fetch_or_value_super(
             } else {
                 undef
             };
-            crate::object::class_constructors::js_error_subclass_default_init(this_box, msg);
+            let options = if !args_ptr.is_null() && args_len >= 2 {
+                *args_ptr.add(1)
+            } else {
+                undef
+            };
+            crate::object::class_constructors::js_error_subclass_default_init_with_options(
+                this_box, msg, options,
+            );
             return undef;
         }
     }

@@ -729,26 +729,17 @@ pub(crate) fn shadow_stack_has_active_frame() -> bool {
 /// reaches its `js_gc_temp_root_truncate`. That depth is therefore recorded
 /// here and restored with the frames, so one savepoint covers both precise
 /// root stacks and `crate::exception` needs no separate hook.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ShadowSavepoint {
     frame_top: usize,
     len: usize,
     temp_roots: usize,
 }
 
-impl ShadowSavepoint {
-    /// Identity savepoint for an empty shadow stack — used to
-    /// zero-initialize the per-try-depth savepoint table.
-    pub(crate) const EMPTY: ShadowSavepoint = ShadowSavepoint {
-        frame_top: usize::MAX,
-        len: 0,
-        temp_roots: 0,
-    };
-}
-
 /// Capture the current shadow-stack depth so it can be restored after a
 /// non-local exit. Call at `js_try_push` time, before the protected
 /// region can push any callee frames.
+#[inline]
 pub(crate) fn shadow_stack_savepoint() -> ShadowSavepoint {
     SHADOW.with(|cell| unsafe {
         let s = &*cell.get();

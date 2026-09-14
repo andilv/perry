@@ -125,6 +125,24 @@ pub(super) fn compile_method(
                 if name == super::arguments::SYNTHETIC_ARGUMENTS_LENGTH_TYPE
         )
     });
+    if typed_public_trampoline.is_none()
+        && !force_generic_body
+        && proven_this.is_none()
+        && nonnegative_index_params.is_none()
+        && !fast_array_handle_clone
+        && !ptr_array_cache_clone
+        && !guarded_undefined_clone
+        && !pshape_arg_clone
+        && super::literal_constructor::try_compile(
+            llmod,
+            class,
+            method,
+            &public_llvm_name,
+            cross_module.class_keys_globals.get(&class.name),
+        )
+    {
+        return Ok(());
+    }
     // Representation-selection Phase 5a: the proven-`this` clone is a SECOND,
     // additive body compiled from the same HIR through the same statement
     // lowerer. It never replaces the public symbol and never participates in
@@ -787,6 +805,7 @@ pub(super) fn compile_method(
     // as uninitialized register values (read as NaN-boxed undefined).
     let is_constructor_method = method.name == format!("{}_constructor", class.name);
     if is_constructor_method {
+        crate::lower_call::defer_dynamic_derived_fields(&mut ctx, class);
         // #9043: a default-derived chain can reach a dynamic parent through a
         // constructor-free static ancestor (`Leaf -> Mid -> <captured Base>`).
         // Keep the owner of that dynamic edge so this standalone Leaf symbol
@@ -1013,6 +1032,12 @@ pub(super) fn compile_method(
                                 .and_then(|p| ctx.locals.get(&p.id).cloned())
                                 .map(|slot| ctx.block().load(DOUBLE, &slot))
                                 .unwrap_or_else(|| undef_lit.clone());
+                            let options_box = method
+                                .params
+                                .get(1)
+                                .and_then(|p| ctx.locals.get(&p.id).cloned())
+                                .map(|slot| ctx.block().load(DOUBLE, &slot))
+                                .unwrap_or_else(|| undef_lit.clone());
                             let this_box = ctx
                                 .this_stack
                                 .last()
@@ -1021,8 +1046,12 @@ pub(super) fn compile_method(
                                 .unwrap_or_else(|| undef_lit.clone());
                             let blk = ctx.block();
                             blk.call_void(
-                                "js_error_subclass_default_init",
-                                &[(DOUBLE, &this_box), (DOUBLE, &msg_box)],
+                                "js_error_subclass_default_init_with_options",
+                                &[
+                                    (DOUBLE, &this_box),
+                                    (DOUBLE, &msg_box),
+                                    (DOUBLE, &options_box),
+                                ],
                             );
                         }
                         ("".to_string(), 0)

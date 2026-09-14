@@ -308,6 +308,9 @@ pub(super) struct CopyingNurseryTraceStats {
     /// row with `in_place_promotion=true` and zero here promoted nothing and
     /// proves nothing.
     pub(super) in_place_promoted_objects: usize,
+    /// Bytes promoted by that path — `promoted_bytes` minus what the same
+    /// cycle tenured by copy. The promoted cohort counts only these (#10241).
+    pub(super) in_place_promoted_bytes: usize,
     pub(super) in_place_promoted_blocks: usize,
     /// Bytes on the promoted blocks that were NOT live — the footprint this
     /// technique trades for the speed, retained until the next full.
@@ -572,6 +575,19 @@ pub(super) fn layout_scan_trace_active() -> bool {
 
 #[inline]
 pub(super) fn record_layout_child_slot_read(kind: HeapChildSlotReadKind) {
+    // #10182: the process-wide arm flag inline, the thread-local out of line.
+    // Inlined together into the mark's per-slot path, the optimizer fetched
+    // the thread-local's address before testing the flag, i.e. on every
+    // traced slot of every collection with tracing off.
+    if !LAYOUT_SCAN_TRACE_ARMED_ANY.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    record_layout_child_slot_read_armed(kind);
+}
+
+#[cold]
+#[inline(never)]
+fn record_layout_child_slot_read_armed(kind: HeapChildSlotReadKind) {
     if !layout_scan_trace_active() {
         return;
     }

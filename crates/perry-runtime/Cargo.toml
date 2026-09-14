@@ -50,6 +50,11 @@ keepalive-anchors = []
 # retag rides the same gate (it only exists to label mimalloc's mappings).
 alloc-mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 
+# Prebuilt native runtime for programs whose existing feature analysis requires
+# only this subset. Keep in sync with optimized_libs/prebuilt_core.rs (tested).
+# Unwind behavior stays unchanged; this is a feature/size profile only.
+prebuilt-core = ["full", "alloc-mimalloc", "keepalive-anchors", "global-math"]
+
 # `PERRY_ALLOC_CENSUS` — a sampling profiler for the Rust heap
 # (`alloc_census`). OFF by default and compiled out entirely: the census wraps
 # the `#[global_allocator]`, and `gc_malloc` runs ~1M times/sec, so even the
@@ -301,8 +306,6 @@ dyn-eval = ["dep:perry-parser", "dep:perry-diagnostics"]
 # with perry-hir through perry-dispatch, so the runtime's property-read and
 # method-call paths and the HIR's import lowering cannot drift apart.
 perry-dispatch.workspace = true
-thiserror.workspace = true
-anyhow.workspace = true
 libc.workspace = true
 rustc-demangle = "0.1"
 # Owned single-phase unwinder (#7302 follow-up): decodes .eh_frame CFI for

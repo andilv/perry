@@ -62,6 +62,17 @@ pub(crate) struct CensusBlock {
     pub(crate) censused: bool,
     /// Some object in the block needs the per-object sweep path.
     pub(crate) obligation: bool,
+    /// Some header in the block was already MARKED or PINNED when the census
+    /// read it (a subset of `obligation`, kept apart for
+    /// `young_generation_unmarked`).
+    pub(crate) premarked: bool,
+    /// The census parsed every header of the block itself, walkable or not
+    /// (`ValidPointerSetBuilder::census_whole_block`), so `non_walkable` is a
+    /// complete answer. The per-object census never sees a non-walkable header.
+    pub(crate) whole_walk: bool,
+    /// Some header in the block does not parse as an arena object — an
+    /// invalidated dead header (`obj_type == 0`) among them.
+    pub(crate) non_walkable: bool,
 }
 
 /// Per-block census facts and trace reachability for one cycle's
@@ -135,7 +146,26 @@ impl BlockCensus {
             bytes: 0,
             censused: true,
             obligation: false,
+            premarked: false,
+            whole_walk: false,
+            non_walkable: false,
         };
+    }
+
+    /// The block just begun is being parsed header by header in one pass.
+    #[inline]
+    pub(crate) fn note_whole_block_walk(&mut self) {
+        if self.armed {
+            self.current.whole_walk = true;
+        }
+    }
+
+    /// The current block holds a header that does not parse as an object.
+    #[inline]
+    pub(crate) fn note_non_walkable(&mut self) {
+        if self.armed {
+            self.current.non_walkable = true;
+        }
     }
 
     /// Record one censused header of the current block. Branch-light: this
@@ -145,19 +175,46 @@ impl BlockCensus {
     /// `header` must be a walkable arena header inside the current block.
     #[inline(always)]
     pub(crate) unsafe fn note_header(&mut self, header: *const GcHeader) {
-        let flags = (*header).gc_flags;
         let obj_type = (*header).obj_type;
         let size = (*header).size as u64;
-        let exceptional_flags = (flags ^ GC_FLAG_ARENA)
-            & (GC_FLAG_ARENA | GC_FLAG_MARKED | GC_FLAG_PINNED | GC_FLAG_FORWARDED)
-            != 0;
-        let raw_f64_array = obj_type == GC_TYPE_ARRAY
-            && (*header)._reserved & (GC_ARRAY_RAW_F64_LAYOUT | GC_ARRAY_RAW_F64_HOLES) != 0;
+        let (flag_obligation, premarked) = census_header_flag_facts(header);
         let type_obligation = self.obligation_by_type[obj_type as usize];
         let block = &mut self.current;
         block.objects += 1;
         block.bytes += size;
-        block.obligation |= exceptional_flags | type_obligation | raw_f64_array;
+        block.obligation |= flag_obligation | type_obligation;
+        block.premarked |= premarked;
+    }
+
+    /// Set the current block's facts from a record another walk made of it
+    /// (`adopt_census`), applying this census's per-type obligations to the
+    /// recorded object types.
+    pub(crate) fn adopt_block_facts(
+        &mut self,
+        objects: u64,
+        bytes: u64,
+        types: &[u64; 4],
+        flag_obligation: bool,
+        premarked: bool,
+        non_walkable: bool,
+    ) {
+        if !self.armed {
+            return;
+        }
+        let type_obligation = (0..256usize)
+            .any(|t| types[t >> 6] & (1u64 << (t & 63)) != 0 && self.obligation_by_type[t]);
+        let block = &mut self.current;
+        block.objects = objects;
+        block.bytes = bytes;
+        block.obligation = flag_obligation || type_obligation;
+        block.premarked = premarked;
+        block.non_walkable = non_walkable;
+    }
+
+    /// The facts of the block currently being censused (tests only).
+    #[cfg(test)]
+    pub(crate) fn current_facts_for_tests(&self) -> CensusBlock {
+        self.current
     }
 
     /// Fold the current block into the per-index table. Called at every block
@@ -213,6 +270,38 @@ impl BlockCensus {
         any.then_some(skip)
     }
 
+    /// After the mark of a synchronous full: does the young generation (Eden
+    /// and both survivor spaces) hold **no** marked or pinned object?
+    ///
+    /// Every in-use young block must be censused, unchanged since the census
+    /// (no allocate-black birth, no block created after it), free of headers
+    /// that were already marked or pinned when censused, and unreached by the
+    /// trace. An unreached block holds no object the trace marked (see this
+    /// module's doc: every census-built mark passes a membership query that
+    /// records its block), so every young object is then garbage. `false` when
+    /// the census is disarmed or anything is uncertain.
+    pub(crate) fn young_generation_unmarked(&self) -> bool {
+        if !self.armed {
+            return false;
+        }
+        let snapshots = crate::arena::arena_block_snapshots();
+        let young = crate::arena::young_block_count().min(snapshots.len());
+        snapshots[..young]
+            .iter()
+            .enumerate()
+            .all(|(block_idx, snapshot)| {
+                if snapshot.data == 0 || snapshot.offset == 0 {
+                    return true;
+                }
+                self.block(block_idx).is_some_and(|block| {
+                    !block.premarked
+                        && !self.reached(block_idx)
+                        && block.data == snapshot.data
+                        && block.end == snapshot.data.saturating_add(snapshot.offset)
+                })
+            })
+    }
+
     pub(crate) fn block(&self, block_idx: usize) -> Option<CensusBlock> {
         self.blocks.get(block_idx).copied().filter(|b| b.censused)
     }
@@ -231,6 +320,21 @@ pub(crate) mod sabotage {
 
     pub(crate) const FORGET_REACHED: u8 = 1;
     pub(crate) const FORGET_OBLIGATIONS: u8 = 2;
+    /// `verify::full_remembered_rebuild_provably_empty` answers true whatever
+    /// the heap holds.
+    pub(crate) const FORCE_REBUILD_SKIP: u8 = 4;
+    /// The sweep never applies its per-page accounting tally before a page-index
+    /// flush or a step end (it is applied only at page changes).
+    pub(crate) const FORGET_PAGE_TALLY_ORDER: u8 = 8;
+    /// A dead old header is invalidated without first expanding the described
+    /// promoted run of its page.
+    pub(crate) const FORGET_RUN_EXPANSION: u8 = 16;
+    /// The sweep treats every whole-walked block as holding no invalidated
+    /// header, whatever the census saw.
+    pub(crate) const FORGET_HOLES: u8 = 32;
+    /// The whole-block sweep's fast path keeps objects without recording that
+    /// their block holds a live object.
+    pub(crate) const FORGET_WHOLE_BLOCK_LIVE: u8 = 64;
 
     thread_local! {
         static SABOTAGE: Cell<u8> = const { Cell::new(0) };
@@ -272,6 +376,27 @@ pub(crate) mod sabotage {
     }
 }
 
+/// The per-object census facts that depend on a header's flags rather than its
+/// type: `(flag obligation, pre-marked)`. The flag obligation covers a pinned,
+/// forwarded or already-marked header, one without `GC_FLAG_ARENA`, and an array
+/// whose raw-f64 layout bits would fire a typed-feedback invalidation.
+///
+/// # Safety
+/// `header` is a readable arena header.
+#[inline(always)]
+pub(crate) unsafe fn census_header_flag_facts(header: *const GcHeader) -> (bool, bool) {
+    let flags = (*header).gc_flags;
+    let exceptional_flags = (flags ^ GC_FLAG_ARENA)
+        & (GC_FLAG_ARENA | GC_FLAG_MARKED | GC_FLAG_PINNED | GC_FLAG_FORWARDED)
+        != 0;
+    let raw_f64_array = (*header).obj_type == GC_TYPE_ARRAY
+        && (*header)._reserved & (GC_ARRAY_RAW_F64_LAYOUT | GC_ARRAY_RAW_F64_HOLES) != 0;
+    (
+        exceptional_flags | raw_f64_array,
+        flags & (GC_FLAG_MARKED | GC_FLAG_PINNED) != 0,
+    )
+}
+
 /// Does a dead object of `obj_type` need `reclaim_dead_object`'s per-object
 /// work beyond what the full trace's dead-owner fan-out and the block reset
 /// already do?
@@ -296,6 +421,22 @@ pub(crate) fn type_needs_per_object_sweep(obj_type: u8, object_side_tables_live:
         | GcMoveHookKind::SetSideTables
         | GcMoveHookKind::ExoticExpandoOwner => false,
     }
+}
+
+crate::perry_thread_local! {
+    static HOLE_REBUILD_BLOCKS_SKIPPED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Record live old blocks one sweep's hole-list rebuild did not parse because
+/// they provably hold no invalidated header (live-subject counter).
+pub(crate) fn note_hole_rebuild_blocks_skipped(blocks: u64) {
+    HOLE_REBUILD_BLOCKS_SKIPPED.with(|c| c.set(c.get().saturating_add(blocks)));
+}
+
+/// Live old blocks this thread's hole-list rebuilds skipped, since thread start.
+#[cfg(test)]
+pub(crate) fn hole_rebuild_blocks_skipped() -> u64 {
+    HOLE_REBUILD_BLOCKS_SKIPPED.with(Cell::get)
 }
 
 crate::perry_thread_local! {

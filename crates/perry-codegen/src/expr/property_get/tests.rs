@@ -34,6 +34,7 @@ fn ir_opts(debug_locations: bool, module_source: Option<&str>) -> CompileOptions
         disable_buffer_fast_path: false,
         namespace_imports: Vec::new(),
         namespace_member_nested: Vec::new(),
+        constructor_param_counts: Default::default(),
         imported_classes: Vec::new(),
         short_spread_method_candidates: std::sync::Arc::default(),
         object_literal_method_candidates: std::sync::Arc::default(),
@@ -1006,6 +1007,10 @@ fn generic_length_read_serves_a_string_inline() {
         .map(|i| i + 1)
         .unwrap_or(sso_body.len());
     let sso_body = &sso_body[..sso_end];
+    assert!(
+        ir.contains("\nsso.utf16") && ir.contains("\nsso.length.done"),
+        "non-ASCII inline strings must have a UTF-16 counting arm:\n{ir}"
+    );
     assert!(
         sso_body.contains("lshr i64") && sso_body.contains(", 40"),
         "the SSO arm must extract the inline length byte, not call the \

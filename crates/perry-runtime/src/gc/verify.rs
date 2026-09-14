@@ -232,9 +232,9 @@ pub(super) unsafe fn remember_evacuated_old_to_young_slot(
     sticky: &mut StickyRememberedSet,
     parent_header: *mut GcHeader,
     slot: *mut u64,
-) {
+) -> bool {
     if slot.is_null() {
-        return;
+        return false;
     }
     let child_addr = decode_heap_addr(*slot);
     // Nursery AND malloc-GC children both need their pages kept dirty:
@@ -242,13 +242,17 @@ pub(super) unsafe fn remember_evacuated_old_to_young_slot(
     // leaves — dropping an old→malloc page here would free the malloc
     // child on the next minor (see remembered_child_needs_tracking).
     if child_addr == 0 || !crate::gc::barrier::remembered_child_needs_tracking(child_addr) {
-        return;
+        return false;
     }
     sticky.remember_slot(
         parent_header,
         slot,
         slot_is_external_to(parent_header, slot),
     );
+    // Report the child's tracking requirement, not whether its page was new.
+    // The repair diagnostic can count productive slots without decoding and
+    // classifying the same child a second time.
+    true
 }
 
 /// Is `slot` outside `parent_header`'s own allocation, or on a page the
@@ -337,9 +341,26 @@ pub(super) fn restore_surviving_dirty_coverage(
     covered: &crate::fast_hash::PtrHashSet<usize>,
     cycle_label: &str,
 ) {
+    // Keep slot accounting out of the normal GC walk. Both instantiations
+    // perform exactly the same repair; only the diagnostic one counts it.
+    if crate::gc::gc_diag_enabled() {
+        restore_surviving_dirty_coverage_impl::<true>(snapshot, covered, cycle_label);
+    } else {
+        restore_surviving_dirty_coverage_impl::<false>(snapshot, covered, cycle_label);
+    }
+}
+
+fn restore_surviving_dirty_coverage_impl<const DIAGNOSTICS: bool>(
+    snapshot: &RememberedDirtySnapshot,
+    covered: &crate::fast_hash::PtrHashSet<usize>,
+    cycle_label: &str,
+) {
     let mut sticky = StickyRememberedSet::default();
     let mut walked = 0usize;
     let mut skipped = 0usize;
+    let mut parents_visited = 0usize;
+    let mut slots_visited = 0usize;
+    let mut slots_tracking = 0usize;
     #[cfg(debug_assertions)]
     let mut skipped_sticky = StickyRememberedSet::default();
     // Mirror scan_remembered_dirty_slots_copying's scan_header guards: the
@@ -367,12 +388,23 @@ pub(super) fn restore_surviving_dirty_coverage(
         {
             return;
         }
+        if DIAGNOSTICS {
+            parents_visited += 1;
+        }
         visit_gc_rewrite_slots(header, |slot| {
+            if DIAGNOSTICS {
+                // Count all enumerated slots, including unproductive weak
+                // targets and primitive values. This measures traversal work.
+                slots_visited += 1;
+            }
             if crate::weakref::is_weak_target_trace_slot(header, slot.slot) {
                 return;
             }
             slot.record_layout_read();
-            remember_evacuated_old_to_young_slot(&mut sticky, header, slot.slot);
+            let tracking = remember_evacuated_old_to_young_slot(&mut sticky, header, slot.slot);
+            if DIAGNOSTICS && tracking {
+                slots_tracking += 1;
+            }
         });
     };
     if !snapshot.dirty_old_pages.is_empty() {
@@ -429,10 +461,19 @@ pub(super) fn restore_surviving_dirty_coverage(
              object `scan_dirty_object_slots` reported complete"
         );
     }
-    if crate::gc::gc_diag_enabled() {
+    if DIAGNOSTICS {
+        // These are the two actual snapshot inputs and the skip-set size.
+        // `dirty_pages` also includes external pages and is NOT the set the
+        // old-arena walk iterates. Candidate counts precede validity guards;
+        // parent visits and slot counts describe the admitted traversal.
         eprintln!(
-            "[gc-restore-coverage] {cycle_label} dirty_pages={} objects_walked={walked} objects_skipped={skipped} pages_added={added}",
-            snapshot.dirty_pages.len()
+            "[gc-restore-coverage] {cycle_label} dirty_old_pages={} external_entries={} \
+             covered={} objects_walked={walked} objects_skipped={skipped} \
+             parents_visited={parents_visited} slots_visited={slots_visited} \
+             slots_tracking={slots_tracking} pages_added={added}",
+            snapshot.dirty_old_pages.len(),
+            snapshot.external_dirty_entries.len(),
+            covered.len(),
         );
     }
 }
@@ -509,6 +550,48 @@ unsafe fn remember_retained_old_to_young_slots(
     });
 }
 
+crate::perry_thread_local! {
+    /// Synchronous full collections whose old→young remembered-set rebuild was
+    /// replaced by an exact clear because the young generation held no marked
+    /// object (#10182). Live-subject counter for the tests and the diag line.
+    static FULL_REMEMBERED_REBUILDS_SKIPPED: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Running count of [`FULL_REMEMBERED_REBUILDS_SKIPPED`] on this thread.
+pub(crate) fn full_remembered_rebuilds_skipped() -> u64 {
+    FULL_REMEMBERED_REBUILDS_SKIPPED.with(std::cell::Cell::get)
+}
+
+/// #10182: after a synchronous full's mark, can the old→young remembered-set
+/// rebuild only produce an empty set?
+///
+/// The rebuild remembers a slot of a marked (or pinned) old parent exactly when
+/// its child classifies as young (nursery) or is a registered malloc object
+/// (`remembered_child_needs_tracking`). A marked parent's strong child is
+/// marked too, and the rebuild skips weak slots exactly as the trace does. So:
+///
+/// * if no young object is marked or pinned (`young_generation_unmarked`),
+///   every young child a marked parent could name is garbage the sweep is
+///   about to reclaim, and no mutator runs in between to make one live; and
+/// * if the malloc registry is empty — the same premise the copying minor's
+///   `skip_remembering` uses — there is no malloc child at all,
+///
+/// then the walk can insert nothing that names a live object, and the
+/// remembered set this full leaves behind is exactly empty. The pre-cycle
+/// dirty snapshot repair (`restore_surviving_dirty_coverage`) still runs in
+/// reclaim as before. A budgeted cycle has no census, so it never qualifies.
+pub(super) fn full_remembered_rebuild_provably_empty(census: &super::trace::BlockCensus) -> bool {
+    #[cfg(test)]
+    if super::trace::block_skip::sabotage::get()
+        & super::trace::block_skip::sabotage::FORCE_REBUILD_SKIP
+        != 0
+    {
+        return census.is_armed();
+    }
+    census.young_generation_unmarked() && MALLOC_STATE.with(|s| s.borrow().objects.is_empty())
+}
+
 pub(super) struct OldToYoungRememberedRebuildState {
     require_marked: bool,
     sticky: StickyRememberedSet,
@@ -542,6 +625,27 @@ impl OldToYoungRememberedRebuildState {
             malloc_index: 0,
             objects_scanned: 0,
             done: false,
+        }
+    }
+
+    /// The rebuild of a full whose result is provably empty
+    /// (`full_remembered_rebuild_provably_empty`): no walk, an empty set.
+    pub(super) fn provably_empty() -> Self {
+        FULL_REMEMBERED_REBUILDS_SKIPPED.with(|c| c.set(c.get().saturating_add(1)));
+        if crate::gc::gc_diag_enabled() {
+            eprintln!(
+                "[gc-remembered-rebuild] full skipped=young_generation_unmarked skips_total={}",
+                full_remembered_rebuilds_skipped()
+            );
+        }
+        Self {
+            require_marked: true,
+            sticky: StickyRememberedSet::default(),
+            arena_cursor: None,
+            arena_done: true,
+            malloc_index: 0,
+            objects_scanned: 0,
+            done: true,
         }
     }
 

@@ -41,12 +41,14 @@ mod import_meta_resolve;
 mod json_module;
 mod native_addon;
 mod parse_error;
+pub(crate) mod reexport_prune;
 mod script_string;
 mod static_require_transform;
 #[cfg(test)]
 mod tests;
 mod walk;
 mod wasm_asset;
+mod worker;
 
 use binding_faithfulness::audit_native_binding_choice;
 pub(super) use discovery::is_nextjs_runtime_module;
@@ -540,6 +542,9 @@ fn collect_module_one(
     let ast_module = defined_module.as_ref().unwrap_or(ast_module);
     let resolved_module = import_meta_resolve::resolve_static(ast_module, &canonical, ctx)?;
     let ast_module = resolved_module.as_ref().unwrap_or(ast_module);
+    let forwarding_module =
+        reexport_prune::normalize_forwarding_barrel(ast_module, entry_path, ctx);
+    let ast_module = forwarding_module.as_ref().unwrap_or(ast_module);
     let file_loader_sources = file_loader_import_sources(ast_module);
     let source_file_path = canonical.to_string_lossy().to_string();
 
@@ -1008,7 +1013,7 @@ fn collect_module_one(
                         ));
                         return;
                     }
-                    if set.len() != 1 {
+                    if eval_mode && set.len() != 1 {
                         dyn_errors.push(format!(
                             "worker_threads Worker in module {}: filename must resolve to exactly one path for now, got {}",
                             module_name,
@@ -1034,28 +1039,28 @@ fn collect_module_one(
                                 return;
                             }
                         }
-                    } else if set[0].starts_with("file:") {
-                        // Helper-returned URLs carry a URL spelling, while the
-                        // module resolver (including --bunfs-root) consumes a
-                        // filesystem spelling. Decode through the URL parser
-                        // before recording both the import edge and Worker path.
-                        match url::Url::parse(&set[0])
-                            .ok()
-                            .and_then(|url| url.to_file_path().ok())
-                        {
-                            Some(path) => set[0] = path.to_string_lossy().into_owned(),
-                            None => {
-                                dyn_errors.push(format!(
-                                    "worker_threads Worker in module {}: invalid file URL {:?}",
-                                    module_name, set[0]
-                                ));
+                    }
+                    let imports = if eval_mode {
+                        set.clone()
+                    } else {
+                        match worker::resolve_candidates(
+                            &mut set,
+                            entry_path,
+                            &canonical,
+                            &module_name,
+                            ctx,
+                            format,
+                        ) {
+                            Ok(imports) => imports,
+                            Err(error) => {
+                                dyn_errors.push(error);
                                 return;
                             }
                         }
-                    }
-                    for p in &set {
-                        if !new_dyn_imports.contains(p) {
-                            new_dyn_imports.push(p.clone());
+                    };
+                    for path in imports {
+                        if !new_dyn_imports.contains(&path) {
+                            new_dyn_imports.push(path);
                         }
                     }
                     worker_path_sets.push(set);
@@ -1796,8 +1801,10 @@ fn collect_module_one(
         }
     }
 
+    ctx.reexport_pruner.imports(&hir_module.imports);
+
     // Process re-exports
-    for export in &hir_module.exports {
+    for (export_index, export) in hir_module.exports.iter().enumerate() {
         let source = match export {
             perry_hir::Export::ReExport { source, .. } => Some(source),
             perry_hir::Export::ExportAll { source } => Some(source),
@@ -1924,7 +1931,19 @@ fn collect_module_one(
                 }
 
                 match kind {
-                    ModuleKind::NativeCompiled => pending.push(source_path),
+                    ModuleKind::NativeCompiled => {
+                        if reexport_prune::record(
+                            ctx,
+                            &canonical,
+                            entry_path,
+                            export_index,
+                            export,
+                            &resolved_path,
+                            &source_path,
+                        ) {
+                            pending.push(source_path);
+                        }
+                    }
                     ModuleKind::Interpreted => {
                         // JS runtime (V8) support was removed, so interpreted
                         // node_modules dependencies are not followed. A direct

@@ -560,6 +560,36 @@ pub(super) fn note_full_collection_reclaimed_old_gen() {
     OLD_GEN_AT_LAST_MEASUREMENT.with(|c| c.set(crate::arena::old_gen_in_use_bytes()));
 }
 
+/// A promoted-cohort full measured, with its own mark, that `live_bytes` of the
+/// `promoted_bytes` the minor at the same safepoint promoted survived — and
+/// proved that a minor over that young generation would have measured the same
+/// (#10241, `promoted_cohort::survival`, `MinorView::Exact`). The caller feeds
+/// nothing else.
+///
+/// That is the ratio the predictor describes, taken by a trace at the same
+/// safepoint, so a figure under [`PROMOTE_SURVIVAL_THRESHOLD_PERMILLE`]
+/// replaces the ratio the promotion was admitted on: the next minor evacuates
+/// and measures again instead of promoting the churn on faith. A figure at or
+/// above it leaves the predictor alone — it confirms the promotion, and the
+/// minor's own measurement is the one untraced admission was priced against.
+///
+/// Why not force a measuring minor after every reclaiming full instead: on a
+/// parse loop whose trees die one tree later every cohort full reclaims its
+/// whole cohort, and a traced minor over a 58 MB young generation costs ~95 ms
+/// against ~11 ms untraced (`records_array_20m:parse`). There the full measures
+/// 500‰ but a dead born-old tree array refers into the promoted blocks, so a
+/// minor would have measured them live and nothing is fed.
+pub(super) fn note_full_measured_promotion_survival(
+    promoted_bytes: usize,
+    live_bytes: usize,
+) -> Option<u64> {
+    let permille = super::promoted_cohort::survival::survival_permille(promoted_bytes, live_bytes)?;
+    if permille < PROMOTE_SURVIVAL_THRESHOLD_PERMILLE {
+        LAST_YOUNG_SURVIVAL_PERMILLE.with(|c| c.set(Some(permille)));
+    }
+    Some(permille)
+}
+
 /// How many cycles promoted in place, and how many objects they promoted.
 /// The "did the subject actually run?" counters — a green benchmark that never
 /// entered the path proves nothing.

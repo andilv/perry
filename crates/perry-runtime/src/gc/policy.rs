@@ -105,6 +105,16 @@ pub(super) fn next_arena_trigger_base() -> usize {
 /// (near-zero infant mortality), a saturated survivor space, and 1427
 /// collections for a run that allocates ~1.4 GB.
 pub(super) fn young_scavenge_cap_due() -> bool {
+    young_scavenge_cap_due_with_old_reclaimable(old_gen_reclaimable_pressure_bytes)
+}
+
+/// [`young_scavenge_cap_due`] with the old-gen reclaimable-pressure read
+/// supplied by the caller. `gc_budgeted_due_trigger` has already read that
+/// value for its old-reclaim arm, and nothing between that read and this one
+/// touches old-gen, so it passes a closure returning the value it holds rather
+/// than paying two more thread-local reads. The read happens where it always
+/// did: after the census seed, which changes only the young-side factor.
+fn young_scavenge_cap_due_with_old_reclaimable(old_reclaimable: impl FnOnce() -> usize) -> bool {
     if !nursery_cap_active() {
         return false;
     }
@@ -114,10 +124,16 @@ pub(super) fn young_scavenge_cap_due() -> bool {
     // process, halfway to the base cap). Not while a collection is in
     // progress or a budgeted cycle is active — the young generation is being
     // rewritten then and the walk would read forwarding stubs.
-    if GC_FLAGS.with(|f| f.get()) & GC_FLAG_IN_ALLOC == 0 && !gc_budgeted_cycle_active() {
+    //
+    // The seeded test comes first because the seed can happen only once: in
+    // steady state this is one thread-local read instead of three.
+    if !super::tenuring::object_census_seeded()
+        && GC_FLAGS.with(|f| f.get()) & GC_FLAG_IN_ALLOC == 0
+        && !gc_budgeted_cycle_active()
+    {
         super::tenuring::maybe_seed_object_census_from_allocation(from_space_in_use);
     }
-    from_space_in_use >= scavenge_nursery_cap_dueness_bytes()
+    from_space_in_use >= scavenge_nursery_cap_dueness_bytes_with(old_reclaimable)
 }
 
 /// #10169: does the young generation hold at least one BASE nursery cap of
@@ -142,11 +158,22 @@ pub(crate) fn young_generation_holds_a_nursery() -> bool {
 /// NOT feed `effective_next_arena_trigger`: this is about *dueness*, and a test
 /// that also moved the trigger clamp would be changing two things at once.
 fn scavenge_nursery_cap_dueness_bytes() -> usize {
+    scavenge_nursery_cap_dueness_bytes_with(old_gen_reclaimable_pressure_bytes)
+}
+
+fn scavenge_nursery_cap_dueness_bytes_with(old_reclaimable: impl FnOnce() -> usize) -> usize {
     #[cfg(test)]
     if let Some(bytes) = GC_NURSERY_CAP_TEST_DUE_BYTES.with(Cell::get) {
         return bytes;
     }
-    super::tenuring::scavenge_nursery_cap_effective_bytes()
+    let influx_driven = super::tenuring::influx_driven_nursery_cap_bytes();
+    let old_reclaimable = old_reclaimable();
+    debug_assert_eq!(
+        old_reclaimable,
+        old_gen_reclaimable_pressure_bytes(),
+        "the old-gen pressure a due check reuses must still be the current value"
+    );
+    super::tenuring::scavenge_nursery_cap_from(influx_driven, old_reclaimable)
 }
 
 #[cfg(test)]
@@ -437,6 +464,32 @@ pub(super) fn tiny_parse_pressure_due_with(
         && in_use >= base.saturating_add(tiny_parse_pressure_headroom_bytes(step))
 }
 
+/// Should a tiny-parse boundary collect under the generational collector?
+///
+/// The priced in-use guard ([`tiny_parse_pressure_due`]) answers "has the
+/// arena grown enough to be worth a collection", on total in-use, which a
+/// collection cannot lower below the live set (#9831). It never asked the
+/// generational question: is the young generation at its scavenge cap? A loop
+/// of tiny `JSON.parse` calls allocates only under the parser's suppression
+/// window and at bounded inline-object births, so nothing else arms the
+/// nursery safepoint for it, and the young generation grew to the guard's
+/// 48 MB floor before its first minor: `small_record:parse` peaked at 80 MiB
+/// against Node's 59 with 0–9 ‰ of each collection surviving. The nursery cap
+/// is safe to consult where the absolute in-use guard was not: a minor lowers
+/// the quantity it tests to the survivors, so it cannot fire again until the
+/// cap has been refilled.
+///
+/// Medium-parse pacing (2026-09-14) adds the third arm for the same reason the
+/// second one exists, one currency over: both of the first two are denominated
+/// in ARENA bytes, and a lazily-parsed document's bytes are not in the arena at
+/// all. See
+/// [`external_side_parse_pressure_due`].
+pub(super) fn tiny_parse_generational_collection_due(in_use: usize, in_use_trigger: usize) -> bool {
+    tiny_parse_pressure_due(in_use, in_use_trigger)
+        || young_scavenge_cap_due()
+        || external_side_parse_pressure_due()
+}
+
 /// The live [`tiny_parse_pressure_due_with`]: current base and step.
 pub(super) fn tiny_parse_pressure_due(in_use: usize, in_use_trigger: usize) -> bool {
     #[cfg(test)]
@@ -477,13 +530,22 @@ fn diag_tiny_parse_forced_collection(site: &str, in_use: usize) {
     }
     let base = GC_TINY_PARSE_PRESSURE_BASE_BYTES.with(Cell::get);
     let step = GC_STEP_BYTES.with(Cell::get);
+    // Medium-parse pacing (2026-09-14): the side-allocation arm's own inputs,
+    // so a diag reader can tell which of the three arms priced this collection
+    // rather than re-deriving it — the same "assert the subject was live" rule.
+    let external = external_side_live_bytes();
+    let external_base = GC_LAST_COLLECTION_EXTERNAL_SIDE_BYTES.with(Cell::get);
     eprintln!(
-        "[gc-tiny-parse] forced collection site={} in_use={} base={} headroom={} step={}",
+        "[gc-tiny-parse] forced collection site={} in_use={} base={} headroom={} step={} \
+         external_side={} external_base={} external_band={}",
         site,
         in_use,
         base,
         tiny_parse_pressure_headroom_bytes(step),
-        step
+        step,
+        external,
+        external_base,
+        external_side_parse_band_bytes(external_base)
     );
 }
 
@@ -586,12 +648,72 @@ const GC_EXTERNAL_SIDE_ALLOC_STEP: usize = 16 * 1024 * 1024;
 crate::perry_thread_local! {
     static GC_EXTERNAL_SIDE_ALLOC_PENDING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GC_EXTERNAL_SIDE_LIVE_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Medium-parse pacing (2026-09-14): [`external_side_live_bytes`] as the
+    /// last collection ended — the base of the parse-boundary growth band
+    /// ([`external_side_parse_pressure_due_with`]). A byte COUNT, never an
+    /// address; written only from `note_collection_finished_arena_occupancy`.
+    pub(super) static GC_LAST_COLLECTION_EXTERNAL_SIDE_BYTES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// Medium-parse pacing (2026-09-14): external side bytes that a
+    /// collection or mutator operation has released since the last full — see
+    /// [`external_side_old_reclaim_pressure_bytes`]. A byte COUNT, never an
+    /// address.
+    pub(super) static GC_EXTERNAL_SIDE_DRAINED_SINCE_FULL: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// Live bytes currently held by external Map/Set side buffers on this thread.
 #[inline]
 pub(super) fn external_side_live_bytes() -> usize {
     GC_EXTERNAL_SIDE_LIVE_BYTES.with(Cell::get)
+}
+
+/// Medium-parse pacing (2026-09-14): how many bytes of external side allocation
+/// may accumulate past the last collection before a `JSON.parse` boundary is
+/// due.
+///
+/// Deliberately the `max(floor, proportional)` shape of
+/// [`gc_old_reclaim_growth_band_bytes`], for the two reasons that shape exists:
+///
+/// * a program whose live side set is genuinely large (a retained multi-MB
+///   `Map`) must not collect once per parse, so the band grows with it; and
+/// * a collection that CANNOT lower the number this band watches re-baselines
+///   it at the surviving value, so futile repeats space out geometrically
+///   instead of firing at a constant step. That is what keeps this arm off the
+///   #7437/#7592 livelock: a lazy array whose cluster was born OLD
+///   (`json_tape::lazy_cluster_is_old`) keeps its tape through the nursery
+///   collection this arm schedules, and the next band is then twice as far
+///   away rather than due again at the next parse.
+pub(super) fn external_side_parse_band_bytes(baseline: usize) -> usize {
+    gc_trigger_headroom_floor_bytes().max(baseline)
+}
+
+/// [`external_side_parse_pressure_due`] with both readings supplied.
+pub(super) fn external_side_parse_pressure_due_with(live: usize, baseline: usize) -> bool {
+    live >= baseline.saturating_add(external_side_parse_band_bytes(baseline))
+}
+
+/// Medium-parse pacing (2026-09-14): has external side-allocation churn earned
+/// a parse-boundary collection?
+///
+/// Every other pacing input a parse boundary reads is denominated in ARENA
+/// bytes, and a lazily-parsed document's memory is not in the arena: a 13 KB
+/// `records_array_16k` parse puts ~1.1 KB (header + sparse cache + bitmap) in
+/// the nursery and ~24 KB of tape in a `json_tape_store` side allocation. So
+/// the young generation reads 1/24th of what the process is actually holding,
+/// and a parse loop reaches its nursery cap 24x later than the memory says it
+/// should. Measured on `records_array_16k:parse` at `origin/main`
+/// (`PERRY_GC_DIAG=1`, 11 284 iterations): EIGHT collections, every one of them
+/// a full mark-sweep from `alloc_point_old_reclaim`, each firing at
+/// `external_side=33.6 MB` with `arena_total` between 3 and 8 MB,
+/// `old_in_use=0` and `from_space` never above 7 MB against a 16 MB nursery
+/// cap. The only pacing this workload had was the old-reclaim growth band
+/// reading those side bytes, i.e. 32 MB of dead tape per cycle.
+pub(super) fn external_side_parse_pressure_due() -> bool {
+    external_side_parse_pressure_due_with(
+        external_side_live_bytes(),
+        GC_LAST_COLLECTION_EXTERNAL_SIDE_BYTES.with(Cell::get),
+    )
 }
 
 /// Record `bytes` of fresh external side-buffer allocation (Map entries /
@@ -618,9 +740,31 @@ pub(crate) fn gc_note_external_side_alloc(bytes: usize) {
     }
 }
 
-/// Record that a Map/Set side buffer of `bytes` was freed (GC finalizer).
+/// Record released external side bytes, from either a collector or a mutator operation.
 pub(crate) fn gc_note_external_side_free(bytes: usize) {
     GC_EXTERNAL_SIDE_LIVE_BYTES.with(|c| c.set(c.get().saturating_sub(bytes)));
+    GC_EXTERNAL_SIDE_DRAINED_SINCE_FULL.with(|c| c.set(c.get().saturating_add(bytes)));
+}
+
+/// The external side-buffer term of OLD-RECLAIM pressure.
+///
+/// Live bytes plus all reported releases since the last full baseline. The
+/// release hook also runs during JSON tape materialization, regex scratch
+/// teardown, native-addon adjustments and Map/Set buffer replacement; this
+/// accounting is broader than bytes freed by a minor collection.
+///
+/// Holding released bytes in this term keeps cheap collections from removing
+/// the pressure that pays for arena-capacity reclamation. On the measured
+/// `records_array_1m:sparse` loop, the live-only alternative reduced fulls from
+/// seven to one and raised peak RSS from 63.5 to 73.6 MiB despite freeing more
+/// tape. The cumulative term restored that workload's full-collection cadence.
+///
+/// This is not a general guarantee of identical pacing: a mutator-side release
+/// lowers the previous live-only term but leaves this cumulative term unchanged,
+/// so other workloads can reach the full-collection threshold earlier. The full
+/// baseline resets the released-byte contribution before pricing the next band.
+pub(super) fn external_side_old_reclaim_pressure_bytes() -> usize {
+    external_side_live_bytes().saturating_add(GC_EXTERNAL_SIDE_DRAINED_SINCE_FULL.with(Cell::get))
 }
 
 #[inline]
@@ -1525,7 +1669,12 @@ fn gc_bump_malloc_trigger_inner(collect_now: bool) {
         // The guard now also requires the arena to have grown past the
         // productivity-priced headroom since the last collection ended.
         let in_use = crate::arena::arena_in_use_bytes();
-        if !tiny_parse_pressure_due(in_use, tiny_parse_in_use_trigger_for_mode()) {
+        let due = if use_gen_gc {
+            tiny_parse_generational_collection_due(in_use, tiny_parse_in_use_trigger_for_mode())
+        } else {
+            tiny_parse_pressure_due(in_use, tiny_parse_in_use_trigger_for_mode())
+        };
+        if !due {
             return;
         }
         if use_gen_gc {
@@ -1581,7 +1730,12 @@ fn gc_collect_pending_suppressed_parse_slow() {
     // boundary collection from stacking a second minor on top of it. A request
     // nothing has satisfied is still due and still collects.
     let in_use = crate::arena::arena_in_use_bytes();
-    if !tiny_parse_pressure_due(in_use, tiny_parse_in_use_trigger_for_mode()) {
+    let due = if gen_gc_enabled() {
+        tiny_parse_generational_collection_due(in_use, tiny_parse_in_use_trigger_for_mode())
+    } else {
+        tiny_parse_pressure_due(in_use, tiny_parse_in_use_trigger_for_mode())
+    };
+    if !due {
         return;
     }
     diag_tiny_parse_forced_collection("parse_boundary", in_use);
@@ -1609,8 +1763,8 @@ pub fn gc_schedule_parse_boundary_collection_if_pressure() {
         return;
     }
     // #9831: priced the same way as the post-parse guard above — see
-    // `tiny_parse_pressure_due_with`.
-    if !tiny_parse_pressure_due(
+    // `tiny_parse_pressure_due_with` — plus the young generation's own cap.
+    if !tiny_parse_generational_collection_due(
         crate::arena::arena_in_use_bytes(),
         gc_tiny_parse_in_use_trigger_dyn_bytes(),
     ) {
@@ -1876,8 +2030,8 @@ pub(super) fn copied_minor_promotion_handoff_due(trigger_kind: GcTriggerKind) ->
         return false;
     }
     let promotable = copied_minor_promotable_active_survivor_bytes();
-    let old_in_use =
-        old_gen_reclaimable_pressure_bytes().saturating_add(external_side_live_bytes());
+    let old_in_use = old_gen_reclaimable_pressure_bytes()
+        .saturating_add(external_side_old_reclaim_pressure_bytes());
     let baseline = GC_LAST_OLD_RECLAIM_IN_USE_BYTES.with(|bytes| bytes.get());
     copied_minor_promotion_handoff_pressure_due(promotable, old_in_use, baseline)
 }
@@ -1938,6 +2092,9 @@ pub(super) fn credit_promoted_bytes_to_old_baseline(promoted_bytes: usize) {
     }
     GC_LAST_OLD_RECLAIM_IN_USE_BYTES
         .with(|bytes| bytes.set(bytes.get().saturating_add(promoted_bytes)));
+    // #10182: the credit hides these bytes from the growth band by design; the
+    // promoted-cohort bound is what still counts the in-place-promoted share of
+    // them (`promoted_cohort::note_minor_promotion`, called by the minor).
 }
 
 /// Feed a copying minor's measured young-survival ratio to arena-growth pacing.
@@ -1985,8 +2142,8 @@ pub(super) fn maybe_schedule_old_reclaim_after_copied_minor() {
     // a tenured-then-dead Map holds its multi-MB buffer until a full
     // reclaim's old-gen sweep finalizes it, so the buffer bytes must be
     // able to escalate that reclaim.
-    let old_in_use =
-        old_gen_reclaimable_pressure_bytes().saturating_add(external_side_live_bytes());
+    let old_in_use = old_gen_reclaimable_pressure_bytes()
+        .saturating_add(external_side_old_reclaim_pressure_bytes());
     let baseline = GC_LAST_OLD_RECLAIM_IN_USE_BYTES.with(|bytes| bytes.get());
     if old_reclaim_pressure_due(old_in_use, baseline) {
         GC_OLD_RECLAIM_PENDING.with(|pending| pending.set(true));
@@ -2010,11 +2167,18 @@ pub(super) fn request_old_reclaim_for_untraced_promotions(bytes: usize) {
 }
 
 pub(super) fn finish_full_old_reclaim_baseline() {
+    // Medium-parse pacing (2026-09-14): the full this baseline records is the
+    // collection the drained bytes were being held for, so the debt is paid
+    // here — before the baseline is read, or the baseline would carry it into
+    // the next band incorrectly including already released bytes in the following growth band.
+    GC_EXTERNAL_SIDE_DRAINED_SINCE_FULL.with(|c| c.set(0));
     // Baseline includes external side-buffer bytes (#6010) so the growth
     // delta in `old_reclaim_pressure_due` stays unit-consistent.
-    let old_in_use =
-        old_gen_reclaimable_pressure_bytes().saturating_add(external_side_live_bytes());
+    let old_in_use = old_gen_reclaimable_pressure_bytes()
+        .saturating_add(external_side_old_reclaim_pressure_bytes());
     GC_LAST_OLD_RECLAIM_IN_USE_BYTES.with(|bytes| bytes.set(old_in_use));
+    // #10182: this full verified everything old; the promoted cohort starts over.
+    super::promoted_cohort::note_full_finished(old_in_use);
     // Record the TOTAL post-full live set for major-GC pacing (young+old): the
     // full sweep is the only collection that frees forwarding stubs, so this is
     // the "clean" size the arena returns to and the base for the K× growth gate.
@@ -2180,6 +2344,12 @@ pub(super) fn note_collection_finished_arena_occupancy(full: bool) {
     GC_LAST_COLLECTION_POST_IN_USE_BYTES.with(|cell| cell.set(bytes));
     // #9831: the same moment, in the units the tiny-parse guard reads.
     GC_TINY_PARSE_PRESSURE_BASE_BYTES.with(|cell| cell.set(crate::arena::arena_in_use_bytes()));
+    // Medium-parse pacing (2026-09-14): and in the units the parse-boundary
+    // side-allocation band reads. This is the site that makes the band self-correcting: whatever the sweep
+    // and the from-space pass just released has already been subtracted from
+    // `external_side_live_bytes`, so a collection that freed the tapes
+    // re-bases at ~0 and one that could not re-bases at the surviving value.
+    GC_LAST_COLLECTION_EXTERNAL_SIDE_BYTES.with(|cell| cell.set(external_side_live_bytes()));
     super::arena_right_size::note_collection_finished(bytes, full);
 }
 
@@ -2770,6 +2940,14 @@ pub fn gc_check_trigger() {
         return;
     }
 
+    // This function asks "what is due?" up to three times on the path where
+    // nothing is (the old-reclaim arm, the nursery arm, the assist gate). Every
+    // arm that acts returns, so the state each later question sees is the
+    // state the first one saw, and a repeatable answer can be reused. An
+    // answer from the #10169 flag branch is re-evaluated, exactly as before.
+    let mut due_memo = DueTriggerMemo::new();
+    let mut due = || due_memo.get(gc_budgeted_due_trigger_eval);
+
     // #5476: a workload that churns *large* temporaries (>16 KB, born directly
     // in the old arena) grows the old generation without ever exercising the
     // nursery. Old-gen reclaim pressure schedules a budgeted full cycle that
@@ -2824,10 +3002,7 @@ pub fn gc_check_trigger() {
     // on. Polls off ⇒ the precise path is reached less often ⇒ this arm fires
     // more often ⇒ the census counter rises. Inert, not unsound.
     if !gc_budgeted_cycle_active()
-        && matches!(
-            gc_budgeted_due_trigger(),
-            Some(BudgetedGcTrigger::OldReclaim)
-        )
+        && matches!(due(), Some(BudgetedGcTrigger::OldReclaim))
         && !GC_OLD_RECLAIM_IN_PROGRESS.with(Cell::get)
     {
         let _reentry = OldReclaimReentryGuard::enter();
@@ -2909,7 +3084,7 @@ pub fn gc_check_trigger() {
             || gc_moving_loop_polls_enabled()
             || super::roots::registered_root_scanners_block_budgeted_gc())
     {
-        let direct_kind = match gc_budgeted_due_trigger() {
+        let direct_kind = match due() {
             // #7909: `YoungScavengeCap` is a nursery-churn trigger exactly like
             // `ArenaBytes` here — this arm's whole job is to route nursery
             // pressure to a collection that can actually reclaim it, so the two
@@ -3054,7 +3229,7 @@ pub fn gc_check_trigger() {
         }
     }
 
-    if !gc_budgeted_cycle_active() && gc_budgeted_due_trigger().is_none() {
+    if !gc_budgeted_cycle_active() && due().is_none() {
         return;
     }
 
@@ -3255,6 +3430,45 @@ pub(crate) fn note_young_leaf_born_old() {
 }
 
 pub(super) fn gc_budgeted_due_trigger() -> Option<BudgetedGcTrigger> {
+    gc_budgeted_due_trigger_eval().0
+}
+
+/// Reuse of a repeatable [`gc_budgeted_due_trigger_eval`] answer across the
+/// questions one `gc_check_trigger` call asks. An unrepeatable answer is
+/// returned once and the next question evaluates again.
+pub(super) struct DueTriggerMemo(Option<Option<BudgetedGcTrigger>>);
+
+impl DueTriggerMemo {
+    pub(super) const fn new() -> Self {
+        Self(None)
+    }
+
+    pub(super) fn get(
+        &mut self,
+        eval: impl FnOnce() -> (Option<BudgetedGcTrigger>, bool),
+    ) -> Option<BudgetedGcTrigger> {
+        if let Some(due) = self.0 {
+            return due;
+        }
+        let (due, repeatable) = eval();
+        if repeatable {
+            self.0 = Some(due);
+        }
+        due
+    }
+}
+
+/// [`gc_budgeted_due_trigger`], plus whether evaluating it again with no state
+/// changed in between is guaranteed to give the same answer.
+///
+/// Only the #10169 flag branch below breaks that: it consumes the flag and
+/// returns early, so a second evaluation takes the ordinary path and may
+/// answer differently (for example `OldReclaim`). The #8122 census seed does
+/// not break it. The seed runs inside the young-cap arm before that arm's
+/// comparison, so the first evaluation already compared against the seeded
+/// cap; no earlier arm reads the census and the malloc arm after it does not
+/// either, and a second evaluation cannot seed again.
+pub(super) fn gc_budgeted_due_trigger_eval() -> (Option<BudgetedGcTrigger>, bool) {
     // #10169: a leaf born old under young pressure gives the nursery minor
     // ONE-TIME priority over old-reclaim, and only while the young generation
     // is still unmeasured. A young generation that a minor has already
@@ -3268,16 +3482,16 @@ pub(super) fn gc_budgeted_due_trigger() -> Option<BudgetedGcTrigger> {
     if GC_YOUNG_LEAF_BORN_OLD.with(Cell::get) {
         GC_YOUNG_LEAF_BORN_OLD.with(|flag| flag.set(false));
         if !super::young_generation_measured_retained() && young_scavenge_cap_due() {
-            return Some(BudgetedGcTrigger::YoungScavengeCap);
+            return (Some(BudgetedGcTrigger::YoungScavengeCap), false);
         }
     }
     let old_pending = GC_OLD_RECLAIM_PENDING.with(Cell::get);
     // #6010: external Map/Set side-buffer bytes escalate to OldReclaim too.
-    let old_in_use =
-        old_gen_reclaimable_pressure_bytes().saturating_add(external_side_live_bytes());
+    let old_reclaimable = old_gen_reclaimable_pressure_bytes();
+    let old_in_use = old_reclaimable.saturating_add(external_side_old_reclaim_pressure_bytes());
     let old_baseline = GC_LAST_OLD_RECLAIM_IN_USE_BYTES.with(|bytes| bytes.get());
     if old_pending || old_reclaim_pressure_due(old_in_use, old_baseline) {
-        return Some(BudgetedGcTrigger::OldReclaim);
+        return (Some(BudgetedGcTrigger::OldReclaim), true);
     }
 
     // Two separately-scoped arena arms (see `young_scavenge_cap_due` for why
@@ -3286,19 +3500,21 @@ pub(super) fn gc_budgeted_due_trigger() -> Option<BudgetedGcTrigger> {
     // only.
     let total = crate::arena::arena_total_bytes();
     if total >= next_arena_trigger_base() {
-        return Some(BudgetedGcTrigger::ArenaBytes);
+        return (Some(BudgetedGcTrigger::ArenaBytes), true);
     }
-    if young_scavenge_cap_due() {
-        return Some(BudgetedGcTrigger::YoungScavengeCap);
+    // Old-gen is untouched since the read above: the arms in between only
+    // read, and the census seed walks the young generation.
+    if young_scavenge_cap_due_with_old_reclaimable(|| old_reclaimable) {
+        return (Some(BudgetedGcTrigger::YoungScavengeCap), true);
     }
 
     let malloc_count = malloc_object_count();
     let next_malloc_trigger = GC_NEXT_MALLOC_TRIGGER.with(|c| c.get());
     if malloc_count >= next_malloc_trigger {
-        return Some(BudgetedGcTrigger::MallocCount);
+        return (Some(BudgetedGcTrigger::MallocCount), true);
     }
 
-    None
+    (None, true)
 }
 
 /// Phase 1 of the moving-GC project: run a copying (moving) minor at a
@@ -3422,8 +3638,21 @@ pub(crate) fn gc_safepoint_moving_minor() -> bool {
             _ => "ArenaBytes",
         },
     );
+    // #10182: when this minor's promotion can bring the promoted cohort to its
+    // bound, its promotion walk records the census facts of the blocks it
+    // promotes for the cohort full that would follow at this safepoint.
+    let record_census = matches!(kind, GcTriggerKind::ArenaBytes)
+        && super::promoted_cohort::promotion_may_reach_bound(
+            crate::arena::copying_from_space_in_use_bytes(),
+        );
+    if record_census {
+        super::trace::adopt_census::begin_recording();
+    }
     // No `force_full_scan`: roots are precise at this safepoint.
     let outcome = super::gc_collect_minor_with_trigger(GcTriggerSnapshot::capture(kind));
+    if record_census {
+        super::trace::adopt_census::finish_recording();
+    }
     match kind {
         GcTriggerKind::MallocCount => {
             gc_finish_malloc_trigger_collection(pre_malloc_count, pre_in_use, outcome);
@@ -3437,6 +3666,75 @@ pub(crate) fn gc_safepoint_moving_minor() -> bool {
     // the precise collection that replaced it actually ran (CLAUDE.md, four
     // ways a gate cannot fail — #4, the gate runs but its subject never did).
     super::record_safepoint_drain(super::SafepointDrainKind::NurseryMinor);
+    run_promoted_cohort_full_if_due();
+    super::trace::adopt_census::discard();
+    true
+}
+
+/// #10182: run the promoted-cohort full (`gc::promoted_cohort`) if the nursery
+/// minor this precise safepoint just ran brought the cohort to its bound.
+///
+/// Same collection the OldReclaim safepoint arm runs — a synchronous full with
+/// `SkipDisabled` roots — at the same kind of point, and right after a minor,
+/// so an in-place promotion has left no young object for the remembered-set
+/// rebuild to find. Returns whether a full ran.
+pub(super) fn run_promoted_cohort_full_if_due() -> bool {
+    if !super::promoted_cohort::full_due() || GC_OLD_RECLAIM_IN_PROGRESS.with(Cell::get) {
+        return false;
+    }
+    let _reentry = OldReclaimReentryGuard::enter();
+    let cohort = super::promoted_cohort::promoted_since_full();
+    let bound = super::promoted_cohort::bound_bytes();
+    let before = old_gen_reclaimable_pressure_bytes().saturating_add(external_side_live_bytes());
+    super::diag_sites::trigger_decision("safepoint", "PromotedCohort");
+    super::diag_sites::set_full_site("safepoint_promoted_cohort");
+    let adopted_before = super::trace::adopt_census::adopted_blocks();
+    // #10241: the full's sweep measures how much of what the minor at this
+    // safepoint promoted is still reachable (`promoted_cohort::PromotedSurvival`).
+    super::promoted_cohort::survival::arm_survival_probe(super::trace::adopt_census::ready_blocks());
+    super::trace::adopt_census::begin_adopting();
+    // No `force_full_scan`: roots are precise at this safepoint.
+    gc_collect_full_mark_sweep_with_trigger(GcTriggerSnapshot::capture(GcTriggerKind::OldGenBytes))
+        .emit_after_current();
+    super::trace::adopt_census::discard();
+    let survival = super::promoted_cohort::survival::take_survival_probe();
+    #[cfg(test)]
+    let feed = !super::promoted_cohort::survival::sabotage::unfed();
+    #[cfg(not(test))]
+    let feed = true;
+    let survival_permille = survival.as_ref().and_then(|s| {
+        if feed && s.minor_view == super::promoted_cohort::survival::MinorView::Exact {
+            super::note_full_measured_promotion_survival(s.promoted_bytes, s.live_bytes)
+        } else {
+            s.permille()
+        }
+    });
+    let adopted = super::trace::adopt_census::adopted_blocks() - adopted_before;
+    let after = old_gen_reclaimable_pressure_bytes().saturating_add(external_side_live_bytes());
+    let reclaimed = before.saturating_sub(after);
+    let productive = super::promoted_cohort::record_full_yield(cohort, reclaimed);
+    if super::gc_diag_enabled() {
+        let (blocks, promoted_by_minor, live_of_promoted, minor_view) =
+            survival.as_ref().map_or((0, 0, 0, "none"), |s| {
+                (
+                    s.blocks,
+                    s.promoted_bytes,
+                    s.live_bytes,
+                    s.minor_view.as_str(),
+                )
+            });
+        eprintln!(
+            "[gc-promoted-cohort] full cohort={cohort} bound={bound} reclaimed={reclaimed} \
+             productive={productive} adopted_census_blocks={adopted} backoff_shift={} \
+             promoted_blocks={blocks} promoted_by_minor={promoted_by_minor} \
+             live_of_promoted={live_of_promoted} survival_permille={} minor_view={minor_view} \
+             predictor={}",
+            super::promoted_cohort::backoff_shift(),
+            survival_permille.map_or_else(|| "none".to_string(), |p| p.to_string()),
+            super::last_young_survival_permille()
+                .map_or_else(|| "none".to_string(), |p| p.to_string())
+        );
+    }
     true
 }
 
@@ -3876,6 +4174,47 @@ fn gc_start_budgeted_cycle_for_pressure(progress_kind: GcProgressKind) -> Option
     })
 }
 
+/// What one budgeted step decided, without the debt figures.
+///
+/// The step machinery returns this; only callers that hand a
+/// [`JsGcStepResult`] to someone attach the debt, through
+/// [`GcStepReport::with_debt`]. The runtime's own polls (regex quanta, the
+/// microtask pump, the event loop) discard the result, and a
+/// `GcDebtSnapshot` costs a second evaluation of the nursery cap, the arena
+/// trigger and the old-reclaim band on every poll that finds nothing due.
+///
+/// Attaching the debt after the step returns reads the same values it used to
+/// read inside the step: the snapshot was always the last thing a step
+/// computed, and the only work between that point and the caller is dropping
+/// `BudgetedGcStepGuard`, which clears a flag the snapshot does not read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GcStepReport {
+    pub(crate) status: u32,
+    phase: u32,
+    collection_kind: u32,
+    trigger_kind: u32,
+    active: bool,
+    completed: bool,
+}
+
+impl GcStepReport {
+    /// The FFI result, with the debt measured now.
+    pub(crate) fn with_debt(self) -> JsGcStepResult {
+        let debt = GcDebtSnapshot::current();
+        JsGcStepResult {
+            status: self.status,
+            phase: self.phase,
+            collection_kind: self.collection_kind,
+            trigger_kind: self.trigger_kind,
+            active: u32::from(self.active),
+            completed: u32::from(self.completed),
+            arena_debt_bytes: debt.arena_debt_bytes,
+            malloc_debt_objects: debt.malloc_debt_objects,
+            old_reclaim_debt_bytes: debt.old_reclaim_debt_bytes,
+        }
+    }
+}
+
 fn gc_step_result(
     status: u32,
     phase: u32,
@@ -3883,26 +4222,22 @@ fn gc_step_result(
     trigger_kind: u32,
     active: bool,
     completed: bool,
-) -> JsGcStepResult {
-    let debt = GcDebtSnapshot::current();
-    JsGcStepResult {
+) -> GcStepReport {
+    GcStepReport {
         status,
         phase,
         collection_kind,
         trigger_kind,
-        active: u32::from(active),
-        completed: u32::from(completed),
-        arena_debt_bytes: debt.arena_debt_bytes,
-        malloc_debt_objects: debt.malloc_debt_objects,
-        old_reclaim_debt_bytes: debt.old_reclaim_debt_bytes,
+        active,
+        completed,
     }
 }
 
-fn gc_idle_step_result() -> JsGcStepResult {
+fn gc_idle_step_result() -> GcStepReport {
     gc_step_result(JS_GC_STEP_STATUS_IDLE, 0, 0, 0, false, false)
 }
 
-fn gc_cycle_step_result(status: u32, cycle: &BudgetedGcCycle, completed: bool) -> JsGcStepResult {
+fn gc_cycle_step_result(status: u32, cycle: &BudgetedGcCycle, completed: bool) -> GcStepReport {
     gc_step_result(
         status,
         cycle.state.phase().ffi_code(),
@@ -3913,7 +4248,7 @@ fn gc_cycle_step_result(status: u32, cycle: &BudgetedGcCycle, completed: bool) -
     )
 }
 
-fn gc_budgeted_status_result() -> JsGcStepResult {
+fn gc_budgeted_status_result() -> GcStepReport {
     if !gc_budgeted_cycle_active() {
         return gc_idle_step_result();
     }
@@ -3932,7 +4267,7 @@ fn gc_budgeted_status_result() -> JsGcStepResult {
     }
 }
 
-fn gc_budgeted_skipped_result() -> JsGcStepResult {
+fn gc_budgeted_skipped_result() -> GcStepReport {
     if !gc_budgeted_cycle_active() {
         return gc_step_result(JS_GC_STEP_STATUS_SKIPPED, 0, 0, 0, false, false);
     }
@@ -3945,7 +4280,7 @@ fn gc_budgeted_skipped_result() -> JsGcStepResult {
     })
 }
 
-fn gc_finish_budgeted_cycle(mut cycle: BudgetedGcCycle) -> JsGcStepResult {
+fn gc_finish_budgeted_cycle(mut cycle: BudgetedGcCycle) -> GcStepReport {
     let outcome = cycle
         .state
         .take_outcome()
@@ -3981,7 +4316,7 @@ fn gc_finish_budgeted_cycle(mut cycle: BudgetedGcCycle) -> JsGcStepResult {
 }
 
 enum BudgetedStepOutcome {
-    Result(JsGcStepResult),
+    Result(GcStepReport),
     Completed(BudgetedGcCycle),
 }
 
@@ -4018,7 +4353,7 @@ pub(super) fn gc_drain_active_budgeted_cycle() {
     }
 }
 
-fn gc_budgeted_step_work_units_inner(work_units: usize) -> JsGcStepResult {
+fn gc_budgeted_step_work_units_inner(work_units: usize) -> GcStepReport {
     gc_budgeted_step_work_units_inner_with_progress(work_units, GcProgressKind::NormalIncremental)
 }
 
@@ -4056,7 +4391,7 @@ pub(super) fn gc_idle_reclaim_try_start() -> bool {
 /// cycle stops reporting `ACTIVE`. Never starts a cycle of its own — when none
 /// is active the stepper's pressure check runs exactly as it would at any host
 /// safepoint.
-pub(super) fn gc_idle_reclaim_step(budget_us: u64) -> JsGcStepResult {
+pub(super) fn gc_idle_reclaim_step(budget_us: u64) -> GcStepReport {
     let start = Instant::now();
     let mut result = gc_budgeted_step_work_units_inner(GC_NORMAL_INCREMENTAL_WORK_UNITS);
     while result.status == JS_GC_STEP_STATUS_ACTIVE
@@ -4083,7 +4418,7 @@ fn defer_nursery_cap_to_precise_safepoint() {
 fn gc_budgeted_step_work_units_inner_with_progress(
     work_units: usize,
     start_progress_kind: GcProgressKind,
-) -> JsGcStepResult {
+) -> GcStepReport {
     if work_units == 0 {
         return gc_budgeted_status_result();
     }
@@ -4095,13 +4430,34 @@ fn gc_budgeted_step_work_units_inner_with_progress(
         return gc_budgeted_skipped_result();
     };
 
-    if !gc_budgeted_cycle_active() {
+    // The common host poll: no cycle, nothing due. Everything past this point
+    // (starting and stepping a cycle) lives out of line, so that poll does not
+    // pay the multi-kilobyte frame the cycle machinery needs. `_guard` stays
+    // held across the call, exactly as when the code was inline.
+    let due = if gc_budgeted_cycle_active() {
+        None
+    } else {
         let Some(due) = gc_budgeted_due_trigger() else {
             super::instruments::note_budgeted_step_skip(
                 super::instruments::BudgetedStepSkip::NoTrigger,
             );
             return gc_idle_step_result();
         };
+        Some(due)
+    };
+    gc_budgeted_start_or_step(due, work_units, start_progress_kind)
+}
+
+/// The part of [`gc_budgeted_step_work_units_inner_with_progress`] that starts
+/// a cycle for `due` (when `Some`, i.e. no cycle was active and a trigger was
+/// due) and steps the active cycle. The caller holds `BudgetedGcStepGuard`.
+#[inline(never)]
+fn gc_budgeted_start_or_step(
+    due: Option<BudgetedGcTrigger>,
+    work_units: usize,
+    start_progress_kind: GcProgressKind,
+) -> GcStepReport {
+    if let Some(due) = due {
         if due == BudgetedGcTrigger::YoungScavengeCap && start_progress_kind.is_budgeted() {
             // ★ #7909. Starting a budgeted cycle here is strictly worse than
             // starting nothing, and it is self-sustaining.
@@ -4222,11 +4578,25 @@ fn gc_budgeted_step_work_units_inner_with_progress(
 fn gc_mutator_assist_step_work_units_inner_with_progress(
     work_units: usize,
     start_progress_kind: GcProgressKind,
-) -> JsGcStepResult {
+) -> GcStepReport {
     gc_budgeted_step_work_units_inner_with_progress(work_units, start_progress_kind)
 }
 
+/// A host safepoint that reports what it did, debt included. For callers
+/// that read the result: `js_gc_safepoint` and tests.
 pub(crate) fn gc_runtime_safepoint() -> JsGcStepResult {
+    gc_runtime_safepoint_report().with_debt()
+}
+
+/// The runtime's own safepoint poll (regex quanta, the microtask pump, the
+/// event loop). Makes exactly the decisions [`gc_runtime_safepoint`] makes and
+/// skips only the debt snapshot, which none of these callers reads.
+#[inline]
+pub(crate) fn gc_runtime_safepoint_poll() {
+    let _ = gc_runtime_safepoint_report();
+}
+
+fn gc_runtime_safepoint_report() -> GcStepReport {
     let budget = gc_progress_contract().budget_for(GcProgressKind::NormalIncremental);
     let Some(work_units) = budget.work_units else {
         return gc_budgeted_status_result();
@@ -4246,14 +4616,14 @@ fn write_gc_step_result(out: *mut JsGcStepResult, result: JsGcStepResult) -> u32
 #[no_mangle]
 pub extern "C" fn js_gc_step_work_units(work_units: u64, out: *mut JsGcStepResult) -> u32 {
     let work_units = usize::try_from(work_units).unwrap_or(usize::MAX);
-    let result = gc_budgeted_step_work_units_inner(work_units);
+    let result = gc_budgeted_step_work_units_inner(work_units).with_debt();
     write_gc_step_result(out, result)
 }
 
 #[no_mangle]
 pub extern "C" fn js_gc_step_us(budget_us: u64, out: *mut JsGcStepResult) -> u32 {
     if budget_us == 0 {
-        let result = gc_budgeted_status_result();
+        let result = gc_budgeted_status_result().with_debt();
         return write_gc_step_result(out, result);
     }
 
@@ -4264,12 +4634,12 @@ pub extern "C" fn js_gc_step_us(budget_us: u64, out: *mut JsGcStepResult) -> u32
     {
         result = gc_budgeted_step_work_units_inner(1);
     }
-    write_gc_step_result(out, result)
+    write_gc_step_result(out, result.with_debt())
 }
 
 #[no_mangle]
 pub extern "C" fn js_gc_step_status(out: *mut JsGcStepResult) -> u32 {
-    let result = gc_budgeted_status_result();
+    let result = gc_budgeted_status_result().with_debt();
     write_gc_step_result(out, result)
 }
 

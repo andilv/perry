@@ -20,6 +20,7 @@ mod bootstrap;
 mod build_cache;
 mod bundle_apple;
 mod bundle_ios;
+mod bundle_macos;
 mod defines;
 // `pub(crate)` so `commands::deps` can reuse `cjs_wrap::detect`'s
 // comment/string masker for its source scans (D005) instead of duplicating a
@@ -51,6 +52,7 @@ mod precompile_capture;
 mod reachability;
 mod size_report;
 mod solid_config;
+mod tiny_program;
 mod typed_feedback_profile;
 mod update_config;
 mod windows_target;

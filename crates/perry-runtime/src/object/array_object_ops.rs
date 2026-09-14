@@ -62,7 +62,8 @@ unsafe fn array_header_mut(obj: *mut ObjectHeader) -> *mut crate::array::ArrayHe
 /// Apply `Object.freeze` / `Object.seal` to an array's OWN index + named data
 /// properties. The generic `mark_all_keys` walks `crate::object::object_keys_array(obj)`, but an
 /// array's indices live in the dense element store and its named props in the
-/// `ARRAY_NAMED_PROPS` side table — neither appears in `keys_array` — so
+/// array's own named properties (`array/named_props.rs`) — neither appears in
+/// `keys_array` — so
 /// freeze/seal historically missed them, leaving a frozen array's elements
 /// writable/configurable. Returns `true` when `obj` is an array (handled here),
 /// `false` otherwise so the caller can fall back to the ordinary key walk.
@@ -870,6 +871,9 @@ pub(crate) unsafe fn define_array_property(
 
     // Write the value: an explicit `value` wins; a NEW property with no value
     // defaults to `undefined`; a redefine that omits `value` keeps the current.
+    // Setting a new property can allocate its pairs array and relocate the
+    // receiver. The descriptor-field reads below can collect again, so reload
+    // the rooted receiver only after every probe has finished.
     if has_value {
         crate::array::array_named_property_set(arr, key_str, value);
     } else if !exists {
@@ -886,8 +890,13 @@ pub(crate) unsafe fn define_array_property(
         .unwrap_or_else(|| cur_attrs.map(|a| a.enumerable()).unwrap_or(false));
     let configurable = read_bool(b"configurable")
         .unwrap_or_else(|| cur_attrs.map(|a| a.configurable()).unwrap_or(false));
+    // Named descriptor readers use the caller's owner identity, which can be
+    // a pre-growth forwarding alias. Preserve that identity while reloading
+    // the handle after every allocating probe: GC moves update the handle,
+    // whereas resolving array growth here alone would strand the attributes
+    // from getOwnPropertyDescriptor's existing lookup.
     set_property_attrs(
-        obj as usize,
+        current_obj() as usize,
         key_name.to_string(),
         PropertyAttrs::new(writable, enumerable, configurable),
     );

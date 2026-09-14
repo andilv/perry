@@ -4,6 +4,10 @@ use super::*;
 pub(super) mod block_skip;
 pub(super) use block_skip::BlockCensus;
 
+#[path = "trace/adopt_census.rs"]
+pub(crate) mod adopt_census;
+pub(crate) use adopt_census::AdoptableBlockBuilder;
+
 crate::perry_thread_local! {
     /// Set by test-only helpers that wipe page metadata for isolation
     /// (`old_arena_page_index_clear_for_tests`): real objects become
@@ -82,11 +86,11 @@ pub(super) fn classifier_valid_object_start(addr: usize) -> bool {
 
 /// #6179: differential-verification mode for the page-metadata classifier.
 pub(super) fn classifier_verify_enabled() -> bool {
-    if CLASSIFIER_VERIFY_SUPPRESSED.with(|c| c.get()) {
-        return false;
-    }
+    // The cached process-wide switch first: this runs on every census hit, and
+    // the suppression flag is a thread-local (#10182).
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| super::env_flag_enabled("PERRY_GC_VERIFY_CLASSIFIER"))
+        && !CLASSIFIER_VERIFY_SUPPRESSED.with(|c| c.get())
 }
 
 crate::perry_thread_local! {
@@ -94,42 +98,114 @@ crate::perry_thread_local! {
         const { std::cell::UnsafeCell::new(Vec::new()) };
 }
 
-const VALID_POINTER_ARENA_RUN_CAPACITY: usize = 1024;
+/// Census blocks whose walked extent exceeds this keep a sorted start list
+/// instead of a start bitmap: an oversized block (one large allocation rounded
+/// up to a `BLOCK_SIZE` multiple) holds a handful of objects, and a bitmap over
+/// its whole extent would be mostly zero words.
+const CENSUS_BITMAP_MAX_EXTENT: usize = crate::arena::BLOCK_SIZE;
+
+/// Start bitmaps are allocated in chunks of this many words (8 KiB), one or two
+/// per block. A bitmap kept in one contiguous vector grew past the allocator's
+/// small and medium size classes and made it commit a fresh large page:
+/// `records_array_1m:sparse` read +4.8 MiB peak RSS for a ~100 KB index. The
+/// start runs this replaces were 8 KiB vectors too.
+const CENSUS_BITMAP_CHUNK_WORDS: usize = 1024;
+const CENSUS_BITMAP_CHUNK_WORD_SHIFT: u32 = 10;
+/// Chunks a bitmap block can need: `CENSUS_BITMAP_MAX_EXTENT` bytes at one bit
+/// per 8 bytes is `2 * CENSUS_BITMAP_CHUNK_WORDS` words.
+const CENSUS_BITMAP_MAX_CHUNKS: usize = 2;
+
+/// Arena object starts sit on 8-byte boundaries relative to their block's
+/// `data` pointer: `ArenaObjectCursor::next_budgeted` rounds every header
+/// offset up to a multiple of 8 before reading it, and the census consumes
+/// exactly the headers that cursor yields.
+const CENSUS_START_ALIGN_SHIFT: u32 = 3;
+
+/// Window of the direct-mapped block index (#10182): one arena block (1 MiB).
+/// Distinct arena blocks are at least this large and never overlap, so no two
+/// census block bases fall into one window.
+const CENSUS_BLOCK_WINDOW_SHIFT: u32 = 20;
+/// Largest direct-mapped block index built: 16 GiB of address span, 128 KiB of
+/// table. A census spread wider keeps the binary search.
+const CENSUS_BLOCK_WINDOW_MAX: usize = 1 << 14;
+
+/// One censused arena block, in address order (#10182).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CensusStartBlock {
+    /// The block's `data` address as the census cursor snapshotted it.
+    pub(super) base: usize,
+    /// Bytes the census walked (`offset` in the snapshot). No censused header
+    /// starts at or past `base + extent`.
+    pub(super) extent: usize,
+    /// Global arena block index (`u32::MAX` when unknown).
+    pub(super) block_idx: u32,
+    /// Bitmap blocks: the block's bitmap chunks (owned by
+    /// `ValidPointerSet::start_bitmap_chunks`); word `w` is word
+    /// `w & (CENSUS_BITMAP_CHUNK_WORDS - 1)` of chunk `w >> 10`. Null past the
+    /// block's word count.
+    pub(super) chunks: [*mut u64; CENSUS_BITMAP_MAX_CHUNKS],
+    /// Sorted blocks: index of the block's first start in `large_starts`.
+    pub(super) first: usize,
+    /// Bitmap blocks: word count. Sorted blocks: start count.
+    pub(super) len: usize,
+    pub(super) sorted: bool,
+}
+
+impl CensusStartBlock {
+    /// Word `word_idx` of this bitmap block's start bitmap.
+    ///
+    /// # Safety
+    /// `self` is a bitmap block of a live `ValidPointerSet` and
+    /// `word_idx < self.len`.
+    #[inline(always)]
+    unsafe fn word_ptr(&self, word_idx: usize) -> *mut u64 {
+        debug_assert!(!self.sorted && word_idx < self.len);
+        self.chunks[word_idx >> CENSUS_BITMAP_CHUNK_WORD_SHIFT]
+            .add(word_idx & (CENSUS_BITMAP_CHUNK_WORDS - 1))
+    }
+}
 
 pub(crate) struct ValidPointerSet {
-    /// Arena-only start pointers in address-ordered runs — **the exact arena
-    /// membership set**, not merely an index for `enclosing_object`'s floor
-    /// lookups. `ArenaObjectCursorBuilder::new(ArenaWalkOrder::Address)` hands
-    /// the census headers over in ascending address order, so each run is
-    /// sorted by construction and a floor lookup that lands on the query IS
-    /// the membership answer.
+    /// **The exact arena membership set**, one entry per censused arena block
+    /// in ascending address order. `ArenaObjectCursorBuilder::new(
+    /// ArenaWalkOrder::Address)` hands the census the blocks in address order
+    /// and each block's headers in address order, so the table is sorted by
+    /// construction and a block never appears twice.
     ///
-    /// This used to be shadowed by a parallel `BTreeSet` over the same
-    /// addresses. That set cost one B-tree insert per live arena object with
-    /// nothing to show for it: the runs already held the same data in the same
-    /// order. On `json_pipeline` 500k the shadow cost **245.5 ms of a 748.3 ms
-    /// full collection** (`phase_us.build_valid_pointer_set`), 12.6% of the
-    /// `build_out` phase, and ~40 MB of transient peak heap (#7592).
-    pub(super) arena_runs: Vec<Vec<usize>>,
-    /// `arena_runs[i]`'s global arena block index (`u32::MAX` for runs pushed
-    /// without one). The census seals a run at every block boundary, so a
-    /// run never straddles two blocks and a membership hit names its block
-    /// for free (#10182).
-    pub(super) arena_run_blocks: Vec<u32>,
-    pub(super) current_arena_run_block: u32,
+    /// Membership used to answer from address-ordered runs of user pointers
+    /// (1024 per run, sealed at block boundaries): a binary search over every
+    /// run's first key, then a second binary search inside the run — about 21
+    /// cache-missing probes per traced pointer field, which was ~46 % of a full
+    /// mark on a live 20 MB JSON tree. The runs replaced a shadow `BTreeSet`
+    /// (#7592) and cost 8 bytes per censused object.
+    ///
+    /// Now each block carries an **object-start bitmap** (1 bit per 8-byte
+    /// alignment unit of its walked extent, 16 KB for a full 1 MB block) and a
+    /// query is a search over the block fences (`arena_block_bases`, one entry
+    /// per block) plus one bit test. Oversized blocks keep a sorted start list
+    /// (`large_starts`), since they hold a few objects over many megabytes.
+    pub(super) arena_blocks: Vec<CensusStartBlock>,
+    /// `arena_blocks[i].base`, mirrored into one contiguous vector so the
+    /// block-level binary search reads 8-byte fences only.
+    pub(super) arena_block_bases: Vec<usize>,
+    /// Storage of the bitmap blocks' start bitmaps, in 8 KiB chunks (see
+    /// `CENSUS_BITMAP_CHUNK_WORDS`). Bit `k` of a block's bitmap is set iff a
+    /// censused header starts at `base + (k << 3)`. A chunk's heap buffer never
+    /// moves, so `CensusStartBlock::chunks` may point into it.
+    pub(super) start_bitmap_chunks: Vec<Vec<u64>>,
+    /// Concatenated ascending start lists (user pointers) of the sorted blocks.
+    pub(super) large_starts: Vec<usize>,
     /// Per-block census facts and trace reachability (#10182). Disarmed
     /// unless this set was built by the production census walk.
     pub(super) block_census: BlockCensus,
-    /// `arena_runs[i].first()`, mirrored into one contiguous vector so the
-    /// run-level binary search reads 8-byte fences instead of chasing a
-    /// `Vec` header per probe. At 500k `json_pipeline` records this is ~4k
-    /// entries (32 KB, L2-resident) against 33 MB of run storage, and it is
-    /// what keeps the membership lookup competitive with the B-tree probe it
-    /// replaces (#7592).
-    pub(super) arena_run_firsts: Vec<usize>,
-    pub(super) current_arena_run: Vec<usize>,
-    /// Live count of pushed arena starts (sealed runs + the open one), kept so
-    /// `lookup_count` stays O(1).
+    /// Direct-mapped block index (#10182): one entry per 1 MiB window from
+    /// `block_windows_lo`, holding the index of the greatest census block whose
+    /// base is at or below the window start and the index of the census block,
+    /// at most one, whose base lies inside the window (`u32::MAX` for none).
+    /// Empty means `census_block_at` binary-searches `arena_block_bases`.
+    pub(super) block_windows: Vec<(u32, u32)>,
+    pub(super) block_windows_lo: usize,
+    /// Live count of pushed arena starts, kept so `lookup_count` stays O(1).
     pub(super) arena_count: usize,
     /// Exact membership for **malloc-tracked** objects only, which have no
     /// address order to exploit. A B-tree avoids hash-table rebuilds in tiny
@@ -170,12 +246,13 @@ pub(crate) struct ValidPointerSet {
 impl ValidPointerSet {
     pub(super) fn new() -> Self {
         Self {
-            arena_runs: Vec::new(),
-            arena_run_blocks: Vec::new(),
-            current_arena_run_block: u32::MAX,
+            arena_blocks: Vec::new(),
+            arena_block_bases: Vec::new(),
+            start_bitmap_chunks: Vec::new(),
+            large_starts: Vec::new(),
             block_census: BlockCensus::disarmed(),
-            arena_run_firsts: Vec::new(),
-            current_arena_run: Vec::with_capacity(VALID_POINTER_ARENA_RUN_CAPACITY),
+            block_windows: Vec::new(),
+            block_windows_lo: 0,
             arena_count: 0,
             malloc_lookup: std::collections::BTreeSet::new(),
             range_min: usize::MAX,
@@ -186,34 +263,173 @@ impl ValidPointerSet {
         }
     }
 
-    /// Caller must guarantee that pushes happen in ascending address
-    /// order — `ValidPointerSetBuilder` does so via `ArenaObjectCursor`
-    /// in address order. `block_idx` is the start's global arena block; the
-    /// open run is sealed whenever it changes, so no run straddles two blocks
-    /// (#10182).
-    pub(super) fn push_arena_in_block(&mut self, ptr: usize, block_idx: u32) {
+    /// Open census block `block_idx`: `data`/`offset` exactly as the census
+    /// cursor snapshotted it. Every start pushed until the next call belongs to
+    /// this block. Blocks must be opened in ascending address order.
+    pub(super) fn begin_arena_block(&mut self, block_idx: u32, data: usize, offset: usize) {
         if self.classifier_mode {
             return; // #6179: no exact census in classifier mode
         }
-        if block_idx != self.current_arena_run_block {
-            self.seal_current_arena_run();
-            self.current_arena_run_block = block_idx;
+        if let Some(previous) = self.arena_blocks.last() {
+            assert!(
+                previous.base.saturating_add(previous.extent) <= data,
+                "census blocks must arrive in ascending, non-overlapping address order: \
+                 {:#x}+{:#x} then {data:#x}",
+                previous.base,
+                previous.extent
+            );
         }
-        if let Some(previous) = self
-            .current_arena_run
-            .last()
-            .copied()
-            .or_else(|| self.arena_runs.last().and_then(|run| run.last()).copied())
-        {
-            debug_assert!(previous <= ptr);
-        }
+        let sorted = offset > CENSUS_BITMAP_MAX_EXTENT;
+        let mut chunks = [std::ptr::null_mut(); CENSUS_BITMAP_MAX_CHUNKS];
+        let (first, len) = if sorted {
+            (self.large_starts.len(), 0)
+        } else {
+            let bits = offset.div_ceil(1 << CENSUS_START_ALIGN_SHIFT);
+            let words = bits.div_ceil(64);
+            for (index, chunk) in chunks.iter_mut().enumerate() {
+                let start = index * CENSUS_BITMAP_CHUNK_WORDS;
+                if start >= words {
+                    break;
+                }
+                let mut storage = vec![0u64; (words - start).min(CENSUS_BITMAP_CHUNK_WORDS)];
+                *chunk = storage.as_mut_ptr();
+                self.start_bitmap_chunks.push(storage);
+            }
+            (0, words)
+        };
+        self.arena_block_bases.push(data);
+        self.arena_blocks.push(CensusStartBlock {
+            base: data,
+            extent: offset,
+            block_idx,
+            chunks,
+            first,
+            len,
+            sorted,
+        });
+    }
 
-        self.record_pointer_range(ptr);
-        self.current_arena_run.push(ptr);
-        self.arena_count += 1;
-        if self.current_arena_run.len() >= VALID_POINTER_ARENA_RUN_CAPACITY {
-            self.seal_current_arena_run();
+    /// Open census block `block_idx` with start-bitmap storage built by someone
+    /// else (`adopt_census`): `chunks` hold `words` words in the census layout
+    /// for a block whose walked extent is `offset`.
+    pub(super) fn begin_arena_block_with_chunks(
+        &mut self,
+        block_idx: u32,
+        data: usize,
+        offset: usize,
+        words: usize,
+        mut chunks: Vec<Vec<u64>>,
+    ) {
+        debug_assert!(!self.classifier_mode && offset <= CENSUS_BITMAP_MAX_EXTENT);
+        if let Some(previous) = self.arena_blocks.last() {
+            assert!(
+                previous.base.saturating_add(previous.extent) <= data,
+                "census blocks must arrive in ascending, non-overlapping address order: \
+                 {:#x}+{:#x} then {data:#x}",
+                previous.base,
+                previous.extent
+            );
         }
+        assert_eq!(
+            words,
+            offset.div_ceil(1 << CENSUS_START_ALIGN_SHIFT).div_ceil(64),
+            "adopted bitmap must cover exactly the block's walked extent"
+        );
+        let mut pointers = [std::ptr::null_mut(); CENSUS_BITMAP_MAX_CHUNKS];
+        for (index, chunk) in chunks.iter_mut().enumerate().take(CENSUS_BITMAP_MAX_CHUNKS) {
+            pointers[index] = chunk.as_mut_ptr();
+        }
+        self.start_bitmap_chunks.extend(chunks);
+        self.arena_block_bases.push(data);
+        self.arena_blocks.push(CensusStartBlock {
+            base: data,
+            extent: offset,
+            block_idx,
+            chunks: pointers,
+            first: 0,
+            len: words,
+            sorted: false,
+        });
+    }
+
+    /// Record a censused arena start (user pointer) in the block opened by the
+    /// last `begin_arena_block`. Starts arrive in ascending address order —
+    /// `ValidPointerSetBuilder` feeds them from `ArenaObjectCursor` in address
+    /// order.
+    pub(super) fn push_arena(&mut self, ptr: usize) {
+        if self.classifier_mode {
+            return; // #6179: no exact census in classifier mode
+        }
+        let block = self
+            .arena_blocks
+            .last_mut()
+            .expect("an arena start is pushed only inside an opened census block");
+        let header_offset = ptr.wrapping_sub(block.base).wrapping_sub(GC_HEADER_SIZE);
+        // A start the bitmap cannot represent would be a silent false negative
+        // (swept live), so the cursor's alignment contract is checked, not
+        // assumed. One predictable compare per censused object.
+        assert!(
+            header_offset < block.extent
+                && header_offset & ((1 << CENSUS_START_ALIGN_SHIFT) - 1) == 0,
+            "census start {ptr:#x} is outside or misaligned in its block \
+             {:#x}+{:#x}",
+            block.base,
+            block.extent
+        );
+        if block.sorted {
+            debug_assert!(self.large_starts.last().is_none_or(|&last| last < ptr));
+            self.large_starts.push(ptr);
+            block.len += 1;
+        } else {
+            let bit = header_offset >> CENSUS_START_ALIGN_SHIFT;
+            // SAFETY: `header_offset < extent` (asserted above), so the word
+            // index is below the block's word count.
+            unsafe {
+                *block.word_ptr(bit >> 6) |= 1u64 << (bit & 63);
+            }
+        }
+        self.arena_count += 1;
+        self.record_pointer_range(ptr);
+    }
+
+    /// Build the direct-mapped block index once the census is complete. It is
+    /// left empty — `census_block_at` keeps the binary search — when two block
+    /// bases share a window (only fabricated test sets do) or the blocks span
+    /// more than `CENSUS_BLOCK_WINDOW_MAX` windows.
+    pub(super) fn build_block_windows(&mut self) {
+        self.block_windows.clear();
+        let (Some(first), Some(last)) = (self.arena_blocks.first(), self.arena_blocks.last())
+        else {
+            return;
+        };
+        let lo = first.base >> CENSUS_BLOCK_WINDOW_SHIFT;
+        let hi = last.base.saturating_add(last.extent.max(1) - 1) >> CENSUS_BLOCK_WINDOW_SHIFT;
+        let windows = hi - lo + 1;
+        if windows > CENSUS_BLOCK_WINDOW_MAX || self.arena_blocks.len() >= u32::MAX as usize {
+            return;
+        }
+        let mut table = vec![(u32::MAX, u32::MAX); windows];
+        let mut previous = usize::MAX;
+        for (idx, block) in self.arena_blocks.iter().enumerate() {
+            let window = (block.base >> CENSUS_BLOCK_WINDOW_SHIFT) - lo;
+            if window == previous {
+                return;
+            }
+            table[window].1 = idx as u32;
+            previous = window;
+        }
+        let mut greatest = u32::MAX;
+        let mut next = 0usize;
+        for (window, entry) in table.iter_mut().enumerate() {
+            let window_start = (lo + window) << CENSUS_BLOCK_WINDOW_SHIFT;
+            while next < self.arena_blocks.len() && self.arena_blocks[next].base <= window_start {
+                greatest = next as u32;
+                next += 1;
+            }
+            entry.0 = greatest;
+        }
+        self.block_windows = table;
+        self.block_windows_lo = lo;
     }
 
     pub(super) fn push_malloc(&mut self, ptr: usize) {
@@ -236,30 +452,29 @@ impl ValidPointerSet {
     pub(super) fn tenured_nursery_bytes(&self) -> usize {
         self.tenured_nursery_bytes
     }
-    pub(super) fn finalize(&mut self) {
-        self.seal_current_arena_run();
+    /// Transient heap bytes the arena membership index holds (fences, block
+    /// table, bitmaps, oversized-block start lists).
+    #[cfg(test)]
+    pub(super) fn arena_index_bytes(&self) -> usize {
+        self.arena_blocks.capacity() * std::mem::size_of::<CensusStartBlock>()
+            + self.arena_block_bases.capacity() * std::mem::size_of::<usize>()
+            + self
+                .start_bitmap_chunks
+                .iter()
+                .map(|chunk| chunk.capacity() * std::mem::size_of::<u64>())
+                .sum::<usize>()
+            + self.start_bitmap_chunks.capacity() * std::mem::size_of::<Vec<u64>>()
+            + self.large_starts.capacity() * std::mem::size_of::<usize>()
     }
 
     #[inline(always)]
-    fn record_pointer_range(&mut self, ptr: usize) {
+    pub(super) fn record_pointer_range(&mut self, ptr: usize) {
         if ptr < self.range_min {
             self.range_min = ptr;
         }
         if ptr > self.range_max {
             self.range_max = ptr;
         }
-    }
-
-    fn seal_current_arena_run(&mut self) {
-        if self.current_arena_run.is_empty() {
-            return;
-        }
-        let sealed = std::mem::take(&mut self.current_arena_run);
-        // Non-empty by the guard above, so the fence mirror stays index-aligned
-        // with `arena_runs` — `arena_run_firsts[i] == arena_runs[i][0]`.
-        self.arena_run_firsts.push(sealed[0]);
-        self.arena_runs.push(sealed);
-        self.arena_run_blocks.push(self.current_arena_run_block);
     }
 
     /// Cheap O(1) range-rejection prefilter. Most stack words and
@@ -292,11 +507,10 @@ impl ValidPointerSet {
             // censused address range.
             return false;
         }
-        // Exact lookup. Arena starts answer from the address-ordered census
-        // runs (a floor lookup that lands ON the query is membership); only
-        // malloc-tracked starts, which have no usable order, need the B-tree.
-        // Arena first because arena hits dominate every workload that reaches
-        // here — a malloc pointer pays one extra run-level binary search.
+        // Exact lookup. Arena starts answer from the per-block start bitmaps;
+        // only malloc-tracked starts, which have no usable order, need the
+        // B-tree. Arena first because arena hits dominate every workload that
+        // reaches here — a malloc pointer pays one extra fence search.
         let exact = self.arena_start_censused(*ptr)
             || (!self.malloc_lookup.is_empty() && self.malloc_lookup.contains(ptr));
         // #6179 differential verification (PERRY_GC_VERIFY_CLASSIFIER=1):
@@ -336,13 +550,14 @@ impl ValidPointerSet {
     /// iteration. Find the largest entry `<= query`, then validate via
     /// the GcHeader's size field.
     pub(crate) fn enclosing_object(&self, ptr: usize) -> Option<usize> {
-        let (candidate, run) = self.find_arena_floor_run(ptr)?;
+        let block = self.census_block_at(ptr)?;
+        let candidate = self.floor_start_in_block(block, ptr)?;
         unsafe {
             let header = (candidate as *const u8).sub(GC_HEADER_SIZE) as *const GcHeader;
             let total = (*header).size as usize;
             let payload_end = candidate + total.saturating_sub(GC_HEADER_SIZE);
             if ptr >= candidate && ptr < payload_end {
-                self.note_run_reached(run);
+                self.block_census.note_reached(block.block_idx);
                 Some(candidate)
             } else {
                 None
@@ -350,57 +565,133 @@ impl ValidPointerSet {
         }
     }
 
-    /// A census hit in run `run`: its block was reached by the trace (#10182).
-    /// See `block_skip`'s module doc for why every mark passes through here.
+    /// The census block whose base is the greatest one `<= ptr`, if any.
+    /// `ptr` may still lie past that block's walked extent.
+    ///
+    /// #10182: answered from the direct-mapped block index when one was built.
+    /// The window holding `ptr` names the greatest base at or below the window
+    /// start and the one base, if any, inside the window, so the greatest base
+    /// at or below `ptr` is the inside one when `ptr` has reached it. Past the
+    /// last window every base is below `ptr`; before the first none is.
     #[inline(always)]
-    fn note_run_reached(&self, run: usize) {
-        if let Some(&block_idx) = self.arena_run_blocks.get(run) {
-            self.block_census.note_reached(block_idx);
+    fn census_block_at(&self, ptr: usize) -> Option<&CensusStartBlock> {
+        if !self.block_windows.is_empty() {
+            let window = ptr >> CENSUS_BLOCK_WINDOW_SHIFT;
+            let idx = match self
+                .block_windows
+                .get(window.wrapping_sub(self.block_windows_lo))
+            {
+                Some(&(below, inside)) => {
+                    #[cfg(test)]
+                    if block_window_sabotage::ignoring_inside() {
+                        return self.arena_blocks.get(below as usize);
+                    }
+                    if inside != u32::MAX && ptr >= self.arena_block_bases[inside as usize] {
+                        inside
+                    } else {
+                        below
+                    }
+                }
+                None if window < self.block_windows_lo => return None,
+                None => return self.arena_blocks.last(),
+            };
+            return self.arena_blocks.get(idx as usize);
         }
+        self.census_block_at_by_search(ptr)
     }
 
-    /// Exact arena membership: the census runs are address-ordered, so `ptr`
-    /// was censused iff its floor is itself.
-    ///
-    /// **Load-bearing ordering requirement, which the `BTreeSet` this replaced
-    /// did not have.** The B-tree was complete after every `push_arena`, so a
-    /// mid-build query merely saw fewer entries. The runs are only complete
-    /// once `finalize()` has sealed `current_arena_run` — up to
-    /// `VALID_POINTER_ARENA_RUN_CAPACITY` censused starts are invisible before
-    /// that. A membership query on an unsealed set is therefore a FALSE
-    /// NEGATIVE, and a false negative here is not a missed optimisation: the
-    /// conservative scan drops the root, the object is swept live, and the
-    /// failure surfaces cycles later as `TypeError: value is not a function`.
-    ///
-    /// The builder's phase machine guarantees this today (`Finalize` precedes
-    /// `Done`, and the set escapes only through `finish()`), so the assert is
-    /// free in release. It exists so that a phase added after `Finalize`, or a
-    /// caller that queries a partially-built set, fails a test instead of
-    /// corrupting the heap. Verified to fire: skipping the seal in `finalize`
-    /// trips it with "4 censused starts are invisible to this lookup".
-    #[inline]
-    fn arena_start_censused(&self, ptr: usize) -> bool {
-        debug_assert!(
-            self.current_arena_run.is_empty(),
-            "arena membership queried before finalize() sealed the open run: \
-             {} censused starts are invisible to this lookup",
-            self.current_arena_run.len()
-        );
-        match self.find_arena_floor_run(ptr) {
-            Some((floor, run)) if floor == ptr => {
-                self.note_run_reached(run);
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn find_arena_floor_run(&self, ptr: usize) -> Option<(usize, usize)> {
-        let idx = self.arena_run_firsts.partition_point(|&first| first <= ptr);
+    #[inline(always)]
+    fn census_block_at_by_search(&self, ptr: usize) -> Option<&CensusStartBlock> {
+        let idx = self.arena_block_bases.partition_point(|&base| base <= ptr);
         if idx == 0 {
             return None;
         }
-        Self::find_floor(&self.arena_runs[idx - 1], ptr).map(|floor| (floor, idx - 1))
+        self.arena_blocks.get(idx - 1)
+    }
+
+    /// `(direct-mapped answer, binary-search answer)` as block bases, for the
+    /// block-index test.
+    #[cfg(test)]
+    pub(super) fn census_block_base_both_ways(&self, ptr: usize) -> (Option<usize>, Option<usize>) {
+        (
+            self.census_block_at(ptr).map(|b| b.base),
+            self.census_block_at_by_search(ptr).map(|b| b.base),
+        )
+    }
+
+    /// Exact arena membership: a census hit also records that the trace
+    /// reached the hit's block (#10182; see `block_skip`'s module doc for why
+    /// every mark passes through here).
+    #[inline]
+    fn arena_start_censused(&self, ptr: usize) -> bool {
+        let Some(block) = self.census_block_at(ptr) else {
+            return false;
+        };
+        let hit = if block.sorted {
+            self.large_starts[block.first..block.first + block.len]
+                .binary_search(&ptr)
+                .is_ok()
+        } else {
+            // Below `base + GC_HEADER_SIZE` the subtraction wraps past every
+            // extent, so one compare rejects both ends of the block.
+            let header_offset = ptr.wrapping_sub(block.base).wrapping_sub(GC_HEADER_SIZE);
+            if header_offset >= block.extent
+                || header_offset & ((1 << CENSUS_START_ALIGN_SHIFT) - 1) != 0
+            {
+                false
+            } else {
+                let bit = header_offset >> CENSUS_START_ALIGN_SHIFT;
+                #[cfg(test)]
+                let bit = start_bitmap_sabotage::shift_probe(bit);
+                // SAFETY: `header_offset < extent`, so the word index is below
+                // the block's word count (the sabotaged probe in test builds
+                // may step one bit past it, still inside the last word).
+                let word_idx = bit >> 6;
+                word_idx < block.len
+                    && unsafe { (*block.word_ptr(word_idx) >> (bit & 63)) & 1 != 0 }
+            }
+        };
+        if hit {
+            self.block_census.note_reached(block.block_idx);
+        }
+        hit
+    }
+
+    /// Greatest censused start (user pointer) in `block` that is `<= ptr`.
+    fn floor_start_in_block(&self, block: &CensusStartBlock, ptr: usize) -> Option<usize> {
+        if block.sorted {
+            let starts = &self.large_starts[block.first..block.first + block.len];
+            return Self::find_floor(starts, ptr);
+        }
+        if block.extent == 0 {
+            return None;
+        }
+        // A start `s <= ptr` has its header at `s - GC_HEADER_SIZE`, so the
+        // highest candidate header offset is `ptr - base - GC_HEADER_SIZE`,
+        // clamped to the last walked byte.
+        let header_offset = ptr.checked_sub(block.base)?.checked_sub(GC_HEADER_SIZE)?;
+        let bit = header_offset.min(block.extent - 1) >> CENSUS_START_ALIGN_SHIFT;
+        let mut word_idx = bit >> 6;
+        let top = bit & 63;
+        let keep = if top == 63 {
+            u64::MAX
+        } else {
+            (1u64 << (top + 1)) - 1
+        };
+        // SAFETY: `bit` derives from an offset below `extent`, and every
+        // later index is smaller.
+        let mut word = unsafe { *block.word_ptr(word_idx) } & keep;
+        loop {
+            if word != 0 {
+                let floor_bit = word_idx * 64 + (63 - word.leading_zeros() as usize);
+                return Some(block.base + (floor_bit << CENSUS_START_ALIGN_SHIFT) + GC_HEADER_SIZE);
+            }
+            if word_idx == 0 {
+                return None;
+            }
+            word_idx -= 1;
+            word = unsafe { *block.word_ptr(word_idx) };
+        }
     }
 
     pub(super) fn find_floor(sorted: &[usize], ptr: usize) -> Option<usize> {
@@ -412,6 +703,103 @@ impl ValidPointerSet {
             return None;
         }
         Some(sorted[idx - 1])
+    }
+}
+
+/// Sabotage switch for the block-index test: a lookup ignores the base inside
+/// the window and answers with the block below it. Test builds only.
+#[cfg(test)]
+pub(crate) mod block_window_sabotage {
+    use std::cell::Cell;
+
+    thread_local! {
+        static IGNORE_INSIDE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    #[inline]
+    pub(crate) fn ignoring_inside() -> bool {
+        IGNORE_INSIDE.with(Cell::get)
+    }
+
+    pub(crate) struct Guard(bool);
+
+    impl Guard {
+        pub(crate) fn arm() -> Self {
+            Self(IGNORE_INSIDE.with(|s| s.replace(true)))
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            IGNORE_INSIDE.with(|s| s.set(self.0));
+        }
+    }
+}
+
+/// Sabotage switch for the whole-block census test: the one-pass walk skips
+/// recording every start bit. Test builds only.
+#[cfg(test)]
+pub(crate) mod whole_block_census_sabotage {
+    use std::cell::Cell;
+
+    thread_local! {
+        static DROP_STARTS: Cell<bool> = const { Cell::new(false) };
+    }
+
+    #[inline]
+    pub(crate) fn dropping_starts() -> bool {
+        DROP_STARTS.with(Cell::get)
+    }
+
+    /// Arms the dropped starts until the guard drops.
+    pub(crate) struct Guard(bool);
+
+    impl Guard {
+        pub(crate) fn arm() -> Self {
+            Self(DROP_STARTS.with(|s| s.replace(true)))
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            DROP_STARTS.with(|s| s.set(self.0));
+        }
+    }
+}
+
+/// Sabotage switch for the start-bitmap tests: shifts every bitmap probe by
+/// one alignment unit, so a test can show its membership oracle notices a
+/// bitmap that answers for the wrong address. Test builds only.
+#[cfg(test)]
+pub(crate) mod start_bitmap_sabotage {
+    use std::cell::Cell;
+
+    thread_local! {
+        static SHIFT_PROBE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    #[inline]
+    pub(crate) fn shift_probe(bit: usize) -> usize {
+        if SHIFT_PROBE.with(Cell::get) {
+            bit + 1
+        } else {
+            bit
+        }
+    }
+
+    /// Arms the shifted probe until the guard drops.
+    pub(crate) struct Guard(bool);
+
+    impl Guard {
+        pub(crate) fn arm() -> Self {
+            Self(SHIFT_PROBE.with(|s| s.replace(true)))
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            SHIFT_PROBE.with(|s| s.set(self.0));
+        }
     }
 }
 
@@ -449,8 +837,7 @@ pub(super) enum ValidPointerSetBuildPhase {
 pub(super) struct ValidPointerSetBuilderSnapshot {
     pub(super) phase: ValidPointerSetBuildPhase,
     pub(super) arena_setup_blocks: usize,
-    pub(super) arena_run_count: usize,
-    pub(super) current_arena_run_len: usize,
+    pub(super) arena_block_count: usize,
     pub(super) lookup_count: usize,
     pub(super) malloc_index: usize,
 }
@@ -513,6 +900,10 @@ impl ValidPointerSetBuilder {
                     }
                 }
                 ValidPointerSetBuildPhase::ArenaWalk => {
+                    if unbounded && self.walk_whole_blocks() {
+                        self.phase = ValidPointerSetBuildPhase::MallocWalk;
+                        continue;
+                    }
                     if !self.step_arena_walk(&mut remaining) {
                         return false;
                     }
@@ -535,7 +926,7 @@ impl ValidPointerSetBuilder {
                         return false;
                     }
                     self.set.block_census.flush_block();
-                    self.set.finalize();
+                    self.set.build_block_windows();
                     self.phase = ValidPointerSetBuildPhase::Done;
                     return true;
                 }
@@ -573,34 +964,199 @@ impl ValidPointerSetBuilder {
                 }
                 return false;
             };
-            if self.census_armed {
-                if block_idx != self.census_block_idx {
-                    self.census_block_idx = block_idx;
-                    if let Some((_, data, offset)) = self
-                        .arena_cursor
-                        .as_ref()
-                        .and_then(crate::arena::ArenaObjectCursor::current_block_extent)
-                    {
+            if block_idx != self.census_block_idx {
+                self.census_block_idx = block_idx;
+                if let Some((_, data, offset)) = self
+                    .arena_cursor
+                    .as_ref()
+                    .and_then(crate::arena::ArenaObjectCursor::current_block_extent)
+                {
+                    self.set.begin_arena_block(
+                        u32::try_from(block_idx).unwrap_or(u32::MAX),
+                        data,
+                        offset,
+                    );
+                    if self.census_armed {
                         self.set.block_census.begin_block(block_idx, data, offset);
                     }
                 }
+            }
+            if self.census_armed {
                 unsafe {
                     self.set
                         .block_census
                         .note_header(header_ptr as *const GcHeader);
                 }
             }
-            self.record_arena_header(header_ptr, block_idx);
+            self.record_arena_header(header_ptr);
         }
         false
     }
 
-    fn record_arena_header(&mut self, header_ptr: *mut u8, block_idx: usize) {
+    /// An unbudgeted census walks each block in one pass
+    /// ([`Self::census_whole_block`]) instead of one cursor call per object:
+    /// the census reads every header of the arena, and on a pacing full over
+    /// two promoted 20 MB JSON trees its per-object overhead, not the memory
+    /// traffic, was three quarters of the phase (#10182). Returns false, and
+    /// walks nothing, when the per-object path must be kept: classifier mode
+    /// records no starts, and a cursor a budgeted step left inside a block
+    /// resumes mid-block.
+    fn walk_whole_blocks(&mut self) -> bool {
+        if self.set.classifier_mode
+            || !self
+                .arena_cursor
+                .as_ref()
+                .is_some_and(crate::arena::ArenaObjectCursor::at_block_boundary)
+        {
+            return false;
+        }
+        loop {
+            let next = self
+                .arena_cursor
+                .as_mut()
+                .expect("arena cursor exists during arena walk")
+                .next_whole_block();
+            let Some((block_idx, data, offset, size)) = next else {
+                self.arena_cursor = None;
+                return true;
+            };
+            // SAFETY: the cursor snapshotted this block for this census, and
+            // nothing runs between that snapshot and this walk.
+            unsafe { self.census_whole_block(block_idx, data, offset, size) };
+        }
+    }
+
+    /// Census one whole arena block in a single pass. It yields exactly the
+    /// headers `ArenaObjectCursor::next_budgeted` yields for the block (same
+    /// alignment, stop conditions and walkability filter) and records exactly
+    /// what `step_arena_walk` records for each of them; the per-block constants
+    /// (the bitmap chunks, the nursery classification, the pointer range) are
+    /// hoisted out of the per-object loop.
+    ///
+    /// # Safety
+    /// `data`/`offset`/`size` are an arena block as the census cursor
+    /// snapshotted it.
+    unsafe fn census_whole_block(
+        &mut self,
+        block_idx: usize,
+        data: usize,
+        offset: usize,
+        size: usize,
+    ) {
+        // #10182: a block the in-place promotion walk of this very safepoint
+        // recorded is adopted instead of walked (see `adopt_census`).
+        if self.adopt_promoted_block(block_idx, data, offset, size) {
+            return;
+        }
+        self.walk_census_block(block_idx, data, offset, size);
+    }
+
+    /// The census walk of one whole block (see [`Self::census_whole_block`]).
+    ///
+    /// # Safety
+    /// As `census_whole_block`.
+    pub(super) unsafe fn walk_census_block(
+        &mut self,
+        block_idx: usize,
+        data: usize,
+        offset: usize,
+        size: usize,
+    ) {
+        let mut cursor = 0usize;
+        let mut begun = false;
+        let mut bitmap: Option<[*mut u64; CENSUS_BITMAP_MAX_CHUNKS]> = None;
+        let mut nursery = false;
+        let mut first_start = 0usize;
+        let mut last_start = 0usize;
+        let mut bitmap_starts = 0usize;
+        let mut tenured_bytes = 0usize;
+        let mut non_walkable_before_first_object = false;
+        while cursor < offset {
+            let aligned = (cursor + 7) & !7;
+            if aligned >= offset {
+                break;
+            }
+            let header = (data + aligned) as *const GcHeader;
+            let total_size = (*header).size as usize;
+            if total_size == 0 || total_size > size {
+                break;
+            }
+            cursor = aligned + total_size;
+            if !crate::gc::gc_type_is_arena_walkable((*header).obj_type) {
+                if begun {
+                    self.set.block_census.note_non_walkable();
+                } else {
+                    non_walkable_before_first_object = true;
+                }
+                continue;
+            }
+            let user_ptr = data + aligned + GC_HEADER_SIZE;
+            if !begun {
+                begun = true;
+                self.census_block_idx = block_idx;
+                self.set.begin_arena_block(
+                    u32::try_from(block_idx).unwrap_or(u32::MAX),
+                    data,
+                    offset,
+                );
+                if self.census_armed {
+                    self.set.block_census.begin_block(block_idx, data, offset);
+                    self.set.block_census.note_whole_block_walk();
+                    if non_walkable_before_first_object {
+                        self.set.block_census.note_non_walkable();
+                    }
+                }
+                let block = self
+                    .set
+                    .arena_blocks
+                    .last()
+                    .expect("census block just opened");
+                if !block.sorted {
+                    bitmap = Some(block.chunks);
+                }
+                // Every object of the block has the block's classification.
+                nursery = crate::arena::pointer_in_nursery(user_ptr);
+                first_start = user_ptr;
+            }
+            if self.census_armed {
+                self.set.block_census.note_header(header);
+            }
+            match bitmap {
+                Some(chunks) => {
+                    #[cfg(test)]
+                    if whole_block_census_sabotage::dropping_starts() {
+                        last_start = user_ptr;
+                        continue;
+                    }
+                    // `aligned` is a multiple of 8 below `offset`, the block's
+                    // extent: the bit and its word are inside the bitmap.
+                    let bit = aligned >> CENSUS_START_ALIGN_SHIFT;
+                    let word = bit >> 6;
+                    *chunks[word >> CENSUS_BITMAP_CHUNK_WORD_SHIFT]
+                        .add(word & (CENSUS_BITMAP_CHUNK_WORDS - 1)) |= 1u64 << (bit & 63);
+                    bitmap_starts += 1;
+                }
+                None => self.set.push_arena(user_ptr),
+            }
+            last_start = user_ptr;
+            let flags = (*header).gc_flags;
+            if nursery && flags & GC_FLAG_TENURED != 0 && flags & GC_FLAG_FORWARDED == 0 {
+                tenured_bytes += total_size;
+            }
+        }
+        if begun {
+            if bitmap.is_some() {
+                self.set.arena_count += bitmap_starts;
+                self.set.record_pointer_range(first_start);
+                self.set.record_pointer_range(last_start);
+            }
+            self.set.record_tenured_nursery_bytes(tenured_bytes);
+        }
+    }
+
+    fn record_arena_header(&mut self, header_ptr: *mut u8) {
         let user_ptr = unsafe { header_ptr.add(GC_HEADER_SIZE) };
-        self.set.push_arena_in_block(
-            user_ptr as usize,
-            u32::try_from(block_idx).unwrap_or(u32::MAX),
-        );
+        self.set.push_arena(user_ptr as usize);
         unsafe {
             let header = header_ptr as *const GcHeader;
             let flags = (*header).gc_flags;
@@ -639,8 +1195,7 @@ impl ValidPointerSetBuilder {
                 .arena_cursor_builder
                 .as_ref()
                 .map_or(0, crate::arena::ArenaObjectCursorBuilder::inspected_blocks),
-            arena_run_count: self.set.arena_runs.len(),
-            current_arena_run_len: self.set.current_arena_run.len(),
+            arena_block_count: self.set.arena_blocks.len(),
             lookup_count: self.set.lookup_count(),
             malloc_index: self.malloc_index,
         }
@@ -751,14 +1306,16 @@ pub(super) fn try_mark_raw_root_addr(addr: usize, valid_ptrs: &ValidPointerSet) 
 /// on exact mutable roots. `PERRY_CONSERVATIVE_STACK_SCAN=full` forces the
 /// legacy path for debugging and makes copied-minor ineligible.
 
+#[inline(always)]
 pub(super) unsafe fn mark_field_into_worklist(
     val_bits: u64,
     valid_ptrs: &ValidPointerSet,
     worklist: &mut Vec<*mut GcHeader>,
+    proxy_trace_active: bool,
 ) -> bool {
-    if crate::proxy::gc_full_trace_active()
-        && crate::proxy::gc_observe_traced_value(val_bits, valid_ptrs)
-    {
+    // `proxy_trace_active` is `crate::proxy::gc_full_trace_active()`, read by
+    // the caller once for the whole object being traced (#10182).
+    if proxy_trace_active && crate::proxy::gc_observe_traced_value(val_bits, valid_ptrs) {
         return false;
     }
     let tag = val_bits & TAG_MASK;
@@ -794,6 +1351,19 @@ pub(super) unsafe fn mark_field_into_worklist(
         return false;
     }
     (*header).gc_flags = flags | GC_FLAG_MARKED;
+    // #10182: tracing a pointer-free object that is not a forwarding stub does
+    // nothing — `trace_one_worklist_header` would only follow a FORWARDED hop,
+    // and a leaf descriptor visits no slot — so it is marked and not queued.
+    // Strings are half the objects of a JSON tree.
+    #[cfg(not(test))]
+    let forwarded = flags & GC_FLAG_FORWARDED != 0;
+    #[cfg(test)]
+    let forwarded = flags & GC_FLAG_FORWARDED != 0 && !leaf_mark_sabotage::ignoring_forwarding();
+    if !forwarded
+        && gc_type_rewrite_descriptor_kind((*header).obj_type) == GcRewriteDescriptorKind::Leaf
+    {
+        return true;
+    }
     // Push directly onto the caller's worklist. No MARK_SEEDS push —
     // that's only needed for root-phase callers that don't own a
     // worklist (mark_mutable_root_slots, mark_registered_roots,
@@ -801,6 +1371,37 @@ pub(super) unsafe fn mark_field_into_worklist(
     // already owns and consumes this worklist.
     worklist.push(header);
     true
+}
+
+/// Sabotage switch for the leaf-mark test: a forwarded pointer-free object is
+/// not queued either, so its forwarding hop is never followed. Test builds
+/// only.
+#[cfg(test)]
+pub(crate) mod leaf_mark_sabotage {
+    use std::cell::Cell;
+
+    thread_local! {
+        static IGNORE_FORWARDING: Cell<bool> = const { Cell::new(false) };
+    }
+
+    #[inline]
+    pub(crate) fn ignoring_forwarding() -> bool {
+        IGNORE_FORWARDING.with(Cell::get)
+    }
+
+    pub(crate) struct Guard(bool);
+
+    impl Guard {
+        pub(crate) fn arm() -> Self {
+            Self(IGNORE_FORWARDING.with(|s| s.replace(true)))
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            IGNORE_FORWARDING.with(|s| s.set(self.0));
+        }
+    }
 }
 
 pub(super) fn try_mark_young_value_as_seed(value_bits: u64, valid_ptrs: &ValidPointerSet) -> bool {
@@ -877,6 +1478,13 @@ pub(super) fn drain_trace_worklist_step(
     let mut remaining = budget;
     while remaining > 0 && *cursor < worklist.len() {
         let header = worklist[*cursor];
+        // #10182: the drain visits headers in queue order and each one is a
+        // cold DRAM read on a heap larger than the cache (a 20 MB JSON tree);
+        // start the read of the entry a few places ahead, as the copying
+        // minor's drain already does. A prefetch cannot fault.
+        if let Some(&ahead) = worklist.get(*cursor + super::prefetch::PREFETCH_DISTANCE) {
+            super::prefetch::prefetch_read(ahead as usize);
+        }
         *cursor += 1;
         trace_one_worklist_header(header, valid_ptrs, worklist, minor_only);
         remaining -= 1;
@@ -1128,26 +1736,90 @@ pub(super) unsafe fn trace_heap_rewrite_slots(
     valid_ptrs: &ValidPointerSet,
     worklist: &mut Vec<*mut GcHeader>,
 ) {
+    // #10182: two per-object facts read once instead of once per slot —
+    // whether the proxy registry observes this trace (it changes only when a
+    // proxy is created, and none is created inside one object's visit), and
+    // whether the object is one of the weak-holder classes whose weak slots
+    // the trace skips (its class cannot change while it is traced). Range
+    // descriptors are walked here directly rather than through a per-slot
+    // dynamic callback.
+    let proxy_trace_active = crate::proxy::gc_full_trace_active();
+    #[cfg(not(test))]
+    let weak_holder = crate::weakref::is_weak_holder_header(header);
+    #[cfg(test)]
+    let weak_holder =
+        crate::weakref::is_weak_holder_header(header) && !mark_hoist_sabotage::forgetting_weak();
     visit_gc_rewrite_slot_descriptors(header, |descriptor| unsafe {
-        if let GcMutableSlotDescriptor::PointerFreeRange(range) = descriptor {
-            if crate::proxy::gc_full_trace_active() {
-                for i in 0..range.slot_count() {
-                    crate::proxy::gc_observe_traced_value(*range.slot(i), valid_ptrs);
-                }
-            }
-            return;
-        }
-        descriptor.visit_slots(&mut |slot| {
-            if crate::weakref::is_weak_target_trace_slot(header, slot.slot) {
+        let mut visit_slot = |slot: *mut u64, layout_kind: Option<HeapChildSlotReadKind>| {
+            if weak_holder && crate::weakref::is_weak_target_trace_slot(header, slot) {
                 return;
             }
-            slot.record_layout_read();
-            if slot.layout_kind.is_some() {
+            if let Some(kind) = layout_kind {
+                record_layout_child_slot_read(kind);
                 record_trace_slot_read();
             }
-            mark_field_into_worklist(*slot.slot, valid_ptrs, worklist);
-        });
+            mark_field_into_worklist(*slot, valid_ptrs, worklist, proxy_trace_active);
+        };
+        match descriptor {
+            GcMutableSlotDescriptor::PointerFreeRange(range) => {
+                if proxy_trace_active {
+                    for i in 0..range.slot_count() {
+                        crate::proxy::gc_observe_traced_value(*range.slot(i), valid_ptrs);
+                    }
+                }
+            }
+            GcMutableSlotDescriptor::Slot(slot) => visit_slot(slot.slot, slot.layout_kind),
+            GcMutableSlotDescriptor::Range { range, layout_kind } => {
+                // Start the header reads of the range's pointer children
+                // before marking any of them: each is a cold DRAM read the
+                // mark would otherwise take one at a time. A prefetch cannot
+                // fault, so the candidate need not be proven a pointer yet.
+                for i in 0..range.slot_count() {
+                    let bits = *range.slot(i);
+                    let tag = bits & TAG_MASK;
+                    if tag == POINTER_TAG || tag == STRING_TAG {
+                        super::prefetch::prefetch_read(
+                            ((bits & POINTER_MASK) as usize).wrapping_sub(GC_HEADER_SIZE),
+                        );
+                    }
+                }
+                for i in 0..range.slot_count() {
+                    visit_slot(range.slot(i), layout_kind);
+                }
+            }
+        }
     });
+}
+
+/// Sabotage switch for the mark-hoist test: the per-object weak-holder fact
+/// reads false, so a weak holder's weak slots are traced strongly. Test builds
+/// only.
+#[cfg(test)]
+pub(crate) mod mark_hoist_sabotage {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FORGET_WEAK: Cell<bool> = const { Cell::new(false) };
+    }
+
+    #[inline]
+    pub(crate) fn forgetting_weak() -> bool {
+        FORGET_WEAK.with(Cell::get)
+    }
+
+    pub(crate) struct Guard(bool);
+
+    impl Guard {
+        pub(crate) fn arm() -> Self {
+            Self(FORGET_WEAK.with(|s| s.replace(true)))
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FORGET_WEAK.with(|s| s.set(self.0));
+        }
+    }
 }
 
 /// Trace array elements.

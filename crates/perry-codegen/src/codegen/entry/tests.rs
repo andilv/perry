@@ -21,6 +21,7 @@ fn entry_opts(output_type: &str) -> CompileOptions {
         disable_buffer_fast_path: false,
         namespace_imports: Vec::new(),
         namespace_member_nested: Vec::new(),
+        constructor_param_counts: Default::default(),
         imported_classes: Vec::new(),
         short_spread_method_candidates: std::sync::Arc::default(),
         object_literal_method_candidates: std::sync::Arc::default(),
@@ -202,7 +203,7 @@ fn executable_exit_block_emits_the_process_exit_event() {
         .find("call void @js_process_emit_before_exit_pending()")
         .expect("beforeExit should be emitted with the pending exit code");
     let pump = exit_block
-        .find("call i32 @js_promise_run_microtasks_event_loop()")
+        .find("call i32 @js_promise_run_before_exit_checkpoint()")
         .expect("the post-beforeExit drain should be emitted");
     let exit_event = exit_block
         .find("call void @js_process_run_exit_sequence()")
@@ -223,6 +224,11 @@ fn executable_exit_block_emits_the_process_exit_event() {
     assert!(
         pump < exit_event,
         "the exit event must come after beforeExit and its drain\n{exit_block}"
+    );
+    let after_checkpoint = &exit_block[pump..exit_event];
+    assert!(
+        after_checkpoint.contains("br i1") && after_checkpoint.contains("%event_loop.header."),
+        "work scheduled by beforeExit must be able to return to the event loop\n{after_checkpoint}"
     );
     assert!(
         exit_event < finalization,

@@ -7,6 +7,10 @@ pub(super) struct ArenaSweepObjectsState {
     cursor: crate::arena::ArenaObjectCursor,
     /// Dead old headers awaiting one batched page-index removal (see `sweep_batch`).
     pending_old_unregister: super::sweep_batch::PendingOldUnregister,
+    /// Page accounting of consecutive single-page old objects, applied once per
+    /// page (see `arena::page_meta::sweep_tally`). `usize::MAX` when empty.
+    old_page_tally_page: usize,
+    old_page_tally: crate::arena::OldPageSweepTally,
     block_snapshots: Vec<crate::arena::ArenaBlockSnapshot>,
     block_has_live: Vec<bool>,
     resettable_general_n: usize,
@@ -56,6 +60,14 @@ pub(super) struct ArenaSweepObjectsState {
     block_skip_blocks: u64,
     block_skip_objects: u64,
     block_skip_bytes: u64,
+    /// #10182: per block, the census parsed every header and none of them was
+    /// invalidated, and the block has not changed since. Empty unless the
+    /// block skip ran against an armed census.
+    /// Cleared for a block as soon as this sweep invalidates a header in it.
+    census_hole_free: Vec<bool>,
+    /// #10241: a promoted-cohort full armed `promoted_cohort`'s survival
+    /// probe, and this is the synchronous full sweep that answers it.
+    survival_probe: bool,
 }
 
 impl ArenaSweepObjectsState {
@@ -71,6 +83,8 @@ impl ArenaSweepObjectsState {
         Self {
             cursor: crate::arena::ArenaObjectCursor::new(crate::arena::ArenaWalkOrder::BlockIndex),
             pending_old_unregister: Default::default(),
+            old_page_tally_page: usize::MAX,
+            old_page_tally: Default::default(),
             block_snapshots,
             block_has_live: vec![false; n_blocks],
             resettable_general_n: crate::arena::general_block_count(),
@@ -94,6 +108,8 @@ impl ArenaSweepObjectsState {
             block_skip_blocks: 0,
             block_skip_objects: 0,
             block_skip_bytes: 0,
+            census_hole_free: Vec::new(),
+            survival_probe: false,
         }
     }
 
@@ -116,6 +132,10 @@ impl ArenaSweepObjectsState {
     /// A skipped block contributes nothing to `block_has_live`, which is the
     /// only liveness the cleanup reads.
     pub(super) fn apply_block_skip(&mut self, census: &super::super::trace::BlockCensus) {
+        // Reached only from a synchronous full sweep, which is the one whose
+        // marks are final and whose whole-block walk the probe reads.
+        self.survival_probe =
+            !self.minor_sweep && super::super::promoted_cohort::survival::survival_probe_armed();
         if self.minor_sweep
             || !self.reclaim_dead_old_blocks
             || self.targeted_old_blocks.is_some()
@@ -124,6 +144,25 @@ impl ArenaSweepObjectsState {
             return;
         }
         let survivors = crate::arena::survivor_block_index_range();
+        #[cfg(not(test))]
+        let forget_holes = false;
+        #[cfg(test)]
+        let forget_holes = super::super::trace::block_skip::sabotage::get()
+            & super::super::trace::block_skip::sabotage::FORGET_HOLES
+            != 0;
+        self.census_hole_free = self
+            .block_snapshots
+            .iter()
+            .enumerate()
+            .map(|(block_idx, snapshot)| {
+                census.block(block_idx).is_some_and(|block| {
+                    block.whole_walk
+                        && (!block.non_walkable || forget_holes)
+                        && block.data == snapshot.data
+                        && block.end == snapshot.data.saturating_add(snapshot.offset)
+                })
+            })
+            .collect();
         let mut skip = vec![false; self.block_snapshots.len()];
         let mut any = false;
         for (block_idx, snapshot) in self.block_snapshots.iter().enumerate() {
@@ -161,6 +200,12 @@ impl ArenaSweepObjectsState {
             }
             skip[block_idx] = true;
             any = true;
+            if self.survival_probe {
+                super::super::promoted_cohort::survival::note_probe_block_skipped(
+                    snapshot.data,
+                    snapshot.offset,
+                );
+            }
             self.freed_bytes = self.freed_bytes.saturating_add(block.bytes);
             if block_idx < self.resettable_general_n {
                 self.eden_dead_bytes = self.eden_dead_bytes.saturating_add(block.bytes);
@@ -195,14 +240,40 @@ impl ArenaSweepObjectsState {
     /// completes — block liveness is final at that point, and the block
     /// cleanup that follows only touches blocks with NO live object, which
     /// the rebuild's filter already skips.
+    ///
+    /// #10182: the rebuild also skips a live block that provably holds no
+    /// hole, i.e. no header with `obj_type == 0`. Those headers are produced
+    /// only by invalidating a dead old object, and consumed only by reuse.
+    /// A block qualifies when this cycle's census parsed all of its headers
+    /// and found none that does not parse as an object, the block has not
+    /// grown since, and this sweep invalidated nothing in it. Nothing else in a
+    /// synchronous full writes a header between the census and here. On a
+    /// pacing full that keeps one promoted JSON tree, the rebuild otherwise
+    /// re-parses the whole tree to find no hole.
     pub(super) fn push_live_block_holes(&mut self) {
         if self.reclaim_dead_old_blocks {
-            super::old_free_rebuild_from_live_old_blocks(
-                &self.block_has_live,
-                self.old_block_start,
-            );
+            let old_block_start = self.old_block_start;
+            let block_has_live = &self.block_has_live;
+            let hole_free = &self.census_hole_free;
+            let mut skipped = 0u64;
+            super::old_free_rebuild_from_old_blocks(|block_idx| {
+                if block_idx < old_block_start
+                    || !block_has_live.get(block_idx).copied().unwrap_or(false)
+                {
+                    return false;
+                }
+                if hole_free.get(block_idx).copied().unwrap_or(false) {
+                    skipped += 1;
+                    return false;
+                }
+                true
+            });
+            super::super::trace::block_skip::note_hole_rebuild_blocks_skipped(skipped);
             if crate::gc::gc_diag_enabled() {
-                eprintln!("[gc-old-free] reusable_bytes={}", super::old_free_bytes());
+                eprintln!(
+                    "[gc-old-free] reusable_bytes={} rebuild_skipped_blocks={skipped}",
+                    super::old_free_bytes()
+                );
             }
         }
     }
@@ -210,6 +281,22 @@ impl ArenaSweepObjectsState {
     pub(super) fn step(&mut self, budget: usize) -> bool {
         let mut remaining = budget;
         let mut done = false;
+        if budget == usize::MAX && self.cursor.at_block_boundary() {
+            while let Some((block_idx, data, offset, size)) = self.cursor.next_whole_block() {
+                let live_before = self.arena_live_bytes;
+                // SAFETY: the block was snapshotted by this sweep's cursor.
+                unsafe { self.sweep_whole_block(block_idx, data, offset, size) };
+                if self.survival_probe {
+                    super::super::promoted_cohort::survival::note_probe_block_swept(
+                        data,
+                        offset,
+                        self.arena_live_bytes - live_before,
+                    );
+                }
+            }
+            remaining = 0;
+            done = true;
+        }
         while remaining > 0 {
             let Some((header_ptr, block_idx)) = self.cursor.next() else {
                 done = true;
@@ -218,9 +305,154 @@ impl ArenaSweepObjectsState {
             remaining -= 1;
             self.process_object(header_ptr as *mut GcHeader, block_idx);
         }
-        // Never leave a dead header in the page index across a step boundary.
-        self.pending_old_unregister.flush();
+        // Never leave a dead header in the page index, or a page's accounting
+        // unapplied, across a step boundary. The tally goes first: the
+        // unregister flush zeroes the accounting of pages it empties.
+        if self.page_tally_order_kept() {
+            self.apply_old_page_tally();
+            self.pending_old_unregister.flush();
+        } else {
+            self.pending_old_unregister.flush();
+            self.apply_old_page_tally();
+        }
         done
+    }
+
+    /// Sweep one whole block in a single pass (#10182). It visits exactly the
+    /// headers `ArenaObjectCursor::next_budgeted` yields for the block and
+    /// handles each exactly as `process_object` would. The common case — a
+    /// marked, unpinned, unforwarded object in a block that does not age-bump —
+    /// is `keep_live_object` with the per-block constants (old or general,
+    /// from-space membership, age bumping) hoisted out of the loop; every other
+    /// header goes through `process_object` unchanged.
+    ///
+    /// # Safety
+    /// `data`/`offset`/`size` are an arena block as this sweep's cursor
+    /// snapshotted it.
+    unsafe fn sweep_whole_block(
+        &mut self,
+        block_idx: usize,
+        data: usize,
+        offset: usize,
+        size: usize,
+    ) {
+        let is_old = block_idx >= self.old_block_start;
+        let general = block_idx < self.resettable_general_n;
+        let age_bump = self.do_age_bump && general;
+        let from_space = crate::arena::block_in_copying_from_space(
+            block_idx,
+            self.resettable_general_n,
+            &self.active_survivor_blocks,
+        );
+        #[cfg(test)]
+        let record_live = super::super::trace::block_skip::sabotage::get()
+            & super::super::trace::block_skip::sabotage::FORGET_WHOLE_BLOCK_LIVE
+            == 0;
+        #[cfg(not(test))]
+        let record_live = true;
+        let mut kept_live = false;
+        let mut cursor = 0usize;
+        while cursor < offset {
+            let aligned = (cursor + 7) & !7;
+            if aligned >= offset {
+                break;
+            }
+            let header = (data + aligned) as *mut GcHeader;
+            let total_size = (*header).size as usize;
+            if total_size == 0 || total_size > size {
+                break;
+            }
+            cursor = aligned + total_size;
+            if !crate::gc::gc_type_is_arena_walkable((*header).obj_type) {
+                continue;
+            }
+            let flags = (*header).gc_flags;
+            if age_bump
+                || flags & (GC_FLAG_MARKED | GC_FLAG_PINNED | GC_FLAG_FORWARDED) != GC_FLAG_MARKED
+            {
+                self.process_object(header, block_idx);
+                continue;
+            }
+            if is_old {
+                self.account_old_object(header, total_size, true, false);
+            }
+            kept_live = true;
+            if general {
+                self.eden_live_bytes = self.eden_live_bytes.saturating_add(total_size as u64);
+            }
+            self.arena_live_bytes = self.arena_live_bytes.saturating_add(total_size as u64);
+            if from_space {
+                self.arena_live_from_space_bytes = self
+                    .arena_live_from_space_bytes
+                    .saturating_add(total_size as u64);
+            }
+            (*header).gc_flags = flags & !GC_FLAG_MARKED;
+        }
+        if kept_live && record_live {
+            if let Some(slot) = self.block_has_live.get_mut(block_idx) {
+                *slot = true;
+            }
+        }
+    }
+
+    /// Account one swept old object on its page(s), batching single-page
+    /// objects per page.
+    #[inline(always)]
+    fn account_old_object(
+        &mut self,
+        header: *mut GcHeader,
+        total_size: usize,
+        live: bool,
+        pinned: bool,
+    ) {
+        match crate::arena::old_object_single_page(header as usize, total_size) {
+            Some(page) => {
+                if page != self.old_page_tally_page {
+                    self.apply_old_page_tally();
+                    self.old_page_tally_page = page;
+                }
+                self.old_page_tally.add(total_size, live, pinned);
+            }
+            None => crate::arena::old_page_account_swept_object(
+                header as usize,
+                total_size,
+                live,
+                pinned,
+            ),
+        }
+    }
+
+    fn apply_old_page_tally(&mut self) {
+        if self.old_page_tally_page != usize::MAX {
+            crate::arena::old_page_account_swept_tally(
+                self.old_page_tally_page,
+                &self.old_page_tally,
+            );
+        }
+        self.old_page_tally_page = usize::MAX;
+        self.old_page_tally = Default::default();
+    }
+
+    /// The tally is applied before every page-index flush (always, outside the
+    /// sabotaged test).
+    #[inline(always)]
+    fn page_tally_order_kept(&self) -> bool {
+        #[cfg(test)]
+        {
+            use super::super::trace::block_skip::sabotage;
+            sabotage::get() & sabotage::FORGET_PAGE_TALLY_ORDER == 0
+        }
+        #[cfg(not(test))]
+        true
+    }
+
+    /// Queue a dead old header's page-index removal, applying the page tally
+    /// first when the queue is about to flush.
+    unsafe fn defer_old_unregister(&mut self, header: *mut GcHeader, total_size: usize) {
+        if self.pending_old_unregister.flushes_on_next_defer() && self.page_tally_order_kept() {
+            self.apply_old_page_tally();
+        }
+        self.pending_old_unregister.defer(header, total_size);
     }
 
     pub(super) fn block_has_live(&self) -> &[bool] {
@@ -315,12 +547,7 @@ impl ArenaSweepObjectsState {
         count_in_live_census: bool,
     ) {
         if block_idx >= self.old_block_start {
-            crate::arena::old_page_account_swept_object(
-                header as usize,
-                (*header).size as usize,
-                true,
-                pinned,
-            );
+            self.account_old_object(header, (*header).size as usize, true, pinned);
         }
         if block_idx < self.block_has_live.len() {
             self.block_has_live[block_idx] = true;
@@ -386,7 +613,7 @@ impl ArenaSweepObjectsState {
         let total_size = (*header).size as usize;
         let dead_old = block_idx >= self.old_block_start;
         if dead_old {
-            crate::arena::old_page_account_swept_object(header as usize, total_size, false, false);
+            self.account_old_object(header, total_size, false, false);
         }
         let user_ptr = (header as *mut u8).add(GC_HEADER_SIZE);
         self.freed_bytes = self.freed_bytes.saturating_add(total_size as u64);
@@ -395,7 +622,8 @@ impl ArenaSweepObjectsState {
             gc_type_clear_dead_payload_side_tables((*header).obj_type, user_ptr as usize);
         }
         if self.reclaim_dead_old_blocks && dead_old {
-            self.pending_old_unregister.defer(header, total_size);
+            self.note_invalidated(block_idx);
+            self.defer_old_unregister(header, total_size);
         } else {
             (*header).gc_flags = flags & !(GC_FLAG_FORWARDED | GC_FLAG_MARKED);
         }
@@ -405,7 +633,7 @@ impl ArenaSweepObjectsState {
         let total_size = (*header).size as usize;
         let dead_old = block_idx >= self.old_block_start;
         if dead_old {
-            crate::arena::old_page_account_swept_object(header as usize, total_size, false, false);
+            self.account_old_object(header, total_size, false, false);
         }
         let user_ptr = (header as *mut u8).add(GC_HEADER_SIZE);
         self.freed_bytes = self.freed_bytes.saturating_add(total_size as u64);
@@ -414,7 +642,15 @@ impl ArenaSweepObjectsState {
         }
         finalize_dead_arena_payload(header, user_ptr, self.overflow_active);
         if self.reclaim_dead_old_blocks && dead_old {
-            self.pending_old_unregister.defer(header, total_size);
+            self.note_invalidated(block_idx);
+            self.defer_old_unregister(header, total_size);
+        }
+    }
+
+    #[inline]
+    fn note_invalidated(&mut self, block_idx: usize) {
+        if let Some(slot) = self.census_hole_free.get_mut(block_idx) {
+            *slot = false;
         }
     }
 }

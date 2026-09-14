@@ -268,6 +268,27 @@ impl ArenaObjectCursor {
         self.finished
     }
 
+    /// Hand out the next whole block as `(global block index, data, offset,
+    /// size)`, snapshotted exactly as `next_budgeted` would walk it, for a
+    /// caller that parses the block itself (#10182). Honours `set_skip_blocks`.
+    /// Only valid at a block boundary ([`Self::at_block_boundary`]); `None`
+    /// once the cursor is exhausted.
+    pub(crate) fn next_whole_block(&mut self) -> Option<(usize, usize, usize, usize)> {
+        debug_assert!(self.at_block_boundary());
+        if !self.ensure_current_block() {
+            return None;
+        }
+        let block = self.current_block.take()?;
+        self.offset = 0;
+        Some((block.block_idx, block.data, block.offset, block.size))
+    }
+
+    /// No block has been entered by `next_budgeted` (the start of the walk, or
+    /// the point right after a block was exhausted).
+    pub(crate) fn at_block_boundary(&self) -> bool {
+        self.current_block.is_none() && self.offset == 0
+    }
+
     /// Never enter the blocks whose global index is set in `skip` (#10182).
     /// Must be installed before the first `next`; a block the cursor is
     /// already inside is not affected.
@@ -903,6 +924,16 @@ pub fn arena_block_count() -> usize {
 #[inline]
 pub fn general_block_count() -> usize {
     ARENA.with(|arena| unsafe { (*arena.get()).blocks.len() })
+}
+
+/// Global block indices `0..young_block_count()` are the young generation:
+/// the general (Eden) arena's blocks, then both survivor semispaces' — the
+/// order `arena_block_snapshots` and the object cursors use.
+pub(crate) fn young_block_count() -> usize {
+    let g = ARENA.with(|arena| unsafe { (*arena.get()).blocks.len() });
+    let s0 = SURVIVOR_ARENA_0.with(|arena| unsafe { (*arena.get()).blocks.len() });
+    let s1 = SURVIVOR_ARENA_1.with(|arena| unsafe { (*arena.get()).blocks.len() });
+    g + s0 + s1
 }
 
 /// Per-block `size` for the general (nursery-Eden) arena, indexed by

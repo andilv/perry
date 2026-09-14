@@ -82,6 +82,38 @@ fn has_sync_iterator(value: f64) -> bool {
     raw != 0 && perry_runtime::closure::is_closure_ptr(raw as usize)
 }
 
+/// A short description of a rejected `Headers` init, so the thrown message
+/// names what was passed instead of only saying it is not iterable. Kept cheap:
+/// it runs only on the error path.
+fn describe_headers_init(value: f64) -> String {
+    let jsval = JSValue::from_bits(value.to_bits());
+    if jsval.is_any_string() {
+        return "string".to_string();
+    }
+    if perry_runtime::proxy::js_proxy_is_proxy(value) != 0 {
+        return "Proxy".to_string();
+    }
+    if perry_runtime::js_array_is_array(value).to_bits() == TAG_TRUE {
+        return "array".to_string();
+    }
+    let raw = perry_runtime::js_nanbox_get_pointer(value);
+    if raw == 0 {
+        return format!("{:#018x}", value.to_bits());
+    }
+    let addr = raw as usize;
+    if perry_runtime::map::is_registered_map(addr) {
+        return "Map".to_string();
+    }
+    if perry_runtime::set::is_registered_set(addr) {
+        return "Set".to_string();
+    }
+    match gc_type_for_raw_ptr(raw) {
+        Some(t) if t == perry_runtime::gc::GC_TYPE_OBJECT => "object".to_string(),
+        Some(t) => format!("gc type {t}"),
+        None => format!("non-heap {:#018x}", value.to_bits()),
+    }
+}
+
 fn is_headers_init_iterable(value: f64) -> bool {
     let jsval = JSValue::from_bits(value.to_bits());
     if jsval.is_any_string() {
@@ -121,6 +153,16 @@ fn read_headers_record_entries(
     if has_sync_iterator(value) {
         return None;
     }
+    // A Proxy wrapping a record (`new Headers(new Proxy(headers, {}))`) is a
+    // valid record init: the spec reads the init's own keys and values through
+    // the object's internal methods, which for a Proxy means its `ownKeys` and
+    // `get` traps. The pointer below is a proxy id, not a `GC_TYPE_OBJECT`
+    // heap object, so without this branch the record path bailed and the
+    // constructor reported "init is not iterable" for an ordinary header
+    // object (OpenCode's request path, tracker #10107).
+    if perry_runtime::proxy::js_proxy_is_proxy(value) != 0 {
+        return unsafe { read_proxy_record_entries(value, scope) };
+    }
     let raw = perry_runtime::js_nanbox_get_pointer(value);
     if gc_type_for_raw_ptr(raw) != Some(perry_runtime::gc::GC_TYPE_OBJECT) {
         return None;
@@ -155,18 +197,88 @@ fn read_headers_record_entries(
     }
 }
 
-unsafe fn materialize_headers_init_iterable(
+/// Web IDL record conversion queries each own descriptor before converting its
+/// key and reading its value. Both descriptor and get traps may collect.
+unsafe fn read_proxy_record_entries(
     value: f64,
     scope: &perry_runtime::gc::RuntimeHandleScope,
-) -> *const perry_runtime::ArrayHeader {
-    if !is_headers_init_iterable(value) {
-        headers_init_type_error("Headers constructor: init is not iterable");
+) -> Option<Vec<(String, String)>> {
+    let proxy_handle = scope.root_nanbox_f64(value);
+    let keys_value = perry_runtime::proxy::js_proxy_own_keys(proxy_handle.get_nanbox_f64());
+    let keys_handle = scope.root_nanbox_f64(keys_value);
+    let keys_raw = perry_runtime::js_nanbox_get_pointer(keys_handle.get_nanbox_f64());
+    if keys_raw == 0 {
+        return Some(Vec::new());
     }
-    let arr_value = perry_runtime::array::js_for_of_to_array(value);
+    let len = perry_runtime::js_array_length(keys_raw as *const perry_runtime::ArrayHeader);
+    let enumerable_key = scope.root_nanbox_f64(perry_runtime::value::js_nanbox_string(
+        perry_runtime::js_string_from_bytes(b"enumerable".as_ptr(), 10) as i64,
+    ));
+    let mut entries = Vec::with_capacity(len as usize);
+    for i in 0..len {
+        let entry_scope = perry_runtime::gc::RuntimeHandleScope::new();
+        let keys_now = perry_runtime::js_nanbox_get_pointer(keys_handle.get_nanbox_f64());
+        let key = entry_scope.root_nanbox_f64(perry_runtime::array::js_array_get_f64(
+            keys_now as *const perry_runtime::ArrayHeader,
+            i,
+        ));
+        let descriptor = perry_runtime::proxy::js_reflect_get_own_property_descriptor(
+            proxy_handle.get_nanbox_f64(),
+            key.get_nanbox_f64(),
+        );
+        if descriptor.to_bits() == TAG_UNDEFINED {
+            continue;
+        }
+        let descriptor = entry_scope.root_nanbox_f64(descriptor);
+        // Coercing an inline string can allocate. Read the descriptor pointer
+        // only after that coercion, and reread the key before the get trap.
+        let enumerable_ptr =
+            perry_runtime::builtins::js_string_coerce(enumerable_key.get_nanbox_f64());
+        let descriptor_ptr = perry_runtime::js_nanbox_get_pointer(descriptor.get_nanbox_f64());
+        let enumerable = perry_runtime::js_object_get_field_by_name_f64(
+            descriptor_ptr as *const perry_runtime::ObjectHeader,
+            enumerable_ptr,
+        );
+        if perry_runtime::value::js_is_truthy(enumerable) == 0 {
+            continue;
+        }
+        if !JSValue::from_bits(key.get_nanbox_f64().to_bits()).is_any_string() {
+            headers_init_type_error(
+                "Headers constructor: symbol key cannot be converted to a ByteString",
+            );
+        }
+        let key_ptr = perry_runtime::builtins::js_string_coerce(key.get_nanbox_f64());
+        if key_ptr.is_null() {
+            continue;
+        }
+        let name = string_from_header(key_ptr as *const StringHeader).unwrap_or_default();
+        let value =
+            perry_runtime::proxy::js_proxy_get(proxy_handle.get_nanbox_f64(), key.get_nanbox_f64());
+        entries.push((name, header_init_string(value)));
+    }
+    Some(entries)
+}
+
+unsafe fn materialize_headers_init_iterable(
+    value: &perry_runtime::gc::RuntimeHandle<'_>,
+    scope: &perry_runtime::gc::RuntimeHandleScope,
+) -> *const perry_runtime::ArrayHeader {
+    // Iterator lookup and conversion may invoke user code and move the init.
+    // Reuse the caller's root for conversion and the new error diagnostics.
+    if !is_headers_init_iterable(value.get_nanbox_f64()) {
+        headers_init_type_error(&format!(
+            "Headers constructor: init is not iterable (received {})",
+            describe_headers_init(value.get_nanbox_f64())
+        ));
+    }
+    let arr_value = perry_runtime::array::js_for_of_to_array(value.get_nanbox_f64());
     let arr_handle = scope.root_nanbox_f64(arr_value);
     let raw = perry_runtime::js_nanbox_get_pointer(arr_handle.get_nanbox_f64());
     if raw == 0 {
-        headers_init_type_error("Headers constructor: init is not iterable");
+        headers_init_type_error(&format!(
+            "Headers constructor: init is not iterable (received {})",
+            describe_headers_init(value.get_nanbox_f64())
+        ));
     }
     raw as *const perry_runtime::ArrayHeader
 }
@@ -245,12 +357,20 @@ pub unsafe extern "C" fn js_headers_init_from_value(handle: f64, init: f64) -> f
         return f64::from_bits(TAG_UNDEFINED);
     }
 
+    // A Proxy value is not a Headers handle: its NaN-box would otherwise be
+    // masked into a registry id and could alias a live Headers entry, silently
+    // copying the wrong (or no) headers. Route it to the record path below.
+    let is_proxy_init = perry_runtime::proxy::js_proxy_is_proxy(init) != 0;
     let source_id = handle_id(init);
-    let cloned = HEADERS_REGISTRY
-        .lock()
-        .unwrap()
-        .get(&source_id)
-        .map(|store| store.entries.clone());
+    let cloned = if is_proxy_init {
+        None
+    } else {
+        HEADERS_REGISTRY
+            .lock()
+            .unwrap()
+            .get(&source_id)
+            .map(|store| store.entries.clone())
+    };
     if let Some(entries) = cloned {
         append_header_entries(target_id, entries);
         return f64::from_bits(TAG_UNDEFINED);
@@ -265,7 +385,7 @@ pub unsafe extern "C" fn js_headers_init_from_value(handle: f64, init: f64) -> f
         return f64::from_bits(TAG_UNDEFINED);
     }
 
-    let arr = materialize_headers_init_iterable(init_now, &scope);
+    let arr = materialize_headers_init_iterable(&init_handle, &scope);
     let entries = read_headers_iterable_entries(arr, &scope);
     append_header_entries(target_id, entries);
     f64::from_bits(TAG_UNDEFINED)

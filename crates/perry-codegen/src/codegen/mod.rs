@@ -182,11 +182,15 @@ mod artifact_display_names;
 mod artifact_source_text;
 mod artifacts;
 mod boxed_locals;
+mod cjs_exports;
 #[cfg(test)]
 mod clone_suffix_tests;
 mod closure;
 mod closure_collect;
+mod constructor_contracts;
+pub use constructor_contracts::{ConstructorContracts, ResolvedConstructorContracts};
 mod ctor_arity;
+pub use ctor_arity::{context_free_ctor_param_count, UNRESOLVED_PARENT_FWD_ARITY};
 #[cfg(test)]
 mod declared_string_add_tests;
 #[cfg(test)]
@@ -209,10 +213,12 @@ mod tdz_names;
 // `pub(crate)` so `crate::linker` can read the inline-hot-small policy
 // (`inline_hot_small_enabled` / `inline_hot_small_hint_threshold`).
 pub(crate) mod helpers;
+mod literal_constructor;
 mod method;
 mod method_registry;
 mod method_trampolines;
 mod module_globals_emit;
+pub(crate) mod namespace_value_getters;
 mod native_namespace_exports;
 #[cfg(test)]
 mod number_exactness_tests;
@@ -410,6 +416,8 @@ pub fn user_function_symbol(module_name: &str, function_name: &str) -> String {
 /// guarantee — do not change to `&mut` without also moving the cache
 /// hash to AFTER codegen.
 pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> {
+    let (live_cjs_hir, cjs_property_exports) = cjs_exports::prepare(hir);
+    let hir = live_cjs_hir.as_ref();
     let progress = CompileProgress::new(&hir.name, module_callable_count(hir));
     let triple = opts.target.clone().unwrap_or_else(default_target_triple);
     let fp_flags = crate::block::FpFlags::new(opts.fast_math, opts.fp_contract_mode);
@@ -2731,6 +2739,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         &opts.imported_classes,
         &cross_module.compile_time_constants,
         &module_prefix,
+        &cjs_property_exports,
     );
     cross_module.module_global_proven_types = module_global_proven_types;
 
@@ -3622,6 +3631,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         hir,
         import_function_prefixes: &opts.import_function_prefixes,
         imported_classes: &opts.imported_classes,
+        constructor_param_counts: &opts.constructor_param_counts,
         is_entry_module: opts.is_entry_module,
         non_entry_module_prefixes: &opts.non_entry_module_prefixes,
         output_type: &opts.output_type,

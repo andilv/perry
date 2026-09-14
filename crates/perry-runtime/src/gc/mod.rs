@@ -38,7 +38,9 @@ pub use types::*;
 mod json_defer;
 mod policy;
 pub(crate) use json_defer::JsonParseAllocation;
+#[cfg(test)]
 pub(crate) use policy::gc_runtime_safepoint;
+pub(crate) use policy::gc_runtime_safepoint_poll;
 pub(crate) use policy::note_young_leaf_born_old;
 /// The one writer of `GC_SAFEPOINT_PENDING` — it also keeps the poll's global
 /// arming shadow in step. See `gc/poll_arm.rs`.
@@ -234,6 +236,8 @@ mod native_stack_scan;
 /// mechanism is `arena/promote.rs`; this decides when to use it.
 mod promote_in_place;
 use promote_in_place::*;
+/// #10182: full collections paced by the bytes promoted since the last full.
+mod promoted_cohort;
 #[cfg(test)]
 pub(crate) use promote_in_place::{
     clear_young_survival_for_tests, last_young_survival_permille, seed_young_survival_for_tests,
@@ -1317,6 +1321,7 @@ pub extern "C" fn js_gc_init() {
     // constructor; this call keeps that constructor in the link and re-applies
     // the option idempotently. See `crate::mimalloc_os_tag`.
     crate::mimalloc_os_tag::ensure_mimalloc_os_tag_applied();
+    crate::startup_memory_profile::retain_constructor();
     crate::node_submodules::diagnostics_channel_init_main_thread();
     crate::node_submodules::init_trace_events_runtime();
     // #5093: force every class-field access back through the full guard call —

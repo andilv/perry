@@ -136,6 +136,7 @@ pub mod net_validate;
 #[cfg(feature = "node-api-host")]
 pub mod node_api_host;
 mod param_type_guard;
+mod startup_memory_profile;
 // #6468: the `node:http2` constant tables are only reachable through the
 // `http2` native-module namespace, so a program that never imports `node:http2`
 // links none of them. The auto-optimizer enables `mod-http2-constants` on an
@@ -198,6 +199,9 @@ pub mod timer;
 /// #7469: one `_tlv_get_addr` for the whole allocation hot path.
 #[doc(hidden)]
 pub mod tls_hot;
+#[cfg(any(target_os = "android", all(test, unix)))]
+#[doc(hidden)]
+pub mod tls_os_pool;
 pub mod typed_feedback;
 pub mod typedarray;
 pub mod typedarray_half;
@@ -464,10 +468,16 @@ pub(crate) mod stdlib_pump {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_enter_catch_pump() {
+        std::mem::forget(PumpDepthGuard::enter().0);
+    }
+
     /// Capture the re-entrant stdlib-pump depth at `try` entry. A caught JS
     /// throw can longjmp past `PumpDepthGuard::drop`; exception handling uses
     /// this savepoint to keep the next top-level pump recognizable as a new
     /// tick (and therefore run its lifecycle hooks).
+    #[inline]
     pub(crate) fn pump_depth_savepoint() -> u32 {
         PUMP_DEPTH.with(|depth| depth.get())
     }
@@ -739,7 +749,7 @@ pub(crate) mod stdlib_pump {
         // #2532/#9696 — drain every initialized extension through the
         // registry; stdlib deliberately has no per-extension pump arms.
         run_aux_pumps();
-        let _ = crate::gc::gc_runtime_safepoint();
+        crate::gc::gc_runtime_safepoint_poll();
     }
 
     static STDLIB_HAS_ACTIVE_FN: AtomicPtr<()> = AtomicPtr::new(null_mut());
