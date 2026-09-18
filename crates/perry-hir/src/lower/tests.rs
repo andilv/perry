@@ -1982,7 +1982,10 @@ fn hoisted_class_constructs_sibling_declared_inside_a_later_closure() {
     );
 }
 
+mod ambient_declare;
 mod unresolved_new_global;
+
+mod global_this_new_shadowed;
 
 mod capture_stash;
 mod mixin_parent_chain;

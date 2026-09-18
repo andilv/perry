@@ -278,7 +278,7 @@ pub(crate) fn emit_v8_member_method_call(
 ///     collision-free `(namespace, member)` registry key; the rest of the
 ///     lower_new path resolves that key through the usual `ctx.classes`
 ///     lookup.
-fn is_global_object_expr(expr: &Expr) -> bool {
+pub(crate) fn is_global_object_expr(expr: &Expr) -> bool {
     match expr {
         Expr::GlobalGet(_) => true,
         Expr::PropertyGet {
@@ -308,6 +308,18 @@ pub(crate) fn try_static_class_name<'a>(callee: &'a Expr, ctx: &FnCtx<'_>) -> Op
             object, property, ..
         } => {
             if is_global_object_expr(object.as_ref()) {
+                // #10359: `lower_new` resolves the name against the module's
+                // classes, class aliases and imports before (or instead of)
+                // the builtin, but a module binding is never a property of
+                // the global object. With `import { Event } from "./ev"` in
+                // scope, folding `new globalThis.Event()` built the imported
+                // class; read the property and construct it at runtime.
+                if ctx.classes.contains_key(property)
+                    || ctx.local_class_aliases.contains_key(property)
+                    || ctx.import_function_prefixes.contains_key(property)
+                {
+                    return None;
+                }
                 return Some(Cow::Borrowed(property.as_str()));
             }
             // Namespace import: `import * as ns from 'm'; new ns.Foo()`.
