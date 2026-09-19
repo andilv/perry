@@ -43,6 +43,7 @@ mod buffer_views;
 mod channel;
 #[cfg(test)]
 mod class_method_arguments_object_tests;
+mod collection_receiver;
 #[cfg(test)]
 mod conforming_layout_note_tests;
 mod helpers;
@@ -85,6 +86,7 @@ pub(crate) use channel::{
     extract_array_of_object_shape, lower_channel_reduction, try_match_channel_reduction,
     variant_name,
 };
+pub(crate) use collection_receiver::unbox_collection_receiver;
 pub(crate) use helpers::{
     array_store_needs_layout_note, array_store_needs_write_barrier, buffer_alias_metadata_suffix,
     class_field_store_layout_note_is_conforming, class_field_store_needs_layout_note,
@@ -165,9 +167,13 @@ mod class_field_barrier_tests;
 mod class_field_get_shape_tests;
 mod dispatch;
 #[cfg(test)]
+mod entry_block_alloca_tests;
+#[cfg(test)]
 mod hit_path_access_tests;
 #[cfg(test)]
 mod index_set_barrier_tests;
+#[cfg(test)]
+mod instanceof_imported_rhs_tests;
 mod record_value;
 mod repsel_gates;
 mod scalar_slot_root;
@@ -3046,7 +3052,7 @@ mod math_simple;
 mod misc_methods;
 mod new_dynamic;
 mod objects_arrays_lit;
-mod os_uri_dates;
+pub(crate) mod os_uri_dates;
 pub(crate) mod property_get;
 pub(crate) mod property_set;
 pub(crate) mod proxy_reflect;

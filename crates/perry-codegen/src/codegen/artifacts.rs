@@ -1868,56 +1868,16 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
         user_fn_display_names.push((sym, display.clone()));
     }
 
-    // #4101: collect retained function source text, keyed by the same
-    // wrapper/closure symbol the name registration uses. Top-level functions
-    // always have a `__perry_wrap_<name>` global (emitted unconditionally
-    // above); inline closures only have a `perry_closure_*` global when
-    // materialized, so gate those on `materialized_closure_ids` to avoid
-    // referencing an undefined global (the #318/#343 clang-failure class).
-    let mut user_fn_source: Vec<(String, String, bool)> = Vec::new();
-    for f in &hir.functions {
-        if let Some(src) = hir.closure_source_text.get(&f.id) {
-            if let Some(sym) = func_names.get(&f.id) {
-                user_fn_source.push((
-                    format!("__perry_wrap_{}", sym),
-                    src.text.clone(),
-                    src.is_non_strict_ordinary,
-                ));
-            }
-        }
-    }
-    // Sorted, NOT raw `HashMap` iteration (#7038). The loop above walks
-    // `hir.functions` (a `Vec`) and is already deterministic; this one keyed off
-    // the map's iteration order, so the `@.str.N` numbering of the emitted
-    // string constants was a per-process permutation. Same input, different
-    // `.ll` on every run — which silently invalidates any A/B that compares raw
-    // IR, a technique several representation and GC investigations relied on.
-    // Emission order is the only thing that changes; sorting by `FuncId` makes
-    // it stable without altering what is emitted.
-    let mut materialized_closure_sources: Vec<(
-        &perry_hir::types::FuncId,
-        &perry_hir::FunctionSourceMetadata,
-    )> = hir
-        .closure_source_text
-        .iter()
-        .filter(|(func_id, _)| {
-            !registered_fn_ids.contains(*func_id) && materialized_closure_ids.contains(*func_id)
-        })
-        .collect();
-    materialized_closure_sources.sort_by_key(|(func_id, _)| **func_id);
-    for (func_id, src) in materialized_closure_sources {
-        let sym = format!("perry_closure_{}__{}", module_prefix, func_id);
-        user_fn_source.push((sym, src.text.clone(), src.is_non_strict_ordinary));
-    }
-
-    // #9468: method/accessor bodies are raw symbols rather than closure
-    // wrappers. Pair retained MethodDefinition text only with symbols this
-    // module actually emitted; the helper also preserves the file-size gate.
-    super::artifact_source_text::extend_class_method_source_text(
+    // #4101 + #9468: collecting retained function source text lives in
+    // `artifact_source_text::collect_user_fn_source` (split out for the file cap).
+    let user_fn_source = super::artifact_source_text::collect_user_fn_source(
         hir,
+        &func_names,
+        closures,
+        &registered_fn_ids,
+        &materialized_closure_ids,
         module_prefix,
         llmod,
-        &mut user_fn_source,
     );
 
     // Wall 51: the standalone-ctor arity registered into CLASS_CONSTRUCTORS must
@@ -1943,6 +1903,10 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
 
     progress.checkpoint("runtime registration metadata");
 
+    let class_source_elided = super::function_source_header::elide_class_sources(hir);
+    let class_source_text = class_source_elided
+        .as_ref()
+        .unwrap_or(&hir.class_source_text);
     emit_string_pool(
         llmod,
         strings,
@@ -1954,7 +1918,7 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
         class_table,
         imported_class_stubs,
         &hir.class_display_names,
-        &hir.class_source_text,
+        &class_source_text,
         &ctor_arity_overrides,
         closure_rest_params,
         closure_arities,

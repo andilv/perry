@@ -91,6 +91,7 @@ pub mod cluster;
 pub mod cluster_sched;
 pub mod collection_iter;
 pub mod collection_iter_object;
+pub mod collection_receiver;
 pub mod color_parse;
 pub mod date;
 #[cfg(feature = "mod-dgram")]
@@ -363,8 +364,9 @@ pub use value::{
     js_set_native_async_hooks_construct, js_set_native_bun_tcp_dispatch,
     js_set_native_crypto_dispatch, js_set_native_domain_dispatch, js_set_native_events_construct,
     js_set_native_events_dispatch, js_set_native_http_dispatch, js_set_native_module_js_loader,
-    js_set_native_querystring_dispatch, js_set_native_sqlite_dispatch, js_set_native_tls_dispatch,
-    js_set_native_webcrypto_dispatch, js_set_native_zlib_dispatch, js_set_new_from_handle_v8,
+    js_set_native_net_dispatch, js_set_native_querystring_dispatch, js_set_native_sqlite_dispatch,
+    js_set_native_tls_dispatch, js_set_native_webcrypto_dispatch, js_set_native_zlib_dispatch,
+    js_set_new_from_handle_v8,
 };
 
 // Extension pump registration — allows extensions to register pump functions

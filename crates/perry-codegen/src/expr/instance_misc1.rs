@@ -69,7 +69,8 @@ use crate::types::{DOUBLE, I1, I32, I64, PTR};
 use super::{
     emit_root_nanbox_store_on_block, emit_shadow_slot_bind_for_local, emit_string_literal_global,
     emit_write_barrier, extract_array_of_object_shape, i32_bool_to_nanbox, lower_array_literal,
-    lower_expr, nanbox_pointer_inline, nanbox_string_inline, unbox_str_handle, unbox_to_i64, FnCtx,
+    lower_expr, lower_js_args_array, nanbox_pointer_inline, nanbox_string_inline, unbox_str_handle,
+    unbox_to_i64, FnCtx,
 };
 
 /// Reserved runtime class id for a built-in constructor usable as a class
@@ -121,8 +122,57 @@ pub(crate) fn builtin_parent_reserved_class_id(name: &str) -> Option<u32> {
         "BigInt64Array" => 0xFFFF0039,
         "BigUint64Array" => 0xFFFF003A,
         "Function" => 0xFFFF00F0,
+        // #10556: `class Sub extends EventEmitter {}` — same shape as the
+        // Array/Map/Set/Error builtins above. Without this edge,
+        // `new Sub() instanceof EventEmitter` never reaches the class-chain
+        // walk in `js_instanceof` and falls back to the dynamic-dispatch
+        // handle/prototype probes in perry-runtime/src/object/instanceof.rs,
+        // which don't recognize a genuine subclass ObjectHeader. Keep in
+        // sync with `CLASS_ID_EVENT_EMITTER` there.
+        "EventEmitter" => 0xFFFF0076,
+        // #10599: `class Sub extends EventEmitterAsyncResource {}` needs the
+        // same parent edge as plain EventEmitter above -- without it,
+        // `get_parent_class_id` never resolves for this id, and the
+        // getPrototypeOf-identity fallback in
+        // perry-runtime/src/object/class_registry/state.rs
+        // (`reserved_native_parent_prototype_bits`) never runs. Keep in sync
+        // with `CLASS_ID_EVENT_EMITTER_ASYNC_RESOURCE` there.
+        "EventEmitterAsyncResource" => 0xFFFF0077,
         _ => return None,
     })
+}
+
+/// #10477: HIR hands `x instanceof F` with an IMPORTED `F` to codegen as a
+/// dynamic RHS (the binding's `ExternFuncRef` value), because only codegen
+/// knows what the import resolved to. Returns `true` when the static
+/// `js_instanceof(v, <class id>)` path below still answers the question, so the
+/// value is never materialized:
+///
+/// - an imported CLASS: its value is the INT32 class-ref immediate that
+///   `js_instanceof_dynamic` would only unpack back to the same id. The filter
+///   mirrors `ExternFuncRef`'s value lowering (`dyn_extern_i18n.rs`), so class
+///   metadata that is not this lexical binding never claims it;
+/// - a binding that is not a compiled source-module import (a V8-fallback or
+///   node-submodule import, an FFI `declare function`, an unresolved name): its
+///   value form is a placeholder, and these keep their reserved-id mapping.
+///
+/// Every other import (a function constructor, an exported `const` holding
+/// one, a CJS `module.exports = F`) has no class id, so the static path folded
+/// it to id 0 and the check was always `false`. `name == ty` confines this to
+/// the bare-identifier RHS; a parenthesized or cast RHS was dynamic before.
+fn imported_instanceof_rhs_is_static(ctx: &FnCtx<'_>, ty: &str, ty_expr: &Expr) -> bool {
+    let Expr::ExternFuncRef { name, .. } = ty_expr else {
+        return false;
+    };
+    if name != ty {
+        return false;
+    }
+    let imported_class = ctx.class_ids.contains_key(name)
+        && !ctx.imported_vars.contains(name)
+        && !ctx.namespace_imports.contains(name);
+    imported_class
+        || !ctx.import_function_prefixes.contains_key(name)
+        || ctx.import_function_v8_specifiers.contains_key(name)
 }
 
 fn emit_with_key(ctx: &mut FnCtx<'_>, property: &str) -> (String, String) {
@@ -333,7 +383,10 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // #7615 slice 2: `v` is live across the RHS's lowering, so the pair
             // is rooted as a group. The static-RHS path below lowers nothing
             // after `v` and keeps its plain `lower_expr`.
-            if let Some(ty_e) = ty_expr {
+            if let Some(ty_e) = ty_expr
+                .as_deref()
+                .filter(|ty_e| !imported_instanceof_rhs_is_static(ctx, ty, ty_e))
+            {
                 return rooting::with_operands_rooted(ctx, &[e, ty_e], |ctx, vals| {
                     Ok(ctx.block().call(
                         DOUBLE,
@@ -1425,10 +1478,12 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 };
                 let item_vals: Vec<String> = vals[items_at..].to_vec();
 
+                // Scratch out-parameter slot receiving the modified-array
+                // handle from js_array_splice. #10463: an entry-block alloca —
+                // `blk.alloca` in the current block grew the stack on every
+                // loop iteration, as did the item buffer below.
+                let out_slot = ctx.func.alloca_entry(I64);
                 let blk = ctx.block();
-                // Scratch out-parameter slot — used only in this block to
-                // receive the modified-array handle from js_array_splice.
-                let out_slot = blk.alloca(I64);
                 blk.store(I64, "0", &out_slot);
                 let arr_handle = unbox_to_i64(blk, &arr_box);
                 // ToIntegerOrInfinity via the clamping helper: `fptosi` on
@@ -1439,25 +1494,13 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 let count_i32 =
                     blk.call(I32, "js_array_splice_delete_count", &[(DOUBLE, &count_d)]);
 
-                let (items_ptr, items_count_str) = if item_vals.is_empty() {
-                    ("null".to_string(), "0".to_string())
-                } else {
-                    // Allocate a stack buffer of [N x double] for the
-                    // items, store each value, and pass the base pointer.
-                    let n = item_vals.len();
-                    let items_count_str = format!("{}", n);
-                    let buf_reg = blk.next_reg();
-                    blk.emit_raw(format!("{} = alloca [{} x double]", buf_reg, n));
-                    for (i, val) in item_vals.iter().enumerate() {
-                        let slot = blk.gep(DOUBLE, &buf_reg, &[(I64, &format!("{}", i))]);
-                        blk.store(DOUBLE, val, &slot);
-                    }
-                    (buf_reg, items_count_str)
-                };
+                // A stack buffer of [N x double] holding the items (null/0
+                // when there are none).
+                let (items_ptr, items_count_str) = lower_js_args_array(ctx, &item_vals);
 
                 // Note: js_array_splice's return value is the DELETED
                 // array; the modified-in-place arr is written to *out_arr.
-                let deleted_handle = blk.call(
+                let deleted_handle = ctx.block().call(
                     I64,
                     "js_array_splice",
                     &[

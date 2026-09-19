@@ -140,6 +140,37 @@ pub(super) fn lower_new(ctx: &mut LoweringContext, new_expr: &ast::NewExpr) -> R
                 args,
             });
         }
+        // #10430: `new Stream()` for the legacy `node:stream` `Stream`
+        // constructor — the named export (any alias) or the default import,
+        // which IS that constructor. The by-name `Expr::New { "Stream" }`
+        // fallback built a prototype-less placeholder with no `on`/`emit`;
+        // construct the export value instead, so the runtime makes the
+        // instance inherit `Stream.prototype` (and through it EventEmitter).
+        // A namespace import keeps its builtin-module alias and is excluded.
+        let callee_name = callee_ident.sym.as_ref();
+        let is_stream_constructor_value = ctx.lookup_local(callee_name).is_none()
+            && match ctx.lookup_native_module(callee_name) {
+                Some(("stream" | "node:stream", Some("Stream"))) => true,
+                Some(("stream" | "node:stream", None)) => {
+                    ctx.lookup_builtin_module_alias(callee_name).is_none()
+                }
+                _ => false,
+            };
+        let has_spread_arg = new_expr
+            .args
+            .as_deref()
+            .is_some_and(|args| args.iter().any(|arg| arg.spread.is_some()));
+        if is_stream_constructor_value && !has_spread_arg {
+            return Ok(Expr::NewDynamic {
+                callee: Box::new(Expr::PropertyGet {
+                    byte_offset: 0,
+                    object: Box::new(Expr::NativeModuleRef("stream".to_string())),
+                    property: "Stream".to_string(),
+                }),
+                args: lower_optional_args(ctx, new_expr.args.as_deref())?,
+                byte_offset: new_byte_offset,
+            });
+        }
         // #4995: `new EE()` where `EE` is the events module *value* — the
         // default import (`import EE from 'events'`) or a CJS alias
         // (`var EE = require('events')`). Node's `events` module exports the
@@ -812,6 +843,29 @@ pub(super) fn lower_new(ctx: &mut LoweringContext, new_expr: &ast::NewExpr) -> R
                         // TypeError) if the generated source is beyond it —
                         // still catchable, still located, never a crash.
                         crate::eval_classifier::EvalDecision::DeferToRuntimeError(_message) => {}
+                    }
+                    // #10421: whichever bucket the body landed in (a
+                    // known-library body, or constant strings the fold could
+                    // not use), the function is built at runtime, so the
+                    // auto-optimized runtime must keep the interpreter.
+                    crate::eval_classifier::note_dynamic_function_reachable();
+                    // #10424: a spread argument list (`new Function(...parts)`)
+                    // must reach the constructor element by element. The
+                    // by-name `Expr::New` below lowers each argument as one
+                    // value, so the whole array became a single non-string
+                    // argument and the function got an empty body.
+                    if args_slice.iter().any(|a| a.spread.is_some()) {
+                        let callee = Expr::PropertyGet {
+                            byte_offset: 0,
+                            object: Box::new(Expr::GlobalGet(0)),
+                            property: "Function".to_string(),
+                        };
+                        let args = lower_new_spread_args(ctx, args_slice)?;
+                        return Ok(Expr::NewDynamicSpread {
+                            callee: Box::new(callee),
+                            args,
+                            byte_offset: new_byte_offset,
+                        });
                     }
                 }
             }
@@ -1489,15 +1543,21 @@ pub(super) fn lower_new(ctx: &mut LoweringContext, new_expr: &ast::NewExpr) -> R
                 // attach), which the generic dynamic construct does not.
                 // A shadowing local over an UNRELATED same-named class
                 // declaration has no alias entry, so wall 7's reroute keeps
-                // firing.
-                let local_is_class_alias =
-                    ctx.inferred_class_bindings.contains(class_name.as_str());
-                if !local_is_class_alias {
-                    return Ok(Expr::NewDynamic {
-                        callee: Box::new(Expr::LocalGet(local_id)),
-                        args,
-                        byte_offset: new_byte_offset,
-                    });
+                // firing. When two class expressions claimed this name, the
+                // binding's OWN class is used (#10489), never the first
+                // claimant's.
+                match ctx
+                    .inferred_class_bindings
+                    .class_key_for(local_id, &class_name)
+                {
+                    Some(key) => class_name = key.to_string(),
+                    None => {
+                        return Ok(Expr::NewDynamic {
+                            callee: Box::new(Expr::LocalGet(local_id)),
+                            args,
+                            byte_offset: new_byte_offset,
+                        });
+                    }
                 }
             }
             // Issue #838 followup (b): when `<Ident>` is NOT a real

@@ -15,6 +15,7 @@ fn make_ctx() -> LoweringContext {
     LoweringContext::new("test.ts")
 }
 
+mod instanceof_rhs;
 mod literal_shape;
 
 #[test]
@@ -1988,6 +1989,8 @@ mod unresolved_new_global;
 mod global_this_new_shadowed;
 
 mod capture_stash;
+mod class_member_var_captures;
+mod function_ctor_runtime_routing;
 mod mixin_parent_chain;
 mod native_module_sync;
 

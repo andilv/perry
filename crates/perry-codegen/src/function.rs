@@ -15,6 +15,9 @@ use crate::types::LlvmType;
 /// #7173 / #7174). A sibling file only because of the 2,000-line cap.
 mod precise_roots;
 
+/// #10463: the entry-block `alloca` invariant, enforced on the final stream.
+mod entry_allocas;
+
 use precise_roots::{lower_precise_roots_to_native_stack, retype_landing_pads_for_statepoints};
 
 pub struct LlFunction {
@@ -175,6 +178,14 @@ pub struct LlFunction {
     /// Entry/module-init functions use this for process-level diagnostics
     /// that must run regardless of which block reaches the normal epilogue.
     pre_return_void_calls: Vec<String>,
+    /// #10464: entry-alloca slots holding a variable-box cell this frame
+    /// minted, paired with the kind's `js_*box_scope_release`. Each `ret`
+    /// hands the slot's current cell back to the runtime (a no-op for a slot
+    /// still holding its TAG_UNDEFINED entry sentinel).
+    pre_return_box_releases: Vec<(String, &'static str)>,
+    /// Slots withdrawn by [`Self::forget_pre_return_box_release`]; a later
+    /// registration of the same slot stays withdrawn.
+    withheld_box_release_slots: Vec<String>,
 }
 
 /// Render the frame-push instruction. Kept in one place so the eager
@@ -279,6 +290,8 @@ impl LlFunction {
             stack_map_slot_count: 0,
             force_shadow_frame: false,
             pre_return_void_calls: Vec::new(),
+            pre_return_box_releases: Vec::new(),
+            withheld_box_release_slots: Vec::new(),
         }
     }
 
@@ -492,6 +505,29 @@ impl LlFunction {
 
     pub fn add_pre_return_void_call(&mut self, func_name: impl Into<String>) {
         self.pre_return_void_calls.push(func_name.into());
+    }
+
+    /// #10464: release the variable-box cell held by `slot` before every
+    /// `ret`. `slot` must be an entry-block alloca whose value is a box
+    /// pointer or TAG_UNDEFINED on every path. Idempotent per slot.
+    pub fn add_pre_return_box_release(&mut self, slot: &str, release_fn: &'static str) {
+        if !self.pre_return_box_releases.iter().any(|(s, _)| s == slot)
+            && !self.withheld_box_release_slots.iter().any(|s| s == slot)
+        {
+            self.pre_return_box_releases
+                .push((slot.to_string(), release_fn));
+        }
+    }
+
+    /// Withdraw a slot registered by [`Self::add_pre_return_box_release`]
+    /// because a holder the runtime does not count (a mapped `arguments`
+    /// object, a plain-async step closure) received its cell. Sticky: the
+    /// slot is never released by this frame afterwards.
+    pub fn forget_pre_return_box_release(&mut self, slot: &str) {
+        self.pre_return_box_releases.retain(|(s, _)| s != slot);
+        if !self.withheld_box_release_slots.iter().any(|s| s == slot) {
+            self.withheld_box_release_slots.push(slot.to_string());
+        }
     }
 
     /// Invoke-EH (#7302): enter/leave a handler scope. While a scope is
@@ -1089,8 +1125,9 @@ impl LlFunction {
         &self,
         sink: &mut dyn FnMut(FinalItem<'_>) -> Result<(), E>,
     ) -> Result<(), E> {
-        let rewrite_rets =
-            self.shadow_frame_slot.is_some() || !self.pre_return_void_calls.is_empty();
+        let rewrite_rets = self.shadow_frame_slot.is_some()
+            || !self.pre_return_void_calls.is_empty()
+            || !self.pre_return_box_releases.is_empty();
         let mut seq: u32 = 0;
         for (i, blk) in self.blocks.iter().enumerate() {
             if i > 0 {
@@ -1111,12 +1148,19 @@ impl LlFunction {
                 usize::MAX
             };
             let mut idx = 0usize;
+            let mut in_entry_block = is_entry;
             for inst in blk.insts() {
                 if idx == boundary {
                     for line in &self.entry_post_init_setup {
                         self.text_item(line, rewrite_rets, &mut seq, sink)?;
                     }
                 }
+                entry_allocas::refuse_alloca_outside_entry_block(
+                    &self.name,
+                    &blk.label,
+                    inst,
+                    &mut in_entry_block,
+                );
                 self.inst_item(inst, rewrite_rets, &mut seq, sink)?;
                 idx += 1;
             }
@@ -1192,6 +1236,18 @@ impl LlFunction {
     ) -> Result<(), E> {
         for func_name in &self.pre_return_void_calls {
             sink(FinalItem::Text(&format!("  call void @{}()", func_name)))?;
+        }
+        for (slot, release_fn) in &self.pre_return_box_releases {
+            let load_reg = format!("%box_release_l_{}", seq);
+            *seq += 1;
+            sink(FinalItem::Text(&format!(
+                "  {} = load i64, ptr {}",
+                load_reg, slot
+            )))?;
+            sink(FinalItem::Text(&format!(
+                "  call void @{}(i64 {})",
+                release_fn, load_reg
+            )))?;
         }
         if let Some(handle_slot) = &self.shadow_frame_slot {
             let load_reg = format!("%shadow_pop_l_{}", seq);

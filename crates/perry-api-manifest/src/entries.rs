@@ -54,8 +54,6 @@ pub const NATIVE_MODULES: &[&str] = &[
     "mongodb",        // MongoDB driver
     "better-sqlite3", // synchronous SQLite (replaces the N-API addon)
     "sqlite",         // node:sqlite builtin surface
-    "tursodb",        // Turso/libSQL client (legacy in-tree; now @perryts/tursodb)
-    "iroh",           // iroh p2p (legacy in-tree; now @perryts/iroh)
     // #6562: Bun FFI (C-ABI). The `bun:` prefix is part of the specifier
     // (unlike `node:`, which is stripped) — `import { dlopen } from "bun:ffi"`.
     "bun:ffi",
@@ -158,7 +156,6 @@ pub const NATIVE_MODULES: &[&str] = &[
     // ── More third-party npm packages ──
     "redis",                 // npm `redis` client (aliases ioredis)
     "rate-limiter-flexible", // rate limiting
-    "fetch",                 // bare-name alias for the node-fetch surface
     // `undici` (#466) — served by perry's native fetch stack via the
     // bundled perry-ext-undici wrapper (ProxyAgent / Agent /
     // setGlobalDispatcher / getGlobalDispatcher / fetch subset).
@@ -231,9 +228,13 @@ pub const NODE_SUBMODULES: &[&str] = &[
 ];
 
 /// Internal manifest keys used by dispatch/property gates but not importable
-/// module specifiers.
+/// module specifiers. `fetch` covers the built-in Web Fetch API's value-typed
+/// dispatch tag (`Response`/`Headers`/`Request`/`Blob`/`FormData` + the bare
+/// global `fetch()` call) — real fetch/HTTP-client I/O, distinct from the
+/// removed bare-name `"fetch"` alias for the `node-fetch` npm package that
+/// used to double as its NATIVE_MODULES entry (see well_known_bindings.toml).
 #[cfg(test)]
-pub(crate) const INTERNAL_MODULE_KEYS: &[&str] = &["inspector.Network", "punycode.ucs2"];
+pub(crate) const INTERNAL_MODULE_KEYS: &[&str] = &["inspector.Network", "punycode.ucs2", "fetch"];
 
 /// Modules handled entirely by `perry-runtime` — the linker doesn't
 /// need to pull in `perry-stdlib` for these. Migrated from

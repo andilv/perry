@@ -42,6 +42,7 @@ pub use super::class_handles::{
 };
 use super::*;
 
+mod accessor_attrs;
 mod builtin_alias_construct;
 mod class_meta;
 mod construct;
@@ -62,6 +63,14 @@ pub(crate) mod prototype_objects;
 mod registration;
 mod state;
 mod vm_brand;
+
+// ── accessor_attrs.rs ───────────────────────────────────────────────────────
+pub(crate) use accessor_attrs::{
+    class_accessor_attrs, class_accessor_attrs_in_use, class_accessor_descriptor,
+    class_declared_accessor_ptrs, class_enumerable_accessor_names,
+    class_prototype_enumerable_accessor, class_set_accessor_attrs,
+    decl_prototype_enumerable_key_snapshot, decl_prototype_keys_with_enumerable_accessors,
+};
 
 // ── state.rs ────────────────────────────────────────────────────────────────
 #[cfg(test)]
@@ -96,8 +105,9 @@ pub use state::{
 // ── prototype_objects.rs ────────────────────────────────────────────────────
 pub(crate) use prototype_objects::{
     class_prototype_object, ensure_function_prototype_object, function_class_id,
-    function_value_for_class_id, resolve_proto_chain_field,
+    function_value_for_class_id, proto_chain_symbol_slot, resolve_proto_chain_field,
     resolve_proto_chain_field_with_receiver, resolve_proto_chain_symbol,
+    synthetic_class_prototype_object,
 };
 pub use prototype_objects::{
     js_set_function_prototype, js_set_prototype_property, NEXT_SYNTHETIC_CLASS_ID,

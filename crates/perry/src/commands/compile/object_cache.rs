@@ -241,7 +241,7 @@ fn stable_type_key(ty: &perry_hir::types::Type) -> String {
 ///
 /// We also mix in environment variables that `perry-codegen` reads
 /// at compile time but that aren't part of `CompileOptions`:
-/// `PERRY_DEBUG_INIT`, `PERRY_DEBUG_SYMBOLS`, `PERRY_LLVM_CLANG`,
+/// `PERRY_DEBUG_INIT`, `PERRY_DEBUG_SYMBOLS`, `PERRY_FUNCTION_SOURCE`, `PERRY_LLVM_CLANG`,
 /// `PERRY_WRITE_BARRIERS`, `PERRY_SHADOW_STACK`,
 /// `PERRY_DISABLE_BUFFER_FAST_PATH`, `PERRY_VERIFY_NATIVE_REGIONS`,
 /// and `PERRY_TARGET_CPU`. See the env-var
@@ -387,6 +387,12 @@ fn compute_object_cache_key_with_env(
     h.field(
         "entry_source_path",
         opts.app_metadata.entry_source_path.as_deref().unwrap_or(""),
+    );
+    // Provider installs are calls baked into the entry prologue (#10428):
+    // adding a `require('net')` elsewhere must not reuse an entry without it.
+    h.field(
+        "native_provider_installs",
+        &opts.app_metadata.native_provider_installs.join("|"),
     );
 
     // Ordered lists (order is significant — topological init, FFI index,
@@ -643,6 +649,14 @@ fn compute_object_cache_key_with_env(
             if let Some(namespace) = &c.namespace {
                 buf.push_str(":namespace=");
                 buf.push_str(namespace);
+                buf.push('|');
+            }
+            // #10484: the constructor's trailing-array layout decides how a
+            // `new` site packs its arguments. Only constructors reading
+            // `arguments` add a component, so other keys stay byte-identical.
+            if c.constructor_has_synthetic_arguments {
+                buf.push_str(":ctor_arguments=1:ctor_rest=");
+                buf.push_str(if c.constructor_has_rest { "1" } else { "0" });
                 buf.push('|');
             }
             buf.push_str("method_rest=");
@@ -1008,6 +1022,8 @@ fn compute_object_cache_key_with_env(
     //     eager initializer chain in the entry object (entry.rs).
     //   - PERRY_DEBUG_SYMBOLS=1 adds `-g` to clang → embeds DWARF sections
     //     into the object (linker.rs).
+    //   - PERRY_FUNCTION_SOURCE=header elides function bodies from
+    //     `fn.toString()` metadata (#10574).
     //   - PERRY_LLVM_CLANG selects which clang binary compiles .ll → .o;
     //     different clang versions/builds emit different bytes (linker.rs).
     //   - PERRY_WRITE_BARRIERS=0/off/false suppresses generated barrier
@@ -1184,6 +1200,12 @@ fn compute_object_cache_key_with_env(
         env_var("PERRY_STRING_INIT_CHUNK_SIZE")
             .as_deref()
             .unwrap_or(""),
+    );
+    // #10574: header vs full function source changes the retained-source
+    // constants in `__perry_init_strings_*`.
+    h.field(
+        "env_function_source",
+        env_var("PERRY_FUNCTION_SOURCE").as_deref().unwrap_or(""),
     );
     h.field(
         "env_entry_symbol",

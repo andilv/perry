@@ -30,7 +30,11 @@ pub(crate) fn value_is_callable(value: f64) -> bool {
     // INT32-tagged class references (top 16 bits = 0x7FFE) are callable
     // constructors emitted by codegen. `is_pointer()` only checks 0x7FFD,
     // so they would fall through to `return false` without this guard.
-    if (value.to_bits() >> 48) == 0x7FFE {
+    // `class_ref_id` also requires `is_class_id_registered`, so a
+    // user-crafted NaN payload sharing this tag band (e.g. via
+    // `DataView.setFloat64` — a real JS number, not a class ref) is not
+    // misclassified as callable.
+    if class_ref_id(value).is_some() {
         return true;
     }
     let jv = crate::JSValue::from_bits(value.to_bits());
@@ -62,15 +66,13 @@ fn small_native_handle_id(value: f64) -> Option<i64> {
     None
 }
 
+/// Candidate heap address of an `instanceof` operand; 0 for every primitive.
+/// #10479: this used to treat every tag band `>= 0x7FF8` as a pointer, so a
+/// 1-5 byte inline string (or an INT32 class ref) reached
+/// `object_static_prototype` as a garbage address and segfaulted.
+#[inline]
 fn value_addr(value: f64) -> usize {
-    let bits = value.to_bits();
-    if (bits >> 48) >= 0x7FF8 {
-        (bits & crate::value::POINTER_MASK) as usize
-    } else if (bits >> 48) == 0 && bits >= 0x1000 {
-        bits as usize
-    } else {
-        0
-    }
+    crate::value::addr_class::object_ref_addr(value)
 }
 
 fn recorded_prototype_instanceof_builtin(value: f64, name: &str) -> Option<bool> {
@@ -99,7 +101,12 @@ fn is_native_module_namespace_value(value: f64, expected: &str) -> bool {
         return false;
     }
     let obj = jv.as_pointer::<ObjectHeader>();
-    if obj.is_null() {
+    // #10556: a native `new EventEmitter()` is a POINTER_TAG registry handle
+    // (`0x38000`), and `x instanceof EventEmitter` asks this probe first — the
+    // null check alone let it read `class_id` out of unmapped low memory.
+    let is_object = unsafe { crate::value::addr_class::try_read_gc_header(obj as usize) }
+        .is_some_and(|header| header.obj_type == crate::gc::GC_TYPE_OBJECT);
+    if !is_object {
         return false;
     }
     unsafe {
@@ -245,12 +252,13 @@ pub extern "C" fn js_instanceof_dynamic(value: f64, type_ref: f64) -> f64 {
         }
     }
     let bits = type_ref.to_bits();
-    let top16 = bits >> 48;
-    if top16 == 0x7FFE {
-        let class_id = (bits & 0xFFFF_FFFF) as u32;
-        if class_id != 0 {
-            return js_instanceof(value, class_id);
-        }
+    // `class_ref_id` requires `is_class_id_registered`, not just the tag —
+    // a user-crafted NaN payload sharing the 0x7FFE band (a real JS number
+    // constructed via `DataView.setFloat64`, not a codegen-emitted class
+    // ref) must fall through to the unresolved-RHS `TypeError` below
+    // instead of being dispatched into `js_instanceof` as a bogus class id.
+    if let Some(class_id) = class_ref_id(type_ref) {
+        return js_instanceof(value, class_id);
     }
     // #9502: a heap class object's template id identifies its code, not its
     // evaluation. Compare the actual prototype objects so sibling evaluations
@@ -328,9 +336,20 @@ pub extern "C" fn js_instanceof_dynamic(value: f64, type_ref: f64) -> f64 {
             return f64::from_bits(crate::value::TAG_TRUE);
         }
         if module == "events" && method == "EventEmitter" {
+            // #10556: a genuine subclass instance (`class Sub extends
+            // EventEmitter {}`) is a real ObjectHeader carrying Sub's own
+            // class id, not a handle and not prototype-linked to the real
+            // `EventEmitter.prototype` — so it is invisible to the
+            // handle/prototype probes below. Delegate to the static path
+            // first: `js_instanceof` walks the class-chain parent edge that
+            // codegen registers for `extends EventEmitter`
+            // (`builtin_parent_reserved_class_id` in
+            // perry-codegen/src/expr/instance_misc1.rs), and its own
+            // `CLASS_ID_EVENT_EMITTER` branch already covers the direct
+            // handle/`util.inherits` cases. Keep the general prototype walk
+            // as a fallback for shapes neither path reaches.
             return f64::from_bits(
-                if is_event_emitter_instance_value(value)
-                    || super::tls_constructor_prototype_is_instance_of(value, method.as_str())
+                if js_instanceof(value, CLASS_ID_EVENT_EMITTER).to_bits() == crate::value::TAG_TRUE
                     || ordinary_has_instance_prototype_walk(value, type_ref)
                 {
                     crate::value::TAG_TRUE
@@ -702,11 +721,12 @@ fn ordinary_has_instance_prototype_walk(value: f64, type_ref: f64) -> bool {
     //   * a heap-allocated string/bigint/symbol gets ToObject-wrapped by
     //     getPrototypeOf, so the walk climbs the wrapper chain and can spuriously
     //     match (`Symbol() instanceof Object` wrongly returned `true`).
-    // Every tag below is checked without dereferencing. Real f64 numbers are
-    // already answered `false` by the primitive fast paths before this point and
-    // share tag-space with raw heap pointers (a bare `is_number()` would
-    // misclassify a module-level object var), so they are intentionally left to
-    // those paths rather than guarded here.
+    // Every tag below is checked without dereferencing. Real f64 numbers share
+    // tag-space with legacy raw heap pointers (a bare `is_number()` would
+    // misclassify a raw-bitcast object), so a number is only rejected when it
+    // does not decode as an object address. They are NOT all answered by
+    // earlier fast paths: a dynamic `1.5 instanceof Number` / `instanceof
+    // Object` reached this walk, ToObject-wrapped the number and matched.
     let scope = crate::gc::RuntimeHandleScope::new();
     let value = scope.root_nanbox_f64(value);
     let type_ref = scope.root_nanbox_f64(type_ref);
@@ -718,6 +738,7 @@ fn ordinary_has_instance_prototype_walk(value: f64, type_ref: f64) -> bool {
             || jv.is_int32()
             || jv.is_any_string()
             || jv.is_bigint()
+            || (jv.is_number() && value_addr(value.get_nanbox_f64()) == 0)
             || unsafe { crate::symbol::js_is_symbol(value.get_nanbox_f64()) != 0 }
         {
             return false;
@@ -1599,27 +1620,15 @@ pub extern "C" fn js_instanceof(value: f64, class_id: u32) -> f64 {
     // perspective — must return true without force-materializing.
     const CLASS_ID_ARRAY: u32 = 0xFFFF0024;
     if class_id == CLASS_ID_ARRAY {
-        let addr = if jsval.is_pointer() {
-            (bits & 0x0000_FFFF_FFFF_FFFF) as usize
-        } else {
-            let top16 = (bits >> 48) as u16;
-            if top16 == 0 && bits >= 0x1000 {
-                bits as usize
-            } else {
-                0
-            }
-        };
-        if addr != 0 && addr >= crate::gc::GC_HEADER_SIZE {
-            let gc_header = (addr - crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-            unsafe {
-                let obj_type = (*gc_header).obj_type;
-                if obj_type == crate::gc::GC_TYPE_ARRAY || obj_type == crate::gc::GC_TYPE_LAZY_ARRAY
-                {
-                    return true_val;
-                }
-            }
-        }
-        return false_val;
+        // A POINTER_TAG handle id (fetch/zlib/stdlib registries) is not a heap
+        // address; the canonical header read rejects it instead of probing the
+        // byte below it.
+        let is_array = unsafe { crate::value::addr_class::try_read_gc_header(value_addr(value)) }
+            .is_some_and(|header| {
+                header.obj_type == crate::gc::GC_TYPE_ARRAY
+                    || header.obj_type == crate::gc::GC_TYPE_LAZY_ARRAY
+            });
+        return if is_array { true_val } else { false_val };
     }
 
     // Typed arrays — Int8Array..Float16Array reserved IDs (0xFFFF0030..3B).
@@ -1783,6 +1792,18 @@ pub extern "C" fn js_instanceof(value: f64, class_id: u32) -> f64 {
             if let Some(matches) = recorded_prototype_instanceof_builtin(value, "Error") {
                 return if matches { true_val } else { false_val };
             }
+        }
+
+        // Everything below reads `ObjectHeader::class_id`, which only a
+        // genuine `GC_TYPE_OBJECT` has. Every other GC type keeps something
+        // else in that word — an array's `length`, a closure's function
+        // pointer, a Map's `size` — so `[1, 2] instanceof C` was true whenever
+        // the length equalled (or chained to) `C`'s class id.
+        if gc_type != crate::gc::GC_TYPE_OBJECT {
+            return false_val;
+        }
+
+        if class_id == crate::error::CLASS_ID_ERROR {
             let obj_class_id = (*obj_ptr).class_id;
             if extends_builtin_error(obj_class_id) {
                 return true_val;
@@ -1834,6 +1855,15 @@ mod null_lhs_tests {
             f64::from_bits(crate::value::INT32_TAG | 5), // int32 5
             f64::from_bits(crate::value::STRING_TAG | 0x1000), // string tag (addr never deref'd)
             f64::from_bits(crate::value::BIGINT_TAG | 0x1000), // bigint tag (addr never deref'd)
+            // #10479: inline SSO strings ("uri", "a") and a synthetic class ref.
+            f64::from_bits(crate::value::SHORT_STRING_TAG | 0x0300_0069_7275),
+            f64::from_bits(crate::value::SHORT_STRING_TAG | 0x0100_0000_0061),
+            f64::from_bits(crate::value::INT32_TAG | 0x8000_0000),
+            // Ordinary numbers: a dynamic `1.5 instanceof Number` reached the
+            // walk and matched through the ToObject wrapper.
+            1.5,
+            -0.0,
+            f64::NAN,
         ];
         for lhs in cases {
             // A dummy non-object RHS is never consulted for a non-object LHS.

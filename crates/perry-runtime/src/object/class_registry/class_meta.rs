@@ -293,6 +293,10 @@ pub(crate) fn identify_global_builtin_constructor(func_value: f64) -> Option<&'s
             // each back to "Array"/"Object"/"Date".
             || func_ptr == global_this_array_thunk as *const u8 as usize
             || func_ptr == global_this_object_thunk as *const u8 as usize
+            // #10423: `Function` carries its own call thunk now; `new F(…)` /
+            // `Reflect.construct(Function, …)` must still route to the
+            // from-strings constructor in construct.rs.
+            || func_ptr == global_this_function_call_thunk as *const u8 as usize
             || func_ptr == global_this_date_thunk as *const u8 as usize
             || func_ptr == global_this_blob_thunk as *const u8 as usize
             || func_ptr == global_this_file_thunk as *const u8 as usize
@@ -364,6 +368,8 @@ pub(crate) fn identify_global_builtin_constructor(func_value: f64) -> Option<&'s
                 Some("Array")
             } else if func_ptr == global_this_object_thunk as *const u8 as usize {
                 Some("Object")
+            } else if func_ptr == global_this_function_call_thunk as *const u8 as usize {
+                Some("Function")
             } else if func_ptr == global_this_string_thunk as *const u8 as usize {
                 Some("String")
             } else if func_ptr == global_this_number_thunk as *const u8 as usize {
@@ -590,11 +596,37 @@ pub static ANON_SHAPE_CLASS_IDS: ImageTable<RwLock<Option<PtrHashSet<u32>>>> =
 /// Mark `class_id` as a synthetic anon-shape class so `.constructor`
 /// reads on instances of that class return the global `Object`
 /// constructor rather than the synthetic class ref.
+/// The lock-free read mirror lives in the class IMAGE
+/// (`class_image::anon_fast_lookup` / `anon_fast_insert`), next to
+/// `parent_dense`, because `ANON_SHAPE_CLASS_IDS` is an `ImageTable` and every
+/// access resolves through `current()`. A process-global mirror would answer
+/// one image's question out of another image's registrations.
+///
+/// Why a mirror at all: `is_anon_shape_class_id` is asked once per dynamic
+/// property read from `native_get::try_data_get_bytes`, and taking an `RwLock`
+/// read guard to do it was 16.1% of an `o[k]` loop — the largest single frame
+/// left in that profile. A guard is an atomic read-modify-write on a lock word
+/// shared by every thread in the image, paid to consult a set written only
+/// from module init.
+///
+/// A sticky "is the set empty" flag does NOT work here, and that was measured
+/// before this was written: object literals ARE anon shapes, so such a flag is
+/// true in essentially every real program and the lock is taken anyway.
+///
+/// The set is INSERT-ONLY — the registrar below only ever calls `insert`, and
+/// nothing removes — which is what makes an open-addressed mirror sound with
+/// no reclamation scheme: an entry, once published, stays valid for the life
+/// of the image.
 #[no_mangle]
 pub unsafe extern "C" fn js_register_anon_shape_class_id(class_id: u32) {
     if class_id == 0 {
         return;
     }
+    // Mirror FIRST: a reader that sees the id here is right, and one that does
+    // not yet see it falls through to the locked set below, which the write
+    // guard is about to update. The reverse order would let a reader miss in
+    // both.
+    super::super::class_image::anon_fast_insert(class_id);
     let mut guard = ANON_SHAPE_CLASS_IDS.write().unwrap();
     if guard.is_none() {
         *guard = Some(new_ptr_hash_set());
@@ -628,6 +660,9 @@ pub fn declared_class_outranks_anon_shape(class_id: u32) -> bool {
 pub fn is_anon_shape_class_id(class_id: u32) -> bool {
     if class_id == 0 {
         return false;
+    }
+    if let Some(verdict) = super::super::class_image::anon_fast_lookup(class_id) {
+        return verdict;
     }
     if let Ok(guard) = ANON_SHAPE_CLASS_IDS.read() {
         if let Some(set) = guard.as_ref() {
