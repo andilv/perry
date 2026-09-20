@@ -50,7 +50,7 @@ mod helpers;
 mod i32_fast_path;
 mod in_presence_ic;
 mod index;
-mod nanbox_inline;
+pub(crate) mod nanbox_inline;
 mod native_memory;
 mod native_record;
 mod object_literal;
@@ -148,7 +148,7 @@ pub(crate) use write_barrier::{
     emit_write_barrier_slot_generation_tested, emit_write_barrier_slot_on_block,
     emit_write_barrier_slot_value_and_generation_tested, lower_array_super_init,
     lower_event_emitter_async_resource_subclass_init, lower_event_emitter_subclass_init,
-    lower_lru_cache_subclass_init, lower_node_stream_super_init, lower_stream_super_init,
+    lower_node_stream_super_init, lower_stream_super_init,
 };
 
 // Issue #1098 phase 3: the `FnCtx` definition stays in this trunk, but its
@@ -216,7 +216,8 @@ pub(crate) use slot_rep::{
     collect_canonical_str_ineligible_locals, collect_closure_referenced_locals,
     deny_canonical_context, deny_canonical_i32, load_canonical_local_boxed, local_is_canonical_str,
     local_rep_is_canonical_i32, note_canonical_local, ptr_shape_context_rule_text,
-    store_canonical_local_from_double, CanonicalI32Denial, SlotRep, PTR_SHAPE_SCALAR_REPLACED,
+    store_canonical_local_from_double, CanonicalI32Denial, SlotRep, PTR_SHAPE_NO_ACCESS_SITE,
+    PTR_SHAPE_SCALAR_REPLACED,
 };
 
 pub(crate) use dispatch::{lower_expr, lower_math_operand};

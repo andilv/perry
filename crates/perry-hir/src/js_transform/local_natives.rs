@@ -665,9 +665,6 @@ pub fn chained_native_class(module: &str, prior_method: &str) -> Option<&'static
         ("mysql2", "getConnection") | ("mysql2/promise", "getConnection") => Some("PoolConnection"),
         ("pg", "connect") => Some("PoolClient"),
         ("ioredis", "duplicate") => Some("Redis"),
-        // dayjs / moment manipulation methods return a NEW date handle.
-        ("dayjs", "add" | "subtract" | "startOf" | "endOf") => Some("App"),
-        ("moment", "add" | "subtract" | "startOf" | "endOf" | "clone") => Some("App"),
         _ => None,
     }
 }
@@ -1351,7 +1348,6 @@ pub fn detect_native_instance_creation_with_context(
                 ("http", "createServer") => "HttpServer",
                 ("https", "createServer") => "HttpsServer",
                 ("http2", "createSecureServer") => "Http2SecureServer",
-                ("node-cron", "schedule") => "CronJob",
                 ("readline", "createInterface") => "Interface",
                 ("bun", "Transpiler") => "Transpiler",
                 // Issue #1193: `const $ = load(html)` / `loadFragment(html)`
@@ -1359,11 +1355,6 @@ pub fn detect_native_instance_creation_with_context(
                 // Tagging the local as CheerioAPI lets the rewriter below
                 // turn `$(sel)` into `NativeMethodCall(cheerio.select, $)`.
                 ("cheerio", "load" | "loadFragment") => "CheerioAPI",
-                // node-forge: `forge.pki.createCertificate()` returns a
-                // mutable cert builder whose instance methods
-                // (setSubject/setIssuer/setExtensions/sign) dispatch under
-                // class "Certificate" (see NATIVE_MODULE_TABLE).
-                ("node-forge", "createCertificate") => "Certificate",
                 _ => return None,
             };
             // For ("net", _) / ("tls", _) factories, `s` belongs to net.Socket's

@@ -123,6 +123,7 @@ mod split;
 pub(crate) mod suffix_cursor;
 pub(crate) mod trim_cache;
 mod utf16_count;
+pub(crate) mod wtf8;
 
 #[cfg(test)]
 mod case_tests;
@@ -139,6 +140,8 @@ mod trim_tests;
 mod tests_guard_page;
 #[cfg(test)]
 mod tests_validated_flag;
+#[cfg(test)]
+mod tests_wtf8_collation;
 
 // Explicit named re-exports — preserve the original `crate::string::*`
 // surface 1:1. NO glob re-exports.
@@ -244,6 +247,10 @@ pub use slice_ops::{
     js_string_trim_start,
 };
 pub use split::js_string_split;
+/// The engine-free `String.prototype.split`, for the engine path to delegate to
+/// once it has ruled out `@@split`.
+#[cfg(feature = "regex-engine")]
+pub(crate) use split::js_string_split_js as js_string_split_plain;
 #[cfg(not(feature = "regex-engine"))]
 pub use split::{js_string_split_js, js_string_split_n};
 

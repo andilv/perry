@@ -30,18 +30,8 @@ pub mod perry_ffi_async;
 
 // Core modules - always available
 pub mod async_local_storage;
-// commander — feature-gated as of v0.5.555 so the well-known flip
-// can route `import { Command } from 'commander'` to
-// perry-ext-commander without duplicate `_js_commander_*` symbols.
-#[cfg(feature = "bundled-commander")]
-pub mod commander;
 pub mod common;
 pub mod domain;
-// dayjs / date-fns — feature-gated as of v0.5.548 so the well-known
-// flip can route `import 'dayjs'` / `import 'date-fns'` to
-// perry-ext-dayjs without duplicate `_js_dayjs_*` symbols at link.
-#[cfg(feature = "bundled-dayjs")]
-pub mod dayjs;
 // decimal feature-gated as of v0.5.547 — well-known flip routes
 // to perry-ext-decimal.
 #[cfg(feature = "bundled-decimal")]
@@ -55,20 +45,7 @@ pub mod decimal;
 // can route to perry-ext-events.
 #[cfg(feature = "bundled-events")]
 pub mod events;
-// exponential_backoff feature-gated as of v0.5.542 so the
-// well-known flip can route to perry-ext-exponential-backoff.
-#[cfg(feature = "bundled-exponential-backoff")]
-pub mod exponential_backoff;
 pub mod lodash;
-// moment — feature-gated as of v0.5.549 so the well-known flip can
-// route `import 'moment'` to perry-ext-moment without duplicate
-// `_js_moment_*` symbols at link.
-#[cfg(feature = "bundled-moment")]
-pub mod moment;
-// lru_cache is feature-gated as of v0.5.539 so the well-known
-// flip can route `import 'lru-cache'` to perry-ext-lru-cache.
-#[cfg(feature = "bundled-lru-cache")]
-pub mod lru_cache;
 pub mod readline;
 // string_decoder — issue #848. Native StringDecoder with real `write` /
 // `end` methods + `lastNeed` / `lastTotal` / `lastChar` getters wired
@@ -91,23 +68,13 @@ mod multipart_parser;
 
 // Re-export core
 pub use async_local_storage::*;
-#[cfg(feature = "bundled-commander")]
-pub use commander::*;
 pub use common::*;
-#[cfg(feature = "bundled-dayjs")]
-pub use dayjs::*;
 #[cfg(feature = "bundled-decimal")]
 pub use decimal::*;
 pub use domain::*;
 #[cfg(feature = "bundled-events")]
 pub use events::*;
-#[cfg(feature = "bundled-exponential-backoff")]
-pub use exponential_backoff::*;
 pub use lodash::*;
-#[cfg(feature = "bundled-lru-cache")]
-pub use lru_cache::*;
-#[cfg(feature = "bundled-moment")]
-pub use moment::*;
 pub use querystring::*;
 pub use readline::*;
 pub use string_decoder::*;
@@ -120,12 +87,10 @@ pub mod framework;
 #[cfg(feature = "http-server")]
 pub use framework::*;
 
-// === Fastify-Compatible Framework ===
-// The in-stdlib fastify adapter was removed: `import 'fastify'` is served
-// exclusively by the external `perry-ext-fastify` crate via the well-known
-// flip (see `well_known_bindings.toml` + `optimized_libs.rs`). perry-stdlib's
-// per-tick bridge into the external crate lives behind the
-// `external-fastify-pump` feature (drained from `async_bridge`).
+// === Fastify ===
+// The npm `fastify` binding was removed (#466): `import 'fastify'` now
+// compiles the real npm package from source, same as any other package
+// under the wildcard resolution.
 
 // === Web Fetch API (fetch / Headers / Request / Response / Blob) ===
 // #5174: gated on `web-fetch`, not `http-client`, so Web Fetch stays
@@ -368,34 +333,23 @@ pub mod cheerio;
 pub use cheerio::*;
 
 // === Scheduler ===
-#[cfg(feature = "bundled-cron")]
-pub mod cron;
-#[cfg(feature = "bundled-cron")]
-pub use cron::*;
-
-// Unconditional cron timer stubs — always present so the CLI event loop in
-// `module_init.rs` can call `js_cron_timer_tick` / `js_cron_timer_has_pending`
-// even when the `scheduler` feature is disabled (e.g. an auto-optimized build
-// of a project that imports `node:crypto` but not `node-cron`). With the
-// scheduler feature ENABLED, these symbols are provided by `cron.rs` instead;
-// the `#[cfg(not(feature = "scheduler"))]` gate below prevents a duplicate
-// symbol error in that case.
-#[cfg(not(feature = "scheduler"))]
+// The native `cron` binding (perry-ext-cron / perry-stdlib's own
+// `cron.rs`) was removed — real `cron` npm source compiles via
+// `perry.compilePackages` instead. These two symbols stay unconditional:
+// the CLI event loop in `module_init.rs` calls `js_cron_timer_tick` /
+// `js_cron_timer_has_pending` every iteration regardless of whether a
+// program uses cron at all, so they must always resolve to something —
+// now always this 0-returning stub.
 #[no_mangle]
 pub extern "C" fn js_cron_timer_tick() -> i32 {
     0
 }
-#[cfg(not(feature = "scheduler"))]
 #[no_mangle]
 pub extern "C" fn js_cron_timer_has_pending() -> i32 {
     0
 }
 
 // === Rate Limiting ===
-#[cfg(feature = "bundled-ratelimit")]
-pub mod ratelimit;
-#[cfg(feature = "bundled-ratelimit")]
-pub use ratelimit::*;
 
 // === IDs ===
 // Nothing left to gate: `bundled-uuid` went with the uuid binding

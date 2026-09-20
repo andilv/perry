@@ -123,8 +123,6 @@ pub(super) fn lower_builtin_new<'a>(
         "Redis" => Some(&["ioredis", "redis", "iovalkey"]),
         "MongoClient" => Some(&["mongodb"]),
         "Decimal" => Some(&["decimal.js"]),
-        "RateLimiterMemory" => Some(&["rate-limiter-flexible"]),
-        "CronJob" => Some(&["cron", "node-cron"]),
         "Transpiler" => Some(&["bun"]),
         _ => None,
     };
@@ -397,19 +395,6 @@ pub(super) fn lower_builtin_new<'a>(
             );
             Ok(Some(nanbox_pointer_inline(blk, &handle)))
         }
-        // commander Command — `new Command()` allocates a real CommanderHandle
-        // via the runtime constructor so subsequent `.command(...).action(...)
-        // .parse(...)` calls operate on a registered handle. Without this,
-        // `lower_new` falls back to an empty placeholder ObjectHeader and the
-        // entire fluent chain dispatches against junk (closes #187).
-        "Command" => {
-            for a in args {
-                let _ = lower_expr(ctx, a)?;
-            }
-            let blk = ctx.block();
-            let handle = blk.call(I64, "js_commander_new", &[]);
-            Ok(Some(nanbox_pointer_inline(blk, &handle)))
-        }
         // events.EventEmitter — `new EventEmitter()` produces a real
         // EventEmitterHandle so `.on(...)` / `.emit(...)` find their
         // registered handle (NATIVE_MODULE_TABLE wires those methods
@@ -633,23 +618,6 @@ pub(super) fn lower_builtin_new<'a>(
             let result = ctx.block().call(DOUBLE, runtime_fn, &[(DOUBLE, &opts_box)]);
             Ok(Some(result))
         }
-        // lru-cache LRUCache — `new LRUCache({ max, ttl, updateAgeOnGet })`.
-        // The runtime parses the whole NaN-boxed options object itself
-        // (`js_lru_cache_new(options: f64)`), so we just lower the options
-        // argument and hand it through — no static field extraction, which
-        // means dynamic/variable options objects work too. A missing options
-        // argument passes `undefined`, which the runtime rejects with the
-        // same `TypeError` npm's constructor destructuring raises.
-        "LRUCache" => {
-            // npm's constructor ignores everything past the options object,
-            // but the arguments are still evaluated — the tail is lowered
-            // for its side effects so `new LRUCache(opts, f())` still calls
-            // `f`. #6986: `opts_val` was held across that lowering.
-            let opts_val = adopt_leading_arg_discard_rest(ctx, args, group)?;
-            let blk = ctx.block();
-            let handle = blk.call(I64, "js_lru_cache_new", &[(DOUBLE, &opts_val)]);
-            Ok(Some(nanbox_pointer_inline(blk, &handle)))
-        }
         // (`WebSocketServer` is handled by an earlier branch lower in this
         // file — pre-existing from 2026-04-14. No new branch needed here.)
         // pg Client — `new Client(config)` matching npm pg's API: synchronous
@@ -826,92 +794,6 @@ pub(super) fn lower_builtin_new<'a>(
             // The runtime sig takes one i64 (currently *const c_void, ignored).
             // Pass 0 — semantically "use env-var defaults".
             let handle = blk.call(I64, "js_ioredis_new", &[(I64, "0")]);
-            Ok(Some(nanbox_pointer_inline(blk, &handle)))
-        }
-        // rate-limiter-flexible `new RateLimiterMemory({ points, duration })`.
-        // Gated on the import source above. The options object crosses as
-        // raw NaN-box bits (i64) so the runtime parses `points`/`duration`
-        // by name; missing arg → TAG_UNDEFINED → npm defaults (4 points /
-        // 1 s). Pre-fix this fell to the js_object_alloc(0,0) placeholder
-        // and every method call dispatched against `{}`. Instance methods
-        // (consume/get/delete/block/penalty/reward) are wired in
-        // NATIVE_MODULE_TABLE for module "rate-limiter-flexible".
-        "RateLimiterMemory" => {
-            // #6986: `options` was held across the discard loop's lowering.
-            let options = adopt_leading_arg_discard_rest(ctx, args, group)?;
-            let blk = ctx.block();
-            let options_bits = blk.bitcast_double_to_i64(&options);
-            let handle = blk.call(
-                I64,
-                "js_ratelimit_new_from_options",
-                &[(I64, &options_bits)],
-            );
-            Ok(Some(nanbox_pointer_inline(blk, &handle)))
-        }
-        // npm `cron` package: `new CronJob(cronTime, onTick, onComplete?,
-        // start?)`. Gated on the import source above. Unlike node-cron's
-        // `schedule()` factory (which auto-starts), a CronJob only begins
-        // firing when the 4th argument is truthy or `job.start()` is
-        // called — `js_cron_job_new` implements that. The onTick closure
-        // is UNBOXED to a raw ClosureHeader pointer (unbox_to_i64): the
-        // cron tick calls it via js_closure_call0 on the raw pointer, so
-        // tagged NaN-box bits would throw "value is not a function" on
-        // the first fire. onComplete is lowered for side effects only.
-        // start/stop/isRunning/nextDate dispatch via the existing
-        // ("cron", true, …) NATIVE_MODULE_TABLE rows.
-        "CronJob" => {
-            // #6986: `expr_ptr` (via `get_raw_string_ptr`, itself a
-            // lower_expr + immediate derive with no window of its own) and
-            // `on_tick` were both held across every later argument's
-            // lowering. Adopt each boxed operand into `group` as it is
-            // produced — argument order preserved — then re-read right
-            // before use. `expr_ptr`'s derivation (`js_get_string_pointer_unified`)
-            // can itself allocate (SSO materialize, nanbox.rs), so it runs
-            // FIRST among the final derivations: `on_tick`'s `unbox_to_i64`
-            // is pure bitwise (no collect) and `start` needs no further
-            // derivation, so re-reading them after is safe.
-            let cron_time_idx = adopt_optional_arg(ctx, args, 0, group)?;
-            let on_tick_idx = adopt_optional_arg(ctx, args, 1, group)?;
-            if let Some(arg) = args.get(2) {
-                let _ = lower_expr(ctx, arg)?;
-            }
-            let start_idx = adopt_optional_arg(ctx, args, 3, group)?;
-            for arg in args.iter().skip(4) {
-                let _ = lower_expr(ctx, arg)?;
-            }
-            let expr_ptr = match cron_time_idx {
-                Some(i) => {
-                    let cron_time = group.reread(ctx, i)?;
-                    ctx.block().call(
-                        I64,
-                        "js_get_string_pointer_unified",
-                        &[(DOUBLE, &cron_time)],
-                    )
-                }
-                None => "0".to_string(),
-            };
-            let cb_ptr = match on_tick_idx {
-                Some(i) => {
-                    let on_tick = group.reread(ctx, i)?;
-                    let blk = ctx.block();
-                    unbox_to_i64(blk, &on_tick)
-                }
-                None => {
-                    let undef = double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
-                    let blk = ctx.block();
-                    unbox_to_i64(blk, &undef)
-                }
-            };
-            let start = match start_idx {
-                Some(i) => group.reread(ctx, i)?,
-                None => double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)),
-            };
-            let blk = ctx.block();
-            let handle = blk.call(
-                I64,
-                "js_cron_job_new",
-                &[(I64, &expr_ptr), (I64, &cb_ptr), (DOUBLE, &start)],
-            );
             Ok(Some(nanbox_pointer_inline(blk, &handle)))
         }
         // async_hooks.AsyncLocalStorage — `new AsyncLocalStorage()` produces a

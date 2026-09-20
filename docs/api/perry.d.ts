@@ -1,6 +1,6 @@
 // Auto-generated from Perry's API manifest (#465). Do not edit by hand.
 // Source: perry-api-manifest::API_MANIFEST
-// Coverage: 2064 entries across 130 modules
+// Coverage: 2026 entries across 118 modules
 
 type PerryI8 = number & { readonly __perryI8?: never };
 type PerryI16 = number & { readonly __perryI16?: never };
@@ -490,11 +490,6 @@ declare module "cluster" {
   export function setupMaster(...args: any[]): any;
   /** stdlib */
   export function setupPrimary(...args: any[]): any;
-}
-
-declare module "commander" {
-  /** stdlib */
-  export const args: any;
 }
 
 declare module "console" {
@@ -1028,17 +1023,6 @@ declare module "constants" {
   export const defaultCoreCipherList: any;
 }
 
-declare module "cron" {
-  /** stdlib */
-  export class CronJob { [key: string]: any; }
-  /** stdlib */
-  export function describe(expr: string): string;
-  /** stdlib */
-  export function schedule(expr: string, handler: any): any;
-  /** stdlib */
-  export function validate(expr: string): boolean;
-}
-
 declare module "crypto" {
   /** stdlib */
   export class Cipheriv { [key: string]: any; }
@@ -1176,40 +1160,6 @@ declare module "crypto" {
   export function timingSafeEqual(...args: any[]): any;
   /** stdlib */
   export function verify(...args: any[]): any;
-}
-
-declare module "date-fns" {
-  /** stdlib */
-  export function addDays(...args: any[]): any;
-  /** stdlib */
-  export function addMonths(...args: any[]): any;
-  /** stdlib */
-  export function addYears(...args: any[]): any;
-  /** stdlib */
-  export function differenceInDays(...args: any[]): any;
-  /** stdlib */
-  export function differenceInHours(...args: any[]): any;
-  /** stdlib */
-  export function differenceInMinutes(...args: any[]): any;
-  /** stdlib */
-  export function endOfDay(...args: any[]): any;
-  /** stdlib */
-  export function format(...args: any[]): any;
-  /** stdlib */
-  export function isAfter(...args: any[]): any;
-  /** stdlib */
-  export function isBefore(...args: any[]): any;
-  /** stdlib */
-  export function parseISO(...args: any[]): any;
-  /** stdlib */
-  export function startOfDay(...args: any[]): any;
-}
-
-declare module "dayjs" {
-  /** stdlib */
-  export function dayjs(input?: any): any;
-  /** stdlib */
-  export default function (input?: any): any;
 }
 
 declare module "dgram" {
@@ -1576,16 +1526,6 @@ declare module "events" {
   export function once(...args: any[]): any;
   /** stdlib */
   export function setMaxListeners(...args: any[]): any;
-}
-
-declare module "exponential-backoff" {
-  /** stdlib */
-  export function backOff(p0: any, p1: any): any;
-}
-
-declare module "fastify" {
-  /** stdlib */
-  export default function (p0: any): any;
 }
 
 declare module "fetch" {
@@ -2110,11 +2050,6 @@ declare module "lodash" {
   export function uniq(p0: any): any;
 }
 
-declare module "lru-cache" {
-  /** stdlib */
-  export default function (p0: any): any;
-}
-
 declare module "module" {
   /** stdlib */
   export class Module { [key: string]: any; }
@@ -2183,13 +2118,6 @@ declare module "module" {
   export function stripTypeScriptTypes(...args: any[]): any;
   /** stdlib */
   export function syncBuiltinESMExports(...args: any[]): any;
-}
-
-declare module "moment" {
-  /** stdlib */
-  export default function (input?: any): any;
-  /** stdlib */
-  export function moment(input?: any): any;
 }
 
 declare module "mongodb" {
@@ -2262,13 +2190,6 @@ declare module "net" {
   export function setDefaultAutoSelectFamilyAttemptTimeout(...args: any[]): any;
 }
 
-declare module "node-cron" {
-  /** stdlib */
-  export function schedule(...args: any[]): any;
-  /** stdlib */
-  export function validate(...args: any[]): any;
-}
-
 declare module "node-fetch" {
   /** stdlib */
   export class Blob { [key: string]: any; }
@@ -2282,25 +2203,6 @@ declare module "node-fetch" {
   export class Response { [key: string]: any; }
   /** stdlib */
   export default function (...args: any[]): any;
-}
-
-declare module "node-forge" {
-  /** stdlib */
-  export function certificateFromPem(...args: any[]): any;
-  /** stdlib */
-  export function certificateToPem(...args: any[]): any;
-  /** stdlib */
-  export function create(...args: any[]): any;
-  /** stdlib */
-  export function createCertificate(...args: any[]): any;
-  /** stdlib */
-  export function generateKeyPair(...args: any[]): any;
-  /** stdlib */
-  export function privateKeyFromPem(...args: any[]): any;
-  /** stdlib */
-  export function privateKeyToPem(...args: any[]): any;
-  /** stdlib */
-  export function publicKeyToPem(...args: any[]): any;
 }
 
 declare module "node-pty" {
@@ -3591,13 +3493,6 @@ declare module "punycode" {
   export function toUnicode(...args: any[]): any;
 }
 
-declare module "qs" {
-  /** stdlib */
-  export function parse(input: string, options: any): any;
-  /** stdlib */
-  export function stringify(value: any, options: any): string;
-}
-
 declare module "querystring" {
   /** stdlib */
   const _default: any;
@@ -3616,13 +3511,6 @@ declare module "querystring" {
   export function unescape(...args: any[]): any;
   /** stdlib */
   export function unescapeBuffer(...args: any[]): any;
-}
-
-declare module "rate-limiter-flexible" {
-  /** stdlib */
-  export class RateLimiterAbstract { [key: string]: any; }
-  /** stdlib */
-  export class RateLimiterMemory { [key: string]: any; }
 }
 
 declare module "readline" {

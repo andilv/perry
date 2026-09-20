@@ -34,12 +34,6 @@
   ],
   "holders": [
     {
-      "file": "crates/perry-ext-exponential-backoff/src/lib.rs",
-      "name": "NEXT_ID",
-      "verdict": "not_a_gc_pointer",
-      "why": "Monotonic backoff-state id counter (lib.rs:378). The closures live in STATES (BackoffState.task/outer/retry_cb), which scan_backoff_roots visits."
-    },
-    {
       "file": "crates/perry-ext-fetch/src/lib.rs",
       "name": "REQUEST_HANDLES",
       "verdict": "covered_elsewhere",
@@ -347,6 +341,12 @@
       "name": "TEST_PATH_OVERRIDE",
       "verdict": "test_only",
       "why": "Declared under cfg(test); holds an explicitly leaked Rust path string used by the isolated census unit tests."
+    },
+    {
+      "file": "crates/perry-runtime/src/gc/collection_points.rs",
+      "name": "ARMED_SITE",
+      "verdict": "test_only",
+      "why": "Cell<Option<&'static str>>: a static string-literal site NAME an armed rooting-regression test compares against, never a GC heap pointer. Declared under #[cfg(test)] only (collection_points.rs:15); the whole module compiles to an empty inline no-op outside cfg(test), so this storage never exists in a shipped binary."
     },
     {
       "file": "crates/perry-runtime/src/gc/copying.rs",
@@ -811,6 +811,12 @@
       "why": "Source order for Symbol-keyed class members: HashMap<(class_id, SymbolHeader::id, is_static), u32>. The u64 is the symbol's stable id (read once at registration in record_class_symbol_member_order), NOT its address, so the table needs no re-key when a Symbol is evacuated; the value is an order index. The member values themselves live in CLASS_SYMBOL_METHODS/CLASS_SYMBOL_ACCESSORS, which scan_class_symbol_member_keys_mut visits and rewrite_class_symbol_method_key_if_forwarded re-keys."
     },
     {
+      "file": "crates/perry-runtime/src/object/delete_rest.rs",
+      "name": "DELETE_TRANSITION_TEST_OVERRIDE",
+      "verdict": "test_only",
+      "why": "Cell<Option<bool>> holding a tri-state force/suppress flag for the delete-as-shape-transition path (#10826). The type cannot hold a heap pointer at all -- Option<bool> is a two-bit value, not a NaN box and not a *mut -- so there is nothing for a scanner to reach. Set only from #[cfg(test)] helpers; the shipping path reads it and finds None."
+    },
+    {
       "file": "crates/perry-runtime/src/object/descriptor_state.rs",
       "name": "TEST_SUPPRESS_DESCRIPTOR_YOUNG_NOTE",
       "verdict": "not_a_gc_pointer",
@@ -1107,9 +1113,9 @@
     },
     {
       "file": "crates/perry-runtime/src/string/format.rs",
-      "name": "POW10",
+      "name": "POW10_FIXED",
       "verdict": "not_a_gc_pointer",
-      "why": "A [u64; 7] constant table of powers of ten."
+      "why": "A [u64; 20] constant table of powers of ten, holding 10^0..10^19 \u2014 plain integers, never an address, so the collector never sees a pointer here. Was POW10, a [u64; 7] local to fmt_fixed_int; hoisted to module scope by #10770 so that js_number_to_fixed's admission test and fmt_fixed_int itself read ONE table, because the old seven-entry length was what silently capped toFixed's fast path at dp <= 6."
     },
     {
       "file": "crates/perry-runtime/src/string/mod.rs",
@@ -1134,6 +1140,12 @@
       "name": "ACTIVE_THREAD_JOBS",
       "verdict": "not_a_gc_pointer",
       "why": "In-flight job counter for perry/thread."
+    },
+    {
+      "file": "crates/perry-runtime/src/timer/tests_inline.rs",
+      "name": "SELF_ID",
+      "verdict": "test_only",
+      "why": "AtomicI64 holding a scheduled mock timer's id (an i64 returned by schedule_mock_callback_timer, never a GC heap pointer) so the timer's own extern \"C\" callback can look itself up in the ref-state registry mid-dispatch. Declared under #[cfg(test)] only (tests_inline.rs, mock_dispatch_own_pin_tests), never live in a shipped binary."
     },
     {
       "file": "crates/perry-runtime/src/weakref/test_support.rs",
@@ -2547,18 +2559,6 @@
       "name": "WINDOW_ROOTS",
       "verdict": "not_a_gc_pointer",
       "why": "Window-root registry maps numeric window handles to numeric root-widget handles; neither value is a JavaScript heap pointer."
-    },
-    {
-      "file": "crates/perry-runtime/src/gc/collection_points.rs",
-      "name": "ARMED_SITE",
-      "verdict": "test_only",
-      "why": "Cell<Option<&'static str>>: a static string-literal site NAME an armed rooting-regression test compares against, never a GC heap pointer. Declared under #[cfg(test)] only (collection_points.rs:15); the whole module compiles to an empty inline no-op outside cfg(test), so this storage never exists in a shipped binary."
-    },
-    {
-      "file": "crates/perry-runtime/src/timer/tests_inline.rs",
-      "name": "SELF_ID",
-      "verdict": "test_only",
-      "why": "AtomicI64 holding a scheduled mock timer's id (an i64 returned by schedule_mock_callback_timer, never a GC heap pointer) so the timer's own extern \"C\" callback can look itself up in the ref-state registry mid-dispatch. Declared under #[cfg(test)] only (tests_inline.rs, mock_dispatch_own_pin_tests), never live in a shipped binary."
     }
   ],
   "_FRONTIER_README": "Identity-pinned debt ratchet over new perry-ui* candidates and otherwise-unclassified core raw/Perry TLS declarations (see the census docstring, \u201cThe identity-pinned frontier\u201d). A new uncovered holder fails until it is scanned, receives a researched holders verdict, or is deliberately pinned as debt. Moving a researched false positive to holders graduates it from this list. A fixed or classified holder makes its old frontier pin stale, so the receipt must be deleted.",
@@ -4045,16 +4045,8 @@
       "name": "SESSION_STORE"
     },
     {
-      "file": "crates/perry-stdlib/src/commander.rs",
-      "name": "GC_REGISTERED"
-    },
-    {
       "file": "crates/perry-stdlib/src/common/async_bridge.rs",
       "name": "GC_SCANNER_REGISTERED"
-    },
-    {
-      "file": "crates/perry-stdlib/src/cron.rs",
-      "name": "CRON_GC_REGISTERED"
     },
     {
       "file": "crates/perry-stdlib/src/crypto/hash_handles.rs",
@@ -4087,10 +4079,6 @@
     {
       "file": "crates/perry-stdlib/src/events.rs",
       "name": "EVENTS_GC_REGISTERED"
-    },
-    {
-      "file": "crates/perry-stdlib/src/exponential_backoff.rs",
-      "name": "GC_REGISTERED"
     },
     {
       "file": "crates/perry-stdlib/src/fetch/gc.rs",

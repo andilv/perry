@@ -32,7 +32,6 @@ pub const NATIVE_MODULES: &[&str] = &[
     "mysql2",         // MySQL/MariaDB client
     "mysql2/promise", // mysql2's promise-API subpath
     "pg",             // PostgreSQL client
-    "qs",             // nested query-string parser/stringifier (Stripe dependency)
     "bcrypt",         // bcrypt password hashing (replaces the N-API addon)
     "argon2",         // Argon2 password hashing (replaces the N-API addon)
     "ioredis",        // Redis/Valkey client
@@ -53,7 +52,6 @@ pub const NATIVE_MODULES: &[&str] = &[
     "bun:jsc",
     "ffi",        // node:ffi (the node: prefix is normalized away)
     "bun:sqlite", // Bun facade over Perry's native SQLite engine
-    "node-cron",  // cron-style scheduler (npm node-cron; aliases `cron`)
     "nodemailer", // SMTP email sending
     // ── Node.js builtin modules ──
     "http",               // HTTP client + server
@@ -89,19 +87,11 @@ pub const NATIVE_MODULES: &[&str] = &[
     "dns/promises",       // (duplicate — kept for parity)
     "url",                // URL / URLSearchParams
     // ── More third-party npm packages ──
-    "lru-cache",           // LRU cache
-    "commander",           // CLI argument parser
-    "decimal.js",          // arbitrary-precision decimals
-    "bignumber.js",        // arbitrary-precision big numbers
-    "exponential-backoff", // retry-with-backoff helper
-    "lodash",              // general utility library
-    "dayjs",               // date/time library
-    "date-fns",            // functional date utilities
-    "moment",              // (legacy) date/time library
-    "sharp",               // image processing (replaces the N-API addon)
-    "cheerio",             // server-side jQuery-style HTML parsing
-    "cron",                // cron scheduler (aliases node-cron)
-    "fastify",             // HTTP server framework
+    "decimal.js",   // arbitrary-precision decimals
+    "bignumber.js", // arbitrary-precision big numbers
+    "lodash",       // general utility library
+    "sharp",        // image processing (replaces the N-API addon)
+    "cheerio",      // server-side jQuery-style HTML parsing
     // ── Node.js builtins (cont.) ──
     "async_hooks", // async context tracking
     // #2875: internal module backing DisposableStack/AsyncDisposableStack
@@ -147,8 +137,7 @@ pub const NATIVE_MODULES: &[&str] = &[
     "perry/audio",             // audio surface
     "perry/background",        // background-task surface
     // ── More third-party npm packages ──
-    "redis",                 // npm `redis` client (aliases ioredis)
-    "rate-limiter-flexible", // rate limiting
+    "redis", // npm `redis` client (aliases ioredis)
     // `undici` (#466) — served by perry's native fetch stack via the
     // bundled perry-ext-undici wrapper (ProxyAgent / Agent /
     // setGlobalDispatcher / getGlobalDispatcher / fetch subset).
@@ -177,11 +166,6 @@ pub const NATIVE_MODULES: &[&str] = &[
     "node-pty",
     "bun-pty",
     "@lydell/node-pty", // API-identical node-pty fork (see above)
-    // #466: node-forge PKI subset (RSA keygen, X.509 build/sign, PEM).
-    // Bundled wrapper at `crates/perry-ext-node-forge`; served natively
-    // for Socket Firewall's TLS-MITM CA so forge's pure-JS crypto isn't
-    // AOT-compiled.
-    "node-forge",
     // @parcel/watcher's root binding and the eight published Node-API
     // sidecars. HIR canonicalizes sidecars to the root dispatch table.
     "@parcel/watcher",
