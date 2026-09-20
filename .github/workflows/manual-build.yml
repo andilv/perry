@@ -176,7 +176,7 @@ jobs:
             -p perry-runtime -p perry-runtime-static \
             -p perry-stdlib -p perry-stdlib-static \
             -p perry-ext-net -p perry-ext-ws -p perry-ext-http \
-            -p perry-ext-axios -p perry-ext-fetch -p perry-ext-undici \
+            -p perry-ext-fetch -p perry-ext-undici \
             -p perry-ext-fastify -p perry-ext-mongodb -p perry-ext-pg \
             -p perry-ext-mysql2 -p perry-ext-ioredis -p perry-ext-nodemailer
 
@@ -189,7 +189,7 @@ jobs:
         # regresses silently.
         if: steps.filter.outputs.run == 'true' && runner.os != 'Windows'
         run: |
-          SHARED_TOKIO="perry-ext-net perry-ext-ws perry-ext-http perry-ext-axios perry-ext-fetch perry-ext-undici perry-ext-fastify perry-ext-mongodb perry-ext-pg perry-ext-mysql2 perry-ext-ioredis perry-ext-nodemailer"
+          SHARED_TOKIO="perry-ext-net perry-ext-ws perry-ext-http perry-ext-fetch perry-ext-undici perry-ext-fastify perry-ext-mongodb perry-ext-pg perry-ext-mysql2 perry-ext-ioredis perry-ext-nodemailer"
           for d in crates/perry-ext-*; do
             [ -d "$d" ] || continue
             name=$(basename "$d")
@@ -230,7 +230,7 @@ jobs:
               exit 1
             fi
           fi
-          for lib in net ws http axios fetch undici fastify mongodb pg mysql2 ioredis nodemailer; do
+          for lib in net ws http fetch undici fastify mongodb pg mysql2 ioredis nodemailer; do
             archive="$LIBDIR/libperry_ext_$lib.a"
             if [ ! -f "$archive" ]; then
               echo "::warning::libperry_ext_$lib.a missing (keep-going skipped it) — out-of-tree users fall back to the perry-stdlib copy or a compile-time error"
