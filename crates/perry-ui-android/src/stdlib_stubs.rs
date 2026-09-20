@@ -56,40 +56,6 @@ pub extern "C" fn js_await_js_promise() -> i64 {
     0
 }
 #[no_mangle]
-pub extern "C" fn js_axios_create() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_axios_delete() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_axios_get() -> i64 {
-    0
-}
-
-#[no_mangle]
-pub extern "C" fn js_axios_head() -> i64 {
-    0
-}
-
-#[no_mangle]
-pub extern "C" fn js_axios_options() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_axios_post() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_axios_put() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_axios_request() -> i64 {
-    0
-}
-#[no_mangle]
 pub extern "C" fn js_bcrypt_compare() -> i64 {
     0
 }
@@ -542,18 +508,6 @@ pub extern "C" fn js_decimal_to_string() -> i64 {
     0
 }
 #[no_mangle]
-pub extern "C" fn js_dotenv_config() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_dotenv_config_path() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_dotenv_parse() -> i64 {
-    0
-}
-#[no_mangle]
 pub extern "C" fn js_ethers_format_ether() -> i64 {
     0
 }
@@ -916,26 +870,6 @@ pub extern "C" fn js_ioredis_setex() -> i64 {
     0
 }
 // js_json_* — real implementations in json.rs
-#[no_mangle]
-pub extern "C" fn js_jwt_decode() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_jwt_sign() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_jwt_sign_es256() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_jwt_sign_rs256() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_jwt_verify() -> i64 {
-    0
-}
 #[no_mangle]
 pub extern "C" fn js_lodash_camel_case() -> i64 {
     0
@@ -1333,14 +1267,6 @@ pub extern "C" fn js_mysql2_pool_query() -> i64 {
     0
 }
 #[no_mangle]
-pub extern "C" fn js_nanoid() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_nanoid_custom() -> i64 {
-    0
-}
-#[no_mangle]
 pub extern "C" fn js_new_instance() -> i64 {
     0
 }
@@ -1464,94 +1390,6 @@ pub extern "C" fn js_sqlite_transaction_commit() -> i64 {
 }
 #[no_mangle]
 pub extern "C" fn js_sqlite_transaction_rollback() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_uuid_nil() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_uuid_v1() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_uuid_v4() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_uuid_v7() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_uuid_validate() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_uuid_version() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_validator_contains() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_validator_equals() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_validator_is_alpha() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_validator_is_alphanumeric() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_validator_is_email() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_validator_is_empty() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_validator_is_float() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_validator_is_hexadecimal() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_validator_is_int() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_validator_is_json() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_validator_is_length() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_validator_is_lowercase() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_validator_is_numeric() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_validator_is_uppercase() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_validator_is_url() -> i64 {
-    0
-}
-#[no_mangle]
-pub extern "C" fn js_validator_is_uuid() -> i64 {
     0
 }
 // readline (#347) — TUI use case isn't relevant on Android, so stubs

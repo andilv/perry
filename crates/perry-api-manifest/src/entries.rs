@@ -32,7 +32,6 @@ pub const NATIVE_MODULES: &[&str] = &[
     "mysql2",         // MySQL/MariaDB client
     "mysql2/promise", // mysql2's promise-API subpath
     "pg",             // PostgreSQL client
-    "uuid",           // RFC-4122 UUID generation
     "qs",             // nested query-string parser/stringifier (Stripe dependency)
     "bcrypt",         // bcrypt password hashing (replaces the N-API addon)
     "argon2",         // Argon2 password hashing (replaces the N-API addon)
@@ -40,16 +39,10 @@ pub const NATIVE_MODULES: &[&str] = &[
     // iovalkey: the Valkey fork of ioredis (valkey-io/iovalkey), served by the
     // same perry-ext-ioredis surface — see well_known_bindings.toml.
     "iovalkey",
-    "axios",          // HTTP client (routes onto the native fetch/http stack)
     "node-fetch",     // WHATWG fetch client
     "ws",             // WebSocket client/server
     "zlib",           // (Node builtin) gzip/deflate/brotli/zstd compression
     "crypto",         // (Node builtin) hashing, HMAC, cipher, sign/verify, WebCrypto
-    "dotenv",         // .env file loader
-    "dotenv/config",  // dotenv's auto-load-on-import subpath
-    "jsonwebtoken",   // JWT sign/verify
-    "nanoid",         // compact URL-safe ID generation
-    "validator",      // string validators/sanitizers
     "ethers",         // Ethereum library (utils/wallet/ABI)
     "mongodb",        // MongoDB driver
     "better-sqlite3", // synchronous SQLite (replaces the N-API addon)

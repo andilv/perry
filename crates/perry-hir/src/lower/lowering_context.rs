@@ -201,6 +201,18 @@ pub struct LoweringContext {
     /// `lookup_class_accessor_names` and walked across the parent chain when
     /// processing a subclass's ctor body.
     pub(crate) class_accessor_names: HashMap<String, ClassAccessorNames>,
+    /// Issue #10487: own+inherited instance METHOD names per class (mirrors
+    /// `class_accessor_names`). Used by the "infer fields from ctor body
+    /// `this.x = ...`" pass to avoid mis-categorising an assignment that
+    /// overrides an INHERITED method (`this.close = () => …` where `close`
+    /// is declared on a parent class) as a new own data field — that
+    /// allocated an inline slot shadowing the inherited method from the
+    /// moment `super()` returns, so `this.close` read `undefined` until the
+    /// assignment ran (undici MockPool/MockClient's `this.close.bind(this)`
+    /// threw "Bind must be called on a function" for the same reason).
+    /// Own-class methods were already excluded (#665-adjacent zod fix);
+    /// this extends the exclusion across the `extends` chain.
+    pub(crate) class_method_names: HashMap<String, Vec<String>>,
     /// Issue #562: class name → `(module, class)` tuple from
     /// `native_extends`. Populated when lowering each class, consumed by
     /// `destructuring.rs` to register `let x = new SubclassOfStream()`
@@ -263,6 +275,22 @@ pub struct LoweringContext {
     /// For namespace imports (import * as x), method_name is None
     /// For named imports (import { v4 as uuid }), method_name is Some("v4")
     pub(crate) native_modules: Vec<(String, String, Option<String>)>,
+    /// #10623: `const { Key } = require("<resolvable native module>")`
+    /// destructured bindings, keyed by the LOCAL binding name -> the
+    /// destructured export KEY (identity for the common unaliased case).
+    /// Recorded unconditionally, even inside a CJS-wrapped module where
+    /// `register_destructured_stream_ctors` deliberately skips the full
+    /// `native_modules` alias registration (#8342: the wrapper's synthetic
+    /// `require(...)` returns a real runtime value there, so the static
+    /// native-namespace fast path is not safe to use for ordinary property
+    /// reads/calls). Class-heritage resolution (`class_decl.rs`) is a
+    /// narrower consumer: it only needs "was this identifier bound FROM a
+    /// require() of a real native module", to avoid treating `class X
+    /// extends AsyncResource {}` as user-shadowed merely because the CJS
+    /// wrapper makes every top-level `const` a genuine local. Not itself a
+    /// module/value resolution table — do not use it for anything requiring
+    /// runtime-accurate native-module semantics.
+    pub(crate) require_destructured_native_locals: HashMap<String, String>,
     /// Built-in module aliases from require(): local_name -> module_name (e.g., "myFs" -> "fs")
     pub(crate) builtin_module_aliases: Vec<(String, String)>,
     /// Stack of type parameter scopes (for nested generics)
@@ -1175,4 +1203,20 @@ pub struct LoweringContext {
     /// (ES2025 §15.2.1.1, early error for `new.target` in eval). ArrowFunction
     /// bodies and module/script top-level both leave this false.
     pub(crate) in_nonarrow_fn: bool,
+}
+
+// Issue #10487: own+inherited instance method names per class (mirrors
+// `class_accessor_names`'s register/lookup pair in context.rs). Split into
+// its own `impl` block here rather than in context.rs, which sits at the
+// file-size cap.
+impl LoweringContext {
+    pub(crate) fn register_class_method_names(&mut self, class_name: String, names: Vec<String>) {
+        self.class_method_names.insert(class_name, names);
+    }
+
+    pub(crate) fn lookup_class_method_names(&self, class_name: &str) -> Option<&[String]> {
+        self.class_method_names
+            .get(class_name)
+            .map(|n| n.as_slice())
+    }
 }

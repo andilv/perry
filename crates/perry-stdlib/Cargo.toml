@@ -23,18 +23,10 @@ default = ["full"]
 # must stay out of this list: release archives enable `full` without linking
 # their per-program provider archives, and adding an external HTTP pump here
 # made HTTP-free Linux UI links require libperry_ext_http.a (#5983, #8587).
-full = ["http-server", "http-client", "database", "crypto", "compression", "email", "websocket", "image", "scheduler", "ids", "html-parser", "rate-limit", "validation", "net", "tls", "bundled-dotenv", "bundled-lru-cache", "bundled-exponential-backoff", "bundled-events", "bundled-decimal", "bundled-dayjs", "bundled-moment", "bundled-commander", "bundled-streams"]
+full = ["http-server", "http-client", "database", "crypto", "compression", "email", "websocket", "image", "scheduler", "ids", "html-parser", "rate-limit", "net", "tls", "bundled-lru-cache", "bundled-exponential-backoff", "bundled-events", "bundled-decimal", "bundled-dayjs", "bundled-moment", "bundled-commander", "bundled-streams"]
 
 # Minimal core - just what's needed for basic programs
 core = []
-
-# In-tree implementation of the npm `dotenv` package (#466 Phase 4
-# step 2). Default-on; turned off by the compiler when the
-# well-known bindings table (`well_known_bindings.toml`) routes
-# `import 'dotenv'` to `perry-ext-dotenv` so the link line doesn't
-# end up with two copies of `_js_dotenv_*` symbols. Programs that
-# don't import dotenv pay nothing for this either way.
-bundled-dotenv = []
 
 # In-tree implementation of `lru-cache`. Default-on through
 # `default = ["full"]`; flipped to perry-ext-lru-cache by the
@@ -76,18 +68,17 @@ bundled-commander = []
 # perry-stdlib's per-tick bridge into it lives behind `external-fastify-pump`.
 http-server = ["dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes", "async-runtime"]
 
-# Web Fetch and Axios compatibility surface. The well-known flip can
-# strip this when the external binding owns the imported surface.
+# Web Fetch compatibility surface. The well-known flip can strip this
+# when the external binding owns the imported surface.
 # `bundled-streams` rides under the umbrella for backwards-compat
 # with v0.5.571's `--features http-client` callers (which got
 # `pub mod streams` transitively). The well-known flip strips
 # `bundled-streams` directly, and also strips `http-client` when
-# axios / node-fetch / http / https is imported through the
-# well-known table — both ends move in lockstep.
+# node-fetch / http / https is imported through the well-known
+# table — both ends move in lockstep.
 #
-# #5174: `http-client` decomposes into `web-fetch` (the Web Fetch API)
-# plus the Axios compatibility module. Node HTTP is provided only by
-# perry-ext-http.
+# #5174: `http-client` decomposes into `web-fetch` (the Web Fetch API).
+# Node HTTP is provided only by perry-ext-http.
 web-fetch = ["dep:reqwest", "async-runtime", "bundled-streams"]
 http-client = ["web-fetch"]
 
@@ -229,10 +220,9 @@ bundled-mongodb = ["dep:mongodb", "dep:bson", "dep:futures-util", "async-runtime
 # bindings so the well-known flip (#466 Phase 4 step 2) can route them
 # to perry-ext-bcrypt / perry-ext-argon2 without taking the rest of
 # the crypto surface offline.
-crypto = ["dep:sha2", "dep:sha1", "dep:sha3", "dep:shake", "dep:sha3_010", "dep:sha3-utils", "dep:rsa-sha1", "dep:md-5", "dep:hex", "dep:hmac", "dep:aes", "dep:aes_09", "dep:cbc", "dep:ecb", "dep:ctr", "dep:scrypt", "dep:pbkdf2", "dep:base64", "dep:x25519-dalek", "dep:x448", "dep:ed25519-dalek", "dep:ed448-goldilocks", "dep:aes-gcm", "dep:chacha20poly1305", "dep:ghash", "dep:aes-kw", "dep:hkdf", "dep:p256", "dep:p384", "dep:p521", "dep:x509-cert", "dep:ml-kem", "async-runtime", "ids", "bundled-bcrypt", "bundled-argon2", "bundled-jsonwebtoken", "bundled-ethers"]
+crypto = ["dep:sha2", "dep:sha1", "dep:sha3", "dep:shake", "dep:sha3_010", "dep:sha3-utils", "dep:rsa-sha1", "dep:md-5", "dep:hex", "dep:hmac", "dep:aes", "dep:aes_09", "dep:cbc", "dep:ecb", "dep:ctr", "dep:scrypt", "dep:pbkdf2", "dep:base64", "dep:x25519-dalek", "dep:x448", "dep:ed25519-dalek", "dep:ed448-goldilocks", "dep:aes-gcm", "dep:chacha20poly1305", "dep:ghash", "dep:aes-kw", "dep:hkdf", "dep:p256", "dep:p384", "dep:p521", "dep:rsa", "dep:spki", "dep:x509-cert", "dep:ml-kem", "async-runtime", "ids", "bundled-bcrypt", "bundled-argon2", "bundled-ethers"]
 bundled-bcrypt = ["dep:bcrypt", "async-runtime"]
 bundled-argon2 = ["dep:argon2", "async-runtime"]
-bundled-jsonwebtoken = ["dep:jsonwebtoken", "dep:p256", "dep:rsa", "dep:spki"]
 # ethers blockchain utilities — pure Rust, no extra deps. Default-on
 # through `crypto` umbrella; the well-known flip strips this and
 # routes to perry-ext-ethers when `import 'ethers'` is detected.
@@ -291,20 +281,13 @@ bundled-cron = ["dep:cron", "async-runtime"]
 rate-limit = ["bundled-ratelimit"]
 bundled-ratelimit = ["dep:governor", "async-runtime"]
 
-# Validation — `validation` umbrella stays for backwards-compat;
-# v0.5.538's well-known flip toggles `bundled-validator` instead.
-validation = ["bundled-validator"]
-bundled-validator = ["dep:perry-validation"]
 
-# UUID/nanoid — `ids` stays as the umbrella for backwards compat;
-# from v0.5.534 onwards the per-binding split (`bundled-uuid` /
-# `bundled-nanoid`) is what the well-known bindings flip (#466
-# Phase 4 step 2) toggles. Each sub-feature pulls in its own
-# optional dep + gates its own module so a wrapper port can strip
-# exactly one binding from perry-stdlib without affecting the other.
-ids = ["bundled-uuid", "bundled-nanoid"]
-bundled-uuid = ["dep:uuid"]
-bundled-nanoid = ["dep:nanoid"]
+# `ids` is now an empty umbrella kept only for backwards compat:
+# both members are gone — `bundled-uuid` with the uuid binding
+# (#10701) and `bundled-nanoid` with the nanoid binding (#10693).
+# Real `uuid` / `nanoid` now compile from npm source, so nothing
+# needs to be toggled here; enabling `ids` is a harmless no-op.
+ids = []
 
 # Async runtime (tokio) - internal feature
 async-runtime = ["dep:tokio"]
@@ -388,7 +371,6 @@ md-5 = { version = "0.11", optional = true }
 hex = { workspace = true, optional = true }
 hmac = { version = "0.13", optional = true }
 bcrypt = { version = "0.19", optional = true }
-jsonwebtoken = { workspace = true, optional = true }
 p256 = { version = "0.13", optional = true, default-features = false, features = ["pkcs8", "pem", "ecdsa", "ecdh"] }
 p384 = { version = "0.13", optional = true, default-features = false, features = ["pkcs8", "pem", "ecdsa", "ecdh"] }
 p521 = { version = "0.13", optional = true, default-features = false, features = ["pkcs8", "pem", "ecdsa", "ecdh"] }
@@ -444,11 +426,13 @@ cron = { version = "0.17", optional = true }
 governor = { version = "0.10", optional = true }
 
 # Validation
-perry-validation = { workspace = true, optional = true }
 
 # IDs
-uuid = { version = "1.23", features = ["v4", "v1", "v3", "v5", "v7"], optional = true }
-nanoid = { version = "0.5", optional = true }
+# Required unconditionally by crypto/random.rs (crypto.randomUUID /
+# randomUUID({ v7: true })), which has no feature gate of its own —
+# never optional, regardless of the bundled-uuid npm-binding feature
+# (removed; see #10678/#466).
+uuid = { version = "1.23", features = ["v4", "v1", "v3", "v5", "v7"] }
 
 # LRU Cache — optional from v0.5.539 so the well-known flip can
 # strip the perry-stdlib copy when `import 'lru-cache'` resolves

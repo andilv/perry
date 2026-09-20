@@ -1,6 +1,6 @@
 // Auto-generated from Perry's API manifest (#465). Do not edit by hand.
 // Source: perry-api-manifest::API_MANIFEST
-// Coverage: 2093 entries across 136 modules
+// Coverage: 2064 entries across 130 modules
 
 type PerryI8 = number & { readonly __perryI8?: never };
 type PerryI16 = number & { readonly __perryI16?: never };
@@ -255,44 +255,6 @@ declare module "async_hooks" {
   export function executionAsyncResource(...args: any[]): any;
   /** stdlib */
   export function triggerAsyncId(...args: any[]): any;
-}
-
-declare module "axios" {
-  /** stdlib */
-  export function all(...args: any[]): any;
-  /** stdlib */
-  export function create(...args: any[]): any;
-  /** stdlib */
-  function _delete(...args: any[]): any;
-  export { _delete as delete };
-  /** stdlib */
-  export function get(...args: any[]): any;
-  /** stdlib */
-  export function head(...args: any[]): any;
-  /** stdlib */
-  export function options(...args: any[]): any;
-  /** stdlib */
-  export function patch(...args: any[]): any;
-  /** stdlib */
-  export function post(...args: any[]): any;
-  /** stdlib */
-  export function put(...args: any[]): any;
-  /** stdlib */
-  export function request(...args: any[]): any;
-  /** stdlib */
-  const _default: ((...args: any[]) => any) & {
-    all: typeof all;
-    create: typeof create;
-    delete: typeof _delete;
-    get: typeof get;
-    head: typeof head;
-    options: typeof options;
-    patch: typeof patch;
-    post: typeof post;
-    put: typeof put;
-    request: typeof request;
-  };
-  export default _default;
 }
 
 declare module "bcrypt" {
@@ -1563,13 +1525,6 @@ declare module "domain" {
   export function createDomain(...args: any[]): any;
 }
 
-declare module "dotenv" {
-  /** stdlib */
-  export function config(...args: any[]): any;
-  /** stdlib */
-  export function parse(src: string): any;
-}
-
 declare module "ethers" {
   /** stdlib */
   export function formatEther(p0: any): string;
@@ -2096,15 +2051,6 @@ declare module "iovalkey" {
   export function createClient(...args: any[]): any;
 }
 
-declare module "jsonwebtoken" {
-  /** stdlib */
-  export function decode(token: string): any;
-  /** stdlib */
-  export function sign(payload: any, secret: string, options?: any, kid?: string): string;
-  /** stdlib */
-  export function verify(token: string, secret: string): any;
-}
-
 declare module "lodash" {
   /** stdlib */
   export function camelCase(p0: string): string;
@@ -2267,11 +2213,6 @@ declare module "mysql2/promise" {
   export function createConnection(p0: any): any;
   /** stdlib */
   export function createPool(p0: any): any;
-}
-
-declare module "nanoid" {
-  /** stdlib */
-  export function nanoid(size: number): string;
 }
 
 declare module "net" {
@@ -4371,23 +4312,6 @@ declare module "util/types" {
   export function isWeakSet(...args: any[]): any;
 }
 
-declare module "uuid" {
-  /** stdlib */
-  export function v1(): string;
-  /** stdlib */
-  export function v3(name: string, namespace: string): string;
-  /** stdlib */
-  export function v4(): string;
-  /** stdlib */
-  export function v5(name: string, namespace: string): string;
-  /** stdlib */
-  export function v7(): string;
-  /** stdlib */
-  export function validate(id: string): boolean;
-  /** stdlib */
-  export function version(id: string): number;
-}
-
 declare module "v8" {
   /** stdlib */
   export class DefaultDeserializer { [key: string]: any; }
@@ -4435,19 +4359,6 @@ declare module "v8" {
   export function takeCoverage(...args: any[]): any;
   /** stdlib */
   export function writeHeapSnapshot(...args: any[]): any;
-}
-
-declare module "validator" {
-  /** stdlib */
-  export function isEmail(s: string): boolean;
-  /** stdlib */
-  export function isEmpty(s: string): boolean;
-  /** stdlib */
-  export function isJSON(s: string): boolean;
-  /** stdlib */
-  export function isURL(s: string): boolean;
-  /** stdlib */
-  export function isUUID(s: string): boolean;
 }
 
 declare module "vm" {

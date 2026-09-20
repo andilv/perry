@@ -36,61 +36,6 @@
 # requires every ext crate and package mapping to have an explicit decision
 # (#5716).
 
-[bindings.dotenv]
-crate = "perry-ext-dotenv"
-# Library file name without the `lib` prefix or `.a` extension.
-# Cargo derives this from the crate name by replacing `-` with `_`,
-# but stating it explicitly here is documentation for humans
-# inspecting the table.
-lib = "perry_ext_dotenv"
-# Tracking issue for the migration; surfaced in error messages
-# when the bundled .a is missing at link time.
-tracking = "#466"
-# `compat` — how faithful this wrapper is to the npm package's public
-# API (see `BindingCompat` in well_known.rs). `full` = audited complete
-# drop-in, safe to auto-prefer over an on-disk node_modules copy.
-# ABSENT ⇒ conservative `partial` default. dotenv remains partial: this
-# wrapper has `config()` / `parse()`, but not the upstream decrypt/populate/
-# configDotenv surface and option/error semantics.
-compat = "partial"
-
-[bindings.dotenv.upstream]
-version = "17.4.2"
-sha256 = "8648852be8209110b34dca75dcc3ed12ce7fae9fcc8edd1ef9e180e708af1398"
-repo = "https://github.com/motdotla/dotenv"
-ref = "a61f616a3160bb6e6f22ff55f08b7eba3a3fab68"
-ported-at = "17.4.2"
-date = "2026-07-30"
-[bindings.nanoid]
-crate = "perry-ext-nanoid"
-lib = "perry_ext_nanoid"
-tracking = "#466"
-# Partial: the wrapper covers nanoid + custom alphabets, but not the complete
-# upstream export set and flattens the curried customAlphabet contract.
-compat = "partial"
-
-[bindings.nanoid.upstream]
-version = "6.0.0"
-sha256 = "5cade80a39ccf4fd174c8e412eca13accfce36c9c2a0982b4ea23403d729a8d8"
-repo = "https://github.com/ai/nanoid"
-ref = "4dacb107b54ffd0e1abfe91b7ef452e0fd5a8e12"
-ported-at = "6.0.0"
-date = "2026-07-30"
-[bindings.uuid]
-crate = "perry-ext-uuid"
-lib = "perry_ext_uuid"
-tracking = "#466"
-# Partial: several upstream exports and input forms are absent (including
-# parse/stringify and newer conversion/constants APIs).
-compat = "partial"
-
-[bindings.uuid.upstream]
-version = "14.0.1"
-sha256 = "e062c57ed120ea135478f305da04802bf69eab23fbc0ca2bae6989b6855390c4"
-repo = "https://github.com/uuidjs/uuid"
-ref = "70177807e9229dfacde2038dc1e722f1828f358a"
-ported-at = "14.0.1"
-date = "2026-07-30"
 [bindings.qs]
 crate = "perry-ext-qs"
 lib = "perry_ext_qs"
@@ -130,30 +75,6 @@ sha256 = "4acffbd5e5a87fe8fad926afc9a9ac450d69b7082686dd2836be0d8309dbd8aa"
 repo = "https://github.com/ranisalt/node-argon2"
 ref = "786de7152f95881b0683aea1d2ca60ed0d6d9e2f"
 ported-at = "0.45.1"
-date = "2026-07-30"
-[bindings.jsonwebtoken]
-crate = "perry-ext-jsonwebtoken"
-lib = "perry_ext_jsonwebtoken"
-tracking = "#466"
-
-[bindings.jsonwebtoken.upstream]
-version = "9.0.3"
-sha256 = "d9af2628a7a4dda25acf1e19c7ecc2468e1e9e8d4619fe2cae829e89d96f6b82"
-repo = "https://github.com/auth0/node-jsonwebtoken"
-ref = "ed59e76ea37a80f54b833668c02a5271984dcba3"
-ported-at = "9.0.3"
-date = "2026-07-30"
-[bindings.validator]
-crate = "perry-ext-validator"
-lib = "perry_ext_validator"
-tracking = "#466"
-
-[bindings.validator.upstream]
-version = "13.15.35"
-sha256 = "f9a6b506bd9eda8df9d2a4120613426948d9f66cde1b6d5fad3406758d2f81f4"
-repo = "https://github.com/validatorjs/validator.js"
-ref = "7a8079709cd4cb27b2a1846e6f6508d68c9d928f"
-ported-at = "13.15.35"
 date = "2026-07-30"
 [bindings.lru-cache]
 crate = "perry-ext-lru-cache"
@@ -241,18 +162,6 @@ sha256 = "2ede00f3e458fa991d304dd8a1fed812d686ac5d213c1d6704963c3674913526"
 repo = "https://github.com/coveooss/exponential-backoff"
 ref = "5622170828bd91dc149585bfa3d82c8972a75ac5"
 ported-at = "3.1.3"
-date = "2026-07-30"
-[bindings.axios]
-crate = "perry-ext-axios"
-lib = "perry_ext_axios"
-tracking = "#466"
-
-[bindings.axios.upstream]
-version = "1.19.0"
-sha256 = "a511049fdaec40a320368b3ee965079b3e14481f82d052584f746bbdc3f01ede"
-repo = "https://github.com/axios/axios"
-ref = "311fcc5c8d989b7248f05d390bb83bfbfb009977"
-ported-at = "1.19.0"
 date = "2026-07-30"
 [bindings.events]
 crate = "perry-ext-events"

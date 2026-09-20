@@ -2,7 +2,7 @@
 
 This page is auto-generated from Perry's compile-time API manifest (`perry-api-manifest::API_MANIFEST`). It is the source of truth for what `perry compile` accepts; references to symbols not listed here produce `R005 UnimplementedApi` (issue #463). Stubs (#464) are flagged ⚠ — they link cleanly but no-op at runtime on the chosen target.
 
-Total: 3035 entries across 138 modules.
+Total: 3006 entries across 132 modules.
 
 ## Modules
 
@@ -22,7 +22,6 @@ Total: 3035 entries across 138 modules.
 - [`assert`](#assert)
 - [`assert/strict`](#assertstrict)
 - [`async_hooks`](#async_hooks)
-- [`axios`](#axios)
 - [`bcrypt`](#bcrypt)
 - [`better-sqlite3`](#better-sqlite3)
 - [`bignumber.js`](#bignumberjs)
@@ -48,7 +47,6 @@ Total: 3035 entries across 138 modules.
 - [`dns`](#dns)
 - [`dns/promises`](#dnspromises)
 - [`domain`](#domain)
-- [`dotenv`](#dotenv)
 - [`ethers`](#ethers)
 - [`events`](#events)
 - [`exponential-backoff`](#exponential-backoff)
@@ -64,7 +62,6 @@ Total: 3035 entries across 138 modules.
 - [`inspector/promises`](#inspectorpromises)
 - [`ioredis`](#ioredis)
 - [`iovalkey`](#iovalkey)
-- [`jsonwebtoken`](#jsonwebtoken)
 - [`lodash`](#lodash)
 - [`lru-cache`](#lru-cache)
 - [`module`](#module)
@@ -72,7 +69,6 @@ Total: 3035 entries across 138 modules.
 - [`mongodb`](#mongodb)
 - [`mysql2`](#mysql2)
 - [`mysql2/promise`](#mysql2promise)
-- [`nanoid`](#nanoid)
 - [`net`](#net)
 - [`node-cron`](#node-cron)
 - [`node-fetch`](#node-fetch)
@@ -136,9 +132,7 @@ Total: 3035 entries across 138 modules.
 - [`url`](#url)
 - [`util`](#util)
 - [`util/types`](#utiltypes)
-- [`uuid`](#uuid)
 - [`v8`](#v8)
-- [`validator`](#validator)
 - [`vm`](#vm)
 - [`wasi`](#wasi)
 - [`worker_threads`](#worker_threads)
@@ -344,22 +338,6 @@ Total: 3035 entries across 138 modules.
 
 - `asyncWrapProviders`
 - `default`
-
-## `axios`
-
-### Methods
-
-- `all` — module
-- `create` — module
-- `default` — module
-- `delete` — module
-- `get` — module
-- `head` — module
-- `options` — module
-- `patch` — module
-- `post` — module
-- `put` — module
-- `request` — module
 
 ## `bcrypt`
 
@@ -1349,13 +1327,6 @@ Total: 3035 entries across 138 modules.
 - `active`
 - `members`
 
-## `dotenv`
-
-### Methods
-
-- `config` — module
-- `parse` — module
-
 ## `ethers`
 
 ### Methods
@@ -2012,14 +1983,6 @@ Total: 3035 entries across 138 modules.
 
 - `createClient` — module
 
-## `jsonwebtoken`
-
-### Methods
-
-- `decode` — module
-- `sign` — module
-- `verify` — module
-
 ## `lodash`
 
 ### Methods
@@ -2209,12 +2172,6 @@ Total: 3035 entries across 138 modules.
 - `query` — instance
 - `release` — instance
 - `rollback` — instance
-
-## `nanoid`
-
-### Methods
-
-- `nanoid` — module
 
 ## `net`
 
@@ -3926,18 +3883,6 @@ Total: 3035 entries across 138 modules.
 - `isWeakMap` — module
 - `isWeakSet` — module
 
-## `uuid`
-
-### Methods
-
-- `v1` — module
-- `v3` — module
-- `v4` — module
-- `v5` — module
-- `v7` — module
-- `validate` — module
-- `version` — module
-
 ## `v8`
 
 ### Classes
@@ -3995,16 +3940,6 @@ Total: 3035 entries across 138 modules.
 
 - `promiseHooks`
 - `startupSnapshot`
-
-## `validator`
-
-### Methods
-
-- `isEmail` — module
-- `isEmpty` — module
-- `isJSON` — module
-- `isURL` — module
-- `isUUID` — module
 
 ## `vm`
 

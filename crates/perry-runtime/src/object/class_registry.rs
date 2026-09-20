@@ -53,7 +53,8 @@ pub mod decl_prototype_table;
 mod dispatch;
 pub(crate) mod evaluation_heritage;
 pub(crate) use evaluation_heritage::{
-    active_class_evaluation_parent, is_self_heritage_value, push_active_class_evaluation,
+    active_class_evaluation_parent, instance_pinned_constructing_class, is_self_heritage_value,
+    pin_instance_constructing_class, push_active_class_evaluation,
 };
 mod function_prototype;
 mod gc_roots;
@@ -201,9 +202,9 @@ pub use registration::{
 #[cfg(test)]
 pub(crate) use dispatch::test_bump_vtable_generation;
 pub(crate) use dispatch::{
-    call_vtable_method, call_vtable_method_with_private_brand, fetch_parent_kind_in_chain,
-    obj_dispatch_ic_insert, obj_dispatch_ic_lookup, vtable_generation, vtable_ic_insert,
-    vtable_ic_lookup, VTABLE_GEN,
+    call_vtable_method, call_vtable_method_with_private_brand, class_lookup_surface_gen_bump,
+    class_lookup_surface_generation, fetch_parent_kind_in_chain, obj_dispatch_ic_insert,
+    obj_dispatch_ic_lookup, vtable_generation, vtable_ic_insert, vtable_ic_lookup, VTABLE_GEN,
 };
 
 // ── parent_static.rs ────────────────────────────────────────────────────────
@@ -217,8 +218,8 @@ pub(crate) use parent_static::{
     class_own_symbol_method, class_private_instance_getter_value,
     class_private_instance_setter_apply, class_static_accessor_getter_value,
     class_static_accessor_setter_apply, class_symbol_getter_value, class_symbol_setter_apply,
-    get_parent_class_id, lookup_class_symbol_method_in_chain, lookup_static_method_in_chain,
-    register_class, register_class_dynamic_static_accessor,
+    dynamic_value_class_id, get_parent_class_id, lookup_class_symbol_method_in_chain,
+    lookup_static_method_in_chain, register_class, register_class_dynamic_static_accessor,
 };
 pub use parent_static::{
     is_class_object_ptr, is_class_object_value, is_registered_class_prototype_object,

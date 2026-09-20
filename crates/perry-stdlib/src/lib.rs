@@ -6,7 +6,7 @@
 //! # Features
 //! - `core` - Minimal runtime (always included)
 //! - `http-server` - Native HTTP server (hyper-based)
-//! - `http-client` - Web Fetch and Axios compatibility surface
+//! - `http-client` - Web Fetch compatibility surface
 //! - `database` - All databases (postgres, mysql, sqlite, redis, mongodb)
 //! - `crypto` - Cryptographic functions
 //! - `compression` - zlib compression
@@ -51,8 +51,6 @@ pub mod decimal;
 // without duplicate _js_dotenv_* symbols at link time. Default-on
 // preserves byte-identical behavior for programs that don't opt into
 // the well-known path.
-#[cfg(feature = "bundled-dotenv")]
-pub mod dotenv;
 // events feature-gated as of v0.5.546 so the well-known flip
 // can route to perry-ext-events.
 #[cfg(feature = "bundled-events")]
@@ -101,8 +99,6 @@ pub use dayjs::*;
 #[cfg(feature = "bundled-decimal")]
 pub use decimal::*;
 pub use domain::*;
-#[cfg(feature = "bundled-dotenv")]
-pub use dotenv::*;
 #[cfg(feature = "bundled-events")]
 pub use events::*;
 #[cfg(feature = "bundled-exponential-backoff")]
@@ -182,12 +178,6 @@ pub use fetch::*;
 pub mod fetch_blob;
 #[cfg(feature = "web-fetch")]
 pub use fetch_blob::*;
-
-// === Axios compatibility surface ===
-#[cfg(feature = "http-client")]
-pub mod axios;
-#[cfg(feature = "http-client")]
-pub use axios::*;
 
 // === Web Streams API (issue #237) ===
 // Per-binding gate (v0.5.572): `bundled-streams` is the only flag
@@ -340,14 +330,9 @@ pub mod argon2;
 #[cfg(feature = "bundled-argon2")]
 pub use argon2::*;
 
-// jsonwebtoken split out into `bundled-jsonwebtoken` (v0.5.538)
 // for the same reason as bcrypt/argon2 — well-known flip
 // independence. The `crypto` umbrella still pulls it in for
 // backwards compat.
-#[cfg(feature = "bundled-jsonwebtoken")]
-pub mod jsonwebtoken;
-#[cfg(feature = "bundled-jsonwebtoken")]
-pub use jsonwebtoken::*;
 
 #[cfg(feature = "crypto")]
 pub mod crypto_e2e;
@@ -412,32 +397,12 @@ pub mod ratelimit;
 #[cfg(feature = "bundled-ratelimit")]
 pub use ratelimit::*;
 
-// === Validation ===
-// `validation` umbrella now expands to `bundled-validator`
-// (v0.5.538). Per-binding gate lets the well-known flip swap the
-// validator wrapper out without affecting the rest of the
-// validation surface (none — there's just the one wrapper today,
-// but the split unblocks future additions).
-#[cfg(feature = "bundled-validator")]
-pub mod validator;
-#[cfg(feature = "bundled-validator")]
-pub use validator::*;
-
 // === IDs ===
-// `bundled-uuid` / `bundled-nanoid` (v0.5.534) replace the old
-// `ids` umbrella so the well-known flip (#466 Phase 4) can toggle
-// each binding independently. The umbrella stays as
-// `ids = ["bundled-uuid", "bundled-nanoid"]` so existing
-// `--features ids` callers keep working byte-identically.
-#[cfg(feature = "bundled-uuid")]
-pub mod uuid;
-#[cfg(feature = "bundled-uuid")]
-pub use uuid::*;
-
-#[cfg(feature = "bundled-nanoid")]
-pub mod nanoid;
-#[cfg(feature = "bundled-nanoid")]
-pub use nanoid::*;
+// Nothing left to gate: `bundled-uuid` went with the uuid binding
+// (#10701) and `bundled-nanoid` with the nanoid binding (#10693);
+// real `uuid` / `nanoid` now compile from npm source. The `ids`
+// umbrella stays (empty) in Cargo.toml so existing
+// `--features ids` callers keep working.
 
 // === Container Module ===
 #[cfg(feature = "container")]
