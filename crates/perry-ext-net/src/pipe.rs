@@ -54,7 +54,11 @@ const TAG_FALSE_BITS: u64 = 0x7FFC_0000_0000_0003;
 extern "C" {
     fn js_dynamic_object_get_property(
         obj_value: f64,
-        property_name_ptr: *const i8,
+        // `c"…".as_ptr()` yields `*const c_char`, whose signedness is
+        // target-defined (`i8` on x86_64, `u8` on aarch64/arm) — declare
+        // the parameter as `c_char`, not a hardcoded `i8`, or every ARM
+        // target fails E0308 at this declaration's call sites.
+        property_name_ptr: *const std::ffi::c_char,
         property_name_len: usize,
     ) -> f64;
     fn js_implicit_this_set(value: f64) -> f64;
