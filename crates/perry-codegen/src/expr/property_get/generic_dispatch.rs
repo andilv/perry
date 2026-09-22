@@ -147,7 +147,22 @@ pub(crate) fn lower_generic_property_get(
     let key_handle_global = format!("@{}", ctx.strings.entry(key_idx).handle_global);
     let blk = ctx.block();
     let obj_bits = blk.bitcast_double_to_i64(&obj_box);
-    let obj_handle = blk.and(I64, &obj_bits, POINTER_MASK_I64);
+    // The receiver handle. For every key but `.length` the tag test below is
+    // the EXACT `POINTER_TAG` test, and then the handle is `bits ^ POINTER_TAG`
+    // rather than `bits & POINTER_MASK`: the two are the same value on the
+    // pointer path (the xor clears exactly the sixteen tag bits the test just
+    // proved equal to the tag) and the xor is the value the tag test is
+    // computed FROM, so the unmask costs nothing on top of it — where the
+    // `and` form was a `mov $0x30, %al; bzhi` pair after the compare, on
+    // every read. Every use of the handle is dominated by the tag test's true
+    // edge, which is what makes the xor a valid unmask. `.length` keeps the
+    // mask: its test admits STRING-tagged receivers too, and for those the
+    // xor would leave the tag's low bits set.
+    let obj_handle = if property == "length" {
+        blk.and(I64, &obj_bits, POINTER_MASK_I64)
+    } else {
+        blk.xor(I64, &obj_bits, crate::nanbox::POINTER_TAG_I64)
+    };
     // The key handle is materialised per consumer (see `emit_key_handle`), all
     // of which are cold. The one exception is the typed-feedback OBSERVE call,
     // which sits in the hot `pget.pic` block — so under `--typed-feedback` the
@@ -192,31 +207,34 @@ pub(crate) fn lower_generic_property_get(
         return Ok(val);
     }
 
-    // # Inline hit, two exits (T1)
+    // # Inline hit, two exits (T1); the hit is tag test -> shape compare -> load
     //
     // What stays inline below is exactly the hit: the receiver-tag test, the
-    // small-handle test, the packed header kind/descriptor word, the compact
-    // MRU compare, the overflow-bit test, the raw slot load with its hole
-    // check, and the bounded polymorphic ways. EVERY other arm this tower used
-    // to expand — the SSO receiver, the INT32 class ref, the nullish throw, the
-    // non-object receiver, the overflow load, the deleted-slot miss, the two
-    // Array-subclass named-prefix ladders, and the miss+prime — is now a branch
-    // to one of TWO calls that reproduce them in the same order:
-    // `js_object_get_field_ic_nonptr` for a receiver that is not a heap
-    // pointer, `js_object_get_field_ic_slow` for one that is. The split is not
-    // cosmetic — see `pget.recv_other` below for the +4 instructions per HIT
-    // that a single shared exit cost.
+    // small-handle test, the compact MRU word compared against the receiver's
+    // ShapeId, the raw slot load, and the bounded polymorphic ways. EVERY
+    // other arm this tower used to expand — the SSO receiver, the INT32 class
+    // ref, the nullish throw, the non-object receiver, the overflow load, the
+    // deleted-slot miss, the two Array-subclass named-prefix ladders, and the
+    // miss+prime — is now a branch to one of TWO calls that reproduce them in
+    // the same order: `js_object_get_field_ic_nonptr` for a receiver that is
+    // not a heap pointer, `js_object_get_field_ic_slow` for one that is. The
+    // split is not cosmetic — see `pget.recv_other` below for the +4
+    // instructions per HIT that a single shared exit cost.
+    //
+    // The ShapeId compare is the whole receiver classification. Five guards
+    // that used to sit between the small-handle test and the load are gone
+    // because the fact each one tested is now a function of the ShapeId word:
+    // "is this site primed?" and the overflow-bit test (#10833: an unprimed
+    // word is `PACKED_GET_EMPTY`, a spill entry is flipped out of the ShapeId
+    // range), the GC-kind load (#10828, rule 3), the descriptor flag (#10824,
+    // rule 1) and the `TAG_HOLE` compare (#10826: delete is a shape
+    // transition). Each is argued at the point where it used to be emitted.
     //
     // The arms were not cheap to keep: ~37 basic blocks, ~177 pre-RS4GC IR
     // instructions and 6-7 call sites per site, each call a statepoint whose
     // live GC values are written into `.perry_gcmap`. On @babel/parser the
-    // tower was 29% of all emitted IR across 6,487 sites. It is also not a
-    // trade against the fast path: the hit sequence below is instruction for
-    // instruction what it was, with ONE deliberate difference — the
-    // overflow-bit test is spelled `== 0` with its successors swapped, so the
-    // guard-passing edge is the true edge like every other link in the chain
-    // (see `pic.hit` below) — and the ways still resolve `PIC_WAYS + 1` shapes
-    // without a call.
+    // tower was 29% of all emitted IR across 6,487 sites. The ways still
+    // resolve `PIC_WAYS + 1` shapes without a call.
     //
     // Issue #70/#73/#128: guard against non-pointer receivers
     // before the PIC deref. Tag-based check on the unmasked
@@ -281,7 +299,11 @@ pub(crate) fn lower_generic_property_get(
         let obj_tag_masked = ctx.block().and(I64, &obj_tag, "65533"); // 0xFFFD
         ctx.block().icmp_eq(I64, &obj_tag_masked, "32765") // 0x7FFD
     } else {
-        ctx.block().icmp_eq(I64, &obj_tag, "32765") // POINTER_TAG exactly
+        // `(bits ^ POINTER_TAG) >> 48 == 0` is `bits >> 48 == 0x7FFD`, spelled
+        // on the value the pointer path then uses as its handle (see
+        // `obj_handle` above), so the unmask is folded into the test.
+        let xor_tag = ctx.block().lshr(I64, &obj_handle, "48");
+        ctx.block().icmp_eq(I64, &xor_tag, "0")
     };
 
     // `.length` on a receiver whose static type is not a proven string.
@@ -470,8 +492,6 @@ pub(crate) fn lower_generic_property_get(
     // LLVM if-converts a flat predicate, so every receiver paid every load and
     // every compare even after the very first one had already decided the
     // answer.
-    let hdr_idx = ctx.new_block("pic.recv_hdr");
-    let hdr_label = ctx.block_label(hdr_idx);
     let tok_idx = ctx.new_block("pic.token");
     let tok_label = ctx.block_label(tok_idx);
     let hit_idx = ctx.new_block("pic.hit");
@@ -481,132 +501,102 @@ pub(crate) fn lower_generic_property_get(
     // the hit path pays a `jmp` to the survivor instead of falling through.
     let hit_live_idx =
         crate::expr::typed_feedback_emission_enabled().then(|| ctx.new_block("pic.hit.live"));
-    // The hole edge gets its own landing block, as it did before T1. Note what
-    // that does and does not buy, measured: `pic.hit.inline` and `pic.way.load`
-    // end in the same three instructions (bitcast, TAG_HOLE compare, branch),
-    // and SimplifyCFG folds this block and `pic.way.live` away, so the two
-    // tails end up congruent and get merged anyway — the hit still reaches the
-    // shared tail by a `jmp`, and removing this block changed the 10M-read
-    // monomorphic loop by exactly 0 instructions. It is kept because it keeps
-    // the emitted hole edge structurally distinct from the way path's, which is
-    // the shape every reader of this tower since #9287 expects; the remaining
-    // jump needs branch weights (`!prof`) to fix, which the IR builder has no
-    // way to emit today.
-    let deleted_idx = ctx.new_block("pic.hit.deleted");
     let miss_idx = ctx.new_block("pic.miss");
     let hit_label = ctx.block_label(hit_idx);
-    let deleted_label = ctx.block_label(deleted_idx);
     let miss_label = ctx.block_label(miss_idx);
     // Small-handle receivers (native-module registry ids) must never be
     // dereferenced. Pre-#7883 they were kept out of the loads by selecting a
     // sentinel address and AND-ing `is_real_ptr` into `hit`; the branch does
     // the same job without putting a `select` (and the sentinel's address
     // materialisation) in front of every real object read.
-    ctx.block().cond_br(&is_real_ptr, &hdr_label, &cold_label);
-    ctx.current_block = hdr_idx;
-
-    // The compact cache is a permanently valid scalar global. Load it before
-    // receiver-dependent shape probing so its latency overlaps header reads.
-    let packed_word = ctx.block().load_atomic_monotonic(I64, &packed_ref, 8);
-
-    // GcHeader starts with obj_type:u8, gc_flags:u8, reserved:u16. On
-    // known little-endian targets one load tests both kind and descriptors;
-    // other targets retain byte/halfword loads with native endianness.
-    let gc_type_addr = ctx.block().sub(I64, &obj_handle, "8");
-    let gc_type_ptr = ctx.block().inttoptr(I64, &gc_type_addr);
-    let packed_header = matches!(
-        ctx.target_triple.split('-').next().unwrap_or(""),
-        "aarch64" | "arm64" | "arm64_32" | "x86_64" | "i686" | "i386" | "riscv64" | "wasm32"
-    )
-    .then(|| ctx.block().load(I32, &gc_type_ptr));
-    // The separate kind BYTE is needed only by the native-endian descriptor
-    // guard and by the Map/Set split. With the packed header word the kind is
-    // already inside it, so materialising the byte anyway would leave a dead
-    // `trunc` on every hit.
-    let gc_type =
-        (inline_collection_size || packed_header.is_none()).then(|| match &packed_header {
-            Some(word) => ctx.block().trunc(I32, word, I8),
-            None => ctx.block().load(I8, &gc_type_ptr),
-        });
-
-    // `MapHeader` and `SetHeader` both begin with `size: u32`. A native
-    // collection is not an ObjectHeader and can never hit this PIC, so split
-    // it off immediately after the already-required GC-kind load. The generic
-    // miss handler recognizes the same two kinds before ordinary object
-    // lookup; this only removes that repeated classification and call ladder.
+    // # No GC-header load, no descriptor-flag test: the ShapeId compare is
+    // the receiver classification
+    //
+    // Between the small-handle test and the ShapeId compare this tower used
+    // to load the `GcHeader` word at `receiver - 8` and require
+    // `obj_type == GC_TYPE_OBJECT` with `OBJ_FLAG_HAS_DESCRIPTORS` clear
+    // (#72, #6080): a packed `i32` load, a 4-byte immediate `and`, a compare
+    // and a branch on every hit, plus an endianness split in the emitter.
+    // Both facts are now carried by the ShapeId word itself, so the compare
+    // below proves them and the load is gone. The argument, each part held
+    // by another lane's tests:
+    //
+    // * **Kind** (#10828, rule 3): for any POINTER-tagged value that passes
+    //   the receiver-tag test, the u32 at payload `+4` equals a live object
+    //   ShapeId only if the cell is a `GC_TYPE_OBJECT` carrying that shape.
+    //   Every other GC kind's `+4` word is a count bounded below the ShapeId
+    //   floor in release at its allocation funnel, a structurally small
+    //   value, or (for `DateCell`) was moved. `object/shape_rule3.rs` walks
+    //   all 21 kinds and asserts the fence-keeping set is empty. This is why
+    //   the tag test above is the EXACT `POINTER_TAG` test and not the
+    //   collapsed pointer-or-string one (#10833): a heap string's `+4` is
+    //   its `StringHeader`, and #10828's guarantee is stated over
+    //   POINTER-tagged values.
+    // * **Descriptors** (#10824, rule 1): every descriptor install, per-key
+    //   removal and bulk clear on an ordinary object transitions its ShapeId
+    //   (the last gaps — `clear_object_descriptors` and seven raw table
+    //   `remove()` calls outside `descriptor_state.rs` — are closed). A site
+    //   primed on a plain data slot therefore cannot match the receiver once
+    //   `defineProperty` has converted that key to a getter: the receiver's
+    //   `+4` word changed. The prime side (`get_field_ic_miss_impl`) refuses
+    //   a descriptor-bearing receiver, so no cached word names a shape whose
+    //   slot the descriptor tables might override; the one exception, the
+    //   Array-subclass named-prefix proof, carries its own per-key data-only
+    //   proof for the slot it publishes.
+    // * **Unstamped receivers** (#10824, rule 2): nothing but the shape
+    //   allocator mints into the ShapeId range — synthetic class ids started
+    //   AT the floor and moved to `[0xC000_0000, 0xFFFF_0000)` — so a
+    //   receiver still carrying `parent_class_id` at `+4` cannot match a
+    //   primed word. "Is this site primed?" is not asked either: the word is
+    //   born holding `PACKED_GET_EMPTY`, which no `+4` word can equal.
+    //
+    // `.size` is the one key that still reads the header byte here, and only
+    // to serve a native Map/Set — whose `size` is their leading `u32` — from
+    // its own arm; the byte is NOT consulted for the object path. A receiver
+    // that is neither takes the ShapeId compare exactly like every other key.
     let collection_size_idx = inline_collection_size.then(|| {
+        let kind_idx = ctx.new_block("pget.collection_kind");
+        let kind_label = ctx.block_label(kind_idx);
         let collection_idx = ctx.new_block("pget.collection_size");
         let collection_label = ctx.block_label(collection_idx);
-        let object_check_idx = ctx.new_block("pic.recv_object_check");
-        let object_check_label = ctx.block_label(object_check_idx);
-        let kind = gc_type
-            .clone()
-            .expect("the GC-kind byte is materialised whenever `.size` is inlined");
-        let is_map = ctx.block().icmp_eq(I8, &kind, "8"); // GC_TYPE_MAP
-        let is_set = ctx.block().icmp_eq(I8, &kind, "12"); // GC_TYPE_SET
+        ctx.block().cond_br(&is_real_ptr, &kind_label, &cold_label);
+        ctx.current_block = kind_idx;
+        // `GcHeader` starts with `obj_type: u8`, at offset 0 of the header on
+        // every target, so this is one byte load whatever the byte order.
+        let gc_type_addr = ctx.block().sub(I64, &obj_handle, "8");
+        let gc_type_ptr = ctx.block().inttoptr(I64, &gc_type_addr);
+        let gc_type = ctx.block().load(I8, &gc_type_ptr);
+        let is_map = ctx.block().icmp_eq(I8, &gc_type, "8"); // GC_TYPE_MAP
+        let is_set = ctx.block().icmp_eq(I8, &gc_type, "12"); // GC_TYPE_SET
         let is_collection = ctx.block().or(I1, &is_map, &is_set);
         ctx.block()
-            .cond_br(&is_collection, &collection_label, &object_check_label);
-        ctx.current_block = object_check_idx;
+            .cond_br(&is_collection, &collection_label, &tok_label);
         collection_idx
     });
-
-    // Closures and RegExp values have distinct GC kinds. Every
-    // `GC_TYPE_OBJECT` payload is therefore an ObjectHeader and its ShapeId is
-    // the remaining exact layout discriminator.
-    //
-    // #6080: a receiver that has ever had a property/accessor descriptor
-    // installed (`Object.defineProperty`) needs descriptor-aware dispatch —
-    // an accessor must fire on reads, a non-writable slot must reject stores.
-    // The PIC hit path is a raw slot load: if the site was primed on a plain
-    // data property and `defineProperty` later converts that key to a getter
-    // (or a different descriptor), `keys_array` is unchanged, so the stale
-    // hit path would return the raw slot and bypass the getter entirely.
-    // OBJ_FLAG_HAS_DESCRIPTORS is bit 11 of reserved (bit 27 of the
-    // little-endian header word). Ignore gc_flags and every other flag.
-    // A descriptor-bearing receiver leaves for the slow exit, which keeps the
-    // Array-subclass named-prefix proof that used to be a second inline ladder
-    // here: it is the one case where an unrelated `length` descriptor must not
-    // make every declared field permanently generic.
-    let is_plain_kind = if let Some(word) = &packed_header {
-        let kind_and_desc = ctx.block().and(I32, word, "134217983"); // 0x080000ff
-        ctx.block().icmp_eq(I32, &kind_and_desc, "2")
-    } else {
-        let kind = gc_type
-            .as_ref()
-            .expect("the GC-kind byte is materialised on native-endian targets");
-        let is_object_kind = ctx.block().icmp_eq(I8, kind, "2");
-        let reserved_addr = ctx.block().sub(I64, &obj_handle, "6");
-        let reserved_ptr = ctx.block().inttoptr(I64, &reserved_addr);
-        let reserved = ctx.block().load(crate::types::I16, &reserved_ptr);
-        let has_desc = ctx.block().and(crate::types::I16, &reserved, "2048");
-        let no_desc = ctx.block().icmp_eq(crate::types::I16, &has_desc, "0");
-        ctx.block().and(I1, &is_object_kind, &no_desc)
-    };
-    // Validate kind and descriptor policy before reading ObjectHeader's
-    // ShapeId. "Is this site primed?" is NOT asked here any more: the compact
-    // word's unprimed value is `PACKED_GET_EMPTY`, which no receiver ShapeId
-    // word can equal, so the ShapeId compare below answers it. Folding the old
-    // `packed != 0` test in here also violated this tower's own rule — it was
-    // the one place where two guards were AND-ed into a flat predicate instead
-    // of branching out on the first failure (#7883), and it cost the `test`
-    // and the branch on every hit.
-    ctx.block().cond_br(&is_plain_kind, &tok_label, &cold_label);
+    if collection_size_idx.is_none() {
+        ctx.block().cond_br(&is_real_ptr, &tok_label, &cold_label);
+    }
     ctx.current_block = tok_idx;
+
+    // The compact cache is a permanently valid scalar global; its load and
+    // the receiver's ShapeId load below are independent, so they overlap.
+    let packed_word = ctx.block().load_atomic_monotonic(I64, &packed_ref, 8);
 
     // The receiver token is derived solely from its authoritative ShapeId.
     // Invalid/unstamped payloads miss closed.
     // #8113: the ShapeId word moved from header offset 8 to 4.
     let pcid_addr = ctx.block().add(I64, &obj_handle, "4");
     let pcid_ptr = ctx.block().inttoptr(I64, &pcid_addr);
+    // The hot ShapeId load has exactly ONE use: the compare. The two cold
+    // consumers of the same word — the spill compare in `pic.token.miss` and
+    // the way token in `pic.ways` — read it AGAIN there, through an atomic
+    // load that GVN will not merge with this one. That is a deliberate
+    // re-derivation on the miss path (one load, on a path that is about to
+    // spend hundreds), and it is what lets isel fold this load into the
+    // compare itself: `cmp %ecx, 4(%rdi)` instead of a `mov` and a `cmp`,
+    // one instruction fewer on every hit. With the word live into the cold
+    // blocks it had to sit in a register.
     let pcid = ctx.block().load(I32, &pcid_ptr);
-    let pcid64 = ctx.block().zext(I32, &pcid, I64);
-    // pic_prime_get is the only production writer of get-cache tokens and
-    // refuses the zero-ShapeId token. All remaining tokens carry a valid,
-    // never-reused ShapeId; vacant entries are zero. Equality therefore
-    // proves a nonzero stamp without another check on every property read.
-    // Keyless Object.create(proto) receivers still miss and walk prototypes.
-    let token = ctx.block().or(I64, &pcid64, "4611686018427387904");
 
     // A nonzero packed word contains a valid ShapeId and its slot. The
     // header guard above rejects a fresh site; matching the low 32 bits then
@@ -619,6 +609,15 @@ pub(crate) fn lower_generic_property_get(
         .cond_br(&token_eq, &hit_label, &token_miss_label);
 
     ctx.current_block = token_miss_idx;
+    // The cold re-read of the ShapeId word — see the hot load above.
+    let pcid = ctx.block().load_atomic_monotonic(I32, &pcid_ptr, 4);
+    let pcid64 = ctx.block().zext(I32, &pcid, I64);
+    // pic_prime_get is the only production writer of get-cache tokens and
+    // refuses the zero-ShapeId token. All remaining tokens carry a valid,
+    // never-reused ShapeId; vacant entries are zero. Equality therefore
+    // proves a nonzero stamp without another check on every property read.
+    // Keyless Object.create(proto) receivers still miss and walk prototypes.
+    let token = ctx.block().or(I64, &pcid64, "4611686018427387904");
     // The SPILL entry — tested HERE, and nowhere on the hit path.
     //
     // A key past the object's inline region used to publish its slot into the
@@ -648,12 +647,33 @@ pub(crate) fn lower_generic_property_get(
         .cond_br(&is_spill, &call_label, &ways_entry_label);
 
     // Every way load still requires a resolved full cache. A site that has
-    // never primed has no cache, so there is nothing to compare against and
-    // the read goes straight out.
+    // never primed has no cache, so there is nothing to compare against.
+    //
+    // That "never primed" edge is also exactly where an INHERITED read lives:
+    // a key on the prototype chain is never an own slot on the receiver's
+    // shape, so a site that only ever reads it never resolves its cache, and
+    // every read of it reaches this branch with `present` false. So that
+    // edge, and no other, asks the inherited-read cache (#10834/#10842)
+    // before calling out — see `pic.miss.inherited` below. Every other path
+    // to the exit (a small handle, a spill entry, an MRU or way miss at a site
+    // that HAS primed) is unchanged to the instruction; the first placement
+    // asked on all of them and cost every own-key miss the price of a
+    // declining probe (+88 on a megamorphic site, +89 on a spill read).
+    //
+    // Under `--typed-feedback` the edge keeps its old target: the recording
+    // blocks put a guard-fail and a fallback-call record on precisely this
+    // edge, and a read served without a call would have to change one of
+    // those records. Feedback builds are profiling builds; they keep their
+    // signal byte-identical and go without the hook.
     ctx.current_block = ways_entry_idx;
     let token_cache = crate::expr::emit_inline_cache_slot(ctx, &cache_name);
+    let inherited_idx = (!crate::expr::typed_feedback_emission_enabled())
+        .then(|| ctx.new_block("pic.miss.inherited"));
+    let never_primed_label = inherited_idx
+        .map(|idx| ctx.block_label(idx))
+        .unwrap_or_else(|| cold_label.clone());
     ctx.block()
-        .cond_br(&token_cache.present, &miss_label, &cold_label);
+        .cond_br(&token_cache.present, &miss_label, &never_primed_label);
 
     // `js_object_get_field_ic_miss` primes only slots below the descriptor's
     // exact `live_inline_slot_count`. ShapeIds are never reused, so an exact
@@ -682,23 +702,33 @@ pub(crate) fn lower_generic_property_get(
     // `shr` only because its overflow block consumed the same value).
     let field_ptr = ctx.block().gep(DOUBLE, &base_ptr, &[(I64, &slot)]);
     let val_hit = ctx.block().load(DOUBLE, &field_ptr);
-    let val_hit_bits = ctx.block().bitcast_double_to_i64(&val_hit);
-    let hit_deleted = ctx
-        .block()
-        .icmp_eq(I64, &val_hit_bits, crate::nanbox::TAG_HOLE_I64);
-    // A hole is a field deleted since priming. It took the ordinary miss
-    // before (via `pic.miss`, whose way compares can never match a token the
-    // MRU entry still holds — `pic_prime_get` evicts a duplicate before it
-    // writes one), and it takes the same ordinary miss now, recording the same
-    // guard-fail/fallback-call pair on the way.
-    let hit_live_label = hit_live_idx
-        .map(|idx| ctx.block_label(idx))
-        .unwrap_or_else(|| merge_label.clone());
-    ctx.block()
-        .cond_br(&hit_deleted, &deleted_label, &hit_live_label);
+    // The loaded value is the answer. The `TAG_HOLE` compare that used to
+    // stand here (four instructions on every read: bitcast, 10-byte `movabs`
+    // or a stack reload of the constant, `cmp`, branch) was the patch for one
+    // operation — `delete` — which under #9064's stable tombstones kept the
+    // receiver's ShapeId and marked the slot instead. #10826 made every
+    // successful delete a shape transition: the receiver's `+4` word ALWAYS
+    // changes, and when the keys array is owned the predecessor id is retired
+    // (`shape_descriptor_by_id` -> `None`), so a compact word primed before a
+    // delete cannot match after it, and a ShapeId hit proves the slot it names
+    // is live. Every inline slot is born `TAG_UNDEFINED` (`object/alloc.rs`),
+    // so nothing but a delete ever writes a hole into one.
+    //
+    // The hole stays in the SLOT, so every path that reaches a slot WITHOUT a
+    // shape-hit proof — the spill arm, a keys-array scan, `object_field_at`,
+    // every walker — must still treat it as absent, and does. The way path
+    // below no longer compares either: the argument is stated there.
+    //
+    // Ordinary deletes always transition the shape before clearing the slot.
     let hit_end_label = match hit_live_idx {
-        None => ctx.block().label.clone(),
+        None => {
+            let label = ctx.block().label.clone();
+            ctx.block().br(&merge_label);
+            label
+        }
         Some(idx) => {
+            let live_label = ctx.block_label(idx);
+            ctx.block().br(&live_label);
             ctx.current_block = idx;
             crate::expr::emit_typed_feedback_record_call(
                 ctx.block(),
@@ -710,11 +740,6 @@ pub(crate) fn lower_generic_property_get(
             label
         }
     };
-
-    // The hit's hole lands here rather than on the shared exit — see the
-    // congruence note where the block is minted.
-    ctx.current_block = deleted_idx;
-    ctx.block().br(&cold_label);
 
     // PIC miss on the MRU entry — before paying for the call, try the
     // polymorphic ways (#7753).
@@ -835,9 +860,7 @@ pub(crate) fn lower_generic_property_get(
         .pop()
         .expect("PIC_WAYS is non-zero, so the reduction leaves exactly one lane");
     let way_load_idx = ctx.new_block("pic.way.load");
-    let way_live_idx = ctx.new_block("pic.way.live");
     let way_load_label = ctx.block_label(way_load_idx);
-    let way_live_label = ctx.block_label(way_live_idx);
     ctx.block().cond_br(&way_any, &way_load_label, &call_label);
 
     ctx.current_block = way_load_idx;
@@ -846,14 +869,24 @@ pub(crate) fn lower_generic_property_get(
     let way_field_addr = ctx.block().add(I64, &way_base, &way_offset);
     let way_field_ptr = ctx.block().inttoptr(I64, &way_field_addr);
     let val_way = ctx.block().load(DOUBLE, &way_field_ptr);
-    let val_way_bits = ctx.block().bitcast_double_to_i64(&val_way);
-    let way_deleted = ctx
-        .block()
-        .icmp_eq(I64, &val_way_bits, crate::nanbox::TAG_HOLE_I64);
-    ctx.block()
-        .cond_br(&way_deleted, &call_label, &way_live_label);
-
-    ctx.current_block = way_live_idx;
+    // The loaded value is the answer here too, for the reason the shape-gated
+    // hit above needs no `TAG_HOLE` compare (#10826: a successful delete
+    // ALWAYS moves the receiver's ShapeId, so an exact-id match proves the
+    // slot it names is live).
+    //
+    // A way pair is not a second kind of cache entry needing its own
+    // argument. `pic_prime_get` is the ONLY writer of a way, and the only
+    // values it ever writes into one are `prev_tok`/`prev_slot` — the pair
+    // that was sitting in the MRU entry. Every `(token, slot)` a way holds is
+    // therefore an MRU pair that aged out; the token it is compared against is
+    // the same receiver ShapeId word the MRU compare reads; and ShapeIds are
+    // never reused. Whatever makes the MRU pair safe to load without a hole
+    // check makes the way pair safe — the entry did not become weaker by
+    // moving one word over.
+    //
+    // The two ways in which a way pair differs from an MRU pair both narrow
+    // it: an overflow-encoded slot is refused entry to a way at all, and a way
+    // is consulted only after the MRU entry has already missed.
     let way_end_label = ctx.block().label.clone();
     ctx.block().br(&merge_label);
 
@@ -878,6 +911,45 @@ pub(crate) fn lower_generic_property_get(
         );
         ctx.block().br(&call_label);
     }
+
+    // The inherited-read hook, on the never-primed edge only (see the branch
+    // that reaches it, in `pic.token.ways`). A read whose key lives on the
+    // prototype chain can never take the own-slot hit — the receiver's shape
+    // says the key is not own — so before this block it paid the slow entry's
+    // prologue and dispatch (79 of an inherited read's 204 instructions,
+    // measured by the inherited-reads lane) just to reach the same lookup
+    // inside `get_field_ic_miss_impl`. `js_inherited_read_cache_hit_f64` is
+    // a pure state read — it allocates nothing, triggers no GC and runs no
+    // user code — so it is a leaf in `gc_call_effects.rs` and
+    // `root_reload.rs`: no spill, no reload around it. `TAG_HOLE` is its
+    // decline sentinel, which no ordinary value can be, so the answer is one
+    // compare, with the SERVED edge as the true edge like every guard-passing
+    // edge in this tower (#7883); a decline continues to the one exit exactly
+    // as the never-primed edge did before. Nothing is primed from here:
+    // priming stays in the miss handler, the one place that already knows
+    // the key is not own without a second search. The versioned-loop deopt
+    // note is emitted here as it is on the exit, so entering either cold arm
+    // still records the bailout.
+    let inherited_arm = inherited_idx.map(|idx| {
+        ctx.current_block = idx;
+        crate::expr::emit_versioned_loop_callback_deopt(ctx);
+        let inh_key_handle = emit_key_handle(ctx, &key_handle_global);
+        let recv_ptr = ctx.block().inttoptr(I64, &obj_handle);
+        let key_ptr = ctx.block().inttoptr(I64, &inh_key_handle);
+        let val_inherited = ctx.block().call(
+            DOUBLE,
+            "js_inherited_read_cache_hit_f64",
+            &[(PTR, &recv_ptr), (PTR, &key_ptr)],
+        );
+        let inherited_bits = ctx.block().bitcast_double_to_i64(&val_inherited);
+        let inherited_served =
+            ctx.block()
+                .icmp_ne(I64, &inherited_bits, crate::nanbox::TAG_HOLE_I64);
+        let inherited_end_label = ctx.block().label.clone();
+        ctx.block()
+            .cond_br(&inherited_served, &merge_label, &cold_label);
+        (val_inherited, inherited_end_label)
+    });
 
     // The object exit: one call reproducing every pointer-path arm this tower
     // used to expand.
@@ -931,6 +1003,9 @@ pub(crate) fn lower_generic_property_get(
         (&val_miss, &miss_end_label),
         (&val_nonptr, &nonptr_end_label),
     ];
+    if let Some((val_inherited, inherited_end_label)) = inherited_arm.as_ref() {
+        incoming.push((val_inherited, inherited_end_label));
+    }
     if let Some((sso_val, sso_end_label)) = sso_arm.as_ref() {
         incoming.push((sso_val, sso_end_label));
     }

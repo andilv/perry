@@ -851,13 +851,23 @@ pub(crate) fn typed_array_length_or_throw(val: f64) -> u32 {
         throw_range_error(format!("Invalid typed array length: {shown}").as_bytes());
     }
     // #5067 — Perry stores the element count in a `u32` capacity field, so a
-    // length above `u32::MAX` cannot be represented (and the backing block
-    // could never be allocated anyway). Node passes the `<= 2**53-1` length
-    // check for these and then fails the actual allocation, so match its
+    // length above the cap cannot be represented (and the backing block could
+    // never be allocated anyway). Node passes the `<= 2**53-1` length check
+    // for these and then fails the actual allocation, so match its
     // `RangeError: Array buffer allocation failed` rather than silently
-    // saturating the cast to `u32::MAX` (which produced a wrong-size array
-    // or aborted the process in the allocator).
-    if integer > u32::MAX as f64 {
+    // saturating the cast (which produced a wrong-size array or aborted the
+    // process in the allocator).
+    //
+    // RULE 3 (single-path object model): the cap is `i32::MAX`, not
+    // `u32::MAX`, because `TypedArrayHeader::capacity` sits at payload `+4` —
+    // the word the emitted read path loads as a ShapeId. `new Int8Array(2**31)`
+    // wrote `capacity = 0x8000_0000`, which is not merely inside the ShapeId
+    // range but is the FIRST id the process ever mints. This lowers no
+    // documented maximum: `new Uint8Array(n)`, `new ArrayBuffer(n)` and
+    // `Buffer.alloc(n)` already stop at `i32::MAX`
+    // (`buffer/from.rs`), so this only makes the remaining element types
+    // agree with their siblings.
+    if integer > i32::MAX as f64 {
         throw_range_error(b"Array buffer allocation failed");
     }
     integer as u32
@@ -1011,7 +1021,14 @@ fn typed_array_payload_size(capacity: u32, elem_size: usize) -> usize {
 /// Allocate a zero-filled typed array of `length` elements.
 pub fn typed_array_alloc(kind: u8, length: u32) -> *mut TypedArrayHeader {
     let elem_size = elem_size_for_kind(kind);
-    let capacity = length.max(1);
+    // RULE 3 (`object/shape_rule3.rs`): `capacity` occupies payload `+4`.
+    // `typed_array_length_or_throw` already refuses an over-range length at
+    // the constructor; this is the same bound at the allocation funnel, which
+    // the internal callers (`subarray`, `slice`, the `set` paths) also reach.
+    let capacity = crate::object::shape_rule3::checked_plus_four_word(
+        length.max(1),
+        b"Array buffer allocation failed",
+    );
     // 2026-07-09 audit: small typed arrays were raw-`alloc`'d with NO
     // GcHeader and never freed — invisible to every GC trigger, unbounded
     // RSS on churn. Every typed array now takes the old-arena GC path

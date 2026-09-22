@@ -38,11 +38,46 @@ const CURSOR_FIELDS: u32 = 5;
 
 // --- counters (PERRY_SEGVIEW_DIAG=1) ---------------------------------------
 
-static OPENS: AtomicU64 = AtomicU64::new(0);
-static DECLINE_NOT_SEGMENTER: AtomicU64 = AtomicU64::new(0);
-static DECLINE_NOT_GRAPHEME: AtomicU64 = AtomicU64::new(0);
-static DECLINE_SEGMENT_PATCHED: AtomicU64 = AtomicU64::new(0);
-static DECLINE_NOT_STRING: AtomicU64 = AtomicU64::new(0);
+per_test_global! {
+    // #10944: a test asserts this counter's value, and libtest runs tests
+    // in one process — any sibling touching the same path made the
+    // assertion fail by one. `per_test_global!` gives each test thread its
+    // own instance in a TEST build and expands to the plain `static`,
+    // byte for byte, outside one.
+    static OPENS: AtomicU64 = AtomicU64::new(0);
+}
+per_test_global! {
+    // #10944: a test asserts this counter's value, and libtest runs tests
+    // in one process — any sibling touching the same path made the
+    // assertion fail by one. `per_test_global!` gives each test thread its
+    // own instance in a TEST build and expands to the plain `static`,
+    // byte for byte, outside one.
+    static DECLINE_NOT_SEGMENTER: AtomicU64 = AtomicU64::new(0);
+}
+per_test_global! {
+    // #10944: a test asserts this counter's value, and libtest runs tests
+    // in one process — any sibling touching the same path made the
+    // assertion fail by one. `per_test_global!` gives each test thread its
+    // own instance in a TEST build and expands to the plain `static`,
+    // byte for byte, outside one.
+    static DECLINE_NOT_GRAPHEME: AtomicU64 = AtomicU64::new(0);
+}
+per_test_global! {
+    // #10944: a test asserts this counter's value, and libtest runs tests
+    // in one process — any sibling touching the same path made the
+    // assertion fail by one. `per_test_global!` gives each test thread its
+    // own instance in a TEST build and expands to the plain `static`,
+    // byte for byte, outside one.
+    static DECLINE_SEGMENT_PATCHED: AtomicU64 = AtomicU64::new(0);
+}
+per_test_global! {
+    // #10944: a test asserts this counter's value, and libtest runs tests
+    // in one process — any sibling touching the same path made the
+    // assertion fail by one. `per_test_global!` gives each test thread its
+    // own instance in a TEST build and expands to the plain `static`,
+    // byte for byte, outside one.
+    static DECLINE_NOT_STRING: AtomicU64 = AtomicU64::new(0);
+}
 static DECLINE_NOT_UTF8: AtomicU64 = AtomicU64::new(0);
 static DECLINE_EMPTY: AtomicU64 = AtomicU64::new(0);
 static NEXTS: AtomicU64 = AtomicU64::new(0);
@@ -571,6 +606,14 @@ mod view_mode_tests {
     /// constructor path so the test cannot pass against a hand-made object the
     /// production code would reject.
     fn grapheme_segmenter() -> f64 {
+        // A real `new Intl.Segmenter(...)` always runs in a realm that has a
+        // `globalThis`; these tests run on a bare libtest thread that may not.
+        // They used to get one for free — `resolve_prototype_addr` materialized
+        // it as a side effect of answering "is this `Object.prototype`?" — and
+        // v0.5.1627 removed that side effect (it cost ~5 ms on the first
+        // `setTimeout`). Establish the realm explicitly rather than depend on a
+        // side effect of a predicate.
+        let _ = crate::object::js_get_global_this();
         let options = crate::object::js_object_alloc(0, 1);
         let key = crate::string::js_string_from_bytes(b"granularity".as_ptr(), 11);
         crate::object::js_object_set_field_by_name(options, key, js_string("grapheme"));

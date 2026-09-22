@@ -17,6 +17,14 @@ pub fn synthesize_class_captures(
     computed_members: &mut Vec<ClassComputedMember>,
     constructor: &mut Option<Function>,
     static_methods: &mut Vec<Function>,
+    // #10835: ids of the getters/setters that are STATIC. They live in the
+    // `getters`/`setters` vectors alongside instance accessors, so without
+    // this they take the instance rewrite (`this.__perry_cap_*`) — which a
+    // static accessor has no instance to satisfy, leaving the reference to
+    // fall through to the enclosing local that lowering promoted to a
+    // module-level global. One slot, overwritten by every evaluation of the
+    // enclosing factory.
+    static_accessor_fn_ids: &[crate::types::FuncId],
 ) {
     let cap_salt = ctx.cap_salt();
     let module_level_ids = ctx.module_level_ids.clone();
@@ -68,22 +76,18 @@ pub fn synthesize_class_captures(
     // Without this, `LocalGet(outer_id)` inside a field's init expression
     // would read a non-existent local in the ctor's scope when
     // `apply_field_initializers_recursive` lowers the initializer.
-    // Collect refs from both the init expr and the computed key_expr.
+    // Collect refs from initializer expressions. Computed field keys are
+    // deliberately excluded: ClassDefinitionEvaluation resolves them in the
+    // enclosing scope and stores the resulting PropertyKey in a hidden class
+    // slot. They do not execute in the constructor and therefore must not be
+    // rewritten to constructor-local capture parameters. Doing so leaves the
+    // definition-site StaticFieldSet reading an unbound synthetic parameter;
+    // undici's PoolBase then installs `[kClients] = []` under the wrong key.
     for field in fields.iter() {
         if let Some(init) = &field.init {
             let mut refs = Vec::new();
             let mut visited = std::collections::HashSet::new();
             crate::analysis::collect_local_refs_expr(init, &mut refs, &mut visited);
-            for id in refs {
-                if outer_scope_ids.contains(&id) && !module_level_ids.contains(&id) {
-                    union_captures.insert(id);
-                }
-            }
-        }
-        if let Some(key) = &field.key_expr {
-            let mut refs = Vec::new();
-            let mut visited = std::collections::HashSet::new();
-            crate::analysis::collect_local_refs_expr(key, &mut refs, &mut visited);
             for id in refs {
                 if outer_scope_ids.contains(&id) && !module_level_ids.contains(&id) {
                     union_captures.insert(id);
@@ -299,11 +303,17 @@ pub fn synthesize_class_captures(
         let id_map = rewrite_method_body(ctx, &mut m.body);
         append_self_sites(&mut m.body, &id_map);
     }
-    for (_, g) in getters.iter_mut() {
+    for (_, g) in getters
+        .iter_mut()
+        .filter(|(_, g)| !static_accessor_fn_ids.contains(&g.id))
+    {
         let id_map = rewrite_method_body(ctx, &mut g.body);
         append_self_sites(&mut g.body, &id_map);
     }
-    for (_, s) in setters.iter_mut() {
+    for (_, s) in setters
+        .iter_mut()
+        .filter(|(_, s)| !static_accessor_fn_ids.contains(&s.id))
+    {
         let id_map = rewrite_method_body(ctx, &mut s.body);
         append_self_sites(&mut s.body, &id_map);
     }
@@ -349,6 +359,45 @@ pub fn synthesize_class_captures(
         prologue.append(&mut sm.body);
         sm.body = prologue;
         append_self_sites(&mut sm.body, &id_map);
+    }
+
+    // 2b-bis (#10835). STATIC accessors get the same treatment as static
+    // methods. They have no instance, so the capture reads go through
+    // `ClassCaptureValue`, which codegen lowers to
+    // `js_class_capture_value_for_receiver(this, cid, index)` — per-evaluation
+    // `__perry_ctor_caps` first, decl-site snapshot second. Previously they
+    // took the instance rewrite and silently read a module-level global.
+    for (_, acc) in getters
+        .iter_mut()
+        .chain(setters.iter_mut())
+        .filter(|(_, f)| static_accessor_fn_ids.contains(&f.id))
+    {
+        let mut id_map: std::collections::HashMap<LocalId, LocalId> =
+            std::collections::HashMap::new();
+        let mut prologue: Vec<Stmt> = Vec::new();
+        for (index, &outer_id) in captures_vec.iter().enumerate() {
+            let new_id = ctx.fresh_local();
+            id_map.insert(outer_id, new_id);
+            prologue.push(Stmt::Let {
+                id: new_id,
+                name: crate::cap_fields::cap_field_name(cap_salt, outer_id),
+                ty: captured_outer_types
+                    .get(&outer_id)
+                    .cloned()
+                    .unwrap_or(Type::Any),
+                mutable: true,
+                init: Some(Expr::ClassCaptureValue {
+                    class_name: name.to_string(),
+                    index: index as u32,
+                    fallback: None,
+                    prefer_fallback: false,
+                }),
+            });
+        }
+        crate::analysis::remap_local_ids_in_stmts(&mut acc.body, &id_map);
+        prologue.append(&mut acc.body);
+        acc.body = prologue;
+        append_self_sites(&mut acc.body, &id_map);
     }
 
     // 2c. STATIC computed methods (`static [k]() {}`, and the static methods
@@ -583,9 +632,8 @@ pub fn synthesize_class_captures(
     }
     *constructor = Some(ctor);
 
-    // Issue #740: rewrite field initializers and computed-key
-    // expressions using the same `ctor_id_map`. Field initializers
-    // are lowered inside the constructor body by
+    // Issue #740: rewrite field initializers using the same `ctor_id_map`.
+    // Field initializers are lowered inside the constructor body by
     // `apply_field_initializers_recursive`, so `LocalGet(outer_id)`
     // inside a field's init must be rewritten to read the fresh
     // ctor-local param that holds the captured value (synthesized
@@ -594,9 +642,6 @@ pub fn synthesize_class_captures(
     for field in fields.iter_mut() {
         if let Some(init) = field.init.as_mut() {
             crate::analysis::remap_local_ids_in_expr(init, &ctor_id_map);
-        }
-        if let Some(key) = field.key_expr.as_mut() {
-            crate::analysis::remap_local_ids_in_expr(key, &ctor_id_map);
         }
     }
 

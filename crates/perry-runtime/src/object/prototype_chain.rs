@@ -24,6 +24,35 @@
 //! `proto_bits` for an explicit `Object.setPrototypeOf(obj, null)` is
 //! `TAG_NULL`, so a recorded-null entry is distinguishable from "no entry
 //! recorded" (default prototype); in the meta record, 0 means unset.
+//!
+//! # What the residual registry costs an inherited read: nothing (measured)
+//!
+//! The 2026-09-20 object-model design note proposed deleting `OBJECT_PROTOTYPES`
+//! on the theory that its `Mutex` plus a hash probe per chain level was "likely
+//! part of the 950 ns inherited read". Callgrind says otherwise. On
+//! `const P={a:1}; const O=Object.create(P); O.a` at 200 k reads (v0.5.1619,
+//! `--debug-symbols`, x86-64-v3), ~1300 instructions per inherited read split
+//! as: `native_get::try_data_get_bytes` self 344; `class_prototype_object` 192,
+//! of which 118 is the SipHash of the `CLASS_PROTOTYPE_OBJECTS` probe;
+//! `keys_find_slot_by_bytes_resolved` 180 (twice — receiver, then holder);
+//! `get_field_ic_miss_impl` self 153; `closure_dynamic_prop_by_key` 90;
+//! `shape_descriptor_by_id` 70; `is_anon_shape_class_id` 54;
+//! `class_decl_prototype_object` 41; `from_utf8` 38; `is_arguments_object` 28.
+//! Neither `get_object_prototypes` nor `pthread_mutex_lock` appears at all,
+//! because #6759 phase B already took every `GC_TYPE_OBJECT` off this table —
+//! the prototype of an `Object.create` receiver comes from the class registry,
+//! not from here.
+//!
+//! So the table is not a duplicate of `ObjectMeta.prototype` waiting to be
+//! deleted; it is the ONLY storage the kinds below have. Removing it means
+//! giving each of them a prototype slot of its own, kind by kind: arrays and
+//! lazy arrays (an `ArrayHeader` slot — the #6759 tranche this module's header
+//! already names), typed arrays, `ArrayBuffer`/`SharedArrayBuffer`/`DataView`
+//! (`BufferHeader`), `GC_TYPE_REGEXP`, `Map`/`Set`/`Error`/`Promise`/`Date`/
+//! `Temporal` cells, closures (`dyn_eval`), and native handle-band ids, which
+//! are integers with no cell at all (the Express `res`/`req` case in
+//! `object_ops::define_properties`) and so need a different answer entirely.
+//! None of that work makes an inherited property read faster.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -360,6 +389,29 @@ fn object_set_static_prototype_impl(obj_ptr: usize, proto_bits: u64, link_kind: 
     if obj_ptr == 0 {
         return;
     }
+    // Whatever else this link does, the TARGET is now somebody's prototype, so
+    // a later structural mutation of it is invisible to everything below it.
+    // The inherited-read cache refuses to record an unmarked hop, so a link
+    // kind missing from this funnel costs a cache hit and can never leave a
+    // stale entry (`object::proto_validity`). Marking allocates a meta record,
+    // so it happens BEFORE this function takes any raw pointer of its own.
+    //
+    // #10868 lever (iv): the mark returns the prototype's stable serial, read
+    // from the meta pointer AFTER the mark's allocation, and it is carried as a
+    // plain u64 to the divergence below rather than re-read through a pointer
+    // that allocation may have moved.
+    let prototype_serial: Option<u64> = unsafe {
+        let prototype = crate::value::JSValue::from_bits(proto_bits);
+        if prototype.is_pointer() {
+            crate::object::proto_validity::mark_object_as_prototype(
+                prototype.as_pointer::<crate::ObjectHeader>() as usize,
+            )
+        } else if proto_bits == crate::value::TAG_NULL {
+            Some(crate::object::proto_validity::NULL_PROTOTYPE_SERIAL)
+        } else {
+            None
+        }
+    };
     if !ARRAY_TARGET_PROTO_RECORDED.load(Ordering::Relaxed)
         && obj_ptr >= crate::gc::GC_HEADER_SIZE + 0x1000
         && crate::value::addr_class::is_above_handle_band(obj_ptr)
@@ -427,7 +479,25 @@ fn object_set_static_prototype_impl(obj_ptr: usize, proto_bits: u64, link_kind: 
                 proto_bits,
             );
             if prototype_diverged {
-                crate::object::shapes::transition_object_shape_semantics(obj);
+                #[cfg(feature = "shape-mint-diag")]
+                crate::object::shape_mint_census::note_proto_divergence(
+                    crate::object::shapes::object_shape_stamp(obj),
+                    proto_bits,
+                );
+                // A prototype without a serial (not a meta-capable object) keeps
+                // the unique-generation transition: correct, just unmerged.
+                match prototype_serial {
+                    Some(serial) => {
+                        crate::object::shapes::transition_object_shape_semantics_for_prototype(
+                            obj,
+                            serial,
+                            link_kind as u8,
+                        );
+                    }
+                    None => {
+                        crate::object::shapes::transition_object_shape_semantics(obj);
+                    }
+                }
             }
             return;
         }
@@ -542,6 +612,122 @@ fn object_has_prototype_flag(obj_ptr: usize, flag: u64) -> bool {
 /// default, regardless of whether runtime wiring or a user-facing operation
 /// selected it. Cache guards use this conservative signal.
 #[inline]
+/// Does this receiver's `[[Prototype]]` chain END IN AN EXPLICIT `null`?
+///
+/// Perry bakes class ids at allocation time, so every "the own-key scan
+/// missed, what does this object inherit?" path in the runtime falls back to
+/// the receiver's CLASS surface — its vtable, its declaration prototype, or
+/// `Object.prototype`. That fallback is right for an object whose chain was
+/// never touched, and it is WRONG for one whose chain was explicitly ended:
+/// `Object.setPrototypeOf(o, null)` says there is nothing above `o` any more,
+/// and the fallback walked up anyway and answered from the prototype `o` was
+/// BORN with (#10827).
+///
+/// A chain ends explicitly when a hop carries a recorded `TAG_NULL`
+/// (`Object.setPrototypeOf(x, null)`, `__proto__ = null`) or is a cell born
+/// with no prototype at all (`Object.create(null)`, `OBJ_FLAG_NULL_PROTO`). It
+/// does NOT end explicitly when a hop simply has no record: that is an
+/// ordinary object standing on the class default, which is exactly the case
+/// the fallback exists for.
+///
+/// Cost is paid only on a MISS, and only walks hops that carry a record: an
+/// ordinary receiver answers `false` from one absent meta record plus one
+/// header bit.
+pub(crate) fn prototype_chain_ends_in_explicit_null(obj_ptr: usize) -> bool {
+    let mut current = obj_ptr;
+    // The same bound the generic chain walk uses. A cycle cannot be built
+    // through `setPrototypeOf` (it refuses one), but a bound is cheaper than
+    // trusting that from here.
+    for _ in 0..32 {
+        if unsafe { cell_is_born_null_proto(current) } {
+            return true;
+        }
+        match object_static_prototype(current) {
+            // No per-instance record on this hop. The chain does not stop
+            // here: it continues through the hop's CLASS, which is where a
+            // `class K {}` instance keeps `K.prototype`. Following it is what
+            // makes `Object.setPrototypeOf(K.prototype, null)` visible to an
+            // instance that was never itself re-prototyped — the case where
+            // the receiver's own guard and the holder's both see nothing.
+            None => {
+                let next = unsafe { class_link_prototype(current) };
+                if next == 0 || next == current || next == obj_ptr {
+                    return false;
+                }
+                current = next;
+            }
+            Some(TAG_NULL) => return true,
+            Some(bits) => {
+                let top16 = bits >> 48;
+                let next = if top16 == 0x7FFD {
+                    (bits & 0x0000_FFFF_FFFF_FFFF) as usize
+                } else if top16 == 0
+                    && crate::value::addr_class::is_above_handle_band(bits as usize)
+                {
+                    // The canonical band predicate rather than a hand-typed
+                    // `> 0x10000` floor: `addr_class` owns where the handle
+                    // band ends, and a literal here is the shape #6321 fixed.
+                    bits as usize
+                } else {
+                    return false;
+                };
+                if next == 0 || next == current || next == obj_ptr {
+                    return false;
+                }
+                current = next;
+            }
+        }
+    }
+    false
+}
+
+/// The prototype a cell reaches through its CLASS rather than through a
+/// per-instance record: the declared `class X {}` prototype when there is one,
+/// otherwise the synthetic-class prototype object. 0 when the cell has no
+/// class link — an ordinary `{}` (class id 0) or a kind whose chain is not
+/// resolved this way.
+///
+/// Deliberately the same precedence `native_get::try_data_get_bytes` uses to
+/// resolve the next hop, so this predicate walks the chain a READ walks and
+/// cannot answer about a hop the read never visits.
+#[inline]
+unsafe fn class_link_prototype(obj_ptr: usize) -> usize {
+    if obj_ptr == 0 || !crate::object::is_valid_obj_ptr(obj_ptr as *const u8) {
+        return 0;
+    }
+    let Some(header) = crate::value::addr_class::try_read_gc_header(obj_ptr) else {
+        return 0;
+    };
+    if header.obj_type != crate::gc::GC_TYPE_OBJECT {
+        return 0;
+    }
+    let class_id = (*(obj_ptr as *const crate::ObjectHeader)).class_id;
+    if class_id == 0 {
+        return 0;
+    }
+    let declared = super::class_decl_prototype_object(class_id);
+    if !declared.is_null() {
+        return declared as usize;
+    }
+    super::class_prototype_object(class_id) as usize
+}
+
+/// Was this cell allocated with no prototype (`Object.create(null)`,
+/// `querystring.parse`)? That is `OBJ_FLAG_NULL_PROTO`, the header bit #1175
+/// added, and it is the born-null half of the question
+/// [`prototype_chain_ends_in_explicit_null`] asks.
+#[inline]
+unsafe fn cell_is_born_null_proto(obj_ptr: usize) -> bool {
+    if obj_ptr == 0 || !crate::object::is_valid_obj_ptr(obj_ptr as *const u8) {
+        return false;
+    }
+    let Some(header) = crate::value::addr_class::try_read_gc_header(obj_ptr) else {
+        return false;
+    };
+    header.obj_type == crate::gc::GC_TYPE_OBJECT
+        && header._reserved & crate::gc::OBJ_FLAG_NULL_PROTO != 0
+}
+
 pub(crate) fn object_has_prototype_divergence(obj_ptr: usize) -> bool {
     object_has_prototype_flag(obj_ptr, crate::object::OBJECT_META_FLAG_PROTO_DIVERGED)
 }
@@ -927,6 +1113,92 @@ mod tests {
         );
         assert!(object_has_prototype_divergence(user_overridden as usize));
         assert!(object_has_user_prototype_override(user_overridden as usize));
+    }
+
+    /// #10827. Every one of these is a case where the READ used to disagree
+    /// with `in` on the same object — perry contradicting itself, which is the
+    /// cleanest oracle available and the one the regression fixture asserts.
+    #[test]
+    fn an_explicitly_nulled_prototype_ends_the_chain() {
+        let proto = crate::object::js_object_alloc(0, 4);
+        let obj = crate::object::js_object_alloc(0, 4);
+        object_set_static_prototype(
+            obj as usize,
+            crate::value::js_nanbox_pointer(proto as i64).to_bits(),
+        );
+        assert!(
+            !prototype_chain_ends_in_explicit_null(obj as usize),
+            "a chain standing on a real prototype object is not ended"
+        );
+        object_set_user_prototype(obj as usize, crate::value::TAG_NULL);
+        assert!(
+            prototype_chain_ends_in_explicit_null(obj as usize),
+            "Object.setPrototypeOf(o, null) says there is nothing above o; \
+             without this the class-surface fallback walked up anyway and \
+             answered from the prototype o was BORN with"
+        );
+    }
+
+    #[test]
+    fn a_null_ended_interior_prototype_ends_the_chain_for_an_instance() {
+        // The interior prototype is EXPLICITLY ended, not merely absent.
+        // O -> P1 -> null. Neither O's own record nor the holder's says
+        // anything: the statement is two hops up.
+        let p1 = crate::object::js_object_alloc(0, 4);
+        let obj = crate::object::js_object_alloc(0, 4);
+        object_set_static_prototype(
+            obj as usize,
+            crate::value::js_nanbox_pointer(p1 as i64).to_bits(),
+        );
+        assert!(!prototype_chain_ends_in_explicit_null(obj as usize));
+        object_set_user_prototype(p1 as usize, crate::value::TAG_NULL);
+        assert!(
+            prototype_chain_ends_in_explicit_null(obj as usize),
+            "an interior prototype ended in null is invisible to both ends of \
+             the chain"
+        );
+    }
+
+    #[test]
+    fn a_hop_born_without_a_prototype_ends_the_chain() {
+        let born_null = crate::object::js_object_alloc_null_proto(0, 4);
+        assert!(
+            prototype_chain_ends_in_explicit_null(born_null as usize),
+            "Object.create(null) is the born half of the same statement"
+        );
+        let obj = crate::object::js_object_alloc(0, 4);
+        object_set_static_prototype(
+            obj as usize,
+            crate::value::js_nanbox_pointer(born_null as i64).to_bits(),
+        );
+        assert!(
+            prototype_chain_ends_in_explicit_null(obj as usize),
+            "pointing an object at an Object.create(null) ends ITS chain too"
+        );
+    }
+
+    #[test]
+    fn an_untouched_object_does_not_end_its_chain() {
+        // The common case, and the one that must stay cheap and must stay
+        // FALSE: an ordinary object stands on the class default, which is
+        // exactly what the fallback this predicate gates exists to reach.
+        let plain = crate::object::js_object_alloc(0, 4);
+        assert!(!prototype_chain_ends_in_explicit_null(plain as usize));
+    }
+
+    #[test]
+    fn a_recorded_prototype_cycle_does_not_hang_the_null_walk() {
+        let first = crate::object::js_object_alloc(0, 0);
+        let second = crate::object::js_object_alloc(0, 0);
+        object_set_static_prototype(
+            first as usize,
+            crate::value::js_nanbox_pointer(second as i64).to_bits(),
+        );
+        object_set_static_prototype(
+            second as usize,
+            crate::value::js_nanbox_pointer(first as i64).to_bits(),
+        );
+        assert!(!prototype_chain_ends_in_explicit_null(first as usize));
     }
 
     #[test]

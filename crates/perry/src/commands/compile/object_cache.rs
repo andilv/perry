@@ -313,6 +313,18 @@ fn compute_object_cache_key_with_env(
     // doesn't usually move between rebuilds.
     h.field("build_id", &format!("{:016x}", perry_build_id()));
     h.field("ir_only", if opts.emit_ir_only { "1" } else { "0" });
+    // #10399: a program that constructs a `worker_threads` Worker emits its
+    // module-init guards and module-global slots thread-local. That changes
+    // the IR of EVERY module, not just the worker's, so an object cached from
+    // a worker-free build must never be served to a build that has one.
+    h.field(
+        "worker_tls_globals",
+        if perry_codegen::program_has_worker() {
+            "1"
+        } else {
+            "0"
+        },
+    );
     // #5247: `--debug-symbols` flips per-call `js_set_call_location` emission,
     // which changes the emitted IR (and `.o` bytes). Without this in the key,
     // toggling the flag would serve the previously-cached object and the
@@ -1393,6 +1405,23 @@ fn compute_object_cache_key_with_env(
         env_var("PERRY_NUMBER_BY_CONSTRUCTION")
             .as_deref()
             .unwrap_or(""),
+    );
+
+    // #10777 — numeric-provenance fact ordering. `=1` lets the function-scope
+    // `number_by_construction` fixpoint see the `Ptr<Shape>` receiver proofs
+    // computed before it, which flips `both_numeric` and with it the `+`
+    // lowering. Different IR, different .o bytes.
+    h.field(
+        "env_l14_nbc_order",
+        env_var("PERRY_L14_NBC_ORDER").as_deref().unwrap_or(""),
+    );
+
+    // #10884 step 4b — the region kill switch. Same reasoning as the build
+    // cache above, and the same trap #10929 fell into: keying ONE of the two
+    // caches leaves the other serving objects compiled the other way.
+    h.field(
+        "env_region_reads",
+        env_var("PERRY_REGION_READS").as_deref().unwrap_or(""),
     );
 
     h.finish()

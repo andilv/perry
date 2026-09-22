@@ -192,24 +192,12 @@ pub mod tls;
 pub use tls::*;
 
 // === Databases ===
-// pg lives behind `bundled-pg` (v0.5.566); mysql2 lives behind
-// `bundled-mysql2` (v0.5.567). Either feature pulls in sqlx, so
-// the modules' `#[cfg(any(...))]` covers both bundled gates plus
-// the legacy `database-postgres`/`database-mysql` umbrellas (kept
-// for backwards-compat).
-#[cfg(any(feature = "bundled-pg", feature = "bundled-mysql2"))]
-pub mod pg;
-#[cfg(any(feature = "bundled-pg", feature = "bundled-mysql2"))]
-pub use pg::connection::*;
-#[cfg(any(feature = "bundled-pg", feature = "bundled-mysql2"))]
-pub use pg::pool::*;
-
-#[cfg(any(feature = "bundled-pg", feature = "bundled-mysql2"))]
-pub mod mysql2;
-#[cfg(any(feature = "bundled-pg", feature = "bundled-mysql2"))]
-pub use mysql2::connection::*;
-#[cfg(any(feature = "bundled-pg", feature = "bundled-mysql2"))]
-pub use mysql2::pool::*;
+// Both in-tree database wrappers that lived here are gone: the `pg`
+// module + `bundled-pg` feature (#10677) and the `mysql2` module +
+// `bundled-mysql2` feature (#10680), the pre-#466 native
+// reimplementations of the `pg` and `mysql2` npm packages. Perry now
+// compiles both real packages from source instead of shipping bundled
+// reimplementations.
 
 #[cfg(feature = "database-sqlite")]
 pub mod sqlite;

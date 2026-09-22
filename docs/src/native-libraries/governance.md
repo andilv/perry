@@ -72,6 +72,20 @@ passing the governance check.
   with Node across transliteration, replacement, strict/trim options, locale,
   regular-expression removal, and `slugify.extend`. Its former
   `perry-ext-slugify` and `perry-stdlib` implementations have been removed.
+- `mysql2@3.23.2` compiles from its installed CommonJS source through the
+  default automatic package-routing path, including the `generate-function`
+  row-parser factories it builds with `new Function` at runtime — handled by
+  the `dyn_eval` interpreter's class-expression support (#10661/#10675). A
+  real local-MySQL round trip (`CREATE TABLE`/`INSERT`/`SELECT`/`DELETE`/
+  `DROP`) passed with no `perry.compilePackages` entry for `mysql2` at all.
+  Its former `perry-ext-mysql2` crate and `perry-stdlib` implementation have
+  been removed.
+- `pg@8.22.0` compiles from its installed CommonJS source through the default
+  automatic package-routing path. A real local-PostgreSQL round trip
+  (`CREATE TABLE`/parameterized `INSERT`/`SELECT`/parameterized `DELETE`/
+  `DROP`) on a `Client`, plus a `Pool` query, passed with no
+  `perry.compilePackages` entry for `pg` at all. Its former `perry-ext-pg`
+  crate and `perry-stdlib` implementation have been removed.
 
 ## Current inventory
 
@@ -96,12 +110,10 @@ from `well_known_bindings.toml`. Regenerate this table with
 | `perry-ext-http` | `http`<br>`http2`<br>`https` | Runtime API | Keep near core; consolidate when practical | Bundled; retained |
 | `perry-ext-ioredis` | `ioredis`<br>`iovalkey`<br>`redis` | Source package | Compile the upstream package source | Bundled; migration pending |
 | `perry-ext-mongodb` | `mongodb` | Source package | Compile the upstream package source | Bundled; migration pending |
-| `perry-ext-mysql2` | `mysql2`<br>`mysql2/promise` | Source package | Compile the upstream package source | Bundled; migration pending |
 | `perry-ext-net` | `net` | Runtime API | Keep near core; consolidate when practical | Bundled; retained |
 | `perry-ext-nodemailer` | `nodemailer` | Source package | Compile the upstream package source | Bundled; migration pending |
 | `perry-ext-parcel-watcher` | `@parcel/watcher`<br>`@parcel/watcher-darwin-arm64`<br>`@parcel/watcher-darwin-x64`<br>`@parcel/watcher-linux-arm64-glibc`<br>`@parcel/watcher-linux-arm64-musl`<br>`@parcel/watcher-linux-x64-glibc`<br>`@parcel/watcher-linux-x64-musl`<br>`@parcel/watcher-win32-arm64`<br>`@parcel/watcher-win32-x64` | External integration | Move to an external native package | Bundled; migration pending |
 | `perry-ext-pdf` | `@perryts/pdf` | External integration | Move to an external native package | Bundled; migration pending |
-| `perry-ext-pg` | `pg` | Source package | Compile the upstream package source | Bundled; migration pending |
 | `perry-ext-sharp` | `sharp` | External integration | Move to an external native package | Bundled; migration pending |
 | `perry-ext-streams` | `streams` | Runtime API | Keep near core; consolidate when practical | Bundled; retained |
 | `perry-ext-typescript` | `typescript` | Source package | Compile the upstream package source | Bundled; migration pending |

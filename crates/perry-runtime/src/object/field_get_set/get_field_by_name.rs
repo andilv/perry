@@ -54,6 +54,30 @@ pub extern "C" fn js_object_get_field_by_name(
     obj: *const ObjectHeader,
     key: *const crate::StringHeader,
 ) -> JSValue {
+    // Lane 3 hook C: the same inherited-read entry, for the callers that do
+    // not come through a per-site cache (the recursive prototype hop, native
+    // callers, `js_object_get_field_by_name_f64`). It goes BEFORE
+    // `try_data_get_by_name` because that is the walk it replaces; a decline
+    // costs an epoch load and one failed compare.
+    if let Some(value) =
+        unsafe { crate::object::inherited_read_cache::inherited_read_cache_hit(obj, key) }
+    {
+        return value;
+    }
+    get_field_by_name_past_inherited_cache(obj, key)
+}
+
+/// The same read for a caller that has ALREADY asked the inherited-read cache
+/// and been refused.
+///
+/// `get_field_ic_miss_impl` is exactly that caller: it consults the cache at
+/// the top and falls through to here at the bottom. Asking twice is not free —
+/// a read the cache refuses (an accessor on the prototype is the common one)
+/// would pay two lookups per read for two answers that are the same.
+pub(crate) fn get_field_by_name_past_inherited_cache(
+    obj: *const ObjectHeader,
+    key: *const crate::StringHeader,
+) -> JSValue {
     if let Some(value) = unsafe { super::super::native_get::try_data_get_by_name(obj, key) } {
         return value;
     }
@@ -1000,32 +1024,7 @@ pub extern "C" fn js_object_get_field_by_name(
                     let key_len = (*key).byte_len as usize;
                     let key_bytes = std::slice::from_raw_parts(key_ptr, key_len);
                     if key_bytes == b"constructor" {
-                        if let Some(value) = crate::timer::timer_constructor_value(raw as i64) {
-                            return JSValue::from_bits(value.to_bits());
-                        }
-                    }
-                    if let Some(method) = timer_handle_method_name_static(key_bytes) {
-                        if crate::timer::is_known_timer_id(raw as i64) {
-                            let this_f64 = f64::from_bits(
-                                crate::value::js_nanbox_pointer(raw as i64).to_bits(),
-                            );
-                            // #8133: the `'static` literal, NOT `key_ptr`.
-                            let result = super::super::js_class_method_bind(
-                                this_f64,
-                                method.as_ptr(),
-                                method.len(),
-                            );
-                            return JSValue::from_bits(result.to_bits());
-                        }
-                    }
-                    // TextDecoder/TextEncoder registry handles — see
-                    // `text_handle_property` (text.rs).
-                    if let Some(v) = crate::text::text_handle_property(raw, key_bytes) {
-                        return v;
-                    }
-                    if key_bytes == b"constructor" {
-                        let null_obj_ptr = &NULL_OBJECT_BYTES as *const NullObjectBytes as *mut u8;
-                        return JSValue::from_bits(JSValue::pointer(null_obj_ptr).bits());
+                        return JSValue::from_bits(crate::object::null_stub_value().to_bits());
                     }
                     if let Some(dispatch) = handle_property_dispatch() {
                         let bits = dispatch(raw as i64, key_ptr, key_len);
@@ -1265,6 +1264,37 @@ pub extern "C" fn js_object_get_field_by_name(
                     }
                     return JSValue::from_bits(value.to_bits());
                 }
+                // A capture-carrying class declaration is materialized as a
+                // heap class object (`ClassExprFresh`).  References that were
+                // lowered before the declaration's runtime binding existed
+                // (the class constructor itself and earlier helper closures)
+                // still carry the template `ClassRef`.  Runtime additions such
+                // as `Object.defineProperty(C, "OPEN", { value: 1 })` live on
+                // the materialized object, so consulting only the template
+                // tables makes `C.OPEN` undefined in those bodies even though
+                // the same expression at the declaration site reads `1`.
+                //
+                // `CLASS_OBJECT_VALUES` is already the runtime identity used
+                // by `instance.constructor`.  Read that same current
+                // evaluation first, preserving its own-property and pinned
+                // static-parent semantics; a miss continues through the
+                // ordinary ClassRef registry path below.
+                if !is_prototype_ref {
+                    if let Some(class_object) =
+                        super::super::class_registry::class_object_value_for_cid(class_id)
+                    {
+                        let class_object = JSValue::from_bits(class_object.to_bits());
+                        if class_object.is_pointer() {
+                            let class_object = class_object.as_pointer::<ObjectHeader>();
+                            if !class_object.is_null() && class_object as usize != obj as usize {
+                                let value = js_object_get_field_by_name(class_object, key);
+                                if !value.is_undefined() {
+                                    return value;
+                                }
+                            }
+                        }
+                    }
+                }
                 // Instance (prototype) methods must only resolve when reading
                 // off the prototype ref (`C.prototype.m`), NOT off the class ref
                 // itself (`C.m`). In JS a class object does not expose its
@@ -1385,14 +1415,34 @@ pub extern "C" fn js_object_get_field_by_name(
                             let static_proto =
                                 super::super::class_registry::class_static_prototype(child);
                             if !static_proto.is_null() {
+                                // #10911: this walk re-enters with the PARENT as
+                                // the object. It was written when effect's `ast`
+                                // was a static DATA field (see above), where the
+                                // object doesn't matter; effect now makes `ast` a
+                                // static GETTER, and a getter found this way ran
+                                // with `this` === the parent class. Stash the
+                                // class the read started from so the accessor
+                                // binds it (spec OrdinaryGet threads Receiver) --
+                                // the same device `resolve_proto_chain_field_inner`
+                                // uses for instance getters.
+                                let prev =
+                                    crate::object::field_get_set::accessor_receiver_override_begin(
+                                        class_value,
+                                    );
                                 let v = js_object_get_field_by_name(static_proto as *const _, key);
+                                crate::object::field_get_set::accessor_receiver_override_end(prev);
                                 if !v.is_undefined() {
                                     return v;
                                 }
                             }
                             let proto = super::super::class_registry::class_prototype_object(child);
                             if !proto.is_null() {
+                                let prev =
+                                    crate::object::field_get_set::accessor_receiver_override_begin(
+                                        class_value,
+                                    );
                                 let v = js_object_get_field_by_name(proto as *const _, key);
+                                crate::object::field_get_set::accessor_receiver_override_end(prev);
                                 // Return a value present on the pinned object even
                                 // when it is `null` — a static explicitly set to
                                 // `null` on THIS evaluation is authoritative and

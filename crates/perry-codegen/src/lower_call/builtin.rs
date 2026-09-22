@@ -117,7 +117,6 @@ pub(super) fn lower_builtin_new<'a>(
         .get(class_name)
         .map(|s| s.as_str());
     let required_sources: Option<&[&str]> = match class_name {
-        "Client" | "Pool" => Some(&["pg"]),
         "Database" => Some(&["better-sqlite3"]),
         "DatabaseSync" | "Session" | "StatementSync" => Some(&["sqlite", "node:sqlite"]),
         "Redis" => Some(&["ioredis", "redis", "iovalkey"]),
@@ -248,6 +247,31 @@ pub(super) fn lower_builtin_new<'a>(
         // Uint8Array — i.e. ArrayBuffers — are aliased rather than
         // copied). SharedArrayBuffer uses the same storage allocation with a
         // separate runtime registry so util.types can distinguish it.
+        // #10873: `new ArrayBuffer(length, { maxByteLength })`. The options bag
+        // used to be dropped here — never even evaluated — so a resizable
+        // buffer silently came back fixed-length. The runtime reads
+        // `maxByteLength` AFTER `ToIndex(length)`, per spec, so both operands
+        // go over raw. `length` can be an object (its `valueOf` runs in the
+        // runtime), and lowering the options literal allocates: root it.
+        "ArrayBuffer" if args.len() >= 2 => {
+            let size_collects = rooting::any_operand_may_collect(ctx, args[1..].iter());
+            let size_idx = group.lower(ctx, &args[0], size_collects)?;
+            let options_idx = adopt_optional_arg(ctx, args, 1, group)?;
+            for arg in args.iter().skip(2) {
+                let _ = lower_expr(ctx, arg)?;
+            }
+            let size_box = group.reread(ctx, size_idx)?;
+            let options_box = match options_idx {
+                Some(i) => group.reread(ctx, i)?,
+                None => double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)),
+            };
+            let handle = ctx.block().call(
+                I64,
+                "js_array_buffer_new_with_options",
+                &[(DOUBLE, &size_box), (DOUBLE, &options_box)],
+            );
+            Ok(Some(nanbox_pointer_inline(ctx.block(), &handle)))
+        }
         "ArrayBuffer" | "SharedArrayBuffer" => {
             let size_box = if !args.is_empty() {
                 lower_expr(ctx, &args[0])?
@@ -620,41 +644,6 @@ pub(super) fn lower_builtin_new<'a>(
         }
         // (`WebSocketServer` is handled by an earlier branch lower in this
         // file — pre-existing from 2026-04-14. No new branch needed here.)
-        // pg Client — `new Client(config)` matching npm pg's API: synchronous
-        // constructor that stores the config; the user calls
-        // `await client.connect()` separately to open the TCP connection.
-        // Pre-fix `new Client(config)` fell into the empty-placeholder branch
-        // and every chained method (.connect/.query/.end) dispatched against
-        // junk. The runtime's older `js_pg_connect(config) -> Promise<Handle>`
-        // (still wired as the receiver-less `pg.connect(config)` factory)
-        // combines new+connect in one step; this branch maps the npm shape
-        // through the new `js_pg_client_new` (sync, stores config) +
-        // `js_pg_client_connect` (async, opens the connection) split.
-        "Client" => {
-            let config_val = if let Some(arg) = args.first() {
-                lower_expr(ctx, arg)?
-            } else {
-                double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED))
-            };
-            let blk = ctx.block();
-            let handle = blk.call(I64, "js_pg_client_new", &[(DOUBLE, &config_val)]);
-            Ok(Some(nanbox_pointer_inline(blk, &handle)))
-        }
-        // pg Pool — `new Pool(config)`. sqlx's `connect_lazy` makes this
-        // synchronous (no actual connections opened until first `.query()`),
-        // matching npm pg Pool's auto-connect-on-first-use semantics. The
-        // older `js_pg_create_pool` factory (returns Promise<Handle>) stays
-        // wired for `pg.Pool(config)` and similar patterns.
-        "Pool" => {
-            let config_val = if let Some(arg) = args.first() {
-                lower_expr(ctx, arg)?
-            } else {
-                double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED))
-            };
-            let blk = ctx.block();
-            let handle = blk.call(I64, "js_pg_pool_new", &[(DOUBLE, &config_val)]);
-            Ok(Some(nanbox_pointer_inline(blk, &handle)))
-        }
         // bun:sqlite Database — distinct internal name avoids colliding with
         // better-sqlite3's exported `Database` while preserving full JS values
         // for Bun's optional filename and flags object.

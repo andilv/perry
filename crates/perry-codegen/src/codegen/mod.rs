@@ -216,6 +216,8 @@ mod tdz_names;
 // `pub(crate)` so `crate::linker` can read the inline-hot-small policy
 // (`inline_hot_small_enabled` / `inline_hot_small_hint_threshold`).
 pub(crate) mod helpers;
+// #10399: the driver sets this before any module codegen runs.
+pub use helpers::{program_has_worker, set_program_has_worker};
 mod literal_constructor;
 mod method;
 mod method_registry;
@@ -425,6 +427,9 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
     let hir = live_cjs_hir.as_ref();
     let progress = CompileProgress::new(&hir.name, module_callable_count(hir));
     let triple = opts.target.clone().unwrap_or_else(default_target_triple);
+    // `PERRY_REGION_DIAG=1`: report step 4b's regions and the statement-level
+    // runs it does not reach, when this module's codegen ends.
+    let _region_diag = crate::expr::region_read_run::ModuleDiag::start(hir);
     let fp_flags = crate::block::FpFlags::new(opts.fast_math, opts.fp_contract_mode);
 
     // #5334 lever B: decide ONCE, up front, whether this module is large enough
@@ -1188,12 +1193,16 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             &c.name,
             &mut used_class_keys_globals,
         );
-        llmod.add_internal_global(&global_name, I64, "0");
+        // #10399: the keys array, the ShapeId and the header image are all
+        // composed by module init, so with a Worker in the program they are
+        // per-thread — which is also what #10399 Paths 2 and 3 were patching
+        // up at runtime (a foreign keys array / foreign ShapeId).
+        llmod.add_internal_module_state_global(&global_name, I64, "0");
         // #8772: the immutable class ShapeId is a producer-authored
         // whole-program capability. Generic callers in other modules load it
         // to guard reverse-discovered direct method arms. The keys array stays
         // private; only the opaque process-unique identity is exported.
-        llmod.add_global(
+        llmod.add_module_state_global(
             &crate::typed_shape::shape_id_global_name_from_keys_global(&global_name),
             I32,
             "0",
@@ -1208,7 +1217,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         );
         // #8122: the inline-`new` header image, composed at module init
         // (`string_pool.rs`) for the classes `class_header_images` admits.
-        llmod.add_internal_global(
+        llmod.add_internal_module_state_global(
             &crate::typed_shape::header_image_global_name_from_keys_global(&global_name),
             "<2 x i64>",
             "zeroinitializer",
@@ -1393,8 +1402,10 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             &c.name,
             &mut used_class_keys_globals,
         );
-        llmod.add_internal_global(&global_name, I64, "0");
-        llmod.add_internal_global(
+        // #10399: composed by module init -> per-thread when the program
+        // constructs a Worker.
+        llmod.add_internal_module_state_global(&global_name, I64, "0");
+        llmod.add_internal_module_state_global(
             &crate::typed_shape::shape_id_global_name_from_keys_global(&global_name),
             I32,
             "0",
@@ -1406,7 +1417,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         );
         // #8122: the inline-`new` header image, composed at module init
         // (`string_pool.rs`) for the classes `class_header_images` admits.
-        llmod.add_internal_global(
+        llmod.add_internal_module_state_global(
             &crate::typed_shape::header_image_global_name_from_keys_global(&global_name),
             "<2 x i64>",
             "zeroinitializer",
@@ -2404,7 +2415,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             .map(|object| (object.source_prefix.clone(), object.source_global_id))
             .collect();
     for (source_prefix, source_global_id) in &imported_object_producers {
-        llmod.add_external_global(
+        llmod.add_external_module_state_global(
             &format!("perry_global_{source_prefix}__{source_global_id}"),
             DOUBLE,
         );
@@ -2415,7 +2426,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             && imported_object_producers
                 .insert((candidate.source_prefix.clone(), candidate.source_global_id))
         {
-            llmod.add_external_global(
+            llmod.add_external_module_state_global(
                 &format!(
                     "perry_global_{}__{}",
                     candidate.source_prefix, candidate.source_global_id
@@ -2433,14 +2444,14 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         if candidate.source_prefix != module_prefix
             && declared_short_spread_shapes.insert(candidate.shape_id_global.clone())
         {
-            llmod.add_external_global(&candidate.shape_id_global, I32);
+            llmod.add_external_module_state_global(&candidate.shape_id_global, I32);
         }
     }
     for candidate in opts.object_literal_method_candidates.values().flatten() {
         if candidate.source_prefix != module_prefix
             && declared_short_spread_shapes.insert(candidate.shape_id_global.clone())
         {
-            llmod.add_external_global(&candidate.shape_id_global, I32);
+            llmod.add_external_module_state_global(&candidate.shape_id_global, I32);
         }
     }
 
@@ -3612,7 +3623,23 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             .exports
             .iter()
             .filter_map(|e| match e {
-                perry_hir::Export::Named { exported, .. } => Some(exported.clone()),
+                perry_hir::Export::Named { local, exported }
+                    if !hir.imports.iter().any(|import| {
+                        import.is_native
+                            && perry_api_manifest::is_node_core_module(&import.source)
+                            && import.specifiers.iter().any(|specifier| {
+                                matches!(
+                                    specifier,
+                                    perry_hir::ImportSpecifier::Named {
+                                        local: import_local,
+                                        ..
+                                    } if import_local == local
+                                )
+                            })
+                    }) =>
+                {
+                    Some(exported.clone())
+                }
                 _ => None,
             })
             .collect();

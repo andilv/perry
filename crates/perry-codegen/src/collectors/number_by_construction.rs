@@ -112,6 +112,11 @@ pub(crate) fn collect_number_by_construction_locals(
     spec_numeric_params: &HashSet<u32>,
     not_bigint_locals: &HashSet<u32>,
     module_global_proven_types: &HashMap<u32, HirType>,
+    // #10777: shape-proven receivers and the property names numeric on all of
+    // them, from `collect_shape_proven_ptr_locals`. Empty reproduces the
+    // pre-fix behaviour exactly.
+    shape_members: &HashSet<u32>,
+    shape_numeric_fields: &HashSet<String>,
 ) -> HashSet<u32> {
     if !enabled() {
         return HashSet::new();
@@ -155,6 +160,8 @@ pub(crate) fn collect_number_by_construction_locals(
         not_bigint_locals,
         &HashMap::new(),
         &numeric_ta_views,
+        shape_members,
+        shape_numeric_fields,
     );
     numeric.extend(collect_number_at_read_after_undefined(
         stmts,
@@ -648,6 +655,8 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             ta_views,
+            &HashSet::new(),
+            &HashSet::new(),
         )
     }
 
@@ -741,5 +750,156 @@ mod tests {
         )));
         let numeric = run_fixpoint(&stmts, &HashSet::new());
         assert!(!numeric.contains(&acc));
+    }
+}
+
+// ── #10777: shape inputs for the function-scope walk ──────────────────────
+
+/// `PERRY_L14_NBC_ORDER` gate. **Default OFF.** When off this returns empty
+/// sets, the fixpoint sees exactly what it saw before, and every emitted byte
+/// is identical to the pre-fix build — the reorder in `hir_facts.rs` is pure,
+/// so the knob gates the INPUTS, not the position. Keyed into the object cache
+/// so a warm cache cannot serve the other arm's object.
+pub(crate) fn nbc_order_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        matches!(
+            std::env::var("PERRY_L14_NBC_ORDER").as_deref(),
+            Ok("1") | Ok("on") | Ok("true")
+        )
+    })
+}
+
+/// Turn the receiver proofs into the `(members, numeric_fields)` pair the
+/// function-scope fixpoint needs.
+///
+/// ## Why an INTERSECTION, and why that is sound
+///
+/// `expr_numeric_by_construction` takes ONE `numeric_fields` set for ONE
+/// receiver class, because its other caller proves one receiver at a time. A
+/// function-scope walk may see several shape-proven receivers of different
+/// classes, and the arm it feeds asks only "is `members.contains(recv)` and
+/// `numeric_fields.contains(prop)`" — it does not re-check which receiver the
+/// property belongs to.
+///
+/// So the set passed must be numeric on **every** admitted receiver, which is
+/// the intersection: if `prop` is numeric on all of them, it is numeric on
+/// whichever one the expression names. Under-approximates when receivers
+/// disagree; exact for a single shape-proven receiver.
+///
+/// A union would be a WRONG ANSWER, not a weaker one: `a` numeric on `C` and
+/// not on `D` would license a bare `fadd` on `D.a`.
+/// The gate is passed in so both modes can be tested without changing the
+/// process environment shared by parallel unit tests.
+pub(crate) fn shape_numeric_inputs(
+    shape_proven: &HashMap<u32, crate::collectors::ptr_shape::PtrShapeLocal>,
+    enabled: bool,
+) -> (HashSet<u32>, HashSet<String>) {
+    if !enabled || shape_proven.is_empty() {
+        return (HashSet::new(), HashSet::new());
+    }
+    let mut members: HashSet<u32> = HashSet::new();
+    let mut fields: Option<HashSet<String>> = None;
+    for (id, fact) in shape_proven {
+        members.insert(*id);
+        fields = Some(match fields {
+            None => fact.numeric_fields.clone(),
+            Some(acc) => acc
+                .intersection(&fact.numeric_fields)
+                .cloned()
+                .collect::<HashSet<String>>(),
+        });
+    }
+    let fields = fields.unwrap_or_default();
+    if fields.is_empty() {
+        return (HashSet::new(), HashSet::new());
+    }
+    (members, fields)
+}
+
+#[cfg(test)]
+mod shape_input_tests {
+    use super::*;
+    use crate::collectors::ptr_shape::PtrShapeLocal;
+
+    fn property_local(id: u32, receiver: u32, property: &str) -> Stmt {
+        Stmt::Let {
+            id,
+            name: format!("value_{id}"),
+            ty: HirType::Any,
+            mutable: false,
+            init: Some(Expr::PropertyGet {
+                object: Box::new(Expr::LocalGet(receiver)),
+                property: property.to_string(),
+                byte_offset: 0,
+            }),
+        }
+    }
+
+    fn numeric_locals(
+        stmts: &[Stmt],
+        members: &HashSet<u32>,
+        fields: &HashSet<String>,
+    ) -> HashSet<u32> {
+        super::super::ptr_shape::collect_numeric_by_construction_locals_for_type_analysis(
+            stmts,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            members,
+            fields,
+        )
+    }
+
+    #[test]
+    fn nbc_order_intersects_numeric_fields_before_proving_property_locals() {
+        let shape_proven = HashMap::from([
+            (
+                10,
+                PtrShapeLocal {
+                    class_name: "First".to_string(),
+                    numeric_fields: HashSet::from(["shared".to_string(), "first_only".to_string()]),
+                    report_name: None,
+                },
+            ),
+            (
+                11,
+                PtrShapeLocal {
+                    class_name: "Second".to_string(),
+                    numeric_fields: HashSet::from(["shared".to_string()]),
+                    report_name: None,
+                },
+            ),
+        ]);
+        let stmts = [
+            property_local(20, 10, "shared"),
+            property_local(21, 11, "shared"),
+            property_local(22, 11, "first_only"),
+            property_local(23, 10, "first_only"),
+            property_local(24, 12, "shared"),
+        ];
+
+        let (members, fields) = shape_numeric_inputs(&shape_proven, true);
+        let numeric = numeric_locals(&stmts, &members, &fields);
+        assert!(numeric.contains(&20), "shared field on First is numeric");
+        assert!(numeric.contains(&21), "shared field on Second is numeric");
+        assert!(
+            !numeric.contains(&22),
+            "union would unsoundly admit Second.first_only"
+        );
+        assert!(
+            !numeric.contains(&23),
+            "function-wide inputs must be safe for both receivers"
+        );
+        assert!(
+            !numeric.contains(&24),
+            "an unproven receiver is not a numeric input"
+        );
+
+        let (off_members, off_fields) = shape_numeric_inputs(&shape_proven, false);
+        assert!(numeric_locals(&stmts, &off_members, &off_fields).is_empty());
     }
 }

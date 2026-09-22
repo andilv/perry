@@ -15,6 +15,66 @@ fn make_ctx() -> LoweringContext {
     LoweringContext::new("test.ts")
 }
 
+#[test]
+fn a_computed_instance_field_key_is_not_a_constructor_capture() {
+    let source = r#"
+        function make() {
+            const items = Symbol("items");
+            const payload = { ok: true };
+            class Base {
+                [items] = [];
+                getPayload() { return payload; }
+            }
+            return Base;
+        }
+    "#;
+    let module =
+        perry_parser::parse_typescript(source, "computed-field-key.ts").expect("source parses");
+    let hir = super::lower_module(&module, "computed-field-key", "computed-field-key.ts")
+        .expect("source lowers");
+    let class = hir
+        .classes
+        .iter()
+        .find(|class| class.name == "Base")
+        .expect("nested class is lowered");
+
+    assert_eq!(
+        class
+            .fields
+            .iter()
+            .filter(|field| field.name.starts_with("__perry_cap_"))
+            .count(),
+        1,
+        "the method value is captured, but the definition-time key is not"
+    );
+    assert!(class.fields[0].key_expr.is_some());
+    assert!(
+        class.constructor.is_some(),
+        "the unrelated method capture keeps a synthesized constructor"
+    );
+}
+
+#[test]
+fn a_lexical_fetch_result_is_not_registered_as_a_native_response() {
+    let source = r#"
+        function fetch(_url: string) {
+            return Promise.resolve({ text() { return "userland"; } });
+        }
+        async function run() {
+            const response = await fetch("http://localhost/");
+            return response.text();
+        }
+    "#;
+    let module = perry_parser::parse_typescript(source, "fetch-shadow.ts").expect("source parses");
+    let hir =
+        super::lower_module(&module, "fetch-shadow", "fetch-shadow.ts").expect("source lowers");
+    let dump = format!("{hir:?}");
+    assert!(
+        !dump.contains("NativeMethodCall { module: \"fetch\", class_name: Some(\"Response\")"),
+        "a lexical fetch function must keep userland Response dispatch: {dump}"
+    );
+}
+
 mod instanceof_rhs;
 mod literal_shape;
 
