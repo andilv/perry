@@ -140,7 +140,7 @@ jobs:
             # per-target rustflags (musl libc.a search order + fortify off).
             FEATURES="--no-default-features --features full-cli"
           fi
-          cargo build --${{ github.event.inputs.profile }} --target ${{ steps.target.outputs.triple }} $FEATURES -p perry
+          cargo build --profile ${{ github.event.inputs.profile }} --target ${{ steps.target.outputs.triple }} $FEATURES -p perry
 
       - name: Verify musl binary is fully static
         if: steps.filter.outputs.run == 'true' && matrix.musl == true
@@ -152,52 +152,48 @@ jobs:
             exit 1
           fi
 
-      - name: Build runtime, stdlib, and shared-tokio ext libraries
-        # #507 — tokio-using wrappers (ws / net / http / db drivers / mail)
-        # MUST be built in the SAME cargo invocation as perry-stdlib. Each
-        # separate `cargo build` invocation unifies tokio features over its
-        # own closure, producing a second tokio compilation whose
-        # hash-mangled CONTEXT thread-local differs from the one
-        # perry-stdlib's runtime enters. The final binary then carries two
-        # CONTEXT TLS variables and any I/O wrapper panics at runtime with
-        # "there is no reactor running". One invocation forces cargo to
-        # resolve a single tokio artifact for the whole closure — identical
-        # mangled symbols, linker dedup, one TLS (this is exactly what the
-        # in-tree auto-optimize path does; the authoritative crate list is
-        # `binding_needs_shared_tokio` in
-        # crates/perry/src/commands/compile/optimized_libs/freshness.rs).
-        # `--keep-going` preserves the old best-effort semantics: a wrapper
-        # that cannot build on this host is skipped without aborting the
-        # rest, while feature unification still applies to every crate that
-        # does build.
+      - name: Build runtime and stdlib
+        # Core libraries the bundle ships. Built first so the closure's
+        # feature resolution is owned by this invocation; every ext crate
+        # below reuses the result from cache.
         if: steps.filter.outputs.run == 'true'
         run: |
-          cargo build --${{ github.event.inputs.profile }} --target ${{ steps.target.outputs.triple }} --keep-going \
+          cargo build --profile ${{ github.event.inputs.profile }} --target ${{ steps.target.outputs.triple }} --keep-going \
             -p perry-runtime -p perry-runtime-static \
-            -p perry-stdlib -p perry-stdlib-static \
-            -p perry-ext-net -p perry-ext-ws -p perry-ext-http \
-            -p perry-ext-fetch -p perry-ext-undici \
-            -p perry-ext-undici -p perry-ext-mongodb -p perry-ext-pg \
-            -p perry-ext-mysql2 -p perry-ext-ioredis -p perry-ext-nodemailer
+            -p perry-stdlib -p perry-stdlib-static
 
-      - name: Build remaining native ext libraries (CPU-only)
-        # CPU-only wrappers (bcrypt, sharp, zlib, dotenv, ...) route their
-        # async work through perry-ffi's spawn_blocking shim into
-        # perry-stdlib's tokio — they carry no tokio of their own, so
-        # separate invocations are safe here. Every crate on the
-        # shared-tokio list above must stay OUT of this loop or #507
-        # regresses silently.
-        if: steps.filter.outputs.run == 'true' && runner.os != 'Windows'
+      - name: Build native ext libraries (derived from the governance inventory)
+        # #507 — tokio-using wrappers must share a cargo invocation with the
+        # stdlib, or cargo resolves a second tokio compilation whose
+        # hash-mangled CONTEXT thread-local differs from the one
+        # perry-stdlib's runtime enters; the final binary then carries two
+        # CONTEXT TLS variables and any I/O wrapper panics at runtime with
+        # "there is no reactor running". Upstream's #7358 pattern guarantees
+        # that structurally: EVERY wrapper is built alongside
+        # perry-runtime/-stdlib (plain + -static), so no hardcoded
+        # tokio-vs-CPU crate split is needed.
+        # The crate list comes from scripts/release_ext_packages.sh — the
+        # governance inventory upstream's own release workflow consumes — so
+        # ext crates added or removed upstream flow through without workflow
+        # edits (the old hardcoded lists broke on every binding removal:
+        # axios a97f72b25, fastify dcb8a760a, fetch/pg/mysql2 b77aba634).
+        # Best-effort per crate: a wrapper that cannot build on this host is
+        # skipped without failing the leg (packaging ships whatever was
+        # produced; missing archives surface as compile-time errors for
+        # out-of-tree users, and the verify step below warns per missing
+        # governed lib).
+        if: steps.filter.outputs.run == 'true'
         run: |
-          SHARED_TOKIO="perry-ext-net perry-ext-ws perry-ext-http perry-ext-fetch perry-ext-undici perry-ext-mongodb perry-ext-pg perry-ext-mysql2 perry-ext-ioredis perry-ext-nodemailer"
-          for d in crates/perry-ext-*; do
-            [ -d "$d" ] || continue
-            name=$(basename "$d")
-            case " $SHARED_TOKIO " in
-              *" $name "*) continue ;;
-            esac
-            cargo build --${{ github.event.inputs.profile }} --target ${{ steps.target.outputs.triple }} -p "$name" || true
-          done
+          governed_ext_packages=$(./scripts/release_ext_packages.sh)
+          while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            echo "::group::build $name"
+            cargo build --profile ${{ github.event.inputs.profile }} --target ${{ steps.target.outputs.triple }} \
+              -p perry-runtime -p perry-runtime-static \
+              -p perry-stdlib -p perry-stdlib-static \
+              -p "$name" || echo "  (skipped $name — failed to build on this host)"
+            echo "::endgroup::"
+          done <<< "$governed_ext_packages"
 
       - name: Verify shared tokio across stdlib and tokio-set ext libs
         # Gates the #507 property the bundle actually ships: the tokio
@@ -230,22 +226,29 @@ jobs:
               exit 1
             fi
           fi
-          for lib in net ws http fetch undici mongodb pg mysql2 ioredis nodemailer; do
-            archive="$LIBDIR/libperry_ext_$lib.a"
+          # Same governance inventory the build step consumed — adding or
+          # removing an ext crate upstream needs no edit here.
+          governed_ext_packages=$(./scripts/release_ext_packages.sh)
+          checked=0
+          while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            short="${name#perry-ext-}"
+            archive="$LIBDIR/libperry_ext_$short.a"
             if [ ! -f "$archive" ]; then
-              echo "::warning::libperry_ext_$lib.a missing (keep-going skipped it) — out-of-tree users fall back to the perry-stdlib copy or a compile-time error"
+              echo "::warning::libperry_ext_$short.a missing (skipped on this host) — out-of-tree users fall back to the perry-stdlib copy or a compile-time error"
               continue
             fi
+            checked=$((checked + 1))
             lib_tokio="$(grep -aoE 'Cs[0-9a-zA-Z]{8,}_5tokio' "$archive" 2>/dev/null | sort -u || true)"
-            # A wrapper with NO tokio symbols (undici) cannot carry the
-            # CONTEXT collision; only compare when the archive actually
-            # references tokio.
+            # A wrapper with NO tokio symbols (undici, or a CPU-only wrapper)
+            # cannot carry the CONTEXT collision; only compare when the
+            # archive actually references tokio.
             if [ -n "$lib_tokio" ] && [ "$lib_tokio" != "$STDLIB_TOKIO" ]; then
-              echo "::error::libperry_ext_$lib.a tokio ($lib_tokio) != stdlib tokio ($STDLIB_TOKIO) — CONTEXT TLS mismatch, runtime panic (#507)"
+              echo "::error::libperry_ext_$short.a tokio ($lib_tokio) != stdlib tokio ($STDLIB_TOKIO) — CONTEXT TLS mismatch, runtime panic (#507)"
               exit 1
             fi
-          done
-          echo "shared-tokio verification passed: $STDLIB_TOKIO"
+          done <<< "$governed_ext_packages"
+          echo "shared-tokio verification passed over $checked ext archive(s): $STDLIB_TOKIO"
 
       - name: Package (Unix)
         if: steps.filter.outputs.run == 'true' && runner.os != 'Windows'
