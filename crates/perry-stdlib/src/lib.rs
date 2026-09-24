@@ -6,6 +6,9 @@
 //! # Features
 //! - `core` - Minimal runtime (always included)
 //! - `http-server` - Native HTTP server (hyper-based)
+//! - `http-client` - Web Fetch and Axios compatibility surface
+//! - `database` - In-stdlib databases (sqlite only; postgres/mysql/redis/mongodb
+//!   are served by the perry-ext-* wrappers)
 //! - `http-client` - Web Fetch compatibility surface
 //! - `database` - All databases (postgres, mysql, sqlite, redis, mongodb)
 //! - `crypto` - Cryptographic functions
@@ -21,21 +24,18 @@ pub use perry_updater;
 
 // `extern "C"` shims that perry-ffi declares for use by external
 // native binding crates (#466 Phase 1 + 5 — async surface). Gated
-// on `async-runtime` because the underlying async_bridge does;
-// every wrapper that depends on these (bcrypt, argon2, ws, db
-// drivers, …) already triggers `async-runtime` through its own
-// per-binding feature, so the linkage is automatic.
-#[cfg(feature = "async-runtime")]
+// on `async-bridge` because the underlying async_bridge is; the
+// three shims that drive tokio futures (`perry_ffi_spawn_async`,
+// `perry_ffi_spawn_blocking_with_reactor`, and `perry_ffi_spawn_blocking`'s
+// tokio-pool arm) additionally need `async-runtime`, which every
+// wrapper that calls them selects through the auto-optimize driver.
+#[cfg(feature = "async-bridge")]
 pub mod perry_ffi_async;
 
 // Core modules - always available
 pub mod async_local_storage;
 pub mod common;
 pub mod domain;
-// decimal feature-gated as of v0.5.547 — well-known flip routes
-// to perry-ext-decimal.
-#[cfg(feature = "bundled-decimal")]
-pub mod decimal;
 // dotenv is feature-gated as of v0.5.533 so the well-known bindings
 // table (#466 Phase 4) can route `import 'dotenv'` to perry-ext-dotenv
 // without duplicate _js_dotenv_* symbols at link time. Default-on
@@ -69,8 +69,6 @@ mod multipart_parser;
 // Re-export core
 pub use async_local_storage::*;
 pub use common::*;
-#[cfg(feature = "bundled-decimal")]
-pub use decimal::*;
 pub use domain::*;
 #[cfg(feature = "bundled-events")]
 pub use events::*;
@@ -92,6 +90,29 @@ pub use framework::*;
 // compiles the real npm package from source, same as any other package
 // under the wildcard resolution.
 
+// === turnloop P6: the shared client TLS session ===
+// Driven by both outbound engines below (`turnloop_client`, `turnloop_smtp`).
+#[cfg(any(feature = "turnloop-http-client", feature = "turnloop-smtp-client"))]
+pub(crate) mod turnloop_tls_client;
+
+// === turnloop P6: SMTP on turnloop handles ===
+// `turnloop-smtp`'s sans-I/O `Connection` over a turnloop socket. Gated on its
+// own feature rather than `bundled-nodemailer` so the `js_smtp_*` entry points
+// survive the well-known flip that strips the bundled surface — that is how
+// perry-ext-nodemailer reaches this engine.
+#[cfg(feature = "turnloop-smtp-client")]
+pub mod turnloop_smtp;
+
+// === turnloop P6: outbound HTTP/1.1 on turnloop handles ===
+// The only transport `fetch` has — directly when this thread owns the agent's
+// loop, and through turnloop P10's `agent_post` when another thread of the
+// same agent does. What the engine refuses (an undrivable proxy, a URL the
+// fetch policy layer rejects, a host where `Loop::new` failed) rejects with
+// Node's error; there is no reqwest fallback any more. See `turnloop_client`'s
+// module note.
+#[cfg(feature = "turnloop-http-client")]
+pub mod turnloop_client;
+
 // === Web Fetch API (fetch / Headers / Request / Response / Blob) ===
 // #5174: gated on `web-fetch`, not `http-client`, so Web Fetch stays
 // independent from the external node:http implementation.
@@ -110,8 +131,8 @@ pub mod fetch;
 //
 // The definitions genuinely need Fetch machinery (`FETCH_RESPONSES`,
 // `consume_response_body`), so they cannot simply move out; and making the http
-// features depend on `web-fetch` would link `reqwest` — an HTTP *client* — into
-// every `node:http` *server* build. Instead the symbols always exist, and
+// features depend on `web-fetch` would link an HTTP *client* into every
+// `node:http` *server* build. Instead the symbols always exist, and
 // without Web Fetch they answer "nothing to bridge", which is exactly right:
 // with no `fetch` module there are no `Response` objects to snapshot.
 #[cfg(not(feature = "web-fetch"))]
@@ -158,6 +179,13 @@ pub mod streams;
 #[cfg(feature = "bundled-streams")]
 pub use streams::*;
 
+// === TLS over a tokio transport (turnloop P8 group H) ===
+// perry-tls-session's sans-I/O rustls session driven over the tokio sockets
+// the bundled `node:tls` server, `net` client and `wss://` connector still
+// use — the replacement for their former tokio-rustls streams.
+#[cfg(any(feature = "tls-runtime", feature = "bundled-ws"))]
+pub(crate) mod tls_stream;
+
 // === WebSocket ===
 #[cfg(feature = "bundled-ws")]
 pub mod ws;
@@ -192,6 +220,12 @@ pub mod tls;
 pub use tls::*;
 
 // === Databases ===
+// The bundled `pg` / `mysql2` / `ioredis` / `mongodb` modules were deleted in
+// turnloop P8 group H. `import 'pg'` / `'mysql2'` / `'ioredis'` / `'redis'` /
+// `'iovalkey'` / `'mongodb'` are served exclusively by the perry-ext-*
+// wrappers through the well-known flip, which is the only path they have taken
+// since v0.5.565-568; each wrapper defines a strict superset of the symbols the
+// bundled copy did. Only sqlite remains in-stdlib.
 // Both in-tree database wrappers that lived here are gone: the `pg`
 // module + `bundled-pg` feature (#10677) and the `mysql2` module +
 // `bundled-mysql2` feature (#10680), the pre-#466 native
@@ -232,16 +266,6 @@ pub extern "C" fn js_sqlite_is_db_handle(_handle: i64) -> i32 {
 pub extern "C" fn js_sqlite_is_stmt_handle(_handle: i64) -> i32 {
     0
 }
-
-#[cfg(feature = "bundled-ioredis")]
-pub mod ioredis;
-#[cfg(feature = "bundled-ioredis")]
-pub use ioredis::*;
-
-#[cfg(feature = "bundled-mongodb")]
-pub mod mongodb;
-#[cfg(feature = "bundled-mongodb")]
-pub use mongodb::*;
 
 // === Crypto ===
 #[cfg(feature = "crypto")]

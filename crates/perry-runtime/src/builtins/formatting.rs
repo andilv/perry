@@ -748,7 +748,8 @@ pub(crate) fn format_jsvalue(value: f64, depth: usize) -> String {
                     if depth > inspect_depth_limit() {
                         return inspect_finish_circular(ptr as usize, "[Object]".to_string());
                     }
-                    let _keys_array = crate::object::object_keys_array(obj_ptr);
+                    let _keys_array_view = crate::object::object_keys(obj_ptr);
+                    let _keys_array = _keys_array_view.arr();
 
                     // Always route through `format_object_as_json` so the
                     // `[util.inspect.custom]` hook lookup runs even for
@@ -1113,11 +1114,12 @@ unsafe fn format_object_as_json(
         }
     };
 
-    let keys_array = crate::object::object_keys_array(obj_ptr);
+    let keys_array_view = crate::object::object_keys(obj_ptr);
+    let keys_array = keys_array_view.arr();
     let key_count = if keys_array.is_null() {
         0
     } else {
-        crate::array::js_array_length(keys_array) as usize
+        keys_array_view.count() as usize
     };
 
     // Honor `Object.defineProperty(..., { enumerable: false })`. By default
@@ -1153,6 +1155,23 @@ unsafe fn format_object_as_json(
         // Perry stores private class fields in the regular key table, but
         // Node's util.inspect never exposes them, even with showHidden.
         if has_class_name && key_str.starts_with('#') {
+            continue;
+        }
+
+        // Perry's hidden runtime-internal own keys physically live in the
+        // keys_array but are not JS properties at all: the #6438 class-object
+        // parent edge (`__perry_parent_class`), the #10624 constructing-class
+        // instance pin (`__perry_ctor_class_object`), the Map/Set subclass
+        // backing store, WeakMap entries, capture snapshots, private brands.
+        // `is_internal_runtime_key` is the one exact allowlist every other
+        // own-key consumer already applies — `Object.keys`, `for…in`,
+        // `getOwnPropertyNames`, `JSON.stringify`, `hasOwnProperty`, spread.
+        // util.inspect was the lone hold-out, so a per-evaluation class object
+        // (or any instance constructed from one) rendered
+        // `{ __perry_ctor_class_object: … }` in its body where Node prints
+        // nothing. `showHidden` deliberately does NOT reveal them: it exposes
+        // non-enumerable JS properties, and these are runtime bookkeeping.
+        if crate::object::is_internal_runtime_key(&key_str) {
             continue;
         }
 
@@ -1482,7 +1501,8 @@ fn format_jsvalue_for_json(value: f64, depth: usize) -> String {
                         if depth > inspect_depth_limit() {
                             return inspect_finish_circular(ptr as usize, "[Object]".to_string());
                         }
-                        let keys_array = crate::object::object_keys_array(obj_ptr);
+                        let keys_array_view = crate::object::object_keys(obj_ptr);
+                        let keys_array = keys_array_view.arr();
                         let body_str = if !keys_array.is_null()
                             && (keys_array as usize) > 0x10000
                             && ((keys_array as u64) >> 48) == 0
@@ -1596,6 +1616,9 @@ fn format_inspect_property_key(key: &str) -> String {
 
 #[cfg(test)]
 mod inspect_property_key_tests;
+
+#[cfg(test)]
+mod internal_key_hiding_tests;
 
 #[inline]
 fn looks_like_raw_heap_pointer(value: f64) -> bool {

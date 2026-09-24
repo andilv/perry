@@ -506,7 +506,14 @@ const FFI_REGISTRY: &[(&str, OwnerKind)] = &[
     ("js_ws_connect",                               OwnerKind::WellKnown("ws")),
     ("js_ws_connect_start",                         OwnerKind::WellKnown("ws")),
     ("js_ws_send",                                  OwnerKind::WellKnown("ws")),
+    ("js_ws_send_value",                            OwnerKind::WellKnown("ws")),
+    ("js_ws_send_value_client_i64",                 OwnerKind::WellKnown("ws")),
     ("js_ws_close",                                 OwnerKind::WellKnown("ws")),
+    ("js_ws_close_with",                            OwnerKind::WellKnown("ws")),
+    ("js_ws_close_with_client_i64",                 OwnerKind::WellKnown("ws")),
+    ("js_ws_ping",                                  OwnerKind::WellKnown("ws")),
+    ("js_ws_pong",                                  OwnerKind::WellKnown("ws")),
+    ("js_ws_terminate",                             OwnerKind::WellKnown("ws")),
     ("js_ws_on",                                    OwnerKind::WellKnown("ws")),
     ("js_ws_receive",                               OwnerKind::WellKnown("ws")),
     ("js_ws_is_open",                               OwnerKind::WellKnown("ws")),
@@ -522,6 +529,7 @@ const FFI_REGISTRY: &[(&str, OwnerKind)] = &[
     ("js_ws_server_address",                        OwnerKind::WellKnown("ws")),
     ("js_ws_server_emit",                           OwnerKind::WellKnown("ws")),
     ("js_ws_server_close",                          OwnerKind::WellKnown("ws")),
+    ("js_ws_server_close_with",                     OwnerKind::WellKnown("ws")),
 
     // ── #1724: global Blob/File + URL object-URL helpers ──────────────
     // `new Blob([...])`, `new File([...], name)`, `URL.createObjectURL`,
@@ -634,6 +642,25 @@ const EXT_PREFIX_REGISTRY: &[(&str, &str)] = &[
     ("js_bun_transpiler_", "typescript"),
     ("js_bun_build", "typescript"),
 ];
+
+/// Return the well-known binding that provides an emitted FFI symbol. The
+/// compile driver's pre-link check uses the same exact and prefix registries
+/// as codegen's provider routing, including the two-provider Bun server call.
+pub fn well_known_owner_for_symbol(symbol: &str) -> Option<&'static str> {
+    if symbol == "js_bun_serve" {
+        return Some("http");
+    }
+    if let Some((_, owner)) = FFI_REGISTRY.iter().find(|(name, _)| *name == symbol) {
+        return match owner {
+            OwnerKind::WellKnown(key) => Some(key),
+            OwnerKind::Stdlib { .. } => None,
+        };
+    }
+    EXT_PREFIX_REGISTRY
+        .iter()
+        .find(|(prefix, _)| symbol.starts_with(prefix))
+        .map(|(_, binding)| *binding)
+}
 
 /// Process-wide collector of provider keys observed during codegen.
 /// Populated by [`record_ffi_call`] from `LlBlock::call` / `call_void`.

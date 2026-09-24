@@ -410,6 +410,18 @@ pub(crate) const PERRY_UI_TABLE_PART_A: &[MethodRow] = &[
         ret: ReturnKind::Void,
     },
     MethodRow {
+        method: "textSetLetterSpacing",
+        runtime: "perry_ui_text_set_letter_spacing",
+        args: &[ArgKind::Widget, ArgKind::F64],
+        ret: ReturnKind::Void,
+    },
+    MethodRow {
+        method: "textSetLineHeight",
+        runtime: "perry_ui_text_set_line_height",
+        args: &[ArgKind::Widget, ArgKind::F64],
+        ret: ReturnKind::Void,
+    },
+    MethodRow {
         method: "textSetString",
         runtime: "perry_ui_text_set_string",
         args: &[ArgKind::Widget, ArgKind::Str],
@@ -844,6 +856,24 @@ pub(crate) const PERRY_UI_TABLE_PART_A: &[MethodRow] = &[
         runtime: "perry_ui_textfield_focus",
         args: &[ArgKind::Widget],
         ret: ReturnKind::Void,
+    },
+    MethodRow {
+        method: "textfieldSetSelectionRange",
+        runtime: "perry_ui_textfield_set_selection_range",
+        args: &[ArgKind::Widget, ArgKind::F64, ArgKind::F64],
+        ret: ReturnKind::Void,
+    },
+    MethodRow {
+        method: "textfieldGetSelectionStart",
+        runtime: "perry_ui_textfield_get_selection_start",
+        args: &[ArgKind::Widget],
+        ret: ReturnKind::F64,
+    },
+    MethodRow {
+        method: "textfieldGetSelectionEnd",
+        runtime: "perry_ui_textfield_get_selection_end",
+        args: &[ArgKind::Widget],
+        ret: ReturnKind::F64,
     },
     MethodRow {
         method: "textfieldBlurAll",

@@ -183,6 +183,7 @@ mod artifact_source_text;
 mod artifacts;
 mod boxed_locals;
 mod cjs_exports;
+mod class_artifacts;
 #[cfg(test)]
 mod clone_suffix_tests;
 mod closure;
@@ -199,6 +200,7 @@ mod declared_string_add_tests;
 mod emission_order_tests;
 mod entry;
 pub mod entry_outline;
+mod export_value_wrappers;
 pub(crate) mod func_registry;
 mod function;
 mod function_source_header;
@@ -2537,6 +2539,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         imported_vars: opts.imported_vars,
         imported_object_literals,
         needs_stdlib: opts.needs_stdlib,
+        program_is_synchronous: opts.program_is_synchronous,
         needs_geisterhand: opts.needs_geisterhand,
         geisterhand_port: opts.geisterhand_port,
         compile_time_constants,
@@ -2618,8 +2621,9 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             // into a flat `[N x i32]` LLVM constant so `X[i][j]` / `krow[j]` can
             // load directly from `.rodata` instead of chasing the arena array
             // header. Qualifying locals are `Let { mutable: false }`, have a
-            // rectangular int-literal 2D init, and are never mutated anywhere
-            // in the module (LocalSet/Update/IndexSet/mutating methods).
+            // rectangular int-literal 2D init, and are used only by direct
+            // element reads or read-only row aliases. Any observable row value
+            // or write keeps the normal heap representation authoritative.
             let mut map: std::collections::HashMap<u32, crate::expr::FlatConstInfo> =
                 std::collections::HashMap::new();
             for s in logical_entry_stmts.iter().copied() {
@@ -2631,35 +2635,39 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
                 } = s
                 {
                     if let Some((rows, cols, vals)) = crate::expr::try_flat_const_2d_int(init) {
-                        let mut mutated = false;
-                        if crate::collectors::has_any_mutation(&hir.init, *id) {
-                            mutated = true;
-                        }
-                        if !mutated {
+                        let mut safe =
+                            crate::collectors::flat_const_array_uses_are_read_only(&hir.init, *id);
+                        if safe {
                             for f in &hir.functions {
-                                if crate::collectors::has_any_mutation(&f.body, *id) {
-                                    mutated = true;
+                                if !crate::collectors::flat_const_array_uses_are_read_only(
+                                    &f.body, *id,
+                                ) {
+                                    safe = false;
                                     break;
                                 }
                             }
                         }
-                        if !mutated {
+                        if safe {
                             'outer: for c in &hir.classes {
                                 for m in &c.methods {
-                                    if crate::collectors::has_any_mutation(&m.body, *id) {
-                                        mutated = true;
+                                    if !crate::collectors::flat_const_array_uses_are_read_only(
+                                        &m.body, *id,
+                                    ) {
+                                        safe = false;
                                         break 'outer;
                                     }
                                 }
                                 if let Some(ctor) = &c.constructor {
-                                    if crate::collectors::has_any_mutation(&ctor.body, *id) {
-                                        mutated = true;
+                                    if !crate::collectors::flat_const_array_uses_are_read_only(
+                                        &ctor.body, *id,
+                                    ) {
+                                        safe = false;
                                         break;
                                     }
                                 }
                             }
                         }
-                        if !mutated {
+                        if safe {
                             let gname = format!("perry_flat_{}__{}", module_prefix, id);
                             let init_str = format!(
                                 "[{}]",
@@ -3624,9 +3632,14 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             .iter()
             .filter_map(|e| match e {
                 perry_hir::Export::Named { local, exported }
+                    // #11044: matches the broadened getter-emission gate in
+                    // artifacts.rs — `import.is_native` alone, not restricted
+                    // to node-core builtins, since non-core Perry-native
+                    // packages (ws, ioredis, ...) get the same synthetic
+                    // Import+Export pair from module_decl.rs's re-export
+                    // handling and must skip this dead-stub arm too.
                     if !hir.imports.iter().any(|import| {
                         import.is_native
-                            && perry_api_manifest::is_node_core_module(&import.source)
                             && import.specifiers.iter().any(|specifier| {
                                 matches!(
                                     specifier,

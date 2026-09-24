@@ -71,6 +71,30 @@ pub(super) fn try_static_method_and_instance(
     // handle it. Refs test262 language/arguments-object
     // cls-*-static-*-spread-operator.
     let static_call_has_spread = call.args.iter().any(|a| a.spread.is_some());
+
+    // `import * as web from "node:stream/web"; (web.ReadableStream as
+    // any).from(xs)` has a nested namespace receiver. Route it through the
+    // same native factory as the named-import form before the generic
+    // module.Class.staticMethod arm sees it as `stream/web.ReadableStream`.
+    if !static_call_has_spread {
+        if let ast::Expr::Member(member) = expr {
+            if matches!(&member.prop, ast::MemberProp::Ident(prop) if prop.sym.as_ref() == "from")
+                && crate::lower_types::is_web_readable_stream_constructor_ref(
+                    ctx,
+                    member.obj.as_ref(),
+                )
+            {
+                return Ok(Ok(Expr::NativeMethodCall {
+                    module: "readable_stream".to_string(),
+                    class_name: Some("ReadableStream".to_string()),
+                    object: None,
+                    method: "from".to_string(),
+                    args,
+                }));
+            }
+        }
+    }
+
     // Check for static method calls (e.g., Counter.increment())
     if let ast::Expr::Member(member) = expr {
         if let ast::Expr::Ident(obj_ident) = unwrap_ts_wrappers(member.obj.as_ref()) {
@@ -358,8 +382,8 @@ pub(super) fn try_static_method_and_instance(
             }
         }
 
-        // Check for method calls on new Big/Decimal/BigNumber() expressions
-        // e.g., new Big("100").div(2)
+        // Check for method calls on new LRUCache/Command() expressions
+        // e.g., new LRUCache({max:3}).set("a", 1)
         if let Some(module_name) = detect_native_instance_expr(ctx, &member.obj) {
             if let ast::MemberProp::Ident(method_ident) = &member.prop {
                 let method_name = method_ident.sym.to_string();
@@ -412,21 +436,6 @@ pub(super) fn try_static_method_and_instance(
                 ..
             } = &object_expr
             {
-                // Methods that return the same type (builder pattern)
-                let is_math_lib =
-                    matches!(module.as_str(), "big.js" | "decimal.js" | "bignumber.js");
-                let is_math_method = matches!(
-                    method_name.as_str(),
-                    // arithmetic + chainable rounding/formatting
-                    "plus" | "minus" | "times" | "div" | "mod" |
-                            "pow" | "sqrt" | "abs" | "neg" | "round" | "floor" | "ceil" | "toFixed" |
-                            // decimal.js: terminal-shape methods that still need
-                            // NativeMethodCall dispatch (so a.plus(b).eq(c) etc.
-                            // doesn't fall back to the generic Call+PropertyGet path).
-                            "toString" | "toNumber" | "valueOf" |
-                            "eq" | "lt" | "lte" | "gt" | "gte" | "cmp" |
-                            "isZero" | "isPositive" | "isNegative"
-                );
                 // #1048 — fastify Reply chainable methods. `reply.code(201)
                 // .type("application/json").send(payload)` ships every method
                 // returning the same reply handle for chaining; without this
@@ -472,8 +481,7 @@ pub(super) fn try_static_method_and_instance(
                         | "destroy"
                         | "end"
                 );
-                if (is_math_lib && is_math_method)
-                    || (is_fastify_reply && is_fastify_reply_chain_method)
+                if (is_fastify_reply && is_fastify_reply_chain_method)
                     || (is_http_client_request && is_client_request_chain_method)
                 {
                     return Ok(Ok(Expr::NativeMethodCall {

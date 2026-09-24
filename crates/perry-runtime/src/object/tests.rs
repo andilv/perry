@@ -937,10 +937,12 @@ fn transition_cache_lookup_rejects_mutated_edge_target() {
 
     transition_cache_insert(std::ptr::null(), 0, key, keys as usize, 0, 0);
 
-    assert!(
-        transition_cache_lookup(0, key).is_none(),
-        "slot 0 cache edge must not hit after its keys array grows past length 1"
-    );
+    // A slot-0 edge's target is the array's FIRST key, whatever the array's
+    // length: the edge carries the count. What #6006 forbids is adopting the
+    // longer list, so the hit must name exactly one key.
+    let (target, slot_idx, _) =
+        transition_cache_lookup(0, key).expect("the edge's target prefix is intact");
+    assert_eq!((target.arr(), target.count(), slot_idx), (keys, 1, 0));
 
     let slot = transition_cache_slot(0, key as usize);
     with_transition_cache(|t| unsafe {
@@ -972,7 +974,11 @@ fn transition_cache_requires_exact_predecessor_shape_id() {
     );
     assert_eq!(
         transition_cache_lookup(PREDECESSOR, key),
-        Some((keys as usize, 0, TARGET))
+        Some((
+            crate::object::ObjectKeys::new(keys as *mut ArrayHeader, 1),
+            0,
+            TARGET
+        ))
     );
 
     let slot = transition_cache_slot(PREDECESSOR, key as usize);
@@ -1063,12 +1069,12 @@ fn transition_cache_lookup_rejects_slot_key_mismatch() {
 
 #[test]
 fn transition_cache_lookup_rejects_grown_shared_target() {
-    // #6006: a cached edge's `target_len` is a snapshot. The shared target
-    // keys_array can grow IN PLACE after caching (a later object extends the
-    // same shape), so `target_len == slot_idx + 1` still passes while the
-    // actual array is now longer. Adopting it would give the object a
-    // keys_array with more keys than field_count tracks — keys present, values
-    // undefined. The exact-length content check must catch the grown array.
+    // #6006: a cached edge's target is a snapshot. A shared target array
+    // grows IN PLACE after caching when it is a canonical backing whose tip
+    // is extended, so the array is now longer than the edge's list. Adopting
+    // the ARRAY'S length would give the object more keys than it has values —
+    // keys present, values undefined. The edge's count is what the hit must
+    // carry: the grown backing still holds the target as its prefix.
     let key = crate::string::js_string_from_bytes(b"gamma".as_ptr(), 5);
     let extra = crate::string::js_string_from_bytes(b"delta".as_ptr(), 5);
 
@@ -1090,9 +1096,12 @@ fn transition_cache_lookup_rejects_grown_shared_target() {
         "test setup: push must grow in place, not realloc"
     );
 
-    assert!(
-        transition_cache_lookup(0, key).is_none(),
-        "a cache edge whose shared target grew past slot_idx+1 must be rejected (#6006)"
+    let (target, _, _) = transition_cache_lookup(0, key)
+        .expect("a grown shared target still holds the edge's list as its prefix");
+    assert_eq!(
+        (target.arr(), target.count()),
+        (keys, 1),
+        "the hit must carry the edge's count, not the grown array's length (#6006)"
     );
 
     let slot = transition_cache_slot(0, key as usize);
@@ -1819,7 +1828,7 @@ fn constructor_ref_method_value_resolves_static_over_instance_method() {
 ///
 /// A buffer is a `BufferHeader` — no `class_id`, no `keys_array`. With no arm
 /// of its own it fell through to the ordinary arm, which read
-/// `crate::object::object_keys_array(obj)` out of the bytes that follow a buffer header and handed
+/// `crate::object::object_keys(obj).arr()` out of the bytes that follow a buffer header and handed
 /// that to `js_array_length`, whose lazy-array probe dereferences `addr - 8`.
 ///
 /// The two platforms fail differently, which is why this test asserts the

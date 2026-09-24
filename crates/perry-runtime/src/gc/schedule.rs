@@ -102,6 +102,12 @@
 //! the clock, the network or the filesystem are of course only as reproducible
 //! as those inputs.
 
+// Without the `gc-instruments` feature this instrument's entry predicate is a
+// constant "off" (inlined, so every caller's guarded branch folds away and the
+// instrument links nothing); the rest of the module stays compiled so it
+// cannot rot, hence the allow.
+#![cfg_attr(not(feature = "gc-instruments"), allow(dead_code, unused_imports))]
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Default expected fraction of handled safepoints that collect. Chosen as a
@@ -239,6 +245,13 @@ thread_local! {
 
 /// Resolved `(seed, threshold)`, or `None` when the mode is off. Cached: the
 /// environment is read exactly once per process.
+#[cfg(not(feature = "gc-instruments"))]
+#[inline(always)]
+fn resolved() -> Option<(u64, u64)> {
+    None
+}
+
+#[cfg(feature = "gc-instruments")]
 fn resolved() -> Option<(u64, u64)> {
     #[cfg(test)]
     if let Some(over) = SCHEDULE_OVERRIDE.with(std::cell::Cell::get) {
@@ -246,7 +259,7 @@ fn resolved() -> Option<(u64, u64)> {
     }
     use std::sync::OnceLock;
     static CACHED: OnceLock<Option<(u64, u64)>> = OnceLock::new();
-    *CACHED.get_or_init(|| {
+    *crate::once_init::get_or_init(&CACHED, || {
         let seed = parse_seed(std::env::var("PERRY_GC_SCHEDULE_SEED").ok().as_deref())?;
         let rate = parse_rate(std::env::var("PERRY_GC_SCHEDULE_RATE").ok().as_deref());
         let resolved = (seed, rate_threshold(rate));
@@ -481,7 +494,7 @@ pub(crate) fn schedule_poll_stride_bytes() -> usize {
     }
     use std::sync::OnceLock;
     static CACHED: OnceLock<usize> = OnceLock::new();
-    *CACHED.get_or_init(|| {
+    *crate::once_init::get_or_init(&CACHED, || {
         parse_schedule_alloc_kb(std::env::var("PERRY_GC_SCHEDULE_ALLOC_KB").ok().as_deref())
     })
 }

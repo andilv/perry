@@ -1,5 +1,42 @@
 use super::*;
 
+#[test]
+fn fetch_json_preserves_document_key_order() {
+    let source = br#"{"title":"t","permission":[],"zeta":1,"10":"ten","2":"two"}"#;
+    let parsed = unsafe { parse_json_body(source) }.expect("valid JSON body");
+    let output =
+        unsafe { perry_runtime::json::js_json_stringify(f64::from_bits(parsed.bits()), 0) };
+    assert!(!output.is_null());
+    let output = unsafe { perry_ffi::JsString::from_raw(output.cast::<perry_ffi::StringHeader>()) };
+    let bytes = perry_ffi::read_bytes(output).expect("JSON.stringify returned a string");
+    assert_eq!(
+        bytes,
+        br#"{"2":"two","10":"ten","title":"t","permission":[],"zeta":1}"#
+    );
+}
+
+/// The turnloop client engine is the only transport `fetch` has, and it
+/// hardcoded `RedirectMode::Follow` before this change — so a `RequestInit`
+/// that carries a mode is not by itself evidence the mode is honoured. This
+/// pins the engine translation, whose three arms are easy to swap silently.
+#[test]
+fn fetch_redirect_mode_maps_onto_the_engines_redirect_mode() {
+    use turnloop_http::client::RedirectMode;
+
+    assert_eq!(
+        turnloop_bridge::engine_redirect(FetchRedirectMode::Follow),
+        RedirectMode::Follow
+    );
+    assert_eq!(
+        turnloop_bridge::engine_redirect(FetchRedirectMode::Manual),
+        RedirectMode::Manual
+    );
+    assert_eq!(
+        turnloop_bridge::engine_redirect(FetchRedirectMode::Error),
+        RedirectMode::Error
+    );
+}
+
 /// #8546: Coop hosts each in-process deployment on its own dedicated Perry
 /// thread. The Fetch scanner registry is thread-local, so a process-global
 /// registration latch makes the first Next application safe and leaves the

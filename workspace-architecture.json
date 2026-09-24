@@ -24,7 +24,7 @@
     ]
   },
   "baseline": {
-    "workspace_members": 64,
+    "workspace_members": 67,
     "default_dependency_closure": [
       "perry",
       "perry-api-manifest",
@@ -39,9 +39,11 @@
       "perry-diagnostics",
       "perry-dispatch",
       "perry-hir",
+      "perry-http-client",
       "perry-parser",
       "perry-perex",
       "perry-runtime",
+      "perry-tls-session",
       "perry-transform",
       "perry-ui-model",
       "perry-updater"
@@ -59,16 +61,18 @@
       "perry-diagnostics",
       "perry-dispatch",
       "perry-hir",
+      "perry-http-client",
       "perry-parser",
       "perry-perex",
       "perry-runtime",
+      "perry-tls-session",
       "perry-transform",
       "perry-ui-model",
       "perry-updater"
     ],
     "decision_counts": {
-      "externalize": 15,
-      "keep": 44,
+      "externalize": 13,
+      "keep": 49,
       "merge": 1,
       "remove": 1,
       "review": 3
@@ -123,6 +127,10 @@
       "category": "test-support",
       "decision": "keep"
     },
+    "perry-db-turnloop": {
+      "category": "runtime-core",
+      "decision": "keep"
+    },
     "perry-diagnostics": {
       "category": "compiler-core",
       "decision": "keep"
@@ -164,11 +172,6 @@
       "decision": "externalize",
       "migration": "compile-source"
     },
-    "perry-ext-decimal": {
-      "category": "binding",
-      "decision": "externalize",
-      "migration": "compile-source"
-    },
     "perry-ext-ethers": {
       "category": "binding",
       "decision": "externalize",
@@ -178,21 +181,6 @@
       "category": "binding",
       "decision": "keep",
       "migration": "core-runtime"
-    },
-    "perry-ext-fetch": {
-      "category": "binding",
-      "decision": "externalize",
-      "migration": "compile-source"
-    },
-    "perry-ext-parcel-watcher": {
-      "category": "binding",
-      "decision": "externalize",
-      "migration": "external-package"
-    },
-    "perry-ext-undici": {
-      "category": "binding",
-      "decision": "externalize",
-      "migration": "compile-source"
     },
     "perry-ext-http": {
       "category": "binding",
@@ -219,6 +207,11 @@
       "decision": "externalize",
       "migration": "compile-source"
     },
+    "perry-ext-parcel-watcher": {
+      "category": "binding",
+      "decision": "externalize",
+      "migration": "external-package"
+    },
     "perry-ext-pdf": {
       "category": "binding",
       "decision": "externalize",
@@ -239,6 +232,11 @@
       "decision": "externalize",
       "migration": "compile-source"
     },
+    "perry-ext-undici": {
+      "category": "binding",
+      "decision": "externalize",
+      "migration": "compile-source"
+    },
     "perry-ext-ws": {
       "category": "binding",
       "decision": "keep",
@@ -255,6 +253,14 @@
     },
     "perry-hir": {
       "category": "compiler-core",
+      "decision": "keep"
+    },
+    "perry-http-client": {
+      "category": "runtime-core",
+      "decision": "keep"
+    },
+    "perry-http-server": {
+      "category": "runtime-core",
       "decision": "keep"
     },
     "perry-native-registration": {
@@ -283,6 +289,14 @@
     },
     "perry-stdlib-static": {
       "category": "artifact-wrapper",
+      "decision": "keep"
+    },
+    "perry-tls-session": {
+      "category": "runtime-core",
+      "decision": "keep"
+    },
+    "perry-tls-turnloop": {
+      "category": "runtime-core",
       "decision": "keep"
     },
     "perry-transform": {

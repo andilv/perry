@@ -520,6 +520,30 @@ pub(crate) fn populate_global_this_builtins(singleton_at_entry: *mut ObjectHeade
             super::super::PropertyAttrs::new(true, false, true),
         );
     }
+    // WebIDL inheritance carries prototype method values across these two
+    // interface pairs. Both constructors have been installed by this point.
+    for (child, parent) in [("AbortSignal", "EventTarget"), ("CustomEvent", "Event")] {
+        let child_ctor = js_get_global_this_builtin_value(child.as_ptr(), child.len());
+        let parent_ctor = js_get_global_this_builtin_value(parent.as_ptr(), parent.len());
+        let child_proto = builtin_prototype_value(child);
+        let parent_proto = builtin_prototype_value(parent);
+        if JSValue::from_bits(child_ctor.to_bits()).is_pointer()
+            && JSValue::from_bits(parent_ctor.to_bits()).is_pointer()
+        {
+            crate::closure::closure_set_static_prototype(
+                crate::value::js_nanbox_get_pointer(child_ctor) as usize,
+                parent_ctor.to_bits(),
+            );
+        }
+        if JSValue::from_bits(child_proto.to_bits()).is_pointer()
+            && JSValue::from_bits(parent_proto.to_bits()).is_pointer()
+        {
+            super::super::prototype_chain::object_set_static_prototype(
+                crate::value::js_nanbox_get_pointer(child_proto) as usize,
+                parent_proto.to_bits(),
+            );
+        }
+    }
     // The hidden `%AsyncFunction%` tower is allocated before the constructor
     // loop, but its two parents are the `Function` values installed by that
     // loop. Complete those links now that both are available.
@@ -643,18 +667,15 @@ pub(crate) fn populate_global_this_builtins(singleton_at_entry: *mut ObjectHeade
         let name_key =
             crate::string::js_string_from_bytes(name_bytes.as_ptr(), name_bytes.len() as u32);
         let ns_value = if matches!(name, "console" | "process") {
-            // #6230: install the module's runtime dispatch bucket so dynamic
-            // method calls on the namespace *value* resolve — `const p = process;
-            // p.exit(1)`, `process["exit"](1)`, `p.cwd()`, dynamic `console.log`.
-            // These globals are never `import`ed, so nothing else emits the
-            // `js_nm_install_<module>()` call; `import`ed modules get theirs from
-            // the import. Reached only when the globalThis singleton is
-            // materialized — i.e. exactly when process/console are used as values.
-            match name {
-                "process" => crate::object::native_module_registry::js_nm_install_process(),
-                "console" => crate::object::native_module_registry::js_nm_install_console(),
-                _ => {}
-            }
+            // #6230: dynamic method calls on the namespace *value* (`const p =
+            // process; p.exit(1)`, `process["exit"](1)`, dynamic `console.log`)
+            // need the module's runtime dispatch bucket. It is NOT installed
+            // here: this function is statically reachable from core property
+            // paths, so installing here linked both buckets (and `process`'s
+            // stdio stream objects) into every binary. Codegen instead emits
+            // `js_nm_install_process` / `js_nm_install_console` /
+            // `js_install_global_value_surfaces` at every site that can yield
+            // one of these values (see perry-codegen `global_value_installs`).
             js_create_native_module_namespace(name_bytes.as_ptr(), name_bytes.len())
         } else if name == "WebAssembly" {
             super::global_this_webassembly::create_webassembly_namespace()

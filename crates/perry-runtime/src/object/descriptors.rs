@@ -64,10 +64,11 @@ unsafe fn boxed_string_own_property_names(obj_value: f64, str_value: f64) -> f64
 
     let obj = extract_obj_ptr(obj_value);
     if !obj.is_null() {
-        let keys = crate::object::object_keys_array(obj);
+        let keys_view = crate::object::object_keys(obj);
+        let keys = keys_view.arr();
         if !keys.is_null() {
-            let len = crate::array::js_array_length(keys) as usize;
-            let order = ecma_own_key_order(keys);
+            let len = keys_view.count() as usize;
+            let order = ecma_own_key_order(keys_view);
             let pos = |j: usize| -> u32 {
                 match &order {
                     Some(ord) => ord[j],
@@ -1563,14 +1564,15 @@ fn js_object_get_own_property_names_shape(obj_value: f64) -> f64 {
                 return f64::from_bits((empty as u64) | 0x7FFD_0000_0000_0000);
             }
         }
-        let keys = crate::object::object_keys_array(obj);
+        let keys_view = crate::object::object_keys(obj);
+        let keys = keys_view.arr();
         if keys.is_null() {
             let empty = crate::array::js_array_alloc(0);
             return f64::from_bits((empty as u64) | 0x7FFD_0000_0000_0000);
         }
         // Clone the keys array — Object.getOwnPropertyNames includes ALL keys (even non-enumerable).
-        let len = crate::array::js_array_length(keys) as usize;
-        let order = ecma_own_key_order(keys);
+        let len = keys_view.count() as usize;
+        let order = ecma_own_key_order(keys_view);
         let pos = |j: usize| -> u32 {
             match &order {
                 Some(ord) => ord[j],
@@ -1974,7 +1976,10 @@ pub(crate) unsafe fn nm_get_own_descriptor(
         "process" | "process.namespace" | "process.default"
     ) && key_name == "permission"
     {
-        let value = crate::process::process_metadata_property("permission")
+        // Through the `process` constant registry: a descriptor read needs the
+        // `process` value, whose every source installs that registry row.
+        let value = super::native_module_registry::nm_const_lookup("process")
+            .and_then(|f| unsafe { f("process", "permission", 0.0, false) })
             .unwrap_or_else(|| f64::from_bits(crate::value::TAG_UNDEFINED));
         return Some(build_data_descriptor(value, false, true, false));
     }

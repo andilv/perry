@@ -137,6 +137,16 @@ pub(crate) struct ShapeDescriptor {
 /// Shape identity is the FACTS, never the storage address. A descriptor value
 /// lifted out of the table compares equal to the record it came from.
 impl ShapeDescriptor {
+    /// This shape's ordered keys: the keys array and the shape's own count,
+    /// which is the authority (the array can be a longer shared backing).
+    #[inline]
+    pub(crate) fn keys_view(&self) -> crate::object::ObjectKeys {
+        crate::object::ObjectKeys::new(
+            self.keys as usize as *mut ArrayHeader,
+            self.logical_key_count,
+        )
+    }
+
     /// The one `keys` word the collector rewrites for this shape, or `None`
     /// for a descriptor value that was never lifted out of the table. The
     /// collector itself asks [`ShapeRecordRef::keys_slot`] (#10362).
@@ -1280,19 +1290,14 @@ pub(crate) unsafe fn install_cached_object_shape_transition(
     obj: *mut crate::object::ObjectHeader,
     expected_predecessor_shape_id: u32,
     target_shape_id: u32,
-    _target_keys: *mut ArrayHeader,
+    target_keys: crate::object::ObjectKeys,
 ) -> bool {
-    let target_key_count = if _target_keys.is_null() {
-        0
-    } else {
-        crate::array::keys_array_len_capped_to_capacity(_target_keys) as u32
-    };
     install_cached_object_shape_version(
         obj,
         expected_predecessor_shape_id,
         target_shape_id,
-        _target_keys,
-        target_key_count,
+        target_keys.arr(),
+        target_keys.count(),
     )
 }
 
@@ -1391,11 +1396,10 @@ unsafe fn install_cached_object_shape_version_impl(
     }
 
     #[cfg(debug_assertions)]
-    if !_target_keys.is_null()
-        && crate::array::keys_array_len_capped_to_capacity(_target_keys) as u32 == _target_key_count
-    {
-        debug_assert_object_shape_parity_for_keys(obj, _target_keys);
-    }
+    debug_assert_object_shape_parity_for_keys(
+        obj,
+        crate::object::ObjectKeys::new(_target_keys, _target_key_count),
+    );
     #[cfg(test)]
     TEST_CACHED_TRANSITION_WATCH.with(|watch| {
         if watch.get() == obj as usize {
@@ -1545,7 +1549,7 @@ pub(crate) unsafe fn birth_stamp_object_shape(
 pub(crate) unsafe fn try_birth_stamp_preinstalled_shape(
     obj: *mut crate::object::ObjectHeader,
     runtime_shape_id: u32,
-    keys: *mut ArrayHeader,
+    keys: crate::object::ObjectKeys,
     live_inline_slot_count: u32,
 ) -> bool {
     if obj.is_null() {
@@ -1554,13 +1558,8 @@ pub(crate) unsafe fn try_birth_stamp_preinstalled_shape(
     let Some(descriptor) = shape_descriptor_by_id(runtime_shape_id) else {
         return false;
     };
-    let logical_key_count = if keys.is_null() {
-        0
-    } else {
-        crate::array::keys_array_len_capped_to_capacity(keys) as u32
-    };
-    if descriptor.keys != keys as u64
-        || descriptor.logical_key_count != logical_key_count
+    if descriptor.keys != keys.arr() as u64
+        || descriptor.logical_key_count != keys.count()
         || descriptor.live_inline_slot_count != live_inline_slot_count
         || descriptor.semantic_generation != 0
         || descriptor.object_kind != ShapeObjectKind::Ordinary
@@ -1654,8 +1653,8 @@ pub(crate) unsafe fn synchronize_object_shape_descriptor_from(
         return 0;
     }
     let keys = predecessor
-        .map(|descriptor| descriptor.keys as usize as *mut ArrayHeader)
-        .unwrap_or(std::ptr::null_mut());
+        .map(|descriptor| descriptor.keys_view())
+        .unwrap_or(crate::object::ObjectKeys::NONE);
     publish_object_shape_from(obj, predecessor, keys, live_inline_slot_count)
 }
 
@@ -1670,7 +1669,7 @@ pub(crate) unsafe fn synchronize_object_shape_descriptor_from(
 pub(crate) unsafe fn publish_object_shape_from(
     obj: *mut crate::object::ObjectHeader,
     predecessor: Option<ShapeDescriptor>,
-    keys: *mut ArrayHeader,
+    keys_view: crate::object::ObjectKeys,
     live_inline_slot_count: u32,
 ) -> u32 {
     if obj.is_null() || !shape_word_is_writable(obj) {
@@ -1680,11 +1679,10 @@ pub(crate) unsafe fn publish_object_shape_from(
     // The learned exact numeric-tail installer has its own entry point and
     // intentionally preserves this Array-subclass family proof.
     crate::array::clear_array_subclass_named_prefix_token(obj);
-    let key_count = if keys.is_null() {
-        0
-    } else {
-        crate::array::keys_array_len_capped_to_capacity(keys) as u32
-    };
+    // The caller states the count: a keys array's header length is not a
+    // receiver's key count (see `ObjectKeys`).
+    let keys = keys_view.arr();
+    let key_count = keys_view.count();
 
     // A same-address length change is legal only for an owned keys array. A
     // shared array must have cloned before push; otherwise siblings already
@@ -1721,21 +1719,23 @@ pub(crate) unsafe fn publish_object_shape_from(
                 return old_id;
             }
             let shared = (*gc.as_ptr()).gc_flags & crate::gc::GC_FLAG_SHAPE_SHARED != 0;
-            debug_assert!(
-                !shared,
-                "shared keys array mutated in place under an immutable ShapeId"
-            );
-            if shared {
-                return old_id;
+            // A SHARED keys array is a canonical backing: the lists on one
+            // growth chain are prefixes of it, each with its own descriptor,
+            // and a prefix never changes (only the tip is appended, past every
+            // published count). Moving to a longer or shorter prefix of it is
+            // an ordinary transition with no history to retire. An OWNED
+            // array has one carrier, whose earlier same-address versions this
+            // publish supersedes.
+            if !shared {
+                // An Array-subclass receiver is the one owner whose history IS
+                // reinstalled: `array_tail_transition` learns the (predecessor,
+                // successor) pair right after this publish returns and its
+                // reverse edge stamps the predecessor back on `pop`. That cache
+                // takes ownership through `cache_carrier`, but only once the
+                // learner has run, so the gate here is the receiver kind the
+                // learner is scoped to (`record_array_tail` in the append tail).
+                retire_owned_history = !crate::array::is_array_subclass_class_id((*obj).class_id);
             }
-            // An Array-subclass receiver is the one owner whose history IS
-            // reinstalled: `array_tail_transition` learns the (predecessor,
-            // successor) pair right after this publish returns and its
-            // reverse edge stamps the predecessor back on `pop`. That cache
-            // takes ownership through `cache_carrier`, but only once the
-            // learner has run, so the gate here is the receiver kind the
-            // learner is scoped to (`record_array_tail` in the append tail).
-            retire_owned_history = !crate::array::is_array_subclass_class_id((*obj).class_id);
         }
     }
 
@@ -1777,7 +1777,7 @@ pub(crate) unsafe fn publish_object_shape_from(
         // armed before the armed predecessor goes.
         retire_owned_shape_siblings(keys as u64, id);
     }
-    debug_assert_object_shape_parity_for_keys(obj, keys);
+    debug_assert_object_shape_parity_for_keys(obj, keys_view);
     id
 }
 
@@ -1832,7 +1832,13 @@ pub(crate) unsafe fn transition_object_shape_semantics(
     });
     let keys = current.keys as usize as *mut ArrayHeader;
     let key_count = current.logical_key_count;
-    let generation = SHAPE_SEMANTIC_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // A dictionary receiver's identity lives in its own namespace, disjoint
+    // from both ordinary ones (see `object/dictionary.rs`).
+    let generation = if crate::object::dictionary::is_dictionary(obj) {
+        crate::object::dictionary::next_generation()
+    } else {
+        SHAPE_SEMANTIC_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    };
     if generation == 0 {
         shape_id_exhausted_abort();
     }
@@ -1965,6 +1971,11 @@ pub(crate) unsafe fn transition_object_shape_semantics_for_prototype(
         synchronize_object_shape_descriptor(obj);
         object_shape_descriptor(obj).expect("shape synchronization must publish a descriptor")
     });
+    // A dictionary receiver's shape is its own; there is no sharing to earn,
+    // and its generation must stay in the dictionary namespace.
+    if crate::object::dictionary::is_dictionary(obj) {
+        return transition_object_shape_semantics(obj);
+    }
     let Some(generation) =
         deterministic_prototype_generation(object_shape_stamp(obj), prototype_serial, link_kind)
     else {
@@ -2014,6 +2025,11 @@ pub(crate) unsafe fn transition_object_shape_semantics_for_data_descriptor(
         synchronize_object_shape_descriptor(obj);
         object_shape_descriptor(obj).expect("shape synchronization must publish a descriptor")
     });
+    // As for a prototype divergence: a dictionary receiver's shape is its
+    // own, and its generation stays in the dictionary namespace.
+    if crate::object::dictionary::is_dictionary(obj) {
+        return transition_object_shape_semantics(obj);
+    }
     let Some(generation) =
         deterministic_semantic_generation(object_shape_stamp(obj), key_bytes, attrs)
     else {
@@ -2139,19 +2155,10 @@ fn descriptor_matches_object(
         return false;
     };
     unsafe {
-        d.keys == crate::object::object_keys_array(obj) as u64
-            && d.logical_key_count == object_header_key_count(obj)
+        let keys = crate::object::object_keys(obj);
+        d.keys == keys.arr() as u64
+            && d.logical_key_count == keys.count()
             && d.live_inline_slot_count == live_inline_slot_count
-    }
-}
-
-#[inline]
-unsafe fn object_header_key_count(obj: *const crate::object::ObjectHeader) -> u32 {
-    let keys = crate::object::object_keys_array(obj);
-    if keys.is_null() {
-        0
-    } else {
-        crate::array::keys_array_len_capped_to_capacity(keys) as u32
     }
 }
 
@@ -2166,7 +2173,7 @@ pub(crate) unsafe fn debug_assert_object_shape_parity(obj: *const crate::object:
     // this gate release builds executed both on every object birth and shape
     // publish (~80 instructions per `new C()`).
     if cfg!(debug_assertions) {
-        debug_assert_object_shape_parity_for_keys(obj, crate::object::object_keys_array(obj));
+        debug_assert_object_shape_parity_for_keys(obj, crate::object::object_keys(obj));
     }
 }
 
@@ -2178,7 +2185,7 @@ pub(crate) unsafe fn debug_assert_object_shape_parity(obj: *const crate::object:
 #[inline]
 pub(crate) unsafe fn debug_assert_object_shape_parity_for_keys(
     obj: *const crate::object::ObjectHeader,
-    keys: *mut ArrayHeader,
+    keys: crate::object::ObjectKeys,
 ) {
     if !cfg!(debug_assertions) {
         return;
@@ -2194,15 +2201,18 @@ pub(crate) unsafe fn debug_assert_object_shape_parity_for_keys(
     }
     let id = object_shape_stamp(obj);
     if id != 0 {
-        let key_count = if keys.is_null() {
-            0
-        } else {
-            crate::array::keys_array_len_capped_to_capacity(keys) as u32
-        };
         debug_assert!(
-            shape_descriptor_by_id(id)
-                .is_some_and(|d| { d.keys == keys as u64 && d.logical_key_count == key_count }),
+            shape_descriptor_by_id(id).is_some_and(|d| {
+                d.keys == keys.arr() as u64 && d.logical_key_count == keys.count()
+            }),
             "published ShapeId disagrees with authoritative ObjectHeader facts"
+        );
+        // The count names a prefix of the array; it never reaches past it.
+        debug_assert!(
+            keys.is_null()
+                || keys.count() as usize
+                    <= crate::array::keys_array_len_capped_to_capacity(keys.arr()),
+            "a receiver's key count runs past its keys array"
         );
     }
 }
@@ -2228,6 +2238,17 @@ pub(crate) unsafe fn clear_object_shape_stamp(obj: *mut crate::object::ObjectHea
     } else {
         false
     }
+}
+
+/// A shape-shared keys array's prefix never changes: the only in-place write
+/// any such array sees is a canonical backing's tip append, past every
+/// published count (`canonical_keys::append_at_tip`); every other writer
+/// copies first. So one index serves every list on it.
+unsafe fn keys_prefix_is_immutable(keys: *const ArrayHeader) -> bool {
+    crate::value::addr_class::try_read_gc_header(keys as usize).is_some_and(|gc| {
+        gc.obj_type == crate::gc::GC_TYPE_ARRAY
+            && gc.gc_flags & crate::gc::GC_FLAG_SHAPE_SHARED != 0
+    })
 }
 
 /// Build (or extend) the slot map for `keys` covering `key_count` keys.
@@ -2291,11 +2312,16 @@ pub(crate) unsafe fn shape_slot_lookup_verdict(
     let mut inner = crate::state::state().shapes.inner.borrow_mut();
     let shape = match inner.indices.get_mut(&keys_id) {
         Some(s) => {
-            if s.indexed_len > key_count {
-                // Shrink (delete/compaction): slots are untrustworthy.
+            if s.indexed_len > key_count && !keys_prefix_is_immutable(keys) {
+                // An owned array that shrank (delete/compaction): slots are
+                // untrustworthy.
                 inner.indices.remove(&keys_id);
                 return KeysIndexVerdict::Unindexed;
             }
+            // A canonical backing's index covers its longest list, and a
+            // shorter list on it answers from the same index: every candidate
+            // below is kept only if its slot is below THIS list's count, and
+            // is content-validated, so a slot of a longer list can only miss.
             s
         }
         None => {
@@ -2312,7 +2338,9 @@ pub(crate) unsafe fn shape_slot_lookup_verdict(
     if shape.indexed_len < key_count {
         index_range(shape, keys, key_count);
     }
-    let complete = shape.indexed_len == key_count;
+    // Complete for THIS list when it covers at least its `key_count` slots:
+    // a shorter list on a canonical backing is a prefix of what was indexed.
+    let complete = shape.indexed_len >= key_count;
     let absent = if complete {
         KeysIndexVerdict::Absent
     } else {
@@ -2353,6 +2381,17 @@ pub(crate) unsafe fn shape_slot_lookup_verdict(
     // Hash-bucket candidates existed but none matched: with a complete index
     // that still proves absence (the bucket held colliding OTHER keys).
     absent
+}
+
+/// Total slots covered by every live slot index (test instrumentation).
+#[cfg(test)]
+pub(crate) fn indexed_slots_for_test() -> u64 {
+    let inner = crate::state::state().shapes.inner.borrow();
+    inner
+        .indices
+        .values()
+        .map(|ix| u64::from(ix.indexed_len))
+        .sum()
 }
 
 /// Record a freshly appended key: `keys` (the POST-append array — a clone

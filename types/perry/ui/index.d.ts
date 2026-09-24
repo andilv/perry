@@ -230,6 +230,12 @@ export function App(config: {
     icon?: string;
     body: Widget;
     /**
+     * Quit when the final application window closes. On macOS this opts out
+     * of the usual windowless state; GTK4 and Windows already quit on close.
+     * Ignored on mobile, TV, watch, and visionOS.
+     */
+    quitOnLastWindowClose?: boolean;
+    /**
      * Initial window state. Default is `"normal"` — the window opens at
      * the requested `width`/`height`. `"maximized"` zooms the window to
      * fill the working area (taskbar/dock visible). `"fullscreen"` enters
@@ -821,6 +827,10 @@ export function textSetColor(widget: Widget, r: number, g: number, b: number, a:
 export function textSetFontSize(widget: Widget, size: number): void;
 export function textSetFontWeight(widget: Widget, size: number, weight: number): void;
 export function textSetFontFamily(widget: Widget, family: string): void;
+/** Set character spacing in points on a macOS or web Text label. Zero restores the default. */
+export function textSetLetterSpacing(widget: Widget, points: number): void;
+/** Set line height as a multiple of the font's natural line height on macOS or web. One restores the default. */
+export function textSetLineHeight(widget: Widget, multiple: number): void;
 export function textSetWraps(widget: Widget, maxWidth: number): void;
 export function textSetSelectable(widget: Widget, selectable: number): void;
 /**
@@ -1213,6 +1223,12 @@ export function setCornerRadius(widget: Widget, radius: number): void;
 export function textfieldSetString(widget: Widget, text: string): void;
 export function textfieldGetString(widget: Widget): string;
 export function textfieldFocus(widget: Widget): void;
+/** macOS: set a UTF-16 selection [start, end), or place the cursor when equal. Works before or after focus. */
+export function textfieldSetSelectionRange(widget: Widget, start: number, end: number): void;
+/** macOS: get the current or pending UTF-16 selection start. */
+export function textfieldGetSelectionStart(widget: Widget): number;
+/** macOS: get the current or pending UTF-16 selection end. */
+export function textfieldGetSelectionEnd(widget: Widget): number;
 export function textfieldBlurAll(): void;
 export function textfieldSetNextKeyView(widget: Widget, next: Widget): void;
 export function textfieldSetOnSubmit(widget: Widget, callback: () => void): void;

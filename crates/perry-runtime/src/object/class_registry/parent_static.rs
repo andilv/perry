@@ -447,11 +447,12 @@ pub(crate) fn class_object_own_field_bytes(
         return None;
     }
     unsafe {
-        let keys = crate::object::object_keys_array(obj);
+        let keys_view = crate::object::object_keys(obj);
+        let keys = keys_view.arr();
         if keys.is_null() {
             return None;
         }
-        let len = (*keys).length;
+        let len = keys_view.count();
         for i in 0..len {
             let k = crate::array::js_array_get_f64(keys, i);
             let sp = crate::value::js_get_string_pointer_unified(k) as *const crate::StringHeader;
@@ -968,6 +969,7 @@ pub(crate) fn lookup_class_symbol_method_in_chain(
 }
 
 include!("parent_static/private_and_dynamic.rs");
+include!("parent_static/static_accessor_call.rs");
 
 /// Presence-only check (`[[HasProperty]]`, never `[[Get]]`) for a Symbol-keyed
 /// METHOD or ACCESSOR declared on `class_id` or any ancestor. These computed
@@ -1042,7 +1044,7 @@ pub(crate) fn class_own_symbol_member_keys(class_id: u32, is_static: bool) -> Ve
             }
         }
     });
-    keys.sort_by_key(|sym_key| unsafe {
+    crate::cold_sort::sort_by_key(&mut keys, |sym_key| unsafe {
         let ptr = *sym_key as *const crate::symbol::SymbolHeader;
         let symbol_id = if ptr.is_null() { u64::MAX } else { (*ptr).id };
         let definition_order = CLASS_SYMBOL_MEMBER_ORDERS.with(|orders| {
@@ -1714,6 +1716,13 @@ pub unsafe extern "C" fn js_class_static_method_call(
         crate::object::static_this_disarm();
         crate::object::static_private_owner_pop();
         crate::object::js_implicit_this_set(prev_this.get_nanbox_f64());
+        return result;
+    }
+    // #10893: not a static METHOD — a static ACCESSOR on the class-id chain
+    // whose value is callable. See `try_static_accessor_value_call`.
+    if let Some(result) =
+        try_static_accessor_value_call(class_id, name, receiver, args_ptr, args_len)
+    {
         return result;
     }
     // #1787 / #321: not a static METHOD — try a static FIELD holding a

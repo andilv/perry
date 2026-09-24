@@ -9,12 +9,11 @@
 //! cannot be retired by ownership, so a workload that produces unboundedly
 //! many distinct key lists — a `Map`-like object built by name with thousands
 //! of keys, a per-request object keyed by user input — would accumulate
-//! interned shapes for the life of the process. There is also a cost half:
-//! under one canonical keys array per layout an append can no longer mutate
-//! in place, so an object whose key list is unique to it pays a copy of
-//! length *k* per append, i.e. **O(k²)** over *k* appends.
+//! interned shapes for the life of the process: one ShapeId and one trie node
+//! per key it ever added. (The storage is linear: the lists of a growth chain
+//! share one canonical backing, which a tip append grows in place.)
 //!
-//! Dictionary mode bounds both. An object whose keys have stopped being worth
+//! Dictionary mode bounds that. An object whose keys have stopped being worth
 //! interning keeps them itself, and stops minting shapes for them.
 //!
 //! # The representation, and why the shape stays honest
@@ -191,10 +190,28 @@ pub(crate) fn test_clear_layout_id_budget() {
 
 /// Resolve the knob once. Value-parsed, not presence-parsed: #7991 shipped a
 /// knob that `PERRY_GC_DIAG=0` turned ON.
+/// The compiled-in trigger-1 threshold (a unique RUN, see
+/// [`should_latch_to_dictionary`]), armed BY DEFAULT.
+///
+/// #10868 step 2.5: a receiver with a key list unique to it mints one ShapeId
+/// and one canonical trie node per key it adds, retained while its backing
+/// lives. When every prefix was its own array it also cost k(k+1)/2 element
+/// words (8,192 keys: 461 MB unlatched, 50 MB latched); one backing per
+/// growth chain made that storage linear, so what the latch bounds now is the
+/// per-key identity. §L8.3.2's rule stands: a bound that is off by default is
+/// not a bound.
+///
+/// On `ts.transpileModule` this threshold latches 2 receivers, as many as the
+/// former raw key-count trigger did at the same number. The env var still
+/// overrides, in both directions.
+const DEFAULT_LATCH_MIN_KEYS: u64 = 1024;
+
 #[cold]
 #[inline(never)]
 fn resolve_latch_arming() -> bool {
-    let mut armed = false;
+    // Armed by default; the reads below only ADJUST the threshold.
+    LATCH_MIN_KEYS.store(DEFAULT_LATCH_MIN_KEYS, Ordering::Relaxed);
+    let mut armed = true;
     // Trigger 2, injectable. A fixture that really exhausts a 24-bit layout-id
     // space is impractical, so the budget is a number the allocator PUBLISHES
     // and anyone can inject — which is the only thing that makes the
@@ -262,10 +279,30 @@ pub fn dictionary_counters_line() -> String {
     )
 }
 
+/// The CURRENT arming, resolved — for a scope guard that must restore what
+/// it found instead of assuming the default is off. Once #10868 armed the
+/// latch by default, "disarm on exit" stopped being "restore on exit".
+#[cfg(test)]
+pub(crate) fn test_latch_state() -> Option<u64> {
+    if dictionary_latch_armed() {
+        Some(LATCH_MIN_KEYS.load(Ordering::Relaxed))
+    } else {
+        None
+    }
+}
+
 /// Arm or disarm the latch from a test. Returns the previous minimum, if armed.
 #[cfg(test)]
 pub(crate) fn test_arm_latch(min_keys: Option<u64>) -> Option<u64> {
-    let was = if LATCH_ARMED.load(Ordering::Relaxed) == 1 {
+    // RESOLVE before saving. `LATCH_ARMED` starts at -1 = unresolved, and
+    // reading the raw atomic sees that as "not armed" — so a test that saved
+    // before anything had queried the latch restored `None`, which STORES 0
+    // and disarms it for every later test in the process. Harmless while the
+    // default was off; fatal once #10868 armed it, because the 65,536-key
+    // membership test runs later in the same binary and its key list is
+    // unique to it. It passed standalone and OOM'd in the suite, which is the
+    // signature of exactly this.
+    let was = if dictionary_latch_armed() {
         Some(LATCH_MIN_KEYS.load(Ordering::Relaxed))
     } else {
         None
@@ -292,27 +329,27 @@ pub(crate) fn test_reset_counters() {
 ///
 /// TWO independent triggers, not one:
 ///
-/// 1. **Unbounded key growth.** An interned shape is shared and cannot be
+/// 1. **Unique key growth.** An interned shape is shared and cannot be
 ///    retired by ownership the way today's private ones are (97.8% of records
 ///    are retired today), so a receiver whose key list is unique to it and
-///    grows without bound must stop interning. Policy.
+///    grows without bound must stop interning. Policy. The argument is the
+///    list's UNIQUE RUN (`canonical_keys::take_unique_run`): how many keys the
+///    lineage grew by, one receiver's append at a time, since another arrival
+///    last reached it — not the key count, which would also latch every
+///    member of a family of objects that merely share a long list.
 /// 2. **Layout-id exhaustion** ([`note_layout_id_budget`]). The canonical
 ///    layout id is 24 bits; when none is left the receiver cannot be interned
 ///    at all and dictionary mode is the only place for it. Correctness, not
 ///    policy — which is why it ignores the key-count threshold.
 ///
-/// **Stubbed: it can only answer `true` when the latch is explicitly armed.**
-/// The production trigger belongs to the content-key work (L8.3.13): the
-/// condition that matters is "this object's key list is unique to it", and
-/// that is not answerable until shape identity is content-keyed — today
-/// `fresh_keys_new_list` is 0.1 % of mints, so a predicate written against
-/// today's facts would be measuring the transition cache, not the program.
-/// Until then the latch is driven directly, by the tests and by
-/// `PERRY_OBJECT_DICTIONARY_MIN_KEYS`, and the counters above say which.
+/// Uniqueness is answerable now that shape identity is content-keyed: the
+/// canonical trie sees every list a receiver creates by appending, and every
+/// arrival at an existing one except through the transition cache.
+/// `PERRY_OBJECT_DICTIONARY_MIN_KEYS` sets the minimum run.
 ///
 /// Off, this is one relaxed load and a compare.
 #[inline]
-pub(crate) fn should_latch_to_dictionary(logical_key_count: u32) -> bool {
+pub(crate) fn should_latch_to_dictionary(unique_run: u32) -> bool {
     match LATCH_ARMED.load(Ordering::Relaxed) {
         0 => return false,
         -1 => {
@@ -329,8 +366,9 @@ pub(crate) fn should_latch_to_dictionary(logical_key_count: u32) -> bool {
         EXHAUSTION_LATCHES.fetch_add(1, Ordering::Relaxed);
         return true;
     }
-    // Trigger 1: unbounded growth of a key list unique to this receiver.
-    u64::from(logical_key_count) >= LATCH_MIN_KEYS.load(Ordering::Relaxed)
+    // Trigger 1: growth of a key list unique to this receiver. A run of 0 is a
+    // list this publish did not create, which trigger 1 never latches.
+    unique_run != 0 && u64::from(unique_run) >= LATCH_MIN_KEYS.load(Ordering::Relaxed)
 }
 
 /// The object's private key list, or null when it has none.
@@ -411,8 +449,10 @@ unsafe fn store_keys_array(meta: *mut ObjectMeta, keys: *mut ArrayHeader) {
     );
 }
 
-/// A fresh generation in the dictionary namespace.
-fn next_generation() -> u64 {
+/// A fresh generation in the dictionary namespace. Every semantic transition
+/// of a dictionary receiver draws from here (`shapes::transition_object_shape_semantics`),
+/// so its identity never leaves the namespace.
+pub(crate) fn next_generation() -> u64 {
     let n = DICTIONARY_GENERATION_NEXT.fetch_add(1, Ordering::Relaxed);
     debug_assert!(
         n < DICTIONARY_GENERATION_TAG,

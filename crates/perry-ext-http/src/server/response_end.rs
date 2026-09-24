@@ -7,7 +7,7 @@
 //! `EndTail`, which parks every snapshot the sequence consumes in the
 //! runtime's transient-root stack before any of it crosses a JS call.
 
-use hyper::StatusCode;
+use http::StatusCode;
 use perry_ffi::{get_handle, get_handle_mut, JsClosure, JsValue, RawClosureHeader};
 
 use crate::server::request::emit_no_arg_to_listeners;
@@ -69,9 +69,8 @@ pub unsafe extern "C" fn js_node_http_res_end_full(handle: i64, chunk: f64, arg2
     tail.emit_close();
 }
 
-/// `res.end(chunk?)` — append final chunk + flush the response back
-/// to hyper through the oneshot channel + fire `'finish'` and
-/// `'close'` listeners.
+/// `res.end(chunk?)` — append final chunk + hand the response to the
+/// connection's encoder + fire `'finish'` and `'close'` listeners.
 #[no_mangle]
 pub extern "C" fn js_node_http_res_end(handle: i64, chunk: f64) {
     if let Some((finish_listeners, close_listeners)) = finalize_buffered_end(handle, chunk) {
@@ -84,8 +83,8 @@ pub extern "C" fn js_node_http_res_end(handle: i64, chunk: f64) {
 }
 
 /// `res.end([chunk][, callback])` — callback-aware variant. Standalone
-/// responses flush through the assigned socket; everything else takes the
-/// existing hyper-oneshot path. Queued write callbacks run first, in
+/// responses flush through the assigned socket; everything else goes to the
+/// connection's encoder. Queued write callbacks run first, in
 /// order, then the end callback (#4904).
 #[no_mangle]
 pub unsafe extern "C" fn js_node_http_res_end_with_cb(handle: i64, chunk: f64, callback: i64) {

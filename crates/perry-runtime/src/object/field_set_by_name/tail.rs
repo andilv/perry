@@ -410,6 +410,11 @@ pub(crate) fn set_field_by_name_object_tail(
             let obj = obj_handle.get_raw_mut_ptr::<ObjectHeader>();
             let value = value_handle.get_nanbox_f64();
             match key_str.as_str() {
+                "origin" | "searchParams" => return,
+                "host" => {
+                    crate::url::js_url_set_host(obj, value);
+                    return;
+                }
                 "pathname" => {
                     crate::url::js_url_set_pathname(obj, value);
                     return;
@@ -457,7 +462,8 @@ pub(crate) fn set_field_by_name_object_tail(
             obj_flags & (crate::gc::OBJ_FLAG_SEALED | crate::gc::OBJ_FLAG_NO_EXTEND) != 0;
         let record_array_tail = crate::array::is_array_subclass_class_id((*obj).class_id);
 
-        let mut keys = crate::object::object_keys_array(obj);
+        let mut keys_view = crate::object::object_keys(obj);
+        let mut keys = keys_view.arr();
 
         // Validate keys_array is a real heap pointer or null.
         if !keys.is_null() {
@@ -488,10 +494,11 @@ pub(crate) fn set_field_by_name_object_tail(
         // transition-cache fast path, whose `prev_shape_id` is read AFTER
         // this — then appends at the floor. Seeding allocates, so every raw
         // local is re-read through its handle.
-        if keys.is_null() && crate::object::reserved_slot_floor_for_class_id((*obj).class_id) != 0 {
+        if keys.is_null() && crate::object::reserved_slot_floor_for_object(obj) != 0 {
             let seeded = crate::object::ensure_reserved_floor_keys(obj);
             refresh_roots_after_alloc!();
-            keys = crate::object::object_keys_array(obj);
+            keys_view = crate::object::object_keys(obj);
+            keys = keys_view.arr();
             if !seeded && keys.is_null() {
                 // Seed failed (allocation refused): DROP the write rather
                 // than run the append below, whose index-0 slot is the
@@ -500,7 +507,6 @@ pub(crate) fn set_field_by_name_object_tail(
             }
         }
 
-        let mut prev_keys_usize = keys as usize;
         let prev_shape_id = super::shapes::object_shape_stamp(obj);
 
         // FAST PATH: shape-transition cache with interned string pointer identity.
@@ -563,9 +569,9 @@ pub(crate) fn set_field_by_name_object_tail(
                     obj,
                     prev_shape_id,
                     target_shape_id,
-                    next_keys as *mut ArrayHeader,
+                    next_keys,
                 ) {
-                    set_object_keys_array(obj, next_keys as *mut ArrayHeader);
+                    set_object_keys(obj, next_keys);
                 }
                 // #8113: one bound probe, reused.
                 let live_slots = crate::object::object_live_slot_count(obj);
@@ -618,13 +624,29 @@ pub(crate) fn set_field_by_name_object_tail(
                 let key_str = key_to_str_for_diag(key);
                 crate::error::throw_immutable_write(1, &key_str);
             }
-            // Create a new keys array with the key
-            let new_keys = crate::array::js_array_alloc(4);
+            // #10868 step 2.5 stage 1b: the one-key list is a canonical node
+            // like any other. Every `{}` that sets the same first key now
+            // reaches the SAME array — which is the whole of the mint fix at
+            // this site, because a fresh 4-slot allocation per receiver was a
+            // fresh identity per receiver.
+            let new_keys = match crate::object::canonical_keys::SharedLayout::of_receiver(obj) {
+                Some(proof) => crate::object::canonical_keys::extend_key(
+                    &proof,
+                    crate::object::canonical_keys::CanonicalKeys::EMPTY,
+                    key,
+                )
+                .view(),
+                // A latched receiver owns its list from its first key.
+                None => {
+                    let fresh = crate::array::js_array_alloc(4);
+                    refresh_roots_after_alloc!();
+                    let grown =
+                        crate::array::js_array_push(fresh, JSValue::string_ptr(key as *mut _));
+                    crate::object::ObjectKeys::owned(grown)
+                }
+            };
             refresh_roots_after_alloc!();
-            let new_keys =
-                crate::array::js_array_push(new_keys, JSValue::string_ptr(key as *mut _));
-            refresh_roots_after_alloc!();
-            set_object_keys_array(obj, new_keys);
+            set_object_keys(obj, new_keys);
             super::mark_object_dynamic_shape_unknown(obj);
 
             // Reallocate fields to hold at least one value
@@ -661,7 +683,7 @@ pub(crate) fn set_field_by_name_object_tail(
                     },
                     prev_shape_id,
                     interned_key,
-                    new_keys as usize,
+                    new_keys.arr() as usize,
                     0,
                     super::shapes::object_shape_stamp(obj),
                 );
@@ -674,7 +696,7 @@ pub(crate) fn set_field_by_name_object_tail(
             // #10868 step 2.5 stage 1: same un-latch hazard as the read
             // path's field-cache stamp — this publishes an explicit keys edge.
             if !crate::object::dictionary::is_dictionary(obj) {
-                super::shapes::stamp_object_shape(obj, new_keys, 1, 1);
+                super::shapes::stamp_object_shape(obj, new_keys.arr(), 1, 1);
             }
             return;
         }
@@ -743,7 +765,7 @@ pub(crate) fn set_field_by_name_object_tail(
         }
 
         // Search through the keys array for a match
-        let key_count = crate::array::js_array_length(keys) as usize;
+        let key_count = keys_view.count() as usize;
         let alloc_limit = std::cmp::max(
             crate::object::object_live_slot_count(obj),
             crate::object::INLINE_SLOT_FLOOR as u32,
@@ -762,7 +784,7 @@ pub(crate) fn set_field_by_name_object_tail(
             let name_len = (*key).byte_len as usize;
             let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
             let key_hash = key_bytes_hash(name_ptr, name_len);
-            if let Some(i) = keys_index_lookup(obj, keys, name_bytes, key_hash) {
+            if let Some(i) = keys_index_lookup(obj, keys_view, name_bytes, key_hash) {
                 let i = i as usize;
                 if is_frozen {
                     let key_str = key_to_str_for_diag(key);
@@ -796,73 +818,49 @@ pub(crate) fn set_field_by_name_object_tail(
             // scan is shared.
             // We achieve this by setting a marker, then the linear
             // scan checks it and skips.
-            let keys_gc_header =
-                (keys as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-            let keys_shared = if (keys as usize) >= crate::gc::GC_HEADER_SIZE
-                && (*keys_gc_header).obj_type == crate::gc::GC_TYPE_ARRAY
-            {
-                (*keys_gc_header).gc_flags & crate::gc::GC_FLAG_SHAPE_SHARED != 0
-            } else {
-                true
-            };
-            let owned_keys = if keys_shared {
-                let cloned = crate::array::js_array_alloc(key_count as u32 + 4);
-                refresh_roots_after_alloc!();
-                let keys = crate::object::object_keys_array(obj);
-                prev_keys_usize = keys as usize;
-                // #10939: a keys array's elements do not necessarily start
-                // at `header + 8`. `keys_array_dense_slots` resolves a
-                // grow-forward pointer and adds `array_front_offset`, which is
-                // nonzero for any array with a front reserve — #9019's
-                // reserved-floor keys arrays are BORN with leading holes, and a
-                // size-class round-up alone can make it nonzero. The clone
-                // declares every published slot a pointer, so copying from the
-                // wrong base does not merely read the wrong bytes: it promises
-                // the collector that `ArrayHeader` and reserve words are heap
-                // pointers. A missing property now, a SIGSEGV inside the next
-                // collection later, with a backtrace naming something else.
-                let (src_data, src_len) = crate::object::keys_array_dense_slots(keys);
-                let dst_data =
-                    crate::array::array_elements_ptr(cloned as *const crate::array::ArrayHeader);
-                // A source shorter than the shape's count means the shape is already
-                // lying; copy what exists rather than publishing uninitialised words
-                // as traced pointers.
-                let copied = std::cmp::min(key_count, src_len);
-                debug_assert_eq!(
-                    copied, key_count,
-                    "the shape's key count outruns its keys array"
-                );
-                for i in 0..copied {
-                    // GC_STORE_AUDIT(INIT): cloned keys array is unpublished; layout is rebuilt before publication.
-                    *dst_data.add(i) = (*src_data.add(i)).to_bits();
-                }
-                (*cloned).length = copied as u32;
-                super::rebuild_array_layout_from_slots(cloned);
-                set_object_keys_array(obj, cloned);
-                cloned
-            } else {
-                keys
-            };
+            // #10868 step 2.5 stage 1b. The successor is THE canonical array
+            // for this ordered list plus `key`, so the clone, the ownership
+            // test and the `+ 4` slack are all gone — and, decisively for the
+            // mint count, so is the PUBLISHED intermediate. This block used to
+            // publish the clone and then publish the pushed array, minting
+            // TWO ShapeIds per grow where the layout changed once: the census
+            // reads them as tail.rs:809 `fresh_keys_known_list` 2,431
+            // followed by tail.rs:825 `key_count` 4,222.
+            //
+            // `shape_keys_grown` went with them. It migrated the slot index
+            // of an OWNED array across an in-place grow; no keys array is
+            // owned any more, so the arm it served does not exist rather than
+            // being guarded (L8.3.15c).
             let new_index = key_count;
-            if new_index >= alloc_limit {
-                let owned_keys_handle = scope.root_raw_mut_ptr(owned_keys);
-                let new_keys =
-                    crate::array::js_array_push(owned_keys, JSValue::string_ptr(key as *mut _));
-                prev_keys_usize = if keys_shared {
-                    prev_keys_usize
-                } else {
-                    owned_keys_handle.get_raw_mut_ptr::<ArrayHeader>() as usize
-                };
-                refresh_roots_after_alloc!();
-                set_object_keys_array(obj, new_keys);
-                super::mark_object_dynamic_shape_unknown(obj);
-                // #8067: migrate only the owned array's validated slot index;
-                // the immutable descriptor is versioned to the new facts. A
-                // shared fork must NOT migrate: the old address still serves
-                // the siblings' live shape.
-                if !keys_shared {
-                    super::shapes::shape_keys_grown(prev_keys_usize, new_keys);
+            // #10868 step 2.5: TWO MODES, chosen by a fact on the shape —
+            // which is what dictionary mode IS. This is not a fast path
+            // beside a slow one inside one mode; an ordinary receiver's key
+            // list is a SHARED LAYOUT and interns, a latched receiver's list
+            // is its OWN and appends in place. `SharedLayout::of_receiver` is
+            // the kind check, and `canonicalize`/`extend_key` cannot be
+            // called without what it returns.
+            let new_keys = match crate::object::canonical_keys::SharedLayout::of_receiver(obj) {
+                Some(proof) => {
+                    let canonical_parent =
+                        crate::object::canonical_keys::canonicalize(&proof, keys, key_count as u32);
+                    refresh_roots_after_alloc!();
+                    crate::object::canonical_keys::extend_key(&proof, canonical_parent, key).view()
                 }
+                None => {
+                    // The parent's owned arm, unchanged: a dictionary's array
+                    // carries no `GC_FLAG_SHAPE_SHARED`, so this is the
+                    // in-place O(1)-amortized append that mode exists for.
+                    let owned = scope.root_raw_mut_ptr(keys);
+                    let grown =
+                        crate::array::js_array_push(keys, JSValue::string_ptr(key as *mut _));
+                    let _ = owned.get_raw_mut_ptr::<ArrayHeader>();
+                    crate::object::ObjectKeys::owned(grown)
+                }
+            };
+            refresh_roots_after_alloc!();
+            if new_index >= alloc_limit {
+                set_object_keys(obj, new_keys);
+                super::mark_object_dynamic_shape_unknown(obj);
                 // #7538: derive the stored bits from the REFRESHED `value` —
                 // see the twin below the linear scan.
                 let vbits = overflow_store_bits(value, obj, new_index);
@@ -884,35 +882,21 @@ pub(crate) fn set_field_by_name_object_tail(
                         },
                         prev_shape_id,
                         interned_key,
-                        new_keys as usize,
+                        new_keys.arr() as usize,
                         new_index as u32,
                         super::shapes::object_shape_stamp(obj),
                     );
                 }
                 keys_index_insert(
-                    crate::object::object_keys_array(obj),
+                    crate::object::object_keys(obj).arr(),
                     (new_index + 1) as u32,
                     key_hash,
                     new_index as u32,
                 );
                 return;
             }
-            let owned_keys_handle = scope.root_raw_mut_ptr(owned_keys);
-            let new_keys =
-                crate::array::js_array_push(owned_keys, JSValue::string_ptr(key as *mut _));
-            prev_keys_usize = if keys_shared {
-                prev_keys_usize
-            } else {
-                owned_keys_handle.get_raw_mut_ptr::<ArrayHeader>() as usize
-            };
-            refresh_roots_after_alloc!();
-            set_object_keys_array(obj, new_keys);
+            set_object_keys(obj, new_keys);
             super::mark_object_dynamic_shape_unknown(obj);
-            // #8067: owned grow keeps the slot index, while the immutable
-            // descriptor is versioned (see the overflow branch above).
-            if !keys_shared {
-                super::shapes::shape_keys_grown(prev_keys_usize, new_keys);
-            }
             // #7154 publication order: `gc_field_slot_range` bounds the
             // collector's view of the payload by `field_count`, so a slot at an
             // index the count does not yet cover is invisible to BOTH tracing
@@ -940,7 +924,7 @@ pub(crate) fn set_field_by_name_object_tail(
                     },
                     prev_shape_id,
                     interned_key,
-                    new_keys as usize,
+                    new_keys.arr() as usize,
                     new_index as u32,
                     super::shapes::object_shape_stamp(obj),
                 );
@@ -950,7 +934,7 @@ pub(crate) fn set_field_by_name_object_tail(
             // C3a migration above, an owned grow lands the append on the
             // migrated record rather than forcing a rebuild.
             keys_index_insert(
-                crate::object::object_keys_array(obj),
+                crate::object::object_keys(obj).arr(),
                 (new_index + 1) as u32,
                 key_hash,
                 new_index as u32,
@@ -1038,83 +1022,38 @@ pub(crate) fn set_field_by_name_object_tail(
         // clone entirely. This saves ~19 clones of growing size per
         // 20-property plain-object literal.
         //
-        // Validate the GC header before reading it. `keys_array` has
-        // already been range-checked for user address space but may
-        // still point at something other than a GC-allocated array
-        // in rare cases (static data, buffers re-interpreted as keys
-        // arrays). If the header doesn't identify as GC_TYPE_ARRAY,
-        // assume shared and clone (the previous, always-safe behaviour).
-        let keys_gc_header =
-            (keys as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-        let keys_shared = if (keys as usize) >= crate::gc::GC_HEADER_SIZE
-            && (*keys_gc_header).obj_type == crate::gc::GC_TYPE_ARRAY
-        {
-            (*keys_gc_header).gc_flags & crate::gc::GC_FLAG_SHAPE_SHARED != 0
-        } else {
-            // Unknown provenance — take the safe side.
-            true
-        };
-        let owned_keys = if keys_shared {
-            let cloned = crate::array::js_array_alloc(key_count as u32 + 4);
-            refresh_roots_after_alloc!();
-            let keys = crate::object::object_keys_array(obj);
-            prev_keys_usize = keys as usize;
-            // #10939: a keys array's elements do not necessarily start
-            // at `header + 8`. `keys_array_dense_slots` resolves a
-            // grow-forward pointer and adds `array_front_offset`, which is
-            // nonzero for any array with a front reserve — #9019's
-            // reserved-floor keys arrays are BORN with leading holes, and a
-            // size-class round-up alone can make it nonzero. The clone
-            // declares every published slot a pointer, so copying from the
-            // wrong base does not merely read the wrong bytes: it promises
-            // the collector that `ArrayHeader` and reserve words are heap
-            // pointers. A missing property now, a SIGSEGV inside the next
-            // collection later, with a backtrace naming something else.
-            let (src_data, src_len) = crate::object::keys_array_dense_slots(keys);
-            let dst_data =
-                crate::array::array_elements_ptr(cloned as *const crate::array::ArrayHeader);
-            // A source shorter than the shape's count means the shape is already
-            // lying; copy what exists rather than publishing uninitialised words
-            // as traced pointers.
-            let copied = std::cmp::min(key_count, src_len);
-            debug_assert_eq!(
-                copied, key_count,
-                "the shape's key count outruns its keys array"
-            );
-            for i in 0..copied {
-                // GC_STORE_AUDIT(INIT): cloned keys array is unpublished; layout is rebuilt before publication.
-                *dst_data.add(i) = (*src_data.add(i)).to_bits();
+        // #10868 step 2.5 stage 1b: the canonical successor, as above the
+        // linear scan. The clone-if-shared block this replaces published the
+        // clone and then the pushed array — two mints per grow; the census
+        // reads them as tail.rs:1022 `fresh_keys_known_list` 9,076 and
+        // tail.rs:1044/1102 `key_count` 3,676 + 5,416. `keys_shared` is not
+        // tested because it is now true of every keys array by construction.
+        let new_index = key_count;
+        // Two modes, as above the linear scan.
+        let new_keys = match crate::object::canonical_keys::SharedLayout::of_receiver(obj) {
+            Some(proof) => {
+                let canonical_parent =
+                    crate::object::canonical_keys::canonicalize(&proof, keys, key_count as u32);
+                refresh_roots_after_alloc!();
+                crate::object::canonical_keys::extend_key(&proof, canonical_parent, key).view()
             }
-            (*cloned).length = copied as u32;
-            super::rebuild_array_layout_from_slots(cloned);
-            set_object_keys_array(obj, cloned);
-            cloned
-        } else {
-            keys
+            None => {
+                let owned = scope.root_raw_mut_ptr(keys);
+                let grown = crate::array::js_array_push(keys, JSValue::string_ptr(key as *mut _));
+                let _ = owned.get_raw_mut_ptr::<ArrayHeader>();
+                crate::object::ObjectKeys::owned(grown)
+            }
         };
+        refresh_roots_after_alloc!();
 
         // Check if we have a spare physical slot (js_object_alloc_with_shape allocates max(N,8) slots).
         // Class objects (js_object_alloc_class_with_keys) have only exactly field_count slots;
         // attempting to write to new_index = key_count would overflow into the next heap allocation.
-        let new_index = key_count;
         if new_index >= alloc_limit {
             // No inline room — store in the overflow HashMap so the value is not lost.
             // Also add the key to keys_array so Object.keys() sees it.
-            let owned_keys_handle = scope.root_raw_mut_ptr(owned_keys);
-            let new_keys =
-                crate::array::js_array_push(owned_keys, JSValue::string_ptr(key as *mut _));
-            prev_keys_usize = if keys_shared {
-                prev_keys_usize
-            } else {
-                owned_keys_handle.get_raw_mut_ptr::<ArrayHeader>() as usize
-            };
-            refresh_roots_after_alloc!();
-            set_object_keys_array(obj, new_keys);
+            set_object_keys(obj, new_keys);
             super::mark_object_dynamic_shape_unknown(obj);
-            // #8067: migrate the owned slot index, not the descriptor id.
-            if !keys_shared {
-                super::shapes::shape_keys_grown(prev_keys_usize, new_keys);
-            }
             // #7538: the bits stored into overflow must come from the
             // REFRESHED `value`. This was snapshotted ABOVE the
             // `js_array_push` that grows the keys array — an allocation, so a
@@ -1158,29 +1097,16 @@ pub(crate) fn set_field_by_name_object_tail(
                     },
                     prev_shape_id,
                     interned_key,
-                    new_keys as usize,
+                    new_keys.arr() as usize,
                     new_index as u32,
                     super::shapes::object_shape_stamp(obj),
                 );
             }
             return;
         }
-        // First, add the key to the keys array (may reallocate)
-        let owned_keys_handle = scope.root_raw_mut_ptr(owned_keys);
-        let new_keys = crate::array::js_array_push(owned_keys, JSValue::string_ptr(key as *mut _));
-        prev_keys_usize = if keys_shared {
-            prev_keys_usize
-        } else {
-            owned_keys_handle.get_raw_mut_ptr::<ArrayHeader>() as usize
-        };
-        refresh_roots_after_alloc!();
-        // Update the object's keys_array pointer in case js_array_push reallocated
-        set_object_keys_array(obj, new_keys);
+        // Publish the canonical successor computed above.
+        set_object_keys(obj, new_keys);
         super::mark_object_dynamic_shape_unknown(obj);
-        // #8067: migrate the owned slot index, not the descriptor id.
-        if !keys_shared {
-            super::shapes::shape_keys_grown(prev_keys_usize, new_keys);
-        }
 
         // Set the field at the new index and update logical field_count
         // #7154 publication order: `gc_field_slot_range` bounds the
@@ -1212,7 +1138,7 @@ pub(crate) fn set_field_by_name_object_tail(
                 },
                 prev_shape_id,
                 interned_key,
-                new_keys as usize,
+                new_keys.arr() as usize,
                 new_index as u32,
                 super::shapes::object_shape_stamp(obj),
             );

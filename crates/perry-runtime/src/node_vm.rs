@@ -215,11 +215,11 @@ impl Default for ContextOptions {
 static VM_SCRIPTS: OnceLock<Mutex<HashMap<usize, ScriptMetadata>>> = OnceLock::new();
 
 fn scripts() -> &'static Mutex<HashMap<usize, ScriptMetadata>> {
-    VM_SCRIPTS.get_or_init(|| Mutex::new(HashMap::new()))
+    crate::once_init::get_or_init(&VM_SCRIPTS, || Mutex::new(HashMap::new()))
 }
 
 fn compiled_function_sources() -> &'static Mutex<HashMap<usize, String>> {
-    VM_COMPILED_FUNCTION_SOURCES.get_or_init(|| Mutex::new(HashMap::new()))
+    crate::once_init::get_or_init(&VM_COMPILED_FUNCTION_SOURCES, || Mutex::new(HashMap::new()))
 }
 
 pub(crate) fn compiled_function_source_for_closure(closure: usize) -> Option<String> {
@@ -1246,6 +1246,7 @@ fn main_context_state() -> ContextState {
     if let Some(state) = MAIN_CONTEXT.with(|main| main.borrow().clone()) {
         return state;
     }
+    crate::object::js_install_global_value_surfaces();
     let global = crate::object::js_get_global_this();
     let state = ContextState {
         returned_bits: global.to_bits(),

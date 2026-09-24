@@ -55,7 +55,13 @@ mod test_root_helpers;
 #[cfg(test)]
 pub(crate) use test_root_helpers::*;
 
-mod alloc;
+pub(crate) mod alloc;
+mod alloc_basic;
+pub(crate) use alloc::mark_object_plain_ordinary;
+pub use alloc::{
+    js_object_alloc, js_object_alloc_fast, js_object_alloc_fast_with_parent,
+    js_object_alloc_null_proto, js_object_alloc_with_parent, js_object_coerce,
+};
 mod json_construction;
 pub(crate) use json_construction::{
     object_from_inline_json_fields, object_from_json_fields_preinstalled,
@@ -79,6 +85,7 @@ pub(crate) use class_registry::class_registry_census;
 #[cfg(feature = "regex-engine")]
 pub(crate) use class_registry::construct_two_rooted;
 pub(crate) use class_registry::{construct_rooted_arguments, scan_current_new_target_root_mut};
+pub(crate) mod canonical_keys;
 mod census;
 pub(crate) use census::object_tables_census;
 mod collection_proto_thunks;
@@ -101,7 +108,7 @@ pub(crate) use gc_slots::{
     gc_field_slot_range, gc_shape_keys_edge_slot, rebuild_array_layout_from_slots,
     rebuild_object_field_layout,
 };
-mod global_fetch;
+pub(crate) mod global_fetch;
 pub(crate) use global_fetch::scan_pending_fetch_signal_root_mut;
 mod global_this;
 pub mod handle_expando;
@@ -163,12 +170,16 @@ pub(crate) use native_module_registry::js_nm_enable_install_all;
 pub(crate) use native_module_registry::nm_ctor_lookup;
 // Re-exported for submodule installers that delegate to a native module
 // (`fs/promises` → `fs.constants`, `sys` → `util`).
-pub(crate) use native_module_registry::{js_nm_install_fs, js_nm_install_perf, js_nm_install_util};
+pub(crate) use native_module_registry::{
+    js_install_global_value_surfaces, js_nm_install_fs, js_nm_install_module, js_nm_install_perf,
+    js_nm_install_util,
+};
 mod literal_constructor;
 mod native_module_stream;
 pub(crate) mod native_this_alias;
 mod object_literal_ops;
 pub(crate) mod object_ops;
+pub(crate) mod own_override;
 pub(crate) use object_ops::{ensure_key_in_keys_array, install_builtin_getter};
 mod object_ops_frozen;
 mod polymorphic_index;
@@ -191,7 +202,9 @@ pub(crate) use shapes::ShapeTable;
 mod prototype_helpers;
 mod reflect_support;
 mod reserved_floor;
-pub(crate) use reserved_floor::{ensure_reserved_floor_keys, reserved_slot_floor_for_class_id};
+pub(crate) use reserved_floor::{
+    ensure_reserved_floor_keys, reserved_slot_floor_for_class_id, reserved_slot_floor_for_object,
+};
 #[cfg(feature = "regex-engine")]
 pub(crate) mod regex_canonical;
 pub(crate) mod regex_proto_thunks;
@@ -207,7 +220,9 @@ pub(crate) use spill::{
 #[cfg(test)]
 use spill::{spill_capable_owner, spill_get, SPILL_MAX_FIELD_INDEX};
 #[cfg(test)]
-pub(crate) use spill::{test_set_spill_safepoint_hook, SpillSafepointHook};
+pub(crate) use spill::{
+    test_set_spill_safepoint_hook, SpillSafepointHook, TEST_LAYOUT_NOTE_SLOT_CALLS,
+};
 mod string_proto_thunks;
 #[cfg(feature = "temporal")]
 mod temporal_proto;
@@ -261,7 +276,9 @@ pub use native_call_method::*;
 pub use native_module::*;
 pub(crate) use native_module_dispatch::*;
 pub(crate) use native_module_stream::*;
-pub(crate) use nm_namespace_hooks::{arm_nm_namespace_ops, nm_namespace_ops, NmNamespaceOps};
+pub(crate) use nm_namespace_hooks::{
+    arm_nm_ee_ops, arm_nm_namespace_ops, nm_ee_ops, nm_namespace_ops, NmEeOps, NmNamespaceOps,
+};
 pub use object_literal_ops::*;
 pub use object_ops::*;
 pub use object_ops_frozen::*;
@@ -518,7 +535,8 @@ pub(crate) struct ObjectHotTables {
     /// checks (notably homogeneous Array element stores).
     pub(crate) shape_kind_cache: std::cell::UnsafeCell<Box<[u64]>>,
     /// Overflow map for shape_ids that collide in the inline cache. Values
-    /// are `(keys_array, runtime_shape_id)` — see [`ShapeCacheEntry`].
+    /// are `(keys_array, runtime_shape_id, key_count)` — see
+    /// [`ShapeCacheEntry`].
     ///
     /// `PtrHasher`, not SipHash. The inline cache above is 256 entries,
     /// direct-mapped on `shape_id & 255`, and `shape_id` steps by
@@ -537,7 +555,32 @@ pub(crate) struct ObjectHotTables {
     /// Iteration-order safe: the only iteration is `scan_shape_cache_roots_mut`
     /// (`.values_mut()`, GC root marking — commutative). Nothing else iterates.
     pub(crate) shape_cache_overflow:
-        RefCell<crate::fast_hash::PtrHashMap<u32, (*mut ArrayHeader, u32)>>,
+        RefCell<crate::fast_hash::PtrHashMap<u32, (*mut ArrayHeader, u32, u32)>>,
+    /// This agent's class_id -> (keys array address, field count, key count)
+    /// memo,
+    /// read by `alloc::registered_class_keys_array`.
+    ///
+    /// PER AGENT, because the addresses are. A class id names the same
+    /// compiled class in every agent, but each agent runs its own module
+    /// init and builds its own keys array in its own heap. When this was a
+    /// process-global `RwLock` (#10969 review, finding 3), a worker's module
+    /// init overwrote the main thread's entry with a foreign-heap address,
+    /// and each agent's weak prune then dropped the other's entry because it
+    /// could not attribute the address to its own heap. Here a foreign address
+    /// cannot be in the table at all.
+    ///
+    /// WEAK, per #6759 phase 3 and the discipline `canonical_keys` uses: the
+    /// address is rewritten on move by `alloc::scan_class_keys_roots_mut` and
+    /// the entry is dropped on death by `alloc::prune_dead_class_keys_entries`.
+    ///
+    /// `PtrHasher`, not SipHash: the key is a codegen-minted class id, never
+    /// external input, and `js_object_alloc_class_with_keys` remembers on
+    /// every construction (a `claude-code --help` profile put SipHash under
+    /// `remember_class_keys_array` at 0.175% of samples).
+    ///
+    /// Iteration-order safe: the two mutating passes rewrite independent
+    /// values and drop entries by a per-entry predicate.
+    pub(crate) class_keys_by_id: RefCell<crate::fast_hash::PtrHashMap<u32, (usize, u32, u32)>>,
     /// Per-thread shape-transition cache for the dynamic-key write path;
     /// see the doc block above `with_transition_cache`. HEAP-allocated
     /// (`Box`) — oversized inline storage overflowed the arm64_32 ILP32
@@ -567,6 +610,7 @@ impl ObjectHotTables {
                 [ShapeCacheEntry {
                     shape_id: 0,
                     runtime_shape_id: 0,
+                    key_count: 0,
                     keys_array: std::ptr::null_mut(),
                 }; SHAPE_INLINE_CACHE_SIZE],
             ),
@@ -574,6 +618,7 @@ impl ObjectHotTables {
                 vec![0; shapes::SHAPE_KIND_CACHE_SIZE].into_boxed_slice(),
             ),
             shape_cache_overflow: RefCell::new(crate::fast_hash::new_ptr_hash_map()),
+            class_keys_by_id: RefCell::new(crate::fast_hash::new_ptr_hash_map()),
             transition_cache: std::cell::UnsafeCell::new(
                 vec![
                     TransitionEntry {
@@ -620,6 +665,8 @@ const KEYS_INDEX_THRESHOLD: u32 = 32;
 
 #[path = "keys_lookup.rs"]
 mod keys_lookup;
+mod object_keys;
+pub(crate) use object_keys::ObjectKeys;
 pub(crate) mod read_stub;
 pub(crate) use keys_lookup::*;
 
@@ -652,6 +699,9 @@ pub(crate) struct ShapeCacheEntry {
     /// probe. Distinct from `shape_id`, which is the CODEGEN packed-keys
     /// hash used as this cache's lookup key.
     runtime_shape_id: u32,
+    /// The cached list's key count. The keys array can be a canonical
+    /// backing shared with longer lists, so its header length is not it.
+    key_count: u32,
     keys_array: *mut ArrayHeader,
 }
 
@@ -681,38 +731,85 @@ crate::perry_thread_local! {
 
 // Storage: `ObjectHotTables::{shape_inline_cache, shape_cache_overflow}`.
 
-/// Look up a keys_array by shape_id. Returns `null` on miss.
+/// Look up a static shape's keys by shape_id. `ObjectKeys::NONE` on miss.
 /// Hot-path: ~3 ALU ops + 1 load + 1 cmp + 1 branch (no RefCell, no HashMap).
 #[inline(always)]
-fn shape_cache_get(shape_id: u32) -> *mut ArrayHeader {
+fn shape_cache_get(shape_id: u32) -> ObjectKeys {
     shape_cache_get_with_id(shape_id).0
 }
 
-/// #6804: `shape_cache_get` plus the keys array's RUNTIME ShapeId (0 on
-/// miss), so the literal-allocation birth-stamp costs no extra probe.
+/// #6804: `shape_cache_get` plus the keys' RUNTIME ShapeId (0 on miss), so
+/// the literal-allocation birth-stamp costs no extra probe.
 #[inline(always)]
-fn shape_cache_get_with_id(shape_id: u32) -> (*mut ArrayHeader, u32) {
+fn shape_cache_get_with_id(shape_id: u32) -> (ObjectKeys, u32) {
     let st = crate::state::state();
     let slot = (shape_id as usize) & (SHAPE_INLINE_CACHE_SIZE - 1);
     // Safety: the state is per-thread by construction; the UnsafeCell
     // allows zero-overhead reads on the hot path.
     let entry = unsafe { (*st.object_hot.shape_inline_cache.get())[slot] };
     if entry.shape_id == shape_id {
-        return (entry.keys_array, entry.runtime_shape_id);
+        return (
+            ObjectKeys::new(entry.keys_array, entry.key_count),
+            entry.runtime_shape_id,
+        );
     }
     // Miss — check the overflow map.
     st.object_hot
         .shape_cache_overflow
         .borrow()
         .get(&shape_id)
-        .copied()
-        .unwrap_or((std::ptr::null_mut(), 0))
+        .map(|&(keys, runtime_shape_id, key_count)| {
+            (ObjectKeys::new(keys, key_count), runtime_shape_id)
+        })
+        .unwrap_or((ObjectKeys::NONE, 0))
 }
 
 /// Insert a keys_array into the cache. Updates the inline slot
 /// (evicting any prior entry there) and also writes to the overflow
 /// map so misses on the inline cache still find the value.
-fn shape_cache_insert(shape_id: u32, keys_array: *mut ArrayHeader) {
+/// #10868 step 2.5 stage 1c: this call CAN COLLECT, because `canonicalize`
+/// allocates, so it takes the caller's live object BY VALUE and hands back
+/// the post-collection one. A caller that keeps its old binding no longer
+/// compiles. That is not hypothetical: stage 1b introduced the allocation and
+/// `js_object_alloc_class_with_keys` wrote its keys edge at the stale address,
+/// which `descriptor_trap_collection_preserves_for_in_target_and_keys` caught
+/// because its trap collects once per key — fourteen collections through one
+/// enumeration, where the `ownKeys` sibling collects once and saw nothing.
+#[must_use]
+fn shape_cache_insert(
+    shape_id: u32,
+    live: canonical_keys::LiveObject,
+    keys: ObjectKeys,
+) -> (canonical_keys::LiveObject, ObjectKeys) {
+    // #10868 step 2.5 stage 1b: the cache holds the CANONICAL array for this
+    // static shape's key list, so two compile-time shapes that spell the same
+    // ordered key list are one layout rather than two. The canonical array is
+    // RETURNED rather than swapped in silently — every caller here keeps
+    // using the pointer afterwards (`remember_class_keys_array`, and the
+    // value it hands back to codegen), and a cache holding one array while
+    // the caller holds another is exactly the divergence this stage exists to
+    // remove.
+    let (live, keys) = {
+        // SAFETY: a live keys array or null; `canonicalize` allocates, roots
+        // its own operand, and `across` roots the caller's object.
+        if keys.count() == 0 {
+            // The empty list has no canonical array — the trie's root owns
+            // none — and a zero-length keys array is NOT interchangeable with
+            // null here: `js_build_class_keys_array` hands this pointer back
+            // to generated code. Leave it exactly as it was.
+            (live, keys)
+        } else {
+            live.across(|| unsafe {
+                canonical_keys::canonicalize(
+                    &canonical_keys::SharedLayout::shape_cache_entry(),
+                    keys.arr(),
+                    keys.count(),
+                )
+                .view()
+            })
+        }
+    };
+    let keys_array = keys.arr();
     // Mark the array as shape-shared so `js_object_set_field_by_name`
     // knows it must clone before mutating. The clone path was firing
     // every time *any* fresh object literal added a property beyond
@@ -734,7 +831,7 @@ fn shape_cache_insert(shape_id: u32, keys_array: *mut ArrayHeader) {
     let runtime_shape_id = if keys_array.is_null() {
         0
     } else {
-        shapes::shape_id_for_keys_ensure(keys_array, unsafe { (*keys_array).length })
+        shapes::shape_id_for_keys_ensure(keys_array, keys.count())
     };
     let st = crate::state::state();
     let slot = (shape_id as usize) & (SHAPE_INLINE_CACHE_SIZE - 1);
@@ -743,14 +840,16 @@ fn shape_cache_insert(shape_id: u32, keys_array: *mut ArrayHeader) {
         let entry = &mut (*st.object_hot.shape_inline_cache.get())[slot];
         entry.shape_id = shape_id;
         entry.runtime_shape_id = runtime_shape_id;
+        entry.key_count = keys.count();
         crate::gc::runtime_store_root_raw_mut_ptr_slot(&mut entry.keys_array, keys_array);
     }
     st.object_hot
         .shape_cache_overflow
         .borrow_mut()
-        .insert(shape_id, (keys_array, runtime_shape_id));
+        .insert(shape_id, (keys_array, runtime_shape_id, keys.count()));
     crate::gc::runtime_write_barrier_root_raw_ptr(keys_array);
     shape_carriers::note_shape_id(runtime_shape_id);
+    (live, keys)
 }
 
 /// Thread-local shape-transition cache for the dynamic-key write path
@@ -1009,13 +1108,14 @@ fn transition_edge_places_key(
         }
         let keys = next_keys as *const ArrayHeader;
         // A single-key transition edge (prev + key) always produces a target
-        // shape of exactly `slot_idx + 1` keys, with `key` at the last slot.
-        // Requiring the EXACT length (not just `slot_idx < length`) also
-        // rejects the "shared target grew in place after caching" case — where
-        // the cached `target_len` still matches but the actual array is now
-        // longer, so adopting it would give the object a keys_array with more
-        // keys than field_count tracks (keys present, values undefined).
-        if (*keys).length != slot_idx.wrapping_add(1) {
+        // list of exactly `slot_idx + 1` keys, with `key` at the last slot.
+        // The target is `(next_keys, slot_idx + 1)`: its count comes from the
+        // edge, never from the array. A cached array can be a canonical
+        // backing whose tip has grown past the target since; its first
+        // `slot_idx + 1` keys never change (a shape-shared array is appended
+        // only at its tip, past every published count), so it still holds the
+        // target as long as it is at least that long.
+        if (*keys).length <= slot_idx {
             return false;
         }
         let stored = crate::array::js_array_get(keys, slot_idx);
@@ -1036,7 +1136,7 @@ fn transition_edge_places_key(
 fn transition_cache_lookup(
     prev_shape_id: u32,
     interned_key: *const crate::StringHeader,
-) -> Option<(usize, u32, u32)> {
+) -> Option<(ObjectKeys, u32, u32)> {
     let (kid, len_marker) = transition_key_id(interned_key);
     let slot = transition_cache_slot(prev_shape_id, kid);
     let entry = with_transition_cache(|t| unsafe { (*t)[slot] });
@@ -1056,10 +1156,12 @@ fn transition_cache_lookup(
             return None;
         }
         let expected_len = entry_slot_idx.checked_add(1)?;
+        // A single-key edge's target list is exactly `slot_idx + 1` keys.
+        let target_keys = ObjectKeys::new(entry.next_keys as *mut ArrayHeader, expected_len);
         if entry.target_len == expected_len {
             #[cfg(feature = "shape-mint-diag")]
             shape_mint_census::note_transition_hit();
-            return Some((entry.next_keys, entry_slot_idx, entry.target_shape_id));
+            return Some((target_keys, entry_slot_idx, entry.target_shape_id));
         }
         // Stamp SHAPE_SHARED on the returned keys_array — this is the
         // moment we observe that a SECOND object is reusing the
@@ -1067,13 +1169,29 @@ fn transition_cache_lookup(
         // owner (whose keys_array points at the same memory) must
         // now treat the array as shared.
         unsafe {
+            // Only a SHARED array's prefix is immutable. An array that was
+            // still owned until this stamp may have been rewritten in place by
+            // its owner since the insert, so it must still be exactly the
+            // target's length (the rule before shared backings); a shared one
+            // may have grown past it at its tip.
+            // `transition_edge_places_key` above already proved this address
+            // is a tracked array header.
+            let was_shared = (*((entry.next_keys as *const u8)
+                .wrapping_sub(crate::gc::GC_HEADER_SIZE)
+                as *const crate::gc::GcHeader))
+                .gc_flags
+                & crate::gc::GC_FLAG_SHAPE_SHARED
+                != 0;
             if !transition_cache_stamp_shape_shared(entry.next_keys) {
                 #[cfg(feature = "shape-mint-diag")]
                 shape_mint_census::note_transition_miss(shape_mint_census::TcMiss::Unshared);
                 return None;
             }
             let keys = entry.next_keys as *const ArrayHeader;
-            if (*keys).length != expected_len || (*keys).length > (*keys).capacity {
+            if (*keys).length < expected_len
+                || (!was_shared && (*keys).length != expected_len)
+                || (*keys).length > (*keys).capacity
+            {
                 #[cfg(feature = "shape-mint-diag")]
                 shape_mint_census::note_transition_miss(shape_mint_census::TcMiss::TargetLen);
                 return None;
@@ -1087,7 +1205,7 @@ fn transition_cache_lookup(
         }
         #[cfg(feature = "shape-mint-diag")]
         shape_mint_census::note_transition_hit();
-        Some((entry.next_keys, entry_slot_idx, entry.target_shape_id))
+        Some((target_keys, entry_slot_idx, entry.target_shape_id))
     } else {
         // The one distinction that matters: an EMPTY slot is a cold miss, an
         // occupied one that does not match is a direct-mapped COLLISION with a
@@ -1163,7 +1281,9 @@ fn transition_cache_insert(
         {
             let expected_len = slot_idx.saturating_add(1);
             let keys = next_keys as *const ArrayHeader;
-            if (*keys).length == expected_len && (*keys).length <= (*keys).capacity {
+            // The target is the array's first `expected_len` keys (see
+            // `transition_edge_places_key`).
+            if (*keys).length >= expected_len && (*keys).length <= (*keys).capacity {
                 target_len = expected_len;
             }
         }
@@ -1325,6 +1445,9 @@ pub fn scan_object_cache_roots(mark: &mut dyn FnMut(f64)) {
 }
 
 pub fn scan_object_cache_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
+    // Object-owned weak layout caches: rewrite moves without retaining keys.
+    canonical_keys::scan_canonical_keys_roots_mut(visitor);
+    scan_class_keys_roots_mut(visitor);
     for slot in [
         &HTTP_METHODS_CACHE,
         &FS_CONSTANTS_CACHE,
@@ -1400,8 +1523,15 @@ pub fn scan_object_cache_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'
 /// but a call: a seam with logic of its own can drift from the writer it
 /// stands in for, which is exactly what let a deleted arm site stay green.
 #[cfg(test)]
-pub(crate) fn test_shape_cache_insert(shape_id: u32, keys_array: *mut ArrayHeader) {
-    shape_cache_insert(shape_id, keys_array);
+pub(crate) fn test_shape_cache_insert(
+    shape_id: u32,
+    keys_array: *mut ArrayHeader,
+) -> *mut ArrayHeader {
+    // A test hands in a freshly built, exclusively owned list.
+    let keys = unsafe { ObjectKeys::owned(keys_array) };
+    shape_cache_insert(shape_id, canonical_keys::LiveObject::none(), keys)
+        .1
+        .arr()
 }
 
 #[cfg(test)]
@@ -1412,12 +1542,14 @@ pub(crate) fn test_seed_shape_cache_root(shape_id: u32, keys_array: *mut ArrayHe
         // GC_STORE_AUDIT(ROOT): test seed mirrors shape_inline_cache roots scanned by scan_shape_cache_roots_mut.
         let entry = &mut (*st.object_hot.shape_inline_cache.get())[slot];
         entry.shape_id = shape_id;
+        entry.key_count = ObjectKeys::owned(keys_array).count();
         crate::gc::runtime_store_root_raw_mut_ptr_slot(&mut entry.keys_array, keys_array);
     }
     {
         let mut cache = st.object_hot.shape_cache_overflow.borrow_mut();
         cache.clear();
-        cache.insert(shape_id, (keys_array, 0));
+        let count = unsafe { ObjectKeys::owned(keys_array).count() };
+        cache.insert(shape_id, (keys_array, 0, count));
     }
     crate::gc::runtime_write_barrier_root_raw_ptr(keys_array);
 }
@@ -1501,17 +1633,22 @@ pub struct ObjectHeader {
     pub meta: *mut ObjectMeta,
 }
 
-/// Return the ordered keys array derived from the receiver's authoritative
-/// ShapeId descriptor. #8047 removed the per-object header mirror; this is the
-/// sole runtime spelling for consumers that need the pointer rather than the
-/// complete descriptor.
+// `ObjectKeys` lives in `object_keys.rs`.
+
+/// Return the receiver's ordered keys, derived from its authoritative ShapeId
+/// descriptor: the keys array and the shape's key count. #8047 removed the
+/// per-object header mirror; this is the sole runtime spelling for consumers
+/// that need the keys rather than the complete descriptor.
 #[inline]
-pub(crate) unsafe fn object_keys_array(obj: *const ObjectHeader) -> *mut ArrayHeader {
+pub(crate) unsafe fn object_keys(obj: *const ObjectHeader) -> ObjectKeys {
     let Some(descriptor) = shapes::object_shape_descriptor(obj) else {
-        return std::ptr::null_mut();
+        return ObjectKeys::NONE;
     };
     if descriptor.keys != 0 {
-        return descriptor.keys as usize as *mut ArrayHeader;
+        return ObjectKeys::new(
+            descriptor.keys as usize as *mut ArrayHeader,
+            descriptor.logical_key_count,
+        );
     }
     // The shape publishes no keys. Either the receiver genuinely has none, or
     // it is in DICTIONARY MODE and carries its own ordered list (#10868 step
@@ -1521,8 +1658,9 @@ pub(crate) unsafe fn object_keys_array(obj: *const ObjectHeader) -> *mut ArrayHe
     // node-identical behaviour on a dictionary object with no second
     // implementation of key order. An ordinary receiver never reaches this
     // line — the nonzero `keys` word returns above — so the branch costs
-    // nothing on the path that matters.
-    dictionary::keys_array(obj)
+    // nothing on the path that matters. A dictionary list is the receiver's
+    // own, so its header length is its count.
+    ObjectKeys::owned(dictionary::keys_array(obj))
 }
 
 /// Return the two shape facts needed together by callback-free serializers.
@@ -1531,10 +1669,13 @@ pub(crate) unsafe fn object_keys_array(obj: *const ObjectHeader) -> *mut ArrayHe
 #[inline]
 pub(crate) unsafe fn object_keys_and_live_slots(
     obj: *const ObjectHeader,
-) -> Option<(*mut ArrayHeader, u32)> {
+) -> Option<(ObjectKeys, u32)> {
     shapes::object_shape_descriptor(obj).map(|descriptor| {
         (
-            descriptor.keys as usize as *mut ArrayHeader,
+            ObjectKeys::new(
+                descriptor.keys as usize as *mut ArrayHeader,
+                descriptor.logical_key_count,
+            ),
             descriptor.live_inline_slot_count,
         )
     })
@@ -1600,9 +1741,9 @@ pub(crate) use cell_meta::cell_has_meta_edge;
 /// pointer taken before the allocation.
 #[inline]
 #[cfg_attr(feature = "shape-mint-diag", track_caller)]
-unsafe fn set_object_keys_array(obj: *mut ObjectHeader, keys_array: *mut ArrayHeader) {
+unsafe fn set_object_keys(obj: *mut ObjectHeader, keys: ObjectKeys) {
     let live = object_live_slot_count(obj);
-    set_object_keys_array_with_live(obj, keys_array, live);
+    set_object_keys_with_live(obj, keys, live);
 }
 
 /// `set_object_keys_array` for a receiver whose live inline-slot bound is not
@@ -1613,11 +1754,12 @@ unsafe fn set_object_keys_array(obj: *mut ObjectHeader, keys_array: *mut ArrayHe
 /// spurious `live = 0` intermediate for every allocation.
 #[inline]
 #[cfg_attr(feature = "shape-mint-diag", track_caller)]
-unsafe fn set_object_keys_array_with_live(
+unsafe fn set_object_keys_with_live(
     obj: *mut ObjectHeader,
-    keys_array: *mut ArrayHeader,
+    keys: ObjectKeys,
     live_inline_slot_count: u32,
 ) {
+    let keys_array = keys.arr();
     // #6759 C3c: a stamped shape id (carried in the `parent_class_id` word)
     // describes the OLD keys array on a pointer CHANGE. A same-pointer append is
     // versioned inside the publication helper; an immutable old descriptor is
@@ -1640,6 +1782,13 @@ unsafe fn set_object_keys_array_with_live(
     // publication into its own record and mints nothing. That is the bound
     // the mode exists to provide; see `object/dictionary.rs`.
     if dictionary::is_dictionary(obj) {
+        // A dictionary receiver's list is its own, so its length is its count.
+        debug_assert!(
+            keys_array.is_null()
+                || crate::array::keys_array_len_capped_to_capacity(keys_array) as u32
+                    == keys.count(),
+            "a dictionary receiver publishes an owned list"
+        );
         dictionary::publish_keys(obj, keys_array, live_inline_slot_count);
         return;
     }
@@ -1669,14 +1818,16 @@ unsafe fn set_object_keys_array_with_live(
     // (`shapes::stamp_object_shape_id_with_carrier_note`), which
     // `publish_object_shape_from` and every other post-birth publish now
     // route through — this call site no longer needs to remember the note.
-    shapes::publish_object_shape_from(obj, predecessor, keys_array, live_inline_slot_count);
-    // #10868 step 2.5 stage 1. The predicate is stubbed off (see
-    // `dictionary::should_latch_to_dictionary`, one relaxed load when off);
-    // armed, this is where a receiver stops interning its key list.
+    shapes::publish_object_shape_from(obj, predecessor, keys, live_inline_slot_count);
+    // #10868 step 2.5: this is where a receiver whose key list is unique to
+    // it stops interning (`dictionary::should_latch_to_dictionary`). The run
+    // is nonzero only when the append that produced `keys` created the list.
     if !keys_array.is_null() {
-        let key_count = crate::array::keys_array_len_capped_to_capacity(keys_array) as u32;
-        if dictionary::should_latch_to_dictionary(key_count) {
-            dictionary::latch_object_to_dictionary(obj);
+        let unique_run = canonical_keys::take_unique_run(keys);
+        if dictionary::should_latch_to_dictionary(unique_run)
+            && dictionary::latch_object_to_dictionary(obj)
+        {
+            canonical_keys::note_latched_away(keys);
         }
     }
 }

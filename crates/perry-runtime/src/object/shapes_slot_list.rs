@@ -836,6 +836,14 @@ pub(crate) unsafe fn publish_object_shape_delete_transition(
     let Some(current) = super::object_shape_descriptor(obj) else {
         return 0;
     };
+    // A dictionary receiver's identity comes from its own generation
+    // namespace and its keys live in its meta (its shape is keyless): this
+    // publisher would stamp an ordinary-namespace generation over it. Decline,
+    // and both callers take the compacting delete, which republishes through
+    // `dictionary::publish_keys`.
+    if crate::object::dictionary::is_dictionary(obj) {
+        return 0;
+    }
     let predecessor = super::object_shape_stamp(obj);
     // A delete is a STRUCTURAL transition, so the Array-subclass
     // named-prefix proof has to go: it is the one identity that deliberately
@@ -845,12 +853,13 @@ pub(crate) unsafe fn publish_object_shape_delete_transition(
     // shape transition exists to close. Every other transition publisher
     // already clears it; the hole-delete publishes did not.
     crate::array::clear_array_subclass_named_prefix_token(obj);
-    // The key count comes from the ARRAY, not the lineage: an O(1) hole
-    // delete leaves the length untouched, and the caller has not yet written
-    // the hole, so both agree here. Reading the array keeps this function
-    // honest if a future caller publishes after a length change.
+    // The key count comes from the SHAPE, which owns it: an O(1) hole delete
+    // leaves the count untouched, and a keys array's header length is only
+    // an upper bound on it (a canonical backing is as long as its longest
+    // list). Both lanes that publish here hold an owned array whose length
+    // they have not changed, so the two agree anyway.
     let keys_ptr = current.keys as usize as *mut super::ArrayHeader;
-    let logical_key_count = crate::array::keys_array_len_capped_to_capacity(keys_ptr) as u32;
+    let logical_key_count = current.logical_key_count;
     let generation =
         delete_transition_generation(predecessor, key_hash, slot).unwrap_or_else(|| {
             let generation =
@@ -1188,8 +1197,9 @@ mod tests {
                 packed.as_ptr(),
                 packed.len() as u32,
             );
-            let shared_keys = crate::object::object_keys_array(deleting);
-            assert_eq!(shared_keys, crate::object::object_keys_array(sibling));
+            let shared_keys_view = crate::object::object_keys(deleting);
+            let shared_keys = shared_keys_view.arr();
+            assert_eq!(shared_keys, crate::object::object_keys(sibling).arr());
             let keys_gc = crate::value::addr_class::try_read_gc_header(shared_keys as usize)
                 .expect("test premise: shared keys must be a live GC allocation");
             assert_ne!(
@@ -1213,9 +1223,10 @@ mod tests {
                 crate::object::js_object_delete_field(deleting, victim_key),
                 1
             );
-            let private_keys = crate::object::object_keys_array(deleting);
+            let private_keys_view = crate::object::object_keys(deleting);
+            let private_keys = private_keys_view.arr();
             assert_ne!(private_keys, shared_keys);
-            assert_eq!(crate::object::object_keys_array(sibling), shared_keys);
+            assert_eq!(crate::object::object_keys(sibling).arr(), shared_keys);
 
             assert_eq!(
                 shape_slot_lookup(

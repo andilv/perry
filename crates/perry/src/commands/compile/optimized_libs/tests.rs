@@ -25,6 +25,31 @@ fn write_file(path: &Path, contents: &[u8]) {
     std::fs::write(path, contents).expect("write test file");
 }
 
+#[test]
+fn missing_ext_archive_names_emitted_symbols_and_their_providers() {
+    let emitted = BTreeSet::from([
+        "js_bun_tcp_nm_install".to_string(),
+        "js_ext_http_nm_install".to_string(),
+    ]);
+    let definitions = HashSet::new();
+    let missing = missing_ext_archive_diagnostics(&emitted, &definitions, &[], None);
+    assert_eq!(missing.len(), 2);
+    assert!(missing.iter().any(|line| {
+        line.contains("js_bun_tcp_nm_install")
+            && line.contains("libperry_ext_net.a")
+            && line.contains("-p perry-stdlib-static -p perry-ext-net")
+    }));
+    assert!(missing.iter().any(|line| {
+        line.contains("js_ext_http_nm_install")
+            && line.contains("libperry_ext_http.a")
+            && line.contains("-p perry-stdlib-static -p perry-ext-http")
+    }));
+
+    let resolved = [PathBuf::from("/archive/libperry_ext_net.a")];
+    let definitions = HashSet::from(["js_ext_http_nm_install".to_string()]);
+    assert!(missing_ext_archive_diagnostics(&emitted, &definitions, &resolved, None).is_empty());
+}
+
 fn minimal_auto_workspace(dir: &Path) {
     write_file(&dir.join("Cargo.toml"), b"[workspace]\n");
     write_file(&dir.join("Cargo.lock"), b"# lock\n");
@@ -89,15 +114,16 @@ fn build_optimized_libs_reuses_fresh_auto_archives_without_cargo() {
     // Mirror build_optimized_libs's feature derivation for this import-free
     // ctx: since the stdlib cherry-pick, `crypto` is no longer force-added
     // (it only joins via imports, `uses_crypto_builtins`, or the codegen
-    // `js_crypto_*` prefix net); only the `async-runtime` floor (required
-    // by the always-on worker_threads/readline async bridge) is forced, and
-    // the import-/fetch-driven unions don't fire for a fresh ctx.
+    // `js_crypto_*` prefix net); only the `async-bridge` floor (required
+    // by the always-on worker_threads/readline async bridge; tokio-free
+    // since turnloop P8 lane L) is forced, and the import-/fetch-driven
+    // unions don't fire for a fresh ctx.
     let mut features = compute_required_features(
         &ctx.native_module_imports,
         ctx.uses_fetch,
         ctx.uses_crypto_builtins,
     );
-    features.insert("async-runtime");
+    features.insert("async-bridge");
     let feature_arg = features_to_cargo_arg(&features);
     let panic_abort_safe =
         !ctx.needs_ui && !ctx.needs_thread && !ctx.needs_plugins && !ctx.needs_geisterhand;
@@ -1482,4 +1508,17 @@ fn wasm_usage_changes_auto_optimize_cache_key() {
         key_no_wasm, key_wasm,
         "wasm usage must change the cache key so the target dirs don't collide"
     );
+}
+
+#[test]
+fn gc_instrument_knobs_match_the_runtime() {
+    // The compiler decides whether to link the instruments; the runtime aborts
+    // when a knob it cannot serve is set. Both must name the same knobs.
+    let root = super::super::find_perry_workspace_root().unwrap();
+    let src =
+        std::fs::read_to_string(root.join("crates/perry-runtime/src/gc/instruments.rs")).unwrap();
+    let start = src.find("INSTRUMENT_KNOBS: &[&str] = &[").unwrap();
+    let end = start + src[start..].find("];").unwrap();
+    let runtime: Vec<&str> = src[start..end].split('"').skip(1).step_by(2).collect();
+    assert_eq!(runtime, super::freshness::GC_INSTRUMENT_KNOBS);
 }

@@ -57,6 +57,7 @@ impl WasmModuleEmitter {
             string_eq: next_import(),
             string_len: next_import(),
             jsvalue_to_string: next_import(),
+            jsvalue_to_template_string: next_import(),
             is_truthy: next_import(),
             js_strict_eq: next_import(),
             math_floor: next_import(),
@@ -307,6 +308,7 @@ impl WasmModuleEmitter {
             ("string_eq", t_f64_f64_i32),
             ("string_len", t_f64_f64),
             ("jsvalue_to_string", t_f64_f64),
+            ("jsvalue_to_template_string", t_f64_f64),
             ("is_truthy", t_f64_i32),
             ("js_strict_eq", t_f64_f64_i32),
             ("math_floor", t_f64_f64),
@@ -530,11 +532,11 @@ impl WasmModuleEmitter {
             ("path_is_absolute", t_f64_i32), // (str) -> i32
             // Phase 5: Async/Promise/Fetch
             ("fetch_url", t_f64_f64), // (url_str) -> promise_handle
-            ("fetch_with_options", t_f64_f64_f64_f64), // (url, method, body, headers_obj) -> promise_handle
-            ("response_json", t_f64_f64),              // (response_handle) -> promise_handle
-            ("response_text", t_f64_f64),              // (response_handle) -> promise_handle
-            ("promise_new", t_void_f64),               // () -> promise_handle
-            ("promise_resolve", t_f64_f64_void),       // (promise_handle, value) -> void
+            ("fetch_with_options", t_f64_f64_f64_f64_f64), // (url, method, body, headers_obj, redirect) -> promise_handle
+            ("response_json", t_f64_f64),                  // (response_handle) -> promise_handle
+            ("response_text", t_f64_f64),                  // (response_handle) -> promise_handle
+            ("promise_new", t_void_f64),                   // () -> promise_handle
+            ("promise_resolve", t_f64_f64_void),           // (promise_handle, value) -> void
             ("promise_then", t_f64_f64_f64), // (promise_handle, closure_handle) -> promise_handle
             ("await_promise", t_f64_f64),    // (value) -> resolved_value_or_value
             // Memory-based bridge: args written to WASM memory at 0xFF00, only plain numbers as params

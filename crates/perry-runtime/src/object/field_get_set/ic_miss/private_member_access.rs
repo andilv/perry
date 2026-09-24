@@ -265,6 +265,30 @@ pub(crate) fn private_member_set_by_name(
     true
 }
 
+/// Resolve an INSTANCE's private brand for `declaring_class_id` from the
+/// evaluation stamped on it (`stamp_private_evaluation_brand`).
+///
+/// The stamp is the most-derived class evaluation that constructed the
+/// instance: `new E()` stamps E's class object even when the private member
+/// being accessed was declared by an ancestor. Every ancestor evaluation whose
+/// constructor ran on the instance through `super()` is reachable from that
+/// stamp by the per-evaluation parent edge each fresh class object pins
+/// (`js_class_object_pin_parent`), so walk it and answer with the ancestor
+/// evaluation belonging to `declaring_class_id`'s template. Comparing only the
+/// stamp rejected every legal `this.#x` in an inherited method when both
+/// classes are per-evaluation — function-local classes (#11127), and
+/// top-level classes that capture a CommonJS-wrapper local such as
+/// `const EventEmitter = require("events")` (#11131).
+///
+/// The walk stops at the first non-class-object heritage (a static ClassRef,
+/// a closure, a builtin), which answers `None` exactly as before, and the
+/// caller still requires the per-field marker, so a brand found here never
+/// admits an uninitialized element.
+fn instance_ancestor_evaluation_brand(brand: f64, declaring_class_id: u32) -> Option<u64> {
+    super::super::class_constructors::pinned_class_object_for_ancestor(brand, declaring_class_id)
+        .map(f64::to_bits)
+}
+
 /// If the lexical class evaluation can be recovered from `brand_owner`,
 /// compare `obj` against that exact evaluation. `None` asks callers to retain
 /// the existing template-class check for ordinary (single-evaluation) classes.
@@ -388,4 +412,53 @@ pub(crate) fn test_push_catch_private_hint(marker: u32) {
             is_write: true,
         });
     });
+}
+
+#[cfg(test)]
+mod instance_ancestor_evaluation_brand_tests {
+    use super::*;
+
+    unsafe fn class_object(cid: u32) -> f64 {
+        let class = crate::object::js_object_alloc(cid, 0);
+        crate::object::class_registry::js_object_mark_class(class as i64);
+        crate::value::js_nanbox_pointer(class as i64)
+    }
+
+    unsafe fn pin_parent(class: f64, parent: f64) {
+        let key = super::super::super::class_registry::parent_static::CLASS_OBJECT_PARENT_KEY;
+        let key = crate::string::js_string_from_bytes(key.as_ptr(), key.len() as u32);
+        let class = JSValue::from_bits(class.to_bits()).as_pointer::<ObjectHeader>();
+        js_object_set_field_by_name(class as *mut ObjectHeader, key, parent);
+    }
+
+    /// #11127/#11131: `new E()` stamps E's evaluation, yet a method of the
+    /// ancestor S must find S's evaluation on the instance through E's pinned
+    /// parent. A class object keeps the exact comparison: static private
+    /// elements are not inherited.
+    #[test]
+    fn instance_brand_resolves_through_pinned_ancestor_evaluations() {
+        unsafe {
+            const CID_S: u32 = 62_511;
+            const CID_E: u32 = 62_512;
+            const CID_F: u32 = 62_513;
+            const CID_OTHER: u32 = 62_514;
+            let s = class_object(CID_S);
+            let e = class_object(CID_E);
+            let f = class_object(CID_F);
+            pin_parent(e, s);
+            pin_parent(f, e);
+
+            let instance = crate::object::js_object_alloc(CID_F, 0);
+            stamp_private_evaluation_brand(instance, f);
+            let instance = crate::value::js_nanbox_pointer(instance as i64);
+
+            assert_eq!(private_evaluation_brand(instance, CID_F), Some(f.to_bits()));
+            assert_eq!(private_evaluation_brand(instance, CID_E), Some(e.to_bits()));
+            assert_eq!(private_evaluation_brand(instance, CID_S), Some(s.to_bits()));
+            assert_eq!(private_evaluation_brand(instance, CID_OTHER), None);
+
+            assert_eq!(private_evaluation_brand(f, CID_F), Some(f.to_bits()));
+            assert_eq!(private_evaluation_brand(f, CID_S), None);
+        }
+    }
 }

@@ -798,6 +798,17 @@ pub extern "C" fn perry_ui_stack_set_distribution(_handle: i64, _dist: f64) {}
 pub extern "C" fn perry_ui_stack_set_alignment(_handle: i64, _align: f64) {}
 #[no_mangle]
 pub extern "C" fn perry_ui_textfield_focus(_handle: i64) {}
+// Selection control is currently macOS-specific; retain the shared UI ABI.
+#[no_mangle]
+pub extern "C" fn perry_ui_textfield_set_selection_range(_handle: i64, _start: f64, _end: f64) {}
+#[no_mangle]
+pub extern "C" fn perry_ui_textfield_get_selection_start(_handle: i64) -> f64 {
+    0.0
+}
+#[no_mangle]
+pub extern "C" fn perry_ui_textfield_get_selection_end(_handle: i64) -> f64 {
+    0.0
+}
 #[no_mangle]
 pub extern "C" fn perry_ui_textfield_set_string(_handle: i64, _text: i64) {}
 #[no_mangle]
@@ -1210,6 +1221,9 @@ pub extern "C" fn perry_ui_app_set_transparent(_app: i64, _val: f64) {}
 pub extern "C" fn perry_ui_app_set_vibrancy(_app: i64, _ptr: i64) {}
 #[no_mangle]
 pub extern "C" fn perry_ui_app_set_activation_policy(_app: i64, _ptr: i64) {}
+
+#[no_mangle]
+pub extern "C" fn perry_ui_app_set_quit_on_last_window_close(_app_handle: i64, _value: f64) {}
 /// Issue #1280 — watchOS apps don't have user-resizable windows. Stub.
 #[no_mangle]
 pub extern "C" fn perry_ui_app_set_window_state(_app: i64, _ptr: i64) {}
@@ -1972,3 +1986,10 @@ pub extern "C" fn perry_ui_app_set_frame_autosave_name(_app_handle: i64, _value_
 /// Export the shared ABI so portable perry/ui code continues to compile.
 #[no_mangle]
 pub extern "C" fn perry_ui_widget_set_max_width(_handle: i64, _max_width: f64) {}
+
+// macOS Text spacing setters are harmless on this platform.
+#[no_mangle]
+pub extern "C" fn perry_ui_text_set_letter_spacing(_handle: i64, _points: f64) {}
+
+#[no_mangle]
+pub extern "C" fn perry_ui_text_set_line_height(_handle: i64, _multiple: f64) {}

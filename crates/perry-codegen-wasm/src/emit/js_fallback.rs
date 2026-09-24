@@ -357,6 +357,7 @@ impl WasmModuleEmitter {
                 headers,
                 headers_dynamic,
                 signal: _,
+                redirect,
             } => {
                 let url_js = self.emit_js_expr(url, locals);
                 let method_js = self.emit_js_expr(method, locals);
@@ -381,6 +382,10 @@ impl WasmModuleEmitter {
                         opts.push_str(&format!("'{}': getString({})", key, v));
                     }
                     opts.push('}');
+                }
+                if let Some(mode) = redirect {
+                    let redirect_js = self.emit_js_expr(mode, locals);
+                    opts.push_str(&format!(", redirect: getString({})", redirect_js));
                 }
                 opts.push('}');
                 format!("fromJsValue(await fetch(getString({}), {}))", url_js, opts)
@@ -630,6 +635,10 @@ impl WasmModuleEmitter {
             Expr::StringCoerce(val) => {
                 let v = self.emit_js_expr(val, locals);
                 format!("fromJsValue(String(toJsValue({})))", v)
+            }
+            Expr::TemplateStringCoerce(val) => {
+                let v = self.emit_js_expr(val, locals);
+                format!("fromJsValue(`${{toJsValue({})}}`)", v)
             }
             Expr::ObjectCoerce(val) => {
                 let v = self.emit_js_expr(val, locals);

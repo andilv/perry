@@ -236,11 +236,14 @@ fn the_reverse_indices_follow_a_moved_keys_array() {
     let obj = (js_shadow_slot_get(0) & POINTER_MASK) as *mut crate::ObjectHeader;
     let id = unsafe { shapes::object_shape_stamp(obj) };
     assert!(shapes::is_shape_id(id), "the receiver stays stamped");
-    assert_eq!(
-        shapes::test_shape_ids_for_keys(after.keys as usize),
-        vec![id],
+    // A family is every descriptor on one keys ARRAY, and one canonical
+    // backing serves a whole growth chain: the receiver's `[k0, k1]` shares
+    // it with the `[k0]` it grew from. All of them follow the move.
+    let family = shapes::test_shape_ids_for_keys(after.keys as usize);
+    assert!(
+        family.contains(&id),
         "#9706: the family index must be re-keyed to the forwarded address \
-         (before={:#x} after={:#x} under-before={:?} record-keys={:#x})",
+         (before={:#x} after={:#x} family={family:?} under-before={:?} record-keys={:#x})",
         before.keys,
         after.keys,
         shapes::test_shape_ids_for_keys(before.keys as usize),
@@ -248,6 +251,13 @@ fn the_reverse_indices_follow_a_moved_keys_array() {
             .map(|d| d.keys)
             .unwrap_or(0)
     );
+    for member in &family {
+        assert_eq!(
+            shapes::shape_descriptor_by_id(*member).map(|d| d.keys),
+            Some(after.keys),
+            "#9706: family member {member} still names another array"
+        );
+    }
     assert!(
         shapes::test_shape_ids_for_keys(before.keys as usize).is_empty(),
         "#9706: nothing may stay indexed under the from-space address"
@@ -667,4 +677,103 @@ fn transition_cache_target_survives_and_can_restamp_after_full_trace() {
     shapes::test_reset_cached_transition_stamps();
     js_shadow_slot_set(0, crate::value::TAG_UNDEFINED);
     shapes::test_clear_shape_table();
+}
+
+/// Check reclaimed STORAGE, not merely a weak table entry disappearing.
+#[test]
+fn dead_canonical_cache_list_storage_is_reused() {
+    use crate::object::canonical_keys::{canonicalize, CanonicalKeys, SharedLayout};
+    let _guard = CopyingNurseryTestGuard::new(0);
+    let _triggers = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    crate::object::canonical_keys::reset_for_test();
+    crate::arena::arena_reset_all_blocks_to_zero();
+    let raw = crate::array::js_array_alloc(1);
+    let raw = crate::array::js_array_push(raw, crate::JSValue::from_bits(crate::value::TAG_HOLE));
+    let list: CanonicalKeys = unsafe { canonicalize(&SharedLayout::shape_cache_entry(), raw, 1) };
+    let addr = list.addr();
+    let capacity = unsafe { (*list.as_ptr()).capacity };
+    let _ = collect_minor_trace(GcTriggerKind::Direct);
+    // Eden reset must return the actual dead cell. Weak-table pruning alone
+    // would also pass with never-reclaimed long-lived allocation.
+    let mut reused = false;
+    for _ in 0..64 {
+        let next = crate::array::js_array_alloc_with_length_exact(capacity);
+        reused |= next as usize == addr;
+    }
+    assert!(
+        reused,
+        "the dead canonical list's storage was not returned to the allocator"
+    );
+}
+
+/// The collector is itself a writer of published key elements. A live
+/// prefix and its full list have separate headers/storage even after moving.
+#[test]
+fn canonical_prefix_and_full_list_survive_element_rewrites() {
+    use crate::object::canonical_keys::{canonicalize, extend_key, SharedLayout};
+    let _guard = CopyingNurseryTestGuard::new(0);
+    let _triggers = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    super::support::register_runtime_handle_root_scanner_for_tests();
+    gc_register_mutable_root_scanner(crate::object::canonical_keys::scan_canonical_keys_roots_mut);
+    // The shape table's descriptors name those same young lists; its weak
+    // rewrite must run too, or a descriptor keeps a moved list's old address.
+    gc_register_mutable_root_scanner(crate::object::shapes::scan_shape_table_rekey_mut);
+    crate::object::canonical_keys::reset_for_test();
+    let scope = RuntimeHandleScope::new();
+    let raw = scope.root_raw_mut_ptr(crate::array::js_array_alloc(3));
+    for name in [
+        "moving_prefix_first",
+        "moving_prefix_second",
+        "moving_prefix_third",
+    ] {
+        let k = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+        let next =
+            raw.with_mut_ptr(|a| crate::array::js_array_push(a, crate::JSValue::string_ptr(k)));
+        raw.set_raw_mut_ptr(next);
+    }
+    let proof = SharedLayout::shape_cache_entry();
+    let full = unsafe { raw.with_const_ptr(|a| canonicalize(&proof, a, 3)) };
+    let full = scope.root_raw_mut_ptr(full.as_ptr());
+    let prefix = unsafe { full.with_const_ptr(|a| canonicalize(&proof, a, 2)) };
+    let prefix = scope.root_raw_mut_ptr(prefix.as_ptr());
+    raw.set_raw_mut_ptr::<crate::ArrayHeader>(std::ptr::null_mut());
+    let first_before = full
+        .with_const_ptr(|a| crate::array::js_array_get(a, 0))
+        .bits();
+    let trace = collect_minor_trace(GcTriggerKind::Direct);
+    assert!(trace.copying_nursery.copied_objects > 0);
+    let first_after = full
+        .with_const_ptr(|a| crate::array::js_array_get(a, 0))
+        .bits();
+    assert_ne!(
+        first_before, first_after,
+        "GC must actually rewrite the element pointer"
+    );
+    assert_eq!(
+        prefix.with_const_ptr(|a| crate::array::js_array_length(a)),
+        2
+    );
+    assert_eq!(full.with_const_ptr(|a| crate::array::js_array_length(a)), 3);
+    for (i, expected) in ["moving_prefix_first", "moving_prefix_second"]
+        .iter()
+        .enumerate()
+    {
+        let value = prefix.with_const_ptr(|a| crate::array::js_array_get(a, i as u32));
+        let mut sso = [0; crate::value::SHORT_STRING_MAX_LEN];
+        assert_eq!(
+            unsafe { crate::string::js_string_key_bytes(value, &mut sso) },
+            Some(expected.as_bytes())
+        );
+    }
+    unsafe {
+        let canonical_prefix = prefix.with_const_ptr(|a| canonicalize(&proof, a, 2));
+        prefix.with_mut_ptr(|a| assert_eq!(canonical_prefix.as_ptr(), a));
+        let last = full.with_const_ptr(|a| crate::array::js_array_get(a, 2));
+        let full_again = extend_key(
+            &proof,
+            canonical_prefix,
+            (last.bits() & POINTER_MASK) as *const crate::StringHeader,
+        );
+        full.with_mut_ptr(|a| assert_eq!(full_again.as_ptr(), a));
+    }
 }

@@ -41,8 +41,8 @@ unsafe fn emit_tls_secure_connect(handle: i64) {
         }
         drop(frame);
         lifecycle::drain_once_listeners(handle, "error");
-        if let Some(socket) = statics::sockets().lock().unwrap().get(&handle) {
-            let _ = socket.cmd_tx.send(SocketCommand::Destroy);
+        if let Some(socket) = statics::sockets().lock().unwrap().get_mut(&handle) {
+            let _ = socket.command(handle, SocketCommand::Destroy);
         }
         return;
     }
@@ -136,6 +136,7 @@ pub unsafe extern "C" fn js_ext_net_drain_pending() -> i32 {
                 let cbs = listeners_for(id, "data");
                 if cbs.is_empty() {
                     server_state::buffer_pending_server_data(id, bytes);
+                    emit_socket_no_arg(id, "readable");
                     continue;
                 }
                 // #8259: park BEFORE the payload allocation below — it can
@@ -227,7 +228,7 @@ pub unsafe extern "C" fn js_ext_net_drain_pending() -> i32 {
                 }
                 // Issue #1852 — readable side ended (peer FIN). Fire the
                 // `'end'` listeners; the trailing `Close` event (pushed
-                // right after `End` in `run_socket_task`) does the actual
+                // once the socket is torn down) does the actual
                 // listener-map / socket-map teardown, so don't remove
                 // anything here.
                 let frame = dispatch_custody::DispatchFrame::park(listeners_for(id, "end"));
@@ -239,7 +240,17 @@ pub unsafe extern "C" fn js_ext_net_drain_pending() -> i32 {
                 }
                 drop(frame);
                 lifecycle::drain_once_listeners(id, "end");
+                // P1: a turnloop socket has no task to run the post-EOF
+                // shutdown, so it happens here — AFTER the `'end'` listeners
+                // ran, which is what gives a synchronous `socket.write()`
+                // inside an `'end'` handler the same chance the tokio task's
+                // post-EOF command drain gave it. Node's default
+                // (`allowHalfOpen: false`) ends the writable side once the
+                // readable side has ended, then closes.
+                crate::turnloop_io::finish_read_end(id);
             }
+            // #11111 — the queue emptied after a `write()` returned false.
+            PendingNetEvent::Drain(id) => emit_socket_no_arg(id, "drain"),
             PendingNetEvent::WriteComplete(_, completion, error)
             | PendingNetEvent::ShutdownComplete(_, completion, error) => {
                 lifecycle::dispatch_socket_completion(completion, error);

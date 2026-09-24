@@ -44,9 +44,12 @@ mod jsvalue;
 mod nanbox;
 mod tags;
 pub(crate) mod to_string;
+pub(crate) mod to_string_array;
 #[cfg(test)]
 mod to_string_buffer_tests;
 pub(crate) mod to_string_class_ref;
+pub(crate) mod to_string_primitive;
+pub(crate) mod to_string_radix;
 mod truthy;
 
 #[cfg(test)]
@@ -114,10 +117,10 @@ pub use nanbox::{
 
 // ----- Dynamic arithmetic dispatch (BigInt vs float) -----
 pub use dynamic_arith::{
-    js_dynamic_add, js_dynamic_bitand, js_dynamic_bitor, js_dynamic_bitxor, js_dynamic_div,
-    js_dynamic_mod, js_dynamic_mul, js_dynamic_neg, js_dynamic_pos, js_dynamic_pow, js_dynamic_shl,
-    js_dynamic_shr, js_dynamic_string_or_number_add, js_dynamic_sub, js_dynamic_ushr,
-    js_numeric_step, js_to_numeric,
+    js_add_throw_if_symbol, js_dynamic_add, js_dynamic_bitand, js_dynamic_bitor, js_dynamic_bitxor,
+    js_dynamic_div, js_dynamic_mod, js_dynamic_mul, js_dynamic_neg, js_dynamic_pos, js_dynamic_pow,
+    js_dynamic_shl, js_dynamic_shr, js_dynamic_string_or_number_add, js_dynamic_sub,
+    js_dynamic_ushr, js_numeric_step, js_to_numeric, js_to_primitive_default_for_add,
 };
 
 // ----- Dynamic index get/set + bare-NaN check -----
@@ -126,16 +129,20 @@ pub use dyn_index::{
 };
 
 // ----- to-string conversion helpers -----
-pub(crate) use to_string::{
-    array_prototype_to_string, call_array_prototype_to_string_method, coerce_validate_radix,
+pub use to_string::{
+    js_ensure_string_ptr, js_jsvalue_to_string, js_jsvalue_to_string_coerce,
+    js_jsvalue_to_string_method, js_value_to_str_ptr_for_ffi,
+};
+pub(crate) use to_string_array::{
+    array_prototype_to_string, call_array_prototype_to_string_method,
+};
+pub(crate) use to_string_primitive::{
     function_to_primitive_for_add, function_to_string_method_result,
     ordinary_to_primitive_for_toprimitive, ordinary_to_primitive_number_for_add,
     to_primitive_number, OrdinaryToPrimitiveOutcome,
 };
-pub use to_string::{
-    js_ensure_string_ptr, js_jsvalue_to_string, js_jsvalue_to_string_coerce,
-    js_jsvalue_to_string_method, js_jsvalue_to_string_radix, js_value_to_str_ptr_for_ffi,
-};
+pub(crate) use to_string_radix::coerce_validate_radix;
+pub use to_string_radix::js_jsvalue_to_string_radix;
 
 // ----- Equality, comparison, SameValueZero, dynamic string equality -----
 pub(crate) use equality::resolve_forwarding;

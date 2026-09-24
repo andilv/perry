@@ -18,6 +18,12 @@ pub(crate) unsafe fn dispatch_net_socket(handle: i64, method: &str, args: &[f64]
     }
 
     match method {
+        "read" => crate::net::js_net_socket_read(
+            handle,
+            args.first()
+                .copied()
+                .unwrap_or(f64::from_bits(0x7FFC_0000_0000_0001)),
+        ),
         "write" if !args.is_empty() => {
             // Issue #1131 — pass the full NaN-box bits; the runtime
             // probes Buffer-vs-string and reads the correct layout.
@@ -178,7 +184,9 @@ pub(crate) unsafe fn dispatch_external_net_socket(handle: i64, method: &str, arg
         // silently dropped — no `write()` syscall ever fires. The distinct
         // symbols have no twin and always reach ext-net's own registry.
         // Mirrors how `js_ext_net_destroy_socket` was already split out (#5010).
-        fn js_ext_net_socket_write(handle: i64, buf_ptr: i64);
+        // #11111 — returns Node's boolean `write()` result.
+        fn js_ext_net_socket_write(handle: i64, buf_ptr: i64) -> f64;
+        fn js_ext_net_socket_read(handle: i64, size: f64) -> f64;
         // Issue #1852 — `js_ext_net_socket_end` takes the optional final
         // chunk (NA_JSV bits) so `socket.end(data)` writes before FIN.
         fn js_ext_net_socket_end(handle: i64, chunk_bits: i64);
@@ -234,13 +242,18 @@ pub(crate) unsafe fn dispatch_external_net_socket(handle: i64, method: &str, arg
     }
 
     match method {
+        "read" => js_ext_net_socket_read(
+            handle,
+            args.first()
+                .copied()
+                .unwrap_or(f64::from_bits(0x7FFC_0000_0000_0001)),
+        ),
         "write" if !args.is_empty() => {
             // Issue #1131 — pass the full NaN-box bits, not the
             // pre-stripped pointer. ext-net's write probes Buffer-vs-string
             // itself. #5021 — distinct symbol so the bytes can't be dropped
             // into the bundled twin's empty registry.
-            js_ext_net_socket_write(handle, args[0].to_bits() as i64);
-            f64::from_bits(0x7FFC_0000_0000_0001)
+            js_ext_net_socket_write(handle, args[0].to_bits() as i64)
         }
         "end" => {
             // Issue #1852 — forward the optional `socket.end(data)` chunk;

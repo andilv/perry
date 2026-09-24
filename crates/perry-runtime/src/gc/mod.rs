@@ -517,7 +517,7 @@ fn gc_collect_minor_with_trigger_inner(
 pub fn gen_gc_enabled() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
+    *crate::once_init::get_or_init(&CACHED, || {
         // Generational minors are only sound with runtime write barriers:
         // minors black-leaf old parents and trust the remembered set for
         // every old→young/old→malloc edge. `PERRY_WRITE_BARRIERS=0` used
@@ -756,7 +756,7 @@ pub(super) fn gc_scavenge_enabled() -> bool {
     }
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
+    *crate::once_init::get_or_init(&CACHED, || {
         // ON BY DEFAULT (#7056). `PERRY_GC_SCAVENGE=0`/`off`/`false` reverts.
         //
         // This pairs with the nursery cap in `policy::effective_next_arena_trigger`
@@ -973,6 +973,8 @@ pub fn gc_init() {
         return;
     }
     crate::perf_hooks::init_time_origin();
+    #[cfg(not(feature = "gc-instruments"))]
+    instruments::refuse_instrument_knobs_without_instruments();
     // `PERRY_GC_CENSUS`: remember the main thread and install the SIGUSR2
     // trigger. No-op (one OnceLock read) when the env var is unset.
     census::census_on_gc_init();
@@ -1407,6 +1409,9 @@ pub extern "C" fn js_gc_release_current_thread_collection_side_allocations() {
     // safepoints the schedule actually saw. Inert (one cached-`Option` load) and
     // once-only when the mode is off.
     schedule::report_exit_summary();
+    // turnloop P0: destroy this thread's agent loop and print the
+    // `PERRY_LOOP_STATS=1` line on the same all-exits funnel.
+    crate::event_pump::shutdown_wait_driver();
     crate::r#box::report_box_stats_at_exit();
     crate::arena::alloc_sample::report("exit");
     diag_sites::report_charges("exit");

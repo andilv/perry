@@ -81,7 +81,7 @@ pub(super) fn select_old_page_defrag_pages_from_snapshot(
         }
     }
 
-    candidates.sort_unstable_by(|a, b| {
+    crate::cold_sort::sort_by(&mut candidates, |a, b| {
         let b_ratio = (b.dead_bytes as u128).saturating_mul(a.allocated_bytes as u128);
         let a_ratio = (a.dead_bytes as u128).saturating_mul(b.allocated_bytes as u128);
         b_ratio
@@ -125,7 +125,9 @@ crate::perry_thread_local! {
 /// cannot return. Present so the two selections can be compared in one binary.
 fn idle_compact_block_selection_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| crate::gc::env_default_on_enabled("PERRY_GC_IDLE_COMPACT_BLOCKS"))
+    *crate::once_init::get_or_init(&ENABLED, || {
+        crate::gc::env_default_on_enabled("PERRY_GC_IDLE_COMPACT_BLOCKS")
+    })
 }
 
 /// Block bytes the most recent idle-compaction selection predicted it could
@@ -222,7 +224,7 @@ fn old_page_defrag_enabled() -> bool {
     }
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
+    *crate::once_init::get_or_init(&ENABLED, || {
         old_page_defrag_enabled_from_value(std::env::var("PERRY_GC_OLD_DEFRAG").ok().as_deref())
     })
 }
@@ -429,7 +431,7 @@ fn select_whole_blocks(
         .sum();
     // Cheapest to empty first; among equals prefer the one that gives back the
     // most dead bytes.
-    order.sort_unstable_by(|&a, &b| {
+    crate::cold_sort::sort_by(&mut order, |&a, &b| {
         blocks[a]
             .live_bytes
             .cmp(&blocks[b].live_bytes)

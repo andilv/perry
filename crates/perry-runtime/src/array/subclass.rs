@@ -437,12 +437,10 @@ pub(crate) unsafe fn array_subclass_named_prefix_token_for_slot(
     if class_id == 0 || !is_array_subclass_class_id(class_id) {
         return 0;
     }
-    let Some((declared_keys, declared_count)) =
-        crate::object::registered_class_keys_array(class_id)
-    else {
-        return 0;
-    };
-    if declared_keys.is_null() {
+    // The class memo answers only whether a declared layout exists here; its
+    // address is read again right before the comparison below, so no
+    // allocation between the two can leave a stale copy in hand.
+    if crate::object::registered_class_keys_array(class_id).is_none() {
         return 0;
     }
     // An elements-backed instance (`super::subclass_elements`) has NO numeric
@@ -495,11 +493,18 @@ pub(crate) unsafe fn array_subclass_named_prefix_token_for_slot(
     if shape.object_kind != crate::object::shapes::ShapeObjectKind::Ordinary {
         return 0;
     }
-    let current_keys = shape.keys as usize as *const ArrayHeader;
-    let (current_slots, current_physical_len) = crate::object::keys_array_dense_slots(current_keys);
-    let (declared_slots, declared_physical_len) =
-        crate::object::keys_array_dense_slots(declared_keys as *const ArrayHeader);
-    let current_count = (shape.logical_key_count as usize).min(current_physical_len);
+    let Some((declared_keys, declared_count)) =
+        crate::object::registered_class_keys_array(class_id)
+    else {
+        return 0;
+    };
+    if declared_keys.is_null() {
+        return 0;
+    }
+    // Both counts come from shapes: the receiver's descriptor and the class
+    // memo's view. `dense_slots` caps each at its array's physical length.
+    let (current_slots, current_count) = shape.keys_view().dense_slots();
+    let (declared_slots, declared_physical_len) = declared_keys.dense_slots();
     let declared_count = (declared_count as usize).min(declared_physical_len);
     if current_slots.is_null() || declared_slots.is_null() || declared_count > current_count {
         return 0;

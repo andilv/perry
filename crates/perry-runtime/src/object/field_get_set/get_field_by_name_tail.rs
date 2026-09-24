@@ -1234,7 +1234,8 @@ pub(crate) fn get_field_by_name_object_tail(
             }
         }
 
-        let keys = crate::object::object_keys_array(obj);
+        let keys_view = crate::object::object_keys(obj);
+        let keys = keys_view.arr();
 
         if keys.is_null() {
             // #9131; see `prototype_override::inherited_field_if_overridden`.
@@ -1454,7 +1455,7 @@ pub(crate) fn get_field_by_name_object_tail(
         // drive the wide-key map build or the linear scan below into unbounded
         // work (see `keys_array_len_capped_to_capacity`). No-op for well-formed
         // arrays.
-        let key_count = crate::array::keys_array_len_capped_to_capacity(keys);
+        let key_count = keys_view.count() as usize;
 
         // Per-thread inline cache (`state().field_lookup.field_cache`):
         // fixed-size direct-mapped cache (no allocation, no HashMap).
@@ -1760,9 +1761,9 @@ pub(crate) fn get_field_by_name_object_tail(
         // lookup, preserving ordinary shadowing while avoiding a rebound
         // function value from the generic inherited-accessor path.
         if (*obj).class_id == crate::process::MODULE_CJS_CLASS_ID && key_bytes == b"constructor" {
-            return JSValue::from_bits(
-                crate::object::module_constructor_identity_value().to_bits(),
-            );
+            if let Some(ctor) = crate::object::module_cjs_constructor_via_hook() {
+                return JSValue::from_bits(ctor.to_bits());
+            }
         }
 
         // #2820: before giving up, walk an explicit `Object.setPrototypeOf`

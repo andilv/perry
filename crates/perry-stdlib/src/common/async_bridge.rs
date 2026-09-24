@@ -1,24 +1,45 @@
-//! Async bridge: connects Rust async (tokio) with the perry Promise system.
+//! Async bridge: settles Perry Promises from native work, on the thread that
+//! owns the JS heap.
 //!
-//! The perry runtime has a Promise implementation that expects synchronous
-//! resolution callbacks. We need to bridge this with tokio's async runtime
-//! for database operations.
+//! Native work — a turnloop pool job, a plain OS thread, or, in a build with
+//! the `async-runtime` feature, a tokio task — never builds a JSValue. It
+//! queues either finished bits (`queue_promise_resolution`) or a converter
+//! (`queue_deferred_resolution`), and `js_stdlib_process_pending` settles the
+//! promise on the main thread.
 //!
 //! IMPORTANT: perry-runtime uses thread-local arenas for memory allocation.
-//! This means JSValue objects created on tokio worker threads will be allocated
+//! This means JSValue objects created on worker threads will be allocated
 //! from a different arena than the main thread, causing memory corruption.
 //!
 //! To avoid this, async operations should:
-//! 1. NOT create JSValue objects (arrays, strings, objects) in async blocks
+//! 1. NOT create JSValue objects (arrays, strings, objects) off the main thread
 //! 2. Store raw Rust data and use deferred conversion callbacks
 //! 3. The conversion callbacks run on the main thread during js_stdlib_process_pending
+//!
+//! # No tokio here (turnloop P8 lane L)
+//!
+//! This module is compiled under `async-bridge` and contains no tokio. The
+//! tokio current-thread runtime and everything that drives it live in
+//! `super::tokio_bridge`, which only `async-runtime` compiles — the features
+//! whose code hands it tokio futures (bundled net/tls/ws sockets, reqwest
+//! fetch, the container engine) and the `perry_ffi_spawn_async` /
+//! `_with_reactor` C ABI that perry-ext-net / perry-ext-http still use. A
+//! program that needs none of those (crypto, bcrypt, argon2, zlib, readline,
+//! nodemailer, worker_threads, a UI app) links no tokio at all. The tokio
+//! half's public names are re-exported below so no caller's path changed.
 
-use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use once_cell::sync::Lazy;
-use tokio::runtime::Runtime;
+
+#[cfg(feature = "async-runtime")]
+pub(crate) use super::tokio_bridge::spawn_native;
+#[cfg(feature = "async-runtime")]
+pub use super::tokio_bridge::{
+    block_on, drive_pending, run_one_tick, runtime, spawn, spawn_for_promise,
+    spawn_for_promise_deferred, spawn_for_promise_deferred_with_error, RUNTIME,
+};
 
 /// Issue #859: pin a Promise so the GC can't sweep it while a tokio
 /// worker is computing its eventual resolution.
@@ -122,35 +143,35 @@ pub unsafe fn js_promise_new_for_native_resolution() -> *mut perry_runtime::Prom
 /// returning undefined.
 pub static EXT_BLOCKING_TASKS_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 
-/// Global tokio runtime for all async stdlib operations.
+/// Owns exactly one `EXT_BLOCKING_TASKS_INFLIGHT` increment, released on drop.
 ///
-/// Unified single-thread async model: a CURRENT-THREAD runtime, driven one
-/// bounded tick at a time by the main JS event loop (see `stdlib_wait_driver`
-/// and `js_register_wait_driver`). The I/O reactor, timer wheel, and all
-/// spawned native tasks (reqwest / net / ws) run on the main thread interleaved
-/// with JS — Node's model — so a native completion is observed in-thread and
-/// queued with no cross-thread wake to lose. `spawn_blocking` still offloads
-/// genuinely blocking / CPU-bound work to the blocking-thread pool; its result
-/// is delivered back and ends the next tick.
-pub static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        // #10399: glibc carves a thread's static TLS block out of the same
-        // mapping as its stack, so a compiled program's TLS comes off the top
-        // of whatever we ask for here. OpenCode's binary carries 5.79 MB of
-        // PT_TLS once module state is per-thread; against tokio's 2 MB default
-        // the blocking threads were left with almost no usable stack and
-        // SIGSEGV'd deep inside reqwest's connector on first use, while the
-        // main thread (whose TLS is allocated separately) was fine.
-        //
-        // The stack is reserved address space, committed lazily, so a generous
-        // reservation costs no RSS. `PERRY_THREAD_STACK_SIZE` overrides it.
-        .thread_stack_size(blocking_thread_stack_size())
-        .build()
-        .expect("Failed to create tokio current-thread runtime")
-});
+/// Create it BEFORE spawning and move it into the task: the decrement then runs
+/// on completion, on error, when the task panics (tokio drops the future while
+/// unwinding) and when the task is dropped before its first poll (runtime
+/// shutdown). The hand-written `fetch_add` / `fetch_sub` pairs it replaces
+/// leaked an increment on the last two paths, which pinned the event loop alive
+/// forever. Drop also notifies the main thread so the loop re-evaluates its
+/// keep-alive predicate.
+pub(crate) struct InflightGuard(());
 
-/// #10399: stack reservation for perry-spawned threads. See `RUNTIME`.
+impl InflightGuard {
+    pub(crate) fn new() -> Self {
+        EXT_BLOCKING_TASKS_INFLIGHT.fetch_add(1, Ordering::AcqRel);
+        Self(())
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        let previous = EXT_BLOCKING_TASKS_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "EXT_BLOCKING_TASKS_INFLIGHT underflow");
+        perry_runtime::event_pump::js_notify_main_thread();
+    }
+}
+
+/// #10399: stack reservation for perry-spawned threads — tokio's blocking
+/// pool (`tokio_bridge::RUNTIME`), `worker_threads` Workers, and the plain
+/// threads `perry_ffi_spawn_blocking` falls back to without tokio.
 pub fn blocking_thread_stack_size() -> usize {
     const DEFAULT: usize = 32 * 1024 * 1024;
     std::env::var("PERRY_THREAD_STACK_SIZE")
@@ -159,12 +180,6 @@ pub fn blocking_thread_stack_size() -> usize {
         .filter(|v| *v >= 1024 * 1024)
         .unwrap_or(DEFAULT)
 }
-
-/// Fired whenever a producer has queued main-thread-visible work (any
-/// `js_notify_main_thread`, via the wait-driver wake). Ends the current bounded
-/// tick in `stdlib_wait_driver`. `notify_one` coalesces and leaves a permit if
-/// no tick is in progress, so a notify between ticks is not lost.
-static EVENT_READY: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 /// Pending promise resolutions
 /// Format: (promise_ptr, is_success, result_value)
@@ -176,11 +191,17 @@ static PENDING_RESOLUTIONS: Lazy<Mutex<Vec<PendingResolution>>> =
 static PENDING_DEFERRED: Lazy<Mutex<Vec<DeferredResolution>>> =
     Lazy::new(|| Mutex::new(Vec::new()));
 
+/// turnloop P0: the two queues' lengths, republished under their locks after
+/// every push and drain, so `js_stdlib_has_active_handles` — asked on every
+/// event-loop turn — reads two atomics instead of taking both queue locks.
+static PENDING_RESOLUTIONS_LEN: AtomicUsize = AtomicUsize::new(0);
+static PENDING_DEFERRED_LEN: AtomicUsize = AtomicUsize::new(0);
+
 thread_local! {
     static GC_SCANNER_REGISTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-fn ensure_gc_scanner_registered() {
+pub(super) fn ensure_gc_scanner_registered() {
     GC_SCANNER_REGISTERED.with(|registered| {
         if registered.get() {
             return;
@@ -236,181 +257,6 @@ pub fn scan_pending_native_async_resolution_roots_mut(
     }
 }
 
-/// Get a reference to the global runtime
-pub fn runtime() -> &'static Runtime {
-    &RUNTIME
-}
-
-/// Spawn an async task on the global runtime.
-///
-/// Issue #921: bump `EXT_BLOCKING_TASKS_INFLIGHT` for the lifetime of
-/// the future so `js_stdlib_has_active_handles()` keeps the codegen-
-/// emitted event loop alive while the task is running.
-///
-/// Without the bump, the race window is:
-///
-/// 1. `main()` is async, calls `await fetch(...)` (or any other
-///    `spawn(...)`-backed binding) — `js_fetch_*` returns a fresh
-///    Promise and `spawn(future)` schedules the network roundtrip
-///    on a tokio worker.
-/// 2. Codegen's async lowering returns from the current step,
-///    yielding control back to the entry-module init.
-/// 3. The entry-module init finishes (top-level `main()` was
-///    fire-and-forget), so codegen drops into its event-loop
-///    bootstrap.
-/// 4. The event loop's `js_stdlib_has_active_handles()` check sees
-///    `PENDING_RESOLUTIONS` empty, no WS / NET / HTTP / readline,
-///    no `EXT_BLOCKING_TASKS_INFLIGHT` increment from `spawn(...)`,
-///    so it returns 0.
-/// 5. The loop exits cleanly (exit code 0). The tokio worker
-///    eventually queues its resolution, but no one is listening
-///    anymore.
-///
-/// User-visible symptom: `await fetch(...)` silently exits the
-/// process with no JS error and no stderr from the network
-/// callback. Production hosts (PM2, systemd) interpret the clean
-/// exit as a crash and restart the binary.
-///
-/// Bumping INFLIGHT around the spawned future fixes this by making
-/// the event-loop active-handle check pessimistically wait for the
-/// future to finish (or queue its resolution and decrement INFLIGHT).
-/// Same mechanism `perry_ffi_spawn_blocking` already uses for
-/// external wrapper crates (#591); fetch / ioredis / zlib / etc.
-/// just hadn't been wired through it yet.
-pub fn spawn<F>(future: F)
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    ensure_pump_registered();
-    EXT_BLOCKING_TASKS_INFLIGHT.fetch_add(1, Ordering::AcqRel);
-    RUNTIME.spawn(async move {
-        future.await;
-        EXT_BLOCKING_TASKS_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
-        // Notify in case the future resolved without going through
-        // `queue_promise_resolution` — flip the active-handle gate
-        // so the loop re-evaluates.
-        perry_runtime::event_pump::js_notify_main_thread();
-    });
-}
-
-/// Block on an async task (use sparingly, mainly for initialization)
-pub fn block_on<F, T>(future: F) -> T
-where
-    F: Future<Output = T>,
-{
-    RUNTIME.block_on(future)
-}
-
-/// Wait-driver SLEEP side — one bounded tick of the current-thread runtime.
-///
-/// Installed via `js_register_wait_driver` and called by the main loop's
-/// `js_wait_for_event` in place of a condvar park. `block_on` drives the I/O
-/// reactor, the timer wheel, and every spawned native task (reqwest / net / ws)
-/// on THIS (main) thread until a producer fires `EVENT_READY` — i.e. a native
-/// task queued a resolution / pushed an event — or `budget_ms` elapses,
-/// whichever first. Because the producing task ran in this same tick, its
-/// completion is observed in-thread and `perry_poll` drains it on the next loop
-/// turn; there is no cross-thread wake to lose. `budget_ms` is the loop's
-/// computed sleep budget (min of the next Perry timer/native deadline and the
-/// 1 s idle cap); a zero budget is floored to 1 ms so native work still gets
-/// one poll cycle under a hot timer.
-extern "C" fn stdlib_wait_driver(budget_ms: u64) {
-    run_one_tick(budget_ms);
-}
-
-/// One bounded tick of the current-thread runtime: drive the reactor + timers +
-/// spawned native tasks until `EVENT_READY` fires or `budget_ms` (floored to
-/// 1 ms) elapses. Shared by the main-loop wait-driver and `perry_ffi_run_pending`
-/// (a synchronous native API that must let a delivering task run — see
-/// `perry-ffi::run_pending`). Must NOT be called from inside a spawned runtime
-/// task (no nested `block_on`); only from the main thread between ticks.
-pub fn run_one_tick(budget_ms: u64) {
-    extern "C" {
-        fn js_main_thread_notified() -> i32;
-    }
-    let budget = std::time::Duration::from_millis(budget_ms.max(1));
-    RUNTIME.block_on(async {
-        let notified = EVENT_READY.notified();
-        tokio::pin!(notified);
-        // Register as a waiter BEFORE checking the condition: a `notify_waiters`
-        // that lands between the check and the await still wakes us (it wakes only
-        // registered waiters). `enable()` returns false here because the wake side
-        // stores no permit.
-        notified.as_mut().enable();
-        // End immediately if a native result was already queued during this tick
-        // (the durable `NOTIFIED` flag — checked instead of a notify permit so a
-        // stale wake can't make us skip parking on the reactor). The main loop
-        // cleared `NOTIFIED` before this tick, so a set flag is fresh work.
-        if unsafe { js_main_thread_notified() } != 0 {
-            return;
-        }
-        // Otherwise park: `block_on` drives every spawned native task (reqwest /
-        // net / ws) and parks on the I/O reactor on this thread until a producer
-        // queues a result (`notify_waiters` wakes us; we re-check NOTIFIED) or the
-        // budget elapses.
-        let _ = tokio::time::timeout(budget, notified).await;
-    });
-}
-
-/// Drive the runtime for the full `budget_ms` (floored to 1 ms), parking on the
-/// I/O reactor so spawned native tasks make progress. Unlike `run_one_tick` this
-/// does NOT end early on the `NOTIFIED` flag — it is for a *synchronous* native
-/// API (`perry_ffi_run_pending`, e.g. `js_ws_wait_for_message`) that is called
-/// mid-`perry_poll` (where `NOTIFIED` may already be set for unrelated reasons)
-/// and just needs the delivering task to run for a slice before it re-checks its
-/// own condition.
-pub fn drive_pending(budget_ms: u64) {
-    let budget = std::time::Duration::from_millis(budget_ms.max(1));
-    RUNTIME.block_on(async {
-        tokio::time::sleep(budget).await;
-    });
-}
-
-/// Wait-driver WAKE side — ends the current bounded tick. Fired from
-/// `js_notify_main_thread` (via `js_register_wait_driver`) by any producer: the
-/// in-thread native task during a tick, or a blocking-pool thread cross-thread.
-/// Uses `notify_waiters` (NOT `notify_one`) so it stores NO permit: a notify
-/// outside a tick is intentionally dropped (the corresponding `NOTIFIED` flag is
-/// the durable signal the tick re-checks), which is what keeps stale permits from
-/// making every tick return instantly without parking on the reactor.
-extern "C" fn stdlib_wait_wake() {
-    EVENT_READY.notify_waiters();
-}
-
-/// Wait-driver FAST side — a brief native drive invoked by `js_wait_for_event`
-/// when JS work is pending (a notify or queued microtasks). On the single-thread
-/// runtime, in-flight native tasks (a fetch's reqwest `send`, its h2 connection
-/// driver, sibling fetches, or a server accept loop) run ONLY inside a tick;
-/// under constant JS promise churn the fast-path is taken every iteration, so
-/// without this they are starved forever (the bundle hang). When something
-/// native IS in flight, drive one short (1 ms) tick: `block_on` drains the run
-/// queue (starts freshly-spawned tasks) and parks briefly on the I/O reactor
-/// (advancing TLS/h2 round-trips and accepting server connections), ending early
-/// if a native result is queued. No-op when nothing native is in flight, so
-/// pure-JS-async pays only atomic loads.
-extern "C" fn stdlib_fast_drive() {
-    extern "C" {
-        fn js_aux_has_active() -> i32;
-    }
-    let n = EXT_BLOCKING_TASKS_INFLIGHT.load(Ordering::Acquire);
-    let registered_extension_active = unsafe { js_aux_has_active() != 0 };
-    let native = native_fast_drive_needed(n, registered_extension_active);
-    if !native {
-        return;
-    }
-    RUNTIME.block_on(async {
-        let notified = EVENT_READY.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(1), notified).await;
-    });
-}
-
-#[inline]
-fn native_fast_drive_needed(blocking_tasks_inflight: usize, extension_active: bool) -> bool {
-    blocking_tasks_inflight > 0 || extension_active
-}
-
 /// Queue a promise resolution to be processed later
 /// NOTE: Only use this for simple values (numbers, booleans, undefined, null)
 /// that don't involve pointer allocations. For complex values like arrays,
@@ -433,6 +279,7 @@ pub fn queue_promise_resolution(promise_ptr: usize, is_success: bool, result_bit
             is_success,
             result_bits,
         });
+        PENDING_RESOLUTIONS_LEN.store(pending.len(), Ordering::Release);
     }
     // Issue #84: wake the main-thread event loop / await busy-wait the
     // instant we enqueue, instead of waiting up to ~10 ms for the next
@@ -461,6 +308,7 @@ where
             is_success,
             converter: Box::new(converter),
         });
+        PENDING_DEFERRED_LEN.store(pending.len(), Ordering::Release);
     }
     // Issue #84: same as queue_promise_resolution — wake the main thread
     // immediately so the awaiter doesn't pay the old hard-sleep latency.
@@ -487,18 +335,13 @@ pub fn ensure_pump_registered() {
             fn js_stdlib_init_dispatch();
         }
         ensure_gc_scanner_registered();
-        // Unified single-thread async model: install the wait-driver so the main
-        // JS loop drives the current-thread tokio runtime one bounded tick per
-        // `js_wait_for_event` (see `stdlib_wait_driver`). Registered here, before
-        // any async work spawns, so the first `js_wait_for_event` after a spawn
-        // already drives the runtime. Forcing RUNTIME now also constructs it on
-        // the main thread up front.
-        perry_runtime::event_pump::js_register_wait_driver(
-            Some(stdlib_wait_driver),
-            Some(stdlib_fast_drive),
-            Some(stdlib_wait_wake),
-        );
-        Lazy::force(&RUNTIME);
+        // The tokio half (turnloop P8 lane L): a build that carries the
+        // runtime installs its wait-driver here, before any async work spawns,
+        // so the first `js_wait_for_event` after a spawn already drives it. A
+        // build without `async-runtime` installs nothing: the primary agent
+        // parks in its own turnloop loop, which `js_notify_main_thread` wakes.
+        #[cfg(feature = "async-runtime")]
+        super::tokio_bridge::install_wait_driver();
         unsafe {
             js_register_stdlib_pump(js_stdlib_process_pending);
             js_register_stdlib_has_active(js_stdlib_has_active_handles);
@@ -528,6 +371,7 @@ pub extern "C" fn js_stdlib_process_pending() -> i32 {
         let mut pending = PENDING_RESOLUTIONS.lock().unwrap();
         let n = pending.len();
         count += n as i32;
+        PENDING_RESOLUTIONS_LEN.store(0, Ordering::Release);
         pending.drain(..).collect()
     };
     for resolution in simple_resolutions {
@@ -564,6 +408,7 @@ pub extern "C" fn js_stdlib_process_pending() -> i32 {
         let mut pending = PENDING_DEFERRED.lock().unwrap();
         let n = pending.len();
         count += n as i32;
+        PENDING_DEFERRED_LEN.store(0, Ordering::Release);
         pending.drain(..).collect()
     };
 
@@ -669,18 +514,25 @@ pub extern "C" fn js_stdlib_has_active_handles() -> i32 {
     if EXT_BLOCKING_TASKS_INFLIGHT.load(Ordering::Acquire) != 0 {
         return 1;
     }
-    // Check for pending stdlib resolutions
+    // Check for pending stdlib resolutions (turnloop P0: O(1) length mirrors).
+    if PENDING_RESOLUTIONS_LEN.load(Ordering::Acquire) != 0
+        || PENDING_DEFERRED_LEN.load(Ordering::Acquire) != 0
     {
-        let pending = PENDING_RESOLUTIONS.lock().unwrap();
-        if !pending.is_empty() {
-            return 1;
-        }
+        return 1;
     }
-    {
-        let pending = PENDING_DEFERRED.lock().unwrap();
-        if !pending.is_empty() {
-            return 1;
-        }
+    // turnloop P6: an outbound request the client engine accepted is work the
+    // process owes an answer for, and it holds NO `InflightGuard` on purpose.
+    // The guard also feeds `native_work_inflight`, which makes the park choose
+    // the legacy tokio tick over a turnloop turn (P4's note 2) — so a fetch
+    // that took the turnloop path would have driven tokio to wait for work
+    // tokio was not carrying. A separate predicate is the whole point.
+    #[cfg(feature = "turnloop-http-client")]
+    if crate::turnloop_client::has_pending_requests() {
+        return 1;
+    }
+    #[cfg(feature = "turnloop-smtp-client")]
+    if crate::turnloop_smtp::has_pending() {
+        return 1;
     }
     // Check for active WebSocket servers/connections
     #[cfg(feature = "websocket")]
@@ -759,145 +611,94 @@ pub extern "C" fn js_stdlib_has_active_handles() -> i32 {
     0
 }
 
-/// Spawn an async operation that will resolve a Promise when complete
+/// turnloop P4: run `work` on turnloop's shared blocking pool and settle
+/// `promise_ptr` from its result, on the thread that owns the JS heap.
 ///
-/// WARNING: This function assumes the returned u64 bits represent a simple value
-/// (number, boolean, undefined, null) that doesn't contain heap pointers.
-/// For complex values (arrays, objects, strings), use spawn_for_promise_deferred instead.
+/// This is `spawn_for_promise_deferred`'s contract with the tokio runtime
+/// taken out of the middle. The two halves are the same as before — owned Rust
+/// data on the worker, JSValue construction on the main thread — but now the
+/// split is a trait bound rather than a convention: `work` is `Send` and
+/// returns `Result<T, String>`, and `converter` runs inside the completion
+/// dispatch on the submitting thread.
 ///
-/// # Safety
-/// The promise_ptr must be a valid pointer to a Promise object
-pub unsafe fn spawn_for_promise<F>(promise_ptr: *mut u8, future: F)
-where
-    F: Future<Output = Result<u64, String>> + Send + 'static,
-{
-    ensure_pump_registered();
-    ensure_gc_scanner_registered();
-    // Convert to usize for Send.
-    let ptr = promise_ptr as usize;
-    // Issue #859: pin the promise BEFORE crossing the tokio boundary.
-    // See `pin_promise_for_native_resolution` for the full rationale.
-    pin_promise_for_native_resolution(ptr);
-
-    // Issue #921: same race-window mitigation as the plain
-    // `spawn()` above — bump INFLIGHT for the lifetime of the
-    // future so the event loop's `js_stdlib_has_active_handles`
-    // check stays truthy until the resolution is queued.
-    EXT_BLOCKING_TASKS_INFLIGHT.fetch_add(1, Ordering::AcqRel);
-    RUNTIME.spawn(async move {
-        match future.await {
-            Ok(result_bits) => {
-                queue_promise_resolution(ptr, true, result_bits);
-            }
-            Err(error_msg) => {
-                // Store the error message and create the string on the main thread
-                queue_deferred_resolution(ptr, false, move || {
-                    let str_ptr = perry_runtime::js_string_from_bytes(
-                        error_msg.as_ptr(),
-                        error_msg.len() as u32,
-                    );
-                    // Use string_ptr for proper type identification (STRING_TAG, not POINTER_TAG)
-                    perry_runtime::JSValue::string_ptr(str_ptr).bits()
-                });
-            }
-        }
-        EXT_BLOCKING_TASKS_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
-        perry_runtime::event_pump::js_notify_main_thread();
-    });
-}
-
-/// Spawn an async operation with deferred JSValue creation
-///
-/// This is the safe way to create complex JSValues (arrays, objects, strings)
-/// from async operations. The async block returns raw Rust data, and the
-/// converter function creates the JSValue on the main thread.
-///
-/// # Type Parameters
-/// - `T`: The raw data type produced by the async operation (must be Send + 'static)
-/// - `F`: The async future type
-/// - `C`: The converter function type
-///
-/// # Arguments
-/// - `promise_ptr`: Pointer to the Promise object
-/// - `future`: Async future that produces Result<T, String>
-/// - `converter`: Function that converts T to JSValue bits (runs on main thread)
+/// Returns **false** when the pool refused the job, in which case the work has
+/// already run inline on the calling thread and the promise is already
+/// settled. A refusal happens on a thread with no event loop (a
+/// `worker_threads` agent) or under pool backpressure, and it is visible:
+/// `refused=` on the `PERRY_LOOP_STATS` line counts exactly those jobs.
 ///
 /// # Safety
-/// The promise_ptr must be a valid pointer to a Promise object
-pub unsafe fn spawn_for_promise_deferred<T, F, C>(promise_ptr: *mut u8, future: F, converter: C)
+/// `promise_ptr` must point to a live Perry Promise, as for
+/// [`spawn_for_promise_deferred`].
+#[cfg(not(target_arch = "wasm32"))]
+pub unsafe fn pool_for_promise_deferred<T, W, C>(
+    promise_ptr: *mut u8,
+    work: W,
+    converter: C,
+) -> bool
 where
     T: Send + 'static,
-    F: Future<Output = Result<T, String>> + Send + 'static,
+    W: FnOnce() -> Result<T, String> + Send + 'static,
+    // `Send` because the deferred-resolution queue is process-global and its
+    // entries are `Send`; the closure still only ever RUNS on the main thread.
     C: FnOnce(T) -> u64 + Send + 'static,
 {
     ensure_pump_registered();
     ensure_gc_scanner_registered();
     let ptr = promise_ptr as usize;
-    // Issue #859: pin the promise BEFORE crossing the tokio boundary.
+    // Issue #859, unchanged: the job holds the promise only as an address,
+    // which no root scanner visits, so it is pinned across the crossing. The
+    // pin is a flag bit and `js_promise_new_cross_thread` has already set it;
+    // taking it again is idempotent and the single settlement releases it.
     pin_promise_for_native_resolution(ptr);
-
-    // Issue #921: same race-window mitigation as `spawn_for_promise`
-    // above — bump INFLIGHT for the lifetime of the future.
-    EXT_BLOCKING_TASKS_INFLIGHT.fetch_add(1, Ordering::AcqRel);
-    RUNTIME.spawn(async move {
-        match future.await {
-            Ok(data) => {
-                // Queue deferred resolution with the converter
+    perry_runtime::turnloop_pool::submit_or_run_inline(work, move |delivery| {
+        use perry_runtime::turnloop_pool::Delivery;
+        match delivery {
+            Delivery::Done(Ok(data)) => {
                 queue_deferred_resolution(ptr, true, move || converter(data));
             }
-            Err(error_msg) => {
-                // Create error string on main thread
-                queue_deferred_resolution(ptr, false, move || {
-                    let str_ptr = perry_runtime::js_string_from_bytes(
-                        error_msg.as_ptr(),
-                        error_msg.len() as u32,
-                    );
-                    // Use string_ptr for proper type identification (STRING_TAG, not POINTER_TAG)
-                    perry_runtime::JSValue::string_ptr(str_ptr).bits()
-                });
+            Delivery::Done(Err(message)) => queue_rejection_string(ptr, message),
+            // A cancelled or panicking job still owes the awaiter an answer;
+            // leaving the promise pending is the one outcome a caller cannot
+            // recover from (DESIGN D4).
+            Delivery::Cancelled => {
+                queue_rejection_string(ptr, "operation was cancelled".to_string())
+            }
+            Delivery::Failed(_) => {
+                queue_rejection_string(ptr, "native operation failed".to_string())
             }
         }
-        EXT_BLOCKING_TASKS_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
-        perry_runtime::event_pump::js_notify_main_thread();
+    })
+}
+
+/// Reject `promise` with a JS string built on the main thread.
+///
+/// `queue_deferred_resolution`'s converter runs on the main thread, which is
+/// the only place `js_string_from_bytes` is legal; every rejection path that
+/// carries a message goes through here so none of them can forget.
+pub(super) fn queue_rejection_string(promise: usize, message: String) {
+    queue_deferred_resolution(promise, false, move || {
+        let str_ptr = perry_runtime::js_string_from_bytes(message.as_ptr(), message.len() as u32);
+        perry_runtime::JSValue::string_ptr(str_ptr).bits()
     });
 }
 
-/// Spawn an async operation whose success and error values both need to be
-/// materialized on the main thread.
+/// Reject `promise_ptr` with `message` on the next pump.
 ///
-/// Database adapters use this variant to reject with a real JavaScript Error
-/// (including driver-specific fields such as `code` and `errno`) instead of a
-/// bare string. As with [`spawn_for_promise_deferred`], neither converter runs
-/// on the async executor, where allocating Perry heap values would be unsafe.
+/// The tokio-free spelling of `spawn_for_promise(p, async { Err(message) })`,
+/// which bindings used for an argument error found before any work started:
+/// the promise is pinned across the window exactly as the spawn pinned it, and
+/// it settles in the same place, `js_stdlib_process_pending`. What is gone is
+/// the task hop — the rejection no longer waits for a tokio tick to queue it.
 ///
 /// # Safety
 /// `promise_ptr` must point to a live Perry Promise.
-pub unsafe fn spawn_for_promise_deferred_with_error<T, E, F, C, R>(
-    promise_ptr: *mut u8,
-    future: F,
-    converter: C,
-    reject_converter: R,
-) where
-    T: Send + 'static,
-    E: Send + 'static,
-    F: Future<Output = Result<T, E>> + Send + 'static,
-    C: FnOnce(T) -> u64 + Send + 'static,
-    R: FnOnce(E) -> u64 + Send + 'static,
-{
+pub unsafe fn reject_promise_later(promise_ptr: *mut u8, message: String) {
     ensure_pump_registered();
     ensure_gc_scanner_registered();
     let ptr = promise_ptr as usize;
     pin_promise_for_native_resolution(ptr);
-
-    EXT_BLOCKING_TASKS_INFLIGHT.fetch_add(1, Ordering::AcqRel);
-    RUNTIME.spawn(async move {
-        match future.await {
-            Ok(data) => queue_deferred_resolution(ptr, true, move || converter(data)),
-            Err(error) => queue_deferred_resolution(ptr, false, move || reject_converter(error)),
-        }
-        EXT_BLOCKING_TASKS_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
-        perry_runtime::event_pump::js_notify_main_thread();
-    });
+    queue_rejection_string(ptr, message);
 }
 
 #[cfg(test)]
@@ -905,8 +706,13 @@ mod tests {
     use super::*;
 
     fn clear_pending() {
-        PENDING_RESOLUTIONS.lock().unwrap().clear();
-        PENDING_DEFERRED.lock().unwrap().clear();
+        let mut resolutions = PENDING_RESOLUTIONS.lock().unwrap();
+        resolutions.clear();
+        PENDING_RESOLUTIONS_LEN.store(0, Ordering::Release);
+        drop(resolutions);
+        let mut deferred = PENDING_DEFERRED.lock().unwrap();
+        deferred.clear();
+        PENDING_DEFERRED_LEN.store(0, Ordering::Release);
     }
 
     #[test]
@@ -931,17 +737,37 @@ mod tests {
         ));
     }
 
+    /// lane L: an argument error found before any work starts rejects through
+    /// the tokio-free queue — pinned across the window, settled by the pump
+    /// with the message as a JS string — instead of a spawned tokio task.
     #[test]
-    fn active_extension_keeps_the_fast_wait_path_driving_native_tasks() {
-        assert!(!native_fast_drive_needed(0, false));
-        assert!(native_fast_drive_needed(0, true));
-        assert!(native_fast_drive_needed(1, false));
-        assert!(native_fast_drive_needed(1, true));
+    fn reject_promise_later_rejects_with_the_message_on_the_next_pump() {
+        clear_pending();
+        let promise = perry_runtime::js_promise_new_cross_thread();
+        unsafe { reject_promise_later(promise as *mut u8, "Invalid password".to_string()) };
+        assert_eq!(
+            perry_runtime::promise::js_promise_state(promise),
+            0,
+            "nothing settles before the pump runs"
+        );
+        assert!(js_stdlib_process_pending() >= 1);
+        assert_eq!(perry_runtime::promise::js_promise_state(promise), 2);
+        let reason = perry_runtime::promise::js_promise_reason(promise);
+        let ptr = perry_runtime::value::js_get_string_pointer_unified(reason)
+            as *const perry_runtime::StringHeader;
+        assert!(!ptr.is_null(), "the rejection reason is a JS string");
+        let text = unsafe { crate::common::string_from_header_lossy(ptr) };
+        assert_eq!(text.as_deref(), Some("Invalid password"));
     }
 
     #[test]
     fn stdlib_bridge_does_not_hard_reference_extension_pumps() {
-        let source = include_str!("async_bridge.rs");
+        // Both halves: the tokio one is its own file since lane L.
+        let source = [
+            include_str!("async_bridge.rs"),
+            include_str!("tokio_bridge.rs"),
+        ]
+        .concat();
         let extension_symbols = [
             "js_ws_process_pending",
             "js_ws_has_pending",

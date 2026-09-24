@@ -1,0 +1,216 @@
+{
+  "_README": [
+    "The turnloop migration's remaining tokio surface (docs/turnloop/p8-report.md).",
+    "",
+    "`edges` and `lockfile` are GATED by scripts/tokio_inventory.py, strictly and in",
+    "both directions: a NEW edge fails, and a STALE entry fails too \u2014 so a lane that",
+    "removes an edge must delete its own line, and this file can never describe a tree",
+    "that is gone. Regenerate with `python3 scripts/tokio_inventory.py --update`, which",
+    "preserves every surviving entry's annotations.",
+    "",
+    "Per edge, the four hand-written fields are the ones `cargo tree` cannot give:",
+    "  surface       what JS reaches it, or 'none' if no JS surface does",
+    "  reached_when  the condition under which a program actually takes it",
+    "  blocker       what has to exist before it can move",
+    "  issue         where that is tracked",
+    "  plan          its group in the report's costed removal plan; every edge is in",
+    "                exactly one group, and `--list` prints the totals",
+    "",
+    "Group J is not in the costed plan: it is the four database wrappers, which are",
+    "being DELETED rather than migrated because each wraps a pure-JS npm package that",
+    "Perry can now compile from source. Their edges leave with the crates.",
+    "",
+    "`source_sites` is NOT gated: a comment naming tokio::spawn moves it, so a failure",
+    "there would carry no information. It is recorded because it is the only number",
+    "that says how much code sits behind an edge."
+  ],
+  "edges": [
+    {
+      "crate": "perry-container-compose",
+      "dep": "tokio",
+      "kind": "dev",
+      "optional": false,
+      "target": null,
+      "surface": "none. The separate `perry-compose` binary (a Docker-Compose-like driver for Apple Container / Podman). perry-stdlib reaches it only under the non-default `container` feature, which `full` does not enable.",
+      "reached_when": "running `perry-compose`, or a build that explicitly enables `perry-stdlib/container`",
+      "blocker": "async end-to-end across ~14.8k lines (`async-trait` backends, `tokio::process::Command`, `tokio::time::timeout`). A rewrite of a non-JS tool; no event-loop transport is involved.",
+      "issue": "unfiled \u2014 P8",
+      "plan": "K"
+    },
+    {
+      "crate": "perry-container-compose",
+      "dep": "tokio",
+      "kind": "normal",
+      "optional": false,
+      "target": null,
+      "surface": "none. The separate `perry-compose` binary (a Docker-Compose-like driver for Apple Container / Podman). perry-stdlib reaches it only under the non-default `container` feature, which `full` does not enable.",
+      "reached_when": "running `perry-compose`, or a build that explicitly enables `perry-stdlib/container`",
+      "blocker": "async end-to-end across ~14.8k lines (`async-trait` backends, `tokio::process::Command`, `tokio::time::timeout`). A rewrite of a non-JS tool; no event-loop transport is involved.",
+      "issue": "unfiled \u2014 P8",
+      "plan": "K"
+    },
+    {
+      "crate": "perry-ext-http",
+      "dep": "reqwest",
+      "kind": "normal",
+      "optional": false,
+      "target": null,
+      "surface": "`http.request()` / `https.get()` / `https.request()` \u2014 the node:http CLIENT half",
+      "reached_when": "NO LONGER always. `client_turnloop::try_dispatch` is offered every exchange before `dispatch_request` and takes cleartext `http://` requests with no body, no explicit Agent, no per-request timeout, no proxy and none of the three bypass headers; reqwest gets everything it declines. So: `https://`, any request body, an explicit `http.Agent`, `options.timeout`/`req.setTimeout`, `NODE_USE_ENV_PROXY=1`, a URL with credentials, the CONNECT/TRACE/TRACK methods, and `TE: trailers` / `Connection: Upgrade` / `Expect: 100-continue` (which keep their own raw-socket bypasses).",
+      "blocker": "The decline set above, shrinking per lane: TLS (`perry-tls-session` above the same handle, as `perry-ext-ws`'s client does), request-body framing plus `Lifecycle` deadlines armed on `tl::timer_arm`, keep-alive via `turnloop_http::client::Pool`, and the Agent lane. CORRECTION to the older note: `agent.rs` is NOT a duplicate of reqwest's pool and is not the blocker it was described as. It is a real per-origin admission engine (FIFO waiter queue, maxSockets/maxTotalSockets/maxFreeSockets, socket facades) that sits ABOVE the transport and survives the migration nearly intact; the reqwest coupling there is 9 call sites in `client_for_agent`/`client_for_agent_tls`/`agent_pool_config`. Also stale in that note: the three raw `tokio::net::TcpStream` bypasses are `plain_client.rs` (`TE: trailers`), `continue_client.rs` (`Expect: 100-continue`) and `client_upgrade.rs` (`Connection: Upgrade`, #10468) \u2014 NOT the `agent.createConnection` override, which reaches no tokio at all (it runs on perry-ext-net's raw_net vtable in `client_connect_override.rs`). `Http1Connection` hands `Event::Trailers`, `Event::Informational` and `Event::Upgrade` back to the caller, so all three ARE deletable by this migration. `createConnection` is a different problem: it needs an fd-adoption ABI that does not exist yet \u2014 `turnloop::Detached::from_fd` + `Loop::attach` are real, but neither `perry_ffi::turnloop_net` nor `perry-runtime`'s `turnloop_net/abi.rs` exposes them to a binding crate.",
+      "issue": "#10328 (the agent cache never evicts); the transport is unfiled \u2014 P6 named it, P8 confirms it",
+      "plan": "C"
+    },
+    {
+      "crate": "perry-ext-http",
+      "dep": "tokio",
+      "kind": "normal",
+      "optional": false,
+      "target": null,
+      "surface": "the node:http/https CLIENT only: every row above, plus the three raw-TcpStream client bypasses. NO LONGER any server: `http.createServer` / `https.createServer` / `http2.createServer` / `createSecureServer` are turnloop-only (plan A closed; `src/server/` contains no `tokio::` code), and NO LONGER `http2.connect`.",
+      "reached_when": "always (the node:http client). The server no longer reaches tokio on any thread: a thread that does not own its agent's loop posts `listen()` to the owner, and a host where Loop::new failed reports ENOTSUP.",
+      "blocker": "the union of the rows above, and NOT group D's own work -- the plan's row D already said so (\u201cits last, once C and E are done\u201d). E is done, D's `h2` half is done, and plan A is done: the hyper HTTP/1.1, HTTPS and HTTP/2 accept loops, the raw-'upgrade' peeler, the tokio-tungstenite attached-WebSocket path and the SCHED_RR fd-inject loop are deleted (SCHED_RR descriptors are adopted onto the loop with `turnloop_net::adopt_stream`), and so is tokio's type vocabulary in the server structs (`ServerResponse::{response_tx, stream_tx, stream_in_flight, connection_close}`, `HttpServer::{shutdown_tx, request_rx, upgrade_rx}`, `Http2StreamHandle::response_tx`, `ShapeBody::Stream`). What is left is `reqwest` + `tokio-rustls` (plan C, the node:http/https CLIENT: ~1,950 lines of `agent.rs` plus three raw `tokio::net::TcpStream` bypasses), so this edge is held open entirely by C.",
+      "issue": "unfiled \u2014 P8",
+      "plan": "D"
+    },
+    {
+      "crate": "perry-ext-http",
+      "dep": "tokio-rustls",
+      "kind": "normal",
+      "optional": false,
+      "target": null,
+      "surface": "TLS for the node:https client. NO LONGER `https.createServer()`: the server's TLS is perry-ext-net's turnloop session on every thread (plan A closed).",
+      "reached_when": "the node:https client (reqwest's rustls stack and the raw client bypasses)",
+      "blocker": "the client half of plan C; the server half is gone.",
+      "issue": "unfiled \u2014 P8",
+      "plan": "C"
+    },
+    {
+      "crate": "perry-ext-ioredis",
+      "dep": "redis",
+      "kind": "normal",
+      "optional": false,
+      "target": null,
+      "surface": "`new Redis()` / ioredis \u2014 every command",
+      "reached_when": "a host where `Loop::new` failed \u2014 the only remaining case now that the `tokio-wait-driver` A/B arm has been deleted. **The agent-shaped decline is CLOSED** (turnloop P10, perry#10395 step 2): a second thread acting for an agent another thread already owns \u2014 a host pump thread, Android's UI thread for `perry-native` \u2014 now hands its work to that owner through `perry_ffi::agent_post` instead of keeping this driver alive for itself. No longer a worker agent (P9 gave every agent a loop), and no longer TLS (`rediss://`, the default since `REDIS_TLS` defaults to true, is carried by turnloop).",
+      "blocker": "SUPERSEDED BY A SCOPE DECISION (Ralph, 2026-09-17): this crate is going away, so this edge goes with it and NOBODY SHOULD CONVERT IT. `ioredis` is a pure-JS npm package, and the native wrapper exists only because Perry was TypeScript-only at one time. The plan is to delete the wrapper and compile the package from its own JS source, which removes this edge by deletion rather than by migration. Do not spend a lane on a turnloop transport here. The pre-existing blocker, kept for the record and no longer actionable: two reasons left, and neither is specific to redis or to this binding \u2014 both are an ABSENCE of a loop rather than a hole in the path. Only ONE reason is left now that the `tokio-wait-driver` A/B arm has been deleted: a host where `Loop::new` failed has no loop to post to. It is one shared decision, not four conversions \u2014 every plan-A and plan-B edge names that same single cause. Narrow third case, documented rather than fixed: `net_available()` CLAIMS a route without building a loop, so a client created in the window between the owner claiming its slot and publishing its `Poster` sees no route and is created on the legacy transport for its life. TLS is done: perry-db-turnloop installs a client session through perry-tls-turnloop.",
+      "issue": "#10335 \u2014 spawn_blocking/block_on CLOSED for the agent-shaped decline by #10395 step 2",
+      "plan": "J"
+    },
+    {
+      "crate": "perry-ext-ioredis",
+      "dep": "tokio",
+      "kind": "normal",
+      "optional": false,
+      "target": null,
+      "surface": "as `redis` above",
+      "reached_when": "a host where `Loop::new` failed \u2014 the only remaining case now that the `tokio-wait-driver` A/B arm has been deleted. **The agent-shaped decline is CLOSED** (turnloop P10, perry#10395 step 2): a second thread acting for an agent another thread already owns \u2014 a host pump thread, Android's UI thread for `perry-native` \u2014 now hands its work to that owner through `perry_ffi::agent_post` instead of keeping this driver alive for itself. No longer a worker agent (P9 gave every agent a loop), and no longer TLS (`rediss://`, the default since `REDIS_TLS` defaults to true, is carried by turnloop).",
+      "blocker": "SUPERSEDED BY A SCOPE DECISION (Ralph, 2026-09-17): this crate is going away, so this edge goes with it and NOBODY SHOULD CONVERT IT. `ioredis` is a pure-JS npm package, and the native wrapper exists only because Perry was TypeScript-only at one time. The plan is to delete the wrapper and compile the package from its own JS source, which removes this edge by deletion rather than by migration. Do not spend a lane on a turnloop transport here. The pre-existing blocker, kept for the record and no longer actionable: two reasons left, and neither is specific to redis or to this binding \u2014 both are an ABSENCE of a loop rather than a hole in the path. Only ONE reason is left now that the `tokio-wait-driver` A/B arm has been deleted: a host where `Loop::new` failed has no loop to post to. It is one shared decision, not four conversions \u2014 every plan-A and plan-B edge names that same single cause. Narrow third case, documented rather than fixed: `net_available()` CLAIMS a route without building a loop, so a client created in the window between the owner claiming its slot and publishing its `Poster` sees no route and is created on the legacy transport for its life. The #1824 hazard of building the JS result on a foreign thread goes with it: a posted command is answered on the agent's OWNER, which is where that agent's values live.",
+      "issue": "#10336, #10339 \u2014 agent-shaped decline CLOSED by #10395 step 2",
+      "plan": "J"
+    },
+    {
+      "crate": "perry-ext-mongodb",
+      "dep": "mongodb",
+      "kind": "normal",
+      "optional": false,
+      "target": null,
+      "surface": "`new MongoClient()` \u2014 connect, find, insert, update, delete, aggregate",
+      "reached_when": "a thread that could not get a loop of its own \u2014 since turnloop P9 that is a second thread acting for an agent another thread already owns (a host pump thread; Android's UI thread for `perry-native`), not a worker agent, or a host where Loop::new failed, plus `mongodb+srv://`, several hosts, `replicaSet=`, `compressors=`, a per-connection TLS key (`tlsCAFile`, `tlsInsecure`, \u2026), an unparsable URI, or no /dev/urandom. A plain `tls=true`/`ssl=true` no longer declines.",
+      "blocker": "SUPERSEDED BY A SCOPE DECISION (Ralph, 2026-09-17): this crate is going away, so this edge goes with it and NOBODY SHOULD CONVERT IT. `mongodb` is a pure-JS npm package, and the native wrapper exists only because Perry was TypeScript-only at one time. The plan is to delete the wrapper and compile the package from its own JS source, which removes this edge by deletion rather than by migration. Do not spend a lane on a turnloop transport here. The pre-existing blocker, kept for the record and no longer actionable: SRV lookup and topology discovery/SDAM monitors stay in the `mongodb` driver; turnloop-mongodb is a single-connection protocol core. TLS itself is done \u2014 perry-db-turnloop installs a client session at connect time \u2014 but a URI naming its own trust store still declines, because this path honours the process TLS environment and has nowhere to put a per-URI store.",
+      "issue": "#10332, #10341",
+      "plan": "J"
+    },
+    {
+      "crate": "perry-ext-mongodb",
+      "dep": "tokio",
+      "kind": "normal",
+      "optional": false,
+      "target": null,
+      "surface": "as `mongodb` above",
+      "reached_when": "a thread that could not get a loop of its own \u2014 since turnloop P9 that is a second thread acting for an agent another thread already owns (a host pump thread; Android's UI thread for `perry-native`), not a worker agent, or a host where Loop::new failed, or any of the URI features above (TLS by itself is no longer one).",
+      "blocker": "SUPERSEDED BY A SCOPE DECISION (Ralph, 2026-09-17): this crate is going away, so this edge goes with it and NOBODY SHOULD CONVERT IT. `mongodb` is a pure-JS npm package, and the native wrapper exists only because Perry was TypeScript-only at one time. The plan is to delete the wrapper and compile the package from its own JS source, which removes this edge by deletion rather than by migration. Do not spend a lane on a turnloop transport here. The pre-existing blocker, kept for the record and no longer actionable: `spawn_blocking` + `Handle::current().block_on` per operation. Goes with the driver.",
+      "issue": "#10339",
+      "plan": "J"
+    },
+    {
+      "crate": "perry-stdlib",
+      "dep": "tokio",
+      "kind": "normal",
+      "optional": true,
+      "target": null,
+      "surface": "the tokio HALF of the async bridge only (turnloop P8 lane L split it out): `common::tokio_bridge` \u2014 the current-thread `RUNTIME`, its wait-driver tick, `spawn` / `spawn_for_promise*` \u2014 plus the `perry_ffi_spawn_async` / `perry_ffi_spawn_blocking_with_reactor` C ABI and `perry_ffi_spawn_blocking`'s tokio-pool arm. The promise bridge itself (`common::async_bridge`'s settle queue and pump, and the promise / pool / blocking `perry_ffi_*` shims) is tokio-free under the `async-bridge` feature, which is what the auto-optimize driver now force-enables.",
+      "reached_when": "the `async-runtime` feature, which is selected only by (1) a Cargo feature whose code hands tokio a future \u2014 `web-fetch` (reqwest), `bundled-net` / `tls-runtime` / `external-tls-server` / `external-net-tls` / `bundled-ws` (tokio sockets), `external-net-pump` / `external-ws-pump` / `external-http-server-pump` / `external-http-client-pump` (perry-ext-net / -ws / -http hand futures to `perry_ffi_spawn_async`), `container`; or (2) the auto-optimize driver, for every shared-tokio wrapper (`binding_needs_shared_tokio`: net, ws, http, https, http2, undici, fastify, mongodb, ioredis, redis, nodemailer) and for pg / mysql2. `full` still implies it, so every PERRY_NO_AUTO_OPTIMIZE / prebuilt-archive build links tokio. It is NO LONGER forced onto every auto-optimized program: one that uses only crypto, bcrypt, argon2, zlib (bundled or perry-ext-zlib), readline, worker_threads, timers or a UI backend links no tokio.",
+      "blocker": "each selector in `reached_when` has to go; then `tokio_bridge.rs` and the three `cfg(feature = \"async-runtime\")` shims in `perry_ffi_async.rs` delete whole and `async-runtime` collapses into `async-bridge` \u2014 nothing in `async_bridge.rs` has to move. In order: G (#11101) leaves `web-fetch` tokio-free, after which it needs only `async-bridge`; H (#11102) plus P1 put the bundled net / tls / ws sockets on turnloop handles; A moved perry-ext-net off tokio and tokio-rustls (#11105, landed in merge train 266); perry-ext-http's `perry_ffi_spawn_async` / `_with_reactor` use is what remains of that step; B removes the db wrappers' decline paths, which call `Handle::current()` inside `perry_ffi_spawn_blocking` (with perry-ext-net's `upgradeTLS` reply wait, the only reason that shim still needs tokio's pool in a tokio build); K takes `container` off tokio. PerryTS/turnloop#42 is NOT a blocker any more: `Occupancy::Long` shipped in turnloop 0.1.0-alpha.5 (Perry pins alpha.6), and the tokio-free `perry_ffi_spawn_blocking` already runs on it through `turnloop_pool::submit_long`.",
+      "issue": "unfiled \u2014 P8; PerryTS/turnloop#42 closed (Occupancy::Long, turnloop 0.1.0-alpha.5+); lane L split the bridge from the runtime",
+      "plan": "L"
+    },
+    {
+      "crate": "perry-ui-android",
+      "dep": "tungstenite",
+      "kind": "normal",
+      "optional": false,
+      "target": "cfg(target_os = \"android\")",
+      "surface": "`perry/ui` WebSocket on Android (`crates/perry-ui-android/src/ws.rs`)",
+      "reached_when": "an Android target build only",
+      "blocker": "SYNC tungstenite on its own thread \u2014 not a tokio edge at all. #11065 bumped this crate's pin from 0.24 to 0.30, so the tree-wide tungstenite major-version split is gone: this edge now resolves to the same 0.30.0 as turnloop-websocket. `turnloop_websocket::Connection` works over a blocking `std::net::TcpStream` as happily as over anything else, so the migration off tungstenite entirely is still mechanical \u2014 but it cannot be built or run from the shared Linux box, and an unexecutable migration is not one to land blind.",
+      "issue": "unfiled \u2014 P8",
+      "plan": "N"
+    }
+  ],
+  "lockfile": {
+    "h2": [
+      "0.4.19"
+    ],
+    "hyper": [
+      "1.11.1"
+    ],
+    "hyper-rustls": [
+      "0.27.9"
+    ],
+    "hyper-util": [
+      "0.1.20"
+    ],
+    "lettre": [
+      "0.11.23"
+    ],
+    "mongodb": [
+      "3.9.1"
+    ],
+    "redis": [
+      "1.7.0"
+    ],
+    "reqwest": [
+      "0.12.28"
+    ],
+    "tokio": [
+      "1.53.1"
+    ],
+    "tokio-rustls": [
+      "0.26.5"
+    ],
+    "tokio-util": [
+      "0.7.18"
+    ],
+    "tower": [
+      "0.5.3"
+    ],
+    "tower-http": [
+      "0.6.11"
+    ],
+    "tungstenite": [
+      "0.30.0"
+    ]
+  },
+  "source_sites": {
+    "perry": 3,
+    "perry-container-compose": 14,
+    "perry-ext-ads": 5,
+    "perry-ext-http": 43,
+    "perry-ext-ioredis": 13,
+    "perry-ext-mongodb": 29,
+    "perry-ffi": 2,
+    "perry-stdlib": 80,
+    "perry-ui-gtk4": 6
+  }
+}

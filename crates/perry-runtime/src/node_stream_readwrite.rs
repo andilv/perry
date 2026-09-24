@@ -17,7 +17,8 @@ pub(super) unsafe fn own_field_by_key_bytes(obj: *const ObjectHeader, key: &[u8]
     if obj.is_null() {
         return None;
     }
-    let keys = crate::object::object_keys_array(obj);
+    let keys_view = crate::object::object_keys(obj);
+    let keys = keys_view.arr();
     let keys_ptr = keys as usize;
     if keys.is_null() || keys_ptr < 0x10000 {
         return None;
@@ -26,7 +27,7 @@ pub(super) unsafe fn own_field_by_key_bytes(obj: *const ObjectHeader, key: &[u8]
         return None;
     }
 
-    let key_count = crate::array::js_array_length(keys) as usize;
+    let key_count = keys_view.count() as usize;
     if key_count > 65_536 {
         return None;
     }
@@ -446,13 +447,6 @@ pub(super) fn pipe_stream_to_destination(stream: f64, dest: f64, end_dest: bool)
     if !end_dest {
         add_pipe_no_end_destination(stream, dest);
     }
-    // A flowing destination (e.g. a piped-into PassThrough/Duplex) must consume
-    // each chunk from its own readable buffer when it emits 'data' live —
-    // otherwise the chunk lingers in the buffer and the destination's drain
-    // microtask re-emits it, duplicating every piped chunk. `pipeline()` already
-    // marks both ends; `pipe()` needs the same on the destination. (matches
-    // mark_live_pipe_consume_on_emit usage in node_stream_pipeline.rs)
-    mark_live_pipe_consume_on_emit(dest);
     install_pipe_destination_listeners(stream, dest);
     let _ = emit_stream_event(dest, string_value(b"pipe"), &[stream]);
     set_readable_flowing(stream, f64::from_bits(TAG_TRUE));
@@ -920,7 +914,10 @@ pub(super) fn drain_readable_from_events(stream: f64) {
             }
         }
     }
-    if !stream_destroyed(stream) {
+    if !stream_destroyed(stream)
+        && !has_truthy_hidden(stream, hidden_transform_finishing_key())
+        && readable_drain_may_end(stream)
+    {
         emit_readable_end_once(stream);
     }
 }

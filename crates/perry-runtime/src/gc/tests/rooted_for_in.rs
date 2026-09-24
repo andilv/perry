@@ -40,6 +40,16 @@ fn run(inherited_proxy: bool, descriptor_trap: bool) {
     );
     gc_register_mutable_root_scanner(crate::proxy::scan_proxy_roots_mut);
     COPIED.with(|count| count.set(0));
+    // This fixture constructs cached descriptor/JSON shapes across moving
+    // collections. The isolation guard removes production's root registry;
+    // restore the cache root and its weak metadata rewrites explicitly.
+    // Long-lived canonical arrays used to conceal the missing registrations.
+    gc_register_mutable_root_scanner(crate::object::scan_shape_cache_roots_mut);
+    gc_register_mutable_root_scanner(crate::object::canonical_keys::scan_canonical_keys_roots_mut);
+    // The shape table's descriptors name those same young lists; its weak
+    // rewrite must run too, or a descriptor keeps a moved list's old address.
+    gc_register_mutable_root_scanner(crate::object::shapes::scan_shape_table_rekey_mut);
+    gc_register_mutable_root_scanner(crate::object::scan_class_keys_roots_mut);
     let scope = RuntimeHandleScope::new();
     let target = object(&scope);
     crate::object::js_object_set_prototype_of(
@@ -178,6 +188,14 @@ fn descriptor_completion_reloads_after_field_getter_collection() {
     );
     gc_register_mutable_root_scanner(crate::proxy::scan_proxy_roots_mut);
     COPIED.with(|count| count.set(0));
+    // As in `run`: the isolation guard removes production's root registry,
+    // and the descriptor object's keys are young canonical lists that the
+    // getter's collection moves. Without the object-model rewrites the shape
+    // table keeps naming their old addresses.
+    gc_register_mutable_root_scanner(crate::object::scan_object_cache_roots_mut);
+    gc_register_mutable_root_scanner(crate::object::scan_shape_cache_roots_mut);
+    gc_register_mutable_root_scanner(crate::object::scan_transition_cache_roots_mut);
+    gc_register_mutable_root_scanner(crate::object::shapes::scan_shape_table_rekey_mut);
     let scope = RuntimeHandleScope::new();
     let target = object(&scope);
     set(target, "property_name", 7.0);

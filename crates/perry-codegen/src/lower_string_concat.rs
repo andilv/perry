@@ -203,7 +203,10 @@ pub(crate) fn lower_string_self_append_chain(
 /// SSO bits.
 fn proven_heap_string_operand(_ctx: &FnCtx<'_>, e: &Expr) -> bool {
     match e {
-        Expr::String(_) | Expr::WtfString(_) | Expr::StringCoerce(_) => true,
+        Expr::String(_)
+        | Expr::WtfString(_)
+        | Expr::StringCoerce(_)
+        | Expr::TemplateStringCoerce(_) => true,
         Expr::Conditional {
             then_expr,
             else_expr,
@@ -760,7 +763,7 @@ pub(crate) fn flatten_string_add_chain<'a>(
 /// Drop a `StringCoerce` wrapper the chain helper's own formatting makes
 /// redundant.
 ///
-/// The template desugaring wraps every substitution in `StringCoerce` so it is
+/// The template desugaring wraps every substitution in `TemplateStringCoerce` so it is
 /// toString-first rather than `+`'s valueOf-first (#6078). But
 /// `js_string_concat_chain` formats each part itself, and for two kinds of part
 /// its formatting IS `ToString`: a value already proven a string (the coercion
@@ -800,16 +803,19 @@ pub(crate) fn flatten_string_add_chain<'a>(
 /// than the declared check, because `String(obj)` and `+`'s ToPrimitive can
 /// disagree — but `js_string_coerce`'s object arm ITSELF forwards to
 /// `js_jsvalue_to_string`, matching classify loop's fallback exactly, so even
-/// that case stays correct; declared-number trust only ever changes which
-/// code path produces the (identical) answer, never the answer.
+/// that case stays correct for explicit String coercion. Template coercion
+/// cannot use declared-number trust: a lying annotation may contain a Symbol,
+/// which implicit ToString must reject before the concat helper sees it.
 fn chain_part_without_redundant_coerce<'a>(ctx: &FnCtx<'_>, part: &'a Expr) -> &'a Expr {
-    let Expr::StringCoerce(inner) = part else {
-        return part;
+    let (inner, is_template) = match part {
+        Expr::StringCoerce(inner) => (inner, false),
+        Expr::TemplateStringCoerce(inner) => (inner, true),
+        _ => return part,
     };
     let is_string = crate::type_analysis::string_value_is_runtime_guaranteed(ctx, inner);
     let is_plain_number = (crate::type_analysis::is_numeric_expr(ctx, inner)
         && crate::expr::expr_produces_non_pointer_bits_by_construction(ctx, inner))
-        || crate::type_analysis::is_declared_number_expr(ctx, inner);
+        || (!is_template && crate::type_analysis::is_declared_number_expr(ctx, inner));
     if is_string || is_plain_number {
         inner
     } else {
@@ -817,14 +823,75 @@ fn chain_part_without_redundant_coerce<'a>(ctx: &FnCtx<'_>, part: &'a Expr) -> &
     }
 }
 
+/// A template substitution already performs ToString (string hint) while it
+/// is evaluated. An ordinary `+` operand instead needs ToPrimitive(default),
+/// unless its runtime value is already known to be primitive.
+fn chain_part_needs_default_primitive(ctx: &FnCtx<'_>, part: &Expr) -> bool {
+    !matches!(part, Expr::StringCoerce(_))
+        && !crate::type_analysis::string_value_is_runtime_guaranteed(ctx, part)
+        && !crate::expr::expr_produces_non_pointer_bits_by_construction(ctx, part)
+}
+
 pub(crate) fn lower_string_concat_chain(ctx: &mut FnCtx<'_>, parts: &[&Expr]) -> Result<String> {
     debug_assert!(parts.len() >= 2);
     debug_assert!(parts.len() <= CONCAT_CHAIN_MAX_PARTS);
+    let needs_primitive: Vec<bool> = parts
+        .iter()
+        .map(|part| chain_part_needs_default_primitive(ctx, part))
+        .collect();
     let parts: Vec<&Expr> = parts
         .iter()
         .map(|part| chain_part_without_redundant_coerce(ctx, part))
         .collect();
     let parts = parts.as_slice();
+
+    if needs_primitive.iter().any(|needed| *needed) {
+        return with_rooted_group(ctx, parts.len() + 2, |ctx, group| {
+            // For the first Add, both operands are evaluated before either is
+            // coerced. Later parts are evaluated and coerced one at a time,
+            // before the next Add's right operand is evaluated.
+            let mut first = Vec::with_capacity(2);
+            for part in parts.iter().take(2) {
+                let raw = lower_expr(ctx, part)?;
+                first.push(group.adopt_emitted(ctx, Repr::Boxed, &raw, true));
+            }
+
+            let mut converted = Vec::with_capacity(parts.len());
+            for i in 0..parts.len() {
+                let raw = if i < 2 {
+                    group.reread_emitted(ctx, first[i])
+                } else {
+                    lower_expr(ctx, parts[i])?
+                };
+                let value = if needs_primitive[i] {
+                    ctx.block()
+                        .call(DOUBLE, "js_to_primitive_default_for_add", &[(DOUBLE, &raw)])
+                } else {
+                    raw
+                };
+                converted.push(group.adopt_emitted(ctx, Repr::Boxed, &value, true));
+                // A Symbol throws only after both operands of this Add have
+                // been converted. Do that check after the head pair, then
+                // after each later right operand and before the next one.
+                if i == 1 {
+                    for part in converted.iter().take(2) {
+                        let value = group.reread_emitted(ctx, *part);
+                        ctx.block()
+                            .call_void("js_add_throw_if_symbol", &[(DOUBLE, &value)]);
+                    }
+                } else if i > 1 {
+                    let value = group.reread_emitted(ctx, converted[i]);
+                    ctx.block()
+                        .call_void("js_add_throw_if_symbol", &[(DOUBLE, &value)]);
+                }
+            }
+            let lowered: Vec<String> = converted
+                .into_iter()
+                .map(|part| group.reread_emitted(ctx, part))
+                .collect();
+            Ok(emit_string_concat_chain(ctx, &lowered))
+        });
+    }
 
     // Lower each part first (in source order); side effects must fire
     // left-to-right per JS spec. #6951: that ordering is exactly what makes

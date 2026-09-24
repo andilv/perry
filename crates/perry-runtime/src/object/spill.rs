@@ -8,6 +8,11 @@
 
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_LAYOUT_NOTE_SLOT_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
 // Last-accessed overflow Vec cache — one entry, keyed by `obj_ptr`.
 // Skips the outer HashMap lookup on consecutive writes to the same
 // object (exactly the row-build pattern: a single object gets its
@@ -41,7 +46,7 @@ use super::*;
 #[inline]
 pub(crate) fn object_spill_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
+    *crate::once_init::get_or_init(&ON, || {
         !matches!(
             std::env::var("PERRY_OBJECT_SPILL").as_deref(),
             Ok("0") | Ok("off") | Ok("false")
@@ -64,6 +69,7 @@ unsafe fn spill_elements(spill: *const crate::array::ArrayHeader) -> *mut u64 {
 #[inline]
 unsafe fn spill_store_slot(spill: *mut crate::array::ArrayHeader, index: usize, vbits: u64) {
     let slot = spill_elements(spill).add(index);
+    let old_bits = *slot;
     *slot = vbits;
     // Length is the buffer's high-water mark: `js_array_alloc_with_length`
     // sets length = REQUESTED capacity while the physical capacity rounds up
@@ -75,7 +81,12 @@ unsafe fn spill_store_slot(spill: *mut crate::array::ArrayHeader, index: usize, 
     if index >= (*spill).length as usize {
         (*spill).length = (index + 1) as u32;
     }
-    crate::gc::layout_note_slot(spill as usize, index, vbits);
+    // Spill elements are boxed JS values just like ordinary array slots. The
+    // old value is already in hand, so preserve the same overwrite invariant
+    // as array stores: scalar -> scalar and pointer -> pointer cannot change
+    // the GC slot mask and need no full layout note. Transitions in either
+    // direction still take the complete path below.
+    crate::gc::layout_note_slot_aware(spill as usize, index, vbits, old_bits);
     crate::gc::runtime_write_barrier_slot(spill as usize, slot as usize, vbits);
 }
 
@@ -451,7 +462,7 @@ fn note_learned_inline_fields(obj_ptr: usize, class_id: u32, needed_fields: u32)
 pub(crate) fn learned_inline_field_count(class_id: u32) -> u32 {
     // Bisection kill-switch: PERRY_LEARNED_INLINE=0 disables consumption.
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| {
+    if !*crate::once_init::get_or_init(&ON, || {
         !matches!(
             std::env::var("PERRY_LEARNED_INLINE").as_deref(),
             Ok("0") | Ok("off") | Ok("false")
@@ -562,6 +573,70 @@ mod tests {
             learned_inline_field_count(DECLARED_CID),
             13,
             "a real instance overflow must still teach the class high-water mark"
+        );
+    }
+
+    #[test]
+    fn spill_overwrites_only_note_pointer_kind_transitions() {
+        let _lock = crate::gc::global_side_table_test_lock();
+        let _trigger_guard = crate::gc::GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+        let owner = js_object_alloc(0x6B45_5A13, 0);
+        let slot = 18;
+
+        TEST_LAYOUT_NOTE_SLOT_CALLS.with(|calls| calls.set(0));
+        spill_set(owner as usize, slot, 1.0f64.to_bits());
+        assert_eq!(TEST_LAYOUT_NOTE_SLOT_CALLS.with(Cell::get), 0);
+
+        TEST_LAYOUT_NOTE_SLOT_CALLS.with(|calls| calls.set(0));
+        spill_set(owner as usize, slot, 2.0f64.to_bits());
+        assert_eq!(
+            TEST_LAYOUT_NOTE_SLOT_CALLS.with(Cell::get),
+            0,
+            "a scalar overwrite must not enter the full layout hook"
+        );
+
+        let child_a = js_object_alloc(0x6B45_5A14, 0);
+        let child_a_bits =
+            crate::value::POINTER_TAG | (child_a as u64 & crate::value::POINTER_MASK);
+        TEST_LAYOUT_NOTE_SLOT_CALLS.with(|calls| calls.set(0));
+        spill_set(owner as usize, slot, child_a_bits);
+        assert_eq!(
+            TEST_LAYOUT_NOTE_SLOT_CALLS.with(Cell::get),
+            1,
+            "a scalar-to-pointer transition must update the slot layout"
+        );
+
+        let spill = crate::object::test_spill_buffer_addr(owner as usize);
+        assert_eq!(
+            crate::gc::test_layout_pointer_slot_count(spill, slot + 1),
+            Some(1)
+        );
+
+        let child_b = js_object_alloc(0x6B45_5A15, 0);
+        let child_b_bits =
+            crate::value::POINTER_TAG | (child_b as u64 & crate::value::POINTER_MASK);
+        TEST_LAYOUT_NOTE_SLOT_CALLS.with(|calls| calls.set(0));
+        spill_set(owner as usize, slot, child_b_bits);
+        assert_eq!(
+            TEST_LAYOUT_NOTE_SLOT_CALLS.with(Cell::get),
+            0,
+            "a pointer overwrite must preserve the existing mask bit"
+        );
+        assert_eq!(
+            crate::gc::test_layout_pointer_slot_count(spill, slot + 1),
+            Some(1)
+        );
+
+        TEST_LAYOUT_NOTE_SLOT_CALLS.with(|calls| calls.set(0));
+        spill_set(owner as usize, slot, 3.0f64.to_bits());
+        assert_eq!(
+            TEST_LAYOUT_NOTE_SLOT_CALLS.with(Cell::get),
+            1,
+            "a pointer-to-scalar transition must clear the slot layout"
+        );
+        assert_eq!(
+            crate::gc::test_layout_pointer_slot_count(spill, slot + 1),
+            Some(0)
         );
     }
 }

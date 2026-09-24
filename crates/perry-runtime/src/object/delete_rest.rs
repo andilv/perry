@@ -328,14 +328,15 @@ pub extern "C" fn js_object_delete_field(
                 }
             }
         }
-        let mut keys = crate::object::object_keys_array(obj);
+        let mut keys_view = crate::object::object_keys(obj);
+        let mut keys = keys_view.arr();
         if keys.is_null() {
             // No keys array means no fields to delete, but delete "succeeds" vacuously
             return 1;
         }
 
         // Search through the keys array for a match
-        let key_count = crate::array::js_array_length(keys) as usize;
+        let key_count = keys_view.count() as usize;
         // #6759: shape-index + dense-slot scan (SSO-aware via the shared
         // helper, preserving #1781). The old per-element `js_array_get` walk
         // made every `delete` O(keys) full-accessor calls — measured as the
@@ -360,6 +361,10 @@ pub extern "C" fn js_object_delete_field(
                     if !attrs.configurable() {
                         return 0;
                     }
+                    // The key is about to be removed on either the tombstone
+                    // or compacting lane. Its old writable/enumerable flags
+                    // must not govern a later assignment that recreates it.
+                    super::clear_property_attrs(obj as usize, name);
                 }
                 // A configurable data method on a class/Object prototype is about
                 // to disappear. Retire only this name's direct-method guards.
@@ -419,7 +424,8 @@ pub extern "C" fn js_object_delete_field(
             // its authoritative old keys edge instead of copying through the
             // pre-collection raw addresses.
             obj = reloaded_obj;
-            keys = crate::object::object_keys_array(obj);
+            keys_view = crate::object::object_keys(obj);
+            keys = keys_view.arr();
             let src_elements =
                 crate::array::array_elements_ptr(keys as *const crate::ArrayHeader) as *const f64;
             let dst_elements =
@@ -432,7 +438,9 @@ pub extern "C" fn js_object_delete_field(
             }
             (*keys_cloned).length = key_count as u32;
             super::rebuild_array_layout_from_slots(keys_cloned);
-            set_object_keys_array(obj, keys_cloned);
+            // The fork is this receiver's own list from here on.
+            keys_view = crate::object::ObjectKeys::owned(keys_cloned);
+            set_object_keys(obj, keys_view);
             keys = keys_cloned;
             keys_owned = true;
         }
@@ -607,7 +615,8 @@ pub extern "C" fn js_object_delete_field(
             // ObjectHeader facts". `publish_object_shape_from` versions a
             // same-pointer change internally, and `keys_changed` is false here
             // so the typed layout is preserved rather than marked unknown.
-            set_object_keys_array(obj, keys);
+            // An owned (unshared) list: its header length is its count.
+            set_object_keys(obj, crate::object::ObjectKeys::owned(keys));
             super::shapes::shape_index_shift_in_place(keys as usize, i as u32, key_count as u32)
         } else {
             let keys_cloned = crate::array::js_array_alloc(new_count.max(1) as u32 + 4);
@@ -657,7 +666,7 @@ pub extern "C" fn js_object_delete_field(
             );
             // `set_object_keys_array` publishes the cloned edge while preserving
             // the predecessor's semantic generation and object kind.
-            set_object_keys_array(obj, keys_cloned);
+            set_object_keys(obj, crate::object::ObjectKeys::owned(keys_cloned));
             index_migrated
         };
 
@@ -739,7 +748,7 @@ pub extern "C" fn js_object_delete_field(
         // dropping it would throw away the rebuild this is meant to avoid —
         // the next lookup would re-hash every surviving key name.
         if !index_migrated {
-            crate::object::shapes::shape_drop(crate::object::object_keys_array(obj));
+            crate::object::shapes::shape_drop(crate::object::object_keys(obj).arr());
         }
         1
     }
@@ -1095,8 +1104,85 @@ pub extern "C" fn js_object_delete_dynamic(obj: *mut ObjectHeader, key: f64) -> 
     1
 }
 
-/// Create a rest object from destructuring: copies all properties from src except excluded keys.
-/// exclude_keys is an array of NaN-boxed string pointers (the explicitly destructured keys).
+unsafe fn copy_rest_symbol_properties(
+    src_handle: &crate::gc::RuntimeHandle<'_>,
+    exclude_handle: &crate::gc::RuntimeHandle<'_>,
+    rest_handle: &crate::gc::RuntimeHandle<'_>,
+) {
+    // `src_boxed` re-derives the NaN-boxed receiver from the ROOT every time
+    // it is called. A single boxed copy taken up front would be a raw address
+    // held across `js_object_get_own_property_symbols` and every getter below
+    // (#7341); the closure keeps the read ordered after the last collection
+    // point instead.
+    let src_boxed = || {
+        src_handle.with_const_ptr::<ObjectHeader, _>(|p| crate::value::js_nanbox_pointer(p as i64))
+    };
+    // Snapshot [[OwnPropertyKeys]] before running any getters. The returned
+    // array is a GC object, so keep it rooted while each property read may run
+    // arbitrary user code and collect.
+    let symbols = crate::symbol::js_object_get_own_property_symbols(src_boxed())
+        as *mut crate::array::ArrayHeader;
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let symbols_handle = scope.root_raw_mut_ptr(symbols);
+    let symbol_count = symbols_handle
+        .with_const_ptr::<crate::array::ArrayHeader, _>(|p| crate::array::js_array_length(p));
+    let exclude_count = exclude_handle.with_const_ptr::<crate::array::ArrayHeader, _>(|p| {
+        if p.is_null() {
+            0
+        } else {
+            crate::array::js_array_length(p)
+        }
+    });
+
+    for i in 0..symbol_count {
+        let symbol = symbols_handle
+            .with_const_ptr::<crate::array::ArrayHeader, _>(|p| crate::array::js_array_get(p, i));
+        let symbol_bits = symbol.bits();
+        // `js_array_get` cannot collect, so one scoped read of the exclude
+        // array covers the whole scan.
+        let excluded = exclude_handle.with_const_ptr::<crate::array::ArrayHeader, _>(|ex| {
+            (0..exclude_count).any(|j| crate::array::js_array_get(ex, j).bits() == symbol_bits)
+        });
+        if excluded {
+            continue;
+        }
+
+        let iter_scope = crate::gc::RuntimeHandleScope::new();
+        let symbol_handle = iter_scope.root_nanbox_u64(symbol_bits);
+        let symbol_value = symbol_handle.get_nanbox_f64();
+        let symbol_key = (symbol_value.to_bits() & crate::value::POINTER_MASK) as usize;
+
+        // CopyDataProperties rechecks the descriptor after collecting keys:
+        // an earlier getter may have deleted this key, and non-enumerable
+        // symbols must not appear in the rest object.
+        let Some(slot) = crate::symbol::own_symbol_slot(src_boxed(), symbol_value) else {
+            continue;
+        };
+        let enumerable = src_handle.with_const_ptr::<ObjectHeader, _>(|p| {
+            crate::symbol::symbol_property_is_enumerable(p as usize, symbol_key)
+        });
+        if !enumerable {
+            continue;
+        }
+
+        // `slot.read` may invoke an accessor and therefore collect, so the
+        // rest receiver is re-read from its root afterwards.
+        let value_handle = iter_scope.root_nanbox_f64(slot.read(src_boxed()));
+        // CreateDataProperty semantics: install a fresh enumerable data
+        // property without invoking an inherited setter on Object.prototype.
+        rest_handle.with_mut_ptr::<ObjectHeader, _>(|rest| {
+            crate::symbol::define_symbol_data_property(
+                crate::value::js_nanbox_pointer(rest as i64),
+                symbol_handle.get_nanbox_f64(),
+                value_handle.get_nanbox_f64(),
+            )
+        });
+    }
+}
+
+/// Create a rest object from destructuring: copies all own enumerable
+/// properties from `src` except the explicitly destructured keys.
+/// `exclude_keys` contains NaN-boxed strings and may also contain Symbols.
 /// Returns a pointer to a new object with the remaining key-value pairs.
 #[no_mangle]
 pub extern "C" fn js_object_rest(
@@ -1107,19 +1193,42 @@ pub extern "C" fn js_object_rest(
         return js_object_alloc(0, 0);
     }
     unsafe {
-        if super::string_wrapper::length(src as usize).is_some() {
-            return super::string_wrapper::rest(src, exclude_keys);
-        }
-        let keys = crate::object::object_keys_array(src);
-        if keys.is_null() {
-            return js_object_alloc(0, 0);
-        }
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let src_handle = scope.root_raw_const_ptr(src);
+        let exclude_handle = scope.root_raw_const_ptr(exclude_keys);
 
-        let key_count = crate::array::js_array_length(keys) as usize;
+        if super::string_wrapper::length(src as usize).is_some() {
+            let rest = src_handle.with_const_ptr::<ObjectHeader, _>(|src_ptr| {
+                exclude_handle.with_const_ptr::<ArrayHeader, _>(|exclude_ptr| {
+                    super::string_wrapper::rest(src_ptr, exclude_ptr)
+                })
+            });
+            let rest_handle = scope.root_raw_mut_ptr(rest);
+            // The symbol copy runs getters and allocates, so take the rest
+            // object's address from its root AFTER that call, never before.
+            let (_, rest_ptr) = rest_handle.across_mut::<ObjectHeader, _>(|| {
+                copy_rest_symbol_properties(&src_handle, &exclude_handle, &rest_handle)
+            });
+            return rest_ptr;
+        }
+        // `ObjectKeys` is a VIEW holding a raw `*mut ArrayHeader` (object_keys.rs:21),
+        // so it must not be LIVE across an allocating call any more than a bare
+        // pointer may be. Read it through the rooted receiver, take the array and
+        // the shape-owned count out of it immediately, root the array, and never
+        // touch the view again -- everything below uses `keys_handle`/`key_count`.
+        // `count()` is 0 for a keyless receiver (`ObjectKeys::NONE`), which is the
+        // same 0 the pre-`ObjectKeys` code computed with an explicit null test.
+        let keys_view =
+            src_handle.with_const_ptr::<ObjectHeader, _>(|p| crate::object::object_keys(p));
+        let keys = keys_view.arr();
+        let keys_handle = scope.root_raw_mut_ptr(keys);
+        let key_count = keys_view.count() as usize;
         let exclude_count = if exclude_keys.is_null() {
             0
         } else {
-            crate::array::js_array_length(exclude_keys) as usize
+            exclude_handle.with_const_ptr::<crate::array::ArrayHeader, _>(|p| {
+                crate::array::js_array_length(p)
+            }) as usize
         };
 
         // Collect indices of keys to include (not in exclude list and not undefined/deleted).
@@ -1131,27 +1240,30 @@ pub extern "C" fn js_object_rest(
         let mut include_indices: Vec<usize> = Vec::new();
         let mut src_buf = [0u8; crate::value::SHORT_STRING_MAX_LEN];
         for i in 0..key_count {
-            let key_val = crate::array::js_array_get(keys, i as u32);
+            let key_val = keys_handle.with_const_ptr::<crate::array::ArrayHeader, _>(|keys| {
+                crate::array::js_array_get(keys, i as u32)
+            });
             let key_bytes = match crate::string::js_string_key_bytes(key_val, &mut src_buf) {
                 Some(b) => b.to_vec(),
                 None => continue,
             };
 
             // Check if field was deleted
-            let field_val = js_object_get_field(src, i as u32);
+            let field_val = src_handle
+                .with_const_ptr::<ObjectHeader, _>(|obj| js_object_get_field(obj, i as u32));
             if field_val.is_undefined() {
                 continue;
             }
 
-            // Check if this key is in the exclude list
-            let mut excluded = false;
-            for j in 0..exclude_count {
-                let ex_val = crate::array::js_array_get(exclude_keys, j as u32);
-                if crate::string::js_string_key_matches_bytes(ex_val, &key_bytes) {
-                    excluded = true;
-                    break;
-                }
-            }
+            // Check if this key is in the exclude list. Neither `js_array_get`
+            // nor the byte compare can collect, so one scoped read of the
+            // exclude array covers the whole scan.
+            let excluded = exclude_handle.with_const_ptr::<crate::array::ArrayHeader, _>(|ex| {
+                (0..exclude_count).any(|j| {
+                    let ex_val = crate::array::js_array_get(ex, j as u32);
+                    crate::string::js_string_key_matches_bytes(ex_val, &key_bytes)
+                })
+            });
             if !excluded {
                 include_indices.push(i);
             }
@@ -1159,22 +1271,41 @@ pub extern "C" fn js_object_rest(
 
         // Allocate new object with the right number of fields
         let rest_count = include_indices.len() as u32;
-        let rest_obj = js_object_alloc(0, rest_count);
+        let rest_handle = scope.root_raw_mut_ptr(js_object_alloc(0, rest_count));
 
         // Create keys array for the rest object
-        let rest_keys = crate::array::js_array_alloc_with_length(rest_count);
-        set_object_keys_array(rest_obj, rest_keys);
+        let rest_keys_handle =
+            scope.root_raw_mut_ptr(crate::array::js_array_alloc_with_length(rest_count));
+        // A fresh list, the rest object's own until it is published, so its
+        // header length IS its count -- which is what `owned` asserts.
+        rest_handle.with_mut_ptr::<ObjectHeader, _>(|rest| {
+            rest_keys_handle.with_mut_ptr::<crate::array::ArrayHeader, _>(|rest_keys| {
+                set_object_keys(rest, crate::object::ObjectKeys::owned(rest_keys))
+            })
+        });
 
         // Copy included key-value pairs
         for (new_idx, &src_idx) in include_indices.iter().enumerate() {
-            let key_val = crate::array::js_array_get(keys, src_idx as u32);
-            crate::array::js_array_set(rest_keys, new_idx as u32, key_val);
+            let key_val = keys_handle.with_const_ptr::<crate::array::ArrayHeader, _>(|keys| {
+                crate::array::js_array_get(keys, src_idx as u32)
+            });
+            rest_keys_handle.with_mut_ptr::<crate::array::ArrayHeader, _>(|rest_keys| {
+                crate::array::js_array_set(rest_keys, new_idx as u32, key_val)
+            });
 
-            let field_val = js_object_get_field(src, src_idx as u32);
-            js_object_set_field(rest_obj, new_idx as u32, field_val);
+            let field_val = src_handle
+                .with_const_ptr::<ObjectHeader, _>(|obj| js_object_get_field(obj, src_idx as u32));
+            rest_handle.with_mut_ptr::<ObjectHeader, _>(|rest| {
+                js_object_set_field(rest, new_idx as u32, field_val)
+            });
         }
 
-        rest_obj
+        // As above: the symbol copy can collect, so the returned address comes
+        // from the root after it, not from a pointer read before it.
+        let (_, rest_ptr) = rest_handle.across_mut::<ObjectHeader, _>(|| {
+            copy_rest_symbol_properties(&src_handle, &exclude_handle, &rest_handle)
+        });
+        rest_ptr
     }
 }
 
@@ -1258,7 +1389,7 @@ mod shape_transition_tests_6759 {
                 .expect("delete must publish a by-id descriptor");
             assert_eq!(
                 descriptor.keys,
-                crate::object::object_keys_array(obj) as u64
+                crate::object::object_keys(obj).arr() as u64
             );
             assert_eq!(descriptor.logical_key_count, 2);
             assert_eq!(
@@ -1301,7 +1432,8 @@ mod shape_transition_tests_6759 {
             for (i, v) in [10.0f64, 20.0, 30.0].iter().enumerate() {
                 js_object_set_field(obj, i as u32, JSValue::from_bits(v.to_bits()));
             }
-            let keys_before = crate::object::object_keys_array(obj);
+            let keys_before_view = crate::object::object_keys(obj);
+            let keys_before = keys_before_view.arr();
             assert_eq!((*obj).class_id, CID, "test premise: a class instance");
             let before = (*obj).parent_class_id;
             assert!(
@@ -1345,7 +1477,7 @@ mod shape_transition_tests_6759 {
                 .expect("class delete must publish a by-id descriptor");
             assert_eq!(
                 descriptor.keys,
-                crate::object::object_keys_array(obj) as u64
+                crate::object::object_keys(obj).arr() as u64
             );
             assert_eq!(descriptor.logical_key_count, 2);
             assert_eq!(
@@ -1355,7 +1487,7 @@ mod shape_transition_tests_6759 {
 
             // Still true, and still what the guard compares until rung 3.
             assert_ne!(
-                crate::object::object_keys_array(obj),
+                crate::object::object_keys(obj).arr(),
                 keys_before,
                 "the keys pointer is the guard's compaction evidence and it did not change"
             );
@@ -1526,6 +1658,79 @@ mod sso_tests_1781 {
     }
 }
 
+#[cfg(test)]
+mod descriptor_delete_tests_10840 {
+    use super::*;
+
+    #[test]
+    fn deleting_configurable_read_only_data_allows_readding_the_key() {
+        let _lock = crate::gc::global_side_table_test_lock();
+        for tombstones in [true, false] {
+            let _mode = test_scope_tombstone_deletes(tombstones);
+            for enumerable in [true, false] {
+                let obj = crate::object::js_object_alloc(0, 8);
+                let a = crate::string::js_string_from_bytes(b"a".as_ptr(), 1);
+                let b = crate::string::js_string_from_bytes(b"b".as_ptr(), 1);
+                crate::object::js_object_set_field_by_name(obj, a, 1.0);
+                crate::object::js_object_set_field_by_name(obj, b, 2.0);
+                super::super::descriptor_state::set_property_attrs(
+                    obj as usize,
+                    "a".to_string(),
+                    super::super::descriptor_state::PropertyAttrs::new(false, enumerable, true),
+                );
+
+                assert_eq!(js_object_delete_field(obj, a), 1);
+                assert!(
+                    super::super::descriptor_state::get_property_attrs(obj as usize, "a").is_none(),
+                    "a successful delete must discard the deleted key's attributes"
+                );
+                crate::object::js_object_set_field_by_name(obj, a, 9.0);
+                assert_eq!(
+                    crate::object::js_object_get_field_by_name(obj, a).bits(),
+                    9.0f64.to_bits(),
+                    "assignment must recreate the deleted property"
+                );
+                assert_eq!(
+                    crate::object::js_object_get_field_by_name(obj, b).bits(),
+                    2.0f64.to_bits(),
+                    "deleting a must preserve b"
+                );
+                let keys = crate::object::js_object_keys(obj);
+                assert_eq!(crate::array::js_array_length(keys), 2);
+                assert!(unsafe {
+                    crate::string::js_string_key_matches(crate::array::js_array_get(keys, 0), b)
+                });
+                assert!(unsafe {
+                    crate::string::js_string_key_matches(crate::array::js_array_get(keys, 1), a)
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn deleting_nonconfigurable_read_only_data_keeps_the_descriptor() {
+        let _lock = crate::gc::global_side_table_test_lock();
+        let obj = crate::object::js_object_alloc(0, 8);
+        let key = crate::string::js_string_from_bytes(b"locked".as_ptr(), 6);
+        crate::object::js_object_set_field_by_name(obj, key, 7.0);
+        super::super::descriptor_state::set_property_attrs(
+            obj as usize,
+            "locked".to_string(),
+            super::super::descriptor_state::PropertyAttrs::new(false, true, false),
+        );
+
+        assert_eq!(js_object_delete_field(obj, key), 0);
+        assert_eq!(
+            crate::object::js_object_get_field_by_name(obj, key).bits(),
+            7.0f64.to_bits()
+        );
+        let attrs = super::super::descriptor_state::get_property_attrs(obj as usize, "locked")
+            .expect("refused delete must preserve the descriptor");
+        assert!(!attrs.writable());
+        assert!(!attrs.configurable());
+    }
+}
+
 /// Gate for O(1) tombstone deletes (`PERRY_OBJECT_TOMBSTONES`).
 /// The default and its rationale live beside the environment parsing below.
 fn object_tombstone_deletes_enabled() -> bool {
@@ -1537,7 +1742,7 @@ fn object_tombstone_deletes_enabled() -> bool {
         return forced;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
+    *crate::once_init::get_or_init(&ON, || {
         // DEFAULT-ON again (#9038's 6.5x populated-delete win). #9212 made
         // this opt-in because of #9200 — an unarmed successor descriptor let
         // an evacuating minor sweep a deleted receiver's live keys array —

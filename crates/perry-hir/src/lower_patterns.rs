@@ -1396,41 +1396,23 @@ pub(crate) fn pre_scan_node_http_client_request_socket_params(
     arrow.params.first().and_then(pat_ident_name)
 }
 
-/// Detect if an expression represents a native handle instance (Big, Decimal, etc.)
-/// Returns the module name if it does.
+/// Detect if an expression represents a native handle instance recognized
+/// by hardcoded class name.
 ///
-/// A user `class Big {...}` (or `Decimal`, etc.) in the current module shadows
-/// the hardcoded library-name mapping — without that gate `class Big { f0=0; }
-/// const b = new Big(); b.f0` returned 0 because the value was routed through
-/// big.js's handle-based dispatch.
-///
-/// #10439: those two "is it a local class" checks are not the only way this
-/// name can mean something other than the native handle. `Big`/`Decimal`/
-/// `BigNumber`/`LRUCache`/`Command` are exactly the names commander,
-/// lru-cache, decimal.js and big.js/bignumber.js export themselves, so an
-/// import of the REAL package — resolved to real source because the user
-/// listed it in `perry.compilePackages` — hits this same match arm with
-/// nothing local to shadow it. Chasing the fix-lineage precedent (#10589/
-/// #10608 for an imported plain-function ctor, #10623/#10636 for a
-/// require()-destructured native base): decide by what the identifier
-/// resolves to, not by its spelling. `is_native_module` (consulted when this
-/// module's imports were lowered) already returns `false` for a
-/// compilePackages-compiled specifier, so a genuinely compiled `Decimal`/
-/// `Command`/`LRUCache` was never handed to `register_native_module`, and
-/// `lookup_native_module` reports that honestly — the same positive-evidence
-/// discipline `ident_may_start_native_method_call` and
-/// `native_class_from_factory_call` already apply for the sibling shapes
-/// just below in `expr_call/static_and_instance.rs`. A name with no native
-/// import at all (a bare same-named user function, or an import of an
-/// unrelated module) is rejected for the same reason: genuine Big / Decimal /
-/// BigNumber / LRUCache / Command usage is always reached through an import
-/// of the real package.
+/// Currently a stub that always returns `None` for `new Ident(...)`: every
+/// name this function used to recognize (Big/Decimal/BigNumber, then
+/// LRUCache/Command) has had its native binding removed (#10684, #10708,
+/// #10712). Kept — rather than deleted along with its callers — because the
+/// shape (hardcoded-name lookup with a local-class shadow guard, decided by
+/// import provenance per #10439, matching the sibling logic in
+/// `expr_call/static_and_instance.rs`) is the one future hardcoded-name
+/// native classes should reuse; deleting it now would just require
+/// re-deriving the same shadow-guard discipline from scratch later.
 pub(crate) fn detect_native_instance_expr(
     ctx: &LoweringContext,
     expr: &ast::Expr,
 ) -> Option<&'static str> {
     match expr {
-        // new Big(...) / new Decimal(...) / new BigNumber(...)
         ast::Expr::New(new_expr) => {
             if let ast::Expr::Ident(ident) = new_expr.callee.as_ref() {
                 let class_name = ident.sym.as_ref();
@@ -1439,16 +1421,7 @@ pub(crate) fn detect_native_instance_expr(
                 {
                     return None;
                 }
-                let module = match class_name {
-                    "Big" => "big.js",
-                    "Decimal" => "decimal.js",
-                    "BigNumber" => "bignumber.js",
-                    _ => return None,
-                };
-                match ctx.lookup_native_module(class_name) {
-                    Some((m, _)) if m == module => Some(module),
-                    _ => None,
-                }
+                None
             } else {
                 None
             }

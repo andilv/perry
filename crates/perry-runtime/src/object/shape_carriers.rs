@@ -46,7 +46,9 @@ fn stable_target_resolves(entry: TransitionEntry) -> bool {
             return false;
         }
         let keys = entry.next_keys as *const ArrayHeader;
-        if (*keys).length != expected_len || (*keys).length > (*keys).capacity {
+        // The target is the backing's first `expected_len` keys; a canonical
+        // backing that grew past them since (its tip) still holds them.
+        if (*keys).length < expected_len || (*keys).length > (*keys).capacity {
             return false;
         }
     }
@@ -76,7 +78,7 @@ pub(crate) fn recompute_after_full_trace() {
             note_shape_id(entry.runtime_shape_id);
         }
     }
-    for &(keys, runtime_shape_id) in state.object_hot.shape_cache_overflow.borrow().values() {
+    for &(keys, runtime_shape_id, _) in state.object_hot.shape_cache_overflow.borrow().values() {
         if !keys.is_null() {
             note_shape_id(runtime_shape_id);
         }

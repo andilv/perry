@@ -71,8 +71,26 @@ LEDGER = Path("scripts/native_result_ledger.tsv")
 # specifiers, so rows fall by twice the provider count). 349 -> 314 rows and
 # 300 -> 279 providers; each figure is what the script reports on the
 # resolved tree, not arithmetic (#10739).
-EXPECTED_ROWS = 314
-EXPECTED_PROVIDERS = 279
+#
+# +7 rows / +7 providers (#11068): the previously unreachable ioredis
+# `setex`, `ping`, and hash-command methods now have native-table rows. Each
+# provider returns its newly allocated Promise pointer, matching the existing
+# ioredis command rows. 314 -> 321 rows and 279 -> 286 providers.
+#
+# -12 rows / -12 providers (#10704): removing decimal.js/big.js/
+# bignumber.js dropped the 12 NR_HANDLE_ID-classified js_decimal_*
+# providers from the ledger (abs/ceil/div_value/floor/minus_value/
+# mod_value/neg/plus_value/pow/round/sqrt/times_value) along with
+# their table rows in the deleted native_table/async_decimal.rs. The
+# other ~13 js_decimal_* runtime symbols the old table declared
+# (cmp/eq/gt/lt variants, to_string, from_number, etc.) returned
+# NR_F64/NR_JS_VALUE-ish kinds this ledger never classified, so they
+# don't move this count. 321 -> 309 rows and 286 -> 274
+# providers; each figure is what the script reports on the resolved
+# tree, not arithmetic (#10739 -- these are CHAINED ABSOLUTES, so the
+# base moved when #11068 landed and the delta had to be re-derived).
+EXPECTED_ROWS = 309
+EXPECTED_PROVIDERS = 274
 KINDS = {
     "NR_GCPTR",
     "NR_NULLABLE_GCPTR",

@@ -1919,6 +1919,23 @@ pub unsafe extern "C-unwind" fn js_native_call_method(
         return result;
     }
 
+    // #10943: an own property BEATS the builtin. Every kind dispatcher below
+    // resolves a method by NAME against the receiver's kind — a Map's `get`, a
+    // Date's `getTime` — and none of them consults the receiver's own
+    // properties, so `const m = new Map(); m.get = () => 1; m.get()` ran
+    // `Map.prototype.get`. Reflection already disagreed with the call:
+    // `typeof`, `hasOwnProperty` and `Object.keys` all see the own property.
+    //
+    // Resolved and called HERE, in Get-then-Call order, the way the Proxy arm
+    // above does it. A BORROWED builtin (`m.get = Map.prototype.get`) is not a
+    // user method and falls through to the native arms — dispatching it by
+    // name again is how an earlier attempt recursed until the stack ran out.
+    if let Some(result) =
+        crate::object::own_override::call_own_user_method(object(), method_name, &refreshed_args())
+    {
+        return result;
+    }
+
     if let Some(r) = primitive_methods::dispatch_primitive(
         &root_scope,
         &object_handle,

@@ -1,15 +1,15 @@
-//! rustls client config + handshake for `tls.connect` and the
-//! `socket.upgradeToTLS` mid-stream upgrade. Split out of `lib.rs` (#1852)
-//! to keep that file under the 2000-line gate; the logic is unchanged.
+//! rustls client config for `tls.connect` and the `socket.upgradeToTLS`
+//! mid-stream upgrade. Split out of `lib.rs` (#1852) to keep that file under
+//! the 2000-line gate. The handshake itself runs over the socket's turnloop
+//! handle (`turnloop_tls_io`).
 
 use std::sync::{Arc, Mutex, OnceLock};
 
 use perry_ffi::{js_array_get, js_array_length, ArrayHeader, JsValue};
-use tokio::net::TcpStream;
-use tokio_rustls::rustls::client::danger::{
-    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
-};
-use tokio_rustls::{client::TlsStream, rustls, TlsConnector};
+// `rustls` is this crate's own direct dependency — the same rustls 0.23
+// `turnloop-tls` re-exports, which is why the config types unify with
+// `turnloop_tls_io`'s `Arc<rustls::ClientConfig>`.
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 
 #[derive(Clone, Default)]
 pub(crate) struct TlsClientConfigData {
@@ -19,6 +19,28 @@ pub(crate) struct TlsClientConfigData {
     alpn_protocols: Vec<Vec<u8>>,
     version_mask: i32,
     custom_identity: bool,
+}
+
+impl TlsClientConfigData {
+    /// The configuration an **in-process** caller needs: an ALPN list, and
+    /// everything else left at the platform default.
+    ///
+    /// Every other constructor reads JS values (`ca`, `cert`, `key`,
+    /// `secureContext`), which a caller with no options object cannot produce.
+    /// `http2.connect('https://…')` is that caller: it has an authority and a
+    /// protocol requirement and nothing else, and before this it had no way to
+    /// say so — which is the whole reason `turnloop_tls_io` exposed only a
+    /// server installer.
+    pub(crate) fn for_alpn(alpn_protocols: Vec<Vec<u8>>, ca: Vec<Vec<u8>>) -> Self {
+        Self {
+            alpn_protocols,
+            // `None` and `Some(vec![])` are different answers: `None` keeps the
+            // platform roots, an empty explicit list would trust nothing. Node
+            // draws the same line for an absent `ca`.
+            ca: (!ca.is_empty()).then_some(ca),
+            ..Self::default()
+        }
+    }
 }
 
 fn pending_tls_aborts() -> &'static Mutex<std::collections::HashSet<i64>> {
@@ -36,18 +58,21 @@ pub(crate) fn fire_pending_tls_abort(handle: i64) {
 /// Node reports an already-aborted connect asynchronously, after callers have
 /// had a chance to attach `error` and `close` listeners to the returned socket.
 unsafe fn schedule_tls_abort(handle: i64) {
-    // An alloc-only SocketState normally has `pending_rx: Some` and is not
-    // considered live by ext-net until connect() consumes that receiver. This
-    // TLS fast path never starts connect(), so mark the synthetic socket live
-    // until its deferred Close event removes it from the registry.
+    // An alloc-only SocketState is `awaiting_connect` and is not considered
+    // live by ext-net until connect() runs. This TLS fast path never starts
+    // connect(), so mark the synthetic socket live until its deferred Close
+    // event removes it from the registry.
     if let Some(socket) = crate::statics::sockets().lock().unwrap().get_mut(&handle) {
         socket.is_open = true;
     }
     pending_tls_aborts().lock().unwrap().insert(handle);
-    perry_ffi::spawn_async(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        fire_pending_tls_abort(handle);
-    });
+    // A deadline on the loop, not a timer task: registering a `'close'`
+    // listener fires the abort early (`js_net_socket_on`), and whichever comes
+    // first wins because `fire_pending_tls_abort` removes the entry.
+    crate::turnloop_io::arm_deadline(
+        25,
+        crate::turnloop_io::Deadline::TlsAbort { socket_id: handle },
+    );
 }
 
 pub(crate) fn begin_tls_upgrade(
@@ -56,21 +81,47 @@ pub(crate) fn begin_tls_upgrade(
     verify: bool,
     config: TlsClientConfigData,
 ) -> Result<(), String> {
-    let cmd_tx = crate::statics::sockets()
-        .lock()
-        .unwrap()
-        .get(&handle)
-        .map(|socket| socket.cmd_tx.clone())
-        .ok_or_else(|| "socket is closed".to_string())?;
-    let (reply, _reply_rx) = tokio::sync::oneshot::channel();
-    cmd_tx
-        .send(crate::SocketCommand::UpgradeTls {
-            servername,
-            verify,
-            config,
-            reply,
-        })
-        .map_err(|_| "socket task is gone".to_string())
+    let (turnloop, awaiting_connect) = {
+        let sockets = crate::statics::sockets().lock().unwrap();
+        let socket = sockets
+            .get(&handle)
+            .ok_or_else(|| "socket is closed".to_string())?;
+        (socket.turnloop, socket.awaiting_connect)
+    };
+    if !turnloop {
+        // A `new net.Socket()` that has not been asked to connect accepts the
+        // request and drops it, as every command it is given before connecting
+        // is dropped (`SocketState::awaiting_connect`); one whose connect was
+        // refused has nothing to put a session on.
+        return if awaiting_connect {
+            Ok(())
+        } else {
+            Err("socket task is gone".to_string())
+        };
+    }
+    // The session is installed above the same turnloop handle. No reply
+    // channel: JS learns the outcome from `'secureConnect'` / `'error'`, which
+    // is what this caller (`tls.connect` after a plain connect) already
+    // listened for. It runs on the loop's owner; a failure there is reported
+    // the way the caller reports one it gets back from here.
+    if crate::turnloop_io::enabled() {
+        return crate::turnloop_tls_io::begin_client_upgrade(
+            handle, servername, verify, config, None,
+        );
+    }
+    let posted = crate::turnloop_io::post_to_owner(Box::new(move || {
+        if let Err(error) =
+            crate::turnloop_tls_io::begin_client_upgrade(handle, servername, verify, config, None)
+        {
+            crate::push_event(crate::PendingNetEvent::Error(handle, error));
+            crate::push_event(crate::PendingNetEvent::Close(handle));
+        }
+    }));
+    if posted {
+        Ok(())
+    } else {
+        Err(crate::turnloop_io::NO_LOOP_CODE.to_string())
+    }
 }
 
 unsafe fn is_array(value: f64) -> bool {
@@ -299,7 +350,7 @@ impl ServerCertVerifier for NodeConfiguredCaVerifier {
     ) -> Result<ServerCertVerified, rustls::Error> {
         if self.custom_identity {
             let parsed = rustls::server::ParsedCertificate::try_from(end_entity)?;
-            let provider = rustls::crypto::aws_lc_rs::default_provider();
+            let provider = rustls::crypto::ring::default_provider();
             match rustls::client::verify_server_cert_signed_by_trust_anchor(
                 &parsed,
                 &self.roots,
@@ -365,19 +416,22 @@ impl ServerCertVerifier for NodeConfiguredCaVerifier {
     }
 }
 
-fn build_tls_connector(
+/// The rustls client configuration Node's options describe. `turnloop_tls_io`
+/// drives its unbuffered session with it directly; splitting it out of the old
+/// `TlsConnector` path is what let a turnloop socket be upgraded at all.
+pub(crate) fn build_client_config(
     verify: bool,
     data: Option<&TlsClientConfigData>,
-) -> Result<TlsConnector, String> {
+) -> Result<Arc<rustls::ClientConfig>, String> {
     // rustls panics resolving the process-level CryptoProvider when both
     // `ring` and `aws-lc-rs` end up in the dep graph. Server paths install
     // one before their first handshake; a client-only program (no tls/https
     // server) reached `ClientConfig::builder()` with none installed once
     // #4971 made `tls.connect` actually resolve its host. Idempotent —
     // `install_default` errors (ignored) if a provider is already set.
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let _ = rustls::crypto::ring::default_provider().install_default();
     if !verify {
-        return build_tls_connector_insecure(data);
+        return build_client_config_insecure(data);
     }
     let mut root_store = rustls::RootCertStore::empty();
     if let Some(ca) = data.and_then(|data| data.ca.as_ref()) {
@@ -404,7 +458,7 @@ fn build_tls_connector(
     };
     let versions = protocol_versions(data.map_or(0b11, |data| data.version_mask));
     let builder = rustls::ClientConfig::builder_with_provider(
-        rustls::crypto::aws_lc_rs::default_provider().into(),
+        rustls::crypto::ring::default_provider().into(),
     )
     .with_protocol_versions(&versions)
     .map_err(|error| format!("tls protocol versions: {error}"))?
@@ -424,7 +478,7 @@ fn build_tls_connector(
             .dangerous()
             .set_certificate_verifier(Arc::new(verifier));
     }
-    Ok(TlsConnector::from(Arc::new(config)))
+    Ok(Arc::new(config))
 }
 
 fn client_auth_material(
@@ -445,9 +499,9 @@ fn client_auth_material(
     Some((certs, key))
 }
 
-fn build_tls_connector_insecure(
+fn build_client_config_insecure(
     data: Option<&TlsClientConfigData>,
-) -> Result<TlsConnector, String> {
+) -> Result<Arc<rustls::ClientConfig>, String> {
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
     use rustls::{DigitallySignedStruct, SignatureScheme};
 
@@ -498,7 +552,7 @@ fn build_tls_connector_insecure(
 
     let versions = protocol_versions(data.map_or(0b11, |data| data.version_mask));
     let builder = rustls::ClientConfig::builder_with_provider(
-        rustls::crypto::aws_lc_rs::default_provider().into(),
+        rustls::crypto::ring::default_provider().into(),
     )
     .with_protocol_versions(&versions)
     .map_err(|error| format!("tls protocol versions: {error}"))?
@@ -514,112 +568,118 @@ fn build_tls_connector_insecure(
     if let Some(data) = data {
         config.alpn_protocols = data.alpn_protocols.clone();
     }
-    Ok(TlsConnector::from(Arc::new(config)))
+    Ok(Arc::new(config))
 }
 
-pub(crate) async fn do_tls_handshake(
-    tcp: TcpStream,
-    servername: &str,
-    verify: bool,
-    data: Option<&TlsClientConfigData>,
-) -> Result<TlsStream<TcpStream>, String> {
-    let connector = if verify {
-        build_tls_connector(true, data)?
-    } else {
-        build_tls_connector_insecure(data)?
-    };
-    let server_name = rustls::pki_types::ServerName::try_from(servername.to_string())
-        .map_err(|e| format!("invalid servername '{}': {}", servername, e))?;
-    connector
-        .connect(server_name, tcp)
-        .await
-        .map_err(|e| format!("tls handshake: {}", e))
+/// The handshake outcome a socket publishes to JS, read out of the turnloop
+/// path's unbuffered session: what `socket.authorized` / `getProtocol()` /
+/// `getPeerCertificate()` report.
+pub(crate) struct HandshakeFacts {
+    protocol: &'static str,
+    alpn: Vec<u8>,
+    peer: Vec<u8>,
+    own_certificate: Vec<u8>,
+    authorized: bool,
+    servername: String,
 }
 
-pub(crate) fn record_tls_handshake(
-    handle: i64,
-    stream: &TlsStream<TcpStream>,
-    servername: &str,
-    verify: bool,
-    data: Option<&TlsClientConfigData>,
-) {
-    let connection = stream.get_ref().1;
-    let protocol = match connection.protocol_version() {
-        Some(rustls::ProtocolVersion::TLSv1_2) => "TLSv1.2",
-        Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3",
-        _ => "",
-    };
-    let alpn = connection.alpn_protocol().unwrap_or_default();
-    let peer = connection
-        .peer_certificates()
-        .and_then(|certs| certs.first())
-        .map(|cert| cert.as_ref())
-        .unwrap_or_default();
-    let trusted_by_configured_ca =
-        data.and_then(|data| data.ca.as_ref())
-            .is_some_and(|materials| {
-                materials.iter().any(|material| {
-                    let mut cursor = std::io::Cursor::new(material);
-                    let trusted = rustls_pemfile::certs(&mut cursor)
-                        .flatten()
-                        .any(|cert| cert.as_ref() == peer);
-                    trusted
-                })
-            });
-    let authorized = verify || trusted_by_configured_ca;
-    let authorization_error = if authorized {
-        ""
-    } else {
-        "DEPTH_ZERO_SELF_SIGNED_CERT"
-    };
-    if let Some(socket) = crate::statics::sockets().lock().unwrap().get_mut(&handle) {
-        socket.tls.encrypted = true;
-        socket.tls.authorized = authorized;
-        socket.tls.servername = Some(servername.to_string());
+impl HandshakeFacts {
+    pub(crate) fn from_session(
+        session: &crate::turnloop_tls::TlsSession,
+        servername: &str,
+        verify: bool,
+        data: Option<&TlsClientConfigData>,
+    ) -> Self {
+        let peer = session
+            .peer_certificates()
+            .and_then(|chain| chain.into_iter().next())
+            .unwrap_or_default();
+        Self {
+            protocol: session.protocol_version(),
+            alpn: session.alpn_protocol().unwrap_or_default(),
+            authorized: verify || trusted_by_configured_ca(data, &peer),
+            peer,
+            own_certificate: own_certificate(data),
+            servername: servername.to_string(),
+        }
     }
-    let own_certificate = data
-        .map(|data| {
-            let mut cursor = std::io::Cursor::new(&data.cert);
-            let certificate = rustls_pemfile::certs(&mut cursor)
-                .flatten()
-                .next()
-                .map(|cert| cert.as_ref().to_vec())
-                .unwrap_or_default();
-            certificate
+
+    /// Write the facts onto the socket and tell JS through the runtime's
+    /// `js_tls_client_record_connected` extern.
+    pub(crate) fn publish(&self, handle: i64) {
+        let authorization_error = if self.authorized {
+            ""
+        } else {
+            "DEPTH_ZERO_SELF_SIGNED_CERT"
+        };
+        if let Some(socket) = crate::statics::sockets().lock().unwrap().get_mut(&handle) {
+            socket.tls.encrypted = true;
+            socket.tls.authorized = self.authorized;
+            socket.tls.servername = Some(self.servername.clone());
+        }
+        extern "C" {
+            fn js_tls_client_record_connected(
+                handle: i64,
+                authorized: i32,
+                authorization_error_ptr: *const u8,
+                authorization_error_len: usize,
+                protocol_ptr: *const u8,
+                protocol_len: usize,
+                alpn_ptr: *const u8,
+                alpn_len: usize,
+                peer_cert_ptr: *const u8,
+                peer_cert_len: usize,
+                own_cert_ptr: *const u8,
+                own_cert_len: usize,
+            );
+        }
+        // SAFETY: every pointer/length pair below borrows a live local for the
+        // duration of the call; the runtime copies what it keeps.
+        unsafe {
+            js_tls_client_record_connected(
+                handle,
+                self.authorized as i32,
+                authorization_error.as_ptr(),
+                authorization_error.len(),
+                self.protocol.as_ptr(),
+                self.protocol.len(),
+                self.alpn.as_ptr(),
+                self.alpn.len(),
+                self.peer.as_ptr(),
+                self.peer.len(),
+                self.own_certificate.as_ptr(),
+                self.own_certificate.len(),
+            );
+        }
+    }
+}
+
+/// Node treats a peer certificate that the caller itself supplied as `ca` as
+/// authorized even when verification was disabled.
+fn trusted_by_configured_ca(data: Option<&TlsClientConfigData>, peer: &[u8]) -> bool {
+    data.and_then(|data| data.ca.as_ref())
+        .is_some_and(|materials| {
+            materials.iter().any(|material| {
+                let mut cursor = std::io::Cursor::new(material);
+                let trusted = rustls_pemfile::certs(&mut cursor)
+                    .flatten()
+                    .any(|cert| cert.as_ref() == peer);
+                trusted
+            })
         })
-        .unwrap_or_default();
-    extern "C" {
-        fn js_tls_client_record_connected(
-            handle: i64,
-            authorized: i32,
-            authorization_error_ptr: *const u8,
-            authorization_error_len: usize,
-            protocol_ptr: *const u8,
-            protocol_len: usize,
-            alpn_ptr: *const u8,
-            alpn_len: usize,
-            peer_cert_ptr: *const u8,
-            peer_cert_len: usize,
-            own_cert_ptr: *const u8,
-            own_cert_len: usize,
-        );
-    }
-    unsafe {
-        js_tls_client_record_connected(
-            handle,
-            authorized as i32,
-            authorization_error.as_ptr(),
-            authorization_error.len(),
-            protocol.as_ptr(),
-            protocol.len(),
-            alpn.as_ptr(),
-            alpn.len(),
-            peer.as_ptr(),
-            peer.len(),
-            own_certificate.as_ptr(),
-            own_certificate.len(),
-        );
-    }
+}
+
+fn own_certificate(data: Option<&TlsClientConfigData>) -> Vec<u8> {
+    data.map(|data| {
+        let mut cursor = std::io::Cursor::new(&data.cert);
+        let certificate = rustls_pemfile::certs(&mut cursor)
+            .flatten()
+            .next()
+            .map(|cert| cert.as_ref().to_vec())
+            .unwrap_or_default();
+        certificate
+    })
+    .unwrap_or_default()
 }
 
 // ─── FFI: tls.connect ────────────────────────────────────────────────────────

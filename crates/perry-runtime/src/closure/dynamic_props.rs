@@ -66,7 +66,7 @@ impl ClosureProps {
                 strings.push((key.clone(), value));
             }
         }
-        indexed.sort_by_key(|(index, _, _)| *index);
+        crate::cold_sort::sort_by_key(&mut indexed, |(index, _, _)| *index);
         indexed
             .into_iter()
             .map(|(_, key, value)| (key, value))
@@ -92,7 +92,7 @@ per_test_global! {
 }
 
 fn get_closure_props() -> &'static Mutex<PtrHashMap<usize, ClosureProps>> {
-    CLOSURE_PROPS.get_or_init(|| Mutex::new(new_ptr_hash_map()))
+    crate::once_init::get_or_init(&CLOSURE_PROPS, || Mutex::new(new_ptr_hash_map()))
 }
 
 #[cfg(feature = "wasm-host")]
@@ -105,7 +105,7 @@ per_test_global! {
 
 #[cfg(feature = "wasm-host")]
 fn get_wasm_funcref_externals() -> &'static Mutex<PtrHashMap<usize, usize>> {
-    WASM_FUNCREF_EXTERNALS.get_or_init(|| Mutex::new(new_ptr_hash_map()))
+    crate::once_init::get_or_init(&WASM_FUNCREF_EXTERNALS, || Mutex::new(new_ptr_hash_map()))
 }
 
 #[cfg(feature = "wasm-host")]
@@ -208,7 +208,7 @@ per_test_global! {
 }
 
 fn get_closure_deleted_keys() -> &'static Mutex<PtrHashMap<usize, HashSet<String>>> {
-    CLOSURE_DELETED_KEYS.get_or_init(|| Mutex::new(new_ptr_hash_map()))
+    crate::once_init::get_or_init(&CLOSURE_DELETED_KEYS, || Mutex::new(new_ptr_hash_map()))
 }
 
 /// Record that `key` was `delete`d off the closure at `ptr`.
@@ -261,7 +261,10 @@ per_test_global! {
 }
 
 fn get_closure_prototypes() -> &'static Mutex<PtrHashMap<usize, u64>> {
-    CLOSURE_STATIC_PROTOTYPES.get_or_init(|| Mutex::new(new_ptr_hash_map()))
+    crate::once_init::get_or_init(
+        &CLOSURE_STATIC_PROTOTYPES,
+        || Mutex::new(new_ptr_hash_map()),
+    )
 }
 
 /// Record `Object.setPrototypeOf(closure_ptr, proto)`. `proto_bits` is the
@@ -498,6 +501,18 @@ pub(crate) fn visit_closure_dynamic_prop_values_mut(owner: usize, mut visit: imp
         visit(value);
     }
 
+    // `visit` may rewrite an old value to a nursery/survivor address. This
+    // path temporarily removes the entry, so the ordinary setter's pre-publish
+    // young-log note does not cover the rewritten value. Re-arm the log before
+    // putting the entry back; otherwise the next minor-scoped root walk skips
+    // the new pointer (#11117).
+    let relevant_value_bits = owner_props
+        .values
+        .values()
+        .map(|value| value.to_bits())
+        .find(|bits| crate::gc::young_log::bits_are_minor_relevant(*bits))
+        .unwrap_or(0);
+    note_young_closure_owner(owner, relevant_value_bits);
     if let Ok(mut props) = get_closure_props().lock() {
         merge_closure_prop_map(&mut props, owner, owner_props);
     }
@@ -538,6 +553,7 @@ pub(crate) fn visit_closure_static_prototype_slot_mut(
     // The visit can forward the owner itself (self-referential
     // prototype); re-key like the roots scanner does.
     let new_owner = forwarded_heap_owner(owner).unwrap_or(owner);
+    note_young_closure_owner(new_owner, proto_bits);
     if let Ok(mut prototypes) = get_closure_prototypes().lock() {
         prototypes.insert(new_owner, proto_bits);
     }

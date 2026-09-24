@@ -20,12 +20,12 @@
 //! `NativeModSig` rows live in
 //! `perry-codegen/src/lower_call/native_table/net_events.rs`.
 
-use perry_ffi::{alloc_string, nanbox_string_bits, ArrayHeader, JsValue, StringHeader};
+use perry_ffi::{
+    alloc_buffer, alloc_string, nanbox_string_bits, ArrayHeader, JsValue, StringHeader,
+};
 use std::collections::HashSet;
-use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use tokio::io::AsyncWriteExt;
 
 use crate::statics;
 use crate::string_from_header_i64;
@@ -56,6 +56,23 @@ fn nanbox_bool(b: bool) -> f64 {
 
 fn nanbox_undefined() -> f64 {
     f64::from_bits(TAG_UNDEFINED_BITS)
+}
+
+/// Paused-mode `net.Socket.read()`: return the next buffered chunk, or the
+/// Node sentinel `null` when no data is currently available.
+#[no_mangle]
+pub unsafe extern "C" fn js_ext_net_socket_read(handle: i64, _size: f64) -> f64 {
+    let Some(bytes) = crate::server_state::take_pending_socket_data(handle) else {
+        return f64::from_bits(JsValue::NULL.bits());
+    };
+    let buffer = alloc_buffer(&bytes);
+    f64::from_bits(0x7FFD_0000_0000_0000 | (buffer as u64 & 0x0000_FFFF_FFFF_FFFF))
+}
+
+/// Typed native-table calls use the provider-neutral symbol name.
+#[no_mangle]
+pub unsafe extern "C" fn js_net_socket_read(handle: i64, size: f64) -> f64 {
+    js_ext_net_socket_read(handle, size)
 }
 
 /// Main-thread custody for write/end callbacks awaiting socket-task I/O.
@@ -133,7 +150,7 @@ pub unsafe extern "C" fn js_net_socket_get_pending(handle: i64) -> f64 {
     //
     // Deliberately keyed on `has_opened`/`destroyed`, NOT `is_open`:
     // `is_open` flips false via `server_state::mark_socket_closed`, called
-    // from the tokio task thread as soon as teardown STARTS (before the main
+    // from the completion sink as soon as teardown STARTS (before the main
     // thread has processed the `'end'`/`'close'` events that same teardown
     // just queued), while `destroyed` only flips at `'close'`-processing
     // time — the one point that actually agrees with Node's own timing (see
@@ -405,19 +422,96 @@ pub unsafe extern "C" fn js_net_socket_get_remote_family(handle: i64) -> f64 {
 }
 
 /// `socket.bufferSize` — Node reports `undefined` for an unconnected socket
-/// and `0` (plus any internally buffered writes) once connected. We surface
-/// `undefined` while closed, `0` while open.
+/// and `writableLength` once connected (its getter is literally
+/// `this._handle ? this.writableLength : undefined`).
 ///
 /// # Safety
 ///
 /// See [`js_net_socket_get_pending`].
 #[no_mangle]
 pub unsafe extern "C" fn js_net_socket_get_buffer_size(handle: i64) -> f64 {
-    if with_socket(handle, false, |s| s.is_open) {
-        0.0
-    } else {
-        nanbox_undefined()
+    match with_socket(handle, None, |s| s.is_open.then_some(s.bytes_queued)) {
+        Some(queued) => queued as f64,
+        None => nanbox_undefined(),
     }
+}
+
+/// Node's default `writableHighWaterMark` for a byte stream
+/// (`stream.getDefaultHighWaterMark(false)`, 64 KiB since Node 22).
+pub(crate) const WRITABLE_HIGH_WATER_MARK: u64 = 64 * 1024;
+
+/// `socket.writableHighWaterMark` (#11111).
+///
+/// # Safety
+///
+/// See [`js_net_socket_get_pending`].
+#[no_mangle]
+pub unsafe extern "C" fn js_net_socket_get_writable_high_water_mark(_handle: i64) -> f64 {
+    WRITABLE_HIGH_WATER_MARK as f64
+}
+
+/// `socket.writableLength` — bytes `write()` accepted that have not left yet
+/// (#11111). `0` for a socket this registry no longer knows, as in Node once
+/// the stream is destroyed and its buffer cleared.
+///
+/// # Safety
+///
+/// See [`js_net_socket_get_pending`].
+#[no_mangle]
+pub unsafe extern "C" fn js_net_socket_get_writable_length(handle: i64) -> f64 {
+    with_socket(handle, 0u64, |s| s.bytes_queued) as f64
+}
+
+/// `socket.writableNeedDrain` — a `write()` returned `false` and `'drain'` has
+/// not fired since (#11111).
+///
+/// # Safety
+///
+/// See [`js_net_socket_get_pending`].
+#[no_mangle]
+pub unsafe extern "C" fn js_net_socket_get_writable_need_drain(handle: i64) -> f64 {
+    let need_drain = with_socket(handle, false, |s| s.need_drain);
+    f64::from_bits(perry_ffi::JsValue::from_bool(need_drain).bits())
+}
+
+/// Node's `write()` return value, judged the way `Writable.prototype.write`
+/// judges it (`writeOrBuffer`): the chunk is counted into `writableLength`
+/// FIRST, then `ret = writableLength < writableHighWaterMark`, and a `false`
+/// arms `writableNeedDrain` so the queue emptying emits `'drain'`. A write to
+/// a destroyed or ended socket is `false` as well.
+///
+/// Called right after the chunk was queued, so `bytes_queued` already holds
+/// it. `accepted` is false when the queueing itself failed.
+fn write_return_value(handle: i64, accepted: bool) -> f64 {
+    let ret = statics::sockets()
+        .lock()
+        .ok()
+        .and_then(|mut sockets| {
+            let s = sockets.get_mut(&handle)?;
+            if !accepted || s.destroyed || s.writable_ended {
+                return Some(false);
+            }
+            let below = s.bytes_queued < WRITABLE_HIGH_WATER_MARK;
+            if !below {
+                s.need_drain = true;
+            }
+            Some(below)
+        })
+        .unwrap_or(false);
+    f64::from_bits(perry_ffi::JsValue::from_bool(ret).bits())
+}
+
+/// Whether the queue just emptied with a `'drain'` owed (#11111): clears
+/// `need_drain` and reports true exactly once per `false` return. Node's
+/// `afterWrite` emits `'drain'` only while the stream is not ending and not
+/// destroyed, and before the completed writes' callbacks.
+pub(crate) fn take_drain(socket: &mut crate::SocketState) -> bool {
+    if socket.need_drain && socket.bytes_queued == 0 && !socket.writable_ended && !socket.destroyed
+    {
+        socket.need_drain = false;
+        return true;
+    }
+    false
 }
 
 /// `socket.autoSelectFamilyAttemptedAddresses` — Node reports `undefined`
@@ -465,70 +559,45 @@ pub unsafe extern "C" fn js_net_socket_get_auto_select_family_attempted_addresse
 ///
 /// `chunk_bits` must be a valid NaN-boxed JS value; string / Buffer pointers
 /// must reference live runtime allocations.
+///
+/// Returns Node's boolean `write()` result (#11111).
 #[no_mangle]
-pub unsafe extern "C" fn js_ext_net_socket_write(handle: i64, chunk_bits: i64) {
+pub unsafe extern "C" fn js_ext_net_socket_write(handle: i64, chunk_bits: i64) -> f64 {
     let bytes = match crate::jsvalue_to_socket_bytes(f64::from_bits(chunk_bits as u64)) {
         Some(b) => b,
-        None => return,
+        None => return write_return_value(handle, false),
     };
-    enqueue_socket_write(handle, bytes, 0);
+    let accepted = enqueue_socket_write(handle, bytes, 0);
+    write_return_value(handle, accepted)
 }
 
-fn enqueue_socket_write(handle: i64, bytes: Vec<u8>, completion: u64) {
+/// Queue `bytes`; false when the submission was refused (and reported).
+fn enqueue_socket_write(handle: i64, bytes: Vec<u8>, completion: u64) -> bool {
     let mut sockets = statics::sockets().lock().unwrap();
-    let failure = if let Some(s) = sockets.get_mut(&handle) {
-        let byte_len = bytes.len() as u64;
-        if s.cmd_tx
-            .send(crate::SocketCommand::Write(bytes, completion))
-            .is_err()
-        {
-            Some("Socket write failed")
-        } else {
-            s.bytes_queued = s.bytes_queued.saturating_add(byte_len);
-            None
-        }
-    } else {
-        Some("Socket is closed")
+    let (failure, turnloop) = match sockets.get_mut(&handle) {
+        Some(s) => (
+            s.command(handle, crate::SocketCommand::Write(bytes, completion))
+                .err(),
+            s.turnloop,
+        ),
+        None => (Some("Socket is closed".to_string()), false),
     };
     drop(sockets);
+    let Some(message) = failure else {
+        return true;
+    };
+    if turnloop {
+        // The driver refused the submission: report it as a write failure,
+        // including the 'error' + teardown.
+        crate::turnloop_io::submission_failed(handle, completion, message);
+        return false;
+    }
     if completion != 0 {
-        if let Some(message) = failure {
-            unsafe {
-                dispatch_socket_completion(completion, Some(message.to_string()));
-            }
+        unsafe {
+            dispatch_socket_completion(completion, Some(message));
         }
     }
-}
-
-fn record_socket_write_progress(handle: i64, written: usize) {
-    if written == 0 {
-        return;
-    }
-    if let Some(socket) = statics::sockets().lock().unwrap().get_mut(&handle) {
-        let written = written as u64;
-        socket.bytes_queued = socket.bytes_queued.saturating_sub(written);
-        socket.bytes_written = socket.bytes_written.saturating_add(written);
-    }
-}
-
-pub(crate) async fn write_socket_bytes(
-    transport: &mut crate::Transport,
-    handle: i64,
-    bytes: &[u8],
-) -> io::Result<()> {
-    let mut written = 0;
-    while written < bytes.len() {
-        let count = transport.write(&bytes[written..]).await?;
-        if count == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "failed to write socket bytes",
-            ));
-        }
-        written += count;
-        record_socket_write_progress(handle, count);
-    }
-    Ok(())
+    false
 }
 
 /// `socket.write(chunk)` under the name the static NATIVE_MODULE_TABLE path
@@ -541,6 +610,9 @@ pub(crate) async fn write_socket_bytes(
 /// See [`js_ext_net_socket_write`].
 #[no_mangle]
 pub unsafe extern "C" fn js_net_socket_write(handle: i64, chunk_bits: i64) {
+    // Deliberately `()`: the bundled stdlib twin of this shared name returns
+    // nothing, and a duplicate symbol must keep one signature. Callers that
+    // need `write()`'s boolean use the distinct `js_ext_net_socket_write*`.
     js_ext_net_socket_write(handle, chunk_bits);
 }
 
@@ -572,13 +644,17 @@ fn register_socket_completion(handle: i64, callback: i64) -> u64 {
 }
 
 /// Full Node overload for `socket.write(chunk[, encoding][, callback])`.
+///
+/// Returns Node's boolean result (#11111): `true` while `writableLength`
+/// stays under `writableHighWaterMark`, `false` once it reaches it — and a
+/// `false` is always followed by `'drain'` when the queue empties.
 #[no_mangle]
 pub unsafe extern "C" fn js_ext_net_socket_write3(
     handle: i64,
     chunk: f64,
     encoding_or_callback: f64,
     callback: f64,
-) {
+) -> f64 {
     let roots = perry_ffi::TransientRootScope::enter();
     let callback = roots.root_nanbox(callback);
     let encoding_or_callback = roots.root_nanbox(encoding_or_callback);
@@ -591,9 +667,10 @@ pub unsafe extern "C" fn js_ext_net_socket_write3(
                 Some("Invalid data passed to socket.write".to_string()),
             );
         }
-        return;
+        return write_return_value(handle, false);
     };
-    enqueue_socket_write(handle, bytes, completion);
+    let accepted = enqueue_socket_write(handle, bytes, completion);
+    write_return_value(handle, accepted)
 }
 
 /// `socket.end([data])` — optionally write a final chunk, then half-close the
@@ -629,16 +706,15 @@ pub unsafe extern "C" fn js_ext_net_socket_end(handle: i64, chunk_bits: i64) {
     if let Some(s) = sockets.get_mut(&handle) {
         if let Some(bytes) = final_bytes {
             if !bytes.is_empty() {
-                let byte_len = bytes.len() as u64;
-                if s.cmd_tx.send(crate::SocketCommand::Write(bytes, 0)).is_ok() {
-                    s.bytes_queued = s.bytes_queued.saturating_add(byte_len);
-                }
+                let _ = s.command(handle, crate::SocketCommand::Write(bytes, 0));
             }
         }
         // #10465 — `writableEnded` (and `writable`) flip as soon as `.end()`
         // is CALLED, per Node's docs, not once the FIN actually flushes.
         s.writable_ended = true;
-        let _ = s.cmd_tx.send(crate::SocketCommand::End(0));
+        // Routed through `command`, the one place that knows which thread
+        // owns the socket's loop.
+        let _ = s.command(handle, crate::SocketCommand::End(0));
     }
 }
 
@@ -686,20 +762,12 @@ pub unsafe extern "C" fn js_ext_net_socket_end3(
     let mut sockets = statics::sockets().lock().unwrap();
     if let Some(socket) = sockets.get_mut(&handle) {
         if let Some(bytes) = final_bytes.filter(|bytes| !bytes.is_empty()) {
-            let byte_len = bytes.len() as u64;
-            if socket
-                .cmd_tx
-                .send(crate::SocketCommand::Write(bytes, 0))
-                .is_ok()
-            {
-                socket.bytes_queued = socket.bytes_queued.saturating_add(byte_len);
-            }
+            let _ = socket.command(handle, crate::SocketCommand::Write(bytes, 0));
         }
         // #10465 — see the sibling note in `js_ext_net_socket_end`.
         socket.writable_ended = true;
         if socket
-            .cmd_tx
-            .send(crate::SocketCommand::End(completion))
+            .command(handle, crate::SocketCommand::End(completion))
             .is_err()
             && completion != 0
         {
@@ -740,7 +808,7 @@ pub extern "C" fn js_ext_net_destroy_socket(handle: i64) {
     if let Some(s) = sockets.get_mut(&handle) {
         s.destroyed = true;
         s.is_open = false;
-        let _ = s.cmd_tx.send(crate::SocketCommand::Destroy);
+        let _ = s.command(handle, crate::SocketCommand::Destroy);
     }
 }
 
@@ -1437,12 +1505,11 @@ mod tests {
     #[test]
     fn rejected_write_does_not_increase_bytes_written() {
         let handle = -91_238;
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        drop(rx);
+        // A socket whose connect never reached the loop refuses the write.
         statics::sockets()
             .lock()
             .unwrap()
-            .insert(handle, crate::SocketState::for_test(tx));
+            .insert(handle, crate::SocketState::for_test(false));
 
         enqueue_socket_write(handle, vec![1, 2, 3], 0);
         assert_eq!(unsafe { js_net_socket_get_bytes_written(handle) }, 0.0);
@@ -1453,19 +1520,132 @@ mod tests {
     #[test]
     fn bytes_written_includes_queue_then_keeps_only_dispatched_progress_on_close() {
         let handle = -91_239;
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        // A socket still waiting for `connect()` accepts and counts the write.
         statics::sockets()
             .lock()
             .unwrap()
-            .insert(handle, crate::SocketState::for_test(tx));
+            .insert(handle, crate::SocketState::for_test(true));
 
         enqueue_socket_write(handle, vec![1, 2, 3, 4], 0);
         assert_eq!(unsafe { js_net_socket_get_bytes_written(handle) }, 4.0);
-        record_socket_write_progress(handle, 2);
+        // Two bytes reached the wire (what the write sink records), two are
+        // still queued when the socket closes.
+        if let Some(socket) = statics::sockets().lock().unwrap().get_mut(&handle) {
+            socket.bytes_queued -= 2;
+            socket.bytes_written += 2;
+        }
         assert_eq!(unsafe { js_net_socket_get_bytes_written(handle) }, 4.0);
         crate::server_state::mark_socket_closed(handle);
         assert_eq!(unsafe { js_net_socket_get_bytes_written(handle) }, 2.0);
 
         statics::sockets().lock().unwrap().remove(&handle);
+    }
+
+    fn js_bool(b: bool) -> u64 {
+        JsValue::from_bool(b).bits()
+    }
+
+    /// #11111 — `write()` is Node's boolean, judged after the chunk is
+    /// counted, and a `false` arms `writableNeedDrain`.
+    #[test]
+    fn write_returns_node_boolean_against_the_high_water_mark() {
+        let handle = -91_240;
+        // Still waiting for `connect()`: writes are accepted and counted,
+        // which is exactly where Node's own `false` is deterministic.
+        statics::sockets()
+            .lock()
+            .unwrap()
+            .insert(handle, crate::SocketState::for_test(true));
+
+        let accepted = enqueue_socket_write(handle, vec![0; 5], 0);
+        assert_eq!(
+            write_return_value(handle, accepted).to_bits(),
+            js_bool(true)
+        );
+        assert_eq!(
+            unsafe { js_net_socket_get_writable_need_drain(handle) }.to_bits(),
+            js_bool(false)
+        );
+
+        let hwm = WRITABLE_HIGH_WATER_MARK as usize;
+        let accepted = enqueue_socket_write(handle, vec![0; hwm], 0);
+        assert_eq!(
+            write_return_value(handle, accepted).to_bits(),
+            js_bool(false),
+            "a chunk that reaches the high-water mark returns false"
+        );
+        assert_eq!(
+            unsafe { js_net_socket_get_writable_length(handle) },
+            (hwm + 5) as f64
+        );
+        assert_eq!(
+            unsafe { js_net_socket_get_writable_need_drain(handle) }.to_bits(),
+            js_bool(true)
+        );
+        assert_eq!(
+            unsafe { js_net_socket_get_writable_high_water_mark(handle) },
+            65536.0
+        );
+
+        statics::sockets().lock().unwrap().remove(&handle);
+    }
+
+    /// A refused write, or one after `end()`, is `false` — never `undefined`.
+    #[test]
+    fn refused_or_ended_writes_return_false() {
+        let handle = -91_241;
+        statics::sockets()
+            .lock()
+            .unwrap()
+            .insert(handle, crate::SocketState::for_test(false));
+        let accepted = enqueue_socket_write(handle, vec![1], 0);
+        assert!(!accepted, "a socket whose connect never started refuses");
+        assert_eq!(
+            write_return_value(handle, accepted).to_bits(),
+            js_bool(false)
+        );
+
+        if let Some(socket) = statics::sockets().lock().unwrap().get_mut(&handle) {
+            *socket = crate::SocketState::for_test(true);
+            socket.writable_ended = true;
+        }
+        let accepted = enqueue_socket_write(handle, vec![1], 0);
+        assert_eq!(
+            write_return_value(handle, accepted).to_bits(),
+            js_bool(false)
+        );
+
+        statics::sockets().lock().unwrap().remove(&handle);
+        assert_eq!(
+            write_return_value(handle, true).to_bits(),
+            js_bool(false),
+            "an unknown socket is false too"
+        );
+    }
+
+    /// `'drain'` is owed exactly once per `false`, only when the queue is
+    /// empty, and never once the writable side is ending or destroyed.
+    #[test]
+    fn drain_fires_once_when_the_queue_empties_and_not_after_end() {
+        let mut socket = crate::SocketState::for_test(true);
+        assert!(!take_drain(&mut socket), "no false return, no drain");
+
+        socket.need_drain = true;
+        socket.bytes_queued = 10;
+        assert!(!take_drain(&mut socket), "not while bytes are still queued");
+        socket.bytes_queued = 0;
+        assert!(take_drain(&mut socket));
+        assert!(
+            !socket.need_drain,
+            "writableNeedDrain clears with the event"
+        );
+        assert!(!take_drain(&mut socket), "exactly once");
+
+        socket.need_drain = true;
+        socket.writable_ended = true;
+        assert!(!take_drain(&mut socket), "Node skips 'drain' while ending");
+        socket.writable_ended = false;
+        socket.destroyed = true;
+        assert!(!take_drain(&mut socket), "or once destroyed");
     }
 }

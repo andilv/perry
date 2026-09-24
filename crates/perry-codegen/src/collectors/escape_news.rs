@@ -322,6 +322,7 @@ fn collect_used_new_fields_in_expr(
         | Expr::Await(operand)
         | Expr::Delete(operand)
         | Expr::StringCoerce(operand)
+        | Expr::TemplateStringCoerce(operand)
         | Expr::ObjectCoerce(operand)
         | Expr::BooleanCoerce(operand)
         | Expr::NumberCoerce(operand)
@@ -858,6 +859,7 @@ fn collect_used_new_fields_in_expr(
             headers,
             headers_dynamic,
             signal,
+            redirect,
         } => {
             collect_used_new_fields_in_expr(url, non_escaping_news, used);
             collect_used_new_fields_in_expr(method, non_escaping_news, used);
@@ -870,6 +872,9 @@ fn collect_used_new_fields_in_expr(
             }
             if let Some(s) = signal {
                 collect_used_new_fields_in_expr(s, non_escaping_news, used);
+            }
+            if let Some(r) = redirect {
+                collect_used_new_fields_in_expr(r, non_escaping_news, used);
             }
         }
         Expr::FetchGetWithAuth { url, auth_header } => {

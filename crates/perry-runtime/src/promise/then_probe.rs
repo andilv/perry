@@ -188,7 +188,8 @@ unsafe fn proto_signature(proto_addr: usize) -> Option<(usize, u32, u16, u32)> {
         return None;
     }
     let obj = proto_addr as *const ObjectHeader;
-    let keys = crate::object::object_keys_array(obj);
+    let keys_view = crate::object::object_keys(obj);
+    let keys = keys_view.arr();
     let keys_addr = keys as usize;
     let keys_len = if keys.is_null() {
         0
@@ -336,7 +337,8 @@ enum OwnScan {
 /// keys array holds every own data key — inline and overflow slots alike are
 /// indexed by position in it — so a full scan is a complete presence test.
 unsafe fn own_then_scan(obj: *const ObjectHeader) -> OwnScan {
-    let keys = crate::object::object_keys_array(obj);
+    let keys_view = crate::object::object_keys(obj);
+    let keys = keys_view.arr();
     if keys.is_null() {
         // No own named properties at all.
         return OwnScan::NoThen;
@@ -655,7 +657,7 @@ fn class_registry_inert(class_id: u32) -> bool {
 
 fn verify_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
+    *crate::once_init::get_or_init(&ON, || {
         matches!(
             std::env::var("PERRY_THENABLE_VERIFY").as_deref(),
             Ok("1") | Ok("on") | Ok("true")

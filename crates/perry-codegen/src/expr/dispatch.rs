@@ -28,6 +28,23 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
     // one. Handlers that care receive it as an argument, because they consult
     // it after lowering their operands — by which point the field is gone.
     let value_discarded = std::mem::take(&mut ctx.discard_this_expr);
+    // #10943: a receiver the call-site guard already materialised is RE-READ,
+    // never re-evaluated. The guard needs the receiver's value before it
+    // branches, and the lowering below it is handed the same expression — so
+    // without this, `make().get(k)` would call `make()` twice.
+    if let Some(value) =
+        crate::rooting::materialized_receiver_reread(ctx, expr as *const Expr as usize)
+    {
+        return Ok(value);
+    }
+    // #10943: HIR folds a builtin method call on a proven receiver into a
+    // dedicated node that lowers straight to the native helper, below the
+    // chain guard entirely. An own property still beats the builtin, so the
+    // same diamond is applied here, at the one place every folded node
+    // passes through.
+    if let Some(value) = super::folded_builtin_override::try_lower(ctx, expr)? {
+        return Ok(value);
+    }
     if let Some(value) = super::suffix_cursor::try_lower(ctx, expr)? {
         return Ok(value);
     }
@@ -142,6 +159,7 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         | Expr::MathMax(..)
         | Expr::MathMaxSpread(..)
         | Expr::StringCoerce(..)
+        | Expr::TemplateStringCoerce(..)
         | Expr::ObjectCoerce(..)
         | Expr::BooleanCoerce(..)
         | Expr::ArraySlice { .. }

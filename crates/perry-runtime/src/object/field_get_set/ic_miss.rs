@@ -1285,7 +1285,7 @@ pub(super) fn get_field_ic_miss_impl(
 #[inline]
 fn outlined_mru_hit_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
+    *crate::once_init::get_or_init(&ON, || {
         crate::gc::env_default_on_from_value(
             std::env::var("PERRY_IC_OUTLINE_FASTPATH").ok().as_deref(),
         )
@@ -1688,7 +1688,8 @@ fn private_evaluation_brand(value: f64, declaring_class_id: u32) -> Option<u64> 
         return None;
     }
     let value = crate::proxy::private_element_receiver(value);
-    if super::super::class_registry::is_class_object_value(value) {
+    let value_is_class_object = super::super::class_registry::is_class_object_value(value);
+    if value_is_class_object {
         let object = JSValue::from_bits(value.to_bits()).as_pointer::<ObjectHeader>();
         if !object.is_null() && js_object_get_class_id(object) == declaring_class_id {
             return Some(value.to_bits());
@@ -1708,6 +1709,11 @@ fn private_evaluation_brand(value: f64, declaring_class_id: u32) -> Option<u64> 
     };
     if !super::super::class_registry::is_class_object_value(brand) {
         return None;
+    }
+    if !value_is_class_object {
+        // #11127/#11131: an instance carries its MOST-DERIVED evaluation; an
+        // ancestor's brand is that evaluation's pinned heritage chain.
+        return instance_ancestor_evaluation_brand(brand, declaring_class_id);
     }
     let object = JSValue::from_bits(brand.to_bits()).as_pointer::<ObjectHeader>();
     (!object.is_null() && js_object_get_class_id(object) == declaring_class_id)
@@ -2056,7 +2062,8 @@ mod private_evaluation_brand_tests {
 
             let instance = crate::object::js_object_alloc(CID, 2);
             let shape_before = crate::object::shapes::object_shape_id(instance);
-            let keys_before = crate::object::object_keys_array(instance);
+            let keys_before_view = crate::object::object_keys(instance);
+            let keys_before = keys_before_view.arr();
             let slots_before = crate::object::object_live_slot_count(instance);
 
             stamp_private_evaluation_brand(instance, class_value);
@@ -2065,7 +2072,7 @@ mod private_evaluation_brand_tests {
                 crate::object::shapes::object_shape_id(instance),
                 shape_before
             );
-            assert_eq!(crate::object::object_keys_array(instance), keys_before);
+            assert_eq!(crate::object::object_keys(instance).arr(), keys_before);
             assert_eq!(
                 crate::object::object_live_slot_count(instance),
                 slots_before

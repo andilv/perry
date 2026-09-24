@@ -149,6 +149,18 @@ unsafe fn integrity_flags_are_writable(obj: *const ObjectHeader) -> bool {
     !obj.is_null() && crate::value::addr_class::try_read_tracked_gc_header(obj as usize).is_some()
 }
 
+/// Extensibility is part of a shaped object's semantics. Retire its previous
+/// ShapeId when an integrity flag changes so a shape-keyed add path cannot
+/// reuse an edge learned while the object was extensible.
+unsafe fn set_integrity_flags(obj: *mut ObjectHeader, flags: u16) {
+    let gc = gc_header_for(obj);
+    let added = (*gc)._reserved & flags != flags;
+    (*gc)._reserved |= flags;
+    if added {
+        shapes::transition_object_shape_semantics(obj);
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn js_object_freeze(obj_value: f64) -> f64 {
     crate::array::subclass_elements::deopt_value(obj_value);
@@ -167,10 +179,12 @@ pub extern "C" fn js_object_freeze(obj_value: f64) -> f64 {
         // no-op-and-return-the-value behaviour for a rejected receiver is
         // unchanged (`test_gap_handle_band_object_ops` `Object.freeze(blob)`).
         if integrity_flags_are_writable(obj) {
-            let gc = gc_header_for(obj);
-            (*gc)._reserved |= crate::gc::OBJ_FLAG_FROZEN
-                | crate::gc::OBJ_FLAG_SEALED
-                | crate::gc::OBJ_FLAG_NO_EXTEND;
+            set_integrity_flags(
+                obj,
+                crate::gc::OBJ_FLAG_FROZEN
+                    | crate::gc::OBJ_FLAG_SEALED
+                    | crate::gc::OBJ_FLAG_NO_EXTEND,
+            );
             // TypedArray receivers are NOT `ObjectHeader`s — the key walk
             // below would read a garbage `keys_array` off the TA header and
             // can fault depending on heap layout. The GC flags above are the
@@ -277,8 +291,10 @@ pub extern "C" fn js_object_seal(obj_value: f64) -> f64 {
         unsafe {
             let obj = extract_obj_ptr(obj_value);
             if integrity_flags_are_writable(obj) {
-                let gc = gc_header_for(obj);
-                (*gc)._reserved |= crate::gc::OBJ_FLAG_SEALED | crate::gc::OBJ_FLAG_NO_EXTEND;
+                set_integrity_flags(
+                    obj,
+                    crate::gc::OBJ_FLAG_SEALED | crate::gc::OBJ_FLAG_NO_EXTEND,
+                );
             }
         }
         return obj_value;
@@ -286,8 +302,10 @@ pub extern "C" fn js_object_seal(obj_value: f64) -> f64 {
     unsafe {
         let obj = extract_obj_ptr(obj_value);
         if integrity_flags_are_writable(obj) {
-            let gc = gc_header_for(obj);
-            (*gc)._reserved |= crate::gc::OBJ_FLAG_SEALED | crate::gc::OBJ_FLAG_NO_EXTEND;
+            set_integrity_flags(
+                obj,
+                crate::gc::OBJ_FLAG_SEALED | crate::gc::OBJ_FLAG_NO_EXTEND,
+            );
             // TypedArray receivers: GC flags only — see `js_object_freeze`.
             if crate::typedarray::lookup_typed_array_kind(obj as usize).is_some()
                 || crate::typedarray_props::typed_array_addr_from_value(obj_value).is_some()
@@ -389,8 +407,7 @@ pub extern "C" fn js_object_prevent_extensions(obj_value: f64) -> f64 {
                 crate::typedarray_props::typed_array_mark_no_extend(owner);
                 return obj_value;
             }
-            let gc = gc_header_for(obj);
-            (*gc)._reserved |= crate::gc::OBJ_FLAG_NO_EXTEND;
+            set_integrity_flags(obj, crate::gc::OBJ_FLAG_NO_EXTEND);
         }
     }
     obj_value
@@ -484,7 +501,8 @@ unsafe fn object_integrity_level(obj: *mut ObjectHeader, frozen: bool) -> bool {
         // Empty array + non-extensible ⇒ integrity holds.
         return true;
     }
-    let keys = crate::object::object_keys_array(obj);
+    let keys_view = crate::object::object_keys(obj);
+    let keys = keys_view.arr();
     if keys.is_null() {
         return true; // no own keys + non-extensible ⇒ frozen/sealed
     }
@@ -492,7 +510,7 @@ unsafe fn object_integrity_level(obj: *mut ObjectHeader, frozen: bool) -> bool {
     if (keys_ptr as u64) >> 48 != 0 || keys_ptr < 0x10000 {
         return true;
     }
-    let key_count = crate::array::js_array_length(keys) as usize;
+    let key_count = keys_view.count() as usize;
     if key_count > 65536 {
         return false;
     }

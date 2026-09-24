@@ -190,7 +190,8 @@ pub(super) const NET_EVENTS_ROWS: &[NativeModSig] = &[
         // receives f64 arguments, while NA_JSV uses the integer ABI for
         // runtimes whose signatures explicitly take raw i64 bits.
         args: &[NA_F64, NA_F64, NA_F64],
-        ret: NR_VOID,
+        // #11111 — Node's boolean (NaN-boxed), not `undefined`.
+        ret: NR_F64,
     },
     NativeModSig {
         module: "net",
@@ -401,6 +402,15 @@ pub(super) const NET_EVENTS_ROWS: &[NativeModSig] = &[
     // Socket rows remain generic so they still match in the fallback pass when
     // the HIR preserves a more specific net class filter for nearby accessors
     // such as `Server.listening` and `SocketAddress.address`.
+    NativeModSig {
+        module: "net",
+        has_receiver: true,
+        method: "read",
+        class_filter: None,
+        runtime: "js_net_socket_read",
+        args: &[NA_F64],
+        ret: NR_F64,
+    },
     NativeModSig {
         module: "net",
         has_receiver: true,

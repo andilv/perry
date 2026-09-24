@@ -356,8 +356,8 @@ fn parse_unwind_info(ui: &[u8], image_base: u64) -> (Vec<(u64, u32)>, Vec<(u64, 
                 _ => return None,
             }
         }
-        funcs.sort_unstable_by_key(|entry| entry.0);
-        lsdas.sort_unstable_by_key(|entry| entry.0);
+        crate::cold_sort::sort_by_u64_key(&mut funcs, |entry| entry.0);
+        crate::cold_sort::sort_by_u64_key(&mut lsdas, |entry| entry.0);
         Some((funcs, lsdas, personalities))
     })()
     .unwrap_or_default()
@@ -573,7 +573,7 @@ fn walker() -> Option<&'static Mutex<Walker>> {
                         }
                     }
                 }
-                index.sort_unstable_by_key(|e| e.0);
+                crate::cold_sort::sort_by_u64_key(&mut index, |e| e.0);
                 image.fde_index = index;
                 images.push(WalkerImage {
                     image,
@@ -823,7 +823,7 @@ pub(crate) fn walk_pcs_from_here(_max: usize) -> Option<Vec<u64>> {
 /// answer and aborts on mismatch. Zero work when unset (one lazy bool).
 fn diff_mode() -> bool {
     static MODE: OnceLock<bool> = OnceLock::new();
-    *MODE.get_or_init(|| {
+    *crate::once_init::get_or_init(&MODE, || {
         let mode = std::env::var("PERRY_EH_WALKER");
         let on = matches!(mode.as_deref(), Ok("diff"));
         if on || matches!(mode.as_deref(), Ok("stats")) {
@@ -1013,7 +1013,7 @@ pub(crate) static FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// owned transport where it can, falling back per-throw where it cannot.
 fn fast_transport_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
+    *crate::once_init::get_or_init(&ON, || {
         !matches!(
             std::env::var("PERRY_EH_WALKER").as_deref(),
             Ok("off") | Ok("0") | Ok("system")

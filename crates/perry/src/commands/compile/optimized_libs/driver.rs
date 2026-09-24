@@ -67,6 +67,29 @@ pub(crate) fn build_optimized_libs(
         );
         std::process::exit(1);
     }
+    // turnloop P8 group H: perry-stdlib's bundled ioredis / mongodb copies were
+    // deleted, so with the flip disabled there is nothing left to define
+    // `js_ioredis_*` / `js_mongodb_*` and the link would fail with a wall of
+    // undefined symbols. Say so up front instead.
+    //
+    // pg / mysql2 / fastify are NOT listed: main's npm-binding strip removed
+    // their well-known rows entirely, so those imports compile the real npm
+    // package from source and never reach a wrapper either way.
+    if let Some(module) = iteration_set
+        .iter()
+        .map(|m| m.strip_prefix("node:").unwrap_or(m))
+        .find(|m| matches!(*m, "ioredis" | "redis" | "iovalkey" | "mongodb"))
+        .filter(|_| !use_well_known)
+    {
+        eprintln!(
+            "error: `import '{module}'` requires an external perry-ext-* wrapper, but the \
+             well-known flip is disabled (PERRY_DISABLE_WELL_KNOWN). perry-stdlib's bundled \
+             ioredis / mongodb copies were removed; unset PERRY_DISABLE_WELL_KNOWN so the \
+             import routes to its wrapper crate."
+        );
+        std::process::exit(1);
+    }
+
     // `PERRY_NO_AUTO_OPTIMIZE=1` — opt out of the per-app feature-set
     // specialization and use the prebuilt `target/release/libperry_*.a`
     // built with the default `full` feature set. Used by CI doc-tests
@@ -144,9 +167,9 @@ pub(crate) fn build_optimized_libs(
     // final binary; `Handle::current()` works.
     //
     // CPU-only wrappers (bcrypt, argon2, sharp, …) don't need this —
-    // they only use perry-ffi's `spawn_blocking` shim, which routes
-    // through perry-stdlib's tokio. Their workspace-built .a stays
-    // fine.
+    // they only use perry-ffi's `spawn_blocking` / pool shims, which
+    // perry-stdlib serves without tokio when the program selects none
+    // (turnloop P8 lane L). Their workspace-built .a stays fine.
     let mut tokio_using_bindings: Vec<(String, String, Option<String>)> = Vec::new();
     let mut external_net_transport = false;
     // Web Fetch is selected independently from the external node:http
@@ -164,6 +187,15 @@ pub(crate) fn build_optimized_libs(
                 continue;
             };
             let needs_shared_tokio = binding_needs_shared_tokio(module_normalized);
+            // turnloop P8 lane L: a wrapper that shares perry-stdlib's tokio
+            // needs perry-stdlib to HAVE one. Since the promise bridge stopped
+            // implying tokio (`async-bridge`), `async-runtime` is selected per
+            // program, and this is where every tokio-using wrapper selects it
+            // — the same predicate the shared-tokio rebuild and the #7629
+            // coherence check key on, so the three cannot disagree.
+            if needs_shared_tokio {
+                features.insert("async-runtime");
+            }
             // For CPU-only wrappers we can use the workspace-built
             // copy directly. Skip the binding entirely if no .a
             // exists on disk (partial build / release tarball
@@ -234,6 +266,23 @@ pub(crate) fn build_optimized_libs(
                 // exists on disk first (so we can actually build it).
                 let crate_dir = workspace_root.join("crates").join(&binding.krate);
                 if !crate_dir.is_dir() {
+                    // turnloop P8 group H removed the bundled db copies, so
+                    // the fall-back below has nothing to fall back to.
+                    if matches!(
+                        module_normalized,
+                        "ioredis" | "redis" | "iovalkey" | "mongodb"
+                    ) {
+                        eprintln!(
+                            "error: `import '{}'` requires the external {} wrapper, but its \
+                             source crate was not found at `{}`. perry-stdlib's bundled copy was \
+                             removed; build or restore {}.",
+                            module,
+                            binding.krate,
+                            crate_dir.display(),
+                            binding.krate
+                        );
+                        std::process::exit(1);
+                    }
                     if matches!(format, OutputFormat::Text) && verbose > 0 {
                         eprintln!(
                             "  well-known: skipping `{}` — crate `{}` source not on disk; \
@@ -295,33 +344,49 @@ pub(crate) fn build_optimized_libs(
             }
             // perry-ffi's async surface (#466 Phase 1.1 / Phase 5
             // step 5+) is gated behind perry-stdlib's
-            // `async-runtime` feature — the `perry_ffi_*` shim
+            // `async-bridge` feature — the `perry_ffi_*` shim
             // module that wrappers like bcrypt / argon2 / ws / db
             // pull through linking lives in
-            // `crates/perry-stdlib/src/perry_ffi_async.rs` and
-            // can only be compiled when tokio is in the build.
+            // `crates/perry-stdlib/src/perry_ffi_async.rs`.
             // Stripping `bundled-bcrypt` (etc.) without
-            // re-asserting `async-runtime` would leave the
+            // re-asserting the bridge would leave the
             // wrapper's `.a` carrying unresolved `perry_ffi_*`
             // references. Detect async wrappers by checking
             // whether the original feature list contained an
             // async feature; if it did, ensure it stays.
+            //
+            // turnloop P8 lane L split the tokio runtime out of the
+            // bridge, so the two halves are asserted separately: the
+            // CPU-only wrappers need only the bridge, while the ones
+            // whose stdlib twin ran on tokio sockets / reqwest keep
+            // `async-runtime` (their wrappers are also shared-tokio,
+            // above; this is the belt to that brace).
             let original_features =
                 crate::commands::stdlib_features::module_to_features(module_normalized);
             if original_features.iter().any(|f| {
                 matches!(
                     *f,
-                    "bundled-bcrypt"
-                        | "bundled-argon2"
-                        | "bundled-nodemailer"
-                        | "bundled-ioredis"
-                        | "bundled-mongodb"
-                        | "bundled-ws"
-                        | "bundled-net"
-                        | "http-client"
-                        | "bundled-streams"
+                    "bundled-bcrypt" | "bundled-argon2" | "bundled-nodemailer" | "bundled-streams"
                 )
             }) {
+                features.insert("async-bridge");
+            }
+            if original_features
+                .iter()
+                .any(|f| matches!(*f, "bundled-ws" | "bundled-net" | "http-client"))
+            {
+                features.insert("async-runtime");
+            }
+            // turnloop P8 group H: the bundled pg / mysql2 / ioredis / mongodb
+            // modules were deleted, so `module_to_features` names no feature
+            // for them and the check above cannot see them. The wrappers still
+            // settle every promise through perry-stdlib's `perry_ffi_*` shim,
+            // which only compiles under `async-runtime` — key it on the module
+            // name, the same way `undici` / `nodemailer` / `fastify` do below.
+            if matches!(
+                module_normalized,
+                "pg" | "mysql2" | "mysql2/promise" | "ioredis" | "redis" | "iovalkey" | "mongodb"
+            ) {
                 features.insert("async-runtime");
             }
             // `undici` (#466): perry-ext-undici is thin glue over the
@@ -335,6 +400,17 @@ pub(crate) fn build_optimized_libs(
             // the wrapper's JsPromise surface needs anyway.)
             if module_normalized == "undici" {
                 features.insert("web-fetch");
+            }
+            // turnloop P6 — the same shape, for SMTP. `import 'nodemailer'`
+            // strips `bundled-nodemailer` and routes to perry-ext-nodemailer,
+            // which reaches perry-stdlib's turnloop SMTP engine through the
+            // `js_perry_smtp_*` C seam. That engine is gated on
+            // `turnloop-smtp-client`, which is NOT implied by
+            // `bundled-nodemailer` precisely so the strip cannot take it — but
+            // the rebuilt feature list is explicit, so it has to be re-asserted
+            // here or the wrapper's externs dangle at link time.
+            if module_normalized == "nodemailer" {
+                features.insert("turnloop-smtp-client");
             }
             // v0.5.579 — when the flip strips `bundled-net`, activate
             // `external-net-pump` to retain the shared runtime and external
@@ -438,14 +514,16 @@ pub(crate) fn build_optimized_libs(
     // reach into perry-stdlib's async bridge from GLib/NSTimer/WM_TIMER
     // trampolines (js_stdlib_process_pending, js_promise_run_microtasks).
     // Those symbols live in perry-stdlib/src/common/async_bridge.rs which is
-    // gated on `#[cfg(feature = "async-runtime")]`. For a bare UI program
+    // gated on `#[cfg(feature = "async-bridge")]`. For a bare UI program
     // whose user code imports zero stdlib modules, compute_required_features
     // returns an empty set and the auto-optimized stdlib is built with
-    // --no-default-features — no `async-runtime`, no async_bridge module, no
-    // symbol. Force `async-runtime` whenever the program pulls in a UI
-    // backend so the trampolines resolve at link time.
+    // --no-default-features — no bridge, no async_bridge module, no
+    // symbol. Force `async-bridge` whenever the program pulls in a UI
+    // backend so the trampolines resolve at link time. (The bridge is
+    // tokio-free since turnloop P8 lane L, so a UI app no longer links tokio
+    // for it.)
     if ctx.needs_ui {
-        features.insert("async-runtime");
+        features.insert("async-bridge");
     }
     // zlib per-codec cherry-pick: `import 'node:zlib'` only selected the
     // gzip/deflate base above (`compression-gzip`). Layer the Brotli / zstd
@@ -463,6 +541,16 @@ pub(crate) fn build_optimized_libs(
         if ctx.uses_zlib_zstd || perry_hir::has_deferred_dynamic_code_sites() {
             features.insert("compression-zstd");
         }
+    }
+    // WHATWG compression streams: `bundled-streams` no longer carries the
+    // Brotli codec, because `web-fetch` implies it for `response.body` and the
+    // format `match` kept the whole encoder live in every fetch program. Layer
+    // `streams-brotli` on only when the program names CompressionStream /
+    // DecompressionStream, or has deferred dynamic code that could.
+    if features.contains("bundled-streams")
+        && (ctx.uses_web_compression_stream || perry_hir::has_deferred_dynamic_code_sites())
+    {
+        features.insert("streams-brotli");
     }
     // perry-stdlib unconditionally re-bundles perry-updater (so user code
     // calling `perry/updater` resolves at link time without extra wiring).
@@ -482,14 +570,19 @@ pub(crate) fn build_optimized_libs(
     //      the prefix rule in `perry_codegen::ext_registry::record_ffi_call`
     //      feeds `ctx.extra_stdlib_features`, unioned in above.
     //
-    // `async-runtime` stays force-on: perry-stdlib's ALWAYS-ON modules
+    // The promise bridge stays force-on: perry-stdlib's ALWAYS-ON modules
     // (worker_threads' promise bridge, readline's pump) compile against
-    // `common::async_bridge`, which is `async-runtime`-gated — a bare
+    // `common::async_bridge`, which is `async-bridge`-gated — a bare
     // `--no-default-features` stdlib has never compiled, and the crypto
-    // force used to satisfy the gate transitively. Tokio was therefore in
-    // every stdlib-linking binary before the cherry-pick too; the win here
-    // is dropping the crypto/codec crates, not the runtime bridge.
-    features.insert("async-runtime");
+    // force used to satisfy the gate transitively.
+    //
+    // turnloop P8 lane L: this force used to be `async-runtime`, i.e. tokio,
+    // so tokio was in every stdlib-linking binary. The bridge is tokio-free
+    // now, and `async-runtime` is selected only by a feature that hands tokio
+    // a future (Cargo implies it: web-fetch, bundled net/tls/ws, the
+    // external net/ws/http pumps, container) or by a shared-tokio wrapper
+    // (above). A program that needs none of those links no tokio.
+    features.insert("async-bridge");
     let feature_arg = features_to_cargo_arg(&features);
 
     // panic = "abort" is safe whenever no `catch_unwind` callers are
@@ -962,6 +1055,12 @@ pub(crate) fn build_optimized_libs(
         // first `throw` that crosses a runtime frame aborts.
         if !panic_immediate {
             rustflags.push("-C force-unwind-tables=yes".to_string());
+            // Synchronous tables: exact at call sites, which is every PC
+            // the exception transport unwinds from, and compact-encodable
+            // on Apple targets (async tables force a DWARF FDE per
+            // function — ~500 KB of `__eh_frame`). Mirrors
+            // `.cargo/config.toml`.
+            rustflags.push("-Zuse-sync-unwind=yes".to_string());
         }
         cargo_cmd.env("RUSTFLAGS", rustflags.join(" "));
     }

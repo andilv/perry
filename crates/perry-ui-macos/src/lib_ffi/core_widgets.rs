@@ -18,6 +18,12 @@ pub extern "C" fn perry_ui_app_set_body(app_handle: i64, root_handle: i64) {
     app::app_set_body(app_handle, root_handle);
 }
 
+/// Opt in to quitting when the final application window closes.
+#[no_mangle]
+pub extern "C" fn perry_ui_app_set_quit_on_last_window_close(app_handle: i64, value: f64) {
+    app::app_set_quit_on_last_window_close(app_handle, value);
+}
+
 /// Run the app event loop (blocks until window closes).
 #[no_mangle]
 pub extern "C" fn perry_ui_app_run(app_handle: i64) {
@@ -421,6 +427,16 @@ pub extern "C" fn perry_ui_text_set_font_size(handle: i64, size: f64) {
 #[no_mangle]
 pub extern "C" fn perry_ui_text_set_font_weight(handle: i64, size: f64, weight: f64) {
     widgets::text::set_font_weight(handle, size, weight);
+}
+
+#[no_mangle]
+pub extern "C" fn perry_ui_text_set_letter_spacing(handle: i64, points: f64) {
+    widgets::text::set_letter_spacing(handle, points);
+}
+
+#[no_mangle]
+pub extern "C" fn perry_ui_text_set_line_height(handle: i64, multiple: f64) {
+    widgets::text::set_line_height(handle, multiple);
 }
 
 /// Enable word wrapping on a Text widget with a max width.

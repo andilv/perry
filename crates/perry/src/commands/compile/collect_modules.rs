@@ -43,7 +43,7 @@ mod native_addon;
 mod parse_error;
 pub(crate) mod reexport_prune;
 mod script_string;
-mod static_require_transform;
+pub(super) mod static_require_transform;
 #[cfg(test)]
 mod tests;
 mod walk;
@@ -423,6 +423,7 @@ fn collect_module_one(
                 &canonical,
                 target,
                 cjs_is_entry_module,
+                Some(&ctx.compile_packages),
             );
             // Newlines before the original body in the wrapped output = the
             // wrapper prefix line count. Recorded only when the body was
@@ -441,6 +442,7 @@ fn collect_module_one(
                 &canonical,
                 target,
                 cjs_is_entry_module,
+                Some(&ctx.compile_packages),
             )
         }
     } else {

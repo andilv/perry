@@ -676,8 +676,9 @@ unsafe fn serialize_object(obj: *const crate::object::ObjectHeader) -> Serialize
     // slot — which keeps the surviving pairs aligned and matches node
     // (postMessage of an object with deleted keys carries only live keys).
     let hole_at = |i: usize| -> bool {
-        let keys_arr = crate::object::object_keys_array(obj);
-        if keys_arr.is_null() || i >= (*keys_arr).length as usize {
+        let keys_arr_view = crate::object::object_keys(obj);
+        let keys_arr = keys_arr_view.arr();
+        if keys_arr.is_null() || i >= keys_arr_view.count() as usize {
             return false;
         }
         let keys_elements =
@@ -699,9 +700,10 @@ unsafe fn serialize_object(obj: *const crate::object::ObjectHeader) -> Serialize
     }
 
     // Serialize keys array if present (plain objects have keys, class instances don't)
-    let keys = if !crate::object::object_keys_array(obj).is_null() {
-        let keys_arr = crate::object::object_keys_array(obj);
-        let keys_len = (*keys_arr).length as usize;
+    let keys = if !crate::object::object_keys(obj).is_null() {
+        let keys_arr_view = crate::object::object_keys(obj);
+        let keys_arr = keys_arr_view.arr();
+        let keys_len = keys_arr_view.count() as usize;
         let keys_elements =
             crate::array::array_elements_ptr(keys_arr as *const crate::array::ArrayHeader)
                 as *const f64;
@@ -1715,6 +1717,7 @@ fn queue_thread_result_with_mode(
             result,
             is_rejection,
         });
+        PENDING_THREAD_RESULTS_LEN.store(pending.len(), Ordering::SeqCst);
     }
     ACTIVE_THREAD_JOBS.fetch_sub(1, Ordering::SeqCst);
     // Issue #84: wake the main thread so spawn()-returned promises
@@ -1791,6 +1794,10 @@ unsafe impl Send for PendingThreadResult {}
 /// Global queue for pending thread results.
 static PENDING_THREAD_RESULTS: std::sync::Mutex<Vec<PendingThreadResult>> =
     std::sync::Mutex::new(Vec::new());
+/// turnloop P0: `PENDING_THREAD_RESULTS.len()`, republished under its lock
+/// after every mutation. `js_thread_has_pending` runs on every event-loop
+/// turn; an empty queue (the steady state) now answers without the lock.
+static PENDING_THREAD_RESULTS_LEN: AtomicUsize = AtomicUsize::new(0);
 
 /// Process pending thread results. Called from the main thread's event loop
 /// (registered as a pump function, similar to js_stdlib_process_pending).
@@ -1818,6 +1825,7 @@ pub extern "C" fn js_thread_process_pending() -> i32 {
             .into_iter()
             .partition(|item| crate::agent::owns(item.owner));
         *pending = theirs;
+        PENDING_THREAD_RESULTS_LEN.store(pending.len(), Ordering::SeqCst);
         mine
     };
     let count = mine.len() as i32;
@@ -1866,6 +1874,9 @@ pub extern "C" fn js_thread_has_pending() -> i32 {
     if ACTIVE_THREAD_JOBS.load(Ordering::SeqCst) != 0 {
         return 1;
     }
+    if PENDING_THREAD_RESULTS_LEN.load(Ordering::SeqCst) == 0 {
+        return 0;
+    }
     // #6185: only entries THIS agent can actually settle count as work keeping
     // its loop alive. Reporting a foreign entry here would spin the event loop
     // forever on a result the drain (correctly) refuses to touch.
@@ -1887,6 +1898,7 @@ pub(crate) fn purge_agent_thread_results(agent: crate::agent::AgentId) {
         Err(poisoned) => poisoned.into_inner(),
     };
     pending.retain(|item| item.owner != agent);
+    PENDING_THREAD_RESULTS_LEN.store(pending.len(), Ordering::SeqCst);
 }
 
 #[cfg(test)]

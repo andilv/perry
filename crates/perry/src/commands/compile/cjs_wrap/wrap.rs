@@ -3,7 +3,34 @@
 
 use super::*;
 use std::borrow::Cow;
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Component, Path, PathBuf};
+
+fn relative_import_specifier(from: &Path, to: &Path) -> Option<String> {
+    let from: Vec<Component<'_>> = from.components().collect();
+    let to: Vec<Component<'_>> = to.components().collect();
+    if from.first() != to.first() {
+        return None;
+    }
+    let common = from
+        .iter()
+        .zip(&to)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut relative = PathBuf::new();
+    for _ in common..from.len() {
+        relative.push("..");
+    }
+    for component in &to[common..] {
+        relative.push(component.as_os_str());
+    }
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    if relative.starts_with('.') {
+        Some(relative)
+    } else {
+        Some(format!("./{relative}"))
+    }
+}
 
 fn resolved_native_addon(
     source_path: &Path,
@@ -105,7 +132,7 @@ pub(in crate::commands::compile) fn wrap_commonjs(source: &str, source_path: &Pa
     // here, which is correct for the overwhelming majority of CJS-wrapped
     // files (dependencies). The real per-module entry status is threaded
     // explicitly from `collect_modules.rs`, the only place that knows it.
-    wrap_commonjs_for_target(source, source_path, None, false)
+    wrap_commonjs_for_target(source, source_path, None, false, None)
 }
 
 pub(in crate::commands::compile) fn wrap_commonjs_for_target(
@@ -113,8 +140,16 @@ pub(in crate::commands::compile) fn wrap_commonjs_for_target(
     source_path: &Path,
     target: Option<&str>,
     is_entry_module: bool,
+    compile_packages: Option<&HashSet<String>>,
 ) -> String {
-    wrap_commonjs_with_body_offset(source, source_path, target, is_entry_module).0
+    wrap_commonjs_with_body_offset(
+        source,
+        source_path,
+        target,
+        is_entry_module,
+        compile_packages,
+    )
+    .0
 }
 
 /// Like [`wrap_commonjs_for_target`], but also returns the byte offset within
@@ -129,6 +164,7 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
     source_path: &Path,
     target: Option<&str>,
     is_entry_module: bool,
+    compile_packages: Option<&HashSet<String>>,
 ) -> (String, Option<usize>) {
     let mut source_cow = Cow::Borrowed(source);
 
@@ -424,7 +460,59 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
                 | "_http_server" => "http",
                 other => other,
             };
-            format!("import {} from '{}';", local, import_spec)
+            // #11047: this import represents a CommonJS `require`, so bare
+            // package specifiers must use the package's `require` export
+            // condition. Leaving the original specifier here sends it through
+            // the ordinary ESM resolver after wrapping, which prefers
+            // `exports.import`. For `ws`, that selected `wrapper.mjs` instead
+            // of `index.js`; the ESM default is WebSocket but intentionally
+            // lacks the CommonJS-only `.Server` attachment.
+            //
+            // Resolve the require entry while the original call-site context
+            // is still known. Keep relative imports spelled as written so
+            // their existing cycle/deferred-module handling remains intact.
+            let resolved_require_spec = if import_spec == spec
+                && !spec.starts_with("./")
+                && !spec.starts_with("../")
+                && !std::path::Path::new(spec).is_absolute()
+                && compile_packages.is_none_or(|packages| {
+                    let (package_name, _) =
+                        super::super::resolve::parse_package_specifier(spec);
+                    packages.contains("*") || packages.contains(&package_name)
+                })
+            {
+                source_path
+                    .parent()
+                    .and_then(|module_dir| {
+                        super::super::collect_modules::static_require_transform::resolve_static_require(
+                            module_dir,
+                            spec,
+                            None,
+                        )
+                    })
+                    // Keep the resolved target relative to the importing
+                    // module. Absolute node_modules imports are classified as
+                    // ordinary runtime JS by the general resolver because the
+                    // original package name (and therefore compilePackages
+                    // opt-in) is no longer visible there.
+                    .and_then(|path| {
+                        source_path
+                            .parent()
+                            .and_then(|module_dir| relative_import_specifier(module_dir, &path))
+                    })
+            } else {
+                None
+            };
+            if let Some(resolved) = resolved_require_spec {
+                format!(
+                    "import {} from {};",
+                    local,
+                    serde_json::to_string(&resolved)
+                        .expect("CJS import specifier is JSON encodable")
+                )
+            } else {
+                format!("import {} from '{}';", local, import_spec)
+            }
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -1522,7 +1610,7 @@ fn cyclic_missing_property_names(
     .filter_map(|capture| capture.get(1).map(|name| name.as_str().to_string()))
     .collect::<std::collections::HashSet<_>>();
     let masked_source = super::detect::strip_comments_and_strings(source);
-    let mut missing = std::collections::BTreeSet::new();
+    let mut candidate_sites = Vec::new();
     for alias in aliases {
         let access = perry_perex::tooling::Regex::new(&format!(
             r#"(?:^|[^A-Za-z0-9_$]){}\.([A-Za-z_$][A-Za-z0-9_$]*)"#,
@@ -1532,11 +1620,17 @@ fn cyclic_missing_property_names(
         for capture in access.captures_iter(&masked_source) {
             if let Some(property) = capture.get(1).map(|name| name.as_str()) {
                 if !assigned_before.contains(property) {
-                    missing.insert(property.to_string());
+                    candidate_sites.push((capture.get(0).unwrap().start(), property.to_string()));
                 }
             }
         }
     }
+    let offsets: Vec<usize> = candidate_sites.iter().map(|(offset, _)| *offset).collect();
+    let deferred = super::extract_requires::deferred_function_sites(&masked_source, &offsets);
+    let missing: std::collections::BTreeSet<String> = candidate_sites
+        .into_iter()
+        .filter_map(|(offset, property)| (!deferred.contains(&offset)).then_some(property))
+        .collect();
     missing.into_iter().collect()
 }
 

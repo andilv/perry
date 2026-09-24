@@ -165,6 +165,10 @@ function buildImports() {
         stringTable.push(String(toJsValue(val)));
         return nanboxString(stringTable.length - 1);
       },
+      jsvalue_to_template_string: (val) => {
+        stringTable.push(`${toJsValue(val)}`);
+        return nanboxString(stringTable.length - 1);
+      },
       is_truthy: (val) => {
         const bits = f64ToU64(val);
         if (bits === TAG_FALSE || bits === TAG_NULL || bits === TAG_UNDEFINED) return 0;
@@ -1325,7 +1329,7 @@ function buildImports() {
         const p = fetch(url);
         return nanboxPointer(allocHandle(p));
       },
-      fetch_with_options: (urlStr, methodVal, bodyVal, headersVal) => {
+      fetch_with_options: (urlStr, methodVal, bodyVal, headersVal, redirectVal) => {
         const url = getString(urlStr);
         const opts = {};
         if (!isUndefined(methodVal)) opts.method = getString(methodVal);
@@ -1334,6 +1338,7 @@ function buildImports() {
           const h = getHandle(headersVal);
           if (h && typeof h === 'object') opts.headers = h;
         }
+        if (!isUndefined(redirectVal)) opts.redirect = getString(redirectVal);
         const p = fetch(url, opts);
         return nanboxPointer(allocHandle(p));
       },
@@ -1624,6 +1629,7 @@ const __memDispatch = {
     return 0;
   },
   jsvalue_to_string: (val) => String(val),
+  jsvalue_to_template_string: (val) => `${val}`,
   is_truthy: (val) => {
     if (val === false || val === null || val === undefined || val === 0 || val === '') return 0;
     if (Number.isNaN(val)) return 0;
@@ -2229,11 +2235,12 @@ const __memDispatch = {
 
   // Fetch/Promise — args are plain JS values
   fetch_url: (urlStr) => fetch(String(urlStr)),
-  fetch_with_options: (urlStr, methodVal, bodyVal, headersVal) => {
+  fetch_with_options: (urlStr, methodVal, bodyVal, headersVal, redirectVal) => {
     const url = String(urlStr); const opts = {};
     if (methodVal !== undefined) opts.method = String(methodVal);
     if (bodyVal !== undefined) opts.body = String(bodyVal);
     if (headersVal && typeof headersVal === 'object') opts.headers = headersVal;
+    if (redirectVal !== undefined) opts.redirect = String(redirectVal);
     return fetch(url, opts);
   },
   response_json: (resp) => { if (!resp || typeof resp.json !== 'function') return undefined; return resp.json(); },
@@ -3328,6 +3335,8 @@ function perry_ui_text_set_string(h, text) { const el = uiGet(h); if (el) el.tex
 function perry_ui_text_set_selectable(h, selectable) { const el = uiGet(h); if (el) el.style.userSelect = selectable ? "text" : "none"; }
 function perry_ui_text_set_wraps(h) { const el = uiGet(h); if (el) el.style.wordWrap = "break-word"; }
 function perry_ui_text_set_color(h, r, g, b, a) { perry_ui_set_foreground(h, r, g, b, a); }
+function perry_ui_text_set_letter_spacing(h, points) { const el = uiGet(h); if (el) el.style.letterSpacing = points === 0 ? "normal" : points + "px"; }
+function perry_ui_text_set_line_height(h, multiple) { const el = uiGet(h); if (el && multiple > 0) el.style.lineHeight = multiple === 1 ? "normal" : String(multiple); }
 function perry_ui_button_set_bordered(h, bordered) { const el = uiGet(h); if (el) el.style.border = bordered ? "" : "none"; }
 function perry_ui_button_set_title(h, title) { const el = uiGet(h); if (el) el.textContent = title; }
 function perry_ui_button_set_text_color(h, r, g, b, a) { perry_ui_set_foreground(h, r, g, b, a); }
@@ -4761,6 +4770,7 @@ const __perryUiDispatch = {
   perry_ui_foreach_register, perry_ui_navstack_register_route,
   // Text/Button/TextField ops
   perry_ui_text_set_string, perry_ui_text_set_selectable, perry_ui_text_set_wraps, perry_ui_text_set_color,
+  perry_ui_text_set_letter_spacing, perry_ui_text_set_line_height,
   perry_ui_text_set_text_alignment,
   perry_ui_button_set_bordered, perry_ui_button_set_title, perry_ui_button_set_text_color,
   perry_ui_button_set_image, perry_ui_button_set_content_tint_color, perry_ui_button_set_image_position,

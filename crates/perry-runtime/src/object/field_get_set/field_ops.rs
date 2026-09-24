@@ -335,9 +335,29 @@ pub extern "C" fn js_object_set_field_by_index(
 
 /// Set the keys array for an object (used for Object.keys() support)
 /// The keys_array should be an array of string pointers
+///
+/// #10868 step 2.5 stage 1b: the list is canonicalized on the way in. The
+/// census named this site — 21 of the 24 remaining duplicate-content mints on
+/// the same-content fixture came from here — and that is the whole argument
+/// for a census over a perf gate: a producer outside the funnel costs a
+/// duplicate LAYOUT, which no timing and no parity row can see.
 #[no_mangle]
 pub extern "C" fn js_object_set_keys(obj: *mut ObjectHeader, keys_array: *mut ArrayHeader) {
     unsafe {
-        set_object_keys_array(obj, keys_array);
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let obj_handle = scope.root_raw_mut_ptr(obj);
+        // Generated code hands in a freshly built, exclusively owned list.
+        let keys = crate::object::ObjectKeys::owned(keys_array);
+        let len = keys.count();
+        let proof = crate::object::canonical_keys::SharedLayout::of_receiver(obj);
+        let (published, obj) = obj_handle.across_mut(|| match proof {
+            Some(proof) => {
+                crate::object::canonical_keys::canonicalize(&proof, keys_array, len).view()
+            }
+            // A latched receiver's list is its own; publishing it as a shared
+            // layout is what lost 407 of 8,192 keys before the proof existed.
+            None => keys,
+        });
+        set_object_keys(obj, published);
     }
 }

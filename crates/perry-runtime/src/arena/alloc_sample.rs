@@ -34,6 +34,12 @@
 //! compiled user code (`crate::error::describe_chain`), else the linker
 //! symbol. Cumulative since process start.
 
+// Without the `gc-instruments` feature this instrument's entry predicate is a
+// constant "off" (inlined, so every caller's guarded branch folds away and the
+// instrument links nothing); the rest of the module stays compiled so it
+// cannot rot, hence the allow.
+#![cfg_attr(not(feature = "gc-instruments"), allow(dead_code, unused_imports))]
+
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -69,6 +75,24 @@ crate::perry_thread_local! {
 
 /// Read `PERRY_ALLOC_SITE_SAMPLE` once (from `gc_init`). A bare `1` or an
 /// unparsable value selects the default interval.
+/// The sampling interval, or 0 when off. A constant 0 without the
+/// `gc-instruments` feature, so the allocation fast paths drop the check.
+#[cfg(feature = "gc-instruments")]
+#[inline(always)]
+fn current_interval() -> usize {
+    INTERVAL.load(Ordering::Relaxed)
+}
+
+#[cfg(not(feature = "gc-instruments"))]
+#[inline(always)]
+fn current_interval() -> usize {
+    0
+}
+
+#[cfg(not(feature = "gc-instruments"))]
+pub(crate) fn init_from_env() {}
+
+#[cfg(feature = "gc-instruments")]
 pub(crate) fn init_from_env() {
     let raw = std::env::var("PERRY_ALLOC_SITE_SAMPLE").ok();
     let interval = parse_interval(raw.as_deref());
@@ -103,7 +127,7 @@ pub(crate) const MIN_INTERVAL_BYTES: usize = 256;
 /// `obj_type` is about to happen.
 #[inline(always)]
 pub(crate) fn note(total: usize, obj_type: u8) {
-    let interval = INTERVAL.load(Ordering::Relaxed);
+    let interval = current_interval();
     if interval == 0 {
         return;
     }
@@ -139,7 +163,7 @@ fn note_slow(total: usize, obj_type: u8, interval: usize) {
 /// path since the last sync. Charge them to the shared countdown.
 #[inline(always)]
 pub(crate) fn note_inline_sync(block_offset: usize, inline_offset: usize) {
-    let interval = INTERVAL.load(Ordering::Relaxed);
+    let interval = current_interval();
     if interval == 0 || inline_offset <= block_offset {
         return;
     }
@@ -162,7 +186,7 @@ fn note_inline_slow(bytes: usize, interval: usize) {
 /// when a sample is due. Identity when off.
 #[inline(always)]
 pub(crate) fn inline_limit(offset: usize, block_size: usize) -> usize {
-    let interval = INTERVAL.load(Ordering::Relaxed);
+    let interval = current_interval();
     if interval == 0 {
         return block_size;
     }
@@ -204,7 +228,7 @@ fn type_name(t: usize) -> &'static str {
 
 /// Print the cumulative histogram. `label` names the occasion.
 pub(crate) fn report(label: &str) {
-    let interval = INTERVAL.load(Ordering::Relaxed);
+    let interval = current_interval();
     if interval == 0 {
         return;
     }
@@ -229,7 +253,7 @@ pub(crate) fn report(label: &str) {
             .filter(|(_, &c)| c > 0)
             .map(|(t, &c)| (t, c))
             .collect();
-        types.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
+        crate::cold_sort::sort_by_key(&mut types, |&(_, c)| std::cmp::Reverse(c));
         let mut line = String::from("[alloc-site]   by-type:");
         for (t, c) in types {
             line.push_str(&format!(
@@ -240,7 +264,7 @@ pub(crate) fn report(label: &str) {
         }
         eprintln!("{line}");
         let mut sites: Vec<(&[usize; DEPTH], &Site)> = table.sites.iter().collect();
-        sites.sort_by_key(|(_, s)| std::cmp::Reverse(s.samples));
+        crate::cold_sort::sort_by_key(&mut sites, |(_, s)| std::cmp::Reverse(s.samples));
         for (key, s) in sites.iter().take(30) {
             let n = key.iter().position(|&p| p == 0).unwrap_or(DEPTH);
             let mut top_types: Vec<(usize, u32)> = s
@@ -250,7 +274,7 @@ pub(crate) fn report(label: &str) {
                 .filter(|(_, &c)| c > 0)
                 .map(|(t, &c)| (t, c))
                 .collect();
-            top_types.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
+            crate::cold_sort::sort_by_key(&mut top_types, |&(_, c)| std::cmp::Reverse(c));
             let types: Vec<String> = top_types
                 .iter()
                 .take(3)

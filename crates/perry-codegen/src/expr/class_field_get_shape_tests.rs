@@ -308,3 +308,163 @@ fn the_ic_call_carries_the_guard_operands() {
         "IC call signature drifted from the guard's operand list:\n{line}"
     );
 }
+
+/// Loads in a block body, one per line.
+fn loads(body: &str) -> Vec<&str> {
+    body.lines().filter(|l| l.contains(" = load ")).collect()
+}
+
+/// The hit path of a BOXED class-field read is the receiver range check, ONE
+/// ShapeId compare against the poisonable expectation, and the slot load.
+///
+/// Every header predicate the guard used to test with a masked word compare
+/// (GC kind, forwarded, descriptor flag, tombstone flag) is carried by the
+/// ShapeId (`emit_class_field_read_precheck`, rules 1-3 and #10826), and a
+/// boxed slot needs no class id: the key list fixes the slot. This fails on
+/// the pre-change guard, which loaded the header word and the 64-bit
+/// (class id, ShapeId) identity.
+#[test]
+fn boxed_class_field_read_guard_is_one_shape_compare() {
+    let ir = ir(Type::Any);
+    let deref = block_body(&ir, "class_field_inline.deref").expect("deref block");
+    let deref_loads = loads(deref);
+    assert_eq!(
+        deref_loads.len(),
+        2,
+        "boxed read guard must load the ShapeId word and the expectation, nothing else:\n{deref}"
+    );
+    assert!(
+        deref.contains("load volatile i32, ptr @perry_class_guard_shape_"),
+        "the expectation must be read VOLATILE (the runtime poisons it):\n{deref}"
+    );
+    assert!(
+        deref_loads
+            .iter()
+            .filter(|l| l.contains("load i32, ptr "))
+            .count()
+            == 1
+            && !deref_loads.iter().any(|l| l.contains("load i64")),
+        "one 32-bit ShapeId load, no 64-bit identity (class id) load:\n{deref}"
+    );
+    assert!(
+        !deref.contains("load i16"),
+        "a boxed read does not test the typed-layout intact bit:\n{deref}"
+    );
+    // The receiver test is the one-compare range check, not the flat
+    // tag+handle predicate.
+    assert!(
+        ir.contains("sub i64 ")
+            && ir.contains(", 9222527611925692416")
+            && ir.contains("icmp ult i64 ")
+            && ir.contains(", 281474975662080"),
+        "receiver test is not the biased range check:\n{ir}"
+    );
+    // The header word mask of the old guard (0xFF | 0x80 << 8 | 3072 << 16)
+    // must be gone from the read.
+    assert!(
+        !ir.contains("201359615"),
+        "the GcHeader word mask is back on the read guard:\n{ir}"
+    );
+}
+
+/// A RAW-F64 class-field read keeps exactly the two facts the ShapeId does
+/// not carry: the class id (a key-list ShapeId is shared with same-keyed
+/// literals and classes, which may hold a non-number in the slot) and the
+/// per-object typed-layout intact bit (a downgrade clears it without a shape
+/// transition). Nothing else — no GcHeader word.
+#[test]
+fn raw_f64_class_field_read_guard_keeps_class_id_and_intact_bit() {
+    let ir = ir(Type::Number);
+    let deref = block_body(&ir, "class_field_inline.deref").expect("deref block");
+    let deref_loads = loads(deref);
+    assert_eq!(
+        deref_loads.len(),
+        3,
+        "raw-f64 read guard: the (class id, ShapeId) word, the expectation and \
+         the _reserved half-word, nothing else:\n{deref}"
+    );
+    assert!(
+        deref_loads.iter().any(|l| l.contains("load i64")),
+        "the class id must stay in the raw-f64 compare:\n{deref}"
+    );
+    assert!(
+        deref.contains("load i16, ") && deref.contains("and i16 ") && deref.contains(", 4096"),
+        "the raw-f64 guard must test GC_OBJ_TYPED_LAYOUT_INTACT:\n{deref}"
+    );
+    assert!(
+        !ir.contains("469795071"),
+        "the GcHeader word mask is back on the read guard:\n{ir}"
+    );
+}
+
+/// Every `probe` function body (the entry and its clones) in `ir`, and
+/// nothing else: the class constructors in the same module carry the WRITE
+/// guard's own `class_field_inline.*` blocks.
+fn probe_bodies(ir: &str) -> String {
+    let mut out = String::new();
+    let mut from = 0;
+    while let Some(rel) = ir[from..].find("\ndefine ") {
+        let start = from + rel + 1;
+        let end = ir[start..]
+            .find("\n}\n")
+            .map(|e| start + e + 3)
+            .unwrap_or(ir.len());
+        let header = &ir[start..start + ir[start..].find('\n').unwrap_or(0)];
+        if header.contains("__probe") {
+            out.push_str(&ir[start..end]);
+            out.push('\n');
+        }
+        from = end;
+    }
+    assert!(!out.is_empty(), "no probe function in:\n{ir}");
+    out
+}
+
+/// `probe(p: Point)` where `Point` has `subclasses` field-less subclasses.
+fn hierarchy_ir(subclasses: u32) -> String {
+    let mut m = probe_module(Type::Any);
+    for i in 0..subclasses {
+        let mut sub = point_class(Type::Any);
+        sub.id = 200 + i;
+        sub.name = format!("Sub{i}");
+        sub.extends_name = Some("Point".to_string());
+        sub.fields = Vec::new();
+        m.classes.push(sub);
+    }
+    String::from_utf8(
+        compile_module(&m, super::class_field_barrier_tests::ir_opts()).expect("module compiles"),
+    )
+    .expect("LLVM IR should be UTF-8")
+}
+
+/// A read whose declared class has a subclass the guard cannot name goes to
+/// the generic IC. Past `MAX_CLASS_FIELD_SUBCLASS_ARMS` every arm is dropped,
+/// so a subclass instance would miss the class guard on every read and pay
+/// `js_class_field_get_ic` behind it (Zod's `ZodType` base-class reads);
+/// within the cap the arms name every subclass and the class route stays.
+/// Both halves are asserted, so the test fails if the routing never fires
+/// AND if it fires where the arms already cover the hierarchy.
+#[test]
+fn uncovered_subclass_routes_the_read_to_the_generic_ic() {
+    let covered = probe_bodies(&hierarchy_ir(1));
+    let covered_deref = block_body(&covered, "class_field_inline.deref")
+        .unwrap_or_else(|| panic!("one armed subclass must keep the class route:\n{covered}"));
+    assert_eq!(
+        covered_deref
+            .matches("load volatile i32, ptr @perry_class_guard_shape_")
+            .count(),
+        2,
+        "the declared class and its one subclass arm:\n{covered_deref}"
+    );
+
+    let wide = probe_bodies(&hierarchy_ir(9));
+    assert!(
+        block_body(&wide, "class_field_inline.deref").is_none(),
+        "nine subclasses overflow the arms: the class guard would miss every \
+         subclass receiver, so the read must not take the class route:\n{wide}"
+    );
+    assert!(
+        wide.contains("_packed_get") && !wide.contains("call double @js_class_field_get_ic("),
+        "the read must be served by the generic IC's per-site word:\n{wide}"
+    );
+}

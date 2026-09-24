@@ -219,6 +219,7 @@ pub extern "C" fn perry_ffi_promise_reject_deferred(
 /// recommended pattern; pure-async tasks can use this same shim
 /// (the closure can run an `async {}` block via
 /// `tokio::runtime::Handle::current().block_on`).
+#[cfg(feature = "async-runtime")]
 #[no_mangle]
 pub extern "C" fn perry_ffi_spawn_blocking(ctx: *mut c_void, invoke: extern "C" fn(*mut c_void)) {
     // v0.5.579: ensure perry-stdlib's pump is registered with the
@@ -236,18 +237,110 @@ pub extern "C" fn perry_ffi_spawn_blocking(ctx: *mut c_void, invoke: extern "C" 
     let ctx_addr = ctx as usize;
     // #591: keep the event loop alive until the spawned closure has
     // queued its Promise resolution. See `EXT_BLOCKING_TASKS_INFLIGHT`.
-    use std::sync::atomic::Ordering;
-    async_bridge::EXT_BLOCKING_TASKS_INFLIGHT.fetch_add(1, Ordering::AcqRel);
+    let inflight = async_bridge::InflightGuard::new();
     async_bridge::runtime().spawn_blocking(move || {
         invoke(ctx_addr as *mut c_void);
-        async_bridge::EXT_BLOCKING_TASKS_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
-        // Wake the main thread: well-formed wrappers will have
-        // queued a Promise resolution from inside `invoke`, which
-        // already notified — but a wrapper that resolves without
+        // Dropping the guard wakes the main thread: well-formed wrappers
+        // will have queued a Promise resolution from inside `invoke`,
+        // which already notified — but a wrapper that resolves without
         // going through queue_* still needs the active-handle gate
         // to flip and re-evaluate.
-        perry_runtime::event_pump::js_notify_main_thread();
+        drop(inflight);
     });
+    perry_runtime::event_pump::js_native_work_submitted();
+}
+
+/// `perry_ffi_spawn_blocking(ctx, invoke)` in a build WITHOUT tokio (turnloop
+/// P8 lane L) — same contract, no tokio blocking pool to run on.
+///
+/// Every caller that reaches this arm is a CPU-only wrapper (perry-ads,
+/// perry-ext-sharp, …): the auto-optimize driver selects `async-runtime` for
+/// every binding whose closure enters tokio (`Handle::current()` from inside
+/// the closure is only legal on tokio's own blocking pool), so this arm never
+/// sees one. It runs `invoke(ctx)` on turnloop's `Occupancy::Long` worker set
+/// (PerryTS/turnloop#42) — not the bounded set, because nothing in this ABI
+/// says the closure is short, and a closure that holds its thread must not
+/// starve bcrypt/argon2/zlib's bounded jobs. A thread with no event loop (a
+/// `worker_threads` agent before its loop exists), or a refusal at the long
+/// set's ceiling, falls back to one plain OS thread, which is what tokio's
+/// blocking pool would have spawned in the same position.
+///
+/// The in-flight counter is held for exactly the closure's run, as in the
+/// tokio arm, and released even when the job is cancelled or dropped unrun.
+#[cfg(not(feature = "async-runtime"))]
+#[no_mangle]
+pub extern "C" fn perry_ffi_spawn_blocking(ctx: *mut c_void, invoke: extern "C" fn(*mut c_void)) {
+    async_bridge::ensure_pump_registered();
+    let ctx_addr = ctx as usize;
+    let inflight = async_bridge::InflightGuard::new();
+    let run = move || {
+        invoke(ctx_addr as *mut c_void);
+        drop(inflight);
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // `submit_long` consumes `run` only when it accepts the job, so a
+        // refusal hands it back through the slot for the thread fallback.
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(run)));
+        let pool_slot = slot.clone();
+        let accepted = perry_runtime::turnloop_pool::submit_long(
+            move || {
+                if let Some(run) = pool_slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    run();
+                }
+            },
+            |_delivery| {},
+        )
+        .is_ok();
+        if accepted {
+            return;
+        }
+        let run = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(run) = run {
+            spawn_blocking_thread(run);
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    run();
+}
+
+/// The no-loop fallback of the tokio-free `perry_ffi_spawn_blocking`: one OS
+/// thread with the same stack reservation tokio's blocking pool used (#10399).
+/// If even the thread cannot be created the closure runs inline — the one
+/// outcome that must not happen is an awaited promise never settling.
+#[cfg(all(not(feature = "async-runtime"), not(target_arch = "wasm32")))]
+fn spawn_blocking_thread<F: FnOnce() + Send + 'static>(run: F) {
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(run)));
+    let thread_slot = slot.clone();
+    let spawned = std::thread::Builder::new()
+        .name("perry-blocking".to_string())
+        .stack_size(async_bridge::blocking_thread_stack_size())
+        .spawn(move || {
+            let run = thread_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(run) = run {
+                run();
+            }
+        });
+    if spawned.is_err() {
+        let run = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(run) = run {
+            run();
+        }
+    }
+    perry_runtime::event_pump::js_native_work_submitted();
 }
 
 /// `perry_ffi_spawn_blocking_with_reactor(ctx, invoke)` — like
@@ -276,6 +369,11 @@ pub extern "C" fn perry_ffi_spawn_blocking(ctx: *mut c_void, invoke: extern "C" 
 /// (test_issue_422_socket_connect / test_net_min / test_net_socket /
 /// test_net_upgrade_tls / test_sock_write_map all panicked with
 /// "there is no reactor running" without this shim).
+///
+/// Compiled only with `async-runtime`: a closure that needs tokio's reactor
+/// has nothing to run on without it, and a link error names the missing
+/// feature where a stub would abort at runtime.
+#[cfg(feature = "async-runtime")]
 #[no_mangle]
 pub extern "C" fn perry_ffi_spawn_blocking_with_reactor(
     ctx: *mut c_void,
@@ -286,17 +384,15 @@ pub extern "C" fn perry_ffi_spawn_blocking_with_reactor(
     async_bridge::ensure_pump_registered();
     let ctx_addr = ctx as usize;
     // #591: same active-handle gate as the plain variant.
-    use std::sync::atomic::Ordering;
-    async_bridge::EXT_BLOCKING_TASKS_INFLIGHT.fetch_add(1, Ordering::AcqRel);
+    let inflight = async_bridge::InflightGuard::new();
     // Spawn directly on the multi-thread runtime so the closure
     // body runs on a worker thread that has full I/O reactor +
     // handle access. Inside the spawned task, `tokio::spawn(fut)`
     // and `Handle::current().spawn(fut)` both work for fan-out
     // I/O work.
-    async_bridge::runtime().spawn(async move {
+    async_bridge::spawn_native(async move {
         invoke(ctx_addr as *mut c_void);
-        async_bridge::EXT_BLOCKING_TASKS_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
-        perry_runtime::event_pump::js_notify_main_thread();
+        drop(inflight);
     });
 }
 
@@ -324,6 +420,10 @@ pub extern "C" fn perry_ffi_spawn_blocking_with_reactor(
 /// `ctx` must be a pointer produced by perry-ffi's `spawn_async` (i.e.
 /// `Box::into_raw` of a `Box<Pin<Box<dyn Future<Output = ()> +
 /// Send>>>`) and not already consumed.
+///
+/// Compiled only with `async-runtime`, for the reason
+/// `perry_ffi_spawn_blocking_with_reactor` is: the future is a tokio future.
+#[cfg(feature = "async-runtime")]
 #[no_mangle]
 pub unsafe extern "C" fn perry_ffi_spawn_async(ctx: *mut c_void) {
     // Register the main-thread pump exactly like the blocking variants
@@ -334,7 +434,7 @@ pub unsafe extern "C" fn perry_ffi_spawn_async(ctx: *mut c_void) {
     // SAFETY: `ctx` came from perry-ffi's `spawn_async` (Box::into_raw
     // of `Box<BoxFuture>`); reconstruct + own it once.
     let future: BoxFuture = *unsafe { Box::from_raw(ctx as *mut BoxFuture) };
-    async_bridge::runtime().spawn(future);
+    async_bridge::spawn_native(future);
 }
 
 /// `perry_ffi_run_pending(budget_ms)` — drive the shared current-thread runtime
@@ -344,8 +444,182 @@ pub unsafe extern "C" fn perry_ffi_spawn_async(ctx: *mut c_void) {
 /// actually runs; in the unified single-thread model the runtime only advances
 /// while the main thread drives it. Safe on the main thread between ticks; must
 /// not be called from inside a spawned runtime task.
+///
+/// turnloop P4 (DESIGN §9, "`run_pending` becomes a bounded `turn`"): this is
+/// now a **v1 shim over v2**. It takes a turnloop turn *first*, so a caller
+/// polling for a blocking-pool result actually collects it — a turn is the only
+/// thing that does — and then drives whatever tokio work is left. The tokio
+/// half goes away with tokio in P8; the signature does not change.
+///
+/// The turn is deliberately **non-blocking** rather than given the caller's
+/// budget: this shim's callers are waiting for something *tokio* will deliver
+/// (`js_ws_wait_for_message`), and spending their budget parked in turnloop
+/// would add a poll's worth of latency to every one of them. A caller that is
+/// waiting for a pool result specifically asks for a blocking turn through the
+/// v2 [`perry_ffi_pool_turn`].
+///
+/// Without tokio (turnloop P8 lane L) there is no tokio half to drive, so the
+/// whole budget goes to the turn: whatever a caller is waiting for is either a
+/// turnloop completion or a pump entry a pool/OS thread queues, and a bounded
+/// turn is what observes both.
 #[no_mangle]
 pub extern "C" fn perry_ffi_run_pending(budget_ms: u64) {
     async_bridge::ensure_pump_registered();
-    async_bridge::drive_pending(budget_ms);
+    #[cfg(feature = "async-runtime")]
+    {
+        pool_turn(0);
+        async_bridge::drive_pending(budget_ms);
+    }
+    #[cfg(not(feature = "async-runtime"))]
+    pool_turn(budget_ms);
+}
+
+// ── perry-ffi async ABI v2: the shared blocking pool ────────────────────────
+//
+// The v2 surface is three symbols, and the split between them is the contract
+// (see `perry-ffi::pool`): `run_on_pool` runs on a turnloop pool thread with
+// nothing but owned Rust data, `deliver_on_owner` runs on the thread that
+// submitted, where JSValues are legal. perry-ffi owns both trampolines and the
+// `ctx` box; this side only routes.
+
+/// Outcome codes, matching `perry-ffi::pool`'s. Plain integers so the boundary
+/// carries no Rust layout.
+const POOL_OUTCOME_DONE: i32 = 0;
+const POOL_OUTCOME_CANCELLED: i32 = 1;
+const POOL_OUTCOME_FAILED: i32 = 2;
+
+/// `perry_ffi_pool_submit(ctx, run_on_pool, deliver_on_owner)` — run
+/// `run_on_pool(ctx)` on turnloop's shared bounded pool and
+/// `deliver_on_owner(ctx, outcome)` on the calling thread once it finishes.
+///
+/// Returns the job id, or **0** when the submission was refused — this thread
+/// has no event loop (a `worker_threads` agent), or the pool queue is full.
+/// A refused submission delivers nothing and the caller still owns `ctx`.
+///
+/// Exactly one delivery per accepted job (turnloop DESIGN D4), including when
+/// the job is cancelled or panics, so `ctx` is freed exactly once.
+///
+/// Unlike `perry_ffi_spawn_blocking` this needs no in-flight counter: an
+/// accepted job is an outstanding turnloop operation, and
+/// `js_stdlib_has_active_handles` already reports it through
+/// `turnloop_pool::has_pending_jobs`.
+#[no_mangle]
+pub extern "C" fn perry_ffi_pool_submit(
+    ctx: *mut c_void,
+    run_on_pool: extern "C" fn(*mut c_void),
+    deliver_on_owner: extern "C" fn(*mut c_void, i32),
+) -> u64 {
+    // Resolutions a delivery queues drain on the main thread through the
+    // stdlib pump, exactly as for the v1 shims.
+    async_bridge::ensure_pump_registered();
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Raw pointers are not `Send`; the address is, and only the pool-side
+        // trampoline dereferences it there (see `perry-ffi::pool::Ctx`).
+        let ctx_addr = ctx as usize;
+        let submitted = perry_runtime::turnloop_pool::submit(
+            move || {
+                run_on_pool(ctx_addr as *mut c_void);
+            },
+            move |delivery| {
+                let outcome = match delivery {
+                    perry_runtime::turnloop_pool::Delivery::Done(()) => POOL_OUTCOME_DONE,
+                    perry_runtime::turnloop_pool::Delivery::Cancelled => POOL_OUTCOME_CANCELLED,
+                    perry_runtime::turnloop_pool::Delivery::Failed(_) => POOL_OUTCOME_FAILED,
+                };
+                deliver_on_owner(ctx_addr as *mut c_void, outcome);
+            },
+        );
+        match submitted {
+            Ok(job) => job.raw(),
+            Err(_) => 0,
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (ctx, run_on_pool, deliver_on_owner);
+        0
+    }
+}
+
+/// `perry_ffi_pool_cancel(job)` — ask the runtime to cancel an accepted job.
+/// Best effort (turnloop DESIGN D8): a job the pool already started runs to its
+/// end, and either way exactly one delivery still happens. Returns 0 when the
+/// job is already delivered or unknown.
+#[no_mangle]
+pub extern "C" fn perry_ffi_pool_cancel(job: u64) -> i32 {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let id = perry_runtime::turnloop_pool::JobId::from_raw(job);
+        i32::from(perry_runtime::turnloop_pool::cancel(id))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = job;
+        0
+    }
+}
+
+/// `perry_ffi_pool_turn(budget_ms)` — one bounded event-loop turn, so a
+/// synchronous binding polling for a pool result actually collects it.
+#[no_mangle]
+pub extern "C" fn perry_ffi_pool_turn(budget_ms: u64) {
+    pool_turn(budget_ms);
+}
+
+#[inline]
+fn pool_turn(budget_ms: u64) {
+    #[cfg(not(target_arch = "wasm32"))]
+    perry_runtime::turnloop_pool::turn(budget_ms);
+    #[cfg(target_arch = "wasm32")]
+    let _ = budget_ms;
+}
+
+/// The tokio-free `perry_ffi_spawn_blocking` arm only compiles without
+/// `async-runtime`, which the default (`full`) test build always has, so these
+/// run under e.g. `cargo test -p perry-stdlib --no-default-features --features
+/// crypto`. The unit-test thread has no agent loop, so this exercises the
+/// plain-thread fallback; the `Occupancy::Long` path is
+/// `turnloop_pool::tests::a_long_job_runs_while_every_bounded_worker_is_held`.
+#[cfg(all(test, not(feature = "async-runtime"), not(target_arch = "wasm32")))]
+mod tokio_free_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    static RAN: AtomicU64 = AtomicU64::new(0);
+
+    extern "C" fn record_run(ctx: *mut c_void) {
+        // Take ownership of the ctx box exactly as perry-ffi's trampoline does.
+        let caller = unsafe { Box::from_raw(ctx as *mut std::thread::ThreadId) };
+        assert_ne!(
+            *caller,
+            std::thread::current().id(),
+            "the closure must not run on the thread that called the shim"
+        );
+        RAN.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[test]
+    fn spawn_blocking_without_tokio_runs_off_thread_and_releases_its_inflight() {
+        let baseline = async_bridge::EXT_BLOCKING_TASKS_INFLIGHT.load(Ordering::Acquire);
+        let ran_before = RAN.load(Ordering::Acquire);
+        let ctx = Box::into_raw(Box::new(std::thread::current().id())) as *mut c_void;
+        perry_ffi_spawn_blocking(ctx, record_run);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while RAN.load(Ordering::Acquire) == ran_before
+            || async_bridge::EXT_BLOCKING_TASKS_INFLIGHT.load(Ordering::Acquire) != baseline
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the closure never ran, or its in-flight reference leaked"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            RAN.load(Ordering::Acquire),
+            ran_before + 1,
+            "ran exactly once"
+        );
+    }
 }

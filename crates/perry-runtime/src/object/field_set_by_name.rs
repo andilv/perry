@@ -227,9 +227,9 @@ pub extern "C" fn js_object_set_field_by_name(
                                     o,
                                     prev_shape_id,
                                     target_shape_id,
-                                    next_keys as *mut ArrayHeader,
+                                    next_keys,
                                 ) {
-                                    set_object_keys_array(o, next_keys as *mut ArrayHeader);
+                                    set_object_keys(o, next_keys);
                                 }
                                 // #8113: one bound probe, reused.
                                 let live_slots = crate::object::object_live_slot_count(o);
@@ -305,6 +305,16 @@ pub extern "C" fn js_object_set_field_by_name(
     'exotic_gauntlet: {
         if receiver_is_object_header {
             break 'exotic_gauntlet;
+        }
+        // #10943: arm the own-override guard BEFORE this gauntlet's per-kind
+        // branches. There is no single install funnel below — buffers, stream
+        // handles and the meta/expando paths each store their own way — and a
+        // missed installer is the silent wrong value the guard exists to
+        // remove. Arming here covers every kind including ones added later;
+        // it over-approximates, and the only cost of that is the guard's slow
+        // side. Named keys only: an index write is not a method shadow.
+        if !key.is_null() {
+            crate::object::own_override::note_exotic_named_prop_install();
         }
         // A Buffer is an ordinary object in Node (a Uint8Array), so `buf.foo = v`
         // stores an own property — and an own key SHADOWS the same-named prototype

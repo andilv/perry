@@ -45,9 +45,15 @@ mod hoist_classes;
 mod wrap;
 
 #[cfg(test)]
+mod issue_10435_tests;
+#[cfg(test)]
 mod issue_10662_tests;
 #[cfg(test)]
+mod issue_10760_tests;
+#[cfg(test)]
 mod issue_6585_tests;
+#[cfg(test)]
+mod package_resolution_tests;
 #[cfg(test)]
 mod parcel_watcher_tests;
 #[cfg(test)]

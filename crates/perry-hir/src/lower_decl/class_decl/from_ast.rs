@@ -117,7 +117,7 @@ pub(crate) fn lower_class_from_ast(
                 // `is_genuine_node_stream_parent` so a userland stream-shim
                 // binding (readable-stream's `Transform`) falls through to the
                 // dynamic `extends_expr` parent path.
-                "Readable" | "Writable" | "Duplex" | "Transform"
+                "Readable" | "Writable" | "Duplex" | "Transform" | "PassThrough"
                     if is_genuine_node_stream_parent(ctx, &parent_name) =>
                 {
                     Some(("node_stream".to_string(), canonical_parent_name.clone()))
@@ -199,6 +199,18 @@ pub(crate) fn lower_class_from_ast(
                     match lower_class_heritage_expr(ctx, super_class) {
                         Ok(expr) => (None, Some(parent_name), None, Some(Box::new(expr))),
                         Err(_) => (None, Some(parent_name), None, None),
+                    }
+                } else if ctx.scope_depth > 0 && ctx.locals.lookup(ident.sym.as_ref()).is_some() {
+                    // A function-local class declaration is a fresh class
+                    // object each time its enclosing function runs. Preserve
+                    // its static id for method/layout analysis, but also
+                    // record the evaluated local as the actual superclass.
+                    // Otherwise a fresh child class expression links to the
+                    // shared template prototype and loses writes such as
+                    // `Base.prototype.name = tag` (Effect TaggedError).
+                    match lower_class_heritage_expr(ctx, super_class) {
+                        Ok(expr) => (parent_cid, Some(parent_name), None, Some(Box::new(expr))),
+                        Err(_) => (parent_cid, Some(parent_name), None, None),
                     }
                 } else {
                     (parent_cid, Some(parent_name), None, None)

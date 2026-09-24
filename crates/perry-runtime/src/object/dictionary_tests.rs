@@ -13,16 +13,25 @@ use super::dictionary;
 use super::{js_object_alloc, js_object_get_field_by_name, js_object_set_field_by_name};
 
 /// Restores the latch arming on scope exit (panic included) so a failing test
-/// cannot leak an armed latch into unrelated tests on the same process.
+/// cannot leak its arming into unrelated tests on the same process.
+///
+/// It RESTORES WHAT IT FOUND. It used to disarm unconditionally, which was
+/// the same thing while the default was off — and became the opposite of
+/// restoring once #10868 armed the latch by default: every dictionary test
+/// then leaked a DISARMED latch forward, and
+/// `own_key_membership_crosses_65536_without_a_cutoff`, which runs later in
+/// the same binary and whose key list is unique to it, hit the k(k+1)/2
+/// cliff and was OOM-killed. It passed standalone and died in the suite,
+/// which is the signature of leaked process-global state (L16.11).
 fn scopeguard_latch() -> impl Drop {
-    struct Restore;
+    struct Restore(Option<u64>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            dictionary::test_arm_latch(None);
+            dictionary::test_arm_latch(self.0);
             dictionary::test_clear_layout_id_budget();
         }
     }
-    Restore
+    Restore(dictionary::test_latch_state())
 }
 
 unsafe fn set_key(obj: *mut super::ObjectHeader, name: &str, value: f64) {
@@ -86,7 +95,7 @@ fn the_latch_moves_the_key_list_into_the_meta_record() {
             !dictionary::is_dictionary(obj),
             "test premise: the latch is off by default"
         );
-        let before = super::object_keys_array(obj);
+        let before = super::object_keys(obj).arr();
         assert!(!before.is_null(), "test premise: the receiver has keys");
 
         assert!(
@@ -105,7 +114,7 @@ fn the_latch_moves_the_key_list_into_the_meta_record() {
             "the dictionary shape must draw from the dictionary namespace"
         );
 
-        let after = super::object_keys_array(obj);
+        let after = super::object_keys(obj).arr();
         assert!(!after.is_null(), "the key list must still be reachable");
         assert_ne!(
             after, before,
@@ -131,7 +140,7 @@ fn the_latch_moves_the_key_list_into_the_meta_record() {
             );
         }
         assert_eq!(
-            crate::array::js_array_length(super::object_keys_array(obj)),
+            crate::array::js_array_length(super::object_keys(obj).arr()),
             14
         );
     }
@@ -385,5 +394,56 @@ fn layout_id_exhaustion_latches_whatever_the_key_count() {
         assert_eq!(get_key(obj, "dictx_b"), 2.0);
         assert_eq!(get_key(obj, "dictx_c"), 3.0);
         assert_eq!(get_key(obj, "dictx_d"), 4.0);
+    }
+}
+
+/// Trigger 1 latches a key list UNIQUE to its receiver, not a long one: a
+/// family of objects built the same way shares its lineage, so at most the
+/// receivers that extend it past what an earlier one reached latch — here
+/// only the first. A raw key-count trigger at the same threshold latches all
+/// four (it did, before the trigger read the canonical trie's unique run).
+#[test]
+fn a_family_sharing_a_long_list_does_not_latch_but_a_unique_list_does() {
+    let _lock = crate::gc::global_side_table_test_lock();
+    let _restore = scopeguard_latch();
+    unsafe {
+        dictionary::test_arm_latch(Some(40));
+        dictionary::test_reset_counters();
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let family: Vec<_> = (0..4)
+            .map(|_| {
+                let obj = scope.root_raw_mut_ptr(js_object_alloc(0, 0));
+                for i in 0..60 {
+                    obj.with_mut_ptr(|o| set_key(o, &format!("dictfam_{i:02}"), i as f64));
+                }
+                obj
+            })
+            .collect();
+        let latched: Vec<bool> = family
+            .iter()
+            .map(|obj| obj.with_const_ptr(|o| dictionary::is_dictionary(o)))
+            .collect();
+        assert_eq!(
+            latched,
+            [true, false, false, false],
+            "only the receiver that grew the lineage first may latch"
+        );
+        assert_eq!(dictionary::dictionary_latches(), 1);
+        for obj in &family {
+            for i in [0, 39, 40, 59] {
+                assert_eq!(
+                    obj.with_mut_ptr(|o| get_key(o, &format!("dictfam_{i:02}"))),
+                    i as f64
+                );
+            }
+        }
+        // A list unique to its receiver latches once its run reaches the
+        // threshold.
+        let unique = scope.root_raw_mut_ptr(js_object_alloc(0, 0));
+        for i in 0..45 {
+            unique.with_mut_ptr(|o| set_key(o, &format!("dictuniq_{i:02}"), i as f64));
+        }
+        assert!(unique.with_const_ptr(|o| dictionary::is_dictionary(o)));
+        assert_eq!(dictionary::dictionary_latches(), 2);
     }
 }

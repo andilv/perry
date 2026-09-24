@@ -59,16 +59,25 @@ toml.workspace = true
 walkdir.workspace = true
 # `perry dev` file-watch loop only (commands/dev.rs); optional under watch-cli.
 notify = { workspace = true, optional = true }
-reqwest.workspace = true
-tokio.workspace = true
-tokio-tungstenite.workspace = true
-futures-util.workspace = true
+# turnloop P11 (docs/turnloop/p11-report.md): the CLI's HTTP and WebSocket
+# transport. It has no JS event loop to cooperate with, so it owns a
+# `turnloop::Loop` per connection and turns it to completion — which is why
+# reqwest, tokio and tokio-tungstenite are gone from this manifest rather than
+# narrowed. `python3 scripts/tokio_inventory.py` gates that they stay gone.
+perry-http-client.workspace = true
 url.workspace = true
 dirs.workspace = true
 flate2.workspace = true
 tar.workspace = true
 base64.workspace = true
-zip.workspace = true
+# Keep zip's default codec set, but select its backend-neutral flate2 feature.
+# `zip`'s `deflate` feature forces flate2's zlib-rs backend across the whole
+# Cargo build; feature unification then makes node:zlib's default gzip output
+# almost twice as large (#10810).
+zip = { version = "8", default-features = false, features = [
+  "aes-crypto", "bzip2", "deflate64", "deflate-flate2", "deflate-zopfli",
+  "lzma", "ppmd", "time", "zstd", "xz",
+] }
 tempfile.workspace = true
 libc.workspace = true
 zstd.workspace = true
@@ -101,7 +110,7 @@ fslock = "0.2"
 # feature — listing them as direct deps just makes them callable from
 # the CLI module. ed25519-dalek 2.1 takes any CryptoRng; we use rand 0.9
 # for the keygen seed.
-ed25519-dalek = { version = "2.1", features = ["rand_core"], optional = true }
+ed25519-dalek = { version = "3.0", features = ["rand_core"], optional = true }
 sha2 = "0.11"
 hex.workspace = true
 rand = { version = "0.10", optional = true }

@@ -1,5 +1,7 @@
 //! `Stmt::For`, `Stmt::While`, `Stmt::DoWhile` lowering and supporting helpers.
 
+mod i32_counter;
+
 use super::*;
 
 use crate::expr::{
@@ -7157,6 +7159,9 @@ pub(crate) fn lower_for(
         return Ok(());
     }
 
+    if i32_counter::lower(ctx, init, condition, update, body)? {
+        return Ok(());
+    }
     lower_for_after_init(ctx, init, condition, update, body, "for")
 }
 
@@ -7187,6 +7192,29 @@ pub(super) fn lower_for_after_init_with_i32_bound(
     body: &[Stmt],
     label_prefix: &str,
     precomputed_i32_bound: Option<(u32, String)>,
+) -> Result<()> {
+    lower_for_after_init_impl(
+        ctx,
+        init,
+        condition,
+        update,
+        body,
+        label_prefix,
+        precomputed_i32_bound,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_for_after_init_impl(
+    ctx: &mut FnCtx<'_>,
+    init: Option<&Stmt>,
+    condition: Option<&perry_hir::Expr>,
+    update: Option<&perry_hir::Expr>,
+    body: &[Stmt],
+    label_prefix: &str,
+    precomputed_i32_bound: Option<(u32, String)>,
+    try_dynamic_bound: bool,
 ) -> Result<()> {
     let loop_proof_scope_id = ctx.next_loop_proof_scope_id();
 
@@ -7450,7 +7478,8 @@ pub(super) fn lower_for_after_init_with_i32_bound(
     // finite-integral-i32 guard and `fptosi(n)` once here, in the pre-loop
     // block, so the cond block can pick an `icmp slt/sle i32` fast loop when
     // safe and fall back to the generic comparison otherwise.
-    let dynamic_i32_bound: Option<DynamicI32Bound> = if hoist_classification.is_none()
+    let dynamic_i32_bound: Option<DynamicI32Bound> = if try_dynamic_bound
+        && hoist_classification.is_none()
         && local_bound_classification.is_none()
         && precomputed_i32_bound.is_none()
     {
@@ -8525,7 +8554,19 @@ pub(crate) fn classify_for_local_bound(
     };
     // Counter must be provably integer-valued (initialized from integer
     // literal, only mutated by Update ++/--).
-    if !ctx.integer_locals.contains(&counter_id) {
+    // #11052: the i32 condition path is only valid when every update can keep
+    // its shadow in sync. A captured mutable counter lives in a heap box;
+    // `Update` writes that box and deliberately returns before touching
+    // `i32_counter_slots`. Installing a fresh stack shadow for such a counter
+    // leaves the condition reading its initial value forever. Captures and
+    // module globals likewise do not own ordinary local storage that this
+    // optimization may shadow.
+    if !ctx.integer_locals.contains(&counter_id)
+        || !local_has_readable_slot(ctx, counter_id)
+        || ctx.boxed_vars.contains(&counter_id)
+        || ctx.closure_captures.contains_key(&counter_id)
+        || ctx.module_globals.contains_key(&counter_id)
+    {
         return None;
     }
     // Bound is safe to hoist only when it is both i32-proven and loop
@@ -9223,6 +9264,7 @@ fn expr_array_length_effect(
         | Expr::TypeOf(operand)
         | Expr::Delete(operand)
         | Expr::StringCoerce(operand)
+        | Expr::TemplateStringCoerce(operand)
         | Expr::ObjectCoerce(operand)
         | Expr::BooleanCoerce(operand)
         | Expr::NumberCoerce(operand) => walk(operand),
@@ -9680,6 +9722,7 @@ pub(crate) fn expr_preserves_array_length(
         | Expr::TypeOf(operand)
         | Expr::Delete(operand)
         | Expr::StringCoerce(operand)
+        | Expr::TemplateStringCoerce(operand)
         | Expr::ObjectCoerce(operand)
         | Expr::BooleanCoerce(operand)
         | Expr::NumberCoerce(operand) => walk(operand),

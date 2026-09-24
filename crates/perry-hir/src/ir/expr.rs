@@ -1576,6 +1576,10 @@ pub enum Expr {
         // aborted (`controller.abort()` / `AbortSignal.timeout`). Lowered to a
         // `js_fetch_set_pending_signal` call emitted just before the fetch.
         signal: Option<Box<Expr>>,
+        // The `init.redirect` mode, when present. Lowered to the pending-mode
+        // bridge immediately before `js_fetch_with_options`, whose ABI predates
+        // RequestInit redirect support.
+        redirect: Option<Box<Expr>>,
     },
     FetchGetWithAuth {
         // fetchWithAuth(url, authHeader) -> Promise<Response>
@@ -2440,6 +2444,8 @@ pub enum Expr {
     /// String(value) -> string
     /// Type coercion to string
     StringCoerce(Box<Expr>),
+    /// Template substitution uses abstract ToString, which rejects Symbols.
+    TemplateStringCoerce(Box<Expr>),
     /// `Object(value)` plain-call coercion (#3149). Nullish/primitive → a fresh
     /// `{}`; an existing object/array passes through unchanged.
     ObjectCoerce(Box<Expr>),

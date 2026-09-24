@@ -665,7 +665,7 @@ pub(crate) fn lower_module_decl(
                                     // method dispatch (returning 0 for every
                                     // unknown property), so reads of any field
                                     // returned 0. Same shadowing logic applies
-                                    // to `Decimal`, `BigNumber`, etc.
+                                    // to the other hardcoded names below.
                                     let user_class_defined = module
                                         .classes
                                         .iter()
@@ -688,9 +688,6 @@ pub(crate) fn lower_module_decl(
                                                 Some("ws".to_string())
                                             }
                                             "Redis" => Some("ioredis".to_string()),
-                                            "Big" => Some("big.js".to_string()),
-                                            "Decimal" => Some("decimal.js".to_string()),
-                                            "BigNumber" => Some("bignumber.js".to_string()),
                                             _ => None,
                                         }
                                     };
@@ -754,9 +751,6 @@ pub(crate) fn lower_module_decl(
                                                     Some("ws".to_string())
                                                 }
                                                 "Redis" => Some("ioredis".to_string()),
-                                                "Big" => Some("big.js".to_string()),
-                                                "Decimal" => Some("decimal.js".to_string()),
-                                                "BigNumber" => Some("bignumber.js".to_string()),
                                                 _ => None,
                                             }
                                         };
@@ -1460,19 +1454,38 @@ pub(crate) fn lower_module_decl(
                                 })
                                 .unwrap_or_else(|| local.clone());
 
-                            // A Node builtin has no compiled source module for the
+                            // A native module has no compiled source module for the
                             // driver to follow through a normal ReExport edge. Model
                             // the forwarding binding as a synthetic named import so
                             // codegen can publish a live getter for the builtin ESM
                             // export cell. The synthetic local is compiler-private:
                             // `export { x } from "node:m"` does not introduce `x`
                             // into this module's lexical scope.
+                            // Node core builtins are the only sources with a
+                            // manifest complete enough to validate named-export
+                            // existence (`module_has_public_named_export` reads
+                            // the generated API manifest, which is exhaustive
+                            // only for core modules). Other Perry-native npm
+                            // packages (ws, ioredis, mysql2, ...) still need the
+                            // same synthetic-import treatment below — #11044:
+                            // ethers' `ws.ts` does `export { WebSocket } from
+                            // "ws"`, and without this a facade re-export of a
+                            // non-core native package fell through to the
+                            // generic `Export::ReExport` arm below, which has
+                            // no compiled source module to follow either — so
+                            // codegen expected a local function body that was
+                            // never emitted, and the link failed on
+                            // `__perry_wrap_perry_fn_<mod>__<name>`.
                             let native_source = canonicalize_native_import_source(&source);
-                            if perry_api_manifest::is_node_core_module(&native_source) {
-                                if !perry_api_manifest::module_has_public_named_export(
-                                    &native_source,
-                                    &local,
-                                ) {
+                            if is_native_module(&native_source) {
+                                let is_node_core =
+                                    perry_api_manifest::is_node_core_module(&native_source);
+                                if is_node_core
+                                    && !perry_api_manifest::module_has_public_named_export(
+                                        &native_source,
+                                        &local,
+                                    )
+                                {
                                     crate::lower_bail!(
                                         named.span,
                                         "The requested module '{}' does not provide an export named '{}'",

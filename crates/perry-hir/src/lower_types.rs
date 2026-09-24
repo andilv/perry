@@ -610,6 +610,26 @@ fn infer_type_from_expr_inner(expr: &ast::Expr, ctx: &LoweringContext) -> Type {
                         return Type::Any;
                     }
                 }
+                // #11128: `new C()` where `C` is a VALUE binding — a local
+                // holding a class value (`const C: any = R`, a factory's
+                // result, a destructured `require(...)` namespace) — not a
+                // class declaration, a function declaration or an import.
+                // Nothing is known about what it constructs, so the instance
+                // is `Any`. Typing it `Named("C")` named no class, and the
+                // array/collection fast-path gates read an unknown `Named`
+                // as "definitely not a string, so an array": `r.push(1)`
+                // lowered to `Expr::ArrayPush`, which rewrote the receiver
+                // local with a fresh array and never ran the user's `push`
+                // (redis's `SinglyLinkedList`). Checked before the type-args
+                // arm so `new C<T>()` does not become `Generic { base: "C" }`
+                // with the same effect.
+                if !ctx.classes_index.contains_key(name.as_str())
+                    && ctx.lookup_local(&name).is_some()
+                    && ctx.lookup_func(&name).is_none()
+                    && ctx.lookup_imported_func(&name).is_none()
+                {
+                    return Type::Any;
+                }
                 if let Some(type_args) = new_expr.type_args.as_ref() {
                     // #10894: `new Uint8Array<ArrayBuffer>(n)` — the argument
                     // is the backing buffer's type and has no runtime meaning,
@@ -1135,6 +1155,69 @@ pub(crate) fn is_node_readable_static_factory_call(
     };
     matches!(&member.prop, ast::MemberProp::Ident(prop) if matches!(prop.sym.as_ref(), "from" | "of"))
         && is_node_readable_constructor_ref(ctx, member.obj.as_ref())
+}
+
+fn is_web_readable_stream_module_alias(ctx: &LoweringContext, name: &str) -> bool {
+    matches!(
+        ctx.lookup_native_module(name),
+        Some(("stream/web" | "node:stream/web", None))
+    ) || matches!(
+        ctx.namespace_import_sources.get(name).map(String::as_str),
+        Some("stream/web" | "node:stream/web")
+    )
+}
+
+pub(crate) fn is_web_readable_stream_constructor_ref(
+    ctx: &LoweringContext,
+    expr: &ast::Expr,
+) -> bool {
+    match expr {
+        ast::Expr::Ident(ident) => {
+            let name = ident.sym.as_ref();
+            matches!(
+                ctx.lookup_native_module(name),
+                Some(("stream/web" | "node:stream/web", Some("ReadableStream")))
+            ) || (name == "ReadableStream" && !ctx.shadows_unqualified_global(name))
+        }
+        ast::Expr::Member(member) => {
+            let (ast::Expr::Ident(obj), ast::MemberProp::Ident(prop)) =
+                (member.obj.as_ref(), &member.prop)
+            else {
+                return false;
+            };
+            prop.sym.as_ref() == "ReadableStream"
+                && is_web_readable_stream_module_alias(ctx, obj.sym.as_ref())
+        }
+        ast::Expr::Paren(paren) => is_web_readable_stream_constructor_ref(ctx, &paren.expr),
+        ast::Expr::TsAs(ts_as) => is_web_readable_stream_constructor_ref(ctx, &ts_as.expr),
+        ast::Expr::TsTypeAssertion(ts_assert) => {
+            is_web_readable_stream_constructor_ref(ctx, &ts_assert.expr)
+        }
+        ast::Expr::TsNonNull(non_null) => {
+            is_web_readable_stream_constructor_ref(ctx, &non_null.expr)
+        }
+        ast::Expr::TsConstAssertion(const_assert) => {
+            is_web_readable_stream_constructor_ref(ctx, &const_assert.expr)
+        }
+        ast::Expr::TsSatisfies(satisfies) => {
+            is_web_readable_stream_constructor_ref(ctx, &satisfies.expr)
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn is_web_readable_stream_from_call(ctx: &LoweringContext, expr: &ast::Expr) -> bool {
+    let ast::Expr::Call(call) = expr else {
+        return false;
+    };
+    let ast::Callee::Expr(callee) = &call.callee else {
+        return false;
+    };
+    let ast::Expr::Member(member) = callee.as_ref() else {
+        return false;
+    };
+    matches!(&member.prop, ast::MemberProp::Ident(prop) if prop.sym.as_ref() == "from")
+        && is_web_readable_stream_constructor_ref(ctx, member.obj.as_ref())
 }
 
 fn expr_may_have_typed_receiver(expr: &ast::Expr, ctx: &LoweringContext) -> bool {

@@ -45,7 +45,7 @@ use super::property_get_names::{
 };
 
 pub(crate) mod generic_dispatch;
-mod globalget;
+pub(crate) mod globalget;
 mod helpers;
 
 mod composed_ics;
@@ -1626,6 +1626,31 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                             );
                             return Ok(val);
                         }
+                        let requires_raw_f64 = crate::type_analysis::class_field_declared_type(
+                            ctx,
+                            &class_name,
+                            property,
+                        )
+                        .as_ref()
+                        .is_some_and(crate::typed_shape::type_is_raw_f64_candidate);
+                        let subclass_arms =
+                            crate::expr::class_field_inline_guard::class_field_subclass_arms(
+                                ctx,
+                                &class_name,
+                                property,
+                                field_index,
+                                requires_raw_f64,
+                            );
+                        // A subclass the guard cannot name would miss it on
+                        // every read and pay the IC call behind it; the
+                        // generic IC serves such a site from its own word.
+                        if !crate::expr::class_field_inline_guard::class_field_arms_cover_every_subclass(
+                            ctx,
+                            &class_name,
+                            &subclass_arms,
+                        ) {
+                            return lower_generic_property_get(ctx, object, property, *byte_offset);
+                        }
                         let recv_box = lower_expr(ctx, object)?;
                         let key_idx = ctx.strings.intern(property);
                         let key_handle_global =
@@ -1638,13 +1663,6 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         );
                         let field_idx_str = field_index.to_string();
                         let expected_class_id_str = expected_class_id.to_string();
-                        let requires_raw_f64 = crate::type_analysis::class_field_declared_type(
-                            ctx,
-                            &class_name,
-                            property,
-                        )
-                        .as_ref()
-                        .is_some_and(crate::typed_shape::type_is_raw_f64_candidate);
                         let requires_raw_f64_str = if requires_raw_f64 { "1" } else { "0" };
                         let expected_shape_id = crate::typed_shape::load_class_shape_id(
                             ctx,
@@ -1683,12 +1701,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         // #5093: build the guard operands once, up front, so
                         // both the inline shape pre-check and the fast slot
                         // load can reference them.
-                        let (obj_bits, obj_handle) = {
-                            let blk = ctx.block();
-                            let obj_bits = blk.bitcast_double_to_i64(&recv_box);
-                            let obj_handle = blk.and(I64, &obj_bits, POINTER_MASK_I64);
-                            (obj_bits, obj_handle)
-                        };
+                        let obj_bits = ctx.block().bitcast_double_to_i64(&recv_box);
                         let fast_idx = ctx.new_block("class_field_get.fast");
                         let merge_idx = ctx.new_block("class_field_get.merge");
                         let fast_label = ctx.block_label(fast_idx);
@@ -1698,22 +1711,12 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         // branches straight to the fast slot load, skipping the
                         // cross-crate guard call; on a miss it leaves the current
                         // block at the single-exit IC call below.
-                        let subclass_arms =
-                            crate::expr::class_field_inline_guard::class_field_subclass_arms(
-                                ctx,
-                                &class_name,
-                                property,
-                                field_index,
-                                requires_raw_f64,
-                            );
-                        let _guardcall_label =
-                            crate::expr::class_field_inline_guard::emit_class_field_inline_precheck(
+                        let (_guardcall_label, obj_handle) =
+                            crate::expr::class_field_inline_guard::emit_class_field_read_precheck(
                                 ctx,
                                 &obj_bits,
-                                &obj_handle,
                                 &expected_class_id_str,
                                 requires_raw_f64,
-                                None,
                                 &fast_label,
                                 &subclass_arms,
                                 &keys_global_name,

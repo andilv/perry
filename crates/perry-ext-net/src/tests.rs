@@ -186,3 +186,92 @@ fn listener_registration_round_trip() {
     assert_eq!(cbs[0], 0xDEADBEEF_i64);
     assert_eq!(cbs[1], 0xCAFEBABE_i64);
 }
+
+/// `undefined` as the codegen hands it to a native method: the two trailing
+/// arguments of `socket.connect(port)`.
+const UNDEFINED: f64 = f64::from_bits(0x7FFC_0000_0000_0001);
+
+/// `new net.Socket()` then `socket.connect(port)` — issue #422's deferred
+/// connect, which is also what `Bun.connect` and `net.Socket.prototype.connect`
+/// lower to — must reach the agent's turnloop loop, on whichever thread asks.
+///
+/// History: `js_net_socket_method_connect` once had no `turnloop_io::enabled()`
+/// check at all and spawned a tokio socket task even with the loop fully
+/// available. There is no tokio task to fall back to any more, so the three
+/// outcomes are the three routes of `turnloop_io::on_loop`:
+///
+/// * this thread owns the loop — the connect is submitted here, and
+///   `turnloop_net::live_handles` (the independent witness: it counts the
+///   handles this thread's loop actually holds) moves by one;
+/// * another thread owns it — the socket is published as a loop socket and
+///   the submission is posted to that owner, so nothing is registered here;
+/// * no loop exists for the agent — the connect is refused with `ENOTSUP`
+///   and the socket is NOT left marked as a loop socket.
+///
+/// **The route is observed, not assumed**, because an agent's route is claimed
+/// once per thread by the first thread to ask
+/// (`event_pump::agent_loop::claim_route`) and every other thread acting for
+/// that agent is declined for life — so which harness thread this lands on
+/// decides the route. Every arm asserts something; none is a skip.
+#[test]
+fn deferred_connect_reaches_the_loop_on_every_route() {
+    let _lock = GC_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let owns_loop = turnloop_io::enabled();
+    let can_post = perry_ffi::agent_post::available();
+    let handles_before = perry_ffi::turnloop_net::live_handles();
+
+    let h = unsafe { js_net_socket_alloc() };
+    let _cleanup = NetHandleCleanup::new(vec![h]);
+    {
+        let sockets = statics::sockets().lock().unwrap();
+        assert!(
+            !sockets[&h].turnloop && sockets[&h].awaiting_connect,
+            "fixture must start unconnected, or the verdict below is vacuous"
+        );
+    }
+
+    // Port 1 on loopback: the submission is what is under test, not the
+    // connect's outcome. turnloop resolves and connects asynchronously, so a
+    // refused peer arrives as a later completion and cannot make this pass.
+    unsafe {
+        js_net_socket_method_connect(h, 1.0, UNDEFINED, UNDEFINED);
+    }
+
+    let (on_loop, awaiting) = {
+        let sockets = statics::sockets().lock().unwrap();
+        (sockets[&h].turnloop, sockets[&h].awaiting_connect)
+    };
+    let handles_after = perry_ffi::turnloop_net::live_handles();
+    assert!(
+        !awaiting,
+        "connect() must consume the awaiting-connect state"
+    );
+    if owns_loop {
+        // Leave no in-flight connect behind for a sibling test's pump.
+        crate::lifecycle::js_ext_net_destroy_socket(h);
+    }
+    let _ = unsafe { js_net_process_pending() };
+
+    if owns_loop {
+        assert!(on_loop, "an owned loop must take the connect");
+        assert_eq!(
+            handles_after,
+            handles_before + 1,
+            "the flag says turnloop but the driver holds no new handle"
+        );
+    } else if can_post {
+        assert!(on_loop, "a posted connect still makes this a loop socket");
+        assert_eq!(
+            handles_after, handles_before,
+            "a posted connect must not register a handle on the posting thread"
+        );
+    } else {
+        assert!(
+            !on_loop,
+            "a refused connect must not leave the socket marked as a loop socket"
+        );
+        assert_eq!(handles_after, handles_before);
+    }
+}

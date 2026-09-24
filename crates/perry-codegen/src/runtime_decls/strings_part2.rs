@@ -153,6 +153,9 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     );
     // Object introspection / mutation (Agent A's accessor-descriptor work).
     module.declare_function("js_object_has_own", DOUBLE, &[DOUBLE, DOUBLE]);
+    // #10943: the own-override guard condition; 0 takes the builtin, 1 the
+    // universal dispatcher.
+    module.declare_function("js_receiver_may_own_named_method", I32, &[DOUBLE, PTR, I64]);
     // #2891: Object.prototype.propertyIsEnumerable.call(obj, key).
     module.declare_function(
         "js_object_property_is_enumerable",
@@ -776,6 +779,11 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     module.declare_function("js_timer_tick_if_refed", I32, &[]);
     module.declare_function("js_callback_timer_tick", I32, &[]);
     module.declare_function("js_interval_timer_tick", I32, &[]);
+    // turnloop P3: the generated event loop's Node-ordered phases.
+    module.declare_function("js_event_loop_timers_phase", I32, &[]);
+    module.declare_function("js_event_loop_poll_callbacks", I32, &[]);
+    module.declare_function("js_event_loop_check_phase", I32, &[]);
+    module.declare_function("js_immediate_has_pending", I32, &[]);
     // Timer has-pending checks — called from the main event loop to
     // decide whether to keep ticking or exit.
     module.declare_function("js_timer_has_pending", I32, &[]);
