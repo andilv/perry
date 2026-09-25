@@ -152,48 +152,40 @@ jobs:
             exit 1
           fi
 
-      - name: Build runtime and stdlib
-        # Core libraries the bundle ships. Built first so the closure's
-        # feature resolution is owned by this invocation; every ext crate
-        # below reuses the result from cache.
+      - name: Build runtime, stdlib, and governed ext libraries (one closure)
+        # #507 — every tokio-using wrapper MUST be minted against the SAME
+        # tokio compilation as perry-stdlib: the `Cs<hash>_5tokio` symbols
+        # baked into each staticlib must match, or the final binary carries
+        # two CONTEXT TLS variables and any I/O wrapper panics at runtime
+        # with "there is no reactor running".
+        # The hash is closure-dependent (cargo unions tokio features per
+        # invocation), so this MUST be ONE invocation over the stdlib AND
+        # all ext wrappers together. A per-wrapper loop does not satisfy
+        # #507 even with the stdlib re-listed each time: each invocation
+        # re-mints tokio+stdlib with that closure's union, so the shipped
+        # libperry_stdlib.a ends up carrying the LAST crate's hash and
+        # diverges from earlier wrappers (real failure:
+        # `libperry_ext_http.a tokio (CslJ0BC8TjXRP_5tokio) != stdlib tokio
+        # (Cs6OU60Uxqifa_5tokio)` — caught by the verify step below).
+        # The crate list is DERIVED from scripts/release_ext_packages.sh —
+        # the governance inventory upstream's own release workflow consumes
+        # — so ext crates added or removed upstream flow through without
+        # workflow edits (the old hardcoded lists broke on every binding
+        # removal: axios a97f72b25, fastify dcb8a760a, fetch/pg/mysql2
+        # b77aba634).
+        # `--keep-going` preserves the best-effort semantics: a wrapper that
+        # cannot build on this host is skipped without aborting the rest,
+        # packaging ships whatever was produced, and the verify step below
+        # warns per missing governed archive.
         if: steps.filter.outputs.run == 'true'
         run: |
+          ext_pkgs=$(./scripts/release_ext_packages.sh | sed 's/^/-p /' | tr '\n' ' ')
+          # shellcheck disable=SC2086 — intentional word splitting: one
+          # `-p <crate>` argument per governed ext package.
           cargo build --profile ${{ github.event.inputs.profile }} --target ${{ steps.target.outputs.triple }} --keep-going \
             -p perry-runtime -p perry-runtime-static \
-            -p perry-stdlib -p perry-stdlib-static
-
-      - name: Build native ext libraries (derived from the governance inventory)
-        # #507 — tokio-using wrappers must share a cargo invocation with the
-        # stdlib, or cargo resolves a second tokio compilation whose
-        # hash-mangled CONTEXT thread-local differs from the one
-        # perry-stdlib's runtime enters; the final binary then carries two
-        # CONTEXT TLS variables and any I/O wrapper panics at runtime with
-        # "there is no reactor running". Upstream's #7358 pattern guarantees
-        # that structurally: EVERY wrapper is built alongside
-        # perry-runtime/-stdlib (plain + -static), so no hardcoded
-        # tokio-vs-CPU crate split is needed.
-        # The crate list comes from scripts/release_ext_packages.sh — the
-        # governance inventory upstream's own release workflow consumes — so
-        # ext crates added or removed upstream flow through without workflow
-        # edits (the old hardcoded lists broke on every binding removal:
-        # axios a97f72b25, fastify dcb8a760a, fetch/pg/mysql2 b77aba634).
-        # Best-effort per crate: a wrapper that cannot build on this host is
-        # skipped without failing the leg (packaging ships whatever was
-        # produced; missing archives surface as compile-time errors for
-        # out-of-tree users, and the verify step below warns per missing
-        # governed lib).
-        if: steps.filter.outputs.run == 'true'
-        run: |
-          governed_ext_packages=$(./scripts/release_ext_packages.sh)
-          while IFS= read -r name; do
-            [ -n "$name" ] || continue
-            echo "::group::build $name"
-            cargo build --profile ${{ github.event.inputs.profile }} --target ${{ steps.target.outputs.triple }} \
-              -p perry-runtime -p perry-runtime-static \
-              -p perry-stdlib -p perry-stdlib-static \
-              -p "$name" || echo "  (skipped $name — failed to build on this host)"
-            echo "::endgroup::"
-          done <<< "$governed_ext_packages"
+            -p perry-stdlib -p perry-stdlib-static \
+            $ext_pkgs
 
       - name: Verify shared tokio across stdlib and tokio-set ext libs
         # Gates the #507 property the bundle actually ships: the tokio
