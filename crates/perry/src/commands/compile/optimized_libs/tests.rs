@@ -502,29 +502,25 @@ fn undici_needs_shared_tokio() {
 }
 
 /// The emitted-FFI → link derivation resolves to real well-known bindings.
-/// The codegen prefix net routes `js_ioredis_*` / `js_undici_*` to these
+/// The codegen prefix net routes `js_undici_*` to these
 /// binding keys; each must exist in the shipped `well_known_bindings.toml`
 /// and map to its `perry-ext-*` crate, or the driver's routing loop would
 /// silently drop the flip.
 #[test]
 fn ext_prefix_binding_keys_resolve_to_wrapper_crates() {
-    for (key, krate) in [
-        ("ioredis", "perry-ext-ioredis"),
-        ("undici", "perry-ext-undici"),
-    ] {
+    for (key, krate) in [("undici", "perry-ext-undici")] {
         let binding = super::super::well_known::lookup_well_known(key)
             .unwrap_or_else(|| panic!("`{key}` must be a well-known binding"));
         assert_eq!(binding.krate, krate, "binding `{key}` routes to `{krate}`");
     }
 }
 
-/// The auto-build selection split: ioredis/undici carry their own tokio and
+/// The auto-build selection split: undici carries its own tokio and
 /// must ride the shared auto-optimize invocation, while node-forge is CPU-only
 /// (routes async through perry-stdlib's spawn_blocking shim) and is auto-built
 /// by the isolated leaf-build path in the driver's CPU-only branch.
 #[test]
 fn ext_binding_build_routing_split() {
-    assert!(binding_needs_shared_tokio("ioredis"));
     assert!(binding_needs_shared_tokio("undici"));
 }
 
@@ -1521,4 +1517,112 @@ fn gc_instrument_knobs_match_the_runtime() {
     let end = start + src[start..].find("];").unwrap();
     let runtime: Vec<&str> = src[start..end].split('"').skip(1).step_by(2).collect();
     assert_eq!(runtime, super::freshness::GC_INSTRUMENT_KNOBS);
+}
+
+// #11174: a no-auto HTTP rebuild bundles runtime code into the stdlib archive.
+// Exercise Cargo feature unification with a real miniature workspace; the
+// runtime refuses to build if the command silently drops its default engines.
+#[test]
+fn no_auto_http_pump_preserves_runtime_defaults() {
+    let _guard = env_lock();
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::create_dir_all(workspace.path().join("crates/perry-ui-geisterhand"))
+        .expect("workspace marker");
+    write_file(
+        &workspace.path().join("Cargo.toml"),
+        br#"
+[workspace]
+resolver = "2"
+members = ["crates/perry-runtime", "crates/perry-stdlib-static", "crates/perry-ext-http"]
+"#,
+    );
+    write_file(
+        &workspace.path().join("crates/perry-runtime/Cargo.toml"),
+        br#"
+[package]
+name = "perry-runtime"
+version = "0.1.0"
+edition = "2021"
+[features]
+default = ["regex-engine", "temporal", "url-engine"]
+regex-engine = []
+temporal = []
+url-engine = []
+stdlib = []
+"#,
+    );
+    write_file(
+        &workspace.path().join("crates/perry-runtime/src/lib.rs"),
+        br#"
+#[cfg(not(all(feature = "regex-engine", feature = "temporal", feature = "url-engine")))]
+compile_error!("no-auto HTTP build lost runtime defaults");
+pub fn runtime_probe() -> u32 { 42 }
+"#,
+    );
+    write_file(
+        &workspace
+            .path()
+            .join("crates/perry-stdlib-static/Cargo.toml"),
+        br#"
+[package]
+name = "perry-stdlib-static"
+version = "0.1.0"
+edition = "2021"
+[lib]
+name = "perry_stdlib"
+crate-type = ["staticlib"]
+[dependencies]
+perry-runtime = { path = "../perry-runtime", default-features = false, features = ["stdlib"] }
+perry-stdlib = { path = "../perry-stdlib" }
+"#,
+    );
+    write_file(
+        &workspace
+            .path()
+            .join("crates/perry-stdlib-static/src/lib.rs"),
+        br#"
+#[no_mangle]
+pub extern "C" fn stdlib_probe() -> u32 { perry_runtime::runtime_probe() }
+"#,
+    );
+    write_file(
+        &workspace.path().join("crates/perry-stdlib/Cargo.toml"),
+        br#"
+[package]
+name = "perry-stdlib"
+version = "0.1.0"
+edition = "2021"
+[features]
+external-http-client-pump = []
+"#,
+    );
+    write_file(
+        &workspace.path().join("crates/perry-stdlib/src/lib.rs"),
+        b"",
+    );
+    write_file(
+        &workspace.path().join("crates/perry-ext-http/Cargo.toml"),
+        br#"
+[package]
+name = "perry-ext-http"
+version = "0.1.0"
+edition = "2021"
+[lib]
+name = "perry_ext_http"
+crate-type = ["staticlib"]
+"#,
+    );
+    write_file(
+        &workspace.path().join("crates/perry-ext-http/src/lib.rs"),
+        b"",
+    );
+    let old_root = std::env::var_os("PERRY_WORKSPACE_ROOT");
+    std::env::set_var("PERRY_WORKSPACE_ROOT", workspace.path());
+    let built = super::no_auto::build_http_client_pump_stdlib(None, OutputFormat::Json, 0);
+    match old_root {
+        Some(root) => std::env::set_var("PERRY_WORKSPACE_ROOT", root),
+        None => std::env::remove_var("PERRY_WORKSPACE_ROOT"),
+    }
+    let (stdlib, ext_http) = built.expect("HTTP rebuild must preserve runtime default features");
+    assert!(stdlib.is_file() && ext_http.is_file());
 }

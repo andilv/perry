@@ -1,32 +1,18 @@
-//! Provider-safe GC registration for the Web Fetch registries' heap values.
+//! GC scanning for Fetch's heap edges (signals and cached bound methods).
 //!
-//! The Fetch handle registries are process-global `lazy_static!` tables keyed
-//! by small handle ids, and three of them hold *heap values*, not just Rust
-//! data:
+//! Minors retain and rewrite these edges because old JS owners need not be
+//! visited. Full marking instead reaches them through `lifecycle`'s handle
+//! trace, so an unreachable handle/cache cycle does not become a permanent
+//! root. Relocation passes still rewrite surviving slots. Each thread scans
+//! only the handles it owns; another mutator's heap must never be visited.
 //!
-//! * `HEADERS_METHOD_VALUE_CACHE` — the bound-method closure behind
+//! * `HeadersRecord::method_values` — the bound-method closure behind
 //!   `headers.get` / `headers.entries` / … (one per `(handle, method)`),
-//! * `FORM_DATA_METHOD_VALUE_CACHE` — the same for `FormData`,
+//! * `FormDataStore::method_values` — the same for `FormData`,
 //! * `RequestRecord::signal` — the `AbortSignal` object behind `request.signal`.
 //!
-//! Until #8163 nothing marked or rewrote those slots. `js_write_barrier_root_nanbox`
-//! at the store site is only the incremental-marking shade — it does not
-//! register a root — so under a moving collector the cached closure either
-//! died (nothing else referenced it once the caller dropped the bound copy) or
-//! moved, and the next `headers.get` read handed the pre-move address to
-//! `typeof`. That is precisely the shape the production Next App Route fixture
-//! hit under forced evacuation: `(await headers()).get(...)` twice per request
-//! with collections between, and the second read faulting on a retired
-//! from-space closure. `PERRY_GC_VERIFY_EVACUATION` cannot see it (no scanner
-//! to verify), `PERRY_GC_PROTECT_FROMSPACE_HOLDERS` cannot see it (the holder is
-//! a Rust `HashMap` outside the GC heap), and `scripts/gc_runtime_root_holders.py`
-//! could not see it either — its declaration regex did not match
-//! `lazy_static!`'s `static ref` (fixed alongside this module).
-//!
-//! Registration goes through the stable C ABI, exactly like `streams::gc`, so a
-//! separately packaged stdlib provider installs its scanner into the
-//! process-wide runtime image rather than into any runtime glue that happens to
-//! be linked into the stdlib image.
+//! Registration uses the stable C ABI so external stdlib providers participate
+//! in the process-wide collector.
 //!
 //! **Locking contract (load-bearing).** The scanner runs *during* a collection
 //! on the mutator thread and takes each table's mutex, so **no site may hold one
@@ -65,6 +51,7 @@ type FfiNamedMutableRootScanner =
     extern "C" fn(scanner_id: usize, visit: FfiMutableRootVisitor, ctx: *mut c_void);
 
 extern "C" {
+    fn perry_ffi_gc_root_visitor_is_full_mark(ctx: *mut c_void) -> bool;
     fn perry_ffi_gc_register_mutable_root_scanner_named(
         source_ptr: *const u8,
         source_len: usize,
@@ -144,7 +131,14 @@ extern "C" fn scan_fetch_roots_ffi(
     visit: FfiMutableRootVisitor,
     ctx: *mut c_void,
 ) {
-    scan_fetch_roots_with(&mut FfiFetchRootVisitor { visit, ctx });
+    let mut visitor = FfiFetchRootVisitor { visit, ctx };
+    if unsafe { perry_ffi_gc_root_visitor_is_full_mark(ctx) } {
+        // Full marking reaches registry edges only through live handles
+        // (`lifecycle::observe`), except for young ids, which are roots.
+        lifecycle::visit_young_handles(&mut visitor);
+        return;
+    }
+    scan_fetch_roots_with(&mut visitor);
 }
 
 #[cfg(test)]
@@ -155,10 +149,23 @@ pub(super) fn scan_fetch_roots(mark: &mut dyn FnMut(f64)) {
 
 /// Visit every heap-value slot the Fetch registries own.
 pub(super) fn scan_fetch_roots_with<V: FetchRootVisitor>(visitor: &mut V) {
-    headers_method_value::visit_roots(visitor);
-    dispatch::visit_form_data_method_value_roots(visitor);
+    // Each mutator visits only the records it owns (`lifecycle::owns`).
+    if let Ok(mut headers) = HEADERS_REGISTRY.lock() {
+        for (_, record) in headers.iter_mut().filter(|(id, _)| lifecycle::owns(**id)) {
+            for bits in record.method_values.values_mut() {
+                visitor.visit_nanbox_u64_slot(bits);
+            }
+        }
+    }
+    if let Ok(mut forms) = body_metadata::FORM_DATA_REGISTRY.lock() {
+        for (_, record) in forms.iter_mut().filter(|(id, _)| lifecycle::owns(**id)) {
+            for bits in record.method_values.values_mut() {
+                visitor.visit_nanbox_u64_slot(bits);
+            }
+        }
+    }
     if let Ok(mut requests) = REQUEST_REGISTRY.lock() {
-        for request in requests.values_mut() {
+        for (_, request) in requests.iter_mut().filter(|(id, _)| lifecycle::owns(**id)) {
             visitor.visit_nanbox_f64_slot(&mut request.signal);
         }
     }

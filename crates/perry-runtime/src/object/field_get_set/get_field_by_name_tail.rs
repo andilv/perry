@@ -39,7 +39,7 @@ pub(crate) fn get_field_by_name_object_tail(
                 return value;
             }
             // Issue #340: small-handle receivers (raw < 0x100000) come
-            // from native modules (axios, fastify, ioredis, ...) that
+            // from native modules (axios, fastify, ...) that
             // store objects in registries and expose integer ids. The
             // handle property dispatcher (registered by stdlib via
             // `js_register_handle_property_dispatch`) routes the
@@ -1288,10 +1288,8 @@ pub(crate) fn get_field_by_name_object_tail(
                             while depth < 32 {
                                 if let Some(vtable) = reg.get(&cid) {
                                     if let Some(&getter_ptr) = vtable.getters.get(name) {
-                                        let this_f64 = class_getter_this(obj);
-                                        let f: extern "C" fn(f64) -> f64 =
-                                            std::mem::transmute(getter_ptr);
-                                        return JSValue::from_bits(f(this_f64).to_bits());
+                                        let v = call_class_getter(getter_ptr, obj);
+                                        return JSValue::from_bits(v.to_bits());
                                     }
                                 }
                                 match get_parent_class_id(cid) {
@@ -1659,10 +1657,8 @@ pub(crate) fn get_field_by_name_object_tail(
                                     // Getters take `this` as f64 (NaN-boxed
                                     // POINTER_TAG), matching the codegen
                                     // calling convention for class methods.
-                                    let this_f64: f64 = class_getter_this(obj);
-                                    let f: extern "C" fn(f64) -> f64 =
-                                        std::mem::transmute(getter_ptr);
-                                    return JSValue::from_bits(f(this_f64).to_bits());
+                                    let v = call_class_getter(getter_ptr, obj);
+                                    return JSValue::from_bits(v.to_bits());
                                 }
                             }
                         }

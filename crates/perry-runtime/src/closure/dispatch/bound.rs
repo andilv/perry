@@ -178,28 +178,16 @@ pub unsafe fn dispatch_bound_method(closure: *const ClosureHeader, args: &[f64])
                 if let Some((func_ptr, param_count, has_synth_args, has_rest)) =
                     crate::object::lookup_class_method_in_chain(owner_id, name)
                 {
-                    return if let Some(brand) = private_brand {
-                        crate::object::call_vtable_method_with_private_brand(
-                            func_ptr,
-                            call_receiver.to_bits() as i64,
-                            args.as_ptr(),
-                            args.len(),
-                            param_count,
-                            has_synth_args,
-                            has_rest,
-                            brand,
-                        )
-                    } else {
-                        crate::object::call_vtable_method(
-                            func_ptr,
-                            call_receiver.to_bits() as i64,
-                            args.as_ptr(),
-                            args.len(),
-                            param_count,
-                            has_synth_args,
-                            has_rest,
-                        )
-                    };
+                    return crate::object::call_vtable_method_value(
+                        func_ptr,
+                        call_receiver,
+                        args.as_ptr(),
+                        args.len(),
+                        param_count,
+                        has_synth_args,
+                        has_rest,
+                        private_brand,
+                    );
                 }
             }
         }
@@ -772,19 +760,30 @@ pub unsafe extern "C" fn js_function_bind(
 static KEEP_JS_FUNCTION_BIND: unsafe extern "C" fn(f64, *const f64, usize) -> f64 =
     js_function_bind;
 
-/// Reify a `Function.prototype.{bind,call,apply}` (or any function method)
-/// *read off a closure as a value* into a callable BOUND_METHOD closure. When
-/// invoked it routes through `js_native_call_method(receiver, method, …)`, so
-/// `f.bind`, `f.call`, `f.apply` behave as real functions instead of reading
-/// back `undefined`.
-///
-/// Fixes the "uncurry-this" idiom `Function.prototype.call.bind(method)`
-/// (#3716): reading `.bind` off the reified `Function.prototype.call` value
-/// previously returned `undefined`, so the bound function was never created.
-/// `receiver` must be a NaN-boxed closure pointer; `method` is a `'static`
-/// byte slice (`b"bind"` / `b"call"` / `b"apply"`) whose pointer the
-/// BOUND_METHOD captures verbatim.
+/// Read inherited function methods as ordinary, unbound property values.
+/// `call`, `apply`, and `bind` must retain their Function.prototype identity
+/// and accept a receiver supplied by the eventual call (#11175). Other
+/// legacy function-method fallbacks still use a bound native-method wrapper.
 pub(crate) unsafe fn reify_function_method_value(receiver: f64, method: &'static [u8]) -> f64 {
+    if matches!(method, b"call" | b"apply" | b"bind") {
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let receiver = scope.root_nanbox_f64(receiver);
+        let proto = scope.root_nanbox_f64(crate::object::js_object_get_prototype_of(
+            receiver.get_nanbox_f64(),
+        ));
+        if proto.get_nanbox_u64() == crate::value::TAG_NULL {
+            return f64::from_bits(crate::value::TAG_UNDEFINED);
+        }
+        let key = crate::string::js_string_from_bytes(method.as_ptr(), method.len() as u32);
+        let key = crate::value::js_nanbox_string(key as i64);
+        // Reflect.get preserves the original function as `this` if the
+        // inherited slot has been replaced with an accessor.
+        return crate::proxy::js_reflect_get(
+            proto.get_nanbox_f64(),
+            key,
+            receiver.get_nanbox_f64(),
+        );
+    }
     let closure = js_closure_alloc(BOUND_METHOD_FUNC_PTR, 3);
     if closure.is_null() {
         return f64::from_bits(crate::value::TAG_UNDEFINED);
@@ -890,3 +889,6 @@ mod rebind_predicate_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod function_method_value_tests;

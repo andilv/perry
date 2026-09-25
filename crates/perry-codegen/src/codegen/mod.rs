@@ -431,7 +431,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
     let triple = opts.target.clone().unwrap_or_else(default_target_triple);
     // `PERRY_REGION_DIAG=1`: report step 4b's regions and the statement-level
     // runs it does not reach, when this module's codegen ends.
-    let _region_diag = crate::expr::region_read_run::ModuleDiag::start(hir);
+    let _region_diag = crate::expr::region_guard::ModuleDiag::start(hir);
     let fp_flags = crate::block::FpFlags::new(opts.fast_math, opts.fp_contract_mode);
 
     // #5334 lever B: decide ONCE, up front, whether this module is large enough
@@ -2714,7 +2714,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         // Per-module local-name → import-source map. Walks `hir.imports`
         // and records every named/default import binding's source spec.
         // `lower_builtin_new` consults this to gate ambiguously-named
-        // built-in arms (Client / Pool / Database / Redis / MongoClient /
+        // built-in arms (Client / Pool / Database / MongoClient /
         // Decimal) on the import source — `import Client from
         // "better-sqlite3"` should not dispatch through pg's Client arm.
         // See issue #602.

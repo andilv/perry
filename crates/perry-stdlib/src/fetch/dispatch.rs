@@ -38,6 +38,7 @@ pub extern "C" fn js_response_body_init_reset() -> f64 {
 /// (`c.json`/`c.text`) are unaffected.
 #[no_mangle]
 pub extern "C" fn js_response_body_init_ptr(value: f64) -> i64 {
+    let _fetch_roots = lifecycle::pin_handles(&[value]);
     set_pending_fetch_body_content_type(
         JSValue::from_bits(value.to_bits())
             .is_any_string()
@@ -251,28 +252,13 @@ pub(crate) unsafe fn fetch_request_body_bytes(body_ptr: *const StringHeader) -> 
     super::string_from_header(body_ptr).map(String::into_bytes)
 }
 
-lazy_static::lazy_static! {
-    /// Bound-method closures behind `formData.get` / `.entries` / … — the
-    /// `FormData` twin of `HEADERS_METHOD_VALUE_CACHE`, and a GC root for the
-    /// same reason (#8163): the values are heap closures held outside the heap.
-    pub(super) static ref FORM_DATA_METHOD_VALUE_CACHE: Mutex<HashMap<(usize, &'static str), u64>> =
-        Mutex::new(HashMap::new());
-}
-
-/// Visit every cached `FormData` bound-method closure (see `super::gc`).
-pub(super) fn visit_form_data_method_value_roots<V: super::gc::FetchRootVisitor>(visitor: &mut V) {
-    if let Ok(mut cache) = FORM_DATA_METHOD_VALUE_CACHE.lock() {
-        for bits in cache.values_mut() {
-            visitor.visit_nanbox_u64_slot(bits);
-        }
-    }
-}
-
 fn form_data_bound_method_value(form_id: usize, method_name: &'static str) -> f64 {
-    if let Some(bits) = FORM_DATA_METHOD_VALUE_CACHE
+    let _fetch_roots = lifecycle::pin_handles(&[handle_to_f64(form_id)]);
+    if let Some(bits) = super::body_metadata::FORM_DATA_REGISTRY
         .lock()
         .unwrap()
-        .get(&(form_id, method_name))
+        .get(&form_id)
+        .and_then(|record| record.method_values.get(method_name))
         .copied()
     {
         return f64::from_bits(bits);
@@ -291,10 +277,13 @@ fn form_data_bound_method_value(form_id: usize, method_name: &'static str) -> f6
     perry_runtime::closure::js_closure_set_capture_ptr(closure, 2, method_name.len() as i64);
     let value = perry_runtime::value::js_nanbox_pointer(closure as i64);
     unsafe { js_write_barrier_root_nanbox(value.to_bits()) };
-    FORM_DATA_METHOD_VALUE_CACHE
+    if let Some(record) = super::body_metadata::FORM_DATA_REGISTRY
         .lock()
         .unwrap()
-        .insert((form_id, method_name), value.to_bits());
+        .get_mut(&form_id)
+    {
+        record.method_values.insert(method_name, value.to_bits());
+    }
     value
 }
 
@@ -348,6 +337,7 @@ pub extern "C" fn js_fetch_handle_kind(id: usize) -> u8 {
 /// property reads on a Response handle whose id collides with a Request id.
 #[doc(hidden)]
 pub fn dispatch_request_property(req_id: usize, prop: &str) -> Option<f64> {
+    let _fetch_roots = lifecycle::pin_handles(&[handle_to_f64(req_id)]);
     // `request.headers` — lazily allocate a Headers registry entry backed by
     // the request's stored header map and cache the id so repeat reads return
     // the same handle (`req.headers === req.headers`). Mirrors the Response
@@ -453,6 +443,7 @@ pub fn dispatch_request_property(req_id: usize, prop: &str) -> Option<f64> {
 /// Response/Headers/Blob id and the registry-membership gate is unambiguous.
 #[doc(hidden)]
 pub fn dispatch_request_method(req_id: usize, method: &str, _args: &[f64]) -> Option<f64> {
+    let _fetch_roots = lifecycle::pin_handles(&[handle_to_f64(req_id)]);
     {
         let guard = REQUEST_REGISTRY.lock().unwrap();
         guard.get(&req_id)?;
@@ -494,6 +485,7 @@ pub fn dispatch_request_method(req_id: usize, method: &str, _args: &[f64]) -> Op
 /// Returns `None` if the id isn't a known Response or the property is unknown.
 #[doc(hidden)]
 pub fn dispatch_response_property(resp_id: usize, prop: &str) -> Option<f64> {
+    let _fetch_roots = lifecycle::pin_handles(&[handle_to_f64(resp_id)]);
     // `response.headers` — use the same backing handle as the typed accessor.
     // This preserves both object identity and mutations (notably
     // `NextResponse.cookies`' Set-Cookie writes) across module boundaries.
@@ -540,34 +532,30 @@ pub fn dispatch_response_property(resp_id: usize, prop: &str) -> Option<f64> {
             js_class_method_bind(handle_to_f64(resp_id), name.as_ptr(), name.len())
         });
     }
-    let guard = FETCH_RESPONSES.lock().unwrap();
-    let resp = guard.get(&resp_id)?;
-    let bits = match prop {
-        "status" => return Some(resp.status as f64),
-        "statusText" => {
-            let p = js_string_from_bytes(resp.status_text.as_ptr(), resp.status_text.len() as u32);
-            JSValue::string_ptr(p).bits()
+    // Snapshot under the guard, allocate after dropping it: a collection
+    // triggered by the string allocation locks this registry (`lifecycle`).
+    let text = {
+        let guard = FETCH_RESPONSES.lock().unwrap();
+        let resp = guard.get(&resp_id)?;
+        match prop {
+            "status" => return Some(resp.status as f64),
+            "statusText" => resp.status_text.clone(),
+            "type" => resp.type_name.clone(),
+            "url" => resp.url.clone(),
+            "ok" => {
+                return Some(f64::from_bits(if resp.status >= 200 && resp.status < 300 {
+                    TAG_TRUE
+                } else {
+                    TAG_FALSE
+                }))
+            }
+            "bodyUsed" => return Some(tagged_bool(resp.body_used)),
+            "redirected" => return Some(tagged_bool(resp.redirected)),
+            _ => return None,
         }
-        "type" => {
-            let p = js_string_from_bytes(resp.type_name.as_ptr(), resp.type_name.len() as u32);
-            JSValue::string_ptr(p).bits()
-        }
-        "url" => {
-            let p = js_string_from_bytes(resp.url.as_ptr(), resp.url.len() as u32);
-            JSValue::string_ptr(p).bits()
-        }
-        "ok" => {
-            return Some(f64::from_bits(if resp.status >= 200 && resp.status < 300 {
-                TAG_TRUE
-            } else {
-                TAG_FALSE
-            }))
-        }
-        "bodyUsed" => return Some(tagged_bool(resp.body_used)),
-        "redirected" => return Some(tagged_bool(resp.redirected)),
-        _ => return None,
     };
-    Some(f64::from_bits(bits))
+    let p = js_string_from_bytes(text.as_ptr(), text.len() as u32);
+    Some(f64::from_bits(JSValue::string_ptr(p).bits()))
 }
 
 /// Try to read a property off a Headers handle by registry id.
@@ -576,6 +564,7 @@ pub fn dispatch_response_property(resp_id: usize, prop: &str) -> Option<f64> {
 /// while call sites still route through `HANDLE_METHOD_DISPATCH`.
 #[doc(hidden)]
 pub fn dispatch_headers_property(headers_id: usize, prop: &str) -> Option<f64> {
+    let _fetch_roots = lifecycle::pin_handles(&[handle_to_f64(headers_id)]);
     {
         let guard = HEADERS_REGISTRY.lock().unwrap();
         guard.get(&headers_id)?;
@@ -604,6 +593,7 @@ pub fn dispatch_headers_property(headers_id: usize, prop: &str) -> Option<f64> {
 /// feature checks such as `typeof form.append === "function"` work.
 #[doc(hidden)]
 pub fn dispatch_form_data_property(form_id: usize, prop: &str) -> Option<f64> {
+    let _fetch_roots = lifecycle::pin_handles(&[handle_to_f64(form_id)]);
     if !form_data_contains_handle(form_id) {
         return None;
     }
@@ -631,6 +621,7 @@ pub fn dispatch_form_data_property(form_id: usize, prop: &str) -> Option<f64> {
 /// claiming membership alone would shadow legitimate calls on other handles.
 #[doc(hidden)]
 pub fn dispatch_response_method(resp_id: usize, method: &str, _args: &[f64]) -> Option<f64> {
+    let _fetch_roots = lifecycle::pin_handles(&[handle_to_f64(resp_id)]);
     {
         let guard = FETCH_RESPONSES.lock().unwrap();
         guard.get(&resp_id)?;
@@ -672,6 +663,7 @@ pub fn dispatch_response_method(resp_id: usize, method: &str, _args: &[f64]) -> 
 /// unknown ids or methods.
 #[doc(hidden)]
 pub fn dispatch_form_data_method(form_id: usize, method: &str, args: &[f64]) -> Option<f64> {
+    let _fetch_roots = lifecycle::pin_handles(&[handle_to_f64(form_id)]);
     if !form_data_contains_handle(form_id) {
         return None;
     }
@@ -732,6 +724,7 @@ pub fn dispatch_form_data_method(form_id: usize, method: &str, args: &[f64]) -> 
 /// ids or methods.
 #[doc(hidden)]
 pub fn dispatch_blob_method(blob_id: usize, method: &str, args: &[f64]) -> Option<f64> {
+    let _fetch_roots = lifecycle::pin_handles(&[handle_to_f64(blob_id)]);
     {
         let guard = BLOB_REGISTRY.lock().unwrap();
         guard.get(&blob_id)?;
@@ -765,6 +758,7 @@ pub fn dispatch_blob_method(blob_id: usize, method: &str, args: &[f64]) -> Optio
 /// unknown ids or methods.
 #[doc(hidden)]
 pub fn dispatch_headers_method(headers_id: usize, method: &str, args: &[f64]) -> Option<f64> {
+    let _fetch_roots = lifecycle::pin_handles(&[handle_to_f64(headers_id)]);
     {
         let guard = HEADERS_REGISTRY.lock().unwrap();
         guard.get(&headers_id)?;
@@ -820,8 +814,12 @@ pub fn dispatch_headers_method(headers_id: usize, method: &str, args: &[f64]) ->
 /// Returns `None` if the id isn't a known Blob or the property is unknown.
 #[doc(hidden)]
 pub fn dispatch_blob_property(blob_id: usize, prop: &str) -> Option<f64> {
-    let guard = BLOB_REGISTRY.lock().unwrap();
-    let blob = guard.get(&blob_id)?;
+    let _fetch_roots = lifecycle::pin_handles(&[handle_to_f64(blob_id)]);
+    // Membership only; every allocating arm below runs with the guard dropped
+    // (a collection triggered by the allocation locks this registry).
+    if !BLOB_REGISTRY.lock().unwrap().contains_key(&blob_id) {
+        return None;
+    }
     if matches!(prop, "text" | "arrayBuffer" | "bytes" | "slice") {
         extern "C" {
             fn js_class_method_bind(
@@ -841,20 +839,17 @@ pub fn dispatch_blob_property(blob_id: usize, prop: &str) -> Option<f64> {
             js_class_method_bind(handle_to_f64(blob_id), name.as_ptr(), name.len())
         });
     }
-    let bits = match prop {
-        "size" => return Some(blob.body.len() as f64),
-        "type" => {
-            let p =
-                js_string_from_bytes(blob.content_type.as_ptr(), blob.content_type.len() as u32);
-            JSValue::string_ptr(p).bits()
+    let text = {
+        let guard = BLOB_REGISTRY.lock().unwrap();
+        let blob = guard.get(&blob_id)?;
+        match prop {
+            "size" => return Some(blob.body.len() as f64),
+            "type" => blob.content_type.clone(),
+            "name" => blob.file_name.clone()?,
+            "lastModified" => return blob.last_modified_ms,
+            _ => return None,
         }
-        "name" => {
-            let name = blob.file_name.as_ref()?;
-            let p = js_string_from_bytes(name.as_ptr(), name.len() as u32);
-            JSValue::string_ptr(p).bits()
-        }
-        "lastModified" => return blob.last_modified_ms,
-        _ => return None,
     };
-    Some(f64::from_bits(bits))
+    let p = js_string_from_bytes(text.as_ptr(), text.len() as u32);
+    Some(f64::from_bits(JSValue::string_ptr(p).bits()))
 }

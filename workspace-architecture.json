@@ -24,10 +24,12 @@
     ]
   },
   "baseline": {
-    "workspace_members": 67,
+    "workspace_members": 70,
     "default_dependency_closure": [
       "perry",
       "perry-api-manifest",
+      "perry-base64",
+      "perry-cli-support",
       "perry-codegen",
       "perry-codegen-arkts",
       "perry-codegen-glance",
@@ -38,6 +40,7 @@
       "perry-container-compose",
       "perry-diagnostics",
       "perry-dispatch",
+      "perry-hex",
       "perry-hir",
       "perry-http-client",
       "perry-parser",
@@ -51,6 +54,8 @@
     "perry_dependency_closure": [
       "perry",
       "perry-api-manifest",
+      "perry-base64",
+      "perry-cli-support",
       "perry-codegen",
       "perry-codegen-arkts",
       "perry-codegen-glance",
@@ -60,6 +65,7 @@
       "perry-codegen-wear-tiles",
       "perry-diagnostics",
       "perry-dispatch",
+      "perry-hex",
       "perry-hir",
       "perry-http-client",
       "perry-parser",
@@ -71,8 +77,8 @@
       "perry-updater"
     ],
     "decision_counts": {
-      "externalize": 13,
-      "keep": 49,
+      "externalize": 12,
+      "keep": 53,
       "merge": 1,
       "remove": 1,
       "review": 3
@@ -89,6 +95,14 @@
     },
     "perry-audio-miniaudio": {
       "category": "platform-core",
+      "decision": "keep"
+    },
+    "perry-base64": {
+      "category": "runtime-core",
+      "decision": "keep"
+    },
+    "perry-cli-support": {
+      "category": "tool",
       "decision": "keep"
     },
     "perry-codegen": {
@@ -187,11 +201,6 @@
       "decision": "keep",
       "migration": "core-runtime"
     },
-    "perry-ext-ioredis": {
-      "category": "binding",
-      "decision": "externalize",
-      "migration": "compile-source"
-    },
     "perry-ext-mongodb": {
       "category": "binding",
       "decision": "externalize",
@@ -248,6 +257,10 @@
       "migration": "core-runtime"
     },
     "perry-ffi": {
+      "category": "runtime-core",
+      "decision": "keep"
+    },
+    "perry-hex": {
       "category": "runtime-core",
       "decision": "keep"
     },
@@ -360,6 +373,10 @@
       "decision": "merge"
     },
     "perry-updater": {
+      "category": "runtime-core",
+      "decision": "keep"
+    },
+    "perry-uuid": {
       "category": "runtime-core",
       "decision": "keep"
     },

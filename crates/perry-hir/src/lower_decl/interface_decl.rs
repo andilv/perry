@@ -6,6 +6,87 @@ use crate::ir::*;
 use crate::lower::LoweringContext;
 use crate::lower_types::*;
 
+pub(crate) struct InterfaceScope {
+    interfaces_len: usize,
+    shadowed: Vec<(
+        String,
+        Option<Vec<String>>,
+        Option<crate::types::ObjectType>,
+    )>,
+}
+
+/// Interfaces are erased at runtime, but their types must be visible throughout
+/// the declaring lexical scope, including before the declaration (#11138).
+/// Save only names declared here so nested/sibling scopes cannot overwrite the
+/// enclosing interface's dispatch classification or JSON.parse shape metadata.
+pub(crate) fn enter_interface_scope<'a>(
+    ctx: &mut LoweringContext,
+    stmts: impl IntoIterator<Item = &'a ast::Stmt>,
+) -> Result<InterfaceScope> {
+    let mut saved = InterfaceScope {
+        interfaces_len: ctx.interfaces.len(),
+        shadowed: Vec::new(),
+    };
+    for stmt in stmts {
+        let ast::Stmt::Decl(ast::Decl::TsInterface(decl)) = stmt else {
+            continue;
+        };
+        let name = decl.id.sym.to_string();
+        let keys = ctx.interface_source_keys.remove(&name);
+        let object = ctx.interface_object_types.remove(&name);
+        // Save the enclosing declaration only once. Later declarations with
+        // this name merge into the current scope rather than shadowing it.
+        let previous = if saved.shadowed.iter().any(|(n, _, _)| n == &name) {
+            Some((keys, object))
+        } else {
+            saved.shadowed.push((name.clone(), keys, object));
+            None
+        };
+        if let Err(error) = lower_interface_decl(ctx, decl, false) {
+            exit_interface_scope(ctx, saved);
+            return Err(error);
+        }
+        if let Some((keys, object)) = previous {
+            let mut merged_keys = keys.unwrap_or_default();
+            for key in ctx.interface_source_keys.remove(&name).unwrap_or_default() {
+                if !merged_keys.contains(&key) {
+                    merged_keys.push(key);
+                }
+            }
+            let current = ctx.interface_object_types.remove(&name);
+            let merged_object = match (object, current) {
+                (Some(mut previous), Some(current)) => {
+                    previous.properties.extend(current.properties);
+                    Some(previous)
+                }
+                (previous, current) => previous.or(current),
+            };
+            if let Some(mut object) = merged_object {
+                object.property_order = Some(merged_keys.clone());
+                ctx.interface_object_types.insert(name.clone(), object);
+            }
+            if !merged_keys.is_empty() {
+                ctx.interface_source_keys.insert(name, merged_keys);
+            }
+        }
+    }
+    Ok(saved)
+}
+
+pub(crate) fn exit_interface_scope(ctx: &mut LoweringContext, saved: InterfaceScope) {
+    ctx.interfaces.truncate(saved.interfaces_len);
+    for (name, keys, object) in saved.shadowed.into_iter().rev() {
+        ctx.interface_source_keys.remove(&name);
+        ctx.interface_object_types.remove(&name);
+        if let Some(keys) = keys {
+            ctx.interface_source_keys.insert(name.clone(), keys);
+        }
+        if let Some(object) = object {
+            ctx.interface_object_types.insert(name, object);
+        }
+    }
+}
+
 pub fn lower_interface_decl(
     ctx: &mut LoweringContext,
     iface_decl: &ast::TsInterfaceDecl,
@@ -175,3 +256,6 @@ pub fn lower_interface_decl(
         is_exported,
     })
 }
+
+#[cfg(test)]
+mod tests;

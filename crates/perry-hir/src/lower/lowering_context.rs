@@ -43,6 +43,11 @@ impl InferredClassBindings {
         self.names.remove(name)
     }
 
+    /// Forget the class previously held by this particular lexical binding.
+    pub(crate) fn remove_binding(&mut self, local: LocalId) {
+        self.by_local.remove(&local);
+    }
+
     /// A second class expression claimed `name` under a disambiguated key.
     pub(crate) fn mark_contested(&mut self, name: &str) {
         self.contested.insert(name.to_string());
@@ -386,6 +391,27 @@ pub struct LoweringContext {
     /// while lowering that ClassBody, while nested classes can still capture
     /// an outer class expression's evaluated value.
     pub(crate) class_expr_self_bindings: Vec<(String, usize, LocalId)>,
+    /// #11157: set by the function-body class-DECLARATION arm right before it
+    /// calls `lower_class_decl`, and consumed there. When the declaration is
+    /// already known to take the per-evaluation `ClassExprFresh` path (dynamic
+    /// heritage or private elements), `lower_class_decl` then registers a
+    /// `class_expr_self_bindings` entry for the class name — exactly what a
+    /// named class expression gets — so the members' own references to the
+    /// class resolve to this evaluation instead of the shared template.
+    pub(crate) class_decl_self_binding_wanted: bool,
+    /// #11157: the compiler-private self-binding local `lower_class_decl`
+    /// registered for the declaration it just lowered (see above), handed
+    /// back to the declaration arm so it can become the `ClassExprFresh`
+    /// evaluation owner.
+    pub(crate) class_decl_self_binding: Option<LocalId>,
+    /// #11157: template names of class DECLARATIONS that lowered to a
+    /// per-evaluation `ClassExprFresh` binding. A static write through such a
+    /// class's name must reach the evaluated object, not the template.
+    pub(crate) per_evaluation_class_decls: HashSet<String>,
+    /// #11142: the active `class_expr_self_bindings` entries that belong to
+    /// per-evaluation class DECLARATIONS. `new C()` and `x instanceof C` in
+    /// such a body construct and test against the evaluation too.
+    pub(crate) class_decl_self_binding_ids: Vec<LocalId>,
     /// True while lowering a static class member body.
     pub(crate) current_class_member_is_static: bool,
     /// Lexical stack of private-name scopes — one entry per enclosing class

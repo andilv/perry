@@ -60,21 +60,95 @@ pub extern "C" fn js_class_capture_value_for_receiver(
     // Function.prototype.call/apply. Dispatch restores that evaluated class
     // either as the private lexical brand (method-value dispatch) or as the
     // static private owner (ordinary static dispatch); prefer it when present.
-    let receiver = super::field_get_set::current_private_lexical_brand_value(class_id)
-        .or_else(super::static_private_owner_current)
-        .unwrap_or(receiver);
-    if super::class_registry::is_class_object_value(receiver) {
-        let caps_value =
-            super::js_object_get_own_field_or_undef(receiver, b"__perry_ctor_caps".as_ptr(), 17);
-        let caps = crate::value::JSValue::from_bits(caps_value.to_bits());
-        if caps.is_pointer() {
-            let array = caps.as_pointer::<crate::array::ArrayHeader>();
-            if !array.is_null() && index < crate::array::js_array_length(array) {
-                return crate::array::js_array_get_f64(array, index);
-            }
+    //
+    // #11200 / #10911: the candidate is not necessarily an evaluation of
+    // `class_id` itself. An INHERITED static reached through a subclass
+    // (`Sub.make()` running `Base.make`) is dispatched with the SUBCLASS as
+    // receiver and owner, and the subclass's own `__perry_ctor_caps` is laid
+    // out for the subclass's capture list -- reading `index` from it returned
+    // an unrelated binding (mongodb's `CursorResponse.make` saw an object
+    // where `isErrorResponse` belonged). And a top-level `class A extends
+    // f()` is a ClassRef with no caps at all, so its inherited capturing
+    // statics fell through to the template snapshot, which a class
+    // EXPRESSION never registers (`undefined`). Only an evaluation of the
+    // declaring template owns these slots: walk each candidate's heritage to
+    // it, and when none is reachable use the declaration snapshot -- never
+    // another class's array.
+    let candidates = [
+        super::field_get_set::current_private_lexical_brand_value(class_id),
+        super::static_private_owner_current(),
+        Some(receiver),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        if let Some(owner) = capture_owner_for_template(candidate, class_id) {
+            return class_object_capture_slot(owner, index)
+                .unwrap_or_else(|| js_class_capture_value(class_id, index));
         }
     }
     js_class_capture_value(class_id, index)
+}
+
+/// The class evaluation of template `class_id` that `start` (a class object or
+/// a declaration ClassRef) is, or inherits from. Each hop prefers the
+/// per-evaluation pinned parent and falls back to the template-keyed dynamic
+/// heritage, the same order `instanceof`'s `class_chain_reaches_dynamic` walks.
+/// A ClassRef of `class_id` itself answers `None`: a declaration's captures
+/// live in its decl-site snapshot, not on an object.
+fn capture_owner_for_template(start: f64, class_id: u32) -> Option<f64> {
+    let mut current = start;
+    for _ in 0..64 {
+        let cid = if super::class_registry::is_class_object_value(current) {
+            let object =
+                crate::value::JSValue::from_bits(current.to_bits()).as_pointer::<ObjectHeader>();
+            if object.is_null() {
+                return None;
+            }
+            let cid = super::js_object_get_class_id(object);
+            if cid == class_id {
+                return Some(current);
+            }
+            if let Some(parent) = super::class_registry::class_object_pinned_parent(object) {
+                current = parent;
+                continue;
+            }
+            cid
+        } else if super::class_prototype_ref_id(current).is_some() {
+            return None;
+        } else {
+            let cid = super::class_ref_id(current)?;
+            if cid == class_id {
+                return None;
+            }
+            cid
+        };
+        if cid == 0 {
+            return None;
+        }
+        let parent = super::class_registry::parent_static::template_dynamic_parent_value(cid);
+        if parent.to_bits() == current.to_bits() {
+            return None;
+        }
+        current = parent;
+    }
+    None
+}
+
+/// Slot `index` of a class evaluation's own `__perry_ctor_caps` array, when it
+/// carries one that long. `class_value` must already be a verified class object
+/// (`capture_owner_for_template` only answers with one), so this does not
+/// repeat that registry check on the static-method prologue's hot path.
+fn class_object_capture_slot(class_value: f64, index: u32) -> Option<f64> {
+    let caps_value =
+        super::js_object_get_own_field_or_undef(class_value, b"__perry_ctor_caps".as_ptr(), 17);
+    let caps = crate::value::JSValue::from_bits(caps_value.to_bits());
+    if !caps.is_pointer() {
+        return None;
+    }
+    let array = caps.as_pointer::<crate::array::ArrayHeader>();
+    if array.is_null() || index >= crate::array::js_array_length(array) {
+        return None;
+    }
+    Some(crate::array::js_array_get_f64(array, index))
 }
 
 /// #1787: per-template constructor function pointers, keyed by the
@@ -518,6 +592,9 @@ pub unsafe extern "C" fn js_super_construct_apply(
     this_value: f64,
     args_array: f64,
 ) -> f64 {
+    let new_target_scope = crate::gc::RuntimeHandleScope::new();
+    let _new_target = crate::object::SuperNewTargetScope::bind(&new_target_scope, this_value);
+
     let undef = f64::from_bits(crate::value::TAG_UNDEFINED);
     let this_raw = (this_value.to_bits() & crate::value::POINTER_MASK) as i64;
     if std::env::var_os("PERRY_SUPER_DEBUG").is_some() {
@@ -751,7 +828,23 @@ pub unsafe extern "C" fn js_super_method_call_dynamic(
         Ok(s) => s,
         Err(_) => return undef,
     };
-    let parent_cid = match crate::object::get_parent_class_id(child_class_id) {
+    // Repeated evaluations can share a template id, so the template parent
+    // table cannot represent their heritage edge. Resolve the method's own
+    // evaluation first, then read its pinned parent.
+    let lexical_owner = super::field_get_set::current_private_lexical_brand_value(child_class_id)
+        .or_else(|| {
+            super::field_get_set::private_evaluation_brand_value(this_value)
+                .and_then(|owner| pinned_class_object_for_ancestor(owner, child_class_id))
+        });
+    let parent_owner = lexical_owner.and_then(|owner| {
+        let object = crate::value::JSValue::from_bits(owner.to_bits()).as_pointer::<ObjectHeader>();
+        super::class_registry::class_object_pinned_parent(object)
+    });
+    let parent_cid = parent_owner
+        .map(super::class_registry::parent_static::dynamic_value_class_id)
+        .filter(|cid| *cid != 0)
+        .or_else(|| crate::object::get_parent_class_id(child_class_id));
+    let parent_cid = match parent_cid {
         Some(p) if p != 0 => p,
         // #6316: `class Bus extends EventEmitter` has NO registered parent —
         // the native base is not a perry class, so nothing was ever wired into
@@ -760,11 +853,15 @@ pub unsafe extern "C" fn js_super_method_call_dynamic(
         // displaced is the correct target.
         _ => return call_displaced_native_base_method(this_value, name, args_ptr, args_len, undef),
     };
+    let _parent_brand =
+        super::field_get_set::PrivateHintBrandScope::new(parent_owner.map(f64::to_bits));
     // Static-context super call (`super.m()` inside a `static` method): the
     // receiver is the class constructor (a ClassRef), so resolve the PARENT's
     // STATIC method (not an instance/prototype method) and invoke it with
     // `this` bound to the current class. Refs class/super/in-static-methods.
-    if super::class_ref_id(this_value).is_some() {
+    if super::class_ref_id(this_value).is_some()
+        || super::class_registry::is_class_object_value(this_value)
+    {
         if let Some((func_ptr, param_count, has_rest)) =
             super::class_registry::lookup_static_method_in_chain(parent_cid, name)
         {
@@ -813,7 +910,7 @@ pub unsafe extern "C" fn js_super_method_call_dynamic(
     let resolved = super::class_registry::lookup_class_method_in_chain(parent_cid, name);
     if let Some((func_ptr, param_count, has_synth, has_rest)) = resolved {
         let this_raw = (this_value.to_bits() & crate::value::POINTER_MASK) as i64;
-        return call_vtable_method(
+        return super::class_registry::call_vtable_method_with_private_brand(
             func_ptr,
             this_raw,
             args_ptr,
@@ -821,6 +918,9 @@ pub unsafe extern "C" fn js_super_method_call_dynamic(
             param_count,
             has_synth,
             has_rest,
+            parent_owner
+                .or_else(|| super::field_get_set::private_evaluation_brand_value(this_value))
+                .unwrap_or(undef),
         );
     }
     // The parent may be a function-style class whose method lives in the
@@ -981,16 +1081,18 @@ static KEEP_JS_SUPER_METHOD_CALL_DYNAMIC_APPLY: unsafe extern "C" fn(
 /// # Safety
 /// `this_raw` must be a valid `ObjectHeader` pointer (as `i64`); `args_ptr`
 /// must point to `args_len` valid `f64`s (or be null when `args_len == 0`).
+/// Return the constructor result so a super caller can adopt a replacement
+/// receiver; return undefined when no constructor was found.
 pub(crate) unsafe fn run_class_constructor_on_this_flat(
     parent_cid: u32,
     this_raw: i64,
     args_ptr: *const f64,
     args_len: usize,
-) -> bool {
-    if this_raw == 0 || parent_cid == 0 {
-        return false;
-    }
+) -> f64 {
     let undef = f64::from_bits(crate::value::TAG_UNDEFINED);
+    if this_raw == 0 || parent_cid == 0 {
+        return undef;
+    }
     let mut cur = parent_cid;
     let mut depth = 0usize;
     while cur != 0 && depth < 64 {
@@ -1019,7 +1121,7 @@ pub(crate) unsafe fn run_class_constructor_on_this_flat(
             for slot in 0..sig_caps as usize {
                 final_args.push(caps.get(slot).map(|b| f64::from_bits(*b)).unwrap_or(undef));
             }
-            let _ = call_vtable_method(
+            return call_vtable_method(
                 ctor_ptr,
                 this_raw,
                 final_args.as_ptr(),
@@ -1028,7 +1130,6 @@ pub(crate) unsafe fn run_class_constructor_on_this_flat(
                 false,
                 false,
             );
-            return true;
         }
         let next = crate::object::get_parent_class_id(cur).unwrap_or(0);
         if next == cur {
@@ -1037,7 +1138,7 @@ pub(crate) unsafe fn run_class_constructor_on_this_flat(
         cur = next;
         depth += 1;
     }
-    false
+    undef
 }
 
 /// Append the spread of `value` to `target` (array handle), handling BOTH
@@ -1416,7 +1517,7 @@ unsafe fn replay_class_object_constructor_impl(
     let _active_evaluation =
         super::class_registry::push_active_class_evaluation(capture_owner_handle.get_nanbox_f64());
     inst_handle.with_mut_ptr::<ObjectHeader, _>(|inst| {
-        call_vtable_method(
+        super::class_registry::call_vtable_method_with_private_brand(
             ctor_ptr,
             inst as i64,
             final_args.as_ptr(),
@@ -1426,6 +1527,7 @@ unsafe fn replay_class_object_constructor_impl(
             // Capture-forwarding constructor args are materialized positionally
             // above (including any caps), so no trailing rest re-packing here.
             false,
+            capture_owner_handle.get_nanbox_f64(),
         )
     })
 }

@@ -82,6 +82,10 @@ pub(crate) unsafe fn fetch_subclass_handle_id(obj: usize) -> Option<i64> {
     if v.is_undefined() {
         return None;
     }
+    if v.is_pointer() {
+        let id = crate::value::js_nanbox_get_pointer(f64::from_bits(v.bits()));
+        return crate::value::addr_class::is_fetch_handle_band(id as usize).then_some(id);
+    }
     let id = f64::from_bits(v.bits());
     if id.is_finite() && id > 0.0 && id.fract() == 0.0 {
         Some(id as i64)
@@ -259,7 +263,7 @@ pub use accessors::js_object_get_field;
 pub(crate) use accessors::{
     accessor_receiver_override_begin, accessor_receiver_override_end,
     accessor_receiver_override_take, array_prototype_property_value,
-    builtin_reflection_accessor_read, class_getter_this, invoke_accessor_getter,
+    builtin_reflection_accessor_read, call_class_getter, invoke_accessor_getter,
     invoke_accessor_setter, is_typed_array_prototype, object_field_at_with_live,
     ordinary_object_prototype_property_value, own_data_field_by_name,
     primitive_builtin_prototype_property, primitive_object_prototype_accessor,
@@ -304,7 +308,7 @@ pub(crate) use ic_miss::{
     private_member_access_hints_restore, private_member_access_hints_savepoint,
     private_member_call_by_name, private_member_get_by_name, private_member_set_by_name,
     scan_private_lexical_brand_roots_mut, set_method_value_name, stamp_private_evaluation_brand,
-    take_private_method_call_hint, take_private_method_owner_hint,
+    take_private_method_call_hint, take_private_method_owner_hint, PrivateHintBrandScope,
 };
 pub use ic_miss::{
     js_class_field_add, js_object_get_field_by_name_f64, js_object_get_field_by_property_id_f64,
@@ -312,8 +316,14 @@ pub use ic_miss::{
     js_object_set_field_by_property_id, js_private_brand_add, js_private_brand_check,
     js_private_field_add, js_private_guard, PicCache, PicCacheSlot, PIC_CACHE_WORDS,
 };
+// The read path's spill flip, shared with the static-key store IC's ways
+// (`proxy/put_value/packed_set.rs`): one encoding for both compact words.
+pub(crate) use ic_miss::PACKED_SPILL_FLIP;
 #[cfg(test)]
-pub(crate) use ic_miss::{primitive_proto_method_name_static, test_push_catch_private_hint};
+pub(crate) use ic_miss::{
+    primitive_proto_method_name_static, test_pending_private_access_owner,
+    test_push_catch_private_hint,
+};
 /// The one slow exit of the emitted generic property-get tower. Declared here
 /// rather than inside `ic_miss.rs` only because that file sits at the
 /// 2000-line cap; the source lives next to its sibling entries.

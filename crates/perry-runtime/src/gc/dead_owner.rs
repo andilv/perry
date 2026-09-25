@@ -38,9 +38,8 @@
 //! still.
 //!
 //! This module supplies the two deadness predicates and the fan-out passes,
-//! mirroring the proven Map/Set pattern (`map.rs`:
-//! `collect_dead_registered_maps_post_trace` /
-//! `is_dead_copied_minor_from_space_map`):
+//! mirroring the Set registry liveness policy. Map storage is now owned by
+//! its header and uses the ordinary type finalizer instead:
 //!
 //! * [`prune_dead_owner_side_tables_post_trace`] runs at sweep entry of the
 //!   non-copying cycle kinds (marks fresh, nothing freed or reallocated yet)
@@ -370,13 +369,11 @@ pub(super) const DEAD_KEY_PRUNES: &[DeadKeyPrune] = &[
         prune: crate::map::prune_dead_map_iterator_array_owners,
         young_prune: None,
     },
-    // Re-keyed by `map_header_moved_for_gc`; a dead Map's squeeze history
-    // serves no cursor.
     DeadKeyPrune {
-        table: "MAP_COMPACTION_LOG",
+        table: "SET_KEY_IDENTITIES",
         owner: DeadKeyOwner::Any,
-        prune: crate::map::prune_dead_map_compaction_log_owners,
-        young_prune: None,
+        prune: crate::set::prune_dead_identity_owners,
+        young_prune: Some(crate::set::prune_dead_identity_owners_young),
     },
     DeadKeyPrune {
         table: "SET_ITERATOR_ARRAYS",
@@ -472,6 +469,13 @@ pub(super) const DEAD_KEY_PRUNES: &[DeadKeyPrune] = &[
         owner: DeadKeyOwner::Closure,
         prune: crate::closure::prune_dead_closure_side_table_owners,
         young_prune: Some(crate::closure::prune_dead_closure_side_table_owners_young),
+    },
+    #[cfg(feature = "dyn-eval")]
+    DeadKeyPrune {
+        table: "dyn_eval::LIFETIME.owners + FN_REGISTRY",
+        owner: DeadKeyOwner::Closure,
+        prune: crate::dyn_eval::prune_dead_function_owners,
+        young_prune: Some(crate::dyn_eval::prune_dead_function_owners_young),
     },
     DeadKeyPrune {
         table: "BUILTIN_CLOSURE_LENGTH + BUILTIN_CLOSURE_NON_CONSTRUCTABLE",

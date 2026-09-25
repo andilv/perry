@@ -250,6 +250,7 @@ fn listen_error_description(code: &str) -> &'static str {
         "EAFNOSUPPORT" => "address family not supported",
         "EMFILE" => "too many open files",
         "ENOTSUP" => "operation not supported on socket",
+        "EAGAIN" => "resource temporarily unavailable",
         _ => "listen failed",
     }
 }
@@ -396,7 +397,7 @@ pub(crate) fn queue_listen_error_parts(
     let errno = if errno != 0 {
         errno
     } else {
-        // `errno_for_code` returns the negated OS code Node reports.
+        // `errno_for_code` returns libuv's errno, which is what Node reports.
         perry_ffi::turnloop_net::errno_for_code(code)
     };
     let err = ListenError {

@@ -48,6 +48,8 @@ fn is_genuine_node_stream_parent(ctx: &LoweringContext, name: &str) -> bool {
 }
 
 mod class_heritage;
+mod decl_self_binding;
+pub(crate) use decl_self_binding::fresh_class_decl_self_binding;
 mod from_ast;
 mod member_helpers;
 mod member_registration;
@@ -70,6 +72,10 @@ pub fn lower_class_decl(
     // Resolve through any active scope-local rename so a disambiguated
     // duplicate class registers (and self-references) under its unique name.
     let name = ctx.resolve_class_name(class_decl.ident.sym.as_str());
+    // #11157: consume the declaration arm's request before anything below can
+    // lower a nested class declaration.
+    let self_binding_wanted = std::mem::take(&mut ctx.class_decl_self_binding_wanted);
+    ctx.class_decl_self_binding = None;
     validate_legacy_decorator_surface(&class_decl.class, &name)?;
     validate_class_element_early_errors(&class_decl.class, &name)?;
     let class_id = match ctx.lookup_class(&name) {
@@ -394,6 +400,15 @@ pub fn lower_class_decl(
                     Ok(expr) => (None, Some(parent_name), None, Some(Box::new(expr))),
                     Err(_) => (None, Some(parent_name), None, None),
                 }
+            } else if member_heritage_hides_global_builtin(ctx, member, &parent_name) {
+                // #11139: a trailing name that codegen routes as a JS built-in
+                // (`class ConnectionString extends whatwg_url_1.URL`) keeps no
+                // static name or link, so `super()` runs the member's own
+                // constructor through the dynamic parent path.
+                match lower_class_heritage_expr(ctx, super_class) {
+                    Ok(expr) => (None, None, None, Some(Box::new(expr))),
+                    Err(_) => (None, None, None, None),
+                }
             } else {
                 // A NAMED cross-module member-extends (`class NodeNextRequest
                 // extends _index.BaseNextRequest`). The static `extends_name`
@@ -442,6 +457,14 @@ pub fn lower_class_decl(
     } else {
         (None, None, None, None)
     };
+
+    // #11157: a function-body declaration with a runtime heritage value or
+    // private elements is evaluated per evaluation (`ClassExprFresh`). Give
+    // its members the evaluated class, not the template, for its own name.
+    let class_self_binding = (self_binding_wanted
+        && (extends_expr.is_some()
+            || decl_self_binding::class_body_has_private_names(&class_decl.class)))
+    .then(|| decl_self_binding::push_decl_self_binding(ctx, class_decl.ident.sym.as_ref(), &name));
 
     // Issue #10486: the branches above deliberately leave `extends_name`
     // None when the heritage identifier resolves to a lexically-scoped
@@ -762,7 +785,7 @@ pub fn lower_class_decl(
                         );
                     }
                     ast::MethodKind::Method => {
-                        let mut func = with_static_member_context(ctx, method.is_static, |ctx| {
+                        let func = with_static_member_context(ctx, method.is_static, |ctx| {
                             lower_class_method(ctx, method)
                         })?;
                         // Issue #212 fixed the broader class-method-captures-
@@ -775,22 +798,22 @@ pub fn lower_class_decl(
                         // removed in v0.5.319. See the v0.5.317 entry for the
                         // history and `test_issue_154_using_dispose.ts` for the
                         // regression test.
-                        // `*[Symbol.iterator]()` — lift to a top-level generator
-                        // and register a synthetic `@@iterator` wrapper so both
-                        // the `for…of` fast path and runtime-dispatched iterator
-                        // consumers work (#5128). See the helper for details.
+                        // `*[Symbol.iterator]()` — install the generator itself
+                        // under the computed `Symbol.iterator` key, keeping the
+                        // ordinary method receiver (#5128, #11170). See the
+                        // helper for details.
                         if prop_name == "@@iterator" && func.is_generator && !method.is_static {
-                            let wrapper = synthesize_symbol_iterator_wrapper(ctx, &name, &mut func);
+                            let function = register_symbol_iterator_generator(ctx, &name, func);
                             let ast::PropName::Computed(computed) = &method.key else {
                                 unreachable!("@@iterator generator key must be computed");
                             };
                             // The computed-symbol registration installs the
-                            // runtime dispatch alias too. Registering the wrapper
-                            // as a string method also exposed an own "@@iterator"
+                            // runtime dispatch alias too. Registering the method
+                            // under a string name also exposed an own "@@iterator"
                             // property that the source never declared (#9788).
                             computed_members.push(ClassComputedMember {
                                 key_expr: lower_expr(ctx, &computed.expr)?,
-                                function: wrapper,
+                                function,
                                 is_static: false,
                                 kind: ClassComputedMemberKind::Method,
                                 source_order: member_index,
@@ -1193,8 +1216,17 @@ pub fn lower_class_decl(
     // unpatched capture slot (test262 static-field-init-this-inside-arrow).
     for sf in &mut static_fields {
         if let Some(init) = &mut sf.init {
-            crate::analysis::substitute_lexical_this_in_expr(init, &Expr::ClassRef(name.clone()));
+            match class_self_binding {
+                Some(self_id) => decl_self_binding::substitute_static_this_with_self(init, self_id),
+                None => crate::analysis::substitute_lexical_this_in_expr(
+                    init,
+                    &Expr::ClassRef(name.clone()),
+                ),
+            }
         }
+    }
+    if let Some(self_id) = class_self_binding {
+        decl_self_binding::pop_decl_self_binding(ctx, self_id);
     }
 
     // Exit type parameter scope

@@ -17,10 +17,13 @@ use super::class_computed::push_deduped_class_computed_keys;
 use super::helpers::{async_iterator_method_call, is_filehandle_readlines_for_await_target};
 use super::*;
 
+mod class_self_binding;
 mod detect;
 mod for_await;
 pub(crate) mod gen_capture_scan;
 mod nested_fn_decl;
+
+use class_self_binding::{decl_self_binding_init, decl_self_binding_owner, lower_body_class_decl};
 
 use gen_capture_scan::nested_generator_references_outer_locals;
 
@@ -338,7 +341,7 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
             let already_exists = ctx.pending_classes.iter().any(|c| c.name == class_name)
                 || ctx.classes_index.contains_key(&class_name);
             if !already_exists {
-                let class = lower_class_decl(ctx, class_decl, false)?;
+                let (class, decl_self_binding) = lower_body_class_decl(ctx, class_decl)?;
                 if let Some(extends_expr) = &class.extends_expr {
                     result.push(Stmt::Expr(Expr::RegisterClassParentDynamic {
                         class_name: class.name.clone(),
@@ -363,11 +366,19 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
                     .lookup_class_captures(&class.name)
                     .map(|ids| ids.iter().map(|id| Expr::LocalGet(*id)).collect())
                     .unwrap_or_default();
+                // #11142: a self-binding capture holds the evaluated class
+                // object, so snapshot the captures only once it exists.
+                let mut deferred_capture_snapshot = None;
                 if !captured_exprs.is_empty() {
-                    result.push(Stmt::Expr(Expr::RegisterClassCaptures {
+                    let snapshot = Stmt::Expr(Expr::RegisterClassCaptures {
                         class_name: class.name.clone(),
                         captures: captured_exprs.clone(),
-                    }));
+                    });
+                    if decl_self_binding.is_some() {
+                        deferred_capture_snapshot = Some(snapshot);
+                    } else {
+                        result.push(snapshot);
+                    }
                 }
                 // Captures (#6465), private brands (#5893), computed names,
                 // and dynamic heritage (#9502) belong to each evaluation.
@@ -388,7 +399,9 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
                 let fresh_binding = has_private_elements
                     || class.extends_expr.is_some()
                     || !computed_keys.is_empty()
-                    || (!captured_exprs.is_empty() && !has_static_state);
+                    || (!captured_exprs.is_empty() && !has_static_state)
+                    // #11157: members that captured the self-binding need it.
+                    || decl_self_binding.is_some();
                 let named_statics: Vec<(String, Expr)> = if fresh_binding {
                     class
                         .static_fields
@@ -447,7 +460,19 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
                         ),
                     );
                 }
+                let evaluation_owner = decl_self_binding_owner(
+                    ctx,
+                    decl_self_binding,
+                    &class.name,
+                    &captured_exprs,
+                    &named_statics,
+                    &computed_keys,
+                    &computed_statics,
+                );
                 let template_name = class.name.clone();
+                if fresh_binding {
+                    ctx.per_evaluation_class_decls.insert(template_name.clone());
+                }
                 ctx.pending_classes.push(class);
                 // #6465/#5893/#9502 (see `fresh_binding` above): bind the
                 // declared name to a per-evaluation heap class object carrying
@@ -469,18 +494,22 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
                         id: class_local,
                         name: binding_name,
                         ty: Type::Any,
-                        init: Some(Expr::ClassExprFresh {
-                            template: template_name,
-                            evaluation_owner: None,
-                            named_statics,
-                            computed_keys,
-                            computed_statics,
-                            static_init_order,
-                            captured_args: captured_exprs,
-                        }),
+                        init: Some(decl_self_binding_init(
+                            evaluation_owner,
+                            Expr::ClassExprFresh {
+                                template: template_name,
+                                evaluation_owner,
+                                named_statics,
+                                computed_keys,
+                                computed_statics,
+                                static_init_order,
+                                captured_args: captured_exprs,
+                            },
+                        )),
                         mutable: false,
                     });
                 }
+                result.extend(deferred_capture_snapshot);
                 // #5251 follow-up — a function-nested `class X { … }` whose
                 // name collides with an OUTER same-named local must SHADOW
                 // that local within this scope, exactly as a nested
@@ -1018,6 +1047,8 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
         }
         ast::Stmt::Switch(switch_stmt) => {
             let mut discriminant = lower_expr(ctx, &switch_stmt.discriminant)?;
+            let interfaces =
+                enter_interface_scope(ctx, switch_stmt.cases.iter().flat_map(|case| &case.cons))?;
             let mut cases = Vec::new();
             let switch_scope_mark = ctx.push_block_scope();
             // Case statement-lists share the switch's block scope without
@@ -1053,6 +1084,7 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
             }
 
             crate::lower_decl::exit_class_rename_scope(ctx, saved_class_renames);
+            exit_interface_scope(ctx, interfaces);
             ctx.pop_block_scope(switch_scope_mark);
 
             if !tdz_boxes.is_empty() {
@@ -2198,7 +2230,8 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
         ast::Stmt::Empty(_) => {}
         // `debugger;` is a no-op in AOT compilation.
         ast::Stmt::Debugger(_) => {}
-        // Type-only declarations are fully erased at compile time.
+        // Type-only declarations emit no runtime statements. Interfaces were
+        // registered at scope entry, before any uses (including forward uses).
         ast::Stmt::Decl(ast::Decl::TsInterface(_)) | ast::Stmt::Decl(ast::Decl::TsTypeAlias(_)) => {
         }
         // Body-local enum. Enum accesses never need a runtime object: both the

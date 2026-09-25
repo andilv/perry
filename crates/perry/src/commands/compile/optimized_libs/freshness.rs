@@ -145,7 +145,7 @@ pub(crate) fn auto_optimized_cache_key(
     // dependency graphs (#9470; the same class produced #9094's Linux link).
     //
     // Sort and deduplicate here as a defensive measure: aliases such as
-    // `ioredis` + `redis` + `iovalkey` name the same wrapper and must
+    // `mysql2` + `mysql2/promise` name the same wrapper and must
     // describe the same graph regardless of discovery order or alias
     // multiplicity.
     let mut tokio_bindings: Vec<String> = tokio_using_bindings
@@ -494,6 +494,10 @@ pub(crate) fn auto_optimized_source_fingerprint(
         // RUNTIME_BUILD_INPUTS. Those sources participate in the embedded
         // compiler/runtime build id even when they are not Cargo dependencies
         // of the static runtime wrapper.
+        "perry-base64",
+        "perry-hex",
+        "perry-uuid",
+        "perry-cli-support",
         "perry-dispatch",
         "perry",
         "perry-codegen",
@@ -791,10 +795,8 @@ pub(crate) fn binding_needs_shared_tokio(module: &str) -> bool {
         | "undici"
         // HTTP server (hyper)
         | "fastify"
-        // Database drivers (mongodb, sqlx, redis)
+        // Database drivers (mongodb)
         | "mongodb"
-        | "ioredis"
-        | "redis"
         // Mail (lettre)
         | "nodemailer"
     )

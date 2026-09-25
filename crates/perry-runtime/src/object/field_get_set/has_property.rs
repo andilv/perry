@@ -1188,6 +1188,26 @@ unsafe fn ordinary_has_property(
                 return true;
             }
         }
+        // #11112: ClassBody accessors are virtual own properties of the
+        // declared/evaluated prototype, not entries in its physical key array.
+        // Inspect each actual chain node, so a replaced prototype cannot
+        // resurrect members from the receiver's original class. The own-only
+        // accessor lookup respects deletion and never invokes a getter.
+        if !cur_is_array {
+            if let Some(name) = key_name {
+                if let Some(class_id) =
+                    super::super::class_registry::class_id_for_decl_prototype_object(cur as usize)
+                {
+                    if super::super::class_registry::class_declared_accessor_ptrs(
+                        class_id, false, name,
+                    )
+                    .is_some()
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
         // Advance to the recorded `[[Prototype]]`.
         let cur_addr = cur as usize;
         match super::super::prototype_chain::object_static_prototype(cur_addr) {
@@ -1362,7 +1382,12 @@ pub(crate) unsafe fn closure_dynamic_prop_by_key(
     }
     let name = crate::string::header_str_checked(key)?;
     let val = crate::closure::closure_get_dynamic_prop(obj, name);
-    if val.to_bits() != crate::value::TAG_UNDEFINED {
+    // Function methods were already resolved, including a getter or own
+    // slot returning undefined. Do not repeat that read or synthesize a
+    // fallback method over an explicit undefined value (#11175).
+    if val.to_bits() != crate::value::TAG_UNDEFINED
+        || (matches!(name, "call" | "apply" | "bind") && crate::closure::is_closure_ptr(obj))
+    {
         return Some(val);
     }
     // #4533/#3716: reading an inherited Function/Object prototype method as a
@@ -1463,3 +1488,6 @@ pub(crate) fn wide_key_index_note_hit(keys_id: usize, key_bytes: &[u8], index: u
     let h = crate::object::key_bytes_hash(key_bytes.as_ptr(), key_bytes.len());
     crate::object::shapes::shape_note_hit(keys_id as *const crate::array::ArrayHeader, h, index);
 }
+
+#[cfg(test)]
+mod evaluation_accessor_tests;

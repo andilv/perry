@@ -74,6 +74,7 @@ pub(crate) use accessor_attrs::{
 };
 
 // ── state.rs ────────────────────────────────────────────────────────────────
+pub(crate) use state::async_resource_prototype_value;
 #[cfg(test)]
 pub(crate) use state::class_decl_prototype_object_root_store;
 pub(crate) use state::{
@@ -204,9 +205,10 @@ pub use registration::{
 #[cfg(test)]
 pub(crate) use dispatch::test_bump_vtable_generation;
 pub(crate) use dispatch::{
-    call_vtable_method, call_vtable_method_with_private_brand, class_lookup_surface_gen_bump,
-    class_lookup_surface_generation, fetch_parent_kind_in_chain, obj_dispatch_ic_insert,
-    obj_dispatch_ic_lookup, vtable_generation, vtable_ic_insert, vtable_ic_lookup, VTABLE_GEN,
+    call_vtable_method, call_vtable_method_value, call_vtable_method_with_private_brand,
+    class_lookup_surface_gen_bump, class_lookup_surface_generation, fetch_parent_kind_in_chain,
+    obj_dispatch_ic_insert, obj_dispatch_ic_lookup, vtable_generation, vtable_ic_insert,
+    vtable_ic_lookup, VTABLE_GEN,
 };
 
 // ── parent_static.rs ────────────────────────────────────────────────────────

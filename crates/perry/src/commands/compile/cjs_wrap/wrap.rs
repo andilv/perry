@@ -471,7 +471,11 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
             // Resolve the require entry while the original call-site context
             // is still known. Keep relative imports spelled as written so
             // their existing cycle/deferred-module handling remains intact.
-            let resolved_require_spec = if import_spec == spec
+            // These registered facade entry points stay native even under an
+            // explicit compilePackages opt-in. Resolving them to watcher.node
+            // creates a compiled-module import whose body is intentionally absent.
+            let watcher_facade = is_watcher_facade(spec);
+            let resolved_require_spec = if !watcher_facade && import_spec == spec
                 && !spec.starts_with("./")
                 && !spec.starts_with("../")
                 && !std::path::Path::new(spec).is_absolute()
@@ -736,15 +740,33 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
 
     let require_resolve_cases = require_specs
         .iter()
-        .map(|spec| {
-            let resolved = resolved_native_addon(source_path, spec)
-                .map(|(_, logical_id)| logical_id)
-                .unwrap_or_else(|| spec.clone());
-            format!(
+        .filter_map(|spec| {
+            // A loaded file's identity is its resolved filename, not the
+            // original require spelling. Keep builtin and hosted-addon IDs,
+            // but never claim that a missing optional file resolved.
+            // The @parcel/watcher facade entry points stay native, so their
+            // identity is the package id, as for their import above: resolving
+            // them to watcher.node names a module whose body is intentionally
+            // absent (#11252).
+            let resolved = if builtin_requires.contains(spec) || is_watcher_facade(spec) {
+                Some(spec.clone())
+            } else {
+                resolved_native_addon(source_path, spec)
+                    .map(|(_, logical_id)| logical_id)
+                    .or_else(|| {
+                        source_path.parent().and_then(|module_dir| {
+                            super::super::collect_modules::static_require_transform::resolve_static_require(
+                                module_dir, spec, None,
+                            )
+                        }).map(|path| path.to_string_lossy().into_owned())
+                    })
+                    .or_else(|| perry_hir::is_native_module(spec).then(|| spec.clone()))
+            }?;
+            Some(format!(
                 "        if (specifier === {}) return {};",
                 serde_json::to_string(spec).expect("specifier is JSON encodable"),
                 serde_json::to_string(&resolved).expect("resolved specifier is JSON encodable")
-            )
+            ))
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -1500,6 +1522,15 @@ fn host_node_arch() -> Option<&'static str> {
     {
         None
     }
+}
+
+/// The registered `@parcel/watcher` facade entry points. They stay native even
+/// under an explicit `compilePackages` opt-in, so both the generated import and
+/// the generated `require.resolve` identity keep the package specifier instead
+/// of resolving it to `watcher.node`.
+fn is_watcher_facade(spec: &str) -> bool {
+    perry_hir::is_native_module(spec)
+        && (spec == "@parcel/watcher" || spec.starts_with("@parcel/watcher-"))
 }
 
 /// Fold OpenCode's target-dependent @parcel/watcher sidecar require before

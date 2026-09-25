@@ -21,6 +21,14 @@ pub(crate) extern "C" fn function_prototype_call_thunk(
     rest: f64,
 ) -> f64 {
     let target = f64::from_bits(IMPLICIT_THIS.with(|c| c.get()));
+    // The generic value-call bridge treats a proxy invocation as a bare
+    // call. Preserve the explicit receiver of Function.prototype.call.
+    if crate::proxy::js_proxy_is_proxy(target) == 1 {
+        if !crate::proxy::is_callable_function(target) {
+            crate::closure::throw_not_callable();
+        }
+        return crate::proxy::js_proxy_apply(target, this_arg, rest);
+    }
     let args = global_this_rest_array_values(rest);
     let (args_ptr, args_len) = if args.is_empty() {
         (std::ptr::null::<f64>(), 0)
@@ -403,6 +411,13 @@ unsafe fn function_apply_args(args_array: f64) -> Vec<f64> {
     if value.is_undefined() || value.is_null() {
         return Vec::new();
     }
+    // IsArray follows a Proxy's target, but the Proxy value is not an
+    // ArrayHeader. CreateListFromArrayLike must observe its length/index get
+    // traps (and revoked-proxy errors) through ordinary property access.
+    if crate::proxy::js_proxy_is_proxy(args_array) == 1 {
+        return generic_array_like_to_vec(args_array);
+    }
+
     // An arguments OBJECT is array-like but fails the IsArray check below —
     // unpack it via its registry (`fn.apply(this, arguments)`).
     if value.is_pointer() {
@@ -517,6 +532,42 @@ pub(crate) unsafe fn generic_array_like_to_vec(args_array: f64) -> Vec<f64> {
     crate::gc::RuntimeHandleScope::refreshed_nanbox_f64_slice(&handles)
 }
 
+/// Codegen entry for a statically known proxy's `call` / `apply` invocation.
+#[no_mangle]
+pub unsafe extern "C" fn js_function_apply_proxy(
+    target: f64,
+    receiver: f64,
+    args_array: f64,
+) -> f64 {
+    function_apply_proxy(target, receiver, args_array)
+}
+
+// Generated code is the only caller of this exported bridge; retain it in
+// the reduced-runtime bitcode build as well as ordinary static archives.
+#[cfg(feature = "keepalive-anchors")]
+#[used(compiler)]
+static KEEP_JS_FUNCTION_APPLY_PROXY: unsafe extern "C" fn(f64, f64, f64) -> f64 =
+    js_function_apply_proxy;
+
+/// Shared by builtin method-value invocation and direct `.apply` dispatch.
+pub(crate) unsafe fn function_apply_proxy(target: f64, receiver: f64, args_array: f64) -> f64 {
+    if !crate::proxy::is_callable_function(target) {
+        crate::closure::throw_not_callable();
+    }
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let target = scope.root_nanbox_f64(target);
+    let receiver = scope.root_nanbox_f64(receiver);
+    // Validate and snapshot CreateListFromArrayLike before invoking the trap.
+    // The proxy bridge roots the values and builds a fresh Array, including
+    // for nullish (empty) argument lists.
+    let args = function_apply_args(args_array);
+    crate::proxy::call_proxy_value_with_this(
+        target.get_nanbox_f64(),
+        receiver.get_nanbox_f64(),
+        &args,
+    )
+}
+
 pub(crate) extern "C" fn function_prototype_apply_thunk(
     _closure: *const crate::closure::ClosureHeader,
     this_arg: f64,
@@ -524,6 +575,9 @@ pub(crate) extern "C" fn function_prototype_apply_thunk(
 ) -> f64 {
     unsafe {
         let target = f64::from_bits(IMPLICIT_THIS.with(|c| c.get()));
+        if crate::proxy::js_proxy_is_proxy(target) == 1 {
+            return function_apply_proxy(target, this_arg, args_array);
+        }
         let args = function_apply_args(args_array);
         let this_arg = crate::closure::coerce_call_this(target, this_arg);
         // Rebind a concise/object-literal method's baked `this` slot to the
@@ -927,3 +981,6 @@ pub(crate) extern "C" fn array_prototype_concat_thunk(
     let args = global_this_rest_array_values(rest);
     crate::array::js_arraylike_concat(this, args.as_ptr(), args.len() as i32)
 }
+
+#[cfg(test)]
+mod apply_args_tests;

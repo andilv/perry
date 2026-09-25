@@ -30,6 +30,7 @@ mod dirty_page_cache;
 mod env_knob_parse;
 mod error_side_tables;
 mod evacuation;
+mod fetch_handle_trace;
 mod forwarded_stub_membership;
 mod forwarding_target_validation;
 mod forwarding_verification;
@@ -58,6 +59,7 @@ mod layout_trace;
 mod lazy_intrinsic_towers;
 mod lazy_tape_side_alloc;
 mod leaf_marks;
+mod map_store;
 mod mark_slot_hoists;
 mod oldgen;
 mod os_tag;
@@ -82,6 +84,7 @@ mod shape_keys_descriptor_edge;
 mod smoke;
 mod start_bitmap;
 mod step_bounds;
+mod string_char_array_roots;
 pub(super) mod support;
 mod survival_diag;
 mod sweep_described_runs;
@@ -102,3 +105,8 @@ mod young_leaf_route;
 mod young_log_tests;
 mod zero_slot_fixture;
 mod zero_slot_skip;
+
+#[cfg(feature = "dyn-eval")]
+mod dyn_eval_registry;
+
+mod private_evaluation_storage;

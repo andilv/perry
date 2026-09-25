@@ -1,6 +1,4 @@
-fn private_brand_key(declaring_class_id: u32) -> String {
-    format!("#<perry:private-brand:{declaring_class_id}>")
-}
+include!("private_evaluation_storage.rs");
 
 crate::perry_thread_local! {
     static PRIVATE_METHOD_OWNER_HINT: std::cell::RefCell<Option<(u32, String)>> =
@@ -18,6 +16,7 @@ struct PrivateMemberAccessHint {
     kind: u32,
     is_static: bool,
     is_write: bool,
+    brand_owner: Option<u64>,
 }
 
 #[inline]
@@ -121,9 +120,13 @@ pub(crate) fn private_member_get_by_name(
     obj: *const ObjectHeader,
     key: *const crate::StringHeader,
 ) -> Option<f64> {
+    if let Some(value) = private_evaluation_field_get(obj, key) {
+        return Some(value);
+    }
     let name = private_member_storage_name(key)?;
     let hint = take_private_member_access_hint(&name, false)?;
     let receiver = private_member_receiver(obj);
+    let _owner = PrivateHintBrandScope::new(hint.brand_owner);
     unsafe {
         match hint.kind {
             1 => {
@@ -143,10 +146,8 @@ pub(crate) fn private_member_get_by_name(
                         ),
                     );
                 }
-                let stable_name = super::super::native_module::intern_class_method_name(
-                    hint.class_id,
-                    &name,
-                );
+                let stable_name =
+                    super::super::native_module::intern_class_method_name(hint.class_id, &name);
                 Some(super::super::js_class_method_bind(
                     receiver,
                     stable_name.as_ptr(),
@@ -179,7 +180,8 @@ pub(crate) unsafe fn private_member_call_by_name(
     args_ptr: *const f64,
     args_len: usize,
 ) -> Option<f64> {
-    let (class_id, is_static, name) = take_private_method_call_hint(storage_name)?;
+    let (class_id, is_static, name, owner) = take_private_method_call_hint(storage_name)?;
+    let _owner = PrivateHintBrandScope::new(owner);
 
     let scope = crate::gc::RuntimeHandleScope::new();
     let receiver = scope.root_nanbox_f64(receiver);
@@ -220,14 +222,16 @@ pub(crate) unsafe fn private_member_call_by_name(
     )
 }
 
-pub(crate) fn take_private_method_call_hint(storage_name: &str) -> Option<(u32, bool, &str)> {
+pub(crate) fn take_private_method_call_hint(
+    storage_name: &str,
+) -> Option<(u32, bool, &str, Option<u64>)> {
     let name = private_member_storage_name_str(storage_name)?;
     let hint = take_private_member_access_hint(name, false)?;
     if hint.kind != 1 {
         return None;
     }
     let _ = take_private_method_owner_hint(name);
-    Some((hint.class_id, hint.is_static, name))
+    Some((hint.class_id, hint.is_static, name, hint.brand_owner))
 }
 
 pub(crate) fn private_member_set_by_name(
@@ -235,6 +239,9 @@ pub(crate) fn private_member_set_by_name(
     key: *const crate::StringHeader,
     value: f64,
 ) -> bool {
+    if private_evaluation_field_set(obj, key, value) {
+        return true;
+    }
     let Some(name) = private_member_storage_name(key) else {
         return false;
     };
@@ -242,6 +249,7 @@ pub(crate) fn private_member_set_by_name(
         return false;
     };
     let receiver = private_member_receiver(obj);
+    let _owner = PrivateHintBrandScope::new(hint.brand_owner);
     let applied = unsafe {
         if hint.is_static {
             super::super::class_registry::class_static_accessor_setter_apply(
@@ -313,8 +321,7 @@ fn private_evaluation_brand_matches(
     }
 
     if let Some(expected) = current_private_lexical_brand(declaring_class_id) {
-        let actual = private_evaluation_brand(obj, declaring_class_id);
-        return Some(actual == Some(expected));
+        return Some(private_evaluation_brand_is(obj, expected));
     }
 
     let brand_owner = if super::super::class_registry::is_class_object_value(brand_owner) {
@@ -330,7 +337,7 @@ fn private_evaluation_brand_matches(
         brand_owner
     };
     let expected = private_evaluation_brand(brand_owner, declaring_class_id)?;
-    Some(private_evaluation_brand(obj, declaring_class_id) == Some(expected))
+    Some(private_evaluation_brand_is(obj, expected))
 }
 
 #[no_mangle]
@@ -352,6 +359,12 @@ pub extern "C" fn js_private_brand_check(
         return false_value;
     }
 
+    let field_name =
+        unsafe { std::slice::from_raw_parts(field_name_ptr, field_name_len as usize) }.to_vec();
+    let field_name_ptr = field_name.as_ptr();
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let obj_root = scope.root_nanbox_f64(obj);
+    let _owner = PrivateHintBrandScope::new(private_access_owner(brand_owner, declaring_class_id));
     let has_declaring_brand =
         private_evaluation_brand_matches(obj, brand_owner, declaring_class_id).unwrap_or_else(
             || {
@@ -373,7 +386,7 @@ pub extern "C" fn js_private_brand_check(
     }
 
     if is_static == 0 {
-        let storage = crate::proxy::private_element_receiver(obj);
+        let storage = crate::proxy::private_element_receiver(obj_root.get_nanbox_f64());
         if !private_instance_element_is_present(
             storage,
             declaring_class_id,
@@ -410,6 +423,7 @@ pub(crate) fn test_push_catch_private_hint(marker: u32) {
             kind: 0,
             is_static: false,
             is_write: true,
+            brand_owner: None,
         });
     });
 }
@@ -461,4 +475,310 @@ mod instance_ancestor_evaluation_brand_tests {
             assert_eq!(private_evaluation_brand(f, CID_S), None);
         }
     }
+}
+
+// Generator continuations execute after method dispatch has popped its lexical
+// brand. Capture that environment at creation, with the receiver fallback used
+// by directly compiled method calls. The existing stack scanner and exception
+// savepoints root and unwind restored environments.
+#[no_mangle]
+pub extern "C" fn js_private_lexical_brand_capture(receiver: f64, is_static: i32) -> f64 {
+    // Static dispatch keeps its lexical owner separately from explicit this.
+    // Prefer it only for static members: an instance generator created from a
+    // static method must retain the instance method's own lexical environment.
+    if is_static != 0 {
+        if let Some(owner) = super::super::static_private_owner_current() {
+            return owner;
+        }
+    }
+    PRIVATE_LEXICAL_BRAND_STACK.with(|stack| stack.borrow().last().copied())
+        .map(f64::from_bits)
+        .or_else(|| private_evaluation_brand_value(receiver))
+        .unwrap_or_else(|| f64::from_bits(crate::value::TAG_UNDEFINED))
+}
+
+#[no_mangle]
+pub extern "C" fn js_private_lexical_brand_push(brand: f64) -> f64 {
+    private_lexical_brand_push(brand);
+    f64::from_bits(crate::value::TAG_UNDEFINED)
+}
+
+#[no_mangle]
+pub extern "C" fn js_private_lexical_brand_pop() -> f64 {
+    private_lexical_brand_pop();
+    f64::from_bits(crate::value::TAG_UNDEFINED)
+}
+
+#[cfg(feature = "keepalive-anchors")]
+#[used(compiler)]
+static KEEP_PRIVATE_LEXICAL_CAPTURE: extern "C" fn(f64, i32) -> f64 = js_private_lexical_brand_capture;
+#[cfg(feature = "keepalive-anchors")]
+#[used(compiler)]
+static KEEP_PRIVATE_LEXICAL_PUSH: extern "C" fn(f64) -> f64 = js_private_lexical_brand_push;
+#[cfg(feature = "keepalive-anchors")]
+#[used(compiler)]
+static KEEP_PRIVATE_LEXICAL_POP: extern "C" fn() -> f64 = js_private_lexical_brand_pop;
+
+#[cfg(test)]
+mod repeated_evaluation_tests {
+    use super::*;
+
+    unsafe fn class_object(cid: u32) -> f64 {
+        let class = crate::object::js_object_alloc(cid, 0);
+        crate::object::class_registry::js_object_mark_class(class as i64);
+        crate::value::js_nanbox_pointer(class as i64)
+    }
+
+    extern "C" fn super_owner_probe(_this: f64) -> f64 {
+        current_private_lexical_brand_value(62_537).unwrap_or(0.0)
+    }
+
+    extern "C" fn root_owner_probe(_this: f64) -> f64 {
+        0.0
+    }
+
+    #[test]
+    fn repeated_evaluation_super_uses_pinned_parent_owner() {
+        unsafe {
+            const CID: u32 = 62_537;
+            const ROOT: u32 = 62_538;
+            crate::object::js_register_class_parent(CID, ROOT);
+            for (cid, method) in [
+                (CID, super_owner_probe as *const u8),
+                (ROOT, root_owner_probe as *const u8),
+            ] {
+                crate::object::js_register_class_method(
+                    cid as i64,
+                    b"owner".as_ptr(),
+                    5,
+                    method as i64,
+                    0,
+                    0,
+                    0,
+                );
+            }
+            let scope = crate::gc::RuntimeHandleScope::new();
+            let a = scope.root_nanbox_f64(class_object(CID));
+            let b = scope.root_nanbox_f64(class_object(CID));
+            let parent_key =
+                super::super::super::class_registry::parent_static::CLASS_OBJECT_PARENT_KEY;
+            let key =
+                crate::string::js_string_from_bytes(parent_key.as_ptr(), parent_key.len() as u32);
+            js_object_set_field_by_name(
+                JSValue::from_bits(b.get_nanbox_f64().to_bits()).as_pointer::<ObjectHeader>()
+                    as *mut ObjectHeader,
+                key,
+                a.get_nanbox_f64(),
+            );
+            let object = scope.root_raw_mut_ptr(crate::object::js_object_alloc(CID, 0));
+            object.with_mut_ptr::<ObjectHeader, _>(|object| {
+                stamp_private_evaluation_brand(object, b.get_nanbox_f64())
+            });
+            private_lexical_brand_push(b.get_nanbox_f64());
+            let result = object.with_mut_ptr::<ObjectHeader, _>(|object| {
+                crate::object::js_super_method_call_dynamic(
+                    CID,
+                    b"owner".as_ptr(),
+                    5,
+                    crate::value::js_nanbox_pointer(object as i64),
+                    std::ptr::null(),
+                    0,
+                )
+            });
+            private_lexical_brand_pop();
+            assert_eq!(
+                result.to_bits(),
+                a.get_nanbox_f64().to_bits(),
+                "super must use its exact pinned parent evaluation"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_evaluations_use_distinct_private_field_markers() {
+        unsafe {
+            let a = class_object(62_531);
+            let b = class_object(62_531);
+            private_lexical_brand_push(a);
+            let first = private_field_marker_key(62_531, b"#v".as_ptr(), 2);
+            private_lexical_brand_pop();
+            private_lexical_brand_push(b);
+            let second = private_field_marker_key(62_531, b"#v".as_ptr(), 2);
+            private_lexical_brand_pop();
+            assert_ne!(
+                first, second,
+                "each evaluation creates a fresh private name"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_evaluation_field_values_do_not_alias() {
+        unsafe {
+            const CID: u32 = 62_533;
+            let scope = crate::gc::RuntimeHandleScope::new();
+            let a = scope.root_nanbox_f64(class_object(CID));
+            let b = scope.root_nanbox_f64(class_object(CID));
+            let layout = format!("#<perry:private-value:{CID}:#v>\0");
+            let object = scope.root_raw_mut_ptr(crate::object::js_object_alloc_class_with_keys(
+                CID,
+                0,
+                1,
+                layout.as_ptr(),
+                layout.len() as u32,
+            ));
+            let parent_key =
+                super::super::super::class_registry::parent_static::CLASS_OBJECT_PARENT_KEY;
+            let parent_key =
+                crate::string::js_string_from_bytes(parent_key.as_ptr(), parent_key.len() as u32);
+            js_object_set_field_by_name(
+                JSValue::from_bits(b.get_nanbox_f64().to_bits()).as_pointer::<ObjectHeader>()
+                    as *mut ObjectHeader,
+                parent_key,
+                a.get_nanbox_f64(),
+            );
+            object.with_mut_ptr::<ObjectHeader, _>(|object| {
+                stamp_private_evaluation_brand(object, b.get_nanbox_f64())
+            });
+
+            let field =
+                scope.root_string_ptr(crate::string::js_string_from_bytes(b"#v".as_ptr(), 2));
+            let request = format!("#<perry:private-value:{CID}:#v>");
+            let request = scope.root_string_ptr(crate::string::js_string_from_bytes(
+                request.as_ptr(),
+                request.len() as u32,
+            ));
+            // Every call below receives the handles' CURRENT pointers via
+            // with_mut_ptr: js_private_field_add / js_private_guard are
+            // self-rooting runtime entry points, and
+            // private_evaluation_field_{get,set} root their receiver before
+            // they allocate, so no pointer is held across a collection here.
+            let field_get = || {
+                object.with_mut_ptr::<ObjectHeader, _>(|object| {
+                    request.with_mut_ptr::<crate::StringHeader, _>(|request| {
+                        private_evaluation_field_get(object, request)
+                    })
+                })
+            };
+            for (brand, value) in [(a.get_nanbox_f64(), 11.0), (b.get_nanbox_f64(), 22.0)] {
+                private_lexical_brand_push(brand);
+                object.with_mut_ptr::<ObjectHeader, _>(|object| {
+                    field.with_mut_ptr::<crate::StringHeader, _>(|field| {
+                        js_private_field_add(
+                            crate::value::js_nanbox_pointer(object as i64),
+                            CID,
+                            crate::value::js_nanbox_string(field as i64),
+                            value,
+                        )
+                    })
+                });
+                private_lexical_brand_pop();
+            }
+            private_lexical_brand_push(a.get_nanbox_f64());
+            assert_eq!(field_get(), Some(11.0));
+            assert!(object.with_mut_ptr::<ObjectHeader, _>(|object| {
+                request.with_mut_ptr::<crate::StringHeader, _>(|request| {
+                    private_evaluation_field_set(object, request, 33.0)
+                })
+            }));
+            private_lexical_brand_pop();
+            private_lexical_brand_push(b.get_nanbox_f64());
+            assert_eq!(field_get(), Some(22.0));
+            private_lexical_brand_pop();
+            private_lexical_brand_push(a.get_nanbox_f64());
+            assert_eq!(field_get(), Some(33.0));
+            private_lexical_brand_pop();
+            // A direct static call has no lexical stack entry. Its guard's
+            // owner must survive until the field read, rather than selecting
+            // the receiver's most-derived evaluation again.
+            let depth = private_member_access_hints_savepoint();
+            object.with_mut_ptr::<ObjectHeader, _>(|object| {
+                js_private_guard(
+                    crate::value::js_nanbox_pointer(object as i64),
+                    a.get_nanbox_f64(),
+                    CID,
+                    b"#v".as_ptr(),
+                    2,
+                    0,
+                    0,
+                )
+            });
+            assert_eq!(field_get(), Some(33.0));
+            assert_eq!(private_member_access_hints_savepoint(), depth);
+
+            // Generic assignment must consume the guard's owner hint too.
+            for value in [44.0, 55.0, 66.0] {
+                // Re-read the object for each call: js_private_guard may
+                // collect, so a receiver bound before it would be stale.
+                object.with_mut_ptr::<ObjectHeader, _>(|object| {
+                    js_private_guard(
+                        crate::value::js_nanbox_pointer(object as i64),
+                        a.get_nanbox_f64(),
+                        CID,
+                        b"#v".as_ptr(),
+                        2,
+                        0,
+                        1,
+                    )
+                });
+                assert_eq!(private_member_access_hints_savepoint(), depth + 1);
+                object.with_mut_ptr::<ObjectHeader, _>(|object| {
+                    request.with_mut_ptr::<crate::StringHeader, _>(|request| {
+                        let receiver = crate::value::js_nanbox_pointer(object as i64);
+                        crate::proxy::js_put_value_set(
+                            receiver,
+                            crate::value::js_nanbox_string(request as i64),
+                            value,
+                            receiver,
+                            1,
+                        )
+                    })
+                });
+                assert_eq!(
+                    private_member_access_hints_savepoint(),
+                    depth,
+                    "PutValue must consume a private field write hint"
+                );
+                private_lexical_brand_push(a.get_nanbox_f64());
+                assert_eq!(field_get(), Some(value));
+                private_lexical_brand_pop();
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_evaluation_ancestor_brand_matches_by_identity() {
+        unsafe {
+            let a = class_object(62_532);
+            let b = class_object(62_532);
+            let key = super::super::super::class_registry::parent_static::CLASS_OBJECT_PARENT_KEY;
+            let key = crate::string::js_string_from_bytes(key.as_ptr(), key.len() as u32);
+            let object = JSValue::from_bits(b.to_bits()).as_pointer::<ObjectHeader>();
+            js_object_set_field_by_name(object as *mut ObjectHeader, key, a);
+            let instance = crate::object::js_object_alloc(62_532, 0);
+            stamp_private_evaluation_brand(instance, b);
+            let instance = crate::value::js_nanbox_pointer(instance as i64);
+            private_lexical_brand_push(a);
+            let matches = private_evaluation_brand_matches(instance, a, 62_532);
+            private_lexical_brand_pop();
+            assert_eq!(matches, Some(true));
+            assert_eq!(private_evaluation_brand_matches(b, a, 62_532), Some(false));
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_pending_private_access_owner() -> Option<u64> {
+    PRIVATE_MEMBER_ACCESS_HINTS
+        .with(|hints| hints.borrow().last().and_then(|hint| hint.brand_owner))
+}
+
+fn scan_private_member_access_hint_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
+    PRIVATE_MEMBER_ACCESS_HINTS.with(|hints| {
+        for hint in hints.borrow_mut().iter_mut() {
+            if let Some(owner) = hint.brand_owner.as_mut() {
+                visitor.visit_nanbox_u64_slot(owner);
+            }
+        }
+    });
 }

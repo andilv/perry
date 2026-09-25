@@ -493,6 +493,7 @@ pub fn substitute_lexical_this_in_expr(expr: &mut Expr, replacement: &Expr) {
         Expr::Closure {
             body,
             captures_this,
+            captures,
             params,
             ..
         } => {
@@ -507,6 +508,14 @@ pub fn substitute_lexical_this_in_expr(expr: &mut Expr, replacement: &Expr) {
                 // slot so the closure-cache key doesn't include a stale
                 // implicit-this snapshot.
                 *captures_this = false;
+                // #11157: a local replacement (a per-evaluation class's
+                // self-binding) is read from the closure body now, so the
+                // closure must capture it like any other outer local.
+                if let Expr::LocalGet(id) = replacement {
+                    if !captures.contains(id) {
+                        captures.push(*id);
+                    }
+                }
             }
         }
         _ => crate::walker::walk_expr_children_mut(expr, &mut |child| {
@@ -948,6 +957,17 @@ pub fn remap_local_ids_in_expr(expr: &mut Expr, map: &std::collections::HashMap<
             }
             // `value` descended via walker.
         }
+        // #11142: the class self-binding local is a raw id, not a child
+        // expression. Remap it with the captures that read it.
+        Expr::ClassExprFresh {
+            evaluation_owner: Some(owner),
+            ..
+        } => {
+            if let Some(&new_id) = map.get(owner) {
+                *owner = new_id;
+            }
+            // Statics, keys and captured args descended via walker.
+        }
         Expr::Closure {
             body,
             captures,
@@ -1052,7 +1072,19 @@ fn replace_this_in_stmt(stmt: &mut Stmt, this_id: LocalId) {
             }
         }
         Stmt::Throw(e) => replace_this_in_expr(e, this_id),
-        _ => {}
+        Stmt::DoWhile { body, condition } => {
+            replace_this_in_stmts(body, this_id);
+            replace_this_in_expr(condition, this_id);
+        }
+        Stmt::Labeled { body, .. } => replace_this_in_stmt(body, this_id),
+        Stmt::Return(None)
+        | Stmt::Break
+        | Stmt::Continue
+        | Stmt::LabeledBreak(_)
+        | Stmt::LabeledContinue(_)
+        | Stmt::PreallocateBoxes(_)
+        | Stmt::PreallocateTdzBoxes(_)
+        | Stmt::ReleaseBoxes(_) => {}
     }
 }
 
@@ -1161,9 +1193,9 @@ fn replace_this_in_expr(expr: &mut Expr, this_id: LocalId) {
         // wrap the lazy-iterator-protocol receiver, `MapEntries`/`SetValues`
         // wrap a Map/Set whose fast path is disabled). Missing them here left
         // a `for (const x of this.gen())` inside a lifted
-        // `*[Symbol.iterator]()` generator (`synthesize_symbol_iterator_wrapper`
-        // below, which lifts the method to a top-level function and replaces
-        // `this` with an explicit param) with an unreplaced `Expr::This` deep
+        // `*[Symbol.iterator]()` generator (then lifted to a top-level
+        // function with `this` replaced by an explicit param; that lift was
+        // removed by #11170) with an unreplaced `Expr::This` deep
         // inside the wrapper — it fell through to the catch-all and evaluated
         // to `undefined` outside any method body, `Cannot read properties of
         // undefined (reading 'gen')`. Hoisting the same call into a local
@@ -1259,9 +1291,38 @@ fn replace_this_in_expr(expr: &mut Expr, this_id: LocalId) {
             }
         }
         Expr::StaticFieldSet { value, .. } => replace_this_in_expr(value, this_id),
-        // Don't recurse into nested closures — they have their own
-        // `this` binding and should keep their references intact.
+        // An arrow inherits the lexical `this`, so its body's `this` is the
+        // same receiver: rewrite it too, and capture the explicit `this`
+        // local so the closure can read it (#11170). Without this, an arrow
+        // inside a lifted body read the implicit `this` of the top-level
+        // function — `undefined`.
+        Expr::Closure {
+            params,
+            body,
+            captures,
+            captures_this: true,
+            is_arrow: true,
+            ..
+        } => {
+            for p in params.iter_mut() {
+                if let Some(d) = &mut p.default {
+                    replace_this_in_expr(d, this_id);
+                }
+            }
+            replace_this_in_stmts(body, this_id);
+            if !captures.contains(&this_id) {
+                captures.push(this_id);
+            }
+        }
+        // Don't recurse into other closures — a non-arrow function has its
+        // own `this` binding and keeps its references intact.
         Expr::Closure { .. } => {}
-        _ => {}
+        // Every other variant: descend through the central exhaustive walker.
+        // The hand-written arms above predate it; the old `_ => {}` catch-all
+        // silently left `Expr::This` in place under any variant not listed
+        // (a `PrivateGuard` / `PrivateBrandCheck` receiver — `this.#x`,
+        // `#x in this` — template literals, …), which then evaluated to the
+        // lifted function's own `this` (#10445, #11170).
+        _ => walk_expr_children_mut(expr, &mut |child| replace_this_in_expr(child, this_id)),
     }
 }

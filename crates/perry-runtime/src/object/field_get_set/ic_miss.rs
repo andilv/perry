@@ -951,7 +951,7 @@ pub(super) fn get_field_ic_miss_impl(
             }
         }
     }
-    // Issue #340: small-handle receivers (axios, fastify, ioredis,
+    // Issue #340: small-handle receivers (axios, fastify,
     // ...) are passed here from the codegen IC miss path with the
     // lower-48 of the NaN-box stripped — `obj as usize` is the
     // raw handle id (1, 2, 3, ...). Route to HANDLE_PROPERTY_DISPATCH
@@ -1644,13 +1644,17 @@ pub(crate) fn scan_private_lexical_brand_roots_mut(
             visitor.visit_nanbox_u64_slot(bits);
         }
     });
+    scan_private_member_access_hint_roots_mut(visitor);
 }
 
 fn current_private_lexical_brand(declaring_class_id: u32) -> Option<u64> {
     PRIVATE_LEXICAL_BRAND_STACK.with(|stack| {
         let bits = *stack.borrow().last()?;
         let value = f64::from_bits(bits);
-        private_evaluation_brand(value, declaring_class_id).map(|_| bits)
+        // Ordinary inherited dispatch can publish the most-derived evaluation.
+        // Resolve the declaring template on that pinned chain; an explicitly
+        // bound ancestor method already starts at its exact lexical owner.
+        instance_ancestor_evaluation_brand(value, declaring_class_id)
     })
 }
 
@@ -1658,8 +1662,9 @@ pub(crate) fn current_private_lexical_brand_value(declaring_class_id: u32) -> Op
     current_private_lexical_brand(declaring_class_id).map(f64::from_bits)
 }
 
-/// Stamp an instance constructed through a `ClassExprFresh` value with the
-/// identity of that particular class evaluation. The brand lives in the
+/// Record the owner of a `ClassExprFresh` instance or evaluation prototype.
+/// Prototypes carry lexical ownership only; private access still separately
+/// requires an initialized instance element. The brand lives in the
 /// object's traced metadata record so it neither shifts user field slots nor
 /// changes the instance's ShapeId / own-key enumeration.
 pub(crate) unsafe fn stamp_private_evaluation_brand(obj: *mut ObjectHeader, class_value: f64) {
@@ -1721,7 +1726,7 @@ fn private_evaluation_brand(value: f64, declaring_class_id: u32) -> Option<u64> 
 }
 
 /// Return the fresh ClassDefinitionEvaluation object carried by a constructor
-/// or instance. Unlike `private_evaluation_brand`, this does not require the
+/// or instance/prototype. Unlike `private_evaluation_brand`, this does not require the
 /// caller to know the compile-time template id; method dispatch uses it to
 /// establish the callee's lexical private-name environment.
 pub(crate) fn private_evaluation_brand_value(value: f64) -> Option<f64> {
@@ -1746,7 +1751,17 @@ pub(crate) fn private_evaluation_brand_value(value: f64) -> Option<f64> {
 
 include!("ic_miss/private_member_access.rs");
 
+#[cfg(test)]
 fn private_field_marker_key(
+    declaring_class_id: u32,
+    field_name_ptr: *const u8,
+    field_name_len: u32,
+) -> Option<String> {
+    private_field_marker_key_for(None, declaring_class_id, field_name_ptr, field_name_len)
+}
+
+fn private_field_marker_key_for(
+    receiver: Option<f64>,
     declaring_class_id: u32,
     field_name_ptr: *const u8,
     field_name_len: u32,
@@ -1761,8 +1776,10 @@ fn private_field_marker_key(
         ))
         .ok()?
     };
+    let field_name = field_name.to_owned();
     Some(format!(
-        "#<perry:private-field:{declaring_class_id}:{field_name}>"
+        "#<perry:private-field:{}:{field_name}>",
+        private_storage_namespace_for(declaring_class_id, receiver)
     ))
 }
 
@@ -1779,12 +1796,22 @@ fn private_instance_element_is_present(
     field_name_len: u32,
     kind: u32,
 ) -> bool {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let storage = scope.root_nanbox_f64(storage);
     let marker = if kind == 0 {
-        private_field_marker_key(declaring_class_id, field_name_ptr, field_name_len)
+        private_field_marker_key_for(
+            Some(storage.get_nanbox_f64()),
+            declaring_class_id,
+            field_name_ptr,
+            field_name_len,
+        )
     } else {
-        Some(private_brand_key(declaring_class_id))
+        Some(format!(
+            "#<perry:private-brand:{}>",
+            private_storage_namespace_for(declaring_class_id, Some(storage.get_nanbox_f64()))
+        ))
     };
-    marker.is_some_and(|marker| private_marker_is_present(storage, &marker))
+    marker.is_some_and(|marker| private_marker_is_present(storage.get_nanbox_f64(), &marker))
 }
 
 /// Install one class's instance-private brand on `obj`.
@@ -1799,8 +1826,13 @@ pub extern "C" fn js_private_brand_add(obj: f64, declaring_class_id: u32) -> f64
     if declaring_class_id == 0 {
         return obj;
     }
-    let storage = crate::proxy::private_element_receiver(obj);
-    let marker = private_brand_key(declaring_class_id);
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let obj = scope.root_nanbox_f64(obj);
+    let marker = format!(
+        "#<perry:private-brand:{}>",
+        private_storage_namespace_for(declaring_class_id, Some(obj.get_nanbox_f64()))
+    );
+    let storage = crate::proxy::private_element_receiver(obj.get_nanbox_f64());
     if private_marker_is_present(storage, &marker) {
         throw_private_type_error("Cannot initialize private elements twice on the same object");
     }
@@ -1824,7 +1856,7 @@ pub extern "C" fn js_private_brand_add(obj: f64, declaring_class_id: u32) -> f64
             js_object_set_field_by_name(object, key, f64::from_bits(crate::value::TAG_TRUE));
         });
     });
-    obj
+    obj.get_nanbox_f64()
 }
 
 /// Define an instance private field without going through Proxy [[Set]].  The
@@ -1850,10 +1882,6 @@ pub extern "C" fn js_private_field_add(
     }
     let field_name_len = unsafe { (*field_key_ptr).byte_len };
     let field_name_ptr = crate::string::string_data(field_key_ptr);
-    let Some(marker) = private_field_marker_key(declaring_class_id, field_name_ptr, field_name_len)
-    else {
-        throw_private_type_error("Invalid private field name");
-    };
     let field_name = unsafe {
         std::str::from_utf8(std::slice::from_raw_parts(
             field_name_ptr,
@@ -1861,7 +1889,16 @@ pub extern "C" fn js_private_field_add(
         ))
     }
     .unwrap_or_else(|_| throw_private_type_error("Invalid private field name"));
-    let storage_name = format!("#<perry:private-value:{declaring_class_id}:{field_name}>");
+    let field_name = field_name.to_owned();
+    let marker = private_field_marker_key_for(
+        Some(obj.get_nanbox_f64()),
+        declaring_class_id,
+        field_name.as_ptr(),
+        field_name.len() as u32,
+    )
+    .unwrap_or_else(|| throw_private_type_error("Invalid private field name"));
+    let storage_name =
+        private_instance_value_name(declaring_class_id, &field_name, obj.get_nanbox_f64(), None);
     let storage = crate::proxy::private_element_receiver(obj.get_nanbox_f64());
     if private_marker_is_present(storage, &marker) {
         throw_private_type_error("Cannot initialize a private field twice on the same object");
@@ -1954,6 +1991,17 @@ pub extern "C" fn js_private_guard(
     if declaring_class_id == 0 {
         return obj;
     }
+    // A first private-name lookup can allocate the class metadata. Keep the
+    // requested name independent of a caller-owned GC string across it.
+    if _field_name_ptr.is_null() || _field_name_len == 0 {
+        throw_private_type_error("Invalid private field name");
+    }
+    let field_name =
+        unsafe { std::slice::from_raw_parts(_field_name_ptr, _field_name_len as usize) }.to_vec();
+    let _field_name_ptr = field_name.as_ptr();
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let obj_root = scope.root_nanbox_f64(obj);
+    let brand_owner_root = scope.root_nanbox_f64(brand_owner);
     let is_static = op >= 2;
     let read_write = op & 1; // 0=read, 1=write
     if is_static && crate::proxy::js_proxy_is_proxy(obj) != 0 {
@@ -1961,6 +2009,7 @@ pub extern "C" fn js_private_guard(
             "Cannot access private member from an object whose class did not declare it",
         );
     }
+    let _owner = PrivateHintBrandScope::new(private_access_owner(brand_owner, declaring_class_id));
     let has_brand = private_evaluation_brand_matches(obj, brand_owner, declaring_class_id)
         .unwrap_or_else(|| {
             if is_static {
@@ -1984,7 +2033,7 @@ pub extern "C" fn js_private_guard(
         );
     }
     if !is_static {
-        let storage = crate::proxy::private_element_receiver(obj);
+        let storage = crate::proxy::private_element_receiver(obj_root.get_nanbox_f64());
         if !private_instance_element_is_present(
             storage,
             declaring_class_id,
@@ -2006,7 +2055,8 @@ pub extern "C" fn js_private_guard(
     if illegal {
         throw_private_type_error("Invalid private member operation for its kind");
     }
-    if kind != 0 {
+    let access_owner = private_access_owner(brand_owner_root.get_nanbox_f64(), declaring_class_id);
+    if kind != 0 || (!is_static && access_owner.is_some()) {
         let field_name = unsafe {
             std::str::from_utf8(std::slice::from_raw_parts(
                 _field_name_ptr,
@@ -2022,6 +2072,7 @@ pub extern "C" fn js_private_guard(
                 kind,
                 is_static,
                 is_write: read_write != 0,
+                brand_owner: access_owner,
             });
         });
     }
@@ -2039,9 +2090,9 @@ pub extern "C" fn js_private_guard(
         });
     }
     if is_static {
-        obj
+        obj_root.get_nanbox_f64()
     } else {
-        crate::proxy::private_element_receiver(obj)
+        crate::proxy::private_element_receiver(obj_root.get_nanbox_f64())
     }
 }
 

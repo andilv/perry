@@ -115,7 +115,11 @@ pub(super) fn try_static_method_and_instance(
             // itself keyed on a local/param binding via `lookup_native_instance`
             // (e.g. an upgrade handler's `wsId.send(...)` parameter) and must
             // still dispatch.
-            let local_shadows_class = ctx.lookup_local(&obj_name).is_some();
+            // #11157: a per-evaluation class's self-binding is a value too —
+            // `C.m()` inside C's own body must call THIS evaluation's `m`
+            // with `this` = the evaluated class object.
+            let local_shadows_class = ctx.lookup_local(&obj_name).is_some()
+                || ctx.resolve_class_self_binding(&obj_name).is_some();
             if local_shadows_class {
                 // fall through past the static arms to native-instance / generic
                 // dispatch below.
@@ -516,7 +520,6 @@ pub(super) fn try_static_method_and_instance(
                             Some("PoolConnection")
                         }
                         ("pg", "connect") => Some("PoolClient"),
-                        ("ioredis", "duplicate") => Some("Redis"),
                         // dayjs manipulation methods return a NEW date
                         // handle — lets `d.add(7, 'day').format(...)`
                         // dispatch against the result. "App" matches the

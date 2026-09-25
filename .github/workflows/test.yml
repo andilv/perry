@@ -191,6 +191,9 @@ jobs:
         if: ${{ !cancelled() }}
         run: ./scripts/check_changeset_fragment.sh --self-test
 
+      - name: Docs catalog toolchain tests
+        run: python3 docs/scripts/test_i18n_toolchain.py
+
       - name: Require a changelog.d/ fragment for crates/ changes
         if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'skip-changelog')
         env:
@@ -976,6 +979,14 @@ jobs:
             cargo_args+=(--exclude "$package")
           done
           cargo clippy "${cargo_args[@]}"
+
+      - name: Lean dependency boundaries and helper compatibility
+        if: ${{ !cancelled() }}
+        run: |
+          python3 scripts/check_lean_dependencies.py
+          cargo test --locked -p perry-base64 -p perry-hex -p perry-uuid -p perry-cli-support --all-features
+          cargo check --locked -p perry-stdlib --no-default-features
+          cargo check --locked -p perry --no-default-features --features dev-cli
 
       - name: Regenerate API docs
         if: ${{ !cancelled() }}
@@ -3292,7 +3303,7 @@ jobs:
         # a "no reactor running" panic. `test_issue_414_mysql_query_params`
         # was the single compile-smoke failure this caused. Same set the
         # doc-tests job already builds together.
-        run: cargo build --release -p perry -p perry-runtime -p perry-stdlib -p perry-runtime-static -p perry-stdlib-static -p perry-ext-ioredis -p perry-ext-mongodb -p perry-ext-nodemailer
+        run: cargo build --release -p perry -p perry-runtime -p perry-stdlib -p perry-runtime-static -p perry-stdlib-static -p perry-ext-mongodb -p perry-ext-nodemailer
 
       - name: Issue #945 scalar method IR guard
         run: |
@@ -4144,7 +4155,7 @@ jobs:
         # Build them in this SAME Cargo graph as perry-stdlib: otherwise each
         # no-auto fallback build bundles a distinct tokio TLS/runtime and the
         # linker rejects the unsafe pair (#507, #7629).
-        run: cargo build --release -p perry -p perry-runtime -p perry-stdlib -p perry-runtime-static -p perry-stdlib-static -p ${{ matrix.ui_backend }} -p perry-doc-tests -p perry-ext-ioredis -p perry-ext-mongodb -p perry-ext-nodemailer -p perry-ext-net
+        run: cargo build --release -p perry -p perry-runtime -p perry-stdlib -p perry-runtime-static -p perry-stdlib-static -p ${{ matrix.ui_backend }} -p perry-doc-tests -p perry-ext-mongodb -p perry-ext-nodemailer -p perry-ext-net
 
       - name: Verify macOS application bundle packaging
         if: matrix.os == 'macos-14'

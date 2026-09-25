@@ -75,6 +75,7 @@ fn a_lexical_fetch_result_is_not_registered_as_a_native_response() {
     );
 }
 
+mod class_decl_self_binding;
 mod instanceof_rhs;
 mod literal_shape;
 
@@ -1987,5 +1988,12 @@ mod ui_widget_add_child;
 
 mod issue_10623_require_destructured_native_super;
 mod issue_10745_passthrough_heritage;
+mod issue_11139_member_heritage_builtin_name;
 
 mod hoisted_sibling_in_later_closure;
+
+mod function_constructor_shadow;
+mod issue_11157_class_decl_self_statics;
+
+#[path = "tests/anonymous_class_outer_binding.rs"]
+mod anonymous_class_outer_binding;

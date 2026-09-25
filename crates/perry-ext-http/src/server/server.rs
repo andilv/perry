@@ -8,8 +8,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use lazy_static::lazy_static;
-
 use perry_ffi::{
     alloc_string, get_handle, get_handle_mut, iter_handles_of, register_handle, JsClosure, JsValue,
     RawClosureHeader, StringHeader,
@@ -633,17 +631,11 @@ pub(super) unsafe fn listen_http_server(
             }
         }
     }));
-    if !posted {
+    if let Some(code) = posted.error_code() {
         // No loop exists for this agent anywhere (a host where `Loop::new`
-        // failed): report it where Node reports a failed listen.
-        queue_listen_error_parts(
-            server_handle,
-            &host,
-            port,
-            crate::server::turnloop_serve::NO_LOOP_CODE,
-            0,
-            "listen",
-        );
+        // failed), or the owner's postbox refused every retry: report it
+        // where Node reports a failed listen.
+        queue_listen_error_parts(server_handle, &host, port, code, 0, "listen");
         if let Some(s) = get_handle_mut::<HttpServer>(server_handle) {
             withdraw_listen_callbacks(s);
         }
@@ -753,11 +745,9 @@ impl ListenPlan {
     }
 }
 
-lazy_static! {
-    /// SCHED_RR workers' "stop accepting" flag, set by `server.close()`.
-    static ref RR_INJECT_CLOSED: Mutex<HashMap<i64, Arc<AtomicBool>>> =
-        Mutex::new(HashMap::new());
-}
+/// SCHED_RR workers' "stop accepting" flag, set by `server.close()`.
+static RR_INJECT_CLOSED: std::sync::LazyLock<Mutex<HashMap<i64, Arc<AtomicBool>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// A listen that succeeded: create the server's async resource and queue the
 /// deferred `'listening'` emit.

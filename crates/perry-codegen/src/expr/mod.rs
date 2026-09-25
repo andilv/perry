@@ -2995,6 +2995,7 @@ pub(crate) mod calls;
 mod child_proc;
 mod closure;
 mod compare;
+pub(crate) mod region_guard;
 pub(crate) mod region_read_run;
 pub(crate) use compare::lower_string_literal_strict_eq;
 #[cfg(test)]
@@ -3059,6 +3060,7 @@ pub(crate) mod os_uri_dates;
 pub(crate) mod property_get;
 pub(crate) mod property_set;
 pub(crate) mod proxy_reflect;
+pub(crate) mod put_value_store_ic;
 mod static_field_meta;
 mod static_method;
 mod string_regex_proc;
@@ -4483,3 +4485,9 @@ pub(crate) fn box_capture_entry_cells_enabled() -> bool {
         )
     })
 }
+
+#[cfg(test)]
+mod virtual_getter_tests;
+
+#[cfg(test)]
+mod call_spread_function_method_tests;

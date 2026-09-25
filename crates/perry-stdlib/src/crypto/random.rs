@@ -116,7 +116,7 @@ pub extern "C" fn js_crypto_random_bytes_hex(size: f64) -> *mut StringHeader {
 
     let mut bytes = vec![0u8; size];
     rand::rng().fill_bytes(&mut bytes);
-    let hex_str = hex::encode(&bytes);
+    let hex_str = perry_hex::encode(&bytes);
 
     js_string_from_bytes(hex_str.as_ptr(), hex_str.len() as u32)
 }
@@ -126,8 +126,7 @@ pub extern "C" fn js_crypto_random_bytes_hex(size: f64) -> *mut StringHeader {
 #[no_mangle]
 pub unsafe extern "C" fn js_crypto_random_uuid(options_bits: f64) -> *mut StringHeader {
     validate_random_uuid_options(options_bits);
-    let uuid = uuid::Uuid::new_v4();
-    let uuid_str = uuid.to_string();
+    let uuid_str = perry_uuid::v4();
     js_string_from_bytes(uuid_str.as_ptr(), uuid_str.len() as u32)
 }
 
@@ -139,8 +138,7 @@ pub unsafe extern "C" fn js_crypto_random_uuid(options_bits: f64) -> *mut String
 /// accepted for shape parity but does not change the generated value.
 #[no_mangle]
 pub extern "C" fn js_crypto_random_uuidv7() -> *mut StringHeader {
-    let uuid = uuid::Uuid::now_v7();
-    let uuid_str = uuid.to_string();
+    let uuid_str = perry_uuid::v7();
     js_string_from_bytes(uuid_str.as_ptr(), uuid_str.len() as u32)
 }
 
@@ -392,6 +390,17 @@ pub unsafe extern "C" fn js_crypto_native_dispatch(
             js_crypto_check_prime_async(arg(0), undefined, arg(1))
         }
         "checkPrime" | "checkPrimeSync" => js_crypto_check_prime_sync(arg(0), arg(1)),
+        // #11046: the inventory helpers are reached through this dispatcher
+        // whenever the receiver is not a statically-known `node:crypto`
+        // reference — `let crypto; crypto = require('node:crypto');
+        // crypto.getHashes()` (undici's subresource-integrity feature probe),
+        // a detached `const f = crypto.getHashes; f()`, or `crypto` held in an
+        // object. Without these arms they fell to `_ => undefined`, and
+        // undici's `cryptoHashes.length` threw at module init.
+        "getHashes" => pointer_value(js_crypto_get_hashes() as *mut u8),
+        "getCiphers" => pointer_value(js_crypto_get_ciphers() as *mut u8),
+        "getCurves" => pointer_value(js_crypto_get_curves() as *mut u8),
+        "getCipherInfo" => js_crypto_get_cipher_info(arg(0), arg(1)),
         "getFips" => 0.0,
         "setFips" => undefined,
         "secureHeapUsed" => pointer_value(js_crypto_secure_heap_used() as *mut u8),
@@ -744,6 +753,47 @@ mod tests {
             js_crypto_native_dispatch(method.as_ptr(), method.len(), std::ptr::null(), 0)
         };
         assert_eq!(result.to_bits(), 0.0f64.to_bits());
+    }
+
+    /// #11046: a `crypto` receiver the compiler cannot prove is `node:crypto`
+    /// (undici's `let crypto; crypto = require('node:crypto')`) reaches the
+    /// inventory helpers only through this dispatcher. Each must answer an
+    /// array, never `undefined`, and `getCipherInfo` must answer the same
+    /// object/`undefined` split as the direct helper.
+    #[test]
+    fn crypto_native_dispatch_answers_inventories() {
+        for method in ["getHashes", "getCiphers", "getCurves"] {
+            let result = unsafe {
+                js_crypto_native_dispatch(method.as_ptr(), method.len(), std::ptr::null(), 0)
+            };
+            let value = perry_runtime::JSValue::from_bits(result.to_bits());
+            assert!(
+                value.is_pointer(),
+                "{method} must answer an array, got {result:?}"
+            );
+            let arr = perry_runtime::js_nanbox_get_pointer(result)
+                as *const perry_runtime::array::ArrayHeader;
+            assert!(
+                unsafe { (*arr).length } > 0,
+                "{method} must answer a non-empty inventory"
+            );
+        }
+        let method = b"getCipherInfo";
+        let known = [js_str("aes-256-cbc"), undefined()];
+        let result = unsafe {
+            js_crypto_native_dispatch(method.as_ptr(), method.len(), known.as_ptr(), known.len())
+        };
+        assert!(perry_runtime::JSValue::from_bits(result.to_bits()).is_pointer());
+        let unknown = [js_str("no-such-cipher"), undefined()];
+        let result = unsafe {
+            js_crypto_native_dispatch(
+                method.as_ptr(),
+                method.len(),
+                unknown.as_ptr(),
+                unknown.len(),
+            )
+        };
+        assert_eq!(result.to_bits(), undefined().to_bits());
     }
 
     #[test]

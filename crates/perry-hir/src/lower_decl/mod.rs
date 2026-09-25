@@ -42,7 +42,9 @@ pub(crate) use class_computed::fresh_class_static_init_order;
 pub(crate) use class_computed::{
     class_computed_member_registration_expr, prepare_ordered_class_computed_names,
 };
-pub(crate) use class_decl::{lower_class_decl, lower_class_from_ast};
+pub(crate) use class_decl::{
+    fresh_class_decl_self_binding, lower_class_decl, lower_class_from_ast,
+};
 pub(crate) use class_members::{
     lower_class_method, lower_class_method_with_name, lower_class_prop, lower_constructor,
     lower_getter_method, lower_getter_method_with_name, lower_setter_method,
@@ -60,7 +62,9 @@ pub(crate) use helpers::{
     mapped_argument_parameter_ids, params_are_simple_arguments_list, params_use_arguments,
     symbol_well_known_key, with_static_member_context, WellKnownComputedMethod,
 };
-pub(crate) use interface_decl::lower_interface_decl;
+pub(crate) use interface_decl::{
+    enter_interface_scope, exit_interface_scope, lower_interface_decl,
+};
 pub(crate) use private_members::{
     build_private_scope, lower_private_getter, lower_private_method, lower_private_prop,
     lower_private_setter,

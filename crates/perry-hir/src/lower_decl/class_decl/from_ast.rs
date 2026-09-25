@@ -29,12 +29,10 @@ pub(crate) fn lower_class_from_ast(
     ctx.current_class = Some(name.to_string());
     let old_class_scope_depth = ctx.current_class_scope_depth.replace(ctx.scope_depth);
     let old_inner_name = ctx.current_class_inner_name.take();
-    // A class-expression caller stashes the source ident here; fall back
-    // to the (possibly synthetic) registration name when absent.
+    // Only a source identifier creates an inner binding. An anonymous
+    // class's inferred display name must not shadow its enclosing variable.
     let explicit_inner_name = ctx.pending_class_inner_name.take();
-    ctx.current_class_inner_name = explicit_inner_name
-        .clone()
-        .or_else(|| Some(name.to_string()));
+    ctx.current_class_inner_name = explicit_inner_name.clone();
     let old_is_derived = ctx.current_class_is_derived;
     ctx.current_class_is_derived = class.super_class.is_some();
 
@@ -239,6 +237,14 @@ pub(crate) fn lower_class_from_ast(
                 match lower_class_heritage_expr(ctx, super_class) {
                     Ok(expr) => (None, Some(parent_name), None, Some(Box::new(expr))),
                     Err(_) => (None, Some(parent_name), None, None),
+                }
+            } else if member_heritage_hides_global_builtin(ctx, member, &parent_name) {
+                // #11139: keep in lockstep with the matching arm in
+                // `lower_class_decl` — `extends ns.URL` is ns's property, not
+                // the global built-in the bare name would select in codegen.
+                match lower_class_heritage_expr(ctx, super_class) {
+                    Ok(expr) => (None, None, None, Some(Box::new(expr))),
+                    Err(_) => (None, None, None, None),
                 }
             } else {
                 // Named cross-module member-extends — route through `extends_expr`
@@ -454,24 +460,24 @@ pub(crate) fn lower_class_from_ast(
                         );
                     }
                     ast::MethodKind::Method => {
-                        let mut func = with_static_member_context(ctx, method.is_static, |ctx| {
+                        let func = with_static_member_context(ctx, method.is_static, |ctx| {
                             lower_class_method(ctx, method)
                         })?;
-                        // `*[Symbol.iterator]()` — lift to a top-level generator
-                        // and register a synthetic `@@iterator` wrapper (#5128),
-                        // exactly as the class-declaration path does above.
+                        // `*[Symbol.iterator]()` — install the generator itself
+                        // under the computed key (#5128, #11170), exactly as the
+                        // class-declaration path does.
                         if prop_name == "@@iterator" && func.is_generator && !method.is_static {
-                            let wrapper = synthesize_symbol_iterator_wrapper(ctx, name, &mut func);
+                            let function = register_symbol_iterator_generator(ctx, name, func);
                             let ast::PropName::Computed(computed) = &method.key else {
                                 unreachable!("@@iterator generator key must be computed");
                             };
                             // The computed-symbol registration installs the
-                            // runtime dispatch alias too. Registering the wrapper
-                            // as a string method also exposed an own "@@iterator"
+                            // runtime dispatch alias too. Registering the method
+                            // under a string name also exposed an own "@@iterator"
                             // property that the source never declared (#9788).
                             computed_members.push(ClassComputedMember {
                                 key_expr: lower_expr(ctx, &computed.expr)?,
-                                function: wrapper,
+                                function,
                                 is_static: false,
                                 kind: ClassComputedMemberKind::Method,
                                 source_order: member_index,

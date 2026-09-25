@@ -1,7 +1,7 @@
 //! ClientRequest metadata and client IncomingMessage FFI surface.
 
 use super::*;
-use base64::Engine as _;
+use perry_base64::Engine as _;
 use std::fmt::Write as _;
 
 /// `IncomingMessage.setEncoding(encoding)` for client responses. The same
@@ -72,7 +72,7 @@ pub extern "C" fn js_http_client_request_method(handle: Handle) -> *mut StringHe
 #[no_mangle]
 pub extern "C" fn js_http_client_request_protocol(handle: Handle) -> *mut StringHeader {
     let protocol = with_handle_mut::<ClientRequestHandle, _, _>(handle, |req| {
-        reqwest::Url::parse(&req.url)
+        url::Url::parse(&req.url)
             .map(|u| format!("{}:", u.scheme()))
             .unwrap_or_default()
     })
@@ -83,7 +83,7 @@ pub extern "C" fn js_http_client_request_protocol(handle: Handle) -> *mut String
 #[no_mangle]
 pub extern "C" fn js_http_client_request_host(handle: Handle) -> *mut StringHeader {
     let host = with_handle_mut::<ClientRequestHandle, _, _>(handle, |req| {
-        reqwest::Url::parse(&req.url)
+        url::Url::parse(&req.url)
             .ok()
             .and_then(|u| u.host_str().map(|s| s.to_string()))
             .unwrap_or_default()
@@ -95,7 +95,7 @@ pub extern "C" fn js_http_client_request_host(handle: Handle) -> *mut StringHead
 #[no_mangle]
 pub extern "C" fn js_http_client_request_path(handle: Handle) -> *mut StringHeader {
     let path = with_handle_mut::<ClientRequestHandle, _, _>(handle, |req| {
-        reqwest::Url::parse(&req.url)
+        url::Url::parse(&req.url)
             .map(|u| {
                 let mut path = u.path().to_string();
                 if path.is_empty() {
@@ -350,8 +350,8 @@ pub(crate) fn body_chunk_value(body: &[u8], encoding: Option<&str>) -> f64 {
         Some(encoding) => {
             let normalized = encoding.to_ascii_lowercase().replace(['-', '_'], "");
             let s = match normalized.as_str() {
-                "base64" => base64::engine::general_purpose::STANDARD.encode(body),
-                "base64url" => base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(body),
+                "base64" => perry_base64::engine::general_purpose::STANDARD.encode(body),
+                "base64url" => perry_base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(body),
                 "hex" => {
                     let mut encoded = String::with_capacity(body.len() * 2);
                     for byte in body {

@@ -81,6 +81,7 @@ mod class_gc_roots;
 mod class_handles;
 pub mod class_image;
 mod class_registry;
+pub(crate) use class_registry::async_resource_prototype_value;
 pub(crate) use class_registry::class_registry_census;
 #[cfg(feature = "regex-engine")]
 pub(crate) use class_registry::construct_two_rooted;
@@ -88,6 +89,8 @@ pub(crate) use class_registry::{construct_rooted_arguments, scan_current_new_tar
 pub(crate) mod canonical_keys;
 mod census;
 pub(crate) use census::object_tables_census;
+#[cfg(test)]
+mod bound_method_receiver_tests;
 mod collection_proto_thunks;
 mod data_view_registry;
 mod dataview_proto_thunks;
@@ -340,6 +343,7 @@ pub(crate) use field_get_set::{
 };
 #[cfg(test)]
 pub(crate) use this_binding::js_derived_super_scope_push;
+pub(crate) use this_binding::SuperNewTargetScope;
 pub(crate) use this_binding::{
     derived_super_binding_stack_restore, derived_super_binding_stack_savepoint,
     implicit_this_trap_restore, implicit_this_trap_savepoint, new_target_trap_restore,
