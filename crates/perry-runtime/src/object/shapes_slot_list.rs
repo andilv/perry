@@ -416,6 +416,33 @@ pub(crate) unsafe fn retire_owned_shape_history(
     }
 }
 
+/// The inline/overflow boundary a live count implies: slot `i` is inline iff
+/// `i < inline_slot_bound(live)`. Every reader and writer splits on this.
+#[inline(always)]
+fn inline_slot_bound(live_inline_slot_count: u32) -> u32 {
+    live_inline_slot_count.max(crate::object::INLINE_SLOT_FLOOR as u32)
+}
+
+/// May a stable-tombstone update rewrite `from` to `to` UNDER THE SAME ID?
+///
+/// Only if the boundary does not move (#10768). Caches record a slot's
+/// inline-or-overflow verdict when they prime (`IC_SLOT_OVERFLOW_BIT` in the
+/// read and write stubs' slot words) and re-prove it only through the shape
+/// token. That is sound only if an id pins the boundary. A general
+/// publication pins it by minting a new id for a new count. These two
+/// updaters are the one place a count changes under an id that is already
+/// stamped, so they check it here, for every caller, instead of each caller
+/// showing its own change is harmless. A change that WOULD move the boundary
+/// declines, and the caller mints a successor like any other receiver.
+///
+/// A raise that stays below the floor is admitted. That is the #9064 re-add
+/// into an unused inline slot (`live 1 -> 2` under a floor of 2), which moves
+/// no slot across the boundary.
+#[inline(always)]
+fn stable_update_keeps_inline_bound(from: u32, to: u32) -> bool {
+    inline_slot_bound(from) == inline_slot_bound(to)
+}
+
 /// Update the private structural facts of a stable-tombstone receiver without
 /// changing its ShapeId.
 ///
@@ -423,8 +450,9 @@ pub(crate) unsafe fn retire_owned_shape_history(
 /// allocation must stay at the same address, so the descriptor's GC edge and
 /// every surviving `(token, slot)` remain unchanged. Deletes change only the
 /// hole count; a re-add appends at the private array's tail and may also widen
-/// the inline live bound. A grow-reallocation declines and uses the ordinary
-/// mint-then-stamp path.
+/// the live count below the inline boundary. A grow-reallocation declines and
+/// uses the ordinary mint-then-stamp path, and so does any update that would
+/// move the inline/overflow boundary (`stable_update_keeps_inline_bound`).
 ///
 /// A mutable private epoch must not participate in exact-facts interning.
 /// Detach it on entry and leave it in the keys-address family, which keeps GC
@@ -467,6 +495,9 @@ pub(crate) unsafe fn try_update_stable_tombstone_shape(
         && current.hole_count == hole_count
     {
         return Some(id);
+    }
+    if !stable_update_keeps_inline_bound(current.live_inline_slot_count, live_inline_slot_count) {
+        return None;
     }
 
     // Detach from exact-facts interning, so a mutable private epoch is never
@@ -527,6 +558,7 @@ pub(crate) unsafe fn try_update_stable_tombstone_shape_cached(
     if record.keys != current.keys
         || record.has(RECORD_FLAG_FACTS_INDEXED)
         || record.object_kind() != super::ShapeObjectKind::Ordinary
+        || !stable_update_keeps_inline_bound(record.live_inline_slot_count, live_inline_slot_count)
     {
         return None;
     }
@@ -673,6 +705,7 @@ pub(crate) unsafe fn publish_object_shape_holes(
         generation,
         current.object_kind,
         hole_count,
+        current.proto_id,
     ));
     // #9200 THE FIX: stamp through the carrier-note funnel. This publish is
     // the one that minted a fresh (old_carrier=false) descriptor for an
@@ -894,6 +927,7 @@ pub(crate) unsafe fn publish_object_shape_delete_transition(
             generation,
             current.object_kind,
             hole_count,
+            current.proto_id,
         );
     }
     if id == 0 {
@@ -1021,6 +1055,7 @@ fn mint_detached_delete_successor(
     semantic_generation: u64,
     object_kind: super::ShapeObjectKind,
     hole_count: u32,
+    proto_id: u64,
 ) -> u32 {
     let Ok(id) = super::alloc_shape_id() else {
         return 0;
@@ -1032,7 +1067,8 @@ fn mint_detached_delete_successor(
         semantic_generation,
         object_kind,
         hole_count,
-    );
+    )
+    .with_proto_id(proto_id);
     // `ShapeRecord::new` sets the flag by default, because its usual caller
     // inserts into `by_facts` on the next line. This record is never inserted
     // there, and the flag is what both stable-tombstone updaters read to
@@ -1074,6 +1110,7 @@ pub(super) fn install_external_shape_id(
     keys: *const super::ArrayHeader,
     logical_key_count: u32,
     live_inline_slot_count: u32,
+    proto_id: u64,
 ) -> bool {
     if !super::is_shape_id(id) || (keys.is_null() && logical_key_count != 0) {
         return false;
@@ -1086,19 +1123,21 @@ pub(super) fn install_external_shape_id(
         0,
         super::ShapeObjectKind::Ordinary,
         0,
-    );
+    )
+    .with_proto_id(proto_id);
     record.set(super::shapes_store::RECORD_FLAG_EXTERNAL_CARRIER, true);
     let table = &crate::state::state().shapes;
     let mut inner = table.inner.borrow_mut();
     if let Some(existing) = table.slab().record_ptr(id) {
         // SAFETY: live slab record, single-threaded agent.
-        let matches = unsafe { &*existing }.facts_match(
+        let matches = unsafe { &*existing }.facts_match_proto(
             keys,
             logical_key_count,
             live_inline_slot_count,
             0,
             super::ShapeObjectKind::Ordinary,
             0,
+            proto_id,
         );
         if matches {
             // SAFETY: same record and agent discipline as above.

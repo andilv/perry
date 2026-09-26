@@ -127,6 +127,14 @@ object PerryBridge {
     @JvmStatic
     fun getActivity(): Activity = activity
 
+    @JvmStatic
+    fun createSplitView(): View = PerrySplitView(activity)
+
+    @JvmStatic
+    fun splitViewAddChild(parent: View, child: View) {
+        (parent as? PerrySplitView)?.addPane(child)
+    }
+
     // --- Content view ---
 
     @JvmStatic
@@ -158,6 +166,31 @@ object PerryBridge {
             }
             latch.await()
         }
+    }
+
+    // TabBar state and all view mutations belong to the Android UI thread.
+    private fun <T> tabBarOnUiThread(action: () -> T): T {
+        if (Looper.myLooper() == Looper.getMainLooper()) return action()
+        val task = java.util.concurrent.FutureTask<T> { action() }
+        uiHandler.post(task)
+        return task.get()
+    }
+
+    @JvmStatic
+    fun createTabBar(callbackKey: Long): View = tabBarOnUiThread {
+        PerryTabBar(activity, callbackKey)
+    }
+
+    @JvmStatic
+    fun tabBarAddTab(view: View, label: String, content: View) = tabBarOnUiThread {
+        (view as? PerryTabBar)?.addTab(label, content)
+        Unit
+    }
+
+    @JvmStatic
+    fun tabBarSetSelected(view: View, index: Int) = tabBarOnUiThread {
+        (view as? PerryTabBar)?.selectTab(index)
+        Unit
     }
 
     // --- dp conversion ---
@@ -425,6 +458,16 @@ object PerryBridge {
         val progress = ((value - min) * 100.0).toInt()
         seekBar.progress = progress
     }
+
+    // --- Table ---
+
+    @JvmStatic
+    fun createTable(rows: Int, columns: Int, renderKey: Long): View = PerryTable.onUi {
+        PerryTable(activity, rows, columns, renderKey)
+    }
+
+    @JvmStatic
+    external fun nativeTableRenderCell(key: Long, row: Int, column: Int): View?
 
     // --- Spinner (Picker) callback ---
 

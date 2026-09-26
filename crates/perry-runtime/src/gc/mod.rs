@@ -207,6 +207,10 @@ use tenuring::*;
 mod oldgen;
 use oldgen::*;
 pub(crate) mod heap_generation;
+/// #10698: `gc_check_trigger`'s "nothing is due" watermark and the
+/// `TriggerInput` cell type whose writes retire it.
+pub(crate) mod trigger_watermark;
+pub(crate) use trigger_watermark::TriggerInput;
 mod oldgen_defrag;
 use oldgen_defrag::*;
 mod cycle;
@@ -1065,6 +1069,10 @@ pub fn gc_init() {
     // address cannot be recycled under the entry, and rewritten, so a
     // compacting or copying pass leaves it pointing at the same object.
     reg_scanner!(crate::object::inherited_read_cache::scan_inherited_read_cache_roots_mut);
+    // Inherited-access lane: a store site's chain verdict names its interned
+    // key and the receiver's recorded prototype, and compares them on every
+    // use, so both are STRONG roots (`object::chain_store`).
+    reg_scanner!(crate::object::chain_store::scan_chain_store_roots_mut);
     reg_scanner!(crate::map::scan_map_iterator_array_roots_mut);
     reg_scanner!(crate::set::scan_set_iterator_array_roots_mut);
     reg_scanner!(crate::perf_hooks::scan_perf_entries_roots_mut);
@@ -1211,6 +1219,7 @@ pub fn gc_init() {
     // them if a copying collection moves their backing allocations.
     reg_scanner!(crate::object::scan_native_callable_export_roots_mut);
     reg_scanner!(crate::object::scan_class_capture_value_roots_mut);
+    reg_scanner!(crate::object::scan_class_env_roots_mut);
     reg_scanner!(crate::node_vm::scan_vm_roots_mut);
     // #6559: the dyn-eval interpreter's rooted value stack (environments,
     // temporaries, arguments of in-flight interpreted frames). Mark +

@@ -13,6 +13,7 @@ mod collection_methods;
 mod common_methods;
 mod disposal;
 mod handle_methods;
+mod namespace_override;
 mod object_proto;
 mod primitive_methods;
 mod proto_dispatch;
@@ -30,12 +31,20 @@ mod probe_dispatch_tests;
 /// #8139: `toLocaleString` on an array / typed-array / buffer receiver.
 mod to_locale_string_tests;
 mod typed_array;
+#[cfg(test)]
+/// #10724: the vtable guard's own-key scan never uses the element accessor.
+mod vtable_guard_scan_tests;
 
 use bare_receiver::{
     canonicalize_bare_gc_receiver, dispatch_unvouched_bare_as_number, is_unvouched_bare_word,
 };
 use disposal::{
     js_using_check_disposable, try_disposable_stack_method_dispatch, try_symbol_dispose_dispatch,
+};
+#[cfg(test)]
+pub(crate) use namespace_override::test_push_catch_namespace_override;
+pub(crate) use namespace_override::{
+    namespace_override_stack_restore, namespace_override_stack_savepoint,
 };
 pub use object_proto::js_value_to_locale_string;
 pub(crate) use object_proto::{
@@ -182,8 +191,18 @@ unsafe fn class_vtable_fast_guard(object: f64, method_bytes: &[u8]) -> Option<(u
         if key_count > 65536 {
             return None;
         }
-        for i in 0..key_count {
-            let key_val = crate::array::js_array_get(keys, i as u32);
+        // #10724: read the RAW dense slots, not `js_array_get` per key. That
+        // accessor re-runs the whole JS-facing element gauntlet (lazy-array
+        // strip, Map/Set/typed-array/subclass arms, `clean_arr_ptr`, descriptor
+        // gate, hole → prototype chain) on every key of every guarded call, and
+        // this loop was 75% of all `js_array_get_f64` calls on a natively
+        // compiled `tsc --noEmit` (26.4 M reads). `keys` came straight out of the
+        // live `descriptor` above with no allocation since, which is exactly the
+        // `_resolved` accessor's contract. A keys array is dense and holds only
+        // strings, so a hole or non-string slot simply fails the byte compare.
+        let (slots, slot_len) = crate::object::keys_array_dense_slots_resolved(keys);
+        for i in 0..key_count.min(slot_len) {
+            let key_val = crate::JSValue::from_bits((*slots.add(i)).to_bits());
             if crate::string::js_string_key_matches_bytes(key_val, method_bytes) {
                 return None;
             }
@@ -1436,6 +1455,25 @@ pub unsafe extern "C-unwind" fn js_native_call_method(
             && crate::object::is_valid_obj_ptr(ns_ptr as *const u8)
             && (*ns_ptr).class_id == crate::object::native_module::NATIVE_MODULE_CLASS_ID
         {
+            // #10848: a method the program REPLACED on the namespace
+            // (`console.error = f`, `console[m] = f`) wins over the native
+            // implementation — every read of `console.error` already sees it
+            // (`native_namespace_user_value` consults both stores a user write
+            // can land in); the call must too.
+            if let Some(module) = crate::object::native_module::read_native_module_name(ns_ptr) {
+                if let Some(result) = namespace_override::call_native_namespace_override(
+                    &root_scope,
+                    object(),
+                    module,
+                    method_name,
+                    &refreshed_args(),
+                ) {
+                    return result;
+                }
+            }
+            // Re-read: the override probe above can allocate (and so move the
+            // namespace object).
+            let ns_ptr = jsval().as_pointer::<ObjectHeader>();
             let ns_args = refreshed_args();
             return crate::object::dispatch_native_module_method(
                 ns_ptr as *const ObjectHeader,

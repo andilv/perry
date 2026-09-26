@@ -478,6 +478,27 @@ impl LoweringContext {
 
     /// Look up the captured outer-scope LocalIds for a class. Returns `None`
     /// for plain (non-capturing) classes.
+    /// Record that `class_name` keeps its captures in the class environment.
+    pub(crate) fn register_class_env(&mut self, class_name: String) {
+        self.class_env_classes.insert(class_name);
+    }
+
+    /// Whether `class_name`'s environment reads are guarded by evaluation.
+    pub(crate) fn is_class_env_guarded(&self, class_name: &str) -> bool {
+        self.class_env_guarded.contains(class_name)
+    }
+
+    /// Whether `class_name` keeps its captures in the class environment.
+    pub(crate) fn is_class_env(&self, class_name: &str) -> bool {
+        self.class_env_classes.contains(class_name)
+    }
+
+    /// Whether the class node spanning `span` is evaluated at most once.
+    pub(crate) fn class_definition_runs_once(&self, span: swc_common::Span) -> bool {
+        !(span.lo.0 == 0 && span.hi.0 == 0)
+            && self.run_once_class_spans.contains(&(span.lo.0, span.hi.0))
+    }
+
     pub(crate) fn lookup_class_captures(&self, class_name: &str) -> Option<&[LocalId]> {
         self.class_captures
             .iter()
@@ -1266,10 +1287,23 @@ impl LoweringContext {
     /// implicit-namespace lowering when no ordinary local shadows them. Imports
     /// may use any registered alias; the native-module shadow stack records
     /// when an inner local masks one of those aliases.
+    ///
+    /// #11336: a binding imported from a *source* module shadows the canonical
+    /// name too. `import * as crypto from "./utils"` — or CommonJS
+    /// `const crypto = require('./utils')`, which the CJS wrap hoists to an
+    /// import — is not a local, so the implicit arm used to claim it, and
+    /// `crypto.sha256(buf)` lowered to Perry's hex-digest intrinsic instead of
+    /// calling the module's own `sha256`. node-postgres names its WebCrypto
+    /// helper module exactly that, which broke every scram-sha-256 login.
+    /// Native imports never register an imported function (they register an
+    /// alias, checked above), so this only ever removes a false match.
     pub(crate) fn is_builtin_module_namespace(&self, name: &str, module: &str) -> bool {
         let alias_matches = self.lookup_builtin_module_alias(name) == Some(module)
             && !self.module_shadow_stack.iter().any(|shadow| shadow == name);
-        alias_matches || (name == module && self.lookup_local(name).is_none())
+        alias_matches
+            || (name == module
+                && self.lookup_local(name).is_none()
+                && self.lookup_imported_func(name).is_none())
     }
 
     /// #1750: record `const w = <root>.win32` / `.posix` so that later

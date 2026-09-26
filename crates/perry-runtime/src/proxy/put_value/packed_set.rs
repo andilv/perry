@@ -70,8 +70,8 @@ use super::*;
 /// compares the receiver's ShapeId word against the low half, and a receiver
 /// that was never shape-stamped carries a small `parent_class_id` there (0 for
 /// an anonymous literal), which a zero sentinel would match. `0xFFFF_FFFF` is
-/// above every ShapeId and every class id (`u32::MAX` is reserved, see
-/// `class_guard_shape.rs`), so the compare refuses an unprimed site by itself.
+/// above every ShapeId and every class id (`u32::MAX` is never allocated
+/// as either), so the compare refuses an unprimed site by itself.
 pub const PACKED_SET_EMPTY: u64 = 0xFFFF_FFFF;
 
 /// Ways in a site's cache. The first [`PACKED_SET_INLINE_WAYS`] are compared by
@@ -80,8 +80,33 @@ pub const PACKED_SET_EMPTY: u64 = 0xFFFF_FFFF;
 pub const PACKED_SET_WAYS: usize = 8;
 pub const PACKED_SET_INLINE_WAYS: usize = 4;
 
-/// A site's way cache: packed words in the compact word's format.
-pub type PackedSetWays = [u64; PACKED_SET_WAYS];
+/// The word after the ways: the site's inherited-access chain entry
+/// (`object::chain_store`), 0 until the site primes one. Never compared by
+/// the emitted code, which reads only ways `0..PACKED_SET_INLINE_WAYS`.
+pub const PACKED_SET_CHAIN_WORD: usize = PACKED_SET_WAYS;
+
+/// A site's way cache: packed words in the compact word's format, then the
+/// chain entry word.
+pub type PackedSetWays = [u64; PACKED_SET_WAYS + 1];
+
+/// A site cache no prime has touched: every way empty, no chain entry.
+pub const fn packed_set_cache_empty() -> PackedSetWays {
+    let mut cache = [PACKED_SET_EMPTY; PACKED_SET_WAYS + 1];
+    cache[PACKED_SET_CHAIN_WORD] = 0;
+    cache
+}
+
+/// The site's cache, allocating it (empty) if it has none yet.
+///
+/// # Safety
+/// `cache_slot` is null or a live packed-set cache slot.
+pub(crate) unsafe fn packed_set_cache_resolve(
+    cache_slot: *mut PackedSetWaysSlot,
+) -> *mut PackedSetWays {
+    crate::object::pic_slot_resolve_init(cache_slot, |fresh| {
+        *fresh = packed_set_cache_empty();
+    })
+}
 /// The emitted `@perry_ic_N = private global ptr null` for a store site.
 pub type PackedSetWaysSlot = *mut PackedSetWays;
 
@@ -123,6 +148,7 @@ pub extern "C" fn js_put_value_set_packed_miss(
     // The ways the emitted code does not compare. Nothing here allocates or
     // runs user code, so `target` and `value` are still the caller's values
     // when the full walk below needs them.
+    let chain_site = crate::object::chain_store::ChainSite::Packed(cache_slot);
     unsafe {
         let cache = crate::object::pic_slot_peek(cache_slot);
         if !cache.is_null() {
@@ -140,6 +166,26 @@ pub extern "C" fn js_put_value_set_packed_miss(
         }
     }
 
+    // Inherited-access lane: a key-adding store whose chain this site has
+    // already proved clear takes the transition append (`object::chain_store`).
+    // Allocation-free on a decline.
+    let chain_key = if key.is_null() {
+        None
+    } else {
+        unsafe {
+            crate::object::chain_store::interned_key_for_store(f64::from_bits(
+                crate::value::js_nanbox_string(key as i64).to_bits(),
+            ))
+        }
+    };
+    if let Some(chain_key) = chain_key {
+        if let Some(stored) = unsafe {
+            crate::object::chain_store::chain_store_try(chain_site, target, chain_key, value)
+        } {
+            return stored;
+        }
+    }
+    let pre_shape = unsafe { crate::object::chain_store::pre_store_shape(target) };
     let scope = crate::gc::RuntimeHandleScope::new();
     let target_handle = scope.root_nanbox_f64(target);
     let key_handle = scope.root_string_ptr(key);
@@ -162,6 +208,21 @@ pub extern "C" fn js_put_value_set_packed_miss(
     });
     unsafe {
         prime_packed_set(target_handle.get_nanbox_f64(), key, cache_slot, packed);
+        // Re-resolved after the store: the slow path may have interned the key.
+        let chain_key = if key.is_null() {
+            std::ptr::null()
+        } else {
+            crate::object::chain_store::interned_key_for_store(f64::from_bits(
+                crate::value::js_nanbox_string(key as i64).to_bits(),
+            ))
+            .unwrap_or(std::ptr::null())
+        };
+        crate::object::chain_store::chain_store_after_miss(
+            chain_site,
+            pre_shape,
+            target_handle.get_nanbox_f64(),
+            chain_key,
+        );
     }
     result
 }
@@ -332,7 +393,10 @@ unsafe fn prime_packed_set(
         return;
     }
     let stamp = crate::object::shapes::object_shape_stamp(obj);
-    if !crate::object::shapes::is_shape_id(stamp) {
+    // Only an ORDINARY-band ShapeId may enter a site word: a dictionary
+    // shape's id is outside it (`shapes::DICTIONARY_SHAPE_ID_BASE`), so no
+    // emitted store compare can equal a dictionary receiver's word.
+    if !crate::object::shapes::is_site_matchable_shape_id(stamp) {
         return;
     }
     // One word format for the MRU word and every way: `(index << 32) | key`,
@@ -348,11 +412,7 @@ unsafe fn prime_packed_set(
 
     // The way cache: fill the first empty way, never evict.
     if !cache_slot.is_null() {
-        let cache = crate::object::pic_slot_resolve_init(cache_slot, |fresh| {
-            for w in (*fresh).iter_mut() {
-                *w = PACKED_SET_EMPTY;
-            }
-        });
+        let cache = packed_set_cache_resolve(cache_slot);
         if !cache.is_null() {
             let ways = &*(cache as *const [AtomicU64; PACKED_SET_WAYS]);
             for way in ways.iter() {

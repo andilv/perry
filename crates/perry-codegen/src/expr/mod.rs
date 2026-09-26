@@ -105,6 +105,7 @@ pub(crate) use i32_fast_path::{
     try_flat_const_2d_int, try_lower_flat_const_index_get,
 };
 pub(crate) use index::lower_index_set_fast;
+pub(crate) use logical_collections::emit_private_site_cache;
 pub(crate) use nanbox_inline::{
     i32_bool_to_nanbox, i32_to_nanbox, nanbox_bigint_inline, nanbox_pointer_inline,
     nanbox_pointer_inline_pub, nanbox_string_inline,
@@ -160,6 +161,8 @@ pub(crate) use write_barrier::{
 mod array_callback_shape_tests;
 #[cfg(test)]
 mod array_push_guard_tests;
+#[cfg(test)]
+mod array_push_own_tests;
 #[cfg(test)]
 mod barrier_stem_census_tests;
 #[cfg(test)]
@@ -1174,6 +1177,13 @@ pub(crate) struct FnCtx<'a> {
     /// keeps today's guarded lowering because its receiver is unproven.
     pub proven_this: Option<crate::collectors::PtrShapeLocal>,
 
+    /// #10906: a metadata-only class candidate for `this` in a closed-shape
+    /// object-literal method body — the `__AnonShape_*` class its literal
+    /// allocates. Nominates only the guarded class-field get/set paths, whose
+    /// runtime class-id/shape check owns the fallback; `receiver_class_name`
+    /// never sees it, so nothing that trusts a proven receiver does either.
+    pub guarded_this_class: Option<String>,
+
     /// #8774: parameter-local exact-shape proofs installed only in a guarded
     /// `$pshape_args` method clone.  Like `proven_this`, each value remains a
     /// tagged JSValue in its ordinary shadow-bound slot; field lowering reloads
@@ -1643,6 +1653,12 @@ pub(crate) struct FnCtx<'a> {
     /// Mutable locals known to be non-negative at the current point. While
     /// guards provide the upper bound; this set supplies the lower bound.
     pub nonnegative_integer_locals: std::collections::HashSet<u32>,
+    /// #10509: synthesized `arguments` locals whose slot holds the caller's
+    /// raw argument bundle because the prologue proved the Arguments object
+    /// unobservable (`codegen::arguments::arguments_elision`). Their
+    /// `.length` and `[k]` reads lower through `codegen::arguments`.
+    pub elided_arguments:
+        std::collections::HashMap<u32, crate::codegen::arguments::ElidedArguments>,
     /// Native representation records drained into `LlModule` after this
     /// function/method/closure/module-init body has been lowered.
     pub native_rep_records: Vec<NativeRepRecord>,
@@ -2985,6 +3001,7 @@ impl<'a> FnCtx<'a> {
 mod array_methods;
 pub(crate) mod array_pop;
 mod array_push;
+mod array_push_own;
 mod arrays_finds;
 mod bigint_set;
 mod binary;
@@ -2993,6 +3010,7 @@ mod boolean_number_tests;
 mod call_spread;
 pub(crate) mod calls;
 mod child_proc;
+pub(crate) mod class_env;
 mod closure;
 mod compare;
 pub(crate) mod region_guard;
@@ -3061,6 +3079,7 @@ pub(crate) mod property_get;
 pub(crate) mod property_set;
 pub(crate) mod proxy_reflect;
 pub(crate) mod put_value_store_ic;
+pub(crate) mod receiver_range;
 mod static_field_meta;
 mod static_method;
 mod string_regex_proc;

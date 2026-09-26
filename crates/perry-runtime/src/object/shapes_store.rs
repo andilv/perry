@@ -32,7 +32,7 @@
 //! 32-byte slab record with one 24-byte family bucket per keys array is the
 //! same information at a fraction of the bytes.
 
-use super::{ShapeDescriptor, ShapeObjectKind, SHAPE_ID_BASE};
+use super::{ShapeDescriptor, ShapeObjectKind, DICTIONARY_SHAPE_ID_BASE, SHAPE_ID_BASE};
 use std::cell::UnsafeCell;
 
 pub(super) const RECORD_FLAG_PRESENT: u8 = 1 << 0;
@@ -55,6 +55,11 @@ pub(crate) struct ShapeRecord {
     /// keyless shape).
     pub(super) keys: u64,
     pub(super) semantic_generation: u64,
+    /// The receiver's [[Prototype]] identity (`shapes::object_proto_id`). An
+    /// identity fact like every other field here: two objects share a ShapeId
+    /// only if they share their prototype, so anything a site learns about a
+    /// ShapeId's inherited behaviour is keyed by the shape itself.
+    pub(super) proto_id: u64,
     pub(super) logical_key_count: u32,
     pub(super) live_inline_slot_count: u32,
     pub(super) hole_count: u32,
@@ -71,13 +76,14 @@ pub(crate) struct ShapeRecord {
 const RECORD_KIND_SHIFT: u32 = 8;
 const RECORD_KIND_MASK: u32 = 0b11 << RECORD_KIND_SHIFT;
 
-const _: () = assert!(std::mem::size_of::<ShapeRecord>() == 32);
+const _: () = assert!(std::mem::size_of::<ShapeRecord>() == 40);
 const _: () = assert!(std::mem::align_of::<ShapeRecord>() == 8);
 
 impl ShapeRecord {
     const EMPTY: ShapeRecord = ShapeRecord {
         keys: 0,
         semantic_generation: 0,
+        proto_id: 0,
         logical_key_count: 0,
         live_inline_slot_count: 0,
         hole_count: 0,
@@ -143,11 +149,45 @@ impl ShapeRecord {
         ShapeRecord {
             keys,
             semantic_generation,
+            proto_id: 0,
             logical_key_count,
             live_inline_slot_count,
             hole_count,
             flags_and_kind: u32::from(flags) | kind_bits,
         }
+    }
+
+    /// The same record for a receiver whose [[Prototype]] identity is
+    /// `proto_id` (see [`ShapeRecord::proto_id`]).
+    #[inline]
+    pub(super) fn with_proto_id(mut self, proto_id: u64) -> ShapeRecord {
+        self.proto_id = proto_id;
+        self
+    }
+
+    /// [`ShapeRecord::facts_match`] including the prototype identity — the
+    /// test every production interning path uses.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    pub(super) fn facts_match_proto(
+        &self,
+        keys: u64,
+        logical_key_count: u32,
+        live_inline_slot_count: u32,
+        semantic_generation: u64,
+        object_kind: ShapeObjectKind,
+        hole_count: u32,
+        proto_id: u64,
+    ) -> bool {
+        self.proto_id == proto_id
+            && self.facts_match(
+                keys,
+                logical_key_count,
+                live_inline_slot_count,
+                semantic_generation,
+                object_kind,
+                hole_count,
+            )
     }
 
     /// Exact-facts identity test (#8067): keys edge, both counts, generation,
@@ -178,13 +218,14 @@ impl ShapeRecord {
     /// re-indexes it.
     #[inline]
     pub(super) fn facts_key_with_keys(&self, keys: u64) -> u64 {
-        facts_key(
+        facts_key_proto(
             keys,
             self.logical_key_count,
             self.live_inline_slot_count,
             self.semantic_generation,
             self.object_kind(),
             self.hole_count,
+            self.proto_id,
         )
     }
 
@@ -201,6 +242,7 @@ impl ShapeRecord {
             logical_key_count: self.logical_key_count,
             live_inline_slot_count: self.live_inline_slot_count,
             semantic_generation: self.semantic_generation,
+            proto_id: self.proto_id,
             object_kind: self.object_kind(),
             hole_count: self.hole_count,
         }
@@ -213,6 +255,8 @@ impl ShapeRecord {
 /// old `ShapeFacts` map could not use it); a 64-bit collision between two
 /// live shapes is resolved by the per-hit `facts_match` on the record, so a
 /// collision only costs a second record read, never a wrong answer.
+/// [`facts_key`] for a record at the DEFAULT prototype identity (0).
+#[cfg(test)]
 #[inline]
 pub(super) fn facts_key(
     keys: u64,
@@ -221,6 +265,28 @@ pub(super) fn facts_key(
     semantic_generation: u64,
     object_kind: ShapeObjectKind,
     hole_count: u32,
+) -> u64 {
+    facts_key_proto(
+        keys,
+        logical_key_count,
+        live_inline_slot_count,
+        semantic_generation,
+        object_kind,
+        hole_count,
+        0,
+    )
+}
+
+/// The seven identity facts, the prototype identity included.
+#[inline]
+pub(super) fn facts_key_proto(
+    keys: u64,
+    logical_key_count: u32,
+    live_inline_slot_count: u32,
+    semantic_generation: u64,
+    object_kind: ShapeObjectKind,
+    hole_count: u32,
+    proto_id: u64,
 ) -> u64 {
     const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -235,6 +301,7 @@ pub(super) fn facts_key(
     // full enum on every hit, so that was never a wrong answer — but it is a
     // silent hash-quality loss, and the two kinds differ in every consumer.
     h = fold(h, object_kind.code());
+    h = fold(h, proto_id);
     // Final avalanche: FNV keeps most of its entropy in the high bits and
     // hashbrown's probe sequence starts from the LOW bits.
     h ^ (h >> 32)
@@ -287,8 +354,16 @@ fn new_page() -> Page {
 }
 
 /// The by-id descriptor store. See the module docs.
+/// Two page directories: ordinary ShapeIds index from `SHAPE_ID_BASE`, and the
+/// dictionary band (`shapes::DICTIONARY_SHAPE_ID_BASE`) from its own base. One
+/// directory indexed from `SHAPE_ID_BASE` would grow to ~24,577 page slots the
+/// moment the first dictionary id is minted; measured on `ts.transpileModule`,
+/// that one ~196 KB allocation moved the GC arena's pages relative to the
+/// page-class table window and cost +2.3% instructions (1.65 M vs 0.20 M
+/// registered-page misses in `classify_heap_generation`).
 pub(crate) struct ShapeSlab {
     pages: Vec<Option<Page>>,
+    dict_pages: Vec<Option<Page>>,
     /// Present records.
     len: usize,
 }
@@ -297,18 +372,49 @@ impl ShapeSlab {
     pub(super) fn new() -> Self {
         ShapeSlab {
             pages: Vec::new(),
+            dict_pages: Vec::new(),
             len: 0,
         }
     }
 
+    /// `(dictionary band?, index within that band's directory)`.
     #[inline]
-    fn index_of(id: u32) -> Option<usize> {
-        super::is_shape_id(id).then(|| (id - SHAPE_ID_BASE) as usize)
+    fn index_of(id: u32) -> Option<(bool, usize)> {
+        if !super::is_shape_id(id) {
+            return None;
+        }
+        Some(if id >= DICTIONARY_SHAPE_ID_BASE {
+            (true, (id - DICTIONARY_SHAPE_ID_BASE) as usize)
+        } else {
+            (false, (id - SHAPE_ID_BASE) as usize)
+        })
     }
 
     #[inline]
-    fn id_of(index: usize) -> u32 {
-        SHAPE_ID_BASE + index as u32
+    fn id_of(dict: bool, index: usize) -> u32 {
+        if dict {
+            DICTIONARY_SHAPE_ID_BASE + index as u32
+        } else {
+            SHAPE_ID_BASE + index as u32
+        }
+    }
+
+    #[inline]
+    fn dir(&self, dict: bool) -> &Vec<Option<Page>> {
+        if dict {
+            &self.dict_pages
+        } else {
+            &self.pages
+        }
+    }
+
+    #[inline]
+    fn dir_mut(&mut self, dict: bool) -> &mut Vec<Option<Page>> {
+        if dict {
+            &mut self.dict_pages
+        } else {
+            &mut self.pages
+        }
     }
 
     /// `(page, chunk within page, record within chunk)` of a slab index.
@@ -332,9 +438,9 @@ impl ShapeSlab {
     /// only ever happens through the table's own retirement paths.
     #[inline]
     pub(super) fn record_ptr(&self, id: u32) -> Option<*mut ShapeRecord> {
-        let index = Self::index_of(id)?;
+        let (dict, index) = Self::index_of(id)?;
         let (page, chunk, slot) = Self::split(index);
-        let chunk = self.pages.get(page)?.as_ref()?[chunk].as_ref()?;
+        let chunk = self.dir(dict).get(page)?.as_ref()?[chunk].as_ref()?;
         let cell = chunk[slot].get();
         // SAFETY: the cell belongs to a live chunk owned by this slab; reads
         // and writes are serialized by the single-threaded agent discipline
@@ -363,13 +469,15 @@ impl ShapeSlab {
     /// Install `record` under `id`, allocating the page and chunk on first
     /// touch. Returns the record it replaced, if the id was already present.
     pub(super) fn insert(&mut self, id: u32, mut record: ShapeRecord) -> Option<ShapeRecord> {
-        let index = Self::index_of(id).expect("ShapeSlab::insert: id outside the ShapeId range");
+        let (dict, index) =
+            Self::index_of(id).expect("ShapeSlab::insert: id outside the ShapeId range");
         record.set(RECORD_FLAG_PRESENT, true);
         let (page, chunk, slot) = Self::split(index);
-        if page >= self.pages.len() {
-            self.pages.resize_with(page + 1, || None);
+        let dir = self.dir_mut(dict);
+        if page >= dir.len() {
+            dir.resize_with(page + 1, || None);
         }
-        let page = self.pages[page].get_or_insert_with(new_page);
+        let page = dir[page].get_or_insert_with(new_page);
         let chunk = page[chunk].get_or_insert_with(new_chunk);
         let cell = chunk[slot].get_mut();
         let previous = cell.present().then_some(*cell);
@@ -382,9 +490,9 @@ impl ShapeSlab {
 
     /// Clear the record under `id`, returning it if it was present.
     pub(super) fn remove(&mut self, id: u32) -> Option<ShapeRecord> {
-        let index = Self::index_of(id)?;
+        let (dict, index) = Self::index_of(id)?;
         let (page, chunk, slot) = Self::split(index);
-        let chunk = self.pages.get_mut(page)?.as_mut()?[chunk].as_mut()?;
+        let chunk = self.dir_mut(dict).get_mut(page)?.as_mut()?[chunk].as_mut()?;
         let cell = chunk[slot].get_mut();
         if !cell.present() {
             return None;
@@ -398,20 +506,22 @@ impl ShapeSlab {
     /// Visit every present record in id order. The callback may write
     /// through the record pointer; it must not insert or remove.
     pub(super) fn for_each(&self, mut f: impl FnMut(u32, *mut ShapeRecord)) {
-        for (page_index, page) in self.pages.iter().enumerate() {
-            let Some(page) = page else {
-                continue;
-            };
-            for (chunk_index, chunk) in page.iter().enumerate() {
-                let Some(chunk) = chunk else {
+        for dict in [false, true] {
+            for (page_index, page) in self.dir(dict).iter().enumerate() {
+                let Some(page) = page else {
                     continue;
                 };
-                let base = ((page_index << PAGE_SHIFT) | chunk_index) << CHUNK_SHIFT;
-                for (slot, cell) in chunk.iter().enumerate() {
-                    let p = cell.get();
-                    // SAFETY: live chunk, single-threaded agent.
-                    if unsafe { (*p).present() } {
-                        f(Self::id_of(base | slot), p);
+                for (chunk_index, chunk) in page.iter().enumerate() {
+                    let Some(chunk) = chunk else {
+                        continue;
+                    };
+                    let base = ((page_index << PAGE_SHIFT) | chunk_index) << CHUNK_SHIFT;
+                    for (slot, cell) in chunk.iter().enumerate() {
+                        let p = cell.get();
+                        // SAFETY: live chunk, single-threaded agent.
+                        if unsafe { (*p).present() } {
+                            f(Self::id_of(dict, base | slot), p);
+                        }
                     }
                 }
             }
@@ -431,35 +541,39 @@ impl ShapeSlab {
     /// retirement is monotonic in id order for the common workload, so the
     /// oldest chunks empty first.
     pub(super) fn release_empty_chunks(&mut self) {
-        for page in self.pages.iter_mut() {
-            let Some(chunks) = page.as_mut() else {
-                continue;
-            };
-            let mut live_chunks = 0usize;
-            for chunk in chunks.iter_mut() {
-                let empty = chunk
-                    .as_ref()
-                    .is_some_and(|c| c.iter().all(|cell| !unsafe { (*cell.get()).present() }));
-                if empty {
-                    *chunk = None;
+        for dict in [false, true] {
+            let dir = self.dir_mut(dict);
+            for page in dir.iter_mut() {
+                let Some(chunks) = page.as_mut() else {
+                    continue;
+                };
+                let mut live_chunks = 0usize;
+                for chunk in chunks.iter_mut() {
+                    let empty = chunk
+                        .as_ref()
+                        .is_some_and(|c| c.iter().all(|cell| !unsafe { (*cell.get()).present() }));
+                    if empty {
+                        *chunk = None;
+                    }
+                    if chunk.is_some() {
+                        live_chunks += 1;
+                    }
                 }
-                if chunk.is_some() {
-                    live_chunks += 1;
+                if live_chunks == 0 {
+                    *page = None;
                 }
             }
-            if live_chunks == 0 {
-                *page = None;
+            while dir.last().is_some_and(Option::is_none) {
+                dir.pop();
             }
+            dir.shrink_to_fit();
         }
-        while self.pages.last().is_some_and(Option::is_none) {
-            self.pages.pop();
-        }
-        self.pages.shrink_to_fit();
     }
 
     #[cfg(test)]
     pub(super) fn clear(&mut self) {
         self.pages.clear();
+        self.dict_pages.clear();
         self.len = 0;
     }
 
@@ -468,11 +582,11 @@ impl ShapeSlab {
     pub(super) fn estimated_bytes(&self) -> usize {
         let mut pages = 0usize;
         let mut chunks = 0usize;
-        for page in self.pages.iter().flatten() {
+        for page in self.pages.iter().chain(self.dict_pages.iter()).flatten() {
             pages += 1;
             chunks += page.iter().filter(|c| c.is_some()).count();
         }
-        self.pages.capacity() * std::mem::size_of::<Option<Page>>()
+        (self.pages.capacity() + self.dict_pages.capacity()) * std::mem::size_of::<Option<Page>>()
             + pages * PAGE_LEN * std::mem::size_of::<Option<Chunk>>()
             + chunks * CHUNK_LEN * std::mem::size_of::<ShapeRecord>()
     }
@@ -482,6 +596,7 @@ impl ShapeSlab {
     pub(super) fn chunk_count(&self) -> usize {
         self.pages
             .iter()
+            .chain(self.dict_pages.iter())
             .flatten()
             .map(|page| page.iter().filter(|c| c.is_some()).count())
             .sum()
@@ -978,9 +1093,12 @@ mod tests {
     /// because it lives in bytes that were already padding, so a future field
     /// that grows the record silently takes that away. Fail here rather than
     /// discovering it as RSS.
+    ///
+    /// 32 -> 40 bytes is deliberate: [[Prototype]] is a shape fact
+    /// (`proto_id`), and a 64-bit prototype identity does not fit the padding.
     #[test]
     fn the_record_geometry_is_free_and_facts_key_is_o1() {
-        assert_eq!(std::mem::size_of::<ShapeRecord>(), 32, "record grew");
+        assert_eq!(std::mem::size_of::<ShapeRecord>(), 40, "record grew");
         assert_eq!(std::mem::align_of::<ShapeRecord>(), 8, "record realigned");
 
         // `facts_key` folds the keys ADDRESS; it must never dereference it.
@@ -1253,5 +1371,26 @@ mod tests {
         assert!(list.remove_unordered(4));
         assert!(!list.contains(4));
         assert!(list.contains(8));
+    }
+
+    /// A dictionary-band id lives in its own directory: inserting one must not
+    /// grow the ordinary directory to the band's offset (~24,577 page slots),
+    /// which moved the GC arena's pages and cost tsc +2.3% instructions.
+    #[test]
+    fn a_dictionary_band_id_does_not_grow_the_ordinary_directory() {
+        let mut slab = ShapeSlab::new();
+        let ordinary = super::super::SHAPE_ID_BASE + 3;
+        let dict = super::super::DICTIONARY_SHAPE_ID_BASE + 5;
+        slab.insert(ordinary, ShapeRecord::EMPTY);
+        slab.insert(dict, ShapeRecord::EMPTY);
+        assert_eq!(
+            slab.pages.len(),
+            1,
+            "one ordinary page slot, not the band offset"
+        );
+        assert_eq!(slab.dict_pages.len(), 1);
+        assert!(slab.record_ptr(ordinary).is_some() && slab.record_ptr(dict).is_some());
+        assert_eq!(slab.ids(), vec![ordinary, dict]);
+        assert!(slab.remove(dict).is_some() && slab.record_ptr(dict).is_none());
     }
 }

@@ -648,7 +648,11 @@ impl SH for Expr {
             Expr::TemplateRaw(e) => { tag(h, 446); e.as_ref().hash(h); }
             Expr::RegisterClassParentDynamic { class_name, parent_expr, } => { tag(h, 447); class_name.hash(h); parent_expr.as_ref().hash(h); }
             Expr::RegisterClassCaptures { class_name, captures } => { tag(h, 12241); class_name.hash(h); for c in captures { c.hash(h); } }
-            Expr::RefreshClassExprCaptures { class_value, captures } => { tag(h, 12243); class_value.as_ref().hash(h); for c in captures { c.hash(h); } }
+            Expr::RefreshClassExprCaptures { class_value, captures, env_class } => { tag(h, 12243); class_value.as_ref().hash(h); for c in captures { c.hash(h); } env_class.hash(h); }
+            Expr::ClassEnvGet { class_name, index, guarded } => { tag(h, 12244); class_name.hash(h); index.hash(h); guarded.hash(h); }
+            Expr::ClassEnvSet { class_name, index, value, guarded, publish } => { tag(h, 12245); class_name.hash(h); index.hash(h); value.as_ref().hash(h); guarded.hash(h); publish.hash(h); }
+            Expr::ClassEnvStamp { class_name, instance, evaluation } => { tag(h, 12246); class_name.hash(h); instance.as_ref().hash(h); evaluation.as_ref().hash(h); }
+            Expr::ClassEnvCurrent { class_name } => { tag(h, 12247); class_name.hash(h); }
             Expr::ClassCaptureValue { class_name, index, fallback, prefer_fallback } => { tag(h, 12242); class_name.hash(h); index.hash(h); fallback.hash(h); prefer_fallback.hash(h); }
             Expr::RegisterClassStaticSymbol { class_name, key_expr, value_expr, } => { tag(h, 12025); class_name.hash(h); key_expr.as_ref().hash(h); value_expr.as_ref().hash(h); }
             Expr::RegisterClassComputedMethod { class_name, key_expr, method_name, is_static, param_count, has_rest, definition_order } => { tag(h, 12233); class_name.hash(h); key_expr.as_ref().hash(h); method_name.hash(h); is_static.hash(h); param_count.hash(h); has_rest.hash(h); definition_order.hash(h); }
@@ -667,7 +671,7 @@ impl SH for Expr {
             Expr::WebAssemblyInstantiate { bytes, imports } => { tag(h, 12028); bytes.as_ref().hash(h); imports.hash(h); }
             Expr::WebAssemblyCallExport { instance, name, args, } => { tag(h, 12029); instance.as_ref().hash(h); name.as_ref().hash(h); args.hash(h); }
             Expr::DynamicImport { paths, arg, options, byte_offset, deferred_error, synchronous } => { tag(h, 12030); for p in paths { p.hash(h); } arg.as_ref().hash(h); options.hash(h); byte_offset.hash(h); deferred_error.hash(h); synchronous.hash(h); }
-            Expr::WorkerNew { paths, filename, options, is_eval } => {
+            Expr::WorkerNew { paths, filename, options, is_eval, partial } => {
                 tag(h, 12055);
                 for p in paths { p.hash(h); }
                 filename.as_ref().hash(h);
@@ -679,6 +683,7 @@ impl SH for Expr {
                     None => false.hash(h),
                 }
                 is_eval.hash(h);
+                partial.hash(h);
             }
         }
     }

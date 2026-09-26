@@ -417,34 +417,24 @@ fn collect_module_one(
     // original-source line. The default build does no extra work.
     let mut cjs_wrap_body_prefix_lines: Option<u32> = None;
     let source = if was_cjs_wrapped {
+        let (wrapped, body_off) = super::cjs_wrap::wrap_commonjs_with_addon_paths(
+            &raw_source,
+            &canonical,
+            target,
+            cjs_is_entry_module,
+            Some(&ctx.compile_packages),
+            Some(&ctx.native_addon_paths),
+        );
         if ctx.debug_symbols {
-            let (wrapped, body_off) = super::cjs_wrap::wrap_commonjs_with_body_offset(
-                &raw_source,
-                &canonical,
-                target,
-                cjs_is_entry_module,
-                Some(&ctx.compile_packages),
-            );
-            // Newlines before the original body in the wrapped output = the
-            // wrapper prefix line count. Recorded only when the body was
-            // located; otherwise we skip the skew correction (graceful
-            // degrade to the uncorrected line rather than a wrong one).
+            // Preserve original-source locations after injecting the wrapper.
             cjs_wrap_body_prefix_lines = body_off.map(|off| {
                 wrapped.as_bytes()[..off]
                     .iter()
                     .filter(|&&b| b == b'\n')
                     .count() as u32
             });
-            wrapped
-        } else {
-            super::cjs_wrap::wrap_commonjs_for_target(
-                &raw_source,
-                &canonical,
-                target,
-                cjs_is_entry_module,
-                Some(&ctx.compile_packages),
-            )
         }
+        wrapped
     } else {
         raw_source
     };
@@ -697,6 +687,19 @@ fn collect_module_one(
     let solid_module = solid_runtime
         .as_deref()
         .and_then(|runtime| perry_hir::solid_jsx::lower_solid_jsx(ast_module, runtime));
+    // #10848: fold this module's built-in member writes into the program-wide
+    // set before lowering it. A patch first seen after other modules were
+    // already lowered forces a re-walk (`rerun_collect_with_class_field_types`)
+    // so those modules' direct calls see it too.
+    let patched_before = ctx.patched_builtins.len();
+    perry_hir::scan_patched_builtins(
+        solid_module.as_ref().unwrap_or(ast_module),
+        &mut ctx.patched_builtins,
+    );
+    if ctx.patched_builtins.len() != patched_before && ctx.patched_builtins_lowered_modules > 0 {
+        ctx.patched_builtins_grew_after_lower = true;
+    }
+    perry_hir::set_patched_builtins(std::sync::Arc::new(ctx.patched_builtins.clone()));
     let lower_result = perry_hir::lower_module_full_with_platform_globals(
         solid_module.as_ref().unwrap_or(ast_module),
         &module_name,
@@ -717,6 +720,8 @@ fn collect_module_one(
         collected: Some(ctx.native_modules.len() + ctx.js_modules.len()),
         ..Default::default()
     });
+    ctx.patched_builtins_lowered_modules += 1;
+    perry_hir::clear_patched_builtins();
     perry_hir::clear_compile_packages_override();
     perry_hir::clear_current_module_source();
     perry_hir::clear_precompile_state();
@@ -992,7 +997,7 @@ fn collect_module_one(
             }
         }
     });
-    let mut worker_path_sets: Vec<Vec<String>> = Vec::new();
+    let mut worker_path_sets: Vec<(Vec<String>, bool)> = Vec::new();
     let mut saw_worker_new = false;
     perry_hir::for_each_worker_new(&hir_module, &mut |expr| {
         saw_worker_new = true;
@@ -1012,13 +1017,16 @@ fn collect_module_one(
             // doesn't misclassify multi-line filenames).
             let eval_mode = *is_eval;
             let mut visiting: std::collections::HashSet<u32> = std::collections::HashSet::new();
-            let resolution = if eval_mode {
-                perry_hir::resolve_import_path_with_context(
-                    filename.as_ref(),
-                    &module_const_locals,
-                    &dynamic_param_literals,
-                    &dynamic_local_literals,
-                    &mut visiting,
+            let (resolution, partial) = if eval_mode {
+                (
+                    perry_hir::resolve_import_path_with_context(
+                        filename.as_ref(),
+                        &module_const_locals,
+                        &dynamic_param_literals,
+                        &dynamic_local_literals,
+                        &mut visiting,
+                    ),
+                    false,
                 )
             } else {
                 perry_hir::resolve_worker_path(
@@ -1091,7 +1099,7 @@ fn collect_module_one(
                             new_dyn_imports.push(path);
                         }
                     }
-                    worker_path_sets.push(set);
+                    worker_path_sets.push((set, partial));
                 }
                 perry_hir::Resolution::Unresolved(reason) => {
                     // Real-world packages (e.g. Next.js build-time worker
@@ -1107,7 +1115,7 @@ fn collect_module_one(
                             module_name, reason
                         );
                     }
-                    worker_path_sets.push(Vec::new());
+                    worker_path_sets.push((Vec::new(), false));
                 }
             }
         }
@@ -1145,10 +1153,11 @@ fn collect_module_one(
     });
     let mut worker_path_sets = worker_path_sets.into_iter();
     perry_hir::for_each_worker_new_mut(&mut hir_module, &mut |expr| {
-        if let perry_hir::Expr::WorkerNew { paths, .. } = expr {
+        if let perry_hir::Expr::WorkerNew { paths, partial, .. } = expr {
             if paths.is_empty() {
-                if let Some(set) = worker_path_sets.next() {
+                if let Some((set, incomplete)) = worker_path_sets.next() {
                     *paths = set;
+                    *partial = incomplete;
                 }
             }
         }

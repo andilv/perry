@@ -219,7 +219,7 @@ pub const PIC_CACHE_WORDS: usize = 12;
 /// |---|---|
 /// | 0 | `tok0` — most-recently-used ShapeId token |
 /// | 1 | `slot0` — its resolved field slot |
-/// | 2 | optional Array-subclass class-declared named-prefix token |
+/// | 2 | unused — was the Array-subclass named-prefix token, retired by S6 (site state must derive from one shape) |
 /// | 3,4 / 5,6 / 7,8 / 9,10 | `(tok, slot)` ways |
 /// | 11 | round-robin victim index for the ways |
 pub type PicCache = [i64; PIC_CACHE_WORDS];
@@ -438,8 +438,10 @@ fn pic_latch_megamorphic(c: &mut PicCache) {
 /// per-site global, or a stack array of that type).
 pub(crate) unsafe fn pic_prime_get(cache: *mut PicCache, token: i64, slot: i64) {
     // A token hit must prove a nonzero ShapeId, including in polymorphic ways.
-    // Keyless/unstamped receivers require the full prototype lookup.
-    if token == crate::object::shapes::PIC_ID_TOKEN_BIT as i64 {
+    // Keyless/unstamped receivers require the full prototype lookup. And only
+    // an ORDINARY-band id may be written: a dictionary shape's id can never be
+    // held by a site (`shapes::DICTIONARY_SHAPE_ID_BASE`).
+    if !crate::object::shapes::is_site_matchable_token(token as u64) {
         return;
     }
     let c = &mut *cache;
@@ -1161,12 +1163,7 @@ pub(super) fn get_field_ic_miss_impl(
                                     let token = (stamp as u64
                                         | crate::object::shapes::PIC_ID_TOKEN_BIT)
                                         as i64;
-                                    // Word 2 (named-prefix identity) stays 0:
-                                    // the prefix paths compute inline
-                                    // addresses and must never fire from an
-                                    // overflow-primed entry.
                                     let cache = pic_slot_resolve(cache_slot);
-                                    (*cache)[2] = 0;
                                     packed_get::prime_get(
                                         cache,
                                         token,
@@ -1205,24 +1202,27 @@ pub(super) fn get_field_ic_miss_impl(
                     // shape id — no second probe.
                     let stamp = crate::object::shapes::object_shape_stamp(obj);
                     let token = (stamp as u64 | crate::object::shapes::PIC_ID_TOKEN_BIT) as i64;
-                    // Word 2 carries an optional class-declared named-prefix
-                    // identity for object-backed Array subclasses. Their
-                    // numeric tail changes ShapeId on every push/pop while
-                    // declared fields keep the same slots. The proof builder
-                    // is gated by an existing ObjectMeta pointer so ordinary
-                    // objects retain the old miss cost; it validates the
-                    // complete prefix before publishing a nonzero token.
-                    let named_prefix_token = if !(*obj).meta.is_null() {
-                        crate::array::array_subclass_named_prefix_token_for_slot(obj, i) as i64
-                    } else {
-                        0
-                    };
-                    if has_own_descriptors && named_prefix_token == 0 {
+                    // A descriptor-bearing receiver primes only when the key is
+                    // proved a plain data slot. The one proof that exists is
+                    // the object-backed Array subclass's named-prefix proof
+                    // (every declared key accessor-free on THIS receiver; its
+                    // unrelated `length` descriptor must not make `arch.sset`
+                    // permanently generic). It is a PRIME-TIME proof only: the
+                    // site stores nothing but `(ShapeId, slot)`, and a ShapeId
+                    // implies its descriptor semantics (every descriptor event
+                    // mints a new generation, #10824/#10287), so the pair is a
+                    // fact about this one shape for as long as the id lives.
+                    // The proof builder is gated by an existing ObjectMeta
+                    // pointer so ordinary objects retain the old miss cost. It
+                    // runs whenever it ran before (it also publishes the token
+                    // on the object's meta, which `element_shape` consumes).
+                    let named_prefix_proved = !(*obj).meta.is_null()
+                        && crate::array::array_subclass_named_prefix_token_for_slot(obj, i) != 0;
+                    if has_own_descriptors && !named_prefix_proved {
                         miss_reason = R::OwnDescriptorFallthrough;
                         break;
                     }
                     let cache = pic_slot_resolve(cache_slot);
-                    (*cache)[2] = named_prefix_token;
                     packed_get::prime_get(cache, token, i as i64, packed);
                     if diag {
                         ic_diag_note(cache_slot, key, R::OwnInlinePrimed);
@@ -1658,6 +1658,13 @@ fn current_private_lexical_brand(declaring_class_id: u32) -> Option<u64> {
     })
 }
 
+/// The class-definition evaluation `value` belongs to for members of
+/// `declaring_class_id`: a class object of that template is its own, and an
+/// instance's is its recorded brand's ancestor for that template.
+pub(crate) fn class_evaluation_of(value: f64, declaring_class_id: u32) -> Option<f64> {
+    private_evaluation_brand(value, declaring_class_id).map(f64::from_bits)
+}
+
 pub(crate) fn current_private_lexical_brand_value(declaring_class_id: u32) -> Option<f64> {
     current_private_lexical_brand(declaring_class_id).map(f64::from_bits)
 }
@@ -1750,6 +1757,7 @@ pub(crate) fn private_evaluation_brand_value(value: f64) -> Option<f64> {
 }
 
 include!("ic_miss/private_member_access.rs");
+include!("ic_miss/private_guard_fast.rs");
 
 #[cfg(test)]
 fn private_field_marker_key(
@@ -1991,48 +1999,104 @@ pub extern "C" fn js_private_guard(
     if declaring_class_id == 0 {
         return obj;
     }
-    // A first private-name lookup can allocate the class metadata. Keep the
-    // requested name independent of a caller-owned GC string across it.
     if _field_name_ptr.is_null() || _field_name_len == 0 {
         throw_private_type_error("Invalid private field name");
     }
     let field_name =
-        unsafe { std::slice::from_raw_parts(_field_name_ptr, _field_name_len as usize) }.to_vec();
-    let _field_name_ptr = field_name.as_ptr();
+        unsafe { std::slice::from_raw_parts(_field_name_ptr, _field_name_len as usize) };
+    private_guard_checked(
+        obj,
+        brand_owner,
+        declaring_class_id,
+        field_name,
+        kind,
+        op,
+        true,
+    )
+}
+
+/// The body of [`js_private_guard`]. `record_hints == false` performs the same
+/// checks and throws but leaves the member-hint stack alone, for a caller that
+/// consumes the access itself (`js_private_method_guard`).
+fn private_guard_checked(
+    obj: f64,
+    brand_owner: f64,
+    declaring_class_id: u32,
+    field_name_bytes: &[u8],
+    kind: u32,
+    op: u32,
+    record_hints: bool,
+) -> f64 {
+    let is_static = op >= 2;
+    let is_write = op & 1 != 0;
+    // #10501: settle the common instance access without spelling a marker.
+    if !is_static {
+        if let Some(slot) = private_instance_access_is_proven(
+            obj,
+            brand_owner,
+            declaring_class_id,
+            field_name_bytes,
+            kind,
+        ) {
+            private_guard_record_access(
+                declaring_class_id,
+                slot.name,
+                kind,
+                false,
+                is_write,
+                None,
+                record_hints,
+            );
+            return obj;
+        }
+    }
+    // Interning also makes the name independent of the caller's buffer across
+    // any allocation below (a first private-name lookup can allocate class
+    // metadata). Only a non-UTF-8 spelling, which codegen never emits, keeps
+    // the historical owned copy and the empty hint name.
+    let interned = intern_private_name(field_name_bytes);
+    let owned_name;
+    let (_field_name_ptr, _field_name_len) = match interned {
+        Some(name) => (name.as_ptr(), name.len() as u32),
+        None => {
+            owned_name = field_name_bytes.to_vec();
+            (owned_name.as_ptr(), owned_name.len() as u32)
+        }
+    };
     let scope = crate::gc::RuntimeHandleScope::new();
     let obj_root = scope.root_nanbox_f64(obj);
     let brand_owner_root = scope.root_nanbox_f64(brand_owner);
-    let is_static = op >= 2;
-    let read_write = op & 1; // 0=read, 1=write
     if is_static && crate::proxy::js_proxy_is_proxy(obj) != 0 {
         throw_private_type_error(
             "Cannot access private member from an object whose class did not declare it",
         );
     }
     let _owner = PrivateHintBrandScope::new(private_access_owner(brand_owner, declaring_class_id));
-    let has_brand = private_evaluation_brand_matches(obj, brand_owner, declaring_class_id)
-        .unwrap_or_else(|| {
-            if is_static {
-                // Static private brand: the receiver must be exactly the
-                // declaring class constructor (identity), not an instance or
-                // a subclass.
-                super::super::class_ref_id(obj) == Some(declaring_class_id)
-            } else {
-                private_instance_element_is_present(
-                    crate::proxy::private_element_receiver(obj),
-                    declaring_class_id,
-                    _field_name_ptr,
-                    _field_name_len,
-                    kind,
-                )
-            }
-        });
+    let evaluation_verdict = private_evaluation_brand_matches(obj, brand_owner, declaring_class_id);
+    let has_brand = evaluation_verdict.unwrap_or_else(|| {
+        if is_static {
+            // Static private brand: the receiver must be exactly the
+            // declaring class constructor (identity), not an instance or
+            // a subclass.
+            super::super::class_ref_id(obj) == Some(declaring_class_id)
+        } else {
+            private_instance_element_is_present(
+                crate::proxy::private_element_receiver(obj),
+                declaring_class_id,
+                _field_name_ptr,
+                _field_name_len,
+                kind,
+            )
+        }
+    });
     if !has_brand {
         throw_private_type_error(
             "Cannot access private member from an object whose class did not declare it",
         );
     }
-    if !is_static {
+    // Without an evaluation verdict the brand above WAS the element-present
+    // check, under this same lexical scope, so repeating it cannot differ.
+    if !is_static && evaluation_verdict.is_some() {
         let storage = crate::proxy::private_element_receiver(obj_root.get_nanbox_f64());
         if !private_instance_element_is_present(
             storage,
@@ -2044,51 +2108,16 @@ pub extern "C" fn js_private_guard(
             throw_private_type_error("Cannot access private member before it has been initialized");
         }
     }
-    let op = read_write;
-    // Kind/op legality, after the brand check (spec order).
-    let illegal = matches!(
-        (op, kind),
-        (0, 3) /* read setter-only: [[Get]] of accessor without getter */
-            | (1, 2) /* write getter-only: [[Set]] of accessor without setter */
-            | (1, 1) /* write private method */
-    );
-    if illegal {
-        throw_private_type_error("Invalid private member operation for its kind");
-    }
     let access_owner = private_access_owner(brand_owner_root.get_nanbox_f64(), declaring_class_id);
-    if kind != 0 || (!is_static && access_owner.is_some()) {
-        let field_name = unsafe {
-            std::str::from_utf8(std::slice::from_raw_parts(
-                _field_name_ptr,
-                _field_name_len as usize,
-            ))
-            .unwrap_or("")
-            .to_string()
-        };
-        PRIVATE_MEMBER_ACCESS_HINTS.with(|hints| {
-            hints.borrow_mut().push(PrivateMemberAccessHint {
-                class_id: declaring_class_id,
-                name: field_name.clone(),
-                kind,
-                is_static,
-                is_write: read_write != 0,
-                brand_owner: access_owner,
-            });
-        });
-    }
-    if kind == 1 && read_write == 0 {
-        let field_name = unsafe {
-            std::str::from_utf8(std::slice::from_raw_parts(
-                _field_name_ptr,
-                _field_name_len as usize,
-            ))
-            .unwrap_or("")
-            .to_string()
-        };
-        PRIVATE_METHOD_OWNER_HINT.with(|hint| {
-            *hint.borrow_mut() = Some((declaring_class_id, field_name));
-        });
-    }
+    private_guard_record_access(
+        declaring_class_id,
+        interned.unwrap_or(""),
+        kind,
+        is_static,
+        is_write,
+        access_owner,
+        record_hints,
+    );
     if is_static {
         obj_root.get_nanbox_f64()
     } else {
@@ -2143,7 +2172,9 @@ mod poly_pic_tests {
     use crate::proxy::IC_SLOT_OVERFLOW_BIT;
 
     fn id_tok(n: u64) -> i64 {
-        (n | PIC_ID_TOKEN_BIT) as i64
+        // A real ORDINARY-band ShapeId: `pic_prime_get` admits nothing else
+        // (a dictionary-band or out-of-range id never enters a site, S6).
+        ((u64::from(crate::object::shapes::SHAPE_ID_BASE) + n) | PIC_ID_TOKEN_BIT) as i64
     }
 
     /// A slot word for a field past the inline region, exactly as the miss
@@ -2439,7 +2470,7 @@ mod poly_pic_tests {
     fn a_wider_than_capacity_rotation_latches_then_re_arms() {
         let mut c: PicCache = [0; PIC_CACHE_WORDS];
         let shapes: Vec<i64> = (0..(PIC_WAYS as i64 + 3))
-            .map(|i| 0x5000_0000_0000 + i * 8)
+            .map(|i| id_tok(0x500 + i as u64))
             .collect();
         unsafe {
             for _ in 0..40 {
@@ -2506,7 +2537,7 @@ mod poly_pic_tests {
         unsafe {
             for _ in 0..200 {
                 for i in 0..(PIC_WAYS as i64 + 1) {
-                    pic_prime_get(&mut c, 0x6000_0000_0000 + i * 8, i);
+                    pic_prime_get(&mut c, id_tok(0x600 + i as u64), i);
                 }
             }
         }
@@ -2530,7 +2561,7 @@ mod poly_pic_tests {
     fn a_rare_extra_shape_does_not_latch_a_site_that_fits() {
         let mut c: PicCache = [0; PIC_CACHE_WORDS];
         let hot: Vec<i64> = (0..(PIC_WAYS as i64 + 1))
-            .map(|i| 0x7000_0000_0000 + i * 8)
+            .map(|i| id_tok(0x700 + i as u64))
             .collect();
         unsafe {
             for round in 0..400 {
@@ -2584,7 +2615,9 @@ mod poly_pic_tests {
                 continue;
             }
             let slot = c[PIC_WAY_BASE + w * 2 + 1];
-            let expected = (tok as u64 & !PIC_ID_TOKEN_BIT) - 200;
+            let expected = (tok as u64 & !PIC_ID_TOKEN_BIT)
+                - u64::from(crate::object::shapes::SHAPE_ID_BASE)
+                - 200;
             assert_eq!(
                 slot, expected as i64,
                 "way {w} pairs token {tok:#x} with the wrong slot"

@@ -6,6 +6,34 @@
 
 use super::*;
 
+/// Heap-backed builtins whose reserved ids otherwise dispatch by native brand.
+fn heap_builtin_name(class_id: u32) -> Option<&'static str> {
+    Some(match class_id {
+        crate::buffer::BUFFER_TYPE_ID => "Uint8Array",
+        crate::buffer::NODE_BUFFER_CLASS_ID => "Buffer",
+        0xFFFF0020 => "Date",
+        0xFFFF0021 => "RegExp",
+        0xFFFF0022 => "Map",
+        0xFFFF0023 => "Set",
+        0xFFFF0025 => "ArrayBuffer",
+        0xFFFF002E => "SharedArrayBuffer",
+        crate::error::CLASS_ID_ERROR => "Error",
+        crate::error::CLASS_ID_TYPE_ERROR => "TypeError",
+        crate::error::CLASS_ID_RANGE_ERROR => "RangeError",
+        crate::error::CLASS_ID_REFERENCE_ERROR => "ReferenceError",
+        crate::error::CLASS_ID_SYNTAX_ERROR => "SyntaxError",
+        crate::error::CLASS_ID_EVAL_ERROR => "EvalError",
+        crate::error::CLASS_ID_URI_ERROR => "URIError",
+        crate::error::CLASS_ID_AGGREGATE_ERROR => "AggregateError",
+        crate::typedarray::CLASS_ID_INT8_ARRAY..=crate::typedarray::CLASS_ID_FLOAT16_ARRAY => {
+            crate::typedarray::name_for_kind(
+                (class_id - crate::typedarray::CLASS_ID_INT8_ARRAY) as u8,
+            )
+        }
+        _ => return None,
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn js_instanceof(value: f64, class_id: u32) -> f64 {
     const TAG_TRUE: u64 = 0x7FFC_0000_0000_0004;
@@ -79,6 +107,12 @@ pub extern "C" fn js_instanceof(value: f64, class_id: u32) -> f64 {
         }
     }
 
+    // OrdinaryHasInstance step 3: once no user `@@hasInstance` answered, a
+    // primitive is never an instance of anything (#11261). Without this a
+    // plain number reached the native brand probes below as a handle id.
+    if instanceof_lhs_is_primitive(value) {
+        return false_val;
+    }
     // Subclass-of-built-in: see `subclass_of_builtin_reaches`.
     if subclass_of_builtin_reaches(value, class_id) {
         return true_val;
@@ -257,6 +291,23 @@ pub extern "C" fn js_instanceof(value: f64, class_id: u32) -> f64 {
     let bits = value.to_bits();
     let jsval = crate::JSValue::from_bits(bits);
 
+    // #11256: Object.create(Builtin.prototype) has no native brand, but is
+    // still an instance of Builtin. Ordinary objects may store their chain
+    // through a synthetic class id rather than per-object prototype metadata.
+    // Native cells retain their brand path unless their prototype is recorded.
+    if let Some(name) = heap_builtin_name(class_id) {
+        let ordinary = unsafe { crate::value::addr_class::try_read_gc_header(value_addr(value)) }
+            .is_some_and(|header| header.obj_type == crate::gc::GC_TYPE_OBJECT);
+        let matches = if ordinary {
+            prototype_instanceof_builtin(value, name)
+        } else {
+            recorded_prototype_instanceof_builtin(value, name)
+        };
+        if let Some(matches) = matches {
+            return if matches { true_val } else { false_val };
+        }
+    }
+
     // Native/exotic subclass instances (typed arrays, ArrayBuffers, boxed
     // primitives, Dates, …) do not carry a Perry `ObjectHeader.class_id`.
     // Their constructor records the distinct newTarget prototype in the
@@ -273,24 +324,22 @@ pub extern "C" fn js_instanceof(value: f64, class_id: u32) -> f64 {
         }
     }
 
-    // Special handling for Uint8Array/Buffer (class_id 0xFFFF0004)
-    // Perry buffers are raw BufferHeader pointers bitcast to f64 (not NaN-boxed),
-    // so the normal POINTER_TAG check doesn't work for them.
-    // We use a thread-local buffer registry to identify buffer pointers.
-    if class_id == crate::buffer::BUFFER_TYPE_ID {
-        // Check if NaN-boxed pointer
-        if jsval.is_pointer() {
-            let addr = (bits & 0x0000_FFFF_FFFF_FFFF) as usize;
-            if crate::buffer::is_registered_buffer(addr) {
-                return true_val;
-            }
-        }
-        // Check if raw pointer (buffer values are bitcast, not NaN-boxed)
-        let top16 = (bits >> 48) as u16;
-        if top16 == 0 && bits >= 0x1000 && crate::buffer::is_registered_buffer(bits as usize) {
-            return true_val;
-        }
-        return false_val;
+    // `instanceof Uint8Array` (class_id 0xFFFF0004) and `instanceof Buffer`
+    // (0xFFFF000C). #11239: both answer from the shared view classifier. The
+    // old arm tested bare buffer-registry membership for BOTH ids, which also
+    // holds for an ArrayBuffer, a DataView and crypto key material — so
+    // `new DataView(ab) instanceof Buffer` was true — while a registry-backed
+    // `class S extends Uint8Array` instance was not `instanceof Uint8Array`.
+    if class_id == crate::buffer::BUFFER_TYPE_ID || class_id == crate::buffer::NODE_BUFFER_CLASS_ID
+    {
+        let brand = super::super::view_brand::view_brand(value);
+        let matches = if class_id == crate::buffer::NODE_BUFFER_CLASS_ID {
+            brand == Some(super::super::view_brand::ViewBrand::NodeBuffer)
+        } else {
+            brand.and_then(super::super::view_brand::ViewBrand::typed_array_kind)
+                == Some(crate::typedarray::KIND_UINT8)
+        };
+        return if matches { true_val } else { false_val };
     }
 
     // ArrayBuffer — Perry models ArrayBuffer storage with BufferHeader values

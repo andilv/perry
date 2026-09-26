@@ -480,6 +480,69 @@ pub enum Expr {
     RefreshClassExprCaptures {
         class_value: Box<Expr>,
         captures: Vec<Expr>,
+        /// The template class whose members read their captures from the
+        /// class environment (`ClassEnvGet`), when the class takes that path.
+        /// The refresh then also rewrites the environment slots, so members
+        /// observe a captured binding initialized after the class evaluated.
+        env_class: Option<String>,
+    },
+
+    /// Read slot `index` of a class's capture ENVIRONMENT: the per-class
+    /// storage holding the class-definition evaluation's captured outer
+    /// values, the way V8 keeps them in the closure context. Emitted for
+    /// classes whose definition is evaluated at most once (see
+    /// `lower::run_once`). Their instance members read captures here instead
+    /// of from per-instance `__perry_cap_*` fields, so instances carry no
+    /// hidden capture keys and the slot of every real field does not depend
+    /// on the class's capture count. Codegen lowers it to one load of a
+    /// module-state global.
+    ClassEnvGet {
+        class_name: String,
+        index: u32,
+        /// The class definition may be evaluated more than once (a CommonJS
+        /// module body the runtime can re-run), so the read is GUARDED: while
+        /// the class has had one evaluation the slot is read directly; after a
+        /// second one the runtime resolves the receiver's own evaluation and
+        /// reads that evaluation's capture array unless it is the owner.
+        guarded: bool,
+    },
+
+    /// Write slot `index` of a class's capture environment (see
+    /// `ClassEnvGet`). Emitted where a member or the constructor assigns a
+    /// captured binding, and where the constructor publishes its capture
+    /// params. Evaluates to `value`.
+    ClassEnvSet {
+        class_name: String,
+        index: u32,
+        value: Box<Expr>,
+        /// See `ClassEnvGet::guarded`.
+        guarded: bool,
+        /// The constructor's entry publish of its capture params (as opposed
+        /// to a member's write of a captured binding). A guarded publish only
+        /// runs while the class has had a single evaluation: afterwards the
+        /// params may belong to a later evaluation, whose own capture array
+        /// already holds them.
+        publish: bool,
+    },
+
+    /// Construct `instance` (an `Expr::New` of a guarded class-environment
+    /// class, see `ClassEnvGet::guarded`) and, once the class has had more
+    /// than one evaluation, record `evaluation` (the class value the `new`
+    /// site's binding holds) as the instance's evaluation. An unrecorded
+    /// instance belongs to the class's first evaluation.
+    ClassEnvStamp {
+        class_name: String,
+        instance: Box<Expr>,
+        evaluation: Box<Expr>,
+    },
+
+    /// The class value of the evaluation the enclosing member of guarded
+    /// class `class_name` belongs to (the extracted method's own, else the
+    /// receiver's), or `undefined` while the class has had a single
+    /// evaluation or for its first one. Feeds `ClassEnvStamp` for a
+    /// `new <Self>()` inside the class's own members.
+    ClassEnvCurrent {
+        class_name: String,
     },
 
     /// Read slot `index` of a class's decl-site capture snapshot
@@ -2766,6 +2829,8 @@ pub enum Expr {
     /// empty, and the module collector resolves it before codegen.
     WorkerNew {
         paths: Vec<String>,
+        /// Opaque return paths remain possible; never assume a sole candidate.
+        partial: bool,
         filename: Box<Expr>,
         options: Option<Box<Expr>>,
         /// `true` when the Worker options carry `eval: true` — i.e. the first

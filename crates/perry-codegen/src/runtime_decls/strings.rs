@@ -29,6 +29,8 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_jsvalue_to_string", I64, &[DOUBLE]);
     // #3146: nullish-guarded `.toString()` member-call variant.
     module.declare_function("js_jsvalue_to_string_method", I64, &[DOUBLE]);
+    // #10762: NaN-box-returning twin — an SSO immediate for a short number.
+    module.declare_function("js_jsvalue_to_string_method_box", DOUBLE, &[DOUBLE]);
     // ToString coercion (undefined→"undefined", null→"null", objects dispatch
     // toString) — used by RegExp exec/test arg + constructor coercion.
     module.declare_function("js_jsvalue_to_string_coerce", I64, &[DOUBLE]);
@@ -451,6 +453,11 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_math_max2", DOUBLE, &[DOUBLE, DOUBLE]);
     module.declare_function("js_string_coerce", I64, &[DOUBLE]);
     module.declare_function("js_template_string_coerce", I64, &[DOUBLE]);
+    // #10762: NaN-box-returning twins for the `String(x)` / `${x}` lowerings.
+    // A number whose text fits `SHORT_STRING_MAX_LEN` comes back as SSO bits
+    // with no allocation; a string argument comes back unchanged.
+    module.declare_function("js_string_coerce_box", DOUBLE, &[DOUBLE]);
+    module.declare_function("js_template_string_coerce_box", DOUBLE, &[DOUBLE]);
     // RequireObjectCoercible + ToString for inline-lowered String.prototype
     // methods on a non-string receiver: a nullish `this` throws the V8
     // member-access TypeError instead of coercing undefined→"undefined".
@@ -476,6 +483,22 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
         "js_private_guard",
         DOUBLE,
         &[DOUBLE, DOUBLE, I32, PTR, I32, I32, I32],
+    );
+    // #10501: per-site cached field guard and the fused `recv.#m(args)` pair.
+    module.declare_function(
+        "js_private_guard_site",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, I32, PTR, I32, I32, I32, PTR],
+    );
+    module.declare_function(
+        "js_private_method_guard",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, I32, PTR, I32, PTR],
+    );
+    module.declare_function(
+        "js_private_method_call",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, I32, PTR, I32, PTR, I64, PTR],
     );
     module.declare_function("js_private_lexical_brand_capture", DOUBLE, &[DOUBLE, I32]);
     module.declare_function("js_private_lexical_brand_push", DOUBLE, &[DOUBLE]);
@@ -1140,6 +1163,13 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_bool_box_set", VOID, &[I64, I32]);
     module.declare_function("js_arguments_object_alloc", I64, &[DOUBLE, DOUBLE, I32]);
     module.declare_function("js_arguments_object_map_index", VOID, &[I64, I32, I64]);
+    // #10509: `arguments[k]` against an elided Arguments object.
+    module.declare_function("js_arguments_bundle_index_get", DOUBLE, &[DOUBLE, DOUBLE]);
+    module.declare_function(
+        "js_arguments_bundle_get_slow",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, DOUBLE, PTR, I32],
+    );
     module.declare_function("js_array_like_to_array", I64, &[DOUBLE]);
     module.declare_function("js_object_get_class_id", I32, &[I64]);
     module.declare_function("js_object_alloc_with_parent", I64, &[I32, I32, I32]);
@@ -1182,7 +1212,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     );
     module.declare_function("js_build_class_keys_array", I64, &[I32, I32, PTR, I32]);
     module.declare_function("js_object_shape_id_for_keys", I32, &[I64, I32]);
-    module.declare_function("js_register_class_guard_shape", VOID, &[PTR]);
+    module.declare_function("js_object_shape_id_for_class_keys", I32, &[I64, I32, I32]);
     // #10123: (shape_id, NaN-boxed key) -> inline slot index, or -1. The
     // element-shape loop clone's shape-keyed preheader resolves each tracked
     // property once against the shape the runtime just proved.
@@ -1202,7 +1232,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function(
         "js_register_imported_class_shape_slot",
         VOID,
-        &[I32, I32, PTR, PTR, PTR, PTR],
+        &[I32, I32, PTR, PTR, PTR],
     );
     // Inline bump-allocator state accessor + slow path. Ordinary allocation
     // kernels cache `js_inline_arena_state` at function entry. Self-recursive
@@ -1528,6 +1558,15 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_tdz_suppress_end", VOID, &[]);
     // Static-method prologue read of one decl-site capture snapshot slot.
     module.declare_function("js_class_capture_value", DOUBLE, &[I32, I32]);
+    // Guarded class capture environments (`perry-runtime` object/class_env).
+    module.declare_function("js_class_env_register_state", VOID, &[I32, PTR]);
+    module.declare_function("js_class_env_register_slot", VOID, &[I32, I32, PTR]);
+    module.declare_function("js_class_env_evaluate", VOID, &[I32, DOUBLE, DOUBLE]);
+    module.declare_function("js_class_env_refresh", VOID, &[I32, DOUBLE, DOUBLE]);
+    module.declare_function("js_class_env_get", DOUBLE, &[DOUBLE, I32, I32]);
+    module.declare_function("js_class_env_set", VOID, &[DOUBLE, I32, I32, DOUBLE]);
+    module.declare_function("js_class_env_stamp", DOUBLE, &[DOUBLE, I32, DOUBLE]);
+    module.declare_function("js_class_env_current", DOUBLE, &[DOUBLE, I32]);
     module.declare_function(
         "js_class_capture_value_for_receiver",
         DOUBLE,

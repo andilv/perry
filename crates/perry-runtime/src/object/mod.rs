@@ -70,6 +70,8 @@ pub(crate) use json_construction::{
 };
 mod arguments;
 #[cfg(test)]
+mod arguments_bundle_tests;
+#[cfg(test)]
 mod arguments_latch_tests;
 mod array_object_ops;
 mod assert;
@@ -77,6 +79,7 @@ mod async_generator_queue;
 mod bigint_dispatch;
 mod buffer_dispatch;
 mod class_constructors;
+mod class_env;
 mod class_gc_roots;
 mod class_handles;
 pub mod class_image;
@@ -113,11 +116,12 @@ pub(crate) use gc_slots::{
 };
 pub(crate) mod global_fetch;
 pub(crate) use global_fetch::scan_pending_fetch_signal_root_mut;
-mod global_this;
-pub mod handle_expando;
 /// Lane 3: the (receiver shape, key) -> (holder, slot) cache that gives an
 /// INHERITED read an inline-cache hit. See the module docs for the guard and
 /// the GC contract.
+pub(crate) mod chain_store;
+mod global_this;
+pub mod handle_expando;
 pub(crate) mod inherited_read_cache;
 pub(crate) mod prop_plan;
 pub(crate) mod proto_validity;
@@ -129,6 +133,8 @@ mod global_this_tables;
 mod groupby;
 pub(crate) mod has_own_helpers;
 mod instanceof;
+#[cfg(test)]
+mod keys_walk_accessor_tests;
 mod live_slots;
 mod null_stub;
 mod side_table_roots;
@@ -183,6 +189,8 @@ pub(crate) mod native_this_alias;
 mod object_literal_ops;
 pub(crate) mod object_ops;
 pub(crate) mod own_override;
+#[cfg(test)]
+mod own_override_push_tests;
 pub(crate) use object_ops::{ensure_key_in_keys_array, install_builtin_getter};
 mod object_ops_frozen;
 mod polymorphic_index;
@@ -232,12 +240,12 @@ mod temporal_proto;
 mod typed_array_define;
 pub(crate) mod typed_array_proto_thunks;
 mod util_types;
+pub(crate) mod view_brand;
 mod weakref_proto_thunks;
 mod websocket_global;
 mod with_env;
 // Issue #1103 follow-up: behavior-preserving split of the residual top-level
 // helpers that lived directly in `object/mod.rs`.
-mod class_guard_shape;
 mod class_meta_registry;
 pub(crate) mod descriptor_state;
 mod this_binding;
@@ -250,6 +258,7 @@ pub(crate) use async_generator_queue::is_async_generator_instance_value;
 pub(crate) use bigint_dispatch::*;
 pub use buffer_dispatch::*;
 pub use class_constructors::*;
+pub use class_env::*;
 pub use class_gc_roots::scan_class_inheritance_roots_mut;
 #[cfg(test)]
 pub(crate) use class_gc_roots::{
@@ -305,7 +314,6 @@ pub use with_env::*;
 // Re-exports for the residual-helper split (issue #1103 follow-up). Explicit
 // named re-exports keep existing `crate::object::X` / bare-name call sites in
 // the object submodules resolving unchanged.
-pub use class_guard_shape::{js_register_class_guard_shape, CLASS_GUARD_SHAPE_POISON};
 pub(crate) use class_meta_registry::{
     builtin_error_prototype_name, class_generic_origin, extends_builtin_error, fetch_parent_kind,
     lookup_has_instance_hook, lookup_to_string_tag_hook, register_fetch_parent_kind,
@@ -1122,7 +1130,14 @@ fn transition_edge_places_key(
         if (*keys).length <= slot_idx {
             return false;
         }
-        let stored = crate::array::js_array_get(keys, slot_idx);
+        // #10724: one raw dense-slot read, not the JS-facing element accessor
+        // (3.6 M `js_array_get_f64` calls on a native `tsc`). The cached address
+        // is not from a live descriptor, so resolve it (forwarding, validation).
+        let (slots, slot_len) = keys_array_dense_slots(keys);
+        if slot_idx as usize >= slot_len {
+            return false;
+        }
+        let stored = crate::JSValue::from_bits((*slots.add(slot_idx as usize)).to_bits());
         crate::string::js_string_key_matches(stored, key)
     }
 }

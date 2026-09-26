@@ -27,6 +27,7 @@ pub use attr_variants::{
 };
 pub use fast_paths::js_object_set_field_by_name_transition_fast;
 pub(crate) use fast_paths::{
+    object_set_field_by_name_transition_chain_proven_value,
     object_set_field_by_name_transition_only_fast_value, try_existing_own_data_overwrite,
     try_readd_stable_tombstone,
 };
@@ -204,7 +205,11 @@ pub extern "C" fn js_object_set_field_by_name(
                         // index below the floor.
                         && crate::object::reserved_slot_floor_for_class_id(class_id) == 0
                         && !super::prototype_chain::object_has_prototype_divergence(raw)
-                        && super::prop_plan::store_plan_check(class_id, key as usize)
+                        && super::prop_plan::store_plan_check(
+                            class_id,
+                            key as usize,
+                            super::prop_plan::receiver_proto_bits(o),
+                        )
                     {
                         let prev_shape_id = super::shapes::object_shape_stamp(o);
                         if prev_shape_id != 0 {

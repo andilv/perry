@@ -3,6 +3,7 @@
 
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::Mutex;
 
 /// Function pointer type for dispatching method calls on handle-based objects.
 /// Handle-based objects use small integer IDs (1, 2, 3...) instead of real heap pointers.
@@ -136,24 +137,15 @@ pub type EventEmitterOnFn =
 static HANDLE_METHOD_DISPATCH_PTR: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 static HANDLE_PROPERTY_DISPATCH_PTR: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 static HANDLE_PROPERTY_SET_DISPATCH_PTR: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
-static HANDLE_METHOD_EXTENSION_DISPATCH_PTRS: [AtomicPtr<()>; 4] = [
-    AtomicPtr::new(ptr::null_mut()),
-    AtomicPtr::new(ptr::null_mut()),
-    AtomicPtr::new(ptr::null_mut()),
-    AtomicPtr::new(ptr::null_mut()),
-];
-static HANDLE_PROPERTY_EXTENSION_DISPATCH_PTRS: [AtomicPtr<()>; 4] = [
-    AtomicPtr::new(ptr::null_mut()),
-    AtomicPtr::new(ptr::null_mut()),
-    AtomicPtr::new(ptr::null_mut()),
-    AtomicPtr::new(ptr::null_mut()),
-];
-static HANDLE_PROPERTY_SET_EXTENSION_DISPATCH_PTRS: [AtomicPtr<()>; 4] = [
-    AtomicPtr::new(ptr::null_mut()),
-    AtomicPtr::new(ptr::null_mut()),
-    AtomicPtr::new(ptr::null_mut()),
-    AtomicPtr::new(ptr::null_mut()),
-];
+// Extension dispatchers (#11286): one unbounded table per surface. These used
+// to be fixed `[AtomicPtr<()>; 4]` arrays whose overflow path overwrote the
+// LAST slot, so with five method registrants (perry-ext-{http server, http
+// client, net, ws, nodemailer}) the fourth crate to initialize silently lost
+// its dynamic dispatch. Registration is lazy (each crate registers on first
+// use), so WHICH crate lost it depended on the program's first-use order.
+static HANDLE_METHOD_EXTENSION_DISPATCH_PTRS: ExtensionTable = ExtensionTable::new();
+static HANDLE_PROPERTY_EXTENSION_DISPATCH_PTRS: ExtensionTable = ExtensionTable::new();
+static HANDLE_PROPERTY_SET_EXTENSION_DISPATCH_PTRS: ExtensionTable = ExtensionTable::new();
 static HANDLE_OWN_PROPERTY_NAMES_DISPATCH_PTR: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 static HANDLE_PROTOTYPE_DISPATCH_PTR: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 static STREAM_HANDLE_PROBE_PTR: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
@@ -171,30 +163,131 @@ static HTTP_AGENT_HANDLE_PROBE_PTR: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut
 static TLS_HANDLE_KIND_PROBE_PTR: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 static FFI_HANDLE_EXISTS_PROBE_PTR: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 static EVENT_EMITTER_ON_PTR: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+static EVENT_EMITTER_METHOD_DISPATCH_PTR: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+static EVENT_EMITTER_PROPERTY_DISPATCH_PTR: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 
 const TAG_UNDEFINED: u64 = 0x7FFC_0000_0000_0001;
 
-fn has_extension(slots: &[AtomicPtr<()>]) -> bool {
-    slots
-        .iter()
-        .any(|slot| !slot.load(Ordering::Acquire).is_null())
+/// Number of extension dispatchers held inline. Registrations beyond it go to
+/// the growable overflow list instead of evicting anything (#11286).
+const INLINE_EXTENSION_SLOTS: usize = 4;
+
+/// Append-only table of extension dispatcher function pointers.
+///
+/// The first `INLINE_EXTENSION_SLOTS` registrants live in fixed atomic slots,
+/// filled strictly in order, so the hot path for the common case is the same
+/// unrolled scan the old fixed array compiled to (and an empty table is one
+/// null check on slot 0). Further registrants go to `overflow`, a growable
+/// list consulted only once every inline slot is taken — the old code
+/// overwrote the last slot there instead.
+///
+/// Writers (a handful of one-time `Once`-guarded registrations per process)
+/// serialize on `lock`. The overflow list is copy-on-append and published with
+/// a `Release` store; a superseded list is intentionally leaked, because a
+/// concurrent reader may still be iterating it, and the leak is bounded by the
+/// number of distinct registrations. Entries are code pointers, never GC heap
+/// pointers, so none of this is a GC root.
+pub(crate) struct ExtensionTable {
+    inline: [AtomicPtr<()>; INLINE_EXTENSION_SLOTS],
+    overflow: AtomicPtr<ExtensionList>,
+    lock: Mutex<()>,
 }
 
-fn register_extension(slots: &[AtomicPtr<()>], f: *mut ()) {
-    for slot in slots {
-        if slot.load(Ordering::Acquire) == f {
-            return;
+struct ExtensionList {
+    fns: Box<[*mut ()]>,
+}
+
+impl ExtensionTable {
+    pub(crate) const fn new() -> Self {
+        Self {
+            inline: [const { AtomicPtr::new(ptr::null_mut()) }; INLINE_EXTENSION_SLOTS],
+            overflow: AtomicPtr::new(ptr::null_mut()),
+            lock: Mutex::new(()),
         }
     }
-    for slot in slots {
-        if slot
-            .compare_exchange(ptr::null_mut(), f, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
+
+    /// Slots fill in order, so slot 0 is set iff anything is registered.
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.inline[0].load(Ordering::Acquire).is_null()
+    }
+
+    /// Offer each registered dispatcher, in registration order (= dispatch
+    /// priority), to `claims` until one returns `true`.
+    #[inline(always)]
+    fn any_claims(&self, mut claims: impl FnMut(*mut ()) -> bool) -> bool {
+        for slot in &self.inline {
+            let p = slot.load(Ordering::Acquire);
+            if p.is_null() {
+                // In-order fill: an empty inline slot means no overflow yet.
+                return false;
+            }
+            if claims(p) {
+                return true;
+            }
+        }
+        let list = self.overflow.load(Ordering::Acquire);
+        if !list.is_null() {
+            // SAFETY: a published list is never freed or mutated (see above).
+            for &p in unsafe { (*list).fns.iter() } {
+                if claims(p) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Every registered dispatcher, in registration order.
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> Vec<*mut ()> {
+        let mut out = Vec::new();
+        self.any_claims(|p| {
+            out.push(p);
+            false
+        });
+        out
+    }
+
+    /// Register `f`; idempotent for a pointer already present. Never evicts.
+    pub(crate) fn register(&self, f: *mut ()) {
+        if f.is_null() {
             return;
         }
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        if self.any_claims(|p| p == f) {
+            return;
+        }
+        for slot in &self.inline {
+            if slot.load(Ordering::Acquire).is_null() {
+                slot.store(f, Ordering::Release);
+                return;
+            }
+        }
+        let current = self.overflow.load(Ordering::Acquire);
+        let current: &[*mut ()] = if current.is_null() {
+            &[]
+        } else {
+            // SAFETY: as in `any_claims`.
+            unsafe { &(*current).fns }
+        };
+        let mut fns = Vec::with_capacity(current.len() + 1);
+        fns.extend_from_slice(current);
+        fns.push(f);
+        let list = Box::into_raw(Box::new(ExtensionList {
+            fns: fns.into_boxed_slice(),
+        }));
+        // The previous list (if any) is leaked on purpose — see the type doc.
+        self.overflow.store(list, Ordering::Release);
     }
-    slots[slots.len() - 1].store(f, Ordering::Release);
+}
+
+fn has_extension(table: &ExtensionTable) -> bool {
+    !table.is_empty()
+}
+
+fn register_extension(table: &ExtensionTable, f: *mut ()) {
+    table.register(f);
 }
 
 unsafe extern "C" fn composite_handle_method_dispatch(
@@ -204,14 +297,11 @@ unsafe extern "C" fn composite_handle_method_dispatch(
     args_ptr: *const f64,
     args_len: usize,
 ) -> f64 {
-    for slot in HANDLE_METHOD_EXTENSION_DISPATCH_PTRS.iter() {
-        let p = slot.load(Ordering::Acquire);
-        if p.is_null() {
-            continue;
-        }
+    let mut out = f64::from_bits(TAG_UNDEFINED);
+    if HANDLE_METHOD_EXTENSION_DISPATCH_PTRS.any_claims(|p| {
         let f = std::mem::transmute::<*mut (), HandleMethodDispatchExtensionFn>(p);
-        let mut out = f64::from_bits(TAG_UNDEFINED);
-        if f(
+        out = f64::from_bits(TAG_UNDEFINED);
+        f(
             handle,
             method_name_ptr,
             method_name_len,
@@ -219,9 +309,8 @@ unsafe extern "C" fn composite_handle_method_dispatch(
             args_len,
             &mut out,
         ) != 0
-        {
-            return out;
-        }
+    }) {
+        return out;
     }
 
     let p = HANDLE_METHOD_DISPATCH_PTR.load(Ordering::Acquire);
@@ -238,16 +327,13 @@ unsafe extern "C" fn composite_handle_property_dispatch(
     property_name_ptr: *const u8,
     property_name_len: usize,
 ) -> f64 {
-    for slot in HANDLE_PROPERTY_EXTENSION_DISPATCH_PTRS.iter() {
-        let p = slot.load(Ordering::Acquire);
-        if p.is_null() {
-            continue;
-        }
+    let mut out = f64::from_bits(TAG_UNDEFINED);
+    if HANDLE_PROPERTY_EXTENSION_DISPATCH_PTRS.any_claims(|p| {
         let f = std::mem::transmute::<*mut (), HandlePropertyDispatchExtensionFn>(p);
-        let mut out = f64::from_bits(TAG_UNDEFINED);
-        if f(handle, property_name_ptr, property_name_len, &mut out) != 0 {
-            return out;
-        }
+        out = f64::from_bits(TAG_UNDEFINED);
+        f(handle, property_name_ptr, property_name_len, &mut out) != 0
+    }) {
+        return out;
     }
 
     let p = HANDLE_PROPERTY_DISPATCH_PTR.load(Ordering::Acquire);
@@ -265,15 +351,11 @@ unsafe extern "C" fn composite_handle_property_set_dispatch(
     property_name_len: usize,
     value: f64,
 ) {
-    for slot in HANDLE_PROPERTY_SET_EXTENSION_DISPATCH_PTRS.iter() {
-        let p = slot.load(Ordering::Acquire);
-        if p.is_null() {
-            continue;
-        }
+    if HANDLE_PROPERTY_SET_EXTENSION_DISPATCH_PTRS.any_claims(|p| {
         let f = std::mem::transmute::<*mut (), HandlePropertySetDispatchExtensionFn>(p);
-        if f(handle, property_name_ptr, property_name_len, value) != 0 {
-            return;
-        }
+        f(handle, property_name_ptr, property_name_len, value) != 0
+    }) {
+        return;
     }
 
     let p = HANDLE_PROPERTY_SET_DISPATCH_PTR.load(Ordering::Acquire);
@@ -636,6 +718,48 @@ pub unsafe extern "C" fn js_register_event_emitter_on(f: EventEmitterOnFn) {
     EVENT_EMITTER_ON_PTR.store(f as *mut (), Ordering::Release);
 }
 
+/// #11270: the EventEmitter implementation's own method dispatcher, for
+/// receivers codegen could not type (`arr[i].on(...)`, `new ns.EventEmitter()`).
+/// perry-stdlib's handle dispatcher consults it before its own name mapping,
+/// whose `extern "C"` calls bind to perry-stdlib's in-crate `bundled-events`
+/// copies — an empty registry whenever perry-ext-events is the linked
+/// implementation. Same contract as the handle-dispatch extensions: return 1
+/// and write `out` when the handle is the implementation's own, 0 otherwise.
+#[inline]
+pub fn event_emitter_method_dispatch() -> Option<HandleMethodDispatchExtensionFn> {
+    let p = EVENT_EMITTER_METHOD_DISPATCH_PTR.load(Ordering::Acquire);
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { std::mem::transmute::<*mut (), HandleMethodDispatchExtensionFn>(p) })
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn js_register_event_emitter_method_dispatch(
+    f: HandleMethodDispatchExtensionFn,
+) {
+    EVENT_EMITTER_METHOD_DISPATCH_PTR.store(f as *mut (), Ordering::Release);
+}
+
+/// Property-read (method-value) counterpart of `event_emitter_method_dispatch`.
+#[inline]
+pub fn event_emitter_property_dispatch() -> Option<HandlePropertyDispatchExtensionFn> {
+    let p = EVENT_EMITTER_PROPERTY_DISPATCH_PTR.load(Ordering::Acquire);
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { std::mem::transmute::<*mut (), HandlePropertyDispatchExtensionFn>(p) })
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn js_register_event_emitter_property_dispatch(
+    f: HandlePropertyDispatchExtensionFn,
+) {
+    EVENT_EMITTER_PROPERTY_DISPATCH_PTR.store(f as *mut (), Ordering::Release);
+}
+
 /// Register a function to handle property access on handle-based objects.
 #[no_mangle]
 pub unsafe extern "C" fn js_register_handle_property_dispatch(f: HandlePropertyDispatchFn) {
@@ -675,3 +799,7 @@ pub unsafe extern "C" fn js_register_handle_own_property_names_dispatch(
 pub unsafe extern "C" fn js_register_handle_prototype_dispatch(f: HandlePrototypeDispatchFn) {
     HANDLE_PROTOTYPE_DISPATCH_PTR.store(f as *mut (), Ordering::Release);
 }
+
+#[cfg(test)]
+#[path = "class_handles_extension_tests.rs"]
+mod extension_tests;

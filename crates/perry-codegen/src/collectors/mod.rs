@@ -25,6 +25,7 @@ mod index_uses;
 mod int_valued_i64_locals;
 mod int_valued_ta_locals;
 mod integer_locals;
+mod literal_method_home;
 mod local_refs;
 mod loop_bounded_i32;
 mod mutation;
@@ -95,6 +96,7 @@ pub(crate) use int_valued_i64_locals::ceil_log2_abs;
 pub(crate) use integer_locals::{
     collect_flat_row_aliases, is_int32_producing_expr, static_index_window,
 };
+pub(crate) use literal_method_home::literal_method_home_classes;
 pub(crate) use local_refs::{expr_contains_local_get, mark_all_candidate_refs_in_expr};
 pub(crate) use mutation::{
     body_contains_call, body_contains_closure, flat_const_array_uses_are_read_only,
@@ -135,7 +137,7 @@ pub(crate) use shadow_slots::{
 };
 pub(crate) use spec_abi_sites::{
     collect_spec_abi_facts, guarded_number_array_param_eligible, reassigned_locals,
-    reassigned_locals_in_module, SpecParamRep, SpecTaBinding,
+    reassigned_locals_in_module, rebound_locals, SpecParamRep, SpecTaBinding,
 };
 pub(crate) use this_as_value::{
     class_chain_extends_builtin_error, class_chain_has_unmodeled_base, class_uses_this_as_value,

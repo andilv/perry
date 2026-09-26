@@ -181,9 +181,13 @@ pub use streams::*;
 
 // === TLS over a tokio transport (turnloop P8 group H) ===
 // perry-tls-session's sans-I/O rustls session driven over the tokio sockets
-// the bundled `node:tls` server, `net` client and `wss://` connector still
-// use — the replacement for their former tokio-rustls streams.
-#[cfg(any(feature = "tls-runtime", feature = "bundled-ws"))]
+// the bundled `net` client (`tls`) and `wss://` connector (`bundled-ws`) still
+// use — the replacement for their former tokio-rustls streams. The `node:tls`
+// server no longer needs it: its sockets are turnloop handles
+// (`tls/turnloop_server.rs`, turnloop P8 lane L), so `tls-runtime` alone —
+// what `external-net-tls` selects for every net / http program — links no
+// tokio.
+#[cfg(any(feature = "tls", feature = "bundled-ws"))]
 pub(crate) mod tls_stream;
 
 // === WebSocket ===
@@ -221,10 +225,9 @@ pub use tls::*;
 
 // === Databases ===
 // The bundled `pg` / `mysql2` / `ioredis` / `mongodb` modules were deleted in
-// turnloop P8 group H. `import 'mongodb'` is served exclusively by the
-// perry-ext-mongodb wrapper through the well-known flip; `pg`, `mysql2`,
-// `ioredis`, `redis` and `iovalkey` compile the real npm package from source.
-// Only sqlite remains in-stdlib.
+// turnloop P8 group H. `pg`, `mysql2`, `ioredis`, `redis`, `iovalkey` and
+// `mongodb` compile the real npm package from source. Only sqlite remains
+// in-stdlib.
 // Both in-tree database wrappers that lived here are gone: the `pg`
 // module + `bundled-pg` feature (#10677) and the `mysql2` module +
 // `bundled-mysql2` feature (#10680), the pre-#466 native

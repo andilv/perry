@@ -10,6 +10,8 @@ use super::compile::{CompileArgs, CompileResult};
 use crate::{OutputFormat, Platform};
 
 mod android;
+mod android_signing;
+mod android_template;
 mod devices;
 mod entry;
 mod launch;

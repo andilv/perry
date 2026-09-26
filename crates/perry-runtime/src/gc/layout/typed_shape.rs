@@ -68,6 +68,10 @@ unsafe fn mask_words<'a>(words: *const u64, word_count: u32) -> &'a [u64] {
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct RegisteredTypedShapeKey {
     class_id: u32,
+    /// The prototype identity the class id names when it registers: a shape
+    /// fact, so two registrations of one class id that name different
+    /// prototypes (per-module class ids collide) get two ShapeIds.
+    proto_id: u64,
     slot_count: u32,
     raw_f64_words: Vec<u64>,
     pointer_words: Vec<u64>,
@@ -88,6 +92,9 @@ struct RegisteredTypedShapes {
     ids_by_layout: crate::fast_hash::FastKeyHashMap<RegisteredTypedShapeKey, u32>,
     /// Bare `u32` ShapeId key -> `PtrHasher` (single multiply + avalanche).
     layouts_by_id: crate::fast_hash::PtrHashMap<u32, TypedLayoutDescriptor>,
+    /// Typed ShapeId -> the prototype identity it was minted with, for
+    /// installing it into another module's slots or another agent.
+    proto_by_id: crate::fast_hash::PtrHashMap<u32, u64>,
     /// `(class id, slot count)` -> the first typed ShapeId registered for it.
     /// Read when an importing module registers its compiled ShapeId slots.
     typed_by_class: std::collections::HashMap<(u32, u32), u32>,
@@ -109,11 +116,6 @@ struct ImportedShapeSlot {
     keys_slot: usize,
     shape_slot: usize,
     image_slot: usize,
-    /// The importing module's `@perry_class_guard_shape_*` twin of
-    /// `shape_slot`. It must follow the same rewrite, or an imported class's
-    /// inline guard would compare against a stale expectation and miss for the
-    /// life of the process. 0 when the stub predates the guard global.
-    guard_slot: usize,
 }
 
 static REGISTERED_TYPED_SHAPES: std::sync::LazyLock<std::sync::Mutex<RegisteredTypedShapes>> =
@@ -166,8 +168,10 @@ pub extern "C" fn js_gc_typed_shape_id_for_keys(
         eprintln!("Perry internal error: invalid pre-registered typed shape masks");
         std::process::abort();
     }
+    let proto_id = crate::object::shapes::class_proto_id(class_id);
     let key = RegisteredTypedShapeKey {
         class_id,
+        proto_id,
         slot_count,
         raw_f64_words: raw_f64_slice.to_vec(),
         pointer_words: pointer_slice.to_vec(),
@@ -183,6 +187,7 @@ pub extern "C" fn js_gc_typed_shape_id_for_keys(
             shape_id,
             keys as usize as *const crate::array::ArrayHeader,
             slot_count,
+            proto_id,
         ) {
             eprintln!("Perry internal error: typed ShapeId structural mismatch");
             std::process::abort();
@@ -193,9 +198,11 @@ pub extern "C" fn js_gc_typed_shape_id_for_keys(
     let shape_id = crate::object::shapes::mint_registered_typed_shape_id(
         keys as usize as *const crate::array::ArrayHeader,
         slot_count,
+        proto_id,
     );
     registered.ids_by_layout.insert(key, shape_id);
     registered.layouts_by_id.insert(shape_id, descriptor);
+    registered.proto_by_id.insert(shape_id, proto_id);
     publish_to_imported_slots(&mut registered, class_id, slot_count, shape_id);
     shape_id
 }
@@ -243,8 +250,11 @@ fn publish_to_imported_slots(
         .entry((class_id, slot_count))
         .or_insert(shape_id);
     if let Some(slots) = registered.pending_imported.remove(&(class_id, slot_count)) {
+        let proto_id = registered.proto_by_id.get(&shape_id).copied();
         for slot in slots {
-            unsafe { rewrite_imported_shape_slot(slot, slot_count, shape_id) };
+            if let Some(proto_id) = proto_id {
+                unsafe { rewrite_imported_shape_slot(slot, slot_count, shape_id, proto_id) };
+            }
         }
     }
 }
@@ -252,30 +262,24 @@ fn publish_to_imported_slots(
 /// # Safety
 /// `slot` must hold the addresses codegen registered: a live `u64` keys global,
 /// a `u32` ShapeId global and a null or `<2 x i64>` header image global.
-unsafe fn rewrite_imported_shape_slot(slot: ImportedShapeSlot, slot_count: u32, shape_id: u32) {
+unsafe fn rewrite_imported_shape_slot(
+    slot: ImportedShapeSlot,
+    slot_count: u32,
+    shape_id: u32,
+    proto_id: u64,
+) {
     let keys = std::ptr::read(slot.keys_slot as *const u64);
     if keys == 0
         || !crate::object::shapes::install_registered_typed_shape_id(
             shape_id,
             keys as usize as *const crate::array::ArrayHeader,
             slot_count,
+            proto_id,
         )
     {
         return;
     }
     std::ptr::write(slot.shape_slot as *mut u32, shape_id);
-    if slot.guard_slot != 0 {
-        // The guard expectation follows the ShapeId — unless the inline path
-        // has already been disabled, in which case it must stay poisoned. A
-        // stub registered before the flip and rewritten after it would
-        // otherwise reopen a fast path the process has closed.
-        let value = if crate::object::class_field_inline_guard_enabled() {
-            shape_id
-        } else {
-            crate::object::CLASS_GUARD_SHAPE_POISON
-        };
-        std::ptr::write(slot.guard_slot as *mut u32, value);
-    }
     if slot.image_slot != 0 {
         let word = (slot.image_slot as *mut u64).add(1);
         let class_id_bits = std::ptr::read(word) & 0xFFFF_FFFF;
@@ -298,7 +302,6 @@ pub extern "C" fn js_register_imported_class_shape_slot(
     keys_slot: *const u64,
     shape_slot: *mut u32,
     image_slot: *mut u64,
-    guard_slot: *mut u32,
 ) {
     if class_id == 0 || keys_slot.is_null() || shape_slot.is_null() || slot_count >= 16_000_000 {
         return;
@@ -307,22 +310,18 @@ pub extern "C" fn js_register_imported_class_shape_slot(
         keys_slot: keys_slot as usize,
         shape_slot: shape_slot as usize,
         image_slot: image_slot as usize,
-        guard_slot: guard_slot as usize,
     };
-    // Also enrol the guard expectation for process-wide poisoning, so a LATER
-    // `disable_class_field_inline_guard` reaches an imported class's slot too.
-    if !guard_slot.is_null() {
-        // SAFETY: a compiled `@perry_class_guard_shape_*` global, static and
-        // writable for the life of the image (the caller's contract above).
-        unsafe { crate::object::js_register_class_guard_shape(guard_slot) };
-    }
     let mut registered = registered_typed_shapes();
     match registered
         .typed_by_class
         .get(&(class_id, slot_count))
         .copied()
     {
-        Some(shape_id) => unsafe { rewrite_imported_shape_slot(slot, slot_count, shape_id) },
+        Some(shape_id) => {
+            if let Some(proto_id) = registered.proto_by_id.get(&shape_id).copied() {
+                unsafe { rewrite_imported_shape_slot(slot, slot_count, shape_id, proto_id) }
+            }
+        }
         None => registered
             .pending_imported
             .entry((class_id, slot_count))
@@ -339,7 +338,6 @@ static KEEP_JS_REGISTER_IMPORTED_CLASS_SHAPE_SLOT: extern "C" fn(
     *const u64,
     *mut u32,
     *mut u64,
-    *mut u32,
 ) = js_register_imported_class_shape_slot;
 
 #[allow(clippy::too_many_arguments)]
@@ -668,10 +666,6 @@ mod imported_shape_slot_tests {
         keys: Box<u64>,
         shape: Box<u32>,
         image: Box<[u64; 2]>,
-        /// The poisonable guard expectation twinned with `shape`. It must
-        /// follow every rewrite `shape` gets, or an imported class's inline
-        /// field guard compares against a stale value for the whole process.
-        guard: Box<u32>,
     }
 
     fn slots(class_id: u32, packed: &[u8]) -> Slots {
@@ -681,7 +675,6 @@ mod imported_shape_slot_tests {
             keys: Box::new(keys),
             shape: Box::new(ordinary),
             image: Box::new([0x1234_5678, ((ordinary as u64) << 32) | class_id as u64]),
-            guard: Box::new(ordinary),
         }
     }
 
@@ -692,7 +685,6 @@ mod imported_shape_slot_tests {
             &*s.keys as *const u64,
             &mut *s.shape as *mut u32,
             s.image.as_mut_ptr(),
-            &mut *s.guard as *mut u32,
         );
     }
 
@@ -717,14 +709,6 @@ mod imported_shape_slot_tests {
             "the consumer's packed word is untouched"
         );
         assert_eq!(s.image[1], ((typed as u64) << 32) | class_id as u64);
-        // Both rewrite paths must carry the guard expectation with them. If
-        // this drifts, an imported class's inline field guard compares a live
-        // object against the stub's ORDINARY id forever — it never goes wrong,
-        // it just silently never hits, which no correctness test would catch.
-        assert_eq!(
-            *s.guard, typed,
-            "the guard expectation follows the ShapeId slot"
-        );
     }
 
     /// The consumer registers first (its string pool ran before the defining
@@ -751,26 +735,17 @@ mod imported_shape_slot_tests {
         assert_published(class_id, &s, typed);
     }
 
-    /// Disabling the inline path poisons a registered expectation, and a
-    /// LATER rewrite must not resurrect it.
+    /// Disabling the class-field inline path leaves an imported class's
+    /// ShapeId slot following the mint: the per-access guards compare against
+    /// that slot, and no process switch may stand between them and it (S6).
     #[test]
-    fn a_disabled_inline_path_keeps_imported_expectations_poisoned() {
+    fn a_disabled_inline_path_does_not_stop_the_shape_slot_following_the_mint() {
         let class_id = 0x0B1_1005;
         let mut s = slots(class_id, b"next\0value\0");
         register(class_id, &mut s);
         crate::object::disable_class_field_inline_guard();
-        assert_eq!(
-            *s.guard,
-            crate::object::CLASS_GUARD_SHAPE_POISON,
-            "disabling must poison an already-registered expectation"
-        );
         let typed = mint(class_id, *s.keys);
-        assert_eq!(*s.shape, typed, "the ShapeId slot still follows the mint");
-        assert_eq!(
-            *s.guard,
-            crate::object::CLASS_GUARD_SHAPE_POISON,
-            "a rewrite after the disable must NOT reopen the fast path"
-        );
+        assert_published(class_id, &s, typed);
         crate::object::test_reset_class_field_inline_guard();
     }
 
@@ -791,7 +766,6 @@ mod imported_shape_slot_tests {
             &*foreign.keys as *const u64,
             &mut *foreign.shape as *mut u32,
             foreign.image.as_mut_ptr(),
-            &mut *foreign.guard as *mut u32,
         );
         let mut narrow = slots(class_id, b"next\0value\0");
         assert_ne!(
@@ -805,7 +779,6 @@ mod imported_shape_slot_tests {
             &*narrow.keys as *const u64,
             &mut *narrow.shape as *mut u32,
             std::ptr::null_mut(),
-            &mut *narrow.guard as *mut u32,
         );
         let _typed = mint(class_id, *narrow.keys);
         assert_eq!(

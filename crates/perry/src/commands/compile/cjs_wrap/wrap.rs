@@ -35,10 +35,16 @@ fn relative_import_specifier(from: &Path, to: &Path) -> Option<String> {
 fn resolved_native_addon(
     source_path: &Path,
     specifier: &str,
+    native_addon_paths: Option<&std::collections::BTreeMap<PathBuf, String>>,
 ) -> Option<(std::path::PathBuf, String)> {
     let target = super::super::resolve::resolve_relative_import_path(specifier, source_path)?;
     if target.extension().and_then(|extension| extension.to_str()) != Some("node") {
         return None;
+    }
+    // Use the collector's authorized project-relative path, even without a
+    // package name or when the addon has a nearer, nested package.json.
+    if let Some(project_path) = native_addon_paths.and_then(|paths| paths.get(&target)) {
+        return Some((target, format!("$project/{project_path}")));
     }
     let package_root = target
         .ancestors()
@@ -135,6 +141,7 @@ pub(in crate::commands::compile) fn wrap_commonjs(source: &str, source_path: &Pa
     wrap_commonjs_for_target(source, source_path, None, false, None)
 }
 
+#[cfg(test)]
 pub(in crate::commands::compile) fn wrap_commonjs_for_target(
     source: &str,
     source_path: &Path,
@@ -159,12 +166,33 @@ pub(in crate::commands::compile) fn wrap_commonjs_for_target(
 /// a wrapped-coordinate `byte_offset` back to original-source coordinates.
 /// `None` when the body could not be located in the wrapped output (a
 /// special-case early rewrite changed it); callers then skip the mapping.
+#[cfg(test)]
 pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
     source: &str,
     source_path: &Path,
     target: Option<&str>,
     is_entry_module: bool,
     compile_packages: Option<&HashSet<String>>,
+) -> (String, Option<usize>) {
+    wrap_commonjs_with_addon_paths(
+        source,
+        source_path,
+        target,
+        is_entry_module,
+        compile_packages,
+        None,
+    )
+}
+
+/// Wrap CommonJS using the project's canonical addon-path authorization map.
+/// The graph collector and generated loader calls must use the same logical id.
+pub(in crate::commands::compile) fn wrap_commonjs_with_addon_paths(
+    source: &str,
+    source_path: &Path,
+    target: Option<&str>,
+    is_entry_module: bool,
+    compile_packages: Option<&HashSet<String>>,
+    native_addon_paths: Option<&std::collections::BTreeMap<PathBuf, String>>,
 ) -> (String, Option<usize>) {
     let mut source_cow = Cow::Borrowed(source);
 
@@ -239,7 +267,8 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
             // than being routed to `createRequire`. Every valid built-in
             // subpath is already an entry in `NODE_BUILTIN_MODULES`.
             let normalized = spec.strip_prefix("node:").unwrap_or(spec);
-            perry_hir::is_node_builtin_module(normalized)
+            !perry_hir::is_bare_prefix_only_builtin(spec)
+                && perry_hir::is_node_builtin_module(normalized)
         })
         .cloned()
         .collect();
@@ -373,7 +402,7 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
     let mut chosen_alias_per_spec: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for (alias, spec, _) in &raw_aliases {
-        if resolved_native_addon(source_path, spec).is_some() {
+        if resolved_native_addon(source_path, spec, native_addon_paths).is_some() {
             continue;
         }
         if !alias_is_safe(alias) {
@@ -390,7 +419,9 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
         // in the IIFE body and `require("process")` goes through the
         // synthetic require, which resolves builtins via createRequire.
         let normalized = spec.strip_prefix("node:").unwrap_or(spec);
-        if perry_hir::is_node_builtin_module(normalized) {
+        if !perry_hir::is_bare_prefix_only_builtin(spec)
+            && perry_hir::is_node_builtin_module(normalized)
+        {
             continue;
         }
         if import_local_names.iter().any(|n| n == alias) {
@@ -448,7 +479,7 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
         // synthetic require's `createRequire` arm instead (see `require_cases`),
         // which never references the import local.
         .filter(|(spec, _)| !builtin_requires.contains(spec))
-        .filter(|(spec, _)| resolved_native_addon(source_path, spec).is_none())
+        .filter(|(spec, _)| resolved_native_addon(source_path, spec, native_addon_paths).is_none())
         .map(|(spec, local)| {
             // #4904: Node's underscore-prefixed internal http modules are
             // require-only re-exports of the public `http` surface
@@ -542,13 +573,26 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
         .iter()
         .zip(import_local_names.iter())
         .map(|(spec, local)| {
-            if let Some((_target, logical_id)) = resolved_native_addon(source_path, spec) {
+            if let Some((_target, logical_id)) = resolved_native_addon(source_path, spec, native_addon_paths) {
                 let specifier =
                     serde_json::to_string(spec).expect("native addon specifier is JSON encodable");
                 let logical_id = serde_json::to_string(&logical_id)
                     .expect("native addon logical id is JSON encodable");
                 return format!(
                     "        if (specifier === {specifier}) {{ const nativeModule = {{ exports: {{}} }}; process.dlopen(nativeModule, {logical_id}); return nativeModule.exports; }}"
+                );
+            }
+            // Missing prefix-only packages must not read the unresolved import
+            // placeholder: its canonical native name can still yield a namespace.
+            if perry_hir::is_bare_prefix_only_builtin(spec)
+                && source_path.parent().and_then(|dir| {
+                    super::super::collect_modules::static_require_transform::resolve_static_require(
+                        dir, spec, None,
+                    )
+                }).is_none()
+            {
+                return format!(
+                    "        if (specifier === '{spec}') throw __perry_cjs_require_error('error', 'MODULE_NOT_FOUND', \"Cannot find module '{spec}'\");"
                 );
             }
             let resolved_target =
@@ -603,7 +647,7 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
                         // the import binding is the value this arm returned
                         // before the target was deferred at all.
                         format!(
-                            "const childBefore = require.cache[{path:?}]; globalThis.__perry_cjs_pending_parent = module; let required; try {{ required = __perry_require_path_module({path:?}); }} finally {{ globalThis.__perry_cjs_pending_parent = undefined; }} if (required === undefined && !__perry_has_path_module({path:?})) required = {local}; {warnings}{link_child}const __perry_rec = require.cache[{path:?}]; if (__perry_rec !== undefined && __perry_rec.loaded === true) {local}__rec = __perry_rec; return required;",
+                            "const childBefore = require.cache[{path:?}]; globalThis.__perry_cjs_pending_parent = module; let required; try {{ required = __perry_require_path_module({path:?}); required = __perry_cjs_refresh_path({path:?}, required); }} finally {{ globalThis.__perry_cjs_pending_parent = undefined; }} if (required === undefined && !__perry_has_path_module({path:?})) required = {local}; {warnings}{link_child}const __perry_rec = require.cache[{path:?}]; if (__perry_rec !== undefined && __perry_rec.loaded === true) {local}__rec = __perry_rec; return required;",
                             path = target.to_string_lossy(),
                             local = local,
                         )
@@ -623,6 +667,14 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
                 )
             } else if needs_runtime_record {
                 runtime_require.clone().unwrap_or_else(|| format!("return {local};"))
+            } else if let Some(target) = resolved_target.as_ref() {
+                // #11249: an eager import binding outlives require.cache
+                // deletion and replacement. Read the live record, and use
+                // the same cold re-evaluation path as a deferred require.
+                format!(
+                    "const __perry_cached = require.cache[{path:?}]; if (__perry_cached !== undefined) {{ {link_child}return __perry_cached.exports; }} return __perry_cjs_refresh_path({path:?}, {local});",
+                    path = target.to_string_lossy(),
+                )
             } else {
                 format!("{link_child}return {local};")
             };
@@ -653,8 +705,11 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
                     // `module.exports` after evaluation still reads through
                     // (matching Node), and a cyclic target mid-initialisation
                     // keeps going through the registry until it completes.
+                    // Validate identity against the public cache on every hit:
+                    // deletion and replacement revoke this saved record.
                     format!(
-                        "        if (specifier === '{spec}') {{ if ({local}__rec !== undefined) return {local}__rec.exports; {required_value} }}"
+                        "        if (specifier === '{spec}') {{ if ({local}__rec !== undefined && require.cache[{path:?}] === {local}__rec) return {local}__rec.exports; {required_value} }}",
+                        path = resolved_target.as_ref().unwrap().to_string_lossy(),
                     )
                 } else if link_child.is_empty() {
                     format!("        if (specifier === '{spec}') return {local};")
@@ -669,8 +724,8 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
         .join("\n");
     // One memo slot per deferred specifier, declared in the factory so each
     // module INSTANCE gets its own (they are per-module state, not global).
-    // A plain local is deliberate: an object keyed by specifier would put a
-    // property read on the hot require path, which is what this is removing.
+    // Keep the loaded-record memo local; its hot path validates the record
+    // against require.cache instead of re-entering the path registry.
     let lazy_cache_decls = require_specs
         .iter()
         .zip(import_local_names.iter())
@@ -751,7 +806,7 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
             let resolved = if builtin_requires.contains(spec) || is_watcher_facade(spec) {
                 Some(spec.clone())
             } else {
-                resolved_native_addon(source_path, spec)
+                resolved_native_addon(source_path, spec, native_addon_paths)
                     .map(|(_, logical_id)| logical_id)
                     .or_else(|| {
                         source_path.parent().and_then(|module_dir| {
@@ -760,7 +815,7 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
                             )
                         }).map(|path| path.to_string_lossy().into_owned())
                     })
-                    .or_else(|| perry_hir::is_native_module(spec).then(|| spec.clone()))
+                    .or_else(|| perry_hir::is_native_module_specifier(spec).then(|| spec.clone()))
             }?;
             Some(format!(
                 "        if (specifier === {}) return {};",
@@ -1034,7 +1089,8 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
             // the synthetic require (which uses createRequire for builtins).
             .filter(|(_, spec, _)| {
                 let normalized = spec.strip_prefix("node:").unwrap_or(spec);
-                !perry_hir::is_node_builtin_module(normalized)
+                perry_hir::is_bare_prefix_only_builtin(spec)
+                    || !perry_hir::is_node_builtin_module(normalized)
             })
             .map(|(_, _, range)| range)
             .collect::<Vec<_>>();
@@ -1123,15 +1179,6 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
     } else {
         "__perry_cjs_factory"
     };
-    // Generate the `__perry_cjs_require_is_builtin` switch cases from the
-    // shared `NODE_BUILTIN_MODULES` table so the dynamic/computed `require`
-    // arm stays in sync with `perry_hir::is_node_builtin_module`. The
-    // hardcoded list previously omitted 16 entries (`tls`, `dgram`,
-    // `diagnostics_channel`, `fs/promises`, `inspector`, `repl`,
-    // `stream/web`, `v8`, `vm`, `wasi`, …), so a computed
-    // `require(specifier)` for one of those fell through to compiled-module
-    // resolution and raised `MODULE_NOT_FOUND` instead of routing through
-    // `createRequire`. Each entry emits both the bare and `node:` spelling.
     // #10735: `require.main` must be the process ENTRY module only —
     // `module` there, unequal (or `undefined`, for an ESM entry) everywhere
     // else. `codegen::entry::compile_module_entry` already published a
@@ -1246,21 +1293,10 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
         err.code = code;
         return err;
     }}
-    // Accepts BOTH spellings of every builtin, which is what the switch this
-    // replaced did. `isBuiltin` alone is stricter than the switch: `sea`,
-    // `sqlite`, `test` and `test/reporters` are builtins only in their `node:`
-    // form, so bare `require("sqlite")` stopped resolving — and OpenCode's
-    // dependency graph contains exactly that. wrangler does
-    // `DatabaseSync = __require("sqlite").DatabaseSync` and then
-    // `new DatabaseSync(...)`, which became `new undefined()`.
-    //
-    // Whether Perry should accept the bare spellings at all is a real question,
-    // but it is a SEMANTIC one and does not belong in a performance change.
-    // Behaviour here is byte-for-byte what the switch did; the divergence is
-    // filed separately.
+    // Keep the original spelling: prefix-only builtins are packages when
+    // requested without `node:` (#10410).
     function __perry_cjs_require_is_builtin(specifier) {{
-        return __perry_cjs_is_builtin(specifier)
-            || __perry_cjs_is_builtin('node:' + specifier);
+        return __perry_cjs_is_builtin(specifier);
     }}
     // `isBuiltin` comes from `node:module` instead of a switch emitted into
     // EVERY CommonJS module. The switch carried both spellings of all 58
@@ -1271,6 +1307,18 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
     // accepted the bare spelling too. The runtime predicate agrees with Node
     // 26 on all 58 names in both spellings.
 {lazy_cache_decls}
+    // A path-registry initializer runs once, while deleting require.cache
+    // requests another execution of a loaded CommonJS factory. Allocate this
+    // module-bound loader only on that cold path; ordinary loads keep the
+    // registry and live-record fast paths above.
+    let __perry_cjs_reload_require;
+    function __perry_cjs_refresh_path(path, value) {{
+        const cached = __perry_cjs_base_require.cache[path];
+        if (cached !== undefined) return cached.exports;
+        if (!__perry_has_path_module(path)) return value;
+        if (__perry_cjs_reload_require === undefined) __perry_cjs_reload_require = __perry_cjs_create_require({module_filename_literal});
+        return __perry_cjs_reload_require(path);
+    }}
     function require(specifier) {{
         if (typeof specifier !== 'string') throw __perry_cjs_require_error('type', 'ERR_INVALID_ARG_TYPE', 'The "id" argument must be of type string.');
         if (specifier === '') throw __perry_cjs_require_error('type', 'ERR_INVALID_ARG_VALUE', 'The argument "id" must be a non-empty string.');
@@ -1323,7 +1371,7 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
                 }}
             }}
             const __perry_path_mod = __perry_require_path_module(__perry_path_spec);
-            if (__perry_path_mod !== undefined || __perry_has_path_module(__perry_path_spec)) return __perry_path_mod;
+            if (__perry_path_mod !== undefined || __perry_has_path_module(__perry_path_spec)) return __perry_cjs_refresh_path(__perry_path_spec, __perry_path_mod);
         }}
         // Runtime `require(absolutePath)` of a `.json` file (Next.js loads
         // manifests this way: `require(this.middlewareManifestPath)`). Node's
@@ -1832,3 +1880,11 @@ fn rewrite_safe_buffer_slow_buffer_fallback(source: &str) -> Option<String> {
         None
     }
 }
+
+#[cfg(test)]
+#[path = "cache_invalidation_tests.rs"]
+mod cache_invalidation_tests;
+
+#[cfg(test)]
+#[path = "native_addon_tests.rs"]
+mod native_addon_tests;

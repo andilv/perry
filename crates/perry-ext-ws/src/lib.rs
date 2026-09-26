@@ -215,8 +215,13 @@ static WS_CLIENT_PARENT_SERVER: std::sync::LazyLock<Mutex<HashMap<usize, Handle>
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 static WS_CLIENT_LISTENERS: std::sync::LazyLock<Mutex<HashMap<usize, WsClientListeners>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
-static WS_PENDING_EVENTS: std::sync::LazyLock<Mutex<Vec<PendingWsEvent>>> =
-    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+static WS_PENDING_EVENTS: std::sync::LazyLock<Mutex<std::collections::VecDeque<PendingWsEvent>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::VecDeque::new()));
+/// The `'listening'` / `'open'` events `js_ws_process_pending` is delivering
+/// right now, innermost last. A drain pops each event before running its
+/// listeners, so without this a listener registered *inside* that event's
+/// own callback would find it neither queued nor delivered and replay it.
+static WS_DISPATCHING: Mutex<Vec<ReplayKey>> = Mutex::new(Vec::new());
 
 static WS_ACTIVE_SERVERS: AtomicI32 = AtomicI32::new(0);
 static WS_RUNTIME_HOOKS_REGISTERED: std::sync::Once = std::sync::Once::new();
@@ -290,8 +295,62 @@ fn scan_ws_roots(visitor: &mut GcRootVisitor<'_>) {
     });
 }
 
+/// An event a late-registered listener may be owed a replay of.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ReplayKey {
+    Listening(Handle),
+    Open(usize),
+}
+
+impl ReplayKey {
+    fn of(event: &PendingWsEvent) -> Option<Self> {
+        match event {
+            PendingWsEvent::Listening(handle) => Some(Self::Listening(*handle)),
+            PendingWsEvent::Open(ws_id) => Some(Self::Open(*ws_id)),
+            _ => None,
+        }
+    }
+}
+
+/// Whether the event `key` names has not finished reaching its listeners:
+/// still queued, or being delivered right now. Either way a listener
+/// registered now needs no replay — a queued event will reach it, and Node
+/// does not call a listener added during an emit for that emit.
+fn replay_is_pending(key: ReplayKey) -> bool {
+    WS_DISPATCHING.lock().unwrap().contains(&key)
+        || WS_PENDING_EVENTS
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|ev| ReplayKey::of(ev) == Some(key))
+}
+
+/// Marks one event as being delivered for the life of the guard.
+struct Dispatching(Option<ReplayKey>);
+
+impl Dispatching {
+    fn enter(event: &PendingWsEvent) -> Self {
+        let key = ReplayKey::of(event);
+        if let Some(key) = key {
+            WS_DISPATCHING.lock().unwrap().push(key);
+        }
+        Self(key)
+    }
+}
+
+impl Drop for Dispatching {
+    fn drop(&mut self) {
+        if let Some(key) = self.0 {
+            let mut dispatching = WS_DISPATCHING.lock().unwrap();
+            if let Some(at) = dispatching.iter().rposition(|k| *k == key) {
+                dispatching.remove(at);
+            }
+        }
+    }
+}
+
 fn push_ws_event(ev: PendingWsEvent) {
-    WS_PENDING_EVENTS.lock().unwrap().push(ev);
+    WS_PENDING_EVENTS.lock().unwrap().push_back(ev);
     notify_main_thread();
 }
 
@@ -1030,15 +1089,18 @@ pub unsafe extern "C" fn js_ws_on(
     let is_client = WS_CONNECTIONS.lock().unwrap().contains_key(&ws_id);
     if !is_client {
         if let Some(server) = get_handle_mut::<WsServerHandle>(handle) {
-            // If the server has already bound by the time the user
-            // registers a "listening" handler, re-emit the event so the
-            // late-registered callback fires on the next event-loop pump.
-            // Without this, the accept-loop task races the JS-side `wss.on(
-            // "listening", cb)` registration — `push_ws_event(Listening)`
-            // happens immediately after the bind succeeds, and any pump
-            // tick that drains it before the user's listener registers
-            // discards the event silently.
-            let already_listening = event_name == "listening" && server.is_listening;
+            // If the server has already bound and its `Listening` event has
+            // already been drained, re-emit it so a late-registered callback
+            // fires on the next event-loop pump instead of never.
+            //
+            // Only once drained: the standalone server binds synchronously
+            // and queues `Listening` in its constructor, so a listener
+            // registered in the same tick is reached by that event, and a
+            // replay on top of it fired every `'listening'` listener twice
+            // (#11309).
+            let already_listening = event_name == "listening"
+                && server.is_listening
+                && !replay_is_pending(ReplayKey::Listening(handle));
             server
                 .listeners
                 .entry(event_name)
@@ -1060,7 +1122,8 @@ pub unsafe extern "C" fn js_ws_on(
             .unwrap()
             .get(&ws_id)
             .map(|c| c.is_open)
-            .unwrap_or(false);
+            .unwrap_or(false)
+        && !replay_is_pending(ReplayKey::Open(ws_id));
     let replay_messages = event_name == "message";
     let mut g = WS_CLIENT_LISTENERS.lock().unwrap();
     let entry = g.entry(ws_id).or_insert_with(|| WsClientListeners {
@@ -1289,15 +1352,20 @@ fn payload_value(payload: &WsPayload) -> f64 {
 /// Called by perry-codegen's main-thread event-loop pump.
 #[no_mangle]
 pub extern "C" fn js_ws_process_pending() -> i32 {
-    let events: Vec<PendingWsEvent> = {
-        let mut g = WS_PENDING_EVENTS.lock().unwrap();
-        std::mem::take(&mut *g)
-    };
-    if events.is_empty() {
+    // One event at a time, and only the ones queued before this drain began:
+    // an event a listener queues is delivered on the next tick, as it was when
+    // the whole batch was taken at once. Popping singly is what keeps the rest
+    // of the batch visible to `replay_is_pending` while each listener runs.
+    let batch = WS_PENDING_EVENTS.lock().unwrap().len();
+    if batch == 0 {
         return 0;
     }
     let mut fired = 0;
-    for ev in events {
+    for _ in 0..batch {
+        let Some(ev) = WS_PENDING_EVENTS.lock().unwrap().pop_front() else {
+            break;
+        };
+        let _dispatching = Dispatching::enter(&ev);
         match ev {
             PendingWsEvent::Connection(server_handle, client_id) => {
                 // Match `ws`: clients is current before the user-visible
@@ -1542,328 +1610,4 @@ fn listeners_on_server(handle: Handle, event: &str) -> Vec<i64> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use perry_ffi::{drop_handle, get_handle, register_handle};
-    use std::sync::{Mutex, MutexGuard};
-
-    static GC_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    struct GcTestGuard {
-        frame: u64,
-        previous_force_evacuation: i32,
-        _lock: MutexGuard<'static, ()>,
-    }
-
-    impl GcTestGuard {
-        fn new() -> Self {
-            let lock = GC_TEST_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let previous_force_evacuation =
-                perry_runtime::gc::js_gc_force_evacuation_test_override(1);
-            perry_runtime::gc::js_gc_write_barriers_emitted(1);
-            let frame = perry_runtime::gc::js_shadow_frame_push(0);
-            Self {
-                frame,
-                previous_force_evacuation,
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for GcTestGuard {
-        fn drop(&mut self) {
-            perry_runtime::gc::js_shadow_frame_pop(self.frame);
-            perry_runtime::gc::js_gc_write_barriers_emitted(0);
-            perry_runtime::gc::js_gc_force_evacuation_test_override(self.previous_force_evacuation);
-        }
-    }
-
-    fn young_gc_root() -> i64 {
-        perry_runtime::arena::arena_alloc_gc(32, 8, perry_runtime::gc::GC_TYPE_STRING) as i64
-    }
-
-    fn assert_rewritten(before: i64, after: i64) {
-        assert_ne!(after, before);
-        assert!(perry_runtime::arena::pointer_in_nursery(after as usize));
-    }
-
-    #[test]
-    fn gc_scanner_registration_idempotent() {
-        ensure_runtime_hooks_registered();
-        ensure_runtime_hooks_registered();
-    }
-
-    #[test]
-    fn gc_mutable_scanner_rewrites_client_and_server_listener_roots() {
-        let _guard = GcTestGuard::new();
-        perry_ffi::gc_register_mutable_root_scanner_named("perry-ext-ws", scan_ws_roots);
-
-        let client_id = usize::MAX - 9_001;
-        let client_callback = young_gc_root();
-        WS_CLIENT_LISTENERS.lock().unwrap().insert(
-            client_id,
-            WsClientListeners {
-                listeners: HashMap::from([("message".to_string(), vec![client_callback])]),
-            },
-        );
-
-        let server_callback = young_gc_root();
-        let clients_before = alloc_set(4).bits();
-        let server_handle = register_handle(WsServerHandle {
-            listeners: HashMap::from([("connection".to_string(), vec![server_callback])]),
-            port: 0,
-            host: "0.0.0.0".into(),
-            attached_server: None,
-            no_server: true,
-            is_listening: false,
-            client_ids: Vec::new(),
-            clients_bits: clients_before,
-            listener_id: None,
-        });
-
-        let _ = perry_runtime::gc::gc_collect_minor();
-
-        {
-            let clients = WS_CLIENT_LISTENERS.lock().unwrap();
-            assert_rewritten(client_callback, clients[&client_id].listeners["message"][0]);
-            let server = get_handle::<WsServerHandle>(server_handle)
-                .expect("server handle should remain live");
-            assert_rewritten(server_callback, server.listeners["connection"][0]);
-            assert_ne!(server.clients_bits, clients_before);
-            let clients = JsValue::from_bits(server.clients_bits)
-                .as_pointer::<perry_runtime::set::SetHeader>();
-            assert_eq!(perry_runtime::set::js_set_size(clients), 0);
-        }
-        WS_CLIENT_LISTENERS.lock().unwrap().remove(&client_id);
-        drop_handle(server_handle);
-    }
-
-    /// #9324: the DYNAMIC read must reach the same live `Set` the typed read
-    /// gets. Pre-fix this dispatcher did not exist, every untyped
-    /// `wss.clients` read `undefined`, and iterating it killed the process.
-    #[test]
-    fn handle_property_dispatch_answers_clients_for_an_untyped_read() {
-        let _lock = GC_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let undefined = f64::from_bits(JsValue::UNDEFINED.bits());
-        let server_handle = js_ws_server_new(undefined);
-
-        let mut out = f64::NAN;
-        let handled = unsafe {
-            js_ext_ws_handle_property_dispatch(
-                server_handle,
-                b"clients".as_ptr(),
-                b"clients".len(),
-                &mut out,
-            )
-        };
-        assert_eq!(handled, 1, "the dispatcher must claim `clients`");
-        assert_eq!(
-            out.to_bits(),
-            js_ws_server_clients(server_handle).to_bits(),
-            "the dynamic read must return the SAME Set as the typed read"
-        );
-        let set = JsValue::from_bits(out.to_bits()).as_pointer::<perry_runtime::set::SetHeader>();
-        assert!(!set.is_null());
-        assert_eq!(perry_runtime::set::js_set_size(set), 0);
-
-        // Every other property stays unhandled so the composite dispatcher
-        // falls through to the primary stdlib dispatcher.
-        let mut other = f64::NAN;
-        assert_eq!(
-            unsafe {
-                js_ext_ws_handle_property_dispatch(
-                    server_handle,
-                    b"readyState".as_ptr(),
-                    b"readyState".len(),
-                    &mut other,
-                )
-            },
-            0
-        );
-
-        drop_handle(server_handle);
-
-        // A handle that is no longer a live server must NOT be claimed —
-        // otherwise this arm would shadow whatever id gets recycled into it.
-        let mut dead = f64::NAN;
-        assert_eq!(
-            unsafe {
-                js_ext_ws_handle_property_dispatch(
-                    server_handle,
-                    b"clients".as_ptr(),
-                    b"clients".len(),
-                    &mut dead,
-                )
-            },
-            0
-        );
-    }
-
-    #[test]
-    fn server_clients_is_a_stable_set_that_tracks_connections() {
-        let _lock = GC_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let undefined = f64::from_bits(JsValue::UNDEFINED.bits());
-        let server_handle = js_ws_server_new(undefined);
-
-        let first = js_ws_server_clients(server_handle);
-        let second = js_ws_server_clients(server_handle);
-        assert_eq!(first.to_bits(), second.to_bits());
-        let clients =
-            JsValue::from_bits(first.to_bits()).as_pointer::<perry_runtime::set::SetHeader>();
-        assert!(!clients.is_null());
-        assert_eq!(perry_runtime::set::js_set_size(clients), 0);
-
-        let client_id = register_handle(WsClientHandle) as usize;
-        track_server_client(server_handle, client_id);
-        let clients = JsValue::from_bits(js_ws_server_clients(server_handle).to_bits())
-            .as_pointer::<perry_runtime::set::SetHeader>();
-        assert_eq!(perry_runtime::set::js_set_size(clients), 1);
-        assert_eq!(
-            perry_runtime::set::js_set_has(
-                clients,
-                f64::from_bits(client_js_value(client_id).bits())
-            ),
-            1
-        );
-
-        WS_CLIENT_PARENT_SERVER
-            .lock()
-            .unwrap()
-            .insert(client_id, server_handle);
-        assert_eq!(untrack_server_client(client_id), Some(server_handle));
-        let clients = JsValue::from_bits(js_ws_server_clients(server_handle).to_bits())
-            .as_pointer::<perry_runtime::set::SetHeader>();
-        assert_eq!(perry_runtime::set::js_set_size(clients), 0);
-
-        drop_handle(client_id as i64);
-        drop_handle(server_handle);
-    }
-
-    #[test]
-    fn has_pending_returns_zero_with_no_state() {
-        // May be non-zero if a prior test left state behind, but
-        // process_pending drains it.
-        let _ = js_ws_process_pending();
-        // No active servers, no pending events, no open connections.
-        // (We can't fully clean state across tests since these are
-        // process-globals; assert non-negative as the minimal sanity
-        // check.)
-        let v = js_ws_has_pending();
-        assert!(v >= 0);
-    }
-
-    #[test]
-    fn handle_to_i64_strips_pointer_tag() {
-        let raw_ptr: u64 = 0x1234_5678_9abc;
-        let nan_boxed = f64::from_bits(POINTER_TAG | raw_ptr);
-        assert_eq!(js_ws_handle_to_i64(nan_boxed), raw_ptr as i64);
-
-        let plain = 42.0_f64;
-        assert_eq!(js_ws_handle_to_i64(plain), 42);
-    }
-
-    #[test]
-    fn client_handles_do_not_alias_registered_servers() {
-        let server = js_ws_server_new(f64::from_bits(JsValue::UNDEFINED.bits()));
-        let client = register_handle(WsClientHandle);
-        assert_ne!(server, client);
-        assert!(get_handle_mut::<WsServerHandle>(client).is_none());
-        assert!(get_handle_mut::<WsClientHandle>(server).is_none());
-        assert_eq!(
-            decode_client_id(f64::from_bits(client_js_value(client as usize).bits())),
-            client as usize
-        );
-        assert_eq!(decode_client_id(client as f64), client as usize);
-        perry_ffi::drop_handle(client);
-        perry_ffi::drop_handle(server);
-    }
-
-    /// The event-loop keepalive predicate, on constructed connections rather
-    /// than the process-global map so it cannot race another test.
-    ///
-    /// The third case is the regression: a refused `new WebSocket(url)` leaves
-    /// the transport `Connecting` for ever (nothing ever attaches), so a
-    /// predicate that asked only about the transport would report the process
-    /// live until it was killed.
-    #[test]
-    fn keepalive_counts_connecting_clients_but_not_failed_ones() {
-        let connection = |transport, is_open, is_closed| WsConnection {
-            transport,
-            messages: Vec::new(),
-            is_open,
-            is_closing: false,
-            is_closed,
-        };
-        assert!(
-            connection_is_live(&connection(
-                WsTransport::Connecting(Vec::new()),
-                false,
-                false
-            )),
-            "a handshake in flight keeps the loop alive"
-        );
-        assert!(
-            connection_is_live(&connection(WsTransport::Turnloop(1), true, false)),
-            "an open connection keeps the loop alive"
-        );
-        assert!(
-            !connection_is_live(&connection(
-                WsTransport::Connecting(Vec::new()),
-                false,
-                true
-            )),
-            "a FAILED connect must not keep the loop alive for ever"
-        );
-        assert!(
-            !connection_is_live(&connection(WsTransport::Turnloop(1), false, true)),
-            "a closed connection must not keep the loop alive"
-        );
-    }
-
-    /// #6117 — `readyState` walks the npm-ws lifecycle: CONNECTING (0)
-    /// pre-open, OPEN (1), CLOSING (2) after `close()` is requested,
-    /// CLOSED (3) once the IO loop marks the connection dead, and CLOSED
-    /// for ids with no entry (cleaned up, or promise-path connect failed).
-    /// Uses an id far outside anything other tests insert, so no lock.
-    #[test]
-    fn ready_state_reports_npm_ws_lifecycle() {
-        let ws_id = 990_077usize;
-        WS_CONNECTIONS.lock().unwrap().insert(
-            ws_id,
-            WsConnection {
-                // CONNECTING is a real transport state now rather than a
-                // channel with nothing on the other end: a `close()` here is
-                // queued, which is exactly what the assertions below check
-                // does not disturb `readyState`.
-                transport: WsTransport::Connecting(Vec::new()),
-                messages: Vec::new(),
-                is_open: false,
-                is_closing: false,
-                is_closed: false,
-            },
-        );
-
-        assert_eq!(js_ws_ready_state(ws_id as i64), 0.0);
-        WS_CONNECTIONS
-            .lock()
-            .unwrap()
-            .get_mut(&ws_id)
-            .unwrap()
-            .is_open = true;
-        assert_eq!(js_ws_ready_state(ws_id as i64), 1.0);
-        js_ws_close(ws_id as i64);
-        assert_eq!(js_ws_ready_state(ws_id as i64), 2.0);
-        if let Some(c) = WS_CONNECTIONS.lock().unwrap().get_mut(&ws_id) {
-            c.is_closed = true;
-        }
-        assert_eq!(js_ws_ready_state(ws_id as i64), 3.0);
-        WS_CONNECTIONS.lock().unwrap().remove(&ws_id);
-        assert_eq!(js_ws_ready_state(ws_id as i64), 3.0);
-    }
-}
+mod tests;

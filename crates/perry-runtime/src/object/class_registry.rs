@@ -18,13 +18,14 @@
 
 pub use super::class_handles::{
     event_emitter_async_resource_dispatch, event_emitter_async_resource_handle_probe,
-    event_emitter_get_domain, event_emitter_handle_probe, event_emitter_on,
-    event_emitter_set_domain, fetch_handle_kind_probe, handle_method_dispatch,
-    handle_own_property_names_dispatch, handle_property_dispatch, handle_property_set_dispatch,
-    handle_prototype_dispatch, http_agent_handle_probe,
-    js_register_event_emitter_async_resource_dispatch,
+    event_emitter_get_domain, event_emitter_handle_probe, event_emitter_method_dispatch,
+    event_emitter_on, event_emitter_property_dispatch, event_emitter_set_domain,
+    fetch_handle_kind_probe, handle_method_dispatch, handle_own_property_names_dispatch,
+    handle_property_dispatch, handle_property_set_dispatch, handle_prototype_dispatch,
+    http_agent_handle_probe, js_register_event_emitter_async_resource_dispatch,
     js_register_event_emitter_async_resource_handle_probe, js_register_event_emitter_get_domain,
-    js_register_event_emitter_handle_probe, js_register_event_emitter_on,
+    js_register_event_emitter_handle_probe, js_register_event_emitter_method_dispatch,
+    js_register_event_emitter_on, js_register_event_emitter_property_dispatch,
     js_register_event_emitter_set_domain, js_register_fetch_handle_kind_probe,
     js_register_handle_method_dispatch, js_register_handle_own_property_names_dispatch,
     js_register_handle_property_dispatch, js_register_handle_property_set_dispatch,
@@ -106,8 +107,8 @@ pub use state::{
 
 // ── prototype_objects.rs ────────────────────────────────────────────────────
 pub(crate) use prototype_objects::{
-    alloc_synthetic_class_id, class_prototype_object, ensure_function_prototype_object,
-    function_class_id, function_value_for_class_id, proto_chain_symbol_slot,
+    class_prototype_object, ensure_function_prototype_object, function_class_id,
+    function_value_for_class_id, instance_class_prototype_object, object_proto_chain_symbol_slot,
     resolve_proto_chain_field, resolve_proto_chain_field_with_receiver, resolve_proto_chain_symbol,
     synthetic_class_prototype_object, SYNTHETIC_CLASS_ID_BASE,
 };

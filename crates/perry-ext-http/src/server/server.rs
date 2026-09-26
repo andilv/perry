@@ -14,7 +14,7 @@ use perry_ffi::{
 };
 
 use crate::server::ensure_gc_scanner_registered;
-use crate::server::request::{emit_no_arg_to_listeners, handle_to_pointer_f64, with_implicit_this};
+use crate::server::request::{handle_to_pointer_f64, with_implicit_this};
 use crate::server::response::{ResponseShape, ServerResponse};
 use crate::server::types::{
     extract_host, extract_port, js_handle_clear_side_tables, js_promise_run_microtasks,
@@ -233,13 +233,14 @@ pub struct HttpPendingUpgrade {
     pub head: Vec<u8>,
 }
 
-/// Server handles whose accept loop saw a new connection since the last
-/// pump tick. Drained by `js_node_http_server_process_pending` to fire
-/// `'connection'` listeners on the main thread (#4905). Node passes the
-/// socket as the listener argument; we don't model a net.Socket for
-/// these connections yet, so listeners fire with no args — enough for
-/// the canonical connection-counting idiom.
-pub(crate) static PENDING_CONNECTION_EVENTS: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+/// `(server_handle, socket_handle)` pairs whose accept loop saw a new
+/// connection since the last pump tick. Drained by
+/// `js_node_http_server_process_pending` to fire `'connection'` listeners on
+/// the main thread (#4905). `socket_handle` is the connection's identity
+/// (`crate::server::request::alloc_connection_socket`): the `IncomingMessage`-shaped object Node passes as the
+/// listener's argument and that every request on the connection shares as
+/// `req.socket`.
+pub(crate) static PENDING_CONNECTION_EVENTS: Mutex<Vec<(i64, i64)>> = Mutex::new(Vec::new());
 
 /// Read the `HttpServer` behind a JS server handle, whichever flavour it is.
 ///
@@ -256,6 +257,22 @@ pub(crate) fn with_base_server<R>(handle: i64, f: impl FnOnce(&HttpServer) -> R)
     }
     get_handle::<crate::server::http2_server::Http2SecureServer>(handle)
         .map(|server| f(&server.base))
+}
+
+/// Mutate the same base server used by connection admission. The callback must
+/// finish before invoking JS, which can re-enter or close the server.
+pub(crate) fn with_base_server_mut<R>(
+    handle: i64,
+    f: impl FnOnce(&mut HttpServer) -> R,
+) -> Option<R> {
+    if let Some(server) = get_handle_mut::<HttpServer>(handle) {
+        return Some(f(server));
+    }
+    if let Some(server) = get_handle_mut::<crate::server::https_server::HttpsServer>(handle) {
+        return Some(f(&mut server.base));
+    }
+    get_handle_mut::<crate::server::http2_server::Http2SecureServer>(handle)
+        .map(|server| f(&mut server.base))
 }
 
 pub(crate) static TURNLOOP_UPGRADES: Mutex<std::collections::VecDeque<HttpPendingUpgrade>> =
@@ -1082,11 +1099,11 @@ pub extern "C" fn js_node_http_server_process_pending() -> i32 {
     // #4905 — fire `'connection'` listeners for connections accepted since
     // the last tick, before their requests are dispatched (Node fires
     // `'connection'` ahead of `'request'`).
-    let connection_events: Vec<i64> = PENDING_CONNECTION_EVENTS
+    let connection_events: Vec<(i64, i64)> = PENDING_CONNECTION_EVENTS
         .lock()
         .map(|mut q| q.drain(..).collect())
         .unwrap_or_default();
-    for server_handle in connection_events {
+    for (server_handle, socket_handle) in connection_events {
         // The handle may back an HttpServer or an HttpsServer (whose
         // accept loop pushes here too since #4971) — probe both.
         let listeners = get_handle_mut::<HttpServer>(server_handle)
@@ -1100,7 +1117,19 @@ pub extern "C" fn js_node_http_server_process_pending() -> i32 {
             continue;
         }
         let this_val = handle_to_pointer_f64(server_handle);
-        with_implicit_this(this_val, || emit_no_arg_to_listeners(&listeners));
+        let socket_val = handle_to_pointer_f64(socket_handle);
+        with_implicit_this(this_val, || {
+            crate::server::request::emit_one_arg_to_listeners(&listeners, socket_val)
+        });
+        count += 1;
+    }
+
+    // Fire `'close'` on every connection
+    // socket whose TCP connection fully closed since the last tick — before
+    // this tick's server `'close'` callback below (`drain_deferred_close_for`),
+    // matching Node's ordering.
+    for socket_handle in crate::server::turnloop_serve::take_closed_sockets() {
+        crate::server::request::close_incoming_message(socket_handle);
         count += 1;
     }
 
@@ -1177,7 +1206,7 @@ pub extern "C" fn js_node_http_server_process_pending() -> i32 {
 
     // #5010 — drain perry-ext-net's own pending-event queue. A raw
     // `'upgrade'` (#4973) hands the listener a real `net.Socket` adopted into
-    // perry-ext-net (`adopt_upgraded_tcp_stream`); when user code destroys it,
+    // perry-ext-net (`adopt_turnloop_upgrade`); when user code destroys it,
     // the socket task queues a `Close` event in perry-ext-net's queue. For an
     // http-only program perry-stdlib runs with its OWN bundled net (so its
     // `external-net-pump` arm is OFF and never touches ext-net's queue), and
@@ -1214,12 +1243,17 @@ fn drain_upgrades(server_handle: i64) -> i32 {
             // extensions + GC scanner are registered on the main thread before
             // user code touches the socket.
             perry_ext_net::ensure_adopted_socket_dispatch();
-            crate::server::upgrade::fire_upgrade_listeners(
+            if !crate::server::upgrade::fire_upgrade_listeners(
                 up.server_handle,
                 up.request_handle,
                 up.raw_socket_id,
                 up.head,
-            );
+            ) {
+                // Listeners may disappear between connection admission and
+                // delivery. Nobody owns this raw upgrade in that case.
+                perry_ext_net::js_ext_net_destroy_socket(up.raw_socket_id);
+                perry_ffi::drop_handle(up.request_handle);
+            }
         } else {
             perry_ext_ws::accept_attached_connection(
                 up.server_handle,
@@ -1480,3 +1514,7 @@ fn _force_promise_link(p: *mut Promise) -> i32 {
 fn _force_tag_link() -> u64 {
     TAG_NULL | (POINTER_TAG & PTR_MASK)
 }
+
+#[cfg(test)]
+#[path = "server/upgrade_tests.rs"]
+mod upgrade_tests;

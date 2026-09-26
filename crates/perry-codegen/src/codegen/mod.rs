@@ -213,6 +213,8 @@ mod hoisted_callback_method_tests;
 #[cfg(test)]
 mod index_method_clone_tests;
 mod indexed_method_artifacts;
+#[cfg(test)]
+mod literal_method_this_tests;
 mod ordinary_method_artifacts;
 mod tdz_names;
 // `pub(crate)` so `crate::linker` can read the inline-hot-small policy
@@ -1209,14 +1211,6 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             I32,
             "0",
         );
-        // The poisonable twin of the ShapeId global: same value, same linkage,
-        // but only ever COMPARED against — see
-        // `typed_shape::guard_shape_global_name_from_keys_global`.
-        llmod.add_global(
-            &crate::typed_shape::guard_shape_global_name_from_keys_global(&global_name),
-            I32,
-            "0",
-        );
         // #8122: the inline-`new` header image, composed at module init
         // (`string_pool.rs`) for the classes `class_header_images` admits.
         llmod.add_internal_module_state_global(
@@ -1409,11 +1403,6 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         llmod.add_internal_module_state_global(&global_name, I64, "0");
         llmod.add_internal_module_state_global(
             &crate::typed_shape::shape_id_global_name_from_keys_global(&global_name),
-            I32,
-            "0",
-        );
-        llmod.add_internal_global(
-            &crate::typed_shape::guard_shape_global_name_from_keys_global(&global_name),
             I32,
             "0",
         );
@@ -2470,6 +2459,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         async_step_closures: hir.async_step_closures.iter().copied().collect(),
         module_global_proven_types: std::collections::HashMap::new(),
         funcs_reading_dynamic_this,
+        literal_method_home_classes: crate::collectors::literal_method_home_classes(hir),
         type_aliases: opts.type_aliases,
         imported_func_param_counts: opts.imported_func_param_counts,
         import_function_origin_names: opts.import_function_origin_names.clone(),
@@ -2714,7 +2704,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         // Per-module local-name → import-source map. Walks `hir.imports`
         // and records every named/default import binding's source spec.
         // `lower_builtin_new` consults this to gate ambiguously-named
-        // built-in arms (Client / Pool / Database / MongoClient /
+        // built-in arms (Client / Pool / Database /
         // Decimal) on the import source — `import Client from
         // "better-sqlite3"` should not dispatch through pg's Client arm.
         // See issue #602.

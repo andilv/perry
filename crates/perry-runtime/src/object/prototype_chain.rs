@@ -396,6 +396,7 @@ enum PrototypeLinkKind {
     ClassEvaluation,
     RuntimeWiring,
     UserOverride,
+    FreshObject,
 }
 
 /// Record runtime prototype wiring while preserving the loud setter's cache
@@ -433,9 +434,19 @@ pub(crate) fn object_link_class_evaluation_prototype(obj_ptr: usize, proto_bits:
     object_set_static_prototype_impl(obj_ptr, proto_bits, PrototypeLinkKind::ClassEvaluation)
 }
 
+/// Install Object.create's individual chain before the object escapes. It
+/// needs the user-override dispatch guards, but cannot invalidate any existing
+/// receiver's store plans or element-shape proofs.
+pub(crate) fn object_link_created_prototype(obj_ptr: usize, proto_bits: u64) {
+    object_set_static_prototype_impl(obj_ptr, proto_bits, PrototypeLinkKind::FreshObject)
+}
+
 fn object_set_static_prototype_impl(obj_ptr: usize, proto_bits: u64, link_kind: PrototypeLinkKind) {
     let prototype_diverged = link_kind != PrototypeLinkKind::ClassDefault;
-    let user_override = link_kind == PrototypeLinkKind::UserOverride;
+    let user_override = matches!(
+        link_kind,
+        PrototypeLinkKind::UserOverride | PrototypeLinkKind::FreshObject
+    );
     if obj_ptr == 0 {
         return;
     }
@@ -450,18 +461,24 @@ fn object_set_static_prototype_impl(obj_ptr: usize, proto_bits: u64, link_kind: 
     // from the meta pointer AFTER the mark's allocation, and it is carried as a
     // plain u64 to the divergence below rather than re-read through a pointer
     // that allocation may have moved.
-    let prototype_serial: Option<u64> = unsafe {
-        let prototype = crate::value::JSValue::from_bits(proto_bits);
-        if prototype.is_pointer() {
-            crate::object::proto_validity::mark_object_as_prototype(
-                prototype.as_pointer::<crate::ObjectHeader>() as usize,
-            )
-        } else if proto_bits == crate::value::TAG_NULL {
-            Some(crate::object::proto_validity::NULL_PROTOTYPE_SERIAL)
-        } else {
-            None
-        }
-    };
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let owner_handle = scope.root_raw_mut_ptr(obj_ptr as *mut u8);
+    let prototype_handle = scope.root_heap_word_u64(proto_bits);
+    let (prototype_serial, obj_ptr): (Option<u64>, *mut u8) =
+        owner_handle.across_mut::<u8, _>(|| unsafe {
+            let prototype = crate::value::JSValue::from_bits(proto_bits);
+            if prototype.is_pointer() {
+                crate::object::proto_validity::mark_object_as_prototype(
+                    prototype.as_pointer::<crate::ObjectHeader>() as usize,
+                )
+            } else if proto_bits == crate::value::TAG_NULL {
+                Some(crate::object::proto_validity::NULL_PROTOTYPE_SERIAL)
+            } else {
+                None
+            }
+        });
+    let obj_ptr = obj_ptr as usize;
+    let proto_bits = prototype_handle.get_heap_word_u64();
     if !ARRAY_TARGET_PROTO_RECORDED.load(Ordering::Relaxed)
         && obj_ptr >= crate::gc::GC_HEADER_SIZE + 0x1000
         && crate::value::addr_class::is_above_handle_band(obj_ptr)
@@ -528,27 +545,26 @@ fn object_set_static_prototype_impl(obj_ptr: usize, proto_bits: u64, link_kind: 
                 &(*meta).prototype as *const u64 as usize,
                 proto_bits,
             );
+            #[cfg(feature = "shape-mint-diag")]
             if prototype_diverged {
-                #[cfg(feature = "shape-mint-diag")]
                 crate::object::shape_mint_census::note_proto_divergence(
                     crate::object::shapes::object_shape_stamp(obj),
                     proto_bits,
                 );
-                // A prototype without a serial (not a meta-capable object) keeps
-                // the unique-generation transition: correct, just unmerged.
-                match prototype_serial {
-                    Some(serial) => {
-                        crate::object::shapes::transition_object_shape_semantics_for_prototype(
-                            obj,
-                            serial,
-                            link_kind as u8,
-                        );
-                    }
-                    None => {
-                        crate::object::shapes::transition_object_shape_semantics(obj);
-                    }
-                }
             }
+            // The [[Prototype]] is a SHAPE fact, for every link kind: the
+            // receiver moves to the shape naming its new prototype. A class-
+            // default link is not exempt — `F.prototype = other` followed by
+            // `new F()` otherwise leaves old and new instances on one shape
+            // over two chains. Same predecessor + same prototype reaches the
+            // same shape, so construction shares shapes as before. A
+            // prototype with no serial (a function, array or typed array)
+            // gets an identity of its own.
+            let proto_id = match prototype_serial {
+                Some(_) => crate::object::shapes::object_proto_id(obj),
+                None => crate::object::shapes::fresh_unique_proto_id(),
+            };
+            crate::object::shapes::transition_object_shape_prototype(obj, proto_id);
             return;
         }
     }

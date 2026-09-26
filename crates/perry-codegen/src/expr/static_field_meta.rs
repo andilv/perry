@@ -156,8 +156,11 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // side-effect-free capture loads — no user code runs inside it.
             ctx.block().call_void("js_tdz_suppress_begin", &[]);
             let mut lowered: Vec<String> = Vec::with_capacity(captures.len());
-            for c in captures {
-                lowered.push(lower_expr(ctx, c)?);
+            for (index, c) in captures.iter().enumerate() {
+                let v = lower_expr(ctx, c)?;
+                // A class-environment class's evaluation publishes here too.
+                super::class_env::store_class_env_slot(ctx, class_name, index as u32, &v, c);
+                lowered.push(v);
             }
             ctx.block().call_void("js_tdz_suppress_end", &[]);
             if let Some(&class_id) = ctx.class_ids.get(class_name) {
@@ -198,12 +201,22 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         Expr::RefreshClassExprCaptures {
             class_value,
             captures,
+            env_class,
         } => {
             let cap_len = captures.len().to_string();
             let mut caps_arr = ctx.block().call(I64, "js_array_alloc", &[(I32, &cap_len)]);
             ctx.block().call_void("js_tdz_suppress_begin", &[]);
-            for capture in captures {
+            for (index, capture) in captures.iter().enumerate() {
                 let value = lower_expr(ctx, capture)?;
+                if let Some(env_class) = env_class {
+                    super::class_env::store_class_env_slot(
+                        ctx,
+                        env_class,
+                        index as u32,
+                        &value,
+                        capture,
+                    );
+                }
                 caps_arr = ctx.block().call(
                     I64,
                     "js_array_push_f64",
@@ -215,6 +228,15 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // Lower after the allocating array operations so a movable class
             // object is reloaded from its compiler-private rooted local.
             let owner = lower_expr(ctx, class_value)?;
+            if let Some(env_class) = env_class {
+                super::class_env::publish_guarded(
+                    ctx,
+                    env_class,
+                    "js_class_env_refresh",
+                    &owner,
+                    &caps_box,
+                );
+            }
             let key_idx = ctx.strings.intern("__perry_ctor_caps");
             let key_handle_global = format!("@{}", ctx.strings.entry(key_idx).handle_global);
             let key_box = ctx.block().load(DOUBLE, &key_handle_global);
@@ -630,8 +652,18 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         protect_caps,
                         |ctx, acc| {
                             ctx.block().call_void("js_tdz_suppress_begin", &[]);
-                            for arg in captured_args {
+                            for (index, arg) in captured_args.iter().enumerate() {
                                 let v = lower_expr(ctx, arg)?;
+                                // The evaluation publishes a class-environment
+                                // class's slots before any static initializer
+                                // or member can read them.
+                                super::class_env::store_class_env_slot(
+                                    ctx,
+                                    template,
+                                    index as u32,
+                                    &v,
+                                    arg,
+                                );
                                 acc.advance(ctx, "js_array_push_f64", &[Arg::Plain(DOUBLE, &v)]);
                             }
                             ctx.block().call_void("js_tdz_suppress_end", &[]);
@@ -652,6 +684,17 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     blk.call_void(
                         "js_object_set_field_by_name",
                         &[(I64, &obj), (I64, &key_raw), (DOUBLE, &caps_box)],
+                    );
+                    // A guarded class environment learns this evaluation; the
+                    // first one publishes its captures into the slots.
+                    let obj = group.reread_emitted(ctx, rooted);
+                    let obj_box = nanbox_pointer_inline(ctx.block(), &obj);
+                    super::class_env::publish_guarded(
+                        ctx,
+                        template,
+                        "js_class_env_evaluate",
+                        &obj_box,
+                        &caps_box,
                     );
                 }
                 // Static fields and blocks execute only after every computed

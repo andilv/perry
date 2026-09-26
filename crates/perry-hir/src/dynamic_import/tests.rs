@@ -731,6 +731,7 @@ fn worker_new_visitor_descends_into_closure_bodies() {
         params: vec![],
         return_type: Type::Void,
         body: vec![Stmt::Expr(Expr::WorkerNew {
+            partial: false,
             paths: vec![],
             filename: Box::new(Expr::String("./worker.js".to_string())),
             options: None,
@@ -1226,6 +1227,67 @@ fn flatten_explicit_reexport_through_export_all_reaches_ultimate_owner() {
     assert_eq!(flat[1].name, "null");
     assert_eq!(flat[1].source_module, "leaf");
     assert_eq!(flat[1].source_local, "_null");
+}
+
+#[test]
+fn flatten_export_all_ignores_private_same_named_binding() {
+    // `export *` forwards only a source's exports. A private `foo` in one star
+    // source must not make the exported `foo` of another star source ambiguous;
+    // pre-fix the walk returned `None` and named the pure barrel as owner, whose
+    // `perry_fn_barrel__foo` getter is never emitted (link error, zod 4.6.5).
+    let real = module_defining_fn("real", "foo");
+    let mut shadow = module_defining_fn("shadow", "foo");
+    shadow.exports.clear();
+    let mut barrel = Module::new("barrel");
+    for source in ["real", "shadow"] {
+        barrel.exports.push(Export::ExportAll {
+            source: source.into(),
+        });
+    }
+    let mut bridge = Module::new("bridge");
+    bridge.exports.push(Export::ReExport {
+        source: "barrel".into(),
+        imported: "foo".into(),
+        exported: "foo".into(),
+    });
+    let map = std::collections::HashMap::from([
+        ("real".to_string(), real),
+        ("shadow".to_string(), shadow),
+        ("barrel".to_string(), barrel),
+        ("bridge".to_string(), bridge),
+    ]);
+    let lookup = |s: &str| map.get(s);
+    let flat = flatten_exports("bridge", &lookup);
+    assert_eq!(flat.len(), 1);
+    assert_eq!(flat[0].source_module, "real");
+    assert_eq!(flat[0].source_local, "foo");
+}
+
+#[test]
+fn flatten_reexport_skips_private_binding_of_star_forwarder() {
+    // `shadow` has a private `foo` and `export * from "./real"`, so its export
+    // `foo` is real's. The private body must not answer the export lookup.
+    let real = module_defining_fn("real", "foo");
+    let mut shadow = module_defining_fn("shadow", "foo");
+    shadow.exports = vec![Export::ExportAll {
+        source: "real".into(),
+    }];
+    let mut bridge = Module::new("bridge");
+    bridge.exports.push(Export::ReExport {
+        source: "shadow".into(),
+        imported: "foo".into(),
+        exported: "foo".into(),
+    });
+    let map = std::collections::HashMap::from([
+        ("real".to_string(), real),
+        ("shadow".to_string(), shadow),
+        ("bridge".to_string(), bridge),
+    ]);
+    let lookup = |s: &str| map.get(s);
+    let flat = flatten_exports("bridge", &lookup);
+    assert_eq!(flat.len(), 1);
+    assert_eq!(flat[0].source_module, "real");
+    assert_eq!(flat[0].source_local, "foo");
 }
 
 #[test]

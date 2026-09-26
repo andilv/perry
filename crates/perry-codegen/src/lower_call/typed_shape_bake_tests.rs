@@ -578,7 +578,7 @@ fn imported_pointer_layout_does_not_invent_a_consumer_typed_shape_id() {
     let ir =
         String::from_utf8(compile_module(&module, opts).unwrap()).expect("LLVM IR should be UTF-8");
     assert!(
-        ir.contains("call i32 @js_object_shape_id_for_keys("),
+        ir.contains("call i32 @js_object_shape_id_for_class_keys("),
         "the consumer must share the producer's canonical structural ShapeId:\n{ir}"
     );
     assert!(
@@ -685,10 +685,8 @@ fn imported_stub_registers_its_shape_slots_for_the_defining_modules_typed_id() {
             && call.contains("i32 55,"),
         "registration must name the stub's keys and ShapeId globals and its class id:\n{call}"
     );
-    // The stub seeds TWO globals before registering — its ShapeId and the
-    // poisonable guard expectation twinned with it — so look for the ShapeId
-    // store by name rather than taking whichever `store i32` happens to be
-    // last.
+    // Look for the ShapeId store by name rather than taking whichever
+    // `store i32` happens to be last.
     assert!(
         ir[..register_at]
             .rfind("@perry_class_shape_id_")
@@ -696,10 +694,11 @@ fn imported_stub_registers_its_shape_slots_for_the_defining_modules_typed_id() {
                 || ir[..at].rfind("store i32 ").is_some()),
         "the slot is registered after this module stored its own id:\n{ir}"
     );
+    // S6: there is no poisonable guard twin to seed or register any more; the
+    // class-field guards compare against the ShapeId global itself.
     assert!(
-        ir[..register_at].contains("@perry_class_guard_shape_"),
-        "the guard expectation must be seeded before registration too, or an \
-         imported class guards against a stale value forever:\n{ir}"
+        !ir.contains("perry_class_guard_shape_"),
+        "no poisonable guard expectation may be emitted:\n{ir}"
     );
 
     let mut dylib = ir_opts();

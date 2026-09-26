@@ -47,7 +47,7 @@ fn header(value: f64) -> *mut crate::gc::GcHeader {
 /// One store through the miss entry with a fresh site; returns the word.
 fn store_fresh(target: f64, key: *const crate::StringHeader, value: f64) -> (f64, u64) {
     let packed = AtomicU64::new(PACKED_SET_EMPTY);
-    let mut cache: PackedSetWays = [PACKED_SET_EMPTY; PACKED_SET_WAYS];
+    let mut cache: PackedSetWays = packed_set_cache_empty();
     let mut cache_slot: PackedSetWaysSlot = &mut cache;
     let stored = js_put_value_set_packed_miss(target, key, value, 0, &mut cache_slot, &packed);
     (stored, packed.load(Ordering::Relaxed))
@@ -62,10 +62,10 @@ fn packed_set_empty_matches_codegen() {
     // It must be unmatchable by any receiver's `+4` word: above the ShapeId
     // range, and `u32::MAX` is reserved as a never-allocated class id.
     assert!(PACKED_SET_EMPTY as u32 >= crate::object::shapes::SHAPE_ID_END);
-    assert_eq!(
-        PACKED_SET_EMPTY as u32,
-        crate::object::CLASS_GUARD_SHAPE_POISON
-    );
+    assert_eq!(PACKED_SET_EMPTY as u32, u32::MAX);
+    assert!(!crate::object::shapes::is_site_matchable_shape_id(
+        PACKED_SET_EMPTY as u32
+    ));
 }
 
 #[test]
@@ -267,7 +267,7 @@ fn a_second_shape_is_kept_in_the_ways_without_moving_the_word() {
     let second = parsed(br#"{"n":2,"z":0}"#);
     assert_ne!(stamp(first), stamp(second));
     let packed = AtomicU64::new(PACKED_SET_EMPTY);
-    let mut cache: PackedSetWays = [PACKED_SET_EMPTY; PACKED_SET_WAYS];
+    let mut cache: PackedSetWays = packed_set_cache_empty();
     let mut cache_slot: PackedSetWaysSlot = &mut cache;
     js_put_value_set_packed_miss(first, key, 1.0, 0, &mut cache_slot, &packed);
     js_put_value_set_packed_miss(second, key, 2.0, 0, &mut cache_slot, &packed);
@@ -314,9 +314,15 @@ fn a_fresh_way_cache_is_born_empty_not_zero() {
     assert!(!slot.is_null(), "the first prime allocates the way cache");
     let ways = unsafe { &*slot };
     assert_eq!(ways[0] as u32, stamp(target));
-    for (i, w) in ways.iter().enumerate().skip(1) {
+    for (i, w) in ways[..PACKED_SET_WAYS].iter().enumerate().skip(1) {
         assert_eq!(*w, PACKED_SET_EMPTY, "way {i} must be born EMPTY");
     }
+    // The chain-entry word after the ways is a pointer word, not a way: it is
+    // born 0 (no entry), and no emitted compare reads it.
+    assert_eq!(
+        ways[PACKED_SET_CHAIN_WORD], 0,
+        "the chain word is born empty"
+    );
 }
 
 #[test]
@@ -406,4 +412,85 @@ fn a_non_interned_key_publishes_by_content() {
         "a non-interned key must still publish"
     );
     assert_eq!(word >> 32, 1);
+}
+
+/// A static-key store that ADDS a key to a class instance misses into this
+/// entry on every call (the emitted hit only serves existing own slots), so
+/// this is where the inherited-access chain verdict must run. Since #11241 no
+/// static-key store reaches the write-PIC miss entries at all: a verdict wired
+/// only there fires zero times while every trap test stays green. Asserts the
+/// verdict is primed on THIS site and then serves the later stores.
+#[test]
+fn a_key_adding_static_store_is_served_by_the_chain_verdict() {
+    const CID: u32 = 0x0004_2217;
+    let first = interned(b"chainPackedFirst");
+    let added = interned(b"chainPackedAdded");
+    let mut first_cache: PackedSetWays = packed_set_cache_empty();
+    let mut first_slot: PackedSetWaysSlot = &mut first_cache;
+    let first_packed = AtomicU64::new(PACKED_SET_EMPTY);
+    let mut cache: PackedSetWays = packed_set_cache_empty();
+    let mut cache_slot: PackedSetWaysSlot = &mut cache;
+    let packed = AtomicU64::new(PACKED_SET_EMPTY);
+    // A class with a prototype object, as a compiled class has: the verdict
+    // walks (and marks) the chain it proves clear, so a class with no
+    // prototype to walk is refused.
+    let proto = crate::object::js_object_alloc(0, 4);
+    crate::object::class_prototype_object_root_store(CID, proto);
+    let before = crate::object::chain_store::chain_store_hits_this_thread();
+    const STORES: u64 = 6;
+    for i in 0..STORES {
+        let obj = crate::object::js_object_alloc(CID, 0);
+        let target = f64::from_bits(crate::value::js_nanbox_pointer(obj as i64).to_bits());
+        // One key first, so the receiver the chain-verdict site sees carries a
+        // real ShapeId, as a constructor's receiver does.
+        js_put_value_set_packed_miss(target, first, 1.0, 0, &mut first_slot, &first_packed);
+        js_put_value_set_packed_miss(target, added, i as f64, 0, &mut cache_slot, &packed);
+        let read = crate::object::js_object_get_field_by_name_f64(obj, added);
+        assert_eq!(read, i as f64, "the added key holds the stored value");
+    }
+    assert_ne!(
+        cache[PACKED_SET_CHAIN_WORD],
+        0,
+        "the site primed a chain verdict in its own cache: {}",
+        crate::object::chain_store::chain_store_counters_for_test()
+    );
+    let served = crate::object::chain_store::chain_store_hits_this_thread() - before;
+    assert!(
+        served >= STORES - 1,
+        "every store after the prime is served by the chain verdict: {served} of {STORES}"
+    );
+}
+
+/// S6 on the store side: a dictionary-mode receiver must never publish a store
+/// site word. Its ShapeId survives appends and in-place deletes, so no
+/// `(ShapeId, slot)` is a fact of that id. The control is the same receiver
+/// before the latch, which does publish. Two independent facts refuse it: the
+/// dictionary shape publishes no key list (so the prime finds no slot), and the
+/// prime admits only a matchable ShapeId. This pins the outcome; it goes red
+/// only if BOTH are removed, which is why the band check is not the only
+/// guard here.
+#[test]
+fn a_dictionary_receiver_never_publishes_a_store_site_word() {
+    let _lock = crate::gc::global_side_table_test_lock();
+    let _no_gc = crate::gc::GcSuppressScope::new();
+    let target = parsed(SRC);
+    let key = interned(b"n");
+    let (_, word) = store_fresh(target, key, 7.0);
+    assert_eq!(
+        word as u32,
+        stamp(target),
+        "control: an ordinary receiver publishes"
+    );
+    assert!(unsafe { crate::object::dictionary::latch_object_to_dictionary(object_of(target)) });
+    let id = stamp(target);
+    assert!(
+        !crate::object::shapes::is_site_matchable_shape_id(id),
+        "premise: the dictionary id is outside the matchable band: {id:#x}"
+    );
+    let (stored, word) = store_fresh(target, key, 8.0);
+    assert_eq!(stored, 8.0, "the miss still performs the store");
+    assert_eq!(
+        word, PACKED_SET_EMPTY,
+        "a dictionary receiver must not publish"
+    );
 }

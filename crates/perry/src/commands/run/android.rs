@@ -5,7 +5,7 @@ use super::*;
 /// Build an Android APK from the compiled .so and install/launch on a device.
 ///
 /// Steps:
-/// 1. Copy the Gradle template from perry-ui-android/template/ to a temp dir
+/// 1. Extract the bundled Gradle template into the build directory
 /// 2. Place the compiled .so in app/src/main/jniLibs/arm64-v8a/
 /// 3. Update the applicationId in build.gradle.kts
 /// 4. Run ./gradlew assembleDebug
@@ -41,14 +41,6 @@ fn build_and_run_android_impl(
     format: OutputFormat,
     wear: bool,
 ) -> Result<()> {
-    // Find the perry workspace root to locate the Android template
-    let workspace_root = super::super::compile::find_perry_workspace_root()
-        .ok_or_else(|| anyhow!("Cannot find Perry workspace root — needed for Android template"))?;
-    let template_dir = workspace_root.join("crates/perry-ui-android/template");
-    if !template_dir.exists() {
-        bail!("Android template not found at {}", template_dir.display());
-    }
-
     // Create a build directory alongside the .so
     let build_dir = so_path
         .parent()
@@ -63,9 +55,10 @@ fn build_and_run_android_impl(
         println!("Building Android APK...");
     }
 
-    // Copy template to build directory
-    copy_dir_recursive(&template_dir, &build_dir)
-        .map_err(|e| anyhow!("Failed to copy Android template: {}", e))?;
+    // The release binary carries the matching Kotlin bridge and resources.
+    // This path must work without a Perry checkout on the user's machine.
+    super::android_template::extract(&build_dir)
+        .map_err(|e| anyhow!("Failed to extract Android template: {}", e))?;
 
     // Wear OS: overlay the watch form-factor onto the copied phone template
     // (manifest feature + standalone meta-data, Wear minSdk, androidx.wear dep).
@@ -845,142 +838,6 @@ pub fn inject_android_deeplinks(
     Ok(())
 }
 
-/// Sign an unsigned APK with the Android debug keystore for local testing.
-/// Creates the debug keystore if it doesn't exist.
-pub fn debug_sign_apk(apk_path: &Path, format: OutputFormat) -> Result<PathBuf> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let debug_keystore = PathBuf::from(&home).join(".android/debug.keystore");
-
-    // Create debug keystore if it doesn't exist
-    if !debug_keystore.exists() {
-        if let Some(parent) = debug_keystore.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        let status = Command::new("keytool")
-            .args([
-                "-genkeypair",
-                "-v",
-                "-keystore",
-                &debug_keystore.to_string_lossy(),
-                "-storepass",
-                "android",
-                "-alias",
-                "androiddebugkey",
-                "-keypass",
-                "android",
-                "-keyalg",
-                "RSA",
-                "-keysize",
-                "2048",
-                "-validity",
-                "10000",
-                "-dname",
-                "CN=Android Debug,O=Android,C=US",
-            ])
-            .status()
-            .map_err(|e| anyhow!("keytool not found: {}", e))?;
-        if !status.success() {
-            bail!("Failed to create debug keystore");
-        }
-    }
-
-    if let OutputFormat::Text = format {
-        println!("Signing APK with debug key...");
-    }
-
-    // Find apksigner from the Android SDK
-    let android_home = std::env::var("ANDROID_HOME")
-        .or_else(|_| std::env::var("ANDROID_SDK_ROOT"))
-        .unwrap_or_else(|_| format!("{}/Library/Android/sdk", home));
-
-    let apksigner = find_apksigner(&android_home);
-
-    // zipalign first (required before signing)
-    let aligned_path = apk_path.with_extension("aligned.apk");
-    let zipalign = PathBuf::from(&android_home).join("build-tools");
-    if let Some(zipalign_bin) = find_latest_build_tool(&zipalign, "zipalign") {
-        let status = Command::new(&zipalign_bin)
-            .args(["4"])
-            .arg(apk_path)
-            .arg(&aligned_path)
-            .status();
-        if let Ok(s) = status {
-            if s.success() {
-                std::fs::rename(&aligned_path, apk_path).ok();
-            }
-        }
-    }
-
-    // Sign with apksigner
-    if let Some(signer) = apksigner {
-        let status = Command::new(&signer)
-            .args([
-                "sign",
-                "--ks",
-                &debug_keystore.to_string_lossy(),
-                "--ks-pass",
-                "pass:android",
-                "--ks-key-alias",
-                "androiddebugkey",
-                "--key-pass",
-                "pass:android",
-            ])
-            .arg(apk_path)
-            .status()
-            .map_err(|e| anyhow!("apksigner failed: {}", e))?;
-        if !status.success() {
-            bail!("Failed to sign APK with debug keystore");
-        }
-    } else {
-        // Fallback: use jarsigner
-        let status = Command::new("jarsigner")
-            .args([
-                "-keystore",
-                &debug_keystore.to_string_lossy(),
-                "-storepass",
-                "android",
-                "-keypass",
-                "android",
-                "-signedjar",
-            ])
-            .arg(apk_path)
-            .arg(apk_path)
-            .arg("androiddebugkey")
-            .status()
-            .map_err(|e| anyhow!("jarsigner not found: {}", e))?;
-        if !status.success() {
-            bail!("Failed to sign APK with debug keystore");
-        }
-    }
-
-    Ok(apk_path.to_path_buf())
-}
-
-/// Find apksigner in the Android SDK build-tools
-pub fn find_apksigner(android_home: &str) -> Option<PathBuf> {
-    find_latest_build_tool(
-        &PathBuf::from(android_home).join("build-tools"),
-        "apksigner",
-    )
-}
-
-/// Find the latest version of a build tool
-pub fn find_latest_build_tool(build_tools_dir: &Path, tool_name: &str) -> Option<PathBuf> {
-    let mut versions: Vec<_> = std::fs::read_dir(build_tools_dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .collect();
-    versions.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
-    for v in versions {
-        let tool = v.path().join(tool_name);
-        if tool.exists() {
-            return Some(tool);
-        }
-    }
-    None
-}
-
 /// Install and launch an APK on an Android device/emulator via adb
 pub fn install_and_launch_android(
     apk_path: &Path,
@@ -989,7 +846,7 @@ pub fn install_and_launch_android(
     format: OutputFormat,
 ) -> Result<()> {
     // Debug-sign the APK if unsigned (Android requires signatures for install)
-    debug_sign_apk(apk_path, format)?;
+    super::android_signing::debug_sign_apk(apk_path, format)?;
 
     if let OutputFormat::Text = format {
         println!();
@@ -1083,6 +940,23 @@ pub fn get_android_pid(serial: &str, bundle_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wear_overlay_applies_to_bundled_android_template() {
+        let temp = tempfile::tempdir().unwrap();
+        super::super::android_template::extract(temp.path()).unwrap();
+        apply_wear_overlay(temp.path(), OutputFormat::Json).unwrap();
+        let manifest =
+            std::fs::read_to_string(temp.path().join("app/src/main/AndroidManifest.xml")).unwrap();
+        let gradle = std::fs::read_to_string(temp.path().join("app/build.gradle.kts")).unwrap();
+        assert!(manifest.contains("android.hardware.type.watch"));
+        assert!(manifest.contains("com.google.android.wearable.standalone"));
+        assert!(gradle.contains("minSdk = 30"));
+        assert!(temp
+            .path()
+            .join("app/src/main/java/com/perry/app/PerryBridge.kt")
+            .is_file());
+    }
 
     /// `apply_wear_overlay` must transform a copy of the *real* Android template
     /// into a Wear OS project: watch feature + standalone meta-data in the

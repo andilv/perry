@@ -777,7 +777,7 @@ pub(super) fn compile_function(
     let _ = lf.create_block("entry");
 
     let mut boxed_vars = module_boxed_vars.clone();
-    super::arguments::add_arguments_mapped_boxes(&f.params, &mut boxed_vars);
+    super::arguments::add_arguments_mapped_boxes(&f.params, Some(&f.body), &mut boxed_vars);
 
     // Store each param into an alloca slot, collecting LocalId → slot
     // mappings. We release the &mut LlBlock at scope end before handing
@@ -1347,6 +1347,7 @@ pub(super) fn compile_function(
         stable_packed_loop_facts: Vec::new(),
         pshape_tower_routable: &cross_module.pshape_tower_routable,
         proven_this: None,
+        guarded_this_class: None,
         proven_shape_params: std::collections::HashMap::new(),
         typed_i32_methods: &cross_module.typed_i32_methods,
         typed_i1_methods: &cross_module.typed_i1_methods,
@@ -1378,6 +1379,7 @@ pub(super) fn compile_function(
         int_range_facts: Vec::new(),
         next_loop_proof_scope_id: 0,
         nonnegative_integer_locals: HashSet::new(),
+        elided_arguments: HashMap::new(),
         native_rep_records: Vec::new(),
         known_noalias_buffer_locals: native_facts.known_noalias_buffer_locals(),
         buffer_alias_base,

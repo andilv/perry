@@ -138,7 +138,12 @@ pub(crate) fn lower_class_expr(
     } else {
         None
     };
+    // Inside a function body a capturing class expression lowers to a fresh
+    // class object per evaluation (`ClassExprFresh` below), which is what the
+    // guarded class environment keys evaluations by.
+    ctx.pending_fresh_class_expr = !at_module_top;
     let class_result = lower_class_from_ast(ctx, &class_expr.class, &synthetic_name, false);
+    ctx.pending_fresh_class_expr = false;
     if let Some(self_id) = self_binding {
         let (_, _, popped_id) = ctx
             .class_expr_self_bindings
@@ -238,6 +243,7 @@ pub(crate) fn lower_class_expr(
             || computed_name_evaluations.iter().any(uses_self)
     });
     let has_static_methods = !class.static_methods.is_empty();
+    let native_parent = class.native_extends.is_some();
     ctx.pending_classes.push(class);
     // #1772/#5893: a class EXPRESSION that carries per-evaluation static
     // fields, captures, or private elements lowers to a
@@ -254,13 +260,44 @@ pub(crate) fn lower_class_expr(
     // to the class-ref. The `ClassExprFresh` path is reserved for class
     // expressions inside a function body (factories like effect's
     // `make()`), which produce a distinct class object per call.
-    if !at_module_top && has_private_elements {
+    let per_evaluation_state = !at_module_top
+        && (!named_statics.is_empty()
+            || !computed_keys.is_empty()
+            || !captured_args.is_empty()
+            || !static_block_names.is_empty()
+            || has_private_elements
+            || self_binding_used
+            // A factory-created superclass is a fresh class object with its
+            // own mutable prototype. A shared ClassRef for the child links to
+            // the template prototype instead of that evaluated parent (e.g.
+            // Effect's Base.prototype.name = tag). Keep the runtime parent
+            // value on a fresh child class. The shared path remains for class
+            // expressions with static methods until those methods can be
+            // installed on fresh class objects.
+            || (parent_expr.is_some() && !has_static_methods));
+    // #11298: every evaluation of a class expression creates a distinct
+    // constructor and prototype (ClassDefinitionEvaluation), even when the
+    // class has none of the per-evaluation state above. A capture-free,
+    // statically-parented class expression in a function used to return the one
+    // shared `ClassRef`, so `makeClass() === makeClass()` and a property
+    // defined on the second evaluation's prototype leaked into instances of
+    // the first. A native-module parent (`extends AsyncResource`) stays on
+    // the shared template: an implicit constructor constructed through a
+    // fresh class value does not forward its `new` arguments to the native
+    // base's init (#10623).
+    let identity_only =
+        !at_module_top && !per_evaluation_state && parent_expr.is_none() && !native_parent;
+    let fresh_evaluation = per_evaluation_state || identity_only;
+    if (!at_module_top && has_private_elements) || identity_only {
         // `const C = class { #x }` normally records C as an inferred static
         // class alias, which makes `new C()` bypass the local class VALUE.
         // A private class evaluated in a function must construct through its
         // fresh heap class object so the instance receives this evaluation's
-        // brand token. Keep the static alias optimization for all other class
-        // expressions and for module-top expressions (which evaluate once).
+        // brand token; an identity-only class (#11298) must do the same so
+        // `Object.getPrototypeOf(new C()) === C.prototype` holds for this
+        // evaluation's prototype. Keep the static alias optimization for all
+        // other class expressions and for module-top expressions (which
+        // evaluate once).
         ctx.inferred_class_bindings.remove(&synthetic_name);
         if let Some(name) = assignment_name.as_ref() {
             ctx.inferred_class_bindings.remove(name);
@@ -281,6 +318,9 @@ pub(crate) fn lower_class_expr(
     // update only the object that was actually evaluated in this invocation.
     // Module top is skipped — module-level ids are stripped from capture lists
     // by `filter_module_level_captures`, so there is nothing to refresh.
+    let env_class = ctx
+        .is_class_env(&synthetic_name)
+        .then(|| synthetic_name.clone());
     let capture_owner = if !at_module_top && (!captured_args.is_empty() || self_binding_used) {
         let ids = ctx
             .lookup_class_captures(&synthetic_name)
@@ -292,7 +332,8 @@ pub(crate) fn lower_class_expr(
             // initializers can read the self-binding before ClassExprFresh
             // returns. Empty entries materialize that local without emitting a
             // capture refresh.
-            ctx.body_class_expr_captures.push((owner, ids));
+            ctx.body_class_expr_captures
+                .push((owner, ids, env_class.clone()));
             Some(owner)
         } else if ids.is_empty() {
             None
@@ -301,28 +342,14 @@ pub(crate) fn lower_class_expr(
                 format!("__perry_class_expr_capture_owner_{synthetic_name}"),
                 crate::types::Type::Any,
             );
-            ctx.body_class_expr_captures.push((owner, ids));
+            ctx.body_class_expr_captures
+                .push((owner, ids, env_class.clone()));
             Some(owner)
         }
     } else {
         None
     };
-    if !at_module_top
-        && (!named_statics.is_empty()
-            || !computed_keys.is_empty()
-            || !captured_args.is_empty()
-            || !static_block_names.is_empty()
-            || has_private_elements
-            || self_binding_used
-            // A factory-created superclass is a fresh class object with its
-            // own mutable prototype. A shared ClassRef for the child links to
-            // the template prototype instead of that evaluated parent (e.g.
-            // Effect's Base.prototype.name = tag). Keep the runtime parent
-            // value on a fresh child class. The shared path remains for class
-            // expressions with static methods until those methods can be
-            // installed on fresh class objects.
-            || (parent_expr.is_some() && !has_static_methods))
-    {
+    if fresh_evaluation {
         // #6438: a class expression WITH heritage (`class extends <expr>`) used
         // to be excluded here and fell back to the shared-template `ClassRef`
         // path — the very thing #1772's comment above warns about: it "shares

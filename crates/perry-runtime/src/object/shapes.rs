@@ -122,6 +122,9 @@ pub(crate) struct ShapeDescriptor {
     /// mint a process-unique nonzero generation so two semantically different
     /// layouts can never compare equal merely because their keys/counts do.
     pub(crate) semantic_generation: u64,
+    /// The receiver's [[Prototype]] identity ([`object_proto_id`]): part of
+    /// the shape's identity, so one ShapeId names one prototype.
+    pub(crate) proto_id: u64,
     /// Semantic receiver kind carried by this exact ShapeId. This is kept in
     /// the authoritative descriptor rather than `GcHeader::_reserved`, whose
     /// bits belong to the GC layout/age protocol and object feature flags.
@@ -212,6 +215,7 @@ impl PartialEq for ShapeDescriptor {
             && self.logical_key_count == other.logical_key_count
             && self.live_inline_slot_count == other.live_inline_slot_count
             && self.semantic_generation == other.semantic_generation
+            && self.proto_id == other.proto_id
             && self.object_kind == other.object_kind
             && self.hole_count == other.hole_count
     }
@@ -525,6 +529,36 @@ pub(crate) const SHAPE_ID_BASE: u32 = 0x8000_0000;
 /// unreachable in practice).
 pub(crate) const SHAPE_ID_END: u32 = 0xC000_0000;
 
+/// # The dictionary band: ShapeIds no site can ever hold
+///
+/// The top quarter of the ShapeId range, `[DICTIONARY_SHAPE_ID_BASE,
+/// SHAPE_ID_END)`, holds dictionary-mode shapes and nothing else, and ordinary
+/// shapes are minted strictly below it. Membership is a fact of the id's
+/// VALUE, fixed when the shape is minted from its generation namespace
+/// ([`crate::object::dictionary::DICTIONARY_GENERATION_TAG`]) — not a check any
+/// site makes.
+///
+/// Why a band: a dictionary shape describes no keys (`keys = NULL`), and its
+/// receiver KEEPS the id across layout changes — an in-place append or
+/// tombstone publishes nothing (`object/dictionary.rs`). A per-site memo
+/// `(ShapeId, slot)` is sound only because a ShapeId names ONE immutable key
+/// list forever; a dictionary id names none. So every site word is written
+/// with an id from the [`is_site_matchable_shape_id`] band, which excludes this
+/// one — the same way a spill entry's word is flipped out of the id range by
+/// `PACKED_SPILL_FLIP` — and no emitted compare (the compact word, the ways,
+/// a region word, a presence or store cache) can equal a dictionary receiver's
+/// `+4` word. Everything that reads a shape from an object (`is_shape_id`,
+/// the descriptor table, the collector) still sees an ordinary ShapeId.
+///
+/// A quarter of the range (2^28 ids) is a floor, not an estimate: a
+/// dictionary draws one id at its latch and one per compacting delete or
+/// inline-bound change, O(1) per object, against the ordinary band's one per
+/// shape birth.
+pub(crate) const DICTIONARY_SHAPE_ID_BASE: u32 = 0xB000_0000;
+
+const _: () = assert!(SHAPE_ID_BASE < DICTIONARY_SHAPE_ID_BASE);
+const _: () = assert!(DICTIONARY_SHAPE_ID_BASE < SHAPE_ID_END);
+
 /// #6759 C3c: PROCESS-GLOBAL allocator (supersedes the per-thread counter
 /// C3a landed with). Global uniqueness matters because the worker
 /// serializer replays `parent_class_id` verbatim: a deep-copied object's
@@ -534,11 +568,41 @@ pub(crate) const SHAPE_ID_END: u32 = 0xC000_0000;
 static SHAPE_ID_NEXT: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(SHAPE_ID_BASE);
 
+/// The dictionary band's own monotonic counter (see
+/// [`DICTIONARY_SHAPE_ID_BASE`]); never reused, parks at `SHAPE_ID_END`.
+static DICTIONARY_SHAPE_ID_NEXT: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(DICTIONARY_SHAPE_ID_BASE);
+
 static SHAPE_SEMANTIC_NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[inline]
 pub(crate) fn is_shape_id(v: u32) -> bool {
     (SHAPE_ID_BASE..SHAPE_ID_END).contains(&v)
+}
+
+/// May a per-site cache word hold this id? True exactly for an ORDINARY-band
+/// ShapeId: never for a dictionary shape ([`DICTIONARY_SHAPE_ID_BASE`]), never
+/// for a class id, never for 0. Every site-word writer publishes only ids this
+/// accepts, so an emitted compare can never equal a dictionary receiver's word.
+#[inline]
+pub(crate) fn is_site_matchable_shape_id(v: u32) -> bool {
+    (SHAPE_ID_BASE..DICTIONARY_SHAPE_ID_BASE).contains(&v)
+}
+
+/// [`is_site_matchable_shape_id`] for a per-site PIC TOKEN
+/// (`PIC_ID_TOKEN_BIT | ShapeId`): the exact token form over a matchable id.
+#[inline]
+pub(crate) fn is_site_matchable_token(token: u64) -> bool {
+    token == (PIC_ID_TOKEN_BIT | u64::from(token as u32))
+        && is_site_matchable_shape_id(token as u32)
+}
+
+/// Is this a dictionary-mode ShapeId? A fact of the value alone. (The
+/// production writers ask the complement, [`is_site_matchable_shape_id`].)
+#[cfg(test)]
+#[inline]
+pub(crate) fn is_dictionary_shape_id(v: u32) -> bool {
+    (DICTIONARY_SHAPE_ID_BASE..SHAPE_ID_END).contains(&v)
 }
 
 /// #6804: classify a WIDENED shape token (`object_shape()`'s usize). Ids
@@ -565,14 +629,19 @@ pub(crate) enum ShapeDescriptorError {
     InvalidFacts,
 }
 
-fn alloc_shape_id_from(next: &std::sync::atomic::AtomicU32) -> Result<u32, ShapeIdExhausted> {
+fn alloc_shape_id_from(
+    next: &std::sync::atomic::AtomicU32,
+    end: u32,
+) -> Result<u32, ShapeIdExhausted> {
     use std::sync::atomic::Ordering;
     loop {
         let id = next.load(Ordering::Relaxed);
-        if id >= SHAPE_ID_END {
+        if id >= end {
             // Park at the exclusive end. In particular, never fetch_add at
-            // END: wrapping to zero could eventually alias a live ShapeId.
-            next.store(SHAPE_ID_END, Ordering::Relaxed);
+            // END: wrapping to zero could eventually alias a live ShapeId, and
+            // running past the ordinary band's end would mint into the
+            // dictionary band.
+            next.store(end, Ordering::Relaxed);
             return Err(ShapeIdExhausted);
         }
         if next
@@ -584,8 +653,28 @@ fn alloc_shape_id_from(next: &std::sync::atomic::AtomicU32) -> Result<u32, Shape
     }
 }
 
+/// An ORDINARY-band ShapeId: every mint except a dictionary shape's.
 fn alloc_shape_id() -> Result<u32, ShapeIdExhausted> {
-    alloc_shape_id_from(&SHAPE_ID_NEXT)
+    alloc_shape_id_from(&SHAPE_ID_NEXT, DICTIONARY_SHAPE_ID_BASE)
+}
+
+/// A dictionary-band ShapeId ([`DICTIONARY_SHAPE_ID_BASE`]).
+fn alloc_dictionary_shape_id() -> Result<u32, ShapeIdExhausted> {
+    alloc_shape_id_from(&DICTIONARY_SHAPE_ID_NEXT, SHAPE_ID_END)
+}
+
+/// The band a new shape's id is drawn from is decided by its generation
+/// namespace: a dictionary generation (bit 62 set, bit 63 clear —
+/// `dictionary::next_generation`) mints in the dictionary band, everything
+/// else in the ordinary band.
+fn alloc_shape_id_for_generation(semantic_generation: u64) -> Result<u32, ShapeIdExhausted> {
+    const DETERMINISTIC_BIT: u64 = 1 << 63;
+    let tag = crate::object::dictionary::DICTIONARY_GENERATION_TAG;
+    if semantic_generation & (DETERMINISTIC_BIT | tag) == tag {
+        alloc_dictionary_shape_id()
+    } else {
+        alloc_shape_id()
+    }
 }
 
 /// The next ShapeId this process would hand out.
@@ -610,6 +699,7 @@ fn shape_descriptor_ensure_with_generation(
     live_inline_slot_count: u32,
     semantic_generation: u64,
     object_kind: ShapeObjectKind,
+    proto_id: u64,
 ) -> Result<u32, ShapeDescriptorError> {
     shape_descriptor_ensure_with_holes(
         keys,
@@ -618,6 +708,7 @@ fn shape_descriptor_ensure_with_generation(
         semantic_generation,
         object_kind,
         0,
+        proto_id,
     )
 }
 
@@ -634,6 +725,7 @@ pub(crate) fn shape_descriptor_ensure_with_holes(
     semantic_generation: u64,
     object_kind: ShapeObjectKind,
     hole_count: u32,
+    proto_id: u64,
 ) -> Result<u32, ShapeDescriptorError> {
     let keys_id = keys as usize as u64;
     if keys_id == 0 && logical_key_count != 0 {
@@ -662,13 +754,14 @@ pub(crate) fn shape_descriptor_ensure_with_holes(
     } else {
         (0, "", 0)
     };
-    let facts = shapes_store::facts_key(
+    let facts = shapes_store::facts_key_proto(
         keys_id,
         logical_key_count,
         live_inline_slot_count,
         semantic_generation,
         object_kind,
         hole_count,
+        proto_id,
     );
     let table = &crate::state::state().shapes;
     let mut inner = table.inner.borrow_mut();
@@ -682,13 +775,14 @@ pub(crate) fn shape_descriptor_ensure_with_holes(
             let record = unsafe { *record };
             // The bucket is a 64-bit fold: validate the facts on every hit.
             if record.has(RECORD_FLAG_FACTS_INDEXED)
-                && record.facts_match(
+                && record.facts_match_proto(
                     keys_id,
                     logical_key_count,
                     live_inline_slot_count,
                     semantic_generation,
                     object_kind,
                     hole_count,
+                    proto_id,
                 )
             {
                 #[cfg(feature = "shape-mint-diag")]
@@ -697,7 +791,8 @@ pub(crate) fn shape_descriptor_ensure_with_holes(
             }
         }
     }
-    let id = alloc_shape_id().map_err(|_| ShapeDescriptorError::IdExhausted)?;
+    let id = alloc_shape_id_for_generation(semantic_generation)
+        .map_err(|_| ShapeDescriptorError::IdExhausted)?;
     #[cfg(feature = "shape-mint-diag")]
     if census_on {
         // Every descriptor already indexed under this keys ADDRESS, copied out
@@ -738,7 +833,8 @@ pub(crate) fn shape_descriptor_ensure_with_holes(
         semantic_generation,
         object_kind,
         hole_count,
-    );
+    )
+    .with_proto_id(proto_id);
     // Publish by-id first, then the reverse accelerators. An ObjectHeader is
     // stamped only after this function returns, so a visible id always has a
     // complete descriptor.
@@ -765,6 +861,30 @@ pub(crate) fn shape_descriptor_ensure(
         live_inline_slot_count,
         0,
         ShapeObjectKind::Ordinary,
+        PROTO_ID_DEFAULT,
+    )
+}
+
+/// [`shape_descriptor_ensure`] for a receiver whose [[Prototype]] identity is
+/// read off the receiver itself — every mint that has an object in hand and
+/// no lineage to copy it from.
+///
+/// # Safety
+/// `obj` is a live shaped `ObjectHeader`.
+#[cfg_attr(feature = "shape-mint-diag", track_caller)]
+pub(crate) unsafe fn shape_descriptor_ensure_for_object(
+    obj: *const crate::object::ObjectHeader,
+    keys: *const ArrayHeader,
+    logical_key_count: u32,
+    live_inline_slot_count: u32,
+) -> Result<u32, ShapeDescriptorError> {
+    shape_descriptor_ensure_with_generation(
+        keys,
+        logical_key_count,
+        live_inline_slot_count,
+        0,
+        ShapeObjectKind::Ordinary,
+        object_proto_id(obj),
     )
 }
 
@@ -803,6 +923,24 @@ pub(crate) fn publish_shape_result(result: Result<u32, ShapeDescriptorError>) ->
 #[cfg_attr(feature = "shape-mint-diag", track_caller)]
 pub(crate) fn shape_id_for_keys_ensure(keys: *const ArrayHeader, key_count: u32) -> u32 {
     publish_shape_result(shape_descriptor_ensure(keys, key_count, key_count))
+}
+
+/// [`shape_id_for_keys_ensure`] for an instance of `class_id`: the birth shape
+/// carries the prototype identity that class implies ([`class_proto_id`]).
+#[cfg_attr(feature = "shape-mint-diag", track_caller)]
+pub(crate) fn shape_id_for_class_keys_ensure(
+    keys: *const ArrayHeader,
+    key_count: u32,
+    class_id: u32,
+) -> u32 {
+    publish_shape_result(shape_descriptor_ensure_with_generation(
+        keys,
+        key_count,
+        key_count,
+        0,
+        ShapeObjectKind::Ordinary,
+        class_proto_id(class_id),
+    ))
 }
 
 /// One FIELD of a shape's descriptor, without lifting the whole record.
@@ -1027,6 +1165,21 @@ pub extern "C" fn js_object_shape_id_for_keys(keys: u64, key_count: u32) -> u32 
     id
 }
 
+/// [`js_object_shape_id_for_keys`] for a class's birth shape: codegen passes
+/// the class id, because the shape names the prototype that class implies.
+#[no_mangle]
+pub extern "C" fn js_object_shape_id_for_class_keys(
+    keys: u64,
+    key_count: u32,
+    class_id: u32,
+) -> u32 {
+    let id =
+        shape_id_for_class_keys_ensure(keys as usize as *const ArrayHeader, key_count, class_id);
+    // SAFETY: `id` was resolved from this agent's live slab record above.
+    unsafe { note_external_shape_carrier(shape_descriptor_by_id(id)) };
+    id
+}
+
 /// #10123: the inline slot a PLAIN ordinary shape assigns to `key`, or `-1`.
 ///
 /// The element-shape loop clone's shape-keyed arm asks this once per tracked
@@ -1144,7 +1297,9 @@ pub extern "C" fn js_region_guard_pack(
     k3: u64,
     k4: u64,
 ) -> u64 {
-    if !is_shape_id(shape_id) || n == 0 || n > REGION_GUARD_MAX_KEYS {
+    // A region word is a site word: only an ORDINARY-band id may enter it
+    // (see `DICTIONARY_SHAPE_ID_BASE`).
+    if !is_site_matchable_shape_id(shape_id) || n == 0 || n > REGION_GUARD_MAX_KEYS {
         return REGION_GUARD_WORD_EMPTY;
     }
     let keys = [k0, k1, k2, k3, k4];
@@ -1218,9 +1373,13 @@ static KEEP_JS_REGION_GUARD_PRIME: unsafe extern "C" fn(
 /// [`shape_id_for_keys_ensure`], this deliberately does not canonicalise by
 /// keys alone: two objects with identical property names but different raw
 /// slot representations must never share a pre-baked GC descriptor.
-pub(crate) fn mint_registered_typed_shape_id(keys: *const ArrayHeader, key_count: u32) -> u32 {
+pub(crate) fn mint_registered_typed_shape_id(
+    keys: *const ArrayHeader,
+    key_count: u32,
+    proto_id: u64,
+) -> u32 {
     let id = alloc_shape_id().unwrap_or_else(|_| shape_id_exhausted_abort());
-    if !shapes_slot_list::install_external_shape_id(id, keys, key_count, key_count) {
+    if !shapes_slot_list::install_external_shape_id(id, keys, key_count, key_count, proto_id) {
         invalid_shape_facts_abort();
     }
     id
@@ -1228,12 +1387,18 @@ pub(crate) fn mint_registered_typed_shape_id(keys: *const ArrayHeader, key_count
 
 /// Install an already-minted process-global typed ShapeId in this agent (for
 /// another module or worker that reuses the same compiled class identity).
+///
+/// `proto_id` is the prototype identity the id was MINTED with (the typed
+/// registry records it): a class id's prototype identity read later can
+/// differ (a module whose codegen reused the id for an anonymous shape), and
+/// a ShapeId's facts never change.
 pub(crate) fn install_registered_typed_shape_id(
     id: u32,
     keys: *const ArrayHeader,
     key_count: u32,
+    proto_id: u64,
 ) -> bool {
-    shapes_slot_list::install_external_shape_id(id, keys, key_count, key_count)
+    shapes_slot_list::install_external_shape_id(id, keys, key_count, key_count, proto_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -1442,7 +1607,7 @@ pub(crate) unsafe fn stamp_object_shape(
     }
     let Some(lineage) = object_shape_descriptor(obj) else {
         crate::array::clear_array_subclass_named_prefix_token(obj);
-        let id = shape_descriptor_ensure(keys, key_count, live_inline_slot_count)
+        let id = shape_descriptor_ensure_for_object(obj, keys, key_count, live_inline_slot_count)
             .unwrap_or_else(|error| shape_descriptor_error_abort(error));
         stamp_object_shape_id_with_carrier_note(obj, id);
         debug_assert_object_shape_parity(obj);
@@ -1457,6 +1622,7 @@ pub(crate) unsafe fn stamp_object_shape(
         // Same-array restamp: physical holes persist, so must the count
         // (see the lineage publish below for the churn-growth rationale).
         lineage.hole_count,
+        lineage.proto_id,
     ));
     if id != (*obj).parent_class_id {
         // Read-side lookup_ways also calls `stamp_object_shape` to populate its
@@ -1510,6 +1676,7 @@ pub(crate) unsafe fn birth_stamp_object_shape(
                 keys,
                 key_count,
                 live_inline_slot_count,
+                object_proto_id(obj),
             );
     if supplied_id_is_local {
         stamp_object_shape_id_with_carrier_note(obj, runtime_shape_id);
@@ -1563,6 +1730,7 @@ pub(crate) unsafe fn try_birth_stamp_preinstalled_shape(
         || descriptor.live_inline_slot_count != live_inline_slot_count
         || descriptor.semantic_generation != 0
         || descriptor.object_kind != ShapeObjectKind::Ordinary
+        || descriptor.proto_id != object_proto_id(obj)
     {
         return false;
     }
@@ -1757,6 +1925,12 @@ pub(crate) unsafe fn publish_object_shape_from(
     // forever and grow the array unbounded. Only the squeeze itself (which
     // physically removes the holes) publishes 0, explicitly.
     let hole_count = lineage.map(|descriptor| descriptor.hole_count).unwrap_or(0);
+    // The prototype identity is carried like the other semantic facts; a
+    // receiver with no lineage (an unstamped newborn) reads its own.
+    let proto_id = match lineage {
+        Some(descriptor) => descriptor.proto_id,
+        None => object_proto_id(obj),
+    };
     let id = publish_shape_result(shape_descriptor_ensure_with_holes(
         keys,
         key_count,
@@ -1764,6 +1938,7 @@ pub(crate) unsafe fn publish_object_shape_from(
         semantic_generation,
         object_kind,
         hole_count,
+        proto_id,
     ));
     stamp_object_shape_id_with_carrier_note(obj, id);
     if retire_owned_history {
@@ -1848,6 +2023,7 @@ pub(crate) unsafe fn transition_object_shape_semantics(
         current.live_inline_slot_count,
         generation,
         current.object_kind,
+        current.proto_id,
     ));
     stamp_object_shape_id_with_carrier_note(obj, id);
     debug_assert_object_shape_parity(obj);
@@ -1909,88 +2085,218 @@ fn deterministic_semantic_generation(
     Some(x | (1 << 63))
 }
 
-/// #10868 lever (iv): semantic generation for a PROTOTYPE divergence, as a
-/// pure function of *(predecessor ShapeId, the prototype's stable serial, link
-/// kind)* — the prototype twin of [`deterministic_semantic_generation`].
-///
-/// Two receivers that diverge the same way from the same predecessor land on
-/// the same successor, instead of each taking a fresh value from the
-/// `SHAPE_SEMANTIC_NEXT` counter. On one tsc `transpileModule` that site minted
-/// 48,197 shapes from 78 predecessors and at most 97 (predecessor, prototype)
-/// pairs.
-///
-/// Soundness: two receivers with DIFFERENT prototypes carry different serials,
-/// so they get different generations and different ShapeIds, and a
-/// shape-keyed inherited-read cache can never serve one receiver's holder for
-/// the other. `PROTOTYPE_DOMAIN` keeps this input space disjoint from the
-/// descriptor generation's; bit 63 is set like every deterministic generation.
-fn deterministic_prototype_generation(
-    prev_shape_id: u32,
-    prototype_serial: u64,
-    link_kind: u8,
-) -> Option<u64> {
-    if prev_shape_id == 0 || prototype_serial == 0 {
-        return None;
-    }
-    const PROTOTYPE_DOMAIN: u64 = 0x5052_4F54_4F54_5950; // "PROTOTYP"
-    let mut x = prototype_serial.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ (u64::from(prev_shape_id) << 32 | u64::from(prev_shape_id))
-        ^ (u64::from(link_kind) << 24)
-        ^ PROTOTYPE_DOMAIN;
-    x ^= x >> 30;
-    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x ^= x >> 27;
-    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
-    x ^= x >> 31;
-    Some(x | (1 << 63))
-}
-
-#[cfg(test)]
-pub(crate) fn test_deterministic_prototype_generation(
-    prev_shape_id: u32,
-    prototype_serial: u64,
-    link_kind: u8,
-) -> Option<u64> {
-    deterministic_prototype_generation(prev_shape_id, prototype_serial, link_kind)
-}
-
 /// [`transition_object_shape_semantics`] for a PROTOTYPE divergence whose
 /// prototype has a stable serial. Falls back to the unique-generation
 /// transition, which is always correct, when there is no predecessor.
+/// Move `obj` to the shape whose prototype identity is `proto_id`: the ONE
+/// transition a [[Prototype]] change makes, from the link funnel
+/// (`prototype_chain::object_set_static_prototype_impl`) for every link kind
+/// and from the post-birth class-id rewrites.
+///
+/// Layout facts are carried unchanged and the prototype identity is replaced,
+/// so every receiver that makes the same change from the same predecessor
+/// reaches the same shape through exact-facts interning: no generation hash,
+/// no per-object id. A dictionary receiver keeps its own namespace — it gets
+/// a unique generation, as for every other change to it.
+///
+/// # Safety
+/// `obj` is a live `ObjectHeader`, or null.
 #[cfg_attr(feature = "shape-mint-diag", track_caller)]
-pub(crate) unsafe fn transition_object_shape_semantics_for_prototype(
+pub(crate) unsafe fn transition_object_shape_prototype(
     obj: *mut crate::object::ObjectHeader,
-    prototype_serial: u64,
-    link_kind: u8,
+    proto_id: u64,
 ) -> u32 {
     if obj.is_null() || !shape_word_is_writable(obj) {
         return 0;
     }
-    crate::array::clear_array_subclass_named_prefix_token(obj);
     let current = object_shape_descriptor(obj).unwrap_or_else(|| {
         synchronize_object_shape_descriptor(obj);
         object_shape_descriptor(obj).expect("shape synchronization must publish a descriptor")
     });
-    // A dictionary receiver's shape is its own; there is no sharing to earn,
-    // and its generation must stay in the dictionary namespace.
-    if crate::object::dictionary::is_dictionary(obj) {
-        return transition_object_shape_semantics(obj);
+    if current.proto_id == proto_id {
+        return object_shape_stamp(obj);
     }
-    let Some(generation) =
-        deterministic_prototype_generation(object_shape_stamp(obj), prototype_serial, link_kind)
-    else {
-        return transition_object_shape_semantics(obj);
+    crate::array::clear_array_subclass_named_prefix_token(obj);
+    let generation = if crate::object::dictionary::is_dictionary(obj) {
+        crate::object::dictionary::next_generation()
+    } else {
+        current.semantic_generation
     };
-    let id = publish_shape_result(shape_descriptor_ensure_with_generation(
+    let id = publish_shape_result(shape_descriptor_ensure_with_holes(
         current.keys as usize as *mut ArrayHeader,
         current.logical_key_count,
         current.live_inline_slot_count,
         generation,
         current.object_kind,
+        current.hole_count,
+        proto_id,
     ));
     stamp_object_shape_id_with_carrier_note(obj, id);
     debug_assert_object_shape_parity(obj);
     id
+}
+
+/// Re-derive `obj`'s prototype identity after a write the identity is read
+/// from (a post-birth `class_id` rewrite) and move it to the matching shape.
+///
+/// # Safety
+/// `obj` is a live `ObjectHeader`, or null.
+pub(crate) unsafe fn restamp_object_proto_id(obj: *mut crate::object::ObjectHeader) -> u32 {
+    if obj.is_null() || !shape_word_is_writable(obj) || object_shape_stamp(obj) == 0 {
+        return 0;
+    }
+    transition_object_shape_prototype(obj, object_proto_id(obj))
+}
+
+// ---------------------------------------------------------------------------
+// [[Prototype]] identity — a SHAPE fact.
+//
+// A ShapeId names one prototype: every object carrying it inherits from the
+// same object (or the same class-implied prototype), so a site may key what it
+// learned about inherited behaviour on the receiver's shape alone.
+//
+//   0                      the realm's default `Object.prototype` (class id 0,
+//                          a closed-literal anon shape)
+//   PROTO_ID_NULL          a null [[Prototype]]
+//   serial (1 .. 2^62)     a recorded prototype object: its stable serial
+//                          (`proto_validity::mark_object_as_prototype`), for
+//                          `setPrototypeOf`, `__proto__`, `new F()`,
+//                          `Object.create`
+//   CLASS | class          a compiled class instance whose prototype its class
+//                          implies (generic specializations share the origin)
+//   MIXED | class | serial a compiled class instance with a recorded prototype
+//                          (a per-evaluation class, `setPrototypeOf` on an
+//                          instance): Perry keeps class accessors in the
+//                          class's vtable, so the vtable is part of what the
+//                          receiver inherits
+//   UNIQUE | n             a prototype with no serial (a function, array or
+//                          typed array used as a prototype): one fresh
+//                          identity per link, carried by lineage
+// ---------------------------------------------------------------------------
+
+/// The default prototype identity: the realm's `Object.prototype`.
+pub(crate) const PROTO_ID_DEFAULT: u64 = 0;
+/// A null [[Prototype]].
+pub(crate) const PROTO_ID_NULL: u64 = u64::MAX;
+const PROTO_ID_TAG_SHIFT: u32 = 62;
+const PROTO_ID_CLASS: u64 = 1 << PROTO_ID_TAG_SHIFT;
+const PROTO_ID_MIXED: u64 = 2 << PROTO_ID_TAG_SHIFT;
+const PROTO_ID_UNIQUE: u64 = 3 << PROTO_ID_TAG_SHIFT;
+/// Serial bits a MIXED identity can carry beside a 32-bit class id.
+const PROTO_ID_MIXED_SERIAL_BITS: u32 = 30;
+
+static PROTO_ID_UNIQUE_NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A prototype identity no other link has: for a prototype with no serial.
+pub(crate) fn fresh_unique_proto_id() -> u64 {
+    let n = PROTO_ID_UNIQUE_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Stay clear of PROTO_ID_NULL at the very top of the UNIQUE band.
+    PROTO_ID_UNIQUE | (n & ((1 << PROTO_ID_TAG_SHIFT) - 2))
+}
+
+/// The class whose vtable an instance of `class_id` inherits through, or 0 for
+/// a class id with none: a plain object, a closed-literal anon shape, or a
+/// synthetic id (`Object.create`, an ES5 constructor), whose prototype is an
+/// ordinary object.
+fn vtable_class(class_id: u32) -> u32 {
+    if class_id == 0
+        || class_id >= crate::object::class_registry::prototype_objects::SYNTHETIC_CLASS_ID_BASE
+        || crate::object::is_anon_shape_class_id(class_id)
+    {
+        return 0;
+    }
+    crate::object::class_generic_origin(class_id).unwrap_or(class_id)
+}
+
+/// The prototype identity an instance of `class_id` is BORN with, before any
+/// prototype is recorded on it.
+pub(crate) fn class_proto_id(class_id: u32) -> u64 {
+    match vtable_class(class_id) {
+        0 => PROTO_ID_DEFAULT,
+        class => PROTO_ID_CLASS | u64::from(class),
+    }
+}
+
+/// The stable serial of the prototype object `bits` names, or 0.
+///
+/// # Safety
+/// `bits` are a recorded `ObjectMeta.prototype` word.
+unsafe fn prototype_serial(bits: u64) -> u64 {
+    let value = crate::value::JSValue::from_bits(bits);
+    if !value.is_pointer() {
+        return 0;
+    }
+    let addr = value.as_pointer::<u8>() as usize;
+    match crate::value::addr_class::try_read_gc_header(addr) {
+        Some(header) if header.obj_type == crate::gc::GC_TYPE_OBJECT => {
+            let meta = (*(addr as *const crate::object::ObjectHeader)).meta;
+            if meta.is_null() {
+                0
+            } else {
+                (*meta).proto_serial
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// `obj`'s [[Prototype]] identity, read off the object: what a mint with no
+/// lineage to copy stamps into the shape. Allocation-free.
+///
+/// # Safety
+/// `obj` is a live `ObjectHeader`.
+pub(crate) unsafe fn object_proto_id(obj: *const crate::object::ObjectHeader) -> u64 {
+    if let Some(header) = crate::value::addr_class::try_read_gc_header(obj as usize) {
+        if header._reserved & crate::gc::OBJ_FLAG_NULL_PROTO != 0 {
+            return PROTO_ID_NULL;
+        }
+    }
+    let class_id = (*obj).class_id;
+    let class = vtable_class(class_id);
+    let meta = (*obj).meta;
+    if !meta.is_null() && (*meta).prototype != 0 {
+        let bits = (*meta).prototype;
+        if bits == crate::value::TAG_NULL {
+            return PROTO_ID_NULL;
+        }
+        let serial = prototype_serial(bits);
+        if serial == 0 {
+            return fresh_unique_proto_id();
+        }
+        if class == 0 {
+            return serial;
+        }
+        if serial >= 1 << PROTO_ID_MIXED_SERIAL_BITS {
+            return fresh_unique_proto_id();
+        }
+        return PROTO_ID_MIXED | u64::from(class) << PROTO_ID_MIXED_SERIAL_BITS | serial;
+    }
+    if class != 0 {
+        return PROTO_ID_CLASS | u64::from(class);
+    }
+    if class_id >= crate::object::class_registry::prototype_objects::SYNTHETIC_CLASS_ID_BASE {
+        // `Object.create(p)`: the prototype lives in the synthetic class's
+        // registry slot, fixed for that id's life.
+        let proto = crate::object::class_prototype_object(class_id);
+        if !proto.is_null() {
+            let serial = prototype_serial(crate::value::js_nanbox_pointer(proto as i64).to_bits());
+            if serial != 0 {
+                return serial;
+            }
+        }
+        return PROTO_ID_CLASS | u64::from(class_id);
+    }
+    PROTO_ID_DEFAULT
+}
+
+/// The prototype identity recorded in shape `id`, or `None` for an id with no
+/// descriptor. One slab read; no descriptor copy.
+#[inline]
+pub(crate) fn shape_proto_id(id: u32) -> Option<u64> {
+    let table = &crate::state::state().shapes;
+    let record = table.slab().record_ptr(id)?;
+    // SAFETY: live slab record, read immediately on this agent.
+    Some(unsafe { (*record).proto_id })
 }
 
 /// [`transition_object_shape_semantics`] for a DATA-descriptor install, whose
@@ -2043,6 +2349,7 @@ pub(crate) unsafe fn transition_object_shape_semantics_for_data_descriptor(
         current.live_inline_slot_count,
         generation,
         current.object_kind,
+        current.proto_id,
     ));
     stamp_object_shape_id_with_carrier_note(obj, id);
     debug_assert_object_shape_parity(obj);
@@ -2080,6 +2387,7 @@ pub(crate) unsafe fn transition_object_shape_to_class(
         current.live_inline_slot_count,
         current.semantic_generation,
         ShapeObjectKind::Class,
+        current.proto_id,
     ));
     stamp_object_shape_id_with_carrier_note(obj, id);
     debug_assert_object_shape_parity(obj);
@@ -2159,6 +2467,7 @@ fn descriptor_matches_object(
         d.keys == keys.arr() as u64
             && d.logical_key_count == keys.count()
             && d.live_inline_slot_count == live_inline_slot_count
+            && d.proto_id == object_proto_id(obj)
     }
 }
 
@@ -3041,6 +3350,39 @@ pub(crate) fn shape_table_census() -> Vec<crate::gc::census::SideTableRow> {
     // between this and `shapes.descriptors` is what chunk release reclaims.
     let minted = SHAPE_ID_NEXT.load(std::sync::atomic::Ordering::Relaxed) - SHAPE_ID_BASE;
     rows.push(("shapes.ids_minted(process)", minted as usize, 0));
+    // How the descriptor population splits by [[Prototype]] identity kind,
+    // and how many distinct prototype identities it names: what the
+    // prototype-in-shape rule costs in shapes.
+    let mut by_kind = [0usize; 6];
+    let mut distinct = std::collections::HashSet::new();
+    slab.for_each(|_, record| {
+        // SAFETY: live slab record, read immediately under agent ownership.
+        let proto_id = unsafe { (*record).proto_id };
+        distinct.insert(proto_id);
+        let kind = match proto_id {
+            PROTO_ID_DEFAULT => 0,
+            PROTO_ID_NULL => 1,
+            id if id >> PROTO_ID_TAG_SHIFT == 0 => 2,
+            id if id & PROTO_ID_UNIQUE == PROTO_ID_CLASS => 3,
+            id if id & PROTO_ID_UNIQUE == PROTO_ID_MIXED => 4,
+            _ => 5,
+        };
+        by_kind[kind] += 1;
+    });
+    for (name, count) in [
+        "shapes.proto(object_prototype)",
+        "shapes.proto(null)",
+        "shapes.proto(object_serial)",
+        "shapes.proto(class_default)",
+        "shapes.proto(class_recorded)",
+        "shapes.proto(unique)",
+    ]
+    .into_iter()
+    .zip(by_kind)
+    {
+        rows.push((name, count, 0));
+    }
+    rows.push(("shapes.proto.distinct_identities", distinct.len(), 0));
     rows
 }
 

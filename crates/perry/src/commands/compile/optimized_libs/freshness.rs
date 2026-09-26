@@ -137,15 +137,16 @@ pub(crate) fn auto_optimized_cache_key(
 ) -> String {
     let target_str = target.unwrap_or("host");
     // The stripped stdlib feature set is not enough to identify this Cargo
-    // graph. For example, mongodb and a CPU-only async wrapper both reduce to
-    // `async-runtime`, but only the mongodb build selects perry-ext-mongodb.
+    // graph. For example, two programs whose wrappers both reduce to
+    // `async-runtime` can still select different wrapper crates, and so
+    // different Cargo graphs.
     // Sharing a target dir lets the second invocation replace stdlib after
     // the first invocation releases its build lock but before it links. The
     // first process then sees an ext archive and stdlib archive from different
     // dependency graphs (#9470; the same class produced #9094's Linux link).
     //
     // Sort and deduplicate here as a defensive measure: aliases such as
-    // `mysql2` + `mysql2/promise` name the same wrapper and must
+    // `http` + `https` name the same wrapper and must
     // describe the same graph regardless of discovery order or alias
     // multiplicity.
     let mut tokio_bindings: Vec<String> = tokio_using_bindings
@@ -758,7 +759,7 @@ pub(crate) fn resolve_auto_well_known_libs(
 }
 
 /// True if this binding's wrapper crate has its own tokio dependency
-/// for I/O (TcpStream, hyper, reqwest, mongodb, sqlx, redis,
+/// for I/O (TcpStream, hyper, reqwest, sqlx, redis,
 /// tokio-tungstenite, lettre, …) and must therefore share a single
 /// tokio compilation with perry-stdlib's runtime.
 ///
@@ -795,9 +796,39 @@ pub(crate) fn binding_needs_shared_tokio(module: &str) -> bool {
         | "undici"
         // HTTP server (hyper)
         | "fastify"
-        // Database drivers (mongodb)
-        | "mongodb"
         // Mail (lettre)
         | "nodemailer"
     )
+}
+
+/// True if this binding's wrapper archive still BUNDLES tokio — its own
+/// `Cargo.toml` depends on tokio and it hands tokio futures to perry-stdlib's
+/// runtime (`perry_ffi_spawn_async` / `_with_reactor`) or calls
+/// `Handle::current()`. Only these need perry-stdlib's `async-runtime`, and
+/// only their archives are compared by the #7629 link check.
+///
+/// A strict subset of [`binding_needs_shared_tokio`], which is the set the
+/// auto-optimize driver co-builds in the stdlib's cargo invocation. The two
+/// diverged in turnloop P8 lane L: perry-ext-net (#11105) and perry-ext-ws run
+/// on turnloop and carry no tokio, perry-ext-nodemailer dropped lettre's tokio
+/// transport (P6), and perry-ext-undici never had one — so a program that
+/// imports only those links no tokio at all. They stay in the co-build set
+/// (it still gives them the stdlib's own perry-runtime / perry-ffi
+/// compilation), but asking for `async-runtime` on their behalf would put
+/// tokio back into every net / ws program for nothing.
+///
+/// The set is EMPTY. `pg` / `mysql2` left with their wrappers (#10677 /
+/// #10680); perry-ext-http left when tokio lane D dropped its last tokio edge
+/// (#11265) — its servers (#11144), client (#11205) and `createConnection`
+/// all run on turnloop; and mongodb, the last member, left when
+/// perry-ext-mongodb was deleted (#11337) — its npm package now compiles from
+/// source over `net` / `tls`. So on the auto-optimize path no well-known
+/// wrapper selects `async-runtime` any more.
+///
+/// The predicate is kept, not deleted, because it is the single source the
+/// driver, the no-auto warning and the #7629 link check (`shared_tokio_lib_stems`)
+/// all key on: a future wrapper that bundles tokio goes back in here and
+/// those three pick it up together.
+pub(crate) fn binding_bundles_tokio(_module: &str) -> bool {
+    false
 }

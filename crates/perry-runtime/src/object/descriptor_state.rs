@@ -296,14 +296,12 @@ pub static PERRY_CLASS_FIELD_INLINE_GUARD_DISABLED: AtomicU8 = AtomicU8::new(0);
 /// Disable the codegen-inlined class-field fast path process-wide (see
 /// [`PERRY_CLASS_FIELD_INLINE_GUARD_DISABLED`]). Idempotent.
 ///
-/// Sets the latch AND poisons every registered guard-expectation slot. The two
-/// are one decision with two carriers: sites that still read the latch keep
-/// working unchanged, while `emit_class_field_inline_precheck` — the per-access
-/// guard on every static-key read — gets the same authority for free out of the
-/// expectation it already loads. Poison first, so no thread can observe a set
-/// latch beside a live expectation.
+/// The per-access class-field read and write guards no longer consult this
+/// decision at all (S6): they compare the receiver's ShapeId against the
+/// class's own ShapeId global, and nothing may tell a shape compare not to
+/// trust the shape. The latch still gates the whole-loop and proven-receiver
+/// forms that read it directly.
 pub(crate) fn disable_class_field_inline_guard() {
-    super::class_guard_shape::poison_class_guard_shapes();
     PERRY_CLASS_FIELD_INLINE_GUARD_DISABLED.store(1, Ordering::Relaxed);
 }
 
@@ -315,11 +313,6 @@ pub(crate) fn class_field_inline_guard_enabled() -> bool {
 #[cfg(test)]
 pub(crate) fn test_reset_class_field_inline_guard() {
     PERRY_CLASS_FIELD_INLINE_GUARD_DISABLED.store(0, Ordering::Relaxed);
-    // Unpoison every registered expectation back to the ShapeId it was seeded
-    // with. Production never does this — the disable decision is monotonic —
-    // but a test that flips the latch must not leave later tests guarding
-    // against `CLASS_GUARD_SHAPE_POISON`.
-    super::class_guard_shape::restore_class_guard_shapes_for_test();
     // Also clear the C5a per-key vetting sets (production-monotonic, so
     // without this a key name reused across tests in one process would
     // inherit an earlier test's declared-field / installed-key state and
@@ -1238,7 +1231,7 @@ pub(crate) unsafe fn plain_data_write_may_intercept(addr: usize, class_id: u32, 
 
 /// Store a property descriptor for (obj, key).
 pub(crate) fn set_property_attrs(obj: usize, key: String, attrs: PropertyAttrs) {
-    super::prop_plan::prop_plan_epoch_bump();
+    super::prop_plan::prop_plan_epoch_bump_for_owner(obj);
     note_data_descriptor_target(obj, &key, attrs);
     let st = state();
     st.descriptors.property_attrs_in_use.set(true);
@@ -1261,7 +1254,7 @@ pub(crate) fn set_property_attrs_batch(obj: usize, entries: &[(&str, PropertyAtt
     if entries.is_empty() {
         return;
     }
-    super::prop_plan::prop_plan_epoch_bump();
+    super::prop_plan::prop_plan_epoch_bump_for_owner(obj);
     note_descriptor_target(obj);
     let st = state();
     st.descriptors.property_attrs_in_use.set(true);
@@ -1291,7 +1284,7 @@ pub(crate) fn clear_property_attrs(obj: usize, key: &str) {
         return;
     }
     owner_index_remove(&state().descriptors.attr_keys_by_owner, obj, key);
-    super::prop_plan::prop_plan_epoch_bump();
+    super::prop_plan::prop_plan_epoch_bump_for_owner(obj);
     unsafe {
         let object = obj as *mut crate::object::ObjectHeader;
         if crate::object::object_is_shaped(object) {
@@ -1316,6 +1309,56 @@ pub(crate) fn get_accessor_descriptor(obj: usize, key: &str) -> Option<AccessorD
         .borrow()
         .get(&(obj, key.to_string()))
         .copied()
+}
+
+/// Descriptor lookups for a native HANDLE owner (`handle_expando`): a
+/// small-band id OR a never-freed native `Box` backing such as an
+/// `AsyncResource`'s (#10926). Neither is a GC cell, so these probe the tables
+/// directly and never consult the per-cell meta summary. That summary reads
+/// `owner - 8` as a `GcHeader` behind only a magnitude check, and a `Box`
+/// address passes it: the preceding allocator slot's bytes were classified as
+/// an object header and a field past the `Box`'s end dereferenced as its
+/// `ObjectMeta` -- an intermittent SIGSEGV (or, in a debug build, a
+/// "misaligned pointer dereference" of string bytes) on every
+/// `resource.eventEmitter` read that happened to sit behind a matching byte.
+/// For a small-band id the summary already answered "probe" without reading
+/// memory, so the verdicts are unchanged there.
+pub(crate) fn get_handle_accessor_descriptor(
+    handle: usize,
+    key: &str,
+) -> Option<AccessorDescriptor> {
+    state()
+        .descriptors
+        .accessor_descriptors
+        .borrow()
+        .get(&(handle, key.to_string()))
+        .copied()
+}
+
+/// Handle-owner twin of [`get_property_attrs`]; see
+/// [`get_handle_accessor_descriptor`]. No `String`-wrapper index synthesis: a
+/// handle is never a boxed string, and that probe reads the owner's header too.
+pub(crate) fn get_handle_property_attrs(handle: usize, key: &str) -> Option<PropertyAttrs> {
+    state()
+        .descriptors
+        .property_descriptors
+        .borrow()
+        .get(&(handle, key.to_string()))
+        .copied()
+}
+
+/// Handle-owner twin of [`accessor_descriptor_keys_for_obj`]; see
+/// [`get_handle_accessor_descriptor`].
+pub(crate) fn handle_accessor_descriptor_keys(handle: usize) -> Vec<String> {
+    let mut keys = state()
+        .descriptors
+        .accessor_keys_by_owner
+        .borrow()
+        .get(&handle)
+        .cloned()
+        .unwrap_or_default();
+    keys.sort();
+    keys
 }
 
 /// Does `owner` hold ANY property (data) descriptor?
@@ -1510,7 +1553,7 @@ fn note_accessor_descriptor_key(key: &str) {
 
 /// Store an accessor descriptor for (obj, key).
 pub(crate) fn set_accessor_descriptor(obj: usize, key: String, acc: AccessorDescriptor) {
-    super::prop_plan::prop_plan_epoch_bump();
+    super::prop_plan::prop_plan_epoch_bump_for_owner(obj);
     note_accessor_descriptor_target(obj, &key, &acc);
     let st = state();
     st.descriptors.accessors_in_use.set(true);
@@ -1579,7 +1622,7 @@ pub(crate) fn install_fresh_accessor_property(
     acc: AccessorDescriptor,
     attrs: PropertyAttrs,
 ) {
-    super::prop_plan::prop_plan_epoch_bump();
+    super::prop_plan::prop_plan_epoch_bump_for_owner(obj);
     // #10287: one keyed transition covers the pair, exactly as the two-call
     // sequence this folds would have produced (the accessor half runs last
     // there, so its encoding is the one that survives).
@@ -1668,7 +1711,7 @@ pub(crate) fn clear_accessor_descriptor(obj: usize, key: &str) {
         return;
     }
     owner_index_remove(&state().descriptors.accessor_keys_by_owner, obj, key);
-    super::prop_plan::prop_plan_epoch_bump();
+    super::prop_plan::prop_plan_epoch_bump_for_owner(obj);
     unsafe {
         let object = obj as *mut crate::object::ObjectHeader;
         if crate::object::object_is_shaped(object) {
@@ -1702,7 +1745,7 @@ pub(crate) fn set_builtin_accessor_descriptor(
     acc: AccessorDescriptor,
     attrs: PropertyAttrs,
 ) {
-    super::prop_plan::prop_plan_epoch_bump();
+    super::prop_plan::prop_plan_epoch_bump_for_owner(obj);
     note_descriptor_target(obj);
     note_accessor_descriptor_key(&key);
     // #6759 Phase C2: the meta summary must over-approximate the tables
@@ -1740,7 +1783,7 @@ pub(crate) fn set_builtin_accessor_descriptor(
 /// `PROPERTY_DESCRIPTORS` per-object and unconditionally. The gate stays
 /// down, so the object get/set hot path is unaffected for every program.
 pub(crate) fn set_builtin_property_attrs(obj: usize, key: String, attrs: PropertyAttrs) {
-    super::prop_plan::prop_plan_epoch_bump();
+    super::prop_plan::prop_plan_epoch_bump_for_owner(obj);
     note_descriptor_target(obj);
     // #6759 Phase C2: see `set_builtin_accessor_descriptor`.
     note_meta_descriptor_key(obj, &key, false);

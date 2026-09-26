@@ -241,9 +241,11 @@ fn codegen_signature(row: &perry_dispatch::MethodRow, has_receiver: bool) -> Abi
         ArgKind::F64 | ArgKind::Closure => AbiType::F64,
     }));
     let ret = match row.ret {
-        ReturnKind::Widget | ReturnKind::Promise | ReturnKind::Str | ReturnKind::I64AsF64 => {
-            AbiType::I64
-        }
+        ReturnKind::Widget
+        | ReturnKind::Promise
+        | ReturnKind::Str
+        | ReturnKind::I64AsF64
+        | ReturnKind::I64AsBool => AbiType::I64,
         ReturnKind::F64 => AbiType::F64,
         ReturnKind::Void => AbiType::Void,
     };
@@ -372,6 +374,71 @@ native_platform_test!(test_android, "Android", "../perry-ui-android/src", androi
 native_platform_test!(test_gtk4, "GTK4", "../perry-ui-gtk4/src", gtk4);
 native_platform_test!(test_windows, "Windows", "../perry-ui-windows/src", windows);
 
+/// Styling handles use the integer widget ABI, independently of floating-point
+/// color/font/layout arguments. Mixing those register classes shifts every value.
+#[test]
+fn test_android_styling_codegen_ffi_signatures() {
+    let symbols = [
+        "perry_ui_widget_set_corner_radius",
+        "perry_ui_widget_set_shadow",
+        "perry_ui_widget_set_background_color",
+        "perry_ui_widget_set_background_gradient",
+        "perry_ui_widget_set_border_color",
+        "perry_ui_widget_set_border_width",
+        "perry_ui_widget_set_edge_insets",
+        "perry_ui_widget_set_opacity",
+        "perry_ui_widget_set_width",
+        "perry_ui_widget_set_height",
+        "perry_ui_text_set_color",
+        "perry_ui_text_set_font_size",
+        "perry_ui_text_set_font_weight",
+        "perry_ui_text_set_letter_spacing",
+        "perry_ui_text_set_line_height",
+        "perry_ui_button_set_bordered",
+        "perry_ui_button_set_text_color",
+    ];
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let native = extract_native_crate_signatures(&root.join("../perry-ui-android/src"));
+    let mut mismatches = Vec::new();
+    for name in symbols {
+        let row = perry_dispatch::PERRY_UI_TABLE
+            .iter()
+            .find(|row| row.runtime == name)
+            .unwrap_or_else(|| panic!("missing dispatch row for {name}"));
+        let actual = native
+            .get(name)
+            .unwrap_or_else(|| panic!("missing Android export {name}"));
+        let expected = codegen_signature(row, false);
+        if actual != &expected {
+            mismatches.push(format!("{name}: Android {actual}, codegen {expected}"));
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+/// Table's string getter returns a raw string pointer, while selection getters
+/// return integer indices. Check every Android Table entry against codegen.
+#[test]
+fn test_android_table_codegen_ffi_signatures() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let native = extract_native_crate_signatures(&manifest_dir.join("../perry-ui-android/src"));
+    let mut checked = 0;
+    for row in perry_dispatch::PERRY_UI_TABLE {
+        if !row.runtime.starts_with("perry_ui_table_") {
+            continue;
+        }
+        let expected = codegen_signature(row, false);
+        assert_eq!(
+            native.get(row.runtime),
+            Some(&expected),
+            "{} ABI mismatch",
+            row.runtime
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 12, "all Table operations must be covered");
+}
+
 /// Every Windows UI export that native codegen can call must use the exact
 /// integer/floating-point ABI shape declared in `perry-dispatch`.
 ///
@@ -434,4 +501,25 @@ fn test_web() {
     let source = include_str!("../../perry-codegen-js/src/web_runtime.js");
     let symbols = extract_web_symbols(source);
     check_platform("Web", &symbols, |f| f.web, |f| f.web_name.unwrap_or(f.name));
+}
+
+/// System predicates share the native integer ABI on every native UI backend.
+#[test]
+fn test_dark_mode_codegen_ffi_signatures() {
+    let row = perry_dispatch::PERRY_SYSTEM_TABLE
+        .iter()
+        .find(|row| row.method == "isDarkMode")
+        .unwrap();
+    let expected = codegen_signature(row, false);
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for platform in [
+        "android", "macos", "ios", "tvos", "watchos", "visionos", "gtk4", "windows",
+    ] {
+        let native =
+            extract_native_crate_signatures(&root.join(format!("../perry-ui-{platform}/src")));
+        let actual = native
+            .get(row.runtime)
+            .unwrap_or_else(|| panic!("missing predicate on {platform}"));
+        assert_eq!(actual, &expected, "isDarkMode ABI mismatch on {platform}");
+    }
 }

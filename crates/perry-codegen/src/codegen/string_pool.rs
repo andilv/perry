@@ -342,7 +342,11 @@ pub(super) fn emit_string_pool(
     {
         let mut named: Vec<(u32, String)> = Vec::new();
         for (class_name, class) in classes.iter() {
-            if *class_name != class.name {
+            // Imported stubs (id == 0) use consumer lookup keys, which may
+            // be aliases or synthetic namespace keys. Only the defining
+            // module owns the JavaScript display name; an importer must not
+            // overwrite it when its string initializer runs.
+            if class.id == 0 || *class_name != class.name {
                 continue;
             }
             let cid = match class_ids.get(class_name).copied() {
@@ -638,10 +642,12 @@ pub(super) fn emit_string_pool(
                 ],
             )
         } else {
+            // The class id rides along: a birth shape names the prototype
+            // its class implies ([[Prototype]] is a shape fact).
             blk.call(
                 I32,
-                "js_object_shape_id_for_keys",
-                &[(I64, &arr), (I32, &fc_str)],
+                "js_object_shape_id_for_class_keys",
+                &[(I64, &arr), (I32, &fc_str), (I32, &cid_str)],
             )
         };
         let shape_global = format!(
@@ -649,18 +655,6 @@ pub(super) fn emit_string_pool(
             crate::typed_shape::shape_id_global_name_from_keys_global(global_name)
         );
         blk.store(I32, &shape_id, &shape_global);
-
-        // Seed the guard expectation with the same ShapeId and hand the
-        // runtime its address, so `disable_class_field_inline_guard` can poison
-        // it. Registration happens AFTER the seed, and the runtime poisons on
-        // the spot if the latch already flipped — so a module initialised late
-        // cannot reopen a fast path the process has closed.
-        let guard_global = format!(
-            "@{}",
-            crate::typed_shape::guard_shape_global_name_from_keys_global(global_name)
-        );
-        blk.store(I32, &shape_id, &guard_global);
-        blk.call_void("js_register_class_guard_shape", &[(PTR, &guard_global)]);
 
         // #8122: compose the class's inline-`new` header image —
         // `[packed GcHeader word | class_id | ShapeId << 32]` — beside the
@@ -718,7 +712,6 @@ pub(super) fn emit_string_pool(
                     (PTR, &global_ref),
                     (PTR, &shape_global),
                     (PTR, &image_ref),
-                    (PTR, &guard_global),
                 ],
             );
         }
@@ -1773,3 +1766,7 @@ pub(super) fn emit_string_pool(
     }
     blk.ret_void();
 }
+
+#[cfg(test)]
+#[path = "class_name_registration_tests.rs"]
+mod class_name_registration_tests;
