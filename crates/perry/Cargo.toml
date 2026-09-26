@@ -28,7 +28,19 @@ swc_ecma_transforms_base.workspace = true
 swc_ecma_visit.workspace = true
 perry-hir.workspace = true
 perry-transform.workspace = true
-perry-codegen.workspace = true
+# FORK-MAINTAINED DIVERGENCE (musl, #7353): `default-features = false` here
+# plus the `llvm-inprocess` entry in `default` below is what lets a musl
+# build strip the in-process LLVM with `--no-default-features` — apt's
+# glibc-built LLVM objects (`__isoc23_*@@GLIBC_2.38`, -lz3/-lxml2/-lffi)
+# cannot link into a static musl binary, so manual-build.yml's musl legs
+# build `--no-default-features --features full-cli`. Upstream's
+# `perry-codegen.workspace = true` (f70bbaff8) dropped the edge, and cargo
+# ORs a dependency's default-features across all requirers, so no CLI flag
+# combination can strip it — the musl link dies with exactly that symbol.
+# NOTE: the direct `path` form is required — `default-features = false` is
+# silently ignored when inheriting via `workspace = true`.
+# Re-apply this edge after upstream syncs if it conflicts away.
+perry-codegen = { path = "../perry-codegen", default-features = false }
 perry-runtime.workspace = true
 perry-diagnostics.workspace = true
 perry-updater.workspace = true
@@ -110,7 +122,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 [features]
 # The default build is the full official CLI — every command and codegen
 # backend. The shipped binary is unchanged from before #5422.
-default = ["full-cli"]
+default = ["full-cli", "llvm-inprocess"]
 # Opt-in reader support for archives outside Perry's release/IPA/HAP contract.
 extended-zip = ["zip/aes-crypto", "zip/bzip2", "zip/deflate64", "zip/deflate-zopfli", "zip/lzma", "zip/ppmd", "zip/time", "zip/zstd", "zip/xz"]
 
